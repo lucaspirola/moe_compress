@@ -146,7 +146,9 @@ class InputCovarianceAccumulator:
             self.covariance[key] = cov.cpu()
         else:
             self.covariance[key] = self.covariance[key] + cov.cpu()
-        self.token_count[key] += flat.shape[0]
+        # Use .get() so we work regardless of whether token_count is a
+        # defaultdict or a plain dict (the Stage 2 remap replaces it).
+        self.token_count[key] = self.token_count.get(key, 0) + flat.shape[0]
 
 
 @contextlib.contextmanager

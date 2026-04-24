@@ -45,15 +45,18 @@ class _TinyMoEBlock(nn.Module):
         topk_vals, topk_idx = logits.softmax(dim=-1).topk(self.top_k, dim=-1)
         out = torch.zeros_like(x)
         for e_idx, expert in enumerate(self.experts):
-            mask = (topk_idx == e_idx)
+            mask = (topk_idx == e_idx)                      # [B, T, k]
             if not mask.any():
                 continue
-            weights = topk_vals[mask]
-            idxs = mask.any(dim=-1)
-            selected = x[idxs]
-            out[idxs] = out[idxs] + expert(selected) * weights.sum(dim=-1, keepdim=True)[idxs] / max(self.top_k, 1)
-        out = out + self.shared_expert(x)
-        return out
+            tok_mask = mask.any(dim=-1)                     # [B, T]
+            selected = x[tok_mask]                          # [N, hidden]
+            if selected.numel() == 0:
+                continue
+            # Per-token gate weight = sum of gate vals over the slots where
+            # this token picked expert e_idx (typically 0 or 1 per top-k).
+            w = (topk_vals * mask.to(topk_vals.dtype)).sum(dim=-1)[tok_mask]
+            out[tok_mask] = out[tok_mask] + expert(selected) * w.unsqueeze(-1)
+        return out + self.shared_expert(x)
 
 
 class _TinyLayer(nn.Module):

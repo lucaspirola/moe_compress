@@ -118,23 +118,42 @@ def main(argv=None) -> int:
     # `_FactoredLinear` submodules without additional plumbing. For that
     # reason, ``--resume-from-stage`` values >2 fall back to the original
     # checkpoint today (documented limitation, see README.md Risk register).
-    if start <= 2:
+    stop = args.stop_after_stage
+
+    # Make the optional save a no-op if the caller asked us to skip it.
+    if args.skip_save:
+        from .utils import model_io as _mio
+        _mio.save_checkpoint = _skip_save_checkpoint
+
+    if start <= 2 <= stop:
         log.info("=== Stage 2 — REAP + REAM ===")
         stage2_reap_ream.run(model, tokenizer, config, artifacts_dir, device=device)
+    if stop < 3:
+        log.info("Stopping after stage %d as requested.", stop)
+        return 0
 
-    if start <= 3:
+    if start <= 3 <= stop:
         log.info("=== Stage 3 — SVD ===")
         stage3_svd.run(model, tokenizer, config, artifacts_dir, decomposition, device=device)
+    if stop < 4:
+        log.info("Stopping after stage %d as requested.", stop)
+        return 0
 
-    if start <= 4:
+    if start <= 4 <= stop:
         log.info("=== Stage 4 — EoRA ===")
         stage4_eora.run(model, tokenizer, config, artifacts_dir)
+    if stop < 5:
+        log.info("Stopping after stage %d as requested.", stop)
+        return 0
 
-    if start <= 5:
+    if start <= 5 <= stop:
         log.info("=== Stage 5 — Router KD ===")
         stage5_router_kd.run(model, tokenizer, config, artifacts_dir, device=device)
+    if stop < 6:
+        log.info("Stopping after stage %d as requested.", stop)
+        return 0
 
-    if start <= 6:
+    if start <= 6 <= stop:
         log.info("=== Stage 6 — Validation ===")
         stage6_validate.run(model, tokenizer, config, artifacts_dir, device=device)
 
@@ -152,12 +171,31 @@ def _parse(argv) -> argparse.Namespace:
     p.add_argument("--artifacts-dir", default="./artifacts")
     p.add_argument("--target-ratio", type=float, default=None)
     p.add_argument("--resume-from-stage", type=int, default=0)
+    p.add_argument(
+        "--stop-after-stage", type=int, default=6,
+        help="Exit after the named stage completes (inclusive). Useful for "
+             "per-stage supervision on HF Jobs. 6 = run everything.",
+    )
+    p.add_argument(
+        "--skip-save", action="store_true",
+        help="Skip save_checkpoint calls between stages. For in-memory smoke "
+             "testing on tiny models that don't round-trip through HF save.",
+    )
     return p.parse_args(argv)
 
 
 def _load_config(path) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def _skip_save_checkpoint(model, tokenizer, out_dir):
+    """Replacement for save_checkpoint when --skip-save is passed."""
+    from pathlib import Path as _Path
+    out = _Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    log.info("[--skip-save] suppressing save_pretrained → %s", out)
+    return out
 
 
 def _validate_config(config: dict) -> None:

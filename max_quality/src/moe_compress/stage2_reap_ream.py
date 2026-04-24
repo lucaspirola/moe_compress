@@ -279,15 +279,21 @@ def _hook_layer_for_reap(layer_ref: MoELayerRef, acc: ReapAccumulator):
 
 
 def _topk_from_config(layer_ref: MoELayerRef) -> int:
-    cfg = getattr(layer_ref.mlp, "config", None)
-    if cfg is None:
-        # Try parent's config
-        return 8
-    for name in ("num_experts_per_tok", "top_k", "router_top_k"):
-        v = getattr(cfg, name, None)
-        if v:
-            return int(v)
-    return 8
+    # Prefer the block-level attribute (what the forward actually uses); fall
+    # back to the config object; finally clamp to the surviving expert count.
+    mlp = layer_ref.mlp
+    for name in ("top_k", "num_experts_per_tok", "router_top_k"):
+        v = getattr(mlp, name, None)
+        if isinstance(v, int) and v > 0:
+            return min(v, len(mlp.experts))
+    cfg = getattr(mlp, "config", None)
+    if cfg is not None:
+        for name in ("num_experts_per_tok", "top_k", "router_top_k"):
+            v = getattr(cfg, name, None)
+            if isinstance(v, int) and v > 0:
+                return min(v, len(mlp.experts))
+    # Last resort — clamp to expert count so topk() never errors.
+    return min(8, len(mlp.experts))
 
 
 # ---------------------------------------------------------------------------
