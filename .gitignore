@@ -19,6 +19,9 @@ dist/
 *.swp
 .DS_Store
 
+# Claude Code local state
+.claude/
+
 # Virtual envs (venv lives at /home/lucas/ai/venv, outside this repo)
 venv/
 .venv/
