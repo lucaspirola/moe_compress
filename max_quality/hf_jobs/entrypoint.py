@@ -64,12 +64,15 @@ LOG = logging.getLogger("hf_jobs.entrypoint")
 # Config from env
 # ---------------------------------------------------------------------------
 
-CODE_REPO      = os.environ.get("CODE_REPO",       "pirola/moe-compress-code")
-MODEL_REPO     = os.environ.get("MODEL_REPO",      "Qwen/Qwen3.6-35B-A3B")
-RESULT_REPO    = os.environ.get("RESULT_REPO",     "")           # auto-generated if empty
-TARGET_RATIO   = float(os.environ.get("TARGET_RATIO", "0.30"))
-CACHE_MOUNT    = Path(os.environ.get("CACHE_MOUNT", "/mnt/cache"))
-CONFIG_PATH    = os.environ.get("CONFIG_PATH",     "configs/qwen36_35b_a3b_30pct.yaml")
+CODE_REPO        = os.environ.get("CODE_REPO",       "pirola/moe-compress-code")
+MODEL_REPO       = os.environ.get("MODEL_REPO",      "Qwen/Qwen3.6-35B-A3B")
+RESULT_REPO      = os.environ.get("RESULT_REPO",     "")           # auto-generated if empty
+TARGET_RATIO     = float(os.environ.get("TARGET_RATIO", "0.30"))
+CACHE_MOUNT      = Path(os.environ.get("CACHE_MOUNT", "/mnt/cache"))
+CONFIG_PATH      = os.environ.get("CONFIG_PATH",     "configs/qwen36_35b_a3b_30pct.yaml")
+RESUME_FROM      = int(os.environ.get("RESUME_FROM_STAGE", "0"))
+STOP_AFTER       = int(os.environ.get("STOP_AFTER_STAGE",  "6"))
+UPLOAD_ON_STOP   = os.environ.get("UPLOAD_ON_STOP", "1") not in ("0", "false", "False")
 
 
 def _main() -> int:
@@ -118,6 +121,8 @@ def _main() -> int:
             "--model", MODEL_REPO,
             "--artifacts-dir", str(artifacts_dir),
             "--target-ratio", str(TARGET_RATIO),
+            "--resume-from-stage", str(RESUME_FROM),
+            "--stop-after-stage",  str(STOP_AFTER),
         ]
         LOG.info("Invoking run_pipeline.main(%s)", argv)
         exit_code = run_pipeline_main(argv)
@@ -192,7 +197,9 @@ def _default_result_repo() -> str:
     # Strip a "Qwen/" prefix for brevity in the result repo name.
     stem = MODEL_REPO.split("/", 1)[-1].lower().replace(".", "-")
     pct = int(round(TARGET_RATIO * 100))
-    return f"pirola/{stem}-strategy-a-{pct}pct-{ts}"
+    # Per-stage runs get their own repo so supervision artifacts don't collide.
+    stage_tag = f"-stop{STOP_AFTER}" if STOP_AFTER < 6 else ""
+    return f"pirola/{stem}-strategy-a-{pct}pct{stage_tag}-{ts}"
 
 
 def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:

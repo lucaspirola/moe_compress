@@ -77,14 +77,18 @@ def main(argv=None) -> int:
 
     # Figure out which checkpoint to load for the starting stage.
     start = args.resume_from_stage
+    stop = args.stop_after_stage
     model, tokenizer = _load_for_stage(start, config, artifacts_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if start <= 0:
+    if start <= 0 <= stop:
         log.info("=== Stage 0 — Super Expert Detection ===")
         stage0_super_experts.run(model, tokenizer, config, artifacts_dir, device=device)
+    if stop < 1:
+        log.info("Stopping after stage %d as requested.", stop)
+        return 0
 
-    if start <= 1:
+    if start <= 1 <= stop:
         log.info("=== Budget Solver ===")
         blacklist_payload = load_json_artifact(artifacts_dir / "stage0_blacklist.json")
         blacklist = {int(k): list(v) for k, v in blacklist_payload.get("blacklist", {}).items()}
@@ -110,6 +114,9 @@ def main(argv=None) -> int:
             })
         else:
             decomposition = None  # not needed for Stage 4+
+    if stop < 2:
+        log.info("Stopping after stage %d as requested.", stop)
+        return 0
 
     # FIX (review bug #3): keep the model alive across Stages 2-5. The
     # saved checkpoints between those stages are artifacts for post-mortem
@@ -118,7 +125,6 @@ def main(argv=None) -> int:
     # `_FactoredLinear` submodules without additional plumbing. For that
     # reason, ``--resume-from-stage`` values >2 fall back to the original
     # checkpoint today (documented limitation, see README.md Risk register).
-    stop = args.stop_after_stage
 
     # Make the optional save a no-op if the caller asked us to skip it.
     if args.skip_save:
