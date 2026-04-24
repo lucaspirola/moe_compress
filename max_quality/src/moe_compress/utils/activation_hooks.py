@@ -106,7 +106,11 @@ class ReapAccumulator:
     def add_gpu(self, key: tuple[int, int], contrib: torch.Tensor, n_tokens: int) -> None:
         cur = self._gpu_sums.get(key)
         if cur is None:
-            self._gpu_sums[key] = contrib.detach()
+            # ``.clone()`` so the stored accumulator owns its storage. Caller
+            # ``record_reap`` computes a fresh 0-dim tensor per call today so
+            # the detach-only path would also work, but clone hardens against
+            # future callers who reuse buffers.
+            self._gpu_sums[key] = contrib.detach().clone()
         else:
             cur.add_(contrib.detach())
         self.counts[key] = self.counts.get(key, 0) + n_tokens
