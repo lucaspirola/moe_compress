@@ -289,6 +289,7 @@ def _collect_pruned_input_covariance(
     for ref in moe_layers:
         with instrument_experts(ref, {"input": input_cb, "intermediate": intermediate_cb}):
             run_calibration(model, batches, device=device)
+        B_acc.finalize_layer(ref.layer_idx)
 
 
 def _load_stage2_covariance(path: Path):

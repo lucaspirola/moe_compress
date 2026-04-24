@@ -91,6 +91,10 @@ def run(
             model, layer_ref, batches, reap_acc, cov_acc,
             device=device,
         )
+        # Drain GPU-resident accumulators to CPU once per layer (avoid the
+        # per-expert-per-sample stall from the pre-refactor implementation).
+        reap_acc.finalize_layer(layer_ref.layer_idx)
+        cov_acc.finalize_layer(layer_ref.layer_idx)
 
         n_experts = layer_ref.num_routed_experts
         protected = set(blacklist.get(layer_ref.layer_idx, []))

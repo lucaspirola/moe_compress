@@ -63,52 +63,103 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class DownProjMaxAccumulator:
+    """Per-(layer, expert) max(|x|) accumulator, GPU-resident during forward.
+
+    Keeps a 0-dim CUDA tensor per expert and runs ``torch.maximum`` on it
+    without syncing. :meth:`finalize` transfers to CPU once at end of
+    profiling (not per-expert, per-sample).
+    """
     per_expert_max: dict[tuple[int, int], float] = field(default_factory=dict)
+    _gpu: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
 
     def update(self, layer_idx: int, expert_idx: int, x: torch.Tensor) -> None:
-        cur = float(x.detach().abs().max().cpu().item())
+        cur = x.detach().abs().amax()                       # 0-dim, stays on device
         key = (layer_idx, expert_idx)
-        if cur > self.per_expert_max.get(key, 0.0):
-            self.per_expert_max[key] = cur
+        prev = self._gpu.get(key)
+        if prev is None:
+            self._gpu[key] = cur
+        else:
+            prev.copy_(torch.maximum(prev, cur))
+
+    def finalize(self) -> None:
+        for key, tensor in self._gpu.items():
+            val = float(tensor.cpu().item())
+            if val > self.per_expert_max.get(key, 0.0):
+                self.per_expert_max[key] = val
+        self._gpu.clear()
 
 
 @dataclass
 class ReapAccumulator:
+    """REAP score accumulator, GPU-resident during layer profiling.
+
+    Instead of ``sums[k] += float(tensor.cpu().item())`` (which stalls the GPU
+    on every expert × sample event), we keep a per-expert 0-dim tensor on the
+    same device as the forward and only transfer to CPU via
+    :meth:`finalize_layer`.
+    """
     sums: dict[tuple[int, int], float] = field(default_factory=lambda: defaultdict(float))
     counts: dict[tuple[int, int], int] = field(default_factory=lambda: defaultdict(int))
     freq: dict[tuple[int, int], int] = field(default_factory=lambda: defaultdict(int))
+    _gpu_sums: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
+
+    def add_gpu(self, key: tuple[int, int], contrib: torch.Tensor, n_tokens: int) -> None:
+        cur = self._gpu_sums.get(key)
+        if cur is None:
+            self._gpu_sums[key] = contrib.detach()
+        else:
+            cur.add_(contrib.detach())
+        self.counts[key] = self.counts.get(key, 0) + n_tokens
+        self.freq[key] = self.freq.get(key, 0) + n_tokens
+
+    def finalize_layer(self, layer_idx: int) -> None:
+        keys = [k for k in self._gpu_sums if k[0] == layer_idx]
+        for k in keys:
+            gpu = self._gpu_sums.pop(k)
+            self.sums[k] = self.sums.get(k, 0.0) + float(gpu.cpu().item())
+
+    def finalize_all(self) -> None:
+        layer_ids = {k[0] for k in self._gpu_sums}
+        for li in layer_ids:
+            self.finalize_layer(li)
 
     def score(self, layer_idx: int, expert_idx: int) -> float:
         k = (layer_idx, expert_idx)
         n = self.counts.get(k, 0)
         if n == 0:
             return 0.0
-        return self.sums[k] / n
+        return self.sums.get(k, 0.0) / n
 
 
 @dataclass
 class InputCovarianceAccumulator:
     """Per-(layer, expert, matrix_name) streaming covariance accumulator.
 
-    Storage optimizations (addresses review P0-3):
+    Two-tier storage:
+      * ``_gpu``: transient covariances for the *currently-hot layer* kept
+        resident on the forward's device. Summed in fp32 on GPU to avoid
+        CPU-sync on every expert × sample event.
+      * ``covariance``: CPU-resident final results, in ``storage_dtype``
+        (default bf16 for disk economy). Populated by :meth:`finalize_layer`
+        once per-layer profiling completes.
 
-    - Covariances are stored on CPU in ``torch.float32`` but **with gate_proj
-      and up_proj aliasing the same storage**: both share the same input
-      tensor inside ``Qwen3_5MoeExperts`` (x entering ``gate_up_proj``), so
-      we intern the tensor once and return it under both keys. Callers that
-      write via ``update`` with ``matrix_name="up_proj"`` when the same
-      ``(layer, expert)`` already has ``gate_proj`` data become no-ops.
+    Stage 2 drives profiling one layer at a time, so only one layer's worth
+    of per-expert GPU covariances is live simultaneously (≤ ~256 experts
+    × 2048×2048 fp32 ≈ 4.3 GB — fits well under an 80 GB A100).
 
-    - Entries are returned as fresh tensors on demand; internal storage uses
-      ``float32`` for numerical stability but can be lowered to ``bfloat16``
-      via ``set_storage_dtype`` when RAM pressure demands it (matters for
-      40-layer × 256-expert full runs where fp32 cov would be ~113 GB).
+    Aliasing: ``gate_proj`` and ``up_proj`` share input inside
+    ``Qwen3_5MoeExperts`` so writes with ``matrix_name="up_proj"`` are
+    ignored (``gate_proj`` already covers it, and :meth:`get` returns the
+    gate_proj entry for up_proj lookups).
     """
 
     covariance: dict[tuple[int, int, str], torch.Tensor] = field(default_factory=dict)
     token_count: dict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))
     storage_dtype: torch.dtype = torch.float32
-    _alias_gate_up: bool = True       # whether up_proj shares gate_proj storage
+    _alias_gate_up: bool = True
+    # GPU-resident transient storage, keyed the same way as ``covariance``.
+    _gpu: dict[tuple[int, int, str], torch.Tensor] = field(default_factory=dict)
+    _gpu_token_count: dict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))
 
     def set_storage_dtype(self, dtype: torch.dtype) -> None:
         self.storage_dtype = dtype
@@ -116,26 +167,49 @@ class InputCovarianceAccumulator:
     def update(
         self, layer_idx: int, expert_idx: int, matrix_name: str, x: torch.Tensor
     ) -> None:
-        # gate_proj and up_proj share input; let only gate_proj actually
-        # allocate storage and have get()/items() surface both keys.
+        """Accumulate xᵀx on the *same device as x*. No CPU sync here."""
         if self._alias_gate_up and matrix_name == "up_proj":
             return
-        flat = x.detach().reshape(-1, x.shape[-1]).to(torch.float32)
+        flat = x.detach().reshape(-1, x.shape[-1])
         if flat.numel() == 0:
             return
-        cov_full = flat.transpose(0, 1) @ flat
-        cov = cov_full.to(self.storage_dtype).cpu()
+        flat_f32 = flat.to(torch.float32)
+        cov = flat_f32.transpose(0, 1) @ flat_f32            # stays on GPU
         key = (layer_idx, expert_idx, matrix_name)
-        if key in self.covariance:
-            self.covariance[key] = (self.covariance[key].to(torch.float32) + cov.to(torch.float32)).to(self.storage_dtype)
+        cur = self._gpu.get(key)
+        if cur is None:
+            self._gpu[key] = cov
         else:
-            self.covariance[key] = cov
-        self.token_count[key] = self.token_count.get(key, 0) + flat.shape[0]
+            cur.add_(cov)
+        self._gpu_token_count[key] = self._gpu_token_count.get(key, 0) + flat.shape[0]
+
+    def finalize_layer(self, layer_idx: int) -> None:
+        """Move every covariance for ``layer_idx`` from GPU to CPU in
+        ``storage_dtype``. Call once after a layer's profile is done; the
+        per-expert GPU tensors are freed afterwards."""
+        keys = [k for k in self._gpu if k[0] == layer_idx]
+        for k in keys:
+            gpu_cov = self._gpu.pop(k)
+            cpu_cov = gpu_cov.to(self.storage_dtype).cpu()
+            prev = self.covariance.get(k)
+            if prev is None:
+                self.covariance[k] = cpu_cov
+            else:
+                self.covariance[k] = (
+                    prev.to(torch.float32) + cpu_cov.to(torch.float32)
+                ).to(self.storage_dtype)
+            self.token_count[k] = (
+                self.token_count.get(k, 0) + self._gpu_token_count.pop(k, 0)
+            )
+
+    def finalize_all(self) -> None:
+        """Move every GPU-resident covariance to CPU. Use when layers are
+        instrumented simultaneously (e.g. Stage 0) instead of one-at-a-time."""
+        layer_ids = {k[0] for k in self._gpu}
+        for li in layer_ids:
+            self.finalize_layer(li)
 
     def get(self, key: tuple[int, int, str]) -> torch.Tensor | None:
-        """Bank-aware accessor: returns gate_proj cov when asked for up_proj
-        under the alias policy, so callers do not need to know about the
-        sharing."""
         if key in self.covariance:
             return self.covariance[key]
         if self._alias_gate_up and key[2] == "up_proj":
@@ -156,7 +230,8 @@ def record_reap(
     gate_vals: torch.Tensor,
     expert_outs: torch.Tensor,
 ) -> None:
-    """``gate_vals`` [T], ``expert_outs`` [T, hidden]."""
+    """``gate_vals`` [T], ``expert_outs`` [T, hidden]. Accumulates on GPU —
+    the CPU transfer happens in :meth:`ReapAccumulator.finalize_layer`."""
     if gate_vals.numel() == 0:
         return
     leading = int(expert_outs.shape[0]) if expert_outs.dim() >= 2 else int(expert_outs.numel())
@@ -168,10 +243,7 @@ def record_reap(
         )
     norms = expert_outs.to(torch.float32).norm(dim=-1)
     contrib = (gate_vals.to(torch.float32) * norms).sum()
-    k = (layer_idx, expert_idx)
-    acc.sums[k] += float(contrib.detach().cpu().item())
-    acc.counts[k] += int(gate_vals.numel())
-    acc.freq[k] += int(gate_vals.numel())
+    acc.add_gpu((layer_idx, expert_idx), contrib, int(gate_vals.numel()))
 
 
 # ---------------------------------------------------------------------------

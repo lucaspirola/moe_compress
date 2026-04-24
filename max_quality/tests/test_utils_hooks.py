@@ -16,6 +16,7 @@ def test_down_proj_max_accumulator():
     acc.update(0, 3, torch.tensor([-7.0, 1.0, 2.0]))
     acc.update(0, 3, torch.tensor([0.5, 0.1]))          # smaller — should not override
     acc.update(0, 4, torch.tensor([0.2, 0.3]))
+    acc.finalize()                                      # drain GPU-resident tensors to CPU
     assert acc.per_expert_max[(0, 3)] == pytest.approx(7.0)
     assert acc.per_expert_max[(0, 4)] == pytest.approx(0.3)
 
@@ -34,6 +35,7 @@ def test_reap_scoring_accumulates_contribution():
     gate = torch.tensor([0.5, 0.25])
     outs = torch.tensor([[1.0, 0.0], [0.0, 2.0]])      # norms = [1.0, 2.0]
     record_reap(acc, 1, 7, gate, outs)
+    acc.finalize_layer(1)                               # drain GPU sums to CPU
     # contrib = 0.5*1.0 + 0.25*2.0 = 1.0
     assert acc.sums[(1, 7)] == pytest.approx(1.0)
     assert acc.counts[(1, 7)] == 2

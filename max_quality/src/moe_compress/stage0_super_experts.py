@@ -62,6 +62,7 @@ def run(
         for ref in moe_layers:
             stack.enter_context(instrument_experts(ref, {"down": down_cb}))
         run_calibration(model, batches, device=device)
+    acc.finalize()
 
     per_experts_by_layer = {ref.layer_idx: ref.num_routed_experts for ref in moe_layers}
     blacklist = _threshold_per_layer(
