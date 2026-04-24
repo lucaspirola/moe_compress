@@ -1,0 +1,139 @@
+# Strategy A — Qwen/Qwen3.6-35B-A3B — 30% total parameter reduction
+#
+# Single source of truth for pipeline hyperparameters. Every stage module reads
+# only the section(s) it owns. Do not add stage-specific flags outside these.
+
+model:
+  name_or_path: Qwen/Qwen3.6-35B-A3B
+  revision: main
+  torch_dtype: bfloat16
+  trust_remote_code: false        # transformers>=5.3 has native qwen3_5_moe
+  # For the 16 GB local smoke runs: switch these on in a sibling config.
+  load_in_4bit: false
+  device_map: auto                # uses accelerate; on A100 everything fits on 1 GPU
+  attn_implementation: sdpa       # DeltaNet layers ignore this; full_attention uses it
+
+target:
+  # Total parameter reduction (measured, not estimated) the pipeline must hit.
+  total_reduction_ratio: 0.30
+  # Initial split — solver will iterate until the measured reduction ≥ target.
+  initial_expert_reduction: 0.22
+  initial_svd_reduction: 0.11
+
+calibration:
+  dataset: allenai/c4
+  subset: en
+  split: train
+  seed: 1337
+  num_sequences: 1024
+  sequence_length: 2048
+  # Super-expert detection uses the first slice only.
+  super_expert_num_samples: 100
+  # Domain mix for generative tasks (Stages 2/5). 0:0.5:0.5 = C4:Math:Code
+  domain_mix:
+    c4: 0.0
+    math: 0.5
+    code: 0.5
+  math_dataset: hendrycks/competition_math
+  code_dataset: bigcode/the-stack-smol       # code slice; kept small
+
+stage0_super_experts:
+  zscore_threshold: 2.5           # blacklist expert if down_proj max > mean + 2.5σ
+  max_blacklisted_per_layer: 4    # paper observes 3-4 per layer on Qwen3
+  global_blacklist_cap_pct: 0.05  # hard cap: ≤ 5% of all experts
+
+stage1_grape:
+  similarity_metric: cosine       # one of: cosine | mse | cka
+  min_experts_per_layer: 64       # floor; Qwen3-30B (128 experts) uses 32, scale by 2x
+  early_layer_bonus: 8            # add +8 to layers 0..early_layer_bonus_depth
+  early_layer_bonus_depth: 4
+  include_shared_in_similarity: false
+  target_total_experts_per_layer_avg: 200  # initial; recomputed by solver
+
+stage2_reap_ream:
+  batch_size: 1
+  num_calibration_samples: 1024
+  reap_min_active_tokens: 32      # skip experts with < this activation count when scoring
+  ream:
+    gate_weight: 1.0              # weight on δ_gate in combined cost
+    expert_weight: 1.0            # weight on δ̃_expert
+    hungarian: true               # scipy.optimize.linear_sum_assignment
+    frequency_weighted_merge: true
+  sequential_recompute: true      # re-run fwd through 0..l before profiling l+1
+  per_layer_mse_sigma_threshold: 3.0   # bump budget +10% if layer exceeds this
+  per_layer_mse_bump_ratio: 0.10
+
+stage3_svd:
+  scope: moe_experts_only         # NEVER change; attention SVD is off-spec
+  d_rank:
+    parameter_cost_omega_mode: auto  # ω = d1 + n·d2 per paper
+  swift_svd_plus:
+    alpha_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    validation_samples: 512       # WikiText-2 slice for α selection
+    metric: wikitext2_ppl
+    per_group_type: true          # pick α separately for gate/up/down_proj
+  aa_svd:
+    use_post_prune_inputs: true   # B = pruned-model inputs; A = original
+  block_refine:
+    enabled: true
+    lbfgs_steps: 100
+    lbfgs_history: 10
+    per_block_loss: mse
+
+stage4_eora:
+  per_expert: true                # spec note: per-expert beats global on MoE
+  compensation_budget_pct: 0.03   # EoRA adds back ≤ 3% of Stage 3 savings
+  eigenspace_rank_cap: 64         # hard cap per matrix
+
+stage5_router_kd:
+  optimizer: adamw
+  learning_rate: 5.0e-5           # spec-corrected from 1e-5
+  epochs: 1
+  batch_size: 2
+  gradient_accumulation: 4
+  max_sequence_length: 512
+  kd_temperature: 1.0
+  max_calibration_samples: 3000
+  # Only router weights update. Enumerated paths are matched as substrings.
+  trainable_name_patterns:
+    - mlp.gate.weight
+    - mlp.gate.bias
+  frozen_name_patterns:
+    - experts
+    - shared_expert
+    - self_attn
+    - norm
+    - embed
+    - lm_head
+  enable_output_router_logits: true   # flipped on for teacher+student during KD
+
+stage6_validate:
+  wikitext2:
+    enabled: true
+    dataset: wikitext
+    subset: wikitext-2-raw-v1
+    split: test
+    sequence_length: 2048
+  zero_shot:
+    enabled: true
+    tasks: [arc_challenge, hellaswag]
+  generative:
+    enabled: true
+    humaneval:
+      num_samples_per_task: 1
+      max_new_tokens: 512
+    math500:
+      num_samples: 500
+      max_new_tokens: 1024
+  thresholds:
+    wikitext2_ppl_relative_max_increase: 0.03
+    arc_c_absolute_max_drop: 0.015
+    hellaswag_absolute_max_drop: 0.015
+    humaneval_absolute_max_drop: 0.03
+    math500_absolute_max_drop: 0.03
+    measured_reduction_min: 0.30
+
+logging:
+  level: INFO
+  log_every_n_steps: 50
+  save_intermediate_every_n_layers: 10
