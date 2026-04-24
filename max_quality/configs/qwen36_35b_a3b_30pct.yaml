@@ -21,21 +21,23 @@ target:
   initial_svd_reduction: 0.11
 
 calibration:
-  dataset: allenai/c4
-  subset: en
-  split: train
+  # Source: single multi-subset SFT dataset. Subset weights reflect the
+  # expected deployment mix (general chat-dominant, math/science heavy tails
+  # for reasoning, agent traces for tool-use coverage).
+  source: nvidia-cascade
+  dataset: nvidia/Nemotron-Cascade-2-SFT-Data
   seed: 1337
   num_sequences: 1024
   sequence_length: 2048
-  # Super-expert detection uses the first slice only.
   super_expert_num_samples: 100
-  # Domain mix for generative tasks (Stages 2/5). 0:0.5:0.5 = C4:Math:Code
-  domain_mix:
-    c4: 0.0
-    math: 0.5
-    code: 0.5
-  math_dataset: hendrycks/competition_math
-  code_dataset: bigcode/the-stack-smol       # code slice; kept small
+  subset_weights:
+    math: 0.21
+    science: 0.11
+    chat: 0.56
+    instruction_following: 0.033
+    conversational_agent: 0.0331
+    swe: 0.02
+    terminal_agent: 0.0331
 
 stage0_super_experts:
   zscore_threshold: 2.5           # blacklist expert if down_proj max > mean + 2.5σ

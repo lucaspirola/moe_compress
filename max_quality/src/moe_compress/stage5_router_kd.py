@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .utils.activation_hooks import capture_router_outputs
-from .utils.calibration import CalibrationSpec, build_calibration_tensor, iter_batches
+from .utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from .utils.model_io import (
     iter_moe_layers,
     load_json_artifact,
@@ -59,13 +59,11 @@ def run(
 
     _freeze_non_routers(student, s5["trainable_name_patterns"])
 
-    spec = CalibrationSpec(
-        num_sequences=s5["max_calibration_samples"],
-        sequence_length=s5["max_sequence_length"],
-        seed=cal["seed"] + 5,
-        domain_mix=cal["domain_mix"],
-        c4_dataset=cal["dataset"],
-        c4_subset=cal["subset"],
+    spec = spec_from_config(
+        cal,
+        num_sequences_override=s5["max_calibration_samples"],
+        sequence_length_override=s5["max_sequence_length"],
+        seed_offset=5,
     )
     calib = build_calibration_tensor(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache"

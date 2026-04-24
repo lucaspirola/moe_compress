@@ -20,7 +20,7 @@ from .utils.activation_hooks import (
     instrument_experts,
     run_calibration,
 )
-from .utils.calibration import CalibrationSpec, build_super_expert_slice, iter_batches
+from .utils.calibration import build_super_expert_slice, iter_batches, spec_from_config
 from .utils.model_io import iter_moe_layers, save_json_artifact
 
 log = logging.getLogger(__name__)
@@ -36,14 +36,7 @@ def run(
 ) -> Path:
     s0 = config["stage0_super_experts"]
     cal = config["calibration"]
-    spec = CalibrationSpec(
-        num_sequences=cal["num_sequences"],
-        sequence_length=cal["sequence_length"],
-        seed=cal["seed"],
-        domain_mix=cal["domain_mix"],
-        c4_dataset=cal["dataset"],
-        c4_subset=cal["subset"],
-    )
+    spec = spec_from_config(cal)
     calib = build_super_expert_slice(
         tokenizer, spec, num_samples=cal["super_expert_num_samples"],
         cache_dir=artifacts_dir / "_calibration_cache",

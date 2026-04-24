@@ -32,7 +32,7 @@ from .utils.activation_hooks import (
     record_reap,
     run_calibration,
 )
-from .utils.calibration import CalibrationSpec, build_calibration_tensor, iter_batches
+from .utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from .utils.model_io import (
     MATRIX_NAMES,
     MoELayerRef,
@@ -67,14 +67,7 @@ def run(
     blacklist_payload = load_json_artifact(artifacts_dir / "stage0_blacklist.json")
     blacklist = {int(k): list(v) for k, v in blacklist_payload.get("blacklist", {}).items()}
 
-    spec = CalibrationSpec(
-        num_sequences=s2["num_calibration_samples"],
-        sequence_length=cal["sequence_length"],
-        seed=cal["seed"],
-        domain_mix=cal["domain_mix"],
-        c4_dataset=cal["dataset"],
-        c4_subset=cal["subset"],
-    )
+    spec = spec_from_config(cal, num_sequences_override=s2["num_calibration_samples"])
     calib = build_calibration_tensor(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache"
     )

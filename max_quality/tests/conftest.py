@@ -184,6 +184,9 @@ def tiny_config():
             "initial_svd_reduction": 0.10,
         },
         "calibration": {
+            # Tests never hit the real loader (monkey-patched), but the
+            # spec_from_config parser requires these keys.
+            "source": "c4-math-code",
             "dataset": "allenai/c4", "subset": "en", "split": "train",
             "seed": 0, "num_sequences": 8, "sequence_length": 16,
             "super_expert_num_samples": 4,

@@ -33,7 +33,7 @@ from .utils.activation_hooks import (
     instrument_experts,
     run_calibration,
 )
-from .utils.calibration import CalibrationSpec, build_calibration_tensor, iter_batches
+from .utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from .utils.model_io import (
     MATRIX_NAMES,
     FactoredExperts,
@@ -76,13 +76,10 @@ def run(
     A_cov = _load_stage2_covariance(artifacts_dir / "_stage2_input_covariance.pt")
 
     # B covariance: fresh calibration through the already-pruned model.
-    spec = CalibrationSpec(
-        num_sequences=s3["swift_svd_plus"]["validation_samples"],
-        sequence_length=cal["sequence_length"],
-        seed=cal["seed"] + 2,
-        domain_mix=cal["domain_mix"],
-        c4_dataset=cal["dataset"],
-        c4_subset=cal["subset"],
+    spec = spec_from_config(
+        cal,
+        num_sequences_override=s3["swift_svd_plus"]["validation_samples"],
+        seed_offset=2,
     )
     calib = build_calibration_tensor(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache"
