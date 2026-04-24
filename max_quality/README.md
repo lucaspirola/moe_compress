@@ -44,6 +44,51 @@ pytest tests/ -v                         # synthetic MoE unit tests
 pytest tests/test_smoke_qwen3_0_5b.py    # end-to-end on a small MoE model
 ```
 
+## Run on Hugging Face Jobs (recommended)
+
+HF Jobs provisions an A100 on demand, runs the pipeline, then releases the GPU
+automatically when the script exits — no idle billing. Persistent state lives
+in a private HF bucket mounted at `/mnt/cache`.
+
+**One-time setup (done in commit 12e1fa0):**
+- Bucket `pirola/moe-cache` (holds HF snapshot cache + pipeline artifacts)
+- Dataset repo `pirola/moe-compress-code` (pipeline source, fetched by the job
+  on start)
+
+**Submit a run:**
+
+```bash
+./hf_jobs/submit.sh                      # default: a100-large, 30% target
+TARGET_RATIO=0.25 ./hf_jobs/submit.sh    # lighter compression
+FLAVOR=h200 ./hf_jobs/submit.sh          # faster, costs 2× more
+DETACH=1 ./hf_jobs/submit.sh             # return immediately; follow logs
+                                         # via `hf jobs logs $JOB_ID -f`
+```
+
+Cost at $2.50/h (a100-large) × ~2.75 h ≈ **$7 per run**, plus ~$2/month for
+the bucket. The GPU is released on any script exit (success, pipeline error,
+or `SIGTERM`), so there is no idle tail.
+
+**Before the first real run**, do a 10-minute CPU dry-run to confirm auth,
+mounts, and code delivery:
+
+```bash
+hf jobs uv run hf_jobs/dry_run.py \
+    --flavor cpu-basic --timeout 10m \
+    --volume hf://buckets/pirola/moe-cache:/mnt/cache \
+    --secrets HF_TOKEN \
+    --env CODE_REPO=pirola/moe-compress-code \
+    --env CACHE_MOUNT=/mnt/cache
+```
+
+**Results land at** `pirola/qwen3-6-35b-a3b-strategy-a-<pct>pct-<utc-timestamp>`
+(private model repo, auto-created). The final `stage5_final/` safetensors are
+uploaded as the main model; `stage*.json` per-stage artifacts land under
+`artifacts/`. Set `RESULT_REPO` to override the destination.
+
+**Re-runs are cheap**: the bucket retains the model snapshot (~70 GB) and the
+calibration token cache, so subsequent jobs skip those downloads.
+
 ## Protected components (never touched by pruning/SVD)
 
 - Shared expert at every MoE layer
