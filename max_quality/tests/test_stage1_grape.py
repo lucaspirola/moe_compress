@@ -1,4 +1,4 @@
-"""Stage 1 — GRAPE: redundancy ranking and budget allocation."""
+"""Stage 1 — GRAPE redundancy ranking on fused-experts fixture."""
 from __future__ import annotations
 
 import pytest
@@ -6,29 +6,33 @@ import torch
 
 from moe_compress import stage1_grape
 from moe_compress.budget.solver import BudgetDecomposition
+from moe_compress.utils.model_io import build_banks, iter_moe_layers
 
 
 def test_highly_redundant_layer_gets_smaller_budget(tiny_model, tiny_config, tmp_path):
-    # Make layer 0's experts near-identical (high redundancy) and layer 1's
-    # experts diverse. GRAPE should allocate fewer experts to layer 0.
+    # Make layer 0's experts near-identical (high redundancy) by copying the
+    # first expert's rows into the others directly on the fused tensors.
     with torch.no_grad():
-        base_expert = tiny_model.model.layers[0].mlp.experts[0]
-        for e in tiny_model.model.layers[0].mlp.experts[1:]:
-            for name in ("gate_proj", "up_proj", "down_proj"):
-                getattr(e, name).weight.copy_(
-                    getattr(base_expert, name).weight + 1e-4 * torch.randn_like(
-                        getattr(base_expert, name).weight
-                    )
-                )
-        for e in tiny_model.model.layers[1].mlp.experts:
-            for name in ("gate_proj", "up_proj", "down_proj"):
-                getattr(e, name).weight.copy_(torch.randn_like(getattr(e, name).weight))
+        for ref in iter_moe_layers(tiny_model):
+            banks = build_banks(ref)
+            if ref.layer_idx == 0:
+                W0 = banks["gate_proj"].get(0).clone()
+                Wu = banks["up_proj"].get(0).clone()
+                Wd = banks["down_proj"].get(0).clone()
+                for e in range(1, ref.num_routed_experts):
+                    banks["gate_proj"].set(e, W0 + 1e-4 * torch.randn_like(W0))
+                    banks["up_proj"].set(e, Wu + 1e-4 * torch.randn_like(Wu))
+                    banks["down_proj"].set(e, Wd + 1e-4 * torch.randn_like(Wd))
+            else:  # layer 1: randomize every expert
+                for e in range(ref.num_routed_experts):
+                    for name in ("gate_proj", "up_proj", "down_proj"):
+                        banks[name].set(e, torch.randn_like(banks[name].get(e)))
 
     decomp = BudgetDecomposition(
         total_reduction_ratio=0.20,
         expert_prune_ratio=0.25,
         svd_rank_ratio=0.0,
-        global_expert_budget=5,          # target: keep 5 of 8 total routed experts
+        global_expert_budget=5,
         min_experts_per_layer=2,
         blacklisted_experts={},
     )
@@ -38,5 +42,4 @@ def test_highly_redundant_layer_gets_smaller_budget(tiny_model, tiny_config, tmp
     out = json.loads((tmp_path / "stage1_budgets.json").read_text())
     budgets = {int(k): v for k, v in out["per_layer_target_experts"].items()}
     assert sum(budgets.values()) == 5
-    # Layer 0 (redundant) should get ≤ layer 1 (diverse).
     assert budgets[0] <= budgets[1]

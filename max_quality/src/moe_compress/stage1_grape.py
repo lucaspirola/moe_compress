@@ -1,18 +1,7 @@
-"""Stage 1 — GRAPE non-uniform per-layer expert budgets.
+"""Stage 1 — GRAPE non-uniform per-layer expert budgets (fused-experts-aware).
 
-Given a global expert budget ``B`` (surviving routed experts summed over
-layers), distribute it per layer using pairwise expert-weight redundancy:
-
-    D^l_{ij} = 1 - cos(w_i, w_j)     (or MSE / CKA per config)
-    R^l      = mean_{i≠j} D^l_{ij}
-    R̃^l     = (R^l - min R) / (max R - min R)
-    N'_l     = max(min_experts, round(B · (1 - R̃^l) / Σ_{l'} (1 - R̃^{l'})))
-    + early_layer_bonus if l < early_layer_bonus_depth
-
-``w_i`` is the flattened concatenation ``[gate_proj; up_proj; down_proj]``.
-Shared expert is excluded (per config flag).
-
-Artifact: ``stage1_budgets.json`` — ``{layer_idx: target_expert_count}``.
+Same math as before; only the weight-flattening step reads from
+``ExpertMatrixBank.get(e)`` instead of per-expert ``nn.Linear.weight``.
 """
 from __future__ import annotations
 
@@ -24,9 +13,9 @@ import torch
 
 from .budget.solver import BudgetDecomposition
 from .utils.model_io import (
-    get_expert_matrices,
+    MATRIX_NAMES,
+    build_banks,
     iter_moe_layers,
-    iter_routed_experts,
     save_json_artifact,
 )
 
@@ -46,21 +35,17 @@ def run(
     redundancies: dict[int, float] = {}
     for ref in moe_layers:
         D = _pairwise_distance_matrix(ref, metric=s1["similarity_metric"])
-        # Off-diagonal mean
         n = D.shape[0]
         if n <= 1:
             redundancies[ref.layer_idx] = 0.0
             continue
         off = (D.sum() - D.diag().sum()) / (n * (n - 1))
-        # Lower distance = more redundant → convert to "redundancy score" in [0,1]
-        redundancy = 1.0 - float(off.item())
-        redundancies[ref.layer_idx] = redundancy
-        log.debug("Layer %d redundancy=%.4f", ref.layer_idx, redundancy)
+        redundancies[ref.layer_idx] = 1.0 - float(off.item())
 
     budgets = _allocate_budgets(
         redundancies=redundancies,
         global_budget=decomposition.global_expert_budget,
-        per_layer_counts={ref.layer_idx: len(ref.experts) for ref in moe_layers},
+        per_layer_counts={ref.layer_idx: ref.num_routed_experts for ref in moe_layers},
         min_experts=s1["min_experts_per_layer"],
         blacklist=decomposition.blacklisted_experts,
         early_bonus=s1["early_layer_bonus"],
@@ -83,49 +68,34 @@ def run(
 
 
 def _pairwise_distance_matrix(layer_ref, *, metric: str) -> torch.Tensor:
-    """Compute a dense ``[N, N]`` distance matrix over routed experts."""
+    banks = build_banks(layer_ref)
     vecs: list[torch.Tensor] = []
-    for _, expert in iter_routed_experts(layer_ref):
-        mats = get_expert_matrices(expert)
-        parts = []
-        for name in ("gate_proj", "up_proj", "down_proj"):
-            if name in mats:
-                parts.append(mats[name].weight.detach().to(torch.float32).flatten())
-        if not parts:
-            continue
+    for e in range(layer_ref.num_routed_experts):
+        parts = [banks[name].get(e).detach().to(torch.float32).flatten()
+                 for name in MATRIX_NAMES]
         vecs.append(torch.cat(parts))
     if not vecs:
         return torch.zeros(0, 0)
-
-    W = torch.stack(vecs)                             # [N, P]  may be huge for 256 experts
+    W = torch.stack(vecs)
     if metric == "cosine":
         W = torch.nn.functional.normalize(W, dim=1)
-        sim = W @ W.transpose(0, 1)                   # [N, N] in [-1, 1]
-        # Distance in [0, 1] — same scale as MSE fallback.
+        sim = W @ W.transpose(0, 1)
         dist = (1.0 - sim).clamp(min=0.0, max=2.0) / 2.0
     elif metric == "mse":
-        # Batched pairwise: ||a - b||² = ||a||² + ||b||² - 2 a·b
         sq = (W * W).sum(dim=1)
         dot = W @ W.transpose(0, 1)
         dist = (sq[:, None] + sq[None, :] - 2 * dot).clamp(min=0.0)
-        dist = dist / (dist.max().clamp(min=1e-8))     # normalize to [0, 1]
+        dist = dist / (dist.max().clamp(min=1e-8))
     elif metric == "cka":
-        dist = _cka_distance(W)
+        n = W.size(0)
+        K = W @ W.transpose(0, 1)
+        H = torch.eye(n, device=W.device) - 1.0 / n
+        Kc = H @ K @ H
+        denom = torch.sqrt(Kc.diag().unsqueeze(0) * Kc.diag().unsqueeze(1)).clamp(min=1e-8)
+        dist = (1.0 - (Kc / denom)).clamp(min=0.0, max=1.0)
     else:
         raise ValueError(f"Unknown similarity metric: {metric}")
     return dist
-
-
-def _cka_distance(W: torch.Tensor) -> torch.Tensor:
-    """Approximate linear CKA distance on flattened weights."""
-    n = W.size(0)
-    K = W @ W.transpose(0, 1)                         # [N, N] Gram
-    # Center gram
-    H = torch.eye(n, device=W.device) - 1.0 / n
-    Kc = H @ K @ H
-    denom = torch.sqrt(Kc.diag().unsqueeze(0) * Kc.diag().unsqueeze(1)).clamp(min=1e-8)
-    cka = Kc / denom
-    return (1.0 - cka).clamp(min=0.0, max=1.0)
 
 
 def _allocate_budgets(
@@ -138,8 +108,6 @@ def _allocate_budgets(
     early_bonus: int,
     early_bonus_depth: int,
 ) -> dict[int, int]:
-    """Convert redundancy scores into per-layer target experts."""
-    # Normalize redundancy across layers
     vals = np.array([redundancies[li] for li in sorted(redundancies)])
     if vals.max() > vals.min():
         r_tilde = (vals - vals.min()) / (vals.max() - vals.min())
@@ -154,12 +122,10 @@ def _allocate_budgets(
         proto = global_budget * (inv[idx] / total_inv)
         if li < early_bonus_depth:
             proto += early_bonus
-        # Protect at least (min_experts + blacklist), but never exceed layer size
         floor = max(min_experts, len(blacklist.get(li, [])))
         ceil = per_layer_counts[li]
         budgets[li] = int(min(ceil, max(floor, round(proto))))
 
-    # If rounding pushed us off the global budget, rebalance greedily by redundancy.
     diff = global_budget - sum(budgets.values())
     if diff != 0:
         order = sorted(sorted_ids, key=lambda l: inv[sorted_ids.index(l)], reverse=(diff > 0))

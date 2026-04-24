@@ -27,8 +27,12 @@ Either way the script returns and the HF Jobs runtime releases the GPU.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "torch>=2.5.0",
-#     "transformers>=4.48.0",
+#     # HF Jobs a100-large (and most GPU flavors as of 2026-04) run NVIDIA
+#     # drivers at CUDA 12.9. torch 2.11+ is linked against CUDA 13 and will
+#     # fall back to CPU silently on those hosts — we cap below 2.11 so UV
+#     # resolves a cu124/cu126 wheel. Revisit after HF upgrades drivers.
+#     "torch>=2.5.0,<2.11.0",
+#     "transformers>=4.57.0",
 #     "accelerate>=1.0.0",
 #     "datasets>=3.0.0",
 #     "safetensors>=0.4.5",
@@ -158,18 +162,28 @@ def _sanity_check() -> None:
             f"Expected bucket mount at {CACHE_MOUNT}. Pass --volume "
             "pirola/moe-cache:/mnt/cache to `hf jobs run`."
         )
-    # Surface GPU availability early.
-    try:
-        import torch
-        LOG.info(
-            "torch=%s cuda=%s devices=%d%s",
-            torch.__version__,
-            torch.cuda.is_available(),
-            torch.cuda.device_count(),
-            f" [{torch.cuda.get_device_name(0)}]" if torch.cuda.is_available() else "",
+    # Surface GPU availability early — HARD FAIL if CUDA isn't usable.
+    # Running the 35 B pipeline on CPU is a multi-hour waste (silent OOM in
+    # practice), so we'd rather pay $0.05 for a fast crash than $3 for a
+    # mid-run cancellation.
+    import torch
+    avail = torch.cuda.is_available()
+    LOG.info(
+        "torch=%s torch.cuda=%s avail=%s device_count=%d%s",
+        torch.__version__,
+        getattr(torch.version, "cuda", "?"),
+        avail,
+        torch.cuda.device_count(),
+        f" [{torch.cuda.get_device_name(0)}]" if avail else "",
+    )
+    if not avail:
+        raise RuntimeError(
+            "torch.cuda.is_available() is False on this job — refusing to "
+            "run the compression pipeline on CPU. Most likely the PEP 723 "
+            "torch pin resolved to a CUDA-toolkit version newer than the "
+            "host driver. Check the 'CUDA initialization' warning above. "
+            "Tighten the torch pin in hf_jobs/entrypoint.py and re-submit."
         )
-    except Exception as err:                     # noqa: BLE001
-        LOG.warning("torch import sanity check failed: %s", err)
 
 
 def _download_code(repo_id: str, dest: Path) -> None:

@@ -54,6 +54,7 @@ stage2_reap_ream:
   batch_size: 1
   num_calibration_samples: 1024
   reap_min_active_tokens: 32      # skip experts with < this activation count when scoring
+  covariance_storage_dtype: bfloat16  # "float32" or "bfloat16" — bf16 halves on-disk cov size
   ream:
     gate_weight: 1.0              # weight on δ_gate in combined cost
     expert_weight: 1.0            # weight on δ̃_expert

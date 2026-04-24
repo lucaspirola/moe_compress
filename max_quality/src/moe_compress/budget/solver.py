@@ -25,7 +25,6 @@ from ..utils.model_io import (
     count_expert_parameters,
     count_parameters,
     iter_moe_layers,
-    iter_routed_experts,
 )
 
 log = logging.getLogger(__name__)
@@ -64,9 +63,7 @@ class BudgetDecomposition:
 
 
 def _count_experts_by_layer(model: nn.Module) -> dict[int, int]:
-    return {
-        ref.layer_idx: len(list(iter_routed_experts(ref))) for ref in iter_moe_layers(model)
-    }
+    return {ref.layer_idx: ref.num_routed_experts for ref in iter_moe_layers(model)}
 
 
 def solve(

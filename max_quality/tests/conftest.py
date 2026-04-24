@@ -1,9 +1,14 @@
-"""Test fixtures for the MoE compression pipeline.
+"""Test fixtures: synthetic MoE that mirrors Qwen3_5Moe's fused layout.
 
-The main fixture builds a tiny synthetic MoE model (2 layers × 4 routed
-experts × 1 shared expert, hidden=16, intermediate=8) that mirrors the
-module structure Qwen3_5MoeSparseMoeBlock exposes. That lets us exercise
-Stages 0–3 without downloading the real 35 B checkpoint.
+The pipeline targets fused experts — a single ``nn.Module`` per layer owns
+all expert weights as stacked tensors. The fixture replicates that exactly:
+``mlp.experts`` is a ``_TinyFusedExperts`` with ``gate_up_proj`` and
+``down_proj`` parameters shaped ``[num_experts, 2·d_int, d_hid]`` and
+``[num_experts, d_hid, d_int]`` respectively.
+
+The fixture's forward implements the same sparse per-expert loop as the
+reference ``Qwen3_5MoeExperts.forward`` so ``instrument_experts`` callbacks
+fire with shapes that match the real model.
 """
 from __future__ import annotations
 
@@ -13,20 +18,66 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-# Make the `src/` tree importable without an editable install.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
-class _TinyExpert(nn.Module):
-    def __init__(self, hidden: int, intermediate: int):
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden, intermediate, bias=False)
-        self.up_proj = nn.Linear(hidden, intermediate, bias=False)
-        self.down_proj = nn.Linear(intermediate, hidden, bias=False)
+# ---------------------------------------------------------------------------
+# Synthetic fused-experts module (structural twin of Qwen3_5MoeExperts)
+# ---------------------------------------------------------------------------
 
-    def forward(self, x):
-        return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+
+class _TinyFusedExperts(nn.Module):
+    def __init__(self, num_experts: int, hidden: int, intermediate: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.hidden_dim = hidden
+        self.intermediate_dim = intermediate
+        self.gate_up_proj = nn.Parameter(
+            torch.randn(num_experts, 2 * intermediate, hidden) * 0.02
+        )
+        self.down_proj = nn.Parameter(
+            torch.randn(num_experts, hidden, intermediate) * 0.02
+        )
+        self.act_fn = nn.SiLU()
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        final = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+            hit = (mask.sum(dim=(-1, -2)) > 0).nonzero()
+        for e_idx in hit:
+            e = e_idx[0]
+            if e == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(mask[e])
+            sel = hidden_states[token_idx]
+            gate_up = F.linear(sel, self.gate_up_proj[e])
+            gate, up = gate_up.chunk(2, dim=-1)
+            intermediate = self.act_fn(gate) * up
+            down = F.linear(intermediate, self.down_proj[e])
+            down = down * top_k_weights[token_idx, top_k_pos, None]
+            final.index_add_(0, token_idx, down.to(final.dtype))
+        return final
+
+
+class _TinyRouter(nn.Module):
+    def __init__(self, num_experts: int, hidden: int, top_k: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.hidden_dim = hidden
+        self.top_k = top_k
+        self.weight = nn.Parameter(torch.randn(num_experts, hidden) * 0.02)
+
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        logits = F.linear(hidden_states, self.weight)
+        probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+        topv, topi = torch.topk(probs, self.top_k, dim=-1)
+        topv = topv / topv.sum(dim=-1, keepdim=True)
+        topv = topv.to(logits.dtype)
+        return logits, topv, topi
 
 
 class _TinyMoEBlock(nn.Module):
@@ -34,33 +85,25 @@ class _TinyMoEBlock(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        self.gate = nn.Linear(hidden, num_experts, bias=False)
-        self.experts = nn.ModuleList([
-            _TinyExpert(hidden, intermediate) for _ in range(num_experts)
-        ])
-        self.shared_expert = _TinyExpert(hidden, intermediate)
+        self.gate = _TinyRouter(num_experts, hidden, top_k)
+        self.experts = _TinyFusedExperts(num_experts, hidden, intermediate)
+        # Minimal shared expert (unfused, protected).
+        self.shared_expert = nn.Sequential()
+        self.shared_expert.gate_proj = nn.Linear(hidden, intermediate, bias=False)
+        self.shared_expert.up_proj = nn.Linear(hidden, intermediate, bias=False)
+        self.shared_expert.down_proj = nn.Linear(intermediate, hidden, bias=False)
+        self.shared_expert_gate = nn.Linear(hidden, 1, bias=False)
 
     def forward(self, x):
-        logits = self.gate(x)
-        topk_vals, topk_idx = logits.softmax(dim=-1).topk(self.top_k, dim=-1)
-        out = torch.zeros_like(x)
-        for e_idx, expert in enumerate(self.experts):
-            mask = (topk_idx == e_idx)                      # [B, T, k]
-            if not mask.any():
-                continue
-            tok_mask = mask.any(dim=-1)                     # [B, T]
-            selected = x[tok_mask]                          # [N, hidden]
-            if selected.numel() == 0:
-                continue
-            # Per-token gate weight = sum of gate vals over the slots where
-            # this token picked expert e_idx (typically 0 or 1 per top-k).
-            w = (topk_vals * mask.to(topk_vals.dtype)).sum(dim=-1)[tok_mask]
-            out[tok_mask] = out[tok_mask] + expert(selected) * w.unsqueeze(-1)
-        return out + self.shared_expert(x)
+        B, T, H = x.shape
+        flat = x.reshape(-1, H)
+        _, weights, indices = self.gate(flat)
+        exp_out = self.experts(flat, indices, weights)
+        return exp_out.reshape(B, T, H)
 
 
 class _TinyLayer(nn.Module):
-    def __init__(self, hidden: int, intermediate: int, num_experts: int, top_k: int):
+    def __init__(self, hidden, intermediate, num_experts, top_k):
         super().__init__()
         self.mlp = _TinyMoEBlock(hidden, intermediate, num_experts, top_k)
 
@@ -69,8 +112,7 @@ class _TinyLayer(nn.Module):
 
 
 class _TinyTower(nn.Module):
-    def __init__(self, num_layers: int, hidden: int, intermediate: int,
-                 num_experts: int, top_k: int):
+    def __init__(self, num_layers, hidden, intermediate, num_experts, top_k):
         super().__init__()
         self.layers = nn.ModuleList([
             _TinyLayer(hidden, intermediate, num_experts, top_k)
@@ -79,41 +121,36 @@ class _TinyTower(nn.Module):
 
 
 class _TinyConfig:
-    def __init__(self, num_experts: int, num_layers: int):
+    def __init__(self, num_experts, num_layers, hidden, intermediate, top_k):
         self.num_hidden_layers = num_layers
         self.layer_types = ["full_attention"] * num_layers
         self.num_experts = num_experts
+        self.num_experts_per_tok = top_k
+        self.hidden_size = hidden
+        self.moe_intermediate_size = intermediate
         self.text_config = self
 
 
 class _TinyModel(nn.Module):
     def __init__(
-        self,
-        *,
-        hidden: int = 16,
-        intermediate: int = 8,
-        num_layers: int = 2,
-        num_experts: int = 4,
-        top_k: int = 2,
+        self, *,
+        hidden: int = 16, intermediate: int = 8,
+        num_layers: int = 2, num_experts: int = 4, top_k: int = 2,
     ):
         super().__init__()
         self.embed = nn.Embedding(32, hidden)
         self.model = _TinyTower(num_layers, hidden, intermediate, num_experts, top_k)
         self.lm_head = nn.Linear(hidden, 32, bias=False)
-        self.config = _TinyConfig(num_experts, num_layers)
+        self.config = _TinyConfig(num_experts, num_layers, hidden, intermediate, top_k)
 
-    def forward(self, input_ids=None, labels=None, output_router_logits=False, **_ignored):
+    def forward(self, input_ids=None, labels=None, **_ignored):
         x = self.embed(input_ids)
-        rls: list[torch.Tensor] = []
         for layer in self.model.layers:
-            # Capture router logits as a side effect.
-            if output_router_logits:
-                rls.append(layer.mlp.gate(x))
             x = layer(x)
         logits = self.lm_head(x)
         loss = None
         if labels is not None:
-            loss = nn.functional.cross_entropy(
+            loss = F.cross_entropy(
                 logits[..., :-1, :].reshape(-1, logits.shape[-1]),
                 labels[..., 1:].reshape(-1),
                 ignore_index=-100,
@@ -123,7 +160,6 @@ class _TinyModel(nn.Module):
         out = _Out()
         out.logits = logits
         out.loss = loss
-        out.router_logits = rls if output_router_logits else None
         return out
 
 
@@ -137,13 +173,10 @@ def tiny_model():
 def tiny_config():
     return {
         "model": {
-            "name_or_path": "tiny",
-            "revision": "main",
-            "torch_dtype": "float32",
-            "device_map": "cpu",
+            "name_or_path": "tiny", "revision": "main",
+            "torch_dtype": "float32", "device_map": "cpu",
             "attn_implementation": "sdpa",
-            "load_in_4bit": False,
-            "trust_remote_code": False,
+            "load_in_4bit": False, "trust_remote_code": False,
         },
         "target": {
             "total_reduction_ratio": 0.25,
@@ -151,39 +184,30 @@ def tiny_config():
             "initial_svd_reduction": 0.10,
         },
         "calibration": {
-            "dataset": "allenai/c4",
-            "subset": "en",
-            "split": "train",
-            "seed": 0,
-            "num_sequences": 8,
-            "sequence_length": 16,
+            "dataset": "allenai/c4", "subset": "en", "split": "train",
+            "seed": 0, "num_sequences": 8, "sequence_length": 16,
             "super_expert_num_samples": 4,
             "domain_mix": {"c4": 1.0, "math": 0.0, "code": 0.0},
-            "math_dataset": "unused",
-            "code_dataset": "unused",
+            "math_dataset": "unused", "code_dataset": "unused",
         },
         "stage0_super_experts": {
-            "zscore_threshold": 1.0,
-            "max_blacklisted_per_layer": 1,
+            "zscore_threshold": 1.0, "max_blacklisted_per_layer": 1,
             "global_blacklist_cap_pct": 0.50,
         },
         "stage1_grape": {
-            "similarity_metric": "cosine",
-            "min_experts_per_layer": 2,
-            "early_layer_bonus": 0,
-            "early_layer_bonus_depth": 0,
+            "similarity_metric": "cosine", "min_experts_per_layer": 2,
+            "early_layer_bonus": 0, "early_layer_bonus_depth": 0,
             "include_shared_in_similarity": False,
             "target_total_experts_per_layer_avg": 3,
         },
         "stage2_reap_ream": {
-            "batch_size": 1,
-            "num_calibration_samples": 4,
+            "batch_size": 1, "num_calibration_samples": 4,
             "reap_min_active_tokens": 1,
+            "covariance_storage_dtype": "float32",
+
             "ream": {
-                "gate_weight": 1.0,
-                "expert_weight": 1.0,
-                "hungarian": True,
-                "frequency_weighted_merge": True,
+                "gate_weight": 1.0, "expert_weight": 1.0,
+                "hungarian": True, "frequency_weighted_merge": True,
             },
             "sequential_recompute": True,
             "per_layer_mse_sigma_threshold": 3.0,
@@ -193,36 +217,30 @@ def tiny_config():
             "scope": "moe_experts_only",
             "d_rank": {"parameter_cost_omega_mode": "auto"},
             "swift_svd_plus": {
-                "alpha_grid": [0.5],
-                "validation_samples": 2,
-                "metric": "wikitext2_ppl",
-                "per_group_type": True,
+                "alpha_grid": [0.5], "validation_samples": 2,
+                "metric": "wikitext2_ppl", "per_group_type": True,
             },
             "aa_svd": {"use_post_prune_inputs": True},
-            "block_refine": {"enabled": False, "lbfgs_steps": 5, "lbfgs_history": 2,
-                             "per_block_loss": "mse"},
+            "block_refine": {"enabled": False, "lbfgs_steps": 5,
+                             "lbfgs_history": 2, "per_block_loss": "mse"},
         },
         "stage4_eora": {
-            "per_expert": True,
-            "compensation_budget_pct": 0.03,
+            "per_expert": True, "compensation_budget_pct": 0.03,
             "eigenspace_rank_cap": 4,
         },
         "stage5_router_kd": {
-            "optimizer": "adamw",
-            "learning_rate": 5.0e-5,
-            "epochs": 1,
-            "batch_size": 1,
-            "gradient_accumulation": 1,
-            "max_sequence_length": 16,
-            "kd_temperature": 1.0,
+            "optimizer": "adamw", "learning_rate": 5.0e-5, "epochs": 1,
+            "batch_size": 1, "gradient_accumulation": 1,
+            "max_sequence_length": 16, "kd_temperature": 1.0,
             "max_calibration_samples": 4,
             "trainable_name_patterns": ["mlp.gate.weight"],
             "frozen_name_patterns": ["experts", "shared_expert", "embed", "lm_head"],
             "enable_output_router_logits": True,
         },
         "stage6_validate": {
-            "wikitext2": {"enabled": False, "dataset": "wikitext", "subset": "wikitext-2-raw-v1",
-                          "split": "test", "sequence_length": 16},
+            "wikitext2": {"enabled": False, "dataset": "wikitext",
+                          "subset": "wikitext-2-raw-v1", "split": "test",
+                          "sequence_length": 16},
             "zero_shot": {"enabled": False, "tasks": []},
             "generative": {"enabled": False},
             "thresholds": {
