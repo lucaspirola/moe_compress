@@ -14,7 +14,7 @@
 set -euo pipefail
 
 FLAVOR="${FLAVOR:-a100-large}"
-TIMEOUT="${TIMEOUT:-5h}"
+TIMEOUT="${TIMEOUT:-8h}"
 CODE_REPO="${CODE_REPO:-pirola/moe-compress-code}"
 MODEL_REPO="${MODEL_REPO:-Qwen/Qwen3.6-35B-A3B}"
 RESULT_REPO="${RESULT_REPO:-}"
