@@ -348,13 +348,23 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
 
     def _stage(src: Path, name: str) -> None:
         target = aux_stage / "artifacts" / name
-        if target.exists():
+        if target.exists() or target.is_symlink():
             return
-        # Hardlink first (zero copy on same fs), fall back to copy on failure.
+        # Try symlink first (zero copy, works on FUSE mounts), then hardlink
+        # (zero copy, same-fs only), then full copy as last resort. The 5–20 GB
+        # sidecars (covariance, originals) make a real copy expensive on FUSE.
+        src_abs = src.resolve()
         try:
-            os.link(src, target)
+            os.symlink(src_abs, target)
+            return
         except OSError:
-            shutil.copy2(src, target)
+            pass
+        try:
+            os.link(src_abs, target)
+            return
+        except OSError:
+            pass
+        shutil.copy2(src_abs, target)
 
     staged_count = 0
     for name in aux_files:
@@ -363,9 +373,12 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
             continue
         _stage(p, name)
         staged_count += 1
-    # merge_map sits inside stage2_pruned — stage it under artifacts/ too.
+    # merge_map sits inside stage2_pruned. When stage2_pruned IS the final_dir
+    # being uploaded to repo root, it already lands there — skip the duplicate
+    # staging under artifacts/. Otherwise (success path, final_dir = stage5_final
+    # etc.) we do need it under artifacts/.
     mm = artifacts_dir / "stage2_pruned" / "merge_map.json"
-    if mm.exists():
+    if mm.exists() and final_dir.name != "stage2_pruned":
         _stage(mm, "merge_map.json")
         staged_count += 1
 
@@ -376,6 +389,9 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
             repo_id=repo_id,
             repo_type="model",
         )
+
+    # P2-2: clean up the staging dir so the bucket doesn't retain stale links.
+    shutil.rmtree(aux_stage, ignore_errors=True)
 
     # A small status file makes it trivial to grep across runs.
     status_path = artifacts_dir / "_job_status.txt"
