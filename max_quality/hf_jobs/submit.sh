@@ -25,6 +25,7 @@ ENTRYPOINT="$(cd "$(dirname "$0")" && pwd)/entrypoint.py"
 DETACH="${DETACH:-0}"
 RESUME_FROM_STAGE="${RESUME_FROM_STAGE:-0}"
 STOP_AFTER_STAGE="${STOP_AFTER_STAGE:-6}"
+PRIOR_STAGE_REPO="${PRIOR_STAGE_REPO:-}"
 
 if [[ ! -f "$ENTRYPOINT" ]]; then
     echo "entrypoint.py not found at $ENTRYPOINT" >&2
@@ -44,6 +45,7 @@ echo "    model repo   : $MODEL_REPO"
 echo "    target ratio : $TARGET_RATIO"
 echo "    resume from  : stage $RESUME_FROM_STAGE"
 echo "    stop after   : stage $STOP_AFTER_STAGE"
+echo "    prior repo   : ${PRIOR_STAGE_REPO:-<none>}"
 echo "    bucket mount : $BUCKET → $MOUNT"
 echo "    result repo  : ${RESULT_REPO:-<auto: pirola/qwen3-6-35b-a3b-strategy-a-<pct>pct[-stopN]-<ts>>}"
 echo
@@ -61,5 +63,6 @@ exec hf jobs uv run "$ENTRYPOINT" \
     --env "CONFIG_PATH=configs/qwen36_35b_a3b_30pct.yaml" \
     --env "RESUME_FROM_STAGE=$RESUME_FROM_STAGE" \
     --env "STOP_AFTER_STAGE=$STOP_AFTER_STAGE" \
+    --env "PRIOR_STAGE_REPO=$PRIOR_STAGE_REPO" \
     --env "PYTORCH_ALLOC_CONF=expandable_segments:True" \
     $DETACH_FLAG

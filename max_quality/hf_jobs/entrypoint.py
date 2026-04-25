@@ -77,6 +77,11 @@ CONFIG_PATH      = os.environ.get("CONFIG_PATH",     "configs/qwen36_35b_a3b_30p
 RESUME_FROM      = int(os.environ.get("RESUME_FROM_STAGE", "0"))
 STOP_AFTER       = int(os.environ.get("STOP_AFTER_STAGE",  "6"))
 UPLOAD_ON_STOP   = os.environ.get("UPLOAD_ON_STOP", "1") not in ("0", "false", "False")
+# When resuming from stage 3+, the bucket may have a partial/missing prior
+# checkpoint. Set PRIOR_STAGE_REPO to the HF model repo (e.g.
+# "pirola/qwen3-6-35b-a3b-strategy-a-30pct-stop2-...") to download it into
+# artifacts/stage2_pruned/ before the pipeline starts.
+PRIOR_STAGE_REPO = os.environ.get("PRIOR_STAGE_REPO", "")
 
 
 def _main() -> int:
@@ -110,6 +115,12 @@ def _main() -> int:
     from huggingface_hub import snapshot_download
     LOG.info("Ensuring model snapshot is resident at %s", hf_home / "hub")
     snapshot_download(MODEL_REPO, cache_dir=hf_home / "hub", allow_patterns=["*"])
+
+    # 2b. If resuming from stage 3+ and the bucket checkpoint is stale/partial,
+    #     download the full prior-stage checkpoint from PRIOR_STAGE_REPO into the
+    #     artifacts directory so run_pipeline can find it at artifacts/stage2_pruned/.
+    if PRIOR_STAGE_REPO and RESUME_FROM >= 3:
+        _restore_prior_checkpoint(PRIOR_STAGE_REPO, artifacts_dir)
 
     # 3. Run the pipeline.
     result_repo = RESULT_REPO or _default_result_repo()
@@ -186,6 +197,35 @@ def _sanity_check() -> None:
         )
 
 
+def _restore_prior_checkpoint(repo_id: str, artifacts_dir: Path) -> None:
+    """Download a prior-stage HF model repo into artifacts/stage2_pruned/.
+
+    This is used when RESUME_FROM_STAGE >= 3 and the bucket artifact is stale
+    or incomplete (e.g. the stage 2 job saved a partial checkpoint to the bucket
+    but uploaded the full model to Hub).
+
+    The destination dir name is always ``stage2_pruned`` — the standard path that
+    ``run_pipeline._load_for_stage(3)`` looks for.
+    """
+    from huggingface_hub import snapshot_download
+    dest = artifacts_dir / "stage2_pruned"
+    dest.mkdir(parents=True, exist_ok=True)
+    # Check if the checkpoint is already complete (has index + both shards).
+    index = dest / "model.safetensors.index.json"
+    meta  = dest / "compressed_metadata.json"
+    if index.exists() and meta.exists():
+        LOG.info("stage2_pruned already complete at %s — skipping download", dest)
+        return
+    LOG.info("Downloading prior-stage checkpoint from %s → %s", repo_id, dest)
+    snapshot_download(
+        repo_id,
+        repo_type="model",
+        local_dir=str(dest),
+        ignore_patterns=["*.metadata", "job_status.txt", "artifacts/*"],
+    )
+    LOG.info("Prior-stage checkpoint ready at %s", dest)
+
+
 def _download_code(repo_id: str, dest: Path) -> None:
     """Clone-equivalent: fresh snapshot every job start so we don't run stale code."""
     from huggingface_hub import snapshot_download
@@ -258,6 +298,7 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
         "stage2_layer_mse.json",
         "budget_decomposition.json",
         "stage6_eval.json",
+        "_stage2_input_covariance.pt",   # needed for Stage 3 AA-SVD on resume
     ]
     for name in aux_files:
         p = artifacts_dir / name

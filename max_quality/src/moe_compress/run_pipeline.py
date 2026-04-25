@@ -38,7 +38,7 @@ from . import (
     stage5_router_kd,
     stage6_validate,
 )
-from .utils.model_io import load_json_artifact, load_model
+from .utils.model_io import load_json_artifact, load_model, load_compressed_model
 
 log = logging.getLogger(__name__)
 
@@ -228,10 +228,10 @@ def _validate_config(config: dict) -> None:
 def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
     """Load the model + tokenizer appropriate for starting at ``stage``.
 
-    Stages 0-2 load the original pretrained model. Stages 3-6 require the
-    in-memory state from earlier stages; resume from those is not supported
-    by `from_pretrained` because of `_FactoredLinear` + per-layer-variable
-    `num_experts` (review bug #2/#3).
+    Stages 0-2 load the original pretrained model.
+    Stages 3-6 load the previous stage's compressed checkpoint via
+    ``load_compressed_model`` which handles both pruned (Qwen3_5MoeExperts)
+    and factored (FactoredExperts) layouts.
     """
     if stage <= 2:
         return load_model(
@@ -243,12 +243,22 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
             load_in_4bit=config["model"].get("load_in_4bit", False),
             trust_remote_code=config["model"].get("trust_remote_code", False),
         )
-    raise RuntimeError(
-        f"--resume-from-stage={stage} is not supported in this pipeline version. "
-        "Re-run from Stage 0 (cheap Stages 0-1 re-use cached calibration) or "
-        "implement a custom `load_pipeline_checkpoint` that reconstructs "
-        "_FactoredLinear submodules from saved state_dicts."
+    # Stages 3+: load the checkpoint produced by the preceding stage.
+    prev_dir_name = STAGE_REGISTRY[stage][1]
+    prev_path = artifacts_dir / prev_dir_name
+    if not prev_path.exists():
+        raise FileNotFoundError(
+            f"Cannot resume from stage {stage}: expected checkpoint at {prev_path}. "
+            "Run the preceding stages first."
+        )
+    log.info("Loading stage %d input from %s", stage, prev_path)
+    model, tokenizer, _ = load_compressed_model(
+        prev_path,
+        device_map=config["model"]["device_map"],
+        torch_dtype=config["model"]["torch_dtype"],
+        attn_implementation=config["model"]["attn_implementation"],
     )
+    return model, tokenizer
 
 
 def _load_from_dir(path: Path, config: dict):
