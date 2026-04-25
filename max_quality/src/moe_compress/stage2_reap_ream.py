@@ -87,6 +87,7 @@ def run(
             k + 1, len(moe_layers), layer_ref.layer_idx, target,
         )
         reap_acc = ReapAccumulator()
+        torch.cuda.empty_cache()   # release fragmented reserved-but-unallocated memory before forward pass
         _profile_layer(
             model, layer_ref, batches, reap_acc, cov_acc,
             device=device,

@@ -61,4 +61,5 @@ exec hf jobs uv run "$ENTRYPOINT" \
     --env "CONFIG_PATH=configs/qwen36_35b_a3b_30pct.yaml" \
     --env "RESUME_FROM_STAGE=$RESUME_FROM_STAGE" \
     --env "STOP_AFTER_STAGE=$STOP_AFTER_STAGE" \
+    --env "PYTORCH_ALLOC_CONF=expandable_segments:True" \
     $DETACH_FLAG

@@ -53,7 +53,7 @@ stage1_grape:
   target_total_experts_per_layer_avg: 200  # initial; recomputed by solver
 
 stage2_reap_ream:
-  batch_size: 8                    # 80GB A100 at the edge; fall back to 6 or 4 if first layer OOMs
+  batch_size: 4                    # 80GB A100: batch=8 OOMs (73.88/79.25 GB used by model), batch=4 needs ~3.8 GB peak
   num_calibration_samples: 1024
   reap_min_active_tokens: 32      # skip experts with < this activation count when scoring
   covariance_storage_dtype: bfloat16  # "float32" or "bfloat16" — bf16 halves on-disk cov size
