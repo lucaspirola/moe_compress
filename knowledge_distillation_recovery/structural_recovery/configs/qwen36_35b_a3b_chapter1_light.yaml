@@ -1,23 +1,29 @@
 # Chapter 1 — Light tier (~1.8B tokens, ~6h on a100x4, ~$60)
 #
 # Logit-only forward KLD recovery for the Strategy A compressed model.
-# Stack: FP8 teacher (sharded under ZeRO-3 via HfDeepSpeedConfig) +
+# Stack: BF16 teacher (sharded under ZeRO-3 via HfDeepSpeedConfig) +
 # DeepSpeedCPUAdam (optim states on CPU host RAM) + grad checkpointing +
 # DeepSpeed ZeRO-3 sharding of student weights/grads.
 #
+# Teacher precision: BF16, NOT FP8. A100 has no FP8 tensor cores
+# (Hopper-only); loading the FP8 checkpoint on A100 would either fail or
+# dequantize to BF16 at load time anyway. The 70 GB BF16 teacher fits via
+# ZeRO-3 sharding (~17.5 GB / GPU). The 1×H200 smoke tier is the one place
+# FP8 is correct.
+#
 # Per-GPU memory footprint on a100x4 (each A100-80GB, host has 568 GB RAM):
-#   teacher (FP8 sharded)            ~9 GB
-#   student weights (BF16 sharded)  ~17 GB
-#   student grads (BF16 sharded)    ~17 GB
+#   teacher (BF16 sharded)         ~17.5 GB
+#   student weights (BF16 sharded) ~17.5 GB
+#   student grads (BF16 sharded)   ~17.5 GB
 #   optimizer state                  0 GB (CPU offload via DeepSpeedCPUAdam)
 #   activations (grad ckpt)         ~12 GB
 #   DeepSpeed buffers                ~5 GB
-#   Total                          ~60 GB / 80 GB
+#   Total                          ~70 GB / 80 GB
 
 teacher:
-  name_or_path: Qwen/Qwen3.6-35B-A3B-FP8       # ~37 GB; lm_head + embed in BF16
+  name_or_path: Qwen/Qwen3.6-35B-A3B           # BF16, ~70 GB; sharded by ZeRO-3
   revision: main
-  torch_dtype: bfloat16                        # non-FP8 modules
+  torch_dtype: bfloat16
   attn_implementation: sdpa
 
 student:

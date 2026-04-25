@@ -56,6 +56,7 @@ Optional env vars:
 #     "scipy>=1.11.0",
 #     "bitsandbytes>=0.44.0",
 #     "deepspeed>=0.15.0",
+#     "nvidia-modelopt>=0.21.0",
 #     "pyyaml>=6.0",
 # ]
 # ///
@@ -120,10 +121,28 @@ def _main() -> int:
     config_arg = str(recovery_dir / config_rel)
     ds_config_arg = str(recovery_dir / DS_CONFIG_PATH)
 
-    # 3. Prime model snapshots (idempotent on cache hit).
-    _prime_snapshot("Qwen/Qwen3.6-35B-A3B-FP8", hf_home)
-    if not SKIP_TEACHER:
-        _prime_snapshot("Qwen/Qwen3.6-35B-A3B", hf_home)
+    # 3. Prime model snapshots (idempotent on cache hit). Read the YAML so we
+    #    prime the actual teacher the run will use — light tier uses BF16,
+    #    smoke tier uses FP8, and hardcoding either is wrong for the other.
+    import yaml
+    with open(config_arg) as _f:
+        _cfg = yaml.safe_load(_f) or {}
+    phase2_teacher = _cfg["teacher"]["name_or_path"]
+    _prime_snapshot(phase2_teacher, hf_home)
+
+    # If teacher correction will run, also prime its BF16 source. The source
+    # is teacher_correction.bf16_teacher_name_or_path if set; otherwise it's
+    # derived by stripping `-FP8` (so a BF16 phase2 teacher passes through
+    # unchanged and we skip the redundant prime).
+    tcc = _cfg.get("teacher_correction") or {}
+    if tcc.get("enabled") and not SKIP_TEACHER and not SMOKE:
+        bf16_teacher = (
+            tcc.get("bf16_teacher_name_or_path")
+            or phase2_teacher.removesuffix("-FP8").removesuffix("-fp8")
+        )
+        if bf16_teacher != phase2_teacher:
+            _prime_snapshot(bf16_teacher, hf_home)
+
     _prime_snapshot(STUDENT_REPO, hf_home)
 
     # 4. PYTHONPATH prepends both code dirs.
@@ -156,8 +175,9 @@ def _main() -> int:
         teacher_source = str(artifacts_dir / "teacher_corrected_bf16")
         if not Path(teacher_source).exists():
             LOG.warning("Phase 1 reported success but %s missing; "
-                        "Phase 2 will fall back to the FP8 teacher.",
-                        teacher_source)
+                        "Phase 2 will fall back to teacher.name_or_path "
+                        "from the YAML (%s).",
+                        teacher_source, phase2_teacher)
             teacher_source = None
 
     # 6. Phase 2: Distillation.

@@ -7,8 +7,10 @@
 #   a100x8   8× A100      (640 GB), 1136 GB host RAM, $20/h (Moderate/Heavy)
 #   h200     1× H200      (141 GB), 256 GB host RAM, $5/h   ← Smoke tier default
 #
-# NOTE: a100-large (1× A100, 80 GB) is NOT viable — FP8 teacher (~37 GB) +
-# BF16 student (~70 GB) = 107 GB, exceeds the 80 GB budget.
+# NOTE: a100-large (1× A100, 80 GB) is NOT viable — BF16 teacher (~70 GB) +
+# BF16 student (~70 GB) = 140 GB, exceeds the 80 GB budget. (A100 has no FP8
+# tensor cores, so the FP8 teacher path that would fit on H200 doesn't apply
+# here.)
 #
 # Usage:
 #   STUDENT_REPO=pirola/qwen3-... ./hf_jobs/submit.sh                   # Light
@@ -18,9 +20,10 @@
 
 set -euo pipefail
 
-# Smoke runs default to the smoke YAML on h200 (single H200, 141 GB);
-# Light runs default to a100x4. a100-large (single A100-80GB) cannot fit
-# the FP8 teacher (~37 GB) + BF16 student (~70 GB) at once.
+# Smoke runs default to the smoke YAML on h200 (single H200, 141 GB) and
+# can use the FP8 teacher (Hopper supports FP8). Light runs default to
+# a100x4 with the BF16 teacher (A100 has no FP8 tensor cores). a100-large
+# (single A100-80GB) cannot fit BF16 teacher + BF16 student simultaneously.
 SMOKE="${SMOKE:-0}"
 if [[ "$SMOKE" == "1" ]]; then
     FLAVOR="${FLAVOR:-h200}"

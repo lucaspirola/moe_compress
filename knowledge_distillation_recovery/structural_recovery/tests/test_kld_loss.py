@@ -109,6 +109,33 @@ def test_kld_per_token_is_T_times_smaller_than_batch_sum():
         f"expected new_loss ≈ old_loss / T={T}, got ratio={ratio}"
 
 
+def test_kld_matches_handrolled_implementation():
+    """The modelopt-backed `forward_kld_loss` must match the prior hand-rolled
+    `F.kl_div(reduction='batchmean') * T²` exactly. Catches the reduction
+    semantics gotcha — `reduction='mean'` would divide by an extra factor of
+    V (vocab size) and the test would fail by orders of magnitude.
+    """
+    import torch.nn.functional as F
+    torch.manual_seed(42)
+    B, T, V = 2, 8, 1000
+    s = torch.randn(B, T, V)
+    t = torch.randn(B, T, V)
+
+    for temp in (0.5, 1.0, 2.0):
+        # Hand-rolled reference (the implementation that lived here pre-swap).
+        s2 = s.reshape(-1, V).float()
+        t2 = t.reshape(-1, V).float()
+        ref_log_p = F.log_softmax(s2 / temp, dim=-1)
+        ref_p = F.softmax(t2 / temp, dim=-1)
+        ref_loss = F.kl_div(ref_log_p, ref_p, reduction="batchmean") * (temp ** 2)
+
+        new_loss = forward_kld_loss(s, t, temperature=temp)
+        assert new_loss.item() == pytest.approx(ref_loss.item(), abs=1e-5), (
+            f"modelopt swap diverges from hand-rolled at T={temp}: "
+            f"new={new_loss.item()} vs ref={ref_loss.item()}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # cosine_with_warmup
 # ---------------------------------------------------------------------------

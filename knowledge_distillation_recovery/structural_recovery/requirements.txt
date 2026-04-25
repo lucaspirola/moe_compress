@@ -5,5 +5,6 @@
 # Chapter 1-specific extras:
 bitsandbytes>=0.44.0          # 8-bit AdamW (Appendix D.4)
 deepspeed>=0.15.0             # ZeRO-3 across 4x A100
+nvidia-modelopt>=0.21.0       # LogitsDistillationLoss (guide §1.8.2)
 pyyaml>=6.0
 pytest>=8.0

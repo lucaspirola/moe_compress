@@ -80,7 +80,8 @@ def main(argv: list[str] | None = None) -> int:
                  accelerator.distributed_type)
         (artifacts_dir / "resolved_config.yaml").write_text(yaml.safe_dump(config))
 
-    # 1. Load FP8 teacher (sharded under ZeRO-3 if DS, else replicated on device)
+    # 1. Load teacher (sharded under ZeRO-3 if DS, else replicated on device).
+    #    Light tier on a100x4: BF16 (FP8 needs Hopper). Smoke on H200: FP8.
     teacher, _teacher_tok = _load_teacher(config, accelerator)
 
     # 2. Load compressed student (sharded by DS in accelerator.prepare). We
@@ -269,12 +270,15 @@ def _activate_zero3_init(accelerator) -> None:
 
 
 def _load_teacher(config: dict[str, Any], accelerator):
-    """Load the (FP8 by default) teacher.
+    """Load the teacher whose dtype is set by the YAML.
 
     Under DeepSpeed ZeRO-3 we activate ``HfDeepSpeedConfig`` BEFORE
     ``from_pretrained`` so the teacher params are immediately sharded across
-    ranks (~37 GB FP8 / 4 ≈ 9 GB per GPU). Forward passes use deepspeed.zero
-    hooks to all-gather the params on demand.
+    ranks. For the Light tier on a100x4 (BF16 teacher, ~70 GB), each rank
+    sees ~17.5 GB. For the Smoke tier on 1×H200 the FP8 teacher (~37 GB)
+    fits replicated. (FP8 inference needs Hopper — A100 has no FP8 tensor
+    cores, so the BF16 teacher is the only option on a100x4.) Forward passes
+    use deepspeed.zero hooks to all-gather sharded params on demand.
 
     Without DeepSpeed: load normally, replicate on the configured device.
     """

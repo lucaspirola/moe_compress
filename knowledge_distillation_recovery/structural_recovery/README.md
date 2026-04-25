@@ -8,19 +8,22 @@ Spec: [`pirola/knowledge-distillation-recovery`](https://huggingface.co/pirola/k
 — Chapter 1 of `QUALITY_RECOVERY_GUIDE.md` plus `VRAM_OPTIMIZATION.md`
 (Appendix D).
 
-Plan: `~/.claude/plans/on-another-session-we-soft-pixel.md`.
-
 ## Stack (Appendix D.2)
 
-| Component                | This pipeline                          |
-|--------------------------|----------------------------------------|
-| Teacher                  | `Qwen/Qwen3.6-35B-A3B-FP8` (~37 GB)    |
-| Student                  | `stage5_final/` from max_quality (BF16)|
-| Optimizer                | 8-bit AdamW (`bnb.optim.AdamW8bit`)    |
-| Loss                     | Forward KLD only, T = 1.0              |
-| Activations              | Gradient checkpointing                 |
-| Parallelism              | DeepSpeed ZeRO-3                       |
-| Hardware                 | HF Jobs `a100x4` (4× A100, 320 GB)     |
+| Component                | Light tier (a100x4)                    | Smoke tier (1× H200)              |
+|--------------------------|----------------------------------------|-----------------------------------|
+| Teacher                  | `Qwen/Qwen3.6-35B-A3B` BF16 (~70 GB)   | `Qwen/Qwen3.6-35B-A3B-FP8` (~37 GB) |
+| Student                  | `stage5_final/` from max_quality (BF16)| same                              |
+| Optimizer                | DeepSpeedCPUAdam (CPU offload)         | 8-bit AdamW (`bnb.optim.AdamW8bit`)|
+| Loss                     | Forward KLD only, T = 1.0              | same                              |
+| Activations              | Gradient checkpointing                 | same                              |
+| Parallelism              | DeepSpeed ZeRO-3 (4-way)               | none (single GPU)                 |
+| Hardware                 | HF Jobs `a100x4` (4× A100, 320 GB)     | HF Jobs `h200` (141 GB)           |
+
+**FP8 teacher is Hopper-only.** A100 has no FP8 tensor cores, so the light
+tier on a100x4 must use the BF16 teacher (sharded ~17.5 GB / GPU under
+ZeRO-3). The smoke tier on H200 can and does use the FP8 teacher to fit
+teacher + student in 141 GB.
 
 ## Quick start
 
@@ -31,9 +34,10 @@ SMOKE=1 STUDENT_REPO=pirola/qwen3-6-35b-a3b-strategy-a-30pct-<ts> \
     ./hf_jobs/submit.sh
 ```
 
-a100-large (1× A100-80GB) is **NOT** viable — the FP8 teacher (~37 GB) +
-BF16 student (~70 GB) total 107 GB, which exceeds 80 GB. The smoke tier
-uses h200 (141 GB) for headroom.
+a100-large (1× A100-80GB) is **NOT** viable. On A100 the teacher must be
+BF16 (~70 GB; FP8 needs Hopper) and the student is BF16 (~70 GB) — total
+140 GB exceeds 80 GB. The smoke tier uses 1× H200 (141 GB) where the
+FP8 teacher (~37 GB) + BF16 student (~70 GB) fits.
 
 Light tier (4× A100, ~6 h, ~$60):
 

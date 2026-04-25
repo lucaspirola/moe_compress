@@ -27,7 +27,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
 
@@ -44,21 +43,23 @@ def forward_kld_loss(
 ) -> torch.Tensor:
     """Forward KL: ``KLD(p_teacher || p_student)`` averaged per token.
 
-    PyTorch's ``F.kl_div(reduction='batchmean')`` divides the sum by the FIRST
-    dim of the input only. With logits shaped ``[B, T, V]`` that gives
-    per-sample-summed-over-tokens — i.e. the loss is ~T× larger than the
-    per-token mean Minitron's hyperparameters were tuned against. We reshape
-    to ``[B*T, V]`` so ``batchmean`` divides by ``B*T``, the actual token count.
+    Delegates to ``modelopt.torch.distill.LogitsDistillationLoss`` — the loss
+    class QUALITY_RECOVERY_GUIDE.md §1.8.2 names as canonical.
+
+    Reduction is ``"batchmean"`` after reshaping to ``[B*T, V]`` so PyTorch
+    divides by the token count (``B*T``), giving per-token mean. ModelOpt's
+    default ``"mean"`` would divide by ``B*T*V`` (an extra factor of vocab
+    size, ~150k) and silently collapse the gradient signal.
 
     Both inputs are upcast to fp32 before the softmax so the loss is
     numerically stable on bf16 logits — the underlying model can still run in bf16.
     """
+    from modelopt.torch.distill.losses import LogitsDistillationLoss
     V = student_logits.shape[-1]
     s = student_logits.reshape(-1, V).float()
     t = teacher_logits.reshape(-1, V).float()
-    s_log_p = F.log_softmax(s / temperature, dim=-1)
-    t_p = F.softmax(t / temperature, dim=-1)
-    return F.kl_div(s_log_p, t_p, reduction="batchmean") * (temperature ** 2)
+    loss_fn = LogitsDistillationLoss(temperature=temperature, reduction="batchmean")
+    return loss_fn(s, t)
 
 
 # ---------------------------------------------------------------------------

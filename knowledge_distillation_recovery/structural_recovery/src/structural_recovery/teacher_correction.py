@@ -25,9 +25,11 @@ Output: ``artifacts_dir/teacher_corrected_bf16/`` — a standard
 ``--teacher-source <out_dir>`` to ``run_recovery`` to use the corrected
 teacher instead of the original FP8.
 
-Note: this saves BF16 (not FP8). The KD step accepts a BF16 teacher fine —
-it costs ~33 GB extra VRAM vs the FP8 path but still fits ``a100x4`` with
-margin. A future revision could re-quantize via llm-compressor.
+Note: this saves BF16 (not FP8). On a100x4 the KD step's teacher is BF16
+anyway (A100 has no FP8 tensor cores; FP8 is a Hopper-only path used by
+the H200 smoke tier), so there is no precision gap to bridge there. On
+H200, the FP8 teacher is preferred; a future revision could re-quantize
+the corrected BF16 weights via llm-compressor for the H200 path.
 """
 from __future__ import annotations
 
