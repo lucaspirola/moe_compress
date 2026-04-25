@@ -70,6 +70,7 @@ distillation:
   trainable_scope: full                        # full | experts_only | factored_only
   use_gradient_checkpointing: true             # required at this scale
   nan_loss_circuit_breaker: true
+  consecutive_nan_threshold: 5                 # raise after this many consecutive bad windows
 
 eval:
   wikitext2:

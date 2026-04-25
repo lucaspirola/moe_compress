@@ -16,8 +16,10 @@ student grads (sharded) + activations (grad ckpt'd).
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import shutil
 from itertools import islice
 from pathlib import Path
@@ -216,14 +218,24 @@ def _all_finite(loss: torch.Tensor, accelerator) -> bool:
 
     Critical under DeepSpeed: a rank-local skip would mismatch reductions on
     the next backward and hang NCCL. We collectively detect → collectively skip.
+
+    Item 8: when the answer is False, also surface WHICH rank(s) reported
+    non-finite. Useful for diagnosing single-GPU ECC errors that look like
+    "training-only" NaN — if the same rank ID keeps appearing, suspect that
+    GPU's hardware.
     """
-    flag = torch.tensor(
-        1.0 if torch.isfinite(loss).all() else 0.0,
-        device=accelerator.device,
-    )
+    is_finite_local = 1.0 if torch.isfinite(loss).all() else 0.0
+    flag = torch.tensor(is_finite_local, device=accelerator.device)
     if accelerator.num_processes > 1:
-        # MIN reduces 1.0/0.0 to 0.0 if ANY rank had a non-finite loss.
-        flag = accelerator.reduce(flag, reduction="min")
+        # gather first → log per-rank; then min → collective bool
+        all_flags = accelerator.gather(flag.unsqueeze(0))      # shape [world]
+        if accelerator.is_main_process and (all_flags < 0.5).any():
+            bad = (all_flags < 0.5).nonzero(as_tuple=True)[0].tolist()
+            log.warning(
+                "non-finite loss on ranks %s — investigate hardware if recurrent "
+                "on the same rank.", bad,
+            )
+        flag = all_flags.min()
     return bool(flag.item() >= 0.5)
 
 
@@ -319,27 +331,38 @@ def run_distillation(
             f"warmup_steps={warmup} must be < total_steps={total_steps}. "
             "Increase total_tokens or reduce warmup_steps."
         )
+    config_path = config.get("_source_path", "<config>")
     if total_steps < 50:
+        # Item 4: actionable warning.
+        tokens_for_50_steps = 50 * tokens_per_step
         log.warning(
-            "total_steps=%d is small (<50); cosine decay has limited headroom. "
-            "OK for smoke runs, undersized for real recovery.",
-            total_steps,
+            "total_steps=%d is small (<50) — cosine decay has limited headroom. "
+            "For meaningful recovery, increase `distillation.total_tokens` to "
+            "at least %d (currently %d) in %s.",
+            total_steps, tokens_for_50_steps, int(dconf["total_tokens"]),
+            config_path,
         )
     log.info(
         "schedule: %d total steps (tokens_per_step=%d, world=%d, grad_accum=%d, seq=%d)",
         total_steps, tokens_per_step, world, grad_accum, seq_len,
     )
 
-    # Calibration shortage check (P1: warn explicitly if too short).
-    # Each rank consumes `total_steps * grad_accum` of its local batches.
+    # Calibration shortage check — each rank consumes total_steps * grad_accum
+    # of its local batches.
     needed_micro_local = total_steps * grad_accum
     if len(batches) < needed_micro_local:
+        # Item 3: actionable warning. Compute exactly how many sequences the
+        # YAML must request to cover the budget on the current world size.
+        current_n = int(config["calibration"]["num_sequences"])
+        required_n = total_steps * grad_accum * world * micro_bsz
         log.warning(
             "rank %d: calibration is short — need %d local micro-batches but "
             "have %d. Training will exit early — only %d optim steps will run "
-            "(out of %d planned). Bump calibration.num_sequences in YAML.",
+            "(out of %d planned). To run all planned steps, bump "
+            "`calibration.num_sequences` from %d to >= %d in %s.",
             accelerator.process_index, needed_micro_local, len(batches),
             len(batches) // grad_accum, total_steps,
+            current_n, required_n, config_path,
         )
 
     # Optimizer: built BEFORE accelerator.prepare. DS prepare swaps it
@@ -365,10 +388,22 @@ def run_distillation(
     micro_in_window = 0
     last_loss: float | None = None
 
-    # tokens_consumed counts tokens passed through forward (incl. NaN-skipped).
-    # tokens_with_grad counts tokens that contributed to a successful optim.step.
+    # Three-way token accounting (invariant: tokens_with_grad +
+    # tokens_skipped_nan + last_window_partial == tokens_consumed):
+    #   tokens_consumed     — every micro-batch's forward (incl. substituted)
+    #   tokens_with_grad    — micro-batches that survived to a successful optim.step
+    #   tokens_skipped_nan  — micro-batches whose loss was substituted to zero
     tokens_consumed = 0
     tokens_with_grad = 0
+    tokens_skipped_nan = 0
+
+    # NaN escalation state (item 2). consecutive_nan_windows increments at the
+    # END of each window (every grad_accum micros) where ANY micro substituted;
+    # resets on a clean window.
+    nan_threshold = int(dconf.get("consecutive_nan_threshold", 5))
+    consecutive_nan_windows = 0
+    nan_in_current_window = False
+    nan_diagnostic_emitted = False  # only dump per-layer JSON once per run
 
     for batch in islice(batches, needed_micro_local):
         ids = batch.to(accelerator.device, non_blocking=True)
@@ -394,6 +429,25 @@ def run_distillation(
         if nan_guard and not finite:
             log.warning("step=%d micro=%d non-finite loss; substituting zero.",
                         step, micro_in_window)
+            # Item 2: dump diagnostic on FIRST occurrence only. We snapshot
+            # the (already-computed) student/teacher logits — no extra forward
+            # so we don't deadlock under ZeRO-3 (where forward is collective).
+            # Running rank 0 only is therefore safe.
+            if not nan_diagnostic_emitted and accelerator.is_main_process:
+                try:
+                    _dump_nan_diagnostic(
+                        ids=ids, s_logits=s_logits, t_logits=t_logits,
+                        loss=loss, artifacts_dir=artifacts_dir,
+                        step=step, micro=micro_in_window,
+                    )
+                except Exception as err:                          # noqa: BLE001
+                    log.warning("nan diagnostic failed: %s", err)
+            nan_diagnostic_emitted = True
+
+            # Item 6: account for skipped tokens.
+            tokens_skipped_nan += int(ids.numel()) * world
+            nan_in_current_window = True
+
             if is_ds:
                 cleaned = torch.nan_to_num(s_logits, nan=0.0, posinf=0.0, neginf=0.0)
                 loss = cleaned.sum() * 0.0
@@ -428,11 +482,33 @@ def run_distillation(
             step += 1
             micro_in_window = 0
 
+            # Item 2: end-of-window NaN escalation. A window is "bad" if any
+            # of its grad_accum micros substituted; we count consecutive bad
+            # windows and hard-raise after the threshold.
+            if nan_in_current_window:
+                consecutive_nan_windows += 1
+                if consecutive_nan_windows >= nan_threshold:
+                    raise RuntimeError(
+                        f"NaN circuit breaker tripped: {consecutive_nan_windows} "
+                        f"consecutive windows with non-finite loss "
+                        f"(threshold={nan_threshold}). Inspect "
+                        f"artifacts/nan_diagnostic_step*.json for per-layer "
+                        f"activation stats. Likely root cause: corrupted "
+                        f"student weights, incompatible teacher/student "
+                        f"tokenisation, or sharded-init mismatch."
+                    )
+            else:
+                consecutive_nan_windows = 0
+            nan_in_current_window = False
+
             if accelerator.is_main_process and step % log_every == 0:
-                log.info("step=%d/%d lr=%.3e loss=%.6f tok=%.2fB/%.2fB",
-                         step, total_steps, optim.param_groups[0]["lr"],
-                         last_loss, tokens_with_grad / 1e9,
-                         int(dconf["total_tokens"]) / 1e9)
+                log.info(
+                    "step=%d/%d lr=%.3e loss=%.6f tok=%.2fB/%.2fB nan_skip=%.2fM",
+                    step, total_steps, optim.param_groups[0]["lr"],
+                    last_loss, tokens_with_grad / 1e9,
+                    int(dconf["total_tokens"]) / 1e9,
+                    tokens_skipped_nan / 1e6,
+                )
 
             if eval_every > 0 and step % eval_every == 0:
                 # COLLECTIVE: every rank participates in the forward.
@@ -441,14 +517,16 @@ def run_distillation(
             if save_every > 0 and step % save_every == 0:
                 _save(student, tokenizer, config, artifacts_dir, accelerator,
                       step=step, tokens_with_grad=tokens_with_grad,
-                      tokens_consumed=tokens_consumed, partial=True)
+                      tokens_consumed=tokens_consumed,
+                      tokens_skipped_nan=tokens_skipped_nan, partial=True)
 
             if step >= total_steps:
                 break
 
     return _save(student, tokenizer, config, artifacts_dir, accelerator,
                  step=step, tokens_with_grad=tokens_with_grad,
-                 tokens_consumed=tokens_consumed, partial=False)
+                 tokens_consumed=tokens_consumed,
+                 tokens_skipped_nan=tokens_skipped_nan, partial=False)
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +536,7 @@ def run_distillation(
 
 def _save(student, tokenizer, config, artifacts_dir, accelerator,
           *, step: int, tokens_with_grad: int, tokens_consumed: int,
-          partial: bool) -> Path:
+          tokens_skipped_nan: int = 0, partial: bool) -> Path:
     """Save the recovered checkpoint, mirroring max_quality's
     ``save_compressed_checkpoint`` layout (sharded safetensors + tokenizer +
     ``compressed_metadata.json``).
@@ -471,10 +549,9 @@ def _save(student, tokenizer, config, artifacts_dir, accelerator,
     Other ranks return an empty dict.
 
     Partial saves go to ``chapter1_recovered_partial_step{N}/`` and old ones
-    are pruned (keep last 2) — cheap insurance against a kill mid-write.
+    are pruned (keep last 2). Writes are atomic via ``.tmp`` + rename, with a
+    ``_SAVE_COMPLETE`` sentinel inside each finished dir.
     """
-    import json
-
     from moe_compress.utils.model_io import (
         COMPRESSED_METADATA_FILENAME, FactoredExperts, iter_moe_layers,
     )
@@ -485,6 +562,10 @@ def _save(student, tokenizer, config, artifacts_dir, accelerator,
         out_dir = artifacts_dir / f"chapter1_recovered_partial_step{step}"
     else:
         out_dir = artifacts_dir / "chapter1_recovered"
+    # Item 1: write to a .tmp directory and atomically rename. Readers either
+    # see the previous (intact) directory or the new (complete) one — never a
+    # half-written checkpoint.
+    tmp_dir = out_dir.parent / f"{out_dir.name}.tmp"
 
     # 1. Build metadata from architecture (cheap; works on sharded model
     #    because num_experts/ranks are stored as Python ints, not tensor
@@ -512,6 +593,7 @@ def _save(student, tokenizer, config, artifacts_dir, accelerator,
             "trainable_scope": config["distillation"]["trainable_scope"],
             "tokens_with_grad": tokens_with_grad,
             "tokens_consumed": tokens_consumed,
+            "tokens_skipped_nan": tokens_skipped_nan,
             "step": step,
             "partial": partial,
         },
@@ -521,21 +603,43 @@ def _save(student, tokenizer, config, artifacts_dir, accelerator,
     #    Returns CPU-resident dict on rank 0, empty dict on others.
     state_dict = accelerator.get_state_dict(student)
 
-    # 3. Rank 0 writes everything.
+    # 3. Rank 0 writes everything to TMP, then atomic-replaces the final dir.
     if accelerator.is_main_process:
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # Clean any stale .tmp from a previous failed save.
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True)
         unwrapped.save_pretrained(
-            out_dir, state_dict=state_dict, safe_serialization=True,
+            tmp_dir, state_dict=state_dict, safe_serialization=True,
         )
         if tokenizer is not None:
-            tokenizer.save_pretrained(out_dir)
-        (out_dir / COMPRESSED_METADATA_FILENAME).write_text(
+            tokenizer.save_pretrained(tmp_dir)
+        (tmp_dir / COMPRESSED_METADATA_FILENAME).write_text(
             json.dumps(metadata, indent=2)
         )
-        log.info("Saved %s checkpoint to %s (step=%d, tokens_with_grad=%.2fB)",
+        # Sentinel file written LAST — its presence inside out_dir is a
+        # post-rename guarantee that the dir was fully populated before the
+        # rename.
+        (tmp_dir / "_SAVE_COMPLETE").write_text(
+            json.dumps({"step": step, "partial": partial})
+        )
+        # Compute sha256 of first shard for the manifest BEFORE the rename
+        # so we don't double-walk after.
+        first_shard_sha = _sha256_of_first_shard(tmp_dir)
+
+        # Atomic rename. Replaces existing out_dir if any.
+        _atomic_replace_dir(tmp_dir, out_dir)
+
+        log.info("Saved %s checkpoint to %s (step=%d, tokens_with_grad=%.2fB, "
+                 "tokens_skipped_nan=%.2fM)",
                  "PARTIAL" if partial else "FINAL", out_dir, step,
-                 tokens_with_grad / 1e9)
+                 tokens_with_grad / 1e9, tokens_skipped_nan / 1e6)
+
         if partial:
+            _append_to_partials_manifest(
+                artifacts_dir, step=step, path=out_dir.name,
+                sha256_first_shard=first_shard_sha,
+            )
             _prune_old_partials(artifacts_dir, keep=2)
 
     accelerator.wait_for_everyone()
@@ -543,11 +647,12 @@ def _save(student, tokenizer, config, artifacts_dir, accelerator,
 
 
 def _prune_old_partials(artifacts_dir: Path, *, keep: int = 2) -> None:
-    """Delete all but the K most-recent ``chapter1_recovered_partial_stepN/`` dirs."""
+    """Delete all but the K most-recent partial dirs AND drop them from
+    ``partials.json``. ``.tmp`` siblings are not counted."""
     pattern = "chapter1_recovered_partial_step*"
     dirs: list[tuple[int, Path]] = []
     for p in artifacts_dir.glob(pattern):
-        if not p.is_dir():
+        if not p.is_dir() or p.name.endswith(".tmp"):
             continue
         try:
             n = int(p.name.split("step")[-1])
@@ -561,3 +666,149 @@ def _prune_old_partials(artifacts_dir: Path, *, keep: int = 2) -> None:
             log.info("Pruned old partial: %s", p)
         except OSError as err:
             log.warning("Failed to prune %s: %s", p, err)
+
+    # Update manifest: drop entries whose dirs no longer exist.
+    manifest_path = artifacts_dir / "partials.json"
+    if manifest_path.exists():
+        try:
+            entries = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            entries = []
+        kept = [e for e in entries if (artifacts_dir / e["path"]).is_dir()]
+        if len(kept) != len(entries):
+            _atomic_write_json(manifest_path, kept)
+
+
+# ---------------------------------------------------------------------------
+# Atomic save helpers (item 1)
+# ---------------------------------------------------------------------------
+
+
+def _atomic_replace_dir(src: Path, dst: Path) -> None:
+    """Atomically replace ``dst`` with ``src``. Both must be on the same FS.
+
+    POSIX ``rename(2)`` (and Python's ``os.rename``) refuses to replace a
+    non-empty directory. We work around by moving the existing ``dst`` aside
+    first; on rename failure, restore it.
+    """
+    if dst.exists():
+        backup = dst.with_name(dst.name + ".bak")
+        if backup.exists():
+            shutil.rmtree(backup)
+        os.rename(dst, backup)
+        try:
+            os.rename(src, dst)
+        except Exception:
+            # Restore the backup on any failure.
+            os.rename(backup, dst)
+            raise
+        shutil.rmtree(backup, ignore_errors=True)
+    else:
+        os.rename(src, dst)
+
+
+def _sha256_of_first_shard(dir_: Path) -> str:
+    """Hash the first ``model-*.safetensors`` shard for the manifest. A few
+    seconds of I/O — cheap insurance for the eyeball test "is this checkpoint
+    the one I think it is?"."""
+    import hashlib
+    shards = sorted(dir_.glob("model-*.safetensors"))
+    if not shards:
+        # Fallback for non-sharded saves.
+        shards = sorted(dir_.glob("*.safetensors"))
+    if not shards:
+        return ""
+    h = hashlib.sha256()
+    with shards[0].open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _atomic_write_json(path: Path, payload) -> None:
+    """Write JSON to ``path`` via ``.tmp`` + ``os.replace``."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, path)
+
+
+def _append_to_partials_manifest(artifacts_dir: Path, *, step: int,
+                                 path: str, sha256_first_shard: str) -> None:
+    """Append/update an entry for ``step`` in ``artifacts/partials.json``."""
+    from datetime import datetime, timezone
+    manifest_path = artifacts_dir / "partials.json"
+    entries: list[dict] = []
+    if manifest_path.exists():
+        try:
+            entries = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError) as err:
+            log.warning("partials.json unreadable, recreating: %s", err)
+            entries = []
+    # Replace any existing entry for this step (idempotent on retry).
+    entries = [e for e in entries if e.get("step") != step]
+    entries.append({
+        "step": step,
+        "path": path,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "sha256_first_shard": sha256_first_shard,
+    })
+    entries.sort(key=lambda e: e["step"])
+    _atomic_write_json(manifest_path, entries)
+
+
+# ---------------------------------------------------------------------------
+# NaN diagnostic (item 2)
+# ---------------------------------------------------------------------------
+
+
+def _dump_nan_diagnostic(*, ids, s_logits, t_logits, loss, artifacts_dir: Path,
+                         step: int, micro: int) -> None:
+    """Snapshot the NaN-triggering inputs + logits stats to a JSON file.
+
+    No extra forward — uses tensors already in the training-step scope, so
+    safe to call from rank 0 only without deadlocking ZeRO-3 collectives.
+    Per-layer activation hooks are intentionally NOT done here (they would
+    need a collective re-forward); the saved input_ids let the operator run
+    a postmortem with whatever tooling they prefer.
+    """
+    out = artifacts_dir / f"nan_diagnostic_step{step}_micro{micro}.json"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    def _stats(t):
+        try:
+            x = t.detach().float()
+            return {
+                "shape": list(t.shape),
+                "dtype": str(t.dtype),
+                "has_nan": bool(torch.isnan(x).any().item()),
+                "has_inf": bool(torch.isinf(x).any().item()),
+                "min": float(torch.nan_to_num(x, nan=float("inf")).min().item()),
+                "max": float(torch.nan_to_num(x, nan=float("-inf")).max().item()),
+                "mean_finite": float(
+                    x[torch.isfinite(x)].mean().item()
+                    if torch.isfinite(x).any() else float("nan")
+                ),
+            }
+        except Exception as err:                                 # noqa: BLE001
+            return {"error": str(err)}
+
+    payload = {
+        "step": step,
+        "micro": micro,
+        "input_ids_first_64": ids.detach().cpu().reshape(-1).tolist()[:64],
+        "input_ids_shape": list(ids.shape),
+        "loss_value": float(loss.detach().item()) if loss.numel() == 1 else None,
+        "student_logits": _stats(s_logits),
+        "teacher_logits": _stats(t_logits),
+        "hint": (
+            "If has_nan=True on student_logits but not teacher_logits, the "
+            "student's forward is the culprit — likely sharded-init mismatch "
+            "or corrupted weights. If both are NaN, suspect input_ids out of "
+            "vocab range or a tokenizer mismatch. Per-layer hooks were NOT "
+            "captured (would require a collective re-forward under ZeRO-3); "
+            "rerun a single-batch forward locally with these input_ids to dig "
+            "deeper."
+        ),
+    }
+    _atomic_write_json(out, payload)
+    log.warning("NaN diagnostic written to %s", out)

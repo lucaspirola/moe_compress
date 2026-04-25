@@ -90,11 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     #    but using the student's tokenizer is the spec contract for the
     #    Chapter 2 handoff). Sanity-check vocab sizes match the teacher's.
     student, tokenizer = _load_student(config, accelerator)
-    if len(tokenizer) != len(_teacher_tok):
-        raise RuntimeError(
-            f"Tokenizer vocab mismatch: student={len(tokenizer)} "
-            f"teacher={len(_teacher_tok)}. KD requires aligned vocabularies."
-        )
+    _assert_tokenizers_compatible(tokenizer, _teacher_tok)
 
     # 3. Set trainable params per scope
     from .distillation import enable_student_training, run_distillation
@@ -138,8 +134,12 @@ def _parse(argv) -> argparse.Namespace:
 
 
 def _load_config(path: str) -> dict[str, Any]:
+    """Load YAML config and stamp the source path under ``_source_path`` so
+    downstream code can produce actionable warnings ("bump foo in <this file>")."""
     with open(path) as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    config["_source_path"] = str(Path(path).resolve())
+    return config
 
 
 def _build_accelerator(config: dict[str, Any]):
@@ -149,6 +149,60 @@ def _build_accelerator(config: dict[str, Any]):
     launcher-provided one."""
     from accelerate import Accelerator
     return Accelerator()
+
+
+# Item 5: vocab/special-token compatibility check. ``len(tokenizer)`` alone
+# misses subtle mismatches like a different ``eos_token_id`` that would
+# silently break generation and KD.
+_VOCAB_FIELDS = (
+    "pad_token_id",
+    "eos_token_id",
+    "bos_token_id",
+    "unk_token_id",
+)
+
+
+def _assert_tokenizers_compatible(student_tok, teacher_tok) -> None:
+    """Raise if student/teacher tokenisations would diverge in any way that
+    matters for KD. Emits a per-field diff in the error message."""
+    diffs: list[tuple[str, Any, Any]] = []
+    s_vocab, t_vocab = len(student_tok), len(teacher_tok)
+    if s_vocab != t_vocab:
+        diffs.append(("vocab_size", s_vocab, t_vocab))
+    for field in _VOCAB_FIELDS:
+        sv = getattr(student_tok, field, None)
+        tv = getattr(teacher_tok, field, None)
+        if sv != tv:
+            diffs.append((field, sv, tv))
+    s_specials = dict(getattr(student_tok, "special_tokens_map", {}) or {})
+    t_specials = dict(getattr(teacher_tok, "special_tokens_map", {}) or {})
+    if s_specials != t_specials:
+        diffs.append(("special_tokens_map", s_specials, t_specials))
+
+    if not diffs:
+        log.info("Tokenizer compatibility: OK (vocab=%d, all fields match).", s_vocab)
+        return
+
+    lines = ["Tokenizer mismatch between student and teacher:"]
+    # All fields, even matching, for context.
+    all_fields = ["vocab_size"] + list(_VOCAB_FIELDS) + ["special_tokens_map"]
+    diff_keys = {d[0] for d in diffs}
+    for field in all_fields:
+        if field == "vocab_size":
+            sv, tv = s_vocab, t_vocab
+        elif field == "special_tokens_map":
+            sv, tv = s_specials, t_specials
+        else:
+            sv = getattr(student_tok, field, None)
+            tv = getattr(teacher_tok, field, None)
+        marker = "✗" if field in diff_keys else "✓"
+        lines.append(f"  {field:<20s} student={sv!r}  teacher={tv!r}  {marker}")
+    lines.append(
+        "KD requires aligned tokenization. Verify both come from the same "
+        "base model — Strategy A does not change vocabulary, so a divergence "
+        "here means the student or teacher source is wrong."
+    )
+    raise RuntimeError("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -180,10 +234,32 @@ def _activate_zero3_init(accelerator) -> None:
         return
     if _DSCHF_HOLDER:
         return  # already activated this process
-    from transformers.integrations import HfDeepSpeedConfig
+    from transformers.integrations import (
+        HfDeepSpeedConfig, is_deepspeed_zero3_enabled,
+    )
     plugin = accelerator.state.deepspeed_plugin
     ds_config = plugin.deepspeed_config        # dict, fully resolved
     _DSCHF_HOLDER.append(HfDeepSpeedConfig(ds_config))
+
+    # Item 7: verify the activation actually took effect. Without this,
+    # `from_pretrained` would load the teacher full-rank on every GPU and
+    # OOM later — a confusing failure mode to debug. Hard-fail here with
+    # the exact knobs to inspect.
+    if not is_deepspeed_zero3_enabled():
+        try:
+            import deepspeed                              # noqa: F401
+            ds_avail = True
+        except ImportError:
+            ds_avail = False
+        raise RuntimeError(
+            "HfDeepSpeedConfig was instantiated but "
+            "is_deepspeed_zero3_enabled() returned False — the teacher will "
+            "load full-rank on each rank and OOM. Inspect: "
+            f"plugin.zero_stage={getattr(plugin, 'zero_stage', '?')}, "
+            f"deepspeed_importable={ds_avail}, "
+            f"ds_config['zero_optimization']['stage']="
+            f"{ds_config.get('zero_optimization', {}).get('stage', '?')}."
+        )
     log.info("HfDeepSpeedConfig activated for ZeRO-3 sharded from_pretrained.")
 
 

@@ -136,8 +136,11 @@ def _parse(argv) -> argparse.Namespace:
 
 
 def _load_config(path: str) -> dict[str, Any]:
+    """Load YAML config; stamp source path for actionable warnings."""
     with open(path) as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    config["_source_path"] = str(Path(path).resolve())
+    return config
 
 
 def _strip_fp8_suffix(name: str) -> str:
@@ -168,9 +171,29 @@ def _activate_zero3_init(accelerator) -> None:
         return
     if _DSCHF_HOLDER:
         return  # already activated this process
-    from transformers.integrations import HfDeepSpeedConfig
+    from transformers.integrations import (
+        HfDeepSpeedConfig, is_deepspeed_zero3_enabled,
+    )
     plugin = accelerator.state.deepspeed_plugin
-    _DSCHF_HOLDER.append(HfDeepSpeedConfig(plugin.deepspeed_config))
+    ds_config = plugin.deepspeed_config
+    _DSCHF_HOLDER.append(HfDeepSpeedConfig(ds_config))
+
+    # Item 7 mirror: hard-fail if the activation didn't take effect.
+    if not is_deepspeed_zero3_enabled():
+        try:
+            import deepspeed                              # noqa: F401
+            ds_avail = True
+        except ImportError:
+            ds_avail = False
+        raise RuntimeError(
+            "HfDeepSpeedConfig was instantiated but "
+            "is_deepspeed_zero3_enabled() returned False — the BF16 teacher "
+            "would load full-rank on each rank and OOM. Inspect: "
+            f"plugin.zero_stage={getattr(plugin, 'zero_stage', '?')}, "
+            f"deepspeed_importable={ds_avail}, "
+            f"ds_config['zero_optimization']['stage']="
+            f"{ds_config.get('zero_optimization', {}).get('stage', '?')}."
+        )
     log.info("HfDeepSpeedConfig activated for ZeRO-3 sharded from_pretrained.")
 
 

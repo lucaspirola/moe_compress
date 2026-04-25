@@ -66,6 +66,7 @@ distillation:
   trainable_scope: experts_only                # so 1× a100-large fits
   use_gradient_checkpointing: true
   nan_loss_circuit_breaker: true
+  consecutive_nan_threshold: 5                 # raise after this many consecutive bad windows
 
 eval:
   wikitext2:
