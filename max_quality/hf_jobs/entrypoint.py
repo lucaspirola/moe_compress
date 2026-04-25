@@ -228,9 +228,14 @@ def _restore_prior_checkpoint(repo_id: str, artifacts_dir: Path, resume_from: in
         return
     dest = artifacts_dir / dirname
     dest.mkdir(parents=True, exist_ok=True)
-    index = dest / "model.safetensors.index.json"
-    meta  = dest / "compressed_metadata.json"
-    if index.exists() and meta.exists():
+    # `save_pretrained(safe_serialization=True)` writes a sharded model with
+    # `model.safetensors.index.json` only when the state_dict exceeds ~5 GB;
+    # smaller compressed checkpoints (e.g. Stage 3+ after rank reduction) emit
+    # a single `model.safetensors`. Accept either as proof of a complete dir.
+    index   = dest / "model.safetensors.index.json"
+    single  = dest / "model.safetensors"
+    meta    = dest / "compressed_metadata.json"
+    if (index.exists() or single.exists()) and meta.exists():
         LOG.info("%s already complete at %s — skipping download", dirname, dest)
     else:
         LOG.info("Downloading prior-stage checkpoint from %s → %s", repo_id, dest)
@@ -322,7 +327,11 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
             repo_type="model",
         )
 
-    # Upload the auxiliary artifact JSONs under "artifacts/" in the repo.
+    # Auxiliary artifacts (small JSONs and multi-GB sidecars like
+    # ``_stage3_original_weights.pt``) all go under ``artifacts/`` in the repo.
+    # We stage them into a single folder mirroring the Hub layout, then use
+    # ``upload_large_folder`` for resumable, chunked, retried uploads — the
+    # large sidecars (5–20 GB) make per-file ``upload_file`` calls fragile.
     aux_files = [
         "stage0_blacklist.json",
         "stage1_budgets.json",
@@ -332,22 +341,38 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
         "_stage2_input_covariance.pt",   # needed for Stage 3 AA-SVD on resume
         "_stage3_original_weights.pt",   # needed for Stage 4 EoRA residuals on resume
     ]
+    aux_stage = artifacts_dir / "_aux_stage"
+    if aux_stage.exists():
+        shutil.rmtree(aux_stage, ignore_errors=True)
+    (aux_stage / "artifacts").mkdir(parents=True, exist_ok=True)
+
+    def _stage(src: Path, name: str) -> None:
+        target = aux_stage / "artifacts" / name
+        if target.exists():
+            return
+        # Hardlink first (zero copy on same fs), fall back to copy on failure.
+        try:
+            os.link(src, target)
+        except OSError:
+            shutil.copy2(src, target)
+
+    staged_count = 0
     for name in aux_files:
         p = artifacts_dir / name
         if not p.exists():
             continue
-        api.upload_file(
-            path_or_fileobj=str(p),
-            path_in_repo=f"artifacts/{name}",
-            repo_id=repo_id,
-            repo_type="model",
-        )
-    # merge_map sits inside stage2_pruned — grab it explicitly too.
+        _stage(p, name)
+        staged_count += 1
+    # merge_map sits inside stage2_pruned — stage it under artifacts/ too.
     mm = artifacts_dir / "stage2_pruned" / "merge_map.json"
     if mm.exists():
-        api.upload_file(
-            path_or_fileobj=str(mm),
-            path_in_repo="artifacts/merge_map.json",
+        _stage(mm, "merge_map.json")
+        staged_count += 1
+
+    if staged_count:
+        LOG.info("Uploading %d aux artifact(s) via upload_large_folder", staged_count)
+        api.upload_large_folder(
+            folder_path=str(aux_stage),
             repo_id=repo_id,
             repo_type="model",
         )
