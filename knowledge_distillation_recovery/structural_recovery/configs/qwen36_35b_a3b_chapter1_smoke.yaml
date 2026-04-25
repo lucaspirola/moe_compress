@@ -1,0 +1,79 @@
+# Chapter 1 — Smoke tier (~50M tokens, ~30 min on h200, ~$2.50)
+#
+# Plumbing validation only: loss decreases, reload works, no NaN.
+# Hardware: HF Jobs `h200` (1× H200, 141 GB VRAM, 256 GB host RAM, $5/h).
+# A single A100-80GB can NOT fit teacher+student at once — FP8 teacher
+# (~37 GB) + BF16 student (~70 GB) = 107 GB > 80 GB. We need the H200 for
+# headroom even on the smoke tier.
+#
+# Architecture:
+#   - trainable_scope=experts_only (cuts optim/grad VRAM)
+#   - bnb.AdamW8bit (no DeepSpeed → no engine complications on 1 GPU)
+#   - teacher_correction disabled (smoke is a plumbing check, not a quality gate)
+
+teacher:
+  name_or_path: Qwen/Qwen3.6-35B-A3B-FP8
+  revision: main
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+student:
+  source: pirola/qwen3-6-35b-a3b-strategy-a-30pct-CHANGE_ME
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+calibration:
+  source: nvidia-cascade
+  dataset: nvidia/Nemotron-Cascade-2-SFT-Data
+  seed: 1337
+  num_sequences: 13000                         # 13k × 4096 ≈ 53M fresh tokens
+  sequence_length: 4096
+  subset_weights:
+    math: 0.21
+    science: 0.11
+    chat: 0.56
+    instruction_following: 0.033
+    conversational_agent: 0.0331
+    swe: 0.02
+    terminal_agent: 0.0331
+
+teacher_correction:
+  enabled: false                               # skip for smoke
+  target: bf16_then_requantize
+  steps: 400
+  per_device_batch_size: 1
+  gradient_accumulation: 16
+  learning_rate: 1.0e-6
+  warmup_steps: 50
+
+distillation:
+  loss: forward_kld
+  temperature: 1.0
+  optimizer: adamw_bnb_8bit                    # smoke = single GPU, no DeepSpeed
+  learning_rate: 2.0e-4
+  min_learning_rate: 4.5e-7
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  grad_clip_norm: 1.0
+  warmup_steps: 20
+  total_tokens: 50_000_000
+  per_device_batch_size: 1
+  gradient_accumulation: 32
+  sequence_length: 4096
+  log_every_n_steps: 5
+  eval_every_n_steps: 50
+  save_every_n_steps: 0                        # final-only for smoke
+  trainable_scope: experts_only                # so 1× a100-large fits
+  use_gradient_checkpointing: true
+  nan_loss_circuit_breaker: true
+
+eval:
+  wikitext2:
+    enabled: true
+    sequence_length: 2048
+    num_sequences: 64                          # quick
+  sample_generations:
+    enabled: false
+
+logging:
+  level: INFO
