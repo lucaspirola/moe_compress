@@ -118,9 +118,9 @@ def _main() -> int:
 
     # 2b. If resuming from stage 3+ and the bucket checkpoint is stale/partial,
     #     download the full prior-stage checkpoint from PRIOR_STAGE_REPO into the
-    #     artifacts directory so run_pipeline can find it at artifacts/stage2_pruned/.
+    #     correct artifacts/<prior_stage>/ subdir so run_pipeline can load it.
     if PRIOR_STAGE_REPO and RESUME_FROM >= 3:
-        _restore_prior_checkpoint(PRIOR_STAGE_REPO, artifacts_dir)
+        _restore_prior_checkpoint(PRIOR_STAGE_REPO, artifacts_dir, RESUME_FROM)
 
     # 3. Run the pipeline.
     result_repo = RESULT_REPO or _default_result_repo()
@@ -197,33 +197,64 @@ def _sanity_check() -> None:
         )
 
 
-def _restore_prior_checkpoint(repo_id: str, artifacts_dir: Path) -> None:
-    """Download a prior-stage HF model repo into artifacts/stage2_pruned/.
+# Maps RESUME_FROM_STAGE → name of the prior stage's checkpoint subdir.
+# Mirrors run_pipeline.STAGE_REGISTRY[stage][1] but local to entrypoint so we
+# don't have to import the pipeline module before sys.path is set up.
+_PRIOR_STAGE_DIRNAME = {
+    3: "stage2_pruned",
+    4: "stage3_svd",
+    5: "stage4_eora",
+    6: "stage5_final",
+}
 
-    This is used when RESUME_FROM_STAGE >= 3 and the bucket artifact is stale
-    or incomplete (e.g. the stage 2 job saved a partial checkpoint to the bucket
-    but uploaded the full model to Hub).
 
-    The destination dir name is always ``stage2_pruned`` — the standard path that
-    ``run_pipeline._load_for_stage(3)`` looks for.
+def _restore_prior_checkpoint(repo_id: str, artifacts_dir: Path, resume_from: int) -> None:
+    """Download a prior-stage HF model repo into ``artifacts/<prior_stage>/``.
+
+    Used when ``RESUME_FROM_STAGE >= 3`` and the bucket artifact is stale or
+    incomplete (e.g. the prior stage uploaded the full model to Hub but only
+    a partial copy made it into the bucket).
+
+    Sidecar files saved by earlier stages at ``artifacts_dir/_stage*_*.pt`` are
+    uploaded by ``_upload_results`` under ``artifacts/<file>`` in the Hub repo.
+    On download they land under ``<dest>/artifacts/<file>``; we move them up
+    to ``artifacts_dir/<file>`` so Stage 3/4 find them at the expected path.
     """
     from huggingface_hub import snapshot_download
-    dest = artifacts_dir / "stage2_pruned"
+    dirname = _PRIOR_STAGE_DIRNAME.get(resume_from)
+    if dirname is None:
+        LOG.warning("No prior-stage dirname for RESUME_FROM_STAGE=%d — skipping restore",
+                    resume_from)
+        return
+    dest = artifacts_dir / dirname
     dest.mkdir(parents=True, exist_ok=True)
-    # Check if the checkpoint is already complete (has index + both shards).
     index = dest / "model.safetensors.index.json"
     meta  = dest / "compressed_metadata.json"
     if index.exists() and meta.exists():
-        LOG.info("stage2_pruned already complete at %s — skipping download", dest)
-        return
-    LOG.info("Downloading prior-stage checkpoint from %s → %s", repo_id, dest)
-    snapshot_download(
-        repo_id,
-        repo_type="model",
-        local_dir=str(dest),
-        ignore_patterns=["*.metadata", "job_status.txt", "artifacts/*"],
-    )
-    LOG.info("Prior-stage checkpoint ready at %s", dest)
+        LOG.info("%s already complete at %s — skipping download", dirname, dest)
+    else:
+        LOG.info("Downloading prior-stage checkpoint from %s → %s", repo_id, dest)
+        snapshot_download(
+            repo_id,
+            repo_type="model",
+            local_dir=str(dest),
+            ignore_patterns=["*.metadata", "job_status.txt"],
+        )
+        LOG.info("Prior-stage checkpoint ready at %s", dest)
+
+    # Hoist any sidecar files (covariance, originals) from <dest>/artifacts/*
+    # up one level to <artifacts_dir>/* so Stage 3 / Stage 4 find them at the
+    # paths their loaders expect.
+    sidecar_src = dest / "artifacts"
+    if sidecar_src.is_dir():
+        for p in sidecar_src.iterdir():
+            if not p.is_file():
+                continue
+            target = artifacts_dir / p.name
+            if target.exists():
+                continue
+            shutil.move(str(p), str(target))
+            LOG.info("Hoisted sidecar %s → %s", p.name, target)
 
 
 def _download_code(repo_id: str, dest: Path) -> None:
@@ -299,6 +330,7 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
         "budget_decomposition.json",
         "stage6_eval.json",
         "_stage2_input_covariance.pt",   # needed for Stage 3 AA-SVD on resume
+        "_stage3_original_weights.pt",   # needed for Stage 4 EoRA residuals on resume
     ]
     for name in aux_files:
         p = artifacts_dir / name
