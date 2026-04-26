@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 import types
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -164,6 +165,14 @@ class InputCovarianceAccumulator:
     # GPU-resident transient storage, keyed the same way as ``covariance``.
     _gpu: dict[tuple[int, int, str], torch.Tensor] = field(default_factory=dict)
     _gpu_token_count: dict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))
+    # Thread lock guarding ``covariance`` and ``token_count`` dict mutations.
+    # Stage 3 runs ``spill_layer_to_disk`` on a background thread (overlapping
+    # I/O with the next layer's forward pass) while the main thread continues
+    # to ``finalize_layer`` for layer N+1. The two threads touch different
+    # KEYS but the SAME dict objects; CPython dict resize during another
+    # thread's pop/insert can corrupt the hash table even under the GIL.
+    # RLock so pop loops + helper methods can re-enter safely.
+    _lock: "threading.RLock" = field(default_factory=lambda: threading.RLock())  # noqa: F821
 
     def set_storage_dtype(self, dtype: torch.dtype) -> None:
         self.storage_dtype = dtype
@@ -180,6 +189,8 @@ class InputCovarianceAccumulator:
         flat_f32 = flat.to(torch.float32)
         cov = flat_f32.transpose(0, 1) @ flat_f32            # stays on GPU
         key = (layer_idx, expert_idx, matrix_name)
+        # _gpu / _gpu_token_count are touched only by the calling thread
+        # (forward hooks fire synchronously on the main thread) — no lock.
         cur = self._gpu.get(key)
         if cur is None:
             self._gpu[key] = cov
@@ -195,16 +206,17 @@ class InputCovarianceAccumulator:
         for k in keys:
             gpu_cov = self._gpu.pop(k)
             cpu_cov = gpu_cov.to(self.storage_dtype).cpu()
-            prev = self.covariance.get(k)
-            if prev is None:
-                self.covariance[k] = cpu_cov
-            else:
-                self.covariance[k] = (
-                    prev.to(torch.float32) + cpu_cov.to(torch.float32)
-                ).to(self.storage_dtype)
-            self.token_count[k] = (
-                self.token_count.get(k, 0) + self._gpu_token_count.pop(k, 0)
-            )
+            with self._lock:
+                prev = self.covariance.get(k)
+                if prev is None:
+                    self.covariance[k] = cpu_cov
+                else:
+                    self.covariance[k] = (
+                        prev.to(torch.float32) + cpu_cov.to(torch.float32)
+                    ).to(self.storage_dtype)
+                self.token_count[k] = (
+                    self.token_count.get(k, 0) + self._gpu_token_count.pop(k, 0)
+                )
 
     def finalize_all(self) -> None:
         """Move every GPU-resident covariance to CPU. Use when layers are
@@ -212,6 +224,91 @@ class InputCovarianceAccumulator:
         layer_ids = {k[0] for k in self._gpu}
         for li in layer_ids:
             self.finalize_layer(li)
+
+    def spill_layer_to_disk(self, layer_idx: int, dir_path) -> None:
+        """Persist all in-memory entries for ``layer_idx`` to a single
+        ``layer_{layer_idx}.pt`` file under ``dir_path``, then drop them
+        from the in-memory dict. Bounds per-layer accumulators to disk —
+        required on hosts where the full per-(layer, expert) cov dict
+        would exceed the cgroup memory limit (a100-large = 142 GB).
+        Call :meth:`load_layer_from_disk` to bring a layer back when
+        the factor loop needs it.
+
+        Writes are **atomic**: tensors are saved to ``layer_{idx}.pt.tmp``
+        and only renamed to the final path after ``torch.save`` returns
+        successfully. A SIGKILL/OOM mid-write therefore leaves at most a
+        ``.tmp`` file (which the resume path doesn't recognize), never a
+        truncated final ``.pt`` that would silently load as garbage on
+        resume.
+        """
+        import os
+        from pathlib import Path
+        # Snapshot keys + payload under the lock so a concurrent
+        # finalize_layer (different keys but same dict) can't trigger a
+        # dict-resize while we're iterating.
+        with self._lock:
+            keys = [k for k in self.covariance if k[0] == layer_idx]
+            if not keys:
+                return
+            payload = {
+                "format_version": 1,
+                "covariance": {k: self.covariance[k] for k in keys},
+                "tokens": {k: self.token_count.get(k, 0) for k in keys},
+            }
+        out = Path(dir_path) / f"layer_{layer_idx}.pt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(out.suffix + ".tmp")
+        torch.save(payload, tmp)        # disk I/O — releases GIL, no lock
+        os.replace(tmp, out)            # atomic on POSIX, including FUSE
+        with self._lock:
+            for k in keys:
+                self.covariance.pop(k, None)
+
+    def load_layer_from_disk(self, layer_idx: int, dir_path) -> bool:
+        """Restore a previously spilled layer's entries to the in-memory
+        dict. Returns True if loaded, False if the file doesn't exist
+        (caller should treat as not-yet-computed)."""
+        from pathlib import Path
+        p = Path(dir_path) / f"layer_{layer_idx}.pt"
+        if not p.exists():
+            return False
+        try:
+            payload = torch.load(p, map_location="cpu")
+        except Exception as exc:                     # noqa: BLE001
+            # Most likely a torn .pt that snuck past the .tmp+rename
+            # guard (e.g. an old run on a previous version of this
+            # code). Raise with the path so it's actionable.
+            raise RuntimeError(
+                f"Failed to torch.load spill file {p}: {exc!r}. "
+                "The file is likely corrupt — delete it (or the whole "
+                "spill dir) and re-run the affected layer."
+            ) from exc
+        if not isinstance(payload, dict) or "covariance" not in payload:
+            raise RuntimeError(
+                f"Spill file {p} has unexpected layout: "
+                f"got {type(payload).__name__} "
+                f"(keys={list(payload.keys()) if isinstance(payload, dict) else 'n/a'}). "
+                "Likely a legacy or corrupt format — delete and re-run."
+            )
+        fmt = int(payload.get("format_version", 0))
+        if fmt != 1:
+            raise RuntimeError(
+                f"Spill file {p} has format_version={fmt} (expected 1). "
+                "Regenerate by deleting the per-layer spill dir and re-running."
+            )
+        with self._lock:
+            self.covariance.update(payload["covariance"])
+            for k, n in payload.get("tokens", {}).items():
+                self.token_count[k] = n
+        return True
+
+    def unload_layer(self, layer_idx: int) -> None:
+        """Drop in-memory entries for a layer (used after a lazy-load+use
+        cycle during the factor phase). Token counts are left in place
+        since they're tiny."""
+        with self._lock:
+            for k in [k for k in self.covariance if k[0] == layer_idx]:
+                self.covariance.pop(k, None)
 
     def get(self, key: tuple[int, int, str]) -> torch.Tensor | None:
         if key in self.covariance:
@@ -363,8 +460,10 @@ def run_calibration(
     device=None,
     extra_forward_kwargs: dict | None = None,
     per_batch_callback: Callable[[int], None] | None = None,
+    log_every: int = 64,
 ) -> None:
     model.eval()
+    n_total = len(batches) if hasattr(batches, "__len__") else None
     with torch.no_grad():
         for i, batch in enumerate(batches):
             if device is not None:
@@ -372,6 +471,11 @@ def run_calibration(
             model(input_ids=batch, **(extra_forward_kwargs or {}))
             if per_batch_callback is not None:
                 per_batch_callback(i)
+            if log_every > 0 and (i + 1) % log_every == 0:
+                if n_total is not None:
+                    log.info("calibration forward %d/%d", i + 1, n_total)
+                else:
+                    log.info("calibration forward %d", i + 1)
 
 
 # ---------------------------------------------------------------------------

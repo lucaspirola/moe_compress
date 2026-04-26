@@ -42,6 +42,7 @@ from .utils.model_io import (
     save_compressed_checkpoint,
     save_json_artifact,
 )
+from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 
@@ -141,11 +142,23 @@ def run(
         }
         _remap_covariance_for_layer(cov_acc, layer_ref.layer_idx, centroid_ids)
 
+        sum_cost = float(delta.sum()) if delta.size else 0.0
+        max_group = max((len(g) for g in grouped.values()), default=1)
+        mean_group = (n_experts - len(protected)) / max(len(centroid_ids), 1) if centroid_ids else 0.0
         log.info(
-            "  kept %d / %d experts (blacklist=%d) — Σ cost=%.4f",
+            "  kept %d / %d experts (blacklist=%d) — Σ cost=%.4f, max_group=%d, mean_group=%.2f",
             len(centroid_ids), n_experts, len(protected),
-            float(delta.sum()) if delta.size else 0.0,
+            sum_cost, max_group, mean_group,
         )
+        _trackio_log({
+            "stage2/layer_idx": layer_ref.layer_idx,
+            "stage2/kept_experts": len(centroid_ids),
+            "stage2/total_experts": n_experts,
+            "stage2/sum_assignment_cost": sum_cost,
+            "stage2/mean_cost_per_pair": sum_cost / max(delta.size, 1),
+            "stage2/max_merge_group_size": max_group,
+            "stage2/mean_merge_group_size": mean_group,
+        })
 
     out_dir = artifacts_dir / "stage2_pruned"
     save_compressed_checkpoint(

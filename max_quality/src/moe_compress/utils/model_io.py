@@ -31,6 +31,7 @@ so the rest of the model is untouched.
 """
 from __future__ import annotations
 
+import gc
 import json
 import logging
 from dataclasses import dataclass, field
@@ -643,12 +644,70 @@ def save_compressed_checkpoint(
     return out_path
 
 
+def _assign_storage(model: nn.Module, key: str, tensor: torch.Tensor) -> None:
+    """In-place storage swap for ``model.state_dict()[key] = tensor``.
+
+    nn.Parameter: rebind ``.data`` (drops old storage refcount → freed).
+    Buffer / non-parameter: replace via ``setattr(parent_module, leaf, tensor)``
+    after dropping the existing buffer registration.
+
+    Why one-at-a-time: building a shard-sized partial dict and calling
+    ``load_state_dict(partial, assign=True)`` works correctly but holds the
+    entire shard on cuda alongside the still-referenced skeleton tensors,
+    blowing past the A100 80 GB ceiling. This helper swaps a single tensor
+    so the freed skeleton storage is reclaimed before the next tensor lands.
+    """
+    parent_path, _, leaf = key.rpartition(".")
+    parent = model.get_submodule(parent_path) if parent_path else model
+    existing = getattr(parent, leaf)
+    # Defense-in-depth: a shape mismatch on .data = will raise inside
+    # Tensor.set_ with a cryptic message; a dtype mismatch silently
+    # changes the param's dtype and corrupts forward dozens of layers
+    # later. Either failure mode would only surface hours into a 5-hour
+    # run. Catch them at the swap site with a clear error.
+    if existing.shape != tensor.shape:
+        raise RuntimeError(
+            f"_assign_storage: shape mismatch on {key!r} — skeleton "
+            f"{tuple(existing.shape)} vs checkpoint {tuple(tensor.shape)}"
+        )
+    if existing.dtype != tensor.dtype:
+        raise RuntimeError(
+            f"_assign_storage: dtype mismatch on {key!r} — skeleton "
+            f"{existing.dtype} vs checkpoint {tensor.dtype}"
+        )
+    if isinstance(existing, nn.Parameter):
+        # Param: rebind .data so the registered Parameter object stays the
+        # same (preserves any tying / hooks). Drop refcount on old storage.
+        # Also clear ._grad so a stale gradient at the old shape doesn't
+        # linger (defense for future paths that might call this on a
+        # trained model).
+        existing._grad = None
+        existing.data = tensor
+    elif leaf in getattr(parent, "_buffers", {}):
+        # Persistent buffer. Re-register it so the module's _buffers dict
+        # points at the new tensor; preserve persistent / non-persistent flag.
+        persistent = leaf not in getattr(parent, "_non_persistent_buffers_set", set())
+        parent._buffers.pop(leaf, None)
+        parent.register_buffer(leaf, tensor, persistent=persistent)
+    else:
+        # state_dict() only yields parameters + persistent buffers, so this
+        # branch is unreachable for any key in expected_keys. Fail loud
+        # rather than silently writing a raw Tensor where a Parameter or
+        # registered buffer was expected.
+        raise RuntimeError(
+            f"_assign_storage: key {key!r} resolves to {type(existing).__name__}, "
+            "not nn.Parameter or persistent buffer. Streaming load would "
+            "leak a raw tensor — investigate the model skeleton."
+        )
+
+
 def load_compressed_model(
     path: str | Path,
     *,
     device_map: str | dict = "auto",
     torch_dtype: str | torch.dtype = "bfloat16",
     attn_implementation: str = "sdpa",
+    allow_missing_keys: bool = False,
 ):
     """Reconstruct a compressed model from a directory produced by
     :func:`save_compressed_checkpoint`.
@@ -667,13 +726,20 @@ def load_compressed_model(
       5. ``load_state_dict(strict=False)`` from the saved safetensors shards.
     """
     from transformers import AutoConfig, AutoTokenizer
-    from safetensors.torch import load_file
+    from safetensors import safe_open
 
     path = Path(path)
     meta = json.loads((path / COMPRESSED_METADATA_FILENAME).read_text())
     cfg = AutoConfig.from_pretrained(path)
     dtype = getattr(torch, torch_dtype) if isinstance(torch_dtype, str) else torch_dtype
-    target_device = torch.device("cuda") if (device_map == "auto" and torch.cuda.is_available()) else torch.device("cpu")
+    # Resolve target device. The previous string-compare ``device_map == "auto"``
+    # silently fell through to CPU when the caller passed a dict like
+    # ``{"": 0}`` (their explicit GPU pin), defeating the streaming intent
+    # and risking a host-RAM OOM on the post-load ``model.to``. If CUDA is
+    # available, stream to ``cuda``; otherwise CPU regardless of device_map.
+    target_device = (
+        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    )
 
     auto_cls = _pick_auto_class(list(getattr(cfg, "architectures", None) or []))
     log.info("Building skeleton %s from config (no weights yet)", auto_cls.__name__)
@@ -681,26 +747,117 @@ def load_compressed_model(
 
     _resize_moe_stack_to_metadata(model, meta, dtype=dtype, device=target_device)
 
-    log.info("Loading state_dict from %s", path)
+    # Stream each tensor one-at-a-time directly into ``target_device``,
+    # swapping the existing param/buffer storage in place. Avoids both
+    # the ~70 GB CPU state_dict (the Stage 3 OOM commit a98e6cc fixed)
+    # AND the dual-residence-on-CUDA peak that a per-shard partial dict
+    # would cause: holding a full shard's tensors (~50 GB) on cuda while
+    # the resized MoE skeleton (also ~50 GB) is still referenced briefly
+    # exceeds the 80 GB A100. By replacing one storage at a time, the
+    # allocator can reclaim each freed skeleton block before the next
+    # tensor lands. Peak CUDA = skeleton size + 1 tensor (a few hundred MB).
     shards = sorted(path.glob("model-*.safetensors")) or sorted(path.glob("*.safetensors"))
-    state_dict: dict[str, torch.Tensor] = {}
+    log.info("Streaming state_dict from %s (%d shards) → %s",
+             path, len(shards), target_device)
+    # IMPORTANT: harvest the key set without binding the dict. ``state_dict()``
+    # internally calls ``param.detach()`` which is ``shallow_copy_and_detach``
+    # — the returned dict's values share storage with the originals and bump
+    # each storage's refcount by 1. Keeping ``state`` alive across the shard
+    # loop pins every skeleton tensor on cuda, defeating the per-tensor swap
+    # below. The set comprehension is reaped immediately after this stmt, so
+    # detached aliases drop their extra refcount before the load begins.
+    expected_keys = set(model.state_dict().keys())
+    loaded_keys: set[str] = set()
+    unexpected_all: list[str] = []
+    # Pre-scan the largest single tensor we'll load. The streaming swap
+    # holds one tensor on the new device alongside the to-be-replaced
+    # storage, so peak ≈ skeleton + max_tensor. Logging it makes a future
+    # config change that introduces a multi-GB single tensor visible at
+    # load start (when we can still abort) instead of mid-load OOM.
+    max_bytes = 0
+    max_key = ""
     for s in shards:
-        state_dict.update(load_file(str(s)))
+        with safe_open(str(s), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                slice_obj = f.get_slice(key)
+                shape = slice_obj.get_shape()
+                # element size: bf16/fp16=2, fp32=4, int8=1, etc.
+                dtype_str = slice_obj.get_dtype()
+                elem = {"BF16": 2, "F16": 2, "F32": 4, "F64": 8,
+                        "I8": 1, "U8": 1, "I16": 2, "I32": 4, "I64": 8,
+                        "BOOL": 1}.get(dtype_str, 4)
+                nbytes = elem
+                for d in shape:
+                    nbytes *= d
+                if nbytes > max_bytes:
+                    max_bytes = nbytes
+                    max_key = key
+    log.info("Largest single tensor: %s (%.2f GB)", max_key, max_bytes / 1e9)
+    for k, s in enumerate(shards):
+        n_loaded_in_shard = 0
+        n_unexpected_in_shard = 0
+        with safe_open(str(s), framework="pt", device=str(target_device)) as f:
+            for key in f.keys():
+                t = f.get_tensor(key)            # already on target_device
+                if key not in expected_keys:
+                    unexpected_all.append(key)
+                    n_unexpected_in_shard += 1
+                    del t
+                    continue
+                _assign_storage(model, key, t)
+                loaded_keys.add(key)
+                n_loaded_in_shard += 1
+                del t
+        log.info("  shard %d/%d: %s (%d loaded, %d unexpected)",
+                 k + 1, len(shards), s.name, n_loaded_in_shard, n_unexpected_in_shard)
+        gc.collect()
+        if target_device.type == "cuda":
+            torch.cuda.empty_cache()
 
-    # Move the skeleton off `meta` before the load, then use assign=True so
-    # meta tensors can be replaced in-place rather than .copy_'d (which fails
-    # on meta). assign=True is safe when the state_dict tensors already have
-    # the right dtype/device (set by _resize_moe_stack_to_metadata).
-    try:
-        model.to_empty(device=target_device)
-    except Exception:                                # noqa: BLE001
-        pass
-    missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
-    log.info("  load_state_dict: missing=%d unexpected=%d", len(missing), len(unexpected))
-    if missing[:5]:
-        log.debug("  sample missing: %s", missing[:5])
-    if unexpected[:5]:
-        log.debug("  sample unexpected: %s", unexpected[:5])
+    missing_final = sorted(expected_keys - loaded_keys)
+    log.info("  load done: missing=%d unexpected=%d",
+             len(missing_final), len(unexpected_all))
+    if missing_final[:5]:
+        log.debug("  sample missing: %s", missing_final[:5])
+    if unexpected_all[:5]:
+        log.debug("  sample unexpected: %s", unexpected_all[:5])
+    # Fail loud on missing keys. A missing param/buffer means the skeleton's
+    # default _init_weights value (random init) survives — the model will
+    # silently train/run on garbage for that layer and we'd only notice
+    # hours later via degraded eval. Better to crash here. The
+    # ``allow_missing_keys`` flag is for tests on partial fixtures only.
+    if missing_final and not allow_missing_keys:
+        raise RuntimeError(
+            f"Streaming load completed with {len(missing_final)} missing key(s). "
+            f"Sample: {missing_final[:5]}. The skeleton retains random-init "
+            "weights for these — refusing to silently corrupt the model. "
+            "If this is a deliberate partial load, pass allow_missing_keys=True."
+        )
+
+    # Catch any leftovers: non-persistent buffers (e.g. RoPE ``inv_freq`` with
+    # ``persistent=False``) are NOT in state_dict / safetensors, so streaming
+    # never touches them. ``from_config`` initializes them on CPU; without
+    # this move, first forward hits a CUDA/CPU device mismatch (the same bug
+    # commit a98e6cc fixed). NB: blanket ``model.to_empty`` would obliterate
+    # the streamed weights — instead we surface meta leftovers as a hard
+    # error so the operator knows to investigate (we don't expect any with
+    # the current ``from_config`` path, but safer to fail loud than silent).
+    if target_device.type == "cuda":
+        meta_leftovers = [
+            n for n, p in model.named_parameters() if p.is_meta
+        ] + [
+            n for n, b in model.named_buffers() if b.is_meta
+        ]
+        if meta_leftovers:
+            raise RuntimeError(
+                f"After streaming load, {len(meta_leftovers)} tensor(s) are "
+                f"still on meta (sample: {meta_leftovers[:5]}). The skeleton "
+                "was not fully populated by the safetensors shards and a "
+                "blanket model.to_empty would silently zero out the streamed "
+                "weights. Investigate the missing keys reported above."
+            )
+        model.to(target_device)
+        torch.cuda.empty_cache()
 
     tokenizer = AutoTokenizer.from_pretrained(path)
     return model, tokenizer, meta

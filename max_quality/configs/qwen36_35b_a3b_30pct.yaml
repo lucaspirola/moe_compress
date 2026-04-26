@@ -68,6 +68,10 @@ stage2_reap_ream:
 
 stage3_svd:
   scope: moe_experts_only         # NEVER change; attention SVD is off-spec
+  batch_size: 16                  # B-cov forward runs under no_grad → cheap
+                                  # activations; bigger batch amortizes the
+                                  # model-weight HBM read. A100-80GB sweet
+                                  # spot: 16 (~30min Stage 3 vs ~5h40m at 1).
   d_rank:
     parameter_cost_omega_mode: auto  # ω = d1 + n·d2 per paper
   swift_svd_plus:
@@ -92,8 +96,18 @@ stage5_router_kd:
   optimizer: adamw
   learning_rate: 5.0e-5           # spec-corrected from 1e-5
   epochs: 1
-  batch_size: 2
-  gradient_accumulation: 4
+  # batch_size × gradient_accumulation = effective batch (=8). Bumped
+  # batch_size 2→4 and dropped grad_accum 4→2 since teacher is now 4-bit
+  # (~17 GB) so we have headroom on the A100. Activations at batch=4 with
+  # autograd: ~4 GB → total weights+acts ≈ 70 GB / 80 GB. Same effective
+  # batch, fewer gradient_accumulation iterations → ~2× wall-clock saved.
+  batch_size: 4
+  gradient_accumulation: 2
+  # Quantize the (frozen) teacher to NF4 via bitsandbytes so it fits on
+  # the same A100 as the student without CPU offload. KD signal is robust
+  # to 4-bit teacher precision (router is bottlenecked by topology, not
+  # logit precision); validate via Stage 6 vs. a precomputed-logits run.
+  teacher_load_in_4bit: true
   max_sequence_length: 512
   kd_temperature: 1.0
   max_calibration_samples: 3000

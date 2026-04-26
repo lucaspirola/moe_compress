@@ -23,6 +23,7 @@ from .utils.model_io import (
     save_compressed_checkpoint,
     save_json_artifact,
 )
+from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 
@@ -52,13 +53,16 @@ def run(
 
     rank_map: dict[str, int] = {}
     compensated_params = 0
-    for ref in iter_moe_layers(model):
+    layers = list(iter_moe_layers(model))
+    log.info("Stage 4: EoRA residual compensation over %d MoE layers", len(layers))
+    for k, ref in enumerate(layers):
         fe = ref.experts_module
         if not isinstance(fe, FactoredExperts):
             continue
         dev = fe.gate_proj_U.device
         dtype = fe.gate_proj_U.dtype
         N = fe.num_experts
+        log.info("Stage 4 layer %d/%d (idx=%d, %d experts)", k + 1, len(layers), ref.layer_idx, N)
         for name in MATRIX_NAMES:
             # Per-matrix-type, per-layer: pool per-expert residuals independently.
             # Budget: ≤ compensation_budget_pct of saved params for this matrix.
@@ -75,6 +79,10 @@ def run(
 
             U_corr = torch.zeros(N, d_out, r_per_expert, dtype=dtype, device=dev)
             V_corr = torch.zeros(N, r_per_expert, d_in, dtype=dtype, device=dev)
+            # Track residual norm before/after to verify EoRA actually helps.
+            res_before_sum = 0.0
+            res_after_sum = 0.0
+            n_eligible = 0
             for e in range(N):
                 key = (ref.layer_idx, e, name)
                 W_orig = originals.get(key)
@@ -88,16 +96,36 @@ def run(
                        fe.up_proj_V.data[e]   if name == "up_proj"   else \
                        fe.down_proj_V.data[e]
                 delta = W_orig_f - (U_e.to(torch.float32) @ V_e.to(torch.float32))
+                res_before_sum += float(delta.norm().item() ** 2)
                 A = A_cov.get(key)
                 Uc, Vc = _compute_eora_factors(delta, A, r_per_expert, dev)
                 U_corr[e] = Uc.to(dtype)
                 V_corr[e] = Vc.to(dtype)
+                # Residual after applying the planned correction (Uc @ Vc).
+                res_after = delta - (Uc.to(torch.float32) @ Vc.to(torch.float32))
+                res_after_sum += float(res_after.norm().item() ** 2)
+                n_eligible += 1
+                if (e + 1) % 32 == 0:
+                    log.info("  L%d/%s expert %d/%d", ref.layer_idx, name, e + 1, N)
 
             fe.widen_rank(name, U_corr, V_corr)
             rank_map[f"L{ref.layer_idx}_{name}"] = fe.ranks[name]
             compensated_params += int(U_corr.numel() + V_corr.numel())
-            log.info("  L%d/%s widened by r=%d → new rank=%d",
-                     ref.layer_idx, name, r_per_expert, fe.ranks[name])
+            res_before = (res_before_sum / max(n_eligible, 1)) ** 0.5
+            res_after = (res_after_sum / max(n_eligible, 1)) ** 0.5
+            rel_drop = (res_before - res_after) / max(res_before, 1e-12)
+            log.info("  L%d/%s widened by r=%d → new rank=%d; residual %.4e→%.4e (-%.1f%%)",
+                     ref.layer_idx, name, r_per_expert, fe.ranks[name],
+                     res_before, res_after, 100 * rel_drop)
+            _trackio_log({
+                "stage4/layer_idx": ref.layer_idx,
+                f"stage4/{name}_added_rank": r_per_expert,
+                f"stage4/{name}_new_rank": fe.ranks[name],
+                f"stage4/{name}_residual_before": res_before,
+                f"stage4/{name}_residual_after": res_after,
+                f"stage4/{name}_residual_rel_drop": rel_drop,
+                "stage4/compensated_params": compensated_params,
+            })
 
     out_dir = artifacts_dir / "stage4_eora"
     save_compressed_checkpoint(
@@ -110,6 +138,20 @@ def run(
         "compensated_params": compensated_params,
         "config": s4,
     }, out_dir / "eora_ranks.json")
+    # Stage 4 is the last consumer of both `_stage3_original_weights.pt` and
+    # `_stage2_input_covariance.pt`. Both are already durable on the per-stage
+    # Hub repos (`<base>-stage2`, `<base>-stage3`) — leaving them on the
+    # bucket only causes the entrypoint's job-exit aux upload to push ~140 GB
+    # of already-uploaded data to the aggregate result repo. Delete on Stage 4
+    # success only; on failure they stay so a re-run can pick up cleanly.
+    for sidecar in ("_stage3_original_weights.pt", "_stage2_input_covariance.pt"):
+        p = artifacts_dir / sidecar
+        if p.exists():
+            try:
+                p.unlink()
+                log.info("Deleted %s (no longer needed past Stage 4; durable on Hub)", p)
+            except OSError as exc:
+                log.warning("Could not delete %s: %s", p, exc)
     log.info("Stage 4 complete — EoRA added %d params → %s", compensated_params, out_dir)
     return out_dir
 

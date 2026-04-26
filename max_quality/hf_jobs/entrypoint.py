@@ -45,6 +45,16 @@ Either way the script returns and the HF Jobs runtime releases the GPU.
 #     "peft>=0.13.0",
 #     "pyyaml>=6.0",
 #     "lm-eval>=0.4.5",
+#     # Observability — Trackio (HF-native experiment tracking, syncs to
+#     # pirola/trackio Space) + pynvml/psutil for system metrics. See
+#     # src/moe_compress/utils/system_metrics.py.
+#     "trackio>=0.5.0",
+#     "nvidia-ml-py>=12.0",
+#     "psutil>=5.9",
+#     # 4-bit teacher quantization for Stage 5 router KD — avoids holding
+#     # ~120 GB (teacher 70 GB BF16 + student 50 GB BF16) on a single 80 GB
+#     # A100, which would force CPU offload and 5–10× slowdown.
+#     "bitsandbytes>=0.43.0",
 # ]
 # ///
 
@@ -126,9 +136,39 @@ def _main() -> int:
     result_repo = RESULT_REPO or _default_result_repo()
     LOG.info("Result repo will be: %s", result_repo)
 
+    # Per-stage Hub upload base — set so run_pipeline.py uploads each stage's
+    # checkpoint to its own per-stage repo immediately after the stage finishes.
+    # Bucket FUSE writes are NOT durable on cancel/SIGKILL; the Hub commit is
+    # the only durability boundary. See docs/huggingface_jobs_and_buckets.md.
+    per_stage_base = _per_stage_base_repo(result_repo)
+    os.environ["PIPELINE_HUB_RESULT_REPO_BASE"] = per_stage_base
+    LOG.info("Per-stage Hub upload base: %s (each stage → <base>-stage{N})", per_stage_base)
+
     exit_code = 0
     pipeline_error: BaseException | None = None
+    metrics = None
+    trackio_run = None
     try:
+        # Trackio: HF-native experiment tracking. Auto-creates the Space on
+        # first run. Inside try/finally so a slow Space-create or network
+        # hang still hits the cleanup path on cancel/timeout. Returns the
+        # Run object (not the module) so .log() works from background threads.
+        trackio_run = _init_trackio(result_repo)
+
+        # Background system-metrics sampler (GPU/CPU/VRAM/RAM every 30s).
+        # Logs to stdout AND the Trackio Run object so the curve is durable
+        # even if Trackio is off. Started inside the try so any failure
+        # flows through the finally (and so a startup error never skips
+        # the Trackio finish).
+        try:
+            from moe_compress.utils.system_metrics import SystemMetrics
+            metrics = SystemMetrics(interval_sec=30.0, trackio_run=trackio_run)
+            metrics.start()
+        except Exception as exc:                 # noqa: BLE001
+            LOG.warning("SystemMetrics startup failed (%s) — continuing without sampler",
+                        exc)
+            metrics = None
+
         # Import after sys.path manipulation.
         from moe_compress.run_pipeline import main as run_pipeline_main
         argv = [
@@ -147,6 +187,19 @@ def _main() -> int:
         pipeline_error = exc
         LOG.error("Pipeline raised: %s\n%s", exc, traceback.format_exc())
         exit_code = 2
+    finally:
+        # Drain metrics and finalize Trackio BEFORE the artifact upload so the
+        # dashboard captures the full timeline regardless of pipeline outcome.
+        if metrics is not None:
+            try:
+                metrics.stop()
+            except Exception as exc:             # noqa: BLE001
+                LOG.warning("metrics.stop failed: %s", exc)
+        if trackio_run is not None:
+            try:
+                trackio_run.finish()
+            except Exception as exc:             # noqa: BLE001
+                LOG.warning("trackio_run.finish failed: %s", exc)
 
     # 4. Upload artifacts regardless of success/failure — partial progress
     #    is worth keeping (per-stage artifacts can restart the next run).
@@ -282,6 +335,52 @@ def _download_code(repo_id: str, dest: Path) -> None:
     )
 
 
+def _init_trackio(result_repo: str):
+    """Initialize Trackio for this run. Returns the **Run** object on success,
+    or None on any failure (graceful fallback so a missing dep / Space-creation
+    error never blocks the pipeline). Uses a single shared Space at
+    ``$TRACKIO_SPACE_ID`` (default ``pirola/trackio``); each run lands as a
+    new name on the same dashboard.
+
+    NB: we return the Run object (not the trackio module) because Trackio's
+    module-level ``trackio.log`` reads a thread-local current-run pointer,
+    which means the SystemMetrics daemon thread (a different thread) can't
+    log via ``trackio.log``. ``run.log`` is object-bound and works from any
+    thread.
+    """
+    space_id = os.environ.get("TRACKIO_SPACE_ID", "pirola/trackio")
+    run_name = result_repo.split("/", 1)[-1]
+    try:
+        import trackio
+    except ImportError as exc:
+        LOG.warning("trackio not installed (%s) — observability metrics disabled", exc)
+        return None
+    try:
+        run = trackio.init(
+            project="moe-compress-strategy-a",
+            name=run_name,
+            space_id=space_id,
+            # Trackio's built-in GPU sampler — extra belt next to our own
+            # SystemMetrics CPU/RAM thread, in case our thread breaks.
+            auto_log_gpu=True,
+            gpu_log_interval=30.0,
+            config={
+                "model": MODEL_REPO,
+                "target_ratio": TARGET_RATIO,
+                "resume_from": RESUME_FROM,
+                "stop_after": STOP_AFTER,
+                "prior_stage_repo": PRIOR_STAGE_REPO or None,
+                "result_repo": result_repo,
+            },
+        )
+        LOG.info("Trackio initialized: project=moe-compress-strategy-a, name=%s, space=%s",
+                 run_name, space_id)
+        return run
+    except Exception as exc:                         # noqa: BLE001
+        LOG.warning("trackio.init failed (%s) — continuing without remote tracking", exc)
+        return None
+
+
 def _default_result_repo() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     # Strip a "Qwen/" prefix for brevity in the result repo name.
@@ -290,6 +389,14 @@ def _default_result_repo() -> str:
     # Per-stage runs get their own repo so supervision artifacts don't collide.
     stage_tag = f"-stop{STOP_AFTER}" if STOP_AFTER < 6 else ""
     return f"pirola/{stem}-strategy-a-{pct}pct{stage_tag}-{ts}"
+
+
+def _per_stage_base_repo(result_repo: str) -> str:
+    """Strip the ``-stopN`` segment from a result repo name so per-stage uploads
+    land in a stable family of repos regardless of where the operator chose to
+    stop. ``run_pipeline.py`` appends ``-stage{N}`` per stage."""
+    import re
+    return re.sub(r"-stop\d+", "", result_repo)
 
 
 def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:

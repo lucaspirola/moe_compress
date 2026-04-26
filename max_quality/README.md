@@ -89,6 +89,14 @@ uploaded as the main model; `stage*.json` per-stage artifacts land under
 **Re-runs are cheap**: the bucket retains the model snapshot (~70 GB) and the
 calibration token cache, so subsequent jobs skip those downloads.
 
+**Durability**: each heavy stage (2–5) uploads its checkpoint to a per-stage
+Hub repo (`<result_repo>-stage{N}`) immediately on completion, so a job that
+crashes or is cancelled later still preserves every completed stage. Resume
+the next stage with `PRIOR_STAGE_REPO=<that-stage-repo>`. Bucket writes are
+**not** durable on `hf jobs cancel` — see
+[`docs/huggingface_jobs_and_buckets.md`](docs/huggingface_jobs_and_buckets.md)
+for the full operating model.
+
 ## Protected components (never touched by pruning/SVD)
 
 - Shared expert at every MoE layer

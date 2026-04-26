@@ -18,6 +18,7 @@ from .utils.model_io import (
     iter_moe_layers,
     save_json_artifact,
 )
+from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +34,9 @@ def run(
 
     log.info("Stage 1: computing layer redundancy over %d MoE layers", len(moe_layers))
     redundancies: dict[int, float] = {}
-    for ref in moe_layers:
+    for k, ref in enumerate(moe_layers):
+        log.info("Stage 1 redundancy: layer %d/%d (idx=%d)",
+                 k + 1, len(moe_layers), ref.layer_idx)
         D = _pairwise_distance_matrix(ref, metric=s1["similarity_metric"])
         n = D.shape[0]
         if n <= 1:
@@ -41,6 +44,11 @@ def run(
             continue
         off = (D.sum() - D.diag().sum()) / (n * (n - 1))
         redundancies[ref.layer_idx] = 1.0 - float(off.item())
+        _trackio_log({
+            "stage1/layer": k + 1,
+            "stage1/layer_idx": ref.layer_idx,
+            "stage1/redundancy": redundancies[ref.layer_idx],
+        })
 
     budgets = _allocate_budgets(
         redundancies=redundancies,

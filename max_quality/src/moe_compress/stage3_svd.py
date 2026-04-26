@@ -43,8 +43,35 @@ from .utils.model_io import (
     save_compressed_checkpoint,
     save_json_artifact,
 )
+from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
+
+
+def _proc_rss_gb() -> float | None:
+    """Per-process RSS in GB. Tighter bound on the pipeline's own memory
+    footprint than ``virtual_memory().used`` (which is host-wide and
+    floats with page cache from other tenants / cold mmap pages).
+    Returns None if psutil is unavailable."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1e9
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+def _maxrss_gb() -> float | None:
+    """Peak RSS since process start, monotonically non-decreasing.
+    Best signal for ``did this layer's accumulator actually grow``."""
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+def _fmt(x):
+    return f"{x:.1f}" if x is not None else "?"
 
 
 @dataclass
@@ -84,13 +111,38 @@ def run(
     calib = build_calibration_tensor(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache"
     )
-    batches = iter_batches(calib, batch_size=1)
+    # batch_size is read from config; default 1 for backwards compat. The
+    # B-covariance forward runs under torch.no_grad(), so activations are
+    # cheap (~100 MB / batch elem) and the GPU bottleneck is HBM bandwidth
+    # — bigger batches amortize the model-weight read and approach
+    # compute-bound throughput. Empirical sweet spot on a100-large @ 80 GB
+    # VRAM is batch_size=16 (~30 min total Stage 3 vs. ~5h40m at batch=1).
+    bcov_batch_size = int(s3.get("batch_size", 1))
+    batches = iter_batches(calib, batch_size=bcov_batch_size)
+    log.info("Stage 3 B-cov calibration: batch_size=%d", bcov_batch_size)
     B_acc = InputCovarianceAccumulator()
-    _collect_pruned_input_covariance(model, moe_layers, batches, B_acc, device=device)
+    # Match Stage 2's bf16 storage so the per-layer covariance dict stays
+    # under the a100-large 142 GB cgroup limit. fp32 would be ~140 GB at
+    # the end of B-cov, which crashed our prior run at layer 20.
+    B_cov_dtype = getattr(torch, s3.get("bcov_storage_dtype", "bfloat16"))
+    B_acc.set_storage_dtype(B_cov_dtype)
+    # Per-layer disk spill directory. After each layer's finalize, that
+    # layer's entries are written to disk and dropped from memory; the
+    # factor loop later lazy-loads one layer at a time. Also gives us
+    # crash-resume: if a previous run made it to layer 19, those .pt
+    # files are already there and we skip those layers in the B-cov loop.
+    bcov_spill_dir = artifacts_dir / "_stage3_bcov_partial"
+    bcov_spill_dir.mkdir(parents=True, exist_ok=True)
+    _collect_pruned_input_covariance(
+        model, moe_layers, batches, B_acc, device=device,
+        spill_dir=bcov_spill_dir,
+    )
 
     # 1. Per-(layer, matrix) group stats and rank allocation.
+    log.info("Stage 3: computing per-group stats over %d layers", len(moe_layers))
     group_stats: dict[tuple[int, str], _GroupStats] = {}
-    for ref in moe_layers:
+    for k, ref in enumerate(moe_layers):
+        log.info("  group-stat layer %d/%d (idx=%d)", k + 1, len(moe_layers), ref.layer_idx)
         banks = build_banks(ref)
         for name in MATRIX_NAMES:
             group_stats[(ref.layer_idx, name)] = _group_stat(
@@ -111,6 +163,19 @@ def run(
         ranks_layer = {
             name: ranks[(ref.layer_idx, name)] for name in MATRIX_NAMES
         }
+        # Lazy-load this layer's B-cov from the per-layer spill files.
+        # Keeps in-memory cov bounded to ~one layer (~3-5 GB at bf16).
+        # Assert (not silent fall-through) — a missing spill at this
+        # point would mean _aa_svd silently falls back to plain SVD for
+        # this whole layer's experts, ignoring the activation-aware
+        # weighting; we'd ship a degraded model. Crash loud instead.
+        loaded = B_acc.load_layer_from_disk(ref.layer_idx, bcov_spill_dir)
+        if not loaded:
+            raise RuntimeError(
+                f"Stage 3 factor: B-cov spill missing for layer {ref.layer_idx} "
+                f"at {bcov_spill_dir}/layer_{ref.layer_idx}.pt. The B-cov phase "
+                "should have produced this file. Investigate before proceeding."
+            )
         banks = build_banks(ref)
         # Snapshot originals for this layer
         for e in range(ref.num_routed_experts):
@@ -126,7 +191,12 @@ def run(
             intermediate_dim=ex.gate_up_proj.shape[1] // 2,
             ranks=ranks_layer, dtype=dtype, device=dev,
         )
-        # Fill factors by per-expert AA-SVD.
+        # Fill factors by per-expert AA-SVD. Track relative reconstruction
+        # error per (layer, matrix) so the dashboard shows whether the chosen
+        # rank is enough — a "convergence in spirit" signal for the SVD.
+        err_sum: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
+        norm_sum: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
+        n_per_matrix: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
         for e in range(ref.num_routed_experts):
             for name in MATRIX_NAMES:
                 W = originals[(ref.layer_idx, e, name)].to(device=dev, dtype=torch.float32)
@@ -136,10 +206,27 @@ def run(
                 U_k, V_k = _aa_svd(W, A, B, k, device=dev)
                 new_factored.set_factors(e, name, U_k, V_k)
                 rank_map[f"L{ref.layer_idx}_E{e}_{name}"] = k
+                # Frobenius reconstruction error
+                with torch.no_grad():
+                    R = W - (U_k.to(torch.float32) @ V_k.to(torch.float32))
+                    err_sum[name] += float(R.norm().item() ** 2)
+                    norm_sum[name] += float(W.norm().item() ** 2)
+                    n_per_matrix[name] += 1
         # Swap in.
         setattr(ref.mlp, "experts", new_factored)
         ref.experts_module = new_factored
+        recon_metrics: dict[str, float] = {"stage3/recon_layer_idx": float(ref.layer_idx)}
+        for name in MATRIX_NAMES:
+            if norm_sum[name] > 0:
+                rel = (err_sum[name] / norm_sum[name]) ** 0.5
+                recon_metrics[f"stage3/recon_rel_err/{name}"] = rel
+                log.info("  L%d %s rank=%d rel_recon_err=%.4f",
+                         ref.layer_idx, name, ranks_layer[name], rel)
+        _trackio_log(recon_metrics)
         log.info("  layer %d factored at ranks=%s", ref.layer_idx, ranks_layer)
+        # Drop this layer's B-cov from memory now that we're done factoring
+        # it. The next iteration will lazy-load the next layer's spill.
+        B_acc.unload_layer(ref.layer_idx)
 
     # 3. Save originals for Stage 4.
     torch.save(originals, artifacts_dir / "_stage3_original_weights.pt")
@@ -169,6 +256,15 @@ def run(
         },
         "config": s3,
     }, out_dir / "rank_map.json")
+    # Clean up the per-layer B-cov spill dir on successful Stage 3 finish.
+    # Otherwise a future re-run (e.g. with a different svd_rank_ratio) would
+    # silently reuse the stale cov instead of recomputing. The spill dir's
+    # purpose is mid-stage crash-resume only; once Stage 3 has completed
+    # cleanly its outputs live in stage3_svd/ and originals.pt.
+    import shutil
+    if (artifacts_dir / "_stage3_bcov_partial").exists():
+        shutil.rmtree(artifacts_dir / "_stage3_bcov_partial", ignore_errors=True)
+        log.info("Removed Stage 3 B-cov spill dir (no longer needed post-success).")
     log.info("Stage 3 complete → %s", out_dir)
     return out_dir
 
@@ -272,13 +368,23 @@ def _aa_svd(
 
 def _collect_pruned_input_covariance(
     model, moe_layers, batches, B_acc: InputCovarianceAccumulator, *, device,
+    spill_dir=None,
 ) -> None:
-    """Collect post-prune input covariance one layer at a time so GPU + CPU
-    memory stays bounded. Trade-off: N forward passes instead of 1, but each
-    one only accumulates covariance for a single MoE layer (~200 experts ×
-    2 matrices = ~400 entries on CPU).
+    """Collect post-prune input covariance one layer at a time.
 
-    This addresses review P1-4 (simultaneous 40-layer instrumentation).
+    With ``spill_dir`` set, after each layer's finalize the layer's entries
+    are written to ``spill_dir/layer_{idx}.pt`` and dropped from memory,
+    bounding peak CPU usage to ~one layer's covariance (~3-5 GB at bf16).
+    On entry, any layer whose spill file already exists is skipped — this
+    is the crash-resume path: a previous run that died at layer 20 leaves
+    19 .pt files; the next run resumes at layer 20.
+
+    The spill itself runs on a background single-worker thread so the main
+    GPU loop can launch the *next* layer's forward pass while the previous
+    layer's ~5 GB tensors stream to FUSE. Spills are serialized against
+    each other (one worker) to avoid FUSE-bandwidth contention. Race-safe
+    because each spill only touches keys for its own ``layer_idx``; the
+    next layer mutates different keys.
     """
     def input_cb(li, e, tensor, ctx):
         B_acc.update(li, e, "gate_proj", tensor)  # up_proj aliases to gate_proj
@@ -286,10 +392,90 @@ def _collect_pruned_input_covariance(
     def intermediate_cb(li, e, tensor, ctx):
         B_acc.update(li, e, "down_proj", tensor)
 
-    for ref in moe_layers:
-        with instrument_experts(ref, {"input": input_cb, "intermediate": intermediate_cb}):
-            run_calibration(model, batches, device=device)
-        B_acc.finalize_layer(ref.layer_idx)
+    from concurrent.futures import ThreadPoolExecutor
+    spill_executor: ThreadPoolExecutor | None = None
+    spill_futures: list = []
+    if spill_dir is not None:
+        spill_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="bcov-spill",
+        )
+
+    n = len(moe_layers)
+    try:
+        for k, ref in enumerate(moe_layers):
+            if spill_dir is not None:
+                existing = (spill_dir / f"layer_{ref.layer_idx}.pt").exists()
+                if existing:
+                    log.info("Stage 3 B-cov layer %d/%d (idx=%d) — already spilled, skipping",
+                             k + 1, n, ref.layer_idx)
+                    continue
+            log.info("Stage 3 B-cov layer %d/%d (idx=%d) — instrumented calibration pass",
+                     k + 1, n, ref.layer_idx)
+            with instrument_experts(ref, {"input": input_cb, "intermediate": intermediate_cb}):
+                run_calibration(model, batches, device=device)
+            B_acc.finalize_layer(ref.layer_idx)
+            # Background spill: hand this layer off to the executor so the
+            # main loop can immediately start the NEXT layer's forward pass.
+            # Spill takes ~30-60s for a 5 GB layer on FUSE; the next forward
+            # takes ~8 min, so we fully overlap I/O with GPU compute.
+            if spill_executor is not None:
+                # Surface earlier failures BEFORE submitting more work.
+                _drain_done_futures(spill_futures)
+                fut = spill_executor.submit(
+                    B_acc.spill_layer_to_disk, ref.layer_idx, spill_dir,
+                )
+                spill_futures.append(fut)
+            # Trackio: per-layer pipeline-progress snapshot. Three CPU memory
+            # signals so we can distinguish accumulator growth from page cache:
+            #   - bcov_ram_used_gb:  host-wide (psutil.virtual_memory().used);
+            #                        floats with page cache, NOT a leak indicator.
+            #   - bcov_proc_rss_gb:  this process's RSS (Python heap + tensor
+            #                        storage + touched mmaps); tighter bound.
+            #   - bcov_maxrss_gb:    peak RSS since process start, monotonically
+            #                        non-decreasing — the cleanest "did the
+            #                        accumulator actually grow" trace.
+            proc_rss = _proc_rss_gb()
+            maxrss = _maxrss_gb()
+            host_ram = None
+            try:
+                import psutil
+                host_ram = psutil.virtual_memory().used / 1e9
+            except Exception:                            # noqa: BLE001
+                pass
+            log.info(
+                "  Stage 3 B-cov layer %d/%d done — proc_rss=%sGB maxrss=%sGB host_ram=%sGB",
+                k + 1, n, _fmt(proc_rss), _fmt(maxrss), _fmt(host_ram),
+            )
+            _trackio_log({
+                "stage3/bcov_layer": k + 1,
+                "stage3/bcov_layer_idx": ref.layer_idx,
+                "stage3/bcov_proc_rss_gb": proc_rss if proc_rss is not None else float("nan"),
+                "stage3/bcov_maxrss_gb": maxrss if maxrss is not None else float("nan"),
+                "stage3/bcov_ram_used_gb": host_ram if host_ram is not None else float("nan"),
+            })
+    finally:
+        if spill_executor is not None:
+            log.info("Waiting for %d background spill(s) to flush before factor phase",
+                     sum(1 for f in spill_futures if not f.done()))
+            for f in spill_futures:
+                # .result() reraises any exception from the spill thread.
+                f.result()
+            spill_executor.shutdown(wait=True)
+            log.info("All B-cov layer spills durable on disk.")
+
+
+def _drain_done_futures(futures: list) -> None:
+    """Surface exceptions from any spill that has already finished. Doesn't
+    block — only inspects already-completed futures and removes them from
+    the list. Call before submitting more work so a stale failure doesn't
+    silently keep the loop running."""
+    still_pending = []
+    for f in futures:
+        if f.done():
+            f.result()      # raises if the spill thread errored
+        else:
+            still_pending.append(f)
+    futures[:] = still_pending
 
 
 def _load_stage2_covariance(path: Path):
@@ -331,6 +517,11 @@ def _per_matrix_refine(
         fe: FactoredExperts = ref.experts_module
         if not isinstance(fe, FactoredExperts):
             continue
+        # Aggregate convergence: sum of (initial_loss, final_loss) over experts
+        # for this layer × matrix. Per-expert is too noisy for the dashboard.
+        layer_init: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
+        layer_final: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
+        layer_count: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
         for e in range(fe.num_experts):
             for name in MATRIX_NAMES:
                 key = (ref.layer_idx, e, name)
@@ -341,6 +532,10 @@ def _per_matrix_refine(
                 A_d = A.to(device=fe.gate_proj_U.device, dtype=torch.float32)
                 U_p = getattr(fe, f"{name}_U").data[e].clone().to(torch.float32).requires_grad_(True)
                 V_p = getattr(fe, f"{name}_V").data[e].clone().to(torch.float32).requires_grad_(True)
+                # Initial loss (pre-refine) for the convergence diff.
+                with torch.no_grad():
+                    R0 = W - U_p @ V_p
+                    init_loss = float(((R0 @ A_d) * R0).sum().item())
                 opt = torch.optim.LBFGS(
                     [U_p, V_p], history_size=lbfgs_history,
                     max_iter=lbfgs_steps, line_search_fn="strong_wolfe",
@@ -354,10 +549,29 @@ def _per_matrix_refine(
                     return loss
 
                 try:
-                    opt.step(closure)
+                    final_t = opt.step(closure)
+                    final_loss = float(final_t.item()) if final_t is not None else init_loss
                 except Exception as err:
                     log.debug("refine skipped for %s: %s", key, err)
                     continue
                 with torch.no_grad():
                     getattr(fe, f"{name}_U").data[e].copy_(U_p.to(getattr(fe, f"{name}_U").dtype))
                     getattr(fe, f"{name}_V").data[e].copy_(V_p.to(getattr(fe, f"{name}_V").dtype))
+                layer_init[name] += init_loss
+                layer_final[name] += final_loss
+                layer_count[name] += 1
+        # Per-layer LBFGS convergence: how much did the activation-weighted
+        # loss drop, averaged over experts? Negative = worse (shouldn't happen).
+        metrics: dict[str, float] = {"stage3/refine_layer_idx": float(ref.layer_idx)}
+        for name in MATRIX_NAMES:
+            if layer_count[name] == 0:
+                continue
+            init_m = layer_init[name] / layer_count[name]
+            final_m = layer_final[name] / layer_count[name]
+            rel = (init_m - final_m) / max(init_m, 1e-12)
+            metrics[f"stage3/refine_loss_init/{name}"] = init_m
+            metrics[f"stage3/refine_loss_final/{name}"] = final_m
+            metrics[f"stage3/refine_rel_drop/{name}"] = rel
+            log.info("  L%d %s LBFGS: %.4e → %.4e (drop %.1f%%)",
+                     ref.layer_idx, name, init_m, final_m, 100 * rel)
+        _trackio_log(metrics)

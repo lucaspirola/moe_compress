@@ -22,6 +22,7 @@ from .utils.activation_hooks import (
 )
 from .utils.calibration import build_super_expert_slice, iter_batches, spec_from_config
 from .utils.model_io import iter_moe_layers, save_json_artifact
+from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +90,24 @@ def run(
         "Stage 0 complete — blacklisted %d / %d experts → %s",
         sum(len(v) for v in out.values()), total_experts, path,
     )
+    # Trackio: per-layer distribution stats of the down-proj max activation
+    # (the signal Stage 0 thresholds on). High max + high std = a real super
+    # expert; low std + high cap = the threshold is doing nothing.
+    import statistics as _stats
+    for ref in moe_layers:
+        vals = [
+            acc.per_expert_max.get((ref.layer_idx, e), 0.0)
+            for e in range(ref.num_routed_experts)
+        ]
+        if not vals:
+            continue
+        _trackio_log({
+            "stage0/layer_idx": ref.layer_idx,
+            "stage0/down_max_mean": float(_stats.fmean(vals)),
+            "stage0/down_max_std": float(_stats.pstdev(vals)) if len(vals) > 1 else 0.0,
+            "stage0/down_max_max": float(max(vals)),
+            "stage0/blacklisted": float(len(blacklist.get(ref.layer_idx, []))),
+        })
     return path
 
 

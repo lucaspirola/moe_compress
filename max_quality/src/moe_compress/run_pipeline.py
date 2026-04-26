@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -38,9 +39,25 @@ from . import (
     stage5_router_kd,
     stage6_validate,
 )
+from .utils.hub_upload import (
+    hub_repo_base_from_env,
+    upload_stage_to_hub,
+    wait_for_pending_uploads,
+)
 from .utils.model_io import load_json_artifact, load_model, load_compressed_model
+from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
+
+
+def _finish_stage(stage_idx: int, t_start: float, repo_id: str | None) -> None:
+    """Log stage completion + push timing scalar to Trackio. The repo name is
+    a string and goes to stdout only — Trackio metrics are scalars."""
+    dt = time.monotonic() - t_start
+    h = int(dt // 3600); m = int((dt % 3600) // 60); s = int(dt % 60)
+    log.info("Stage %d done in %dh%02dm%02ds — durable on Hub: %s",
+             stage_idx, h, m, s, repo_id or "<not uploaded>")
+    _trackio_log({f"pipeline/stage_{stage_idx}_seconds": dt})
 
 
 STAGE_REGISTRY = {
@@ -131,38 +148,57 @@ def main(argv=None) -> int:
         from .utils import model_io as _mio
         _mio.save_checkpoint = _skip_save_checkpoint
 
+    hub_base = hub_repo_base_from_env()
+
     if start <= 2 <= stop:
         log.info("=== Stage 2 — REAP + REAM ===")
+        t2 = time.monotonic()
         stage2_reap_ream.run(model, tokenizer, config, artifacts_dir, device=device)
+        repo2 = upload_stage_to_hub(2, artifacts_dir, repo_base=hub_base) if hub_base else None
+        _finish_stage(2, t2, repo2)
     if stop < 3:
         log.info("Stopping after stage %d as requested.", stop)
+        wait_for_pending_uploads()
         return 0
 
     if start <= 3 <= stop:
         log.info("=== Stage 3 — SVD ===")
+        t3 = time.monotonic()
         stage3_svd.run(model, tokenizer, config, artifacts_dir, decomposition, device=device)
+        repo3 = upload_stage_to_hub(3, artifacts_dir, repo_base=hub_base) if hub_base else None
+        _finish_stage(3, t3, repo3)
     if stop < 4:
         log.info("Stopping after stage %d as requested.", stop)
+        wait_for_pending_uploads()
         return 0
 
     if start <= 4 <= stop:
         log.info("=== Stage 4 — EoRA ===")
+        t4 = time.monotonic()
         stage4_eora.run(model, tokenizer, config, artifacts_dir)
+        repo4 = upload_stage_to_hub(4, artifacts_dir, repo_base=hub_base) if hub_base else None
+        _finish_stage(4, t4, repo4)
     if stop < 5:
         log.info("Stopping after stage %d as requested.", stop)
+        wait_for_pending_uploads()
         return 0
 
     if start <= 5 <= stop:
         log.info("=== Stage 5 — Router KD ===")
+        t5 = time.monotonic()
         stage5_router_kd.run(model, tokenizer, config, artifacts_dir, device=device)
+        repo5 = upload_stage_to_hub(5, artifacts_dir, repo_base=hub_base) if hub_base else None
+        _finish_stage(5, t5, repo5)
     if stop < 6:
         log.info("Stopping after stage %d as requested.", stop)
+        wait_for_pending_uploads()
         return 0
 
     if start <= 6 <= stop:
         log.info("=== Stage 6 — Validation ===")
         stage6_validate.run(model, tokenizer, config, artifacts_dir, device=device)
 
+    wait_for_pending_uploads()
     log.info("Pipeline complete.")
     return 0
 

@@ -33,6 +33,7 @@ from .utils.model_io import (
     load_model,
     save_json_artifact,
 )
+from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +108,35 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     overall_pass = all(results["thresholds"].values())
     log.info("Stage 6 complete — thresholds %s; detail → %s",
              "PASS" if overall_pass else "FAIL", path)
+    # Trackio: flatten the metric scalars so they appear on the dashboard.
+    # Layout per `_deltas`/`_measured_reduction`: results = {
+    #   "student": {metric: float, ...},
+    #   "teacher": {metric: float, ...},
+    #   "delta":   {metric: {"student": s, "teacher": t, "delta": d}, ...},
+    #   "measured_reduction": {total_student, total_teacher, total_reduction_ratio, ...},
+    # }
+    flat: dict[str, float] = {}
+    for side in ("student", "teacher"):
+        for k, v in results.get(side, {}).items():
+            try:
+                flat[f"stage6/{side}/{k}"] = float(v)
+            except (TypeError, ValueError):
+                pass
+    for k, triple in results.get("delta", {}).items():
+        if isinstance(triple, dict):
+            for sub in ("student", "teacher", "delta"):
+                if sub in triple:
+                    try:
+                        flat[f"stage6/delta/{k}/{sub}"] = float(triple[sub])
+                    except (TypeError, ValueError):
+                        pass
+    for k, v in results.get("measured_reduction", {}).items():
+        try:
+            flat[f"stage6/measured_reduction/{k}"] = float(v)
+        except (TypeError, ValueError):
+            pass
+    flat["stage6/overall_pass"] = 1.0 if overall_pass else 0.0
+    _trackio_log(flat)
     if not overall_pass:
         log.error(
             "One or more quality gates FAILED: %s",
@@ -146,8 +176,9 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None) -> float:
     model.eval()
     nll_sum = 0.0
     tok_count = 0
+    log.info("Stage 6 PPL: %d sequences × len=%d", n_full, seq_len)
     with torch.no_grad():
-        for batch in iter_batches(chunks, batch_size=1):
+        for i, batch in enumerate(iter_batches(chunks, batch_size=1)):
             if device is not None:
                 batch = batch.to(device)
             out = model(input_ids=batch, labels=batch)
@@ -155,6 +186,8 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None) -> float:
             nll = float(out.loss.item()) * (batch.numel() - batch.shape[0])
             nll_sum += nll
             tok_count += batch.numel() - batch.shape[0]
+            if (i + 1) % 64 == 0:
+                log.info("  PPL forward %d/%d", i + 1, n_full)
     if tok_count == 0:
         return float("inf")
     return math.exp(nll_sum / tok_count)
@@ -211,12 +244,15 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None) -> float:
     model.eval()
     passes = 0
     total = 0
-    for row in ds:
+    log.info("Stage 6 HumanEval: %d problems", len(ds))
+    for i, row in enumerate(ds):
         prompt = row["prompt"]
         completion = _generate(model, tokenizer, prompt, max_new=max_new, device=device)
         if _check_humaneval(prompt, completion, row["test"], row["entry_point"]):
             passes += 1
         total += 1
+        if (i + 1) % 16 == 0:
+            log.info("  HumanEval %d/%d (pass=%d)", i + 1, len(ds), passes)
     return passes / max(total, 1)
 
 
@@ -237,12 +273,16 @@ def _math500(model, tokenizer, cfg: dict, *, device=None) -> float:
     model.eval()
     correct = 0
     total = 0
-    for row in ds.select(range(min(n, len(ds)))):
+    n_total = min(n, len(ds))
+    log.info("Stage 6 MATH-500: %d problems", n_total)
+    for i, row in enumerate(ds.select(range(n_total))):
         prompt = f"Problem: {row['problem']}\nAnswer:"
         completion = _generate(model, tokenizer, prompt, max_new=max_new, device=device)
         if _check_math(completion, row.get("answer", "")):
             correct += 1
         total += 1
+        if (i + 1) % 25 == 0:
+            log.info("  MATH-500 %d/%d (correct=%d)", i + 1, n_total, correct)
     return correct / max(total, 1)
 
 
