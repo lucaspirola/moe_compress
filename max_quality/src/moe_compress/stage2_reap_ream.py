@@ -17,7 +17,10 @@ algorithmically.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
+import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -81,7 +84,61 @@ def run(
     cov_acc.set_storage_dtype(cov_dtype)
     merge_map: dict[int, dict[int, list[int]]] = {}
 
+    # -----------------------------------------------------------------------
+    # Crash-resume: scan partial_dir for layers already completed in a prior
+    # interrupted run. Re-apply merges in layer order (fast, no forward pass).
+    # -----------------------------------------------------------------------
+    partial_dir = artifacts_dir / "_stage2_partial"
+    partial_dir.mkdir(parents=True, exist_ok=True)
+    completed_layers: set[int] = set()
+
+    for ref in moe_layers:
+        merge_path = partial_dir / f"merge_{ref.layer_idx}.json"
+        cov_path = partial_dir / f"layer_{ref.layer_idx}.pt"
+        if not (merge_path.exists() and cov_path.exists()):
+            continue
+        data = json.loads(merge_path.read_text())
+        fv = int(data.get("format_version", 0))
+        if fv != 1:
+            raise RuntimeError(
+                f"_stage2_partial/merge_{ref.layer_idx}.json has format_version={fv} "
+                "(expected 1) — delete _stage2_partial/ and re-run Stage 2"
+            )
+        centroid_ids = [int(x) for x in data["centroid_ids"]]
+        grouped = {int(k): list(v) for k, v in data["grouped"].items()}
+        freq = {int(k): int(v) for k, v in data["freq"].items()}
+        merge_map_layer = {int(k): list(v) for k, v in data["merge_map_layer"].items()}
+
+        _merge_experts_inplace(ref, grouped, freq,
+                               freq_weighted=s2["ream"]["frequency_weighted_merge"])
+        banks = build_banks(ref)
+        for bank in banks.values():
+            bank.select(centroid_ids)
+        _resize_router_for_kept_experts(ref, centroid_ids)
+
+        ok = cov_acc.load_layer_from_disk(ref.layer_idx, partial_dir)
+        if not ok:
+            raise RuntimeError(
+                f"Stage 2 resume: _stage2_partial/layer_{ref.layer_idx}.pt listed "
+                "but failed to load — delete _stage2_partial/ and re-run Stage 2"
+            )
+        merge_map[ref.layer_idx] = merge_map_layer
+        completed_layers.add(ref.layer_idx)
+        log.info("Stage 2: layer %d resumed from partial (skipping profile + merge)",
+                 ref.layer_idx)
+
+    if completed_layers:
+        log.info("Stage 2: resumed %d / %d layers from %s",
+                 len(completed_layers), len(moe_layers), partial_dir)
+
     for k, layer_ref in enumerate(moe_layers):
+        if layer_ref.layer_idx in completed_layers:
+            log.info(
+                "Stage 2 layer %d/%d (idx=%d) — skipped (resumed from partial)",
+                k + 1, len(moe_layers), layer_ref.layer_idx,
+            )
+            continue
+
         target = per_layer_target[layer_ref.layer_idx]
         log.info(
             "Stage 2 layer %d/%d (idx=%d) — profiling then merging to %d experts",
@@ -142,6 +199,15 @@ def run(
         }
         _remap_covariance_for_layer(cov_acc, layer_ref.layer_idx, centroid_ids)
 
+        # Atomically persist this layer's output for crash-resume.
+        # Uses a non-destructive snapshot (does NOT remove from cov_acc memory) so
+        # the final _save_covariance call at the end of run() sees the full dataset.
+        _snapshot_cov_layer(cov_acc, layer_ref.layer_idx, partial_dir)
+        _write_merge_json(
+            partial_dir, layer_ref.layer_idx, centroid_ids, grouped, freq,
+            merge_map[layer_ref.layer_idx],
+        )
+
         sum_cost = float(delta.sum()) if delta.size else 0.0
         max_group = max((len(g) for g in grouped.values()), default=1)
         mean_group = (n_experts - len(protected)) / max(len(centroid_ids), 1) if centroid_ids else 0.0
@@ -168,8 +234,60 @@ def run(
     )
     save_json_artifact(merge_map, out_dir / "merge_map.json")
     _save_covariance(cov_acc, artifacts_dir / "_stage2_input_covariance.pt")
+    shutil.rmtree(partial_dir, ignore_errors=True)
     log.info("Stage 2 complete — pruned checkpoint at %s", out_dir)
     return out_dir
+
+
+# ---------------------------------------------------------------------------
+# Partial-resume helpers
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_cov_layer(
+    cov_acc: InputCovarianceAccumulator,
+    layer_idx: int,
+    partial_dir: Path,
+) -> None:
+    """Atomically write layer_idx's covariance to partial_dir WITHOUT removing it from memory.
+
+    Unlike InputCovarianceAccumulator.spill_layer_to_disk (which pops the keys),
+    this snapshot is non-destructive so _save_covariance at the end of run() still
+    sees the full accumulated dataset.
+    """
+    keys = [k for k in cov_acc.covariance if k[0] == layer_idx]
+    if not keys:
+        return
+    payload = {
+        "format_version": 1,
+        "covariance": {k: cov_acc.covariance[k].clone() for k in keys},
+        "tokens": {k: cov_acc.token_count.get(k, 0) for k in keys},
+    }
+    tmp = partial_dir / f"layer_{layer_idx}.pt.tmp"
+    final = partial_dir / f"layer_{layer_idx}.pt"
+    torch.save(payload, tmp)
+    os.replace(tmp, final)
+
+
+def _write_merge_json(
+    partial_dir: Path,
+    layer_idx: int,
+    centroid_ids: list[int],
+    grouped: dict[int, list[int]],
+    freq: dict[int, int],
+    merge_map_layer: dict[int, list[int]],
+) -> None:
+    payload = {
+        "format_version": 1,
+        "centroid_ids": centroid_ids,
+        "grouped": {str(k): list(v) for k, v in grouped.items()},
+        "freq": {str(k): int(v) for k, v in freq.items()},
+        "merge_map_layer": {str(k): list(v) for k, v in merge_map_layer.items()},
+    }
+    tmp = partial_dir / f"merge_{layer_idx}.json.tmp"
+    final = partial_dir / f"merge_{layer_idx}.json"
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, final)
 
 
 # ---------------------------------------------------------------------------

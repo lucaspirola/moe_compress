@@ -12,9 +12,12 @@ Stage 4 never re-inflates by more than that fraction.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from .utils.model_io import (
     MATRIX_NAMES,
@@ -55,6 +58,10 @@ def run(
     compensated_params = 0
     layers = list(iter_moe_layers(model))
     log.info("Stage 4: EoRA residual compensation over %d MoE layers", len(layers))
+
+    partial_dir = artifacts_dir / "_stage4_partial"
+    partial_dir.mkdir(parents=True, exist_ok=True)
+
     for k, ref in enumerate(layers):
         fe = ref.experts_module
         if not isinstance(fe, FactoredExperts):
@@ -62,7 +69,38 @@ def run(
         dev = fe.gate_proj_U.device
         dtype = fe.gate_proj_U.dtype
         N = fe.num_experts
+
+        # Crash-resume: load saved layer state if present.
+        spill_path = partial_dir / f"layer_{ref.layer_idx}.pt"
+        if spill_path.exists():
+            try:
+                payload = torch.load(spill_path, map_location="cpu")
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Stage 4 resume: failed to load {spill_path}: {exc}"
+                ) from exc
+            fv = int(payload.get("format_version", 0))
+            if fv != 1:
+                raise RuntimeError(
+                    f"Stage 4 resume: {spill_path} has format_version={fv} "
+                    "(expected 1) — delete _stage4_partial/ and re-run Stage 4"
+                )
+            for name in MATRIX_NAMES:
+                u = payload[f"{name}_U"].to(device=dev, dtype=dtype)
+                v = payload[f"{name}_V"].to(device=dev, dtype=dtype)
+                setattr(fe, f"{name}_U", nn.Parameter(u, requires_grad=False))
+                setattr(fe, f"{name}_V", nn.Parameter(v, requires_grad=False))
+                fe.ranks[name] = int(payload["ranks"][name])
+            rank_map.update(payload["rank_map_layer"])
+            compensated_params += int(payload["compensated_params_layer"])
+            log.info("Stage 4 layer %d/%d (idx=%d) — resumed from partial",
+                     k + 1, len(layers), ref.layer_idx)
+            continue
+
         log.info("Stage 4 layer %d/%d (idx=%d, %d experts)", k + 1, len(layers), ref.layer_idx, N)
+        layer_compensated_params = 0
+        rank_map_layer: dict[str, int] = {}
+
         for name in MATRIX_NAMES:
             # Per-matrix-type, per-layer: pool per-expert residuals independently.
             # Budget: ≤ compensation_budget_pct of saved params for this matrix.
@@ -109,8 +147,8 @@ def run(
                     log.info("  L%d/%s expert %d/%d", ref.layer_idx, name, e + 1, N)
 
             fe.widen_rank(name, U_corr, V_corr)
-            rank_map[f"L{ref.layer_idx}_{name}"] = fe.ranks[name]
-            compensated_params += int(U_corr.numel() + V_corr.numel())
+            rank_map_layer[f"L{ref.layer_idx}_{name}"] = fe.ranks[name]
+            layer_compensated_params += int(U_corr.numel() + V_corr.numel())
             res_before = (res_before_sum / max(n_eligible, 1)) ** 0.5
             res_after = (res_after_sum / max(n_eligible, 1)) ** 0.5
             rel_drop = (res_before - res_after) / max(res_before, 1e-12)
@@ -124,8 +162,14 @@ def run(
                 f"stage4/{name}_residual_before": res_before,
                 f"stage4/{name}_residual_after": res_after,
                 f"stage4/{name}_residual_rel_drop": rel_drop,
-                "stage4/compensated_params": compensated_params,
+                "stage4/compensated_params": compensated_params + layer_compensated_params,
             })
+
+        rank_map.update(rank_map_layer)
+        compensated_params += layer_compensated_params
+
+        # Atomically persist this layer's FactoredExperts state for crash-resume.
+        _spill_layer(partial_dir, ref.layer_idx, fe, rank_map_layer, layer_compensated_params)
 
     out_dir = artifacts_dir / "stage4_eora"
     save_compressed_checkpoint(
@@ -138,6 +182,9 @@ def run(
         "compensated_params": compensated_params,
         "config": s4,
     }, out_dir / "eora_ranks.json")
+
+    shutil.rmtree(partial_dir, ignore_errors=True)
+
     # Stage 4 is the last consumer of both `_stage3_original_weights.pt` and
     # `_stage2_input_covariance.pt`. Both are already durable on the per-stage
     # Hub repos (`<base>-stage2`, `<base>-stage3`) — leaving them on the
@@ -154,6 +201,29 @@ def run(
                 log.warning("Could not delete %s: %s", p, exc)
     log.info("Stage 4 complete — EoRA added %d params → %s", compensated_params, out_dir)
     return out_dir
+
+
+def _spill_layer(
+    partial_dir: Path,
+    layer_idx: int,
+    fe: FactoredExperts,
+    rank_map_layer: dict[str, int],
+    compensated_params_layer: int,
+) -> None:
+    payload = {
+        "format_version": 1,
+        "layer_idx": layer_idx,
+        "ranks": dict(fe.ranks),
+        "rank_map_layer": rank_map_layer,
+        "compensated_params_layer": compensated_params_layer,
+    }
+    for name in MATRIX_NAMES:
+        payload[f"{name}_U"] = getattr(fe, f"{name}_U").data.cpu()
+        payload[f"{name}_V"] = getattr(fe, f"{name}_V").data.cpu()
+    tmp = partial_dir / f"layer_{layer_idx}.pt.tmp"
+    final = partial_dir / f"layer_{layer_idx}.pt"
+    torch.save(payload, tmp)
+    os.replace(tmp, final)
 
 
 def _compute_eora_factors(

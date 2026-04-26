@@ -11,6 +11,7 @@ unchanged from the earlier design.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -160,6 +161,7 @@ def run(
     )
     grad_accum = s5["gradient_accumulation"]
     T = s5["kd_temperature"]
+    ckpt_every = int(s5.get("checkpoint_every_n_steps", 0))
 
     student_refs = list(iter_moe_layers(student))
     student_layer_idxs = {r.layer_idx for r in student_refs}
@@ -177,19 +179,74 @@ def run(
                 "Regenerate the cache against the same model architecture."
             )
 
+    # -----------------------------------------------------------------------
+    # Crash-resume: find latest checkpoint and restore router + optim state.
+    # Checkpoints are only written on optimizer step boundaries (every
+    # checkpoint_every_n_steps steps). On resume, up to grad_accum-1 batches
+    # of gradient signal from the last incomplete accumulation window before the
+    # crash are silently dropped — the gradient buffer is zeroed on restart. This
+    # is an inherent limitation of step-boundary checkpointing and is acceptable
+    # for router KD (the training signal is redundant across batches).
+    # -----------------------------------------------------------------------
+    partial_dir = artifacts_dir / "_stage5_partial"
+    partial_dir.mkdir(parents=True, exist_ok=True)
+    resume_step = 0
+    resume_epoch = 0
+    resume_batch_i = -1
+
+    ckpts = sorted(
+        partial_dir.glob("step_*.pt"),
+        key=lambda p: int(p.stem.split("_")[1]),
+    )
+    if ckpts:
+        latest = ckpts[-1]
+        try:
+            payload = torch.load(latest, map_location="cpu")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Stage 5 resume: failed to load checkpoint {latest}: {exc}"
+            ) from exc
+        fv = int(payload.get("format_version", 0))
+        if fv != 1:
+            raise RuntimeError(
+                f"Stage 5 checkpoint {latest} has format_version={fv} "
+                "(expected 1) — delete _stage5_partial/ and re-run Stage 5"
+            )
+        # Restore router parameters into the student model.
+        for pname, t in payload["router_state"].items():
+            parts = pname.split(".")
+            obj = student
+            for part in parts[:-1]:
+                obj = getattr(obj, part)
+            getattr(obj, parts[-1]).data.copy_(t)
+        optim.load_state_dict(payload["optim_state"])
+        if device is not None:
+            _move_optimizer_state_to_device(optim, device)
+        resume_step = int(payload["step"])
+        resume_epoch = int(payload["epoch"])
+        resume_batch_i = int(payload["batch_idx"])
+        log.info("Stage 5: resumed from step %d (epoch %d, batch %d)",
+                 resume_step, resume_epoch, resume_batch_i)
+
     student.train()
     total_steps = (len(batches) // grad_accum) * s5["epochs"]
     log.info("Stage 5: %d routers trainable; %d steps (grad-accum=%d)",
              sum(1 for _ in student.parameters() if _.requires_grad),
              total_steps, grad_accum)
 
-    step = 0
+    step = resume_step
     optim.zero_grad()
     cache_seq_len = int(s5["max_sequence_length"])
     cache_batch_size = int(s5["batch_size"])
     cache_tokens_per_batch = cache_batch_size * cache_seq_len
     for epoch in range(s5["epochs"]):
+        if epoch < resume_epoch:
+            continue
         for i, batch in enumerate(batches):
+            # Fast-forward: skip batches already processed in the resumed run.
+            if epoch == resume_epoch and i <= resume_batch_i:
+                continue
+
             if device is not None:
                 batch = batch.to(device)
 
@@ -291,14 +348,67 @@ def run(
                         "stage5/layer_loss_mean": mean_v,
                     }
                     _trackio_log(payload)
+
+                # Periodic checkpoint for crash-resume.
+                if ckpt_every > 0 and step % ckpt_every == 0:
+                    _save_stage5_checkpoint(partial_dir, step, epoch, i, student, optim)
+                    # Keep only the two most recent checkpoints to bound disk use.
+                    old_step = step - 2 * ckpt_every
+                    if old_step > 0:
+                        old_ckpt = partial_dir / f"step_{old_step}.pt"
+                        if old_ckpt.exists():
+                            old_ckpt.unlink()
         optim.zero_grad()
 
     out_dir = artifacts_dir / "stage5_final"
     save_compressed_checkpoint(
         student, tokenizer, out_dir, pipeline_stage="stage5_final",
     )
+    # Keep _stage5_partial/ on success: checkpoints are useful for debugging
+    # convergence and post-mortem analysis. The directory is small (≤ 2 × few MB).
     log.info("Stage 5 complete → %s", out_dir)
     return out_dir
+
+
+def _save_stage5_checkpoint(
+    partial_dir: Path,
+    step: int,
+    epoch: int,
+    batch_idx: int,
+    student: nn.Module,
+    optim: torch.optim.Optimizer,
+) -> None:
+    router_state = {
+        name: p.data.cpu().clone()
+        for name, p in student.named_parameters()
+        if p.requires_grad
+    }
+    payload = {
+        "format_version": 1,
+        "step": step,
+        "epoch": epoch,
+        "batch_idx": batch_idx,
+        "router_state": router_state,
+        "optim_state": optim.state_dict(),
+    }
+    tmp = partial_dir / f"step_{step}.pt.tmp"
+    final = partial_dir / f"step_{step}.pt"
+    torch.save(payload, tmp)
+    os.replace(tmp, final)
+    log.info("Stage 5: checkpoint saved at step %d (epoch %d, batch %d)", step, epoch, batch_idx)
+
+
+def _move_optimizer_state_to_device(optim: torch.optim.Optimizer, device) -> None:
+    """Move all optimizer state tensors to the target device.
+
+    Required after load_state_dict() when the checkpoint was saved on CPU
+    but the training params live on a CUDA device — otherwise the first
+    optimizer step silently mixes CPU and CUDA tensors.
+    """
+    for state in optim.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
 
 
 def _freeze_non_routers(model: nn.Module, trainable_patterns: list[str]) -> None:

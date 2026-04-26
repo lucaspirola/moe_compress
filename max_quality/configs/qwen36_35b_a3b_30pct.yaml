@@ -111,6 +111,7 @@ stage5_router_kd:
   max_sequence_length: 512
   kd_temperature: 1.0
   max_calibration_samples: 3000
+  checkpoint_every_n_steps: 100    # save router+optim state every N optimizer steps for crash-resume
   # Only router weights update. Enumerated paths are matched as substrings.
   trainable_name_patterns:
     - mlp.gate.weight

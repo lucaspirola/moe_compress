@@ -506,7 +506,9 @@ def capture_router_outputs(layer_refs: list[MoELayerRef]):
             logits = F.linear(x, router.weight)
             if getattr(router, "bias", None) is not None:
                 logits = logits + router.bias
-            storage[li].append(logits.detach())
+            # Do NOT detach: teacher logits are captured inside torch.no_grad() so they
+            # have no grad_fn anyway; student logits need grad_fn for backward() to work.
+            storage[li].append(logits)
         return _h
 
     for ref in layer_refs:

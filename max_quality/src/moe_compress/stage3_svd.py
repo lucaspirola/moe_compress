@@ -43,6 +43,7 @@ from .utils.model_io import (
     save_compressed_checkpoint,
     save_json_artifact,
 )
+from .utils.futures import drain_done_futures as _drain_done_futures
 from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
@@ -462,20 +463,6 @@ def _collect_pruned_input_covariance(
                 f.result()
             spill_executor.shutdown(wait=True)
             log.info("All B-cov layer spills durable on disk.")
-
-
-def _drain_done_futures(futures: list) -> None:
-    """Surface exceptions from any spill that has already finished. Doesn't
-    block — only inspects already-completed futures and removes them from
-    the list. Call before submitting more work so a stale failure doesn't
-    silently keep the loop running."""
-    still_pending = []
-    for f in futures:
-        if f.done():
-            f.result()      # raises if the spill thread errored
-        else:
-            still_pending.append(f)
-    futures[:] = still_pending
 
 
 def _load_stage2_covariance(path: Path):
