@@ -68,7 +68,25 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
                 model, tokenizer, s6["generative"]["math500"], device=device,
             )
 
-    # 4. Load teacher for baseline comparison and repeat the same slices
+    # 4. Snapshot student param counts BEFORE loading teacher — once teacher
+    #    is loaded we may move student to CPU, but `count_expert_parameters`
+    #    is param-element-counting and dtype-independent so it stays correct.
+    student_total = count_parameters(model)
+    student_expert = count_expert_parameters(model, routed_only=True)
+
+    # 5. Free student GPU memory before loading the BF16 teacher — together
+    #    they exceed the 80 GB A100 budget (factored student ~35 GB +
+    #    BF16 teacher ~70 GB > 80 GB). Student eval is done; we don't need
+    #    it on GPU again. CPU offload keeps it available for parameter
+    #    counting; full delete is unnecessary.
+    import torch
+    try:
+        model.to("cpu")
+    except Exception as exc:                                # noqa: BLE001
+        log.warning("Could not move student to CPU before teacher load: %s", exc)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     log.info("Stage 6: loading uncompressed baseline for delta computation")
     teacher, _ = load_model(
         config["model"]["name_or_path"],
@@ -99,7 +117,9 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
 
     # 5. Deltas and threshold checks
     results["delta"] = _deltas(results["student"], results["teacher"])
-    results["measured_reduction"] = _measured_reduction(model, teacher)
+    results["measured_reduction"] = _measured_reduction(
+        model, teacher, student_total=student_total, student_expert=student_expert,
+    )
     results["thresholds"] = _check_thresholds(results, s6["thresholds"])
 
     path = artifacts_dir / "stage6_eval.json"
@@ -348,10 +368,18 @@ def _deltas(student: dict, teacher: dict) -> dict:
     return out
 
 
-def _measured_reduction(student, teacher) -> dict:
-    s_total = count_parameters(student)
+def _measured_reduction(
+    student, teacher,
+    *,
+    student_total: int | None = None,
+    student_expert: int | None = None,
+) -> dict:
+    # Allow caller to pass pre-computed student counts (taken before student
+    # was moved to CPU for the teacher load). Fall back to live counts when
+    # called outside that context.
+    s_total = student_total if student_total is not None else count_parameters(student)
+    s_expert = student_expert if student_expert is not None else count_expert_parameters(student, routed_only=True)
     t_total = count_parameters(teacher)
-    s_expert = count_expert_parameters(student, routed_only=True)
     t_expert = count_expert_parameters(teacher, routed_only=True)
     return {
         "total_student": s_total,

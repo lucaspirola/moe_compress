@@ -38,6 +38,11 @@ def run(
     artifacts_dir: Path,
 ) -> Path:
     s4 = config["stage4_eora"]
+    # A-cov was persisted by Stage 2 in this storage dtype; the eigh threshold
+    # in `_compute_eora_factors` must be tuned to that dtype's quantization
+    # noise floor or it will keep noise-inflated directions.
+    s2 = config.get("stage2_reap_ream", {})
+    a_storage_dtype = getattr(torch, s2.get("covariance_storage_dtype", "float32"))
     A_cov_path = artifacts_dir / "_stage2_input_covariance.pt"
     A_cov = {}
     if A_cov_path.exists():
@@ -117,6 +122,10 @@ def run(
 
             U_corr = torch.zeros(N, d_out, r_per_expert, dtype=dtype, device=dev)
             V_corr = torch.zeros(N, r_per_expert, d_in, dtype=dtype, device=dev)
+            # Per-expert effective rank of the EoRA correction. Defaults to
+            # 0 for experts without an `originals` entry (no correction
+            # applied → no parameters added in effective terms).
+            eff_per_expert: list[int] = [0] * N
             # Track residual norm before/after to verify EoRA actually helps.
             res_before_sum = 0.0
             res_after_sum = 0.0
@@ -136,9 +145,12 @@ def run(
                 delta = W_orig_f - (U_e.to(torch.float32) @ V_e.to(torch.float32))
                 res_before_sum += float(delta.norm().item() ** 2)
                 A = A_cov.get(key)
-                Uc, Vc = _compute_eora_factors(delta, A, r_per_expert, dev)
+                Uc, Vc, take_eff = _compute_eora_factors(
+                    delta, A, r_per_expert, dev, storage_dtype=a_storage_dtype,
+                )
                 U_corr[e] = Uc.to(dtype)
                 V_corr[e] = Vc.to(dtype)
+                eff_per_expert[e] = int(take_eff)
                 # Residual after applying the planned correction (Uc @ Vc).
                 res_after = delta - (Uc.to(torch.float32) @ Vc.to(torch.float32))
                 res_after_sum += float(res_after.norm().item() ** 2)
@@ -146,7 +158,7 @@ def run(
                 if (e + 1) % 32 == 0:
                     log.info("  L%d/%s expert %d/%d", ref.layer_idx, name, e + 1, N)
 
-            fe.widen_rank(name, U_corr, V_corr)
+            fe.widen_rank(name, U_corr, V_corr, added_effective_per_expert=eff_per_expert)
             rank_map_layer[f"L{ref.layer_idx}_{name}"] = fe.ranks[name]
             layer_compensated_params += int(U_corr.numel() + V_corr.numel())
             res_before = (res_before_sum / max(n_eligible, 1)) ** 0.5
@@ -231,25 +243,33 @@ def _compute_eora_factors(
     A: torch.Tensor | None,
     r: int,
     device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    storage_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Returns (U, V, take_eff) where `take_eff <= r` is the effective rank
+    of the correction. When `take_eff < r`, U/V are zero-padded to width r so
+    the caller's pre-allocated tensors stay shape-stable, but the trailing
+    `r - take_eff` columns/rows contribute nothing — they should not count
+    toward parameter budgets or rank reporting.
+    """
     if r <= 0:
         return (torch.zeros(delta.shape[0], 0, device=device),
-                torch.zeros(0, delta.shape[1], device=device))
+                torch.zeros(0, delta.shape[1], device=device), 0)
     delta = delta.to(device=device, dtype=torch.float32)
     d_out, d_in = delta.shape
 
-    def _plain_svd_padded() -> tuple[torch.Tensor, torch.Tensor]:
+    def _plain_svd_padded() -> tuple[torch.Tensor, torch.Tensor, int]:
         # Defensive zero-pad: caller's pre-allocated [d_out, r] / [r, d_in]
         # tensors require exact-r width even on the fallback path.
         U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
         rk = min(r, U.shape[1])
         if rk == r:
-            return U[:, :r] * S[:r], Vh[:r, :]
+            return U[:, :r] * S[:r], Vh[:r, :], r
         U_out = torch.zeros(d_out, r, device=device, dtype=delta.dtype)
         V_out = torch.zeros(r, d_in, device=device, dtype=delta.dtype)
         U_out[:, :rk] = U[:, :rk] * S[:rk]
         V_out[:rk, :] = Vh[:rk, :]
-        return U_out, V_out
+        return U_out, V_out, rk
 
     if A is None:
         return _plain_svd_padded()
@@ -257,11 +277,15 @@ def _compute_eora_factors(
     A = 0.5 * (A + A.T)
     eigvals, eigvecs = torch.linalg.eigh(A)            # ascending
     sigma_max = float(eigvals[-1].clamp_min(0).item())
-    thresh = max(sigma_max * 1e-6, 1e-12)
+    # Dtype-aware noise floor — see _NOISE_FLOOR_BY_DTYPE in stage3_svd.
+    from moe_compress.stage3_svd import _NOISE_FLOOR_BY_DTYPE
+    rel_floor = _NOISE_FLOOR_BY_DTYPE.get(storage_dtype or torch.float32, 1e-6)
+    thresh = max(sigma_max * rel_floor, 1e-12)
     keep_mask = eigvals > thresh
     keep_idx = keep_mask.nonzero(as_tuple=False).flatten()
     if keep_idx.numel() == 0:
-        return _plain_svd_padded()
+        U_pad, V_pad, eff = _plain_svd_padded()
+        return U_pad, V_pad, eff
     # `nonzero` returns indices in ascending position order, so `keep_idx`
     # is sorted ascending in eigvals (since eigh is ascending). flip → top-r.
     keep_desc = keep_idx.flip(0)
@@ -273,10 +297,10 @@ def _compute_eora_factors(
     U_take = U[:, :take_eff] * S[:take_eff]
     V_take = Vh[:take_eff] @ P.T                              # [take_eff, d_in]
     if take_eff >= r:
-        return U_take[:, :r], V_take[:r, :]
+        return U_take[:, :r], V_take[:r, :], r
     # Zero-pad to fixed r so caller's [d_out, r] / [r, d_in] tensors stay shape-stable.
     U_out = torch.zeros(d_out, r, device=device, dtype=U_take.dtype)
     V_out = torch.zeros(r, d_in, device=device, dtype=V_take.dtype)
     U_out[:, :take_eff] = U_take
     V_out[:take_eff, :] = V_take
-    return U_out, V_out
+    return U_out, V_out, take_eff

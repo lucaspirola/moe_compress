@@ -435,6 +435,16 @@ class FactoredExperts(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.intermediate_dim = int(intermediate_dim)
         self.ranks = dict(ranks)
+        # Per-expert effective rank tracking. Stored slot widths in `ranks`
+        # may exceed the effective rank when columns are zero-padded (e.g.
+        # AA-SVD `k_eff < k`, EoRA `take_eff < r_per_expert`). The honest
+        # parameter count uses `effective_ranks`, summed across experts.
+        # Initialized to the slot width (assumes full effective rank);
+        # callers update via `set_factors` / `widen_rank`.
+        self.effective_ranks: dict[str, list[int]] = {
+            n: [int(ranks[n])] * int(num_experts)
+            for n in ("gate_proj", "up_proj", "down_proj")
+        }
         from transformers.activations import ACT2FN
         self.act_fn = ACT2FN["silu"]
 
@@ -475,9 +485,14 @@ class FactoredExperts(nn.Module):
         getattr(self, f"{name}_U").data[expert_idx].copy_(U_k)
         getattr(self, f"{name}_V").data[expert_idx].copy_(V_k)
 
-    def set_factors(self, expert_idx: int, name: str, U: torch.Tensor, V: torch.Tensor) -> None:
+    def set_factors(
+        self, expert_idx: int, name: str, U: torch.Tensor, V: torch.Tensor,
+        *, effective_rank: int | None = None,
+    ) -> None:
         getattr(self, f"{name}_U").data[expert_idx].copy_(U.to(self.gate_proj_U.dtype))
         getattr(self, f"{name}_V").data[expert_idx].copy_(V.to(self.gate_proj_V.dtype))
+        if effective_rank is not None:
+            self.effective_ranks[name][expert_idx] = int(effective_rank)
 
     def select_experts(self, kept_ids: list[int]) -> None:
         # Idempotent — skip if already matching.
@@ -491,10 +506,17 @@ class FactoredExperts(nn.Module):
             setattr(self, attr, nn.Parameter(new_t, requires_grad=t.requires_grad))
         self.num_experts = len(kept_ids)
 
-    def widen_rank(self, name: str, U_new: torch.Tensor, V_new: torch.Tensor) -> None:
+    def widen_rank(
+        self, name: str, U_new: torch.Tensor, V_new: torch.Tensor,
+        *, added_effective_per_expert: list[int] | None = None,
+    ) -> None:
         """Append ``(U_new, V_new)`` per-expert along the rank dim (Stage 4 EoRA).
 
         ``U_new``: [N, d_out, r], ``V_new``: [N, r, d_in]. Updates ``ranks[name]``.
+
+        ``added_effective_per_expert``: per-expert true rank of the appended
+        correction (≤ r). If None, assumes full r per expert. Used to keep
+        `effective_ranks` honest when EoRA's eigh path zero-pads columns.
         """
         cur_U = getattr(self, f"{name}_U")
         cur_V = getattr(self, f"{name}_V")
@@ -503,6 +525,11 @@ class FactoredExperts(nn.Module):
         setattr(self, f"{name}_U", nn.Parameter(new_U, requires_grad=False))
         setattr(self, f"{name}_V", nn.Parameter(new_V, requires_grad=False))
         self.ranks[name] = int(new_U.shape[-1])
+        added_r = int(U_new.shape[-1])
+        if added_effective_per_expert is None:
+            added_effective_per_expert = [added_r] * self.num_experts
+        for e, eff_add in enumerate(added_effective_per_expert):
+            self.effective_ranks[name][e] = int(self.effective_ranks[name][e]) + int(eff_add)
 
     # ---- Forward: mirrors Qwen3_5MoeExperts.forward --------------------
 
@@ -560,9 +587,19 @@ def count_expert_parameters(model: nn.Module, *, routed_only: bool = True) -> in
     for ref in iter_moe_layers(model):
         ex = ref.experts_module
         if isinstance(ex, FactoredExperts):
-            for attr in ("gate_proj_U", "gate_proj_V", "up_proj_U", "up_proj_V",
-                         "down_proj_U", "down_proj_V"):
-                total += getattr(ex, attr).numel()
+            # Use effective ranks (per-expert) so zero-padded columns from
+            # AA-SVD's k_eff < k or EoRA's take_eff < r aren't counted as
+            # real parameters. Each expert contributes (d_out + d_in) × eff
+            # for each of {gate, up, down}.
+            d_int, d_hid = ex.intermediate_dim, ex.hidden_dim
+            for name, (d_out, d_in) in (
+                ("gate_proj", (d_int, d_hid)),
+                ("up_proj",   (d_int, d_hid)),
+                ("down_proj", (d_hid, d_int)),
+            ):
+                eff_per_expert = ex.effective_ranks.get(name, [ex.ranks[name]] * ex.num_experts)
+                eff_sum = sum(int(r) for r in eff_per_expert)
+                total += (d_out + d_in) * eff_sum
         elif _is_fused_experts(ex):
             total += ex.gate_up_proj.numel() + ex.down_proj.numel()
         else:
@@ -619,11 +656,16 @@ def save_compressed_checkpoint(
     per_layer_num_experts: dict[str, int] = {}
     factored_layers: list[int] = []
     factored_ranks: dict[str, dict[str, int]] = {}
+    factored_effective_ranks: dict[str, dict[str, list[int]]] = {}
     for ref in iter_moe_layers(model):
         per_layer_num_experts[str(ref.layer_idx)] = ref.num_routed_experts
         if isinstance(ref.experts_module, FactoredExperts):
             factored_layers.append(ref.layer_idx)
             factored_ranks[str(ref.layer_idx)] = dict(ref.experts_module.ranks)
+            factored_effective_ranks[str(ref.layer_idx)] = {
+                k: [int(v) for v in vs]
+                for k, vs in ref.experts_module.effective_ranks.items()
+            }
 
     metadata = {
         "version": 1,
@@ -631,6 +673,10 @@ def save_compressed_checkpoint(
         "per_layer_num_experts": per_layer_num_experts,
         "factored_layers": sorted(factored_layers),
         "factored_ranks": factored_ranks,
+        # Per-expert effective rank — needed for honest parameter counting on
+        # reload. Stored slot widths in `factored_ranks` may exceed effective
+        # rank when AA-SVD's k_eff < k or EoRA's take_eff < r.
+        "factored_effective_ranks": factored_effective_ranks,
     }
     if extra_metadata:
         metadata["extra"] = extra_metadata
@@ -877,6 +923,10 @@ def _resize_moe_stack_to_metadata(
     factored_ids  = set(meta["factored_layers"])
     factored_ranks = {int(k): {kk: int(vv) for kk, vv in v.items()}
                       for k, v in meta["factored_ranks"].items()}
+    factored_effective = {
+        int(k): {kk: [int(x) for x in vs] for kk, vs in v.items()}
+        for k, v in meta.get("factored_effective_ranks", {}).items()
+    }
 
     for ref in iter_moe_layers(model):
         li = ref.layer_idx
@@ -891,6 +941,12 @@ def _resize_moe_stack_to_metadata(
                 dtype=dtype,
                 device=device,
             )
+            # Restore effective ranks if the metadata captured them; else
+            # fall back to the slot-width default that __init__ already set.
+            if li in factored_effective:
+                for nm, vs in factored_effective[li].items():
+                    if len(vs) == new_fact.num_experts:
+                        new_fact.effective_ranks[nm] = list(vs)
             ref.mlp.experts = new_fact
             ref.experts_module = new_fact
             ref.mlp.num_experts = target_n

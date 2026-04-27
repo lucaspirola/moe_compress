@@ -61,8 +61,8 @@ def test_eora_bf16_A_beats_isotropic_in_A_norm():
     r = 32
     for seed in (1, 2, 3):
         delta, A, A_fp32 = _make_inputs(seed)
-        U_iso, V_iso = _compute_eora_factors(delta, None, r, "cpu")
-        U_a, V_a = _compute_eora_factors(delta, A, r, "cpu")
+        U_iso, V_iso, _ = _compute_eora_factors(delta, None, r, "cpu")
+        U_a, V_a, _ = _compute_eora_factors(delta, A, r, "cpu")
         res_iso = _A_weighted_residual(delta, U_iso, V_iso, A_fp32)
         res_a = _A_weighted_residual(delta, U_a, V_a, A_fp32)
         assert res_a < res_iso - 1e-6, (
@@ -74,7 +74,7 @@ def test_eora_bf16_A_beats_isotropic_in_A_norm():
 def test_eora_bf16_A_shape_stable():
     delta, A, _ = _make_inputs(seed=4)
     r = 32
-    U, V = _compute_eora_factors(delta, A, r, "cpu")
+    U, V, _ = _compute_eora_factors(delta, A, r, "cpu")
     assert U.shape == (_D_OUT, r)
     assert V.shape == (r, _D_IN)
 
@@ -104,7 +104,7 @@ def test_eora_zero_pad_path_used_when_take_lt_r():
     A = (Q * eigvals.unsqueeze(0)) @ Q.T
 
     r = 12
-    U, V = _compute_eora_factors(delta, A, r, "cpu")
+    U, V, _ = _compute_eora_factors(delta, A, r, "cpu")
     assert U.shape == (d_out, r), f"zero-pad path produced wrong U shape: {U.shape}"
     assert V.shape == (r, d_in), f"zero-pad path produced wrong V shape: {V.shape}"
     # The padded trailing columns/rows must be exactly zero.
@@ -128,7 +128,7 @@ def test_eora_non_square_shapes_and_residual():
         X = torch.randn(80, d_in, generator=g, dtype=torch.float32)
         A = (X.T @ X).to(torch.bfloat16).to(torch.float32)
         r = 16
-        U, V = _compute_eora_factors(delta, A, r, "cpu")
+        U, V, _ = _compute_eora_factors(delta, A, r, "cpu")
         assert U.shape == (d_out, r), f"({d_out},{d_in}): U shape {U.shape}"
         assert V.shape == (r, d_in), f"({d_out},{d_in}): V shape {V.shape}"
         residual = (delta - U @ V).norm().item()
@@ -147,6 +147,6 @@ def test_eora_r_zero_returns_empty(a_provider):
     code paths (parametrized to make that explicit; both currently land on
     the same line, but the parametrization guards against a future split)."""
     delta = torch.randn(64, 48, dtype=torch.float32)
-    U, V = _compute_eora_factors(delta, a_provider(48), r=0, device="cpu")
+    U, V, _ = _compute_eora_factors(delta, a_provider(48), r=0, device="cpu")
     assert U.shape == (64, 0)
     assert V.shape == (0, 48)

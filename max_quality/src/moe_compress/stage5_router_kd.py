@@ -419,6 +419,19 @@ def _freeze_non_routers(model: nn.Module, trainable_patterns: list[str]) -> None
 def _pool_teacher_logits(
     teacher_logits: torch.Tensor, merge_map_layer: dict[int, list[int]],
 ) -> torch.Tensor:
+    """Pool teacher logits over merged child experts.
+
+    `logsumexp` is the mathematically correct pooling operator for
+    "the merged expert absorbs the routing mass of all its children":
+        softmax(logsumexp(logits_children))_e
+            = exp(logsumexp(logits_children_e)) / Z_pooled
+            = (Σ_i exp(logit_child_i)) / Z_pooled
+            = Σ_i softmax_orig(child_i)
+    i.e. the pooled probability equals the sum of child probabilities.
+    Using mean(logits) instead would give softmax(mean(logits)) ∝ Π exp(l_i)^(1/k),
+    which is the geometric mean of probabilities — not what we want for
+    routing mass.
+    """
     num_student = len(merge_map_layer)
     leading = teacher_logits.shape[:-1]
     out = torch.empty((*leading, num_student),

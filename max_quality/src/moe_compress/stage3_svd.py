@@ -153,9 +153,10 @@ def run(
     T_budget = _compute_T_budget(group_stats, decomposition.svd_rank_ratio)
     proj_weights = config.get("stage3_svd", {}).get("d_rank", {}).get("per_projection_weight", {})
     ranks = _d_rank_allocate(group_stats, T_budget, proj_weights=proj_weights or None)
-    alpha_by_type = _swift_svd_plus_grid(
-        model, tokenizer, config, group_stats, ranks, artifacts_dir,
-    )
+    # Swift-SVD+ α-grid blend was specified in the YAML but never implemented;
+    # `_aa_svd` is one-sided B-only (α has no effect). Record None so old
+    # consumers reading this metadata see the truthful state.
+    alpha_by_type = None
 
     # 2. Snapshot originals (for Stage 4 residuals) then factor per-layer.
     originals: dict[tuple[int, int, str], torch.Tensor] = {}
@@ -211,10 +212,12 @@ def run(
                 A = _cov_lookup(A_cov, ref.layer_idx, e, name)
                 B = _cov_lookup(B_acc.covariance, ref.layer_idx, e, name)
                 k = ranks_layer[name]
-                U_k, V_k, rel_err, k_eff = _aa_svd(W, A, B, k, device=dev)
+                U_k, V_k, rel_err, k_eff = _aa_svd(
+                    W, A, B, k, device=dev, storage_dtype=B_cov_dtype,
+                )
                 if k_eff < k:
                     k_eff_clip_count[name] += 1
-                new_factored.set_factors(e, name, U_k, V_k)
+                new_factored.set_factors(e, name, U_k, V_k, effective_rank=k_eff)
                 rank_map[f"L{ref.layer_idx}_E{e}_{name}"] = k
                 err_sum[name] += rel_err
                 n_per_matrix[name] += 1
@@ -344,25 +347,77 @@ def _d_rank_allocate(
     def _weight(g, s):
         return math.sqrt(s.effective_rank / s.omega) * pw.get(g[1], 1.0)
 
+    def _cap(s):
+        return min(s.d_out, s.d_in) - 1
+
     denom = sum(_weight(g, s) for g, s in group_stats.items()) or 1.0
-    out = {}
-    for g, s in group_stats.items():
-        k = _weight(g, s) * T_budget / denom
-        k = max(1, min(int(round(k)), min(s.d_out, s.d_in) - 1))
-        out[g] = k
+    raw: dict = {g: _weight(g, s) * T_budget / denom for g, s in group_stats.items()}
+    out: dict = {g: max(1, min(int(round(raw[g])), _cap(s)))
+                 for g, s in group_stats.items()}
+
+    # Correction: rounding+clamping perturbs the total away from T_budget.
+    # Redistribute the residual to under-allocated groups (those still below
+    # their cap) up to a configurable tolerance.
+    target = int(T_budget)
+    actual = sum(out.values())
+    diff = target - actual
+    if diff != 0:
+        # Sort by (cap_room when adding, allocated rank when subtracting) so
+        # the largest groups absorb most of the correction proportionally.
+        sign = 1 if diff > 0 else -1
+        # Iterate while there's residual to assign and at least one group
+        # can accept it. Bounded by T_budget iterations as a safety.
+        for _ in range(abs(diff)):
+            if sign > 0:
+                # Pick the group with the largest fractional remainder that
+                # still has room below its cap.
+                cands = [
+                    (raw[g] - out[g], g) for g, s in group_stats.items()
+                    if out[g] < _cap(s)
+                ]
+                if not cands:
+                    break
+                cands.sort(reverse=True)
+                _, g = cands[0]
+                out[g] += 1
+            else:
+                # Pick the group with the smallest fractional remainder that
+                # still has room above the floor (rank ≥ 1).
+                cands = [(raw[g] - out[g], g) for g in group_stats if out[g] > 1]
+                if not cands:
+                    break
+                cands.sort()
+                _, g = cands[0]
+                out[g] -= 1
+
+    final_total = sum(out.values())
+    drift = abs(final_total - target)
+    if drift > 0:
+        log.warning("D-Rank budget conservation: residual drift %d after "
+                    "correction (target=%d, actual=%d) — bounded by per-group "
+                    "rank caps", drift, target, final_total)
+    elif diff != 0:
+        log.info("D-Rank budget redistributed %+d ranks across groups "
+                 "(target=%d, conserved)", diff, target)
     return out
-
-
-def _swift_svd_plus_grid(
-    model, tokenizer, config, group_stats, ranks, artifacts_dir,
-) -> dict[str, float]:
-    log.info("Swift-SVD+ α-grid: using α=0.5 per matrix type (placeholder).")
-    return {"gate_proj": 0.5, "up_proj": 0.5, "down_proj": 0.5}
 
 
 # ---------------------------------------------------------------------------
 # AA-SVD per matrix
 # ---------------------------------------------------------------------------
+
+
+_NOISE_FLOOR_BY_DTYPE: dict[torch.dtype, float] = {
+    # Relative threshold above which an eigenvalue of B is considered signal
+    # rather than storage-quantization noise. Driven by the storage dtype's
+    # mantissa bits: bf16 has 7 (~2⁻⁷ ≈ 8e-3 noise), fp16 has 10 (~2⁻¹⁰ ≈ 1e-3),
+    # fp32 has 23 (~2⁻²³). Set the floor a small margin above noise to ensure
+    # we don't keep noise-inflated directions.
+    torch.bfloat16: 1e-2,
+    torch.float16:  1e-3,
+    torch.float32:  1e-6,
+    torch.float64:  1e-12,
+}
 
 
 def _aa_svd(
@@ -372,6 +427,7 @@ def _aa_svd(
     k: int,
     *,
     device,
+    storage_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, float, int]:
     """Activation-aware rank-k factorization of W.
 
@@ -406,7 +462,13 @@ def _aa_svd(
         B = 0.5 * (B + B.T)
         eigvals, eigvecs = torch.linalg.eigh(B)            # ascending
         sigma_max = float(eigvals[-1].clamp_min(0).item())
-        thresh = max(sigma_max * 1e-6, 1e-12)
+        # Dtype-aware noise floor: B was up-cast from `storage_dtype` and its
+        # tail eigenvalues are dominated by the round-trip quantization noise.
+        # A 1e-6 floor (fp32-appropriate) is 1000× below fp16's noise and
+        # 10000× below bf16's — it would keep pure noise directions and waste
+        # rank budget on artifacts. See `_NOISE_FLOOR_BY_DTYPE`.
+        rel_floor = _NOISE_FLOOR_BY_DTYPE.get(storage_dtype or torch.float32, 1e-6)
+        thresh = max(sigma_max * rel_floor, 1e-12)
         keep = eigvals > thresh
         r_eff = int(keep.sum().item())
         if r_eff == 0:
