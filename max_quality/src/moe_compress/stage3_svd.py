@@ -201,8 +201,8 @@ def run(
         # Fill factors by per-expert AA-SVD. Track relative reconstruction
         # error per (layer, matrix) so the dashboard shows whether the chosen
         # rank is enough — a "convergence in spirit" signal for the SVD.
+        # Per-expert weighted relative error: mean of ||(W-UV)L_B||/||WL_B|| across experts.
         err_sum: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
-        norm_sum: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
         n_per_matrix: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
         for e in range(ref.num_routed_experts):
             for name in MATRIX_NAMES:
@@ -210,22 +210,18 @@ def run(
                 A = _cov_lookup(A_cov, ref.layer_idx, e, name)
                 B = _cov_lookup(B_acc.covariance, ref.layer_idx, e, name)
                 k = ranks_layer[name]
-                U_k, V_k = _aa_svd(W, A, B, k, device=dev)
+                U_k, V_k, rel_err = _aa_svd(W, A, B, k, device=dev)
                 new_factored.set_factors(e, name, U_k, V_k)
                 rank_map[f"L{ref.layer_idx}_E{e}_{name}"] = k
-                # Frobenius reconstruction error
-                with torch.no_grad():
-                    R = W - (U_k.to(torch.float32) @ V_k.to(torch.float32))
-                    err_sum[name] += float(R.norm().item() ** 2)
-                    norm_sum[name] += float(W.norm().item() ** 2)
-                    n_per_matrix[name] += 1
+                err_sum[name] += rel_err
+                n_per_matrix[name] += 1
         # Swap in.
         setattr(ref.mlp, "experts", new_factored)
         ref.experts_module = new_factored
         recon_metrics: dict[str, float] = {"stage3/recon_layer_idx": float(ref.layer_idx)}
         for name in MATRIX_NAMES:
-            if norm_sum[name] > 0:
-                rel = (err_sum[name] / norm_sum[name]) ** 0.5
+            if n_per_matrix[name] > 0:
+                rel = err_sum[name] / n_per_matrix[name]
                 recon_metrics[f"stage3/recon_rel_err/{name}"] = rel
                 log.info("  L%d %s rank=%d rel_recon_err=%.4f",
                          ref.layer_idx, name, ranks_layer[name], rel)
@@ -358,7 +354,16 @@ def _aa_svd(
     k: int,
     *,
     device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Activation-aware rank-k factorization of W.
+
+    Returns (U_k, V_k, rel_err) where rel_err is the weighted relative
+    reconstruction error the AA-SVD objective actually minimizes:
+      ||(W - U_k V_k) L_B||_F / ||W L_B||_F
+    For the plain-SVD fallback (no covariance), rel_err is the standard
+    unweighted Frobenius relative error ||W - U_k V_k||_F / ||W||_F.
+    Both are in [0, 1] and are meaningful quality signals.
+    """
     d_out, d_in = W.shape
     k = max(1, min(k, min(d_out, d_in) - 1))
     try:
@@ -375,12 +380,21 @@ def _aa_svd(
         V_k = torch.linalg.solve_triangular(
             L_B.transpose(0, 1), Vh[:k, :].transpose(0, 1), upper=True,
         ).transpose(0, 1)
+        with torch.no_grad():
+            R_weighted = (W - U_k @ V_k) @ L_B
+            W_weighted = W @ L_B
+            w_norm = W_weighted.norm()
+            rel_err = float((R_weighted.norm() / w_norm).item()) if w_norm > 0 else 0.0
     except Exception as err:                         # noqa: BLE001
         log.warning("AA-SVD fallback to plain SVD (%s)", err)
         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
         U_k = U[:, :k] * S[:k]
         V_k = Vh[:k, :]
-    return U_k, V_k
+        with torch.no_grad():
+            R = W - U_k @ V_k
+            w_norm = W.norm()
+            rel_err = float((R.norm() / w_norm).item()) if w_norm > 0 else 0.0
+    return U_k, V_k, rel_err
 
 
 # ---------------------------------------------------------------------------
