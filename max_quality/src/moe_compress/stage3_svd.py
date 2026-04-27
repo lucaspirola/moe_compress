@@ -186,6 +186,11 @@ def run(
         ex = ref.experts_module
         dtype = ex.gate_up_proj.dtype
         dev = ex.gate_up_proj.device
+        # Originals are already snapshotted to CPU above; offload the dense
+        # expert module before allocating FactoredExperts to avoid a brief
+        # double-occupancy OOM on 80 GB A100s.
+        ex.to("cpu")
+        torch.cuda.empty_cache()
         new_factored = FactoredExperts(
             num_experts=ref.num_routed_experts,
             hidden_dim=ex.gate_up_proj.shape[-1],
