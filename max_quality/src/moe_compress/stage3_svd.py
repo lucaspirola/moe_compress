@@ -204,13 +204,16 @@ def run(
         # Per-expert weighted relative error: mean of ||(W-UV)L_B||/||WL_B|| across experts.
         err_sum: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
         n_per_matrix: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
+        k_eff_clip_count: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
         for e in range(ref.num_routed_experts):
             for name in MATRIX_NAMES:
                 W = originals[(ref.layer_idx, e, name)].to(device=dev, dtype=torch.float32)
                 A = _cov_lookup(A_cov, ref.layer_idx, e, name)
                 B = _cov_lookup(B_acc.covariance, ref.layer_idx, e, name)
                 k = ranks_layer[name]
-                U_k, V_k, rel_err = _aa_svd(W, A, B, k, device=dev)
+                U_k, V_k, rel_err, k_eff = _aa_svd(W, A, B, k, device=dev)
+                if k_eff < k:
+                    k_eff_clip_count[name] += 1
                 new_factored.set_factors(e, name, U_k, V_k)
                 rank_map[f"L{ref.layer_idx}_E{e}_{name}"] = k
                 err_sum[name] += rel_err
@@ -222,9 +225,24 @@ def run(
         for name in MATRIX_NAMES:
             if n_per_matrix[name] > 0:
                 rel = err_sum[name] / n_per_matrix[name]
+                # Renamed from `recon_rel_err` post-bf16 fix: this is the
+                # B-weighted singular-value-tail ratio of M = W·L_B. The old
+                # key is dual-emitted as an alias so existing trackio
+                # dashboards keep working — TODO(post-launch): drop the alias
+                # once dashboards are migrated to `b_weighted_tail_ratio`.
+                recon_metrics[f"stage3/b_weighted_tail_ratio/{name}"] = rel
                 recon_metrics[f"stage3/recon_rel_err/{name}"] = rel
-                log.info("  L%d %s rank=%d rel_recon_err=%.4f",
-                         ref.layer_idx, name, ranks_layer[name], rel)
+                recon_metrics[f"stage3/k_eff_clip_count/{name}"] = float(k_eff_clip_count[name])
+                recon_metrics[f"stage3/k_eff_clip_ratio/{name}"] = (
+                    k_eff_clip_count[name] / max(n_per_matrix[name], 1)
+                )
+                # `b_weighted_tail_ratio` = ‖tail_S(M)‖/‖S(M)‖, the singular-
+                # value-tail proxy for ‖(W−UV)L_B‖/‖WL_B‖. Pre-fix code logged
+                # this same key as `rel_recon_err`; numbers from before commit
+                # e7e0fbf are not directly comparable.
+                log.info("  L%d %s rank=%d b_weighted_tail_ratio=%.4f k_eff_clipped=%d/%d",
+                         ref.layer_idx, name, ranks_layer[name], rel,
+                         k_eff_clip_count[name], n_per_matrix[name])
         _trackio_log(recon_metrics)
         log.info("  layer %d factored at ranks=%s", ref.layer_idx, ranks_layer)
         # Drop this layer's B-cov from memory now that we're done factoring
@@ -354,7 +372,7 @@ def _aa_svd(
     k: int,
     *,
     device,
-) -> tuple[torch.Tensor, torch.Tensor, float]:
+) -> tuple[torch.Tensor, torch.Tensor, float, int]:
     """Activation-aware rank-k factorization of W.
 
     Standard one-sided ASVD (SVD-LLM / Yuan et al.):
@@ -380,20 +398,51 @@ def _aa_svd(
     try:
         if B is None:
             raise ValueError("no post-prune covariance B available")
+        # Truncated symmetric eigendecomposition of B. Handles rank deficiency
+        # natively (bf16/fp16 covariance round-trips quantize small eigenvalues
+        # to zero — Cholesky-of-B+εI then fits noise into nonexistent
+        # directions, yielding rel_err ≫ 1).
         B = B.to(device=device, dtype=torch.float32)
-        B_reg = B + 1e-6 * torch.eye(B.shape[0], dtype=B.dtype, device=device)
-        L_B = torch.linalg.cholesky(B_reg)
-        M = W @ L_B
+        B = 0.5 * (B + B.T)
+        eigvals, eigvecs = torch.linalg.eigh(B)            # ascending
+        sigma_max = float(eigvals[-1].clamp_min(0).item())
+        thresh = max(sigma_max * 1e-6, 1e-12)
+        keep = eigvals > thresh
+        r_eff = int(keep.sum().item())
+        if r_eff == 0:
+            raise ValueError("B has no positive eigenvalues above threshold")
+        eigvals_keep = eigvals[keep].clamp_min(0)
+        eigvecs_keep = eigvecs[:, keep]
+        L_B = eigvecs_keep * eigvals_keep.sqrt().unsqueeze(0)   # [d_in, r_eff]
+        M = W @ L_B                                             # [d_out, r_eff]
         U, S, Vh = torch.linalg.svd(M, full_matrices=False)
-        U_k = U[:, :k] * S[:k]
-        V_k = torch.linalg.solve_triangular(
-            L_B.transpose(0, 1), Vh[:k, :].transpose(0, 1), upper=True,
-        ).transpose(0, 1)
-        with torch.no_grad():
-            R_weighted = (W - U_k @ V_k) @ L_B
-            W_weighted = W @ L_B
-            w_norm = W_weighted.norm()
-            rel_err = float((R_weighted.norm() / w_norm).item()) if w_norm > 0 else 0.0
+        k_eff = max(1, min(k, r_eff))
+        U_eff = U[:, :k_eff] * S[:k_eff]
+        # Closed-form pseudo-inverse for V = Vh[:k_eff] @ pinv(L_B):
+        # L_B = Q·diag(√λ) with orthonormal Q, so pinv(L_B) = diag(1/√λ)·Qᵀ.
+        # Avoids `torch.linalg.lstsq` entirely — its CUDA `gels` driver
+        # assumes full rank and can return NaN on the rank-boundary B here,
+        # and `gelsd`/`gelsy`/`gelss` are CPU-only in PyTorch.
+        inv_sqrt = eigvals_keep.clamp_min(1e-30).rsqrt()
+        V_eff = (Vh[:k_eff, :] * inv_sqrt.unsqueeze(0)) @ eigvecs_keep.T  # [k_eff, d_in]
+        # Numerically stable rel_err: tail singular values of M.
+        S2 = S * S
+        denom = S2.sum().clamp_min(1e-30)
+        if k_eff < S2.numel():
+            rel_err = float((S2[k_eff:].sum() / denom).sqrt().item())
+        else:
+            rel_err = 0.0
+        # Always return shape [d_out, k] / [k, d_in] — caller's FactoredExperts
+        # slot is pre-allocated at `k`. Zero-pad when effective rank < k; this
+        # is functionally a smaller-rank correction (the zero columns/rows
+        # contribute nothing to U_k @ V_k).
+        if k_eff < k:
+            U_k = torch.zeros(d_out, k, device=device, dtype=U_eff.dtype)
+            V_k = torch.zeros(k, d_in, device=device, dtype=V_eff.dtype)
+            U_k[:, :k_eff] = U_eff
+            V_k[:k_eff, :] = V_eff
+        else:
+            U_k, V_k = U_eff, V_eff
     except Exception as err:                         # noqa: BLE001
         log.warning("AA-SVD fallback to plain SVD (%s)", err)
         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
@@ -403,7 +452,8 @@ def _aa_svd(
             R = W - U_k @ V_k
             w_norm = W.norm()
             rel_err = float((R.norm() / w_norm).item()) if w_norm > 0 else 0.0
-    return U_k, V_k, rel_err
+        k_eff = k
+    return U_k, V_k, rel_err, k_eff
 
 
 # ---------------------------------------------------------------------------

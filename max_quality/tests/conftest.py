@@ -12,6 +12,7 @@ fire with shapes that match the real model.
 """
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
@@ -258,3 +259,17 @@ def tiny_config():
         "logging": {"level": "INFO", "log_every_n_steps": 5,
                     "save_intermediate_every_n_layers": 1},
     }
+
+
+@pytest.fixture
+def tiny_config_bf16(tiny_config):
+    """Same as tiny_config but with bf16 covariance storage on both stages.
+
+    Use for smoke runs that must continue to work after the bf16→fp16
+    storage switch (defense in depth: if a future config flips the dtype
+    back to bf16, the eigh-based AA-SVD must still tolerate it).
+    """
+    cfg = copy.deepcopy(tiny_config)
+    cfg["stage2_reap_ream"]["covariance_storage_dtype"] = "bfloat16"
+    cfg["stage3_svd"]["bcov_storage_dtype"] = "bfloat16"
+    return cfg

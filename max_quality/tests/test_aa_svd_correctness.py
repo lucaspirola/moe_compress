@@ -54,7 +54,7 @@ def test_aa_svd_recovers_W_with_isotropic_B():
     B = torch.eye(16, dtype=torch.float32)
     A = torch.eye(16, dtype=torch.float32) * 1.5  # different scale, must be ignored
     k = min(W.shape) - 1
-    U_k, V_k, _ = _aa_svd(W, A, B, k, device="cpu")
+    U_k, V_k, _, _ = _aa_svd(W, A, B, k, device="cpu")
     U_full, S_full, Vh_full = torch.linalg.svd(W, full_matrices=False)
     expected = U_full[:, :k] @ torch.diag(S_full[:k]) @ Vh_full[:k, :]
     err = (U_k @ V_k - expected).norm() / expected.norm()
@@ -72,7 +72,7 @@ def test_aa_svd_minimizes_B_weighted_error():
     """
     W, A, B = _make_inputs(d_out=32, d_in=24, seed=1)
     k = 16
-    _, _, rel_err = _aa_svd(W, A, B, k, device="cpu")
+    _, _, rel_err, _ = _aa_svd(W, A, B, k, device="cpu")
 
     # The optimal rank-k error in the B-weighted norm is the tail of M's
     # singular values: sqrt(sum_{i>=k} σ_i^2(M)) / sqrt(sum_i σ_i^2(M)).
@@ -98,7 +98,7 @@ def test_aa_svd_target_is_W_not_W_at_A():
     """
     W, A, B = _make_inputs(d_out=24, d_in=20, seed=2)
     k = min(W.shape) - 1   # near-full rank → tight approximation
-    U_k, V_k, _ = _aa_svd(W, A, B, k, device="cpu")
+    U_k, V_k, _, _ = _aa_svd(W, A, B, k, device="cpu")
     recon = U_k @ V_k
 
     err_to_W = (recon - W).norm().item()
@@ -114,9 +114,9 @@ def test_aa_svd_ignores_A_factor():
     """Result must not depend on A — A is reserved for L-BFGS refinement only."""
     W, A, B = _make_inputs(d_out=20, d_in=16, seed=3)
     k = 8
-    U1, V1, r1 = _aa_svd(W, A, B, k, device="cpu")
-    U2, V2, r2 = _aa_svd(W, A * 100.0, B, k, device="cpu")  # rescale A 100x
-    U3, V3, r3 = _aa_svd(W, None, B, k, device="cpu")       # drop A entirely
+    U1, V1, r1, _ = _aa_svd(W, A, B, k, device="cpu")
+    U2, V2, r2, _ = _aa_svd(W, A * 100.0, B, k, device="cpu")  # rescale A 100x
+    U3, V3, r3, _ = _aa_svd(W, None, B, k, device="cpu")       # drop A entirely
 
     diff_U_12 = (U1 - U2).norm().item() / (U1.norm().item() + 1e-9)
     diff_V_12 = (V1 - V2).norm().item() / (V1.norm().item() + 1e-9)
@@ -135,7 +135,7 @@ def test_aa_svd_rel_err_in_unit_interval():
     """Returned rel_err must be in [0, 1] — it's a relative weighted error."""
     W, A, B = _make_inputs(d_out=24, d_in=20, seed=4)
     for k in (4, 8, 12, 18):
-        _, _, rel_err = _aa_svd(W, A, B, k, device="cpu")
+        _, _, rel_err, _ = _aa_svd(W, A, B, k, device="cpu")
         assert 0.0 <= rel_err <= 1.0 + 1e-6, (
             f"rel_err out of [0,1] at k={k}: {rel_err}"
         )
@@ -146,7 +146,7 @@ def test_aa_svd_rel_err_decreases_with_rank():
     W, A, B = _make_inputs(d_out=32, d_in=24, seed=5)
     errs = []
     for k in (2, 4, 8, 16, 22):
-        _, _, rel_err = _aa_svd(W, A, B, k, device="cpu")
+        _, _, rel_err, _ = _aa_svd(W, A, B, k, device="cpu")
         errs.append(rel_err)
     for prev, cur in zip(errs[:-1], errs[1:]):
         assert cur <= prev + 1e-5, (
@@ -158,7 +158,7 @@ def test_aa_svd_plain_fallback_when_B_missing():
     """With B=None, falls back to plain SVD; rel_err matches optimal Frobenius."""
     W, _, _ = _make_inputs(d_out=20, d_in=16, seed=6)
     k = 8
-    U_k, V_k, rel_err = _aa_svd(W, None, None, k, device="cpu")
+    U_k, V_k, rel_err, _ = _aa_svd(W, None, None, k, device="cpu")
     recon = U_k @ V_k
     _U_full, S_full, _ = torch.linalg.svd(W, full_matrices=False)
     optimal_err = float((S_full[k:].pow(2).sum().sqrt() / W.norm()).item())

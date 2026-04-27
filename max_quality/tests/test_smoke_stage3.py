@@ -38,9 +38,15 @@ def _noop_save(model, tokenizer, path, **kwargs):
     return Path(path)
 
 
-@pytest.fixture
-def patched_stage3(monkeypatch, tiny_config):
-    """Patch calibration loaders in every stage module that calls them."""
+@pytest.fixture(params=["fp32", "bf16"])
+def patched_stage3(request, monkeypatch, tiny_config, tiny_config_bf16):
+    """Patch calibration loaders in every stage module that calls them.
+
+    Parametrized over ``fp32`` (default) and ``bf16`` covariance storage so the
+    eigh-based AA-SVD path is exercised under bf16 quantization end-to-end —
+    defense in depth for the bf16 covariance bug fixed in §6.5.
+    """
+    tiny_config = tiny_config_bf16 if request.param == "bf16" else tiny_config
     from moe_compress.utils import calibration as cal_mod
 
     def _fake_build(tokenizer, spec, cache_dir=None):

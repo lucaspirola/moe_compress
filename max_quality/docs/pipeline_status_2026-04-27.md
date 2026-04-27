@@ -232,6 +232,11 @@ Cannot proceed without a valid Stage 3 output.
 
 ## 6. The current blocker (where we want a second opinion)
 
+> **Superseded by §6.5 below.** The dominant root cause turned out to be
+> bfloat16 covariance storage, not the regularizer. The hypothesis recorded
+> in this section ("rank-deficient B + 1e-6·I") is correct as far as it goes
+> but missed the upstream cause. Read §6.5 for the resolution.
+
 ### 6.1 What we observed
 
 Trackio run
@@ -338,6 +343,70 @@ test suite < 30 s.
    into more directions than calibration spans?
 4. Is there value in increasing the calibration token count for Stage 2
    to push `rank(B)` up, even though it's still much less than 6144?
+
+---
+
+## 6.5 Resolution & re-run
+
+Diagnosis converged on **bfloat16 covariance storage** as the dominant root
+cause: fp32 accumulation on GPU is correct, but
+`InputCovarianceAccumulator.finalize_layer` casts to `storage_dtype` before
+spilling to disk. Both Stage 2 and Stage 3 defaulted that dtype to bf16
+(7 mantissa bits), which round-tripped the small eigenvalues of `B = XᵀX`
+to zero — manufacturing rank deficiency that no `1e-6·I` regularization
+rescues. CI did not catch it because `tests/conftest.py` overrides
+`covariance_storage_dtype` to `float32`.
+
+Fixes applied (full plan kept in private operator notes; key decisions
+captured here):
+
+- `stage3_svd._aa_svd` rewritten around a **truncated symmetric
+  eigendecomposition of B** with a relative noise floor (`λ > 1e-6·λ_max`).
+  Effective-rank-clipped `k_eff` replaces Cholesky-of-(B+εI); rel-err is
+  computed from singular value tails of `M = W·L_B`, removing the
+  cancellation that produced `rel_err ≫ 1`.
+- `stage4_eora._compute_eora_factors` hardened the same way: drop the
+  `1e-6·I`, use eigh with the relative threshold, zero-pad U/V when the
+  effective rank is below `r` so the caller's fixed-shape tensors stay
+  consistent.
+- Storage dtype switched **bf16 → float16** at both call sites
+  (`covariance_storage_dtype: float16`; new `stage3_svd.bcov_storage_dtype:
+  float16`). Same byte count as bf16, but fp16's 10 mantissa bits remove
+  the silent precision loss at the source.
+- `per_projection_weight` reset to uniform (1/1/1) — the prior
+  1.75/1.35/0.35 was tuned against bug-artifact recon errors. Re-tune from
+  the (now trustworthy) `stage3/recon_rel_err/{name}` after one Stage 3
+  re-run.
+- New regression tests (the bf16 covariance bug's primary guard is the first):
+  - [`tests/test_aa_svd_bf16_quantized.py`](../tests/test_aa_svd_bf16_quantized.py)
+  - [`tests/test_aa_svd_fp16_quantized.py`](../tests/test_aa_svd_fp16_quantized.py)
+  - [`tests/test_eora_bf16_A.py`](../tests/test_eora_bf16_A.py)
+  - [`tests/conftest.py`](../tests/conftest.py) adds `tiny_config_bf16`;
+    [`tests/test_smoke_stage3.py`](../tests/test_smoke_stage3.py) is now
+    parametrized over both fp32 and bf16 covariance storage.
+- `rel_err` semantics shifted: it is now the relative singular-value-tail
+  ratio of `M = W·L_B`, equal to the prior `‖(W−UV)L_B‖/‖WL_B‖` whenever
+  `k_eff < rank(M)`. Trackio numbers from runs after the fix are not
+  directly comparable to the bug-era numbers in the 10²–10⁶ range.
+- `stage3/k_eff_clip_count/{name}` now logged per layer to surface budget
+  vs effective-rank under-spend.
+
+Re-run sequence (HF Jobs). Each job is gated by the prior stage's Hub
+upload (the bucket FUSE mount is non-durable on cancel/timeout, so per-stage
+Hub commits are the only safe handoff). Per-job env vars:
+`RESUME_FROM_STAGE=N`, `STOP_AFTER_STAGE=N`, and `PRIOR_STAGE_REPO=` the
+previous job's `<base>-stageN` repo. See
+[`docs/huggingface_jobs_and_buckets.md`](huggingface_jobs_and_buckets.md)
+for the full durability rationale.
+
+| Job | Stages | `--timeout` | Reason |
+|---|---|---|---|
+| A | 2 only | 5h | Regenerate fp16 A sidecar (~3 h on a100-large) |
+| B | 3 only | 3h | Math fixes + new B with float16 storage (~30 min) |
+| C | 4 + 5 chained | 6h | Stage 4 consumes A; Stage 5 trains router (~5 h) |
+| D | 6 only | 5h | Final quality gate (~1–2 h) |
+
+Total ~12–18 GPU hours. Per-stage verification gates are in §5 of the plan.
 
 ---
 

@@ -236,14 +236,47 @@ def _compute_eora_factors(
         return (torch.zeros(delta.shape[0], 0, device=device),
                 torch.zeros(0, delta.shape[1], device=device))
     delta = delta.to(device=device, dtype=torch.float32)
-    if A is None:
+    d_out, d_in = delta.shape
+
+    def _plain_svd_padded() -> tuple[torch.Tensor, torch.Tensor]:
+        # Defensive zero-pad: caller's pre-allocated [d_out, r] / [r, d_in]
+        # tensors require exact-r width even on the fallback path.
         U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
-        return U[:, :r] * S[:r], Vh[:r, :]
+        rk = min(r, U.shape[1])
+        if rk == r:
+            return U[:, :r] * S[:r], Vh[:r, :]
+        U_out = torch.zeros(d_out, r, device=device, dtype=delta.dtype)
+        V_out = torch.zeros(r, d_in, device=device, dtype=delta.dtype)
+        U_out[:, :rk] = U[:, :rk] * S[:rk]
+        V_out[:rk, :] = Vh[:rk, :]
+        return U_out, V_out
+
+    if A is None:
+        return _plain_svd_padded()
     A = A.to(device=device, dtype=torch.float32)
-    eigvals, eigvecs = torch.linalg.eigh(A + 1e-6 * torch.eye(A.shape[0], device=device))
-    order = torch.argsort(eigvals, descending=True)
-    P = eigvecs[:, order[:r]]
-    projected = delta @ P
+    A = 0.5 * (A + A.T)
+    eigvals, eigvecs = torch.linalg.eigh(A)            # ascending
+    sigma_max = float(eigvals[-1].clamp_min(0).item())
+    thresh = max(sigma_max * 1e-6, 1e-12)
+    keep_mask = eigvals > thresh
+    keep_idx = keep_mask.nonzero(as_tuple=False).flatten()
+    if keep_idx.numel() == 0:
+        return _plain_svd_padded()
+    # `nonzero` returns indices in ascending position order, so `keep_idx`
+    # is sorted ascending in eigvals (since eigh is ascending). flip → top-r.
+    keep_desc = keep_idx.flip(0)
+    take = min(r, int(keep_desc.numel()))
+    P = eigvecs[:, keep_desc[:take]]                          # [d_in, take]
+    projected = delta @ P                                     # [d_out, take]
     U, S, Vh = torch.linalg.svd(projected, full_matrices=False)
-    V_back = Vh @ P.transpose(0, 1)
-    return U[:, :r] * S[:r], V_back[:r, :]
+    take_eff = min(take, U.shape[1])
+    U_take = U[:, :take_eff] * S[:take_eff]
+    V_take = Vh[:take_eff] @ P.T                              # [take_eff, d_in]
+    if take_eff >= r:
+        return U_take[:, :r], V_take[:r, :]
+    # Zero-pad to fixed r so caller's [d_out, r] / [r, d_in] tensors stay shape-stable.
+    U_out = torch.zeros(d_out, r, device=device, dtype=U_take.dtype)
+    V_out = torch.zeros(r, d_in, device=device, dtype=V_take.dtype)
+    U_out[:, :take_eff] = U_take
+    V_out[:take_eff, :] = V_take
+    return U_out, V_out

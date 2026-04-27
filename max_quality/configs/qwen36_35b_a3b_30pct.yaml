@@ -56,7 +56,9 @@ stage2_reap_ream:
   batch_size: 4                    # 80GB A100: batch=8 OOMs (73.88/79.25 GB used by model), batch=4 needs ~3.8 GB peak
   num_calibration_samples: 1024
   reap_min_active_tokens: 32      # skip experts with < this activation count when scoring
-  covariance_storage_dtype: bfloat16  # "float32" or "bfloat16" — bf16 halves on-disk cov size
+  covariance_storage_dtype: float16   # fp16 (10 mantissa bits) avoids the bf16 (7 bits) precision loss
+                                      # that round-tripped Stage 2 covariance and produced rank-deficient B
+                                      # in Stage 3 (rel_recon_err ≫ 1). Same byte count as bf16.
   ream:
     gate_weight: 1.0              # weight on δ_gate in combined cost
     expert_weight: 1.0            # weight on δ̃_expert
@@ -75,13 +77,14 @@ stage3_svd:
   d_rank:
     parameter_cost_omega_mode: auto  # ω = d1 + n·d2 per paper
     # Per-projection rank bias (budget-neutral: weights are normalized).
-    # Motivated by SiLU amplification: gate_proj errors compound through the
-    # nonlinearity, up_proj errors are linear, down_proj already near low-rank
-    # (empirical rel_recon_err: gate~981k, up~468k, down~5k at uniform 0.14).
+    # Reset to uniform after the bf16-covariance bug was fixed — the prior
+    # values (gate=1.75, up=1.35, down=0.35) were tuned against bug-artifact
+    # rel_recon_err numbers (gate~981k, up~468k, down~5k). Re-tune from
+    # trustworthy stage3/recon_rel_err/{name} after one Stage 3 run.
     per_projection_weight:
-      gate_proj: 1.75
-      up_proj:   1.35
-      down_proj: 0.35
+      gate_proj: 1.0
+      up_proj:   1.0
+      down_proj: 1.0
   swift_svd_plus:
     alpha_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     validation_samples: 512       # WikiText-2 slice for α selection
@@ -89,6 +92,7 @@ stage3_svd:
     per_group_type: true          # pick α separately for gate/up/down_proj
   aa_svd:
     use_post_prune_inputs: true   # B = pruned-model inputs; A = original
+  bcov_storage_dtype: float16     # B post-prune covariance storage; see covariance_storage_dtype above.
   block_refine:
     enabled: true
     lbfgs_steps: 100
