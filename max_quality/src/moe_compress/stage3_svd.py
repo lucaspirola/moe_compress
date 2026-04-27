@@ -357,24 +357,33 @@ def _aa_svd(
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
     """Activation-aware rank-k factorization of W.
 
+    Standard one-sided ASVD (SVD-LLM / Yuan et al.):
+      Minimize ||(W - UV) L_B||_F  where B = X_post_prune^T X_post_prune
+      Solution:
+        M = W @ L_B
+        SVD(M) = U Σ Vh
+        U_k = U[:,:k] * S[:k]
+        V_k = Vh[:k,:] @ L_B^{-1}   (back-solve to undo the L_B weighting)
+      Then U_k @ V_k ≈ W (rank-k optimal in the B-weighted Frobenius norm).
+
+    The pre-prune covariance A (Stage 2) is intentionally NOT used here —
+    only B (post-prune) reflects the input distribution that the compressed
+    model will actually see. A is reserved for the optional L-BFGS refine
+    in _per_matrix_refine.
+
     Returns (U_k, V_k, rel_err) where rel_err is the weighted relative
-    reconstruction error the AA-SVD objective actually minimizes:
-      ||(W - U_k V_k) L_B||_F / ||W L_B||_F
-    For the plain-SVD fallback (no covariance), rel_err is the standard
-    unweighted Frobenius relative error ||W - U_k V_k||_F / ||W||_F.
-    Both are in [0, 1] and are meaningful quality signals.
+    reconstruction error the objective actually minimizes:
+      ||(W - U_k V_k) L_B||_F / ||W L_B||_F   ∈ [0, 1]
     """
     d_out, d_in = W.shape
     k = max(1, min(k, min(d_out, d_in) - 1))
     try:
-        if A is None or B is None:
-            raise ValueError("no covariance available")
-        A = A.to(device=device, dtype=torch.float32)
+        if B is None:
+            raise ValueError("no post-prune covariance B available")
         B = B.to(device=device, dtype=torch.float32)
         B_reg = B + 1e-6 * torch.eye(B.shape[0], dtype=B.dtype, device=device)
         L_B = torch.linalg.cholesky(B_reg)
-        BBT_inv = torch.cholesky_inverse(L_B)
-        M = W @ A @ B.transpose(0, 1) @ BBT_inv @ L_B
+        M = W @ L_B
         U, S, Vh = torch.linalg.svd(M, full_matrices=False)
         U_k = U[:, :k] * S[:k]
         V_k = torch.linalg.solve_triangular(
