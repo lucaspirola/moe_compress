@@ -10,7 +10,9 @@ A_cov is absent — that's fine for wiring correctness.
 """
 from __future__ import annotations
 
+import copy
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -189,6 +191,64 @@ def test_stage3_with_preseeded_acov(tiny_model, patched_stage3, tmp_path):
         tiny_model, _TinyTokenizer(), patched_stage3, tmp_path, decomp, device=None,
     )
     assert (tmp_path / "stage3_svd" / "rank_map.json").exists()
+
+
+def test_stage3_block_refine_emits_b_weighted_check(
+    tiny_model, patched_stage3, tmp_path, monkeypatch,
+):
+    """When block_refine is enabled, the B-weighted regression check fires
+    per (layer × matrix) and emits trackio metrics ``refine_bw_loss_init/*``,
+    ``refine_bw_loss_final/*``, and ``refine_bw_rel_drop/*``. This guards
+    against silent quality loss in the B-weighted norm — the L-BFGS refine
+    optimises the A-weighted objective but the B-weighted loss is what
+    ``_aa_svd`` (and model quality) actually cares about.
+    """
+    # Deep-copy as belt-and-braces: ``patched_stage3`` is function-scoped so
+    # leakage across parametrized invocations is unlikely, but a future edit
+    # to a nested sub-dict (``d_rank``, ``aa_svd``, ``swift_svd_plus``)
+    # could still alias the underlying ``tiny_config`` if its scope is ever
+    # widened. Cheap insurance.
+    config = copy.deepcopy(patched_stage3)
+    config["stage3_svd"]["block_refine"] = {
+        "enabled": True, "lbfgs_steps": 3, "lbfgs_history": 5,
+    }
+
+    captured: list[dict] = []
+
+    def _capture_metrics(metrics):
+        if isinstance(metrics, dict):
+            captured.append(dict(metrics))
+
+    monkeypatch.setattr(stage3_svd, "_trackio_log", _capture_metrics)
+
+    decomp = _run_stages_012(tiny_model, config, tmp_path)
+    stage3_svd.run(
+        tiny_model, _TinyTokenizer(), config, tmp_path, decomp, device=None,
+    )
+
+    refine_metrics = [
+        m for m in captured if any(k.startswith("stage3/refine_") for k in m)
+    ]
+    assert refine_metrics, "no refine trackio events captured"
+
+    bw_keys_seen = set()
+    bw_values: list[tuple[str, float]] = []
+    for m in refine_metrics:
+        for k, v in m.items():
+            if k.startswith("stage3/refine_bw_"):
+                bw_keys_seen.add(k.split("/", 1)[1].rsplit("/", 1)[0])
+                bw_values.append((k, float(v)))
+    # Expect bw_loss_init / bw_loss_final / bw_rel_drop to all appear at
+    # least once across the captured per-layer events.
+    for kind in ("refine_bw_loss_init", "refine_bw_loss_final",
+                 "refine_bw_rel_drop"):
+        assert kind in bw_keys_seen, (
+            f"expected '{kind}' in refine metrics; got {sorted(bw_keys_seen)}"
+        )
+    # All emitted B-weighted values must be finite — guards against silent
+    # NaN/Inf propagation from a degenerate B (e.g. all-zero rows).
+    for k, v in bw_values:
+        assert math.isfinite(v), f"non-finite B-weighted metric {k}={v}"
 
 
 def test_stage3_spill_dir_created_during_run(tiny_model, patched_stage3, tmp_path,

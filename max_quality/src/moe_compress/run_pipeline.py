@@ -283,9 +283,22 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
     prev_dir_name = STAGE_REGISTRY[stage][1]
     prev_path = artifacts_dir / prev_dir_name
     if not prev_path.exists():
+        # Most common operator error: re-queueing a downstream stage in a
+        # fresh job without setting PRIOR_STAGE_REPO. The HF Jobs bucket is
+        # non-durable across cancel/timeout (see project memory), so a fresh
+        # job starts with an empty artifacts_dir; the prior-stage checkpoint
+        # must be hydrated from the per-stage Hub repo by entrypoint.py via
+        # PRIOR_STAGE_REPO before _load_for_stage runs.
         raise FileNotFoundError(
-            f"Cannot resume from stage {stage}: expected checkpoint at {prev_path}. "
-            "Run the preceding stages first."
+            f"Cannot resume from stage {stage}: expected checkpoint at {prev_path}.\n"
+            f"  - If running locally: run stages 0..{stage - 1} first so "
+            f"{prev_dir_name}/ exists under {artifacts_dir}.\n"
+            f"  - If running on HF Jobs: set BOTH "
+            f"RESUME_FROM_STAGE={stage} AND PRIOR_STAGE_REPO=<the Hub repo "
+            f"holding the {prev_dir_name}/ output of stage {stage - 1}>. "
+            f"The entrypoint only hydrates the bucket when RESUME_FROM_STAGE "
+            f">= 3 AND PRIOR_STAGE_REPO is non-empty; setting just one is "
+            f"silently a no-op."
         )
     log.info("Loading stage %d input from %s", stage, prev_path)
     model, tokenizer, _ = load_compressed_model(

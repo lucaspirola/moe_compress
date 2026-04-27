@@ -262,6 +262,7 @@ def run(
             moe_layers, originals, A_cov,
             lbfgs_steps=s3["block_refine"]["lbfgs_steps"],
             lbfgs_history=s3["block_refine"]["lbfgs_history"],
+            B_acc=B_acc, bcov_spill_dir=bcov_spill_dir,
         )
 
     out_dir = artifacts_dir / "stage3_svd"
@@ -651,12 +652,37 @@ def _per_matrix_refine(
     *,
     lbfgs_steps: int,
     lbfgs_history: int,
+    B_acc=None,
+    bcov_spill_dir: Path | None = None,
 ) -> None:
+    # The L-BFGS objective here is the A-weighted (pre-prune input cov)
+    # reconstruction loss ‖(W−UV)·A^{1/2}‖_F², which is *not* the same as
+    # the B-weighted (post-prune input cov) loss ‖(W−UV)·L_B‖_F² that
+    # ``_aa_svd`` minimised. A and B both live in input space [d_in, d_in]
+    # but capture different signal distributions (full pre-prune vs. the
+    # subset that survives Stage 2 expert merge). The two norms can
+    # disagree; refine can in principle improve the A-weighted metric
+    # while slightly degrading the B-weighted metric. We compute the
+    # B-weighted residual pre/post-refine per (layer, matrix) and warn if
+    # any matrix regresses, so silent quality loss in the B-weighted norm
+    # is observable in trackio rather than invisible.
     log.info(
         "Stage 3.D: activation-weighted refine (%d layers × 3 matrices × N experts)",
         len(moe_layers),
     )
+    bw_check = B_acc is not None and bcov_spill_dir is not None
     for ref in moe_layers:
+        # Lazy-load this layer's B-cov for the pre/post B-weighted check.
+        # Same pattern as the factor loop: load → use → unload to keep the
+        # in-memory cov bounded to ~one layer.
+        if bw_check:
+            loaded = B_acc.load_layer_from_disk(ref.layer_idx, bcov_spill_dir)
+            if not loaded:
+                log.warning(
+                    "Refine: B-cov spill missing for layer %d at %s; "
+                    "skipping B-weighted regression check for this layer.",
+                    ref.layer_idx, bcov_spill_dir,
+                )
         fe: FactoredExperts = ref.experts_module
         if not isinstance(fe, FactoredExperts):
             continue
@@ -665,6 +691,13 @@ def _per_matrix_refine(
         layer_init: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
         layer_final: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
         layer_count: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
+        # B-weighted residual tr((W−UV) B (W−UV)^T) = ((R @ B) * R).sum(),
+        # pre/post-refine. Same trace form as the A-weighted line; B is the
+        # post-prune *input* covariance ([d_in, d_in]), the same B that
+        # ``_aa_svd`` minimised against — not an output-side cov.
+        bw_init: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
+        bw_final: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
+        bw_count: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
         for e in range(fe.num_experts):
             for name in MATRIX_NAMES:
                 key = (ref.layer_idx, e, name)
@@ -673,12 +706,25 @@ def _per_matrix_refine(
                     continue
                 W = originals[key].to(device=fe.gate_proj_U.device, dtype=torch.float32)
                 A_d = A.to(device=fe.gate_proj_U.device, dtype=torch.float32)
+                B_d = None
+                if bw_check:
+                    B_t = _cov_lookup(B_acc.covariance, ref.layer_idx, e, name)
+                    if B_t is not None:
+                        B_d = B_t.to(device=fe.gate_proj_U.device, dtype=torch.float32)
                 U_p = getattr(fe, f"{name}_U").data[e].clone().to(torch.float32).requires_grad_(True)
                 V_p = getattr(fe, f"{name}_V").data[e].clone().to(torch.float32).requires_grad_(True)
                 # Initial loss (pre-refine) for the convergence diff.
+                # Held in locals — only committed to the layer accumulators
+                # after a successful ``opt.step``, so an LBFGS exception
+                # cannot leave bw_init incremented without a matching
+                # bw_final / bw_count.
                 with torch.no_grad():
                     R0 = W - U_p @ V_p
                     init_loss = float(((R0 @ A_d) * R0).sum().item())
+                    bw_init_local = (
+                        float(((R0 @ B_d) * R0).sum().item())
+                        if B_d is not None else None
+                    )
                 opt = torch.optim.LBFGS(
                     [U_p, V_p], history_size=lbfgs_history,
                     max_iter=lbfgs_steps, line_search_fn="strong_wolfe",
@@ -700,6 +746,11 @@ def _per_matrix_refine(
                 with torch.no_grad():
                     getattr(fe, f"{name}_U").data[e].copy_(U_p.to(getattr(fe, f"{name}_U").dtype))
                     getattr(fe, f"{name}_V").data[e].copy_(V_p.to(getattr(fe, f"{name}_V").dtype))
+                    if B_d is not None and bw_init_local is not None:
+                        R1 = W - U_p @ V_p
+                        bw_init[name] += bw_init_local
+                        bw_final[name] += float(((R1 @ B_d) * R1).sum().item())
+                        bw_count[name] += 1
                 layer_init[name] += init_loss
                 layer_final[name] += final_loss
                 layer_count[name] += 1
@@ -717,4 +768,30 @@ def _per_matrix_refine(
             metrics[f"stage3/refine_rel_drop/{name}"] = rel
             log.info("  L%d %s LBFGS: %.4e → %.4e (drop %.1f%%)",
                      ref.layer_idx, name, init_m, final_m, 100 * rel)
+            # B-weighted regression check: refine optimises the A-weighted
+            # objective, but the B-weighted norm is what ``_aa_svd`` (and,
+            # by proxy, the model's actual quality on calibration-like
+            # input) targets. Warn loudly if refine made the B-weighted
+            # residual worse on this layer × matrix.
+            if bw_count[name] > 0:
+                bw_i = bw_init[name] / bw_count[name]
+                bw_f = bw_final[name] / bw_count[name]
+                bw_rel = (bw_i - bw_f) / max(bw_i, 1e-12)
+                metrics[f"stage3/refine_bw_loss_init/{name}"] = bw_i
+                metrics[f"stage3/refine_bw_loss_final/{name}"] = bw_f
+                metrics[f"stage3/refine_bw_rel_drop/{name}"] = bw_rel
+                if bw_rel < -1e-3:
+                    log.warning(
+                        "  L%d %s refine REGRESSED B-weighted norm: "
+                        "%.4e → %.4e (%.2f%%); A-weighted dropped %.1f%%. "
+                        "Refine objective ≠ B-weighted target; consider "
+                        "reducing lbfgs_steps or disabling block_refine.",
+                        ref.layer_idx, name, bw_i, bw_f, 100 * bw_rel,
+                        100 * rel,
+                    )
+                else:
+                    log.info("  L%d %s B-weighted: %.4e → %.4e (drop %.1f%%)",
+                             ref.layer_idx, name, bw_i, bw_f, 100 * bw_rel)
         _trackio_log(metrics)
+        if bw_check:
+            B_acc.unload_layer(ref.layer_idx)
