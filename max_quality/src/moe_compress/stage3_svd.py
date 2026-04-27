@@ -151,7 +151,8 @@ def run(
             )
 
     T_budget = _compute_T_budget(group_stats, decomposition.svd_rank_ratio)
-    ranks = _d_rank_allocate(group_stats, T_budget)
+    proj_weights = config.get("stage3_svd", {}).get("d_rank", {}).get("per_projection_weight", {})
+    ranks = _d_rank_allocate(group_stats, T_budget, proj_weights=proj_weights or None)
     alpha_by_type = _swift_svd_plus_grid(
         model, tokenizer, config, group_stats, ranks, artifacts_dir,
     )
@@ -313,11 +314,26 @@ def _compute_T_budget(group_stats: dict, svd_rank_ratio: float) -> int:
     return int(max(1, target_params / max(avg_cost, 1.0)))
 
 
-def _d_rank_allocate(group_stats: dict, T_budget: int) -> dict:
-    denom = sum(math.sqrt(s.effective_rank / s.omega) for s in group_stats.values()) or 1.0
+def _d_rank_allocate(
+    group_stats: dict,
+    T_budget: int,
+    proj_weights: dict[str, float] | None = None,
+) -> dict:
+    """Distribute T_budget rank across all (layer, matrix) groups.
+
+    proj_weights biases the allocation toward specific projection types without
+    changing the total budget — e.g. {"gate_proj": 1.75, "up_proj": 1.35,
+    "down_proj": 0.35} gives gate/up more rank at down_proj's expense.
+    """
+    pw = proj_weights or {}
+
+    def _weight(g, s):
+        return math.sqrt(s.effective_rank / s.omega) * pw.get(g[1], 1.0)
+
+    denom = sum(_weight(g, s) for g, s in group_stats.items()) or 1.0
     out = {}
     for g, s in group_stats.items():
-        k = math.sqrt(s.effective_rank / s.omega) * T_budget / denom
+        k = _weight(g, s) * T_budget / denom
         k = max(1, min(int(round(k)), min(s.d_out, s.d_in) - 1))
         out[g] = k
     return out

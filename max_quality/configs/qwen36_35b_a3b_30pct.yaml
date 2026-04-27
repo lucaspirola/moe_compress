@@ -74,6 +74,14 @@ stage3_svd:
                                   # spot: 16 (~30min Stage 3 vs ~5h40m at 1).
   d_rank:
     parameter_cost_omega_mode: auto  # ω = d1 + n·d2 per paper
+    # Per-projection rank bias (budget-neutral: weights are normalized).
+    # Motivated by SiLU amplification: gate_proj errors compound through the
+    # nonlinearity, up_proj errors are linear, down_proj already near low-rank
+    # (empirical rel_recon_err: gate~981k, up~468k, down~5k at uniform 0.14).
+    per_projection_weight:
+      gate_proj: 1.75
+      up_proj:   1.35
+      down_proj: 0.35
   swift_svd_plus:
     alpha_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     validation_samples: 512       # WikiText-2 slice for α selection
