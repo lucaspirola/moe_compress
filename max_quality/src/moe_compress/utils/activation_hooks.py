@@ -68,26 +68,30 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class ReamCostAccumulator:
-    """Collects per-token per-expert gate weight profiles and gated expert
-    outputs for computing REAM's activation-space cost matrix (paper Eq. 5, 8).
+    """Collects per-token per-expert **pre-softmax router logit** profiles and
+    gated expert outputs for computing REAM's activation-space cost matrix
+    (paper 2604.04356, Eq. 5 & 8).
 
     Storage per layer:
-      - gate_weight_profiles[layer_idx][expert_idx]: dict mapping global token
-        index → gate weight. Aligned by global token position so δ_gate cosine
-        similarity compares the same tokens across experts (paper Eq. 5).
+      - gate_logit_profiles[layer_idx][expert_idx]: dict mapping global token
+        index → pre-softmax router logit. Aligned by global token position so
+        δ_gate cosine similarity compares the same tokens across experts
+        (paper Eq. 5).  Pre-softmax logits can be negative and unbounded,
+        giving the full [-1, 1] cosine similarity range (post-softmax weights
+        are non-negative, compressing cosine to [0, 1]).
       - gated_output_sim/count: incremental pairwise cosine similarity of
         gated expert outputs per batch (paper Eq. 8, approximated as
         cosine(mean_gated_i, mean_gated_j) per batch).
 
-    Gate weights are post-softmax routing probabilities (σ(x)_e), not raw
-    logits.  The paper's Eq. 5 uses raw logits; we use probabilities as a
-    pragmatic approximation since capturing raw logits requires an extra
-    router pre-hook.  The cosine geometry differs (probabilities are
-    non-negative) but the ranking signal is preserved.
+    Pre-softmax logits are captured via ``capture_router_outputs`` (a
+    pre-forward hook on the router module that recomputes
+    ``F.linear(hidden, router.weight)``).  This runs independently of and
+    concurrently with the ``instrument_experts`` hooks that capture gated
+    expert outputs.
     """
-    # Per-(layer, expert): dict[global_token_idx → gate_weight_value].
+    # Per-(layer, expert): dict[global_token_idx → pre-softmax logit].
     # Aligned by global token position for correct δ_gate cosine sim.
-    gate_weight_profiles: dict[int, dict[int, dict[int, float]]] = field(
+    gate_logit_profiles: dict[int, dict[int, dict[int, float]]] = field(
         default_factory=lambda: defaultdict(lambda: defaultdict(dict))
     )
     # Incremental pairwise cosine similarity of gated expert outputs.
@@ -96,23 +100,28 @@ class ReamCostAccumulator:
     # Temporary per-batch storage: (layer, expert) → stacked gated output tensor [T, d_hid]
     _batch_gated: dict[tuple[int, int], list[torch.Tensor]] = field(default_factory=lambda: defaultdict(list))
 
-    def record_gate_weight(
-        self, layer_idx: int, expert_idx: int,
-        gate_weights: torch.Tensor, token_indices: torch.Tensor,
-        batch_offset: int,
+    def record_router_logits(
+        self, layer_idx: int, logits: torch.Tensor, batch_offset: int,
     ) -> None:
-        """Record per-token gate weights keyed by global token index.
+        """Record pre-softmax router logits for ALL experts from one batch.
+
+        Called once per batch per layer (from the ``capture_router_outputs``
+        hook), NOT once per expert.  The logits tensor has shape
+        ``[n_tokens_in_batch, num_experts]`` — we scatter each expert's
+        column into its per-token profile dict.
 
         Args:
-            gate_weights: [T] post-softmax routing weights for active tokens.
-            token_indices: [T] local token indices within the batch.
+            logits: [T, E] pre-softmax router logits.
             batch_offset: global offset = batch_idx * batch_size * seq_len.
         """
-        weights = gate_weights.detach().cpu().tolist()
-        indices = token_indices.detach().cpu().tolist()
-        prof = self.gate_weight_profiles[layer_idx][expert_idx]
-        for tok_local, w in zip(indices, weights):
-            prof[batch_offset + tok_local] = w
+        # Detach + CPU once; then scatter per-expert.
+        logits_cpu = logits.detach().cpu()   # [T, E]
+        n_tokens, n_experts = logits_cpu.shape
+        for e in range(n_experts):
+            col = logits_cpu[:, e].tolist()
+            prof = self.gate_logit_profiles[layer_idx][e]
+            for t, val in enumerate(col):
+                prof[batch_offset + t] = val
 
     def record_gated_output(self, layer_idx: int, expert_idx: int,
                             gate_weights: torch.Tensor, expert_output: torch.Tensor) -> None:
@@ -159,14 +168,14 @@ class ReamCostAccumulator:
                 self.gated_output_count[k2] += 1
 
     def compute_delta_gate(self, layer_idx: int, expert_i: int, expert_j: int) -> float:
-        """δ_gate(i,j) per REAM Eq. 5: cosine sim between gate weight profile vectors.
+        """δ_gate(i,j) per REAM Eq. 5: cosine sim between pre-softmax gate
+        logit profile vectors.
 
         Both vectors are indexed by the same global token positions (union of
-        tokens where either expert was active). Tokens where one expert was
-        inactive get 0.0, preserving alignment.
+        ALL calibration tokens — every token has a logit for every expert).
         """
-        prof_i = self.gate_weight_profiles.get(layer_idx, {}).get(expert_i, {})
-        prof_j = self.gate_weight_profiles.get(layer_idx, {}).get(expert_j, {})
+        prof_i = self.gate_logit_profiles.get(layer_idx, {}).get(expert_i, {})
+        prof_j = self.gate_logit_profiles.get(layer_idx, {}).get(expert_j, {})
         if not prof_i and not prof_j:
             return 1.0  # max distance if no data
         all_tokens = sorted(set(prof_i.keys()) | set(prof_j.keys()))
@@ -191,7 +200,7 @@ class ReamCostAccumulator:
 
     def clear_layer(self, layer_idx: int) -> None:
         """Free memory for a processed layer."""
-        self.gate_weight_profiles.pop(layer_idx, None)
+        self.gate_logit_profiles.pop(layer_idx, None)
         keys_to_clear = [k for k in self.gated_output_sim if k[0] == layer_idx]
         for k in keys_to_clear:
             self.gated_output_sim.pop(k, None)
