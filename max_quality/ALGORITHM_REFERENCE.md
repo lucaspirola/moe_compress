@@ -228,7 +228,7 @@ where `X_j = {x | j ∈ TopK(σ(x))}`, `g_j(x)` is the post-softmax routing weig
 
 **Activation-space similarities** (NOT weight-space):
 
-- **δ_gate(i,j)** (Eq. 5): Cosine distance between gate weight profile vectors. Each expert's profile is a vector indexed by global token position, containing the post-softmax routing weight for that token (0.0 for tokens not routed to this expert). Experts with similar routing patterns have low δ_gate.
+- **δ_gate(i,j)** (Eq. 5): Cosine distance between **pre-softmax** router logit profile vectors. Each expert's profile is a vector indexed by global token position, containing the pre-softmax logit for that token (captured via `capture_router_outputs` pre-forward hook on the router module, which recomputes `F.linear(hidden, router.weight)`). Pre-softmax logits can be negative and unbounded, giving the full `[-1, 1]` cosine similarity range.
 
 - **δ̃_expert(i,j)** (Eq. 8): Mean cosine distance of gated expert outputs `σ(x)_e · E_e(x)`. Computed incrementally per batch as `cosine(mean_gated_output_i, mean_gated_output_j)` to avoid materializing all outputs.
 
@@ -319,6 +319,23 @@ k_g = √(R_eff(g) / ω) × T_budget / Σ_{g'} √(R_eff(g') / ω)   (Eq. 6 — 
 where `ω = n_experts × (d_out + d_in)` is the per-rank parameter cost and `T_budget` is the global rank budget derived from `svd_rank_ratio`.
 
 **Per-projection bias** (budget-neutral): `gate_proj=1.33`, `up_proj=0.67`, `down_proj=1.0`. Derived from SwiGLU error sensitivity: gate errors are amplified by SiLU; up errors are bounded; down errors propagate to all downstream layers.
+
+#### Phase B.2: Swift-SVD+ Per-Expert Rank Redistribution (Paper 2604.01609, Algorithm 2)
+
+Within each (layer, matrix_type) group, D-Rank gives a uniform rank `k_g` to every expert. Swift-SVD+ refines this by redistributing the group's total rank budget `k_g × N_experts` across individual experts using a blending score:
+
+```
+s_i = β_i^α · (log(e + ε*_i))^{1-α}
+```
+
+where:
+- `β_i = σ_i² / Σ_j σ_j²` — spectral energy proportion (how much of the group's total spectral energy this expert contributes)
+- `ε*_i = √(Σ_{j>k̄} σ_j² / Σ_j σ_j²)` — reconstruction error at the group's mean rank `k̄` (higher = this expert needs more rank)
+- `α ∈ [0, 1]` — balances the two signals
+
+**α grid search:** For each projection type (if `per_group_type: true`), evaluate all `α ∈ {0.0, 0.1, ..., 1.0}` and pick the α that minimises total tail spectral energy across all experts in that type. This takes seconds (purely weight-space SVD, no forward passes).
+
+Per-expert ranks are stored in the `FactoredExperts` slot at the max rank across experts in the group (zero-padded for experts with lower rank). `effective_ranks` tracks the true per-expert rank for honest parameter counting.
 
 #### Phase C: Hybrid Activation-Aware SVD
 
@@ -540,11 +557,9 @@ Each heavy stage (2–5) uploads its checkpoint to a per-stage Hub repo immediat
 | Stage | Deviation | Paper Says | Implementation Does | Justification |
 |-------|-----------|-----------|-------------------|---------------|
 | 1 | Weight-space D^l metric | Paper experiments likely use activation-based CKA | Cosine similarity on flattened weight vectors | Paper §3.2 explicitly allows "CKA, MSE, or other similarity measures" |
-| 2 | Gate weight profiles use post-softmax probabilities | Paper Eq. 5 uses pre-softmax logits | Post-softmax weights from `ctx["top_k_weights"]` | Pragmatic — raw logits require an extra router pre-hook; cosine geometry differs but ranking signal is preserved |
 | 2 | δ̃_expert uses `cosine(mean_gated)` per batch | Paper Eq. 8 averages per-token cosine over jointly-active tokens | Mean gated output per expert, then pairwise cosine | Avoids O(T²·E²) per-token pair matching; approximate but tractable |
 | 2 | Neuron alignment cost is weight-only (`C_wt`) | Paper uses `C = C_act + C_wt` | Only weight-based Frobenius distance | Paper ablation (§5.4) shows weight-only has ΔAVG = −0.5 — minor impact |
 | 3 | AA-SVD uses auto-covariance A, not cross-covariance | Theorem 3.2 requires `X_pre^T X_post` | Substitutes `A_cov = X_pre^T X_pre` | Cross-covariance not stored; the two coincide under light pruning |
-| 3 | Swift-SVD+ α grid search is not implemented | Config declares `alpha_grid` | α has no effect on the current one-sided B-only path | Deferred to post-launch |
 | 5 | Effective batch size 4×2 instead of 2×4 | Paper Table 1: batch_size=2, grad_accum=4 | batch_size=4, grad_accum=2 | Same effective batch (8); adapted for A100 memory headroom with 4-bit teacher |
 
 ---
