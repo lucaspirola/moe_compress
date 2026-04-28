@@ -1,9 +1,14 @@
 """Stage 4 — EoRA residual compensation, fused-experts-aware.
 
 For each (layer, expert, matrix) factored in Stage 3, we compute the
-residual ΔW_e = W_orig_e - U_e @ V_e, project it into the top-r eigenspace
-of the input activation covariance, take a rank-r SVD, and **widen** the
-corresponding ``FactoredExperts`` U / V along the rank dim.
+residual ΔW_e = W_orig_e - U_e @ V_e, project it through the **√Λ-scaled
+eigenspace** of the input activation covariance (paper Algorithm 1, step 3:
+Q' = Q·√Λ), take a rank-r SVD of the *full* projected error ΔW'= ΔW·Q'
+(shape [d_out, d_in], NOT pre-truncated to r), then back-project via
+V_corr = V'^T · (√Λ)^{-1} · Q^T and **widen** the corresponding
+``FactoredExperts`` U / V along the rank dim.
+
+Reference: EoRA (2410.21271) Algorithm 1.
 
 The compensation budget per matrix is capped at
 ``compensation_budget_pct × (stage3 saved params for this matrix)``, so
@@ -251,11 +256,24 @@ def _compute_eora_factors(
     *,
     storage_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Returns (U, V, take_eff) where `take_eff <= r` is the effective rank
-    of the correction. When `take_eff < r`, U/V are zero-padded to width r so
-    the caller's pre-allocated tensors stay shape-stable, but the trailing
-    `r - take_eff` columns/rows contribute nothing — they should not count
-    toward parameter budgets or rank reporting.
+    """Paper-correct EoRA (2410.21271) Algorithm 1.
+
+    Steps (matching paper notation, restricted to signal eigenspace):
+      1. ΔW = W_orig − Ŵ                           [d_out × d_in]  (caller)
+      2. Eigendecompose X̃X̃ᵀ = QΛQᵀ                [d_in × d_in]
+         Keep n_keep eigenvectors above noise floor.
+      3. Q' = Q_keep · √Λ_keep                      [d_in × n_keep]
+      4. ΔW' = ΔW · Q'                              [d_out × n_keep]  (full projection)
+      5. SVD(ΔW') full_matrices=False → top take_eff=min(r, min(d_out, n_keep))
+      6. B' = U'[:,:take_eff] · Σ'[:take_eff]       [d_out × take_eff]
+         A  = Vh'[:take_eff] · diag(1/√Λ_keep) @ Q_keep^T   [take_eff × d_in]
+
+    The √Λ scaling is the core innovation of EoRA: it importance-weights the
+    eigenspace so SVD concentrates rank budget on high-variance input directions.
+    Without it, this degenerates to the Act-S baseline.
+
+    Returns (U, V, take_eff) where `take_eff <= r` is the effective rank.
+    When `take_eff < r`, U/V are zero-padded to width r.
     """
     if r <= 0:
         return (torch.zeros(delta.shape[0], 0, device=device),
@@ -264,8 +282,7 @@ def _compute_eora_factors(
     d_out, d_in = delta.shape
 
     def _plain_svd_padded() -> tuple[torch.Tensor, torch.Tensor, int]:
-        # Defensive zero-pad: caller's pre-allocated [d_out, r] / [r, d_in]
-        # tensors require exact-r width even on the fallback path.
+        # Fallback: plain SVD without activation weighting.
         U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
         rk = min(r, U.shape[1])
         if rk == r:
@@ -278,34 +295,62 @@ def _compute_eora_factors(
 
     if A is None:
         return _plain_svd_padded()
+
     A = A.to(device=device, dtype=torch.float32)
     A = 0.5 * (A + A.T)
-    eigvals, eigvecs = torch.linalg.eigh(A)            # ascending
+    if A.shape != (d_in, d_in):
+        log.warning("EoRA: covariance shape %s != (%d,%d), falling back to plain SVD",
+                    A.shape, d_in, d_in)
+        return _plain_svd_padded()
+
+    # Step 2: Eigendecompose activation covariance X̃X̃ᵀ = QΛQᵀ  (A shape [d_in × d_in])
+    eigvals, eigvecs = torch.linalg.eigh(A)  # ascending order
+
     sigma_max = float(eigvals[-1].clamp_min(0).item())
     # Dtype-aware noise floor — see _NOISE_FLOOR_BY_DTYPE in stage3_svd.
     from moe_compress.stage3_svd import _NOISE_FLOOR_BY_DTYPE
     rel_floor = _NOISE_FLOOR_BY_DTYPE.get(storage_dtype or torch.float32, 1e-6)
     thresh = max(sigma_max * rel_floor, 1e-12)
+
     keep_mask = eigvals > thresh
-    keep_idx = keep_mask.nonzero(as_tuple=False).flatten()
-    if keep_idx.numel() == 0:
-        U_pad, V_pad, eff = _plain_svd_padded()
-        return U_pad, V_pad, eff
-    # `nonzero` returns indices in ascending position order, so `keep_idx`
-    # is sorted ascending in eigvals (since eigh is ascending). flip → top-r.
-    keep_desc = keep_idx.flip(0)
-    take = min(r, int(keep_desc.numel()))
-    P = eigvecs[:, keep_desc[:take]]                          # [d_in, take]
-    projected = delta @ P                                     # [d_out, take]
-    U, S, Vh = torch.linalg.svd(projected, full_matrices=False)
-    take_eff = min(take, U.shape[1])
-    U_take = U[:, :take_eff] * S[:take_eff]
-    V_take = Vh[:take_eff] @ P.T                              # [take_eff, d_in]
+    if not keep_mask.any():
+        return _plain_svd_padded()
+
+    # Keep only directions above the noise floor for the projection.
+    eigvals_keep = eigvals[keep_mask].clamp_min(0)
+    eigvecs_keep = eigvecs[:, keep_mask]         # [d_in, n_keep]
+    n_keep = int(eigvals_keep.numel())
+
+    # Step 3: Q' = Q · √Λ  (paper Algorithm 1 step 3).
+    # FULL projection matrix — NOT truncated to r. The SVD in step 5
+    # will optimally select the best r directions from the FULL d_in-
+    # dimensional projected error. Pre-truncating to r would eliminate
+    # the joint optimisation that distinguishes EoRA from Act-S.
+    sqrt_lambda = eigvals_keep.sqrt()                         # [n_keep]
+    Q_prime = eigvecs_keep * sqrt_lambda.unsqueeze(0)         # [d_in, n_keep]
+
+    # Step 4: ΔW' = ΔW · Q'  (FULL projection, [d_out × n_keep])
+    delta_prime = delta @ Q_prime                             # [d_out, n_keep]
+
+    # Step 5: rank-r SVD of the full projected error
+    U_p, S_p, Vh_p = torch.linalg.svd(delta_prime, full_matrices=False)
+    take_eff = min(r, int(U_p.shape[1]))
+
+    # Step 6a: B' = U' Σ'
+    U_corr = U_p[:, :take_eff] * S_p[:take_eff]              # [d_out, take_eff]
+
+    # Step 6b: Back-project A = V'^T · Q'^{-1}
+    # Q'^{-1} = diag(1/√Λ) · Q^T  (since Q has orthonormal columns)
+    # So: A = V'^T · diag(1/√Λ) · Q^T = (Vh_p[:take_eff] · diag(1/√Λ)) @ Q^T
+    inv_sqrt_lambda = eigvals_keep.clamp_min(1e-30).rsqrt()   # [n_keep]
+    V_corr = (Vh_p[:take_eff, :] * inv_sqrt_lambda.unsqueeze(0)) @ eigvecs_keep.T
+    # V_corr shape: [take_eff, d_in]
+
+    # Zero-pad to fixed r so caller's pre-allocated tensors stay shape-stable.
     if take_eff >= r:
-        return U_take[:, :r], V_take[:r, :], r
-    # Zero-pad to fixed r so caller's [d_out, r] / [r, d_in] tensors stay shape-stable.
-    U_out = torch.zeros(d_out, r, device=device, dtype=U_take.dtype)
-    V_out = torch.zeros(r, d_in, device=device, dtype=V_take.dtype)
-    U_out[:, :take_eff] = U_take
-    V_out[:take_eff, :] = V_take
+        return U_corr[:, :r], V_corr[:r, :], r
+    U_out = torch.zeros(d_out, r, device=device, dtype=U_corr.dtype)
+    V_out = torch.zeros(r, d_in, device=device, dtype=V_corr.dtype)
+    U_out[:, :take_eff] = U_corr
+    V_out[:take_eff, :] = V_corr
     return U_out, V_out, take_eff
