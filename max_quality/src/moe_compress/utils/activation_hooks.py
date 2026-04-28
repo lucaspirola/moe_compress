@@ -97,8 +97,13 @@ class ReamCostAccumulator:
     # Incremental pairwise cosine similarity of gated expert outputs.
     gated_output_sim: dict[tuple[int, int, int], float] = field(default_factory=lambda: defaultdict(float))
     gated_output_count: dict[tuple[int, int, int], int] = field(default_factory=lambda: defaultdict(int))
-    # Temporary per-batch storage: (layer, expert) → stacked gated output tensor [T, d_hid]
-    _batch_gated: dict[tuple[int, int], list[torch.Tensor]] = field(default_factory=lambda: defaultdict(list))
+    # Temporary per-batch storage: (layer, expert) → {global_token_idx → gated_output [d_hid]}
+    _batch_gated_indexed: dict[tuple[int, int], dict[int, torch.Tensor]] = field(
+        default_factory=lambda: defaultdict(dict)
+    )    # Per-neuron activation mean for C_act in neuron alignment (REAM §4).
+    # Key: (layer_idx, expert_idx) → running sum of intermediate activations [d_intermediate]
+    _neuron_act_sum: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
+    _neuron_act_count: dict[tuple[int, int], int] = field(default_factory=lambda: defaultdict(int))
 
     def record_router_logits(
         self, layer_idx: int, logits: torch.Tensor, batch_offset: int,
@@ -124,48 +129,61 @@ class ReamCostAccumulator:
                 prof[batch_offset + t] = val
 
     def record_gated_output(self, layer_idx: int, expert_idx: int,
-                            gate_weights: torch.Tensor, expert_output: torch.Tensor) -> None:
-        """Record gated expert output σ(x)_e * E_e(x) for later pairwise cosine sim."""
-        # gate_weights: [T], expert_output: [T, d_hid]
-        gated = (gate_weights.unsqueeze(-1) * expert_output).detach()  # [T, d_hid]
-        self._batch_gated[(layer_idx, expert_idx)].append(gated)
+                            gate_weights: torch.Tensor, expert_output: torch.Tensor,
+                            token_indices: torch.Tensor, batch_offset: int) -> None:
+        """Record gated expert output σ(x)_e * E_e(x) keyed by global token index."""
+        # gate_weights: [T], expert_output: [T, d_hid], token_indices: [T]
+        gated = (gate_weights.unsqueeze(-1) * expert_output).detach().cpu().to(torch.float32)  # [T, d_hid]
+        indices = (token_indices.detach().cpu() + batch_offset).tolist()
+        prof = self._batch_gated_indexed[(layer_idx, expert_idx)]
+        for idx, t in enumerate(indices):
+            prof[t] = gated[idx]
 
     def finalize_batch(self, layer_idx: int, num_experts: int) -> None:
         """After a full forward pass through the layer, compute pairwise cosine
-        similarities between all expert pairs that were both active in this batch.
-        This avoids storing all gated outputs across batches."""
-        # Collect per-expert gated output for this layer from the current batch.
-        per_expert: dict[int, torch.Tensor] = {}
+        similarities over jointly-active tokens (paper Eq. 8 exact formulation).
+
+        For each pair (i, j), finds the token intersection where BOTH experts
+        were active in this batch, computes per-token cosine similarity on the
+        gated outputs, and averages. This is O(E² × |intersection|) per batch,
+        where |intersection| ≈ (top_k/E)² × T is typically very small.
+        """
+        # Collect per-expert {global_token_idx → gated_output} for this batch.
+        per_expert: dict[int, dict[int, torch.Tensor]] = {}
         for e in range(num_experts):
             key = (layer_idx, e)
-            if key not in self._batch_gated or not self._batch_gated[key]:
-                continue
-            stacked = torch.cat(self._batch_gated[key], dim=0).cpu().to(torch.float32)  # [T_e, d_hid]
-            per_expert[e] = stacked
-        # Clear batch storage for this layer.
-        keys_to_clear = [k for k in self._batch_gated if k[0] == layer_idx]
+            if key in self._batch_gated_indexed and self._batch_gated_indexed[key]:
+                per_expert[e] = dict(self._batch_gated_indexed[key])
+        # Clear batch storage.
+        keys_to_clear = [k for k in self._batch_gated_indexed if k[0] == layer_idx]
         for k in keys_to_clear:
-            del self._batch_gated[k]
+            self._batch_gated_indexed[k].clear()
 
-        # Pairwise cosine similarity: for each pair (i, j), use
-        # cosine_sim(mean_gated_i, mean_gated_j) as an approximation of
-        # paper Eq. 8's mean(per-token cosine sim). This avoids the
-        # O(T^2 * E^2) cost of per-token pair matching.
         expert_ids = sorted(per_expert.keys())
         if len(expert_ids) < 2:
             return
-        means: dict[int, torch.Tensor] = {}
-        for e in expert_ids:
-            means[e] = per_expert[e].mean(dim=0)  # [d_hid]
+
+        # Build per-expert token sets for fast intersection.
+        token_sets: dict[int, set[int]] = {e: set(per_expert[e].keys()) for e in expert_ids}
+
         for idx_i, e_i in enumerate(expert_ids):
             for e_j in expert_ids[idx_i + 1:]:
-                sim = float(F.cosine_similarity(means[e_i].unsqueeze(0), means[e_j].unsqueeze(0)).item())
+                # Intersection: tokens where BOTH experts were active.
+                shared = token_sets[e_i] & token_sets[e_j]
+                if not shared:
+                    continue
+                # Per-token cosine similarity on the intersection.
+                vecs_i = torch.stack([per_expert[e_i][t] for t in shared])  # [|shared|, d_hid]
+                vecs_j = torch.stack([per_expert[e_j][t] for t in shared])  # [|shared|, d_hid]
+                sims = F.cosine_similarity(vecs_i, vecs_j, dim=-1)           # [|shared|]
+                avg_sim = float(sims.mean().item())
                 k1 = (layer_idx, e_i, e_j)
                 k2 = (layer_idx, e_j, e_i)
-                self.gated_output_sim[k1] += sim
-                self.gated_output_sim[k2] += sim
-                self.gated_output_count[k1] += 1
-                self.gated_output_count[k2] += 1
+                n_shared = len(shared)
+                self.gated_output_sim[k1] += avg_sim * n_shared
+                self.gated_output_sim[k2] += avg_sim * n_shared
+                self.gated_output_count[k1] += n_shared
+                self.gated_output_count[k2] += n_shared
 
     def compute_delta_gate(self, layer_idx: int, expert_i: int, expert_j: int) -> float:
         """δ_gate(i,j) per REAM Eq. 5: cosine sim between pre-softmax gate
@@ -198,6 +216,36 @@ class ReamCostAccumulator:
         avg_sim = self.gated_output_sim[key] / count
         return (1.0 - avg_sim) / 2.0  # normalize to [0, 1]
 
+    def record_neuron_activations(
+        self, layer_idx: int, expert_idx: int, intermediate: torch.Tensor,
+    ) -> None:
+        """Accumulate per-neuron activation sums for C_act (REAM §4).
+
+        ``intermediate`` is the input to down_proj: shape [T, d_intermediate].
+        Each column is a neuron. We accumulate sum(|activation|, dim=0) over
+        tokens and batches, then divide by count to get per-neuron mean
+        activation magnitude.
+        """
+        key = (layer_idx, expert_idx)
+        # Use abs so the mean captures activation magnitude, not signed average.
+        batch_sum = intermediate.detach().abs().sum(dim=0).cpu().to(torch.float32)  # [d_intermediate]
+        n_tokens = int(intermediate.shape[0])
+        prev = self._neuron_act_sum.get(key)
+        if prev is None:
+            self._neuron_act_sum[key] = batch_sum
+        else:
+            self._neuron_act_sum[key] = prev + batch_sum
+        self._neuron_act_count[key] += n_tokens
+
+    def get_neuron_mean(self, layer_idx: int, expert_idx: int) -> torch.Tensor | None:
+        """Return per-neuron mean activation magnitude [d_intermediate], or None."""
+        key = (layer_idx, expert_idx)
+        s = self._neuron_act_sum.get(key)
+        c = self._neuron_act_count.get(key, 0)
+        if s is None or c == 0:
+            return None
+        return s / c
+
     def clear_layer(self, layer_idx: int) -> None:
         """Free memory for a processed layer."""
         self.gate_logit_profiles.pop(layer_idx, None)
@@ -205,6 +253,10 @@ class ReamCostAccumulator:
         for k in keys_to_clear:
             self.gated_output_sim.pop(k, None)
             self.gated_output_count.pop(k, None)
+        neuron_keys = [k for k in self._neuron_act_sum if k[0] == layer_idx]
+        for k in neuron_keys:
+            self._neuron_act_sum.pop(k, None)
+            self._neuron_act_count.pop(k, 0)
 
 
 
