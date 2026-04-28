@@ -11,8 +11,14 @@ Key differences from the pre-refactor version:
     We save these under the (layer, expert, matrix_name) key space that
     Stage 3 consumes.
 
-The REAM Hungarian + frequency-weighted-merge logic is unchanged
-algorithmically.
+REAM cost matrix (paper 2604.04356):
+  - δ_gate (Eq. 5): cosine similarity between per-token gate logit profiles
+    (activation-space, NOT weight-space).
+  - δ̃_expert (Eq. 8): mean cosine similarity between gated expert outputs
+    σ(x)_i · E_i(x) (activation-space, NOT weight-space).
+  - Grouping: greedy pseudo-pruning per paper §4, NOT Hungarian assignment.
+
+Frequency-weighted merge with neuron permutation alignment is preserved.
 """
 from __future__ import annotations
 
@@ -31,6 +37,7 @@ from scipy.optimize import linear_sum_assignment
 
 from .utils.activation_hooks import (
     InputCovarianceAccumulator,
+    ReamCostAccumulator,
     ReapAccumulator,
     instrument_experts,
     record_reap,
@@ -175,9 +182,10 @@ def run(
             k + 1, len(moe_layers), layer_ref.layer_idx, target,
         )
         reap_acc = ReapAccumulator()
+        ream_acc = ReamCostAccumulator()
         torch.cuda.empty_cache()   # release fragmented reserved-but-unallocated memory before forward pass
         _profile_layer(
-            model, layer_ref, batches, reap_acc, cov_acc,
+            model, layer_ref, batches, reap_acc, cov_acc, ream_acc,
             device=device,
         )
         # Drain GPU-resident accumulators to CPU once per layer (avoid the
@@ -222,8 +230,7 @@ def run(
 
             delta = _ream_cost_matrix(
                 layer_ref, noncentroid_ids, centroid_ids,
-                gate_weight=s2["ream"]["gate_weight"],
-                expert_weight=s2["ream"]["expert_weight"],
+                ream_acc=ream_acc,
             )
             assignment = _assign_children_to_centroids(
                 delta, len(noncentroid_ids), len(centroid_ids),
@@ -283,6 +290,9 @@ def run(
         for bank in banks.values():
             bank.select(centroid_ids)
         _resize_router_for_kept_experts(layer_ref, centroid_ids)
+
+        # Free REAM activation-space accumulators for this layer.
+        ream_acc.clear_layer(layer_ref.layer_idx)
 
         merge_map[layer_ref.layer_idx] = {
             new_idx: sorted(grouped[centroid])
@@ -406,10 +416,13 @@ def _profile_layer(
     batches,
     reap_acc: ReapAccumulator,
     cov_acc: InputCovarianceAccumulator,
+    ream_acc: ReamCostAccumulator,
     *,
     device=None,
 ) -> None:
     layer_idx = layer_ref.layer_idx
+    n_experts = layer_ref.num_routed_experts
+    model.eval()  # ensure dropout/batchnorm are in eval mode for calibration
 
     def input_cb(li, e, tensor, ctx):
         # Input to gate_proj + up_proj share the same tensor; the accumulator
@@ -423,16 +436,28 @@ def _profile_layer(
     def down_cb(li, e, tensor, ctx):
         # REAP contribution per expert dispatch event.
         record_reap(reap_acc, li, e, ctx["top_k_weights"], tensor)
+        # REAM: record gate logit profile and gated expert output.
+        # ctx["top_k_weights"] are post-softmax gate values (σ(x)_e).
+        ream_acc.record_gate_logit(li, e, ctx["top_k_weights"])
+        ream_acc.record_gated_output(li, e, ctx["top_k_weights"], tensor)
 
     with instrument_experts(
         layer_ref,
         {"input": input_cb, "intermediate": intermediate_cb, "down": down_cb},
     ):
-        run_calibration(model, batches, device=device)
+        for batch_idx, batch in enumerate(batches):
+            if device is not None:
+                batch = batch.to(device)
+            with torch.no_grad():
+                model(input_ids=batch)
+            # After each batch, compute pairwise gated output similarities
+            # incrementally to avoid storing all outputs across batches.
+            ream_acc.finalize_batch(layer_idx, n_experts)
 
 
 # ---------------------------------------------------------------------------
-# REAM cost + Hungarian assignment
+# REAM cost (activation-space, paper 2604.04356 Eq. 5 & 8)
+# + greedy pseudo-pruning assignment (paper §4)
 # ---------------------------------------------------------------------------
 
 
@@ -441,50 +466,78 @@ def _ream_cost_matrix(
     noncentroid_ids: list[int],
     centroid_ids: list[int],
     *,
-    gate_weight: float,
-    expert_weight: float,
+    ream_acc: ReamCostAccumulator,
 ) -> np.ndarray:
+    """Compute REAM cost δ_REAM(i,j) = δ_gate(i,j) + δ̃_expert(i,j) using
+    activation-space similarities per paper 2604.04356 Eq. 5 & 8.
+
+    - δ_gate: cosine similarity between per-token gate logit profile vectors
+    - δ̃_expert: mean cosine similarity between gated expert outputs
+    """
     if not noncentroid_ids or not centroid_ids:
         return np.zeros((len(noncentroid_ids), len(centroid_ids)))
 
-    router = layer_ref.router
-    gate_w = router.weight.detach().to(torch.float32)
-    gate_w_n = torch.nn.functional.normalize(gate_w, dim=1)
-    gate_sim = gate_w_n @ gate_w_n.transpose(0, 1)
-    delta_gate_full = (1.0 - gate_sim).clamp(min=0.0, max=2.0) / 2.0
+    li = layer_ref.layer_idx
+    cost = np.zeros((len(noncentroid_ids), len(centroid_ids)), dtype=np.float64)
 
-    # Expert similarity via flattened combined weights (gate, up, down).
-    banks = build_banks(layer_ref)
-    all_ids = noncentroid_ids + centroid_ids
-    flat_vecs: list[torch.Tensor] = []
-    for e in all_ids:
-        parts = [banks[n].get(e).detach().to(torch.float32).flatten() for n in MATRIX_NAMES]
-        flat_vecs.append(torch.cat(parts))
-    W = torch.stack(flat_vecs)
-    Wn = torch.nn.functional.normalize(W, dim=1)
-    sim = Wn @ Wn.transpose(0, 1)
-    expert_sim = sim[: len(noncentroid_ids), len(noncentroid_ids):]
-    delta_expert = (1.0 - expert_sim).clamp(min=0.0, max=2.0) / 2.0
+    for ci, child in enumerate(noncentroid_ids):
+        for cj, centroid in enumerate(centroid_ids):
+            dg = ream_acc.compute_delta_gate(li, child, centroid)
+            de = ream_acc.compute_delta_expert(li, child, centroid)
+            cost[ci, cj] = dg + de  # paper Eq. 7: unweighted sum
 
-    dg = delta_gate_full[np.ix_(noncentroid_ids, centroid_ids)]
-    cost = gate_weight * dg + expert_weight * delta_expert
-    return cost.cpu().numpy()
+    return cost
 
 
 def _assign_children_to_centroids(
     cost: np.ndarray, n_children: int, n_centroids: int,
+    centroid_saliency_order: list[int] | None = None,
 ) -> list[int]:
+    """Greedy pseudo-pruning per REAM paper §4.
+
+    Iterate centroids in descending saliency order. For each centroid,
+    greedily absorb the most-similar (lowest-cost) unassigned non-centroid.
+    Repeat until all non-centroids are assigned.
+
+    This replaces the previous Hungarian assignment (which was a global
+    bipartite matching — not what the paper describes).
+    """
     if n_children == 0 or n_centroids == 0:
         return []
+
     assignment = [-1] * n_children
-    remaining = list(range(n_children))
-    while remaining:
-        batch = remaining[:n_centroids]
-        sub = cost[np.ix_(batch, range(n_centroids))]
-        row_ind, col_ind = linear_sum_assignment(sub)
-        for r, c in zip(row_ind, col_ind):
-            assignment[batch[r]] = int(c)
-        remaining = remaining[n_centroids:]
+    assigned = set()
+
+    # If saliency order not provided, use column index order (centroids are
+    # already sorted by REAP score in the caller).
+    centroid_order = centroid_saliency_order if centroid_saliency_order else list(range(n_centroids))
+
+    # Keep assigning until all children are assigned. Multiple passes may be
+    # needed since each centroid takes at most one child per pass. This is
+    # equivalent to the paper's "up to C" greedy assignment.
+    while len(assigned) < n_children:
+        made_progress = False
+        for c_idx in centroid_order:
+            # Find the cheapest unassigned child for this centroid.
+            best_child = -1
+            best_cost = float("inf")
+            for ch in range(n_children):
+                if ch in assigned:
+                    continue
+                if cost[ch, c_idx] < best_cost:
+                    best_cost = cost[ch, c_idx]
+                    best_child = ch
+            if best_child >= 0:
+                assignment[best_child] = c_idx
+                assigned.add(best_child)
+                made_progress = True
+        if not made_progress:
+            unassigned = [ch for ch in range(n_children) if ch not in assigned]
+            raise RuntimeError(
+                f"Greedy assignment stalled: {len(unassigned)} children unassigned "
+                f"with {n_centroids} centroids — possible NaN in cost matrix"
+            )
+
     return assignment
 
 
