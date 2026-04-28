@@ -50,6 +50,7 @@ stage0_super_experts:
 stage1_grape:
   similarity_metric: cosine       # one of: cosine | mse | cka
   min_experts_per_layer: 64       # floor; Qwen3-30B (128 experts) uses 32, scale by 2x
+  entropy_tolerance: 0.1          # γ in GRAPE Eq. 10: entropy threshold = E_0 * (1 - γ)
   early_layer_bonus: 8            # add +8 to first early_layer_bonus_depth MoE layers (by MoE-sequence index)
   early_layer_bonus_depth: 4      # protects first 4 MoE layers
   late_layer_bonus: 8             # add +8 to last late_layer_bonus_depth MoE layers (by MoE-sequence index)
