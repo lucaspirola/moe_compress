@@ -39,6 +39,7 @@ from .utils.activation_hooks import (
     InputCovarianceAccumulator,
     ReamCostAccumulator,
     ReapAccumulator,
+    capture_router_outputs,
     instrument_experts,
     record_reap,
     run_calibration,
@@ -424,7 +425,7 @@ def _profile_layer(
     n_experts = layer_ref.num_routed_experts
     model.eval()  # ensure dropout/batchnorm are in eval mode for calibration
 
-    # Track batch offset for global token indexing in gate weight profiles.
+    # Track batch offset for global token indexing in gate logit profiles.
     _batch_offset = [0]
 
     def input_cb(li, e, tensor, ctx):
@@ -439,25 +440,33 @@ def _profile_layer(
     def down_cb(li, e, tensor, ctx):
         # REAP contribution per expert dispatch event.
         record_reap(reap_acc, li, e, ctx["top_k_weights"], tensor)
-        # REAM: record gate weight profile (aligned by global token index)
-        # and gated expert output for pairwise cosine sim.
+        # REAM: record gated expert output for pairwise cosine sim.
         # ctx["top_k_weights"] are post-softmax gate values (σ(x)_e).
-        # ctx["token_idx"] are local indices within the batch.
-        ream_acc.record_gate_weight(
-            li, e, ctx["top_k_weights"], ctx["token_idx"], _batch_offset[0],
-        )
         ream_acc.record_gated_output(li, e, ctx["top_k_weights"], tensor)
 
+    # Two independent hooks active simultaneously:
+    # 1. capture_router_outputs: pre-forward hook on router → pre-softmax logits [T, E]
+    # 2. instrument_experts: monkey-patched forward on experts → per-expert callbacks
+    # The router hook fires first (pre-forward), then the experts hook fires
+    # during the forward. They don't interfere.
     with instrument_experts(
         layer_ref,
         {"input": input_cb, "intermediate": intermediate_cb, "down": down_cb},
-    ):
+    ), capture_router_outputs([layer_ref]) as router_logits_storage:
         for batch_idx, batch in enumerate(batches):
             if device is not None:
                 batch = batch.to(device)
             _batch_offset[0] = batch_idx * batch.shape[0] * batch.shape[1]
+            # Clear the router logits storage for this batch (it accumulates
+            # across forward passes within the context manager).
+            router_logits_storage[layer_idx].clear()
             with torch.no_grad():
                 model(input_ids=batch)
+            # Scatter the pre-softmax router logits into per-expert profiles.
+            # capture_router_outputs appends one [T, E] tensor per forward call.
+            if router_logits_storage[layer_idx]:
+                batch_logits = router_logits_storage[layer_idx][-1]  # [T, E]
+                ream_acc.record_router_logits(layer_idx, batch_logits, _batch_offset[0])
             # After each batch, compute pairwise gated output similarities
             # incrementally to avoid storing all outputs across batches.
             ream_acc.finalize_batch(layer_idx, n_experts)
