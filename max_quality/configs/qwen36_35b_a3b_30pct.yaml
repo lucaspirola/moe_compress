@@ -116,16 +116,17 @@ stage5_router_kd:
   learning_rate: 5.0e-5           # spec-corrected from 1e-5
   epochs: 1
   # batch_size × gradient_accumulation = effective batch (=8). Bumped
-  # batch_size 2→4 and dropped grad_accum 4→2 since teacher is now 4-bit
-  # (~17 GB) so we have headroom on the A100. Activations at batch=4 with
-  # autograd: ~4 GB → total weights+acts ≈ 70 GB / 80 GB. Same effective
-  # batch, fewer gradient_accumulation iterations → ~2× wall-clock saved.
+  # batch_size 2→4 and dropped grad_accum 4→2 since the NF4-quantized
+  # teacher (~17 GB) leaves headroom on the A100. The student is always
+  # BF16 (~50 GB); only the frozen teacher is quantized for VRAM savings.
+  # Activations at batch=4: ~4 GB → total ≈ 70 GB / 80 GB. Same effective
+  # batch as paper (2×4=8), ~2× fewer grad_accum iters → faster wall-clock.
   batch_size: 4
   gradient_accumulation: 2
-  # Quantize the (frozen) teacher to NF4 via bitsandbytes so it fits on
-  # the same A100 as the student without CPU offload. KD signal is robust
-  # to 4-bit teacher precision (router is bottlenecked by topology, not
-  # logit precision); validate via Stage 6 vs. a precomputed-logits run.
+  # Quantize the (frozen) teacher to NF4 via bitsandbytes so teacher+student
+  # co-reside on a single A100. This is a VRAM optimization only — the
+  # pipeline model (student) is always BF16. KD signal is robust to teacher
+  # quantization (routing topology matters more than logit precision).
   teacher_load_in_4bit: true
   max_sequence_length: 512
   kd_temperature: 1.0
