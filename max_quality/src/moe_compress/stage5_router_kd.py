@@ -273,17 +273,13 @@ def run(
             # KL(teacher ‖ student) over vocabulary, per-token, scaled by τ².
             # Paper Eq. 3: L_RKD = (τ²/N_x) Σ_t KL(p_T^t ‖ p_S^t)
             # Shift logits: predict token t+1 from position t (standard causal LM).
-            # Use positions [0, L-2] to predict [1, L-1].
             t_logits_shift = teacher_vocab_logits[:, :-1, :]   # [B, L-1, |V|]
             s_logits_shift = student_vocab_logits[:, :-1, :]   # [B, L-1, |V|]
 
-            t_p = F.softmax(t_logits_shift / T, dim=-1)
-            s_lp = F.log_softmax(s_logits_shift / T, dim=-1)
-
-            # Per-token KL, then mean over all (non-pad) tokens.
-            per_token_kl = F.kl_div(s_lp, t_p, reduction="none").sum(dim=-1)  # [B, L-1]
-            n_tokens = per_token_kl.numel()
-            loss = (per_token_kl.sum() / max(n_tokens, 1)) * (T ** 2)
+            # Chunked KL to bound peak memory: at |V|≈150K with B=4, chunk=128,
+            # peak intermediate is ~300 MB vs ~1.2 GB for the full sequence.
+            seq_chunk = int(s5.get("kd_seq_chunk_size", 128))
+            loss = _chunked_vocab_kl(s_logits_shift, t_logits_shift, T, chunk_size=seq_chunk)
 
             (loss / grad_accum).backward()
 
@@ -330,6 +326,37 @@ def run(
     # convergence and post-mortem analysis. The directory is small (≤ 2 × few MB).
     log.info("Stage 5 complete → %s", out_dir)
     return out_dir
+
+
+def _chunked_vocab_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    temperature: float,
+    chunk_size: int = 128,
+) -> torch.Tensor:
+    """Compute vocab-level KL(teacher ‖ student) in sequence chunks.
+
+    Processes ``chunk_size`` sequence positions at a time to bound peak
+    intermediate memory. At chunk_size=128 with |V|=150K and B=4:
+      Peak intermediate per chunk ≈ 4 × 128 × 150K × 4 bytes ≈ 300 MB
+      vs ≈1.2 GB for the full sequence at L=512.
+
+    Returns scalar loss = (τ²/N_tokens) × Σ_t KL(teacher_t ‖ student_t).
+    """
+    B, L, V = student_logits.shape
+    total_kl = torch.zeros((), device=student_logits.device, dtype=torch.float32)
+    n_tokens = 0
+    for start in range(0, L, chunk_size):
+        end = min(start + chunk_size, L)
+        s_chunk = student_logits[:, start:end, :]
+        t_chunk = teacher_logits[:, start:end, :]
+        t_p = F.softmax(t_chunk / temperature, dim=-1)
+        s_lp = F.log_softmax(s_chunk / temperature, dim=-1)
+        chunk_kl = F.kl_div(s_lp, t_p, reduction="none").sum(dim=-1)  # [B, chunk_len]
+        total_kl = total_kl + chunk_kl.sum()
+        n_tokens += chunk_kl.numel()
+        del t_p, s_lp, chunk_kl  # free intermediates eagerly
+    return (total_kl / max(n_tokens, 1)) * (temperature ** 2)
 
 
 def _save_stage5_checkpoint(
