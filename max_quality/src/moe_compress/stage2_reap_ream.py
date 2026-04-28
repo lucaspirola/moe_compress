@@ -424,6 +424,9 @@ def _profile_layer(
     n_experts = layer_ref.num_routed_experts
     model.eval()  # ensure dropout/batchnorm are in eval mode for calibration
 
+    # Track batch offset for global token indexing in gate weight profiles.
+    _batch_offset = [0]
+
     def input_cb(li, e, tensor, ctx):
         # Input to gate_proj + up_proj share the same tensor; the accumulator
         # aliases them so a single gate_proj update covers both.
@@ -436,9 +439,13 @@ def _profile_layer(
     def down_cb(li, e, tensor, ctx):
         # REAP contribution per expert dispatch event.
         record_reap(reap_acc, li, e, ctx["top_k_weights"], tensor)
-        # REAM: record gate logit profile and gated expert output.
+        # REAM: record gate weight profile (aligned by global token index)
+        # and gated expert output for pairwise cosine sim.
         # ctx["top_k_weights"] are post-softmax gate values (σ(x)_e).
-        ream_acc.record_gate_logit(li, e, ctx["top_k_weights"])
+        # ctx["token_idx"] are local indices within the batch.
+        ream_acc.record_gate_weight(
+            li, e, ctx["top_k_weights"], ctx["token_idx"], _batch_offset[0],
+        )
         ream_acc.record_gated_output(li, e, ctx["top_k_weights"], tensor)
 
     with instrument_experts(
@@ -448,6 +455,7 @@ def _profile_layer(
         for batch_idx, batch in enumerate(batches):
             if device is not None:
                 batch = batch.to(device)
+            _batch_offset[0] = batch_idx * batch.shape[0] * batch.shape[1]
             with torch.no_grad():
                 model(input_ids=batch)
             # After each batch, compute pairwise gated output similarities
