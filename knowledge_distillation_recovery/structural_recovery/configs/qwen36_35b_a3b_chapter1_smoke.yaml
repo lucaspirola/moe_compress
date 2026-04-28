@@ -62,7 +62,7 @@ distillation:
   sequence_length: 4096
   log_every_n_steps: 5
   eval_every_n_steps: 50
-  save_every_n_steps: 0                        # final-only for smoke
+  save_every_n_steps: 0                        # 0 == disable interim saves (final-only); see distillation.run_distillation
   trainable_scope: experts_only                # 1× H200 (141 GB): keep optim/grad VRAM small under bnb.AdamW8bit
   use_gradient_checkpointing: true
   nan_loss_circuit_breaker: true

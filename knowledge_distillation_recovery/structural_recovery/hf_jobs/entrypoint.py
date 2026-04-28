@@ -76,6 +76,16 @@ from pathlib import Path
 LOG = logging.getLogger("hf_jobs.recovery_entrypoint")
 
 
+def _truthy(name: str, default: str = "0") -> bool:
+    """Parse common truthy spellings consistently across the orchestrator.
+
+    Accepts ``1 / true / yes / on`` (case-insensitive, whitespace-trimmed)
+    as truthy; everything else is falsy. Mirroring this contract in
+    ``submit.sh`` keeps launcher and entrypoint in agreement.
+    """
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 CACHE_MOUNT             = Path(os.environ.get("CACHE_MOUNT", "/mnt/cache"))
 CODE_REPO               = os.environ.get("CODE_REPO",       "pirola/moe-compress-code")
 RECOVERY_REPO           = os.environ.get("RECOVERY_REPO",   "pirola/structural-recovery-code")
@@ -83,10 +93,10 @@ STUDENT_REPO            = os.environ.get("STUDENT_REPO",    "")
 CONFIG_PATH             = os.environ.get("CONFIG_PATH",     "")
 DS_CONFIG_PATH          = os.environ.get("DS_CONFIG_PATH",  "ds_configs/zero3_offload_optim.json")
 RESULT_REPO             = os.environ.get("RESULT_REPO",     "")
-SMOKE                   = os.environ.get("SMOKE", "0") not in ("0", "false", "False", "")
-SKIP_TEACHER            = os.environ.get("SKIP_TEACHER_CORRECTION", "0") not in ("0", "false", "False", "")
+SMOKE                   = _truthy("SMOKE")
+SKIP_TEACHER            = _truthy("SKIP_TEACHER_CORRECTION")
 TEACHER_CORRECTED_REPO  = os.environ.get("TEACHER_CORRECTED_REPO", "")
-ALLOW_SINGLE_GPU        = os.environ.get("ALLOW_SINGLE_GPU", "0") not in ("0", "false", "False", "")
+ALLOW_SINGLE_GPU        = _truthy("ALLOW_SINGLE_GPU")
 
 
 def _main() -> int:
@@ -291,7 +301,12 @@ def _run_phase(*, entry: str, extra_args: list[str], config_arg: str,
     try:
         completed = subprocess.run(cmd, env=env, check=False)
         return completed.returncode
-    except BaseException as exc:                                 # noqa: BLE001
+    except (KeyboardInterrupt, SystemExit):
+        # Let cancellation propagate so the SIGTERM-=>143 handler at module
+        # bottom can convert it into the documented exit code. Swallowing
+        # these would defeat the cancellation-distinguishing contract.
+        raise
+    except Exception as exc:                                     # noqa: BLE001
         LOG.error("subprocess raised: %s\n%s", exc, traceback.format_exc())
         return 2
 
@@ -345,7 +360,10 @@ def _sanity_check() -> None:
 
 
 def _with_retry(fn, label: str, max_attempts: int = 3) -> None:
-    """Call fn() up to max_attempts times with exponential backoff."""
+    """Call ``fn()`` up to ``max_attempts`` times with a fixed-schedule backoff
+    (30s, 90s, 90s, ...). Last delay repeats indefinitely if more attempts
+    are configured. Returns ``fn``'s value on success; re-raises the last
+    exception on exhaustion."""
     import time
     delays = [30, 90]
     for attempt in range(1, max_attempts + 1):
@@ -506,6 +524,10 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
     if not final_dir.exists():
         # Fall back to the most recent valid partial. Exclude .tmp dirs (from
         # interrupted atomic renames) and dirs missing _SAVE_COMPLETE.
+        def _partial_step(p: Path) -> int:
+            tail = p.name.split("step")[-1]
+            return int(tail) if tail.isdigit() else -1
+
         partials = sorted(
             [
                 p for p in artifacts_dir.glob("chapter1_recovered_partial_step*")
@@ -513,7 +535,7 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
                 and not p.name.endswith(".tmp")
                 and (p / "_SAVE_COMPLETE").exists()
             ],
-            key=lambda p: int(p.name.split("step")[-1]) if p.name.split("step")[-1].isdigit() else -1,
+            key=_partial_step,
         )
         if partials:
             LOG.warning("chapter1_recovered missing; uploading %s.", partials[-1])
@@ -547,7 +569,7 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
             # operator's only signal that the job actually finished.
             LOG.warning("aux upload %s failed: %s — continuing.", name, err)
 
-    status_path = artifacts_dir / "_job_status.txt"
+    status_path = artifacts_dir / "job_status.txt"
     status_path.write_text(
         f"{'SUCCESS' if ok else 'FAILURE'} at "
         f"{datetime.now(timezone.utc).isoformat()}\n"

@@ -52,7 +52,8 @@ Local equivalent (with shared venv at `/home/lucas/ai/venv`):
 source /home/lucas/ai/venv/bin/activate
 pip install -e .
 pytest tests/ -v
-accelerate launch --config_file ds_configs/zero3_offload_optim.json \
+accelerate launch --use_deepspeed --deepspeed_config_file ds_configs/zero3_offload_optim.json \
+    --mixed_precision bf16 \
     -m structural_recovery.run_recovery \
     --config configs/qwen36_35b_a3b_chapter1_smoke.yaml \
     --student /path/to/stage5_final \

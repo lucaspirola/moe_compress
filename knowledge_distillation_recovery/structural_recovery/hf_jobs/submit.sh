@@ -25,11 +25,16 @@ set -euo pipefail
 # a100x4 with the BF16 teacher (A100 has no FP8 tensor cores). a100-large
 # (single A100-80GB) cannot fit BF16 teacher + BF16 student simultaneously.
 SMOKE="${SMOKE:-0}"
-if [[ "$SMOKE" == "1" ]]; then
+# Match entrypoint.py's ``_truthy`` parser: 1 / true / yes / on (case-
+# insensitive). Keeps launcher and entrypoint in agreement on what is truthy.
+shopt -s nocasematch
+if [[ "$SMOKE" =~ ^(1|true|yes|on)$ ]]; then
+    shopt -u nocasematch
     FLAVOR="${FLAVOR:-h200}"
     CONFIG_PATH="${CONFIG_PATH:-configs/qwen36_35b_a3b_chapter1_smoke.yaml}"
     TIMEOUT="${TIMEOUT:-2h}"
 else
+    shopt -u nocasematch
     FLAVOR="${FLAVOR:-a100x4}"
     CONFIG_PATH="${CONFIG_PATH:-configs/qwen36_35b_a3b_chapter1_light.yaml}"
     TIMEOUT="${TIMEOUT:-12h}"
@@ -108,7 +113,7 @@ ENV_ARGS=(
     --env "CONFIG_PATH=$CONFIG_PATH"
     --env "SMOKE=$SMOKE"
     --env "SKIP_TEACHER_CORRECTION=$SKIP_TEACHER_CORRECTION"
-    --env "PYTORCH_ALLOC_CONF=expandable_segments:True"
+    --env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 )
 if [[ -n "$RESULT_REPO" ]]; then
     ENV_ARGS+=(--env "RESULT_REPO=$RESULT_REPO")

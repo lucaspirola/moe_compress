@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from structural_recovery.distillation import (
     _shard_batches_per_rank, cosine_with_warmup, forward_kld_loss,
@@ -91,7 +92,6 @@ def test_kld_per_token_normalisation():
 def test_kld_per_token_is_T_times_smaller_than_batch_sum():
     """Sanity-check the bug fix: per-token loss is much smaller than the
     old (broken) per-sample-summed-over-tokens loss."""
-    import torch.nn.functional as F
     torch.manual_seed(5)
     B, T, V = 2, 32, 256
     s = torch.randn(B, T, V)
@@ -115,7 +115,6 @@ def test_kld_matches_handrolled_implementation():
     semantics gotcha — `reduction='mean'` would divide by an extra factor of
     V (vocab size) and the test would fail by orders of magnitude.
     """
-    import torch.nn.functional as F
     torch.manual_seed(42)
     B, T, V = 2, 8, 1000
     s = torch.randn(B, T, V)

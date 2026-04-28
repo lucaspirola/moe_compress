@@ -30,9 +30,8 @@ if str(_PKG_SRC) not in sys.path and _PKG_SRC.is_dir():
     sys.path.insert(0, str(_PKG_SRC))
 
 # Resolve max_quality src: env var override > sibling auto-discovery.
-_MAX_QUALITY_SRC = Path(
-    os.environ.get("MOE_COMPRESS_MAX_QUALITY", "")
-) if os.environ.get("MOE_COMPRESS_MAX_QUALITY") else (_REPO_ROOT / "max_quality" / "src")
+_MQ_ENV = os.environ.get("MOE_COMPRESS_MAX_QUALITY")
+_MAX_QUALITY_SRC = Path(_MQ_ENV) if _MQ_ENV else (_REPO_ROOT / "max_quality" / "src")
 
 # Try to make max_quality importable; record success/failure for the skip hook.
 _MAX_QUALITY_AVAILABLE: bool = False

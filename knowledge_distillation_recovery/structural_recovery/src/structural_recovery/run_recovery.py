@@ -38,8 +38,8 @@ import yaml
 log = logging.getLogger(__name__)
 
 
-# _DSCHF_HOLDER and _activate_zero3_init live in distillation so all phases
-# share one canonical implementation (imported below where needed).
+# _activate_zero3_init lives in distillation so all phases share one
+# canonical implementation (imported in _load_teacher).
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
             log.warning("SystemMetrics startup failed (%s) — continuing without sampler.", exc)
 
     try:
-        return _run(config, args, artifacts_dir, accelerator, metrics)
+        return _run(config, args, artifacts_dir, accelerator)
     finally:
         if metrics is not None:
             try:
@@ -108,8 +108,10 @@ def main(argv: list[str] | None = None) -> int:
                 log.warning("metrics.stop failed: %s", exc)
 
 
-def _run(config, args, artifacts_dir, accelerator, _metrics) -> int:  # noqa: ARG001
-    """Inner body of main() — separated so SystemMetrics stop is always called."""
+def _run(config, args, artifacts_dir, accelerator) -> int:
+    """Inner body of main() — separated so SystemMetrics stop is always
+    called via the outer try/finally even on exception. The metrics daemon
+    is owned entirely by ``main`` and not threaded through here."""
 
     # Capture the *original* student source before any auto-resume override,
     # for the resume_state.json sidecar below.
@@ -140,9 +142,9 @@ def _run(config, args, artifacts_dir, accelerator, _metrics) -> int:  # noqa: AR
         # ``tokenizer.save_pretrained(tmp_dir)`` — so the tokenizer SHOULD be
         # there. If a partial somehow lacks it (older format / manual edit),
         # fall back to the original student source for tokenizer-only loading
-        # and warn loudly.
-        has_tok = any(partial_dir.glob("tokenizer*"))
-        if not has_tok and accelerator.is_main_process:
+        # and warn loudly. Rank-0-only — non-rank-0 ranks do not need the
+        # warning and the glob is wasted I/O on the bucket FS.
+        if accelerator.is_main_process and not any(partial_dir.glob("tokenizer*")):
             log.warning(
                 "Auto-resume partial %s lacks tokenizer files; "
                 "load_compressed_model will fail. Either re-run from "
@@ -289,9 +291,9 @@ def _validate_config(config: dict[str, Any]) -> None:
             f"distillation.betas must be a 2-element list/tuple of numbers; "
             f"got {betas!r}."
         )
-    # Don't write the source-path stamp into the resolved_config artifact.
-    # It's a runtime breadcrumb, not a config field.
-    # (popped right before yaml.safe_dump in main).
+    # The ``_source_path`` runtime stamp is filtered out of the dumped
+    # ``resolved_config.yaml`` (see comprehension in ``main``); it's a
+    # runtime breadcrumb, not a re-loadable config field.
 
 
 def _build_accelerator():
@@ -347,7 +349,7 @@ def _assert_tokenizers_compatible(student_tok, teacher_tok) -> None:
         else:
             sv = getattr(student_tok, field, None)
             tv = getattr(teacher_tok, field, None)
-        marker = "✗" if field in diff_keys else "✓"
+        marker = "FAIL" if field in diff_keys else "OK  "
         lines.append(f"  {field:<20s} student={sv!r}  teacher={tv!r}  {marker}")
     lines.append(
         "KD requires aligned tokenization. Verify both come from the same "

@@ -122,22 +122,20 @@ def test_nan_diagnostic_dump_writes_expected_keys(tmp_path):
     assert payload["student_logits"]["has_nan"] is True
     assert payload["student_logits"]["has_inf"] is True
     assert payload["teacher_logits"]["has_nan"] is False
+    # The triggering loss is NaN: JSON has no native NaN, so the dump uses
+    # ``float("nan")`` which json.dumps emits as the literal ``NaN``. Re-
+    # parse and confirm it's a non-finite float (NaN-self-comparison fails).
+    loss_value = payload["loss_value"]
+    assert isinstance(loss_value, float) and loss_value != loss_value
     assert "hint" in payload
 
 
 # ---------------------------------------------------------------------------
-# Item 6: tokens_skipped_nan threading is exercised by tests above
-# (covered by the metadata schema in the module-level _save signature).
+# _all_finite reports bad ranks
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Item 8: _all_finite reports bad ranks
-# ---------------------------------------------------------------------------
-
-
-def _mock_acc_with_gather(num_processes: int, gathered_flags: torch.Tensor,
-                          is_main: bool = True) -> MagicMock:
+def _mock_acc_with_gather(num_processes: int, gathered_flags: torch.Tensor) -> MagicMock:
     """Build a stub Accelerator whose ``gather`` returns a fixed tensor.
 
     Distributed gather is mocked — these tests exercise the post-gather
@@ -148,7 +146,7 @@ def _mock_acc_with_gather(num_processes: int, gathered_flags: torch.Tensor,
     acc = MagicMock()
     acc.num_processes = num_processes
     acc.process_index = 0
-    acc.is_main_process = is_main
+    acc.is_main_process = True
     acc.device = torch.device("cpu")
     acc.gather = MagicMock(return_value=gathered_flags)
     return acc
@@ -219,7 +217,7 @@ def test_vocab_check_raises_on_eos_mismatch():
     msg = str(ei.value)
     assert "eos_token_id" in msg
     assert "151645" in msg and "151644" in msg
-    assert "✗" in msg, "expected per-field diff marker in error"
+    assert "FAIL" in msg, "expected per-field diff marker in error"
 
 
 def test_vocab_check_raises_on_vocab_size_mismatch():

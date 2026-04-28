@@ -61,6 +61,18 @@ def test_tmp_dirs_ignored(tmp_path):
     assert _load_latest_partial(tmp_path) == (None, 0)
 
 
+def test_tmp_dir_does_not_shadow_valid_sibling(tmp_path):
+    """If a .tmp sibling exists alongside a valid partial, discovery must
+    return the valid one — the .tmp must be ignored, not preferred."""
+    valid = _make_partial(tmp_path, 500)
+    tmp_dir = tmp_path / "chapter1_recovered_partial_step500.tmp"
+    tmp_dir.mkdir()
+    (tmp_dir / "_SAVE_COMPLETE").write_text("{}")
+    path, step = _load_latest_partial(tmp_path)
+    assert step == 500
+    assert path == valid
+
+
 def test_unparseable_step_skipped(tmp_path):
     bad = tmp_path / "chapter1_recovered_partial_stepXYZ"
     bad.mkdir()
