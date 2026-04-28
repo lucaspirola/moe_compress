@@ -52,10 +52,18 @@ Local equivalent (with shared venv at `/home/lucas/ai/venv`):
 source /home/lucas/ai/venv/bin/activate
 pip install -e .
 pytest tests/ -v
+# Smoke (single-GPU, no DeepSpeed — bnb 8-bit AdamW, matches entrypoint
+# behavior under SMOKE=1):
+python -m structural_recovery.run_recovery \
+    --config configs/qwen36_35b_a3b_chapter1_smoke.yaml \
+    --student /path/to/stage5_final \
+    --artifacts-dir ./recovery_artifacts --smoke
+
+# Light (multi-GPU under DeepSpeed ZeRO-3):
 accelerate launch --use_deepspeed --deepspeed_config_file ds_configs/zero3_offload_optim.json \
     --mixed_precision bf16 \
     -m structural_recovery.run_recovery \
-    --config configs/qwen36_35b_a3b_chapter1_smoke.yaml \
+    --config configs/qwen36_35b_a3b_chapter1_light.yaml \
     --student /path/to/stage5_final \
     --artifacts-dir ./recovery_artifacts
 ```

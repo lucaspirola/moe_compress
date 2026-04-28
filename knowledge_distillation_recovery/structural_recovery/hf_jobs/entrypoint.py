@@ -359,17 +359,15 @@ def _sanity_check() -> None:
         )
 
 
-def _with_retry(fn, label: str, max_attempts: int = 3) -> None:
+def _with_retry(fn, label: str, max_attempts: int = 3):
     """Call ``fn()`` up to ``max_attempts`` times with a fixed-schedule backoff
-    (30s, 90s, 90s, ...). Last delay repeats indefinitely if more attempts
-    are configured. Returns ``fn``'s value on success; re-raises the last
-    exception on exhaustion."""
+    (30s, 90s, 90s, ...). Returns ``fn``'s value on success; re-raises the
+    last exception on exhaustion."""
     import time
     delays = [30, 90]
     for attempt in range(1, max_attempts + 1):
         try:
-            fn()
-            return
+            return fn()
         except Exception as exc:  # noqa: BLE001
             if attempt == max_attempts:
                 raise
