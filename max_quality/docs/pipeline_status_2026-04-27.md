@@ -17,13 +17,13 @@ who has not been following the day-to-day work.
 We started from the public model
 [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B), a 35 B
 parameter sparse Mixture-of-Experts (MoE) model. Each of its 40 transformer
-blocks contains 128 routed experts plus 1 shared expert; each token is routed
+blocks contains 256 routed experts plus 1 shared expert; each token is routed
 to top-8 experts. The model is referenced from
 [`hf_jobs/submit.sh`](../hf_jobs/submit.sh#L22) and
 [`configs/qwen36_35b_a3b_30pct.yaml`](../configs/qwen36_35b_a3b_30pct.yaml).
 
 **Why this model.** Compared to Qwen3-32B-A3B, Qwen3.6-35B-A3B's higher
-expert count (128 vs ~32) gives more redundancy headroom for expert
+expert count (256 vs ~32) gives more redundancy headroom for expert
 pruning while keeping `topk=8` active per token. It also has native
 `transformers≥4.57` support via the fused `Qwen3_5MoeExperts` module, which
 the entire pipeline relies on.
