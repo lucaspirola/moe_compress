@@ -42,6 +42,7 @@ RESULT_REPO="${RESULT_REPO:-}"
 BUCKET="${BUCKET:-hf://buckets/pirola/moe-cache}"
 MOUNT="${MOUNT:-/mnt/cache}"
 SKIP_TEACHER_CORRECTION="${SKIP_TEACHER_CORRECTION:-0}"
+TEACHER_CORRECTED_REPO="${TEACHER_CORRECTED_REPO:-}"
 ENTRYPOINT="$(cd "$(dirname "$0")" && pwd)/entrypoint.py"
 DETACH="${DETACH:-0}"
 
@@ -56,9 +57,24 @@ if [[ ! -f "$ENTRYPOINT" ]]; then
     exit 1
 fi
 
-DETACH_FLAG=""
+# Opt-in preflight: run tests locally before spending compute. Catches the
+# most common regressions in <10s. Pass PRECHECK=1 explicitly.
+if [[ "${PRECHECK:-0}" == "1" ]]; then
+    REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+    PYBIN="${PYBIN:-/home/lucas/ai/venv/bin/python}"
+    if [[ -x "$PYBIN" ]]; then
+        echo ">>> Preflight: tests/test_kld_loss.py tests/test_defensive.py tests/test_resume.py tests/test_param_groups.py"
+        ( cd "$REPO_ROOT" && "$PYBIN" -m pytest tests/test_kld_loss.py tests/test_defensive.py tests/test_resume.py tests/test_param_groups.py -q ) \
+            || { echo "Preflight FAILED — refusing to submit" >&2; exit 1; }
+        echo
+    else
+        echo "PRECHECK=1 set but $PYBIN not executable; skipping preflight" >&2
+    fi
+fi
+
+DETACH_ARGS=()
 if [[ "$DETACH" == "1" ]]; then
-    DETACH_FLAG="--detach"
+    DETACH_ARGS+=(--detach)
 fi
 
 echo ">>> Submitting Chapter 1 — Structural Recovery"
@@ -70,6 +86,7 @@ echo "    student repo    : $STUDENT_REPO"
 echo "    config          : $CONFIG_PATH"
 echo "    smoke           : $SMOKE"
 echo "    skip teacher cc : $SKIP_TEACHER_CORRECTION"
+echo "    teacher ckpt    : ${TEACHER_CORRECTED_REPO:-<run Phase 1>}"
 echo "    bucket mount    : $BUCKET → $MOUNT"
 echo "    result repo     : ${RESULT_REPO:-<auto>}"
 echo
@@ -88,6 +105,9 @@ ENV_ARGS=(
 if [[ -n "$RESULT_REPO" ]]; then
     ENV_ARGS+=(--env "RESULT_REPO=$RESULT_REPO")
 fi
+if [[ -n "$TEACHER_CORRECTED_REPO" ]]; then
+    ENV_ARGS+=(--env "TEACHER_CORRECTED_REPO=$TEACHER_CORRECTED_REPO")
+fi
 
 exec hf jobs uv run "$ENTRYPOINT" \
     --flavor "$FLAVOR" \
@@ -95,4 +115,4 @@ exec hf jobs uv run "$ENTRYPOINT" \
     --volume "$BUCKET:$MOUNT" \
     --secrets HF_TOKEN \
     "${ENV_ARGS[@]}" \
-    $DETACH_FLAG
+    "${DETACH_ARGS[@]}"

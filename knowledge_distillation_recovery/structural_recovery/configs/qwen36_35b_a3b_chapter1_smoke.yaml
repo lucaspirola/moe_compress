@@ -14,7 +14,7 @@
 teacher:
   name_or_path: Qwen/Qwen3.6-35B-A3B-FP8
   revision: main
-  torch_dtype: bfloat16
+  torch_dtype: auto                              # load in native FP8 on H200 (Hopper); bfloat16 would dequantize to 70 GB
   attn_implementation: sdpa
 
 student:
@@ -63,7 +63,7 @@ distillation:
   log_every_n_steps: 5
   eval_every_n_steps: 50
   save_every_n_steps: 0                        # final-only for smoke
-  trainable_scope: experts_only                # so 1× a100-large fits
+  trainable_scope: experts_only                # 1× H200 (141 GB): keep optim/grad VRAM small under bnb.AdamW8bit
   use_gradient_checkpointing: true
   nan_loss_circuit_breaker: true
   consecutive_nan_threshold: 5                 # raise after this many consecutive bad windows

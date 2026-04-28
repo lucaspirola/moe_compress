@@ -72,7 +72,7 @@ distillation:
   sequence_length: 4096
   log_every_n_steps: 10
   eval_every_n_steps: 200
-  save_every_n_steps: 500
+  save_every_n_steps: 100                        # worst-case replay ~6% of budget vs 29% at 500
   trainable_scope: full                        # full | experts_only | factored_only
   use_gradient_checkpointing: true             # required at this scale
   nan_loss_circuit_breaker: true

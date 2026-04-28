@@ -16,6 +16,7 @@ DeepSpeed correctness rules (P0):
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 import torch
@@ -50,16 +51,23 @@ def final_report(student, tokenizer, config: dict[str, Any], accelerator) -> dic
     """End-of-run report. COLLECTIVE — every rank participates in the forward.
 
     Only rank 0 returns a populated dict; other ranks return ``{}``.
+
+    Resilient like ``run`` — final report is a diagnostic that must not abort
+    the job after the (already-saved) checkpoint exists.
     """
     out: dict[str, Any] = {}
     eval_cfg = config.get("eval", {})
-    if eval_cfg.get("wikitext2", {}).get("enabled", False):
-        # Final pass uses 4× the smoke slice for a tighter estimate.
-        cfg = dict(eval_cfg["wikitext2"])
-        cfg["num_sequences"] = int(cfg.get("num_sequences", 256)) * 4
-        ppl = _wikitext2_ppl(student, tokenizer, cfg, accelerator)
+    try:
+        if eval_cfg.get("wikitext2", {}).get("enabled", False):
+            # Final pass uses 4× the smoke slice for a tighter estimate.
+            cfg = dict(eval_cfg["wikitext2"])
+            cfg["num_sequences"] = int(cfg.get("num_sequences", 256)) * 4
+            ppl = _wikitext2_ppl(student, tokenizer, cfg, accelerator)
+            if accelerator.is_main_process:
+                out["wikitext2_ppl"] = ppl
+    except Exception as err:                                         # noqa: BLE001
         if accelerator.is_main_process:
-            out["wikitext2_ppl"] = ppl
+            log.warning("final_report eval failed (continuing): %s", err)
     if accelerator.is_main_process:
         log.info("final_report: %s", out)
     return out
@@ -95,6 +103,11 @@ def _wikitext2_ppl(student, tokenizer, cfg: dict[str, Any], accelerator) -> floa
     ids = ids[: n_seqs * seq_len]
     inp = torch.tensor(ids, dtype=torch.long).view(n_seqs, seq_len).to(accelerator.device)
 
+    # NOTE: data is rank-replicated (no distributed sampler), so every rank
+    # computes the *same* nll on the *same* sequences. We deliberately do not
+    # reduce across ranks. If a future refactor introduces a distributed
+    # sampler, also add an `accelerator.gather`/`accelerator.reduce` here to
+    # avoid silently producing per-rank-different PPLs.
     student.eval()
     nll_total = 0.0
     tok_total = 0
@@ -117,8 +130,7 @@ def _wikitext2_ppl(student, tokenizer, cfg: dict[str, Any], accelerator) -> floa
         student.train()
 
     avg_nll = nll_total / max(1, tok_total)
-    ppl = float(torch.exp(torch.tensor(avg_nll)).item())
-    return ppl
+    return float(math.exp(avg_nll))
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +185,6 @@ def _do_generations(student, tokenizer, prompts, max_new, accelerator) -> None:
             try:
                 # accelerator.unwrap_model so generate() sees the underlying
                 # nn.Module (DeepSpeed engine doesn't implement generate).
-                from accelerate import Accelerator  # type: ignore  # noqa
                 model = accelerator.unwrap_model(student)
                 out = model.generate(
                     ids, max_new_tokens=max_new, do_sample=False,

@@ -45,11 +45,8 @@ import yaml
 log = logging.getLogger(__name__)
 
 
-# Module-scope holder so HfDeepSpeedConfig instances aren't GC'd between the
-# loader function returning and the subsequent ``from_pretrained`` calls.
-# (HfDeepSpeedConfig keeps a thread-local global internally, but defence in
-# depth — this also makes the lifetime obvious to readers.)
-_DSCHF_HOLDER: list = []
+# _DSCHF_HOLDER and ZeRO-3 helpers are canonical in distillation.py;
+# imported where needed below.
 
 
 # ---------------------------------------------------------------------------
@@ -86,8 +83,8 @@ def main(argv: list[str] | None = None) -> int:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     out_dir = artifacts_dir / "teacher_corrected_bf16"
 
-    if out_dir.exists() and any(out_dir.iterdir()) and not args.overwrite:
-        log.info("Output already exists at %s; pass --overwrite to redo.", out_dir)
+    if out_dir.exists() and (out_dir / "_SAVE_COMPLETE").exists() and not args.overwrite:
+        log.info("Output already exists at %s (sentinel present); pass --overwrite to redo.", out_dir)
         return 0
 
     # Build accelerator (picks up DeepSpeed from launcher if applicable).
@@ -154,49 +151,13 @@ def _strip_fp8_suffix(name: str) -> str:
 
 
 def _is_zero3(accelerator) -> bool:
-    from accelerate.utils import DistributedType
-    if accelerator.distributed_type != DistributedType.DEEPSPEED:
-        return False
-    plugin = getattr(accelerator.state, "deepspeed_plugin", None)
-    return plugin is not None and int(plugin.zero_stage) >= 3
+    from .distillation import _is_zero3 as _iz3
+    return _iz3(accelerator)
 
 
 def _activate_zero3_init(accelerator) -> None:
-    """Pin a module-scope HfDeepSpeedConfig so subsequent from_pretrained
-    constructs ZeRO-3-sharded params via ``deepspeed.zero.Init``.
-
-    Same pattern as ``run_recovery._activate_zero3_init`` — uses the
-    module-scope ``_DSCHF_HOLDER`` so the pin survives function exits.
-    No-op if not under DeepSpeed ZeRO-3 or if already activated.
-    """
-    if not _is_zero3(accelerator):
-        return
-    if _DSCHF_HOLDER:
-        return  # already activated this process
-    from transformers.integrations import (
-        HfDeepSpeedConfig, is_deepspeed_zero3_enabled,
-    )
-    plugin = accelerator.state.deepspeed_plugin
-    ds_config = plugin.deepspeed_config
-    _DSCHF_HOLDER.append(HfDeepSpeedConfig(ds_config))
-
-    # Item 7 mirror: hard-fail if the activation didn't take effect.
-    if not is_deepspeed_zero3_enabled():
-        try:
-            import deepspeed                              # noqa: F401
-            ds_avail = True
-        except ImportError:
-            ds_avail = False
-        raise RuntimeError(
-            "HfDeepSpeedConfig was instantiated but "
-            "is_deepspeed_zero3_enabled() returned False — the BF16 teacher "
-            "would load full-rank on each rank and OOM. Inspect: "
-            f"plugin.zero_stage={getattr(plugin, 'zero_stage', '?')}, "
-            f"deepspeed_importable={ds_avail}, "
-            f"ds_config['zero_optimization']['stage']="
-            f"{ds_config.get('zero_optimization', {}).get('stage', '?')}."
-        )
-    log.info("HfDeepSpeedConfig activated for ZeRO-3 sharded from_pretrained.")
+    from .distillation import _activate_zero3_init as _az3
+    _az3(accelerator)
 
 
 def _load_bf16_teacher(name: str, config, accelerator):
@@ -290,10 +251,18 @@ def _finetune_ce(teacher, tokenizer, config, artifacts_dir, accelerator):
     is_ds = _is_deepspeed(accelerator)
     grad_clip = float(config["distillation"]["grad_clip_norm"])
     warmup = int(tcc["warmup_steps"])
+    nan_threshold = int(config["distillation"].get("consecutive_nan_threshold", 5))
     optim.zero_grad(set_to_none=True)
 
     step = 0
     micro_idx = 0
+    consecutive_nan_windows = 0
+    nan_in_current_window = False
+    # Pad/mask contract: build_calibration_tensor (->_tokenize_to_fixed_length)
+    # returns fully-packed sequences (concatenated streams + EOS separators,
+    # hard 5%-shortage cap), so every position is a real token. Passing
+    # ``labels=ids`` without an attention_mask is correct for this input — no
+    # pad positions exist to mask out.
     for batch in batches:
         ids = batch.to(accelerator.device, non_blocking=True)
         out = teacher(input_ids=ids, labels=ids)
@@ -302,6 +271,7 @@ def _finetune_ce(teacher, tokenizer, config, artifacts_dir, accelerator):
         if not _all_finite(loss, accelerator):
             if accelerator.is_main_process:
                 log.warning("teacher_correction :: step=%d non-finite loss; substituting zero.", step)
+            nan_in_current_window = True
             if is_ds:
                 # Build zero loss graph-connected via teacher logits so DS's
                 # micro-batch counter advances. NaN * 0 = NaN, so use a
@@ -328,8 +298,23 @@ def _finetune_ce(teacher, tokenizer, config, artifacts_dir, accelerator):
             optim.zero_grad(set_to_none=True)
             step += 1
             micro_idx = 0
+
+            if nan_in_current_window:
+                consecutive_nan_windows += 1
+                if consecutive_nan_windows >= nan_threshold:
+                    raise RuntimeError(
+                        f"teacher_correction NaN circuit breaker: "
+                        f"{consecutive_nan_windows} consecutive windows with "
+                        f"non-finite loss (threshold={nan_threshold})."
+                    )
+            else:
+                consecutive_nan_windows = 0
+            nan_in_current_window = False
+
             if accelerator.is_main_process and step % 25 == 0:
-                log.info("teacher_correction :: step=%d/%d ce_loss=%.4f lr=%.2e",
+                # ``loss`` here is the LAST micro-batch in the just-committed
+                # window, not the windowed average — name the log key so.
+                log.info("teacher_correction :: step=%d/%d last_micro_ce_loss=%.4f lr=%.2e",
                          step, steps, float(loss.item()), lr)
             if step >= steps:
                 break
@@ -349,18 +334,37 @@ def _save_bf16(teacher, tokenizer, out_dir: Path, accelerator) -> None:
     Under DS3 we use ``accelerator.get_state_dict`` (CPU-streamed gather on
     rank 0), NOT ``GatheredParameters`` (which would re-materialise the full
     70 GB BF16 model on every GPU and OOM).
+
+    Writes are atomic: rank 0 fills a ``.tmp`` directory, writes a
+    ``_SAVE_COMPLETE`` sentinel last, then renames to ``out_dir``. A SIGKILL
+    mid-write leaves the ``.tmp`` behind (cleaned on the next run) rather than
+    a partial ``out_dir`` that fools the idempotency guard.
     """
+    import shutil
+    from .distillation import _atomic_replace_dir
+
     accelerator.wait_for_everyone()
 
+    # ``accelerator.get_state_dict`` is COLLECTIVE under ZeRO-3: it runs the
+    # streamed-gather hook on every rank and returns the full CPU dict on
+    # rank 0 (empty dict on others). Calling it inside a rank-0-only branch
+    # would deadlock — keep it outside the is_main_process gate.
     state_dict = accelerator.get_state_dict(teacher)
 
     if accelerator.is_main_process:
-        out_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir = out_dir.parent / f"{out_dir.name}.tmp"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True)
         unwrapped = accelerator.unwrap_model(teacher)
         unwrapped.save_pretrained(
-            out_dir, state_dict=state_dict, safe_serialization=True,
+            tmp_dir, state_dict=state_dict, safe_serialization=True,
         )
-        tokenizer.save_pretrained(out_dir)
+        tokenizer.save_pretrained(tmp_dir)
+        # Sentinel written LAST — its presence in out_dir after rename
+        # is the integrity proof used by the idempotency guard.
+        (tmp_dir / "_SAVE_COMPLETE").write_text("{}")
+        _atomic_replace_dir(tmp_dir, out_dir)
 
     accelerator.wait_for_everyone()
 

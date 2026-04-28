@@ -36,6 +36,19 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# Module-level cache so we don't construct LogitsDistillationLoss per micro-batch.
+_KLD_LOSS_CACHE: dict[float, Any] = {}
+
+
+def _get_kld_loss_fn(temperature: float):
+    fn = _KLD_LOSS_CACHE.get(temperature)
+    if fn is None:
+        from modelopt.torch.distill.losses import LogitsDistillationLoss
+        fn = LogitsDistillationLoss(temperature=temperature, reduction="batchmean")
+        _KLD_LOSS_CACHE[temperature] = fn
+    return fn
+
+
 def forward_kld_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
@@ -53,13 +66,24 @@ def forward_kld_loss(
 
     Both inputs are upcast to fp32 before the softmax so the loss is
     numerically stable on bf16 logits — the underlying model can still run in bf16.
+
+    Pad/mask contract: the calibration tensor produced by
+    ``moe_compress.utils.calibration._tokenize_to_fixed_length`` is fully
+    packed (concatenated streams separated by EOS, hard 5%-shortage cap).
+    Every position is a real token, so per-position averaging is correct
+    without an attention_mask. If a future call site feeds pad-bearing
+    sequences this contract is violated — assert at the boundary there.
     """
-    from modelopt.torch.distill.losses import LogitsDistillationLoss
+    if student_logits.shape[-1] != teacher_logits.shape[-1]:
+        raise ValueError(
+            f"forward_kld_loss: vocab mismatch — student V={student_logits.shape[-1]} "
+            f"vs teacher V={teacher_logits.shape[-1]}. Same-tokenizer distillation "
+            "is required (Strategy A does not change vocabulary)."
+        )
     V = student_logits.shape[-1]
     s = student_logits.reshape(-1, V).float()
     t = teacher_logits.reshape(-1, V).float()
-    loss_fn = LogitsDistillationLoss(temperature=temperature, reduction="batchmean")
-    return loss_fn(s, t)
+    return _get_kld_loss_fn(temperature)(s, t)
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +238,39 @@ def _is_zero3(accelerator) -> bool:
     return int(plugin.zero_stage) >= 3
 
 
+# Module-scope holder so HfDeepSpeedConfig instances survive function exits.
+# Per-process singleton — each subprocess gets its own copy on import.
+_DSCHF_HOLDER: list = []
+
+
+def _activate_zero3_init(accelerator) -> None:
+    """Pin a module-scope HfDeepSpeedConfig so from_pretrained shards params
+    via deepspeed.zero.Init. No-op if not under ZeRO-3 or already activated."""
+    if not _is_zero3(accelerator):
+        return
+    if _DSCHF_HOLDER:
+        return
+    from transformers.integrations import HfDeepSpeedConfig, is_deepspeed_zero3_enabled
+    plugin = accelerator.state.deepspeed_plugin
+    ds_config = plugin.deepspeed_config
+    _DSCHF_HOLDER.append(HfDeepSpeedConfig(ds_config))
+    if not is_deepspeed_zero3_enabled():
+        try:
+            import deepspeed  # noqa: F401
+            ds_avail = True
+        except ImportError:
+            ds_avail = False
+        raise RuntimeError(
+            "HfDeepSpeedConfig was instantiated but is_deepspeed_zero3_enabled() "
+            "returned False — the model would load full-rank on each rank and OOM. "
+            f"plugin.zero_stage={getattr(plugin, 'zero_stage', '?')}, "
+            f"deepspeed_importable={ds_avail}, "
+            f"ds_config['zero_optimization']['stage']="
+            f"{ds_config.get('zero_optimization', {}).get('stage', '?')}."
+        )
+    log.info("HfDeepSpeedConfig activated for ZeRO-3 sharded from_pretrained.")
+
+
 def _all_finite(loss: torch.Tensor, accelerator) -> bool:
     """Collective NaN/Inf check. Returns True iff loss is finite on EVERY rank.
 
@@ -262,6 +319,7 @@ def run_distillation(
     config: dict[str, Any],
     artifacts_dir: Path,
     accelerator,
+    resume_step: int = 0,
 ) -> Path:
     """One Chapter 1 distillation pass. Saves to ``artifacts_dir/chapter1_recovered``.
 
@@ -348,8 +406,10 @@ def run_distillation(
         total_steps, tokens_per_step, world, grad_accum, seq_len,
     )
 
-    # Calibration shortage check — each rank consumes total_steps * grad_accum
-    # of its local batches.
+    # Calibration shortage check — each rank consumes (total_steps - resume_step)
+    # * grad_accum of its local batches in the *remaining* run. We compute the
+    # full requirement first so the warning quotes the absolute number a fresh
+    # run would need; we slice ``batches`` for resume right below.
     needed_micro_local = total_steps * grad_accum
     if len(batches) < needed_micro_local:
         # Item 3: actionable warning. Compute exactly how many sequences the
@@ -365,6 +425,22 @@ def run_distillation(
             len(batches) // grad_accum, total_steps,
             current_n, required_n, config_path,
         )
+
+    # Resume: skip microbatches already consumed in a prior run. Calibration
+    # batches are deterministic from the fixed cache, so slicing the list is
+    # equivalent to replaying and discarding the consumed prefix.
+    if resume_step > 0:
+        skip_micros = resume_step * grad_accum
+        if skip_micros < len(batches):
+            batches = batches[skip_micros:]
+            log.info("Resuming from step=%d: skipped %d local micro-batches.",
+                     resume_step, skip_micros)
+        else:
+            log.warning(
+                "resume_step=%d would skip all %d local batches; starting from scratch.",
+                resume_step, len(batches),
+            )
+            resume_step = 0
 
     # Optimizer: built BEFORE accelerator.prepare. DS prepare swaps it
     # into a wrapped engine optimizer. bnb/CPUAdam don't compose with each
@@ -384,19 +460,39 @@ def run_distillation(
     temperature = float(dconf["temperature"])
     grad_clip = float(dconf["grad_clip_norm"])
 
-    optim.zero_grad(set_to_none=True)
-    step = 0
-    micro_in_window = 0
-    last_loss: float | None = None
+    # M3: assert grad-clip matches the DS engine config (they're specified
+    # separately and can silently diverge if one is edited without the other).
+    if is_ds:
+        try:
+            ds_cfg = accelerator.state.deepspeed_plugin.deepspeed_config
+            ds_clip = ds_cfg.get("gradient_clipping")
+            if ds_clip is not None and abs(float(ds_clip) - grad_clip) > 1e-6:
+                raise RuntimeError(
+                    f"grad_clip_norm={grad_clip} in YAML ≠ "
+                    f"gradient_clipping={ds_clip} in DS config — "
+                    "update ds_configs/zero3_offload_optim.json to match."
+                )
+        except (AttributeError, KeyError):
+            pass
 
-    # Three-way token accounting (invariant: tokens_with_grad +
-    # tokens_skipped_nan + last_window_partial == tokens_consumed):
-    #   tokens_consumed     — every micro-batch's forward (incl. substituted)
-    #   tokens_with_grad    — micro-batches that survived to a successful optim.step
-    #   tokens_skipped_nan  — micro-batches whose loss was substituted to zero
+    optim.zero_grad(set_to_none=True)
+    step = resume_step
+    micro_in_window = 0
+    last_real_loss: float | None = None
+
+    # Token accounting — explicit four-way split so the bookkeeping invariant
+    # holds at any exit point:
+    #   tokens_consumed       — every micro-batch's forward (incl. substituted)
+    #   tokens_with_grad      — micros in windows that committed an optim.step
+    #   tokens_skipped_nan    — micros whose loss was substituted to zero (DS path)
+    #   tokens_dropped_window — micros in windows abandoned by the non-DS NaN
+    #                           branch OR left over in a partial trailing window
+    # Invariant: consumed = with_grad + skipped_nan + dropped_window
     tokens_consumed = 0
     tokens_with_grad = 0
     tokens_skipped_nan = 0
+    tokens_dropped_window = 0
+    pending_window_tokens = 0  # credited to with_grad on commit, dropped on abandon
 
     # NaN escalation state (item 2). consecutive_nan_windows increments at the
     # END of each window (every grad_accum micros) where ANY micro substituted;
@@ -406,7 +502,24 @@ def run_distillation(
     nan_in_current_window = False
     nan_diagnostic_emitted = False  # only dump per-layer JSON once per run
 
-    for batch in islice(batches, needed_micro_local):
+    # After resume, ``batches`` was already trimmed by ``skip_micros``. We
+    # iterate the *remaining* micros via a manual iterator so a non-DS NaN
+    # skip (which doesn't advance ``step``) doesn't deplete the budget — and
+    # ``islice`` won't mis-cap the count after resume.
+    remaining_micros = max(0, (total_steps - step) * grad_accum)
+    if remaining_micros > len(batches):
+        log.warning(
+            "rank %d: only %d local micros available but %d are needed to "
+            "reach step=%d. Run will exit early.",
+            accelerator.process_index, len(batches), remaining_micros, total_steps,
+        )
+    batch_iter = iter(batches)
+    consumed_micros = 0
+
+    for batch in batch_iter:
+        if consumed_micros >= remaining_micros:
+            break
+        consumed_micros += 1
         ids = batch.to(accelerator.device, non_blocking=True)
 
         with torch.no_grad():
@@ -417,7 +530,9 @@ def run_distillation(
 
         # Each rank's batch is disjoint (data parallel), so total tokens this
         # micro-batch across the world = ids.numel() * world.
-        tokens_consumed += int(ids.numel()) * world
+        this_micro_tokens = int(ids.numel()) * world
+        tokens_consumed += this_micro_tokens
+        pending_window_tokens += this_micro_tokens
 
         # Collective NaN check. Under DeepSpeed we MUST keep the engine's
         # micro-batch counter aligned (it tracks reduce-scatter timing).
@@ -446,20 +561,28 @@ def run_distillation(
             nan_diagnostic_emitted = True
 
             # Item 6: account for skipped tokens.
-            tokens_skipped_nan += int(ids.numel()) * world
+            tokens_skipped_nan += this_micro_tokens
+            # The micro is now booked under skipped_nan, not pending_window.
+            pending_window_tokens -= this_micro_tokens
             nan_in_current_window = True
 
             if is_ds:
-                cleaned = torch.nan_to_num(s_logits, nan=0.0, posinf=0.0, neginf=0.0)
-                loss = cleaned.sum() * 0.0
+                loss = s_logits.detach().new_zeros(1, requires_grad=True).sum()
             else:
                 optim.zero_grad(set_to_none=True)
+                # Abandoned window: any prior committed-but-not-stepped micros
+                # in this window are dropped; credit them to dropped_window so
+                # the invariant holds.
+                tokens_dropped_window += pending_window_tokens
+                pending_window_tokens = 0
                 micro_in_window = 0
+                nan_in_current_window = False  # window abandoned — don't count as bad
                 del t_logits, s_logits
                 continue
 
         accelerator.backward(loss / grad_accum)
-        last_loss = float(loss.detach().item())
+        if finite:  # don't record the zero-substitute value from NaN steps
+            last_real_loss = float(loss.detach().item())
         # Free per-batch tensors aggressively now that backward is queued.
         del t_logits, s_logits
         micro_in_window += 1
@@ -479,7 +602,12 @@ def run_distillation(
             ))
             optim.step()
             optim.zero_grad(set_to_none=True)
-            tokens_with_grad += grad_accum * micro_bsz * world * seq_len
+            # Credit the committed window to with_grad (sum of real per-micro
+            # token counts, identical to grad_accum * micro_bsz * world *
+            # seq_len for a packed window — but using the running sum is
+            # robust to varying ids.numel() across micros).
+            tokens_with_grad += pending_window_tokens
+            pending_window_tokens = 0
             step += 1
             micro_in_window = 0
 
@@ -506,7 +634,8 @@ def run_distillation(
                 log.info(
                     "step=%d/%d lr=%.3e loss=%.6f tok=%.2fB/%.2fB nan_skip=%.2fM",
                     step, total_steps, optim.param_groups[0]["lr"],
-                    last_loss, tokens_with_grad / 1e9,
+                    last_real_loss if last_real_loss is not None else float("nan"),
+                    tokens_with_grad / 1e9,
                     int(dconf["total_tokens"]) / 1e9,
                     tokens_skipped_nan / 1e6,
                 )
@@ -519,15 +648,23 @@ def run_distillation(
                 _save(student, tokenizer, config, artifacts_dir, accelerator,
                       step=step, tokens_with_grad=tokens_with_grad,
                       tokens_consumed=tokens_consumed,
-                      tokens_skipped_nan=tokens_skipped_nan, partial=True)
+                      tokens_skipped_nan=tokens_skipped_nan,
+                      tokens_dropped_window=tokens_dropped_window,
+                      partial=True)
 
             if step >= total_steps:
                 break
 
+    # On exit, any uncommitted micros in pending_window_tokens are dropped.
+    tokens_dropped_window += pending_window_tokens
+    pending_window_tokens = 0
+
     return _save(student, tokenizer, config, artifacts_dir, accelerator,
                  step=step, tokens_with_grad=tokens_with_grad,
                  tokens_consumed=tokens_consumed,
-                 tokens_skipped_nan=tokens_skipped_nan, partial=False)
+                 tokens_skipped_nan=tokens_skipped_nan,
+                 tokens_dropped_window=tokens_dropped_window,
+                 partial=False)
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +674,8 @@ def run_distillation(
 
 def _save(student, tokenizer, config, artifacts_dir, accelerator,
           *, step: int, tokens_with_grad: int, tokens_consumed: int,
-          tokens_skipped_nan: int = 0, partial: bool) -> Path:
+          tokens_skipped_nan: int = 0, tokens_dropped_window: int = 0,
+          partial: bool) -> Path:
     """Save the recovered checkpoint, mirroring max_quality's
     ``save_compressed_checkpoint`` layout (sharded safetensors + tokenizer +
     ``compressed_metadata.json``).
@@ -595,6 +733,7 @@ def _save(student, tokenizer, config, artifacts_dir, accelerator,
             "tokens_with_grad": tokens_with_grad,
             "tokens_consumed": tokens_consumed,
             "tokens_skipped_nan": tokens_skipped_nan,
+            "tokens_dropped_window": tokens_dropped_window,
             "step": step,
             "partial": partial,
         },
@@ -642,6 +781,10 @@ def _save(student, tokenizer, config, artifacts_dir, accelerator,
                 sha256_first_shard=first_shard_sha,
             )
             _prune_old_partials(artifacts_dir, keep=2)
+        else:
+            # Final save: clean up all partial dirs so they don't linger on
+            # the bucket or get picked up by _upload_results as a fallback.
+            _prune_old_partials(artifacts_dir, keep=0)
 
     accelerator.wait_for_everyone()
     return out_dir
@@ -661,7 +804,8 @@ def _prune_old_partials(artifacts_dir: Path, *, keep: int = 2) -> None:
             continue
         dirs.append((n, p))
     dirs.sort()  # ascending step
-    for _, p in dirs[:-keep]:
+    to_delete = dirs if keep == 0 else dirs[:-keep]
+    for _, p in to_delete:
         try:
             shutil.rmtree(p)
             log.info("Pruned old partial: %s", p)
@@ -678,6 +822,39 @@ def _prune_old_partials(artifacts_dir: Path, *, keep: int = 2) -> None:
         kept = [e for e in entries if (artifacts_dir / e["path"]).is_dir()]
         if len(kept) != len(entries):
             _atomic_write_json(manifest_path, kept)
+
+
+# ---------------------------------------------------------------------------
+# Partial checkpoint discovery (resume)
+# ---------------------------------------------------------------------------
+
+
+def _load_latest_partial(artifacts_dir: Path) -> "tuple[Path | None, int]":
+    """Find the latest completed partial checkpoint for resume.
+
+    Returns (partial_dir, resume_step) or (None, 0) if none found.
+    A partial is valid iff _SAVE_COMPLETE exists inside it — written last,
+    after atomic rename, so its presence guarantees a fully-written dir.
+    """
+    dirs: list[tuple[int, Path]] = []
+    for p in artifacts_dir.glob("chapter1_recovered_partial_step*"):
+        if not p.is_dir() or p.name.endswith(".tmp"):
+            continue
+        if not (p / "_SAVE_COMPLETE").exists():
+            log.warning("Partial %s missing _SAVE_COMPLETE — skipping (incomplete write).", p.name)
+            continue
+        try:
+            step = int(p.name.split("step")[-1])
+        except ValueError:
+            log.warning("Could not parse step from %s — skipping.", p.name)
+            continue
+        dirs.append((step, p))
+    if not dirs:
+        return None, 0
+    dirs.sort(reverse=True)
+    best_step, best_path = dirs[0]
+    log.info("Found partial checkpoint at step=%d: %s", best_step, best_path)
+    return best_path, best_step
 
 
 # ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@ def test_kld_zero_at_identity():
     for T in (0.5, 1.0, 2.0):
         loss = forward_kld_loss(logits, logits, temperature=T)
         assert torch.isfinite(loss)
-        assert loss.item() == pytest.approx(0.0, abs=1e-4)
+        assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
 def test_kld_positive_for_different_distributions():
