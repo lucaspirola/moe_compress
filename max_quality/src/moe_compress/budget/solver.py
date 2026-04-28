@@ -70,8 +70,7 @@ def solve(
     model: nn.Module,
     *,
     target_total_reduction: float,
-    initial_expert_reduction: float,
-    initial_svd_reduction: float,
+    expert_svd_ratio: float,
     min_experts_per_layer: int,
     blacklisted_experts: dict[int, list[int]] | None = None,
     max_iterations: int = 20,
@@ -80,9 +79,14 @@ def solve(
     """Iteratively tighten the two knobs until the projected reduction
     meets or exceeds the target within ``tolerance``.
 
-    We keep ``expert_prune_ratio : svd_rank_ratio`` at roughly the initial
-    ratio — if the initial knobs undershoot, we scale both up; if they
-    overshoot, we scale both down.
+    ``expert_svd_ratio`` is the explicit ep:sp split (expert_prune_ratio /
+    svd_rank_ratio).  Higher values favour pruning over factorisation;
+    lower values favour factorisation over pruning.  Both knobs are scaled
+    together during iteration, so the ratio is always honoured exactly.
+
+    The starting point is derived analytically from the ratio and the model's
+    expert/total param fraction, giving convergence in ≤ 3 iterations for
+    typical targets.
     """
     blacklisted_experts = blacklisted_experts or {}
     total_params = count_parameters(model)
@@ -99,9 +103,13 @@ def solve(
         for li in per_layer_counts
     }
 
-    ep = initial_expert_reduction
-    sp = initial_svd_reduction
-    ratio = sp / max(ep, 1e-9)        # preserve initial split
+    # Analytical starting point: ignore the ep*sp cross-term and solve
+    #   expert_params * sp * (ratio + 1) / total_params ≈ target
+    # This lands close to the solution for any ratio, cutting iterations.
+    ratio = 1.0 / max(expert_svd_ratio, 1e-9)   # sp / ep — kept fixed throughout
+    sp_start = target_total_reduction * total_params / (max(expert_params, 1) * max(expert_svd_ratio + 1, 1e-9))
+    ep = min(0.60, sp_start * expert_svd_ratio)
+    sp = min(0.40, ep * ratio)
     decomp: BudgetDecomposition | None = None
 
     for it in range(max_iterations):

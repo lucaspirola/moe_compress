@@ -40,6 +40,7 @@ log = logging.getLogger(__name__)
 
 def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> Path:
     s6 = config["stage6_validate"]
+    model.eval()   # stage5 leaves model in train(); set eval before any sub-metric
     results: dict = {"student": {}, "teacher": {}, "delta": {}, "thresholds": {}}
 
     # 1. WikiText-2 PPL on student
@@ -407,6 +408,9 @@ def _check_thresholds(results: dict, thresholds: dict) -> dict[str, bool]:
         if d is not None:
             drop = d["teacher"] - d["student"]
             checks[f"{task}_drop_ok"] = drop <= thresh
+        else:
+            log.warning("Threshold check for %s skipped — metric missing from results "
+                        "(lm-eval task name mismatch or evaluation error)", task)
     mr = results["measured_reduction"]["total_reduction_ratio"]
     checks["measured_reduction_ok"] = mr >= thresholds["measured_reduction_min"]
     return checks

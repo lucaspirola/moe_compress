@@ -310,7 +310,7 @@ def _group_stat(n_experts: int, bank) -> _GroupStats:
     p = mean_s ** 2
     p = p / p.sum().clamp(min=1e-12)
     eff_rank = float(torch.exp(-(p * p.clamp(min=1e-12).log()).sum()).item())
-    omega = d_out + n_experts * d_in
+    omega = n_experts * (d_out + d_in)
     return _GroupStats(d_out, d_in, n_experts, mean_s, eff_rank, omega)
 
 

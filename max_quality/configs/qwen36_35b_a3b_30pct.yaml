@@ -16,9 +16,12 @@ model:
 target:
   # Total parameter reduction (measured, not estimated) the pipeline must hit.
   total_reduction_ratio: 0.30
-  # Initial split — solver will iterate until the measured reduction ≥ target.
-  initial_expert_reduction: 0.22
-  initial_svd_reduction: 0.11
+  # ep:sp split — expert_prune_ratio / svd_rank_ratio.  2.0 = pruning removes
+  # twice as many params as SVD factorisation.  Tune this if Stage 6 quality
+  # is worse than expected: lower values shift work to SVD (less lossy for
+  # heterogeneous experts); higher values shift work to pruning (faster but
+  # coarser).  SVD-LLM V2 (2503.12340) recommends starting at 2–3 for MoE.
+  expert_svd_ratio: 2.0
 
 calibration:
   # Source: single multi-subset SFT dataset. Subset weights reflect the
@@ -75,15 +78,18 @@ stage3_svd:
                                   # model-weight HBM read. A100-80GB sweet
                                   # spot: 16 (~30min Stage 3 vs ~5h40m at 1).
   d_rank:
-    parameter_cost_omega_mode: auto  # ω = d1 + n·d2 per paper
-    # Per-projection rank bias (budget-neutral: weights are normalized).
-    # Reset to uniform after the bf16-covariance bug was fixed — the prior
-    # values (gate=1.75, up=1.35, down=0.35) were tuned against bug-artifact
-    # rel_recon_err numbers (gate~981k, up~468k, down~5k). Re-tune from
-    # trustworthy stage3/recon_rel_err/{name} after one Stage 3 run.
+    parameter_cost_omega_mode: auto  # ω = n·(d_out + d_in): per-rank param cost for n per-expert factors
+    # Per-projection rank bias (budget-neutral: weights sum to 3× uniform).
+    # Rationale: SwiGLU error sensitivity (jjang-ai/jangq, research/397B-MLP-ASYMMETRY.md):
+    #   gate_proj  → SiLU amplifier: errors multiply up_proj output; most sensitive → most rank
+    #   up_proj    → linear multiplicand: errors are bounded and proportional → least rank
+    #   down_proj  → residual stream guardian: every downstream layer is affected → middle
+    # Derived from their empirical bit floors gate=4 / up=2 / down=3 (budget-neutral at 3-bit avg):
+    #   weight = bits / mean(bits) → gate=4/3≈1.33, up=2/3≈0.67, down=3/3=1.0, avg=1.0
+    # Re-tune from stage3/recon_rel_err/{name} after first Stage 3 run if data disagrees.
     per_projection_weight:
-      gate_proj: 1.0
-      up_proj:   1.0
+      gate_proj: 1.33
+      up_proj:   0.67
       down_proj: 1.0
   swift_svd_plus:
     alpha_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]

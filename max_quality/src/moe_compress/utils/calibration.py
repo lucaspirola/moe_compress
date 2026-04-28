@@ -113,7 +113,7 @@ def build_calibration_tensor(
                 continue
             # Per-subset seed offset so subsets draw from independent shuffles
             # even when the same base seed is reused across stages.
-            seed = spec.seed + hash(subset) % 1_000_000
+            seed = spec.seed + int(hashlib.md5(subset.encode()).hexdigest(), 16) % 1_000_000
             texts.extend(_stream_cascade_texts(
                 spec.dataset, subset, count, tokenizer, seed=seed,
             ))

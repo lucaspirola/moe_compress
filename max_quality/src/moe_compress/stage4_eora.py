@@ -52,12 +52,12 @@ def run(
                     A_cov_path)
 
     originals_path = artifacts_dir / "_stage3_original_weights.pt"
-    originals: dict = {}
-    if originals_path.exists():
-        originals = torch.load(originals_path, map_location="cpu")
-    else:
-        log.warning("Stage 4: no Stage 3 originals at %s — skipping compensation",
-                    originals_path)
+    if not originals_path.exists():
+        raise FileNotFoundError(
+            f"Stage 4 requires Stage 3 original weights at {originals_path}. "
+            "Re-run Stage 3 first."
+        )
+    originals: dict = torch.load(originals_path, map_location="cpu")
 
     rank_map: dict[str, int] = {}
     compensated_params = 0
@@ -96,6 +96,8 @@ def run(
                 setattr(fe, f"{name}_U", nn.Parameter(u, requires_grad=False))
                 setattr(fe, f"{name}_V", nn.Parameter(v, requires_grad=False))
                 fe.ranks[name] = int(payload["ranks"][name])
+                if "effective_ranks" in payload:
+                    fe.effective_ranks[name] = [int(r) for r in payload["effective_ranks"][name]]
             rank_map.update(payload["rank_map_layer"])
             compensated_params += int(payload["compensated_params_layer"])
             log.info("Stage 4 layer %d/%d (idx=%d) — resumed from partial",
@@ -144,7 +146,9 @@ def run(
                        fe.down_proj_V.data[e]
                 delta = W_orig_f - (U_e.to(torch.float32) @ V_e.to(torch.float32))
                 res_before_sum += float(delta.norm().item() ** 2)
-                A = A_cov.get(key)
+                # up_proj shares the gate_proj input covariance (same fused tensor).
+                cov_key = (ref.layer_idx, e, "gate_proj") if name == "up_proj" else key
+                A = A_cov.get(cov_key)
                 Uc, Vc, take_eff = _compute_eora_factors(
                     delta, A, r_per_expert, dev, storage_dtype=a_storage_dtype,
                 )
@@ -226,6 +230,7 @@ def _spill_layer(
         "format_version": 1,
         "layer_idx": layer_idx,
         "ranks": dict(fe.ranks),
+        "effective_ranks": {n: list(v) for n, v in fe.effective_ranks.items()},
         "rank_map_layer": rank_map_layer,
         "compensated_params_layer": compensated_params_layer,
     }

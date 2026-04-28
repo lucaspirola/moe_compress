@@ -388,6 +388,30 @@ def _assign_children_to_centroids(
 # ---------------------------------------------------------------------------
 
 
+def _permutation_align_to_centroid(
+    ref_gate: torch.Tensor,
+    ref_up: torch.Tensor,
+    child_gate: torch.Tensor,
+    child_up: torch.Tensor,
+) -> np.ndarray:
+    """Return the permutation of the child's intermediate dimension that best
+    aligns its neurons to the centroid's, minimising the combined gate+up
+    Frobenius distance (REAM §4, weight-based term).
+
+    perm[i] = child neuron index that should map to centroid position i.
+    Applied as: gate_child[perm, :], up_child[perm, :], down_child[:, perm].
+    """
+    # Inputs are already float32 from the caller.  cdist on CPU is faster than
+    # GPU for these small matrices (~2048×2048) because Hungarian is CPU-only
+    # regardless, so we avoid a GPU→CPU transfer of the result.
+    C = (
+        torch.cdist(ref_gate.cpu(), child_gate.cpu())
+        + torch.cdist(ref_up.cpu(), child_up.cpu())
+    ).numpy()
+    _, col_ind = linear_sum_assignment(C)
+    return col_ind
+
+
 def _merge_experts_inplace(
     layer_ref: MoELayerRef,
     grouped: dict[int, list[int]],
@@ -396,7 +420,13 @@ def _merge_experts_inplace(
     freq_weighted: bool,
 ) -> None:
     """Write the frequency-weighted average of each group into the centroid
-    slot of the stacked tensors. ``select`` afterwards drops non-centroid rows.
+    slot of the stacked tensors.
+
+    Before averaging, each child expert's intermediate neurons are permuted to
+    align with the centroid's neurons via Hungarian assignment on the combined
+    gate+up weight cost matrix (REAM §4, weight-based term).  The centroid
+    itself is averaged in as-is (identity permutation).  ``select`` afterwards
+    drops non-centroid rows.
     """
     banks = build_banks(layer_ref)
     with torch.no_grad():
@@ -407,12 +437,31 @@ def _merge_experts_inplace(
             if not freq_weighted:
                 weights[:] = 1.0
             weights = weights / weights.sum()
+
+            ref_gate = banks["gate_proj"].get(centroid).to(torch.float32)
+            ref_up   = banks["up_proj"].get(centroid).to(torch.float32)
+
+            accs: dict[str, torch.Tensor | None] = {name: None for name in banks}
+            for w, m in zip(weights, members):
+                gate_m = banks["gate_proj"].get(m).to(torch.float32)
+                up_m   = banks["up_proj"].get(m).to(torch.float32)
+                perm = (
+                    None if m == centroid
+                    else _permutation_align_to_centroid(ref_gate, ref_up, gate_m, up_m)
+                )
+                for name, bank in banks.items():
+                    if name == "gate_proj":
+                        Wm = gate_m
+                    elif name == "up_proj":
+                        Wm = up_m
+                    else:
+                        Wm = bank.get(m).to(torch.float32)
+                    if perm is not None:
+                        Wm = Wm[perm, :] if name in ("gate_proj", "up_proj") else Wm[:, perm]
+                    accs[name] = Wm * w if accs[name] is None else accs[name] + Wm * w
+
             for name, bank in banks.items():
-                acc = None
-                for w, m in zip(weights, members):
-                    Wm = bank.get(m).to(torch.float32)
-                    acc = Wm * float(w) if acc is None else acc + Wm * float(w)
-                bank.set(centroid, acc)
+                bank.set(centroid, accs[name])
 
 
 def _resize_router_for_kept_experts(layer_ref: MoELayerRef, kept_ids: list[int]) -> None:

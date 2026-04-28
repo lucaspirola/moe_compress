@@ -112,8 +112,7 @@ def main(argv=None) -> int:
         decomposition = budget_solver.solve(
             model,
             target_total_reduction=config["target"]["total_reduction_ratio"],
-            initial_expert_reduction=config["target"]["initial_expert_reduction"],
-            initial_svd_reduction=config["target"]["initial_svd_reduction"],
+            expert_svd_ratio=config["target"]["expert_svd_ratio"],
             min_experts_per_layer=config["stage1_grape"]["min_experts_per_layer"],
             blacklisted_experts=blacklist,
         )
@@ -259,6 +258,9 @@ def _validate_config(config: dict) -> None:
     target = config["target"]["total_reduction_ratio"]
     if not (0.0 < target < 1.0):
         raise ValueError(f"target.total_reduction_ratio={target} must be in (0, 1).")
+    ratio = config["target"]["expert_svd_ratio"]
+    if ratio <= 0:
+        raise ValueError(f"target.expert_svd_ratio={ratio} must be > 0.")
 
 
 def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):

@@ -66,7 +66,7 @@ def load_model(
 
     kwargs: dict = {
         "revision": revision,
-        "dtype": dtype,
+        "torch_dtype": dtype,
         "device_map": device_map,
         "attn_implementation": attn_implementation,
         "trust_remote_code": trust_remote_code,
@@ -545,20 +545,47 @@ class FactoredExperts(nn.Module):
             expert_mask = expert_mask.permute(2, 1, 0)
             expert_hit = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero()
 
-        for expert_idx in expert_hit:
-            e = expert_idx[0]
-            if e == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[e])
-            sel = hidden_states[token_idx]
+        if expert_hit.numel() == 0:
+            return final_hidden_states
 
-            gate = F.linear(F.linear(sel, self.gate_proj_V[e]), self.gate_proj_U[e])
-            up   = F.linear(F.linear(sel, self.up_proj_V[e]),   self.up_proj_U[e])
-            intermediate = self.act_fn(gate) * up
-            down = F.linear(F.linear(intermediate, self.down_proj_V[e]),
-                            self.down_proj_U[e])
-            down = down * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, down.to(final_hidden_states.dtype))
+        # Collect (expert_id, token_indices, top_k_positions) per active expert.
+        expert_data: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for row in expert_hit:
+            e = row[0]
+            top_k_pos, token_idx = torch.where(expert_mask[e])
+            expert_data.append((e, token_idx, top_k_pos))
+
+        # Gather all active-expert tokens into a padded batch for bmm.
+        # Shape: [n_active, max_tokens, d_hid]. Zero-initialize so padding rows
+        # produce zeros through all 6 bmm calls rather than garbage values.
+        n_active = len(expert_data)
+        max_tokens = max(len(tok) for _, tok, _ in expert_data)
+        gathered = hidden_states.new_zeros(n_active, max_tokens, hidden_states.shape[-1])
+        for i, (_, token_idx, _) in enumerate(expert_data):
+            gathered[i, :len(token_idx)] = hidden_states[token_idx]
+
+        # Index factor matrices for all active experts at once.
+        hit_ids = expert_hit[:, 0]          # [n_active]
+        V_g = self.gate_proj_V[hit_ids]     # [n_active, k_g, d_hid]
+        U_g = self.gate_proj_U[hit_ids]     # [n_active, d_int, k_g]
+        V_u = self.up_proj_V[hit_ids]       # [n_active, k_u, d_hid]
+        U_u = self.up_proj_U[hit_ids]       # [n_active, d_int, k_u]
+        V_d = self.down_proj_V[hit_ids]     # [n_active, k_d, d_int]
+        U_d = self.down_proj_U[hit_ids]     # [n_active, d_hid, k_d]
+
+        # 6 batched matmuls replace ~6*n_active serial F.linear kernel launches.
+        gate  = torch.bmm(torch.bmm(gathered, V_g.transpose(-1, -2)), U_g.transpose(-1, -2))
+        up    = torch.bmm(torch.bmm(gathered, V_u.transpose(-1, -2)), U_u.transpose(-1, -2))
+        inter = self.act_fn(gate) * up      # [n_active, max_tokens, d_int]
+        down  = torch.bmm(torch.bmm(inter,   V_d.transpose(-1, -2)), U_d.transpose(-1, -2))
+        # down: [n_active, max_tokens, d_hid]
+
+        # Unpad, apply routing weights, and scatter back with a single index_add_.
+        flat_tok = torch.cat([tok for _, tok, _   in expert_data])
+        flat_pos = torch.cat([pos for _, _,   pos in expert_data])
+        flat_out = torch.cat([down[i, :len(tok)] for i, (_, tok, _) in enumerate(expert_data)], dim=0)
+        flat_w   = top_k_weights[flat_tok, flat_pos, None]
+        final_hidden_states.index_add_(0, flat_tok, (flat_out * flat_w).to(final_hidden_states.dtype))
         return final_hidden_states
 
 
