@@ -153,19 +153,54 @@ def run(
     T_budget = _compute_T_budget(group_stats, decomposition.svd_rank_ratio)
     proj_weights = config.get("stage3_svd", {}).get("d_rank", {}).get("per_projection_weight", {})
     ranks = _d_rank_allocate(group_stats, T_budget, proj_weights=proj_weights or None)
-    # Swift-SVD+ α-grid blend was specified in the YAML but never implemented;
-    # `_aa_svd` is one-sided B-only (α has no effect). Record None so old
-    # consumers reading this metadata see the truthful state.
-    alpha_by_type = None
+
+    # Swift-SVD+ α grid search (paper 2604.01609, Algorithm 2).
+    # Within each (layer, matrix_type) group, redistribute the group's total
+    # rank budget across individual experts using the blending score:
+    #   s_i = β_i^α · (log(e + ε*_i))^{1-α}
+    # where β_i = spectral energy proportion and ε*_i = reconstruction error
+    # at a reference rank. α balances the two signals; we grid-search α per
+    # projection type on a small validation set.
+    svd_plus_cfg = s3.get("swift_svd_plus", {})
+    alpha_grid = svd_plus_cfg.get("alpha_grid")
+    per_group_type = svd_plus_cfg.get("per_group_type", True)
+    if alpha_grid and len(alpha_grid) > 1:
+        log.info("Stage 3: Swift-SVD+ α grid search over %d values (per_group_type=%s)",
+                 len(alpha_grid), per_group_type)
+        alpha_by_type = _swift_svd_plus_alpha_search(
+            moe_layers, group_stats, ranks, alpha_grid,
+            per_group_type=per_group_type,
+        )
+        log.info("Stage 3: Swift-SVD+ selected α = %s", alpha_by_type)
+        # Redistribute per-expert ranks within each group using the selected α.
+        per_expert_ranks = _redistribute_ranks_swift_svd_plus(
+            moe_layers, group_stats, ranks, alpha_by_type,
+            grouped_svs_cache=None,  # will recompute; could cache but it's fast
+        )
+    else:
+        alpha_by_type = None
+        per_expert_ranks = None  # uniform: every expert gets ranks[(li, name)]
 
     # 2. Snapshot originals (for Stage 4 residuals) then factor per-layer.
     originals: dict[tuple[int, int, str], torch.Tensor] = {}
     rank_map: dict[str, int] = {}
 
     for ref in moe_layers:
-        ranks_layer = {
-            name: ranks[(ref.layer_idx, name)] for name in MATRIX_NAMES
-        }
+        # When Swift-SVD+ gives per-expert ranks, allocate at the max rank
+        # across experts for each matrix type (the slot width). Experts with
+        # lower rank will be zero-padded; effective_ranks tracks the true rank.
+        if per_expert_ranks is not None:
+            ranks_layer = {
+                name: max(
+                    per_expert_ranks.get((ref.layer_idx, name, e), ranks[(ref.layer_idx, name)])
+                    for e in range(ref.num_routed_experts)
+                )
+                for name in MATRIX_NAMES
+            }
+        else:
+            ranks_layer = {
+                name: ranks[(ref.layer_idx, name)] for name in MATRIX_NAMES
+            }
         # Lazy-load this layer's B-cov from the per-layer spill files.
         # Keeps in-memory cov bounded to ~one layer (~3-5 GB at bf16).
         # Assert (not silent fall-through) — a missing spill at this
@@ -211,7 +246,11 @@ def run(
                 W = originals[(ref.layer_idx, e, name)].to(device=dev, dtype=torch.float32)
                 A = _cov_lookup(A_cov, ref.layer_idx, e, name)
                 B = _cov_lookup(B_acc.covariance, ref.layer_idx, e, name)
-                k = ranks_layer[name]
+                # Per-expert rank from Swift-SVD+ if available, else group-uniform.
+                if per_expert_ranks is not None:
+                    k = per_expert_ranks.get((ref.layer_idx, name, e), ranks_layer[name])
+                else:
+                    k = ranks_layer[name]
                 U_k, V_k, rel_err, k_eff = _aa_svd(
                     W, A, B, k, device=dev, storage_dtype=B_cov_dtype,
                 )
@@ -402,6 +441,184 @@ def _d_rank_allocate(
                  "(target=%d, conserved)", diff, target)
     return out
 
+
+
+def _swift_svd_plus_alpha_search(
+    moe_layers: list,
+    group_stats: dict[tuple[int, str], _GroupStats],
+    base_ranks: dict[tuple[int, str], int],
+    alpha_grid: list[float],
+    *,
+    per_group_type: bool = True,
+) -> dict[str, float]:
+    """Swift-SVD+ (2604.01609, Algorithm 2): select α per projection type.
+
+    For each candidate α, compute the blending score for every expert within
+    each (layer, matrix_type) group:
+
+        s_i = β_i^α · (log(e + ε*_i))^{1-α}
+
+    where:
+      - β_i = σ_i² / Σ_j σ_j²  (spectral energy proportion — how much of the
+        group's total spectral energy this expert contributes)
+      - ε*_i = √(Σ_{j>k̄} σ_j² / Σ_j σ_j²)  (reconstruction error at the
+        group's mean rank k̄ — higher = this expert needs more rank)
+
+    Then redistribute the group's total rank budget proportionally to s_i.
+    The α that minimises the total weighted reconstruction error across all
+    experts in the group wins.
+
+    Returns {matrix_type: best_α} if per_group_type, else {"all": best_α}.
+    """
+    import math as _math
+
+    # Collect per-expert singular value spectra, grouped by matrix type.
+    # grouped_svs[name][(layer_idx, expert_idx)] = singular_values tensor
+    grouped_svs: dict[str, dict[tuple[int, int], torch.Tensor]] = {
+        n: {} for n in MATRIX_NAMES
+    }
+    for (li, name), gs in group_stats.items():
+        banks = build_banks([ref for ref in moe_layers if ref.layer_idx == li][0])
+        for e in range(gs.n_experts):
+            W = banks[name].get(e).detach().to(torch.float32)
+            svs = torch.linalg.svdvals(W)
+            grouped_svs[name][(li, e)] = svs
+
+    def _evaluate_alpha(name: str, alpha: float) -> float:
+        """Total weighted reconstruction error for this α across all experts
+        in the given projection type."""
+        group_keys = [(li, n) for (li, n) in base_ranks if n == name]
+        total_err = 0.0
+        for (li, n) in group_keys:
+            gs = group_stats[(li, n)]
+            k_group = base_ranks[(li, n)]
+            # Collect per-expert scores.
+            expert_ids = list(range(gs.n_experts))
+            betas: list[float] = []
+            epsilons: list[float] = []
+            energies: list[float] = []
+            for e in expert_ids:
+                svs = grouped_svs[n][(li, e)]
+                s2 = (svs * svs)
+                total_energy = float(s2.sum().clamp_min(1e-30).item())
+                energies.append(total_energy)
+                # ε*_i at reference rank k_group
+                tail = float(s2[k_group:].sum().item()) if k_group < len(s2) else 0.0
+                epsilons.append((tail / total_energy) ** 0.5)
+            # β_i = energy_i / total_energy_in_group
+            group_energy = sum(energies) or 1.0
+            betas = [e_val / group_energy for e_val in energies]
+            # Blending scores
+            scores = []
+            for beta, eps in zip(betas, epsilons):
+                s = (beta ** alpha) * (_math.log(_math.e + eps) ** (1.0 - alpha))
+                scores.append(max(s, 1e-12))
+            # Redistribute group rank budget proportionally to scores.
+            total_score = sum(scores) or 1.0
+            total_group_rank = k_group * gs.n_experts
+            per_expert_ranks = [
+                max(1, min(min(gs.d_out, gs.d_in) - 1,
+                           int(round(total_group_rank * (sc / total_score)))))
+                for sc in scores
+            ]
+            # Evaluate: sum of tail energy at allocated rank per expert.
+            for e, k_e in zip(expert_ids, per_expert_ranks):
+                svs = grouped_svs[n][(li, e)]
+                s2 = svs * svs
+                tail = float(s2[k_e:].sum().item()) if k_e < len(s2) else 0.0
+                total_err += tail
+        return total_err
+
+    if per_group_type:
+        best_alphas: dict[str, float] = {}
+        for name in MATRIX_NAMES:
+            best_alpha = 0.5
+            best_err = float("inf")
+            for alpha in alpha_grid:
+                err = _evaluate_alpha(name, alpha)
+                if err < best_err:
+                    best_err = err
+                    best_alpha = alpha
+            best_alphas[name] = best_alpha
+            log.info("  Swift-SVD+ %s: best α=%.1f (err=%.4e)", name, best_alpha, best_err)
+        return best_alphas
+    else:
+        best_alpha = 0.5
+        best_err = float("inf")
+        for alpha in alpha_grid:
+            err = sum(_evaluate_alpha(n, alpha) for n in MATRIX_NAMES)
+            if err < best_err:
+                best_err = err
+                best_alpha = alpha
+        log.info("  Swift-SVD+ global: best α=%.1f (err=%.4e)", best_alpha, best_err)
+        return {"all": best_alpha}
+
+
+def _redistribute_ranks_swift_svd_plus(
+    moe_layers: list,
+    group_stats: dict[tuple[int, str], _GroupStats],
+    base_ranks: dict[tuple[int, str], int],
+    alpha_by_type: dict[str, float],
+    *,
+    grouped_svs_cache=None,
+) -> dict[tuple[int, str, int], int]:
+    """Given the selected α per type, compute per-expert ranks.
+
+    Returns {(layer_idx, matrix_name, expert_idx): rank}.
+    The total rank within each (layer, matrix_type) group is conserved
+    (sum of per-expert ranks = base_rank × n_experts).
+    """
+    import math as _math
+
+    out: dict[tuple[int, str, int], int] = {}
+    for (li, name), gs in group_stats.items():
+        k_group = base_ranks[(li, name)]
+        alpha = alpha_by_type.get(name, alpha_by_type.get("all", 0.5))
+
+        # Collect per-expert singular values.
+        banks = build_banks([ref for ref in moe_layers if ref.layer_idx == li][0])
+        energies: list[float] = []
+        epsilons: list[float] = []
+        for e in range(gs.n_experts):
+            W = banks[name].get(e).detach().to(torch.float32)
+            svs = torch.linalg.svdvals(W)
+            s2 = svs * svs
+            total_e = float(s2.sum().clamp_min(1e-30).item())
+            energies.append(total_e)
+            tail = float(s2[k_group:].sum().item()) if k_group < len(s2) else 0.0
+            epsilons.append((tail / total_e) ** 0.5)
+
+        group_energy = sum(energies) or 1.0
+        betas = [e_val / group_energy for e_val in energies]
+        scores = [
+            max((b ** alpha) * (_math.log(_math.e + eps) ** (1.0 - alpha)), 1e-12)
+            for b, eps in zip(betas, epsilons)
+        ]
+        total_score = sum(scores) or 1.0
+        total_group_rank = k_group * gs.n_experts
+        cap = min(gs.d_out, gs.d_in) - 1
+
+        per_e = [
+            max(1, min(cap, int(round(total_group_rank * (sc / total_score)))))
+            for sc in scores
+        ]
+        # Reconcile rounding residual.
+        diff = total_group_rank - sum(per_e)
+        if diff != 0:
+            order = sorted(range(gs.n_experts),
+                           key=lambda i: scores[i], reverse=(diff > 0))
+            for idx in order:
+                if diff == 0:
+                    break
+                step = 1 if diff > 0 else -1
+                new_val = per_e[idx] + step
+                if 1 <= new_val <= cap:
+                    per_e[idx] = new_val
+                    diff -= step
+
+        for e, k_e in enumerate(per_e):
+            out[(li, name, e)] = k_e
+    return out
 
 # ---------------------------------------------------------------------------
 # AA-SVD per matrix
