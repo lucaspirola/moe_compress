@@ -395,7 +395,7 @@ For each factored expert matrix, computes the residual `ΔW = W_original − U·
 
 ### Why
 
-EoRA recovers quality lost to rank truncation in Stage 3. The paper reports +10.84pp ARC-C on LLaMA3-8B at 3-bit quantization. The key innovation over naive SVD of the residual is the √Λ-weighted eigenspace projection, which concentrates the correction rank budget on directions the model actually uses.
+EoRA recovers quality lost to rank truncation in Stage 3. The paper reports +10.84pp ARC-C on LLaMA3-8B (in the paper's 3-bit quantization experiment — not applicable to our BF16 pipeline, cited for magnitude context only). The key innovation over naive SVD of the residual is the √Λ-weighted eigenspace projection, which concentrates the correction rank budget on directions the model actually uses.
 
 ### How — Paper Algorithm 1
 
@@ -479,11 +479,11 @@ where `z_T, z_S ∈ ℝ^{|V|}` are teacher/student vocabulary logits for next-to
 | Max sequence length | 512 | Paper |
 | KD temperature (τ) | 1.0 | Paper |
 | Max calibration samples | 3000 | Paper |
-| Teacher precision | NF4 (4-bit) | Pipeline-specific (fits teacher + student on single A100) |
+| Teacher precision | NF4 via bitsandbytes (~17 GB) | Pipeline-specific VRAM optimization: the frozen teacher is quantized so teacher+student co-reside on one 80 GB A100. The student (pipeline model) is always BF16. |
 
 ### Teacher Loading
 
-The teacher is loaded in NF4 quantization via bitsandbytes (~17 GB) to co-reside with the student (~50 GB) on a single 80 GB A100. Alternatively, precomputed teacher vocabulary logits can be loaded from a cache file (`teacher_logits_cache` config key) to skip the live teacher entirely.
+The frozen teacher is loaded in NF4 quantization via bitsandbytes (~17 GB) purely as a VRAM optimization so it can co-reside with the BF16 student (~50 GB) on a single 80 GB A100. The student — the pipeline model being compressed — is **always BF16 throughout all stages**. No stage of this pipeline operates on a quantized model. Alternatively, precomputed teacher vocabulary logits can be loaded from a cache file (`teacher_logits_cache` config key) to skip the live teacher entirely.
 
 ### Resume
 
@@ -560,7 +560,7 @@ Each heavy stage (2–5) uploads its checkpoint to a per-stage Hub repo immediat
 | 2 | δ̃_expert uses `cosine(mean_gated)` per batch | Paper Eq. 8 averages per-token cosine over jointly-active tokens | Mean gated output per expert, then pairwise cosine | Avoids O(T²·E²) per-token pair matching; approximate but tractable |
 | 2 | Neuron alignment cost is weight-only (`C_wt`) | Paper uses `C = C_act + C_wt` | Only weight-based Frobenius distance | Paper ablation (§5.4) shows weight-only has ΔAVG = −0.5 — minor impact |
 | 3 | AA-SVD uses auto-covariance A, not cross-covariance | Theorem 3.2 requires `X_pre^T X_post` | Substitutes `A_cov = X_pre^T X_pre` | Cross-covariance not stored; the two coincide under light pruning |
-| 5 | Effective batch size 4×2 instead of 2×4 | Paper Table 1: batch_size=2, grad_accum=4 | batch_size=4, grad_accum=2 | Same effective batch (8); adapted for A100 memory headroom with 4-bit teacher |
+| 5 | Effective batch size 4×2 instead of 2×4 | Paper Table 1: batch_size=2, grad_accum=4 | batch_size=4, grad_accum=2 | Same effective batch (8); adapted for A100 VRAM headroom with NF4-quantized teacher |
 
 ---
 
