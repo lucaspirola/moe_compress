@@ -337,19 +337,58 @@ def _check_humaneval(prompt: str, completion: str, test_src: str, entry_point: s
 
 
 def _check_math(completion: str, reference: str) -> bool:
-    """Crude string-match equivalence on the last numeric token.
+    """Normalized string-match with SymPy fallback.
 
-    Proper grading uses SymPy normalization — left as a future improvement.
-    Ranking / trend signal is enough for Stage 6 threshold checking.
+    First tries SymPy-based symbolic equivalence (handles different forms
+    like 3/4 vs 0.75). Falls back to last-numeric-token string match if
+    SymPy is not available or parsing fails.
     """
     import re
+
+    def _extract_boxed(s: str) -> str | None:
+        """Extract content from \\boxed{...} if present."""
+        # Find the last \\boxed{...} in the string.
+        matches = re.findall(r'\\boxed\{([^}]*)\}', s)
+        return matches[-1] if matches else None
 
     def _last_numeric(s: str) -> str | None:
         nums = re.findall(r"-?\d+\.?\d*", s)
         return nums[-1] if nums else None
 
-    a = _last_numeric(completion)
-    b = _last_numeric(reference)
+    # Try to extract boxed answer first (standard MATH format).
+    comp_answer = _extract_boxed(completion)
+    ref_answer = _extract_boxed(reference)
+    if comp_answer is None:
+        comp_answer = _last_numeric(completion)
+    if ref_answer is None:
+        ref_answer = _last_numeric(reference)
+
+    if comp_answer is None or ref_answer is None:
+        return False
+
+    # Direct string match.
+    if comp_answer.strip() == ref_answer.strip():
+        return True
+
+    # SymPy symbolic equivalence.
+    try:
+        from sympy import simplify, sympify
+        from sympy.parsing.latex import parse_latex
+        try:
+            a = parse_latex(comp_answer)
+        except Exception:
+            a = sympify(comp_answer)
+        try:
+            b = parse_latex(ref_answer)
+        except Exception:
+            b = sympify(ref_answer)
+        return bool(simplify(a - b) == 0)
+    except Exception:
+        pass
+
+    # Fallback: numeric string match.
+    a = _last_numeric(comp_answer)
+    b = _last_numeric(ref_answer)
     return a is not None and b is not None and a == b
 
 
