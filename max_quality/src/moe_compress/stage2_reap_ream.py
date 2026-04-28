@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import shutil
 from pathlib import Path
@@ -91,6 +92,7 @@ def run(
     partial_dir = artifacts_dir / "_stage2_partial"
     partial_dir.mkdir(parents=True, exist_ok=True)
     completed_layers: set[int] = set()
+    _layer_mean_costs: list[float] = []  # running history for cost-threshold gate (Strategy C)
 
     for ref in moe_layers:
         merge_path = partial_dir / f"merge_{ref.layer_idx}.json"
@@ -109,6 +111,17 @@ def run(
         freq = {int(k): int(v) for k, v in data["freq"].items()}
         merge_map_layer = {int(k): list(v) for k, v in data["merge_map_layer"].items()}
 
+        # Guard: the model passed in must be pre-merge (Stage 1 output) to
+        # avoid double-merging already-processed layers on resume.
+        n_pre_merge = len(freq)
+        if ref.num_routed_experts != n_pre_merge:
+            raise RuntimeError(
+                f"Stage 2 resume layer {ref.layer_idx}: expected {n_pre_merge} "
+                f"experts (pre-merge) but model has {ref.num_routed_experts}. "
+                "The model passed to stage2.run() must be the Stage 1 output, "
+                "not a partially-merged model."
+            )
+
         _merge_experts_inplace(ref, grouped, freq,
                                freq_weighted=s2["ream"]["frequency_weighted_merge"])
         banks = build_banks(ref)
@@ -116,20 +129,34 @@ def run(
             bank.select(centroid_ids)
         _resize_router_for_kept_experts(ref, centroid_ids)
 
-        ok = cov_acc.load_layer_from_disk(ref.layer_idx, partial_dir)
-        if not ok:
+        # The model has already been mutated above (merge + select + resize);
+        # a covariance load failure here means the process must be restarted
+        # with a fresh (pre-Stage-2) model, not just with _stage2_partial/ deleted.
+        try:
+            cov_acc.load_layer_from_disk(ref.layer_idx, partial_dir)
+        except Exception as _exc:
             raise RuntimeError(
-                f"Stage 2 resume: _stage2_partial/layer_{ref.layer_idx}.pt listed "
-                "but failed to load — delete _stage2_partial/ and re-run Stage 2"
-            )
+                f"Stage 2 resume: failed to load covariance for layer {ref.layer_idx} "
+                f"from _stage2_partial/ ({_exc}). "
+                "The in-memory model has already been partially mutated — "
+                "restart with a fresh Stage 1 model and delete _stage2_partial/."
+            ) from _exc
         merge_map[ref.layer_idx] = merge_map_layer
         completed_layers.add(ref.layer_idx)
         log.info("Stage 2: layer %d resumed from partial (skipping profile + merge)",
                  ref.layer_idx)
+        # Re-populate cost history so Strategy C's running mean is warm on resume.
+        if "mean_cost_per_pair" in data:
+            _layer_mean_costs.append(float(data["mean_cost_per_pair"]))
 
     if completed_layers:
         log.info("Stage 2: resumed %d / %d layers from %s",
                  len(completed_layers), len(moe_layers), partial_dir)
+
+    max_group_cap: int = s2.get("max_merge_group_size", 0) or 0
+    cost_sigma: float = s2.get("ream_cost_sigma_threshold", float("inf"))
+    cost_bump_ratio: float = s2.get("ream_cost_bump_ratio", 0.10)
+    min_active_tokens: int = s2.get("reap_min_active_tokens", 0)
 
     for k, layer_ref in enumerate(moe_layers):
         if layer_ref.layer_idx in completed_layers:
@@ -158,30 +185,91 @@ def run(
         n_experts = layer_ref.num_routed_experts
         protected = set(blacklist.get(layer_ref.layer_idx, []))
         scores = np.array([reap_acc.score(layer_ref.layer_idx, e) for e in range(n_experts)])
-
-        centroid_ids = sorted(protected)
-        for e in np.argsort(-scores):
-            e = int(e)
-            if e in protected:
-                continue
-            centroid_ids.append(e)
-            if len(centroid_ids) >= target:
-                break
-        centroid_ids = sorted(centroid_ids)
-        noncentroid_ids = [e for e in range(n_experts) if e not in set(centroid_ids)]
-
-        delta = _ream_cost_matrix(
-            layer_ref, noncentroid_ids, centroid_ids,
-            gate_weight=s2["ream"]["gate_weight"],
-            expert_weight=s2["ream"]["expert_weight"],
-        )
-        assignment = _assign_children_to_centroids(
-            delta, len(noncentroid_ids), len(centroid_ids),
-        )
         freq = {e: reap_acc.freq.get((layer_ref.layer_idx, e), 0) for e in range(n_experts)}
-        grouped: dict[int, list[int]] = {c: [c] for c in centroid_ids}
-        for child_pos, centroid_pos in enumerate(assignment):
-            grouped[centroid_ids[centroid_pos]].append(noncentroid_ids[child_pos])
+
+        # --- Budget bump loop (Strategy B: max_group_size cap; Strategy C: REAM cost gate) ---
+        effective_target = target
+        centroid_ids: list[int] = []
+        noncentroid_ids: list[int] = []
+        grouped: dict[int, list[int]] = {}
+        delta = np.empty(0)
+        assignment: list[int] = []
+        running_mean: float = 0.0  # defined here so it's always in scope for the warning log
+
+        for _bump_attempt in range(n_experts - target + 1):
+            centroid_ids = sorted(protected)
+            for _e in np.argsort(-scores):
+                if len(centroid_ids) >= effective_target:
+                    break
+                e = int(_e)
+                if e in protected:
+                    continue
+                if freq[e] < min_active_tokens:  # skip dead experts (reap_min_active_tokens)
+                    continue
+                centroid_ids.append(e)
+            centroid_ids = sorted(centroid_ids)
+            if len(centroid_ids) < effective_target:
+                log.warning(
+                    "  layer %d: centroid selection yielded %d < %d (effective_target) — "
+                    "%d candidate(s) filtered by reap_min_active_tokens=%d",
+                    layer_ref.layer_idx, len(centroid_ids), effective_target,
+                    effective_target - len(centroid_ids), min_active_tokens,
+                )
+            noncentroid_ids = [e for e in range(n_experts) if e not in set(centroid_ids)]
+
+            delta = _ream_cost_matrix(
+                layer_ref, noncentroid_ids, centroid_ids,
+                gate_weight=s2["ream"]["gate_weight"],
+                expert_weight=s2["ream"]["expert_weight"],
+            )
+            assignment = _assign_children_to_centroids(
+                delta, len(noncentroid_ids), len(centroid_ids),
+            )
+            grouped = {c: [c] for c in centroid_ids}
+            for child_pos, centroid_pos in enumerate(assignment):
+                grouped[centroid_ids[centroid_pos]].append(noncentroid_ids[child_pos])
+
+            max_group = max((len(g) for g in grouped.values()), default=1)
+            b_fail = (max_group_cap > 0) and (max_group > max_group_cap)
+
+            n_pairs = int(delta.size)
+            mean_cost = float(delta.sum()) / max(n_pairs, 1)
+            c_fail = False
+            if len(_layer_mean_costs) >= 4:
+                running_mean = float(np.mean(_layer_mean_costs))
+                c_fail = mean_cost > running_mean * (1.0 + cost_sigma)
+
+            if not b_fail and not c_fail:
+                break
+
+            bump = 1
+            if c_fail:
+                bump = max(bump, math.ceil(effective_target * cost_bump_ratio))
+            if b_fail:
+                log.warning(
+                    "  layer %d: max_group=%d > cap=%d — bumping target %d→%d",
+                    layer_ref.layer_idx, max_group, max_group_cap,
+                    effective_target, effective_target + bump,
+                )
+            if c_fail:
+                log.warning(
+                    "  layer %d: mean_cost=%.4f > threshold=%.4f — bumping target %d→%d",
+                    layer_ref.layer_idx, mean_cost,
+                    running_mean * (1.0 + cost_sigma),
+                    effective_target, effective_target + bump,
+                )
+            effective_target = min(effective_target + bump, n_experts)
+            if effective_target >= n_experts:
+                break
+
+        assert all(a >= 0 for a in assignment), (
+            f"Layer {layer_ref.layer_idx}: _assign_children_to_centroids returned "
+            f"unassigned (-1) sentinel for {sum(1 for a in assignment if a < 0)} child(ren); "
+            f"n_children={len(noncentroid_ids)}, n_centroids={len(centroid_ids)}"
+        )
+
+        if delta.size > 0:  # skip no-prune layers (zero-cost entries bias the running mean)
+            _layer_mean_costs.append(float(delta.sum()) / int(delta.size))
 
         _merge_experts_inplace(
             layer_ref, grouped, freq,
@@ -206,6 +294,7 @@ def run(
         _write_merge_json(
             partial_dir, layer_ref.layer_idx, centroid_ids, grouped, freq,
             merge_map[layer_ref.layer_idx],
+            mean_cost_per_pair=float(delta.sum()) / max(int(delta.size), 1),
         )
 
         sum_cost = float(delta.sum()) if delta.size else 0.0
@@ -224,16 +313,21 @@ def run(
             "stage2/mean_cost_per_pair": sum_cost / max(delta.size, 1),
             "stage2/max_merge_group_size": max_group,
             "stage2/mean_merge_group_size": mean_group,
+            "stage2/effective_target": len(centroid_ids),
+            "stage2/stage1_target": target,
         })
 
     out_dir = artifacts_dir / "stage2_pruned"
+    # Write covariance FIRST: if the job is killed after the checkpoint but
+    # before the covariance, Stage 3 would find stage2_pruned/ but no covariance
+    # and fail; worse, a Stage 2 re-run would double-merge already-merged layers.
+    _save_covariance(cov_acc, artifacts_dir / "_stage2_input_covariance.pt")
     save_compressed_checkpoint(
         model, tokenizer, out_dir,
         pipeline_stage="stage2_pruned",
         extra_metadata={"merge_map_file": "merge_map.json"},
     )
     save_json_artifact(merge_map, out_dir / "merge_map.json")
-    _save_covariance(cov_acc, artifacts_dir / "_stage2_input_covariance.pt")
     shutil.rmtree(partial_dir, ignore_errors=True)
     log.info("Stage 2 complete — pruned checkpoint at %s", out_dir)
     return out_dir
@@ -254,15 +348,20 @@ def _snapshot_cov_layer(
     Unlike InputCovarianceAccumulator.spill_layer_to_disk (which pops the keys),
     this snapshot is non-destructive so _save_covariance at the end of run() still
     sees the full accumulated dataset.
+
+    INVARIANT: _remap_covariance_for_layer must be called for this layer BEFORE
+    _snapshot_cov_layer. Snapshotting before remapping persists pre-merge expert keys,
+    which resume would load back into the already-merged model, corrupting stage3 inputs.
     """
-    keys = [k for k in cov_acc.covariance if k[0] == layer_idx]
-    if not keys:
-        return
-    payload = {
-        "format_version": 1,
-        "covariance": {k: cov_acc.covariance[k].clone() for k in keys},
-        "tokens": {k: cov_acc.token_count.get(k, 0) for k in keys},
-    }
+    with cov_acc._lock:
+        keys = [k for k in cov_acc.covariance if k[0] == layer_idx]
+        if not keys:
+            return
+        payload = {
+            "format_version": 1,
+            "covariance": {k: cov_acc.covariance[k].clone() for k in keys},
+            "tokens": {k: cov_acc.token_count.get(k, 0) for k in keys},
+        }
     tmp = partial_dir / f"layer_{layer_idx}.pt.tmp"
     final = partial_dir / f"layer_{layer_idx}.pt"
     torch.save(payload, tmp)
@@ -276,6 +375,8 @@ def _write_merge_json(
     grouped: dict[int, list[int]],
     freq: dict[int, int],
     merge_map_layer: dict[int, list[int]],
+    *,
+    mean_cost_per_pair: float = 0.0,
 ) -> None:
     payload = {
         "format_version": 1,
@@ -283,6 +384,7 @@ def _write_merge_json(
         "grouped": {str(k): list(v) for k, v in grouped.items()},
         "freq": {str(k): int(v) for k, v in freq.items()},
         "merge_map_layer": {str(k): list(v) for k, v in merge_map_layer.items()},
+        "mean_cost_per_pair": mean_cost_per_pair,
     }
     tmp = partial_dir / f"merge_{layer_idx}.json.tmp"
     final = partial_dir / f"merge_{layer_idx}.json"
@@ -501,16 +603,20 @@ def _remap_covariance_for_layer(
     id_to_new = {old: new for new, old in enumerate(centroid_ids)}
     new_cov: dict = {}
     new_tokens: dict = {}
-    for key, val in list(cov.covariance.items()):
-        li, eidx, name = key
-        if li != layer_idx:
-            new_cov[key] = val
-            new_tokens[key] = cov.token_count.get(key, 0)
-            continue
-        if eidx not in id_to_new:
-            continue
-        new_key = (li, id_to_new[eidx], name)
-        new_cov[new_key] = val
-        new_tokens[new_key] = cov.token_count.get(key, 0)
-    cov.covariance = new_cov
-    cov.token_count = new_tokens
+    with cov._lock:
+        for key, val in list(cov.covariance.items()):
+            li, eidx, name = key
+            if li != layer_idx:
+                new_cov[key] = val
+                new_tokens[key] = cov.token_count.get(key, 0)
+                continue
+            if eidx not in id_to_new:
+                continue
+            new_key = (li, id_to_new[eidx], name)
+            new_cov[new_key] = val
+            new_tokens[new_key] = cov.token_count.get(key, 0)
+        # NOTE: snapshot was written post-remap; do NOT call
+        # _remap_covariance_for_layer again on resume for already-remapped layers.
+        # Tuple-assign so both dicts swap in a single bytecode instruction,
+        # preventing any code path from observing a mismatched pair.
+        cov.covariance, cov.token_count = new_cov, new_tokens

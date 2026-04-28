@@ -106,6 +106,8 @@ def test_stage2_smoke_full_chain(tiny_model, patched_calibration, tmp_path):
         ].items()
     }
     for li, layer in enumerate(tiny_model.model.layers):
+        if li not in budgets:
+            continue  # non-MoE layer (dense MLP) — not in the budget dict
         assert layer.mlp.experts.num_experts == budgets[li]
         assert layer.mlp.experts.gate_up_proj.shape[0] == budgets[li]
         assert layer.mlp.experts.down_proj.shape[0] == budgets[li]
@@ -118,3 +120,55 @@ def test_stage2_smoke_full_chain(tiny_model, patched_calibration, tmp_path):
         assert 0 <= e < budgets[li], (
             f"covariance key has expert index {e} beyond layer {li}'s budget {budgets[li]}"
         )
+
+
+def test_stage2_max_merge_group_size_enforced(tiny_model, patched_calibration, tmp_path):
+    """max_merge_group_size=2 must force the bump loop to keep enough experts
+    that no centroid ends up with more than 2 members (itself + 1 child).
+
+    Tiny model: 2 MoE layers × 4 experts.  We set global_budget=4 (2/layer)
+    which means 2 non-centroids per layer; each centroid absorbs 1 child
+    → max_group=2, which is exactly the cap — no bump expected.
+    Then we tighten to global_budget=2 (1/layer) where 3 non-centroids would
+    pile onto 1 centroid (max_group=4 > cap=2) → bump must fire and raise the
+    effective target until max_group ≤ 2.
+    """
+    import copy
+
+    from moe_compress.utils import model_io as mio
+
+    model = copy.deepcopy(tiny_model)
+
+    stage0_super_experts.run(
+        model, _TinyTokenizer(), patched_calibration, tmp_path, device=None,
+    )
+
+    # Budget of 1 per layer (below min_experts_per_layer=2 in config, so we
+    # override that key) to force very aggressive merging.
+    cfg = copy.deepcopy(patched_calibration)
+    cfg["stage1_grape"]["min_experts_per_layer"] = 1
+    cfg["stage2_reap_ream"]["max_merge_group_size"] = 2
+
+    decomp = solver.BudgetDecomposition(
+        total_reduction_ratio=0.2,
+        expert_prune_ratio=0.5,
+        svd_rank_ratio=0.0,
+        global_expert_budget=2,   # 1 expert per MoE layer → max_group would be 4 without cap
+        min_experts_per_layer=1,
+        blacklisted_experts={},
+    )
+    stage1_grape.run(model, cfg, tmp_path, decomp)
+
+    def _noop_save(m, tok, path, **kwargs):
+        Path(path).mkdir(parents=True, exist_ok=True)
+        return Path(path)
+
+    mio.save_compressed_checkpoint = _noop_save              # type: ignore[assignment]
+    stage2_reap_ream.save_compressed_checkpoint = _noop_save  # type: ignore[attr-defined]
+
+    stage2_reap_ream.run(model, _TinyTokenizer(), cfg, tmp_path, device=None)
+
+    # With max_merge_group_size=2: ceil(4 experts / 2) = 2 centroids minimum.
+    for layer in model.model.layers:
+        n = layer.mlp.experts.num_experts
+        assert n >= 2, f"got {n} experts, expected ≥ 2 with max_merge_group_size=2"

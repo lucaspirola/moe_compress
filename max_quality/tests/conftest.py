@@ -201,21 +201,20 @@ def tiny_config():
         "stage1_grape": {
             "similarity_metric": "cosine", "min_experts_per_layer": 2,
             "early_layer_bonus": 0, "early_layer_bonus_depth": 0,
-            "include_shared_in_similarity": False,
+            "late_layer_bonus": 0, "late_layer_bonus_depth": 0,
             "target_total_experts_per_layer_avg": 3,
         },
         "stage2_reap_ream": {
             "batch_size": 1, "num_calibration_samples": 4,
             "reap_min_active_tokens": 1,
             "covariance_storage_dtype": "float32",
-
+            "max_merge_group_size": 0,
+            "ream_cost_sigma_threshold": float("inf"),
+            "ream_cost_bump_ratio": 0.10,
             "ream": {
                 "gate_weight": 1.0, "expert_weight": 1.0,
                 "hungarian": True, "frequency_weighted_merge": True,
             },
-            "sequential_recompute": True,
-            "per_layer_mse_sigma_threshold": 3.0,
-            "per_layer_mse_bump_ratio": 0.10,
         },
         "stage3_svd": {
             "scope": "moe_experts_only",

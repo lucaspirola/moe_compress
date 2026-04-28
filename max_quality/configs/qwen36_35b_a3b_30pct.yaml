@@ -52,24 +52,26 @@ stage1_grape:
   min_experts_per_layer: 64       # floor; Qwen3-30B (128 experts) uses 32, scale by 2x
   early_layer_bonus: 8            # add +8 to layers 0..early_layer_bonus_depth
   early_layer_bonus_depth: 4
-  include_shared_in_similarity: false
+  late_layer_bonus: 8             # add +8 to last late_layer_bonus_depth MoE layers
+  late_layer_bonus_depth: 5       # protects last 5 MoE layers (output generation / instruction following)
   target_total_experts_per_layer_avg: 200  # initial; recomputed by solver
 
 stage2_reap_ream:
-  batch_size: 4                    # 80GB A100: batch=8 OOMs (73.88/79.25 GB used by model), batch=4 needs ~3.8 GB peak
+  batch_size: 6                    # 80GB A100: batch=8 OOMs (73.88/79.25 GB used by model), batch=4 needs ~3.8 GB peak; bumped to 6 for ~50% faster calibration
   num_calibration_samples: 1024
-  reap_min_active_tokens: 32      # skip experts with < this activation count when scoring
+  reap_min_active_tokens: 32      # skip experts whose token activation count < this from centroid candidates
   covariance_storage_dtype: float16   # fp16 (10 mantissa bits) avoids the bf16 (7 bits) precision loss
                                       # that round-tripped Stage 2 covariance and produced rank-deficient B
                                       # in Stage 3 (rel_recon_err ≫ 1). Same byte count as bf16.
+  max_merge_group_size: 3         # bump target if any group exceeds this size (4→1 causes subspace collapse)
+  ream_cost_sigma_threshold: 1.5  # bump target if mean_cost_per_pair > running_mean * (1 + threshold)
+                                  # inactive for first 4 freshly-processed layers (bootstrap guard)
+  ream_cost_bump_ratio: 0.10      # bump amount = ceil(target * ratio) when cost gate triggers
   ream:
     gate_weight: 1.0              # weight on δ_gate in combined cost
     expert_weight: 1.0            # weight on δ̃_expert
     hungarian: true               # scipy.optimize.linear_sum_assignment
     frequency_weighted_merge: true
-  sequential_recompute: true      # re-run fwd through 0..l before profiling l+1
-  per_layer_mse_sigma_threshold: 3.0   # bump budget +10% if layer exceeds this
-  per_layer_mse_bump_ratio: 0.10
 
 stage3_svd:
   scope: moe_experts_only         # NEVER change; attention SVD is off-spec

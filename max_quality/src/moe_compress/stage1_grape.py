@@ -58,6 +58,8 @@ def run(
         blacklist=decomposition.blacklisted_experts,
         early_bonus=s1["early_layer_bonus"],
         early_bonus_depth=s1["early_layer_bonus_depth"],
+        late_bonus=s1.get("late_layer_bonus", 0),
+        late_bonus_depth=s1.get("late_layer_bonus_depth", 0),
     )
     out = {
         "per_layer_target_experts": {str(k): v for k, v in budgets.items()},
@@ -99,8 +101,14 @@ def _pairwise_distance_matrix(layer_ref, *, metric: str) -> torch.Tensor:
         K = W @ W.transpose(0, 1)
         H = torch.eye(n, device=W.device) - 1.0 / n
         Kc = H @ K @ H
-        denom = torch.sqrt(Kc.diag().unsqueeze(0) * Kc.diag().unsqueeze(1)).clamp(min=1e-8)
+        # Use the un-centred gram K for the HSIC normalization denominator so
+        # the denominator is always PSD (K.diag() >= 0 by construction).
+        # Kc.diag() can go negative for n < d after double-centering, which
+        # would collapse the denominator and flip the similarity sign.
+        diag_safe = K.diag().clamp(min=0.0)
+        denom = torch.sqrt(diag_safe.unsqueeze(0) * diag_safe.unsqueeze(1)).clamp(min=1e-8)
         dist = (1.0 - (Kc / denom)).clamp(min=0.0, max=1.0)
+        dist.fill_diagonal_(0.0)
     else:
         raise ValueError(f"Unknown similarity metric: {metric}")
     return dist
@@ -115,7 +123,18 @@ def _allocate_budgets(
     blacklist: dict[int, list[int]],
     early_bonus: int,
     early_bonus_depth: int,
+    late_bonus: int = 0,
+    late_bonus_depth: int = 0,
 ) -> dict[int, int]:
+    max_feasible = sum(per_layer_counts.values())
+    min_feasible = sum(max(min_experts, len(blacklist.get(li, []))) for li in per_layer_counts)
+    if not (min_feasible <= global_budget <= max_feasible):
+        raise ValueError(
+            f"global_budget={global_budget} is outside the feasible range "
+            f"[{min_feasible}, {max_feasible}] given per-layer constraints. "
+            f"Adjust global_expert_budget or min_experts_per_layer in the config."
+        )
+
     vals = np.array([redundancies[li] for li in sorted(redundancies)])
     if vals.max() > vals.min():
         r_tilde = (vals - vals.min()) / (vals.max() - vals.min())
@@ -125,20 +144,28 @@ def _allocate_budgets(
     total_inv = inv.sum() or 1.0
 
     sorted_ids = sorted(redundancies)
+    n_moe_layers = len(sorted_ids)
     budgets: dict[int, int] = {}
     for idx, li in enumerate(sorted_ids):
         proto = global_budget * (inv[idx] / total_inv)
-        if li < early_bonus_depth:
+        if early_bonus_depth > 0 and li < early_bonus_depth:
             proto += early_bonus
+        if late_bonus_depth > 0 and idx >= n_moe_layers - late_bonus_depth:
+            proto += late_bonus
         floor = max(min_experts, len(blacklist.get(li, [])))
         ceil = per_layer_counts[li]
         budgets[li] = int(min(ceil, max(floor, round(proto))))
 
     diff = global_budget - sum(budgets.values())
     if diff != 0:
-        order = sorted(sorted_ids, key=lambda l: inv[sorted_ids.index(l)], reverse=(diff > 0))
+        inv_by_id = {li: inv[idx] for idx, li in enumerate(sorted_ids)}
+        order = sorted(sorted_ids, key=lambda l: inv_by_id[l], reverse=(diff > 0))
+        # Cap: (|diff| + 1) * len(order) guarantees convergence even when only
+        # one layer can donate at a time — e.g. when early_bonus inflates the
+        # initial allocation and all other layers are already at their floor.
+        max_iters = (abs(diff) + 1) * len(order)
         i = 0
-        while diff != 0 and i < 10 * len(order):
+        while diff != 0 and i < max_iters:
             li = order[i % len(order)]
             step = 1 if diff > 0 else -1
             new_val = budgets[li] + step
@@ -148,4 +175,11 @@ def _allocate_budgets(
                 budgets[li] = new_val
                 diff -= step
             i += 1
+    if diff != 0:
+        raise RuntimeError(
+            f"_allocate_budgets: could not reconcile expert budget "
+            f"(diff={diff} remaining). "
+            f"Constraints may be infeasible: global_budget={global_budget}, "
+            f"sum={sum(budgets.values())}."
+        )
     return budgets
