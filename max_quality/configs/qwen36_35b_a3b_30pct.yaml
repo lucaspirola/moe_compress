@@ -37,7 +37,7 @@ calibration:
     math: 0.21
     science: 0.11
     chat: 0.56
-    instruction_following: 0.033
+    instruction_following: 0.0338
     conversational_agent: 0.0331
     swe: 0.02
     terminal_agent: 0.0331

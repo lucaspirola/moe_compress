@@ -148,8 +148,9 @@ def run(
         # Re-populate cost history so Strategy C's running mean is warm on resume.
         # Mirror the live-path guard (delta.size > 0): skip 0.0 entries from
         # no-prune layers to avoid biasing the running mean downward.
-        if data.get("mean_cost_per_pair"):
-            _layer_mean_costs.append(float(data["mean_cost_per_pair"]))
+        val = data.get("mean_cost_per_pair")
+        if val is not None and val > 0.0:
+            _layer_mean_costs.append(float(val))
 
     if completed_layers:
         log.info("Stage 2: resumed %d / %d layers from %s",
@@ -262,7 +263,7 @@ def run(
                 )
             effective_target = min(effective_target + bump, n_experts)
             if effective_target >= n_experts:
-                break
+                continue  # run loop body once more with all experts as centroids
 
         assert all(a >= 0 for a in assignment), (
             f"Layer {layer_ref.layer_idx}: _assign_children_to_centroids returned "
@@ -301,7 +302,7 @@ def run(
 
         sum_cost = float(delta.sum()) if delta.size else 0.0
         max_group = max((len(g) for g in grouped.values()), default=1)
-        mean_group = (n_experts - len(protected)) / max(len(centroid_ids), 1) if centroid_ids else 0.0
+        mean_group = n_experts / max(len(centroid_ids), 1) if centroid_ids else 0.0
         log.info(
             "  kept %d / %d experts (blacklist=%d) — Σ cost=%.4f, max_group=%d, mean_group=%.2f",
             len(centroid_ids), n_experts, len(protected),
