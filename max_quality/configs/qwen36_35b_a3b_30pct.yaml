@@ -129,6 +129,9 @@ stage5_router_kd:
   teacher_load_in_4bit: true
   max_sequence_length: 512
   kd_temperature: 1.0
+  kd_seq_chunk_size: 128            # sequence-dim chunk size for vocab KL computation;
+                                    # bounds peak intermediate memory at B×chunk×|V|×4 bytes.
+                                    # At chunk=128 with |V|≈150K and B=4: ~300 MB vs ~1.2 GB unchunked.
   max_calibration_samples: 3000
   checkpoint_every_n_steps: 100    # save router+optim state every N optimizer steps for crash-resume
   # Only router weights update. Enumerated paths are matched as substrings.
