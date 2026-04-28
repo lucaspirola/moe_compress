@@ -61,6 +61,122 @@ log = logging.getLogger(__name__)
 # Accumulators (API preserved from pre-refactor; stages import these)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# REAM cost accumulator (activation-space, paper 2604.04356 Eq. 5 & 8)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ReamCostAccumulator:
+    """Collects per-token per-expert gate logit profiles and gated expert
+    outputs for computing REAM's activation-space cost matrix (paper Eq. 5, 8).
+
+    Storage per layer:
+      - gate_logit_profiles[layer_idx][expert_idx]: list of scalar gate logits
+        per token → flattened to a length-|X| vector for δ_gate cosine sim.
+      - gated_expert_outputs[layer_idx]: list of (expert_idx, gated_output_vec)
+        tuples → used to compute per-token cosine sim for δ̃_expert.
+
+    Kept on CPU (scalars / small vecs) to avoid GPU OOM on high-expert-count
+    models.
+    """
+    # Per-(layer, expert): list of scalar gate logit values, one per active token.
+    gate_logit_profiles: dict[int, dict[int, list[float]]] = field(default_factory=lambda: defaultdict(lambda: defaultdict(list)))
+    # Per-(layer, expert): list of gated expert output vectors [d_hid], one per active token.
+    # For δ̃_expert we need per-token cosine sim between pairs of experts, so we store
+    # the full gated output. Memory: ~N_experts * N_tokens * d_hid * 4 bytes per layer.
+    # For large models, we compute the pairwise similarity incrementally per batch
+    # to avoid materialising all outputs.
+    # sim_accum[(li, e_i, e_j)] = running sum of cosine_sim(gated_out_i, gated_out_j)
+    # sim_count[(li, e_i, e_j)] = count of tokens where both i and j were active
+    gated_output_sim: dict[tuple[int, int, int], float] = field(default_factory=lambda: defaultdict(float))
+    gated_output_count: dict[tuple[int, int, int], int] = field(default_factory=lambda: defaultdict(int))
+    # Temporary per-batch storage: (layer, expert) → stacked gated output tensor [T, d_hid]
+    _batch_gated: dict[tuple[int, int], list[torch.Tensor]] = field(default_factory=lambda: defaultdict(list))
+
+    def record_gate_logit(self, layer_idx: int, expert_idx: int, gate_logits_per_token: torch.Tensor) -> None:
+        """Record per-token gate logits (scalar per token) for this expert."""
+        vals = gate_logits_per_token.detach().cpu().tolist()
+        self.gate_logit_profiles[layer_idx][expert_idx].extend(vals)
+
+    def record_gated_output(self, layer_idx: int, expert_idx: int,
+                            gate_weights: torch.Tensor, expert_output: torch.Tensor) -> None:
+        """Record gated expert output σ(x)_e * E_e(x) for later pairwise cosine sim."""
+        # gate_weights: [T], expert_output: [T, d_hid]
+        gated = (gate_weights.unsqueeze(-1) * expert_output).detach()  # [T, d_hid]
+        self._batch_gated[(layer_idx, expert_idx)].append(gated)
+
+    def finalize_batch(self, layer_idx: int, num_experts: int) -> None:
+        """After a full forward pass through the layer, compute pairwise cosine
+        similarities between all expert pairs that were both active in this batch.
+        This avoids storing all gated outputs across batches."""
+        # Collect per-expert gated output for this layer from the current batch.
+        per_expert: dict[int, torch.Tensor] = {}
+        for e in range(num_experts):
+            key = (layer_idx, e)
+            if key not in self._batch_gated or not self._batch_gated[key]:
+                continue
+            stacked = torch.cat(self._batch_gated[key], dim=0).cpu().to(torch.float32)  # [T_e, d_hid]
+            per_expert[e] = stacked
+        # Clear batch storage for this layer.
+        keys_to_clear = [k for k in self._batch_gated if k[0] == layer_idx]
+        for k in keys_to_clear:
+            del self._batch_gated[k]
+
+        # Pairwise cosine similarity: for each pair (i, j), average cosine sim
+        # over tokens where BOTH were active. Since experts process different
+        # token subsets, we use the simpler per-expert average approach:
+        # δ̃_E(i,j) = cosine_sim(mean_gated_i, mean_gated_j) as an approximation.
+        # This avoids the O(T^2 * E^2) cost of per-token pair matching.
+        expert_ids = sorted(per_expert.keys())
+        if len(expert_ids) < 2:
+            return
+        # Compute mean gated output per expert (over active tokens in this batch).
+        means: dict[int, torch.Tensor] = {}
+        for e in expert_ids:
+            means[e] = per_expert[e].mean(dim=0)  # [d_hid]
+        # Pairwise cosine sim on mean gated outputs.
+        for idx_i, e_i in enumerate(expert_ids):
+            for e_j in expert_ids[idx_i + 1:]:
+                sim = float(F.cosine_similarity(means[e_i].unsqueeze(0), means[e_j].unsqueeze(0)).item())
+                k1 = (layer_idx, e_i, e_j)
+                k2 = (layer_idx, e_j, e_i)
+                self.gated_output_sim[k1] += sim
+                self.gated_output_sim[k2] += sim
+                self.gated_output_count[k1] += 1
+                self.gated_output_count[k2] += 1
+
+    def compute_delta_gate(self, layer_idx: int, expert_i: int, expert_j: int) -> float:
+        """δ_gate(i,j) per REAM Eq. 5: cosine sim between gate logit profile vectors."""
+        prof_i = self.gate_logit_profiles.get(layer_idx, {}).get(expert_i, [])
+        prof_j = self.gate_logit_profiles.get(layer_idx, {}).get(expert_j, [])
+        if not prof_i or not prof_j:
+            return 1.0  # max distance if no data
+        # Pad to same length (tokens where one expert was inactive get 0 logit).
+        max_len = max(len(prof_i), len(prof_j))
+        vi = torch.tensor(prof_i + [0.0] * (max_len - len(prof_i)), dtype=torch.float32)
+        vj = torch.tensor(prof_j + [0.0] * (max_len - len(prof_j)), dtype=torch.float32)
+        sim = float(F.cosine_similarity(vi.unsqueeze(0), vj.unsqueeze(0)).item())
+        return (1.0 - sim) / 2.0  # normalize to [0, 1]
+
+    def compute_delta_expert(self, layer_idx: int, expert_i: int, expert_j: int) -> float:
+        """δ̃_E(i,j) per REAM Eq. 8: mean cosine sim of gated expert outputs."""
+        key = (layer_idx, expert_i, expert_j)
+        count = self.gated_output_count.get(key, 0)
+        if count == 0:
+            return 1.0  # max distance
+        avg_sim = self.gated_output_sim[key] / count
+        return (1.0 - avg_sim) / 2.0  # normalize to [0, 1]
+
+    def clear_layer(self, layer_idx: int) -> None:
+        """Free memory for a processed layer."""
+        self.gate_logit_profiles.pop(layer_idx, None)
+        keys_to_clear = [k for k in self.gated_output_sim if k[0] == layer_idx]
+        for k in keys_to_clear:
+            self.gated_output_sim.pop(k, None)
+            self.gated_output_count.pop(k, None)
+
+
 
 @dataclass
 class DownProjMaxAccumulator:
