@@ -1,7 +1,7 @@
 # Strategy A — Maximum Quality MoE Compression: Algorithm Reference
 
 **Pipeline:** `max_quality/` in [`pirola/moe-compress`](https://huggingface.co/datasets/pirola/moe-compress/tree/main/max_quality)
-**Target model:** [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) — 35B parameter sparse MoE, 128 routed experts per layer, top-8 routing, 40 MoE decoder layers.
+**Target model:** [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) — 35B parameter sparse MoE, 256 routed experts per layer, top-8 routing, 40 MoE decoder layers, `moe_intermediate_size=512`, `hidden_size=2048`.
 **Goal:** 30% total parameter reduction with ≤3% relative WikiText-2 PPL increase and ≤1.5pp zero-shot accuracy drop.
 **Config:** [`configs/qwen36_35b_a3b_30pct.yaml`](configs/qwen36_35b_a3b_30pct.yaml)
 **Code review date:** 2026-04-28
@@ -104,7 +104,7 @@ Given a `target_total_reduction` (e.g., 0.30) and an `expert_svd_ratio` (e.g., 2
 3. If outside tolerance, scale both knobs by `target / projected`, maintaining the ep:sp ratio exactly
 4. Converges in ≤3 iterations for typical targets
 
-**Floor constraints:** No layer can go below `min_experts_per_layer` (default 64 for 128-expert layers) or below the number of blacklisted experts. The solver enforces these when projecting the expert budget.
+**Floor constraints:** No layer can go below `min_experts_per_layer` (default 128 for 256-expert layers) or below the number of blacklisted experts. The solver enforces these when projecting the expert budget.
 
 ---
 
@@ -204,7 +204,7 @@ Stage 1 is stateless (JSON-only output). Re-running is cheap and always safe.
 
 ### What
 
-Reduces the number of routed experts per layer from 128 to ~90–100 by merging similar experts (not deleting — merged experts' knowledge is preserved via frequency-weighted averaging). Simultaneously collects input covariance matrices consumed by Stages 3 and 4.
+Reduces the number of routed experts per layer from 256 to ~180–200 by merging similar experts (not deleting — merged experts' knowledge is preserved via frequency-weighted averaging). Simultaneously collects input covariance matrices consumed by Stages 3 and 4.
 
 ### Why
 
