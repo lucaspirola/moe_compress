@@ -50,11 +50,10 @@ stage0_super_experts:
 stage1_grape:
   similarity_metric: cosine       # one of: cosine | mse | cka
   min_experts_per_layer: 64       # floor; Qwen3-30B (128 experts) uses 32, scale by 2x
-  early_layer_bonus: 8            # add +8 to layers 0..early_layer_bonus_depth
-  early_layer_bonus_depth: 4
-  late_layer_bonus: 8             # add +8 to last late_layer_bonus_depth MoE layers
+  early_layer_bonus: 8            # add +8 to first early_layer_bonus_depth MoE layers (by MoE-sequence index)
+  early_layer_bonus_depth: 4      # protects first 4 MoE layers
+  late_layer_bonus: 8             # add +8 to last late_layer_bonus_depth MoE layers (by MoE-sequence index)
   late_layer_bonus_depth: 5       # protects last 5 MoE layers (output generation / instruction following)
-  target_total_experts_per_layer_avg: 200  # initial; recomputed by solver
 
 stage2_reap_ream:
   batch_size: 6                    # 80GB A100: batch=8 OOMs (73.88/79.25 GB used by model), batch=4 needs ~3.8 GB peak; bumped to 6 for ~50% faster calibration
@@ -70,7 +69,6 @@ stage2_reap_ream:
   ream:
     gate_weight: 1.0              # weight on δ_gate in combined cost
     expert_weight: 1.0            # weight on δ̃_expert
-    hungarian: true               # scipy.optimize.linear_sum_assignment
     frequency_weighted_merge: true
 
 stage3_svd:

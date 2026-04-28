@@ -148,7 +148,7 @@ def _allocate_budgets(
     budgets: dict[int, int] = {}
     for idx, li in enumerate(sorted_ids):
         proto = global_budget * (inv[idx] / total_inv)
-        if early_bonus_depth > 0 and li < early_bonus_depth:
+        if early_bonus_depth > 0 and idx < early_bonus_depth:
             proto += early_bonus
         if late_bonus_depth > 0 and idx >= n_moe_layers - late_bonus_depth:
             proto += late_bonus

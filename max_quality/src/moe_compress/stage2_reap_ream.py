@@ -146,7 +146,9 @@ def run(
         log.info("Stage 2: layer %d resumed from partial (skipping profile + merge)",
                  ref.layer_idx)
         # Re-populate cost history so Strategy C's running mean is warm on resume.
-        if "mean_cost_per_pair" in data:
+        # Mirror the live-path guard (delta.size > 0): skip 0.0 entries from
+        # no-prune layers to avoid biasing the running mean downward.
+        if data.get("mean_cost_per_pair"):
             _layer_mean_costs.append(float(data["mean_cost_per_pair"]))
 
     if completed_layers:
@@ -388,7 +390,7 @@ def _write_merge_json(
     }
     tmp = partial_dir / f"merge_{layer_idx}.json.tmp"
     final = partial_dir / f"merge_{layer_idx}.json"
-    tmp.write_text(json.dumps(payload))
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
     os.replace(tmp, final)
 
 
