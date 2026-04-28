@@ -285,6 +285,7 @@ def run(
         _merge_experts_inplace(
             layer_ref, grouped, freq,
             freq_weighted=s2["ream"]["frequency_weighted_merge"],
+            ream_acc=ream_acc,
         )
 
         banks = build_banks(layer_ref)
@@ -436,13 +437,18 @@ def _profile_layer(
     def intermediate_cb(li, e, tensor, ctx):
         # Input to down_proj.
         cov_acc.update(li, e, "down_proj", tensor)
+        # REAM: per-neuron activation magnitude for C_act alignment (paper §4).
+        ream_acc.record_neuron_activations(li, e, tensor)
 
     def down_cb(li, e, tensor, ctx):
         # REAP contribution per expert dispatch event.
         record_reap(reap_acc, li, e, ctx["top_k_weights"], tensor)
-        # REAM: record gated expert output for pairwise cosine sim.
-        # ctx["top_k_weights"] are post-softmax gate values (σ(x)_e).
-        ream_acc.record_gated_output(li, e, ctx["top_k_weights"], tensor)
+        # REAM: record gated expert output keyed by global token index for
+        # exact per-token pairwise cosine sim (paper Eq. 8).
+        ream_acc.record_gated_output(
+            li, e, ctx["top_k_weights"], tensor,
+            ctx["token_idx"], _batch_offset[0],
+        )
 
     # Two independent hooks active simultaneously:
     # 1. capture_router_outputs: pre-forward hook on router → pre-softmax logits [T, E]
@@ -568,22 +574,32 @@ def _permutation_align_to_centroid(
     ref_up: torch.Tensor,
     child_gate: torch.Tensor,
     child_up: torch.Tensor,
+    ref_act_mean: torch.Tensor | None = None,
+    child_act_mean: torch.Tensor | None = None,
 ) -> np.ndarray:
     """Return the permutation of the child's intermediate dimension that best
-    aligns its neurons to the centroid's, minimising the combined gate+up
-    Frobenius distance (REAM §4, weight-based term).
+    aligns its neurons to the centroid's, minimising the combined cost
+    C = C_wt + C_act (REAM §4).
+
+    C_wt: gate+up Frobenius distance between neuron weight rows.
+    C_act: L2 distance between per-neuron mean activation magnitudes.
 
     perm[i] = child neuron index that should map to centroid position i.
     Applied as: gate_child[perm, :], up_child[perm, :], down_child[:, perm].
     """
-    # Inputs are already float32 from the caller.  cdist on CPU is faster than
-    # GPU for these small matrices (~2048×2048) because Hungarian is CPU-only
-    # regardless, so we avoid a GPU→CPU transfer of the result.
     C = (
         torch.cdist(ref_gate.cpu(), child_gate.cpu())
         + torch.cdist(ref_up.cpu(), child_up.cpu())
-    ).numpy()
-    _, col_ind = linear_sum_assignment(C)
+    )
+    # C_act: per-neuron activation distance (paper §4, "activation and weight
+    # permutation alignment"). Each neuron's mean activation magnitude is a
+    # scalar; cdist on [d_int, 1] gives pairwise L2 = pairwise |diff|.
+    if ref_act_mean is not None and child_act_mean is not None:
+        C = C + torch.cdist(
+            ref_act_mean.cpu().unsqueeze(-1),
+            child_act_mean.cpu().unsqueeze(-1),
+        )
+    _, col_ind = linear_sum_assignment(C.numpy())
     return col_ind
 
 
@@ -593,17 +609,20 @@ def _merge_experts_inplace(
     freq: dict[int, int],
     *,
     freq_weighted: bool,
+    ream_acc: ReamCostAccumulator | None = None,
 ) -> None:
     """Write the frequency-weighted average of each group into the centroid
     slot of the stacked tensors.
 
     Before averaging, each child expert's intermediate neurons are permuted to
     align with the centroid's neurons via Hungarian assignment on the combined
-    gate+up weight cost matrix (REAM §4, weight-based term).  The centroid
-    itself is averaged in as-is (identity permutation).  ``select`` afterwards
-    drops non-centroid rows.
+    C = C_wt + C_act cost matrix (REAM §4). C_wt uses gate+up weight distances;
+    C_act uses per-neuron mean activation magnitude distances (from ream_acc).
+    The centroid itself is averaged in as-is (identity permutation).
+    ``select`` afterwards drops non-centroid rows.
     """
     banks = build_banks(layer_ref)
+    li = layer_ref.layer_idx
     with torch.no_grad():
         for centroid, members in grouped.items():
             if len(members) <= 1:
@@ -615,14 +634,19 @@ def _merge_experts_inplace(
 
             ref_gate = banks["gate_proj"].get(centroid).to(torch.float32)
             ref_up   = banks["up_proj"].get(centroid).to(torch.float32)
+            ref_act  = ream_acc.get_neuron_mean(li, centroid) if ream_acc else None
 
             accs: dict[str, torch.Tensor | None] = {name: None for name in banks}
             for w, m in zip(weights, members):
                 gate_m = banks["gate_proj"].get(m).to(torch.float32)
                 up_m   = banks["up_proj"].get(m).to(torch.float32)
+                child_act = ream_acc.get_neuron_mean(li, m) if ream_acc else None
                 perm = (
                     None if m == centroid
-                    else _permutation_align_to_centroid(ref_gate, ref_up, gate_m, up_m)
+                    else _permutation_align_to_centroid(
+                        ref_gate, ref_up, gate_m, up_m,
+                        ref_act_mean=ref_act, child_act_mean=child_act,
+                    )
                 )
                 for name, bank in banks.items():
                     if name == "gate_proj":
