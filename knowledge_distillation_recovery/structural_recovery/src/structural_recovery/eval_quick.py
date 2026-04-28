@@ -83,6 +83,7 @@ def _wikitext2_ppl(student, tokenizer, cfg: dict[str, Any], accelerator) -> floa
 
     seq_len = int(cfg.get("sequence_length", 2048))
     n_seqs_req = int(cfg.get("num_sequences", 256))
+    eval_bs = int(cfg.get("micro_batch_size", 1))
 
     if accelerator.is_main_process:
         log.info("eval :: loading WikiText-2 (test, %d×%d requested)",
@@ -113,10 +114,10 @@ def _wikitext2_ppl(student, tokenizer, cfg: dict[str, Any], accelerator) -> floa
     tok_total = 0
     try:
         with torch.no_grad():
-            for i in range(n_seqs):
-                seq = inp[i:i + 1]
+            for i in range(0, n_seqs, eval_bs):
+                seq = inp[i:i + eval_bs]
                 # COLLECTIVE forward: every rank must call.
-                logits = student(input_ids=seq).logits         # [1, T, V]
+                logits = student(input_ids=seq).logits         # [B, T, V]
                 shift_logits = logits[:, :-1, :].float()
                 shift_labels = seq[:, 1:]
                 loss = F.cross_entropy(

@@ -156,17 +156,24 @@ def _main() -> int:
             # with a clear error rather than letting _prime_snapshot retry-
             # then-fail with an opaque RepositoryNotFoundError after wasting
             # ~2 minutes on retry backoff.
+            from huggingface_hub import HfApi
+            from huggingface_hub.errors import RepositoryNotFoundError
             try:
-                from huggingface_hub import HfApi
-                HfApi().model_info(bf16_teacher)
-            except Exception as err:                                 # noqa: BLE001
+                _with_retry(
+                    lambda: HfApi().model_info(bf16_teacher),
+                    label=f"model_info({bf16_teacher})",
+                )
+            except RepositoryNotFoundError as err:
                 raise RuntimeError(
                     f"Teacher correction is enabled but the derived BF16 "
                     f"teacher repo {bf16_teacher!r} (stripped from "
-                    f"{phase2_teacher!r}) is not accessible on the Hub: {err}. "
+                    f"{phase2_teacher!r}) does not exist on the Hub: {err}. "
                     "Either set teacher_correction.bf16_teacher_name_or_path "
                     "in the YAML, or set SKIP_TEACHER_CORRECTION=1."
-                ) from None
+                ) from err
+            # Other exceptions (transient 5xx) propagate with their original
+            # traceback so the operator can distinguish "repo missing" from
+            # "Hub is flaky".
             _prime_snapshot(bf16_teacher, hf_home)
 
     _prime_snapshot(STUDENT_REPO, hf_home)
@@ -422,8 +429,13 @@ def _upload_phase1_to_hub(artifacts_dir: Path, result_repo_base: str) -> None:
         LOG.warning("create_repo(%s): %s — continuing.", repo_id, err)
 
     LOG.info("=== Uploading Phase 1 checkpoint to Hub: %s ===", repo_id)
-    api.upload_large_folder(
-        folder_path=str(src), repo_id=repo_id, repo_type="model",
+    # Phase 1 upload is the only durability boundary across job
+    # cancellations — a transient 5xx must not sink the whole run.
+    _with_retry(
+        lambda: api.upload_large_folder(
+            folder_path=str(src), repo_id=repo_id, repo_type="model",
+        ),
+        label=f"upload_large_folder({repo_id})",
     )
 
     cfg_path = artifacts_dir / "resolved_config.yaml"
@@ -462,9 +474,12 @@ def _restore_teacher_corrected_checkpoint(repo_id: str, artifacts_dir: Path) -> 
         shutil.rmtree(dest, ignore_errors=True)
     LOG.info("Downloading teacher corrected checkpoint from %s -> %s", repo_id, dest)
     dest.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id, repo_type="model", local_dir=str(dest),
-        ignore_patterns=["*.metadata", "job_status.txt", "artifacts/*"],
+    _with_retry(
+        lambda: snapshot_download(
+            repo_id, repo_type="model", local_dir=str(dest),
+            ignore_patterns=["*.metadata", "job_status.txt", "artifacts/*"],
+        ),
+        label=f"_restore_teacher_corrected_checkpoint({repo_id})",
     )
     LOG.info("Teacher correction checkpoint restored from Hub.")
 
@@ -478,6 +493,16 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
         LOG.warning("create_repo(%s): %s — continuing.", repo_id, err)
 
     final_dir = artifacts_dir / "chapter1_recovered"
+    # If the trainer was SIGKILLed mid-final-save, ``chapter1_recovered`` may
+    # exist but be incomplete (no _SAVE_COMPLETE sentinel). Treat that as
+    # missing and fall back to the latest valid partial.
+    if final_dir.exists() and not (final_dir / "_SAVE_COMPLETE").exists():
+        LOG.warning(
+            "%s exists but _SAVE_COMPLETE is absent — final-save was likely "
+            "interrupted; falling back to the latest complete partial.",
+            final_dir,
+        )
+        final_dir = artifacts_dir / "_does_not_exist"
     if not final_dir.exists():
         # Fall back to the most recent valid partial. Exclude .tmp dirs (from
         # interrupted atomic renames) and dirs missing _SAVE_COMPLETE.

@@ -82,7 +82,10 @@ def main(argv: list[str] | None = None) -> int:
         log.info("World size: %d  device: %s  distributed_type: %s",
                  accelerator.num_processes, accelerator.device,
                  accelerator.distributed_type)
-        (artifacts_dir / "resolved_config.yaml").write_text(yaml.safe_dump(config))
+        # Strip the _source_path runtime stamp before dumping so the artifact
+        # is a clean, re-loadable config.
+        _dump_cfg = {k: v for k, v in config.items() if k != "_source_path"}
+        (artifacts_dir / "resolved_config.yaml").write_text(yaml.safe_dump(_dump_cfg))
 
     # SystemMetrics daemon: rank 0 only — GPU is shared so one sampler suffices.
     # moe_compress.utils is available via PYTHONPATH (entrypoint sets code_dir/src).
@@ -108,6 +111,10 @@ def main(argv: list[str] | None = None) -> int:
 def _run(config, args, artifacts_dir, accelerator, _metrics) -> int:  # noqa: ARG001
     """Inner body of main() — separated so SystemMetrics stop is always called."""
 
+    # Capture the *original* student source before any auto-resume override,
+    # for the resume_state.json sidecar below.
+    orig_student_source = config["student"]["source"]
+
     # 1. Load teacher (sharded under ZeRO-3 if DS, else replicated on device).
     #    Light tier on a100x4: BF16 (FP8 needs Hopper). Smoke on H200: FP8.
     teacher, teacher_tok = _load_teacher(config, accelerator)
@@ -126,8 +133,33 @@ def _run(config, args, artifacts_dir, accelerator, _metrics) -> int:  # noqa: AR
     from .distillation import _load_latest_partial, enable_student_training, run_distillation
     partial_dir, resume_step = _load_latest_partial(artifacts_dir)
     if resume_step > 0:
-        log.info("Auto-resume: step=%d from %s — overriding student source.", resume_step, partial_dir)
+        if accelerator.is_main_process:
+            log.info("Auto-resume: step=%d from %s — overriding student source.",
+                     resume_step, partial_dir)
+        # Tokenizer guard: the partial dir is produced by ``_save`` which calls
+        # ``tokenizer.save_pretrained(tmp_dir)`` — so the tokenizer SHOULD be
+        # there. If a partial somehow lacks it (older format / manual edit),
+        # fall back to the original student source for tokenizer-only loading
+        # and warn loudly.
+        has_tok = any(partial_dir.glob("tokenizer*"))
+        if not has_tok and accelerator.is_main_process:
+            log.warning(
+                "Auto-resume partial %s lacks tokenizer files; "
+                "load_compressed_model will fail. Either re-run from "
+                "scratch or copy the tokenizer from the original student "
+                "source into the partial dir.",
+                partial_dir,
+            )
         config["student"]["source"] = str(partial_dir)
+        # Persist resume state to a sidecar so resolved_config.yaml (already
+        # written above with the *original* student source) is supplemented
+        # by the actual runtime state.
+        if accelerator.is_main_process:
+            (artifacts_dir / "resume_state.json").write_text(json.dumps({
+                "resume_step": resume_step,
+                "partial_dir": str(partial_dir),
+                "original_student_source": orig_student_source,
+            }, indent=2))
 
     student, tokenizer = _load_student(config, accelerator)
     _assert_tokenizers_compatible(tokenizer, teacher_tok)
@@ -250,6 +282,16 @@ def _validate_config(config: dict[str, Any]) -> None:
         raise ValueError(
             f"distillation.total_tokens must be > 0; got {tt}."
         )
+    betas = config["distillation"]["betas"]
+    if not (isinstance(betas, (list, tuple)) and len(betas) == 2
+            and all(isinstance(b, (int, float)) for b in betas)):
+        raise ValueError(
+            f"distillation.betas must be a 2-element list/tuple of numbers; "
+            f"got {betas!r}."
+        )
+    # Don't write the source-path stamp into the resolved_config artifact.
+    # It's a runtime breadcrumb, not a config field.
+    # (popped right before yaml.safe_dump in main).
 
 
 def _build_accelerator():
@@ -407,6 +449,10 @@ def _load_student(config: dict[str, Any], accelerator):
         log.info("Loading STUDENT from %s (dtype=%s, attn=%s)", src, dtype_str, attn_impl)
 
     # device_map="auto" would fight ZeRO-3 placement. None lands on CPU.
+    # NOTE: load_compressed_model passes ``low_cpu_mem_usage=True`` to
+    # ``from_config`` internally; under ZeRO-3 it's a no-op (params are
+    # sharded by HfDeepSpeedConfig context), but harmless to leave on for
+    # the non-DS path. Kept implicit rather than threaded through here.
     student, tokenizer, meta = load_compressed_model(
         src,
         device_map=None,

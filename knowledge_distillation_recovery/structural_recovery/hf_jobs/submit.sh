@@ -61,8 +61,16 @@ fi
 # most common regressions in <10s. Pass PRECHECK=1 explicitly.
 if [[ "${PRECHECK:-0}" == "1" ]]; then
     REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-    PYBIN="${PYBIN:-/home/lucas/ai/venv/bin/python}"
-    if [[ -x "$PYBIN" ]]; then
+    # Default to the local venv if present, else fall back to whatever
+    # ``python3`` resolves to so other operators / CI can still preflight.
+    if [[ -z "${PYBIN:-}" ]]; then
+        if [[ -x /home/lucas/ai/venv/bin/python ]]; then
+            PYBIN=/home/lucas/ai/venv/bin/python
+        else
+            PYBIN="$(command -v python3 || true)"
+        fi
+    fi
+    if [[ -n "$PYBIN" && -x "$PYBIN" ]]; then
         echo ">>> Preflight: tests/test_kld_loss.py tests/test_defensive.py tests/test_resume.py tests/test_param_groups.py"
         ( cd "$REPO_ROOT" && "$PYBIN" -m pytest tests/test_kld_loss.py tests/test_defensive.py tests/test_resume.py tests/test_param_groups.py -q ) \
             || { echo "Preflight FAILED — refusing to submit" >&2; exit 1; }

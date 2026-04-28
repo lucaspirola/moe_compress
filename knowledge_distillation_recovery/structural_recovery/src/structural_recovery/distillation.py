@@ -239,21 +239,25 @@ def _is_zero3(accelerator) -> bool:
 
 
 # Module-scope holder so HfDeepSpeedConfig instances survive function exits.
-# Per-process singleton — each subprocess gets its own copy on import.
-_DSCHF_HOLDER: list = []
+# Keyed by ``id(deepspeed_config)`` so a second call with a *different*
+# config (e.g. teacher correction → KD in-process, or unit tests) re-runs
+# activation. With the same config the activation is a no-op.
+_DSCHF_HOLDER: dict[int, Any] = {}
 
 
 def _activate_zero3_init(accelerator) -> None:
     """Pin a module-scope HfDeepSpeedConfig so from_pretrained shards params
-    via deepspeed.zero.Init. No-op if not under ZeRO-3 or already activated."""
+    via deepspeed.zero.Init. No-op if not under ZeRO-3 or already activated
+    for this exact ds_config object."""
     if not _is_zero3(accelerator):
-        return
-    if _DSCHF_HOLDER:
         return
     from transformers.integrations import HfDeepSpeedConfig, is_deepspeed_zero3_enabled
     plugin = accelerator.state.deepspeed_plugin
     ds_config = plugin.deepspeed_config
-    _DSCHF_HOLDER.append(HfDeepSpeedConfig(ds_config))
+    cfg_key = id(ds_config)
+    if cfg_key in _DSCHF_HOLDER:
+        return
+    _DSCHF_HOLDER[cfg_key] = HfDeepSpeedConfig(ds_config)
     if not is_deepspeed_zero3_enabled():
         try:
             import deepspeed  # noqa: F401
@@ -310,6 +314,40 @@ def _shard_batches_per_rank(batches: list, accelerator) -> list:
     if np <= 1:
         return list(batches)
     return list(batches[pi::np])
+
+
+def _read_resume_token_counters(artifacts_dir: Path) -> dict[str, int]:
+    """Read cumulative token counters from the latest valid partial's metadata.
+
+    Returns dict with keys ``tokens_consumed``, ``tokens_with_grad``,
+    ``tokens_skipped_nan``, ``tokens_dropped_window`` (defaults to 0). Used
+    to seed counters on resume so the saved metadata reflects cumulative
+    totals across resume segments, not just the current run.
+    """
+    out = {
+        "tokens_consumed": 0,
+        "tokens_with_grad": 0,
+        "tokens_skipped_nan": 0,
+        "tokens_dropped_window": 0,
+    }
+    partial, _ = _load_latest_partial(artifacts_dir)
+    if partial is None:
+        return out
+    try:
+        meta = json.loads((partial / "compressed_metadata.json").read_text())
+        extra = meta.get("extra", {})
+        for k in out:
+            v = extra.get(k)
+            if isinstance(v, int) and v >= 0:
+                out[k] = v
+    except (OSError, json.JSONDecodeError, KeyError):
+        # Corrupt metadata: counters stay at 0; resume_step still advances
+        # because that came from the dir name. Saved totals will under-
+        # report — log so the operator notices.
+        log.warning("Could not read resume token counters from %s; "
+                    "starting at 0 — saved totals will under-report.",
+                    partial)
+    return out
 
 
 def run_distillation(
@@ -488,10 +526,17 @@ def run_distillation(
     #   tokens_dropped_window — micros in windows abandoned by the non-DS NaN
     #                           branch OR left over in a partial trailing window
     # Invariant: consumed = with_grad + skipped_nan + dropped_window
-    tokens_consumed = 0
-    tokens_with_grad = 0
-    tokens_skipped_nan = 0
-    tokens_dropped_window = 0
+    #
+    # Seed from the resume partial's metadata so saved totals are CUMULATIVE
+    # across resume segments, not per-segment.
+    _resume_counters = _read_resume_token_counters(artifacts_dir) if resume_step > 0 else {
+        "tokens_consumed": 0, "tokens_with_grad": 0,
+        "tokens_skipped_nan": 0, "tokens_dropped_window": 0,
+    }
+    tokens_consumed = _resume_counters["tokens_consumed"]
+    tokens_with_grad = _resume_counters["tokens_with_grad"]
+    tokens_skipped_nan = _resume_counters["tokens_skipped_nan"]
+    tokens_dropped_window = _resume_counters["tokens_dropped_window"]
     pending_window_tokens = 0  # credited to with_grad on commit, dropped on abandon
 
     # NaN escalation state (item 2). consecutive_nan_windows increments at the
@@ -567,7 +612,14 @@ def run_distillation(
             nan_in_current_window = True
 
             if is_ds:
-                loss = s_logits.detach().new_zeros(1, requires_grad=True).sum()
+                # Build a graph-connected zero loss so DS's micro-batch
+                # counter advances and backward touches the engine
+                # bookkeeping. ``s_logits * 0.0`` is NaN-on-NaN, so first
+                # nan_to_num the logits, then multiply by 0.0 — zero
+                # gradient, but the graph stays attached to student params.
+                cleaned = torch.nan_to_num(s_logits, nan=0.0,
+                                           posinf=0.0, neginf=0.0)
+                loss = (cleaned * 0.0).sum()
             else:
                 optim.zero_grad(set_to_none=True)
                 # Abandoned window: any prior committed-but-not-stepped micros

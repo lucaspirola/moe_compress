@@ -108,8 +108,11 @@ def main(argv: list[str] | None = None) -> int:
     # Fine-tune.
     _finetune_ce(teacher, tokenizer, config, artifacts_dir, accelerator)
 
-    # Save (gathered under ZeRO-3).
-    _save_bf16(teacher, tokenizer, out_dir, accelerator)
+    # Save (gathered under ZeRO-3). Pass the BF16 source name so _save_bf16
+    # can persist the *original* tokenizer (not the in-process-mutated one
+    # whose pad_token was synthesized).
+    _save_bf16(teacher, bf16_name, out_dir, accelerator,
+               tokenizer_revision=config["teacher"].get("revision", "main"))
 
     if accelerator.is_main_process:
         log.info("Teacher correction complete -> %s", out_dir)
@@ -182,6 +185,11 @@ def _load_bf16_teacher(name: str, config, accelerator):
     )
     tokenizer = AutoTokenizer.from_pretrained(name, revision=revision)
     if tokenizer.pad_token_id is None:
+        # NOTE: this mutation is in-process only. We deliberately do NOT
+        # save_pretrained the mutated tokenizer — _save_bf16 re-loads from
+        # ``name`` to persist the original tokenizer (without our pad-token
+        # synthesis), so downstream consumers don't inherit a synthesized
+        # pad_token == eos_token they didn't ask for.
         tokenizer.pad_token = tokenizer.eos_token
     return teacher, tokenizer
 
@@ -247,6 +255,19 @@ def _finetune_ce(teacher, tokenizer, config, artifacts_dir, accelerator):
     optim = build_optimizer(teacher, fake_dconf)
     teacher, optim = accelerator.prepare(teacher, optim)
     teacher.train()
+
+    # Assert no DeepSpeed scheduler is configured for this stage — the manual
+    # warmup below sets g["lr"] every step, and a DS scheduler would silently
+    # overwrite it on optim.step(). We expect ds_config to omit "scheduler".
+    if _is_deepspeed(accelerator):
+        ds_cfg = accelerator.state.deepspeed_plugin.deepspeed_config
+        if "scheduler" in ds_cfg:
+            raise RuntimeError(
+                "ds_config contains a 'scheduler' block, but "
+                "teacher_correction overwrites lr manually each step. "
+                "Either drop the DS scheduler or move LR scheduling fully "
+                "into DS. ds_config keys: " + ", ".join(sorted(ds_cfg.keys()))
+            )
 
     is_ds = _is_deepspeed(accelerator)
     grad_clip = float(config["distillation"]["grad_clip_norm"])
@@ -328,7 +349,8 @@ def _finetune_ce(teacher, tokenizer, config, artifacts_dir, accelerator):
         pass
 
 
-def _save_bf16(teacher, tokenizer, out_dir: Path, accelerator) -> None:
+def _save_bf16(teacher, bf16_name: str, out_dir: Path, accelerator,
+               *, tokenizer_revision: str = "main") -> None:
     """Save the corrected teacher as a standard transformers BF16 checkpoint.
 
     Under DS3 we use ``accelerator.get_state_dict`` (CPU-streamed gather on
@@ -360,7 +382,14 @@ def _save_bf16(teacher, tokenizer, out_dir: Path, accelerator) -> None:
         unwrapped.save_pretrained(
             tmp_dir, state_dict=state_dict, safe_serialization=True,
         )
-        tokenizer.save_pretrained(tmp_dir)
+        # Persist the *original* tokenizer from the Hub (not the in-process
+        # one whose pad_token may have been synthesized to eos_token in
+        # _load_bf16_teacher) so downstream consumers don't inherit a
+        # synthesized pad_token they didn't ask for.
+        from transformers import AutoTokenizer
+        AutoTokenizer.from_pretrained(
+            bf16_name, revision=tokenizer_revision,
+        ).save_pretrained(tmp_dir)
         # Sentinel written LAST — its presence in out_dir after rename
         # is the integrity proof used by the idempotency guard.
         (tmp_dir / "_SAVE_COMPLETE").write_text("{}")

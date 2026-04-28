@@ -138,6 +138,13 @@ def test_nan_diagnostic_dump_writes_expected_keys(tmp_path):
 
 def _mock_acc_with_gather(num_processes: int, gathered_flags: torch.Tensor,
                           is_main: bool = True) -> MagicMock:
+    """Build a stub Accelerator whose ``gather`` returns a fixed tensor.
+
+    Distributed gather is mocked — these tests exercise the post-gather
+    inspection logic in ``_all_finite`` (which ranks reported non-finite),
+    not the NCCL collective itself. Real distributed semantics are out of
+    scope for the unit suite.
+    """
     acc = MagicMock()
     acc.num_processes = num_processes
     acc.process_index = 0
