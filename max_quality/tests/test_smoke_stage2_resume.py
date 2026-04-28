@@ -91,11 +91,11 @@ def test_stage2_resume_skips_completed_layers(tiny_model, patched_stage2, tmp_pa
     original_profile = stage2_reap_ream._profile_layer
     call_count = [0]
 
-    def _crashing_profile(model, layer_ref, batches, reap_acc, cov_acc, *, device):
+    def _crashing_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, *, device):
         call_count[0] += 1
         if call_count[0] > 1:
             raise RuntimeError("simulated crash after layer 0")
-        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, device=device)
+        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, device=device)
 
     monkeypatch.setattr(stage2_reap_ream, "_profile_layer", _crashing_profile)
 
@@ -125,9 +125,9 @@ def test_stage2_resume_skips_completed_layers(tiny_model, patched_stage2, tmp_pa
     monkeypatch.setattr(stage2_reap_ream, "_profile_layer", original_profile)
     second_call_count = [0]
 
-    def _counting_profile(model, layer_ref, batches, reap_acc, cov_acc, *, device):
+    def _counting_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, *, device):
         second_call_count[0] += 1
-        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, device=device)
+        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, device=device)
 
     monkeypatch.setattr(stage2_reap_ream, "_profile_layer", _counting_profile)
 
@@ -178,11 +178,11 @@ def test_stage2_resume_produces_same_merge_map(tiny_model, patched_stage2, tmp_p
     original_profile = stage2_reap_ream._profile_layer
     call_count = [0]
 
-    def _crash_after_first(model, layer_ref, batches, reap_acc, cov_acc, *, device):
+    def _crash_after_first(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, *, device):
         call_count[0] += 1
         if call_count[0] > 1:
             raise RuntimeError("crash")
-        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, device=device)
+        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, device=device)
 
     monkeypatch.setattr(stage2_reap_ream, "_profile_layer", _crash_after_first)
     with pytest.raises(RuntimeError, match="crash"):
