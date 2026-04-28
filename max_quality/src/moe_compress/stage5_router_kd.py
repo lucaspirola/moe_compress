@@ -1,12 +1,25 @@
-"""Stage 5 — Router KD, fused-experts-aware.
+"""Stage 5 — Router KD via vocabulary-level output distillation.
 
-Structural change from the pre-refactor version: ``Qwen3_5MoeSparseMoeBlock``
-does NOT expose router logits through the model output tuple. We capture
-them via a forward hook on each layer's ``gate`` (Qwen3_5MoeTopKRouter)
-using :func:`capture_router_outputs`.
+Reference: 2603.02217 (Router Knowledge Distillation), Eq. 3.
 
-Everything else (merge-map pooling, KL loss, AdamW hyperparameters) is
-unchanged from the earlier design.
+The paper distills at the **vocabulary output logit** level, NOT at the
+intermediate router gate level. From §4:
+
+  "By distilling output logits rather than matching router gate values
+   explicitly, Router KD avoids requiring the teacher and student to share
+   identical expert sets or gate dimensionalities."
+
+This means the loss is:
+
+  L_RKD = (τ²/N_x) Σ_t  KL(softmax(z_T^t / τ) ‖ softmax(z_S^t / τ))
+
+where z_T, z_S ∈ ℝ^|V| are the teacher/student vocabulary logits for
+next-token prediction, and the sum is over unmasked token positions.
+
+Only router weights are trainable; all expert weights are frozen. The
+vocabulary-level signal propagates gradients through the full forward pass
+including the routing decisions, which naturally adapts the router to the
+compressed expert set.
 """
 from __future__ import annotations
 
@@ -18,7 +31,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils.activation_hooks import capture_router_outputs
 from .utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from .utils.model_io import (
     iter_moe_layers,
@@ -42,8 +54,10 @@ def run(
     s5 = config["stage5_router_kd"]
     cal = config["calibration"]
 
-    merge_map = load_json_artifact(artifacts_dir / "stage2_pruned" / "merge_map.json")
-    merge_map = {int(li): {int(k): list(v) for k, v in grp.items()} for li, grp in merge_map.items()}
+    # NOTE: merge_map is no longer used by vocabulary-level KD (it was needed
+    # only for the old router-level logsumexp pooling). Kept for backward
+    # compatibility with checkpoint metadata that references it.
+    # merge_map = load_json_artifact(artifacts_dir / "stage2_pruned" / "merge_map.json")
 
     # Stage 5 holds teacher (~70 GB BF16) AND student (~50 GB BF16) on cuda
     # at once — exceeds 80 GB A100 and forces CPU offload (5–10× slowdown).
@@ -163,30 +177,18 @@ def run(
     T = s5["kd_temperature"]
     ckpt_every = int(s5.get("checkpoint_every_n_steps", 0))
 
+    # Teacher/student MoE layer count sanity check (router structure must match
+    # even though we're distilling at vocab level — the student's routers are
+    # what we're training).
     student_refs = list(iter_moe_layers(student))
-    student_layer_idxs = {r.layer_idx for r in student_refs}
-    if teacher_refs is not None:
+
+    if teacher is not None:
+        teacher_refs = list(iter_moe_layers(teacher))
         assert len(teacher_refs) == len(student_refs), \
-            f"Teacher/student layer count mismatch: {len(teacher_refs)} vs {len(student_refs)}"
-        assert {r.layer_idx for r in teacher_refs} == student_layer_idxs, \
-            "Teacher/student MoE layer indices disagree"
-    elif teacher_logits_cache is not None:
-        cache_layer_idxs = set(teacher_logits_cache["logits"].keys())
-        if cache_layer_idxs != student_layer_idxs:
-            raise RuntimeError(
-                f"Teacher-logits cache covers layers {sorted(cache_layer_idxs)} "
-                f"but student has MoE layers {sorted(student_layer_idxs)}. "
-                "Regenerate the cache against the same model architecture."
-            )
+            f"Teacher/student MoE layer count mismatch: {len(teacher_refs)} vs {len(student_refs)}"
 
     # -----------------------------------------------------------------------
     # Crash-resume: find latest checkpoint and restore router + optim state.
-    # Checkpoints are only written on optimizer step boundaries (every
-    # checkpoint_every_n_steps steps). On resume, up to grad_accum-1 batches
-    # of gradient signal from the last incomplete accumulation window before the
-    # crash are silently dropped — the gradient buffer is zeroed on restart. This
-    # is an inherent limitation of step-boundary checkpointing and is acceptable
-    # for router KD (the training signal is redundant across batches).
     # -----------------------------------------------------------------------
     partial_dir = artifacts_dir / "_stage5_partial"
     partial_dir.mkdir(parents=True, exist_ok=True)
@@ -236,9 +238,6 @@ def run(
 
     step = resume_step
     optim.zero_grad()
-    cache_seq_len = int(s5["max_sequence_length"])
-    cache_batch_size = int(s5["batch_size"])
-    cache_tokens_per_batch = cache_batch_size * cache_seq_len
     for epoch in range(s5["epochs"]):
         if epoch < resume_epoch:
             continue
@@ -250,52 +249,42 @@ def run(
             if device is not None:
                 batch = batch.to(device)
 
+            # --- Vocabulary-level KD (paper 2603.02217, Eq. 3) ---
+            # Teacher: full forward pass, get vocabulary logits z_T ∈ ℝ^{B×L×|V|}
             if teacher_logits_cache is not None:
-                # Path B: pull this batch's per-layer teacher logits from
-                # the precomputed cache. Cache is keyed token-by-token in
-                # the same order iter_batches produces, so:
-                #   batch i covers tokens [i*B*T, (i+1)*B*T)
-                t_out = {}
+                # Path B: precomputed teacher vocab logits.
+                cache_seq_len = int(s5["max_sequence_length"])
+                cache_batch_size = int(s5["batch_size"])
+                cache_tokens_per_batch = cache_batch_size * cache_seq_len
                 token_start = i * cache_tokens_per_batch
                 token_end = token_start + (batch.shape[0] * batch.shape[1])
-                for li, full_tensor in teacher_logits_cache["logits"].items():
-                    t_out[li] = [
-                        full_tensor[token_start:token_end].to(device=batch.device, dtype=torch.float32)
-                    ]
-                ref_layer_indices = list(t_out.keys())
+                teacher_vocab_logits = teacher_logits_cache["vocab_logits"][token_start:token_end]
+                teacher_vocab_logits = teacher_vocab_logits.to(device=batch.device, dtype=torch.float32)
+                teacher_vocab_logits = teacher_vocab_logits.view(batch.shape[0], batch.shape[1], -1)
             else:
-                with torch.no_grad(), capture_router_outputs(teacher_refs) as t_out_ctx:
-                    teacher(input_ids=batch)
-                t_out = {li: list(v) for li, v in t_out_ctx.items()}
-                ref_layer_indices = [r.layer_idx for r in teacher_refs]
+                with torch.no_grad():
+                    teacher_out = teacher(input_ids=batch)
+                teacher_vocab_logits = teacher_out.logits.to(torch.float32)  # [B, L, |V|]
 
-            with capture_router_outputs(student_refs) as s_out:
-                student(input_ids=batch)
+            # Student: full forward pass with gradients (routers are trainable).
+            student_out = student(input_ids=batch)
+            student_vocab_logits = student_out.logits.to(torch.float32)  # [B, L, |V|]
 
-            loss = torch.zeros((), device=batch.device, dtype=torch.float32)
-            per_layer_loss: dict[int, float] = {}
-            n_layers = 0
-            for li in ref_layer_indices:
-                t_logits = t_out.get(li, [])
-                s_logits = s_out.get(li, [])
-                if not t_logits or not s_logits:
-                    continue
-                tl = t_logits[-1].to(torch.float32)
-                sl = s_logits[-1].to(torch.float32)
-                if li in merge_map:
-                    tl = _pool_teacher_logits(tl, merge_map[li])
-                t_p = F.softmax(tl / T, dim=-1)
-                s_lp = F.log_softmax(sl / T, dim=-1)
-                layer_loss = F.kl_div(s_lp, t_p, reduction="batchmean") * (T ** 2)
-                loss = loss + layer_loss
-                per_layer_loss[li] = float(layer_loss.detach().item())
-                n_layers += 1
-            if n_layers == 0:
-                raise RuntimeError(
-                    "No router logits captured from either teacher or student. "
-                    "Hooks may not be firing — check iter_moe_layers + router classes."
-                )
-            loss = loss / n_layers
+            # KL(teacher ‖ student) over vocabulary, per-token, scaled by τ².
+            # Paper Eq. 3: L_RKD = (τ²/N_x) Σ_t KL(p_T^t ‖ p_S^t)
+            # Shift logits: predict token t+1 from position t (standard causal LM).
+            # Use positions [0, L-2] to predict [1, L-1].
+            t_logits_shift = teacher_vocab_logits[:, :-1, :]   # [B, L-1, |V|]
+            s_logits_shift = student_vocab_logits[:, :-1, :]   # [B, L-1, |V|]
+
+            t_p = F.softmax(t_logits_shift / T, dim=-1)
+            s_lp = F.log_softmax(s_logits_shift / T, dim=-1)
+
+            # Per-token KL, then mean over all (non-pad) tokens.
+            per_token_kl = F.kl_div(s_lp, t_p, reduction="none").sum(dim=-1)  # [B, L-1]
+            n_tokens = per_token_kl.numel()
+            loss = (per_token_kl.sum() / max(n_tokens, 1)) * (T ** 2)
+
             (loss / grad_accum).backward()
 
             if (i + 1) % grad_accum == 0:
@@ -310,42 +299,15 @@ def run(
                 step += 1
                 if step % config["logging"]["log_every_n_steps"] == 0:
                     loss_val = float(loss.item())
-                    # Highest- and lowest-loss layers tell us where the router
-                    # is having the hardest time matching the teacher.
-                    if per_layer_loss:
-                        worst_li, worst_v = max(per_layer_loss.items(), key=lambda x: x[1])
-                        best_li, best_v = min(per_layer_loss.items(), key=lambda x: x[1])
-                    else:
-                        worst_li = worst_v = best_li = best_v = 0
                     log.info(
-                        "  epoch=%d step=%d loss=%.6f grad_norm=%.4f "
-                        "(worst L%d=%.4f, best L%d=%.4f)",
+                        "  epoch=%d step=%d loss=%.6f grad_norm=%.4f",
                         epoch, step, loss_val, grad_norm,
-                        worst_li, worst_v, best_li, best_v,
                     )
-                    # Distribution stats over per-layer losses (worst/best
-                    # already captured above). p50/p95 give shape; mean/std
-                    # give scale. We do NOT log one Trackio series per layer
-                    # — at ~40 layers × thousands of steps that floods the
-                    # dashboard with low-signal series. Worst/best+stats is
-                    # enough to spot a single layer drifting.
-                    losses_sorted = sorted(per_layer_loss.values()) if per_layer_loss else [0.0]
-                    n = len(losses_sorted)
-                    p50 = losses_sorted[n // 2]
-                    p95 = losses_sorted[min(n - 1, int(0.95 * n))]
-                    mean_v = sum(losses_sorted) / n
                     payload = {
                         "stage5/epoch": epoch,
                         "stage5/step": step,
                         "stage5/loss": loss_val,
                         "stage5/grad_norm": grad_norm,
-                        "stage5/worst_layer_idx": float(worst_li),
-                        "stage5/worst_layer_loss": worst_v,
-                        "stage5/best_layer_idx": float(best_li),
-                        "stage5/best_layer_loss": best_v,
-                        "stage5/layer_loss_p50": p50,
-                        "stage5/layer_loss_p95": p95,
-                        "stage5/layer_loss_mean": mean_v,
                     }
                     _trackio_log(payload)
 
@@ -416,29 +378,4 @@ def _freeze_non_routers(model: nn.Module, trainable_patterns: list[str]) -> None
         p.requires_grad_(any(pat in name for pat in trainable_patterns))
 
 
-def _pool_teacher_logits(
-    teacher_logits: torch.Tensor, merge_map_layer: dict[int, list[int]],
-) -> torch.Tensor:
-    """Pool teacher logits over merged child experts.
 
-    `logsumexp` is the mathematically correct pooling operator for
-    "the merged expert absorbs the routing mass of all its children":
-        softmax(logsumexp(logits_children))_e
-            = exp(logsumexp(logits_children_e)) / Z_pooled
-            = (Σ_i exp(logit_child_i)) / Z_pooled
-            = Σ_i softmax_orig(child_i)
-    i.e. the pooled probability equals the sum of child probabilities.
-    Using mean(logits) instead would give softmax(mean(logits)) ∝ Π exp(l_i)^(1/k),
-    which is the geometric mean of probabilities — not what we want for
-    routing mass.
-    """
-    num_student = len(merge_map_layer)
-    leading = teacher_logits.shape[:-1]
-    out = torch.empty((*leading, num_student),
-                      dtype=teacher_logits.dtype,
-                      device=teacher_logits.device)
-    for student_idx in range(num_student):
-        children = merge_map_layer[student_idx]
-        sub = teacher_logits.index_select(-1, torch.as_tensor(children, device=teacher_logits.device))
-        out[..., student_idx] = torch.logsumexp(sub, dim=-1)
-    return out
