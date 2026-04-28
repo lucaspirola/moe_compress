@@ -121,10 +121,9 @@ def run(
 
     if teacher_logits_cache is None:
         load_in_4bit = bool(s5.get("teacher_load_in_4bit", False))
-        # If the global model load_in_4bit is on (Stages 0-2 used 4-bit on
-        # smaller hardware) but Stage 5 explicitly didn't opt into 4-bit
-        # for the teacher, the user is about to load a BF16 35 B teacher
-        # alongside the student → almost certainly OOM. Warn loudly.
+        # If model.load_in_4bit is on but Stage 5 didn't opt in for the
+        # teacher, warn: the BF16 teacher (~70 GB) + student (~50 GB) will
+        # OOM the A100.
         if config["model"].get("load_in_4bit", False) and not load_in_4bit:
             log.warning(
                 "Stage 5: config['model']['load_in_4bit']=true but "
@@ -132,16 +131,15 @@ def run(
                 "will load in BF16 (~70 GB) and likely OOM the A100. "
                 "Set teacher_load_in_4bit: true to match."
             )
-        # When 4-bit, force device_map={"": 0} so the entire quantized teacher
-        # lands on the same GPU as the student. bnb's NF4 packs Qwen3.6-35B
-        # into ~17 GB → fits comfortably alongside the ~50 GB student.
+        # When teacher_load_in_4bit, force device_map={"": 0} so the entire
+        # NF4-quantized teacher lands on the same GPU as the student. This is
+        # a VRAM optimization for Stage 5 only — the pipeline model (student)
+        # is always BF16; the teacher is quantized only to fit alongside it.
         device_map = {"": 0} if load_in_4bit else config["model"]["device_map"]
-        log.info("Loading teacher for router KD: %s (load_in_4bit=%s, device_map=%s)",
+        log.info("Loading teacher for KD: %s (teacher_load_in_4bit=%s, device_map=%s)",
                  config["model"]["name_or_path"], load_in_4bit, device_map)
-        # Decouple Stage 5's teacher 4-bit decision from the global
-        # config["model"]["load_in_4bit"]. The global flag is meant for
-        # initial-model loads (Stages 0-2); Stage 5 should make its own
-        # explicit decision.
+        # Stage 5's teacher quantization is independent of the global
+        # config["model"]["load_in_4bit"] (which is for local smoke tests).
         teacher, _ = load_model(
             config["model"]["name_or_path"],
             revision=config["model"]["revision"],
