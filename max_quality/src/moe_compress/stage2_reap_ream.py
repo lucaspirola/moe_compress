@@ -39,7 +39,9 @@ from .utils.activation_hooks import (
     InputCovarianceAccumulator,
     ReamCostAccumulator,
     ReapAccumulator,
+    _EarlyExitException,
     capture_router_outputs,
+    early_exit_after_layer,
     instrument_experts,
     record_reap,
     run_calibration,
@@ -394,6 +396,19 @@ def _profile_layer(
     *,
     device=None,
 ) -> None:
+    """Profile a single MoE layer with early-exit forward.
+
+    REAM sequential merging (paper 2604.04356, §4, Fig 1(b)) requires
+    that each layer is profiled on hidden states reflecting all prior
+    merges.  All metrics (REAP scores, REAM δ_gate/δ̃_expert, input
+    covariance) depend only on hidden states arriving *at* this layer,
+    not on downstream layers.  We therefore abort the forward pass
+    immediately after this layer completes via :func:`early_exit_after_layer`,
+    avoiding O(40−L) unnecessary layer-forwards per batch.
+
+    Total layer-forwards across 40 sequential profiling passes:
+    1+2+…+40 = 820 (vs 40×40 = 1600 without early exit).
+    """
     layer_idx = layer_ref.layer_idx
     n_experts = layer_ref.num_routed_experts
     model.eval()
@@ -417,14 +432,18 @@ def _profile_layer(
     with instrument_experts(
         layer_ref,
         {"input": input_cb, "intermediate": intermediate_cb, "down": down_cb},
-    ), capture_router_outputs([layer_ref]) as router_logits_storage:
+    ), capture_router_outputs([layer_ref]) as router_logits_storage, \
+         early_exit_after_layer(model, layer_idx):
         for batch_idx, batch in enumerate(batches):
             if device is not None:
                 batch = batch.to(device)
             _batch_offset[0] = batch_idx * batch.shape[0] * batch.shape[1]
             router_logits_storage[layer_idx].clear()
             with torch.no_grad():
-                model(input_ids=batch)
+                try:
+                    model(input_ids=batch)
+                except _EarlyExitException:
+                    pass  # expected — target layer completed
             if router_logits_storage[layer_idx]:
                 batch_logits = router_logits_storage[layer_idx][-1]
                 ream_acc.record_router_logits(layer_idx, batch_logits, _batch_offset[0])

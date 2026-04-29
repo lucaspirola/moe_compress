@@ -724,6 +724,135 @@ def run_calibration(
 
 
 # ---------------------------------------------------------------------------
+# Early-exit calibration (REAM sequential merging — skip layers after target)
+# ---------------------------------------------------------------------------
+
+
+class _EarlyExitException(Exception):
+    """Sentinel raised by a forward hook to abort the forward pass early.
+
+    Used by :func:`run_calibration_early_exit` to avoid executing decoder
+    layers after the target layer.  The forward runs under ``torch.no_grad()``
+    so no autograd graph is corrupted.
+    """
+    pass
+
+
+@contextlib.contextmanager
+def early_exit_after_layer(model: nn.Module, target_layer_idx: int):
+    """Context manager that installs a forward hook on the decoder layer
+    *after* ``target_layer_idx`` that raises :class:`_EarlyExitException`,
+    aborting the forward pass once the target layer has fully executed.
+
+    For the last MoE layer there is no next layer to hook — we hook the
+    text tower's post-layers module (norm / final_layernorm) if it exists,
+    otherwise we let the full forward run (no savings, but correct).
+
+    Usage::
+
+        with early_exit_after_layer(model, target_layer_idx=5):
+            try:
+                model(input_ids=batch)
+            except _EarlyExitException:
+                pass  # expected — layer 5 completed, layers 6+ skipped
+    """
+    tower = _find_text_tower(model)
+    layers = tower.layers
+    hook_target = None
+    if target_layer_idx + 1 < len(layers):
+        hook_target = layers[target_layer_idx + 1]
+    else:
+        # Last layer — try hooking the post-layers norm to avoid the lm_head.
+        for attr in ("norm", "final_layernorm", "ln_f"):
+            candidate = getattr(tower, attr, None)
+            if isinstance(candidate, nn.Module):
+                hook_target = candidate
+                break
+
+    if hook_target is None:
+        # No layer after target — full forward, no savings.
+        yield
+        return
+
+    def _exit_hook(_module, _input):
+        raise _EarlyExitException()
+
+    handle = hook_target.register_forward_pre_hook(_exit_hook)
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
+def _find_text_tower(model: nn.Module) -> nn.Module:
+    """Locate the decoder tower that owns ``.layers``.
+
+    Duplicated from model_io to avoid a circular import; the canonical
+    version lives in :mod:`moe_compress.utils.model_io`.
+    """
+    candidates: list[nn.Module] = [model]
+    for attr in ("model", "language_model", "text_model"):
+        sub = getattr(model, attr, None)
+        if sub is not None:
+            candidates.append(sub)
+    if hasattr(model, "model"):
+        for attr in ("language_model", "text_model", "decoder"):
+            sub = getattr(model.model, attr, None)
+            if sub is not None:
+                candidates.append(sub)
+    seen: set[int] = set()
+    for c in candidates:
+        if id(c) in seen:
+            continue
+        seen.add(id(c))
+        layer_list = getattr(c, "layers", None)
+        if isinstance(layer_list, (nn.ModuleList, list)) and len(layer_list) > 0:
+            return c
+    raise RuntimeError("Could not locate decoder tower with .layers attribute")
+
+
+def run_calibration_early_exit(
+    model: nn.Module,
+    batches,
+    target_layer_idx: int,
+    *,
+    device=None,
+    extra_forward_kwargs: dict | None = None,
+    per_batch_callback: Callable[[int], None] | None = None,
+    log_every: int = 64,
+) -> None:
+    """Like :func:`run_calibration` but aborts the forward pass after
+    ``target_layer_idx`` completes.  Layers after the target are never
+    executed, giving a ~2× wall-clock speedup for REAM's sequential
+    per-layer profiling (paper 2604.04356 §4, Fig 1(b)).
+
+    All metrics collected for the target layer (REAP scores, REAM cost,
+    input covariance) depend only on hidden states arriving *at* that
+    layer, not on downstream layers.  The early exit is therefore
+    mathematically identical to a full forward.
+    """
+    model.eval()
+    n_total = len(batches) if hasattr(batches, "__len__") else None
+    with torch.no_grad(), early_exit_after_layer(model, target_layer_idx) as _:
+        for i, batch in enumerate(batches):
+            if device is not None:
+                batch = batch.to(device)
+            try:
+                model(input_ids=batch, **(extra_forward_kwargs or {}))
+            except _EarlyExitException:
+                pass  # expected — target layer completed, downstream skipped
+            if per_batch_callback is not None:
+                per_batch_callback(i)
+            if log_every > 0 and (i + 1) % log_every == 0:
+                if n_total is not None:
+                    log.info("calibration forward (early-exit@L%d) %d/%d",
+                             target_layer_idx, i + 1, n_total)
+                else:
+                    log.info("calibration forward (early-exit@L%d) %d",
+                             target_layer_idx, i + 1)
+
+
+# ---------------------------------------------------------------------------
 # Router-output hook (Stage 5 uses this instead of the fused-experts shim)
 # ---------------------------------------------------------------------------
 

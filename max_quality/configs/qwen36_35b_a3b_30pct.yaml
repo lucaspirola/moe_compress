@@ -142,9 +142,9 @@ stage5_router_kd:
   teacher_load_in_4bit: false
   max_sequence_length: 512
   kd_temperature: 1.0
-  kd_seq_chunk_size: 128            # sequence-dim chunk size for vocab KL computation;
-                                    # bounds peak intermediate memory at B×chunk×|V|×4 bytes.
-                                    # At chunk=128 with |V|≈150K and B=8: ~600 MB vs ~2.5 GB unchunked.
+  kd_seq_chunk_size: 512            # H200: full sequence in one chunk (~2.4 GB peak at B=8, |V|≈150K).
+                                    # Eliminates chunk-boundary Python loop overhead.
+                                    # On smaller VRAM (A100): set to 128 to bound peak at ~600 MB.
   max_calibration_samples: 3000
   checkpoint_every_n_steps: 100    # save router+optim state every N optimizer steps for crash-resume
   # Only router weights update. Enumerated paths are matched as substrings.
@@ -159,6 +159,9 @@ stage5_router_kd:
     - embed
     - lm_head
   enable_output_router_logits: true   # flipped on for teacher+student during KD
+  torch_compile: true                 # torch.compile on teacher+student for 20-40% forward speedup.
+                                      # H200 Hopper architecture. Set false for debugging or
+                                      # hardware without compile support.
 
 stage6_validate:
   wikitext2:
