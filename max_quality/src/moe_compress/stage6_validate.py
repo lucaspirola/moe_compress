@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import sys
 from pathlib import Path
 
 import torch
@@ -43,18 +45,20 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     model.eval()   # stage5 leaves model in train(); set eval before any sub-metric
     results: dict = {"student": {}, "teacher": {}, "delta": {}, "thresholds": {}}
 
+    calib_texts: list[str] = []  # accumulates eval text for imatrix calibration
+
     # 1. WikiText-2 PPL on student
     if s6["wikitext2"]["enabled"]:
         log.info("Stage 6: WikiText-2 PPL (student)")
         results["student"]["wikitext2_ppl"] = _wikitext2_ppl(
-            model, tokenizer, s6["wikitext2"], device=device,
+            model, tokenizer, s6["wikitext2"], device=device, collect=calib_texts,
         )
 
     # 2. Zero-shot via lm-eval (ARC-C + HellaSwag)
     if s6["zero_shot"]["enabled"]:
         log.info("Stage 6: zero-shot harness")
         results["student"].update(
-            _lm_eval_tasks(model, tokenizer, s6["zero_shot"]["tasks"])
+            _lm_eval_tasks(model, tokenizer, s6["zero_shot"]["tasks"], collect=calib_texts)
         )
 
     # 3. Generative — HumanEval + MATH-500
@@ -62,11 +66,11 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
         log.info("Stage 6: generative (HumanEval + MATH-500)")
         if "humaneval" in s6["generative"]:
             results["student"]["humaneval_pass_at_1"] = _humaneval(
-                model, tokenizer, s6["generative"]["humaneval"], device=device,
+                model, tokenizer, s6["generative"]["humaneval"], device=device, collect=calib_texts,
             )
         if "math500" in s6["generative"]:
             results["student"]["math500_accuracy"] = _math500(
-                model, tokenizer, s6["generative"]["math500"], device=device,
+                model, tokenizer, s6["generative"]["math500"], device=device, collect=calib_texts,
             )
 
     # 4. Snapshot student param counts BEFORE loading teacher — once teacher
@@ -126,6 +130,19 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     path = artifacts_dir / "stage6_eval.json"
     save_json_artifact(results, path)
 
+    # Free teacher GPU memory before llama-imatrix subprocess uses the GPU.
+    # On A100 the teacher (~70 GB BF16) must be evicted before the F16 GGUF
+    # (~35 GB) can be loaded by llama-imatrix; on H200 it's optional but tidy.
+    try:
+        teacher.to("cpu")
+        del teacher
+    except Exception:  # noqa: BLE001
+        pass
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    _generate_imatrix(calib_texts, s6.get("imatrix", {}), artifacts_dir)
+
     overall_pass = all(results["thresholds"].values())
     log.info("Stage 6 complete — thresholds %s; detail → %s",
              "PASS" if overall_pass else "FAIL", path)
@@ -171,7 +188,7 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
 # ---------------------------------------------------------------------------
 
 
-def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None) -> float:
+def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None) -> float:
     from datasets import load_dataset
 
     ds = load_dataset(cfg["dataset"], cfg["subset"], split=cfg["split"])
@@ -182,6 +199,8 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None) -> float:
         text = row.get("text", "")
         if not text.strip():
             continue
+        if collect is not None:
+            collect.append(text)
         ids = tokenizer(text, add_special_tokens=False)["input_ids"]
         all_ids.extend(ids)
         all_ids.append(eos)
@@ -219,7 +238,7 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _lm_eval_tasks(model, tokenizer, tasks: list[str]) -> dict:
+def _lm_eval_tasks(model, tokenizer, tasks: list[str], *, collect=None) -> dict:
     """Delegate to lm-eval's simple_evaluate. If lm-eval isn't installed or
     the HF-LM wrapper doesn't handle this architecture, log and return {}."""
     try:
@@ -231,13 +250,28 @@ def _lm_eval_tasks(model, tokenizer, tasks: list[str]) -> dict:
 
     try:
         lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=1)
-        out = simple_evaluate(model=lm, tasks=list(tasks), num_fewshot=0)
+        out = simple_evaluate(
+            model=lm, tasks=list(tasks), num_fewshot=0,
+            log_samples=(collect is not None),
+        )
         results = out.get("results", {})
         flat: dict = {}
         for task, metrics in results.items():
             acc = metrics.get("acc,none") or metrics.get("acc") or metrics.get("acc_norm,none")
             if acc is not None:
                 flat[f"{task}_acc"] = float(acc)
+        if collect is not None and "samples" in out:
+            for task_samples in out["samples"].values():
+                seen: set[str] = set()
+                for s in task_samples:
+                    try:
+                        args = s.get("arguments", ())
+                        ctx = args[0] if args else None
+                        if ctx and isinstance(ctx, str) and ctx not in seen:
+                            seen.add(ctx)
+                            collect.append(ctx)
+                    except (KeyError, IndexError, TypeError):
+                        pass
         return flat
     except Exception as err:           # noqa: BLE001
         log.warning("lm-eval evaluation failed: %s", err)
@@ -249,7 +283,7 @@ def _lm_eval_tasks(model, tokenizer, tasks: list[str]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _humaneval(model, tokenizer, cfg: dict, *, device=None) -> float:
+def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None) -> float:
     try:
         from datasets import load_dataset
     except Exception as err:           # noqa: BLE001
@@ -268,6 +302,8 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None) -> float:
     log.info("Stage 6 HumanEval: %d problems", len(ds))
     for i, row in enumerate(ds):
         prompt = row["prompt"]
+        if collect is not None:
+            collect.append(prompt)
         completion = _generate(model, tokenizer, prompt, max_new=max_new, device=device)
         if _check_humaneval(prompt, completion, row["test"], row["entry_point"]):
             passes += 1
@@ -277,7 +313,7 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None) -> float:
     return passes / max(total, 1)
 
 
-def _math500(model, tokenizer, cfg: dict, *, device=None) -> float:
+def _math500(model, tokenizer, cfg: dict, *, device=None, collect=None) -> float:
     try:
         from datasets import load_dataset
     except Exception as err:           # noqa: BLE001
@@ -298,6 +334,8 @@ def _math500(model, tokenizer, cfg: dict, *, device=None) -> float:
     log.info("Stage 6 MATH-500: %d problems", n_total)
     for i, row in enumerate(ds.select(range(n_total))):
         prompt = f"Problem: {row['problem']}\nAnswer:"
+        if collect is not None:
+            collect.append(prompt)
         completion = _generate(model, tokenizer, prompt, max_new=max_new, device=device)
         if _check_math(completion, row.get("answer", "")):
             correct += 1
@@ -429,6 +467,112 @@ def _measured_reduction(
         "expert_teacher": t_expert,
         "expert_reduction_ratio": 1.0 - (s_expert / max(t_expert, 1)),
     }
+
+
+# ---------------------------------------------------------------------------
+# imatrix calibration + GGUF conversion
+# ---------------------------------------------------------------------------
+
+
+def _generate_imatrix(texts: list[str], icfg: dict, artifacts_dir: Path) -> None:
+    """Write multi-domain calibration text, convert model to F16 GGUF, run llama-imatrix."""
+    import shutil
+    import subprocess
+
+    if not icfg.get("enabled", True):
+        log.info("imatrix: disabled via config.")
+        return
+
+    # 1. Write calibration file — always, even if llama.cpp is absent (manual fallback).
+    calib_path = artifacts_dir / "calibration_imatrix.txt"
+    joined = "\n\n".join(t.strip() for t in texts if t and t.strip())
+    calib_path.write_text(joined, encoding="utf-8")
+    log.info("imatrix: calibration file written (%d docs, %d chars) → %s",
+             len(texts), len(joined), calib_path)
+
+    # 2. Locate llama.cpp.
+    llama_cpp_dir = _find_llama_cpp_dir(icfg.get("llama_cpp_dir"))
+    if llama_cpp_dir is None:
+        log.warning(
+            "imatrix: llama.cpp not found. Set LLAMA_CPP_DIR env var or build it "
+            "in the job entrypoint. Calibration text preserved at %s.", calib_path,
+        )
+        return
+
+    imatrix_bin = llama_cpp_dir / "build" / "bin" / "llama-imatrix"
+    convert_py  = llama_cpp_dir / "convert_hf_to_gguf.py"
+    if not imatrix_bin.exists() or not convert_py.exists():
+        log.warning("imatrix: binaries missing under %s; skipping.", llama_cpp_dir)
+        return
+
+    # 3. Locate the stage5_final HF model directory for GGUF conversion.
+    model_dir = artifacts_dir / "stage5_final"
+    if not model_dir.exists():
+        log.warning("imatrix: stage5_final not found at %s; skipping.", model_dir)
+        return
+
+    # 4. Disk-space guard — F16 GGUF of the compressed student is ~35 GB.
+    free_gb = shutil.disk_usage(artifacts_dir).free / 1e9
+    if free_gb < 40:
+        log.warning("imatrix: only %.1f GB free at %s; skipping GGUF conversion.", free_gb, artifacts_dir)
+        return
+
+    # 5. Convert HF model → F16 GGUF.
+    f16_path = artifacts_dir / "model_f16.gguf"
+    env = {
+        **os.environ,
+        "LD_LIBRARY_PATH": str(llama_cpp_dir / "build" / "bin") + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
+    }
+    log.info("imatrix: converting %s → F16 GGUF", model_dir)
+    try:
+        subprocess.run(
+            [sys.executable, str(convert_py), str(model_dir),
+             "--outtype", "f16", "--outfile", str(f16_path)],
+            check=True, timeout=3600,
+        )
+        log.info("imatrix: GGUF ready (%.1f GB)", f16_path.stat().st_size / 1e9)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("imatrix: GGUF conversion failed (%s); skipping.", exc)
+        return
+
+    # 6. Run llama-imatrix.
+    imatrix_out = artifacts_dir / "imatrix.gguf"
+    ngl = int(icfg.get("ngl", 99))
+    ctx = int(icfg.get("ctx_size", 2048))
+    log.info("imatrix: running llama-imatrix (ngl=%d, ctx=%d) → %s", ngl, ctx, imatrix_out)
+    try:
+        subprocess.run(
+            [str(imatrix_bin),
+             "-m", str(f16_path), "-f", str(calib_path),
+             "-o", str(imatrix_out), "--output-format", "gguf",
+             "--no-ppl", "-ngl", str(ngl), "-c", str(ctx)],
+            env=env, check=True, timeout=7200,
+        )
+        log.info("imatrix: saved (%.1f MB)", imatrix_out.stat().st_size / 1e6)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("imatrix: llama-imatrix failed (%s). Calibration text at %s.", exc, calib_path)
+
+
+def _find_llama_cpp_dir(override: str | None = None) -> Path | None:
+    """Return the llama.cpp root containing build/bin/llama-imatrix, or None."""
+    import shutil
+
+    candidates: list[Path] = []
+    if override:
+        candidates.append(Path(override))
+    env_dir = os.environ.get("LLAMA_CPP_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+    on_path = shutil.which("llama-imatrix")
+    if on_path:
+        # .../build/bin/llama-imatrix → root is 3 levels up
+        candidates.append(Path(on_path).parent.parent.parent)
+    candidates.append(Path("/home/lucas/ai/tools/llama.cpp"))  # local dev fallback
+
+    for p in candidates:
+        if (p / "build" / "bin" / "llama-imatrix").exists() and (p / "convert_hf_to_gguf.py").exists():
+            return p
+    return None
 
 
 def _check_thresholds(results: dict, thresholds: dict) -> dict[str, bool]:

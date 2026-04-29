@@ -6,8 +6,8 @@ At this point each MoE layer still has a fused ``Qwen3_5MoeExperts`` but with
 1. Compute per-group statistics (D-Rank) over banks.
 2. Choose per-group uniform rank ``k_g`` via D-Rank allocation targeting
    the global ``T_budget`` derived from ``decomposition.svd_rank_ratio``.
-3. Swift-SVD+ α selection per matrix type (placeholder α=0.5 by default;
-   the grid-search harness is wired but gated by config).
+3. Swift-SVD+ α grid search per projection type (α ∈ {0.0, ..., 1.0},
+   minimising total tail spectral energy; enabled via config alpha_grid).
 4. For each layer, **factor every expert at the chosen group rank**
    via AA-SVD using the Stage-2 covariance and a fresh pruned-model
    calibration. Install a :class:`FactoredExperts` in place of the fused module.

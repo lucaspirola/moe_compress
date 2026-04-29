@@ -169,6 +169,16 @@ def _main() -> int:
                         exc)
             metrics = None
 
+        # Build llama.cpp in the background while stages 1-5 run — it will be
+        # ready long before Stage 6 needs it, without blocking the pipeline start.
+        import threading
+        threading.Thread(
+            target=_install_llama_cpp,
+            args=(CACHE_MOUNT / "llama.cpp",),
+            daemon=True,
+            name="llama-cpp-build",
+        ).start()
+
         # Import after sys.path manipulation.
         from moe_compress.run_pipeline import main as run_pipeline_main
         argv = [
@@ -315,6 +325,44 @@ def _restore_prior_checkpoint(repo_id: str, artifacts_dir: Path, resume_from: in
             LOG.info("Hoisted sidecar %s → %s", p.name, target)
 
 
+def _install_llama_cpp(dest: Path) -> None:
+    """Shallow-clone and CUDA-build llama.cpp, then export LLAMA_CPP_DIR.
+
+    Idempotent: skips the build if the llama-imatrix binary already exists
+    (e.g. the bucket cache still has the build from a prior job run).
+    """
+    imatrix_bin = dest / "build" / "bin" / "llama-imatrix"
+    if imatrix_bin.exists():
+        LOG.info("llama.cpp already built at %s — skipping.", dest)
+        os.environ["LLAMA_CPP_DIR"] = str(dest)
+        return
+
+    LOG.info("Building llama.cpp with CUDA at %s", dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1",
+             "https://github.com/ggerganov/llama.cpp", str(dest)],
+            check=True, timeout=300,
+        )
+        build_dir = dest / "build"
+        subprocess.run(
+            ["cmake", "-B", str(build_dir), str(dest),
+             "-DGGML_CUDA=ON", "-DCMAKE_BUILD_TYPE=Release"],
+            check=True, timeout=120,
+        )
+        subprocess.run(
+            ["cmake", "--build", str(build_dir), "--config", "Release",
+             f"-j{os.cpu_count() or 4}",
+             "--target", "llama-imatrix", "llama-quantize"],
+            check=True, timeout=1800,
+        )
+        os.environ["LLAMA_CPP_DIR"] = str(dest)
+        LOG.info("llama.cpp build complete → %s", imatrix_bin)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("llama.cpp build failed (%s) — Stage 6 imatrix will be skipped.", exc)
+
+
 def _download_code(repo_id: str, dest: Path) -> None:
     """Clone-equivalent: fresh snapshot every job start so we don't run stale code."""
     from huggingface_hub import snapshot_download
@@ -447,6 +495,8 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
         "stage6_eval.json",
         "_stage2_input_covariance.pt",   # needed for Stage 3 AA-SVD on resume
         "_stage3_original_weights.pt",   # needed for Stage 4 EoRA residuals on resume
+        "calibration_imatrix.txt",       # multi-domain imatrix calibration text (Stage 6)
+        "imatrix.gguf",                  # importance matrix for GGUF quantization (Stage 6)
     ]
     aux_stage = artifacts_dir / "_aux_stage"
     if aux_stage.exists():
