@@ -523,7 +523,7 @@ where `z_T, z_S ∈ ℝ^{|V|}` are teacher/student vocabulary logits, `m_{t+1} �
 | Parameter | Value | Source |
 |-----------|-------|--------|
 | Optimizer | AdamW | Paper |
-| Learning rate | **5×10⁻⁵** | Paper Table 1 (corrected from original 1e-5) |
+| Learning rate | **5×10⁻⁵** | Paper Table 1 (implementation previously used 1e-5; corrected to match paper) |
 | Epochs | 1 | Paper |
 | Batch size | 4 | Adapted (paper: 2) |
 | Gradient accumulation | 2 | Adapted (paper: 4) |
@@ -625,16 +625,18 @@ Each heavy stage (2–5) uploads its checkpoint to a per-stage Hub repo immediat
 
 | Stage | Deviation | Paper Says | Implementation Does | Justification |
 |-------|-----------|-----------|-------------------|---------------|
-| 0 | Detection threshold | 2507.23279 Eq. 6: global P_{99.5} AND 0.1·a_max AND l∈L — all three required | Per-layer z-score (mean + 2.5σ); no global statistics; no early-layer restriction | Avoids two-pass global stat collection; per-layer z-score is conservative in practice |
+| 0 | Detection threshold | 2507.23279 Eq. 6 + Algorithm 1: two-stage process — first detect MA-formation layers L, then global P_{99.5} AND 0.1·a_max AND l∈L — all three required | Per-layer z-score (mean + 2.5σ); no global statistics; no MA-formation layer pre-filtering; all 40 MoE layers profiled | Avoids two-pass global stat collection and MA-pattern detection; per-layer z-score is conservative in practice (SEs produce z > 10 typically) |
 | 0 | Blacklist caps | Paper: purely threshold-based, no caps | max_blacklisted_per_layer=4 and global_blacklist_cap_pct=5% | Safety guardrails against over-blacklisting |
 | 1 | Weight-space D^l metric | Paper experiments likely use activation-based CKA | Cosine similarity on flattened weight vectors | Paper §3.2 explicitly allows "CKA, MSE, or other similarity measures" |
 | 1 | γ entropy tolerance | 2604.06542 Eq. 10: γ∈[0,1], no default given | γ=0.1 (project-chosen, not from paper) | Paper leaves γ unspecified; 0.1 chosen empirically |
 | 1 | Floor and bonus constraints | GRAPE has no floor constraints or layer bonuses | min_experts_per_layer=64; early_layer_bonus=+8 (first 4); late_layer_bonus=+8 (last 5) | Protects embedding propagation and output generation quality |
-| 3 | AA-SVD uses auto-covariance on A100 | 2504.01588 Theorem 3.2 requires `X_pre^T X_post` | H200: exact cross-cov via dual-forward; A100: substitutes `X_pre^T X_pre` | Cross-covariance requires both models in VRAM simultaneously (~120 GB); A100 fallback only |
+| 1 | D^l update after merge | 2604.06542 Algorithm 1 lines 11–12: zero only pair entry D_{i*,j*} and D_{j*,i*}; update R^l ← R^l − 2·D_{i*,j*} | Zeros the absorbed expert's entire row and column in D^l; recomputes R^l from updated matrix | Prevents the absorbed expert from influencing future pair-selection; the paper's update assumes the merged expert cannot be re-selected, but only zeroing the pair entry leaves stale similarity values that can distort R^l and layer selection in subsequent iterations |
+| 3 | AA-SVD uses auto-covariance on A100 | 2604.02119 Theorem 3.2 requires cross-covariance `X_pre^T X_post` | H200: exact cross-cov via dual-forward; A100: substitutes `X_pre^T X_pre` | Cross-covariance requires both models in VRAM simultaneously (~120 GB); A100 fallback only |
 | 3 | D-Rank ω adapted for MoE | 2509.25622 Eq. 7: ω = d₁ + n·d₂ (layers per group × dimensions) | ω = n_experts × (d_out + d_in) | D-Rank targets shared-basis layer groups; adapted for MoE expert groups |
 | 3 | Swift-SVD+ β and ε* | 2604.01609 Alg. 2: β = end-to-end layer importance [1,2]; ε* = raw Frobenius loss ‖XW−XW*‖_F | β = per-expert spectral energy share; ε* = normalized tail energy ratio | Layer importance requires extra forward passes; spectral proxy adapted for within-group expert redistribution |
 | 3 | α selection criterion | 2604.01609 §3.2.2: select α by validation-set end-to-end performance | Minimises total tail spectral energy — no forward passes | Validation evaluation per α requires 11× model-scale forward passes |
 | 4 | Eigenspace noise-floor truncation | 2410.21271 Alg. 1: full Q ∈ ℝ^{k×k} used; QQ^T = I guarantees Theorem 1 exactness | Eigenvectors below noise floor discarded; n_keep < k retained before SVD | Suppresses near-zero noise directions; weakens Theorem 1 exactness but improves numerical stability |
+| 5 | Calibration data source | 2603.02217 §F.3 Table 1: calibration dataset = c4 (used identically across all experiments) | Multi-domain Nemotron-Cascade-2-SFT-Data with weighted subsets (chat 0.56, math 0.21, science 0.11, etc.) | Task-aware calibration better matches target deployment distribution; c4 is general pre-training data with limited reasoning/code coverage |
 | 5 | Effective batch size 4×2 instead of 2×4 | 2603.02217 Table 1: batch_size=2, grad_accum=4 | batch_size=4, grad_accum=2 | Same effective batch (8); adapted for A100 VRAM headroom with NF4-quantized teacher |
 
 ---
@@ -656,4 +658,4 @@ Each heavy stage (2–5) uploads its checkpoint to a per-stage Hub repo immediat
 
 ---
 
-*This document was generated from a full algorithmic review of the max_quality codebase on 2026-04-28; §13 updated 2026-04-29 after a per-stage paper compliance audit. All formulas were verified against the cited papers' methodology sections. All deviations are deliberate and documented. For the original validation audit, see the archived [VALIDATED_STRATEGIES.md](https://huggingface.co/pirola/moe-compression-workflow/blob/main/VALIDATED_STRATEGIES.md).*
+*This document was generated from a full algorithmic review of the max_quality codebase on 2026-04-28; §13 updated 2026-04-29 after a per-stage paper compliance audit including full methodology-section cross-reference of all 10 cited papers. All formulas were verified against the cited papers' methodology sections. All deviations are deliberate and documented. For the original validation audit, see the archived [VALIDATED_STRATEGIES.md](https://huggingface.co/pirola/moe-compression-workflow/blob/main/VALIDATED_STRATEGIES.md).*
