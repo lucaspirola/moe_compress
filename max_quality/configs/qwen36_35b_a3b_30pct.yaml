@@ -10,7 +10,7 @@ model:
   trust_remote_code: false        # transformers>=5.3 has native qwen3_5_moe
   # For the 16 GB local smoke runs: switch these on in a sibling config.
   load_in_4bit: false
-  device_map: auto                # uses accelerate; on A100 everything fits on 1 GPU
+  device_map: auto                # uses accelerate; on H200 everything fits on 1 GPU
   attn_implementation: sdpa       # DeltaNet layers ignore this; full_attention uses it
 
 target:
@@ -32,7 +32,6 @@ calibration:
   seed: 1337
   num_sequences: 1024
   sequence_length: 2048
-  super_expert_num_samples: 100
   subset_weights:
     math: 0.21
     science: 0.11
@@ -42,28 +41,37 @@ calibration:
     swe: 0.02
     terminal_agent: 0.0331
 
-stage0_super_experts:
-  zscore_threshold: 2.5           # blacklist expert if down_proj max > mean + 2.5σ
-  max_blacklisted_per_layer: 4    # paper observes 3-4 per layer on Qwen3
-  global_blacklist_cap_pct: 0.05  # hard cap: ≤ 5% of all experts
+# Stage 0 is removed — SE detection is now Phase B of Stage 1.
 
 stage1_grape:
-  similarity_metric: cosine       # one of: cosine | mse | cka
-  min_experts_per_layer: 128      # floor; Qwen3.6-35B-A3B has 256 routed experts per layer
+  # Phase A: calibration forward pass
+  num_calibration_samples: 512    # 512 samples × 2048 tokens ≈ 1M tokens for CKA stability
+  # Phase B: super expert detection (2507.23279)
+  super_expert_detection:
+    zscore_threshold: 2.5           # blacklist expert if down_proj max > mean + 2.5σ
+    max_blacklisted_per_layer: 4    # paper observes 3-4 per layer on Qwen3
+    global_blacklist_cap_pct: 0.05  # hard cap: ≤ 5% of all experts
+  # Phase C: CKA similarity (used by default; cosine/mse available for ablation)
+  similarity_metric: cka          # one of: cka | cosine | mse
+  # Phase D: GRAPE Algorithm 1
+  # Floor = num_routed_experts // 2 (computed at runtime from model config).
+  # No early/late layer bonuses — the 50% floor is sufficient protection.
+  # min_experts_per_layer is a fallback only; runtime uses max(this, n//2).
+  min_experts_per_layer: 128      # fallback floor; overridden by n//2 = 128 for 256-expert layers
   entropy_tolerance: 0.1          # γ in GRAPE Eq. 10: entropy threshold = E_0 * (1 - γ)
-  early_layer_bonus: 8            # add +8 to first early_layer_bonus_depth MoE layers (by MoE-sequence index)
-  early_layer_bonus_depth: 4      # protects first 4 MoE layers
-  late_layer_bonus: 8             # add +8 to last late_layer_bonus_depth MoE layers (by MoE-sequence index)
-  late_layer_bonus_depth: 5       # protects last 5 MoE layers (output generation / instruction following)
 
 stage2_reap_ream:
-  batch_size: 6                    # 80GB A100: batch=8 OOMs (73.88/79.25 GB used by model), batch=4 needs ~3.8 GB peak; bumped to 6 for ~50% faster calibration
+  batch_size: 6                    # H200: model ~70GB leaves ~71GB headroom; bs=6 is ~50% faster than bs=4
   num_calibration_samples: 1024
   reap_min_active_tokens: 32      # skip experts whose token activation count < this from centroid candidates
   covariance_storage_dtype: float16   # fp16 (10 mantissa bits) avoids the bf16 (7 bits) precision loss
                                       # that round-tripped Stage 2 covariance and produced rank-deficient B
                                       # in Stage 3 (rel_recon_err ≫ 1). Same byte count as bf16.
-  max_merge_group_size: 3         # bump target if any group exceeds this size (4→1 causes subspace collapse)
+  max_merge_group_size: 8         # bump target if any group exceeds this size.
+                                  # REAM paper §A.1 uses C=16 for Qwen3-30B at 25% reduction;
+                                  # 8 is conservative but allows centroids to absorb multiple
+                                  # similar experts as the paper intends. Previous value of 3
+                                  # was too restrictive and prevented meaningful merges.
   ream_cost_sigma_threshold: 1.5  # bump target if mean_cost_per_pair > running_mean * (1 + threshold)
                                   # inactive for first 4 freshly-processed layers (bootstrap guard)
   ream_cost_bump_ratio: 0.10      # bump amount = ceil(target * ratio) when cost gate triggers
@@ -76,18 +84,10 @@ stage3_svd:
   scope: moe_experts_only         # NEVER change; attention SVD is off-spec
   batch_size: 16                  # B-cov forward runs under no_grad → cheap
                                   # activations; bigger batch amortizes the
-                                  # model-weight HBM read. A100-80GB sweet
-                                  # spot: 16 (~30min Stage 3 vs ~5h40m at 1).
+                                  # model-weight HBM read. H200 sweet spot: 16.
   d_rank:
     parameter_cost_omega_mode: auto  # ω = n·(d_out + d_in): per-rank param cost for n per-expert factors
     # Per-projection rank bias (budget-neutral: weights sum to 3× uniform).
-    # Rationale: SwiGLU error sensitivity (jjang-ai/jangq, research/397B-MLP-ASYMMETRY.md):
-    #   gate_proj  → SiLU amplifier: errors multiply up_proj output; most sensitive → most rank
-    #   up_proj    → linear multiplicand: errors are bounded and proportional → least rank
-    #   down_proj  → residual stream guardian: every downstream layer is affected → middle
-    # Derived from their empirical bit floors gate=4 / up=2 / down=3 (budget-neutral at 3-bit avg):
-    #   weight = bits / mean(bits) → gate=4/3≈1.33, up=2/3≈0.67, down=3/3=1.0, avg=1.0
-    # Re-tune from stage3/recon_rel_err/{name} after first Stage 3 run if data disagrees.
     per_projection_weight:
       gate_proj: 1.33
       up_proj:   0.67
@@ -98,7 +98,7 @@ stage3_svd:
     metric: wikitext2_ppl
     per_group_type: true          # pick α separately for gate/up/down_proj
   aa_svd:
-    use_post_prune_inputs: true   # B = pruned-model inputs; A = original
+    use_post_prune_inputs: true   # B = pruned-model inputs; C = cross-covariance (H200 path)
   bcov_storage_dtype: float16     # B post-prune covariance storage; see covariance_storage_dtype above.
   block_refine:
     enabled: true
@@ -113,26 +113,23 @@ stage4_eora:
 
 stage5_router_kd:
   optimizer: adamw
-  learning_rate: 5.0e-5           # spec-corrected from 1e-5
+  learning_rate: 5.0e-5           # paper Table 1 (§F.3)
   epochs: 1
-  # batch_size × gradient_accumulation = effective batch (=8). Bumped
-  # batch_size 2→4 and dropped grad_accum 4→2 since the NF4-quantized
-  # teacher (~17 GB) leaves headroom on the A100. The student is always
-  # BF16 (~50 GB); only the frozen teacher is quantized for VRAM savings.
-  # Activations at batch=4: ~4 GB → total ≈ 70 GB / 80 GB. Same effective
-  # batch as paper (2×4=8), ~2× fewer grad_accum iters → faster wall-clock.
-  batch_size: 4
-  gradient_accumulation: 2
-  # Quantize the (frozen) teacher to NF4 via bitsandbytes so teacher+student
-  # co-reside on a single A100. This is a VRAM optimization only — the
-  # pipeline model (student) is always BF16. KD signal is robust to teacher
-  # quantization (routing topology matters more than logit precision).
-  teacher_load_in_4bit: true
+  # batch_size × gradient_accumulation = effective batch (=8).
+  # H200 (141 GB VRAM): teacher BF16 (~70 GB) + student BF16 (~50 GB) = ~120 GB.
+  # At bs=8, vocab logits consume ~5 GB, leaving ~16 GB headroom.
+  # bs=8 with grad_accum=1 eliminates gradient accumulation overhead entirely:
+  # 375 forward passes (= 375 optimizer steps) vs 750 at bs=4/grad_accum=2.
+  # Same effective batch as paper (8×1 = 2×4 = 8).
+  batch_size: 8
+  gradient_accumulation: 1
+  # Teacher loads in BF16 on H200 — no quantization needed.
+  teacher_load_in_4bit: false
   max_sequence_length: 512
   kd_temperature: 1.0
   kd_seq_chunk_size: 128            # sequence-dim chunk size for vocab KL computation;
                                     # bounds peak intermediate memory at B×chunk×|V|×4 bytes.
-                                    # At chunk=128 with |V|≈150K and B=4: ~300 MB vs ~1.2 GB unchunked.
+                                    # At chunk=128 with |V|≈150K and B=8: ~600 MB vs ~2.5 GB unchunked.
   max_calibration_samples: 3000
   checkpoint_every_n_steps: 100    # save router+optim state every N optimizer steps for crash-resume
   # Only router weights update. Enumerated paths are matched as substrings.
