@@ -15,18 +15,17 @@ This document is the **single authoritative reference** for the algorithms imple
 1. [Introduction and Pipeline Overview](#1-introduction-and-pipeline-overview)
 2. [Calibration Data](#2-calibration-data)
 3. [Budget Solver](#3-budget-solver)
-4. [Stage 0 — Super Expert Detection](#4-stage-0--super-expert-detection)
-5. [Stage 1 — GRAPE Budget Allocation](#5-stage-1--grape-budget-allocation)
-6. [Stage 2 — REAP Scoring + REAM Pseudo-Pruning](#6-stage-2--reap-scoring--ream-pseudo-pruning)
-6.5. [Stage 2.5 — Post-Merge Router Calibration](#65-stage-25--post-merge-router-calibration)
-7. [Stage 3 — Non-Uniform SVD Factorization](#7-stage-3--non-uniform-svd-factorization)
-8. [Stage 4 — EoRA Residual Compensation](#8-stage-4--eora-residual-compensation)
-9. [Stage 5 — Router Knowledge Distillation (Final)](#9-stage-5--router-knowledge-distillation-final)
-10. [Stage 6 — Validation](#10-stage-6--validation)
-11. [Protected Components](#11-protected-components)
-12. [Durability and Crash-Resume Model](#12-durability-and-crash-resume-model)
-13. [Known Deviations from Papers](#13-known-deviations-from-papers)
-14. [References](#14-references)
+4. [Stage 1 — Super Expert Detection + GRAPE Budget Allocation](#4-stage-1--super-expert-detection--grape-budget-allocation)
+5. [Stage 2 — REAP Scoring + REAM Pseudo-Pruning](#5-stage-2--reap-scoring--ream-pseudo-pruning)
+5.5. [Stage 2.5 — Post-Merge Router Calibration](#55-stage-25--post-merge-router-calibration)
+6. [Stage 3 — Non-Uniform SVD Factorization](#6-stage-3--non-uniform-svd-factorization)
+7. [Stage 4 — EoRA Residual Compensation](#7-stage-4--eora-residual-compensation)
+8. [Stage 5 — Router Knowledge Distillation (Final)](#8-stage-5--router-knowledge-distillation-final)
+9. [Stage 6 — Validation](#9-stage-6--validation)
+10. [Protected Components](#10-protected-components)
+11. [Durability and Crash-Resume Model](#11-durability-and-crash-resume-model)
+12. [Known Deviations from Papers](#12-known-deviations-from-papers)
+13. [References](#13-references)
 
 ---
 
@@ -35,11 +34,9 @@ This document is the **single authoritative reference** for the algorithms imple
 The pipeline compresses MoE models through a sequence of complementary techniques applied in a fixed order. The ordering is not arbitrary — each stage's output depends on prior stages, and later stages must see the final expert behaviour to calibrate correctly.
 
 ```
-Stage 0: Super Expert Detection     → blacklist JSON (experts too important to touch)
+Stage 1: SE Detection + GRAPE       → blacklist JSON + per-layer expert budgets (non-uniform)
    ↓
 Budget Solver                        → ep:sp decomposition (how much to prune vs. factorise)
-   ↓
-Stage 1: GRAPE Budget Allocation     → per-layer expert budgets (non-uniform)
    ↓
 Stage 2: REAP Score + REAM Merge     → pruned model checkpoint + input covariances (A)
    ↓
@@ -62,7 +59,7 @@ The total parameter reduction compounds multiplicatively:
 
 applied to the **compressible pool** (routed expert weights only). Non-compressible parameters (attention, shared experts, embeddings, lm_head, layer norms, router weights) count toward the total denominator but are never modified (except router weights in Stages 2.5 and 5).
 
-**Hardware:** Full pipeline runs on a single H200 (141 GB VRAM). Stages 2.5, 3, 4, and 5 keep the student model resident between stages — no inter-stage reload. Stage 5 runs twice: once after Stage 2 (as Stage 2.5) and once after Stage 4 (final). Stages 0–1 are weight-space only and run on any machine.
+**Hardware:** Full pipeline runs on a single H200 (141 GB VRAM). Stages 2.5, 3, 4, and 5 keep the student model resident between stages — no inter-stage reload. Stage 5 runs twice: once after Stage 2 (as Stage 2.5) and once after Stage 4 (final). Stage 1 requires a single forward pass (~10 min on H200); all subsequent GRAPE computation is weight-space only.
 
 ---
 
@@ -84,11 +81,11 @@ applied to the **compressible pool** (routed expert weights only). Non-compressi
 
 **Tokenization:** Rows are rendered via the tokenizer's chat template (`apply_chat_template`), then concatenated with EOS separators and chunked to `sequence_length=2048`.
 
-**Disjoint draws per stage:** Each stage uses a different `seed_offset` from the base seed (`1337`), ensuring Stages 0, 2, 3, and 5 draw from independent shuffles of the same distribution.
+**Disjoint draws per stage:** Each stage uses a different `seed_offset` from the base seed (`1337`), ensuring Stages 1, 2, 3, and 5 draw from independent shuffles of the same distribution.
 
 | Stage | seed_offset | num_sequences | sequence_length |
 |-------|-------------|---------------|-----------------|
-| 0 | +1 | 100 | 2048 |
+| 1 (SE + CKA) | +1 | 512 | 2048 |
 | 2 | +0 | 1024 | 2048 |
 | 3 (B-cov) | +2 | 512 | 2048 |
 | 5 (KD) | +5 | 3000 | 512 |
@@ -107,35 +104,42 @@ Given a `target_total_reduction` (e.g., 0.30) and an `expert_svd_ratio` (e.g., 2
 3. If outside tolerance, scale both knobs by `target / projected`, maintaining the ep:sp ratio exactly
 4. Converges in ≤3 iterations for typical targets
 
-**Floor constraints:** No layer can go below `min_experts_per_layer` (default 128 for 256-expert layers) or below the number of blacklisted experts. The solver enforces these when projecting the expert budget.
+**Floor constraints:** No layer can go below `min_experts_per_layer` (default: `num_routed_experts // 2` = 128 for 256-expert layers) or below the number of blacklisted experts. The solver enforces these when projecting the expert budget.
 
 ---
 
-## 4. Stage 0 — Super Expert Detection
+## 4. Stage 1 — Super Expert Detection + GRAPE Budget Allocation
 
-**File:** [`stage0_super_experts.py`](src/moe_compress/stage0_super_experts.py)
-**Paper:** Super Experts in MoE Models (2507.23279)
-**Hardware:** H200. Original BF16 model (~70 GB) leaves 71 GB VRAM headroom — no quantization or memory tricks needed.
+**File:** [`stage1_grape.py`](src/moe_compress/stage1_grape.py)
+**Papers:**
+- Super Experts in MoE Models (2507.23279) — SE detection
+- GRAPE: Greedy Redundancy-Aware Pruning for MoE (2604.06542), §3.2–3.3, Algorithm 1 — budget allocation
+**Hardware:** H200. Original BF16 model (~70 GB) leaves 71 GB VRAM headroom. Single forward pass over 512 calibration samples (~10 min), then weight-space GRAPE computation on GPU.
 
 ### What
 
-Identifies a small set of "super experts" — experts with disproportionately large activation magnitudes — that must never be pruned, merged, or factored because their removal causes catastrophic quality collapse (e.g., −21.7% on Qwen3-30B).
+A single unified stage that (a) identifies super experts that must never be compressed, and (b) computes non-uniform per-layer expert budgets using activation-aware CKA similarity. Both tasks share a single calibration forward pass.
 
 ### Why
 
-Super experts carry outsized influence on model output despite being activated at normal frequency. Pruning them produces errors that no downstream compensation (SVD, EoRA, Router KD) can recover.
+Super experts carry outsized influence on model output despite being activated at normal frequency. Pruning them causes catastrophic quality collapse (e.g., −21.7% on Qwen3-30B). They must be detected before any budget allocation.
+
+Uniform pruning wastes budget — some layers have highly redundant experts (high pairwise CKA similarity) while others are diverse. GRAPE's +2.45% peak on Mixtral-8x22B at the 4-expert setting (paper Table 2) demonstrates the value of non-uniform allocation. Using CKA (rather than weight-space cosine) for the similarity metric gives GRAPE activation-aware redundancy estimates, producing better budgets for Stage 2.
 
 ### How
 
-Stage 0 is already single-pass: all 40 MoE layers are instrumented simultaneously and `run_calibration` runs once over all 100 samples.
+#### Phase A: Single-Pass Calibration (512 samples)
 
-1. Run 100 calibration samples through the model with `instrument_experts` callbacks recording `max(|down_proj_output|)` per (layer, expert)
-2. Per layer: z-score the max activation values
-3. Flag experts exceeding `mean + 2.5σ`
-4. Cap at `max_blacklisted_per_layer=4` per layer, `global_blacklist_cap_pct=5%` globally
-5. Emit `stage0_blacklist.json`
+All 40 MoE layers are instrumented simultaneously. `run_calibration` runs once over all 512 samples, collecting two things per (layer, expert):
 
-### Formula
+1. **Max activation magnitude** `max(|down_proj_output|)` — for super expert detection
+2. **Expert output representations** `f_e(x)` — for CKA pairwise similarity computation
+
+This is a single forward pass (~10 min on H200). The expert output representations are accumulated into per-layer representation matrices for CKA.
+
+#### Phase B: Super Expert Detection (Paper 2507.23279)
+
+Per layer: z-score the max activation values and flag experts exceeding `mean + 2.5σ`. Cap at `max_blacklisted_per_layer=4` per layer, `global_blacklist_cap_pct=5%` globally. Emit `stage1_blacklist.json`.
 
 ```
 blacklisted(l, e) = max_activation(l, e) > μ_l + z · σ_l
@@ -143,33 +147,19 @@ blacklisted(l, e) = max_activation(l, e) > μ_l + z · σ_l
 
 where `z = 2.5` (configurable), `μ_l` and `σ_l` are the mean and standard deviation of max activations across all experts in layer `l`.
 
-### Resume
+#### Phase C: CKA Similarity Matrices
 
-Stage 0 is stateless (JSON-only output, no model mutation). Re-running is cheap and always safe.
+For each MoE layer, compute the pairwise CKA (Centered Kernel Alignment) matrix `D^l ∈ ℝ^{N×N}` from the collected expert output representations. CKA measures functional similarity between experts based on their response patterns to actual inputs — two experts that produce similar outputs on the calibration data have high CKA, regardless of weight-space similarity.
 
----
+Paper §3.2 explicitly allows "CKA, MSE, or other similarity measures" for D^l. CKA is the metric used by Zhang et al. (2025), cited in GRAPE §3.2 as the reference for intra-layer redundancy assessment.
 
-## 5. Stage 1 — GRAPE Budget Allocation
+With 512 samples × 2048 tokens = ~1M token-level activations per expert, the CKA kernel matrices are well-conditioned for 256-expert layers.
 
-**File:** [`stage1_grape.py`](src/moe_compress/stage1_grape.py)
-**Paper:** GRAPE: Greedy Redundancy-Aware Pruning for MoE (2604.06542), §3.2–3.3, Algorithm 1
-**Hardware:** H200. Pure weight-space computation — no forward passes, no calibration data. Model stays loaded from Stage 0. Distance matrix computation (`cdist`, cosine similarity on 256-expert banks) runs on GPU.
+#### Phase D: GRAPE Algorithm 1 (entropy-aware greedy merge with restart)
 
-### What
+1. **Initialize** each expert as its own cluster. Compute per-layer redundancy `R^l = Σ_{i≠j} D^l_{ij}` (Eq. 11, sum form). Set entropy threshold `Ê = E_0 × (1 − γ)` where `E_0` is the initial cross-layer entropy and `γ=0.1` (Eq. 10 — γ is project-chosen; paper gives no default).
 
-Computes a **non-uniform** per-layer expert budget: layers with more redundant experts donate more of their capacity, while layers with diverse experts keep more.
-
-### Why
-
-Uniform pruning wastes budget — some layers have highly redundant experts (high pairwise similarity) while others are diverse. GRAPE's +2.45% peak on Mixtral-8x22B at the 4-expert setting (paper Table 2) demonstrates the value of non-uniform allocation.
-
-### How — GRAPE Algorithm 1 (entropy-aware greedy merge with restart)
-
-1. **Compute pairwise distance matrices** `D^l` for all MoE layers using a pluggable metric (cosine similarity on flattened expert weight vectors by default — paper §3.2 explicitly allows "CKA, MSE, or other similarity measures")
-
-2. **Initialize** each expert as its own cluster. Compute per-layer redundancy `R^l = Σ_{i≠j} D^l_{ij}` (Eq. 11, sum form). Set entropy threshold `Ê = E_0 × (1 − γ)` where `E_0` is the initial cross-layer entropy and `γ=0.1` (Eq. 10 — γ is project-chosen; paper gives no default).
-
-3. **Greedy loop** until total surviving experts ≤ `global_expert_budget`:
+2. **Greedy loop** until total surviving experts ≤ `global_expert_budget`:
    - If all layers frozen → **restart** (unfreeze all)
    - Pick `l* = argmax R^l` among unfrozen layers above their floor
    - Pick `(i*, j*) = argmax D^{l*}_{ij}` (most similar pair)
@@ -177,7 +167,7 @@ Uniform pruning wastes budget — some layers have highly redundant experts (hig
    - Decrement `cluster_counts[l*]`
    - If entropy drops below `Ê` → **freeze** layer `l*`
 
-4. **Floor constraints:** `min_experts_per_layer=64`, plus `early_layer_bonus=+8` for first 4 MoE layers and `late_layer_bonus=+8` for last 5 MoE layers (protects input embedding propagation and output generation).
+3. **Floor constraint:** `min_experts_per_layer = num_routed_experts // 2` (= 128 for 256-expert layers). No early/late layer bonuses — the floor alone provides sufficient protection at 50% max removal per layer.
 
 ### Key Formulas
 
@@ -190,22 +180,22 @@ E = −Σ_l (n_l / N_total) × log(n_l / N_total)   (cross-layer entropy)
 
 ### Resume
 
-Stage 1 is stateless (JSON-only output). Re-running is cheap and always safe.
+Stage 1 is stateless (JSON-only output: blacklist + per-layer budgets). Re-running is cheap and always safe.
 
 ### Correctness Notes
 
-- The `R^l` update zeroes out the merged expert's *entire* row and column (not just the pair), preventing the absorbed expert from being re-selected in future iterations. This is more correct than the paper's pseudocode line 12 (`R^l ← R^l − 2·D[i*,j*]`), which appears to assume upper-triangular unique-pair counting. See [D6](#13-known-deviations-from-papers).
+- The `R^l` update zeroes out the merged expert's *entire* row and column (not just the pair), preventing the absorbed expert from being re-selected in future iterations. This is more correct than the paper's pseudocode line 12 (`R^l ← R^l − 2·D[i*,j*]`), which appears to assume upper-triangular unique-pair counting. See [D4](#12-known-deviations-from-papers).
 - If the budget cannot be reached (all layers hit their floors), a warning is logged but the pipeline continues with the achieved budget.
 
 ---
 
-## 6. Stage 2 — REAP Scoring + REAM Pseudo-Pruning
+## 5. Stage 2 — REAP Scoring + REAM Pseudo-Pruning
 
 **File:** [`stage2_reap_ream.py`](src/moe_compress/stage2_reap_ream.py)
 **Papers:**
 - REAP: Routing-Expert Activation Pruning (2510.13999), Eq. 9
 - REAM: Routing Expert Activation Merging (2604.04356), §3–4, Eq. 5–8
-**Hardware:** H200. Model (70 GB BF16) stays loaded from Stage 1. 71 GB VRAM headroom enables `batch_size=24+` (A100 was capped at 6 due to 10 GB headroom) and single-pass profiling across all layers.
+**Hardware:** H200. Model (70 GB BF16) stays loaded from Stage 1. 71 GB VRAM headroom enables `batch_size=24+` and single-pass profiling across all layers.
 
 ### What
 
@@ -246,7 +236,7 @@ where `X_j = {x | j ∈ TopK(σ(x))}`, `g_j(x)` is the post-softmax routing weig
 Top-N'_l experts by REAP score become **centroids** (protected from removal). Non-centroids are assigned to centroids via **greedy pseudo-pruning**:
 
 1. Iterate centroids in descending saliency order
-2. For each centroid, absorb the most similar (highest δ_REAM) unassigned non-centroid
+2. For each centroid, absorb the most similar (highest δ_REAM) unassigned non-centroid, up to `max_merge_group_size` non-centroids per centroid
 3. Repeat until all non-centroids are assigned
 
 #### Step 4: Frequency-Weighted Merge (Paper Eq. 6)
@@ -272,7 +262,7 @@ Stored in `_stage2_input_covariance.pt` (fp16 storage to avoid bf16 precision lo
 ### Budget Bump Loop
 
 Two safety gates can raise the effective target if merge quality is poor:
-- **`max_merge_group_size=3`**: If any group exceeds this, bump target
+- **`max_merge_group_size=8`**: If any group exceeds this, bump target. The REAM paper uses C=16 for Qwen3-30B at 25% reduction (§A.1); 8 is conservative but allows centroids to absorb multiple similar experts as the paper intends.
 - **`ream_cost_sigma_threshold=1.5`**: If mean cost exceeds `running_mean × (1 + 1.5)`, bump target (inactive for first 4 layers)
 
 ### Resume
@@ -287,7 +277,7 @@ On resume, completed layers are replayed from partial files (fast, no forward pa
 
 ---
 
-## 6.5. Stage 2.5 — Post-Merge Router Calibration
+## 5.5. Stage 2.5 — Post-Merge Router Calibration
 
 **File:** [`stage5_router_kd.py`](src/moe_compress/stage5_router_kd.py) (same code as Stage 5)
 **Paper:** Router Knowledge Distillation for MoE Compression (2603.02217)
@@ -305,12 +295,12 @@ Stage 2.5 is distinct from Stage 5: Stage 5 recalibrates routers after SVD facto
 
 ### How
 
-Identical to Stage 5 (§9), with two differences:
+Identical to Stage 5 (§8), with two differences:
 
 | Parameter | Stage 2.5 | Stage 5 |
 |---|---|---|
 | Input model | Stage 2 output (dense merged experts) | Stage 4 output (FactoredExperts + EoRA) |
-| Teacher precision | BF16 — both models fit on H200 | BF16 on H200; NF4 fallback for A100 |
+| Teacher precision | BF16 — both models fit on H200 | BF16 |
 | Checkpoint prefix | `_stage2p5_partial/` | `_stage5_partial/` |
 | Hub artifact | `<base>-stage2p5` | `<base>-stage5` |
 
@@ -320,7 +310,7 @@ Same step-boundary checkpointing as Stage 5, under `_stage2p5_partial/`.
 
 ---
 
-## 7. Stage 3 — Non-Uniform SVD Factorization
+## 6. Stage 3 — Non-Uniform SVD Factorization
 
 **File:** [`stage3_svd.py`](src/moe_compress/stage3_svd.py)
 **Papers:**
@@ -344,9 +334,9 @@ SVD factorization reduces parameters from `d_out × d_in` to `k × (d_out + d_in
 
 **B-covariance** `B = X_post^T X_post`: Run the pruned (post-Stage-2) model on fresh calibration data to collect per-(layer, expert, matrix) input covariances reflecting the distribution the compressed model will see after merging.
 
-**Cross-covariance** `C = X_pre^T X_post` (H200 only): Run both the original model and the pruned model on the same calibration batch simultaneously. For each batch: forward original → collect `X_pre`; forward pruned → collect `X_post`; accumulate `C += X_pre^T @ X_post`. This gives the exact cross-covariance required by AA-SVD Theorem 3.2 and eliminates the auto-covariance approximation.
+**Cross-covariance** `C = X_pre^T X_post`: Run both the original model and the pruned model on the same calibration batch simultaneously. For each batch: forward original → collect `X_pre`; forward pruned → collect `X_post`; accumulate `C += X_pre^T @ X_post`. This gives the exact cross-covariance required by AA-SVD Theorem 3.2.
 
-Requires H200 (141 GB VRAM): original BF16 (~70 GB) + pruned BF16 (~50 GB) = ~120 GB. On A100 the cross-covariance path is skipped and Phase C falls back to the auto-covariance approximation.
+Requires H200 (141 GB VRAM): original BF16 (~70 GB) + pruned BF16 (~50 GB) = ~120 GB.
 
 **Single-pass collection:** All 40 MoE layers are hooked simultaneously in a single calibration pass (not one pass per layer). Peak CPU RAM is ~88 GB for all accumulated covariances; this is feasible on H200 instances. Per-layer spill to disk still applies after each layer's accumulation is finalised, keeping the resident footprint bounded.
 
@@ -387,7 +377,7 @@ Per-expert ranks are stored in the `FactoredExperts` slot at the max rank across
 
 For each (layer, expert, matrix):
 
-**When cross-covariance C and B are available (H200 path — paper-exact):**
+**Paper-exact path (H200 — cross-covariance C and B available):**
 
 ```
 M = W · C · B⁻¹ · L_B        where C = X_pre^T X_post
@@ -395,15 +385,7 @@ M = W · C · B⁻¹ · L_B        where C = X_pre^T X_post
 
 This is the exact AA-SVD Theorem 3.2 formula. `L_B` is the eigendecomposition-based square root of B.
 
-**When only A (pre-prune auto-cov) and B are available (A100 fallback):**
-
-```
-M = W · A_cov · B⁻¹ · L_B    where A_cov = X_pre^T X_pre  (auto-covariance approximation)
-```
-
-The two coincide when pre/post distributions are similar (light pruning). See [D7](#13-known-deviations-from-papers) for deviation status.
-
-**When only B is available (A = None):** Falls back to Corollary 3.3:
+**Fallback when only B is available (A = None):** Falls back to Corollary 3.3:
 
 ```
 M = W · L_B
@@ -435,7 +417,7 @@ using L-BFGS with strong Wolfe line search (`lbfgs_steps=100`, `lbfgs_history=10
 
 ---
 
-## 8. Stage 4 — EoRA Residual Compensation
+## 7. Stage 4 — EoRA Residual Compensation
 
 **File:** [`stage4_eora.py`](src/moe_compress/stage4_eora.py)
 **Paper:** EoRA: Training-Free Compensation for Compressed LLMs (2410.21271), Algorithm 1
@@ -487,11 +469,11 @@ Stage 4 deletes `_stage3_original_weights.pt` and `_stage2_input_covariance.pt` 
 
 ---
 
-## 9. Stage 5 — Router Knowledge Distillation (Final)
+## 8. Stage 5 — Router Knowledge Distillation (Final)
 
 **File:** [`stage5_router_kd.py`](src/moe_compress/stage5_router_kd.py)
 **Paper:** Router Knowledge Distillation for MoE Compression (2603.02217), Eq. 3, Table 1, §F.3
-**Hardware:** H200. EoRA-compensated student model stays resident from Stage 4. Teacher loads in BF16 (~70 GB); combined VRAM ~120 GB.
+**Hardware:** H200. EoRA-compensated student model stays resident from Stage 4. Teacher loads in BF16 (~70 GB); combined VRAM ~126 GB (with bs=8 logits).
 
 ### What
 
@@ -515,7 +497,7 @@ where `z_T, z_S ∈ ℝ^{|V|}` are teacher/student vocabulary logits, `m_{t+1} �
 1. Teacher forward pass (no_grad) → vocabulary logits `[B, L, |V|]`
 2. Student forward pass (with gradients) → vocabulary logits `[B, L, |V|]`
 3. Shift logits: position `t` predicts token `t+1` (standard causal LM)
-4. Chunked KL: process `chunk_size=128` sequence positions at a time to bound peak memory at `B × chunk × |V| × 4` bytes (~300 MB at B=4, |V|=150K vs ~1.2 GB unchunked)
+4. Chunked KL: process `chunk_size=128` sequence positions at a time to bound peak memory at `B × chunk × |V| × 4` bytes (~600 MB at B=8, |V|=150K vs ~2.5 GB unchunked)
 5. `F.kl_div(log_softmax(student/τ), softmax(teacher/τ))` = KL(teacher ‖ student) — correct forward KL direction
 
 ### Hyperparameters (Paper Table 1, §F.3)
@@ -525,25 +507,25 @@ where `z_T, z_S ∈ ℝ^{|V|}` are teacher/student vocabulary logits, `m_{t+1} �
 | Optimizer | AdamW | Paper |
 | Learning rate | **5×10⁻⁵** | Paper Table 1 (implementation previously used 1e-5; corrected to match paper) |
 | Epochs | 1 | Paper |
-| Batch size | 4 | Adapted (paper: 2) |
-| Gradient accumulation | 2 | Adapted (paper: 4) |
-| **Effective batch size** | **8** | Same as paper (4×2 = 2×4) |
+| Batch size | 8 | Adapted (paper: 2) |
+| Gradient accumulation | 1 | Adapted (paper: 4) |
+| **Effective batch size** | **8** | Same as paper (8×1 = 2×4) |
 | Max sequence length | 512 | Paper |
 | KD temperature (τ) | 1.0 | Paper |
 | Max calibration samples | 3000 | Paper |
-| Teacher precision | BF16 on H200; NF4 (bitsandbytes, ~17 GB) on A100 | H200 (141 GB VRAM) fits teacher+student in BF16. NF4 is a fallback for the 80 GB A100 only. Student is always BF16. |
+| Teacher precision | BF16 | H200 (141 GB VRAM) fits teacher+student in BF16 with ~15 GB headroom at bs=8. Student is always BF16. |
 
 ### Teacher Loading
 
-On H200 (141 GB VRAM), both teacher and student load in BF16 (~70 GB + ~50 GB = ~120 GB). On A100 (80 GB VRAM), the teacher is quantized to NF4 via bitsandbytes (~17 GB) so the two can co-reside. The student — the pipeline model being compressed — is **always BF16 throughout all stages**. No stage operates on a quantized model. Alternatively, precomputed teacher vocabulary logits can be loaded from a cache file (`teacher_logits_cache` config key) to skip the live teacher entirely.
+On H200 (141 GB VRAM), both teacher and student load in BF16 (~70 GB + ~50 GB = ~120 GB). At bs=8 with seq_len=512, vocabulary logits consume ~5 GB, leaving ~16 GB headroom. Alternatively, precomputed teacher vocabulary logits can be loaded from a cache file (`teacher_logits_cache` config key) to skip the live teacher entirely.
 
 ### Resume
 
-Step-boundary checkpointing to `_stage5_partial/step_{N}.pt` (every 100 optimizer steps). Each checkpoint contains router parameter state + optimizer state. On resume, up to `grad_accum−1` batches of gradient signal from the last incomplete accumulation window are silently dropped. Only the two most recent checkpoints are retained.
+Step-boundary checkpointing to `_stage5_partial/step_{N}.pt` (every 100 optimizer steps). Each checkpoint contains router parameter state + optimizer state. On resume, the last incomplete batch's gradient signal is silently dropped (no accumulation window — each batch is one optimizer step). Only the two most recent checkpoints are retained.
 
 ---
 
-## 10. Stage 6 — Validation
+## 9. Stage 6 — Validation
 
 **File:** [`stage6_validate.py`](src/moe_compress/stage6_validate.py)
 **Hardware:** Runs on the same H200 instance as Stage 5 (student model stays resident).
@@ -589,7 +571,7 @@ Stage 6 is stateless. Re-running is always safe.
 
 ---
 
-## 11. Protected Components
+## 10. Protected Components
 
 These are **never** modified by any compression stage:
 
@@ -598,11 +580,11 @@ These are **never** modified by any compression stage:
 - **Embeddings** and **lm_head**
 - **Layer norms** (RMSNorm)
 - **Router weights** — except Stage 5, which updates *only* these
-- **Super experts** on the Stage 0 blacklist
+- **Super experts** on the Stage 1 blacklist
 
 ---
 
-## 12. Durability and Crash-Resume Model
+## 11. Durability and Crash-Resume Model
 
 HF Jobs bucket FUSE mounts are **not durable** under SIGKILL or timeout. The durability boundary is per-stage Hub uploads:
 
@@ -621,32 +603,30 @@ Each heavy stage (2–5) uploads its checkpoint to a per-stage Hub repo immediat
 
 ---
 
-## 13. Known Deviations from Papers
+## 12. Known Deviations from Papers
 
 | ID | Stage | Deviation | Paper Says | Implementation Does | Justification |
 |----|-------|-----------|-----------|-------------------|---------------|
-| D1 | 0 | Detection threshold | 2507.23279 Eq. 6 + Algorithm 1: two-stage process — first detect MA-formation layers L, then global P_{99.5} AND 0.1·a_max AND l∈L — all three required | Per-layer z-score (mean + 2.5σ); no global statistics; no MA-formation layer pre-filtering; all 40 MoE layers profiled | Avoids two-pass global stat collection and MA-pattern detection; per-layer z-score is conservative in practice (SEs produce z > 10 typically) |
-| D2 | 0 | Blacklist caps | Paper: purely threshold-based, no caps | max_blacklisted_per_layer=4 and global_blacklist_cap_pct=5% | Safety guardrails against over-blacklisting |
-| D3 | 1 | Weight-space D^l metric | Paper experiments likely use activation-based CKA | Cosine similarity on flattened weight vectors | Paper §3.2 explicitly allows "CKA, MSE, or other similarity measures" |
-| D4 | 1 | γ entropy tolerance | 2604.06542 Eq. 10: γ∈[0,1], no default given | γ=0.1 (project-chosen, not from paper) | Paper leaves γ unspecified; 0.1 chosen empirically |
-| D5 | 1 | Floor and bonus constraints | GRAPE has no floor constraints or layer bonuses | min_experts_per_layer=64; early_layer_bonus=+8 (first 4); late_layer_bonus=+8 (last 5) | Protects embedding propagation and output generation quality |
-| D6 | 1 | D^l update after merge | 2604.06542 Algorithm 1 lines 11–12: zero only pair entry D_{i*,j*} and D_{j*,i*}; update R^l ← R^l − 2·D_{i*,j*} | Zeros the absorbed expert's entire row and column in D^l; recomputes R^l from updated matrix | Prevents the absorbed expert from influencing future pair-selection; the paper's update assumes the merged expert cannot be re-selected, but only zeroing the pair entry leaves stale similarity values that can distort R^l and layer selection in subsequent iterations |
-| D7 | 3 | AA-SVD uses auto-covariance on A100 | 2604.02119 Theorem 3.2 requires cross-covariance `X_pre^T X_post` | H200: exact cross-cov via dual-forward; A100: substitutes `X_pre^T X_pre` | Cross-covariance requires both models in VRAM simultaneously (~120 GB); A100 fallback only |
-| D8 | 3 | D-Rank ω adapted for MoE | 2509.25622 Eq. 7: ω = d₁ + n·d₂ (layers per group × dimensions) | ω = n_experts × (d_out + d_in) | D-Rank targets shared-basis layer groups; adapted for MoE expert groups |
-| D9 | 3 | Swift-SVD+ β and ε* | 2604.01609 Alg. 2: β = end-to-end layer importance [1,2]; ε* = raw Frobenius loss ‖XW−XW*‖_F | β = per-expert spectral energy share; ε* = normalized tail energy ratio | Layer importance requires extra forward passes; spectral proxy adapted for within-group expert redistribution |
-| D10 | 3 | α selection criterion | 2604.01609 §3.2.2: select α by validation-set end-to-end performance | Minimises total tail spectral energy — no forward passes | Validation evaluation per α requires 11× model-scale forward passes |
-| D11 | 4 | Eigenspace noise-floor truncation | 2410.21271 Alg. 1: full Q ∈ ℝ^{k×k} used; QQ^T = I guarantees Theorem 1 exactness | Eigenvectors below noise floor discarded; n_keep < k retained before SVD | Suppresses near-zero noise directions; weakens Theorem 1 exactness but improves numerical stability |
-| D12 | 5 | Calibration data source | 2603.02217 §F.3 Table 1: calibration dataset = c4 (used identically across all experiments) | Multi-domain Nemotron-Cascade-2-SFT-Data with weighted subsets (chat 0.56, math 0.21, science 0.11, etc.) | Task-aware calibration better matches target deployment distribution; c4 is general pre-training data with limited reasoning/code coverage |
-| D13 | 5 | Effective batch size 4×2 instead of 2×4 | 2603.02217 Table 1: batch_size=2, grad_accum=4 | batch_size=4, grad_accum=2 | Same effective batch (8); adapted for A100 VRAM headroom with NF4-quantized teacher |
+| D1 | 1 | Detection threshold | 2507.23279 Eq. 6 + Algorithm 1: two-stage process — first detect MA-formation layers L, then global P_{99.5} AND 0.1·a_max AND l∈L — all three required | Per-layer z-score (mean + 2.5σ); no global statistics; no MA-formation layer pre-filtering; all 40 MoE layers profiled | Avoids two-pass global stat collection and MA-pattern detection; per-layer z-score is conservative in practice (SEs produce z > 10 typically) |
+| D2 | 1 | Blacklist caps | Paper: purely threshold-based, no caps | max_blacklisted_per_layer=4 and global_blacklist_cap_pct=5% | Safety guardrails against over-blacklisting |
+| D3 | 1 | γ entropy tolerance | 2604.06542 Eq. 10: γ∈[0,1], no default given | γ=0.1 (project-chosen, not from paper) | Paper leaves γ unspecified; 0.1 chosen empirically |
+| D4 | 1 | D^l update after merge | 2604.06542 Algorithm 1 lines 11–12: zero only pair entry D_{i*,j*} and D_{j*,i*}; update R^l ← R^l − 2·D_{i*,j*} | Zeros the absorbed expert's entire row and column in D^l; recomputes R^l from updated matrix | Prevents the absorbed expert from influencing future pair-selection; the paper's update assumes the merged expert cannot be re-selected, but only zeroing the pair entry leaves stale similarity values that can distort R^l and layer selection in subsequent iterations |
+| D5 | 1 | Floor without layer bonuses | GRAPE has no floor constraints | min_experts_per_layer = num_routed_experts // 2 (=128); no early/late layer bonuses | 50% max removal per layer bounds the compression within the range where papers demonstrate results; bonuses removed — the floor alone is sufficient |
+| D6 | 3 | AA-SVD auto-covariance fallback | 2604.02119 Theorem 3.2 requires cross-covariance `X_pre^T X_post` | H200: exact cross-cov via dual-forward (paper-exact); fallback code path substitutes `X_pre^T X_pre` but is inactive on H200 | Cross-covariance requires both models in VRAM simultaneously (~120 GB); fallback retained for non-H200 hardware only |
+| D7 | 3 | D-Rank ω adapted for MoE | 2509.25622 Eq. 7: ω = d₁ + n·d₂ (layers per group × dimensions) | ω = n_experts × (d_out + d_in) | D-Rank targets shared-basis layer groups; adapted for MoE expert groups |
+| D8 | 3 | Swift-SVD+ β and ε* | 2604.01609 Alg. 2: β = end-to-end layer importance [1,2]; ε* = raw Frobenius loss ‖XW−XW*‖_F | β = per-expert spectral energy share; ε* = normalized tail energy ratio | Layer importance requires extra forward passes; spectral proxy adapted for within-group expert redistribution |
+| D9 | 3 | α selection criterion | 2604.01609 §3.2.2: select α by validation-set end-to-end performance | Minimises total tail spectral energy — no forward passes | Validation evaluation per α requires 11× model-scale forward passes |
+| D10 | 4 | Eigenspace noise-floor truncation | 2410.21271 Alg. 1: full Q ∈ ℝ^{k×k} used; QQ^T = I guarantees Theorem 1 exactness | Eigenvectors below noise floor discarded; n_keep < k retained before SVD | Suppresses near-zero noise directions; weakens Theorem 1 exactness but improves numerical stability |
+| D11 | 5 | Calibration data source | 2603.02217 §F.3 Table 1: calibration dataset = c4 (used identically across all experiments) | Multi-domain Nemotron-Cascade-2-SFT-Data with weighted subsets (chat 0.56, math 0.21, science 0.11, etc.) | Task-aware calibration better matches target deployment distribution; c4 is general pre-training data with limited reasoning/code coverage |
 
 ---
 
-## 14. References
+## 13. References
 
 | ID | Paper | Year | Used In |
 |----|-------|------|---------|
-| 2507.23279 | Super Experts in MoE Models | 2025 | Stage 0 |
-| 2604.06542 | GRAPE: Greedy Redundancy-Aware Pruning for MoE | 2026 | Stage 1 |
+| 2507.23279 | Super Experts in MoE Models | 2025 | Stage 1 (SE detection) |
+| 2604.06542 | GRAPE: Greedy Redundancy-Aware Pruning for MoE | 2026 | Stage 1 (budget allocation) |
 | 2510.13999 | REAP: Routing-Expert Activation Pruning | 2025 | Stage 2 (scoring) |
 | 2604.04356 | REAM: Routing Expert Activation Merging | 2026 | Stage 2 (merging) |
 | 2509.25622 | D-Rank: Spectral Entropy Rank Allocation | 2025 | Stage 3 (rank budget) |
@@ -658,4 +638,4 @@ Each heavy stage (2–5) uploads its checkpoint to a per-stage Hub repo immediat
 
 ---
 
-*This document was generated from a full algorithmic review of the max_quality codebase on 2026-04-28; §13 updated 2026-04-29 after a per-stage paper compliance audit including full methodology-section cross-reference of all 10 cited papers. All formulas were verified against the cited papers' methodology sections. All deviations are deliberate and documented. For the original validation audit, see the archived [VALIDATED_STRATEGIES.md](https://huggingface.co/pirola/moe-compression-workflow/blob/main/VALIDATED_STRATEGIES.md).*
+*This document was generated from a full algorithmic review of the max_quality codebase on 2026-04-28; §12 updated 2026-04-29 after a per-stage paper compliance audit including full methodology-section cross-reference of all 10 cited papers. Spec redesign on 2026-04-29: merged Stage 0 into Stage 1 (CKA + SE detection), floor=n//2, max_merge_group=8, Router KD bs=8. All formulas were verified against the cited papers' methodology sections. All deviations are deliberate and documented. For the original validation audit, see the archived [VALIDATED_STRATEGIES.md](https://huggingface.co/pirola/moe-compression-workflow/blob/main/VALIDATED_STRATEGIES.md).*
