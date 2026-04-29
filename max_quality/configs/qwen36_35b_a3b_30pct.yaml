@@ -173,6 +173,11 @@ stage6_validate:
     humaneval_absolute_max_drop: 0.03
     math500_absolute_max_drop: 0.03
     measured_reduction_min: 0.30
+  imatrix:
+    enabled: true
+    ngl: 99        # GPU layers for llama-imatrix (-ngl 99 = all on GPU)
+    ctx_size: 2048 # context window, aligned with wikitext2 sequence_length
+    llama_cpp_dir: # null = auto-detect via LLAMA_CPP_DIR env var or PATH
 
 logging:
   level: INFO
