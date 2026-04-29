@@ -154,6 +154,19 @@ def run(
             p.requires_grad_(False)
         teacher_refs = list(iter_moe_layers(teacher))
 
+    # --- torch.compile acceleration (spec §8) ---
+    use_compile = bool(s5.get("torch_compile", False))
+    if use_compile:
+        try:
+            if teacher is not None:
+                log.info("Stage 5: torch.compile(teacher, mode='reduce-overhead')")
+                teacher = torch.compile(teacher, mode="reduce-overhead")
+            log.info("Stage 5: torch.compile(student, mode='reduce-overhead')")
+            student = torch.compile(student, mode="reduce-overhead")
+        except Exception as exc:
+            log.warning("Stage 5: torch.compile failed (%s) — falling back to eager mode", exc)
+            use_compile = False
+
     _freeze_non_routers(student, s5["trainable_name_patterns"])
 
     spec = spec_from_config(
