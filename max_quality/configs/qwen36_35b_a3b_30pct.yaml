@@ -102,7 +102,11 @@ stage3_svd:
     metric: wikitext2_ppl
     per_group_type: true          # pick α separately for gate/up/down_proj
   aa_svd:
-    use_post_prune_inputs: true   # B = pruned-model inputs; C = cross-covariance (H200 path)
+    use_post_prune_inputs: true   # B = pruned-model inputs
+    cross_covariance: true        # Collect C = X_pre^T X_post via dual-forward (paper-exact
+                                  # Theorem 3.2). Requires original + pruned model in VRAM
+                                  # simultaneously (~120 GB). Set false to fall back to
+                                  # auto-covariance A = X_pre^T X_pre approximation.
   bcov_storage_dtype: float16     # B post-prune covariance storage; see covariance_storage_dtype above.
   block_refine:
     enabled: true
