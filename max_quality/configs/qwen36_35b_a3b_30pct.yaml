@@ -45,7 +45,11 @@ calibration:
 
 stage1_grape:
   # Phase A: calibration forward pass
-  num_calibration_samples: 512    # 512 samples × 2048 tokens ≈ 1M tokens for CKA stability
+  num_calibration_samples: 256    # 256 samples × 2048 tokens ≈ 512K tokens.
+                                  # ExpertOutputAccumulator reservoir caps at 256 tokens/expert;
+                                  # with ~3.1% activation rate, 256 samples yields ~16K tokens/expert
+                                  # — the reservoir fills to cap regardless. More samples only
+                                  # marginally improve reservoir randomness. ~5 min on H200.
   # Phase B: super expert detection (2507.23279)
   super_expert_detection:
     zscore_threshold: 2.5           # blacklist expert if down_proj max > mean + 2.5σ
