@@ -22,7 +22,7 @@ Usage:
     from moe_compress.utils.activation_hooks import instrument_experts
 
     callbacks = {
-        "down":         down_max_cb,     # Stage 0
+        "down":         down_cb,         # Stage 1 (SE detection + CKA)
         "input":        cov_cb,          # Stage 2/3 gate_up_proj input cov
         "intermediate": int_cov_cb,      # Stage 2/3 down_proj input cov
     }
@@ -33,10 +33,10 @@ Usage:
 The instrumentation is per-layer. Install on each MoE layer you want to
 observe; caller handles which layers' data to collect.
 
-This module also keeps the previously-used accumulator dataclasses
-(``DownProjMaxAccumulator``, ``ReapAccumulator``, ``InputCovarianceAccumulator``)
-because Stages 0/2/3 still use their API — only the hook plumbing below them
-changed.
+This module also keeps the accumulator dataclasses
+(``DownProjMaxAccumulator``, ``ExpertOutputAccumulator``, ``ReapAccumulator``,
+``InputCovarianceAccumulator``) because Stages 1/2/3 use their API — only the
+hook plumbing below them changed.
 """
 from __future__ import annotations
 
@@ -289,6 +289,99 @@ class DownProjMaxAccumulator:
 
 
 @dataclass
+class ExpertOutputAccumulator:
+    """Per-(layer, expert) expert output representation collector for CKA.
+
+    Collects down_proj output vectors during the calibration forward pass
+    using reservoir sampling to bound memory. Used by Stage 1 Phase C to
+    compute CKA pairwise similarity matrices.
+
+    Memory budget: max_tokens_per_expert=256 × d_out=2048 × 4 bytes = 2 MB
+    per expert. With 256 experts × 40 layers ≈ 20 GB total — fits in H200's
+    71 GB headroom alongside the model.
+
+    During the forward pass, expert outputs arrive on GPU. We detach and
+    transfer to CPU immediately (like DownProjMaxAccumulator.finalize but
+    streaming). The reservoir is maintained on CPU to avoid GPU memory pressure.
+
+    Usage:
+        acc = ExpertOutputAccumulator(max_tokens_per_expert=256)
+        # ... inside the down_cb callback:
+        acc.update(layer_idx, expert_idx, down_proj_output)
+        # ... after forward pass:
+        acc.finalize()
+        R = acc.get_representations(layer_idx, expert_idx)  # [n, d_out]
+    """
+    max_tokens_per_expert: int = 256
+    # CPU-resident reservoir: (layer_idx, expert_idx) → list of [d_out] tensors.
+    _reservoir: dict[tuple[int, int], list[torch.Tensor]] = field(default_factory=dict)
+    # Count of total tokens seen per (layer, expert) — for reservoir sampling.
+    _seen_count: dict[tuple[int, int], int] = field(default_factory=lambda: defaultdict(int))
+    # Finalized stacked representations: (layer, expert) → [n_tokens, d_out].
+    _finalized: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
+
+    def update(self, layer_idx: int, expert_idx: int, x: torch.Tensor) -> None:
+        """Collect expert output vectors via reservoir sampling.
+
+        ``x`` shape: [T, d_out] where T is the number of tokens routed to
+        this expert in the current batch. Called from the ``down`` callback.
+        """
+        if x.dim() < 2 or x.shape[0] == 0:
+            return
+        key = (layer_idx, expert_idx)
+        batch_cpu = x.detach().cpu().to(torch.float32)  # [T, d_out]
+        n_batch = batch_cpu.shape[0]
+
+        reservoir = self._reservoir.get(key)
+        if reservoir is None:
+            reservoir = []
+            self._reservoir[key] = reservoir
+
+        seen = self._seen_count[key]
+        cap = self.max_tokens_per_expert
+
+        for i in range(n_batch):
+            seen += 1
+            if len(reservoir) < cap:
+                # Reservoir not full — always accept.
+                reservoir.append(batch_cpu[i])
+            else:
+                # Reservoir sampling: replace a random element with
+                # probability cap/seen. Uses Python's random to avoid
+                # importing numpy in this hot path.
+                import random
+                j = random.randint(0, seen - 1)
+                if j < cap:
+                    reservoir[j] = batch_cpu[i]
+
+        self._seen_count[key] = seen
+
+    def finalize(self) -> None:
+        """Stack reservoir lists into contiguous tensors and free the lists."""
+        for key, reservoir in self._reservoir.items():
+            if reservoir:
+                self._finalized[key] = torch.stack(reservoir, dim=0)  # [n, d_out]
+            else:
+                self._finalized[key] = torch.empty(0, 0, dtype=torch.float32)
+        self._reservoir.clear()
+        self._seen_count.clear()
+
+    def get_representations(self, layer_idx: int, expert_idx: int) -> torch.Tensor | None:
+        """Return [n_tokens, d_out] on CPU, or None if no data collected."""
+        key = (layer_idx, expert_idx)
+        t = self._finalized.get(key)
+        if t is None:
+            # Check un-finalized reservoir as fallback.
+            reservoir = self._reservoir.get(key)
+            if reservoir:
+                return torch.stack(reservoir, dim=0)
+            return None
+        if t.numel() == 0:
+            return None
+        return t
+
+
+@dataclass
 class ReapAccumulator:
     """REAP score accumulator, GPU-resident during layer profiling.
 
@@ -305,10 +398,6 @@ class ReapAccumulator:
     def add_gpu(self, key: tuple[int, int], contrib: torch.Tensor, n_tokens: int) -> None:
         cur = self._gpu_sums.get(key)
         if cur is None:
-            # ``.clone()`` so the stored accumulator owns its storage. Caller
-            # ``record_reap`` computes a fresh 0-dim tensor per call today so
-            # the detach-only path would also work, but clone hardens against
-            # future callers who reuse buffers.
             self._gpu_sums[key] = contrib.detach().clone()
         else:
             cur.add_(contrib.detach())
@@ -360,16 +449,8 @@ class InputCovarianceAccumulator:
     token_count: dict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))
     storage_dtype: torch.dtype = torch.float32
     _alias_gate_up: bool = True
-    # GPU-resident transient storage, keyed the same way as ``covariance``.
     _gpu: dict[tuple[int, int, str], torch.Tensor] = field(default_factory=dict)
     _gpu_token_count: dict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))
-    # Thread lock guarding ``covariance`` and ``token_count`` dict mutations.
-    # Stage 3 runs ``spill_layer_to_disk`` on a background thread (overlapping
-    # I/O with the next layer's forward pass) while the main thread continues
-    # to ``finalize_layer`` for layer N+1. The two threads touch different
-    # KEYS but the SAME dict objects; CPython dict resize during another
-    # thread's pop/insert can corrupt the hash table even under the GIL.
-    # RLock so pop loops + helper methods can re-enter safely.
     _lock: "threading.RLock" = field(default_factory=lambda: threading.RLock())  # noqa: F821
 
     def set_storage_dtype(self, dtype: torch.dtype) -> None:
@@ -385,10 +466,8 @@ class InputCovarianceAccumulator:
         if flat.numel() == 0:
             return
         flat_f32 = flat.to(torch.float32)
-        cov = flat_f32.transpose(0, 1) @ flat_f32            # stays on GPU
+        cov = flat_f32.transpose(0, 1) @ flat_f32
         key = (layer_idx, expert_idx, matrix_name)
-        # _gpu / _gpu_token_count are touched only by the calling thread
-        # (forward hooks fire synchronously on the main thread) — no lock.
         cur = self._gpu.get(key)
         if cur is None:
             self._gpu[key] = cov
@@ -397,9 +476,6 @@ class InputCovarianceAccumulator:
         self._gpu_token_count[key] = self._gpu_token_count.get(key, 0) + flat.shape[0]
 
     def finalize_layer(self, layer_idx: int) -> None:
-        """Move every covariance for ``layer_idx`` from GPU to CPU in
-        ``storage_dtype``. Call once after a layer's profile is done; the
-        per-expert GPU tensors are freed afterwards."""
         keys = [k for k in self._gpu if k[0] == layer_idx]
         for k in keys:
             gpu_cov = self._gpu.pop(k)
@@ -417,33 +493,13 @@ class InputCovarianceAccumulator:
                 )
 
     def finalize_all(self) -> None:
-        """Move every GPU-resident covariance to CPU. Use when layers are
-        instrumented simultaneously (e.g. Stage 0) instead of one-at-a-time."""
         layer_ids = {k[0] for k in self._gpu}
         for li in layer_ids:
             self.finalize_layer(li)
 
     def spill_layer_to_disk(self, layer_idx: int, dir_path) -> None:
-        """Persist all in-memory entries for ``layer_idx`` to a single
-        ``layer_{layer_idx}.pt`` file under ``dir_path``, then drop them
-        from the in-memory dict. Bounds per-layer accumulators to disk —
-        required on hosts where the full per-(layer, expert) cov dict
-        would exceed the cgroup memory limit (a100-large = 142 GB).
-        Call :meth:`load_layer_from_disk` to bring a layer back when
-        the factor loop needs it.
-
-        Writes are **atomic**: tensors are saved to ``layer_{idx}.pt.tmp``
-        and only renamed to the final path after ``torch.save`` returns
-        successfully. A SIGKILL/OOM mid-write therefore leaves at most a
-        ``.tmp`` file (which the resume path doesn't recognize), never a
-        truncated final ``.pt`` that would silently load as garbage on
-        resume.
-        """
         import os
         from pathlib import Path
-        # Snapshot keys + payload under the lock so a concurrent
-        # finalize_layer (different keys but same dict) can't trigger a
-        # dict-resize while we're iterating.
         with self._lock:
             keys = [k for k in self.covariance if k[0] == layer_idx]
             if not keys:
@@ -456,26 +512,20 @@ class InputCovarianceAccumulator:
         out = Path(dir_path) / f"layer_{layer_idx}.pt"
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_suffix(out.suffix + ".tmp")
-        torch.save(payload, tmp)        # disk I/O — releases GIL, no lock
-        os.replace(tmp, out)            # atomic on POSIX, including FUSE
+        torch.save(payload, tmp)
+        os.replace(tmp, out)
         with self._lock:
             for k in keys:
                 self.covariance.pop(k, None)
 
     def load_layer_from_disk(self, layer_idx: int, dir_path) -> bool:
-        """Restore a previously spilled layer's entries to the in-memory
-        dict. Returns True if loaded, False if the file doesn't exist
-        (caller should treat as not-yet-computed)."""
         from pathlib import Path
         p = Path(dir_path) / f"layer_{layer_idx}.pt"
         if not p.exists():
             return False
         try:
             payload = torch.load(p, map_location="cpu")
-        except Exception as exc:                     # noqa: BLE001
-            # Most likely a torn .pt that snuck past the .tmp+rename
-            # guard (e.g. an old run on a previous version of this
-            # code). Raise with the path so it's actionable.
+        except Exception as exc:
             raise RuntimeError(
                 f"Failed to torch.load spill file {p}: {exc!r}. "
                 "The file is likely corrupt — delete it (or the whole "
@@ -501,9 +551,6 @@ class InputCovarianceAccumulator:
         return True
 
     def unload_layer(self, layer_idx: int) -> None:
-        """Drop in-memory entries for a layer (used after a lazy-load+use
-        cycle during the factor phase). Token counts are left in place
-        since they're tiny."""
         with self._lock:
             for k in [k for k in self.covariance if k[0] == layer_idx]:
                 self.covariance.pop(k, None)
@@ -704,8 +751,6 @@ def capture_router_outputs(layer_refs: list[MoELayerRef]):
             logits = F.linear(x, router.weight)
             if getattr(router, "bias", None) is not None:
                 logits = logits + router.bias
-            # Do NOT detach: teacher logits are captured inside torch.no_grad() so they
-            # have no grad_fn anyway; student logits need grad_fn for backward() to work.
             storage[li].append(logits)
         return _h
 
