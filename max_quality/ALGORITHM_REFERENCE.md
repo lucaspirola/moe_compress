@@ -332,15 +332,15 @@ SVD factorization reduces parameters from `d_out × d_in` to `k × (d_out + d_in
 
 #### Phase A: Covariance Collection (B and cross-covariance C)
 
-**B-covariance** `B = X_post^T X_post`: Run the pruned (post-Stage-2) model on fresh calibration data to collect per-(layer, expert, matrix) input covariances reflecting the distribution the compressed model will see after merging.
+**Dual-forward collection on H200:** Both the original (teacher) model and the pruned (student) model are loaded in VRAM simultaneously (~70 GB + ~50 GB = ~120 GB on H200's 141 GB). For each calibration batch, the teacher forwards first, then the student. Hooks on both models collect:
 
-**Cross-covariance** `C = X_pre^T X_post`: Run both the original model and the pruned model on the same calibration batch simultaneously. For each batch: forward original → collect `X_pre`; forward pruned → collect `X_post`; accumulate `C += X_pre^T @ X_post`. This gives the exact cross-covariance required by AA-SVD Theorem 3.2.
+**B-covariance** `B = X_post^T X_post`: Auto-covariance of the pruned model's per-expert inputs. Reflects the input distribution the compressed model will see at inference.
 
-Requires H200 (141 GB VRAM): original BF16 (~70 GB) + pruned BF16 (~50 GB) = ~120 GB.
+**Cross-covariance** `C = X_pre^T X_post`: For each (layer, student_expert), the teacher's hidden state at the same token positions that the student routes to that expert is captured. `C` is accumulated as `X_pre^T @ X_post` per batch. This gives the exact cross-covariance required by AA-SVD Theorem 3.2 (paper 2604.02119): "what would the original model have produced for the inputs that the compressed model actually receives."
 
-**Single-pass collection:** All 40 MoE layers are hooked simultaneously in a single calibration pass (not one pass per layer). Peak CPU RAM is ~88 GB for all accumulated covariances; this is feasible on H200 instances. Per-layer spill to disk still applies after each layer's accumulation is finalised, keeping the resident footprint bounded.
+The teacher model is freed from VRAM after covariance collection completes — it is not needed for the factoring phase.
 
-All covariances are written to `_stage3_bcov_partial/layer_{idx}.pt`. Background I/O thread overlaps spill with the next batch's forward pass.
+**Per-layer spill:** All 40 MoE layers are hooked simultaneously in a single calibration pass (not one pass per layer). After each layer's accumulation is finalised, both B and C covariances are spilled to disk (`_stage3_bcov_partial/` and `_stage3_ccov_partial/`). Background I/O thread overlaps spill with the next batch's forward pass, keeping the resident footprint bounded.
 
 #### Phase B: D-Rank Allocation (Paper 2509.25622, Eq. 2 & 6)
 
@@ -377,15 +377,23 @@ Per-expert ranks are stored in the `FactoredExperts` slot at the max rank across
 
 For each (layer, expert, matrix):
 
-**Paper-exact path (H200 — cross-covariance C and B available):**
+**Path 1 — Paper-exact Theorem 3.2 (primary on H200, cross-covariance C available):**
 
 ```
 M = W · C · B⁻¹ · L_B        where C = X_pre^T X_post
 ```
 
-This is the exact AA-SVD Theorem 3.2 formula. `L_B` is the eigendecomposition-based square root of B.
+This is the exact AA-SVD Theorem 3.2 formula. `L_B` is the eigendecomposition-based square root of B. The cross-covariance `C` is collected during Phase A's dual-forward pass.
 
-**Fallback when only B is available (A = None):** Falls back to Corollary 3.3:
+**Path 2 — Auto-covariance approximation (C unavailable, A available):**
+
+```
+M = W · A · B⁻¹ · L_B        where A = X_pre^T X_pre
+```
+
+Substitutes pre-prune auto-covariance for cross-covariance. The two coincide when pre/post distributions are similar (light pruning). Active when `aa_svd.cross_covariance: false` in config.
+
+**Path 3 — Corollary 3.3 fallback (B only):**
 
 ```
 M = W · L_B
@@ -612,9 +620,9 @@ Each heavy stage (2–5) uploads its checkpoint to a per-stage Hub repo immediat
 | D3 | 1 | γ entropy tolerance | 2604.06542 Eq. 10: γ∈[0,1], no default given | γ=0.1 (project-chosen, not from paper) | Paper leaves γ unspecified; 0.1 chosen empirically |
 | D4 | 1 | D^l update after merge | 2604.06542 Algorithm 1 lines 11–12: zero only pair entry D_{i*,j*} and D_{j*,i*}; update R^l ← R^l − 2·D_{i*,j*} | Zeros the absorbed expert's entire row and column in D^l; recomputes R^l from updated matrix | Prevents the absorbed expert from influencing future pair-selection; the paper's update assumes the merged expert cannot be re-selected, but only zeroing the pair entry leaves stale similarity values that can distort R^l and layer selection in subsequent iterations |
 | D5 | 1 | Floor without layer bonuses | GRAPE has no floor constraints | min_experts_per_layer = num_routed_experts // 2 (=128); no early/late layer bonuses | 50% max removal per layer bounds the compression within the range where papers demonstrate results; bonuses removed — the floor alone is sufficient |
-| D6 | 3 | AA-SVD auto-covariance fallback | 2604.02119 Theorem 3.2 requires cross-covariance `X_pre^T X_post` | H200: exact cross-cov via dual-forward (paper-exact); fallback code path substitutes `X_pre^T X_pre` but is inactive on H200 | Cross-covariance requires both models in VRAM simultaneously (~120 GB); fallback retained for non-H200 hardware only |
+| D6 | 3 | AA-SVD cross-covariance scope | 2604.02119 Theorem 3.2 requires cross-covariance for all linear layers | Cross-covariance C collected for gate_proj/up_proj (input-side) via dual-forward; down_proj falls back to Corollary 3.3 (B-only) because the teacher's per-expert intermediate activations require full expert dispatch instrumentation | Gate/up inputs share the same hidden state (pre-routing) so one capture covers both; down_proj inputs are expert-internal (post gate+up) and differ between teacher and student expert sets |
 | D7 | 3 | D-Rank ω adapted for MoE | 2509.25622 Eq. 7: ω = d₁ + n·d₂ (layers per group × dimensions) | ω = n_experts × (d_out + d_in) | D-Rank targets shared-basis layer groups; adapted for MoE expert groups |
-| D8 | 3 | Swift-SVD+ β and ε* | 2604.01609 Alg. 2: β = end-to-end layer importance [1,2]; ε* = raw Frobenius loss ‖XW−XW*‖_F | β = per-expert spectral energy share; ε* = normalized tail energy ratio | Layer importance requires extra forward passes; spectral proxy adapted for within-group expert redistribution |
+| D8 | 3 | Swift-SVD+ β | 2604.01609 Alg. 2: β = end-to-end layer importance, min-max normalized to [1,2] | β = per-expert spectral energy share (σ_i² / Σ σ_j²) | Paper's β is per-layer importance (requires 40 extra forward passes); adapted to per-expert within-group redistribution where the paper has no solution. ε* is now activation-weighted via Stage 2 A-covariance (no longer a deviation) |
 | D9 | 3 | α selection criterion | 2604.01609 §3.2.2: select α by validation-set end-to-end performance | Minimises total tail spectral energy — no forward passes | Validation evaluation per α requires 11× model-scale forward passes |
 | D10 | 4 | Eigenspace noise-floor truncation | 2410.21271 Alg. 1: full Q ∈ ℝ^{k×k} used; QQ^T = I guarantees Theorem 1 exactness | Eigenvectors below noise floor discarded; n_keep < k retained before SVD | Suppresses near-zero noise directions; weakens Theorem 1 exactness but improves numerical stability |
 | D11 | 5 | Calibration data source | 2603.02217 §F.3 Table 1: calibration dataset = c4 (used identically across all experiments) | Multi-domain Nemotron-Cascade-2-SFT-Data with weighted subsets (chat 0.56, math 0.21, science 0.11, etc.) | Task-aware calibration better matches target deployment distribution; c4 is general pre-training data with limited reasoning/code coverage |
