@@ -77,7 +77,7 @@ def run(
     per_layer_target = {
         int(k): int(v) for k, v in budgets_payload["per_layer_target_experts"].items()
     }
-    blacklist_payload = load_json_artifact(artifacts_dir / "stage0_blacklist.json")
+    blacklist_payload = load_json_artifact(artifacts_dir / "stage1_blacklist.json")
     blacklist = {int(k): list(v) for k, v in blacklist_payload.get("blacklist", {}).items()}
 
     spec = spec_from_config(cal, num_sequences_override=s2["num_calibration_samples"])
@@ -119,8 +119,6 @@ def run(
         freq = {int(k): int(v) for k, v in data["freq"].items()}
         merge_map_layer = {int(k): list(v) for k, v in data["merge_map_layer"].items()}
 
-        # Guard: the model passed in must be pre-merge (Stage 1 output) to
-        # avoid double-merging already-processed layers on resume.
         n_pre_merge = len(freq)
         if ref.num_routed_experts != n_pre_merge:
             raise RuntimeError(
@@ -137,9 +135,6 @@ def run(
             bank.select(centroid_ids)
         _resize_router_for_kept_experts(ref, centroid_ids)
 
-        # The model has already been mutated above (merge + select + resize);
-        # a covariance load failure here means the process must be restarted
-        # with a fresh (pre-Stage-2) model, not just with _stage2_partial/ deleted.
         try:
             cov_acc.load_layer_from_disk(ref.layer_idx, partial_dir)
         except Exception as _exc:
@@ -153,9 +148,6 @@ def run(
         completed_layers.add(ref.layer_idx)
         log.info("Stage 2: layer %d resumed from partial (skipping profile + merge)",
                  ref.layer_idx)
-        # Re-populate cost history so Strategy C's running mean is warm on resume.
-        # Mirror the live-path guard (delta.size > 0): skip 0.0 entries from
-        # no-prune layers to avoid biasing the running mean downward.
         val = data.get("mean_cost_per_pair")
         if val is not None and val > 0.0:
             _layer_mean_costs.append(float(val))
@@ -184,13 +176,11 @@ def run(
         )
         reap_acc = ReapAccumulator()
         ream_acc = ReamCostAccumulator()
-        torch.cuda.empty_cache()   # release fragmented reserved-but-unallocated memory before forward pass
+        torch.cuda.empty_cache()
         _profile_layer(
             model, layer_ref, batches, reap_acc, cov_acc, ream_acc,
             device=device,
         )
-        # Drain GPU-resident accumulators to CPU once per layer (avoid the
-        # per-expert-per-sample stall from the pre-refactor implementation).
         reap_acc.finalize_layer(layer_ref.layer_idx)
         cov_acc.finalize_layer(layer_ref.layer_idx)
 
@@ -199,14 +189,13 @@ def run(
         scores = np.array([reap_acc.score(layer_ref.layer_idx, e) for e in range(n_experts)])
         freq = {e: reap_acc.freq.get((layer_ref.layer_idx, e), 0) for e in range(n_experts)}
 
-        # --- Budget bump loop (Strategy B: max_group_size cap; Strategy C: REAM cost gate) ---
         effective_target = target
         centroid_ids: list[int] = []
         noncentroid_ids: list[int] = []
         grouped: dict[int, list[int]] = {}
         delta = np.empty(0)
         assignment: list[int] = []
-        running_mean: float = 0.0  # defined here so it's always in scope for the warning log
+        running_mean: float = 0.0
 
         for _bump_attempt in range(n_experts - target + 1):
             centroid_ids = sorted(protected)
@@ -216,7 +205,7 @@ def run(
                 e = int(_e)
                 if e in protected:
                     continue
-                if freq[e] < min_active_tokens:  # skip dead experts (reap_min_active_tokens)
+                if freq[e] < min_active_tokens:
                     continue
                 centroid_ids.append(e)
             centroid_ids = sorted(centroid_ids)
@@ -271,7 +260,7 @@ def run(
                 )
             effective_target = min(effective_target + bump, n_experts)
             if effective_target >= n_experts:
-                continue  # run loop body once more with all experts as centroids
+                continue
 
         assert all(a >= 0 for a in assignment), (
             f"Layer {layer_ref.layer_idx}: _assign_children_to_centroids returned "
@@ -279,7 +268,7 @@ def run(
             f"n_children={len(noncentroid_ids)}, n_centroids={len(centroid_ids)}"
         )
 
-        if delta.size > 0:  # skip no-prune layers (zero-cost entries bias the running mean)
+        if delta.size > 0:
             _layer_mean_costs.append(float(delta.sum()) / int(delta.size))
 
         _merge_experts_inplace(
@@ -293,7 +282,6 @@ def run(
             bank.select(centroid_ids)
         _resize_router_for_kept_experts(layer_ref, centroid_ids)
 
-        # Free REAM activation-space accumulators for this layer.
         ream_acc.clear_layer(layer_ref.layer_idx)
 
         merge_map[layer_ref.layer_idx] = {
@@ -302,9 +290,6 @@ def run(
         }
         _remap_covariance_for_layer(cov_acc, layer_ref.layer_idx, centroid_ids)
 
-        # Atomically persist this layer's output for crash-resume.
-        # Uses a non-destructive snapshot (does NOT remove from cov_acc memory) so
-        # the final _save_covariance call at the end of run() sees the full dataset.
         _snapshot_cov_layer(cov_acc, layer_ref.layer_idx, partial_dir)
         _write_merge_json(
             partial_dir, layer_ref.layer_idx, centroid_ids, grouped, freq,
@@ -333,9 +318,6 @@ def run(
         })
 
     out_dir = artifacts_dir / "stage2_pruned"
-    # Write covariance FIRST: if the job is killed after the checkpoint but
-    # before the covariance, Stage 3 would find stage2_pruned/ but no covariance
-    # and fail; worse, a Stage 2 re-run would double-merge already-merged layers.
     _save_covariance(cov_acc, artifacts_dir / "_stage2_input_covariance.pt")
     save_compressed_checkpoint(
         model, tokenizer, out_dir,
@@ -358,16 +340,6 @@ def _snapshot_cov_layer(
     layer_idx: int,
     partial_dir: Path,
 ) -> None:
-    """Atomically write layer_idx's covariance to partial_dir WITHOUT removing it from memory.
-
-    Unlike InputCovarianceAccumulator.spill_layer_to_disk (which pops the keys),
-    this snapshot is non-destructive so _save_covariance at the end of run() still
-    sees the full accumulated dataset.
-
-    INVARIANT: _remap_covariance_for_layer must be called for this layer BEFORE
-    _snapshot_cov_layer. Snapshotting before remapping persists pre-merge expert keys,
-    which resume would load back into the already-merged model, corrupting stage3 inputs.
-    """
     with cov_acc._lock:
         keys = [k for k in cov_acc.covariance if k[0] == layer_idx]
         if not keys:
@@ -408,7 +380,7 @@ def _write_merge_json(
 
 
 # ---------------------------------------------------------------------------
-# Per-layer profiling: REAP + input covariance via instrument_experts
+# Per-layer profiling
 # ---------------------------------------------------------------------------
 
 
@@ -424,37 +396,24 @@ def _profile_layer(
 ) -> None:
     layer_idx = layer_ref.layer_idx
     n_experts = layer_ref.num_routed_experts
-    model.eval()  # ensure dropout/batchnorm are in eval mode for calibration
+    model.eval()
 
-    # Track batch offset for global token indexing in gate logit profiles.
     _batch_offset = [0]
 
     def input_cb(li, e, tensor, ctx):
-        # Input to gate_proj + up_proj share the same tensor; the accumulator
-        # aliases them so a single gate_proj update covers both.
         cov_acc.update(li, e, "gate_proj", tensor)
 
     def intermediate_cb(li, e, tensor, ctx):
-        # Input to down_proj.
         cov_acc.update(li, e, "down_proj", tensor)
-        # REAM: per-neuron activation magnitude for C_act alignment (paper §4).
         ream_acc.record_neuron_activations(li, e, tensor)
 
     def down_cb(li, e, tensor, ctx):
-        # REAP contribution per expert dispatch event.
         record_reap(reap_acc, li, e, ctx["top_k_weights"], tensor)
-        # REAM: record gated expert output keyed by global token index for
-        # exact per-token pairwise cosine sim (paper Eq. 8).
         ream_acc.record_gated_output(
             li, e, ctx["top_k_weights"], tensor,
             ctx["token_idx"], _batch_offset[0],
         )
 
-    # Two independent hooks active simultaneously:
-    # 1. capture_router_outputs: pre-forward hook on router → pre-softmax logits [T, E]
-    # 2. instrument_experts: monkey-patched forward on experts → per-expert callbacks
-    # The router hook fires first (pre-forward), then the experts hook fires
-    # during the forward. They don't interfere.
     with instrument_experts(
         layer_ref,
         {"input": input_cb, "intermediate": intermediate_cb, "down": down_cb},
@@ -463,24 +422,17 @@ def _profile_layer(
             if device is not None:
                 batch = batch.to(device)
             _batch_offset[0] = batch_idx * batch.shape[0] * batch.shape[1]
-            # Clear the router logits storage for this batch (it accumulates
-            # across forward passes within the context manager).
             router_logits_storage[layer_idx].clear()
             with torch.no_grad():
                 model(input_ids=batch)
-            # Scatter the pre-softmax router logits into per-expert profiles.
-            # capture_router_outputs appends one [T, E] tensor per forward call.
             if router_logits_storage[layer_idx]:
-                batch_logits = router_logits_storage[layer_idx][-1]  # [T, E]
+                batch_logits = router_logits_storage[layer_idx][-1]
                 ream_acc.record_router_logits(layer_idx, batch_logits, _batch_offset[0])
-            # After each batch, compute pairwise gated output similarities
-            # incrementally to avoid storing all outputs across batches.
             ream_acc.finalize_batch(layer_idx, n_experts)
 
 
 # ---------------------------------------------------------------------------
-# REAM cost (activation-space, paper 2604.04356 Eq. 5 & 8)
-# + greedy pseudo-pruning assignment (paper §4)
+# REAM cost + assignment
 # ---------------------------------------------------------------------------
 
 
@@ -491,12 +443,6 @@ def _ream_cost_matrix(
     *,
     ream_acc: ReamCostAccumulator,
 ) -> np.ndarray:
-    """Compute REAM cost δ_REAM(i,j) = δ_gate(i,j) + δ̃_expert(i,j) using
-    activation-space similarities per paper 2604.04356 Eq. 5 & 8.
-
-    - δ_gate: cosine similarity between per-token gate logit profile vectors
-    - δ̃_expert: mean cosine similarity between gated expert outputs
-    """
     if not noncentroid_ids or not centroid_ids:
         return np.zeros((len(noncentroid_ids), len(centroid_ids)))
 
@@ -507,7 +453,7 @@ def _ream_cost_matrix(
         for cj, centroid in enumerate(centroid_ids):
             dg = ream_acc.compute_delta_gate(li, child, centroid)
             de = ream_acc.compute_delta_expert(li, child, centroid)
-            cost[ci, cj] = dg + de  # paper Eq. 7: unweighted sum
+            cost[ci, cj] = dg + de
 
     return cost
 
@@ -516,32 +462,17 @@ def _assign_children_to_centroids(
     cost: np.ndarray, n_children: int, n_centroids: int,
     centroid_saliency_order: list[int] | None = None,
 ) -> list[int]:
-    """Greedy pseudo-pruning per REAM paper §4.
-
-    Iterate centroids in descending saliency order. For each centroid,
-    greedily absorb the most-similar (lowest-cost) unassigned non-centroid.
-    Repeat until all non-centroids are assigned.
-
-    This replaces the previous Hungarian assignment (which was a global
-    bipartite matching — not what the paper describes).
-    """
     if n_children == 0 or n_centroids == 0:
         return []
 
     assignment = [-1] * n_children
     assigned = set()
 
-    # If saliency order not provided, use column index order (centroids are
-    # already sorted by REAP score in the caller).
     centroid_order = centroid_saliency_order if centroid_saliency_order else list(range(n_centroids))
 
-    # Keep assigning until all children are assigned. Multiple passes may be
-    # needed since each centroid takes at most one child per pass. This is
-    # equivalent to the paper's "up to C" greedy assignment.
     while len(assigned) < n_children:
         made_progress = False
         for c_idx in centroid_order:
-            # Find the cheapest unassigned child for this centroid.
             best_child = -1
             best_cost = float("inf")
             for ch in range(n_children):
@@ -565,7 +496,7 @@ def _assign_children_to_centroids(
 
 
 # ---------------------------------------------------------------------------
-# Frequency-weighted merge (bank-aware)
+# Merge + router resize + covariance I/O
 # ---------------------------------------------------------------------------
 
 
@@ -577,23 +508,10 @@ def _permutation_align_to_centroid(
     ref_act_mean: torch.Tensor | None = None,
     child_act_mean: torch.Tensor | None = None,
 ) -> np.ndarray:
-    """Return the permutation of the child's intermediate dimension that best
-    aligns its neurons to the centroid's, minimising the combined cost
-    C = C_wt + C_act (REAM §4).
-
-    C_wt: gate+up Frobenius distance between neuron weight rows.
-    C_act: L2 distance between per-neuron mean activation magnitudes.
-
-    perm[i] = child neuron index that should map to centroid position i.
-    Applied as: gate_child[perm, :], up_child[perm, :], down_child[:, perm].
-    """
     C = (
         torch.cdist(ref_gate.cpu(), child_gate.cpu())
         + torch.cdist(ref_up.cpu(), child_up.cpu())
     )
-    # C_act: per-neuron activation distance (paper §4, "activation and weight
-    # permutation alignment"). Each neuron's mean activation magnitude is a
-    # scalar; cdist on [d_int, 1] gives pairwise L2 = pairwise |diff|.
     if ref_act_mean is not None and child_act_mean is not None:
         C = C + torch.cdist(
             ref_act_mean.cpu().unsqueeze(-1),
@@ -611,16 +529,6 @@ def _merge_experts_inplace(
     freq_weighted: bool,
     ream_acc: ReamCostAccumulator | None = None,
 ) -> None:
-    """Write the frequency-weighted average of each group into the centroid
-    slot of the stacked tensors.
-
-    Before averaging, each child expert's intermediate neurons are permuted to
-    align with the centroid's neurons via Hungarian assignment on the combined
-    C = C_wt + C_act cost matrix (REAM §4). C_wt uses gate+up weight distances;
-    C_act uses per-neuron mean activation magnitude distances (from ream_acc).
-    The centroid itself is averaged in as-is (identity permutation).
-    ``select`` afterwards drops non-centroid rows.
-    """
     banks = build_banks(layer_ref)
     li = layer_ref.layer_idx
     with torch.no_grad():
@@ -681,11 +589,6 @@ def _resize_router_for_kept_experts(layer_ref: MoELayerRef, kept_ids: list[int])
         mlp.num_experts = len(kept_ids)
 
 
-# ---------------------------------------------------------------------------
-# Covariance I/O + post-merge remap (preserves Round-1 fix)
-# ---------------------------------------------------------------------------
-
-
 def _save_covariance(cov: InputCovarianceAccumulator, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"covariance": cov.covariance, "tokens": dict(cov.token_count)}, path)
@@ -712,8 +615,4 @@ def _remap_covariance_for_layer(
             new_key = (li, id_to_new[eidx], name)
             new_cov[new_key] = val
             new_tokens[new_key] = cov.token_count.get(key, 0)
-        # NOTE: snapshot was written post-remap; do NOT call
-        # _remap_covariance_for_layer again on resume for already-remapped layers.
-        # Tuple-assign so both dicts swap in a single bytecode instruction,
-        # preventing any code path from observing a mismatched pair.
         cov.covariance, cov.token_count = new_cov, new_tokens
