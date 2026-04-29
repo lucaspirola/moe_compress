@@ -98,9 +98,16 @@ stage3_svd:
       down_proj: 1.0
   swift_svd_plus:
     alpha_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    validation_samples: 512       # WikiText-2 slice for α selection
-    metric: wikitext2_ppl
-    per_group_type: true          # pick α separately for gate/up/down_proj
+    validation_samples: 512       # WikiText-2 sequences for paper-exact α selection (§3.2.2).
+                                  # For each α candidate, the full model is factored at the
+                                  # corresponding per-expert ranks and evaluated end-to-end.
+                                  # 11 candidates × ~3 min ≈ ~33 min on H200.
+                                  # Set to 0 to use spectral proxy (no forward passes, seconds).
+    validation_batch_size: 16     # Batch size for WikiText-2 PPL evaluation during α search.
+    metric: wikitext2_ppl         # End-to-end metric for α selection.
+    per_group_type: true          # Per-projection-type α refinement via spectral proxy
+                                  # after the global validation-based search. The paper
+                                  # uses a single α; per-type is our extension.
   aa_svd:
     use_post_prune_inputs: true   # B = pruned-model inputs
     cross_covariance: true        # Collect C = X_pre^T X_post via dual-forward (paper-exact
