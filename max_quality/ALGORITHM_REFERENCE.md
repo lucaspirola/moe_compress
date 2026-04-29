@@ -369,7 +369,13 @@ where:
 - `ε*_i = √(Σ_{j>k̄} σ_j² / Σ_j σ_j²)` — reconstruction error at the group's mean rank `k̄` (higher = this expert needs more rank)
 - `α ∈ [0, 1]` — balances the two signals
 
-**α grid search:** For each projection type (if `per_group_type: true`), evaluate all `α ∈ {0.0, 0.1, ..., 1.0}` and pick the α that minimises total tail spectral energy across all experts in that type. This takes seconds (purely weight-space SVD, no forward passes).
+**α selection (paper §3.2.2 — validation-based):** For each candidate α ∈ {0.0, 0.1, ..., 1.0}, the full model is factored at the corresponding per-expert ranks using AA-SVD (reusing B/C covariance from Phase A spill files) and evaluated on WikiText-2 PPL (`validation_samples: 512` sequences). The α yielding the lowest end-to-end perplexity is selected. This implements the paper's exact procedure: *"For each candidate corresponding to α_i, the optimal low-rank approximation of every layer is computed using the closed-form solution in (3). The resulting compressed models are then evaluated on a validation set, and the candidate that yields the best end-to-end performance is selected."*
+
+The factoring reuses cached spectral components from Phase A's B-covariance collection; each candidate requires ~2 minutes for a full 40-layer factor pass and ~20 seconds for PPL evaluation on H200. No model copies are made — originals are snapshotted to CPU RAM (~50 GB; H200 has 256 GB host RAM) and restored after each evaluation. Total α search: ~33 minutes for 11 candidates.
+
+When `per_group_type: true`, per-projection-type α is further refined from the global optimum using a spectral energy proxy (no forward passes, seconds). This per-type refinement is an extension beyond the paper, which uses a single α for all projections.
+
+When `validation_samples: 0`, the search falls back to the spectral energy proxy for all α selection (no forward passes, seconds). This is faster but does not capture end-to-end interaction effects.
 
 Per-expert ranks are stored in the `FactoredExperts` slot at the max rank across experts in the group (zero-padded for experts with lower rank). `effective_ranks` tracks the true per-expert rank for honest parameter counting.
 
@@ -623,7 +629,6 @@ Each heavy stage (2–5) uploads its checkpoint to a per-stage Hub repo immediat
 | D6 | 3 | AA-SVD cross-covariance scope | 2604.02119 Theorem 3.2 requires cross-covariance for all linear layers | Cross-covariance C collected for gate_proj/up_proj (input-side) via dual-forward; down_proj falls back to Corollary 3.3 (B-only) because the teacher's per-expert intermediate activations require full expert dispatch instrumentation | Gate/up inputs share the same hidden state (pre-routing) so one capture covers both; down_proj inputs are expert-internal (post gate+up) and differ between teacher and student expert sets |
 | D7 | 3 | D-Rank ω adapted for MoE | 2509.25622 Eq. 7: ω = d₁ + n·d₂ (layers per group × dimensions) | ω = n_experts × (d_out + d_in) | D-Rank targets shared-basis layer groups; adapted for MoE expert groups |
 | D8 | 3 | Swift-SVD+ β | 2604.01609 Alg. 2: β = end-to-end layer importance, min-max normalized to [1,2] | β = per-expert spectral energy share (σ_i² / Σ σ_j²) | Paper's β is per-layer importance (requires 40 extra forward passes); adapted to per-expert within-group redistribution where the paper has no solution. ε* is now activation-weighted via Stage 2 A-covariance (no longer a deviation) |
-| D9 | 3 | α selection criterion | 2604.01609 §3.2.2: select α by validation-set end-to-end performance | Minimises total tail spectral energy — no forward passes | Validation evaluation per α requires 11× model-scale forward passes |
 | D10 | 4 | Eigenspace noise-floor truncation | 2410.21271 Alg. 1: full Q ∈ ℝ^{k×k} used; QQ^T = I guarantees Theorem 1 exactness | Eigenvectors below noise floor discarded; n_keep < k retained before SVD | Suppresses near-zero noise directions; weakens Theorem 1 exactness but improves numerical stability |
 | D11 | 5 | Calibration data source | 2603.02217 §F.3 Table 1: calibration dataset = c4 (used identically across all experiments) | Multi-domain Nemotron-Cascade-2-SFT-Data with weighted subsets (chat 0.56, math 0.21, science 0.11, etc.) | Task-aware calibration better matches target deployment distribution; c4 is general pre-training data with limited reasoning/code coverage |
 
@@ -639,11 +644,11 @@ Each heavy stage (2–5) uploads its checkpoint to a per-stage Hub repo immediat
 | 2604.04356 | REAM: Routing Expert Activation Merging | 2026 | Stage 2 (merging) |
 | 2509.25622 | D-Rank: Spectral Entropy Rank Allocation | 2025 | Stage 3 (rank budget) |
 | 2604.02119 | AA-SVD: Anchored Adaptive SVD for LLMs | 2026 | Stage 3 (factorization) |
-| 2604.01609 | Swift-SVD+: Dynamic Non-Uniform Rank Allocation | 2026 | Stage 3 (α grid search) |
+| 2604.01609 | Swift-SVD+: Dynamic Non-Uniform Rank Allocation | 2026 | Stage 3 (α validation search + rank redistribution) |
 | 2503.12340 | SVD-LLM V2: Per-Type Rank Allocation | 2025 | Stage 3 (motivation) |
 | 2410.21271 | EoRA: Training-Free Compensation for Compressed LLMs | 2024 | Stage 4 |
 | 2603.02217 | Router Knowledge Distillation for MoE Compression | 2026 | Stage 5 |
 
 ---
 
-*This document was generated from a full algorithmic review of the max_quality codebase on 2026-04-28; §12 updated 2026-04-29 after a per-stage paper compliance audit including full methodology-section cross-reference of all 10 cited papers. Spec redesign on 2026-04-29: merged Stage 0 into Stage 1 (CKA + SE detection), floor=n//2, max_merge_group=8, Router KD bs=8. All formulas were verified against the cited papers' methodology sections. All deviations are deliberate and documented. For the original validation audit, see the archived [VALIDATED_STRATEGIES.md](https://huggingface.co/pirola/moe-compression-workflow/blob/main/VALIDATED_STRATEGIES.md).*
+*This document was generated from a full algorithmic review of the max_quality codebase on 2026-04-28; §12 updated 2026-04-29 after a per-stage paper compliance audit including full methodology-section cross-reference of all 10 cited papers. Spec redesign on 2026-04-29: merged Stage 0 into Stage 1 (CKA + SE detection), floor=n//2, max_merge_group=8, Router KD bs=8. D9 resolved on 2026-04-30: Swift-SVD+ α selection now uses paper-exact WikiText-2 PPL validation (§3.2.2 of 2604.01609) instead of spectral proxy; D9 removed from §12. All formulas were verified against the cited papers' methodology sections. All deviations are deliberate and documented. For the original validation audit, see the archived [VALIDATED_STRATEGIES.md](https://huggingface.co/pirola/moe-compression-workflow/blob/main/VALIDATED_STRATEGIES.md).*
