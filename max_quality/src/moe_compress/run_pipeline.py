@@ -11,12 +11,12 @@ Usage:
 
 Each stage:
 1. verifies its dependency artifacts exist
-2. loads the checkpoint from the previous stage (or the original for Stage 0)
+2. loads the checkpoint from the previous stage (or the original for Stage 1)
 3. runs its ``run(...)`` function
 4. writes its artifact(s) atomically
 
-Stage resume: ``--resume-from-stage N`` skips 0..N-1 and loads the Stage (N-1)
-checkpoint if it exists on disk.
+Stage resume: ``--resume-from-stage N`` skips stages before N and loads the
+Stage (N-1) checkpoint if it exists on disk.
 """
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ import yaml
 
 from .budget import solver as budget_solver
 from . import (
-    stage0_super_experts,
     stage1_grape,
     stage2_reap_ream,
     stage3_svd,
@@ -51,8 +50,7 @@ log = logging.getLogger(__name__)
 
 
 def _finish_stage(stage_idx: int, t_start: float, repo_id: str | None) -> None:
-    """Log stage completion + push timing scalar to Trackio. The repo name is
-    a string and goes to stdout only — Trackio metrics are scalars."""
+    """Log stage completion + push timing scalar to Trackio."""
     dt = time.monotonic() - t_start
     h = int(dt // 3600); m = int((dt % 3600) // 60); s = int(dt % 60)
     log.info("Stage %d done in %dh%02dm%02ds — durable on Hub: %s",
@@ -61,7 +59,6 @@ def _finish_stage(stage_idx: int, t_start: float, repo_id: str | None) -> None:
 
 
 STAGE_REGISTRY = {
-    0: ("stage0_blacklist.json",               "original"),
     1: ("stage1_budgets.json",                 "original"),
     2: ("stage2_pruned",                       "original"),
     3: ("stage3_svd",                          "stage2_pruned"),
@@ -92,22 +89,31 @@ def main(argv=None) -> int:
     log.info("Artifacts directory: %s", artifacts_dir)
     log.info("Pipeline target: %.1f%% total parameter reduction", config["target"]["total_reduction_ratio"] * 100)
 
-    # Figure out which checkpoint to load for the starting stage.
     start = args.resume_from_stage
     stop = args.stop_after_stage
     model, tokenizer = _load_for_stage(start, config, artifacts_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if start <= 0 <= stop:
-        log.info("=== Stage 0 — Super Expert Detection ===")
-        stage0_super_experts.run(model, tokenizer, config, artifacts_dir, device=device)
-    if stop < 1:
-        log.info("Stopping after stage %d as requested.", stop)
-        return 0
-
     if start <= 1 <= stop:
-        log.info("=== Budget Solver ===")
-        blacklist_payload = load_json_artifact(artifacts_dir / "stage0_blacklist.json")
+        log.info("=== Stage 1 — Super Expert Detection + GRAPE Budgets ===")
+        t1 = time.monotonic()
+
+        # First pass: approximate budget (blacklist unknown yet)
+        decomposition = budget_solver.solve(
+            model,
+            target_total_reduction=config["target"]["total_reduction_ratio"],
+            expert_svd_ratio=config["target"]["expert_svd_ratio"],
+            min_experts_per_layer=config["stage1_grape"]["min_experts_per_layer"],
+            blacklisted_experts={},
+        )
+
+        # Stage 1: SE detection + CKA + GRAPE
+        blacklist_path, budgets_path = stage1_grape.run(
+            model, tokenizer, config, artifacts_dir, decomposition, device=device,
+        )
+
+        # Re-run budget solver with actual blacklist for accurate decomposition
+        blacklist_payload = load_json_artifact(blacklist_path)
         blacklist = {int(k): list(v) for k, v in blacklist_payload.get("blacklist", {}).items()}
         decomposition = budget_solver.solve(
             model,
@@ -119,8 +125,7 @@ def main(argv=None) -> int:
         (artifacts_dir / "budget_decomposition.json").write_text(
             __import__("json").dumps(decomposition.as_dict(), indent=2)
         )
-        log.info("=== Stage 1 — GRAPE Budgets ===")
-        stage1_grape.run(model, config, artifacts_dir, decomposition)
+        _finish_stage(1, t1, None)
     else:
         decomp_path = artifacts_dir / "budget_decomposition.json"
         if decomp_path.exists():
@@ -129,18 +134,11 @@ def main(argv=None) -> int:
                 k: v for k, v in payload.items() if k in budget_solver.BudgetDecomposition.__dataclass_fields__
             })
         else:
-            decomposition = None  # not needed for Stage 4+
+            decomposition = None
+
     if stop < 2:
         log.info("Stopping after stage %d as requested.", stop)
         return 0
-
-    # FIX (review bug #3): keep the model alive across Stages 2-5. The
-    # saved checkpoints between those stages are artifacts for post-mortem
-    # / future custom-loader resumption only; HF `from_pretrained` cannot
-    # reload a state_dict that contains per-layer-variable `num_experts` and
-    # `_FactoredLinear` submodules without additional plumbing. For that
-    # reason, ``--resume-from-stage`` values >2 fall back to the original
-    # checkpoint today (documented limitation, see README.md Risk register).
 
     # Make the optional save a no-op if the caller asked us to skip it.
     if args.skip_save:
@@ -211,7 +209,7 @@ def _parse(argv) -> argparse.Namespace:
     p.add_argument("--model", default=None)
     p.add_argument("--artifacts-dir", default="./artifacts")
     p.add_argument("--target-ratio", type=float, default=None)
-    p.add_argument("--resume-from-stage", type=int, default=0)
+    p.add_argument("--resume-from-stage", type=int, default=1)
     p.add_argument(
         "--stop-after-stage", type=int, default=6,
         help="Exit after the named stage completes (inclusive). Useful for "
@@ -240,20 +238,12 @@ def _skip_save_checkpoint(model, tokenizer, out_dir):
 
 
 def _validate_config(config: dict) -> None:
-    """Catch known-bad configurations before the pipeline starts a long run.
-
-    This is a small wall against foot-guns like pruning below ``top_k``.
-    """
+    """Catch known-bad configurations before the pipeline starts a long run."""
     min_exp = config["stage1_grape"]["min_experts_per_layer"]
-    # Reasonable lower bound: any MoE forward with top_k routing needs at
-    # least that many experts to pick from. Qwen3.6-35B-A3B defaults to 8
-    # routed experts per token; we require a generous headroom.
     if min_exp < 9:
         raise ValueError(
             f"stage1_grape.min_experts_per_layer={min_exp} is below the "
-            "recommended floor of 9 (top-k=8 + 1 headroom). Pruning below "
-            "top_k causes the router to emit fewer experts than it selects, "
-            "triggering dispatch errors."
+            "recommended floor of 9 (top-k=8 + 1 headroom)."
         )
     target = config["target"]["total_reduction_ratio"]
     if not (0.0 < target < 1.0):
@@ -264,13 +254,7 @@ def _validate_config(config: dict) -> None:
 
 
 def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
-    """Load the model + tokenizer appropriate for starting at ``stage``.
-
-    Stages 0-2 load the original pretrained model.
-    Stages 3-6 load the previous stage's compressed checkpoint via
-    ``load_compressed_model`` which handles both pruned (Qwen3_5MoeExperts)
-    and factored (FactoredExperts) layouts.
-    """
+    """Load the model + tokenizer appropriate for starting at ``stage``."""
     if stage <= 2:
         return load_model(
             config["model"]["name_or_path"],
@@ -281,26 +265,16 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
             load_in_4bit=config["model"].get("load_in_4bit", False),
             trust_remote_code=config["model"].get("trust_remote_code", False),
         )
-    # Stages 3+: load the checkpoint produced by the preceding stage.
     prev_dir_name = STAGE_REGISTRY[stage][1]
     prev_path = artifacts_dir / prev_dir_name
     if not prev_path.exists():
-        # Most common operator error: re-queueing a downstream stage in a
-        # fresh job without setting PRIOR_STAGE_REPO. The HF Jobs bucket is
-        # non-durable across cancel/timeout (see project memory), so a fresh
-        # job starts with an empty artifacts_dir; the prior-stage checkpoint
-        # must be hydrated from the per-stage Hub repo by entrypoint.py via
-        # PRIOR_STAGE_REPO before _load_for_stage runs.
         raise FileNotFoundError(
             f"Cannot resume from stage {stage}: expected checkpoint at {prev_path}.\n"
-            f"  - If running locally: run stages 0..{stage - 1} first so "
+            f"  - If running locally: run stages 1..{stage - 1} first so "
             f"{prev_dir_name}/ exists under {artifacts_dir}.\n"
             f"  - If running on HF Jobs: set BOTH "
             f"RESUME_FROM_STAGE={stage} AND PRIOR_STAGE_REPO=<the Hub repo "
-            f"holding the {prev_dir_name}/ output of stage {stage - 1}>. "
-            f"The entrypoint only hydrates the bucket when RESUME_FROM_STAGE "
-            f">= 3 AND PRIOR_STAGE_REPO is non-empty; setting just one is "
-            f"silently a no-op."
+            f"holding the {prev_dir_name}/ output of stage {stage - 1}>."
         )
     log.info("Loading stage %d input from %s", stage, prev_path)
     model, tokenizer, _ = load_compressed_model(
@@ -310,20 +284,6 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
         attn_implementation=config["model"]["attn_implementation"],
     )
     return model, tokenizer
-
-
-def _load_from_dir(path: Path, config: dict):
-    if not path.exists():
-        raise FileNotFoundError(f"Expected prior stage checkpoint at {path}")
-    return load_model(
-        str(path),
-        revision="main",
-        torch_dtype=config["model"]["torch_dtype"],
-        device_map=config["model"]["device_map"],
-        attn_implementation=config["model"]["attn_implementation"],
-        load_in_4bit=config["model"].get("load_in_4bit", False),
-        trust_remote_code=config["model"].get("trust_remote_code", False),
-    )
 
 
 if __name__ == "__main__":
