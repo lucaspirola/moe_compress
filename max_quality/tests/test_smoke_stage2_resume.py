@@ -61,7 +61,8 @@ def patched_stage2(monkeypatch, tiny_config):
 
 
 def _run_stages_01(model, config, tmp_path):
-    stage0_super_experts.run(model, _TinyTokenizer(), config, tmp_path, device=None)
+    tokenizer = _TinyTokenizer()
+    stage0_super_experts.run(model, tokenizer, config, tmp_path, device=None)
     decomp = BudgetDecomposition(
         total_reduction_ratio=0.2,
         expert_prune_ratio=0.5,
@@ -70,7 +71,7 @@ def _run_stages_01(model, config, tmp_path):
         min_experts_per_layer=2,
         blacklisted_experts={},
     )
-    stage1_grape.run(model, config, tmp_path, decomp)
+    stage1_grape.run(model, tokenizer, config, tmp_path, decomp)
     return decomp
 
 
@@ -199,3 +200,21 @@ def test_stage2_resume_produces_same_merge_map(tiny_model, patched_stage2, tmp_p
     assert clean_merge_map == resume_merge_map, (
         "Merge map from resumed run differs from clean run — resume broke determinism"
     )
+
+
+def test_stage2_resume_deletes_orphaned_pt(tiny_model, patched_stage2, tmp_path):
+    """Orphaned layer_N.pt (no matching merge_N.json) must be deleted on resume."""
+    _run_stages_01(tiny_model, patched_stage2, tmp_path)
+    partial_dir = tmp_path / "_stage2_partial"
+    partial_dir.mkdir()
+
+    # Simulate orphaned state: .pt exists, .json does not
+    orphan = partial_dir / "layer_0.pt"
+    torch.save({"format_version": 1, "covariance": {}, "tokens": {}}, orphan)
+    assert orphan.exists()
+
+    model, tokenizer = tiny_model, _TinyTokenizer()
+    stage2_reap_ream.run(model, tokenizer, patched_stage2, tmp_path, device=None)
+
+    # Orphan must be gone; layer was reprocessed
+    assert not orphan.exists()

@@ -101,6 +101,22 @@ def run(
     # -----------------------------------------------------------------------
     partial_dir = artifacts_dir / "_stage2_partial"
     partial_dir.mkdir(parents=True, exist_ok=True)
+
+    # Crash safety: delete any .pt whose matching .json is absent.
+    # A .pt without .json means the process died between _snapshot_cov_layer
+    # and _write_merge_json. The covariance has been remapped but not recorded.
+    # Reprocessing the .pt would double-remap — silent numerical corruption.
+    for ref in moe_layers:
+        pt_path = partial_dir / f"layer_{ref.layer_idx}.pt"
+        json_path = partial_dir / f"merge_{ref.layer_idx}.json"
+        if pt_path.exists() and not json_path.exists():
+            log.warning(
+                "Stage 2 resume: orphaned %s (no matching JSON) — "
+                "deleting and reprocessing layer %d",
+                pt_path.name, ref.layer_idx,
+            )
+            pt_path.unlink()
+
     completed_layers: set[int] = set()
     _layer_mean_costs: list[float] = []  # running history for cost-threshold gate (Strategy C)
 
