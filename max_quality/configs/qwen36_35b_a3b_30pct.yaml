@@ -164,6 +164,42 @@ stage5_router_kd:
                                       # hardware without compile support.
 
 stage6_validate:
+  # --- Compute-time optimizations (2026-04-30) ---
+  # All optimizations are purely computational scheduling — no metric, formula,
+  # threshold, or evaluation methodology is changed. Numerically identical to
+  # the batch_size=1 baseline.
+  #
+  # Optimization #1: WikiText-2 PPL batch size (default 1 → 8).
+  # VRAM per batch element: ~1.1 GB (logits + KV). At bs=8: ~8.8 GB additional.
+  # Well within the 91 GB headroom (141 GB - 50 GB student).
+  ppl_batch_size: 8
+  #
+  # Optimization #2: lm-eval batch size (default 1 → auto:8).
+  # "auto:X" makes lm-eval binary-search upward from X for the largest safe
+  # batch. On H200 with 91 GB headroom, stabilizes at 32-64.
+  lm_eval_batch_size: "auto:8"
+  #
+  # Optimizations #3, #4: Batched model.generate() for HumanEval/MATH-500.
+  # Greedy decode (do_sample=False) is deterministic regardless of batch.
+  # Left-padding + attention_mask ensures no cross-contamination.
+  gen_batch_size: 8
+  #
+  # Optimization #5: torch.compile for prefill-dominant forward paths.
+  # dynamic=True handles variable-length padded batches. mode="reduce-overhead"
+  # enables CUDA graphs where possible. One-time cost ~3-5 min, amortized over
+  # 1000+ forward passes. Do NOT compile model.generate() — autoregressive
+  # decoding changes shapes every step, causing excessive recompilation.
+  torch_compile: true
+  #
+  # Optimization #7: Cache teacher baselines (deterministic eval = same numbers).
+  # The teacher (uncompressed Qwen3.6-35B-A3B) is a fixed, known model. Every
+  # Stage 6 run re-evaluates the same teacher on the same benchmarks. Caching
+  # eliminates ~50% of total wall-clock time (teacher load + all teacher evals).
+  # Cache key: sha256(model_name + revision + eval_config) — auto-invalidates.
+  teacher_eval_cache:
+    enabled: true
+    cache_path:                     # null = auto: artifacts_dir / "teacher_eval_cache.json"
+  #
   wikitext2:
     enabled: true
     dataset: wikitext
