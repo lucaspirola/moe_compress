@@ -153,11 +153,11 @@ For each MoE layer, compute the pairwise CKA (Centered Kernel Alignment) matrix 
 
 Paper §3.2 explicitly allows "CKA, MSE, or other similarity measures" for D^l. CKA is the metric used by Zhang et al. (2025), cited in GRAPE §3.2 as the reference for intra-layer redundancy assessment.
 
-With 256 samples × 2048 tokens = ~512K token-level activations per expert (reservoir-sampled to 256 per expert for CKA), the CKA kernel matrices are well-conditioned for 256-expert layers.
+With 256 samples × 2048 tokens ≈ 524K total token activations across the layer (each expert sees only its top-k/N routed fraction; for top-8 over 256 experts that is ≈ 16K per expert before sampling), reservoir-sampled to 256 per expert for CKA so the kernel matrices are well-conditioned for 256-expert layers.
 
 #### Phase D: GRAPE Algorithm 1 (entropy-aware greedy merge with restart)
 
-1. **Initialize** each expert as its own cluster. Compute per-layer redundancy `R^l = Σ_{i≠j} D^l_{ij}` (Eq. 11, sum form). Set entropy threshold `Ê = E_0 × (1 − γ)` where `E_0` is the initial cross-layer entropy and `γ=0.1` (Eq. 10 — γ is project-chosen; paper gives no default).
+1. **Initialize** each expert as its own cluster. Compute per-layer redundancy `R^l = Σ_{i≠j} D^l_{ij}` (Eq. 11, sum form). Set entropy threshold `Ê = E_0 × (1 − γ)` (Eq. 10) where `E_0` is the initial cross-layer entropy and `γ=0.1` is project-chosen (see [D3](#12-known-deviations-from-papers); the paper gives no default).
 
 2. **Greedy loop** until total surviving experts ≤ `global_expert_budget`:
    - If all layers frozen → **restart** (unfreeze all)
@@ -184,7 +184,7 @@ Stage 1 is stateless (JSON-only output: blacklist + per-layer budgets). Re-runni
 
 ### Correctness Notes
 
-- The `R^l` update zeroes out the merged expert's *entire* row and column (not just the pair), preventing the absorbed expert from being re-selected in future iterations. This is more correct than the paper's pseudocode line 12 (`R^l ← R^l − 2·D[i*,j*]`), which appears to assume upper-triangular unique-pair counting. See [D4](#12-known-deviations-from-papers).
+- The `R^l` update zeroes out the merged expert's *entire* row and column (not just the pair), preventing the absorbed expert from being re-selected in future iterations. The paper's pseudocode line 12 (`R^l ← R^l − 2·D[i*,j*]`) is consistent with the sum-over-`i≠j` form of `R^l` (the 2× accounts for both `D[i*,j*]` and `D[j*,i*]`), but it only adjusts the scalar `R^l` while leaving stale similarity entries in row/column `j*` that can mis-rank future merges. Zeroing the full row/column eliminates that staleness. See [D4](#12-known-deviations-from-papers).
 - If the budget cannot be reached (all layers hit their floors), a warning is logged but the pipeline continues with the achieved budget.
 
 ---
@@ -199,7 +199,7 @@ Stage 1 is stateless (JSON-only output: blacklist + per-layer budgets). Re-runni
 
 ### What
 
-Reduces the number of routed experts per layer from 256 to ~180–200 by merging similar experts (not deleting — merged experts' knowledge is preserved via frequency-weighted averaging). Simultaneously collects input covariance matrices (A) consumed by Stages 3 and 4.
+Reduces the number of routed experts per layer from 256 to ~180–200 by merging similar experts (not deleting — merged experts' knowledge is preserved via frequency-weighted averaging, with intermediate-neuron permutation alignment so that the averaged neurons correspond across the merge group). Simultaneously collects input covariance matrices (A) consumed by Stages 3 and 4.
 
 ### Why
 
@@ -235,11 +235,11 @@ S_j = (1/|X_j|) × Σ_{x ∈ X_j} g_j(x) · ‖f_j(x)‖₂
 
 where `X_j = {x | j ∈ TopK(σ(x))}`, `g_j(x)` is the post-softmax routing weight, and `f_j(x)` is the expert output vector.
 
-#### Step 2: REAM Cost Matrix (Paper 2604.04356, Eq. 5 & 8)
+#### Step 2: REAM Cost Matrix (Paper 2604.04356, Eq. 5, 7, 8)
 
 **Activation-space similarities** (NOT weight-space):
 
-- **δ_gate(i,j)** (Eq. 5): Cosine distance between **pre-softmax** router logit profile vectors. Each expert's profile is a vector indexed by global token position, containing the pre-softmax logit for that token (captured via `capture_router_outputs` pre-forward hook on the router module, which recomputes `F.linear(hidden, router.weight)`). Pre-softmax logits can be negative and unbounded, giving the full `[-1, 1]` cosine similarity range.
+- **δ_gate(i,j)** (Eq. 5): Cosine similarity between **pre-softmax** router logit profile vectors. Each expert's profile is a vector indexed by global token position, containing the pre-softmax logit for that token (captured via `capture_router_outputs` pre-forward hook on the router module, which recomputes `F.linear(hidden, router.weight)`). Pre-softmax logits can be negative and unbounded, giving the full `[-1, 1]` cosine similarity range.
 
 - **δ̃_expert(i,j)** (Eq. 8): Per-token cosine similarity of gated expert outputs `σ(x)_e · E_e(x)`, averaged over the full calibration set X. Gate weights naturally suppress inactive tokens (σ(x)_e → 0 for non-active tokens), so the denominator is |X| not the jointly-active count — matching paper Eq. 8. Accumulated incrementally per batch via `finalize_batch` in `activation_hooks.py`.
 
@@ -328,7 +328,7 @@ Same step-boundary checkpointing as Stage 5, under `_stage2p5_partial/`.
 
 **File:** [`stage3_svd.py`](src/moe_compress/stage3_svd.py)
 **Papers:**
-- D-Rank: Spectral entropy for rank allocation (2509.25622), Eq. 2, 6
+- D-Rank: Spectral entropy for rank allocation (2509.25622), Eq. 2, 7
 - AA-SVD: Anchored Adaptive SVD (2604.02119), Theorem 3.2, Corollary 3.3
 - SVD-LLM V2: Heterogeneous rank allocation (2503.12340)
 - Swift-SVD+: Dynamic rank allocation (2604.01609), Algorithm 2
@@ -350,13 +350,15 @@ SVD factorization reduces parameters from `d_out × d_in` to `k × (d_out + d_in
 
 **B-covariance** `B = X_post^T X_post`: Auto-covariance of the pruned model's per-expert inputs. Reflects the input distribution the compressed model will see at inference.
 
+**A-covariance reuse:** The pre-prune input auto-covariance `A = X_pre^T X_pre` referenced by Phase C Path 2 and Phase D's refinement objective is **not collected here** — it is reused from Stage 2's calibration pass (`_stage2_input_covariance.pt`, see §5 "Covariance Side-Collection") to avoid a redundant teacher forward.
+
 **Cross-covariance** `C = X_pre^T X_post`: For each (layer, student_expert), the teacher's hidden state at the same token positions that the student routes to that expert is captured. `C` is accumulated as `X_pre^T @ X_post` per batch. This gives the exact cross-covariance required by AA-SVD Theorem 3.2 (paper 2604.02119): "what would the original model have produced for the inputs that the compressed model actually receives."
 
 The teacher model is freed from VRAM after covariance collection completes — it is not needed for the factoring phase.
 
 **Per-layer spill:** All 40 MoE layers are hooked simultaneously in a single calibration pass (not one pass per layer). After each layer's accumulation is finalised, both B and C covariances are spilled to disk (`_stage3_bcov_partial/` and `_stage3_ccov_partial/`). Background I/O thread overlaps spill with the next batch's forward pass, keeping the resident footprint bounded.
 
-#### Phase B: D-Rank Allocation (Paper 2509.25622, Eq. 2 & 6)
+#### Phase B: D-Rank Allocation (Paper 2509.25622, Eq. 2 & 7)
 
 For each (layer, matrix_type) group:
 
@@ -380,7 +382,7 @@ s_i = β_i^α · (log(e + ε*_i))^{1-α}
 
 where:
 - `β_i = σ_i² / Σ_j σ_j²` — spectral energy proportion (how much of the group's total spectral energy this expert contributes)
-- `ε*_i = √(Σ_{j>k̄} σ_j² / Σ_j σ_j²)` — reconstruction error at the group's mean rank `k̄` (higher = this expert needs more rank)
+- `ε*_i = √(Σ_{j>k̄} σ̃_j² / Σ_j σ̃_j²)` — activation-weighted reconstruction error at the group's mean rank `k̄`, where `σ̃_j` are the singular values of `W·A^{1/2}` (Stage 2 input auto-covariance from §5; see [D8](#12-known-deviations-from-papers) — ε* is now activation-weighted, not spectral-only). Higher = this expert needs more rank.
 - `α ∈ [0, 1]` — balances the two signals
 
 **α selection (paper §3.2.2 — validation-based):** For each candidate α ∈ {0.0, 0.1, ..., 1.0}, the full model is factored at the corresponding per-expert ranks using AA-SVD (reusing B/C covariance from Phase A spill files) and evaluated on WikiText-2 PPL (`validation_samples: 512` sequences). The α yielding the lowest end-to-end perplexity is selected. This implements the paper's exact procedure: *"For each candidate corresponding to α_i, the optimal low-rank approximation of every layer is computed using the closed-form solution in (3). The resulting compressed models are then evaluated on a validation set, and the candidate that yields the best end-to-end performance is selected."*
@@ -419,7 +421,7 @@ Substitutes pre-prune auto-covariance for cross-covariance. The two coincide whe
 M = W · L_B
 ```
 
-Then: `SVD(M) = U Σ V^T`, `U_k = U[:,:k] · S[:k]`, `V_k = V^T[:k,:] · L_B⁻¹`.
+Then: `SVD(M) = U Σ V^T`, `U_k = U[:,:k] · diag(Σ[:k])`, `V_k^T = V^T[:k,:] · L_B⁻¹`. The rank-k reconstruction is `W ≈ U_k · V_k^T`.
 
 **Eigendecomposition caching (gate_proj ↔ up_proj):** The covariance matrices B and C are identical for `gate_proj` and `up_proj` within the same expert — both projections receive the hidden state as input, and `_cov_lookup` falls back from `up_proj` to `gate_proj`. The eigendecomposition of B (`eigh`) and the derived right-hand-side product (CQ·diag(1/√λ), AQ·diag(1/√λ), or L_B depending on the path) are precomputed once per expert via `_precompute_eigh` and cached in an `_EighDecomp` dataclass. Both `gate_proj` and `up_proj` then call `_aa_svd_precomputed`, which skips directly to `M = W @ rhs`, SVD, and back-solve. `down_proj` has its own B (intermediate-dim covariance, 512×512) and goes through the full `_aa_svd` path.
 
@@ -440,7 +442,7 @@ Per-matrix activation-weighted reconstruction refinement:
 min_{U,V} ‖(W − U·V) · A^{1/2}‖²_F
 ```
 
-using L-BFGS with strong Wolfe line search (`lbfgs_steps=100`, `lbfgs_history=10`). B-weighted regression is monitored — if refine worsens the B-weighted norm, a warning is logged.
+using L-BFGS with strong Wolfe line search (`lbfgs_steps=100`, `lbfgs_history=10`). The objective is weighted by `A^{1/2}` (pre-prune input auto-covariance, reused from Stage 2) so the refinement minimises reconstruction error in the directions the original model actually exercises. As an independent sanity check, the post-prune `B`-weighted residual `‖(W − UV)·B^{1/2}‖_F` is also monitored — if refinement worsens the B-weighted norm (i.e. quality on the pruned model's input distribution regresses despite improved A-weighted loss), a warning is logged. The two distributions agree under light pruning; the cross-check guards against A/B drift under aggressive pruning.
 
 ### Resume
 
@@ -742,6 +744,8 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 | D3 | 1 | γ entropy tolerance | 2604.06542 Eq. 10: γ∈[0,1], no default given | γ=0.1 (project-chosen, not from paper) | Paper leaves γ unspecified; 0.1 chosen empirically |
 | D4 | 1 | D^l update after merge | 2604.06542 Algorithm 1 lines 11–12: zero only pair entry D_{i*,j*} and D_{j*,i*}; update R^l ← R^l − 2·D_{i*,j*} | Zeros the absorbed expert's entire row and column in D^l; recomputes R^l from updated matrix | Prevents the absorbed expert from influencing future pair-selection; the paper's update assumes the merged expert cannot be re-selected, but only zeroing the pair entry leaves stale similarity values that can distort R^l and layer selection in subsequent iterations |
 | D5 | 1 | Floor without layer bonuses | GRAPE has no floor constraints | min_experts_per_layer = num_routed_experts // 2 (=128); no early/late layer bonuses | 50% max removal per layer bounds the compression within the range where papers demonstrate results; bonuses removed — the floor alone is sufficient |
+| D5a | 2 | REAM merge-group cap | 2604.04356 §A.1: C=16 for Qwen3-30B at 25% reduction | `max_merge_group_size=8` (with budget-bump fallback if exceeded) | Conservative bound — caps any single centroid's absorption at half the paper's cap, keeping merge groups smaller and more homogeneous; the budget bump compensates for any blocked merges so the global expert target is still met |
+| D5b | 2 | Intermediate-neuron permutation in merge | 2604.04356 Eq. 6: frequency-weighted average `W_merged = Σ_i (freq_i / Σ_j freq_j) · W_i` (no permutation) | Hungarian permutation `P_i` aligning each child expert's intermediate neurons to the centroid before averaging, with combined cost `C = C_wt + C_act` (gate+up Frobenius weight distance + per-neuron mean-activation L2 distance) | Naive averaging assumes intermediate neurons are already index-aligned across experts, which is not true in general — Qwen3 experts are independently initialised and their intermediate-dim coordinate systems are arbitrary. Permutation alignment recovers a better correspondence before averaging and reduces post-merge reconstruction error |
 | D6 | 3 | AA-SVD cross-covariance scope | 2604.02119 Theorem 3.2 requires cross-covariance for all linear layers | Cross-covariance C collected for gate_proj/up_proj (input-side) via dual-forward; down_proj falls back to Corollary 3.3 (B-only) because the teacher's per-expert intermediate activations require full expert dispatch instrumentation | Gate/up inputs share the same hidden state (pre-routing) so one capture covers both; down_proj inputs are expert-internal (post gate+up) and differ between teacher and student expert sets |
 | D7 | 3 | D-Rank ω adapted for MoE | 2509.25622 Eq. 7: ω = d₁ + n·d₂ (layers per group × dimensions) | ω = n_experts × (d_out + d_in) | D-Rank targets shared-basis layer groups; adapted for MoE expert groups |
 | D8 | 3 | Swift-SVD+ β | 2604.01609 Alg. 2: β = end-to-end layer importance, min-max normalized to [1,2] | β = per-expert spectral energy share (σ_i² / Σ σ_j²) | Paper's β is per-layer importance (requires 40 extra forward passes); adapted to per-expert within-group redistribution where the paper has no solution. ε* is now activation-weighted via Stage 2 A-covariance (no longer a deviation) |
@@ -767,4 +771,4 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 
 ---
 
-*This document was generated from a full algorithmic review of the max_quality codebase on 2026-04-28; §12 updated 2026-04-29 after a per-stage paper compliance audit including full methodology-section cross-reference of all 10 cited papers. Spec redesign on 2026-04-29: merged Stage 0 into Stage 1 (CKA + SE detection), floor=n//2, max_merge_group=8, Router KD bs=8. D9 resolved on 2026-04-30: Swift-SVD+ α selection now uses paper-exact WikiText-2 PPL validation (§3.2.2 of 2604.01609) instead of spectral proxy; D9 removed from §12. Phase C eigh caching added 2026-04-30: gate_proj/up_proj share the same B and C covariance; eigendecomposition is now precomputed once per expert and reused for both projections, eliminating ~7,200 redundant eigh(2048×2048) calls. Compute-time optimizations 2026-04-30: (1) Stage 2 sequential profiling with early-exit forward — **implemented**; (2) vectorized REAM accumulators — **planned, not yet implemented**; (3) Stage 5 KL chunk size increased to full sequence length on H200 — **implemented**; (4) torch.compile support for Stages 2.5/5 KD forward passes — **implemented**. Stage 6 compute-time optimizations 2026-04-30 — **all implemented**: (5) WikiText-2 PPL batch_size 1→8; (6) lm-eval batch_size=auto:8; (7) batched model.generate() for HumanEval and MATH-500; (8) torch.compile for prefill-dominant forward paths; (9) teacher eval caching with sha256 cache key auto-invalidation (~50% total time eliminated); (10) teacher I/O overlap via background CPU preload; (11) GGUF conversion overlap with teacher eval. All Stage 6 optimizations are purely computational scheduling — numerically identical to batch_size=1 baseline. Expected total Stage 6 speedup: ~8–12× (from ~3–5 hours to ~25–30 minutes on H200). All formulas were verified against the cited papers. All deviations are deliberate and documented. For the original validation audit, see the archived [VALIDATED_STRATEGIES.md](https://huggingface.co/pirola/moe-compression-workflow/blob/main/VALIDATED_STRATEGIES.md).*
+*This document was generated from a full algorithmic review of the max_quality codebase on 2026-04-28; §12 updated 2026-04-29 after a per-stage paper compliance audit including full methodology-section cross-reference of all 10 cited papers; further per-stage spec-only paper-compliance review on 2026-05-01 added D5a (REAM merge-group cap) and D5b (intermediate-neuron Hungarian alignment in merge), corrected the D-Rank citation (Eq. 7, not Eq. 6) and the §6 ε* formula to reflect activation weighting per D8, fixed the δ_gate similarity/distance notation in §5, clarified A-covariance reuse from Stage 2 in §6 Phase A, clarified the A-vs-B weighting roles in §6 Phase D, fixed the SVD reconstruction notation (`diag(Σ[:k])` instead of `S[:k]`), and corrected the §4 R^l-update rationale. Spec redesign on 2026-04-29: merged Stage 0 into Stage 1 (CKA + SE detection), floor=n//2, max_merge_group=8, Router KD bs=8. D9 resolved on 2026-04-30: Swift-SVD+ α selection now uses paper-exact WikiText-2 PPL validation (§3.2.2 of 2604.01609) instead of spectral proxy; D9 removed from §12. Phase C eigh caching added 2026-04-30: gate_proj/up_proj share the same B and C covariance; eigendecomposition is now precomputed once per expert and reused for both projections, eliminating ~7,200 redundant eigh(2048×2048) calls. Compute-time optimizations 2026-04-30: (1) Stage 2 sequential profiling with early-exit forward — **implemented**; (2) vectorized REAM accumulators — **planned, not yet implemented**; (3) Stage 5 KL chunk size increased to full sequence length on H200 — **implemented**; (4) torch.compile support for Stages 2.5/5 KD forward passes — **implemented**. Stage 6 compute-time optimizations 2026-04-30 — **all implemented**: (5) WikiText-2 PPL batch_size 1→8; (6) lm-eval batch_size=auto:8; (7) batched model.generate() for HumanEval and MATH-500; (8) torch.compile for prefill-dominant forward paths; (9) teacher eval caching with sha256 cache key auto-invalidation (~50% total time eliminated); (10) teacher I/O overlap via background CPU preload; (11) GGUF conversion overlap with teacher eval. All Stage 6 optimizations are purely computational scheduling — numerically identical to batch_size=1 baseline. Expected total Stage 6 speedup: ~8–12× (from ~3–5 hours to ~25–30 minutes on H200). All formulas were verified against the cited papers. All deviations are deliberate and documented. For the original validation audit, see the archived [VALIDATED_STRATEGIES.md](https://huggingface.co/pirola/moe-compression-workflow/blob/main/VALIDATED_STRATEGIES.md).*
