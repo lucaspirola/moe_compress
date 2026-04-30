@@ -65,10 +65,13 @@ def run(
     # ------------------------------------------------------------------
     # Phase A: Single-pass calibration (512 samples)
     # ------------------------------------------------------------------
-    spec = spec_from_config(cal, seed_offset=1)
+    spec = spec_from_config(
+        cal,
+        num_sequences_override=s1.get("num_calibration_samples"),
+        seed_offset=1,
+    )
     calib = build_calibration_tensor(
         tokenizer, spec,
-        num_sequences_override=s1["num_calibration_samples"],
         cache_dir=artifacts_dir / "_calibration_cache",
     )
     batches = iter_batches(calib, batch_size=1)
