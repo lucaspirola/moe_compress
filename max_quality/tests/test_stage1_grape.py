@@ -9,6 +9,15 @@ from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.utils.model_io import build_banks, iter_moe_layers
 
 
+class _TinyTokenizer:
+    name_or_path = "tiny-tokenizer"
+    eos_token_id = 0
+    def __call__(self, text, *_, **__):
+        return {"input_ids": [min(ord(c) % 32, 31) for c in (text or " ")]}
+    def save_pretrained(self, *_args, **_kwargs):
+        return None
+
+
 def test_highly_redundant_layer_gets_smaller_budget(tiny_model, tiny_config, tmp_path):
     # Make layer 0's experts near-identical (high redundancy) by copying the
     # first expert's rows into the others directly on the fused tensors.
@@ -36,7 +45,7 @@ def test_highly_redundant_layer_gets_smaller_budget(tiny_model, tiny_config, tmp
         min_experts_per_layer=2,
         blacklisted_experts={},
     )
-    stage1_grape.run(tiny_model, tiny_config, tmp_path, decomp)
+    stage1_grape.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
 
     import json
     out = json.loads((tmp_path / "stage1_budgets.json").read_text())
