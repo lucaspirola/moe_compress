@@ -228,3 +228,30 @@ def test_stage4_resume_restores_factored_experts_from_spill(
             f"L{layer0_idx}/{name}: fe.ranks={fe_resumed.ranks[name]} "
             f"but U.shape[-1]={U_actual.shape[-1]} — ranks dict inconsistent after resume"
         )
+
+
+def test_stage4_double_widen_raises(
+    tiny_model, patched_stages, tmp_path
+):
+    """Running Stage 4 twice on the same in-process model must raise AssertionError."""
+    import shutil
+
+    # Run stages 0-3 to get a model with FactoredExperts
+    _run_stages_0123(tiny_model, patched_stages, tmp_path)
+
+    layers = [ref for ref in iter_moe_layers(tiny_model)
+              if isinstance(ref.experts_module, FactoredExperts)]
+    if not layers:
+        pytest.skip("No FactoredExperts layers — EoRA added no rank for any layer")
+
+    # First Stage 4 run succeeds
+    stage4_eora.run(tiny_model, _TinyTokenizer(), patched_stages, tmp_path)
+
+    # Clear partial dir so the second run doesn't skip via resume
+    partial_dir = tmp_path / "_stage4_partial"
+    if partial_dir.exists():
+        shutil.rmtree(partial_dir)
+
+    # Second in-process run must fail with double-widen detected
+    with pytest.raises(AssertionError, match="double-widen"):
+        stage4_eora.run(tiny_model, _TinyTokenizer(), patched_stages, tmp_path)
