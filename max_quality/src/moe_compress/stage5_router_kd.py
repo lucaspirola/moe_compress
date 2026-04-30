@@ -121,47 +121,53 @@ def run(
                         cache_path_cfg, cache_path)
 
     if teacher_logits_cache is None:
-        load_in_4bit = bool(s5.get("teacher_load_in_4bit", False))
-        # If model.load_in_4bit is on but Stage 5 didn't opt in for the
-        # teacher, warn: the BF16 teacher (~70 GB) + student (~50 GB) will
-        # OOM the A100.
-        if config["model"].get("load_in_4bit", False) and not load_in_4bit:
-            log.warning(
-                "Stage 5: config['model']['load_in_4bit']=true but "
-                "stage5_router_kd.teacher_load_in_4bit=false. The teacher "
-                "will load in BF16 (~70 GB) and likely OOM the A100. "
-                "Set teacher_load_in_4bit: true to match."
-            )
-        # When teacher_load_in_4bit, force device_map={"": 0} so the entire
-        # NF4-quantized teacher lands on the same GPU as the student. This is
-        # a VRAM optimization for Stage 5 only — the pipeline model (student)
-        # is always BF16; the teacher is quantized only to fit alongside it.
-        device_map = {"": 0} if load_in_4bit else config["model"]["device_map"]
-        log.info("Loading teacher for KD: %s (teacher_load_in_4bit=%s, device_map=%s)",
-                 config["model"]["name_or_path"], load_in_4bit, device_map)
-        # Stage 5's teacher quantization is independent of the global
-        # config["model"]["load_in_4bit"] (which is for local smoke tests).
-        teacher, _ = load_model(
-            config["model"]["name_or_path"],
-            revision=config["model"]["revision"],
-            torch_dtype=config["model"]["torch_dtype"],
-            device_map=device_map,
-            attn_implementation=config["model"]["attn_implementation"],
-            load_in_4bit=load_in_4bit,
-            trust_remote_code=config["model"].get("trust_remote_code", False),
-        )
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
-        teacher_refs = list(iter_moe_layers(teacher))
+        # Deferred teacher load: only load the teacher on the first live training
+        # batch. On resume, fast-forward iterates without ever touching the teacher —
+        # saves ~60s + 70 GB VRAM when resuming deep into training.
+        _teacher_state: dict = {"model": None, "refs": None}
+
+        def _get_teacher(student_refs_count: int):
+            if _teacher_state["model"] is None:
+                load_in_4bit = bool(s5.get("teacher_load_in_4bit", False))
+                if config["model"].get("load_in_4bit", False) and not load_in_4bit:
+                    log.warning(
+                        "Stage 5: config['model']['load_in_4bit']=true but "
+                        "stage5_router_kd.teacher_load_in_4bit=false. The teacher "
+                        "will load in BF16 (~70 GB) and likely OOM the A100. "
+                        "Set teacher_load_in_4bit: true to match."
+                    )
+                _device_map = {"": 0} if load_in_4bit else config["model"]["device_map"]
+                log.info("Loading teacher for KD (first live batch): %s "
+                         "(teacher_load_in_4bit=%s, device_map=%s)",
+                         config["model"]["name_or_path"], load_in_4bit, _device_map)
+                _t, _ = load_model(
+                    config["model"]["name_or_path"],
+                    revision=config["model"]["revision"],
+                    torch_dtype=config["model"]["torch_dtype"],
+                    device_map=_device_map,
+                    attn_implementation=config["model"]["attn_implementation"],
+                    load_in_4bit=load_in_4bit,
+                    trust_remote_code=config["model"].get("trust_remote_code", False),
+                )
+                _t.eval()
+                if use_compile:
+                    try:
+                        log.info("Stage 5: torch.compile(teacher, mode='reduce-overhead')")
+                        _t = torch.compile(_t, mode="reduce-overhead")
+                    except Exception as exc:
+                        log.warning("Stage 5: torch.compile(teacher) failed (%s) — eager", exc)
+                _teacher_state["model"] = _t
+                _teacher_state["refs"] = list(iter_moe_layers(_t))
+                assert len(_teacher_state["refs"]) == student_refs_count, (
+                    f"Teacher/student MoE layer count mismatch: "
+                    f"{len(_teacher_state['refs'])} vs {student_refs_count}"
+                )
+            return _teacher_state["model"]
 
     # --- torch.compile acceleration (spec §8) ---
     use_compile = bool(s5.get("torch_compile", False))
     if use_compile:
         try:
-            if teacher is not None:
-                log.info("Stage 5: torch.compile(teacher, mode='reduce-overhead')")
-                teacher = torch.compile(teacher, mode="reduce-overhead")
             log.info("Stage 5: torch.compile(student, mode='reduce-overhead')")
             student = torch.compile(student, mode="reduce-overhead")
         except Exception as exc:
@@ -193,11 +199,6 @@ def run(
     # even though we're distilling at vocab level — the student's routers are
     # what we're training).
     student_refs = list(iter_moe_layers(student))
-
-    if teacher is not None:
-        teacher_refs = list(iter_moe_layers(teacher))
-        assert len(teacher_refs) == len(student_refs), \
-            f"Teacher/student MoE layer count mismatch: {len(teacher_refs)} vs {len(student_refs)}"
 
     # -----------------------------------------------------------------------
     # Crash-resume: find latest checkpoint and restore router + optim state.
@@ -279,7 +280,7 @@ def run(
                 teacher_vocab_logits = teacher_vocab_logits.view(batch.shape[0], batch.shape[1], -1)
             else:
                 with torch.no_grad():
-                    teacher_out = teacher(input_ids=batch)
+                    teacher_out = _get_teacher(len(student_refs))(input_ids=batch)
                 teacher_vocab_logits = teacher_out.logits.to(torch.float32)  # [B, L, |V|]
 
             # Student: full forward pass with gradients (routers are trainable).
