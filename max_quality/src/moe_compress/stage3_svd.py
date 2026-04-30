@@ -1589,8 +1589,12 @@ def _collect_covariances(
     try:
         for k, ref in enumerate(moe_layers):
             if spill_dir is not None:
-                existing = (spill_dir / f"layer_{ref.layer_idx}.pt").exists()
-                if existing:
+                b_spilled = (spill_dir / f"layer_{ref.layer_idx}.pt").exists()
+                c_spilled = (
+                    ccov_spill_dir is None
+                    or (ccov_spill_dir / f"layer_{ref.layer_idx}.pt").exists()
+                )
+                if b_spilled and c_spilled:
                     log.info("Stage 3 cov layer %d/%d (idx=%d) — already spilled, skipping",
                              k + 1, n, ref.layer_idx)
                     continue
