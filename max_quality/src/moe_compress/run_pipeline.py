@@ -301,7 +301,7 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
     if stage <= 2:
         return load_model(
             config["model"]["name_or_path"],
-            revision=config["model"]["revision"],
+            revision=config["model"].get("revision", "main"),
             torch_dtype=config["model"]["torch_dtype"],
             device_map=config["model"]["device_map"],
             attn_implementation=config["model"]["attn_implementation"],
