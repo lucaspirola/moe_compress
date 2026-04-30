@@ -389,6 +389,12 @@ def _grape_greedy_merge(
         for li in per_layer_counts
     }
 
+    # global_budget (from BudgetDecomposition) counts TOTAL surviving experts including
+    # blacklisted ones. GRAPE tracks only non-blacklisted experts in cluster_counts, so
+    # the termination condition must compare against the non-blacklisted budget.
+    total_blacklisted = sum(len(v) for v in blacklist.values())
+    effective_budget = max(0, global_budget - total_blacklisted)
+
     # R^l = sum of off-diagonal distances (Eq. 11, sum form)
     R: dict[int, float] = {}
     for li in sorted_layers:
@@ -420,12 +426,12 @@ def _grape_greedy_merge(
     frozen: set[int] = set()
     current_total = sum(cluster_counts.values())
 
-    log.info("GRAPE: global_budget=%d, current_total=%d, gamma=%.2f, E_hat=%.4f, floor=%d",
-             global_budget, current_total, gamma, E_hat, min_experts)
+    log.info("GRAPE: global_budget=%d (non-bl effective=%d), current_total=%d, gamma=%.2f, E_hat=%.4f, floor=%d",
+             global_budget, effective_budget, current_total, gamma, E_hat, min_experts)
 
     max_iterations = current_total * n_moe_layers
     for iteration in range(max_iterations):
-        if current_total <= global_budget:
+        if current_total <= effective_budget:
             break
 
         if len(frozen) >= n_moe_layers:
@@ -481,14 +487,19 @@ def _grape_greedy_merge(
         if E_current < E_hat:
             frozen.add(best_layer)
 
-    log.info("GRAPE: converged at %d total experts (target %d) after %d iterations",
-             current_total, global_budget, min(iteration + 1, max_iterations))
+    log.info("GRAPE: converged at %d non-blacklisted experts (target %d) after %d iterations",
+             current_total, effective_budget, min(iteration + 1, max_iterations))
 
-    if current_total > global_budget:
+    if current_total > effective_budget:
         log.warning(
-            "GRAPE: could not reach global_budget=%d (achieved=%d). "
+            "GRAPE: could not reach effective_budget=%d non-blacklisted (achieved=%d). "
             "Consider reducing min_experts_per_layer or the target reduction ratio.",
-            global_budget, current_total,
+            effective_budget, current_total,
         )
 
-    return dict(cluster_counts)
+    # Stage 2 reads per-layer budgets as TOTAL centroid count (blacklisted + non-blacklisted).
+    # Add blacklisted experts back so Stage 2's effective_target is inclusive.
+    return {
+        li: cluster_counts[li] + len(blacklist.get(li, []))
+        for li in cluster_counts
+    }
