@@ -395,7 +395,13 @@ def _grape_greedy_merge(
     total_blacklisted = sum(len(v) for v in blacklist.values())
     effective_budget = max(0, global_budget - total_blacklisted)
 
-    # R^l = sum of off-diagonal distances (Eq. 11, sum form)
+    # R^l = sum of off-diagonal distances (Eq. 11, sum form).
+    # D_matrices contains DISTANCES (0=identical, large=different) from
+    # _pairwise_distance_matrix / _cka_distance_matrix. Small R means experts
+    # are mutually similar (redundant); large R means diverse experts.
+    # Layer selection uses argmin R (most redundant = smallest distance sum),
+    # NOT argmax — this is correct for distance matrices despite GRAPE's paper
+    # notation which uses argmax R over a SIMILARITY-based R.
     R: dict[int, float] = {}
     for li in sorted_layers:
         D = D_matrices[li]
