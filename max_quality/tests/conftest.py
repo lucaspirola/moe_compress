@@ -199,10 +199,15 @@ def tiny_config():
             "global_blacklist_cap_pct": 0.50,
         },
         "stage1_grape": {
+            "num_calibration_samples": 4,
             "similarity_metric": "cosine", "min_experts_per_layer": 2,
             "early_layer_bonus": 0, "early_layer_bonus_depth": 0,
             "late_layer_bonus": 0, "late_layer_bonus_depth": 0,
             "target_total_experts_per_layer_avg": 3,
+            "super_expert_detection": {
+                "zscore_threshold": 1.0, "max_blacklisted_per_layer": 1,
+                "global_blacklist_cap_pct": 0.50,
+            },
         },
         "stage2_reap_ream": {
             "batch_size": 1, "num_calibration_samples": 4,
