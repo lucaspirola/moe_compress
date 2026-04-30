@@ -88,7 +88,7 @@ def _run_stages_012(model, config, tmp_path):
         min_experts_per_layer=2,
         blacklisted_experts={},
     )
-    stage1_grape.run(model, config, tmp_path, decomp)
+    stage1_grape.run(model, _TinyTokenizer(), config, tmp_path, decomp)
     stage2_reap_ream.run(
         model, _TinyTokenizer(), config, tmp_path, device=None,
     )
