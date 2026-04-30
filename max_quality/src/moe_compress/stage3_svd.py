@@ -171,14 +171,31 @@ def run(
     if ccov_spill_dir is not None:
         ccov_spill_dir.mkdir(parents=True, exist_ok=True)
 
-    _collect_covariances(
-        model, moe_layers, batches, B_acc, device=device,
-        spill_dir=bcov_spill_dir,
-        teacher_model=teacher_model,
-        teacher_moe_layers=teacher_moe_layers,
-        C_acc=C_acc,
-        ccov_spill_dir=ccov_spill_dir,
+    # On resume: if all per-layer B-cov spill files already exist, skip Phase A
+    # entirely (including teacher model load — saves ~60s + 70 GB VRAM).
+    _all_bcov_spills_exist = (
+        not no_resume
+        and all(
+            (bcov_spill_dir / f"layer_{ref.layer_idx}.pt").exists()
+            for ref in moe_layers
+        )
     )
+
+    if _all_bcov_spills_exist:
+        log.info(
+            "Stage 3: all %d B-cov spill files found — skipping Phase A "
+            "(covariance collection + teacher load)",
+            len(moe_layers),
+        )
+    else:
+        _collect_covariances(
+            model, moe_layers, batches, B_acc, device=device,
+            spill_dir=bcov_spill_dir,
+            teacher_model=teacher_model,
+            teacher_moe_layers=teacher_moe_layers,
+            C_acc=C_acc,
+            ccov_spill_dir=ccov_spill_dir,
+        )
 
     # Free the teacher model after covariance collection — not needed for factoring.
     if teacher_model is not None:
@@ -233,6 +250,14 @@ def run(
     originals = _snapshot_originals(moe_layers)
     log.info("Snapshotted %d original expert matrices to CPU for "
              "α-search and Stage 4 residuals", len(originals))
+
+    # Persist originals before Phase D. Stage 4 reads this file, so it must
+    # exist even if Stage 3 crashes mid-factoring. Written once here so
+    # Stage 4 can always resume cleanly from the correct original weights.
+    _orig_path = artifacts_dir / "_stage3_original_weights.pt"
+    torch.save(originals, _orig_path)
+    log.info("Saved Stage 3 original weights snapshot (%d matrices) → %s",
+             len(originals), _orig_path)
 
     # Pre-flight RAM check: if the system is low on memory, fall back
     # to the spectral proxy rather than OOM during the α-search loop.
@@ -303,6 +328,14 @@ def run(
     else:
         alpha_by_type = None
         per_expert_ranks = None  # uniform: every expert gets ranks[(li, name)]
+
+    # Persist α result so a crash during Phase D doesn't force re-running
+    # the ~33 min α search on resume.
+    if not no_resume:
+        save_json_artifact(
+            {"alpha_by_type": alpha_by_type},
+            artifacts_dir / "_stage3_alpha_result.json",
+        )
 
     # 2. Factor per-layer using the pre-built originals snapshot.
     rank_map: dict[str, int] = {}
@@ -451,10 +484,6 @@ def run(
         B_acc.unload_layer(ref.layer_idx)
         if C_acc is not None:
             C_acc.unload_layer(ref.layer_idx)
-
-    # 3. Save originals for Stage 4.
-    torch.save(originals, artifacts_dir / "_stage3_original_weights.pt")
-    log.info("Saved Stage 3 original weights snapshot (%d matrices)", len(originals))
 
     # 4. Block refine (optional).
     if s3["block_refine"]["enabled"]:
