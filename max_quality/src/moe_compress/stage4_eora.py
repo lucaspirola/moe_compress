@@ -58,6 +58,14 @@ def run(
 
     originals_path = artifacts_dir / "_stage3_original_weights.pt"
     if not originals_path.exists():
+        # If Stage 4 already completed, the originals are intentionally deleted.
+        # Re-entering Stage 4 on an already-widened model is a double-widen.
+        if (artifacts_dir / "stage4_eora" / "eora_ranks.json").exists():
+            raise AssertionError(
+                "Stage 4 double-widen detected: _stage3_original_weights.pt was deleted "
+                "after a prior successful Stage 4 run. "
+                "widen_rank() has already been applied to this model."
+            )
         raise FileNotFoundError(
             f"Stage 4 requires Stage 3 original weights at {originals_path}. "
             "Re-run Stage 3 first."

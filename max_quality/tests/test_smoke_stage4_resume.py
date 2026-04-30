@@ -178,6 +178,11 @@ def test_stage4_resume_restores_factored_experts_from_spill(
     if not layers:
         pytest.skip("No FactoredExperts layers — EoRA added no rank for any layer")
 
+    # Backup originals before the first Stage 4 run (Stage 4 deletes them on success).
+    import shutil as _shutil
+    originals_backup = tmp_path / "_stage3_original_weights_backup.pt"
+    _shutil.copy(tmp_path / "_stage3_original_weights.pt", originals_backup)
+
     # Run Stage 4 to completion — capture FactoredExperts tensors from layer 0.
     stage4_eora.run(tiny_model, _TinyTokenizer(), patched_stages, tmp_path)
     layer0_idx = layers[0].layer_idx
@@ -209,6 +214,9 @@ def test_stage4_resume_restores_factored_experts_from_spill(
     tmp_pt = partial_dir / f"layer_{layer0_idx}.pt.tmp"
     torch.save(payload, tmp_pt)
     os.replace(tmp_pt, partial_dir / f"layer_{layer0_idx}.pt")
+
+    # Restore originals for layer 1 (Stage 4 deleted them on its first successful run).
+    _shutil.copy(originals_backup, tmp_path / "_stage3_original_weights.pt")
 
     # Reset model again and re-run Stage 4 — layer 0 should come from the spill.
     tiny_model.load_state_dict(state_after_3)
