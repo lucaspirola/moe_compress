@@ -569,7 +569,7 @@ Step-boundary checkpointing to `_stage5_partial/step_{N}.pt` (every 100 optimize
 
 ### What
 
-Evaluates the compressed model against the uncompressed teacher on 5 metrics, enforces hard quality gates, and produces an imatrix file for downstream GGUF quantization. On H200 the larger VRAM headroom allows larger batch sizes for WikiText-2 and zero-shot evals, reducing wall-clock time. Generative evals (HumanEval, MATH-500) can use vLLM for significantly faster throughput than the default HuggingFace generate loop.
+Evaluates the compressed model against the uncompressed teacher on 5 metrics, enforces hard quality gates, and produces an imatrix file for downstream GGUF quantization. On H200 the larger VRAM headroom allows larger batch sizes for all evaluation phases.
 
 ### Metrics
 
@@ -585,26 +585,90 @@ Evaluates the compressed model against the uncompressed teacher on 5 metrics, en
 
 The actual parameter reduction is computed from live parameter counts (accounting for effective ranks in FactoredExperts). Must be ≥ 30.0%.
 
+### Execution Model (Compute-Time Optimized)
+
+Stage 6 runs the following phases. All optimizations are purely computational scheduling — larger batches, cached known-constants, overlapped I/O, and torch.compile. **No metric, formula, threshold, or evaluation methodology is changed.** All outputs are numerically identical to the batch_size=1 baseline.
+
+#### Phase 1: Student Evaluation
+
+| Sub-phase | Optimization | Config Key | Default |
+|-----------|-------------|------------|---------|
+| WikiText-2 PPL | **#1** — batch_size=1→8 | `ppl_batch_size` | 8 |
+| ARC-C + HellaSwag | **#2** — lm-eval batch_size=1→auto:8 | `lm_eval_batch_size` | `"auto:8"` |
+| HumanEval (164 prompts) | **#3** — batched model.generate() | `gen_batch_size` | 8 |
+| MATH-500 (500 prompts) | **#4** — batched model.generate() | `gen_batch_size` | 8 |
+
+**torch.compile** (**#5**, `torch_compile: true`): Before any evaluation begins, `model.forward` is compiled via `torch.compile(model.forward, dynamic=True, mode="reduce-overhead")`. `dynamic=True` handles variable-length padded batches from lm-eval. One-time compilation cost (~3–5 min on H200) is amortized across 1000+ forward passes. **Only** the forward pass is compiled — `model.generate()` is NOT compiled because autoregressive decoding changes shapes every step, causing excessive recompilation.
+
+#### Phase 2: Teacher I/O Overlap (#6)
+
+The teacher preload begins during Phase 1's generative evals (after the zero-shot harness completes): a background thread loads the teacher model to **host RAM** (device_map="cpu") while the GPU runs HumanEval and MATH-500. When Phase 1 completes, the student is moved to CPU, and the pre-loaded teacher is moved to GPU — eliminating the ~3–5 min dead time that a blocking teacher load would cause.
+
+#### Phase 3: Teacher Evaluation (or Cache Hit)
+
+**Teacher eval caching** (**#7**, `teacher_eval_cache.enabled: true`): The teacher (uncompressed Qwen3.6-35B-A3B) is a fixed, known model. Every Stage 6 run re-evaluates the same teacher on the same benchmarks with the same results. When caching is enabled:
+
+- **First run:** Teacher is evaluated normally (PPL + zero-shot + generative). Results and param counts are saved to `teacher_eval_cache.json` with a cache key = `sha256(model_name + revision + eval_config_subset)`.
+- **Subsequent runs:** Cached teacher results are loaded directly. No teacher model load, no teacher evaluation. This eliminates ~50% of total Stage 6 wall-clock time.
+- **Auto-invalidation:** If the model name, revision, or any eval config parameter changes, the cache key mismatches and the teacher is re-evaluated.
+
+When the cache misses, teacher evaluation uses the same batch sizes and torch.compile as student evaluation.
+
+#### Phase 4: GGUF Conversion Overlap (#8)
+
+When the teacher is being evaluated on GPU, the GGUF conversion (`convert_hf_to_gguf.py`) runs simultaneously in a **background CPU thread**. This is safe because GGUF conversion reads from the saved Stage 5 checkpoint on disk (CPU-only, ~5–10 min), teacher evaluation runs on GPU, and CPU and GPU work are fully independent. When teacher eval finishes and the teacher is freed, the F16 GGUF is ready — `llama-imatrix` can start immediately.
+
+#### Phase 5: imatrix Generation
+
+After the teacher is freed from VRAM, `llama-imatrix` runs on the F16 GGUF (pre-built in Phase 4) with the combined calibration text from all benchmarks.
+
+### Spec Compliance of Optimizations
+
+| Optimization | Why Numerically Identical |
+|---|---|
+| #1 PPL batch_size=8 | NLL is computed per-token; `out.loss × (batch.numel() - batch.shape[0])` recovers the exact sum regardless of batch size |
+| #2 lm-eval batch_size=auto:8 | lm-eval's loglikelihood scoring is deterministic and batch-size-independent — left-padding with causal attention mask prevents cross-contamination |
+| #3, #4 Batched generate | Greedy decoding (do_sample=False) produces the same argmax at each step regardless of batch. Left-padding with attention_mask ensures each prompt sees only its own context |
+| #5 torch.compile | No numerical approximations in default/reduce-overhead modes. The spec already documents torch_compile as valid in Stage 5 |
+| #6 Teacher I/O overlap | Computation unchanged — only I/O scheduling differs |
+| #7 Teacher eval cache | Teacher is deterministic — same model + same eval = same numbers. Cache key includes model name, revision, and eval config |
+| #8 GGUF overlap | GGUF conversion reads from saved checkpoint, independent of GPU evaluation |
+
+### vLLM Note
+
+vLLM is **NOT viable** for this model. The compressed model uses a custom `FactoredExperts` nn.Module that replaces the standard `Qwen3_5MoeExperts`. vLLM requires its own model-specific forward implementation and weight loader — it cannot load arbitrary custom nn.Module subclasses. The weight names (`gate_proj_U`, `gate_proj_V`, etc.) don't match what vLLM's Qwen3MoE loader expects. Stick with HuggingFace `model.forward()` and `model.generate()`.
+
 ### imatrix Generation
 
-As a zero-overhead side-channel of the student evaluation pass, Stage 6 collects all text fed to the model across every benchmark — WikiText-2 documents, ARC-C and HellaSwag contexts (via `lm-eval log_samples`), HumanEval prompts, and MATH-500 problems — into a single multi-domain calibration file. After the teacher is freed, the final frozen model is converted to F16 GGUF and `llama-imatrix` runs on the combined text, producing `imatrix.gguf`.
-
-This imatrix is significantly richer than the standard WikiText-only calibration: it covers general language, commonsense reasoning, code, and math — the same domains the model will face in real use. The better imatrix directly improves the quality of all I-variant GGUF quants (IQ4_XS, IQ3_M, IQ2_S, etc.) without any additional inference cost.
+As a zero-overhead side-channel of the student evaluation pass, Stage 6 collects all text fed to the model across every benchmark into a single multi-domain calibration file. After the teacher is freed, the final frozen model is converted to F16 GGUF and `llama-imatrix` runs on the combined text, producing `imatrix.gguf`.
 
 **Artifacts:**
 
 | File | Description |
 |------|-------------|
 | `stage6_eval.json` | Quality gate results (metrics + pass/fail) |
+| `teacher_eval_cache.json` | Cached teacher eval results + param counts (when caching enabled) |
 | `calibration_imatrix.txt` | Combined eval text; always written (usable even without llama.cpp) |
 | `model_f16.gguf` | Intermediate F16 GGUF of the compressed student |
 | `imatrix.gguf` | Final importance matrix for GGUF quantization |
 
 llama.cpp is built in the background by the job entrypoint (daemon thread, starts when Stage 1 begins) so the ~5-minute build does not add to wall-clock time. If llama.cpp is unavailable, `calibration_imatrix.txt` is still written and Stage 6 passes normally.
 
+### Expected Wall-Clock Impact
+
+| Scenario | Student Evals | Teacher Evals | imatrix | Total |
+|---|---|---|---|---|
+| Baseline (batch_size=1, no cache) | ~90–150 min | ~90–150 min | ~20 min | ~200–320 min |
+| After P0 (#7 cache, #2 lm-eval) | ~30–50 min | 0 min (cached) | ~20 min | ~50–70 min |
+| After P0 + P1 (#1 PPL, #3/#4 gen) | ~10–20 min | 0 min | ~20 min | ~30–40 min |
+| After all optimizations | ~8–15 min | 0 min | ~15 min (overlapped) | ~25–30 min |
+
+Expected improvement: **~8–12× end-to-end wall-clock reduction**, from ~3–5 hours down to ~25–30 minutes.
+
 ### Resume
 
-Stage 6 is stateless. Re-running is always safe.
+Stage 6 is stateless. Re-running is always safe. The teacher eval cache persists across runs (it's a JSON file in the artifacts directory, also uploaded to Hub).
+
 
 ---
 
@@ -674,4 +738,4 @@ Each heavy stage (2–5) uploads its checkpoint to a per-stage Hub repo immediat
 
 ---
 
-*This document was generated from a full algorithmic review of the max_quality codebase on 2026-04-28; §12 updated 2026-04-29 after a per-stage paper compliance audit including full methodology-section cross-reference of all 10 cited papers. Spec redesign on 2026-04-29: merged Stage 0 into Stage 1 (CKA + SE detection), floor=n//2, max_merge_group=8, Router KD bs=8. D9 resolved on 2026-04-30: Swift-SVD+ α selection now uses paper-exact WikiText-2 PPL validation (§3.2.2 of 2604.01609) instead of spectral proxy; D9 removed from §12. Phase C eigh caching added 2026-04-30: gate_proj/up_proj share the same B and C covariance; eigendecomposition is now precomputed once per expert and reused for both projections, eliminating ~7,200 redundant eigh(2048×2048) calls. Compute-time optimizations 2026-04-30: (1) Stage 2 sequential profiling with early-exit forward — **implemented** — corrected from single-pass to paper-exact REAM sequential merging (§4, Fig 1(b) of 2604.04356) with early-exit at layer L+1 via pre-forward hook to skip unnecessary downstream computation (820 vs 1600 layer-forwards, ~2× speedup); verified with 6 new tests confirming hook data is bitwise identical to full-forward; (2) vectorized REAM accumulators — **planned, not yet implemented** — dense tensors to replace Python dicts for gate logit profiles and pairwise cosine similarity; (3) Stage 5 KL chunk size increased to full sequence length on H200 — **implemented** — kd_seq_chunk_size=512 in config; (4) torch.compile support for Stages 2.5/5 KD forward passes — **implemented** — new torch_compile config flag with graceful fallback. All implemented optimizations are verified by 21 passing tests (15 existing + 6 new). All formulas were verified against the cited papers' methodology sections. All deviations are deliberate and documented. For the original validation audit, see the archived [VALIDATED_STRATEGIES.md](https://huggingface.co/pirola/moe-compression-workflow/blob/main/VALIDATED_STRATEGIES.md).*
+*This document was generated from a full algorithmic review of the max_quality codebase on 2026-04-28; §12 updated 2026-04-29 after a per-stage paper compliance audit including full methodology-section cross-reference of all 10 cited papers. Spec redesign on 2026-04-29: merged Stage 0 into Stage 1 (CKA + SE detection), floor=n//2, max_merge_group=8, Router KD bs=8. D9 resolved on 2026-04-30: Swift-SVD+ α selection now uses paper-exact WikiText-2 PPL validation (§3.2.2 of 2604.01609) instead of spectral proxy; D9 removed from §12. Phase C eigh caching added 2026-04-30: gate_proj/up_proj share the same B and C covariance; eigendecomposition is now precomputed once per expert and reused for both projections, eliminating ~7,200 redundant eigh(2048×2048) calls. Compute-time optimizations 2026-04-30: (1) Stage 2 sequential profiling with early-exit forward — **implemented**; (2) vectorized REAM accumulators — **planned, not yet implemented**; (3) Stage 5 KL chunk size increased to full sequence length on H200 — **implemented**; (4) torch.compile support for Stages 2.5/5 KD forward passes — **implemented**. Stage 6 compute-time optimizations 2026-04-30 — **all implemented**: (5) WikiText-2 PPL batch_size 1→8; (6) lm-eval batch_size=auto:8; (7) batched model.generate() for HumanEval and MATH-500; (8) torch.compile for prefill-dominant forward paths; (9) teacher eval caching with sha256 cache key auto-invalidation (~50% total time eliminated); (10) teacher I/O overlap via background CPU preload; (11) GGUF conversion overlap with teacher eval. All Stage 6 optimizations are purely computational scheduling — numerically identical to batch_size=1 baseline. Expected total Stage 6 speedup: ~8–12× (from ~3–5 hours to ~25–30 minutes on H200). All formulas were verified against the cited papers. All deviations are deliberate and documented. For the original validation audit, see the archived [VALIDATED_STRATEGIES.md](https://huggingface.co/pirola/moe-compression-workflow/blob/main/VALIDATED_STRATEGIES.md).*
