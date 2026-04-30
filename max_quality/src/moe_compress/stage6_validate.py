@@ -74,7 +74,7 @@ def _teacher_cache_key(config: dict) -> str:
     s6 = config["stage6_validate"]
     payload = json.dumps({
         "model_name_or_path": config["model"]["name_or_path"],
-        "model_revision": config["model"].get("revision", "main"),
+        "model_revision": config["model"].get("revision") or "main",
         "torch_dtype": config["model"].get("torch_dtype", "bfloat16"),
         "wikitext2": s6.get("wikitext2", {}),
         "zero_shot": s6.get("zero_shot", {}),
@@ -437,20 +437,23 @@ def _background_gguf_convert(icfg: dict, artifacts_dir: Path, result: dict) -> N
         return
 
     f16_path = artifacts_dir / "model_f16.gguf"
+    f16_tmp = artifacts_dir / "model_f16.gguf.tmp"
     log.info("GGUF convert (background): %s → F16 GGUF", model_dir)
     try:
         t0 = time.monotonic()
         subprocess.run(
             [sys.executable, str(convert_py), str(model_dir),
-             "--outtype", "f16", "--outfile", str(f16_path)],
+             "--outtype", "f16", "--outfile", str(f16_tmp)],
             check=True, timeout=3600,
         )
+        os.replace(f16_tmp, f16_path)
         dt = time.monotonic() - t0
         result["f16_path"] = f16_path
         log.info("GGUF convert (background): done in %.1fs (%.1f GB)",
                  dt, f16_path.stat().st_size / 1e9)
     except Exception as exc:
         log.warning("GGUF convert (background): failed (%s)", exc)
+        f16_tmp.unlink(missing_ok=True)
 
 
 def _run_llama_imatrix_with_prebuilt_gguf(
