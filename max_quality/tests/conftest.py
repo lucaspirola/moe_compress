@@ -228,7 +228,7 @@ def tiny_config():
                 "alpha_grid": [0.5], "validation_samples": 2,
                 "metric": "wikitext2_ppl", "per_group_type": True,
             },
-            "aa_svd": {"use_post_prune_inputs": True},
+            "aa_svd": {"use_post_prune_inputs": True, "cross_covariance": False},
             "block_refine": {"enabled": False, "lbfgs_steps": 5,
                              "lbfgs_history": 2, "per_block_loss": "mse"},
         },
