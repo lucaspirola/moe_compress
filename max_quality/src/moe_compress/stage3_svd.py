@@ -167,9 +167,13 @@ def run(
 
     bcov_spill_dir = artifacts_dir / "_stage3_bcov_partial"
     bcov_spill_dir.mkdir(parents=True, exist_ok=True)
+    for _stale in bcov_spill_dir.glob("*.tmp"):
+        _stale.unlink(missing_ok=True)
     ccov_spill_dir = artifacts_dir / "_stage3_ccov_partial" if C_acc is not None else None
     if ccov_spill_dir is not None:
         ccov_spill_dir.mkdir(parents=True, exist_ok=True)
+        for _stale in ccov_spill_dir.glob("*.tmp"):
+            _stale.unlink(missing_ok=True)
 
     # On resume: if all per-layer B-cov spill files already exist, skip Phase A
     # entirely (including teacher model load — saves ~60s + 70 GB VRAM).
