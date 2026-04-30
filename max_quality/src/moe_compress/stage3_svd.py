@@ -44,6 +44,7 @@ from .utils.model_io import (
     build_banks,
     iter_moe_layers,
     load_model,
+    load_json_artifact,
     save_compressed_checkpoint,
     save_json_artifact,
 )
@@ -180,6 +181,12 @@ def run(
             "(covariance collection + teacher load)",
             len(moe_layers),
         )
+        # On resume we skip the else-branch where C_acc is normally created.
+        # Re-create it here so the factoring loop can still lazy-load
+        # the existing C-cov spill files (AA-SVD Path 1 / Theorem 3.2).
+        if cross_cov_enabled:
+            C_acc = InputCovarianceAccumulator()
+            C_acc.set_storage_dtype(B_cov_dtype)
     else:
         if cross_cov_enabled:
             log.info("Stage 3: loading original model for cross-covariance dual-forward (Theorem 3.2)")
@@ -293,55 +300,74 @@ def run(
         except ImportError:
             pass  # psutil unavailable — proceed optimistically
 
-    if alpha_grid and len(alpha_grid) > 1:
-        if validation_samples > 0:
-            # Paper-exact: global α via WikiText-2 PPL validation (§3.2.2).
-            log.info("Stage 3: Swift-SVD+ α selection via validation "
-                     "(%d samples, %d candidates)",
-                     validation_samples, len(alpha_grid))
-            best_global_alpha = _swift_svd_plus_alpha_search_validation(
-                model, tokenizer, moe_layers, group_stats, ranks,
-                alpha_grid, originals, A_cov, B_acc, bcov_spill_dir,
-                C_acc, ccov_spill_dir, config, device=device,
-            )
-            if per_group_type:
-                # Per-type refinement using spectral proxy, seeded from the
-                # validation-selected global α. The paper uses a single α
-                # for all projections; per-type is our extension.
-                log.info("Stage 3: per-type α refinement via spectral "
-                         "proxy (seed=%.1f)", best_global_alpha)
+    # Resume: if α was already selected (and saved) in a previous interrupted
+    # run, reload it and skip the ~33 min α search entirely.
+    _alpha_cache_path = artifacts_dir / "_stage3_alpha_result.json"
+    _alpha_loaded = False
+    if not no_resume and _alpha_cache_path.exists() and alpha_grid and len(alpha_grid) > 1:
+        try:
+            _cached_alpha = load_json_artifact(_alpha_cache_path)
+            alpha_by_type = _cached_alpha.get("alpha_by_type")
+            if alpha_by_type is not None:
+                log.info("Stage 3: loaded cached α from %s — skipping α search", _alpha_cache_path)
+                per_expert_ranks = _redistribute_ranks_swift_svd_plus(
+                    moe_layers, group_stats, ranks, alpha_by_type,
+                    grouped_svs_cache=None, A_cov=A_cov,
+                )
+                _alpha_loaded = True
+        except Exception as _exc:
+            log.warning("Stage 3: failed to load α cache (%s) — running α search", _exc)
+
+    if not _alpha_loaded:
+        if alpha_grid and len(alpha_grid) > 1:
+            if validation_samples > 0:
+                # Paper-exact: global α via WikiText-2 PPL validation (§3.2.2).
+                log.info("Stage 3: Swift-SVD+ α selection via validation "
+                         "(%d samples, %d candidates)",
+                         validation_samples, len(alpha_grid))
+                best_global_alpha = _swift_svd_plus_alpha_search_validation(
+                    model, tokenizer, moe_layers, group_stats, ranks,
+                    alpha_grid, originals, A_cov, B_acc, bcov_spill_dir,
+                    C_acc, ccov_spill_dir, config, device=device,
+                )
+                if per_group_type:
+                    # Per-type refinement using spectral proxy, seeded from the
+                    # validation-selected global α. The paper uses a single α
+                    # for all projections; per-type is our extension.
+                    log.info("Stage 3: per-type α refinement via spectral "
+                             "proxy (seed=%.1f)", best_global_alpha)
+                    alpha_by_type = _swift_svd_plus_alpha_search(
+                        moe_layers, group_stats, ranks, alpha_grid,
+                        per_group_type=True,
+                        A_cov=A_cov,
+                    )
+                    log.info("Stage 3: Swift-SVD+ per-type α = %s "
+                             "(global validation best = %.1f)",
+                             alpha_by_type, best_global_alpha)
+                else:
+                    alpha_by_type = {"all": best_global_alpha}
+                    log.info("Stage 3: Swift-SVD+ selected α = %s",
+                             alpha_by_type)
+            else:
+                # Fallback: spectral proxy only (no forward passes).
+                log.info("Stage 3: Swift-SVD+ α search via spectral proxy "
+                         "(%d candidates, per_group_type=%s)",
+                         len(alpha_grid), per_group_type)
                 alpha_by_type = _swift_svd_plus_alpha_search(
                     moe_layers, group_stats, ranks, alpha_grid,
-                    per_group_type=True,
+                    per_group_type=per_group_type,
                     A_cov=A_cov,
                 )
-                log.info("Stage 3: Swift-SVD+ per-type α = %s "
-                         "(global validation best = %.1f)",
-                         alpha_by_type, best_global_alpha)
-            else:
-                alpha_by_type = {"all": best_global_alpha}
-                log.info("Stage 3: Swift-SVD+ selected α = %s",
-                         alpha_by_type)
-        else:
-            # Fallback: spectral proxy only (no forward passes).
-            log.info("Stage 3: Swift-SVD+ α search via spectral proxy "
-                     "(%d candidates, per_group_type=%s)",
-                     len(alpha_grid), per_group_type)
-            alpha_by_type = _swift_svd_plus_alpha_search(
-                moe_layers, group_stats, ranks, alpha_grid,
-                per_group_type=per_group_type,
+                log.info("Stage 3: Swift-SVD+ selected α = %s", alpha_by_type)
+            # Redistribute per-expert ranks within each group using the selected α.
+            per_expert_ranks = _redistribute_ranks_swift_svd_plus(
+                moe_layers, group_stats, ranks, alpha_by_type,
+                grouped_svs_cache=None,
                 A_cov=A_cov,
             )
-            log.info("Stage 3: Swift-SVD+ selected α = %s", alpha_by_type)
-        # Redistribute per-expert ranks within each group using the selected α.
-        per_expert_ranks = _redistribute_ranks_swift_svd_plus(
-            moe_layers, group_stats, ranks, alpha_by_type,
-            grouped_svs_cache=None,
-            A_cov=A_cov,
-        )
-    else:
-        alpha_by_type = None
-        per_expert_ranks = None  # uniform: every expert gets ranks[(li, name)]
+        else:
+            alpha_by_type = None
+            per_expert_ranks = None  # uniform: every expert gets ranks[(li, name)]
 
     # Persist α result so a crash during Phase D doesn't force re-running
     # the ~33 min α search on resume.

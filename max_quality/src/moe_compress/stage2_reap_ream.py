@@ -449,7 +449,11 @@ def _profile_layer(
     n_experts = layer_ref.num_routed_experts
     model.eval()
 
+    # Cumulative token offset: tracks the global start index of each batch.
+    # Using cumulative addition (not batch_idx * fixed_size) handles the last
+    # partial batch when num_calibration_samples % batch_size != 0.
     _batch_offset = [0]
+    _next_offset = [0]
 
     def input_cb(li, e, tensor, ctx):
         cov_acc.update(li, e, "gate_proj", tensor)
@@ -473,7 +477,7 @@ def _profile_layer(
         for batch_idx, batch in enumerate(batches):
             if device is not None:
                 batch = batch.to(device)
-            _batch_offset[0] = batch_idx * batch.shape[0] * batch.shape[1]
+            _batch_offset[0] = _next_offset[0]
             router_logits_storage[layer_idx].clear()
             with torch.no_grad():
                 try:
@@ -484,6 +488,7 @@ def _profile_layer(
                 batch_logits = router_logits_storage[layer_idx][-1]
                 ream_acc.record_router_logits(layer_idx, batch_logits, _batch_offset[0])
             ream_acc.finalize_batch(layer_idx, n_experts)
+            _next_offset[0] += batch.shape[0] * batch.shape[1]
 
 
 # ---------------------------------------------------------------------------

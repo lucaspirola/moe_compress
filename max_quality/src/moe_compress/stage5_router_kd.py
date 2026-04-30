@@ -202,7 +202,7 @@ def run(
     )
     grad_accum = s5["gradient_accumulation"]
     T = s5["kd_temperature"]
-    ckpt_every = int(s5.get("checkpoint_every_n_steps", 0))
+    ckpt_every = int(s5.get("checkpoint_every_n_steps", 100))
 
     # Teacher/student MoE layer count sanity check (router structure must match
     # even though we're distilling at vocab level — the student's routers are
@@ -354,11 +354,13 @@ def run(
                     _save_stage5_checkpoint(partial_dir, step, epoch, i, student, optim,
                                             grad_accum=grad_accum)
                     # Keep only the two most recent checkpoints to bound disk use.
-                    old_step = step - 2 * ckpt_every
-                    if old_step > 0:
-                        old_ckpt = partial_dir / f"step_{old_step}.pt"
-                        if old_ckpt.exists():
-                            old_ckpt.unlink()
+                    # Sort by step number (ascending) and delete all but the newest two.
+                    all_ckpts = sorted(
+                        partial_dir.glob("step_*.pt"),
+                        key=lambda p: int(p.stem.split("_")[1]),
+                    )
+                    for old_ckpt in all_ckpts[:-2]:
+                        old_ckpt.unlink(missing_ok=True)
         optim.zero_grad()
 
     out_dir = artifacts_dir / f"{stage_key}_final"

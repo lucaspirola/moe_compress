@@ -1,6 +1,6 @@
 """Stage 1 — Super Expert Detection + GRAPE non-uniform per-layer expert budgets.
 
-Merged stage: a single 512-sample calibration forward pass simultaneously
+Merged stage: a single calibration forward pass (size from config) simultaneously
 collects (a) max |down_proj_output| for super expert detection and (b) expert
 output representations for CKA pairwise similarity matrices, which feed GRAPE
 Algorithm 1 (2604.06542, §3.3).
@@ -407,15 +407,23 @@ def _grape_greedy_merge(
     # Layer selection uses argmin R (most redundant = smallest distance sum),
     # NOT argmax — this is correct for distance matrices despite GRAPE's paper
     # notation which uses argmax R over a SIMILARITY-based R.
+    #
+    # Blacklisted experts are zeroed out in D_work so they never participate
+    # in pair selection as either centroid (i_star) or absorbed expert (j_star),
+    # and their distances do not inflate R (which would bias layer selection).
+    D_work: dict[int, np.ndarray] = {}
+    for li in sorted_layers:
+        d = D_matrices[li].cpu().numpy().copy()
+        for bl_e in blacklist.get(li, []):
+            d[bl_e, :] = 0.0
+            d[:, bl_e] = 0.0
+        D_work[li] = d
+
     R: dict[int, float] = {}
     for li in sorted_layers:
-        D = D_matrices[li]
-        n = D.shape[0]
-        R[li] = float((D.sum() - D.diag().sum()).item()) if n > 1 else 0.0
-
-    D_work: dict[int, np.ndarray] = {
-        li: D_matrices[li].cpu().numpy().copy() for li in sorted_layers
-    }
+        d = D_work[li]
+        n = d.shape[0]
+        R[li] = float((d.sum() - np.diag(d).sum())) if n > 1 else 0.0
 
     # Floor: max(min_experts, blacklist size per layer)
     floors: dict[int, int] = {
@@ -450,7 +458,12 @@ def _grape_greedy_merge(
     # Per-layer sets of absorbed (merged-away) expert indices.  Using an explicit
     # set — rather than checking D_l == 0 — avoids misidentifying genuinely
     # zero-distance (identical-weight) expert pairs as already-merged.
-    merged: dict[int, set[int]] = {li: set() for li in sorted_layers}
+    # Pre-populate with blacklisted experts: their D_work rows/cols are 0.0
+    # (zeroed during D_work initialization), so without this pre-population
+    # argmin would select them as j_star and corrupt cluster_counts.
+    merged: dict[int, set[int]] = {
+        li: set(blacklist.get(li, [])) for li in sorted_layers
+    }
 
     max_iterations = current_total * n_moe_layers
     for iteration in range(max_iterations):
