@@ -111,11 +111,10 @@ def run(
     A_cov = _load_stage2_covariance(artifacts_dir / "_stage2_input_covariance.pt")
 
     # B covariance + cross-covariance: fresh calibration through both models.
-    spec = spec_from_config(
-        cal,
-        num_sequences_override=s3["swift_svd_plus"]["validation_samples"],
-        seed_offset=2,
-    )
+    # Use cal["num_sequences"] directly — do NOT reuse validation_samples here,
+    # because validation_samples=0 means "disable PPL α-search, use spectral proxy"
+    # and must NOT zero out the B-cov calibration pass.
+    spec = spec_from_config(cal, seed_offset=2)
     calib = build_calibration_tensor(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache"
     )
@@ -136,28 +135,6 @@ def run(
     teacher_model = None
     teacher_moe_layers = None
 
-    if cross_cov_enabled:
-        log.info("Stage 3: loading original model for cross-covariance dual-forward (Theorem 3.2)")
-        teacher_model, _ = load_model(
-            config["model"]["name_or_path"],
-            revision=config["model"]["revision"],
-            torch_dtype=config["model"]["torch_dtype"],
-            device_map=config["model"]["device_map"],
-            attn_implementation=config["model"]["attn_implementation"],
-            trust_remote_code=config["model"].get("trust_remote_code", False),
-        )
-        teacher_model.eval()
-        for p in teacher_model.parameters():
-            p.requires_grad_(False)
-        teacher_moe_layers = list(iter_moe_layers(teacher_model))
-        C_acc = InputCovarianceAccumulator()
-        C_acc.set_storage_dtype(B_cov_dtype)
-        log.info("Stage 3: dual-forward covariance collection (B + cross-cov C), batch_size=%d",
-                 bcov_batch_size)
-    else:
-        log.info("Stage 3: B-cov only (cross-covariance disabled), batch_size=%d",
-                 bcov_batch_size)
-
     if no_resume:
         import shutil as _shutil
         for _d in ["_stage3_bcov_partial", "_stage3_ccov_partial"]:
@@ -169,19 +146,31 @@ def run(
     bcov_spill_dir.mkdir(parents=True, exist_ok=True)
     for _stale in bcov_spill_dir.glob("*.tmp"):
         _stale.unlink(missing_ok=True)
-    ccov_spill_dir = artifacts_dir / "_stage3_ccov_partial" if C_acc is not None else None
+    ccov_spill_dir = artifacts_dir / "_stage3_ccov_partial" if cross_cov_enabled else None
     if ccov_spill_dir is not None:
         ccov_spill_dir.mkdir(parents=True, exist_ok=True)
         for _stale in ccov_spill_dir.glob("*.tmp"):
             _stale.unlink(missing_ok=True)
 
-    # On resume: if all per-layer B-cov spill files already exist, skip Phase A
-    # entirely (including teacher model load — saves ~60s + 70 GB VRAM).
+    # On resume: if all B-cov spill files exist (and all C-cov spills when cross-cov is
+    # enabled), skip Phase A entirely — including the ~60s / 70 GB teacher model load.
+    # Not checking C-cov completeness here would silently fall back to B-only paths for
+    # a run that switched cross_covariance: false → true.
     _all_bcov_spills_exist = (
         not no_resume
         and all(
             (bcov_spill_dir / f"layer_{ref.layer_idx}.pt").exists()
             for ref in moe_layers
+        )
+        and (
+            not cross_cov_enabled
+            or (
+                ccov_spill_dir is not None
+                and all(
+                    (ccov_spill_dir / f"layer_{ref.layer_idx}.pt").exists()
+                    for ref in moe_layers
+                )
+            )
         )
     )
 
@@ -192,6 +181,27 @@ def run(
             len(moe_layers),
         )
     else:
+        if cross_cov_enabled:
+            log.info("Stage 3: loading original model for cross-covariance dual-forward (Theorem 3.2)")
+            teacher_model, _ = load_model(
+                config["model"]["name_or_path"],
+                revision=config["model"]["revision"],
+                torch_dtype=config["model"]["torch_dtype"],
+                device_map=config["model"]["device_map"],
+                attn_implementation=config["model"]["attn_implementation"],
+                trust_remote_code=config["model"].get("trust_remote_code", False),
+            )
+            teacher_model.eval()
+            for p in teacher_model.parameters():
+                p.requires_grad_(False)
+            teacher_moe_layers = list(iter_moe_layers(teacher_model))
+            C_acc = InputCovarianceAccumulator()
+            C_acc.set_storage_dtype(B_cov_dtype)
+            log.info("Stage 3: dual-forward covariance collection (B + cross-cov C), batch_size=%d",
+                     bcov_batch_size)
+        else:
+            log.info("Stage 3: B-cov only (cross-covariance disabled), batch_size=%d",
+                     bcov_batch_size)
         _collect_covariances(
             model, moe_layers, batches, B_acc, device=device,
             spill_dir=bcov_spill_dir,
