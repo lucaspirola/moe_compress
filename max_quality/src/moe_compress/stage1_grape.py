@@ -60,7 +60,12 @@ def run(
     s1 = config["stage1_grape"]
     cal = config["calibration"]
     moe_layers = list(iter_moe_layers(model))
-    n_per_layer = moe_layers[0].num_routed_experts if moe_layers else 0
+    if not moe_layers:
+        raise ValueError(
+            "Stage 1: model has no MoE layers — check iter_moe_layers() compatibility "
+            "with this model architecture."
+        )
+    n_per_layer = moe_layers[0].num_routed_experts
 
     # ------------------------------------------------------------------
     # Phase A: Single-pass calibration (512 samples)
@@ -426,6 +431,13 @@ def _grape_greedy_merge(
         probs = probs[probs > 0]
         return float(-np.sum(probs * np.log(probs)))
 
+    if gamma <= 0.0:
+        log.warning(
+            "GRAPE: gamma=%.4f ≤ 0 — entropy constraint will freeze every layer after "
+            "the first merge (E_hat=E_init). Set gamma > 0 to allow meaningful reduction.",
+            gamma,
+        )
+
     E_init = _entropy(cluster_counts)
     E_hat = E_init * (1.0 - gamma)
 
@@ -434,6 +446,11 @@ def _grape_greedy_merge(
 
     log.info("GRAPE: global_budget=%d (non-bl effective=%d), current_total=%d, gamma=%.2f, E_hat=%.4f, floor=%d",
              global_budget, effective_budget, current_total, gamma, E_hat, min_experts)
+
+    # Per-layer sets of absorbed (merged-away) expert indices.  Using an explicit
+    # set — rather than checking D_l == 0 — avoids misidentifying genuinely
+    # zero-distance (identical-weight) expert pairs as already-merged.
+    merged: dict[int, set[int]] = {li: set() for li in sorted_layers}
 
     max_iterations = current_total * n_moe_layers
     for iteration in range(max_iterations):
@@ -462,22 +479,22 @@ def _grape_greedy_merge(
 
         D_l = D_work[best_layer]
         n = D_l.shape[0]
-        # For a distance matrix: find the most similar (smallest distance) off-diagonal pair.
-        # Diagonal is 0 (self-distance) and already-merged pairs are zeroed out — exclude both.
+        # For a distance matrix: find the most similar (smallest distance) pair where
+        # neither expert has already been absorbed.  Track absorbed experts explicitly
+        # so that genuinely zero-distance (identical-weight) pairs remain selectable.
+        absorbed = merged[best_layer]
         tmp = D_l.copy()
         np.fill_diagonal(tmp, np.inf)
-        tmp[D_l == 0] = np.inf
+        for a in absorbed:
+            tmp[a, :] = np.inf
+            tmp[:, a] = np.inf
         if not np.isfinite(tmp).any():
             frozen.add(best_layer)
             continue
         flat_idx = int(np.argmin(tmp))
         i_star, j_star = divmod(flat_idx, n)
 
-        if D_l[i_star, j_star] <= 0:
-            frozen.add(best_layer)
-            continue
-
-        # D4: zero entire row/column of absorbed expert (not just the pair)
+        # D4: zero entire row/column of absorbed expert and update R
         contribution = float(D_l[i_star, j_star]) + float(D_l[j_star, i_star])
         R[best_layer] -= contribution
         D_l[i_star, j_star] = 0.0
@@ -485,6 +502,7 @@ def _grape_greedy_merge(
         R[best_layer] -= float(D_l[j_star, :].sum() + D_l[:, j_star].sum())
         D_l[j_star, :] = 0.0
         D_l[:, j_star] = 0.0
+        absorbed.add(j_star)
 
         cluster_counts[best_layer] -= 1
         current_total -= 1
