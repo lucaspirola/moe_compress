@@ -84,6 +84,8 @@ def run(
     else:
         partial_dir = artifacts_dir / "_stage4_partial"
         partial_dir.mkdir(parents=True, exist_ok=True)
+        for _stale in partial_dir.glob("*.tmp"):
+            _stale.unlink(missing_ok=True)
 
     # Snapshot Stage 3 ranks before any widening occurs.
     # Used by the double-widen guard below to detect in-process re-runs.

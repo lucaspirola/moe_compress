@@ -108,6 +108,8 @@ def run(
     else:
         partial_dir = artifacts_dir / "_stage2_partial"
         partial_dir.mkdir(parents=True, exist_ok=True)
+        for _stale in partial_dir.glob("*.tmp"):
+            _stale.unlink(missing_ok=True)
 
         # Crash safety: delete any .pt whose matching .json is absent.
         # A .pt without .json means the process died between _snapshot_cov_layer

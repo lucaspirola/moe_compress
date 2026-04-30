@@ -212,6 +212,8 @@ def run(
     else:
         partial_dir = artifacts_dir / "_stage5_partial"
         partial_dir.mkdir(parents=True, exist_ok=True)
+        for _stale in partial_dir.glob("*.tmp"):
+            _stale.unlink(missing_ok=True)
 
         ckpts = sorted(
             partial_dir.glob("step_*.pt"),
@@ -244,6 +246,14 @@ def run(
             resume_step = int(payload["step"])
             resume_epoch = int(payload["epoch"])
             resume_batch_i = int(payload["batch_idx"])
+            if "gradient_accumulation" in payload:
+                saved_ga = int(payload["gradient_accumulation"])
+                if saved_ga != grad_accum:
+                    raise RuntimeError(
+                        f"Stage 5 resume: gradient_accumulation mismatch — "
+                        f"checkpoint has {saved_ga}, config has {grad_accum}. "
+                        "Delete _stage5_partial/ and re-run or align the config."
+                    )
             log.info("Stage 5: resumed from step %d (epoch %d, batch %d)",
                      resume_step, resume_epoch, resume_batch_i)
 
@@ -326,7 +336,8 @@ def run(
 
                 # Periodic checkpoint for crash-resume.
                 if partial_dir is not None and ckpt_every > 0 and step % ckpt_every == 0:
-                    _save_stage5_checkpoint(partial_dir, step, epoch, i, student, optim)
+                    _save_stage5_checkpoint(partial_dir, step, epoch, i, student, optim,
+                                            grad_accum=grad_accum)
                     # Keep only the two most recent checkpoints to bound disk use.
                     old_step = step - 2 * ckpt_every
                     if old_step > 0:
@@ -383,6 +394,7 @@ def _save_stage5_checkpoint(
     batch_idx: int,
     student: nn.Module,
     optim: torch.optim.Optimizer,
+    grad_accum: int = 1,
 ) -> None:
     router_state = {
         name: p.data.cpu().clone()
@@ -396,6 +408,7 @@ def _save_stage5_checkpoint(
         "batch_idx": batch_idx,
         "router_state": router_state,
         "optim_state": optim.state_dict(),
+        "gradient_accumulation": grad_accum,
     }
     tmp = partial_dir / f"step_{step}.pt.tmp"
     final = partial_dir / f"step_{step}.pt"
