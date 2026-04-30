@@ -72,6 +72,14 @@ def run(
     partial_dir = artifacts_dir / "_stage4_partial"
     partial_dir.mkdir(parents=True, exist_ok=True)
 
+    # Snapshot Stage 3 ranks before any widening occurs.
+    # Used by the double-widen guard below to detect in-process re-runs.
+    stage3_ranks: dict[int, dict[str, int]] = {}
+    for ref in layers:
+        fe = ref.experts_module
+        if isinstance(fe, FactoredExperts):
+            stage3_ranks[ref.layer_idx] = {name: fe.ranks[name] for name in MATRIX_NAMES}
+
     for k, ref in enumerate(layers):
         fe = ref.experts_module
         if not isinstance(fe, FactoredExperts):
@@ -167,6 +175,15 @@ def run(
                 if (e + 1) % 32 == 0:
                     log.info("  L%d/%s expert %d/%d", ref.layer_idx, name, e + 1, N)
 
+            # Double-widen guard: assert ranks haven't been modified yet.
+            # Protects against in-process re-runs (notebooks, test harnesses)
+            # where widen_rank() would double-apply EoRA correction.
+            assert fe.ranks[name] == stage3_ranks.get(ref.layer_idx, {}).get(name, fe.ranks[name]), (
+                f"Stage 4 double-widen detected: layer={ref.layer_idx}, matrix={name}, "
+                f"current_rank={fe.ranks[name]}, "
+                f"stage3_rank={stage3_ranks.get(ref.layer_idx, {}).get(name)}. "
+                "widen_rank() has already been applied in this process."
+            )
             fe.widen_rank(name, U_corr, V_corr, added_effective_per_expert=eff_per_expert)
             rank_map_layer[f"L{ref.layer_idx}_{name}"] = fe.ranks[name]
             layer_compensated_params += int(U_corr.numel() + V_corr.numel())
