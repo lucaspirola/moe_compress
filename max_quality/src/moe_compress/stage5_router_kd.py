@@ -51,7 +51,15 @@ def run(
     *,
     device=None,
     no_resume: bool = False,
+    stage_key: str = "stage5",
 ) -> Path:
+    """Run Router KD.
+
+    ``stage_key`` controls the partial-dir and output-dir names, allowing the
+    same code to serve both Stage 2.5 (``stage_key="stage2p5"``) and Stage 5
+    (``stage_key="stage5"``).  The config section read is always
+    ``stage5_router_kd`` regardless of ``stage_key``.
+    """
     s5 = config["stage5_router_kd"]
     cal = config["calibration"]
 
@@ -120,6 +128,10 @@ def run(
             log.warning("Stage 5: teacher_logits_cache=%s not found at %s — falling back to live teacher",
                         cache_path_cfg, cache_path)
 
+    # --- torch.compile acceleration (spec §8) ---
+    # Assigned BEFORE _get_teacher closure so the closure's reference resolves correctly.
+    use_compile = bool(s5.get("torch_compile", False))
+
     if teacher_logits_cache is None:
         # Deferred teacher load: only load the teacher on the first live training
         # batch. On resume, fast-forward iterates without ever touching the teacher —
@@ -163,9 +175,6 @@ def run(
                     f"{len(_teacher_state['refs'])} vs {student_refs_count}"
                 )
             return _teacher_state["model"]
-
-    # --- torch.compile acceleration (spec §8) ---
-    use_compile = bool(s5.get("torch_compile", False))
     if use_compile:
         try:
             log.info("Stage 5: torch.compile(student, mode='reduce-overhead')")
@@ -209,8 +218,14 @@ def run(
 
     if no_resume:
         partial_dir = None
+        # Delete any stale partial dir so a future non-no-resume run does not
+        # accidentally resume from a prior run's checkpoints.
+        stale = artifacts_dir / f"_{stage_key}_partial"
+        if stale.exists():
+            import shutil as _shutil
+            _shutil.rmtree(stale, ignore_errors=True)
     else:
-        partial_dir = artifacts_dir / "_stage5_partial"
+        partial_dir = artifacts_dir / f"_{stage_key}_partial"
         partial_dir.mkdir(parents=True, exist_ok=True)
         for _stale in partial_dir.glob("*.tmp"):
             _stale.unlink(missing_ok=True)
@@ -346,13 +361,11 @@ def run(
                             old_ckpt.unlink()
         optim.zero_grad()
 
-    out_dir = artifacts_dir / "stage5_final"
+    out_dir = artifacts_dir / f"{stage_key}_final"
     save_compressed_checkpoint(
-        student, tokenizer, out_dir, pipeline_stage="stage5_final",
+        student, tokenizer, out_dir, pipeline_stage=f"{stage_key}_final",
     )
-    # Keep _stage5_partial/ on success: checkpoints are useful for debugging
-    # convergence and post-mortem analysis. The directory is small (≤ 2 × few MB).
-    log.info("Stage 5 complete → %s", out_dir)
+    log.info("Stage %s complete → %s", stage_key, out_dir)
     return out_dir
 
 

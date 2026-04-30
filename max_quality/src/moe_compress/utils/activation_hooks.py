@@ -95,8 +95,12 @@ class ReamCostAccumulator:
         default_factory=lambda: defaultdict(lambda: defaultdict(dict))
     )
     # Incremental pairwise cosine similarity of gated expert outputs.
+    # gated_output_sim accumulates Σ_{t in shared} cos_sim for each pair.
+    # The final δ̃_expert(i,j) divides by |X| (total calibration tokens),
+    # NOT by jointly-active count, per REAM Eq. 8 and spec §5 Step 2.
     gated_output_sim: dict[tuple[int, int, int], float] = field(default_factory=lambda: defaultdict(float))
-    gated_output_count: dict[tuple[int, int, int], int] = field(default_factory=lambda: defaultdict(int))
+    # Total calibration tokens seen per layer (denominator for Eq. 8).
+    _total_tokens_by_layer: dict[int, int] = field(default_factory=lambda: defaultdict(int))
     # Temporary per-batch storage: (layer, expert) → {global_token_idx → gated_output [d_hid]}
     _batch_gated_indexed: dict[tuple[int, int], dict[int, torch.Tensor]] = field(
         default_factory=lambda: defaultdict(dict)
@@ -160,11 +164,20 @@ class ReamCostAccumulator:
             self._batch_gated_indexed[k].clear()
 
         expert_ids = sorted(per_expert.keys())
-        if len(expert_ids) < 2:
-            return
 
         # Build per-expert token sets for fast intersection.
         token_sets: dict[int, set[int]] = {e: set(per_expert[e].keys()) for e in expert_ids}
+
+        # Accumulate total tokens seen for this layer (spec Eq. 8 denominator = |X|).
+        # Every token routes through this layer, so total unique tokens = union of all
+        # per-expert active sets (since every token activates exactly top_k experts).
+        all_batch_tokens: set[int] = set()
+        for e in expert_ids:
+            all_batch_tokens |= token_sets[e]
+        self._total_tokens_by_layer[layer_idx] += len(all_batch_tokens)
+
+        if len(expert_ids) < 2:
+            return
 
         for idx_i, e_i in enumerate(expert_ids):
             for e_j in expert_ids[idx_i + 1:]:
@@ -176,14 +189,13 @@ class ReamCostAccumulator:
                 vecs_i = torch.stack([per_expert[e_i][t] for t in shared])  # [|shared|, d_hid]
                 vecs_j = torch.stack([per_expert[e_j][t] for t in shared])  # [|shared|, d_hid]
                 sims = F.cosine_similarity(vecs_i, vecs_j, dim=-1)           # [|shared|]
-                avg_sim = float(sims.mean().item())
+                # Accumulate sum of per-token cosine similarities (numerator of Eq. 8).
+                # Dividing by |X| happens in compute_delta_expert, NOT here.
+                sim_sum = float(sims.sum().item())
                 k1 = (layer_idx, e_i, e_j)
                 k2 = (layer_idx, e_j, e_i)
-                n_shared = len(shared)
-                self.gated_output_sim[k1] += avg_sim * n_shared
-                self.gated_output_sim[k2] += avg_sim * n_shared
-                self.gated_output_count[k1] += n_shared
-                self.gated_output_count[k2] += n_shared
+                self.gated_output_sim[k1] += sim_sum
+                self.gated_output_sim[k2] += sim_sum
 
     def compute_delta_gate(self, layer_idx: int, expert_i: int, expert_j: int) -> float:
         """δ_gate(i,j) per REAM Eq. 5: cosine sim between pre-softmax gate
@@ -208,12 +220,17 @@ class ReamCostAccumulator:
         return (1.0 - sim) / 2.0  # normalize to [0, 1]
 
     def compute_delta_expert(self, layer_idx: int, expert_i: int, expert_j: int) -> float:
-        """δ̃_E(i,j) per REAM Eq. 8: mean cosine sim of gated expert outputs."""
+        """δ̃_E(i,j) per REAM Eq. 8: mean cosine sim of gated expert outputs.
+
+        Denominator is |X| (total calibration tokens), NOT jointly-active count.
+        Gate weights suppress non-active tokens to ~0, so their cosine similarity
+        contribution is ~0 — only jointly-active tokens contribute to the numerator.
+        """
         key = (layer_idx, expert_i, expert_j)
-        count = self.gated_output_count.get(key, 0)
-        if count == 0:
+        total = self._total_tokens_by_layer.get(layer_idx, 0)
+        if total == 0:
             return 1.0  # max distance
-        avg_sim = self.gated_output_sim[key] / count
+        avg_sim = self.gated_output_sim.get(key, 0.0) / total
         return (1.0 - avg_sim) / 2.0  # normalize to [0, 1]
 
     def record_neuron_activations(
@@ -252,7 +269,7 @@ class ReamCostAccumulator:
         keys_to_clear = [k for k in self.gated_output_sim if k[0] == layer_idx]
         for k in keys_to_clear:
             self.gated_output_sim.pop(k, None)
-            self.gated_output_count.pop(k, None)
+        self._total_tokens_by_layer.pop(layer_idx, None)
         neuron_keys = [k for k in self._neuron_act_sum if k[0] == layer_idx]
         for k in neuron_keys:
             self._neuron_act_sum.pop(k, None)

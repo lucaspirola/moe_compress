@@ -80,7 +80,7 @@ def _teacher_cache_key(config: dict) -> str:
         "zero_shot": s6.get("zero_shot", {}),
         "generative": s6.get("generative", {}),
     }, sort_keys=True)
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _load_teacher_cache(cache_path: Path, cache_key: str) -> dict | None:
@@ -591,7 +591,8 @@ def _lm_eval_tasks(model, tokenizer, tasks: list[str], *, collect=None,
         results = out.get("results", {})
         flat: dict = {}
         for task, metrics in results.items():
-            acc = metrics.get("acc,none") or metrics.get("acc") or metrics.get("acc_norm,none")
+            # ARC-C canonical metric is acc_norm,none (normalized); prefer it first.
+            acc = metrics.get("acc_norm,none") or metrics.get("acc,none") or metrics.get("acc")
             if acc is not None:
                 flat[f"{task}_acc"] = float(acc)
         if collect is not None and "samples" in out:
@@ -652,9 +653,12 @@ def _generate_batched(model, tokenizer, prompts: list[str], *, max_new: int,
                     pad_token_id=tokenizer.eos_token_id,
                 )
 
+            input_len = encoded["input_ids"].shape[1]  # padded width, same for all in batch
             for j in range(len(batch_prompts)):
-                prompt_len = int(encoded["attention_mask"][j].sum())
-                generated_ids = out[j, prompt_len:]
+                # Slice from input_len (not attention_mask.sum()) because with left-padding
+                # the shorter prompts have prompt_len < padded_len, causing out[j, prompt_len:]
+                # to include trailing pad tokens from the input as "generated" tokens.
+                generated_ids = out[j, input_len:]
                 results[i + j] = tokenizer.decode(generated_ids, skip_special_tokens=True)
     finally:
         tokenizer.padding_side = original_padding_side
@@ -765,8 +769,27 @@ def _check_math(completion: str, reference: str) -> bool:
     import re
 
     def _extract_boxed(s: str) -> str | None:
-        matches = re.findall(r'\\boxed\{([^}]*)\}', s)
-        return matches[-1] if matches else None
+        # Balanced-brace extraction handles nested braces (e.g. \boxed{\frac{1}{2}}).
+        # The simple regex [^}]* stops at the first } and misses nested LaTeX.
+        results = []
+        idx = 0
+        while True:
+            m = re.search(r'\\boxed\{', s[idx:])
+            if not m:
+                break
+            start = idx + m.end()
+            depth = 1
+            i = start
+            while i < len(s) and depth > 0:
+                if s[i] == '{':
+                    depth += 1
+                elif s[i] == '}':
+                    depth -= 1
+                i += 1
+            if depth == 0:
+                results.append(s[start:i - 1])
+            idx = start
+        return results[-1] if results else None
 
     def _last_numeric(s: str) -> str | None:
         nums = re.findall(r"-?\d+\.?\d*", s)
@@ -910,19 +933,23 @@ def _generate_imatrix(texts: list[str], icfg: dict, artifacts_dir: Path) -> None
         return
 
     f16_path = artifacts_dir / "model_f16.gguf"
+    f16_tmp = artifacts_dir / "model_f16.gguf.tmp"
     env = {
         **os.environ,
         "LD_LIBRARY_PATH": str(llama_cpp_dir / "build" / "bin") + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
     }
     log.info("imatrix: converting %s → F16 GGUF", model_dir)
     try:
+        f16_tmp.unlink(missing_ok=True)
         subprocess.run(
             [sys.executable, str(convert_py), str(model_dir),
-             "--outtype", "f16", "--outfile", str(f16_path)],
+             "--outtype", "f16", "--outfile", str(f16_tmp)],
             check=True, timeout=3600,
         )
+        os.replace(f16_tmp, f16_path)
         log.info("imatrix: GGUF ready (%.1f GB)", f16_path.stat().st_size / 1e9)
     except Exception as exc:  # noqa: BLE001
+        f16_tmp.unlink(missing_ok=True)
         log.warning("imatrix: GGUF conversion failed (%s); skipping.", exc)
         return
 
