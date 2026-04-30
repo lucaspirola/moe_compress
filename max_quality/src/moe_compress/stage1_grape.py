@@ -110,7 +110,14 @@ def run(
         cap_per_layer=se_cfg["max_blacklisted_per_layer"],
     )
     total_experts = sum(per_experts_by_layer.values())
-    global_cap = int(se_cfg["global_blacklist_cap_pct"] * total_experts)
+    cap_pct = float(se_cfg["global_blacklist_cap_pct"])
+    if not (0.0 < cap_pct <= 1.0):
+        raise ValueError(
+            f"global_blacklist_cap_pct={cap_pct} must be a fraction in (0, 1], "
+            "e.g. 0.05 for 5%. Got a value outside this range — did you pass an "
+            "integer percentage (e.g. 5) instead of a decimal (0.05)?"
+        )
+    global_cap = int(cap_pct * total_experts)
     blacklist = _apply_global_cap(blacklist, max_acc.per_expert_max, global_cap)
 
     blacklist_out = {str(li): sorted(es) for li, es in blacklist.items() if es}
@@ -374,7 +381,13 @@ def _grape_greedy_merge(
     sorted_layers = sorted(per_layer_counts.keys())
     n_moe_layers = len(sorted_layers)
 
-    cluster_counts: dict[int, int] = dict(per_layer_counts)
+    # Entropy is computed over active (non-blacklisted) experts only.
+    # Blacklisted experts are not available for merging, so including them in
+    # cluster_counts would inflate E_init and cause premature layer freezing.
+    cluster_counts: dict[int, int] = {
+        li: per_layer_counts[li] - len(blacklist.get(li, []))
+        for li in per_layer_counts
+    }
 
     # R^l = sum of off-diagonal distances (Eq. 11, sum form)
     R: dict[int, float] = {}
@@ -420,13 +433,13 @@ def _grape_greedy_merge(
             log.info("GRAPE iter %d: all layers frozen → restart", iteration)
 
         best_layer = None
-        best_R = -1.0
+        best_R = float('inf')
         for li in sorted_layers:
             if li in frozen:
                 continue
             if cluster_counts[li] <= floors[li]:
                 continue
-            if R[li] > best_R:
+            if R[li] < best_R:
                 best_R = R[li]
                 best_layer = li
 
@@ -437,8 +450,15 @@ def _grape_greedy_merge(
 
         D_l = D_work[best_layer]
         n = D_l.shape[0]
-        np.fill_diagonal(D_l, 0.0)
-        flat_idx = int(np.argmax(D_l))
+        # For a distance matrix: find the most similar (smallest distance) off-diagonal pair.
+        # Diagonal is 0 (self-distance) and already-merged pairs are zeroed out — exclude both.
+        tmp = D_l.copy()
+        np.fill_diagonal(tmp, np.inf)
+        tmp[D_l == 0] = np.inf
+        if not np.isfinite(tmp).any():
+            frozen.add(best_layer)
+            continue
+        flat_idx = int(np.argmin(tmp))
         i_star, j_star = divmod(flat_idx, n)
 
         if D_l[i_star, j_star] <= 0:

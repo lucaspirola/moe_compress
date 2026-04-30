@@ -1268,12 +1268,17 @@ class _EighDecomp:
                       - Path 1 (Theorem 3.2): CQ · diag(1/√λ)
                       - Path 2 (auto-cov):    AQ · diag(1/√λ)
                       - Path 3 (Cor. 3.3):    L_B = Q · diag(√λ)
+        rhs_pinv:     Pseudo-inverse of rhs, shape [r_eff, d_in].
+                      Used in the back-solve: V_k = Vh[:k] @ rhs_pinv.
+                      - Path 3: exact inverse = diag(1/√λ) · Q^T (no extra SVD)
+                      - Paths 1/2: torch.linalg.pinv(rhs)
         r_eff:        Number of retained eigenvalues (= rhs.shape[1]).
     """
     eigvals_keep: torch.Tensor
     eigvecs_keep: torch.Tensor
     inv_sqrt: torch.Tensor
     rhs: torch.Tensor
+    rhs_pinv: torch.Tensor
     r_eff: int
 
 
@@ -1316,21 +1321,27 @@ def _precompute_eigh(
         C = C.to(device=device, dtype=torch.float32)
         CQ = C @ eigvecs_keep                                    # [d_in, r_eff]
         rhs = CQ * inv_sqrt.unsqueeze(0)                         # [d_in, r_eff]
+        # pinv(C·Q·Λ^{-1/2}) ≠ Λ^{-1/2}·Q^T — must compute pseudo-inverse explicitly.
+        rhs_pinv = torch.linalg.pinv(rhs)                        # [r_eff, d_in]
     elif A is not None:
         # Path 2: Auto-covariance — rhs = A @ Q · diag(1/√λ)
         A = A.to(device=device, dtype=torch.float32)
         A = 0.5 * (A + A.T)
         AQ = A @ eigvecs_keep                                    # [d_in, r_eff]
         rhs = AQ * inv_sqrt.unsqueeze(0)                         # [d_in, r_eff]
+        rhs_pinv = torch.linalg.pinv(rhs)                        # [r_eff, d_in]
     else:
         # Path 3: Corollary 3.3 — rhs = L_B = Q · diag(√λ)
         rhs = eigvecs_keep * eigvals_keep.sqrt().unsqueeze(0)    # [d_in, r_eff]
+        # Exact inverse: (Q·Λ^{1/2})^{-1} = Λ^{-1/2}·Q^T — no extra SVD.
+        rhs_pinv = inv_sqrt.unsqueeze(1) * eigvecs_keep.T        # [r_eff, d_in]
 
     return _EighDecomp(
         eigvals_keep=eigvals_keep,
         eigvecs_keep=eigvecs_keep,
         inv_sqrt=inv_sqrt,
         rhs=rhs,
+        rhs_pinv=rhs_pinv,
         r_eff=r_eff,
     )
 
@@ -1358,8 +1369,12 @@ def _aa_svd_precomputed(
         U, S, Vh = torch.linalg.svd(M, full_matrices=False)
         k_eff = max(1, min(k, decomp.r_eff))
         U_eff = U[:, :k_eff] * S[:k_eff]
-        # Back-solve: V = Vh[:k_eff] @ diag(1/√λ) @ Q^T
-        V_eff = (Vh[:k_eff, :] * decomp.inv_sqrt.unsqueeze(0)) @ decomp.eigvecs_keep.T  # [k_eff, d_in]
+        # Back-solve: V_k = Vh[:k_eff] @ rhs_pinv where rhs_pinv = pinv(rhs).
+        # Path 3: rhs_pinv = Λ^{-1/2}·Q^T (exact, precomputed analytically).
+        # Paths 1/2: rhs_pinv = pinv(C·Q·Λ^{-1/2}) (precomputed via torch.linalg.pinv).
+        # Using the path-specific rhs_pinv is critical for Paths 1/2 — the naive
+        # Λ^{-1/2}·Q^T back-solve ignores the C/A factor and produces wrong V_k.
+        V_eff = Vh[:k_eff, :] @ decomp.rhs_pinv                 # [k_eff, d_in]
         # Numerically stable rel_err: tail singular values of M.
         S2 = S * S
         denom = S2.sum().clamp_min(1e-30)
@@ -1652,6 +1667,10 @@ def _collect_covariances(
                 f.result()
             spill_executor.shutdown(wait=True)
             log.info("All cov layer spills durable on disk.")
+
+
+# Public alias for tests that import the B-only covariance collection path.
+_collect_pruned_input_covariance = _collect_covariances
 
 
 def _load_stage2_covariance(path: Path):

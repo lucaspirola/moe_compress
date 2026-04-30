@@ -61,7 +61,10 @@ def _finish_stage(stage_idx: int, t_start: float, repo_id: str | None) -> None:
 STAGE_REGISTRY = {
     1: ("stage1_budgets.json",                 "original"),
     2: ("stage2_pruned",                       "original"),
-    3: ("stage3_svd",                          "stage2_pruned"),
+    # Stage 2.5 (Router KD post-merge) is not in this registry because it is
+    # always run immediately after Stage 2 (not resumable as a standalone entry
+    # point via --resume-from-stage). Its output is "stage2p5_final".
+    3: ("stage3_svd",                          "stage2p5_final"),
     4: ("stage4_eora",                         "stage3_svd"),
     5: ("stage5_final",                        "stage4_eora"),
     6: ("stage6_eval.json",                    "stage5_final"),
@@ -154,6 +157,16 @@ def main(argv=None) -> int:
                              no_resume=args.no_resume)
         repo2 = upload_stage_to_hub(2, artifacts_dir, repo_base=hub_base) if hub_base else None
         _finish_stage(2, t2, repo2)
+
+        # Stage 2.5 — Router KD post-merge: recalibrate routers so Stage 3
+        # covariance collection sees already-adapted routing decisions.
+        # Always runs immediately after Stage 2 (no standalone resume entry point).
+        log.info("=== Stage 2.5 — Post-Merge Router KD ===")
+        t2p5 = time.monotonic()
+        stage5_router_kd.run(model, tokenizer, config, artifacts_dir, device=device,
+                             no_resume=args.no_resume, stage_key="stage2p5")
+        repo2p5 = upload_stage_to_hub("2p5", artifacts_dir, repo_base=hub_base) if hub_base else None
+        _finish_stage("2p5", t2p5, repo2p5)
     if stop < 3:
         log.info("Stopping after stage %d as requested.", stop)
         wait_for_pending_uploads()
@@ -293,6 +306,27 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
             attn_implementation=config["model"]["attn_implementation"],
             load_in_4bit=config["model"].get("load_in_4bit", False),
             trust_remote_code=config["model"].get("trust_remote_code", False),
+        )
+    # Stage 3's predecessor is stage2p5_final (post-merge Router KD output).
+    # If resuming directly from stage 3 without running stage 2.5 (e.g., the
+    # stage2p5_final dir does not exist), fall back to stage2_pruned so that
+    # the pipeline can still resume when stage2p5_final is on a Hub repo that
+    # was downloaded by the job entrypoint.
+    if stage == 3:
+        for candidate in ("stage2p5_final", "stage2_pruned"):
+            prev_path = artifacts_dir / candidate
+            if prev_path.exists():
+                log.info("Loading stage 3 input from %s", prev_path)
+                model, tokenizer, _ = load_compressed_model(
+                    prev_path,
+                    device_map=config["model"]["device_map"],
+                    torch_dtype=config["model"]["torch_dtype"],
+                    attn_implementation=config["model"]["attn_implementation"],
+                )
+                return model, tokenizer
+        raise FileNotFoundError(
+            "Cannot resume from stage 3: neither stage2p5_final/ nor stage2_pruned/ "
+            f"exists under {artifacts_dir}. Run stages 1–2.5 first."
         )
     prev_dir_name = STAGE_REGISTRY[stage][1]
     prev_path = artifacts_dir / prev_dir_name

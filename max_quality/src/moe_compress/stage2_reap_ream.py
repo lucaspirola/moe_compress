@@ -105,6 +105,12 @@ def run(
 
     if no_resume:
         partial_dir = None
+        # Delete stale partial dir so a future non-no-resume run cannot resume
+        # from this run's incomplete (or absent) checkpoints.
+        stale = artifacts_dir / "_stage2_partial"
+        if stale.exists():
+            import shutil as _shutil
+            _shutil.rmtree(stale, ignore_errors=True)
     else:
         partial_dir = artifacts_dir / "_stage2_partial"
         partial_dir.mkdir(parents=True, exist_ok=True)
@@ -222,6 +228,10 @@ def run(
         running_mean: float = 0.0
 
         for _bump_attempt in range(n_experts - target + 1):
+            # Centroids in descending saliency order: protected first (highest priority),
+            # then non-protected in descending REAP score order (spec §5 Step 3).
+            # This order is preserved into _assign_children_to_centroids so that
+            # higher-saliency centroids absorb children first.
             centroid_ids = sorted(protected)
             for _e in np.argsort(-scores):
                 if len(centroid_ids) >= effective_target:
@@ -232,7 +242,8 @@ def run(
                 if freq[e] < min_active_tokens:
                     continue
                 centroid_ids.append(e)
-            centroid_ids = sorted(centroid_ids)
+            # Do NOT re-sort by index — the descending-saliency order built above is
+            # the correct iteration order for the greedy assignment (spec §5 Step 3).
             if len(centroid_ids) < effective_target:
                 log.warning(
                     "  layer %d: centroid selection yielded %d < %d (effective_target) — "
