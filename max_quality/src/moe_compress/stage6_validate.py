@@ -247,7 +247,7 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             log.info("Stage 6: loading uncompressed baseline for delta computation")
             teacher, _ = load_model(
                 config["model"]["name_or_path"],
-                revision=config["model"]["revision"],
+                revision=config["model"].get("revision", "main"),
                 torch_dtype=config["model"]["torch_dtype"],
                 device_map=config["model"]["device_map"],
                 attn_implementation=config["model"]["attn_implementation"],
@@ -390,7 +390,7 @@ def _preload_teacher_to_cpu(config: dict, result: dict) -> None:
         t0 = time.monotonic()
         teacher, _ = load_model(
             config["model"]["name_or_path"],
-            revision=config["model"]["revision"],
+            revision=config["model"].get("revision", "main"),
             torch_dtype=config["model"]["torch_dtype"],
             device_map="cpu",
             attn_implementation=config["model"]["attn_implementation"],
@@ -534,7 +534,10 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
             collect.append(text)
         ids = tokenizer(text, add_special_tokens=False)["input_ids"]
         all_ids.extend(ids)
-        all_ids.append(eos)
+        # Avoid double-EOS at document boundaries when the tokenizer already
+        # appends EOS as part of the text encoding.
+        if not ids or ids[-1] != eos:
+            all_ids.append(eos)
 
     seq_len = cfg["sequence_length"]
     n_full = len(all_ids) // seq_len
@@ -834,7 +837,12 @@ def _check_math(completion: str, reference: str) -> bool:
 
     a = _last_numeric(comp_answer)
     b = _last_numeric(ref_answer)
-    return a is not None and b is not None and a == b
+    if a is None or b is None:
+        return False
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -843,6 +851,9 @@ def _check_math(completion: str, reference: str) -> bool:
 
 
 def _deltas(student: dict, teacher: dict) -> dict:
+    # delta = student - teacher: positive means student is worse for PPL
+    # (higher is worse), negative means student is worse for accuracy tasks
+    # (lower is worse). _check_thresholds interprets each metric's sign.
     out = {}
     for k in set(student) | set(teacher):
         s = student.get(k)
@@ -877,7 +888,7 @@ def _measured_reduction(
         try:
             teacher_tmp, _ = load_model(
                 config["model"]["name_or_path"],
-                revision=config["model"]["revision"],
+                revision=config["model"].get("revision", "main"),
                 torch_dtype=config["model"]["torch_dtype"],
                 device_map="cpu",
                 attn_implementation=config["model"]["attn_implementation"],
@@ -1017,8 +1028,9 @@ def _check_thresholds(results: dict, thresholds: dict) -> dict[str, bool]:
             drop = d["teacher"] - d["student"]
             checks[f"{task}_drop_ok"] = drop <= thresh
         else:
-            log.warning("Threshold check for %s skipped — metric missing from results "
+            log.warning("Threshold check for %s failed — metric missing from results "
                         "(lm-eval task name mismatch or evaluation error)", task)
+            checks[f"{task}_drop_ok"] = False
     mr = results["measured_reduction"]["total_reduction_ratio"]
     checks["measured_reduction_ok"] = mr >= thresholds["measured_reduction_min"]
     return checks
