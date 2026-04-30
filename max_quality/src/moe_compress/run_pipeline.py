@@ -49,11 +49,11 @@ from .utils.trackio_log import trackio_log as _trackio_log
 log = logging.getLogger(__name__)
 
 
-def _finish_stage(stage_idx: int, t_start: float, repo_id: str | None) -> None:
+def _finish_stage(stage_idx, t_start: float, repo_id: str | None) -> None:
     """Log stage completion + push timing scalar to Trackio."""
     dt = time.monotonic() - t_start
     h = int(dt // 3600); m = int((dt % 3600) // 60); s = int(dt % 60)
-    log.info("Stage %d done in %dh%02dm%02ds — durable on Hub: %s",
+    log.info("Stage %s done in %dh%02dm%02ds — durable on Hub: %s",
              stage_idx, h, m, s, repo_id or "<not uploaded>")
     _trackio_log({f"pipeline/stage_{stage_idx}_seconds": dt})
 

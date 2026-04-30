@@ -246,7 +246,7 @@ def run(
             if fv != 1:
                 raise RuntimeError(
                     f"Stage 5 checkpoint {latest} has format_version={fv} "
-                    "(expected 1) — delete _stage5_partial/ and re-run Stage 5"
+                    f"(expected 1) — delete _{stage_key}_partial/ and re-run"
                 )
             # Restore router parameters into the student model.
             for pname, t in payload["router_state"].items():
@@ -267,7 +267,7 @@ def run(
                     raise RuntimeError(
                         f"Stage 5 resume: gradient_accumulation mismatch — "
                         f"checkpoint has {saved_ga}, config has {grad_accum}. "
-                        "Delete _stage5_partial/ and re-run or align the config."
+                        f"Delete _{stage_key}_partial/ and re-run or align the config."
                     )
             log.info("Stage 5: resumed from step %d (epoch %d, batch %d)",
                      resume_step, resume_epoch, resume_batch_i)

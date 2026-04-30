@@ -592,7 +592,13 @@ def _lm_eval_tasks(model, tokenizer, tasks: list[str], *, collect=None,
         flat: dict = {}
         for task, metrics in results.items():
             # ARC-C canonical metric is acc_norm,none (normalized); prefer it first.
-            acc = metrics.get("acc_norm,none") or metrics.get("acc,none") or metrics.get("acc")
+            # Use key-existence check (not truthiness) so acc=0.0 is not skipped.
+            for _k in ("acc_norm,none", "acc,none", "acc"):
+                if _k in metrics:
+                    acc = metrics[_k]
+                    break
+            else:
+                acc = None
             if acc is not None:
                 flat[f"{task}_acc"] = float(acc)
         if collect is not None and "samples" in out:
@@ -788,7 +794,11 @@ def _check_math(completion: str, reference: str) -> bool:
                 i += 1
             if depth == 0:
                 results.append(s[start:i - 1])
-            idx = start
+                idx = start
+            else:
+                # Unclosed \boxed{ — truncated output; stop scanning to avoid
+                # misidentifying nested \boxed{} inside the open group as top-level.
+                break
         return results[-1] if results else None
 
     def _last_numeric(s: str) -> str | None:
