@@ -43,7 +43,7 @@ from .utils.hub_upload import (
     upload_stage_to_hub,
     wait_for_pending_uploads,
 )
-from .utils.model_io import load_json_artifact, load_model, load_compressed_model
+from .utils.model_io import load_json_artifact, load_model, load_compressed_model, save_json_artifact
 from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
@@ -122,9 +122,7 @@ def main(argv=None) -> int:
             min_experts_per_layer=config["stage1_grape"]["min_experts_per_layer"],
             blacklisted_experts=blacklist,
         )
-        (artifacts_dir / "budget_decomposition.json").write_text(
-            __import__("json").dumps(decomposition.as_dict(), indent=2)
-        )
+        save_json_artifact(decomposition.as_dict(), artifacts_dir / "budget_decomposition.json")
         _finish_stage(1, t1, None)
     else:
         decomp_path = artifacts_dir / "budget_decomposition.json"

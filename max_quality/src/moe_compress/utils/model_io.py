@@ -34,6 +34,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
@@ -1011,8 +1012,10 @@ def _resize_moe_stack_to_metadata(
 def save_json_artifact(obj, path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as f:
         json.dump(obj, f, indent=2, sort_keys=True, default=_json_default)
+    os.replace(tmp, path)
     return path
 
 
