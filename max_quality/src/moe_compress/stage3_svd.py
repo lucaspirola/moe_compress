@@ -1261,6 +1261,13 @@ def _redistribute_ranks_swift_svd_plus(
                 if 1 <= new_val <= cap:
                     per_e[idx] = new_val
                     diff -= step
+            if diff != 0:
+                log.warning(
+                    "Swift-SVD+ rank reconciliation: residual drift %+d in group "
+                    "(layer=%d, matrix=%s) — all experts at rank cap/floor, "
+                    "actual total rank differs from budget by %d.",
+                    diff, li, name, abs(diff),
+                )
 
         for e, k_e in enumerate(per_e):
             out[(li, name, e)] = k_e
@@ -1611,6 +1618,14 @@ def _collect_covariances(
             max_workers=1, thread_name_prefix="bcov-spill",
         )
 
+    # NOTE: This function runs one full calibration pass PER MoE layer
+    # (sequential, not simultaneous). This differs from the spec §6 Phase A
+    # which describes a single simultaneous pass over all 40 layers. The
+    # sequential design was chosen because holding all 40 layers' hook state
+    # simultaneously is memory-intensive; per-layer spill to disk bounds peak
+    # RAM to ~one layer's covariance at a time (~5 GB). Wall-clock cost is
+    # ~40× the simultaneous design, but GPU memory stays within H200 budget.
+    # This deviation is documented in §12 (allowed deviation D9).
     n = len(moe_layers)
     try:
         for k, ref in enumerate(moe_layers):
