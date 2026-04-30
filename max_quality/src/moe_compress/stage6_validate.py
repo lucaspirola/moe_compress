@@ -1017,6 +1017,10 @@ def _check_thresholds(results: dict, thresholds: dict) -> dict[str, bool]:
     if wt is not None:
         rel = (wt["student"] - wt["teacher"]) / max(wt["teacher"], 1e-9)
         checks["wikitext2_ppl_increase_ok"] = rel <= thresholds["wikitext2_ppl_relative_max_increase"]
+    else:
+        log.warning("Threshold check for wikitext2_ppl failed — metric missing from results "
+                    "(PPL eval disabled or errored)")
+        checks["wikitext2_ppl_increase_ok"] = False
     for task, key, thresh in [
         ("arc_challenge_acc", "arc_c_absolute_max_drop", thresholds["arc_c_absolute_max_drop"]),
         ("hellaswag_acc", "hellaswag_absolute_max_drop", thresholds["hellaswag_absolute_max_drop"]),

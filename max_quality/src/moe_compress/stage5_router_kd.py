@@ -277,6 +277,13 @@ def run(
     log.info("Stage 5: %d routers trainable; %d steps (grad-accum=%d)",
              sum(1 for _ in student.parameters() if _.requires_grad),
              total_steps, grad_accum)
+    trailing = len(batches) % grad_accum
+    if trailing != 0:
+        log.warning(
+            "Stage 5: %d trailing batches will not form a complete grad-accum "
+            "window (grad_accum=%d) — their gradients are dropped at epoch end.",
+            trailing, grad_accum,
+        )
 
     step = resume_step
     optim.zero_grad()

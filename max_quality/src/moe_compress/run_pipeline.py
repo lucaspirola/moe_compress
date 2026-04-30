@@ -139,6 +139,7 @@ def main(argv=None) -> int:
 
     if stop < 2:
         log.info("Stopping after stage %d as requested.", stop)
+        wait_for_pending_uploads()
         return 0
 
     # Make the optional save a no-op if the caller asked us to skip it.
@@ -316,7 +317,14 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
         for candidate in ("stage2p5_final", "stage2_pruned"):
             prev_path = artifacts_dir / candidate
             if prev_path.exists():
-                log.info("Loading stage 3 input from %s", prev_path)
+                if candidate == "stage2_pruned":
+                    log.warning(
+                        "Loading stage 3 input from %s — stage2p5_final not found; "
+                        "Stage 2.5 router recalibration will be absent from this run.",
+                        prev_path,
+                    )
+                else:
+                    log.info("Loading stage 3 input from %s", prev_path)
                 model, tokenizer, _ = load_compressed_model(
                     prev_path,
                     device_map=config["model"]["device_map"],
