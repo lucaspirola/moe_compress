@@ -232,7 +232,8 @@ def run(
             # then non-protected in descending REAP score order (spec §5 Step 3).
             # This order is preserved into _assign_children_to_centroids so that
             # higher-saliency centroids absorb children first.
-            centroid_ids = sorted(protected)
+            # Protected experts sorted by REAP score descending (not by expert index).
+            centroid_ids = sorted(protected, key=lambda e: -scores[e])
             for _e in np.argsort(-scores):
                 if len(centroid_ids) >= effective_target:
                     break
@@ -514,7 +515,6 @@ def _ream_cost_matrix(
 
 def _assign_children_to_centroids(
     cost: np.ndarray, n_children: int, n_centroids: int,
-    centroid_saliency_order: list[int] | None = None,
 ) -> list[int]:
     if n_children == 0 or n_centroids == 0:
         return []
@@ -522,7 +522,9 @@ def _assign_children_to_centroids(
     assignment = [-1] * n_children
     assigned = set()
 
-    centroid_order = centroid_saliency_order if centroid_saliency_order else list(range(n_centroids))
+    # Iterate centroids 0..n_centroids-1; caller builds centroid_ids in descending
+    # saliency order so column index 0 = highest-saliency centroid.
+    centroid_order = list(range(n_centroids))
 
     while len(assigned) < n_children:
         made_progress = False
