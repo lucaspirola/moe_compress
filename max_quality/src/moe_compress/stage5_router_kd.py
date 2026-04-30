@@ -50,6 +50,7 @@ def run(
     artifacts_dir: Path,
     *,
     device=None,
+    no_resume: bool = False,
 ) -> Path:
     s5 = config["stage5_router_kd"]
     cal = config["calibration"]
@@ -201,45 +202,49 @@ def run(
     # -----------------------------------------------------------------------
     # Crash-resume: find latest checkpoint and restore router + optim state.
     # -----------------------------------------------------------------------
-    partial_dir = artifacts_dir / "_stage5_partial"
-    partial_dir.mkdir(parents=True, exist_ok=True)
     resume_step = 0
     resume_epoch = 0
     resume_batch_i = -1
 
-    ckpts = sorted(
-        partial_dir.glob("step_*.pt"),
-        key=lambda p: int(p.stem.split("_")[1]),
-    )
-    if ckpts:
-        latest = ckpts[-1]
-        try:
-            payload = torch.load(latest, map_location="cpu")
-        except Exception as exc:
-            raise RuntimeError(
-                f"Stage 5 resume: failed to load checkpoint {latest}: {exc}"
-            ) from exc
-        fv = int(payload.get("format_version", 0))
-        if fv != 1:
-            raise RuntimeError(
-                f"Stage 5 checkpoint {latest} has format_version={fv} "
-                "(expected 1) — delete _stage5_partial/ and re-run Stage 5"
-            )
-        # Restore router parameters into the student model.
-        for pname, t in payload["router_state"].items():
-            parts = pname.split(".")
-            obj = student
-            for part in parts[:-1]:
-                obj = getattr(obj, part)
-            getattr(obj, parts[-1]).data.copy_(t)
-        optim.load_state_dict(payload["optim_state"])
-        if device is not None:
-            _move_optimizer_state_to_device(optim, device)
-        resume_step = int(payload["step"])
-        resume_epoch = int(payload["epoch"])
-        resume_batch_i = int(payload["batch_idx"])
-        log.info("Stage 5: resumed from step %d (epoch %d, batch %d)",
-                 resume_step, resume_epoch, resume_batch_i)
+    if no_resume:
+        partial_dir = None
+    else:
+        partial_dir = artifacts_dir / "_stage5_partial"
+        partial_dir.mkdir(parents=True, exist_ok=True)
+
+        ckpts = sorted(
+            partial_dir.glob("step_*.pt"),
+            key=lambda p: int(p.stem.split("_")[1]),
+        )
+        if ckpts:
+            latest = ckpts[-1]
+            try:
+                payload = torch.load(latest, map_location="cpu")
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Stage 5 resume: failed to load checkpoint {latest}: {exc}"
+                ) from exc
+            fv = int(payload.get("format_version", 0))
+            if fv != 1:
+                raise RuntimeError(
+                    f"Stage 5 checkpoint {latest} has format_version={fv} "
+                    "(expected 1) — delete _stage5_partial/ and re-run Stage 5"
+                )
+            # Restore router parameters into the student model.
+            for pname, t in payload["router_state"].items():
+                parts = pname.split(".")
+                obj = student
+                for part in parts[:-1]:
+                    obj = getattr(obj, part)
+                getattr(obj, parts[-1]).data.copy_(t)
+            optim.load_state_dict(payload["optim_state"])
+            if device is not None:
+                _move_optimizer_state_to_device(optim, device)
+            resume_step = int(payload["step"])
+            resume_epoch = int(payload["epoch"])
+            resume_batch_i = int(payload["batch_idx"])
+            log.info("Stage 5: resumed from step %d (epoch %d, batch %d)",
+                     resume_step, resume_epoch, resume_batch_i)
 
     student.train()
     total_steps = (len(batches) // grad_accum) * s5["epochs"]
@@ -319,7 +324,7 @@ def run(
                     _trackio_log(payload)
 
                 # Periodic checkpoint for crash-resume.
-                if ckpt_every > 0 and step % ckpt_every == 0:
+                if partial_dir is not None and ckpt_every > 0 and step % ckpt_every == 0:
                     _save_stage5_checkpoint(partial_dir, step, epoch, i, student, optim)
                     # Keep only the two most recent checkpoints to bound disk use.
                     old_step = step - 2 * ckpt_every

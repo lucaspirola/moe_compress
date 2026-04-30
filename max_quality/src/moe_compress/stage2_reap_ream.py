@@ -69,6 +69,7 @@ def run(
     *,
     device=None,
     stage1_budget_path: Path | None = None,
+    no_resume: bool = False,
 ) -> Path:
     s2 = config["stage2_reap_ream"]
     cal = config["calibration"]
@@ -99,80 +100,83 @@ def run(
     # Crash-resume: scan partial_dir for layers already completed in a prior
     # interrupted run. Re-apply merges in layer order (fast, no forward pass).
     # -----------------------------------------------------------------------
-    partial_dir = artifacts_dir / "_stage2_partial"
-    partial_dir.mkdir(parents=True, exist_ok=True)
-
-    # Crash safety: delete any .pt whose matching .json is absent.
-    # A .pt without .json means the process died between _snapshot_cov_layer
-    # and _write_merge_json. The covariance has been remapped but not recorded.
-    # Reprocessing the .pt would double-remap — silent numerical corruption.
-    for ref in moe_layers:
-        pt_path = partial_dir / f"layer_{ref.layer_idx}.pt"
-        json_path = partial_dir / f"merge_{ref.layer_idx}.json"
-        if pt_path.exists() and not json_path.exists():
-            log.warning(
-                "Stage 2 resume: orphaned %s (no matching JSON) — "
-                "deleting and reprocessing layer %d",
-                pt_path.name, ref.layer_idx,
-            )
-            pt_path.unlink()
-
     completed_layers: set[int] = set()
     _layer_mean_costs: list[float] = []  # running history for cost-threshold gate (Strategy C)
 
-    for ref in moe_layers:
-        merge_path = partial_dir / f"merge_{ref.layer_idx}.json"
-        cov_path = partial_dir / f"layer_{ref.layer_idx}.pt"
-        if not (merge_path.exists() and cov_path.exists()):
-            continue
-        data = json.loads(merge_path.read_text())
-        fv = int(data.get("format_version", 0))
-        if fv != 1:
-            raise RuntimeError(
-                f"_stage2_partial/merge_{ref.layer_idx}.json has format_version={fv} "
-                "(expected 1) — delete _stage2_partial/ and re-run Stage 2"
-            )
-        centroid_ids = [int(x) for x in data["centroid_ids"]]
-        grouped = {int(k): list(v) for k, v in data["grouped"].items()}
-        freq = {int(k): int(v) for k, v in data["freq"].items()}
-        merge_map_layer = {int(k): list(v) for k, v in data["merge_map_layer"].items()}
+    if no_resume:
+        partial_dir = None
+    else:
+        partial_dir = artifacts_dir / "_stage2_partial"
+        partial_dir.mkdir(parents=True, exist_ok=True)
 
-        n_pre_merge = len(freq)
-        if ref.num_routed_experts != n_pre_merge:
-            raise RuntimeError(
-                f"Stage 2 resume layer {ref.layer_idx}: expected {n_pre_merge} "
-                f"experts (pre-merge) but model has {ref.num_routed_experts}. "
-                "The model passed to stage2.run() must be the Stage 1 output, "
-                "not a partially-merged model."
-            )
+        # Crash safety: delete any .pt whose matching .json is absent.
+        # A .pt without .json means the process died between _snapshot_cov_layer
+        # and _write_merge_json. The covariance has been remapped but not recorded.
+        # Reprocessing the .pt would double-remap — silent numerical corruption.
+        for ref in moe_layers:
+            pt_path = partial_dir / f"layer_{ref.layer_idx}.pt"
+            json_path = partial_dir / f"merge_{ref.layer_idx}.json"
+            if pt_path.exists() and not json_path.exists():
+                log.warning(
+                    "Stage 2 resume: orphaned %s (no matching JSON) — "
+                    "deleting and reprocessing layer %d",
+                    pt_path.name, ref.layer_idx,
+                )
+                pt_path.unlink()
 
-        _merge_experts_inplace(ref, grouped, freq,
-                               freq_weighted=s2["ream"]["frequency_weighted_merge"])
-        banks = build_banks(ref)
-        for bank in banks.values():
-            bank.select(centroid_ids)
-        _resize_router_for_kept_experts(ref, centroid_ids)
+        for ref in moe_layers:
+            merge_path = partial_dir / f"merge_{ref.layer_idx}.json"
+            cov_path = partial_dir / f"layer_{ref.layer_idx}.pt"
+            if not (merge_path.exists() and cov_path.exists()):
+                continue
+            data = json.loads(merge_path.read_text())
+            fv = int(data.get("format_version", 0))
+            if fv != 1:
+                raise RuntimeError(
+                    f"_stage2_partial/merge_{ref.layer_idx}.json has format_version={fv} "
+                    "(expected 1) — delete _stage2_partial/ and re-run Stage 2"
+                )
+            centroid_ids = [int(x) for x in data["centroid_ids"]]
+            grouped = {int(k): list(v) for k, v in data["grouped"].items()}
+            freq = {int(k): int(v) for k, v in data["freq"].items()}
+            merge_map_layer = {int(k): list(v) for k, v in data["merge_map_layer"].items()}
 
-        try:
-            cov_acc.load_layer_from_disk(ref.layer_idx, partial_dir)
-        except Exception as _exc:
-            raise RuntimeError(
-                f"Stage 2 resume: failed to load covariance for layer {ref.layer_idx} "
-                f"from _stage2_partial/ ({_exc}). "
-                "The in-memory model has already been partially mutated — "
-                "restart with a fresh Stage 1 model and delete _stage2_partial/."
-            ) from _exc
-        merge_map[ref.layer_idx] = merge_map_layer
-        completed_layers.add(ref.layer_idx)
-        log.info("Stage 2: layer %d resumed from partial (skipping profile + merge)",
-                 ref.layer_idx)
-        val = data.get("mean_cost_per_pair")
-        if val is not None and val > 0.0:
-            _layer_mean_costs.append(float(val))
+            n_pre_merge = len(freq)
+            if ref.num_routed_experts != n_pre_merge:
+                raise RuntimeError(
+                    f"Stage 2 resume layer {ref.layer_idx}: expected {n_pre_merge} "
+                    f"experts (pre-merge) but model has {ref.num_routed_experts}. "
+                    "The model passed to stage2.run() must be the Stage 1 output, "
+                    "not a partially-merged model."
+                )
 
-    if completed_layers:
-        log.info("Stage 2: resumed %d / %d layers from %s",
-                 len(completed_layers), len(moe_layers), partial_dir)
+            _merge_experts_inplace(ref, grouped, freq,
+                                   freq_weighted=s2["ream"]["frequency_weighted_merge"])
+            banks = build_banks(ref)
+            for bank in banks.values():
+                bank.select(centroid_ids)
+            _resize_router_for_kept_experts(ref, centroid_ids)
+
+            try:
+                cov_acc.load_layer_from_disk(ref.layer_idx, partial_dir)
+            except Exception as _exc:
+                raise RuntimeError(
+                    f"Stage 2 resume: failed to load covariance for layer {ref.layer_idx} "
+                    f"from _stage2_partial/ ({_exc}). "
+                    "The in-memory model has already been partially mutated — "
+                    "restart with a fresh Stage 1 model and delete _stage2_partial/."
+                ) from _exc
+            merge_map[ref.layer_idx] = merge_map_layer
+            completed_layers.add(ref.layer_idx)
+            log.info("Stage 2: layer %d resumed from partial (skipping profile + merge)",
+                     ref.layer_idx)
+            val = data.get("mean_cost_per_pair")
+            if val is not None and val > 0.0:
+                _layer_mean_costs.append(float(val))
+
+        if completed_layers:
+            log.info("Stage 2: resumed %d / %d layers from %s",
+                     len(completed_layers), len(moe_layers), partial_dir)
 
     max_group_cap: int = s2.get("max_merge_group_size", 0) or 0
     cost_sigma: float = s2.get("ream_cost_sigma_threshold", float("inf"))
@@ -308,12 +312,13 @@ def run(
         }
         _remap_covariance_for_layer(cov_acc, layer_ref.layer_idx, centroid_ids)
 
-        _snapshot_cov_layer(cov_acc, layer_ref.layer_idx, partial_dir)
-        _write_merge_json(
-            partial_dir, layer_ref.layer_idx, centroid_ids, grouped, freq,
-            merge_map[layer_ref.layer_idx],
-            mean_cost_per_pair=float(delta.sum()) / max(int(delta.size), 1),
-        )
+        if partial_dir is not None:
+            _snapshot_cov_layer(cov_acc, layer_ref.layer_idx, partial_dir)
+            _write_merge_json(
+                partial_dir, layer_ref.layer_idx, centroid_ids, grouped, freq,
+                merge_map[layer_ref.layer_idx],
+                mean_cost_per_pair=float(delta.sum()) / max(int(delta.size), 1),
+            )
 
         sum_cost = float(delta.sum()) if delta.size else 0.0
         max_group = max((len(g) for g in grouped.values()), default=1)
@@ -343,7 +348,8 @@ def run(
         extra_metadata={"merge_map_file": "merge_map.json"},
     )
     save_json_artifact(merge_map, out_dir / "merge_map.json")
-    shutil.rmtree(partial_dir, ignore_errors=True)
+    if partial_dir is not None:
+        shutil.rmtree(partial_dir, ignore_errors=True)
     log.info("Stage 2 complete — pruned checkpoint at %s", out_dir)
     return out_dir
 

@@ -97,6 +97,7 @@ def run(
     decomposition: BudgetDecomposition,
     *,
     device=None,
+    no_resume: bool = False,
 ) -> Path:
     s3 = config["stage3_svd"]
     cal = config["calibration"]
@@ -156,6 +157,13 @@ def run(
     else:
         log.info("Stage 3: B-cov only (cross-covariance disabled), batch_size=%d",
                  bcov_batch_size)
+
+    if no_resume:
+        import shutil as _shutil
+        for _d in ["_stage3_bcov_partial", "_stage3_ccov_partial"]:
+            _p = artifacts_dir / _d
+            if _p.exists():
+                _shutil.rmtree(_p, ignore_errors=True)
 
     bcov_spill_dir = artifacts_dir / "_stage3_bcov_partial"
     bcov_spill_dir.mkdir(parents=True, exist_ok=True)

@@ -146,9 +146,12 @@ def main(argv=None) -> int:
     hub_base = hub_repo_base_from_env()
 
     if start <= 2 <= stop:
+        if start >= 2:
+            _validate_stage1_artifacts(artifacts_dir)
         log.info("=== Stage 2 — REAP + REAM ===")
         t2 = time.monotonic()
-        stage2_reap_ream.run(model, tokenizer, config, artifacts_dir, device=device)
+        stage2_reap_ream.run(model, tokenizer, config, artifacts_dir, device=device,
+                             no_resume=args.no_resume)
         repo2 = upload_stage_to_hub(2, artifacts_dir, repo_base=hub_base) if hub_base else None
         _finish_stage(2, t2, repo2)
     if stop < 3:
@@ -159,7 +162,8 @@ def main(argv=None) -> int:
     if start <= 3 <= stop:
         log.info("=== Stage 3 — SVD ===")
         t3 = time.monotonic()
-        stage3_svd.run(model, tokenizer, config, artifacts_dir, decomposition, device=device)
+        stage3_svd.run(model, tokenizer, config, artifacts_dir, decomposition, device=device,
+                       no_resume=args.no_resume)
         repo3 = upload_stage_to_hub(3, artifacts_dir, repo_base=hub_base) if hub_base else None
         _finish_stage(3, t3, repo3)
     if stop < 4:
@@ -170,7 +174,7 @@ def main(argv=None) -> int:
     if start <= 4 <= stop:
         log.info("=== Stage 4 — EoRA ===")
         t4 = time.monotonic()
-        stage4_eora.run(model, tokenizer, config, artifacts_dir)
+        stage4_eora.run(model, tokenizer, config, artifacts_dir, no_resume=args.no_resume)
         repo4 = upload_stage_to_hub(4, artifacts_dir, repo_base=hub_base) if hub_base else None
         _finish_stage(4, t4, repo4)
     if stop < 5:
@@ -181,7 +185,8 @@ def main(argv=None) -> int:
     if start <= 5 <= stop:
         log.info("=== Stage 5 — Router KD ===")
         t5 = time.monotonic()
-        stage5_router_kd.run(model, tokenizer, config, artifacts_dir, device=device)
+        stage5_router_kd.run(model, tokenizer, config, artifacts_dir, device=device,
+                             no_resume=args.no_resume)
         repo5 = upload_stage_to_hub(5, artifacts_dir, repo_base=hub_base) if hub_base else None
         _finish_stage(5, t5, repo5)
     if stop < 6:
@@ -218,6 +223,10 @@ def _parse(argv) -> argparse.Namespace:
         help="Skip save_checkpoint calls between stages. For in-memory smoke "
              "testing on tiny models that don't round-trip through HF save.",
     )
+    p.add_argument(
+        "--no-resume", action="store_true",
+        help="Disable crash-resume I/O for stages 2–5. Each stage runs from scratch.",
+    )
     return p.parse_args(argv)
 
 
@@ -233,6 +242,28 @@ def _skip_save_checkpoint(model, tokenizer, out_dir):
     out.mkdir(parents=True, exist_ok=True)
     log.info("[--skip-save] suppressing save_pretrained → %s", out)
     return out
+
+
+def _validate_stage1_artifacts(artifacts_dir: Path) -> None:
+    """Raise with a clear error if Stage 1 output artifacts are missing or corrupt."""
+    required = [
+        artifacts_dir / "stage1_blacklist.json",
+        artifacts_dir / "stage1_budgets.json",
+        artifacts_dir / "budget_decomposition.json",
+    ]
+    for p in required:
+        if not p.exists():
+            raise FileNotFoundError(
+                f"Stage 1 artifact missing: {p}\n"
+                "Run with --resume-from-stage 1 (or from scratch) to regenerate."
+            )
+        try:
+            load_json_artifact(p)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Stage 1 artifact corrupted: {p}: {exc}\n"
+                "Delete the file and re-run Stage 1."
+            ) from exc
 
 
 def _validate_config(config: dict) -> None:

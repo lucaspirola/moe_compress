@@ -41,6 +41,8 @@ def run(
     tokenizer,
     config: dict,
     artifacts_dir: Path,
+    *,
+    no_resume: bool = False,
 ) -> Path:
     s4 = config["stage4_eora"]
     # A-cov was persisted by Stage 2 in this storage dtype; the eigh threshold
@@ -77,8 +79,11 @@ def run(
     layers = list(iter_moe_layers(model))
     log.info("Stage 4: EoRA residual compensation over %d MoE layers", len(layers))
 
-    partial_dir = artifacts_dir / "_stage4_partial"
-    partial_dir.mkdir(parents=True, exist_ok=True)
+    if no_resume:
+        partial_dir = None
+    else:
+        partial_dir = artifacts_dir / "_stage4_partial"
+        partial_dir.mkdir(parents=True, exist_ok=True)
 
     # Snapshot Stage 3 ranks before any widening occurs.
     # Used by the double-widen guard below to detect in-process re-runs.
@@ -97,8 +102,8 @@ def run(
         N = fe.num_experts
 
         # Crash-resume: load saved layer state if present.
-        spill_path = partial_dir / f"layer_{ref.layer_idx}.pt"
-        if spill_path.exists():
+        spill_path = partial_dir / f"layer_{ref.layer_idx}.pt" if partial_dir is not None else None
+        if spill_path is not None and spill_path.exists():
             try:
                 payload = torch.load(spill_path, map_location="cpu")
             except Exception as exc:
@@ -215,7 +220,8 @@ def run(
         compensated_params += layer_compensated_params
 
         # Atomically persist this layer's FactoredExperts state for crash-resume.
-        _spill_layer(partial_dir, ref.layer_idx, fe, rank_map_layer, layer_compensated_params)
+        if partial_dir is not None:
+            _spill_layer(partial_dir, ref.layer_idx, fe, rank_map_layer, layer_compensated_params)
 
     out_dir = artifacts_dir / "stage4_eora"
     save_compressed_checkpoint(
@@ -229,7 +235,8 @@ def run(
         "config": s4,
     }, out_dir / "eora_ranks.json")
 
-    shutil.rmtree(partial_dir, ignore_errors=True)
+    if partial_dir is not None:
+        shutil.rmtree(partial_dir, ignore_errors=True)
 
     # Stage 4 is the last consumer of both `_stage3_original_weights.pt` and
     # `_stage2_input_covariance.pt`. Both are already durable on the per-stage
