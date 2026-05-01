@@ -350,7 +350,7 @@ SVD factorization reduces parameters from `d_out × d_in` to `k × (d_out + d_in
 
 **B-covariance** `B = X_post^T X_post`: Auto-covariance of the pruned model's per-expert inputs. Reflects the input distribution the compressed model will see at inference.
 
-**A-covariance reuse:** The pre-prune input auto-covariance `A = X_pre^T X_pre` referenced by Phase C Path 2 and Phase D's refinement objective is **not collected here** — it is reused from Stage 2's calibration pass (`_stage2_input_covariance.pt`, see §5 "Covariance Side-Collection") to avoid a redundant teacher forward.
+**A-covariance reuse:** The pre-prune input auto-covariance `A = X_pre^T X_pre` referenced by Phase C Path 2 and by Phase B.2's activation-weighted `ε*` (per D8) is **not collected here** — it is reused from Stage 2's calibration pass (`_stage2_input_covariance.pt`, see §5 "Covariance Side-Collection") to avoid a redundant teacher forward.
 
 **Cross-covariance** `C = X_pre^T X_post`: For each (layer, student_expert), the teacher's hidden state at the same token positions that the student routes to that expert is captured. `C` is accumulated as `X_pre^T @ X_post` per batch. This gives the exact cross-covariance required by AA-SVD Theorem 3.2 (paper 2604.02119): "what would the original model have produced for the inputs that the compressed model actually receives."
 
@@ -470,7 +470,7 @@ For each (layer, expert, matrix):
 
 6. **Correction factors:**
    - `U_corr = U'[:, :take_eff] · Σ'[:take_eff]` — shape `[d_out × take_eff]`
-   - `V_corr = V'^T[:take_eff] · (√Λ)⁻¹ · Q^T` — shape `[take_eff × d_in]` (back-projected to original weight space)
+   - `V_corr = V'^T[:take_eff] · (√Λ_keep)⁻¹ · Q_keep^T` — shape `[take_eff × d_in]` (back-projected to original weight space)
 
 7. **Widen:** `new_U = [U_old | U_corr]`, `new_V = [V_old; V_corr]` — algebraically equivalent to `Ŵ·x + B'·A·x`
 
@@ -711,7 +711,7 @@ All partial checkpoint files are written via `.tmp` → `os.replace` (atomic on 
 
 **Stage 3 covariance reuse:** On re-entry, if all per-layer B-cov spill files exist in `_stage3_bcov_partial/`, Phase A (covariance collection) is skipped entirely — including the teacher model load (~70 GB, ~60s). The α search result is cached in `_stage3_alpha_result.json` and reused on re-entry (~33 min saved).
 
-**Stage 3 originals snapshot:** `_stage3_original_weights.pt` is saved immediately after `_snapshot_originals()` returns, BEFORE the α search and Phase D factoring. Stage 4 can access originals even if Stage 3 crashes during factoring.
+**Stage 3 originals snapshot:** `_stage3_original_weights.pt` is saved immediately after `_snapshot_originals()` returns, BEFORE the α search and Phase C factoring. Stage 4 can access originals even if Stage 3 crashes during factoring.
 
 **Stage 4 double-widen guard:** When `_stage3_original_weights.pt` is absent but `stage4_eora/eora_ranks.json` exists, Stage 4 detects a double-widen attempt and raises `AssertionError`. This protects against in-process re-runs (notebooks, test harnesses) where `widen_rank()` would silently double-apply EoRA correction.
 
