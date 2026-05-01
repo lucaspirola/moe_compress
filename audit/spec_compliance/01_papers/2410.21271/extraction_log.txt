@@ -1,0 +1,20 @@
+2410.21271 sha256=9a88acbd2272de4bc3ce724b2505d1346a385149f8e09e71c5e82e73c7347023 bytes=4154067
+
+2026-05-01 phase2 extraction
+- pdftext source.pdf -> source.md (1706 lines, non-empty); chosen as primary
+- marker_single not run (pdftext output adequate; equations parseable as ASCII text)
+- Equations recovered: Eq.1 (layer-wise compression loss), Eq.2 (SVD error approx loss),
+  Eq.3 (EoRA loss in eigenspace), Eq.4 (forward pass), Eq.5 (compensation reformulation),
+  Eq.6 (Frobenius via Gram-trace), Eq.7-9 (theorem proof)
+- Algorithm 1 (EoRA) recovered, 7 numbered steps
+- Theorem 1 recovered with proof sketch
+- Tables 1-13 partially in text; tables 1,2,4,5,6,7,8,9,10 captured for hyperparam/results
+- Spec uses "V_corr" notation. Paper notation: U', V' singular vectors, Σ' singular values;
+  final factors A = U' Σ' and the residual correction B = V'^T Q'^{-1} (Q'^{-1} = sqrt(Λ)^{-1} U^T)
+  Captured verbatim as it appears in source.md (with primes denoted by apostrophes; pdftext
+  occasionally drops the prime markers on bare letters).
+- Calibration: 128 seq @ len 2048 for WikiText2; 32+32 (task + C4) for ARC/MathQA/GSM8K
+- Ranks ablated: {64,128,256,512}; default rank 128
+- Hardware: single H100; comparators: ZeroQuant-V2, Act-S (ASVD-derived), ApiQ
+- Models: LLaMA2-7B/13B, LLaMA3-8B; compression: SparseGPT 2:4, GPTQ W3/W4, Wanda 2:4
+- LoRA fine-tuning init: 3 epochs, batch=64, lr=1e-5, cosine LR; rank 128 every linear layer

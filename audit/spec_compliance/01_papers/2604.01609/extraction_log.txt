@@ -1,0 +1,2 @@
+2604.01609 sha256=a55edba987e74e45d5de3e1f8b8dfdb9c782500f5bb4af572b9a15c33bf59a4b bytes=1275831
+[2026-05-01T09:02:24+02:00] phase2 extraction: pdftext OK -> source.md (2238 lines); claims.jsonl 58 entries; covers Eq.1-12, Thm 3.1, Alg.1, Alg.2, hyperparams (alpha grid 11 vals, delta=0.5, N=256, seqlen=2048), Tables 1/2/3/4/5/6, ablation variants, §3.2.2 alpha-search verbatim, redistribution rule, beta normalization, per-projection scope. No marker fallback needed (equations parseable).

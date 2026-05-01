@@ -1,0 +1,7 @@
+2509.25622 sha256=267c4099a613de03ec107dd5675e7b4102e7b06613227caa2683b45cd1edc10e bytes=650441
+extracted_with=pdftext (~/ai/venv/bin/pdftext --sort) at 2026-05-01
+source.md_lines=1711 source.md_bytes=65832
+equations_parseable=yes (manual normalization in claims.jsonl verbatim fields; raw markdown has split lines around super/subscripts but Eqs 1,2,3-7,8-12,13-19 all recoverable)
+marker_single_fallback=not_needed
+claims_emitted=61 (kinds: equation x16, claim x24, table_value x9, hyperparameter x6; covers full §3 methodology, §4 experiments, §A.3 derivation)
+critical_claims=eq2_spectral_entropy, eq7_rank_allocation (and its restatement as eq19), omega_def, hp_calibration, hp_grouping_rule, gqa_n1_rule, beta_recommendation, whitening_S_definition
