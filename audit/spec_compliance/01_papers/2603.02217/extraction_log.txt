@@ -1,0 +1,5 @@
+2603.02217 sha256=9e78a1201bfb79b186c2757739f005fb5329a4d5cc25eabd69c8828f1df81e24 bytes=1270666
+---
+Fri May  1 08:58:37 CEST 2026
+pdftext --sort run; lines=3866
+claims.jsonl lines=82; source.md lines=3866; pdftext OK; no marker fallback needed (equations parseable)

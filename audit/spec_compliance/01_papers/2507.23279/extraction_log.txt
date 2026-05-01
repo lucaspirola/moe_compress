@@ -1,0 +1,24 @@
+2507.23279 sha256=7cd6a3851d063c5b25597db3284d0a7dd93e2521a683c4cf03ae592b73b79503 bytes=11000634
+
+[Phase 2 extraction]
+Tool used: ~/ai/venv/bin/pdftext --sort
+Command: pdftext source.pdf --out_path source.md --sort
+Output: source.md (3734 lines, 93572 bytes)
+
+marker_single NOT run. Rationale: pdftext output had cleanly recoverable structure
+- Eqs 1-11 all present in text (lines 184-202, 257-282, 393-401, 1696-1726, 1759, 1797-1807, plus Eq.7 broken across lines 808-840 but reconstructible)
+- Algorithm 1 fully captured at lines 1962-2003
+- All numbered Tables 1-10 located via grep (Tables 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+- Figure 12 power-law fit values (alpha, x_min) cleanly extractable
+
+Equation rendering quirks (none load-bearing):
+- Multi-line stacked subscripts (e.g. "Hl '" notation) split across 3-4 lines but identifiable
+- Eq. 7 (Dsink) summation indices split across multiple lines; reconstructed in claim 2507.23279#eq7_dsink
+No equations were lost or unrecoverable — marker_single fallback unnecessary.
+
+Claims emitted: 71 (target 30-80, cap 100)
+- Equations: 11 (Eqs. 1-11)
+- Algorithm steps: 4 (Alg. 1 input/output + Stage 1 + Stage 2 collection + Stage 2 threshold)
+- Table values: 13 (Tables 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 + Fig 12 fits)
+- Hyperparameters: 2 (calibration size, Qwen3 dims)
+- Claims: 41 (mechanism, distribution invariance, baselines, etc.)

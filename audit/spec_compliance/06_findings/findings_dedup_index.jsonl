@@ -1,0 +1,38 @@
+{"kept_id": "F-paper-2507.23279-0012", "dup_ids": ["F-paper-2507.23279-0029", "F-paper-2507.23279-0050", "F-paper-2507.23279-0001", "F-paper-2507.23279-0002", "F-paper-2507.23279-0003", "F-paper-2507.23279-0004", "F-paper-2507.23279-0005", "F-paper-2507.23279-0007", "F-paper-2507.23279-0008", "F-paper-2507.23279-0009", "F-paper-2507.23279-0010", "F-paper-2507.23279-0011", "F-paper-2507.23279-0013", "F-paper-2507.23279-0014", "F-paper-2507.23279-0017", "F-paper-2507.23279-0018", "F-paper-2507.23279-0019", "F-paper-2507.23279-0020", "F-paper-2507.23279-0021", "F-paper-2507.23279-0022", "F-paper-2507.23279-0023", "F-paper-2507.23279-0024", "F-paper-2507.23279-0025", "F-paper-2507.23279-0026", "F-paper-2507.23279-0028", "F-paper-2507.23279-0030", "F-paper-2507.23279-0031", "F-paper-2507.23279-0032", "F-paper-2507.23279-0033", "F-paper-2507.23279-0034", "F-paper-2507.23279-0036", "F-paper-2507.23279-0040", "F-paper-2507.23279-0041", "F-paper-2507.23279-0042", "F-paper-2507.23279-0043", "F-paper-2507.23279-0044", "F-paper-2507.23279-0045", "F-paper-2507.23279-0046", "F-paper-2507.23279-0048", "F-paper-2507.23279-0049", "F-paper-2507.23279-0051", "F-paper-2507.23279-0053", "F-paper-2507.23279-0054", "F-paper-2507.23279-0055", "F-paper-2507.23279-0056", "F-paper-2507.23279-0057", "F-paper-2507.23279-0058", "F-paper-2507.23279-0059", "F-paper-2507.23279-0060", "F-paper-2507.23279-0061", "F-paper-2507.23279-0062"], "spec_line": null, "category": "silent_omission", "regime": "paper"}
+{"kept_id": "F-paper-2507.23279-0006", "dup_ids": [], "spec_line": 142, "category": "uncovered_deviation", "regime": "paper"}
+{"kept_id": "F-paper-2507.23279-0015", "dup_ids": ["F-paper-2507.23279-0052"], "spec_line": 142, "category": "paraphrase_drift", "regime": "paper"}
+{"kept_id": "F-paper-2507.23279-0016", "dup_ids": ["F-paper-2507.23279-0027", "F-paper-2507.23279-0035"], "spec_line": null, "category": "uncovered_deviation", "regime": "paper"}
+{"kept_id": "F-paper-2507.23279-0037", "dup_ids": ["F-paper-2507.23279-0039", "F-paper-2507.23279-0047"], "spec_line": 730, "category": "uncovered_deviation", "regime": "paper"}
+{"kept_id": "F-paper-2507.23279-0038", "dup_ids": [], "spec_line": 135, "category": "paraphrase_drift", "regime": "paper"}
+{"kept_id": "F-resume-0001", "dup_ids": [], "spec_line": 284, "category": "silent_omission", "regime": "resume"}
+{"kept_id": "F-resume-0002", "dup_ids": [], "spec_line": 695, "category": "durability_gap", "regime": "resume"}
+{"kept_id": "F-h200-0001", "dup_ids": [], "spec_line": 62, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0002", "dup_ids": [], "spec_line": 138, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0003", "dup_ids": ["F-h200-0004"], "spec_line": 224, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0005", "dup_ids": [], "spec_line": 274, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0006", "dup_ids": [], "spec_line": 426, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0007", "dup_ids": [], "spec_line": 533, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0008", "dup_ids": [], "spec_line": 568, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0009", "dup_ids": [], "spec_line": 586, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0010", "dup_ids": [], "spec_line": 587, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0011", "dup_ids": [], "spec_line": 588, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0012", "dup_ids": [], "spec_line": 595, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0013", "dup_ids": [], "spec_line": 602, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0014", "dup_ids": [], "spec_line": 619, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0015", "dup_ids": [], "spec_line": 620, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0016", "dup_ids": [], "spec_line": 621, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0017", "dup_ids": [], "spec_line": 651, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0018", "dup_ids": [], "spec_line": 656, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0019", "dup_ids": [], "spec_line": 712, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-h200-0020", "dup_ids": [], "spec_line": 539, "category": "missing_citation", "regime": "h200"}
+{"kept_id": "F-cross-h200-0001", "dup_ids": [], "spec_line": 274, "category": "unsupported_justification", "regime": "cross"}
+{"kept_id": "F-ch12-0001", "dup_ids": [], "spec_line": 736, "category": "misdescribed_ch12", "regime": "chapter12"}
+{"kept_id": "F-ch12-missing-0001", "dup_ids": [], "spec_line": 332, "category": "silent_omission", "regime": "chapter12"}
+{"kept_id": "F-ch12-missing-0002", "dup_ids": ["F-ch12-missing-0003"], "spec_line": 384, "category": "silent_omission", "regime": "chapter12"}
+{"kept_id": "F-ch12-missing-0004", "dup_ids": [], "spec_line": 366, "category": "silent_omission", "regime": "chapter12"}
+{"kept_id": "F-ch12-missing-0005", "dup_ids": [], "spec_line": 463, "category": "silent_omission", "regime": "chapter12"}
+{"kept_id": "F-ch12-missing-0006", "dup_ids": [], "spec_line": 479, "category": "silent_omission", "regime": "chapter12"}
+{"kept_id": "F-ch12-missing-0007", "dup_ids": ["F-ch12-missing-0010"], "spec_line": 274, "category": "silent_omission", "regime": "chapter12"}
+{"kept_id": "F-ch12-missing-0008", "dup_ids": [], "spec_line": 295, "category": "silent_omission", "regime": "chapter12"}
+{"kept_id": "F-ch12-missing-0009", "dup_ids": [], "spec_line": 739, "category": "misdescribed_ch12", "regime": "chapter12"}
+{"kept_id": "F-ch12-missing-0011", "dup_ids": [], "spec_line": 89, "category": "silent_omission", "regime": "chapter12"}

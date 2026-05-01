@@ -1,0 +1,23 @@
+{
+  "phases": {
+    "1_paper_acquisition":   {"status": "done", "papers_done": ["2507.23279","2604.06542","2510.13999","2604.04356","2509.25622","2604.02119","2604.01609","2503.12340","2410.21271","2603.02217"]},
+    "2_paper_extraction":    {"status": "done", "papers_done": ["2507.23279","2604.06542","2510.13999","2604.04356","2509.25622","2604.02119","2604.01609","2503.12340","2410.21271","2603.02217"]},
+    "3_truth_refs":          {"status": "done", "h200_done": true, "resume_done": true},
+    "4_spec_indexing":       {"status": "done", "subindexes_done": ["citations","formulas","h200_claims","resume_claims"]},
+    "5_paper_crossref":      {"status": "done", "papers_done": ["2507.23279","2604.06542","2510.13999","2604.04356","2509.25622","2604.02119","2604.01609","2503.12340","2410.21271","2603.02217"]},
+    "6_h200_crossref":       {"status": "done"},
+    "7_resume_crossref":     {"status": "done"},
+    "8_chapter12_audit":     {"status": "done"},
+    "9_findings_merge":      {"status": "done"}
+  },
+  "spec_path": "max_quality/ALGORITHM_REFERENCE.md",
+  "spec_sha256": "cf3ce8be9b92caf9f967f84a34827dc693168437d0346b6affa5067f3d64ed36",
+  "ch12_sha256": "960dde98f5050fcaf3fdee1d43ddc147bae5bdcb335979e06c4f133ee584ac32",
+  "ch12_line_range": [726, 745],
+  "papers": [
+    "2507.23279", "2604.06542", "2510.13999", "2604.04356",
+    "2509.25622", "2604.02119", "2604.01609", "2503.12340",
+    "2410.21271", "2603.02217"
+  ],
+  "started_at": "2026-05-01T00:00:00Z"
+}

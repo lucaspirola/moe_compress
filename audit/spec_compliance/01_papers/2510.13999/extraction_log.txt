@@ -1,0 +1,7 @@
+2510.13999 sha256=dbd18141f157d31b1874e592d0cf7f32ae0d9fe0bf536c8cf9f4dddc240ea8a5 bytes=960321
+phase2 extraction:
+  tool: ~/ai/venv/bin/pdftext source.pdf --out_path source.md --sort
+  result: success; source.md = 2813 lines, 123518 bytes
+  equations: legible (Eq. 1-16 captured, REAP saliency Eq. 9 verbatim)
+  fallback: marker_single NOT invoked; pdftext output sufficient
+  claims: 50 emitted, covers Eq. 1-16, baseline definitions (D), hyperparameter table (Table 1), main result tables (Tables 2,3), calibration setup, evaluation config.
