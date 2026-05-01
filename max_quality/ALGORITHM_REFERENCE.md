@@ -370,8 +370,6 @@ k_g = √(R_eff(g) / ω) × T_budget / Σ_{g'} √(R_eff(g') / ω)   (Eq. 7 — 
 
 where `ω = n_experts × (d_out + d_in)` is the per-rank parameter cost and `T_budget` is the global rank budget derived from `svd_rank_ratio`.
 
-**Per-projection bias** (budget-neutral): `gate_proj=1.33`, `up_proj=0.67`, `down_proj=1.0`. Derived from SwiGLU error sensitivity: gate errors are amplified by SiLU; up errors are bounded; down errors propagate to all downstream layers.
-
 #### Phase B.2: Swift-SVD+ Per-Expert Rank Redistribution (Paper 2604.01609, Algorithm 2)
 
 Within each (layer, matrix_type) group, D-Rank gives a uniform rank `k_g` to every expert. Swift-SVD+ refines this by redistributing the group's total rank budget `k_g × N_experts` across individual experts using a blending score:
@@ -389,9 +387,7 @@ where:
 
 The factoring reuses cached spectral components from Phase A's B-covariance collection; each candidate requires ~2 minutes for a full 40-layer factor pass and ~20 seconds for PPL evaluation on H200. No model copies are made — originals are snapshotted to CPU RAM (~50 GB; H200 has 256 GB host RAM) and restored after each evaluation. Total α search: ~33 minutes for 11 candidates.
 
-When `per_group_type: true`, per-projection-type α is further refined from the global optimum using a spectral energy proxy (no forward passes, seconds). This per-type refinement is an extension beyond the paper, which uses a single α for all projections.
-
-When `validation_samples: 0`, the search falls back to the spectral energy proxy for all α selection (no forward passes, seconds). This is faster but does not capture end-to-end interaction effects.
+**Paper-compliance contract.** The α search MUST complete the paper-exact end-to-end PPL validation (Swift-SVD+ §3.2.2). If host RAM headroom at α-search entry is insufficient (<15 GB available), Stage 3 raises `RuntimeError` immediately rather than degrade to a spectral proxy — silently producing a non-paper-compliant model is worse than failing fast. Operators must provision adequate host RAM (~50 GB for the Qwen3-30B snapshot plus working set) or reduce `validation_samples` to fit. The previously-shipped silent spectral fallback was deviation D9 and was removed from Ch. 12 specifically because the pipeline now refuses to run that path. *(Implementation follow-up: replace the current OOM auto-fallback at `stage3_svd.py:285-301` with a hard `RuntimeError` to bring the code in line with this contract.)*
 
 Per-expert ranks are stored in the `FactoredExperts` slot at the max rank across experts in the group (zero-padded for experts with lower rank). `effective_ranks` tracks the true per-expert rank for honest parameter counting.
 
@@ -433,16 +429,6 @@ This eliminates N_experts × N_layers redundant `eigh(2048×2048)` calls (~7,200
 - `k_eff = min(k, r_eff)` — never allocates rank beyond B's effective rank
 - Zero-padding when `k_eff < k` so FactoredExperts tensors stay shape-stable
 - If `_precompute_eigh` raises (e.g. all-zero B), the per-matrix loop falls back to full `_aa_svd` which itself falls back to plain SVD
-
-#### Phase D: L-BFGS Block Refinement (currently enabled)
-
-Per-matrix activation-weighted reconstruction refinement:
-
-```
-min_{U,V} ‖(W − U·V) · A^{1/2}‖²_F
-```
-
-using L-BFGS with strong Wolfe line search (`lbfgs_steps=100`, `lbfgs_history=10`). The objective is weighted by `A^{1/2}` (pre-prune input auto-covariance, reused from Stage 2) so the refinement minimises reconstruction error in the directions the original model actually exercises. As an independent sanity check, the post-prune `B`-weighted residual `‖(W − UV)·B^{1/2}‖_F` is also monitored — if refinement worsens the B-weighted norm (i.e. quality on the pruned model's input distribution regresses despite improved A-weighted loss), a warning is logged. The two distributions agree under light pruning; the cross-check guards against A/B drift under aggressive pruning.
 
 ### Resume
 
