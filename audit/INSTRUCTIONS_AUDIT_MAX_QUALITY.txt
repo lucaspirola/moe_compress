@@ -1,0 +1,64 @@
+Four-step sequence after findings.md lands:
+
+  1. Triage (you, manually, ~30 min)
+
+  Open audit/spec_compliance/06_findings/findings.md and read it end-to-end. For each finding, decide one of four dispositions:
+
+  - Accept-fix — agree with the finding; the recommended_fix gets applied to the spec.
+  - Accept-but-different-fix — agree the issue is real but disagree with the recommended remedy. Note your alternative.
+  - Reject — the audit got it wrong. Note why (the disagreement itself becomes a meta-finding worth keeping).
+  - Defer — real issue, not now. Tag with a follow-up (TODO comment in spec, or schedule a future cleanup agent).
+
+  Write the dispositions inline as > DECISION: accept | reject | defer — <reason> blocks in findings.md. The audit artifact thereby becomes the audit-report-with-decisions, which is
+  itself version-controllable.
+
+  2. Fix-up session (Claude Code, with your approvals)
+
+  Open a new session and paste:
+
+  Read audit/spec_compliance/06_findings/findings.md. For every finding
+  marked "accept-fix" or "accept-but-different-fix", apply the
+  corresponding edit to max_quality/ALGORITHM_REFERENCE.md. Group edits
+  by stage and commit per stage with prefix "docs(spec):".
+
+  For each edit: show me the proposed change BEFORE applying. Wait for
+  my approval. After all approved edits land, mark the finding as
+  "FIXED in commit <sha>" inline in findings.md and commit that update
+  under "audit(spec):".
+
+  Do NOT touch findings tagged "reject" or "defer".
+
+  This is the explicit-approval-per-edit loop you ran for Stage 3 in this session. The audit produced ~20–60 findings probably; per-edit approval is tedious but necessary because Ch. 12
+   ↔ §6 ↔ paper alignment is precisely the surface where automated fixers introduce subtle errors.
+
+  3. Verification re-run (cheap)
+
+  The same shallow per-stage Ralph loop you just ran (/ralph-loop ... -completion-promise REVIEW PASS) — but this time as a regression check, not a discovery scan. The shallow review is
+   well-suited for this: it confirms no fix introduced a new uncovered deviation, and it converges fast (one or two iterations) because the heavy audit already cleaned the slate.
+
+  You could also re-run a targeted heavy audit (just the affected stages/regimes) by adding a phases.scope field to the manifest before re-launching. That's a more rigorous verification
+   but takes ~hours; the shallow Ralph review is usually sufficient as a regression net.
+
+  4. Implementation follow-ups (if the audit surfaces any)
+
+  The audit can produce findings of category paper_compliance_break where an H200 optimization breaks the paper but isn't yet sanctioned in Ch. 12. The fix is usually one of:
+
+  - Add a Ch. 12 row sanctioning the deviation (with your explicit approval — same rule that bit us this session)
+  - Change the implementation to restore paper compliance
+  - Both — Ch. 12 row plus an empirical-pending TODO
+
+  Examples already known to be lurking: the validation_samples=0 OOM auto-fallback (spec says hard-fail, code currently silently degrades — implementation follow-up flagged inline at
+  line 392-ish). The audit may surface more like this. Each gets its own implementation PR/commit, separate from the spec fixes.
+
+  Beyond that
+
+  If the audit comes back essentially clean (≤5 minor findings), you're done — the spec is in a defensible compliance state. You can then:
+
+  - Tag a release of the spec (git tag spec-audit-pass-2026-05-01) so the verified state is reproducible.
+  - Schedule a recurring shallow review — the Ralph loop you ran today is a good monthly regression check (/schedule weekly /ralph-loop ... — but that's overkill; quarterly is more
+  honest given how slowly the spec changes).
+  - Move on to the spec ↔ code parity audit — the spec is now provably aligned with the papers; the next blind spot is whether the code is provably aligned with the spec. That's the
+  audit I described in section 4 of the heavy-audit recipe (out of scope this round, but the natural follow-on).
+
+  Want me to also schedule a follow-up agent to run the verification re-run automatically once the heavy audit completes? That would be a /schedule candidate — fire after the audit
+  branch is touched, run the shallow Ralph review, post a one-line "regression-clean" or "regression-found N items" report.
