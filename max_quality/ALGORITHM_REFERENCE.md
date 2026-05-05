@@ -224,8 +224,8 @@ With 256 samples × 2048 tokens ≈ 524K total token activations across the laye
 
 2. **Greedy loop** until total surviving experts ≤ `global_expert_budget`:
    - If all layers frozen → **restart** (unfreeze all)
-   - Pick `l* = argmax R^l` among unfrozen layers above their floor
-   - Pick `(i*, j*) = argmax D^{l*}_{ij}` (most similar pair)
+   - Pick `l* = argmin R^l` among unfrozen layers above their floor (smallest total pairwise distance = most redundant layer; note: implementation uses a distance matrix, so argmin is correct — the GRAPE paper's `argmax` applies to similarity matrices)
+   - Pick `(i*, j*) = argmin D^{l*}_{ij}` (most similar pair = smallest distance; same distance-vs-similarity inversion as layer selection above)
    - **Merge:** zero out `j*`'s row/column in `D^{l*}`, update `R^{l*}`
    - Decrement `cluster_counts[l*]`
    - If entropy drops below `Ê` → **freeze** layer `l*`
