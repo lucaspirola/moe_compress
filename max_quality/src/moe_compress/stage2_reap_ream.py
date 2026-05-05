@@ -91,8 +91,9 @@ def run(
 
     moe_layers = list(iter_moe_layers(model))
     cov_acc = InputCovarianceAccumulator()
-    # Addresses review P0-3 (cov storage OOM): default to bf16 on-disk cov.
-    cov_dtype = getattr(torch, s2.get("covariance_storage_dtype", "bfloat16"))
+    # Spec §5 "Covariance Side-Collection": FP32 storage certified by Swift-SVD
+    # paper 2604.01609; avoids numerical degradation in eigendecomposition.
+    cov_dtype = getattr(torch, s2.get("covariance_storage_dtype", "float32"))
     cov_acc.set_storage_dtype(cov_dtype)
     merge_map: dict[int, dict[int, list[int]]] = {}
 
@@ -259,17 +260,29 @@ def run(
                 ream_acc=ream_acc,
             )
             assignment = _assign_children_to_centroids(
-                delta, len(noncentroid_ids), len(centroid_ids),
+                delta, len(noncentroid_ids), len(centroid_ids), max_group_cap,
             )
             grouped = {c: [c] for c in centroid_ids}
             for child_pos, centroid_pos in enumerate(assignment):
+                if centroid_pos < 0:
+                    continue  # child was not absorbed — will be deleted
                 grouped[centroid_ids[centroid_pos]].append(noncentroid_ids[child_pos])
 
+            n_deleted_unmerged = sum(1 for a in assignment if a < 0)
             max_group = max((len(g) for g in grouped.values()), default=1)
-            b_fail = (max_group_cap > 0) and (max_group > max_group_cap)
+            # b_fail: any non-centroid was deleted without being merged, meaning
+            # its knowledge is lost. Direct check replaces the old proxy
+            # (max_group > cap) now that the cap is enforced inside the assignment.
+            b_fail = (max_group_cap > 0) and (n_deleted_unmerged > 0)
 
-            n_pairs = int(delta.size)
-            mean_cost = float(delta.sum()) / max(n_pairs, 1)
+            _iter_n_assigned = sum(1 for a in assignment if a >= 0)
+            _iter_assigned_cost = (
+                sum(float(delta[ch, assignment[ch]])
+                    for ch in range(len(noncentroid_ids))
+                    if assignment[ch] >= 0)
+                if delta.size > 0 else 0.0
+            )
+            mean_cost = _iter_assigned_cost / max(_iter_n_assigned, 1)
             c_fail = False
             if len(_layer_mean_costs) >= 4:
                 running_mean = float(np.mean(_layer_mean_costs))
@@ -281,31 +294,50 @@ def run(
             bump = 1
             if c_fail:
                 bump = max(bump, math.ceil(effective_target * cost_bump_ratio))
+            new_effective = min(effective_target + bump, n_experts)
             if b_fail:
                 log.warning(
-                    "  layer %d: max_group=%d > cap=%d — bumping target %d→%d",
-                    layer_ref.layer_idx, max_group, max_group_cap,
-                    effective_target, effective_target + bump,
+                    "  layer %d: %d non-centroid(s) deleted unmerged (cap=%d) — "
+                    "bumping target %d→%d",
+                    layer_ref.layer_idx, n_deleted_unmerged, max_group_cap,
+                    effective_target, new_effective,
                 )
             if c_fail:
                 log.warning(
                     "  layer %d: mean_cost=%.4f > threshold=%.4f — bumping target %d→%d",
                     layer_ref.layer_idx, mean_cost,
                     running_mean * (1.0 + cost_sigma),
-                    effective_target, effective_target + bump,
+                    effective_target, new_effective,
                 )
-            effective_target = min(effective_target + bump, n_experts)
+            effective_target = new_effective
             if effective_target >= n_experts:
                 continue
 
-        assert all(a >= 0 for a in assignment), (
-            f"Layer {layer_ref.layer_idx}: _assign_children_to_centroids returned "
-            f"unassigned (-1) sentinel for {sum(1 for a in assignment if a < 0)} child(ren); "
-            f"n_children={len(noncentroid_ids)}, n_centroids={len(centroid_ids)}"
-        )
+        # Log any non-centroids that were deleted unmerged (assignment == -1).
+        # This is expected and correct when max_group_cap is enforced and the
+        # bump loop could not find a target where all children fit.
+        n_deleted_final = sum(1 for a in assignment if a < 0)
+        if n_deleted_final > 0:
+            deleted_ids = [
+                noncentroid_ids[ch] for ch, a in enumerate(assignment) if a < 0
+            ]
+            log.warning(
+                "  layer %d: %d non-centroid(s) deleted unmerged (weights discarded): %s",
+                layer_ref.layer_idx, n_deleted_final, deleted_ids,
+            )
 
-        if delta.size > 0:
-            _layer_mean_costs.append(float(delta.sum()) / int(delta.size))
+        # Compute actual-assignment costs: sum only the (child → centroid) pairs
+        # that were actually assigned, not all n_noncentroids × n_centroids entries.
+        assigned_cost = sum(
+            float(delta[ch, assignment[ch]])
+            for ch in range(len(noncentroid_ids))
+            if assignment[ch] >= 0
+        ) if delta.size > 0 else 0.0
+        n_assigned = sum(1 for a in assignment if a >= 0)
+        mean_assigned_cost = assigned_cost / max(n_assigned, 1)
+
+        if n_assigned > 0:
+            _layer_mean_costs.append(mean_assigned_cost)
 
         _merge_experts_inplace(
             layer_ref, grouped, freq,
@@ -331,23 +363,22 @@ def run(
             _write_merge_json(
                 partial_dir, layer_ref.layer_idx, centroid_ids, grouped, freq,
                 merge_map[layer_ref.layer_idx],
-                mean_cost_per_pair=float(delta.sum()) / max(int(delta.size), 1),
+                mean_cost_per_pair=mean_assigned_cost,
             )
 
-        sum_cost = float(delta.sum()) if delta.size else 0.0
         max_group = max((len(g) for g in grouped.values()), default=1)
         mean_group = n_experts / max(len(centroid_ids), 1) if centroid_ids else 0.0
         log.info(
             "  kept %d / %d experts (blacklist=%d) — Σ cost=%.4f, max_group=%d, mean_group=%.2f",
             len(centroid_ids), n_experts, len(protected),
-            sum_cost, max_group, mean_group,
+            assigned_cost, max_group, mean_group,
         )
         _trackio_log({
             "stage2/layer_idx": layer_ref.layer_idx,
             "stage2/kept_experts": len(centroid_ids),
             "stage2/total_experts": n_experts,
-            "stage2/sum_assignment_cost": sum_cost,
-            "stage2/mean_cost_per_pair": sum_cost / max(delta.size, 1),
+            "stage2/sum_assignment_cost": assigned_cost,
+            "stage2/mean_cost_per_pair": mean_assigned_cost,
             "stage2/max_merge_group_size": max_group,
             "stage2/mean_merge_group_size": mean_group,
             "stage2/effective_target": len(centroid_ids),
@@ -390,7 +421,19 @@ def _snapshot_cov_layer(
     tmp = partial_dir / f"layer_{layer_idx}.pt.tmp"
     final = partial_dir / f"layer_{layer_idx}.pt"
     torch.save(payload, tmp)
+    # Spec §11: durable write — fsync file bytes, then fsync parent dir entry,
+    # then atomic rename so a crash never leaves a truncated final file.
+    fd = os.open(str(tmp), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     os.replace(tmp, final)
+    parent_fd = os.open(str(final.parent), os.O_RDONLY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _write_merge_json(
@@ -414,7 +457,19 @@ def _write_merge_json(
     tmp = partial_dir / f"merge_{layer_idx}.json.tmp"
     final = partial_dir / f"merge_{layer_idx}.json"
     tmp.write_text(json.dumps(payload), encoding="utf-8")
+    # Spec §11: durable write — fsync file bytes, then fsync parent dir entry,
+    # then atomic rename so a crash never leaves a truncated final file.
+    fd = os.open(str(tmp), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     os.replace(tmp, final)
+    parent_fd = os.open(str(final.parent), os.O_RDONLY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -519,21 +574,35 @@ def _ream_cost_matrix(
 
 
 def _assign_children_to_centroids(
-    cost: np.ndarray, n_children: int, n_centroids: int,
+    cost: np.ndarray, n_children: int, n_centroids: int, max_group_cap: int = 0,
 ) -> list[int]:
+    """Single-pass greedy assignment of non-centroid children to centroids.
+
+    Iterates centroids once in order 0..n_centroids-1 (caller builds centroid_ids
+    in descending saliency — column 0 = highest-saliency centroid).  For each
+    centroid, greedily absorbs up to *max_group_cap* unassigned children (lowest
+    cost = most similar first).  When max_group_cap=0 the cap is disabled and each
+    centroid absorbs as many remaining unassigned children as exist.
+
+    Children not absorbed after the single pass receive assignment -1 (deleted,
+    weights discarded — spec §5 Step 3).
+
+    Returns a list of length n_children where entry ch is:
+      >= 0  → centroid column index this child is merged into
+      -1    → child was not absorbed (to be deleted)
+    """
     if n_children == 0 or n_centroids == 0:
-        return []
+        return [-1] * n_children
 
     assignment = [-1] * n_children
-    assigned = set()
+    assigned: set[int] = set()
 
-    # Iterate centroids 0..n_centroids-1; caller builds centroid_ids in descending
-    # saliency order so column index 0 = highest-saliency centroid.
-    centroid_order = list(range(n_centroids))
-
-    while len(assigned) < n_children:
-        made_progress = False
-        for c_idx in centroid_order:
+    # Single pass: iterate centroids in descending saliency order (column 0 first).
+    for c_idx in range(n_centroids):
+        # Slots available for this centroid: unlimited when cap disabled (0).
+        slots = max_group_cap if max_group_cap > 0 else n_children
+        absorbed = 0
+        while absorbed < slots:
             best_child = -1
             best_cost = float("inf")
             for ch in range(n_children):
@@ -542,16 +611,11 @@ def _assign_children_to_centroids(
                 if cost[ch, c_idx] < best_cost:
                     best_cost = cost[ch, c_idx]
                     best_child = ch
-            if best_child >= 0:
-                assignment[best_child] = c_idx
-                assigned.add(best_child)
-                made_progress = True
-        if not made_progress:
-            unassigned = [ch for ch in range(n_children) if ch not in assigned]
-            raise RuntimeError(
-                f"Greedy assignment stalled: {len(unassigned)} children unassigned "
-                f"with {n_centroids} centroids — possible NaN in cost matrix"
-            )
+            if best_child < 0:
+                break  # no more unassigned children
+            assignment[best_child] = c_idx
+            assigned.add(best_child)
+            absorbed += 1
 
     return assignment
 
