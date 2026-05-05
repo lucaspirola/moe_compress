@@ -94,13 +94,14 @@ def run(
         cache_dir=artifacts_dir / "_calibration_cache",
     )
     batches = iter_batches(calib, batch_size=1)
+    n_batches = len(batches)
 
     # ------------------------------------------------------------------
     # Phase A: MA-Formation Layer Detection (Pass 1)
     # ------------------------------------------------------------------
     log.info(
         "Stage 1 Phase A: detecting MA-formation layers over %d samples (%d MoE layers)",
-        len(batches), len(moe_layers),
+        n_batches, len(moe_layers),
     )
     L = _detect_ma_layers(model, batches, moe_layers, device, ma_ratio=ma_ratio)
     log.info("Stage 1 Phase A: MA-formation layers L = %s", sorted(L))
@@ -113,7 +114,7 @@ def run(
     log.info(
         "Stage 1 Phase B: profiling %d layers × %d experts on %d samples "
         "(magnitude for L=%s, CKA for all layers)",
-        len(moe_layers), n_per_layer, len(batches), sorted(L),
+        len(moe_layers), n_per_layer, n_batches, sorted(L),
     )
 
     max_acc = DownProjMaxAccumulator()
@@ -159,7 +160,7 @@ def run(
     save_json_artifact(
         {
             "blacklist": blacklist_out,
-            "per_expert_max": {f"{k[0]}_{k[1]}": v for k, v in max_acc.per_expert_max.items()},
+            "per_expert_max": {f"L{k[0]}E{k[1]}": v for k, v in max_acc.per_expert_max.items()},
             "config": blacklist_config,
         },
         blacklist_path,
@@ -190,7 +191,7 @@ def run(
     # ------------------------------------------------------------------
     # Phase D: CKA Similarity Matrices
     # ------------------------------------------------------------------
-    log.info("Stage 1 Phase D: computing CKA pairwise similarity matrices")
+    log.info("Stage 1 Phase D: computing CKA pairwise distance matrices (D = 1 − CKA)")
 
     D_matrices: dict[int, torch.Tensor] = {}
     per_layer_counts: dict[int, int] = {}
@@ -352,7 +353,11 @@ def _apply_paper_criterion(
     """Apply Eq. 6 three-way AND: a > P99.5 AND a > 0.1·a_max AND l ∈ L."""
     blacklist: dict[int, list[int]] = {}
     for (li, e), v in per_expert_max.items():
-        assert li in L  # per_expert_max is only populated for l ∈ L (Phase B gate)
+        if li not in L:
+            raise RuntimeError(
+                f"per_expert_max contains layer {li} which is not in L={L}; "
+                "down_cb should only call max_acc.update() for li in L"
+            )
         if v > p995 and v > a_max_threshold:
             blacklist.setdefault(li, []).append(e)
     return blacklist
@@ -507,9 +512,10 @@ def _grape_greedy_merge(
         n = d.shape[0]
         R[li] = float((d.sum() - np.diag(d).sum())) if n > 1 else 0.0
 
-    # Floor: max(min_experts, blacklist size per layer)
+    # Floor: non-blacklisted portion = max(min_experts - BL, 0).
+    # Total floor = non-blacklisted floor + BL = max(min_experts, BL). Correct.
     floors: dict[int, int] = {
-        li: max(min_experts, len(blacklist.get(li, [])))
+        li: max(min_experts - len(blacklist.get(li, [])), 0)
         for li in sorted_layers
     }
 
@@ -532,6 +538,12 @@ def _grape_greedy_merge(
     E_hat = E_init * (1.0 - gamma)
 
     frozen: set[int] = set()
+    # Pre-populate floor_blocked for layers already at their floor before merging starts.
+    # Lazy-add inside the loop handles layers that reach their floor mid-run, but
+    # without this pre-population, layers simultaneously at-floor and in `frozen`
+    # (from a prior restart cycle) would never be added to floor_blocked, causing
+    # _non_floor_blocked to overcount and trigger spurious restarts.
+    floor_blocked: set[int] = {li for li in sorted_layers if cluster_counts.get(li, 0) <= floors.get(li, 0)}
     current_total = sum(cluster_counts.values())
 
     log.info("GRAPE: global_budget=%d (non-bl effective=%d), current_total=%d, gamma=%.2f, E_hat=%.4f, floor=%d",
@@ -548,13 +560,18 @@ def _grape_greedy_merge(
     }
 
     max_iterations = current_total * n_moe_layers
+    iteration = -1
     for iteration in range(max_iterations):
         if current_total <= effective_budget:
             break
 
-        if len(frozen) >= n_moe_layers:
+        # Restart only when entropy-frozen layers block all non-floor-blocked layers.
+        # Floor constraints are permanent — clearing floor_blocked can't help and
+        # causes a spurious restart loop when all layers are at their floor.
+        _non_floor_blocked = n_moe_layers - len(floor_blocked)
+        if _non_floor_blocked > 0 and len(frozen) >= _non_floor_blocked:
             frozen.clear()
-            log.info("GRAPE iter %d: all layers frozen → restart", iteration)
+            log.info("GRAPE iter %d: all non-floor-blocked layers frozen → restart", iteration)
 
         best_layer = None
         best_R = float('inf')
@@ -562,6 +579,7 @@ def _grape_greedy_merge(
             if li in frozen:
                 continue
             if cluster_counts[li] <= floors[li]:
+                floor_blocked.add(li)
                 continue
             if R[li] < best_R:
                 best_R = R[li]
