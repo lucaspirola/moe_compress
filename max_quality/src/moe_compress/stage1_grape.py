@@ -1,12 +1,11 @@
 """Stage 1 — Super Expert Detection + GRAPE non-uniform per-layer expert budgets.
 
-Merged stage: a single calibration forward pass (size from config) simultaneously
-collects (a) max |down_proj_output| for super expert detection and (b) expert
-output representations for CKA pairwise similarity matrices, which feed GRAPE
-Algorithm 1 (2604.06542, §3.3).
+Two sequential forward passes over 256 calibration samples:
+  Phase A: detect MA-formation layers (set L)
+  Phase B: collect max down_proj output magnitude (l ∈ L) + CKA representations (all layers)
 
-Super expert detection follows 2507.23279 with per-layer z-score thresholding
-(deviation D1) and safety caps (deviation D2).
+Super expert detection follows 2507.23279 Eq. 6: three-way AND criterion
+(> P99.5(A) AND > 0.1·a_max AND l ∈ L). No per-layer caps, no global caps.
 
 GRAPE uses CKA similarity (paper §3.2 explicitly allows "CKA, MSE, or other
 similarity measures"). Floor constraint: num_routed_experts // 2 (deviation D5).
@@ -19,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from .budget.solver import BudgetDecomposition
 from .utils.activation_hooks import (
@@ -38,6 +38,8 @@ from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 
+_MA_RATIO = 100.0  # max / quantile(0.99) threshold for MA pattern detection
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -53,7 +55,7 @@ def run(
     *,
     device=None,
 ) -> tuple[Path, Path]:
-    """Run the merged Stage 1: SE detection + GRAPE budget allocation.
+    """Run Stage 1: SE detection + GRAPE budget allocation.
 
     Returns (blacklist_path, budgets_path).
     """
@@ -67,9 +69,21 @@ def run(
         )
     n_per_layer = moe_layers[0].num_routed_experts
 
-    # ------------------------------------------------------------------
-    # Phase A: Single-pass calibration (512 samples)
-    # ------------------------------------------------------------------
+    se_cfg = s1["super_expert_detection"]
+
+    # Warn on deprecated config keys (kept for backwards compat; not used).
+    for old_key in ("zscore_threshold", "max_blacklisted_per_layer", "global_blacklist_cap_pct"):
+        if old_key in se_cfg:
+            log.warning(
+                "Stage 1: config key '%s' is deprecated and ignored. "
+                "Super expert detection now uses the paper's three-way AND criterion "
+                "(P99.5 + 0.1·a_max). Remove this key from your config.",
+                old_key,
+            )
+
+    ma_ratio = float(se_cfg.get("ma_ratio", _MA_RATIO))
+    a_max_fraction = float(se_cfg.get("a_max_fraction", 0.1))
+
     spec = spec_from_config(
         cal,
         num_sequences_override=s1.get("num_calibration_samples"),
@@ -81,16 +95,34 @@ def run(
     )
     batches = iter_batches(calib, batch_size=1)
 
+    # ------------------------------------------------------------------
+    # Phase A: MA-Formation Layer Detection (Pass 1)
+    # ------------------------------------------------------------------
     log.info(
-        "Stage 1 Phase A: profiling %d layers × %d experts on %d samples",
-        len(moe_layers), n_per_layer, len(batches),
+        "Stage 1 Phase A: detecting MA-formation layers over %d samples (%d MoE layers)",
+        len(batches), len(moe_layers),
+    )
+    L = _detect_ma_layers(model, batches, moe_layers, device, ma_ratio=ma_ratio)
+    log.info("Stage 1 Phase A: MA-formation layers L = %s", sorted(L))
+
+    # ------------------------------------------------------------------
+    # Phase B: Expert Magnitude + CKA (Pass 2)
+    # ------------------------------------------------------------------
+    batches = iter_batches(calib, batch_size=1)
+
+    log.info(
+        "Stage 1 Phase B: profiling %d layers × %d experts on %d samples "
+        "(magnitude for L=%s, CKA for all layers)",
+        len(moe_layers), n_per_layer, len(batches), sorted(L),
     )
 
     max_acc = DownProjMaxAccumulator()
     output_acc = ExpertOutputAccumulator()
 
     def down_cb(li, e, tensor, ctx):
-        max_acc.update(li, e, tensor)
+        # Magnitude collection restricted to MA-formation layers per spec.
+        if li in L:
+            max_acc.update(li, e, tensor)
         output_acc.update(li, e, tensor)
 
     import contextlib as _ctx
@@ -103,41 +135,39 @@ def run(
     output_acc.finalize()
 
     # ------------------------------------------------------------------
-    # Phase B: Super Expert Detection (2507.23279)
+    # Phase C: Super Expert Detection (2507.23279, Eq. 6)
     # ------------------------------------------------------------------
-    se_cfg = s1["super_expert_detection"]
     per_experts_by_layer = {ref.layer_idx: ref.num_routed_experts for ref in moe_layers}
 
-    blacklist = _threshold_per_layer(
-        max_acc.per_expert_max,
-        num_experts_per_layer=per_experts_by_layer,
-        zscore=se_cfg["zscore_threshold"],
-        cap_per_layer=se_cfg["max_blacklisted_per_layer"],
+    p995, a_max = _compute_se_thresholds(max_acc.per_expert_max, L)
+    blacklist = _apply_paper_criterion(
+        max_acc.per_expert_max, L, p995, a_max_fraction * a_max,
     )
-    total_experts = sum(per_experts_by_layer.values())
-    cap_pct = float(se_cfg["global_blacklist_cap_pct"])
-    if not (0.0 < cap_pct <= 1.0):
-        raise ValueError(
-            f"global_blacklist_cap_pct={cap_pct} must be a fraction in (0, 1], "
-            "e.g. 0.05 for 5%. Got a value outside this range — did you pass an "
-            "integer percentage (e.g. 5) instead of a decimal (0.05)?"
-        )
-    global_cap = int(cap_pct * total_experts)
-    blacklist = _apply_global_cap(blacklist, max_acc.per_expert_max, global_cap)
 
     blacklist_out = {str(li): sorted(es) for li, es in blacklist.items() if es}
+    total_experts = sum(per_experts_by_layer.values())
+
+    blacklist_config = {
+        "a_max_fraction": a_max_fraction,
+        "ma_ratio": ma_ratio,
+        "ma_formation_layers": sorted(L),
+        "p995_value": p995,
+        "a_max_value": float(a_max),
+        "a_max_threshold": float(a_max_fraction * a_max),
+    }
     blacklist_path = artifacts_dir / "stage1_blacklist.json"
     save_json_artifact(
         {
             "blacklist": blacklist_out,
             "per_expert_max": {f"{k[0]}_{k[1]}": v for k, v in max_acc.per_expert_max.items()},
-            "config": se_cfg,
+            "config": blacklist_config,
         },
         blacklist_path,
     )
     log.info(
-        "Stage 1 Phase B: blacklisted %d / %d super experts → %s",
-        sum(len(v) for v in blacklist_out.values()), total_experts, blacklist_path,
+        "Stage 1 Phase C: blacklisted %d / %d super experts (P99.5=%.3g, 0.1·a_max=%.3g) → %s",
+        sum(len(v) for v in blacklist_out.values()), total_experts,
+        p995, a_max_fraction * a_max, blacklist_path,
     )
 
     # Trackio: SE detection stats
@@ -158,9 +188,9 @@ def run(
         })
 
     # ------------------------------------------------------------------
-    # Phase C: CKA Similarity Matrices
+    # Phase D: CKA Similarity Matrices
     # ------------------------------------------------------------------
-    log.info("Stage 1 Phase C: computing CKA pairwise similarity matrices")
+    log.info("Stage 1 Phase D: computing CKA pairwise similarity matrices")
 
     D_matrices: dict[int, torch.Tensor] = {}
     per_layer_counts: dict[int, int] = {}
@@ -181,7 +211,7 @@ def run(
             D_matrices[ref.layer_idx] = _pairwise_distance_matrix(ref, metric=metric)
 
     # ------------------------------------------------------------------
-    # Phase D: GRAPE Algorithm 1 (entropy-aware greedy merge with restart)
+    # Phase E: GRAPE Algorithm 1 (entropy-aware greedy merge with restart)
     # ------------------------------------------------------------------
     global_budget = decomposition.global_expert_budget
     gamma = float(s1.get("entropy_tolerance", 0.1))
@@ -198,16 +228,33 @@ def run(
         gamma=gamma,
     )
 
-    # Logging: per-layer redundancy
-    redundancies: dict[int, float] = {}
+    # Logging: per-layer redundancy R̃^l (spec §4, Eq. 3)
+    # Build D_work_logging: zero blacklisted rows/cols in a copy of D_matrices
+    # (mirrors what _grape_greedy_merge does internally, for consistency).
+    D_work_logging: dict[int, np.ndarray] = {}
     for li, D in D_matrices.items():
-        n = D.shape[0]
-        if n <= 1:
-            redundancies[li] = 0.0
-        else:
-            sim = 1.0 - D
-            off = (sim.sum() - sim.diag().sum()) / (n * (n - 1))
-            redundancies[li] = float(off.item())
+        d = D.cpu().numpy().copy()
+        for bl_e in blacklist.get(li, []):
+            d[bl_e, :] = 0.0
+            d[:, bl_e] = 0.0
+        D_work_logging[li] = d
+
+    # R^l = Σ_{i≠j} D^l_{ij}  (sum of off-diagonal distances)
+    R_raw: dict[int, float] = {}
+    for li, d in D_work_logging.items():
+        n = d.shape[0]
+        R_raw[li] = float(d.sum() - np.diag(d).sum()) if n > 1 else 0.0
+
+    # Min-max normalise across layers → R̃^l ∈ [0, 1]
+    r_min = min(R_raw.values())
+    r_max = max(R_raw.values())
+    denom = r_max - r_min if r_max > r_min else 1.0
+
+    redundancies: dict[int, float] = {
+        li: (R_raw[li] - r_min) / denom for li in R_raw
+    }
+
+    for li in D_matrices:
         _trackio_log({
             "stage1/layer_idx": li,
             "stage1/redundancy": redundancies[li],
@@ -231,49 +278,84 @@ def run(
 
 
 # ---------------------------------------------------------------------------
-# Super Expert Detection helpers
+# Phase A: MA-formation layer detection
 # ---------------------------------------------------------------------------
 
 
-def _threshold_per_layer(
-    per_expert_max: dict[tuple[int, int], float],
+def _detect_ma_layers(
+    model: nn.Module,
+    batches,
+    moe_layers,
+    device,
     *,
-    num_experts_per_layer: dict[int, int],
-    zscore: float,
-    cap_per_layer: int,
-) -> dict[int, list[int]]:
-    blacklist: dict[int, list[int]] = {}
-    for li, n_experts in num_experts_per_layer.items():
-        vals = np.array([per_expert_max.get((li, e), 0.0) for e in range(n_experts)])
-        mean, std = vals.mean(), vals.std()
-        if std <= 0:
-            blacklist[li] = []
-            continue
-        thresh = mean + zscore * std
-        flagged = [int(e) for e in range(n_experts) if vals[e] > thresh]
-        flagged.sort(key=lambda e: -vals[e])
-        blacklist[li] = flagged[:cap_per_layer]
-    return blacklist
+    ma_ratio: float = _MA_RATIO,
+) -> set[int]:
+    """Forward pass 1: identify decoder layers that form massive activations.
+
+    A layer l is in L if, for any batch, max|H_l(x)| > ma_ratio * quantile(|H_l(x)|, 0.99).
+    H_l(x) is the post-MoE block output (i.e., the decoder layer's output tensor).
+    """
+    L: set[int] = set()
+    moe_layer_modules = {ref.layer_module: ref.layer_idx for ref in moe_layers}
+    handles: list = []
+
+    def _make_hook(layer_idx: int):
+        def _hook(_module, _input, output):
+            # output may be a tuple (hidden, ...) or just the hidden tensor
+            h = output[0] if isinstance(output, tuple) else output
+            if not isinstance(h, torch.Tensor):
+                return
+            h_abs = h.detach().abs().float()
+            q99 = torch.quantile(h_abs.flatten(), 0.99).item()
+            if q99 > 0 and h_abs.max().item() > ma_ratio * q99:
+                L.add(layer_idx)
+        return _hook
+
+    for module, layer_idx in moe_layer_modules.items():
+        h = module.register_forward_hook(_make_hook(layer_idx))
+        handles.append(h)
+
+    try:
+        run_calibration(model, batches, device=device)
+    finally:
+        for h in handles:
+            h.remove()
+
+    return L
 
 
-def _apply_global_cap(
-    blacklist: dict[int, list[int]],
+# ---------------------------------------------------------------------------
+# Phase C: Super Expert Detection helpers
+# ---------------------------------------------------------------------------
+
+
+def _compute_se_thresholds(
     per_expert_max: dict[tuple[int, int], float],
-    cap: int,
+    L: set[int],
+) -> tuple[float, float]:
+    """Compute P99.5 and a_max over all (l, e) with l ∈ L."""
+    A = [v for (li, _e), v in per_expert_max.items() if li in L]
+    if not A:
+        return 0.0, 0.0
+    arr = np.array(A, dtype=np.float64)
+    p995 = float(np.percentile(arr, 99.5))
+    a_max = float(arr.max())
+    return p995, a_max
+
+
+def _apply_paper_criterion(
+    per_expert_max: dict[tuple[int, int], float],
+    L: set[int],
+    p995: float,
+    a_max_threshold: float,
 ) -> dict[int, list[int]]:
-    flat = [
-        (li, e, per_expert_max.get((li, e), 0.0))
-        for li, es in blacklist.items()
-        for e in es
-    ]
-    if len(flat) <= cap:
-        return blacklist
-    flat.sort(key=lambda x: -x[2])
-    kept = flat[:cap]
-    out: dict[int, list[int]] = {}
-    for li, e, _ in kept:
-        out.setdefault(li, []).append(e)
-    return out
+    """Apply Eq. 6 three-way AND: a > P99.5 AND a > 0.1·a_max AND l ∈ L."""
+    blacklist: dict[int, list[int]] = {}
+    for (li, e), v in per_expert_max.items():
+        assert li in L  # per_expert_max is only populated for l ∈ L (Phase B gate)
+        if v > p995 and v > a_max_threshold:
+            blacklist.setdefault(li, []).append(e)
+    return blacklist
 
 
 # ---------------------------------------------------------------------------
