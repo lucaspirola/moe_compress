@@ -259,11 +259,9 @@ Stage 1 is stateless (JSON-only output: blacklist + per-layer budgets). Re-runni
 
 ### Blacklist Output (`stage1_blacklist.json`)
 
-Stage 1 emits a blacklist consumed by Stage 2. It contains two categories of completely protected experts:
+Stage 1 emits `stage1_blacklist.json` containing **one category only**: Super Expert (layer, expert) index pairs from Phase C's three-way AND criterion. Fewer than 0.5% of all routed experts for typical models.
 
-1. **Super experts (SE)**: specific (layer, expert) index pairs identified by Phase C's three-way AND criterion. These are the only experts individually identified by Stage 1 and stored by name. Fewer than 0.5% of all routed experts for typical models.
-
-2. **Shared experts**: the model architecture's always-active `shared_expert` attribute present in each MoE layer. These are not routed experts and are never part of the GRAPE or REAM expert pools. Stage 2 excludes them implicitly by architecture (they live in a separate attribute in Qwen3) but must be tracked explicitly for any pipeline code that traverses expert weights.
+Shared experts (`mlp.shared_expert`) are **not in the blacklist** and are not processed by Stage 1 at all. They live in a separate model attribute, distinct from the routed `mlp.experts` list, and are architecturally invisible to `iter_moe_layers`, GRAPE, and REAM. No explicit exclusion is needed — they are simply never candidates.
 
 **What GRAPE contributes to Stage 2 is per-layer budgets (N'_l), not individual expert blacklists.** N'_l ≥ `min_experts_per_layer` (128) for every layer due to the floor constraint. Stage 2 uses N'_l as the target centroid count for REAM per layer; REAP scores then determine which N'_l routed non-blacklisted experts become centroids.
 
@@ -307,15 +305,13 @@ These optimizations are purely implementation-level data-structure changes. The 
 
 #### Blacklisted Expert Exclusion
 
-Before any REAP/REAM computation, two categories of experts are **completely excluded** from Stage 2 — they are not candidates for the centroid set and not candidates for the non-centroid set; their weights pass through Stage 2 unchanged:
+Before any REAP/REAM computation, **super experts (SEs)** are excluded from the routed expert pool — they are not candidates for the centroid set and not candidates for the non-centroid set; their weights pass through Stage 2 unchanged. SEs are identified by the (layer, expert) pairs in `stage1_blacklist.json`. Placing an SE in the centroid set would allow non-centroid weights to be merged into it, modifying the SE's weights — defeating the purpose of blacklisting.
 
-1. **Super experts (SE)**: the specific (layer, expert) pairs emitted by Stage 1 Phase C and stored in `stage1_blacklist.json`. Placing an SE in the centroid set would allow non-centroid weights to be merged into it, modifying the SE's weights — defeating the purpose of blacklisting.
+**Shared experts** (`mlp.shared_expert`) are never in scope: they live in a separate model attribute, are not indexed as routed experts, and are never iterated by `iter_moe_layers`. No explicit exclusion logic is needed for them in Stage 2.
 
-2. **Shared experts**: the model architecture's always-active `shared_expert` attribute (a separate weight tensor per MoE layer, distinct from the routed `experts` list). In the Qwen3 architecture the shared expert lives in a separate attribute and is never indexed as part of the routed pool; it is implicitly excluded by the reference implementation and must be explicitly excluded in any custom traversal.
+GRAPE outputs per-layer **budgets** (N'_l — how many routed experts to keep per layer), not individual expert blacklists. The floor constraint (min 128 per layer) is enforced on N'_l; REAM then selects which N'_l routed non-SE experts become centroids via REAP score.
 
-GRAPE outputs per-layer **budgets** (N'_l — how many routed experts to keep per layer), not individual expert blacklists. The floor constraint (min 128 per layer) is enforced on N'_l; REAM then selects which N'_l routed non-blacklisted experts become centroids via REAP score.
-
-All counts below (N'_l, feasibility checks, group sizes) refer to non-blacklisted routed experts only.
+All counts below (N'_l, feasibility checks, group sizes) refer to non-SE routed experts only.
 
 #### Step 1: REAP Scoring (Paper 2510.13999, Eq. 9)
 
@@ -355,7 +351,7 @@ where the denominator `Σ_j freq_j` sums over merge group members only (not all 
 
 #### Step 5: Router Resize
 
-Remove merged non-centroid experts' rows from `gate.weight`. Update `num_experts` on the MoE block. Blacklisted experts' rows (super experts, shared experts) are **not removed** — they remain in the router and expert list unchanged.
+Remove merged non-centroid experts' rows from `gate.weight`. Update `num_experts` on the MoE block. SE rows are **not removed** — they remain in the router and expert list unchanged.
 
 ### Covariance Side-Collection
 
