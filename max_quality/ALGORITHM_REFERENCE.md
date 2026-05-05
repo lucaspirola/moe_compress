@@ -126,7 +126,7 @@ A single unified stage that (a) identifies super experts that must never be comp
 
 Super experts carry outsized influence on model output despite being activated at normal frequency. Pruning them causes catastrophic quality collapse (e.g., −21.7% relative average accuracy drop across 9 benchmarks (Table 3, non-thinking mode) on Qwen3-30B-A3B). They must be detected before any budget allocation.
 
-Uniform pruning wastes budget — some layers have highly redundant experts (high pairwise CKA similarity) while others are diverse. GRAPE's +2.45% peak on Mixtral-8x22B at the 4-expert setting (paper Table 2) demonstrates the value of non-uniform allocation. Using CKA (rather than weight-space cosine) for the similarity metric gives GRAPE activation-aware redundancy estimates, producing better budgets for Stage 2.
+Uniform pruning wastes budget — some layers have highly redundant experts (high pairwise CKA similarity) while others are diverse. GRAPE's +2.45% peak on Mixtral-8x22B at the 4-expert setting (paper Table 1) demonstrates the value of non-uniform allocation. Using CKA (rather than weight-space cosine) for the similarity metric gives GRAPE activation-aware redundancy estimates, producing better budgets for Stage 2.
 
 ### How
 
@@ -197,12 +197,12 @@ blacklisted(l, e) = a_{l,e} > P99.5(A)  AND  a_{l,e} > 0.1 · a_max  AND  l ∈ 
 ```
 
 where:
-- `A = {a_{l,e}}` is the set of all max down_proj output magnitudes across all experts in all MA-formation layers
+- `A = {a_{l,e}}` is the set of all max down_proj output magnitudes across all experts in MA-formation layers (l ∈ L)
 - `P99.5(A) = Percentile_99.5(A)` is the 99.5th percentile of this global set
 - `a_max = max(A)` is the global maximum across all (l, e) in L
 - `L` is the MA-formation layer set from Phase A
 
-> **Note on §3.2.1 vs Algorithm 1:** The paper's §3.2.1 prose defines A as covering all such values across the entire model, while Algorithm 1 (Appendix L, lines 15–23, Stage 2) contains the inner loop restricted to l ∈ L (line 16). The spec follows Algorithm 1 as the more precise procedural definition — A is computed only over MA-formation layers.
+> **Note on §3.2.1 vs Algorithm 1:** The paper's §3.2.1 prose defines A as covering all such values across the entire model, while Algorithm 1 (Appendix L, lines 15–23, Stage 2) contains the inner loop restricted to l ∈ L (line 16). The spec follows Algorithm 1 as the more precise procedural definition — A is computed only over MA-formation layers. (see [D-SE-A](#12-known-deviations-from-papers))
 
 All three conditions are required simultaneously. The l ∈ L constraint is enforced implicitly by restricting A to MA-formation layers — only experts in those layers are candidates.
 
@@ -210,9 +210,9 @@ All three conditions are required simultaneously. The l ∈ L constraint is enfo
 
 **Calibration check:** For models where the paper has published the canonical SE set, the Phase C output should be verified against it as a model-specific regression check. For example, for Qwen3-30B-A3B the paper reports (Table 2): Layer 1 Expert 68, Layer 2 Expert 92, Layer 3 Expert 82. This is provided as a verification reference for that specific model checkpoint — it is not a hardcoded list and other models will produce different SE sets. A compliant implementation should reproduce the paper's canonical set on the paper's target model before being applied to new models.
 
-#### Phase D: CKA Similarity Matrices
+#### Phase D: CKA Distance Matrices
 
-For each MoE layer, compute the pairwise CKA (Centered Kernel Alignment) matrix `D^l ∈ ℝ^{N×N}` from the collected expert output representations. CKA measures functional similarity between experts based on their response patterns to actual inputs — two experts that produce similar outputs on the calibration data have high CKA, regardless of weight-space similarity.
+For each MoE layer, compute the pairwise CKA **distance** matrix `D^l ∈ ℝ^{N×N}` where `D^l_{ij} = 1 − CKA(f_i, f_j)` (distance, not raw similarity: 0 = identical, 1 = maximally different). CKA measures functional similarity between experts based on their response patterns to actual inputs — two experts that produce similar outputs on the calibration data have high CKA and thus low distance D^l_{ij}.
 
 Paper §3.2 explicitly allows "CKA, MSE, or other similarity measures" for D^l. CKA is the metric used by Zhang et al. (2025), cited in GRAPE §3.2 as the reference for intra-layer redundancy assessment.
 
@@ -223,19 +223,19 @@ With 256 samples × 2048 tokens ≈ 524K total token activations across the laye
 1. **Initialize** each expert as its own cluster. Compute per-layer redundancy `R^l = Σ_{i≠j} D^l_{ij}` (Eq. 11, sum form). Set entropy threshold `Ê = E_0 × (1 − γ)` (Eq. 10) where `E_0` is the initial cross-layer entropy and `γ=0.1` is project-chosen (see [D3](#12-known-deviations-from-papers); the paper gives no default).
 
 2. **Greedy loop** until total surviving experts ≤ `global_expert_budget`:
-   - If all layers frozen → **restart** (unfreeze all)
+   - If all layers frozen and budget not yet met → **restart** (unfreeze all; if budget already met, the outer loop exits normally)
    - Pick `l* = argmin R^l` among unfrozen layers above their floor (smallest total pairwise distance = most redundant layer; note: implementation uses a distance matrix, so argmin is correct — the GRAPE paper's `argmax` applies to similarity matrices)
    - Pick `(i*, j*) = argmin D^{l*}_{ij}` (most similar pair = smallest distance; same distance-vs-similarity inversion as layer selection above)
    - **Merge:** zero out `j*`'s row/column in `D^{l*}`, update `R^{l*}`
    - Decrement `cluster_counts[l*]`
    - If entropy drops below `Ê` → **freeze** layer `l*`
 
-3. **Floor constraint:** `min_experts_per_layer = num_routed_experts // 2` (= 128 for 256-expert layers). No early/late layer bonuses — the floor alone provides sufficient protection at 50% max removal per layer.
+3. **Floor constraint:** `min_experts_per_layer = num_routed_experts // 2` (= 128 for 256-expert layers). No early/late layer bonuses — the floor alone provides sufficient protection at 50% max removal per layer (see [D5](#12-known-deviations-from-papers)).
 
 ### Key Formulas
 
 ```
-R^l = Σ_{i≠j} D^l_{ij}                          (Eq. 11 — sum, not mean)
+R^l = Σ_{i≠j} D^l_{ij}                          (Eq. 11 — sum of off-diagonal distances; smaller R^l = more redundant layer)
 R̃^l = (R^l − min R) / (max R − min R)           (Eq. 3 — for logging only)
 Ê = E_0 × (1 − γ)                                (Eq. 10 — entropy threshold)
 E = −Σ_l (n_l / N_total) × log(n_l / N_total)   (cross-layer entropy)
@@ -247,7 +247,7 @@ Stage 1 is stateless (JSON-only output: blacklist + per-layer budgets). Re-runni
 
 ### Correctness Notes
 
-- The `R^l` update zeroes out the merged expert's *entire* row and column (not just the pair), preventing the absorbed expert from being re-selected in future iterations. The paper's pseudocode line 12 (`R^l ← R^l − 2·D[i*,j*]`) is consistent with the sum-over-`i≠j` form of `R^l` (the 2× accounts for both `D[i*,j*]` and `D[j*,i*]`), but it only adjusts the scalar `R^l` while leaving stale similarity entries in row/column `j*` that can mis-rank future merges. Zeroing the full row/column eliminates that staleness. See [D4](#12-known-deviations-from-papers).
+- The `R^l` update zeroes out the merged expert's *entire* row and column (not just the pair), preventing the absorbed expert from being re-selected in future iterations. The paper's pseudocode line 10 (`R^l ← R^l − 2·D[i*,j*]`) is consistent with the sum-over-`i≠j` form of `R^l` (the 2× accounts for both `D[i*,j*]` and `D[j*,i*]`), but it only adjusts the scalar `R^l` while leaving stale similarity entries in row/column `j*` that can mis-rank future merges. Zeroing the full row/column eliminates that staleness. See [D4](#12-known-deviations-from-papers).
 - If the budget cannot be reached (all layers hit their floors), a warning is logged but the pipeline continues with the achieved budget.
 
 ---
@@ -871,8 +871,9 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 
 | ID | Stage | Deviation | Paper Says | Implementation Does | Justification |
 |----|-------|-----------|-----------|-------------------|---------------|
+| D-SE-A | 1 | SE detection: A restricted to l∈L | 2507.23279 §3.2.1: "Let 𝒜 = {a_{l,e}} be the set of all such values across the entire model" — A covers all MoE layers | A is restricted to l ∈ L (MA-formation layers only) per Algorithm 1 Appendix L lines 15–23 | The paper's Algorithm 1 is the more precise procedural definition; restricting A to l∈L means P99.5 and a_max reflect only the MA-formation layer population, which the paper intended as the relevant reference distribution for SE thresholds |
 | D3 | 1 | γ entropy tolerance | 2604.06542 Eq. 10: γ∈[0,1], no default given | γ=0.1 (project-chosen, not from paper) | Paper leaves γ unspecified; 0.1 chosen empirically |
-| D4 | 1 | D^l update after merge | 2604.06542 Algorithm 1 lines 11–12: zero only pair entry D_{i*,j*} and D_{j*,i*}; update R^l ← R^l − 2·D_{i*,j*} | Zeros the absorbed expert's entire row and column in D^l; recomputes R^l from updated matrix | Prevents the absorbed expert from influencing future pair-selection; the paper's update assumes the merged expert cannot be re-selected, but only zeroing the pair entry leaves stale similarity values that can distort R^l and layer selection in subsequent iterations |
+| D4 | 1 | D^l update after merge | 2604.06542 Algorithm 1 lines 9–10: zero only pair entry D_{i*,j*} and D_{j*,i*} (line 9); update R^l ← R^l − 2·D_{i*,j*} (line 10) | Zeros the absorbed expert's entire row and column in D^l; recomputes R^l from updated matrix | Prevents the absorbed expert from influencing future pair-selection; the paper's update assumes the merged expert cannot be re-selected, but only zeroing the pair entry leaves stale similarity values that can distort R^l and layer selection in subsequent iterations |
 | D5 | 1 | Floor without layer bonuses | GRAPE has no floor constraints | min_experts_per_layer = num_routed_experts // 2 (=128); no early/late layer bonuses | 50% max removal per layer bounds the compression within the range where papers demonstrate results; bonuses removed — the floor alone is sufficient |
 | D5a | 2 | REAM merge-group cap | 2604.04356 §A.1: C=16 for Qwen3-30B at 25% reduction | `max_merge_group_size=8` (with budget-bump fallback if exceeded) | Conservative bound — caps any single centroid's absorption at half the paper's cap, keeping merge groups smaller and more homogeneous; the budget bump compensates for any blocked merges so the global expert target is still met |
 | D5b | 2 | Cost matrix choice for neuron permutation alignment in merge | 2604.04356 Eq. 6: frequency-weighted average with neuron permutation alignment (Ainsworth et al., 2023) w.r.t. the centroid expert; cost matrix C unspecified | Hungarian permutation `P_i` with cost matrix `C = C_wt + C_act` (gate+up Frobenius weight distance + per-neuron mean-activation L2 distance) | Paper prescribes permutation but leaves the cost form open. Spec uses `C_wt + C_act`: weight-space Frobenius distance captures structural similarity; activation-weighted neuron L2 distance captures functional importance. *TODO: Ablation of cost matrix choice (C_wt only vs. C_wt + C_act vs. activation-only) pending Stage 6 evals.* |
