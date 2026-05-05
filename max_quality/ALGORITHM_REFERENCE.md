@@ -252,6 +252,16 @@ Stage 1 is stateless (JSON-only output: blacklist + per-layer budgets). Re-runni
 - The `R^l` update zeroes out the merged expert's *entire* row and column (not just the pair), preventing the absorbed expert from being re-selected in future iterations. The paper's pseudocode line 10 (`R^l ← R^l − 2·D[i*,j*]`) is consistent with the sum-over-`i≠j` form of `R^l` (the 2× accounts for both `D[i*,j*]` and `D[j*,i*]`), but it only adjusts the scalar `R^l` while leaving stale similarity entries in row/column `j*` that can mis-rank future merges. Zeroing the full row/column eliminates that staleness. See [D4](#12-known-deviations-from-papers).
 - If the budget cannot be reached (all layers hit their floors), a warning is logged but the pipeline continues with the achieved budget.
 
+### Blacklist Output (`stage1_blacklist.json`)
+
+Stage 1 emits a blacklist consumed by Stage 2. It contains two categories of completely protected experts:
+
+1. **Super experts (SE)**: specific (layer, expert) index pairs identified by Phase C's three-way AND criterion. These are the only experts individually identified by Stage 1 and stored by name. Fewer than 0.5% of all routed experts for typical models.
+
+2. **Shared experts**: the model architecture's always-active `shared_expert` attribute present in each MoE layer. These are not routed experts and are never part of the GRAPE or REAM expert pools. Stage 2 excludes them implicitly by architecture (they live in a separate attribute in Qwen3) but must be tracked explicitly for any pipeline code that traverses expert weights.
+
+**What GRAPE contributes to Stage 2 is per-layer budgets (N'_l), not individual expert blacklists.** N'_l ≥ `min_experts_per_layer` (128) for every layer due to the floor constraint. Stage 2 uses N'_l as the target centroid count for REAM per layer; REAP scores then determine which N'_l routed non-blacklisted experts become centroids.
+
 ---
 
 ## 5. Stage 2 — REAP Scoring + REAM Pseudo-Pruning
@@ -282,7 +292,7 @@ This gives a ~2× wall-clock speedup over the naïve approach (running all 40 la
 
 The REAM cost matrix computation involves two pairwise similarity metrics across all experts in a layer (up to 256 experts). A future optimization replaces Python dicts with dense tensors for O(1) vectorized operations:
 
-- **Gate logit profiles** (`ReamCostAccumulator`): Instead of `dict[expert_id → dict[token_idx → float]]`, a pre-allocated `torch.Tensor(num_experts, total_calibration_tokens)` on CPU in float16 stores each expert's pre-softmax router logit for each calibration token. The full `[N_experts × N_experts]` δ_gate cosine-similarity matrix is computed in one `F.normalize` + `matmul` call (~milliseconds for 256×256) rather than O(N²) Python-level loops. **Memory note:** at the updated calibration size of 4000 × 2048 = 8.19M tokens with 256 experts, the logit tensor is 256 × 8.19M × 2 bytes ≈ 4.2 GB per layer in FP16 on host RAM. This is materially larger than the prior 1024-sequence budget (~1.1 GB). The H200's host RAM (512 GB) comfortably accommodates this; the tensor is allocated and freed per layer, not held across layers simultaneously.
+- **Gate logit profiles** (`ReamCostAccumulator`): Instead of `dict[expert_id → dict[token_idx → float]]`, a pre-allocated `torch.Tensor(num_experts, total_calibration_tokens)` on CPU in float16 stores each expert's pre-softmax router logit for each calibration token. The full `[N_experts × N_experts]` δ_gate similarity matrix is computed in one `F.normalize` + `matmul` call (~milliseconds for 256×256): normalize each row to unit length, compute the gram matrix (inner products = cosine similarities of unit vectors), convert to Euclidean distances via `d = sqrt(2 − 2·cos)`, then apply `dist2sim`. This replaces O(N²) Python-level loops. **Memory note:** at the updated calibration size of 4000 × 2048 = 8.19M tokens with 256 experts, the logit tensor is 256 × 8.19M × 2 bytes ≈ 4.2 GB per layer in FP16 on host RAM. This is materially larger than the prior 1024-sequence budget (~1.1 GB). The H200's host RAM (512 GB) comfortably accommodates this; the tensor is allocated and freed per layer, not held across layers simultaneously.
 
 - **Gated-output pairwise similarity** (`finalize_batch`): Per-batch pairwise cosine similarity of gated expert outputs is computed via a single batched `F.cosine_similarity` over the jointly-active token intersection per expert pair, accumulated incrementally as before but with vectorized inner loops.
 
@@ -290,9 +300,21 @@ These optimizations are purely implementation-level data-structure changes. The 
 
 **Per-layer merge execution (sequential — must see prior merges):**
 
+#### Blacklisted Expert Exclusion
+
+Before any REAP/REAM computation, two categories of experts are **completely excluded** from Stage 2 — they are not candidates for the centroid set and not candidates for the non-centroid set; their weights pass through Stage 2 unchanged:
+
+1. **Super experts (SE)**: the specific (layer, expert) pairs emitted by Stage 1 Phase C and stored in `stage1_blacklist.json`. Placing an SE in the centroid set would allow non-centroid weights to be merged into it, modifying the SE's weights — defeating the purpose of blacklisting.
+
+2. **Shared experts**: the model architecture's always-active `shared_expert` attribute (a separate weight tensor per MoE layer, distinct from the routed `experts` list). In the Qwen3 architecture the shared expert lives in a separate attribute and is never indexed as part of the routed pool; it is implicitly excluded by the reference implementation and must be explicitly excluded in any custom traversal.
+
+GRAPE outputs per-layer **budgets** (N'_l — how many routed experts to keep per layer), not individual expert blacklists. The floor constraint (min 128 per layer) is enforced on N'_l; REAM then selects which N'_l routed non-blacklisted experts become centroids via REAP score.
+
+All counts below (N'_l, feasibility checks, group sizes) refer to non-blacklisted routed experts only.
+
 #### Step 1: REAP Scoring (Paper 2510.13999, Eq. 9)
 
-> **Note on routing weight notation:** REAP (2510.13999) uses `g_j(x)` for the post-softmax routing weight, masked to zero for non-top-k experts. REAM (2604.04356) uses `σ(x)_j` for the full unmasked softmax (always positive). This spec uses `π(x)_j` as shorthand for the hard top-k masked version (not REAM's notation). In §5 below, `g_j(x)` follows REAP notation (masked, zero for non-active); the REAM Eq. 8 formula written with σ is interpreted using π(x)_j (hard top-k masked) rather than σ(x)_j; see the implementation note in Step 2 (δ̃_expert).
+> **Note on routing weight notation:** REAP (2510.13999) uses `g_j(x)` for the post-softmax routing weight, masked to zero for non-top-k experts. REAM (2604.04356) uses `σ(x)_j` for the **full unmasked softmax** (always strictly positive for every expert on every token). In §5 below, `g_j(x)` follows REAP notation (masked, zero for non-active); the REAM Eq. 8 formula uses `σ(x)_j` as the full unmasked softmax — confirmed by the reference implementation: `F.softmax(router_logits, dim=-1)` over all experts with no top-k masking (`ream/moe_utils.py` lines 157–158, 173–174).
 
 For each expert `j`, compute importance as the conditional average of gate-weighted output norm over active tokens:
 
@@ -304,21 +326,19 @@ where `X_j = {x | j ∈ TopK(σ(x))}`, `g_j(x)` is the post-softmax routing weig
 
 #### Step 2: REAM Cost Matrix (Paper 2604.04356, Eq. 5, 7, 8)
 
-**Activation-space distances** (NOT weight-space; lower = more similar):
+**Activation-space similarities** (NOT weight-space; higher = more similar; both components scaled to [0, 1]):
 
-- **δ_gate(i,j)** (Eq. 5): Distance derived from cosine similarity between **pre-softmax** router logit profile vectors: `(1 − cosine_sim) / 2 ∈ [0, 1]`. Each expert's profile is a vector indexed by global token position, containing the pre-softmax logit for that token (captured via `capture_router_outputs` pre-forward hook on the router module, which recomputes `F.linear(hidden, router.weight)`). Pre-softmax logits are used rather than post-softmax probabilities.
+- **δ_gate(i,j)** (Eq. 5): Similarity between **pre-softmax** router logit profile vectors. Each expert's profile is a vector of length |X| (one pre-softmax logit per calibration token). Profiles are **L2-row-normalized** (each expert's profile vector is unit-normalized), then pairwise Euclidean distances are computed; `dist2sim` converts to similarity by dividing by the matrix-wide maximum distance and subtracting from 1. δ_gate ∈ [0, 1]; higher = more similar. (Reference: `ream/ream.py` lines 37–41.)
 
-- **δ̃_expert(i,j)** (Eq. 8): Distance derived from per-token cosine similarity of gated expert outputs `σ(x)_e · E_e(x)`: `(1 − mean_cosine_sim) / 2 ∈ [0, 1]`. REAM Eq. 8 is written with the full unmasked softmax σ (strictly positive for all experts). The implementation uses the hard top-k masked version π(x), treating non-active experts as exact zeros. This is a deliberate implementation choice; the implementation must guard against undefined cosine similarity for zero-vector pairs (e.g., treating `sim(0, v) = 0`). The denominator is |X| not the jointly-active count — matching paper Eq. 8. Accumulated incrementally per batch via `finalize_batch` in `activation_hooks.py`.
+- **δ̃_expert(i,j)** (Eq. 8): `(1/|X|) Σ_{x∈X} sim(σ(x)_i · E_i(x), σ(x)_j · E_j(x))` — mean per-token cosine similarity of the two experts' **full-softmax-gated** outputs (`σ(x)_i` is the full unmasked softmax weight), averaged over all |X| calibration tokens (not just jointly-active tokens). The raw cosine similarity ∈ [−1, 1] is **rescaled to [0, 1]** as `(cosine_sim + 1) / 2`. δ̃_expert ∈ [0, 1]; higher = more similar. (Reference: `ream/ream.py` lines 99–113, `moe_utils.py` lines 157–158, 173–174.) **Sparse-routing note:** In sparse top-k routing, experts are only dispatched on their top-k tokens. For jointly-active tokens, the top-k routing weight equals the full-softmax weight σ(x)_e. Non-jointly-active tokens contribute zero to the numerator (expert output not computed); they still appear in the denominator |X|. This is a faithful implementation of Eq. 8 under sparse routing, not a deviation.
 
-- **δ_REAM(i,j) = δ_gate(i,j) + δ̃_expert(i,j)** (Eq. 7): Unweighted sum (paper uses equal weight 1.0). δ_REAM ∈ [0, 2] with **lower = more similar** — the greedy assignment selects the non-centroid with the **lowest** δ_REAM.
+- **δ_REAM(i,j) = (δ_gate(i,j) + δ̃_expert(i,j)) / 2**: Equal-weight average of gate and expert similarities; both components already in [0, 1]. δ_REAM ∈ [0, 1]; **higher = more similar**. The working distance is `cost(i,j) = 1 − δ_REAM(i,j) ∈ [0, 1]`; lower cost = more similar — the greedy assignment selects non-centroids with the **lowest cost**. (Reference: `ream/ream.py` lines 46–53.)
 
 #### Step 3: Greedy Pseudo-Pruning Assignment (Paper §4)
 
-Top-N'_l experts by REAP score become **centroids** (protected from removal). Non-centroids are assigned to centroids via **greedy pseudo-pruning**:
+**Feasibility check:** Before the greedy pass, validate that `N'_l × max_merge_group_size ≥ N_l` (where N_l is the total number of non-blacklisted routed experts in the layer, N'_l is the centroid count). If this is violated, bump `effective_target` by 1 (or by `ceil(effective_target × cost_bump_ratio)` whichever is larger) and retry. If `effective_target` reaches `n_experts` without achieving feasibility, fall back to zero-merge: keep all non-protected experts as centroids (no merges performed for this layer). This guarantees no expert weights are lost at the cost of not meeting the compression target. (Reference: `ream/ream.py` lines 60–62.)
 
-1. Iterate centroids in descending saliency order
-2. For each centroid, absorb the most similar (lowest δ_REAM) unassigned non-centroid, up to `max_merge_group_size` non-centroids per centroid
-3. Iterate all centroids once; centroids that receive no non-centroid assignments form singleton groups and pass through unchanged; non-centroids that are not assigned to any centroid are removed from the gate weight matrix (REAM §4)
+Top-N'_l experts by REAP score become **centroids**. Non-centroids are assigned to centroids via a **single-pass greedy algorithm**: iterate centroids in **descending saliency order** (most salient centroid first — order is important); for each centroid, absorb up to `max_merge_group_size` unassigned non-centroids with the **lowest cost** (most similar), in order. The loop exits early once all non-centroids are assigned. **Every non-centroid is guaranteed to be assigned** — the feasibility check ensures full coverage. (Reference: `ream/ream.py` lines 63–87.)
 
 #### Step 4: Frequency-Weighted Merge (Paper Eq. 6)
 
@@ -330,7 +350,7 @@ where the denominator `Σ_j freq_j` sums over merge group members only (not all 
 
 #### Step 5: Router Resize
 
-Remove merged experts' rows from `gate.weight`. Update `num_experts` on the MoE block.
+Remove merged non-centroid experts' rows from `gate.weight`. Update `num_experts` on the MoE block. Blacklisted experts' rows (super experts, shared experts) are **not removed** — they remain in the router and expert list unchanged.
 
 ### Covariance Side-Collection
 
@@ -343,7 +363,7 @@ Stored in `_stage2_input_covariance.pt` (fp32 storage; Swift-SVD paper 2604.0160
 ### Budget Bump Loop
 
 Two safety gates can raise the effective target if merge quality is poor:
-- **`max_merge_group_size=8`**: If any group exceeds this, bump target. The REAM paper uses C=16 for Qwen3-30B at 25% reduction (128→96 experts) and C=32 for 50% reduction (128→64 experts) — suggesting C scales with compression depth rather than pool size; C=8 is deliberately conservative (see D5a). The budget-bump fallback ensures the global expert target is still met.
+- **`max_merge_group_size=8`**: If any group exceeds this, bump target. The REAM paper uses C=16 at 25% reduction (128→96 experts) and C=32 at 50% reduction (128→64 experts) on a 128-expert pool — in both cases C is far larger than the average absorption per centroid. Our pipeline targets ~30% expert reduction on a 256-expert pool; at the floor budget (256→128), each centroid absorbs an average of 1.0 non-centroid, so C=8 provides 8× headroom above the average. The budget-bump fallback catches any groups that do exceed the cap.
 - **`ream_cost_sigma_threshold=1.5`**: If mean cost exceeds `running_mean × (1 + 1.5)`, bump target (inactive for first 4 layers)
 
 ### Resume
@@ -875,7 +895,6 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 | D3 | 1 | γ entropy tolerance | 2604.06542 Eq. 10: γ∈[0,1], no default given | γ=0.1 (project-chosen, not from paper) | Paper leaves γ unspecified; 0.1 chosen empirically |
 | D4 | 1 | D^l update after merge | 2604.06542 Algorithm 1 lines 9–10: zero only pair entry D_{i*,j*} and D_{j*,i*} (line 9); update R^l ← R^l − 2·D_{i*,j*} (line 10) | Zeros the absorbed expert's entire row and column in D^l; recomputes R^l from updated matrix | Prevents the absorbed expert from influencing future pair-selection; the paper's update assumes the merged expert cannot be re-selected, but only zeroing the pair entry leaves stale similarity values that can distort R^l and layer selection in subsequent iterations |
 | D5 | 1 | Floor without layer bonuses | GRAPE has no floor constraints | min_experts_per_layer = num_routed_experts // 2 (=128); no early/late layer bonuses | 50% max removal per layer bounds the compression within the range where papers demonstrate results; bonuses removed — the floor alone is sufficient |
-| D5a | 2 | REAM merge-group cap | 2604.04356 §A.1: C=16 for Qwen3-30B at 25% reduction | `max_merge_group_size=8` (with budget-bump fallback if exceeded) | Conservative bound — caps any single centroid's absorption at half the paper's cap, keeping merge groups smaller and more homogeneous; the budget bump compensates for any blocked merges so the global expert target is still met |
 | D5b | 2 | Cost matrix choice for neuron permutation alignment in merge | 2604.04356 Eq. 6: frequency-weighted average with neuron permutation alignment (Ainsworth et al., 2023) w.r.t. the centroid expert; cost matrix C unspecified | Hungarian permutation `P_i` with cost matrix `C = C_wt + C_act` (gate+up Frobenius weight distance + per-neuron mean-activation L2 distance) | Paper prescribes permutation but leaves the cost form open. Spec uses `C_wt + C_act`: weight-space Frobenius distance captures structural similarity; activation-weighted neuron L2 distance captures functional importance. *TODO: Ablation of cost matrix choice (C_wt only vs. C_wt + C_act vs. activation-only) pending Stage 6 evals.* |
 | D-protocol-blend | 2.5 | Protocol combination: REAM + Router KD in sequence | 2604.04356 (REAM): explicitly evaluates "without any fine-tuning after compression"; 2603.02217 (Router KD): designed as a standalone step, not as a post-REAM patch | Spec applies Router KD (Stage 2.5) immediately after the REAM merge | Router KD restores routing accuracy degraded by weight averaging; REAM's static evaluation does not cover post-merge routing drift. Combined protocol not ablated against REAM-static-only baseline: empirical_pending |
 | D6 | 3 | AA-SVD cross-covariance scope | 2604.02119 Theorem 3.2 requires cross-covariance for all linear layers | Cross-covariance C collected for gate_proj/up_proj (input-side) via dual-forward; down_proj falls back to Corollary 3.3 (B-only) because the teacher's per-expert intermediate activations require full expert dispatch instrumentation | Gate/up inputs share the same hidden state (pre-routing) so one capture covers both; down_proj inputs are expert-internal (post gate+up) and differ between teacher and student expert sets |
