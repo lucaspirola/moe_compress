@@ -38,7 +38,8 @@ from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 
-_MA_RATIO = 100.0  # max / quantile(0.99) threshold for MA pattern detection
+_MA_RATIO = 100.0        # max / Q99 threshold — absolute outlier check for first MoE layer
+_MA_GROWTH_RATIO = 5.0   # max|H_l| / max|H_{l-1}| threshold — growth check for subsequent layers
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +83,7 @@ def run(
             )
 
     ma_ratio = float(se_cfg.get("ma_ratio", _MA_RATIO))
+    ma_growth_ratio = float(se_cfg.get("ma_growth_ratio", _MA_GROWTH_RATIO))
     a_max_fraction = float(se_cfg.get("a_max_fraction", 0.1))
 
     spec = spec_from_config(
@@ -103,7 +105,7 @@ def run(
         "Stage 1 Phase A: detecting MA-formation layers over %d samples (%d MoE layers)",
         n_batches, len(moe_layers),
     )
-    L = _detect_ma_layers(model, batches, moe_layers, device, ma_ratio=ma_ratio)
+    L = _detect_ma_layers(model, batches, moe_layers, device, ma_ratio=ma_ratio, ma_growth_ratio=ma_growth_ratio)
     log.info("Stage 1 Phase A: MA-formation layers L = %s", sorted(L))
 
     # ------------------------------------------------------------------
@@ -290,26 +292,41 @@ def _detect_ma_layers(
     device,
     *,
     ma_ratio: float = _MA_RATIO,
+    ma_growth_ratio: float = _MA_GROWTH_RATIO,
 ) -> set[int]:
-    """Forward pass 1: identify decoder layers that form massive activations.
+    """Forward pass 1: identify decoder layers that form (amplify) massive activations.
 
-    A layer l is in L if, for any batch, max|H_l(x)| > ma_ratio * quantile(|H_l(x)|, 0.99).
-    H_l(x) is the post-MoE block output (i.e., the decoder layer's output tensor).
+    Uses a hybrid check to distinguish formation from propagation:
+    - First MoE layer: absolute outlier check — add to L if max|H_l| > ma_ratio × Q99(|H_l|).
+    - Subsequent layers: growth check — add to L if max|H_l| / max|H_{l-1}| > ma_growth_ratio.
+
+    MAs propagate stably through residuals after they form; the old absolute check would
+    flag all post-formation layers. The growth check flags only amplification events.
+    Both maxima are tracked across all calibration batches (MAs are input-stable per the paper).
     """
-    L: set[int] = set()
+    sorted_layer_indices = sorted(ref.layer_idx for ref in moe_layers)
+    if not sorted_layer_indices:
+        return set()
+    first_layer_idx = sorted_layer_indices[0]
+
     moe_layer_modules = {ref.layer_module: ref.layer_idx for ref in moe_layers}
+    layer_max: dict[int, float] = {idx: 0.0 for idx in sorted_layer_indices}
+    layer_q99: dict[int, float] = {idx: 0.0 for idx in sorted_layer_indices}
     handles: list = []
 
     def _make_hook(layer_idx: int):
         def _hook(_module, _input, output):
-            # output may be a tuple (hidden, ...) or just the hidden tensor
             h = output[0] if isinstance(output, tuple) else output
             if not isinstance(h, torch.Tensor):
                 return
             h_abs = h.detach().abs().float()
-            q99 = torch.quantile(h_abs.flatten(), 0.99).item()
-            if q99 > 0 and h_abs.max().item() > ma_ratio * q99:
-                L.add(layer_idx)
+            curr_max = h_abs.max().item()
+            if curr_max > layer_max[layer_idx]:
+                layer_max[layer_idx] = curr_max
+            if layer_idx == first_layer_idx:
+                curr_q99 = torch.quantile(h_abs.flatten(), 0.99).item()
+                if curr_q99 > layer_q99[layer_idx]:
+                    layer_q99[layer_idx] = curr_q99
         return _hook
 
     for module, layer_idx in moe_layer_modules.items():
@@ -321,6 +338,17 @@ def _detect_ma_layers(
     finally:
         for h in handles:
             h.remove()
+
+    L: set[int] = set()
+    for i, layer_idx in enumerate(sorted_layer_indices):
+        if i == 0:
+            q99 = layer_q99[layer_idx]
+            if q99 > 0 and layer_max[layer_idx] > ma_ratio * q99:
+                L.add(layer_idx)
+        else:
+            prev_max = layer_max[sorted_layer_indices[i - 1]]
+            if prev_max > 0 and layer_max[layer_idx] / prev_max > ma_growth_ratio:
+                L.add(layer_idx)
 
     return L
 
