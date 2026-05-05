@@ -227,6 +227,8 @@ With 256 samples × 2048 tokens ≈ 524K total token activations across the laye
 
 #### Phase E: GRAPE Algorithm 1 (entropy-aware greedy merge with restart)
 
+**SE blacklist interaction:** Before the greedy loop, each SE's row and column in `D^l` are zeroed so SEs never participate in pair selection and their distances do not contribute to `R^l`. SE cluster slots are subtracted from both `cluster_counts` and the global budget (`effective_budget = global_budget − total_SEs`), so the loop terminates when the non-SE surviving count meets the non-SE budget. The floor is also applied to the non-SE pool only: `floor_l = max(min_experts − |SE_l|, 0)`.
+
 1. **Initialize** each expert as its own cluster. Compute per-layer redundancy `R^l = Σ_{i≠j} D^l_{ij}` (Eq. 11, sum form). Set entropy threshold `Ê = E_0 × (1 − γ)` (Eq. 10) where `E_0` is the initial cross-layer entropy and `γ=0.1` is project-chosen (see [D3](#12-known-deviations-from-papers); the paper gives no default).
 
 2. **Greedy loop** until total surviving experts ≤ `global_expert_budget`:
@@ -237,7 +239,7 @@ With 256 samples × 2048 tokens ≈ 524K total token activations across the laye
    - Decrement `cluster_counts[l*]`
    - If entropy drops below `Ê` → **freeze** layer `l*`
 
-3. **Floor constraint:** `min_experts_per_layer = num_routed_experts // 2` (= 128 for 256-expert layers). No early/late layer bonuses — the floor alone provides sufficient protection at 50% max removal per layer (see [D5](#12-known-deviations-from-papers)).
+3. **Floor constraint:** `min_experts_per_layer = num_routed_experts // 2` (= 128 for 256-expert layers). Applied to the non-SE pool per layer. No early/late layer bonuses — the floor alone provides sufficient protection at 50% max removal per layer (see [D5](#12-known-deviations-from-papers)).
 
 ### Key Formulas
 
