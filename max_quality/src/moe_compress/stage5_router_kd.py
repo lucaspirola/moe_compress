@@ -185,6 +185,13 @@ def run(
 
     _freeze_non_routers(student, s5["trainable_name_patterns"])
 
+    # Optimizer constructed AFTER freezing so it only receives parameters that
+    # have requires_grad=True at construction time.
+    optim = torch.optim.AdamW(
+        [p for p in student.parameters() if p.requires_grad],
+        lr=s5["learning_rate"],
+    )
+
     spec = spec_from_config(
         cal,
         num_sequences_override=s5["max_calibration_samples"],
@@ -195,11 +202,6 @@ def run(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache"
     )
     batches = iter_batches(calib, batch_size=s5["batch_size"])
-
-    optim = torch.optim.AdamW(
-        [p for p in student.parameters() if p.requires_grad],
-        lr=s5["learning_rate"],
-    )
     grad_accum = s5["gradient_accumulation"]
     T = s5["kd_temperature"]
     ckpt_every = int(s5.get("checkpoint_every_n_steps", 100))
@@ -292,7 +294,9 @@ def run(
             continue
         for i, batch in enumerate(batches):
             # Fast-forward: skip batches already processed in the resumed run.
-            if epoch == resume_epoch and i <= resume_batch_i:
+            # resume_batch_i was already processed (checkpoint saved after it),
+            # so skip 0..(resume_batch_i-1) and re-process from resume_batch_i.
+            if epoch == resume_epoch and i < resume_batch_i:
                 continue
 
             if device is not None:
@@ -314,6 +318,7 @@ def run(
                 with torch.no_grad():
                     teacher_out = _get_teacher(len(student_refs))(input_ids=batch)
                 teacher_vocab_logits = teacher_out.logits.to(torch.float32)  # [B, L, |V|]
+                del teacher_out  # free the full output object before student backward pass
 
             # Student: full forward pass with gradients (routers are trainable).
             student_out = student(input_ids=batch)
@@ -334,16 +339,17 @@ def run(
 
             if (i + 1) % grad_accum == 0:
                 # Pre-step: compute gradient norm over trainable params.
-                grad_sq = 0.0
-                for p in student.parameters():
-                    if p.requires_grad and p.grad is not None:
-                        grad_sq += float(p.grad.detach().norm().item() ** 2)
-                grad_norm = grad_sq ** 0.5
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in student.parameters() if p.requires_grad and p.grad is not None],
+                        float('inf'),
+                    )
+                )
                 optim.step()
                 optim.zero_grad()
                 step += 1
                 if step % config["logging"]["log_every_n_steps"] == 0:
-                    loss_val = float(loss.item())
+                    loss_val = float(loss.item())  # per-batch loss; effective gradient = loss / grad_accum
                     log.info(
                         "  epoch=%d step=%d loss=%.6f grad_norm=%.4f",
                         epoch, step, loss_val, grad_norm,
@@ -368,6 +374,12 @@ def run(
                     )
                     for old_ckpt in all_ckpts[:-2]:
                         old_ckpt.unlink(missing_ok=True)
+        trailing = len(batches) % grad_accum if grad_accum > 1 else 0
+        if trailing:
+            log.debug(
+                "Epoch %d: %d trailing batch(es) not stepped (grad_accum=%d)",
+                epoch, trailing, grad_accum,
+            )
         optim.zero_grad()
 
     out_dir = artifacts_dir / f"{stage_key}_final"
