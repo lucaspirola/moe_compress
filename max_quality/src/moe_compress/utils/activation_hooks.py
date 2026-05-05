@@ -143,6 +143,17 @@ class ReamCostAccumulator:
         for idx, t in enumerate(indices):
             prof[t] = gated[idx]
 
+    def record_batch_token_count(self, layer_idx: int, n_tokens: int) -> None:
+        """Record the exact number of tokens in a batch for the Eq. 8 denominator.
+
+        Must be called from the _profile_layer loop immediately after
+        ream_acc.finalize_batch(...). This gives an exact |X| denominator
+        independent of routing activity (fixes the edge case where an entire
+        batch has no active expert, which would cause finalize_batch to miss
+        those tokens in the union-of-sets count).
+        """
+        self._total_tokens_by_layer[layer_idx] += n_tokens
+
     def finalize_batch(self, layer_idx: int, num_experts: int) -> None:
         """After a full forward pass through the layer, compute pairwise cosine
         similarities over jointly-active tokens (paper Eq. 8 exact formulation).
@@ -151,6 +162,10 @@ class ReamCostAccumulator:
         were active in this batch, computes per-token cosine similarity on the
         gated outputs, and averages. This is O(E² × |intersection|) per batch,
         where |intersection| ≈ (top_k/E)² × T is typically very small.
+
+        Note: token counting for the Eq. 8 denominator is handled by
+        record_batch_token_count(), called from the _profile_layer loop with
+        the exact batch token count (batch.shape[0] * batch.shape[1]).
         """
         # Collect per-expert {global_token_idx → gated_output} for this batch.
         per_expert: dict[int, dict[int, torch.Tensor]] = {}
@@ -167,14 +182,6 @@ class ReamCostAccumulator:
 
         # Build per-expert token sets for fast intersection.
         token_sets: dict[int, set[int]] = {e: set(per_expert[e].keys()) for e in expert_ids}
-
-        # Accumulate total tokens seen for this layer (spec Eq. 8 denominator = |X|).
-        # Every token routes through this layer, so total unique tokens = union of all
-        # per-expert active sets (since every token activates exactly top_k experts).
-        all_batch_tokens: set[int] = set()
-        for e in expert_ids:
-            all_batch_tokens |= token_sets[e]
-        self._total_tokens_by_layer[layer_idx] += len(all_batch_tokens)
 
         if len(expert_ids) < 2:
             return
@@ -197,41 +204,88 @@ class ReamCostAccumulator:
                 self.gated_output_sim[k1] += sim_sum
                 self.gated_output_sim[k2] += sim_sum
 
-    def compute_delta_gate(self, layer_idx: int, expert_i: int, expert_j: int) -> float:
-        """δ_gate(i,j) per REAM Eq. 5: cosine sim between pre-softmax gate
-        logit profile vectors.
+    def compute_gate_similarity_matrix(
+        self, layer_idx: int, expert_ids: list[int],
+    ) -> torch.Tensor:
+        """δ_gate similarity matrix per REAM Eq. 5, using the observed-max dist2sim.
 
-        Both vectors are indexed by the same global token positions (union of
-        ALL calibration tokens — every token has a logit for every expert).
+        Builds the (len(expert_ids), |X|) gate logit profile matrix, L2-row-
+        normalizes each expert's row, computes full pairwise Euclidean distances,
+        and converts via `dist2sim = 1 - d / d.max()` — dividing by the
+        **observed** maximum across the full N×N pairwise distance matrix, matching
+        the reference implementation (ream/ream.py lines 37-41).
+
+        Args:
+            layer_idx: MoE layer index.
+            expert_ids: ordered list of expert indices to include.
+
+        Returns:
+            Float32 tensor of shape (len(expert_ids), len(expert_ids)) where
+            entry [i, j] = δ_gate similarity ∈ [0, 1] for expert_ids[i] vs
+            expert_ids[j]. Returns an all-zeros tensor if any expert has no
+            profile data (no batches were processed).
         """
-        prof_i = self.gate_logit_profiles.get(layer_idx, {}).get(expert_i, {})
-        prof_j = self.gate_logit_profiles.get(layer_idx, {}).get(expert_j, {})
-        if not prof_i and not prof_j:
-            return 1.0  # max distance if no data
-        all_tokens = sorted(set(prof_i.keys()) | set(prof_j.keys()))
+        n = len(expert_ids)
+        if n == 0:
+            return torch.zeros(0, 0, dtype=torch.float32)
+
+        layer_profiles = self.gate_logit_profiles.get(layer_idx, {})
+
+        # Collect all token indices across all requested experts.
+        all_tokens = sorted(
+            set().union(*[layer_profiles[e].keys() for e in expert_ids if e in layer_profiles])
+        )
         if not all_tokens:
-            return 1.0
-        vi = torch.tensor([prof_i.get(t, 0.0) for t in all_tokens], dtype=torch.float32)
-        vj = torch.tensor([prof_j.get(t, 0.0) for t in all_tokens], dtype=torch.float32)
-        # Guard against zero vectors (expert never activated).
-        if vi.norm() < 1e-12 or vj.norm() < 1e-12:
-            return 1.0
-        sim = float(F.cosine_similarity(vi.unsqueeze(0), vj.unsqueeze(0)).item())
-        return (1.0 - sim) / 2.0  # normalize to [0, 1]
+            # No data at all — min similarity (0.0) for every pair.
+            return torch.zeros(n, n, dtype=torch.float32)
+
+        T = len(all_tokens)
+        token_to_col = {t: c for c, t in enumerate(all_tokens)}
+
+        # Build (n, T) matrix; missing token entries default to 0.0.
+        mat = torch.zeros(n, T, dtype=torch.float32)
+        for row, e in enumerate(expert_ids):
+            prof = layer_profiles.get(e, {})
+            if not prof:
+                # Expert has no profile — row stays zero; will get min similarity.
+                continue
+            for t, val in prof.items():
+                c = token_to_col.get(t)
+                if c is not None:
+                    mat[row, c] = val
+
+        # L2-row-normalize each expert's profile vector.
+        mat = F.normalize(mat, p=2, dim=1)  # (n, T)
+
+        # Full pairwise Euclidean distances → (n, n).
+        d = torch.cdist(mat, mat, p=2)  # (n, n)
+
+        # dist2sim: 1 - d / d.max() (observed-max normalization, matching reference).
+        # Clamp denominator to avoid division by zero when all profiles are identical.
+        sim = 1.0 - d / d.max().clamp(min=1e-12)
+
+        return sim.to(torch.float32)
 
     def compute_delta_expert(self, layer_idx: int, expert_i: int, expert_j: int) -> float:
-        """δ̃_E(i,j) per REAM Eq. 8: mean cosine sim of gated expert outputs.
+        """δ̃_expert(i,j) per REAM Eq. 8: mean cosine similarity of gated outputs.
 
         Denominator is |X| (total calibration tokens), NOT jointly-active count.
-        Gate weights suppress non-active tokens to ~0, so their cosine similarity
-        contribution is ~0 — only jointly-active tokens contribute to the numerator.
+        Returns similarity ∈ [0, 1] via (avg_cosine + 1) / 2.
+        Reference: ream/ream.py lines 99-113.
+
+        Sparse-routing approximation: In sparse top-k routing, experts are only
+        dispatched on their top-k tokens. For jointly-active tokens, the top-k
+        routing weight equals the full-softmax weight σ(x)_e. Non-jointly-active
+        tokens contribute zero to the numerator (expert output not computed); they
+        still appear in the denominator |X| (via record_batch_token_count). This
+        is a faithful implementation of Eq. 8 under sparse routing, not a deviation.
         """
         key = (layer_idx, expert_i, expert_j)
         total = self._total_tokens_by_layer.get(layer_idx, 0)
         if total == 0:
-            return 1.0  # max distance
+            return 0.0  # min similarity
         avg_sim = self.gated_output_sim.get(key, 0.0) / total
-        return (1.0 - avg_sim) / 2.0  # normalize to [0, 1]
+        return (avg_sim + 1.0) / 2.0  # rescale cosine ∈ [-1, 1] → similarity ∈ [0, 1]
 
     def record_neuron_activations(
         self, layer_idx: int, expert_idx: int, intermediate: torch.Tensor,
