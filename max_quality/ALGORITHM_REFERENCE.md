@@ -304,20 +304,20 @@ where `X_j = {x | j ∈ TopK(σ(x))}`, `g_j(x)` is the post-softmax routing weig
 
 #### Step 2: REAM Cost Matrix (Paper 2604.04356, Eq. 5, 7, 8)
 
-**Activation-space similarities** (NOT weight-space):
+**Activation-space distances** (NOT weight-space; lower = more similar):
 
-- **δ_gate(i,j)** (Eq. 5): Cosine similarity between **pre-softmax** router logit profile vectors. Each expert's profile is a vector indexed by global token position, containing the pre-softmax logit for that token (captured via `capture_router_outputs` pre-forward hook on the router module, which recomputes `F.linear(hidden, router.weight)`). Pre-softmax logits are used rather than post-softmax probabilities.
+- **δ_gate(i,j)** (Eq. 5): Distance derived from cosine similarity between **pre-softmax** router logit profile vectors: `(1 − cosine_sim) / 2 ∈ [0, 1]`. Each expert's profile is a vector indexed by global token position, containing the pre-softmax logit for that token (captured via `capture_router_outputs` pre-forward hook on the router module, which recomputes `F.linear(hidden, router.weight)`). Pre-softmax logits are used rather than post-softmax probabilities.
 
-- **δ̃_expert(i,j)** (Eq. 8): Per-token cosine similarity of gated expert outputs `σ(x)_e · E_e(x)`, averaged over the full calibration set X. REAM Eq. 8 is written with the full unmasked softmax σ (strictly positive for all experts). The implementation uses the hard top-k masked version π(x), treating non-active experts as exact zeros. This is a deliberate implementation choice; the implementation must guard against undefined cosine similarity for zero-vector pairs (e.g., treating `sim(0, v) = 0`). The denominator is |X| not the jointly-active count — matching paper Eq. 8. Accumulated incrementally per batch via `finalize_batch` in `activation_hooks.py`.
+- **δ̃_expert(i,j)** (Eq. 8): Distance derived from per-token cosine similarity of gated expert outputs `σ(x)_e · E_e(x)`: `(1 − mean_cosine_sim) / 2 ∈ [0, 1]`. REAM Eq. 8 is written with the full unmasked softmax σ (strictly positive for all experts). The implementation uses the hard top-k masked version π(x), treating non-active experts as exact zeros. This is a deliberate implementation choice; the implementation must guard against undefined cosine similarity for zero-vector pairs (e.g., treating `sim(0, v) = 0`). The denominator is |X| not the jointly-active count — matching paper Eq. 8. Accumulated incrementally per batch via `finalize_batch` in `activation_hooks.py`.
 
-- **δ_REAM(i,j) = δ_gate(i,j) + δ̃_expert(i,j)** (Eq. 7): Unweighted sum (paper uses equal weight 1.0).
+- **δ_REAM(i,j) = δ_gate(i,j) + δ̃_expert(i,j)** (Eq. 7): Unweighted sum (paper uses equal weight 1.0). δ_REAM ∈ [0, 2] with **lower = more similar** — the greedy assignment selects the non-centroid with the **lowest** δ_REAM.
 
 #### Step 3: Greedy Pseudo-Pruning Assignment (Paper §4)
 
 Top-N'_l experts by REAP score become **centroids** (protected from removal). Non-centroids are assigned to centroids via **greedy pseudo-pruning**:
 
 1. Iterate centroids in descending saliency order
-2. For each centroid, absorb the most similar (highest δ_REAM) unassigned non-centroid, up to `max_merge_group_size` non-centroids per centroid
+2. For each centroid, absorb the most similar (lowest δ_REAM) unassigned non-centroid, up to `max_merge_group_size` non-centroids per centroid
 3. Iterate all centroids once; centroids that receive no non-centroid assignments form singleton groups and pass through unchanged; non-centroids that are not assigned to any centroid are removed from the gate weight matrix (REAM §4)
 
 #### Step 4: Frequency-Weighted Merge (Paper Eq. 6)
@@ -832,13 +832,11 @@ Each heavy stage (2–5) uploads its checkpoint to a per-stage Hub repo immediat
 
 All partial checkpoint files are written via a durable atomic write sequence:
 1. Write data to `<path>.tmp`
-2. `fsync(<path>.tmp)` — flushes file data and metadata to storage
-3. `fsync(parent_dir)` — ensures the `.tmp` file's directory entry is durable
-4. `os.replace(<path>.tmp, <path>)` — atomic rename on POSIX
+2. `fsync(<path>.tmp)` — flush file data to storage
+3. `os.replace(<path>.tmp, <path>)` — atomic rename on POSIX
+4. `fsync(parent_dir)` — make the new directory entry durable (survives power loss after rename)
 
-This sequence survives SIGKILL, training-framework timeout, kernel panic, and power loss. A crash at any point before step 4 completes leaves at most a `.tmp` file, never a truncated or partially-visible final file. Dangling `.tmp` files are cleaned up at stage startup.
-
-> **Implementation follow-up:** The current code performs `.tmp` → `os.replace` without the two `fsync` calls. Replace the write helper at `checkpoint_utils.py` (or equivalent) with the above 4-step sequence to bring the implementation in line with this spec.
+This sequence survives SIGKILL, training-framework timeout, kernel panic, and power loss. A crash at any point before step 3 completes leaves at most a `.tmp` file, never a truncated or partially-visible final file. A crash between steps 3 and 4 may lose the rename on some POSIX filesystems, but step 4 is a best-effort durability seal — the file is never corrupted. Dangling `.tmp` files are cleaned up at stage startup.
 
 **`--no-resume` flag:** When passed to `run_pipeline.py`, disables all within-stage resume behaviour. Each stage runs unconditionally from scratch with no partial-file I/O. Stage 1 and Stage 6 are unaffected (they have no resume files).
 
