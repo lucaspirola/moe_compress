@@ -21,8 +21,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
-from dataclasses import dataclass, field
+import dataclasses
+from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 
 import torch
@@ -238,18 +240,10 @@ def build_super_expert_slice(
             f"spec.num_sequences={spec.num_sequences}"
         )
     # validation delegated to build_calibration_tensor.
-    small_spec = CalibrationSpec(
+    small_spec = _dc_replace(
+        spec,
         num_sequences=num_samples,
-        sequence_length=spec.sequence_length,
         seed=(spec.seed + 1) % (2**32),
-        source=spec.source,
-        dataset=spec.dataset,
-        subset_weights=spec.subset_weights,
-        domain_mix=spec.domain_mix,
-        c4_dataset=spec.c4_dataset,
-        c4_subset=spec.c4_subset,
-        math_dataset=spec.math_dataset,
-        code_dataset=spec.code_dataset,
     )
     return build_calibration_tensor(tokenizer, small_spec, cache_dir=cache_dir)
 
@@ -306,7 +300,7 @@ def spec_from_config(
         # "dataset" and "subset_weights" are required keys for this source;
         # raise a descriptive error rather than a bare KeyError if absent.
         try:
-            dataset = cal_cfg["dataset"]
+            dataset = str(cal_cfg["dataset"]).strip()
             subset_weights = dict(cal_cfg["subset_weights"])
         except KeyError as exc:
             raise KeyError(
@@ -401,7 +395,7 @@ def _distribute_counts(total: int, weights: dict[str, float]) -> dict[str, int]:
     if weight_sum <= 0:
         raise ValueError("all subset weights are zero — cannot distribute sequences")
     raw = {k: (v / weight_sum) * total for k, v in weights.items()}
-    out = {k: int(v) for k, v in raw.items()}
+    out = {k: math.floor(v) for k, v in raw.items()}
     remainder = total - sum(out.values())
     # remainder can be negative if float arithmetic causes sum(raw) to slightly
     # exceed total; handle both directions so sum(out.values()) == total exactly.
