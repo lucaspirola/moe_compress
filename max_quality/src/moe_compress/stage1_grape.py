@@ -744,8 +744,8 @@ def _grape_greedy_merge(
     floor_blocked: set[int] = {li for li in sorted_layers if cluster_counts[li] <= floors[li]}
     current_total = sum(cluster_counts.values())
 
-    log.info("GRAPE: global_budget=%d (non-bl effective=%d), current_total=%d, gamma=%.4g, E_hat=%.4f, floor=%d",
-             global_budget, effective_budget, current_total, gamma, E_hat, min_experts)
+    log.info("GRAPE: global_budget=%d (non-bl effective=%d), current_total=%d, gamma=%.4g, E_hat=%.4f",
+             global_budget, effective_budget, current_total, gamma, E_hat)
 
     # Per-layer sets of absorbed (merged-away) expert indices.  Using an explicit
     # set — rather than checking D_l == 0 — avoids misidentifying genuinely
@@ -763,9 +763,9 @@ def _grape_greedy_merge(
 
     # Tight case: at most current_total merge-iterations plus at most n_moe_layers
     # structurally-blocked skip-iterations (each layer joins structurally_blocked at most
-    # once; restarts do not consume a separate iteration — frozen.clear() and the next
-    # merge both happen in the same iteration body). The factor n_moe_layers * 2 is well
-    # above this tight bound.
+    # once). Top-of-loop restarts fall through to layer selection in the same iteration;
+    # lag-corrected restarts use `continue` and burn one iteration without a merge.
+    # The factor n_moe_layers * 2 is well above this tight bound in both cases.
     max_iterations = current_total * n_moe_layers * 2
     log.debug("GRAPE max_iterations=%d (current_total=%d, n_moe_layers=%d)",
               max_iterations, current_total, n_moe_layers)
@@ -890,7 +890,8 @@ def _grape_greedy_merge(
         log.warning(
             "GRAPE: could not reach effective_budget=%d non-blacklisted (achieved=%d) "
             "after %d iterations (max_iterations=%d). "
-            "Consider reducing min_experts_per_layer or the target reduction ratio.",
+            "Consider increasing global_budget or reducing the target compression ratio "
+            "(floors are per_layer_counts[li] // 2 per layer).",
             effective_budget, current_total, iter_ + 1, max_iterations,
         )
 
