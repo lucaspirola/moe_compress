@@ -35,17 +35,20 @@ observe; caller handles which layers' data to collect.
 
 This module also keeps the accumulator dataclasses
 (``DownProjMaxAccumulator``, ``ExpertOutputAccumulator``, ``ReapAccumulator``,
-``InputCovarianceAccumulator``) because Stages 1/2/3 use their API — only the
-hook plumbing below them changed.
+``InputCovarianceAccumulator``, ``ReamCostAccumulator``) because Stages 1/2/3
+use their API — only the hook plumbing below them changed.
 """
 from __future__ import annotations
 
 import contextlib
 import logging
+import os
+import random
 import threading
 import types
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 import torch
@@ -68,80 +71,116 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class ReamCostAccumulator:
-    """Collects per-token per-expert **pre-softmax router logit** profiles and
+    """Collects per-token per-expert **pre-softmax routing score** profiles and
     gated expert outputs for computing REAM's activation-space cost matrix
     (paper 2604.04356, Eq. 5 & 8).
 
     Storage per layer:
       - gate_logit_profiles[layer_idx][expert_idx]: dict mapping global token
-        index → pre-softmax router logit. Aligned by global token position so
-        δ_gate cosine similarity compares the same tokens across experts
-        (paper Eq. 5).  Pre-softmax logits can be negative and unbounded,
+        index → pre-softmax routing score (linear projection + optional bias +
+        e_score_correction_bias if present). Aligned by global token position
+        so δ_gate cosine similarity compares the same tokens across experts
+        (paper Eq. 5).  Pre-softmax scores can be negative and unbounded,
         giving the full [-1, 1] cosine similarity range (post-softmax weights
         are non-negative, compressing cosine to [0, 1]).
       - gated_output_sim/count: incremental pairwise cosine similarity of
         gated expert outputs per batch (paper Eq. 8, approximated as
         cosine(mean_gated_i, mean_gated_j) per batch).
 
-    Pre-softmax logits are captured via ``capture_router_outputs`` (a
+    Pre-softmax routing scores are captured via ``capture_router_outputs`` (a
     pre-forward hook on the router module that recomputes
-    ``F.linear(hidden, router.weight)``).  This runs independently of and
-    concurrently with the ``instrument_experts`` hooks that capture gated
-    expert outputs.
+    ``F.linear(hidden, router.weight)`` plus any bias terms).  This runs
+    independently of and concurrently with the ``instrument_experts`` hooks
+    that capture gated expert outputs.
     """
+    # Total number of experts in the MoE layer; 0 means "not set, skip bounds check".
+    num_experts: int = 0
     # Per-(layer, expert): dict[global_token_idx → pre-softmax logit].
     # Aligned by global token position for correct δ_gate cosine sim.
-    gate_logit_profiles: dict[int, dict[int, dict[int, float]]] = field(
+    gate_logit_profiles: dict[int, dict[int, dict[int, float]]] = field(  # actually defaultdict(lambda: defaultdict(dict)) — outer and middle levels are auto-created
         default_factory=lambda: defaultdict(lambda: defaultdict(dict))
     )
     # Incremental pairwise cosine similarity of gated expert outputs.
     # gated_output_sim accumulates Σ_{t in shared} cos_sim for each pair.
     # The final δ̃_expert(i,j) divides by |X| (total calibration tokens),
     # NOT by jointly-active count, per REAM Eq. 8 and spec §5 Step 2.
-    gated_output_sim: dict[tuple[int, int, int], float] = field(default_factory=lambda: defaultdict(float))
+    gated_output_sim: defaultdict[tuple[int, int, int], float] = field(default_factory=lambda: defaultdict(float))  # auto-vivifies with 0.0
     # Total calibration tokens seen per layer (denominator for Eq. 8).
     _total_tokens_by_layer: dict[int, int] = field(default_factory=lambda: defaultdict(int))
     # Temporary per-batch storage: (layer, expert) → {global_token_idx → gated_output [d_hid]}
     _batch_gated_indexed: dict[tuple[int, int], dict[int, torch.Tensor]] = field(
         default_factory=lambda: defaultdict(dict)
-    )    # Per-neuron activation mean for C_act in neuron alignment (REAM §4).
+    )
+    # Per-neuron activation mean for C_act in neuron alignment (REAM §4).
     # Key: (layer_idx, expert_idx) → running sum of intermediate activations [d_intermediate]
     _neuron_act_sum: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
-    _neuron_act_count: dict[tuple[int, int], int] = field(default_factory=lambda: defaultdict(int))
+    _neuron_act_count: dict[tuple[int, int], int] = field(default_factory=dict)
+    # Lock protecting _batch_gated_indexed from concurrent record_gated_output /
+    # finalize_batch access (M-3).
+    _lock: "threading.Lock" = field(default_factory=threading.Lock)
 
     def record_router_logits(
         self, layer_idx: int, logits: torch.Tensor, batch_offset: int,
     ) -> None:
-        """Record pre-softmax router logits for ALL experts from one batch.
+        """Record pre-softmax routing scores for ALL experts from one batch.
 
         Called once per batch per layer (from the ``capture_router_outputs``
         hook), NOT once per expert.  The logits tensor has shape
         ``[n_tokens_in_batch, num_experts]`` — we scatter each expert's
         column into its per-token profile dict.
 
+        "Routing score" here means: linear projection + optional bias +
+        e_score_correction_bias if present (pre-softmax routing score).
+
         Args:
-            logits: [T, E] pre-softmax router logits.
+            logits: [T, E] pre-softmax routing scores.
             batch_offset: global offset = batch_idx * batch_size * seq_len.
         """
-        # Detach + CPU once; then scatter per-expert.
         logits_cpu = logits.detach().cpu()   # [T, E]
-        n_tokens, n_experts = logits_cpu.shape
+        _, n_experts = logits_cpu.shape
+        all_logits = logits_cpu.tolist()  # one .tolist() call
+        # Build staging dicts outside the lock
+        staging: dict[int, dict[int, float]] = {}
         for e in range(n_experts):
-            col = logits_cpu[:, e].tolist()
-            prof = self.gate_logit_profiles[layer_idx][e]
-            for t, val in enumerate(col):
-                prof[batch_offset + t] = val
+            prof = staging.setdefault(e, {})
+            for t_idx, expert_logits in enumerate(all_logits):
+                global_t = batch_offset + t_idx
+                prof[global_t] = expert_logits[e]
+        # Merge under lock — O(T×E) dict.update calls, but lock held only for fast Python merges
+        with self._lock:
+            for e, new_entries in staging.items():
+                existing = self.gate_logit_profiles[layer_idx][e]
+                # Check for duplicates
+                dups = set(new_entries) & set(existing)
+                if dups:
+                    log.warning(
+                        "record_router_logits: %d duplicate global token indices for expert %d layer %d — overwriting",
+                        len(dups), e, layer_idx,
+                    )
+                existing.update(new_entries)
 
     def record_gated_output(self, layer_idx: int, expert_idx: int,
                             gate_weights: torch.Tensor, expert_output: torch.Tensor,
                             token_indices: torch.Tensor, batch_offset: int) -> None:
         """Record gated expert output σ(x)_e * E_e(x) keyed by global token index."""
+        if self.num_experts > 0 and (expert_idx < 0 or expert_idx >= self.num_experts):
+            log.warning(
+                "record_gated_output: expert_idx %d out of range [0, %d)",
+                expert_idx, self.num_experts,
+            )
+            return
         # gate_weights: [T], expert_output: [T, d_hid], token_indices: [T]
         gated = (gate_weights.unsqueeze(-1) * expert_output).detach().cpu().to(torch.float32)  # [T, d_hid]
         indices = (token_indices.detach().cpu() + batch_offset).tolist()
-        prof = self._batch_gated_indexed[(layer_idx, expert_idx)]
-        for idx, t in enumerate(indices):
-            prof[t] = gated[idx]
+        with self._lock:
+            prof = self._batch_gated_indexed.setdefault((layer_idx, expert_idx), {})
+            for idx, t in enumerate(indices):
+                if t in prof:
+                    log.warning(
+                        "record_gated_output: duplicate token index %d for expert %d layer %d — overwriting",
+                        t, expert_idx, layer_idx,
+                    )
+                prof[t] = gated[idx].clone()
 
     def record_batch_token_count(self, layer_idx: int, n_tokens: int) -> None:
         """Record the exact number of tokens in a batch for the Eq. 8 denominator.
@@ -152,7 +191,8 @@ class ReamCostAccumulator:
         batch has no active expert, which would cause finalize_batch to miss
         those tokens in the union-of-sets count).
         """
-        self._total_tokens_by_layer[layer_idx] += n_tokens
+        with self._lock:
+            self._total_tokens_by_layer[layer_idx] += n_tokens
 
     def finalize_batch(self, layer_idx: int, num_experts: int) -> None:
         """After a full forward pass through the layer, compute pairwise cosine
@@ -160,23 +200,28 @@ class ReamCostAccumulator:
 
         For each pair (i, j), finds the token intersection where BOTH experts
         were active in this batch, computes per-token cosine similarity on the
-        gated outputs, and averages. This is O(E² × |intersection|) per batch,
-        where |intersection| ≈ (top_k/E)² × T is typically very small.
+        gated outputs, and accumulates sums of per-token cosine similarities
+        (the actual averaging by |X| happens in compute_delta_expert). This is
+        O(E² × |intersection|) per batch, where |intersection| ≈
+        (top_k/E)² × T is typically very small.
 
         Note: token counting for the Eq. 8 denominator is handled by
         record_batch_token_count(), called from the _profile_layer loop with
         the exact batch token count (batch.shape[0] * batch.shape[1]).
         """
         # Collect per-expert {global_token_idx → gated_output} for this batch.
-        per_expert: dict[int, dict[int, torch.Tensor]] = {}
-        for e in range(num_experts):
-            key = (layer_idx, e)
-            if key in self._batch_gated_indexed and self._batch_gated_indexed[key]:
-                per_expert[e] = dict(self._batch_gated_indexed[key])
-        # Clear batch storage.
-        keys_to_clear = [k for k in self._batch_gated_indexed if k[0] == layer_idx]
-        for k in keys_to_clear:
-            self._batch_gated_indexed[k].clear()
+        # Acquire lock to safely read and clear _batch_gated_indexed.
+        with self._lock:
+            per_expert: dict[int, dict[int, torch.Tensor]] = {}
+            for e in range(num_experts):
+                key = (layer_idx, e)
+                if key in self._batch_gated_indexed and self._batch_gated_indexed[key]:
+                    # Pop directly — no copy needed; we own this dict exclusively after the pop
+                    per_expert[e] = self._batch_gated_indexed.pop(key)
+            # Clear any remaining batch storage for this layer (empty dicts or experts not in range).
+            keys_to_clear = [k for k in self._batch_gated_indexed if k[0] == layer_idx]
+            for k in keys_to_clear:
+                self._batch_gated_indexed.pop(k, None)
 
         expert_ids = sorted(per_expert.keys())
 
@@ -186,6 +231,7 @@ class ReamCostAccumulator:
         if len(expert_ids) < 2:
             return
 
+        sim_updates: dict[tuple, float] = {}
         for idx_i, e_i in enumerate(expert_ids):
             for e_j in expert_ids[idx_i + 1:]:
                 # Intersection: tokens where BOTH experts were active.
@@ -193,16 +239,26 @@ class ReamCostAccumulator:
                 if not shared:
                     continue
                 # Per-token cosine similarity on the intersection.
-                vecs_i = torch.stack([per_expert[e_i][t] for t in shared])  # [|shared|, d_hid]
-                vecs_j = torch.stack([per_expert[e_j][t] for t in shared])  # [|shared|, d_hid]
+                # Use sorted() for deterministic per-token ordering (set iteration is non-deterministic).
+                vecs_i = torch.stack([per_expert[e_i][t] for t in sorted(shared)])  # [|shared|, d_hid]
+                vecs_j = torch.stack([per_expert[e_j][t] for t in sorted(shared)])  # [|shared|, d_hid]
                 sims = F.cosine_similarity(vecs_i, vecs_j, dim=-1)           # [|shared|]
+                # Guard against NaN from zero-vector gated outputs (e.g. when a
+                # gated expert output is the zero vector, cosine_similarity returns
+                # NaN). Treat those tokens as contributing zero to the similarity
+                # sum (maps to neutral 0.5 after rescaling in compute_delta_expert,
+                # not minimum similarity).
+                sims = torch.where(torch.isnan(sims), torch.zeros_like(sims), sims)
                 # Accumulate sum of per-token cosine similarities (numerator of Eq. 8).
                 # Dividing by |X| happens in compute_delta_expert, NOT here.
                 sim_sum = float(sims.sum().item())
                 k1 = (layer_idx, e_i, e_j)
                 k2 = (layer_idx, e_j, e_i)
-                self.gated_output_sim[k1] += sim_sum
-                self.gated_output_sim[k2] += sim_sum
+                sim_updates[k1] = sim_updates.get(k1, 0.0) + sim_sum
+                sim_updates[k2] = sim_updates.get(k2, 0.0) + sim_sum
+        with self._lock:
+            for k, v in sim_updates.items():
+                self.gated_output_sim[k] = self.gated_output_sim.get(k, 0.0) + v
 
     def compute_gate_similarity_matrix(
         self, layer_idx: int, expert_ids: list[int],
@@ -222,14 +278,23 @@ class ReamCostAccumulator:
         Returns:
             Float32 tensor of shape (len(expert_ids), len(expert_ids)) where
             entry [i, j] = δ_gate similarity ∈ [0, 1] for expert_ids[i] vs
-            expert_ids[j]. Returns an all-zeros tensor if any expert has no
-            profile data (no batches were processed).
+            expert_ids[j]. Returns an all-zeros tensor if NO expert has
+            accumulated profile data (i.e. no batches were processed for any
+            of the requested experts).
         """
         n = len(expert_ids)
         if n == 0:
             return torch.zeros(0, 0, dtype=torch.float32)
 
-        layer_profiles = self.gate_logit_profiles.get(layer_idx, {})
+        # Snapshot the profiles under the lock, then release before heavy computation.
+        # Deep-copy the innermost token→logit dicts so a concurrent record_router_logits
+        # calling existing.update() on those inner dicts cannot cause
+        # "dictionary changed size during iteration" or non-deterministic results (M-2).
+        with self._lock:
+            layer_profiles = {
+                k: {t: val for t, val in v.items()}
+                for k, v in self.gate_logit_profiles.get(layer_idx, {}).items()
+            }
 
         # Collect all token indices across all requested experts.
         all_tokens = sorted(
@@ -247,22 +312,35 @@ class ReamCostAccumulator:
         for row, e in enumerate(expert_ids):
             prof = layer_profiles.get(e, {})
             if not prof:
-                # Expert has no profile — row stays zero; will get min similarity.
+                # Expert has no profile — row stays zero; zero-norm rows are
+                # normalized to zeros after NaN replacement, yielding min similarity.
                 continue
             for t, val in prof.items():
                 c = token_to_col.get(t)
+                # c is guaranteed non-None: all_tokens is built from the union of all profile keys
                 if c is not None:
                     mat[row, c] = val
 
         # L2-row-normalize each expert's profile vector.
         mat = F.normalize(mat, p=2, dim=1)  # (n, T)
+        # Guard against NaN from zero-norm rows (experts with an all-zero profile
+        # vector). F.normalize produces NaN for zero vectors; replace with zeros
+        # so they contribute minimum (0.0) similarity to every pair.
+        mat = torch.where(torch.isnan(mat), torch.zeros_like(mat), mat)
+
+        # Early exit for all-zero profile matrix — cdist would yield all-zero distances,
+        # mapping to all-ones similarity, which is meaningless. Return zeros (minimum-
+        # similarity sentinel, consistent with the no-data contract in the docstring).
+        if mat.abs().sum() == 0:
+            return torch.zeros(n, n, dtype=torch.float32)
 
         # Full pairwise Euclidean distances → (n, n).
         d = torch.cdist(mat, mat, p=2)  # (n, n)
 
         # dist2sim: 1 - d / d.max() (observed-max normalization, matching reference).
-        # Clamp denominator to avoid division by zero when all profiles are identical.
+        # Numerical robustness clamp for near-zero profiles (the all-zeros case is handled above).
         sim = 1.0 - d / d.max().clamp(min=1e-12)
+        sim.fill_diagonal_(1.0)
 
         return sim.to(torch.float32)
 
@@ -271,6 +349,7 @@ class ReamCostAccumulator:
 
         Denominator is |X| (total calibration tokens), NOT jointly-active count.
         Returns similarity ∈ [0, 1] via (avg_cosine + 1) / 2.
+        Returns NaN when no data is available (callers must check ``math.isnan``).
         Reference: ream/ream.py lines 99-113.
 
         Sparse-routing approximation: In sparse top-k routing, experts are only
@@ -281,10 +360,13 @@ class ReamCostAccumulator:
         is a faithful implementation of Eq. 8 under sparse routing, not a deviation.
         """
         key = (layer_idx, expert_i, expert_j)
-        total = self._total_tokens_by_layer.get(layer_idx, 0)
+        with self._lock:
+            total = self._total_tokens_by_layer.get(layer_idx, 0)
+            sim_val = self.gated_output_sim.get(key, 0.0)
         if total == 0:
-            return 0.0  # min similarity
-        avg_sim = self.gated_output_sim.get(key, 0.0) / total
+            # no profiling data — return NaN sentinel; callers must check math.isnan
+            return float("nan")
+        avg_sim = sim_val / total
         return (avg_sim + 1.0) / 2.0  # rescale cosine ∈ [-1, 1] → similarity ∈ [0, 1]
 
     def record_neuron_activations(
@@ -299,36 +381,44 @@ class ReamCostAccumulator:
         """
         key = (layer_idx, expert_idx)
         # Use abs so the mean captures activation magnitude, not signed average.
+        # Compute outside the lock — no shared state touched here.
         batch_sum = intermediate.detach().abs().sum(dim=0).cpu().to(torch.float32)  # [d_intermediate]
         n_tokens = int(intermediate.shape[0])
-        prev = self._neuron_act_sum.get(key)
-        if prev is None:
-            self._neuron_act_sum[key] = batch_sum
-        else:
-            self._neuron_act_sum[key] = prev + batch_sum
-        self._neuron_act_count[key] += n_tokens
+        with self._lock:
+            prev = self._neuron_act_sum.get(key)
+            if prev is None:
+                self._neuron_act_sum[key] = batch_sum
+            else:
+                self._neuron_act_sum[key] = prev + batch_sum
+            self._neuron_act_count[key] = self._neuron_act_count.get(key, 0) + n_tokens
 
     def get_neuron_mean(self, layer_idx: int, expert_idx: int) -> torch.Tensor | None:
         """Return per-neuron mean activation magnitude [d_intermediate], or None."""
         key = (layer_idx, expert_idx)
-        s = self._neuron_act_sum.get(key)
-        c = self._neuron_act_count.get(key, 0)
-        if s is None or c == 0:
-            return None
-        return s / c
+        with self._lock:
+            s = self._neuron_act_sum.get(key)
+            c = self._neuron_act_count.get(key, 0)
+            if s is None or c == 0:
+                return None
+            return s.clone() / c
 
     def clear_layer(self, layer_idx: int) -> None:
         """Free memory for a processed layer."""
-        self.gate_logit_profiles.pop(layer_idx, None)
-        keys_to_clear = [k for k in self.gated_output_sim if k[0] == layer_idx]
-        for k in keys_to_clear:
-            self.gated_output_sim.pop(k, None)
-        self._total_tokens_by_layer.pop(layer_idx, None)
-        neuron_keys = [k for k in self._neuron_act_sum if k[0] == layer_idx]
-        for k in neuron_keys:
-            self._neuron_act_sum.pop(k, None)
-            self._neuron_act_count.pop(k, 0)
-
+        with self._lock:
+            self.gate_logit_profiles.pop(layer_idx, None)
+            keys_to_clear = [k for k in self.gated_output_sim if k[0] == layer_idx]
+            for k in keys_to_clear:
+                self.gated_output_sim.pop(k, None)
+            self._total_tokens_by_layer.pop(layer_idx, None)
+            batch_keys = [k for k in self._batch_gated_indexed if k[0] == layer_idx]
+            for k in batch_keys:
+                self._batch_gated_indexed.pop(k, None)
+            # _neuron_act_sum and _neuron_act_count are always updated together, so their
+            # key sets are identical — iterate one and clear both.
+            neuron_keys = [k for k in self._neuron_act_sum if k[0] == layer_idx]
+            for k in neuron_keys:
+                self._neuron_act_sum.pop(k, None)
+                self._neuron_act_count.pop(k, None)
 
 
 @dataclass
@@ -341,22 +431,42 @@ class DownProjMaxAccumulator:
     """
     per_expert_max: dict[tuple[int, int], float] = field(default_factory=dict)
     _gpu: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
+    _lock: "threading.Lock" = field(default_factory=threading.Lock)
 
     def update(self, layer_idx: int, expert_idx: int, x: torch.Tensor) -> None:
-        cur = x.detach().abs().amax()                       # 0-dim, stays on device
+        cur = x.detach().abs().amax()  # 0-dim, stays on device; amax() always returns a fresh tensor
         key = (layer_idx, expert_idx)
-        prev = self._gpu.get(key)
-        if prev is None:
-            self._gpu[key] = cur
-        else:
-            prev.copy_(torch.maximum(prev, cur))
+        with self._lock:
+            prev = self._gpu.get(key)
+            if prev is None:
+                self._gpu[key] = cur
+            else:
+                # torch.maximum on a 0-dim scalar is cheap; do it under the lock to avoid lost updates
+                self._gpu[key] = torch.maximum(prev, cur)
 
     def finalize(self) -> None:
-        for key, tensor in self._gpu.items():
-            val = float(tensor.cpu().item())
-            if val > self.per_expert_max.get(key, 0.0):
-                self.per_expert_max[key] = val
-        self._gpu.clear()
+        with self._lock:
+            gpu_copy = dict(self._gpu)
+            self._gpu.clear()
+        # Phase 1: GPU→CPU outside lock — may stall CUDA stream, don't block other threads.
+        items = [(key, tensor.cpu()) for key, tensor in gpu_copy.items()]
+        # Phase 2: merge back under lock — prevents a concurrent finalize() call from
+        # racing on per_expert_max between the CPU transfer and the dict write.
+        with self._lock:
+            for key, cpu_val in items:
+                val = float(cpu_val.item())
+                if val > self.per_expert_max.get(key, 0.0):
+                    self.per_expert_max[key] = val
+
+    def clear_layer(self, layer_idx: int) -> None:
+        """Free memory for a processed layer (consistent with ReamCostAccumulator.clear_layer)."""
+        with self._lock:
+            gpu_keys = [k for k in self._gpu if k[0] == layer_idx]
+            for k in gpu_keys:
+                self._gpu.pop(k, None)
+            cpu_keys = [k for k in self.per_expert_max if k[0] == layer_idx]
+            for k in cpu_keys:
+                self.per_expert_max.pop(k, None)
 
 
 @dataclass
@@ -387,9 +497,10 @@ class ExpertOutputAccumulator:
     # CPU-resident reservoir: (layer_idx, expert_idx) → list of [d_out] tensors.
     _reservoir: dict[tuple[int, int], list[torch.Tensor]] = field(default_factory=dict)
     # Count of total tokens seen per (layer, expert) — for reservoir sampling.
-    _seen_count: dict[tuple[int, int], int] = field(default_factory=lambda: defaultdict(int))
+    _seen_count: dict[tuple[int, int], int] = field(default_factory=dict)
     # Finalized stacked representations: (layer, expert) → [n_tokens, d_out].
     _finalized: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
+    _lock: "threading.Lock" = field(default_factory=threading.Lock)
 
     def update(self, layer_idx: int, expert_idx: int, x: torch.Tensor) -> None:
         """Collect expert output vectors via reservoir sampling.
@@ -403,53 +514,62 @@ class ExpertOutputAccumulator:
         batch_cpu = x.detach().cpu().to(torch.float32)  # [T, d_out]
         n_batch = batch_cpu.shape[0]
 
-        reservoir = self._reservoir.get(key)
-        if reservoir is None:
-            reservoir = []
-            self._reservoir[key] = reservoir
+        # Full reservoir-sampling loop held under _lock — consider pre-computing
+        # replacement schedule outside the lock if this ever runs in a multi-threaded
+        # context (M-4).
+        with self._lock:
+            reservoir = self._reservoir.get(key)
+            if reservoir is None:
+                reservoir = []
+                self._reservoir[key] = reservoir
 
-        seen = self._seen_count[key]
-        cap = self.max_tokens_per_expert
+            seen = self._seen_count.get(key, 0)
+            cap = self.max_tokens_per_expert
 
-        for i in range(n_batch):
-            seen += 1
-            if len(reservoir) < cap:
-                # Reservoir not full — always accept.
-                reservoir.append(batch_cpu[i])
-            else:
-                # Reservoir sampling: replace a random element with
-                # probability cap/seen. Uses Python's random to avoid
-                # importing numpy in this hot path.
-                import random
-                j = random.randint(0, seen - 1)
-                if j < cap:
-                    reservoir[j] = batch_cpu[i]
+            for i in range(n_batch):
+                seen += 1
+                if len(reservoir) < cap:
+                    # Reservoir not full — always accept.
+                    reservoir.append(batch_cpu[i])
+                else:
+                    # Reservoir sampling: replace a random element with
+                    # probability cap/seen.
+                    j = random.randint(0, seen - 1)
+                    if j < cap:
+                        reservoir[j] = batch_cpu[i]
 
-        self._seen_count[key] = seen
+            self._seen_count[key] = seen
 
     def finalize(self) -> None:
         """Stack reservoir lists into contiguous tensors and free the lists."""
-        for key, reservoir in self._reservoir.items():
-            if reservoir:
-                self._finalized[key] = torch.stack(reservoir, dim=0)  # [n, d_out]
-            else:
-                self._finalized[key] = torch.empty(0, 0, dtype=torch.float32)
-        self._reservoir.clear()
-        self._seen_count.clear()
+        with self._lock:
+            to_stack = {k: list(v) for k, v in self._reservoir.items() if v}
+            empty_keys = [k for k, v in self._reservoir.items() if not v]
+            self._reservoir.clear()
+            self._seen_count.clear()
+        # torch.stack outside the lock — CPU-only work, no need to block other threads.
+        stacked_results = {key: torch.stack(tensors, dim=0) for key, tensors in to_stack.items()}
+        empty_results = {key: torch.empty(0, 0, dtype=torch.float32) for key in empty_keys}
+        with self._lock:
+            self._finalized.update(stacked_results)
+            self._finalized.update(empty_results)
 
     def get_representations(self, layer_idx: int, expert_idx: int) -> torch.Tensor | None:
         """Return [n_tokens, d_out] on CPU, or None if no data collected."""
         key = (layer_idx, expert_idx)
-        t = self._finalized.get(key)
-        if t is None:
-            # Check un-finalized reservoir as fallback.
-            reservoir = self._reservoir.get(key)
-            if reservoir:
-                return torch.stack(reservoir, dim=0)
-            return None
-        if t.numel() == 0:
-            return None
-        return t
+        with self._lock:
+            t = self._finalized.get(key)
+            if t is None:
+                reservoir = self._reservoir.get(key)
+                # Deep-copy each element so the caller cannot mutate the reservoir in-place.
+                reservoir_copy = [elem.clone() for elem in reservoir] if reservoir else None
+            else:
+                reservoir_copy = None
+        if t is not None:
+            return t if t.numel() > 0 else None
+        if reservoir_copy:
+            return torch.stack(reservoir_copy, dim=0)
+        return None
 
 
 @dataclass
@@ -461,37 +581,61 @@ class ReapAccumulator:
     same device as the forward and only transfer to CPU via
     :meth:`finalize_layer`.
     """
-    sums: dict[tuple[int, int], float] = field(default_factory=lambda: defaultdict(float))
-    counts: dict[tuple[int, int], int] = field(default_factory=lambda: defaultdict(int))
-    freq: dict[tuple[int, int], int] = field(default_factory=lambda: defaultdict(int))
+    # Plain dicts (not defaultdicts) so that external callers reading acc.freq[nonexistent_key]
+    # raise KeyError rather than auto-vivifying a spurious zero entry. Use .get() for all
+    # internal reads; explicit assignment for writes.
+    sums: dict[tuple[int, int], float] = field(default_factory=dict)
+    counts: dict[tuple[int, int], int] = field(default_factory=dict)
+    # freq: per-(layer, expert) total token count seen across all batches.
+    # Read externally by stage2_reap_ream.py to compute expert routing frequency.
+    freq: dict[tuple[int, int], int] = field(default_factory=dict)
     _gpu_sums: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
+    # Lock protecting _gpu_sums, sums, counts, and freq from concurrent
+    # add_gpu / finalize_layer / score access.
+    _lock: "threading.Lock" = field(default_factory=threading.Lock)
 
     def add_gpu(self, key: tuple[int, int], contrib: torch.Tensor, n_tokens: int) -> None:
-        cur = self._gpu_sums.get(key)
-        if cur is None:
-            self._gpu_sums[key] = contrib.detach().clone()
-        else:
-            cur.add_(contrib.detach())
-        self.counts[key] = self.counts.get(key, 0) + n_tokens
-        self.freq[key] = self.freq.get(key, 0) + n_tokens
+        with self._lock:
+            cur = self._gpu_sums.get(key)
+            if cur is None:
+                self._gpu_sums[key] = contrib.detach().clone()
+            else:
+                cur.add_(contrib.detach())
+            self.counts[key] = self.counts.get(key, 0) + n_tokens
+            self.freq[key] = self.freq.get(key, 0) + n_tokens
 
     def finalize_layer(self, layer_idx: int) -> None:
-        keys = [k for k in self._gpu_sums if k[0] == layer_idx]
-        for k in keys:
-            gpu = self._gpu_sums.pop(k)
-            self.sums[k] = self.sums.get(k, 0.0) + float(gpu.cpu().item())
+        with self._lock:
+            keys = [k for k in self._gpu_sums if k[0] == layer_idx]
+            gpu_items = [(k, self._gpu_sums.pop(k)) for k in keys]
+        # GPU→CPU transfer outside the lock — 0-dim tensors are tiny but we
+        # keep the pattern consistent. The .cpu().item() is done here so the
+        # subsequent lock section can immediately commit the final value.
+        cpu_items = [(k, float(gpu.cpu().item())) for k, gpu in gpu_items]
+        # Merge all finalized sums in a single lock acquisition so score()
+        # never observes a state where _gpu_sums has been popped but sums has
+        # not yet been updated (torn-read window eliminated — H-B).
+        with self._lock:
+            for k, cpu_val in cpu_items:
+                self.sums[k] = self.sums.get(k, 0.0) + cpu_val
 
     def finalize_all(self) -> None:
-        layer_ids = {k[0] for k in self._gpu_sums}
+        # Snapshot of layer_ids is taken at call time; layers added concurrently
+        # after the snapshot are silently skipped. This is safe when called after
+        # all forward passes complete (the intended usage). (L-2)
+        with self._lock:
+            layer_ids = {k[0] for k in self._gpu_sums}
         for li in layer_ids:
             self.finalize_layer(li)
 
     def score(self, layer_idx: int, expert_idx: int) -> float:
         k = (layer_idx, expert_idx)
-        n = self.counts.get(k, 0)
+        with self._lock:
+            n = self.counts.get(k, 0)
+            s = self.sums.get(k, 0.0)
         if n == 0:
             return 0.0
-        return self.sums.get(k, 0.0) / n
+        return s / n
 
 
 @dataclass
@@ -499,15 +643,19 @@ class InputCovarianceAccumulator:
     """Per-(layer, expert, matrix_name) streaming covariance accumulator.
 
     Two-tier storage:
-      * ``_gpu``: transient covariances for the *currently-hot layer* kept
-        resident on the forward's device. Summed in fp32 on GPU to avoid
-        CPU-sync on every expert × sample event.
+      * ``_pending``: CPU-resident covariance accumulations pending the
+        atomic lock-commit into ``covariance``. Covariance computation was
+        moved to CPU before lock acquisition (to avoid cross-CUDA-stream
+        races), so these tensors are CPU-resident despite the name suggesting
+        GPU. Updated by :meth:`update` outside the lock; drained by
+        :meth:`finalize_layer` inside the lock.
       * ``covariance``: CPU-resident final results, in ``storage_dtype``
-        (default bf16 for disk economy). Populated by :meth:`finalize_layer`
-        once per-layer profiling completes.
+        (default float32; callers may set bf16 via set_storage_dtype() for
+        disk economy). Populated by :meth:`finalize_layer` once per-layer
+        profiling completes.
 
     Stage 2 drives profiling one layer at a time, so only one layer's worth
-    of per-expert GPU covariances is live simultaneously (≤ ~256 experts
+    of per-expert pending covariances is live simultaneously (≤ ~256 experts
     × 2048×2048 fp32 ≈ 4.3 GB — fits well under an 80 GB A100).
 
     Aliasing: ``gate_proj`` and ``up_proj`` share input inside
@@ -517,12 +665,13 @@ class InputCovarianceAccumulator:
     """
 
     covariance: dict[tuple[int, int, str], torch.Tensor] = field(default_factory=dict)
-    token_count: dict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))
+    token_count: defaultdict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))  # auto-vivifies with 0
     storage_dtype: torch.dtype = torch.float32
     _alias_gate_up: bool = True
-    _gpu: dict[tuple[int, int, str], torch.Tensor] = field(default_factory=dict)
+    # CPU-resident covariance accumulations pending lock-commit (see class docstring).
+    _pending: dict[tuple[int, int, str], torch.Tensor] = field(default_factory=dict)
     _gpu_token_count: dict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))
-    _lock: "threading.RLock" = field(default_factory=lambda: threading.RLock())  # noqa: F821
+    _lock: "threading.Lock" = field(default_factory=threading.Lock)
 
     def set_storage_dtype(self, dtype: torch.dtype) -> None:
         self.storage_dtype = dtype
@@ -530,72 +679,130 @@ class InputCovarianceAccumulator:
     def update(
         self, layer_idx: int, expert_idx: int, matrix_name: str, x: torch.Tensor
     ) -> None:
-        """Accumulate xᵀx on the *same device as x*. No CPU sync here."""
+        """Accumulate xᵀx on the *same device as x*. No CPU sync here.
+
+        Lock discipline: we hold ``_lock`` only around the _pending dict reads and
+        writes, NOT during the matmul itself — that would stall the forward
+        thread while the background finalize thread waits for the lock.
+        """
         if self._alias_gate_up and matrix_name == "up_proj":
             return
         flat = x.detach().reshape(-1, x.shape[-1])
         if flat.numel() == 0:
             return
-        flat_f32 = flat.to(torch.float32)
+        # `.clone()` ensures this thread owns the storage: `.to(float32)` returns
+        # a view when the input is already float32, and `.clone()` breaks the alias
+        # so in-place ops on the caller's source tensor cannot affect our computation.
+        flat_f32 = flat.to(torch.float32).clone()
+        # Expensive matmul outside the lock — no shared state touched here.
         cov = flat_f32.transpose(0, 1) @ flat_f32
+        # Move to CPU before lock acquisition to avoid cross-CUDA-stream race on in-place add.
+        cov = cov.cpu()
+        n_tok = flat.shape[0]
         key = (layer_idx, expert_idx, matrix_name)
-        cur = self._gpu.get(key)
-        if cur is None:
-            self._gpu[key] = cov
-        else:
-            cur.add_(cov)
-        self._gpu_token_count[key] = self._gpu_token_count.get(key, 0) + flat.shape[0]
+        with self._lock:
+            cur = self._pending.get(key)
+            if cur is None:
+                self._pending[key] = cov
+            else:
+                cur.add_(cov)
+            self._gpu_token_count[key] = self._gpu_token_count.get(key, 0) + n_tok
 
     def finalize_layer(self, layer_idx: int) -> None:
-        keys = [k for k in self._gpu if k[0] == layer_idx]
-        for k in keys:
-            gpu_cov = self._gpu.pop(k)
-            cpu_cov = gpu_cov.to(self.storage_dtype).cpu()
-            with self._lock:
+        # Phase 1: pop pending tensors under lock to prevent concurrent update()
+        # calls from racing on _pending while we drain it.
+        with self._lock:
+            keys = [k for k in self._pending if k[0] == layer_idx]
+            gpu_items = [(k, self._pending.pop(k), self._gpu_token_count.pop(k, 0))
+                         for k in keys]
+            storage_dtype = self.storage_dtype  # capture under lock
+
+        # Phase 2: cast to storage dtype (tensors are already CPU-resident — see update()).
+        cpu_items = [(k, gpu_cov.to(storage_dtype), n_tok)
+                     for k, gpu_cov, n_tok in gpu_items]
+
+        # Phase 3: merge transferred tensors into CPU-resident covariance dict
+        # under lock so get() readers see a consistent state.
+        # Use the `storage_dtype` captured in Phase 1 — do not re-read self.storage_dtype here.
+        with self._lock:
+            for k, cpu_cov, n_tok in cpu_items:
                 prev = self.covariance.get(k)
                 if prev is None:
                     self.covariance[k] = cpu_cov
                 else:
                     self.covariance[k] = (
                         prev.to(torch.float32) + cpu_cov.to(torch.float32)
-                    ).to(self.storage_dtype)
-                self.token_count[k] = (
-                    self.token_count.get(k, 0) + self._gpu_token_count.pop(k, 0)
-                )
+                    ).to(storage_dtype)
+                self.token_count[k] = self.token_count.get(k, 0) + n_tok
 
     def finalize_all(self) -> None:
-        layer_ids = {k[0] for k in self._gpu}
+        # Snapshot of layer_ids is taken at call time; layers added concurrently
+        # after the snapshot are silently skipped. This is safe when called after
+        # all forward passes complete (the intended usage). (L-2)
+        with self._lock:
+            layer_ids = {k[0] for k in self._pending}
         for li in layer_ids:
             self.finalize_layer(li)
 
     def spill_layer_to_disk(self, layer_idx: int, dir_path) -> None:
-        import os
-        from pathlib import Path
+        """Spill covariance data for ``layer_idx`` to disk and evict from memory.
+
+        INVARIANT: ``finalize_layer(layer_idx)`` must not be called concurrently
+        with ``spill_layer_to_disk(layer_idx)``.  Concurrent calls for *different*
+        layer indices are safe.
+        """
+        # Phase 1: snapshot values under lock — do NOT pop yet so data is not
+        # lost if torch.save fails before the write completes.
         with self._lock:
             keys = [k for k in self.covariance if k[0] == layer_idx]
             if not keys:
                 return
+            # Clone under lock so torch.save in Phase 2 serializes immutable snapshots,
+            # safe against concurrent finalize_layer.
+            snapshot = {k: self.covariance[k].clone() for k in keys}
             payload = {
                 "format_version": 1,
-                "covariance": {k: self.covariance[k] for k in keys},
+                "covariance": snapshot,
                 "tokens": {k: self.token_count.get(k, 0) for k in keys},
             }
+        # Phase 2: write outside the lock so the forward thread is not stalled
+        # during the (potentially slow) torch.save.
         out = Path(dir_path) / f"layer_{layer_idx}.pt"
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_suffix(out.suffix + ".tmp")
-        torch.save(payload, tmp)
-        os.replace(tmp, out)
+        try:
+            torch.save(payload, tmp)
+            os.replace(tmp, out)
+        except BaseException:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        # Phase 3: evict from memory only after the file is safely on disk.
+        # Guard against the TOCTOU race where finalize_layer added new data to
+        # an existing key between Phase 1 and Phase 3: only pop if the stored
+        # value is the same object we snapshotted (identity check via `is`).
+        # If a new tensor was written under the same key, leave it in memory.
         with self._lock:
             for k in keys:
-                self.covariance.pop(k, None)
+                current = self.covariance.get(k)
+                if current is snapshot[k]:
+                    self.covariance.pop(k, None)
+                    self.token_count.pop(k, None)
+                else:
+                    log.warning(
+                        "spill_layer_to_disk: key %r was updated between Phase 1 "
+                        "and Phase 3 — keeping new value in memory (not evicting).",
+                        k,
+                    )
 
     def load_layer_from_disk(self, layer_idx: int, dir_path) -> bool:
-        from pathlib import Path
         p = Path(dir_path) / f"layer_{layer_idx}.pt"
         if not p.exists():
             return False
         try:
-            payload = torch.load(p, map_location="cpu")
+            payload = torch.load(p, map_location="cpu", weights_only=True)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to torch.load spill file {p}: {exc!r}. "
@@ -615,23 +822,46 @@ class InputCovarianceAccumulator:
                 f"Spill file {p} has format_version={fmt} (expected 1). "
                 "Regenerate by deleting the per-layer spill dir and re-running."
             )
+        # Validate all keys before acquiring the lock
+        for k in payload["covariance"]:
+            if k[0] != layer_idx:
+                raise RuntimeError(
+                    f"load_layer_from_disk: key {k!r} does not belong to layer {layer_idx}"
+                )
+        # Now safe to mutate under the lock
         with self._lock:
-            self.covariance.update(payload["covariance"])
+            storage_dtype = self.storage_dtype  # capture under lock, consistent with finalize_layer discipline
+            for k, disk_cov in payload["covariance"].items():
+                prev = self.covariance.get(k)
+                if prev is None:
+                    self.covariance[k] = disk_cov
+                else:
+                    self.covariance[k] = (
+                        prev.to(torch.float32) + disk_cov.to(torch.float32)
+                    ).to(storage_dtype)
             for k, n in payload.get("tokens", {}).items():
-                self.token_count[k] = n
+                self.token_count[k] = self.token_count.get(k, 0) + n
         return True
 
     def unload_layer(self, layer_idx: int) -> None:
         with self._lock:
             for k in [k for k in self.covariance if k[0] == layer_idx]:
                 self.covariance.pop(k, None)
+                self.token_count.pop(k, None)
 
     def get(self, key: tuple[int, int, str]) -> torch.Tensor | None:
-        if key in self.covariance:
-            return self.covariance[key]
-        if self._alias_gate_up and key[2] == "up_proj":
-            alt = (key[0], key[1], "gate_proj")
-            return self.covariance.get(alt)
+        """Return the covariance tensor for ``key``, or None if not present.
+
+        Returns a cloned tensor; callers may modify the result without affecting accumulator state.
+        """
+        with self._lock:
+            if key in self.covariance:
+                return self.covariance[key].clone()
+            if self._alias_gate_up and key[2] == "up_proj":
+                alt = (key[0], key[1], "gate_proj")
+                t = self.covariance.get(alt)
+                if t is not None:
+                    return t.clone()
         return None
 
 
@@ -651,10 +881,14 @@ def record_reap(
     the CPU transfer happens in :meth:`ReapAccumulator.finalize_layer`."""
     if gate_vals.numel() == 0:
         return
-    leading = int(expert_outs.shape[0]) if expert_outs.dim() >= 2 else int(expert_outs.numel())
+    if expert_outs.ndim < 2:
+        raise ValueError(
+            f"record_reap: expert_outs must be 2-D [T, hidden], got shape {expert_outs.shape}"
+        )
+    leading = expert_outs.shape[0]
     if gate_vals.numel() != leading:
         raise RuntimeError(
-            f"REAP: gate_vals.numel()={gate_vals.numel()} != expert_outs[0]={leading} "
+            f"REAP: gate_vals.numel()={gate_vals.numel()} != expert_outs.shape[0]={leading} "
             f"(layer={layer_idx}, expert={expert_idx}). "
             "Instrumented forward is out of sync with the reference dispatch."
         )
@@ -688,7 +922,8 @@ def instrument_experts(
       - ``intermediate``  : called with act_fn(gate) * up (down_proj input)
       - ``down``          : called with down output
       - ``gate_up_out``   : called with the raw pre-chunk gate_up projection
-      - ``gate_up_in``    : alias for ``input`` (clarity)
+      - ``gate_up_in``    : alias for ``input`` — BOTH keys fire independently
+                            if both are registered (no deduplication)
 
     Context dict passed to each callback:
       {"top_k_weights": [T], "top_k_pos": [T], "token_idx": [T]}
@@ -698,66 +933,98 @@ def instrument_experts(
     original_forward = experts.forward
     layer_idx = layer_ref.layer_idx
 
-    def _cb(name, eidx, tensor, ctx):
+    # Reentrancy guard: detect if a previous instrument_experts call already replaced
+    # this module's forward with one of our instrumented wrappers. We mark instrumented
+    # forwards by attaching ``_instrument_experts_patched = True`` to the underlying
+    # function so we can detect double-entry without referencing the inner closures.
+    _underlying = getattr(original_forward, "__func__", original_forward)
+    if getattr(_underlying, "_instrument_experts_patched", False):
+        raise RuntimeError(
+            f"instrument_experts: layer {layer_idx} is already instrumented — "
+            f"double-patching would corrupt the forward chain"
+        )
+
+    def _cb(name, e_int: int, tensor, ctx):
+        # e_int must already be a Python int — conversion is hoisted to the loop
+        # body (once per expert) rather than repeated per callback call (L-4).
         fn = callbacks.get(name)
         if fn is None:
             return
-        fn(layer_idx, int(eidx), tensor, ctx)
+        fn(layer_idx, e_int, tensor, ctx)
 
     if is_factored:
-        def wrapped(self, hidden_states, top_k_index, top_k_weights):
+        def wrapped_factored(self, hidden_states, top_k_index, top_k_weights):
+            if top_k_index.dim() != 2:
+                raise RuntimeError(
+                    f"top_k_index must be 2D [T, top_k], got shape {top_k_index.shape}"
+                )
             final = torch.zeros_like(hidden_states)
             with torch.no_grad():
                 mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
                 hit = (mask.sum(dim=(-1, -2)) > 0).nonzero()
             for expert_idx in hit:
+                # hit contains indices from nonzero() on a mask of shape
+                # [num_experts, ...], so e is always in [0, num_experts).
                 e = expert_idx[0]
-                if e == self.num_experts:
-                    continue
+                e_int = int(e)  # hoist int() conversion once per expert (L-4)
                 top_k_pos, token_idx = torch.where(mask[e])
                 sel = hidden_states[token_idx]
                 ctx = {"top_k_weights": top_k_weights[token_idx, top_k_pos],
                        "top_k_pos": top_k_pos, "token_idx": token_idx}
-                _cb("input", e, sel, ctx)
-                _cb("gate_up_in", e, sel, ctx)
+                _cb("input", e_int, sel, ctx)
+                _cb("gate_up_in", e_int, sel, ctx)
                 gate = F.linear(F.linear(sel, self.gate_proj_V[e]), self.gate_proj_U[e])
                 up   = F.linear(F.linear(sel, self.up_proj_V[e]),   self.up_proj_U[e])
+                # Emit a synthetic gate_up_out consistent with the non-factored path.
+                # FactoredExperts computes gate and up via separate low-rank projections
+                # rather than a single fused gate_up_proj, so we concatenate them to
+                # match the [T, 2*d_ffn] shape the non-factored path emits.
+                _cb("gate_up_out", e_int, torch.cat([gate, up], dim=-1), ctx)
                 intermediate = self.act_fn(gate) * up
-                _cb("intermediate", e, intermediate, ctx)
+                _cb("intermediate", e_int, intermediate, ctx)
                 down = F.linear(F.linear(intermediate, self.down_proj_V[e]),
                                 self.down_proj_U[e])
-                _cb("down", e, down, ctx)
+                _cb("down", e_int, down, ctx)
                 down = down * top_k_weights[token_idx, top_k_pos, None]
                 final.index_add_(0, token_idx, down.to(final.dtype))
             return final
+        forward_fn = wrapped_factored
     else:
-        def wrapped(self, hidden_states, top_k_index, top_k_weights):
+        def wrapped_fused(self, hidden_states, top_k_index, top_k_weights):
+            if top_k_index.dim() != 2:
+                raise RuntimeError(
+                    f"top_k_index must be 2D [T, top_k], got shape {top_k_index.shape}"
+                )
             final = torch.zeros_like(hidden_states)
             with torch.no_grad():
                 mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
                 hit = (mask.sum(dim=(-1, -2)) > 0).nonzero()
             for expert_idx in hit:
+                # hit contains indices from nonzero() on a mask of shape
+                # [num_experts, ...], so e is always in [0, num_experts).
                 e = expert_idx[0]
-                if e == self.num_experts:
-                    continue
+                e_int = int(e)  # hoist int() conversion once per expert (L-4)
                 top_k_pos, token_idx = torch.where(mask[e])
                 sel = hidden_states[token_idx]
                 ctx = {"top_k_weights": top_k_weights[token_idx, top_k_pos],
                        "top_k_pos": top_k_pos, "token_idx": token_idx}
-                _cb("input", e, sel, ctx)
-                _cb("gate_up_in", e, sel, ctx)
+                _cb("input", e_int, sel, ctx)
+                _cb("gate_up_in", e_int, sel, ctx)
                 gate_up = F.linear(sel, self.gate_up_proj[e])
-                _cb("gate_up_out", e, gate_up, ctx)
+                _cb("gate_up_out", e_int, gate_up, ctx)
                 gate, up = gate_up.chunk(2, dim=-1)
                 intermediate = self.act_fn(gate) * up
-                _cb("intermediate", e, intermediate, ctx)
+                _cb("intermediate", e_int, intermediate, ctx)
                 down = F.linear(intermediate, self.down_proj[e])
-                _cb("down", e, down, ctx)
+                _cb("down", e_int, down, ctx)
                 down = down * top_k_weights[token_idx, top_k_pos, None]
                 final.index_add_(0, token_idx, down.to(final.dtype))
             return final
+        forward_fn = wrapped_fused
 
-    experts.forward = types.MethodType(wrapped, experts)
+    # Mark the wrapper so the reentrancy guard above can detect double-patching.
+    forward_fn._instrument_experts_patched = True
+    experts.forward = types.MethodType(forward_fn, experts)
     try:
         yield
     finally:
@@ -799,14 +1066,19 @@ def run_calibration(
 # ---------------------------------------------------------------------------
 
 
-class _EarlyExitException(Exception):
+class _EarlyExitException(BaseException):
     """Sentinel raised by a forward hook to abort the forward pass early.
 
     Used by :func:`run_calibration_early_exit` to avoid executing decoder
     layers after the target layer.  The forward runs under ``torch.no_grad()``
     so no autograd graph is corrupted.
+
+    Inherits from ``BaseException`` (not ``Exception``) so that broad
+    ``except Exception:`` handlers inside model code cannot accidentally
+    swallow the early-exit signal — the correct idiom for control-flow
+    exceptions.
     """
-    pass
+    ...
 
 
 @contextlib.contextmanager
@@ -818,6 +1090,12 @@ def early_exit_after_layer(model: nn.Module, target_layer_idx: int):
     For the last MoE layer there is no next layer to hook — we hook the
     text tower's post-layers module (norm / final_layernorm) if it exists,
     otherwise we let the full forward run (no savings, but correct).
+
+    Note: this context manager is designed for single-call use — one model
+    forward per context manager entry.  Reusing the same entry across multiple
+    forward calls is supported (the hook stays installed for the lifetime of
+    the ``with`` block), but the hook fires once per forward and the caller
+    must catch :class:`_EarlyExitException` for each call individually.
 
     Usage::
 
@@ -855,12 +1133,9 @@ def early_exit_after_layer(model: nn.Module, target_layer_idx: int):
         handle.remove()
 
 
+# FIXME: duplicated from model_io._find_text_tower — consolidate when both modules are refactored.
 def _find_text_tower(model: nn.Module) -> nn.Module:
-    """Locate the decoder tower that owns ``.layers``.
-
-    Duplicated from model_io to avoid a circular import; the canonical
-    version lives in :mod:`moe_compress.utils.model_io`.
-    """
+    """Locate the decoder tower that owns ``.layers``."""
     candidates: list[nn.Module] = [model]
     for attr in ("model", "language_model", "text_model"):
         sub = getattr(model, attr, None)
@@ -904,7 +1179,7 @@ def run_calibration_early_exit(
     """
     model.eval()
     n_total = len(batches) if hasattr(batches, "__len__") else None
-    with torch.no_grad(), early_exit_after_layer(model, target_layer_idx) as _:
+    with torch.no_grad(), early_exit_after_layer(model, target_layer_idx):
         for i, batch in enumerate(batches):
             if device is not None:
                 batch = batch.to(device)
@@ -930,15 +1205,18 @@ def run_calibration_early_exit(
 
 @contextlib.contextmanager
 def capture_router_outputs(layer_refs: list[MoELayerRef]):
-    """Collect **pre-softmax** router logits for each given layer.
+    """Collect **pre-softmax routing scores** for each given layer.
+
+    "Routing score" means: linear projection + optional bias +
+    e_score_correction_bias if present (pre-softmax routing score).
 
     Why a pre-forward hook: ``Qwen3_5MoeTopKRouter.forward`` overwrites its
     first return value with a softmax'd tensor before returning, so a
     ``register_forward_hook`` on the router gives post-softmax probabilities
-    rather than logits. For Stage 5 KD we need the raw scores, so we
-    recompute ``F.linear(hidden, router.weight)`` ourselves in a pre-forward
-    hook. Cheap (one matmul that also runs inside the router) and always
-    correct.
+    rather than the raw scores. For Stage 5 KD we need the raw scores, so we
+    recompute ``F.linear(hidden, router.weight)`` plus bias terms ourselves in
+    a pre-forward hook. Cheap (one matmul that also runs inside the router)
+    and always correct.
     """
     storage: dict[int, list[torch.Tensor]] = {ref.layer_idx: [] for ref in layer_refs}
     handles: list = []
@@ -951,7 +1229,11 @@ def capture_router_outputs(layer_refs: list[MoELayerRef]):
             logits = F.linear(x, router.weight)
             if getattr(router, "bias", None) is not None:
                 logits = logits + router.bias
-            storage[li].append(logits)
+            # Qwen3.5-MoE auxiliary-loss-free load-balancing bias; must be
+            # included to match routing decisions.
+            if hasattr(router, "e_score_correction_bias") and router.e_score_correction_bias is not None:
+                logits = logits + router.e_score_correction_bias
+            storage[li].append(logits.detach())
         return _h
 
     for ref in layer_refs:

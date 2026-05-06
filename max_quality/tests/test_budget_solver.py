@@ -4,7 +4,6 @@ from __future__ import annotations
 import pytest
 
 from moe_compress.budget import solver
-from moe_compress.stage1_grape import _allocate_budgets
 from moe_compress.utils.model_io import count_expert_parameters, count_parameters
 
 
@@ -20,77 +19,125 @@ def test_solve_hits_target(tiny_model):
     decomp = solver.solve(
         tiny_model,
         target_total_reduction=0.15,
-        expert_svd_ratio=5.0,  # ep/sp = 0.25/0.05 = 5
+        ep_sp_knob_ratio=5.0,  # ep/sp = 0.25/0.05 = 5
         min_experts_per_layer=2,
     )
-    assert decomp.projected_total_reduction >= 0.145
-    assert decomp.global_expert_budget < 4 * 2
+    assert 0.145 <= decomp.projected_total_reduction <= 0.165
+    assert decomp.global_expert_budget < 4 * 2  # at least one expert pruned per layer on average
+    assert decomp.global_expert_budget >= 2 * 2  # min_experts_per_layer=2 across 2 layers
 
 
 def test_solve_raises_on_impossible_target(tiny_model):
     # Setting min_experts to the current count leaves nothing prunable →
-    # solver should raise RuntimeError per bug #10 fix.
-    with pytest.raises(RuntimeError, match="target_total_reduction"):
+    # solver should raise ValueError with min_pool=0 or all-protected message.
+    with pytest.raises(ValueError, match=r"min_pool=0|All experts are protected"):
         solver.solve(
             tiny_model,
             target_total_reduction=0.40,
-            expert_svd_ratio=5.0,
+            ep_sp_knob_ratio=5.0,
             min_experts_per_layer=4,   # = original, nothing prunable
         )
 
 
-def test_late_layer_bonus_raises_last_layer_budgets():
-    # 6-layer model: layers 0-5 with 8 experts each, global budget = 36 (75%)
-    # With late_layer_bonus=4 / late_layer_bonus_depth=2: layers 4 and 5 should
-    # receive more experts than layers 2 and 3 (middle layers with equal redundancy).
-    redundancies = {i: 0.5 for i in range(6)}  # uniform redundancy → only bonus differentiates
-    per_layer_counts = {i: 8 for i in range(6)}
-    budgets = _allocate_budgets(
-        redundancies=redundancies,
-        global_budget=36,
-        per_layer_counts=per_layer_counts,
-        min_experts=1,
-        blacklist={},
-        early_bonus=0,
-        early_bonus_depth=0,
-        late_bonus=4,
-        late_bonus_depth=2,
+def test_solve_floor_clamp_branch(tiny_model):
+    """Floor-clamp branch: expert-pruning knob hits the protected-floor ceiling mid-solve.
+
+    With 2 layers × 4 experts (min_pool = 2 when min_experts_per_layer=3),
+    max_prunable_frac = 2/8 = 0.25.  A target of 0.25 with ep_sp_knob_ratio=5
+    drives the scale-adjusted ep above 0.25 during the first iteration's scale
+    step, triggering the floor-clamp branch (ep clamped to min_pool/total_routed,
+    sp solved analytically from the discretisation-consistent formula).  The
+    floor-clamp fires during the scale step, not from the analytical starting point.
+    """
+    decomp = solver.solve(
+        tiny_model,
+        target_total_reduction=0.25,
+        ep_sp_knob_ratio=5.0,
+        min_experts_per_layer=3,   # floor=3 → min_pool=2 → max_prunable_frac=0.25
     )
-    assert sum(budgets.values()) == 36
-    # Late layers (4, 5) must have higher budget than mid layers (2, 3)
-    assert budgets[4] > budgets[2]
-    assert budgets[5] > budgets[3]
-    # All layers must respect floor and ceiling
-    assert all(1 <= v <= 8 for v in budgets.values())
+    # Floor-clamped: exactly 2 experts pruned across 2 layers (6 survive total).
+    assert decomp.global_expert_budget == 6, (
+        f"Expected exactly 6 surviving experts (2 pruned at floor), got {decomp.global_expert_budget}"
+    )
+    # ep is clamped to the floor; svd_rank_ratio absorbs the residual.
+    assert decomp.expert_prune_ratio <= 0.25 + 1e-6, (
+        f"ep should be clamped to ≤0.25 (floor), got {decomp.expert_prune_ratio:.6f}"
+    )
+    assert decomp.svd_rank_ratio > 0, (
+        "sp must be positive: SVD must compensate for the floor-clamped expert pruning"
+    )
+    # Projected reduction must be within tolerance of the target.
+    assert abs(decomp.projected_total_reduction - 0.25) <= 0.005, (
+        f"projected_total_reduction={decomp.projected_total_reduction:.4f} not within 0.005 of 0.25"
+    )
 
 
-def test_early_and_late_bonus_both_applied():
-    # Both early and late bonuses should fire simultaneously on a 6-layer model.
-    redundancies = {i: 0.5 for i in range(6)}
-    per_layer_counts = {i: 8 for i in range(6)}
-    budgets_with_bonuses = _allocate_budgets(
-        redundancies=redundancies,
-        global_budget=36,
-        per_layer_counts=per_layer_counts,
-        min_experts=1,
-        blacklist={},
-        early_bonus=2,
-        early_bonus_depth=1,   # layer 0 gets +2
-        late_bonus=2,
-        late_bonus_depth=1,    # layer 5 gets +2
+def test_solve_rejects_nonfinite_tolerance(tiny_model):
+    """Solver must raise ValueError for non-finite or non-positive tolerance."""
+    with pytest.raises(ValueError, match="tolerance"):
+        solver.solve(
+            tiny_model,
+            target_total_reduction=0.15,
+            ep_sp_knob_ratio=5.0,
+            min_experts_per_layer=2,
+            tolerance=float("inf"),
+        )
+    with pytest.raises(ValueError, match="tolerance"):
+        solver.solve(
+            tiny_model,
+            target_total_reduction=0.15,
+            ep_sp_knob_ratio=5.0,
+            min_experts_per_layer=2,
+            tolerance=float("nan"),
+        )
+    with pytest.raises(ValueError, match="tolerance"):
+        solver.solve(
+            tiny_model,
+            target_total_reduction=0.15,
+            ep_sp_knob_ratio=5.0,
+            min_experts_per_layer=2,
+            tolerance=0,
+        )
+    with pytest.raises(ValueError, match="tolerance"):
+        solver.solve(
+            tiny_model,
+            target_total_reduction=0.15,
+            ep_sp_knob_ratio=5.0,
+            min_experts_per_layer=2,
+            tolerance=-0.001,
+        )
+
+
+def test_blacklisted_experts_is_deep_copied(tiny_model):
+    """Mutating the original blacklisted_experts dict after solve() must not affect decomp."""
+    blacklisted = {0: [0, 1]}
+    original_inner = blacklisted[0]  # save reference before solve
+    decomp = solver.solve(
+        tiny_model,
+        target_total_reduction=0.15,
+        ep_sp_knob_ratio=5.0,
+        min_experts_per_layer=2,
+        blacklisted_experts=blacklisted,
     )
-    budgets_no_bonuses = _allocate_budgets(
-        redundancies=redundancies,
-        global_budget=36,
-        per_layer_counts=per_layer_counts,
-        min_experts=1,
-        blacklist={},
-        early_bonus=0,
-        early_bonus_depth=0,
-        late_bonus=0,
-        late_bonus_depth=0,
+    # Verify the stored inner list is a different object from the caller's original list.
+    assert decomp.blacklisted_experts[0] is not original_inner, "inner list must be a copy"
+    blacklisted[0].append(99)  # mutate original inner list
+    blacklisted[99] = [0]      # add new key to original dict
+    assert decomp.blacklisted_experts == {0: [0, 1]}, "decomp should be independent copy"
+
+
+def test_as_dict_stringifies_blacklisted_keys(tiny_model):
+    """as_dict() must convert int keys in blacklisted_experts to strings for JSON compat."""
+    decomp = solver.solve(
+        tiny_model,
+        target_total_reduction=0.15,
+        ep_sp_knob_ratio=5.0,
+        min_experts_per_layer=2,
+        blacklisted_experts={0: [0, 1], 1: [2]},
     )
-    assert sum(budgets_with_bonuses.values()) == 36
-    # Edge layers get more than the no-bonus baseline
-    assert budgets_with_bonuses[0] >= budgets_no_bonuses[0]
-    assert budgets_with_bonuses[5] >= budgets_no_bonuses[5]
+    d = decomp.as_dict()
+    assert all(isinstance(k, str) for k in d["blacklisted_experts"]), (
+        "blacklisted_experts keys must be strings in as_dict() output"
+    )
+
+
