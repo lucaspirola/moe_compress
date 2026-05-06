@@ -121,7 +121,7 @@ def run(
     # ------------------------------------------------------------------
     # Phase B: Expert Magnitude + CKA (Pass 2)
     # ------------------------------------------------------------------
-    # Re-create iterator for Phase B pass
+    # iter_batches returns a list; reuse the same list for Phase B.
     batches = iter_batches(calib, batch_size=1)
 
     log.info(
@@ -417,8 +417,8 @@ def _detect_ma_layers(
         if i == 0:
             q99_val = first_layer_q99_val[0]
             if q99_val <= 0:
-                log.debug("Stage 1: first-layer Q99 is %.2e for layer %d; excluding from MA-formation candidate set L", q99_val, layer_idx)
-            if q99_val > 0 and layer_max[layer_idx] > ma_ratio * q99_val:
+                log.warning("Stage 1: first-layer Q99 is %.2e for layer %d; model output may be degenerate — excluding from MA-formation candidate set L", q99_val, layer_idx)
+            elif layer_max[layer_idx] > ma_ratio * q99_val:
                 L.add(layer_idx)
         else:
             prev_max = layer_max[sorted_layer_indices[i - 1]]
@@ -552,8 +552,10 @@ def _cka_distance_matrix(
                 )
             Xi_c = Xi[:m_common]
             Xj_c = Xj[:m_common]
-            # Direct doubly-centred gram matrix: avoids allocating a [m, m] H matrix on
-            # every pair. This is standard HSIC centering: K_c = K - row_mean - col_mean + grand_mean.
+            # Biased HSIC estimator (Gretton 2005): K_c = K - row_mean - col_mean + grand_mean.
+            # This differs from the unbiased estimator used in Kornblith et al. (2019), which
+            # removes diagonal entries. The bias cancels in the CKA ratio and is negligible
+            # at m_common ≥ 32; for smaller m_common the distance may be slightly underestimated.
             Ki_raw = Xi_c @ Xi_c.T
             Ki_row = Ki_raw.mean(dim=1, keepdim=True)
             Ki_col = Ki_raw.mean(dim=0, keepdim=True)

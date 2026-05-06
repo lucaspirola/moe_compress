@@ -351,10 +351,11 @@ class ExpertMatrixBank:
     def num_experts(self) -> int:
         if self.is_factored():
             return int(self.experts_module.num_experts)
-        assert self.stacked_attr is not None, (
-            "ExpertMatrixBank.num_experts: stacked_attr is None on non-factored bank — "
-            "this should have been caught by __post_init__"
-        )
+        if self.stacked_attr is None:
+            raise RuntimeError(
+                "ExpertMatrixBank.num_experts: stacked_attr is None on non-factored bank — "
+                "this should have been caught by __post_init__"
+            )
         return int(getattr(self.experts_module, self.stacked_attr).shape[0])
 
     def _stacked(self) -> torch.Tensor:
@@ -805,17 +806,11 @@ class FactoredExperts(nn.Module):
             raise ValueError(
                 f"widen_rank {name!r}: V_new d_in {V_new.shape[-1]} != existing d_in {cur_V.shape[-1]}"
             )
-        new_U = torch.cat([cur_U.data, U_new.to(cur_U.dtype)], dim=-1).contiguous()
-        new_V = torch.cat([cur_V.data, V_new.to(cur_V.dtype)], dim=-2).contiguous()
-        setattr(self, f"{name}_U", nn.Parameter(new_U, requires_grad=cur_U.requires_grad))
-        setattr(self, f"{name}_V", nn.Parameter(new_V, requires_grad=cur_V.requires_grad))
-        self.ranks[name] = int(new_U.shape[-1])
+        # Validate added_effective_per_expert BEFORE any tensor mutation — partial
+        # mutation on bad input would leave tensors widened but effective_ranks wrong.
         added_r = int(U_new.shape[-1])
         if added_effective_per_expert is None:
             added_effective_per_expert = [added_r] * self.num_experts
-        # Validate all entries BEFORE mutating effective_ranks — partial mutation on bad
-        # input would leave the object in an inconsistent state (tensors widened but
-        # effective_ranks only partially updated).
         eff_adds = [int(x) for x in added_effective_per_expert]
         for e, eff_add in enumerate(eff_adds):
             if not (0 <= eff_add <= added_r):
@@ -823,6 +818,12 @@ class FactoredExperts(nn.Module):
                     f"widen_rank {name!r}: added_effective_per_expert[{e}]={eff_add} "
                     f"out of range [0, {added_r}]"
                 )
+        # All validation passed — now mutate tensors and metadata.
+        new_U = torch.cat([cur_U.data, U_new.to(cur_U.dtype)], dim=-1).contiguous()
+        new_V = torch.cat([cur_V.data, V_new.to(cur_V.dtype)], dim=-2).contiguous()
+        setattr(self, f"{name}_U", nn.Parameter(new_U, requires_grad=cur_U.requires_grad))
+        setattr(self, f"{name}_V", nn.Parameter(new_V, requires_grad=cur_V.requires_grad))
+        self.ranks[name] = int(new_U.shape[-1])
         for e, eff_add in enumerate(eff_adds):
             self.effective_ranks[name][e] = int(self.effective_ranks[name][e]) + eff_add
 
@@ -834,14 +835,15 @@ class FactoredExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        # M-3 / H-1: shape assertions FIRST, then bounds check, then F.one_hot.
-        assert top_k_weights.ndim == 2, (
-            f"top_k_weights must be 2-D [n_tokens, top_k], got shape {top_k_weights.shape}"
-        )
-        assert top_k_index.shape == top_k_weights.shape, (
-            f"top_k_index and top_k_weights shape mismatch: "
-            f"{top_k_index.shape} vs {top_k_weights.shape}"
-        )
+        if top_k_weights.ndim != 2:
+            raise ValueError(
+                f"top_k_weights must be 2-D [n_tokens, top_k], got shape {top_k_weights.shape}"
+            )
+        if top_k_index.shape != top_k_weights.shape:
+            raise ValueError(
+                f"top_k_index and top_k_weights shape mismatch: "
+                f"{top_k_index.shape} vs {top_k_weights.shape}"
+            )
 
         # H-1 / N-1: OOB check (including negative indices) before F.one_hot,
         # which would otherwise raise a cryptic PyTorch error on bad indices.
@@ -859,7 +861,7 @@ class FactoredExperts(nn.Module):
         # bool/int mask: autograd never attaches; no_grad not needed
         expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
         expert_mask = expert_mask.permute(2, 1, 0)
-        expert_hit = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero()
+        expert_hit = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=False)
 
         if expert_hit.numel() == 0:
             return final_hidden_states
@@ -886,11 +888,11 @@ class FactoredExperts(nn.Module):
         for i, (_, token_idx, _) in enumerate(expert_data):
             gathered[i, :len(token_idx)] = hidden_states[token_idx].detach()
 
-        # Ensure factor dtype matches hidden_states to prevent cryptic bmm errors.
-        assert self.gate_proj_V.dtype == hidden_states.dtype, (
-            f"FactoredExperts dtype mismatch: hidden_states={hidden_states.dtype}, "
-            f"factors={self.gate_proj_V.dtype}"
-        )
+        if self.gate_proj_V.dtype != hidden_states.dtype:
+            raise RuntimeError(
+                f"FactoredExperts dtype mismatch: hidden_states={hidden_states.dtype}, "
+                f"factors={self.gate_proj_V.dtype}"
+            )
         # gate_proj_V is representative: all factor matrices share the same dtype
         # by construction in __init__ and set_factors (both use the same dtype param).
 
