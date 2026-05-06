@@ -35,9 +35,9 @@ import gc
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Iterator
 
 import torch
 import torch.nn as nn
@@ -63,7 +63,20 @@ def load_model(
 ):
     from transformers import AutoConfig, AutoTokenizer
 
-    dtype = getattr(torch, torch_dtype) if isinstance(torch_dtype, str) else torch_dtype
+    if isinstance(torch_dtype, str):
+        if not hasattr(torch, torch_dtype) or not isinstance(getattr(torch, torch_dtype), torch.dtype):
+            raise ValueError(
+                f"load_model: invalid torch_dtype {torch_dtype!r}; "
+                f"must be a valid torch dtype name like 'float16', 'bfloat16', 'float32'"
+            )
+        dtype = getattr(torch, torch_dtype)
+    else:
+        if not isinstance(torch_dtype, torch.dtype):
+            raise ValueError(
+                f"load_model: torch_dtype must be a str or torch.dtype, "
+                f"got {type(torch_dtype).__name__!r}"
+            )
+        dtype = torch_dtype
 
     kwargs: dict = {
         "revision": revision,
@@ -92,30 +105,53 @@ def load_model(
              name_or_path, auto_cls.__name__, dtype, device_map)
     try:
         model = auto_cls.from_pretrained(name_or_path, **kwargs)
-    except Exception as err:                         # noqa: BLE001
-        log.warning("%s.from_pretrained failed (%s); retrying with AutoModel",
-                    auto_cls.__name__, err)
+    except Exception as exc:                         # noqa: BLE001
+        if isinstance(exc, MemoryError) or isinstance(exc, torch.cuda.OutOfMemoryError):
+            raise
         from transformers import AutoModel
-        model = AutoModel.from_pretrained(name_or_path, **kwargs)
+        if auto_cls is AutoModel:
+            # N-2: no retry — same class would fail identically.
+            raise RuntimeError(
+                f"load_model: AutoModel.from_pretrained failed for {name_or_path!r}; "
+                f"err={exc!r}"
+            ) from exc
+        log.warning("%s.from_pretrained failed (%s); retrying with AutoModel",
+                    auto_cls.__name__, exc)
+        try:
+            model = AutoModel.from_pretrained(name_or_path, **kwargs)
+        except Exception as retry_exc:
+            log.warning("load_model: AutoModel retry also failed for %r: %s", name_or_path, retry_exc)
+            raise RuntimeError(
+                f"load_model: both {auto_cls.__name__} and AutoModel failed for {name_or_path!r}; "
+                f"first_err={exc!r}; retry_err={retry_exc!r}"
+            ) from exc
 
-    tokenizer = AutoTokenizer.from_pretrained(name_or_path, revision=revision)
+    tokenizer = AutoTokenizer.from_pretrained(
+        name_or_path, revision=revision, trust_remote_code=trust_remote_code
+    )
     log.info("Model loaded: %s on devices=%s",
              type(model).__name__, _summarize_device_placement(model))
     return model, tokenizer
 
 
-def _pick_auto_class(architectures: list[str]):
+def _pick_auto_class(architectures: list[str]) -> type:
     from transformers import AutoModel, AutoModelForCausalLM
 
-    joined = " ".join(architectures).lower()
-    if "imagetexttotext" in joined or "conditionalgeneration" in joined or "vision" in joined:
+    if any("causallm" in a.lower() for a in architectures):
+        return AutoModelForCausalLM
+    if any(
+        a.lower().endswith(("imagetexttotextmodel", "conditionalgenerationmodel",
+                            "visionencoderdecodermodel"))
+        or "imagetexttotext" in a.lower()
+        or "conditionalgeneration" in a.lower()
+        or "vision" in a.lower()
+        for a in architectures
+    ):
         try:
             from transformers import AutoModelForImageTextToText
             return AutoModelForImageTextToText
         except ImportError:
             pass
-    if "causallm" in joined:
-        return AutoModelForCausalLM
     return AutoModel
 
 
@@ -124,9 +160,11 @@ def _summarize_device_placement(model) -> str:
     for p in model.parameters():
         d = str(p.device)
         devs[d] = devs.get(d, 0) + p.numel()
-    return ", ".join(
-        f"{d}:{n / 1e9:.1f}B" for d, n in sorted(devs.items(), key=lambda x: -x[1])[:3]
-    )
+    sorted_devs = sorted(devs.items(), key=lambda x: -x[1])
+    top3 = sorted_devs[:3]
+    suffix = f" (top 3 of {len(sorted_devs)})" if len(sorted_devs) > 3 else ""
+    summary = ", ".join(f"{d}:{n / 1e9:.1f}B" for d, n in top3)
+    return summary + suffix
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +189,7 @@ class MoELayerRef:
         if hasattr(ex, "num_experts"):
             return int(ex.num_experts)
         # Fallback: read the first stacked weight's leading dim.
-        for name in ("gate_up_proj", "gate_up_U", "down_proj", "down_proj_U"):
+        for name in ("gate_up_proj", "down_proj", "down_proj_U"):
             t = getattr(ex, name, None)
             if isinstance(t, (nn.Parameter, torch.Tensor)):
                 return int(t.shape[0])
@@ -164,9 +202,12 @@ class MoELayerRef:
             return v
         # fall back to config on mlp
         cfg = getattr(self.mlp, "config", None)
-        if cfg is not None:
-            return int(getattr(cfg, "num_experts_per_tok", 8))
-        return 8
+        if cfg is not None and hasattr(cfg, "num_experts_per_tok"):
+            return int(cfg.num_experts_per_tok)
+        raise RuntimeError(
+            f"Cannot determine top_k for layer {self.layer_idx}: "
+            "no router.top_k or config.num_experts_per_tok found"
+        )
 
 
 def _find_text_tower(model: nn.Module) -> nn.Module:
@@ -207,6 +248,11 @@ def _is_moe_layer(layer: nn.Module) -> bool:
     experts = getattr(mlp, "experts", None)
     if experts is None:
         return False
+    # Require a gate/router sub-module so we can build a MoELayerRef safely.
+    # Without this guard, iter_moe_layers would crash on mlp.gate access for
+    # any module that has .experts but is not a true MoE block.
+    if not hasattr(mlp, "gate"):
+        return False
     # Fused Qwen3_5MoeExperts: identified by having a `gate_up_proj` param.
     if _is_fused_experts(experts):
         return True
@@ -224,6 +270,7 @@ def _is_fused_experts(experts: nn.Module) -> bool:
         hasattr(experts, "gate_up_proj")
         and isinstance(getattr(experts, "gate_up_proj"), (nn.Parameter, torch.Tensor))
         and hasattr(experts, "down_proj")
+        and isinstance(getattr(experts, "down_proj"), (nn.Parameter, torch.Tensor))
     )
 
 
@@ -281,8 +328,20 @@ class ExpertMatrixBank:
     matrix_name: str
     experts_module: nn.Module
     # For fused storage:
-    stacked_attr: str | None = None         # "gate_up_proj" or "down_proj"
+    stacked_attr: str | None = None         # "gate_up_proj", "down_proj", or None (FactoredExperts)
     row_slice: slice | None = None          # sub-slice of dim 1 (out axis), or None
+
+    def __post_init__(self) -> None:
+        # When not on the factored path, stacked_attr must always be set.
+        # A None stacked_attr is the forbidden "neither fused nor factored"
+        # state — catch it early so callers get a clear error rather than an
+        # AttributeError deep inside _stacked(). (row_slice is not tested here;
+        # None row_slice is valid for down_proj in the fused path.)
+        if self.stacked_attr is None and not isinstance(self.experts_module, FactoredExperts):
+            raise ValueError(
+                f"stacked_attr must be set for non-FactoredExperts modules "
+                f"(layer {self.layer_idx}, matrix {self.matrix_name!r})"
+            )
 
     def is_factored(self) -> bool:
         return isinstance(self.experts_module, FactoredExperts)
@@ -290,13 +349,27 @@ class ExpertMatrixBank:
     def num_experts(self) -> int:
         if self.is_factored():
             return int(self.experts_module.num_experts)
+        assert self.stacked_attr is not None, (
+            "ExpertMatrixBank.num_experts: stacked_attr is None on non-factored bank — "
+            "this should have been caught by __post_init__"
+        )
         return int(getattr(self.experts_module, self.stacked_attr).shape[0])
 
     def _stacked(self) -> torch.Tensor:
+        # NOTE: uses getattr each time (late-binding). This is intentional:
+        # after ExpertMatrixBank.select() replaces the nn.Parameter via setattr,
+        # sibling banks that share the same stacked_attr (e.g. gate_proj and
+        # up_proj both pointing at gate_up_proj) will see the updated parameter
+        # on their next _stacked() call without needing their own reference update.
         return getattr(self.experts_module, self.stacked_attr)
 
     def get(self, expert_idx: int) -> torch.Tensor:
-        """Return a ``[d_out, d_in]`` tensor for this (layer, expert, matrix)."""
+        """Return a ``[d_out, d_in]`` tensor for this (layer, expert, matrix).
+
+        For the fused path, returns a view (mutations propagate). For the
+        factored path, returns a new materialized tensor (mutations do NOT
+        propagate; use set_factors/set_factors_from_weight to update parameters).
+        """
         if self.is_factored():
             U, V = self.experts_module.factors(expert_idx, self.matrix_name)
             return U @ V
@@ -319,28 +392,80 @@ class ExpertMatrixBank:
 
     def select(self, kept_ids: list[int]) -> None:
         """Rewrite the underlying stacked tensor with only the chosen expert
-        rows. Idempotent: when multiple banks share the same ``stacked_attr``
-        (gate_proj and up_proj share ``gate_up_proj``), calling select on all
-        three is safe — the second call becomes a no-op because we detect
-        that the stacked tensor has already been sliced to ``len(kept_ids)``.
+        rows.
+
+        On the first call (when the per-attr sentinel
+        ``_last_kept_ids_{stacked_attr}`` is not yet set on the experts
+        module), always applies the ``index_select`` slice — even if
+        ``len(kept_ids) == stacked.shape[0]``, because a reordering like
+        ``[3, 1, 0, 2]`` must still be applied. After the slice,
+        ``em._last_kept_ids_{stacked_attr}`` is recorded.
+
+        On subsequent calls (the per-attr sentinel is already set): if the new
+        ids match exactly, the call is a no-op (idempotent sibling-bank
+        handling for gate_proj / up_proj sharing ``gate_up_proj``). Raises
+        ValueError if the same length but different IDs are passed.
+
+        Contract: all banks that share the same stacked tensor (i.e. gate_proj
+        and up_proj both pointing at ``gate_up_proj``) MUST be called with the
+        identical ``kept_ids`` list. Callers should always iterate all three
+        banks with the same kept_ids in the same loop body.
+
+        For factored experts, ``FactoredExperts.select_experts`` maintains its
+        own ``_last_kept_ids`` sentinel on ``self`` (not on the
+        ``experts_module``).
         """
+        if not kept_ids:
+            raise ValueError(
+                "kept_ids cannot be empty; at least one expert must be selected"
+            )
+        if len(kept_ids) != len(set(kept_ids)):
+            raise ValueError(f"kept_ids contains duplicates: {kept_ids}")
         if self.is_factored():
             # FactoredExperts' own select_experts is also idempotent.
             self.experts_module.select_experts(kept_ids)
             return
         stacked = self._stacked()
-        if stacked.shape[0] == len(kept_ids):
-            # Sibling bank already sliced; still update num_experts if the
-            # experts module tracks it separately.
-            if hasattr(self.experts_module, "num_experts"):
-                self.experts_module.num_experts = len(kept_ids)
-            return
+        em = self.experts_module
+        sentinel_attr = f"_last_kept_ids_{self.stacked_attr}"
+        last = getattr(em, sentinel_attr, None)
+        if last is not None:
+            # Subsequent call: sibling bank or duplicate call.
+            if list(last) == list(kept_ids):
+                # Exact idempotent repeat — skip (sibling bank already sliced).
+                return
+            raise ValueError(
+                f"ExpertMatrixBank.select called with different kept_ids than before "
+                f"(prev_ids={list(last)[:8]}, new_ids={list(kept_ids)[:8]}); "
+                f"can only be called once per stacked attr '{self.stacked_attr}'"
+            )
+        # First call: always apply the slice (handles reordering + pruning).
+        # kept_ids is guaranteed non-empty by the check at line 414 above.
+        if min(kept_ids) < 0:
+            raise ValueError(
+                f"select: kept_ids contains negative index {min(kept_ids)}"
+            )
+        if max(kept_ids) >= stacked.shape[0]:
+            raise ValueError(
+                f"select: kept_ids contains index {max(kept_ids)} >= num_experts {stacked.shape[0]}"
+            )
         idx = torch.as_tensor(kept_ids, device=stacked.device, dtype=torch.long)
-        new_stacked = stacked.data.index_select(0, idx).contiguous().clone()
-        setattr(self.experts_module, self.stacked_attr,
+        new_stacked = stacked.data.index_select(0, idx).clone()
+        setattr(em, self.stacked_attr,
                 nn.Parameter(new_stacked, requires_grad=stacked.requires_grad))
-        if hasattr(self.experts_module, "num_experts"):
-            self.experts_module.num_experts = len(kept_ids)
+        # NOTE: num_experts is updated here, on the first select call for this
+        # stacked_attr. This update is not transactional: if a second select
+        # call (for a different stacked_attr on the same experts_module) raises
+        # due to a sentinel mismatch or kept_ids inconsistency, num_experts will
+        # already reflect the first attr's len(kept_ids). In practice the
+        # sentinel-keyed validation above catches mismatches before the second
+        # select modifies anything, making this safe — but it is not atomic.
+        if hasattr(em, "num_experts"):
+            em.num_experts = len(kept_ids)
+        # Record the kept_ids so sibling banks for the same stacked_attr can
+        # verify they match. Keyed on stacked_attr so banks for different attrs
+        # (e.g. gate_up_proj vs down_proj) do not interfere with each other.
+        setattr(em, sentinel_attr, list(kept_ids))
 
     def shape(self) -> tuple[int, int]:
         """Return ``(d_out, d_in)`` for a single expert's matrix."""
@@ -348,6 +473,16 @@ class ExpertMatrixBank:
             return self.experts_module.matrix_shape(self.matrix_name)
         s = self._stacked().shape
         if self.row_slice is not None:
+            if self.row_slice.step not in (None, 1):
+                raise ValueError(
+                    f"ExpertMatrixBank.shape(): non-unit-step row_slice not supported "
+                    f"(got step={self.row_slice.step!r})"
+                )
+            if self.row_slice.start is None or self.row_slice.stop is None:
+                raise ValueError(
+                    f"ExpertMatrixBank.shape(): row_slice {self.row_slice!r} has None start or stop; "
+                    "only explicit integer slices are supported"
+                )
             return (self.row_slice.stop - self.row_slice.start, s[2])
         return (s[1], s[2])
 
@@ -371,6 +506,8 @@ def build_banks(layer_ref: MoELayerRef) -> dict[str, ExpertMatrixBank]:
     #                down_proj    [N, d_hid, d_int]
     gate_up = em.gate_up_proj
     d_int2 = gate_up.shape[1]
+    if d_int2 % 2 != 0:
+        raise ValueError(f"gate_up_proj dim-1 must be even, got {d_int2}")
     d_int = d_int2 // 2
     return {
         "gate_proj": ExpertMatrixBank(
@@ -430,8 +567,14 @@ class FactoredExperts(nn.Module):
         ranks: dict[str, int],
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str = "cpu",
+        act_fn: str = "silu",
     ):
         super().__init__()
+        missing = {"gate_proj", "up_proj", "down_proj"} - set(ranks)
+        if missing:
+            raise ValueError(
+                f"FactoredExperts: ranks dict is missing required keys: {sorted(missing)}"
+            )
         self.num_experts = int(num_experts)
         self.hidden_dim = int(hidden_dim)
         self.intermediate_dim = int(intermediate_dim)
@@ -447,25 +590,25 @@ class FactoredExperts(nn.Module):
             for n in ("gate_proj", "up_proj", "down_proj")
         }
         from transformers.activations import ACT2FN
-        self.act_fn = ACT2FN["silu"]
+        self.act_fn = ACT2FN[act_fn]
 
         kg, ku, kd = int(ranks["gate_proj"]), int(ranks["up_proj"]), int(ranks["down_proj"])
         # Use requires_grad=False by default (frozen) — Stage 5 training targets
         # the router only; Stage 3/4 widen U/V manually.
-        def p(shape):
-            return nn.Parameter(torch.empty(*shape, dtype=dtype, device=device),
+        def make_param(shape):
+            return nn.Parameter(torch.zeros(*shape, dtype=dtype, device=device),
                                 requires_grad=False)
-        self.gate_proj_U = p((num_experts, intermediate_dim, kg))
-        self.gate_proj_V = p((num_experts, kg, hidden_dim))
-        self.up_proj_U   = p((num_experts, intermediate_dim, ku))
-        self.up_proj_V   = p((num_experts, ku, hidden_dim))
-        self.down_proj_U = p((num_experts, hidden_dim, kd))
-        self.down_proj_V = p((num_experts, kd, intermediate_dim))
+        self.gate_proj_U = make_param((num_experts, intermediate_dim, kg))
+        self.gate_proj_V = make_param((num_experts, kg, hidden_dim))
+        self.up_proj_U   = make_param((num_experts, intermediate_dim, ku))
+        self.up_proj_V   = make_param((num_experts, ku, hidden_dim))
+        self.down_proj_U = make_param((num_experts, hidden_dim, kd))
+        self.down_proj_V = make_param((num_experts, kd, intermediate_dim))
 
     # ---- Bank integration ------------------------------------------------
 
     def matrix_shape(self, name: str) -> tuple[int, int]:
-        if name == "gate_proj" or name == "up_proj":
+        if name in {"gate_proj", "up_proj"}:
             return (self.intermediate_dim, self.hidden_dim)
         if name == "down_proj":
             return (self.hidden_dim, self.intermediate_dim)
@@ -477,35 +620,115 @@ class FactoredExperts(nn.Module):
         return U, V
 
     def set_factors_from_weight(self, expert_idx: int, name: str, W: torch.Tensor) -> None:
-        """Refactor ``W`` via SVD at the current rank and overwrite U, V for this expert."""
+        """Refactor ``W`` via SVD at the current rank and overwrite U, V for this expert.
+
+        Note: When called after ``widen_rank``, ``k`` is taken from
+        ``self.ranks[name]`` (the post-widen rank). The SVD is truncated to the
+        current rank, not the pre-widen rank.
+        """
+        if name not in self.ranks:
+            raise KeyError(
+                f"Unknown projection name {name!r}; expected one of {list(self.ranks)}"
+            )
+        if W.ndim != 2:
+            raise ValueError(
+                f"set_factors_from_weight: expected 2-D weight matrix for {name!r}, "
+                f"got shape {tuple(W.shape)}"
+            )
         k = self.ranks[name]
+        m, n = W.shape
+        rank_bound = min(m, n)
+        if k > rank_bound:
+            raise ValueError(
+                f"rank {k} exceeds matrix rank bound {rank_bound} for {name!r} "
+                f"(matrix shape {(m, n)})"
+            )
         Wf = W.to(torch.float32)
         U, S, Vh = torch.linalg.svd(Wf, full_matrices=False)
-        U_k = (U[:, :k] * S[:k]).to(self.gate_proj_U.dtype)
-        V_k = Vh[:k, :].to(self.gate_proj_V.dtype)
-        getattr(self, f"{name}_U").data[expert_idx].copy_(U_k)
-        getattr(self, f"{name}_V").data[expert_idx].copy_(V_k)
+        U_param = getattr(self, f"{name}_U")
+        V_param = getattr(self, f"{name}_V")
+        U_k = (U[:, :k] * S[:k]).to(U_param.dtype)
+        V_k = Vh[:k, :].to(V_param.dtype)
+        U_param.data[expert_idx].copy_(U_k)
+        V_param.data[expert_idx].copy_(V_k)
+        self.effective_ranks[name][expert_idx] = k
 
     def set_factors(
         self, expert_idx: int, name: str, U: torch.Tensor, V: torch.Tensor,
         *, effective_rank: int | None = None,
     ) -> None:
-        getattr(self, f"{name}_U").data[expert_idx].copy_(U.to(self.gate_proj_U.dtype))
-        getattr(self, f"{name}_V").data[expert_idx].copy_(V.to(self.gate_proj_V.dtype))
-        if effective_rank is not None:
-            self.effective_ranks[name][expert_idx] = int(effective_rank)
+        """Write pre-computed factors U, V for one expert/projection pair.
+
+        ``effective_rank`` records how many columns of U (rows of V) carry
+        genuine signal — important for honest parameter counting when callers
+        zero-pad to a fixed slot width (e.g. AA-SVD k_eff < k, EoRA
+        take_eff < r). When omitted, defaults to ``self.ranks[name]`` (the
+        full slot width), so ``effective_ranks`` is always kept up to date.
+        """
+        if name not in self.ranks:
+            raise KeyError(
+                f"Unknown projection name {name!r}; expected one of {list(self.ranks)}"
+            )
+        if not (0 <= expert_idx < self.num_experts):
+            raise ValueError(
+                f"set_factors: expert_idx={expert_idx} out of range [0, {self.num_experts})"
+            )
+        if effective_rank is None:
+            effective_rank = self.ranks[name]
+        U_param = getattr(self, f"{name}_U")
+        V_param = getattr(self, f"{name}_V")
+        # U_param shape: (num_experts, d_out, k); V_param shape: (num_experts, k, d_in)
+        exp_U = (U_param.shape[1], U_param.shape[2])
+        exp_V = (V_param.shape[1], V_param.shape[2])
+        if tuple(U.shape) != exp_U:
+            raise ValueError(
+                f"set_factors: U.shape={tuple(U.shape)} expected {exp_U} for {name!r}"
+            )
+        if tuple(V.shape) != exp_V:
+            raise ValueError(
+                f"set_factors: V.shape={tuple(V.shape)} expected {exp_V} for {name!r}"
+            )
+        U_param.data[expert_idx].copy_(U.to(U_param.dtype))
+        V_param.data[expert_idx].copy_(V.to(V_param.dtype))
+        self.effective_ranks[name][expert_idx] = int(effective_rank)
 
     def select_experts(self, kept_ids: list[int]) -> None:
-        # Idempotent — skip if already matching.
-        if self.num_experts == len(kept_ids):
-            return
+        if not kept_ids:
+            raise ValueError(
+                "kept_ids cannot be empty; at least one expert must be selected"
+            )
+        if len(kept_ids) != len(set(kept_ids)):
+            raise ValueError(f"kept_ids contains duplicates: {kept_ids}")
+        # Unconditional idempotency/conflict check — must come before any size
+        # comparison so that shrinking calls (len(kept_ids) < num_experts) are
+        # also guarded against a second pruning pass re-applying index_select on
+        # already-pruned tensors.
+        last = getattr(self, "_last_kept_ids", None)
+        if last is not None:
+            if list(kept_ids) == last:
+                return  # idempotent repeat
+            raise ValueError(
+                f"select_experts called twice with different kept_ids "
+                f"(prev={last!r}, new={list(kept_ids)!r})"
+            )
+        if min(kept_ids) < 0:
+            raise ValueError(
+                f"select_experts: kept_ids contains negative index {min(kept_ids)}"
+            )
+        if max(kept_ids) >= self.num_experts:
+            raise ValueError(
+                f"select_experts: kept_ids contains index {max(kept_ids)} >= num_experts {self.num_experts}"
+            )
         idx = torch.as_tensor(kept_ids, device=self.gate_proj_U.device, dtype=torch.long)
         for attr in ("gate_proj_U", "gate_proj_V", "up_proj_U", "up_proj_V",
                      "down_proj_U", "down_proj_V"):
             t = getattr(self, attr)
-            new_t = t.data.index_select(0, idx).contiguous().clone()
+            new_t = t.data.index_select(0, idx).clone()
             setattr(self, attr, nn.Parameter(new_t, requires_grad=t.requires_grad))
         self.num_experts = len(kept_ids)
+        self._last_kept_ids = list(kept_ids)
+        for nm in self.effective_ranks:
+            self.effective_ranks[nm] = [self.effective_ranks[nm][i] for i in kept_ids]
 
     def widen_rank(
         self, name: str, U_new: torch.Tensor, V_new: torch.Tensor,
@@ -519,12 +742,42 @@ class FactoredExperts(nn.Module):
         correction (≤ r). If None, assumes full r per expert. Used to keep
         `effective_ranks` honest when EoRA's eigh path zero-pads columns.
         """
+        if name not in self.ranks:
+            raise KeyError(
+                f"Unknown projection name {name!r}; expected one of {list(self.ranks)}"
+            )
+        if added_effective_per_expert is not None and len(added_effective_per_expert) != self.num_experts:
+            raise ValueError(
+                f"added_effective_per_expert length {len(added_effective_per_expert)} "
+                f"!= num_experts {self.num_experts}"
+            )
+        if U_new.shape[0] != self.num_experts:
+            raise ValueError(
+                f"widen_rank U_new: expected {self.num_experts} experts, got {U_new.shape[0]}"
+            )
+        if V_new.shape[0] != self.num_experts:
+            raise ValueError(
+                f"widen_rank V_new: expected {self.num_experts} experts, got {V_new.shape[0]}"
+            )
+        if U_new.shape[-1] != V_new.shape[-2]:
+            raise ValueError(
+                f"widen_rank rank mismatch: U_new rank dim={U_new.shape[-1]}, "
+                f"V_new rank dim={V_new.shape[-2]}"
+            )
         cur_U = getattr(self, f"{name}_U")
         cur_V = getattr(self, f"{name}_V")
+        if U_new.shape[-2] != cur_U.shape[-2]:
+            raise ValueError(
+                f"widen_rank {name!r}: U_new d_out {U_new.shape[-2]} != existing d_out {cur_U.shape[-2]}"
+            )
+        if V_new.shape[-1] != cur_V.shape[-1]:
+            raise ValueError(
+                f"widen_rank {name!r}: V_new d_in {V_new.shape[-1]} != existing d_in {cur_V.shape[-1]}"
+            )
         new_U = torch.cat([cur_U.data, U_new.to(cur_U.dtype)], dim=-1).contiguous()
         new_V = torch.cat([cur_V.data, V_new.to(cur_V.dtype)], dim=-2).contiguous()
-        setattr(self, f"{name}_U", nn.Parameter(new_U, requires_grad=False))
-        setattr(self, f"{name}_V", nn.Parameter(new_V, requires_grad=False))
+        setattr(self, f"{name}_U", nn.Parameter(new_U, requires_grad=cur_U.requires_grad))
+        setattr(self, f"{name}_V", nn.Parameter(new_V, requires_grad=cur_V.requires_grad))
         self.ranks[name] = int(new_U.shape[-1])
         added_r = int(U_new.shape[-1])
         if added_effective_per_expert is None:
@@ -540,14 +793,41 @@ class FactoredExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        # M-3 / H-1: shape assertions FIRST, then bounds check, then F.one_hot.
+        assert top_k_weights.ndim == 2, (
+            f"top_k_weights must be 2-D [n_tokens, top_k], got shape {top_k_weights.shape}"
+        )
+        assert top_k_index.shape == top_k_weights.shape, (
+            f"top_k_index and top_k_weights shape mismatch: "
+            f"{top_k_index.shape} vs {top_k_weights.shape}"
+        )
+
+        # H-1 / N-1: OOB check (including negative indices) before F.one_hot,
+        # which would otherwise raise a cryptic PyTorch error on bad indices.
+        if top_k_index.numel() > 0 and (
+            top_k_index.min().item() < 0
+            or top_k_index.max().item() >= self.num_experts
+        ):
+            raise RuntimeError(
+                f"FactoredExperts.forward: top_k_index contains out-of-range expert index "
+                f"(min={top_k_index.min().item()}, max={top_k_index.max().item()}, "
+                f"num_experts={self.num_experts})"
+            )
+
         final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero()
+        # bool/int mask: autograd never attaches; no_grad not needed
+        expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        expert_hit = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero()
 
         if expert_hit.numel() == 0:
             return final_hidden_states
+
+        # gathered is a non-grad leaf (requires_grad=False). The detach() on hidden_states indexing
+        # makes the graph break explicit — bmm through gathered never reaches hidden_states or U/V parameters.
+        # Expert parameters U/V receive zero gradient through this forward.
+        # This is intentional: Stage 2–6 never trains expert parameters through FactoredExperts.forward.
+        # If training expert factors, use the unfactored path or rewrite this forward.
 
         # Collect (expert_id, token_indices, top_k_positions) per active expert.
         expert_data: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
@@ -563,7 +843,15 @@ class FactoredExperts(nn.Module):
         max_tokens = max(len(tok) for _, tok, _ in expert_data)
         gathered = hidden_states.new_zeros(n_active, max_tokens, hidden_states.shape[-1])
         for i, (_, token_idx, _) in enumerate(expert_data):
-            gathered[i, :len(token_idx)] = hidden_states[token_idx]
+            gathered[i, :len(token_idx)] = hidden_states[token_idx].detach()
+
+        # Ensure factor dtype matches hidden_states to prevent cryptic bmm errors.
+        assert self.gate_proj_V.dtype == hidden_states.dtype, (
+            f"FactoredExperts dtype mismatch: hidden_states={hidden_states.dtype}, "
+            f"factors={self.gate_proj_V.dtype}"
+        )
+        # gate_proj_V is representative: all factor matrices share the same dtype
+        # by construction in __init__ and set_factors (both use the same dtype param).
 
         # Index factor matrices for all active experts at once.
         hit_ids = expert_hit[:, 0]          # [n_active]
@@ -619,12 +907,8 @@ def count_expert_parameters(model: nn.Module, *, routed_only: bool = True) -> in
             # AA-SVD's k_eff < k or EoRA's take_eff < r aren't counted as
             # real parameters. Each expert contributes (d_out + d_in) × eff
             # for each of {gate, up, down}.
-            d_int, d_hid = ex.intermediate_dim, ex.hidden_dim
-            for name, (d_out, d_in) in (
-                ("gate_proj", (d_int, d_hid)),
-                ("up_proj",   (d_int, d_hid)),
-                ("down_proj", (d_hid, d_int)),
-            ):
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                d_out, d_in = ex.matrix_shape(name)
                 eff_per_expert = ex.effective_ranks.get(name, [ex.ranks[name]] * ex.num_experts)
                 eff_sum = sum(int(r) for r in eff_per_expert)
                 total += (d_out + d_in) * eff_sum
@@ -677,6 +961,10 @@ def save_compressed_checkpoint(
     per-layer ``num_experts`` and ``FactoredExperts`` info so a custom loader
     can reconstruct the architecture before ``load_state_dict``.
     """
+    if not isinstance(pipeline_stage, str) or not pipeline_stage:
+        raise ValueError(
+            f"pipeline_stage must be a non-empty string, got {pipeline_stage!r}"
+        )
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     log.info("Saving compressed checkpoint to %s (stage=%s)", out_path, pipeline_stage)
@@ -706,16 +994,36 @@ def save_compressed_checkpoint(
         # rank when AA-SVD's k_eff < k or EoRA's take_eff < r.
         "factored_effective_ranks": factored_effective_ranks,
     }
-    if extra_metadata:
+    if extra_metadata is not None:
         metadata["extra"] = extra_metadata
 
+    # Write metadata FIRST so that if the shard write fails, the directory has
+    # metadata but no shards (obviously incomplete), rather than shards with no
+    # metadata (which looks complete but is broken and unloadable).
+    # Use save_json_artifact for atomic write (tmp + os.replace) to prevent
+    # partial JSON on crash.
+    save_json_artifact(metadata, out_path / COMPRESSED_METADATA_FILENAME)
+    log.info("  wrote %s (per_layer_num_experts: %d entries, factored_layers: %d)",
+             COMPRESSED_METADATA_FILENAME, len(per_layer_num_experts), len(factored_layers))
     model.save_pretrained(out_path, safe_serialization=True)
     if tokenizer is not None:
         tokenizer.save_pretrained(out_path)
-    (out_path / COMPRESSED_METADATA_FILENAME).write_text(json.dumps(metadata, indent=2))
-    log.info("  wrote %s (per_layer_num_experts: %d entries, factored_layers: %d)",
-             COMPRESSED_METADATA_FILENAME, len(per_layer_num_experts), len(factored_layers))
     return out_path
+
+
+def _canonical_device(d: torch.device) -> torch.device:
+    """Normalize a torch.device to its canonical form for comparison.
+
+    ``torch.device("cuda") != torch.device("cuda:0")`` in PyTorch even though
+    they refer to the same physical device. Normalize both sides before
+    comparing to avoid false-positive device-mismatch errors in the streaming
+    load path.
+    """
+    if d.type == "cuda" and d.index is None:
+        if not torch.cuda.is_available():
+            return d  # can't normalize without CUDA; return as-is
+        return torch.device("cuda", torch.cuda.current_device())
+    return d
 
 
 def _assign_storage(model: nn.Module, key: str, tensor: torch.Tensor) -> None:
@@ -733,7 +1041,17 @@ def _assign_storage(model: nn.Module, key: str, tensor: torch.Tensor) -> None:
     """
     parent_path, _, leaf = key.rpartition(".")
     parent = model.get_submodule(parent_path) if parent_path else model
+    if not hasattr(parent, leaf):
+        raise RuntimeError(
+            f"_assign_storage: checkpoint key {key!r} resolves to attribute {leaf!r} "
+            f"which does not exist on {type(parent).__name__!r}"
+        )
     existing = getattr(parent, leaf)
+    if not isinstance(existing, torch.Tensor):
+        raise RuntimeError(
+            f"_assign_storage: expected a Tensor at {key!r}, "
+            f"got {type(existing).__name__!r}"
+        )
     # Defense-in-depth: a shape mismatch on .data = will raise inside
     # Tensor.set_ with a cryptic message; a dtype mismatch silently
     # changes the param's dtype and corrupts forward dozens of layers
@@ -747,20 +1065,37 @@ def _assign_storage(model: nn.Module, key: str, tensor: torch.Tensor) -> None:
     if existing.dtype != tensor.dtype:
         raise RuntimeError(
             f"_assign_storage: dtype mismatch on {key!r} — skeleton "
-            f"{existing.dtype} vs checkpoint {tensor.dtype}"
+            f"{existing.dtype} vs checkpoint {tensor.dtype}. "
+            "Ensure the torch_dtype passed to load_compressed_model matches the dtype used when the checkpoint was saved."
+        )
+    if _canonical_device(existing.device) != _canonical_device(tensor.device):
+        raise RuntimeError(
+            f"_assign_storage: device mismatch on {key!r} — "
+            f"existing={_canonical_device(existing.device)}, "
+            f"incoming={_canonical_device(tensor.device)}. "
+            "Ensure target_device matches the device the model skeleton was built on."
         )
     if isinstance(existing, nn.Parameter):
         # Param: rebind .data so the registered Parameter object stays the
         # same (preserves any tying / hooks). Drop refcount on old storage.
-        # Also clear ._grad so a stale gradient at the old shape doesn't
+        # Also clear .grad so a stale gradient at the old shape doesn't
         # linger (defense for future paths that might call this on a
         # trained model).
-        existing._grad = None
+        if existing.grad is not None:
+            log.warning(
+                "_assign_storage: discarding non-None gradient on %s — "
+                "this should not happen outside of training", key
+            )
+        existing.grad = None
         existing.data = tensor
     elif leaf in getattr(parent, "_buffers", {}):
         # Persistent buffer. Re-register it so the module's _buffers dict
         # points at the new tensor; preserve persistent / non-persistent flag.
-        persistent = leaf not in getattr(parent, "_non_persistent_buffers_set", set())
+        # named_buffers(recurse=False) only yields persistent buffers by default
+        # (no include_non_persistent=True). A buffer in _buffers that is absent
+        # from persistent_names is therefore correctly identified as non-persistent.
+        persistent_names = {name for name, _ in parent.named_buffers(recurse=False)}
+        persistent = leaf in persistent_names
         parent._buffers.pop(leaf, None)
         parent.register_buffer(leaf, tensor, persistent=persistent)
     else:
@@ -778,10 +1113,11 @@ def _assign_storage(model: nn.Module, key: str, tensor: torch.Tensor) -> None:
 def load_compressed_model(
     path: str | Path,
     *,
-    device_map: str | dict = "auto",
+    device_map: str = "auto",
     torch_dtype: str | torch.dtype = "bfloat16",
     attn_implementation: str = "sdpa",
     allow_missing_keys: bool = False,
+    trust_remote_code: bool = True,
 ):
     """Reconstruct a compressed model from a directory produced by
     :func:`save_compressed_checkpoint`.
@@ -796,28 +1132,69 @@ def load_compressed_model(
            ``per_layer_num_experts[i]``.
          - For ``factored_layers[i]``, swap ``mlp.experts`` with a new
            ``FactoredExperts`` built at the stored ranks.
-         - Resize ``mlp.gate.weight`` to match the new num_experts.
-      5. ``load_state_dict(strict=False)`` from the saved safetensors shards.
+         - Resize ``ref.router.weight`` (``mlp.gate.weight``) to match the new num_experts.
+      5. Stream each tensor one-at-a-time from the safetensors shards via
+         ``safe_open``, assigning directly into the skeleton's parameter/buffer
+         storage with :func:`_assign_storage` (per-tensor swap avoids the dual-
+         residence-on-CUDA peak that a full ``load_state_dict`` would cause).
     """
     from transformers import AutoConfig, AutoTokenizer
     from safetensors import safe_open
 
+    if device_map not in ("auto", "cuda", "cpu"):
+        raise ValueError(
+            f"load_compressed_model() does not support device_map={device_map!r}; "
+            "use 'auto', 'cuda', or 'cpu'"
+        )
+    if device_map == "auto":
+        log.debug(
+            "device_map='auto': loading to GPU 0 if CUDA is available, else CPU "
+            "(no multi-GPU balancing)"
+        )
+
     path = Path(path)
-    meta = json.loads((path / COMPRESSED_METADATA_FILENAME).read_text())
-    cfg = AutoConfig.from_pretrained(path)
-    dtype = getattr(torch, torch_dtype) if isinstance(torch_dtype, str) else torch_dtype
-    # Resolve target device. The previous string-compare ``device_map == "auto"``
-    # silently fell through to CPU when the caller passed a dict like
-    # ``{"": 0}`` (their explicit GPU pin), defeating the streaming intent
-    # and risking a host-RAM OOM on the post-load ``model.to``. If CUDA is
-    # available, stream to ``cuda``; otherwise CPU regardless of device_map.
+    try:
+        meta = json.loads((path / COMPRESSED_METADATA_FILENAME).read_text())
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"load_compressed_model: {path!r} does not look like a compressed checkpoint "
+            f"— missing {COMPRESSED_METADATA_FILENAME!r}"
+        ) from exc
+    if meta.get("version", 0) != 1:
+        raise RuntimeError(
+            f"Checkpoint metadata version {meta.get('version')} is not supported; "
+            "expected version 1."
+        )
+    cfg = AutoConfig.from_pretrained(path, trust_remote_code=trust_remote_code)
+    if isinstance(torch_dtype, str):
+        if not hasattr(torch, torch_dtype) or not isinstance(getattr(torch, torch_dtype), torch.dtype):
+            raise ValueError(
+                f"load_compressed_model: invalid torch_dtype {torch_dtype!r}; "
+                f"must be a valid torch dtype name like 'float16', 'bfloat16', 'float32'"
+            )
+        dtype = getattr(torch, torch_dtype)
+    else:
+        if not isinstance(torch_dtype, torch.dtype):
+            raise ValueError(
+                f"load_compressed_model: torch_dtype must be a str or torch.dtype, "
+                f"got {type(torch_dtype).__name__!r}"
+            )
+        dtype = torch_dtype
+    # Resolve target device. device_map is used only to distinguish cuda vs cpu:
+    # "auto" and "cuda" both stream to CUDA when available, "cpu" forces CPU.
+    # Arbitrary device_map dicts are not supported by the streaming load path.
     target_device = (
-        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        torch.device("cuda") if torch.cuda.is_available() and device_map != "cpu"
+        else torch.device("cpu")
     )
+    if device_map == "cuda" and not torch.cuda.is_available():
+        log.warning(
+            "device_map='cuda' requested but CUDA is not available; falling back to CPU"
+        )
 
     auto_cls = _pick_auto_class(list(getattr(cfg, "architectures", None) or []))
     log.info("Building skeleton %s from config (no weights yet)", auto_cls.__name__)
-    model = auto_cls.from_config(cfg, dtype=dtype, attn_implementation=attn_implementation)
+    model = auto_cls.from_config(cfg, torch_dtype=dtype, attn_implementation=attn_implementation)
 
     _resize_moe_stack_to_metadata(model, meta, dtype=dtype, device=target_device)
 
@@ -830,7 +1207,17 @@ def load_compressed_model(
     # exceeds the 80 GB A100. By replacing one storage at a time, the
     # allocator can reclaim each freed skeleton block before the next
     # tensor lands. Peak CUDA = skeleton size + 1 tensor (a few hundred MB).
-    shards = sorted(path.glob("model-*.safetensors")) or sorted(path.glob("*.safetensors"))
+    shards = sorted(path.glob("model-*.safetensors"))
+    if not shards:
+        fallback = sorted(path.glob("*.safetensors"))
+        if not fallback:
+            raise FileNotFoundError(f"No safetensors shards found in {path}")
+        if len(fallback) > 1:
+            log.warning(
+                "No model-*.safetensors found; falling back to all *.safetensors — "
+                "verify these are model shards"
+            )
+        shards = fallback
     log.info("Streaming state_dict from %s (%d shards) → %s",
              path, len(shards), target_device)
     # IMPORTANT: harvest the key set without binding the dict. ``state_dict()``
@@ -843,36 +1230,23 @@ def load_compressed_model(
     expected_keys = set(model.state_dict().keys())
     loaded_keys: set[str] = set()
     unexpected_all: list[str] = []
-    # Pre-scan the largest single tensor we'll load. The streaming swap
-    # holds one tensor on the new device alongside the to-be-replaced
-    # storage, so peak ≈ skeleton + max_tensor. Logging it makes a future
-    # config change that introduces a multi-GB single tensor visible at
-    # load start (when we can still abort) instead of mid-load OOM.
+    # Track the largest single tensor seen during loading. The streaming swap
+    # holds one tensor on the new device alongside the to-be-replaced storage,
+    # so peak ≈ skeleton + max_tensor. Logging it after loading makes a future
+    # config change that introduces a multi-GB single tensor visible in logs.
     max_bytes = 0
     max_key = ""
-    for s in shards:
-        with safe_open(str(s), framework="pt", device="cpu") as f:
-            for key in f.keys():
-                slice_obj = f.get_slice(key)
-                shape = slice_obj.get_shape()
-                # element size: bf16/fp16=2, fp32=4, int8=1, etc.
-                dtype_str = slice_obj.get_dtype()
-                elem = {"BF16": 2, "F16": 2, "F32": 4, "F64": 8,
-                        "I8": 1, "U8": 1, "I16": 2, "I32": 4, "I64": 8,
-                        "BOOL": 1}.get(dtype_str, 4)
-                nbytes = elem
-                for d in shape:
-                    nbytes *= d
-                if nbytes > max_bytes:
-                    max_bytes = nbytes
-                    max_key = key
-    log.info("Largest single tensor: %s (%.2f GB)", max_key, max_bytes / 1e9)
-    for k, s in enumerate(shards):
+    for shard_idx, s in enumerate(shards):
         n_loaded_in_shard = 0
         n_unexpected_in_shard = 0
         with safe_open(str(s), framework="pt", device=str(target_device)) as f:
             for key in f.keys():
                 t = f.get_tensor(key)            # already on target_device
+                # Track largest tensor via the loaded tensor's numel × itemsize.
+                nbytes = t.numel() * t.element_size()
+                if nbytes > max_bytes:
+                    max_bytes = nbytes
+                    max_key = key
                 if key not in expected_keys:
                     unexpected_all.append(key)
                     n_unexpected_in_shard += 1
@@ -883,10 +1257,11 @@ def load_compressed_model(
                 n_loaded_in_shard += 1
                 del t
         log.info("  shard %d/%d: %s (%d loaded, %d unexpected)",
-                 k + 1, len(shards), s.name, n_loaded_in_shard, n_unexpected_in_shard)
+                 shard_idx + 1, len(shards), s.name, n_loaded_in_shard, n_unexpected_in_shard)
         gc.collect()
         if target_device.type == "cuda":
             torch.cuda.empty_cache()
+    log.info("Largest single tensor: %s (%.2f GB)", max_key, max_bytes / 1e9)
 
     missing_final = sorted(expected_keys - loaded_keys)
     log.info("  load done: missing=%d unexpected=%d",
@@ -930,10 +1305,14 @@ def load_compressed_model(
                 "blanket model.to_empty would silently zero out the streamed "
                 "weights. Investigate the missing keys reported above."
             )
+        # Non-persistent buffers are not in the state_dict and were not moved by
+        # _assign_storage; this call only affects them. Parameters are already on
+        # target_device from streaming and this is a no-op for them.
+        log.debug("Moving non-persistent buffers to %s", target_device)
         model.to(target_device)
         torch.cuda.empty_cache()
 
-    tokenizer = AutoTokenizer.from_pretrained(path)
+    tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=trust_remote_code)
     return model, tokenizer, meta
 
 
@@ -944,8 +1323,9 @@ def _resize_moe_stack_to_metadata(
     """Pre-load hook: install ``FactoredExperts`` for factored layers, shrink
     fused stacks + router for non-factored-but-pruned layers. All new tensors
     are created on the caller-supplied dtype/device (NOT on meta) so the
-    subsequent ``load_state_dict(assign=True)`` can replace them with real
-    weights from the safetensors shards without hitting meta-tensor errors.
+    subsequent streaming ``safe_open`` per-tensor assignment via
+    :func:`_assign_storage` can replace them with real weights from the
+    safetensors shards without hitting meta-tensor or shape-mismatch errors.
     """
     per_layer_num = {int(k): int(v) for k, v in meta["per_layer_num_experts"].items()}
     factored_ids  = set(meta["factored_layers"])
@@ -958,28 +1338,62 @@ def _resize_moe_stack_to_metadata(
 
     for ref in iter_moe_layers(model):
         li = ref.layer_idx
-        target_n = per_layer_num.get(li, ref.num_routed_experts)
+        target_n = per_layer_num.get(li)
+        if target_n is None:
+            log.warning(
+                "_resize_moe_stack_to_metadata: layer %d not in per_layer_num_experts metadata; "
+                "keeping original size %d", li, ref.num_routed_experts
+            )
+            target_n = ref.num_routed_experts
         if li in factored_ids:
+            if li not in factored_ranks:
+                raise RuntimeError(
+                    f"Layer {li} is listed in factored_layers but has no entry in "
+                    "factored_ranks metadata. The checkpoint may be corrupt or was "
+                    "saved with an incompatible version."
+                )
             cfg = getattr(ref.mlp, "config", None) or getattr(model.config, "text_config", model.config)
+            moe_int = getattr(cfg, "moe_intermediate_size", None)
+            if moe_int is None:
+                raise RuntimeError(
+                    f"config is missing 'moe_intermediate_size' — cannot reconstruct "
+                    f"FactoredExperts for layer {li}"
+                )
+            hidden = getattr(cfg, "hidden_size", None)
+            if hidden is None:
+                raise RuntimeError(
+                    f"config is missing 'hidden_size' — cannot reconstruct FactoredExperts for layer {li}"
+                )
             new_fact = FactoredExperts(
                 num_experts=target_n,
-                hidden_dim=cfg.hidden_size,
-                intermediate_dim=cfg.moe_intermediate_size,
+                hidden_dim=hidden,
+                intermediate_dim=moe_int,
                 ranks=factored_ranks[li],
                 dtype=dtype,
                 device=device,
+                act_fn=getattr(cfg, "hidden_act", "silu"),
             )
             # Restore effective ranks if the metadata captured them; else
             # fall back to the slot-width default that __init__ already set.
             if li in factored_effective:
                 for nm, vs in factored_effective[li].items():
-                    if len(vs) == new_fact.num_experts:
-                        new_fact.effective_ranks[nm] = list(vs)
+                    if len(vs) != new_fact.num_experts:
+                        raise RuntimeError(
+                            f"Layer {li}: effective_ranks[{nm!r}] has {len(vs)} entries "
+                            f"but num_experts is {new_fact.num_experts}. The checkpoint "
+                            "metadata is inconsistent."
+                        )
+                    new_fact.effective_ranks[nm] = list(vs)
             ref.mlp.experts = new_fact
-            ref.experts_module = new_fact
-            ref.mlp.num_experts = target_n
+            if hasattr(ref.mlp, "num_experts"):
+                ref.mlp.num_experts = target_n
         elif target_n != ref.num_routed_experts:
             em = ref.experts_module
+            if not _is_fused_experts(em):
+                raise RuntimeError(
+                    f"Layer {li}: cannot resize non-fused, non-factored experts module "
+                    f"of type {type(em).__name__}"
+                )
             gup = em.gate_up_proj
             dp = em.down_proj
             new_gup = nn.Parameter(torch.zeros(target_n, gup.shape[1], gup.shape[2],
@@ -991,16 +1405,35 @@ def _resize_moe_stack_to_metadata(
             em.gate_up_proj = new_gup
             em.down_proj = new_dp
             em.num_experts = target_n
-            ref.mlp.num_experts = target_n
+            if hasattr(ref.mlp, "num_experts"):
+                ref.mlp.num_experts = target_n
+            # Clear per-stacked_attr sentinels set by ExpertMatrixBank.select
+            # so a subsequent select call treats the resized module as a fresh
+            # first call.
+            for attr_name in ("_last_kept_ids_gate_up_proj", "_last_kept_ids_down_proj"):
+                if hasattr(em, attr_name):
+                    delattr(em, attr_name)
+            # Also clear legacy bare sentinel (from before the stacked_attr keying fix)
+            if hasattr(em, "_last_kept_ids"):
+                delattr(em, "_last_kept_ids")
         # Always resize the router to match the target num_experts.
         if ref.router.weight.shape[0] != target_n:
             gw = ref.router.weight
+            assert gw.ndim == 2, (
+                f"_resize_moe_stack_to_metadata: router weight at layer {ref.layer_idx} "
+                f"expected 2D [num_experts, hidden_size], got shape {tuple(gw.shape)}"
+            )
             new_gw = nn.Parameter(torch.zeros(target_n, gw.shape[1],
                                               dtype=dtype, device=device),
                                   requires_grad=gw.requires_grad)
             ref.router.weight = new_gw
-            ref.router.num_experts = target_n
+            if hasattr(ref.router, "num_experts"):
+                ref.router.num_experts = target_n
         if hasattr(ref.router, "top_k") and ref.router.top_k > target_n:
+            log.warning(
+                "layer %d: clamping router top_k %d → %d to match pruned expert count",
+                ref.layer_idx, ref.router.top_k, target_n,
+            )
             ref.router.top_k = target_n
 
 
@@ -1013,22 +1446,45 @@ def save_json_artifact(obj, path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w") as f:
-        json.dump(obj, f, indent=2, sort_keys=True, default=_json_default)
-    os.replace(tmp, path)
+    try:
+        with tmp.open("w") as f:
+            json.dump(obj, f, indent=2, sort_keys=True, default=_json_default)
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
     return path
 
 
-def load_json_artifact(path: str | Path):
-    with Path(path).open() as f:
-        return json.load(f)
+def load_json_artifact(path: str | Path) -> Any:
+    path = Path(path)
+    try:
+        with path.open() as f:
+            return json.load(f)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"Artifact not found: {path}") from e
 
 
-def _json_default(o):
+def _json_default(o: Any) -> Any:
     if isinstance(o, torch.Tensor):
         return o.detach().cpu().tolist()
     if hasattr(o, "tolist"):
         return o.tolist()
+    if isinstance(o, (nn.Module, nn.Parameter)):
+        raise TypeError(
+            f"Object of type {type(o).__name__} is not JSON serializable — "
+            "do not embed nn.Module or nn.Parameter instances in metadata"
+        )
     if hasattr(o, "__dict__"):
-        return o.__dict__
+        d = o.__dict__
+        if len(d) > 50:  # key-count-gated (gates on dict key count, not byte size)
+            log.warning(
+                "_json_default: large object serialized via __dict__ (%d keys, type=%s)",
+                len(d), type(o).__name__,
+            )
+        else:
+            log.debug(
+                "_json_default: falling back to __dict__ for type=%s", type(o).__name__
+            )
+        return d
     raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
