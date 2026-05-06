@@ -6,6 +6,7 @@ import torch
 
 from moe_compress.utils.activation_hooks import (
     DownProjMaxAccumulator,
+    ExpertOutputAccumulator,
     ReapAccumulator,
     record_reap,
 )
@@ -40,3 +41,23 @@ def test_reap_scoring_accumulates_contribution():
     assert acc.sums[(1, 7)] == pytest.approx(1.0)
     assert acc.counts[(1, 7)] == 2
     assert acc.score(1, 7) == pytest.approx(0.5)
+
+
+def test_expert_output_accumulator_reservoir_cap():
+    """Push >256 tokens through ExpertOutputAccumulator; per-expert buffer must be capped at 256."""
+    cap = 256
+    acc = ExpertOutputAccumulator(max_tokens_per_expert=cap)
+    d_out = 8
+    layer_idx, expert_idx = 0, 0
+    # Push 1024 tokens total (> 256) in batches of 64.
+    n_total = 1024
+    batch_size = 64
+    for start in range(0, n_total, batch_size):
+        x = torch.randn(batch_size, d_out)
+        acc.update(layer_idx, expert_idx, x)
+    acc.finalize()
+    R = acc.get_representations(layer_idx, expert_idx)
+    assert R is not None
+    # Reservoir capped at the configured cap.
+    assert R.shape[0] == cap
+    assert R.shape[1] == d_out

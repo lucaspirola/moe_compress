@@ -305,6 +305,20 @@ def iter_moe_layers(model: nn.Module) -> Iterator[MoELayerRef]:
         )
 
 
+def iter_decoder_layers(model: nn.Module) -> Iterator[tuple[int, nn.Module]]:
+    """Yield every decoder layer in the text tower as ``(layer_idx, layer_module)``.
+
+    Modeled on :func:`iter_moe_layers` but covers the full transformer stack
+    (including non-MoE layers).  Used by Stage 1 Phase A's MA-formation
+    detection, which must observe the full residual stream — not just the MoE
+    layers — so the growth ratio ``max|H_l| / max|H_{l-1}|`` is computed
+    against the immediately preceding decoder layer (spec §4 Phase A).
+    """
+    tower = _find_text_tower(model)
+    for idx, layer in enumerate(tower.layers):
+        yield idx, layer
+
+
 # ---------------------------------------------------------------------------
 # ExpertMatrixBank: per-(layer, matrix_name) view into stacked tensors
 # ---------------------------------------------------------------------------
