@@ -271,9 +271,19 @@ class ReamCostAccumulator:
         **observed** maximum across the full N×N pairwise distance matrix, matching
         the reference implementation (ream/ream.py lines 37-41).
 
+        **Spec invariant (§5, δ_gate Eq. 5):** ``expert_ids`` MUST contain ALL
+        non-protected (non-SE) experts in the layer — not just a centroid/candidate
+        subset.  The dist2sim normalization divides by ``D.max()`` computed from
+        this matrix; passing a subset causes ``D.max()`` to be underestimated,
+        inflating similarity values for the omitted pairs.  Callers that need the
+        cost for a (centroid, non-centroid) subset should still pass all N non-SE
+        expert IDs here, then index into the returned matrix.
+
         Args:
             layer_idx: MoE layer index.
-            expert_ids: ordered list of expert indices to include.
+            expert_ids: COMPLETE list of all non-protected expert indices for this
+                layer (spec §5: D.max() must be over the full non-protected
+                population N, not just a nc+c subset).
 
         Returns:
             Float32 tensor of shape (len(expert_ids), len(expert_ids)) where
@@ -757,9 +767,15 @@ class InputCovarianceAccumulator:
             keys = [k for k in self.covariance if k[0] == layer_idx]
             if not keys:
                 return
-            # Clone under lock so torch.save in Phase 2 serializes immutable snapshots,
-            # safe against concurrent finalize_layer.
-            snapshot = {k: self.covariance[k].clone() for k in keys}
+            # Capture original tensor references for Phase 3 identity check, then
+            # clone for thread-safe serialization in Phase 2.  Two separate dicts
+            # are required: ``originals`` maps key → the exact Python object that
+            # was in self.covariance at snapshot time (for the ``is`` check);
+            # ``snapshot`` maps key → a clone safe to hand to torch.save without
+            # holding the lock.  Using only the clones for the identity check would
+            # always fail because a clone is never ``is`` the original.
+            originals = {k: self.covariance[k] for k in keys}
+            snapshot = {k: t.clone() for k, t in originals.items()}
             payload = {
                 "format_version": 1,
                 "covariance": snapshot,
@@ -782,12 +798,14 @@ class InputCovarianceAccumulator:
         # Phase 3: evict from memory only after the file is safely on disk.
         # Guard against the TOCTOU race where finalize_layer added new data to
         # an existing key between Phase 1 and Phase 3: only pop if the stored
-        # value is the same object we snapshotted (identity check via `is`).
+        # value is the same object we snapshotted (identity check via ``is``
+        # against originals, NOT snapshot — snapshot contains clones which are
+        # never ``is`` the current stored tensor).
         # If a new tensor was written under the same key, leave it in memory.
         with self._lock:
             for k in keys:
                 current = self.covariance.get(k)
-                if current is snapshot[k]:
+                if current is originals[k]:
                     self.covariance.pop(k, None)
                     self.token_count.pop(k, None)
                 else:

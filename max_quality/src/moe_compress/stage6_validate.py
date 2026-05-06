@@ -570,10 +570,21 @@ def _run_llama_imatrix_with_prebuilt_gguf(
         log.warning("No calibration texts available; skipping imatrix generation.")
         return
 
+    # Spec §9 Artifacts: calibration_imatrix.txt must ALWAYS be written (usable
+    # even without llama.cpp).  Write it atomically before any guard so that
+    # a missing GGUF or llama.cpp installation does not suppress the file.
+    # _generate_imatrix (fallback path) also writes it atomically, so a double-
+    # write is idempotent and safe.
+    calib_path = artifacts_dir / "calibration_imatrix.txt"
+    calib_tmp = calib_path.with_suffix(".tmp")
+    calib_tmp.write_text(joined, encoding="utf-8")
+    os.replace(calib_tmp, calib_path)
+    log.info("imatrix: calibration file written (%d docs, %d chars) → %s",
+             len(texts), len(joined), calib_path)
+
     f16_path = gguf_result.get("f16_path")
     if f16_path is None or not f16_path.exists():
         log.warning("imatrix: pre-built GGUF not available — falling back to full pipeline")
-        # Do NOT write calibration_imatrix.txt here; _generate_imatrix will write it.
         _generate_imatrix(texts, icfg, artifacts_dir)
         return
 
@@ -586,15 +597,6 @@ def _run_llama_imatrix_with_prebuilt_gguf(
     if not imatrix_bin.exists():
         log.warning("imatrix: llama-imatrix binary not found — skipping.")
         return
-
-    # Only write the calibration file after binary existence checks pass.
-    # That way, if we returned early above, no orphaned calibration file is left on disk.
-    calib_path = artifacts_dir / "calibration_imatrix.txt"
-    calib_tmp = calib_path.with_suffix(".tmp")
-    calib_tmp.write_text(joined, encoding="utf-8")
-    os.replace(calib_tmp, calib_path)
-    log.info("imatrix: calibration file written (%d docs, %d chars) → %s",
-             len(texts), len(joined), calib_path)
 
     imatrix_out = artifacts_dir / "imatrix.gguf"
     ngl = int(icfg.get("ngl", 99))
@@ -1261,6 +1263,15 @@ def _generate_imatrix(texts: list[str], icfg: dict, artifacts_dir: Path) -> None
         log.warning("No calibration texts available; skipping imatrix generation.")
         return
 
+    # Spec §9 Artifacts: calibration_imatrix.txt must ALWAYS be written (usable
+    # even without llama.cpp).  Write it atomically before any llama.cpp guard
+    # so that a missing llama.cpp installation does not suppress the file.
+    calib_tmp = calib_path.with_suffix(".tmp")
+    calib_tmp.write_text(joined, encoding="utf-8")
+    os.replace(calib_tmp, calib_path)
+    log.info("imatrix: calibration file written (%d docs, %d chars) → %s",
+             len(texts), len(joined), calib_path)
+
     llama_cpp_dir = _find_llama_cpp_dir(icfg.get("llama_cpp_dir"))
     if llama_cpp_dir is None:
         log.warning("imatrix: llama.cpp not found; skipping imatrix generation.")
@@ -1281,13 +1292,6 @@ def _generate_imatrix(texts: list[str], icfg: dict, artifacts_dir: Path) -> None
     if free_gb < 40:
         log.warning("imatrix: only %.1f GB free; skipping GGUF conversion.", free_gb)
         return
-
-    # All guards passed — write calibration file now (atomic to avoid partial reads).
-    calib_tmp = calib_path.with_suffix(".tmp")
-    calib_tmp.write_text(joined, encoding="utf-8")
-    os.replace(calib_tmp, calib_path)
-    log.info("imatrix: calibration file written (%d docs, %d chars) → %s",
-             len(texts), len(joined), calib_path)
 
     f16_path = artifacts_dir / "model_f16.gguf"
     f16_tmp = artifacts_dir / "model_f16.gguf.tmp"
@@ -1403,8 +1407,28 @@ def _check_thresholds(results: dict, thresholds: dict, *, s6_cfg: dict | None = 
             )
             skipped_checks["wikitext2_ppl_increase_ok"] = f"teacher PPL <= 0 ({wt['teacher']})"
         else:
+            # rel is a fraction (e.g. 0.03 = 3%).  wt_thresh is stored as a fraction
+            # in config (e.g. 0.03 for the ≤ 3% spec limit).  Both sides use the
+            # same unit so the comparison is correct.  Log as % for human readability.
+            #
+            # Defensive sanity check: a threshold > 1.0 means > 100% relative PPL
+            # increase is acceptable, which is almost certainly a misconfigured
+            # percentage (e.g. 3 instead of 0.03).  Warn loudly so operators catch it.
+            if wt_thresh > 1.0:
+                log.warning(
+                    "_check_thresholds: wikitext2_ppl_relative_max_increase=%.4g looks like "
+                    "a percentage (>1.0); expected a fraction (e.g. 0.03 for 3%%).  "
+                    "Check your config — the quality gate may be too lenient.",
+                    wt_thresh,
+                )
             rel = wt["delta"] / wt["teacher"]
-            checks["wikitext2_ppl_increase_ok"] = rel <= wt_thresh
+            passed = rel <= wt_thresh
+            log.info(
+                "_check_thresholds: wikitext2_ppl relative increase = %.4f%% "
+                "(threshold %.4f%%) → %s",
+                rel * 100, wt_thresh * 100, "PASS" if passed else "FAIL",
+            )
+            checks["wikitext2_ppl_increase_ok"] = passed
     elif wt is None and wt_thresh is None:
         # Neither eval result nor threshold is present — nothing to do.
         # N-2: This is a by-design configuration, not an unexpected condition; use DEBUG.
@@ -1448,12 +1472,27 @@ def _check_thresholds(results: dict, thresholds: dict, *, s6_cfg: dict | None = 
             log.warning("Threshold key '%s' missing from config — skipping check for %s",
                         key_name, task)
             continue
+        # Defensive sanity check: accuracy drop thresholds > 1.0 (i.e. > 100pp)
+        # almost certainly mean the config stored a percentage instead of a fraction.
+        if thresh > 1.0:
+            log.warning(
+                "_check_thresholds: %s threshold %.4g looks like a percentage (>1.0); "
+                "expected a fraction (e.g. 0.015 for 1.5pp).  "
+                "Check your config — the quality gate may be too lenient.",
+                key_name, thresh,
+            )
         d = delta.get(task)
         if d is not None:
             # delta = student - teacher (from _deltas); for accuracy tasks a negative
             # delta means student is worse. drop = teacher - student = -delta.
+            # thresh is stored as a fraction in config (e.g. 0.015 for 1.5pp).
             drop = -d["delta"]
-            checks[f"{task}_drop_ok"] = drop <= thresh
+            passed = drop <= thresh
+            log.info(
+                "_check_thresholds: %s drop = %.4f (%.2fpp), threshold %.4f (%.2fpp) → %s",
+                task, drop, drop * 100, thresh, thresh * 100, "PASS" if passed else "FAIL",
+            )
+            checks[f"{task}_drop_ok"] = passed
         else:
             # Metric absent from delta dict — check whether the eval was disabled,
             # whether the teacher value was non-finite (skip), or whether the
