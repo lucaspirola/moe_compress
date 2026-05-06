@@ -32,7 +32,14 @@ from __future__ import annotations
 import logging
 import threading
 
-log = logging.getLogger("moe_compress.system_metrics")
+log = logging.getLogger(__name__)
+
+
+# After this many consecutive failures from one metrics source (pynvml /
+# psutil / torch / resource), we disable that source for the rest of the
+# run with a single warning. Prevents an unbounded warning-log fire-hose
+# when e.g. an NVML driver bounces mid-run.
+_MAX_CONSECUTIVE_FAILURES = 3
 
 
 class SystemMetrics:
@@ -51,8 +58,17 @@ class SystemMetrics:
         self._nvml_handle = None
         self._psutil = None
         self._tick = 0
+        # Per-source consecutive failure counters (see _MAX_CONSECUTIVE_FAILURES).
+        # ``_disabled`` short-circuits any source that has tripped the limit.
+        self._fail_counts: dict[str, int] = {}
+        self._disabled: set[str] = set()
 
     def start(self) -> None:
+        # Idempotent: if a thread is already running, don't double-spawn.
+        if self._thread is not None and self._thread.is_alive():
+            log.debug("SystemMetrics.start(): already running — no-op")
+            return
+
         try:
             import pynvml
             pynvml.nvmlInit()
@@ -77,10 +93,28 @@ class SystemMetrics:
             log.warning("psutil unavailable (%s) — CPU/RAM metrics disabled", exc)
             self._psutil = None
 
-        self._thread = threading.Thread(
-            target=self._loop, name="system-metrics", daemon=True,
-        )
-        self._thread.start()
+        # Spawn the sampling thread. If THIS step itself fails, unwind any
+        # partial init (notably NVML) so we don't leak the NVML handle and
+        # so a subsequent retry sees a clean slate.
+        try:
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._loop, name="system-metrics", daemon=True,
+            )
+            self._thread.start()
+        except Exception as exc:                     # noqa: BLE001
+            log.warning("SystemMetrics thread spawn failed (%s) — disabling metrics", exc)
+            if self._pynvml is not None:
+                try:
+                    self._pynvml.nvmlShutdown()
+                except Exception:                    # noqa: BLE001
+                    pass
+                self._pynvml = None
+                self._nvml_handle = None
+            self._psutil = None
+            self._thread = None
+            return
+
         log.info("SystemMetrics started (interval=%.1fs, gpu=%d, trackio_run=%s)",
                  self.interval_sec, self.gpu_index,
                  "on" if self.run is not None else "off")
@@ -109,25 +143,52 @@ class SystemMetrics:
         self.start()
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        # exc_type / exc_val / exc_tb are accepted for the context-manager
+        # protocol; we don't suppress, just stop the sampler.
+        del exc_type, exc_val, exc_tb
         self.stop()
 
     # ------------------------------------------------------------------
 
     def _loop(self) -> None:
+        # Outer try guards the WHOLE loop body so a programming error in
+        # _sample/_emit can't kill the metrics thread silently. Per-source
+        # failures are tracked per-source via _record_failure / _record_success
+        # so a single bad source disables only itself, not the whole loop.
         while not self._stop.wait(self.interval_sec):
             try:
                 sample = self._sample()
+                self._tick += 1
+                self._emit(sample)
             except Exception as exc:                 # noqa: BLE001
-                log.warning("metrics sample failed: %s", exc)
+                log.warning("metrics sample failed (loop continues): %s", exc)
                 continue
-            self._tick += 1
-            self._emit(sample)
+
+    def _record_failure(self, source: str, exc: BaseException) -> None:
+        """Bump the failure counter for ``source`` and disable it after the limit."""
+        n = self._fail_counts.get(source, 0) + 1
+        self._fail_counts[source] = n
+        if n >= _MAX_CONSECUTIVE_FAILURES and source not in self._disabled:
+            self._disabled.add(source)
+            log.warning(
+                "%s sampling failed %d times in a row — disabling for the rest of the run (last error: %s)",
+                source, n, exc,
+            )
+
+    def _record_success(self, source: str) -> None:
+        """Reset the consecutive-failure counter for ``source``."""
+        if self._fail_counts.get(source, 0):
+            self._fail_counts[source] = 0
 
     def _sample(self) -> dict[str, float]:
         out: dict[str, float] = {}
 
-        if self._pynvml is not None and self._nvml_handle is not None:
+        if (
+            self._pynvml is not None
+            and self._nvml_handle is not None
+            and "pynvml" not in self._disabled
+        ):
             try:
                 mem = self._pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
                 util = self._pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
@@ -135,18 +196,21 @@ class SystemMetrics:
                 out["sys/vram_used_gb"] = mem.used / 1e9
                 out["sys/vram_total_gb"] = mem.total / 1e9
                 out["sys/vram_pct"] = 100.0 * mem.used / max(mem.total, 1)
+                self._record_success("pynvml")
             except Exception as exc:                 # noqa: BLE001
-                log.warning("pynvml sample failed: %s", exc)
+                self._record_failure("pynvml", exc)
 
-        try:
-            import torch
-            if torch.cuda.is_available():
-                out["sys/torch_alloc_gb"] = torch.cuda.memory_allocated() / 1e9
-                out["sys/torch_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
-        except Exception:                            # noqa: BLE001
-            pass
+        if "torch" not in self._disabled:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    out["sys/torch_alloc_gb"] = torch.cuda.memory_allocated() / 1e9
+                    out["sys/torch_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
+                self._record_success("torch")
+            except Exception as exc:                 # noqa: BLE001
+                self._record_failure("torch", exc)
 
-        if self._psutil is not None:
+        if self._psutil is not None and "psutil" not in self._disabled:
             try:
                 vm = self._psutil.virtual_memory()
                 out["sys/cpu_pct"] = float(self._psutil.cpu_percent(interval=None))
@@ -168,18 +232,21 @@ class SystemMetrics:
                 meminfo = proc.memory_info()
                 out["sys/proc_rss_gb"] = meminfo.rss / 1e9
                 out["sys/proc_vms_gb"] = meminfo.vms / 1e9
+                self._record_success("psutil")
             except Exception as exc:                 # noqa: BLE001
-                log.warning("psutil sample failed: %s", exc)
+                self._record_failure("psutil", exc)
 
         # Peak RSS since process start — monotonically non-decreasing and
         # therefore the cleanest "did our accumulator actually grow"
         # signal. Linux reports KB; we convert to GB.
-        try:
-            import resource
-            ru = resource.getrusage(resource.RUSAGE_SELF)
-            out["sys/maxrss_gb"] = ru.ru_maxrss / (1024 * 1024)
-        except Exception:                            # noqa: BLE001
-            pass
+        if "resource" not in self._disabled:
+            try:
+                import resource
+                ru = resource.getrusage(resource.RUSAGE_SELF)
+                out["sys/maxrss_gb"] = ru.ru_maxrss / (1024 * 1024)
+                self._record_success("resource")
+            except Exception as exc:                 # noqa: BLE001
+                self._record_failure("resource", exc)
 
         return out
 
@@ -213,7 +280,7 @@ class SystemMetrics:
                 log.warning("run.log failed: %s", exc)
 
 
-def _fmt(x):
+def _fmt(x: float | int | None) -> str:
     if x is None:
         return "-"
     return f"{x:.1f}"
