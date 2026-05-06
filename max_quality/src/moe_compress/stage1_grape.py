@@ -232,7 +232,7 @@ def run(
     metric = s1.get("similarity_metric", _SIMILARITY_METRIC_DEFAULT)
     if metric != _SIMILARITY_METRIC_DEFAULT:
         log.info("Stage 1: overriding %s with weight-space metric '%s' (ablation mode)", _SIMILARITY_METRIC_DEFAULT, metric)
-        for k, ref in enumerate(moe_layers):
+        for ref in moe_layers:
             D_matrices[ref.layer_idx] = _pairwise_distance_matrix(ref, metric=metric)
 
     # ------------------------------------------------------------------
@@ -445,6 +445,13 @@ def _compute_se_thresholds(
     """Compute P99.5 and a_max over all (l, e) with l ∈ L."""
     A = [v for (li, _e), v in per_expert_max.items() if li in L]
     if not A:
+        if L:
+            log.warning(
+                "_compute_se_thresholds: MA-formation layers L=%s but no expert fired "
+                "on any calibration sample in those layers; SE detection will find nothing. "
+                "Consider increasing the calibration set size or checking the model.",
+                sorted(L),
+            )
         return 0.0, 0.0
     arr = np.array(A, dtype=np.float64)
     p995 = float(np.percentile(arr, 99.5))
@@ -484,7 +491,7 @@ def _apply_paper_criterion(
 
 
 def _cka_distance_matrix(
-    output_acc: 'ExpertOutputAccumulator',
+    output_acc: ExpertOutputAccumulator,
     layer_ref,
 ) -> torch.Tensor:
     """Compute pairwise CKA distance matrix for all experts in a layer.
@@ -773,14 +780,14 @@ def _grape_greedy_merge(
     # once; restarts do not consume a separate iteration — frozen.clear() and the next
     # merge both happen in the same iteration body). The factor n_moe_layers * 2 is well
     # above this tight bound.
-    maxiter_ations = current_total * n_moe_layers * 2
-    log.debug("GRAPE maxiter_ations=%d (current_total=%d, n_moe_layers=%d)",
-              maxiter_ations, current_total, n_moe_layers)
+    max_iterations = current_total * n_moe_layers * 2
+    log.debug("GRAPE max_iterations=%d (current_total=%d, n_moe_layers=%d)",
+              max_iterations, current_total, n_moe_layers)
     # n_merges counts successful merge operations only.  Structural-blocking skip-iterations
     # advance iter_ without incrementing n_merges, so n_merges <= iter_ always.
     n_merges = 0
-    exit_reason = "maxiter_"
-    for iter_ in range(maxiter_ations):
+    exit_reason = "max_iter"
+    for iter_ in range(max_iterations):
         if current_total <= effective_budget:
             exit_reason = "budget"
             break
@@ -884,12 +891,12 @@ def _grape_greedy_merge(
     log.info("GRAPE: converged at %d non-blacklisted experts (target %d) after %d merges (exit=%s)",
              current_total, effective_budget, n_merges, exit_reason)
 
-    if current_total > effective_budget and exit_reason == "maxiter_":
+    if current_total > effective_budget and exit_reason == "max_iter":
         log.warning(
             "GRAPE: could not reach effective_budget=%d non-blacklisted (achieved=%d) "
-            "after %d iterations (maxiter_ations=%d). "
+            "after %d iterations (max_iterations=%d). "
             "Consider reducing min_experts_per_layer or the target reduction ratio.",
-            effective_budget, current_total, iter_ + 1, maxiter_ations,
+            effective_budget, current_total, iter_ + 1, max_iterations,
         )
 
     # Stage 2 reads per-layer budgets as TOTAL centroid count (blacklisted + non-blacklisted).
