@@ -120,6 +120,8 @@ def load_model(
         try:
             model = AutoModel.from_pretrained(name_or_path, **kwargs)
         except Exception as retry_exc:
+            if isinstance(retry_exc, (MemoryError, torch.cuda.OutOfMemoryError)):
+                raise
             log.warning("load_model: AutoModel retry also failed for %r: %s", name_or_path, retry_exc)
             raise RuntimeError(
                 f"load_model: both {auto_cls.__name__} and AutoModel failed for {name_or_path!r}; "
@@ -373,6 +375,9 @@ class ExpertMatrixBank:
         if self.is_factored():
             U, V = self.experts_module.factors(expert_idx, self.matrix_name)
             return U @ V
+        n = self.num_experts()
+        if not (0 <= expert_idx < n):
+            raise ValueError(f"ExpertMatrixBank.get: expert_idx={expert_idx} out of range [0, {n})")
         w = self._stacked()[expert_idx]               # [d_out_stacked, d_in]
         if self.row_slice is not None:
             w = w[self.row_slice]
@@ -384,6 +389,9 @@ class ExpertMatrixBank:
             # Refactor at the current rank. Rarely used once factored.
             self.experts_module.set_factors_from_weight(expert_idx, self.matrix_name, W)
             return
+        n = self.num_experts()
+        if not (0 <= expert_idx < n):
+            raise ValueError(f"ExpertMatrixBank.set: expert_idx={expert_idx} out of range [0, {n})")
         target = self._stacked()[expert_idx]
         if self.row_slice is not None:
             target[self.row_slice].copy_(W.to(dtype=target.dtype, device=target.device))
@@ -440,7 +448,7 @@ class ExpertMatrixBank:
                 f"can only be called once per stacked attr '{self.stacked_attr}'"
             )
         # First call: always apply the slice (handles reordering + pruning).
-        # kept_ids is guaranteed non-empty by the check at line 414 above.
+        # kept_ids is guaranteed non-empty by the not-kept_ids guard above.
         if min(kept_ids) < 0:
             raise ValueError(
                 f"select: kept_ids contains negative index {min(kept_ids)}"
@@ -615,6 +623,10 @@ class FactoredExperts(nn.Module):
         raise KeyError(name)
 
     def factors(self, expert_idx: int, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        if name not in self.ranks:
+            raise KeyError(
+                f"factors: unknown projection name {name!r}; expected one of {list(self.ranks)}"
+            )
         if not (0 <= expert_idx < self.num_experts):
             raise ValueError(
                 f"factors: expert_idx={expert_idx} out of range [0, {self.num_experts})"
@@ -796,7 +808,13 @@ class FactoredExperts(nn.Module):
         if added_effective_per_expert is None:
             added_effective_per_expert = [added_r] * self.num_experts
         for e, eff_add in enumerate(added_effective_per_expert):
-            self.effective_ranks[name][e] = int(self.effective_ranks[name][e]) + int(eff_add)
+            eff_add = int(eff_add)
+            if not (0 <= eff_add <= added_r):
+                raise ValueError(
+                    f"widen_rank {name!r}: added_effective_per_expert[{e}]={eff_add} "
+                    f"out of range [0, {added_r}]"
+                )
+            self.effective_ranks[name][e] = int(self.effective_ranks[name][e]) + eff_add
 
     # ---- Forward: mirrors Qwen3_5MoeExperts.forward --------------------
 
@@ -1498,7 +1516,7 @@ def _json_default(o: Any) -> Any:
     if hasattr(o, "tolist"):
         return o.tolist()
     if hasattr(o, "__dict__"):
-        d = o.__dict__
+        d = dict(o.__dict__)  # copy — do not return the live __dict__ reference
         if len(d) > 50:  # key-count-gated (gates on dict key count, not byte size)
             log.warning(
                 "_json_default: large object serialized via __dict__ (%d keys, type=%s)",
