@@ -20,10 +20,10 @@ REAM cost matrix (paper 2604.04356, reference ream/ream.py):
     approximation; see `compute_delta_expert` in `activation_hooks.py`),
     rescaled to [0,1] via (cosine+1)/2.
   - δ_REAM = (δ_gate + δ̃_expert) / 2 ∈ [0,1]; cost = 1 − δ_REAM.
-  - Grouping: single-pass greedy approximation of the optimal bipartite grouping
-    in paper §4 (descending centroid saliency); chosen for speed — may produce
-    suboptimal merge quality vs. the paper's results.  Full assignment guaranteed
-    by upfront feasibility check.
+  - Grouping: single-pass greedy procedure matching paper §4 exactly (descending
+    centroid saliency, absorb up to C nearest unassigned non-centroids per centroid).
+    The paper prescribes greedy, not optimal matching; this is spec-compliant.
+    Full assignment guaranteed by upfront feasibility check.
 
 Frequency-weighted merge with neuron permutation alignment is preserved.
 """
@@ -173,7 +173,25 @@ def run(
                 )
             grouped = {int(k): list(v) for k, v in data["grouped"].items()}
             freq = {int(k): int(v) for k, v in data["freq"].items()}
+            _freq_keys = set(freq.keys())
+            if _freq_keys != set(range(len(freq))):
+                raise RuntimeError(
+                    f"Layer {ref.layer_idx}: loaded freq has non-contiguous or unexpected keys — "
+                    "delete partial checkpoint and re-run from scratch"
+                )
             merge_map_layer = {int(k): list(v) for k, v in data["merge_map_layer"].items()}
+
+            _keys = set(merge_map_layer.keys())
+            if _keys != set(range(len(merge_map_layer))):
+                raise RuntimeError(
+                    f"Layer {ref.layer_idx}: loaded merge_map has non-contiguous keys {_keys} — "
+                    "delete partial checkpoint and re-run from scratch"
+                )
+            if any(not v for v in merge_map_layer.values()):
+                raise RuntimeError(
+                    f"Layer {ref.layer_idx}: loaded merge_map has empty member lists — "
+                    "delete partial checkpoint and re-run from scratch"
+                )
 
             # n_pre_merge is derived from len(freq) rather than a dedicated persisted
             # field. This is safe because freq is written with exactly one key per
@@ -190,8 +208,17 @@ def run(
 
             # ream_acc is not passed here: neuron means are not persisted to disk,
             # so permutation alignment on resume uses only gate/up weights.
+            log.warning(
+                "layer %d (resume): neuron-mean activation data not available on resume — "
+                "permutation alignment uses weight-only cost (C_gate + C_up, no C_act). "
+                "Merged weights may differ from a fresh run.",
+                ref.layer_idx,
+            )
             _merge_experts_inplace(ref, grouped, freq,
                                    freq_weighted=s2["ream"]["frequency_weighted_merge"])
+            # build_banks again: _merge_experts_inplace already called it internally, but
+            # bank.select() was never called on any of those banks, so the _last_kept_ids_*
+            # sentinel is still unset and this select() call is safe.
             banks = build_banks(ref)
             for bank in banks.values():
                 bank.select(final_kept_ids)
@@ -264,6 +291,12 @@ def run(
                 f"Layer {layer_ref.layer_idx}: budget target {target} > n_experts {n_experts}; "
                 "budget allocation is inconsistent with layer expert count"
             )
+        if target == n_experts:
+            log.warning(
+                "layer %d: budget target (%d) equals total expert count (%d) — "
+                "no merging will occur; check budget configuration.",
+                layer_ref.layer_idx, target, n_experts,
+            )
 
         effective_target = target
         ream_centroid_ids: list[int] = []
@@ -271,12 +304,14 @@ def run(
         grouped: dict[int, list[int]] = {}
         delta = np.empty((0, 0))
         assignment: list[int] = []
-        running_mean: float = 0.0
+        running_mean: float = float("nan")
         mean_assigned_cost: float = 0.0
         assigned_cost: float = 0.0
         # Invariant: after the bump loop, assignment is either:
         #   (a) a list of length len(ream_noncentroid_ids) with centroid indices (normal path), or
         #   (b) [] with ream_noncentroid_ids also [] (zero-merge fallback path).
+        # (c) c_fail last-resort: assignment holds the last above-threshold assignment
+        #     (len == len(ream_noncentroid_ids)); applied as best-available merge below.
         # b_fail / c_fail are initialized here so the post-loop fallback check never raises
         # NameError if the range were somehow empty.
         b_fail: bool = False
@@ -300,6 +335,7 @@ def run(
                         layer_ref.layer_idx, n_experts - len(protected), len(protected),
                     )
                     _warned_ream_target_zero = True
+                break
 
             # Select top-ream_target non-protected experts by REAP score (descending).
             # This is the greedy centroid selection order: highest-saliency centroid
@@ -345,6 +381,7 @@ def run(
                 delta = _ream_cost_matrix(
                     layer_ref, ream_noncentroid_ids, ream_centroid_ids,
                     ream_acc=ream_acc,
+                    blacklisted_ids=protected,
                 )
                 assignment = _assign_children_to_centroids(
                     delta, n_ream_nc, n_ream_c, max_group_cap,
@@ -396,7 +433,13 @@ def run(
                     layer_ref.layer_idx, n_ream_c, max_group_cap, n_ream_nc,
                     effective_target, new_effective,
                 )
+            # running_mean is always current here: c_fail=True can only be set inside the
+            # cost block (not b_fail path), which assigns running_mean before setting c_fail.
             if c_fail:
+                assert not math.isnan(running_mean), (
+                    "running_mean must be set before c_fail can be True; "
+                    "check that the c_fail assignment is co-located with the running_mean assignment"
+                )
                 log.warning(
                     "  layer %d: mean_cost=%.4f > threshold=%.4f — bumping target %d→%d",
                     layer_ref.layer_idx, mean_cost,
@@ -418,22 +461,29 @@ def run(
                 "applying above-threshold assignment as last resort",
                 layer_ref.layer_idx, b_fail, effective_target, n_experts,
             )
-
         # Fallback: if the bump loop exhausted without achieving feasibility
         # (b_fail still True and no assignment was built), log a WARNING and fall back
         # to keeping all non-protected experts as centroids (zero merges). This is the
         # safest fallback — it produces the least compression but loses no expert weights.
 
-        # Edge case: all non-protected experts were filtered by min_active_tokens so
-        # both REAM candidate lists are empty — no assignment is possible.  b_fail
-        # cannot detect this because n_ream_nc==0 always makes b_fail False, so we
-        # check the lists directly.
-        if not ream_noncentroid_ids and not ream_centroid_ids and n_experts > len(protected) and _original_ream_target > 0:
-            log.warning(
-                "layer %d: all non-protected experts failed the min_active_tokens filter — "
-                "no merging is possible", layer_ref.layer_idx
-            )
-        if b_fail and not assignment and ream_noncentroid_ids:
+        # Zero-target case: budget fully consumed by protected experts — no REAM
+        # centroids or non-centroids should exist and no merges should be produced.
+        # The bump loop broke out early, so ream_centroid_ids/ream_noncentroid_ids/
+        # assignment may still hold stale values from a previous attempt (or their
+        # initial [] defaults). Reset them explicitly so the grouping code below
+        # produces an empty grouped dict and all protected experts flow to final_kept_ids.
+        if _original_ream_target == 0:
+            ream_centroid_ids = []
+            ream_noncentroid_ids = []
+            assignment = []
+            delta = np.empty((0, 0))
+            b_fail = False
+            c_fail = False
+
+        # When b_fail: assignment is [] (reset at iteration top; b_fail skips _assign_children_to_centroids).
+        # When c_fail last-resort (effective_target >= n_experts break): assignment holds the last
+        # computed above-threshold result and is intentionally applied in the grouping step below.
+        if b_fail and ream_noncentroid_ids:
             log.warning(
                 "  layer %d: bump loop exhausted (effective_target=%d == n_experts=%d) "
                 "without achieving feasibility — falling back to zero-merge "
@@ -448,28 +498,49 @@ def run(
                 e for e in range(n_experts) if e not in protected
             ]
             ream_noncentroid_ids = []
+            assignment = []
+            delta = np.empty((0, 0))
 
         if not ream_centroid_ids and ream_noncentroid_ids and _original_ream_target > 0:
             log.warning(
-                "REAM layer %d: no centroids selected after bump loop (all non-protected experts "
-                "failed min_active_tokens or cost gate); promoting all non-protected experts to "
-                "kept without merging.",
+                "REAM layer %d: no centroids selected (all non-protected experts may have failed "
+                "min_active_tokens or cost gate); promoting all non-protected experts to singleton "
+                "centroids (zero-merge fallback).",
                 layer_ref.layer_idx,
             )
             ream_centroid_ids = list(ream_noncentroid_ids)
             ream_noncentroid_ids = []
+            assignment = []
+            delta = np.empty((0, 0))
 
         # Build REAM merge groups (keyed by REAM centroid only — protected experts
         # are not in grouped and their weights are not touched by _merge_experts_inplace).
         grouped = {c: [c] for c in ream_centroid_ids}
         # Protected experts should never appear as REAM centroids; verify the invariant.
-        assert all(eid not in grouped for eid in protected), \
-            "Protected expert appeared as a REAM centroid — invariant violated"
+        _protected_centroids = [eid for eid in protected if eid in grouped]
+        if _protected_centroids:
+            raise RuntimeError(
+                f"Layer {layer_ref.layer_idx}: protected expert(s) {_protected_centroids} "
+                "appeared as REAM centroids — invariant violated"
+            )
         for child_pos, centroid_pos in enumerate(assignment):
             if centroid_pos >= 0:
                 grouped[ream_centroid_ids[centroid_pos]].append(
                     ream_noncentroid_ids[child_pos]
                 )
+
+        for child_pos, centroid_pos in enumerate(assignment):
+            if centroid_pos < 0:
+                # Unassigned non-centroid: promote to singleton centroid to avoid weight loss.
+                orphan_eid = ream_noncentroid_ids[child_pos]
+                log.warning(
+                    "layer %d: non-centroid expert %d unassigned in capped grouping — "
+                    "promoted to singleton centroid to avoid weight loss",
+                    layer_ref.layer_idx, orphan_eid,
+                )
+                grouped[orphan_eid] = [orphan_eid]
+                ream_centroid_ids.append(orphan_eid)
+        ream_centroid_ids = sorted(set(ream_centroid_ids))
 
         assigned_cost = (
             sum(float(delta[ch, assignment[ch]])
@@ -482,7 +553,10 @@ def run(
         # Guard mirrors the resume-path condition (val > 0.0): exclude zero costs
         # so that layers with all-zero pair costs don't bias the running mean low
         # and suppress the cost-sigma bump gate for subsequent layers.
-        if n_assigned > 0 and mean_assigned_cost > 0.0:
+        # Also exclude last-resort c_fail assignments (bump loop exhausted with
+        # effective_target >= n_experts) — those costs would inflate the running mean
+        # and progressively suppress the c_fail gate for subsequent layers.
+        if n_assigned > 0 and mean_assigned_cost > 0.0 and not (c_fail and effective_target >= n_experts):
             _layer_mean_costs.append(mean_assigned_cost)
 
         _merge_experts_inplace(
@@ -506,10 +580,15 @@ def run(
             bank.select(final_kept_ids)
         _resize_router_for_kept_experts(layer_ref, final_kept_ids)
 
+        # Correctness depends on the RuntimeError guard above ensuring no protected expert
+        # appears in grouped. Without that guard, the else-branch would silently emit [eid]
+        # instead of the full merge group for a protected expert that was also a centroid.
         merge_map[layer_ref.layer_idx] = {
-            new_idx: ([eid] if eid in protected else sorted(grouped[eid]))
+            new_idx: (sorted(grouped[eid]) if eid in grouped else [eid])
             for new_idx, eid in enumerate(final_kept_ids)
         }
+        # Ordering critical: remap to post-merge indices BEFORE snapshotting.
+        # Writing pre-remap covariance would silently corrupt the resume path.
         _remap_covariance_for_layer(cov_acc, layer_ref.layer_idx, final_kept_ids)
 
         if partial_dir is not None:
@@ -517,14 +596,16 @@ def run(
             _write_merge_json(
                 partial_dir, layer_ref.layer_idx, final_kept_ids, grouped, freq,
                 merge_map[layer_ref.layer_idx],
-                mean_cost_per_pair=mean_assigned_cost,
+                mean_cost_per_pair=(
+                    mean_assigned_cost
+                    if n_assigned > 0 and mean_assigned_cost > 0.0 and not (c_fail and effective_target >= n_experts)
+                    else None
+                ),
             )
 
         max_group = max((len(g) for g in grouped.values()), default=0)
-        if ream_centroid_ids:
-            mean_group = len(ream_noncentroid_ids) / len(ream_centroid_ids)
-        else:
-            mean_group = 0.0
+        n_noncentroid_members = sum(len(g) - 1 for g in grouped.values())
+        mean_group = n_noncentroid_members / len(grouped) if grouped else 0.0
         log.info(
             "  kept %d / %d experts (protected=%d, ream_centroids=%d) — "
             "Σ cost=%.4f, max_group=%d, mean_group=%.2f",
@@ -537,7 +618,7 @@ def run(
             "stage2/ream_centroids": len(ream_centroid_ids),
             "stage2/total_experts": n_experts,
             "stage2/sum_assignment_cost": assigned_cost,
-            "stage2/mean_cost_per_pair": mean_assigned_cost,
+            "stage2/mean_cost_per_pair": mean_assigned_cost if n_assigned > 0 else float("nan"),
             "stage2/max_merge_group_size": max_group,
             "stage2/mean_merge_group_size": mean_group,
             "stage2/effective_target": effective_target,
@@ -623,7 +704,7 @@ def _write_merge_json(
     freq: dict[int, int],
     merge_map_layer: dict[int, list[int]],
     *,
-    mean_cost_per_pair: float = 0.0,
+    mean_cost_per_pair: float | None = None,
 ) -> None:
     """Write the per-layer merge record to a durable JSON file.
 
@@ -748,6 +829,7 @@ def _ream_cost_matrix(
     centroid_ids: list[int],
     *,
     ream_acc: ReamCostAccumulator,
+    blacklisted_ids: set[int] | None = None,
 ) -> np.ndarray:
     if not noncentroid_ids or not centroid_ids:
         # Early return produces shape (0, n_c) or (n_nc, 0) rather than (0, 0),
@@ -758,18 +840,32 @@ def _ream_cost_matrix(
     li = layer_ref.layer_idx
     n_nc = len(noncentroid_ids)
     n_c = len(centroid_ids)
+    n_experts_total = layer_ref.num_routed_experts
 
-    # Compute δ_gate for all (noncentroid, centroid) pairs in one matrix call.
-    # The observed-max dist2sim requires a full N×N pairwise distance matrix;
-    # a per-pair call cannot implement this correctly (Finding 1).
-    # We build a combined list [noncentroid_ids..., centroid_ids...] and slice
-    # the (noncentroid × centroid) submatrix from the full similarity matrix.
-    # N = len(noncentroid_ids) + len(centroid_ids); normalization must see all
-    # pairwise distances in this combined set, not the full expert population.
-    all_ids = noncentroid_ids + centroid_ids
-    sim_gate_full = ream_acc.compute_gate_similarity_matrix(li, all_ids)
-    # Submatrix: rows = noncentroids (0..n_nc-1), cols = centroids (n_nc..n_nc+n_c-1)
-    sim_gate_sub = sim_gate_full[:n_nc, n_nc:].numpy().astype(np.float64)  # (n_nc, n_c)
+    # Compute δ_gate over the non-protected expert population so that dist2sim
+    # normalizes by the global maximum distance among non-protected experts
+    # (spec §5 Step 2, REAM ref ream/ream.py lines 37-41). Including protected
+    # (super-expert) IDs would let their extreme gate-logit distances dominate
+    # d.max(), compressing all noncentroid–centroid similarities toward 1.0
+    # — DIST2SIM-PROTECTED-BIAS.
+    protected_set = set(blacklisted_ids) if blacklisted_ids else set()
+    all_n_ids = [e for e in range(n_experts_total) if e not in protected_set]
+    _nc_protected = set(noncentroid_ids) & protected_set
+    _c_protected  = set(centroid_ids)    & protected_set
+    if _nc_protected or _c_protected:
+        raise ValueError(
+            f"_ream_cost_matrix: noncentroid_ids or centroid_ids overlap with blacklisted_ids "
+            f"(nc={_nc_protected}, c={_c_protected})"
+        )
+    sim_gate_full = ream_acc.compute_gate_similarity_matrix(li, all_n_ids)
+    # id_to_full_row maps expert ID → row index in all_n_ids.
+    # Invariant: Stage 2 profiles each layer before merging it, so expert IDs are
+    # always pre-merge [0, n_experts_total) when _ream_cost_matrix is called.
+    id_to_full_row = {e: i for i, e in enumerate(all_n_ids)}
+    # Extract the (n_nc × n_c) submatrix from the full N×N matrix.
+    nc_rows = [id_to_full_row[e] for e in noncentroid_ids]
+    c_cols  = [id_to_full_row[e] for e in centroid_ids]
+    sim_gate_sub = sim_gate_full[np.ix_(nc_rows, c_cols)].numpy().astype(np.float64)  # (n_nc, n_c)
 
     cost = np.zeros((n_nc, n_c), dtype=np.float64)
 
@@ -794,9 +890,9 @@ def _assign_children_to_centroids(
 ) -> list[int]:
     """Single-pass greedy assignment of non-centroid children to centroids.
 
-    NOTE: This is a greedy approximation of the optimal bipartite grouping described
-    in paper §4 (which uses optimal matching). Chosen for speed; may produce suboptimal
-    merge quality vs. the paper's results.
+    NOTE: This implements the greedy pseudo-pruning procedure described in paper §4
+    exactly — the paper prescribes greedy (not optimal matching) for centroid grouping.
+    Optimal matching (Hungarian) appears only in intra-group neuron permutation alignment.
 
     When max_group_cap == 0 (uncapped), each child is independently assigned to its
     nearest centroid by cost (argmin over centroid columns), so every child is
@@ -827,7 +923,19 @@ def _assign_children_to_centroids(
         assignment = [-1] * n_children
         for ch in range(n_children):
             best_c = int(np.argmin(cost[ch, :]))
-            assignment[ch] = best_c
+            if not np.isfinite(cost[ch, best_c]):
+                assignment[ch] = -1
+            else:
+                assignment[ch] = best_c
+        n_unassigned = sum(1 for a in assignment if a < 0)
+        if n_unassigned > 0 and n_centroids > 0:
+            log.warning(
+                "_assign_children_to_centroids: %d/%d children unassigned after uncapped pass "
+                "(all-inf cost row(s) in cost matrix) — "
+                "these children will be dropped from the merge group unless the caller "
+                "promotes them as orphan centroids.",
+                n_unassigned, n_children,
+            )
         return assignment
 
     # Capped path (max_group_cap > 0): single-pass greedy, centroid order.
@@ -855,10 +963,25 @@ def _assign_children_to_centroids(
                     best_cost = cost[ch, c_idx]
                     best_child = ch
             if best_child < 0:
-                break  # no more unassigned children
+                # No unassigned children with finite cost remain for this centroid.
+                # Break to next centroid; any remaining unassigned children (all-inf
+                # cost rows) will be reported and promoted as orphan centroids by the
+                # caller. The caller must ensure costs are finite (via feasibility check)
+                # to guarantee all children are assigned.
+                break
             assignment[best_child] = c_idx
             assigned.add(best_child)
             absorbed += 1
+
+    n_unassigned = sum(1 for a in assignment if a < 0)
+    if n_unassigned > 0 and n_centroids > 0:
+        log.warning(
+            "_assign_children_to_centroids: %d/%d children unassigned after capped greedy pass "
+            "(likely cause: inf cost entries in cost matrix preventing assignment) — "
+            "these children will be dropped from the merge group unless the caller "
+            "promotes them as orphan centroids.",
+            n_unassigned, n_children,
+        )
 
     return assignment
 
@@ -876,18 +999,35 @@ def _permutation_align_to_centroid(
     ref_act_mean: torch.Tensor | None = None,
     child_act_mean: torch.Tensor | None = None,
 ) -> np.ndarray:
-    C = (
-        torch.cdist(ref_gate.cpu(), child_gate.cpu())
-        + torch.cdist(ref_up.cpu(), child_up.cpu())
-    )
+    def _safe_norm(M):
+        m_min = float(M.min())
+        m_max = float(M.max())
+        if m_max > m_min:
+            return (M - m_min) / (m_max - m_min)
+        return torch.zeros_like(M)
+
+    C_gate = torch.cdist(ref_gate.cpu(), child_gate.cpu())
+    C_up   = torch.cdist(ref_up.cpu(), child_up.cpu())
     if ref_act_mean is not None and child_act_mean is not None:
-        # Note: act_mean term (activation magnitude L1 diff) is added on the same
-        # scale as weight-space L2 distances; no normalization is applied. These
-        # quantities have incompatible units, but the combination works empirically.
-        C = C + torch.cdist(
-            ref_act_mean.cpu().unsqueeze(-1),
-            child_act_mean.cpu().unsqueeze(-1),
+        # L2-normalize both activation-mean vectors along the neuron dimension
+        # before computing L2 distance (spec §5, F2-PERM-ALIGN-NORM).
+        # eps=1e-8 guards against zero-norm vectors (all-zero activations);
+        # F.normalize returns a zero vector for those, which is the safest
+        # fallback (zero-norm input → zero output, no NaN).
+        ref_act_n   = torch.nn.functional.normalize(ref_act_mean.cpu().float(),   p=2, dim=0, eps=1e-8)
+        child_act_n = torch.nn.functional.normalize(child_act_mean.cpu().float(), p=2, dim=0, eps=1e-8)
+        C_act = torch.cdist(
+            ref_act_n.unsqueeze(-1),
+            child_act_n.unsqueeze(-1),
         )
+        # Scale each cost component to [0, 1] before summing so that
+        # L2-normalized activation distances (O(1/√d_ffn)) are not
+        # negligible relative to gate/up weight distances (O(√d_hidden))
+        # — spec §5, PERM-ACT-SCALE.
+        C_act = _safe_norm(C_act)
+        C = _safe_norm(C_gate) + _safe_norm(C_up) + C_act
+    else:
+        C = _safe_norm(C_gate) + _safe_norm(C_up)
     _, col_ind = linear_sum_assignment(C.numpy())
     return col_ind
 
@@ -906,10 +1046,22 @@ def _merge_experts_inplace(
         for centroid, members in grouped.items():
             if len(members) <= 1:
                 continue
-            weights = np.array([max(freq.get(m, 0), 1) for m in members], dtype=np.float64)
-            if not freq_weighted:
-                weights[:] = 1.0
-            weights = weights / weights.sum()
+            if freq_weighted:
+                weights = np.array([max(freq.get(m, 0), 0) for m in members], dtype=np.float64)
+                # Guard: if all members have zero calibration frequency (pathological
+                # edge case), fall back to equal weights rather than dividing by zero
+                # (spec freq_i / Σ freq_j formula requires Σ > 0 — F2-FREQ-WEIGHT-FLOOR).
+                if weights.sum() <= 0.0:
+                    log.warning(
+                        "layer %d centroid %d: all %d merge members have zero calibration "
+                        "frequency — falling back to equal weights",
+                        li, centroid, len(members),
+                    )
+                    weights[:] = 1.0
+                weights /= weights.sum()
+            else:
+                weights = np.ones(len(members), dtype=np.float64)
+                weights /= weights.sum()  # equal weights; no zero-sum risk
 
             # The centroid serves a dual role: it is the permutation-alignment reference
             # (via ref_gate/ref_up) AND a member of the weighted average (members[0]).
@@ -1011,6 +1163,13 @@ def _remap_covariance_for_layer(
             new_key = (li, id_to_new[eidx], name)
             new_cov[new_key] = val
             new_tokens[new_key] = cov.token_count.get(key, 0)
+        orphan_token_keys = set(cov.token_count.keys()) - set(cov.covariance.keys())
+        if orphan_token_keys:
+            log.warning(
+                "_remap_covariance_for_layer layer %d: %d orphaned token_count keys "
+                "not in covariance will be dropped: %s",
+                layer_idx, len(orphan_token_keys), orphan_token_keys,
+            )
         cov.covariance, cov.token_count = new_cov, new_tokens
     if n_dropped > 0:
         n_dropped_experts = len(dropped_expert_ids)
