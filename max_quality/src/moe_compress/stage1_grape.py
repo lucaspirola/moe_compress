@@ -255,6 +255,13 @@ def run(
             "cannot compute a meaningful floor. Check the model architecture."
         )
     min_experts = n_per_layer // 2
+    solver_floor = getattr(decomposition, "min_experts_per_layer", None)
+    if solver_floor is not None and solver_floor != min_experts:
+        log.warning(
+            "GRAPE floor (n_per_layer // 2 = %d) differs from budget solver floor (%d); "
+            "GRAPE may terminate early at the more permissive floor before reaching the budget.",
+            min_experts, solver_floor,
+        )
 
     budgets = _grape_greedy_merge(
         D_matrices=D_matrices,
@@ -287,13 +294,15 @@ def run(
     # Min-max normalise across layers → R̃^l ∈ [0, 1]
     r_min = min(R_raw.values())
     r_max = max(R_raw.values())
-    denom = r_max - r_min if r_max > r_min else 1.0
-    if r_max == r_min:
+    if r_max > r_min:
+        denom = r_max - r_min
+    else:
         # All layers have identical R_raw — redundancy collapses to 0.0 for all.
         # This is expected and benign for single-layer models (only one data point,
         # so min-max normalisation is undefined and R̃^l=0 for all layers). Also
         # expected when all layers have identical distance-sum profiles (e.g. uniform
         # random init in tests).
+        denom = 1.0
         log.debug(
             "Stage 1: all layers have identical R_raw=%.4g; R̃^l=0 for all layers "
             "(expected for single-layer models or uniform-init tests)",
@@ -320,14 +329,11 @@ def run(
     }
     budgets_path = artifacts_dir / "stage1_budgets.json"
     save_json_artifact(out, budgets_path)
-    if budgets:
-        log.info(
-            "Stage 1 complete — budgets range=[%d..%d] mean=%.1f → %s",
-            min(budgets.values()), max(budgets.values()),
-            np.mean(list(budgets.values())), budgets_path,
-        )
-    else:
-        log.info("Stage 1 complete — no budgets (empty model?) → %s", budgets_path)
+    log.info(
+        "Stage 1 complete — budgets range=[%d..%d] mean=%.1f → %s",
+        min(budgets.values()), max(budgets.values()),
+        np.mean(list(budgets.values())), budgets_path,
+    )
     return blacklist_path, budgets_path
 
 
@@ -363,6 +369,12 @@ def _detect_ma_layers(
     first_layer_idx = sorted_layer_indices[0]
 
     moe_layer_modules = {ref.layer_module: ref.layer_idx for ref in moe_layers}
+    if len(moe_layer_modules) != len(moe_layers):
+        raise ValueError(
+            "_detect_ma_layers: two MoELayerRef entries share the same layer_module object "
+            "(weight-tied layers?); hooks would fire only for one of them. "
+            f"Expected {len(moe_layers)} unique modules, got {len(moe_layer_modules)}."
+        )
     layer_max: dict[int, float] = {idx: 0.0 for idx in sorted_layer_indices}
     # Single-element list so the hook closure can mutate via index assignment.
     # Only the first layer is ever written; subsequent layers use layer_max only.
@@ -508,7 +520,8 @@ def _cka_distance_matrix(
 
     # Compute CKA pairwise using linear kernel.
     # Diagonal is 0 because torch.zeros initializes it and the loop only writes i<j pairs;
-    # CKA(X,X)=1→distance=0 is consistent but the code never evaluates it.
+    # CKA(X,X)=1→distance=0 is consistent but the CKA computation never evaluates self-pairs
+    # (the diagonal is present in D_work but masked by np.fill_diagonal(tmp, np.inf) in GRAPE).
     n = n_experts
     dist = torch.zeros(n, n, dtype=torch.float32)
     for i in range(n):
@@ -701,9 +714,9 @@ def _grape_greedy_merge(
         probs = probs[probs > 0]
         return float(-np.sum(probs * np.log(probs)))
 
-    if gamma == 0:
+    if gamma == 0.0:
         log.warning(
-            "GRAPE: gamma=0 — entropy gate at initial entropy — every entropy-reducing merge will trigger a freeze.",
+            "GRAPE: gamma=0.0 — entropy gate at initial entropy — every entropy-reducing merge will trigger a freeze.",
         )
     elif gamma < 0.0:
         log.warning(
@@ -760,14 +773,14 @@ def _grape_greedy_merge(
     # once; restarts do not consume a separate iteration — frozen.clear() and the next
     # merge both happen in the same iteration body). The factor n_moe_layers * 2 is well
     # above this tight bound.
-    max_iterations = current_total * n_moe_layers * 2
-    log.debug("GRAPE max_iterations=%d (current_total=%d, n_moe_layers=%d)",
-              max_iterations, current_total, n_moe_layers)
+    maxiter_ations = current_total * n_moe_layers * 2
+    log.debug("GRAPE maxiter_ations=%d (current_total=%d, n_moe_layers=%d)",
+              maxiter_ations, current_total, n_moe_layers)
     # n_merges counts successful merge operations only.  Structural-blocking skip-iterations
-    # advance _iter without incrementing n_merges, so n_merges <= _iter always.
+    # advance iter_ without incrementing n_merges, so n_merges <= iter_ always.
     n_merges = 0
-    exit_reason = "max_iter"
-    for _iter in range(max_iterations):
+    exit_reason = "maxiter_"
+    for iter_ in range(maxiter_ations):
         if current_total <= effective_budget:
             exit_reason = "budget"
             break
@@ -788,7 +801,7 @@ def _grape_greedy_merge(
         permanently_blocked = len(floor_blocked) + len(structurally_blocked - floor_blocked)
         non_perm_blocked = n_moe_layers - permanently_blocked
         if non_perm_blocked > 0 and len(frozen - structurally_blocked - floor_blocked) >= non_perm_blocked:
-            log.info("GRAPE iter %d: all non-permanently-blocked layers frozen → restart", _iter)
+            log.info("GRAPE iter %d: all non-permanently-blocked layers frozen → restart", iter_)
             frozen.clear()
             # After clearing frozen, the current iteration immediately runs layer selection
             # and may merge a layer that re-triggers the entropy gate on the following iteration.
@@ -834,7 +847,11 @@ def _grape_greedy_merge(
         # n is the original matrix dimension (total experts), not the count of
         # remaining unabsorbed experts.
         # i_star (absorbing centroid) is intentionally discarded here; Stage 2 re-derives
-        # the merge tree from covariance data.
+        # the merge tree from covariance data. Contract: Stage 2's centroid assignment must
+        # be consistent with the per-layer expert budgets computed here, but the specific
+        # i_star→j_star pairing may differ from GRAPE's selection. This delegation is
+        # intentional (deviation D6) — Stage 2's covariance-weighted centroid is higher
+        # quality than GRAPE's distance-argmin centroid.
         _, j_star = divmod(flat_idx, n)
 
         # D4: zero entire row/column of absorbed expert j_star and update R.
@@ -867,12 +884,12 @@ def _grape_greedy_merge(
     log.info("GRAPE: converged at %d non-blacklisted experts (target %d) after %d merges (exit=%s)",
              current_total, effective_budget, n_merges, exit_reason)
 
-    if current_total > effective_budget and exit_reason == "max_iter":
+    if current_total > effective_budget and exit_reason == "maxiter_":
         log.warning(
             "GRAPE: could not reach effective_budget=%d non-blacklisted (achieved=%d) "
-            "after %d iterations (max_iterations=%d). "
+            "after %d iterations (maxiter_ations=%d). "
             "Consider reducing min_experts_per_layer or the target reduction ratio.",
-            effective_budget, current_total, _iter + 1, max_iterations,
+            effective_budget, current_total, iter_ + 1, maxiter_ations,
         )
 
     # Stage 2 reads per-layer budgets as TOTAL centroid count (blacklisted + non-blacklisted).
