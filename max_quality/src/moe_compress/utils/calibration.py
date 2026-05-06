@@ -44,10 +44,10 @@ _CASCADE_SUBSETS = {
     "math": 0.21,
     "science": 0.11,
     "chat": 0.56,
-    "instruction_following": 0.0331,
-    "conversational_agent": 0.0331,
+    "instruction_following": 0.034,
+    "conversational_agent": 0.033,
     "swe": 0.02,
-    "terminal_agent": 0.0331,
+    "terminal_agent": 0.033,
     # Not listed in the default production mix but accepted if requested:
     "safety": 0.0,
 }
@@ -282,7 +282,7 @@ def spec_from_config(
     own internal ``+1`` offset independently; Stage 0 callers typically pass
     ``seed_offset=0`` to ``spec_from_config`` and rely on that internal offset.
     """
-    source = cal_cfg.get("source", "c4-math-code")
+    source = cal_cfg.get("source", "nvidia-cascade")
     seed = (int(cal_cfg.get("seed", 0)) + seed_offset) % (2**32)
     for required_key in ("num_sequences", "sequence_length"):
         if required_key not in cal_cfg:
@@ -398,9 +398,9 @@ def _distribute_counts(total: int, weights: dict[str, float]) -> dict[str, int]:
     remainder = total - sum(out.values())
     # remainder can be negative if float arithmetic causes sum(raw) to slightly
     # exceed total; handle both directions so sum(out.values()) == total exactly.
-    if abs(remainder) >= len(weights):
+    if abs(remainder) > len(weights):
         raise ValueError(
-            f"_distribute_counts: remainder {remainder} equals or exceeds key count "
+            f"_distribute_counts: remainder {remainder} exceeds key count "
             f"{len(weights)} — float arithmetic error is larger than expected"
         )
     if remainder != 0:

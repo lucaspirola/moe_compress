@@ -296,8 +296,15 @@ def solve(
         # `round(experts_to_prune)` in `_project_expert_budget`, which discretises the surviving
         # expert count.  tolerance should be >= 0.5 * ppa/total_params (the half-expert rounding
         # step) to guarantee convergence.
-        # expert_params > 0 is verified at line 143, so projected_total_reduction cannot be 0.
-        assert projected_total_reduction > 0, "unreachable: expert_params > 0 guaranteed at entry"
+        # projected_total_reduction > 0 is guaranteed by two invariants: (a) at least one of ep
+        # or sp is positive (both are initialised > 0 and the floor-clamp branch's sp formula
+        # always gives sp > 0 when ep = 0), so expert_savings > 0; (b) expert_params > 0
+        # (verified at line 143).  Together these ensure the denominator and numerator are
+        # both positive.
+        assert projected_total_reduction > 0, (
+            "unreachable: ep > 0 or sp > 0 is maintained as a loop invariant, "
+            "ensuring expert_savings > 0 given expert_params > 0"
+        )
         scale = target_total_reduction / projected_total_reduction
         ep = min(_MAX_EP, ep * scale)
         sp = min(_MAX_SP, sp * scale)  # scale sp independently, then clamp (avoids deriving from possibly-clamped ep)
@@ -306,14 +313,21 @@ def solve(
         if ep * expert_params > max_prunable_params:
             ep = max_prunable_params / expert_params
             if ep > _MAX_EP:
-                log.debug("solve: floor-clamp ep=%.4f exceeds _MAX_EP=%.4f; clamping", ep, _MAX_EP)
+                # Unusual case: the protected-expert floor (min_pool/total_routed) itself
+                # exceeds the ceiling cap _MAX_EP.  Apply the ceiling cap so ep stays in
+                # [0, _MAX_EP]; this means we prune fewer experts than the floor would
+                # allow, and sp will absorb the residual.
+                log.debug(
+                    "solve: floor-clamp ep=%.4f (min_pool/total_routed) exceeds _MAX_EP=%.4f; "
+                    "further clamping to ceiling",
+                    ep, _MAX_EP,
+                )
                 ep = _MAX_EP
-            # ep is now fixed by the protected-expert floor (and additionally ceiling-clamped
-            # to _MAX_EP above), so the effective ep used is min(floor_ep, _MAX_EP).  Recompute
-            # the actual integer-rounded surviving expert count at this clamped ep, then solve for
-            # sp from the forward model's exact integer arithmetic rather than the continuous
-            # approximation.  This prevents oscillation between iterations caused by the mismatch
-            # between the continuous formula and the quantised expert count.
+            # ep is now fixed at min(min_pool/total_routed, _MAX_EP).  Recompute the actual
+            # integer-rounded surviving expert count at this clamped ep, then solve for sp
+            # from the forward model's exact integer arithmetic rather than the continuous
+            # approximation.  This prevents oscillation between iterations caused by the
+            # mismatch between the continuous formula and the quantised expert count.
             n_surviving_at_clamped_ep = _project_expert_budget(
                 per_layer_counts, protected_per_layer,
                 ep * expert_params, params_per_expert_avg,
@@ -323,14 +337,6 @@ def solve(
             n_pruned_at_floor = total_routed - n_surviving_at_clamped_ep
             actual_prune_at_floor = n_pruned_at_floor * params_per_expert_avg
             after_prune_at_floor = expert_params - actual_prune_at_floor
-            # ep = max_prunable_params / expert_params = min_pool / total_routed < 1.0,
-            # since the floor-clamp only fires when protected experts exist (n_surviving_at_floor >= 1),
-            # guaranteeing min_pool < total_routed. ep is re-clamped to _MAX_EP above.
-            if ep > _MAX_EP:
-                raise RuntimeError(
-                    f"ep={ep:.6f} exceeds _MAX_EP={_MAX_EP}; this should be unreachable "
-                    f"(ep is clamped to _MAX_EP at the floor-clamp branch above)"
-                )
             # Discretisation-consistent formula: sp needed so that
             #   after_prune_at_floor * (1 - sp) = expert_params - target * total_params
             # i.e. sp = 1 - residual / after_prune_at_floor
@@ -416,6 +422,10 @@ def _project_expert_budget(
     # experts. Per-layer allocation is handled downstream by GRAPE.
     # round, not ceil, to avoid systematic over-pruning bias
     experts_to_prune = round(target_prune_params / max(params_per_expert_avg, 1e-9))
+    # Clamp to [0, max_prunable].  max_prunable >= 0 is guaranteed by callers (min_pool is
+    # clamped to 0 at the call site; internal computation uses max(0, ...) per-layer sums).
+    # The max(0, ...) is a defensive guard in case target_prune_params is subnormal-negative
+    # (cannot happen in normal operation, but avoids a silent negative surviving count).
     experts_to_prune = min(experts_to_prune, max_prunable)
     experts_to_prune = max(0, experts_to_prune)
     if total_experts is None:

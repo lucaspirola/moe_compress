@@ -1225,7 +1225,7 @@ def load_compressed_model(
 
     path = Path(path)
     try:
-        meta = json.loads((path / COMPRESSED_METADATA_FILENAME).read_text())
+        meta = json.loads((path / COMPRESSED_METADATA_FILENAME).read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise FileNotFoundError(
             f"load_compressed_model: {path!r} does not look like a compressed checkpoint "
@@ -1537,19 +1537,45 @@ def save_json_artifact(obj, path: str | Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        with tmp.open("w") as f:
+        with tmp.open("w", encoding="utf-8") as f:
             json.dump(obj, f, indent=2, sort_keys=True, default=_json_default)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
+        # Flush the parent-directory entry so the rename survives power loss.
+        # This is step 4 of the §11 durable-write protocol.
+        _fsync_dir(path.parent)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
     return path
 
 
+def _fsync_dir(directory: Path) -> None:
+    """fsync the directory so that a rename into it survives a power cut.
+
+    Per §11 of the spec: after ``os.replace(tmp, path)`` the new directory
+    entry must be flushed with ``fsync(parent_dir)`` to make it durable on
+    POSIX systems that do not journal directory entries synchronously.
+    """
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        # Best-effort: some filesystems (e.g. tmpfs, FUSE FUSE mounts used by
+        # HF Jobs) raise EINVAL or ENOTSUP on fsync(dir). We log and continue
+        # rather than crashing — the rename is already atomic at the OS level;
+        # the fsync is only needed for kernel-panic / power-loss durability.
+        log.debug("_fsync_dir: fsync(%s) raised OSError (non-durable fs?)", directory)
+
+
 def load_json_artifact(path: str | Path) -> Any:
     path = Path(path)
     try:
-        with path.open() as f:
+        with path.open(encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError as e:
         raise FileNotFoundError(f"Artifact not found: {path}") from e

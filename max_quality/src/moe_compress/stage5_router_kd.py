@@ -175,14 +175,10 @@ def run(
                     f"{len(_teacher_state['refs'])} vs {student_refs_count}"
                 )
             return _teacher_state["model"]
-    if use_compile:
-        try:
-            log.info("Stage 5: torch.compile(student, mode='reduce-overhead')")
-            student = torch.compile(student, mode="reduce-overhead")
-        except Exception as exc:
-            log.warning("Stage 5: torch.compile failed (%s) — falling back to eager mode", exc)
-            use_compile = False
-
+    # Freeze non-router parameters BEFORE compiling the student so that the
+    # compiled graph is traced with the final requires_grad flags. Compiling
+    # before freeze risks the compiler baking in the wrong gradient-enabled
+    # state for parameters that are about to be frozen.
     _freeze_non_routers(student, s5["trainable_name_patterns"])
 
     # Optimizer constructed AFTER freezing so it only receives parameters that
@@ -190,7 +186,21 @@ def run(
     optim = torch.optim.AdamW(
         [p for p in student.parameters() if p.requires_grad],
         lr=s5["learning_rate"],
+        weight_decay=0.0,  # paper Table 1 does not specify weight decay; default 0.01 would
+                           # regularize router weights toward zero, counteracting KD gradient.
     )
+
+    # torch.compile applied AFTER freeze+optimizer construction so the compiled
+    # graph reflects the final frozen parameter layout. named_parameters() on
+    # the compiled wrapper delegates to the underlying module — the optimizer
+    # already holds the correct parameter references before compilation.
+    if use_compile:
+        try:
+            log.info("Stage 5: torch.compile(student, mode='reduce-overhead')")
+            student = torch.compile(student, mode="reduce-overhead")
+        except Exception as exc:
+            log.warning("Stage 5: torch.compile failed (%s) — falling back to eager mode", exc)
+            use_compile = False
 
     spec = spec_from_config(
         cal,
@@ -294,9 +304,12 @@ def run(
             continue
         for i, batch in enumerate(batches):
             # Fast-forward: skip batches already processed in the resumed run.
-            # resume_batch_i was already processed (checkpoint saved after it),
-            # so skip 0..(resume_batch_i-1) and re-process from resume_batch_i.
-            if epoch == resume_epoch and i < resume_batch_i:
+            # resume_batch_i is the last batch of the grad-accum window that
+            # triggered the checkpoint — the optimizer step has already occurred
+            # for that entire window (including batch resume_batch_i itself).
+            # Skip 0..resume_batch_i (inclusive) to avoid re-running the already-
+            # completed step and triggering a spurious duplicate optimizer step.
+            if epoch == resume_epoch and i <= resume_batch_i:
                 continue
 
             if device is not None:
@@ -323,6 +336,7 @@ def run(
             # Student: full forward pass with gradients (routers are trainable).
             student_out = student(input_ids=batch)
             student_vocab_logits = student_out.logits.to(torch.float32)  # [B, L, |V|]
+            del student_out  # free model output object; student_vocab_logits retains grad_fn
 
             # KL(teacher ‖ student) over vocabulary, per-token, scaled by τ².
             # Paper Eq. 3: L_RKD = (τ²/N_x) Σ_t KL(p_T^t ‖ p_S^t)
