@@ -584,6 +584,11 @@ class FactoredExperts(nn.Module):
             raise ValueError(
                 f"FactoredExperts: ranks dict is missing required keys: {sorted(missing)}"
             )
+        for key in ("gate_proj", "up_proj", "down_proj"):
+            if not isinstance(ranks[key], int) or ranks[key] <= 0:
+                raise ValueError(
+                    f"FactoredExperts: ranks[{key!r}]={ranks[key]!r} must be a positive integer"
+                )
         self.num_experts = int(num_experts)
         self.hidden_dim = int(hidden_dim)
         self.intermediate_dim = int(intermediate_dim)
@@ -783,6 +788,14 @@ class FactoredExperts(nn.Module):
                 f"added_effective_per_expert length {len(added_effective_per_expert)} "
                 f"!= num_experts {self.num_experts}"
             )
+        if U_new.ndim != 3:
+            raise ValueError(
+                f"widen_rank {name!r}: U_new must be 3-D [N, d_out, r], got {U_new.ndim}D"
+            )
+        if V_new.ndim != 3:
+            raise ValueError(
+                f"widen_rank {name!r}: V_new must be 3-D [N, r, d_in], got {V_new.ndim}D"
+            )
         if U_new.shape[0] != self.num_experts:
             raise ValueError(
                 f"widen_rank U_new: expected {self.num_experts} experts, got {U_new.shape[0]}"
@@ -844,6 +857,11 @@ class FactoredExperts(nn.Module):
                 f"top_k_index and top_k_weights shape mismatch: "
                 f"{top_k_index.shape} vs {top_k_weights.shape}"
             )
+        if self.gate_proj_V.dtype != hidden_states.dtype:
+            raise RuntimeError(
+                f"FactoredExperts dtype mismatch: hidden_states={hidden_states.dtype}, "
+                f"factors={self.gate_proj_V.dtype}"
+            )
 
         # H-1 / N-1: OOB check (including negative indices) before F.one_hot,
         # which would otherwise raise a cryptic PyTorch error on bad indices.
@@ -888,11 +906,6 @@ class FactoredExperts(nn.Module):
         for i, (_, token_idx, _) in enumerate(expert_data):
             gathered[i, :len(token_idx)] = hidden_states[token_idx].detach()
 
-        if self.gate_proj_V.dtype != hidden_states.dtype:
-            raise RuntimeError(
-                f"FactoredExperts dtype mismatch: hidden_states={hidden_states.dtype}, "
-                f"factors={self.gate_proj_V.dtype}"
-            )
         # gate_proj_V is representative: all factor matrices share the same dtype
         # by construction in __init__ and set_factors (both use the same dtype param).
 
@@ -1243,8 +1256,11 @@ def load_compressed_model(
         )
 
     auto_cls = _pick_auto_class(list(getattr(cfg, "architectures", None) or []))
-    log.info("Building skeleton %s from config (no weights yet)", auto_cls.__name__)
-    model = auto_cls.from_config(cfg, torch_dtype=dtype, attn_implementation=attn_implementation)
+    log.info("Building skeleton %s from config on %s (no weights yet)", auto_cls.__name__, target_device)
+    # Build skeleton directly on target_device so _assign_storage device-match check passes
+    # when tensors are streamed from safetensors to target_device one-at-a-time.
+    with torch.device(target_device):
+        model = auto_cls.from_config(cfg, torch_dtype=dtype, attn_implementation=attn_implementation)
 
     _resize_moe_stack_to_metadata(model, meta, dtype=dtype, device=target_device)
 
