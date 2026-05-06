@@ -594,7 +594,7 @@ def _stream_legacy_texts(
         rows_seen += 1
         txt = row.get(key)
         if isinstance(txt, str) and txt.strip():
-            out.append(txt)
+            out.append(txt.strip())
             if len(out) >= count:
                 break
         if rows_seen >= circuit_limit:
