@@ -657,6 +657,12 @@ class FactoredExperts(nn.Module):
             )
         k = self.ranks[name]
         m, n = W.shape
+        d_out, d_in = self.matrix_shape(name)
+        if (m, n) != (d_out, d_in):
+            raise ValueError(
+                f"set_factors_from_weight: W.shape={tuple(W.shape)} expected ({d_out}, {d_in}) "
+                f"for {name!r} — check for transposed weight matrix"
+            )
         rank_bound = min(m, n)
         if k > rank_bound:
             raise ValueError(
@@ -807,13 +813,17 @@ class FactoredExperts(nn.Module):
         added_r = int(U_new.shape[-1])
         if added_effective_per_expert is None:
             added_effective_per_expert = [added_r] * self.num_experts
-        for e, eff_add in enumerate(added_effective_per_expert):
-            eff_add = int(eff_add)
+        # Validate all entries BEFORE mutating effective_ranks — partial mutation on bad
+        # input would leave the object in an inconsistent state (tensors widened but
+        # effective_ranks only partially updated).
+        eff_adds = [int(x) for x in added_effective_per_expert]
+        for e, eff_add in enumerate(eff_adds):
             if not (0 <= eff_add <= added_r):
                 raise ValueError(
                     f"widen_rank {name!r}: added_effective_per_expert[{e}]={eff_add} "
                     f"out of range [0, {added_r}]"
                 )
+        for e, eff_add in enumerate(eff_adds):
             self.effective_ranks[name][e] = int(self.effective_ranks[name][e]) + eff_add
 
     # ---- Forward: mirrors Qwen3_5MoeExperts.forward --------------------
@@ -1345,9 +1355,12 @@ def load_compressed_model(
             )
         # Non-persistent buffers are not in the state_dict and were not moved by
         # _assign_storage; this call only affects them. Parameters are already on
-        # target_device from streaming and this is a no-op for them.
-        log.debug("Moving non-persistent buffers to %s", target_device)
-        model.to(target_device)
+        # target_device from streaming and would be a no-op — BUT only if device
+        # identity is canonical (cuda:0 != cuda in PyTorch's __eq__). Canonicalize
+        # first to prevent a spurious full-parameter copy that would double peak VRAM.
+        canonical_target = _canonical_device(target_device)
+        log.debug("Moving non-persistent buffers to %s", canonical_target)
+        model.to(canonical_target)
         torch.cuda.empty_cache()
 
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=trust_remote_code)
@@ -1457,10 +1470,11 @@ def _resize_moe_stack_to_metadata(
         # Always resize the router to match the target num_experts.
         if ref.router.weight.shape[0] != target_n:
             gw = ref.router.weight
-            assert gw.ndim == 2, (
-                f"_resize_moe_stack_to_metadata: router weight at layer {ref.layer_idx} "
-                f"expected 2D [num_experts, hidden_size], got shape {tuple(gw.shape)}"
-            )
+            if gw.ndim != 2:
+                raise RuntimeError(
+                    f"_resize_moe_stack_to_metadata: router weight at layer {ref.layer_idx} "
+                    f"expected 2D [num_experts, hidden_size], got shape {tuple(gw.shape)}"
+                )
             new_gw = nn.Parameter(torch.zeros(target_n, gw.shape[1],
                                               dtype=dtype, device=device),
                                   requires_grad=gw.requires_grad)
