@@ -116,8 +116,13 @@ def upload_stage_to_hub(
         return None
     layout = _STAGE_LAYOUT.get(stage_idx)
     if layout is None:
-        log.warning(
+        log.error(
             "upload_stage_to_hub: unknown stage %r — no upload performed", stage_idx,
+        )
+        return None
+    if HfApi is None:
+        log.warning(
+            "Stage %s Hub upload skipped: huggingface_hub not installed", stage_idx,
         )
         return None
     subdir, sidecars = layout
@@ -127,12 +132,6 @@ def upload_stage_to_hub(
         return None
 
     repo_id = f"{repo_base}-stage{stage_idx}"
-
-    if HfApi is None:
-        log.warning(
-            "Stage %s Hub upload skipped: huggingface_hub not installed", stage_idx,
-        )
-        return None
 
     api = HfApi()
     try:

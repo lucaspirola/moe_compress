@@ -62,8 +62,15 @@ class SystemMetrics:
         # ``_disabled`` short-circuits any source that has tripped the limit.
         self._fail_counts: dict[str, int] = {}
         self._disabled: set[str] = set()
+        # Serializes start()/stop() so idempotency checks + thread spawn/join
+        # are atomic even if called concurrently from multiple threads.
+        self._start_stop_lock = threading.Lock()
 
     def start(self) -> None:
+        with self._start_stop_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
         # Idempotent: if a thread is already running, don't double-spawn.
         if self._thread is not None and self._thread.is_alive():
             log.debug("SystemMetrics.start(): already running — no-op")
@@ -120,6 +127,10 @@ class SystemMetrics:
                  "on" if self.run is not None else "off")
 
     def stop(self, timeout: float | None = None) -> None:
+        with self._start_stop_lock:
+            self._stop_locked(timeout=timeout)
+
+    def _stop_locked(self, timeout: float | None = None) -> None:
         # Drop the Trackio Run reference FIRST so any in-flight tick that's
         # already past the ``if self.run is not None`` check still races
         # against a no-op rather than ``run.log`` after ``run.finish()``
