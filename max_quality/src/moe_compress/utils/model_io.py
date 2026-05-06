@@ -1124,12 +1124,17 @@ def _assign_storage(model: nn.Module, key: str, tensor: torch.Tensor) -> None:
             f"{existing.dtype} vs checkpoint {tensor.dtype}. "
             "Ensure the torch_dtype passed to load_compressed_model matches the dtype used when the checkpoint was saved."
         )
-    if _canonical_device(existing.device) != _canonical_device(tensor.device):
+    existing_dev = _canonical_device(existing.device)
+    incoming_dev = _canonical_device(tensor.device)
+    # Allow CPU-skeleton → CUDA-tensor: this is the intended streaming scenario where
+    # the Transformers skeleton starts on CPU (from_config default) and tensors are
+    # loaded one-at-a-time directly onto the target device, freeing CPU storage as we go.
+    # Reject anything else that isn't same-device (e.g. CUDA:0 → CUDA:1, CUDA → CPU).
+    if existing_dev != incoming_dev and existing_dev != torch.device("cpu"):
         raise RuntimeError(
-            f"_assign_storage: device mismatch on {key!r} — "
-            f"existing={_canonical_device(existing.device)}, "
-            f"incoming={_canonical_device(tensor.device)}. "
-            "Ensure target_device matches the device the model skeleton was built on."
+            f"_assign_storage: unexpected device on {key!r} — "
+            f"existing={existing_dev}, incoming={incoming_dev}. "
+            "Expected either matching devices or a CPU-skeleton → target-device stream."
         )
     if isinstance(existing, nn.Parameter):
         # Param: rebind .data so the registered Parameter object stays the
@@ -1256,11 +1261,11 @@ def load_compressed_model(
         )
 
     auto_cls = _pick_auto_class(list(getattr(cfg, "architectures", None) or []))
-    log.info("Building skeleton %s from config on %s (no weights yet)", auto_cls.__name__, target_device)
-    # Build skeleton directly on target_device so _assign_storage device-match check passes
-    # when tensors are streamed from safetensors to target_device one-at-a-time.
-    with torch.device(target_device):
-        model = auto_cls.from_config(cfg, torch_dtype=dtype, attn_implementation=attn_implementation)
+    log.info("Building skeleton %s from config on CPU (no weights yet)", auto_cls.__name__)
+    # from_config builds on CPU by default. _assign_storage permits the CPU→target_device
+    # swap so that each tensor can be loaded directly to target_device and the CPU storage
+    # freed before the next tensor is opened — one tensor peak, not a full second copy.
+    model = auto_cls.from_config(cfg, torch_dtype=dtype, attn_implementation=attn_implementation)
 
     _resize_moe_stack_to_metadata(model, meta, dtype=dtype, device=target_device)
 
@@ -1332,9 +1337,9 @@ def load_compressed_model(
     missing_final = sorted(expected_keys - loaded_keys)
     log.info("  load done: missing=%d unexpected=%d",
              len(missing_final), len(unexpected_all))
-    if missing_final[:5]:
+    if missing_final:
         log.debug("  sample missing: %s", missing_final[:5])
-    if unexpected_all[:5]:
+    if unexpected_all:
         log.debug("  sample unexpected: %s", unexpected_all[:5])
     # Fail loud on missing keys. A missing param/buffer means the skeleton's
     # default _init_weights value (random init) survives — the model will
@@ -1446,6 +1451,11 @@ def _resize_moe_stack_to_metadata(
             # fall back to the slot-width default that __init__ already set.
             if li in factored_effective:
                 for nm, vs in factored_effective[li].items():
+                    if nm not in new_fact.effective_ranks:
+                        raise RuntimeError(
+                            f"Layer {li}: effective_ranks metadata contains unknown "
+                            f"projection {nm!r}; expected one of {list(new_fact.effective_ranks)}"
+                        )
                     if len(vs) != new_fact.num_experts:
                         raise RuntimeError(
                             f"Layer {li}: effective_ranks[{nm!r}] has {len(vs)} entries "
