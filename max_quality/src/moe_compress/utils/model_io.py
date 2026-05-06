@@ -675,10 +675,10 @@ class FactoredExperts(nn.Module):
                 f"rank {k} exceeds matrix rank bound {rank_bound} for {name!r} "
                 f"(matrix shape {(m, n)})"
             )
-        Wf = W.to(torch.float32)
-        U, S, Vh = torch.linalg.svd(Wf, full_matrices=False)
         U_param = getattr(self, f"{name}_U")
         V_param = getattr(self, f"{name}_V")
+        Wf = W.to(device=U_param.device, dtype=torch.float32)
+        U, S, Vh = torch.linalg.svd(Wf, full_matrices=False)
         U_k = (U[:, :k] * S[:k]).to(U_param.dtype)
         V_k = Vh[:k, :].to(V_param.dtype)
         U_param.data[expert_idx].copy_(U_k)
@@ -831,6 +831,16 @@ class FactoredExperts(nn.Module):
                     f"widen_rank {name!r}: added_effective_per_expert[{e}]={eff_add} "
                     f"out of range [0, {added_r}]"
                 )
+        if U_new.device != cur_U.device:
+            raise ValueError(
+                f"widen_rank {name!r}: U_new is on {U_new.device}, "
+                f"existing U is on {cur_U.device}; move U_new to the correct device first"
+            )
+        if V_new.device != cur_V.device:
+            raise ValueError(
+                f"widen_rank {name!r}: V_new is on {V_new.device}, "
+                f"existing V is on {cur_V.device}"
+            )
         # All validation passed — now mutate tensors and metadata.
         new_U = torch.cat([cur_U.data, U_new.to(cur_U.dtype)], dim=-1).contiguous()
         new_V = torch.cat([cur_V.data, V_new.to(cur_V.dtype)], dim=-2).contiguous()
@@ -1313,16 +1323,16 @@ def load_compressed_model(
         with safe_open(str(s), framework="pt", device=str(target_device)) as f:
             for key in f.keys():
                 t = f.get_tensor(key)            # already on target_device
-                # Track largest tensor via the loaded tensor's numel × itemsize.
-                nbytes = t.numel() * t.element_size()
-                if nbytes > max_bytes:
-                    max_bytes = nbytes
-                    max_key = key
                 if key not in expected_keys:
                     unexpected_all.append(key)
                     n_unexpected_in_shard += 1
                     del t
                     continue
+                # Track largest *loaded* tensor (after unexpected-key skip).
+                nbytes = t.numel() * t.element_size()
+                if nbytes > max_bytes:
+                    max_bytes = nbytes
+                    max_key = key
                 _assign_storage(model, key, t)
                 loaded_keys.add(key)
                 n_loaded_in_shard += 1
