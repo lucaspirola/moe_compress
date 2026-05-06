@@ -338,10 +338,13 @@ class ReamCostAccumulator:
         # so they contribute minimum (0.0) similarity to every pair.
         mat = torch.where(torch.isnan(mat), torch.zeros_like(mat), mat)
 
-        # Early exit for all-zero profile matrix — cdist would yield all-zero distances,
-        # mapping to all-ones similarity, which is meaningless. Return zeros (minimum-
-        # similarity sentinel, consistent with the no-data contract in the docstring).
-        if mat.abs().sum() == 0:
+        # Early exit for all-zero (or near-zero) profile matrix — cdist would
+        # yield all-zero distances, mapping to all-ones similarity, which is
+        # meaningless.  Using an absolute threshold (< 1e-9) rather than exact
+        # equality avoids the case where near-zero but non-exactly-zero entries
+        # pass the check and then cause d.max().clamp(min=1e-12) to produce
+        # large negative sim values outside [0, 1].
+        if mat.abs().max() < 1e-9:
             return torch.zeros(n, n, dtype=torch.float32)
 
         # Full pairwise Euclidean distances → (n, n).
@@ -351,6 +354,9 @@ class ReamCostAccumulator:
         # Numerical robustness clamp for near-zero profiles (the all-zeros case is handled above).
         sim = 1.0 - d / d.max().clamp(min=1e-12)
         sim.fill_diagonal_(1.0)
+        # Safety clamp: floating-point rounding in cdist can push values
+        # infinitesimally outside [0, 1]; clamp to guarantee the contract.
+        sim.clamp_(0.0, 1.0)
 
         return sim.to(torch.float32)
 
@@ -376,8 +382,7 @@ class ReamCostAccumulator:
         if total == 0:
             # no profiling data — return NaN sentinel; callers must check math.isnan
             return float("nan")
-        avg_sim = sim_val / total
-        return (avg_sim + 1.0) / 2.0  # rescale cosine ∈ [-1, 1] → similarity ∈ [0, 1]
+        return float(min(1.0, max(0.0, (sim_val / total + 1.0) / 2.0)))  # rescale cosine ∈ [-1, 1] → similarity ∈ [0, 1], clamped
 
     def record_neuron_activations(
         self, layer_idx: int, expert_idx: int, intermediate: torch.Tensor,
@@ -449,12 +454,20 @@ class DownProjMaxAccumulator:
         with self._lock:
             prev = self._gpu.get(key)
             if prev is None:
-                self._gpu[key] = cur
+                self._gpu[key] = cur.clone()  # clone: amax() result may alias allocator memory reused by the next forward
             else:
                 # torch.maximum on a 0-dim scalar is cheap; do it under the lock to avoid lost updates
                 self._gpu[key] = torch.maximum(prev, cur)
 
     def finalize(self) -> None:
+        # Threading invariant: finalize() MUST be called only after all update()
+        # calls for the profiling pass are complete.  If update() fires between
+        # the two lock sections below (after the first lock clears _gpu but before
+        # the second lock writes per_expert_max), the new GPU tensor is left in
+        # _gpu and will only be processed on a subsequent finalize() call.  Since
+        # finalize() is typically called exactly once (at the end of calibration),
+        # any update() that races in will be silently lost.  Callers must ensure
+        # all forward passes are done before calling finalize().
         with self._lock:
             gpu_copy = dict(self._gpu)
             self._gpu.clear()
@@ -540,13 +553,18 @@ class ExpertOutputAccumulator:
                 seen += 1
                 if len(reservoir) < cap:
                     # Reservoir not full — always accept.
-                    reservoir.append(batch_cpu[i])
+                    # Clone so the reservoir entry owns its storage: batch_cpu[i]
+                    # is a row-view into batch_cpu, and if x was already float32
+                    # on CPU, .to(torch.float32) above returns the same storage.
+                    # Without cloning, a buffer-reuse forward pass could corrupt
+                    # previously stored reservoir entries (aliasing bug).
+                    reservoir.append(batch_cpu[i].clone())
                 else:
                     # Reservoir sampling: replace a random element with
                     # probability cap/seen.
                     j = random.randint(0, seen - 1)
                     if j < cap:
-                        reservoir[j] = batch_cpu[i]
+                        reservoir[j] = batch_cpu[i].clone()  # clone for same aliasing reason
 
             self._seen_count[key] = seen
 
@@ -576,7 +594,7 @@ class ExpertOutputAccumulator:
             else:
                 reservoir_copy = None
         if t is not None:
-            return t if t.numel() > 0 else None
+            return t.clone() if t.numel() > 0 else None
         if reservoir_copy:
             return torch.stack(reservoir_copy, dim=0)
         return None
@@ -615,6 +633,13 @@ class ReapAccumulator:
             self.freq[key] = self.freq.get(key, 0) + n_tokens
 
     def finalize_layer(self, layer_idx: int) -> None:
+        # Threading invariant: finalize_layer() MUST be called only after all
+        # forward passes for this layer are complete — no add_gpu() calls may
+        # be in-flight concurrently.  If add_gpu() fires between the two lock
+        # sections below, it can increment counts[k] while sums[k] is still 0;
+        # a concurrent score() call in that window would return 0.0 instead of
+        # the correct value.  The normal pipeline (all forwards → finalize_layer
+        # → score()) is safe; concurrent finalize+score is unsupported.
         with self._lock:
             keys = [k for k in self._gpu_sums if k[0] == layer_idx]
             gpu_items = [(k, self._gpu_sums.pop(k)) for k in keys]
@@ -624,7 +649,8 @@ class ReapAccumulator:
         cpu_items = [(k, float(gpu.cpu().item())) for k, gpu in gpu_items]
         # Merge all finalized sums in a single lock acquisition so score()
         # never observes a state where _gpu_sums has been popped but sums has
-        # not yet been updated (torn-read window eliminated — H-B).
+        # not yet been updated (within the expected single-threaded usage — see
+        # invariant comment above).
         with self._lock:
             for k, cpu_val in cpu_items:
                 self.sums[k] = self.sums.get(k, 0.0) + cpu_val
@@ -852,7 +878,7 @@ class InputCovarianceAccumulator:
             for k, disk_cov in payload["covariance"].items():
                 prev = self.covariance.get(k)
                 if prev is None:
-                    self.covariance[k] = disk_cov
+                    self.covariance[k] = disk_cov.to(storage_dtype)
                 else:
                     self.covariance[k] = (
                         prev.to(torch.float32) + disk_cov.to(torch.float32)
@@ -1244,6 +1270,14 @@ def capture_router_outputs(layer_refs: list[MoELayerRef]):
             x = inputs[0]
             if hasattr(router, "hidden_dim"):
                 x = x.reshape(-1, router.hidden_dim)
+            # Recompute the pre-softmax routing scores from the raw hidden state.
+            # Assumption: the Qwen3.5-MoE router applies no pre-linear transforms
+            # (e.g. no layer norm) to the hidden state before the weight projection.
+            # Verified against the Qwen3.5-MoE router implementation: the forward
+            # path is directly F.linear(hidden, weight) + optional bias terms, with
+            # no layer norm or other nonlinearity before the linear projection.
+            # If a future router variant adds pre-linear transforms, this hook must
+            # be updated to replicate them before the F.linear call.
             logits = F.linear(x, router.weight)
             if getattr(router, "bias", None) is not None:
                 logits = logits + router.bias
@@ -1251,7 +1285,7 @@ def capture_router_outputs(layer_refs: list[MoELayerRef]):
             # included to match routing decisions.
             if hasattr(router, "e_score_correction_bias") and router.e_score_correction_bias is not None:
                 logits = logits + router.e_score_correction_bias
-            storage[li].append(logits.detach())
+            storage[li].append(logits.detach().clone())  # clone: caching allocator may reuse the backing memory on next forward
         return _h
 
     for ref in layer_refs:

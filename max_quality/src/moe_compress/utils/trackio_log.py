@@ -9,9 +9,9 @@ with try/except blocks while preserving the graceful-fallback contract from
 Threading contract
 ------------------
 *Import-tracking state* (``_import_failed``, ``_warned_missing``,
-``_warned_import_exception``, ``_warned_log_bad_attr``) — protected by
-``_lock``; all reads and writes go through the lock so concurrent first calls
-are safe.
+``_warned_import_exception``, ``_warned_log_bad_attr_exc``,
+``_warned_log_bad_attr_noncallable``) — protected by ``_lock``; all reads
+and writes go through the lock so concurrent first calls are safe.
 ``_warned_import_exception`` gates the one-time warning for unexpected
 exceptions raised during the ``import trackio`` step (i.e. not an
 ``ImportError``).
@@ -70,7 +70,8 @@ _trackio: types.ModuleType | None = None
 _import_failed: bool = False
 _warned_missing: bool = False           # covers: ImportError (package absent or broken dep)
 _warned_import_exception: bool = False  # covers: unexpected Exception during import
-_warned_log_bad_attr: bool = False      # covers: trackio installed but mod.log non-callable (version/install issue); written by trackio_log when non-callable mod.log detected
+_warned_log_bad_attr_exc: bool = False          # covers: getattr(mod, 'log') raised an exception
+_warned_log_bad_attr_noncallable: bool = False  # covers: trackio installed but mod.log non-callable (version/install issue)
 
 # Runtime log-failure flags:
 _warned_log_failed: bool = False
@@ -101,7 +102,12 @@ def _import_trackio() -> types.ModuleType | None:
         with _lock:
             if _trackio is None and not _import_failed:   # re-check under lock
                 _trackio = trackio
-            return _trackio
+            # Prefer the locally-imported module to guard against a TOCTOU race
+            # where a concurrent except-branch set _import_failed before we
+            # re-acquired the lock, leaving _trackio as None despite a successful
+            # import on this thread.
+            result = _trackio if _trackio is not None else trackio
+        return result
     except ImportError:
         with _lock:
             _import_failed = True
@@ -134,7 +140,7 @@ def trackio_log(metrics: dict[str, Any]) -> None:
 
     Must be called from the main thread — ``trackio.log`` is not thread-safe.
     """
-    global _import_failed, _trackio, _warned_log_failed, _warned_log_bad_attr
+    global _import_failed, _trackio, _warned_log_failed, _warned_log_bad_attr_exc, _warned_log_bad_attr_noncallable
 
     if not isinstance(metrics, dict):
         raise TypeError(f"metrics must be a dict, got {type(metrics).__name__!r}")
@@ -144,15 +150,23 @@ def trackio_log(metrics: dict[str, Any]) -> None:
         return
     try:
         log_attr = getattr(mod, "log", None)
-    except Exception:
-        log_attr = None
+    except Exception as _exc:
+        with _lock:
+            _import_failed = True
+            _trackio = None   # clear cached module ref so future callers see None once latch is set
+            should_warn = not _warned_log_bad_attr_exc
+            if should_warn:
+                _warned_log_bad_attr_exc = True
+        if should_warn:
+            _log.warning("trackio: getattr(mod, 'log') raised %r — disabling trackio", _exc)
+        return
     if not callable(log_attr):
         with _lock:
             _import_failed = True
             _trackio = None   # clear cached module ref so future callers see None once latch is set
-            should_warn = not _warned_log_bad_attr
+            should_warn = not _warned_log_bad_attr_noncallable
             if should_warn:
-                _warned_log_bad_attr = True
+                _warned_log_bad_attr_noncallable = True
         if should_warn:  # local var; safe to read outside lock
             _log.warning(
                 "trackio has no callable 'log' attribute (check trackio version/installation): %r; "
