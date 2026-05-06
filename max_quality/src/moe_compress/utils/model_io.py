@@ -725,8 +725,8 @@ class FactoredExperts(nn.Module):
             raise ValueError(
                 f"set_factors: V.shape={tuple(V.shape)} expected {exp_V} for {name!r}"
             )
-        U_param.data[expert_idx].copy_(U.to(U_param.dtype))
-        V_param.data[expert_idx].copy_(V.to(V_param.dtype))
+        U_param.data[expert_idx].copy_(U.to(device=U_param.device, dtype=U_param.dtype))
+        V_param.data[expert_idx].copy_(V.to(device=V_param.device, dtype=V_param.dtype))
         self.effective_ranks[name][expert_idx] = int(effective_rank)
 
     def select_experts(self, kept_ids: list[int]) -> None:
@@ -831,12 +831,12 @@ class FactoredExperts(nn.Module):
                     f"widen_rank {name!r}: added_effective_per_expert[{e}]={eff_add} "
                     f"out of range [0, {added_r}]"
                 )
-        if U_new.device != cur_U.device:
+        if _canonical_device(U_new.device) != _canonical_device(cur_U.device):
             raise ValueError(
                 f"widen_rank {name!r}: U_new is on {U_new.device}, "
                 f"existing U is on {cur_U.device}; move U_new to the correct device first"
             )
-        if V_new.device != cur_V.device:
+        if _canonical_device(V_new.device) != _canonical_device(cur_V.device):
             raise ValueError(
                 f"widen_rank {name!r}: V_new is on {V_new.device}, "
                 f"existing V is on {cur_V.device}"
