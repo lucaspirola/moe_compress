@@ -118,10 +118,19 @@ def _load_teacher_cache(cache_path: Path, cache_key: str) -> dict | None:
             log.info("Teacher cache key mismatch (expected %s, found %s) — re-evaluating.",
                      cache_key, data.get("cache_key"))
             return None
-        log.info("Teacher eval cache HIT (%s) — skipping teacher load+eval entirely.", cache_key)
+        param_counts = data.get("teacher_param_counts")
+        if param_counts is None:
+            log.warning(
+                "Teacher eval cache HIT (%s) but cache lacks 'teacher_param_counts' "
+                "(legacy cache file). _measured_reduction will load the teacher model "
+                "from scratch to count parameters — this may take several minutes.",
+                cache_key,
+            )
+        else:
+            log.info("Teacher eval cache HIT (%s) — skipping teacher load+eval entirely.", cache_key)
         return {
             "results": data["teacher_results"],
-            "param_counts": data.get("teacher_param_counts"),
+            "param_counts": param_counts,
         }
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         log.warning("Teacher cache corrupted (%s) — re-evaluating.", exc)
@@ -141,12 +150,34 @@ def _save_teacher_cache(
     if teacher_param_counts is not None:
         data["teacher_param_counts"] = teacher_param_counts
     tmp = cache_path.with_suffix(".tmp")
+    # F-3: Split the try/except into two blocks so that a parent-dir fsync
+    # failure after a successful os.replace does not cause a misleading re-raise.
+    # After os.replace the cache file is durably on disk; the parent fsync is a
+    # belt-and-suspenders flush and its failure should not invalidate the write.
     try:
-        tmp.write_text(json.dumps(data, indent=2))
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_APPEND)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         os.replace(tmp, cache_path)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+    # Parent-dir fsync: best-effort only — file is already on disk after os.replace.
+    try:
+        parent_fd = os.open(str(cache_path.parent), os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except Exception as _fsync_exc:
+        log.debug(
+            "_save_teacher_cache: parent-dir fsync failed (%s); "
+            "cache file was already written by os.replace — continuing.",
+            _fsync_exc,
+        )
     log.info("Teacher eval cache saved → %s (key=%s)", cache_path, cache_key)
 
 
@@ -177,9 +208,9 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             use_torch_compile = False
 
     # Read batch size configs with defaults tuned for H200.
-    ppl_batch_size = s6.get("ppl_batch_size", 8)
+    ppl_batch_size = int(s6.get("ppl_batch_size", 8))
     lm_eval_batch_size = s6.get("lm_eval_batch_size", "auto:8")
-    gen_batch_size = s6.get("gen_batch_size", 8)
+    gen_batch_size = int(s6.get("gen_batch_size", 8))
 
     # 1. WikiText-2 PPL on student (Optimization #1: batch_size=8)
     if s6["wikitext2"]["enabled"]:
@@ -562,25 +593,39 @@ def _run_llama_imatrix_with_prebuilt_gguf(
     texts: list[str], icfg: dict, artifacts_dir: Path, gguf_result: dict,
 ) -> None:
     """Run llama-imatrix using the pre-built F16 GGUF from background thread."""
-    if not icfg.get("enabled", True):
-        return
-
     joined = "\n\n".join(t.strip() for t in texts if t and t.strip())
-    if not joined.strip():
-        log.warning("No calibration texts available; skipping imatrix generation.")
-        return
+    calib_path = artifacts_dir / "calibration_imatrix.txt"
 
     # Spec §9 Artifacts: calibration_imatrix.txt must ALWAYS be written (usable
     # even without llama.cpp).  Write it atomically before any guard so that
-    # a missing GGUF or llama.cpp installation does not suppress the file.
-    # _generate_imatrix (fallback path) also writes it atomically, so a double-
-    # write is idempotent and safe.
-    calib_path = artifacts_dir / "calibration_imatrix.txt"
+    # imatrix.enabled=False or a missing GGUF/llama.cpp installation does not
+    # suppress the file.  _generate_imatrix (fallback path) also writes it
+    # atomically, so a double-write is idempotent and safe.
+    # Spec §11: write to .tmp → fsync .tmp → os.replace → fsync parent dir.
+    # F-1: Write unconditionally — even when joined is empty — so the artifact
+    # is always present as required by the spec.
     calib_tmp = calib_path.with_suffix(".tmp")
     calib_tmp.write_text(joined, encoding="utf-8")
+    fd = os.open(str(calib_tmp), os.O_WRONLY | os.O_APPEND)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     os.replace(calib_tmp, calib_path)
+    parent_fd = os.open(str(calib_path.parent), os.O_RDONLY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
     log.info("imatrix: calibration file written (%d docs, %d chars) → %s",
              len(texts), len(joined), calib_path)
+
+    if not icfg.get("enabled", True):
+        return
+
+    if not joined.strip():
+        log.warning("No calibration texts available; skipping imatrix generation.")
+        return
 
     f16_path = gguf_result.get("f16_path")
     if f16_path is None or not f16_path.exists():
@@ -736,7 +781,10 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
             skipped_batches, total_batches,
             100.0 * (total_batches - skipped_batches) / max(1, total_batches),
         )
-    return math.exp(nll_sum / tok_count)
+    try:
+        return math.exp(nll_sum / tok_count)
+    except OverflowError:
+        return float("inf")
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +897,10 @@ def _generate_batched(model, tokenizer, prompts: list[str], *, max_new: int,
                     **encoded,
                     max_new_tokens=max_new,
                     do_sample=False,
-                    pad_token_id=eos_id,
+                    # tokenizer.pad_token_id is set to eos_token_id by the guard
+                    # above; fall back to 0 if both are absent so generate() never
+                    # receives None.
+                    pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
                 )
 
             input_len = encoded["input_ids"].shape[1]  # padded width, same for all in batch
@@ -1237,13 +1288,20 @@ def _measured_reduction(
             "expert_reduction_ratio": None,
         }
 
+    # F-2: When t_expert == 0 (non-MoE teacher), max(t_expert, 1) yields 1 and
+    # s_expert is also 0, so the formula would produce expert_reduction_ratio=1.0 —
+    # misleadingly suggesting 100% expert reduction.  Use None instead.
+    expert_reduction_ratio = (
+        None if t_expert == 0
+        else 1.0 - (s_expert / t_expert)
+    )
     return {
         "total_student": s_total,
         "total_teacher": t_total,
         "total_reduction_ratio": 1.0 - (s_total / max(t_total, 1)),
         "expert_student": s_expert,
         "expert_teacher": t_expert,
-        "expert_reduction_ratio": 1.0 - (s_expert / max(t_expert, 1)),
+        "expert_reduction_ratio": expert_reduction_ratio,
     }
 
 
@@ -1253,24 +1311,38 @@ def _measured_reduction(
 
 
 def _generate_imatrix(texts: list[str], icfg: dict, artifacts_dir: Path) -> None:
+    calib_path = artifacts_dir / "calibration_imatrix.txt"
+    joined = "\n\n".join(t.strip() for t in texts if t and t.strip())
+
+    # Spec §9 Artifacts: calibration_imatrix.txt must ALWAYS be written (usable
+    # even without llama.cpp), before the enabled guard so that
+    # imatrix.enabled=False does not suppress the file.
+    # Spec §11: write to .tmp → fsync .tmp → os.replace → fsync parent dir.
+    # F-1: Write unconditionally — even when joined is empty — so the artifact
+    # is always present as required by the spec.
+    calib_tmp = calib_path.with_suffix(".tmp")
+    calib_tmp.write_text(joined, encoding="utf-8")
+    fd = os.open(str(calib_tmp), os.O_WRONLY | os.O_APPEND)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(calib_tmp, calib_path)
+    parent_fd = os.open(str(calib_path.parent), os.O_RDONLY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    log.info("imatrix: calibration file written (%d docs, %d chars) → %s",
+             len(texts), len(joined), calib_path)
+
     if not icfg.get("enabled", True):
         log.info("imatrix: disabled via config.")
         return
 
-    calib_path = artifacts_dir / "calibration_imatrix.txt"
-    joined = "\n\n".join(t.strip() for t in texts if t and t.strip())
     if not joined.strip():
         log.warning("No calibration texts available; skipping imatrix generation.")
         return
-
-    # Spec §9 Artifacts: calibration_imatrix.txt must ALWAYS be written (usable
-    # even without llama.cpp).  Write it atomically before any llama.cpp guard
-    # so that a missing llama.cpp installation does not suppress the file.
-    calib_tmp = calib_path.with_suffix(".tmp")
-    calib_tmp.write_text(joined, encoding="utf-8")
-    os.replace(calib_tmp, calib_path)
-    log.info("imatrix: calibration file written (%d docs, %d chars) → %s",
-             len(texts), len(joined), calib_path)
 
     llama_cpp_dir = _find_llama_cpp_dir(icfg.get("llama_cpp_dir"))
     if llama_cpp_dir is None:
@@ -1388,16 +1460,16 @@ def _check_thresholds(results: dict, thresholds: dict, *, s6_cfg: dict | None = 
     delta = results.get("delta", {})
     wt = delta.get("wikitext2_ppl")
     wt_thresh = thresholds.get("wikitext2_ppl_relative_max_increase", None)
-    # M3: Correct elif ordering — check _non_finite_skipped BEFORE wt_thresh is None,
-    # otherwise the wt_thresh is None branch silently shadows the non-finite case
-    # when both conditions are true.
-    # Order:
+    # Elif ordering matters — non-finite auto-fails must come BEFORE the
+    # `wt is None and wt_thresh is None` catch-all, otherwise a student with
+    # inf/nan PPL passes silently when no threshold is configured.
+    # Actual branch order:
     #   1.  Both wt and wt_thresh present → perform the relative check.
-    #   2.  wt is None AND wt_thresh is None → no eval, no threshold; warn only.
-    #   2b. wikitext2_ppl teacher was non-finite → skip (teacher issue, not student failure).
-    #   3.  wikitext2_ppl student was non-finite → treat as automatic FAILURE (H3/M5).
-    #   4.  wt_thresh is None → threshold unconfigured; skip (no penalty).
-    #   5.  wt is None → data missing despite threshold being set.
+    #   2.  wikitext2_ppl student non-finite → auto-FAIL (H3/M5), regardless of threshold.
+    #   3.  wikitext2_ppl teacher non-finite → skip (teacher issue, not student failure).
+    #   4.  wt is None AND wt_thresh is None → no eval, no threshold; debug only.
+    #   5.  wt_thresh is None → threshold unconfigured; skip (no penalty).
+    #   6.  wt is None → data missing despite threshold being set.
     if wt is not None and wt_thresh is not None:
         # Use pre-computed delta (student - teacher): positive = student PPL higher = worse.
         if wt["teacher"] <= 0:
@@ -1429,10 +1501,18 @@ def _check_thresholds(results: dict, thresholds: dict, *, s6_cfg: dict | None = 
                 rel * 100, wt_thresh * 100, "PASS" if passed else "FAIL",
             )
             checks["wikitext2_ppl_increase_ok"] = passed
-    elif wt is None and wt_thresh is None:
-        # Neither eval result nor threshold is present — nothing to do.
-        # N-2: This is a by-design configuration, not an unexpected condition; use DEBUG.
-        log.debug("Threshold key 'wikitext2_ppl_relative_max_increase' missing from config and no wikitext2_ppl result — skipping check")
+    elif "wikitext2_ppl" in delta.get("_non_finite_skipped", []):
+        # H3 / M5: A non-finite student PPL (inf/nan) is an automatic failure.
+        # MUST be checked BEFORE the `wt is None and wt_thresh is None` catch-all:
+        # when wt_thresh is unconfigured, both conditions are true and the catch-all
+        # would silence this auto-fail, allowing overall_pass=True for a model with
+        # infinite PPL.  Non-finite student values always auto-fail regardless of
+        # whether a threshold was configured.
+        log.warning(
+            "_check_thresholds: wikitext2_ppl was non-finite (student PPL=inf/nan); "
+            "treating as automatic threshold FAILURE rather than a skipped check.",
+        )
+        checks["wikitext2_ppl_increase_ok"] = False
     elif "wikitext2_ppl" in delta.get("_teacher_non_finite_skipped", []):
         # M-1: Teacher PPL was non-finite (teacher eval failed); this is a teacher issue,
         # not a student failure — skip the check rather than auto-failing the student.
@@ -1441,15 +1521,10 @@ def _check_thresholds(results: dict, thresholds: dict, *, s6_cfg: dict | None = 
             "skipping threshold check (teacher eval issue, not student failure).",
         )
         skipped_checks["wikitext2_ppl_increase_ok"] = "teacher wikitext2_ppl non-finite (teacher eval issue)"
-    elif "wikitext2_ppl" in delta.get("_non_finite_skipped", []):
-        # H3 / M5: A non-finite student PPL (inf/nan) is an automatic failure.
-        # Putting it in skipped_checks would allow overall_pass=True, which is wrong —
-        # a model that produces infinite PPL has catastrophically degraded.
-        log.warning(
-            "_check_thresholds: wikitext2_ppl was non-finite (student PPL=inf/nan); "
-            "treating as automatic threshold FAILURE rather than a skipped check.",
-        )
-        checks["wikitext2_ppl_increase_ok"] = False
+    elif wt is None and wt_thresh is None:
+        # Neither eval result nor threshold is present — nothing to do.
+        # N-2: This is a by-design configuration, not an unexpected condition; use DEBUG.
+        log.debug("Threshold key 'wikitext2_ppl_relative_max_increase' missing from config and no wikitext2_ppl result — skipping check")
     elif wt_thresh is None:
         # Threshold not configured but wt result exists — unconfigured threshold, skip.
         log.warning("Threshold key 'wikitext2_ppl_relative_max_increase' missing from config — skipping check")

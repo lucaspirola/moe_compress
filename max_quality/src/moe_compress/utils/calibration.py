@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 
@@ -48,8 +49,6 @@ _CASCADE_SUBSETS = {
     "conversational_agent": 0.033,
     "swe": 0.02,
     "terminal_agent": 0.033,
-    # Not listed in the default production mix but accepted if requested:
-    "safety": 0.0,
 }
 
 
@@ -398,7 +397,7 @@ def _distribute_counts(total: int, weights: dict[str, float]) -> dict[str, int]:
     remainder = total - sum(out.values())
     # remainder can be negative if float arithmetic causes sum(raw) to slightly
     # exceed total; handle both directions so sum(out.values()) == total exactly.
-    if abs(remainder) > len(weights):
+    if abs(remainder) >= len(weights):
         raise ValueError(
             f"_distribute_counts: remainder {remainder} exceeds key count "
             f"{len(weights)} — float arithmetic error is larger than expected"
@@ -464,11 +463,11 @@ def _stream_cascade_texts(
     # buffer_size >> count so the shuffle has meaningful randomness even for
     # streaming datasets whose row count is large; capped to avoid OOM on
     # large datasets with small count values.
-    ds = ds.shuffle(seed=seed, buffer_size=min(max(10000, count * _CIRCUIT_BREAKER_MULTIPLIER), 100_000))
+    circuit_limit = _CIRCUIT_BREAKER_MULTIPLIER * count
+    ds = ds.shuffle(seed=seed, buffer_size=min(max(10_000, circuit_limit), 200_000))
 
     out: list[str] = []
     rows_seen = 0
-    circuit_limit = _CIRCUIT_BREAKER_MULTIPLIER * count
     for row in ds:
         rows_seen += 1
         text = _render_messages(row.get("messages"), tokenizer)
@@ -521,19 +520,26 @@ def _render_messages(messages, tokenizer) -> str | None:
                             "(types: %s); text will be empty for this message",
                             len(content), [type(c).__name__ for c in content],
                         )
-                    content = " ".join(c.get("text", "") for c in filtered)
+                    content = " ".join(c.get("text") or "" for c in filtered)
                 parts.append(f"{role.upper()}: {content}")
             text = "\n".join(parts)
-            # Strip and reject if only role prefixes remain (e.g. "USER:\nASSISTANT:")
+            # Strip and reject if only role prefixes remain (e.g. "USER:\nASSISTANT:").
+            # Tightened from endswith(":") to an uppercase-word-colon pattern so that
+            # content lines legitimately ending with ":" (e.g. "The answer is:") are
+            # not discarded.
             stripped = text.strip()
             if not stripped or all(
-                part.strip().endswith(":") for part in stripped.splitlines() if part.strip()
+                bool(re.match(r'^[A-Z_]+:\s*$', part.strip()))
+                for part in stripped.splitlines() if part.strip()
             ):
                 return None
             return stripped
         except (AttributeError, TypeError, KeyError, ValueError) as fmt_exc:
-            # Include the type of the first element (if any) for easier debugging.
-            first_type = type(messages[0]).__name__
+            # Use next(iter(...)) instead of messages[0] to handle non-subscriptable
+            # iterables — messages[0] inside an except block would raise an uncaught
+            # TypeError if messages is e.g. a generator.
+            first_elem = next(iter(messages), None)
+            first_type = type(first_elem).__name__
             log.warning(
                 "_render_messages: unexpected message format "
                 "(messages type=%s, first element type=%s: %s) — skipping row",
@@ -578,11 +584,11 @@ def _stream_legacy_texts(
     # Shuffle so repeated or concurrent calls with different seeds draw disjoint
     # rows rather than always taking the first N rows of the dataset; capped to
     # avoid OOM on large datasets with small count values.
-    ds = ds.shuffle(seed=seed, buffer_size=min(max(10000, count * _CIRCUIT_BREAKER_MULTIPLIER), 100_000))
+    circuit_limit = _CIRCUIT_BREAKER_MULTIPLIER * count
+    ds = ds.shuffle(seed=seed, buffer_size=min(max(10_000, circuit_limit), 200_000))
 
     out: list[str] = []
     rows_seen = 0
-    circuit_limit = _CIRCUIT_BREAKER_MULTIPLIER * count
     for row in ds:
         rows_seen += 1
         txt = row.get(key)
@@ -627,6 +633,11 @@ def _tokenize_to_fixed_length(
         ids = tokenizer(t, add_special_tokens=False, truncation=False)["input_ids"]
         if hasattr(ids, "tolist"):
             ids = ids.tolist()
+        if isinstance(ids, int):
+            ids = [ids]
+        # Flatten arbitrary-depth nesting — some tokenizers return [[...]] or deeper.
+        while ids and isinstance(ids[0], list):
+            ids = [tok for sub in ids for tok in sub]
         all_ids.extend(ids)
         all_ids.append(eos)
         if len(all_ids) >= need:

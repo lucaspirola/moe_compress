@@ -121,9 +121,23 @@ def run(
                     f"stage5_router_kd.max_calibration_samples={cfg_n}. Stage 5 "
                     "would read past the end of the cache — regenerate or align."
                 )
-            log.info("Stage 5: cache covers %d samples, %d sequence_length, %d layers",
-                     cache_payload.get("num_samples"), cache_payload.get("sequence_length"),
-                     len(cache_payload.get("logits", {})))
+            # F1 fix: verify the cache covers all epochs, not just one pass.
+            # With multi-epoch training the token index advances as
+            # (epoch * num_batches + i) * cache_tokens_per_batch; a cache that
+            # only covers one epoch would be silently re-read from position 0
+            # for epochs 2..N, replaying epoch-1 teacher logits against later
+            # student batches — a corrupted KD signal.
+            epochs_cfg = int(s5.get("epochs", 1))
+            if epochs_cfg > 1 and cache_n < epochs_cfg * cfg_n:
+                log.warning(
+                    "Stage 5: teacher_logits_cache num_samples=%d covers only "
+                    "%d epoch(s) of data but stage5_router_kd.epochs=%d. "
+                    "Cache tokens will be re-read from position 0 for later "
+                    "epochs — regenerate a multi-epoch cache or set epochs=1.",
+                    cache_n, cache_n // max(cfg_n, 1), epochs_cfg,
+                )
+            log.info("Stage 5: cache covers %d samples, %d sequence_length",
+                     cache_payload.get("num_samples"), cache_payload.get("sequence_length"))
         else:
             log.warning("Stage 5: teacher_logits_cache=%s not found at %s — falling back to live teacher",
                         cache_path_cfg, cache_path)
@@ -169,7 +183,7 @@ def run(
                     except Exception as exc:
                         log.warning("Stage 5: torch.compile(teacher) failed (%s) — eager", exc)
                 _teacher_state["model"] = _t
-                _teacher_state["refs"] = list(iter_moe_layers(_t))
+                _teacher_state["refs"] = list(iter_moe_layers(getattr(_t, "_orig_mod", _t)))
                 assert len(_teacher_state["refs"]) == student_refs_count, (
                     f"Teacher/student MoE layer count mismatch: "
                     f"{len(_teacher_state['refs'])} vs {student_refs_count}"
@@ -219,7 +233,7 @@ def run(
     # Teacher/student MoE layer count sanity check (router structure must match
     # even though we're distilling at vocab level — the student's routers are
     # what we're training).
-    student_refs = list(iter_moe_layers(student))
+    student_refs = list(iter_moe_layers(getattr(student, "_orig_mod", student)))
 
     # -----------------------------------------------------------------------
     # Crash-resume: find latest checkpoint and restore router + optim state.
@@ -261,9 +275,14 @@ def run(
                     f"(expected 1) — delete _{stage_key}_partial/ and re-run"
                 )
             # Restore router parameters into the student model.
+            # F3 fix: walk the attribute tree on the unwrapped module so that
+            # parameter names saved by _save_stage5_checkpoint (which also uses
+            # the unwrapped module) resolve correctly even when `student` is a
+            # torch.compile wrapper.
+            _restore_base = getattr(student, "_orig_mod", student)
             for pname, t in payload["router_state"].items():
                 parts = pname.split(".")
-                obj = student
+                obj = _restore_base
                 for part in parts[:-1]:
                     obj = getattr(obj, part)
                 getattr(obj, parts[-1]).data.copy_(t)
@@ -302,6 +321,7 @@ def run(
     for epoch in range(s5["epochs"]):
         if epoch < resume_epoch:
             continue
+        window_loss = 0.0  # accumulates raw loss over each grad-accum window for accurate mean logging
         for i, batch in enumerate(batches):
             # Fast-forward: skip batches already processed in the resumed run.
             # resume_batch_i is the last batch of the grad-accum window that
@@ -322,16 +342,27 @@ def run(
                 cache_seq_len = int(s5["max_sequence_length"])
                 cache_batch_size = int(s5["batch_size"])
                 cache_tokens_per_batch = cache_batch_size * cache_seq_len
-                token_start = i * cache_tokens_per_batch
+                # F1 fix: incorporate the epoch offset so that epoch N reads
+                # the correct slice of the cache instead of wrapping back to
+                # position 0 (which would replay epoch-0 teacher logits
+                # against epoch-N student batches — wrong KD signal).
+                token_start = (epoch * len(batches) + i) * cache_tokens_per_batch
                 token_end = token_start + (batch.shape[0] * batch.shape[1])
-                teacher_vocab_logits = teacher_logits_cache["vocab_logits"][token_start:token_end]
+                teacher_vocab_logits = teacher_logits_cache["logits"][token_start:token_end]
                 teacher_vocab_logits = teacher_vocab_logits.to(device=batch.device, dtype=torch.float32)
                 teacher_vocab_logits = teacher_vocab_logits.view(batch.shape[0], batch.shape[1], -1)
             else:
                 with torch.no_grad():
-                    teacher_out = _get_teacher(len(student_refs))(input_ids=batch)
-                teacher_vocab_logits = teacher_out.logits.to(torch.float32)  # [B, L, |V|]
-                del teacher_out  # free the full output object before student backward pass
+                    # F2 fix: re-enforce eval mode immediately before every
+                    # teacher forward. A single _t.eval() at load time is not
+                    # sufficient — framework hooks or torch.compile can silently
+                    # transition the model back to train mode, which activates
+                    # dropout and produces stochastic KD targets.
+                    _teacher = _get_teacher(len(student_refs))
+                    _teacher.eval()
+                    teacher_out = _teacher(input_ids=batch)
+                    teacher_vocab_logits = teacher_out.logits.detach().to(torch.float32)  # [B, L, |V|]
+                    del teacher_out  # free the full output object before student backward pass
 
             # Student: full forward pass with gradients (routers are trainable).
             student_out = student(input_ids=batch)
@@ -349,13 +380,16 @@ def run(
             seq_chunk = int(s5.get("kd_seq_chunk_size", 128))
             loss = _chunked_vocab_kl(s_logits_shift, t_logits_shift, T, chunk_size=seq_chunk)
 
+            window_loss += float(loss.item())
             (loss / grad_accum).backward()
 
             if (i + 1) % grad_accum == 0:
                 # Pre-step: compute gradient norm over trainable params.
+                # Unwrap compiled wrapper so parameters() reflects the original module's leaf params.
+                _params_for_norm = getattr(student, "_orig_mod", student)
                 grad_norm = float(
                     torch.nn.utils.clip_grad_norm_(
-                        [p for p in student.parameters() if p.requires_grad and p.grad is not None],
+                        [p for p in _params_for_norm.parameters() if p.requires_grad and p.grad is not None],
                         float('inf'),
                     )
                 )
@@ -363,7 +397,7 @@ def run(
                 optim.zero_grad()
                 step += 1
                 if step % config["logging"]["log_every_n_steps"] == 0:
-                    loss_val = float(loss.item())  # per-batch loss; effective gradient = loss / grad_accum
+                    loss_val = window_loss / grad_accum  # mean loss over the completed grad-accum window
                     log.info(
                         "  epoch=%d step=%d loss=%.6f grad_norm=%.4f",
                         epoch, step, loss_val, grad_norm,
@@ -375,6 +409,7 @@ def run(
                         "stage5/grad_norm": grad_norm,
                     }
                     _trackio_log(payload)
+                window_loss = 0.0  # reset accumulator for next grad-accum window
 
                 # Periodic checkpoint for crash-resume.
                 if partial_dir is not None and ckpt_every > 0 and step % ckpt_every == 0:
@@ -398,7 +433,10 @@ def run(
 
     out_dir = artifacts_dir / f"{stage_key}_final"
     save_compressed_checkpoint(
-        student, tokenizer, out_dir, pipeline_stage=f"{stage_key}_final",
+        # Unwrap torch.compile wrapper before save so iter_moe_layers inside
+        # save_compressed_checkpoint can find the text tower via attribute lookup.
+        getattr(student, "_orig_mod", student), tokenizer, out_dir,
+        pipeline_stage=f"{stage_key}_final",
     )
     log.info("Stage %s complete → %s", stage_key, out_dir)
     return out_dir
@@ -444,9 +482,15 @@ def _save_stage5_checkpoint(
     optim: torch.optim.Optimizer,
     grad_accum: int = 1,
 ) -> None:
+    # F3 fix: when torch.compile is active, `student` is a compiled wrapper
+    # whose named_parameters() may enumerate names that differ from the
+    # underlying module's attribute tree (e.g. "_orig_mod.*" prefixes are
+    # stripped or mangled). Use the unwrapped module so that the names saved
+    # here match the attribute path walked during restore.
+    unwrapped = getattr(student, "_orig_mod", student)
     router_state = {
         name: p.data.cpu().clone()
-        for name, p in student.named_parameters()
+        for name, p in unwrapped.named_parameters()
         if p.requires_grad
     }
     payload = {
@@ -461,7 +505,17 @@ def _save_stage5_checkpoint(
     tmp = partial_dir / f"step_{step}.pt.tmp"
     final = partial_dir / f"step_{step}.pt"
     torch.save(payload, tmp)
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     os.replace(tmp, final)
+    parent_fd = os.open(str(final.parent), os.O_RDONLY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
     log.info("Stage 5: checkpoint saved at step %d (epoch %d, batch %d)", step, epoch, batch_idx)
 
 
