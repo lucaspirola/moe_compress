@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from moe_compress import stage0_super_experts, stage1_grape, stage2_reap_ream
+from moe_compress import stage1_grape, stage2_reap_ream
 from moe_compress import stage5_router_kd
 from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.utils.model_io import iter_moe_layers
@@ -54,7 +54,6 @@ def patched_stage5(monkeypatch, tiny_config):
 
     monkeypatch.setattr(cal_mod, "build_calibration_tensor", _fake_build)
     monkeypatch.setattr(cal_mod, "build_super_expert_slice", _fake_slice)
-    monkeypatch.setattr(stage0_super_experts, "build_super_expert_slice", _fake_slice)
     monkeypatch.setattr(stage2_reap_ream, "build_calibration_tensor", _fake_build)
     monkeypatch.setattr(stage5_router_kd, "build_calibration_tensor", _fake_build)
 
@@ -84,14 +83,12 @@ def _prepare_model_and_merge_map(model, config, tmp_path, monkeypatch):
 
     monkeypatch.setattr(cal_mod, "build_calibration_tensor", _fake_build)
     monkeypatch.setattr(cal_mod, "build_super_expert_slice", _fake_slice)
-    monkeypatch.setattr(stage0_super_experts, "build_super_expert_slice", _fake_slice)
     monkeypatch.setattr(stage2_reap_ream, "build_calibration_tensor", _fake_build)
 
     from moe_compress.utils import model_io as mio
     monkeypatch.setattr(mio, "save_compressed_checkpoint", _noop_save)
     monkeypatch.setattr(stage2_reap_ream, "save_compressed_checkpoint", _noop_save)
 
-    stage0_super_experts.run(model, _TinyTokenizer(), config, tmp_path, device=None)
     decomp = BudgetDecomposition(
         total_reduction_ratio=0.2,
         expert_prune_ratio=0.5,

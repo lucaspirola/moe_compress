@@ -40,7 +40,7 @@ def _list_bucket_files(prefix: str) -> list[str]:
 
 
 def inspect_stage0() -> int:
-    data = _read_json_from_bucket("stage0_blacklist.json")
+    data = _read_json_from_bucket("stage1_blacklist.json")
     blacklist = data.get("blacklist", {})
     per_max   = data.get("per_expert_max", {})
     layers = sorted({int(k) for k in blacklist}) or []

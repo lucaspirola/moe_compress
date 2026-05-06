@@ -194,10 +194,6 @@ def tiny_config():
             "domain_mix": {"c4": 1.0, "math": 0.0, "code": 0.0},
             "math_dataset": "unused", "code_dataset": "unused",
         },
-        "stage0_super_experts": {
-            "zscore_threshold": 1.0, "max_blacklisted_per_layer": 1,
-            "global_blacklist_cap_pct": 0.50,
-        },
         "stage1_grape": {
             "num_calibration_samples": 4,
             "similarity_metric": "cosine", "min_experts_per_layer": 2,

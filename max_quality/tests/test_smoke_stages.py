@@ -1,4 +1,4 @@
-"""End-to-end Stages 0/1/2 on the fused-experts synthetic fixture."""
+"""End-to-end Stages 1/2 on the fused-experts synthetic fixture."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from moe_compress import stage0_super_experts, stage1_grape, stage2_reap_ream
+from moe_compress import stage1_grape, stage2_reap_ream
 from moe_compress.budget import solver
 
 
@@ -38,21 +38,8 @@ def patched_calibration(monkeypatch, tiny_config):
 
     monkeypatch.setattr(cal_mod, "build_calibration_tensor", _fake_build)
     monkeypatch.setattr(cal_mod, "build_super_expert_slice", _fake_slice)
-    monkeypatch.setattr(stage0_super_experts, "build_super_expert_slice", _fake_slice)
     monkeypatch.setattr(stage2_reap_ream, "build_calibration_tensor", _fake_build)
     return tiny_config
-
-
-def test_stage0_smoke(tiny_model, patched_calibration, tmp_path):
-    stage0_super_experts.run(
-        tiny_model, _TinyTokenizer(), patched_calibration, tmp_path, device=None,
-    )
-    payload = json.loads((tmp_path / "stage0_blacklist.json").read_text())
-    assert "blacklist" in payload
-    # Per-expert max entries should number num_layers × num_experts (2 × 4 = 8).
-    assert len(payload["per_expert_max"]) == 8
-    # Every entry should be a positive float (forward actually ran).
-    assert all(v >= 0 for v in payload["per_expert_max"].values())
 
 
 def test_stage1_smoke(tiny_model, patched_calibration, tmp_path):
@@ -71,10 +58,6 @@ def test_stage1_smoke(tiny_model, patched_calibration, tmp_path):
 
 
 def test_stage2_smoke_full_chain(tiny_model, patched_calibration, tmp_path):
-    # 0
-    stage0_super_experts.run(
-        tiny_model, _TinyTokenizer(), patched_calibration, tmp_path, device=None,
-    )
     # 1
     decomp = solver.BudgetDecomposition(
         total_reduction_ratio=0.2,
@@ -138,10 +121,6 @@ def test_stage2_max_merge_group_size_enforced(tiny_model, patched_calibration, t
     from moe_compress.utils import model_io as mio
 
     model = copy.deepcopy(tiny_model)
-
-    stage0_super_experts.run(
-        model, _TinyTokenizer(), patched_calibration, tmp_path, device=None,
-    )
 
     # Budget of 1 per layer (below min_experts_per_layer=2 in config, so we
     # override that key) to force very aggressive merging.
