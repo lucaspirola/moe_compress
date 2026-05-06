@@ -33,6 +33,7 @@ from .utils.calibration import build_calibration_tensor, iter_batches, spec_from
 from .utils.model_io import (
     MATRIX_NAMES,
     build_banks,
+    iter_decoder_layers,
     iter_moe_layers,
     save_json_artifact,
 )
@@ -61,6 +62,16 @@ def run(
     device=None,
 ) -> tuple[Path, Path]:
     """Run Stage 1: SE detection + GRAPE budget allocation.
+
+    Writes ``stage1_blacklist.json`` with exactly three top-level keys:
+      - ``blacklist`` : dict[str(layer_idx) -> list[expert_idx]] — the SE blacklist.
+      - ``per_expert_max`` : dict[str -> float] — per-expert max-magnitude over all
+        calibration batches, keyed by the format ``"L{layer_i}E{expert_i}"`` (e.g.
+        ``"L3E17"`` for layer 3, expert 17). Only experts that fired in MA-formation
+        layers (l ∈ L) appear here. (A-C-N-2)
+      - ``config`` : dict — thresholds and detector parameters used to produce
+        the blacklist (a_max_fraction, ma_ratio, ma_growth_ratio,
+        ma_formation_layers, p995_threshold, a_max_absolute, a_max_threshold).
 
     Returns (blacklist_path, budgets_path).
     """
@@ -322,34 +333,55 @@ def _detect_ma_layers(
     ma_ratio: float = _MA_RATIO,
     ma_growth_ratio: float = _MA_GROWTH_RATIO,
 ) -> set[int]:
-    """Forward pass 1: identify decoder layers that form (amplify) massive activations.
+    """Forward pass 1: identify MoE decoder layers that form (amplify) massive activations.
 
-    Uses a hybrid check to distinguish formation from propagation:
+    Spec §4 Phase A + §12 D-ma-detector:
+    - Hooks every decoder layer (not just MoE) so that the growth ratio
+      ``max|H_l| / max|H_{l-1}|`` is computed against the immediately preceding
+      decoder layer in the residual stack — paper definition of MA-formation.
     - First MoE layer: absolute outlier check — add to L if max|H_l| > ma_ratio × Q99(|H_l|).
-    - Subsequent layers: growth check — add to L if max|H_l| / max|H_{l-1}| > ma_growth_ratio.
+    - Subsequent MoE layers: growth check — add to L if
+      max|H_l| / max|H_{l-1}| > ma_growth_ratio (where l-1 is the immediately preceding
+      DECODER layer, MoE or not).
+    - Fallback: if the dynamic detector returns ∅, populate L with every MoE layer whose
+      ``layer_idx < round(0.75 × num_hidden_layers)``.
 
-    MAs propagate stably through residuals after they form; the old absolute check would
+    Q99 (first-layer absolute check) is computed exactly across all calibration batches by
+    buffering per-batch flattened activation magnitudes and computing
+    ``np.percentile(buffer, 99.0)`` once at finalize time (spec §4 Phase A: "Q99 across
+    all calibration batches"). This is option (a) from spec §12 D-ma-detector. Memory
+    fits in RAM at calibration scales (256 samples × 2048 tokens × hidden ≈ ~MB-scale fp32).
+
+    MAs propagate stably through residuals after they form; the old absolute-only check would
     flag all post-formation layers. The growth check flags only amplification events.
     Both maxima are tracked across all calibration batches (MAs are input-stable per the paper).
-
-    Q99 is approximated as the running max of per-batch Q99 values (conservative upper bound).
     """
-    sorted_layer_indices = sorted(ref.layer_idx for ref in moe_layers)
-    if not sorted_layer_indices:
+    sorted_moe_layer_indices = sorted(ref.layer_idx for ref in moe_layers)
+    if not sorted_moe_layer_indices:
         return set()
-    first_layer_idx = sorted_layer_indices[0]
+    moe_layer_set = set(sorted_moe_layer_indices)
+    first_moe_layer_idx = sorted_moe_layer_indices[0]
 
-    moe_layer_modules = {ref.layer_module: ref.layer_idx for ref in moe_layers}
-    if len(moe_layer_modules) != len(moe_layers):
+    # Hook every decoder layer, not just MoE layers (M-2).
+    # All decoder layer modules in residual order; ratio is computed against the
+    # immediately preceding decoder layer (M-1).
+    decoder_layers: list[tuple[int, nn.Module]] = list(iter_decoder_layers(model))
+    if not decoder_layers:
         raise ValueError(
-            "_detect_ma_layers: two MoELayerRef entries share the same layer_module object "
-            "(weight-tied layers?); hooks would fire only for one of them. "
-            f"Expected {len(moe_layers)} unique modules, got {len(moe_layer_modules)}."
+            "_detect_ma_layers: no decoder layers found via iter_decoder_layers()"
         )
-    layer_max: dict[int, float] = {idx: 0.0 for idx in sorted_layer_indices}
-    # Single-element list so the hook closure can mutate via index assignment.
-    # Only the first layer is ever written; subsequent layers use layer_max only.
-    first_layer_q99_val: list[float] = [0.0]
+    decoder_layer_modules = {layer: idx for idx, layer in decoder_layers}
+    if len(decoder_layer_modules) != len(decoder_layers):
+        raise ValueError(
+            "_detect_ma_layers: two decoder layers share the same module object "
+            "(weight-tied layers?); hooks would fire only for one of them. "
+            f"Expected {len(decoder_layers)} unique modules, got {len(decoder_layer_modules)}."
+        )
+    sorted_decoder_layer_indices = sorted(decoder_layer_modules.values())
+    layer_max: dict[int, float] = {idx: 0.0 for idx in sorted_decoder_layer_indices}
+    # Buffer flattened magnitudes from the FIRST MoE layer only — used to compute the
+    # exact Q99 across all calibration batches (option (a) from spec §12 D-ma-detector).
+    first_layer_q99_buffer: list[np.ndarray] = []
     handles: list = []
 
     def _make_hook(layer_idx: int):
@@ -365,15 +397,14 @@ def _detect_ma_layers(
             curr_max = h_abs.max().item()
             if curr_max > layer_max[layer_idx]:
                 layer_max[layer_idx] = curr_max
-            if layer_idx == first_layer_idx:
-                curr_q99 = torch.quantile(h_abs.flatten(), 0.99).item()
-                # NB: running max of per-batch Q99 values; this overestimates the true
-                # cross-batch Q99 but is a conservative upper bound for MA detection.
-                if curr_q99 > first_layer_q99_val[0]:
-                    first_layer_q99_val[0] = curr_q99
+            if layer_idx == first_moe_layer_idx:
+                # Buffer flattened magnitudes for exact cross-batch Q99 (spec §4 Phase A).
+                first_layer_q99_buffer.append(
+                    h_abs.flatten().cpu().numpy()
+                )
         return _hook
 
-    for module, layer_idx in moe_layer_modules.items():
+    for module, layer_idx in decoder_layer_modules.items():
         h = module.register_forward_hook(_make_hook(layer_idx))
         handles.append(h)
 
@@ -383,23 +414,58 @@ def _detect_ma_layers(
         for h in handles:
             h.remove()
 
+    # Compute exact cross-batch Q99 over the union of all per-batch flattened magnitudes.
+    if first_layer_q99_buffer:
+        first_layer_q99 = float(
+            np.percentile(np.concatenate(first_layer_q99_buffer), 99.0)
+        )
+    else:
+        first_layer_q99 = 0.0
+
     L: set[int] = set()
-    for i, layer_idx in enumerate(sorted_layer_indices):
-        if i == 0:
-            q99_val = first_layer_q99_val[0]
-            if q99_val <= 0:
-                log.warning("Stage 1: first-layer Q99 is %.2e for layer %d; model output may be degenerate — excluding from MA-formation candidate set L", q99_val, layer_idx)
-            elif layer_max[layer_idx] > ma_ratio * q99_val:
+    # Map MoE layer index -> position in sorted_decoder_layer_indices (for prev-decoder lookup).
+    decoder_index_pos = {idx: pos for pos, idx in enumerate(sorted_decoder_layer_indices)}
+
+    for layer_idx in sorted_moe_layer_indices:
+        if layer_idx == first_moe_layer_idx:
+            if first_layer_q99 <= 0:
+                log.warning(
+                    "Stage 1: first-MoE-layer Q99 is %.2e for layer %d; model output may be "
+                    "degenerate — excluding from MA-formation candidate set L",
+                    first_layer_q99, layer_idx,
+                )
+            elif layer_max[layer_idx] > ma_ratio * first_layer_q99:
                 L.add(layer_idx)
         else:
-            prev_max = layer_max[sorted_layer_indices[i - 1]]
-            # Note: prev_max is from the previous MoE layer in sorted_layer_indices; for
-            # sparsely-placed MoE layers, this ratio captures compound growth across multiple
-            # non-MoE layers, not just the immediately-preceding transformer layer.
+            # Use the immediately preceding DECODER layer (MoE or not) per spec (M-1).
+            pos = decoder_index_pos[layer_idx]
+            if pos == 0:
+                continue  # no prior decoder layer — defensive (shouldn't happen for non-first)
+            prev_decoder_idx = sorted_decoder_layer_indices[pos - 1]
+            prev_max = layer_max[prev_decoder_idx]
             # prev_max == 0 means the preceding layer produced no non-zero output on any
             # batch; genuine MA detection requires a nonzero baseline, so we skip this check.
             if prev_max > 0 and layer_max[layer_idx] / prev_max > ma_growth_ratio:
                 L.add(layer_idx)
+
+    # 0.75-depth fallback (spec §4 Phase A line 157 + §12 D-ma-detector) (H-1).
+    if not L:
+        cfg = getattr(model, "config", None)
+        text_cfg = getattr(cfg, "text_config", cfg) if cfg is not None else None
+        total_layers = getattr(text_cfg, "num_hidden_layers", None)
+        if total_layers is None:
+            # Fallback to the observed decoder layer count if config is missing.
+            total_layers = len(sorted_decoder_layer_indices)
+        cutoff = round(0.75 * float(total_layers))
+        fallback_layers = [li for li in sorted_moe_layer_indices if li < cutoff]
+        log.warning(
+            "Stage 1 Phase A: dynamic detector returned ∅ (no MA-formation layers found "
+            "via ma_ratio/ma_growth_ratio); applying 0.75-depth fallback (spec §4 Phase A) — "
+            "populating L with every MoE layer whose layer_idx < round(0.75 × %d) = %d. "
+            "Fallback L = %s",
+            total_layers, cutoff, fallback_layers,
+        )
+        L = set(fallback_layers)
 
     return L
 
@@ -438,6 +504,11 @@ def _apply_paper_criterion(
 ) -> dict[int, list[int]]:
     """Apply Eq. 6 three-way AND: a > P99.5 AND a > 0.1·a_max AND l ∈ L."""
     if not L:
+        if per_expert_max:
+            log.warning(
+                "Phase C: L is empty; skipping SE detection (no MA-formation layers found, "
+                "even after fallback)."
+            )
         return {}
     # defensive — unreachable in normal operation (update() only called for li in L).
     # External callers or accumulator reuse may legitimately pass entries outside L;
@@ -566,6 +637,8 @@ def _cka_distance_matrix(
 # ---------------------------------------------------------------------------
 
 
+# Scale note (A-C-N-1): cosine is scaled to [0, 1] by (1 - sim) / 2; MSE is normalized by
+# its max. The two scales are NOT directly comparable across runs that switch metrics.
 def _pairwise_distance_matrix(layer_ref, *, metric: str) -> torch.Tensor:
     """Weight-space pairwise distance matrix (fallback for ablation)."""
     banks = build_banks(layer_ref)
@@ -678,7 +751,7 @@ def _grape_greedy_merge(
     for li, D in D_work.items():
         diag = np.diag(D)
         if not np.allclose(diag, 0.0):
-            log.warning("Stage 1: D_work[layer %d] diagonal is non-zero (max=%.2e); R update may double-count", li, float(np.abs(diag).max()))
+            log.debug("Stage 1: D_work[layer %d] diagonal is non-zero (max=%.2e); R update may double-count", li, float(np.abs(diag).max()))
 
     R: dict[int, float] = {}
     for li in sorted_layers:
@@ -848,12 +921,7 @@ def _grape_greedy_merge(
         flat_idx = int(np.argmin(tmp))
         # n is the original matrix dimension (total experts), not the count of
         # remaining unabsorbed experts.
-        # i_star (absorbing centroid) is intentionally discarded here; Stage 2 re-derives
-        # the merge tree from covariance data. Contract: Stage 2's centroid assignment must
-        # be consistent with the per-layer expert budgets computed here, but the specific
-        # i_star→j_star pairing may differ from GRAPE's selection. This delegation is
-        # intentional (deviation D6) — Stage 2's covariance-weighted centroid is higher
-        # quality than GRAPE's distance-argmin centroid.
+        # i_star is intentionally discarded: GRAPE's contribution to Stage 2 is the per-layer budget N'_l, not pair assignments — Stage 2 re-derives centroids via covariance (spec §4 line 271).
         _, j_star = divmod(flat_idx, n)
 
         # D4: zero entire row/column of absorbed expert j_star and update R.
