@@ -488,7 +488,7 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
     # ``upload_large_folder`` for resumable, chunked, retried uploads — the
     # large sidecars (5–20 GB) make per-file ``upload_file`` calls fragile.
     aux_files = [
-        "stage0_blacklist.json",
+        "stage1_blacklist.json",
         "stage1_budgets.json",
         "stage2_layer_mse.json",
         "budget_decomposition.json",

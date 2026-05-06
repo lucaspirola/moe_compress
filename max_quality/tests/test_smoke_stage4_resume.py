@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from moe_compress import stage0_super_experts, stage1_grape, stage2_reap_ream, stage3_svd
+from moe_compress import stage1_grape, stage2_reap_ream, stage3_svd
 from moe_compress import stage4_eora
 from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.utils.model_io import MATRIX_NAMES, FactoredExperts, iter_moe_layers
@@ -51,7 +51,6 @@ def patched_stages(monkeypatch, tiny_config):
 
     monkeypatch.setattr(cal_mod, "build_calibration_tensor", _fake_build)
     monkeypatch.setattr(cal_mod, "build_super_expert_slice", _fake_slice)
-    monkeypatch.setattr(stage0_super_experts, "build_super_expert_slice", _fake_slice)
     monkeypatch.setattr(stage2_reap_ream, "build_calibration_tensor", _fake_build)
     monkeypatch.setattr(stage3_svd, "build_calibration_tensor", _fake_build)
 
@@ -65,7 +64,6 @@ def patched_stages(monkeypatch, tiny_config):
 
 
 def _run_stages_0123(model, config, tmp_path):
-    stage0_super_experts.run(model, _TinyTokenizer(), config, tmp_path, device=None)
     decomp = BudgetDecomposition(
         total_reduction_ratio=0.2,
         expert_prune_ratio=0.5,
