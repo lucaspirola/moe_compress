@@ -32,6 +32,21 @@ are scaled together during iteration, so the ratio is honoured during scaling
 but may deviate when the expert floor is binding (floor-clamp branch), or when
 either ceiling cap (_MAX_EP, _MAX_SP) is binding at the analytical start.
 
+.. note:: **Spec naming difference (F-01).**
+   §3 of ALGORITHM_REFERENCE.md calls this parameter ``expert_svd_ratio`` and
+   documents it as a *savings* ratio (e.g. "2.0 meaning pruning removes 2× the
+   params that SVD removes").  That description refers to the ratio of savings
+   contributions (``ep / (sp*(1-ep))``), not the knob ratio.  This
+   implementation accepts a **knob ratio** (``ep/sp``) instead, which is more
+   natural to set and scale during the iterative loop.  The two are not equal
+   numerically; callers must pass the knob ratio, not the savings ratio.  See
+   the savings formula above to convert: for a desired savings ratio ``R``,
+   the corresponding knob ratio at a given ``ep`` is ``R * (1 - ep)``, which
+   is target-dependent.  In practice, both ratios produce qualitatively similar
+   trade-offs at the values used in production (e.g., knob ratio 2.0 ≈ savings
+   ratio 1.5 at ep≈0.25).  No code change is needed; this is a documentation
+   note only.
+
 This module does NOT mutate the model. It only returns a
 :class:`BudgetDecomposition` that Stages 1/2/3 consume.
 """
@@ -59,6 +74,16 @@ _MAX_SP = 0.40  # maximum SVD rank reduction ratio
 
 @dataclass
 class BudgetDecomposition:
+    """Solver output consumed by Stages 1/2/3.
+
+    **What this dataclass does NOT contain (F-03):**
+    ``per_layer_target_experts`` (N'_l in the spec) is **not** a solver output.
+    The solver produces only the global ``global_expert_budget`` (total surviving
+    routed experts across all layers).  Per-layer budgets N'_l are allocated by
+    GRAPE in Stage 1 (``stage1_grape.py``), which distributes ``global_expert_budget``
+    non-uniformly across layers using activation-aware CKA similarity, subject to
+    the ``min_experts_per_layer`` floor (see ALGORITHM_REFERENCE.md §4).
+    """
     total_reduction_ratio: float            # target, e.g. 0.30
     expert_prune_ratio: float               # knob value passed to Stage 2; actual pruning fraction may differ when the expert floor is binding
     svd_rank_ratio: float                   # fraction of remaining expert params to remove via Stage 3
@@ -205,6 +230,17 @@ def solve(
     # min_pool is a global lower bound; per-layer floors may prevent pruning all
     # min_pool experts (some layers may have zero prunable capacity). This ceiling
     # is necessary but not sufficient for feasibility.
+    #
+    # F-02 note: Per-layer structural feasibility (individual layers where
+    # protected_per_layer[l] >= per_layer_counts[l], leaving zero prunable
+    # capacity for that layer) is NOT checked here.  The global min_pool check
+    # below handles the degenerate case where ALL layers are fully protected
+    # (min_pool == 0).  For the general case, per-layer budget infeasibility is
+    # detected and handled by GRAPE in Stage 1 (ALGORITHM_REFERENCE.md §4),
+    # which distributes global_expert_budget non-uniformly and enforces
+    # min_experts_per_layer per layer.  Adding a solver-level per-layer warning
+    # would duplicate GRAPE's own feasibility logic without spec mandate (§3
+    # delegates allocation to GRAPE, not the solver).
     min_pool = max(0, total_routed - sum(protected_per_layer.values()))
     if min_pool == 0:
         max_achievable_svd_only = expert_params * _MAX_SP / total_params
@@ -230,17 +266,25 @@ def solve(
             tolerance, 0.5 * quant_granularity,
         )
 
-    ep_prev, sp_prev = None, None  # used for stagnation detection
+    ep_prev, sp_prev = ep, sp  # stagnation detection: snapshot before iter 0 so iter 1 compares against iter 0's pre-computation values
     last_iter: int | None = None  # track last completed iteration for error reporting
     for it in range(max_iterations):
-        # Stagnation check at TOP of loop so we skip the redundant decomp build
-        # when ep/sp haven't changed since the previous iteration (ceilings hit).
-        if ep_prev is not None and abs(ep - ep_prev) < 1e-9 and abs(sp - sp_prev) < 1e-9:
+        # Stagnation check: compare ep/sp entering THIS iteration against values
+        # entering the PREVIOUS iteration. If they are identical the ceiling caps
+        # are binding and further iterations will not change the result.
+        # `it > 0` guards so we never fire on the very first iteration (before any
+        # computation has run). ep_prev/sp_prev are snapshotted at the TOP of each
+        # loop body (below), so they reflect the entering values for the previous
+        # iteration — the values BEFORE that iteration's computation ran.
+        if it > 0 and abs(ep - ep_prev) < 1e-9 and abs(sp - sp_prev) < 1e-9:
             log.debug(
                 "solve: stagnation detected at iter=%d (ep=%.6f, sp=%.6f unchanged since iter=%d); exiting loop",
                 it, ep, sp, it - 1,
             )
             break
+        # Snapshot entering values BEFORE this iteration's computation so the next
+        # iteration's stagnation check can compare against them.
+        ep_prev, sp_prev = ep, sp
         last_iter = it + 1
 
         prune_params = ep * expert_params
@@ -254,7 +298,7 @@ def solve(
                 "Budget decomposition resulted in 0 surviving experts — this would eliminate all "
                 "routed experts. Increase min_experts_per_layer or lower the target."
             )
-        actual_prune_params = expert_params - surviving_experts_total * params_per_expert_avg
+        actual_prune_params = (total_routed - surviving_experts_total) * params_per_expert_avg
         after_prune = expert_params - actual_prune_params
         after_svd = after_prune * (1.0 - sp)
         expert_savings = expert_params - after_svd
@@ -306,11 +350,25 @@ def solve(
             "ensuring expert_savings > 0 given expert_params > 0"
         )
         scale = target_total_reduction / projected_total_reduction
-        ep = min(_MAX_EP, ep * scale)
-        sp = min(_MAX_SP, sp * scale)  # scale sp independently, then clamp (avoids deriving from possibly-clamped ep)
+        # Compute scaled values first WITHOUT clamping so the floor-clamp guard sees
+        # the unclamped ep_scaled.  Applying min(_MAX_EP, ...) before the guard could
+        # reduce ep_scaled below the floor threshold, causing the guard to be skipped
+        # even when ep_scaled genuinely exceeds max_prunable_params/expert_params, which
+        # leads to oscillation instead of convergence.
+        ep_scaled = ep * scale
+        sp_scaled = sp * scale
+        # NOTE (F-04 assessment): the floor-clamp branch *re-assigns* ep to
+        # max_prunable_params/expert_params (a different value) before the inner
+        # `if ep > _MAX_EP` check.  That inner check is NOT dead: it guards the case
+        # where min_pool/total_routed > _MAX_EP (>60% of experts prunable), which is
+        # a valid configuration.  Do NOT remove the inner guard.
         # When the protected-expert floor is binding, overwrite both scale-derived ep and sp:
         # ep is clamped to the floor, and sp is re-derived analytically to absorb the residual.
-        if ep * expert_params > max_prunable_params:
+        if ep_scaled * expert_params > max_prunable_params:
+            # Floor-clamp branch: derive ep from the protected-expert floor, then
+            # apply ceiling AFTER the floor fix (not before).  ep_scaled and sp_scaled
+            # are intentionally not used here — ep is re-derived from max_prunable_params
+            # and sp will be solved analytically below.
             ep = max_prunable_params / expert_params
             if ep > _MAX_EP:
                 # Unusual case: the protected-expert floor (min_pool/total_routed) itself
@@ -352,15 +410,22 @@ def solve(
             # sp driven to 0: pruning at the protected-floor ep already achieves or
             # exceeds the target without any SVD rank reduction.
             if sp == 0.0:
-                required_survival_frac = residual / expert_params  # for the warning below
+                # target_survival_frac is the fraction of expert params that must survive
+                # to hit the reduction target (residual / expert_params), NOT the actual
+                # fraction surviving after floor-clamped pruning (after_prune_at_floor /
+                # expert_params).  When sp==0 the actual fraction is ≤ target_survival_frac.
+                target_survival_frac = residual / expert_params
                 log.warning(
-                    "solve: sp clamped to 0.0 (required_survival_frac=%.4f — expert pruning alone meets the target)",
-                    required_survival_frac,
+                    "solve: sp clamped to 0.0 — SVD rank reduction not needed — pruning at floor-clamped ep "
+                    "meets or exceeds target (target_survival_frac=%.4f — fraction of expert params that must survive)",
+                    target_survival_frac,
                 )
-        # Update prev values at the END of the loop body, after all knob adjustments,
-        # so the stagnation check next iteration compares against the fully-updated values.
-        ep_prev, sp_prev = ep, sp
-
+        else:
+            # Normal path: floor is not binding; apply ceiling caps to scaled values.
+            # Ceilings are applied HERE (after the floor check) to avoid masking a
+            # genuine floor condition by prematurely reducing ep before the guard fires.
+            ep = min(_MAX_EP, ep_scaled)
+            sp = min(_MAX_SP, sp_scaled)
     # decomp is always assigned: max_iterations >= 1 guarantees at least one loop body.
     # Undershoot vs overshoot asymmetry: an undershoot (projected < target) means
     # the model is *less* compressed than requested, which may violate downstream
@@ -401,7 +466,7 @@ def _project_expert_budget(
     """Translate a param-savings target into total surviving experts.
 
     Converts ``target_prune_params`` into an integer expert count to prune
-    (nearest-integer rounded, clamped to prunable capacity), then returns the
+    (floor-rounded, clamped to prunable capacity), then returns the
     total number of surviving routed experts across all layers.  The per-layer
     allocation of survivors is handled downstream by GRAPE; this function
     only determines the global total.
@@ -420,8 +485,9 @@ def _project_expert_budget(
         )
     # This is a global lower bound; per-layer floors may make it impossible to prune all prunable
     # experts. Per-layer allocation is handled downstream by GRAPE.
-    # round, not ceil, to avoid systematic over-pruning bias
-    experts_to_prune = round(target_prune_params / max(params_per_expert_avg, 1e-9))
+    # floor, not round, to ensure pruning target is met-or-exceeded at boundaries
+    # (avoids banker's-rounding oscillation when target lands on a half-integer multiple)
+    experts_to_prune = math.floor(target_prune_params / max(params_per_expert_avg, 1e-9))
     # Clamp to [0, max_prunable].  max_prunable >= 0 is guaranteed by callers (min_pool is
     # clamped to 0 at the call site; internal computation uses max(0, ...) per-layer sums).
     # The max(0, ...) is a defensive guard in case target_prune_params is subnormal-negative
