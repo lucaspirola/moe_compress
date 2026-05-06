@@ -76,8 +76,7 @@ def run(
     if any(ref.num_routed_experts != n_per_layer for ref in moe_layers[1:]):
         log.warning(
             "stage1_grape: layers have heterogeneous expert counts; "
-            "min_experts floor is derived from layer 0 count (%d) only",
-            n_per_layer,
+            "GRAPE floor is computed per-layer as num_routed_experts // 2"
         )
 
     se_cfg = s1["super_expert_detection"]
@@ -241,33 +240,10 @@ def run(
     global_budget = decomposition.global_expert_budget
     gamma = float(s1.get("entropy_tolerance", 0.1))
 
-    # Floor = num_routed_experts // 2 (no early/late bonuses).
-    # NOTE: for heterogeneous architectures where layers have different expert counts,
-    # this single global floor derived from layer 0 is an approximation.  All layers
-    # are treated as having the same floor, which may be too permissive for layers
-    # with fewer experts than layer 0, or overly conservative for layers with more.
-    # A per-layer floor would require extending _grape_greedy_merge to accept a
-    # per-layer min_experts dict; for the current homogeneous-architecture target
-    # this is acceptable (deviation D5).
-    if n_per_layer == 0:
-        raise ValueError(
-            "stage1_grape.run: first MoE layer has 0 routed experts — "
-            "cannot compute a meaningful floor. Check the model architecture."
-        )
-    min_experts = n_per_layer // 2
-    solver_floor = getattr(decomposition, "min_experts_per_layer", None)
-    if solver_floor is not None and solver_floor != min_experts:
-        log.warning(
-            "GRAPE floor (n_per_layer // 2 = %d) differs from budget solver floor (%d); "
-            "GRAPE may terminate early at the more permissive floor before reaching the budget.",
-            min_experts, solver_floor,
-        )
-
     budgets = _grape_greedy_merge(
         D_matrices=D_matrices,
         global_budget=global_budget,
         per_layer_counts=per_layer_counts,
-        min_experts=min_experts,
         blacklist=blacklist,
         gamma=gamma,
     )
@@ -275,15 +251,10 @@ def run(
     # Logging: per-layer redundancy R̃^l (spec §4, Eq. 3)
     # Build D_work_logging: zero blacklisted rows/cols in a copy of D_matrices
     # (mirrors what _grape_greedy_merge does internally, for consistency).
-    D_work_logging: dict[int, np.ndarray] = {}
-    for li, D in D_matrices.items():
-        d = D.cpu().numpy().copy()
-        # Keep in sync with the corresponding zeroing block in _grape_greedy_merge;
-        # consider extracting to `_zero_blacklisted(d, blacklist_for_layer)` if logic diverges.
-        for bl_e in blacklist.get(li, []):
-            d[bl_e, :] = 0.0
-            d[:, bl_e] = 0.0
-        D_work_logging[li] = d
+    D_work_logging: dict[int, np.ndarray] = {
+        li: _zero_blacklisted(D.cpu().numpy().copy(), blacklist.get(li, []))
+        for li, D in D_matrices.items()
+    }
 
     # R^l = Σ_{i≠j} D^l_{ij}  (sum of off-diagonal distances)
     R_raw: dict[int, float] = {}
@@ -550,8 +521,19 @@ def _cka_distance_matrix(
                     "_cka_distance_matrix: layer %d experts (%d, %d) truncated to %d/%d tokens (%.0f%%)",
                     li, i, j, m_common, max(mi, mj), trunc_ratio * 100,
                 )
-            Xi_c = Xi[:m_common]
-            Xj_c = Xj[:m_common]
+            # Uniformly-strided subsample: spreads coverage across the full reservoir
+            # rather than front-slicing, which would over-represent early calibration tokens
+            # (reservoir slots 0..m_common-1 skew toward the first tokens seen).
+            if mi > m_common:
+                step = mi / m_common
+                Xi_c = Xi[[int(k * step) for k in range(m_common)]]
+            else:
+                Xi_c = Xi
+            if mj > m_common:
+                step = mj / m_common
+                Xj_c = Xj[[int(k * step) for k in range(m_common)]]
+            else:
+                Xj_c = Xj
             # Biased HSIC estimator (Gretton 2005): K_c = K - row_mean - col_mean + grand_mean.
             # This differs from the unbiased estimator used in Kornblith et al. (2019), which
             # removes diagonal entries. The bias cancels in the CKA ratio and is negligible
@@ -613,6 +595,14 @@ def _pairwise_distance_matrix(layer_ref, *, metric: str) -> torch.Tensor:
     return dist
 
 
+def _zero_blacklisted(d: np.ndarray, bl_experts: list[int]) -> np.ndarray:
+    """Zero rows and columns of distance matrix `d` for blacklisted experts in-place."""
+    for e in bl_experts:
+        d[e, :] = 0.0
+        d[:, e] = 0.0
+    return d
+
+
 # ---------------------------------------------------------------------------
 # GRAPE Algorithm 1 (entropy-aware greedy merge with restart)
 # ---------------------------------------------------------------------------
@@ -623,14 +613,13 @@ def _grape_greedy_merge(
     D_matrices: dict[int, torch.Tensor],
     global_budget: int,
     per_layer_counts: dict[int, int],
-    min_experts: int,
     blacklist: dict[int, list[int]],
     gamma: float,
 ) -> dict[int, int]:
     """GRAPE Algorithm 1 (2604.06542, §3.3).
 
-    Returns per-layer surviving expert counts (budgets). Floor is num_routed_experts // 2
-    with no per-position adjustment (deviation D5 from paper).
+    Returns per-layer surviving expert counts (budgets). Floor is per_layer_counts[li] // 2
+    computed independently for each layer, so heterogeneous architectures are handled correctly.
     """
     sorted_layers = sorted(per_layer_counts.keys())
     n_moe_layers = len(sorted_layers)
@@ -681,15 +670,10 @@ def _grape_greedy_merge(
     # Blacklisted experts are zeroed out in D_work so they never participate
     # in pair selection as either centroid (i_star) or absorbed expert (j_star),
     # and their distances do not inflate R (which would bias layer selection).
-    D_work: dict[int, np.ndarray] = {}
-    for li in sorted_layers:
-        d = D_matrices[li].cpu().numpy().copy()
-        # Keep in sync with the corresponding zeroing block in run() (D_work_logging);
-        # consider extracting to `_zero_blacklisted(d, blacklist_for_layer)` if logic diverges.
-        for bl_e in blacklist.get(li, []):
-            d[bl_e, :] = 0.0
-            d[:, bl_e] = 0.0
-        D_work[li] = d
+    D_work: dict[int, np.ndarray] = {
+        li: _zero_blacklisted(D_matrices[li].cpu().numpy().copy(), blacklist.get(li, []))
+        for li in sorted_layers
+    }
 
     for li, D in D_work.items():
         diag = np.diag(D)
@@ -704,11 +688,11 @@ def _grape_greedy_merge(
 
     # floors[li] is the NON-BLACKLISTED portion of the hard floor, i.e. the
     # minimum number of non-blacklisted experts that must survive in layer li.
-    # It is NOT the total expert floor; total floor = floors[li] + len(blacklist[li])
-    # = max(min_experts, len(blacklist[li])). GRAPE tracks only non-blacklisted
-    # experts in cluster_counts, so cluster_counts[li] must not drop below floors[li].
+    # Total floor = floors[li] + len(blacklist[li]).
+    # GRAPE tracks only non-blacklisted experts in cluster_counts, so
+    # cluster_counts[li] must not drop below floors[li].
     floors: dict[int, int] = {
-        li: max(min_experts - len(blacklist.get(li, [])), 0)
+        li: max(per_layer_counts[li] // 2 - len(blacklist.get(li, [])), 0)
         for li in sorted_layers
     }
 
@@ -832,6 +816,15 @@ def _grape_greedy_merge(
                 best_layer = li
 
         if best_layer is None:
+            # floor_blocked was updated lazily inside the selection loop above; re-evaluate
+            # the restart condition with the now-complete floor_blocked before giving up —
+            # the per-iteration lag may have prevented the check above from firing.
+            permanently_blocked = len(floor_blocked) + len(structurally_blocked - floor_blocked)
+            non_perm_blocked = n_moe_layers - permanently_blocked
+            if non_perm_blocked > 0 and len(frozen - structurally_blocked - floor_blocked) >= non_perm_blocked:
+                log.info("GRAPE iter %d: post-selection restart (lag-corrected) — unfreezing frozen layers", iter_)
+                frozen.clear()
+                continue
             log.warning("GRAPE: no unfrozen layer can donate — stopping at %d (target %d)",
                         current_total, effective_budget)
             exit_reason = "no_layer"
