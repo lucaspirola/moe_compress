@@ -249,7 +249,12 @@ def run(
     # A per-layer floor would require extending _grape_greedy_merge to accept a
     # per-layer min_experts dict; for the current homogeneous-architecture target
     # this is acceptable (deviation D5).
-    min_experts = n_per_layer // 2 if n_per_layer > 0 else s1.get("min_experts_per_layer", 128)
+    if n_per_layer == 0:
+        raise ValueError(
+            "stage1_grape.run: first MoE layer has 0 routed experts — "
+            "cannot compute a meaningful floor. Check the model architecture."
+        )
+    min_experts = n_per_layer // 2
 
     budgets = _grape_greedy_merge(
         D_matrices=D_matrices,
@@ -703,10 +708,16 @@ def _grape_greedy_merge(
     elif gamma < 0.0:
         log.warning(
             "GRAPE: gamma=%.4f < 0: E_hat > E_init — every merge reduces entropy below the "
-            "inflated threshold, so every layer freezes after one merge per restart cycle; "
+            "inflated threshold, so most layers freeze after the first merge per restart cycle; "
             "the loop produces approximately %d merges per restart cycle (one per MoE layer); "
             "convergence may require far more iterations than the normal (gamma>0) case",
             gamma, n_moe_layers,
+        )
+    elif gamma >= 1.0:
+        log.warning(
+            "GRAPE: gamma=%.4f >= 1.0: E_hat <= 0 — entropy gate permanently disabled; "
+            "GRAPE will merge greedily to floor without entropy constraints",
+            gamma,
         )
 
     E_init = _entropy(cluster_counts)
@@ -752,15 +763,13 @@ def _grape_greedy_merge(
     max_iterations = current_total * n_moe_layers * 2
     log.debug("GRAPE max_iterations=%d (current_total=%d, n_moe_layers=%d)",
               max_iterations, current_total, n_moe_layers)
-    # last_merge_iter is the loop ordinal of the last successful merge, not the count of
-    # successful merges — structural-blocking iterations advance `_iter` without updating
-    # last_merge_iter.  Set to _iter on budget-satisfied break (_iter merges were completed;
-    # _iter+1 would be a ghost iteration where no merge occurs). At max-iterations exit keep
-    # _iter+1 since all iterations were genuine merge attempts.
-    last_merge_iter = 0
+    # n_merges counts successful merge operations only.  Structural-blocking skip-iterations
+    # advance _iter without incrementing n_merges, so n_merges <= _iter always.
+    n_merges = 0
+    exit_reason = "max_iter"
     for _iter in range(max_iterations):
         if current_total <= effective_budget:
-            last_merge_iter = _iter  # _iter merges completed; _iter+1 would be a ghost
+            exit_reason = "budget"
             break
 
         # Restart only when entropy-frozen layers block all non-floor-blocked,
@@ -803,6 +812,7 @@ def _grape_greedy_merge(
         if best_layer is None:
             log.warning("GRAPE: no unfrozen layer can donate — stopping at %d (target %d)",
                         current_total, effective_budget)
+            exit_reason = "no_layer"
             break
 
         D_l = D_work[best_layer]
@@ -852,19 +862,17 @@ def _grape_greedy_merge(
         if E_current < E_hat:
             frozen.add(best_layer)
 
-        # Record the ordinal of this successful merge (budget-satisfied exit sets last_merge_iter
-        # before breaking; max-iterations exit falls through with this value).
-        last_merge_iter = _iter + 1
+        n_merges += 1
 
-    log.info("GRAPE: converged at %d non-blacklisted experts (target %d) after %d merges",
-             current_total, effective_budget, last_merge_iter)
+    log.info("GRAPE: converged at %d non-blacklisted experts (target %d) after %d merges (exit=%s)",
+             current_total, effective_budget, n_merges, exit_reason)
 
-    if current_total > effective_budget:
+    if current_total > effective_budget and exit_reason == "max_iter":
         log.warning(
             "GRAPE: could not reach effective_budget=%d non-blacklisted (achieved=%d) "
-            "(max_iterations=%d reached). "
+            "after %d iterations (max_iterations=%d). "
             "Consider reducing min_experts_per_layer or the target reduction ratio.",
-            effective_budget, current_total, max_iterations,
+            effective_budget, current_total, _iter + 1, max_iterations,
         )
 
     # Stage 2 reads per-layer budgets as TOTAL centroid count (blacklisted + non-blacklisted).

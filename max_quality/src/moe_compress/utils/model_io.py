@@ -106,7 +106,7 @@ def load_model(
     try:
         model = auto_cls.from_pretrained(name_or_path, **kwargs)
     except Exception as exc:                         # noqa: BLE001
-        if isinstance(exc, MemoryError) or isinstance(exc, torch.cuda.OutOfMemoryError):
+        if isinstance(exc, (MemoryError, torch.cuda.OutOfMemoryError)):
             raise
         from transformers import AutoModel
         if auto_cls is AutoModel:
@@ -615,6 +615,10 @@ class FactoredExperts(nn.Module):
         raise KeyError(name)
 
     def factors(self, expert_idx: int, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        if not (0 <= expert_idx < self.num_experts):
+            raise ValueError(
+                f"factors: expert_idx={expert_idx} out of range [0, {self.num_experts})"
+            )
         U = getattr(self, f"{name}_U")[expert_idx]
         V = getattr(self, f"{name}_V")[expert_idx]
         return U, V
@@ -629,6 +633,10 @@ class FactoredExperts(nn.Module):
         if name not in self.ranks:
             raise KeyError(
                 f"Unknown projection name {name!r}; expected one of {list(self.ranks)}"
+            )
+        if not (0 <= expert_idx < self.num_experts):
+            raise ValueError(
+                f"set_factors_from_weight: expert_idx={expert_idx} out of range [0, {self.num_experts})"
             )
         if W.ndim != 2:
             raise ValueError(
@@ -675,6 +683,11 @@ class FactoredExperts(nn.Module):
             )
         if effective_rank is None:
             effective_rank = self.ranks[name]
+        if not (0 <= effective_rank <= self.ranks[name]):
+            raise ValueError(
+                f"set_factors: effective_rank={effective_rank} out of range "
+                f"[0, {self.ranks[name]}] for {name!r}"
+            )
         U_param = getattr(self, f"{name}_U")
         V_param = getattr(self, f"{name}_V")
         # U_param shape: (num_experts, d_out, k); V_param shape: (num_experts, k, d_in)
@@ -1165,6 +1178,13 @@ def load_compressed_model(
             f"Checkpoint metadata version {meta.get('version')} is not supported; "
             "expected version 1."
         )
+    _REQUIRED_META_KEYS = ("per_layer_num_experts", "factored_layers", "factored_ranks")
+    missing_keys = [k for k in _REQUIRED_META_KEYS if k not in meta]
+    if missing_keys:
+        raise RuntimeError(
+            f"load_compressed_model: metadata {path!r} is missing required keys "
+            f"{missing_keys!r}; the checkpoint may be corrupt or incomplete"
+        )
     cfg = AutoConfig.from_pretrained(path, trust_remote_code=trust_remote_code)
     if isinstance(torch_dtype, str):
         if not hasattr(torch, torch_dtype) or not isinstance(getattr(torch, torch_dtype), torch.dtype):
@@ -1466,15 +1486,17 @@ def load_json_artifact(path: str | Path) -> Any:
 
 
 def _json_default(o: Any) -> Any:
-    if isinstance(o, torch.Tensor):
-        return o.detach().cpu().tolist()
-    if hasattr(o, "tolist"):
-        return o.tolist()
+    # nn.Parameter is a subclass of torch.Tensor, so this guard must come first
+    # to prevent silent parameter serialization via the torch.Tensor branch below.
     if isinstance(o, (nn.Module, nn.Parameter)):
         raise TypeError(
             f"Object of type {type(o).__name__} is not JSON serializable — "
             "do not embed nn.Module or nn.Parameter instances in metadata"
         )
+    if isinstance(o, torch.Tensor):
+        return o.detach().cpu().tolist()
+    if hasattr(o, "tolist"):
+        return o.tolist()
     if hasattr(o, "__dict__"):
         d = o.__dict__
         if len(d) > 50:  # key-count-gated (gates on dict key count, not byte size)

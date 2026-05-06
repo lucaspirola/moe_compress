@@ -365,6 +365,8 @@ def spec_from_config(
     domain_mix = dict(domain_mix_raw)
     if any(w < 0 for w in domain_mix.values()):
         raise ValueError(f"domain_mix contains negative values: {domain_mix}")
+    if not any(w > 0 for w in domain_mix.values()):
+        raise ValueError(f"domain_mix are all zero — at least one weight must be positive (source={source!r}): {domain_mix}")
     return CalibrationSpec(
         num_sequences=num_sequences,
         sequence_length=sequence_length,
@@ -389,8 +391,9 @@ def _distribute_counts(total: int, weights: dict[str, float]) -> dict[str, int]:
     to keys with the largest fractional remainders.
 
     Handles the rare case where floating-point accumulation causes a negative
-    remainder (overshoot): subtracts 1 from keys with the largest fractional
-    remainders (where floor() over-counted most), mirroring the positive path.
+    remainder (overshoot): subtracts 1 from keys with the *smallest* fractional
+    remainders — those where float error pushed the raw value just past an integer
+    boundary, causing floor() to produce a value one too high.
     """
     if any(v < 0 for v in weights.values()):
         raise ValueError(f"All weights must be non-negative, got: {weights}")
@@ -476,11 +479,10 @@ def _stream_cascade_texts(
     for row in ds:
         rows_seen += 1
         text = _render_messages(row.get("messages"), tokenizer)
-        if not text:
-            continue
-        out.append(text)
-        if len(out) >= count:
-            break
+        if text:
+            out.append(text)
+            if len(out) >= count:
+                break
         if rows_seen >= circuit_limit:
             log.warning(
                 "_stream_cascade_texts: circuit-breaker fired after %d rows examined for content "
@@ -502,9 +504,11 @@ def _render_messages(messages, tokenizer) -> str | None:
     try:
         # Strip here so both paths return consistently trimmed text (the fallback
         # path already strips; keeping both uniform avoids caller-side compensation).
-        return tokenizer.apply_chat_template(
+        # Return None (not "") on empty render so both paths share the same sentinel.
+        rendered = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False,
         ).strip()
+        return rendered or None
     except Exception as tmpl_exc:                      # noqa: BLE001 — fall back to plain concat
         log.debug("apply_chat_template failed (%s); falling back to plain role/content concat", tmpl_exc)
         try:
@@ -589,11 +593,10 @@ def _stream_legacy_texts(
     for row in ds:
         rows_seen += 1
         txt = row.get(key)
-        if not isinstance(txt, str) or not txt.strip():
-            continue
-        out.append(txt)
-        if len(out) >= count:
-            break
+        if isinstance(txt, str) and txt.strip():
+            out.append(txt)
+            if len(out) >= count:
+                break
         if rows_seen >= circuit_limit:
             log.warning(
                 "_stream_legacy_texts: circuit-breaker fired after %d rows examined for content "
