@@ -484,10 +484,32 @@ def run(
     student.train()
     total_steps = (len(batches) // grad_accum) * s5["epochs"]
     remaining_steps = max(0, total_steps - resume_step)
+    _trainable_param_count = sum(1 for _ in student.parameters() if _.requires_grad)
     log.info("Stage 5: %d routers trainable; %d steps total / %d remaining (grad-accum=%d, resume_step=%d)",
-             sum(1 for _ in student.parameters() if _.requires_grad),
+             _trainable_param_count,
              total_steps, remaining_steps, grad_accum, resume_step)
     trailing = len(batches) % grad_accum
+
+    # One-shot Trackio emit of Stage 5 / Stage 2.5 run-level config. All
+    # values already in scope. Note: namespace is hardcoded "stage5/" even
+    # when stage_key=="stage2p5"; per user direction the bug fix is out of
+    # scope. Operators can disambiguate via stage5/config/stage_key.
+    _trackio_log({
+        "stage5/config/stage_key": str(stage_key),
+        "stage5/config/total_steps_planned": int(total_steps),
+        "stage5/config/remaining_steps": int(remaining_steps),
+        "stage5/config/calib_num_batches": int(len(batches)),
+        "stage5/config/calib_num_samples": int(spec.num_sequences),
+        "stage5/config/calib_seq_len": int(spec.sequence_length),
+        "stage5/config/calib_total_tokens": int(spec.num_sequences * spec.sequence_length),
+        "stage5/config/grad_accum": int(grad_accum),
+        "stage5/config/epochs": int(s5["epochs"]),
+        "stage5/config/kd_temperature": float(T),
+        "stage5/config/trainable_router_params": int(_trainable_param_count),
+        "stage5/config/use_compile_student": bool(use_compile),
+        "stage5/config/teacher_cache_hit": bool(teacher_logits_cache is not None),
+        "stage5/config/trailing_batches_dropped": int(trailing),
+    })
     if trailing != 0:
         log.warning(
             "Stage 5: %d trailing batches per epoch will not form a complete "
