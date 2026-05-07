@@ -178,7 +178,7 @@ def run(
     if _all_bcov_spills_exist:
         log.info(
             "Stage 3: all %d B-cov spill files found — skipping Phase A "
-            "(covariance collection + teacher load)",
+            "(covariance collection)",
             len(moe_layers),
         )
         # On resume we skip the else-branch where C_acc is normally created.
@@ -187,9 +187,12 @@ def run(
         if cross_cov_enabled:
             C_acc = InputCovarianceAccumulator()
             C_acc.set_storage_dtype(B_cov_dtype)
-    else:
-        if cross_cov_enabled:
-            log.info("Stage 3: loading original model for cross-covariance dual-forward (Theorem 3.2)")
+        # Load the teacher even on resume if Phase C.5 is enabled — its block
+        # forwards are required for the anchored MSE objective. Skip the
+        # ~60 s / 70 GB load only when block_refine is off.
+        if bool(s3.get("block_refine", {}).get("enabled", False)):
+            log.info("Stage 3: resume + block_refine — loading original model "
+                     "for Phase C.5 anchored objective")
             teacher_model, _ = load_model(
                 config["model"]["name_or_path"],
                 revision=config["model"]["revision"],
@@ -202,12 +205,36 @@ def run(
             for p in teacher_model.parameters():
                 p.requires_grad_(False)
             teacher_moe_layers = list(iter_moe_layers(teacher_model))
-            C_acc = InputCovarianceAccumulator()
-            C_acc.set_storage_dtype(B_cov_dtype)
-            log.info("Stage 3: dual-forward covariance collection (B + cross-cov C), batch_size=%d",
-                     bcov_batch_size)
+    else:
+        # Teacher is needed when (a) cross-covariance is enabled (Phase A
+        # dual-forward, Theorem 3.2), or (b) block_refine is enabled
+        # (Phase C.5 anchored MSE objective). Load once and use for both.
+        _need_teacher = cross_cov_enabled or bool(s3.get("block_refine", {}).get("enabled", False))
+        if _need_teacher:
+            log.info("Stage 3: loading original model (cross_cov=%s, block_refine=%s)",
+                     cross_cov_enabled, bool(s3.get("block_refine", {}).get("enabled", False)))
+            teacher_model, _ = load_model(
+                config["model"]["name_or_path"],
+                revision=config["model"]["revision"],
+                torch_dtype=config["model"]["torch_dtype"],
+                device_map=config["model"]["device_map"],
+                attn_implementation=config["model"]["attn_implementation"],
+                trust_remote_code=config["model"].get("trust_remote_code", False),
+            )
+            teacher_model.eval()
+            for p in teacher_model.parameters():
+                p.requires_grad_(False)
+            teacher_moe_layers = list(iter_moe_layers(teacher_model))
+            if cross_cov_enabled:
+                C_acc = InputCovarianceAccumulator()
+                C_acc.set_storage_dtype(B_cov_dtype)
+                log.info("Stage 3: dual-forward covariance collection (B + cross-cov C), batch_size=%d",
+                         bcov_batch_size)
+            else:
+                log.info("Stage 3: B-cov only collection; teacher resident for Phase C.5, batch_size=%d",
+                         bcov_batch_size)
         else:
-            log.info("Stage 3: B-cov only (cross-covariance disabled), batch_size=%d",
+            log.info("Stage 3: B-cov only (no cross-cov, no block_refine), batch_size=%d",
                      bcov_batch_size)
         _collect_covariances(
             model, moe_layers, batches, B_acc, device=device,
@@ -218,12 +245,17 @@ def run(
             ccov_spill_dir=ccov_spill_dir,
         )
 
-    # Free the teacher model after covariance collection — not needed for factoring.
-    if teacher_model is not None:
+    # Teacher residency: spec §6 keeps the teacher in VRAM through Phase C.5
+    # so its block forwards can be invoked on-demand for the anchored objective
+    # ‖ℒ_i(X) − ℒ'_i(X')‖². If Phase C.5 (block_refine) is disabled, free now.
+    _block_refine_enabled = bool(s3.get("block_refine", {}).get("enabled", False))
+    if teacher_model is not None and not _block_refine_enabled:
         teacher_model.to("cpu")
         del teacher_model, teacher_moe_layers
+        teacher_model = None  # noqa: F841 - reused below
+        teacher_moe_layers = None
         torch.cuda.empty_cache()
-        log.info("Stage 3: freed original model after cross-covariance collection")
+        log.info("Stage 3: freed original model after cross-covariance collection (block_refine disabled)")
 
     # 1. Per-(layer, matrix) group stats and rank allocation.
     log.info("Stage 3: computing per-group stats over %d layers", len(moe_layers))
@@ -537,14 +569,36 @@ def run(
         if C_acc is not None:
             C_acc.unload_layer(ref.layer_idx)
 
-    # 4. Block refine (optional).
-    if s3["block_refine"]["enabled"]:
-        _per_matrix_refine(
-            moe_layers, originals, A_cov,
-            lbfgs_steps=s3["block_refine"]["lbfgs_steps"],
-            lbfgs_history=s3["block_refine"]["lbfgs_history"],
-            B_acc=B_acc, bcov_spill_dir=bcov_spill_dir,
+    # 4. Phase C.5 — block-level joint refinement (paper 2604.02119 §3.3).
+    # Replaces the legacy per-matrix L-BFGS refine; trains the block's
+    # FactoredExperts U/V slots and the two RMSNorm scales jointly via
+    # AdamW (fp32) on the anchored MSE objective ‖ℒ_i(X) − ℒ'_i(X')‖².
+    if _block_refine_enabled:
+        if teacher_model is None or teacher_moe_layers is None:
+            raise RuntimeError(
+                "Stage 3 Phase C.5 requires the teacher model to be resident. "
+                "Either disable stage3_svd.block_refine.enabled or ensure "
+                "Phase A loaded the teacher (check aa_svd.cross_covariance "
+                "and the resume path)."
+            )
+        br = s3["block_refine"]
+        _phase_c5_block_refine(
+            model, teacher_model, moe_layers, teacher_moe_layers, calib,
+            batch_size=int(br.get("batch_size", 32)),
+            learning_rate=float(br.get("learning_rate", 1.0e-4)),
+            epochs=int(br.get("epochs", 25)),
+            warmup_ratio=float(br.get("warmup_ratio", 0.1)),
+            weight_decay=float(br.get("weight_decay", 0.0)),
+            artifacts_dir=artifacts_dir, no_resume=no_resume, device=device,
         )
+
+    # Free teacher after Phase C.5 (or after factoring if C.5 disabled and the
+    # earlier branch left it resident — defensive).
+    if teacher_model is not None:
+        teacher_model.to("cpu")
+        del teacher_model, teacher_moe_layers
+        torch.cuda.empty_cache()
+        log.info("Stage 3: freed original model after Phase C.5")
 
     out_dir = artifacts_dir / "stage3_svd"
     save_compressed_checkpoint(
@@ -1763,153 +1817,304 @@ def _cov_lookup(cov: dict, layer_idx: int, expert_idx: int, matrix_name: str):
 # ---------------------------------------------------------------------------
 
 
-def _per_matrix_refine(
+def _phase_c5_block_refine(
+    student,
+    teacher,
     moe_layers: list[MoELayerRef],
-    originals: dict[tuple[int, int, str], torch.Tensor],
-    A_cov: dict,
+    teacher_moe_layers: list[MoELayerRef],
+    calib_tensor: torch.Tensor,
     *,
-    lbfgs_steps: int,
-    lbfgs_history: int,
-    B_acc=None,
-    bcov_spill_dir: Path | None = None,
+    batch_size: int,
+    learning_rate: float,
+    epochs: int,
+    warmup_ratio: float,
+    weight_decay: float,
+    artifacts_dir: Path,
+    no_resume: bool,
+    device,
 ) -> None:
-    # The L-BFGS objective here is the A-weighted (pre-prune input cov)
-    # reconstruction loss ‖(W−UV)·A^{1/2}‖_F², which is *not* the same as
-    # the B-weighted (post-prune input cov) loss ‖(W−UV)·L_B‖_F² that
-    # ``_aa_svd`` minimised. A and B both live in input space [d_in, d_in]
-    # but capture different signal distributions (full pre-prune vs. the
-    # subset that survives Stage 2 expert merge). The two norms can
-    # disagree; refine can in principle improve the A-weighted metric
-    # while slightly degrading the B-weighted metric. We compute the
-    # B-weighted residual pre/post-refine per (layer, matrix) and warn if
-    # any matrix regresses, so silent quality loss in the B-weighted norm
-    # is observable in trackio rather than invisible.
-    log.info(
-        "Stage 3.D: activation-weighted refine (%d layers × 3 matrices × N experts)",
-        len(moe_layers),
-    )
-    bw_check = B_acc is not None and bcov_spill_dir is not None
-    for ref in moe_layers:
-        # Lazy-load this layer's B-cov for the pre/post B-weighted check.
-        # Same pattern as the factor loop: load → use → unload to keep the
-        # in-memory cov bounded to ~one layer.
-        if bw_check:
-            loaded = B_acc.load_layer_from_disk(ref.layer_idx, bcov_spill_dir)
-            if not loaded:
-                log.warning(
-                    "Refine: B-cov spill missing for layer %d at %s; "
-                    "skipping B-weighted regression check for this layer.",
-                    ref.layer_idx, bcov_spill_dir,
-                )
-        fe: FactoredExperts = ref.experts_module
-        if not isinstance(fe, FactoredExperts):
-            continue
-        # Aggregate convergence: sum of (initial_loss, final_loss) over experts
-        # for this layer × matrix. Per-expert is too noisy for the dashboard.
-        layer_init: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
-        layer_final: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
-        layer_count: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
-        # B-weighted residual tr((W−UV) B (W−UV)^T) = ((R @ B) * R).sum(),
-        # pre/post-refine. Same trace form as the A-weighted line; B is the
-        # post-prune *input* covariance ([d_in, d_in]), the same B that
-        # ``_aa_svd`` minimised against — not an output-side cov.
-        bw_init: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
-        bw_final: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
-        bw_count: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
-        for e in range(fe.num_experts):
-            for name in MATRIX_NAMES:
-                key = (ref.layer_idx, e, name)
-                A = _cov_lookup(A_cov, ref.layer_idx, e, name)
-                if A is None:
-                    continue
-                W = originals[key].to(device=fe.gate_proj_U.device, dtype=torch.float32)
-                A_d = A.to(device=fe.gate_proj_U.device, dtype=torch.float32)
-                B_d = None
-                if bw_check:
-                    B_t = _cov_lookup(B_acc.covariance, ref.layer_idx, e, name)
-                    if B_t is not None:
-                        B_d = B_t.to(device=fe.gate_proj_U.device, dtype=torch.float32)
-                U_p = getattr(fe, f"{name}_U").data[e].clone().to(torch.float32).requires_grad_(True)
-                V_p = getattr(fe, f"{name}_V").data[e].clone().to(torch.float32).requires_grad_(True)
-                # Initial loss (pre-refine) for the convergence diff.
-                # Held in locals — only committed to the layer accumulators
-                # after a successful ``opt.step``, so an LBFGS exception
-                # cannot leave bw_init incremented without a matching
-                # bw_final / bw_count.
-                with torch.no_grad():
-                    R0 = W - U_p @ V_p
-                    init_loss = float(((R0 @ A_d) * R0).sum().item())
-                    bw_init_local = (
-                        float(((R0 @ B_d) * R0).sum().item())
-                        if B_d is not None else None
-                    )
-                opt = torch.optim.LBFGS(
-                    [U_p, V_p], history_size=lbfgs_history,
-                    max_iter=lbfgs_steps, line_search_fn="strong_wolfe",
-                )
+    """Phase C.5 — block-level joint refinement (paper 2604.02119, Algorithm 2 §3.3).
 
-                def closure():
-                    opt.zero_grad()
-                    R = W - U_p @ V_p
-                    loss = ((R @ A_d) * R).sum()
-                    loss.backward()
-                    return loss
+    For each decoder block i sequentially (0 → N−1):
+      1. Compute the teacher-block target ℒ_i(X_i^teacher) once per batch on
+         the still-resident teacher (no grad).
+      2. Train the block's factored U/V slots and the two RMSNorm scales
+         (input_layernorm, post_attention_layernorm) jointly by AdamW
+         (fp32 moments + fp32 master) for `epochs` over the calibration
+         data with cosine schedule + linear warmup, batch_size batches at
+         a time, MSE loss against the teacher target.
+      3. Advance both upstream streams (X_(i+1)^teacher = teacher.layers[i](...)
+         and X'_(i+1) = refined_student.layers[i](...)) for the next block.
+      4. Save a per-block atomic checkpoint with the refined U/V + RMSNorm
+         state for crash-resume.
+    """
+    s_layers_by_idx = {ref.layer_idx: ref.layer_module for ref in moe_layers}
+    t_layers_by_idx = {ref.layer_idx: ref.layer_module for ref in teacher_moe_layers}
+    block_indices = sorted(s_layers_by_idx.keys())
+    n_blocks = len(block_indices)
+    log.info("Stage 3 Phase C.5: %d blocks × %d epochs (lr=%.1e, batch=%d)",
+             n_blocks, epochs, learning_rate, batch_size)
 
+    partial_dir = None if no_resume else artifacts_dir / "_stage3_phase_c5_partial"
+    if partial_dir is not None:
+        partial_dir.mkdir(parents=True, exist_ok=True)
+        for stale in partial_dir.glob("*.tmp"):
+            stale.unlink(missing_ok=True)
+
+    # Build input batches once. calib_tensor is already token-id integer; we
+    # forward through the model's embedding + decoder stack manually so the
+    # captured kwargs (position_embeddings, attention_mask, position_ids,
+    # cache_position) come from the model's own prep code.
+    n_seq, seq_len = calib_tensor.shape
+    n_batches = (n_seq + batch_size - 1) // batch_size
+    batches = [calib_tensor[b * batch_size:(b + 1) * batch_size] for b in range(n_batches)]
+    log.info("Stage 3 Phase C.5: %d calibration sequences in %d batches", n_seq, n_batches)
+
+    # Capture per-layer kwargs once via a forward pre-hook on each layer.
+    # kwargs are stable across batches with the same shape (attention masks,
+    # position_ids, position_embeddings); we capture from batch 0 and reuse.
+    def _capture_first_pass(model_, layers_by_idx, sample_batch):
+        captured_kwargs: dict[int, dict] = {}
+        captured_inputs: dict[int, torch.Tensor] = {}
+        handles = []
+        for li, layer in layers_by_idx.items():
+            def _make_hook(idx):
+                def _hook(_mod, args, kwargs):
+                    captured_inputs[idx] = args[0].detach() if args else kwargs.get("hidden_states").detach()
+                    captured_kwargs[idx] = {k: v for k, v in kwargs.items() if k != "hidden_states"}
+                return _hook
+            handles.append(layer.register_forward_pre_hook(_make_hook(li), with_kwargs=True))
+        try:
+            with torch.no_grad():
+                model_(input_ids=sample_batch.to(device))
+        finally:
+            for h in handles:
+                h.remove()
+        return captured_kwargs, captured_inputs
+
+    # Use batch 0 to capture stable kwargs (these don't depend on weight values,
+    # only on input_ids shape/positions).
+    sample = batches[0]
+    student_kwargs, _ = _capture_first_pass(student, s_layers_by_idx, sample)
+    teacher_kwargs, _ = _capture_first_pass(teacher, t_layers_by_idx, sample)
+
+    # Initialize both upstream streams: per-batch hidden state at the input to
+    # the FIRST MoE block. Captured via a one-shot forward through the prefix
+    # (embed → any non-MoE layers → first MoE layer pre-hook).
+    first_idx = block_indices[0]
+    log.info("Stage 3 Phase C.5: capturing initial upstream streams at block %d", first_idx)
+
+    def _capture_block_input(model_, layer_module, all_batches):
+        """Run the model forward and capture the hidden_state input to
+        ``layer_module`` once per batch via a one-shot pre-hook + EarlyExit.
+        Returns a list of CPU bf16 tensors, one per batch."""
+        captured: list[torch.Tensor | None] = [None] * len(all_batches)
+        cur_idx = [0]
+
+        class _EarlyExit(Exception):
+            pass
+
+        def _hook(_mod, args, kwargs):
+            t = args[0] if args else kwargs.get("hidden_states")
+            captured[cur_idx[0]] = t.detach().to(dtype=torch.bfloat16, device="cpu")
+            raise _EarlyExit
+
+        handle = layer_module.register_forward_pre_hook(_hook, with_kwargs=True)
+        try:
+            for bi, batch in enumerate(all_batches):
+                cur_idx[0] = bi
                 try:
-                    final_t = opt.step(closure)
-                    final_loss = float(final_t.item()) if final_t is not None else init_loss
-                except Exception as err:
-                    log.debug("refine skipped for %s: %s", key, err)
-                    continue
-                with torch.no_grad():
-                    getattr(fe, f"{name}_U").data[e].copy_(U_p.to(getattr(fe, f"{name}_U").dtype))
-                    getattr(fe, f"{name}_V").data[e].copy_(V_p.to(getattr(fe, f"{name}_V").dtype))
-                    if B_d is not None and bw_init_local is not None:
-                        R1 = W - U_p @ V_p
-                        bw_init[name] += bw_init_local
-                        bw_final[name] += float(((R1 @ B_d) * R1).sum().item())
-                        bw_count[name] += 1
-                layer_init[name] += init_loss
-                layer_final[name] += final_loss
-                layer_count[name] += 1
-        # Per-layer LBFGS convergence: how much did the activation-weighted
-        # loss drop, averaged over experts? Negative = worse (shouldn't happen).
-        metrics: dict[str, float] = {"stage3/refine_layer_idx": float(ref.layer_idx)}
+                    with torch.no_grad():
+                        model_(input_ids=batch.to(device))
+                except _EarlyExit:
+                    pass
+        finally:
+            handle.remove()
+        if any(c is None for c in captured):
+            raise RuntimeError("Phase C.5: failed to capture block input for some batches")
+        return captured  # type: ignore
+
+    s_first_layer = s_layers_by_idx[first_idx]
+    t_first_layer = t_layers_by_idx[first_idx]
+    X_student = _capture_block_input(student, s_first_layer, batches)
+    X_teacher = _capture_block_input(teacher, t_first_layer, batches)
+
+    student_dtype = next(student.parameters()).dtype
+
+    for block_pos, layer_idx in enumerate(block_indices):
+        s_layer = s_layers_by_idx[layer_idx]
+        t_layer = t_layers_by_idx[layer_idx]
+
+        ckpt_path = partial_dir / f"block_{layer_idx}.pt" if partial_dir is not None else None
+        if ckpt_path is not None and ckpt_path.exists():
+            payload = torch.load(ckpt_path, map_location="cpu")
+            if int(payload.get("format_version", 0)) != 1:
+                raise RuntimeError(
+                    f"Stage 3 Phase C.5 resume: {ckpt_path} format_version != 1; "
+                    "delete _stage3_phase_c5_partial/ and re-run."
+                )
+            fe = moe_layers[block_pos].experts_module
+            ref_dev = getattr(fe, "gate_proj_U").device
+            for name in MATRIX_NAMES:
+                getattr(fe, f"{name}_U").data.copy_(
+                    payload[f"{name}_U"].to(device=ref_dev, dtype=student_dtype))
+                getattr(fe, f"{name}_V").data.copy_(
+                    payload[f"{name}_V"].to(device=ref_dev, dtype=student_dtype))
+            for nm, key in (("input_layernorm", "input_layernorm"),
+                            ("post_attention_layernorm", "post_attention_layernorm")):
+                mod = getattr(s_layer, nm, None)
+                if mod is not None and hasattr(mod, "weight") and key in payload:
+                    mod.weight.data.copy_(
+                        payload[key].to(device=mod.weight.device, dtype=student_dtype))
+            log.info("Stage 3 Phase C.5 block %d/%d (idx=%d) — resumed from checkpoint",
+                     block_pos + 1, n_blocks, layer_idx)
+            # Still need to advance the streams using the (resumed) refined block.
+            X_student, X_teacher = _advance_streams(
+                s_layer, t_layer, X_student, X_teacher,
+                student_kwargs.get(layer_idx, {}), teacher_kwargs.get(layer_idx, {}),
+                device,
+            )
+            continue
+
+        # Collect trainables for this block. FactoredExperts U/V slots + the
+        # two RMSNorm scales. All other params remain frozen (we set
+        # requires_grad on the trainable subset only).
+        fe = moe_layers[block_pos].experts_module
+        if not isinstance(fe, FactoredExperts):
+            log.info("Stage 3 Phase C.5 block %d skipped (not factored)", layer_idx)
+            continue
+        trainables: list[nn.Parameter] = []
         for name in MATRIX_NAMES:
-            if layer_count[name] == 0:
-                continue
-            init_m = layer_init[name] / layer_count[name]
-            final_m = layer_final[name] / layer_count[name]
-            rel = (init_m - final_m) / max(init_m, 1e-12)
-            metrics[f"stage3/refine_loss_init/{name}"] = init_m
-            metrics[f"stage3/refine_loss_final/{name}"] = final_m
-            metrics[f"stage3/refine_rel_drop/{name}"] = rel
-            log.info("  L%d %s LBFGS: %.4e → %.4e (drop %.1f%%)",
-                     ref.layer_idx, name, init_m, final_m, 100 * rel)
-            # B-weighted regression check: refine optimises the A-weighted
-            # objective, but the B-weighted norm is what ``_aa_svd`` (and,
-            # by proxy, the model's actual quality on calibration-like
-            # input) targets. Warn loudly if refine made the B-weighted
-            # residual worse on this layer × matrix.
-            if bw_count[name] > 0:
-                bw_i = bw_init[name] / bw_count[name]
-                bw_f = bw_final[name] / bw_count[name]
-                bw_rel = (bw_i - bw_f) / max(bw_i, 1e-12)
-                metrics[f"stage3/refine_bw_loss_init/{name}"] = bw_i
-                metrics[f"stage3/refine_bw_loss_final/{name}"] = bw_f
-                metrics[f"stage3/refine_bw_rel_drop/{name}"] = bw_rel
-                if bw_rel < -1e-3:
-                    log.warning(
-                        "  L%d %s refine REGRESSED B-weighted norm: "
-                        "%.4e → %.4e (%.2f%%); A-weighted dropped %.1f%%. "
-                        "Refine objective ≠ B-weighted target; consider "
-                        "reducing lbfgs_steps or disabling block_refine.",
-                        ref.layer_idx, name, bw_i, bw_f, 100 * bw_rel,
-                        100 * rel,
-                    )
-                else:
-                    log.info("  L%d %s B-weighted: %.4e → %.4e (drop %.1f%%)",
-                             ref.layer_idx, name, bw_i, bw_f, 100 * bw_rel)
-        _trackio_log(metrics)
-        if bw_check:
-            B_acc.unload_layer(ref.layer_idx)
+            for slot in (f"{name}_U", f"{name}_V"):
+                p = getattr(fe, slot)
+                p.requires_grad_(True)
+                trainables.append(p)
+        norm_params: list[nn.Parameter] = []
+        for nm in ("input_layernorm", "post_attention_layernorm"):
+            mod = getattr(s_layer, nm, None)
+            if mod is not None and hasattr(mod, "weight"):
+                mod.weight.requires_grad_(True)
+                norm_params.append(mod.weight)
+        trainables.extend(norm_params)
+
+        # Build optimizer + scheduler. Spec §6 Phase C.5: standard
+        # torch.optim.AdamW (fp32 moments + fp32 master), lr=1e-4,
+        # cosine schedule with linear warmup, 25 epochs.
+        opt = torch.optim.AdamW(trainables, lr=learning_rate, weight_decay=weight_decay)
+        total_steps = max(1, epochs * len(batches))
+        warmup_steps = max(1, int(warmup_ratio * total_steps))
+
+        def _lr_at(step: int) -> float:
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        # Pre-compute teacher targets once per batch (no grad).
+        teacher_targets: list[torch.Tensor] = []
+        with torch.no_grad():
+            for bi, _ in enumerate(batches):
+                x_t = X_teacher[bi].to(device=device, dtype=student_dtype)
+                out = t_layer(x_t, **teacher_kwargs.get(layer_idx, {}))
+                if isinstance(out, tuple):
+                    out = out[0]
+                teacher_targets.append(out.detach().to(dtype=torch.bfloat16, device="cpu"))
+
+        # AdamW loop.
+        loss_first: float | None = None
+        loss_last: float | None = None
+        step = 0
+        for epoch in range(epochs):
+            for bi, _ in enumerate(batches):
+                x_s = X_student[bi].to(device=device, dtype=student_dtype)
+                target = teacher_targets[bi].to(device=device, dtype=student_dtype)
+                out = s_layer(x_s, **student_kwargs.get(layer_idx, {}))
+                if isinstance(out, tuple):
+                    out = out[0]
+                loss = nn.functional.mse_loss(out.to(torch.float32),
+                                               target.to(torch.float32))
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                # Apply LR schedule by overwriting param_group lr each step.
+                lr_now = learning_rate * _lr_at(step)
+                for g in opt.param_groups:
+                    g["lr"] = lr_now
+                opt.step()
+                step += 1
+                if loss_first is None:
+                    loss_first = float(loss.item())
+                loss_last = float(loss.item())
+
+        # Restore frozen state on RMSNorm params (other models don't refine).
+        for p in norm_params:
+            p.requires_grad_(False)
+        # FactoredExperts U/V are kept as-is (Stage 4 will widen them).
+        # We DO leave requires_grad=False on them post-refine to avoid
+        # accidental grad accumulation in subsequent stages.
+        for name in MATRIX_NAMES:
+            for slot in (f"{name}_U", f"{name}_V"):
+                getattr(fe, slot).requires_grad_(False)
+
+        rel_drop = (loss_first - loss_last) / max(loss_first or 1e-12, 1e-12) if loss_first else 0.0
+        log.info("  Phase C.5 block %d/%d (idx=%d) loss %.4e → %.4e (%.1f%%↓)",
+                 block_pos + 1, n_blocks, layer_idx,
+                 loss_first or 0.0, loss_last or 0.0, 100 * rel_drop)
+        _trackio_log({
+            "stage3/c5_layer_idx": float(layer_idx),
+            "stage3/c5_loss_init": loss_first or 0.0,
+            "stage3/c5_loss_final": loss_last or 0.0,
+            "stage3/c5_loss_rel_drop": rel_drop,
+        })
+
+        # Save per-block checkpoint atomically.
+        if ckpt_path is not None:
+            payload = {"format_version": 1, "layer_idx": layer_idx}
+            for nm in ("input_layernorm", "post_attention_layernorm"):
+                mod = getattr(s_layer, nm, None)
+                if mod is not None and hasattr(mod, "weight"):
+                    payload[nm] = mod.weight.detach().cpu()
+            for name in MATRIX_NAMES:
+                payload[f"{name}_U"] = getattr(fe, f"{name}_U").detach().cpu()
+                payload[f"{name}_V"] = getattr(fe, f"{name}_V").detach().cpu()
+            tmp = ckpt_path.with_suffix(".pt.tmp")
+            torch.save(payload, tmp)
+            import os as _os
+            _os.replace(tmp, ckpt_path)
+
+        # Advance streams for the next block (no grad).
+        X_student, X_teacher = _advance_streams(
+            s_layer, t_layer, X_student, X_teacher,
+            student_kwargs.get(layer_idx, {}), teacher_kwargs.get(layer_idx, {}),
+            device,
+        )
+
+    # Cleanup: remove checkpoint dir on success.
+    if partial_dir is not None and partial_dir.exists():
+        import shutil as _shutil
+        _shutil.rmtree(partial_dir, ignore_errors=True)
+        log.info("Stage 3 Phase C.5: removed checkpoint dir (run completed cleanly)")
+
+
+def _advance_streams(s_layer, t_layer, X_student, X_teacher,
+                     s_kwargs, t_kwargs, device):
+    """Forward both layers (no grad) on each batch's current stream and return
+    the next-block-input tensors as bf16 CPU lists."""
+    new_s: list[torch.Tensor] = []
+    new_t: list[torch.Tensor] = []
+    student_dtype = next(s_layer.parameters()).dtype
+    teacher_dtype = next(t_layer.parameters()).dtype
+    with torch.no_grad():
+        for x_s_cpu, x_t_cpu in zip(X_student, X_teacher):
+            x_s = x_s_cpu.to(device=device, dtype=student_dtype)
+            out_s = s_layer(x_s, **s_kwargs)
+            if isinstance(out_s, tuple):
+                out_s = out_s[0]
+            new_s.append(out_s.detach().to(dtype=torch.bfloat16, device="cpu"))
+            x_t = x_t_cpu.to(device=device, dtype=teacher_dtype)
+            out_t = t_layer(x_t, **t_kwargs)
+            if isinstance(out_t, tuple):
+                out_t = out_t[0]
+            new_t.append(out_t.detach().to(dtype=torch.bfloat16, device="cpu"))
+    return new_s, new_t
+
+

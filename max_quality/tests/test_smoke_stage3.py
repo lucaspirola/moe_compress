@@ -189,25 +189,42 @@ def test_stage3_with_preseeded_acov(tiny_model, patched_stage3, tmp_path):
     assert (tmp_path / "stage3_svd" / "rank_map.json").exists()
 
 
-def test_stage3_block_refine_emits_b_weighted_check(
+def test_stage3_phase_c5_emits_loss_metrics(
     tiny_model, patched_stage3, tmp_path, monkeypatch,
 ):
-    """When block_refine is enabled, the B-weighted regression check fires
-    per (layer × matrix) and emits trackio metrics ``refine_bw_loss_init/*``,
-    ``refine_bw_loss_final/*``, and ``refine_bw_rel_drop/*``. This guards
-    against silent quality loss in the B-weighted norm — the L-BFGS refine
-    optimises the A-weighted objective but the B-weighted loss is what
-    ``_aa_svd`` (and model quality) actually cares about.
+    """Phase C.5 (block-level joint refinement, paper 2604.02119 §3.3) emits
+    per-block ``stage3/c5_loss_init``, ``c5_loss_final``, and
+    ``c5_loss_rel_drop`` trackio metrics. Replaces the legacy per-matrix
+    L-BFGS refine which emitted ``refine_bw_*`` metrics.
     """
-    # Deep-copy as belt-and-braces: ``patched_stage3`` is function-scoped so
-    # leakage across parametrized invocations is unlikely, but a future edit
-    # to a nested sub-dict (``d_rank``, ``aa_svd``, ``swift_svd_plus``)
-    # could still alias the underlying ``tiny_config`` if its scope is ever
-    # widened. Cheap insurance.
+    # Snapshot a teacher copy BEFORE Stages 1-2 mutate the model.
+    teacher_copy = copy.deepcopy(tiny_model)
+    teacher_copy.eval()
+    for p in teacher_copy.parameters():
+        p.requires_grad_(False)
+
     config = copy.deepcopy(patched_stage3)
     config["stage3_svd"]["block_refine"] = {
-        "enabled": True, "lbfgs_steps": 3, "lbfgs_history": 5,
+        "enabled": True, "epochs": 1, "batch_size": 1,
+        "learning_rate": 1.0e-4, "warmup_ratio": 0.1, "weight_decay": 0.0,
     }
+    # Phase C.5 requires the teacher resident; cross_covariance triggers the
+    # teacher load. The tiny synthetic model can't be loaded from HF, so we
+    # patch load_model to return the pre-snapshotted copy.
+    # Cross-cov stays False (avoids pre-existing dual-forward bug); block_refine=True
+    # alone now triggers teacher load via the _need_teacher branch.
+    config["stage3_svd"]["aa_svd"]["cross_covariance"] = False
+    monkeypatch.setattr(stage3_svd, "load_model",
+                        lambda *args, **kwargs: (teacher_copy, None))
+    # `model.name_or_path` and `model.revision` keys must exist on the
+    # config for the load_model invocation, even though the patched fn ignores
+    # them.
+    config.setdefault("model", {})
+    config["model"].setdefault("name_or_path", "tiny")
+    config["model"].setdefault("revision", "main")
+    config["model"].setdefault("torch_dtype", "float32")
+    config["model"].setdefault("device_map", "cpu")
+    config["model"].setdefault("attn_implementation", "eager")
 
     captured: list[dict] = []
 
@@ -222,29 +239,19 @@ def test_stage3_block_refine_emits_b_weighted_check(
         tiny_model, _TinyTokenizer(), config, tmp_path, decomp, device=None,
     )
 
-    refine_metrics = [
-        m for m in captured if any(k.startswith("stage3/refine_") for k in m)
-    ]
-    assert refine_metrics, "no refine trackio events captured"
+    c5_metrics = [m for m in captured if any(k.startswith("stage3/c5_") for k in m)]
+    assert c5_metrics, "no Phase C.5 trackio events captured"
 
-    bw_keys_seen = set()
-    bw_values: list[tuple[str, float]] = []
-    for m in refine_metrics:
+    keys_seen = set()
+    for m in c5_metrics:
         for k, v in m.items():
-            if k.startswith("stage3/refine_bw_"):
-                bw_keys_seen.add(k.split("/", 1)[1].rsplit("/", 1)[0])
-                bw_values.append((k, float(v)))
-    # Expect bw_loss_init / bw_loss_final / bw_rel_drop to all appear at
-    # least once across the captured per-layer events.
-    for kind in ("refine_bw_loss_init", "refine_bw_loss_final",
-                 "refine_bw_rel_drop"):
-        assert kind in bw_keys_seen, (
-            f"expected '{kind}' in refine metrics; got {sorted(bw_keys_seen)}"
+            if k.startswith("stage3/c5_"):
+                keys_seen.add(k.split("/", 1)[1])
+                assert math.isfinite(float(v)), f"non-finite C.5 metric {k}={v}"
+    for kind in ("c5_loss_init", "c5_loss_final", "c5_loss_rel_drop"):
+        assert kind in keys_seen, (
+            f"expected '{kind}' in C.5 metrics; got {sorted(keys_seen)}"
         )
-    # All emitted B-weighted values must be finite — guards against silent
-    # NaN/Inf propagation from a degenerate B (e.g. all-zero rows).
-    for k, v in bw_values:
-        assert math.isfinite(v), f"non-finite B-weighted metric {k}={v}"
 
 
 def test_stage3_spill_dir_created_during_run(tiny_model, patched_stage3, tmp_path,

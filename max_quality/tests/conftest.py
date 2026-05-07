@@ -225,8 +225,9 @@ def tiny_config():
                 "alpha_search_min_host_ram_gb": 0.0,
             },
             "aa_svd": {"use_post_prune_inputs": True, "cross_covariance": False},
-            "block_refine": {"enabled": False, "lbfgs_steps": 5,
-                             "lbfgs_history": 2, "per_block_loss": "mse"},
+            "block_refine": {"enabled": False, "epochs": 1, "batch_size": 1,
+                             "learning_rate": 1.0e-4, "warmup_ratio": 0.1,
+                             "weight_decay": 0.0},
         },
         "stage4_eora": {
             "per_expert": True, "compensation_budget_pct": 0.03,

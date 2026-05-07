@@ -119,11 +119,17 @@ stage3_svd:
                                   # simultaneously (~120 GB). Set false to fall back to
                                   # auto-covariance A = X_pre^T X_pre approximation.
   bcov_storage_dtype: float16     # B post-prune covariance storage; see covariance_storage_dtype above.
-  block_refine:
+  block_refine:                       # Phase C.5 — block-level joint refinement
+                                      # (paper 2604.02119 §3.3, Algorithm 2 line 9)
     enabled: true
-    lbfgs_steps: 100
-    lbfgs_history: 10
-    per_block_loss: mse
+    epochs: 25                        # paper Algorithm 2 line 9 / spec §6 Phase C.5
+    batch_size: 32                    # paper Algorithm 2 line 9 / spec §6 Phase C.5
+    learning_rate: 1.0e-4             # paper Appendix B.2 / spec §6 Phase C.5
+    warmup_ratio: 0.1                 # cosine schedule with linear warmup
+    weight_decay: 0.0                 # AdamW default; paper does not specify
+                                      # Optimizer is standard torch.optim.AdamW (fp32 moments
+                                      # + fp32 master) — spec §6 Phase C.5 / H200 sizing
+                                      # rationale. NOT 8-bit AdamW.
 
 stage4_eora:
   per_expert: true                # spec note: per-expert beats global on MoE
