@@ -49,7 +49,7 @@ def run(
     # in `_compute_eora_factors` must be tuned to that dtype's quantization
     # noise floor or it will keep noise-inflated directions.
     s2 = config.get("stage2_reap_ream", {})
-    a_storage_dtype = getattr(torch, s2.get("covariance_storage_dtype", "float32"))
+    a_storage_dtype = getattr(torch, s2.get("covariance_storage_dtype", "float16"))
     A_cov_path = artifacts_dir / "_stage2_input_covariance.pt"
     A_cov = {}
     if A_cov_path.exists():
@@ -143,9 +143,9 @@ def run(
             cur_rank = fe.ranks[name]
             saved_per_expert = d_out * d_in - cur_rank * (d_out + d_in)
             saved_for_matrix = max(0, saved_per_expert) * N
-            max_added_ranks = int(s4["compensation_budget_pct"] * saved_for_matrix)
-            r_per_expert = max_added_ranks // max(N * (d_out + d_in), 1)
-            r_per_expert = min(r_per_expert, s4["eigenspace_rank_cap"], min(d_out, d_in) - 1)
+            param_budget = int(s4["compensation_budget_pct"] * saved_for_matrix)
+            r_per_expert = param_budget // max(N * (d_out + d_in), 1)
+            r_per_expert = min(r_per_expert, s4["eigenspace_rank_cap"], min(d_out, d_in))
             r_per_expert = max(0, r_per_expert)
             if r_per_expert <= 0:
                 continue
