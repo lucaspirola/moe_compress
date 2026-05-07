@@ -1097,7 +1097,7 @@ def _permutation_align_to_centroid(
         # then normalize once), not two separately-normalized components.
         C_act = _safe_norm(C_act)
         C_wt = _safe_norm(C_gate + C_up)
-        C = _safe_norm(C_act) + C_wt
+        C = C_act + C_wt
     else:
         # B-C-M-1: same single-component treatment for the no-activation path.
         C = _safe_norm(C_gate + C_up)
