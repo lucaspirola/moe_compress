@@ -280,25 +280,37 @@ def run(
     log.info("Saved Stage 3 original weights snapshot (%d matrices) → %s",
              len(originals), _orig_path)
 
-    # Pre-flight RAM check: if the system is low on memory, fall back
-    # to the spectral proxy rather than OOM during the α-search loop.
+    # Pre-flight RAM check: paper-compliance contract (spec §6 Phase B.2)
+    # requires the end-to-end PPL α-search per Swift-SVD §3.2.2. If host RAM
+    # cannot host the snapshot + eval working set, fail fast rather than
+    # silently degrade to a spectral proxy that produces a non-paper-compliant
+    # model. Operators must provision ≥15 GB headroom or reduce
+    # validation_samples to fit.
     if validation_samples > 0:
         try:
             import psutil
-            avail_gb = psutil.virtual_memory().available / 1e9
-            # Estimate memory needed: one layer's B-cov (~5 GB) + eval
-            # overhead (~5 GB) on top of what we already hold.
-            min_headroom_gb = 15.0
-            if avail_gb < min_headroom_gb:
-                log.warning(
-                    "Stage 3 α-search: only %.1f GB host RAM available "
-                    "(need ≥%.0f GB headroom). Falling back to spectral "
-                    "proxy for α selection.",
-                    avail_gb, min_headroom_gb,
-                )
-                validation_samples = 0
-        except ImportError:
-            pass  # psutil unavailable — proceed optimistically
+        except ImportError as exc:
+            raise RuntimeError(
+                "Stage 3 α-search requires psutil for the host-RAM pre-flight "
+                "check (spec §6 Phase B.2 paper-compliance contract). Install "
+                "psutil or set stage3_svd.validation_samples=0 to skip the "
+                "α-search entirely."
+            ) from exc
+        avail_gb = psutil.virtual_memory().available / 1e9
+        # Default headroom (15 GB) is sized for production: ~50 GB snapshot in
+        # CPU RAM + ~5 GB B-cov per layer + ~5 GB eval working set on a 30 B
+        # base model. Smoke tests on toy models override via swift_svd_plus
+        # config to skip the gate while still exercising the α-search path.
+        min_headroom_gb = float(svd_plus_cfg.get("alpha_search_min_host_ram_gb", 15.0))
+        if avail_gb < min_headroom_gb:
+            raise RuntimeError(
+                f"Stage 3 α-search: only {avail_gb:.1f} GB host RAM available, "
+                f"need ≥{min_headroom_gb:.0f} GB headroom for the paper-exact "
+                f"end-to-end PPL grid (spec §6 Phase B.2). Provision more RAM "
+                f"or reduce stage3_svd.validation_samples to fit. The previous "
+                f"silent spectral-proxy fallback (D9) was removed because it "
+                f"produced a non-paper-compliant model."
+            )
 
     # Resume: if α was already selected (and saved) in a previous interrupted
     # run, reload it and skip the ~33 min α search entirely.
