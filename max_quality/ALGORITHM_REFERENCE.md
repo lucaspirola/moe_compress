@@ -686,7 +686,7 @@ For each (layer, expert, matrix):
 
 Per-layer atomic checkpointing to `_stage4_partial/layer_{layer_idx}.pt` (format_version=1). Each checkpoint contains the full FactoredExperts U/V state, ranks, effective ranks, and parameter counts. On resume, completed layers are loaded directly; failed layers re-run from the Stage 3 output.
 
-Stage 4 deletes `_stage3_original_weights.pt` on success (already durable on the per-stage Hub repo). `_stage2_input_covariance.pt` is not read by Stage 4 and is NOT deleted here — it is used by Stage 3 and cleaned up by that stage's own success handler.
+Stage 4 is the final consumer of both `_stage3_original_weights.pt` (Step 1, residual) and `_stage2_input_covariance.pt` (Step 2, input Gram for the √Λ projection); both are deleted on Stage 4 success. They remain durable on their per-stage Hub repos (`<base>-stage2`, `<base>-stage3`); on-bucket retention only inflates the entrypoint's job-exit aux upload to the aggregate result repo. On Stage 4 failure both are kept so a re-run can pick up cleanly.
 
 ---
 

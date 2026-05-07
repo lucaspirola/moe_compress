@@ -128,7 +128,7 @@ stage3_svd:
 stage4_eora:
   per_expert: true                # spec note: per-expert beats global on MoE
   compensation_budget_pct: 0.03   # EoRA adds back ≤ 3% of Stage 3 savings
-  eigenspace_rank_cap: 64         # hard cap per matrix
+  eigenspace_rank_cap: 128        # hard cap per matrix (spec §7 Budget)
 
 stage5_router_kd:
   optimizer: adamw
