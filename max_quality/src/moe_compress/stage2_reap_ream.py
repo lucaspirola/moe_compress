@@ -1019,10 +1019,12 @@ def _ream_cost_matrix(
             sim_gate   = float(sim_gate_sub[ci, cj])
             sim_expert = ream_acc.compute_delta_expert(li, child, centroid)
             if math.isnan(sim_expert):
-                # B-C-N-2: When δ̃_expert returns NaN (no joint activations),
-                # substitute 0.0 (no similarity); biases the cost up to
-                # 0.5 + 0.5*δ_gate per D-ream-sparse-routing.
-                sim_expert = 0.0  # no profiling data; treat as no similarity
+                # When δ̃_expert returns NaN (degenerate: no joint-activation
+                # data for this pair), substitute 0.5 — neutral after the
+                # (cos+1)/2 rescale — matching the per-token NaN convention
+                # in finalize_batch (activation_hooks.py) per
+                # D-ream-sparse-routing.
+                sim_expert = 0.5  # neutral; matches per-token NaN handling
             # δ_REAM = (δ_gate + δ̃_expert) / 2 ∈ [0,1]; cost = 1 − δ_REAM ∈ [0,1].
             # Lower cost = more similar (spec §5 Step 2, reference ream/ream.py L46-53).
             cost[ci, cj] = 1.0 - (sim_gate + sim_expert) / 2.0

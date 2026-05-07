@@ -258,11 +258,15 @@ def run(
             log.warning("Stage 5: torch.compile failed (%s) — falling back to eager mode", exc)
             use_compile = False
 
+    # seed_offset distinguishes Stage 2.5 (post-merge router KD) from
+    # Stage 5 (final router KD) so each pass sees a different calibration
+    # draw and the routers are not retrained on the identical 3000 sequences.
+    _seed_offset = 25 if stage_key == "stage2p5" else 5
     spec = spec_from_config(
         cal,
         num_sequences_override=s5["max_calibration_samples"],
         sequence_length_override=s5["max_sequence_length"],
-        seed_offset=5,
+        seed_offset=_seed_offset,
     )
     calib = build_calibration_tensor(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache"
