@@ -118,7 +118,7 @@ Given a `target_total_reduction` (e.g., 0.30) and an `expert_svd_ratio` (e.g., 2
 **Papers:**
 - Super Experts in MoE Models (2507.23279) — SE detection
 - GRAPE: Greedy Redundancy-Aware Pruning for MoE (2604.06542), §3.2–3.3, Algorithm 1 — budget allocation
-**Hardware:** H200. Original BF16 model (~70 GB) leaves 71 GB VRAM headroom. Two sequential forward passes over 256 calibration samples (Algorithm 1 Stage 1 then Stage 2, ~5 min combined), then weight-space GRAPE computation on GPU.
+**Hardware:** H200. Original BF16 model (~70 GB) leaves 71 GB VRAM headroom. Two sequential forward passes over 256 calibration samples (Algorithm 1 Stage 1 then Stage 2, ~5 min combined; project-measured walltime, not paper-derived), then weight-space GRAPE computation on GPU.
 
 ### What
 
@@ -128,7 +128,7 @@ A single unified stage that (a) identifies super experts that must never be comp
 
 Super experts carry outsized influence on model output despite being activated at normal frequency. Pruning them causes catastrophic quality collapse (e.g., −21.7% relative average accuracy drop across 9 benchmarks (Table 3, non-thinking mode) on Qwen3-30B-A3B). They must be detected before any budget allocation.
 
-Uniform pruning wastes budget — some layers have highly redundant experts (high pairwise CKA similarity) while others are diverse. GRAPE's +2.45% peak on Mixtral-8x22B at the 4-expert setting (paper Table 1) demonstrates the value of non-uniform allocation. Using CKA (rather than weight-space cosine) for the similarity metric gives GRAPE activation-aware redundancy estimates, producing better budgets for Stage 2.
+Uniform pruning wastes budget — some layers have highly redundant experts (high pairwise CKA similarity) while others are diverse. GRAPE's +2.45% peak on Mixtral-8x22B at the prune-4-of-8 setting (paper Table 1; "4e" means 4 experts pruned per layer, 50% prune ratio) demonstrates the value of non-uniform allocation. Using CKA (rather than weight-space cosine) for the similarity metric gives GRAPE activation-aware redundancy estimates, producing better budgets for Stage 2.
 
 ### How
 
@@ -164,7 +164,7 @@ Using across-batch maxima is valid because MAs are input-stable: 'their distribu
 
 **Why L matters:** The paper documents that some experts also produce extreme down_proj output magnitudes outside the MA-formation layers — these are called "outlier experts" (Table 7: L1E8, L47E48, L47E100 for Qwen3-30B-A3B; see Appendix C). Tables 6 and 7 are internally inconsistent for the first outlier expert in this model (Table 6: "Layer 47 Expert 8"; Table 7: "Layer 1 Expert 8") (the Table-6 entry 'Layer 47 Expert 8' is almost certainly a typo for 'Layer 1 Expert 8'; spec follows Table 7's L1E8 reading); this spec follows Table 7 (L1E8). These outlier experts do not contribute to MA formation and are not SEs. Not all outlier experts are excluded by the L-filter: L1E8 sits in Layer 1, which is an MA-formation layer (l ∈ L); Table 7 lists it as an outlier expert that is not classified as an SE, implying it fails the magnitude thresholds rather than being excluded by the L-filter (spec inference; paper does not explicitly classify why L1E8 fails the SE criterion). L47E48 and L47E100 sit outside L and are excluded by the L-filter. The l ∈ L constraint ensures that late-layer outlier experts outside L could not be blacklisted even if their magnitudes were large enough to satisfy the P99.5 and 0.1·a_max thresholds. Appendix C establishes that outlier experts lack the mechanistic significance of SEs but does not assert they would or would not pass the numerical thresholds.
 
-**Properties of L:** MA formation in MoE models typically begins in the first 1–3 decoder layers and then stabilises — Mixtral exhibits this in a single layer, Qwen3-30B-A3B in three consecutive early layers. The MA pattern, once established, propagates stably across all subsequent layers via residual connections, so `L` is a small set of early layers (not the full layer stack). Note: this three-layer observation applies to Qwen3-30B-A3B (the paper's subject model); the pipeline's target model (Qwen3.6-35B-A3B) has a different architecture and its `L` will be determined empirically at runtime.
+**Properties of L:** MA formation in MoE models typically begins in the first 1–3 decoder layers and then stabilises — Mixtral exhibits this in a single layer (paper §3.2.2 / Table 4: Mixtral-8x7B-Instruct SE at "Layer 1 Expert 3"), Qwen3-30B-A3B in three consecutive early layers. The MA pattern, once established, propagates stably across all subsequent layers via residual connections, so `L` is a small set of early layers (not the full layer stack). Note: this three-layer observation applies to Qwen3-30B-A3B (the paper's subject model); the pipeline's target model (Qwen3.6-35B-A3B) has a different architecture and its `L` will be determined empirically at runtime.
 
 **Official implementation note:** The authors' released code (github.com/ZunhaiSu/Super-Experts-Profilling) does not implement dynamic MA-formation detection. Instead it uses a fixed depth heuristic: keep only layers with index **< `round(0.75 × total_layers)`** (`include_layers=0.75` parameter, condition `layer_index < include_layers` in `_super_experts_analysis`). For a 40-layer model this means layers 0–29 (the first 75% — exact only when `0.75 × total_layers` is integer; otherwise `round(...)` per the formula), not the last 75%. This heuristic correctly covers Qwen3-30B-A3B's L = {1, 2, 3} since those early layers fall within the first 75%. The spec uses this heuristic only as a fallback when the dynamic detector returns ∅ (see [D-ma-detector](#12-known-deviations-from-papers)).
 
@@ -181,7 +181,7 @@ The expert output representations are accumulated into per-layer representation 
 
 Using the MA-formation layer set `L` constructed in Phase A, Stage 1 computes the global set `A = {a_{l,e}}` of max down_proj output magnitudes restricted to layers in `L`, then applies the three-way AND criterion from Eq. 6. Emit `stage1_blacklist.json`.
 
-**Algorithm (Algorithm 1 (Stage 2 block, lines 14–32); the `l ∈ L` restriction is enforced at the layer-loop header on line 16):**
+**Algorithm (Algorithm 1 — Stage 2 block, lines 14–32 inclusive of the `Stage 2:` header at line 13; the `l ∈ L` restriction is enforced at the layer-loop header on line 16):**
 
 ```
 A ← ∅
