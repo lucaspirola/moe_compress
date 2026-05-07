@@ -156,7 +156,7 @@ end for
 
 **MA pattern detection (project-specified thresholds; see [D-ma-detector](#12-known-deviations-from-papers)):** A layer `l` is added to `L` if it is actively **forming** (amplifying) a massive activation — not merely propagating one that formed in an earlier layer. Paper Algorithm 1 line 8 says only "if MA pattern detected" with no formula; all numeric thresholds below are project choices, not from the paper. The dynamic detector is **primary**, with the official-implementation 0.75-depth heuristic acting as a **secondary fallback** when the dynamic detector returns ∅. Both layers of the detector are motivated by Figure 3 of the paper, which shows MAs are "gradually amplified" through the formation layers, then propagate stably via residuals.
 
-- **First MoE layer** (no predecessor to compare; dense pre-MoE layers in the stack are not MoE candidates and are skipped automatically; the "first" here is the first MoE layer encountered top-down): absolute outlier check — add to `L` if `max|H_l(x)| > ma_ratio × Q_99(|H_l(x)|)` where both statistics are taken as the maximum observed across all calibration batches. **`ma_ratio = 100` is project-specified** (not from the paper). If the first MoE layer fails its absolute-outlier check (max|H_l(x)| ≤ 100·Q_99(...)), it is not added to L by Phase A; it can only enter L via the 0.75-depth fallback if the dynamic detector returns ∅ globally.
+- **First MoE layer** (no predecessor to compare; dense pre-MoE layers in the stack are not MoE candidates and are skipped automatically; the "first" here is the first MoE layer encountered top-down): absolute outlier check — add to `L` if `max|H_l(x)| > ma_ratio × Q_99(|H_l(x)|)` where each statistic is computed across-batches by aggregating per-batch values (the LHS takes the maximum across batches; the RHS takes the 99th percentile of the per-batch maxima). **`ma_ratio = 100` is project-specified** (not from the paper). If the first MoE layer fails its absolute-outlier check (max|H_l(x)| ≤ 100·Q_99(...)), it is not added to L by Phase A; it can only enter L via the 0.75-depth fallback if the dynamic detector returns ∅ globally.
 - **All subsequent layers**: growth check — add to `L` if `max|H_l(x)| / max|H_{l-1}(x)| > ma_growth_ratio`, where both maxima are the per-layer maximum across all calibration batches. **`ma_growth_ratio = 5.0` is project-specified** (not from the paper). A propagation layer has ratio ≈ 1.0; a formation layer has ratio >> 1.
 - **Fallback** (only when the dynamic detector returns ∅): the official implementation's depth heuristic — keep all layers with index `< round(0.75 × total_layers)`. See "Official implementation note" below.
 
@@ -364,6 +364,7 @@ Top-N'_l experts by REAP score become **centroids**. Non-centroids are assigned 
 
 ```
 W_merged = Σ_i (freq_i / Σ_j freq_j) × P_i(W_i)
+        ≡ Σ_i S_i^freq · P_i(W_i)  (paper Eq. 6 form, where S_i^freq = freq_i/|X| and the global denominator |X| cancels through group-renormalization Σ_j (freq_j/|X|) = (Σ_j freq_j)/|X|)
 ```
 
 where the denominator `Σ_j freq_j` sums over merge group members only (not all N experts). `P_i` denotes the neuron permutation alignment as described in the paper's surrounding text (Hungarian algorithm on combined cost matrix `C = C_act + C_wt`) that aligns each child expert's intermediate neurons to the centroid before averaging; it is not an explicit formula component in the paper. `C_wt` is the gate+up Frobenius weight distance (implementation choice: gate_proj and up_proj; paper does not specify). Implementation: `C_wt[p,q] = ‖[W^p_gate, W^p_up] − [W^q_gate, W^q_up]‖_F` computed as the elementwise sum of independent gate and up Frobenius distances, then min-max normalized as a single component. (See D5b for the C_wt + C_act decomposition; both components min-max normalized to [0,1].) `C_act` is the per-neuron mean activation L2 distance, where activation vectors H̄ are normalized before computing the distance (normalization method unspecified in the paper). Implementation: gate-output rows are L2-normalized per-row before computing pairwise Euclidean distances; equivalent to cosine distance on the normalized rows. `freq_i` is the count of calibration tokens for which expert i is in the top-k active set, equivalent to `S_i^freq × |X|` in the paper's notation (REAM Eq. 2).
@@ -726,7 +727,7 @@ where `z_T, z_S ∈ ℝ^{|V|}` are teacher/student vocabulary logits, `m_{t+1} �
 
 | Parameter | Value | Source |
 |-----------|-------|--------|
-| Optimizer | AdamW | Paper |
+| Optimizer | AdamW | Adapted (paper unspecified — paper §F.3 Table 1 lists no optimizer; AdamW is the project default) |
 | Learning rate | **5×10⁻⁵** | Paper Table 1 (implementation previously used 1e-5; corrected to match paper) |
 | Epochs | 1 | Paper |
 | Batch size | 8 | Adapted (paper: 2 with grad-accum=4 → effective 8; spec uses 8 with grad-accum=1, mathematically equivalent). (Loss is per-sequence-normalized by `N_x` per Eq. 3, so microbatch grouping does not rescale individual sequence contributions.) |
@@ -796,7 +797,7 @@ The actual parameter reduction is computed from live parameter counts (accountin
 ```
 Measured Reduction = 1 − live_param_count(student) / live_param_count(teacher)
 ```
-where `live_param_count(model)` includes **all** model parameters: token embeddings, attention projections (DeltaNet linear attention + full attention), MoE expert weights (routed experts, including FactoredExperts U/V factors counted at their per-expert effective ranks; routers; shared experts), all RMSNorm scale parameters, and `lm_head`. Excludes optimizer state, KV cache, and activation buffers (these are not model parameters). Both numerator and denominator are computed via the same iteration over `model.parameters()` with `requires_grad`-agnostic counting.
+where `live_param_count(model)` includes **all** model parameters: token embeddings, attention projections (DeltaNet linear attention + full attention), MoE expert weights (routed experts, including FactoredExperts U/V factors counted at their per-expert effective ranks; routers; shared experts), all RMSNorm scale parameters (must be registered as `nn.Parameter`, not buffers — true for Qwen3-30B-A3B and the target model), and `lm_head`. Excludes optimizer state, KV cache, and activation buffers (these are not model parameters). Both numerator and denominator are computed via the same iteration over `model.parameters()` with `requires_grad`-agnostic counting; if a future architecture registers any of the listed components as a buffer, the iteration must be extended to `chain(model.parameters(), filtered_buffers)` to maintain ratio symmetry.
 
 ### Execution Model (Compute-Time Optimized)
 
@@ -811,11 +812,11 @@ Stage 6 runs the following phases. All optimizations are purely computational sc
 | HumanEval (164 prompts) | **#3** — batched model.generate() | `gen_batch_size` | 8 |
 | MATH-500 (500 prompts) | **#4** — batched model.generate() | `gen_batch_size` | 8 |
 
-**torch.compile** (**#5**, `torch_compile: true`): Before any evaluation begins, `model.forward` is compiled via `torch.compile(model.forward, dynamic=True, mode="reduce-overhead")`. `dynamic=True` handles variable-length padded batches from lm-eval. One-time compilation cost (~3–5 min on H200) is amortized across 1000+ forward passes. **Only** the forward pass is compiled — `model.generate()` is NOT compiled because autoregressive decoding changes shapes every step, causing excessive recompilation.
+**torch.compile** (**#5**, `torch_compile: true`): Before any evaluation begins, `model.forward` is compiled via `torch.compile(model.forward, dynamic=True, mode="reduce-overhead")`. `dynamic=True` handles variable-length padded batches from lm-eval. One-time compilation cost (~3–5 min on H200) is amortized across 1000+ forward passes. **Only** the forward pass is compiled — `model.generate()` is **not** wrapped with `torch.compile`, but each decoding step internally calls the compiled `model.forward`, so generative evals (HumanEval, MATH-500) DO benefit from the compiled forward; only the generate-loop control flow itself runs eagerly. Wrapping `model.generate()` directly was avoided because the prefill-vs-decode shape transition can still trigger one extra recompile; the per-step forward path is the dominant cost and is fully captured.
 
 #### Phase 2: Teacher I/O Overlap (#6)
 
-The teacher preload begins during Phase 1's generative evals (after the zero-shot harness completes): a background thread loads the teacher model to **host RAM** (device_map="cpu") while the GPU runs HumanEval and MATH-500. When Phase 1 completes, the student is moved to CPU, and the pre-loaded teacher is moved to GPU — eliminating the ~3–5 min dead time that a blocking teacher load would cause.
+The teacher preload begins as early as Phase 1 entry (host-RAM-only, GPU-independent — no contention with student evals). In the most conservative scheduling, it begins during Phase 1's generative evals (after the zero-shot harness completes), but starting earlier (during PPL or zero-shot) is also safe and may better hide the load: a background thread loads the teacher model to **host RAM** (device_map="cpu") while the GPU runs HumanEval and MATH-500. When Phase 1 completes, the student is moved to CPU, and the pre-loaded teacher is moved to GPU — eliminating the ~3–5 min dead time that a blocking teacher load would cause.
 
 #### Phase 3: Teacher Evaluation (or Cache Hit)
 
@@ -837,7 +838,7 @@ When the cache misses, teacher evaluation uses the same batch sizes and torch.co
 
 #### Phase 4: GGUF Conversion Overlap (#8)
 
-When the teacher is being evaluated on GPU, the GGUF conversion (`convert_hf_to_gguf.py`) runs simultaneously in a **background CPU thread**. This is safe because GGUF conversion reads from the saved Stage 5 checkpoint on disk (CPU-only, ~5–10 min) — the checkpoint is durable per §11's atomic-write contract before this thread starts — teacher evaluation runs on GPU, and CPU and GPU work are fully independent. When teacher eval finishes and the teacher is freed, the F16 GGUF is ready — `llama-imatrix` can start immediately.
+When the teacher is being evaluated on GPU, the GGUF conversion (`convert_hf_to_gguf.py`) runs simultaneously in a **background CPU thread**. This is safe because GGUF conversion reads from the saved Stage 5 checkpoint on disk (CPU-only, ~5–10 min) — the checkpoint is durable per §11's atomic-write contract before this thread starts — teacher evaluation runs on GPU, and CPU and GPU work are fully independent. When teacher eval finishes and the teacher is freed, the F16 GGUF is ready — `llama-imatrix` can start immediately. **On a teacher-cache HIT** (no teacher evaluation runs), the GGUF conversion thread is started at the beginning of Phase 1 student evals instead and runs concurrently with WikiText-2 PPL / lm-eval / generative evals (still CPU-only, GPU-independent); Phase 5 imatrix waits for thread completion if it has not yet finished.
 
 **GGUF dtype path (F-S-L-3).** `convert_hf_to_gguf.py` reads BF16 / F32 weights from the HF checkpoint and writes an **F16 GGUF** (`model_f16.gguf`) as the conversion target — F16 is the source dtype for imatrix-guided quantization downstream; no quantization happens at this step.
 
