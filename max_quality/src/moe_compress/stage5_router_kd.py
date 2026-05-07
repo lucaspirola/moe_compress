@@ -80,6 +80,17 @@ def run(
         if not cache_path.is_absolute():
             cache_path = artifacts_dir / cache_path
         if cache_path.exists():
+            # Spec §8 mutual-exclusion rule: if both teacher_logits_cache and
+            # teacher_load_in_4bit are configured, cache wins. Surface the
+            # override so an operator who set 4-bit isn't surprised when the
+            # cache path supersedes it.
+            if s5.get("teacher_load_in_4bit"):
+                log.warning(
+                    "Stage 5: teacher_load_in_4bit=true is configured but "
+                    "teacher_logits_cache=%s exists; per spec §8 'cache wins on "
+                    "conflict' the cache supersedes the 4-bit load — 4-bit will not run.",
+                    cache_path,
+                )
             log.info("Stage 5: loading precomputed teacher logits from %s", cache_path)
             # mmap=True keeps the ~30 GB sidecar memory-mapped instead of
             # materializing the whole thing in CPU RAM. Each per-batch
