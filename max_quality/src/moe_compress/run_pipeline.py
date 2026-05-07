@@ -118,7 +118,7 @@ def main(argv=None) -> int:
         decomposition = budget_solver.solve(
             model,
             target_total_reduction=config["target"]["total_reduction_ratio"],
-            expert_svd_ratio=config["target"]["expert_svd_ratio"],
+            ep_sp_knob_ratio=config["target"]["expert_svd_ratio"],
             min_experts_per_layer=config["stage1_grape"]["min_experts_per_layer"],
             blacklisted_experts={},
         )
@@ -134,7 +134,7 @@ def main(argv=None) -> int:
         decomposition = budget_solver.solve(
             model,
             target_total_reduction=config["target"]["total_reduction_ratio"],
-            expert_svd_ratio=config["target"]["expert_svd_ratio"],
+            ep_sp_knob_ratio=config["target"]["expert_svd_ratio"],
             min_experts_per_layer=config["stage1_grape"]["min_experts_per_layer"],
             blacklisted_experts=blacklist,
         )
