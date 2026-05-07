@@ -264,9 +264,22 @@ def run(
     for k, ref in enumerate(moe_layers):
         log.info("  group-stat layer %d/%d (idx=%d)", k + 1, len(moe_layers), ref.layer_idx)
         banks = build_banks(ref)
+        # Group-average pre-prune input covariance for D-Rank whitening.
+        # Spec §6 Phase B.1: gate/up share `A_gate_up` (hidden-state input);
+        # down_proj uses `A_down` (intermediate-activation input). These
+        # come from Stage 2 `_stage2_input_covariance.pt` (already loaded
+        # into `A_cov`). We average across experts in the group since the
+        # spec stipulates a single covariance per (layer, matrix_type).
         for name in MATRIX_NAMES:
+            cov_key_name = "gate_proj" if name == "up_proj" else name
+            covs = []
+            for e in range(ref.num_routed_experts):
+                t = _cov_lookup(A_cov, ref.layer_idx, e, cov_key_name)
+                if t is not None:
+                    covs.append(t.to(torch.float32))
+            A_g = torch.stack(covs).mean(0) if covs else None
             group_stats[(ref.layer_idx, name)] = _group_stat(
-                ref.num_routed_experts, banks[name]
+                ref.num_routed_experts, banks[name], A_g=A_g,
             )
 
     T_budget = _compute_T_budget(group_stats, decomposition.svd_rank_ratio)
@@ -374,6 +387,7 @@ def run(
                     model, tokenizer, moe_layers, group_stats, ranks,
                     alpha_grid, originals, A_cov, B_acc, bcov_spill_dir,
                     C_acc, ccov_spill_dir, config, device=device,
+                    storage_dtype=B_cov_dtype,
                 )
                 if per_group_type:
                     # Per-type refinement using spectral proxy, seeded from the
@@ -638,12 +652,45 @@ def run(
 # ---------------------------------------------------------------------------
 
 
-def _group_stat(n_experts: int, bank) -> _GroupStats:
+def _group_stat(n_experts: int, bank, A_g: torch.Tensor | None = None) -> _GroupStats:
+    """Per-group statistics for D-Rank allocation.
+
+    Spec §6 Phase B.1/B.2 (paper 2509.25622 Eq. 1): the effective rank must
+    be computed from the **whitened** SVD `sv(S_g · W_g^T)` where
+    `S_g = chol(A_g)` (FP64) and `A_g = X_g^T X_g` is the group-average
+    pre-prune input covariance from Stage 2. Raw `sv(W)` is not
+    input-distribution-aware.
+
+    When `A_g` is None (no Stage 2 covariance available), fall back to raw
+    `sv(W)` and warn — this is a degraded path that should only fire on
+    test fixtures or Stage 2 reruns.
+    """
     d_out, d_in = bank.shape()
+    L_A = None
+    if A_g is not None:
+        try:
+            A64 = A_g.to(torch.float64)
+            A64 = 0.5 * (A64 + A64.T)
+            jitter = 1e-6 * A64.diag().mean().clamp_min(1e-12) * torch.eye(
+                A64.shape[0], dtype=torch.float64, device=A64.device)
+            L_A = torch.linalg.cholesky(A64 + jitter).to(torch.float32)
+        except Exception as exc:
+            log.warning("D-Rank whitening: Cholesky on A_g failed (%s); "
+                        "falling back to raw SVD for this group.", exc)
+            L_A = None
+
     svs: list[torch.Tensor] = []
     for e in range(n_experts):
-        W = bank.get(e).detach().to(torch.float32)
-        s = torch.linalg.svdvals(W)
+        W = bank.get(e).detach().to(torch.float32)  # [d_out, d_in]
+        if L_A is not None:
+            # Spec §6 Step B.2: σ_i = sv(S_g · W_g^T). PyTorch stores W as
+            # [d_out × d_in]; transpose to [d_in × d_out] then S @ that
+            # gives the whitened operator whose singular values match the
+            # paper's whitened spectrum.
+            M = L_A @ W.T  # [d_in, d_out]
+            s = torch.linalg.svdvals(M)
+        else:
+            s = torch.linalg.svdvals(W)
         svs.append(_pad(s, min(d_out, d_in)))
     mean_s = torch.stack(svs).mean(0)
     p = mean_s ** 2
@@ -784,21 +831,27 @@ def _build_wikitext2_validation(
     from datasets import load_dataset
 
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    eos = tokenizer.eos_token_id or 0
-    all_ids: list[int] = []
-    for row in ds:
-        text = row.get("text", "")
-        if not text.strip():
-            continue
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-        all_ids.extend(ids)
-        all_ids.append(eos)
+    # Spec §9 WikiText-2 PPL Protocol (F-iter4-M-1): rows are joined with
+    # `"\n\n"` (matching the lm-eval / HF recipe and the imatrix calibration
+    # corpus). Stage 3's α-search PPL must use the same protocol as Stage 6
+    # so the two perplexities are comparable. Empty rows are PRESERVED — the
+    # canonical recipe contributes the literal "\n\n\n\n" boundary tokens
+    # to the chunk stream; filtering them changes chunk boundaries vs.
+    # Stage 6 and breaks comparability.
+    rows = [row.get("text", "") for row in ds]
+    joined = "\n\n".join(rows)
+    all_ids = tokenizer(joined, add_special_tokens=True)["input_ids"]
 
     n_full = len(all_ids) // seq_len
     if n_full == 0:
-        log.warning("WikiText-2 has no full-length sequences; α search will "
-                    "fall back to spectral proxy.")
-        return torch.empty(0, seq_len, dtype=torch.long)
+        # Spec §6 Phase B.2 paper-compliance contract: the α-search MUST
+        # complete the paper-exact end-to-end PPL grid. Silent degradation
+        # to a spectral proxy was D9 (removed). Fail fast.
+        raise RuntimeError(
+            f"Stage 3 α-search: WikiText-2 yielded no full-length sequences "
+            f"(seq_len={seq_len}, total tokens={len(all_ids)}). "
+            "Cannot complete the paper-exact PPL grid."
+        )
     n_use = min(n_full, n_seqs)
     return torch.tensor(
         all_ids[: n_use * seq_len], dtype=torch.long,
@@ -1027,6 +1080,7 @@ def _swift_svd_plus_alpha_search_validation(
     config: dict,
     *,
     device,
+    storage_dtype: torch.dtype = torch.float16,
 ) -> float:
     """Paper-exact α selection via end-to-end WikiText-2 PPL validation.
 
@@ -1066,9 +1120,14 @@ def _swift_svd_plus_alpha_search_validation(
         tokenizer, n_seqs=validation_samples, seq_len=2048,
     )
     if val_tensor.numel() == 0:
-        log.warning("Stage 3 α-search: empty validation set — falling back "
-                    "to spectral proxy.")
-        return 0.5  # neutral fallback
+        # Spec §6 Phase B.2 paper-compliance contract: hard-fail rather
+        # than silently degrade to a non-paper-compliant α.
+        raise RuntimeError(
+            "Stage 3 α-search: validation tensor is empty after building. "
+            "Spec §6 Phase B.2 mandates the paper-exact end-to-end PPL grid; "
+            "the previously-shipped silent spectral-proxy fallback (D9) was "
+            "removed for non-compliance."
+        )
 
     log.info("Stage 3 α-search: %d validation sequences (%d tokens)",
              val_tensor.size(0), val_tensor.numel())
@@ -1088,11 +1147,13 @@ def _swift_svd_plus_alpha_search_validation(
             A_cov=A_cov,
         )
 
-        # 2. Factor the full model at these ranks.
+        # 2. Factor the full model at these ranks. Forward storage_dtype so
+        # the noise floor in `_aa_svd` matches the main factoring pass — using
+        # the default fp16 floor on a bf16-stored B-cov would over-truncate.
         _factor_model_at_ranks(
             model, moe_layers, originals, per_expert_ranks, base_ranks,
             A_cov, B_acc, bcov_spill_dir, C_acc, ccov_spill_dir,
-            device=device,
+            device=device, storage_dtype=storage_dtype,
         )
 
         # 3. Evaluate WikiText-2 PPL.
@@ -1310,14 +1371,16 @@ def _redistribute_ranks_swift_svd_plus(
         total_score = sum(scores) or 1.0
         total_group_rank = k_group * gs.n_experts
         cap = min(gs.d_out, gs.d_in) - 1
-        # Spec §6 Phase B.2 minimal-rank floor (paper 2604.01609 Algorithm 2):
-        # k_i ← max(k_i, floor(k̄ · δ)) with δ = 0.5. Paper warns δ = 0 is
-        # numerically unstable.
+        # Spec §6 Phase B.2 redistribution rule (paper 2604.01609 Algorithm 2
+        # lines 4–9): every expert starts at floor(k̄·δ); the remaining pool
+        # `b = k̄·L·(1−δ)` is distributed by score share. δ = 0.5 — paper
+        # warns δ = 0 is numerically unstable.
         delta = 0.5
         rank_floor = max(1, int(math.floor(k_group * delta)))
+        flexible_pool = k_group * gs.n_experts * (1.0 - delta)
 
         per_e = [
-            max(rank_floor, min(cap, int(round(total_group_rank * (sc / total_score)))))
+            max(rank_floor, min(cap, rank_floor + int(math.floor(flexible_pool * (sc / total_score)))))
             for sc in scores
         ]
         # Reconcile rounding residual.
