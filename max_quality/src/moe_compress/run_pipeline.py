@@ -94,7 +94,8 @@ def main(argv=None) -> int:
 
     start = args.resume_from_stage
     stop = args.stop_after_stage
-    model, tokenizer = _load_for_stage(start, config, artifacts_dir)
+    model, tokenizer = _load_for_stage(start, config, artifacts_dir,
+                                       stop_after_stage=stop)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if start <= 1 <= stop:
@@ -296,15 +297,38 @@ def _validate_config(config: dict) -> None:
         raise ValueError(f"target.expert_svd_ratio={ratio} must be > 0.")
 
 
-def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
+# F-iter4-CRIT-1: Spec §9 lines 821, 838 require BOTH teacher and student to
+# run under attn_implementation="eager" for the Stage 6 quality gate. The
+# teacher is pinned at load time inside stage6_validate.py; the student is
+# loaded here, so we override the config's attn_implementation when this run
+# will reach Stage 6 (the default for production runs).
+_STAGE6_ATTN_IMPLEMENTATION = "eager"
+
+
+def _load_for_stage(stage: int, config: dict, artifacts_dir: Path,
+                    *, stop_after_stage: int = 6):
     """Load the model + tokenizer appropriate for starting at ``stage``."""
+    # F-iter4-CRIT-1: Spec §9 lines 821, 838 require eager attn for the Stage 6
+    # gate run for both teacher and student. The teacher is pinned at load time
+    # inside stage6_validate.py; the student is loaded here, so override the
+    # config's attn_implementation when this run will reach Stage 6.
+    cfg_attn = config["model"]["attn_implementation"]
+    will_run_stage6 = stop_after_stage >= 6
+    student_attn = _STAGE6_ATTN_IMPLEMENTATION if will_run_stage6 else cfg_attn
+    if will_run_stage6 and student_attn != cfg_attn:
+        log.info(
+            "Stage 6 will run (stop_after_stage=%d): overriding "
+            "model.attn_implementation %r -> %r for student load to satisfy "
+            "Spec §9 lines 821, 838 (eager attn for Stage 6 gate).",
+            stop_after_stage, cfg_attn, student_attn,
+        )
     if stage <= 2:
         return load_model(
             config["model"]["name_or_path"],
             revision=config["model"].get("revision", "main"),
             torch_dtype=config["model"]["torch_dtype"],
             device_map=config["model"]["device_map"],
-            attn_implementation=config["model"]["attn_implementation"],
+            attn_implementation=student_attn,
             load_in_4bit=config["model"].get("load_in_4bit", False),
             trust_remote_code=config["model"].get("trust_remote_code", False),
         )
@@ -329,7 +353,7 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
                     prev_path,
                     device_map=config["model"]["device_map"],
                     torch_dtype=config["model"]["torch_dtype"],
-                    attn_implementation=config["model"]["attn_implementation"],
+                    attn_implementation=student_attn,
                 )
                 return model, tokenizer
         raise FileNotFoundError(
@@ -352,7 +376,7 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path):
         prev_path,
         device_map=config["model"]["device_map"],
         torch_dtype=config["model"]["torch_dtype"],
-        attn_implementation=config["model"]["attn_implementation"],
+        attn_implementation=student_attn,
     )
     return model, tokenizer
 

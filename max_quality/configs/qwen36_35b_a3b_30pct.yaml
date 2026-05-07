@@ -135,7 +135,7 @@ stage5_router_kd:
   epochs: 1
   # batch_size × gradient_accumulation = effective batch (=8).
   # H200 (141 GB VRAM): teacher BF16 (~70 GB) + student BF16 (~50 GB) = ~120 GB.
-  # At bs=8, vocab logits consume ~5 GB, leaving ~16 GB headroom.
+  # At bs=8, vocab logits + small KV-cache headroom consume ~6 GB, leaving ~15 GB headroom.
   # bs=8 with grad_accum=1 eliminates gradient accumulation overhead entirely:
   # 375 forward passes (= 375 optimizer steps) vs 750 at bs=4/grad_accum=2.
   # Same effective batch as paper (8×1 = 2×4 = 8).
@@ -153,7 +153,6 @@ stage5_router_kd:
   # Only router weights update. Enumerated paths are matched as substrings.
   trainable_name_patterns:
     - mlp.gate.weight
-    - mlp.gate.bias
   frozen_name_patterns:
     - experts
     - shared_expert
@@ -161,7 +160,6 @@ stage5_router_kd:
     - norm
     - embed
     - lm_head
-  enable_output_router_logits: true   # flipped on for teacher+student during KD
   torch_compile: true                 # torch.compile on teacher+student for 20-40% forward speedup.
                                       # H200 Hopper architecture. Set false for debugging or
                                       # hardware without compile support.
@@ -217,9 +215,13 @@ stage6_validate:
   strict_revision_pinning: true
   dataset_revisions:
     wikitext_ppl:    null   # Salesforce/wikitext (wikitext-2-raw-v1) — used by _wikitext2_ppl AND imatrix calibration corpus (train split)
-    hellaswag:       null   # used internally by lm-eval — pin via lm-eval task config or set null + accept lm-eval default
-    arc_challenge:   null   # used internally by lm-eval — pin via lm-eval task config or set null + accept lm-eval default
-    humaneval:       null   # openai_humaneval
+    # F-iter4-HIGH-1: hellaswag/arc_challenge keys removed — lm-eval pulls its
+    # own dataset revisions internally and our load path cannot enforce a SHA
+    # at simple_evaluate time. Pin via lm-eval task YAMLs if precise revision
+    # control is required; otherwise accept lm-eval's default. The cache-key
+    # auto-invalidates on lm_eval_version change (and on the lm-eval task
+    # config hash; see _teacher_cache_key).
+    humaneval:       null   # openai_humaneval (preferred id: openai/openai_humaneval)
     math500:         null   # HuggingFaceH4/MATH-500
   zero_shot:
     enabled: true
@@ -227,7 +229,9 @@ stage6_validate:
   generative:
     enabled: true
     humaneval:
-      num_samples_per_task: 1
+      # F-iter4-NIT-2: num_samples_per_task removed — Stage 6 is greedy pass@1
+      # only (Spec D-humaneval-greedy); the assertion in stage6_validate.py
+      # rejects any non-1 value if a future operator re-adds this key.
       max_new_tokens: 512
     math500:
       num_samples: 500

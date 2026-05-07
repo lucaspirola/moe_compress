@@ -207,20 +207,48 @@ def run(
                     "not a partially-merged model."
                 )
 
-            # ream_acc is not passed here: neuron means are not persisted to disk,
-            # so permutation alignment on resume uses only gate/up weights.
-            # B-C-L-1 TODO: persisting neuron-mean tensors alongside merge_{layer}.json
-            # would weaken the spec invariant C = C_wt + C_act on resume. Currently
-            # the resume path uses C = C_wt only (no C_act); fix would require a
-            # larger artifact-format change to save/restore the neuron-mean tensors.
-            log.warning(
-                "layer %d (resume): neuron-mean activation data not available on resume — "
-                "permutation alignment uses weight-only cost (C_gate + C_up, no C_act). "
-                "Merged weights may differ from a fresh run.",
-                ref.layer_idx,
-            )
+            # B-iter5-M-2: try to load persisted per-expert neuron-mean tensors so
+            # resume reproduces the spec invariant C = C_wt + C_act (D5b). If the
+            # file is missing (legacy partial dirs predating this fix), fall back
+            # to weight-only alignment with a louder warning.
+            resume_ream_acc: ReamCostAccumulator | None = None
+            neuron_means_path = partial_dir / f"_neuron_means_layer{ref.layer_idx}.pt"
+            if neuron_means_path.exists():
+                try:
+                    nm_payload = torch.load(neuron_means_path, map_location="cpu", weights_only=False)
+                    nm_fv = int(nm_payload.get("format_version", 0))
+                    if nm_fv != 1:
+                        raise RuntimeError(
+                            f"_stage2_partial/_neuron_means_layer{ref.layer_idx}.pt "
+                            f"has format_version={nm_fv} (expected 1)"
+                        )
+                    resume_ream_acc = ReamCostAccumulator()
+                    # Restore per-expert neuron means by re-creating sum/count pairs
+                    # such that get_neuron_mean returns the saved mean (sum/count == mean).
+                    # Setting count=1 and sum=mean is the simplest restoration that
+                    # preserves equality and avoids serializing both tensors.
+                    for eid_str, mean_tensor in nm_payload["neuron_means"].items():
+                        eid = int(eid_str)
+                        resume_ream_acc._neuron_act_sum[(ref.layer_idx, eid)] = mean_tensor.clone()
+                        resume_ream_acc._neuron_act_count[(ref.layer_idx, eid)] = 1
+                except Exception as _exc:
+                    log.warning(
+                        "layer %d (resume): failed to load neuron-mean artifact (%s); "
+                        "falling back to weight-only permutation alignment",
+                        ref.layer_idx, _exc,
+                    )
+                    resume_ream_acc = None
+            if resume_ream_acc is None:
+                log.error(
+                    "layer %d (resume): neuron-mean activation data not available on resume — "
+                    "permutation alignment uses weight-only cost (C_gate + C_up, no C_act). "
+                    "Merged weights WILL differ from a fresh run. Delete _stage2_partial/ "
+                    "to regenerate from scratch with the new artifact format.",
+                    ref.layer_idx,
+                )
             _merge_experts_inplace(ref, grouped, freq,
-                                   freq_weighted=s2["ream"]["frequency_weighted_merge"])
+                                   freq_weighted=s2["ream"]["frequency_weighted_merge"],
+                                   ream_acc=resume_ream_acc)
             # build_banks again: _merge_experts_inplace already called it internally, but
             # bank.select() was never called on any of those banks, so the _last_kept_ids_*
             # sentinel is still unset and this select() call is safe.
@@ -252,9 +280,14 @@ def run(
 
     # B-C-H-1: default to 8 (D5a value) so REAM merging always has a per-centroid
     # cap, preventing degenerate one-centroid-absorbs-all groupings. Setting to 0
-    # explicitly disables the cap (uncapped path); users must opt in to that.
-    max_group_cap: int = int(s2.get("max_merge_group_size", 8) or 8)
-    cost_sigma: float = s2.get("ream_cost_sigma_threshold", float("inf"))
+    # explicitly disables the cap (uncapped path; rare, ablation-only); users must
+    # opt in to that. The `or 8` collapse from earlier was dropped so an explicit
+    # `0` in config is honored as "uncapped" rather than silently overridden to 8.
+    max_group_cap: int = int(s2.get("max_merge_group_size", 8))
+    # B-iter5-L-1 (code): default to 1.5 (D-ream-budget-bump value) so the quality
+    # gate is active out-of-the-box; setting to a very large value (e.g. inf) in
+    # config disables the gate.
+    cost_sigma: float = s2.get("ream_cost_sigma_threshold", 1.5)
     cost_bump_ratio: float = s2.get("ream_cost_bump_ratio", 0.10)
     min_active_tokens: int = s2.get("reap_min_active_tokens", 0)
 
@@ -601,6 +634,10 @@ def run(
 
         if partial_dir is not None:
             _snapshot_cov_layer(cov_acc, layer_ref.layer_idx, partial_dir)
+            # B-iter5-M-2: persist per-expert neuron means BEFORE the merge JSON
+            # so that .pt-before-.json ordering invariant (spec §11) holds for
+            # the new artifact too. Resume detects missing means by file absence.
+            _snapshot_neuron_means_layer(ream_acc, layer_ref.layer_idx, partial_dir)
             _write_merge_json(
                 partial_dir, layer_ref.layer_idx, final_kept_ids, grouped, freq,
                 merge_map[layer_ref.layer_idx],
@@ -700,6 +737,44 @@ def _snapshot_cov_layer(
         }
     tmp = partial_dir / f"layer_{layer_idx}.pt.tmp"
     final = partial_dir / f"layer_{layer_idx}.pt"
+    torch.save(payload, tmp)
+    _durable_rename(tmp, final)
+
+
+def _snapshot_neuron_means_layer(
+    ream_acc: ReamCostAccumulator,
+    layer_idx: int,
+    partial_dir: Path,
+) -> None:
+    """Persist per-expert mean activation vectors for resume-time C_act.
+
+    B-iter5-M-2: spec D5b mandates `C = C_wt + C_act` for permutation alignment.
+    Without this artifact, resume falls back to weight-only alignment and merged
+    weights diverge from a fresh run. This helper snapshots only the small
+    per-expert mean vectors (`[d_intermediate]` per expert), not the full
+    intermediate-activation history (which is large and not needed downstream).
+
+    Format version 1: `{"format_version": 1, "neuron_means": {expert_idx: tensor}}`.
+    Missing-on-resume → loud ERROR + weight-only fallback (preserves run completion).
+    """
+    with ream_acc._lock:
+        keys = [k for k in ream_acc._neuron_act_sum if k[0] == layer_idx]
+        if not keys:
+            log.debug("_snapshot_neuron_means_layer: no neuron-mean entries for layer %d; "
+                      "skipping snapshot (no merges in this layer)", layer_idx)
+            return
+        means: dict[int, torch.Tensor] = {}
+        for k in keys:
+            s = ream_acc._neuron_act_sum[k]
+            c = ream_acc._neuron_act_count.get(k, 0)
+            if c == 0:
+                continue
+            means[k[1]] = (s.clone() / c).contiguous()
+    if not means:
+        return
+    payload = {"format_version": 1, "neuron_means": means}
+    tmp = partial_dir / f"_neuron_means_layer{layer_idx}.pt.tmp"
+    final = partial_dir / f"_neuron_means_layer{layer_idx}.pt"
     torch.save(payload, tmp)
     _durable_rename(tmp, final)
 
@@ -816,9 +891,16 @@ def _profile_layer(
             # the (gate * expert_output) multiplication inside record_gated_output.
             sigma_e = fs[token_idx.cpu(), e].to(tensor.device)
         else:
-            log.warning(
+            # B-iter5-L-4 (code): hook ordering is spec-required to populate
+            # _full_softmax[0] before any expert forward fires; reaching this
+            # branch indicates a real ordering bug. Log at ERROR so it is not
+            # missed; keep the fallback to top_k_weights so the run completes.
+            log.error(
                 "down_cb: full-softmax cache empty for layer %d expert %d — "
-                "falling back to top_k_weights (renormalized; spec-degraded).",
+                "falling back to top_k_weights (renormalized; spec-degraded). "
+                "This indicates a hook-ordering bug — the experts pre-forward "
+                "hook (_populate_full_softmax) should always run before any "
+                "expert forward fires.",
                 li, e,
             )
             sigma_e = ctx["top_k_weights"]
