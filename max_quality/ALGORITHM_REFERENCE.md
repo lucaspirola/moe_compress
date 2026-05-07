@@ -342,7 +342,7 @@ where `X_j = {x | j ∈ TopK(σ(x))}`, `g_j(x)` is the post-softmax routing weig
 
 #### Step 3: Greedy Pseudo-Pruning Assignment (Paper §4)
 
-**Feasibility check:** Before the greedy pass, validate that `N'_l × max_merge_group_size ≥ N_l` (where N_l is the total number of non-blacklisted routed experts in the layer, N'_l is the centroid count). If this is violated, bump `effective_target` by 1 (or by `ceil(effective_target × cost_bump_ratio)` whichever is larger) and retry. If `effective_target` reaches `n_experts` without achieving feasibility, fall back to zero-merge: keep all non-protected experts as centroids (no merges performed for this layer). This guarantees no expert weights are lost at the cost of not meeting the compression target. (Reference: `ream/ream.py` lines 60–62.)
+**Feasibility check:** Before the greedy pass, validate that `N'_l × max_merge_group_size ≥ N_l − N'_l` (where N_l is the total number of non-blacklisted routed experts in the layer, N'_l is the centroid count, and `max_merge_group_size` caps the **non-centroids** absorbed into each centroid — see Step 4). If this is violated, bump `effective_target` by 1 (or by `ceil(effective_target × cost_bump_ratio)` whichever is larger) and retry. If `effective_target` reaches `n_experts` without achieving feasibility, fall back to zero-merge: keep all non-protected experts as centroids (no merges performed for this layer). This guarantees no expert weights are lost at the cost of not meeting the compression target. (Reference: `ream/ream.py` lines 60–62.)
 
 Top-N'_l experts by REAP score become **centroids**. Non-centroids are assigned to centroids via a **single-pass greedy algorithm**: iterate centroids in **descending saliency order** (most salient centroid first — order is important); for each centroid, absorb up to `max_merge_group_size` unassigned non-centroids with the **lowest cost** (most similar), in order. The loop exits early once all non-centroids are assigned. **Every non-centroid is guaranteed to be assigned** — the feasibility check ensures full coverage. (Reference: `ream/ream.py` lines 63–87.)
 
@@ -737,7 +737,7 @@ Frozen-scope reminder: only `mlp.gate.weight` is trainable at Stage 2.5/5. (No P
 
 ### Resume
 
-Step-boundary checkpointing to `_stage5_partial/step_{N}.pt` (every 100 optimizer steps). Each checkpoint contains router parameter state + optimizer state. On resume, the last incomplete batch's gradient signal is silently dropped (no accumulation window — each batch is one optimizer step). Only the two most recent checkpoints are retained.
+Step-boundary checkpointing to `_stage5_partial/step_{N}.pt` (every 100 optimizer steps). Each checkpoint contains router parameter state + optimizer state + the (epoch, batch_idx) cursor. On resume, the optimizer state is restored exactly; the training loop fast-forwards through `resume_batch_i` inclusive (the gradient signal of any batch that was already absorbed into the last checkpointed optimizer step is correctly skipped, not re-applied). Only the two most recent checkpoints are retained.
 
 ---
 
