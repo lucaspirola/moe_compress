@@ -159,14 +159,19 @@ def run(
             # only covers one epoch would be silently re-read from position 0
             # for epochs 2..N, replaying epoch-1 teacher logits against later
             # student batches — a corrupted KD signal.
-            epochs_cfg = int(s5.get("epochs", 1))
             if epochs_cfg > 1 and cache_n < epochs_cfg * cfg_n:
-                log.warning(
-                    "Stage 5: teacher_logits_cache num_samples=%d covers only "
-                    "%d epoch(s) of data but stage5_router_kd.epochs=%d. "
-                    "Cache tokens will be re-read from position 0 for later "
-                    "epochs — regenerate a multi-epoch cache or set epochs=1.",
-                    cache_n, cache_n // max(cfg_n, 1), epochs_cfg,
+                # Hard-fail: training-loop index `(epoch * num_batches + i) *
+                # cache_tokens_per_batch` would read past the end of a
+                # single-epoch cache for epochs >= 1. Reading past end yields
+                # zero-length slices → degenerate (silently zero) KD signal,
+                # which silently corrupts router updates. Refuse to proceed.
+                raise RuntimeError(
+                    f"Stage 5: teacher_logits_cache num_samples={cache_n} covers only "
+                    f"{cache_n // max(cfg_n, 1)} epoch(s) of data but "
+                    f"stage5_router_kd.epochs={epochs_cfg}. The training loop would "
+                    "read past cache end for later epochs, silently corrupting the "
+                    "KD signal. Regenerate a multi-epoch cache (num_samples="
+                    f"{epochs_cfg * cfg_n}) or set epochs=1."
                 )
             log.info("Stage 5: cache covers %d samples, %d sequence_length",
                      cache_payload.get("num_samples"), cache_payload.get("sequence_length"))
