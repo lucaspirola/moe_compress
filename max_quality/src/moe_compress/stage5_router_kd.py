@@ -113,11 +113,19 @@ def run(
             # zero-length slices for late batches → degenerate KD signal.
             cache_n = int(cache_payload.get("num_samples", -1))
             cfg_n = int(s5["max_calibration_samples"])
-            if cache_n != cfg_n:
+            epochs_cfg = int(s5.get("epochs", 1))
+            # Accept caches sized for either single-epoch (cfg_n) or
+            # multi-epoch (epochs_cfg * cfg_n) coverage. The training loop
+            # indexes into the cache via (epoch * len(batches) + i) *
+            # cache_tokens_per_batch, so a cache sized at epochs_cfg * cfg_n
+            # is the canonical multi-epoch layout.
+            allowed_sizes = {cfg_n, epochs_cfg * cfg_n}
+            if cache_n not in allowed_sizes:
                 raise RuntimeError(
                     f"Teacher-logits cache num_samples={cache_n} disagrees with "
-                    f"stage5_router_kd.max_calibration_samples={cfg_n}. Stage 5 "
-                    "would read past the end of the cache — regenerate or align."
+                    f"stage5_router_kd.max_calibration_samples={cfg_n} "
+                    f"(or epochs×cfg_n={epochs_cfg * cfg_n} for multi-epoch). "
+                    "Stage 5 would read past the end of the cache — regenerate or align."
                 )
             # Topology check: the cache must be keyed against this student's
             # vocabulary and calibration shape. A mismatch in the trailing
@@ -186,7 +194,18 @@ def run(
                         "will load in BF16 (~70 GB) and likely OOM the A100. "
                         "Set teacher_load_in_4bit: true to match."
                     )
-                _device_map = {"": 0} if load_in_4bit else config["model"]["device_map"]
+                # 4-bit (bitsandbytes) requires a single-device map; honor the
+                # caller's device choice from config["model"]["device_map"] if
+                # it's a single-device dict (e.g. {"": "cuda:1"}); otherwise
+                # default to {"": 0}. Never pin to GPU 0 unconditionally.
+                _cfg_dm = config["model"]["device_map"]
+                if load_in_4bit:
+                    if isinstance(_cfg_dm, dict) and len(_cfg_dm) == 1:
+                        _device_map = _cfg_dm
+                    else:
+                        _device_map = {"": 0}
+                else:
+                    _device_map = _cfg_dm
                 log.info("Loading teacher for KD (first live batch): %s "
                          "(teacher_load_in_4bit=%s, device_map=%s)",
                          config["model"]["name_or_path"], load_in_4bit, _device_map)
