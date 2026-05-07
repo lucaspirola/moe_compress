@@ -1122,9 +1122,13 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
     rows: list[str] = []
     for row in ds:
         text = row.get("text", "")
-        if not text.strip():
-            continue
-        if collect is not None:
+        # Spec §9 / F-S-C-1 says BOS is applied once on the concatenated text;
+        # the row-to-row joiner is "\n\n" matching the canonical HF / lm-eval
+        # PPL recipe. Empty rows ARE preserved here (canonical recipe keeps
+        # them, producing a "\n\n" + "" + "\n\n" sequence that turns into the
+        # expected paragraph-spacing tokens). Filtering empties would change
+        # the token stream and chunk boundaries vs. the cited recipe.
+        if collect is not None and text.strip():
             collect.append(text)
         rows.append(text)
     concatenated = "\n\n".join(rows)

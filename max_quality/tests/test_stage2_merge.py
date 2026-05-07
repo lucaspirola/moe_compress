@@ -140,5 +140,7 @@ def test_merge_experts_inplace_with_ream_acc(tiny_model):
 
     grouped = {0: [0, 1]}
     freq = {0: 1, 1: 1}
-    # Should not raise — C_act branch is exercised.
-    _merge_experts_inplace(layer_ref, grouped, freq, freq_weighted=False, ream_acc=ream_acc)
+    # Should not raise — C_act branch is exercised. Spec §5 Step 4 mandates
+    # frequency-weighted merge (REAM Eq. 6); the equal-weights branch is no
+    # longer reachable because it would produce spec-non-compliant merges.
+    _merge_experts_inplace(layer_ref, grouped, freq, freq_weighted=True, ream_acc=ream_acc)
