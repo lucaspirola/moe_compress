@@ -886,10 +886,12 @@ def _profile_layer(
         fs = _full_softmax[0]
         if fs is not None:
             # Index the cached [T, n_experts] full-softmax tensor at the
-            # active token positions for this expert. Result shape: [|active|].
-            # Move to device of expert_output to avoid a CPU↔GPU mismatch in
-            # the (gate * expert_output) multiplication inside record_gated_output.
-            sigma_e = fs[token_idx.cpu(), e].to(tensor.device)
+            # active token positions for this expert. fs lives on the same
+            # device as the router logits (typically GPU); index with
+            # token_idx on its native device to avoid a CPU↔GPU round-trip.
+            # Result shape: [|active|]; ensure it lands on the expert-output
+            # device for the downstream (gate * expert_output) multiply.
+            sigma_e = fs[token_idx.to(fs.device), e].to(tensor.device)
         else:
             # B-iter5-L-4 (code): hook ordering is spec-required to populate
             # _full_softmax[0] before any expert forward fires; reaching this
@@ -921,7 +923,9 @@ def _profile_layer(
             batch_logits = router_logits_storage[layer_idx][-1]
             # F.softmax over the last (expert) dim → [T, n_experts] σ(x)_e values.
             # .float() avoids dtype mismatch when the router runs in bf16.
-            _full_softmax[0] = F.softmax(batch_logits.float(), dim=-1).cpu()
+            # Keep on-device (router-logits device) — down_cb indexes with
+            # on-device token_idx, avoiding a CPU↔GPU round-trip per expert.
+            _full_softmax[0] = F.softmax(batch_logits.float(), dim=-1)
         else:
             _full_softmax[0] = None
 

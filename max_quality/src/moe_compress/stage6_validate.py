@@ -110,11 +110,16 @@ _EVAL_TEXT_CONCAT_FILENAME: str = "eval_text_concat.txt"
 # ---------------------------------------------------------------------------
 
 
+_CANONICAL_DATASET_REVISION_KEYS = ("wikitext_ppl", "humaneval", "math500")
+
+
 def _resolve_dataset_revisions(config: dict) -> dict[str, str | None]:
     """Return the per-dataset revision mapping from stage6_validate config.
 
-    Always returns a dict (possibly empty). Keys are dataset slugs used by
-    Stage 6 (wikitext_ppl, hellaswag, arc_challenge, humaneval, math500).
+    Restricted to the canonical 3-key set per spec §9 line 840:
+    {"wikitext_ppl", "humaneval", "math500"}. Any extra keys present in the
+    config are dropped with a warning so the cache key is not contaminated
+    by operator-only metadata.
     """
     s6 = config.get("stage6_validate", {}) or {}
     raw = s6.get("dataset_revisions") or {}
@@ -124,16 +129,22 @@ def _resolve_dataset_revisions(config: dict) -> dict[str, str | None]:
             type(raw).__name__,
         )
         return {}
-    # F-iter4-NIT-4: reject non-string non-null values rather than silently
-    # coercing — a non-string SHA is almost certainly a config typo (e.g. an
-    # int) and we'd rather surface it now than fold a meaningless str(int)
-    # into the teacher cache key.
+    extra = set(raw.keys()) - set(_CANONICAL_DATASET_REVISION_KEYS)
+    if extra:
+        log.warning(
+            "_resolve_dataset_revisions: dropping non-canonical keys %s "
+            "(spec restricts to %s).",
+            sorted(extra), list(_CANONICAL_DATASET_REVISION_KEYS),
+        )
     out: dict[str, str | None] = {}
-    for k, v in raw.items():
+    for k in _CANONICAL_DATASET_REVISION_KEYS:
+        if k not in raw:
+            continue
+        v = raw[k]
         if v is None:
-            out[str(k)] = None
+            out[k] = None
         elif isinstance(v, str):
-            out[str(k)] = v
+            out[k] = v
         else:
             raise TypeError(
                 f"_resolve_dataset_revisions: revision for {k!r} must be a "
@@ -500,6 +511,10 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             f"got {type(_raw_lebs).__name__}"
         )
     gen_batch_size = int(s6.get("gen_batch_size", 8))
+    if gen_batch_size <= 0:
+        raise ValueError(
+            f"stage6_validate.gen_batch_size must be a positive int; got {gen_batch_size!r}."
+        )
 
     # 1. WikiText-2 PPL on student (Optimization #1: batch_size=8)
     if s6["wikitext2"]["enabled"]:
