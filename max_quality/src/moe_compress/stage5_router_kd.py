@@ -34,7 +34,6 @@ import torch.nn.functional as F
 from .utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from .utils.model_io import (
     iter_moe_layers,
-    load_json_artifact,
     load_model,
     save_compressed_checkpoint,
 )
@@ -63,10 +62,7 @@ def run(
     s5 = config["stage5_router_kd"]
     cal = config["calibration"]
 
-    # NOTE: merge_map is no longer used by vocabulary-level KD (it was needed
-    # only for the old router-level logsumexp pooling). Kept for backward
-    # compatibility with checkpoint metadata that references it.
-    # merge_map = load_json_artifact(artifacts_dir / "stage2_pruned" / "merge_map.json")
+    # Vocabulary-level KD does not use merge_map; see ALGORITHM_REFERENCE.md §8.
 
     # Stage 5 holds teacher (~70 GB BF16) AND student (~50 GB BF16) on cuda
     # at once — exceeds 80 GB A100 and forces CPU offload (5–10× slowdown).
@@ -120,6 +116,32 @@ def run(
                     f"Teacher-logits cache num_samples={cache_n} disagrees with "
                     f"stage5_router_kd.max_calibration_samples={cfg_n}. Stage 5 "
                     "would read past the end of the cache — regenerate or align."
+                )
+            # Topology check: the cache must be keyed against this student's
+            # vocabulary and calibration shape. A mismatch in the trailing
+            # logits dim or the (num_samples × sequence_length) token count
+            # means the cache was generated for a different student/tokenizer
+            # combination and would silently produce a wrong KD signal.
+            student_vocab_size = int(getattr(student.config, "vocab_size", -1))
+            cache_logits = cache_payload.get("logits")
+            if cache_logits is None:
+                raise RuntimeError(
+                    "Teacher-logits cache missing 'logits' tensor — wrong cache for this student."
+                )
+            cache_vocab_size = int(cache_logits.shape[-1])
+            if cache_vocab_size != student_vocab_size:
+                raise RuntimeError(
+                    f"Teacher-logits cache vocab_size={cache_vocab_size} does not match "
+                    f"student.config.vocab_size={student_vocab_size} — wrong cache for this student."
+                )
+            cache_seq_len_meta = int(cache_payload.get("sequence_length", -1))
+            expected_tokens = cache_n * cache_seq_len_meta
+            actual_tokens = int(cache_logits.shape[0]) if cache_logits.dim() >= 1 else -1
+            if actual_tokens != expected_tokens:
+                raise RuntimeError(
+                    f"Teacher-logits cache token count ({actual_tokens}) disagrees with "
+                    f"num_samples × sequence_length ({cache_n} × {cache_seq_len_meta} = "
+                    f"{expected_tokens}) — wrong cache for this student."
                 )
             # F1 fix: verify the cache covers all epochs, not just one pass.
             # With multi-epoch training the token index advances as
@@ -193,7 +215,25 @@ def run(
     # compiled graph is traced with the final requires_grad flags. Compiling
     # before freeze risks the compiler baking in the wrong gradient-enabled
     # state for parameters that are about to be frozen.
-    _freeze_non_routers(student, s5["trainable_name_patterns"])
+    # Sanity check: warn if any parameter name matches BOTH trainable and
+    # frozen patterns (frozen_name_patterns is informational; trainable wins,
+    # but a name in both is almost certainly a config bug).
+    _frozen_patterns = s5.get("frozen_name_patterns", []) or []
+    _trainable_patterns = s5["trainable_name_patterns"]
+    if _frozen_patterns:
+        _base_for_check = getattr(student, "_orig_mod", student)
+        _conflicts = [
+            name for name, _ in _base_for_check.named_parameters()
+            if any(pat in name for pat in _trainable_patterns)
+            and any(pat in name for pat in _frozen_patterns)
+        ]
+        if _conflicts:
+            raise RuntimeError(
+                f"Stage 5 config error: {len(_conflicts)} parameter(s) match BOTH "
+                f"trainable_name_patterns and frozen_name_patterns (e.g. {_conflicts[:3]}). "
+                "Resolve the overlap in stage5_router_kd config."
+            )
+    _freeze_non_routers(student, _trainable_patterns)
 
     # Optimizer constructed AFTER freezing so it only receives parameters that
     # have requires_grad=True at construction time.
@@ -321,7 +361,10 @@ def run(
     for epoch in range(s5["epochs"]):
         if epoch < resume_epoch:
             continue
-        window_loss = 0.0  # accumulates raw loss over each grad-accum window for accurate mean logging
+        # Accumulate detached loss tensors across the grad-accum + log windows
+        # and pay one .item() sync at log-emission time, instead of paying
+        # device→host sync per microbatch (~375/epoch at full scale).
+        window_loss_acc: list[torch.Tensor] = []
         for i, batch in enumerate(batches):
             # Fast-forward: skip batches already processed in the resumed run.
             # resume_batch_i is the last batch of the grad-accum window that
@@ -380,7 +423,7 @@ def run(
             seq_chunk = int(s5.get("kd_seq_chunk_size", 128))
             loss = _chunked_vocab_kl(s_logits_shift, t_logits_shift, T, chunk_size=seq_chunk)
 
-            window_loss += float(loss.item())
+            window_loss_acc.append(loss.detach())
             (loss / grad_accum).backward()
 
             if (i + 1) % grad_accum == 0:
@@ -397,7 +440,12 @@ def run(
                 optim.zero_grad()
                 step += 1
                 if step % config["logging"]["log_every_n_steps"] == 0:
-                    loss_val = window_loss / grad_accum  # mean loss over the completed grad-accum window
+                    # Single device→host sync per log boundary (vs per-microbatch).
+                    if window_loss_acc:
+                        loss_val = sum(t.item() for t in window_loss_acc) / len(window_loss_acc)
+                    else:
+                        loss_val = 0.0
+                    window_loss_acc.clear()
                     log.info(
                         "  epoch=%d step=%d loss=%.6f grad_norm=%.4f",
                         epoch, step, loss_val, grad_norm,
@@ -409,7 +457,6 @@ def run(
                         "stage5/grad_norm": grad_norm,
                     }
                     _trackio_log(payload)
-                window_loss = 0.0  # reset accumulator for next grad-accum window
 
                 # Periodic checkpoint for crash-resume.
                 if partial_dir is not None and ckpt_every > 0 and step % ckpt_every == 0:
@@ -423,12 +470,8 @@ def run(
                     )
                     for old_ckpt in all_ckpts[:-2]:
                         old_ckpt.unlink(missing_ok=True)
-        trailing = len(batches) % grad_accum if grad_accum > 1 else 0
-        if trailing:
-            log.debug(
-                "Epoch %d: %d trailing batch(es) not stepped (grad_accum=%d)",
-                epoch, trailing, grad_accum,
-            )
+        # Trailing-batch accounting is computed once before the epoch loop
+        # (see the run-start log.warning above); no per-epoch repeat here.
         optim.zero_grad()
 
     out_dir = artifacts_dir / f"{stage_key}_final"
@@ -456,6 +499,9 @@ def _chunked_vocab_kl(
       vs ≈1.2 GB for the full sequence at L=512.
 
     Returns scalar loss = (τ²/N_tokens) × Σ_t KL(teacher_t ‖ student_t).
+
+    Note: n_tokens = B × (L−1) is the per-position-mean denominator (paper
+    Eq. 3's N_x for fully-packed sequences with no padding).
     """
     B, L, V = student_logits.shape
     total_kl = torch.zeros((), device=student_logits.device, dtype=torch.float32)
