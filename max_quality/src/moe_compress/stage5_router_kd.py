@@ -435,6 +435,18 @@ def run(
                 cache_seq_len = int(s5["max_sequence_length"])
                 cache_batch_size = int(s5["batch_size"])
                 cache_tokens_per_batch = cache_batch_size * cache_seq_len
+                # Cache slicing assumes uniform batch shape across the run —
+                # any trailing partial batch would misalign subsequent
+                # epochs' token_start. Enforce divisibility upfront so the
+                # failure mode is a clean error, not silent KD corruption.
+                if int(s5["max_calibration_samples"]) % cache_batch_size != 0:
+                    raise RuntimeError(
+                        f"Stage 5 teacher-logits cache requires "
+                        f"max_calibration_samples ({s5['max_calibration_samples']}) "
+                        f"divisible by batch_size ({cache_batch_size}); otherwise "
+                        "the trailing partial batch misaligns the cache slice "
+                        "across subsequent batches/epochs."
+                    )
                 # F1 fix: incorporate the epoch offset so that epoch N reads
                 # the correct slice of the cache instead of wrapping back to
                 # position 0 (which would replay epoch-0 teacher logits
