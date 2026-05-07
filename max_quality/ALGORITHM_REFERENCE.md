@@ -538,7 +538,7 @@ The factoring reuses cached spectral components from Phase A's B-covariance coll
 k_i ← floor(k̄ · δ) + floor(b · s_i / Σ_j s_j),   b = k̄ · L · (1 − δ),   δ = 0.5
 ```
 
-Paper line 4 sets `k_i ← k̄ · δ` real-valued and line 9 uses bracketed `[b · s_i / Σ_j s_j]` (paper convention typically denotes rounding); the spec applies `floor(·)` to both terms because per-expert ranks must be integers. The paper explicitly warns that δ = 0 is numerically unstable. After redistribution the per-expert rank is clamped above the floor `k_i ← max(k_i, floor(k̄ · δ))` (defensive against rounding residuals; structurally the redistribution rule already enforces it).
+Paper line 4 sets `k_i ← k̄ · δ` real-valued and line 9 uses bracketed `[b · s_i / Σ_j s_j]` (paper convention typically denotes rounding); the spec applies `floor(·)` to both terms because per-expert ranks must be integers. The paper §A.1 warns that δ = 0 is unsafe — without a minimum-rank floor the score-weighted reallocation can drive low-score experts to rank zero and propagate reconstruction error, so the floor `δ = 0.5` is required for the redistribution to be well-behaved. After redistribution the per-expert rank is clamped above the floor `k_i ← max(k_i, floor(k̄ · δ))` (defensive against rounding residuals; structurally the redistribution rule already enforces it).
 
 Per-expert ranks are stored in the `FactoredExperts` slot at the max rank across experts in the group (zero-padded for experts with lower rank). `effective_ranks` tracks the true per-expert rank for honest parameter counting.
 
