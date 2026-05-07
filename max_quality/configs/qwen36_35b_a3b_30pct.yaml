@@ -212,6 +212,8 @@ stage6_validate:
   # F-C-H-3: per-dataset revision pinning (Spec §9). When strict_revision_pinning
   # is true (default), the run aborts if any value is null. Replace the placeholders
   # below with the actual HF dataset revision SHAs before a production run.
+  # WARNING: this config will RuntimeError at Stage 6 startup until SHAs are pinned.
+  # To run a smoke test that skips Stage 6 verification, set strict_revision_pinning: false.
   strict_revision_pinning: true
   dataset_revisions:
     wikitext_ppl:    null   # Salesforce/wikitext (wikitext-2-raw-v1) — used by _wikitext2_ppl AND imatrix calibration corpus (train split)

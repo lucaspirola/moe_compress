@@ -236,7 +236,9 @@ def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_APPEND)
+    # F-CR2-N-1: open read-only solely to fsync — no bytes are written here.
+    # O_RDONLY is the most accurate intent (write+append flags were misleading).
+    fd = os.open(str(tmp), os.O_RDONLY)
     try:
         os.fsync(fd)
     finally:
@@ -310,6 +312,16 @@ def _load_teacher_cache(cache_path: Path, cache_key: str) -> dict | None:
             log.info("Teacher cache key mismatch (expected %s, found %s) — re-evaluating.",
                      cache_key, data.get("cache_key"))
             return None
+        # F-CR2-N-2: prefer .get() with explicit None check + a precise warning
+        # message over relying on a broad except KeyError.
+        teacher_results = data.get("teacher_results")
+        if teacher_results is None:
+            log.warning(
+                "Teacher cache invalid: 'teacher_results' key missing from cache file %s "
+                "— re-evaluating.",
+                cache_path,
+            )
+            return None
         param_counts = data.get("teacher_param_counts")
         if param_counts is None:
             log.warning(
@@ -321,10 +333,10 @@ def _load_teacher_cache(cache_path: Path, cache_key: str) -> dict | None:
         else:
             log.info("Teacher eval cache HIT (%s) — skipping teacher load+eval entirely.", cache_key)
         return {
-            "results": data["teacher_results"],
+            "results": teacher_results,
             "param_counts": param_counts,
         }
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         log.warning("Teacher cache corrupted (%s) — re-evaluating.", exc)
         return None
 
@@ -348,7 +360,8 @@ def _save_teacher_cache(
     # belt-and-suspenders flush and its failure should not invalidate the write.
     try:
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_APPEND)
+        # F-CR2-N-1: open read-only solely to fsync — no bytes are written here.
+        fd = os.open(str(tmp), os.O_RDONLY)
         try:
             os.fsync(fd)
         finally:
@@ -459,6 +472,18 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     if s6["generative"]["enabled"]:
         log.info("Stage 6: generative (HumanEval + MATH-500), gen_batch_size=%d", int(gen_batch_size))
         if "humaneval" in s6["generative"]:
+            # F-CR2-L-1: schema preservation — accept `num_samples_per_task` for
+            # future operators who may want to ablate, but assert it equals 1.
+            # Spec D-humaneval-greedy mandates greedy single-sample pass@1 (NOT
+            # Chen-2021-style stochastic pass@1 that requires k>=10 samples).
+            _humaneval_cfg = s6["generative"]["humaneval"]
+            _nspt = _humaneval_cfg.get("num_samples_per_task", 1)
+            if int(_nspt) != 1:
+                raise ValueError(
+                    f"stage6_validate.generative.humaneval.num_samples_per_task must be 1 "
+                    f"(spec D-humaneval-greedy: greedy single-sample pass@1); got {_nspt}. "
+                    f"Stochastic pass@1 (Chen 2021) requires a different harness — not supported here."
+                )
             results["student"]["humaneval_pass_at_1"] = _humaneval(
                 model, tokenizer, s6["generative"]["humaneval"], device=device,
                 collect=eval_text_concat, batch_size=gen_batch_size,
@@ -624,14 +649,32 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     # Optimization #8: If GGUF conversion was running in background, wait for it.
     # Then run llama-imatrix (which needs the GPU, now freed from teacher).
     gguf_thread_timed_out = False
+    imatrix_skipped = False
     if gguf_thread is not None:
         log.info("Stage 6: waiting for background GGUF conversion to complete")
         gguf_thread.join(timeout=3700)
         if gguf_thread.is_alive():
-            log.warning("GGUF convert thread still alive after %.0f s timeout; skipping GGUF-dependent steps", 3700)
+            # F-CR2-M-1: SKIP imatrix entirely when the bg thread is still alive after
+            # the timeout. The daemon bg thread continues writing to model_f16.gguf.tmp
+            # and would race with _generate_imatrix's sequential fallback, both of which
+            # call os.replace on the same target path. By skipping, no concurrent writer
+            # exists; the bg thread's eventual replace just updates the GGUF for the next
+            # run. The prebuilt-only GGUF (without imatrix) remains acceptable for
+            # downstream serving.
+            log.error(
+                "GGUF convert thread still alive after %.0f s timeout; SKIPPING imatrix "
+                "entirely to avoid concurrent-writer race on model_f16.gguf",
+                3700,
+            )
             gguf_thread_timed_out = True
+            imatrix_skipped = True
     f16_path = None if gguf_thread_timed_out else gguf_result.get("f16_path")
-    if cached_teacher_results is None and f16_path is not None:
+    if imatrix_skipped:
+        # Sentinel: surface to dashboard via trackio. Do NOT call _generate_imatrix:
+        # it would spawn a sequential GGUF write that races the still-live bg thread.
+        _trackio_log({"stage6/imatrix_skipped": 1.0})
+        results["imatrix_skipped"] = True
+    elif cached_teacher_results is None and f16_path is not None:
         _run_llama_imatrix_with_prebuilt_gguf(
             eval_text_concat, s6.get("imatrix", {}), artifacts_dir, gguf_result,
         )
@@ -931,20 +974,24 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
     except Exception as exc:
         log.warning("_wikitext2_ppl: load_dataset failed (%s); returning inf PPL", exc)
         return float("inf")
-    eos = tokenizer.eos_token_id
-    all_ids: list[int] = []
+    # F-CR2-H-1/H-2 (Spec §9 / F-S-C-1): tokenize the entire concatenated corpus
+    # in a single call with add_special_tokens=True. This:
+    #   - applies BOS exactly once (closes F-CR2-H-2),
+    #   - inserts no inter-row separator tokens beyond the natural newline that
+    #     wikitext-2-raw-v1 already uses (closes F-CR2-H-1),
+    #   - matches the canonical HF / lm-eval WikiText-2 PPL recipe.
+    rows: list[str] = []
     for row in ds:
         text = row.get("text", "")
         if not text.strip():
             continue
         if collect is not None:
             collect.append(text)
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-        all_ids.extend(ids)
-        # Avoid double-EOS at document boundaries when the tokenizer already
-        # appends EOS as part of the text encoding.
-        if eos is not None and (not ids or ids[-1] != eos):
-            all_ids.append(eos)
+        rows.append(text)
+    concatenated = "\n\n".join(rows)
+    all_ids: list[int] = tokenizer(
+        concatenated, add_special_tokens=True, return_tensors=None,
+    )["input_ids"]
 
     seq_len = cfg["sequence_length"]
     n_full = len(all_ids) // seq_len
