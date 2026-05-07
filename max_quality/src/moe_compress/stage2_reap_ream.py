@@ -374,6 +374,26 @@ def run(
     # cost_asymmetric × freq_weighted_merge invariant is checked at the very
     # top of run() (fail-fast); we rely on that here.
 
+    # Stage 2 v2 (spec § 6) — one-shot Trackio emit of the static config so
+    # the dashboard run-summary reflects which features are active without
+    # parsing per-layer logs. All v2 config flags + the partial-JSON
+    # format_version are surfaced under the "stage2/config/*" namespace.
+    _trackio_log({
+        "stage2/config/assignment_solver": assignment_solver,
+        "stage2/config/cost_alignment": cost_alignment_cfg,
+        "stage2/config/cost_whitening": cost_whitening,
+        "stage2/config/cost_asymmetric": cost_asymmetric,
+        "stage2/config/cost_topk_filter": cost_topk_filter,
+        "stage2/config/capacity_util_threshold": capacity_util_threshold,
+        "stage2/config/em_refinement_rounds": em_refinement_rounds,
+        "stage2/config/em_convergence_break": em_convergence_break,
+        "stage2/config/expert_distill_steps": expert_distill_steps,
+        "stage2/config/expert_distill_token_cap": expert_distill_token_cap,
+        "stage2/config/expert_distill_lr": expert_distill_lr,
+        "stage2/config/sinkhorn_iters": sinkhorn_iters,
+        "stage2/config/format_version": 2,
+    })
+
     for k, layer_ref in enumerate(moe_layers):
         if layer_ref.layer_idx in completed_layers:
             log.info(
@@ -446,6 +466,16 @@ def run(
         assignment: list[int] = []
         running_mean: float = float("nan")
         em_rounds_done: int = 0  # populated by _em_refine_assignment in the bump loop
+        # Stage 2 v2: hoist effective_cost_alignment / effective_cost_asymmetric
+        # from the bump-loop's "if not b_fail" branch to layer scope so the
+        # per-layer Trackio emit at the bottom of the loop sees them whether
+        # or not the bump loop's success branch ran (b_fail / zero-merge
+        # fallback leaves the defaults as-is, which is the right thing to
+        # log: "no cost matrix was actually built for this layer"). Same for
+        # capacity_util_value — defaults to 0.0 (uncapped / fully-slack).
+        effective_cost_alignment: str = cost_alignment_cfg
+        effective_cost_asymmetric: bool = cost_asymmetric
+        capacity_util_value: float = 0.0
         mean_assigned_cost: float = 0.0
         assigned_cost: float = 0.0
         # Invariant: after the bump loop, assignment is either:
@@ -534,6 +564,13 @@ def run(
                 #   post-alignment cost matrix is unlikely to change the
                 #   assignment meaningfully — fall back to the cheap symmetric
                 #   path. This is what skips ~half the layers' compute.
+                # Capture the actual u value into the layer-scope variable
+                # so the per-layer Trackio emit can surface it; mirrors the
+                # division done inside _pick_effective_alignment.
+                if max_group_cap <= 0:
+                    capacity_util_value = 0.0
+                else:
+                    capacity_util_value = n_ream_nc / max(n_ream_c * max_group_cap, 1)
                 effective_cost_alignment = _pick_effective_alignment(
                     n_nc=n_ream_nc,
                     n_c=n_ream_c,
@@ -878,6 +915,8 @@ def run(
             assigned_cost, max_group, mean_group,
         )
         _trackio_log({
+            # v1 keys — kept verbatim for backward-compatibility with
+            # existing Trackio dashboards. Do not rename or remove.
             "stage2/layer_idx": layer_ref.layer_idx,
             "stage2/protected_experts": n_protected,
             "stage2/ream_centroids": len(ream_centroid_ids),
@@ -889,6 +928,21 @@ def run(
             "stage2/effective_target": effective_target,
             "stage2/actual_kept_experts": len(final_kept_ids),
             "stage2/stage1_target": target,
+            # v2 keys (spec § 5 / § 6) — per-layer runtime state from the
+            # new dispatcher / capacity gate / EM / distillation paths.
+            "stage2/assignment_solver_used": assignment_solver,
+            "stage2/cost_alignment_effective": effective_cost_alignment,
+            "stage2/cost_asymmetric_effective": effective_cost_asymmetric,
+            "stage2/capacity_util": capacity_util_value,
+            "stage2/capacity_regime": (
+                "tight" if effective_cost_alignment == "post" else "slack"
+            ),
+            "stage2/em_rounds_done": em_rounds_done,
+            # Distillation aggregates: keys appear only on layers where
+            # distillation actually ran (non-empty distill_state). The
+            # **{} no-op keeps the emit slim on disabled / singleton-only
+            # layers, avoiding dashboard noise.
+            **_summarize_distill_state(distill_state),
         })
 
     out_dir = artifacts_dir / "stage2_pruned"
@@ -1735,6 +1789,53 @@ def _distill_merged_group(
         "final_loss": final_loss,
         "initial_loss": float(initial_loss) if initial_loss is not None else None,
         "break_reason": break_reason,
+    }
+
+
+def _summarize_distill_state(
+    distill_state: dict[int, dict] | None,
+) -> dict[str, int | float]:
+    """Aggregate per-merged-group distillation outcomes into per-layer scalars
+    for Trackio emission (spec § 5 step 7b / M8).
+
+    Returns a dict with four keys:
+        ``stage2/distill_groups``       — int, number of non-singleton groups
+                                          actually distilled this layer.
+        ``stage2/distill_mean_final_loss`` — float, mean of per-group ``final_loss``
+                                          (NaN when no groups distilled).
+        ``stage2/distill_mean_steps``   — float, mean step count across groups
+                                          (reflects plateau-break behavior — ratio
+                                          to ``expert_distill_steps`` shows how
+                                          aggressively groups converged).
+        ``stage2/distill_plateau_breaks`` — int, count of groups whose
+                                          ``break_reason == "plateau"``.
+
+    Returns an empty dict when ``distill_state is None`` (distillation
+    disabled or no non-singleton groups). Caller's `_trackio_log({**existing, **summary})`
+    pattern then naturally omits the keys for that layer.
+    """
+    if not distill_state:
+        return {}
+    groups = list(distill_state.values())
+    # Skip "trivial" skips (singletons, zero-steps) so the means reflect actual
+    # distillation work, not no-op placeholders.
+    real = [g for g in groups if g.get("skip") != "trivial" and g.get("final_loss") is not None]
+    if not real:
+        return {
+            "stage2/distill_groups": 0,
+            "stage2/distill_mean_final_loss": float("nan"),
+            "stage2/distill_mean_steps": 0.0,
+            "stage2/distill_plateau_breaks": 0,
+        }
+    n = len(real)
+    final_losses = [float(g["final_loss"]) for g in real]
+    steps = [int(g.get("steps", 0)) for g in real]
+    plateaus = sum(1 for g in real if g.get("break_reason") == "plateau")
+    return {
+        "stage2/distill_groups": n,
+        "stage2/distill_mean_final_loss": sum(final_losses) / n,
+        "stage2/distill_mean_steps": sum(steps) / n,
+        "stage2/distill_plateau_breaks": plateaus,
     }
 
 

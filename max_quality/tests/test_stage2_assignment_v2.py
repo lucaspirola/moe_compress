@@ -1170,3 +1170,300 @@ def test_config_rejects_asymmetric_without_freq_weighted_merge(tmp_path, monkeyp
             _DummyModel(), tokenizer=None, config=bad_config,
             artifacts_dir=tmp_path, no_resume=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Trackio v2 schema tests (spec § 5 / § 6)
+#
+# Verify that Stage 2 v2 emits the expected telemetry keys (one-shot config
+# + per-layer dynamic state), and that the v1 schema is preserved verbatim
+# for backward compatibility with existing dashboards.
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_distill_state_empty_returns_empty_dict():
+    """When distill_state is None or empty, the helper returns {} so the
+    per-layer Trackio emit naturally omits the four `stage2/distill_*` keys
+    on layers where distillation didn't run (singleton-only or disabled)."""
+    from moe_compress.stage2_reap_ream import _summarize_distill_state
+
+    assert _summarize_distill_state(None) == {}
+    assert _summarize_distill_state({}) == {}
+
+
+def test_summarize_distill_state_skips_trivial_groups():
+    """Groups marked ``{"steps": 0, "skip": "trivial"}`` (singleton or
+    zero-steps no-op) must not pollute the means."""
+    from moe_compress.stage2_reap_ream import _summarize_distill_state
+
+    state = {
+        0: {"steps": 0, "skip": "trivial"},
+        1: {"steps": 0, "skip": "trivial"},
+    }
+    out = _summarize_distill_state(state)
+    assert out["stage2/distill_groups"] == 0
+    # NaN sentinel for "no real distillation happened" so the dashboard can
+    # plot it as a missing data point rather than 0 (which would imply a
+    # successful zero-loss merge).
+    import math
+    assert math.isnan(out["stage2/distill_mean_final_loss"])
+    assert out["stage2/distill_mean_steps"] == 0.0
+    assert out["stage2/distill_plateau_breaks"] == 0
+
+
+def test_summarize_distill_state_aggregates_real_groups():
+    """Aggregate count, mean final_loss, mean steps, plateau-break count
+    across non-trivial groups."""
+    from moe_compress.stage2_reap_ream import _summarize_distill_state
+
+    state = {
+        0: {"steps": 100, "final_loss": 0.10, "initial_loss": 1.0, "break_reason": "plateau"},
+        1: {"steps": 200, "final_loss": 0.30, "initial_loss": 1.0, "break_reason": "max_steps"},
+        2: {"steps": 0,   "skip": "trivial"},  # excluded
+    }
+    out = _summarize_distill_state(state)
+    assert out["stage2/distill_groups"] == 2
+    assert out["stage2/distill_mean_final_loss"] == pytest.approx(0.20)
+    assert out["stage2/distill_mean_steps"] == pytest.approx(150.0)
+    assert out["stage2/distill_plateau_breaks"] == 1
+
+
+# ---------------------------------------------------------------------------
+# End-to-end telemetry emission tests via monkey-patched _trackio_log.
+# Reuse the same fake-calibration / fake-save patches as
+# test_config_rejects_asymmetric_without_freq_weighted_merge so we can
+# drive Stage 2 with a tiny synthetic model and capture the dict args.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _captured_trackio_emits(monkeypatch):
+    """Monkey-patch ``_trackio_log`` in stage2_reap_ream to record every dict
+    passed to it during Stage 2. Returns the list reference so tests can
+    inspect the captured emits afterward."""
+    from moe_compress import stage2_reap_ream
+    captured: list[dict] = []
+
+    def _capture(metrics: dict) -> None:
+        captured.append(dict(metrics))
+
+    monkeypatch.setattr(stage2_reap_ream, "_trackio_log", _capture)
+    return captured
+
+
+def _enable_v2_flags_for_telemetry(cfg: dict, *, distill_steps: int = 3) -> dict:
+    """Mutate ``tiny_config`` in-place to turn on every Stage 2 v2 flag with
+    values appropriate for the synthetic ``_TinyModel`` (small K, capacity
+    threshold = 0 so TIGHT path always taken, low EM/distill budgets so
+    tests run in seconds). Returns the same dict for chaining."""
+    s2 = cfg["stage2_reap_ream"]
+    s2["assignment_solver"] = "auto"
+    s2["cost_alignment"] = "post"
+    s2["cost_whitening"] = "diag"
+    s2["cost_asymmetric"] = True
+    s2["cost_topk_filter"] = 2
+    s2["capacity_util_threshold"] = 0.0
+    s2["em_refinement_rounds"] = 1
+    s2["em_convergence_break"] = True
+    s2["expert_distill_steps"] = distill_steps
+    s2["expert_distill_token_cap"] = 8
+    s2["expert_distill_lr"] = 1.0e-4
+    s2["expert_distill_loss_plateau_steps"] = 2
+    s2["sinkhorn_iters"] = 50
+    return cfg
+
+
+class _TinyTokenizerForTelemetry:
+    name_or_path = "tiny"
+    eos_token_id = 0
+    def __call__(self, text, *_, **__):
+        return {"input_ids": [min(ord(c) % 32, 31) for c in (text or " ")]}
+    def save_pretrained(self, *_a, **_kw):
+        return None
+
+
+def _patch_calib_and_save(monkeypatch):
+    """Mirror the patched_stage2 setup from test_smoke_stage2_resume.py: stub
+    calibration tensor builders + save_compressed_checkpoint so Stage 2 (and
+    Stage 1) can run end-to-end on the synthetic _TinyModel without hitting
+    HuggingFace or writing a real checkpoint."""
+    import torch
+    from moe_compress import stage2_reap_ream
+    from moe_compress.utils import calibration as cal_mod
+    from moe_compress.utils import model_io as mio
+    from pathlib import Path
+
+    def _fake_build(tokenizer, spec, cache_dir=None):
+        torch.manual_seed(spec.seed)
+        return torch.randint(0, 32, (spec.num_sequences, spec.sequence_length),
+                             dtype=torch.long)
+
+    def _fake_slice(tokenizer, spec, num_samples, cache_dir=None):
+        torch.manual_seed(spec.seed + 1)
+        return torch.randint(0, 32, (num_samples, spec.sequence_length),
+                             dtype=torch.long)
+
+    def _noop_save(model, tokenizer, path, **kwargs):
+        Path(path).mkdir(parents=True, exist_ok=True)
+        return Path(path)
+
+    monkeypatch.setattr(cal_mod, "build_calibration_tensor", _fake_build)
+    monkeypatch.setattr(cal_mod, "build_super_expert_slice", _fake_slice)
+    monkeypatch.setattr(stage2_reap_ream, "build_calibration_tensor", _fake_build)
+    monkeypatch.setattr(mio, "save_compressed_checkpoint", _noop_save)
+    monkeypatch.setattr(stage2_reap_ream, "save_compressed_checkpoint", _noop_save)
+
+
+def _run_stage1_for_telemetry(model, cfg, tmp_path):
+    """Run Stage 1 with a fixed BudgetDecomposition so Stage 2 has the
+    required artifacts (stage1_blacklist.json, stage1_budgets.json) on disk."""
+    from moe_compress import stage1_grape
+    from moe_compress.budget.solver import BudgetDecomposition
+
+    decomp = BudgetDecomposition(
+        total_reduction_ratio=0.2, expert_prune_ratio=0.5,
+        svd_rank_ratio=0.14, global_expert_budget=4,
+        min_experts_per_layer=2, blacklisted_experts={},
+    )
+    stage1_grape.run(model, _TinyTokenizerForTelemetry(), cfg, tmp_path, decomp)
+
+
+def test_trackio_emits_v2_config_keys_once_at_start(
+    _captured_trackio_emits, tmp_path, monkeypatch, tiny_config,
+):
+    """The one-shot config emit at the top of run() must surface every v2
+    config flag under the ``stage2/config/*`` namespace. Stubs out the
+    per-layer loop via empty iter_moe_layers so this test exercises only
+    the config emit path."""
+    from moe_compress import stage2_reap_ream
+    _patch_calib_and_save(monkeypatch)
+    monkeypatch.setattr(
+        stage2_reap_ream, "load_json_artifact",
+        lambda p: {"per_layer_target_experts": {}, "blacklist": {}},
+    )
+    monkeypatch.setattr(
+        stage2_reap_ream, "iter_moe_layers",
+        lambda model: iter([]),  # short-circuit per-layer loop
+    )
+
+    cfg = _enable_v2_flags_for_telemetry(tiny_config)
+
+    class _Dummy:
+        pass
+
+    stage2_reap_ream.run(
+        _Dummy(), tokenizer=None, config=cfg,
+        artifacts_dir=tmp_path, no_resume=True,
+    )
+
+    config_emits = [
+        e for e in _captured_trackio_emits
+        if any(k.startswith("stage2/config/") for k in e)
+    ]
+    assert len(config_emits) >= 1, "expected at least one config emit at start of run"
+    cfg_emit = config_emits[0]
+
+    expected_keys = {
+        "stage2/config/assignment_solver": str,
+        "stage2/config/cost_alignment": str,
+        "stage2/config/cost_whitening": str,
+        "stage2/config/cost_asymmetric": bool,
+        "stage2/config/cost_topk_filter": int,
+        "stage2/config/capacity_util_threshold": float,
+        "stage2/config/em_refinement_rounds": int,
+        "stage2/config/em_convergence_break": bool,
+        "stage2/config/expert_distill_steps": int,
+        "stage2/config/expert_distill_token_cap": int,
+        "stage2/config/expert_distill_lr": float,
+        "stage2/config/sinkhorn_iters": int,
+        "stage2/config/format_version": int,
+    }
+    for k, t in expected_keys.items():
+        assert k in cfg_emit, f"missing config key {k}"
+        assert isinstance(cfg_emit[k], t), (
+            f"config key {k} has type {type(cfg_emit[k]).__name__}, expected {t.__name__}"
+        )
+
+    # Specific values from _enable_v2_flags_for_telemetry().
+    assert cfg_emit["stage2/config/assignment_solver"] == "auto"
+    assert cfg_emit["stage2/config/cost_alignment"] == "post"
+    assert cfg_emit["stage2/config/cost_whitening"] == "diag"
+    assert cfg_emit["stage2/config/cost_asymmetric"] is True
+    assert cfg_emit["stage2/config/format_version"] == 2
+
+
+def test_trackio_v1_and_v2_per_layer_keys_present(
+    _captured_trackio_emits, tmp_path, monkeypatch, tiny_model, tiny_config,
+):
+    """Combined regression guard + v2-coverage test: with v2 flags ON, the
+    per-layer emit must carry both the legacy v1 key set (no renames /
+    removals) AND the new v2 keys with expected types."""
+    from moe_compress import stage2_reap_ream
+    _patch_calib_and_save(monkeypatch)
+
+    cfg = _enable_v2_flags_for_telemetry(tiny_config)
+    _run_stage1_for_telemetry(tiny_model, cfg, tmp_path)
+    stage2_reap_ream.run(
+        tiny_model, _TinyTokenizerForTelemetry(), cfg, tmp_path,
+        device=None, no_resume=True,
+    )
+
+    per_layer_emits = [e for e in _captured_trackio_emits if "stage2/layer_idx" in e]
+    assert per_layer_emits, "expected at least one per-layer Trackio emit"
+
+    v1_required = {
+        "stage2/layer_idx", "stage2/protected_experts", "stage2/ream_centroids",
+        "stage2/total_experts", "stage2/sum_assignment_cost",
+        "stage2/mean_cost_per_pair", "stage2/max_merge_group_size",
+        "stage2/mean_merge_group_size", "stage2/effective_target",
+        "stage2/actual_kept_experts", "stage2/stage1_target",
+    }
+    v2_required = {
+        "stage2/assignment_solver_used": str,
+        "stage2/cost_alignment_effective": str,
+        "stage2/cost_asymmetric_effective": bool,
+        "stage2/capacity_util": float,
+        "stage2/capacity_regime": str,
+        "stage2/em_rounds_done": int,
+    }
+    for emit in per_layer_emits:
+        # v1 backward-compat: every legacy key still present.
+        missing_v1 = v1_required - emit.keys()
+        assert not missing_v1, f"v1 keys missing: {missing_v1}"
+        # v2 keys: present + correct type + bounded enums.
+        for k, t in v2_required.items():
+            assert k in emit, f"v2 key {k} missing"
+            assert isinstance(emit[k], t), (
+                f"v2 key {k} has type {type(emit[k]).__name__}, expected {t.__name__}"
+            )
+        assert emit["stage2/capacity_regime"] in ("slack", "tight")
+
+
+def test_trackio_distill_keys_absent_when_distillation_disabled(
+    _captured_trackio_emits, tmp_path, monkeypatch, tiny_model, tiny_config,
+):
+    """When ``expert_distill_steps == 0``, the four ``stage2/distill_*``
+    keys must NOT appear on the per-layer emit. Avoids dashboard noise
+    from runs that don't use the feature."""
+    from moe_compress import stage2_reap_ream
+    _patch_calib_and_save(monkeypatch)
+
+    cfg = _enable_v2_flags_for_telemetry(tiny_config, distill_steps=0)
+    _run_stage1_for_telemetry(tiny_model, cfg, tmp_path)
+    stage2_reap_ream.run(
+        tiny_model, _TinyTokenizerForTelemetry(), cfg, tmp_path,
+        device=None, no_resume=True,
+    )
+
+    per_layer_emits = [e for e in _captured_trackio_emits if "stage2/layer_idx" in e]
+    distill_keys = {
+        "stage2/distill_groups",
+        "stage2/distill_mean_final_loss",
+        "stage2/distill_mean_steps",
+        "stage2/distill_plateau_breaks",
+    }
+    for emit in per_layer_emits:
+        intersect = distill_keys & emit.keys()
+        assert not intersect, (
+            f"distill_* keys leaked into emit when expert_distill_steps=0: {intersect}"
+        )
