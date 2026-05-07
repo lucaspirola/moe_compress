@@ -319,10 +319,12 @@ def run(
     T = s5["kd_temperature"]
     ckpt_every = int(s5.get("checkpoint_every_n_steps", 100))
     if ckpt_every <= 0:
-        log.warning(
-            "Stage 5: checkpoint_every_n_steps=%d disables checkpointing — "
-            "spec §8 Resume mandates every 100 steps; resume will not work.",
-            ckpt_every,
+        raise ValueError(
+            f"Stage 5: checkpoint_every_n_steps={ckpt_every} disables "
+            "checkpointing; spec §8 Resume mandates step-boundary "
+            "checkpointing every N optimizer steps. Set a positive integer "
+            "(default 100) — disabling resume would silently lose progress "
+            "on a long-running stage."
         )
 
     # Teacher/student MoE layer count sanity check (router structure must match
