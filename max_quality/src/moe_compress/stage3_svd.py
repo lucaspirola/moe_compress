@@ -137,6 +137,12 @@ def run(
     teacher_model = None
     teacher_moe_layers = None
 
+    # One-shot Trackio emit: AA-SVD path indicator. All values in scope.
+    _trackio_log({
+        "stage3/config/cross_cov_enabled": bool(cross_cov_enabled),
+        "stage3/config/scope": str(s3.get("scope", "moe_experts_only")),
+    })
+
     if no_resume:
         import shutil as _shutil
         for _d in ["_stage3_bcov_partial", "_stage3_ccov_partial"]:
@@ -427,6 +433,19 @@ def run(
         else:
             alpha_by_type = None
             per_expert_ranks = None  # uniform: every expert gets ranks[(li, name)]
+
+    # One-shot Trackio emit of D-Rank / Swift-SVD+ summary. All values in scope.
+    _stage3_alpha_emit: dict[str, float | int | str] = {
+        "stage3/config/t_budget": int(T_budget),
+        "stage3/config/alpha_candidates_count": int(len(alpha_grid) if alpha_grid else 0),
+    }
+    if isinstance(alpha_by_type, dict):
+        for _k, _v in alpha_by_type.items():
+            try:
+                _stage3_alpha_emit[f"stage3/config/alpha_by_type/{_k}"] = float(_v)
+            except (TypeError, ValueError):
+                _stage3_alpha_emit[f"stage3/config/alpha_by_type/{_k}"] = str(_v)
+    _trackio_log(_stage3_alpha_emit)
 
     # Persist α result so a crash during Phase D doesn't force re-running
     # the ~33 min α search on resume.
@@ -2200,6 +2219,10 @@ def _phase_c5_block_refine(
             "stage3/c5_loss_init": loss_first or 0.0,
             "stage3/c5_loss_final": loss_last or 0.0,
             "stage3/c5_loss_rel_drop": rel_drop,
+            # Additive: training-loop shape and warmup configuration. All in scope.
+            "stage3/c5_total_steps": int(total_steps),
+            "stage3/c5_warmup_steps": int(warmup_steps),
+            "stage3/c5_trainable_param_count": int(len(trainables)),
         })
 
         # Save per-block checkpoint atomically.

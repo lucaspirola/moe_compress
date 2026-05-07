@@ -98,6 +98,18 @@ def main(argv=None) -> int:
                                        stop_after_stage=stop)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # One-shot Trackio emit of run-level config so the dashboard's run-summary
+    # carries model name + target compression ratio + device without parsing
+    # per-stage logs. All keys read existing in-scope values; no new state.
+    _trackio_log({
+        "pipeline/config/model_name": str(config["model"]["name_or_path"]),
+        "pipeline/config/target_reduction_ratio": float(config["target"]["total_reduction_ratio"]),
+        "pipeline/config/expert_svd_ratio": float(config["target"]["expert_svd_ratio"]),
+        "pipeline/config/device": device.type,
+        "pipeline/config/resume_from_stage": int(start),
+        "pipeline/config/stop_after_stage": int(stop),
+    })
+
     if start <= 1 <= stop:
         log.info("=== Stage 1 — Super Expert Detection + GRAPE Budgets ===")
         t1 = time.monotonic()

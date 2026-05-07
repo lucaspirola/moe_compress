@@ -466,6 +466,20 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     model.eval()   # stage5 leaves model in train(); set eval before any sub-metric
     results: dict = {"student": {}, "teacher": {}, "delta": {}, "thresholds": {}}
 
+    # One-shot Trackio emit: Stage 6 eval-suite shape and toggles. All values
+    # are config reads — pure additive emit, no logic change.
+    _wt2_cfg = (s6.get("wikitext2") or {})
+    _zs_cfg = (s6.get("zero_shot") or {})
+    _gen_cfg = (s6.get("generative") or {})
+    _trackio_log({
+        "stage6/config/wikitext2_enabled": bool(_wt2_cfg.get("enabled", False)),
+        "stage6/config/wikitext2_seq_len": int(_wt2_cfg.get("sequence_length", 0)),
+        "stage6/config/zero_shot_enabled": bool(_zs_cfg.get("enabled", False)),
+        "stage6/config/zero_shot_n_tasks": int(len(_zs_cfg.get("tasks", []))),
+        "stage6/config/generative_enabled": bool(_gen_cfg.get("enabled", False)),
+        "stage6/config/torch_compile": bool(s6.get("torch_compile", False)),
+    })
+
     # F-C-H-3: enforce strict revision pinning early — fail fast on a misconfigured
     # production run rather than after expensive teacher loads / evals.
     dataset_revisions = _enforce_revision_pinning(config)

@@ -79,6 +79,19 @@ def run(
     layers = list(iter_moe_layers(model))
     log.info("Stage 4: EoRA residual compensation over %d MoE layers", len(layers))
 
+    # One-shot Trackio emit: run-level shape constants. Both values are
+    # already computed from the model and used in the log.info above.
+    _n_experts_first = (
+        layers[0].experts_module.num_experts
+        if layers and hasattr(layers[0].experts_module, "num_experts")
+        else 0
+    )
+    _trackio_log({
+        "stage4/config/n_moe_layers": len(layers),
+        "stage4/config/n_experts_per_layer": int(_n_experts_first),
+        "stage4/config/no_resume": bool(no_resume),
+    })
+
     if no_resume:
         partial_dir = None
     else:
@@ -208,6 +221,7 @@ def run(
             log.info("  L%d/%s widened by r=%d → new rank=%d; residual %.4e→%.4e (-%.1f%%)",
                      ref.layer_idx, name, r_per_expert, fe.ranks[name],
                      res_before, res_after, 100 * rel_drop)
+            _eff_list = [v for v in eff_per_expert if v is not None]
             _trackio_log({
                 "stage4/layer_idx": ref.layer_idx,
                 f"stage4/{name}_added_rank": r_per_expert,
@@ -216,6 +230,16 @@ def run(
                 f"stage4/{name}_residual_after": res_after,
                 f"stage4/{name}_residual_rel_drop": rel_drop,
                 "stage4/compensated_params": compensated_params + layer_compensated_params,
+                # Additive v2 keys: per-layer aggregates of in-scope variables.
+                f"stage4/{name}_n_eligible_experts": int(n_eligible),
+                f"stage4/{name}_eff_rank_mean": (
+                    float(sum(_eff_list) / len(_eff_list)) if _eff_list else 0.0
+                ),
+                f"stage4/{name}_eff_rank_max": int(max(_eff_list)) if _eff_list else 0,
+                f"stage4/{name}_eff_rank_min": int(min(_eff_list)) if _eff_list else 0,
+                # Per-matrix contribution (not the per-layer running total —
+                # which is already in `stage4/compensated_params`).
+                f"stage4/{name}_matrix_compensated_params": int(U_corr.numel() + V_corr.numel()),
             })
 
         rank_map.update(rank_map_layer)

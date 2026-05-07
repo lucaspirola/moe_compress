@@ -209,6 +209,17 @@ def run(
         p995, a_max_fraction * a_max, blacklist_path,
     )
 
+    # One-shot Trackio emit of Phase A/C summary (additive; all variables in
+    # scope from the prose log.info above).
+    _trackio_log({
+        "stage1/ma_formation_layers_count": len(L),
+        "stage1/total_experts": int(total_experts),
+        "stage1/p995_threshold": float(p995),
+        "stage1/a_max": float(a_max),
+        "stage1/a_max_threshold": float(a_max_fraction * a_max),
+        "stage1/n_blacklisted": int(sum(len(v) for v in blacklist_out.values())),
+    })
+
     # Trackio: SE detection stats
     for ref in moe_layers:
         in_ma_layer = ref.layer_idx in L
@@ -977,6 +988,20 @@ def _grape_greedy_merge(
             "(floors are per_layer_counts[li] // 2 per layer).",
             effective_budget, current_total, iter_ + 1, max_iterations,
         )
+
+    # One-shot Trackio emit of GRAPE summary. All variables already in scope
+    # — pure additive emit, no new state computed.
+    _trackio_log({
+        "stage1/effective_budget": int(effective_budget),
+        "stage1/global_budget": int(global_budget),
+        "stage1/total_blacklisted": int(total_blacklisted),
+        "stage1/entropy_initial": float(E_init),
+        "stage1/entropy_threshold": float(E_hat),
+        "stage1/gamma": float(gamma),
+        "stage1/n_merges_executed": int(n_merges),
+        "stage1/exit_reason": exit_reason,
+        "stage1/final_total": int(current_total),
+    })
 
     # Stage 2 reads per-layer budgets as TOTAL centroid count (blacklisted + non-blacklisted).
     # Add blacklisted experts back so Stage 2's effective_target is inclusive.
