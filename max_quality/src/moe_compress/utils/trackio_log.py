@@ -139,8 +139,18 @@ def trackio_log(metrics: dict[str, Any]) -> None:
     then silently swallowed on subsequent calls (silent no-op contract).
 
     Must be called from the main thread — ``trackio.log`` is not thread-safe.
+    Raises ``RuntimeError`` if called from any non-main thread (F-C-N-1: enforce
+    the contract that was previously documented but not checked).
     """
     global _import_failed, _trackio, _warned_log_failed, _warned_log_bad_attr_exc, _warned_log_bad_attr_noncallable
+
+    # F-C-N-1: enforce the main-thread contract documented above.
+    if threading.main_thread() is not threading.current_thread():
+        raise RuntimeError(
+            "trackio_log must be called from the main thread "
+            f"(called from {threading.current_thread().name!r}); "
+            "trackio.log is not thread-safe."
+        )
 
     if not isinstance(metrics, dict):
         raise TypeError(f"metrics must be a dict, got {type(metrics).__name__!r}")
