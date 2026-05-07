@@ -393,13 +393,17 @@ def run(
                 if e in protected:
                     continue
                 if freq[e] < min_active_tokens:
+                    # Spec D-reap-min-active-tokens (§12): low-frequency experts
+                    # are filtered from centroid candidacy; they become
+                    # non-centroids and get merged via Hungarian alignment.
                     continue
                 ream_centroid_ids.append(e)
 
             if len(ream_centroid_ids) < ream_target:
                 log.warning(
                     "  layer %d: REAM centroid selection yielded %d < %d — "
-                    "%d candidate(s) filtered by reap_min_active_tokens=%d",
+                    "%d candidate(s) filtered by reap_min_active_tokens=%d "
+                    "(per spec D-reap-min-active-tokens)",
                     layer_ref.layer_idx, len(ream_centroid_ids), ream_target,
                     ream_target - len(ream_centroid_ids), min_active_tokens,
                 )
