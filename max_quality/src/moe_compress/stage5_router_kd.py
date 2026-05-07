@@ -263,7 +263,12 @@ def run(
     # before freeze risks the compiler baking in the wrong gradient-enabled
     # state for parameters that are about to be frozen.
     # Sanity check: warn if any parameter name matches BOTH trainable and
-    # frozen patterns (frozen_name_patterns is informational; trainable wins,
+    # frozen patterns (frozen_name_patterns is informational only — it is NOT
+    # consulted by _freeze_non_routers; freeze is driven entirely by
+    # `requires_grad_(any(p in name for p in trainable_name_patterns))`.
+    # Names that match only frozen_name_patterns are still correctly frozen
+    # because they fail the trainable-pattern check. The patterns list exists
+    # solely for the conflict-overlap sanity check below; trainable wins,
     # but a name in both is almost certainly a config bug).
     _frozen_patterns = s5.get("frozen_name_patterns", []) or []
     _trainable_patterns = s5["trainable_name_patterns"]
@@ -461,9 +466,10 @@ def run(
     trailing = len(batches) % grad_accum
     if trailing != 0:
         log.warning(
-            "Stage 5: %d trailing batches will not form a complete grad-accum "
-            "window (grad_accum=%d) — their gradients are dropped at epoch end.",
-            trailing, grad_accum,
+            "Stage 5: %d trailing batches per epoch will not form a complete "
+            "grad-accum window (grad_accum=%d) — their gradients are dropped "
+            "at each epoch end (×%d epochs).",
+            trailing, grad_accum, int(s5["epochs"]),
         )
 
     # Spec D-protocol-blend / §8: when running multi-epoch KD with a
