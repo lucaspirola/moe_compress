@@ -278,15 +278,19 @@ def _atomic_write_text(path: Path, text: str) -> None:
     """Write `text` to `path` atomically per Spec §11 (tmp → fsync → replace → fsync parent)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    # F-CR2-N-1: open read-only solely to fsync — no bytes are written here.
-    # O_RDONLY is the most accurate intent (write+append flags were misleading).
-    fd = os.open(str(tmp), os.O_RDONLY)
     try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
+        tmp.write_text(text, encoding="utf-8")
+        # F-CR2-N-1: open read-only solely to fsync — no bytes are written here.
+        # O_RDONLY is the most accurate intent (write+append flags were misleading).
+        fd = os.open(str(tmp), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
     try:
         parent_fd = os.open(str(path.parent), os.O_RDONLY)
         try:
