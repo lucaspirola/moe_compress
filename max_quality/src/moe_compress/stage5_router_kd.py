@@ -72,8 +72,7 @@ def run(
     #       hf_jobs/precompute_teacher_logits.py; skip live teacher entirely.
     # If both are set, (B) wins.
     teacher = None
-    # teacher_refs lives inside `_teacher_state["refs"]` once the teacher is
-    # lazily loaded; intentionally not pre-bound here.
+    # Teacher is lazily loaded inside `_teacher_state["model"]`.
     teacher_logits_cache = None
     cache_path_cfg = s5.get("teacher_logits_cache")
     if cache_path_cfg:
@@ -188,7 +187,7 @@ def run(
         # Deferred teacher load: only load the teacher on the first live training
         # batch. On resume, fast-forward iterates without ever touching the teacher —
         # saves ~60s + 70 GB VRAM when resuming deep into training.
-        _teacher_state: dict = {"model": None, "refs": None}
+        _teacher_state: dict = {"model": None}
 
         def _get_teacher(student_refs_count: int):
             if _teacher_state["model"] is None:
@@ -243,10 +242,10 @@ def run(
                     except Exception as exc:
                         log.warning("Stage 5: torch.compile(teacher) failed (%s) — eager", exc)
                 _teacher_state["model"] = _t
-                _teacher_state["refs"] = list(iter_moe_layers(getattr(_t, "_orig_mod", _t)))
-                assert len(_teacher_state["refs"]) == student_refs_count, (
+                _teacher_refs_count = sum(1 for _ in iter_moe_layers(getattr(_t, "_orig_mod", _t)))
+                assert _teacher_refs_count == student_refs_count, (
                     f"Teacher/student MoE layer count mismatch: "
-                    f"{len(_teacher_state['refs'])} vs {student_refs_count}"
+                    f"{_teacher_refs_count} vs {student_refs_count}"
                 )
             return _teacher_state["model"]
     # Freeze non-router parameters BEFORE compiling the student so that the
@@ -329,7 +328,9 @@ def run(
     # Teacher/student MoE layer count sanity check (router structure must match
     # even though we're distilling at vocab level — the student's routers are
     # what we're training).
-    student_refs = list(iter_moe_layers(getattr(student, "_orig_mod", student)))
+    # We only need the count for teacher↔student topology checks (line 507);
+    # avoid retaining a list of MoE-layer references on a 35B-class model.
+    student_refs_count = sum(1 for _ in iter_moe_layers(getattr(student, "_orig_mod", student)))
 
     # -----------------------------------------------------------------------
     # Crash-resume: find latest checkpoint and restore router + optim state.
@@ -504,7 +505,7 @@ def run(
                     # sufficient — framework hooks or torch.compile can silently
                     # transition the model back to train mode, which activates
                     # dropout and produces stochastic KD targets.
-                    _teacher = _get_teacher(len(student_refs))
+                    _teacher = _get_teacher(student_refs_count)
                     _teacher.eval()
                     teacher_out = _teacher(input_ids=batch)
                     teacher_vocab_logits = teacher_out.logits.detach().to(torch.float32)  # [B, L, |V|]
