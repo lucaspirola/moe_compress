@@ -1222,17 +1222,18 @@ def _merge_experts_inplace(
                     weights[:] = 1.0
                 weights /= weights.sum()
             else:
-                # B-C-M-2: spec mandates frequency-weighted merge per REAM Eq. 6;
-                # equal-weights is for ablation only and produces non-spec-compliant
-                # merges. Warn loudly so this is observable in logs.
-                log.warning(
-                    "Spec mandates frequency-weighted merge per REAM Eq. 6; "
-                    "equal-weights is for ablation only and produces "
-                    "non-spec-compliant merges. (layer=%d centroid=%d members=%d)",
-                    li, centroid, len(members),
+                # B-C-M-2: spec §5 Step 4 mandates frequency-weighted merge per
+                # REAM Eq. 6. The equal-weights branch was an ablation-only
+                # fallback the spec never authorized; refuse to proceed with
+                # spec-non-compliant merges instead of silently warning.
+                raise ValueError(
+                    f"Stage 2: ream.frequency_weighted_merge=False produces "
+                    f"spec-non-compliant merges (REAM Eq. 6 mandates "
+                    f"frequency-weighted averaging). Set ream.frequency_weighted_merge: true "
+                    f"in the config — the equal-weights branch was an ablation "
+                    f"option that has no §12 D-row and must not be used in "
+                    f"production. (layer={li} centroid={centroid} members={len(members)})"
                 )
-                weights = np.ones(len(members), dtype=np.float64)
-                weights /= weights.sum()  # equal weights; no zero-sum risk
 
             # The centroid serves a dual role: it is the permutation-alignment reference
             # (via ref_gate/ref_up) AND a member of the weighted average (members[0]).
