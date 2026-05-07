@@ -18,13 +18,24 @@ caching is enabled, in which case the cached teacher results are used directly.
 Artifact: ``stage6_eval.json`` with absolute metrics + deltas + threshold
 pass/fail summary.
 
-**Security note — HumanEval code execution (H1):**
+**Security note — HumanEval code execution (H1, F-C-L-3):**
 ``_check_humaneval`` executes model-generated Python code via ``exec()`` inside
 a daemon thread with a wall-clock timeout.  This provides *best-effort*
 sandboxing only — there is **no process isolation** (no subprocess, no
 seccomp, no container boundary).  Malicious or runaway generated code can
 access the filesystem, network, and interpreter state.  Use only in trusted
 environments or behind an external sandbox.
+
+Known limitations of the in-process sandbox:
+  * Daemon threads that exceed the timeout are NOT killed — they leak silently
+    until interpreter exit (counted via ``_leaked_counter`` and surfaced as a
+    warning at the end of the eval).
+  * Wall-clock timeouts via ``Thread.join(timeout=...)`` do not interrupt
+    long-running C extensions or syscalls inside the exec body. (POSIX ``signal``
+    -based timeouts would interrupt syscalls but are not used here because they
+    only work on the main thread; signal-based timeouts are POSIX-only anyway.)
+  * No syscall filter (no seccomp/landlock); generated code can open sockets,
+    write to ``/tmp``, exec binaries, etc., subject only to OS-level permissions.
 
 **Compute-time optimizations (2026-04-30):**
 All optimizations are purely computational scheduling — larger batches, cached
@@ -44,6 +55,7 @@ identical to the batch_size=1 baseline.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata as _md
 import json
 import logging
 import math
@@ -82,27 +94,207 @@ log = logging.getLogger(__name__)
 
 _ZERO_SHOT_TASKS: frozenset[str] = frozenset({"arc_challenge_acc", "hellaswag_acc"})
 
+# F-C-H-1: Spec F-S-M-1 mandates eager attention for both teacher and student
+# during the Stage 6 gate run. Constant — never override at call sites.
+_STAGE6_ATTN_IMPLEMENTATION: str = "eager"
+
+# F-C-C-1: Spec §9 — imatrix calibration corpus is the WikiText-2 *train* split,
+# written to calibration_wiki_train.txt. The eval-text concat (eval prompts seen
+# by the model during PPL/zero-shot/generative) is captured separately to
+# eval_text_concat.txt as a debugging side-channel ONLY.
+_IMATRIX_CALIB_FILENAME: str = "calibration_wiki_train.txt"
+_EVAL_TEXT_CONCAT_FILENAME: str = "eval_text_concat.txt"
+
+# ---------------------------------------------------------------------------
+# Dataset revision pinning (F-C-H-3)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_dataset_revisions(config: dict) -> dict[str, str | None]:
+    """Return the per-dataset revision mapping from stage6_validate config.
+
+    Always returns a dict (possibly empty). Keys are dataset slugs used by
+    Stage 6 (wikitext_ppl, hellaswag, arc_challenge, humaneval, math500).
+    """
+    s6 = config.get("stage6_validate", {}) or {}
+    raw = s6.get("dataset_revisions") or {}
+    if not isinstance(raw, dict):
+        log.warning(
+            "_resolve_dataset_revisions: dataset_revisions config is not a dict (%r); ignoring",
+            type(raw).__name__,
+        )
+        return {}
+    # Coerce to str|None; reject non-string non-null values.
+    out: dict[str, str | None] = {}
+    for k, v in raw.items():
+        if v is None:
+            out[str(k)] = None
+        elif isinstance(v, str):
+            out[str(k)] = v
+        else:
+            log.warning(
+                "_resolve_dataset_revisions: revision for %r is not a string (%r); coercing to str",
+                k, v,
+            )
+            out[str(k)] = str(v)
+    return out
+
+
+def _enforce_revision_pinning(
+    config: dict, required_keys: tuple[str, ...] = (
+        "wikitext_ppl", "hellaswag", "arc_challenge", "humaneval", "math500",
+    ),
+) -> dict[str, str | None]:
+    """Validate dataset_revisions when strict_revision_pinning is on.
+
+    Raises RuntimeError listing every missing/null required key. Returns the
+    resolved revisions dict regardless of strict mode (so callers can still
+    pass-through whatever revisions are pinned).
+    """
+    s6 = config.get("stage6_validate", {}) or {}
+    revisions = _resolve_dataset_revisions(config)
+    strict = bool(s6.get("strict_revision_pinning", True))
+    if not strict:
+        return revisions
+    missing = [k for k in required_keys if not revisions.get(k)]
+    if missing:
+        raise RuntimeError(
+            "Stage 6: strict_revision_pinning=true but dataset_revisions are "
+            f"missing or null for: {missing}. Pin each dataset SHA in "
+            "configs/<…>.yaml under stage6_validate.dataset_revisions, or "
+            "set strict_revision_pinning=false to opt out (NOT for production)."
+        )
+    return revisions
+
+
 # ---------------------------------------------------------------------------
 # Teacher eval caching (Optimization #7)
 # ---------------------------------------------------------------------------
 
-def _teacher_cache_key(config: dict) -> str:
-    """Compute a deterministic cache key from teacher model identity + eval config.
 
-    Key components: model name, revision, and the subset of stage6 config that
-    affects teacher evaluation (wikitext2, zero_shot, generative settings).
-    The teacher is deterministic — same model + same eval = same numbers.
+def _safe_pkg_version(name: str) -> str:
+    """Return importlib.metadata.version(name) or 'unknown' if not installed.
+
+    Avoids hard-failing the cache key when an optional package isn't installed
+    (e.g. lm-eval missing in a smoke environment).
+    """
+    try:
+        return _md.version(name)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _teacher_cache_key(config: dict) -> str:
+    """Compute a deterministic SHA-256 cache key from the 9 spec-mandated components.
+
+    Per spec F-S-H-3, the cache key MUST cover every input that can change the
+    teacher's evaluation numbers, so a stale cache cannot mask a meaningful
+    config change.
+
+    Components (sorted-keys JSON, no whitespace):
+      1. model_name              — config.model.name_or_path
+      2. model_revision          — config.model.revision (default "main")
+      3. tokenizer_revision      — config.model.tokenizer_revision (default model_revision)
+      4. dataset_revisions       — canonical sorted-keys mapping from config
+      5. lm_eval_version         — importlib.metadata.version("lm-eval")
+      6. transformers_version    — importlib.metadata.version("transformers")
+      7. dtype                   — config.model.torch_dtype
+      8. attn_impl               — pinned to "eager" per F-S-M-1
+      9. eval_config_subset      — wikitext2 + zero_shot + generative subdicts
     """
     s6 = config["stage6_validate"]
-    payload = json.dumps({
-        "model_name_or_path": config["model"]["name_or_path"],
-        "model_revision": config["model"].get("revision") or "main",
-        "torch_dtype": config["model"].get("torch_dtype", "bfloat16"),
-        "wikitext2": s6.get("wikitext2", {}),
-        "zero_shot": s6.get("zero_shot", {}),
-        "generative": s6.get("generative", {}),
-    }, sort_keys=True)
-    return hashlib.sha256(payload.encode()).hexdigest()
+    model_cfg = config["model"]
+    model_revision = model_cfg.get("revision") or "main"
+    tokenizer_revision = model_cfg.get("tokenizer_revision") or model_revision
+    dataset_revisions = _resolve_dataset_revisions(config)
+    payload = {
+        "model_name": model_cfg["name_or_path"],
+        "model_revision": model_revision,
+        "tokenizer_revision": tokenizer_revision,
+        "dataset_revisions": dataset_revisions,
+        "lm_eval_version": _safe_pkg_version("lm-eval"),
+        "transformers_version": _safe_pkg_version("transformers"),
+        "dtype": str(model_cfg.get("torch_dtype", "bfloat16")),
+        "attn_impl": _STAGE6_ATTN_IMPLEMENTATION,
+        "eval_config_subset": {
+            "wikitext2": s6.get("wikitext2", {}),
+            "zero_shot": s6.get("zero_shot", {}),
+            "generative": s6.get("generative", {}),
+        },
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# imatrix calibration corpus — WikiText-2 *train* split (F-C-C-1)
+# ---------------------------------------------------------------------------
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically per Spec §11 (tmp → fsync → replace → fsync parent)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_APPEND)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    try:
+        parent_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("_atomic_write_text: parent-dir fsync failed (%s); file already on disk", exc)
+
+
+def _build_imatrix_calibration_corpus(
+    artifacts_dir: Path, dataset_revisions: dict[str, str | None],
+) -> Path | None:
+    """Download WikiText-2 *train* split and write `calibration_wiki_train.txt` atomically.
+
+    Returns the path on success, or None if the dataset cannot be loaded
+    (operator can supply the file out-of-band; imatrix run will be skipped
+    upstream when no calibration file exists).
+    """
+    target = artifacts_dir / _IMATRIX_CALIB_FILENAME
+    if target.exists() and target.stat().st_size > 0:
+        log.info("imatrix calibration: %s already exists — reusing", target)
+        return target
+    try:
+        from datasets import load_dataset
+    except Exception as exc:  # noqa: BLE001
+        log.warning("imatrix calibration: `datasets` not available (%s); skipping corpus build", exc)
+        return None
+    revision = dataset_revisions.get("wikitext_ppl")
+    log.info(
+        "imatrix calibration: downloading Salesforce/wikitext (wikitext-2-raw-v1, train, revision=%s)",
+        revision,
+    )
+    try:
+        ds = load_dataset(
+            "Salesforce/wikitext", "wikitext-2-raw-v1",
+            split="train", revision=revision,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("imatrix calibration: load_dataset(train) failed (%s); skipping corpus build", exc)
+        return None
+    rows = []
+    for row in ds:
+        text = row.get("text", "")
+        if text and text.strip():
+            rows.append(text)
+    joined = "\n".join(rows)
+    if not joined.strip():
+        log.warning("imatrix calibration: WikiText-2 train split is empty after filtering; skipping write")
+        return None
+    _atomic_write_text(target, joined)
+    log.info("imatrix calibration: wrote %s (%d rows, %d chars)", target, len(rows), len(joined))
+    return target
 
 
 def _load_teacher_cache(cache_path: Path, cache_key: str) -> dict | None:
@@ -190,7 +382,17 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     model.eval()   # stage5 leaves model in train(); set eval before any sub-metric
     results: dict = {"student": {}, "teacher": {}, "delta": {}, "thresholds": {}}
 
-    calib_texts: list[str] = []  # accumulates eval text for imatrix calibration
+    # F-C-H-3: enforce strict revision pinning early — fail fast on a misconfigured
+    # production run rather than after expensive teacher loads / evals.
+    dataset_revisions = _enforce_revision_pinning(config)
+
+    # F-C-C-1: build the imatrix calibration corpus from WikiText-2 *train* split,
+    # written to artifacts_dir/calibration_wiki_train.txt. The eval-text concat
+    # below is captured separately as a debug side-channel only — it is NOT used
+    # by imatrix anymore (Spec §9 mandate).
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    imatrix_calib_path = _build_imatrix_calibration_corpus(artifacts_dir, dataset_revisions)
+    eval_text_concat: list[str] = []  # debug side-channel only — see eval_text_concat.txt
 
     # Optimization #5: torch.compile for prefill-dominant paths.
     # Compile model.forward before evaluations begin; model.generate also benefits
@@ -216,8 +418,8 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     if s6["wikitext2"]["enabled"]:
         log.info("Stage 6: WikiText-2 PPL (student), batch_size=%d", int(ppl_batch_size))
         results["student"]["wikitext2_ppl"] = _wikitext2_ppl(
-            model, tokenizer, s6["wikitext2"], device=device, collect=calib_texts,
-            batch_size=ppl_batch_size,
+            model, tokenizer, s6["wikitext2"], device=device, collect=eval_text_concat,
+            batch_size=ppl_batch_size, dataset_revisions=dataset_revisions,
         )
 
     # 2. Zero-shot via lm-eval (ARC-C + HellaSwag) (Optimization #2: batch_size=auto:8)
@@ -225,7 +427,7 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
         log.info("Stage 6: zero-shot harness, batch_size=%s", lm_eval_batch_size)
         results["student"].update(
             _lm_eval_tasks(model, tokenizer, s6["zero_shot"]["tasks"],
-                           collect=calib_texts, batch_size=lm_eval_batch_size)
+                           collect=eval_text_concat, batch_size=lm_eval_batch_size)
         )
 
     # Optimization #6: Begin preloading teacher weights to host RAM in a background
@@ -259,12 +461,14 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
         if "humaneval" in s6["generative"]:
             results["student"]["humaneval_pass_at_1"] = _humaneval(
                 model, tokenizer, s6["generative"]["humaneval"], device=device,
-                collect=calib_texts, batch_size=gen_batch_size,
+                collect=eval_text_concat, batch_size=gen_batch_size,
+                dataset_revisions=dataset_revisions,
             )
         if "math500" in s6["generative"]:
             results["student"]["math500_accuracy"] = _math500(
                 model, tokenizer, s6["generative"]["math500"], device=device,
-                collect=calib_texts, batch_size=gen_batch_size,
+                collect=eval_text_concat, batch_size=gen_batch_size,
+                dataset_revisions=dataset_revisions,
             )
 
     # 4. Snapshot student param counts BEFORE loading teacher.
@@ -311,13 +515,18 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             teacher.to(device or "cuda")
         else:
             # Preload failed or wasn't started — load directly.
-            log.info("Stage 6: loading uncompressed baseline for delta computation")
+            # F-C-H-1: pin attn_implementation="eager" per Spec F-S-M-1 regardless of config.
+            log.info(
+                "Stage 6: loading uncompressed baseline for delta computation "
+                "(attn_implementation=%r forced per spec F-S-M-1)",
+                _STAGE6_ATTN_IMPLEMENTATION,
+            )
             teacher, _ = load_model(
                 config["model"]["name_or_path"],
                 revision=config["model"].get("revision", "main"),
                 torch_dtype=config["model"]["torch_dtype"],
                 device_map=config["model"]["device_map"],
-                attn_implementation=config["model"]["attn_implementation"],
+                attn_implementation=_STAGE6_ATTN_IMPLEMENTATION,
                 load_in_4bit=config["model"].get("load_in_4bit", False),
                 trust_remote_code=config["model"].get("trust_remote_code", False),
             )
@@ -347,7 +556,7 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
         if s6["wikitext2"]["enabled"]:
             results["teacher"]["wikitext2_ppl"] = _wikitext2_ppl(
                 teacher, tokenizer, s6["wikitext2"], device=device,
-                batch_size=ppl_batch_size,
+                batch_size=ppl_batch_size, dataset_revisions=dataset_revisions,
             )
         if s6["zero_shot"]["enabled"]:
             results["teacher"].update(
@@ -358,12 +567,12 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             if "humaneval" in s6["generative"]:
                 results["teacher"]["humaneval_pass_at_1"] = _humaneval(
                     teacher, tokenizer, s6["generative"]["humaneval"], device=device,
-                    batch_size=gen_batch_size,
+                    batch_size=gen_batch_size, dataset_revisions=dataset_revisions,
                 )
             if "math500" in s6["generative"]:
                 results["teacher"]["math500_accuracy"] = _math500(
                     teacher, tokenizer, s6["generative"]["math500"], device=device,
-                    batch_size=gen_batch_size,
+                    batch_size=gen_batch_size, dataset_revisions=dataset_revisions,
                 )
 
         # Save teacher results to cache for future runs.
@@ -424,7 +633,7 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     f16_path = None if gguf_thread_timed_out else gguf_result.get("f16_path")
     if cached_teacher_results is None and f16_path is not None:
         _run_llama_imatrix_with_prebuilt_gguf(
-            calib_texts, s6.get("imatrix", {}), artifacts_dir, gguf_result,
+            eval_text_concat, s6.get("imatrix", {}), artifacts_dir, gguf_result,
         )
     else:
         # This else covers two sub-cases:
@@ -437,7 +646,7 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
         #       _generate_imatrix will retry the full GGUF + imatrix pipeline.
         # In both cases _generate_imatrix's internal `enabled` guard ensures we do
         # nothing unnecessary when imatrix is disabled in config.
-        _generate_imatrix(calib_texts, s6.get("imatrix", {}), artifacts_dir)
+        _generate_imatrix(eval_text_concat, s6.get("imatrix", {}), artifacts_dir)
 
     # Only boolean entries in thresholds count toward overall_pass; skipped_checks is a dict.
     _bool_checks = {k: v for k, v in results["thresholds"].items() if isinstance(v, bool)}
@@ -459,6 +668,11 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
                 flat[f"stage6/{side}/{k}"] = float(v)
             except (TypeError, ValueError):
                 pass
+    # F-C-L-1: surface _non_finite_skipped sentinel keys as a single counter
+    # so the dashboard sees the failure-mode signal. _deltas writes these as
+    # *list* values (NOT dicts), so they are skipped by the per-metric triple
+    # block above and would otherwise be invisible on Trackio.
+    non_finite_count = 0
     for k, triple in results.get("delta", {}).items():
         if isinstance(triple, dict):
             for sub in ("student", "teacher", "delta"):
@@ -467,6 +681,9 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
                         flat[f"stage6/delta/{k}/{sub}"] = float(triple[sub])
                     except (TypeError, ValueError):
                         pass
+        elif isinstance(triple, list) and k in ("_non_finite_skipped", "_teacher_non_finite_skipped"):
+            non_finite_count += len(triple)
+    flat["stage6/non_finite_count"] = float(non_finite_count)
     for k, v in results.get("measured_reduction", {}).items():
         try:
             flat[f"stage6/measured_reduction/{k}"] = float(v)
@@ -495,14 +712,18 @@ def _preload_teacher_to_cpu(config: dict, result_q: queue.Queue) -> None:
         )
         return  # get_nowait() will return None → main thread does direct load
     try:
-        log.info("Teacher preload: loading %s to CPU...", config["model"]["name_or_path"])
+        # F-C-H-1: attn_implementation="eager" pinned per Spec F-S-M-1.
+        log.info(
+            "Teacher preload: loading %s to CPU (attn_implementation=%r forced per spec F-S-M-1)...",
+            config["model"]["name_or_path"], _STAGE6_ATTN_IMPLEMENTATION,
+        )
         t0 = time.monotonic()
         teacher, _ = load_model(
             config["model"]["name_or_path"],
             revision=config["model"].get("revision", "main"),
             torch_dtype=config["model"]["torch_dtype"],
             device_map="cpu",
-            attn_implementation=config["model"]["attn_implementation"],
+            attn_implementation=_STAGE6_ATTN_IMPLEMENTATION,
             load_in_4bit=config["model"].get("load_in_4bit", False),
             trust_remote_code=config["model"].get("trust_remote_code", False),
         )
@@ -589,48 +810,55 @@ def _background_gguf_convert(icfg: dict, artifacts_dir: Path, result: dict) -> N
         return
 
 
-def _run_llama_imatrix_with_prebuilt_gguf(
-    texts: list[str], icfg: dict, artifacts_dir: Path, gguf_result: dict,
-) -> None:
-    """Run llama-imatrix using the pre-built F16 GGUF from background thread."""
-    joined = "\n\n".join(t.strip() for t in texts if t and t.strip())
-    calib_path = artifacts_dir / "calibration_imatrix.txt"
+def _write_eval_text_concat(texts: list[str], artifacts_dir: Path) -> Path:
+    """Write the eval-text concat (debug side-channel) atomically.
 
-    # Spec §9 Artifacts: calibration_imatrix.txt must ALWAYS be written (usable
-    # even without llama.cpp).  Write it atomically before any guard so that
-    # imatrix.enabled=False or a missing GGUF/llama.cpp installation does not
-    # suppress the file.  _generate_imatrix (fallback path) also writes it
-    # atomically, so a double-write is idempotent and safe.
-    # Spec §11: write to .tmp → fsync .tmp → os.replace → fsync parent dir.
-    # F-1: Write unconditionally — even when joined is empty — so the artifact
-    # is always present as required by the spec.
-    calib_tmp = calib_path.with_suffix(".tmp")
-    calib_tmp.write_text(joined, encoding="utf-8")
-    fd = os.open(str(calib_tmp), os.O_WRONLY | os.O_APPEND)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(calib_tmp, calib_path)
-    parent_fd = os.open(str(calib_path.parent), os.O_RDONLY)
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
-    log.info("imatrix: calibration file written (%d docs, %d chars) → %s",
-             len(texts), len(joined), calib_path)
+    F-C-C-1: this file is the concatenation of every prompt seen by the model
+    during PPL/zero-shot/generative evals. It is NOT the imatrix calibration
+    corpus — that is `calibration_wiki_train.txt` per Spec §9.
+    """
+    path = artifacts_dir / _EVAL_TEXT_CONCAT_FILENAME
+    joined = "\n\n".join(t.strip() for t in texts if t and t.strip())
+    _atomic_write_text(path, joined)
+    log.info(
+        "eval_text_concat: %d docs (%d chars) → %s (debug only — not used by imatrix)",
+        len(texts), len(joined), path,
+    )
+    return path
+
+
+def _run_llama_imatrix_with_prebuilt_gguf(
+    eval_text_concat: list[str], icfg: dict, artifacts_dir: Path, gguf_result: dict,
+) -> None:
+    """Run llama-imatrix using the pre-built F16 GGUF from background thread.
+
+    F-C-C-1: imatrix calibration corpus is the WikiText-2 *train* split
+    (calibration_wiki_train.txt). The eval_text_concat list captured during
+    PPL/zero-shot/generative evals is written as a debugging side-channel
+    (eval_text_concat.txt) but is NOT used by llama-imatrix.
+    """
+    # Always write eval_text_concat.txt as a debug artifact.
+    _write_eval_text_concat(eval_text_concat, artifacts_dir)
 
     if not icfg.get("enabled", True):
         return
 
-    if not joined.strip():
-        log.warning("No calibration texts available; skipping imatrix generation.")
+    # F-C-C-1: imatrix calibration source is the WikiText-2 *train* split.
+    calib_path = artifacts_dir / _IMATRIX_CALIB_FILENAME
+    if not calib_path.exists() or calib_path.stat().st_size == 0:
+        log.warning(
+            "imatrix: calibration corpus %s missing/empty; skipping imatrix generation. "
+            "Spec §9 requires this file (WikiText-2 train split). "
+            "It is built automatically at the top of run() — check the earlier warning "
+            "from _build_imatrix_calibration_corpus.",
+            calib_path,
+        )
         return
 
     f16_path = gguf_result.get("f16_path")
     if f16_path is None or not f16_path.exists():
         log.warning("imatrix: pre-built GGUF not available — falling back to full pipeline")
-        _generate_imatrix(texts, icfg, artifacts_dir)
+        _generate_imatrix(eval_text_concat, icfg, artifacts_dir)
         return
 
     llama_cpp_dir = _find_llama_cpp_dir(icfg.get("llama_cpp_dir"))
@@ -684,18 +912,22 @@ def _run_llama_imatrix_with_prebuilt_gguf(
 
 
 def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
-                   batch_size: int = 8) -> float:
+                   batch_size: int = 8,
+                   dataset_revisions: dict[str, str | None] | None = None) -> float:
     """Standard next-token NLL → exp(mean_NLL), seq_len=2048.
 
     Batching doesn't change NLL computation — each sequence is scored
     independently; out.loss is the mean over tokens in each batch element,
     and we scale by (batch.numel() - batch.shape[0]) to recover the sum.
     Numerically identical to batch_size=1.
+
+    F-C-H-3: pass revision= to load_dataset when a pinned SHA is configured.
     """
     from datasets import load_dataset
 
+    revision = (dataset_revisions or {}).get("wikitext_ppl")
     try:
-        ds = load_dataset(cfg["dataset"], cfg["subset"], split=cfg["split"])
+        ds = load_dataset(cfg["dataset"], cfg["subset"], split=cfg["split"], revision=revision)
     except Exception as exc:
         log.warning("_wikitext2_ppl: load_dataset failed (%s); returning inf PPL", exc)
         return float("inf")
@@ -929,14 +1161,16 @@ def _generate_batched(model, tokenizer, prompts: list[str], *, max_new: int,
 
 
 def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None,
-               batch_size: int = 8) -> float:
+               batch_size: int = 8,
+               dataset_revisions: dict[str, str | None] | None = None) -> float:
     try:
         from datasets import load_dataset
     except Exception as err:           # noqa: BLE001
         log.warning("datasets not available (%s); skipping HumanEval.", err)
         return float("nan")
+    revision = (dataset_revisions or {}).get("humaneval")
     try:
-        ds = load_dataset("openai_humaneval", split="test")
+        ds = load_dataset("openai_humaneval", split="test", revision=revision)
     except Exception as err:           # noqa: BLE001
         log.warning("HumanEval dataset load failed (%s); skipping.", err)
         return float("nan")
@@ -994,14 +1228,16 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None,
 
 
 def _math500(model, tokenizer, cfg: dict, *, device=None, collect=None,
-             batch_size: int = 8) -> float:
+             batch_size: int = 8,
+             dataset_revisions: dict[str, str | None] | None = None) -> float:
     try:
         from datasets import load_dataset
     except Exception as err:           # noqa: BLE001
         log.warning("datasets not available (%s); skipping MATH-500.", err)
         return float("nan")
+    revision = (dataset_revisions or {}).get("math500")
     try:
-        ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        ds = load_dataset("HuggingFaceH4/MATH-500", split="test", revision=revision)
     except Exception as err:           # noqa: BLE001
         log.warning("MATH-500 dataset load failed (%s); skipping.", err)
         return float("nan")
@@ -1251,12 +1487,13 @@ def _measured_reduction(
                     "device_map='cpu'; loading in full precision."
                 )
                 _load_in_4bit = False
+            # F-C-H-1: attn_implementation="eager" pinned per Spec F-S-M-1.
             teacher_tmp, _ = load_model(
                 config["model"]["name_or_path"],
                 revision=config["model"].get("revision", "main"),
                 torch_dtype=config["model"]["torch_dtype"],
                 device_map="cpu",
-                attn_implementation=config["model"]["attn_implementation"],
+                attn_implementation=_STAGE6_ATTN_IMPLEMENTATION,
                 load_in_4bit=_load_in_4bit,
                 trust_remote_code=config["model"].get("trust_remote_code", False),
             )
@@ -1310,38 +1547,27 @@ def _measured_reduction(
 # ---------------------------------------------------------------------------
 
 
-def _generate_imatrix(texts: list[str], icfg: dict, artifacts_dir: Path) -> None:
-    calib_path = artifacts_dir / "calibration_imatrix.txt"
-    joined = "\n\n".join(t.strip() for t in texts if t and t.strip())
+def _generate_imatrix(eval_text_concat: list[str], icfg: dict, artifacts_dir: Path) -> None:
+    """Sequential GGUF + llama-imatrix fallback path.
 
-    # Spec §9 Artifacts: calibration_imatrix.txt must ALWAYS be written (usable
-    # even without llama.cpp), before the enabled guard so that
-    # imatrix.enabled=False does not suppress the file.
-    # Spec §11: write to .tmp → fsync .tmp → os.replace → fsync parent dir.
-    # F-1: Write unconditionally — even when joined is empty — so the artifact
-    # is always present as required by the spec.
-    calib_tmp = calib_path.with_suffix(".tmp")
-    calib_tmp.write_text(joined, encoding="utf-8")
-    fd = os.open(str(calib_tmp), os.O_WRONLY | os.O_APPEND)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(calib_tmp, calib_path)
-    parent_fd = os.open(str(calib_path.parent), os.O_RDONLY)
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
-    log.info("imatrix: calibration file written (%d docs, %d chars) → %s",
-             len(texts), len(joined), calib_path)
+    F-C-C-1: imatrix calibration corpus is `calibration_wiki_train.txt` (the
+    WikiText-2 train split written at the top of run()). The eval_text_concat
+    list captured during evals is written as a debug-only side-channel.
+    """
+    # Always write the eval-text concat as a debug artifact, regardless of imatrix enable.
+    _write_eval_text_concat(eval_text_concat, artifacts_dir)
 
     if not icfg.get("enabled", True):
         log.info("imatrix: disabled via config.")
         return
 
-    if not joined.strip():
-        log.warning("No calibration texts available; skipping imatrix generation.")
+    calib_path = artifacts_dir / _IMATRIX_CALIB_FILENAME
+    if not calib_path.exists() or calib_path.stat().st_size == 0:
+        log.warning(
+            "imatrix: calibration corpus %s missing/empty; skipping imatrix generation. "
+            "Spec §9 requires this file (WikiText-2 train split).",
+            calib_path,
+        )
         return
 
     llama_cpp_dir = _find_llama_cpp_dir(icfg.get("llama_cpp_dir"))

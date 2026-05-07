@@ -6,12 +6,15 @@
 model:
   name_or_path: Qwen/Qwen3.6-35B-A3B
   revision: main
+  tokenizer_revision: main        # F-C-C-2: pinned tokenizer revision (component of teacher cache key)
   torch_dtype: bfloat16
   trust_remote_code: false        # transformers>=5.3 has native qwen3_5_moe
   # For the 16 GB local smoke runs: switch these on in a sibling config.
   load_in_4bit: false
   device_map: auto                # uses accelerate; on H200 everything fits on 1 GPU
   attn_implementation: sdpa       # DeltaNet layers ignore this; full_attention uses it
+                                  # NOTE: Stage 6 forces attn_implementation="eager" (spec F-S-M-1)
+                                  # for both teacher + student during the gate run regardless of this.
 
 target:
   # Total parameter reduction (measured, not estimated) the pipeline must hit.
@@ -202,10 +205,20 @@ stage6_validate:
   #
   wikitext2:
     enabled: true
-    dataset: wikitext
+    dataset: Salesforce/wikitext        # F-C-H-2: namespaced id pinned by Spec §9.
     subset: wikitext-2-raw-v1
     split: test
     sequence_length: 2048
+  # F-C-H-3: per-dataset revision pinning (Spec §9). When strict_revision_pinning
+  # is true (default), the run aborts if any value is null. Replace the placeholders
+  # below with the actual HF dataset revision SHAs before a production run.
+  strict_revision_pinning: true
+  dataset_revisions:
+    wikitext_ppl:    null   # Salesforce/wikitext (wikitext-2-raw-v1) — used by _wikitext2_ppl AND imatrix calibration corpus (train split)
+    hellaswag:       null   # used internally by lm-eval — pin via lm-eval task config or set null + accept lm-eval default
+    arc_challenge:   null   # used internally by lm-eval — pin via lm-eval task config or set null + accept lm-eval default
+    humaneval:       null   # openai_humaneval
+    math500:         null   # HuggingFaceH4/MATH-500
   zero_shot:
     enabled: true
     tasks: [arc_challenge, hellaswag]
