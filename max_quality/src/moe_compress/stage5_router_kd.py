@@ -406,6 +406,26 @@ def run(
             trailing, grad_accum,
         )
 
+    # Spec D-protocol-blend / §8: when running multi-epoch KD with a
+    # multi-epoch teacher-logits cache, the teacher cache index advances
+    # as (epoch * len(batches) + i), so the same student input batch IDs
+    # would be paired with *different* teacher logits across epochs unless
+    # the teacher cache was generated against a fresh-per-epoch input
+    # ordering. Refuse multi-epoch + cache combinations that we cannot
+    # verify produce a consistent input-vs-logit pairing. (Single-epoch
+    # default config is the canonical path; multi-epoch caches require a
+    # pre-shuffled cache aligned to a deterministic per-epoch input order
+    # the spec does not currently formalize.)
+    if int(s5["epochs"]) > 1 and teacher_logits_cache is not None:
+        raise RuntimeError(
+            f"Stage 5: multi-epoch training (epochs={s5['epochs']}) with "
+            "teacher_logits_cache is not supported — calibration batches are "
+            "produced once and replayed identically across epochs, but the "
+            "cache index advances per (epoch, batch), creating a teacher/"
+            "student input mismatch in epochs ≥ 2. Either set epochs=1 or "
+            "regenerate the cache against a deterministic per-epoch shuffle "
+            "schedule that this code path also applies."
+        )
     step = resume_step
     optim.zero_grad()
     for epoch in range(s5["epochs"]):

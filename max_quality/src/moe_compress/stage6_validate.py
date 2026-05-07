@@ -748,6 +748,19 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             pass
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    else:
+        # Cache-HIT path — teacher was never loaded, so the student is the
+        # only resident model. llama-imatrix will load the F16 GGUF onto the
+        # same GPU; on a 35B-class model this would push GPU residency to
+        # ~140 GB and risk OOM on H200. Move the student to CPU here so the
+        # imatrix subprocess has the GPU to itself, mirroring the non-cache
+        # path's free-before-imatrix discipline.
+        try:
+            model.to("cpu")
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     log.info("Stage 6: starting post-eval imatrix pipeline")
     # Optimization #8: If GGUF conversion was running in background, wait for it.
