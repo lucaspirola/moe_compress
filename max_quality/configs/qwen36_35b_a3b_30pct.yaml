@@ -87,6 +87,38 @@ stage2_reap_ream:
     # combined cost to the unweighted mean (δ_gate + δ̃_expert)/2; per-component
     # weights are not implemented in code and would silently no-op if set.
     frequency_weighted_merge: true
+  # ---- Stage 2 v2 revision (max_quality/docs/stage2_assignment_revision.md) ----
+  # All flags below default to baseline (greedy/pre/none/false/0); flipping
+  # them on activates the new cost-matrix + EM + distillation machinery.
+  # With every flag at baseline, Stage 2 output is bit-identical to v1.
+  # Solver dispatch (M7, P1):
+  assignment_solver: "greedy"      # "greedy" (legacy) | "hungarian" | "mcf" | "auto" | "sinkhorn"
+                                   # auto: hungarian when n_NC ≤ N'_l, else mcf
+                                   # sinkhorn: Tier 3 / M9, capacitated entropy-regularized OT
+  # Sinkhorn knobs (only used when assignment_solver == "sinkhorn"):
+  sinkhorn_epsilon_init: 1.0
+  sinkhorn_epsilon_final: 0.01
+  sinkhorn_iters: 200
+  # Cost matrix variants (M1, M2, P3-asymmetric):
+  cost_alignment: "pre"            # "pre" (current δ_REAM) | "post" (Hungarian-aligned whitened residual)
+  cost_whitening: "none"           # "none" | "diag" | "full" (eigen-sqrt; AA-SVD lineage)
+  cost_asymmetric: false           # multiply by freq_m / (freq_c + freq_m); valid only under freq-weighted merge
+  cost_topk_filter: 48             # K candidates per non-centroid for cost_alignment="post"
+  # Per-layer regime gate (M3):
+  capacity_util_threshold: 0.25    # u < this → SLACK path (cheap symmetric δ_REAM); >= this → TIGHT path
+  # EM refinement (M4):
+  em_refinement_rounds: 0          # 0 disables; Tier 2 default 3 (set after ablation)
+  em_convergence_break: true       # stop early when assignment stops changing
+  # Per-expert distillation (M8 / Tier 1):
+  expert_distill_steps: 0          # 0 disables; Tier 1 default 500 MSE steps per merged group
+  expert_distill_lr: 1.0e-4
+  expert_distill_betas: [0.9, 0.95]
+  expert_distill_token_cap: 8192
+  expert_distill_skip_singletons: true
+  expert_distill_loss_plateau_steps: 50
+  expert_distill_loss_plateau_eps: 1.0e-4
+  expert_distill_parallel_groups: 1
+  expert_distill_optimizer_dtype: "fp32"
 
 stage3_svd:
   scope: moe_experts_only         # NEVER change; attention SVD is off-spec
