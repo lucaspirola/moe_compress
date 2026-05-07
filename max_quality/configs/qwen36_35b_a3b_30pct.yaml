@@ -83,8 +83,9 @@ stage2_reap_ream:
                                   # inactive for first 4 freshly-processed layers (bootstrap guard)
   ream_cost_bump_ratio: 0.10      # bump amount = ceil(target * ratio) when cost gate triggers
   ream:
-    gate_weight: 1.0              # weight on δ_gate in combined cost
-    expert_weight: 1.0            # weight on δ̃_expert
+    # gate_weight / expert_weight removed — D-ream-aggregation pins the
+    # combined cost to the unweighted mean (δ_gate + δ̃_expert)/2; per-component
+    # weights are not implemented in code and would silently no-op if set.
     frequency_weighted_merge: true
 
 stage3_svd:

@@ -942,10 +942,11 @@ def _grape_greedy_merge(
         # is absorbed we must remove its full contribution: D_l[j_star, k] and
         # D_l[k, j_star] for all k. Read the full row/column sum BEFORE zeroing
         # so that D_l[i_star, j_star] / D_l[j_star, i_star] are still included.
-        j_contribution = float(D_l[j_star, :].sum() + D_l[:, j_star].sum())
-        # The diagonal D_l[j_star, j_star] is double-counted but always zero,
-        # so result is exact.
-        # Diagonal is 0 by construction: torch.zeros init + CKA/MSE metrics produce dist(x,x)=0.
+        # Defensively subtract the (always-zero) diagonal once so the formula is
+        # robust if any future metric ever yielded a non-zero self-distance.
+        j_contribution = float(
+            D_l[j_star, :].sum() + D_l[:, j_star].sum() - D_l[j_star, j_star]
+        )
         R[best_layer] -= j_contribution
         pre_clamp_R = R[best_layer]
         R[best_layer] = max(0.0, pre_clamp_R)

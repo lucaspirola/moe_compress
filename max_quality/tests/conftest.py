@@ -213,7 +213,6 @@ def tiny_config():
             "ream_cost_sigma_threshold": float("inf"),
             "ream_cost_bump_ratio": 0.10,
             "ream": {
-                "gate_weight": 1.0, "expert_weight": 1.0,
                 "hungarian": True, "frequency_weighted_merge": True,
             },
         },
