@@ -568,7 +568,11 @@ def run(
 
             # Chunked KL to bound peak memory: at |V|≈150K with B=4, chunk=128,
             # peak intermediate is ~300 MB vs ~1.2 GB for the full sequence.
-            seq_chunk = int(s5.get("kd_seq_chunk_size", 128))
+            # Spec §8 hyperparameter table pins kd_seq_chunk_size=512 on H200
+            # (full sequence length — single-shot KL, no chunk loop). Default
+            # to 512 here so a missing config can't degrade to a non-spec
+            # chunked loop.
+            seq_chunk = int(s5.get("kd_seq_chunk_size", 512))
             loss = _chunked_vocab_kl(s_logits_shift, t_logits_shift, T, chunk_size=seq_chunk)
 
             window_loss_acc.append(loss.detach())

@@ -1193,12 +1193,17 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
         )
         return float("inf")
     if skipped_batches > 0:
-        # Only fire the partial-skip warning when at least some batches succeeded.
-        log.warning(
-            "_wikitext2_ppl: %d/%d batches were skipped; PPL computed over %.1f%% of batches",
+        # Spec §9 PPL formula is over ALL retained chunks (drop-last-partial only).
+        # A runtime skip would silently change the reported PPL's domain, so a
+        # gating decision could pass on a partially-broken student. Force inf
+        # to fail the gate rather than report a sub-corpus PPL.
+        log.error(
+            "_wikitext2_ppl: %d/%d batches were skipped (non-finite loss or runtime error); "
+            "spec §9 mandates PPL over the full retained-chunk corpus — returning inf to "
+            "fail the gate rather than report a sub-corpus PPL.",
             skipped_batches, total_batches,
-            100.0 * (total_batches - skipped_batches) / max(1, total_batches),
         )
+        return float("inf")
     try:
         return math.exp(nll_sum / tok_count)
     except OverflowError:
@@ -1468,6 +1473,15 @@ def _math500(model, tokenizer, cfg: dict, *, device=None, collect=None,
             n, len(ds), len(ds),
         )
     n_total = min(n, len(ds))
+    # Spec §9 mandates "MATH-500 (500 prompts)" — the gate is computed over
+    # the full benchmark, not a subset. Refuse to under-sample silently.
+    if n_total < len(ds):
+        raise ValueError(
+            f"MATH-500: configured num_samples={n} produces n_total={n_total} but "
+            f"the spec gate requires all {len(ds)} prompts. Either set "
+            "generative.math500.num_samples=500 (or omit) or update the spec to "
+            "permit subset evaluation."
+        )
 
     selected = ds.select(range(n_total))
     prompts = [f"Problem: {row['problem']}\nAnswer:" for row in selected]
