@@ -162,7 +162,20 @@ class ReamCostAccumulator:
     def record_gated_output(self, layer_idx: int, expert_idx: int,
                             gate_weights: torch.Tensor, expert_output: torch.Tensor,
                             token_indices: torch.Tensor, batch_offset: int) -> None:
-        """Record gated expert output σ(x)_e * E_e(x) keyed by global token index."""
+        """Record gated expert output σ(x)_e * E_e(x) keyed by global token index.
+
+        IMPORTANT: ``gate_weights`` MUST be the un-renormalized full softmax
+        σ(x)_e at the active token positions for expert ``expert_idx``, NOT the
+        top-k renormalized weights (which sum to 1 over the top-k experts).
+        Spec §5 line 339 + D-ream-sparse-routing require the full softmax over
+        ALL experts so that δ̃_expert(i,j) reflects σ(x)_i · σ(x)_j cosine
+        similarity, not (top_k_w_i / Σ_top_k) · (top_k_w_j / Σ_top_k).
+
+        Stage 2 callers compute this via ``F.softmax(router_logits, dim=-1)``
+        over the full router-logits tensor and index the resulting [T, E]
+        matrix at ``[token_idx, expert_idx]`` to obtain the per-token σ(x)_e
+        values for the dispatched expert.
+        """
         if self.num_experts > 0 and (expert_idx < 0 or expert_idx >= self.num_experts):
             log.warning(
                 "record_gated_output: expert_idx %d out of range [0, %d)",
