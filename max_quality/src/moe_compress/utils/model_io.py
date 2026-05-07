@@ -972,6 +972,57 @@ def count_parameters(model: nn.Module, *, trainable_only: bool = False) -> int:
     return total
 
 
+def count_parameters_effective(model: nn.Module) -> int:
+    """Effective live parameter count, honoring FactoredExperts effective ranks.
+
+    Spec §9 line 785 (live_param_count): FactoredExperts U/V factors must be
+    counted at their per-expert *effective* ranks rather than the padded slot
+    width allocated by ``ranks``. Padded zero columns (introduced by AA-SVD's
+    ``k_eff < k`` and EoRA's ``widen_rank``) are not real parameters.
+
+    Iteration policy:
+      * For each FactoredExperts module, sum
+        ``effective_ranks[name][i] * (d_out + d_in)`` across experts and the
+        three projections (gate / up / down). The factored experts' own
+        ``nn.Parameter`` tensors (gate_proj_U/V, up_proj_U/V, down_proj_U/V)
+        are NOT visited via ``parameters(recurse=False)`` because they would
+        contribute the padded count.
+      * For every other module, sum ``numel()`` of its *direct* parameters
+        only (``module.parameters(recurse=False)``) so children are counted
+        exactly once when the outer ``modules()`` walk reaches them.
+
+    For a model with no FactoredExperts modules this returns the same value
+    as ``count_parameters(model)`` (every parameter belongs to exactly one
+    module via the recurse=False direct-children policy).
+    """
+    total = 0
+    seen_param_ids: set[int] = set()
+    for module in model.modules():
+        if isinstance(module, FactoredExperts):
+            # Effective count via per-expert ranks; skip the padded U/V tensors.
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                d_out, d_in = module.matrix_shape(name)
+                eff_per_expert = module.effective_ranks.get(
+                    name, [module.ranks[name]] * module.num_experts,
+                )
+                eff_sum = sum(int(r) for r in eff_per_expert)
+                total += (d_out + d_in) * eff_sum
+            # Mark the FactoredExperts U/V padded tensors as "already accounted
+            # for" so a parent module that happens to reach them via parameter
+            # sharing (none expected) wouldn't double-count.
+            for p in module.parameters(recurse=False):
+                seen_param_ids.add(id(p))
+            continue
+        # Non-FactoredExperts: sum direct (recurse=False) parameters once.
+        for p in module.parameters(recurse=False):
+            pid = id(p)
+            if pid in seen_param_ids:
+                continue
+            seen_param_ids.add(pid)
+            total += p.numel()
+    return total
+
+
 def count_expert_parameters(model: nn.Module, *, routed_only: bool = True) -> int:
     """Parameters inside the routed-experts banks we plan to compress.
 

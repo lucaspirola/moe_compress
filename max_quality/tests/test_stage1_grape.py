@@ -138,6 +138,89 @@ def test_ma_formation_fallback_when_dynamic_empty(tiny_model, tiny_config, tmp_p
     )
 
 
+def test_blacklist_inner_config_keys(tiny_model, tiny_config, tmp_path):
+    """stage1_blacklist.json['config'] inner block must pin exactly these 7 keys.
+
+    Locks the spec §4 Phase C config schema so a future addition/removal is caught here
+    rather than silently broken by downstream consumers (regression for code-vs-spec L-2).
+    """
+    decomp = BudgetDecomposition(
+        total_reduction_ratio=0.20,
+        expert_prune_ratio=0.25,
+        svd_rank_ratio=0.0,
+        global_expert_budget=5,
+        min_experts_per_layer=2,
+        blacklisted_experts={},
+    )
+    stage1_grape.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
+
+    bl = json.loads((tmp_path / "stage1_blacklist.json").read_text())
+    expected_keys = {
+        "a_max_fraction",
+        "ma_ratio",
+        "ma_growth_ratio",
+        "ma_formation_layers",
+        "p995_threshold",
+        "a_max_absolute",
+        "a_max_threshold",
+    }
+    assert set(bl["config"].keys()) == expected_keys, (
+        f"stage1_blacklist.json['config'] keys drift: "
+        f"got {set(bl['config'].keys())}, expected {expected_keys}"
+    )
+
+
+def test_grape_greedy_merge_with_se_blacklist():
+    """D-se-blacklist-merge contract (regression for code-vs-spec N-2).
+
+    With a non-empty SE blacklist, _grape_greedy_merge must:
+      (a) zero blacklisted rows/cols in D_work (so SEs never become i_star/j_star),
+      (b) compute effective_budget = global_budget − total_SEs (subtract SE slots),
+      (c) reduce per-layer floor by |SE_l| (floor applied to non-SE pool only).
+
+    Build a 2-layer setup with N=4 experts each, blacklist {0:[1,2]}, and pick a
+    global_budget that forces some merges so we can observe the contract.
+    """
+    n = 4
+    # Layer 0: experts 0 and 3 are non-blacklisted; experts 1 and 2 are SE.
+    # Make non-SE pair (0, 3) the most similar so merge selects j_star = 3 (or 0).
+    D0 = torch.full((n, n), 0.9, dtype=torch.float32)
+    D0[0, 3] = D0[3, 0] = 0.05  # very similar non-SE pair
+    D0.fill_diagonal_(0.0)
+    # Layer 1: all distances roughly equal; only one merge should happen here.
+    D1 = torch.full((n, n), 0.6, dtype=torch.float32)
+    D1.fill_diagonal_(0.0)
+
+    blacklist = {0: [1, 2]}
+    per_layer_counts = {0: n, 1: n}
+    # global_budget counts TOTAL surviving experts including blacklisted; pick 6
+    # so effective_budget = 6 − 2 = 4 → must drop from (4-2)+4 = 6 to 4 non-bl.
+    # Per-layer floors: layer 0 → max(4//2 − 2, 0) = 0; layer 1 → max(4//2 − 0, 0) = 2.
+    budgets = stage1_grape._grape_greedy_merge(
+        D_matrices={0: D0, 1: D1},
+        global_budget=6,
+        per_layer_counts=per_layer_counts,
+        blacklist=blacklist,
+        gamma=1.0,  # disable entropy gate so the merge actually proceeds
+    )
+
+    # (a) SE rows/cols zeroed: SEs (1, 2) must NOT have been selected as j_star.
+    #     Survivors include SEs unconditionally; total surviving in each layer ≥ |SE_l|.
+    assert budgets[0] >= 2, f"layer 0 must keep both SEs; got {budgets[0]}"
+
+    # (b) Total surviving experts must equal effective_budget + total_SEs = 4 + 2 = 6.
+    #     But achieved may be larger if floors block — verify it's at least met from non-SE side.
+    total_surviving = sum(budgets.values())
+    assert total_surviving == 6, (
+        f"sum(budgets)={total_surviving} but global_budget=6 with bl={blacklist}; "
+        f"effective_budget should be 6 − 2 = 4 non-blacklisted survivors plus 2 SEs"
+    )
+
+    # (c) Layer 1 floor is 4 // 2 = 2 (no SEs); layer 0 floor is max(2 − 2, 0) = 0
+    #     so layer 0 may drop to just its 2 SEs if entropy permits.
+    assert budgets[1] >= 2, f"layer 1 floor=2 (n//2 with no SE); got budgets[1]={budgets[1]}"
+
+
 def test_cka_distance_contract():
     """Given two identical CKA matrices, the 1 - CKA distance matrix must have all-zero
     diagonal."""

@@ -1296,6 +1296,13 @@ def capture_router_outputs(layer_refs: list[MoELayerRef]):
                 logits = logits + router.bias
             # Qwen3.5-MoE auxiliary-loss-free load-balancing bias; must be
             # included to match routing decisions.
+            # B-iter5-L-3 (code): the bias is included as part of the router's
+            # pre-softmax output (which drives top-k selection); REAM δ_gate
+            # operates on these same bias-adjusted pre-softmax logits — this is
+            # the natural reading (spec is silent on the bias). If a future
+            # spec change requires the unbiased logits for δ_gate, capture must
+            # be split: top-k selection uses biased logits; δ_gate would consume
+            # a separate unbiased capture.
             if hasattr(router, "e_score_correction_bias") and router.e_score_correction_bias is not None:
                 logits = logits + router.e_score_correction_bias
             storage[li].append(logits.detach().clone())  # clone: caching allocator may reuse the backing memory on next forward

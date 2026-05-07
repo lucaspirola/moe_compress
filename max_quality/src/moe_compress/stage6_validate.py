@@ -84,7 +84,7 @@ except Exception:  # noqa: BLE001
 from .utils.calibration import iter_batches
 from .utils.model_io import (
     count_expert_parameters,
-    count_parameters,
+    count_parameters_effective,
     load_model,
     save_json_artifact,
 )
@@ -124,7 +124,10 @@ def _resolve_dataset_revisions(config: dict) -> dict[str, str | None]:
             type(raw).__name__,
         )
         return {}
-    # Coerce to str|None; reject non-string non-null values.
+    # F-iter4-NIT-4: reject non-string non-null values rather than silently
+    # coercing — a non-string SHA is almost certainly a config typo (e.g. an
+    # int) and we'd rather surface it now than fold a meaningless str(int)
+    # into the teacher cache key.
     out: dict[str, str | None] = {}
     for k, v in raw.items():
         if v is None:
@@ -132,17 +135,23 @@ def _resolve_dataset_revisions(config: dict) -> dict[str, str | None]:
         elif isinstance(v, str):
             out[str(k)] = v
         else:
-            log.warning(
-                "_resolve_dataset_revisions: revision for %r is not a string (%r); coercing to str",
-                k, v,
+            raise TypeError(
+                f"_resolve_dataset_revisions: revision for {k!r} must be a "
+                f"string SHA or null; got {type(v).__name__} (value={v!r}). "
+                f"Fix the config under stage6_validate.dataset_revisions."
             )
-            out[str(k)] = str(v)
     return out
 
 
 def _enforce_revision_pinning(
     config: dict, required_keys: tuple[str, ...] = (
-        "wikitext_ppl", "hellaswag", "arc_challenge", "humaneval", "math500",
+        # F-iter4-HIGH-1: hellaswag/arc_challenge dropped from required keys.
+        # lm-eval pulls dataset revisions internally and our load path cannot
+        # enforce a SHA at simple_evaluate time. The cache key invalidates on
+        # lm_eval_version + lm-eval task config hash changes (see
+        # _teacher_cache_key); precise SHA control requires editing lm-eval
+        # task YAMLs out-of-band.
+        "wikitext_ppl", "humaneval", "math500",
     ),
 ) -> dict[str, str | None]:
     """Validate dataset_revisions when strict_revision_pinning is on.
@@ -170,6 +179,10 @@ def _enforce_revision_pinning(
 # ---------------------------------------------------------------------------
 # Teacher eval caching (Optimization #7)
 # ---------------------------------------------------------------------------
+
+# F-iter4-LOW-5: bump this whenever the cache file schema changes. _load_teacher_cache
+# rejects (and triggers re-evaluation) when the on-disk version does not match.
+TEACHER_CACHE_FORMAT_VERSION: int = 1
 
 
 def _safe_pkg_version(name: str) -> str:
@@ -207,12 +220,31 @@ def _teacher_cache_key(config: dict) -> str:
     model_revision = model_cfg.get("revision") or "main"
     tokenizer_revision = model_cfg.get("tokenizer_revision") or model_revision
     dataset_revisions = _resolve_dataset_revisions(config)
+    # F-iter4-NIT-3: explicitly canonicalize dataset_revisions to a sorted-keys
+    # JSON string; do not rely solely on the outer json.dumps(..., sort_keys=)
+    # for nested-dict canonicalization (sort_keys recurses but specifying it
+    # explicitly here documents the contract — Spec §9 line 816 states the
+    # mapping is "JSON-canonicalized ... with sorted keys before concatenation").
+    dataset_revisions_canonical = json.dumps(
+        dataset_revisions, sort_keys=True, separators=(",", ":"),
+    )
+    # F-iter4-HIGH-1: fold the lm-eval task list (and any per-task config we
+    # configure here) into the cache key so the cache invalidates if the
+    # lm-eval task set changes — even when we cannot pin per-dataset SHAs.
+    lm_eval_task_config = {
+        "tasks": list(s6.get("zero_shot", {}).get("tasks", [])),
+        "lm_eval_batch_size": s6.get("lm_eval_batch_size"),
+    }
+    lm_eval_task_config_hash = hashlib.sha256(
+        json.dumps(lm_eval_task_config, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     payload = {
         "model_name": model_cfg["name_or_path"],
         "model_revision": model_revision,
         "tokenizer_revision": tokenizer_revision,
-        "dataset_revisions": dataset_revisions,
+        "dataset_revisions_canonical": dataset_revisions_canonical,
         "lm_eval_version": _safe_pkg_version("lm-eval"),
+        "lm_eval_task_config_hash": lm_eval_task_config_hash,
         "transformers_version": _safe_pkg_version("transformers"),
         "dtype": str(model_cfg.get("torch_dtype", "bfloat16")),
         "attn_impl": _STAGE6_ATTN_IMPLEMENTATION,
@@ -290,7 +322,11 @@ def _build_imatrix_calibration_corpus(
         text = row.get("text", "")
         if text and text.strip():
             rows.append(text)
-    joined = "\n".join(rows)
+    # F-iter4-M-3: align row joiner with the WikiText-2 PPL eval ("\n\n").
+    # Both inputs (PPL eval + imatrix calibration) now use the same convention,
+    # so imatrix activation statistics see a token distribution comparable to
+    # what the PPL gate measures. (Eval uses "\n\n" — see _wikitext2_ppl.)
+    joined = "\n\n".join(rows)
     if not joined.strip():
         log.warning("imatrix calibration: WikiText-2 train split is empty after filtering; skipping write")
         return None
@@ -308,6 +344,16 @@ def _load_teacher_cache(cache_path: Path, cache_key: str) -> dict | None:
         return None
     try:
         data = json.loads(cache_path.read_text())
+        # F-iter4-LOW-5: reject mismatched schema versions so a stale cache
+        # written by an older format never silently feeds wrong values.
+        on_disk_version = data.get("format_version")
+        if on_disk_version is not None and on_disk_version != TEACHER_CACHE_FORMAT_VERSION:
+            log.warning(
+                "Teacher cache format_version mismatch (expected %d, found %r) — "
+                "re-evaluating.",
+                TEACHER_CACHE_FORMAT_VERSION, on_disk_version,
+            )
+            return None
         if data.get("cache_key") != cache_key:
             log.info("Teacher cache key mismatch (expected %s, found %s) — re-evaluating.",
                      cache_key, data.get("cache_key"))
@@ -353,7 +399,14 @@ def _save_teacher_cache(
     }
     if teacher_param_counts is not None:
         data["teacher_param_counts"] = teacher_param_counts
-    tmp = cache_path.with_suffix(".tmp")
+    # F-iter4-LOW-5: stamp a format_version so a future schema bump can be
+    # detected at load time (see _load_teacher_cache).
+    data["format_version"] = TEACHER_CACHE_FORMAT_VERSION
+    # F-iter4-LOW-1: use the same `<file>.<ext>.tmp` convention as
+    # _atomic_write_text (e.g. "teacher_eval_cache.json.tmp"); the previous
+    # `.with_suffix(".tmp")` produced "teacher_eval_cache.tmp" which dropped
+    # the .json extension and made temp files harder to identify.
+    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
     # F-3: Split the try/except into two blocks so that a parent-dir fsync
     # failure after a successful os.replace does not cause a misleading re-raise.
     # After os.replace the cache file is durably on disk; the parent fsync is a
@@ -424,7 +477,28 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
 
     # Read batch size configs with defaults tuned for H200.
     ppl_batch_size = int(s6.get("ppl_batch_size", 8))
-    lm_eval_batch_size = s6.get("lm_eval_batch_size", "auto:8")
+    # F-iter4-LOW-2: validate lm_eval_batch_size — accept positive int, an
+    # int-string, or the "auto[:N]" pattern. Reject anything else early so an
+    # invalid config doesn't surface as a confusing lm-eval traceback later.
+    _raw_lebs = s6.get("lm_eval_batch_size", "auto:8")
+    if isinstance(_raw_lebs, int):
+        if _raw_lebs <= 0:
+            raise ValueError(
+                f"stage6_validate.lm_eval_batch_size must be > 0; got {_raw_lebs}"
+            )
+        lm_eval_batch_size = _raw_lebs
+    elif isinstance(_raw_lebs, str):
+        if not (re.fullmatch(r"\d+", _raw_lebs) or re.fullmatch(r"auto(:\d+)?", _raw_lebs)):
+            raise ValueError(
+                f"stage6_validate.lm_eval_batch_size must be a positive int or "
+                f"match 'auto' / 'auto:N'; got {_raw_lebs!r}"
+            )
+        lm_eval_batch_size = int(_raw_lebs) if _raw_lebs.isdigit() else _raw_lebs
+    else:
+        raise TypeError(
+            f"stage6_validate.lm_eval_batch_size must be int or str; "
+            f"got {type(_raw_lebs).__name__}"
+        )
     gen_batch_size = int(s6.get("gen_batch_size", 8))
 
     # 1. WikiText-2 PPL on student (Optimization #1: batch_size=8)
@@ -497,7 +571,14 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             )
 
     # 4. Snapshot student param counts BEFORE loading teacher.
-    student_total = count_parameters(model)
+    # F-iter4-CRIT-2: use count_parameters_effective so FactoredExperts U/V
+    # factors are counted at their per-expert effective ranks (Spec §9 line 785),
+    # not the padded slot width allocated by ranks. The padded zero columns are
+    # not real parameters.
+    # F-iter4-M-4: snapshot order — AFTER torch.compile (no parameter mutation
+    # there) but BEFORE the student is moved to CPU (a CPU move does not
+    # change numel() so this is for pinning the lifecycle order, not numerics).
+    student_total = count_parameters_effective(model)
     student_expert = count_expert_parameters(model, routed_only=True)
 
     # Initialize gguf_thread and gguf_result at this scope level so the
@@ -602,8 +683,12 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
 
         # Save teacher results to cache for future runs.
         if teacher_cache_enabled:
+            # F-iter4-CRIT-2: teacher has no FactoredExperts modules so the
+            # effective count == physical count, but use the same effective
+            # function for symmetry and so the cached value compares apples-to-
+            # apples with the student's effective live param count.
             teacher_pc = {
-                "total": count_parameters(teacher),
+                "total": count_parameters_effective(teacher),
                 "expert": count_expert_parameters(teacher, routed_only=True),
             }
             try:
@@ -965,7 +1050,29 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
     Numerically identical to batch_size=1.
 
     F-C-H-3: pass revision= to load_dataset when a pinned SHA is configured.
+
+    F-iter4-CRIT-1: assert that the model is running under eager attention.
+    Spec §9 lines 821, 838 require eager attn for the Stage 6 gate run for
+    BOTH teacher and student to remove cross-batch sdpa-kernel variance and
+    preserve the bs=1 ↔ bs>1 numerical-equivalence claim of Optimization #1.
+    F-iter4-L-4: assert sequence_length == 2048 (Spec §9 line 769).
     """
+    # F-iter4-L-4: PPL chunk length is fixed by spec.
+    assert int(cfg.get("sequence_length", 0)) == 2048, (
+        f"_wikitext2_ppl: cfg['sequence_length'] must be 2048 per Spec §9 "
+        f"line 769; got {cfg.get('sequence_length')!r}"
+    )
+    # F-iter4-CRIT-1: verify eager attention pin took effect.
+    try:
+        model_attn = getattr(model.config, "_attn_implementation", None)
+    except Exception:  # noqa: BLE001
+        model_attn = None
+    assert model_attn == _STAGE6_ATTN_IMPLEMENTATION, (
+        f"_wikitext2_ppl: model.config._attn_implementation={model_attn!r} "
+        f"but Spec §9 lines 821, 838 require {_STAGE6_ATTN_IMPLEMENTATION!r} "
+        f"for the Stage 6 gate run. The student must be loaded with "
+        f"attn_implementation='eager' (see run_pipeline._load_for_stage)."
+    )
     from datasets import load_dataset
 
     revision = (dataset_revisions or {}).get("wikitext_ppl")
@@ -1216,10 +1323,20 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None,
         log.warning("datasets not available (%s); skipping HumanEval.", err)
         return float("nan")
     revision = (dataset_revisions or {}).get("humaneval")
-    try:
-        ds = load_dataset("openai_humaneval", split="test", revision=revision)
-    except Exception as err:           # noqa: BLE001
-        log.warning("HumanEval dataset load failed (%s); skipping.", err)
+    # F-iter4-LOW-3: prefer the namespaced HF id ("openai/openai_humaneval");
+    # fall back to the legacy unnamespaced id for HF datasets versions that
+    # haven't migrated yet.
+    ds = None
+    last_err: Exception | None = None
+    for ds_id in ("openai/openai_humaneval", "openai_humaneval"):
+        try:
+            ds = load_dataset(ds_id, split="test", revision=revision)
+            break
+        except Exception as err:           # noqa: BLE001
+            last_err = err
+            log.debug("HumanEval load via %r failed (%s); will try fallback.", ds_id, err)
+    if ds is None:
+        log.warning("HumanEval dataset load failed (%s); skipping.", last_err)
         return float("nan")
 
     max_new = int(cfg.get("max_new_tokens", 512))
@@ -1405,10 +1522,16 @@ def _last_numeric(s: str) -> str | None:
 def _check_math(completion: str, reference: str) -> bool:
     comp_answer = _extract_boxed(completion)
     ref_answer = _extract_boxed(reference)
+    # F-iter4-HIGH-2: when \boxed{...} is absent from the reference, do NOT
+    # fall straight to _last_numeric — that returns "2" for "\\frac{1}{2}",
+    # silently truncating the rational to its denominator. Try SymPy LaTeX
+    # parsing first; only fall back to _last_numeric if LaTeX parsing fails
+    # too. (Comp answers are model output and are scored by symbolic
+    # equivalence below, so the same fallback policy applies.)
     if comp_answer is None:
-        comp_answer = _last_numeric(completion)
+        comp_answer = _math_fallback_extract(completion)
     if ref_answer is None:
-        ref_answer = _last_numeric(reference)
+        ref_answer = _math_fallback_extract(reference)
 
     if comp_answer is None or ref_answer is None:
         return False
@@ -1438,6 +1561,25 @@ def _check_math(completion: str, reference: str) -> bool:
         return abs(float(a) - float(b)) < 1e-6
     except (TypeError, ValueError):
         return False
+
+
+def _math_fallback_extract(s: str) -> str | None:
+    """Return a candidate answer string from ``s`` when no \\boxed{} is found.
+
+    F-iter4-HIGH-2: prefer SymPy LaTeX parsing of the full string before
+    collapsing to the last numeric token. ``_last_numeric`` returns "2" for
+    "\\frac{1}{2}" — incorrect. If LaTeX parsing succeeds the original LaTeX
+    string is returned (the caller's symbolic-equivalence check then re-parses
+    it the same way); only when LaTeX parsing fails do we fall through to
+    ``_last_numeric``.
+    """
+    if _SYMPY_AVAILABLE:
+        try:
+            _ = _parse_latex(s.strip())
+            return s.strip()
+        except Exception:  # noqa: BLE001
+            pass
+    return _last_numeric(s)
 
 
 # ---------------------------------------------------------------------------
@@ -1512,11 +1654,14 @@ def _measured_reduction(
     cached_teacher_param_counts: dict | None = None,
     config: dict | None = None,
 ) -> dict:
-    s_total = student_total if student_total is not None else count_parameters(student_model)
+    # F-iter4-CRIT-2: use count_parameters_effective to honor FactoredExperts
+    # per-expert effective ranks (Spec §9 line 785). For models with no
+    # FactoredExperts (e.g. teacher) this equals count_parameters().
+    s_total = student_total if student_total is not None else count_parameters_effective(student_model)
     s_expert = student_expert if student_expert is not None else count_expert_parameters(student_model, routed_only=True)
 
     if teacher_model is not None:
-        t_total = count_parameters(teacher_model)
+        t_total = count_parameters_effective(teacher_model)
         t_expert = count_expert_parameters(teacher_model, routed_only=True)
     elif cached_teacher_param_counts is not None:
         t_total = cached_teacher_param_counts["total"]
@@ -1545,7 +1690,9 @@ def _measured_reduction(
                 trust_remote_code=config["model"].get("trust_remote_code", False),
             )
             try:
-                t_total = count_parameters(teacher_tmp)
+                # F-iter4-CRIT-2: effective count (no FactoredExperts in teacher,
+                # so equivalent to count_parameters).
+                t_total = count_parameters_effective(teacher_tmp)
                 t_expert = count_expert_parameters(teacher_tmp, routed_only=True)
             finally:
                 del teacher_tmp

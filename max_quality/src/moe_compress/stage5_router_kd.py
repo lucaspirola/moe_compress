@@ -96,10 +96,12 @@ def run(
                 )
             cached_bs = int(cache_payload.get("batch_size", -1))
             if cached_bs != int(s5["batch_size"]):
-                raise RuntimeError(
-                    f"Teacher-logits cache batch_size={cached_bs} disagrees with "
-                    f"stage5_router_kd.batch_size={s5['batch_size']}. Re-run the "
-                    "precompute or align the configs — the cache is keyed token-by-token."
+                log.warning(
+                    "Stage 5: teacher_logits_cache batch_size=%d disagrees with "
+                    "stage5_router_kd.batch_size=%d. The cache is logically valid "
+                    "as long as token order matches; batch grouping is irrelevant "
+                    "to KL correctness — proceeding.",
+                    cached_bs, int(s5["batch_size"]),
                 )
             if int(cache_payload.get("sequence_length", -1)) != int(s5["max_sequence_length"]):
                 raise RuntimeError(
@@ -269,6 +271,12 @@ def run(
     grad_accum = s5["gradient_accumulation"]
     T = s5["kd_temperature"]
     ckpt_every = int(s5.get("checkpoint_every_n_steps", 100))
+    if ckpt_every <= 0:
+        log.warning(
+            "Stage 5: checkpoint_every_n_steps=%d disables checkpointing — "
+            "spec §8 Resume mandates every 100 steps; resume will not work.",
+            ckpt_every,
+        )
 
     # Teacher/student MoE layer count sanity check (router structure must match
     # even though we're distilling at vocab level — the student's routers are
@@ -327,6 +335,20 @@ def run(
                     obj = getattr(obj, part)
                 getattr(obj, parts[-1]).data.copy_(t)
             optim.load_state_dict(payload["optim_state"])
+            # Validate that the optimizer state's param groups match the current
+            # trainable scope. If the trainable_name_patterns config changed since
+            # the checkpoint was written, the param-group layouts will mismatch
+            # and silently apply stale moments to the wrong parameters.
+            _ckpt_param_count = sum(len(g.get("params", [])) for g in payload["optim_state"].get("param_groups", []))
+            _current_param_count = sum(len(g["params"]) for g in optim.param_groups)
+            if _ckpt_param_count != _current_param_count:
+                raise RuntimeError(
+                    f"Stage 5 resume: optimizer param-group count mismatch — "
+                    f"checkpoint has {_ckpt_param_count} params, current trainable "
+                    f"scope has {_current_param_count}. Trainable scope changed since "
+                    f"checkpoint — delete _{stage_key}_partial/ and re-run, or "
+                    f"restore the original trainable_name_patterns."
+                )
             if device is not None:
                 _move_optimizer_state_to_device(optim, device)
             resume_step = int(payload["step"])
@@ -502,6 +524,13 @@ def _chunked_vocab_kl(
 
     Note: n_tokens = B × (L−1) is the per-position-mean denominator (paper
     Eq. 3's N_x for fully-packed sequences with no padding).
+
+    ASSUMPTION: fully-packed sequences (no padding) — see spec §8 N_x note.
+    Under this invariant, paper Eq. 3's mask `m_{t+1}=1` everywhere and
+    `N_x = Σ_t m_{t+1} = B × (L−1) = n_tokens`, so the `+ ε` zero-mask
+    safety constant from paper Eq. 3 is unnecessary. If a future calibration
+    source ever introduces padding, this normalization (and the `+ ε`) must
+    be revisited.
     """
     B, L, V = student_logits.shape
     total_kl = torch.zeros((), device=student_logits.device, dtype=torch.float32)
@@ -551,7 +580,7 @@ def _save_stage5_checkpoint(
     tmp = partial_dir / f"step_{step}.pt.tmp"
     final = partial_dir / f"step_{step}.pt"
     torch.save(payload, tmp)
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    fd = os.open(str(tmp), os.O_RDONLY)
     try:
         os.fsync(fd)
     finally:

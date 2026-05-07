@@ -67,8 +67,10 @@ def run(
       - ``blacklist`` : dict[str(layer_idx) -> list[expert_idx]] — the SE blacklist.
       - ``per_expert_max`` : dict[str -> float] — per-expert max-magnitude over all
         calibration batches, keyed by the format ``"L{layer_i}E{expert_i}"`` (e.g.
-        ``"L3E17"`` for layer 3, expert 17). Only experts that fired in MA-formation
-        layers (l ∈ L) appear here. (A-C-N-2)
+        ``"L3E17"`` for layer 3, expert 17). All MoE layers are instrumented per
+        spec §4 Phase B, so any expert that fired on at least one calibration sample
+        is present here regardless of whether its layer is in L; the L-restriction
+        is applied later when computing P99.5 / a_max for the SE criterion. (A-C-N-2)
       - ``config`` : dict — thresholds and detector parameters used to produce
         the blacklist (a_max_fraction, ma_ratio, ma_growth_ratio,
         ma_formation_layers, p995_threshold, a_max_absolute, a_max_threshold).
@@ -141,15 +143,21 @@ def run(
     )
 
     max_acc = DownProjMaxAccumulator()
-    output_acc = ExpertOutputAccumulator()
+    # Hard-pin to 256 per spec §12 D-ma-detector ("CKA reservoir cap = 256 tokens
+    # per expert"). Passing the value explicitly ensures a future default change
+    # in activation_hooks.py does not silently drift the spec-pinned cap.
+    output_acc = ExpertOutputAccumulator(max_tokens_per_expert=256)
 
     def down_cb(li, e, tensor, _ctx):  # _ctx required by the instrument_experts CallbackFn protocol; unused here
-        # Magnitude collection restricted to MA-formation layers per spec.
-        if li in L:
-            # Using pre-routing-weight magnitude (down_proj output before top_k_weight
-            # scaling). Paper Eq. 6 is ambiguous; post-weight magnitude would require
-            # passing routing weights through the hook.
-            max_acc.update(li, e, tensor)
+        # All MoE layers are instrumented simultaneously per spec §4 Phase B
+        # ("All MoE layers are instrumented simultaneously"). The L-restriction is
+        # applied later, in _compute_se_thresholds (P99.5 / a_max are computed only
+        # over l ∈ L per Algorithm 1 line 16). Hook collects magnitudes for ALL
+        # MoE layers; downstream filtering enforces the SE-criterion's l ∈ L gate.
+        # Using pre-routing-weight magnitude (down_proj output before top_k_weight
+        # scaling). Paper Eq. 6 is ambiguous; post-weight magnitude would require
+        # passing routing weights through the hook.
+        max_acc.update(li, e, tensor)
         output_acc.update(li, e, tensor)
 
     with contextlib.ExitStack() as stack:
@@ -210,8 +218,9 @@ def run(
             "stage1/se_in_ma_layer": float(in_ma_layer),
         }
         # Magnitude stats are only meaningful for MA-formation layers (set L); for non-L
-        # layers max_acc.per_expert_max has no entries, so omit these keys entirely rather
-        # than emitting ambiguous 0.0 values.
+        # layers we now also collect magnitudes (spec §4 Phase B: "All MoE layers are
+        # instrumented simultaneously"), but they never enter the SE three-way AND, so
+        # we still omit these stats for non-L layers rather than emitting ambiguous values.
         if in_ma_layer:
             # Only include experts that were actually activated; absent keys mean zero
             # activations on all calibration samples, which would bias the statistics.
@@ -445,6 +454,11 @@ def _detect_ma_layers(
             prev_max = layer_max[prev_decoder_idx]
             # prev_max == 0 means the preceding layer produced no non-zero output on any
             # batch; genuine MA detection requires a nonzero baseline, so we skip this check.
+            # NOTE: layer_max[layer_idx] and layer_max[prev_decoder_idx] are cumulative
+            # cross-batch maxima; they may peak on different batches. The ratio is
+            # therefore cumulative-vs-cumulative, matching spec §4 Phase A line 156's
+            # "across all calibration batches" wording — valid under the input-stable MA
+            # assumption (spec §4 Phase A, paper §3.2.2 lines 405–406) but worth noting.
             if prev_max > 0 and layer_max[layer_idx] / prev_max > ma_growth_ratio:
                 L.add(layer_idx)
 
@@ -510,17 +524,12 @@ def _apply_paper_criterion(
                 "even after fallback)."
             )
         return {}
-    # defensive — unreachable in normal operation (update() only called for li in L).
-    # External callers or accumulator reuse may legitimately pass entries outside L;
-    # collect unexpected indices first and warn once per layer rather than once per expert.
-    unexpected_layers = {li for (li, _e) in per_expert_max if li not in L}
-    for li in sorted(unexpected_layers):
-        log.warning(
-            "_apply_paper_criterion: layer %d not in MA-layer set L; skipping all experts for this layer", li
-        )
+    # Magnitudes are collected for ALL MoE layers (spec §4 Phase B: "All MoE layers
+    # are instrumented simultaneously"); the SE three-way AND is then enforced here
+    # by silently skipping any (l, e) with l ∉ L (Eq. 6's `l ∈ L` clause).
     blacklist: dict[int, list[int]] = {}
     for (li, e), v in per_expert_max.items():
-        if li in unexpected_layers:
+        if li not in L:
             continue
         if v > p995 and v > a_max_threshold:
             blacklist.setdefault(li, []).append(e)
@@ -764,6 +773,10 @@ def _grape_greedy_merge(
     # Total floor = floors[li] + len(blacklist[li]).
     # GRAPE tracks only non-blacklisted experts in cluster_counts, so
     # cluster_counts[li] must not drop below floors[li].
+    # NOTE: `min_experts_per_layer` is a config key consumed by the budget solver
+    # for global feasibility, but Stage 1 hardcodes the per-layer floor as
+    # `per_layer_counts[li] // 2` per spec §12 D5 ("min_experts_per_layer =
+    # num_routed_experts // 2"). Stage 1 does not read the config value here.
     floors: dict[int, int] = {
         li: max(per_layer_counts[li] // 2 - len(blacklist.get(li, [])), 0)
         for li in sorted_layers
