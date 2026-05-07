@@ -42,6 +42,7 @@ from .utils.model_io import (
     FactoredExperts,
     MoELayerRef,
     build_banks,
+    iter_decoder_layers,
     iter_moe_layers,
     load_model,
     load_json_artifact,
@@ -1309,9 +1310,14 @@ def _redistribute_ranks_swift_svd_plus(
         total_score = sum(scores) or 1.0
         total_group_rank = k_group * gs.n_experts
         cap = min(gs.d_out, gs.d_in) - 1
+        # Spec §6 Phase B.2 minimal-rank floor (paper 2604.01609 Algorithm 2):
+        # k_i ← max(k_i, floor(k̄ · δ)) with δ = 0.5. Paper warns δ = 0 is
+        # numerically unstable.
+        delta = 0.5
+        rank_floor = max(1, int(math.floor(k_group * delta)))
 
         per_e = [
-            max(1, min(cap, int(round(total_group_rank * (sc / total_score)))))
+            max(rank_floor, min(cap, int(round(total_group_rank * (sc / total_score)))))
             for sc in scores
         ]
         # Reconcile rounding residual.
@@ -1324,7 +1330,7 @@ def _redistribute_ranks_swift_svd_plus(
                     break
                 step = 1 if diff > 0 else -1
                 new_val = per_e[idx] + step
-                if 1 <= new_val <= cap:
+                if rank_floor <= new_val <= cap:
                     per_e[idx] = new_val
                     diff -= step
             if diff != 0:
@@ -1848,12 +1854,20 @@ def _phase_c5_block_refine(
       4. Save a per-block atomic checkpoint with the refined U/V + RMSNorm
          state for crash-resume.
     """
+    # All decoder layers (MoE + any dense interlayers) participate in the
+    # forward stream advance so X' produced for block i+1 reflects every
+    # intervening transform. Only MoE blocks (subset) get the AdamW
+    # refinement — dense layers have nothing factored to refine.
+    s_layers_all = {idx: layer for idx, layer in iter_decoder_layers(student)}
+    t_layers_all = {idx: layer for idx, layer in iter_decoder_layers(teacher)}
     s_layers_by_idx = {ref.layer_idx: ref.layer_module for ref in moe_layers}
     t_layers_by_idx = {ref.layer_idx: ref.layer_module for ref in teacher_moe_layers}
-    block_indices = sorted(s_layers_by_idx.keys())
-    n_blocks = len(block_indices)
-    log.info("Stage 3 Phase C.5: %d blocks × %d epochs (lr=%.1e, batch=%d)",
-             n_blocks, epochs, learning_rate, batch_size)
+    moe_idx_to_pos = {ref.layer_idx: i for i, ref in enumerate(moe_layers)}
+    all_indices = sorted(s_layers_all.keys())
+    n_blocks = len(all_indices)
+    n_moe_blocks = len(moe_layers)
+    log.info("Stage 3 Phase C.5: %d decoder layers (%d MoE refined) × %d epochs (lr=%.1e, batch=%d)",
+             n_blocks, n_moe_blocks, epochs, learning_rate, batch_size)
 
     partial_dir = None if no_resume else artifacts_dir / "_stage3_phase_c5_partial"
     if partial_dir is not None:
@@ -1865,10 +1879,23 @@ def _phase_c5_block_refine(
     # forward through the model's embedding + decoder stack manually so the
     # captured kwargs (position_embeddings, attention_mask, position_ids,
     # cache_position) come from the model's own prep code.
+    # drop_last: kwargs (attention_mask, position_ids, position_embeddings)
+    # are captured once from batch 0 and replayed; a trailing partial batch
+    # would shape-mismatch the cached masks.
     n_seq, seq_len = calib_tensor.shape
-    n_batches = (n_seq + batch_size - 1) // batch_size
+    n_batches = n_seq // batch_size
+    if n_batches == 0:
+        raise RuntimeError(
+            f"Stage 3 Phase C.5: calibration tensor has {n_seq} sequences "
+            f"but batch_size={batch_size}; need at least one full batch."
+        )
+    if n_batches * batch_size < n_seq:
+        log.info("Stage 3 Phase C.5: dropping trailing partial batch "
+                 "(%d sequences) to keep cached kwargs shape-stable",
+                 n_seq - n_batches * batch_size)
     batches = [calib_tensor[b * batch_size:(b + 1) * batch_size] for b in range(n_batches)]
-    log.info("Stage 3 Phase C.5: %d calibration sequences in %d batches", n_seq, n_batches)
+    log.info("Stage 3 Phase C.5: %d calibration sequences in %d batches of %d",
+             n_batches * batch_size, n_batches, batch_size)
 
     # Capture per-layer kwargs once via a forward pre-hook on each layer.
     # kwargs are stable across batches with the same shape (attention masks,
@@ -1895,14 +1922,11 @@ def _phase_c5_block_refine(
     # Use batch 0 to capture stable kwargs (these don't depend on weight values,
     # only on input_ids shape/positions).
     sample = batches[0]
-    student_kwargs, _ = _capture_first_pass(student, s_layers_by_idx, sample)
-    teacher_kwargs, _ = _capture_first_pass(teacher, t_layers_by_idx, sample)
-
     # Initialize both upstream streams: per-batch hidden state at the input to
-    # the FIRST MoE block. Captured via a one-shot forward through the prefix
-    # (embed → any non-MoE layers → first MoE layer pre-hook).
-    first_idx = block_indices[0]
-    log.info("Stage 3 Phase C.5: capturing initial upstream streams at block %d", first_idx)
+    # decoder layer 0. Captured via a one-shot forward through the embed prefix
+    # with a pre-hook + EarlyExit on the first decoder layer.
+    first_idx = all_indices[0]
+    log.info("Stage 3 Phase C.5: capturing initial upstream streams at layer %d", first_idx)
 
     def _capture_block_input(model_, layer_module, all_batches):
         """Run the model forward and capture the hidden_state input to
@@ -1934,16 +1958,31 @@ def _phase_c5_block_refine(
             raise RuntimeError("Phase C.5: failed to capture block input for some batches")
         return captured  # type: ignore
 
-    s_first_layer = s_layers_by_idx[first_idx]
-    t_first_layer = t_layers_by_idx[first_idx]
+    s_first_layer = s_layers_all[first_idx]
+    t_first_layer = t_layers_all[first_idx]
     X_student = _capture_block_input(student, s_first_layer, batches)
     X_teacher = _capture_block_input(teacher, t_first_layer, batches)
 
+    # Capture full per-decoder-layer kwargs for ALL layers (including dense
+    # interlayers) so the stream advance is faithful for mixed architectures.
+    student_kwargs_all, _ = _capture_first_pass(student, s_layers_all, sample)
+    teacher_kwargs_all, _ = _capture_first_pass(teacher, t_layers_all, sample)
+
     student_dtype = next(student.parameters()).dtype
 
-    for block_pos, layer_idx in enumerate(block_indices):
-        s_layer = s_layers_by_idx[layer_idx]
-        t_layer = t_layers_by_idx[layer_idx]
+    for layer_idx in all_indices:
+        s_layer = s_layers_all[layer_idx]
+        t_layer = t_layers_all[layer_idx]
+        is_moe = layer_idx in moe_idx_to_pos
+        block_pos = moe_idx_to_pos.get(layer_idx)
+        if not is_moe:
+            # Dense decoder layer between MoE blocks: just advance both streams.
+            X_student, X_teacher = _advance_streams(
+                s_layer, t_layer, X_student, X_teacher,
+                student_kwargs_all.get(layer_idx, {}),
+                teacher_kwargs_all.get(layer_idx, {}), device,
+            )
+            continue
 
         ckpt_path = partial_dir / f"block_{layer_idx}.pt" if partial_dir is not None else None
         if ckpt_path is not None and ckpt_path.exists():
@@ -1960,19 +1999,23 @@ def _phase_c5_block_refine(
                     payload[f"{name}_U"].to(device=ref_dev, dtype=student_dtype))
                 getattr(fe, f"{name}_V").data.copy_(
                     payload[f"{name}_V"].to(device=ref_dev, dtype=student_dtype))
-            for nm, key in (("input_layernorm", "input_layernorm"),
-                            ("post_attention_layernorm", "post_attention_layernorm")):
-                mod = getattr(s_layer, nm, None)
-                if mod is not None and hasattr(mod, "weight") and key in payload:
+            for path in ("input_layernorm", "post_attention_layernorm",
+                         "self_attn.q_norm", "self_attn.k_norm"):
+                mod = s_layer
+                for part in path.split("."):
+                    mod = getattr(mod, part, None)
+                    if mod is None:
+                        break
+                if mod is not None and hasattr(mod, "weight") and path in payload:
                     mod.weight.data.copy_(
-                        payload[key].to(device=mod.weight.device, dtype=student_dtype))
+                        payload[path].to(device=mod.weight.device, dtype=student_dtype))
             log.info("Stage 3 Phase C.5 block %d/%d (idx=%d) — resumed from checkpoint",
                      block_pos + 1, n_blocks, layer_idx)
             # Still need to advance the streams using the (resumed) refined block.
             X_student, X_teacher = _advance_streams(
                 s_layer, t_layer, X_student, X_teacher,
-                student_kwargs.get(layer_idx, {}), teacher_kwargs.get(layer_idx, {}),
-                device,
+                student_kwargs_all.get(layer_idx, {}),
+                teacher_kwargs_all.get(layer_idx, {}), device,
             )
             continue
 
@@ -1981,7 +2024,13 @@ def _phase_c5_block_refine(
         # requires_grad on the trainable subset only).
         fe = moe_layers[block_pos].experts_module
         if not isinstance(fe, FactoredExperts):
-            log.info("Stage 3 Phase C.5 block %d skipped (not factored)", layer_idx)
+            log.info("Stage 3 Phase C.5 block %d skipped (not factored); "
+                     "advancing streams without refinement", layer_idx)
+            X_student, X_teacher = _advance_streams(
+                s_layer, t_layer, X_student, X_teacher,
+                student_kwargs_all.get(layer_idx, {}),
+                teacher_kwargs_all.get(layer_idx, {}), device,
+            )
             continue
         trainables: list[nn.Parameter] = []
         for name in MATRIX_NAMES:
@@ -1989,25 +2038,52 @@ def _phase_c5_block_refine(
                 p = getattr(fe, slot)
                 p.requires_grad_(True)
                 trainables.append(p)
+        # RMSNorm scope (paper 2604.02119 Algorithm 2 line 9 / Appendix B.2):
+        # all block-local norms participate in θ_i. For Qwen3 this includes
+        # input_layernorm + post_attention_layernorm (block-level), and the
+        # per-head q_norm + k_norm inside self-attention.
         norm_params: list[nn.Parameter] = []
-        for nm in ("input_layernorm", "post_attention_layernorm"):
-            mod = getattr(s_layer, nm, None)
-            if mod is not None and hasattr(mod, "weight"):
+        norm_module_paths = ["input_layernorm", "post_attention_layernorm",
+                             "self_attn.q_norm", "self_attn.k_norm"]
+        for path in norm_module_paths:
+            mod = s_layer
+            ok = True
+            for part in path.split("."):
+                mod = getattr(mod, part, None)
+                if mod is None:
+                    ok = False
+                    break
+            if ok and hasattr(mod, "weight") and isinstance(mod.weight, nn.Parameter):
                 mod.weight.requires_grad_(True)
                 norm_params.append(mod.weight)
         trainables.extend(norm_params)
 
-        # Build optimizer + scheduler. Spec §6 Phase C.5: standard
-        # torch.optim.AdamW (fp32 moments + fp32 master), lr=1e-4,
-        # cosine schedule with linear warmup, 25 epochs.
+        # Spec §6 Phase C.5: AdamW must run with fp32 moments + fp32 master
+        # weights. Vanilla `torch.optim.AdamW` initializes `exp_avg`/`exp_avg_sq`
+        # with the same dtype as the parameter — so for bf16 params, moments
+        # are bf16, losing the precision rationale. Promote trainables to
+        # fp32 in-place before the optimizer is constructed; restore the
+        # original dtype after refinement. Frozen params in the same layer
+        # stay bf16; PyTorch dtype-promotes through `nn.Linear` and RMSNorm
+        # so the layer forward runs cleanly in mixed precision.
+        original_dtypes: dict[int, torch.dtype] = {}
+        for p in trainables:
+            original_dtypes[id(p)] = p.dtype
+            if p.dtype != torch.float32:
+                p.data = p.data.to(torch.float32)
         opt = torch.optim.AdamW(trainables, lr=learning_rate, weight_decay=weight_decay)
         total_steps = max(1, epochs * len(batches))
         warmup_steps = max(1, int(warmup_ratio * total_steps))
 
         def _lr_at(step: int) -> float:
-            if step < warmup_steps:
-                return step / max(1, warmup_steps)
-            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            # Step is 0-indexed; offset by 1 so the first step uses a non-zero
+            # warmup fraction rather than lr=0 (paper-typical schedules ramp
+            # from a small fraction up to 1.0, not literally 0). Likewise the
+            # cosine never reaches exactly 0 at total_steps − 1.
+            s = step + 1
+            if s <= warmup_steps:
+                return s / max(1, warmup_steps)
+            progress = (s - warmup_steps) / max(1, total_steps - warmup_steps + 1)
             return 0.5 * (1.0 + math.cos(math.pi * progress))
 
         # Pre-compute teacher targets once per batch (no grad).
@@ -2015,7 +2091,7 @@ def _phase_c5_block_refine(
         with torch.no_grad():
             for bi, _ in enumerate(batches):
                 x_t = X_teacher[bi].to(device=device, dtype=student_dtype)
-                out = t_layer(x_t, **teacher_kwargs.get(layer_idx, {}))
+                out = t_layer(x_t, **teacher_kwargs_all.get(layer_idx, {}))
                 if isinstance(out, tuple):
                     out = out[0]
                 teacher_targets.append(out.detach().to(dtype=torch.bfloat16, device="cpu"))
@@ -2028,7 +2104,7 @@ def _phase_c5_block_refine(
             for bi, _ in enumerate(batches):
                 x_s = X_student[bi].to(device=device, dtype=student_dtype)
                 target = teacher_targets[bi].to(device=device, dtype=student_dtype)
-                out = s_layer(x_s, **student_kwargs.get(layer_idx, {}))
+                out = s_layer(x_s, **student_kwargs_all.get(layer_idx, {}))
                 if isinstance(out, tuple):
                     out = out[0]
                 loss = nn.functional.mse_loss(out.to(torch.float32),
@@ -2045,15 +2121,12 @@ def _phase_c5_block_refine(
                     loss_first = float(loss.item())
                 loss_last = float(loss.item())
 
-        # Restore frozen state on RMSNorm params (other models don't refine).
-        for p in norm_params:
+        # Restore frozen state and original dtypes.
+        for p in trainables:
             p.requires_grad_(False)
-        # FactoredExperts U/V are kept as-is (Stage 4 will widen them).
-        # We DO leave requires_grad=False on them post-refine to avoid
-        # accidental grad accumulation in subsequent stages.
-        for name in MATRIX_NAMES:
-            for slot in (f"{name}_U", f"{name}_V"):
-                getattr(fe, slot).requires_grad_(False)
+            target_dtype = original_dtypes.get(id(p))
+            if target_dtype is not None and p.dtype != target_dtype:
+                p.data = p.data.to(target_dtype)
 
         rel_drop = (loss_first - loss_last) / max(loss_first or 1e-12, 1e-12) if loss_first else 0.0
         log.info("  Phase C.5 block %d/%d (idx=%d) loss %.4e → %.4e (%.1f%%↓)",
@@ -2069,10 +2142,15 @@ def _phase_c5_block_refine(
         # Save per-block checkpoint atomically.
         if ckpt_path is not None:
             payload = {"format_version": 1, "layer_idx": layer_idx}
-            for nm in ("input_layernorm", "post_attention_layernorm"):
-                mod = getattr(s_layer, nm, None)
+            for path in ("input_layernorm", "post_attention_layernorm",
+                         "self_attn.q_norm", "self_attn.k_norm"):
+                mod = s_layer
+                for part in path.split("."):
+                    mod = getattr(mod, part, None)
+                    if mod is None:
+                        break
                 if mod is not None and hasattr(mod, "weight"):
-                    payload[nm] = mod.weight.detach().cpu()
+                    payload[path] = mod.weight.detach().cpu()
             for name in MATRIX_NAMES:
                 payload[f"{name}_U"] = getattr(fe, f"{name}_U").detach().cpu()
                 payload[f"{name}_V"] = getattr(fe, f"{name}_V").detach().cpu()
@@ -2084,8 +2162,8 @@ def _phase_c5_block_refine(
         # Advance streams for the next block (no grad).
         X_student, X_teacher = _advance_streams(
             s_layer, t_layer, X_student, X_teacher,
-            student_kwargs.get(layer_idx, {}), teacher_kwargs.get(layer_idx, {}),
-            device,
+            student_kwargs_all.get(layer_idx, {}),
+            teacher_kwargs_all.get(layer_idx, {}), device,
         )
 
     # Cleanup: remove checkpoint dir on success.
