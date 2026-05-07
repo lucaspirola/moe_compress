@@ -359,7 +359,8 @@ def _detect_ma_layers(
     buffering per-batch flattened activation magnitudes and computing
     ``np.percentile(buffer, 99.0)`` once at finalize time (spec §4 Phase A: "Q99 across
     all calibration batches"). This is option (a) from spec §12 D-ma-detector. Memory
-    fits in RAM at calibration scales (256 samples × 2048 tokens × hidden ≈ ~MB-scale fp32).
+    fits in RAM at calibration scales (256 samples × 2048 tokens × hidden_size × 4 bytes
+    fp32 — for hidden=2048 this is ~4 GB; document for operators planning Stage 1 RAM headroom).
 
     MAs propagate stably through residuals after they form; the old absolute-only check would
     flag all post-formation layers. The growth check flags only amplification events.

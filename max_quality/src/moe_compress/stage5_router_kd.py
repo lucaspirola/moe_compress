@@ -72,7 +72,8 @@ def run(
     #       hf_jobs/precompute_teacher_logits.py; skip live teacher entirely.
     # If both are set, (B) wins.
     teacher = None
-    teacher_refs = None
+    # teacher_refs lives inside `_teacher_state["refs"]` once the teacher is
+    # lazily loaded; intentionally not pre-bound here.
     teacher_logits_cache = None
     cache_path_cfg = s5.get("teacher_logits_cache")
     if cache_path_cfg:
@@ -296,7 +297,15 @@ def run(
     # seed_offset distinguishes Stage 2.5 (post-merge router KD) from
     # Stage 5 (final router KD) so each pass sees a different calibration
     # draw and the routers are not retrained on the identical 3000 sequences.
-    _seed_offset = 25 if stage_key == "stage2p5" else 5
+    if stage_key == "stage2p5":
+        _seed_offset = 25
+    elif stage_key == "stage5":
+        _seed_offset = 5
+    else:
+        raise ValueError(
+            f"Stage 5: unsupported stage_key={stage_key!r}; expected "
+            "'stage5' or 'stage2p5'."
+        )
     spec = spec_from_config(
         cal,
         num_sequences_override=s5["max_calibration_samples"],
@@ -406,9 +415,10 @@ def run(
 
     student.train()
     total_steps = (len(batches) // grad_accum) * s5["epochs"]
-    log.info("Stage 5: %d routers trainable; %d steps (grad-accum=%d)",
+    remaining_steps = max(0, total_steps - resume_step)
+    log.info("Stage 5: %d routers trainable; %d steps total / %d remaining (grad-accum=%d, resume_step=%d)",
              sum(1 for _ in student.parameters() if _.requires_grad),
-             total_steps, grad_accum)
+             total_steps, remaining_steps, grad_accum, resume_step)
     trailing = len(batches) % grad_accum
     if trailing != 0:
         log.warning(
