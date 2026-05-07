@@ -1192,6 +1192,14 @@ def _lm_eval_tasks(model, tokenizer, tasks: list[str], *, collect=None,
         log.warning("lm-eval not available (%s); skipping zero-shot.", err)
         return {}
 
+    # Spec §9 #2: lm-eval batch-size invariance requires eager attention.
+    _attn_impl = getattr(model.config, "_attn_implementation", None)
+    if _attn_impl != _STAGE6_ATTN_IMPLEMENTATION:
+        raise RuntimeError(
+            f"Stage 6 _lm_eval_tasks: model.config._attn_implementation="
+            f"{_attn_impl!r}, expected {_STAGE6_ATTN_IMPLEMENTATION!r} per "
+            "spec §9 #2 (batch-size-independent loglikelihood requires eager attn)."
+        )
     try:
         lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
         out = simple_evaluate(
@@ -1248,6 +1256,19 @@ def _generate_batched(model, tokenizer, prompts: list[str], *, max_new: int,
     # Concurrent callers would race on both the save and the restore, producing
     # non-deterministic tokenizer state mid-batch.  Use a copy of the tokenizer
     # if concurrent access is required.
+    # Spec §9 #3/#4: argmax-identity bs=1 ↔ batched generate requires
+    # eager attention (sdpa/flash can drift batched logits by ~1e-5 and
+    # flip near-tied argmax). Defensive re-assertion (the load-time pin
+    # in run_pipeline._load_for_stage already enforces this; this guard
+    # catches a future regression where someone wraps generate() or
+    # swaps attn impl mid-run).
+    _attn_impl = getattr(model.config, "_attn_implementation", None)
+    if _attn_impl != _STAGE6_ATTN_IMPLEMENTATION:
+        raise RuntimeError(
+            f"Stage 6 _generate_batched: model.config._attn_implementation="
+            f"{_attn_impl!r}, expected {_STAGE6_ATTN_IMPLEMENTATION!r} per "
+            "spec §9 #3/#4 binding requirement (bs=1↔batched argmax-identity)."
+        )
     original_padding_side = tokenizer.padding_side
     original_pad_token_id = tokenizer.pad_token_id
     tokenizer.padding_side = "left"
