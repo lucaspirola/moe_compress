@@ -1303,7 +1303,7 @@ def _save_covariance(cov: InputCovarianceAccumulator, path: Path) -> None:
         # shallow dict of shared tensor references that could be mutated concurrently.
         cov_snapshot = {k: v.clone() for k, v in cov.covariance.items()}
         tok_snapshot = dict(cov.token_count)
-    torch.save({"covariance": cov_snapshot, "tokens": tok_snapshot}, tmp)
+    torch.save({"format_version": 1, "covariance": cov_snapshot, "tokens": tok_snapshot}, tmp)
     _durable_rename(tmp, path)
     log.info("Saved Stage 2 input covariance to %s", path)
 

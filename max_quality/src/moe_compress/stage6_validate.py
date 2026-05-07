@@ -1326,7 +1326,7 @@ def _generate_batched(model, tokenizer, prompts: list[str], *, max_new: int,
             batch_prompts = prompts[i:i + batch_size]
             encoded = tokenizer(
                 batch_prompts, return_tensors="pt", padding=True,
-                truncation=False, add_special_tokens=True,
+                truncation=False, add_special_tokens=False,
             )
             if _gen_dev is not None:
                 encoded = {k: v.to(_gen_dev) for k, v in encoded.items()}

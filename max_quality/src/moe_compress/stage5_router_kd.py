@@ -208,7 +208,18 @@ def run(
                     if isinstance(_cfg_dm, dict) and len(_cfg_dm) == 1:
                         _device_map = _cfg_dm
                     else:
-                        _device_map = {"": 0}
+                        # Co-locate 4-bit teacher with the student rather than
+                        # blindly pinning to GPU 0 — `device` (or the student's
+                        # actual placement) is the source of truth so KL forward
+                        # doesn't perform a cross-device round-trip per microbatch.
+                        if device is not None:
+                            _device_map = {"": str(device)}
+                        else:
+                            try:
+                                _student_device = next(student.parameters()).device
+                                _device_map = {"": str(_student_device)}
+                            except (StopIteration, AttributeError):
+                                _device_map = {"": 0}
                 else:
                     _device_map = _cfg_dm
                 log.info("Loading teacher for KD (first live batch): %s "
