@@ -181,7 +181,7 @@ The expert output representations are accumulated into per-layer representation 
 
 Using the MA-formation layer set `L` constructed in Phase A, Stage 1 computes the global set `A = {a_{l,e}}` of max down_proj output magnitudes restricted to layers in `L`, then applies the three-way AND criterion from Eq. 6. Emit `stage1_blacklist.json`.
 
-**Algorithm (Algorithm 1 — Stage 2 block, lines 14–32 inclusive of the `Stage 2:` header at line 13; the `l ∈ L` restriction is enforced at the layer-loop header on line 16):**
+**Algorithm (Algorithm 1 — Stage 2 block, lines 14–32; line 13 is the `Stage 2:` section header; the `l ∈ L` restriction is enforced at the layer-loop header on line 16):**
 
 ```
 A ← ∅
@@ -379,7 +379,7 @@ During the profiling forward pass, two covariance matrices are accumulated per (
 - **A_gate_up** (`gate_proj`): Input covariance for gate_proj and up_proj (shared tensor)
 - **A_down** (`down_proj`): Input covariance for down_proj (intermediate activations)
 
-Stored in `_stage2_input_covariance.pt` (fp32 storage; Swift-SVD paper 2604.01609 certifies FP32 for covariance accumulation; FP32 also avoids numerical degradation in eigendecomposition). On H200 with `batch_size=6`, the covariance accumulates signal across all 4000 calibration samples, providing well-conditioned A matrices for Stage 3.
+Stored in `_stage2_input_covariance.pt` (fp16 persisted dtype per [D-cov-storage-fp16]; eigendecomposition still runs in fp64 in-memory in Stage 3, so numerical conditioning is preserved). On H200 with `batch_size=6`, the covariance accumulates signal across all 4000 calibration samples, providing well-conditioned A matrices for Stage 3.
 
 ### Budget Bump Loop
 

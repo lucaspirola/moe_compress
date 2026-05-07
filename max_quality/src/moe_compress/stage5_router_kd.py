@@ -433,6 +433,14 @@ def run(
                     _move_optimizer_state_to_device(optim, next(iter(_trainable_devices)))
                 elif device is not None:
                     _move_optimizer_state_to_device(optim, device)
+                else:
+                    log.warning(
+                        "Stage 5 resume: trainable parameters span %d devices (%s) "
+                        "and `device` is None — optimizer state left on its loaded "
+                        "device; subsequent optim.step() may fail with a CPU/CUDA "
+                        "mismatch on multi-device sharded resumes.",
+                        len(_trainable_devices), sorted(str(d) for d in _trainable_devices),
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.warning("Stage 5 resume: optimizer state device migration failed (%s); proceeding", exc)
             resume_step = int(payload["step"])
@@ -593,13 +601,17 @@ def run(
                 step += 1
                 if step % config["logging"]["log_every_n_steps"] == 0:
                     # Single device→host sync per log boundary (vs per-microbatch).
+                    # The window covers the period since the previous log line —
+                    # not a single optimizer step — so the reported loss is the
+                    # window mean, not an instantaneous step loss. The label below
+                    # uses "window_loss" to make this explicit.
                     if window_loss_acc:
                         loss_val = sum(t.item() for t in window_loss_acc) / len(window_loss_acc)
                     else:
                         loss_val = 0.0
                     window_loss_acc.clear()
                     log.info(
-                        "  epoch=%d step=%d loss=%.6f grad_norm=%.4f",
+                        "  epoch=%d step=%d window_loss=%.6f grad_norm=%.4f",
                         epoch, step, loss_val, grad_norm,
                     )
                     payload = {
