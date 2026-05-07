@@ -459,7 +459,7 @@ def _detect_ma_layers(
             # cross-batch maxima; they may peak on different batches. The ratio is
             # therefore cumulative-vs-cumulative, matching spec §4 Phase A line 156's
             # "across all calibration batches" wording — valid under the input-stable MA
-            # assumption (spec §4 Phase A, paper §3.2.2 lines 405–406) but worth noting.
+            # assumption (spec §4 Phase A; paper §3.2.1 last paragraph at lines 405–406) but worth noting.
             if prev_max > 0 and layer_max[layer_idx] / prev_max > ma_growth_ratio:
                 L.add(layer_idx)
 

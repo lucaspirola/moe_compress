@@ -101,7 +101,11 @@ def run(
     # Spec §5 "Covariance Side-Collection": FP32 storage is recommended by
     # Swift-SVD paper 2604.01609 (avoids numerical degradation in eigendecomposition);
     # the dtype is configurable via covariance_storage_dtype.
-    cov_dtype = getattr(torch, s2.get("covariance_storage_dtype", "float32"))
+    # Default fp16 per §12 D-cov-storage-fp16 (10 mantissa bits, half the
+    # disk vs fp32, no measurable downstream PPL drift on Qwen3-30B-A3B).
+    # Production config also pins this to fp16; the default is here for
+    # config-omitted invocations.
+    cov_dtype = getattr(torch, s2.get("covariance_storage_dtype", "float16"))
     cov_acc.set_storage_dtype(cov_dtype)
     merge_map: dict[int, dict[int, list[int]]] = {}
 
