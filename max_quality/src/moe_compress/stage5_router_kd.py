@@ -65,8 +65,8 @@ def run(
     # Vocabulary-level KD does not use merge_map; see ALGORITHM_REFERENCE.md §8.
 
     # Stage 5 holds teacher (~70 GB BF16) AND student (~50 GB BF16) on cuda
-    # at once — exceeds 80 GB A100 and forces CPU offload (5–10× slowdown).
-    # Two mitigations:
+    # at once. On H200 (141 GB) both fit with ~15 GB headroom (per §8 spec).
+    # Mitigations are still available for tighter-VRAM hosts:
     #   (A) teacher_load_in_4bit: true  — bitsandbytes NF4, ~17 GB live.
     #   (B) teacher_logits_cache: <path> — sidecar produced by
     #       hf_jobs/precompute_teacher_logits.py; skip live teacher entirely.
@@ -196,7 +196,7 @@ def run(
                     log.warning(
                         "Stage 5: config['model']['load_in_4bit']=true but "
                         "stage5_router_kd.teacher_load_in_4bit=false. The teacher "
-                        "will load in BF16 (~70 GB) and likely OOM the A100. "
+                        "will load in BF16 (~70 GB) and may OOM tighter-VRAM hosts. "
                         "Set teacher_load_in_4bit: true to match."
                     )
                 # 4-bit (bitsandbytes) requires a single-device map; honor the
@@ -414,6 +414,14 @@ def run(
             log.info("Stage 5: resumed from step %d (epoch %d, batch %d)",
                      resume_step, resume_epoch, resume_batch_i)
 
+    # `train()` enables dropout / batchnorm-train semantics on every submodule.
+    # For Qwen3-30B-A3B and the production target (no dropout, RMSNorm only),
+    # this is a no-op. For architectures with dropout in attention or MLP, the
+    # frozen submodules would still emit dropped activations — a silent
+    # train-vs-eval mismatch that could distort the KD signal. Spec §8 requires
+    # only `mlp.gate.weight` to be trainable; the rest of the module tree is
+    # frozen via _freeze_non_routers but stays in train mode here. If a future
+    # architecture variant introduces dropout, set frozen submodules to eval().
     student.train()
     total_steps = (len(batches) // grad_accum) * s5["epochs"]
     remaining_steps = max(0, total_steps - resume_step)
