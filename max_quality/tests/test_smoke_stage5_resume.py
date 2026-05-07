@@ -262,9 +262,11 @@ def test_stage5_resume_step_counter_continues(
 
     original_save = stage5_router_kd._save_stage5_checkpoint
 
-    def _capture_save(partial_dir, step, epoch, batch_idx, student, optim):
+    def _capture_save(partial_dir, step, epoch, batch_idx, student, optim, grad_accum=1, **_kw):
         steps_seen.append(step)
-        return original_save(partial_dir, step, epoch, batch_idx, student, optim)
+        return original_save(
+            partial_dir, step, epoch, batch_idx, student, optim, grad_accum=grad_accum, **_kw
+        )
 
     monkeypatch.setattr(stage5_router_kd, "_save_stage5_checkpoint", _capture_save)
 
