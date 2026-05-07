@@ -461,11 +461,12 @@ def run(
             if not b_fail and not c_fail:
                 break
 
-            bump = 1
-            if c_fail:
-                # max(..., 1) serves as a floor: ceil(0 * ratio)=0 is unreachable in
-                # practice (effective_target starts at target >= 1), but kept for safety.
-                bump = max(bump, math.ceil(effective_target * cost_bump_ratio))
+            # Spec D-ream-budget-bump: BOTH gates use the same bump formula
+            # max(1, ceil(effective_target * cost_bump_ratio)) — applies to
+            # feasibility (b_fail) AND quality (c_fail) gates uniformly.
+            # Previously the ratio was only applied on c_fail, making
+            # b_fail-only iterations bump by exactly 1 (slow convergence).
+            bump = max(1, math.ceil(effective_target * cost_bump_ratio))
             new_effective = min(effective_target + bump, n_experts)
             if b_fail:
                 log.warning(
