@@ -304,7 +304,7 @@ def spec_from_config(
             raise KeyError(
                 f"calibration config is missing required key {exc} for source='nvidia-cascade'"
             ) from exc
-        unknown = set(subset_weights) - _CASCADE_SUBSETS
+        unknown = set(subset_weights) - _CASCADE_SUBSETS.keys()
         if unknown:
             raise ValueError(
                 f"spec_from_config: unknown subset_weights keys {sorted(unknown)!r}; "
