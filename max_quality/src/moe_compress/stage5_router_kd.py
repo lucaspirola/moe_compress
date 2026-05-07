@@ -409,7 +409,16 @@ def run(
             # was written, even matching counts could pair stale moments with
             # the wrong parameters.
             _ckpt_names: set[str] = set(payload.get("trainable_param_names", []))
-            _current_names = {n for n, p in student.named_parameters() if p.requires_grad}
+            # Use unwrapped student so that names match what
+            # _save_stage5_checkpoint persisted (also unwrapped). With
+            # torch_compile=true, student.named_parameters() returns
+            # `_orig_mod.*`-prefixed names that wouldn't match the saved
+            # unprefixed set, causing every resume to falsely fail the
+            # trainable-scope-changed check.
+            _unwrapped_for_resume = getattr(student, "_orig_mod", student)
+            _current_names = {
+                n for n, p in _unwrapped_for_resume.named_parameters() if p.requires_grad
+            }
             if _ckpt_names and _ckpt_names != _current_names:
                 added = sorted(_current_names - _ckpt_names)
                 removed = sorted(_ckpt_names - _current_names)
