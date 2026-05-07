@@ -727,7 +727,7 @@ where `z_T, z_S ∈ ℝ^{|V|}` are teacher/student vocabulary logits, `m_{t+1} �
 
 | Parameter | Value | Source |
 |-----------|-------|--------|
-| Optimizer | AdamW | Adapted (paper unspecified — paper §F.3 Table 1 lists no optimizer; AdamW is the project default) |
+| Optimizer | AdamW (`weight_decay=0.0`) | Adapted (paper unspecified — paper §F.3 Table 1 lists no optimizer; AdamW is the project default. `weight_decay=0.0` overrides PyTorch's 0.01 default to avoid regularizing the small router-gate matrix toward zero, since only `mlp.gate.weight` is trainable and there are no other parameters absorbing the decay term.) |
 | Learning rate | **5×10⁻⁵** | Paper Table 1 (implementation previously used 1e-5; corrected to match paper) |
 | Epochs | 1 | Paper |
 | Batch size | 8 | Adapted (paper: 2 with grad-accum=4 → effective 8; spec uses 8 with grad-accum=1, mathematically equivalent). (Loss is per-sequence-normalized by `N_x` per Eq. 3, so microbatch grouping does not rescale individual sequence contributions.) |
