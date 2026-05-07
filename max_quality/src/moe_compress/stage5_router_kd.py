@@ -130,19 +130,15 @@ def run(
             # indexes into the cache via (epoch * len(batches) + i) *
             # cache_tokens_per_batch, so a cache sized at epochs_cfg * cfg_n
             # is the canonical multi-epoch layout.
-            # When epochs_cfg > 1, only the canonical multi-epoch cache layout
-            # (cache_n == epochs_cfg * cfg_n) is acceptable here; a
-            # single-epoch cache would later be hard-rejected at the
-            # epochs+cache pre-training guard, so fail closer to the cause.
-            if epochs_cfg > 1:
-                allowed_sizes = {epochs_cfg * cfg_n}
-            else:
-                allowed_sizes = {cfg_n}
-            if cache_n not in allowed_sizes:
+            # The multi-epoch + cache combination is hard-rejected later (the
+            # student input replays identically across epochs while cache
+            # advances — silent KD corruption). So at this point only
+            # epochs_cfg=1 with cache_n=cfg_n is valid; reject anything else
+            # with a clear message that points at the right config knob.
+            if cache_n != cfg_n:
                 raise RuntimeError(
                     f"Teacher-logits cache num_samples={cache_n} disagrees with "
-                    f"stage5_router_kd.max_calibration_samples={cfg_n} "
-                    f"(or epochs×cfg_n={epochs_cfg * cfg_n} for multi-epoch). "
+                    f"stage5_router_kd.max_calibration_samples={cfg_n}. "
                     "Stage 5 would read past the end of the cache — regenerate or align."
                 )
             # Topology check: the cache must be keyed against this student's
