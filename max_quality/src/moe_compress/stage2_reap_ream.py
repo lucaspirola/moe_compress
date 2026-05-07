@@ -39,6 +39,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from .utils.activation_hooks import (
@@ -208,6 +209,10 @@ def run(
 
             # ream_acc is not passed here: neuron means are not persisted to disk,
             # so permutation alignment on resume uses only gate/up weights.
+            # B-C-L-1 TODO: persisting neuron-mean tensors alongside merge_{layer}.json
+            # would weaken the spec invariant C = C_wt + C_act on resume. Currently
+            # the resume path uses C = C_wt only (no C_act); fix would require a
+            # larger artifact-format change to save/restore the neuron-mean tensors.
             log.warning(
                 "layer %d (resume): neuron-mean activation data not available on resume — "
                 "permutation alignment uses weight-only cost (C_gate + C_up, no C_act). "
@@ -245,7 +250,10 @@ def run(
             log.info("Stage 2: resumed %d / %d layers from %s",
                      len(completed_layers), len(moe_layers), partial_dir)
 
-    max_group_cap: int = s2.get("max_merge_group_size", 0) or 0
+    # B-C-H-1: default to 8 (D5a value) so REAM merging always has a per-centroid
+    # cap, preventing degenerate one-centroid-absorbs-all groupings. Setting to 0
+    # explicitly disables the cap (uncapped path); users must opt in to that.
+    max_group_cap: int = int(s2.get("max_merge_group_size", 8) or 8)
     cost_sigma: float = s2.get("ream_cost_sigma_threshold", float("inf"))
     cost_bump_ratio: float = s2.get("ream_cost_bump_ratio", 0.10)
     min_active_tokens: int = s2.get("reap_min_active_tokens", 0)
@@ -775,6 +783,15 @@ def _profile_layer(
     # partial batch when num_calibration_samples % batch_size != 0.
     _batch_offset = 0  # cumulative token start of current batch
     _next_offset = 0   # cumulative token count after current batch
+    # B-C-C-1: full-softmax cache for the current batch's router logits.
+    # Spec §5 line 339 + D-ream-sparse-routing require σ(x)_e (the
+    # un-renormalized full softmax over ALL experts), not the top-k
+    # renormalized weights returned by Qwen3_5MoeTopKRouter.forward.
+    # Populated by an experts-module pre-forward hook that runs AFTER the
+    # router pre-forward hook (which captures the raw logits) but BEFORE any
+    # expert forward (which fires down_cb). down_cb reads _full_softmax[0]
+    # to obtain σ(x)_e at active token positions.
+    _full_softmax: list[torch.Tensor | None] = [None]
 
     def input_cb(li, e, tensor, ctx):
         cov_acc.update(li, e, "gate_proj", tensor)
@@ -786,10 +803,45 @@ def _profile_layer(
     def down_cb(li, e, tensor, ctx):
         # _batch_offset is only read here, never assigned; no nonlocal declaration needed.
         record_reap(reap_acc, li, e, ctx["top_k_weights"], tensor)
+        # B-C-C-1: pass σ(x)_e (full softmax over all experts) at active token
+        # positions for this expert, NOT ctx["top_k_weights"] (renormalized to
+        # sum=1 over top-k). The pre-forward hook installed below populates
+        # _full_softmax[0] before any expert forward fires.
+        token_idx = ctx["token_idx"]
+        fs = _full_softmax[0]
+        if fs is not None:
+            # Index the cached [T, n_experts] full-softmax tensor at the
+            # active token positions for this expert. Result shape: [|active|].
+            # Move to device of expert_output to avoid a CPU↔GPU mismatch in
+            # the (gate * expert_output) multiplication inside record_gated_output.
+            sigma_e = fs[token_idx.cpu(), e].to(tensor.device)
+        else:
+            log.warning(
+                "down_cb: full-softmax cache empty for layer %d expert %d — "
+                "falling back to top_k_weights (renormalized; spec-degraded).",
+                li, e,
+            )
+            sigma_e = ctx["top_k_weights"]
         ream_acc.record_gated_output(
-            li, e, ctx["top_k_weights"], tensor,
-            ctx["token_idx"], _batch_offset,
+            li, e, sigma_e, tensor,
+            token_idx, _batch_offset,
         )
+
+    # B-C-C-1: pre-forward hook on the experts module that computes the full
+    # softmax from the latest captured router logits. Runs after the router
+    # pre-forward hook (which appends to router_logits_storage[layer_idx])
+    # but before the experts forward (which fires down_cb). Because
+    # capture_router_outputs's hook is a *router* pre-forward hook and this
+    # one is an *experts* pre-forward hook, ordering is guaranteed by the
+    # decoder layer's call sequence (router runs first, dispatches to experts).
+    def _populate_full_softmax(_module, _inputs):
+        if router_logits_storage[layer_idx]:
+            batch_logits = router_logits_storage[layer_idx][-1]
+            # F.softmax over the last (expert) dim → [T, n_experts] σ(x)_e values.
+            # .float() avoids dtype mismatch when the router runs in bf16.
+            _full_softmax[0] = F.softmax(batch_logits.float(), dim=-1).cpu()
+        else:
+            _full_softmax[0] = None
 
     try:
         with instrument_experts(
@@ -797,22 +849,31 @@ def _profile_layer(
             {"input": input_cb, "intermediate": intermediate_cb, "down": down_cb},
         ), capture_router_outputs([layer_ref]) as router_logits_storage, \
              early_exit_after_layer(model, layer_idx):
-            for batch in batches:
-                if device is not None:
-                    batch = batch.to(device)
-                _batch_offset = _next_offset
-                router_logits_storage[layer_idx].clear()
-                with torch.no_grad():
-                    try:
-                        model(input_ids=batch)
-                    except _EarlyExitException:
-                        pass  # expected — target layer completed
-                if router_logits_storage[layer_idx]:
-                    batch_logits = router_logits_storage[layer_idx][-1]
-                    ream_acc.record_router_logits(layer_idx, batch_logits, _batch_offset)
-                ream_acc.finalize_batch(layer_idx, n_experts)
-                ream_acc.record_batch_token_count(layer_idx, batch.shape[0] * batch.shape[1])
-                _next_offset += batch.shape[0] * batch.shape[1]
+            # Install the experts pre-forward hook AFTER capture_router_outputs
+            # so the router hook fires first per batch.
+            _experts_handle = layer_ref.experts_module.register_forward_pre_hook(
+                _populate_full_softmax
+            )
+            try:
+                for batch in batches:
+                    if device is not None:
+                        batch = batch.to(device)
+                    _batch_offset = _next_offset
+                    router_logits_storage[layer_idx].clear()
+                    _full_softmax[0] = None
+                    with torch.no_grad():
+                        try:
+                            model(input_ids=batch)
+                        except _EarlyExitException:
+                            pass  # expected — target layer completed
+                    if router_logits_storage[layer_idx]:
+                        batch_logits = router_logits_storage[layer_idx][-1]
+                        ream_acc.record_router_logits(layer_idx, batch_logits, _batch_offset)
+                    ream_acc.finalize_batch(layer_idx, n_experts)
+                    ream_acc.record_batch_token_count(layer_idx, batch.shape[0] * batch.shape[1])
+                    _next_offset += batch.shape[0] * batch.shape[1]
+            finally:
+                _experts_handle.remove()
     finally:
         if was_training:
             model.train()
@@ -876,6 +937,9 @@ def _ream_cost_matrix(
             sim_gate   = float(sim_gate_sub[ci, cj])
             sim_expert = ream_acc.compute_delta_expert(li, child, centroid)
             if math.isnan(sim_expert):
+                # B-C-N-2: When δ̃_expert returns NaN (no joint activations),
+                # substitute 0.0 (no similarity); biases the cost up to
+                # 0.5 + 0.5*δ_gate per D-ream-sparse-routing.
                 sim_expert = 0.0  # no profiling data; treat as no similarity
             # δ_REAM = (δ_gate + δ̃_expert) / 2 ∈ [0,1]; cost = 1 − δ_REAM ∈ [0,1].
             # Lower cost = more similar (spec §5 Step 2, reference ream/ream.py L46-53).
@@ -1000,6 +1064,10 @@ def _permutation_align_to_centroid(
     child_act_mean: torch.Tensor | None = None,
 ) -> np.ndarray:
     def _safe_norm(M):
+        # B-C-L-2: when M is all-zero (or constant), m_max == m_min and we fall
+        # through to torch.zeros_like(M). This means a zero-distance pair stays
+        # zero (no cost contribution from that component) — the desired behavior
+        # for Hungarian assignment where ties resolve arbitrarily.
         m_min = float(M.min())
         m_max = float(M.max())
         if m_max > m_min:
@@ -1024,10 +1092,15 @@ def _permutation_align_to_centroid(
         # L2-normalized activation distances (O(1/√d_ffn)) are not
         # negligible relative to gate/up weight distances (O(√d_hidden))
         # — spec §5, PERM-ACT-SCALE.
+        # B-C-M-1: spec §5 / D5b defines C = C_act + C_wt where C_wt is the
+        # gate+up Frobenius distance treated as a SINGLE component (sum first,
+        # then normalize once), not two separately-normalized components.
         C_act = _safe_norm(C_act)
-        C = _safe_norm(C_gate) + _safe_norm(C_up) + C_act
+        C_wt = _safe_norm(C_gate + C_up)
+        C = _safe_norm(C_act) + C_wt
     else:
-        C = _safe_norm(C_gate) + _safe_norm(C_up)
+        # B-C-M-1: same single-component treatment for the no-activation path.
+        C = _safe_norm(C_gate + C_up)
     _, col_ind = linear_sum_assignment(C.numpy())
     return col_ind
 
@@ -1060,6 +1133,15 @@ def _merge_experts_inplace(
                     weights[:] = 1.0
                 weights /= weights.sum()
             else:
+                # B-C-M-2: spec mandates frequency-weighted merge per REAM Eq. 6;
+                # equal-weights is for ablation only and produces non-spec-compliant
+                # merges. Warn loudly so this is observable in logs.
+                log.warning(
+                    "Spec mandates frequency-weighted merge per REAM Eq. 6; "
+                    "equal-weights is for ablation only and produces "
+                    "non-spec-compliant merges. (layer=%d centroid=%d members=%d)",
+                    li, centroid, len(members),
+                )
                 weights = np.ones(len(members), dtype=np.float64)
                 weights /= weights.sum()  # equal weights; no zero-sum risk
 

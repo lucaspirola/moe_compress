@@ -112,7 +112,10 @@ def test_stage2_resume_skips_completed_layers(tiny_model, patched_stage2, tmp_pa
     # Verify merge JSON structure.
     data = json.loads((partial_dir / f"merge_{layer0_idx}.json").read_text())
     assert data["format_version"] == 1
-    assert "centroid_ids" in data
+    # Field renamed from "centroid_ids" → "final_kept_ids" in format_version 1
+    # (resume path still accepts the old name for backward compat — tested
+    # implicitly via _stage2_partial migration).
+    assert "final_kept_ids" in data
     assert "grouped" in data
     assert "freq" in data
     assert "merge_map_layer" in data
