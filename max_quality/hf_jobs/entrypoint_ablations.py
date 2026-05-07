@@ -100,6 +100,23 @@ def main() -> int:
     if not config_path.exists():
         raise RuntimeError(f"Config not found at {config_path}")
 
+    # Initialize Trackio with a job-level run name BEFORE the pre-flight
+    # Stage 1 fires any _trackio_log() calls. The per-ablation run_ablations
+    # driver later finishes this run and starts per-ablation runs. Without
+    # this init the pre-flight Stage 1 emits would surface a "Call trackio.init
+    # before trackio.log" warning + drop the metrics.
+    try:
+        import trackio
+        trackio.init(
+            project="moe-compress-strategy-a",
+            name="ablation-preflight",
+            space_id=os.environ.get("TRACKIO_SPACE_ID", "pirola/trackio"),
+            config={"role": "preflight_stage1"},
+        )
+        LOG.info("Trackio initialized (project=moe-compress-strategy-a, name=ablation-preflight)")
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("trackio.init failed (%s) — continuing without observability", exc)
+
     from moe_compress.run_ablations import main as run_ablations_main
     argv = [
         "--config", str(config_path),
