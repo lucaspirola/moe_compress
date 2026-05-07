@@ -222,6 +222,7 @@ def tiny_config():
             "swift_svd_plus": {
                 "alpha_grid": [0.5], "validation_samples": 2,
                 "metric": "wikitext2_ppl", "per_group_type": True,
+                "alpha_search_min_host_ram_gb": 0.0,
             },
             "aa_svd": {"use_post_prune_inputs": True, "cross_covariance": False},
             "block_refine": {"enabled": False, "lbfgs_steps": 5,
