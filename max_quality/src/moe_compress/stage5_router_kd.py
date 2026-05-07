@@ -119,7 +119,14 @@ def run(
             # indexes into the cache via (epoch * len(batches) + i) *
             # cache_tokens_per_batch, so a cache sized at epochs_cfg * cfg_n
             # is the canonical multi-epoch layout.
-            allowed_sizes = {cfg_n, epochs_cfg * cfg_n}
+            # When epochs_cfg > 1, only the canonical multi-epoch cache layout
+            # (cache_n == epochs_cfg * cfg_n) is acceptable here; a
+            # single-epoch cache would later be hard-rejected at the
+            # epochs+cache pre-training guard, so fail closer to the cause.
+            if epochs_cfg > 1:
+                allowed_sizes = {epochs_cfg * cfg_n}
+            else:
+                allowed_sizes = {cfg_n}
             if cache_n not in allowed_sizes:
                 raise RuntimeError(
                     f"Teacher-logits cache num_samples={cache_n} disagrees with "
@@ -409,8 +416,20 @@ def run(
                     f"original trainable_name_patterns."
                 )
             optim.load_state_dict(payload["optim_state"])
-            if device is not None:
-                _move_optimizer_state_to_device(optim, device)
+            # Move optimizer state to wherever the trainable params actually
+            # live, not just the explicit `device` arg. Under HF
+            # `device_map="auto"` the caller may pass `device=None` while
+            # params reside on CUDA; loading from a CPU checkpoint without
+            # this move would crash on the first optim.step() with a
+            # device-mismatch.
+            try:
+                _trainable_devices = {p.device for p in student.parameters() if p.requires_grad}
+                if len(_trainable_devices) == 1:
+                    _move_optimizer_state_to_device(optim, next(iter(_trainable_devices)))
+                elif device is not None:
+                    _move_optimizer_state_to_device(optim, device)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Stage 5 resume: optimizer state device migration failed (%s); proceeding", exc)
             resume_step = int(payload["step"])
             resume_epoch = int(payload["epoch"])
             resume_batch_i = int(payload["batch_idx"])
