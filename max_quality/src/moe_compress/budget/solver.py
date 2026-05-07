@@ -266,7 +266,11 @@ def solve(
             tolerance, 0.5 * quant_granularity,
         )
 
-    ep_prev, sp_prev = ep, sp  # stagnation detection: snapshot before iter 0 so iter 1 compares against iter 0's pre-computation values
+    # Stagnation detection state ep_prev/sp_prev is assigned at the top of each
+    # iteration body (see inside the loop) before the next iteration's check
+    # reads it.  The `it > 0` guard skips the check on iter 0, by which point
+    # ep_prev/sp_prev have already been written by iter-0's snapshot — so no
+    # pre-loop seed is needed.
     last_iter: int | None = None  # track last completed iteration for error reporting
     for it in range(max_iterations):
         # Stagnation check: compare ep/sp entering THIS iteration against values
@@ -343,8 +347,8 @@ def solve(
         # projected_total_reduction > 0 is guaranteed by two invariants: (a) at least one of ep
         # or sp is positive (both are initialised > 0 and the floor-clamp branch's sp formula
         # always gives sp > 0 when ep = 0), so expert_savings > 0; (b) expert_params > 0
-        # (verified at line 143).  Together these ensure the denominator and numerator are
-        # both positive.
+        # (verified by the `expert_params == 0` guard above).  Together these ensure the
+        # denominator and numerator are both positive.
         assert projected_total_reduction > 0, (
             "unreachable: ep > 0 or sp > 0 is maintained as a loop invariant, "
             "ensuring expert_savings > 0 given expert_params > 0"
