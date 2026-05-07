@@ -335,12 +335,15 @@ def _build_imatrix_calibration_corpus(
     rows = []
     for row in ds:
         text = row.get("text", "")
-        if text and text.strip():
-            rows.append(text)
-    # F-iter4-M-3: align row joiner with the WikiText-2 PPL eval ("\n\n").
-    # Both inputs (PPL eval + imatrix calibration) now use the same convention,
-    # so imatrix activation statistics see a token distribution comparable to
-    # what the PPL gate measures. (Eval uses "\n\n" — see _wikitext2_ppl.)
+        # Preserve empty rows for symmetry with _wikitext2_ppl: both inputs
+        # use the canonical HF/lm-eval recipe (empty rows produce the
+        # expected paragraph-spacing tokens via the "\n\n" joiner). Filtering
+        # empties here would drift imatrix activation statistics from the
+        # PPL gate's token distribution beyond the joiner-only alignment
+        # the spec describes.
+        rows.append(text)
+    # Spec §9 line 783: shared "\n\n" joiner across PPL eval and imatrix
+    # calibration so imatrix activation statistics see comparable tokens.
     joined = "\n\n".join(rows)
     if not joined.strip():
         log.warning("imatrix calibration: WikiText-2 train split is empty after filtering; skipping write")
@@ -791,6 +794,13 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
         # it would spawn a sequential GGUF write that races the still-live bg thread.
         _trackio_log({"stage6/imatrix_skipped": 1.0})
         results["imatrix_skipped"] = True
+        # eval_text_concat.txt is an unconditional debug side-channel per spec
+        # §9 — write it even on the skipped-imatrix path so the dashboard
+        # has the captured prompts available for triage.
+        try:
+            _write_eval_text_concat(eval_text_concat, artifacts_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("imatrix-skipped path: eval_text_concat write failed (%s)", exc)
     elif cached_teacher_results is None and f16_path is not None:
         _run_llama_imatrix_with_prebuilt_gguf(
             eval_text_concat, s6.get("imatrix", {}), artifacts_dir, gguf_result,
