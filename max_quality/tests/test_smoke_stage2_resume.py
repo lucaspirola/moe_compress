@@ -90,11 +90,12 @@ def test_stage2_resume_skips_completed_layers(tiny_model, patched_stage2, tmp_pa
     original_profile = stage2_reap_ream._profile_layer
     call_count = [0]
 
-    def _crashing_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, *, device):
+    def _crashing_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs):
+        # Forward-compatible kwargs handling (see test_stage2_resume_produces_same_merge_map).
         call_count[0] += 1
         if call_count[0] > 1:
             raise RuntimeError("simulated crash after layer 0")
-        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, device=device)
+        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs)
 
     monkeypatch.setattr(stage2_reap_ream, "_profile_layer", _crashing_profile)
 
@@ -111,14 +112,18 @@ def test_stage2_resume_skips_completed_layers(tiny_model, patched_stage2, tmp_pa
 
     # Verify merge JSON structure.
     data = json.loads((partial_dir / f"merge_{layer0_idx}.json").read_text())
-    assert data["format_version"] == 1
-    # Field renamed from "centroid_ids" → "final_kept_ids" in format_version 1
-    # (resume path still accepts the old name for backward compat — tested
-    # implicitly via _stage2_partial migration).
+    # Stage 2 v2 (spec § 12.1): format_version bumped 1 → 2 for the new
+    # assignment_solver / cost_alignment / EM / distill_state forensic fields.
+    # No backward-compat shim — operators on a v1 partial must delete and re-run.
+    assert data["format_version"] == 2
     assert "final_kept_ids" in data
     assert "grouped" in data
     assert "freq" in data
     assert "merge_map_layer" in data
+    assert "assignment_solver_used" in data
+    assert "cost_alignment_used" in data
+    assert "em_rounds_completed" in data
+    assert "distill_state" in data
 
     # --- Restore model to pre-crash (pre-stage-2) state using the deep copy ---
     model_for_resume = copy.deepcopy(model_before_s2)
@@ -127,9 +132,10 @@ def test_stage2_resume_skips_completed_layers(tiny_model, patched_stage2, tmp_pa
     monkeypatch.setattr(stage2_reap_ream, "_profile_layer", original_profile)
     second_call_count = [0]
 
-    def _counting_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, *, device):
+    def _counting_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs):
+        # Forward-compatible kwargs handling: Phase 3 added ``layer_input_acc``.
         second_call_count[0] += 1
-        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, device=device)
+        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs)
 
     monkeypatch.setattr(stage2_reap_ream, "_profile_layer", _counting_profile)
 
@@ -180,11 +186,14 @@ def test_stage2_resume_produces_same_merge_map(tiny_model, patched_stage2, tmp_p
     original_profile = stage2_reap_ream._profile_layer
     call_count = [0]
 
-    def _crash_after_first(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, *, device):
+    def _crash_after_first(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs):
+        # Phase 3 added the optional ``layer_input_acc`` kwarg; accept any
+        # forward-compatible kwargs via **kwargs so this fixture doesn't have
+        # to be updated every time _profile_layer's signature grows.
         call_count[0] += 1
         if call_count[0] > 1:
             raise RuntimeError("crash")
-        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, device=device)
+        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs)
 
     monkeypatch.setattr(stage2_reap_ream, "_profile_layer", _crash_after_first)
     with pytest.raises(RuntimeError, match="crash"):

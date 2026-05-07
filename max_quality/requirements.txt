@@ -7,6 +7,7 @@
 accelerate>=1.0.0        # device_map + CPU offload
 datasets>=3.0.0          # C4 calibration, WikiText-2, HumanEval, MATH-500
 scipy>=1.11.0            # Hungarian assignment in REAM
+ortools>=9.10            # SimpleMinCostFlow for Stage 2 v2 capacitated assignment
 peft>=0.13.0             # optional EoRA prototyping (adapters merged in-place at end)
 lm-eval>=0.4.5           # Stage 6 zero-shot (ARC-C, HellaSwag)
 pyyaml>=6.0              # config loader

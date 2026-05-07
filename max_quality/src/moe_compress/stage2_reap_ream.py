@@ -35,12 +35,19 @@ import math
 import os
 import shutil
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
+from scipy.special import logsumexp
+
+# Stage 2 v2 — solver dispatch literal. Adding new solvers requires
+# updating both this Literal AND the if/else chain in
+# _assign_children_to_centroids. Keep them in sync.
+SolverName = Literal["greedy", "hungarian", "mcf", "auto", "sinkhorn"]
 
 from .utils.activation_hooks import (
     InputCovarianceAccumulator,
@@ -79,6 +86,18 @@ def run(
 ) -> Path:
     s2 = config["stage2_reap_ream"]
     cal = config["calibration"]
+
+    # Stage 2 v2 (spec § 6 / D-asymmetric-freq): cost_asymmetric is valid
+    # only under freq-weighted merge — the asymmetric factor freq_m/(freq_c+freq_m)
+    # is the per-pair version of the merge weight. Reject the combination
+    # at the very top of `run` so misconfigured pipelines fail fast before
+    # spending compute on calibration / Stage-1 artifact loading.
+    if bool(s2.get("cost_asymmetric", False)) and not s2["ream"]["frequency_weighted_merge"]:
+        raise ValueError(
+            "stage2_reap_ream.cost_asymmetric=True requires "
+            "ream.frequency_weighted_merge=True (spec § 5 step 4T(c)(iii) "
+            "/ D-asymmetric-freq)."
+        )
 
     if stage1_budget_path is None:
         stage1_budget_path = artifacts_dir / "stage1_budgets.json"
@@ -153,10 +172,15 @@ def run(
                 continue
             data = json.loads(merge_path.read_text())
             fv = int(data.get("format_version", 0))
-            if fv != 1:
+            if fv != 2:
+                # Stage 2 v2 (spec § 12.1): format_version bumped 1 → 2 to
+                # accommodate the new assignment_solver_used / em_rounds_completed
+                # / distill_state fields. NO backward-compat shim — see
+                # ALGORITHM_REFERENCE.md § 11. Operators upgrading mid-pipeline
+                # must finish a stage on one version or restart cleanly.
                 raise RuntimeError(
                     f"_stage2_partial/merge_{ref.layer_idx}.json has format_version={fv} "
-                    "(expected 1) — delete _stage2_partial/ and re-run Stage 2"
+                    "(expected 2) — delete _stage2_partial/ and re-run Stage 2"
                 )
             # Migration guard: old partial dirs wrote "centroid_ids"; new ones
             # write "final_kept_ids". Accept both for backward compatibility.
@@ -294,6 +318,61 @@ def run(
     cost_sigma: float = s2.get("ream_cost_sigma_threshold", 1.5)
     cost_bump_ratio: float = s2.get("ream_cost_bump_ratio", 0.10)
     min_active_tokens: int = s2.get("reap_min_active_tokens", 0)
+    # Stage 2 v2 — assignment solver dispatch. Default "greedy" reproduces v1
+    # behavior exactly. See max_quality/docs/stage2_assignment_revision.md § 6.
+    # Validate the YAML value at the boundary so typos are caught at the
+    # config-load site rather than at the per-layer call.
+    _solver_value = str(s2.get("assignment_solver", "greedy")).lower()
+    _valid_solvers = ("greedy", "hungarian", "mcf", "auto", "sinkhorn")
+    if _solver_value not in _valid_solvers:
+        raise ValueError(
+            f"stage2_reap_ream.assignment_solver={_solver_value!r} is not a "
+            f"valid solver name; expected one of {_valid_solvers}."
+        )
+    assignment_solver: SolverName = _solver_value  # type: ignore[assignment]
+
+    # Stage 2 v2 cost matrix variants (spec § 5 step 4 / § 6).
+    cost_alignment_cfg: str = str(s2.get("cost_alignment", "pre")).lower()
+    if cost_alignment_cfg not in ("pre", "post"):
+        raise ValueError(
+            f"stage2_reap_ream.cost_alignment={cost_alignment_cfg!r}; "
+            "expected 'pre' or 'post'."
+        )
+    cost_whitening: str = str(s2.get("cost_whitening", "none")).lower()
+    if cost_whitening not in ("none", "diag", "full"):
+        raise ValueError(
+            f"stage2_reap_ream.cost_whitening={cost_whitening!r}; "
+            "expected 'none', 'diag', or 'full'."
+        )
+    cost_asymmetric: bool = bool(s2.get("cost_asymmetric", False))
+    cost_topk_filter: int = int(s2.get("cost_topk_filter", 48))
+    capacity_util_threshold: float = float(s2.get("capacity_util_threshold", 0.25))
+    em_refinement_rounds: int = int(s2.get("em_refinement_rounds", 0))
+    em_convergence_break: bool = bool(s2.get("em_convergence_break", True))
+    sinkhorn_epsilon_init: float = float(s2.get("sinkhorn_epsilon_init", 1.0))
+    sinkhorn_epsilon_final: float = float(s2.get("sinkhorn_epsilon_final", 0.01))
+    sinkhorn_iters: int = int(s2.get("sinkhorn_iters", 200))
+    if em_refinement_rounds < 0:
+        raise ValueError(
+            f"stage2_reap_ream.em_refinement_rounds={em_refinement_rounds}; "
+            "must be >= 0 (set 0 to disable)."
+        )
+    # Phase 3 (M8): per-merge-group expert distillation flags.
+    expert_distill_steps: int = int(s2.get("expert_distill_steps", 0))
+    expert_distill_lr: float = float(s2.get("expert_distill_lr", 1e-4))
+    _betas_raw = s2.get("expert_distill_betas", [0.9, 0.95])
+    expert_distill_betas: tuple[float, float] = (float(_betas_raw[0]), float(_betas_raw[1]))
+    expert_distill_token_cap: int = int(s2.get("expert_distill_token_cap", 8192))
+    expert_distill_skip_singletons: bool = bool(s2.get("expert_distill_skip_singletons", True))
+    expert_distill_plateau_steps: int = int(s2.get("expert_distill_loss_plateau_steps", 50))
+    expert_distill_plateau_eps: float = float(s2.get("expert_distill_loss_plateau_eps", 1e-4))
+    if expert_distill_steps < 0:
+        raise ValueError(
+            f"stage2_reap_ream.expert_distill_steps={expert_distill_steps}; "
+            "must be >= 0 (set 0 to disable)."
+        )
+    # cost_asymmetric × freq_weighted_merge invariant is checked at the very
+    # top of run() (fail-fast); we rely on that here.
 
     for k, layer_ref in enumerate(moe_layers):
         if layer_ref.layer_idx in completed_layers:
@@ -310,10 +389,26 @@ def run(
         )
         reap_acc = ReapAccumulator()
         ream_acc = ReamCostAccumulator()  # fresh accumulator per layer; discarded after this layer's pass
+        # Stage 2 v2 (M1): cache (perm, residual) per (layer, centroid, noncentroid)
+        # so the cost-matrix builder and merge step share Hungarian alignments.
+        # Cleared at the start of every layer.
+        perm_cache = _PermAlignCache()
+        # Phase 3 (M8): capture layer-input hidden states only when
+        # per-expert distillation is enabled, to keep host-RAM cost zero
+        # for runs that don't use the feature.
+        layer_input_acc = (
+            _LayerInputAccumulator(
+                max_samples=expert_distill_token_cap,
+                seed=layer_ref.layer_idx,  # per-layer seed for bit-reproducibility
+            )
+            if expert_distill_steps > 0
+            else None
+        )
         torch.cuda.empty_cache()
         _profile_layer(
             model, layer_ref, batches, reap_acc, cov_acc, ream_acc,
             device=device,
+            layer_input_acc=layer_input_acc,
         )
         # These two finalize calls are independent of each other and could be
         # parallelised (e.g., via concurrent.futures) if profiling shows this
@@ -350,6 +445,7 @@ def run(
         delta = np.empty((0, 0))
         assignment: list[int] = []
         running_mean: float = float("nan")
+        em_rounds_done: int = 0  # populated by _em_refine_assignment in the bump loop
         mean_assigned_cost: float = 0.0
         assigned_cost: float = 0.0
         # Invariant: after the bump loop, assignment is either:
@@ -368,6 +464,11 @@ def run(
         # Loop runs (1 + n_experts - target) times: 1 initial attempt plus up to
         # (n_experts - target) bumps, one per additional kept expert.
         for _bump_attempt in range(n_experts - target + 1):
+            # F1 fix: reset em_rounds_done per bump iteration so the value
+            # persisted in the partial JSON reflects the iteration whose
+            # assignment is actually committed (not a stale value from a
+            # prior bump iteration).
+            em_rounds_done = 0
             # REAM centroid count = total target minus the protected slots.
             ream_target = max(effective_target - n_protected, 0)
 
@@ -427,13 +528,67 @@ def run(
             c_fail = False
 
             if not b_fail:
+                # Stage 2 v2 capacity-utilization gate (M3, spec § 5 step 3):
+                #   u = n_NC / (N'_l × C_max). When u < threshold, the layer
+                #   has so much slack capacity that the heavyweight
+                #   post-alignment cost matrix is unlikely to change the
+                #   assignment meaningfully — fall back to the cheap symmetric
+                #   path. This is what skips ~half the layers' compute.
+                effective_cost_alignment = _pick_effective_alignment(
+                    n_nc=n_ream_nc,
+                    n_c=n_ream_c,
+                    max_group_cap=max_group_cap,
+                    threshold=capacity_util_threshold,
+                    configured=cost_alignment_cfg,
+                )
+                effective_cost_asymmetric = (
+                    cost_asymmetric and effective_cost_alignment == "post"
+                )
                 delta = _ream_cost_matrix(
                     layer_ref, ream_noncentroid_ids, ream_centroid_ids,
                     ream_acc=ream_acc,
                     blacklisted_ids=protected,
+                    cost_alignment=effective_cost_alignment,
+                    cost_whitening=cost_whitening,
+                    cost_asymmetric=effective_cost_asymmetric,
+                    cost_topk_filter=cost_topk_filter,
+                    freq=freq if effective_cost_asymmetric else None,
+                    cov_acc=cov_acc if effective_cost_alignment == "post" else None,
+                    perm_cache=perm_cache,
                 )
                 assignment = _assign_children_to_centroids(
                     delta, n_ream_nc, n_ream_c, max_group_cap,
+                    solver=assignment_solver,
+                    sinkhorn_epsilon_init=sinkhorn_epsilon_init,
+                    sinkhorn_epsilon_final=sinkhorn_epsilon_final,
+                    sinkhorn_iters=sinkhorn_iters,
+                )
+                # Stage 2 v2 EM refinement (spec § 5 step 4T(e) / M4).
+                # Only meaningful when cost_alignment == "post"; otherwise the
+                # cost matrix doesn't depend on centroid weights and EM is a
+                # no-op. _em_refine_assignment guards on this internally.
+                assignment, delta, em_rounds_done = _em_refine_assignment(
+                    layer_ref,
+                    initial_assignment=assignment,
+                    initial_delta=delta,
+                    ream_centroid_ids=ream_centroid_ids,
+                    ream_noncentroid_ids=ream_noncentroid_ids,
+                    perm_cache=perm_cache,
+                    ream_acc=ream_acc,
+                    cov_acc=cov_acc if effective_cost_alignment == "post" else None,
+                    freq=freq,
+                    max_group_cap=max_group_cap,
+                    cost_alignment=effective_cost_alignment,
+                    cost_whitening=cost_whitening,
+                    cost_asymmetric=effective_cost_asymmetric,
+                    cost_topk_filter=cost_topk_filter,
+                    assignment_solver=assignment_solver,
+                    em_rounds=em_refinement_rounds,
+                    em_break=em_convergence_break,
+                    blacklisted_ids=protected,
+                    sinkhorn_epsilon_init=sinkhorn_epsilon_init,
+                    sinkhorn_epsilon_final=sinkhorn_epsilon_final,
+                    sinkhorn_iters=sinkhorn_iters,
                 )
                 _iter_n_assigned = sum(1 for a in assignment if a >= 0)
                 _iter_assigned_cost = (
@@ -609,11 +764,59 @@ def run(
         if n_assigned > 0 and mean_assigned_cost > 0.0 and not (c_fail and effective_target >= n_experts):
             _layer_mean_costs.append(mean_assigned_cost)
 
+        # Phase 3 (M8): snapshot pre-merge expert weights BEFORE the merge
+        # mutates the bank. The snapshot is consumed only by the per-group
+        # distillation step below; released as soon as that finishes for
+        # this layer (Python GC since no module-level reference is held).
+        pre_merge_weights: dict[int, dict[str, torch.Tensor]] | None = None
+        if expert_distill_steps > 0:
+            pre_merge_weights = _snapshot_pre_merge_layer_experts(layer_ref)
+
         _merge_experts_inplace(
             layer_ref, grouped, freq,
             freq_weighted=s2["ream"]["frequency_weighted_merge"],
             ream_acc=ream_acc,
+            perm_cache=perm_cache,
         )
+
+        # Phase 3 (M8): per-merge-group expert distillation (spec § 5 step 7b).
+        distill_state: dict[int, dict] | None = None
+        if expert_distill_steps > 0 and pre_merge_weights is not None:
+            layer_inputs_buf = (
+                layer_input_acc.get() if layer_input_acc is not None else None
+            )
+            if layer_inputs_buf is None or layer_inputs_buf.shape[0] == 0:
+                log.warning(
+                    "layer %d: expert distillation enabled but no layer-input "
+                    "samples were captured during profile — skipping.",
+                    layer_ref.layer_idx,
+                )
+            else:
+                distill_state = {}
+                target_device = layer_ref.layer_module.parameters().__next__().device
+                for centroid, members in grouped.items():
+                    if expert_distill_skip_singletons and len(members) <= 1:
+                        continue
+                    state = _distill_merged_group(
+                        layer_ref=layer_ref,
+                        centroid_id=centroid,
+                        members=members,
+                        freq=freq,
+                        pre_merge_weights=pre_merge_weights,
+                        layer_inputs=layer_inputs_buf,
+                        steps=expert_distill_steps,
+                        lr=expert_distill_lr,
+                        betas=expert_distill_betas,
+                        plateau_steps=expert_distill_plateau_steps,
+                        plateau_eps=expert_distill_plateau_eps,
+                        token_cap=expert_distill_token_cap,
+                        device=target_device,
+                    )
+                    distill_state[centroid] = state
+                log.info(
+                    "  layer %d distillation: %d non-singleton groups distilled",
+                    layer_ref.layer_idx, len(distill_state),
+                )
 
         # Final kept set = protected experts (untouched) + REAM centroids (post-merge).
         # Protected experts' rows are preserved in gate.weight and expert tensors.
@@ -653,6 +856,14 @@ def run(
                 mean_cost_per_pair=(
                     mean_assigned_cost
                     if n_assigned > 0 and mean_assigned_cost > 0.0 and not (c_fail and effective_target >= n_experts)
+                    else None
+                ),
+                assignment_solver_used=assignment_solver,
+                cost_alignment_used=cost_alignment_cfg,
+                em_rounds_completed=em_rounds_done,
+                distill_state=(
+                    {str(k): v for k, v in distill_state.items()}
+                    if distill_state is not None
                     else None
                 ),
             )
@@ -797,6 +1008,10 @@ def _write_merge_json(
     merge_map_layer: dict[int, list[int]],
     *,
     mean_cost_per_pair: float | None = None,
+    assignment_solver_used: str = "greedy",
+    cost_alignment_used: str = "pre",
+    em_rounds_completed: int = 0,
+    distill_state: dict | None = None,
 ) -> None:
     """Write the per-layer merge record to a durable JSON file.
 
@@ -814,7 +1029,7 @@ def _write_merge_json(
         mean_cost_per_pair: Mean REAM assignment cost, for the budget-bump history.
     """
     payload = {
-        "format_version": 1,
+        "format_version": 2,
         "final_kept_ids": final_kept_ids,
         # list(v) ensures JSON gets a plain list, not a subclass that might not serialize
         "grouped": {str(k): list(v) for k, v in grouped.items()},
@@ -822,6 +1037,13 @@ def _write_merge_json(
         # list(v) ensures JSON gets a plain list, not a subclass that might not serialize
         "merge_map_layer": {str(k): list(v) for k, v in merge_map_layer.items()},
         "mean_cost_per_pair": mean_cost_per_pair,
+        # Stage 2 v2 (spec § 12.1): forensic / resume fields. ``em_rounds_completed``
+        # and ``distill_state`` are reserved for Phases 2 and 3; included here
+        # so Phase-1-completed partials are forward-compatible with later phases.
+        "assignment_solver_used": assignment_solver_used,
+        "cost_alignment_used": cost_alignment_used,
+        "em_rounds_completed": em_rounds_completed,
+        "distill_state": distill_state,
     }
     tmp = partial_dir / f"merge_{layer_idx}.json.tmp"
     final = partial_dir / f"merge_{layer_idx}.json"
@@ -843,6 +1065,7 @@ def _profile_layer(
     ream_acc: ReamCostAccumulator,
     *,
     device=None,
+    layer_input_acc: "_LayerInputAccumulator | None" = None,
 ) -> None:
     """Profile a single MoE layer with early-exit forward.
 
@@ -949,6 +1172,18 @@ def _profile_layer(
             _experts_handle = layer_ref.experts_module.register_forward_pre_hook(
                 _populate_full_softmax
             )
+            # Phase 3: optionally capture the layer-input hidden states for
+            # per-merge-group expert distillation (spec § 5 step 7b / M8).
+            # Hook on the decoder layer module — its first input is the
+            # hidden_states tensor that the layer's forward operates on.
+            _layer_in_handle = None
+            if layer_input_acc is not None:
+                def _capture_layer_input(_module, inputs):
+                    if inputs and inputs[0] is not None:
+                        layer_input_acc.add(inputs[0])
+                _layer_in_handle = layer_ref.layer_module.register_forward_pre_hook(
+                    _capture_layer_input
+                )
             try:
                 for batch in batches:
                     if device is not None:
@@ -969,6 +1204,8 @@ def _profile_layer(
                     _next_offset += batch.shape[0] * batch.shape[1]
             finally:
                 _experts_handle.remove()
+                if _layer_in_handle is not None:
+                    _layer_in_handle.remove()
     finally:
         if was_training:
             model.train()
@@ -986,7 +1223,35 @@ def _ream_cost_matrix(
     *,
     ream_acc: ReamCostAccumulator,
     blacklisted_ids: set[int] | None = None,
+    cost_alignment: str = "pre",
+    cost_whitening: str = "none",
+    cost_asymmetric: bool = False,
+    cost_topk_filter: int = 48,
+    freq: dict[int, int] | None = None,
+    cov_acc: "InputCovarianceAccumulator | None" = None,
+    perm_cache: "_PermAlignCache | None" = None,
+    tentative_centroid_weights: dict[int, dict[str, torch.Tensor]] | None = None,
 ) -> np.ndarray:
+    """Compute the (n_nc × n_c) REAM cost matrix.
+
+    Two modes (Stage 2 v2 spec § 5 step 4):
+
+    - ``cost_alignment="pre"`` (default, v1 behavior): symmetric δ_REAM cost
+      ``1 - (δ_gate + δ̃_expert)/2`` over all pairs.
+    - ``cost_alignment="post"`` (Tier 2 / v2 path): for each non-centroid m,
+      compute the cheap symmetric cost first; take the top-K candidates by
+      cheap cost; for those candidates only, compute the per-pair Hungarian
+      alignment cost and the whitened Frobenius residual
+      ``R_cm = ‖(W_c − P_cm·W_m) · A^{1/2}‖_F`` (sum over gate/up/down per
+      § 5 step 4T(c)(ii)). All other entries get +∞ so the assignment solver
+      treats them as forbidden. Permutations and residuals are stashed in
+      ``perm_cache`` for the merge step to reuse (M1).
+
+    When ``cost_asymmetric=True`` and ``freq`` is provided, the post-alignment
+    residual is multiplied by ``freq_m / (freq_c + freq_m)`` (spec § 5 step
+    4T(c)(iii) / D-asymmetric-freq). This is valid only under the
+    freq-weighted merge path; the caller is responsible for that invariant.
+    """
     if not noncentroid_ids or not centroid_ids:
         # Early return produces shape (0, n_c) or (n_nc, 0) rather than (0, 0),
         # which is intentional. Callers guard with `delta.size > 0`, which correctly
@@ -1043,40 +1308,754 @@ def _ream_cost_matrix(
             cost[ci, cj] = 1.0 - (sim_gate + sim_expert) / 2.0
 
     np.clip(cost, 0.0, 1.0, out=cost)
-    return cost
+
+    if cost_alignment == "pre":
+        return cost
+
+    if cost_alignment != "post":
+        raise ValueError(
+            f"_ream_cost_matrix: unknown cost_alignment={cost_alignment!r}; "
+            "expected 'pre' or 'post'."
+        )
+
+    # Stage 2 v2: post-alignment whitened residual path (spec § 5 step 4T).
+    return _post_alignment_cost(
+        layer_ref,
+        noncentroid_ids,
+        centroid_ids,
+        cheap_cost=cost,
+        ream_acc=ream_acc,
+        cov_acc=cov_acc,
+        perm_cache=perm_cache,
+        whitening_mode=cost_whitening,
+        asymmetric=cost_asymmetric,
+        topk=cost_topk_filter,
+        freq=freq,
+        tentative_centroid_weights=tentative_centroid_weights,
+    )
+
+
+def _post_alignment_cost(
+    layer_ref: MoELayerRef,
+    noncentroid_ids: list[int],
+    centroid_ids: list[int],
+    *,
+    cheap_cost: np.ndarray,
+    ream_acc: ReamCostAccumulator,
+    cov_acc: "InputCovarianceAccumulator | None",
+    perm_cache: "_PermAlignCache | None",
+    whitening_mode: str,
+    asymmetric: bool,
+    topk: int,
+    freq: dict[int, int] | None,
+    tentative_centroid_weights: dict[int, dict[str, torch.Tensor]] | None = None,
+) -> np.ndarray:
+    """Build the post-alignment whitened cost matrix per spec § 5 step 4T.
+
+    Steps per non-centroid m:
+      1. Pick the top-K candidate centroids by ``cheap_cost`` (lowest values).
+      2. For each (c, m) candidate: compute Hungarian alignment via
+         ``_permutation_align_to_centroid`` (cached if available), then the
+         three-term whitened Frobenius residual.
+      3. Optionally multiply by ``freq_m / (freq_c + freq_m)`` (asymmetric).
+      4. Stash (perm, residual) into ``perm_cache`` for the merge step.
+
+    All non-candidate entries get ``+inf`` so the assignment solver treats
+    them as forbidden arcs.
+    """
+    from .utils.cov_sqrt import compute_a_sqrt, CovSqrtCache
+
+    li = layer_ref.layer_idx
+    n_nc = len(noncentroid_ids)
+    n_c = len(centroid_ids)
+
+    if topk < 1:
+        raise ValueError(
+            f"_post_alignment_cost: cost_topk_filter={topk} < 1 — must be at "
+            "least the per-centroid capacity to leave a feasible assignment."
+        )
+
+    if cov_acc is None and whitening_mode != "none":
+        raise ValueError(
+            "_post_alignment_cost: cov_acc is required when "
+            f"cost_whitening={whitening_mode!r} (need input covariance for "
+            "the whitening factor). Set cost_whitening='none' to disable."
+        )
+
+    if asymmetric and freq is None:
+        raise ValueError(
+            "_post_alignment_cost: cost_asymmetric=True requires freq dict "
+            "(per-expert calibration token counts)."
+        )
+
+    banks = build_banks(layer_ref)
+
+    # Per-layer eigen-sqrt cache. Bounded by N centroids × 1 matrix per axis.
+    a_sqrt_cache = CovSqrtCache(max_entries=2 * n_c + 8)
+
+    def _get_a_sqrt(eid: int, name: str) -> torch.Tensor:
+        if whitening_mode == "none":
+            return torch.tensor(1.0)
+        key = (li, eid, name, whitening_mode)
+        cached = a_sqrt_cache.get(key)
+        if cached is not None:
+            return cached
+        # InputCovarianceAccumulator stores covariance under the (layer, expert,
+        # matrix_name) key. ``gate_proj`` and ``up_proj`` share the same input
+        # covariance (the experts' shared input), so look up under "gate_proj"
+        # for both gate and up; "down_proj" has its own covariance.
+        cov_key = (li, eid, name)
+        if cov_acc is None or cov_key not in cov_acc.covariance:
+            raise RuntimeError(
+                f"_post_alignment_cost: missing covariance for layer {li} "
+                f"expert {eid} matrix {name!r}; check that profiling completed "
+                "before cost-matrix construction."
+            )
+        A = cov_acc.covariance[cov_key].to(torch.float32)
+        a_sqrt = compute_a_sqrt(A, mode=whitening_mode)
+        a_sqrt_cache.put(key, a_sqrt)
+        return a_sqrt
+
+    out = np.full((n_nc, n_c), np.inf, dtype=np.float64)
+
+    # Per-non-centroid: pick the top-K cheapest centroids and compute the
+    # expensive cost only for those. All cost-matrix tensor work is
+    # read-only on model params; wrap in torch.no_grad() so the leaf
+    # nn.Parameters' requires_grad=True does not poison the .numpy() calls
+    # in _permutation_align_to_centroid.
+    with torch.no_grad():
+     for ci in range(n_nc):
+        m_id = noncentroid_ids[ci]
+        # Top-K centroid indices by cheap cost (smallest first).
+        # If n_c <= K, we score all centroids.
+        k = min(topk, n_c)
+        top_cj = np.argpartition(cheap_cost[ci], k - 1)[:k]
+        for cj in top_cj:
+            cj = int(cj)
+            c_id = centroid_ids[cj]
+            cache_key = (li, c_id, m_id)
+            cached = perm_cache.get(cache_key) if perm_cache is not None else None
+            # When EM provides a tentative merged centroid weight, the cache
+            # entry for the original centroid is stale — recompute against
+            # the tentative weights instead. F3 fix: single boolean gates
+            # both the residual-reuse and perm-reuse branches so they cannot
+            # diverge under future refactors.
+            tentative_active = (
+                tentative_centroid_weights is not None
+                and c_id in tentative_centroid_weights
+            )
+            cache_usable = (cached is not None) and not tentative_active
+            if cache_usable and cached[1] is not None:
+                # Already computed — reuse both perm and residual.
+                residual = cached[1]
+            else:
+                if tentative_active:
+                    tw = tentative_centroid_weights[c_id]  # type: ignore[index]
+                    ref_gate = tw["gate_proj"].to(torch.float32)
+                    ref_up   = tw["up_proj"].to(torch.float32)
+                    ref_down = tw["down_proj"].to(torch.float32)
+                else:
+                    ref_gate = banks["gate_proj"].get(c_id).to(torch.float32)
+                    ref_up   = banks["up_proj"].get(c_id).to(torch.float32)
+                    ref_down = banks["down_proj"].get(c_id).to(torch.float32)
+                child_gate = banks["gate_proj"].get(m_id).to(torch.float32)
+                child_up   = banks["up_proj"].get(m_id).to(torch.float32)
+                child_down = banks["down_proj"].get(m_id).to(torch.float32)
+
+                ref_act   = ream_acc.get_neuron_mean(li, c_id) if ream_acc else None
+                child_act = ream_acc.get_neuron_mean(li, m_id) if ream_acc else None
+
+                # When the tentative-centroid override is active, the cached
+                # perm is stale (it was computed against the original centroid
+                # weights) — recompute against the tentative weights.
+                if cache_usable:
+                    perm = cached[0]
+                else:
+                    perm = _permutation_align_to_centroid(
+                        ref_gate, ref_up, child_gate, child_up,
+                        ref_act_mean=ref_act, child_act_mean=child_act,
+                    )
+
+                # Whitening still uses the *centroid's own* covariance even
+                # when the tentative-centroid weights replace the centroid's
+                # row in the residual computation. The covariance is a property
+                # of which input distribution the centroid sees post-merge,
+                # which is approximated by A_c (the original centroid's input
+                # statistics). Using A_c here keeps the whitening consistent
+                # across EM rounds; otherwise we'd need to recompute A from
+                # scratch each round.
+                a_sqrt_gate_up = _get_a_sqrt(c_id, "gate_proj")
+                a_sqrt_down    = _get_a_sqrt(c_id, "down_proj")
+                residual = _aligned_whitened_residual(
+                    ref_gate=ref_gate, ref_up=ref_up, ref_down=ref_down,
+                    child_gate=child_gate, child_up=child_up, child_down=child_down,
+                    perm=perm,
+                    a_sqrt_gate_up=a_sqrt_gate_up,
+                    a_sqrt_down=a_sqrt_down,
+                    whitening_mode=whitening_mode,
+                )
+
+                # Only persist to the cache when the residual reflects the
+                # *original* centroid weights (no tentative override). The
+                # tentative residual is per-EM-round and would be stale by
+                # the time the merge step consumes it.
+                if perm_cache is not None and not tentative_active:
+                    perm_cache.put(cache_key, perm, residual)
+
+            if asymmetric:
+                # freq is guaranteed non-None here by the precondition check
+                # at the top of _post_alignment_cost.
+                assert freq is not None
+                f_c = max(int(freq.get(c_id, 0)), 0)
+                f_m = max(int(freq.get(m_id, 0)), 0)
+                denom = f_c + f_m
+                if denom > 0:
+                    factor = f_m / denom
+                else:
+                    factor = 0.5  # both zero — neutral
+                residual = residual * factor
+
+            out[ci, cj] = float(residual)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — per-merge-group expert distillation (spec § 5 step 7b / M8)
+# ---------------------------------------------------------------------------
+
+
+class _LayerInputAccumulator:
+    """Reservoir-sample hidden states arriving at a single MoE layer.
+
+    Captured during the profile pass via a forward-pre hook on the decoder
+    layer. Used by step 7b expert distillation to provide the calibration
+    inputs ``x`` that feed both the merged-centroid student forward and the
+    pre-merge group-member target forward.
+
+    Sample size is capped at ``max_samples`` (default 8192 tokens) so the
+    host RAM cost is bounded even on long calibration runs. With
+    ``hidden_size=2048`` and bf16, a full buffer is ~32 MB.
+
+    A seeded ``torch.Generator`` (default seed = 0) is used for the reservoir
+    coin flips so the captured calibration set is bit-reproducible across
+    runs; callers can override ``seed`` with the layer index for per-layer
+    independence (the Stage 2 driver does this).
+    """
+
+    def __init__(self, max_samples: int = 8192, *, seed: int = 0) -> None:
+        self.max_samples = max_samples
+        self.buffer: torch.Tensor | None = None
+        self.seen = 0
+        self._generator = torch.Generator(device="cpu").manual_seed(int(seed))
+
+    def add(self, hidden: torch.Tensor) -> None:
+        # hidden: (batch, seq, hidden) or (batch*seq, hidden)
+        flat = hidden.reshape(-1, hidden.shape[-1]).detach().to("cpu")
+        n = flat.shape[0]
+        if self.buffer is None:
+            take = min(n, self.max_samples)
+            self.buffer = flat[:take].contiguous().clone()
+            self.seen = n
+            return
+        # Reservoir-style: replace random rows in the buffer with new samples
+        # so the captured set remains a uniform sample across batches.
+        for i in range(n):
+            self.seen += 1
+            if self.buffer.shape[0] < self.max_samples:
+                self.buffer = torch.cat([self.buffer, flat[i:i + 1]], dim=0)
+            else:
+                # Replace a random index with probability max_samples / seen.
+                # Seeded generator → bit-reproducible across runs (F2 fix).
+                j = int(torch.randint(
+                    0, self.seen, (1,), generator=self._generator,
+                ).item())
+                if j < self.max_samples:
+                    self.buffer[j] = flat[i]
+
+    def get(self) -> torch.Tensor | None:
+        return self.buffer
+
+
+def _swiglu_forward(
+    W_gate: torch.Tensor,
+    W_up: torch.Tensor,
+    W_down: torch.Tensor,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Standard SwiGLU FFN forward used by Qwen3-MoE experts.
+
+    PyTorch nn.Linear weight shapes (used by the bank get/set):
+        W_gate, W_up : (d_int, hidden)      — applied as ``F.linear(x, W)``
+        W_down       : (hidden, d_int)
+    Input ``x`` has shape ``(*, hidden)``; output has shape ``(*, hidden)``.
+    """
+    gate = F.linear(x, W_gate)
+    up = F.linear(x, W_up)
+    intermediate = F.silu(gate) * up
+    return F.linear(intermediate, W_down)
+
+
+def _snapshot_pre_merge_layer_experts(
+    layer_ref: MoELayerRef,
+) -> dict[int, dict[str, torch.Tensor]]:
+    """CPU snapshot of every expert's gate/up/down weights for a single
+    layer, taken BEFORE the merge step mutates the bank.
+
+    Used by step 7b (distillation) to compute the pre-merge group-member
+    forward as the distillation target. Released by the per-layer driver
+    once distillation finishes for the layer.
+    """
+    banks = build_banks(layer_ref)
+    out: dict[int, dict[str, torch.Tensor]] = {}
+    n = layer_ref.num_routed_experts
+    for eid in range(n):
+        out[eid] = {
+            name: banks[name].get(eid).detach().cpu().clone()
+            for name in MATRIX_NAMES
+        }
+    return out
+
+
+def _distill_merged_group(
+    *,
+    layer_ref: MoELayerRef,
+    centroid_id: int,
+    members: list[int],
+    freq: dict[int, int],
+    pre_merge_weights: dict[int, dict[str, torch.Tensor]],
+    layer_inputs: torch.Tensor,
+    steps: int,
+    lr: float,
+    betas: tuple[float, float],
+    plateau_steps: int,
+    plateau_eps: float,
+    token_cap: int,
+    device: torch.device,
+) -> dict:
+    """500-step MSE distillation of the merged centroid against the
+    freq-weighted pre-merge group-member forward (spec § 5 step 7b / M8).
+
+    **v1 simplification — see D-expert-distill-mse-v1 in spec § 10**: this
+    implementation differs from the pinned spec target in two ways:
+    (i) freq-weighted-only target ``Σ (freq_e / Σ freq) · E_e^orig(x)``
+        (no per-token routing weight ``g_e^orig(x)``);
+    (ii) input tokens are the reservoir-sampled layer-input ``layer_inputs``
+         for every group, not the routing-restricted ``X_g`` set.
+    Phase 3 v2 will lift both. The v1 form provides a correctly-signed
+    merge-error gradient on a uniform-token sample.
+
+    Returns a small state dict with the final loss, step count, and break
+    reason. The optimizer state is NOT persisted — resume re-runs the
+    distillation from scratch for any layer whose partial JSON is missing.
+    """
+    if steps <= 0 or len(members) <= 1:
+        return {"steps": 0, "skip": "trivial"}
+
+    banks = build_banks(layer_ref)
+    # Trainable: only the merged centroid's three projections. We pull the
+    # current (post-merge) weights, wrap them as nn.Parameter, optimize, then
+    # write back. Using nn.Parameter (not the bank tensors directly) lets us
+    # build an optimizer cleanly without monkey-patching requires_grad on the
+    # shared bank tensor.
+    init_gate = banks["gate_proj"].get(centroid_id).to(device, dtype=torch.float32).clone()
+    init_up   = banks["up_proj"].get(centroid_id).to(device, dtype=torch.float32).clone()
+    init_down = banks["down_proj"].get(centroid_id).to(device, dtype=torch.float32).clone()
+    p_gate = nn.Parameter(init_gate)
+    p_up   = nn.Parameter(init_up)
+    p_down = nn.Parameter(init_down)
+
+    optim = torch.optim.AdamW(
+        [p_gate, p_up, p_down], lr=lr, betas=betas, weight_decay=0.0,
+    )
+
+    # Token cap: subsample deterministically per layer for reproducibility.
+    rng = torch.Generator(device="cpu").manual_seed(layer_ref.layer_idx)
+    n_tokens = layer_inputs.shape[0]
+    if n_tokens > token_cap:
+        idx = torch.randperm(n_tokens, generator=rng)[:token_cap]
+        x_all = layer_inputs[idx]
+    else:
+        x_all = layer_inputs
+    x_all = x_all.to(device, dtype=torch.float32)
+
+    # Build the freq-weighted target once (it doesn't change during training).
+    weights = np.array([max(freq.get(m, 0), 0) for m in members], dtype=np.float64)
+    if weights.sum() <= 0.0:
+        weights[:] = 1.0
+    weights = weights / weights.sum()
+
+    with torch.no_grad():
+        target = torch.zeros_like(x_all)
+        for w, m in zip(weights, members):
+            W_g = pre_merge_weights[m]["gate_proj"].to(device, dtype=torch.float32)
+            W_u = pre_merge_weights[m]["up_proj"  ].to(device, dtype=torch.float32)
+            W_d = pre_merge_weights[m]["down_proj"].to(device, dtype=torch.float32)
+            target = target + float(w) * _swiglu_forward(W_g, W_u, W_d, x_all)
+
+    initial_loss = None
+    plateau_counter = 0
+    last_step = 0
+    final_loss = float("inf")
+    break_reason = "max_steps"
+
+    for step in range(steps):
+        optim.zero_grad(set_to_none=True)
+        student = _swiglu_forward(p_gate, p_up, p_down, x_all)
+        loss = F.mse_loss(student, target)
+        loss.backward()
+        optim.step()
+        last_step = step + 1
+        final_loss = float(loss.detach().item())
+
+        if initial_loss is None:
+            initial_loss = max(final_loss, 1e-12)
+
+        # Plateau early-break: ``relative_loss = final / initial`` falling
+        # below ``plateau_eps`` for ``plateau_steps`` consecutive steps stops
+        # training. Uses < (strict) so the very first step at exact threshold
+        # is NOT counted, matching spec wording "below 1e-4 of the initial".
+        if final_loss / initial_loss < plateau_eps:
+            plateau_counter += 1
+            if plateau_counter >= plateau_steps:
+                break_reason = "plateau"
+                break
+        else:
+            plateau_counter = 0
+
+    # Write the trained weights back to the bank in the original dtype.
+    bank_dtype = banks["gate_proj"].get(centroid_id).dtype
+    with torch.no_grad():
+        banks["gate_proj"].set(centroid_id, p_gate.detach().to(bank_dtype))
+        banks["up_proj"  ].set(centroid_id, p_up.detach().to(bank_dtype))
+        banks["down_proj"].set(centroid_id, p_down.detach().to(bank_dtype))
+
+    return {
+        "steps": last_step,
+        "final_loss": final_loss,
+        "initial_loss": float(initial_loss) if initial_loss is not None else None,
+        "break_reason": break_reason,
+    }
+
+
+def _build_grouped_from_assignment(
+    assignment: list[int],
+    centroid_ids: list[int],
+    noncentroid_ids: list[int],
+) -> dict[int, list[int]]:
+    """Reconstruct ``{centroid_id: [centroid_id, *absorbed_member_ids]}``
+    from a flat assignment list (centroid index per non-centroid)."""
+    grouped: dict[int, list[int]] = {c: [c] for c in centroid_ids}
+    for child_pos, c_idx in enumerate(assignment):
+        if c_idx >= 0:
+            grouped[centroid_ids[c_idx]].append(noncentroid_ids[child_pos])
+    return grouped
+
+
+def _em_compute_tentative_weights(
+    layer_ref: MoELayerRef,
+    grouped: dict[int, list[int]],
+    freq: dict[int, int],
+    ream_acc: ReamCostAccumulator | None,
+    perm_cache: "_PermAlignCache | None",
+) -> dict[int, dict[str, torch.Tensor]]:
+    """Compute the tentative freq-weighted merged centroid weights for every
+    non-singleton group, WITHOUT mutating the bank.
+
+    For each centroid c with members [c, m1, m2, ...]:
+        W_c_tentative = Σ (freq_e / Σ freq) · perm_e(W_e)
+
+    Permutations come from ``perm_cache`` if available; otherwise computed
+    fresh via ``_permutation_align_to_centroid`` (the centroid contributes
+    with identity permutation).
+
+    Used by EM refinement (spec § 5 step 4T(e)) to recompute the cost matrix
+    against the tentative merged centroid before reassigning.
+    """
+    li = layer_ref.layer_idx
+    banks = build_banks(layer_ref)
+    out: dict[int, dict[str, torch.Tensor]] = {}
+
+    for centroid, members in grouped.items():
+        if len(members) <= 1:
+            continue  # singleton — nothing to merge
+
+        weights = np.array([max(freq.get(m, 0), 0) for m in members], dtype=np.float64)
+        if weights.sum() <= 0.0:
+            weights[:] = 1.0
+        weights /= weights.sum()
+
+        ref_gate = banks["gate_proj"].get(centroid).to(torch.float32)
+        ref_up   = banks["up_proj"].get(centroid).to(torch.float32)
+        ref_act  = ream_acc.get_neuron_mean(li, centroid) if ream_acc else None
+
+        accs: dict[str, torch.Tensor | None] = {name: None for name in banks}
+        for w, m in zip(weights, members):
+            gate_m = banks["gate_proj"].get(m).to(torch.float32)
+            up_m   = banks["up_proj"].get(m).to(torch.float32)
+            child_act = ream_acc.get_neuron_mean(li, m) if ream_acc else None
+
+            if m == centroid:
+                perm = None
+            else:
+                cached = (
+                    perm_cache.get((li, centroid, m))
+                    if perm_cache is not None
+                    else None
+                )
+                if cached is not None:
+                    perm = cached[0]
+                else:
+                    perm = _permutation_align_to_centroid(
+                        ref_gate, ref_up, gate_m, up_m,
+                        ref_act_mean=ref_act, child_act_mean=child_act,
+                    )
+
+            for name, bank in banks.items():
+                if name == "gate_proj":
+                    Wm = gate_m
+                elif name == "up_proj":
+                    Wm = up_m
+                else:
+                    Wm = bank.get(m).to(torch.float32)
+                if perm is not None:
+                    Wm = Wm[perm, :] if name in ("gate_proj", "up_proj") else Wm[:, perm]
+                accs[name] = Wm * w if accs[name] is None else accs[name] + Wm * w
+
+        out[centroid] = {name: accs[name] for name in banks}
+
+    return out
+
+
+def _em_refine_assignment(
+    layer_ref: MoELayerRef,
+    *,
+    initial_assignment: list[int],
+    initial_delta: np.ndarray,
+    ream_centroid_ids: list[int],
+    ream_noncentroid_ids: list[int],
+    perm_cache: "_PermAlignCache",
+    ream_acc: ReamCostAccumulator,
+    cov_acc: "InputCovarianceAccumulator | None",
+    freq: dict[int, int],
+    max_group_cap: int,
+    cost_alignment: str,
+    cost_whitening: str,
+    cost_asymmetric: bool,
+    cost_topk_filter: int,
+    assignment_solver: SolverName,
+    em_rounds: int,
+    em_break: bool,
+    blacklisted_ids: set[int] | None,
+    sinkhorn_epsilon_init: float = 1.0,
+    sinkhorn_epsilon_final: float = 0.01,
+    sinkhorn_iters: int = 200,
+) -> tuple[list[int], np.ndarray, int]:
+    """EM refinement loop (spec § 5 step 4T(e) / M4).
+
+    For each round r in 1..em_rounds:
+      1. Build current groups from ``assignment``.
+      2. Compute tentative merged centroid weights (freq-weighted average of
+         current group members, using cached perms where available).
+      3. Recompute the cost matrix with the tentative centroids substituted.
+      4. Re-solve the assignment.
+      5. If ``em_break`` and the new assignment equals the old, stop early.
+
+    Returns ``(final_assignment, final_delta, rounds_completed)``. ``rounds_completed``
+    is the number of rounds where step 4 actually ran (≥ 1 if em_rounds ≥ 1).
+
+    EM is a no-op when:
+      - ``em_rounds <= 0``
+      - ``cost_alignment == "pre"`` (the cheap symmetric cost does not depend
+        on centroid weights, so a tentative merge does not change the cost
+        matrix and the assignment cannot improve).
+    """
+    if em_rounds <= 0 or cost_alignment != "post":
+        return initial_assignment, initial_delta, 0
+
+    n_nc = len(ream_noncentroid_ids)
+    n_c = len(ream_centroid_ids)
+    assignment = list(initial_assignment)
+    delta = initial_delta
+    rounds_done = 0
+
+    for r in range(em_rounds):
+        grouped = _build_grouped_from_assignment(
+            assignment, ream_centroid_ids, ream_noncentroid_ids,
+        )
+        tentative = _em_compute_tentative_weights(
+            layer_ref, grouped, freq, ream_acc, perm_cache,
+        )
+        if not tentative:
+            # No non-singleton groups → tentative is identical to original →
+            # cost matrix would be unchanged. Stop early.
+            break
+
+        new_delta = _ream_cost_matrix(
+            layer_ref, ream_noncentroid_ids, ream_centroid_ids,
+            ream_acc=ream_acc,
+            blacklisted_ids=blacklisted_ids,
+            cost_alignment=cost_alignment,
+            cost_whitening=cost_whitening,
+            cost_asymmetric=cost_asymmetric,
+            cost_topk_filter=cost_topk_filter,
+            freq=freq if cost_asymmetric else None,
+            cov_acc=cov_acc,
+            perm_cache=perm_cache,
+            tentative_centroid_weights=tentative,
+        )
+        new_assignment = _assign_children_to_centroids(
+            new_delta, n_nc, n_c, max_group_cap,
+            solver=assignment_solver,
+            sinkhorn_epsilon_init=sinkhorn_epsilon_init,
+            sinkhorn_epsilon_final=sinkhorn_epsilon_final,
+            sinkhorn_iters=sinkhorn_iters,
+        )
+        rounds_done = r + 1
+        # F2 fix: commit ``delta = new_delta`` BEFORE the break check so
+        # downstream assigned_cost reporting uses the EM-refined cost matrix
+        # even when the assignment converged this round.
+        delta = new_delta
+        if em_break and new_assignment == assignment:
+            break
+        assignment = new_assignment
+
+    return assignment, delta, rounds_done
+
+
+def _pick_effective_alignment(
+    *,
+    n_nc: int,
+    n_c: int,
+    max_group_cap: int,
+    threshold: float,
+    configured: str,
+) -> str:
+    """Decide SLACK vs TIGHT for the cost-matrix path (spec § 5 step 3 / M3).
+
+    Capacity-utilization gate:
+        u = n_NC / (N'_l × C_max).
+    When ``u < threshold`` the layer has so much slack capacity that the
+    heavyweight post-alignment cost matrix is unlikely to change the
+    assignment meaningfully — return ``"pre"`` regardless of the configured
+    value.  Otherwise return the configured value (``"pre"`` or ``"post"``).
+
+    With ``max_group_cap == 0`` (uncapped, ablation-only path) we treat the
+    layer as fully slack (u = 0).
+    """
+    if max_group_cap <= 0:
+        util = 0.0
+    else:
+        capacity = max(n_c * max_group_cap, 1)
+        util = n_nc / capacity
+    if util < threshold:
+        return "pre"
+    return configured
 
 
 def _assign_children_to_centroids(
-    cost: np.ndarray, n_children: int, n_centroids: int, max_group_cap: int = 0,
+    cost: np.ndarray,
+    n_children: int,
+    n_centroids: int,
+    max_group_cap: int = 0,
+    *,
+    solver: SolverName = "greedy",
+    sinkhorn_epsilon_init: float = 1.0,
+    sinkhorn_epsilon_final: float = 0.01,
+    sinkhorn_iters: int = 200,
 ) -> list[int]:
-    """Single-pass greedy assignment of non-centroid children to centroids.
+    """Assign non-centroid children to centroids under a per-centroid cap.
 
-    NOTE: This implements the greedy pseudo-pruning procedure described in paper §4
-    exactly — the paper prescribes greedy (not optimal matching) for centroid grouping.
-    Optimal matching (Hungarian) appears only in intra-group neuron permutation alignment.
+    Solver dispatch (``solver`` argument; spec § 5 Step 3 of
+    ``max_quality/docs/stage2_assignment_revision.md``):
 
-    When max_group_cap == 0 (uncapped), each child is independently assigned to its
-    nearest centroid by cost (argmin over centroid columns), so every child is
-    assigned and no centroid monopolises all children due to iteration order.
+    * ``"greedy"`` — single-pass descending-saliency greedy (legacy, paper
+      §4); preserves bit-identical behavior with prior Stage 2 runs. **This is
+      the default and is required for the Stage 2 v1→v2 compatibility
+      invariant.**
+    * ``"hungarian"`` — rectangular Hungarian (``scipy.optimize.linear_sum_assignment``)
+      on the cost matrix, padded to a square problem when capacity allows
+      multiple absorption per centroid. Optimal under capacity-1 problems
+      (``n_children ≤ n_centroids``); falls back to MCF when capacitated.
+    * ``"mcf"`` — capacitated min-cost flow via OR-Tools' ``SimpleMinCostFlow``.
+      Optimal under capacity ``max_group_cap`` per centroid. Drop-in replacement
+      for greedy that does not bias toward the highest-saliency centroid.
+    * ``"auto"`` — picks ``hungarian`` when ``n_children ≤ n_centroids``,
+      else ``mcf``.
+    * ``"sinkhorn"`` — capacitated entropy-regularized OT (Tier 3 / M9).
+      Solved via log-domain Sinkhorn-Knopp with linear ε-annealing and a
+      slack-child dummy-row construction; see :func:`_assign_sinkhorn`.
 
-    When max_group_cap > 0, iterates centroids once in order 0..n_centroids-1
-    (caller builds centroid_ids in descending saliency — column 0 = highest-saliency
-    centroid).  For each centroid, greedily absorbs up to *max_group_cap* unassigned
-    children (lowest cost = most similar first).
+    NOTE: The greedy branch is unchanged from the v1 Stage 2; the dispatcher
+    is structured so flipping ``solver`` to a non-greedy value is the only
+    semantic change. With ``solver="greedy"`` the output is bit-identical to
+    the prior implementation.
+
+    The legacy greedy path:
+      When ``max_group_cap == 0`` (uncapped), each child is independently
+      assigned to its nearest centroid by cost (argmin over centroid columns).
+
+      When ``max_group_cap > 0``, iterates centroids once in order
+      ``0..n_centroids-1`` (caller builds centroid_ids in descending saliency
+      — column 0 = highest-saliency centroid).  For each centroid, greedily
+      absorbs up to ``max_group_cap`` unassigned children (lowest cost = most
+      similar first).
 
     The caller is responsible for ensuring feasibility before calling:
-    n_centroids * max_group_cap >= n_children (spec §5 Step 3). When the
-    feasibility check passes, every child is guaranteed to receive assignment >= 0.
-    This guarantee assumes `n_centroids >= 1`; when `n_centroids == 0` all children
-    are assigned -1 (no centroid).
+    ``n_centroids * max_group_cap >= n_children`` (spec § 5 Step 3). When the
+    feasibility check passes and the cost matrix is finite, every child is
+    guaranteed to receive ``assignment >= 0``. This guarantee assumes
+    ``n_centroids >= 1``; when ``n_centroids == 0`` all children are assigned
+    ``-1`` (no centroid).
 
-    Returns a list of length n_children where entry ch is:
-      >= 0  → centroid column index this child is merged into
-      -1    → child was not absorbed (should not occur if feasibility holds)
+    Returns:
+        List of length ``n_children`` where entry ``ch`` is:
+          ``>= 0``  → centroid column index this child is merged into
+          ``-1``    → child was not absorbed (should not occur under
+                      feasibility + finite costs)
     """
     if n_children == 0 or n_centroids == 0:
         return [-1] * n_children
 
+    solver_lower = solver.lower()
+    if solver_lower == "greedy":
+        return _assign_greedy(cost, n_children, n_centroids, max_group_cap)
+    if solver_lower == "hungarian":
+        return _assign_hungarian(cost, n_children, n_centroids, max_group_cap)
+    if solver_lower == "mcf":
+        return _assign_mcf(cost, n_children, n_centroids, max_group_cap)
+    if solver_lower == "auto":
+        if n_children <= n_centroids:
+            return _assign_hungarian(cost, n_children, n_centroids, max_group_cap)
+        return _assign_mcf(cost, n_children, n_centroids, max_group_cap)
+    if solver_lower == "sinkhorn":
+        return _assign_sinkhorn(
+            cost, n_children, n_centroids, max_group_cap,
+            epsilon_init=sinkhorn_epsilon_init,
+            epsilon_final=sinkhorn_epsilon_final,
+            iters=sinkhorn_iters,
+        )
+
+    raise ValueError(
+        f"_assign_children_to_centroids: unknown solver {solver!r}; expected "
+        "one of 'greedy', 'hungarian', 'mcf', 'auto', 'sinkhorn'."
+    )
+
+
+def _assign_greedy(
+    cost: np.ndarray, n_children: int, n_centroids: int, max_group_cap: int,
+) -> list[int]:
+    """Legacy greedy path — extracted from the v1 implementation verbatim.
+
+    Preserves the bit-identical assignment under the v1 default (greedy +
+    descending-saliency centroid order).
+
+    Defensive: returns ``[-1] * n_children`` for empty inputs so this helper
+    can be called from fallback paths in :func:`_assign_hungarian` /
+    :func:`_assign_mcf` without re-doing the dispatcher's early-exit.
+    """
+    if n_children == 0 or n_centroids == 0:
+        return [-1] * n_children
     if max_group_cap == 0:
         # Uncapped: assign each child to its nearest centroid by cost.
         # Iterating children (not centroids) avoids the centroid-order bias that
@@ -1147,9 +2126,381 @@ def _assign_children_to_centroids(
     return assignment
 
 
+def _assign_hungarian(
+    cost: np.ndarray, n_children: int, n_centroids: int, max_group_cap: int,
+) -> list[int]:
+    """Rectangular Hungarian assignment via ``scipy.linear_sum_assignment``.
+
+    Optimal under the 1-1 capacity case (``n_children ≤ n_centroids`` with
+    ``max_group_cap >= 1``). When ``n_children > n_centroids``, the problem
+    becomes capacitated and Hungarian alone cannot solve it; we fall back to
+    MCF. This matches the spec § 5 step 4d "auto" rule (hungarian in slack,
+    mcf in tight).
+
+    The cost matrix is shaped ``(n_children, n_centroids)``. ``+inf`` entries
+    are replaced with a large finite sentinel before passing to scipy, since
+    ``linear_sum_assignment`` raises on inf inputs.
+
+    Defensive: returns ``[-1] * n_children`` for empty inputs so this helper
+    can be called directly without re-doing the dispatcher's early-exit.
+    """
+    if n_children == 0 or n_centroids == 0:
+        return [-1] * n_children
+    # Capacitated → defer to MCF. ``max_group_cap == 0`` carries the v1
+    # "uncapped" semantics (each child to its argmin centroid); MCF with
+    # ``max_group_cap = n_children`` reproduces that, so route there too
+    # rather than letting scipy's rectangular Hungarian leave excess
+    # children unassigned.
+    if n_children > n_centroids:
+        return _assign_mcf(cost, n_children, n_centroids, max_group_cap)
+
+    # Replace inf with a large finite sentinel above any finite cost so that
+    # scipy treats the +∞ entries as effectively forbidden but does not raise.
+    finite_max = float(np.nanmax(cost[np.isfinite(cost)])) if np.isfinite(cost).any() else 1.0
+    big = max(finite_max, 1.0) * 1e9
+    safe_cost = np.where(np.isfinite(cost), cost, big)
+
+    row_ind, col_ind = linear_sum_assignment(safe_cost)
+    assignment = [-1] * n_children
+    for r, c in zip(row_ind, col_ind):
+        # Skip pairs that were forbidden by the +∞ → big sentinel — leave as
+        # unassigned; the caller's orphan-promotion path handles them.
+        if safe_cost[r, c] >= big * 0.5:
+            continue
+        assignment[int(r)] = int(c)
+    return assignment
+
+
+def _assign_mcf(
+    cost: np.ndarray, n_children: int, n_centroids: int, max_group_cap: int,
+) -> list[int]:
+    """Capacitated min-cost flow via OR-Tools' ``SimpleMinCostFlow``.
+
+    Models the standard transportation polytope:
+        source → each child (supply 1)
+        child  → each centroid (cost ``cost[ch, c]``, capacity 1)
+        centroid → sink (capacity ``max_group_cap``)
+        sink supply = ``n_children`` so all children must be matched.
+
+    Total unimodularity guarantees integer optimality under the LP relaxation
+    (Ahuja–Magnanti–Orlin §9 — capacity is a transportation problem). OR-Tools
+    runs cost-scaling push-relabel; ~10 ms per layer for our sizes.
+
+    ``+∞`` entries are excluded by simply not adding the corresponding arc.
+
+    Cost normalization: OR-Tools uses int costs. We normalize the finite cost
+    range to ``[0, MCF_INT_SCALE]`` before rounding, so this routine is safe
+    regardless of cost magnitude (relevant when the post-alignment whitened
+    residual is unbounded). The optimal solution is invariant under positive
+    affine transformations of the cost matrix.
+
+    Defensive: returns ``[-1] * n_children`` for empty inputs.
+    """
+    if n_children == 0 or n_centroids == 0:
+        return [-1] * n_children
+
+    if max_group_cap < 1:
+        # Reduce to assignment when no capacity bound is enforced — still
+        # correct for the v1 ``max_group_cap == 0`` "uncapped" semantics by
+        # treating uncapped as ``n_children`` per centroid (effectively
+        # unlimited within the problem).
+        max_group_cap = n_children
+
+    try:
+        from ortools.graph.python.min_cost_flow import SimpleMinCostFlow
+    except ImportError as exc:
+        raise RuntimeError(
+            "_assign_mcf requires the 'ortools' package. Add 'ortools>=9.10' "
+            "to requirements.txt and reinstall, or set "
+            "stage2_reap_ream.assignment_solver back to 'greedy'."
+        ) from exc
+
+    # Normalize finite costs to [0, MCF_INT_SCALE] so int-rounding is always
+    # safe (no overflow for unbounded post-alignment residuals). Min-cost
+    # solutions are invariant under positive affine transformations of cost.
+    finite_mask = np.isfinite(cost)
+    if not finite_mask.any():
+        log.warning(
+            "_assign_mcf: cost matrix has no finite entries — falling back "
+            "to greedy (which will leave all children unassigned)."
+        )
+        return _assign_greedy(cost, n_children, n_centroids, max_group_cap)
+
+    finite_min = float(cost[finite_mask].min())
+    finite_max = float(cost[finite_mask].max())
+    finite_range = finite_max - finite_min
+    MCF_INT_SCALE = 1_000_000
+
+    def _to_int_cost(c: float) -> int:
+        if finite_range <= 0.0:
+            return 0
+        normalized = (c - finite_min) / finite_range
+        return int(round(normalized * MCF_INT_SCALE))
+
+    smcf = SimpleMinCostFlow()
+
+    # Node ids: 0 = source, 1..n_children = child nodes,
+    # n_children+1..n_children+n_centroids = centroid nodes,
+    # n_children+n_centroids+1 = sink.
+    SRC = 0
+    SINK = n_children + n_centroids + 1
+    # Inline arithmetic instead of lambdas for clarity.
+    # child_node(i) = 1 + i
+    # cent_node(j)  = 1 + n_children + j
+
+    # Source → child arcs
+    for i in range(n_children):
+        smcf.add_arc_with_capacity_and_unit_cost(SRC, 1 + i, 1, 0)
+
+    # Child → centroid arcs (skip +∞)
+    for i in range(n_children):
+        for j in range(n_centroids):
+            c_ij = cost[i, j]
+            if not np.isfinite(c_ij):
+                continue
+            smcf.add_arc_with_capacity_and_unit_cost(
+                1 + i, 1 + n_children + j, 1, _to_int_cost(float(c_ij)),
+            )
+
+    # Centroid → sink arcs
+    for j in range(n_centroids):
+        smcf.add_arc_with_capacity_and_unit_cost(
+            1 + n_children + j, SINK, max_group_cap, 0,
+        )
+
+    # Supply: source = +n_children, sink = -n_children, all others = 0.
+    smcf.set_node_supply(SRC, n_children)
+    smcf.set_node_supply(SINK, -n_children)
+
+    status = smcf.solve()
+    if status != smcf.OPTIMAL:
+        log.warning(
+            "_assign_mcf: SimpleMinCostFlow returned non-optimal status %s "
+            "(infeasible? check cost matrix has finite entries and capacity "
+            "satisfies n_centroids * max_group_cap >= n_children). Falling "
+            "back to greedy.",
+            status,
+        )
+        return _assign_greedy(cost, n_children, n_centroids, max_group_cap)
+
+    assignment = [-1] * n_children
+    for arc in range(smcf.num_arcs()):
+        if smcf.flow(arc) <= 0:
+            continue
+        tail = smcf.tail(arc)
+        head = smcf.head(arc)
+        # We only care about child→centroid arcs.
+        if 1 <= tail <= n_children and (n_children + 1) <= head <= (n_children + n_centroids):
+            i = tail - 1
+            j = head - n_children - 1
+            assignment[i] = j
+    return assignment
+
+
+def _assign_sinkhorn(
+    cost: np.ndarray,
+    n_children: int,
+    n_centroids: int,
+    max_group_cap: int,
+    *,
+    epsilon_init: float = 1.0,
+    epsilon_final: float = 0.01,
+    iters: int = 200,
+) -> list[int]:
+    """Capacitated entropy-regularized OT via Sinkhorn-Knopp with a
+    dummy-slack-child construction (spec § 5 step 4d / M9 /
+    D-sinkhorn-soft-assign).
+
+    The standard Sinkhorn-Knopp algorithm requires equality marginals on
+    both sides. Our problem has demand ``n_children`` (each child needs 1)
+    and supply ``n_centroids · max_group_cap`` (each centroid absorbs ≤ cap),
+    so we balance by inserting one **dummy slack child** with marginal
+    ``n_centroids · max_group_cap − n_children`` and uniform high cost to
+    every centroid. After convergence, the dummy's mass flows to whichever
+    real centroids have leftover capacity, and a simple argmax over the
+    real-children rows recovers the hard assignment.
+
+    Note: spec line 152–155 frames the construction as a *virtual centroid*
+    rather than a virtual child; the two constructions are dual and produce
+    the same hard assignment under argmax. The slack-child form is used
+    here because it is simpler to implement: real children's argmax never
+    needs to filter out a dummy column.
+
+    Costs are normalized to ``[0, 1]`` before the Sinkhorn iterations so
+    that ``epsilon`` values are independent of cost magnitude (relevant
+    when post-alignment whitened residuals carry an unbounded scale —
+    optimal-transport solutions are invariant under positive affine cost
+    transforms).
+
+    Defensive: returns ``[-1] * n_children`` for empty inputs.
+    """
+    if n_children == 0 or n_centroids == 0:
+        return [-1] * n_children
+
+    if max_group_cap < 1:
+        # v1 "uncapped" semantics — treat as max_group_cap = n_children so
+        # the supply side has effectively unlimited capacity.
+        max_group_cap = n_children
+
+    slack = n_centroids * max_group_cap - n_children
+    if slack < 0:
+        log.warning(
+            "_assign_sinkhorn: infeasible — n_C × C_max = %d < n_NC = %d. "
+            "Falling back to greedy.",
+            n_centroids * max_group_cap, n_children,
+        )
+        return _assign_greedy(cost, n_children, n_centroids, max_group_cap)
+
+    finite_mask = np.isfinite(cost)
+    if not finite_mask.any():
+        log.warning(
+            "_assign_sinkhorn: cost matrix has no finite entries — "
+            "falling back to greedy."
+        )
+        return _assign_greedy(cost, n_children, n_centroids, max_group_cap)
+
+    # Normalize to [0, 1] so epsilon scaling is cost-magnitude-invariant.
+    finite_min = float(cost[finite_mask].min())
+    finite_max = float(cost[finite_mask].max())
+    finite_range = max(finite_max - finite_min, 1e-12)
+    norm_cost = np.where(
+        finite_mask,
+        (cost - finite_min) / finite_range,
+        # +∞ sentinel → very large finite value so the entry is effectively
+        # forbidden but Sinkhorn-Knopp doesn't underflow exp(-inf/eps).
+        100.0,
+    )
+
+    big_dummy = 100.0  # cost of dummy slack child to every centroid
+
+    # Expanded cost: rows 0..n_children-1 are real children, last row is dummy.
+    expanded = np.zeros((n_children + 1, n_centroids), dtype=np.float64)
+    expanded[:n_children, :] = norm_cost
+    expanded[n_children, :] = big_dummy
+
+    a = np.concatenate([np.ones(n_children), [float(slack)]])  # row marginals
+    b = np.full(n_centroids, float(max_group_cap), dtype=np.float64)  # col marginals
+    # Sanity check: balanced marginals (transportation polytope).
+    assert abs(a.sum() - b.sum()) < 1e-9, (
+        f"_assign_sinkhorn marginals mismatch: sum(a)={a.sum()} vs "
+        f"sum(b)={b.sum()}"
+    )
+
+    log_a = np.log(np.maximum(a, 1e-30))
+    log_b = np.log(np.maximum(b, 1e-30))
+
+    # Log-domain Sinkhorn-Knopp with linear epsilon annealing.
+    f = np.zeros_like(log_a)
+    g = np.zeros_like(log_b)
+    eps = epsilon_init
+    for it in range(max(iters, 1)):
+        eps = epsilon_init + (epsilon_final - epsilon_init) * (it / max(iters - 1, 1))
+        log_K = -expanded / max(eps, 1e-12)
+        # f_i = log_a_i - logsumexp_j(log_K_ij + g_j)
+        f = log_a - logsumexp(log_K + g[np.newaxis, :], axis=1)
+        # g_j = log_b_j - logsumexp_i(log_K_ij + f_i)
+        g = log_b - logsumexp(log_K + f[:, np.newaxis], axis=0)
+
+    log_K = -expanded / max(eps, 1e-12)
+    log_T = f[:, np.newaxis] + log_K + g[np.newaxis, :]
+
+    # Argmax over real centroids per real child (drop the dummy row).
+    real_log_T = log_T[:n_children, :]
+    return [int(np.argmax(row)) for row in real_log_T]
+
+
 # ---------------------------------------------------------------------------
 # Merge + router resize + covariance I/O
 # ---------------------------------------------------------------------------
+
+
+class _PermAlignCache:
+    """Per-layer cache of Hungarian permutations and whitened residuals.
+
+    Stage 2 v2 spec § 5 step 4T(c)(i)–(ii) (M1, "reuse merge-time Hungarian
+    for the assignment cost"): the cost matrix and the merge step share the
+    same per-pair Hungarian alignment. This cache lets both consumers see
+    the result of one computation.
+
+    Keys: ``(layer_idx, centroid_id, noncentroid_id)``.
+    Values: ``(perm: np.ndarray, residual: float | None)``. ``residual`` is
+    ``None`` when the cache entry came from the legacy v1 merge path (which
+    only knows the permutation, not the whitened residual).
+
+    Cleared at the start of every layer; bounded by ``N × K`` per layer
+    (default 256 × 48 = 12,288 entries × ~512 bytes/perm ≈ 6 MB).
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[tuple[int, int, int], tuple[np.ndarray, float | None]] = {}
+
+    def get(self, key: tuple[int, int, int]) -> tuple[np.ndarray, float | None] | None:
+        return self._store.get(key)
+
+    def put(self, key: tuple[int, int, int], perm: np.ndarray, residual: float | None) -> None:
+        self._store[key] = (perm, residual)
+
+    def has(self, key: tuple[int, int, int]) -> bool:
+        return key in self._store
+
+    def clear(self) -> None:
+        self._store.clear()
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+
+def _aligned_whitened_residual(
+    *,
+    ref_gate: torch.Tensor,
+    ref_up: torch.Tensor,
+    ref_down: torch.Tensor,
+    child_gate: torch.Tensor,
+    child_up: torch.Tensor,
+    child_down: torch.Tensor,
+    perm: np.ndarray,
+    a_sqrt_gate_up: torch.Tensor,
+    a_sqrt_down: torch.Tensor,
+    whitening_mode: str,
+) -> float:
+    """Three-term whitened Frobenius residual under a fixed permutation.
+
+    Per spec § 5 step 4T(c)(ii):
+        R_cm = ‖(W_c_gate − W_m_gate[perm, :]) · A_gate_up^{1/2}‖_F
+             + ‖(W_c_up   − W_m_up[perm, :])   · A_gate_up^{1/2}‖_F
+             + ‖(W_c_down − W_m_down[:, perm]) · A_down^{1/2}    ‖_F
+
+    The whitening factor multiplies ΔW on the **right** (input axis), per the
+    AA-SVD lineage and the Round-1 spec-review dimensional fix.
+
+    Convention (PyTorch nn.Linear weight shapes):
+        W_gate, W_up : (d_int, hidden)
+        W_down       : (hidden, d_int)
+        A_gate_up    : (hidden, hidden)
+        A_down       : (d_int, d_int)
+        perm         : length d_int — child neurons reordered to align with the centroid.
+    """
+    # Import here so the module load order doesn't depend on cov_sqrt being
+    # available (cov_sqrt itself depends only on torch, no circular risk).
+    from .utils.cov_sqrt import whitened_residual
+
+    perm_t = torch.as_tensor(perm, dtype=torch.long, device=ref_gate.device)
+
+    # Aligned child weights (gate / up / down). All three projections need
+    # the same per-pair permutation applied on the d_int axis.
+    aligned_gate = child_gate[perm_t, :]      # (d_int, hidden)
+    aligned_up   = child_up[perm_t, :]        # (d_int, hidden)
+    aligned_down = child_down[:, perm_t]      # (hidden, d_int)
+
+    delta_gate = ref_gate - aligned_gate      # (d_int, hidden)
+    delta_up   = ref_up   - aligned_up        # (d_int, hidden)
+    delta_down = ref_down - aligned_down      # (hidden, d_int)
+
+    r_gate = whitened_residual(delta_gate, a_sqrt_gate_up, mode=whitening_mode)
+    r_up   = whitened_residual(delta_up,   a_sqrt_gate_up, mode=whitening_mode)
+    r_down = whitened_residual(delta_down, a_sqrt_down,    mode=whitening_mode)
+
+    return float(r_gate + r_up + r_down)
 
 
 def _permutation_align_to_centroid(
@@ -1209,6 +2560,7 @@ def _merge_experts_inplace(
     *,
     freq_weighted: bool,
     ream_acc: ReamCostAccumulator | None = None,
+    perm_cache: "_PermAlignCache | None" = None,
 ) -> None:
     banks = build_banks(layer_ref)
     li = layer_ref.layer_idx
@@ -1258,13 +2610,24 @@ def _merge_experts_inplace(
                 gate_m = banks["gate_proj"].get(m).to(torch.float32)
                 up_m   = banks["up_proj"].get(m).to(torch.float32)
                 child_act = ream_acc.get_neuron_mean(li, m) if ream_acc else None
-                perm = (
-                    None if m == centroid
-                    else _permutation_align_to_centroid(
-                        ref_gate, ref_up, gate_m, up_m,
-                        ref_act_mean=ref_act, child_act_mean=child_act,
+                if m == centroid:
+                    perm = None
+                else:
+                    # Stage 2 v2 (M1): reuse the perm computed during cost-matrix
+                    # construction if the cache hit. This avoids a second
+                    # Hungarian solve per merge member.
+                    cached = (
+                        perm_cache.get((li, centroid, m))
+                        if perm_cache is not None
+                        else None
                     )
-                )
+                    if cached is not None:
+                        perm = cached[0]
+                    else:
+                        perm = _permutation_align_to_centroid(
+                            ref_gate, ref_up, gate_m, up_m,
+                            ref_act_mean=ref_act, child_act_mean=child_act,
+                        )
                 for name, bank in banks.items():
                     if name == "gate_proj":
                         Wm = gate_m
