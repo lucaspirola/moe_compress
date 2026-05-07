@@ -243,10 +243,13 @@ def run(
                         log.warning("Stage 5: torch.compile(teacher) failed (%s) — eager", exc)
                 _teacher_state["model"] = _t
                 _teacher_refs_count = sum(1 for _ in iter_moe_layers(getattr(_t, "_orig_mod", _t)))
-                assert _teacher_refs_count == student_refs_count, (
-                    f"Teacher/student MoE layer count mismatch: "
-                    f"{_teacher_refs_count} vs {student_refs_count}"
-                )
+                if _teacher_refs_count != student_refs_count:
+                    raise RuntimeError(
+                        f"Teacher/student MoE layer count mismatch: "
+                        f"{_teacher_refs_count} (teacher) vs {student_refs_count} "
+                        f"(student). Vocabulary-level KD requires identical MoE "
+                        "topology between teacher and student."
+                    )
             return _teacher_state["model"]
     # Freeze non-router parameters BEFORE compiling the student so that the
     # compiled graph is traced with the final requires_grad flags. Compiling
@@ -341,19 +344,22 @@ def run(
     resume_epoch = 0
     resume_batch_i = -1
 
+    # `no_resume=True` means "don't pick up existing checkpoints"; it does
+    # NOT mean "don't write new ones". Spec §8 mandates step-boundary
+    # checkpointing every N optimizer steps — disabling future writes would
+    # silently lose all progress on a crash mid-run.
+    partial_dir = artifacts_dir / f"_{stage_key}_partial"
     if no_resume:
-        partial_dir = None
-        # Delete any stale partial dir so a future non-no-resume run does not
-        # accidentally resume from a prior run's checkpoints.
-        stale = artifacts_dir / f"_{stage_key}_partial"
-        if stale.exists():
+        # Delete any stale partial dir from a prior run so the search for a
+        # latest checkpoint below finds none, then recreate empty for fresh
+        # writes during this run.
+        if partial_dir.exists():
             import shutil as _shutil
-            _shutil.rmtree(stale, ignore_errors=True)
-    else:
-        partial_dir = artifacts_dir / f"_{stage_key}_partial"
-        partial_dir.mkdir(parents=True, exist_ok=True)
-        for _stale in partial_dir.glob("*.tmp"):
-            _stale.unlink(missing_ok=True)
+            _shutil.rmtree(partial_dir, ignore_errors=True)
+    partial_dir.mkdir(parents=True, exist_ok=True)
+    for _stale in partial_dir.glob("*.tmp"):
+        _stale.unlink(missing_ok=True)
+    if not no_resume:
 
         ckpts = sorted(
             partial_dir.glob("step_*.pt"),
@@ -385,21 +391,24 @@ def run(
                 for part in parts[:-1]:
                     obj = getattr(obj, part)
                 getattr(obj, parts[-1]).data.copy_(t)
-            optim.load_state_dict(payload["optim_state"])
             # Validate that the optimizer state's param groups match the current
-            # trainable scope. If the trainable_name_patterns config changed since
-            # the checkpoint was written, the param-group layouts will mismatch
-            # and silently apply stale moments to the wrong parameters.
-            _ckpt_param_count = sum(len(g.get("params", [])) for g in payload["optim_state"].get("param_groups", []))
-            _current_param_count = sum(len(g["params"]) for g in optim.param_groups)
-            if _ckpt_param_count != _current_param_count:
+            # trainable scope by comparing param-name sets, not just counts.
+            # If the trainable_name_patterns config changed since the checkpoint
+            # was written, even matching counts could pair stale moments with
+            # the wrong parameters.
+            _ckpt_names: set[str] = set(payload.get("trainable_param_names", []))
+            _current_names = {n for n, p in student.named_parameters() if p.requires_grad}
+            if _ckpt_names and _ckpt_names != _current_names:
+                added = sorted(_current_names - _ckpt_names)
+                removed = sorted(_ckpt_names - _current_names)
                 raise RuntimeError(
-                    f"Stage 5 resume: optimizer param-group count mismatch — "
-                    f"checkpoint has {_ckpt_param_count} params, current trainable "
-                    f"scope has {_current_param_count}. Trainable scope changed since "
-                    f"checkpoint — delete _{stage_key}_partial/ and re-run, or "
-                    f"restore the original trainable_name_patterns."
+                    f"Stage 5 resume: trainable parameter set changed since "
+                    f"checkpoint — added={added[:5]}{'...' if len(added) > 5 else ''}, "
+                    f"removed={removed[:5]}{'...' if len(removed) > 5 else ''}. "
+                    f"Delete _{stage_key}_partial/ and re-run, or restore the "
+                    f"original trainable_name_patterns."
                 )
+            optim.load_state_dict(payload["optim_state"])
             if device is not None:
                 _move_optimizer_state_to_device(optim, device)
             resume_step = int(payload["step"])
@@ -668,6 +677,10 @@ def _save_stage5_checkpoint(
         "router_state": router_state,
         "optim_state": optim.state_dict(),
         "gradient_accumulation": grad_accum,
+        # Trainable parameter name set; resume validates this matches the
+        # current trainable scope so a config change to trainable_name_patterns
+        # cannot pair stale moments with the wrong parameters.
+        "trainable_param_names": sorted(router_state.keys()),
     }
     tmp = partial_dir / f"step_{step}.pt.tmp"
     final = partial_dir / f"step_{step}.pt"
