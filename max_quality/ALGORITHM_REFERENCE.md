@@ -134,6 +134,8 @@ Uniform pruning wastes budget — some layers have highly redundant experts (hig
 
 #### Phase A: MA-Formation Layer Detection (Paper 2507.23279, Algorithm 1 (Appendix L) Stage 1)
 
+> **Note on the two-pass structure:** The two-pass structure (Phase A then Phase B) is faithful to paper Algorithm 1's pseudocode (two `for batch x ∈ D` loops at lines 5 and 15) but is not the only compliant rendering — Phase A's `L` only needs to be available before Phase B begins.
+
 Before scoring individual experts, Stage 1 constructs the set `L` of MA-formation layers. This is a dedicated pre-pass over the calibration data that scans each decoder layer's hidden state for the presence of a massive activation (MA) pattern.
 
 > **Conventions:** Layer indices `l` are 0-indexed throughout §4 Phase A (matches PyTorch `model.layers[l]` indexing and the implementation's `range(total_layers)`).
@@ -154,7 +156,7 @@ end for
 
 **MA pattern detection (project-specified thresholds; see [D-ma-detector](#12-known-deviations-from-papers)):** A layer `l` is added to `L` if it is actively **forming** (amplifying) a massive activation — not merely propagating one that formed in an earlier layer. Paper Algorithm 1 line 8 says only "if MA pattern detected" with no formula; all numeric thresholds below are project choices, not from the paper. The dynamic detector is **primary**, with the official-implementation 0.75-depth heuristic acting as a **secondary fallback** when the dynamic detector returns ∅. Both layers of the detector are motivated by Figure 3 of the paper, which shows MAs are "gradually amplified" through the formation layers, then propagate stably via residuals.
 
-- **First MoE layer** (no predecessor to compare): absolute outlier check — add to `L` if `max|H_l(x)| > ma_ratio × Q_99(|H_l(x)|)` where both statistics are taken as the maximum observed across all calibration batches. **`ma_ratio = 100` is project-specified** (not from the paper).
+- **First MoE layer** (no predecessor to compare; dense pre-MoE layers in the stack are not MoE candidates and are skipped automatically; the "first" here is the first MoE layer encountered top-down): absolute outlier check — add to `L` if `max|H_l(x)| > ma_ratio × Q_99(|H_l(x)|)` where both statistics are taken as the maximum observed across all calibration batches. **`ma_ratio = 100` is project-specified** (not from the paper).
 - **All subsequent layers**: growth check — add to `L` if `max|H_l(x)| / max|H_{l-1}(x)| > ma_growth_ratio`, where both maxima are the per-layer maximum across all calibration batches. **`ma_growth_ratio = 5.0` is project-specified** (not from the paper). A propagation layer has ratio ≈ 1.0; a formation layer has ratio >> 1.
 - **Fallback** (only when the dynamic detector returns ∅): the official implementation's depth heuristic — keep all layers with index `< round(0.75 × total_layers)`. See "Official implementation note" below.
 
@@ -168,7 +170,7 @@ Using across-batch maxima is valid because MAs are input-stable: 'their distribu
 
 #### Phase B: Calibration Pass 2 — Expert Magnitude + CKA (256 samples)
 
-All MoE layers are instrumented simultaneously. `run_calibration` runs once over all 256 samples (this is the second of the two passes; it is driven by Algorithm 1 (Appendix L) Stage 2, which covers expert magnitude collection for l ∈ L (Phase B); thresholding and SE selection are described in Phase C — the CKA collection for GRAPE is performed in the same pass as a pipeline efficiency choice but is not specified by Algorithm 1), collecting two things per (layer, expert):
+All MoE layers are instrumented simultaneously. `run_calibration` runs once over all 256 samples (this is the second of the two passes; it is driven by Algorithm 1 (Appendix L) Stage 2, which covers expert magnitude collection for l ∈ L (Phase B = magnitude + CKA collection); thresholding and SE selection are described in Phase C (Phase C = thresholding + SE selection) — the CKA collection for GRAPE is performed in the same pass as a pipeline efficiency choice but is not specified by Algorithm 1), collecting two things per (layer, expert):
 
 1. **Max activation magnitude** `max_{x∈D} |h_{l,e}(x) · W^{l,e}_{down_proj}|` — for super expert detection. Here `h_{l,e}(x)` is the intermediate activation entering the down_proj of expert `e` in layer `l`, and the magnitude is measured at the down_proj **output** (post-weight-multiplication), exactly as stated in Algorithm 1 line 19.
 2. **Expert output representations** `f_e(x)` — for CKA pairwise similarity computation
@@ -229,7 +231,7 @@ All three conditions are required simultaneously. The l ∈ L constraint is enfo
 
 For each MoE layer, compute the pairwise CKA **distance** matrix `D^l ∈ ℝ^{N×N}` where `D^l_{ij} = 1 − CKA(f_i, f_j)` (distance, not raw similarity: 0 = identical, 1 = maximally different). CKA measures functional similarity between experts based on their response patterns to actual inputs — two experts that produce similar outputs on the calibration data have high CKA and thus low distance D^l_{ij}. The paper's `D^l` is a *similarity* (GRAPE 2604.06542 line 245) and selects pairs with `argmax`; this spec uses the distance form `1 − CKA` and `argmin`, an equivalent sign-flip documented at [D-cka-distance](#12-known-deviations-from-papers).
 
-Paper §3.2 explicitly allows "CKA, MSE, or other similarity measures" for D^l. CKA is the metric used by Zhang et al. (2025), cited in GRAPE §3.2 as the reference for intra-layer redundancy assessment.
+Paper §3.3 explicitly allows "CKA, MSE, or other similarity measures" for D^l. CKA is the metric used by Zhang et al. (2025), cited in GRAPE §3.2 as the reference for intra-layer redundancy assessment.
 
 With 256 samples × 2048 tokens ≈ 524K total token activations across the layer (each expert sees only its top-k/N routed fraction; for top-8 over 256 experts that is ≈ 16K per expert before sampling), reservoir-sampled to 256 per expert for CKA so the kernel matrices are well-conditioned for 256-expert layers.
 
@@ -239,13 +241,13 @@ With 256 samples × 2048 tokens ≈ 524K total token activations across the laye
 
 1. **Initialize** each expert as its own cluster. Compute per-layer redundancy `R^l = Σ_{i≠j} D^l_{ij}` (Eq. 11, applied to the distance matrix per [D-cka-distance](#12-known-deviations-from-papers)). Note: the distance↔similarity identity `R^l_dist = N(N−1) − R^l_sim` assumes the i=j diagonal is excluded (Σ_{i≠j}); including it would break the offset because 1−CKA(f_i,f_i)=0 vs CKA(f_i,f_i)=1. Set entropy threshold `Ê = E × (1 − γ)` (Eq. 10) where `E` is the initial cross-layer entropy (paper notation: unsubscripted `E` defined at initialization; some implementations write `E_0`) and `γ=0.1` is project-chosen (see [D3](#12-known-deviations-from-papers); the paper gives no default).
 
-2. **Greedy loop** until total surviving experts ≤ `global_expert_budget`:
+2. **Greedy loop** until total surviving experts ≤ `effective_budget = global_expert_budget − total_SEs` (paper notation: K; see [D-se-blacklist-merge](#12-known-deviations-from-papers) for the SE subtraction):
    - If all layers frozen and budget not yet met → **restart** (unfreeze all; if budget already met, the outer loop exits normally). The same iteration that clears `frozen` then immediately runs argmin layer/pair selection and performs one merge; the entropy gate is then re-evaluated at the end of the same iteration (paper Algorithm 1 lines 11–12) — this "one extra merge per restart cycle to escape local optima" is documented at [D-grape-restart-merge](#12-known-deviations-from-papers).
    - Pick `l* = argmin R^l` among unfrozen layers strictly above their floor (smallest total pairwise distance = most redundant layer; floor enforced during greedy by skipping any layer at-or-below floor when picking argmin/argmax — see [D5](#12-known-deviations-from-papers); distance-vs-similarity sign-flip vs paper's `argmax` per [D-cka-distance](#12-known-deviations-from-papers))
    - Pick `(i*, j*) = argmin D^{l*}_{ij}` (most similar pair = smallest distance; same distance-vs-similarity inversion per [D-cka-distance](#12-known-deviations-from-papers))
    - **Merge:** zero out `j*`'s row/column in `D^{l*}` (paper line 9); update `R^{l*}` from the modified matrix (paper line 10).
    - Decrement `cluster_counts[l*]` (Stage 1 implicit; tracked by spec).
-   - Recompute cross-layer entropy `E` from updated `cluster_counts` (paper line 11).
+   - Recompute cross-layer entropy `E` from updated `cluster_counts` (paper line 11) (only `cluster_counts[l*]` changes per iteration; entropy is recomputed from the full `cluster_counts` vector but the result reflects only the single-layer change).
    - If `E < Ê` → **freeze** layer `l*` (paper line 12); else continue. (See [D-grape-restart-merge](#12-known-deviations-from-papers) for the second restart path: lag-corrected post-selection restart, which is project-original.)
 
 3. **Floor constraint:** `min_experts_per_layer = num_routed_experts // 2` (= 128 for 256-expert layers). Applied to the non-SE pool per layer. No early/late layer bonuses — the floor alone provides sufficient protection at 50% max removal per layer (see [D5](#12-known-deviations-from-papers)).
@@ -270,11 +272,13 @@ Stage 1 is stateless (JSON-only output: blacklist + per-layer budgets). Re-runni
 
 ### Blacklist Output (`stage1_blacklist.json`)
 
-Stage 1 emits `stage1_blacklist.json` containing **one category only**: Super Expert (layer, expert) index pairs from Phase C's three-way AND criterion. Fewer than 0.5% of all routed experts for typical models.
+Stage 1 emits `stage1_blacklist.json` containing **one category only**: Super Expert (layer, expert) index pairs from Phase C's three-way AND criterion. At most ~0.5% of all routed experts for typical models (Qwen3 0.05%, DeepSeek-V2 0.11%, Mixtral-8x7B 0.39%).
 
 Shared experts (`mlp.shared_expert`) are **not in the blacklist** and are not processed by Stage 1 at all. They live in a separate model attribute, distinct from the routed `mlp.experts` list, and are architecturally invisible to `iter_moe_layers`, GRAPE, and REAM. No explicit exclusion is needed — they are simply never candidates.
 
 **What GRAPE contributes to Stage 2 is per-layer budgets (N'_l), not individual expert blacklists.** N'_l ≥ `min_experts_per_layer` (128) for every layer due to the floor constraint. Stage 2 uses N'_l as the target centroid count for REAM per layer; REAP scores then determine which N'_l routed non-blacklisted experts become centroids.
+
+> Stage 1 spec touch-up 2026-05-07 (iter+3): clarified Phase E entropy-recompute scope (only c_{l*} changes per iter); §4 Phase D citation §3.2 → §3.3; GRAPE K vs effective_budget cross-link in Phase E step 2; minor wording polish on Mixtral percentage and first-MoE-layer scope.
 
 ---
 
