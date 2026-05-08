@@ -108,6 +108,12 @@ def _build_ablation_config(
     cfg.setdefault("stage6_validate", {})
     cfg["stage6_validate"].setdefault("teacher_eval_cache", {})
     cfg["stage6_validate"]["teacher_eval_cache"]["cache_path"] = str(teacher_cache_path)
+    # Disable imatrix for ablations: it runs convert_hf_to_gguf.py + llama-imatrix
+    # via subprocess (10-30 min CPU work for a 35B model) and produces a GGUF
+    # quantization calibration artifact we don't consume in the ablation analysis.
+    # Per-ablation savings: 10-30 min × 12 = 2-6h total.
+    cfg["stage6_validate"].setdefault("imatrix", {})
+    cfg["stage6_validate"]["imatrix"]["enabled"] = False
     return cfg
 
 
