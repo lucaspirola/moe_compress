@@ -2623,16 +2623,25 @@ def _permutation_align_to_centroid(
             return (M - m_min) / (m_max - m_min)
         return torch.zeros_like(M)
 
-    C_gate = torch.cdist(ref_gate.cpu(), child_gate.cpu())
-    C_up   = torch.cdist(ref_up.cpu(), child_up.cpu())
+    # Keep cost-matrix construction on the device of the input weights — the
+    # explicit .cpu() calls present here previously forced ~50-100 ms of CPU
+    # cdist per pair-alignment, vs ~1 ms on GPU; with up to ~5K calls/layer ×
+    # 40 layers the regression compounded to >10 min/run. The single CPU sync
+    # is deferred to the Hungarian step below, which is unavoidably CPU
+    # (scipy.optimize.linear_sum_assignment).
+    # All inputs must share the same device (callers stage tensors via
+    # build_banks(layer_ref), which keys off the live model device); cdist
+    # would error on mixed-device inputs.
+    C_gate = torch.cdist(ref_gate, child_gate)
+    C_up   = torch.cdist(ref_up,   child_up)
     if ref_act_mean is not None and child_act_mean is not None:
         # L2-normalize both activation-mean vectors along the neuron dimension
         # before computing L2 distance (spec §5, F2-PERM-ALIGN-NORM).
         # eps=1e-8 guards against zero-norm vectors (all-zero activations);
         # F.normalize returns a zero vector for those, which is the safest
         # fallback (zero-norm input → zero output, no NaN).
-        ref_act_n   = torch.nn.functional.normalize(ref_act_mean.cpu().float(),   p=2, dim=0, eps=1e-8)
-        child_act_n = torch.nn.functional.normalize(child_act_mean.cpu().float(), p=2, dim=0, eps=1e-8)
+        ref_act_n   = torch.nn.functional.normalize(ref_act_mean.float(),   p=2, dim=0, eps=1e-8)
+        child_act_n = torch.nn.functional.normalize(child_act_mean.float(), p=2, dim=0, eps=1e-8)
         C_act = torch.cdist(
             ref_act_n.unsqueeze(-1),
             child_act_n.unsqueeze(-1),
@@ -2650,7 +2659,8 @@ def _permutation_align_to_centroid(
     else:
         # B-C-M-1: same single-component treatment for the no-activation path.
         C = _safe_norm(C_gate + C_up)
-    _, col_ind = linear_sum_assignment(C.numpy())
+    # Hungarian solver requires CPU numpy — single sync at the end.
+    _, col_ind = linear_sum_assignment(C.detach().cpu().numpy())
     return col_ind
 
 

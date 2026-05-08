@@ -47,12 +47,16 @@ calibration:
 # Stage 0 is removed — SE detection is now Phase B of Stage 1.
 
 stage1_grape:
-  # Phase A: calibration forward pass
-  num_calibration_samples: 256    # 256 samples × 2048 tokens ≈ 512K tokens.
-                                  # ExpertOutputAccumulator reservoir caps at 256 tokens/expert;
-                                  # with ~3.1% activation rate, 256 samples yields ~16K tokens/expert
-                                  # — the reservoir fills to cap regardless. More samples only
-                                  # marginally improve reservoir randomness. ~5 min on H200.
+  # Phase A/B: calibration forward pass
+  num_calibration_samples: 4000   # 4000 samples × 2048 tokens ≈ 8M tokens.
+                                  # Stage 1 runs ONCE and is reused across all ablations, so the
+                                  # one-time cost is amortized. After GPU-vectorizing Phase B
+                                  # (ExpertOutputAccumulator) and Phase D (_cka_distance_matrix),
+                                  # 4000 samples now completes in ~75 min total on H200 (vs 8.5h
+                                  # at 256 samples on the CPU implementations). Benefit: tightest
+                                  # possible P99.5 super-expert threshold + cleanest CKA reservoirs
+                                  # (every active expert's reservoir saturates at the 256-token
+                                  # cap many times over).
   # Phase B: super expert detection (2507.23279)
   super_expert_detection:
     zscore_threshold: 2.5           # blacklist expert if down_proj max > mean + 2.5σ

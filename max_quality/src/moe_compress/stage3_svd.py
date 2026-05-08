@@ -1463,12 +1463,11 @@ class _EighDecomp:
         rhs:          The right-hand-side matrix such that M = W @ rhs.
                       Shape [d_in, r_eff].  Content depends on the path:
                       - Path 1 (Theorem 3.2): CQ · diag(1/√λ)
-                      - Path 2 (auto-cov):    AQ · diag(1/√λ)
                       - Path 3 (Cor. 3.3):    L_B = Q · diag(√λ)
         rhs_pinv:     Pseudo-inverse of rhs, shape [r_eff, d_in].
                       Used in the back-solve: V_k = Vh[:k] @ rhs_pinv.
                       - Path 3: exact inverse = diag(1/√λ) · Q^T (no extra SVD)
-                      - Paths 1/2: torch.linalg.pinv(rhs)
+                      - Path 1: torch.linalg.pinv(rhs)
         r_eff:        Number of retained eigenvalues (= rhs.shape[1]).
     """
     eigvals_keep: torch.Tensor
@@ -1513,22 +1512,25 @@ def _precompute_eigh(
     eigvecs_keep = eigvecs[:, keep]
     inv_sqrt = eigvals_keep.clamp_min(1e-30).rsqrt()             # [r_eff]
 
+    # Path selection: paper 2604.02119 has only two sanctioned paths —
+    #   • Path 1 (Theorem 3.2)    when cross-covariance C is available
+    #   • Path 3 (Corollary 3.3)  fallback using only B
+    # An earlier "Path 2" auto-covariance variant (rhs = A · Q · Λ^{-1/2})
+    # corrupted the rank-k target — it produces U·V ≈ W·A·B^{-1}·L_B rather
+    # than approximating W in the B-weighted norm. Three tests in
+    # tests/test_aa_svd_correctness.py pin A as reserved for L-BFGS refinement
+    # only, never used in the SVD step. The variable ``A`` is kept in the
+    # signature for backward compatibility but is intentionally unused here.
+    del A  # explicit: A must not influence the rank-k factorization
     if C is not None:
-        # Path 1: Paper-exact Theorem 3.2 — rhs = C @ Q · diag(1/√λ)
+        # Path 1: Paper-exact Theorem 3.2 — rhs = C @ Q · diag(1/√λ).
         C = C.to(device=device, dtype=torch.float32)
         CQ = C @ eigvecs_keep                                    # [d_in, r_eff]
         rhs = CQ * inv_sqrt.unsqueeze(0)                         # [d_in, r_eff]
         # pinv(C·Q·Λ^{-1/2}) ≠ Λ^{-1/2}·Q^T — must compute pseudo-inverse explicitly.
         rhs_pinv = torch.linalg.pinv(rhs)                        # [r_eff, d_in]
-    elif A is not None:
-        # Path 2: Auto-covariance — rhs = A @ Q · diag(1/√λ)
-        A = A.to(device=device, dtype=torch.float32)
-        A = 0.5 * (A + A.T)
-        AQ = A @ eigvecs_keep                                    # [d_in, r_eff]
-        rhs = AQ * inv_sqrt.unsqueeze(0)                         # [d_in, r_eff]
-        rhs_pinv = torch.linalg.pinv(rhs)                        # [r_eff, d_in]
     else:
-        # Path 3: Corollary 3.3 — rhs = L_B = Q · diag(√λ)
+        # Path 3: Corollary 3.3 — rhs = L_B = Q · diag(√λ).
         rhs = eigvecs_keep * eigvals_keep.sqrt().unsqueeze(0)    # [d_in, r_eff]
         # Exact inverse: (Q·Λ^{1/2})^{-1} = Λ^{-1/2}·Q^T — no extra SVD.
         rhs_pinv = inv_sqrt.unsqueeze(1) * eigvecs_keep.T        # [r_eff, d_in]
@@ -1553,8 +1555,8 @@ def _aa_svd_precomputed(
     """Rank-k factorization of W using a pre-computed eigendecomposition.
 
     Mathematically identical to ``_aa_svd`` — the only difference is that
-    the eigendecomposition of B and the rhs product (CQ·inv_sqrt, AQ·inv_sqrt,
-    or L_B) are supplied via ``decomp`` rather than recomputed.
+    the eigendecomposition of B and the rhs product (Path 1: CQ·inv_sqrt,
+    or Path 3: L_B) are supplied via ``decomp`` rather than recomputed.
 
     Returns (U_k, V_k, rel_err, k_eff).
     """
@@ -1568,9 +1570,9 @@ def _aa_svd_precomputed(
         U_eff = U[:, :k_eff] * S[:k_eff]
         # Back-solve: V_k = Vh[:k_eff] @ rhs_pinv where rhs_pinv = pinv(rhs).
         # Path 3: rhs_pinv = Λ^{-1/2}·Q^T (exact, precomputed analytically).
-        # Paths 1/2: rhs_pinv = pinv(C·Q·Λ^{-1/2}) (precomputed via torch.linalg.pinv).
-        # Using the path-specific rhs_pinv is critical for Paths 1/2 — the naive
-        # Λ^{-1/2}·Q^T back-solve ignores the C/A factor and produces wrong V_k.
+        # Path 1: rhs_pinv = pinv(C·Q·Λ^{-1/2}) (precomputed via torch.linalg.pinv).
+        # Using the path-specific rhs_pinv is critical for Path 1 — the naive
+        # Λ^{-1/2}·Q^T back-solve ignores the C factor and produces wrong V_k.
         V_eff = Vh[:k_eff, :] @ decomp.rhs_pinv                 # [k_eff, d_in]
         # Numerically stable rel_err: tail singular values of M.
         S2 = S * S
@@ -1613,7 +1615,7 @@ def _aa_svd(
 ) -> tuple[torch.Tensor, torch.Tensor, float, int]:
     """Activation-aware rank-k factorization of W.
 
-    Three paths, in priority order:
+    Two paths from paper 2604.02119, in priority order:
 
     1. **Paper-exact (Theorem 3.2)**: when cross-covariance C = X_pre^T X_post
        and B = X_post^T X_post are both available:
@@ -1621,15 +1623,16 @@ def _aa_svd(
        where L_B satisfies B = L_B · L_B^T. This is the exact AA-SVD solution
        that anchors to original outputs while adapting to shifted inputs.
 
-    2. **Auto-covariance approximation**: when A = X_pre^T X_pre and B are
-       available but C is not:
-         M = W · A · B^{-1} · L_B
-       Substitutes pre-prune auto-covariance for cross-covariance. The two
-       coincide when pre/post distributions are similar (light pruning).
-
-    3. **Corollary 3.3 fallback**: when only B is available:
+    2. **Corollary 3.3 fallback**: when C is unavailable:
          M = W · L_B
        Shift-aware variant that adapts to post-prune distribution only.
+
+    The ``A`` argument (pre-prune auto-covariance) is reserved for L-BFGS
+    refinement and is NOT used in the rank-k factorization. An earlier
+    "Path 2" using A as a proxy for C produced U·V ≈ W·A·B^{-1}·L_B rather
+    than approximating W, breaking downstream consumers (FactoredExperts
+    forward, Stage 4 EoRA residual). The contract is pinned by tests in
+    ``tests/test_aa_svd_correctness.py``.
 
     Returns (U_k, V_k, rel_err, k_eff).
 

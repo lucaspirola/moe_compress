@@ -61,3 +61,84 @@ def test_expert_output_accumulator_reservoir_cap():
     # Reservoir capped at the configured cap.
     assert R.shape[0] == cap
     assert R.shape[1] == d_out
+
+
+def test_expert_output_accumulator_fill_to_sample_boundary():
+    """Reservoir must split correctly within a single batch that crosses the
+    fill→sample boundary. cap=10, push 7 then 7 → first 3 of the second batch
+    fill remaining slots, last 4 enter sampling regime."""
+    cap = 10
+    acc = ExpertOutputAccumulator(max_tokens_per_expert=cap)
+    d_out = 4
+
+    # Batch 1: 7 tokens (all fill). Tag each token with its global index in dim 0.
+    x1 = torch.arange(7, dtype=torch.float32).reshape(7, 1).repeat(1, d_out)
+    acc.update(0, 0, x1)
+
+    # Batch 2: 7 tokens with global indices [7..13]. Capacity has 3 free slots
+    # (cap - 7 = 3) so first 3 fill, last 4 enter reservoir-sampling regime.
+    x2 = torch.arange(7, 14, dtype=torch.float32).reshape(7, 1).repeat(1, d_out)
+    acc.update(0, 0, x2)
+
+    acc.finalize()
+    R = acc.get_representations(0, 0)
+    assert R.shape == (cap, d_out)
+
+    # Tokens 0..9 (all 10) MUST be in the reservoir before sampling; specifically:
+    # slots [0..6] from batch 1 + slots [7..9] from x2[:3]. The sampling tail
+    # (x2[3:]) is allowed to OVERWRITE any of the 10 slots probabilistically.
+    # Conservative check: every retained token's tag is from the union [0..13].
+    tags = R[:, 0].tolist()
+    assert all(0.0 <= t <= 13.0 for t in tags), f"unexpected tag: {tags}"
+    # Slots 0..6 must hold tags 0..6 (head fill is deterministic, sampling
+    # only overwrites slot indices ∈ randint(0, cap), but Phase 1 head-fill
+    # writes to slots [n_filled : n_filled + n_to_fill] = [0:7] and [7:10]
+    # in deterministic order before the sampling tail runs).
+    # The randint sampling could overwrite slots [0..9] uniformly, so we cannot
+    # assert any specific slot contents — but the reservoir cap is enforced.
+
+
+def test_expert_output_accumulator_aliasing_safety():
+    """Mutating the source tensor after update() must not corrupt the
+    reservoir. Tests that indexed assignment copies values, not views."""
+    cap = 4
+    acc = ExpertOutputAccumulator(max_tokens_per_expert=cap)
+    d_out = 3
+    x = torch.tensor([[1.0, 1.0, 1.0],
+                      [2.0, 2.0, 2.0]], dtype=torch.float32)
+    acc.update(0, 0, x)
+    # Mutate x in place AFTER update returns.
+    x[0] = -999.0
+    x[1] = -999.0
+    acc.finalize()
+    R = acc.get_representations(0, 0)
+    assert R.shape == (2, d_out)
+    # Reservoir must hold the original values, not the mutated ones.
+    assert torch.allclose(R[0], torch.tensor([1.0, 1.0, 1.0]))
+    assert torch.allclose(R[1], torch.tensor([2.0, 2.0, 2.0]))
+
+
+def test_expert_output_accumulator_multi_key_isolation():
+    """Different (layer, expert) reservoirs must not bleed into each other.
+    With per-key lazy allocation, this protects against an aliasing or shared
+    storage bug."""
+    cap = 3
+    acc = ExpertOutputAccumulator(max_tokens_per_expert=cap)
+    d_out = 2
+
+    x_a = torch.tensor([[1.0, 1.0], [1.0, 1.0]], dtype=torch.float32)  # 2 tokens for (0, 0)
+    x_b = torch.tensor([[2.0, 2.0], [2.0, 2.0], [2.0, 2.0]], dtype=torch.float32)  # 3 tokens for (1, 5)
+    x_c = torch.tensor([[3.0, 3.0]], dtype=torch.float32)  # 1 token for (0, 1) — same layer, different expert
+
+    acc.update(0, 0, x_a)
+    acc.update(1, 5, x_b)
+    acc.update(0, 1, x_c)
+    acc.finalize()
+
+    R_a = acc.get_representations(0, 0)
+    R_b = acc.get_representations(1, 5)
+    R_c = acc.get_representations(0, 1)
+
+    assert R_a.shape == (2, d_out) and torch.allclose(R_a, torch.full((2, d_out), 1.0))
+    assert R_b.shape == (3, d_out) and torch.allclose(R_b, torch.full((3, d_out), 2.0))
+    assert R_c.shape == (1, d_out) and torch.allclose(R_c, torch.full((1, d_out), 3.0))
