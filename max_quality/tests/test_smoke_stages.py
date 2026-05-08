@@ -53,7 +53,9 @@ def test_stage1_smoke(tiny_model, patched_calibration, tmp_path):
     )
     stage1_grape.run(tiny_model, _TinyTokenizer(), patched_calibration, tmp_path, decomp)
     payload = json.loads((tmp_path / "stage1_budgets.json").read_text())
-    assert payload["global_budget"] == 5
+    # The output schema names this `requested_budget` (carries
+    # decomposition.global_expert_budget); the test was stale from a rename.
+    assert payload["requested_budget"] == 5
     assert all(v >= 2 for v in payload["per_layer_target_experts"].values())
 
 
