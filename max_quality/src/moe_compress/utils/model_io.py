@@ -1225,15 +1225,18 @@ def _assign_storage(model: nn.Module, key: str, tensor: torch.Tensor) -> None:
         existing.grad = None
         existing.data = tensor
     elif leaf in getattr(parent, "_buffers", {}):
-        # Persistent buffer. Re-register it so the module's _buffers dict
-        # points at the new tensor; preserve persistent / non-persistent flag.
-        # named_buffers(recurse=False) only yields persistent buffers by default
-        # (no include_non_persistent=True). A buffer in _buffers that is absent
-        # from persistent_names is therefore correctly identified as non-persistent.
-        persistent_names = {name for name, _ in parent.named_buffers(recurse=False)}
-        persistent = leaf in persistent_names
+        # Buffer (persistent or non-persistent). Re-register so the module's
+        # _buffers dict points at the new tensor; preserve persistent flag.
+        # nn.Module.named_buffers() yields BOTH persistent AND non-persistent
+        # buffers (PyTorch 1.10+). The authoritative source for the flag is
+        # `_non_persistent_buffers_set`: a buffer name in that set is the
+        # non-persistent kind (excluded from state_dict). Earlier code here
+        # used named_buffers(recurse=False) and assumed it yielded only
+        # persistent buffers — that was incorrect, and silently converted
+        # non-persistent buffers into persistent on every storage swap.
+        non_persistent = leaf in getattr(parent, "_non_persistent_buffers_set", set())
         parent._buffers.pop(leaf, None)
-        parent.register_buffer(leaf, tensor, persistent=persistent)
+        parent.register_buffer(leaf, tensor, persistent=not non_persistent)
     else:
         # state_dict() only yields parameters + persistent buffers, so this
         # branch is unreachable for any key in expected_keys. Fail loud

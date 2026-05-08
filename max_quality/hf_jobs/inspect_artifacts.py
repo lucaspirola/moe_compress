@@ -68,7 +68,9 @@ def inspect_stage1() -> int:
     budgets = {int(k): int(v) for k, v in data["per_layer_target_experts"].items()}
     print(f"Stage 1 artifacts:")
     print(f"  layers                : {len(budgets)}")
-    print(f"  global budget         : {data['global_budget']}")
+    # Schema names this `requested_budget` (was historically `global_budget`).
+    print(f"  requested budget      : {data['requested_budget']}")
+    print(f"  achieved budget       : {data['achieved_budget']}")
     print(f"  per-layer budget min  : {min(budgets.values())}")
     print(f"  per-layer budget max  : {max(budgets.values())}")
     print(f"  mean                  : {sum(budgets.values()) / len(budgets):.1f}")
