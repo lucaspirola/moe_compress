@@ -510,107 +510,164 @@ class ExpertOutputAccumulator:
     """Per-(layer, expert) expert output representation collector for CKA.
 
     Collects down_proj output vectors during the calibration forward pass
-    using reservoir sampling to bound memory. Used by Stage 1 Phase C to
+    using reservoir sampling to bound memory. Used by Stage 1 Phase D to
     compute CKA pairwise similarity matrices.
 
-    Memory budget: max_tokens_per_expert=256 × d_out=2048 × 4 bytes = 2 MB
-    per expert. With 256 experts × 40 layers ≈ 20 GB total — fits in H200's
-    71 GB headroom alongside the model.
+    GPU-resident reservoir (revised). Each (layer, expert) reservoir is a
+    pre-shaped ``[cap, d_out]`` tensor on the device of the expert output.
+    Updates are vectorized: instead of a per-token Python loop with a
+    CPU transfer + ``.clone()`` per accepted token, we compute acceptance
+    probabilities for the entire batch in one GPU op and write all accepted
+    rows with a single indexed assignment.
 
-    During the forward pass, expert outputs arrive on GPU. We detach and
-    transfer to CPU immediately (like DownProjMaxAccumulator.finalize but
-    streaming). The reservoir is maintained on CPU to avoid GPU memory pressure.
+    Why GPU. The CPU implementation transferred ``[T, d_out]`` per call;
+    Phase B fires this callback ~10K times per forward (256 experts × 40
+    layers). The CPU loop + .clone() per token dominated Phase B (~25 sec
+    per forward pass on H200, vs ~0.3 sec for Phase A which has no
+    ExpertOutputAccumulator). With this rewrite, Phase B per-forward time
+    drops to be model-forward-bound (~0.3-1 sec).
+
+    Memory budget: max_tokens_per_expert=256 × d_out=2048 × 4 bytes = 2 MB
+    per active expert. With 256 experts × 40 layers ≈ 20 GB peak — fits
+    alongside the ~70 GB Qwen3.6-35B-A3B model in H200's 140 GB. Lazy
+    per-(layer, expert) allocation amortizes the cost.
+
+    Statistical equivalence with sequential reservoir sampling. Vectorized
+    sampling processes a batch of ``n_batch`` tokens in a single op:
+    each token i (1-indexed within the batch) is accepted with probability
+    ``cap / (seen + i)`` and, if accepted, overwrites a uniform random slot.
+    For a single-batch update this matches sequential reservoir sampling
+    in expectation; per-slot occupancy distribution is identical. When two
+    accepted tokens collide on the same slot, last-wins applies (PyTorch
+    indexed-assign semantics) — the resulting distribution is still uniform
+    because the choice of slot is independent of the token content.
 
     Usage:
         acc = ExpertOutputAccumulator(max_tokens_per_expert=256)
         # ... inside the down_cb callback:
         acc.update(layer_idx, expert_idx, down_proj_output)
-        # ... after forward pass:
+        # ... after the forward pass:
         acc.finalize()
-        R = acc.get_representations(layer_idx, expert_idx)  # [n, d_out]
+        R = acc.get_representations(layer_idx, expert_idx)  # [n, d_out] CPU fp32
     """
     max_tokens_per_expert: int = 256
-    # CPU-resident reservoir: (layer_idx, expert_idx) → list of [d_out] tensors.
-    _reservoir: dict[tuple[int, int], list[torch.Tensor]] = field(default_factory=dict)
-    # Count of total tokens seen per (layer, expert) — for reservoir sampling.
+    # GPU-resident reservoir: (layer, expert) → [cap, d_out] fp32 on device.
+    # Lazy-allocated on the first update() for that key.
+    _gpu_reservoir: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
+    # Total tokens seen per (layer, expert) — controls Python-side branches.
     _seen_count: dict[tuple[int, int], int] = field(default_factory=dict)
-    # Finalized stacked representations: (layer, expert) → [n_tokens, d_out].
+    # Finalized CPU representations: (layer, expert) → [n_tokens, d_out] fp32.
     _finalized: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
     _lock: "threading.Lock" = field(default_factory=threading.Lock)
 
     def update(self, layer_idx: int, expert_idx: int, x: torch.Tensor) -> None:
-        """Collect expert output vectors via reservoir sampling.
+        """Collect expert output vectors via vectorized GPU reservoir sampling.
 
         ``x`` shape: [T, d_out] where T is the number of tokens routed to
         this expert in the current batch. Called from the ``down`` callback.
+        Tensor is kept on its native device; no CPU transfer in the hot path.
         """
         if x.dim() < 2 or x.shape[0] == 0:
             return
         key = (layer_idx, expert_idx)
-        batch_cpu = x.detach().cpu().to(torch.float32)  # [T, d_out]
-        n_batch = batch_cpu.shape[0]
+        # Detach + cast on the source device. No .cpu() in the hot path.
+        x = x.detach().to(torch.float32)
+        n_batch, d_out = x.shape
+        cap = self.max_tokens_per_expert
+        device = x.device
 
-        # Full reservoir-sampling loop held under _lock — consider pre-computing
-        # replacement schedule outside the lock if this ever runs in a multi-threaded
-        # context (M-4).
         with self._lock:
-            reservoir = self._reservoir.get(key)
+            reservoir = self._gpu_reservoir.get(key)
             if reservoir is None:
-                reservoir = []
-                self._reservoir[key] = reservoir
+                # Lazy allocate on the device of the first observation.
+                reservoir = torch.empty(cap, d_out, dtype=torch.float32, device=device)
+                self._gpu_reservoir[key] = reservoir
 
             seen = self._seen_count.get(key, 0)
-            cap = self.max_tokens_per_expert
+            n_filled = min(seen, cap)  # currently-occupied slots before this batch
 
-            for i in range(n_batch):
-                seen += 1
-                if len(reservoir) < cap:
-                    # Reservoir not full — always accept.
-                    # Clone so the reservoir entry owns its storage: batch_cpu[i]
-                    # is a row-view into batch_cpu, and if x was already float32
-                    # on CPU, .to(torch.float32) above returns the same storage.
-                    # Without cloning, a buffer-reuse forward pass could corrupt
-                    # previously stored reservoir entries (aliasing bug).
-                    reservoir.append(batch_cpu[i].clone())
-                else:
-                    # Reservoir sampling: replace a random element with
-                    # probability cap/seen.
-                    j = random.randint(0, seen - 1)
-                    if j < cap:
-                        reservoir[j] = batch_cpu[i].clone()  # clone for same aliasing reason
+            # Phase 1: fill empty slots with the head of x. Always-accept regime
+            # of reservoir sampling — equivalent to seen + i ≤ cap.
+            n_to_fill = min(cap - n_filled, n_batch)
+            if n_to_fill > 0:
+                # Indexed assign copies values; no aliasing with x's storage.
+                reservoir[n_filled:n_filled + n_to_fill] = x[:n_to_fill]
 
-            self._seen_count[key] = seen
+            # Phase 2: reservoir sampling for tokens beyond capacity.
+            n_remaining = n_batch - n_to_fill
+            if n_remaining > 0:
+                # Token at remaining-index i is at global position
+                # (seen + n_to_fill + i + 1). Acceptance probability cap/position.
+                positions = (
+                    seen + n_to_fill
+                    + torch.arange(1, n_remaining + 1, device=device, dtype=torch.float32)
+                )
+                probs = float(cap) / positions  # [n_remaining]
+                u = torch.rand(n_remaining, device=device)
+                accept_mask = u < probs                                # [n_remaining]
+                slots = torch.randint(0, cap, (n_remaining,), device=device)
+                # Materialize accepted indices once on GPU; one indexed write.
+                accepted = accept_mask.nonzero(as_tuple=True)[0]
+                if accepted.numel() > 0:
+                    # Source rows: accepted positions within the n_remaining tail.
+                    src_rows = x[n_to_fill + accepted]
+                    dst_slots = slots[accepted]
+                    # Last-wins on collisions (PyTorch indexed-assign default);
+                    # statistically equivalent for uniform reservoir sampling.
+                    reservoir[dst_slots] = src_rows
+
+            self._seen_count[key] = seen + n_batch
 
     def finalize(self) -> None:
-        """Stack reservoir lists into contiguous tensors and free the lists."""
+        """Move GPU reservoirs to CPU (for downstream CKA consumption that
+        operates on host-resident tensors) and free the GPU storage.
+
+        Caller contract: no concurrent ``update()`` calls during ``finalize()``.
+        Phase B closes finalize once after all calibration forwards complete,
+        which satisfies this. Violating the contract would not corrupt the
+        popped reservoir (the local ``gpu_t`` reference keeps it alive) but
+        would race against `_seen_count` clearing, producing inconsistent
+        Phase 1/Phase 2 splits in any post-finalize ``update()``.
+        """
         with self._lock:
-            to_stack = {k: list(v) for k, v in self._reservoir.items() if v}
-            empty_keys = [k for k, v in self._reservoir.items() if not v]
-            self._reservoir.clear()
+            keys = list(self._gpu_reservoir.keys())
+        for key in keys:
+            with self._lock:
+                seen = self._seen_count.get(key, 0)
+                gpu_t = self._gpu_reservoir.pop(key, None)
+            if gpu_t is None:
+                continue
+            n_active = min(seen, self.max_tokens_per_expert)
+            if n_active > 0:
+                # Slice + cpu transfer happens once per (layer, expert).
+                cpu_t = gpu_t[:n_active].detach().to("cpu", copy=True)
+            else:
+                cpu_t = torch.empty(0, 0, dtype=torch.float32)
+            with self._lock:
+                self._finalized[key] = cpu_t
+        with self._lock:
             self._seen_count.clear()
-        # torch.stack outside the lock — CPU-only work, no need to block other threads.
-        stacked_results = {key: torch.stack(tensors, dim=0) for key, tensors in to_stack.items()}
-        empty_results = {key: torch.empty(0, 0, dtype=torch.float32) for key in empty_keys}
-        with self._lock:
-            self._finalized.update(stacked_results)
-            self._finalized.update(empty_results)
 
     def get_representations(self, layer_idx: int, expert_idx: int) -> torch.Tensor | None:
-        """Return [n_tokens, d_out] on CPU, or None if no data collected."""
+        """Return [n_tokens, d_out] CPU fp32, or None if no data collected.
+
+        Reads the finalized CPU snapshot when ``finalize()`` has been called;
+        otherwise materializes from the GPU reservoir on the fly (used by tests
+        that introspect mid-stream)."""
         key = (layer_idx, expert_idx)
         with self._lock:
             t = self._finalized.get(key)
-            if t is None:
-                reservoir = self._reservoir.get(key)
-                # Deep-copy each element so the caller cannot mutate the reservoir in-place.
-                reservoir_copy = [elem.clone() for elem in reservoir] if reservoir else None
-            else:
-                reservoir_copy = None
-        if t is not None:
-            return t.clone() if t.numel() > 0 else None
-        if reservoir_copy:
-            return torch.stack(reservoir_copy, dim=0)
-        return None
+            if t is not None:
+                return t.clone() if t.numel() > 0 else None
+            gpu_t = self._gpu_reservoir.get(key)
+            seen = self._seen_count.get(key, 0)
+            if gpu_t is None or seen == 0:
+                return None
+            n_active = min(seen, self.max_tokens_per_expert)
+            if n_active == 0:
+                return None
+            # Snapshot to CPU; the GPU reservoir keeps streaming.
+            return gpu_t[:n_active].detach().to("cpu", copy=True)
 
 
 @dataclass

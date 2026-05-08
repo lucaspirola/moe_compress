@@ -98,6 +98,11 @@ def _build_ablation_config(
     cfg.setdefault("calibration", {})
     cfg["calibration"]["num_sequences"] = num_sequences
     s2 = cfg.setdefault("stage2_reap_ream", {})
+    # Stage 2 reads its own per-stage knob (stage2_reap_ream.num_calibration_samples,
+    # see stage2_reap_ream.py:111) — overriding only the global calibration.num_sequences
+    # would leave Stage 2 at its YAML-specified value (4000 in prod). Cap it here so the
+    # --num-sequences flag actually bounds Stage 2 work.
+    s2["num_calibration_samples"] = num_sequences
     for k, v in deltas.items():
         s2[k] = v
     cfg.setdefault("stage6_validate", {})

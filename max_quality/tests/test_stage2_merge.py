@@ -67,6 +67,68 @@ def test_assign_children_when_more_children_than_centroids():
     assert assn[2] in (0, 1)
 
 
+def test_permutation_align_device_invariance_cpu_only():
+    """_permutation_align_to_centroid produces a valid permutation regardless of input device.
+
+    Pins the cost-matrix CPU→GPU optimization: the function previously moved
+    inputs to CPU before cdist, now keeps them on the input device. Test runs
+    on CPU (always available); verifies the function produces a valid
+    permutation (each index in [0, d_int) used exactly once) without crashing
+    or returning device-mixed tensors.
+    """
+    d_int, d_hid = 4, 8
+    torch.manual_seed(7)
+    ref_gate   = torch.randn(d_int, d_hid)
+    ref_up     = torch.randn(d_int, d_hid)
+    child_gate = torch.randn(d_int, d_hid)
+    child_up   = torch.randn(d_int, d_hid)
+    ref_act    = torch.randn(d_int)
+    child_act  = torch.randn(d_int)
+
+    # No-activation branch.
+    perm_wt = _permutation_align_to_centroid(ref_gate, ref_up, child_gate, child_up)
+    assert sorted(perm_wt.tolist()) == list(range(d_int))
+
+    # With activation branch.
+    perm_act = _permutation_align_to_centroid(
+        ref_gate, ref_up, child_gate, child_up,
+        ref_act_mean=ref_act, child_act_mean=child_act,
+    )
+    assert sorted(perm_act.tolist()) == list(range(d_int))
+
+
+def test_permutation_align_no_implicit_cpu_calls():
+    """Pin: _permutation_align_to_centroid must not contain explicit .cpu() calls
+    on its cost-construction tensors. Guards the GPU optimization from regression.
+
+    Reads the function source and asserts that the `.cpu()` calls present in the
+    pre-fix CPU regression are absent. The single allowed `.cpu()` is at the
+    Hungarian sync (linear_sum_assignment).
+    """
+    import ast
+    import inspect
+    from moe_compress.stage2_reap_ream import _permutation_align_to_centroid as fn
+    src = inspect.getsource(fn)
+    # AST-walk to find .cpu() calls, ignoring occurrences inside comments / strings.
+    tree = ast.parse(src)
+    cpu_calls = 0
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "cpu"
+            and not node.args
+        ):
+            cpu_calls += 1
+    # Allowed: exactly one .cpu() at the Hungarian boundary
+    # (C.detach().cpu().numpy()). More than one means a regression.
+    assert cpu_calls == 1, (
+        f"_permutation_align_to_centroid has {cpu_calls} .cpu() calls; "
+        f"expected exactly 1 (the Hungarian boundary). The CPU-cost-matrix "
+        f"regression has reappeared."
+    )
+
+
 def test_permutation_align_c_act_breaks_tie():
     """C_act term flips the permutation when activation signal favors a swap.
 

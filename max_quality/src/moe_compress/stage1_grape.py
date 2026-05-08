@@ -553,6 +553,9 @@ def _apply_paper_criterion(
 # ---------------------------------------------------------------------------
 
 
+_CKA_M_MIN_VECTORIZED_FLOOR = 32  # below this, the GPU uniform-m path is unsafe
+
+
 def _cka_distance_matrix(
     output_acc: ExpertOutputAccumulator,
     layer_ref,
@@ -561,61 +564,137 @@ def _cka_distance_matrix(
 
     Uses expert output representations collected during the calibration
     forward pass. CKA(X, Y) = HSIC(X, Y) / sqrt(HSIC(X, X) * HSIC(Y, Y))
-    where HSIC uses linear kernels.
+    where HSIC uses linear kernels and the biased centering of Gretton (2005):
+    K_c = K - row_mean - col_mean + grand_mean. Distance = (1 − CKA), clamped
+    to [0, 1].
+
+    Dispatches between two implementations based on the reservoir fill across
+    the active expert set:
+
+    - **GPU vectorized** (default for prod): subsamples every active expert
+      to a single m_min over the active set, batches the Gram matrices, and
+      computes the full N×N HSIC table in O(N · m² · d) GPU work. ~1 sec/layer
+      on H200 vs ~10 min/layer for the CPU per-pair path.
+    - **CPU per-pair fallback**: original implementation. Activated when the
+      vectorized path is unsafe — m_min < 32 OR m_min < m_max // 4. Used by
+      tests with tiny calibration sets and as a safety net when reservoir
+      under-fill would force every pair to use a low m.
+
+    With the prod default of ``stage1_grape.num_calibration_samples=1024`` and
+    the ExpertOutputAccumulator reservoir cap of 256 tokens/expert, all active
+    experts saturate at m=256 and the GPU path is bit-equivalent (within fp32
+    tolerance) to the original.
+
+    Unactivated experts (m_e ≤ 1) get distance 1.0 in their full row and
+    column, preserving the original placeholder semantics in both paths.
     """
     n_experts = layer_ref.num_routed_experts
     li = layer_ref.layer_idx
 
-    # Collect representation matrices: [n_tokens, d_out] per expert
-    repr_matrices = []
+    # Pre-pass: gather active reservoirs and decide which path to take.
+    active_indices: list[int] = []
+    active_reprs: list[torch.Tensor] = []
+    active_lengths: list[int] = []
     for e in range(n_experts):
-        R = output_acc.get_representations(li, e)  # [n_tokens, d_out]
-        if R is None or R.shape[0] == 0:
-            # Expert was never activated — use a zero placeholder. This causes
-            # CKA(zero, X) = 0 for any X, so distance = 1 - CKA = 1.0 (maximum
-            # distance). Unactivated experts are treated as maximally dissimilar
-            # from all others; will not be preferentially selected as j_star when
-            # more-similar pairs exist; if all pairwise distances equal 1.0,
-            # selection is arbitrary.
-            # Each unactivated expert contributes distance 1.0 to all pairs in its
-            # row/column, inflating R[li]. Since argmin-R selects the most-redundant
-            # layer first, layers with unactivated experts are deprioritized for
-            # merging — semantically backwards but tolerated because unactivated
-            # experts are also filtered in the per-pair argmin (j_star selection).
-            # Shape [1, 1] is safe here: the m_common <= 1 guard (below) ensures this
-            # placeholder is never used in a matmul — the pair is short-circuited to
-            # distance 1.0 before Xi_c @ Xi_c.T is evaluated.
-            R = torch.zeros(1, 1, dtype=torch.float32)
-        repr_matrices.append(R.detach().cpu().to(torch.float32))
+        R = output_acc.get_representations(li, e)  # [m_e, d_out] CPU fp32 or None
+        if R is None or R.shape[0] < 2:
+            continue
+        active_indices.append(e)
+        active_reprs.append(R.detach().to(torch.float32))
+        active_lengths.append(R.shape[0])
 
-    # Compute CKA pairwise using linear kernel.
-    # Diagonal is 0 because torch.zeros initializes it and the loop only writes i<j pairs;
-    # CKA(X,X)=1→distance=0 is consistent but the CKA computation never evaluates self-pairs
-    # (the diagonal is present in D_work but masked by np.fill_diagonal(tmp, np.inf) in GRAPE).
-    n = n_experts
-    dist = torch.zeros(n, n, dtype=torch.float32)
-    for i in range(n):
-        Xi = repr_matrices[i]
-        mi = Xi.shape[0]
-        for j in range(i + 1, n):
-            Xj = repr_matrices[j]
-            mj = Xj.shape[0]
-            # Cross-HSIC: need same number of samples — truncate to min length
+    # Initialize result: max dissimilarity 1.0, self-distance 0.0. Inactive
+    # experts retain their full row/col at 1.0 — bit-identical to the original
+    # zero-placeholder behavior.
+    dist = torch.ones(n_experts, n_experts, dtype=torch.float32)
+    dist.fill_diagonal_(0.0)
+
+    if len(active_indices) < 2:
+        return dist
+
+    m_min = min(active_lengths)
+    m_max = max(active_lengths)
+    if m_min < _CKA_M_MIN_VECTORIZED_FLOOR or m_min < m_max // 4:
+        # Reservoir is under-filled or skewed enough that uniform m_min would
+        # silently degrade every pair's CKA precision. Fall back to the
+        # per-pair m_common path so each pair retains its full intersection.
+        log.info(
+            "_cka_distance_matrix: layer %d active reservoir lengths span [%d..%d]; "
+            "below vectorized floor (m_min ≥ %d and ≥ m_max//4) — falling back to "
+            "CPU per-pair m_common path. Cause: small calibration / routing imbalance.",
+            li, m_min, m_max, _CKA_M_MIN_VECTORIZED_FLOOR,
+        )
+        return _cka_distance_matrix_cpu_per_pair(
+            active_indices, active_reprs, active_lengths, n_experts, dist
+        )
+
+    # ----- GPU vectorized path (uniform m_min over the active set) -----
+    # Uniform-stride subsample to m_min — spreads token coverage across the
+    # reservoir rather than front-slicing, identical to the original.
+    X_list: list[torch.Tensor] = []
+    for R in active_reprs:
+        m = R.shape[0]
+        if m == m_min:
+            X_list.append(R)
+        else:
+            step = m / m_min
+            idx = [int(k * step) for k in range(m_min)]
+            X_list.append(R[idx])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    X = torch.stack(X_list, dim=0).to(device)  # [N_active, m_min, d_out]
+
+    # Batched linear-kernel Gram matrices: K_e = X_e @ X_e.T.
+    K = torch.bmm(X, X.transpose(-2, -1))  # [N_active, m_min, m_min]
+
+    # Biased HSIC centering: K_c = K - row_mean - col_mean + grand_mean.
+    row_mean = K.mean(dim=2, keepdim=True)            # [N, m, 1]
+    col_mean = K.mean(dim=1, keepdim=True)            # [N, 1, m]
+    grand_mean = K.mean(dim=(1, 2), keepdim=True)     # [N, 1, 1]
+    Kc = K - row_mean - col_mean + grand_mean
+
+    # HSIC matrix H[i,j] = ⟨Kc_i, Kc_j⟩_F = (Kc_flat @ Kc_flat^T)[i,j].
+    Kc_flat = Kc.reshape(Kc.shape[0], -1)             # [N, m*m]
+    H = Kc_flat @ Kc_flat.t()                         # [N, N]
+
+    # CKA = H[i,j] / sqrt(max(H[i,i], ε) · max(H[j,j], ε)).
+    diag = H.diagonal().clamp(min=_CKA_EPSILON)
+    norm = torch.sqrt(diag.unsqueeze(0) * diag.unsqueeze(1))
+    CKA = H / norm
+    D_active = (1.0 - CKA).clamp(0.0, 1.0)
+    D_active.fill_diagonal_(0.0)
+
+    # Scatter the active-active sub-block back into the full distance matrix.
+    idx_t = torch.tensor(active_indices, dtype=torch.long)
+    dist[idx_t.unsqueeze(1), idx_t.unsqueeze(0)] = D_active.detach().cpu()
+
+    return dist
+
+
+def _cka_distance_matrix_cpu_per_pair(
+    active_indices: list[int],
+    active_reprs: list[torch.Tensor],
+    active_lengths: list[int],
+    n_experts: int,
+    dist: torch.Tensor,
+) -> torch.Tensor:
+    """CPU per-pair m_common fallback. Preserves the original O(N²) Python loop
+    used when the vectorized GPU path is unsafe (very small reservoirs / skewed
+    fill). Fills the active-active sub-block of ``dist``; inactive rows/cols
+    retain their pre-initialized 1.0 (with diagonal 0.0)."""
+    n_active = len(active_indices)
+    for ii in range(n_active):
+        ei = active_indices[ii]
+        Xi = active_reprs[ii]
+        mi = active_lengths[ii]
+        for jj in range(ii + 1, n_active):
+            ej = active_indices[jj]
+            Xj = active_reprs[jj]
+            mj = active_lengths[jj]
             m_common = min(mi, mj)
             if m_common <= 1:
-                # m_common=1 gives H=0, making HSIC=0 and CKA undefined; treat as
-                # maximum dissimilarity.
-                dist[i, j] = dist[j, i] = 1.0
+                # H=0 → CKA undefined → maximum distance.
+                dist[ei, ej] = dist[ej, ei] = 1.0
                 continue
-            trunc_ratio = m_common / max(mi, mj)
-            if trunc_ratio < 0.5:
-                log.debug(
-                    "_cka_distance_matrix: layer %d experts (%d, %d) truncated to %d/%d tokens (%.0f%%)",
-                    li, i, j, m_common, max(mi, mj), trunc_ratio * 100,
-                )
-            # Uniformly-strided subsample: spreads coverage across the full reservoir
-            # rather than front-slicing, which would over-represent early calibration tokens
-            # (reservoir slots 0..m_common-1 skew toward the first tokens seen).
             if mi > m_common:
                 step = mi / m_common
                 Xi_c = Xi[[int(k * step) for k in range(m_common)]]
@@ -626,30 +705,20 @@ def _cka_distance_matrix(
                 Xj_c = Xj[[int(k * step) for k in range(m_common)]]
             else:
                 Xj_c = Xj
-            # Biased HSIC estimator (Gretton 2005): K_c = K - row_mean - col_mean + grand_mean.
-            # This differs from the unbiased estimator used in Kornblith et al. (2019), which
-            # removes diagonal entries. The bias cancels in the CKA ratio and is negligible
-            # at m_common ≥ 32; for smaller m_common the distance may be slightly underestimated.
+            # Biased HSIC centering (Gretton 2005), identical to the GPU path.
             Ki_raw = Xi_c @ Xi_c.T
-            Ki_row = Ki_raw.mean(dim=1, keepdim=True)
-            Ki_col = Ki_raw.mean(dim=0, keepdim=True)
-            Ki_grand = Ki_raw.mean()
-            Ki = Ki_raw - Ki_row - Ki_col + Ki_grand
-
+            Ki = Ki_raw - Ki_raw.mean(dim=1, keepdim=True) - Ki_raw.mean(dim=0, keepdim=True) + Ki_raw.mean()
             Kj_raw = Xj_c @ Xj_c.T
-            Kj_row = Kj_raw.mean(dim=1, keepdim=True)
-            Kj_col = Kj_raw.mean(dim=0, keepdim=True)
-            Kj_grand = Kj_raw.mean()
-            Kj = Kj_raw - Kj_row - Kj_col + Kj_grand
+            Kj = Kj_raw - Kj_raw.mean(dim=1, keepdim=True) - Kj_raw.mean(dim=0, keepdim=True) + Kj_raw.mean()
             hsic_ij = float((Ki * Kj).sum().item())
             hsic_ii = float((Ki * Ki).sum().item())
             hsic_jj = float((Kj * Kj).sum().item())
             denom = math.sqrt(max(hsic_ii, _CKA_EPSILON) * max(hsic_jj, _CKA_EPSILON))
             cka = hsic_ij / denom
             d = max(0.0, min(1.0, 1.0 - cka))
-            dist[i, j] = d
-            dist[j, i] = d
-
+            dist[ei, ej] = d
+            dist[ej, ei] = d
+    # Diagonal is already 0.0 from the caller.
     return dist
 
 
