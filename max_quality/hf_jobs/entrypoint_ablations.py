@@ -59,6 +59,7 @@ CODE_REPO = os.environ.get("CODE_REPO", "pirola/moe-compress")
 MODEL_REPO = os.environ.get("MODEL_REPO", "Qwen/Qwen3.6-35B-A3B")
 NUM_SEQUENCES = int(os.environ.get("NUM_SEQUENCES", "1000"))
 ONLY = os.environ.get("ONLY", "")
+PREFLIGHT_ONLY = os.environ.get("PREFLIGHT_ONLY", "0") == "1"
 CACHE_MOUNT = Path(os.environ.get("CACHE_MOUNT", "/mnt/cache"))
 CONFIG_PATH = os.environ.get(
     "CONFIG_PATH", "max_quality/configs/qwen36_35b_a3b_30pct.yaml"
@@ -126,6 +127,8 @@ def main() -> int:
     ]
     if ONLY:
         argv += ["--only", ONLY]
+    if PREFLIGHT_ONLY:
+        argv += ["--preflight-only"]
     LOG.info("Invoking run_ablations.main(%s)", argv)
     try:
         return run_ablations_main(argv)
