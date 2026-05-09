@@ -36,9 +36,12 @@ The diagnostic JSON is uploaded to the bucket at
 #     "pyyaml>=6.0",
 #     "nvidia-ml-py>=12.0",
 #     "psutil>=5.9",
-#     # Fast-path linear attention + Mamba conv1d kernels for Qwen3.5/3.6.
-#     "flash-linear-attention>=0.1.2",
-#     "causal-conv1d>=1.4.0",
+#     # NOTE: flash-linear-attention + causal-conv1d intentionally omitted.
+#     # HF Jobs UV environment has no nvcc, so causal-conv1d 1.6.2 (the latest
+#     # the resolver picks) fails to build from source. The diagnostic runs
+#     # only 256 forward passes once — the 10-30% throughput hit from the
+#     # pure-PyTorch fallback path is irrelevant. The production ablation
+#     # entrypoint (entrypoint_ablations.py) needs a separate fix.
 # ]
 # ///
 from __future__ import annotations
