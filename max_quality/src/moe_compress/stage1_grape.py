@@ -37,6 +37,7 @@ from .utils.model_io import (
     iter_moe_layers,
     save_json_artifact,
 )
+from .utils.trackio_log import trackio_flush as _trackio_flush
 from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
@@ -62,8 +63,12 @@ def _make_calibration_progress_cb(phase_tag: str, n_total: int, log_every: int =
     Tags: ``stage1/{phase_tag}/calibration_progress`` (fraction in [0,1]) and
     ``stage1/{phase_tag}/calibration_step`` (raw batch index).
 
-    Cost: one trackio_log call per ``log_every`` batches (~63 emits per phase
-    at 4000 samples / log_every=64). Negligible vs forward-pass cost.
+    Cost: one trackio_log + one trackio_flush call per ``log_every`` batches
+    (~63 emits per phase at 4000 samples / log_every=64). Negligible vs
+    forward-pass cost. The flush ensures (a) trackio's background sender
+    thread is kept alive and (b) the in-process queue drains on a known
+    cadence — without it, a silently-dead sender thread would let queued
+    emits pile up while the dashboard shows nothing.
     """
     def _cb(i: int) -> None:
         n_done = i + 1
@@ -72,6 +77,7 @@ def _make_calibration_progress_cb(phase_tag: str, n_total: int, log_every: int =
                 f"stage1/{phase_tag}/calibration_progress": n_done / n_total,
                 f"stage1/{phase_tag}/calibration_step": n_done,
             })
+            _trackio_flush()
     return _cb
 
 
@@ -274,6 +280,9 @@ def run(
                 entry["stage1/se_down_max_std"] = float(statistics.pstdev(vals)) if len(vals) > 1 else 0.0
                 entry["stage1/se_down_max_max"] = float(max(vals))
         _trackio_log(entry)
+    # End-of-Phase-A/C: drain queue + keep sender thread alive before the
+    # multi-minute Phase D CKA loop (which has no per-batch flush of its own).
+    _trackio_flush()
 
     # ------------------------------------------------------------------
     # Phase D: CKA Similarity Matrices
@@ -354,6 +363,9 @@ def run(
             "stage1/redundancy": redundancies[li],
             "stage1/budget": budgets[li],
         })
+    # End-of-Phase-D/E per-layer emit: drain before Stage 1 returns control
+    # to its caller.
+    _trackio_flush()
 
     out = {
         "per_layer_target_experts": {str(k): v for k, v in budgets.items()},
@@ -1109,6 +1121,8 @@ def _grape_greedy_merge(
         "stage1/exit_reason": exit_reason,
         "stage1/final_total": int(current_total),
     })
+    # End-of-GRAPE-solver: drain final summary before returning.
+    _trackio_flush()
 
     # Stage 2 reads per-layer budgets as TOTAL centroid count (blacklisted + non-blacklisted).
     # Add blacklisted experts back so Stage 2's effective_target is inclusive.

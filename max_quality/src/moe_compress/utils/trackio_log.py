@@ -75,6 +75,8 @@ _warned_log_bad_attr_noncallable: bool = False  # covers: trackio installed but 
 
 # Runtime log-failure flags:
 _warned_log_failed: bool = False
+_warned_flush_no_run: bool = False
+_warned_flush_failed: bool = False
 
 
 def _import_trackio() -> types.ModuleType | None:
@@ -197,3 +199,77 @@ def trackio_log(metrics: dict[str, Any]) -> None:
                 _warned_log_failed = True
         if not already_warned:  # local var; safe to read outside lock
             _log.warning("trackio.log failed; subsequent log failures will not emit a warning", exc_info=True)
+
+
+def trackio_flush() -> None:
+    """Best-effort drain of the active Run's queue + respawn of its sender thread.
+
+    Trackio batches log emits and ships them to the remote Space every
+    ``BATCH_SEND_INTERVAL`` (~0.5 s) via a background thread. If that thread
+    dies silently, queued emits stop reaching the dashboard with no error
+    surfaced anywhere. Calling this helper at known cadence points (e.g. the
+    Stage 1 per-batch progress callback, or end-of-phase summary emits)
+    ensures (a) the sender thread is alive and (b) the in-process queue is
+    drained.
+
+    Reaches into private trackio internals via getattr/no-op fallback:
+    ``Run._ensure_sender_alive`` (respawns dead sender) and
+    ``Run._flush_queues_inline`` (drains queues; for remote Runs this writes
+    to the local-fallback file rather than the Space, but it still relieves
+    queue pressure and makes the data recoverable on the next ``trackio.init``).
+
+    Active-run lookup uses the same ContextVar that ``trackio.log`` itself
+    uses (``trackio.context_vars.current_run``), so it stays in sync with the
+    library's own notion of "current run".
+
+    Must be called from the main thread (mirrors ``trackio_log``'s contract —
+    trackio is not thread-safe).
+    """
+    global _warned_flush_no_run, _warned_flush_failed
+
+    if threading.main_thread() is not threading.current_thread():
+        raise RuntimeError(
+            "trackio_flush must be called from the main thread "
+            f"(called from {threading.current_thread().name!r}); "
+            "trackio.log is not thread-safe."
+        )
+
+    mod = _import_trackio()
+    if mod is None:
+        return
+
+    try:
+        ctx = getattr(mod, "context_vars", None)
+        run = ctx.current_run.get() if ctx is not None else None
+    except Exception:  # noqa: BLE001 — defensive against trackio refactors
+        run = None
+
+    if run is None:
+        with _lock:
+            should_warn = not _warned_flush_no_run
+            if should_warn:
+                _warned_flush_no_run = True
+        if should_warn:
+            _log.debug(
+                "trackio_flush: no active Run "
+                "(trackio.init() not called yet?) — silent no-op"
+            )
+        return
+
+    try:
+        ensure_alive = getattr(run, "_ensure_sender_alive", None)
+        if callable(ensure_alive):
+            ensure_alive()
+        flush = getattr(run, "_flush_queues_inline", None)
+        if callable(flush):
+            flush()
+    except Exception:  # noqa: BLE001 — runtime errors from trackio are non-fatal
+        with _lock:
+            already_warned = _warned_flush_failed
+            if not already_warned:
+                _warned_flush_failed = True
+        if not already_warned:
+            _log.warning(
+                "trackio_flush failed; subsequent flush failures will not emit a warning",
+                exc_info=True,
+            )
