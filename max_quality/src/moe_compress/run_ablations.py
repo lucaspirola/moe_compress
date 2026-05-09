@@ -337,6 +337,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Comma-separated subset of ablation IDs to run (e.g., A0,A4,A8). Default: all 12.")
     parser.add_argument("--smoke-test", action="store_true",
                         help="Run A0 only with tiny calibration; for local plumbing verification")
+    parser.add_argument("--preflight-only", action="store_true",
+                        help="Run Stage 1 pre-flight, write _shared/ artifacts, then exit. "
+                        "For split-platform workflows: run pre-flight on a high-VRAM GPU "
+                        "(e.g. H200) once, then run the per-ablation loop on cheaper hardware "
+                        "that consumes the bucket-stored _shared/ outputs.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -375,6 +380,15 @@ def main(argv: list[str] | None = None) -> int:
         num_sequences=num_sequences,
         teacher_cache_path=teacher_cache_path,
     )
+
+    # Stop here if we only wanted the shared Stage 1 artifacts (e.g., the
+    # H200-pre-flight + A100-ablations split workflow). _preflight wrote
+    # everything needed to shared_dir/{stage1_blacklist,stage1_budgets,
+    # budget_decomposition}.json — pickup happens transparently on whatever
+    # platform runs the per-ablation loop next.
+    if args.preflight_only:
+        log.info("--preflight-only: exiting after pre-flight. _shared/ ready at %s", shared_dir)
+        return 0
 
     # Per-ablation loop.
     results: dict[str, Any] = {}

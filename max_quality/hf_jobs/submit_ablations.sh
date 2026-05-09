@@ -18,6 +18,7 @@ CODE_REPO="${CODE_REPO:-pirola/moe-compress}"
 MODEL_REPO="${MODEL_REPO:-Qwen/Qwen3.6-35B-A3B}"
 NUM_SEQUENCES="${NUM_SEQUENCES:-1000}"
 ONLY="${ONLY:-}"
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 BUCKET="${BUCKET:-hf://buckets/pirola/moe-ablations}"
 MOUNT="${MOUNT:-/mnt/cache}"
 ENTRYPOINT="$(cd "$(dirname "$0")" && pwd)/entrypoint_ablations.py"
@@ -40,6 +41,7 @@ echo "    code repo      : $CODE_REPO"
 echo "    model repo     : $MODEL_REPO"
 echo "    num sequences  : $NUM_SEQUENCES (calibration size for ablations)"
 echo "    only           : ${ONLY:-<all 12: A0..A11>}"
+echo "    preflight-only : $PREFLIGHT_ONLY (1 = run Stage 1 then exit)"
 echo "    bucket mount   : $BUCKET → $MOUNT"
 echo "    Trackio URL    : https://huggingface.co/spaces/pirola/trackio"
 echo
@@ -53,6 +55,7 @@ exec hf jobs uv run "$ENTRYPOINT" \
     --env "MODEL_REPO=$MODEL_REPO" \
     --env "NUM_SEQUENCES=$NUM_SEQUENCES" \
     --env "ONLY=$ONLY" \
+    --env "PREFLIGHT_ONLY=$PREFLIGHT_ONLY" \
     --env "CACHE_MOUNT=$MOUNT" \
     --env "PYTORCH_ALLOC_CONF=expandable_segments:True" \
     $DETACH_FLAG
