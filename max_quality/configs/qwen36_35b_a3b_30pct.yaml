@@ -59,6 +59,18 @@ stage1_grape:
                                   # cap many times over).
   # Phase B: super expert detection (2507.23279)
   super_expert_detection:
+    # Phase A MA-formation detector thresholds (2507.23279 §3.2.1).
+    # Defaults in code: ma_ratio=100.0, ma_growth_ratio=5.0 — calibrated on
+    # Qwen3-30B (no attention output gate). Qwen3.6-35B has attn_output_gate=true
+    # which dampens residual-stream growth, so the 5× threshold misses real
+    # MA-formation events.
+    # Diagnostic phase_a_20260509_191659 showed L34 (3.89×) and L38 (3.69×) as
+    # clear sub-threshold growth events; lowering to 3.0 captures them
+    # cleanly without picking up noise (next layer down, 2.0×, also catches
+    # L1+L6 which are noise).
+    ma_growth_ratio: 3.0
+    # Deprecated keys (warned-and-ignored by code; SE detection uses paper's
+    # three-way AND criterion P99.5 + 0.1·a_max + l ∈ L instead).
     zscore_threshold: 2.5           # blacklist expert if down_proj max > mean + 2.5σ
     max_blacklisted_per_layer: 4    # paper observes 3-4 per layer on Qwen3
     global_blacklist_cap_pct: 0.05  # hard cap: ≤ 5% of all experts

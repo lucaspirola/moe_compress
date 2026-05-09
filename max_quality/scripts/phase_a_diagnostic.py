@@ -300,12 +300,15 @@ def main(argv=None) -> int:
         ma_growth_ratio_choices=[5.0, 4.0, 3.0, 2.5, 2.0],
     )
 
+    # Keep int keys in `result` for the print path; convert to str only when
+    # JSON-serializing. Earlier version JSON-stringified up front and the
+    # print helper KeyError'd on int lookups against str-keyed dict.
     result = {
         "model": args.model,
         "num_samples": args.num_samples,
         "seq_len": args.seq_len,
         "dtype": args.dtype,
-        "layer_max": {str(k): v for k, v in raw["layer_max"].items()},
+        "layer_max": raw["layer_max"],
         "sorted_decoder_indices": raw["sorted_decoder_indices"],
         "first_moe_layer_idx": raw["first_moe_layer_idx"],
         "moe_layer_set": raw["moe_layer_set"],
@@ -315,7 +318,8 @@ def main(argv=None) -> int:
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2))
+    serializable = {**result, "layer_max": {str(k): v for k, v in result["layer_max"].items()}}
+    args.output.write_text(json.dumps(serializable, indent=2))
     LOG.info("Wrote %s (%d bytes)", args.output, args.output.stat().st_size)
 
     _print_summary_table(result)
