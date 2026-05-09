@@ -47,6 +47,34 @@ _CKA_EPSILON = 1e-12     # numerical floor for HSIC denominators to avoid divisi
 _SIMILARITY_METRIC_DEFAULT = "cka"
 
 
+def _make_calibration_progress_cb(phase_tag: str, n_total: int, log_every: int = 64):
+    """Build a per-batch callback that streams Stage 1 calibration progress to
+    Trackio every ``log_every`` batches.
+
+    Phase A and Phase B both run a calibration forward pass over the full
+    sample set (4000 by default). At ~0.4 sec/forward on H200 that is ~28 min
+    per phase, with no Trackio metric emits in the existing flow until each
+    phase's *end-of-phase* summary fires. Operators staring at the Trackio
+    dashboard see a flat zero for ~1 hour. This callback emits a fractional
+    progress signal so the dashboard shows a live ramp 0→1 per phase, helping
+    distinguish "still working" from "stuck".
+
+    Tags: ``stage1/{phase_tag}/calibration_progress`` (fraction in [0,1]) and
+    ``stage1/{phase_tag}/calibration_step`` (raw batch index).
+
+    Cost: one trackio_log call per ``log_every`` batches (~63 emits per phase
+    at 4000 samples / log_every=64). Negligible vs forward-pass cost.
+    """
+    def _cb(i: int) -> None:
+        n_done = i + 1
+        if log_every > 0 and n_done % log_every == 0:
+            _trackio_log({
+                f"stage1/{phase_tag}/calibration_progress": n_done / n_total,
+                f"stage1/{phase_tag}/calibration_step": n_done,
+            })
+    return _cb
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -163,7 +191,12 @@ def run(
     with contextlib.ExitStack() as stack:
         for ref in moe_layers:
             stack.enter_context(instrument_experts(ref, {"down": down_cb}))
-        run_calibration(model, batches, device=device)
+        run_calibration(
+            model, batches, device=device,
+            per_batch_callback=_make_calibration_progress_cb(
+                "phase_b", n_total=len(batches),
+            ),
+        )
 
     max_acc.finalize()
     output_acc.finalize()
@@ -430,7 +463,12 @@ def _detect_ma_layers(
         handles.append(h)
 
     try:
-        run_calibration(model, batches, device=device)
+        run_calibration(
+            model, batches, device=device,
+            per_batch_callback=_make_calibration_progress_cb(
+                "phase_a", n_total=len(batches),
+            ),
+        )
     finally:
         for h in handles:
             h.remove()
