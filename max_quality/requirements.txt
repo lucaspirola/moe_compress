@@ -1,17 +1,46 @@
-# Core (already present in /home/lucas/ai/venv — pinned for reference, do not reinstall):
-#   torch>=2.12.0        (bleeding nightly, built for sm_120)
-#   transformers>=5.3.0  (required for qwen3_5_moe model_type)
-#   safetensors, tokenizers, huggingface_hub, sentencepiece, einops, numpy
+# Canonical dependency list for moe_compress (Strategy A pipeline).
+#
+# Single source of truth, mirrored by:
+#   - hf_jobs/entrypoint_ablations.py PEP 723 inline metadata (HF Jobs path)
+#   - docker/Dockerfile (vast.ai / external GPU path)
+#
+# Note: torch is installed separately (Dockerfile uses the cu124 wheel index;
+# the HF Jobs UV resolver picks an appropriate wheel automatically). We pin
+# the version range here for reference; the install command differs per path.
 
-# Additional deps for Strategy A pipeline:
-accelerate>=1.0.0        # device_map + CPU offload
-datasets>=3.0.0          # C4 calibration, WikiText-2, HumanEval, MATH-500
-scipy>=1.11.0            # Hungarian assignment in REAM
-ortools>=9.10            # SimpleMinCostFlow for Stage 2 v2 capacitated assignment
-peft>=0.13.0             # optional EoRA prototyping (adapters merged in-place at end)
-lm-eval>=0.4.5           # Stage 6 zero-shot (ARC-C, HellaSwag)
-pyyaml>=6.0              # config loader
-pytest>=8.0              # tests
+# --- Deep learning core ---
+torch>=2.5.0,<2.11.0
+transformers>=4.57.0
+accelerate>=1.0.0
+safetensors>=0.4.5
+tokenizers>=0.20.0
+sentencepiece>=0.2.0
+einops>=0.8.0
 
-# Optional (smoke testing only on 16 GB VRAM — NOT used in production A100 run):
-bitsandbytes>=0.44.0     # 4-bit load for local end-to-end dry runs
+# --- Hugging Face plumbing ---
+huggingface_hub>=0.26.0
+datasets>=3.0.0
+
+# --- Numerics + solvers ---
+numpy>=1.26.0
+scipy>=1.11.0       # Hungarian assignment in REAM
+ortools>=9.10       # SimpleMinCostFlow for Stage 2 v2 capacitated assignment
+
+# --- Misc runtime ---
+peft>=0.13.0
+pyyaml>=6.0
+lm-eval>=0.4.5
+trackio>=0.5.0
+nvidia-ml-py>=12.0
+psutil>=5.9
+bitsandbytes>=0.44.0
+
+# --- Fast-path attention kernels for Qwen3.5/3.6 hybrid linear attention ---
+# Without these, transformers falls back to a pure-PyTorch implementation of
+# the linear-attention + Mamba conv1d components (~10-30% slowdown on
+# affected attention layers; warning visible at model load time).
+flash-linear-attention>=0.1.2
+causal-conv1d>=1.4.0
+
+# --- Test only ---
+pytest>=8.0

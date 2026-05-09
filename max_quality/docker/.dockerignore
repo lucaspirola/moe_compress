@@ -1,0 +1,48 @@
+# Build context = max_quality/. Keep it lean — image only ships
+# requirements.txt + docker/bootstrap.sh; everything else is git-cloned
+# at container start by bootstrap.sh.
+
+# VCS / IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Project-local data the image must not bake in
+audit/
+knowledge_distillation_recovery/
+ablations/
+artifacts/
+checkpoints/
+runs/
+trackio_runs/
+*.safetensors
+*.bin
+*.pt
+
+# Local secrets
+.env
+.env.*
+*.pem
+secrets/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docs (rebuild not needed for image)
+docs/
+*.md
+!docker/README.md

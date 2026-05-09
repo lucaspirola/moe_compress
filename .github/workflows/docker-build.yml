@@ -1,0 +1,80 @@
+# Build the moe_compress portable runtime image and push to GHCR.
+#
+# Triggers:
+#   - push to main (publishes :latest + :sha-<short>)
+#   - push of a v* tag (also publishes :<tag>)
+#   - manual dispatch (for when you need to rebuild without code change)
+#
+# Companion to the HF Jobs path. The image carries dependencies only;
+# code is cloned at container start by docker/bootstrap.sh.
+name: docker-build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "max_quality/requirements.txt"
+      - "max_quality/docker/**"
+      - ".github/workflows/docker-build.yml"
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # GHCR lowercases the namespace — keep this lowercase to match.
+  IMAGE_NAME: lucaspirola/moe-compress
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # GHCR push
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=ref,event=tag
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          # Build context is max_quality/ so the Dockerfile can COPY
+          # requirements.txt and docker/bootstrap.sh from the root of the
+          # context (matches the comment in max_quality/docker/Dockerfile).
+          context: max_quality
+          file: max_quality/docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GHA layer cache — first build is slow (CUDA wheels + kernel
+          # compile), subsequent builds reuse the heavy layers.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Image digest
+        run: echo "Pushed ${{ steps.meta.outputs.tags }} @ ${{ steps.meta.outputs.digest }}"
