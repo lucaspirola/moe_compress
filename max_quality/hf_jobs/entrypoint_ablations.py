@@ -45,8 +45,20 @@ Environment:
 #     # Fast-path linear attention + Mamba conv1d kernels for Qwen3.5/3.6.
 #     # Without these, transformers falls back to a pure-PyTorch implementation
 #     # (~10-30% slower on the affected attention layers).
-#     "flash-linear-attention>=0.1.2",
-#     "causal-conv1d>=1.4.0",
+#     #
+#     # flash-linear-attention is pure Python (py3-none-any wheel on PyPI), no
+#     # build needed. Pinned to a known-good version.
+#     "flash-linear-attention==0.5.0",
+#     # causal-conv1d has NO PyPI wheels (sdist-only, all versions). HF Jobs
+#     # UV env has no nvcc, so building from source fails ("NameError: name
+#     # 'bare_metal_version' is not defined" → nvcc-not-found path in setup.py).
+#     # Workaround: pin directly to the prebuilt wheel from Dao-AILab's GitHub
+#     # release that matches the (cu128, torch 2.10, cp312, x86_64) combo UV
+#     # resolves under HF Jobs.
+#     # If UV ever resolves a different python/torch/cuda combo this URL will
+#     # 404 — pick the right wheel from
+#     # https://github.com/Dao-AILab/causal-conv1d/releases and update.
+#     "causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2.post1/causal_conv1d-1.6.2.post1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
 # ]
 # ///
 from __future__ import annotations
