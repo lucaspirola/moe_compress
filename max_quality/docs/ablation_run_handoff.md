@@ -224,7 +224,21 @@ hf jobs inspect 69fe7a28aff1cd33e8f3178f
 
 ---
 
-## 9. Reference Docs (read these for technical depth)
+## 9. External GPU Runbook (vast.ai / RunPod / Lambda)
+
+HF Jobs queue stalls drove a parallel deployment path: the same harness, packaged as a Docker image, runs on any commodity GPU host. Use this when the HF Jobs queue is pathological (current state) or when you want sub-5-min allocation latency.
+
+- **Image**: `ghcr.io/lucaspirola/moe-compress:latest` (also `:sha-<short>` for reproducibility).
+- **Build**: `.github/workflows/docker-build.yml` runs on push to main and rebuilds whenever `requirements.txt`, `docker/**`, or the workflow itself changes.
+- **Runbook**: [`max_quality/docker/README.md`](../docker/README.md) — vast.ai filter command, full `docker run` invocation, env-var reference, local sanity checks.
+
+The image is a **deps-only carrier**: code is `git clone`d at container start by `docker/bootstrap.sh`, and the model snapshot lives on a host-mounted `/cache` volume (mount as `-v /workspace/cache:/cache` on vast.ai). This way you can iterate on code without rebuilding the image, and a 70 GB snapshot survives across rentals.
+
+Both the HF Jobs path and the Docker path consume the same canonical [`max_quality/requirements.txt`](../requirements.txt) — adding or upgrading a dep there propagates to both.
+
+---
+
+## 10. Reference Docs (read these for technical depth)
 
 - [`stage2_assignment_revision.md`](./stage2_assignment_revision.md) — Stage 2 v2 spec including §8 ablation matrix definition (A0..A11 deltas, expected outcomes)
 - [`hf_jobs_operations.md`](./hf_jobs_operations.md) — HF Jobs ops reference
