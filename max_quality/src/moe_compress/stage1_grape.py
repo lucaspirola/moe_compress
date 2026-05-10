@@ -1,14 +1,38 @@
 """Stage 1 — Super Expert Detection + GRAPE non-uniform per-layer expert budgets.
 
-Two sequential forward passes over 256 calibration samples:
-  Phase A: detect MA-formation layers (set L)
-  Phase B: collect max down_proj output magnitude (l ∈ L) + CKA representations (all layers)
+Two sequential forward passes over the calibration set:
+  Phase A: detect MA-formation layers (set L) via dual-signal OR rule —
+           residual-stream growth (gated, threshold ma_growth_ratio) OR
+           MoE-block-output growth (ungated, threshold moe_output_growth_ratio).
+           See ALGORITHM_REFERENCE.md §4 Phase A and D-ma-detector.
+  Phase B: collect (a) max down_proj output magnitude per (layer, expert)
+           for SE detection, (b) CKA representation reservoir per expert
+           for GRAPE, and (c) router scores + sink-token routing stats
+           for the Phase C+ sink-token auto-extension.
 
-Super expert detection follows 2507.23279 Eq. 6: three-way AND criterion
-(> P99.5(A) AND > 0.1·a_max AND l ∈ L). No per-layer caps, no global caps.
+Phase C: paper-compliant three-way AND SE detection (2507.23279 Eq. 6):
+         > P99.5(A) AND > 0.1·a_max AND l ∈ L.
 
-GRAPE uses CKA similarity (paper §3.2 explicitly allows "CKA, MSE, or other
-similarity measures"). Floor constraint: num_routed_experts // 2 (deviation D5).
+Phase C+ (project-original): two complementary auto-extensions to the SE
+blacklist, both deduplicated against Phase C:
+  - AIMER weight-only screening (D-aimer-cross-check) flags experts with
+    concentrated down_proj weights in elevated-magnitude layers.
+  - Sink-token routing analysis (D-sink-token-routing) flags experts whose
+    routing score is sink-token-dominated.
+
+Phase D/E: GRAPE Algorithm 1 (CKA-based pair merging with entropy-aware
+greedy + per-layer floor = num_routed_experts // 2; deviations D-cka-distance,
+D4, D5, D-grape-restart-merge).
+
+Phase F (project-original): post-hoc causal-ablation validation (D-causal-
+ablation-validation; runs in stage1_post_hoc_ablation.py — invoked after the
+GRAPE budgets artifact is written).
+
+Output artifact `stage1_blacklist.json` has 7 top-level keys:
+  blacklist, per_expert_max, config, blacklist_provenance, dual_signal,
+  aimer, sink_token.
+The inner `config` block has 12 keys (all detector thresholds + AIMER/sink
+parameters).
 """
 from __future__ import annotations
 
@@ -419,6 +443,13 @@ def run(
             elif (int(li_str), e) in sink_set:
                 provenance[key] = "sink_token"
             else:
+                log.warning(
+                    "provenance: (%s, %s) appears in final blacklist but not in "
+                    "_phase_c_pre_extensions, aimer_extension, or sink_extension — "
+                    "tagged 'unknown'. This indicates a programming error in a "
+                    "phase that mutated the blacklist without updating its provenance source.",
+                    li_str, e,
+                )
                 provenance[key] = "unknown"
 
     dual_signal = {
@@ -434,7 +465,7 @@ def run(
     }
     aimer_payload = {
         "scores": {
-            f"L{li}E{e}": v for (li, e), v in aimer_scores.items()
+            f"L{li}E{e}": _safe_float_for_json(v) for (li, e), v in aimer_scores.items()
         },
         "bottom_pct_per_layer": {
             str(li): list(exps) for li, exps in bottom_pct_by_layer.items()
@@ -445,15 +476,15 @@ def run(
     }
     sink_payload = {
         "mean_router_score_sink": (
-            {f"L{li}E{e}": v for (li, e), v in sink_acc.mean_router_score_sink.items()}
+            {f"L{li}E{e}": _safe_float_for_json(v) for (li, e), v in sink_acc.mean_router_score_sink.items()}
             if sink_acc is not None else {}
         ),
         "mean_router_score_normal": (
-            {f"L{li}E{e}": v for (li, e), v in sink_acc.mean_router_score_normal.items()}
+            {f"L{li}E{e}": _safe_float_for_json(v) for (li, e), v in sink_acc.mean_router_score_normal.items()}
             if sink_acc is not None else {}
         ),
         "freq_on_sink": (
-            {f"L{li}E{e}": v for (li, e), v in sink_acc.freq_on_sink.items()}
+            {f"L{li}E{e}": _safe_float_for_json(v) for (li, e), v in sink_acc.freq_on_sink.items()}
             if sink_acc is not None else {}
         ),
         "auto_extended": {
@@ -682,12 +713,15 @@ def _get_expert_down_proj_weight(ref, expert_idx: int) -> torch.Tensor:
 
 
 def _safe_float_for_json(v: float):
-    """JSON-safe float: replace NaN with None (json.dump's allow_nan=True
-    serializes NaN as the literal `NaN`, which is not strict JSON; downstream
-    readers — diagnostic scripts, dashboards — should not rely on lenient
-    parsers, so we prefer null).
+    """JSON-safe float: replace NaN/±Inf with None.
+
+    Python's json.dump raises ValueError on non-finite floats. Keep this
+    wrapper conservative (None) so the artifact stays parseable by any
+    standards-compliant JSON consumer.
     """
-    return None if (v != v) else float(v)
+    if v != v or math.isinf(v):
+        return None
+    return float(v)
 
 
 # ---------------------------------------------------------------------------
