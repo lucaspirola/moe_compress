@@ -34,6 +34,7 @@ from transformers import (
 )
 
 from ..config import StudentConfig, TeacherConfig
+from .router_replay import RouterReplayHookProtocol
 
 log = logging.getLogger(__name__)
 
@@ -64,11 +65,15 @@ class Zaya1Adapter:
         the vocab tail; BF16 lm_head with FP8 body weights is the documented
         stable configuration on H200.
         """
+        # LLR-0026 AC #2: adapter forces its required attn_implementation,
+        # overriding the YAML's value. CCA needs `eager` for hookability;
+        # silently honoring a YAML mis-configuration would no-op KV-quant.
+        required_attn = self.required_attn_implementation()
         teacher = self._load_one(
             name_or_path=teacher_cfg.name_or_path,
             revision=teacher_cfg.revision,
             torch_dtype=teacher_cfg.torch_dtype,
-            attn_implementation=teacher_cfg.attn_implementation,
+            attn_implementation=required_attn,
             role="TEACHER",
         )
         # REQ: LLR-0004
@@ -91,7 +96,7 @@ class Zaya1Adapter:
             name_or_path=student_cfg.source,
             revision="main",
             torch_dtype=student_cfg.torch_dtype,
-            attn_implementation=student_cfg.attn_implementation,
+            attn_implementation=required_attn,
             role="STUDENT",
         )
 
@@ -190,8 +195,21 @@ class Zaya1Adapter:
             )
 
     def attention_module_paths(self, model: nn.Module) -> list[str]:
-        """Module paths to ZAYA1's CCA blocks (verified at instantiation in Phase 5)."""
-        raise NotImplementedError("Phase 5: Zaya1Adapter.attention_module_paths")
+        """Dotted paths to each transformer layer's CCA self-attention block.
+
+        Walks ``model.named_modules()`` collecting paths whose last segment
+        is ``self_attn``. Stock HF decoders and ZAYA1's ``ZayaForCausalLM``
+        both use this naming convention; the segment-suffix match avoids
+        false positives from intermediate submodules (``self_attn.q_proj`` etc.)
+        while remaining family-portable.
+
+        ZAYA1's actual CCA layout has the K/V projection inside a
+        ``kv_compressor`` submodule under each ``self_attn``; the Native
+        backend's KV hooks attach to the ``self_attn`` parent and intercept
+        the ``(k, v)`` tuple output. Phase 7 validates the exact tuple shape
+        on real ZAYA1.
+        """
+        return [name for name, _ in model.named_modules() if name.endswith(".self_attn")]
 
     def kv_quant_exempt_indices(self, model: nn.Module) -> list[int]:
         """Empty for ZAYA1 — no SSM layers per arxiv:2605.05365 Table I."""
@@ -199,19 +217,66 @@ class Zaya1Adapter:
 
     # REQ: LLR-0024
     def fp32_carve_outs(self, model: nn.Module) -> list[str]:
-        """`lm_head`, routing softmax, CCA cache state, RMSNorm, residual adds
-        per arxiv:2605.05365 §IV-D. Phase 5 verifies the exact wildcards
-        against an instantiated ZAYA1 module tree."""
-        raise NotImplementedError("Phase 5: Zaya1Adapter.fp32_carve_outs")
+        """ZAYA1 §IV-D FP32 carve-out list.
+
+        Returns substring patterns matched anywhere in dotted module names
+        (the Native backend's matcher and modelopt's ``ignore`` list both
+        consume substrings). Mirrors arxiv:2605.05365 §IV-D's enumerated
+        carve-outs:
+
+          * ``lm_head``      — LM head matmul (LLR-0024 AC #1 explicitly
+            requires this entry)
+          * ``router``       — routing softmax modules (also covers
+            ``moe.router`` / ``router_layer`` / similar variants)
+          * ``norm``         — RMSNorm (matches ``rmsnorm``, ``input_norm``,
+            ``post_attention_layernorm``, etc.)
+          * ``cca_cache``    — CCA cache state (ZAYA1-specific buffer)
+          * ``embed_tokens`` — input token embedding (high-precision matmul,
+            shares the LM-head's numerical sensitivity at the vocab tail)
+
+        Residual additions are NOT carved out by module name — they are
+        tensor ``+`` operations inside layer forwards, not standalone
+        submodules. Modelopt's globally-disabled ``*input_quantizer``
+        (set in ``config_map.quant_block_to_modelopt_config``) handles them
+        by leaving every activation full-precision.
+
+        ``model`` is unused at the substring level — the patterns address
+        any module containing the substring; the parameter is retained for
+        the Protocol shape and for future per-instance overrides.
+        """
+        del model  # Patterns are substring-based; no per-instance inspection needed.
+        # REQ: LLR-0024
+        return ["lm_head", "embed_tokens", "router", "norm", "cca_cache"]
 
     # REQ: LLR-0026
     def required_attn_implementation(self) -> Literal["eager", "sdpa"]:
-        """ZAYA1 uses CCA (not flash-attn-compatible). Phase 5 confirms which
-        of `eager` / `sdpa` the Zyphra fork supports for hookability."""
-        raise NotImplementedError("Phase 5: Zaya1Adapter.required_attn_implementation")
+        """``"eager"`` — CCA's convolutional downprojector is not flash-attn-
+        compatible, and ``eager`` is the ATTN backend that exposes
+        post-projection K/V tensors at a Python hook boundary.
+
+        ``sdpa`` would also expose K/V to a forward hook on ``self_attn``,
+        but the Zyphra fork's CCA layer routes through a custom function
+        (``cca_eager_attention_forward`` per the fork's source) that is only
+        wired under ``eager``. Phase 7 confirms on real ZAYA1.
+
+        Flash-attn is rejected: it fuses K/V projection and never exposes
+        post-projection K/V tensors at a Python hook, silently no-opping the
+        KV simulator.
+        """
+        return "eager"
 
     # REQ: LLR-0025
-    def router_replay_hook(self, teacher: nn.Module, student: nn.Module) -> object:
-        """Pin student's MoE expert assignments to teacher's per
-        arxiv:2605.05365 §IV-C. Phase 5 lands the implementation."""
-        raise NotImplementedError("Phase 5: Zaya1Adapter.router_replay_hook")
+    def router_replay_hook(
+        self, teacher: nn.Module, student: nn.Module
+    ) -> RouterReplayHookProtocol:
+        """Returns a context manager pinning student MoE assignments to teacher's.
+
+        Implementation lives in :mod:`.router_replay`. ZAYA1's MoE layer uses
+        the standard HF ``router`` last-segment naming; the context manager
+        walks both teacher and student for submodules whose dotted path
+        ends with ``.router`` (or equals ``router``) and installs
+        capture/replay hooks (LLR-0025).
+        """
+        from .router_replay import RouterReplayContextManager
+
+        return RouterReplayContextManager(teacher, student, router_path_pattern="router")

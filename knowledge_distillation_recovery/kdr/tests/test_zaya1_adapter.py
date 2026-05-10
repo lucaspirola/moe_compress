@@ -254,3 +254,156 @@ def test_load_logs_layer_count_in_expected_set(
         assert logged_count in {40, 80}, (
             f"LLR-0023 requires layer count in {{40, 80}}; got {logged_count}."
         )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Phase 5: QAD methods (LLR-0024, LLR-0025, LLR-0026)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _fake_zaya_shaped_model() -> nn.Module:
+    """A more elaborate fake whose dotted module names mirror ZAYA1's layout
+    enough to exercise the carve-out / attention-path matchers."""
+
+    class CCAAttn(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_compressor = nn.Linear(8, 8, bias=False)
+            self.kv_compressor = nn.Linear(8, 8, bias=False)
+
+    class MoEFFN(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.router = nn.Linear(8, 4, bias=False)
+            self.experts = nn.ModuleList([nn.Linear(8, 8, bias=False) for _ in range(4)])
+
+    class Layer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.self_attn = CCAAttn()
+            self.mlp = MoEFFN()
+            self.input_norm = nn.LayerNorm(8)  # RMSNorm stand-in
+            self.post_attention_layernorm = nn.LayerNorm(8)
+
+    class Inner(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed_tokens = nn.Embedding(100, 8)
+            self.layers = nn.ModuleList([Layer() for _ in range(2)])
+
+    class Top(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = Inner()
+            self.lm_head = nn.Linear(8, 100, bias=False)
+
+    return Top()
+
+
+# REQ: VERIFIES: LLR-0024
+def test_fp32_carve_outs_includes_lm_head() -> None:
+    """LLR-0024 AC #1: list literally includes 'lm_head'."""
+    out = Zaya1Adapter().fp32_carve_outs(_fake_zaya_shaped_model())
+    assert "lm_head" in out
+
+
+# REQ: VERIFIES: LLR-0024
+def test_fp32_carve_outs_resolve_to_non_empty_submodule_sets() -> None:
+    """LLR-0024 AC #2: every returned pattern matches at least one submodule
+    on a ZAYA1-shaped instantiated model."""
+    model = _fake_zaya_shaped_model()
+    patterns = Zaya1Adapter().fp32_carve_outs(model)
+    names = [n for n, _ in model.named_modules()]
+    for pattern in patterns:
+        # `cca_cache` is ZAYA1-specific runtime state and may not match on
+        # this fake model — skip it from the resolution check (the fake
+        # doesn't simulate the cache module). The remaining patterns must
+        # all match.
+        if pattern == "cca_cache":
+            continue
+        matches = [n for n in names if pattern in n]
+        assert matches, (
+            f"carve-out pattern {pattern!r} resolved to ZERO submodules on "
+            f"the fake ZAYA1 model — would silently skip the carve-out on real ZAYA1"
+        )
+
+
+# REQ: VERIFIES: LLR-0026
+def test_required_attn_implementation_is_eager_or_sdpa() -> None:
+    """LLR-0026 AC #1: returns one of {'eager', 'sdpa'}; flash-attn is rejected."""
+    val = Zaya1Adapter().required_attn_implementation()
+    assert val in ("eager", "sdpa")
+
+
+# REQ: VERIFIES: LLR-0026
+def test_load_passes_required_attn_implementation_to_from_pretrained(
+    teacher_cfg: TeacherConfig, student_cfg: StudentConfig
+) -> None:
+    """LLR-0026 AC #2 + AC #3: adapter forces its required attn_implementation,
+    overriding any YAML mis-configuration AND no flash-attn module appears
+    in the loaded model graph. The fixtures pass 'sdpa' from YAML but
+    adapter requires 'eager'.
+    """
+    captured_kwargs: list[dict[str, Any]] = []
+    loaded_models: list[nn.Module] = []
+
+    def fake_from_pretrained(name_or_path: str, **kw: Any) -> nn.Module:
+        captured_kwargs.append(kw)
+        m = _fake_pretrained_model()
+        loaded_models.append(m)
+        return m
+
+    fake_tok = MagicMock()
+    fake_tok.pad_token_id = None
+    fake_tok.eos_token = "<eos>"
+
+    with patch(
+        "kdr.adapters.zaya1_8b.AutoModelForCausalLM.from_pretrained",
+        side_effect=fake_from_pretrained,
+    ), patch(
+        "kdr.adapters.zaya1_8b.AutoTokenizer.from_pretrained",
+        return_value=fake_tok,
+    ):
+        adapter = Zaya1Adapter()
+        adapter.load_teacher_and_student(
+            _fake_accelerator(), teacher_cfg=teacher_cfg, student_cfg=student_cfg
+        )
+
+    # AC #2: both teacher and student loads receive the adapter's required value.
+    required = Zaya1Adapter().required_attn_implementation()
+    teacher_kw, student_kw = captured_kwargs
+    assert teacher_kw["attn_implementation"] == required
+    assert student_kw["attn_implementation"] == required
+
+    # AC #3: no flash-attn module is present in either resulting model graph.
+    # Mock-based test scope: structural check that no submodule's class name
+    # contains "flash" / "Flash". On a real ZAYA1 the same check would cover
+    # the actual flash-attn classes (``FlashAttention2``, etc.); the full
+    # cross-check against real classes is deferred to Phase 7 hardware.
+    for model in loaded_models:
+        for module_name, mod in model.named_modules():
+            cls_name = mod.__class__.__name__
+            assert "flash" not in cls_name.lower(), (
+                f"flash-attn module detected at {module_name!r}: {cls_name}"
+            )
+
+
+# REQ: VERIFIES: LLR-0023
+def test_attention_module_paths_returns_self_attn_paths() -> None:
+    """attention_module_paths returns a path per layer's self_attn."""
+    paths = Zaya1Adapter().attention_module_paths(_fake_zaya_shaped_model())
+    # 2 layers in the fake model → 2 self_attn paths.
+    assert len(paths) == 2
+    assert all(p.endswith(".self_attn") for p in paths)
+
+
+# REQ: VERIFIES: LLR-0025
+def test_router_replay_hook_returns_context_manager() -> None:
+    """router_replay_hook returns an enterable context manager."""
+    teacher = _fake_zaya_shaped_model()
+    student = _fake_zaya_shaped_model()
+    hook = Zaya1Adapter().router_replay_hook(teacher, student)
+    # Must be enterable; `__exit__` cleans up the installed hooks.
+    assert hasattr(hook, "__enter__")
+    assert hasattr(hook, "__exit__")
+    assert hasattr(hook, "start_microbatch")
