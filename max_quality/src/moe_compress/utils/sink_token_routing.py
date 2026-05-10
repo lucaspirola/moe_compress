@@ -52,7 +52,12 @@ class SinkTokenRoutingAccumulator:
         router_scores: torch.Tensor,        # (batch, seq, num_experts) — post-softmax
         routed_pos: torch.Tensor,           # (batch, seq, top_k) — expert ids actually routed
     ) -> None:
-        sink_mask = self._build_sink_mask(input_ids)  # (batch, seq) bool
+        # Move mask to CPU to match the CPU-resident scores/routed tensors used below.
+        # input_ids may be on GPU during real forward passes; without this, indexing
+        # the CPU `scores_e` with a GPU `sink_mask` raises:
+        #   RuntimeError: indices should be either on cpu or on the same device as
+        #   the indexed tensor (cpu)
+        sink_mask = self._build_sink_mask(input_ids).cpu()  # (batch, seq) bool, CPU
         sink_idx = sink_mask.nonzero(as_tuple=False)
         self._total_sink_tokens += sink_idx.shape[0]
         scores_cpu = router_scores.detach().to(torch.float32).cpu()
