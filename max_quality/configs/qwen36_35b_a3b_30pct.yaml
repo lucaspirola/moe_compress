@@ -52,14 +52,15 @@ stage1_grape:
                                   # well before 1024 samples; CKA matrix Frobenius distance
                                   # changes < 5% between 1024 and 4000 — reviewer report:
                                   # max_quality/docs/stage1_review_10.05.2026.txt §Q6).
-  phase_a_batch_size: 4           # Phase A only tracks max magnitudes (batch-size invariant).
-                                  # Cuts Phase A walltime by ~4× vs batch_size=1.
-  phase_b_batch_size: 8           # Phase B accumulators (max, CKA reservoir, sink-token vectorized
-                                  # reduction) all handle arbitrary B. Live H200 run at bs=1 used
-                                  # 94.6/150.8 GB VRAM (37% free, ~25 GB non-model state). At bs=8
-                                  # activations scale ~8× while reservoirs are batch-invariant —
-                                  # projected ~120-130 GB total, ~20-30 GB headroom.
-                                  # Cuts Phase B forward-pass count from 1024 to 128.
+  phase_a_batch_size: 32          # Phase A has zero accumulators on GPU besides max-magnitude
+                                  # scalars; live H200 runs use 76.2 GB VRAM in this phase
+                                  # (74.6 GB free / 49.5%). bs=32 cuts Phase A forwards from
+                                  # 256 to 32 — wall ~⅛ of bs=4.
+  phase_b_batch_size: 16          # Phase B at bs=8 used 106.1 GB VRAM (44.7 GB free) on the
+                                  # 2026-05-10 H200 run. Activations don't scale linearly with B
+                                  # in eval-mode forward (per-layer tensors released), so bs=8→16
+                                  # adds only ~12 GB → projected ~118 GB total, ~32 GB headroom.
+                                  # Cuts Phase B forwards from 128 to 64.
   super_expert_detection:
     # Phase A dual-signal MA-formation detector — see ALGORITHM_REFERENCE.md §4 Phase A.
     # The OR rule flags a layer if EITHER signal exceeds its threshold.
@@ -74,10 +75,20 @@ stage1_grape:
     aimer_bottom_pct: 0.01        # bottom 1% by AIMER score per layer (~2-3 experts/256-expert layer)
     aimer_layer_max_fraction: 0.1 # require layer's expert-max > 0.1 × a_max_absolute
 
-    # Phase C+ sink-token routing auto-extension (see D-sink-token-routing)
-    sink_token_enabled: true
-    sink_token_score_ratio: 5.0   # mean_score_sink / mean_score_normal > 5.0
-    sink_token_freq_threshold: 0.95  # activation_freq_on_sink > 0.95
+    # Phase C+ sink-token routing auto-extension (see D-sink-token-routing).
+    # Disabled for Qwen3.6-35B-A3B: the 2026-05-10 v4 run with the bug-fixed
+    # per-layer normalization auto-extended 146 experts, of which 91% had
+    # |ΔNLL| < 0.001 in Phase F (no protection benefit) and 9 had ΔNLL < -0.001
+    # (false positives — protecting them hurts). The reviewer's criterion
+    # `freq_on_sink > 0.95 AND score_sink/score_normal > 5×` doesn't generalize
+    # to this architecture: max freq_on_sink = 1.0 saturated for many experts
+    # because Qwen3.6 has lots of experts that legitimately route to every sink
+    # token without being SEs. Phase C three-way AND + AIMER alone (12 SEs in
+    # v3) was the right answer per Phase F validation. Re-enable only after
+    # tightening the criterion (see D-sink-token-routing for follow-ups).
+    sink_token_enabled: false
+    sink_token_score_ratio: 5.0   # retained as default; ineffective when disabled
+    sink_token_freq_threshold: 0.95  # retained as default; ineffective when disabled
 
     # Deprecated keys (warned-and-ignored by code; SE detection uses paper's
     # three-way AND criterion P99.5 + 0.1·a_max + l ∈ L instead).
@@ -90,9 +101,11 @@ stage1_grape:
     enabled: true
     holdout_samples: 100          # held-out from calibration; deterministic seed offset
     topk_nonblacklisted: 5        # per l ∈ L, ablate top-5 non-blacklisted by per_expert_max
-    batch_size: 8                 # Each ablation forwards over the holdout slice; bs=8 cuts the
-                                  # per-ablation batch count from 100 to 13 with the same VRAM
-                                  # budget as Phase B (the run-scoped accumulators stay resident).
+    batch_size: 8                 # Each ablation forwards over the holdout slice. KEPT at 8 (not
+                                  # 16): v4 logged 130.2 GB VRAM during Phase F because Phase B's
+                                  # accumulators stay resident plus the Phase F calibration cache
+                                  # is allocated. bs=16 here would project to ~155 GB — at or
+                                  # over the 150.8 GB H200 ceiling.
 
   # Phase D/E (unchanged)
   similarity_metric: cka
