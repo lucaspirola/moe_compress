@@ -48,40 +48,47 @@ calibration:
 
 stage1_grape:
   # Phase A/B: calibration forward pass
-  num_calibration_samples: 4000   # 4000 samples × 2048 tokens ≈ 8M tokens.
-                                  # Stage 1 runs ONCE and is reused across all ablations, so the
-                                  # one-time cost is amortized. After GPU-vectorizing Phase B
-                                  # (ExpertOutputAccumulator) and Phase D (_cka_distance_matrix),
-                                  # 4000 samples now completes in ~75 min total on H200 (vs 8.5h
-                                  # at 256 samples on the CPU implementations). Benefit: tightest
-                                  # possible P99.5 super-expert threshold + cleanest CKA reservoirs
-                                  # (every active expert's reservoir saturates at the 256-token
-                                  # cap many times over).
-  # Phase B: super expert detection (2507.23279)
+  num_calibration_samples: 1024   # Down from 4000 per reviewer (max + 256-token reservoir saturate
+                                  # well before 1024 samples; CKA matrix Frobenius distance
+                                  # changes < 5% between 1024 and 4000 — reviewer report:
+                                  # max_quality/docs/stage1_review_10.05.2026.txt §Q6).
+  phase_a_batch_size: 4           # Phase A only tracks max magnitudes (batch-size invariant).
+                                  # Cuts Phase A walltime by ~4× vs batch_size=1.
   super_expert_detection:
-    # Phase A MA-formation detector thresholds (2507.23279 §3.2.1).
-    # Defaults in code: ma_ratio=100.0, ma_growth_ratio=5.0 — calibrated on
-    # Qwen3-30B (no attention output gate). Qwen3.6-35B has attn_output_gate=true
-    # which dampens residual-stream growth, so the 5× threshold misses real
-    # MA-formation events.
-    # Diagnostic phase_a_20260509_191659 showed L34 (3.89×) and L38 (3.69×) as
-    # clear sub-threshold growth events; lowering to 3.0 captures them
-    # cleanly without picking up noise (next layer down, 2.0×, also catches
-    # L1+L6 which are noise).
-    ma_growth_ratio: 3.0
+    # Phase A dual-signal MA-formation detector — see ALGORITHM_REFERENCE.md §4 Phase A.
+    # The OR rule flags a layer if EITHER signal exceeds its threshold.
+    ma_growth_ratio: 3.0          # residual-stream (gated) growth threshold; calibrated for
+                                  # Qwen3.5/3.6 attn_output_gate=true (5.0 × E[sigmoid(gate)≈0.6])
+    moe_output_growth_ratio: 2.0  # MoE block output (ungated) growth threshold; secondary signal
+    ma_ratio: 100.0               # First MoE layer absolute outlier check (unchanged from paper)
+    a_max_fraction: 0.1           # Phase C three-way AND threshold (unchanged from paper Eq. 6)
+
+    # Phase C+ AIMER auto-extension (see D-aimer-cross-check)
+    aimer_enabled: true
+    aimer_bottom_pct: 0.01        # bottom 1% by AIMER score per layer (~2-3 experts/256-expert layer)
+    aimer_layer_max_fraction: 0.1 # require layer's expert-max > 0.1 × a_max_absolute
+
+    # Phase C+ sink-token routing auto-extension (see D-sink-token-routing)
+    sink_token_enabled: true
+    sink_token_score_ratio: 5.0   # mean_score_sink / mean_score_normal > 5.0
+    sink_token_freq_threshold: 0.95  # activation_freq_on_sink > 0.95
+
     # Deprecated keys (warned-and-ignored by code; SE detection uses paper's
     # three-way AND criterion P99.5 + 0.1·a_max + l ∈ L instead).
-    zscore_threshold: 2.5           # blacklist expert if down_proj max > mean + 2.5σ
-    max_blacklisted_per_layer: 4    # paper observes 3-4 per layer on Qwen3
-    global_blacklist_cap_pct: 0.05  # hard cap: ≤ 5% of all experts
-  # Phase C: CKA similarity (used by default; cosine/mse available for ablation)
-  similarity_metric: cka          # one of: cka | cosine | mse
-  # Phase D: GRAPE Algorithm 1
-  # Floor = num_routed_experts // 2 (computed at runtime from model config).
-  # No early/late layer bonuses — the 50% floor is sufficient protection.
-  # min_experts_per_layer is a fallback only; runtime uses max(this, n//2).
-  min_experts_per_layer: 128      # fallback floor; overridden by n//2 = 128 for 256-expert layers
-  entropy_tolerance: 0.1          # γ in GRAPE Eq. 10: entropy threshold = E_0 * (1 - γ)
+    zscore_threshold: 2.5
+    max_blacklisted_per_layer: 4
+    global_blacklist_cap_pct: 0.05
+
+  # Phase F: post-hoc causal-ablation validation (see D-causal-ablation-validation)
+  post_hoc_ablation:
+    enabled: true
+    holdout_samples: 100          # held-out from calibration; deterministic seed offset
+    topk_nonblacklisted: 5        # per l ∈ L, ablate top-5 non-blacklisted by per_expert_max
+
+  # Phase D/E (unchanged)
+  similarity_metric: cka
+  min_experts_per_layer: 128
+  entropy_tolerance: 0.1
 
 stage2_reap_ream:
   batch_size: 6                    # H200: model ~70GB leaves ~71GB headroom; bs=6 is ~50% faster than bs=4
