@@ -47,6 +47,7 @@ import torch
 import torch.nn as nn
 
 from .budget.solver import BudgetDecomposition
+from .stage1_post_hoc_ablation import run_phase_f
 from .utils.activation_hooks import (
     DownProjMaxAccumulator,
     ExpertOutputAccumulator,
@@ -661,6 +662,21 @@ def run(
         min(budgets.values()), max(budgets.values()),
         np.mean(list(budgets.values())), budgets_path,
     )
+
+    # ------------------------------------------------------------------
+    # Phase F: post-hoc causal-ablation validation (D-causal-ablation-validation)
+    # ------------------------------------------------------------------
+    try:
+        run_phase_f(
+            model, tokenizer, config, artifacts_dir,
+            blacklist={int(k): list(v) for k, v in blacklist_out.items()},
+            per_expert_max=max_acc.per_expert_max,
+            L=L,
+            device=device,
+        )
+    except Exception as exc:
+        log.error("Stage 1 Phase F failed (non-fatal): %s", exc, exc_info=True)
+
     return blacklist_path, budgets_path
 
 
