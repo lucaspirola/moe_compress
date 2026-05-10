@@ -1,0 +1,117 @@
+[project]
+name = "kdr"
+version = "0.1.0"
+description = "Knowledge Distillation Recovery — unified Ch1 BF16 KD + Ch3 DA-QAD trainer for moe_compress"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Lucas", email = "lucas@eliteaero.com.br" }]
+
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=4.46.0",
+    "accelerate>=1.0.0",
+    "pydantic>=2.5.0",
+    "pyyaml>=6.0",
+    "datasets>=3.0.0",
+    "huggingface_hub>=0.25.0",
+    "safetensors>=0.4.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.10",
+    "ruff>=0.5",
+    "pytest>=8.0",
+    "hypothesis>=6.100",
+    "pre-commit>=3.7",
+    "types-PyYAML",
+]
+modelopt = ["nvidia-modelopt>=0.21.0"]
+deepspeed = ["deepspeed>=0.15.0"]
+bnb = ["bitsandbytes>=0.44.0"]
+compressed = ["compressed-tensors>=0.7.0"]
+
+[project.scripts]
+kdr-train = "kdr.cli.train:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kdr"]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# mypy — strict, per HLR-0012 / LLR-0044
+# ──────────────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.11"
+strict = true
+disallow_untyped_defs = true
+warn_unreachable = true
+warn_unused_ignores = true
+files = ["src/kdr"]
+# Note: `disallow_any_explicit` is intentionally NOT set. Pydantic v2's
+# `ConfigDict` and `Field` machinery exposes `Any` through TypedDict / Field
+# return types — flagging those would force per-line `# type: ignore` on every
+# Pydantic field declaration, defeating the readability strict typing is meant
+# to provide. The `strict = true` family + `disallow_untyped_defs` already
+# catches the cases we care about (untyped function signatures, implicit Any
+# returns). See LLR-0044 for the full configured set.
+
+[[tool.mypy.overrides]]
+module = [
+    "modelopt.*",
+    "deepspeed.*",
+    "bitsandbytes.*",
+    "compressed_tensors.*",
+    "datasets",
+    "datasets.*",
+    "torch",
+    "torch.*",
+    "accelerate",
+    "accelerate.*",
+    "transformers.*",
+]
+ignore_missing_imports = true
+
+# `transformers` ships `py.typed` but the deepspeed-integration submodule's
+# functions are untyped (`HfDeepSpeedConfig.__init__`, `is_deepspeed_zero3_enabled`)
+# under the strict-mode `disallow_untyped_calls`. Suppress the per-call diag
+# at the consumer (`training/zero3_init.py`) by exempting that *module path*
+# rather than per-call so future call sites stay covered.
+[[tool.mypy.overrides]]
+module = ["transformers.integrations.deepspeed"]
+follow_imports = "skip"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ruff — per HLR-0012 / LLR-0044
+# ──────────────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = ["E501"]  # line length: handled by formatter
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]  # asserting False is fine in tests
+
+# ──────────────────────────────────────────────────────────────────────────────
+# pytest
+# ──────────────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --strict-markers"

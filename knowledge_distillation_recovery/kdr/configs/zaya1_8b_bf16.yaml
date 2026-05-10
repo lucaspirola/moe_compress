@@ -1,0 +1,65 @@
+# kdr — ZAYA1-8B `bf16` mode (Chapter 1 BF16 KD)
+#
+# This is the parity smoke for Phase 7.1: same FKLD loss as structural_recovery,
+# no `mtq.quantize` call, no quant-aware behaviour. Self-distillation: teacher
+# and student both initialised from `Zyphra/ZAYA1-reasoning-base`.
+#
+# Hardware: 1× H200 or 1× A100-80GB. Multi-GPU ZeRO-3 is overkill for ZAYA1's
+# 8.4B total / 760M active footprint.
+
+mode: bf16
+
+teacher:
+  name_or_path: Zyphra/ZAYA1-reasoning-base
+  revision: main
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+student:
+  source: Zyphra/ZAYA1-reasoning-base  # self-distillation
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+calibration:
+  source: nvidia-cascade
+  dataset: nvidia/Nemotron-Cascade-2-SFT-Data
+  seed: 1337
+  num_sequences: 13000
+  sequence_length: 4096
+  subset_weights:
+    math: 0.21
+    science: 0.11
+    chat: 0.56
+    instruction_following: 0.033
+    conversational_agent: 0.0331
+    swe: 0.02
+    terminal_agent: 0.0331
+  ptq_subset_size: 256
+
+# `quant:` is intentionally absent in `bf16` mode.
+
+distillation:
+  loss: forward_kld
+  temperature: 1.0
+  optimizer: adamw_bnb_8bit
+  learning_rate: 2.0e-4
+  min_learning_rate: 4.5e-7
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  grad_clip_norm: 1.0
+  warmup_steps: 20
+  total_tokens: 50_000_000     # smoke budget; ~30 min on 1× H200
+  per_device_batch_size: 1
+  gradient_accumulation: 32
+  sequence_length: 4096
+  log_every_n_steps: 5
+  eval_every_n_steps: 50
+  save_every_n_steps: 0        # smoke: no partials
+  trainable_scope: full
+  use_gradient_checkpointing: true
+
+eval:
+  wikitext2:
+    enabled: true
+    sequence_length: 2048
+    num_sequences: 64

@@ -1,0 +1,30 @@
+{
+  "_comment": "DeepSpeed ZeRO-3 for Chapter 1 Light tier on a100x4 (HF Jobs, $10/h). Optimizer state offloaded to CPU host RAM (568 GB available); param + grad shards stay on GPU. Pair with `optimizer: deepspeed_cpu_adam` in the YAML.",
+  "_comment_clip": "gradient_clipping is HARDCODED here (not 'auto') because Accelerate's 'auto' resolves to the YAML's `max_grad_norm`, which we don't expose — our YAML uses `grad_clip_norm`. Hard-coding avoids silent disagreement. Mirror this value into the YAML's distillation.grad_clip_norm if you change it.",
+
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": 1.0,
+
+  "bf16": {"enabled": true},
+
+  "zero_optimization": {
+    "stage": 3,
+    "offload_optimizer": {
+      "device": "cpu",
+      "pin_memory": true
+    },
+    "offload_param": {"device": "none"},
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "reduce_bucket_size": 5e8,
+    "stage3_prefetch_bucket_size": 5e8,
+    "stage3_param_persistence_threshold": 1e6,
+    "stage3_max_live_parameters": 1e9,
+    "stage3_max_reuse_distance": 1e9,
+    "stage3_gather_16bit_weights_on_model_save": true
+  },
+
+  "wall_clock_breakdown": false
+}
