@@ -103,9 +103,15 @@ stage1_grape:
     enabled: true
     holdout_samples: 100               # held-out slice from calibration; deterministic seed_offset=999
     blacklist_threshold: 0.001         # ΔNLL threshold; ~0.1% PPL impact
-    batch_size: 32                     # Phase D runs before E/F so resident memory matches Phase B
-                                       # (~106 GB at bs=8); bs=32 projects ~120-125 GB. Verify on
-                                       # first run; drop to 16 if VRAM near 145 GB.
+    batch_size: 8                      # H200 first-run telemetry (job 6a00caf0, 2026-05-10): the
+                                       # model+Phase B accumulators+Phase E (CKA) reservoir occupy
+                                       # ~99 GB before Phase D, leaving ~40 GB free. The
+                                       # ForCausalLMLoss bf16→fp32 logits upcast at bs=32 OOM'd
+                                       # (tried to allocate 60.6 GB; logits tensor itself is
+                                       # 32×2048×151936×4 bytes = 38 GB upcast). bs=8 keeps the
+                                       # upcast at ~9.5 GB + intermediates ≈ 16 GB total —
+                                       # comfortably within budget and matches the v4-proven
+                                       # post_hoc_ablation config. ~13 batches per candidate.
 
   # Phase E/F (unchanged)
   similarity_metric: cka
