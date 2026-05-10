@@ -47,7 +47,10 @@ import torch
 import torch.nn as nn
 
 from .budget.solver import BudgetDecomposition
-from .stage1_post_hoc_ablation import run_phase_f
+from .stage1_post_hoc_ablation import (
+    _write_ablation_filter_artifact,
+    run_ablation_filter,
+)
 from .utils.activation_hooks import (
     DownProjMaxAccumulator,
     ExpertOutputAccumulator,
@@ -364,114 +367,77 @@ def run(
         sink_acc.finalize()
 
     # ------------------------------------------------------------------
-    # Phase C: Super Expert Detection (2507.23279, Eq. 6)
+    # Phase C: Candidate Generation (union of four detectors)
     # ------------------------------------------------------------------
     p995, a_max = _compute_se_thresholds(max_acc.per_expert_max, L)
-    blacklist = _apply_paper_criterion(
-        max_acc.per_expert_max, L, p995, a_max_fraction * a_max,
-    )
+    a_max_threshold = a_max_fraction * a_max
 
-    # Snapshot Phase C result before AIMER/sink-token extensions; used to tag
-    # provenance of each entry in the final blacklist (phase_c vs aimer vs sink).
-    _phase_c_pre_extensions = {
-        (li, e) for li, lst in blacklist.items() for e in lst
-    }
-
-    # ------------------------------------------------------------------
-    # Phase C+: AIMER weight-only auto-extension (D-aimer-cross-check)
-    # ------------------------------------------------------------------
+    # AIMER scores are needed both as a candidate source and as audit data in
+    # the artifact, so compute them up front regardless of whether AIMER is the
+    # detector of record.
     aimer_scores: dict[tuple[int, int], float] = {}
-    aimer_extension: dict[int, list[int]] = {}
-    bottom_pct_by_layer: dict[int, list[int]] = {}
     aimer_bottom_pct = float(se_cfg.get("aimer_bottom_pct", 0.01))
     aimer_layer_max_fraction = float(se_cfg.get("aimer_layer_max_fraction", 0.1))
-    if bool(se_cfg.get("aimer_enabled", True)):
+    aimer_enabled = bool(se_cfg.get("aimer_enabled", True))
+    if aimer_enabled:
         for ref in moe_layers:
             for e in range(ref.num_routed_experts):
                 w_down = _get_expert_down_proj_weight(ref, e)
                 aimer_scores[(ref.layer_idx, e)] = aimer_score_tensor(w_down)
-        bottom_pct_by_layer = aimer_bottom_pct_per_layer(
-            aimer_scores, pct=aimer_bottom_pct,
-        )
-        # Per-layer max activation magnitude (used to gate AIMER extensions:
-        # only layers whose peak activation is above aimer_layer_max_fraction *
-        # a_max are eligible — focuses AIMER on activation-hot layers).
-        # a_max is L-restricted (computed at line ~352 via _compute_se_thresholds);
-        # using it (vs. a max over all MoE layers) keeps the gate aligned with the
-        # spec's Phase C+ definition and with the artifact's reported
-        # config.a_max_absolute.
-        layer_expert_max: dict[int, float] = {}
-        for (li, _e), v in max_acc.per_expert_max.items():
-            layer_expert_max[li] = max(layer_expert_max.get(li, 0.0), v)
-        blacklisted_set = {(int(li), e) for li, lst in blacklist.items() for e in lst}
-        for li, candidates in bottom_pct_by_layer.items():
-            if layer_expert_max.get(li, 0.0) <= aimer_layer_max_fraction * a_max:
-                continue
-            for e in candidates:
-                if (li, e) in blacklisted_set:
-                    continue
-                aimer_extension.setdefault(li, []).append(e)
-        for li, lst in aimer_extension.items():
-            for e in lst:
-                blacklist.setdefault(li, []).append(e)
-            blacklist[li] = sorted(set(blacklist[li]))
-        log.info(
-            "Stage 1 Phase C+: AIMER auto-extended blacklist with %d new (l,e) pairs across %d layers",
-            sum(len(v) for v in aimer_extension.values()), len(aimer_extension),
-        )
+    bottom_pct_by_layer = (
+        aimer_bottom_pct_per_layer(aimer_scores, pct=aimer_bottom_pct) if aimer_scores else {}
+    )
+
+    sink_score_ratio = float(se_cfg.get("sink_token_score_ratio", 10.0))
+    sink_freq_threshold = float(se_cfg.get("sink_token_freq_threshold", 0.99))
+    sink_max_per_layer_cap = int(se_cfg.get("sink_token_max_per_layer_cap", 10))
+    sink_enabled_cfg = bool(se_cfg.get("sink_token_enabled", True))
+    magnitude_topk_per_l_layer = int(se_cfg.get("magnitude_topk_per_l_layer", 16))
+    ablation_filter_threshold = float(
+        s1.get("ablation_filter", {}).get("blacklist_threshold", 0.001)
+    )
+
+    candidates = _collect_candidates(
+        per_expert_max=max_acc.per_expert_max,
+        L=L,
+        p995=p995,
+        a_max=a_max,
+        a_max_threshold=a_max_threshold,
+        aimer_scores=aimer_scores,
+        bottom_pct_by_layer=bottom_pct_by_layer,
+        aimer_enabled=aimer_enabled,
+        aimer_layer_max_fraction=aimer_layer_max_fraction,
+        sink_acc=sink_acc,
+        sink_enabled=sink_enabled_cfg,
+        sink_score_ratio=sink_score_ratio,
+        sink_freq_threshold=sink_freq_threshold,
+        sink_max_per_layer_cap=sink_max_per_layer_cap,
+        magnitude_topk_per_l_layer=magnitude_topk_per_l_layer,
+    )
+    log.info(
+        "Stage 1 Phase C: collected %d candidates (P99.5=%.3g, a_max_threshold=%.3g)",
+        len(candidates), p995, a_max_threshold,
+    )
 
     # ------------------------------------------------------------------
-    # Phase C+: Sink-token routing auto-extension (D-sink-token-routing)
+    # Phase D: Ablation Filter (load-bearing — produces final blacklist)
     # ------------------------------------------------------------------
-    sink_extension: dict[int, list[int]] = {}
-    sink_score_ratio = float(se_cfg.get("sink_token_score_ratio", 5.0))
-    sink_freq_threshold = float(se_cfg.get("sink_token_freq_threshold", 0.95))
-    if sink_acc is not None:
-        sink_extension = apply_sink_token_extension(
-            sink_acc.mean_router_score_sink,
-            sink_acc.mean_router_score_normal,
-            sink_acc.freq_on_sink,
-            existing_blacklist={int(k): list(v) for k, v in blacklist.items()},
-            score_ratio=sink_score_ratio,
-            freq_threshold=sink_freq_threshold,
-        )
-        for li, lst in sink_extension.items():
-            for e in lst:
-                blacklist.setdefault(li, []).append(e)
-            blacklist[li] = sorted(set(blacklist[li]))
-        log.info(
-            "Stage 1 Phase C+: sink-token auto-extended blacklist with %d new (l,e) pairs across %d layers",
-            sum(len(v) for v in sink_extension.values()), len(sink_extension),
-        )
-
-    # _apply_paper_criterion + auto-extensions only append non-empty lists; recompute
-    # blacklist_out AFTER extensions so it reflects the full Phase C + C+ output.
+    log.info("Stage 1 Phase D: ablating %d candidates", len(candidates))
+    blacklist, candidate_deltas, baseline_nll = run_ablation_filter(
+        model, tokenizer, config, artifacts_dir,
+        candidates=candidates,
+        device=device,
+    )
     blacklist_out = {str(li): sorted(es) for li, es in blacklist.items()}
     total_experts = sum(ref.num_routed_experts for ref in moe_layers)
 
-    # Provenance: tag each surviving (l, e) by its first-detected source so that
-    # downstream tooling (Phase F ablation, diagnostics) can stratify analyses.
-    provenance: dict[str, str] = {}
-    aimer_set = {(int(li), e) for li, lst in aimer_extension.items() for e in lst}
-    sink_set = {(int(li), e) for li, lst in sink_extension.items() for e in lst}
+    # Provenance: each blacklisted (l, e) inherits all detector tags from the
+    # candidate dict (multi-source — list of strings, not single source).
+    provenance: dict[str, list[str]] = {}
     for li_str, exps in blacklist_out.items():
         for e in exps:
-            key = f"L{li_str}E{e}"
-            if (int(li_str), e) in _phase_c_pre_extensions:
-                provenance[key] = "phase_c"
-            elif (int(li_str), e) in aimer_set:
-                provenance[key] = "aimer"
-            elif (int(li_str), e) in sink_set:
-                provenance[key] = "sink_token"
-            else:
-                log.warning(
-                    "provenance: (%s, %s) appears in final blacklist but not in "
-                    "_phase_c_pre_extensions, aimer_extension, or sink_extension — "
-                    "tagged 'unknown'. This indicates a programming error in a "
-                    "phase that mutated the blacklist without updating its provenance source.",
-                    li_str, e,
-                )
-                provenance[key] = "unknown"
+            tags = candidates.get((int(li_str), int(e)), [])
+            provenance[f"L{li_str}E{e}"] = list(tags)
 
     dual_signal = {
         "residual_growth_per_layer": {
@@ -484,6 +450,15 @@ def run(
             str(li): _safe_float_for_json(v) for li, v in moe_output_max.items()
         },
     }
+    # Per-detector candidate sets are reconstructed from the unified candidates
+    # dict so audits can see what each detector flagged before the ablation cut.
+    def _candidates_by_provenance(tag: str) -> dict[str, list[int]]:
+        out: dict[int, list[int]] = {}
+        for (li, e), tags in candidates.items():
+            if tag in tags:
+                out.setdefault(int(li), []).append(int(e))
+        return {str(li): sorted(es) for li, es in out.items()}
+
     aimer_payload = {
         "scores": {
             f"L{li}E{e}": _safe_float_for_json(v) for (li, e), v in aimer_scores.items()
@@ -491,9 +466,7 @@ def run(
         "bottom_pct_per_layer": {
             str(li): list(exps) for li, exps in bottom_pct_by_layer.items()
         },
-        "auto_extended": {
-            str(li): list(exps) for li, exps in aimer_extension.items()
-        },
+        "candidates": _candidates_by_provenance("aimer"),
     }
     sink_payload = {
         "mean_router_score_sink": (
@@ -508,9 +481,7 @@ def run(
             {f"L{li}E{e}": _safe_float_for_json(v) for (li, e), v in sink_acc.freq_on_sink.items()}
             if sink_acc is not None else {}
         ),
-        "auto_extended": {
-            str(li): list(exps) for li, exps in sink_extension.items()
-        },
+        "candidates": _candidates_by_provenance("sink_token"),
     }
 
     blacklist_config = {
@@ -521,11 +492,14 @@ def run(
         "ma_formation_layers": sorted(L),
         "p995_threshold": float(p995),
         "a_max_absolute": float(a_max),
-        "a_max_threshold": float(a_max_fraction * a_max),
+        "a_max_threshold": float(a_max_threshold),
         "aimer_bottom_pct": aimer_bottom_pct,
         "aimer_layer_max_fraction": aimer_layer_max_fraction,
         "sink_token_score_ratio": sink_score_ratio,
         "sink_token_freq_threshold": sink_freq_threshold,
+        "sink_token_max_per_layer_cap": sink_max_per_layer_cap,
+        "magnitude_topk_per_l_layer": magnitude_topk_per_l_layer,
+        "ablation_filter_threshold": ablation_filter_threshold,
     }
     blacklist_path = artifacts_dir / "stage1_blacklist.json"
     save_json_artifact(
@@ -543,10 +517,26 @@ def run(
         },
         blacklist_path,
     )
+    _write_ablation_filter_artifact(
+        artifacts_dir,
+        candidates=candidates,
+        deltas=candidate_deltas,
+        baseline_nll=baseline_nll,
+        threshold=ablation_filter_threshold,
+        blacklist=blacklist,
+        config_dict={
+            "holdout_samples": int(s1.get("ablation_filter", {}).get("holdout_samples", 100)),
+            "magnitude_topk_per_l_layer": magnitude_topk_per_l_layer,
+            "ablation_filter_threshold": ablation_filter_threshold,
+            "ablation_filter_batch_size": int(s1.get("ablation_filter", {}).get("batch_size", 32)),
+            "ma_formation_layers": sorted(L),
+        },
+    )
     log.info(
-        "Stage 1 Phase C: blacklisted %d / %d super experts (P99.5=%.3g, a_max_threshold=%.3g) → %s",
+        "Stage 1 Phase D: ablation-filter kept %d / %d candidates → blacklisted %d / %d experts → %s",
+        sum(len(v) for v in blacklist_out.values()), len(candidates),
         sum(len(v) for v in blacklist_out.values()), total_experts,
-        p995, a_max_fraction * a_max, blacklist_path,
+        blacklist_path,
     )
 
     # One-shot Trackio emit of Phase A/C summary (additive; all variables in
@@ -581,14 +571,14 @@ def run(
                 entry["stage1/se_down_max_std"] = float(statistics.pstdev(vals)) if len(vals) > 1 else 0.0
                 entry["stage1/se_down_max_max"] = float(max(vals))
         _trackio_log(entry)
-    # End-of-Phase-A/C: drain queue + keep sender thread alive before the
-    # multi-minute Phase D CKA loop (which has no per-batch flush of its own).
+    # End-of-Phase-A/C/D: drain queue + keep sender thread alive before the
+    # multi-minute Phase E CKA loop (which has no per-batch flush of its own).
     _trackio_flush()
 
     # ------------------------------------------------------------------
-    # Phase D: CKA Similarity Matrices
+    # Phase E: CKA Similarity Matrices
     # ------------------------------------------------------------------
-    log.info("Stage 1 Phase D: computing CKA pairwise distance matrices (D = 1 − CKA)")
+    log.info("Stage 1 Phase E: computing CKA pairwise distance matrices (D = 1 − CKA)")
 
     D_matrices: dict[int, torch.Tensor] = {}
     per_layer_counts: dict[int, int] = {}
@@ -609,7 +599,7 @@ def run(
             D_matrices[ref.layer_idx] = _pairwise_distance_matrix(ref, metric=metric)
 
     # ------------------------------------------------------------------
-    # Phase E: GRAPE Algorithm 1 (entropy-aware greedy merge with restart)
+    # Phase F: GRAPE Algorithm 1 (entropy-aware greedy merge with restart)
     # ------------------------------------------------------------------
     global_budget = decomposition.global_expert_budget
     gamma = float(s1.get("entropy_tolerance", 0.1))
@@ -664,7 +654,7 @@ def run(
             "stage1/redundancy": redundancies[li],
             "stage1/budget": budgets[li],
         })
-    # End-of-Phase-D/E per-layer emit: drain before Stage 1 returns control
+    # End-of-Phase-E/F per-layer emit: drain before Stage 1 returns control
     # to its caller.
     _trackio_flush()
 
@@ -683,19 +673,9 @@ def run(
         np.mean(list(budgets.values())), budgets_path,
     )
 
-    # ------------------------------------------------------------------
-    # Phase F: post-hoc causal-ablation validation (D-causal-ablation-validation)
-    # ------------------------------------------------------------------
-    try:
-        run_phase_f(
-            model, tokenizer, config, artifacts_dir,
-            blacklist={int(k): list(v) for k, v in blacklist_out.items()},
-            per_expert_max=max_acc.per_expert_max,
-            L=L,
-            device=device,
-        )
-    except Exception as exc:
-        log.error("Stage 1 Phase F failed (non-fatal): %s", exc, exc_info=True)
+    # Note: post-hoc Phase F (legacy report) was promoted to Phase D (load-bearing
+    # ablation filter) and runs above before Phase E/F. See ALGORITHM_REFERENCE.md
+    # §4 Phase D and §12 D-causal-ablation-validation.
 
     return blacklist_path, budgets_path
 
@@ -971,6 +951,86 @@ def _apply_paper_criterion(
         if v > p995 and v > a_max_threshold:
             blacklist.setdefault(li, []).append(e)
     return blacklist
+
+
+def _collect_candidates(
+    *,
+    per_expert_max: dict[tuple[int, int], float],
+    L: set[int],
+    p995: float,
+    a_max: float,
+    a_max_threshold: float,
+    aimer_scores: dict[tuple[int, int], float],
+    bottom_pct_by_layer: dict[int, list[int]],
+    aimer_enabled: bool,
+    aimer_layer_max_fraction: float,
+    sink_acc,
+    sink_enabled: bool,
+    sink_score_ratio: float,
+    sink_freq_threshold: float,
+    sink_max_per_layer_cap: int,
+    magnitude_topk_per_l_layer: int,
+) -> dict[tuple[int, int], list[str]]:
+    """Build the Phase C candidate dict by union of four detectors with provenance tags.
+
+    Returns ``{(layer_idx, expert_idx): sorted_unique_provenance_tags}``. Tag values
+    are drawn from {``"phase_c"``, ``"aimer"``, ``"sink_token"``, ``"magnitude_topk"``}.
+    De-duplication is by (layer, expert) — provenance lists carry every detector
+    that flagged the candidate. Final inclusion in ``stage1_blacklist.json``
+    requires Phase D ablation evidence.
+    """
+    out: dict[tuple[int, int], set[str]] = {}
+
+    # Source 1: three-way AND (paper 2507.23279 Eq. 6, restricted to l ∈ L)
+    three_way = _apply_paper_criterion(per_expert_max, L, p995, a_max_threshold)
+    for li, exps in three_way.items():
+        for e in exps:
+            out.setdefault((int(li), int(e)), set()).add("phase_c")
+
+    # Source 2: AIMER bottom-pct per layer, gated by per-layer activation max
+    if aimer_enabled and bottom_pct_by_layer:
+        layer_expert_max: dict[int, float] = {}
+        for (li, _e), v in per_expert_max.items():
+            layer_expert_max[li] = max(layer_expert_max.get(li, 0.0), v)
+        for li, exps in bottom_pct_by_layer.items():
+            if layer_expert_max.get(li, 0.0) <= aimer_layer_max_fraction * a_max:
+                continue
+            for e in exps:
+                out.setdefault((int(li), int(e)), set()).add("aimer")
+
+    # Source 3: sink-token routing, capped per-layer by score-ratio rank
+    if sink_enabled and sink_acc is not None:
+        flagged = apply_sink_token_extension(
+            sink_acc.mean_router_score_sink,
+            sink_acc.mean_router_score_normal,
+            sink_acc.freq_on_sink,
+            existing_blacklist={},
+            score_ratio=sink_score_ratio,
+            freq_threshold=sink_freq_threshold,
+        )
+        for li, exps in flagged.items():
+            ranked = sorted(
+                exps,
+                key=lambda e: -(
+                    sink_acc.mean_router_score_sink.get((li, e), 0.0)
+                    / max(sink_acc.mean_router_score_normal.get((li, e), 0.0), 1e-9)
+                ),
+            )
+            for e in ranked[:sink_max_per_layer_cap]:
+                out.setdefault((int(li), int(e)), set()).add("sink_token")
+
+    # Source 4: magnitude top-K per l ∈ L
+    if magnitude_topk_per_l_layer > 0 and L:
+        by_layer: dict[int, list[tuple[int, float]]] = {}
+        for (li, e), v in per_expert_max.items():
+            if li in L:
+                by_layer.setdefault(li, []).append((e, v))
+        for li, lst in by_layer.items():
+            lst.sort(key=lambda t: -t[1])
+            for e, _ in lst[:magnitude_topk_per_l_layer]:
+                out.setdefault((int(li), int(e)), set()).add("magnitude_topk")
+
+    return {key: sorted(tags) for key, tags in out.items()}
 
 
 # ---------------------------------------------------------------------------
