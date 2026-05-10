@@ -1,0 +1,37 @@
+# kdr pre-commit hooks (LLR-0046, LLR-0047).
+#
+# Installed locally via:
+#   cd kdr && pip install pre-commit && pre-commit install
+#
+# Runs ruff, mypy, and req scan on every commit. CI runs the same set.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.7
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.1
+    hooks:
+      - id: mypy
+        files: ^src/kdr/
+        args: [--strict]
+        additional_dependencies:
+          - pydantic>=2.5.0
+          - types-PyYAML
+
+  - repo: local
+    hooks:
+      - id: req-scan
+        name: req scan (--strict, Python `#` tag recognition)
+        # Runs the patched req scanner from Phase 0. The scanner picks up
+        # `# REQ: LLR-XXXX` tags in Python files, validates that referenced
+        # LLR ids exist, and (under --strict) treats untagged or broken-link
+        # commits as errors.
+        entry: bash -c 'cd .. && /home/lucas/ai/req/target/release/req scan --strict'
+        language: system
+        pass_filenames: false
+        files: \.py$
