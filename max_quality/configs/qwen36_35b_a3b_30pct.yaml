@@ -70,25 +70,27 @@ stage1_grape:
     ma_ratio: 100.0               # First MoE layer absolute outlier check (unchanged from paper)
     a_max_fraction: 0.1           # Phase C three-way AND threshold (unchanged from paper Eq. 6)
 
-    # Phase C+ AIMER auto-extension (see D-aimer-cross-check)
+    # Phase C: AIMER candidate source (see D-aimer-cross-check). Final blacklist
+    # inclusion is gated by Phase D ablation evidence — AIMER auto-extension
+    # was removed in v6 because static thresholds are fragile across architectures.
     aimer_enabled: true
     aimer_bottom_pct: 0.01        # bottom 1% by AIMER score per layer (~2-3 experts/256-expert layer)
     aimer_layer_max_fraction: 0.1 # require layer's expert-max > 0.1 × a_max_absolute
 
-    # Phase C+ sink-token routing auto-extension (see D-sink-token-routing).
-    # Disabled for Qwen3.6-35B-A3B: the 2026-05-10 v4 run with the bug-fixed
-    # per-layer normalization auto-extended 146 experts, of which 91% had
-    # |ΔNLL| < 0.001 in Phase F (no protection benefit) and 9 had ΔNLL < -0.001
-    # (false positives — protecting them hurts). The reviewer's criterion
-    # `freq_on_sink > 0.95 AND score_sink/score_normal > 5×` doesn't generalize
-    # to this architecture: max freq_on_sink = 1.0 saturated for many experts
-    # because Qwen3.6 has lots of experts that legitimately route to every sink
-    # token without being SEs. Phase C three-way AND + AIMER alone (12 SEs in
-    # v3) was the right answer per Phase F validation. Re-enable only after
-    # tightening the criterion (see D-sink-token-routing for follow-ups).
-    sink_token_enabled: false
-    sink_token_score_ratio: 5.0   # retained as default; ineffective when disabled
-    sink_token_freq_threshold: 0.95  # retained as default; ineffective when disabled
+    # Phase C: sink-token routing candidate source (see D-sink-token-routing).
+    # v6 re-enabled with tightened thresholds + per-layer cap; v4 saturated at
+    # freq_on_sink = 1.0 for many non-SE experts on this architecture, so 0.95
+    # threshold over-fired (146 experts, only 1 with measurable ΔNLL). Final
+    # blacklist inclusion gated by Phase D ablation evidence — false candidates
+    # cost ablation time but cannot reach the blacklist without ΔNLL > threshold.
+    sink_token_enabled: true
+    sink_token_score_ratio: 10.0          # tightened from v4's 5.0
+    sink_token_freq_threshold: 0.99       # tightened from v4's 0.95
+    sink_token_max_per_layer_cap: 10      # caps candidate-set size per layer (sorted by score_ratio desc)
+
+    # Phase C: magnitude top-K candidate source (see D-magnitude-topk-candidates).
+    # candidate-only signal; 2× active-experts-per-token (top-8 routing).
+    magnitude_topk_per_l_layer: 16
 
     # Deprecated keys (warned-and-ignored by code; SE detection uses paper's
     # three-way AND criterion P99.5 + 0.1·a_max + l ∈ L instead).
@@ -96,18 +98,16 @@ stage1_grape:
     max_blacklisted_per_layer: 4
     global_blacklist_cap_pct: 0.05
 
-  # Phase F: post-hoc causal-ablation validation (see D-causal-ablation-validation)
-  post_hoc_ablation:
+  # Phase D: Ablation Filter (was Phase F report-only; now load-bearing — see §4 Phase D).
+  ablation_filter:
     enabled: true
-    holdout_samples: 100          # held-out from calibration; deterministic seed offset
-    topk_nonblacklisted: 5        # per l ∈ L, ablate top-5 non-blacklisted by per_expert_max
-    batch_size: 8                 # Each ablation forwards over the holdout slice. KEPT at 8 (not
-                                  # 16): v4 logged 130.2 GB VRAM during Phase F because Phase B's
-                                  # accumulators stay resident plus the Phase F calibration cache
-                                  # is allocated. bs=16 here would project to ~155 GB — at or
-                                  # over the 150.8 GB H200 ceiling.
+    holdout_samples: 100               # held-out slice from calibration; deterministic seed_offset=999
+    blacklist_threshold: 0.001         # ΔNLL threshold; ~0.1% PPL impact
+    batch_size: 32                     # Phase D runs before E/F so resident memory matches Phase B
+                                       # (~106 GB at bs=8); bs=32 projects ~120-125 GB. Verify on
+                                       # first run; drop to 16 if VRAM near 145 GB.
 
-  # Phase D/E (unchanged)
+  # Phase E/F (unchanged)
   similarity_metric: cka
   min_experts_per_layer: 128
   entropy_tolerance: 0.1

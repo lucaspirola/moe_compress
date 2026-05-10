@@ -6,6 +6,7 @@ import torch
 
 from moe_compress.utils.sink_token_routing import (
     SinkTokenRoutingAccumulator,
+    apply_sink_token_candidate_selection,
     apply_sink_token_extension,
 )
 
@@ -134,3 +135,38 @@ def test_extension_picks_only_strict_threshold_violators():
         freq_threshold=0.95,
     )
     assert extension == {0: [3]}  # expert 2 fails ratio (0.05/0.5 = 0.1) and freq (0.1)
+
+
+def test_sink_token_candidate_selection_caps_per_layer():
+    """v6 candidate selector caps per-layer count and ranks by score-ratio descending.
+
+    With 5 experts in layer 0 all passing both thresholds (ratio > 10×, freq > 0.99),
+    the cap of 3 must select the 3 highest score_ratios (experts 4, 3, 2 — descending).
+    """
+    # Five experts in layer 0, all with ratio > 10 and freq > 0.99 (passing the
+    # tightened thresholds). score_ratio = score_sink / max(score_normal, EPS).
+    mean_score_sink = {(0, e): float(e + 1) * 0.5 for e in range(5)}      # 0.5, 1.0, 1.5, 2.0, 2.5
+    mean_score_normal = {(0, e): 0.01 for e in range(5)}                  # ratio = 50, 100, 150, 200, 250
+    freq_on_sink = {(0, e): 1.0 for e in range(5)}
+    out = apply_sink_token_candidate_selection(
+        mean_score_sink, mean_score_normal, freq_on_sink,
+        score_ratio=10.0, freq_threshold=0.99,
+        max_per_layer_cap=3,
+    )
+    # Top-3 by ratio descending: experts 4, 3, 2 (ratios 250, 200, 150).
+    assert out == {(0, 4), (0, 3), (0, 2)}
+
+
+def test_sink_token_candidate_selection_drops_below_thresholds():
+    """Experts that fail either threshold must be excluded regardless of cap room."""
+    mean_score_sink = {(0, 0): 1.0, (0, 1): 1.0, (0, 2): 0.05}
+    mean_score_normal = {(0, 0): 0.01, (0, 1): 0.5, (0, 2): 0.001}        # ratio = 100, 2, 50
+    freq_on_sink = {(0, 0): 1.0, (0, 1): 1.0, (0, 2): 0.5}                # expert 2 fails freq
+    out = apply_sink_token_candidate_selection(
+        mean_score_sink, mean_score_normal, freq_on_sink,
+        score_ratio=10.0, freq_threshold=0.99,
+        max_per_layer_cap=10,
+    )
+    # Only expert 0 passes both gates (ratio=100 > 10, freq=1.0 > 0.99).
+    # Expert 1 fails ratio (2 < 10); expert 2 fails freq (0.5 < 0.99).
+    assert out == {(0, 0)}
