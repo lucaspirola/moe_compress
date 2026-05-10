@@ -26,9 +26,11 @@ from .budget.solver import BudgetDecomposition
 from .utils.activation_hooks import (
     DownProjMaxAccumulator,
     ExpertOutputAccumulator,
+    capture_router_outputs,
     instrument_experts,
     run_calibration,
 )
+from .utils.aimer import aimer_bottom_pct_per_layer, aimer_score_tensor
 from .utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from .utils.model_io import (
     MATRIX_NAMES,
@@ -36,6 +38,10 @@ from .utils.model_io import (
     iter_decoder_layers,
     iter_moe_layers,
     save_json_artifact,
+)
+from .utils.sink_token_routing import (
+    SinkTokenRoutingAccumulator,
+    apply_sink_token_extension,
 )
 from .utils.trackio_log import trackio_flush as _trackio_flush
 from .utils.trackio_log import trackio_log as _trackio_log
@@ -99,17 +105,27 @@ def run(
 ) -> tuple[Path, Path]:
     """Run Stage 1: SE detection + GRAPE budget allocation.
 
-    Writes ``stage1_blacklist.json`` with exactly three top-level keys:
-      - ``blacklist`` : dict[str(layer_idx) -> list[expert_idx]] — the SE blacklist.
+    Writes ``stage1_blacklist.json`` with exactly seven top-level keys:
+      - ``blacklist`` : dict[str(layer_idx) -> list[expert_idx]] — the SE blacklist
+        (Phase C three-way AND result + Phase C+ AIMER + sink-token extensions).
       - ``per_expert_max`` : dict[str -> float] — per-expert max-magnitude over all
-        calibration batches, keyed by the format ``"L{layer_i}E{expert_i}"`` (e.g.
-        ``"L3E17"`` for layer 3, expert 17). All MoE layers are instrumented per
-        spec §4 Phase B, so any expert that fired on at least one calibration sample
-        is present here regardless of whether its layer is in L; the L-restriction
-        is applied later when computing P99.5 / a_max for the SE criterion. (A-C-N-2)
-      - ``config`` : dict — thresholds and detector parameters used to produce
-        the blacklist (a_max_fraction, ma_ratio, ma_growth_ratio,
-        ma_formation_layers, p995_threshold, a_max_absolute, a_max_threshold).
+        calibration batches, keyed by ``"L{layer_i}E{expert_i}"``. All MoE layers
+        are instrumented per spec §4 Phase B, so any expert that fired on at least
+        one calibration sample is present here regardless of whether its layer is
+        in L; the L-restriction is applied later when computing P99.5 / a_max for
+        the SE criterion. (A-C-N-2)
+      - ``config`` : dict — 12 keys: a_max_fraction, ma_ratio, ma_growth_ratio,
+        moe_output_growth_ratio, ma_formation_layers, p995_threshold,
+        a_max_absolute, a_max_threshold, aimer_bottom_pct, aimer_layer_max_fraction,
+        sink_token_score_ratio, sink_token_freq_threshold.
+      - ``blacklist_provenance`` : dict[str(L{li}E{e}) -> str] — first-detected
+        source for each entry (``phase_c`` / ``aimer`` / ``sink_token``).
+      - ``dual_signal`` : Phase A residual + MoE-output growth ratios per layer
+        (NaN values are serialized as JSON null for downstream tooling safety).
+      - ``aimer`` : per-(l,e) AIMER scores, bottom-pct candidates per layer, and
+        the auto-extended (l,e) pairs accepted by the activation gate.
+      - ``sink_token`` : per-(l,e) mean router scores on sink/normal tokens,
+        activation frequency on sink tokens, and the auto-extended (l,e) pairs.
 
     Returns (blacklist_path, budgets_path).
     """
@@ -208,18 +224,102 @@ def run(
         max_acc.update(li, e, tensor)
         output_acc.update(li, e, tensor)
 
+    # Sink-token routing accumulator (D-sink-token-routing). Captures per-(layer,
+    # expert) statistics about how often the expert routes to "sink" tokens (BOS
+    # or position 0). The expert is auto-extended into the SE blacklist if
+    # mean_router_score_on_sink >> mean_router_score_on_normal AND
+    # activation_frequency_on_sink ≈ 1.0. See utils/sink_token_routing.py.
+    sink_token_enabled = bool(se_cfg.get("sink_token_enabled", True))
+    if sink_token_enabled:
+        bos_token_id = getattr(tokenizer, "bos_token_id", None)
+        sink_acc = SinkTokenRoutingAccumulator(
+            num_layers=len(moe_layers),
+            num_experts=n_per_layer,
+            bos_token_id=int(bos_token_id) if bos_token_id is not None else None,
+        )
+    else:
+        sink_acc = None
+
+    # Per-batch closure: capture each batch's input_ids before the model
+    # forward via a model pre-forward hook, then in per_batch_callback push
+    # (input_ids, router_logits, routed_pos) into sink_acc for every MoE layer.
+    _current_input_ids: list[torch.Tensor | None] = [None]
+
+    def _capture_input_ids(_module, args, kwargs):
+        ids = None
+        if kwargs and "input_ids" in kwargs and kwargs["input_ids"] is not None:
+            ids = kwargs["input_ids"]
+        elif args and len(args) > 0 and isinstance(args[0], torch.Tensor):
+            ids = args[0]
+        _current_input_ids[0] = ids.detach() if ids is not None else None
+
+    def _phase_b_per_batch_cb(progress_cb, router_logits_storage, top_k_per_layer):
+        """Combine progress reporting with per-batch sink-token aggregation.
+
+        capture_router_outputs returns pre-softmax routing logits in
+        ``[B*T, num_experts]``; we reshape to ``[B, T, num_experts]``, take
+        softmax (sink_acc expects post-softmax scores per its docstring), then
+        use top-k to derive the routed expert ids per token. After the batch is
+        consumed, we clear the storage so subsequent batches don't accumulate.
+        """
+        def _cb(i: int) -> None:
+            progress_cb(i)
+            if sink_acc is None:
+                return
+            ids = _current_input_ids[0]
+            if ids is None:
+                return
+            if ids.dim() == 1:
+                ids = ids.unsqueeze(0)
+            B, T = ids.shape
+            for ref in moe_layers:
+                logits_list = router_logits_storage.get(ref.layer_idx)
+                if not logits_list:
+                    continue
+                logits = logits_list[-1]                # [B*T, num_experts]
+                if logits.shape[0] != B * T:
+                    # Defensive: skip if shape mismatch (should not occur, but
+                    # protects against router variants that flatten differently).
+                    continue
+                logits_3d = logits.reshape(B, T, -1)
+                scores = torch.softmax(logits_3d.float(), dim=-1)  # post-softmax
+                top_k = top_k_per_layer[ref.layer_idx]
+                _, routed_pos = torch.topk(scores, k=top_k, dim=-1)  # [B, T, top_k]
+                sink_acc.update(ref.layer_idx, ids, scores, routed_pos)
+            for li in router_logits_storage:
+                router_logits_storage[li].clear()
+        return _cb
+
+    progress_cb = _make_calibration_progress_cb(
+        "phase_b", n_total=len(batches),
+    )
+
     with contextlib.ExitStack() as stack:
         for ref in moe_layers:
             stack.enter_context(instrument_experts(ref, {"down": down_cb}))
+        if sink_acc is not None:
+            router_logits_storage = stack.enter_context(
+                capture_router_outputs(moe_layers)
+            )
+            top_k_per_layer = {ref.layer_idx: ref.top_k for ref in moe_layers}
+            input_ids_handle = model.register_forward_pre_hook(
+                _capture_input_ids, with_kwargs=True
+            )
+            stack.callback(input_ids_handle.remove)
+            per_batch_cb = _phase_b_per_batch_cb(
+                progress_cb, router_logits_storage, top_k_per_layer,
+            )
+        else:
+            per_batch_cb = progress_cb
         run_calibration(
             model, batches, device=device,
-            per_batch_callback=_make_calibration_progress_cb(
-                "phase_b", n_total=len(batches),
-            ),
+            per_batch_callback=per_batch_cb,
         )
 
     max_acc.finalize()
     output_acc.finalize()
+    if sink_acc is not None:
+        sink_acc.finalize()
 
     # ------------------------------------------------------------------
     # Phase C: Super Expert Detection (2507.23279, Eq. 6)
@@ -229,20 +329,151 @@ def run(
         max_acc.per_expert_max, L, p995, a_max_fraction * a_max,
     )
 
-    # _apply_paper_criterion only appends to a key when an expert passes the criterion,
-    # so all present keys map to non-empty lists; blacklist_out may itself be empty if
-    # no expert qualifies.
+    # Snapshot Phase C result before AIMER/sink-token extensions; used to tag
+    # provenance of each entry in the final blacklist (phase_c vs aimer vs sink).
+    _phase_c_pre_extensions = {
+        (li, e) for li, lst in blacklist.items() for e in lst
+    }
+
+    # ------------------------------------------------------------------
+    # Phase C+: AIMER weight-only auto-extension (D-aimer-cross-check)
+    # ------------------------------------------------------------------
+    aimer_scores: dict[tuple[int, int], float] = {}
+    aimer_extension: dict[int, list[int]] = {}
+    bottom_pct_by_layer: dict[int, list[int]] = {}
+    aimer_bottom_pct = float(se_cfg.get("aimer_bottom_pct", 0.01))
+    aimer_layer_max_fraction = float(se_cfg.get("aimer_layer_max_fraction", 0.1))
+    if bool(se_cfg.get("aimer_enabled", True)):
+        for ref in moe_layers:
+            for e in range(ref.num_routed_experts):
+                w_down = _get_expert_down_proj_weight(ref, e)
+                aimer_scores[(ref.layer_idx, e)] = aimer_score_tensor(w_down)
+        bottom_pct_by_layer = aimer_bottom_pct_per_layer(
+            aimer_scores, pct=aimer_bottom_pct,
+        )
+        # Per-layer max activation magnitude (used to gate AIMER extensions:
+        # only layers whose peak activation is above aimer_layer_max_fraction *
+        # global peak are eligible — focuses AIMER on activation-hot layers).
+        layer_expert_max: dict[int, float] = {}
+        for (li, _e), v in max_acc.per_expert_max.items():
+            layer_expert_max[li] = max(layer_expert_max.get(li, 0.0), v)
+        a_max_global = float(max(layer_expert_max.values())) if layer_expert_max else 0.0
+        blacklisted_set = {(int(li), e) for li, lst in blacklist.items() for e in lst}
+        for li, candidates in bottom_pct_by_layer.items():
+            if layer_expert_max.get(li, 0.0) <= aimer_layer_max_fraction * a_max_global:
+                continue
+            for e in candidates:
+                if (li, e) in blacklisted_set:
+                    continue
+                aimer_extension.setdefault(li, []).append(e)
+        for li, lst in aimer_extension.items():
+            for e in lst:
+                blacklist.setdefault(li, []).append(e)
+            blacklist[li] = sorted(set(blacklist[li]))
+        log.info(
+            "Stage 1 Phase C+: AIMER auto-extended blacklist with %d new (l,e) pairs across %d layers",
+            sum(len(v) for v in aimer_extension.values()), len(aimer_extension),
+        )
+
+    # ------------------------------------------------------------------
+    # Phase C+: Sink-token routing auto-extension (D-sink-token-routing)
+    # ------------------------------------------------------------------
+    sink_extension: dict[int, list[int]] = {}
+    sink_score_ratio = float(se_cfg.get("sink_token_score_ratio", 5.0))
+    sink_freq_threshold = float(se_cfg.get("sink_token_freq_threshold", 0.95))
+    if sink_acc is not None:
+        sink_extension = apply_sink_token_extension(
+            sink_acc.mean_router_score_sink,
+            sink_acc.mean_router_score_normal,
+            sink_acc.freq_on_sink,
+            existing_blacklist={int(k): list(v) for k, v in blacklist.items()},
+            score_ratio=sink_score_ratio,
+            freq_threshold=sink_freq_threshold,
+        )
+        for li, lst in sink_extension.items():
+            for e in lst:
+                blacklist.setdefault(li, []).append(e)
+            blacklist[li] = sorted(set(blacklist[li]))
+        log.info(
+            "Stage 1 Phase C+: sink-token auto-extended blacklist with %d new (l,e) pairs across %d layers",
+            sum(len(v) for v in sink_extension.values()), len(sink_extension),
+        )
+
+    # _apply_paper_criterion + auto-extensions only append non-empty lists; recompute
+    # blacklist_out AFTER extensions so it reflects the full Phase C + C+ output.
     blacklist_out = {str(li): sorted(es) for li, es in blacklist.items()}
     total_experts = sum(ref.num_routed_experts for ref in moe_layers)
+
+    # Provenance: tag each surviving (l, e) by its first-detected source so that
+    # downstream tooling (Phase F ablation, diagnostics) can stratify analyses.
+    provenance: dict[str, str] = {}
+    aimer_set = {(int(li), e) for li, lst in aimer_extension.items() for e in lst}
+    sink_set = {(int(li), e) for li, lst in sink_extension.items() for e in lst}
+    for li_str, exps in blacklist_out.items():
+        for e in exps:
+            key = f"L{li_str}E{e}"
+            if (int(li_str), e) in _phase_c_pre_extensions:
+                provenance[key] = "phase_c"
+            elif (int(li_str), e) in aimer_set:
+                provenance[key] = "aimer"
+            elif (int(li_str), e) in sink_set:
+                provenance[key] = "sink_token"
+            else:
+                provenance[key] = "unknown"
+
+    dual_signal = {
+        "residual_growth_per_layer": {
+            str(li): _safe_float_for_json(v) for li, v in residual_growth.items()
+        },
+        "moe_output_growth_per_layer": {
+            str(li): _safe_float_for_json(v) for li, v in moe_output_growth.items()
+        },
+        "moe_output_max_per_layer": {
+            str(li): _safe_float_for_json(v) for li, v in moe_output_max.items()
+        },
+    }
+    aimer_payload = {
+        "scores": {
+            f"L{li}E{e}": v for (li, e), v in aimer_scores.items()
+        },
+        "bottom_pct_per_layer": {
+            str(li): list(exps) for li, exps in bottom_pct_by_layer.items()
+        },
+        "auto_extended": {
+            str(li): list(exps) for li, exps in aimer_extension.items()
+        },
+    }
+    sink_payload = {
+        "mean_router_score_sink": (
+            {f"L{li}E{e}": v for (li, e), v in sink_acc.mean_router_score_sink.items()}
+            if sink_acc is not None else {}
+        ),
+        "mean_router_score_normal": (
+            {f"L{li}E{e}": v for (li, e), v in sink_acc.mean_router_score_normal.items()}
+            if sink_acc is not None else {}
+        ),
+        "freq_on_sink": (
+            {f"L{li}E{e}": v for (li, e), v in sink_acc.freq_on_sink.items()}
+            if sink_acc is not None else {}
+        ),
+        "auto_extended": {
+            str(li): list(exps) for li, exps in sink_extension.items()
+        },
+    }
 
     blacklist_config = {
         "a_max_fraction": a_max_fraction,
         "ma_ratio": ma_ratio,
         "ma_growth_ratio": ma_growth_ratio,
+        "moe_output_growth_ratio": moe_output_growth_ratio,
         "ma_formation_layers": sorted(L),
         "p995_threshold": float(p995),
         "a_max_absolute": float(a_max),
         "a_max_threshold": float(a_max_fraction * a_max),
+        "aimer_bottom_pct": aimer_bottom_pct,
+        "aimer_layer_max_fraction": aimer_layer_max_fraction,
+        "sink_token_score_ratio": sink_score_ratio,
+        "sink_token_freq_threshold": sink_freq_threshold,
     }
     blacklist_path = artifacts_dir / "stage1_blacklist.json"
     save_json_artifact(
@@ -253,6 +484,10 @@ def run(
                 for (layer_i, expert_i), v in max_acc.per_expert_max.items()
             },
             "config": blacklist_config,
+            "blacklist_provenance": provenance,
+            "dual_signal": dual_signal,
+            "aimer": aimer_payload,
+            "sink_token": sink_payload,
         },
         blacklist_path,
     )
@@ -396,6 +631,63 @@ def run(
         np.mean(list(budgets.values())), budgets_path,
     )
     return blacklist_path, budgets_path
+
+
+# ---------------------------------------------------------------------------
+# Phase C+ helpers: per-expert weight accessor (AIMER) + JSON sanitization
+# ---------------------------------------------------------------------------
+
+
+def _get_expert_down_proj_weight(ref, expert_idx: int) -> torch.Tensor:
+    """Return the down_proj weight tensor for a single expert in this MoE layer.
+
+    Supports both fused (FactoredExperts / Qwen3_5MoeExperts-style stacked
+    parameter) and per-expert module layouts. Used by the AIMER weight-only
+    score in Phase C+ where we need per-expert ``W_down``.
+    """
+    experts = ref.experts_module
+    # Per-expert layout (legacy ModuleList of nn.Modules with a .down_proj submodule).
+    if hasattr(experts, "__len__") and not isinstance(experts, torch.nn.Linear):
+        try:
+            return experts[expert_idx].down_proj.weight
+        except (TypeError, AttributeError, IndexError):
+            pass
+    # Fused layout: experts.down_proj is a stacked nn.Parameter
+    # of shape (num_experts, ...).
+    fused = getattr(experts, "down_proj", None)
+    if fused is not None:
+        if isinstance(fused, (torch.nn.Parameter, torch.Tensor)):
+            if fused.shape[0] == ref.num_routed_experts:
+                return fused[expert_idx]
+        elif hasattr(fused, "weight"):
+            w = fused.weight
+            if w.shape[0] == ref.num_routed_experts:
+                return w[expert_idx]
+    # FactoredExperts layout: down_proj is decomposed into U @ V.
+    # Reconstruct the effective down_proj weight as U @ V (shape (d_hid, d_int)).
+    u = getattr(experts, "down_proj_U", None)
+    v = getattr(experts, "down_proj_V", None)
+    if (u is not None and v is not None
+            and isinstance(u, (torch.nn.Parameter, torch.Tensor))
+            and isinstance(v, (torch.nn.Parameter, torch.Tensor))):
+        return u[expert_idx] @ v[expert_idx]
+    # Last-resort: ref.down_proj_weight(expert_idx) if such an accessor exists.
+    accessor = getattr(experts, "down_proj_weight", None)
+    if callable(accessor):
+        return accessor(expert_idx)
+    raise AttributeError(
+        f"Could not locate down_proj weight for expert {expert_idx} in layer {ref.layer_idx}; "
+        f"experts_module type: {type(experts).__name__}"
+    )
+
+
+def _safe_float_for_json(v: float):
+    """JSON-safe float: replace NaN with None (json.dump's allow_nan=True
+    serializes NaN as the literal `NaN`, which is not strict JSON; downstream
+    readers — diagnostic scripts, dashboards — should not rely on lenient
+    parsers, so we prefer null).
+    """
+    return None if (v != v) else float(v)
 
 
 # ---------------------------------------------------------------------------
