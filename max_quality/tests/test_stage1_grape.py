@@ -354,3 +354,23 @@ def test_phase_c_candidate_set_union():
     assert candidates[(0, 3)] == ["sink_token"]
     # No spurious entries beyond these four.
     assert set(candidates.keys()) == {(0, 7), (0, 5), (0, 8), (0, 3)}
+
+
+def test_magnitude_topk_candidates():
+    """_magnitude_topk_candidates picks top-K experts by per_expert_max within l ∈ L only."""
+    per_expert_max = {
+        (5, 0): 1.0, (5, 1): 9.0, (5, 2): 5.0, (5, 3): 8.0, (5, 4): 7.0, (5, 5): 2.0,
+        (9, 0): 100.0,   # layer 9 is not in L → must be ignored
+    }
+    L = {5}
+    out = stage1_grape._magnitude_topk_candidates(per_expert_max, L, top_k=3)
+    # Top-3 in layer 5 by magnitude: experts 1 (9.0), 3 (8.0), 4 (7.0).
+    assert out == {(5, 1), (5, 3), (5, 4)}
+
+
+def test_magnitude_topk_candidates_empty_inputs():
+    """Edge cases: top_k=0, empty L, empty per_expert_max all return empty set."""
+    per_expert_max = {(5, 0): 1.0, (5, 1): 2.0}
+    assert stage1_grape._magnitude_topk_candidates(per_expert_max, L={5}, top_k=0) == set()
+    assert stage1_grape._magnitude_topk_candidates(per_expert_max, L=set(), top_k=5) == set()
+    assert stage1_grape._magnitude_topk_candidates({}, L={5}, top_k=5) == set()
