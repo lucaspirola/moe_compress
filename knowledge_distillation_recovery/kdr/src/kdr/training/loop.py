@@ -35,6 +35,10 @@ from accelerate import Accelerator
 from transformers import PreTrainedTokenizerBase
 
 from ..adapters.base import ModelAdapter
+from ..adapters.router_replay import (
+    NoOpReplayContextManager,
+    RouterReplayHookProtocol,
+)
 from ..config import Config
 from ..eval.quick import run as eval_run
 from ..io.save import SAVE_COMPLETE_SENTINEL, save_kdr_artifact, save_partial
@@ -137,18 +141,38 @@ def run_recovery(
             gc_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     # ── Stage 5: run the FKLD loop ────────────────────────────────────────
-    _LoopState(
-        config=config,
-        accelerator=accelerator,
-        artifacts_dir=artifacts_dir,
-        teacher=teacher,
-        student=student,
-        tokenizer=tokenizer,
-        optim=optim,
-        batches=batches,
-        resume_step=resume_step,
-        source_metadata_path=source_metadata_path,
-    ).run()
+    # Router-replay hook (LLR-0025) — pinned ON for da_qad mode so the
+    # student's MoE expert assignments match the teacher's despite precision
+    # drift. For bf16 we use a no-op hook (zero overhead) so the loop's
+    # microbatch step stays polymorphic — preserves LLR-0007 AC #1's
+    # single-mode-branch invariant by gating on `active_backends` rather
+    # than re-checking config.mode.
+    replay_hook: RouterReplayHookProtocol
+    if active_backends:
+        # Walk the unwrapped student so the hook addresses raw module objects
+        # (DDP / DeepSpeed wrappers don't change the inner module identity,
+        # but `accelerator.unwrap_model` keeps the named_modules paths
+        # consistent with `attention_module_paths`).
+        replay_hook = adapter.router_replay_hook(
+            teacher, accelerator.unwrap_model(student)
+        )
+    else:
+        replay_hook = NoOpReplayContextManager()
+
+    with replay_hook:
+        _LoopState(
+            config=config,
+            accelerator=accelerator,
+            artifacts_dir=artifacts_dir,
+            teacher=teacher,
+            student=student,
+            tokenizer=tokenizer,
+            optim=optim,
+            batches=batches,
+            resume_step=resume_step,
+            source_metadata_path=source_metadata_path,
+            replay_hook=replay_hook,
+        ).run()
 
     # ── Stage 6: final save ───────────────────────────────────────────────
     # Branching on `active_backends` (rather than re-checking the mode flag)
@@ -237,11 +261,15 @@ class _LoopState:
         batches: Iterable[torch.Tensor],
         resume_step: int,
         source_metadata_path: Path | None,
+        replay_hook: RouterReplayHookProtocol,
     ) -> None:
         self.config = config
         self.dconf = config.distillation
         self.accelerator = accelerator
         self.artifacts_dir = artifacts_dir
+        # `replay_hook` is the LLR-0025 router-replay context manager
+        # (already entered by the caller). NoOp instance for bf16 mode.
+        self._replay_hook: RouterReplayHookProtocol = replay_hook
         self.teacher = teacher
         self.student = student
         self.tokenizer = tokenizer
@@ -372,6 +400,11 @@ class _LoopState:
     def _step_one_micro(self, batch: torch.Tensor) -> None:
         """Forward teacher+student, compute loss, accumulate / step."""
         ids = batch.to(self.accelerator.device, non_blocking=True)
+        # REQ: LLR-0025
+        # Reset router-replay state at the top of every microbatch so the
+        # teacher's freshly-captured assignments drive THIS microbatch's
+        # student forward (and not a stale capture from the previous one).
+        self._replay_hook.start_microbatch()
         with torch.no_grad():
             t_logits = self.teacher(input_ids=ids).logits
         s_logits = self.student(input_ids=ids).logits

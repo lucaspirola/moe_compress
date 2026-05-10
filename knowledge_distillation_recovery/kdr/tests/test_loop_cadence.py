@@ -118,6 +118,8 @@ def test_real_loop_state_eval_fires_5_times_in_50_step_run() -> None:
     student = nn.Linear(4, 4)
     optim = torch.optim.SGD(student.parameters(), lr=1e-4)
 
+    from kdr.adapters.router_replay import NoOpReplayContextManager
+
     state = _LoopState(
         config=config,
         accelerator=accel,
@@ -129,6 +131,7 @@ def test_real_loop_state_eval_fires_5_times_in_50_step_run() -> None:
         batches=[],
         resume_step=0,
         source_metadata_path=None,
+        replay_hook=NoOpReplayContextManager(),
     )
 
     eval_calls: list[int] = []

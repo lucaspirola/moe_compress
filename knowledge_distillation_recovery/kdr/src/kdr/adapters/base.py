@@ -19,6 +19,7 @@ from accelerate import Accelerator
 from transformers import PreTrainedTokenizerBase
 
 from ..config import StudentConfig, TeacherConfig
+from .router_replay import RouterReplayHookProtocol
 
 
 # REQ: LLR-0022
@@ -89,12 +90,15 @@ class ModelAdapter(Protocol):
         """
         ...
 
-    def router_replay_hook(self, teacher: nn.Module, student: nn.Module) -> object:
+    def router_replay_hook(
+        self, teacher: nn.Module, student: nn.Module
+    ) -> RouterReplayHookProtocol:
         """Hook context that pins the student's MoE expert assignments to
         those produced by the teacher on the same input batch.
 
         Critical for MoE QAD stability per arxiv:2605.05365 §IV-C ("the
         single most important MoE-specific change"). For non-MoE models
-        this returns a no-op context manager.
+        this returns a :class:`NoOpReplayContextManager` so the training
+        loop's call sites stay polymorphic.
         """
         ...
