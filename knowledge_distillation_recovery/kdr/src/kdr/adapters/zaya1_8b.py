@@ -132,28 +132,38 @@ class Zaya1Adapter:
         return teacher, student, tokenizer
 
     @staticmethod
-    def _patch_zaya_router_per_layer_mlp_expansion() -> None:
-        """Workaround for upstream `Zyphra/transformers@zaya1` bug.
+    def _patch_zaya_router_mlp_expansion_list() -> None:
+        """Workaround for upstream `Zyphra/transformers@zaya1` config-vs-code mismatch.
 
         `Zyphra/ZAYA1-reasoning-base/config.json` ships `zaya_mlp_expansion`
-        as a per-layer list (e.g. ``[0, 256, 0, 256, ...]``), but the fork's
-        ``ZayaRouter.__init__`` calls ``int(mlp_expansion)`` on the value
-        as if it were scalar, raising ``TypeError: int() argument must be a
-        string, a bytes-like object or a real number, not 'list'`` at model
-        load time.
+        as a list (e.g. ``[0, 256, 0, 256, ...]`` of length 80), but the
+        fork's `ZayaModel.__init__` passes the WHOLE list down through
+        `ZayaDecoderMLPLayer` → `ZayaBlock` → `ZayaRouter` without indexing
+        it (verified against zaya1-branch source). `ZayaRouter.__init__`
+        then does `self.mlp_expansion = int(mlp_expansion)` and raises
+        `TypeError: int() argument must be a string, a bytes-like object
+        or a real number, not 'list'`.
 
-        We patch ``ZayaRouter.__init__`` to index the list by ``layer_number``
-        when given a list/tuple. Idempotent (sentinel attribute), and silently
-        no-ops when the Zyphra fork isn't installed (e.g. in the local kdr
-        venv, where stock transformers is on path and the unit tests don't
-        exercise model load).
+        Every router in the model gets the same list. Routers are only
+        instantiated for MoE layers (odd `layer_n`); for those, the
+        appropriate `mlp_expansion` is the UNIQUE NONZERO value in the
+        list. (For ZAYA1-reasoning-base: 256.) Indexing by `layer_n`
+        would also work for layers in range, but the list (length 80) is
+        shorter than `num_hidden_layers` (120), so layer_n>=80 gets
+        IndexError — the homogeneous-nonzero approach handles all 60 MoE
+        layers uniformly.
+
+        Idempotent (sentinel attribute), no-ops when the Zyphra fork isn't
+        installed (e.g. local kdr venv with stock transformers). For
+        heterogeneous-nonzero configs (none seen in the wild yet), the
+        patch falls back to `layer_number` indexing with a bounds check.
         """
         try:
             import transformers.models.zaya.modeling_zaya as _zaya_mod
         except ImportError:
             return
         cls = _zaya_mod.ZayaRouter
-        if getattr(cls, "_kdr_patched_per_layer_mlp_expansion", False):
+        if getattr(cls, "_kdr_patched_mlp_expansion_list", False):
             return
         _orig = cls.__init__
 
@@ -168,8 +178,24 @@ class Zaya1Adapter:
             layer_number: int | None = None,
         ) -> None:
             if isinstance(mlp_expansion, (list, tuple)):
-                ln = layer_number if layer_number is not None else 0
-                mlp_expansion = mlp_expansion[ln]
+                unique_nonzero = {v for v in mlp_expansion if v}
+                if len(unique_nonzero) == 1:
+                    mlp_expansion = unique_nonzero.pop()
+                elif len(unique_nonzero) > 1:
+                    ln = layer_number if layer_number is not None else 0
+                    if 0 <= ln < len(mlp_expansion) and mlp_expansion[ln]:
+                        mlp_expansion = mlp_expansion[ln]
+                    else:
+                        raise ValueError(
+                            f"ZayaRouter: cannot resolve mlp_expansion at "
+                            f"layer_number={ln} from heterogeneous list of "
+                            f"length {len(mlp_expansion)}"
+                        )
+                else:
+                    raise ValueError(
+                        "ZayaRouter: zaya_mlp_expansion list is all zeros; "
+                        "router should not be instantiated"
+                    )
             _orig(
                 self, config, layer_n, num_moe_experts, moe_router_topk,
                 mlp_expansion, hidden_size=hidden_size,
@@ -177,7 +203,7 @@ class Zaya1Adapter:
             )
 
         cls.__init__ = _patched
-        cls._kdr_patched_per_layer_mlp_expansion = True
+        cls._kdr_patched_mlp_expansion_list = True
 
     @staticmethod
     def _load_one(
@@ -197,8 +223,8 @@ class Zaya1Adapter:
         unused; when stock transformers is installed, the flag triggers
         loading from the repo's modeling code.
         """
-        # Apply the per-layer mlp_expansion patch before any model load.
-        Zaya1Adapter._patch_zaya_router_per_layer_mlp_expansion()
+        # Apply the mlp_expansion-list patch before any model load.
+        Zaya1Adapter._patch_zaya_router_mlp_expansion_list()
         log.info(
             "Loading %s %s (dtype=%s, attn=%s, revision=%s)",
             role,
