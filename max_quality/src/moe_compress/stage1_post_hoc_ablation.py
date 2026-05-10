@@ -1,19 +1,20 @@
-"""Phase F — post-hoc causal-ablation validation of the Stage 1 SE blacklist.
+"""Phase D — Ablation Filter (load-bearing) for Stage 1 SE blacklist construction.
 
-After Phase A/B/C/C+ produces the final blacklist, this module measures the
-NLL impact (mean per-token cross-entropy) of ablating (zeroing the down_proj
-output of) each blacklisted expert AND the top-K non-blacklisted experts in
-each MA-formation layer. The report is written to
-``stage1_post_hoc_ablation.json`` and is REPORT-ONLY — no automatic blacklist
-mutation.
+Phase C produces a *candidate* set by union of four detectors (three-way AND,
+AIMER, sink-token routing, magnitude top-K). This module ablates every candidate
+on a held-out calibration slice and keeps only those whose ΔNLL exceeds
+``ablation_filter_threshold`` — that becomes the final blacklist written to
+``stage1_blacklist.json``. Per-candidate ΔNLL (kept and rejected alike) is
+retained in ``stage1_ablation_filter.json`` for audit.
 
-Reviewer (max_quality/docs/stage1_review_10.05.2026.txt §Q4): "Ablate each
-blacklisted expert AND the top-5 non-blacklisted experts (by per_expert_max)
-in L34/L38 to confirm no critical experts were missed."
+This was Phase F (report-only post-hoc validation) in v5; v6 promotes it to the
+authoritative final filter because v4's static-threshold blacklist contained
+~91% dead-weight (158 entries → 5 with measurable ΔNLL). See
+``ALGORITHM_REFERENCE.md`` §4 Phase D and §12 D-causal-ablation-validation.
 
-Cost (Qwen3.6-35B-A3B, H200): ~(|blacklist| + |L|·top_k) forward passes over
-a small held-out slice. With |L|=3, |blacklist|≈10, top_k=5 → ~25 forwards
-≈ 30 minutes.
+The legacy ``run_phase_f`` entry point is kept as a deprecated compatibility
+shim for callers that still pass a fixed blacklist; new code should call
+``run_ablation_filter`` with the candidate dict from Phase C.
 
 Ablation semantics
 ------------------
@@ -28,6 +29,7 @@ the wrapped forward consume — see ``activation_hooks.py`` lines 1099-1103
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 
 import torch
@@ -98,7 +100,20 @@ def run_phase_f(
     *,
     device=None,
 ) -> Path:
-    """Run Phase F and write ``stage1_post_hoc_ablation.json``."""
+    """Deprecated v5 entry point — write the old post-hoc ablation report.
+
+    v6 promotes ablation from report to filter: prefer :func:`run_ablation_filter`
+    on the Phase C candidate set. This function is retained for callers that
+    still want the legacy ``stage1_post_hoc_ablation.json`` report (blacklist
+    ΔNLL + top-K non-blacklisted ΔNLL).
+    """
+    warnings.warn(
+        "run_phase_f is deprecated; v6 uses run_ablation_filter on the Phase C "
+        "candidate set as the load-bearing final filter. See ALGORITHM_REFERENCE.md "
+        "§4 Phase D and §12 D-causal-ablation-validation.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     s1 = config["stage1_grape"]
     cal = config["calibration"]
     pf = s1.get("post_hoc_ablation", {})
@@ -164,4 +179,135 @@ def run_phase_f(
     log.info("Stage 1 Phase F: wrote %d ablation results to %s",
              len(impacts["blacklisted"]) + len(impacts["top_nonblacklisted"]),
              out_path)
+    return out_path
+
+
+def _apply_threshold_filter(
+    deltas: dict[tuple[int, int], float],
+    threshold: float,
+) -> dict[int, list[int]]:
+    """Keep candidates whose ΔNLL > threshold; group by layer with sorted expert ids."""
+    bl: dict[int, list[int]] = {}
+    for (li, e), d in deltas.items():
+        if d > threshold:
+            bl.setdefault(int(li), []).append(int(e))
+    for li in bl:
+        bl[li] = sorted(bl[li])
+    return bl
+
+
+def run_ablation_filter(
+    model,
+    tokenizer,
+    config: dict,
+    artifacts_dir: Path,
+    candidates: dict[tuple[int, int], list[str]],
+    *,
+    device=None,
+) -> tuple[dict[int, list[int]], dict[tuple[int, int], float], float]:
+    """Phase D — ablate every Phase C candidate; return validated blacklist + per-candidate ΔNLL.
+
+    Parameters
+    ----------
+    candidates: ``{(layer_idx, expert_idx): [provenance_tags...]}``
+        Phase C output. Provenance is ignored by the filter itself but is
+        carried through to the artifact for audit.
+
+    Returns
+    -------
+    blacklist: ``{layer_idx: sorted_expert_ids}``
+        The validated final blacklist (ΔNLL > ``ablation_filter_threshold``).
+    per_candidate_dnll: ``{(layer_idx, expert_idx): ΔNLL}``
+        ΔNLL for every candidate (kept and rejected alike).
+    baseline_nll: float
+        Held-out NLL with no ablation.
+
+    Reads ``config["stage1_grape"]["ablation_filter"]``:
+      enabled (default True), holdout_samples (default 100),
+      blacklist_threshold (default 0.001), batch_size (default 32).
+    """
+    s1 = config["stage1_grape"]
+    af = s1.get("ablation_filter", {})
+    if not bool(af.get("enabled", True)):
+        log.info(
+            "Stage 1 Phase D: ablation_filter disabled; falling back to candidate set as blacklist"
+        )
+        bl: dict[int, list[int]] = {}
+        for (li, e), _ in candidates.items():
+            bl.setdefault(int(li), []).append(int(e))
+        for li in bl:
+            bl[li] = sorted(bl[li])
+        return bl, {}, 0.0
+
+    holdout_samples = int(af.get("holdout_samples", 100))
+    threshold = float(af.get("blacklist_threshold", 0.001))
+    batch_size = int(af.get("batch_size", 32))
+
+    spec = spec_from_config(
+        config["calibration"], num_sequences_override=holdout_samples, seed_offset=999
+    )
+    calib = build_calibration_tensor(
+        tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache_phase_d",
+    )
+    eval_batches = iter_batches(calib, batch_size=batch_size)
+
+    moe_layers = {ref.layer_idx: ref for ref in iter_moe_layers(model)}
+    baseline_nll = _measure_corpus_nll(model, eval_batches, device)
+    log.info(
+        "Stage 1 Phase D: baseline mean NLL = %.4f over %d candidates",
+        baseline_nll, len(candidates),
+    )
+
+    deltas: dict[tuple[int, int], float] = {}
+    for (li, e), _provenance in candidates.items():
+        ref = moe_layers.get(int(li))
+        if ref is None:
+            log.warning(
+                "Phase D: layer %d not found in moe_layers; skipping (l=%d, e=%d)", li, li, e
+            )
+            continue
+        with _ablate_expert_context(ref, int(e)):
+            nll = _measure_corpus_nll(model, eval_batches, device)
+        deltas[(int(li), int(e))] = nll - baseline_nll
+
+    blacklist = _apply_threshold_filter(deltas, threshold)
+    log.info(
+        "Stage 1 Phase D: ablation-filter kept %d / %d candidates (threshold=%.4f)",
+        sum(len(v) for v in blacklist.values()), len(deltas), threshold,
+    )
+    return blacklist, deltas, baseline_nll
+
+
+def _write_ablation_filter_artifact(
+    artifacts_dir: Path,
+    *,
+    candidates: dict[tuple[int, int], list[str]],
+    deltas: dict[tuple[int, int], float],
+    baseline_nll: float,
+    threshold: float,
+    blacklist: dict[int, list[int]],
+    config_dict: dict,
+) -> Path:
+    """Write ``stage1_ablation_filter.json`` per the v6 schema (see ALGORITHM_REFERENCE.md §4)."""
+    blacklisted_pairs = {(li, e) for li, exps in blacklist.items() for e in exps}
+    candidates_payload: dict[str, dict] = {}
+    for (li, e), provenance in candidates.items():
+        key = f"L{li}E{e}"
+        delta = deltas.get((int(li), int(e)))
+        candidates_payload[key] = {
+            "delta_nll": float(delta) if delta is not None else None,
+            "provenance": list(provenance),
+            "passed_filter": (int(li), int(e)) in blacklisted_pairs,
+        }
+
+    payload = {
+        "baseline_mean_nll": float(baseline_nll),
+        "ablation_filter_threshold": float(threshold),
+        "candidate_count": len(candidates),
+        "blacklist_count": sum(len(v) for v in blacklist.values()),
+        "candidates": candidates_payload,
+        "config": dict(config_dict),
+    }
+    out_path = artifacts_dir / "stage1_ablation_filter.json"
+    save_json_artifact(payload, out_path)
     return out_path
