@@ -77,6 +77,12 @@ _MA_RATIO = 100.0                     # max / Q99 threshold — first MoE layer 
 _MA_GROWTH_RATIO = 3.0                # was 5.0; calibrated for Qwen3.5/3.6 attn_output_gate=true
 _MOE_OUTPUT_GROWTH_RATIO = 2.0        # ungated MoE-block-output secondary signal (OR with residual)
 _PHASE_A_BATCH_SIZE = 4               # Phase A only tracks max magnitudes — batch-size invariant
+_PHASE_B_BATCH_SIZE = 8               # Phase B accumulators (max, reservoir, sink-token) all handle
+                                      # arbitrary B; the live H200 run at bs=1 used 94.6/150.8 GB
+                                      # VRAM (37% free, ~25 GB non-model state). At bs=8 the
+                                      # activation portion scales ~8× while reservoirs are
+                                      # batch-invariant — projected total ~120-130 GB, leaving
+                                      # ~20-30 GB headroom. Cuts Phase B forward count 8×.
 _CKA_EPSILON = 1e-12                  # numerical floor for HSIC denominators
 _SIMILARITY_METRIC_DEFAULT = "cka"
 
@@ -222,7 +228,12 @@ def run(
     # Phase B: Expert Magnitude + CKA (Pass 2)
     # ------------------------------------------------------------------
     # iter_batches returns a list; reuse the same list for Phase B.
-    batches = iter_batches(calib, batch_size=1)
+    # All Phase B accumulators (DownProjMaxAccumulator, ExpertOutputAccumulator
+    # reservoir sampling, SinkTokenRoutingAccumulator vectorized reduction)
+    # handle arbitrary B — the prior bs=1 was inherited from a single-token
+    # routing instrumentation that no longer exists.
+    phase_b_batch_size = int(s1.get("phase_b_batch_size", _PHASE_B_BATCH_SIZE))
+    batches = iter_batches(calib, batch_size=phase_b_batch_size)
     n_phase_b_batches = len(batches)
 
     log.info(

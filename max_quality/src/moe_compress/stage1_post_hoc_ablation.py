@@ -108,13 +108,20 @@ def run_phase_f(
 
     holdout_samples = int(pf.get("holdout_samples", 100))
     top_k = int(pf.get("topk_nonblacklisted", 5))
+    # The ablation forward pass is forward-only with a single per-expert hook;
+    # the held-out NLL is invariant to batch size as long as token coverage is
+    # complete. bs=8 cuts the per-ablation batch count from 100 to 13. The
+    # Phase B accumulators (max_acc, output_acc) remain resident in run()'s
+    # scope during Phase F, so the memory budget is the same as Phase B's
+    # ~120-130 GB at bs=8 — still ~20-30 GB headroom on the 150.8 GB H200.
+    batch_size = int(pf.get("batch_size", 8))
 
     # Held-out slice: deterministic seed offset distinct from Phase A/B
     spec = spec_from_config(cal, num_sequences_override=holdout_samples, seed_offset=999)
     calib = build_calibration_tensor(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache_phase_f",
     )
-    eval_batches = iter_batches(calib, batch_size=1)
+    eval_batches = iter_batches(calib, batch_size=batch_size)
 
     moe_layers = {ref.layer_idx: ref for ref in iter_moe_layers(model)}
 
