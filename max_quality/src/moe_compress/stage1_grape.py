@@ -165,6 +165,10 @@ def run(
         "Stage 1 Phase A: detecting MA-formation layers over %d samples (%d MoE layers)",
         n_batches, len(moe_layers),
     )
+
+    # residual_growth / moe_output_growth / moe_output_max are consumed in Task 7
+    # (written to blacklist artifact as the `dual_signal` block); bound here as
+    # placeholders so the function-return contract stays stable across tasks.
     L, residual_growth, moe_output_growth, moe_output_max = _detect_ma_layers(
         model, batches, moe_layers, device,
         ma_ratio=ma_ratio,
@@ -178,11 +182,12 @@ def run(
     # ------------------------------------------------------------------
     # iter_batches returns a list; reuse the same list for Phase B.
     batches = iter_batches(calib, batch_size=1)
+    n_phase_b_batches = len(batches)
 
     log.info(
         "Stage 1 Phase B: profiling %d layers × up to %d experts on %d samples "
         "(magnitude for L=%s, CKA for all layers)",
-        len(moe_layers), n_per_layer, n_batches, sorted(L),
+        len(moe_layers), n_per_layer, n_phase_b_batches, sorted(L),
     )
 
     max_acc = DownProjMaxAccumulator()
