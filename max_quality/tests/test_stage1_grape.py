@@ -98,6 +98,29 @@ def test_three_way_AND_criterion():
     assert bl == {5: [7]}
 
 
+def test_phase_a_dual_signal_or_rule():
+    """Phase A flags layer if EITHER residual OR MoE-output growth exceeds threshold."""
+    from moe_compress.stage1_grape import _flag_layer_dual_signal
+
+    # Layer 5: residual growth = 2.5 (below 3.0) but MoE growth = 2.5 (above 2.0) → flag
+    assert _flag_layer_dual_signal(
+        residual_ratio=2.5, moe_ratio=2.5,
+        residual_threshold=3.0, moe_threshold=2.0,
+    ) is True
+
+    # Layer 6: residual growth = 4.0 (above 3.0), MoE growth below threshold → flag
+    assert _flag_layer_dual_signal(
+        residual_ratio=4.0, moe_ratio=1.5,
+        residual_threshold=3.0, moe_threshold=2.0,
+    ) is True
+
+    # Layer 7: below both thresholds → don't flag
+    assert _flag_layer_dual_signal(
+        residual_ratio=2.5, moe_ratio=1.5,
+        residual_threshold=3.0, moe_threshold=2.0,
+    ) is False
+
+
 def test_ma_formation_fallback_when_dynamic_empty(tiny_model, tiny_config, tmp_path, monkeypatch):
     """If the dynamic detector finds nothing, the 0.75-depth fallback must populate L
     with the first-75% of MoE layer indices."""
@@ -111,9 +134,11 @@ def test_ma_formation_fallback_when_dynamic_empty(tiny_model, tiny_config, tmp_p
         # Force impossible thresholds so dynamic detector returns ∅.
         kwargs["ma_ratio"] = 1.0e30
         kwargs["ma_growth_ratio"] = 1.0e30
-        L = real_detect(model, batches, moe_layers, device, **kwargs)
+        kwargs["moe_output_growth_ratio"] = 1.0e30
+        result = real_detect(model, batches, moe_layers, device, **kwargs)
+        L = result[0]
         captured["L"] = set(L)
-        return L
+        return result
 
     monkeypatch.setattr(stage1_grape, "_detect_ma_layers", _spy)
 
