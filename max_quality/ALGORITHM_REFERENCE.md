@@ -1111,6 +1111,7 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 | 2603.02217 | Router Knowledge Distillation for MoE Compression | 2026 | Stage 5 |
 | 2508.03616 | Hidden Dynamics of Massive Activations in Transformer Training | 2025 | Stage 1 §4 Phase A L31 reset rationale |
 | 2603.17771 | Attention Sinks Induce Gradient Sinks | 2026 | Stage 1 §4 Phase A gated-architecture rationale |
+| 2603.18492 | AIMER: Activation-Independent Magnitude-Energy Ratio for Expert Pruning | 2026 | Stage 1 §4 Phase D AIMER auto-extension (D-aimer-cross-check), §4 Phase A calibration-sensitivity discussion |
 
 ---
 
