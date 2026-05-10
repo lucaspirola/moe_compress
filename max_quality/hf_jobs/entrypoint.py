@@ -117,8 +117,15 @@ def _main() -> int:
     LOG.info("HF_HOME=%s", hf_home)
 
     # 1. Download our code repo into the mounted bucket.
+    # The pirola/moe-compress dataset stores the project under max_quality/.
+    # We support both layouts (top-level src/ and max_quality/src/) so older
+    # code repos with src/ at root continue to work.
     _download_code(CODE_REPO, code_dir)
-    sys.path.insert(0, str(code_dir / "src"))
+    if (code_dir / "max_quality" / "src").is_dir():
+        code_root = code_dir / "max_quality"
+    else:
+        code_root = code_dir
+    sys.path.insert(0, str(code_root / "src"))
 
     # 2. Prime the model snapshot (idempotent — ``hf_hub_download``/``snapshot``
     #    short-circuits on cache hit, and the cache lives in the bucket).
@@ -182,7 +189,7 @@ def _main() -> int:
         # Import after sys.path manipulation.
         from moe_compress.run_pipeline import main as run_pipeline_main
         argv = [
-            "--config", str(code_dir / CONFIG_PATH),
+            "--config", str(code_root / CONFIG_PATH),
             "--model", MODEL_REPO,
             "--artifacts-dir", str(artifacts_dir),
             "--target-ratio", str(TARGET_RATIO),
@@ -378,8 +385,16 @@ def _download_code(repo_id: str, dest: Path) -> None:
         repo_id,
         repo_type="dataset",
         local_dir=dest,
-        allow_patterns=["*.py", "*.yaml", "*.yml", "*.txt", "*.md",
-                        "configs/*", "src/**/*", "hf_jobs/*"],
+        allow_patterns=[
+            # Top-level layout (legacy pirola/moe-compress-code)
+            "*.py", "*.yaml", "*.yml", "*.txt", "*.md",
+            "configs/*", "src/**/*", "hf_jobs/*",
+            # Nested layout (current pirola/moe-compress dataset)
+            "max_quality/**/*.py", "max_quality/**/*.yaml",
+            "max_quality/**/*.yml", "max_quality/**/*.txt", "max_quality/**/*.md",
+            "max_quality/configs/*", "max_quality/src/**/*", "max_quality/hf_jobs/*",
+            "max_quality/scripts/*",
+        ],
     )
 
 
