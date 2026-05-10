@@ -220,15 +220,15 @@ def _build_calibration_batches(
             "with pre-built `batches` directly)."
         ) from err
 
-    # Resolve calibration cache under artifacts_dir below the CLI; we
-    # re-use an artifacts-local cache so two runs from the same YAML can
-    # share the (deterministic) tokenized tensor.
-    cache_dir: Any = None  # moe_compress decides default
+    # Calibration cache is decided by moe_compress (default
+    # ./artifacts/_calibration_cache, CWD-relative). Rely on the API's
+    # default — its signature types `cache_dir: str | Path` and would
+    # TypeError on None.
     spec = spec_from_config(
         config.calibration.model_dump(), seed_offset=7
     )
     tokenizer = _load_tokenizer_for_calibration(config)
-    calib = build_calibration_tensor(tokenizer, spec, cache_dir=cache_dir)
+    calib = build_calibration_tensor(tokenizer, spec)
     batches: list[torch.Tensor] = list(
         iter_batches(calib, batch_size=config.distillation.per_device_batch_size)
     )
