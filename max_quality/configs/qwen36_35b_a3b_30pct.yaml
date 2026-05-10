@@ -54,6 +54,12 @@ stage1_grape:
                                   # max_quality/docs/stage1_review_10.05.2026.txt §Q6).
   phase_a_batch_size: 4           # Phase A only tracks max magnitudes (batch-size invariant).
                                   # Cuts Phase A walltime by ~4× vs batch_size=1.
+  phase_b_batch_size: 8           # Phase B accumulators (max, CKA reservoir, sink-token vectorized
+                                  # reduction) all handle arbitrary B. Live H200 run at bs=1 used
+                                  # 94.6/150.8 GB VRAM (37% free, ~25 GB non-model state). At bs=8
+                                  # activations scale ~8× while reservoirs are batch-invariant —
+                                  # projected ~120-130 GB total, ~20-30 GB headroom.
+                                  # Cuts Phase B forward-pass count from 1024 to 128.
   super_expert_detection:
     # Phase A dual-signal MA-formation detector — see ALGORITHM_REFERENCE.md §4 Phase A.
     # The OR rule flags a layer if EITHER signal exceeds its threshold.
@@ -84,6 +90,9 @@ stage1_grape:
     enabled: true
     holdout_samples: 100          # held-out from calibration; deterministic seed offset
     topk_nonblacklisted: 5        # per l ∈ L, ablate top-5 non-blacklisted by per_expert_max
+    batch_size: 8                 # Each ablation forwards over the holdout slice; bs=8 cuts the
+                                  # per-ablation batch count from 100 to 13 with the same VRAM
+                                  # budget as Phase B (the run-scoped accumulators stay resident).
 
   # Phase D/E (unchanged)
   similarity_metric: cka
