@@ -297,7 +297,7 @@ After Phase C and the AIMER + sink-token auto-extensions converge, Stage 1 runs 
 1. **Validation set**: a held-out 100-sample slice of the calibration data not used for Phase A/B (seeded subset, deterministic).
 2. **Baseline**: forward pass over the validation set; record token-level NLL (mean cross-entropy per shifted token).
 3. **For each blacklisted expert `(l, e)`**: zero its `down_proj` output during the forward pass (single-expert ablation hook); record ΔNLL relative to baseline.
-4. **For top-`ablation_topk_nonblacklisted` (default 5) non-blacklisted experts per `l ∈ L`** (sorted by `per_expert_max(l, ·)` descending, excluding already-blacklisted): run the same single-expert ablation; record ΔNLL.
+4. **For top-`topk_nonblacklisted` (default 5) non-blacklisted experts per `l ∈ L`** (sorted by `per_expert_max(l, ·)` descending, excluding already-blacklisted): run the same single-expert ablation; record ΔNLL.
 5. **Report**: emit `stage1_post_hoc_ablation.json` with `{ablated_id: ΔNLL}` for both groups. **No automatic blacklist mutation** — the operator inspects the report and decides whether the ΔNLL gradient indicates a missed SE.
 
 Cost (Qwen3.6-35B-A3B, H200): ~`(|blacklist| + |L| · 5)` forward passes × `(100 sample / 2048 token)` batches. With `|L|=3`, `|blacklist|≈10`, this is ~25 forward passes ≈ 30 minutes — small relative to Stage 1's calibration cost. The reviewer's framing: "as a validation step on your Stage 1 output ... after your Phase C produces a blacklist, ablate each blacklisted expert AND the top-5 non-blacklisted experts (by per_expert_max) in L34/L38 to confirm no critical experts were missed."
