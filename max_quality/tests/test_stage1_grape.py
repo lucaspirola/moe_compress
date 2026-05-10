@@ -59,9 +59,9 @@ def test_highly_redundant_layer_gets_smaller_budget(tiny_model, tiny_config, tmp
 def test_blacklist_schema_seven_top_level_keys(tiny_model, tiny_config, tmp_path):
     """stage1_blacklist.json must have exactly the 7 documented top-level keys.
 
-    Locks the post-Task-7 schema (Phase C base + Phase C+ AIMER + sink-token +
-    dual-signal + provenance). Renamed from `_three_top_level_keys` when the
-    schema was extended.
+    Locks the v6 schema (blacklist is ablation-validated; aimer/sink_token blocks
+    expose `candidates` not `auto_extended`; blacklist_provenance is a list per
+    entry). Top-level key set unchanged from v5 — only inner shapes changed.
     """
     decomp = BudgetDecomposition(
         total_reduction_ratio=0.20,
@@ -178,12 +178,12 @@ def test_ma_formation_fallback_when_dynamic_empty(tiny_model, tiny_config, tmp_p
 
 
 def test_blacklist_inner_config_keys(tiny_model, tiny_config, tmp_path):
-    """stage1_blacklist.json['config'] inner block must pin exactly these 12 keys.
+    """stage1_blacklist.json['config'] inner block must pin exactly these 15 keys.
 
-    Locks the spec §4 Phase C/C+ config schema so a future addition/removal is
-    caught here rather than silently broken by downstream consumers (regression
-    for code-vs-spec L-2). Extended from 7 → 12 keys with Task 7 (AIMER +
-    sink-token + dual-signal moe_output_growth_ratio).
+    Locks the spec §4 Phase C/D config schema so a future addition/removal is
+    caught here rather than silently broken by downstream consumers. Extended
+    from 12 → 15 keys at the v6 candidates+ablation-filter rewrite (added
+    sink_token_max_per_layer_cap, magnitude_topk_per_l_layer, ablation_filter_threshold).
     """
     decomp = BudgetDecomposition(
         total_reduction_ratio=0.20,
@@ -209,6 +209,9 @@ def test_blacklist_inner_config_keys(tiny_model, tiny_config, tmp_path):
         "aimer_layer_max_fraction",
         "sink_token_score_ratio",
         "sink_token_freq_threshold",
+        "sink_token_max_per_layer_cap",
+        "magnitude_topk_per_l_layer",
+        "ablation_filter_threshold",
     }
     assert set(bl["config"].keys()) == expected_keys, (
         f"stage1_blacklist.json['config'] keys drift: "
@@ -291,3 +294,83 @@ def test_cka_distance_contract():
     # Off-diagonal: identical reps → CKA ≈ 1 → distance ≈ 0.
     assert D[0, 1].item() == pytest.approx(0.0, abs=1e-4)
     assert D[1, 0].item() == pytest.approx(0.0, abs=1e-4)
+
+
+def test_phase_c_candidate_set_union():
+    """_collect_candidates unions four detectors with multi-source provenance tags.
+
+    Synthetic single-layer (l=0) scenario:
+      - expert 7: huge magnitude → flagged by phase_c (three-way AND) AND magnitude_topk
+      - expert 5: moderate magnitude in top-K, low AIMER → flagged by aimer + magnitude_topk
+      - expert 3: small magnitude, sink-token-dominated → flagged by sink_token only
+      - expert 8: moderate-low magnitude in top-K but no other signal → magnitude_topk only
+      - other experts (0..N) act as the population from which P99.5/a_max are computed.
+    """
+    from types import SimpleNamespace
+
+    L = {0}
+    # 200 filler experts in layer 0, magnitudes near 1.0 (population for percentile).
+    per_expert_max: dict[tuple[int, int], float] = {(0, e): 1.0 for e in range(200)}
+    per_expert_max[(0, 7)] = 100.0   # huge — passes three-way AND
+    per_expert_max[(0, 5)] = 5.0     # moderate — top-K only
+    per_expert_max[(0, 8)] = 4.0     # moderate — top-K only
+    per_expert_max[(0, 3)] = 0.5     # small — sink-token only
+
+    p995, a_max = stage1_grape._compute_se_thresholds(per_expert_max, L)
+    a_max_threshold = 0.1 * a_max
+
+    # AIMER: only expert 5 has a "concentrated" (low) score; all others are 1.0.
+    # pct=0.005 → k=max(1, round(200*0.005))=1, so the bottom-pct picks only e=5.
+    aimer_scores = {(0, e): 1.0 for e in range(200)}
+    aimer_scores[(0, 5)] = 0.001
+    bottom_pct = stage1_grape.aimer_bottom_pct_per_layer(aimer_scores, pct=0.005)
+
+    # Sink-token mock: only expert 3 is sink-dominated (high freq + high ratio).
+    sink_acc = SimpleNamespace(
+        mean_router_score_sink={(0, 3): 1.0, (0, 5): 0.05, (0, 7): 0.05},
+        mean_router_score_normal={(0, 3): 0.05, (0, 5): 1.0, (0, 7): 1.0},
+        freq_on_sink={(0, 3): 1.0, (0, 5): 0.0, (0, 7): 0.0},
+    )
+
+    candidates = stage1_grape._collect_candidates(
+        per_expert_max=per_expert_max,
+        L=L,
+        p995=p995, a_max=a_max, a_max_threshold=a_max_threshold,
+        aimer_scores=aimer_scores,
+        bottom_pct_by_layer=bottom_pct,
+        aimer_enabled=True,
+        aimer_layer_max_fraction=0.1,
+        sink_acc=sink_acc,
+        sink_enabled=True,
+        sink_score_ratio=10.0,
+        sink_freq_threshold=0.99,
+        sink_max_per_layer_cap=10,
+        magnitude_topk_per_l_layer=3,
+    )
+
+    assert candidates[(0, 7)] == ["magnitude_topk", "phase_c"]
+    assert candidates[(0, 5)] == ["aimer", "magnitude_topk"]
+    assert candidates[(0, 8)] == ["magnitude_topk"]
+    assert candidates[(0, 3)] == ["sink_token"]
+    # No spurious entries beyond these four.
+    assert set(candidates.keys()) == {(0, 7), (0, 5), (0, 8), (0, 3)}
+
+
+def test_magnitude_topk_candidates():
+    """_magnitude_topk_candidates picks top-K experts by per_expert_max within l ∈ L only."""
+    per_expert_max = {
+        (5, 0): 1.0, (5, 1): 9.0, (5, 2): 5.0, (5, 3): 8.0, (5, 4): 7.0, (5, 5): 2.0,
+        (9, 0): 100.0,   # layer 9 is not in L → must be ignored
+    }
+    L = {5}
+    out = stage1_grape._magnitude_topk_candidates(per_expert_max, L, top_k=3)
+    # Top-3 in layer 5 by magnitude: experts 1 (9.0), 3 (8.0), 4 (7.0).
+    assert out == {(5, 1), (5, 3), (5, 4)}
+
+
+def test_magnitude_topk_candidates_empty_inputs():
+    """Edge cases: top_k=0, empty L, empty per_expert_max all return empty set."""
+    per_expert_max = {(5, 0): 1.0, (5, 1): 2.0}
+    assert stage1_grape._magnitude_topk_candidates(per_expert_max, L={5}, top_k=0) == set()
+    assert stage1_grape._magnitude_topk_candidates(per_expert_max, L=set(), top_k=5) == set()
+    assert stage1_grape._magnitude_topk_candidates({}, L={5}, top_k=5) == set()
