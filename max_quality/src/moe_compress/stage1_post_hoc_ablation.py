@@ -1,10 +1,11 @@
 """Phase F — post-hoc causal-ablation validation of the Stage 1 SE blacklist.
 
 After Phase A/B/C/C+ produces the final blacklist, this module measures the
-PPL impact of ablating (zeroing the down_proj output of) each blacklisted
-expert AND the top-K non-blacklisted experts in each MA-formation layer. The
-report is written to ``stage1_post_hoc_ablation.json`` and is REPORT-ONLY — no
-automatic blacklist mutation.
+NLL impact (mean per-token cross-entropy) of ablating (zeroing the down_proj
+output of) each blacklisted expert AND the top-K non-blacklisted experts in
+each MA-formation layer. The report is written to
+``stage1_post_hoc_ablation.json`` and is REPORT-ONLY — no automatic blacklist
+mutation.
 
 Reviewer (max_quality/docs/stage1_review_10.05.2026.txt §Q4): "Ablate each
 blacklisted expert AND the top-5 non-blacklisted experts (by per_expert_max)
