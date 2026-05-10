@@ -42,9 +42,11 @@ from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 
-_MA_RATIO = 100.0        # max / Q99 threshold — absolute outlier check for first MoE layer
-_MA_GROWTH_RATIO = 5.0   # max|H_l| / max|H_{l-1}| threshold — growth check for subsequent layers
-_CKA_EPSILON = 1e-12     # numerical floor for HSIC denominators to avoid division by zero
+_MA_RATIO = 100.0                     # max / Q99 threshold — first MoE layer absolute outlier check
+_MA_GROWTH_RATIO = 3.0                # was 5.0; calibrated for Qwen3.5/3.6 attn_output_gate=true
+_MOE_OUTPUT_GROWTH_RATIO = 2.0        # ungated MoE-block-output secondary signal (OR with residual)
+_PHASE_A_BATCH_SIZE = 4               # Phase A only tracks max magnitudes — batch-size invariant
+_CKA_EPSILON = 1e-12                  # numerical floor for HSIC denominators
 _SIMILARITY_METRIC_DEFAULT = "cka"
 
 
@@ -141,6 +143,7 @@ def run(
     ma_ratio = float(se_cfg.get("ma_ratio", _MA_RATIO))
     ma_growth_ratio = float(se_cfg.get("ma_growth_ratio", _MA_GROWTH_RATIO))
     a_max_fraction = float(se_cfg.get("a_max_fraction", 0.1))
+    moe_output_growth_ratio = float(se_cfg.get("moe_output_growth_ratio", _MOE_OUTPUT_GROWTH_RATIO))
 
     spec = spec_from_config(
         cal,
@@ -151,7 +154,8 @@ def run(
         tokenizer, spec,
         cache_dir=artifacts_dir / "_calibration_cache",
     )
-    batches = iter_batches(calib, batch_size=1)
+    phase_a_batch_size = int(s1.get("phase_a_batch_size", _PHASE_A_BATCH_SIZE))
+    batches = iter_batches(calib, batch_size=phase_a_batch_size)
     n_batches = len(batches)
 
     # ------------------------------------------------------------------
@@ -161,7 +165,12 @@ def run(
         "Stage 1 Phase A: detecting MA-formation layers over %d samples (%d MoE layers)",
         n_batches, len(moe_layers),
     )
-    L = _detect_ma_layers(model, batches, moe_layers, device, ma_ratio=ma_ratio, ma_growth_ratio=ma_growth_ratio)
+    L, residual_growth, moe_output_growth, moe_output_max = _detect_ma_layers(
+        model, batches, moe_layers, device,
+        ma_ratio=ma_ratio,
+        ma_growth_ratio=ma_growth_ratio,
+        moe_output_growth_ratio=moe_output_growth_ratio,
+    )
     log.info("Stage 1 Phase A: MA-formation layers L = %s", sorted(L))
 
     # ------------------------------------------------------------------
@@ -389,6 +398,17 @@ def run(
 # ---------------------------------------------------------------------------
 
 
+def _flag_layer_dual_signal(
+    *,
+    residual_ratio: float,
+    moe_ratio: float,
+    residual_threshold: float,
+    moe_threshold: float,
+) -> bool:
+    """OR-rule flagging: True iff EITHER signal exceeds its threshold (D-ma-detector)."""
+    return (residual_ratio > residual_threshold) or (moe_ratio > moe_threshold)
+
+
 def _detect_ma_layers(
     model: nn.Module,
     batches,
@@ -397,82 +417,70 @@ def _detect_ma_layers(
     *,
     ma_ratio: float = _MA_RATIO,
     ma_growth_ratio: float = _MA_GROWTH_RATIO,
-) -> set[int]:
-    """Forward pass 1: identify MoE decoder layers that form (amplify) massive activations.
+    moe_output_growth_ratio: float = _MOE_OUTPUT_GROWTH_RATIO,
+) -> tuple[set[int], dict[int, float], dict[int, float], dict[int, float]]:
+    """Forward pass 1: identify MA-formation layers via dual-signal OR rule.
 
-    Spec §4 Phase A + §12 D-ma-detector:
-    - Hooks every decoder layer (not just MoE) so that the growth ratio
-      ``max|H_l| / max|H_{l-1}|`` is computed against the immediately preceding
-      decoder layer in the residual stack — paper definition of MA-formation.
-    - First MoE layer: absolute outlier check — add to L if max|H_l| > ma_ratio × Q99(|H_l|).
-    - Subsequent MoE layers: growth check — add to L if
-      max|H_l| / max|H_{l-1}| > ma_growth_ratio (where l-1 is the immediately preceding
-      DECODER layer, MoE or not).
-    - Fallback: if the dynamic detector returns ∅, populate L with every MoE layer whose
-      ``layer_idx < round(0.75 × num_hidden_layers)``.
+    Returns (L, residual_growth, moe_output_growth, moe_output_max):
+      L                   — set of MA-formation layer indices.
+      residual_growth     — per-MoE-layer max|H_l|/max|H_{l-1}| (residual stream).
+                            First MoE layer entry is float('nan') (no predecessor).
+      moe_output_growth   — per-MoE-layer max|MoE_l|/max|MoE_{l-1}| (post-routing-weighted-sum,
+                            pre-residual-add). First MoE layer entry is 0.0 (no predecessor).
+      moe_output_max      — per-MoE-layer raw max|MoE_l| (for diagnostics).
 
-    Q99 (first-layer absolute check) is computed exactly across all calibration batches by
-    buffering per-batch flattened activation magnitudes and computing
-    ``np.percentile(buffer, 99.0)`` once at finalize time (spec §4 Phase A: "Q99 across
-    all calibration batches"). This is option (a) from spec §12 D-ma-detector. Memory
-    fits in RAM at calibration scales (256 samples × 2048 tokens × hidden_size × 4 bytes
-    fp32 — for hidden=2048 this is ~4 GB; document for operators planning Stage 1 RAM headroom).
-
-    MAs propagate stably through residuals after they form; the old absolute-only check would
-    flag all post-formation layers. The growth check flags only amplification events.
-    Both maxima are tracked across all calibration batches (MAs are input-stable per the paper).
+    See ALGORITHM_REFERENCE.md §4 Phase A and D-ma-detector for the OR rule rationale.
     """
     sorted_moe_layer_indices = sorted(ref.layer_idx for ref in moe_layers)
     if not sorted_moe_layer_indices:
-        return set()
-    moe_layer_set = set(sorted_moe_layer_indices)
+        return set(), {}, {}, {}
     first_moe_layer_idx = sorted_moe_layer_indices[0]
+    moe_layer_by_idx = {ref.layer_idx: ref for ref in moe_layers}
 
-    # Hook every decoder layer, not just MoE layers (M-2).
-    # All decoder layer modules in residual order; ratio is computed against the
-    # immediately preceding decoder layer (M-1).
     decoder_layers: list[tuple[int, nn.Module]] = list(iter_decoder_layers(model))
     if not decoder_layers:
-        raise ValueError(
-            "_detect_ma_layers: no decoder layers found via iter_decoder_layers()"
-        )
+        raise ValueError("_detect_ma_layers: no decoder layers found")
     decoder_layer_modules = {layer: idx for idx, layer in decoder_layers}
     if len(decoder_layer_modules) != len(decoder_layers):
-        raise ValueError(
-            "_detect_ma_layers: two decoder layers share the same module object "
-            "(weight-tied layers?); hooks would fire only for one of them. "
-            f"Expected {len(decoder_layers)} unique modules, got {len(decoder_layer_modules)}."
-        )
+        raise ValueError("_detect_ma_layers: weight-tied decoder layers detected")
     sorted_decoder_layer_indices = sorted(decoder_layer_modules.values())
+
+    # Residual-stream max: hooked on every decoder layer
     layer_max: dict[int, float] = {idx: 0.0 for idx in sorted_decoder_layer_indices}
-    # Buffer flattened magnitudes from the FIRST MoE layer only — used to compute the
-    # exact Q99 across all calibration batches (option (a) from spec §12 D-ma-detector).
+    # MoE-block-output max: hooked on each MoE layer's `mlp` (Qwen3_5MoeSparseMoeBlock)
+    moe_block_max: dict[int, float] = {idx: 0.0 for idx in sorted_moe_layer_indices}
     first_layer_q99_buffer: list[np.ndarray] = []
     handles: list = []
 
-    def _make_hook(layer_idx: int):
+    def _make_decoder_hook(layer_idx: int):
         def _hook(_module, _input, output):
             h = output[0] if isinstance(output, tuple) else output
             if not isinstance(h, torch.Tensor):
-                log.debug(
-                    "_detect_ma_layers hook: unexpected output type %s for layer %d; skipping",
-                    type(h).__name__, layer_idx,
-                )
                 return
             h_abs = h.detach().abs().float()
             curr_max = h_abs.max().item()
             if curr_max > layer_max[layer_idx]:
                 layer_max[layer_idx] = curr_max
             if layer_idx == first_moe_layer_idx:
-                # Buffer flattened magnitudes for exact cross-batch Q99 (spec §4 Phase A).
-                first_layer_q99_buffer.append(
-                    h_abs.flatten().cpu().numpy()
-                )
+                first_layer_q99_buffer.append(h_abs.flatten().cpu().numpy())
+        return _hook
+
+    def _make_moe_hook(layer_idx: int):
+        def _hook(_module, _input, output):
+            # Qwen3_5MoeSparseMoeBlock.forward returns (hidden_states, router_logits) tuple.
+            h = output[0] if isinstance(output, tuple) else output
+            if not isinstance(h, torch.Tensor):
+                return
+            curr_max = h.detach().abs().float().max().item()
+            if curr_max > moe_block_max[layer_idx]:
+                moe_block_max[layer_idx] = curr_max
         return _hook
 
     for module, layer_idx in decoder_layer_modules.items():
-        h = module.register_forward_hook(_make_hook(layer_idx))
-        handles.append(h)
+        handles.append(module.register_forward_hook(_make_decoder_hook(layer_idx)))
+    for layer_idx in sorted_moe_layer_indices:
+        ref = moe_layer_by_idx[layer_idx]
+        handles.append(ref.mlp.register_forward_hook(_make_moe_hook(layer_idx)))
 
     try:
         run_calibration(
@@ -485,7 +493,6 @@ def _detect_ma_layers(
         for h in handles:
             h.remove()
 
-    # Compute exact cross-batch Q99 over the union of all per-batch flattened magnitudes.
     if first_layer_q99_buffer:
         first_layer_q99 = float(
             np.percentile(np.concatenate(first_layer_q99_buffer), 99.0)
@@ -494,11 +501,14 @@ def _detect_ma_layers(
         first_layer_q99 = 0.0
 
     L: set[int] = set()
-    # Map MoE layer index -> position in sorted_decoder_layer_indices (for prev-decoder lookup).
+    residual_growth: dict[int, float] = {}
+    moe_output_growth: dict[int, float] = {}
     decoder_index_pos = {idx: pos for pos, idx in enumerate(sorted_decoder_layer_indices)}
 
     for layer_idx in sorted_moe_layer_indices:
         if layer_idx == first_moe_layer_idx:
+            residual_growth[layer_idx] = float("nan")
+            moe_output_growth[layer_idx] = 0.0
             if first_layer_q99 <= 0:
                 log.warning(
                     "Stage 1: first-MoE-layer Q99 is %.2e for layer %d; model output may be "
@@ -507,43 +517,41 @@ def _detect_ma_layers(
                 )
             elif layer_max[layer_idx] > ma_ratio * first_layer_q99:
                 L.add(layer_idx)
-        else:
-            # Use the immediately preceding DECODER layer (MoE or not) per spec (M-1).
-            pos = decoder_index_pos[layer_idx]
-            if pos == 0:
-                continue  # no prior decoder layer — defensive (shouldn't happen for non-first)
-            prev_decoder_idx = sorted_decoder_layer_indices[pos - 1]
-            prev_max = layer_max[prev_decoder_idx]
-            # prev_max == 0 means the preceding layer produced no non-zero output on any
-            # batch; genuine MA detection requires a nonzero baseline, so we skip this check.
-            # NOTE: layer_max[layer_idx] and layer_max[prev_decoder_idx] are cumulative
-            # cross-batch maxima; they may peak on different batches. The ratio is
-            # therefore cumulative-vs-cumulative, matching spec §4 Phase A line 156's
-            # "across all calibration batches" wording — valid under the input-stable MA
-            # assumption (spec §4 Phase A; paper §3.2.1 last paragraph at lines 405–406) but worth noting.
-            if prev_max > 0 and layer_max[layer_idx] / prev_max > ma_growth_ratio:
-                L.add(layer_idx)
+            continue
+        # Residual ratio against the immediately preceding decoder layer
+        pos = decoder_index_pos[layer_idx]
+        prev_decoder_idx = sorted_decoder_layer_indices[pos - 1]
+        prev_max = layer_max[prev_decoder_idx]
+        res_ratio = (layer_max[layer_idx] / prev_max) if prev_max > 0 else 0.0
+        residual_growth[layer_idx] = res_ratio
+        # MoE ratio against the previous MoE layer in the sorted order
+        prev_moe_pos = sorted_moe_layer_indices.index(layer_idx) - 1
+        prev_moe_idx = sorted_moe_layer_indices[prev_moe_pos]
+        prev_moe_max = moe_block_max[prev_moe_idx]
+        moe_ratio = (moe_block_max[layer_idx] / prev_moe_max) if prev_moe_max > 0 else 0.0
+        moe_output_growth[layer_idx] = moe_ratio
+        if _flag_layer_dual_signal(
+            residual_ratio=res_ratio,
+            moe_ratio=moe_ratio,
+            residual_threshold=ma_growth_ratio,
+            moe_threshold=moe_output_growth_ratio,
+        ):
+            L.add(layer_idx)
 
-    # 0.75-depth fallback (spec §4 Phase A line 157 + §12 D-ma-detector) (H-1).
     if not L:
         cfg = getattr(model, "config", None)
         text_cfg = getattr(cfg, "text_config", cfg) if cfg is not None else None
-        total_layers = getattr(text_cfg, "num_hidden_layers", None)
-        if total_layers is None:
-            # Fallback to the observed decoder layer count if config is missing.
-            total_layers = len(sorted_decoder_layer_indices)
+        total_layers = getattr(text_cfg, "num_hidden_layers", None) or len(sorted_decoder_layer_indices)
         cutoff = round(0.75 * float(total_layers))
         fallback_layers = [li for li in sorted_moe_layer_indices if li < cutoff]
         log.warning(
-            "Stage 1 Phase A: dynamic detector returned ∅ (no MA-formation layers found "
-            "via ma_ratio/ma_growth_ratio); applying 0.75-depth fallback (spec §4 Phase A) — "
-            "populating L with every MoE layer whose layer_idx < round(0.75 × %d) = %d. "
-            "Fallback L = %s",
+            "Stage 1 Phase A: dual-signal detector returned ∅; falling back to "
+            "layer_idx < round(0.75 × %d) = %d. Fallback L = %s",
             total_layers, cutoff, fallback_layers,
         )
         L = set(fallback_layers)
 
-    return L
+    return L, residual_growth, moe_output_growth, dict(moe_block_max)
 
 
 # ---------------------------------------------------------------------------
