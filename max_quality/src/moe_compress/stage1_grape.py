@@ -8,31 +8,29 @@ Two sequential forward passes over the calibration set:
   Phase B: collect (a) max down_proj output magnitude per (layer, expert)
            for SE detection, (b) CKA representation reservoir per expert
            for GRAPE, and (c) router scores + sink-token routing stats
-           for the Phase C+ sink-token auto-extension.
+           for the Phase C sink-token candidate source.
 
-Phase C: paper-compliant three-way AND SE detection (2507.23279 Eq. 6):
-         > P99.5(A) AND > 0.1·a_max AND l ∈ L.
+Phase C (candidate generation): build a candidate set by union of four
+  detectors with multi-source provenance — three-way AND (paper Eq. 6),
+  AIMER bottom-pct, sink-token routing (tightened thresholds + per-layer cap),
+  and magnitude top-K per l ∈ L. No auto-blacklist mutation; final inclusion
+  is determined by Phase D ablation evidence.
 
-Phase C+ (project-original): two complementary auto-extensions to the SE
-blacklist, both deduplicated against Phase C:
-  - AIMER weight-only screening (D-aimer-cross-check) flags experts with
-    concentrated down_proj weights in elevated-magnitude layers.
-  - Sink-token routing analysis (D-sink-token-routing) flags experts whose
-    routing score is sink-token-dominated.
+Phase D (ablation filter, load-bearing): ablate every Phase C candidate over
+  a held-out 100-sample slice; keep candidates with ΔNLL > ablation_filter_threshold.
+  Implementation in stage1_ablation_filter.py (D-causal-ablation-validation).
 
-Phase D/E: GRAPE Algorithm 1 (CKA-based pair merging with entropy-aware
-greedy + per-layer floor = num_routed_experts // 2; deviations D-cka-distance,
-D4, D5, D-grape-restart-merge).
-
-Phase F (project-original): post-hoc causal-ablation validation (D-causal-
-ablation-validation; runs in stage1_post_hoc_ablation.py — invoked after the
-GRAPE budgets artifact is written).
+Phase E/F: GRAPE Algorithm 1 (CKA-based pair merging with entropy-aware greedy +
+  per-layer floor = num_routed_experts // 2; deviations D-cka-distance, D4, D5,
+  D-grape-restart-merge).
 
 Output artifact `stage1_blacklist.json` has 7 top-level keys:
   blacklist, per_expert_max, config, blacklist_provenance, dual_signal,
   aimer, sink_token.
-The inner `config` block has 12 keys (all detector thresholds + AIMER/sink
-parameters).
+The inner `config` block has 15 keys (detector thresholds + AIMER/sink parameters
++ magnitude_topk_per_l_layer + ablation_filter_threshold + sink_token_max_per_layer_cap).
+The companion `stage1_ablation_filter.json` artifact carries per-candidate ΔNLL
++ provenance + passed_filter audit data.
 """
 from __future__ import annotations
 
@@ -47,7 +45,7 @@ import torch
 import torch.nn as nn
 
 from .budget.solver import BudgetDecomposition
-from .stage1_post_hoc_ablation import (
+from .stage1_ablation_filter import (
     _write_ablation_filter_artifact,
     run_ablation_filter,
 )
