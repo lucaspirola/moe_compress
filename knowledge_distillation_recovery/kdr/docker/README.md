@@ -141,6 +141,7 @@ curl -sSf "https://console.vast.ai/api/v0/instances/${VAST_INSTANCE_ID}/" \
 | 3         | Zyphra transformers fork install failed                | Check network; fork moved? See LLR-0035   |
 | 4         | git clone or snapshot_download failed                  | Check `HF_TOKEN` scope; check disk space  |
 | 5         | Trainer crashed mid-run                                | Check stderr; if persistent, file an issue. Re-launching against the same `run_id` resumes from the latest partial |
+| 6         | Final artifact uploaded but `from_pretrained` round-trip failed in a fresh Python process | Artifact is on HF Hub; inspect the load error. Common causes: missing tokenizer files in the save (kdr bug — file an issue), Zyphra transformers fork mismatch (re-pin `MOE_COMPRESS_GIT_REF`), or HF Hub propagation lag (rare; relaunch after a few minutes — the run is idempotent on the same `run_id`) |
 
 ## Out of scope
 

@@ -15,6 +15,7 @@
 #   3 — Zyphra transformers fork install failed (LLR-0035)
 #   4 — git clone, snapshot_download, or hub-side resolution failed
 #   5 — trainer or final-upload failed
+#   6 — final-artifact load-back round-trip failed (third-party-loadability check)
 #
 # Inline Python blocks read inputs via ``os.environ[...]`` rather than
 # string-interpolated shell vars — this prevents shell-side injection / quoting
@@ -270,7 +271,50 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Destroy hint
+# 8. Load-back round-trip (third-party-loadability sanity)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Validates that the just-uploaded artifact is consumable from a fresh
+# Python process via the canonical HF API — closes the loop from "we wrote
+# something" to "what we wrote is usable downstream". The trainer's resume
+# path already exercises kdr-internal load; this exercises the API surface
+# any external consumer would use.
+#
+# bf16: AutoModelForCausalLM round-trip; trivial check that the safetensors
+# + config.json + tokenizer files form a valid HF checkpoint.
+#
+# da_qad: deferred to Phase 7.2 — needs a compressed-tensors-aware loader
+# (compressed-tensors package is gated behind kdr's `[compressed]` extra
+# which the default --no-deps install above does not pull).
+
+if [[ -d "${FINAL_DIR}" && "${KDR_MODE}" == "bf16" ]]; then
+    echo ">>> Load-back round-trip: pulling ${RECOVERED_REPO} in a fresh Python process"
+    if ! python - <<'PY'
+import os
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+repo = os.environ["RECOVERED_REPO"]
+tok = AutoTokenizer.from_pretrained(repo)
+model = AutoModelForCausalLM.from_pretrained(
+    repo, torch_dtype=torch.bfloat16, device_map="cuda"
+)
+ids = tok("hello world", return_tensors="pt").input_ids.to("cuda")
+with torch.no_grad():
+    logits = model(input_ids=ids).logits
+assert torch.isfinite(logits).all(), "NaN or Inf in logits — artifact is corrupt"
+print(f"load-back OK: logits shape={tuple(logits.shape)}, dtype={logits.dtype}, finite ✓")
+PY
+    then
+        echo "ERROR: final-artifact load-back round-trip failed." >&2
+        exit 6
+    fi
+elif [[ -d "${FINAL_DIR}" && "${KDR_MODE}" == "da_qad" ]]; then
+    echo ">>> Load-back round-trip skipped for da_qad — Phase 7.2 will add the compressed-tensors round-trip."
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Destroy hint
 # ─────────────────────────────────────────────────────────────────────────────
 
 cat <<'HINT'
