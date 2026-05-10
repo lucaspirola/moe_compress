@@ -132,6 +132,54 @@ class Zaya1Adapter:
         return teacher, student, tokenizer
 
     @staticmethod
+    def _patch_zaya_router_per_layer_mlp_expansion() -> None:
+        """Workaround for upstream `Zyphra/transformers@zaya1` bug.
+
+        `Zyphra/ZAYA1-reasoning-base/config.json` ships `zaya_mlp_expansion`
+        as a per-layer list (e.g. ``[0, 256, 0, 256, ...]``), but the fork's
+        ``ZayaRouter.__init__`` calls ``int(mlp_expansion)`` on the value
+        as if it were scalar, raising ``TypeError: int() argument must be a
+        string, a bytes-like object or a real number, not 'list'`` at model
+        load time.
+
+        We patch ``ZayaRouter.__init__`` to index the list by ``layer_number``
+        when given a list/tuple. Idempotent (sentinel attribute), and silently
+        no-ops when the Zyphra fork isn't installed (e.g. in the local kdr
+        venv, where stock transformers is on path and the unit tests don't
+        exercise model load).
+        """
+        try:
+            import transformers.models.zaya.modeling_zaya as _zaya_mod
+        except ImportError:
+            return
+        cls = _zaya_mod.ZayaRouter
+        if getattr(cls, "_kdr_patched_per_layer_mlp_expansion", False):
+            return
+        _orig = cls.__init__
+
+        def _patched(  # type: ignore[no-untyped-def]
+            self,
+            config: Any,
+            layer_n: int,
+            num_moe_experts: int,
+            moe_router_topk: int,
+            mlp_expansion: Any,
+            hidden_size: int | None = None,
+            layer_number: int | None = None,
+        ) -> None:
+            if isinstance(mlp_expansion, (list, tuple)):
+                ln = layer_number if layer_number is not None else 0
+                mlp_expansion = mlp_expansion[ln]
+            _orig(
+                self, config, layer_n, num_moe_experts, moe_router_topk,
+                mlp_expansion, hidden_size=hidden_size,
+                layer_number=layer_number,
+            )
+
+        cls.__init__ = _patched
+        cls._kdr_patched_per_layer_mlp_expansion = True
+
+    @staticmethod
     def _load_one(
         *,
         name_or_path: str,
@@ -149,6 +197,8 @@ class Zaya1Adapter:
         unused; when stock transformers is installed, the flag triggers
         loading from the repo's modeling code.
         """
+        # Apply the per-layer mlp_expansion patch before any model load.
+        Zaya1Adapter._patch_zaya_router_per_layer_mlp_expansion()
         log.info(
             "Loading %s %s (dtype=%s, attn=%s, revision=%s)",
             role,
