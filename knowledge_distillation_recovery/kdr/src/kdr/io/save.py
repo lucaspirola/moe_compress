@@ -29,6 +29,8 @@ from transformers import PreTrainedTokenizerBase
 
 from ..config import QuantBlock
 from ..modes import Mode
+from ..quant.interface import QuantBackend
+from ..quant.specs import KVQuantSpec, WeightQuantSpec
 
 log = logging.getLogger(__name__)
 
@@ -145,20 +147,216 @@ def save_partial(
 
 
 # REQ: LLR-0018
+# REQ: LLR-0019
+# REQ: LLR-0020
 def save_kdr_artifact(
     model: nn.Module,
     output_dir: Path,
     *,
-    quant_block: QuantBlock | None,
-    input_metadata: dict[str, object] | None = None,
+    backends: list[QuantBackend],
+    quant_block: QuantBlock,
+    fp32_carve_outs: list[str],
+    tokenizer: PreTrainedTokenizerBase | None = None,
+    source_metadata_path: Path | None = None,
 ) -> None:
-    """Compressed-tensors final save — Phase 4.
+    """Compressed-tensors final save (Phase 4 / ``da_qad`` mode).
 
-    Phase 3b leaves this stubbed; the `da_qad`-mode final save lands when the
-    `QuantBackend.save` path is implemented. The `bf16`-mode final save is
-    handled by `save_partial(..., partial=False)`.
+    Mirrors ``save_partial``'s atomicity pattern (LLR-0029): all writes land
+    in a sibling ``.tmp`` directory; only after every step succeeds is the
+    ``.tmp`` atomically renamed onto ``output_dir``; the sentinel is then
+    written LAST, INTO the renamed final dir, so its presence is the
+    post-rename guarantee that every other file in the dir was committed.
+
+    Sequence:
+
+      1. Build under ``.tmp/`` so a half-written dir never appears at
+         ``output_dir``.
+      2. Pick the weight-handling backend (the routed backend whose
+         ``QuantBlockSubset`` carries ``weight``); call its ``.save`` to
+         emit compressed-tensors safetensors + ``config.json`` (LLR-0021).
+      3. Inject the full ``quantization_config`` block into ``config.json``
+         (LLR-0020) — covers the K/V cache scheme and FP32 ``ignore`` list
+         that the converter would otherwise miss.
+      4. Save the tokenizer if provided.
+      5. Preserve the input student's ``compressed_metadata.json`` verbatim
+         when ``source_metadata_path`` exists (HLR-0005 / LLR-0019).
+      6. Atomically rename ``.tmp`` → ``output_dir``.
+      7. Write the empty ``_SAVE_COMPLETE`` sentinel last (LLR-0029
+         invariant — sentinel is written with ``exist_ok=False`` so a
+         stale sentinel from a prior crash + retry surfaces as an error
+         rather than masquerading as a successful re-save).
+
+    Args:
+        model: the quantized student (post ``apply_quant``).
+        output_dir: target directory for the final artifact.
+        backends: routes returned by ``factory.partition_and_dispatch``.
+        quant_block: original YAML quant block (used to compose the
+            ``quantization_config`` payload — LLR-0020).
+        fp32_carve_outs: adapter's FP32 carve-out submodule patterns
+            (becomes the ``ignore`` list — LLR-0020 AC #3).
+        tokenizer: student tokenizer; saved alongside if provided.
+        source_metadata_path: input student's ``compressed_metadata.json``
+            location for byte-equal passthrough; ``None`` if the input
+            lacked the file.
+
+    Raises:
+        ValueError: if no backend handles the weight quantizer (the
+            converter selection requires it).
     """
-    raise NotImplementedError("Phase 4: save_kdr_artifact (compressed-tensors)")
+    weight_backend = _find_weight_handling_backend(backends)
+    if weight_backend is None:
+        raise ValueError(
+            "save_kdr_artifact: no backend in `backends` handles the weight "
+            "quantizer; the compressed-tensors save path requires a "
+            "weight-handling backend (typically ModelOpt)."
+        )
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = output_dir.parent / f"{output_dir.name}.tmp"
+    if tmp_dir.exists():
+        # Stale `.tmp` from a previous failed save — discard.
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+
+    # 2. Backend writes weights + config.json via the format-specific converter.
+    weight_backend.save(model, tmp_dir)
+
+    # 3. Inject the full quantization_config block into config.json.
+    _inject_quantization_config(tmp_dir, quant_block, fp32_carve_outs)
+
+    # 4. Tokenizer (separate from the converter's save).
+    if tokenizer is not None:
+        tokenizer.save_pretrained(tmp_dir)
+
+    # 5. Preserve compressed_metadata.json verbatim if the input had it.
+    if source_metadata_path is not None and source_metadata_path.exists():
+        shutil.copyfile(source_metadata_path, tmp_dir / COMPRESSED_METADATA_FILENAME)
+
+    # 6. Atomic rename — replaces an existing final dir if present.
+    _atomic_replace_dir(tmp_dir, output_dir)
+
+    # REQ: LLR-0029
+    # 7. Sentinel written LAST, INTO the renamed final dir, EMPTY (zero bytes).
+    #    `exist_ok=False` matches `save_partial` so stale sentinels surface as
+    #    errors rather than masking a re-save.
+    sentinel = output_dir / SAVE_COMPLETE_SENTINEL
+    sentinel.touch(exist_ok=False)
+
+    log.info("save_kdr_artifact: wrote final compressed-tensors checkpoint to %s", output_dir)
+
+
+def _find_weight_handling_backend(
+    backends: list[QuantBackend],
+) -> QuantBackend | None:
+    """Pick the backend whose dispatched ``QuantBlockSubset`` includes weight.
+
+    Backends store the dispatched subset on ``self._quant_block`` (set inside
+    ``apply_quant``). Inspecting it avoids threading the routes through a
+    second parameter.
+    """
+    for b in backends:
+        # Both ModelOptBackend and NativeBackend expose ``_quant_block``;
+        # ``getattr`` keeps this duck-typed against the Protocol surface.
+        sub = getattr(b, "_quant_block", None)
+        if sub is not None and getattr(sub, "weight", None) is not None:
+            return b
+    return None
+
+
+def _inject_quantization_config(
+    output_dir: Path,
+    quant_block: QuantBlock,
+    fp32_carve_outs: list[str],
+) -> None:
+    """Patch ``config.json`` with the compressed-tensors ``quantization_config``.
+
+    The backend's converter typically writes a partial ``quantization_config``
+    that doesn't fully reflect kdr's recipe — this function overwrites the
+    block with the canonical kdr-built payload composed from the YAML.
+    """
+    cfg_path = output_dir / "config.json"
+    if not cfg_path.exists():
+        # The converter is expected to produce config.json; if it didn't,
+        # write a minimal stub so the output dir is at least loadable as a
+        # bare HF dir. The caller's verifier flags any deeper issues.
+        cfg: dict[str, Any] = {}
+    else:
+        cfg = json.loads(cfg_path.read_text())
+    cfg["quantization_config"] = _build_quantization_config(quant_block, fp32_carve_outs)
+    cfg_path.write_text(json.dumps(cfg, indent=2, sort_keys=True))
+
+
+def _build_quantization_config(
+    quant_block: QuantBlock,
+    fp32_carve_outs: list[str],
+) -> dict[str, Any]:
+    """Compose the HF ``quantization_config`` dict (LLR-0020).
+
+    Schema (compressed-tensors flavoured):
+
+        {
+            "quant_method": "compressed-tensors",
+            "config_groups": {
+                "group_0": {
+                    "weights": <WeightArgs>,
+                    "input_activations": None,
+                    "targets": ["Linear"],
+                },
+            },
+            "kv_cache_scheme": { "key": <KVArgs>, "value": <KVArgs> },
+            "ignore": [<fp32 carve-out patterns>],
+        }
+    """
+    return {
+        "quant_method": "compressed-tensors",
+        "config_groups": {
+            "group_0": {
+                "weights": _weight_spec_to_ct(quant_block.weight),
+                "input_activations": None,
+                "targets": ["Linear"],
+            },
+        },
+        "kv_cache_scheme": {
+            "key": _kv_spec_to_ct(quant_block.kv_quant.key),
+            "value": _kv_spec_to_ct(quant_block.kv_quant.value),
+        },
+        "ignore": list(fp32_carve_outs),
+    }
+
+
+def _weight_spec_to_ct(spec: WeightQuantSpec) -> dict[str, Any]:
+    """Translate kdr's ``WeightQuantSpec`` to a compressed-tensors-shaped dict."""
+    return {
+        "num_bits": spec.bits,
+        "type": _format_to_ct_type(spec.format),
+        "strategy": _granularity_to_ct_strategy(spec.granularity),
+        "symmetric": True,
+    }
+
+
+def _kv_spec_to_ct(spec: KVQuantSpec) -> dict[str, Any]:
+    """Translate kdr's ``KVQuantSpec`` to a compressed-tensors-shaped dict."""
+    return {
+        "num_bits": spec.bits,
+        "type": _format_to_ct_type(spec.format),
+        "strategy": _granularity_to_ct_strategy(spec.granularity),
+        "symmetric": True,
+    }
+
+
+def _format_to_ct_type(fmt: str) -> str:
+    """Map kdr ``Format`` literal → compressed-tensors ``type`` string."""
+    if fmt == "int":
+        return "int"
+    # ``fp8``, ``nvfp4``, ``mxfp4`` all live under "float" in compressed-tensors.
+    return "float"
+
+
+def _granularity_to_ct_strategy(g: str) -> str:
+    """Map kdr ``Granularity`` literal → compressed-tensors ``strategy`` string."""
+    # compressed-tensors uses these literal strings; pass through directly
+    # except for ``token`` which it spells the same way.
+    return g
 
 
 # ---------------------------------------------------------------------------
