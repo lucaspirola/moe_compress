@@ -114,6 +114,13 @@ pip install -e . --no-deps --quiet || {
     exit 4
 }
 
+# kdr's CLI imports `moe_compress.utils.calibration` from the sibling
+# max_quality project, which has no pyproject.toml (it's PYTHONPATH-imported,
+# matching max_quality/docker/bootstrap.sh's own pattern). Without this
+# export the trainer dies at calibration-batch construction with
+# `ModuleNotFoundError: No module named 'moe_compress'`.
+export PYTHONPATH="${REPO_DIR}/max_quality/src${PYTHONPATH:+:${PYTHONPATH}}"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Zyphra transformers fork install (LLR-0035)
 # ─────────────────────────────────────────────────────────────────────────────
