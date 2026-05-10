@@ -378,14 +378,17 @@ def run(
         )
         # Per-layer max activation magnitude (used to gate AIMER extensions:
         # only layers whose peak activation is above aimer_layer_max_fraction *
-        # global peak are eligible — focuses AIMER on activation-hot layers).
+        # a_max are eligible — focuses AIMER on activation-hot layers).
+        # a_max is L-restricted (computed at line ~352 via _compute_se_thresholds);
+        # using it (vs. a max over all MoE layers) keeps the gate aligned with the
+        # spec's Phase C+ definition and with the artifact's reported
+        # config.a_max_absolute.
         layer_expert_max: dict[int, float] = {}
         for (li, _e), v in max_acc.per_expert_max.items():
             layer_expert_max[li] = max(layer_expert_max.get(li, 0.0), v)
-        a_max_global = float(max(layer_expert_max.values())) if layer_expert_max else 0.0
         blacklisted_set = {(int(li), e) for li, lst in blacklist.items() for e in lst}
         for li, candidates in bottom_pct_by_layer.items():
-            if layer_expert_max.get(li, 0.0) <= aimer_layer_max_fraction * a_max_global:
+            if layer_expert_max.get(li, 0.0) <= aimer_layer_max_fraction * a_max:
                 continue
             for e in candidates:
                 if (li, e) in blacklisted_set:
