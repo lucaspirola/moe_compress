@@ -35,12 +35,16 @@ nvidia-ml-py>=12.0
 psutil>=5.9
 bitsandbytes>=0.44.0
 
-# --- Fast-path attention kernels for Qwen3.5/3.6 hybrid linear attention ---
-# Without these, transformers falls back to a pure-PyTorch implementation of
-# the linear-attention + Mamba conv1d components (~10-30% slowdown on
-# affected attention layers; warning visible at model load time).
-flash-linear-attention>=0.1.2
-causal-conv1d>=1.4.0
+# --- Fast-path attention kernels: handled per environment, NOT here ---
+# flash-linear-attention and causal-conv1d build CUDA kernels and need to
+# link against the host's torch + nvcc. They are installed by:
+#   - max_quality/docker/Dockerfile  (with --no-build-isolation against the
+#     cu124-pinned torch)
+#   - max_quality/hf_jobs/entrypoint_ablations.py  (PEP 723 metadata with
+#     a prebuilt-wheel URL, since the HF Jobs UV env has no nvcc)
+# Listing them here would force pip to source-build under PEP 517 isolation,
+# which spawns a venv that ignores constraint files and pulls a fresh torch
+# from the default PyPI index (currently cu130) — mismatching the cu124 base.
 
 # --- Test only ---
 pytest>=8.0
