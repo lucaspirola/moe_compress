@@ -76,13 +76,17 @@ log = logging.getLogger(__name__)
 _MA_RATIO = 100.0                     # max / Q99 threshold — first MoE layer absolute outlier check
 _MA_GROWTH_RATIO = 3.0                # was 5.0; calibrated for Qwen3.5/3.6 attn_output_gate=true
 _MOE_OUTPUT_GROWTH_RATIO = 2.0        # ungated MoE-block-output secondary signal (OR with residual)
-_PHASE_A_BATCH_SIZE = 4               # Phase A only tracks max magnitudes — batch-size invariant
-_PHASE_B_BATCH_SIZE = 8               # Phase B accumulators (max, reservoir, sink-token) all handle
-                                      # arbitrary B; the live H200 run at bs=1 used 94.6/150.8 GB
-                                      # VRAM (37% free, ~25 GB non-model state). At bs=8 the
-                                      # activation portion scales ~8× while reservoirs are
-                                      # batch-invariant — projected total ~120-130 GB, leaving
-                                      # ~20-30 GB headroom. Cuts Phase B forward count 8×.
+_PHASE_A_BATCH_SIZE = 32              # Phase A has zero accumulators on GPU besides max-magnitude
+                                      # scalars; live H200 runs use 76.2 GB VRAM in this phase
+                                      # (74.6 GB free / 49.5%). bs=32 cuts Phase A forwards from
+                                      # 256 to 32 and the per-batch cost ~scales with B linearly,
+                                      # so wall is ~⅛ of bs=4.
+_PHASE_B_BATCH_SIZE = 16              # Phase B at bs=8 used 106.1 GB VRAM (44.7 GB free) on the
+                                      # 2026-05-10 H200 run. Activations at eval-mode forward
+                                      # don't scale linearly with B (intermediate tensors are
+                                      # released per layer), so the bs=1→bs=8 jump cost only
+                                      # ~12 GB extra; bs=16 projects to ~118 GB total with ~32 GB
+                                      # headroom. Cuts Phase B forwards from 128 to 64.
 _CKA_EPSILON = 1e-12                  # numerical floor for HSIC denominators
 _SIMILARITY_METRIC_DEFAULT = "cka"
 
@@ -91,23 +95,26 @@ def _make_calibration_progress_cb(phase_tag: str, n_total: int, log_every: int =
     """Build a per-batch callback that streams Stage 1 calibration progress to
     Trackio every ``log_every`` batches.
 
-    Phase A and Phase B both run a calibration forward pass over the full
-    sample set (4000 by default). At ~0.4 sec/forward on H200 that is ~28 min
-    per phase, with no Trackio metric emits in the existing flow until each
-    phase's *end-of-phase* summary fires. Operators staring at the Trackio
-    dashboard see a flat zero for ~1 hour. This callback emits a fractional
-    progress signal so the dashboard shows a live ramp 0→1 per phase, helping
-    distinguish "still working" from "stuck".
-
     Tags: ``stage1/{phase_tag}/calibration_progress`` (fraction in [0,1]) and
     ``stage1/{phase_tag}/calibration_step`` (raw batch index).
 
-    Cost: one trackio_log + one trackio_flush call per ``log_every`` batches
-    (~63 emits per phase at 4000 samples / log_every=64). Negligible vs
-    forward-pass cost. The flush ensures (a) trackio's background sender
-    thread is kept alive and (b) the in-process queue drains on a known
-    cadence — without it, a silently-dead sender thread would let queued
-    emits pile up while the dashboard shows nothing.
+    Cost: one ``_trackio_log`` (queue put) per ``log_every`` batches.
+    Non-blocking — Trackio's internal sender thread uploads to HF on its own
+    cadence.
+
+    Why we don't ``_trackio_flush()`` here anymore: the previous version
+    flushed synchronously after each ``_trackio_log`` to keep the sender
+    thread alive and force a known drain cadence. That call **blocked the
+    main thread** waiting for the sender's queue to drain, and on the
+    2026-05-10 H200 run we observed periodic ~3-min idle windows during
+    Phase B (GPU=1%) coinciding with the sender being unable to upload to
+    the trackio bucket (the dashboard stayed empty for the entire run). A
+    blocked sender + synchronous flush = a stalled main thread. The fix is
+    to never block the main thread on the sender: the sender keeps running
+    on its own; if it's healthy we get metrics, if it's dead we lose
+    visibility but the calibration loop runs at full speed. A future fix
+    can move the flush to a daemon-thread heartbeat, but that's not the
+    bottleneck for getting Stage 1 to finish.
     """
     def _cb(i: int) -> None:
         n_done = i + 1
@@ -116,7 +123,6 @@ def _make_calibration_progress_cb(phase_tag: str, n_total: int, log_every: int =
                 f"stage1/{phase_tag}/calibration_progress": n_done / n_total,
                 f"stage1/{phase_tag}/calibration_step": n_done,
             })
-            _trackio_flush()
     return _cb
 
 
