@@ -40,18 +40,23 @@ RUN pip install --upgrade pip wheel setuptools packaging
 
 # torch first against the cu124 wheel index — separate from requirements.txt so
 # we don't accidentally pull a CPU-only build via the default PyPI resolver.
+# Capture the installed wheel as a constraint so pip's resolver cannot
+# back-track and pull a cu130 torch from the default PyPI index when transitive
+# deps (e.g. bitsandbytes) want a higher version.
 RUN pip install --index-url https://download.pytorch.org/whl/cu124 \
-        "torch>=2.5.0,<2.11.0"
+        "torch>=2.5.0,<2.11.0" \
+    && pip freeze | grep '^torch==' > /tmp/torch-constraint.txt
 
-# Bulk install of pinned deps. requirements.txt also lists torch (for reference);
-# pip will see it's already satisfied and skip.
+# Bulk install of pinned deps. The constraint file pins torch to the exact
+# cu124 wheel above, preventing accidental upgrade to a cu130 build that
+# would mismatch the base image's CUDA 12.6 nvcc.
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install -r /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt -c /tmp/torch-constraint.txt
 
 # Compiled fast-path kernels need --no-build-isolation so they can see the
 # already-installed torch + cuda toolkit during their setup.py.
 # Re-pinned here in case a base image already had stale versions.
-RUN pip install --no-build-isolation \
+RUN pip install --no-build-isolation -c /tmp/torch-constraint.txt \
         "causal-conv1d>=1.4.0" \
         "flash-linear-attention>=0.1.2"
 
