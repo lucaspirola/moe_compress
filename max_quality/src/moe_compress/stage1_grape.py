@@ -69,7 +69,7 @@ from .utils.model_io import (
 )
 from .utils.sink_token_routing import (
     SinkTokenRoutingAccumulator,
-    apply_sink_token_extension,
+    apply_sink_token_candidate_selection,
 )
 from .utils.trackio_log import trackio_flush as _trackio_flush
 from .utils.trackio_log import trackio_log as _trackio_log
@@ -953,6 +953,31 @@ def _apply_paper_criterion(
     return blacklist
 
 
+def _magnitude_topk_candidates(
+    per_expert_max: dict[tuple[int, int], float],
+    L: set[int],
+    top_k: int,
+) -> set[tuple[int, int]]:
+    """For each ``l ∈ L``, pick the top-``top_k`` experts by ``per_expert_max``.
+
+    Catches large-magnitude experts within MA-formation layers that don't quite
+    cross the three-way AND but should still go through Phase D ablation. See
+    [D-magnitude-topk-candidates] in ALGORITHM_REFERENCE.md §12.
+    """
+    if top_k <= 0 or not L:
+        return set()
+    by_layer: dict[int, list[tuple[int, float]]] = {}
+    for (li, e), v in per_expert_max.items():
+        if li in L:
+            by_layer.setdefault(int(li), []).append((int(e), float(v)))
+    out: set[tuple[int, int]] = set()
+    for li, lst in by_layer.items():
+        lst.sort(key=lambda t: -t[1])
+        for e, _ in lst[:top_k]:
+            out.add((li, e))
+    return out
+
+
 def _collect_candidates(
     *,
     per_expert_max: dict[tuple[int, int], float],
@@ -1000,35 +1025,20 @@ def _collect_candidates(
 
     # Source 3: sink-token routing, capped per-layer by score-ratio rank
     if sink_enabled and sink_acc is not None:
-        flagged = apply_sink_token_extension(
+        sink_pairs = apply_sink_token_candidate_selection(
             sink_acc.mean_router_score_sink,
             sink_acc.mean_router_score_normal,
             sink_acc.freq_on_sink,
-            existing_blacklist={},
             score_ratio=sink_score_ratio,
             freq_threshold=sink_freq_threshold,
+            max_per_layer_cap=sink_max_per_layer_cap,
         )
-        for li, exps in flagged.items():
-            ranked = sorted(
-                exps,
-                key=lambda e: -(
-                    sink_acc.mean_router_score_sink.get((li, e), 0.0)
-                    / max(sink_acc.mean_router_score_normal.get((li, e), 0.0), 1e-9)
-                ),
-            )
-            for e in ranked[:sink_max_per_layer_cap]:
-                out.setdefault((int(li), int(e)), set()).add("sink_token")
+        for (li, e) in sink_pairs:
+            out.setdefault((li, e), set()).add("sink_token")
 
     # Source 4: magnitude top-K per l ∈ L
-    if magnitude_topk_per_l_layer > 0 and L:
-        by_layer: dict[int, list[tuple[int, float]]] = {}
-        for (li, e), v in per_expert_max.items():
-            if li in L:
-                by_layer.setdefault(li, []).append((e, v))
-        for li, lst in by_layer.items():
-            lst.sort(key=lambda t: -t[1])
-            for e, _ in lst[:magnitude_topk_per_l_layer]:
-                out.setdefault((int(li), int(e)), set()).add("magnitude_topk")
+    for (li, e) in _magnitude_topk_candidates(per_expert_max, L, magnitude_topk_per_l_layer):
+        out.setdefault((li, e), set()).add("magnitude_topk")
 
     return {key: sorted(tags) for key, tags in out.items()}
 

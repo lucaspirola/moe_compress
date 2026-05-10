@@ -150,7 +150,12 @@ def apply_sink_token_extension(
     freq_threshold: float,
 ) -> dict[int, list[int]]:
     """Return per-layer expert ids that meet the sink-token auto-extension criterion
-    AND are not already in `existing_blacklist`."""
+    AND are not already in `existing_blacklist`.
+
+    Deprecated in v6 — kept for backward compatibility with the legacy auto-extension
+    flow. New callers should use :func:`apply_sink_token_candidate_selection` which
+    additionally enforces a per-layer cap on candidate count.
+    """
     already = {(li, e) for li, lst in existing_blacklist.items() for e in lst}
     out: dict[int, list[int]] = {}
     for key, s_sink in mean_score_sink.items():
@@ -163,4 +168,37 @@ def apply_sink_token_extension(
             out.setdefault(key[0], []).append(key[1])
     for li in out:
         out[li] = sorted(out[li])
+    return out
+
+
+def apply_sink_token_candidate_selection(
+    mean_score_sink: dict[tuple[int, int], float],
+    mean_score_normal: dict[tuple[int, int], float],
+    freq_on_sink: dict[tuple[int, int], float],
+    *,
+    score_ratio: float,
+    freq_threshold: float,
+    max_per_layer_cap: int,
+) -> set[tuple[int, int]]:
+    """v6 sink-token candidate generator (D-sink-token-routing).
+
+    Returns the set of ``(layer, expert)`` pairs that pass both thresholds:
+    ``score_sink / max(score_normal, EPS) > score_ratio`` AND
+    ``freq_on_sink > freq_threshold``. Per-layer count is capped at
+    ``max_per_layer_cap`` (sorted by score-ratio descending).
+
+    Replaces :func:`apply_sink_token_extension` for the v6 candidate-pool flow.
+    """
+    by_layer: dict[int, list[tuple[int, float]]] = {}
+    for key, s_sink in mean_score_sink.items():
+        s_norm = mean_score_normal.get(key, 0.0)
+        f_sink = freq_on_sink.get(key, 0.0)
+        ratio = s_sink / max(s_norm, EPS)
+        if ratio > score_ratio and f_sink > freq_threshold:
+            by_layer.setdefault(int(key[0]), []).append((int(key[1]), float(ratio)))
+    out: set[tuple[int, int]] = set()
+    for li, lst in by_layer.items():
+        lst.sort(key=lambda t: -t[1])
+        for e, _ in lst[:max_per_layer_cap]:
+            out.add((li, e))
     return out
