@@ -120,6 +120,12 @@ def test_phase_a_dual_signal_or_rule():
         residual_threshold=3.0, moe_threshold=2.0,
     ) is False
 
+    # Both above → flag (completes the OR truth table)
+    assert _flag_layer_dual_signal(
+        residual_ratio=4.0, moe_ratio=2.5,
+        residual_threshold=3.0, moe_threshold=2.0,
+    ) is True
+
 
 def test_ma_formation_fallback_when_dynamic_empty(tiny_model, tiny_config, tmp_path, monkeypatch):
     """If the dynamic detector finds nothing, the 0.75-depth fallback must populate L
