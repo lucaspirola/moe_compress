@@ -37,8 +37,9 @@ from transformers import PreTrainedTokenizerBase
 from ..adapters.base import ModelAdapter
 from ..config import Config
 from ..eval.quick import run as eval_run
-from ..io.save import SAVE_COMPLETE_SENTINEL, save_partial
+from ..io.save import SAVE_COMPLETE_SENTINEL, save_kdr_artifact, save_partial
 from ..kd_loss import forward_kld_loss
+from ..quant.interface import QuantBackend
 from .optim import build_optimizer, cosine_with_warmup, set_lr
 from .zero3_init import activate_zero3_init, is_deepspeed
 
@@ -85,21 +86,35 @@ def run_recovery(
         )
 
         # REQ: LLR-0007
+        active_backends: list[QuantBackend] = []
+        # Fetched once and cached so the same list flows into both
+        # `partition_and_dispatch` (where it shapes ModelOpt's `ignore` config)
+        # and Stage 6's `save_kdr_artifact` (where it shapes config.json's
+        # `ignore` list per LLR-0020 AC #3). Re-querying the adapter at
+        # Stage 6 would inspect the post-`accelerator.prepare` (DDP-wrapped)
+        # student, whose dotted module paths carry a `module.` prefix and
+        # would diverge from the patterns ModelOpt was configured with at
+        # `apply_quant` time.
+        cached_fp32_carve_outs: list[str] = []
         if config.mode == "da_qad":
             if config.quant is None:
                 raise ValueError(
                     "Config.quant is required in da_qad mode (HLR-0003)."
                 )
-            # Phase 4 implementation lands the actual dispatch. Phase 3b's
-            # bf16 path verifies the loop without entering this branch; the
-            # call is named here so LLR-0007's "exactly one if/else branch"
-            # AC is structurally satisfied.
+            # Phase 4 implementation: real dispatch with calibration batches
+            # and adapter-supplied carve-outs / attention paths.
             from ..quant.factory import partition_and_dispatch
 
-            # Phase 4 will widen the factory signature to accept calibration
-            # batches (LLR-0042 PTQ subset). Phase 3b's bf16 path never enters
-            # this branch, so the current 2-arg signature is sufficient.
-            partition_and_dispatch(student, config.quant)
+            cached_fp32_carve_outs = adapter.fp32_carve_outs(student)
+            active_backends = partition_and_dispatch(
+                student,
+                config.quant,
+                calibration_batches=batches,
+                ptq_subset_size=config.calibration.ptq_subset_size,
+                fp32_carve_outs=cached_fp32_carve_outs,
+                attention_module_paths=adapter.attention_module_paths(student),
+                kv_quant_exempt_indices=adapter.kv_quant_exempt_indices(student),
+            )
 
     # ── Stage 2: trainable scope + optimizer + accelerator.prepare ────────
     _enable_trainable_scope(student, scope=config.distillation.trainable_scope)
@@ -136,7 +151,30 @@ def run_recovery(
     ).run()
 
     # ── Stage 6: final save ───────────────────────────────────────────────
+    # Branching on `active_backends` (rather than re-checking the mode flag)
+    # preserves LLR-0007 AC #1's single-mode-branch invariant: the only
+    # mode-equality site is in Stage 1 above, where it populates
+    # `active_backends`. A non-empty list ⇒ da_qad path took effect, an
+    # empty list ⇒ bf16.
     final_step = max(0, _read_step_from_metadata(artifacts_dir, config.mode))
+    if active_backends:
+        # da_qad: compressed-tensors save via the active backend's converter
+        # (LLR-0018 / LLR-0021). Final dir is sibling to partials.
+        assert config.quant is not None  # Guarded in Stage 1.
+        final_dir = artifacts_dir / f"kdr_{config.mode}_recovered"
+        if accelerator.is_main_process:
+            save_kdr_artifact(
+                accelerator.unwrap_model(student),
+                final_dir,
+                backends=active_backends,
+                quant_block=config.quant,
+                fp32_carve_outs=cached_fp32_carve_outs,
+                tokenizer=tokenizer,
+                source_metadata_path=source_metadata_path,
+            )
+        accelerator.wait_for_everyone()
+        return final_dir
+    # bf16: vanilla save_partial(..., partial=False).
     return save_partial(
         student,
         tokenizer,
