@@ -56,8 +56,13 @@ def test_highly_redundant_layer_gets_smaller_budget(tiny_model, tiny_config, tmp
     assert budgets[0] <= budgets[1]
 
 
-def test_blacklist_schema_three_top_level_keys(tiny_model, tiny_config, tmp_path):
-    """stage1_blacklist.json must have exactly {blacklist, per_expert_max, config}."""
+def test_blacklist_schema_seven_top_level_keys(tiny_model, tiny_config, tmp_path):
+    """stage1_blacklist.json must have exactly the 7 documented top-level keys.
+
+    Locks the post-Task-7 schema (Phase C base + Phase C+ AIMER + sink-token +
+    dual-signal + provenance). Renamed from `_three_top_level_keys` when the
+    schema was extended.
+    """
     decomp = BudgetDecomposition(
         total_reduction_ratio=0.20,
         expert_prune_ratio=0.25,
@@ -69,7 +74,10 @@ def test_blacklist_schema_three_top_level_keys(tiny_model, tiny_config, tmp_path
     stage1_grape.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
 
     bl = json.loads((tmp_path / "stage1_blacklist.json").read_text())
-    assert set(bl.keys()) == {"blacklist", "per_expert_max", "config"}
+    assert set(bl.keys()) == {
+        "blacklist", "per_expert_max", "config",
+        "blacklist_provenance", "dual_signal", "aimer", "sink_token",
+    }
 
 
 def test_three_way_AND_criterion():
@@ -170,10 +178,12 @@ def test_ma_formation_fallback_when_dynamic_empty(tiny_model, tiny_config, tmp_p
 
 
 def test_blacklist_inner_config_keys(tiny_model, tiny_config, tmp_path):
-    """stage1_blacklist.json['config'] inner block must pin exactly these 7 keys.
+    """stage1_blacklist.json['config'] inner block must pin exactly these 12 keys.
 
-    Locks the spec §4 Phase C config schema so a future addition/removal is caught here
-    rather than silently broken by downstream consumers (regression for code-vs-spec L-2).
+    Locks the spec §4 Phase C/C+ config schema so a future addition/removal is
+    caught here rather than silently broken by downstream consumers (regression
+    for code-vs-spec L-2). Extended from 7 → 12 keys with Task 7 (AIMER +
+    sink-token + dual-signal moe_output_growth_ratio).
     """
     decomp = BudgetDecomposition(
         total_reduction_ratio=0.20,
@@ -190,10 +200,15 @@ def test_blacklist_inner_config_keys(tiny_model, tiny_config, tmp_path):
         "a_max_fraction",
         "ma_ratio",
         "ma_growth_ratio",
+        "moe_output_growth_ratio",
         "ma_formation_layers",
         "p995_threshold",
         "a_max_absolute",
         "a_max_threshold",
+        "aimer_bottom_pct",
+        "aimer_layer_max_fraction",
+        "sink_token_score_ratio",
+        "sink_token_freq_threshold",
     }
     assert set(bl["config"].keys()) == expected_keys, (
         f"stage1_blacklist.json['config'] keys drift: "
