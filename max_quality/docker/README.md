@@ -28,6 +28,8 @@ What it does **not** carry: the model snapshot (~70 GB) or the project code. Bot
 
 ## vast.ai operator runbook
 
+Prerequisite: install the `vastai` CLI (`pip install vastai`) and set the API key once with `vastai set api-key <KEY>` — it persists at `~/.config/vastai/vast_api_key` and is auto-read by every subsequent invocation. Upload your SSH public key at https://cloud.vast.ai/account/.
+
 ### 1. Find an instance
 
 Filter for an A100 80 GB DC node with reasonable bandwidth:
@@ -135,6 +137,19 @@ If you have a local CUDA box, you can also check the kernels load:
 docker run --rm --gpus all moe-compress:dev \
     python -c "import torch, fla, causal_conv1d; print(torch.cuda.get_device_name(0))"
 ```
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| First container start sits at "Pulling fs layer" for 5–10 min | Image is ~30 GB; vast.ai host hasn't pulled it before | Wait. Subsequent rentals on the same machine reuse the cached image. |
+| `[bootstrap] FATAL: nvidia-smi not on PATH` | Container started without `--gpus all` | Misconfigured host runtime; destroy the instance and pick a different offer. |
+| `huggingface-cli login` fails with 401 | `HF_TOKEN` invalid, expired, or read-only | Confirm scope at https://huggingface.co/settings/tokens — write is needed for `UPLOAD_ON_SUCCESS=1` and for Trackio dashboards. |
+| `snapshot_download` HTTP 429 | HF Hub anonymous rate limit | The bootstrap is idempotent on `/cache`; relaunch with the same `CACHE_MOUNT` and the partial snapshot resumes. |
+| GHCR `docker pull` fails with `denied` | Image visibility regressed to private | Flip back to public via https://github.com/users/lucaspirola/packages/container/moe-compress/settings (web UI only — GitHub's REST API has no PATCH-visibility endpoint for user-owned packages). |
+| NCCL hang at model load | Multi-GPU launch on a host with broken NCCL fabric | Multi-GPU is not validated for this image — keep `num_gpus=1` in the offer filter. |
 
 ---
 
