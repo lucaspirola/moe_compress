@@ -168,7 +168,7 @@ end for
 
 Using across-batch maxima is valid because MAs are input-stable: 'their distribution remains stable across different input datasets' (paper §3.2.1 last paragraph at lines 405–406, foreshadowing the cross-domain study formalized in §3.2.2).
 
-**Sampling parameters (project-specified — see [D-ma-detector](#12-known-deviations-from-papers) items 4-5):** Phase A uses `phase_a_batch_size = 4` (Phase A only tracks max magnitudes, batch-size invariant). Phase B uses `phase_b_batch_size = 8` — every Phase B accumulator (`DownProjMaxAccumulator`, `ExpertOutputAccumulator` reservoir sampling, `SinkTokenRoutingAccumulator` vectorized reduction) handles arbitrary `B`; the prior `bs=1` was inherited from a per-token routing-instrumentation path that the vectorization eliminated. The live H200 run at bs=1 used 94.6/150.8 GB VRAM (37% free, ~25 GB non-model state); at bs=8 the activation portion scales ~8× while the CKA reservoir + max accumulator are batch-invariant, yielding a projected ~120-130 GB total with ~20-30 GB headroom. Cuts Phase B forward-pass count from 1024 to 128. Phase F (post-hoc ablation) uses the same `batch_size = 8` for its held-out forward passes (Phase B accumulators stay resident, so the memory budget matches). `num_calibration_samples = 1024` (down from 4000; saturates per-layer max and the 256-token reservoir while staying within the < 5% Frobenius drift threshold reported in 2603.18492's calibration sensitivity figure). See §2 calibration table for the cross-stage view.
+**Sampling parameters (project-specified — see [D-ma-detector](#12-known-deviations-from-papers) items 4-5):** Phase A uses `phase_a_batch_size = 32` (Phase A only tracks max magnitudes, batch-size invariant; v4 ran at bs=4 with 76.2 GB VRAM headroom). Phase B uses `phase_b_batch_size = 8` — every Phase B accumulator (`DownProjMaxAccumulator`, `ExpertOutputAccumulator` reservoir sampling, `SinkTokenRoutingAccumulator` vectorized reduction) handles arbitrary `B`; the prior `bs=1` was inherited from a per-token routing-instrumentation path that the vectorization eliminated. The live H200 run at bs=1 used 94.6/150.8 GB VRAM (37% free, ~25 GB non-model state); at bs=8 the activation portion scales ~8× while the CKA reservoir + max accumulator are batch-invariant, yielding a projected ~120-130 GB total with ~20-30 GB headroom. Cuts Phase B forward-pass count from 1024 to 128. Phase D (ablation filter) uses `ablation_filter_batch_size = 32` for its held-out forward passes — Phase B accumulators stay resident through Phase D since Phase E (CKA) still consumes them; held-out cache adds little overhead (~115-125 GB total on H200; verify bs=32 first run, drop to 16 if VRAM near 145 GB). `num_calibration_samples = 1024` (down from 4000; saturates per-layer max and the 256-token reservoir while staying within the < 5% Frobenius drift threshold reported in 2603.18492's calibration sensitivity figure). See §2 calibration table for the cross-stage view.
 
 **Why L matters:** The paper documents that some experts also produce extreme down_proj output magnitudes outside the MA-formation layers — these are called "outlier experts" (Table 7: L1E8, L47E48, L47E100 for Qwen3-30B-A3B; see Appendix C). Tables 6 and 7 are internally inconsistent for the first outlier expert in this model (Table 6: "Layer 47 Expert 8"; Table 7: "Layer 1 Expert 8") (the Table-6 entry 'Layer 47 Expert 8' is almost certainly a typo for 'Layer 1 Expert 8'; spec follows Table 7's L1E8 reading); this spec follows Table 7 (L1E8). These outlier experts do not contribute to MA formation and are not SEs. Not all outlier experts are excluded by the L-filter: L1E8 sits in Layer 1, which is an MA-formation layer (l ∈ L); Table 7 lists it as an outlier expert that is not classified as an SE, implying it fails the magnitude thresholds rather than being excluded by the L-filter (spec inference; paper does not explicitly classify why L1E8 fails the SE criterion). L47E48 and L47E100 sit outside L and are excluded by the L-filter. The l ∈ L constraint ensures that late-layer outlier experts outside L could not be blacklisted even if their magnitudes were large enough to satisfy the P99.5 and 0.1·a_max thresholds. Appendix C establishes that outlier experts lack the mechanistic significance of SEs but does not assert they would or would not pass the numerical thresholds.
 
@@ -180,92 +180,50 @@ Using across-batch maxima is valid because MAs are input-stable: 'their distribu
 
 #### Phase B: Calibration Pass 2 — Expert Magnitude + CKA (256 samples)
 
-All MoE layers are instrumented simultaneously. `run_calibration` runs once over all 256 samples (this is the second of the two passes; it is driven by Algorithm 1 (Appendix L) Stage 2, which covers expert magnitude collection for l ∈ L (Phase B = magnitude + CKA collection); thresholding and SE selection are described in Phase C (Phase C = thresholding + SE selection) — the CKA collection for GRAPE is performed in the same pass as a pipeline efficiency choice but is not specified by Algorithm 1), collecting two things per (layer, expert):
+All MoE layers are instrumented simultaneously. `run_calibration` runs once over all 256 samples (this is the second of the two passes; it is driven by Algorithm 1 (Appendix L) Stage 2, which covers expert magnitude collection for l ∈ L (Phase B = magnitude + CKA + sink-routing collection); candidate generation is described in Phase C (Phase C = candidate-set construction over four detectors); ablation filtering and final blacklist construction happen in Phase D — the CKA collection for GRAPE is performed in the same pass as a pipeline efficiency choice but is not specified by Algorithm 1), collecting two things per (layer, expert):
 
 1. **Max activation magnitude** `max_{x∈D} |h_{l,e}(x) · W^{l,e}_{down_proj}|` — for super expert detection. Here `h_{l,e}(x)` is the intermediate activation entering the down_proj of expert `e` in layer `l`, and the magnitude is measured at the down_proj **output** (post-weight-multiplication), exactly as stated in Algorithm 1 line 19.
 2. **Expert output representations** `f_e(x)` — for CKA pairwise similarity computation
 
 The expert output representations are accumulated into per-layer representation matrices for CKA via reservoir sampling (**cap = 256 tokens per expert**, project-specified; see [D-ma-detector](#12-known-deviations-from-papers) which bundles all Stage 1 sampling/threshold project choices).
 
-#### Phase C: Super Expert Detection (Paper 2507.23279, Eq. 6 + Algorithm 1 Stage 2)
+#### Phase C: Candidate Generation
 
-Using the MA-formation layer set `L` constructed in Phase A, Stage 1 computes the global set `A = {a_{l,e}}` of max down_proj output magnitudes restricted to layers in `L`, then applies the three-way AND criterion from Eq. 6. Emit `stage1_blacklist.json`.
+Phase C produces a **candidate set** by union of four detectors. The candidate set is broad on purpose — false candidates cost ablation time in Phase D but cannot reach the final blacklist without ablation evidence. Each candidate carries a `provenance` list naming which detector(s) flagged it.
 
-**Algorithm (Algorithm 1 — Stage 2 block, lines 14–32; line 13 is the `Stage 2:` section header; the `l ∈ L` restriction is enforced at the layer-loop header on line 16):**
+**Candidate sources:**
 
-```
-A ← ∅
-for each batch x ∈ D:
-    for each layer l ∈ L:
-        for each expert e in layer l:
-            a_{l,e} ← running max of |h_{l,e}(x) · W^{l,e}_{down_proj}| across batches
-            A ← A ∪ {a_{l,e}}
+1. **Three-way AND** (paper 2507.23279 Eq. 6, restricted to `l ∈ L`): `per_expert_max(l, e) > P99.5(A) AND > a_max_fraction · a_max AND l ∈ L`. Historically the highest-precision source. `A = {a_{l,e}}` is the set of all max down_proj output magnitudes across experts in MA-formation layers; `P99.5(A)` and `a_max = max(A)` are the global thresholds. The l ∈ L restriction follows Algorithm 1 (Stage 2 block, lines 14–32) at the layer-loop header on line 16; spec note on §3.2.1 vs Algorithm 1 at [D-SE-A](#12-known-deviations-from-papers).
 
-# Note: a_{l,e} is maintained as a running maximum accumulated across batches,
-# consistent with how Algorithm 1 is actually implemented.
-# (spec rendering of paper line 19 max_{x∈D}: implementation maintains a running
-# max across batches, mathematically equivalent to one max over the full
-# calibration set D)
+2. **AIMER bottom-pct** (see [D-aimer-cross-check](#12-known-deviations-from-papers)): bottom-`aimer_bottom_pct` (=1%) per layer by AIMER score, gated by `per_expert_max[l] > aimer_layer_max_fraction · a_max`. Weight-only signal; small candidate count.
 
-P99.5 ← Percentile_99.5(A)     # global, across all (l,e) with l ∈ L
-a_max ← max(A)                  # global maximum
+3. **Sink-token routing** (see [D-sink-token-routing](#12-known-deviations-from-papers)): `freq_on_sink > sink_token_freq_threshold` (=0.99) AND `score_sink/score_normal > sink_token_score_ratio` (=10×) AND not exceeding `sink_token_max_per_layer_cap` (=10) per layer. Tighter thresholds than v4 because v4 saturated at 1.0 for many non-SE experts on this architecture; the per-layer cap bounds the candidate-set size when sink-token routing is broadly distributed.
 
-S ← ∅
-for each (l, e) with a_{l,e} ∈ A:
-    if a_{l,e} > P99.5  AND  a_{l,e} > 0.1 · a_max:
-        S ← S ∪ {(l, e)}
-return S  # emitted as stage1_blacklist.json
-```
+4. **Magnitude top-K in `l ∈ L`** (see [D-magnitude-topk-candidates](#12-known-deviations-from-papers)): for each `l ∈ L`, top-`magnitude_topk_per_l_layer` (=16) experts by `per_expert_max(l, ·)` not already flagged by sources 1-3. Catches SEs whose magnitude doesn't quite cross the three-way AND but is still large; K=16 = 2× the model's active-experts-per-token (top-8 routing).
 
-**Three-way AND criterion (Eq. 6):**
+**De-duplication** is by `(layer, expert)` pair; provenance is the union of all sources that flagged the candidate. Final filter is Phase D's ablation pass.
 
-```
-blacklisted(l, e) = a_{l,e} > P99.5(A)  AND  a_{l,e} > 0.1 · a_max  AND  l ∈ L
-```
+**Empirical scale (paper 2507.23279):** SEs account for fewer than 0.5% of all experts across the MoE models studied (Table 1: 0.05% for Qwen3-30B-A3B, 0.06% for DeepSeek-R1, 0.11% for DeepSeek-V2-Lite-Chat, 0.39% for Mixtral-8x7B-Instruct-v0.1). Source 1 alone reproduces the paper's canonical SE set on Qwen3-30B-A3B (Table 2: L1E68, L2E92, L3E82); v6 broadens the candidate pool with sources 2-4 to catch architecture-shifted SEs that the static three-way AND threshold misses on Qwen3.6.
 
-where:
-- `A = {a_{l,e}}` is the set of all max down_proj output magnitudes across all experts in MA-formation layers (l ∈ L)
-- `P99.5(A) = Percentile_99.5(A)` is the 99.5th percentile of this global set
-- `a_max = max(A)` is the global maximum across all (l, e) in L
-- `L` is the MA-formation layer set from Phase A
+#### Phase D: Ablation Filter (replaces static-threshold blacklist construction; see [D-causal-ablation-validation](#12-known-deviations-from-papers))
 
-> **Note on §3.2.1 vs Algorithm 1:** The paper's §3.2.1 prose defines A as covering all such values across the entire model, while Algorithm 1 (Stage 2 block, lines 14–32) restricts the inner loop to l ∈ L at the layer-loop header on line 16. The spec follows Algorithm 1 as the more precise procedural definition — A is computed only over MA-formation layers. (see [D-SE-A](#12-known-deviations-from-papers))
+Phase D ablates each candidate produced by Phase C and keeps only those with measurable causal impact.
 
-All three conditions are required simultaneously. The l ∈ L constraint is enforced implicitly by restricting A to MA-formation layers — only experts in those layers are candidates.
+**Procedure:**
 
-**Empirical scale:** SEs account for fewer than 0.5% of all experts across the MoE models studied in the paper (Table 1: 0.05% for Qwen3-30B-A3B, 0.06% for DeepSeek-R1, 0.11% for DeepSeek-V2-Lite-Chat, 0.39% for Mixtral-8x7B-Instruct-v0.1). The paper sets no hard cap on SE count — the three-way AND criterion is purely threshold-based and the extremely tight thresholds (P99.5 AND 0.1·a_max) are self-limiting by design.
+1. **Held-out slice**: 100 calibration samples drawn with a deterministic seed offset distinct from Phase A/B, cached at `_calibration_cache_phase_d/`.
 
-**Calibration check:** For models where the paper has published the canonical SE set, the Phase C output should be verified against it as a model-specific regression check. For example, for Qwen3-30B-A3B the paper reports (Table 2): Layer 1 Expert 68, Layer 2 Expert 92, Layer 3 Expert 82 (paper Table 1 row Qwen3-30B-A3B; SE Count = 3). This is provided as a verification reference for that specific model checkpoint — it is not a hardcoded list and other models will produce different SE sets. A compliant implementation should reproduce the paper's canonical set on the paper's target model before being applied to new models.
+2. **Baseline**: forward over the held-out slice with no ablation; record mean per-token NLL `baseline_nll`.
 
-**AIMER weight-only auto-extension (Qwen3.5/3.6 — see [D-aimer-cross-check](#12-known-deviations-from-papers)):** After the three-way AND blacklist is computed, Stage 1 computes a per-expert AIMER score (arxiv:2603.18492):
+3. **For each candidate `(l, e)`**: install a forward hook that zeros expert `e`'s `down_proj` output during the forward; measure `ablated_nll`; ΔNLL = `ablated_nll − baseline_nll`. Remove hook; restore.
 
-```
-AIMER(e) = ||vec(W_down^{l,e})||_1 / (sqrt(N) · ||vec(W_down^{l,e})||_2)
-```
+4. **Filter**: blacklist = `{(l, e) | ΔNLL > ablation_filter_threshold}` (default 0.001 ≈ 0.1% PPL impact). Per-candidate ΔNLL retained in artifact for audit.
 
-where `N = numel(W_down)`. Lower AIMER = more concentrated/peaky weights = more critical (less replaceable). For each MoE layer, identify the AIMER bottom-`aimer_bottom_pct` (= 1% by default — for 256-expert layers this is 2-3 experts/layer). An expert `(l, e)` is **auto-added to the blacklist** if **all three** hold:
+**Cost**: ~`|candidates|` × forward-pass time. At `ablation_filter_batch_size = 32` and 100 holdout samples (≈4 batches per candidate), each candidate takes ~10 sec → ~10–17 min for a 60–100 candidate set. Phase D runs while Phase B's accumulators are still resident (Phase E (CKA) consumes them), so Phase D's resident memory is Phase B's footprint **plus** the held-out cache (~115–125 GB total on H200; verify on first run).
 
-1. `AIMER(l, e)` is in the layer's bottom-`aimer_bottom_pct`,
-2. `max_e' per_expert_max(l, e')` (the layer's expert-level magnitude max) `> aimer_layer_max_fraction · a_max_absolute`,
-3. `(l, e)` is not already blacklisted by Phase C.
+**Why this is load-bearing**: the v4 run produced a 158-expert blacklist of which only 5 had measurable ablation impact (144 dead-weight, 9 false positives that *hurt* PPL when protected). Static thresholds are fragile across architectures; ablation is ground truth.
 
-Provenance is recorded in `blacklist_provenance` so downstream tools can distinguish phase_c-blacklisted experts from auto-extensions. Cost: zero forward passes — pure weight inspection. Risk floor: condition (2) ensures AIMER never extends a "cold" layer where no expert produced large activations on calibration data.
-
-**Sink-token routing auto-extension (Qwen3.5/3.6 — see [D-sink-token-routing](#12-known-deviations-from-papers)):** During Phase B, the router output of every MoE layer is captured concurrently with the existing expert-output instrumentation. Per (layer, expert), three running statistics are aggregated:
-
-- `mean_router_score_on_sink_tokens` — mean post-softmax routing weight on sink-token positions (positions where input_id == BOS_token_id ∪ position 0 of each sequence).
-- `mean_router_score_on_normal_tokens` — same statistic on non-sink positions.
-- `activation_frequency_on_sink_tokens` — fraction of sink tokens **observed by this layer** at which the expert appears in the top-k routed set. The denominator is the per-layer count of sink tokens across all calibration batches (every layer sees the same calibration data, so the per-layer counts are identical to the global count, but the per-layer normalization is the well-defined contract — see [D-sink-token-routing](#12-known-deviations-from-papers)).
-
-An expert `(l, e)` is **auto-added to the blacklist** if **all three** hold:
-
-1. `mean_router_score_on_sink / max(mean_router_score_on_normal, ε) > sink_token_score_ratio` (default 5.0),
-2. `activation_frequency_on_sink_tokens > sink_token_freq_threshold` (default 0.95),
-3. `(l, e)` is not already blacklisted by Phase C or by AIMER.
-
-Provenance is recorded in `blacklist_provenance` ("sink_token"). The detector is architecturally independent of residual-stream magnitudes — it flags experts whose routing pattern is sink-token-dominated, the structural fingerprint of an SE per the Super Experts paper Figures 20-21 (appendix). De-duplication against both Phase C and the AIMER extension means sink-token can never duplicate an existing blacklist decision.
-
-#### Phase D: CKA Distance Matrices
+#### Phase E: CKA Distance Matrices
 
 For each MoE layer, compute the pairwise CKA **distance** matrix `D^l ∈ ℝ^{N×N}` where `D^l_{ij} = 1 − CKA(f_i, f_j)` (distance, not raw similarity: 0 = identical, 1 = maximally different). CKA measures functional similarity between experts based on their response patterns to actual inputs — two experts that produce similar outputs on the calibration data have high CKA and thus low distance D^l_{ij}. The paper's `D^l` is a *similarity* (GRAPE 2604.06542 line 245) and selects pairs with `argmax`; this spec uses the distance form `1 − CKA` and `argmin`, an equivalent sign-flip documented at [D-cka-distance](#12-known-deviations-from-papers).
 
@@ -273,7 +231,7 @@ Paper §3.3 explicitly allows "CKA, mean squared error, or other similarity meas
 
 With 256 samples × 2048 tokens ≈ 524K total token activations across the layer (each expert sees only its top-k/N routed fraction; for top-8 over 256 experts that is ≈ 16K per expert before sampling), reservoir-sampled to 256 per expert for CKA so the kernel matrices are well-conditioned for 256-expert layers.
 
-#### Phase E: GRAPE Algorithm 1 (entropy-aware greedy merge with restart)
+#### Phase F: GRAPE Budget Allocation
 
 **SE blacklist interaction (spec-original integration of Phases A and B; see [D-se-blacklist-merge](#12-known-deviations-from-papers)):** Before the greedy loop, each SE's row and column in `D^l` are zeroed so SEs never participate in pair selection and their distances do not contribute to `R^l`. SE cluster slots are subtracted from both `cluster_counts` and the global budget (`effective_budget = global_budget − total_SEs`), so the loop terminates when the non-SE surviving count meets the non-SE budget. The floor is also applied to the non-SE pool only: `floor_l = max(min_experts − |SE_l|, 0)`.
 
@@ -289,18 +247,6 @@ With 256 samples × 2048 tokens ≈ 524K total token activations across the laye
    - If `E < Ê` → **freeze** layer `l*` (paper line 12); else continue. (See [D-grape-restart-merge](#12-known-deviations-from-papers) for the second restart path: lag-corrected post-selection restart, which is project-original.)
 
 3. **Floor constraint:** `min_experts_per_layer = num_routed_experts // 2` (= 128 for 256-expert layers). Applied to the non-SE pool per layer. No early/late layer bonuses — the floor alone provides sufficient protection at 50% max removal per layer (see [D5](#12-known-deviations-from-papers)).
-
-#### Phase F: Post-hoc Causal Ablation Validation (project-original; see [D-causal-ablation-validation](#12-known-deviations-from-papers))
-
-After Phase C and the AIMER + sink-token auto-extensions converge, Stage 1 runs a held-out NLL-impact validation pass:
-
-1. **Validation set**: a held-out 100-sample slice of the calibration data not used for Phase A/B (seeded subset, deterministic).
-2. **Baseline**: forward pass over the validation set; record token-level NLL (mean cross-entropy per shifted token).
-3. **For each blacklisted expert `(l, e)`**: zero its `down_proj` output during the forward pass (single-expert ablation hook); record ΔNLL relative to baseline.
-4. **For top-`topk_nonblacklisted` (default 5) non-blacklisted experts per `l ∈ L`** (sorted by `per_expert_max(l, ·)` descending, excluding already-blacklisted): run the same single-expert ablation; record ΔNLL.
-5. **Report**: emit `stage1_post_hoc_ablation.json` with `{ablated_id: ΔNLL}` for both groups. **No automatic blacklist mutation** — the operator inspects the report and decides whether the ΔNLL gradient indicates a missed SE.
-
-Cost (Qwen3.6-35B-A3B, H200): ~`(|blacklist| + |L| · 5)` forward passes × `(100 sample / 2048 token)` batches. With `|L|=3`, `|blacklist|≈10`, this is ~25 forward passes ≈ 30 minutes — small relative to Stage 1's calibration cost. The reviewer's framing: "as a validation step on your Stage 1 output ... after your Phase C produces a blacklist, ablate each blacklisted expert AND the top-5 non-blacklisted experts (by per_expert_max) in L34/L38 to confirm no critical experts were missed."
 
 ### Key Formulas
 
@@ -322,13 +268,13 @@ Stage 1 is stateless (JSON-only output: blacklist + per-layer budgets). Re-runni
 
 ### Blacklist Output (`stage1_blacklist.json`)
 
-Stage 1 emits `stage1_blacklist.json` containing **one category only**: Super Expert (layer, expert) index pairs from Phase C's three-way AND criterion. At most ~0.5% of all routed experts for typical models (Qwen3 0.05%, DeepSeek-V2 0.11%, Mixtral-8x7B 0.39%).
+Stage 1 emits `stage1_blacklist.json` containing the ablation-validated Super Expert blacklist — `(layer, expert)` index pairs whose Phase D ΔNLL exceeded `ablation_filter_threshold`. The candidate pool from Phase C (which can include three-way AND, AIMER, sink-token, and magnitude-top-K provenance) is recorded separately under `aimer.candidates`, `sink_token.candidates`, and `magnitude_topk.candidates` for audit; the per-candidate ΔNLL is in the companion `stage1_ablation_filter.json`. Final blacklist size is bounded by both the candidate pool and the threshold cut — typical Qwen3.6 runs produce 10–30 ablation-validated SEs out of 50–100 candidates, well below the paper's < 0.5% empirical scale.
 
 Shared experts (`mlp.shared_expert`) are **not in the blacklist** and are not processed by Stage 1 at all. They live in a separate model attribute, distinct from the routed `mlp.experts` list, and are architecturally invisible to `iter_moe_layers`, GRAPE, and REAM. No explicit exclusion is needed — they are simply never candidates.
 
 **What GRAPE contributes to Stage 2 is per-layer budgets (N'_l), not individual expert blacklists.** N'_l ≥ `min_experts_per_layer` (128) for every layer due to the floor constraint. Stage 2 uses N'_l as the target centroid count for REAM per layer; REAP scores then determine which N'_l routed non-blacklisted experts become centroids.
 
-> Stage 1 spec touch-up 2026-05-07 (iter+3): clarified Phase E entropy-recompute scope (only c_{l*} changes per iter); §4 Phase D citation §3.2 → §3.3; GRAPE K vs effective_budget cross-link in Phase E step 2; minor wording polish on Mixtral percentage and first-MoE-layer scope.
+> Stage 1 spec touch-up 2026-05-07 (iter+3): clarified Phase F entropy-recompute scope (only c_{l*} changes per iter); §4 Phase E citation §3.2 → §3.3; GRAPE K vs effective_budget cross-link in Phase F step 2; minor wording polish on Mixtral percentage and first-MoE-layer scope. (Phase letters updated 2026-05-10 v6 rename: pre-v6 D/E referred to CKA/GRAPE, now E/F.)
 
 ---
 
@@ -1111,7 +1057,7 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 | 2603.02217 | Router Knowledge Distillation for MoE Compression | 2026 | Stage 5 |
 | 2508.03616 | Hidden Dynamics of Massive Activations in Transformer Training | 2025 | Stage 1 §4 Phase A L31 reset rationale |
 | 2603.17771 | Attention Sinks Induce Gradient Sinks | 2026 | Stage 1 §4 Phase A gated-architecture rationale |
-| 2603.18492 | AIMER: Activation-Independent Magnitude-Energy Ratio for Expert Pruning | 2026 | Stage 1 §4 Phase C AIMER auto-extension (D-aimer-cross-check), §4 Phase A calibration-sensitivity discussion |
+| 2603.18492 | AIMER: Activation-Independent Magnitude-Energy Ratio for Expert Pruning | 2026 | Stage 1 §4 Phase C AIMER candidate source (D-aimer-cross-check), §4 Phase A calibration-sensitivity discussion |
 
 ---
 
