@@ -15,9 +15,9 @@ Image is built by `.github/workflows/docker-build.yml` and pushed to:
 
 ## What the image carries
 
-- CUDA 12.6.3 + cuDNN (devel — `causal-conv1d` and `flash-linear-attention` compile kernels at install)
+- CUDA 13.2.1 + cuDNN (devel — `causal-conv1d` and `flash-linear-attention` compile kernels at install)
 - Python 3.12 (Ubuntu 24.04 native — no PPA, no RC bugs)
-- torch ≥ 2.5, < 2.11 from the cu124 wheel index
+- torch 2.11.0 from the cu130 wheel index
 - All deps in `requirements.txt`
 - `bootstrap.sh` as `ENTRYPOINT`
 - `/cache` declared as `VOLUME`
