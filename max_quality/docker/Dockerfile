@@ -16,6 +16,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_ROOT_USER_ACTION=ignore \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     HF_HOME=/cache/hf \
     TRANSFORMERS_CACHE=/cache/hf/hub \
     PYTORCH_ALLOC_CONF=expandable_segments:True
