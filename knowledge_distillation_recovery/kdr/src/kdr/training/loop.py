@@ -405,9 +405,17 @@ class _LoopState:
         # teacher's freshly-captured assignments drive THIS microbatch's
         # student forward (and not a stale capture from the previous one).
         self._replay_hook.start_microbatch()
+        # `use_cache=False` is critical for training: it tells transformers not
+        # to allocate/thread a KV cache through the forward pass. Without it,
+        # Zyphra's modeling_zaya.py reaches an attention codepath that does
+        # `past_key_values.has_previous_state` on something it expects to be a
+        # ZayaDynamicCache but receives as a bool — raising AttributeError on
+        # microbatch 0 of training. (Observed on instance 36554282, 2026-05-11.)
+        # Inference/eval paths can still opt into caching by calling the model
+        # directly; the trainer never wants it.
         with torch.no_grad():
-            t_logits = self.teacher(input_ids=ids).logits
-        s_logits = self.student(input_ids=ids).logits
+            t_logits = self.teacher(input_ids=ids, use_cache=False).logits
+        s_logits = self.student(input_ids=ids, use_cache=False).logits
         loss = forward_kld_loss(s_logits, t_logits, temperature=self.dconf.temperature)
 
         this_micro_tokens = int(ids.numel()) * self.world
