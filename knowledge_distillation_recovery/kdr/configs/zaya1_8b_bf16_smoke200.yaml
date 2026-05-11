@@ -16,10 +16,12 @@
 # 4 partials present + final artifact uploaded; second launch with the same
 # triple resumes correctly. NOT a parity test against any other pipeline.
 #
-# Wall-clock: ~5 min on 1× H200 (200 optimizer steps × 65_536 tokens/step).
-# Also fits on 1× A100-80GB at this token budget (~78 GB peak VRAM with
-# teacher+student BF16, 8bit-Adam, gradient_checkpointing, FP32 loss
-# intermediates). The previous 4096-seq variant OOMed on A100-80GB by ~4 GB.
+# Wall-clock: ~5 min on 1× H200 at this minimal Phase 7.1 plumbing config
+# (40 steps × 4_096 tokens/step). The previous 4096-seq/200-step variant
+# was sized for a learning run (~110 min on H200, ~$7); for plumbing-only
+# acceptance (4 partials saved + resume tested + load-back finite + no
+# NaN/OOM/NCCL hang) the smaller variant covers every Phase 7.1 gate.
+# Also fits comfortably on A100-80GB.
 
 mode: bf16
 
@@ -39,7 +41,7 @@ calibration:
   dataset: nvidia/Nemotron-Cascade-2-SFT-Data
   seed: 1337
   num_sequences: 13000
-  sequence_length: 2048
+  sequence_length: 1024
   subset_weights:
     math: 0.21
     science: 0.11
@@ -61,14 +63,14 @@ distillation:
   weight_decay: 0.01
   betas: [0.9, 0.999]
   grad_clip_norm: 1.0
-  warmup_steps: 20
-  total_tokens: 13_107_200     # 200 optimizer steps × (bs=1 × ga=32 × seq=2048)
+  warmup_steps: 5
+  total_tokens: 163_840         # 40 optimizer steps × (bs=1 × ga=4 × seq=1024)
   per_device_batch_size: 1
-  gradient_accumulation: 32
-  sequence_length: 2048
-  log_every_n_steps: 5
-  eval_every_n_steps: 50
-  save_every_n_steps: 50       # 4 partials (50/100/150/200) — exercises resume
+  gradient_accumulation: 4
+  sequence_length: 1024
+  log_every_n_steps: 2
+  eval_every_n_steps: 20
+  save_every_n_steps: 10        # 4 partials (10/20/30/40) — exercises resume
   trainable_scope: full
   use_gradient_checkpointing: true
 
