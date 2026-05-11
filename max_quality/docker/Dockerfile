@@ -10,7 +10,7 @@
 #
 # Image carries dependencies only. Code is git-cloned at container start by
 # bootstrap.sh; model snapshot is downloaded into the persistent /cache volume.
-FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -20,28 +20,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_CACHE=/cache/hf/hub \
     PYTORCH_ALLOC_CONF=expandable_segments:True
 
-# Python 3.11 (deadsnakes PPA — Ubuntu 22.04 ships 3.11.0rc1 which has a
-# BlockFinder bug in inspect.py that breaks triton JIT source parsing for
-# any function with `lambda` inside multi-line decorator args, e.g. fla's
-# @triton.heuristics. deadsnakes gives the final 3.11.x release.)
-# + git (for runtime code clone) + build tooling for compiled wheels
-# (flash-linear-attention and causal-conv1d build CUDA kernels — need ninja + nvcc;
-# the cuda:12.6.3-devel base provides nvcc).
+# Ubuntu 24.04 ships Python 3.12 (final release — no BlockFinder/inspect.py
+# RC bugs). git for runtime code clone; build tooling for compiled wheels
+# (flash-linear-attention and causal-conv1d build CUDA kernels — need ninja +
+# nvcc; the cuda:12.6.3-devel base provides nvcc).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 \
-        python3.11-dev \
-        python3.11-distutils \
+        python3 \
+        python3-dev \
+        python3-pip \
         git \
         curl \
         ca-certificates \
         build-essential \
         ninja-build \
-    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --upgrade pip wheel setuptools packaging
