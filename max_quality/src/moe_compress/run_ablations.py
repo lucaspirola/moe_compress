@@ -16,12 +16,26 @@ would create 36+ junk repos under ``pirola/``.
 """
 from __future__ import annotations
 
+import os
+
+# Switch PyTorch's CUDA caching allocator to expandable segments BEFORE any
+# torch import. With the per-layer GPU-resident covariance accumulator
+# (256 experts × ~100 MB matrices) plus per-batch gated-output tensors and
+# repeated dense [T, max_K, d_hid] chunk allocations, the default
+# fixed-block allocator fragments after a handful of profile layers and
+# eventually fails to satisfy a large allocation — surfacing as a hard
+# CUDA segfault rather than a clean OutOfMemoryError. Reproduced as a
+# crash at layer 7 batch ~20 of Stage 2 on Qwen3.6-35B-A3B. The
+# expandable-segments allocator grows the same region instead of carving
+# fixed blocks, so coalesced free space remains usable. No code change
+# needed once this env var is set before torch's CUDA initialization.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import copy
 import faulthandler
 import json
 import logging
-import os
 import shutil
 import sys
 import threading
