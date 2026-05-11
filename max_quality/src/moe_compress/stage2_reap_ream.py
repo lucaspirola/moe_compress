@@ -1239,7 +1239,14 @@ def _profile_layer(
                     _capture_layer_input
                 )
             try:
+                # DIAG: layer-1 hang investigation — log every batch so we can see
+                # if the forward pass is making progress and how long each batch takes.
+                import time as _diag_time
+                _diag_t0 = _diag_time.monotonic()
+                _diag_count = 0
+                log.info("DIAG layer %d: entering batch loop (calibration tensor + early-exit forwards)", layer_idx)
                 for batch in batches:
+                    _diag_t_batch = _diag_time.monotonic()
                     if device is not None:
                         batch = batch.to(device)
                     _batch_offset = _next_offset
@@ -1256,6 +1263,13 @@ def _profile_layer(
                     ream_acc.finalize_batch(layer_idx, n_experts)
                     ream_acc.record_batch_token_count(layer_idx, batch.shape[0] * batch.shape[1])
                     _next_offset += batch.shape[0] * batch.shape[1]
+                    _diag_count += 1
+                    _diag_dt = _diag_time.monotonic() - _diag_t_batch
+                    if _diag_count <= 3 or _diag_count % 10 == 0:
+                        log.info("DIAG layer %d: batch %d done in %.2fs (cumulative %.1fs)",
+                                 layer_idx, _diag_count, _diag_dt, _diag_time.monotonic() - _diag_t0)
+                log.info("DIAG layer %d: batch loop complete — %d batches in %.1fs, now post-profile work",
+                         layer_idx, _diag_count, _diag_time.monotonic() - _diag_t0)
             finally:
                 _experts_handle.remove()
                 if _layer_in_handle is not None:

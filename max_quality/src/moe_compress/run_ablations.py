@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import faulthandler
 import json
 import logging
 import os
@@ -29,6 +30,13 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+# DIAG: layer-1 hang investigation — install a periodic Python stack dumper.
+# Every 120s, if any thread is alive, dump a full stack trace of ALL threads
+# to stderr. Combined with the docker logs SSH tail, this exposes exactly
+# where the harness is when it appears stuck. Negligible overhead at idle.
+faulthandler.enable()
+faulthandler.dump_traceback_later(120, repeat=True, file=sys.stderr)
 
 from .run_pipeline import main as run_pipeline_main
 from .utils.model_io import load_json_artifact, save_json_artifact
