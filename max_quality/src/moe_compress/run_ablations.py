@@ -144,22 +144,24 @@ def _upload_ablation_bg(
         from huggingface_hub import HfApi
         api = HfApi(token=hf_token)
 
-        if upload_shared:
-            _log.info("[%s] uploading _shared/ to %s", ablation_id, bucket)
-            api.upload_folder(
-                folder_path=str(shared_dir),
-                path_in_repo="_shared",
-                repo_id=bucket,
-                repo_type="dataset",
-                ignore_patterns=["*.lock", "__pycache__", "*.py"],
-            )
+        if upload_shared and shared_dir.exists():
+            _log.info("[%s] uploading _shared/ to bucket %s", ablation_id, bucket)
+            add_list = []
+            for f in shared_dir.rglob("*"):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(shared_dir)
+                rel_str = str(rel)
+                if rel_str.endswith(".lock") or rel_str.endswith(".py") or "__pycache__" in rel_str:
+                    continue
+                add_list.append((str(f), f"_shared/{rel_str}"))
+            if add_list:
+                api.batch_bucket_files(bucket_id=bucket, add=add_list)
 
-        _log.info("[%s] uploading stage6_eval.json to %s", ablation_id, bucket)
-        api.upload_file(
-            path_or_fileobj=str(ablation_dir / "stage6_eval.json"),
-            path_in_repo=f"{ablation_id}/stage6_eval.json",
-            repo_id=bucket,
-            repo_type="dataset",
+        _log.info("[%s] uploading stage6_eval.json to bucket %s", ablation_id, bucket)
+        api.batch_bucket_files(
+            bucket_id=bucket,
+            add=[(str(ablation_dir / "stage6_eval.json"), f"{ablation_id}/stage6_eval.json")],
         )
 
         (ablation_dir / "uploaded.flag").touch()
@@ -504,13 +506,11 @@ def main(argv: list[str] | None = None) -> int:
     if upload_bucket and hf_token:
         try:
             from huggingface_hub import HfApi
-            HfApi(token=hf_token).upload_file(
-                path_or_fileobj=str(summary_path),
-                path_in_repo="_summary.json",
-                repo_id=upload_bucket,
-                repo_type="dataset",
+            HfApi(token=hf_token).batch_bucket_files(
+                bucket_id=upload_bucket,
+                add=[(str(summary_path), "_summary.json")],
             )
-            log.info("Uploaded _summary.json to %s", upload_bucket)
+            log.info("Uploaded _summary.json to bucket %s", upload_bucket)
         except Exception as exc:  # noqa: BLE001
             log.warning("Summary upload failed (artifact remains on disk): %s", exc)
 

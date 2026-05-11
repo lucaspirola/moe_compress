@@ -85,7 +85,7 @@ mkdir -p "$CACHE_MOUNT/hf" "$CACHE_MOUNT/ablations" "$CACHE_MOUNT/code"
 #      GPU-switching mid-sweep: destroy instance, launch cheaper one, resume.
 # ---------------------------------------------------------------------------
 if [[ -n "${HF_ARTIFACTS_BUCKET:-}" ]]; then
-    log "Seeding artifacts from $HF_ARTIFACTS_BUCKET → $CACHE_MOUNT/ablations"
+    log "Seeding artifacts from bucket $HF_ARTIFACTS_BUCKET → $CACHE_MOUNT/ablations"
     python3 - <<PYEOF
 import os, sys, pathlib, logging
 logging.basicConfig(level=logging.WARNING)
@@ -96,53 +96,54 @@ shared_dir = ablations_root / "_shared"
 token = os.environ.get("HF_TOKEN")
 
 try:
-    from huggingface_hub import list_repo_files, hf_hub_download
+    from huggingface_hub import HfApi
 except ImportError:
     print("[seed] huggingface_hub not available — skipping", flush=True)
     sys.exit(0)
 
+api = HfApi(token=token)
 try:
-    remote_files = set(list_repo_files(bucket, repo_type="dataset", token=token))
+    # list_bucket_tree returns BucketFile (has .size) and BucketFolder (no .size)
+    remote_files = {item.path for item in api.list_bucket_tree(bucket, recursive=True)
+                    if hasattr(item, "size")}
 except Exception as e:
-    print(f"[seed] cannot list {bucket}: {e} — skipping", flush=True)
+    print(f"[seed] cannot list bucket {bucket}: {e} — skipping", flush=True)
     sys.exit(0)
 
 needed_shared = {"_shared/stage1_blacklist.json", "_shared/stage1_budgets.json",
                  "_shared/budget_decomposition.json"}
 shared_ok = all((shared_dir / f.split("/", 1)[1]).exists() for f in needed_shared)
 
-to_pull = []
+to_pull = []  # list of (remote_path, local_path)
 if not shared_ok:
     missing = [f for f in needed_shared if f in remote_files]
     if len(missing) == len(needed_shared):
-        to_pull.extend(missing)
-        to_pull += [f for f in remote_files if f.startswith("_shared/")]
+        for f in remote_files:
+            if f.startswith("_shared/") and not f.endswith(".lock"):
+                local = ablations_root / f
+                to_pull.append((f, str(local)))
         print("[seed] will pull _shared/ (Stage 1 artifacts)", flush=True)
     else:
-        print("[seed] _shared/ incomplete on Hub — Stage 1 will run fresh", flush=True)
+        print("[seed] _shared/ incomplete on bucket — Stage 1 will run fresh", flush=True)
 
 for f in sorted(remote_files):
     parts = f.split("/")
     if len(parts) == 2 and parts[1] == "stage6_eval.json":
         dst = ablations_root / parts[0] / "stage6_eval.json"
         if not dst.exists():
-            to_pull.append(f)
+            to_pull.append((f, str(dst)))
             print(f"[seed] will pull {f} (marks {parts[0]} complete)", flush=True)
 
 if not to_pull:
     print("[seed] nothing to pull — cache already up to date", flush=True)
     sys.exit(0)
 
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id=bucket,
-    repo_type="dataset",
-    local_dir=str(ablations_root),
-    allow_patterns=list(set(to_pull)),
-    token=token,
-    ignore_patterns=["*.lock"],
-)
-print("[seed] done", flush=True)
+# Ensure parent dirs exist (download_bucket_files writes to absolute paths)
+for _, local in to_pull:
+    pathlib.Path(local).parent.mkdir(parents=True, exist_ok=True)
+
+api.download_bucket_files(bucket_id=bucket, files=to_pull)
+print(f"[seed] downloaded {len(to_pull)} file(s)", flush=True)
 PYEOF
 fi
 
@@ -224,7 +225,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$UPLOAD_ON_SUCCESS" == "1" ]]; then
     log "Final artifact sync to bucket $HF_ARTIFACTS_BUCKET"
-    hf upload --repo-type bucket "$HF_ARTIFACTS_BUCKET" "$CACHE_MOUNT/ablations" \
+    hf buckets sync "$CACHE_MOUNT/ablations/" "hf://buckets/$HF_ARTIFACTS_BUCKET/" \
         --include "_shared/**" \
         --include "*/stage6_eval.json" \
         --include "_summary.json" \
