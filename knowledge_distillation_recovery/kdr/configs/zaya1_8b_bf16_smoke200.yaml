@@ -16,7 +16,10 @@
 # 4 partials present + final artifact uploaded; second launch with the same
 # triple resumes correctly. NOT a parity test against any other pipeline.
 #
-# Wall-clock: ~5 min on 1× H200 (200 optimizer steps × 131_072 tokens/step).
+# Wall-clock: ~5 min on 1× H200 (200 optimizer steps × 65_536 tokens/step).
+# Also fits on 1× A100-80GB at this token budget (~78 GB peak VRAM with
+# teacher+student BF16, 8bit-Adam, gradient_checkpointing, FP32 loss
+# intermediates). The previous 4096-seq variant OOMed on A100-80GB by ~4 GB.
 
 mode: bf16
 
@@ -36,7 +39,7 @@ calibration:
   dataset: nvidia/Nemotron-Cascade-2-SFT-Data
   seed: 1337
   num_sequences: 13000
-  sequence_length: 4096
+  sequence_length: 2048
   subset_weights:
     math: 0.21
     science: 0.11
@@ -59,10 +62,10 @@ distillation:
   betas: [0.9, 0.999]
   grad_clip_norm: 1.0
   warmup_steps: 20
-  total_tokens: 26_214_400     # 200 optimizer steps × (bs=1 × ga=32 × seq=4096)
+  total_tokens: 13_107_200     # 200 optimizer steps × (bs=1 × ga=32 × seq=2048)
   per_device_batch_size: 1
   gradient_accumulation: 32
-  sequence_length: 4096
+  sequence_length: 2048
   log_every_n_steps: 5
   eval_every_n_steps: 50
   save_every_n_steps: 50       # 4 partials (50/100/150/200) — exercises resume
