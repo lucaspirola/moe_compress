@@ -57,6 +57,14 @@ log "PREFLIGHT_ONLY    = $PREFLIGHT_ONLY"
 log "UPLOAD_ON_SUCCESS = $UPLOAD_ON_SUCCESS"
 log "TRACKIO_SPACE_ID  = $TRACKIO_SPACE_ID"
 
+# vast.ai's /.launch writes authorized_keys with group/world-writable permissions,
+# which sshd rejects under StrictModes yes (the default). Fix early so SSH works
+# as soon as bootstrap starts.
+if [[ -d /root/.ssh ]]; then
+    chmod 700 /root/.ssh
+    chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
+fi
+
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     log "FATAL: nvidia-smi not on PATH — was the container started with --gpus all?"
     exit 1
