@@ -2685,8 +2685,14 @@ def _permutation_align_to_centroid(
         # eps=1e-8 guards against zero-norm vectors (all-zero activations);
         # F.normalize returns a zero vector for those, which is the safest
         # fallback (zero-norm input → zero output, no NaN).
-        ref_act_n   = torch.nn.functional.normalize(ref_act_mean.float(),   p=2, dim=0, eps=1e-8)
-        child_act_n = torch.nn.functional.normalize(child_act_mean.float(), p=2, dim=0, eps=1e-8)
+        # Move act_mean tensors to the same device as the weight tensors;
+        # they originate from CPU storage in ReamCostAccumulator._neuron_act_sum
+        # but ref_gate/child_gate live on the model's device. Without this
+        # explicit move, C_act lands on CPU while C_wt is on GPU, and the
+        # subsequent `C = C_act + C_wt` raises a device-mismatch RuntimeError.
+        _act_device = ref_gate.device
+        ref_act_n   = torch.nn.functional.normalize(ref_act_mean.float().to(_act_device),   p=2, dim=0, eps=1e-8)
+        child_act_n = torch.nn.functional.normalize(child_act_mean.float().to(_act_device), p=2, dim=0, eps=1e-8)
         C_act = torch.cdist(
             ref_act_n.unsqueeze(-1),
             child_act_n.unsqueeze(-1),
