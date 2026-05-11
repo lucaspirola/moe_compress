@@ -60,6 +60,13 @@ from .model_io import MoELayerRef, FactoredExperts
 log = logging.getLogger(__name__)
 
 
+# ReamCostAccumulator.finalize_batch chunks its per-token tensor build over
+# `T` to bound peak memory regardless of batch / token count. At max_K=8 and
+# d_hid≈5120 (Qwen3.6-35B-A3B), 2048 tokens ≈ 336 MB on CPU and ≈ 670 MB on
+# GPU per chunk — well within H200 NVL working space.
+_FINALIZE_BATCH_CHUNK: int = 2048
+
+
 # ---------------------------------------------------------------------------
 # Accumulators (API preserved from pre-refactor; stages import these)
 # ---------------------------------------------------------------------------
@@ -207,71 +214,151 @@ class ReamCostAccumulator:
         with self._lock:
             self._total_tokens_by_layer[layer_idx] += n_tokens
 
-    def finalize_batch(self, layer_idx: int, num_experts: int) -> None:
+    def finalize_batch(
+        self, layer_idx: int, num_experts: int,
+        *, compute_device: "torch.device | None" = None,
+    ) -> None:
         """After a full forward pass through the layer, compute pairwise cosine
         similarities over jointly-active tokens (paper Eq. 8 exact formulation).
 
-        For each pair (i, j), finds the token intersection where BOTH experts
-        were active in this batch, computes per-token cosine similarity on the
-        gated outputs, and accumulates sums of per-token cosine similarities
-        (the actual averaging by |X| happens in compute_delta_expert). This is
-        O(E² × |intersection|) per batch, where |intersection| ≈
-        (top_k/E)² × T is typically very small.
+        For each pair (i, j), accumulates the SUM of per-token cosine
+        similarities over tokens where BOTH experts were active in this batch.
+        Division by |X| happens later in compute_delta_expert.
 
-        Note: token counting for the Eq. 8 denominator is handled by
-        record_batch_token_count(), called from the _profile_layer loop with
-        the exact batch token count (batch.shape[0] * batch.shape[1]).
+        Vectorized implementation: gathers per-token active-expert groups
+        (top-K experts per token, K ≪ E), then performs a single batched
+        matmul + scatter_add per token-chunk instead of iterating O(E²) pairs
+        in Python. Replaces a prior per-pair loop with ~32K iterations and
+        per-pair ``.item()`` syncs that dominated _profile_layer wall-time
+        (≈14 s of 20 s per batch in profiling).
+
+        Memory: chunked over the token axis with ``_FINALIZE_BATCH_CHUNK``
+        tokens per chunk so the peak CPU/GPU allocation stays bounded
+        regardless of batch size (peak ≈ CHUNK × max_K × d_hid floats).
+
+        Args:
+            layer_idx: MoE layer index to finalize.
+            num_experts: total number of routed experts in the layer.
+            compute_device: device to run the matmul + scatter_add on.
+                ``None`` auto-picks ``torch.cuda.current_device()`` if CUDA
+                is available, else CPU. Callers with the model on a specific
+                GPU should pass it explicitly so the working tensors land on
+                the same device.
+
+        Semantics (must match prior per-pair implementation):
+          * Self-pair (e, e) entries are excluded from updates.
+          * For each pair (i, j) with i ≠ j, BOTH (i, j) and (j, i) keys are
+            written with the SAME accumulated value (symmetric).
+          * Zero-vector gated outputs contribute 0 to the sum (matching the
+            ``where(isnan, 0)`` guard around cosine_similarity).
+
+        Token counting for the Eq. 8 denominator is handled separately by
+        record_batch_token_count() — this function only updates the
+        numerator (gated_output_sim).
         """
-        # Collect per-expert {global_token_idx → gated_output} for this batch.
-        # Acquire lock to safely read and clear _batch_gated_indexed.
+        # 1. Drain _batch_gated_indexed under the lock; everything else is local.
         with self._lock:
             per_expert: dict[int, dict[int, torch.Tensor]] = {}
             for e in range(num_experts):
                 key = (layer_idx, e)
                 if key in self._batch_gated_indexed and self._batch_gated_indexed[key]:
-                    # Pop directly — no copy needed; we own this dict exclusively after the pop
                     per_expert[e] = self._batch_gated_indexed.pop(key)
-            # Clear any remaining batch storage for this layer (empty dicts or experts not in range).
             keys_to_clear = [k for k in self._batch_gated_indexed if k[0] == layer_idx]
             for k in keys_to_clear:
                 self._batch_gated_indexed.pop(k, None)
 
         expert_ids = sorted(per_expert.keys())
-
-        # Build per-expert token sets for fast intersection.
-        token_sets: dict[int, set[int]] = {e: set(per_expert[e].keys()) for e in expert_ids}
-
         if len(expert_ids) < 2:
             return
 
-        sim_updates: dict[tuple, float] = {}
-        for idx_i, e_i in enumerate(expert_ids):
-            for e_j in expert_ids[idx_i + 1:]:
-                # Intersection: tokens where BOTH experts were active.
-                shared = token_sets[e_i] & token_sets[e_j]
-                if not shared:
-                    continue
-                # Per-token cosine similarity on the intersection.
-                # Use sorted() for deterministic per-token ordering (set iteration is non-deterministic).
-                vecs_i = torch.stack([per_expert[e_i][t] for t in sorted(shared)])  # [|shared|, d_hid]
-                vecs_j = torch.stack([per_expert[e_j][t] for t in sorted(shared)])  # [|shared|, d_hid]
-                sims = F.cosine_similarity(vecs_i, vecs_j, dim=-1)           # [|shared|]
-                # Guard against NaN from zero-vector gated outputs (e.g. when a
-                # gated expert output is the zero vector, cosine_similarity returns
-                # NaN). Treat those tokens as contributing zero to the similarity
-                # sum (maps to neutral 0.5 after rescaling in compute_delta_expert,
-                # not minimum similarity).
-                sims = torch.where(torch.isnan(sims), torch.zeros_like(sims), sims)
-                # Accumulate sum of per-token cosine similarities (numerator of Eq. 8).
-                # Dividing by |X| happens in compute_delta_expert, NOT here.
-                sim_sum = float(sims.sum().item())
-                k1 = (layer_idx, e_i, e_j)
-                k2 = (layer_idx, e_j, e_i)
-                sim_updates[k1] = sim_updates.get(k1, 0.0) + sim_sum
-                sim_updates[k2] = sim_updates.get(k2, 0.0) + sim_sum
+        # 2. Build per-token active-expert groups. For each global token index t,
+        #    collect (expert_id, gated_output_vec) of all experts active there.
+        #    Tokens with <2 active experts contribute nothing to pair sims.
+        token_to_active: dict[int, list[int]] = {}
+        for e in expert_ids:
+            for t in per_expert[e]:
+                token_to_active.setdefault(t, []).append(e)
+        contributing = [(t, exs) for t, exs in token_to_active.items() if len(exs) >= 2]
+        if not contributing:
+            return
+
+        # Resolve the compute device once. Default = current CUDA device if
+        # available, else CPU.
+        if compute_device is None:
+            compute_device = (
+                torch.device(f"cuda:{torch.cuda.current_device()}")
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+
+        # 3. Persistent on-device accumulator for sim_sum across all chunks.
+        sample = next(iter(per_expert[expert_ids[0]].values()))
+        d_hid = int(sample.shape[-1])
+        src_dtype = sample.dtype
+        sim_sum = torch.zeros(
+            (num_experts, num_experts), device=compute_device, dtype=torch.float32
+        )
+
+        T_total = len(contributing)
+        for chunk_start in range(0, T_total, _FINALIZE_BATCH_CHUNK):
+            chunk = contributing[chunk_start:chunk_start + _FINALIZE_BATCH_CHUNK]
+            T = len(chunk)
+            max_K = max(len(exs) for _, exs in chunk)
+
+            # 4. Build dense per-chunk tensors [T, max_K, d_hid] (zero-padded).
+            #    per_expert[e][t] is a CPU float32 tensor [d_hid]. Building on
+            #    CPU keeps the per-iter assignment cheap; we move once to GPU.
+            vecs_cpu = torch.zeros((T, max_K, d_hid), dtype=src_dtype)
+            eids_cpu = torch.zeros((T, max_K), dtype=torch.long)
+            mask_cpu = torch.zeros((T, max_K), dtype=src_dtype)
+            for ti, (t, exs) in enumerate(chunk):
+                for ki, e in enumerate(exs):
+                    vecs_cpu[ti, ki] = per_expert[e][t]
+                    eids_cpu[ti, ki] = e
+                    mask_cpu[ti, ki] = 1
+
+            vecs = vecs_cpu.to(compute_device, non_blocking=True)
+            eids = eids_cpu.to(compute_device, non_blocking=True)
+            mask = mask_cpu.to(compute_device, non_blocking=True)
+
+            # 5. L2-normalize each [d_hid] row. Zero-norm rows must stay zero
+            #    (their contribution to cosine sim is zero), NaN-safe equivalent
+            #    of the prior `where(isnan, 0)` guard.
+            norms = vecs.norm(dim=-1, keepdim=True)             # [T, max_K, 1]
+            nonzero = (norms.squeeze(-1) > 0).to(vecs.dtype)    # [T, max_K]
+            vecs_norm = vecs / norms.clamp_min(1e-12)           # [T, max_K, d_hid]
+
+            # 6. Pairwise cosine similarity within each token via batched matmul.
+            sim = torch.bmm(vecs_norm, vecs_norm.transpose(-1, -2))  # [T, K, K]
+            sim = torch.where(torch.isnan(sim), torch.zeros_like(sim), sim)
+            valid_per_slot = mask * nonzero                         # [T, max_K]
+            pair_mask = valid_per_slot.unsqueeze(2) * valid_per_slot.unsqueeze(1)
+            sim = sim * pair_mask
+
+            # 7. Scatter into the persistent sim_sum accumulator. Padding slots
+            #    have eids=0 and pair_mask=0 → contribute 0; the diagonal is
+            #    zeroed after the chunk loop.
+            flat_sim = sim.to(torch.float32).flatten()
+            flat_i = eids.unsqueeze(2).expand(T, max_K, max_K).flatten()
+            flat_j = eids.unsqueeze(1).expand(T, max_K, max_K).flatten()
+            flat_idx = flat_i * num_experts + flat_j
+            sim_sum.view(-1).scatter_add_(0, flat_idx, flat_sim)
+
+        # 8. Drop the diagonal (original only iterated pairs with i<j) and
+        #    do ONE sync to host. Then dict-merge under the lock.
+        sim_sum.fill_diagonal_(0.0)
+        sim_sum_cpu = sim_sum.cpu().numpy()
+
         with self._lock:
-            for k, v in sim_updates.items():
-                self.gated_output_sim[k] = self.gated_output_sim.get(k, 0.0) + v
+            for i_idx, e_i in enumerate(expert_ids):
+                for e_j in expert_ids[i_idx + 1:]:
+                    v = float(sim_sum_cpu[e_i, e_j])
+                    if v == 0.0:
+                        continue
+                    k1 = (layer_idx, e_i, e_j)
+                    k2 = (layer_idx, e_j, e_i)
+                    self.gated_output_sim[k1] = self.gated_output_sim.get(k1, 0.0) + v
+                    self.gated_output_sim[k2] = self.gated_output_sim.get(k2, 0.0) + v
 
     def compute_gate_similarity_matrix(
         self, layer_idx: int, expert_ids: list[int],

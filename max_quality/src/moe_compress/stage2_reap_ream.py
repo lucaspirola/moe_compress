@@ -1139,6 +1139,16 @@ def _profile_layer(
     was_training = model.training
     model.eval()
 
+    # Resolve `device` from model parameters if the caller left it None,
+    # so finalize_batch's compute_device always lands on the model's GPU
+    # rather than torch.cuda.current_device() (which may diverge in
+    # multi-GPU or thread-context scenarios).
+    if device is None:
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            device = torch.device("cpu")
+
     # Cumulative token offset: tracks the global start index of each batch.
     # Using cumulative addition (not batch_idx * fixed_size) handles the last
     # partial batch when num_calibration_samples % batch_size != 0.
@@ -1261,8 +1271,9 @@ def _profile_layer(
                     _diag_t_batch = _diag_time.monotonic()
                     # Reset per-batch hook timers
                     _diag_cb[0] = 0.0; _diag_cb[1] = 0.0; _diag_cb[2] = 0.0; _diag_cb[3] = 0
-                    if device is not None:
-                        batch = batch.to(device)
+                    # `device` is guaranteed non-None after the resolution block
+                    # at the top of _profile_layer.
+                    batch = batch.to(device)
                     _batch_offset = _next_offset
                     router_logits_storage[layer_idx].clear()
                     _full_softmax[0] = None
@@ -1276,7 +1287,7 @@ def _profile_layer(
                     if router_logits_storage[layer_idx]:
                         batch_logits = router_logits_storage[layer_idx][-1]
                         ream_acc.record_router_logits(layer_idx, batch_logits, _batch_offset)
-                    ream_acc.finalize_batch(layer_idx, n_experts)
+                    ream_acc.finalize_batch(layer_idx, n_experts, compute_device=device)
                     ream_acc.record_batch_token_count(layer_idx, batch.shape[0] * batch.shape[1])
                     _next_offset += batch.shape[0] * batch.shape[1]
                     _diag_count += 1
