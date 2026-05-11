@@ -21,13 +21,13 @@
 mode: bf16
 
 teacher:
-  name_or_path: Zyphra/ZAYA1-reasoning-base
+  name_or_path: Zyphra/ZAYA1-8B
   revision: main
   torch_dtype: bfloat16
   attn_implementation: sdpa
 
 student:
-  source: Zyphra/ZAYA1-reasoning-base  # self-distillation
+  source: Zyphra/ZAYA1-8B  # self-distillation
   torch_dtype: bfloat16
   attn_implementation: sdpa
 

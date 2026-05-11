@@ -125,10 +125,18 @@ export PYTHONPATH="${REPO_DIR}/max_quality/src${PYTHONPATH:+:${PYTHONPATH}}"
 # 3. Zyphra transformers fork install (LLR-0035)
 # ─────────────────────────────────────────────────────────────────────────────
 
-echo ">>> Installing Zyphra transformers fork (zaya1 branch)"
+echo ">>> Installing patched Zyphra transformers fork (lucaspirola/transformers@zaya1-patches)"
+# We install our own fork rather than Zyphra/transformers@zaya1 directly:
+#   - The upstream zaya1 branch pins `huggingface-hub<1.0` which fails
+#     dependency_versions_check at import time under the current shared image
+#     (transformers>=5.x base pulls huggingface_hub 1.x).
+#   - The upstream ZayaRouter.__init__ does `int(mlp_expansion)` on a value
+#     that ships as a list in ZAYA1-reasoning-base's config.
+# Both patches live on `zaya1-patches`; see the branch's single commit for
+# the full rationale.
 if ! pip install --upgrade --force-reinstall --quiet \
-        "transformers @ git+https://github.com/Zyphra/transformers.git@zaya1"; then
-    echo "ERROR: Zyphra transformers fork install failed (LLR-0035)." >&2
+        "transformers @ git+https://github.com/lucaspirola/transformers.git@zaya1-patches"; then
+    echo "ERROR: patched transformers fork install failed (LLR-0035)." >&2
     exit 3
 fi
 
