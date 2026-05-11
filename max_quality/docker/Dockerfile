@@ -10,7 +10,7 @@
 #
 # Image carries dependencies only. Code is git-cloned at container start by
 # bootstrap.sh; model snapshot is downloaded into the persistent /cache volume.
-FROM nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -39,15 +39,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --upgrade pip wheel setuptools packaging
 
-# torch from the cu130 wheel index (matches CUDA 13.2.1 base).
+# torch from the cu128 wheel index (matches CUDA 12.8 base).
 # Capture the installed wheel as a constraint so transitive deps cannot
 # pull a different build variant via the default PyPI index.
-RUN pip install --index-url https://download.pytorch.org/whl/cu130 \
+RUN pip install --index-url https://download.pytorch.org/whl/cu128 \
         "torch==2.11.0" \
     && pip freeze | grep '^torch==' > /tmp/torch-constraint.txt
 
 # Bulk install of pinned deps. The constraint file locks torch to the exact
-# cu130 wheel above.
+# cu128 wheel above.
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt -c /tmp/torch-constraint.txt
 
