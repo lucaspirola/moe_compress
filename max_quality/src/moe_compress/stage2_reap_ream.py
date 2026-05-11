@@ -29,6 +29,7 @@ Frequency-weighted merge with neuron permutation alignment is preserved.
 """
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
@@ -944,6 +945,25 @@ def run(
             # layers, avoiding dashboard noise.
             **_summarize_distill_state(distill_state),
         })
+
+        # End-of-layer cleanup: drop Python refs to the per-layer accumulators
+        # and force the CUDA caching allocator to release unreferenced blocks
+        # back to the driver. Two prior segfaults inside CUDA kernels (silu at
+        # layer ~34, layer 7 in an earlier run) were traced to allocator
+        # fragmentation that accumulated over the long Stage 2 pass: even with
+        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments, freed-but-cached blocks
+        # are not returned to the driver, so a future large allocation can
+        # still fail mid-kernel. Forcing gc.collect() + empty_cache() at every
+        # layer boundary keeps the working set bounded.
+        del reap_acc, ream_acc, perm_cache
+        if layer_input_acc is not None:
+            del layer_input_acc
+        if pre_merge_weights is not None:
+            del pre_merge_weights
+        if distill_state is not None:
+            del distill_state
+        gc.collect()
+        torch.cuda.empty_cache()
 
     out_dir = artifacts_dir / "stage2_pruned"
     _save_covariance(cov_acc, artifacts_dir / "_stage2_input_covariance.pt")
