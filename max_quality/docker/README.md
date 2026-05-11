@@ -28,7 +28,36 @@ What it does **not** carry: the model snapshot (~70 GB) or the project code. Bot
 
 ## vast.ai operator runbook
 
-Prerequisite: install the `vastai` CLI (`pip install vastai`) and set the API key once with `vastai set api-key <KEY>` — it persists at `~/.config/vastai/vast_api_key` and is auto-read by every subsequent invocation. Upload your SSH public key at https://cloud.vast.ai/account/.
+### Before launching — one-time setup
+
+| | What | How |
+|---|---|---|
+| 1 | **vastai CLI** | `pip install vastai`. The user has already done this in a dedicated venv at `/home/lucas/.venv-vastai`; use `/home/lucas/.venv-vastai/bin/vastai` directly, or `source /home/lucas/.venv-vastai/bin/activate` to put it on `$PATH`. |
+| 2 | **vast.ai API key** | Already persisted at `~/.config/vastai/vast_api_key` (mode 0600). The CLI auto-reads it on every invocation — no flag, no env var. To verify: `vastai show user` should print the account. To set on a new machine: `vastai set api-key <KEY>` once. |
+| 3 | **HF_TOKEN** | Already present at `~/.cache/huggingface/token` (the standard `huggingface-cli login` location). Account `pirola`, **write** scope. Inject at launch time with `--env "-e HF_TOKEN=$(cat ~/.cache/huggingface/token) ..."`. The same token works across all moe_compress paths (HF Jobs, vast.ai, kdr). |
+| 4 | **SSH key** | Public key uploaded to https://cloud.vast.ai/account/. Vast.ai injects it into every instance's `authorized_keys`; use `vastai ssh-url <id>` to get the connect string. |
+| 5 | **GHCR image visibility** | `ghcr.io/lucaspirola/moe-compress:latest` is **public** (flipped 2026-05-10). Verify with: `TOKEN=$(curl -s "https://ghcr.io/token?service=ghcr.io&scope=repository:lucaspirola/moe-compress:pull" \| python -c 'import json,sys; print(json.load(sys.stdin)["token"])') && curl -sI -H "Authorization: Bearer $TOKEN" -o /dev/null -w "%{http_code}\n" https://ghcr.io/v2/lucaspirola/moe-compress/manifests/latest` → expect `200`. No `--login` flag needed in `vastai create instance`. |
+
+### Recommended first-launch pattern
+
+For the first launch on a new machine OR after a non-trivial image rebuild, run a cheap pre-flight before the full ablation sweep:
+
+1. **Pre-flight** (~$1–2, ~1 GPU-hour): `--env "... -e PREFLIGHT_ONLY=1 -e UPLOAD_ON_SUCCESS=0"`. Exercises image pull, GPU access, HF auth, model snapshot, repo clone, Stage 1 re-run on the cached snapshot. Does NOT run per-ablation work. Cheap insurance that the environment is sound before committing to a 36–60 GPU-hour sweep.
+2. **Full run** (~$30–50, 36–60 GPU-hours): `--env "... -e PREFLIGHT_ONLY=0 -e UPLOAD_ON_SUCCESS=1"`. After preflight green-lights the box.
+
+Pre-flight redundancy note: if Stage 1 v6 results already exist on HF Hub from a prior HF Jobs run, the preflight redoes that work. To skip it: SSH in after image pull but before bootstrap completes, pre-seed `/cache/ablations/_shared/` from the HF bucket, then resume. Fragile; usually not worth the ~$1 saved.
+
+### Scope: full ablation set vs subset
+
+The harness sweeps A0..A11 (12 REAM solver variants) by default. To run a subset, set `ONLY` to a comma-separated list of ablation IDs:
+
+| Goal | `ONLY=` |
+|---|---|
+| Baseline only | `A0` |
+| Quick representative tri-sample (greedy + auto + +distill) | `A0,A4,A8` |
+| Full sweep | _(omit `ONLY`)_ |
+
+A0 is the greedy baseline; A1–A3 vary the auto solver costs; A4–A7 add whitening + EM + asymmetric routing; A8–A11 layer expert distillation on top.
 
 ### 1. Find an instance
 
