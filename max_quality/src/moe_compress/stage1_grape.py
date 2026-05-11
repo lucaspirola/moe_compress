@@ -55,6 +55,7 @@ from .utils.activation_hooks import (
     capture_router_outputs,
     instrument_experts,
     run_calibration,
+    run_calibration_early_exit,
 )
 from .utils.aimer import aimer_bottom_pct_per_layer, aimer_score_tensor
 from .utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
@@ -828,8 +829,13 @@ def _detect_ma_layers(
         handles.append(ref.mlp.register_forward_hook(_make_moe_hook(layer_idx)))
 
     try:
-        run_calibration(
-            model, batches, device=device,
+        # Phase A only needs decoder-layer and MoE-block activations — lm_head
+        # is not needed and on 80 GB GPUs its logits tensor (~30 GB for
+        # batch×seq×vocab) causes OOM. Stop after the last decoder layer.
+        run_calibration_early_exit(
+            model, batches,
+            target_layer_idx=sorted_decoder_layer_indices[-1],
+            device=device,
             per_batch_callback=_make_calibration_progress_cb(
                 "phase_a", n_total=len(batches),
             ),
