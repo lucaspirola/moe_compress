@@ -252,6 +252,32 @@ fi
 export KDR_PARTIALS_REPO="${PARTIALS_REPO}"
 export KDR_RECOVERED_REPO="${RECOVERED_REPO}"
 
+# Resource snapshot + background watchdog. Two consecutive smoke runs vanished
+# from vast.ai at ~10-15 min in, right around the calibration tokenization
+# spike — suspected host-side OOM-kill. Logging cgroup limit + a 10s resource
+# trace into the same log stream so we get the failure footprint via vastai
+# logs even if the container is reaped.
+echo ">>> Resource snapshot pre-trainer:"
+echo "    cgroup memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo unknown)"
+echo "    host RAM (MB):     $(free -m | awk 'NR==2 {print "used="$3" total="$2}')"
+echo "    GPU VRAM (MB):     $(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits | head -1 | awk -F, '{print "used="$1" total="$2}')"
+echo "    /workspace disk:   $(df -BG /workspace | awk 'NR==2 {print "used="$3" total="$2" avail="$4}')"
+
+# Background watchdog: emits a [watchdog HH:MM:SS] line every 10 seconds.
+# Kill the watchdog at script exit so it doesn't outlive the trainer.
+(
+    while true; do
+        sleep 10
+        ram=$(free -m | awk 'NR==2 {print $3"/"$2"MB"}')
+        vram=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+        disk=$(df -BG /workspace 2>/dev/null | awk 'NR==2 {print $3"/"$2}')
+        pyrss=$(ps -eo rss:9,comm | awk '$2 ~ /python/ {sum+=$1} END {print sum/1024"MB"}')
+        echo "[watchdog $(date +%H:%M:%S)] RAM=${ram} VRAM=${vram}MB disk=${disk} python_rss=${pyrss}"
+    done
+) &
+WATCHDOG_PID=$!
+trap 'kill -9 ${WATCHDOG_PID} 2>/dev/null || true' EXIT
+
 echo ">>> Invoking kdr.cli.train (mode=${KDR_MODE})"
 if ! python -m kdr.cli.train \
         --config "${CONFIG_PATH}" \
