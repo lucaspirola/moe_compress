@@ -100,6 +100,17 @@ class Zaya1Adapter:
             role="STUDENT",
         )
 
+        # Zyphra/ZAYA1-8B ships a generation_config with `top_p=0.95` and
+        # `top_k=-1` alongside `do_sample=False`. Newer transformers
+        # (>= 5.x) validates this combination at save time and raises
+        # `ValueError: GenerationConfig is invalid` because top_p/top_k are
+        # sample-only flags. Unsetting them on the student preserves greedy
+        # decoding (do_sample=False) and unblocks save_partial / final save
+        # without altering inference behavior on the published checkpoint.
+        if getattr(student, "generation_config", None) is not None:
+            student.generation_config.top_p = None
+            student.generation_config.top_k = None
+
         tokenizer = AutoTokenizer.from_pretrained(
             student_cfg.source, trust_remote_code=True
         )
