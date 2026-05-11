@@ -83,13 +83,20 @@ class ReamCostAccumulator:
     (paper 2604.04356, Eq. 5 & 8).
 
     Storage per layer:
-      - gate_logit_profiles[layer_idx][expert_idx]: dict mapping global token
-        index → pre-softmax routing score (linear projection + optional bias +
-        e_score_correction_bias if present). Aligned by global token position
-        so δ_gate cosine similarity compares the same tokens across experts
-        (paper Eq. 5).  Pre-softmax scores can be negative and unbounded,
-        giving the full [-1, 1] cosine similarity range (post-softmax weights
-        are non-negative, compressing cosine to [0, 1]).
+      - gate_logit_profiles[layer_idx]: list of (batch_offset, logits) pairs,
+        where ``logits`` is a CPU float32 tensor of shape ``[T_batch, n_experts]``
+        — one entry appended per profiling batch. The pre-softmax routing
+        scores for batch ``b`` cover global token indices
+        ``[batch_offsets[b], batch_offsets[b] + T_batch)``. This append-only
+        list-of-batches storage replaces a former
+        ``dict[layer][expert] → dict[global_token → float]`` which produced
+        O(T×E) Python dict assignments per batch (3M+ assignments for
+        T=12288/E=256) and dominated wall-time at large num_sequences.
+        Aligned by global token position so δ_gate cosine similarity compares
+        the same tokens across experts (paper Eq. 5). Pre-softmax scores
+        can be negative and unbounded, giving the full [-1, 1] cosine
+        similarity range (post-softmax weights are non-negative,
+        compressing cosine to [0, 1]).
       - gated_output_sim/count: incremental pairwise cosine similarity of
         gated expert outputs per batch (paper Eq. 8, approximated as
         cosine(mean_gated_i, mean_gated_j) per batch).
@@ -102,10 +109,13 @@ class ReamCostAccumulator:
     """
     # Total number of experts in the MoE layer; 0 means "not set, skip bounds check".
     num_experts: int = 0
-    # Per-(layer, expert): dict[global_token_idx → pre-softmax logit].
-    # Aligned by global token position for correct δ_gate cosine sim.
-    gate_logit_profiles: dict[int, dict[int, dict[int, float]]] = field(  # actually defaultdict(lambda: defaultdict(dict)) — outer and middle levels are auto-created
-        default_factory=lambda: defaultdict(lambda: defaultdict(dict))
+    # Per-layer: append-only list of (batch_offset, logits[T_batch, n_experts])
+    # pairs accumulated by record_router_logits. compute_gate_similarity_matrix
+    # concatenates this list once per call into a dense [T_total, n_experts]
+    # matrix. See class docstring for the rationale (eliminates O(T×E) Python
+    # dict population per batch).
+    gate_logit_profiles: dict[int, list[tuple[int, torch.Tensor]]] = field(
+        default_factory=lambda: defaultdict(list)
     )
     # Incremental pairwise cosine similarity of gated expert outputs.
     # gated_output_sim accumulates Σ_{t in shared} cos_sim for each pair.
@@ -114,9 +124,12 @@ class ReamCostAccumulator:
     gated_output_sim: defaultdict[tuple[int, int, int], float] = field(default_factory=lambda: defaultdict(float))  # auto-vivifies with 0.0
     # Total calibration tokens seen per layer (denominator for Eq. 8).
     _total_tokens_by_layer: dict[int, int] = field(default_factory=lambda: defaultdict(int))
-    # Temporary per-batch storage: (layer, expert) → {global_token_idx → gated_output [d_hid]}
-    _batch_gated_indexed: dict[tuple[int, int], dict[int, torch.Tensor]] = field(
-        default_factory=lambda: defaultdict(dict)
+    # Temporary per-batch storage: (layer, expert) → (global_indices [T_active],
+    # gated_outputs [T_active, d_hid]) where both tensors live on the input
+    # device (typically GPU). One entry per expert per batch; finalize_batch
+    # drains it after each batch.
+    _batch_gated_indexed: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict
     )
     # Per-neuron activation mean for C_act in neuron alignment (REAM §4).
     # Key: (layer_idx, expert_idx) → running sum of intermediate activations [d_intermediate]
@@ -132,39 +145,23 @@ class ReamCostAccumulator:
         """Record pre-softmax routing scores for ALL experts from one batch.
 
         Called once per batch per layer (from the ``capture_router_outputs``
-        hook), NOT once per expert.  The logits tensor has shape
-        ``[n_tokens_in_batch, num_experts]`` — we scatter each expert's
-        column into its per-token profile dict.
+        hook), NOT once per expert. Appends the entire ``[T_batch, n_experts]``
+        tensor to ``gate_logit_profiles[layer_idx]`` as one
+        ``(batch_offset, tensor)`` pair — O(1) Python work, no per-token loop.
 
         "Routing score" here means: linear projection + optional bias +
         e_score_correction_bias if present (pre-softmax routing score).
 
         Args:
             logits: [T, E] pre-softmax routing scores.
-            batch_offset: global offset = batch_idx * batch_size * seq_len.
+            batch_offset: global token index of the first row in this batch
+                (== batch_idx * batch_size * seq_len under cumulative offsets).
         """
-        logits_cpu = logits.detach().cpu()   # [T, E]
-        _, n_experts = logits_cpu.shape
-        all_logits = logits_cpu.tolist()  # one .tolist() call
-        # Build staging dicts outside the lock
-        staging: dict[int, dict[int, float]] = {}
-        for e in range(n_experts):
-            prof = staging.setdefault(e, {})
-            for t_idx, expert_logits in enumerate(all_logits):
-                global_t = batch_offset + t_idx
-                prof[global_t] = expert_logits[e]
-        # Merge under lock — O(T×E) dict.update calls, but lock held only for fast Python merges
+        # Single CPU sync moves the whole batch's logits at once; storage is
+        # float32 to match the prior dict[int, float] precision.
+        logits_cpu = logits.detach().to(torch.float32).cpu().contiguous()
         with self._lock:
-            for e, new_entries in staging.items():
-                existing = self.gate_logit_profiles[layer_idx][e]
-                # Check for duplicates
-                dups = set(new_entries) & set(existing)
-                if dups:
-                    log.warning(
-                        "record_router_logits: %d duplicate global token indices for expert %d layer %d — overwriting",
-                        len(dups), e, layer_idx,
-                    )
-                existing.update(new_entries)
+            self.gate_logit_profiles[layer_idx].append((int(batch_offset), logits_cpu))
 
     def record_gated_output(self, layer_idx: int, expert_idx: int,
                             gate_weights: torch.Tensor, expert_output: torch.Tensor,
@@ -190,17 +187,17 @@ class ReamCostAccumulator:
             )
             return
         # gate_weights: [T], expert_output: [T, d_hid], token_indices: [T]
-        gated = (gate_weights.unsqueeze(-1) * expert_output).detach().cpu().to(torch.float32)  # [T, d_hid]
-        indices = (token_indices.detach().cpu() + batch_offset).tolist()
+        # Keep the gated outputs on the input device (typically GPU) so the
+        # downstream finalize_batch consumer can read them without a per-call
+        # CPU sync. The .clone() detaches storage from any caller-side view.
+        gated = (gate_weights.unsqueeze(-1) * expert_output).detach().to(torch.float32).clone()  # [T, d_hid]
+        global_indices = (token_indices.detach().to(torch.long) + batch_offset)  # [T] on input device
         with self._lock:
-            prof = self._batch_gated_indexed.setdefault((layer_idx, expert_idx), {})
-            for idx, t in enumerate(indices):
-                if t in prof:
-                    log.warning(
-                        "record_gated_output: duplicate token index %d for expert %d layer %d — overwriting",
-                        t, expert_idx, layer_idx,
-                    )
-                prof[t] = gated[idx].clone()
+            # Storage shape per (layer, expert): a (indices_tensor, gated_tensor)
+            # tuple. _profile_layer's down_cb fires once per expert per batch
+            # with all that expert's active tokens; we replace any prior entry
+            # rather than merging (no duplicates expected within a batch).
+            self._batch_gated_indexed[(layer_idx, expert_idx)] = (global_indices, gated)
 
     def record_batch_token_count(self, layer_idx: int, n_tokens: int) -> None:
         """Record the exact number of tokens in a batch for the Eq. 8 denominator.
@@ -256,34 +253,10 @@ class ReamCostAccumulator:
         record_batch_token_count() — this function only updates the
         numerator (gated_output_sim).
         """
-        # 1. Drain _batch_gated_indexed under the lock; everything else is local.
-        with self._lock:
-            per_expert: dict[int, dict[int, torch.Tensor]] = {}
-            for e in range(num_experts):
-                key = (layer_idx, e)
-                if key in self._batch_gated_indexed and self._batch_gated_indexed[key]:
-                    per_expert[e] = self._batch_gated_indexed.pop(key)
-            keys_to_clear = [k for k in self._batch_gated_indexed if k[0] == layer_idx]
-            for k in keys_to_clear:
-                self._batch_gated_indexed.pop(k, None)
-
-        expert_ids = sorted(per_expert.keys())
-        if len(expert_ids) < 2:
-            return
-
-        # 2. Build per-token active-expert groups. For each global token index t,
-        #    collect (expert_id, gated_output_vec) of all experts active there.
-        #    Tokens with <2 active experts contribute nothing to pair sims.
-        token_to_active: dict[int, list[int]] = {}
-        for e in expert_ids:
-            for t in per_expert[e]:
-                token_to_active.setdefault(t, []).append(e)
-        contributing = [(t, exs) for t, exs in token_to_active.items() if len(exs) >= 2]
-        if not contributing:
-            return
-
-        # Resolve the compute device once. Default = current CUDA device if
-        # available, else CPU.
+        # Resolve the compute device once, BEFORE the drain. The drain then
+        # moves each expert's gated tensor onto this device (a no-op when the
+        # caller stored on the same device, a single explicit transfer
+        # otherwise — instead of an implicit cross-device error mid-loop).
         if compute_device is None:
             compute_device = (
                 torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -291,8 +264,46 @@ class ReamCostAccumulator:
                 else torch.device("cpu")
             )
 
+        # 1. Drain _batch_gated_indexed under the lock. For each expert:
+        #    - convert its index tensor to a Python list (one .cpu() call)
+        #    - move its gated tensor to compute_device (no-op when already
+        #      there) so subsequent advanced-index gathers stay on one device.
+        with self._lock:
+            per_expert_data: dict[int, tuple[list[int], torch.Tensor]] = {}
+            for e in range(num_experts):
+                key = (layer_idx, e)
+                payload = self._batch_gated_indexed.pop(key, None)
+                if payload is None:
+                    continue
+                indices_tensor, gated_tensor = payload
+                if indices_tensor.numel() == 0:
+                    continue
+                per_expert_data[e] = (
+                    indices_tensor.cpu().tolist(),
+                    gated_tensor.to(compute_device, non_blocking=True),
+                )
+            keys_to_clear = [k for k in self._batch_gated_indexed if k[0] == layer_idx]
+            for k in keys_to_clear:
+                self._batch_gated_indexed.pop(k, None)
+
+        expert_ids = sorted(per_expert_data.keys())
+        if len(expert_ids) < 2:
+            return
+
+        # 2. Build per-token active-expert groups. For each global token index t,
+        #    collect (expert_id, position_in_that_experts_gated_tensor). Tokens
+        #    with <2 active experts contribute nothing to pair sims.
+        token_to_active: dict[int, list[tuple[int, int]]] = {}
+        for e in expert_ids:
+            idx_list, _ = per_expert_data[e]
+            for pos, t in enumerate(idx_list):
+                token_to_active.setdefault(t, []).append((e, pos))
+        contributing = [(t, exs) for t, exs in token_to_active.items() if len(exs) >= 2]
+        if not contributing:
+            return
+
         # 3. Persistent on-device accumulator for sim_sum across all chunks.
-        sample = next(iter(per_expert[expert_ids[0]].values()))
+        sample = per_expert_data[expert_ids[0]][1]
         d_hid = int(sample.shape[-1])
         src_dtype = sample.dtype
         sim_sum = torch.zeros(
@@ -305,21 +316,35 @@ class ReamCostAccumulator:
             T = len(chunk)
             max_K = max(len(exs) for _, exs in chunk)
 
-            # 4. Build dense per-chunk tensors [T, max_K, d_hid] (zero-padded).
-            #    per_expert[e][t] is a CPU float32 tensor [d_hid]. Building on
-            #    CPU keeps the per-iter assignment cheap; we move once to GPU.
-            vecs_cpu = torch.zeros((T, max_K, d_hid), dtype=src_dtype)
-            eids_cpu = torch.zeros((T, max_K), dtype=torch.long)
-            mask_cpu = torch.zeros((T, max_K), dtype=src_dtype)
-            for ti, (t, exs) in enumerate(chunk):
-                for ki, e in enumerate(exs):
-                    vecs_cpu[ti, ki] = per_expert[e][t]
-                    eids_cpu[ti, ki] = e
-                    mask_cpu[ti, ki] = 1
+            # 4. Build dense per-chunk tensors [T, max_K, d_hid] on the compute
+            #    device. To avoid one CUDA kernel launch per (ti, ki) slot
+            #    (which would be ~16K launches per chunk × hundreds of chunks
+            #    per layer), group slot assignments by expert and do ONE
+            #    advanced-index scatter per expert per chunk.
+            vecs = torch.zeros((T, max_K, d_hid), device=compute_device, dtype=src_dtype)
+            eids = torch.zeros((T, max_K), device=compute_device, dtype=torch.long)
+            mask = torch.zeros((T, max_K), device=compute_device, dtype=src_dtype)
 
-            vecs = vecs_cpu.to(compute_device, non_blocking=True)
-            eids = eids_cpu.to(compute_device, non_blocking=True)
-            mask = mask_cpu.to(compute_device, non_blocking=True)
+            # Group (ti, ki, pos) triples by expert. Each `slots_by_expert[e]`
+            # is a list of (ti, ki, pos) for which slot (ti, ki) holds expert e
+            # at position `pos` in expert e's gated tensor.
+            slots_by_expert: dict[int, list[tuple[int, int, int]]] = {}
+            for ti, (t, exs) in enumerate(chunk):
+                for ki, (e, pos) in enumerate(exs):
+                    slots_by_expert.setdefault(e, []).append((ti, ki, pos))
+
+            for e, slots in slots_by_expert.items():
+                # Unzip once to build flat tensors for advanced indexing.
+                ti_idx = [s[0] for s in slots]
+                ki_idx = [s[1] for s in slots]
+                pos_idx = [s[2] for s in slots]
+                ti_t = torch.tensor(ti_idx, device=compute_device, dtype=torch.long)
+                ki_t = torch.tensor(ki_idx, device=compute_device, dtype=torch.long)
+                pos_t = torch.tensor(pos_idx, device=compute_device, dtype=torch.long)
+                # vecs[ti, ki] := per_expert_data[e][1][pos]  (vectorized)
+                vecs[ti_t, ki_t] = per_expert_data[e][1].index_select(0, pos_t)
+                eids[ti_t, ki_t] = e
+                mask[ti_t, ki_t] = 1
 
             # 5. L2-normalize each [d_hid] row. Zero-norm rows must stay zero
             #    (their contribution to cosine sim is zero), NaN-safe equivalent
@@ -396,40 +421,34 @@ class ReamCostAccumulator:
         if n == 0:
             return torch.zeros(0, 0, dtype=torch.float32)
 
-        # Snapshot the profiles under the lock, then release before heavy computation.
-        # Deep-copy the innermost token→logit dicts so a concurrent record_router_logits
-        # calling existing.update() on those inner dicts cannot cause
-        # "dictionary changed size during iteration" or non-deterministic results (M-2).
+        # Snapshot the batch list under the lock, then release before the
+        # concat. The list of (offset, tensor) pairs is shallow-copied; the
+        # individual tensors are not cloned because record_router_logits
+        # never mutates them after append (each call appends a fresh
+        # CPU-resident detach()'d tensor).
         with self._lock:
-            layer_profiles = {
-                k: {t: val for t, val in v.items()}
-                for k, v in self.gate_logit_profiles.get(layer_idx, {}).items()
-            }
+            batches = list(self.gate_logit_profiles.get(layer_idx, ()))
 
-        # Collect all token indices across all requested experts.
-        all_tokens = sorted(
-            set().union(*[layer_profiles[e].keys() for e in expert_ids if e in layer_profiles])
-        )
-        if not all_tokens:
-            # No data at all — min similarity (0.0) for every pair.
+        if not batches:
             return torch.zeros(n, n, dtype=torch.float32)
 
-        T = len(all_tokens)
-        token_to_col = {t: c for c, t in enumerate(all_tokens)}
+        # Concatenate per-batch tensors → dense [T_total, n_experts]. Token
+        # indexing here is implicit: row i corresponds to the i'th token in
+        # batch-order, which matches the contiguous batch_offset accumulation
+        # in _profile_layer (`_next_offset += batch.numel()`).
+        full = torch.cat([t for _, t in batches], dim=0)  # [T_total, n_experts_layer]
 
-        # Build (n, T) matrix; missing token entries default to 0.0.
-        mat = torch.zeros(n, T, dtype=torch.float32)
-        for row, e in enumerate(expert_ids):
-            prof = layer_profiles.get(e, {})
-            if not prof:
-                # Expert has no profile — row stays zero; zero-norm rows are
-                # normalized to zeros after NaN replacement, yielding min similarity.
-                continue
-            for t, val in prof.items():
-                c = token_to_col.get(t)
-                # c is guaranteed non-None: all_tokens is built from the union of all profile keys
-                if c is not None:
-                    mat[row, c] = val
+        # Select the requested experts' columns and transpose to [n, T_total].
+        # `expert_ids` are global expert indices; the storage tensor's second
+        # axis is indexed by the same expert ids, so this is a direct gather.
+        col_idx = torch.tensor(expert_ids, dtype=torch.long)
+        try:
+            mat = full.index_select(1, col_idx).t().contiguous()  # [n, T_total]
+        except IndexError as exc:
+            raise IndexError(
+                f"compute_gate_similarity_matrix: expert_ids out of range for "
+                f"layer {layer_idx} logits with {full.shape[1]} columns: {exc}"
+            ) from exc
 
         # L2-row-normalize each expert's profile vector.
         mat = F.normalize(mat, p=2, dim=1)  # (n, T)
