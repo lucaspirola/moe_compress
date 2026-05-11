@@ -20,20 +20,47 @@ _KLD_LOSS_CACHE: dict[float, nn.Module] = {}
 _CACHE_LOCK = threading.Lock()
 
 
+class _NativeKLDLoss(nn.Module):
+    """Pure-torch parity with `modelopt.torch.distill.LogitsDistillationLoss`.
+
+    Used when modelopt is unavailable (e.g. the BF16-only smoke whose image
+    deliberately doesn't ship modelopt — see
+    `tests/test_loop_dispatch.py::test_bf16_mode_does_not_import_modelopt`).
+    Numerics match modelopt's class at any T by the parity test in
+    `tests/test_kld_loss.py`: forward-KL with `batchmean` reduction and an
+    internal `T**2` scaling to undo the temperature-softmax gradient shrink.
+    """
+
+    def __init__(self, temperature: float):
+        super().__init__()
+        self.T = float(temperature)
+
+    def forward(self, student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
+        T = self.T
+        s_lp = torch.nn.functional.log_softmax(student / T, dim=-1)
+        t_p = torch.nn.functional.softmax(teacher / T, dim=-1)
+        return torch.nn.functional.kl_div(s_lp, t_p, reduction="batchmean") * (T * T)
+
+
 def _get_kld_loss_fn(temperature: float) -> nn.Module:
     """Return the cached `LogitsDistillationLoss(temperature, batchmean)` instance.
 
     Modelopt is imported lazily so kdr is importable in environments without
-    the modelopt wheel (e.g. local dev that doesn't need to run the loss).
+    the modelopt wheel. If the import fails at call time we fall back to
+    `_NativeKLDLoss` (bit-equal at the formula level — modelopt currently
+    wraps the same `F.kl_div` reduction with the same `T**2` scaling).
     """
     fn = _KLD_LOSS_CACHE.get(temperature)
     if fn is None:
         with _CACHE_LOCK:
             fn = _KLD_LOSS_CACHE.get(temperature)
             if fn is None:
-                from modelopt.torch.distill.losses import LogitsDistillationLoss
+                try:
+                    from modelopt.torch.distill.losses import LogitsDistillationLoss
 
-                fn = LogitsDistillationLoss(temperature=temperature, reduction="batchmean")
+                    fn = LogitsDistillationLoss(temperature=temperature, reduction="batchmean")
+                except ImportError:
+                    fn = _NativeKLDLoss(temperature=temperature)
                 _KLD_LOSS_CACHE[temperature] = fn
     return fn
 
