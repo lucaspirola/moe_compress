@@ -4,7 +4,7 @@
 #   - hf_jobs/entrypoint_ablations.py PEP 723 inline metadata (HF Jobs path)
 #   - docker/Dockerfile (vast.ai / external GPU path)
 #
-# Note: torch is installed separately (Dockerfile uses the cu130 wheel index;
+# Note: torch is installed separately (Dockerfile uses the cu128 wheel index;
 # the HF Jobs UV resolver picks an appropriate wheel automatically). We pin
 # the version range here for reference; the install command differs per path.
 
@@ -43,12 +43,12 @@ bitsandbytes>=0.44.0
 # flash-linear-attention and causal-conv1d build CUDA kernels and need to
 # link against the host's torch + nvcc. They are installed by:
 #   - max_quality/docker/Dockerfile  (with --no-build-isolation against the
-#     cu130-pinned torch)
+#     cu128-pinned torch)
 #   - max_quality/hf_jobs/entrypoint_ablations.py  (PEP 723 metadata with
 #     a prebuilt-wheel URL, since the HF Jobs UV env has no nvcc)
 # Listing them here would force pip to source-build under PEP 517 isolation,
 # which spawns a venv that ignores constraint files and pulls a fresh torch
-# from the default PyPI index — mismatching the cu130 base.
+# from the default PyPI index — mismatching the cu128 base.
 
 # --- Test only ---
 pytest>=8.0
