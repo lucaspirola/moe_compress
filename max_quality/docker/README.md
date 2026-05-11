@@ -77,14 +77,15 @@ Pick the cheapest row meeting the filter. Note the `id` column.
 vastai create instance <OFFER_ID> \
     --image ghcr.io/lucaspirola/moe-compress:latest \
     --disk 200 \
+    --onstart-cmd '/usr/local/bin/bootstrap.sh' \
     --env '-e HF_TOKEN=hf_xxx -e ONLY=A0 -e PREFLIGHT_ONLY=0 -e UPLOAD_ON_SUCCESS=1' \
     --ssh
 ```
 
 Notes:
+- `--onstart-cmd '/usr/local/bin/bootstrap.sh'` — **required**. vast.ai wraps every container with its own `/.launch` init script that replaces the image's `ENTRYPOINT`, so the bootstrap.sh baked into the image will NOT auto-run without this flag. Symptom if omitted: instance status flips to `running` but no harness output appears and `/cache/ablations/` stays empty. Diagnosed live 2026-05-11 (instance 36500694).
 - `--disk 200` — 200 GB ephemeral disk for the model snapshot + ablation artifacts. If you mount a persistent vast.ai volume at `/workspace/cache`, drop this to ~30 GB and reuse the snapshot across rentals.
-- The image's `ENTRYPOINT` is `bootstrap.sh`, so the container starts the harness automatically — no SSH needed unless you want to tail logs.
-- `--ssh` is still recommended so you can `ssh root@<host> -p <port>` and `docker logs -f <container>` if something looks wrong.
+- `--ssh` is recommended so you can `ssh root@<host> -p <port>` and `tail -f /cache/bootstrap.log` if something looks wrong. (vast.ai SSH lands you INSIDE the application container, so no `docker logs` indirection — read the log file directly.)
 
 ### 3. Tail logs
 
