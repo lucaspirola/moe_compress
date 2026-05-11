@@ -65,9 +65,45 @@ class QuantBlock(BaseModel):
 
 
 class DistillationConfig(BaseModel):
-    """LLR-0049 owns `eval_every_n_steps`; LLR-0010 owns `optimizer`."""
+    """LLR-0049 owns `eval_every_n_steps`; LLR-0010 owns `optimizer`.
 
-    model_config = ConfigDict(strict=True, extra="forbid")
+    **The tokens-per-step invariant.** The paper-relevant training quantity
+    is the total tokens consumed, not how those tokens are partitioned across
+    micro-batches. Concretely:
+
+        tokens_per_step = per_device_batch_size × world × gradient_accumulation × sequence_length
+        total_steps     = total_tokens // tokens_per_step
+
+    Implementations are free to trade off `per_device_batch_size` against
+    `gradient_accumulation` at constant `tokens_per_step` without changing
+    the optimizer's trajectory (modulo BF16 non-determinism in the reduction
+    order across micro-batches, which is below the BF16 forward's own
+    non-determinism floor). This is the basis of the `auto_batch_size`
+    optimization: at small `per_device_batch_size` the GPU is launch-bound
+    rather than compute-bound (we observed ~44% util at bs=1 on H200 in
+    Phase 7.1), so probing for the largest bs that fits in VRAM and
+    reducing `gradient_accumulation` proportionally typically buys 1.5-2×
+    wall-time on Hopper/Blackwell at no quality cost.
+
+    **Scaling for bigger models.** The probe is bounded above by VRAM. For a
+    70B model in BF16 on a single 141 GB H200, the probe will return
+    `per_device_batch_size=1` and the user is on the manual `gradient_accumulation`
+    path. For a 32B model the probe typically returns 2; for 8B / 13B it
+    typically returns 4-8. Multi-GPU FSDP/ZeRO-3 changes the per-rank VRAM
+    budget but not the per-rank probe semantics.
+
+    **Mutation under `auto_batch_size`.** When the trainer's Stage-4.5 probe
+    rebalances `per_device_batch_size` and `gradient_accumulation`, it
+    writes directly to those attributes after construction. `validate_assignment=True`
+    is enabled so Pydantic re-runs every field validator on the write —
+    a probe that ever produced `bs=0` or `ga=0` would surface immediately
+    rather than corrupting `tokens_per_step` silently. Direct mutation
+    elsewhere in the codebase must continue to satisfy the field
+    constraints; constraints can no longer be bypassed by post-validate
+    attribute assignment.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", validate_assignment=True)
 
     loss: Literal["forward_kld"] = "forward_kld"
     temperature: float = 1.0
@@ -93,6 +129,60 @@ class DistillationConfig(BaseModel):
     save_every_n_steps: int = Field(..., ge=0, description="0 = skip partial saves; final-only")
     trainable_scope: Literal["full", "experts_only", "factored_only"]
     use_gradient_checkpointing: bool = True
+
+    # Phase 7+ throughput optimization. See `_probe_max_batch_size` in
+    # `kdr/training/loop.py` for the algorithm and the class docstring above
+    # for the tokens-per-step invariant.
+    #
+    # When True, the trainer probes for the largest `per_device_batch_size`
+    # that fits VRAM at training start (one-time, ~30 s on H200), then
+    # rewrites `per_device_batch_size` and `gradient_accumulation` to that
+    # probed value and the matching divisor (preserving `tokens_per_step`
+    # exactly). Disabled by default so smoke configs and existing setups see
+    # zero behavior change. Set to True in real-recovery configs where the
+    # 1.5-2× wall-time win is worth the one-time probe cost.
+    #
+    # Generic-tool note: for any model where `per_device_batch_size > 1` is
+    # already manually set to fill VRAM, the probe will leave that value
+    # alone (it caps at the original `per_device_batch_size * gradient_accumulation`
+    # product). The probe is meant as a convenience for the "I don't know
+    # what fits, pick the best" case, not as a forced override.
+    auto_batch_size: bool = Field(
+        default=False,
+        description=(
+            "Phase 7+ throughput optimization. If True, probe at trainer "
+            "init for the largest per_device_batch_size that fits VRAM, "
+            "then reduce gradient_accumulation proportionally to preserve "
+            "tokens_per_step. Default off."
+        ),
+    )
+
+    # Phase 7+ throughput optimization (LLR-0027 v2). See
+    # `kdr/io/save.py:_AsyncSaveExecutor` for the algorithm.
+    #
+    # When True, the rank-0 disk-write phase of save_partial (state_dict
+    # serialization + tokenizer + metadata + atomic rename + sentinel)
+    # runs in a single-flight background thread, so the trainer's next
+    # forward+backward starts as soon as the collective `get_state_dict`
+    # returns. On an 8B BF16 model, save_partial stalls the trainer
+    # ~10-30 s per partial in sync mode; async mode reduces the stall to
+    # ~the consolidation time alone (~1-2 s on H200). The trade-off is
+    # ~weight-tensor-size of additional CPU RAM held in the snapshot
+    # while the background thread serializes (~17 GB for 8B BF16,
+    # ~140 GB for 70B BF16).
+    #
+    # Default off so the sync path is the audit-friendly baseline.
+    # Real recovery configs (e.g., `zaya1_8b_bf16_recovery.yaml`) opt in.
+    enable_async_save: bool = Field(
+        default=False,
+        description=(
+            "Phase 7+ throughput optimization. If True, save_partial "
+            "dispatches the rank-0 disk write to a background thread; the "
+            "next training step starts immediately after the collective "
+            "get_state_dict completes. Costs ~weight-tensor-size of CPU "
+            "RAM per pending snapshot. Default off."
+        ),
+    )
 
 
 class WikiText2Config(BaseModel):

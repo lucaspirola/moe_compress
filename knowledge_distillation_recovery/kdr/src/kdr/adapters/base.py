@@ -19,12 +19,38 @@ from accelerate import Accelerator
 from transformers import PreTrainedTokenizerBase
 
 from ..config import StudentConfig, TeacherConfig
+from ..modes import Mode
 from .router_replay import RouterReplayHookProtocol
 
 
 # REQ: LLR-0022
 class ModelAdapter(Protocol):
-    """Per-model-family knowledge: loaders, exempt indices, FP32 carve-outs."""
+    """Per-model-family knowledge: loaders, exempt indices, FP32 carve-outs.
+
+    Mode-vs-fork constraint (LLR-0026): ``required_attn_implementation(mode)``
+    selects the HF ``attn_implementation`` value per training mode. The choice
+    is driven by two orthogonal forces:
+
+    1. *Mode*: does this training path place hooks at the post-K/V-projection
+       boundary? Quantization-aware-distillation (``da_qad``) does (its
+       KV-quant simulator hooks intercept K/V tensors at every attention
+       layer). Pure-BF16 distillation does not. Hooking paths force ``eager``;
+       non-hooking paths are free to pick the fastest backend (typically
+       ``sdpa`` on Hopper / Blackwell).
+    2. *Fork*: is the model's custom attention routine wired only under a
+       specific HF backend? E.g., ZAYA1's CCA layer routes through
+       ``cca_eager_attention_forward`` which the published Zyphra fork wires
+       only under ``eager``, so the BF16 path *would* still be eager-forced
+       there if not for the SDPA-equivalent fallback path the fork provides.
+       Adapters for other families may face the opposite constraint (a
+       custom attention wired only under SDPA).
+
+    Concrete consequence for implementations: add an explicit branch per
+    mode in ``required_attn_implementation`` rather than falling back to a
+    default. Unknown modes MUST raise ``ValueError`` so the gap surfaces
+    before a paid GPU run rather than silently no-opping (in the hook case)
+    or losing throughput (in the BF16 case).
+    """
 
     name: str
 
@@ -34,6 +60,7 @@ class ModelAdapter(Protocol):
         *,
         teacher_cfg: TeacherConfig,
         student_cfg: StudentConfig,
+        mode: Mode,
     ) -> tuple[nn.Module, nn.Module, PreTrainedTokenizerBase]:
         """Load `(teacher, student, tokenizer)` from the configured sources.
 
@@ -52,6 +79,13 @@ class ModelAdapter(Protocol):
         The returned tokenizer is the STUDENT's tokenizer; the trainer
         independently checks teacher/student tokenizer compatibility and
         uses the student's for calibration and the saved checkpoint.
+
+        `mode` (LLR-0026) selects the attention backend the adapter forwards
+        to `from_pretrained(..., attn_implementation=...)`. Pure-BF16
+        distillation places no K/V hooks and gets the fastest backend
+        (typically SDPA); the quantization-aware-distillation (`da_qad`)
+        path requires the hookable backend (typically eager) for the
+        KV-quant simulator. See LLR-0026 for the full rationale.
         """
         ...
 
@@ -81,12 +115,32 @@ class ModelAdapter(Protocol):
         """
         ...
 
-    def required_attn_implementation(self) -> Literal["eager", "sdpa"]:
-        """The HF `attn_implementation` value the adapter requires.
+    def required_attn_implementation(self, mode: Mode) -> Literal["eager", "sdpa"]:
+        """The HF `attn_implementation` value the adapter requires for `mode`.
 
-        Flash-attn is rejected because it fuses K/V projection and never
-        exposes post-projection K/V tensors at a Python hook boundary,
-        silently no-opping the KV simulator.
+        Mode-aware (LLR-0026):
+
+        - `mode == 'da_qad'` → return the backend whose K/V tensors are
+          exposed at a Python hook boundary (typically `'eager'`). The
+          KV-quant simulator's forward hooks intercept post-projection K/V
+          tensors at every attention layer; SDPA and flash-attn fuse the
+          K/V projection differently and bypass the hook.
+        - `mode == 'bf16'` → return the fastest backend that produces
+          numerically equivalent output (typically `'sdpa'`). No hooks are
+          placed in pure-BF16 distillation, so the eager-only constraint
+          does not apply.
+
+        Flash-attn is rejected in both modes because it fuses K/V projection
+        and never exposes post-projection K/V tensors at a Python hook
+        boundary, silently no-opping the KV simulator in `da_qad` while
+        offering no speedup over SDPA on Hopper/Blackwell for our workload.
+
+        Generic-tool guidance: when adding a new mode (e.g., FP8 or NVFP4
+        quant variants), decide based on whether any hooks will be placed
+        at the K/V boundary. If yes → eager. If no → SDPA. If your
+        architecture's custom attention routine is wired only under a
+        specific HF backend (as ZAYA1's CCA is under eager), the choice is
+        constrained by the model fork rather than by the mode.
         """
         ...
 

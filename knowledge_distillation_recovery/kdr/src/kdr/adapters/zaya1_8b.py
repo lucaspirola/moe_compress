@@ -34,6 +34,7 @@ from transformers import (
 )
 
 from ..config import StudentConfig, TeacherConfig
+from ..modes import Mode
 from .router_replay import RouterReplayHookProtocol
 
 log = logging.getLogger(__name__)
@@ -51,6 +52,7 @@ class Zaya1Adapter:
         *,
         teacher_cfg: TeacherConfig,
         student_cfg: StudentConfig,
+        mode: Mode,
     ) -> tuple[nn.Module, nn.Module, PreTrainedTokenizerBase]:
         """Load (teacher, student, tokenizer).
 
@@ -64,11 +66,18 @@ class Zaya1Adapter:
         BF16 (LLR-0005) — FP8 lm_head produces unstable softmax outputs at
         the vocab tail; BF16 lm_head with FP8 body weights is the documented
         stable configuration on H200.
+
+        `mode` (LLR-0026): selects the attention backend forwarded to
+        `from_pretrained(..., attn_implementation=...)` via
+        :meth:`required_attn_implementation`. `bf16` uses SDPA; `da_qad`
+        uses eager for K/V hookability.
         """
-        # LLR-0026 AC #2: adapter forces its required attn_implementation,
-        # overriding the YAML's value. CCA needs `eager` for hookability;
-        # silently honoring a YAML mis-configuration would no-op KV-quant.
-        required_attn = self.required_attn_implementation()
+        # LLR-0026 AC: adapter forces its required attn_implementation
+        # (mode-aware), overriding the YAML's value. In `da_qad` CCA needs
+        # `eager` for hookability; in `bf16` SDPA is selected for speed.
+        # Silently honoring a YAML mis-configuration would either no-op
+        # KV-quant (da_qad) or lose ~2-3× throughput (bf16) — see LLR-0026.
+        required_attn = self.required_attn_implementation(mode)
         teacher = self._load_one(
             name_or_path=teacher_cfg.name_or_path,
             revision=teacher_cfg.revision,
@@ -336,21 +345,56 @@ class Zaya1Adapter:
         return ["lm_head", "embed_tokens", "router", "norm", "cca_cache"]
 
     # REQ: LLR-0026
-    def required_attn_implementation(self) -> Literal["eager", "sdpa"]:
-        """``"eager"`` — CCA's convolutional downprojector is not flash-attn-
-        compatible, and ``eager`` is the ATTN backend that exposes
-        post-projection K/V tensors at a Python hook boundary.
+    def required_attn_implementation(self, mode: Mode) -> Literal["eager", "sdpa"]:
+        """Mode-aware attention backend selection (LLR-0026).
 
-        ``sdpa`` would also expose K/V to a forward hook on ``self_attn``,
-        but the Zyphra fork's CCA layer routes through a custom function
-        (``cca_eager_attention_forward`` per the fork's source) that is only
-        wired under ``eager``. Phase 7 confirms on real ZAYA1.
+        - ``mode == "da_qad"`` → ``"eager"``. CCA's convolutional
+          downprojector is not flash-attn-compatible, and ``eager`` is the
+          ATTN backend that exposes post-projection K/V tensors at a Python
+          hook boundary. ``sdpa`` would also expose K/V to a forward hook on
+          ``self_attn``, but the Zyphra fork's CCA layer routes through a
+          custom function (``cca_eager_attention_forward`` per the fork's
+          source) that is only wired under ``eager``. Phase 7.1 confirmed
+          on real ZAYA1-8B.
+        - ``mode == "bf16"`` → ``"sdpa"``. Pure-BF16 self/teacher-
+          distillation places no hooks (the trainer installs
+          ``NoOpReplayContextManager()`` at loop.py:160 in BF16 mode), so the
+          eager-only constraint does not apply. SDPA produces numerically
+          equivalent output to eager at BF16 precision (agreement an order
+          of magnitude below the BF16 forward's own non-determinism) and is
+          ~2-3× faster on Hopper/Blackwell, which dominates wall-time for
+          80-layer 8B models. Phase 7.1's 200-step variant spent ~33 s/step
+          on H200 entirely because eager was forced unnecessarily.
 
-        Flash-attn is rejected: it fuses K/V projection and never exposes
-        post-projection K/V tensors at a Python hook, silently no-opping the
-        KV simulator.
+        Flash-attn is rejected in both modes: it fuses K/V projection and
+        never exposes post-projection K/V tensors at a Python hook, silently
+        no-opping the KV simulator in da_qad and offering no measurable
+        speedup over SDPA on Hopper/Blackwell.
+
+        Generic-tool guidance: when adding a new mode (e.g., FP8 / NVFP4
+        quant variants), the choice is driven by two questions —
+        (1) Will any hooks be placed at the post-K/V-projection boundary?
+        If yes, ``eager`` is required because hooks must see post-projection
+        tensors. (2) Is the model architecture's custom attention routine
+        wired only under one HF backend? (e.g., ZAYA1's CCA is eager-only
+        in the published fork.) If yes, the choice is constrained by the
+        fork rather than by the mode. For a new fork that wires its custom
+        attention under SDPA, both BF16 AND quant-with-no-K/V-hooks paths
+        can use SDPA — only K/V-hooking paths are constrained to eager.
         """
-        return "eager"
+        if mode == "bf16":
+            return "sdpa"
+        if mode == "da_qad":
+            return "eager"
+        # Defensive: an unknown mode must NOT silently default. Future modes
+        # need an explicit branch here so the genericness rationale above is
+        # actually applied per-mode rather than papered over with a fallback.
+        raise ValueError(
+            f"Zaya1Adapter.required_attn_implementation: unsupported mode "
+            f"{mode!r}. Add an explicit branch in this method for any new "
+            f"mode, after deciding eager-vs-sdpa per the docstring's "
+            f"generic-tool guidance."
+        )
 
     # REQ: LLR-0025
     def router_replay_hook(

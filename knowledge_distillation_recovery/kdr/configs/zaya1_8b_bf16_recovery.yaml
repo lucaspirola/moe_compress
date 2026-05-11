@@ -1,0 +1,105 @@
+# kdr — ZAYA1-8B `bf16` mode, REAL recovery run config (Phase 7.2+).
+#
+# Distinct from `zaya1_8b_bf16_smoke200.yaml`: this is the actual quality-
+# recovery config that consumes meaningful compute, not the 40-step plumbing
+# smoke. Self-distillation is replaced with a real teacher → student pair
+# at the call site (see CLI invocation); this YAML pins all other knobs.
+#
+# Throughput optimizations enabled here (all paper-compliant — quality
+# preserved, only wall-time reduced):
+#
+#   1. attn=sdpa via mode-aware LLR-0026: BF16 places no K/V hooks, so SDPA
+#      is selected. ~2-3× faster than eager on Hopper/Blackwell, numerically
+#      equivalent to eager at BF16. The adapter forces this regardless of
+#      the `teacher.attn_implementation` / `student.attn_implementation`
+#      YAML values (both kept at "sdpa" here for clarity).
+#
+#   2. auto_batch_size: probe the largest per_device_batch_size that fits
+#      VRAM at trainer init, rebalance gradient_accumulation so
+#      tokens_per_step is preserved exactly. Trades ~30 s of probe time
+#      for 1.5-2× steady-state throughput on H200/B200.
+#
+#   3. enable_async_save: true (Phase C — active). The rank-0 disk-write
+#      phase of save_partial (state_dict serialization + tokenizer +
+#      metadata + atomic rename + sentinel) runs in a single-flight
+#      background thread. Training resumes as soon as the collective
+#      `get_state_dict` returns. Costs ~weight-tensor-size of CPU RAM
+#      per pending snapshot (~17 GB for ZAYA1-8B BF16).
+#
+# Wall-clock target: ~5-10 min per recovery iteration on 1× H200 with the
+# canonical 200-step schedule, depending on auto_batch_size's probed value.
+# For a 70B variant the probed bs will be 1 and ga stays at the configured
+# value — the run takes proportionally longer.
+#
+# Run command (vast.ai): see the bootstrap.sh launch invocation; the only
+# differences from the smoke launch are the KDR_CONFIG path (this file) and
+# possibly a different STUDENT_REPO if the real teacher/student diverge.
+
+mode: bf16
+
+teacher:
+  name_or_path: Zyphra/ZAYA1-8B
+  revision: main
+  torch_dtype: bfloat16
+  # YAML value is informational; the adapter overrides per mode (LLR-0026:
+  # BF16 → sdpa). Keeping it here for documentation; the value does not
+  # change runtime behavior because the adapter's `required_attn_implementation`
+  # is the source of truth.
+  attn_implementation: sdpa
+
+student:
+  source: Zyphra/ZAYA1-8B   # replace at call site for a real teacher-student pair
+  torch_dtype: bfloat16
+  attn_implementation: sdpa  # adapter overrides per mode — see teacher note
+
+calibration:
+  source: nvidia-cascade
+  dataset: nvidia/Nemotron-Cascade-2-SFT-Data
+  seed: 1337
+  num_sequences: 13000
+  sequence_length: 2048      # real recovery uses the full canonical seq, not the smoke's 1024
+  subset_weights:
+    math: 0.21
+    science: 0.11
+    chat: 0.56
+    instruction_following: 0.033
+    conversational_agent: 0.0331
+    swe: 0.02
+    terminal_agent: 0.0331
+  ptq_subset_size: 256
+
+# `quant:` intentionally absent in `bf16` mode.
+
+distillation:
+  loss: forward_kld
+  temperature: 1.0
+  optimizer: adamw_bnb_8bit
+  learning_rate: 2.0e-4
+  min_learning_rate: 4.5e-7
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  grad_clip_norm: 1.0
+  warmup_steps: 20
+  # tokens_per_step = bs × world × ga × seq.  With auto_batch_size=true the
+  # trainer probes for the largest bs at startup; the values below are the
+  # FLOOR (cap on bs×ga product). The probe will not exceed bs × ga = 32
+  # microbatch-sequences per optimizer step. For a 70B variant the probe
+  # will return bs=1 and ga stays at 32; for 8B the probe typically picks
+  # bs=4-8 and ga drops to 8-4.
+  total_tokens: 26_214_400     # 200 optimizer steps × (32 × seq=2048 × 1 GPU world)
+  per_device_batch_size: 1
+  gradient_accumulation: 32
+  sequence_length: 2048
+  log_every_n_steps: 5
+  eval_every_n_steps: 50
+  save_every_n_steps: 50       # 4 partials (50/100/150/200) — exercises resume
+  trainable_scope: full
+  use_gradient_checkpointing: true
+  auto_batch_size: true        # Phase 7+ throughput probe; see kdr/config.py DistillationConfig docstring
+  enable_async_save: true      # Phase 7+ async save_partial; see kdr/io/save.py:_AsyncSaveExecutor
+
+eval:
+  wikitext2:
+    enabled: true
+    sequence_length: 2048
+    num_sequences: 64
