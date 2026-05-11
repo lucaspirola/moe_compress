@@ -108,23 +108,25 @@ def load_model(
     except Exception as exc:                         # noqa: BLE001
         if isinstance(exc, (MemoryError, torch.cuda.OutOfMemoryError)):
             raise
-        from transformers import AutoModel
+        from transformers import AutoModel, AutoModelForCausalLM
         if auto_cls is AutoModel:
             # N-2: no retry — same class would fail identically.
             raise RuntimeError(
                 f"load_model: AutoModel.from_pretrained failed for {name_or_path!r}; "
                 f"err={exc!r}"
             ) from exc
-        log.warning("%s.from_pretrained failed (%s); retrying with AutoModel",
-                    auto_cls.__name__, exc)
+        # Prefer CausalLM over bare AutoModel — base model lacks lm_head for NLL.
+        retry_cls = AutoModelForCausalLM if auto_cls is not AutoModelForCausalLM else AutoModel
+        log.warning("%s.from_pretrained failed (%s); retrying with %s",
+                    auto_cls.__name__, exc, retry_cls.__name__)
         try:
-            model = AutoModel.from_pretrained(name_or_path, **kwargs)
+            model = retry_cls.from_pretrained(name_or_path, **kwargs)
         except Exception as retry_exc:
             if isinstance(retry_exc, (MemoryError, torch.cuda.OutOfMemoryError)):
                 raise
-            log.warning("load_model: AutoModel retry also failed for %r: %s", name_or_path, retry_exc)
+            log.warning("load_model: %s retry also failed for %r: %s", retry_cls.__name__, name_or_path, retry_exc)
             raise RuntimeError(
-                f"load_model: both {auto_cls.__name__} and AutoModel failed for {name_or_path!r}; "
+                f"load_model: both {auto_cls.__name__} and {retry_cls.__name__} failed for {name_or_path!r}; "
                 f"first_err={exc!r}; retry_err={retry_exc!r}"
             ) from exc
 
