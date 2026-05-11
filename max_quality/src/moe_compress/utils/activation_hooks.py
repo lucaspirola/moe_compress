@@ -836,20 +836,32 @@ class InputCovarianceAccumulator:
     """Per-(layer, expert, matrix_name) streaming covariance accumulator.
 
     Two-tier storage:
-      * ``_pending``: CPU-resident covariance accumulations pending the
-        atomic lock-commit into ``covariance``. Covariance computation was
-        moved to CPU before lock acquisition (to avoid cross-CUDA-stream
-        races), so these tensors are CPU-resident despite the name suggesting
-        GPU. Updated by :meth:`update` outside the lock; drained by
-        :meth:`finalize_layer` inside the lock.
+      * ``_pending``: per-key covariance accumulations on the same device as
+        the input tensors (typically GPU during a Stage 2 profiling pass).
+        Updated by :meth:`update` outside the lock; drained by
+        :meth:`finalize_layer`, which does a single GPU→CPU transfer per key.
+        Earlier revisions moved each call's result to CPU before lock
+        acquisition; that produced ~256 small GPU→CPU syncs per profiling
+        batch and dominated wall-time, so updates now stay on the input
+        device. Cross-CUDA-stream callers must synchronize before
+        :meth:`finalize_layer`.
       * ``covariance``: CPU-resident final results, in ``storage_dtype``
         (default float32; callers may set bf16 via set_storage_dtype() for
         disk economy). Populated by :meth:`finalize_layer` once per-layer
         profiling completes.
 
     Stage 2 drives profiling one layer at a time, so only one layer's worth
-    of per-expert pending covariances is live simultaneously (≤ ~256 experts
-    × 2048×2048 fp32 ≈ 4.3 GB — fits well under an 80 GB A100).
+    of per-expert pending covariances is live simultaneously. For
+    Qwen3.6-35B-A3B (d_hid≈5120, intermediate≈2048), the peak GPU footprint
+    of ``_pending`` per layer is roughly:
+
+        gate_proj : 256 × [2048, 2048] fp32 ≈ 4 GB
+        down_proj : 256 × [5120, 5120] fp32 ≈ 25.6 GB
+
+    Total ≈ 30 GB, leaving comfortable headroom on an H200 NVL (143 GB)
+    after the ~70 GB model. Smaller GPUs (e.g. 80 GB A100) require either
+    smaller batch sizes, an alternate accumulator strategy, or a tighter
+    storage dtype.
 
     Aliasing: ``gate_proj`` and ``up_proj`` share input inside
     ``Qwen3_5MoeExperts`` so writes with ``matrix_name="up_proj"`` are
@@ -861,7 +873,7 @@ class InputCovarianceAccumulator:
     token_count: defaultdict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))  # auto-vivifies with 0
     storage_dtype: torch.dtype = torch.float32
     _alias_gate_up: bool = True
-    # CPU-resident covariance accumulations pending lock-commit (see class docstring).
+    # GPU-resident covariance accumulations; drained to CPU once per layer by finalize_layer().
     _pending: dict[tuple[int, int, str], torch.Tensor] = field(default_factory=dict)
     _gpu_token_count: dict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))
     _lock: "threading.Lock" = field(default_factory=threading.Lock)
@@ -877,6 +889,15 @@ class InputCovarianceAccumulator:
         Lock discipline: we hold ``_lock`` only around the _pending dict reads and
         writes, NOT during the matmul itself — that would stall the forward
         thread while the background finalize thread waits for the lock.
+
+        The covariance tensor stays on the input device (typically GPU) for the
+        lifetime of a layer's profile; ``finalize_layer`` does the single
+        GPU→CPU transfer per key when draining ``_pending``. This eliminates
+        the per-call .cpu() sync that was the dominant cost of ``input_cb``
+        in Stage 2 profiling (≈256 calls/batch × 100MB transfer/call). For
+        callers using multiple CUDA streams, ``torch.cuda.synchronize()``
+        must be called before ``finalize_layer`` to ensure pending in-place
+        adds have completed.
         """
         if self._alias_gate_up and matrix_name == "up_proj":
             return
@@ -887,10 +908,9 @@ class InputCovarianceAccumulator:
         # a view when the input is already float32, and `.clone()` breaks the alias
         # so in-place ops on the caller's source tensor cannot affect our computation.
         flat_f32 = flat.to(torch.float32).clone()
-        # Expensive matmul outside the lock — no shared state touched here.
+        # Matmul on the input's device (typically GPU). The covariance tensor
+        # stays on-device — see method docstring for the cross-stream contract.
         cov = flat_f32.transpose(0, 1) @ flat_f32
-        # Move to CPU before lock acquisition to avoid cross-CUDA-stream race on in-place add.
-        cov = cov.cpu()
         n_tok = flat.shape[0]
         key = (layer_idx, expert_idx, matrix_name)
         with self._lock:
@@ -910,8 +930,13 @@ class InputCovarianceAccumulator:
                          for k in keys]
             storage_dtype = self.storage_dtype  # capture under lock
 
-        # Phase 2: cast to storage dtype (tensors are already CPU-resident — see update()).
-        cpu_items = [(k, gpu_cov.to(storage_dtype), n_tok)
+        # Phase 2: cast to storage dtype on the source device (typically GPU)
+        # and then transfer once to CPU. Doing the dtype cast first keeps the
+        # wire transfer at the storage-dtype byte width (e.g. half the volume
+        # for bf16/fp16). The pending tensors now live on GPU until this call
+        # (see update() — the prior per-call .cpu() was removed to eliminate
+        # ~256 GPU→CPU syncs per batch).
+        cpu_items = [(k, gpu_cov.to(storage_dtype).cpu(), n_tok)
                      for k, gpu_cov, n_tok in gpu_items]
 
         # Phase 3: merge transferred tensors into CPU-resident covariance dict
