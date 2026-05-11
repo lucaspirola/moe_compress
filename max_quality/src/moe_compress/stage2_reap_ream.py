@@ -1144,6 +1144,11 @@ def _profile_layer(
     # partial batch when num_calibration_samples % batch_size != 0.
     _batch_offset = 0  # cumulative token start of current batch
     _next_offset = 0   # cumulative token count after current batch
+
+    # DIAG: per-hook time accumulators (input_cb, intermediate_cb, down_cb, call_count)
+    # Reset at start of each batch by the batch loop below.
+    import time as _diag_time_mod
+    _diag_cb = [0.0, 0.0, 0.0, 0]
     # B-C-C-1: full-softmax cache for the current batch's router logits.
     # Spec §5 line 339 + D-ream-sparse-routing require σ(x)_e (the
     # un-renormalized full softmax over ALL experts), not the top-k
@@ -1155,13 +1160,19 @@ def _profile_layer(
     _full_softmax: list[torch.Tensor | None] = [None]
 
     def input_cb(li, e, tensor, ctx):
+        _t = _diag_time_mod.monotonic()
         cov_acc.update(li, e, "gate_proj", tensor)
+        _diag_cb[0] += _diag_time_mod.monotonic() - _t
+        _diag_cb[3] += 1
 
     def intermediate_cb(li, e, tensor, ctx):
+        _t = _diag_time_mod.monotonic()
         cov_acc.update(li, e, "down_proj", tensor)
         ream_acc.record_neuron_activations(li, e, tensor)
+        _diag_cb[1] += _diag_time_mod.monotonic() - _t
 
     def down_cb(li, e, tensor, ctx):
+        _t = _diag_time_mod.monotonic()
         # _batch_offset is only read here, never assigned; no nonlocal declaration needed.
         record_reap(reap_acc, li, e, ctx["top_k_weights"], tensor)
         # B-C-C-1: pass σ(x)_e (full softmax over all experts) at active token
@@ -1196,6 +1207,7 @@ def _profile_layer(
             li, e, sigma_e, tensor,
             token_idx, _batch_offset,
         )
+        _diag_cb[2] += _diag_time_mod.monotonic() - _t
 
     # B-C-C-1: pre-forward hook on the experts module that computes the full
     # softmax from the latest captured router logits. Runs after the router
@@ -1247,16 +1259,20 @@ def _profile_layer(
                 log.info("DIAG layer %d: entering batch loop (calibration tensor + early-exit forwards)", layer_idx)
                 for batch in batches:
                     _diag_t_batch = _diag_time.monotonic()
+                    # Reset per-batch hook timers
+                    _diag_cb[0] = 0.0; _diag_cb[1] = 0.0; _diag_cb[2] = 0.0; _diag_cb[3] = 0
                     if device is not None:
                         batch = batch.to(device)
                     _batch_offset = _next_offset
                     router_logits_storage[layer_idx].clear()
                     _full_softmax[0] = None
+                    _diag_t_fwd = _diag_time.monotonic()
                     with torch.no_grad():
                         try:
                             model(input_ids=batch)
                         except _EarlyExitException:
                             pass  # expected — target layer completed
+                    _diag_fwd_dt = _diag_time.monotonic() - _diag_t_fwd
                     if router_logits_storage[layer_idx]:
                         batch_logits = router_logits_storage[layer_idx][-1]
                         ream_acc.record_router_logits(layer_idx, batch_logits, _batch_offset)
@@ -1266,8 +1282,12 @@ def _profile_layer(
                     _diag_count += 1
                     _diag_dt = _diag_time.monotonic() - _diag_t_batch
                     if _diag_count <= 3 or _diag_count % 10 == 0:
-                        log.info("DIAG layer %d: batch %d done in %.2fs (cumulative %.1fs)",
-                                 layer_idx, _diag_count, _diag_dt, _diag_time.monotonic() - _diag_t0)
+                        log.info(
+                            "DIAG layer %d batch %d: total=%.2fs fwd=%.2fs hooks: input=%.2fs intermed=%.2fs down=%.2fs (n_cb=%d) | cum=%.1fs",
+                            layer_idx, _diag_count, _diag_dt, _diag_fwd_dt,
+                            _diag_cb[0], _diag_cb[1], _diag_cb[2], _diag_cb[3],
+                            _diag_time.monotonic() - _diag_t0,
+                        )
                 log.info("DIAG layer %d: batch loop complete — %d batches in %.1fs, now post-profile work",
                          layer_idx, _diag_count, _diag_time.monotonic() - _diag_t0)
             finally:
