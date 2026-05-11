@@ -85,10 +85,17 @@ HEAD_SHA="$(git -C "$CODE_DIR" rev-parse --short HEAD)"
 log "Code HEAD = $HEAD_SHA"
 
 # ---------------------------------------------------------------------------
-# 4. HF auth
+# 4. HF auth — no explicit login required.
+# `huggingface_hub` (used by snapshot_download below, by trackio, and by the
+# Stage 1/2 upload paths) reads $HF_TOKEN directly from the environment on every
+# API call. We had a `huggingface-cli login` step here previously, but newer
+# huggingface_hub releases (1.x) renamed the CLI to `hf` and the legacy
+# `huggingface-cli login` is a deprecated no-op — it printed a warning and
+# returned non-zero, which `set -e` then killed bootstrap with. `HF_TOKEN`
+# was already in env from the docker `-e HF_TOKEN=...` flag, so the explicit
+# login was redundant. Dropping it keeps the script forward-compatible.
 # ---------------------------------------------------------------------------
-log "Authenticating to HF Hub"
-huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential >/dev/null
+log "HF_TOKEN in env — huggingface_hub will read it from \$HF_TOKEN at each call"
 
 # ---------------------------------------------------------------------------
 # 5. Model snapshot prefetch (skipped automatically if already cached)
