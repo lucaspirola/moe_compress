@@ -23,6 +23,7 @@ import logging
 import os
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -125,6 +126,48 @@ def _build_ablation_config(
 def _is_complete(ablation_dir: Path) -> bool:
     """Skip-if-already-run signal. Stage 6's final artifact is the gate."""
     return (ablation_dir / "stage6_eval.json").exists()
+
+
+def _upload_ablation_bg(
+    ablation_id: str,
+    ablation_dir: Path,
+    shared_dir: Path,
+    bucket: str,
+    hf_token: str,
+    upload_shared: bool,
+) -> None:
+    """Upload one ablation's results to HF Hub. Runs in a background thread so
+    the GPU can start the next ablation immediately. Writes uploaded.flag on
+    success so the orchestrator knows this ablation is durable on Hub."""
+    _log = logging.getLogger(__name__)
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=hf_token)
+
+        if upload_shared:
+            _log.info("[%s] uploading _shared/ to %s", ablation_id, bucket)
+            api.upload_folder(
+                folder_path=str(shared_dir),
+                path_in_repo="_shared",
+                repo_id=bucket,
+                repo_type="dataset",
+                ignore_patterns=["*.lock", "__pycache__", "*.py"],
+            )
+
+        _log.info("[%s] uploading stage6_eval.json to %s", ablation_id, bucket)
+        api.upload_file(
+            path_or_fileobj=str(ablation_dir / "stage6_eval.json"),
+            path_in_repo=f"{ablation_id}/stage6_eval.json",
+            repo_id=bucket,
+            repo_type="dataset",
+        )
+
+        (ablation_dir / "uploaded.flag").touch()
+        _log.info("[%s] upload complete → %s/%s/stage6_eval.json",
+                  ablation_id, bucket, ablation_id)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("[%s] background upload failed (artifacts remain on disk): %s",
+                     ablation_id, exc)
 
 
 def _hardlink_or_copy(src: Path, dst: Path) -> None:
@@ -390,6 +433,15 @@ def main(argv: list[str] | None = None) -> int:
         log.info("--preflight-only: exiting after pre-flight. _shared/ ready at %s", shared_dir)
         return 0
 
+    # Background upload state. When HF_ARTIFACTS_BUCKET is set, each completed
+    # ablation is uploaded in a daemon thread while the GPU works on the next
+    # one. uploaded.flag is written on success so the orchestrator can tell
+    # which ablations are durable on Hub and safe to use when switching GPUs.
+    upload_bucket = os.environ.get("HF_ARTIFACTS_BUCKET", "").strip()
+    hf_token = os.environ.get("HF_TOKEN", "")
+    upload_threads: list[tuple[str, threading.Thread]] = []
+    first_upload = True  # _shared/ is uploaded once alongside the first ablation
+
     # Per-ablation loop.
     results: dict[str, Any] = {}
     failures: list[tuple[str, str]] = []
@@ -409,11 +461,33 @@ def main(argv: list[str] | None = None) -> int:
                     "A0 completed but teacher_eval_cache.json was not written. "
                     "Subsequent ablations would re-run teacher scoring. Halting."
                 )
+            # Kick off background upload immediately — next ablation starts
+            # on the GPU while CPU streams this one to HF Hub.
+            if upload_bucket and hf_token:
+                t = threading.Thread(
+                    target=_upload_ablation_bg,
+                    args=(aid, ablations_root / aid, shared_dir,
+                          upload_bucket, hf_token, first_upload),
+                    daemon=True,
+                    name=f"upload-{aid}",
+                )
+                t.start()
+                upload_threads.append((aid, t))
+                first_upload = False
         except Exception as exc:  # noqa: BLE001
             log.exception("[%s] failed", aid)
             failures.append((aid, str(exc)))
             # Continue to the next ablation; failed run is retryable on the
             # next job invocation (the harness is idempotent).
+
+    # Wait for all background uploads to finish before writing the summary.
+    # Each thread has already started; GPU work is done at this point.
+    if upload_threads:
+        log.info("Waiting for %d background upload(s) to finish…", len(upload_threads))
+        for aid, t in upload_threads:
+            t.join(timeout=600)
+            if t.is_alive():
+                log.warning("[%s] upload thread still alive after 10 min — giving up", aid)
 
     # Aggregate.
     summary_path = ablations_root / "_summary.json"
@@ -426,6 +500,19 @@ def main(argv: list[str] | None = None) -> int:
     }
     save_json_artifact(summary, summary_path)
     log.info("Wrote summary to %s", summary_path)
+
+    if upload_bucket and hf_token:
+        try:
+            from huggingface_hub import HfApi
+            HfApi(token=hf_token).upload_file(
+                path_or_fileobj=str(summary_path),
+                path_in_repo="_summary.json",
+                repo_id=upload_bucket,
+                repo_type="dataset",
+            )
+            log.info("Uploaded _summary.json to %s", upload_bucket)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Summary upload failed (artifact remains on disk): %s", exc)
 
     # Concise dashboard line.
     log.info("=" * 60)

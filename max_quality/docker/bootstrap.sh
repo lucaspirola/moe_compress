@@ -36,8 +36,10 @@ DESTROY_HINT="${DESTROY_HINT:-vastai destroy instance \$VAST_CONTAINERLABEL}"
 export HF_HOME="${HF_HOME:-$CACHE_MOUNT/hf}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 export TRACKIO_SPACE_ID
-# Forwarded to entrypoint of run_ablations.py; the env var is read by the
-# harness via os.environ in run_ablations.main() if/when used.
+export HF_ARTIFACTS_BUCKET
+# HF_ARTIFACTS_BUCKET and HF_TOKEN are exported so run_ablations.py can read
+# them for per-ablation streaming uploads (uploads in background thread while
+# GPU runs the next ablation).
 
 log() { printf '[bootstrap] %s\n' "$*" >&2; }
 
@@ -75,6 +77,74 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 # 2. Cache layout
 # ---------------------------------------------------------------------------
 mkdir -p "$CACHE_MOUNT/hf" "$CACHE_MOUNT/ablations" "$CACHE_MOUNT/code"
+
+# ---------------------------------------------------------------------------
+# 2.5. Seed artifacts from HF Hub (idempotent)
+#      Pulls _shared/ (Stage 1 artifacts) and any A*/stage6_eval.json already
+#      on Hub so _is_complete() skips them on this fresh instance. Enables
+#      GPU-switching mid-sweep: destroy instance, launch cheaper one, resume.
+# ---------------------------------------------------------------------------
+if [[ -n "${HF_ARTIFACTS_BUCKET:-}" ]]; then
+    log "Seeding artifacts from $HF_ARTIFACTS_BUCKET → $CACHE_MOUNT/ablations"
+    python3 - <<PYEOF
+import os, sys, pathlib, logging
+logging.basicConfig(level=logging.WARNING)
+
+bucket = "$HF_ARTIFACTS_BUCKET"
+ablations_root = pathlib.Path("$CACHE_MOUNT/ablations")
+shared_dir = ablations_root / "_shared"
+token = os.environ.get("HF_TOKEN")
+
+try:
+    from huggingface_hub import list_repo_files, hf_hub_download
+except ImportError:
+    print("[seed] huggingface_hub not available — skipping", flush=True)
+    sys.exit(0)
+
+try:
+    remote_files = set(list_repo_files(bucket, repo_type="dataset", token=token))
+except Exception as e:
+    print(f"[seed] cannot list {bucket}: {e} — skipping", flush=True)
+    sys.exit(0)
+
+needed_shared = {"_shared/stage1_blacklist.json", "_shared/stage1_budgets.json",
+                 "_shared/budget_decomposition.json"}
+shared_ok = all((shared_dir / f.split("/", 1)[1]).exists() for f in needed_shared)
+
+to_pull = []
+if not shared_ok:
+    missing = [f for f in needed_shared if f in remote_files]
+    if len(missing) == len(needed_shared):
+        to_pull.extend(missing)
+        to_pull += [f for f in remote_files if f.startswith("_shared/")]
+        print("[seed] will pull _shared/ (Stage 1 artifacts)", flush=True)
+    else:
+        print("[seed] _shared/ incomplete on Hub — Stage 1 will run fresh", flush=True)
+
+for f in sorted(remote_files):
+    parts = f.split("/")
+    if len(parts) == 2 and parts[1] == "stage6_eval.json":
+        dst = ablations_root / parts[0] / "stage6_eval.json"
+        if not dst.exists():
+            to_pull.append(f)
+            print(f"[seed] will pull {f} (marks {parts[0]} complete)", flush=True)
+
+if not to_pull:
+    print("[seed] nothing to pull — cache already up to date", flush=True)
+    sys.exit(0)
+
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id=bucket,
+    repo_type="dataset",
+    local_dir=str(ablations_root),
+    allow_patterns=list(set(to_pull)),
+    token=token,
+    ignore_patterns=["*.lock"],
+)
+print("[seed] done", flush=True)
+PYEOF
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Code clone (or pull if already on the persistent volume)
@@ -146,15 +216,19 @@ if [[ $HARNESS_RC -ne 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Optional artifact upload
+# 7. Final artifact upload safety net
+#    Per-ablation uploads (stage6_eval.json + uploaded.flag) are handled by
+#    run_ablations.py streaming threads — they run while the GPU works on the
+#    next ablation. This block is a safety net for anything that didn't get
+#    uploaded (e.g. run crashed before a thread completed), and for _shared/.
 # ---------------------------------------------------------------------------
 if [[ "$UPLOAD_ON_SUCCESS" == "1" ]]; then
-    log "Uploading artifacts to bucket $HF_ARTIFACTS_BUCKET"
+    log "Final artifact sync to bucket $HF_ARTIFACTS_BUCKET"
     hf upload --repo-type bucket "$HF_ARTIFACTS_BUCKET" "$CACHE_MOUNT/ablations" \
         --include "_shared/**" \
         --include "*/stage6_eval.json" \
         --include "_summary.json" \
-        || log "WARNING: artifact upload failed (non-fatal; artifacts remain on $CACHE_MOUNT)"
+        || log "WARNING: final artifact sync failed (non-fatal; artifacts remain on $CACHE_MOUNT)"
 fi
 
 # ---------------------------------------------------------------------------
