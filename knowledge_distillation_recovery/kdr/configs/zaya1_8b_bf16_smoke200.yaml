@@ -64,6 +64,15 @@ distillation:
   betas: [0.9, 0.999]
   grad_clip_norm: 1.0
   warmup_steps: 5
+  # tokens_per_step = bs × world × ga × seq → total_steps = total_tokens // tokens_per_step.
+  # Smoke deliberately uses bs=1, ga=4 (minimal step time at 4096 tokens/step).
+  # For the REAL recovery run, raise `per_device_batch_size` to the largest
+  # value that fits VRAM and divide `gradient_accumulation` by the same
+  # factor — the total token budget stays constant, the optimizer trajectory
+  # stays numerically equivalent, but per-step wall-time drops 1.5-2× on
+  # Hopper/Blackwell at small bs. Or set `auto_batch_size: true` and let the
+  # trainer probe at startup. The smoke leaves `auto_batch_size: false` (the
+  # default) so plumbing validation runs at a known fixed configuration.
   total_tokens: 163_840         # 40 optimizer steps × (bs=1 × ga=4 × seq=1024)
   per_device_batch_size: 1
   gradient_accumulation: 4

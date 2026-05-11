@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import shutil
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,137 @@ post-atomic-rename invariant that the dir is fully committed."""
 
 COMPRESSED_METADATA_FILENAME = "compressed_metadata.json"
 """HLR-0005 / LLR-0019: preserved verbatim from the input student if present."""
+
+
+# ---------------------------------------------------------------------------
+# Async save_partial machinery (LLR-0027 v2)
+# ---------------------------------------------------------------------------
+#
+# Why a module-level single-flight executor:
+#
+# 1. **Single flight (depth-1 queue)** guarantees monotone partial ordering.
+#    If save_partial(step=50) is dispatched and then save_partial(step=60)
+#    is dispatched while step=50 is still mid-write, the on-disk and Hub
+#    timeline would be racy — partial_step60 could appear before partial_step50.
+#    The depth-1 queue forces the second call to auto-join the first.
+#
+# 2. **Module-level** rather than per-call: the queue must be shared across
+#    all save_partial calls in a single run. A run that does 4 saves at
+#    steps 10/20/30/40 needs ALL of them to flow through the same executor
+#    so each call can auto-join the previous.
+#
+# 3. **max_workers=1** rather than higher: the rank-0 disk write is bound
+#    by sequential I/O to the local SSD; parallelizing would contend for
+#    bandwidth with the trainer's own checkpoint reads (none in steady
+#    state, but the load-back-round-trip at the end of bootstrap.sh).
+#    More importantly, max_workers=1 makes the single-flight invariant
+#    structural rather than enforced-by-convention.
+#
+# Generic-tool notes for adapting to larger setups:
+#
+# - **Pinned-memory cost**: the CPU state_dict snapshot is `.detach().cpu().clone()`,
+#   which costs ~weight-tensor-size in pageable CPU RAM. For an 8B BF16
+#   model that's ~17 GB; for 70B that's ~140 GB. If your host CPU RAM is
+#   constrained, leave `enable_async_save: false` (sync save reuses the
+#   ZeRO-3 consolidation buffer in place) or implement a streamed-to-disk
+#   serializer that pages tensors out of the GPU directly to disk without
+#   the CPU intermediate.
+#
+# - **Multi-rank**: under DDP/FSDP/DS the collective `get_state_dict` is
+#   ALWAYS synchronous (NCCL is not thread-safe). Only the rank-0
+#   post-consolidation disk writes are dispatched to the background
+#   thread. The wait_for_everyone at the end of save_partial barriers
+#   ranks AFTER the submit returns, so other ranks aren't blocked on
+#   rank-0's disk write.
+#
+# - **Crash safety**: if the trainer crashes with a pending Future, the
+#   ThreadPoolExecutor's threads are non-daemon and will block process
+#   exit until they finish. Acceptable for crash-on-bug; for crash-on-
+#   stop-signal the user can ctrl-c twice.
+class _AsyncSaveExecutor:
+    """Module-level single-flight executor for async save_partial."""
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="kdr-save-partial"
+        )
+        self._pending: Future[None] | None = None
+
+    def submit(self, fn: Any, *args: Any, **kwargs: Any) -> Future[None]:
+        # Auto-join the prior future BEFORE submitting the next. Re-raises
+        # if the prior write failed — caller sees the exception at the
+        # call site of the second save, not somewhere later at random.
+        #
+        # `try/finally` guarantees `_pending` is cleared even if `.result()`
+        # raises. Without this, a failed Future stays referenced in
+        # `_pending` and every subsequent `.join()` / `.submit()` would
+        # re-raise the same stale exception. The contract is: a Future's
+        # exception is reported exactly once, at the next operation after
+        # it failed, and then the executor state advances.
+        if self._pending is not None:
+            try:
+                self._pending.result()
+            finally:
+                self._pending = None
+        future = self._executor.submit(fn, *args, **kwargs)
+        self._pending = future
+        return future
+
+    def join(self) -> None:
+        """Block until any pending future completes; re-raise its
+        exception if it failed. No-op if no future is pending."""
+        if self._pending is not None:
+            try:
+                self._pending.result()
+            finally:
+                self._pending = None
+
+    def shutdown(self) -> None:
+        """Final teardown — wait for outstanding work and free the thread.
+        Currently called only from test teardown; production runs let the
+        executor live for the process lifetime (the thread exits at
+        process exit anyway)."""
+        self.join()
+        self._executor.shutdown(wait=True)
+
+
+# Module-global singleton. Construction is lazy (a thread is created only
+# at first .submit). Resetting is exposed for tests via _reset_async_save_executor().
+_ASYNC_SAVE = _AsyncSaveExecutor()
+
+
+def save_partial_join() -> None:
+    """Public entry point: flush any pending async save_partial Future.
+
+    Call this before the final save (which must be synchronous, see
+    LLR-0027 AC) and any time the caller needs the disk state to reflect
+    all in-flight partials (e.g., before uploading from the trainer).
+
+    Re-raises any exception that the background thread saw — this is how
+    a failure mode in the disk write surfaces to the trainer rather than
+    silently corrupting the partial chain.
+    """
+    _ASYNC_SAVE.join()
+
+
+def _reset_async_save_executor() -> None:
+    """Test-only: replace the module-global executor with a fresh one
+    after a failure test (otherwise the stale Future state would leak
+    into the next test).
+
+    This is teardown-safe: any exception raised by a pending Future is
+    SWALLOWED here. The test that raised the exception is responsible
+    for catching it inline (via `pytest.raises(...)`); the role of this
+    function is only to scrub state between tests, not to surface
+    failures. A leaked exception from the prior test must not break the
+    next test's setup phase.
+    """
+    global _ASYNC_SAVE  # noqa: PLW0603 — module-global is the contract
+    try:
+        _ASYNC_SAVE.shutdown()
+    except BaseException:  # noqa: BLE001 — see docstring: teardown swallows.
+        pass
+    _ASYNC_SAVE = _AsyncSaveExecutor()
 
 
 # REQ: LLR-0027
@@ -66,6 +198,7 @@ def save_partial(
     source_metadata_path: Path | None = None,
     extra_metadata: dict[str, Any] | None = None,
     partial: bool = True,
+    async_mode: bool = False,
 ) -> Path:
     """Atomic save of `student` to a partial (or final) dir.
 
@@ -91,59 +224,156 @@ def save_partial(
 
     All ranks call (`get_state_dict` is collective under DS); only rank 0
     actually writes.
+
+    `async_mode` (LLR-0027 v2): when True (only valid for `partial=True`),
+    the rank-0 disk-write phase is dispatched to a single-flight background
+    thread; this function returns the target `Path` immediately after the
+    collective consolidation barrier. Use `save_partial_join()` to flush
+    pending writes before the final save (or to surface background-thread
+    exceptions). The CPU state_dict is deep-copied before submission so
+    subsequent optimizer steps cannot mutate the snapshot.
     """
+    if async_mode and not partial:
+        raise ValueError(
+            "save_partial(async_mode=True, partial=False) is not supported. "
+            "The final save must complete synchronously because its return "
+            "path is consumed immediately by the upload step. Call "
+            "save_partial_join() to flush pending writes, then call "
+            "save_partial(..., partial=False) with async_mode=False."
+        )
+
     accelerator.wait_for_everyone()
 
     out_name = partial_dir_name(mode, step) if partial else f"kdr_{mode}_recovered"
     out_dir = artifacts_dir / out_name
     tmp_dir = out_dir.parent / f"{out_dir.name}.tmp"
 
-    # Collective: every rank participates in the consolidation.
+    # Collective: every rank participates in the consolidation. This MUST
+    # happen on the main thread regardless of async_mode (NCCL is not
+    # thread-safe). Only the post-consolidation rank-0 disk write is
+    # dispatched to a background thread when async_mode=True.
     state_dict = accelerator.get_state_dict(student)
     unwrapped = accelerator.unwrap_model(student)
 
     if accelerator.is_main_process:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        # Clean any stale `.tmp` from a previous failed save.
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
-        tmp_dir.mkdir(parents=True)
-
-        unwrapped.save_pretrained(
-            tmp_dir, state_dict=state_dict, safe_serialization=True
-        )
-        if tokenizer is not None:
-            tokenizer.save_pretrained(tmp_dir)
-
-        # REQ: LLR-0019
-        if source_metadata_path is not None and source_metadata_path.exists():
-            shutil.copyfile(
-                source_metadata_path, tmp_dir / COMPRESSED_METADATA_FILENAME
+        if async_mode:
+            # Deep-copy the state_dict to independent CPU tensors so the
+            # main thread can return to training immediately and any
+            # subsequent optimizer.step() updates to GPU weights cannot
+            # mutate the snapshot that the background thread is serializing.
+            #
+            # `.detach().cpu().clone()` breaks any reference back to the
+            # source storage:
+            #   - `.detach()` strips autograd context (not strictly needed
+            #     post-consolidation but cheap insurance).
+            #   - `.cpu()` moves GPU tensors to CPU (no-op on already-CPU
+            #     tensors under ZeRO-3 consolidation).
+            #   - `.clone()` allocates an independent CPU tensor; even if
+            #     `.cpu()` was a no-op it now decouples from any DS-internal
+            #     CPU buffer that might be reused on the next collective.
+            cpu_state_dict = {
+                k: v.detach().cpu().clone() for k, v in state_dict.items()
+            }
+            # Release the main-thread reference so the original (possibly
+            # GPU-backed) tensors can be reaped immediately.
+            del state_dict
+            _ASYNC_SAVE.submit(
+                _write_partial_dir,
+                tmp_dir=tmp_dir,
+                out_dir=out_dir,
+                state_dict=cpu_state_dict,
+                unwrapped=unwrapped,
+                tokenizer=tokenizer,
+                source_metadata_path=source_metadata_path,
+                extra_metadata=extra_metadata,
+                partial=partial,
+                step=step,
             )
-
-        if extra_metadata is not None:
-            (tmp_dir / "kdr_run_metadata.json").write_text(
-                json.dumps(extra_metadata, indent=2, sort_keys=True)
+        else:
+            _write_partial_dir(
+                tmp_dir=tmp_dir,
+                out_dir=out_dir,
+                state_dict=state_dict,
+                unwrapped=unwrapped,
+                tokenizer=tokenizer,
+                source_metadata_path=source_metadata_path,
+                extra_metadata=extra_metadata,
+                partial=partial,
+                step=step,
             )
-
-        # Atomic rename — replaces an existing final dir if present.
-        _atomic_replace_dir(tmp_dir, out_dir)
-
-        # REQ: LLR-0029
-        # Sentinel written LAST, INTO the renamed final dir, EMPTY (zero bytes).
-        # Mtime ordering guarantees every other file's mtime ≤ sentinel's.
-        sentinel = out_dir / SAVE_COMPLETE_SENTINEL
-        sentinel.touch(exist_ok=False)
-
-        log.info(
-            "Saved %s checkpoint to %s (step=%d)",
-            "PARTIAL" if partial else "FINAL",
-            out_dir,
-            step,
-        )
 
     accelerator.wait_for_everyone()
     return out_dir
+
+
+def _write_partial_dir(
+    *,
+    tmp_dir: Path,
+    out_dir: Path,
+    state_dict: dict[str, Any],
+    unwrapped: nn.Module,
+    tokenizer: PreTrainedTokenizerBase | None,
+    source_metadata_path: Path | None,
+    extra_metadata: dict[str, Any] | None,
+    partial: bool,
+    step: int,
+) -> None:
+    """Rank-0 disk-write subroutine for save_partial. Pure I/O.
+
+    Safe to call from the main thread (sync mode) OR from the
+    ``_AsyncSaveExecutor`` background thread (async mode). The body
+    performs no collective ops, no GPU work, and no shared-state mutation
+    beyond writes to its own `tmp_dir`/`out_dir`.
+
+    Preserves the LLR-0029 sentinel-last invariant: every other file is
+    written first, atomic rename `tmp_dir → out_dir` flips the dir into
+    place, then the empty `_SAVE_COMPLETE` file is `touch`'d LAST inside
+    the renamed dir. Resume logic ignores dirs lacking the sentinel.
+
+    Generic-tool note: when adapting for a non-HF model whose
+    `save_pretrained` semantics differ, the only contract this function
+    needs is "write everything into `tmp_dir`, then `_atomic_replace_dir`,
+    then touch sentinel". The state_dict / tokenizer / metadata operations
+    can be swapped without changing the atomicity guarantee.
+    """
+    # Clean any stale `.tmp` from a previous failed save.
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+
+    unwrapped.save_pretrained(
+        tmp_dir, state_dict=state_dict, safe_serialization=True
+    )
+    if tokenizer is not None:
+        tokenizer.save_pretrained(tmp_dir)
+
+    # REQ: LLR-0019
+    if source_metadata_path is not None and source_metadata_path.exists():
+        shutil.copyfile(
+            source_metadata_path, tmp_dir / COMPRESSED_METADATA_FILENAME
+        )
+
+    if extra_metadata is not None:
+        (tmp_dir / "kdr_run_metadata.json").write_text(
+            json.dumps(extra_metadata, indent=2, sort_keys=True)
+        )
+
+    # Atomic rename — replaces an existing final dir if present.
+    _atomic_replace_dir(tmp_dir, out_dir)
+
+    # REQ: LLR-0029
+    # Sentinel written LAST, INTO the renamed final dir, EMPTY (zero bytes).
+    # Mtime ordering guarantees every other file's mtime ≤ sentinel's.
+    sentinel = out_dir / SAVE_COMPLETE_SENTINEL
+    sentinel.touch(exist_ok=False)
+
+    log.info(
+        "Saved %s checkpoint to %s (step=%d)",
+        "PARTIAL" if partial else "FINAL",
+        out_dir,
+        step,
+    )
 
 
 # REQ: LLR-0018

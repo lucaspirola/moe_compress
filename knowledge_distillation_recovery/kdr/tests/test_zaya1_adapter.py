@@ -91,7 +91,10 @@ def test_load_teacher_first_then_student(
         return_value=fake_tok,
     ):
         teacher, student, tok = Zaya1Adapter().load_teacher_and_student(
-            _fake_accelerator(), teacher_cfg=teacher_cfg, student_cfg=student_cfg
+            _fake_accelerator(),
+            teacher_cfg=teacher_cfg,
+            student_cfg=student_cfg,
+            mode="bf16",
         )
     assert len(call_order) == 2
     # Both come from same self-distillation source by default.
@@ -118,7 +121,10 @@ def test_teacher_frozen_after_load(
         return_value=fake_tok,
     ):
         teacher, _, _ = Zaya1Adapter().load_teacher_and_student(
-            _fake_accelerator(), teacher_cfg=teacher_cfg, student_cfg=student_cfg
+            _fake_accelerator(),
+            teacher_cfg=teacher_cfg,
+            student_cfg=student_cfg,
+            mode="bf16",
         )
     assert all(not p.requires_grad for p in teacher.parameters())
 
@@ -140,7 +146,10 @@ def test_teacher_no_grad_after_backward(
         return_value=fake_tok,
     ):
         teacher, student, _ = Zaya1Adapter().load_teacher_and_student(
-            _fake_accelerator(), teacher_cfg=teacher_cfg, student_cfg=student_cfg
+            _fake_accelerator(),
+            teacher_cfg=teacher_cfg,
+            student_cfg=student_cfg,
+            mode="bf16",
         )
     # Backward through the student; gradients should NOT touch the teacher.
     # Use the student's lm_head dtype to avoid matmul dtype mismatch.
@@ -176,6 +185,7 @@ def test_lm_head_cast_to_bf16_for_fp8_teacher(student_cfg: StudentConfig) -> Non
             _fake_accelerator(),
             teacher_cfg=fp8_teacher_cfg,
             student_cfg=student_cfg,
+            mode="bf16",
         )
     assert teacher.lm_head.weight.dtype == torch.bfloat16
 
@@ -198,7 +208,10 @@ def test_lm_head_unchanged_for_bf16_teacher(
         return_value=fake_tok,
     ):
         teacher, _, _ = Zaya1Adapter().load_teacher_and_student(
-            _fake_accelerator(), teacher_cfg=teacher_cfg, student_cfg=student_cfg
+            _fake_accelerator(),
+            teacher_cfg=teacher_cfg,
+            student_cfg=student_cfg,
+            mode="bf16",
         )
     # bf16 teacher: lm_head dtype == float16 (unchanged from our fake).
     assert teacher.lm_head.weight.dtype == torch.float16
@@ -234,7 +247,10 @@ def test_load_logs_layer_count_in_expected_set(
         return_value=fake_tok,
     ), patch("kdr.adapters.zaya1_8b.log") as mock_log:
         Zaya1Adapter().load_teacher_and_student(
-            _fake_accelerator(), teacher_cfg=teacher_cfg, student_cfg=student_cfg
+            _fake_accelerator(),
+            teacher_cfg=teacher_cfg,
+            student_cfg=student_cfg,
+            mode="bf16",
         )
         # Find the layer-count log message among the info() calls.
         layer_count_messages = [
@@ -330,9 +346,16 @@ def test_fp32_carve_outs_resolve_to_non_empty_submodule_sets() -> None:
 
 # REQ: VERIFIES: LLR-0026
 def test_required_attn_implementation_is_eager_or_sdpa() -> None:
-    """LLR-0026 AC #1: returns one of {'eager', 'sdpa'}; flash-attn is rejected."""
-    val = Zaya1Adapter().required_attn_implementation()
-    assert val in ("eager", "sdpa")
+    """LLR-0026 AC: returns one of {'eager', 'sdpa'} for every supported mode;
+    flash-attn is rejected. The method is now mode-aware (LLR-0026 post-Phase
+    7.1), so we check both modes."""
+    adapter = Zaya1Adapter()
+    for mode in ("bf16", "da_qad"):
+        val = adapter.required_attn_implementation(mode)  # type: ignore[arg-type]
+        assert val in ("eager", "sdpa"), (
+            f"required_attn_implementation({mode!r}) returned {val!r}; "
+            f"only 'eager' and 'sdpa' are allowed by LLR-0026."
+        )
 
 
 # REQ: VERIFIES: LLR-0026
@@ -366,11 +389,16 @@ def test_load_passes_required_attn_implementation_to_from_pretrained(
     ):
         adapter = Zaya1Adapter()
         adapter.load_teacher_and_student(
-            _fake_accelerator(), teacher_cfg=teacher_cfg, student_cfg=student_cfg
+            _fake_accelerator(),
+            teacher_cfg=teacher_cfg,
+            student_cfg=student_cfg,
+            mode="bf16",
         )
 
-    # AC #2: both teacher and student loads receive the adapter's required value.
-    required = Zaya1Adapter().required_attn_implementation()
+    # AC: both teacher and student loads receive the adapter's required
+    # value for the mode the call was made with. The fixture defaults to
+    # mode="bf16" (set in the load_teacher_and_student call above).
+    required = Zaya1Adapter().required_attn_implementation("bf16")
     teacher_kw, student_kw = captured_kwargs
     assert teacher_kw["attn_implementation"] == required
     assert student_kw["attn_implementation"] == required
