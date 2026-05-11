@@ -10,7 +10,7 @@
 #
 # Image carries dependencies only. Code is git-cloned at container start by
 # bootstrap.sh; model snapshot is downloaded into the persistent /cache volume.
-FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -38,18 +38,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --upgrade pip wheel setuptools packaging
 
-# torch first against the cu124 wheel index — separate from requirements.txt so
-# we don't accidentally pull a CPU-only build via the default PyPI resolver.
-# Capture the installed wheel as a constraint so pip's resolver cannot
-# back-track and pull a cu130 torch from the default PyPI index when transitive
-# deps (e.g. bitsandbytes) want a higher version.
-RUN pip install --index-url https://download.pytorch.org/whl/cu124 \
-        "torch>=2.5.0,<2.11.0" \
+# torch from the cu130 wheel index (matches CUDA 13.2.1 base).
+# Capture the installed wheel as a constraint so transitive deps cannot
+# pull a different build variant via the default PyPI index.
+RUN pip install --index-url https://download.pytorch.org/whl/cu130 \
+        "torch==2.11.0" \
     && pip freeze | grep '^torch==' > /tmp/torch-constraint.txt
 
-# Bulk install of pinned deps. The constraint file pins torch to the exact
-# cu124 wheel above, preventing accidental upgrade to a cu130 build that
-# would mismatch the base image's CUDA 12.6 nvcc.
+# Bulk install of pinned deps. The constraint file locks torch to the exact
+# cu130 wheel above.
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt -c /tmp/torch-constraint.txt
 
