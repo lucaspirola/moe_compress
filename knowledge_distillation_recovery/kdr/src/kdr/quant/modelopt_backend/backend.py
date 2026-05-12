@@ -100,6 +100,21 @@ class ModelOptBackend:
         if quant_block.is_empty():
             raise ValueError("backend received an empty quant block")
 
+        # ModelOptBackend's compressed-tensors converter is single-format-
+        # per-run. A Mixed config can only route a single ModelOpt-supported
+        # pattern here; multi-entry weights are a Task 5 / future-Task-6
+        # concern (review H4 — runtime gate at the entry point rather than
+        # buried inside config_map.py).
+        if quant_block.weight is not None and len(quant_block.weight) != 1:
+            raise NotImplementedError(
+                "ModelOptBackend.apply_quant: per-pattern weight quant with "
+                "multiple patterns is not supported. Mixed configs route "
+                "every GGUF pattern to NativeBackend; only one "
+                "modelopt-routable pattern can land here. Got "
+                f"{len(quant_block.weight)} patterns: "
+                f"{[p.pattern for p in quant_block.weight]!r}"
+            )
+
         kwargs: dict[str, str] = {}
         if self.weight_target_pattern is not None:
             kwargs["weight_target_pattern"] = self.weight_target_pattern
@@ -121,7 +136,12 @@ class ModelOptBackend:
         log.info(
             "ModelOptBackend.apply_quant: mtq.quantize complete "
             "(weight=%s, key=%s, value=%s, ignore=%d patterns)",
-            None if quant_block.weight is None else quant_block.weight.format,
+            None
+            if quant_block.weight is None
+            else (
+                f"{quant_block.weight[0].pattern!r}->"
+                f"{quant_block.weight[0].bits}b/{quant_block.weight[0].format}"
+            ),
             None if quant_block.key is None else quant_block.key.format,
             None if quant_block.value is None else quant_block.value.format,
             len(self.fp32_carve_outs),
@@ -146,10 +166,23 @@ class ModelOptBackend:
                 "compressed-tensors save path. KV-only ModelOpt routing is "
                 "unusual; the weight-handling backend owns the tensor save."
             )
+        # Defense-in-depth (review H4): ``apply_quant`` already enforces
+        # len==1, but ``save`` is reachable independently of ``apply_quant``
+        # (after a process restart from a checkpoint, for example).
+        if len(self._quant_block.weight) != 1:
+            raise NotImplementedError(
+                "ModelOptBackend.save: per-pattern weight save with multiple "
+                "patterns is not supported by compressed-tensors converters. "
+                "Mixed-precision configs that include modelopt-routable "
+                "formats alongside others will need Task 6's GGUF save path "
+                "or a future per-pattern compressed-tensors path. Got "
+                f"{len(self._quant_block.weight)} patterns."
+            )
+        weight_spec = self._quant_block.weight[0]
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        converter_cls = resolve_converter_class(self._quant_block.weight.format)
+        converter_cls = resolve_converter_class(weight_spec.format)
         converter = converter_cls()
 
         # Compressed-tensors converters expose either ``save_pretrained(model,

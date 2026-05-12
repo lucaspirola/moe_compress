@@ -30,7 +30,7 @@ generic mapping.
 from __future__ import annotations
 
 from ..interface import QuantBlockSubset
-from ..specs import Format, KVQuantSpec, WeightQuantSpec
+from ..specs import Format, KVQuantSpec, WeightPatternSpec
 
 # `object` (rather than `Any`) keeps the strict-typing invariant from HLR-0012
 # while still allowing modelopt's heterogeneous config dict at the boundary.
@@ -78,7 +78,10 @@ def quant_block_to_modelopt_config(
     quant_cfg: dict[str, object] = {}
 
     if quant_block.weight is not None:
-        quant_cfg[weight_target_pattern] = _weight_modelopt_entry(quant_block.weight)
+        # apply_quant has already enforced len(weight) == 1 (review H4).
+        quant_cfg[weight_target_pattern] = _weight_modelopt_entry(
+            quant_block.weight[0]
+        )
         # Globally disable input quantizers — kdr does not quantize activations.
         quant_cfg[input_target_pattern] = {"enable": False}
 
@@ -102,7 +105,7 @@ def quant_block_to_modelopt_config(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _weight_modelopt_entry(spec: WeightQuantSpec) -> dict[str, object]:
+def _weight_modelopt_entry(spec: WeightPatternSpec) -> dict[str, object]:
     """Per-Linear weight quantizer config dict.
 
     Modelopt's per-quantizer dict carries:

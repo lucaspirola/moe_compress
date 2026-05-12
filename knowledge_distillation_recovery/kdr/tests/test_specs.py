@@ -9,7 +9,13 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from kdr.quant.specs import KVQuantSpec, WeightQuantSpec
+from kdr.quant.specs import (
+    KVQuantSpec,
+    MixedWeightSpec,
+    UniformWeightSpec,
+    WeightPatternSpec,
+    WeightQuantSpec,
+)
 
 
 def _valid_kv_kwargs() -> dict[str, object]:
@@ -97,3 +103,95 @@ def test_weight_spec_rejects_v1_transforms() -> None:
         kwargs["transform"] = deferred
         with pytest.raises(ValidationError):
             WeightQuantSpec(**kwargs)  # type: ignore[arg-type]
+
+
+# ─── WeightPatternSpec (Phase 7.2 Task 2) ────────────────────────────────────
+
+
+def _valid_pattern_kwargs() -> dict[str, object]:
+    return {
+        "pattern": "experts.mlp",
+        "bits": 4,
+        "format": "iq4_xs",
+        "granularity": "block",
+        "transform": "none",
+    }
+
+
+def test_weight_pattern_spec_accepts_valid_config() -> None:
+    spec = WeightPatternSpec(**_valid_pattern_kwargs())  # type: ignore[arg-type]
+    assert spec.pattern == "experts.mlp"
+    assert spec.bits == 4
+    assert spec.format == "iq4_xs"
+    assert spec.granularity == "block"
+    assert spec.transform == "none"
+
+
+def test_weight_pattern_spec_rejects_missing_field() -> None:
+    kwargs = _valid_pattern_kwargs()
+    del kwargs["pattern"]
+    with pytest.raises(ValidationError):
+        WeightPatternSpec(**kwargs)  # type: ignore[arg-type]
+
+
+def test_weight_pattern_spec_rejects_unknown_field() -> None:
+    kwargs = _valid_pattern_kwargs()
+    kwargs["scale"] = 1.0
+    with pytest.raises(ValidationError):
+        WeightPatternSpec(**kwargs)  # type: ignore[arg-type]
+
+
+def test_weight_pattern_spec_rejects_v1_transforms() -> None:
+    for deferred in ("hadamard", "fwht"):
+        kwargs = _valid_pattern_kwargs()
+        kwargs["transform"] = deferred
+        with pytest.raises(ValidationError):
+            WeightPatternSpec(**kwargs)  # type: ignore[arg-type]
+
+
+def test_weight_pattern_spec_rejects_unknown_format() -> None:
+    kwargs = _valid_pattern_kwargs()
+    kwargs["format"] = "fp4"  # not in the Format Literal
+    with pytest.raises(ValidationError):
+        WeightPatternSpec(**kwargs)  # type: ignore[arg-type]
+
+
+# ─── MixedWeightSpec (Phase 7.2 Task 2) ──────────────────────────────────────
+
+
+def test_mixed_weight_spec_accepts_one_entry_spec_map() -> None:
+    spec = MixedWeightSpec(
+        spec_map=[WeightPatternSpec(**_valid_pattern_kwargs())]  # type: ignore[arg-type]
+    )
+    assert len(spec.spec_map) == 1
+    assert spec.spec_map[0].pattern == "experts.mlp"
+
+
+def test_mixed_weight_spec_rejects_empty_spec_map() -> None:
+    with pytest.raises(ValidationError):
+        MixedWeightSpec(spec_map=[])
+
+
+def test_mixed_weight_spec_rejects_unknown_field() -> None:
+    with pytest.raises(ValidationError):
+        MixedWeightSpec(
+            spec_map=[WeightPatternSpec(**_valid_pattern_kwargs())],  # type: ignore[arg-type]
+            default="iq4_xs",  # type: ignore[call-arg]
+        )
+
+
+def test_mixed_weight_spec_rejects_duplicate_patterns() -> None:
+    """The `_no_duplicate_patterns` field validator catches identical patterns
+    inside spec_map at parse time."""
+    entry = WeightPatternSpec(**_valid_pattern_kwargs())  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        MixedWeightSpec(spec_map=[entry, entry])
+
+
+# ─── Alias: WeightQuantSpec resolves to UniformWeightSpec ────────────────────
+
+
+def test_weight_quant_spec_alias_resolves_to_uniform_weight_spec() -> None:
+    """`WeightQuantSpec` is a re-bound alias for `UniformWeightSpec`. Existing
+    imports continue to resolve and `isinstance` checks remain consistent."""
+    assert WeightQuantSpec is UniformWeightSpec

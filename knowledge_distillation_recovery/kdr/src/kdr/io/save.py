@@ -31,7 +31,7 @@ from transformers import PreTrainedTokenizerBase
 from ..config import QuantBlock
 from ..modes import Mode
 from ..quant.interface import QuantBackend
-from ..quant.specs import KVQuantSpec, WeightQuantSpec
+from ..quant.specs import KVQuantSpec, MixedWeightSpec, WeightQuantSpec
 
 log = logging.getLogger(__name__)
 
@@ -537,6 +537,11 @@ def _build_quantization_config(
             "ignore": [<fp32 carve-out patterns>],
         }
     """
+    if isinstance(quant_block.weight, MixedWeightSpec):
+        raise NotImplementedError(
+            "save_kdr_artifact's quantization_config emission for MixedWeightSpec "
+            "lands in Phase 7.2 Task 6."
+        )
     return {
         "quant_method": "compressed-tensors",
         "config_groups": {

@@ -11,30 +11,56 @@ from pathlib import Path
 from typing import Protocol
 
 import torch.nn as nn
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
-from .specs import KVQuantSpec, WeightQuantSpec
+from .specs import KVQuantSpec, WeightPatternSpec
 
 
 class QuantBlockSubset(BaseModel):
     """The portion of the YAML's `quant` block routed to a single backend.
 
-    Field shape is intentionally flat (LLR-0013): the YAML mirrors how humans
-    think about the recipe (K and V belong together under `kv_quant`), while
-    the runtime sub-block flattens them so a backend sees three peers and acts
-    on each independently.
+    ``weight`` is a list of :class:`WeightPatternSpec` entries. The Uniform
+    case (existing YAMLs with a single global weight spec) normalizes to a
+    single-entry list with ``pattern=""`` (matches every Linear). The Mixed
+    case (Profile J et al.) carries the routed subset of the original
+    ``spec_map``. ``None`` means no weight quantization landed on this
+    backend.
 
-    Exactly one `QuantBlockSubset` is dispatched to each routed backend per
-    `apply_quant` call — never two — per LLR-0014. When the factory routes all
-    three quantizers to the same backend (typically ModelOpt), the merged
-    sub-block has all three fields populated.
+    Other LLR-0013 invariants unchanged: exactly one subset is dispatched
+    per backend; backends raise ``ValueError`` on ``is_empty()`` subsets.
+
+    Field shape is intentionally flat (LLR-0013): the YAML mirrors how
+    humans think about the recipe (K and V belong together under
+    ``kv_quant``), while the runtime sub-block flattens them so a backend
+    sees three peers and acts on each independently.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    weight: WeightQuantSpec | None = None
+    weight: list[WeightPatternSpec] | None = None
     key: KVQuantSpec | None = None
     value: KVQuantSpec | None = None
+
+    @field_validator("weight")
+    @classmethod
+    def _no_empty_list(
+        cls, v: list[WeightPatternSpec] | None
+    ) -> list[WeightPatternSpec] | None:
+        """Reject ``weight=[]`` so ``is_empty()``'s ``weight is None`` check
+        stays coherent (review H3).
+
+        The factory's ``_subset_for`` collapses empty per-backend lists to
+        ``None``; a direct constructor call with ``[]`` would otherwise
+        produce a subset where ``is_empty()`` returns False but every
+        backend's weight path silently no-ops over zero patterns.
+        """
+        if v is not None and len(v) == 0:
+            raise ValueError(
+                "QuantBlockSubset.weight must be None or a non-empty list "
+                "of patterns; the factory's _subset_for collapses empty "
+                "lists to None."
+            )
+        return v
 
     def is_empty(self) -> bool:
         """A backend that receives an empty sub-block raises (LLR-0013 AC)."""

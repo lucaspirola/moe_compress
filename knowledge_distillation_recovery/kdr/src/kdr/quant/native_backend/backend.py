@@ -32,7 +32,7 @@ import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
 
 from ..interface import QuantBlockSubset
-from ..specs import KVQuantSpec, WeightQuantSpec
+from ..specs import KVQuantSpec, WeightPatternSpec
 from .ste_simulators import int_quant_ste, mxfp4_kv_ste
 
 log = logging.getLogger(__name__)
@@ -93,7 +93,21 @@ class NativeBackend:
         self._quant_block = quant_block
 
         if quant_block.weight is not None:
-            self._install_weight_quant(model, quant_block.weight)
+            if (
+                len(quant_block.weight) == 1
+                and quant_block.weight[0].pattern == ""
+            ):
+                # Uniform shim path: single empty-pattern entry, install
+                # globally over every non-carve-out Linear as before.
+                self._install_weight_quant(model, quant_block.weight[0])
+            else:
+                raise NotImplementedError(
+                    "NativeBackend mixed-spec weight install (list with "
+                    "multiple entries or non-empty patterns) lands in "
+                    "Phase 7.2 Task 5. "
+                    f"Got {len(quant_block.weight)} pattern(s): "
+                    f"{[p.pattern for p in quant_block.weight]!r}"
+                )
         if quant_block.key is not None or quant_block.value is not None:
             self._install_kv_quant(
                 model, key=quant_block.key, value=quant_block.value
@@ -135,8 +149,16 @@ class NativeBackend:
 
     # ---- Weight install ---------------------------------------------------
 
-    def _install_weight_quant(self, model: nn.Module, spec: WeightQuantSpec) -> None:
+    def _install_weight_quant(
+        self, model: nn.Module, spec: WeightPatternSpec
+    ) -> None:
         """Register a parametrization on every non-carve-out ``nn.Linear``."""
+        assert spec.pattern == "", (
+            "_install_weight_quant in Task 3 only handles the uniform shim "
+            "(empty pattern; matches every Linear). Per-pattern install "
+            "lands in Task 5; apply_quant's caller must enforce this "
+            "invariant before reaching here."
+        )
         if spec.granularity != "channel":
             raise NotImplementedError(
                 f"NativeBackend weight granularity={spec.granularity!r} not "
