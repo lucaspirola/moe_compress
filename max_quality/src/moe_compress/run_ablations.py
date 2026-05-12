@@ -110,10 +110,20 @@ ABLATION_DELTAS: list[tuple[str, dict[str, Any]]] = [
 def _build_ablation_config(
     base: dict, deltas: dict, *, num_sequences: int,
     teacher_cache_path: Path,
+    teacher_model_repo: str | None = None,
+    stage5_max_calibration_samples: int | None = None,
+    stage5_max_sequence_length: int | None = None,
 ) -> dict:
     """Apply per-ablation deltas + the 35%-via-Stage-2-only target to the
     base config. The teacher-cache path forces all 12 ablations to read /
-    write the same Stage 6 cache file (filled by A0, hit by A1..A11)."""
+    write the same Stage 6 cache file (filled by A0, hit by A1..A11).
+
+    Optional Stage 5 overrides (applied uniformly across all ablations in the
+    invocation) lower H200 VRAM pressure without touching A0's BF16 baseline:
+      - teacher_model_repo: swap the KD teacher (e.g. FP8 quant).
+      - stage5_max_calibration_samples / stage5_max_sequence_length: shrink
+        the Stage 2.5 calibration footprint.
+    """
     cfg = copy.deepcopy(base)
     cfg.setdefault("target", {})
     cfg["target"]["total_reduction_ratio"] = 0.35
@@ -128,6 +138,13 @@ def _build_ablation_config(
     s2["num_calibration_samples"] = num_sequences
     for k, v in deltas.items():
         s2[k] = v
+    s5 = cfg.setdefault("stage5_router_kd", {})
+    if teacher_model_repo:
+        s5["teacher_model_repo"] = teacher_model_repo
+    if stage5_max_calibration_samples is not None:
+        s5["max_calibration_samples"] = stage5_max_calibration_samples
+    if stage5_max_sequence_length is not None:
+        s5["max_sequence_length"] = stage5_max_sequence_length
     cfg.setdefault("stage6_validate", {})
     cfg["stage6_validate"].setdefault("teacher_eval_cache", {})
     cfg["stage6_validate"]["teacher_eval_cache"]["cache_path"] = str(teacher_cache_path)
@@ -252,6 +269,9 @@ def _run_one_ablation(
     *, ablation_id: str, deltas: dict[str, Any], base_config: dict,
     shared_dir: Path, ablations_root: Path, model_repo: str,
     num_sequences: int, teacher_cache_path: Path,
+    teacher_model_repo: str | None = None,
+    stage5_max_calibration_samples: int | None = None,
+    stage5_max_sequence_length: int | None = None,
 ) -> dict[str, Any]:
     """Drive one ablation through Stage 2 → 2.5 → Stage 6. Stage 1 artifacts
     are seeded from ``shared_dir``; Stage 6 reads the shared teacher cache."""
@@ -286,6 +306,9 @@ def _run_one_ablation(
             base_config, deltas,
             num_sequences=num_sequences,
             teacher_cache_path=teacher_cache_path,
+            teacher_model_repo=teacher_model_repo,
+            stage5_max_calibration_samples=stage5_max_calibration_samples,
+            stage5_max_sequence_length=stage5_max_sequence_length,
         )
         cfg_path = _write_ablation_config(cfg, ablation_dir)
         _seed_stage1_artifacts(ablation_dir, shared_dir)
@@ -346,6 +369,9 @@ def _run_one_ablation(
 def _preflight(
     *, base_config: dict, shared_dir: Path, model_repo: str,
     num_sequences: int, teacher_cache_path: Path,
+    teacher_model_repo: str | None = None,
+    stage5_max_calibration_samples: int | None = None,
+    stage5_max_sequence_length: int | None = None,
 ) -> None:
     """Run Stage 1 once on the base config. Idempotent — skips if artifacts
     already present. The teacher cache is filled by A0's Stage 6 (no separate
@@ -363,6 +389,9 @@ def _preflight(
         base_config, deltas={},
         num_sequences=num_sequences,
         teacher_cache_path=teacher_cache_path,
+        teacher_model_repo=teacher_model_repo,
+        stage5_max_calibration_samples=stage5_max_calibration_samples,
+        stage5_max_sequence_length=stage5_max_sequence_length,
     )
     cfg_path = _write_ablation_config(cfg, shared_dir)
     rc = run_pipeline_main([
@@ -409,6 +438,21 @@ def main(argv: list[str] | None = None) -> int:
                         "For split-platform workflows: run pre-flight on a high-VRAM GPU "
                         "(e.g. H200) once, then run the per-ablation loop on cheaper hardware "
                         "that consumes the bucket-stored _shared/ outputs.")
+    # Stage 5 VRAM-reduction levers — applied uniformly to every ablation in
+    # this invocation. Either or both may be set; both default to null (no
+    # override, base config values).
+    parser.add_argument("--teacher-model-repo", default=None,
+                        help="Lever (a): override stage5_router_kd.teacher_model_repo "
+                        "for every ablation. Use Qwen/Qwen3.6-35B-A3B-FP8 to fit "
+                        "Stage 2.5 on H200 (143 GB). Default: null (BF16 teacher).")
+    parser.add_argument("--stage5-max-calibration-samples", type=int, default=None,
+                        help="Lever (b): override stage5_router_kd.max_calibration_samples. "
+                        "Smaller calibration set → smaller Stage 2.5 activation peak "
+                        "and fewer KD steps. Default: null (use config value).")
+    parser.add_argument("--stage5-max-sequence-length", type=int, default=None,
+                        help="Lever (b): override stage5_router_kd.max_sequence_length. "
+                        "Shorter sequences also shrink the activation peak. "
+                        "Default: null (use config value).")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -446,6 +490,9 @@ def main(argv: list[str] | None = None) -> int:
         model_repo=args.model,
         num_sequences=num_sequences,
         teacher_cache_path=teacher_cache_path,
+        teacher_model_repo=args.teacher_model_repo,
+        stage5_max_calibration_samples=args.stage5_max_calibration_samples,
+        stage5_max_sequence_length=args.stage5_max_sequence_length,
     )
 
     # Stop here if we only wanted the shared Stage 1 artifacts (e.g., the
@@ -477,6 +524,9 @@ def main(argv: list[str] | None = None) -> int:
                 shared_dir=shared_dir, ablations_root=ablations_root,
                 model_repo=args.model, num_sequences=num_sequences,
                 teacher_cache_path=teacher_cache_path,
+                teacher_model_repo=args.teacher_model_repo,
+                stage5_max_calibration_samples=args.stage5_max_calibration_samples,
+                stage5_max_sequence_length=args.stage5_max_sequence_length,
             )
             results[aid] = result
             # Sanity: A0 must populate the teacher cache.
