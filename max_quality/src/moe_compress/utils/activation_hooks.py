@@ -246,7 +246,9 @@ class ReamCostAccumulator:
                 the same device.
 
         Semantics (preserved bit-for-bit modulo float32 accumulation order,
-        ~1e-5 relative drift; existing pipeline does not pin determinism):
+        up to ~5e-4 relative drift at large token counts (FP32 reduction
+        non-determinism); existing pipeline does not pin determinism (no
+        ``CUBLAS_WORKSPACE_CONFIG``, no ``torch.use_deterministic_algorithms``)):
           * Self-pair (e, e) entries are excluded from updates.
           * For each pair (i, j) with i ≠ j, BOTH (i, j) and (j, i) keys are
             written with the SAME accumulated value (symmetric).
@@ -272,7 +274,7 @@ class ReamCostAccumulator:
         #    compute_device — no .cpu().tolist() here (that was the dominant
         #    pre-vectorization sync cost).
         with self._lock:
-            per_expert: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+            raw: list[tuple[int, torch.Tensor, torch.Tensor]] = []
             for e in range(num_experts):
                 key = (layer_idx, e)
                 payload = self._batch_gated_indexed.pop(key, None)
@@ -281,14 +283,15 @@ class ReamCostAccumulator:
                 indices_tensor, gated_tensor = payload
                 if indices_tensor.numel() == 0:
                     continue
-                per_expert.append((
-                    e,
-                    indices_tensor.to(compute_device, non_blocking=True),
-                    gated_tensor.to(compute_device, non_blocking=True),
-                ))
+                raw.append((e, indices_tensor, gated_tensor))   # no .to() under lock
             keys_to_clear = [k for k in self._batch_gated_indexed if k[0] == layer_idx]
             for k in keys_to_clear:
                 self._batch_gated_indexed.pop(k, None)
+        # outside lock — .to() can block on CUDA stream without holding the mutex
+        per_expert = [
+            (e, idx.to(compute_device, non_blocking=True), g.to(compute_device, non_blocking=True))
+            for e, idx, g in raw
+        ]
 
         if len(per_expert) < 2:
             return
@@ -302,7 +305,6 @@ class ReamCostAccumulator:
         all_gated = torch.cat([g for _, _, g in per_expert], dim=0)  # [N_total, d_hid]
         n_total = int(all_indices.shape[0])
         d_hid = int(all_gated.shape[-1])
-        src_dtype = all_gated.dtype
 
         # 3. Stable sort by token index so identical tokens form contiguous runs.
         order = torch.argsort(all_indices, stable=True)
@@ -352,21 +354,27 @@ class ReamCostAccumulator:
 
             padded_gated = sorted_gated[source_idx_safe]                 # [C, max_k, d_hid]
             padded_eids = sorted_eids[source_idx_safe]                   # [C, max_k]
+            # Defense-in-depth: padded slots route to expert 0's row/col via
+            # flat_idx, but pair_mask zeroes their flat_sim contribution to 0
+            # — masking eids to a fixed sentinel here ensures any future drift
+            # in the mask logic can't silently scatter garbage onto real
+            # (0, j) or (i, 0) entries.
+            padded_eids = torch.where(slot_mask, padded_eids, torch.zeros_like(padded_eids))
             # Zero the gated vectors at invalid slots so they cannot
             # contribute to the bmm cosine sums.
-            padded_gated = padded_gated * slot_mask.unsqueeze(-1).to(src_dtype)
+            padded_gated = padded_gated * slot_mask.unsqueeze(-1).to(torch.float32)
 
             # 7. L2-normalize each [d_hid] row. Zero-norm rows stay zero
             #    (their cosine is undefined; the original used a
             #    ``where(isnan, 0)`` guard which we replicate via the
             #    `nonzero` mask below).
             norms = padded_gated.norm(dim=-1, keepdim=True)              # [C, max_k, 1]
-            nonzero = (norms.squeeze(-1) > 0).to(src_dtype)              # [C, max_k]
+            nonzero = (norms.squeeze(-1) > 0).to(torch.float32)          # [C, max_k]
             padded_norm = padded_gated / norms.clamp_min(1e-12)
 
             sim = torch.bmm(padded_norm, padded_norm.transpose(-1, -2))   # [C, max_k, max_k]
-            sim = torch.where(torch.isnan(sim), torch.zeros_like(sim), sim)
-            valid_per_slot = slot_mask.to(src_dtype) * nonzero
+            # clamp_min(1e-12) on the denominator means no division-by-zero NaN can reach bmm; zero-norm rows are filtered by `nonzero` mask below.
+            valid_per_slot = slot_mask.to(torch.float32) * nonzero
             pair_mask = valid_per_slot.unsqueeze(2) * valid_per_slot.unsqueeze(1)
             sim = sim * pair_mask
 
@@ -392,8 +400,8 @@ class ReamCostAccumulator:
                         continue
                     k1 = (layer_idx, e_i, e_j)
                     k2 = (layer_idx, e_j, e_i)
-                    self.gated_output_sim[k1] = self.gated_output_sim.get(k1, 0.0) + v
-                    self.gated_output_sim[k2] = self.gated_output_sim.get(k2, 0.0) + v
+                    self.gated_output_sim[k1] += v
+                    self.gated_output_sim[k2] += v
 
     def compute_gate_similarity_matrix(
         self, layer_idx: int, expert_ids: list[int],

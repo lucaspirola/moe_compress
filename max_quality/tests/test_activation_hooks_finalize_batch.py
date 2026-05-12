@@ -93,17 +93,13 @@ def _assert_matches_reference(
         for k, v in acc.gated_output_sim.items()
         if k[0] == layer_idx
     }
-    extra = set(actual.keys()) - set(expected.keys())
-    missing = set(expected.keys()) - set(actual.keys())
-    # Tolerate keys where the expected magnitude is below atol — they are
-    # legitimately ambiguous (fp32 rounding can flip them across zero).
-    extra = {k for k in extra if abs(actual[k]) > atol}
-    missing = {k for k in missing if abs(expected[k]) > atol}
-    assert not extra, f"unexpected keys with nontrivial values: {extra}"
-    assert not missing, f"missing keys: {missing}"
+    actual_keys = set(actual.keys())
+    expected_keys = set(expected.keys())
+    assert actual_keys == expected_keys, (
+        f"key set mismatch — extra={actual_keys-expected_keys} "
+        f"missing={expected_keys-actual_keys}"
+    )
     for k, exp_v in expected.items():
-        if k not in actual:
-            continue
         act_v = actual[k]
         tol = max(atol, rtol * max(1.0, abs(exp_v)))
         assert abs(act_v - exp_v) < tol, (
@@ -347,3 +343,62 @@ def test_batch_gated_indexed_drained():
     acc.finalize_batch(0, num_experts, compute_device=torch.device("cpu"))
     layer_keys = [k for k in acc._batch_gated_indexed if k[0] == 0]
     assert layer_keys == [], f"layer 0 entries leaked: {layer_keys}"
+
+
+# ---------------------------------------------------------------------------
+# Fixture 11 — multi-batch accumulation: finalize_batch called twice must
+# sum into the same gated_output_sim entries (pin the `+= v` contract).
+# ---------------------------------------------------------------------------
+def test_multi_batch_accumulates():
+    """Calling ``finalize_batch`` twice on the same accumulator with two
+    disjoint synthetic batches must produce ``gated_output_sim`` equal to
+    the sum of running each batch individually. Pins the ``+= v``
+    accumulation contract against any future regression to plain assignment.
+    """
+    torch.manual_seed(101); np.random.seed(101)
+    num_experts, d_hid = 6, 16
+
+    # Batch A — experts {0, 1, 2} overlap on tokens [0..9].
+    per_expert_a = {
+        0: (torch.arange(10, dtype=torch.long),
+            torch.randn(10, d_hid, dtype=torch.float32)),
+        1: (torch.arange(10, dtype=torch.long),
+            torch.randn(10, d_hid, dtype=torch.float32)),
+        2: (torch.arange(10, dtype=torch.long),
+            torch.randn(10, d_hid, dtype=torch.float32)),
+    }
+    # Batch B — experts {1, 2, 3} overlap on tokens [100..114] (disjoint
+    # token range, overlapping expert set with batch A to exercise +=).
+    per_expert_b = {
+        1: (torch.arange(100, 115, dtype=torch.long),
+            torch.randn(15, d_hid, dtype=torch.float32)),
+        2: (torch.arange(100, 115, dtype=torch.long),
+            torch.randn(15, d_hid, dtype=torch.float32)),
+        3: (torch.arange(100, 115, dtype=torch.long),
+            torch.randn(15, d_hid, dtype=torch.float32)),
+    }
+
+    # Reference: per-batch numpy refs summed.
+    ref_a = _numpy_reference_gated_output_sim(
+        {e: (idx.numpy(), g.numpy()) for e, (idx, g) in per_expert_a.items()}
+    )
+    ref_b = _numpy_reference_gated_output_sim(
+        {e: (idx.numpy(), g.numpy()) for e, (idx, g) in per_expert_b.items()}
+    )
+    expected: dict[tuple[int, int], float] = defaultdict(float)
+    for k, v in ref_a.items():
+        expected[k] += v
+    for k, v in ref_b.items():
+        expected[k] += v
+    expected = {k: v for k, v in expected.items() if v != 0.0}
+
+    # Run the impl: two finalize_batch calls on the same accumulator.
+    acc = ReamCostAccumulator(num_experts=num_experts)
+    for e, (idx, g) in per_expert_a.items():
+        acc._batch_gated_indexed[(0, e)] = (idx, g)
+    acc.finalize_batch(0, num_experts, compute_device=torch.device("cpu"))
+    for e, (idx, g) in per_expert_b.items():
+        acc._batch_gated_indexed[(0, e)] = (idx, g)
+    acc.finalize_batch(0, num_experts, compute_device=torch.device("cpu"))
+
+    _assert_matches_reference(acc, expected, rtol=5e-4)
