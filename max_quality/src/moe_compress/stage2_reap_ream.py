@@ -70,6 +70,7 @@ from .utils.model_io import (
     save_compressed_checkpoint,
     save_json_artifact,
 )
+from .utils.runtime_monitor import snapshot_telemetry as _rt_snap, update as _rt_update
 from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
@@ -1286,7 +1287,8 @@ def _profile_layer(
                 import time as _diag_time
                 _diag_t0 = _diag_time.monotonic()
                 _diag_count = 0
-                log.info("DIAG layer %d: entering batch loop (calibration tensor + early-exit forwards)", layer_idx)
+                log.info("DIAG layer %d: entering batch loop (calibration tensor + early-exit forwards) | %s", layer_idx, _rt_snap())
+                _rt_update(stage="stage2", layer=int(layer_idx), batch=0, phase="profile_layer_start")
                 for batch in batches:
                     _diag_t_batch = _diag_time.monotonic()
                     # Reset per-batch hook timers
@@ -1311,16 +1313,18 @@ def _profile_layer(
                     ream_acc.record_batch_token_count(layer_idx, batch.shape[0] * batch.shape[1])
                     _next_offset += batch.shape[0] * batch.shape[1]
                     _diag_count += 1
+                    _rt_update(stage="stage2", layer=int(layer_idx), batch=int(_diag_count),
+                               phase="profile_layer_batch")
                     _diag_dt = _diag_time.monotonic() - _diag_t_batch
                     if _diag_count <= 3 or _diag_count % 10 == 0:
                         log.info(
-                            "DIAG layer %d batch %d: total=%.2fs fwd=%.2fs hooks: input=%.2fs intermed=%.2fs down=%.2fs (n_cb=%d) | cum=%.1fs",
+                            "DIAG layer %d batch %d: total=%.2fs fwd=%.2fs hooks: input=%.2fs intermed=%.2fs down=%.2fs (n_cb=%d) | cum=%.1fs | %s",
                             layer_idx, _diag_count, _diag_dt, _diag_fwd_dt,
                             _diag_cb[0], _diag_cb[1], _diag_cb[2], _diag_cb[3],
-                            _diag_time.monotonic() - _diag_t0,
+                            _diag_time.monotonic() - _diag_t0, _rt_snap(),
                         )
-                log.info("DIAG layer %d: batch loop complete — %d batches in %.1fs, now post-profile work",
-                         layer_idx, _diag_count, _diag_time.monotonic() - _diag_t0)
+                log.info("DIAG layer %d: batch loop complete — %d batches in %.1fs, now post-profile work | %s",
+                         layer_idx, _diag_count, _diag_time.monotonic() - _diag_t0, _rt_snap())
             finally:
                 _experts_handle.remove()
                 if _layer_in_handle is not None:
