@@ -222,16 +222,19 @@ class ReamCostAccumulator:
         similarities over tokens where BOTH experts were active in this batch.
         Division by |X| happens later in compute_delta_expert.
 
-        Vectorized implementation: gathers per-token active-expert groups
-        (top-K experts per token, K ≪ E), then performs a single batched
-        matmul + scatter_add per token-chunk instead of iterating O(E²) pairs
-        in Python. Replaces a prior per-pair loop with ~32K iterations and
-        per-pair ``.item()`` syncs that dominated _profile_layer wall-time
-        (≈14 s of 20 s per batch in profiling).
+        Fully-vectorized implementation: all per-token active-expert grouping
+        is performed via a single stable sort + ``unique_consecutive`` +
+        advanced-indexed gather on-device. Replaces a prior Python
+        token-to-active dict + per-expert ``slots_by_expert`` loop +
+        per-expert ``torch.tensor(...)`` host→device transfers, which
+        scaled linearly with bs × seq_len and dominated Stage 2 wall time
+        on Qwen3.6-35B-A3B (≈9 s of 12 s per batch at bs=180 on B200, with
+        GPU sitting at 0-17 % util — diagnosed in plan
+        ``the-oregon-b200-we-re-wondrous-scott.md``).
 
-        Memory: chunked over the token axis with ``_FINALIZE_BATCH_CHUNK``
-        tokens per chunk so the peak CPU/GPU allocation stays bounded
-        regardless of batch size (peak ≈ CHUNK × max_K × d_hid floats).
+        Memory: still chunked over the multi-active-token axis with
+        ``_FINALIZE_BATCH_CHUNK`` tokens per chunk so the peak GPU
+        allocation stays bounded (peak ≈ CHUNK × max_K × d_hid floats).
 
         Args:
             layer_idx: MoE layer index to finalize.
@@ -242,7 +245,8 @@ class ReamCostAccumulator:
                 GPU should pass it explicitly so the working tensors land on
                 the same device.
 
-        Semantics (must match prior per-pair implementation):
+        Semantics (preserved bit-for-bit modulo float32 accumulation order,
+        ~1e-5 relative drift; existing pipeline does not pin determinism):
           * Self-pair (e, e) entries are excluded from updates.
           * For each pair (i, j) with i ≠ j, BOTH (i, j) and (j, i) keys are
             written with the SAME accumulated value (symmetric).
@@ -264,12 +268,11 @@ class ReamCostAccumulator:
                 else torch.device("cpu")
             )
 
-        # 1. Drain _batch_gated_indexed under the lock. For each expert:
-        #    - convert its index tensor to a Python list (one .cpu() call)
-        #    - move its gated tensor to compute_device (no-op when already
-        #      there) so subsequent advanced-index gathers stay on one device.
+        # 1. Drain _batch_gated_indexed under the lock. Keep all tensors on
+        #    compute_device — no .cpu().tolist() here (that was the dominant
+        #    pre-vectorization sync cost).
         with self._lock:
-            per_expert_data: dict[int, tuple[list[int], torch.Tensor]] = {}
+            per_expert: list[tuple[int, torch.Tensor, torch.Tensor]] = []
             for e in range(num_experts):
                 key = (layer_idx, e)
                 payload = self._batch_gated_indexed.pop(key, None)
@@ -278,102 +281,109 @@ class ReamCostAccumulator:
                 indices_tensor, gated_tensor = payload
                 if indices_tensor.numel() == 0:
                     continue
-                per_expert_data[e] = (
-                    indices_tensor.cpu().tolist(),
+                per_expert.append((
+                    e,
+                    indices_tensor.to(compute_device, non_blocking=True),
                     gated_tensor.to(compute_device, non_blocking=True),
-                )
+                ))
             keys_to_clear = [k for k in self._batch_gated_indexed if k[0] == layer_idx]
             for k in keys_to_clear:
                 self._batch_gated_indexed.pop(k, None)
 
-        expert_ids = sorted(per_expert_data.keys())
-        if len(expert_ids) < 2:
+        if len(per_expert) < 2:
             return
 
-        # 2. Build per-token active-expert groups. For each global token index t,
-        #    collect (expert_id, position_in_that_experts_gated_tensor). Tokens
-        #    with <2 active experts contribute nothing to pair sims.
-        token_to_active: dict[int, list[tuple[int, int]]] = {}
-        for e in expert_ids:
-            idx_list, _ = per_expert_data[e]
-            for pos, t in enumerate(idx_list):
-                token_to_active.setdefault(t, []).append((e, pos))
-        contributing = [(t, exs) for t, exs in token_to_active.items() if len(exs) >= 2]
-        if not contributing:
-            return
+        # 2. Build flat concatenated tensors on device. Per-expert chunks are
+        #    "owned" by one expert id, so we can label them in one cat.
+        all_eids = torch.cat([
+            torch.full_like(idx, fill_value=e) for e, idx, _ in per_expert
+        ])  # [N_total] long
+        all_indices = torch.cat([idx for _, idx, _ in per_expert])  # [N_total] long
+        all_gated = torch.cat([g for _, _, g in per_expert], dim=0)  # [N_total, d_hid]
+        n_total = int(all_indices.shape[0])
+        d_hid = int(all_gated.shape[-1])
+        src_dtype = all_gated.dtype
 
-        # 3. Persistent on-device accumulator for sim_sum across all chunks.
-        sample = per_expert_data[expert_ids[0]][1]
-        d_hid = int(sample.shape[-1])
-        src_dtype = sample.dtype
-        sim_sum = torch.zeros(
-            (num_experts, num_experts), device=compute_device, dtype=torch.float32
+        # 3. Stable sort by token index so identical tokens form contiguous runs.
+        order = torch.argsort(all_indices, stable=True)
+        sorted_tokens = all_indices[order]
+        sorted_eids = all_eids[order]
+        sorted_gated = all_gated[order]
+
+        # 4. Per-unique-token expert counts via consecutive run-length.
+        _unique_tokens, counts = torch.unique_consecutive(
+            sorted_tokens, return_counts=True,
         )
+        # 5. Filter to tokens with >= 2 active experts (single-active tokens
+        #    contribute nothing to pair sims). starts gives each unique token's
+        #    offset into sorted_*.
+        starts_all = torch.cat([
+            torch.zeros(1, device=compute_device, dtype=torch.long),
+            counts.cumsum(0)[:-1],
+        ])
+        multi_mask = counts >= 2
+        if not multi_mask.any():
+            return
+        multi_starts = starts_all[multi_mask]   # [T_multi] long
+        multi_counts = counts[multi_mask]       # [T_multi] long
+        t_multi = int(multi_starts.numel())
+        max_k = int(multi_counts.max().item())
 
-        T_total = len(contributing)
-        for chunk_start in range(0, T_total, _FINALIZE_BATCH_CHUNK):
-            chunk = contributing[chunk_start:chunk_start + _FINALIZE_BATCH_CHUNK]
-            T = len(chunk)
-            max_K = max(len(exs) for _, exs in chunk)
+        # 6. Accumulator over chunks of the multi-active-token axis. The
+        #    per-chunk padded tensor peak is CHUNK × max_k × d_hid floats.
+        sim_sum = torch.zeros(
+            (num_experts, num_experts), device=compute_device, dtype=torch.float32,
+        )
+        k_grid = torch.arange(max_k, device=compute_device, dtype=torch.long)
 
-            # 4. Build dense per-chunk tensors [T, max_K, d_hid] on the compute
-            #    device. To avoid one CUDA kernel launch per (ti, ki) slot
-            #    (which would be ~16K launches per chunk × hundreds of chunks
-            #    per layer), group slot assignments by expert and do ONE
-            #    advanced-index scatter per expert per chunk.
-            vecs = torch.zeros((T, max_K, d_hid), device=compute_device, dtype=src_dtype)
-            eids = torch.zeros((T, max_K), device=compute_device, dtype=torch.long)
-            mask = torch.zeros((T, max_K), device=compute_device, dtype=src_dtype)
+        for chunk_start in range(0, t_multi, _FINALIZE_BATCH_CHUNK):
+            chunk_end = min(chunk_start + _FINALIZE_BATCH_CHUNK, t_multi)
+            starts_c = multi_starts[chunk_start:chunk_end]   # [C]
+            counts_c = multi_counts[chunk_start:chunk_end]   # [C]
+            c = int(starts_c.numel())
 
-            # Group (ti, ki, pos) triples by expert. Each `slots_by_expert[e]`
-            # is a list of (ti, ki, pos) for which slot (ti, ki) holds expert e
-            # at position `pos` in expert e's gated tensor.
-            slots_by_expert: dict[int, list[tuple[int, int, int]]] = {}
-            for ti, (t, exs) in enumerate(chunk):
-                for ki, (e, pos) in enumerate(exs):
-                    slots_by_expert.setdefault(e, []).append((ti, ki, pos))
+            # source_idx[ti, ki] = starts_c[ti] + ki → row in sorted_* arrays.
+            # For ki >= counts_c[ti], the slot is invalid; mask it out below.
+            source_idx = starts_c.unsqueeze(1) + k_grid.unsqueeze(0)     # [C, max_k]
+            slot_mask = k_grid.unsqueeze(0) < counts_c.unsqueeze(1)       # [C, max_k] bool
+            # Clamp invalid indices to the last valid row so the gather
+            # doesn't OOB-read; the gathered junk is then masked out.
+            source_idx_safe = source_idx.clamp_max(n_total - 1)
 
-            for e, slots in slots_by_expert.items():
-                # Unzip once to build flat tensors for advanced indexing.
-                ti_idx = [s[0] for s in slots]
-                ki_idx = [s[1] for s in slots]
-                pos_idx = [s[2] for s in slots]
-                ti_t = torch.tensor(ti_idx, device=compute_device, dtype=torch.long)
-                ki_t = torch.tensor(ki_idx, device=compute_device, dtype=torch.long)
-                pos_t = torch.tensor(pos_idx, device=compute_device, dtype=torch.long)
-                # vecs[ti, ki] := per_expert_data[e][1][pos]  (vectorized)
-                vecs[ti_t, ki_t] = per_expert_data[e][1].index_select(0, pos_t)
-                eids[ti_t, ki_t] = e
-                mask[ti_t, ki_t] = 1
+            padded_gated = sorted_gated[source_idx_safe]                 # [C, max_k, d_hid]
+            padded_eids = sorted_eids[source_idx_safe]                   # [C, max_k]
+            # Zero the gated vectors at invalid slots so they cannot
+            # contribute to the bmm cosine sums.
+            padded_gated = padded_gated * slot_mask.unsqueeze(-1).to(src_dtype)
 
-            # 5. L2-normalize each [d_hid] row. Zero-norm rows must stay zero
-            #    (their contribution to cosine sim is zero), NaN-safe equivalent
-            #    of the prior `where(isnan, 0)` guard.
-            norms = vecs.norm(dim=-1, keepdim=True)             # [T, max_K, 1]
-            nonzero = (norms.squeeze(-1) > 0).to(vecs.dtype)    # [T, max_K]
-            vecs_norm = vecs / norms.clamp_min(1e-12)           # [T, max_K, d_hid]
+            # 7. L2-normalize each [d_hid] row. Zero-norm rows stay zero
+            #    (their cosine is undefined; the original used a
+            #    ``where(isnan, 0)`` guard which we replicate via the
+            #    `nonzero` mask below).
+            norms = padded_gated.norm(dim=-1, keepdim=True)              # [C, max_k, 1]
+            nonzero = (norms.squeeze(-1) > 0).to(src_dtype)              # [C, max_k]
+            padded_norm = padded_gated / norms.clamp_min(1e-12)
 
-            # 6. Pairwise cosine similarity within each token via batched matmul.
-            sim = torch.bmm(vecs_norm, vecs_norm.transpose(-1, -2))  # [T, K, K]
+            sim = torch.bmm(padded_norm, padded_norm.transpose(-1, -2))   # [C, max_k, max_k]
             sim = torch.where(torch.isnan(sim), torch.zeros_like(sim), sim)
-            valid_per_slot = mask * nonzero                         # [T, max_K]
+            valid_per_slot = slot_mask.to(src_dtype) * nonzero
             pair_mask = valid_per_slot.unsqueeze(2) * valid_per_slot.unsqueeze(1)
             sim = sim * pair_mask
 
-            # 7. Scatter into the persistent sim_sum accumulator. Padding slots
-            #    have eids=0 and pair_mask=0 → contribute 0; the diagonal is
-            #    zeroed after the chunk loop.
+            # 8. Scatter into the persistent [E, E] sim_sum accumulator.
+            #    Padded slots have pair_mask=0, so the eids garbage at
+            #    those slots scatters 0 — diagonal cleared after the loop.
             flat_sim = sim.to(torch.float32).flatten()
-            flat_i = eids.unsqueeze(2).expand(T, max_K, max_K).flatten()
-            flat_j = eids.unsqueeze(1).expand(T, max_K, max_K).flatten()
+            flat_i = padded_eids.unsqueeze(2).expand(c, max_k, max_k).flatten()
+            flat_j = padded_eids.unsqueeze(1).expand(c, max_k, max_k).flatten()
             flat_idx = flat_i * num_experts + flat_j
             sim_sum.view(-1).scatter_add_(0, flat_idx, flat_sim)
 
-        # 8. Drop the diagonal (original only iterated pairs with i<j) and
-        #    do ONE sync to host. Then dict-merge under the lock.
+        # 9. Drop self-pairs and dict-merge under the lock. Single host sync.
         sim_sum.fill_diagonal_(0.0)
         sim_sum_cpu = sim_sum.cpu().numpy()
 
+        expert_ids = sorted(e for e, _, _ in per_expert)
         with self._lock:
             for i_idx, e_i in enumerate(expert_ids):
                 for e_j in expert_ids[i_idx + 1:]:
