@@ -28,6 +28,8 @@ Environment:
 #     "accelerate>=1.0.0",
 #     "datasets>=3.0.0",
 #     "safetensors>=0.4.5",
+#     # Required by transformers.integrations.finegrained_fp8 (FP8 KD teacher).
+#     "kernels>=0.14.0",
 #     "tokenizers>=0.20.0",
 #     "sentencepiece>=0.2.0",
 #     "huggingface_hub>=0.26.0",
