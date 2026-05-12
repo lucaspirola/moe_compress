@@ -13,7 +13,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from .modes import Mode
-from .quant.specs import KVQuantSpec, WeightQuantSpec
+from .quant.specs import KVQuantSpec, MixedWeightSpec, UniformWeightSpec
 
 
 class TeacherConfig(BaseModel):
@@ -56,11 +56,19 @@ class KVQuantBlock(BaseModel):
 
 
 class QuantBlock(BaseModel):
-    """Top-level `quant:` YAML block, used only in `da_qad` mode."""
+    """Top-level `quant:` YAML block, used only in `da_qad` mode.
+
+    `weight` accepts two shapes:
+      - `UniformWeightSpec` — single global weight spec (the pre-Phase-7.2
+        shape; all existing YAMLs use this).
+      - `MixedWeightSpec` — per-module-pattern specs (Profile J et al.).
+
+    Pydantic discriminates by structural shape: `spec_map` field present →
+    `MixedWeightSpec`; otherwise `UniformWeightSpec`.
+    """
 
     model_config = ConfigDict(strict=True, extra="forbid")
-
-    weight: WeightQuantSpec
+    weight: UniformWeightSpec | MixedWeightSpec
     kv_quant: KVQuantBlock
 
 

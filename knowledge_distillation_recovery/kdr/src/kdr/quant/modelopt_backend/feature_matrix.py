@@ -44,6 +44,13 @@ SUPPORTED_QUANTS: dict[tuple[Target, Format], list[int]] = {
     ("kv_value", "int"): [8, 4],
     # NOTE: INT3, INT2, and MXFP4-KV are NOT in this matrix — they fall
     # through to NativeBackend per LLR-0017.
+    #
+    # Phase 7.2 / Profile J design choice (review A6): NO GGUF formats
+    # (IQ*, Q*_K, legacy Q*_0/1, Q8_0) are added here either. They fall
+    # through to NativeBackend's hand-rolled STE simulators via
+    # ``_route_quantizers``'s ``is_supported(...) == False`` path. ModelOpt
+    # has no compressed-tensors converter for the GGUF family in v0; v1's
+    # ``tools/kdr_to_gguf.py`` is the GGUF emission path.
 }
 """The `(target, format)` tuples ModelOpt supports, with the bit widths it
 covers. The factory in `quant.factory` consults this to decide which backend

@@ -26,6 +26,8 @@ branch passes them.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -35,9 +37,46 @@ from .interface import QuantBackend, QuantBlockSubset
 from .modelopt_backend.backend import CalibrateLoop, ModelOptBackend
 from .modelopt_backend.feature_matrix import is_supported
 from .native_backend.backend import NativeBackend
-from .specs import KVQuantSpec, WeightQuantSpec
+from .specs import (
+    KVQuantSpec,
+    MixedWeightSpec,
+    UniformWeightSpec,
+    WeightPatternSpec,
+)
 
 log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routing types
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Typo-safety in routing dicts (review H1): a typo like ``"modelpot"`` becomes
+# a mypy error rather than a silent "no weight on this backend" via
+# ``dict.get()``.
+BackendName = Literal["modelopt", "native"]
+
+
+@dataclass(frozen=True, slots=True)
+class WeightRoutes:
+    """Per-pattern weight routing. One entry per WeightPatternSpec in spec_map.
+
+    Internal-only to ``factory.py`` — not Pydantic to skip the strict-typing
+    auto-discovery in ``tests/test_strict_typing.py`` (see review H2). These
+    records are built from already-validated ``WeightPatternSpec`` /
+    ``KVQuantSpec`` instances; Pydantic re-validation buys nothing.
+    """
+
+    by_backend: dict[BackendName, list[WeightPatternSpec]]
+
+
+@dataclass(frozen=True, slots=True)
+class QuantRoutes:
+    """All routing decisions for one QuantBlock."""
+
+    weight: WeightRoutes
+    key: BackendName
+    value: BackendName
 
 
 def partition_and_dispatch(
@@ -91,8 +130,14 @@ def partition_and_dispatch(
     native_subset = _subset_for(quant_block, routes, "native")
 
     log.info(
-        "partition_and_dispatch: routes=%s; modelopt=%s, native=%s",
-        routes,
+        "partition_and_dispatch: weight_routes=%s, key=%s, value=%s; "
+        "modelopt=%s, native=%s",
+        {
+            k: [f"{p.pattern!r}->{p.bits}b/{p.format}" for p in v]
+            for k, v in sorted(routes.weight.by_backend.items())
+        },
+        routes.key,
+        routes.value,
         _describe_subset(modelopt_subset),
         _describe_subset(native_subset),
     )
@@ -146,54 +191,103 @@ def partition_and_dispatch(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _route_quantizers(quant_block: QuantBlock) -> dict[str, str]:
-    """Pick ``"modelopt"`` or ``"native"`` for each quantizer.
+def _normalize_weight_to_patterns(
+    weight: UniformWeightSpec | MixedWeightSpec,
+) -> list[WeightPatternSpec]:
+    """Lift either spec shape to a uniform list-of-patterns form for routing.
 
-    Returns a dict shaped ``{"weight": "modelopt", "key": "native", "value":
-    "modelopt"}`` etc. The factory uses the routes to assemble per-backend
-    ``QuantBlockSubset`` instances.
+    Uniform -> single-entry list with ``pattern=""`` (the catch-all default;
+    matches every Linear at install time per LLR-0024 v2 precedence).
+    Mixed   -> the spec_map as-is.
+
+    The empty-string pattern is a documented catch-all: when authored in a
+    user's ``MixedWeightSpec.spec_map``, the Pydantic duplicate-pattern
+    validator permits a single entry, and first-match-wins means it should
+    be placed LAST to act as the default. The Uniform shim is just the
+    degenerate case (one entry = the catch-all).
     """
-    return {
-        "weight": _route_one("weight", quant_block.weight),
-        "key": _route_one("kv_key", quant_block.kv_quant.key),
-        "value": _route_one("kv_value", quant_block.kv_quant.value),
-    }
+    if isinstance(weight, MixedWeightSpec):
+        return list(weight.spec_map)
+    # UniformWeightSpec branch
+    return [
+        WeightPatternSpec(
+            pattern="",
+            bits=weight.bits,
+            format=weight.format,
+            granularity=weight.granularity,
+            transform=weight.transform,
+        )
+    ]
 
 
-def _route_one(target: str, spec: WeightQuantSpec | KVQuantSpec) -> str:
-    """Return ``"modelopt"`` if the matrix supports this tuple, else ``"native"``."""
-    # ``target`` is constrained at the call site; the cast below is for mypy.
-    from typing import cast
+def _route_quantizers(quant_block: QuantBlock) -> QuantRoutes:
+    """Route each pattern + K/V to ``modelopt`` or ``native``.
 
-    from .modelopt_backend.feature_matrix import Target
+    Weight routing is per-pattern: each ``WeightPatternSpec`` is bucketed
+    by backend based on ``is_supported("weight", format, bits)``. ``dict``
+    is insertion-ordered (PEP 468 / Python 3.7+); the per-backend
+    ``list[WeightPatternSpec]`` therefore preserves spec_map's original
+    ordering, which is load-bearing for first-match-wins precedence in
+    Task 5's per-pattern install path (review M1).
+    """
+    patterns = _normalize_weight_to_patterns(quant_block.weight)
+    by_backend: dict[BackendName, list[WeightPatternSpec]] = {}
+    for p in patterns:
+        backend: BackendName = (
+            "modelopt" if is_supported("weight", p.format, p.bits) else "native"
+        )
+        by_backend.setdefault(backend, []).append(p)
+    return QuantRoutes(
+        weight=WeightRoutes(by_backend=by_backend),
+        key=_route_one("kv_key", quant_block.kv_quant.key),
+        value=_route_one("kv_value", quant_block.kv_quant.value),
+    )
 
-    if is_supported(cast(Target, target), spec.format, spec.bits):
+
+def _route_one(
+    target: Literal["kv_key", "kv_value"], spec: KVQuantSpec
+) -> BackendName:
+    """Return ``"modelopt"`` if the matrix supports this K/V tuple, else
+    ``"native"``.
+
+    Narrowed parameter type (review C3) means typos become a mypy error
+    rather than a silent fall-through to Native. Weight routing is handled
+    per-pattern inline in :func:`_route_quantizers`.
+    """
+    if is_supported(target, spec.format, spec.bits):
         return "modelopt"
     return "native"
 
 
 def _subset_for(
     quant_block: QuantBlock,
-    routes: dict[str, str],
-    backend_name: str,
+    routes: QuantRoutes,
+    backend_name: BackendName,
 ) -> QuantBlockSubset:
-    """Build a ``QuantBlockSubset`` containing only the quantizers routed to
-    ``backend_name``. Empty if none.
-    """
+    """Build a ``QuantBlockSubset`` filtered to ``backend_name``. Empty if none."""
+    weight_for_backend = routes.weight.by_backend.get(backend_name)
     return QuantBlockSubset(
-        weight=quant_block.weight if routes["weight"] == backend_name else None,
-        key=quant_block.kv_quant.key if routes["key"] == backend_name else None,
-        value=quant_block.kv_quant.value if routes["value"] == backend_name else None,
+        weight=weight_for_backend if weight_for_backend else None,
+        key=quant_block.kv_quant.key if routes.key == backend_name else None,
+        value=quant_block.kv_quant.value if routes.value == backend_name else None,
     )
 
 
 def _describe_subset(subset: QuantBlockSubset) -> str:
-    """Human-readable one-liner for the log line."""
+    """Human-readable one-liner for the log line.
+
+    Per-pattern output: ``weight[<pattern>]=Xb/format``. Review M2 — this
+    breaks any external log parser that grepped for ``weight=`` literally;
+    no in-tree consumer is known. Acknowledged here so we have a record if
+    a Grafana dashboard elsewhere needs updating.
+    """
     if subset.is_empty():
         return "<empty>"
     parts: list[str] = []
     if subset.weight is not None:
-        parts.append(f"weight={subset.weight.bits}b/{subset.weight.format}")
+        for p in subset.weight:
+            label = p.pattern if p.pattern else "<default>"
+            parts.append(f"weight[{label}]={p.bits}b/{p.format}")
     if subset.key is not None:
         parts.append(f"key={subset.key.bits}b/{subset.key.format}")
     if subset.value is not None:

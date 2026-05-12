@@ -21,7 +21,12 @@ from kdr.io.save import (
     save_kdr_artifact,
 )
 from kdr.quant.interface import QuantBlockSubset
-from kdr.quant.specs import KVQuantSpec, WeightQuantSpec
+from kdr.quant.specs import (
+    KVQuantSpec,
+    UniformWeightSpec,
+    WeightPatternSpec,
+    WeightQuantSpec,
+)
 
 
 def _qb() -> QuantBlock:
@@ -34,13 +39,31 @@ def _qb() -> QuantBlock:
     )
 
 
+def _uniform_to_pattern_list(
+    uniform: UniformWeightSpec | None,
+) -> list[WeightPatternSpec] | None:
+    """Convert a parent-YAML ``UniformWeightSpec`` to the post-Phase-7.2
+    list-of-one ``QuantBlockSubset.weight`` shape with ``pattern=""``."""
+    if uniform is None:
+        return None
+    return [
+        WeightPatternSpec(
+            pattern="",
+            bits=uniform.bits,
+            format=uniform.format,
+            granularity=uniform.granularity,
+            transform=uniform.transform,
+        )
+    ]
+
+
 def _fake_backend(
-    *, weight: WeightQuantSpec | None, has_save_pretrained: bool = True
+    *, weight: UniformWeightSpec | None, has_save_pretrained: bool = True
 ) -> MagicMock:
     """A QuantBackend stand-in. Records `.save` calls and writes a stub config.json."""
     b = MagicMock()
     b.name = "fake"
-    b._quant_block = QuantBlockSubset(weight=weight)
+    b._quant_block = QuantBlockSubset(weight=_uniform_to_pattern_list(weight))
 
     def _save(model: nn.Module, output_dir: Path) -> None:
         out = Path(output_dir)
