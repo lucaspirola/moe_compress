@@ -206,7 +206,22 @@ def run(
         def _get_teacher(student_refs_count: int):
             if _teacher_state["model"] is None:
                 load_in_4bit = bool(s5.get("teacher_load_in_4bit", False))
-                if config["model"].get("load_in_4bit", False) and not load_in_4bit:
+                teacher_repo_override = s5.get("teacher_model_repo") or None
+                teacher_name_or_path = (
+                    teacher_repo_override
+                    if teacher_repo_override
+                    else config["model"]["name_or_path"]
+                )
+                if teacher_repo_override and load_in_4bit:
+                    # An override repo is already quantized (e.g. FP8); stacking
+                    # bitsandbytes 4-bit on top is incoherent. Honor the override.
+                    log.warning(
+                        "Stage 5: teacher_model_repo=%s in use; ignoring "
+                        "teacher_load_in_4bit (the override repo is already quantized).",
+                        teacher_repo_override,
+                    )
+                    load_in_4bit = False
+                if config["model"].get("load_in_4bit", False) and not load_in_4bit and not teacher_repo_override:
                     log.warning(
                         "Stage 5: config['model']['load_in_4bit']=true but "
                         "stage5_router_kd.teacher_load_in_4bit=false. The teacher "
@@ -237,10 +252,10 @@ def run(
                 else:
                     _device_map = _cfg_dm
                 log.info("Loading teacher for KD (first live batch): %s "
-                         "(teacher_load_in_4bit=%s, device_map=%s)",
-                         config["model"]["name_or_path"], load_in_4bit, _device_map)
+                         "(teacher_model_repo=%s, teacher_load_in_4bit=%s, device_map=%s)",
+                         teacher_name_or_path, teacher_repo_override, load_in_4bit, _device_map)
                 _t, _ = load_model(
-                    config["model"]["name_or_path"],
+                    teacher_name_or_path,
                     revision=config["model"]["revision"],
                     torch_dtype=config["model"]["torch_dtype"],
                     device_map=_device_map,
@@ -249,7 +264,29 @@ def run(
                     trust_remote_code=config["model"].get("trust_remote_code", False),
                 )
                 _t.eval()
-                if use_compile:
+                # Vocab-size guard for the live-teacher path. Mirrors the
+                # cache-path check at lines 155-159 so a `teacher_model_repo`
+                # pointed at a model with a different tokenizer fails fast
+                # instead of silently producing a wrong KD signal. Passes by
+                # definition on the default path. Unwrap a possible
+                # torch.compile wrapper to read .config reliably.
+                _student_unwrapped = getattr(student, "_orig_mod", student)
+                _teacher_vocab = int(getattr(_t.config, "vocab_size", -1))
+                _student_vocab = int(getattr(_student_unwrapped.config, "vocab_size", -1))
+                if _teacher_vocab != _student_vocab:
+                    raise RuntimeError(
+                        f"Teacher (repo={teacher_name_or_path}) vocab_size="
+                        f"{_teacher_vocab} does not match student vocab_size="
+                        f"{_student_vocab}. Vocabulary-level KD is impossible "
+                        "with a tokenizer mismatch."
+                    )
+                # torch.compile(teacher) is deterministically skipped when an
+                # override repo is in use. FP8 weights are not yet fully
+                # supported by reduce-overhead; the existing eager-fallback
+                # try/except would be a silent slowdown, which the
+                # no-speed-compromises rule disallows. Student compile is
+                # untouched and still carries the speedup.
+                if use_compile and not teacher_repo_override:
                     try:
                         log.info("Stage 5: torch.compile(teacher, mode='reduce-overhead')")
                         _t = torch.compile(_t, mode="reduce-overhead")

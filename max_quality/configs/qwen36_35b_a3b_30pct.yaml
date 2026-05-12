@@ -233,6 +233,13 @@ stage5_router_kd:
   gradient_accumulation: 1
   # Teacher loads in BF16 on H200 — no quantization needed.
   teacher_load_in_4bit: false
+  # Optional alternate teacher for KD (Stage 2.5 / Stage 5). null = use the
+  # main model from config.model.name_or_path (default: BF16 teacher).
+  # Set to a HF repo (e.g. "Qwen/Qwen3.6-35B-A3B-FP8") to use a smaller /
+  # lower-precision teacher when H200 + BF16 teacher + BF16 student would OOM.
+  # The override must share the main model's MoE layer count and tokenizer/vocab
+  # (enforced at load time in stage5_router_kd._get_teacher).
+  teacher_model_repo: null
   max_sequence_length: 512
   kd_temperature: 1.0
   kd_seq_chunk_size: 512            # H200: full sequence in one chunk (~2.4 GB peak at B=8, |V|≈150K).
