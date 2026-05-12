@@ -196,6 +196,81 @@ print('snapshot_download complete')
 "
 
 # ---------------------------------------------------------------------------
+# 5.5. FP8 KD-teacher kernel prefetch + metadata self-heal
+#
+# transformers.integrations.finegrained_fp8 lazily loads `deep-gemm` and
+# `finegrained-fp8` kernels via the `kernels` package during Stage 2.5's
+# first FP8 forward pass (~90 min into a run). Two known upstream gotchas:
+#
+#   (1) `kernels-community/deep-gemm`'s metadata.json is missing the
+#       `name` and `id` fields that kernels>=0.14.0 strict-validates;
+#       load raises ValueError mid-Stage-2.5.
+#   (2) Lazy-load happens deep into the run, so a failure there wastes
+#       all of Stage 2's wall-time.
+#
+# Fix: trigger the kernel downloads eagerly here (each is small — MBs),
+# then walk the resulting metadata.json files and inject sensible name/id
+# values for any kernel that lacks them. Only applies the patch if the
+# kernel teacher path is actually being used (TEACHER_MODEL_REPO non-empty);
+# default BF16 teacher path doesn't need this and we want to skip the
+# extra download.
+# ---------------------------------------------------------------------------
+if [[ -n "${TEACHER_MODEL_REPO:-}" ]]; then
+    log "Pre-fetching FP8 KD-teacher kernels (TEACHER_MODEL_REPO=$TEACHER_MODEL_REPO) and patching metadata.json"
+    python3 - <<'PYEOF'
+import glob, hashlib, json, os, sys
+
+# Trigger lazy downloads. The kernels API caches into HF_HOME/hub/kernels--*/.
+# Best-effort — even if a fetch fails (e.g., HF rate limit), the patch step
+# below fixes whatever did land on disk.
+try:
+    from kernels import get_kernel
+    for repo_id in ("kernels-community/deep-gemm", "kernels-community/finegrained-fp8"):
+        try:
+            get_kernel(repo_id)
+            print(f"[kernels-prefetch] {repo_id}: cached", flush=True)
+        except Exception as exc:
+            print(f"[kernels-prefetch] {repo_id} fetch failed (will patch + retry next time): {exc}",
+                  flush=True)
+except ImportError as exc:
+    print(f"[kernels-prefetch] `kernels` package not installed: {exc} — skipping", flush=True)
+    sys.exit(0)
+
+# Patch metadata.json files missing required fields. kernels>=0.14.0 requires
+# both `name` and `id`. Name must satisfy the strict format (lowercase letters,
+# digits, dashes, start with letter, end with letter/digit) — we infer it from
+# the cache path which uses the kernels--<org>--<name>/ layout. Underscores in
+# the inferred name are mapped to dashes per the spec.
+patched = 0
+for p in glob.glob(f"{os.environ.get('HF_HOME', '/cache/hf')}/hub/kernels--*/snapshots/*/build/*/metadata.json"):
+    try:
+        with open(p) as f:
+            m = json.load(f)
+    except Exception:
+        continue
+    changed = False
+    if "name" not in m:
+        for part in p.split("/"):
+            if part.startswith("kernels--") and part.count("--") >= 2:
+                m["name"] = part.split("--", 2)[2].replace("_", "-")
+                changed = True
+                break
+    if "id" not in m:
+        # Stable id derived from the path so re-runs land on the same value
+        # (helps the kernels cache key stay consistent across invocations).
+        m["id"] = "_" + hashlib.md5(p.encode()).hexdigest()[:14]
+        changed = True
+    if changed:
+        with open(p, "w") as f:
+            json.dump(m, f, indent=2)
+        patched += 1
+        print(f"[kernels-prefetch] patched: {p}", flush=True)
+
+print(f"[kernels-prefetch] complete: {patched} metadata file(s) patched", flush=True)
+PYEOF
+fi
+
+# ---------------------------------------------------------------------------
 # 6. Invoke harness
 # ---------------------------------------------------------------------------
 HARNESS_DIR="$CODE_DIR/max_quality"

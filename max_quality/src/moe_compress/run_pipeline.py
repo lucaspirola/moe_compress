@@ -94,8 +94,33 @@ def main(argv=None) -> int:
 
     start = args.resume_from_stage
     stop = args.stop_after_stage
+
+    # Resume-from-stage-2 shortcut: if a prior run already produced
+    # stage2_pruned/ or stage2p5_final/, skip the corresponding stage's work
+    # and load the cached model. Saves the ~80-min Stage 2 re-profile after
+    # a downstream-stage failure (e.g., Stage 2.5 deps missing, eval crash).
+    # --no-resume defeats this and forces a full Stage 2 re-run, matching
+    # stage2_reap_ream.run's own _stage2_partial/ cleanup semantics.
+    skip_stage2 = False
+    skip_stage25 = False
+    stage2_resume_dir: Path | None = None
+    if start == 2 and not args.no_resume:
+        if (artifacts_dir / "stage2p5_final").exists():
+            log.info("Resume shortcut: stage2p5_final/ exists → skipping Stage 2 + Stage 2.5")
+            stage2_resume_dir = artifacts_dir / "stage2p5_final"
+            skip_stage2 = True
+            skip_stage25 = True
+        elif (artifacts_dir / "stage2_pruned").exists():
+            log.warning(
+                "Resume shortcut: stage2_pruned/ exists (no stage2p5_final/) → "
+                "skipping Stage 2; Stage 2.5 will still run against the cached pruned model"
+            )
+            stage2_resume_dir = artifacts_dir / "stage2_pruned"
+            skip_stage2 = True
+
     model, tokenizer = _load_for_stage(start, config, artifacts_dir,
-                                       stop_after_stage=stop)
+                                       stop_after_stage=stop,
+                                       load_from_override=stage2_resume_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # One-shot Trackio emit of run-level config so the dashboard's run-summary
@@ -163,24 +188,27 @@ def main(argv=None) -> int:
     hub_base = hub_repo_base_from_env()
 
     if start <= 2 <= stop:
-        if start >= 2:
+        if start >= 2 and not skip_stage2:
             _validate_stage1_artifacts(artifacts_dir)
-        log.info("=== Stage 2 — REAP + REAM ===")
-        t2 = time.monotonic()
-        stage2_reap_ream.run(model, tokenizer, config, artifacts_dir, device=device,
-                             no_resume=args.no_resume)
-        repo2 = upload_stage_to_hub(2, artifacts_dir, repo_base=hub_base) if hub_base else None
-        _finish_stage(2, t2, repo2)
+        if not skip_stage2:
+            log.info("=== Stage 2 — REAP + REAM ===")
+            t2 = time.monotonic()
+            stage2_reap_ream.run(model, tokenizer, config, artifacts_dir, device=device,
+                                 no_resume=args.no_resume)
+            repo2 = upload_stage_to_hub(2, artifacts_dir, repo_base=hub_base) if hub_base else None
+            _finish_stage(2, t2, repo2)
 
         # Stage 2.5 — Router KD post-merge: recalibrate routers so Stage 3
         # covariance collection sees already-adapted routing decisions.
-        # Always runs immediately after Stage 2 (no standalone resume entry point).
-        log.info("=== Stage 2.5 — Post-Merge Router KD ===")
-        t2p5 = time.monotonic()
-        stage5_router_kd.run(model, tokenizer, config, artifacts_dir, device=device,
-                             no_resume=args.no_resume, stage_key="stage2p5")
-        repo2p5 = upload_stage_to_hub("2p5", artifacts_dir, repo_base=hub_base) if hub_base else None
-        _finish_stage("2p5", t2p5, repo2p5)
+        # Always runs immediately after Stage 2 unless stage2p5_final/ is
+        # already on disk (in which case skip_stage25 was set above).
+        if not skip_stage25:
+            log.info("=== Stage 2.5 — Post-Merge Router KD ===")
+            t2p5 = time.monotonic()
+            stage5_router_kd.run(model, tokenizer, config, artifacts_dir, device=device,
+                                 no_resume=args.no_resume, stage_key="stage2p5")
+            repo2p5 = upload_stage_to_hub("2p5", artifacts_dir, repo_base=hub_base) if hub_base else None
+            _finish_stage("2p5", t2p5, repo2p5)
     if stop < 3:
         log.info("Stopping after stage %d as requested.", stop)
         wait_for_pending_uploads()
@@ -318,8 +346,18 @@ _STAGE6_ATTN_IMPLEMENTATION = "eager"
 
 
 def _load_for_stage(stage: int, config: dict, artifacts_dir: Path,
-                    *, stop_after_stage: int = 6):
-    """Load the model + tokenizer appropriate for starting at ``stage``."""
+                    *, stop_after_stage: int = 6,
+                    load_from_override: Path | None = None):
+    """Load the model + tokenizer appropriate for starting at ``stage``.
+
+    ``load_from_override`` is the resume-shortcut path computed in ``main()``:
+    when starting at stage 2 with ``stage2_pruned/`` or ``stage2p5_final/``
+    already on disk, the caller wants the loader to read that cached output
+    instead of the original (untouched) model. Passed through to
+    ``load_compressed_model`` here so the loaded model is post-Stage-2 (or
+    post-Stage-2.5) and the corresponding stage block in ``main`` can skip
+    its work.
+    """
     # F-iter4-CRIT-1: Spec §9 lines 821, 838 require eager attn for the Stage 6
     # gate run for both teacher and student. The teacher is pinned at load time
     # inside stage6_validate.py; the student is loaded here, so override the
@@ -335,6 +373,15 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path,
             stop_after_stage, cfg_attn, student_attn,
         )
     if stage <= 2:
+        if load_from_override is not None:
+            log.info("Loading stage 2 input from %s (resume shortcut)", load_from_override)
+            model, tokenizer, _ = load_compressed_model(
+                load_from_override,
+                device_map=config["model"]["device_map"],
+                torch_dtype=config["model"]["torch_dtype"],
+                attn_implementation=student_attn,
+            )
+            return model, tokenizer
         return load_model(
             config["model"]["name_or_path"],
             revision=config["model"].get("revision", "main"),
