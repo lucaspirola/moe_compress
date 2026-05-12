@@ -37,6 +37,7 @@ from .utils.model_io import (
     load_model,
     save_compressed_checkpoint,
 )
+from .utils.runtime_monitor import snapshot_telemetry as _rt_snap, update as _rt_update
 from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
@@ -674,6 +675,8 @@ def run(
                 optim.step()
                 optim.zero_grad()
                 step += 1
+                _rt_update(stage="stage5", epoch=int(epoch), step=int(step), batch=int(i),
+                           phase="kd_train")
                 if step % config["logging"]["log_every_n_steps"] == 0:
                     # Single device→host sync per log boundary (vs per-microbatch).
                     # The window covers the period since the previous log line —
@@ -686,8 +689,8 @@ def run(
                         loss_val = 0.0
                     window_loss_acc.clear()
                     log.info(
-                        "  epoch=%d step=%d window_loss=%.6f grad_norm=%.4f",
-                        epoch, step, loss_val, grad_norm,
+                        "  epoch=%d step=%d window_loss=%.6f grad_norm=%.4f | %s",
+                        epoch, step, loss_val, grad_norm, _rt_snap(),
                     )
                     payload = {
                         "stage5/epoch": epoch,

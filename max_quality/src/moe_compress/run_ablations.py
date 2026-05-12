@@ -54,6 +54,12 @@ faulthandler.dump_traceback_later(120, repeat=True, file=sys.stderr)
 
 from .run_pipeline import main as run_pipeline_main
 from .utils.model_io import load_json_artifact, save_json_artifact
+from .utils.runtime_monitor import (
+    flush as _rt_flush,
+    install_signal_handlers as _rt_install_signal_handlers,
+    set_path as _rt_set_path,
+    update as _rt_update,
+)
 from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
@@ -285,6 +291,13 @@ def _run_one_ablation(
     log.info("[%s] starting (deltas=%s)", ablation_id, deltas)
     t_start = time.monotonic()
 
+    # Per-ablation breadcrumb: <ablation_dir>/_last_alive.json captures the
+    # last-known state (layer/batch/phase + signal on terminal exit) so the
+    # next run can diagnose where the prior attempt died without parsing logs.
+    _rt_set_path(ablation_dir / "_last_alive.json")
+    _rt_update(ablation_id=ablation_id, phase="ablation_start",
+               deltas={k: str(v) for k, v in deltas.items()})
+
     # Per-ablation Trackio run.
     try:
         import trackio
@@ -352,6 +365,12 @@ def _run_one_ablation(
         result["_deltas"] = deltas
         result["_elapsed_seconds"] = elapsed
         log.info("[%s] complete in %.1f min", ablation_id, elapsed / 60.0)
+        # Mark the breadcrumb as cleanly completed so a forensic read of
+        # _last_alive.json after a successful run doesn't look like a
+        # mid-batch crash. Force-flush past the throttle so the final
+        # state lands on disk before this function returns.
+        _rt_update(phase="ablation_done", elapsed_seconds=elapsed)
+        _rt_flush()
         return result
     finally:
         if run is not None:
@@ -464,6 +483,10 @@ def main(argv: list[str] | None = None) -> int:
     base_config = yaml.safe_load(Path(args.config).read_text())
     ablations_root = Path(args.ablations_root)
     ablations_root.mkdir(parents=True, exist_ok=True)
+    # Install SIGTERM/SIGINT/SIGHUP handlers + atexit flusher so the breadcrumb
+    # records terminal signals. SIGSEGV can't be reliably caught from Python;
+    # per-batch _rt_update() calls in the hot paths cover that case.
+    _rt_install_signal_handlers()
     shared_dir = ablations_root / "_shared"
     teacher_cache_path = shared_dir / "teacher_eval_cache.json"
 
