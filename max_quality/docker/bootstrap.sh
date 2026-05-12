@@ -32,6 +32,12 @@ TRACKIO_SPACE_ID="${TRACKIO_SPACE_ID:-pirola/trackio}"
 HF_ARTIFACTS_BUCKET="${HF_ARTIFACTS_BUCKET:-pirola/moe-ablations}"
 UPLOAD_ON_SUCCESS="${UPLOAD_ON_SUCCESS:-0}"
 DESTROY_HINT="${DESTROY_HINT:-vastai destroy instance \$VAST_CONTAINERLABEL}"
+# Stage 5 / Stage 2.5 VRAM-reduction levers. Empty = use config defaults.
+# See max_quality/configs/qwen36_35b_a3b_30pct.yaml and
+# stage5_router_kd._get_teacher for what each knob does.
+TEACHER_MODEL_REPO="${TEACHER_MODEL_REPO:-}"
+STAGE5_MAX_CALIBRATION_SAMPLES="${STAGE5_MAX_CALIBRATION_SAMPLES:-}"
+STAGE5_MAX_SEQUENCE_LENGTH="${STAGE5_MAX_SEQUENCE_LENGTH:-}"
 
 export HF_HOME="${HF_HOME:-$CACHE_MOUNT/hf}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
@@ -58,6 +64,9 @@ log "ONLY              = ${ONLY:-(all 12)}"
 log "PREFLIGHT_ONLY    = $PREFLIGHT_ONLY"
 log "UPLOAD_ON_SUCCESS = $UPLOAD_ON_SUCCESS"
 log "TRACKIO_SPACE_ID  = $TRACKIO_SPACE_ID"
+log "TEACHER_MODEL_REPO= ${TEACHER_MODEL_REPO:-(default BF16 from config.model)}"
+log "STAGE5_MAX_CAL_SS = ${STAGE5_MAX_CALIBRATION_SAMPLES:-(config default)}"
+log "STAGE5_MAX_SEQ_LN = ${STAGE5_MAX_SEQUENCE_LENGTH:-(config default)}"
 
 # vast.ai's /.launch writes authorized_keys with group/world-writable permissions,
 # which sshd rejects under StrictModes yes (the default). Fix early so SSH works
@@ -203,6 +212,17 @@ if [[ -n "$ONLY" ]]; then
 fi
 if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
     ARGS+=("--preflight-only")
+fi
+# Stage 5 VRAM-reduction levers — opt-in. Each only adds to ARGS if set;
+# unset = harness reads the config default (BF16 teacher, full calibration).
+if [[ -n "$TEACHER_MODEL_REPO" ]]; then
+    ARGS+=("--teacher-model-repo" "$TEACHER_MODEL_REPO")
+fi
+if [[ -n "$STAGE5_MAX_CALIBRATION_SAMPLES" ]]; then
+    ARGS+=("--stage5-max-calibration-samples" "$STAGE5_MAX_CALIBRATION_SAMPLES")
+fi
+if [[ -n "$STAGE5_MAX_SEQUENCE_LENGTH" ]]; then
+    ARGS+=("--stage5-max-sequence-length" "$STAGE5_MAX_SEQUENCE_LENGTH")
 fi
 
 log "Command: python -m moe_compress.run_ablations ${ARGS[*]}"

@@ -144,6 +144,9 @@ then destroy.
 | `HF_ARTIFACTS_BUCKET` | `pirola/moe-ablations` | Bucket to receive `_shared/`, `*/stage6_eval.json`, `_summary.json` |
 | `UPLOAD_ON_SUCCESS` | `0` | If `1`, push the artifact subset to `HF_ARTIFACTS_BUCKET` after a clean run |
 | `DESTROY_HINT` | `vastai destroy instance $VAST_CONTAINERLABEL` | Final-line hint for the operator |
+| `TEACHER_MODEL_REPO` | _(empty)_ | Lever (a): override `stage5_router_kd.teacher_model_repo` (e.g. `Qwen/Qwen3.6-35B-A3B-FP8`) to fit Stage 2.5 on H200. Empty = default BF16 teacher. |
+| `STAGE5_MAX_CALIBRATION_SAMPLES` | _(empty)_ | Lever (b): override `stage5_router_kd.max_calibration_samples`. Smaller = lower Stage 2.5 activation peak. Empty = config default. |
+| `STAGE5_MAX_SEQUENCE_LENGTH` | _(empty)_ | Lever (b): override `stage5_router_kd.max_sequence_length`. Shorter = lower peak. Empty = config default. |
 
 ---
 
