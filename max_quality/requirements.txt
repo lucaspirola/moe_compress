@@ -16,6 +16,11 @@ safetensors>=0.4.5
 tokenizers>=0.20.0
 sentencepiece>=0.2.0
 einops>=0.8.0
+# Required by transformers.integrations.finegrained_fp8 (block_size=128 FP8
+# quant) when loading Qwen3.6-35B-A3B-FP8 as the Stage 2.5 KD teacher.
+# Without this, the first forward pass through an FP8 linear layer raises
+# ImportError("finegrained-fp8 kernel requires the `kernels` package").
+kernels>=0.14.0
 
 # --- Hugging Face plumbing ---
 huggingface_hub>=0.26.0
