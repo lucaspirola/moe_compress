@@ -192,14 +192,22 @@ class RouterReplayContextManager:
     def _capture_hook(
         self, _module: nn.Module, _inputs: object, output: object
     ) -> object:
-        """Record the router's output. Returns ``output`` unchanged."""
+        """Record the router's output. Returns ``output`` unchanged.
+
+        Stores `output.detach()` (a view, not a copy). The teacher's forward
+        runs under `torch.no_grad()` and the routers are plain `nn.Linear`
+        invocations — neither path mutates the captured tensor in-place,
+        so the `.clone()` previously here was a redundant memcpy of every
+        router's `(B*T, n_experts)` output per micro. Dropping it removes
+        a non-trivial host-bound copy on the hot path.
+        """
         if isinstance(output, torch.Tensor):
-            self._captured.append(output.detach().clone())
+            self._captured.append(output.detach())
         elif isinstance(output, tuple) and output and isinstance(output[0], torch.Tensor):
             # Many HF routers return ``(logits, top_k_indices, ...)`` — capture
             # element 0 (router_logits) so the replay drives the student's
             # downstream gating math from the same logits.
-            self._captured.append(output[0].detach().clone())
+            self._captured.append(output[0].detach())
         else:
             # Unsupported shape: keep index alignment with a `None` placeholder.
             self._captured.append(None)
