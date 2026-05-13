@@ -31,6 +31,19 @@ import os
 # needed once this env var is set before torch's CUDA initialization.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# Disable inductor's GEMM autotuner BEFORE torch imports. torch 2.11.0+cu130's
+# `torch._grouped_mm` routes through inductor autotune on dynamic group-size
+# signatures; with the Qwen3.6-35B-A3B MoE Stage 2 REAP profile (active-experts
+# cardinality changes once merging starts at layer 12), the autotuner deadlocks
+# — main thread hangs 2 min, faulthandler dump fingers `torch/nn/functional.py
+# in grouped_mm`, then SIGSEGV. Reproduced on H200 SXM5 (driver 580.126.09) AND
+# B200 (590.48.01) on the cu130 image; the prior cu128 wheel did not autotune
+# this op so it worked. Disabling autotune keeps the same kernel at the same
+# cuBLASLt-13 grouped-GEMM speed (no compromise) — only the autotune layer is
+# turned off. See pytorch/pytorch issues #158042, #159378, #156202.
+os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM", "0")
+os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0")
+
 import argparse
 import copy
 import faulthandler
