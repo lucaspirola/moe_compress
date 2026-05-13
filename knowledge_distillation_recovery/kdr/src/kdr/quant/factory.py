@@ -316,10 +316,18 @@ def _make_calibrate_loop(
     def calibrate_loop(model: nn.Module) -> None:
         was_training = model.training
         model.eval()
+        # REQ: LLR-0060
+        # Resolve the model device from a live parameter — under ZeRO-3
+        # the rank-local parameter is on the current GPU; under DDP the
+        # wrapped model's first parameter is on the local device; under
+        # no distribution the model has a uniform device. Each batch is
+        # moved to that device before forward, so the loop works whether
+        # the caller has placed the model on CPU or GPU (HLR-0018).
+        device = next(model.parameters()).device
         try:
             with torch.no_grad():
                 for batch in subset:
-                    model(input_ids=batch)
+                    model(input_ids=batch.to(device))
         finally:
             if was_training:
                 model.train()

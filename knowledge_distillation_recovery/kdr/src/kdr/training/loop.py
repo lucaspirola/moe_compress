@@ -116,6 +116,19 @@ def run_recovery(
                 raise ValueError(
                     "Config.quant is required in da_qad mode (HLR-0003)."
                 )
+            # REQ: LLR-0060
+            # Place the student on the trainer's device BEFORE
+            # `partition_and_dispatch` so ModelOpt's `mtq.quantize`
+            # calibrate_forward_loop runs on GPU. Under DeepSpeed
+            # ZeRO-3, `activate_zero3_init` has already partitioned the
+            # model across ranks — an explicit `.to(device)` would
+            # un-partition it. Under DDP / single-GPU non-DS,
+            # `accelerator.prepare` (Stage 2) is the canonical device
+            # move, but Stage 2 runs after this dispatch; without this
+            # pre-move the entire calibration runs on CPU (verified
+            # live on Datacrunch B200 instance abb84d58, HLR-0018).
+            if not is_deepspeed(accelerator):
+                student = student.to(accelerator.device)
             # Phase 4 implementation: real dispatch with calibration batches
             # and adapter-supplied carve-outs / attention paths.
             from ..quant.factory import partition_and_dispatch
