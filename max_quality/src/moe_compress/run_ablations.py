@@ -44,6 +44,22 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM", "0")
 os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0")
 
+# Disable persistent FX-graph + AOTAutograd caches BEFORE torch imports.
+# Symptom (reproduced 2026-05-14, H200 SXM5, torch 2.11.0+cu130, Stage 2.5
+# router KD with `torch.compile(student, mode='default')`): clean training
+# for 100-200 optimizer steps, then SIGSEGV in either
+# `_aot_autograd/runtime_wrappers.py:2735 impl_fn` (compiled backward) or
+# `triton/runtime/autotuner.py:252 → jit.py:744` (autotune re-entry on a
+# stale cached kernel). Same failure class as pytorch/pytorch#144609 —
+# Inductor's persistent FX-graph cache reuses serialized compiled-backward
+# artifacts whose CUDA device handles get invalidated between autograd
+# buffer releases, producing non-deterministic segfaults at autograd-
+# engine re-invocation. NO speed compromise — torch.compile stays ON, the
+# in-process kernel cache stays hot, only the persistent on-disk artifact
+# cache is bypassed.
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "0")
+os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
+
 import argparse
 import copy
 import faulthandler
