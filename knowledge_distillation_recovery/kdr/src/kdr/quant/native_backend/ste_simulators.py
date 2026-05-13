@@ -1,4 +1,4 @@
-"""Straight-through-estimator quant simulators (LLR-0015, LLR-0045).
+"""Straight-through-estimator quant simulators (LLR-0015).
 
 Pure functions, each accepting an fp32/bf16 input tensor and returning a
 fake-quantized tensor whose forward equals the dequant-quant snap and whose
@@ -34,7 +34,6 @@ intentional and should NOT be normalised by switching either side.
 """
 
 # REQ: LLR-0015
-# REQ: LLR-0045
 
 from __future__ import annotations
 

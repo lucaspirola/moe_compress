@@ -1,9 +1,0 @@
-project = "kdr — Knowledge Distillation Recovery"
-source_dirs = [
-    "kdr/src",
-    "kdr/tests",
-]
-requirements_dir = "requirements"
-default_adapter = "markdown"
-
-[profiles]

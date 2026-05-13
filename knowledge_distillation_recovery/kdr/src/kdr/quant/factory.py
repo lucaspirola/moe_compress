@@ -20,6 +20,7 @@ calibration tensor and adapter info; ``training/loop.py``'s ``da_qad``
 branch passes them.
 """
 
+# REQ: LLR-0013
 # REQ: LLR-0017
 # REQ: LLR-0042
 

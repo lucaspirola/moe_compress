@@ -5,6 +5,8 @@ The single `apply_quant` method shape preserves the "exactly one
 the factory to mix backends per quantizer.
 """
 
+# REQ: LLR-0013
+
 from __future__ import annotations
 
 from pathlib import Path

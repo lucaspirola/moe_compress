@@ -16,6 +16,7 @@ the rename. Resume logic SHALL ignore dirs lacking it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -31,7 +32,12 @@ from transformers import PreTrainedTokenizerBase
 from ..config import QuantBlock
 from ..modes import Mode
 from ..quant.interface import QuantBackend
-from ..quant.specs import KVQuantSpec, MixedWeightSpec, WeightQuantSpec
+from ..quant.specs import (
+    KVQuantSpec,
+    MixedWeightSpec,
+    UniformWeightSpec,
+    WeightPatternSpec,
+)
 
 log = logging.getLogger(__name__)
 
@@ -167,11 +173,9 @@ def _reset_async_save_executor() -> None:
     failures. A leaked exception from the prior test must not break the
     next test's setup phase.
     """
-    global _ASYNC_SAVE  # noqa: PLW0603 — module-global is the contract
-    try:
+    global _ASYNC_SAVE
+    with contextlib.suppress(BaseException):
         _ASYNC_SAVE.shutdown()
-    except BaseException:  # noqa: BLE001 — see docstring: teardown swallows.
-        pass
     _ASYNC_SAVE = _AsyncSaveExecutor()
 
 
@@ -342,7 +346,7 @@ def _write_partial_dir(
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True)
 
-    unwrapped.save_pretrained(
+    unwrapped.save_pretrained(  # type: ignore[operator]
         tmp_dir, state_dict=state_dict, safe_serialization=True
     )
     if tokenizer is not None:
@@ -379,6 +383,7 @@ def _write_partial_dir(
 # REQ: LLR-0018
 # REQ: LLR-0019
 # REQ: LLR-0020
+# REQ: LLR-0056
 def save_kdr_artifact(
     model: nn.Module,
     output_dir: Path,
@@ -537,20 +542,25 @@ def _build_quantization_config(
             "ignore": [<fp32 carve-out patterns>],
         }
     """
-    if isinstance(quant_block.weight, MixedWeightSpec):
-        raise NotImplementedError(
-            "save_kdr_artifact's quantization_config emission for MixedWeightSpec "
-            "lands in Phase 7.2 Task 6."
-        )
-    return {
-        "quant_method": "compressed-tensors",
-        "config_groups": {
+    w = quant_block.weight
+    if isinstance(w, UniformWeightSpec):
+        config_groups: dict[str, Any] = {
             "group_0": {
-                "weights": _weight_spec_to_ct(quant_block.weight),
+                "weights": _weight_spec_to_ct(w),
                 "input_activations": None,
                 "targets": ["Linear"],
             },
-        },
+        }
+    elif isinstance(w, MixedWeightSpec):
+        config_groups = _build_mixed_config_groups(w.spec_map)
+    else:
+        raise ValueError(
+            f"_build_quantization_config: unexpected weight type "
+            f"{type(w).__name__!r}; expected UniformWeightSpec or MixedWeightSpec"
+        )
+    return {
+        "quant_method": "compressed-tensors",
+        "config_groups": config_groups,
         "kv_cache_scheme": {
             "key": _kv_spec_to_ct(quant_block.kv_quant.key),
             "value": _kv_spec_to_ct(quant_block.kv_quant.value),
@@ -559,8 +569,39 @@ def _build_quantization_config(
     }
 
 
-def _weight_spec_to_ct(spec: WeightQuantSpec) -> dict[str, Any]:
-    """Translate kdr's ``WeightQuantSpec`` to a compressed-tensors-shaped dict."""
+def _build_mixed_config_groups(
+    spec_map: list[WeightPatternSpec],
+) -> dict[str, Any]:
+    """Group spec_map entries by (format, bits, granularity) triple.
+
+    Insertion order preserves the user's spec_map declaration order across
+    groups; within a group, ``targets`` lists patterns in declaration
+    order. The first spec in each group serializes via
+    ``_weight_spec_to_ct`` — recipe-equivalence guarantees any spec in
+    the group produces an identical ``weights`` dict.
+    """
+    groups: dict[tuple[str, int, str], list[WeightPatternSpec]] = {}
+    for spec in spec_map:
+        key = (spec.format, spec.bits, spec.granularity)
+        groups.setdefault(key, []).append(spec)
+    return {
+        f"group_{idx}": {
+            "weights": _weight_spec_to_ct(specs[0]),
+            "input_activations": None,
+            "targets": [s.pattern for s in specs],
+        }
+        for idx, (_key, specs) in enumerate(groups.items())
+    }
+
+
+def _weight_spec_to_ct(
+    spec: UniformWeightSpec | WeightPatternSpec,
+) -> dict[str, Any]:
+    """Translate a kdr weight spec to a compressed-tensors-shaped dict.
+
+    Accepts both the Uniform shape and the per-pattern shape — both
+    expose ``bits``, ``format``, ``granularity``.
+    """
     return {
         "num_bits": spec.bits,
         "type": _format_to_ct_type(spec.format),

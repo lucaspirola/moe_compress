@@ -1,10 +1,13 @@
-"""Top-level YAML config models for kdr (LLR-0006, LLR-0011, LLR-0041, LLR-0049).
+"""Top-level YAML config models for kdr (LLR-0006, LLR-0010, LLR-0011, LLR-0041, LLR-0049).
 
 Loading a kdr YAML through `Config.model_validate(yaml.safe_load(...))` either
 returns a fully-typed `Config` instance or raises a Pydantic `ValidationError`
 with a precise field path. There is no silent coercion and no silent extra
 field acceptance — see HLR-0012.
 """
+
+# REQ: LLR-0010
+# REQ: LLR-0011
 
 from __future__ import annotations
 

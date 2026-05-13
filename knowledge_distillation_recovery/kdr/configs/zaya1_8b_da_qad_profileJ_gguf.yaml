@@ -1,0 +1,142 @@
+# kdr — ZAYA1-8B `da_qad` mode, Profile-J mixed-precision GGUF recovery.
+#
+# Phase 7.2 deployment-target recipe (HLR-0016 / LLR-0058). The spec_map
+# patterns target ZAYA1's *actual* module names (Megatron-style fused),
+# not canonical-HF names. Mapping from Profile-J's design intent:
+#
+#   gate+up (fused as linear_fc1; experts)  → IQ2_XS  (2.3125 bpw)
+#   down   (linear_fc2; experts)             → Q3_K    (3.4375 bpw)
+#   q / k attention (linear_q / linear_k)    → IQ4_XS  (4.25   bpw)
+#   o attention (o_proj)                     → IQ4_XS  (4.25   bpw)
+#   embed_tokens / lm_head (tied)            → Q5_K    (5.5    bpw)
+#
+# Modules left at F16 via the ZAYA1 adapter's `fp32_carve_outs` list
+# (LLR-0057):
+#
+#   - `val_proj` substring: CCA value projections
+#                           (`self_attn.qkv.val_proj{1,2}`) — F16
+#                           per Profile-J intent.
+#   - `router` substring:   routing softmax tree
+#                           (`zaya_block.router`, `router.down_proj`,
+#                           `router.rmsnorm_eda`).
+#   - `norm` substring:     RMSNorms / LayerNorms.
+#
+# Estimated on-disk size: ~3.25 GB for ZAYA1-8B (8.84B params; tied
+# embed/lm_head share storage). Target hardware: GTX 1050 Mobile
+# (sm_6.1) loading the resulting `.gguf` under llama.cpp at usable
+# context length.
+#
+# Runtime-only KV quant: during training the simulator uses INT4 K
+# (per-channel) + INT4 V (per-token) — the KIVI scheme from the
+# NVFP4 reference config. At llama.cpp inference time, pass
+# `-ctk q4_0 -ctv q4_0` for symmetric INT4 KV cache (TurboQuant
+# K=3/V=2 is deferred until ggml-org/llama.cpp#20969 lands).
+#
+# Run command (vast.ai): bootstrap.sh with
+# `KDR_CONFIG=zaya1_8b_da_qad_profileJ_gguf.yaml` on 1× H200 or
+# 4× A100-80GB.
+
+mode: da_qad
+
+teacher:
+  name_or_path: Zyphra/ZAYA1-reasoning-base
+  revision: main
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+student:
+  source: Zyphra/ZAYA1-reasoning-base   # self-distillation
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+calibration:
+  source: nvidia-cascade
+  dataset: nvidia/Nemotron-Cascade-2-SFT-Data
+  seed: 1337
+  num_sequences: 13000
+  sequence_length: 4096
+  subset_weights:
+    math: 0.21
+    science: 0.11
+    chat: 0.56
+    instruction_following: 0.033
+    conversational_agent: 0.0331
+    swe: 0.02
+    terminal_agent: 0.0331
+  ptq_subset_size: 256
+
+quant:
+  weight:
+    spec_map:
+      - pattern: linear_fc1    # MoE expert gate+up (fused)
+        bits: 2
+        format: iq2_xs
+        granularity: block
+        transform: none
+      - pattern: linear_fc2    # MoE expert down
+        bits: 3
+        format: q3_k
+        granularity: block
+        transform: none
+      - pattern: linear_q      # attention query (CCA)
+        bits: 4
+        format: iq4_xs
+        granularity: block
+        transform: none
+      - pattern: linear_k      # attention key (CCA)
+        bits: 4
+        format: iq4_xs
+        granularity: block
+        transform: none
+      - pattern: o_proj        # attention output
+        bits: 4
+        format: iq4_xs
+        granularity: block
+        transform: none
+      - pattern: embed_tokens  # input embedding (tied with lm_head)
+        bits: 5
+        format: q5_k
+        granularity: block
+        transform: none
+      - pattern: lm_head       # output projection (tied with embed_tokens)
+        bits: 5
+        format: q5_k
+        granularity: block
+        transform: none
+  kv_quant:
+    key:
+      bits: 4
+      format: int
+      granularity: channel  # KIVI: K per-channel
+      transform: none
+    value:
+      bits: 4
+      format: int
+      granularity: token    # KIVI: V per-token
+      transform: none
+
+distillation:
+  loss: forward_kld
+  temperature: 1.0
+  optimizer: adamw_bnb_8bit
+  learning_rate: 2.0e-4
+  min_learning_rate: 4.5e-7
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  grad_clip_norm: 1.0
+  warmup_steps: 20
+  total_tokens: 50_000_000
+  per_device_batch_size: 1
+  gradient_accumulation: 32
+  sequence_length: 4096
+  log_every_n_steps: 5
+  eval_every_n_steps: 50
+  save_every_n_steps: 0
+  trainable_scope: full
+  use_gradient_checkpointing: true
+
+eval:
+  wikitext2:
+    enabled: true
+    sequence_length: 2048
+    num_sequences: 64

@@ -117,8 +117,8 @@ class Zaya1Adapter:
         # decoding (do_sample=False) and unblocks save_partial / final save
         # without altering inference behavior on the published checkpoint.
         if getattr(student, "generation_config", None) is not None:
-            student.generation_config.top_p = None
-            student.generation_config.top_k = None
+            student.generation_config.top_p = None  # type: ignore[union-attr]
+            student.generation_config.top_k = None  # type: ignore[union-attr]
 
         tokenizer = AutoTokenizer.from_pretrained(
             student_cfg.source, trust_remote_code=True
@@ -312,6 +312,7 @@ class Zaya1Adapter:
         return []
 
     # REQ: LLR-0024
+    # REQ: LLR-0057
     def fp32_carve_outs(self, model: nn.Module) -> list[str]:
         """ZAYA1 §IV-D FP32 carve-out list.
 
@@ -326,9 +327,13 @@ class Zaya1Adapter:
             ``moe.router`` / ``router_layer`` / similar variants)
           * ``norm``         — RMSNorm (matches ``rmsnorm``, ``input_norm``,
             ``post_attention_layernorm``, etc.)
-          * ``cca_cache``    — CCA cache state (ZAYA1-specific buffer)
           * ``embed_tokens`` — input token embedding (high-precision matmul,
             shares the LM-head's numerical sensitivity at the vocab tail)
+          * ``val_proj``     — CCA value projections
+            (``self_attn.qkv.val_proj{1,2}``) — kept at F16 per Profile-J
+            intent: ZAYA1's CCA "downprojector" path is implemented as
+            two small value Linears, highly sensitive to quantization
+            noise. LLR-0057.
 
         Residual additions are NOT carved out by module name — they are
         tensor ``+`` operations inside layer forwards, not standalone
@@ -342,7 +347,7 @@ class Zaya1Adapter:
         """
         del model  # Patterns are substring-based; no per-instance inspection needed.
         # REQ: LLR-0024
-        return ["lm_head", "embed_tokens", "router", "norm", "cca_cache"]
+        return ["lm_head", "embed_tokens", "router", "norm", "val_proj"]
 
     # REQ: LLR-0026
     def required_attn_implementation(self, mode: Mode) -> Literal["eager", "sdpa"]:

@@ -5,6 +5,8 @@ The single binary mode flag controlling whether kdr runs Chapter-1 BF16 KD only
 property of the YAML's `quant` block, not the mode.
 """
 
+# REQ: LLR-0006
+
 from typing import Literal
 
 Mode = Literal["bf16", "da_qad"]

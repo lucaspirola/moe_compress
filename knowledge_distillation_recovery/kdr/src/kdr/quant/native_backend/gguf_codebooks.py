@@ -1,14 +1,10 @@
-"""GGUF codebook constants for Phase 7.2 STE simulators (LLR-0045).
+"""GGUF codebook constants for Phase 7.2 STE simulators (LLR-0053).
 
 Codebook tables used by the IQ-family STE simulators in
 :mod:`.ste_simulators` (IQ2_XS magnitudes + signs; IQ4_XS / IQ4_NL 4-bit
 signed levels). The values are transcribed verbatim from llama.cpp's
 ``ggml/src/ggml-common.h`` — invented values would silently produce a
 quant that does not load through ggml's reference decoder.
-
-REQ: LLR-0045 (Phase 7.2 Task 4)
-TODO(L1): verify LLR-0045 exists in the requirements registry; if not,
-introduce it as part of the Phase 7.2 documentation pass.
 
 Upstream reference
 ------------------
@@ -27,6 +23,8 @@ A copy of the upstream MIT license / SPDX header should accompany this
 file via kdr's ``pyproject.toml`` license declaration; this header is the
 audit trail for which commit's constants are in use.
 """
+
+# REQ: LLR-0053
 
 from __future__ import annotations
 
