@@ -53,6 +53,34 @@ from .gguf_codebooks import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def int_quant_snap(x: torch.Tensor, bits: int, *, axis: int) -> torch.Tensor:
+    """Symmetric integer fake-quant snap — no STE autograd wrap.
+
+    Returns the snapped tensor in ``x.dtype``, detached from autograd.
+    The companion :func:`int_quant_ste` reconstructs the STE result via
+    ``x + (snap - x).detach()``; callers that want to cache the snap
+    (e.g. across micros within one optimizer step) should use this
+    helper directly.
+    """
+    if bits < 2 or bits > 8:
+        raise ValueError(f"bits must be in [2, 8]; got {bits}")
+    if x.ndim == 0:
+        raise ValueError("int_quant_snap requires at least a 1-D tensor")
+
+    qmax = 2 ** (bits - 1) - 1
+    qmin = -(2 ** (bits - 1))
+
+    axis_pos = axis % x.ndim
+    reduce_axes = tuple(i for i in range(x.ndim) if i != axis_pos)
+
+    x_d = x.detach()
+    abs_max = x_d.abs().amax(dim=reduce_axes, keepdim=True)
+    eps = torch.finfo(x.dtype).tiny
+    scale = (abs_max / qmax).clamp(min=eps)
+    q = torch.clamp(torch.round(x_d / scale), min=qmin, max=qmax)
+    return cast(torch.Tensor, q * scale)
+
+
 def int_quant_ste(x: torch.Tensor, bits: int, *, axis: int) -> torch.Tensor:
     """Symmetric integer fake-quantization with straight-through gradient.
 
@@ -73,27 +101,7 @@ def int_quant_ste(x: torch.Tensor, bits: int, *, axis: int) -> torch.Tensor:
     Raises:
         ValueError: if ``bits`` is outside [2, 8] or ``x.ndim == 0``.
     """
-    if bits < 2 or bits > 8:
-        raise ValueError(f"bits must be in [2, 8]; got {bits}")
-    if x.ndim == 0:
-        raise ValueError("int_quant_ste requires at least a 1-D tensor")
-
-    qmax = 2 ** (bits - 1) - 1
-    qmin = -(2 ** (bits - 1))
-
-    axis_pos = axis % x.ndim
-    reduce_axes = tuple(i for i in range(x.ndim) if i != axis_pos)
-
-    # Per-slice abs-max → per-slice scale. `keepdim=True` preserves broadcasting.
-    # `.detach()` keeps the scale out of the autograd graph (it's data-derived
-    # but not a learnable parameter).
-    abs_max = x.detach().abs().amax(dim=reduce_axes, keepdim=True)
-    eps = torch.finfo(x.dtype).tiny
-    scale = (abs_max / qmax).clamp(min=eps)
-
-    q = torch.clamp(torch.round(x / scale), min=qmin, max=qmax)
-    x_q = q * scale
-
+    x_q = int_quant_snap(x, bits, axis=axis)
     # STE: forward == x_q (by construction), backward == identity over x.
     # `(x_q - x).detach()` has zero gradient → ∂(x + (x_q - x).detach())/∂x = 1.
     return cast(torch.Tensor, x + (x_q - x).detach())
@@ -255,18 +263,32 @@ def _block_quantize(
     return snapped.permute(inv_perm).contiguous()
 
 
+def _ste_snap(
+    x: torch.Tensor, snap_fn: Callable[[torch.Tensor], torch.Tensor]
+) -> torch.Tensor:
+    """Snap-only helper: returns the snapped tensor in ``x.dtype``,
+    detached from autograd. Use this when you intend to cache the snap
+    (e.g. across micros within one optimizer step) — the companion STE
+    formula ``x + (snap - x).detach()`` can then be reconstructed per
+    forward call from a cached ``snap``.
+
+    Runs ``snap_fn`` in fp32 regardless of input dtype (codebook
+    constants are integers cast to fp32; the snap reduction is stable
+    in fp32). Result is cast back to ``x.dtype`` at the end.
+    """
+    snapped_fp32 = snap_fn(x.detach().float())
+    return snapped_fp32.to(x.dtype)
+
+
 def _ste_wrap(
     x: torch.Tensor, snap_fn: Callable[[torch.Tensor], torch.Tensor]
 ) -> torch.Tensor:
     """Common STE wrapper: forward = snap, backward = identity over ``x``.
 
-    Runs ``snap_fn`` in fp32 regardless of input dtype (the codebook
-    constants are integers cast to fp32; doing the snap in fp32 keeps the
-    reduction stable). The result is cast back to ``x.dtype`` at the very
-    end.
+    Equivalent to ``x + (_ste_snap(x, snap_fn) - x).detach()`` — kept as a
+    thin wrapper for caller ergonomics where caching is not required.
     """
-    snapped_fp32 = snap_fn(x.detach().float())
-    snapped = snapped_fp32.to(x.dtype)
+    snapped = _ste_snap(x, snap_fn)
     return x + (snapped - x).detach()
 
 
@@ -387,6 +409,17 @@ def _iq2xs_snap_block(super_blocks: torch.Tensor) -> torch.Tensor:
     return snapped.view(*lead, -1, _GGUF_SUPER_BLOCK)
 
 
+def iq2_xs_quant_snap(x: torch.Tensor, *, axis: int = -1) -> torch.Tensor:
+    """IQ2_XS snap-only (see :func:`_ste_snap` for the caching rationale)."""
+    return _ste_snap(
+        x,
+        lambda x_fp32: _block_quantize(
+            x_fp32, axis=axis, super_block_size=_GGUF_SUPER_BLOCK,
+            quant_fn=_iq2xs_snap_block,
+        ),
+    )
+
+
 def iq2_xs_quant_ste(x: torch.Tensor, *, axis: int = -1) -> torch.Tensor:
     """IQ2_XS (2.3125 bpw) codebook STE simulator.
 
@@ -466,6 +499,17 @@ def _q3k_snap_block(super_blocks: torch.Tensor) -> torch.Tensor:
     snapped_sub = q * sub_scale
 
     return snapped_sub.view(*lead, -1, _GGUF_SUPER_BLOCK)
+
+
+def q3_k_quant_snap(x: torch.Tensor, *, axis: int = -1) -> torch.Tensor:
+    """Q3_K snap-only (see :func:`_ste_snap` for the caching rationale)."""
+    return _ste_snap(
+        x,
+        lambda x_fp32: _block_quantize(
+            x_fp32, axis=axis, super_block_size=_GGUF_SUPER_BLOCK,
+            quant_fn=_q3k_snap_block,
+        ),
+    )
 
 
 def q3_k_quant_ste(x: torch.Tensor, *, axis: int = -1) -> torch.Tensor:
@@ -556,6 +600,17 @@ def _iq4xs_snap_block(super_blocks: torch.Tensor) -> torch.Tensor:
     return snapped_sub.view(*lead, -1, _GGUF_SUPER_BLOCK)
 
 
+def iq4_xs_quant_snap(x: torch.Tensor, *, axis: int = -1) -> torch.Tensor:
+    """IQ4_XS snap-only (see :func:`_ste_snap` for the caching rationale)."""
+    return _ste_snap(
+        x,
+        lambda x_fp32: _block_quantize(
+            x_fp32, axis=axis, super_block_size=_GGUF_SUPER_BLOCK,
+            quant_fn=_iq4xs_snap_block,
+        ),
+    )
+
+
 def iq4_xs_quant_ste(x: torch.Tensor, *, axis: int = -1) -> torch.Tensor:
     """IQ4_XS (4.25 bpw) codebook STE simulator.
 
@@ -624,6 +679,17 @@ def _q5k_snap_block(super_blocks: torch.Tensor) -> torch.Tensor:
     snapped_sub = sub_scale * q + sub_min
 
     return snapped_sub.view(*lead, -1, _GGUF_SUPER_BLOCK)
+
+
+def q5_k_quant_snap(x: torch.Tensor, *, axis: int = -1) -> torch.Tensor:
+    """Q5_K snap-only (see :func:`_ste_snap` for the caching rationale)."""
+    return _ste_snap(
+        x,
+        lambda x_fp32: _block_quantize(
+            x_fp32, axis=axis, super_block_size=_GGUF_SUPER_BLOCK,
+            quant_fn=_q5k_snap_block,
+        ),
+    )
 
 
 def q5_k_quant_ste(x: torch.Tensor, *, axis: int = -1) -> torch.Tensor:
