@@ -60,6 +60,23 @@ os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0")
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "0")
 os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
 
+# Inductor's compile_worker uses `fork` by default — on a process that has
+# already initialised CUDA + multithreaded native libs (BLAS, OpenMP), this
+# is undefined behaviour and causes random SIGSEGV in the child during
+# compilation. Stage 6 (eval-only with torch.compile(dynamic=True)) hit this
+# every ~5-10 min during lm_eval's task-rotation (each new task triggers
+# fresh compile jobs at runtime, long after CUDA was already up). Switching
+# the worker startup to `spawn` and serialising compile threads is the
+# supported escape hatch (pytorch/pytorch#148651). Zero speed cost — only
+# the compiler's process topology changes; compiled kernel output is
+# byte-identical, and runtime execution is unaffected. Also bump the
+# Dynamo recompile/cache ceiling so dynamic-shape eval doesn't fall back
+# to eager mid-run when the default 8-entry cache fills up.
+os.environ.setdefault("TORCHINDUCTOR_WORKER_START", "spawn")
+os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+os.environ.setdefault("TORCHDYNAMO_CACHE_SIZE_LIMIT", "512")
+os.environ.setdefault("TORCHDYNAMO_RECOMPILE_LIMIT", "512")
+
 import argparse
 import copy
 import faulthandler
