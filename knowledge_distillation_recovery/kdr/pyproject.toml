@@ -29,7 +29,7 @@ dev = [
 ]
 modelopt = ["nvidia-modelopt>=0.21.0"]
 deepspeed = ["deepspeed>=0.15.0"]
-bnb = ["bitsandbytes>=0.44.0"]
+bnb = ["bitsandbytes>=0.49.2"]
 compressed = ["compressed-tensors>=0.7.0"]
 
 [project.scripts]
