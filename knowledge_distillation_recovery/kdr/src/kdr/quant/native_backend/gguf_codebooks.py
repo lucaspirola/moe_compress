@@ -238,12 +238,15 @@ def get_iq2xs_grid(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     cached = _IQ2XS_GRID_CACHE.get(key)
     if cached is not None:
         return cached
-    # Unpack each uint64 into 8 little-endian bytes.
-    flat: list[int] = []
-    for val in IQ2XS_GRID_RAW:
-        for i in range(8):
-            flat.append((val >> (i * 8)) & 0xff)
-    tensor = torch.tensor(flat, dtype=dtype, device=device).view(512, 8)
+    # REQ: LLR-0063
+    # Vectorised byte-unpack: each uint64 entry produces 8 little-endian
+    # bytes via right-shift + mask, broadcast over a shifts arange. Single
+    # H2D for the raw constants, one bitwise op for the unpack; replaces
+    # the prior CPU-side Python loop + per-call list materialisation.
+    raw = torch.tensor(IQ2XS_GRID_RAW, dtype=torch.int64, device=device)
+    shifts = torch.arange(8, device=device, dtype=torch.int64) * 8
+    unpacked = (raw.unsqueeze(-1) >> shifts) & 0xFF
+    tensor = unpacked.to(dtype)
     _IQ2XS_GRID_CACHE[key] = tensor
     return tensor
 
@@ -259,10 +262,13 @@ def get_ksigns_iq2xs(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     cached = _KSIGNS_IQ2XS_CACHE.get(key)
     if cached is not None:
         return cached
-    expanded: list[list[float]] = []
-    for bits in KSIGNS_IQ2XS:
-        row = [-1.0 if (bits >> i) & 1 else 1.0 for i in range(8)]
-        expanded.append(row)
-    tensor = torch.tensor(expanded, dtype=dtype, device=device)
+    # REQ: LLR-0063
+    # Vectorised bit-unpack: bit j of byte i (j in 0..7) becomes -1.0
+    # when set, +1.0 when clear (ggml's even-parity sign convention).
+    # 1 - 2*bit_set maps {0,1} -> {1,-1} matching the Python-loop form.
+    raw = torch.tensor(KSIGNS_IQ2XS, dtype=torch.int64, device=device)
+    shifts = torch.arange(8, device=device, dtype=torch.int64)
+    bit_set = (raw.unsqueeze(-1) >> shifts) & 1
+    tensor = (1 - 2 * bit_set).to(dtype)
     _KSIGNS_IQ2XS_CACHE[key] = tensor
     return tensor
