@@ -419,6 +419,38 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path,
             "Cannot resume from stage 3: neither stage2p5_final/ nor stage2_pruned/ "
             f"exists under {artifacts_dir}. Run stages 1–2.5 first."
         )
+
+    # Stage 6's nominal predecessor is stage5_final (final Router KD output).
+    # In the ablation harness path (run_ablations.py), the pipeline skips
+    # Stages 3-5 and goes Stage 2 → Stage 2.5 → Stage 6 directly — so
+    # stage5_final/ never gets written and Stage 6 must load from
+    # stage2p5_final/ instead. Mirror the Stage 3 fallback pattern: prefer
+    # stage5_final/ when it exists (full pipeline path), else fall back to
+    # stage2p5_final/ (ablation harness path), else hard-fail.
+    if stage == 6:
+        for candidate in ("stage5_final", "stage2p5_final"):
+            prev_path = artifacts_dir / candidate
+            if prev_path.exists():
+                if candidate == "stage2p5_final":
+                    log.info(
+                        "Loading stage 6 input from %s — stage5_final/ not found "
+                        "(typical ablation harness path: Stage 2 → 2.5 → 6, skipping 3-5).",
+                        prev_path,
+                    )
+                else:
+                    log.info("Loading stage 6 input from %s", prev_path)
+                model, tokenizer, _ = load_compressed_model(
+                    prev_path,
+                    device_map=config["model"]["device_map"],
+                    torch_dtype=config["model"]["torch_dtype"],
+                    attn_implementation=student_attn,
+                )
+                return model, tokenizer
+        raise FileNotFoundError(
+            "Cannot resume from stage 6: neither stage5_final/ nor stage2p5_final/ "
+            f"exists under {artifacts_dir}. Run stages 1–2.5 (ablation) or 1–5 "
+            "(full pipeline) first."
+        )
     prev_dir_name = STAGE_REGISTRY[stage][1]
     prev_path = artifacts_dir / prev_dir_name
     if not prev_path.exists():
