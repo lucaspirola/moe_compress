@@ -29,6 +29,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any, get_args
 
@@ -44,6 +45,71 @@ from ..modes import Mode
 from ..training.loop import run_recovery
 
 log = logging.getLogger(__name__)
+
+
+def _install_jit_monitor() -> None:
+    """Wrap torch's CUDA-extension loader so every JIT compile prints
+    start/finish lines with wall-clock time.
+
+    Without this, modelopt's `modelopt_cuda_ext` (and any other cpp/CUDA
+    extension built lazily) is silent until pytorch's own loader prints
+    its single ``Loaded extension … in N.N seconds`` line at the end —
+    making a slow compile indistinguishable from a hang. The wrapper
+    also surfaces compile failures (which otherwise propagate as
+    ImportError several seconds after the user-visible stall).
+    """
+    try:
+        from torch.utils import cpp_extension
+    except ImportError:
+        return
+
+    if getattr(cpp_extension, "_kdr_jit_wrapped", False):
+        return
+
+    _orig_load = cpp_extension.load
+    _orig_load_inline = cpp_extension.load_inline
+
+    def _timed(orig, kind):
+        def _wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+            name = kwargs.get("name") or (args[0] if args else "<unknown>")
+            log.info("jit %s START name=%s", kind, name)
+            t0 = time.monotonic()
+            try:
+                out = orig(*args, **kwargs)
+            except Exception:
+                log.exception(
+                    "jit %s FAILED name=%s after %.1fs",
+                    kind,
+                    name,
+                    time.monotonic() - t0,
+                )
+                raise
+            log.info(
+                "jit %s DONE  name=%s in %.1fs",
+                kind,
+                name,
+                time.monotonic() - t0,
+            )
+            return out
+
+        return _wrapper
+
+    cpp_extension.load = _timed(_orig_load, "load")
+    cpp_extension.load_inline = _timed(_orig_load_inline, "load_inline")
+    cpp_extension._kdr_jit_wrapped = True
+
+    # Also surface any torch.compile / dynamo recompilation events. These
+    # are emitted via the `torch._logging` dispatch; toggling the named
+    # artifacts is the supported way to opt in. No-op when the running
+    # torch build predates the API.
+    try:
+        import torch._logging as _tlog  # type: ignore[attr-defined]
+
+        _tlog.set_logs(recompiles=True, graph_breaks=True)
+    except Exception:
+        pass
+
+    log.info("jit-monitor installed (wraps cpp_extension.load[_inline])")
 
 
 # REQ: LLR-0008
@@ -89,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
     )
+    _install_jit_monitor()
     args = _parse(argv)
 
     config = _load_config(Path(args.config))
