@@ -226,6 +226,11 @@ KSIGNS_IQ2XS: tuple[int, ...] = (
 
 _IQ2XS_GRID_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 _KSIGNS_IQ2XS_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+_IQ2XS_JOINT_CACHE: dict[
+    tuple[torch.device, torch.dtype],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
+_KVALUES_IQ4NL_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
 
 def get_iq2xs_grid(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -271,4 +276,54 @@ def get_ksigns_iq2xs(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     bit_set = (raw.unsqueeze(-1) >> shifts) & 1
     tensor = (1 - 2 * bit_set).to(dtype)
     _KSIGNS_IQ2XS_CACHE[key] = tensor
+    return tensor
+
+
+def get_iq2xs_joint(
+    device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return cached IQ2_XS joint (magnitude × sign) codebook tensors.
+
+    Returns ``(joint_flat, joint_flat_t, code_sq)`` where:
+      * ``joint_flat``    -- ``(65536, 8)`` reconstructed chunks
+                             (``grid[i] * ksigns[j]`` for every ``(i, j)``).
+      * ``joint_flat_t``  -- ``(8, 65536)`` contiguous transpose, suitable
+                             for ``tile @ joint_flat_t`` matmuls inside
+                             ``_iq2xs_snap_block``.
+      * ``code_sq``       -- ``(65536,)`` per-codeword ``||code||^2``,
+                             hoisted out of the per-tile loop.
+
+    The three tensors are loop-invariants (functions of the codebooks
+    only) but were previously rebuilt for every IQ2_XS forward — at
+    640 Linears × 8 micros per optimizer step that's ~5k redundant
+    materialisations per step. Single cache entry per (device, dtype).
+    """
+    key = (device, dtype)
+    cached = _IQ2XS_JOINT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    grid = get_iq2xs_grid(device, dtype)        # (512, 8)
+    ksigns = get_ksigns_iq2xs(device, dtype)    # (128, 8)
+    joint = grid.unsqueeze(1) * ksigns.unsqueeze(0)  # (512, 128, 8)
+    joint_flat = joint.reshape(512 * 128, 8).contiguous()
+    joint_flat_t = joint_flat.t().contiguous()
+    code_sq = (joint_flat * joint_flat).sum(dim=-1).contiguous()
+    bundle = (joint_flat, joint_flat_t, code_sq)
+    _IQ2XS_JOINT_CACHE[key] = bundle
+    return bundle
+
+
+def get_kvalues_iq4nl(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Return the cached IQ4_NL 16-entry signed codebook as a ``(16,)``
+    tensor on ``device`` and ``dtype``.
+
+    Previously ``_iq4xs_snap_block`` rebuilt this tensor on every call
+    (640+ Linears × micros) — small but ~5k tensor allocations / step.
+    """
+    key = (device, dtype)
+    cached = _KVALUES_IQ4NL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    tensor = torch.tensor(KVALUES_IQ4NL, dtype=dtype, device=device)
+    _KVALUES_IQ4NL_CACHE[key] = tensor
     return tensor
