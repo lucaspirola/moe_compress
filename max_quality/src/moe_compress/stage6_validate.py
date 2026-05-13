@@ -497,11 +497,21 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     # since it calls model.forward internally for each prefill step.
     # dynamic=True handles variable-length padded batches from lm-eval.
     # One-time compilation cost (~3-5 min) is amortized across 1000+ forward passes.
+    #
+    # mode='default' (not 'reduce-overhead'): the 2026-05-13 04:31 A0 run with
+    # reduce-overhead hung in lm-eval's loglikelihood loop after ~10s of activity
+    # (faulthandler thread dump showed `torch._inductor/compile_worker/subproc_pool.py`
+    # — same CUDA-graph deadlock that hung Stage 2.5's grouped_mm). lm-eval issues
+    # 44k+ requests with many distinct input shapes; reduce-overhead's CUDA graph
+    # capture/replay can't keep up with shape churn (we also saw 8 `recompile_limit`
+    # warnings before death). `mode='default'` keeps TorchDynamo + TorchInductor
+    # fusion but drops graph capture, eliminating the deadlock at the cost of
+    # ~10-15% per-forward speed.
     use_torch_compile = s6.get("torch_compile", False)
     if use_torch_compile:
-        log.info("Stage 6: applying torch.compile(dynamic=True, mode='reduce-overhead') to model.forward")
+        log.info("Stage 6: applying torch.compile(dynamic=True, mode='default') to model.forward")
         try:
-            model.forward = torch.compile(model.forward, dynamic=True, mode="reduce-overhead")
+            model.forward = torch.compile(model.forward, dynamic=True, mode="default")
             log.info("Stage 6: torch.compile applied successfully")
         except Exception as exc:
             log.warning("Stage 6: torch.compile failed (%s) — continuing without compilation", exc)
