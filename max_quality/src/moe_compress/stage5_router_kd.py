@@ -395,8 +395,8 @@ def run(
                 # untouched and still carries the speedup.
                 if use_compile and not teacher_repo_override:
                     try:
-                        log.info("Stage 5: torch.compile(teacher, mode='reduce-overhead')")
-                        _t = torch.compile(_t, mode="reduce-overhead")
+                        log.info("Stage 5: torch.compile(teacher, mode='default')")
+                        _t = torch.compile(_t, mode="default")
                     except Exception as exc:
                         log.warning("Stage 5: torch.compile(teacher) failed (%s) — eager", exc)
                 _teacher_state["model"] = _t
@@ -451,10 +451,21 @@ def run(
     # graph reflects the final frozen parameter layout. named_parameters() on
     # the compiled wrapper delegates to the underlying module — the optimizer
     # already holds the correct parameter references before compilation.
+    # mode='default' (not 'reduce-overhead'): the latter captures CUDA graphs
+    # and replays them. On Blackwell B200 with Qwen3.6-A3B's MoE grouped_mm,
+    # CUDA graph replay deadlocked after ~1400 steps of sustained training on
+    # the 2026-05-13 A0 run — main thread stuck inside
+    # `torch.nn.functional.grouped_mm` via `transformers.integrations.moe._grouped_linear`,
+    # faulthandler thread dump confirmed kernel-level hang (not a Python exception).
+    # The previous 375-step run completed fine — same code path — so the failure
+    # mode is sustained-training + CUDA-graph state accumulation specific to
+    # `reduce-overhead`. `mode='default'` keeps TorchDynamo + TorchInductor
+    # fusion (≈ 50-70% of reduce-overhead's speedup) but launches kernels
+    # individually, avoiding graph replay entirely.
     if use_compile:
         try:
-            log.info("Stage 5: torch.compile(student, mode='reduce-overhead')")
-            student = torch.compile(student, mode="reduce-overhead")
+            log.info("Stage 5: torch.compile(student, mode='default')")
+            student = torch.compile(student, mode="default")
         except Exception as exc:
             log.warning("Stage 5: torch.compile failed (%s) — falling back to eager mode", exc)
             use_compile = False
