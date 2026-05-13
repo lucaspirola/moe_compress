@@ -149,6 +149,43 @@ def _check_param_sanity(student: nn.Module, step: int) -> list[str]:
     return bad
 
 
+def _set_experts_implementation(model: nn.Module, impl: str) -> None:
+    """Override the MoE experts forward dispatch on `model`.
+
+    The `transformers.integrations.moe` decorator dispatches each MoE forward
+    by reading `self.config._experts_implementation` at every call (see
+    `ExpertsInterface.get_interface`), so this assignment takes effect for
+    all subsequent forwards without rebuilding the model. The valid values
+    registered in transformers v4.x's `ALL_EXPERTS_FUNCTIONS`:
+
+      * `"grouped_mm"`  — default; uses `torch.nn.functional.grouped_mm`.
+                          DEADLOCKS on Blackwell sm_100 (see project memory
+                          `project_grouped_mm_blackwell.md`). Do NOT use on
+                          B200 / GB200 / B300.
+      * `"batched_mm"`  — uses `torch.bmm` per expert group with padding to
+                          max active count. ~70-90% of grouped_mm's speed,
+                          but bmm is universally supported (Hopper +
+                          Blackwell). Recommended default on B200.
+      * `"sonicmoe"`    — custom kernel registered by the sonicmoe package.
+                          Performance unknown; Blackwell-compatibility
+                          unknown. Try as fallback if `batched_mm` is too
+                          slow or hits an issue.
+      * `"eager"`       — Python loop over active experts, one
+                          `nn.functional.linear` per expert. Universally
+                          compatible. ~30-50% of grouped_mm's speed.
+
+    Sets the implementation on both the multimodal-level `config` and the
+    inner `text_config` if the model is multimodal (Qwen3_5MoeForConditionalGeneration).
+    """
+    base = getattr(model, "_orig_mod", model)
+    cfg = base.config
+    if hasattr(cfg, "text_config"):
+        cfg.text_config._experts_implementation = impl
+    cfg._experts_implementation = impl
+    log.info("Stage 5: MoE experts_implementation = %r (forward dispatch via "
+             "transformers.integrations.moe.ExpertsInterface)", impl)
+
+
 def run(
     student,
     tokenizer,
@@ -168,6 +205,15 @@ def run(
     """
     s5 = config["stage5_router_kd"]
     cal = config["calibration"]
+
+    # Set MoE forward dispatch (default 'batched_mm' to work around the
+    # grouped_mm Blackwell deadlock — see _set_experts_implementation
+    # docstring). Env var `EXPERTS_IMPLEMENTATION` overrides the YAML default
+    # for quick A/B without redeploying config.
+    _experts_impl = os.environ.get(
+        "EXPERTS_IMPLEMENTATION", s5.get("experts_implementation", "batched_mm")
+    )
+    _set_experts_implementation(student, _experts_impl)
 
     # Vocabulary-level KD does not use merge_map; see ALGORITHM_REFERENCE.md §8.
 
@@ -370,6 +416,13 @@ def run(
                     load_in_4bit=load_in_4bit,
                     trust_remote_code=config["model"].get("trust_remote_code", False),
                 )
+                # Set the MoE experts implementation on the teacher too. The
+                # teacher's forward path goes through the same
+                # `transformers.integrations.moe._grouped_mm` integration that
+                # deadlocks on Blackwell (see project memory
+                # `project_grouped_mm_blackwell.md`). Mirror what we applied
+                # to the student at run() entry.
+                _set_experts_implementation(_t, _experts_impl)
                 _t.eval()
                 # Vocab-size guard for the live-teacher path. Mirrors the
                 # cache-path check at lines 155-159 so a `teacher_model_repo`
