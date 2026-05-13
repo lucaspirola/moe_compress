@@ -244,12 +244,44 @@ stage5_router_kd:
                                   # the optimum. The paper does not specify this,
                                   # but our empirical loss curve was textbook
                                   # overfit; 0.01 is the AdamW default.
-  epochs: 1                       # Rolled back from 2 → 1 on 2026-05-13 after
-                                  # the 2-epoch run overfit: epoch 1 mean rose
-                                  # from 0.146 (steps 800-1000) → 0.205
-                                  # (steps 1250-1400). A single 6000-sample pass
-                                  # at 750 steps reaches the same minimum loss
-                                  # without the late-training memorization.
+  epochs: 3                       # 2026-05-13 (Move B): bumped 1 → 3. The
+                                  # earlier overfit signature on the 2-epoch run
+                                  # (loss bottom at step 950 → drift back by step
+                                  # 1400) is now addressed via cosine LR decay
+                                  # and save-best by EMA-smoothed raw KL (see
+                                  # lr_schedule / save_best below) — extra
+                                  # epochs buy more passes over the calibration
+                                  # corpus without re-introducing the drift,
+                                  # because we export the best checkpoint, not
+                                  # the last. Net wall: ~+40 min per ablation.
+  # Move A — LR schedule + best-checkpoint export.
+  lr_schedule: cosine             # 'cosine' = linear warmup → cosine decay to
+                                  # lr_min_ratio × peak. 'none' = constant LR
+                                  # (rollback path).
+  warmup_ratio: 0.05              # First 5% of optimizer steps linearly ramp
+                                  # from LR≈0 up to peak. At 2250 steps (=
+                                  # 6000/8 × 3), warmup ≈ 112 steps.
+  lr_min_ratio: 0.10              # Cosine floor: 10% of peak. At peak 5e-5,
+                                  # final LR = 5e-6. Non-zero floor keeps
+                                  # the optimizer alive at the end so the
+                                  # last 10% of training still produces
+                                  # measurable gradient updates rather than
+                                  # idling.
+  save_best: true                 # Export the EMA-smoothed-best router state at
+                                  # the end of training (vs the last-step state).
+                                  # The last-step state is what bit us in the
+                                  # 2-epoch run that drifted past its optimum.
+  best_metric_ema_alpha: 0.2      # EMA on the raw-KL window mean used for the
+                                  # best-tracker; α=0.2 damps the first ~5
+                                  # log windows so the early noise floor can't
+                                  # win the best slot.
+  # Move B — temperature ramp.
+  kd_temperature_start: 4.0       # Soft targets early — broader posterior helps
+                                  # the router escape the cold-start regime.
+  kd_temperature_end: 1.0         # Hard targets late — tighter posterior pulls
+                                  # the router toward the teacher's modes.
+                                  # Linear interpolation between start/end over
+                                  # the full optimizer step count.
   # batch_size × gradient_accumulation = effective batch (=8).
   # H200 (141 GB VRAM): teacher BF16 (~70 GB) + student BF16 (~50 GB) = ~120 GB.
   # At bs=8, vocab logits + small KV-cache headroom consume ~6 GB, leaving ~15 GB headroom.
@@ -268,19 +300,26 @@ stage5_router_kd:
   # (enforced at load time in stage5_router_kd._get_teacher).
   teacher_model_repo: null
   max_sequence_length: 512
-  kd_temperature: 1.0
+  kd_temperature: 1.0             # Legacy scalar fallback. Active runs use
+                                  # kd_temperature_start/end (above). Kept
+                                  # for any pre-Move-B code path that still
+                                  # reads this scalar.
+  # Do NOT enable teacher_logits_cache with epochs > 1 — the existing runtime
+  # guard at stage5_router_kd.py:744 raises in that combination. Multi-epoch
+  # KD reuses calibration batches across epochs; the cache index would walk
+  # off the end and replay epoch-0 logits against epoch-N inputs.
   kd_seq_chunk_size: 512            # H200: full sequence in one chunk (~2.4 GB peak at B=8, |V|≈150K).
                                     # Eliminates chunk-boundary Python loop overhead.
                                     # On smaller VRAM (A100): set to 128 to bound peak at ~600 MB.
   max_calibration_samples: 6000   # Bumped 2026-05-13 from 3000 → 6000 to give
-                                  # the 2nd epoch more diverse calibration coverage.
-                                  # Combined with epochs=2: 6000 samples × 2 epochs
-                                  # / batch_size=8 = 1500 optimizer steps (vs 375
-                                  # in the 3000×1 baseline). Expected wall: ~15-20
-                                  # min on B200 (vs 4 min before). Each epoch
-                                  # walks the full 6k; pairs well with the
-                                  # epochs=2 bump above for max KD signal at
-                                  # bounded wall cost.
+                                  # later epochs more diverse calibration coverage.
+                                  # Combined with epochs=3 (Move B): 6000 samples
+                                  # × 3 epochs / batch_size=8 = 2250 optimizer
+                                  # steps (vs 375 in the 3000×1 baseline). Each
+                                  # epoch walks the full 6k; pairs with the
+                                  # epochs=3 bump for max KD signal — cosine LR
+                                  # + save-best (above) ensure we export the
+                                  # optimum rather than the last step.
   checkpoint_every_n_steps: 100    # save router+optim state every N optimizer steps for crash-resume
   # Only router weights update. Enumerated paths are matched as substrings.
   trainable_name_patterns:

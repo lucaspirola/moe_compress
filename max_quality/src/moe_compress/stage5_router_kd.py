@@ -24,6 +24,7 @@ compressed expert set.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -551,7 +552,12 @@ def run(
     )
     batches = iter_batches(calib, batch_size=s5["batch_size"])
     grad_accum = s5["gradient_accumulation"]
-    T = s5["kd_temperature"]
+    # Temperature ramp (Move B): linear from start → end over the full
+    # optimizer-step count. If start == end, behaves as a constant temperature
+    # (rollback / legacy). Falls back to the legacy scalar `kd_temperature` if
+    # the start/end keys are absent.
+    T_start = float(s5.get("kd_temperature_start", s5.get("kd_temperature", 1.0)))
+    T_end = float(s5.get("kd_temperature_end", s5.get("kd_temperature", 1.0)))
     ckpt_every = int(s5.get("checkpoint_every_n_steps", 100))
     if ckpt_every <= 0:
         raise ValueError(
@@ -575,6 +581,14 @@ def run(
     resume_step = 0
     resume_epoch = 0
     resume_batch_i = -1
+    # Captured from a v2 (or later) resume checkpoint and consumed after the
+    # LR scheduler / best-tracker locals are constructed below. v1 checkpoints
+    # leave these as None — the scheduler is fast-forwarded by replaying
+    # scheduler.step() resume_step times; best-tracker re-initializes from +inf.
+    _resume_scheduler_state = None
+    _resume_best_raw_kl_ema = None
+    _resume_best_step = None
+    _resume_prev_ema = None
 
     # `no_resume=True` means "don't pick up existing checkpoints"; it does
     # NOT mean "don't write new ones". Spec §8 mandates step-boundary
@@ -606,10 +620,10 @@ def run(
                     f"Stage 5 resume: failed to load checkpoint {latest}: {exc}"
                 ) from exc
             fv = int(payload.get("format_version", 0))
-            if fv != 1:
+            if fv not in (1, 2):
                 raise RuntimeError(
                     f"Stage 5 checkpoint {latest} has format_version={fv} "
-                    f"(expected 1) — delete _{stage_key}_partial/ and re-run"
+                    f"(expected 1 or 2) — delete _{stage_key}_partial/ and re-run"
                 )
             # Restore router parameters into the student model.
             # F3 fix: walk the attribute tree on the unwrapped module so that
@@ -683,6 +697,15 @@ def run(
                         f"checkpoint has {saved_ga}, config has {grad_accum}. "
                         f"Delete _{stage_key}_partial/ and re-run or align the config."
                     )
+            # Capture v2+ fields into outer-scope holders; applied after the
+            # LR scheduler is constructed below (which needs total_optim_steps
+            # to exist).
+            _resume_scheduler_state = payload.get("scheduler_state")
+            if payload.get("best_raw_kl_ema") is not None:
+                _resume_best_raw_kl_ema = float(payload["best_raw_kl_ema"])
+                _resume_best_step = int(payload.get("best_step", -1))
+            if payload.get("prev_ema") is not None:
+                _resume_prev_ema = float(payload["prev_ema"])
             log.info("Stage 5: resumed from step %d (epoch %d, batch %d)",
                      resume_step, resume_epoch, resume_batch_i)
 
@@ -696,7 +719,66 @@ def run(
     # architecture variant introduces dropout, set frozen submodules to eval().
     student.train()
     total_steps = (len(batches) // grad_accum) * s5["epochs"]
+    total_optim_steps = total_steps  # alias used by scheduler + T-ramp
     remaining_steps = max(0, total_steps - resume_step)
+
+    # --- LR scheduler (Move A) ---
+    # Constructed AFTER total_optim_steps is known so the warmup horizon and
+    # cosine endpoint align with the real step count (= len(batches)//grad_accum
+    # × epochs, matching the value emitted to trackio as total_steps_planned).
+    _lr_schedule = str(s5.get("lr_schedule", "none"))
+    _warmup_ratio = float(s5.get("warmup_ratio", 0.05))
+    _lr_min_ratio = float(s5.get("lr_min_ratio", 0.10))
+    warmup_steps = max(1, int(total_optim_steps * _warmup_ratio))
+
+    def _lr_lambda(current_step: int) -> float:
+        if _lr_schedule == "none":
+            return 1.0
+        # Off-by-one: LambdaLR with last_epoch=-1 advances to current_step=0
+        # on the first .step() call. Use (current_step + 1) in the warmup
+        # branch so step 0 fires at LR = 1/warmup_steps, not 0.
+        if current_step < warmup_steps:
+            return (current_step + 1) / warmup_steps
+        progress = (current_step - warmup_steps) / max(1, total_optim_steps - warmup_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return _lr_min_ratio + (1.0 - _lr_min_ratio) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, _lr_lambda)
+
+    # Temperature ramp closure (Move B). Uses total_optim_steps so the ramp
+    # endpoint coincides with the cosine endpoint.
+    def _current_T(global_step: int) -> float:
+        if T_start == T_end:
+            return T_start
+        p = min(max(global_step / max(1, total_optim_steps), 0.0), 1.0)
+        return T_start + (T_end - T_start) * p
+
+    # Best-tracker state (Move A). Initialized here so resume-restore below can
+    # overwrite when restarting from a v2 checkpoint.
+    _best_ema_alpha = float(s5.get("best_metric_ema_alpha", 0.2))
+    _save_best = bool(s5.get("save_best", True))
+    best_raw_kl_ema = float("inf")
+    best_step = -1
+    prev_ema = float("inf")
+
+    # --- Resume restore for scheduler + best-tracker ---
+    # v2 checkpoint: load scheduler state verbatim, restore best/prev EMA.
+    # v1 checkpoint (or no resume): fast-forward scheduler by replaying
+    # scheduler.step() resume_step times so the LR curve picks up at the
+    # right point. Best/prev EMA stay at +inf (the next log boundary
+    # bootstraps cleanly).
+    if _resume_scheduler_state is not None:
+        scheduler.load_state_dict(_resume_scheduler_state)
+    elif resume_step > 0:
+        for _ in range(resume_step):
+            scheduler.step()
+    if _resume_best_raw_kl_ema is not None:
+        best_raw_kl_ema = _resume_best_raw_kl_ema
+        best_step = _resume_best_step if _resume_best_step is not None else -1
+    if _resume_prev_ema is not None:
+        prev_ema = _resume_prev_ema
+
     _trainable_param_count = sum(1 for _ in student.parameters() if _.requires_grad)
     log.info("Stage 5: %d routers trainable; %d steps total / %d remaining (grad-accum=%d, resume_step=%d)",
              _trainable_param_count,
@@ -717,7 +799,11 @@ def run(
         "stage5/config/calib_total_tokens": int(spec.num_sequences * spec.sequence_length),
         "stage5/config/grad_accum": int(grad_accum),
         "stage5/config/epochs": int(s5["epochs"]),
-        "stage5/config/kd_temperature": float(T),
+        "stage5/config/kd_temperature_start": T_start,
+        "stage5/config/kd_temperature_end": T_end,
+        "stage5/config/lr_schedule": str(s5.get("lr_schedule", "none")),
+        "stage5/config/warmup_ratio": float(s5.get("warmup_ratio", 0.05)),
+        "stage5/config/lr_min_ratio": float(s5.get("lr_min_ratio", 0.10)),
         "stage5/config/trainable_router_params": int(_trainable_param_count),
         "stage5/config/use_compile_student": bool(use_compile),
         "stage5/config/teacher_cache_hit": bool(teacher_logits_cache is not None),
@@ -767,6 +853,10 @@ def run(
         # and pay one .item() sync at log-emission time, instead of paying
         # device→host sync per microbatch (~375/epoch at full scale).
         window_loss_acc: list[torch.Tensor] = []
+        # Raw KL = loss / T^2 — invariant under the temperature ramp, so it
+        # remains comparable across the run and across runs with different T
+        # schedules. Used by the best-checkpoint tracker.
+        window_raw_kl_acc: list[torch.Tensor] = []
         for i, batch in enumerate(batches):
             # Fast-forward: skip batches already processed in the resumed run.
             # resume_batch_i is the last batch of the grad-accum window that
@@ -839,6 +929,9 @@ def run(
             # to 512 here so a missing config can't degrade to a non-spec
             # chunked loop.
             seq_chunk = int(s5.get("kd_seq_chunk_size", 512))
+            # Temperature ramps with the optimizer step (piece-wise constant
+            # across the grad_accum micro-batches that compose one step).
+            T = _current_T(step)
             loss = _chunked_vocab_kl(s_logits_shift, t_logits_shift, T, chunk_size=seq_chunk)
 
             # --- First-batch sanity probe (added 2026-05-13) ---
@@ -884,6 +977,8 @@ def run(
                 )
 
             window_loss_acc.append(loss.detach())
+            # T is a Python float; max() on scalars guards against T==0.
+            window_raw_kl_acc.append(loss.detach() / max(T * T, 1e-12))
             (loss / grad_accum).backward()
 
             if (i + 1) % grad_accum == 0:
@@ -898,6 +993,7 @@ def run(
                 )
                 optim.step()
                 optim.zero_grad()
+                scheduler.step()
                 step += 1
                 _rt_update(stage="stage5", epoch=int(epoch), step=int(step), batch=int(i),
                            phase="kd_train")
@@ -911,15 +1007,49 @@ def run(
                         loss_val = sum(t.item() for t in window_loss_acc) / len(window_loss_acc)
                     else:
                         loss_val = 0.0
+                    if window_raw_kl_acc:
+                        raw_kl_val = sum(t.item() for t in window_raw_kl_acc) / len(window_raw_kl_acc)
+                    else:
+                        raw_kl_val = 0.0
                     window_loss_acc.clear()
+                    window_raw_kl_acc.clear()
+
+                    # EMA of raw_kl across log boundaries. prev_ema=+inf on
+                    # first observation triggers a bootstrap (ema = raw_kl_val).
+                    if math.isinf(prev_ema):
+                        ema = raw_kl_val
+                    else:
+                        ema = _best_ema_alpha * raw_kl_val + (1.0 - _best_ema_alpha) * prev_ema
+                    prev_ema = ema
+
+                    # Save-best by EMA-smoothed raw KL. +inf seed of
+                    # best_raw_kl_ema guarantees the first log boundary always
+                    # writes a best.pt, so the run always exports SOMETHING
+                    # even if it crashes before any improvement.
+                    if _save_best and ema < best_raw_kl_ema:
+                        best_raw_kl_ema = ema
+                        best_step = step
+                        _save_best_router_state(partial_dir, student, step, epoch, ema)
+
+                    current_lr = scheduler.get_last_lr()[0]
+                    current_T = _current_T(step)
+
                     log.info(
-                        "  epoch=%d step=%d window_loss=%.6f grad_norm=%.4f | %s",
-                        epoch, step, loss_val, grad_norm, _rt_snap(),
+                        "  epoch=%d step=%d window_loss=%.6f raw_kl=%.6f "
+                        "ema=%.6f best_ema=%.6f@%d lr=%.3e T=%.3f grad_norm=%.4f | %s",
+                        epoch, step, loss_val, raw_kl_val, ema, best_raw_kl_ema,
+                        best_step, current_lr, current_T, grad_norm, _rt_snap(),
                     )
                     payload = {
                         "stage5/epoch": epoch,
                         "stage5/step": step,
                         "stage5/loss": loss_val,
+                        "stage5/raw_kl": raw_kl_val,
+                        "stage5/raw_kl_ema": ema,
+                        "stage5/best_raw_kl_ema": best_raw_kl_ema,
+                        "stage5/best_step": best_step,
+                        "stage5/lr": current_lr,
+                        "stage5/temperature": current_T,
                         "stage5/grad_norm": grad_norm,
                     }
                     _trackio_log(payload)
@@ -942,8 +1072,14 @@ def run(
 
                 # Periodic checkpoint for crash-resume.
                 if partial_dir is not None and ckpt_every > 0 and step % ckpt_every == 0:
-                    _save_stage5_checkpoint(partial_dir, step, epoch, i, student, optim,
-                                            grad_accum=grad_accum)
+                    _save_stage5_checkpoint(
+                        partial_dir, step, epoch, i, student, optim,
+                        grad_accum=grad_accum,
+                        scheduler=scheduler,
+                        best_raw_kl_ema=best_raw_kl_ema,
+                        best_step=best_step,
+                        prev_ema=prev_ema,
+                    )
                     # Keep only the two most recent checkpoints to bound disk use.
                     # Sort by step number (ascending) and delete all but the newest two.
                     all_ckpts = sorted(
@@ -955,6 +1091,40 @@ def run(
         # Trailing-batch accounting is computed once before the epoch loop
         # (see the run-start log.warning above); no per-epoch repeat here.
         optim.zero_grad()
+
+    # --- Best-checkpoint reload (Move A) ---
+    # If save_best was active and a best.pt was written during training, swap
+    # the trainable (router) params for the best snapshot before export. The
+    # bulk of the model (frozen, not in best.pt) stays at its current state —
+    # that's the whole point of saving only the trainable subset.
+    if _save_best:
+        best_path = partial_dir / "best.pt"
+        if best_path.exists():
+            best_blob = torch.load(best_path, map_location="cpu")
+            _base = getattr(student, "_orig_mod", student)
+            missing, unexpected = _base.load_state_dict(
+                best_blob["router_state"], strict=False
+            )
+            log.info(
+                "Stage %s: reloaded best router state from step=%d "
+                "(raw_kl_ema=%.6f); missing=%d (expected — non-router params "
+                "not in best), unexpected=%d",
+                stage_key, int(best_blob.get("step", -1)),
+                float(best_blob.get("raw_kl_ema", float("nan"))),
+                len(missing), len(unexpected),
+            )
+            if unexpected:
+                raise RuntimeError(
+                    f"Stage {stage_key}: best.pt contains unexpected keys "
+                    f"(non-router params leaked into best snapshot): "
+                    f"{unexpected[:5]}"
+                )
+        else:
+            log.warning(
+                "Stage %s: save_best=true but no best.pt found in %s — "
+                "exporting last-step state (best-tracker never fired)",
+                stage_key, partial_dir,
+            )
 
     out_dir = artifacts_dir / f"{stage_key}_final"
     save_compressed_checkpoint(
@@ -1016,6 +1186,10 @@ def _save_stage5_checkpoint(
     student: nn.Module,
     optim: torch.optim.Optimizer,
     grad_accum: int = 1,
+    scheduler: "torch.optim.lr_scheduler._LRScheduler | None" = None,
+    best_raw_kl_ema: float | None = None,
+    best_step: int | None = None,
+    prev_ema: float | None = None,
 ) -> None:
     # F3 fix: when torch.compile is active, `student` is a compiled wrapper
     # whose named_parameters() may enumerate names that differ from the
@@ -1029,7 +1203,7 @@ def _save_stage5_checkpoint(
         if p.requires_grad
     }
     payload = {
-        "format_version": 1,
+        "format_version": 2,
         "step": step,
         "epoch": epoch,
         "batch_idx": batch_idx,
@@ -1040,6 +1214,12 @@ def _save_stage5_checkpoint(
         # current trainable scope so a config change to trainable_name_patterns
         # cannot pair stale moments with the wrong parameters.
         "trainable_param_names": sorted(router_state.keys()),
+        # v2 additions (Move A): LR scheduler + best-tracker state. None for
+        # legacy code paths that don't pass them; resume tolerates None.
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "best_raw_kl_ema": best_raw_kl_ema,
+        "best_step": best_step,
+        "prev_ema": prev_ema,
     }
     tmp = partial_dir / f"step_{step}.pt.tmp"
     final = partial_dir / f"step_{step}.pt"
@@ -1056,6 +1236,44 @@ def _save_stage5_checkpoint(
     finally:
         os.close(parent_fd)
     log.info("Stage 5: checkpoint saved at step %d (epoch %d, batch %d)", step, epoch, batch_idx)
+
+
+def _save_best_router_state(
+    partial_dir: Path,
+    student: nn.Module,
+    step: int,
+    epoch: int,
+    raw_kl_ema: float,
+) -> None:
+    """Atomically rewrite best.pt with the trainable (router) params only.
+
+    File size is ~10-50 MB (router weights only) vs ~5 GB for the full
+    optim+student checkpoint, so we can afford to rewrite on every
+    improvement. The slim payload also keeps the end-of-training reload
+    boundaried: only trainable params land via load_state_dict(strict=False).
+    """
+    unwrapped = getattr(student, "_orig_mod", student)
+    router_state = {
+        name: p.data.cpu().clone()
+        for name, p in unwrapped.named_parameters()
+        if p.requires_grad
+    }
+    payload = {
+        "format_version": 1,  # best.pt format; independent of step_*.pt versioning
+        "step": int(step),
+        "epoch": int(epoch),
+        "raw_kl_ema": float(raw_kl_ema),
+        "router_state": router_state,
+    }
+    tmp = partial_dir / "best.pt.tmp"
+    final = partial_dir / "best.pt"
+    torch.save(payload, tmp)
+    fd = os.open(str(tmp), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, final)
 
 
 def _move_optimizer_state_to_device(optim: torch.optim.Optimizer, device) -> None:
