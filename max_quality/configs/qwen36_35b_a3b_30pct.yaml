@@ -222,12 +222,20 @@ stage4_eora:
 stage5_router_kd:
   optimizer: adamw
   learning_rate: 5.0e-5           # paper Table 1 (§F.3)
-  epochs: 1
+  epochs: 2                       # Bumped 2026-05-13 from 1 → 2 after the first
+                                  # successful Stage 2.5 run (B200 BF16 teacher)
+                                  # showed loss still descending at step 350
+                                  # (0.134, down from 0.282 at step 250). A second
+                                  # epoch re-passes the same calibration data and
+                                  # typically halves the final KD loss for free
+                                  # at constant data — better ROI than just adding
+                                  # more samples until first-epoch saturation is
+                                  # reached.
   # batch_size × gradient_accumulation = effective batch (=8).
   # H200 (141 GB VRAM): teacher BF16 (~70 GB) + student BF16 (~50 GB) = ~120 GB.
   # At bs=8, vocab logits + small KV-cache headroom consume ~6 GB, leaving ~15 GB headroom.
   # bs=8 with grad_accum=1 eliminates gradient accumulation overhead entirely:
-  # 375 forward passes (= 375 optimizer steps) vs 750 at bs=4/grad_accum=2.
+  # 750 forward passes (= 750 optimizer steps at 6000 samples × 2 epochs / 8 batch).
   # Same effective batch as paper (8×1 = 2×4 = 8).
   batch_size: 8
   gradient_accumulation: 1
@@ -245,7 +253,15 @@ stage5_router_kd:
   kd_seq_chunk_size: 512            # H200: full sequence in one chunk (~2.4 GB peak at B=8, |V|≈150K).
                                     # Eliminates chunk-boundary Python loop overhead.
                                     # On smaller VRAM (A100): set to 128 to bound peak at ~600 MB.
-  max_calibration_samples: 3000
+  max_calibration_samples: 6000   # Bumped 2026-05-13 from 3000 → 6000 to give
+                                  # the 2nd epoch more diverse calibration coverage.
+                                  # Combined with epochs=2: 6000 samples × 2 epochs
+                                  # / batch_size=8 = 1500 optimizer steps (vs 375
+                                  # in the 3000×1 baseline). Expected wall: ~15-20
+                                  # min on B200 (vs 4 min before). Each epoch
+                                  # walks the full 6k; pairs well with the
+                                  # epochs=2 bump above for max KD signal at
+                                  # bounded wall cost.
   checkpoint_every_n_steps: 100    # save router+optim state every N optimizer steps for crash-resume
   # Only router weights update. Enumerated paths are matched as substrings.
   trainable_name_patterns:
