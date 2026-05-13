@@ -44,8 +44,8 @@ import torch
 
 from .gguf_codebooks import (
     KVALUES_IQ4NL,
-    get_iq2xs_grid,
-    get_ksigns_iq2xs,
+    get_iq2xs_joint,
+    get_kvalues_iq4nl,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -320,11 +320,12 @@ def _iq2xs_snap_block(super_blocks: torch.Tensor) -> torch.Tensor:
     reflects this floor + a small slack for inter-sub-block max-abs
     variation; see ``test_iq2_xs_forward_bound`` for the rationale.
     """
-    # Materialise codebooks lazily; cached per (device, dtype).
+    # Materialise codebooks lazily; cached per (device, dtype). The joint
+    # codebook + its transpose + per-codeword squared norm are loop
+    # invariants — `get_iq2xs_joint` returns all three from one cache.
     device = super_blocks.device
     dtype = super_blocks.dtype  # fp32 by _ste_wrap contract
-    grid = get_iq2xs_grid(device, dtype)  # (512, 8)
-    ksigns = get_ksigns_iq2xs(device, dtype)  # (128, 8)
+    joint_flat, joint_flat_t, code_sq = get_iq2xs_joint(device, dtype)
 
     # Reshape: (..., n_super, 256) -> (..., n_super * 8 sub-blocks, 32)
     lead = super_blocks.shape[:-1]
@@ -361,25 +362,23 @@ def _iq2xs_snap_block(super_blocks: torch.Tensor) -> torch.Tensor:
     n_total = flat.shape[0]
     snapped_chunks = torch.empty_like(flat)
 
-    # Precompute the full joint codebook: (512, 128, 8) = magnitudes * signs.
-    # That's 512*128*8 = ~524 K fp32 entries = ~2 MB; fits easily in cache.
-    joint = grid.unsqueeze(1) * ksigns.unsqueeze(0)  # (512, 128, 8)
-    joint_flat = joint.view(512 * 128, _IQ2XS_CHUNK)  # (65536, 8)
-    # Hoisted: invariant across tiles (depends only on the codebook).
-    code_sq = (joint_flat * joint_flat).sum(dim=-1)  # (65536,)
+    # ``joint_flat`` (65536, 8), ``joint_flat_t`` (8, 65536), and
+    # ``code_sq`` (65536,) are pulled from a per-(device, dtype) cache —
+    # they only depend on the codebook constants, not on ``flat``.
 
     for start in range(0, n_total, _IQ2XS_ARGMIN_TILE_MAX):
         stop = min(start + _IQ2XS_ARGMIN_TILE_MAX, n_total)
         tile = flat[start:stop]  # (tile_n, 8)
         # Squared L2 distance: ||tile||^2 + ||code||^2 - 2 <tile, code>.
         # We only need argmin, so ||tile||^2 cancels and we compare
-        # ||code||^2 - 2 <tile, code>.
-        inner = tile @ joint_flat.t()  # (tile_n, 65536)
+        # ||code||^2 - 2 <tile, code>. Multiply against the cached
+        # contiguous transpose so the matmul kernel skips a transpose op.
+        inner = tile @ joint_flat_t  # (tile_n, 65536)
         dist = code_sq.unsqueeze(0) - 2.0 * inner  # (tile_n, 65536)
         best = dist.argmin(dim=-1)  # (tile_n,)
         # Decode best index → (magnitude_idx, sign_idx) and look up the
-        # actual reconstructed chunk.
-        snapped_chunks[start:stop] = joint_flat[best]
+        # actual reconstructed chunk via index_select (contiguous gather).
+        snapped_chunks[start:stop] = torch.index_select(joint_flat, 0, best)
 
     # Rescale snapped chunks by sub-block scale and reshape back to super-block.
     snapped_unscaled = snapped_chunks.view(*lead, -1, n_chunks_per_super, _IQ2XS_CHUNK)
@@ -532,7 +531,7 @@ def _iq4xs_snap_block(super_blocks: torch.Tensor) -> torch.Tensor:
 
     device = super_blocks.device
     dtype = super_blocks.dtype
-    kvalues = torch.tensor(KVALUES_IQ4NL, dtype=dtype, device=device)  # (16,)
+    kvalues = get_kvalues_iq4nl(device, dtype)  # (16,)  cached
     # Asymmetric range: negative arm is wider than positive arm.
     kmax_pos = float(max(KVALUES_IQ4NL))   # 113
     kmax_neg = float(-min(KVALUES_IQ4NL))  # 127
