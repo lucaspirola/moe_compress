@@ -103,10 +103,12 @@ def test_profile_j_kv_quant_kivi_int4() -> None:
     )
 
 
-def test_profile_j_student_source_is_reasoning_base() -> None:
-    """LLR-0058 AC: self-distillation seed."""
+def test_profile_j_student_source_is_zaya1_8b() -> None:
+    """LLR-0058 AC: self-distillation seed is ZAYA1-8B (uniform per-layer
+    architecture; the reasoning-base variant uses interleaved per-layer
+    lists not supported by the Zyphra transformers fork)."""
     cfg = _load()
-    assert cfg.student.source == "Zyphra/ZAYA1-reasoning-base"
+    assert cfg.student.source == "Zyphra/ZAYA1-8B"
 
 
 def test_profile_j_spec_map_excludes_carve_out_substrings() -> None:
