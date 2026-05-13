@@ -280,13 +280,21 @@ def _ste_wrap(
 _IQ2XS_SUB_BLOCK: int = 32
 _IQ2XS_CHUNK: int = 8
 
-# IQ2_XS argmin tiling (review M5): the naive broadcast
-#   (chunks[..., None, :] - grid[None, :, :]).norm(dim=-1).argmin(dim=-1)
-# materialises a [n_chunks, 512] distance tensor per super-block. For a
-# [4096, 4096] Linear weight that's about 268 MB fp32 in flight. We chunk
-# the argmin to bound peak memory; the tile size is small enough that the
-# cache line dominates the cost rather than DRAM bandwidth.
-_IQ2XS_ARGMIN_TILE: int = 64
+# IQ2_XS argmin tiling. Each tile contributes two (tile_n, 65536) fp32
+# intermediates (`inner` and `dist`) inside `_iq2xs_snap_block`'s loop:
+#     tile_n * 65536 * 4 bytes * 2 intermediates ≈ tile_n * 512 KB peak
+# With `_MAX = 8192` the per-tile peak is ~4 GB — comfortably within
+# residual VRAM on H200 (141 GB) and B200 (180 GB) after the ~17 GB+
+# teacher and ~17 GB+ student weights are resident.
+#
+# Why the bump from 64 (LLR-0061 / HLR-0019): the small original tile
+# size dispatched ~32 000 CUDA kernel launches per IQ2_XS forward pass
+# on a 4096×4096 Linear weight (n_total = 2M chunks / 64 tile = 32 K).
+# At ~5-10 μs kernel-launch overhead per crossing, that's ~30-60 sec of
+# pure Python→CUDA dispatcher overhead per training-step forward on a
+# Profile-J recipe (~200 IQ2_XS-applicable weights). The larger tile
+# reduces iteration count by 128× without changing arithmetic.
+_IQ2XS_ARGMIN_TILE_MAX: int = 8192
 
 
 def _iq2xs_snap_block(super_blocks: torch.Tensor) -> torch.Tensor:
@@ -360,8 +368,8 @@ def _iq2xs_snap_block(super_blocks: torch.Tensor) -> torch.Tensor:
     # Hoisted: invariant across tiles (depends only on the codebook).
     code_sq = (joint_flat * joint_flat).sum(dim=-1)  # (65536,)
 
-    for start in range(0, n_total, _IQ2XS_ARGMIN_TILE):
-        stop = min(start + _IQ2XS_ARGMIN_TILE, n_total)
+    for start in range(0, n_total, _IQ2XS_ARGMIN_TILE_MAX):
+        stop = min(start + _IQ2XS_ARGMIN_TILE_MAX, n_total)
         tile = flat[start:stop]  # (tile_n, 8)
         # Squared L2 distance: ||tile||^2 + ||code||^2 - 2 <tile, code>.
         # We only need argmin, so ||tile||^2 cancels and we compare
