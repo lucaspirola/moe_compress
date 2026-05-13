@@ -10,7 +10,7 @@
 #
 # Image carries dependencies only. Code is git-cloned at container start by
 # bootstrap.sh; model snapshot is downloaded into the persistent /cache volume.
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -24,7 +24,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Ubuntu 24.04 ships Python 3.12 (final release — no BlockFinder/inspect.py
 # RC bugs). git for runtime code clone; build tooling for compiled wheels
 # (flash-linear-attention and causal-conv1d build CUDA kernels — need ninja +
-# nvcc; the cuda:12.6.3-devel base provides nvcc).
+# nvcc; the cuda:13.0.3-devel base provides nvcc with sm_100 codegen support).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
         python3-dev \
@@ -39,15 +39,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --upgrade pip wheel setuptools packaging
 
-# torch from the cu128 wheel index (matches CUDA 12.8 base).
+# torch from the cu130 wheel index (matches CUDA 13.0 base; cu130 wheels
+# add native sm_100 / Blackwell B200 support — see commit message + memory/
+# project_grouped_mm_blackwell.md for the speed-recovery context).
 # Capture the installed wheel as a constraint so transitive deps cannot
 # pull a different build variant via the default PyPI index.
-RUN pip install --index-url https://download.pytorch.org/whl/cu128 \
+RUN pip install --index-url https://download.pytorch.org/whl/cu130 \
         "torch==2.11.0" \
     && pip freeze | grep '^torch==' > /tmp/torch-constraint.txt
 
 # Bulk install of pinned deps. The constraint file locks torch to the exact
-# cu128 wheel above.
+# cu130 wheel above.
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt -c /tmp/torch-constraint.txt
 
