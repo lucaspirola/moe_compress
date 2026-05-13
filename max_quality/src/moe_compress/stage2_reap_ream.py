@@ -89,6 +89,21 @@ def run(
     s2 = config["stage2_reap_ream"]
     cal = config["calibration"]
 
+    # Blackwell sm_100 workaround: transformers' default MoE forward uses
+    # `torch.nn.functional.grouped_mm`, which deadlocks on B200 partway
+    # through Stage 2 (reproduced as a 2-min main-thread hang then SIGSEGV
+    # at layer 13 batch ~60 on Qwen3.6-35B-A3B, 2026-05-13). Stages 5 and 6
+    # already force `batched_mm` via `_set_experts_implementation` — Stage 2
+    # was the only path still going through the broken kernel. Mirror the
+    # same override here: env var `EXPERTS_IMPLEMENTATION` wins, then the
+    # YAML knob `stage2_reap_ream.experts_implementation`, default
+    # `batched_mm`. See memory/project_grouped_mm_blackwell.md.
+    from .stage5_router_kd import _set_experts_implementation
+    _experts_impl = os.environ.get(
+        "EXPERTS_IMPLEMENTATION", s2.get("experts_implementation", "batched_mm")
+    )
+    _set_experts_implementation(model, _experts_impl)
+
     # Stage 2 v2 (spec § 6 / D-asymmetric-freq): cost_asymmetric is valid
     # only under freq-weighted merge — the asymmetric factor freq_m/(freq_c+freq_m)
     # is the per-pair version of the merge weight. Reject the combination

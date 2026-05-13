@@ -119,6 +119,13 @@ stage1_grape:
   entropy_tolerance: 0.1
 
 stage2_reap_ream:
+  experts_implementation: batched_mm   # Blackwell (B200) workaround for transformers'
+                                       # grouped_mm deadlock — same fix already applied
+                                       # to stage5_router_kd / stage6_validate. Without
+                                       # this, Stage 2 hangs mid-merge (reproduced at
+                                       # layer 13 batch ~60 on B200, 2026-05-13).
+                                       # See memory/project_grouped_mm_blackwell.md.
+                                       # Drop to grouped_mm on Hopper for max speed.
   batch_size: 6                    # H200: model ~70GB leaves ~71GB headroom; bs=6 is ~50% faster than bs=4
   num_calibration_samples: 4000
   reap_min_active_tokens: 32      # skip experts whose token activation count < this from centroid candidates
