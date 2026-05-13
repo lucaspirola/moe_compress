@@ -43,6 +43,112 @@ from .utils.trackio_log import trackio_log as _trackio_log
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Debug instrumentation (added 2026-05-13 after the Stage 2.5 NaN crash on
+# vast.ai B200 contract 36639423). Stage 2.5 had been running for the first
+# time and the previous bare-bones per-50-step logger gave no signal about
+# WHERE NaN entered (teacher? student? KL? params?). These helpers provide:
+#   1. A first-batch sanity probe (always on) — log teacher/student logit
+#      stats and the initial loss BEFORE the optimizer touches anything.
+#   2. A NaN tripwire (always on) — abort on the FIRST non-finite loss with
+#      a structured dump of teacher/student/param state.
+#   3. Per-step debug log (env STAGE5_DEBUG_PER_STEP=1) — fine-grained loss
+#      trajectory for the first N steps instead of the 50-step window mean.
+#   4. Periodic param sanity (env STAGE5_PARAM_CHECK_EVERY=K) — scan trainable
+#      params for NaN/Inf every K steps, halt if any go non-finite silently.
+# ---------------------------------------------------------------------------
+
+
+def _log_first_batch_sanity(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    loss: torch.Tensor,
+) -> None:
+    """First-batch sanity probe — log forward-pass stats and abort if any
+    NaN/Inf is present BEFORE the optimizer runs."""
+    try:
+        t_finite = bool(torch.isfinite(teacher_logits).all())
+        s_finite = bool(torch.isfinite(student_logits).all())
+        loss_finite = bool(torch.isfinite(loss))
+        log.info(
+            "Stage 5 first-batch sanity: "
+            "teacher shape=%s dtype=%s finite=%s abs_max=%.3e mean=%.3e std=%.3e ; "
+            "student shape=%s dtype=%s finite=%s abs_max=%.3e mean=%.3e std=%.3e ; "
+            "initial_loss=%.6e finite=%s",
+            tuple(teacher_logits.shape), teacher_logits.dtype, t_finite,
+            float(teacher_logits.detach().abs().max()),
+            float(teacher_logits.detach().mean()),
+            float(teacher_logits.detach().std()),
+            tuple(student_logits.shape), student_logits.dtype, s_finite,
+            float(student_logits.detach().abs().max()),
+            float(student_logits.detach().mean()),
+            float(student_logits.detach().std()),
+            float(loss.detach()), loss_finite,
+        )
+        if not (t_finite and s_finite and loss_finite):
+            raise RuntimeError(
+                "Stage 5 first-batch sanity FAILED: "
+                f"teacher_finite={t_finite} student_finite={s_finite} loss_finite={loss_finite}. "
+                "Halting before any optimizer step to surface the actual failure mode "
+                "(teacher vs student vs KL) instead of training 50 batches of NaN."
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        log.warning("Stage 5 first-batch sanity probe raised %s (non-fatal — continuing)", exc)
+
+
+def _dump_nan_diagnostics(
+    *,
+    loss: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    student: nn.Module,
+    epoch: int,
+    step: int,
+    batch_i: int,
+) -> None:
+    """Structured dump on non-finite loss — teacher/student stats + first 5
+    non-finite trainable params (routers only)."""
+    try:
+        def _stats(t: torch.Tensor) -> str:
+            t_det = t.detach()
+            n_total = max(1, t_det.numel())
+            n_nan = int(torch.isnan(t_det).sum())
+            n_inf = int(torch.isinf(t_det).sum())
+            return (
+                f"shape={tuple(t.shape)} dtype={t.dtype} "
+                f"abs_max={float(t_det.abs().max()):.3e} mean={float(t_det.mean()):.3e} "
+                f"pct_nan={100.0 * n_nan / n_total:.2f} pct_inf={100.0 * n_inf / n_total:.2f}"
+            )
+        log.error("Stage 5 NaN-tripwire at epoch=%d step=%d batch=%d: loss=%s",
+                  epoch, step, batch_i, float(loss.detach()))
+        log.error("  teacher logits: %s", _stats(teacher_logits))
+        log.error("  student logits: %s", _stats(student_logits))
+        bad_params = _check_param_sanity(student, step)
+        if bad_params:
+            log.error("  non-finite trainable params (first %d): %s", len(bad_params), bad_params)
+        else:
+            log.error("  all trainable params still finite — NaN originates in forward, not weights.")
+    except Exception as exc:
+        log.error("Stage 5 NaN diagnostics raised: %s", exc)
+
+
+def _check_param_sanity(student: nn.Module, step: int) -> list[str]:
+    """Cheap O(params) scan: names of trainable params containing NaN/Inf,
+    capped at 5 for log brevity."""
+    bad: list[str] = []
+    base = getattr(student, "_orig_mod", student)
+    for name, p in base.named_parameters():
+        if not p.requires_grad:
+            continue
+        if not torch.isfinite(p.data).all():
+            bad.append(name)
+            if len(bad) >= 5:
+                break
+    return bad
+
+
 def run(
     student,
     tokenizer,
@@ -578,6 +684,13 @@ def run(
         )
     step = resume_step
     optim.zero_grad()
+    # Tracks whether the first-batch sanity probe has run yet. A boolean is
+    # used (instead of a `step == 0 and i == resume_batch_i + 1` predicate)
+    # because `step` is the optimizer-step counter and stays > 0 across any
+    # non-trivial resume — a step-based guard silently skips the probe on
+    # the resumed path, which is when we need it most (router weights may
+    # have been NaN-poisoned in the previous run).
+    _first_batch_probed = False
     for epoch in range(s5["epochs"]):
         if epoch < resume_epoch:
             continue
@@ -659,6 +772,48 @@ def run(
             seq_chunk = int(s5.get("kd_seq_chunk_size", 512))
             loss = _chunked_vocab_kl(s_logits_shift, t_logits_shift, T, chunk_size=seq_chunk)
 
+            # --- First-batch sanity probe (added 2026-05-13) ---
+            # On the FIRST non-skipped iteration of the run (cold start OR
+            # resume), dump teacher/student/loss stats so we can verify the
+            # forward path BEFORE the optimizer touches anything. Raises if
+            # anything is NaN/Inf — much faster signal than waiting until
+            # step 50. The flag-based guard fires correctly on resumed runs
+            # (where `step` would be > 0 and a `step == 0` test would miss).
+            if not _first_batch_probed:
+                _log_first_batch_sanity(t_logits_shift, s_logits_shift, loss)
+                _first_batch_probed = True
+
+            # --- NaN tripwire (added 2026-05-13) ---
+            # If loss went non-finite, dump diagnostics and abort. Earlier
+            # crashes trained through 250+ NaN batches; this stops at batch 1.
+            if not torch.isfinite(loss):
+                _dump_nan_diagnostics(
+                    loss=loss,
+                    teacher_logits=t_logits_shift,
+                    student_logits=s_logits_shift,
+                    student=student,
+                    epoch=epoch, step=step, batch_i=i,
+                )
+                raise RuntimeError(
+                    f"Stage 5 KD loss is non-finite at epoch={epoch} step={step} "
+                    f"batch={i}: loss={float(loss):.6e}. See ERROR-level dump above "
+                    "for teacher/student/param state. Aborting before backward()."
+                )
+
+            # --- Per-step debug log (env-gated, added 2026-05-13) ---
+            # Fine-grained instantaneous loss for the first N steps when
+            # STAGE5_DEBUG_PER_STEP=1. Falls back to the 50-step window log
+            # after the burn-in window.
+            if os.environ.get("STAGE5_DEBUG_PER_STEP", "0") == "1" and step <= int(
+                os.environ.get("STAGE5_DEBUG_PER_STEP_LIMIT", "20")
+            ):
+                log.info(
+                    "  DEBUG epoch=%d step=%d i=%d loss=%.6e t_max=%.3e s_max=%.3e",
+                    epoch, step, i, float(loss),
+                    float(t_logits_shift.detach().abs().max()),
+                    float(s_logits_shift.detach().abs().max()),
+                )
+
             window_loss_acc.append(loss.detach())
             (loss / grad_accum).backward()
 
@@ -699,6 +854,22 @@ def run(
                         "stage5/grad_norm": grad_norm,
                     }
                     _trackio_log(payload)
+
+                # --- Periodic param sanity (env-gated, added 2026-05-13) ---
+                # When STAGE5_PARAM_CHECK_EVERY=K, run an O(params) NaN/Inf scan
+                # every K optimizer steps. Catches silent NaN drift in router
+                # weights that wouldn't show up in the next-batch loss (e.g., a
+                # param goes NaN but the forward zeros it before loss computes).
+                _param_check_every = int(os.environ.get("STAGE5_PARAM_CHECK_EVERY", "0"))
+                if _param_check_every > 0 and step % _param_check_every == 0:
+                    _bad_params = _check_param_sanity(student, step)
+                    if _bad_params:
+                        raise RuntimeError(
+                            f"Stage 5 param sanity FAILED at step={step}: "
+                            f"non-finite trainable params: {_bad_params}. "
+                            "Some router weight went NaN/Inf without surfacing in loss — "
+                            "halting to preserve diagnostics."
+                        )
 
                 # Periodic checkpoint for crash-resume.
                 if partial_dir is not None and ckpt_every > 0 and step % ckpt_every == 0:
