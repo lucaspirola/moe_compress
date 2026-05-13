@@ -335,21 +335,23 @@ stage6_validate:
   # below with the actual HF dataset revision SHAs before a production run.
   # WARNING: this config will RuntimeError at Stage 6 startup until SHAs are pinned.
   # To run a smoke test that skips Stage 6 verification, set strict_revision_pinning: false.
-  strict_revision_pinning: false  # Opt-out 2026-05-13: dataset SHAs not yet pinned
-                                  # in the placeholders below. This is the smoke-test
-                                  # path; A0..A11 final scientific comparison requires
-                                  # SHAs pinned for reproducibility (flip back to true
-                                  # after filling wikitext_ppl/humaneval/math500 below).
+  strict_revision_pinning: true   # Production: dataset SHAs are pinned below. Flipping
+                                  # back to false should only be done for non-scientific
+                                  # smoke tests; do NOT use the false path for A0..A11
+                                  # final result reporting (reproducibility requirement).
   dataset_revisions:
-    wikitext_ppl:    null   # Salesforce/wikitext (wikitext-2-raw-v1) — used by _wikitext2_ppl AND imatrix calibration corpus (train split)
+    # SHAs resolved via huggingface_hub.HfApi().dataset_info(repo_id).sha
+    # on 2026-05-13 04:25 UTC. Update only if a dataset's content changes
+    # AND you intend to re-run all 12 ablations against the new content.
+    wikitext_ppl:    b08601e04326c79dfdd32d625aee71d232d685c3   # Salesforce/wikitext (wikitext-2-raw-v1) — used by _wikitext2_ppl AND imatrix calibration corpus (train split)
     # F-iter4-HIGH-1: hellaswag/arc_challenge keys removed — lm-eval pulls its
     # own dataset revisions internally and our load path cannot enforce a SHA
     # at simple_evaluate time. Pin via lm-eval task YAMLs if precise revision
     # control is required; otherwise accept lm-eval's default. The cache-key
     # auto-invalidates on lm_eval_version change (and on the lm-eval task
     # config hash; see _teacher_cache_key).
-    humaneval:       null   # openai_humaneval (preferred id: openai/openai_humaneval)
-    math500:         null   # HuggingFaceH4/MATH-500
+    humaneval:       7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544   # openai/openai_humaneval
+    math500:         6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be   # HuggingFaceH4/MATH-500
   zero_shot:
     enabled: true
     tasks: [arc_challenge, hellaswag]
