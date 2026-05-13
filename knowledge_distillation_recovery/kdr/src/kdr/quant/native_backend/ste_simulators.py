@@ -37,6 +37,7 @@ intentional and should NOT be normalised by switching either side.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import cast
 
@@ -47,6 +48,23 @@ from .gguf_codebooks import (
     get_iq2xs_joint,
     get_kvalues_iq4nl,
 )
+
+
+def _iq2xs_argmin_use_bf16() -> bool:
+    """Opt-in switch for bf16 codebook search inside IQ2_XS's tile loop.
+
+    Enabled by ``KDR_IQ2XS_BF16_ARGMIN=1``. Default is fp32 (the
+    historical, validated path). When enabled, the tile @ codebook
+    inner-product runs in bf16 (~2× throughput on B200 tensor cores)
+    and we recast to fp32 for the `code_sq - 2*inner` comparison so
+    argmin stability is preserved against the fp32 baseline. Argmin
+    itself stays fp32-comparison.
+
+    The test in `tests/test_iq2_xs_bf16_argmin.py` gates correctness
+    (≥99% identical argmins, reconstruction-MSE delta bound).
+    """
+    val = os.environ.get("KDR_IQ2XS_BF16_ARGMIN", "0").strip().lower()
+    return val in {"1", "true", "yes", "on"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Symmetric integer STE (INT8 / INT4 / INT3 / INT2)
@@ -388,6 +406,17 @@ def _iq2xs_snap_block(super_blocks: torch.Tensor) -> torch.Tensor:
     # ``code_sq`` (65536,) are pulled from a per-(device, dtype) cache —
     # they only depend on the codebook constants, not on ``flat``.
 
+    # Optional bf16 path for the inner-product (≈2× on B200 tensor cores).
+    # ``joint_flat_t`` is the fp32 transpose; cast once outside the tile
+    # loop so we don't pay a cast per tile.
+    use_bf16 = (
+        _iq2xs_argmin_use_bf16()
+        and joint_flat_t.is_floating_point()
+        and joint_flat_t.device.type == "cuda"
+    )
+    if use_bf16:
+        joint_flat_t_bf16 = joint_flat_t.to(torch.bfloat16)
+
     for start in range(0, n_total, _IQ2XS_ARGMIN_TILE_MAX):
         stop = min(start + _IQ2XS_ARGMIN_TILE_MAX, n_total)
         tile = flat[start:stop]  # (tile_n, 8)
@@ -395,7 +424,10 @@ def _iq2xs_snap_block(super_blocks: torch.Tensor) -> torch.Tensor:
         # We only need argmin, so ||tile||^2 cancels and we compare
         # ||code||^2 - 2 <tile, code>. Multiply against the cached
         # contiguous transpose so the matmul kernel skips a transpose op.
-        inner = tile @ joint_flat_t  # (tile_n, 65536)
+        if use_bf16:
+            inner = (tile.to(torch.bfloat16) @ joint_flat_t_bf16).float()
+        else:
+            inner = tile @ joint_flat_t  # (tile_n, 65536)
         dist = code_sq.unsqueeze(0) - 2.0 * inner  # (tile_n, 65536)
         best = dist.argmin(dim=-1)  # (tile_n,)
         # Decode best index → (magnitude_idx, sign_idx) and look up the
