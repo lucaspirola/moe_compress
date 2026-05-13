@@ -38,12 +38,12 @@ import torch.nn.utils.parametrize as parametrize
 from ..interface import QuantBlockSubset
 from ..specs import Format, KVQuantSpec, WeightPatternSpec
 from .ste_simulators import (
-    int_quant_ste,
-    iq2_xs_quant_ste,
-    iq4_xs_quant_ste,
+    int_quant_snap,
+    iq2_xs_quant_snap,
+    iq4_xs_quant_snap,
     mxfp4_kv_ste,
-    q3_k_quant_ste,
-    q5_k_quant_ste,
+    q3_k_quant_snap,
+    q5_k_quant_snap,
 )
 
 log = logging.getLogger(__name__)
@@ -54,12 +54,67 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class _IntQuantWeight(nn.Module):
+class _CachingSTEParametrization(nn.Module):
+    """Base class for STE weight parametrizations with a per-optim-step
+    snap cache.
+
+    ``nn.utils.parametrize`` re-invokes :meth:`forward` on every access of
+    ``module.weight``, but within one ``gradient_accumulation`` window the
+    underlying weight is frozen — the snap result is identical across all
+    micros. Caching the snap and reconstructing the STE formula
+    ``w + (snap - w).detach()`` on each call preserves autograd semantics
+    (gradient still flows through ``w``; the detached delta carries no
+    gradient) while saving N-1 redundant snap computations per window.
+
+    Subclasses implement :meth:`_snap` to return the detached snap value
+    in ``w.dtype``. Cache invalidation is the trainer's responsibility:
+    after ``optim.step()`` advances the weight, the
+    ``post_optim_step_callbacks`` machinery calls
+    :meth:`NativeBackend.invalidate_ste_cache`, which walks every
+    parametrized Linear and clears each parametrization's cache.
+
+    The cache is NOT a buffer — it must not serialize with the module
+    (would bloat checkpoints and pin a device). It's a plain attribute.
+    """
+
+    _cached_snap: torch.Tensor | None
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cached_snap = None
+
+    def _snap(self, w: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        cached = self._cached_snap
+        if (
+            cached is None
+            or cached.shape != w.shape
+            or cached.dtype != w.dtype
+            or cached.device != w.device
+        ):
+            cached = self._snap(w)
+            self._cached_snap = cached
+        # STE: forward == cached snap; backward == identity over w via the
+        # detached delta. Recreating this expression each forward is what
+        # ties the autograd graph to the *current* w (a fresh leaf every
+        # forward), even though the snap value itself is reused.
+        return w + (cached - w).detach()
+
+    def invalidate_cache(self) -> None:
+        """Drop the cached snap so the next forward recomputes from the
+        current weight."""
+        self._cached_snap = None
+
+
+class _IntQuantWeight(_CachingSTEParametrization):
     """``nn.utils.parametrize`` parametrization that fake-quants a weight.
 
     On every access of ``module.weight``, PyTorch routes through this
     parametrization's forward, so the matmul sees the fake-quanted tensor
-    with STE gradient pass-through.
+    with STE gradient pass-through. The snap is cached per-optim-step
+    (see :class:`_CachingSTEParametrization`).
     """
 
     def __init__(self, bits: int, axis: int) -> None:
@@ -67,48 +122,36 @@ class _IntQuantWeight(nn.Module):
         self.bits = bits
         self.axis = axis
 
-    def forward(self, w: torch.Tensor) -> torch.Tensor:
-        return int_quant_ste(w, self.bits, axis=self.axis)
+    def _snap(self, w: torch.Tensor) -> torch.Tensor:
+        return int_quant_snap(w, self.bits, axis=self.axis)
 
 
-class _IQ2XSQuantWeight(nn.Module):
+class _IQ2XSQuantWeight(_CachingSTEParametrization):
     """IQ2_XS codebook STE parametrization (axis=-1 per LLR-0015)."""
 
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, w: torch.Tensor) -> torch.Tensor:
-        return iq2_xs_quant_ste(w, axis=-1)
+    def _snap(self, w: torch.Tensor) -> torch.Tensor:
+        return iq2_xs_quant_snap(w, axis=-1)
 
 
-class _Q3KQuantWeight(nn.Module):
+class _Q3KQuantWeight(_CachingSTEParametrization):
     """Q3_K codebook STE parametrization (axis=-1 per LLR-0015)."""
 
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, w: torch.Tensor) -> torch.Tensor:
-        return q3_k_quant_ste(w, axis=-1)
+    def _snap(self, w: torch.Tensor) -> torch.Tensor:
+        return q3_k_quant_snap(w, axis=-1)
 
 
-class _IQ4XSQuantWeight(nn.Module):
+class _IQ4XSQuantWeight(_CachingSTEParametrization):
     """IQ4_XS codebook STE parametrization (axis=-1 per LLR-0015)."""
 
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, w: torch.Tensor) -> torch.Tensor:
-        return iq4_xs_quant_ste(w, axis=-1)
+    def _snap(self, w: torch.Tensor) -> torch.Tensor:
+        return iq4_xs_quant_snap(w, axis=-1)
 
 
-class _Q5KQuantWeight(nn.Module):
+class _Q5KQuantWeight(_CachingSTEParametrization):
     """Q5_K codebook STE parametrization (axis=-1 per LLR-0015)."""
 
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, w: torch.Tensor) -> torch.Tensor:
-        return q5_k_quant_ste(w, axis=-1)
+    def _snap(self, w: torch.Tensor) -> torch.Tensor:
+        return q5_k_quant_snap(w, axis=-1)
 
 
 _GGUF_PARAMETRIZATIONS: dict[str, type[nn.Module]] = {
@@ -162,6 +205,32 @@ class NativeBackend:
             self._install_kv_quant(
                 model, key=quant_block.key, value=quant_block.value
             )
+
+    def invalidate_ste_cache(self) -> None:
+        """Drop every parametrized Linear's cached snap.
+
+        Called by the trainer immediately after ``optim.step()`` advances
+        the weights. The next forward then recomputes the snap from the
+        new weights and caches it for the upcoming ``gradient_accumulation``
+        window.
+
+        Idempotent: safe to call on a backend with no parametrizations
+        installed (e.g. a KV-only configuration) — the loop is a no-op.
+        """
+        for module in self._parametrized:
+            # `module.parametrizations.weight` is a `ParametrizationList`;
+            # the entry installed by `_install_one` is the only one we
+            # registered on `.weight`, so index 0 is unambiguous here.
+            parametrizations = getattr(module, "parametrizations", None)
+            if parametrizations is None:
+                continue
+            weight_params = parametrizations.get("weight")
+            if weight_params is None or len(weight_params) == 0:
+                continue
+            param = weight_params[0]
+            invalidate = getattr(param, "invalidate_cache", None)
+            if callable(invalidate):
+                invalidate()
 
     def save(self, model: nn.Module, output_dir: Path) -> None:
         """Save the model with simulated-quanted weights in BF16 safetensors.
