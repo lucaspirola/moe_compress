@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -578,6 +580,16 @@ class _LoopState:
         self.micro_in_window = 0
         self.last_real_loss: float | None = None
 
+        # Observability knobs (env-tunable so YAML edits aren't required).
+        # KDR_MICRO_HEARTBEAT=N    -> emit a heartbeat log every N micro-batches
+        #                            (0 disables; default 4). Reports the
+        #                            instantaneous loss and the wall-time
+        #                            since the previous heartbeat so a stalled
+        #                            forward is detectable inside one window.
+        self._micro_heartbeat_every = int(os.environ.get("KDR_MICRO_HEARTBEAT", "4") or "0")
+        self._micro_heartbeat_t0 = time.monotonic()
+        self._step_t0 = time.monotonic()
+
     # REQ: LLR-0043
     def run(self) -> None:
         """Iterate calibration batches and step the optimizer.
@@ -712,6 +724,24 @@ class _LoopState:
         del t_logits, s_logits
         self.micro_in_window += 1
 
+        if (
+            self._micro_heartbeat_every > 0
+            and self.accelerator.is_main_process
+            and self.micro_in_window % self._micro_heartbeat_every == 0
+        ):
+            now = time.monotonic()
+            dt = now - self._micro_heartbeat_t0
+            self._micro_heartbeat_t0 = now
+            log.info(
+                "heartbeat step=%d micro=%d/%d loss=%.6f dt=%.1fs (%.1fs/micro)",
+                self.step,
+                self.micro_in_window,
+                self.grad_accum,
+                self.last_real_loss if self.last_real_loss is not None else float("nan"),
+                dt,
+                dt / max(1, self._micro_heartbeat_every),
+            )
+
         if self.micro_in_window % self.grad_accum == 0:
             self._commit_window()
 
@@ -753,12 +783,15 @@ class _LoopState:
             self.consecutive_nan_windows = 0
         self.nan_in_current_window = False
 
-        if (
-            self.accelerator.is_main_process
-            and self.step % self.dconf.log_every_n_steps == 0
+        if self.accelerator.is_main_process and (
+            self.step == 1
+            or self.step % self.dconf.log_every_n_steps == 0
         ):
+            now = time.monotonic()
+            step_dt = now - self._step_t0
+            self._step_t0 = now
             log.info(
-                "step=%d/%d lr=%.3e loss=%.6f tok=%.2fB/%.2fB nan_skip=%.2fM",
+                "step=%d/%d lr=%.3e loss=%.6f tok=%.2fB/%.2fB nan_skip=%.2fM step_dt=%.1fs",
                 self.step,
                 self.total_steps,
                 self.optim.param_groups[0]["lr"],
@@ -768,6 +801,7 @@ class _LoopState:
                 self.tokens_with_grad / 1e9,
                 self.dconf.total_tokens / 1e9,
                 self.tokens_skipped_nan / 1e6,
+                step_dt,
             )
 
         # REQ: LLR-0049
