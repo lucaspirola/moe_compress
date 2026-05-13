@@ -218,14 +218,16 @@ class NativeBackend:
         installed (e.g. a KV-only configuration) — the loop is a no-op.
         """
         for module in self._parametrized:
-            # `module.parametrizations.weight` is a `ParametrizationList`;
-            # the entry installed by `_install_one` is the only one we
-            # registered on `.weight`, so index 0 is unambiguous here.
+            # `module.parametrizations.weight` is a `ParametrizationList`
+            # registered by `_install_one`. `nn.ModuleDict` (the type of
+            # `module.parametrizations`) does NOT implement `.get()`;
+            # use `in` + indexing instead. The list is non-empty by
+            # construction (one entry, the parametrization we registered).
             parametrizations = getattr(module, "parametrizations", None)
-            if parametrizations is None:
+            if parametrizations is None or "weight" not in parametrizations:
                 continue
-            weight_params = parametrizations.get("weight")
-            if weight_params is None or len(weight_params) == 0:
+            weight_params = parametrizations["weight"]
+            if len(weight_params) == 0:
                 continue
             param = weight_params[0]
             invalidate = getattr(param, "invalidate_cache", None)
