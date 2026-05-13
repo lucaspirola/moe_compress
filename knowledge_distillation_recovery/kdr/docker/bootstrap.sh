@@ -153,6 +153,21 @@ if ! pip install --upgrade --quiet "huggingface_hub>=1.10.0"; then
     exit 3
 fi
 
+# Install nvidia-modelopt. The shared moe-compress image does NOT ship modelopt
+# by default (it's an optional extra in kdr/pyproject.toml because not every
+# recipe needs it). But kdr's factory routes any (target, format, bits) tuple
+# that modelopt supports — including INT4 KV — to ModelOptBackend per
+# `feature_matrix.SUPPORTED_QUANTS` (LLR-0016). Without modelopt installed,
+# `partition_and_dispatch` succeeds but `ModelOptBackend.apply_quant` fails
+# with `ModuleNotFoundError: No module named 'modelopt'` when it tries to
+# `import modelopt.torch.quantization as mtq`. Caught live on instance
+# 36681182 after the Profile-J spec_map routed all 7 weight patterns to
+# Native and KV (INT4 K + INT4 V) to ModelOpt.
+if ! pip install --upgrade --quiet "nvidia-modelopt>=0.21.0"; then
+    echo "ERROR: nvidia-modelopt>=0.21.0 install failed." >&2
+    exit 3
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Snapshot-download student (HF_TOKEN read from env by huggingface_hub)
 # ─────────────────────────────────────────────────────────────────────────────
