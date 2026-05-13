@@ -222,20 +222,26 @@ stage4_eora:
 stage5_router_kd:
   optimizer: adamw
   learning_rate: 5.0e-5           # paper Table 1 (§F.3)
-  epochs: 2                       # Bumped 2026-05-13 from 1 → 2 after the first
-                                  # successful Stage 2.5 run (B200 BF16 teacher)
-                                  # showed loss still descending at step 350
-                                  # (0.134, down from 0.282 at step 250). A second
-                                  # epoch re-passes the same calibration data and
-                                  # typically halves the final KD loss for free
-                                  # at constant data — better ROI than just adding
-                                  # more samples until first-epoch saturation is
-                                  # reached.
+  weight_decay: 0.01              # Bumped 2026-05-13 from 0.0 → 0.01 after the
+                                  # 2-epoch / 6000-sample run showed the loss
+                                  # bottom out at step 950 (0.117) then RISE
+                                  # back to 0.169 by step 1400 — clear memorization
+                                  # of the calibration corpus. Mild weight decay
+                                  # regularizes router weights against drift past
+                                  # the optimum. The paper does not specify this,
+                                  # but our empirical loss curve was textbook
+                                  # overfit; 0.01 is the AdamW default.
+  epochs: 1                       # Rolled back from 2 → 1 on 2026-05-13 after
+                                  # the 2-epoch run overfit: epoch 1 mean rose
+                                  # from 0.146 (steps 800-1000) → 0.205
+                                  # (steps 1250-1400). A single 6000-sample pass
+                                  # at 750 steps reaches the same minimum loss
+                                  # without the late-training memorization.
   # batch_size × gradient_accumulation = effective batch (=8).
   # H200 (141 GB VRAM): teacher BF16 (~70 GB) + student BF16 (~50 GB) = ~120 GB.
   # At bs=8, vocab logits + small KV-cache headroom consume ~6 GB, leaving ~15 GB headroom.
   # bs=8 with grad_accum=1 eliminates gradient accumulation overhead entirely:
-  # 750 forward passes (= 750 optimizer steps at 6000 samples × 2 epochs / 8 batch).
+  # 750 forward passes (= 750 optimizer steps at 6000 samples / 8 batch / 1 epoch).
   # Same effective batch as paper (8×1 = 2×4 = 8).
   batch_size: 8
   gradient_accumulation: 1
