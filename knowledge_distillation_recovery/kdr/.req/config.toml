@@ -1,0 +1,12 @@
+project = "kdr — Knowledge Distillation Recovery"
+source_dirs = [
+    "src",
+    "tests",
+    "docker",
+    "tools",
+    ".",
+]
+requirements_dir = "requirements"
+default_adapter = "markdown"
+
+[profiles]

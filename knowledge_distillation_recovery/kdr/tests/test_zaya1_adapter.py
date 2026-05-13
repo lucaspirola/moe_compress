@@ -281,11 +281,19 @@ def _fake_zaya_shaped_model() -> nn.Module:
     """A more elaborate fake whose dotted module names mirror ZAYA1's layout
     enough to exercise the carve-out / attention-path matchers."""
 
+    class QKV(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear_q = nn.Linear(8, 8, bias=False)
+            self.linear_k = nn.Linear(8, 8, bias=False)
+            self.val_proj1 = nn.Linear(8, 8, bias=False)  # CCA value F16 carve-out
+            self.val_proj2 = nn.Linear(8, 8, bias=False)  # CCA value F16 carve-out
+
     class CCAAttn(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.q_compressor = nn.Linear(8, 8, bias=False)
-            self.kv_compressor = nn.Linear(8, 8, bias=False)
+            self.qkv = QKV()
+            self.o_proj = nn.Linear(8, 8, bias=False)
 
     class MoEFFN(nn.Module):
         def __init__(self) -> None:
@@ -324,24 +332,52 @@ def test_fp32_carve_outs_includes_lm_head() -> None:
 
 
 # REQ: VERIFIES: LLR-0024
+# REQ: VERIFIES: LLR-0057
 def test_fp32_carve_outs_resolve_to_non_empty_submodule_sets() -> None:
-    """LLR-0024 AC #2: every returned pattern matches at least one submodule
-    on a ZAYA1-shaped instantiated model."""
+    """LLR-0024 AC #2 / LLR-0057 AC: every returned pattern matches at least
+    one submodule on a ZAYA1-shaped instantiated model."""
     model = _fake_zaya_shaped_model()
     patterns = Zaya1Adapter().fp32_carve_outs(model)
     names = [n for n, _ in model.named_modules()]
     for pattern in patterns:
-        # `cca_cache` is ZAYA1-specific runtime state and may not match on
-        # this fake model — skip it from the resolution check (the fake
-        # doesn't simulate the cache module). The remaining patterns must
-        # all match.
-        if pattern == "cca_cache":
-            continue
         matches = [n for n in names if pattern in n]
         assert matches, (
             f"carve-out pattern {pattern!r} resolved to ZERO submodules on "
             f"the fake ZAYA1 model — would silently skip the carve-out on real ZAYA1"
         )
+
+
+# REQ: VERIFIES: LLR-0057
+def test_fp32_carve_outs_matches_zaya1_real_substrings() -> None:
+    """LLR-0057 AC: returned list is the 5 ZAYA1-real carve-out substrings."""
+    out = Zaya1Adapter().fp32_carve_outs(_fake_zaya_shaped_model())
+    assert set(out) == {"lm_head", "embed_tokens", "router", "norm", "val_proj"}
+    assert len(out) == 5, f"expected exactly 5 entries, no duplicates; got {out!r}"
+
+
+# REQ: VERIFIES: LLR-0057
+def test_fp32_carve_outs_val_proj_matches_both_cca_value_linears() -> None:
+    """LLR-0057 AC: `val_proj` substring catches both val_proj1 and val_proj2."""
+    model = _fake_zaya_shaped_model()
+    names = [n for n, _ in model.named_modules()]
+    val_proj_matches = [n for n in names if "val_proj" in n]
+    # Two layers × two val_proj Linears each = 4 modules expected.
+    assert len(val_proj_matches) == 4
+    assert all("val_proj" in n for n in val_proj_matches)
+    assert all(n.endswith(("val_proj1", "val_proj2")) for n in val_proj_matches)
+
+
+# REQ: VERIFIES: LLR-0057
+def test_fp32_carve_outs_val_proj_no_collision_outside_cca() -> None:
+    """LLR-0057 AC: `val_proj` does not match any non-CCA module."""
+    model = _fake_zaya_shaped_model()
+    names = [n for n, _ in model.named_modules()]
+    # Every val_proj match is under self_attn.qkv.
+    for n in names:
+        if "val_proj" in n:
+            assert "self_attn.qkv" in n, (
+                f"unexpected val_proj match outside the CCA path: {n!r}"
+            )
 
 
 # REQ: VERIFIES: LLR-0026

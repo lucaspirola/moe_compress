@@ -337,12 +337,17 @@ def test_uniform_weight_routes_to_native_for_unsupported_formats(
     """A Uniform config with `format=q3_k` routes weight to Native (single-
     pattern GGUF fall-through)."""
     qb = _qb(_w(3, "q3_k"), _kv(3, "int"), _kv(3, "int", granularity="token"))
-    # NativeBackend's apply_quant for q3_k will hit its in-backend
-    # NotImplementedError (format != "int") — that's a Task 5 concern.
-    # We catch and inspect routing only.
+    # Make the routing assumption explicit: q3_k is NOT supported by ModelOpt's
+    # feature_matrix, so the factory must route it to Native.
+    from kdr.quant.modelopt_backend import feature_matrix
+    assert qb.weight.format == "q3_k"
+    assert feature_matrix.is_supported("weight", "q3_k", 3) is False
+    # NativeBackend's apply_quant validates (format, granularity) per Task 5:
+    # q3_k requires granularity='block', but the uniform config uses 'channel'.
+    # That's the error path we catch here to confirm routing landed on Native.
     with (
         patch("modelopt.torch.quantization.quantize", new=_mock_mtq_quantize()),
-        pytest.raises(NotImplementedError, match="format='q3_k'"),
+        pytest.raises(NotImplementedError, match="requires granularity='block'"),
     ):
         partition_and_dispatch(
             tiny_model,
@@ -353,32 +358,43 @@ def test_uniform_weight_routes_to_native_for_unsupported_formats(
         )
 
 
-def test_mixed_weight_all_gguf_routes_to_native(
-    tiny_model: nn.Module,
-) -> None:
-    """All four GGUF entries land on Native; ModelOpt receives no weight."""
+def test_mixed_weight_all_gguf_routes_to_native() -> None:
+    """All four GGUF entries land on Native; ModelOpt receives no weight.
+
+    Uses a 256-wide stand-in model so the GGUF STE's super-block-of-256
+    requirement is met when `register_parametrization` calls the forward
+    once at install time.
+    """
+    model = nn.Sequential()
+    model.add_module("up_proj", nn.Linear(256, 256))
+    model.add_module("down_proj", nn.Linear(256, 256))
     spec_map = [
         _wp(2, "iq2_xs", granularity="block", pattern="experts"),
         _wp(3, "q3_k", granularity="block", pattern="up_proj"),
         _wp(4, "iq4_xs", granularity="block", pattern="down_proj"),
-        _wp(5, "q5_k", granularity="block", pattern=""),  # catch-all last
+        _wp(5, "q5_k", granularity="block", pattern=""),  # catch-all
     ]
     qb = _qb_mixed(
         spec_map,
         _kv(3, "int"),
         _kv(3, "int", granularity="token"),
     )
-    # The NativeBackend.apply_quant will raise NotImplementedError on the
-    # multi-pattern list (Task 5 territory). We assert that error to confirm
-    # all four landed there.
-    with pytest.raises(NotImplementedError, match="mixed-spec weight install"):
-        partition_and_dispatch(
-            tiny_model,
-            qb,
-            calibration_batches=None,
-            ptq_subset_size=0,
-            attention_module_paths=[],
-        )
+    backends = partition_and_dispatch(
+        model,
+        qb,
+        calibration_batches=None,
+        ptq_subset_size=0,
+        attention_module_paths=[],
+    )
+    names = sorted(b.name for b in backends)
+    assert names == ["native"]
+    native = backends[0]
+    sub = getattr(native, "_quant_block", None)
+    assert sub is not None
+    assert sub.weight is not None
+    assert [s.format for s in sub.weight] == [
+        "iq2_xs", "q3_k", "iq4_xs", "q5_k"
+    ]
 
 
 def test_mixed_weight_hybrid_splits_across_backends(
@@ -386,20 +402,24 @@ def test_mixed_weight_hybrid_splits_across_backends(
 ) -> None:
     """One NVFP4 entry (modelopt) + one IQ2_XS entry (Native) → NVFP4 →
     ModelOpt as a single-entry list (passes the A4/A5 guard), IQ2_XS →
-    Native as a single-entry list with a non-empty pattern (raises
-    Task-5 NotImplementedError before the format/granularity gates fire).
+    Native as a single-entry list with a non-empty pattern.
+
+    `tiny_model`'s Linears are named '0' and '1' — neither matches
+    'up_proj' or 'down_proj', so Native raises ValueError on the first
+    unmatched non-carve-out Linear, confirming the IQ2_XS spec landed
+    on Native.
     """
     spec_map = [
         _wp(4, "nvfp4", granularity="block", pattern="up_proj"),
         _wp(2, "iq2_xs", granularity="block", pattern="down_proj"),
     ]
     qb = _qb_mixed(spec_map, _kv(4, "int"), _kv(4, "int", granularity="token"))
-    # NativeBackend.apply_quant trips on the IQ2_XS single-pattern entry
-    # (non-empty pattern → Task-5 NotImplementedError fires before the
-    # format/granularity gates inside _install_weight_quant).
+    # `tiny_model`'s Linears are named ``0`` and ``1``; neither matches the
+    # ``up_proj`` or ``down_proj`` patterns. After Task 5 wiring, Native
+    # raises ValueError on the first unmatched non-carve-out Linear.
     with (
         patch("modelopt.torch.quantization.quantize", new=_mock_mtq_quantize()),
-        pytest.raises(NotImplementedError, match="mixed-spec weight install"),
+        pytest.raises(ValueError, match="matched no spec_map pattern"),
     ):
         partition_and_dispatch(
             tiny_model,

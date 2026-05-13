@@ -5,6 +5,10 @@ HLR-0012 — kdr does not silently coerce types and does not silently ignore
 unknown YAML fields.
 """
 
+# REQ: LLR-0009
+# REQ: LLR-0010
+# REQ: LLR-0012
+
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator

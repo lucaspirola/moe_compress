@@ -19,21 +19,32 @@ simulator functions themselves are general (any axis), so adding more is a
 backend-local change.
 """
 
+# REQ: LLR-0013
 # REQ: LLR-0015
+# REQ: LLR-0055
+# REQ: LLR-0056
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from typing import get_args
 
 import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
 
 from ..interface import QuantBlockSubset
-from ..specs import KVQuantSpec, WeightPatternSpec
-from .ste_simulators import int_quant_ste, mxfp4_kv_ste
+from ..specs import Format, KVQuantSpec, WeightPatternSpec
+from .ste_simulators import (
+    int_quant_ste,
+    iq2_xs_quant_ste,
+    iq4_xs_quant_ste,
+    mxfp4_kv_ste,
+    q3_k_quant_ste,
+    q5_k_quant_ste,
+)
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +69,59 @@ class _IntQuantWeight(nn.Module):
 
     def forward(self, w: torch.Tensor) -> torch.Tensor:
         return int_quant_ste(w, self.bits, axis=self.axis)
+
+
+class _IQ2XSQuantWeight(nn.Module):
+    """IQ2_XS codebook STE parametrization (axis=-1 per LLR-0015)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        return iq2_xs_quant_ste(w, axis=-1)
+
+
+class _Q3KQuantWeight(nn.Module):
+    """Q3_K codebook STE parametrization (axis=-1 per LLR-0015)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        return q3_k_quant_ste(w, axis=-1)
+
+
+class _IQ4XSQuantWeight(nn.Module):
+    """IQ4_XS codebook STE parametrization (axis=-1 per LLR-0015)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        return iq4_xs_quant_ste(w, axis=-1)
+
+
+class _Q5KQuantWeight(nn.Module):
+    """Q5_K codebook STE parametrization (axis=-1 per LLR-0015)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        return q5_k_quant_ste(w, axis=-1)
+
+
+_GGUF_PARAMETRIZATIONS: dict[str, type[nn.Module]] = {
+    "iq2_xs": _IQ2XSQuantWeight,
+    "q3_k": _Q3KQuantWeight,
+    "iq4_xs": _IQ4XSQuantWeight,
+    "q5_k": _Q5KQuantWeight,
+}
+
+
+_GGUF_FORMATS_ACCEPTED_BY_SCHEMA: frozenset[str] = frozenset(
+    f for f in get_args(Format) if f not in {"int", "fp8", "mxfp4", "nvfp4"}
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,42 +157,36 @@ class NativeBackend:
         self._quant_block = quant_block
 
         if quant_block.weight is not None:
-            if (
-                len(quant_block.weight) == 1
-                and quant_block.weight[0].pattern == ""
-            ):
-                # Uniform shim path: single empty-pattern entry, install
-                # globally over every non-carve-out Linear as before.
-                self._install_weight_quant(model, quant_block.weight[0])
-            else:
-                raise NotImplementedError(
-                    "NativeBackend mixed-spec weight install (list with "
-                    "multiple entries or non-empty patterns) lands in "
-                    "Phase 7.2 Task 5. "
-                    f"Got {len(quant_block.weight)} pattern(s): "
-                    f"{[p.pattern for p in quant_block.weight]!r}"
-                )
+            self._install_weight_quant(model, quant_block.weight)
         if quant_block.key is not None or quant_block.value is not None:
             self._install_kv_quant(
                 model, key=quant_block.key, value=quant_block.value
             )
 
     def save(self, model: nn.Module, output_dir: Path) -> None:
-        """Pure-Native compressed-tensors save is a Phase 6 concern.
+        """Save the model with simulated-quanted weights in BF16 safetensors.
 
-        v0 supports Native only for KV-cache fake-quant (KV-cache schemes are
-        runtime metadata, not stored tensors); when Native owns weight quant
-        too, the saved tensors live in the ``compressed_tensors`` packed
-        formats and require a Native-side converter that does not exist in
-        Phase 4. Mixed-mode runs (NVFP4 weight via ModelOpt + INT3 KV via
-        Native) save via the weight-handling backend (typically ModelOpt).
+        Reading ``module.weight`` while the parametrizations from
+        LLR-0055 are active routes through the parametrization's forward,
+        so ``state_dict()`` returns the fake-quanted tensors directly. The
+        BF16 cast keeps storage at the platform's inference dtype; the
+        per-pattern bit-widths are recorded into ``config.json`` by the
+        caller's ``_inject_quantization_config`` step (LLR-0056) and
+        consumed downstream by the GGUF converter (HLR-0017).
+
+        Pre-condition: this is called after ``apply_quant`` has installed
+        the parametrizations. If the dispatched subset carried only KV
+        hooks (no weight), the call is still safe — state_dict reads the
+        unmodified weights, which is the right behavior for a KV-only
+        run.
         """
-        raise NotImplementedError(
-            "NativeBackend.save: pure-Native weight save requires a "
-            "compressed_tensors converter for the chosen INT-N format. v0 "
-            "supports Native for KV quant only; pure-Native weight runs "
-            "wait on the Phase 6 vast.ai bootstrap to add an INT3/INT2 "
-            "compressed-tensors converter wrapper."
+        unwrapped = model
+        state_dict = {
+            name: tensor.detach().to(torch.bfloat16)
+            for name, tensor in unwrapped.state_dict().items()
+        }
+        unwrapped.save_pretrained(  # type: ignore[operator]
+            output_dir, state_dict=state_dict, safe_serialization=True
         )
 
     # ---- Hook lifecycle ---------------------------------------------------
@@ -150,49 +208,127 @@ class NativeBackend:
     # ---- Weight install ---------------------------------------------------
 
     def _install_weight_quant(
-        self, model: nn.Module, spec: WeightPatternSpec
+        self, model: nn.Module, specs: list[WeightPatternSpec]
     ) -> None:
-        """Register a parametrization on every non-carve-out ``nn.Linear``."""
-        assert spec.pattern == "", (
-            "_install_weight_quant in Task 3 only handles the uniform shim "
-            "(empty pattern; matches every Linear). Per-pattern install "
-            "lands in Task 5; apply_quant's caller must enforce this "
-            "invariant before reaching here."
-        )
-        if spec.granularity != "channel":
-            raise NotImplementedError(
-                f"NativeBackend weight granularity={spec.granularity!r} not "
-                "supported in v0; only 'channel' is implemented. Phase 5+ "
-                "extends this when needed."
-            )
-        if spec.format != "int":
-            raise NotImplementedError(
-                f"NativeBackend weight format={spec.format!r} not supported in "
-                "v0; INT3/INT2 paths use 'int'. Other formats route to "
-                "ModelOpt via feature_matrix."
-            )
-        if spec.transform != "none":
-            raise NotImplementedError(
-                f"weight transform={spec.transform!r} deferred to v1+ per the plan."
-            )
+        """Walk every ``nn.Linear`` and install the parametrization for the
+        first matching ``WeightPatternSpec`` (first-match-wins).
 
-        n_installed = 0
+        Precedence: explicit (non-empty) pattern match → carve-out →
+        empty-pattern fallback → ValueError. The empty-string ``pattern``
+        is a *fallback default* (the uniform-config shim normalises a
+        single uniform spec to ``pattern=""``); carve-outs MUST win over
+        it so v0 uniform configs continue to respect ``fp32_carve_outs``.
+        Explicit per-pattern specs (Profile-J's `gate_proj`, etc.) still
+        win over carve-outs, matching the locked design choice #5.
+        """
+        # Eager validation: reject incoherent or unwired specs up-front so
+        # malformed configs fail before the first forward pass.
+        for spec in specs:
+            self._validate_weight_spec(spec)
+
+        n_installed: dict[str, int] = {}
         for name, module in model.named_modules():
             if not isinstance(module, nn.Linear):
                 continue
+            matched = self._first_explicit_match(name, specs)
+            if matched is not None:
+                self._install_one(module, matched)
+                n_installed[matched.format] = n_installed.get(matched.format, 0) + 1
+                continue
             if self._is_carved_out(name):
                 continue
-            parametrize.register_parametrization(
-                module, "weight", _IntQuantWeight(spec.bits, axis=0)
+            fallback = self._fallback_spec(specs)
+            if fallback is not None:
+                self._install_one(module, fallback)
+                n_installed[fallback.format] = n_installed.get(fallback.format, 0) + 1
+                continue
+            raise ValueError(
+                f"NativeBackend: Linear {name!r} matched no spec_map "
+                "pattern and no fp32_carve_outs entry. Either add a "
+                "pattern that matches or list it under fp32_carve_outs."
             )
-            self._parametrized.append(module)
-            n_installed += 1
         log.info(
-            "NativeBackend: installed weight STE on %d Linear modules "
-            "(bits=%d, axis=0)",
-            n_installed,
-            spec.bits,
+            "NativeBackend: installed weight STE on %d Linear modules (%s)",
+            sum(n_installed.values()),
+            ", ".join(f"{k}={v}" for k, v in sorted(n_installed.items())),
         )
+
+    @staticmethod
+    def _first_explicit_match(
+        name: str, specs: list[WeightPatternSpec]
+    ) -> WeightPatternSpec | None:
+        """First spec whose non-empty ``pattern`` substring matches ``name``.
+
+        Empty-string patterns are NOT considered here — they are the
+        fallback default applied after carve-outs (see
+        ``_fallback_spec`` / ``_install_weight_quant``).
+        """
+        for spec in specs:
+            if spec.pattern != "" and spec.pattern in name:
+                return spec
+        return None
+
+    @staticmethod
+    def _fallback_spec(
+        specs: list[WeightPatternSpec],
+    ) -> WeightPatternSpec | None:
+        """First spec with empty ``pattern`` (uniform-config fallback), or None."""
+        for spec in specs:
+            if spec.pattern == "":
+                return spec
+        return None
+
+    @staticmethod
+    def _validate_weight_spec(spec: WeightPatternSpec) -> None:
+        """Reject (format, granularity, transform) tuples we can't install.
+
+        Eager validation per HLR-0013 / LLR-0055: raise BEFORE attempting
+        installation so a malformed config surfaces at training-start.
+        """
+        if spec.transform != "none":
+            raise NotImplementedError(
+                f"weight transform={spec.transform!r} deferred to v1+."
+            )
+        if spec.format == "int":
+            if spec.granularity != "channel":
+                raise NotImplementedError(
+                    f"NativeBackend weight format='int' granularity="
+                    f"{spec.granularity!r} not supported; only 'channel'."
+                )
+            return
+        if spec.format in _GGUF_PARAMETRIZATIONS:
+            if spec.granularity != "block":
+                raise NotImplementedError(
+                    f"NativeBackend weight format={spec.format!r} requires "
+                    f"granularity='block' (super-block-of-256 layout); got "
+                    f"{spec.granularity!r}."
+                )
+            return
+        if spec.format in _GGUF_FORMATS_ACCEPTED_BY_SCHEMA:
+            raise NotImplementedError(
+                f"NativeBackend weight format={spec.format!r} accepted by "
+                "schema but no STE simulator ships in Phase 7.2 — only "
+                "int, iq2_xs, q3_k, iq4_xs, q5_k are wired here."
+            )
+        # Non-GGUF non-int formats (fp8, mxfp4, nvfp4) shouldn't reach the
+        # native backend; the factory routes them to ModelOpt via the
+        # feature_matrix.
+        raise NotImplementedError(
+            f"NativeBackend weight format={spec.format!r} not supported "
+            "natively; expected routing to ModelOpt via feature_matrix."
+        )
+
+    def _install_one(
+        self, module: nn.Linear, spec: WeightPatternSpec
+    ) -> None:
+        """Register the parametrization for ``spec`` on ``module.weight``."""
+        param: nn.Module
+        if spec.format == "int":
+            param = _IntQuantWeight(spec.bits, axis=0)
+        else:
+            param = _GGUF_PARAMETRIZATIONS[spec.format]()
+        parametrize.register_parametrization(module, "weight", param)
+        self._parametrized.append(module)
 
     def _is_carved_out(self, dotted_name: str) -> bool:
         """Substring match against the carve-out list.

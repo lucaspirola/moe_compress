@@ -402,7 +402,7 @@ def _probe_max_batch_size(
                 t_out = teacher(input_ids=input_ids, use_cache=False).logits
             s_out = student(input_ids=input_ids, use_cache=False).logits
             loss = forward_kld_loss(s_out, t_out, temperature=temperature)
-            loss.backward()
+            loss.backward()  # type: ignore[no-untyped-call]
 
             if device.type == "cuda":
                 peak = torch.cuda.max_memory_allocated(device)
