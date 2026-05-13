@@ -1138,10 +1138,104 @@ def save_compressed_checkpoint(
     save_json_artifact(metadata, out_path / COMPRESSED_METADATA_FILENAME)
     log.info("  wrote %s (per_layer_num_experts: %d entries, factored_layers: %d)",
              COMPRESSED_METADATA_FILENAME, len(per_layer_num_experts), len(factored_layers))
-    model.save_pretrained(out_path, safe_serialization=True)
+
+    # IMPORTANT: bypass `model.save_pretrained(safe_serialization=True)` because
+    # HF's save_pretrained has internal MoE-aware logic that UNPACKS stacked
+    # expert tensors (`mlp.experts.gate_up_proj` shape `[E, 2I, H]`) into
+    # per-expert individual modules (`mlp.experts.M.{gate,up,down}_proj.weight`).
+    # That unpacking happens regardless of what state_dict we pass — HF walks
+    # the model's modules independently and ignores our state_dict for known
+    # MoE classes. Verified 2026-05-13 04:10 UTC by round-trip test on
+    # stage2_pruned/: state_dict() returned 1026 keys (80 stacked-expert),
+    # save_pretrained() wrote 24448 keys (23502 individual-expert), and
+    # save_pretrained(state_dict=...) ALSO wrote 24448 individual keys.
+    # The 24K-key format then fails to load via the streaming path
+    # below (Stage 6 RuntimeError: 80 missing keys; the load skeleton expects
+    # stacked `gate_up_proj`/`down_proj` Parameters).
+    #
+    # Direct safetensors write preserves the in-memory stacked form, matching
+    # Stage 2's output format. Sharding by ~5 GB per file follows HF's
+    # convention so the existing streaming loader picks them up unchanged
+    # (sorts `model-*.safetensors` glob).
+    _save_state_dict_sharded(
+        model.state_dict(), out_path, max_shard_size_bytes=5 * 1024**3,
+    )
+
+    # Save config and tokenizer separately (HF save_pretrained's other side-effects).
+    model.config.save_pretrained(out_path)
+    gen_config = getattr(model, "generation_config", None)
+    if gen_config is not None:
+        try:
+            gen_config.save_pretrained(out_path)
+        except Exception as exc:
+            log.warning("save_compressed_checkpoint: generation_config save failed (%s) — non-fatal", exc)
     if tokenizer is not None:
         tokenizer.save_pretrained(out_path)
     return out_path
+
+
+def _save_state_dict_sharded(
+    state_dict: dict,
+    out_path: "Path",
+    *,
+    max_shard_size_bytes: int = 5 * 1024**3,
+) -> None:
+    """Write a state_dict to ``out_path`` as multi-shard safetensors files,
+    producing ``model-NNNNN-of-MMMMM.safetensors`` + ``model.safetensors.index.json``.
+
+    Sharding by accumulated tensor size keeps each file ≤ ``max_shard_size_bytes``
+    (default 5 GiB, matching HF's per-shard convention). Keys are assigned to
+    shards in dict-iteration order; the index.json maps each key to its shard
+    filename.
+
+    Bypasses HF's `save_pretrained` (which unpacks MoE stacked tensors into
+    per-expert individual modules — see :func:`save_compressed_checkpoint`).
+    """
+    from safetensors.torch import save_file
+
+    # First pass: group tensors into shards.
+    shards: list[dict[str, torch.Tensor]] = [{}]
+    cur_size = 0
+    for key, tensor in state_dict.items():
+        # tensor.element_size() * tensor.numel() = bytes
+        n_bytes = tensor.element_size() * tensor.numel()
+        if cur_size + n_bytes > max_shard_size_bytes and shards[-1]:
+            shards.append({})
+            cur_size = 0
+        shards[-1][key] = tensor
+        cur_size += n_bytes
+
+    n_shards = len(shards)
+    log.info("Saving %d-shard safetensors (stacked MoE format) to %s",
+             n_shards, out_path)
+
+    # Second pass: write each shard. Use the HF-convention filename so the
+    # existing streaming loader picks them up via its `model-*.safetensors`
+    # glob without changes.
+    weight_map: dict[str, str] = {}
+    total_bytes = 0
+    for i, shard in enumerate(shards):
+        shard_name = f"model-{i + 1:05d}-of-{n_shards:05d}.safetensors"
+        shard_path = out_path / shard_name
+        # safetensors requires contiguous tensors on CPU. Detach + clone to
+        # CPU avoids tying memory to the live GPU model during write.
+        cpu_shard = {k: v.detach().cpu().contiguous() for k, v in shard.items()}
+        save_file(cpu_shard, str(shard_path))
+        del cpu_shard
+        for k in shard:
+            weight_map[k] = shard_name
+        shard_bytes = sum(t.element_size() * t.numel() for t in shard.values())
+        total_bytes += shard_bytes
+        log.info("  wrote shard %d/%d (%s, %.2f GB)",
+                 i + 1, n_shards, shard_name, shard_bytes / (1024**3))
+
+    index = {
+        "metadata": {"total_size": total_bytes},
+        "weight_map": weight_map,
+    }
+    save_json_artifact(index, out_path / "model.safetensors.index.json")
+    log.info("  wrote model.safetensors.index.json (%d keys, %.2f GB total)",
+             len(weight_map), total_bytes / (1024**3))
 
 
 def _canonical_device(d: torch.device) -> torch.device:
