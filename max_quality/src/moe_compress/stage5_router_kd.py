@@ -440,11 +440,16 @@ def run(
 
     # Optimizer constructed AFTER freezing so it only receives parameters that
     # have requires_grad=True at construction time.
+    # weight_decay is config-driven (default 0.0 to match the pre-2026-05-13
+    # baseline). On the 2026-05-13 A0 run (epochs=2, samples=6000) the loss
+    # bottomed at step 950 then RISE back to step-1400 levels — clear
+    # memorization. weight_decay=0.01 (AdamW default) regularizes router
+    # weights to counter that. The paper doesn't specify, but empirics on this
+    # model say 0.0 over-fits.
     optim = torch.optim.AdamW(
         [p for p in student.parameters() if p.requires_grad],
         lr=s5["learning_rate"],
-        weight_decay=0.0,  # paper Table 1 does not specify weight decay; default 0.01 would
-                           # regularize router weights toward zero, counteracting KD gradient.
+        weight_decay=float(s5.get("weight_decay", 0.0)),
     )
 
     # torch.compile applied AFTER freeze+optimizer construction so the compiled
