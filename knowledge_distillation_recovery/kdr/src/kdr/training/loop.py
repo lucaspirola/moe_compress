@@ -578,7 +578,11 @@ class _LoopState:
         # Per-step state
         self.step = resume_step
         self.micro_in_window = 0
-        self.last_real_loss: float | None = None
+        # `last_real_loss` is held as a 0-d GPU tensor so the per-micro
+        # update (line ~723) does NOT force a cudaStreamSynchronize; the
+        # `.item()` sync happens only inside the heartbeat / step log
+        # blocks where a Python float is actually needed.
+        self._last_real_loss_gpu: torch.Tensor | None = None
 
         # Observability knobs (env-tunable so YAML edits aren't required).
         # KDR_MICRO_HEARTBEAT=N    -> emit a heartbeat log every N micro-batches
@@ -720,7 +724,10 @@ class _LoopState:
 
         self.accelerator.backward(loss / self.grad_accum)
         if finite:
-            self.last_real_loss = float(loss.detach().item())
+            # Keep the loss on-device; sync happens only when the heartbeat
+            # / step log block formats the float. Saves one
+            # cudaStreamSynchronize per micro.
+            self._last_real_loss_gpu = loss.detach()
         del t_logits, s_logits
         self.micro_in_window += 1
 
@@ -732,12 +739,17 @@ class _LoopState:
             now = time.monotonic()
             dt = now - self._micro_heartbeat_t0
             self._micro_heartbeat_t0 = now
+            loss_val = (
+                float(self._last_real_loss_gpu.item())
+                if self._last_real_loss_gpu is not None
+                else float("nan")
+            )
             log.info(
                 "heartbeat step=%d micro=%d/%d loss=%.6f dt=%.1fs (%.1fs/micro)",
                 self.step,
                 self.micro_in_window,
                 self.grad_accum,
-                self.last_real_loss if self.last_real_loss is not None else float("nan"),
+                loss_val,
                 dt,
                 dt / max(1, self._micro_heartbeat_every),
             )
@@ -790,14 +802,17 @@ class _LoopState:
             now = time.monotonic()
             step_dt = now - self._step_t0
             self._step_t0 = now
+            loss_val = (
+                float(self._last_real_loss_gpu.item())
+                if self._last_real_loss_gpu is not None
+                else float("nan")
+            )
             log.info(
                 "step=%d/%d lr=%.3e loss=%.6f tok=%.2fB/%.2fB nan_skip=%.2fM step_dt=%.1fs",
                 self.step,
                 self.total_steps,
                 self.optim.param_groups[0]["lr"],
-                self.last_real_loss
-                if self.last_real_loss is not None
-                else float("nan"),
+                loss_val,
                 self.tokens_with_grad / 1e9,
                 self.dconf.total_tokens / 1e9,
                 self.tokens_skipped_nan / 1e6,
@@ -843,23 +858,27 @@ class _LoopState:
         Critical under DeepSpeed: a rank-local skip would mismatch the next
         backward's reductions and hang NCCL. We collectively detect →
         collectively skip.
+
+        The single-rank fast path does exactly one cudaStreamSynchronize
+        (the `.item()` on the device-side bool). The previous version did
+        two — one from the Python `if-else` over `torch.isfinite(loss).all()`
+        and another from the redundant `flag.item()`.
         """
-        is_finite_local = 1.0 if torch.isfinite(loss).all() else 0.0
-        flag = torch.tensor(is_finite_local, device=self.accelerator.device)
-        if self.accelerator.num_processes > 1:
-            all_flags = self.accelerator.gather(flag.unsqueeze(0))
-            if (
-                self.accelerator.is_main_process
-                and (all_flags < 0.5).any()
-            ):
-                bad = (all_flags < 0.5).nonzero(as_tuple=True)[0].tolist()
-                log.warning(
-                    "non-finite loss on ranks %s — investigate hardware if "
-                    "recurrent on the same rank.",
-                    bad,
-                )
-            flag = all_flags.min()
-        return bool(flag.item() >= 0.5)
+        is_finite_local = torch.isfinite(loss).all()  # 0-d bool tensor on device
+        if self.accelerator.num_processes == 1:
+            return bool(is_finite_local.item())
+        # Multi-rank: gather requires a 1-D tensor of the same dtype across
+        # ranks; cast to float32 for the gather + min.
+        flag = is_finite_local.to(torch.float32)
+        all_flags = self.accelerator.gather(flag.unsqueeze(0))
+        if self.accelerator.is_main_process and (all_flags < 0.5).any():
+            bad = (all_flags < 0.5).nonzero(as_tuple=True)[0].tolist()
+            log.warning(
+                "non-finite loss on ranks %s — investigate hardware if "
+                "recurrent on the same rank.",
+                bad,
+            )
+        return bool(all_flags.min().item() >= 0.5)
 
     def _snapshot_run_metadata(self) -> dict[str, Any]:
         return {

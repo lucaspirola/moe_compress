@@ -37,8 +37,13 @@ class _NativeKLDLoss(nn.Module):
 
     def forward(self, student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
         T = self.T
-        s_lp = torch.nn.functional.log_softmax(student / T, dim=-1)
-        t_p = torch.nn.functional.softmax(teacher / T, dim=-1)
+        # `dtype=torch.float32` lets log_softmax/softmax accept bf16 logits
+        # and accumulate the reduction in fp32 *internally*, without forcing
+        # the caller to materialise a `(B*T, V)` fp32 tensor (~1.2 GB at
+        # V=150k, B*T=2048). Output is fp32; numerics identical to an
+        # explicit `.float()` upcast at the boundary.
+        s_lp = torch.nn.functional.log_softmax(student / T, dim=-1, dtype=torch.float32)
+        t_p = torch.nn.functional.softmax(teacher / T, dim=-1, dtype=torch.float32)
         return torch.nn.functional.kl_div(s_lp, t_p, reduction="batchmean") * (T * T)
 
 
@@ -100,13 +105,23 @@ def forward_kld_loss(
             "is required."
         )
     vocab = student_logits.shape[-1]
-    s = student_logits.reshape(-1, vocab).float()
-    t = teacher_logits.reshape(-1, vocab).float()
+    fn = _get_kld_loss_fn(temperature)
+    if isinstance(fn, _NativeKLDLoss):
+        # Native path's `log_softmax(..., dtype=torch.float32)` does the
+        # fp32 reduction internally; passing bf16 logits avoids
+        # materialising a `(B*T, V)` fp32 tensor on every micro.
+        s = student_logits.reshape(-1, vocab)
+        t = teacher_logits.reshape(-1, vocab)
+    else:
+        # Modelopt's `LogitsDistillationLoss` expects fp32 logits (its
+        # legacy contract). Keep the explicit upcast on that branch.
+        s = student_logits.reshape(-1, vocab).float()
+        t = teacher_logits.reshape(-1, vocab).float()
     # `LogitsDistillationLoss.forward(student, teacher)`: per modelopt's API,
     # the FIRST positional argument is the predicted distribution Q (student)
     # and the SECOND is the target distribution P (teacher). The function
     # computes `KLD(p_teacher || p_student)` — i.e. forward KL with teacher
     # as the target. The loss is multiplied internally by T**2 to compensate
     # for gradient scaling under temperature softmax.
-    result: torch.Tensor = _get_kld_loss_fn(temperature)(s, t)
+    result: torch.Tensor = fn(s, t)
     return result
