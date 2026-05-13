@@ -257,14 +257,13 @@ stage5_router_kd:
     - norm
     - embed
     - lm_head
-  torch_compile: false                # Disabled 2026-05-13 after Stage 2.5 NaN crash on B200
-                                      # contract 36639423: torch.compile(student, mode='reduce-overhead')
-                                      # emitted 12 consecutive "CUDA Graph is empty. captured on wrong
-                                      # device or stream" warnings immediately before the very first
-                                      # loss=nan grad_norm=nan report at step 50. The empty CUDA graph
-                                      # capture is the primary suspect for producing uninitialized /
-                                      # garbage student logits. Re-enable only after the empty-graph
-                                      # issue is root-caused on this model+kernel stack.
+  torch_compile: true                 # 20-40% forward speedup on H200/B200 Hopper/Blackwell.
+                                      # Briefly disabled 2026-05-13 02:08 UTC as a NaN hypothesis;
+                                      # the 02:25 UTC relaunch with torch_compile=false STILL
+                                      # produced loss=nan grad_norm=nan from step 50, ruling out
+                                      # torch.compile as the NaN cause. Re-enabled to keep the
+                                      # speedup. NaN root-cause now under investigation with the
+                                      # debug hooks in stage5_router_kd.py (commit 02baf4b).
 
 stage6_validate:
   # --- Compute-time optimizations (2026-04-30) ---
