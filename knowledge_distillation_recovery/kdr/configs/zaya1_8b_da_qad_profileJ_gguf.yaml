@@ -32,9 +32,16 @@
 # `-ctk q4_0 -ctv q4_0` for symmetric INT4 KV cache (TurboQuant
 # K=3/V=2 is deferred until ggml-org/llama.cpp#20969 lands).
 #
-# Run command (vast.ai): bootstrap.sh with
-# `KDR_CONFIG=zaya1_8b_da_qad_profileJ_gguf.yaml` on 1× H200 or
-# 4× A100-80GB.
+# Run command: bootstrap.sh with
+# `KDR_CONFIG=zaya1_8b_da_qad_profileJ_gguf.yaml` on 1× H200 (141 GB
+# VRAM) or 1× B200 (180 GB VRAM). VRAM budget at `trainable_scope:
+# full` is ~95–130 GB (teacher BF16 + student BF16 + STE
+# parametrization cache + 8-bit AdamW state + activations + KD
+# logits); 1× A100-80GB does NOT fit — the 4× A100-80GB fallback
+# from the NVFP4 reference YAML's launch comment is only valid for
+# recipes that fit in 80 GB per-device or that use multi-GPU
+# sharding (Profile-J's trainable_scope=full is single-GPU only and
+# needs ≥130 GB VRAM headroom).
 
 mode: da_qad
 
@@ -135,7 +142,10 @@ distillation:
   sequence_length: 4096
   log_every_n_steps: 5
   eval_every_n_steps: 50
-  save_every_n_steps: 0
+  save_every_n_steps: 50  # Spot-resilient: every 50 steps writes a
+                          # partial to HF Hub (`pirola/kdr-partials-…`)
+                          # so a preempt mid-run can resume via the
+                          # bootstrap.sh partials-query path.
   trainable_scope: full
   use_gradient_checkpointing: true
 
