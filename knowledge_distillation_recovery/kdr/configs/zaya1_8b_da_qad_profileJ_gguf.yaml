@@ -39,13 +39,17 @@
 mode: da_qad
 
 teacher:
-  name_or_path: Zyphra/ZAYA1-reasoning-base
+  name_or_path: Zyphra/ZAYA1-8B
   revision: main
   torch_dtype: bfloat16
   attn_implementation: sdpa
 
 student:
-  source: Zyphra/ZAYA1-reasoning-base   # self-distillation
+  source: Zyphra/ZAYA1-8B   # self-distillation from ZAYA1-8B (uniform
+                            # per-layer architecture; the reasoning-base
+                            # variant uses per-layer interleaved lists
+                            # that the Zyphra fork does not handle —
+                            # confirmed via live crash on instance 36666031)
   torch_dtype: bfloat16
   attn_implementation: sdpa
 
