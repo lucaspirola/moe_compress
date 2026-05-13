@@ -335,7 +335,11 @@ stage6_validate:
   # below with the actual HF dataset revision SHAs before a production run.
   # WARNING: this config will RuntimeError at Stage 6 startup until SHAs are pinned.
   # To run a smoke test that skips Stage 6 verification, set strict_revision_pinning: false.
-  strict_revision_pinning: true
+  strict_revision_pinning: false  # Opt-out 2026-05-13: dataset SHAs not yet pinned
+                                  # in the placeholders below. This is the smoke-test
+                                  # path; A0..A11 final scientific comparison requires
+                                  # SHAs pinned for reproducibility (flip back to true
+                                  # after filling wikitext_ppl/humaneval/math500 below).
   dataset_revisions:
     wikitext_ppl:    null   # Salesforce/wikitext (wikitext-2-raw-v1) — used by _wikitext2_ppl AND imatrix calibration corpus (train split)
     # F-iter4-HIGH-1: hellaswag/arc_challenge keys removed — lm-eval pulls its
