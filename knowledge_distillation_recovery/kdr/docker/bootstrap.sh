@@ -140,6 +140,19 @@ if ! pip install --upgrade --force-reinstall --quiet \
     exit 3
 fi
 
+# Upgrade huggingface_hub to >=1.10 so the strict-dataclass validator
+# recognises PEP-604 union types (`str | None`). The image ships with
+# huggingface_hub 0.36.2, whose validator can't read the field annotations
+# in `kernels==0.14.0`'s deps.py; without this upgrade the trainer crashes
+# at adapter teacher-load with `StrictDataclassFieldValidationError` deep
+# inside the transformers→kernels import chain. The hf-hub minor versions
+# are backwards-compatible at the API surface kdr uses (snapshot_download,
+# whoami, list_repo_files); the upgrade is safe.
+if ! pip install --upgrade --quiet "huggingface_hub>=1.10.0"; then
+    echo "ERROR: huggingface_hub>=1.10.0 install failed." >&2
+    exit 3
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Snapshot-download student (HF_TOKEN read from env by huggingface_hub)
 # ─────────────────────────────────────────────────────────────────────────────
