@@ -42,7 +42,7 @@ lm-eval>=0.4.5
 trackio>=0.5.0
 nvidia-ml-py>=12.0
 psutil>=5.9
-bitsandbytes>=0.44.0
+bitsandbytes>=0.49.2
 
 # --- Fast-path attention kernels: handled per environment, NOT here ---
 # flash-linear-attention and causal-conv1d build CUDA kernels and need to
