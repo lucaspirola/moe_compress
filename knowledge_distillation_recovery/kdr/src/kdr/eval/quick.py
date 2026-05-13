@@ -112,9 +112,13 @@ def wikitext2_ppl(
         )
 
     ids_list = ids_list[: n_seqs * seq_len]
-    inp = torch.tensor(ids_list, dtype=torch.long).view(n_seqs, seq_len).to(
-        accelerator.device
-    )
+    # REQ: LLR-0062
+    # Construct directly on the target device — avoids a gratuitous CPU
+    # allocation + H2D copy. Numerically identical to the prior pattern
+    # `torch.tensor(...).to(accelerator.device)`.
+    inp = torch.tensor(
+        ids_list, dtype=torch.long, device=accelerator.device
+    ).view(n_seqs, seq_len)
 
     # Data is rank-replicated (no distributed sampler) — every rank computes
     # the *same* nll on the *same* sequences. We deliberately do not reduce
