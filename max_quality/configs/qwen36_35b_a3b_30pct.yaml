@@ -222,6 +222,19 @@ stage4_eora:
 stage5_router_kd:
   optimizer: adamw
   learning_rate: 5.0e-5           # paper Table 1 (§F.3)
+  experts_implementation: batched_mm   # 2026-05-13: Blackwell (B200) workaround for
+                                       # transformers' grouped_mm deadlock — see
+                                       # memory/project_grouped_mm_blackwell.md.
+                                       # Valid values: grouped_mm (default in
+                                       # transformers — DEADLOCKS on sm_100),
+                                       # batched_mm (torch.bmm-based, 70-90% of
+                                       # grouped_mm speed, fully sm_100-supported),
+                                       # sonicmoe (custom kernel, untested on sm_100),
+                                       # eager (Python loop, 30-50% speed, universal).
+                                       # On Hopper (H100/H200) grouped_mm works fine —
+                                       # change back to grouped_mm there for max speed.
+                                       # Env var EXPERTS_IMPLEMENTATION overrides this
+                                       # value at runtime for quick A/B.
   weight_decay: 0.01              # Bumped 2026-05-13 from 0.0 → 0.01 after the
                                   # 2-epoch / 6000-sample run showed the loss
                                   # bottom out at step 950 (0.117) then RISE
@@ -288,6 +301,10 @@ stage5_router_kd:
                                       # debug hooks in stage5_router_kd.py (commit 02baf4b).
 
 stage6_validate:
+  experts_implementation: batched_mm   # Same Blackwell workaround as stage5_router_kd —
+                                       # see that section's comment + memory/project_grouped_mm_blackwell.md.
+                                       # Stage 6's MoE forward path uses the same
+                                       # broken `_grouped_mm` kernel.
   # --- Compute-time optimizations (2026-04-30) ---
   # All optimizations are purely computational scheduling — no metric, formula,
   # threshold, or evaluation methodology is changed. Numerically identical to

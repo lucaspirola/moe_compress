@@ -461,8 +461,34 @@ def _save_teacher_cache(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _set_experts_implementation_s6(model, impl: str) -> None:
+    """Override MoE experts forward dispatch on `model` (Stage 6 variant).
+
+    Mirror of `stage5_router_kd._set_experts_implementation`. See that
+    function's docstring for the rationale (Blackwell `grouped_mm` deadlock
+    workaround) and the registered impl values (`grouped_mm`, `batched_mm`,
+    `sonicmoe`, `eager`).
+    """
+    base = getattr(model, "_orig_mod", model)
+    cfg = base.config
+    if hasattr(cfg, "text_config"):
+        cfg.text_config._experts_implementation = impl
+    cfg._experts_implementation = impl
+    log.info("Stage 6: MoE experts_implementation = %r", impl)
+
+
 def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> Path:
     s6 = config["stage6_validate"]
+
+    # Set MoE forward dispatch (default 'batched_mm' to work around the
+    # grouped_mm Blackwell deadlock — see project memory
+    # `project_grouped_mm_blackwell.md`). Same shim as stage5_router_kd;
+    # env var `EXPERTS_IMPLEMENTATION` overrides YAML for quick A/B.
+    _experts_impl = os.environ.get(
+        "EXPERTS_IMPLEMENTATION", s6.get("experts_implementation", "batched_mm")
+    )
+    _set_experts_implementation_s6(model, _experts_impl)
+
     model.eval()   # stage5 leaves model in train(); set eval before any sub-metric
     results: dict = {"student": {}, "teacher": {}, "delta": {}, "thresholds": {}}
 
