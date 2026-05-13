@@ -228,26 +228,6 @@ def _hardlink_or_copy(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
-def _bridge_stage25_to_stage6(ablation_dir: Path) -> None:
-    """Stage 6 hard-codes its student input as ``stage5_final/``; Stage 2.5
-    produces ``stage2p5_final/``. One symlink bridges them — no code change.
-    """
-    src_name = "stage2p5_final"
-    src = ablation_dir / src_name
-    dst = ablation_dir / "stage5_final"
-    if not src.exists():
-        raise RuntimeError(
-            f"_bridge_stage25_to_stage6: {src} not found — Stage 2.5 did not "
-            "produce its output dir. Cannot run Stage 6."
-        )
-    if dst.is_symlink() or dst.exists():
-        if dst.is_symlink():
-            dst.unlink()
-        else:
-            shutil.rmtree(dst)
-    dst.symlink_to(src_name)  # relative symlink — survives bucket mount changes
-
-
 def _seed_stage1_artifacts(ablation_dir: Path, shared_dir: Path) -> None:
     """Hardlink the three Stage 1 outputs from _shared/ into the ablation
     dir so Stage 2 reads them as if Stage 1 had run locally."""
@@ -339,10 +319,12 @@ def _run_one_ablation(
         if rc1 != 0:
             raise RuntimeError(f"[{ablation_id}] Stage 2/2.5 returned exit code {rc1}")
 
-        # Bridge: Stage 6 expects stage5_final/.
-        _bridge_stage25_to_stage6(ablation_dir)
-
-        # Stage 6 — separate pipeline call so it loads from stage5_final.
+        # Stage 6 loads from stage2p5_final/ via run_pipeline._load_for_stage's
+        # fallback path (0871b98). The previous `stage5_final → stage2p5_final`
+        # symlink bridge is no longer needed and has been removed; the load-time
+        # fallback handles both the full-pipeline path (stage5_final/ present)
+        # and the ablation harness path (stage2p5_final/ only) without a
+        # filesystem-side workaround.
         rc2 = run_pipeline_main([
             "--config", str(cfg_path),
             "--model", model_repo,
