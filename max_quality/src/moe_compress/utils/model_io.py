@@ -1341,11 +1341,40 @@ def load_compressed_model(
         )
 
     auto_cls = _pick_auto_class(list(getattr(cfg, "architectures", None) or []))
-    log.info("Building skeleton %s from config on CPU (no weights yet)", auto_cls.__name__)
+    log.info("Building skeleton %s from config on CPU (no_init_weights — random init skipped)", auto_cls.__name__)
     # from_config builds on CPU by default. _assign_storage permits the CPU→target_device
     # swap so that each tensor can be loaded directly to target_device and the CPU storage
     # freed before the next tensor is opened — one tensor peak, not a full second copy.
-    model = auto_cls.from_config(cfg, torch_dtype=dtype, attn_implementation=attn_implementation)
+    #
+    # Wrap in `no_init_weights()` (transformers' canonical init-skip context manager):
+    # for a 35B-A3B model with 40 MoE layers × 256 experts, the default `from_config`
+    # spends ~12 min recursively calling `_init_weights` on every submodule to populate
+    # parameters with kaiming/normal-distribution random values that are then
+    # IMMEDIATELY overwritten by the per-tensor state_dict streaming below. The
+    # context manager patches `torch.nn.init.*` to no-ops AND flips the module-level
+    # `_init_weights` flag to False, which causes the `if _init_weights:` guard
+    # inside `PreTrainedModel.init_weights()` to short-circuit (skipping the
+    # `initialize_weights()` random-fill + `tie_weights()` call). The `prune_heads`
+    # branch inside `init_weights()` is NOT gated by the flag and still runs —
+    # intentional and harmless here. Tensors come out allocated (correct shape +
+    # dtype) but with undefined memory contents that are overwritten before any
+    # forward/backward reads them.
+    # Measured saving on the 2026-05-13 Stage 2.5 relaunch: ~12 min → ~30 s.
+    #
+    # CRITICAL: `init_weights()` is what calls `tie_weights()` internally (under
+    # the `if _init_weights:` guard). Because `no_init_weights()` sets that flag
+    # to False, the lm_head ↔ embed_tokens tie is skipped during construction.
+    # The compressed checkpoint serializes only ONE side of the tie (whichever
+    # shard writer picked), so the per-tensor loader would either raise
+    # "missing key" (default `allow_missing_keys=False`) or silently load two
+    # independent matrices that then diverge during training. Calling
+    # `model.tie_weights()` explicitly after the context manager re-establishes
+    # the tie using `_tied_weights_keys` (populated during `__init__`/`post_init`
+    # arithmetic, NOT during the `_init_weights` guarded section).
+    from transformers.initialization import no_init_weights
+    with no_init_weights():
+        model = auto_cls.from_config(cfg, torch_dtype=dtype, attn_implementation=attn_implementation)
+    model.tie_weights()
 
     _resize_moe_stack_to_metadata(model, meta, dtype=dtype, device=target_device)
 
@@ -1421,16 +1450,18 @@ def load_compressed_model(
         log.debug("  sample missing: %s", missing_final[:5])
     if unexpected_all:
         log.debug("  sample unexpected: %s", unexpected_all[:5])
-    # Fail loud on missing keys. A missing param/buffer means the skeleton's
-    # default _init_weights value (random init) survives — the model will
-    # silently train/run on garbage for that layer and we'd only notice
-    # hours later via degraded eval. Better to crash here. The
+    # Fail loud on missing keys. Because the skeleton is built under
+    # `no_init_weights()`, a missing param/buffer means the parameter's
+    # storage holds **undefined `torch.empty()` memory** (possibly NaN/Inf)
+    # — even worse than the previous "random init" state, since downstream
+    # NaN propagation is harder to debug than just-degraded numerics. The
     # ``allow_missing_keys`` flag is for tests on partial fixtures only.
     if missing_final and not allow_missing_keys:
         raise RuntimeError(
             f"Streaming load completed with {len(missing_final)} missing key(s). "
-            f"Sample: {missing_final[:5]}. The skeleton retains random-init "
-            "weights for these — refusing to silently corrupt the model. "
+            f"Sample: {missing_final[:5]}. The skeleton retains undefined "
+            "torch.empty() memory for these (no_init_weights skipped the random "
+            "init) — refusing to silently corrupt the model with NaN/Inf. "
             "If this is a deliberate partial load, pass allow_missing_keys=True."
         )
 
