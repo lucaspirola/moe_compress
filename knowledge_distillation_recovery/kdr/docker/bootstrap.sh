@@ -86,8 +86,12 @@ MOE_COMPRESS_GIT_REF="${MOE_COMPRESS_GIT_REF:-main}"
 export HF_TOKEN
 # Pin the HF cache to the persistent mount so re-launches reuse the snapshot.
 export HF_HOME="${CACHE_MOUNT}/hf-cache"
+# Pin PyTorch's JIT extension cache to the persistent mount too — modelopt's
+# CUDA kernels (modelopt_cuda_ext) take ~20s to compile on first run; caching
+# under /workspace lets re-launches on the same instance skip the rebuild.
+export TORCH_EXTENSIONS_DIR="${CACHE_MOUNT}/torch_ext"
 
-mkdir -p "${CACHE_MOUNT}" "${HF_HOME}"
+mkdir -p "${CACHE_MOUNT}" "${HF_HOME}" "${TORCH_EXTENSIONS_DIR}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Repo clone (depth=1, ref-pinned, hard-reset on re-launch)
