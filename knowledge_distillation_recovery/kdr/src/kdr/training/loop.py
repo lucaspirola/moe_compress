@@ -27,7 +27,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -227,7 +227,7 @@ def run_recovery(
         replay_hook = NoOpReplayContextManager()
 
     with replay_hook:
-        _LoopState(
+        loop_state = _LoopState(
             config=config,
             accelerator=accelerator,
             artifacts_dir=artifacts_dir,
@@ -239,7 +239,18 @@ def run_recovery(
             resume_step=resume_step,
             source_metadata_path=source_metadata_path,
             replay_hook=replay_hook,
-        ).run()
+        )
+        # Backends whose state derives from the model weights expose
+        # `invalidate_ste_cache()` — register so the trainer drops the
+        # snap cache immediately after `optim.step()` advances the
+        # weights. `hasattr` guard keeps the registration backend-agnostic
+        # (bf16 mode runs without any backends; ModelOpt currently has
+        # no weight-derived cache to invalidate).
+        for backend in active_backends:
+            invalidate = getattr(backend, "invalidate_ste_cache", None)
+            if callable(invalidate):
+                loop_state.post_optim_step_callbacks.append(invalidate)
+        loop_state.run()
 
     # ── Stage 6: final save ───────────────────────────────────────────────
     # Branching on `active_backends` (rather than re-checking the mode flag)
@@ -575,6 +586,13 @@ class _LoopState:
         self.consecutive_nan_windows = 0
         self.nan_in_current_window = False
 
+        # Post-`optim.step()` callbacks. Subsystems whose state derives from
+        # the (now-frozen-within-a-window) model weights register here so
+        # they get invalidated exactly when the weights change. Primary
+        # consumer: NativeBackend's STE snap cache, which would otherwise
+        # serve stale snaps to the next window's forward.
+        self.post_optim_step_callbacks: list[Callable[[], None]] = []
+
         # Per-step state
         self.step = resume_step
         self.micro_in_window = 0
@@ -776,6 +794,13 @@ class _LoopState:
         )
         self.optim.step()
         self.optim.zero_grad(set_to_none=True)
+        # Invalidate any weight-derived caches now that the weights have
+        # changed. Order matters: must fire AFTER `optim.step()` (otherwise
+        # we'd refresh against the pre-update weights and the next forward
+        # would still see stale snaps for one window) and BEFORE the next
+        # forward (which happens at the top of the next `_step_one_micro`).
+        for cb in self.post_optim_step_callbacks:
+            cb()
         self.tokens_with_grad += self.pending_window_tokens
         self.pending_window_tokens = 0
         self.step += 1
