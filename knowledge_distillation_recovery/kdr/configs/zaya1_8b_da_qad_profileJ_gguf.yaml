@@ -128,24 +128,44 @@ quant:
 
 distillation:
   loss: forward_kld
-  temperature: 1.0
+  # KD-softening: temperature 2.0 (vs 1.0) reduces gradient magnitude on
+  # long-tail tokens where the IQ2_XS expert quantisation is most lossy.
+  # Acts as a cheap regulariser; no compute cost.
+  temperature: 2.0
   optimizer: adamw_bnb_8bit
-  learning_rate: 2.0e-4
-  min_learning_rate: 4.5e-7
+  # lr revised from 2.0e-4 → 5.0e-5 (4× drop) after the post-warmup
+  # divergence observed in the first run (loss 0.64 @ step 10 → 47 @
+  # step 25, wikitext2_ppl=4.5e24 @ step 50). Root cause: at 2.3 bpw the
+  # IQ2_XS codebook gap between adjacent magnitudes is smaller than the
+  # per-step Δw at lr=2e-4, so post-warmup updates flip codebook
+  # assignments faster than the optimizer can settle. 5e-5 is the
+  # standard Q-LoRA / QAT range for ≤3-bit quantisation. 8e-5 is the
+  # upper bound entertained; >=1e-4 keeps the codebook-flip risk.
+  learning_rate: 5.0e-5
+  # Keep cosine decay ratio sane (~10× from peak to min) instead of
+  # the previous ~110× tail; preserves learning signal in the tail.
+  min_learning_rate: 5.0e-6
   weight_decay: 0.01
-  betas: [0.9, 0.999]
-  grad_clip_norm: 1.0
-  warmup_steps: 20
+  # β₂ 0.999 → 0.95: faster second-moment EMA equilibration matches MoE
+  # QAT precedent. The previous 0.999 needed ~10× the steps for the EMA
+  # to stabilise, which underflowed the 20-step warmup.
+  betas: [0.9, 0.95]
+  # Tighter clip; the run-1 trace had a clear precursor spike at step 15
+  # before divergence kicked in at step 20.
+  grad_clip_norm: 0.5
+  # warmup 20 → 60 steps (~16% of run). Lets AdamW second moment settle
+  # before the largest updates land; previous 5% was too aggressive for
+  # the new (smaller) peak lr too.
+  warmup_steps: 60
   total_tokens: 50_000_000
   per_device_batch_size: 1
   gradient_accumulation: 32
   sequence_length: 4096
   log_every_n_steps: 5
   eval_every_n_steps: 50
-  save_every_n_steps: 50  # Spot-resilient: every 50 steps writes a
-                          # partial to HF Hub (`pirola/kdr-partials-…`)
-                          # so a preempt mid-run can resume via the
-                          # bootstrap.sh partials-query path.
+  save_every_n_steps: 25  # Tighter rollback granularity (was 50). Costs
+                          # ~2 min of save I/O per ~25 steps of training;
+                          # cheap insurance after the run-1 catastrophe.
   trainable_scope: full
   use_gradient_checkpointing: true
 
