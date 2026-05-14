@@ -25,6 +25,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import torch
 import torch.nn as nn
 from accelerate import Accelerator
 from transformers import PreTrainedTokenizerBase
@@ -311,6 +312,83 @@ def save_partial(
     return out_dir
 
 
+def _dedupe_shared_storage(
+    state_dict: dict[str, Any]
+) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+    """Remove ``state_dict`` entries whose storage is already saved under
+    another key.
+
+    Background — why this exists:
+    ``nn.utils.parametrize.register_parametrization(lm_head, "weight", ...)``
+    relocates ``lm_head.weight`` to ``lm_head.parametrizations.weight.original``
+    (the parametrize-internal storage slot). ZAYA1 ties ``lm_head.weight``
+    to ``model.embed_tokens.weight`` (one shared underlying tensor); after
+    parametrize, that same storage now appears in two state_dict keys:
+
+      * ``lm_head.parametrizations.weight.original``  (the relocated slot)
+      * ``model.embed_tokens.weight``                  (the canonical tie)
+
+    transformers' standard tied-weights detection looks for ``lm_head.weight``
+    (the *user-visible* name), not the parametrize-internal one — so the
+    duplicate goes undetected and ``safe_serialization=True`` raises:
+
+      RuntimeError: The weights trying to be saved contained shared
+      tensors [{'lm_head.parametrizations.weight.original',
+      'model.embed_tokens.weight'}] ...
+
+    The fix: pre-emptively dedupe by storage identity, preferring the
+    canonical (no ``.parametrizations.``) key as the "kept" name so the
+    standard HF load + tie-restoration path works on the saved
+    checkpoint. The parametrize machinery is re-installed by
+    ``NativeBackend.apply_quant`` on resume; the dropped key is then
+    re-materialised from the kept canonical tensor automatically.
+
+    Returns:
+        ``(deduped_state_dict, drop_log)`` — the filtered dict and a list
+        of ``(dropped_key, kept_key)`` pairs for auditing.
+    """
+    seen: dict[tuple[int, int, int, torch.dtype], str] = {}
+    deduped: dict[str, Any] = {}
+    drop_log: list[tuple[str, str]] = []
+
+    def _is_canonical(name: str) -> bool:
+        # Parametrize-internal slots end in ``.parametrizations.<param>.original``;
+        # treat the non-parametrize names as canonical.
+        return ".parametrizations." not in name
+
+    # Two-pass: first add canonical entries, then add non-canonical ones
+    # only if their storage is new. Guarantees the canonical name wins
+    # any tie regardless of dict iteration order.
+    for pass_canonical in (True, False):
+        for key, value in state_dict.items():
+            if not isinstance(value, torch.Tensor):
+                if pass_canonical:
+                    deduped[key] = value
+                continue
+            if _is_canonical(key) != pass_canonical:
+                continue
+            # Storage identity: (untyped_storage data_ptr, offset, nelements, dtype).
+            # `data_ptr()` alone is insufficient under views with non-zero offset.
+            try:
+                storage_id = (
+                    value.untyped_storage().data_ptr(),
+                    value.storage_offset(),
+                    value.numel(),
+                    value.dtype,
+                )
+            except (RuntimeError, AttributeError):
+                # Meta-device or unusual tensor: keep it verbatim.
+                deduped[key] = value
+                continue
+            kept = seen.get(storage_id)
+            if kept is None:
+                seen[storage_id] = key
+                deduped[key] = value
+            else:
+                drop_log.append((key, kept))
+    return deduped, drop_log
+
+
 def _write_partial_dir(
     *,
     tmp_dir: Path,
@@ -345,6 +423,21 @@ def _write_partial_dir(
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True)
+
+    # Drop parametrize-internal duplicates that share storage with their
+    # tied counterparts (e.g. lm_head.parametrizations.weight.original
+    # vs model.embed_tokens.weight on tied-vocab models). transformers'
+    # safe_serialization=True path raises on undeclared shared tensors;
+    # this dedupe pre-empts that exception. See `_dedupe_shared_storage`
+    # for the full rationale.
+    state_dict, drop_log = _dedupe_shared_storage(state_dict)
+    if drop_log:
+        log.info(
+            "save_partial: dropped %d state_dict entries sharing storage "
+            "with a canonical key (parametrize-tie collision); examples: %s",
+            len(drop_log),
+            drop_log[:3],
+        )
 
     unwrapped.save_pretrained(  # type: ignore[operator]
         tmp_dir, state_dict=state_dict, safe_serialization=True
