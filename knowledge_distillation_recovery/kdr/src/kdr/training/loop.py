@@ -853,7 +853,12 @@ class _LoopState:
         self.step += 1
         self.micro_in_window = 0
 
-        if self.nan_in_current_window:
+        # Capture the NaN flag BEFORE the reset; the EMA block below
+        # needs to know whether this just-committed window was tainted.
+        # (Resetting before the EMA read was a bug: the guard always
+        # passed because the flag had just been zeroed.)
+        nan_this_window = self.nan_in_current_window
+        if nan_this_window:
             self.consecutive_nan_windows += 1
             if self.consecutive_nan_windows >= self.nan_threshold:
                 raise RuntimeError(
@@ -871,11 +876,18 @@ class _LoopState:
         # only on logged steps) so the best-step pointer reflects the
         # real curve, not a coarse subsample. Skip on NaN-tagged windows
         # — they don't carry signal about the basin.
+        #
+        # Also skip the first `warmup_steps` from best-pointer tracking:
+        # during warmup the lr is ramping and the temperature curriculum
+        # (when enabled) is at its highest, so raw_kl is artificially
+        # deflated early. Without this burn-in the best-step pointer
+        # latches on an early-warmup minimum that no later (genuinely
+        # better, but temperature-sharpened) basin can ever beat.
         loss_val_for_ema: float | None = None
         if (
             self.accelerator.is_main_process
             and self._last_real_loss_gpu is not None
-            and not self.nan_in_current_window
+            and not nan_this_window
         ):
             loss_val_for_ema = float(self._last_real_loss_gpu.item())
             t_now = self._last_temperature
@@ -890,9 +902,18 @@ class _LoopState:
                 else:
                     a = self._raw_kl_ema_alpha
                     self._raw_kl_ema = a * raw_kl_now + (1.0 - a) * self._raw_kl_ema
+                # Burn-in: only consider best-pointer updates after the
+                # warmup window closes. Inside warmup the lr is ramping
+                # and the temperature curriculum (when active) is at its
+                # highest end, so raw_kl is systematically deflated.
+                # Without this gate the pointer latches an unbeatable
+                # high-T minimum and stays stuck there for the whole run.
                 if (
-                    self._best_raw_kl_ema is None
-                    or self._raw_kl_ema < self._best_raw_kl_ema
+                    self.step > self.warmup
+                    and (
+                        self._best_raw_kl_ema is None
+                        or self._raw_kl_ema < self._best_raw_kl_ema
+                    )
                 ):
                     self._best_raw_kl_ema = self._raw_kl_ema
                     self._best_step = self.step

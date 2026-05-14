@@ -223,13 +223,32 @@ pointer (Section 6.3).
 Every committed window updates an EMA of `raw_kl` with α=0.2 (mq
 stage-5's choice). When the EMA improves on the best-so-far, the
 current step's metadata (`step`, `raw_kl`, `raw_kl_ema`, `temperature`,
-`loss`) is recorded. At every `save_every_n_steps` boundary the trainer
-writes a small JSON pointer file
+`loss`) is recorded.
+
+**Burn-in.** Best-pointer updates are gated to `step > warmup_steps`.
+Two reasons: (a) during warmup the lr is ramping and AdamW's
+second-moment EMA is settling, so any "best" inside that window is
+not representative of the true loss landscape; (b) the curriculum has
+T at its highest in the early steps, which divides raw_kl by a large
+T² and artificially deflates the metric — without the gate the
+pointer would latch a high-T minimum that no later (genuinely better
+but temperature-sharpened) basin could ever beat.
+
+At every `save_every_n_steps` boundary the trainer writes a small
+JSON pointer file
 `<artifacts_dir>/kdr_<mode>_best_partial_pointer.json` recording the
 best step and the corresponding partial-dir name. A post-mortem
 (or the final-save selector) resolves the pointer to find the partial
 representing the lowest-EMA basin — robust against the run-1 pattern
 where a precursor spike at step 15 preceded a step-25 collapse.
+
+**bf16-mode behaviour.** The curriculum, `raw_kl` tracking, and EMA
+best-pointer all run unconditionally (no quant-mode gate). When the
+trainer is invoked in `bf16` mode no Native backend is installed and
+the `post_optim_step_callbacks` list is empty — the cache-invalidation
+hook simply has nothing to invalidate. The temperature ramp is still
+useful in BF16-only KD (it's the original max_quality stage-5 use
+case) and the best-pointer is still useful for rescuing any KD run.
 
 LR schedule is **linear warmup → cosine decay** to `min_learning_rate`.
 With `total_tokens=50M`, `per_device_batch_size=1`, `seq_length=4096`,
@@ -303,7 +322,7 @@ next step keeps re-flipping a different subset.
 | `betas[1]`         | 0.999    | **0.95** | $\sim$20-step time constant matches warmup; MoE QAT precedent |
 | `grad_clip_norm`   | 1.0      | 0.5      | precursor spike at step 15; cheap insurance |
 | `warmup_steps`     | 20       | **60**   | 5% → 16% of run; AdamW second moment has time to settle |
-| `temperature`      | 1.0      | 2.0      | softens KD on long-tail tokens (where IQ2 is most lossy) |
+| `temperature`      | 1.0 (constant) | 1.0 (endpoint) + `temperature_start: 4.0` (ramp) | soft-to-hard curriculum; high T early smooths the teacher distribution during the codebook-flip-sensitive phase |
 | `save_every_n_steps` | 50     | 25       | tighter rollback granularity given uncertainty |
 
 Trade-off: the 50 M-token budget will under-fit relative to BF16
@@ -355,7 +374,7 @@ from the kept canonical tensor.
 
 | Topic | File |
 |---|---|
-| HLR-0021 — Profile-J intent | `requirements/hlr/HLR-0021.md` |
+| HLR-0016 — Profile-J `da_qad` GGUF recovery YAML intent | `requirements/hlr/HLR-0016.md` |
 | LLR-0001 / 0002 / 0003 — FKLD loss | `requirements/llr/LLR-000{1,2,3}.md` |
 | LLR-0015 — STE simulator design | `requirements/llr/LLR-0015.md` |
 | LLR-0025 — Router replay | `requirements/llr/LLR-0025.md` |
