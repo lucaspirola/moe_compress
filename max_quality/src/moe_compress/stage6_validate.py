@@ -1665,6 +1665,21 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None,
     tests = [row["test"] for row in ds]
     entry_points = [row["entry_point"] for row in ds]
 
+    # Optional problem-count cap for smoke testing the segfault-fix path
+    # without burning 164 generates. Env var wins over cfg. Value 0/unset =
+    # no cap. Truncate prompts/tests/entry_points in lockstep so pass@1
+    # arithmetic still divides by the actual count.
+    _he_limit = int(os.environ.get("HUMANEVAL_LIMIT", cfg.get("limit", 0)) or 0)
+    if _he_limit > 0 and _he_limit < len(prompts):
+        log.warning(
+            "Stage 6 HumanEval: HUMANEVAL_LIMIT=%d active — truncating from "
+            "%d → %d problems (smoke mode; pass@1 computed on subset)",
+            _he_limit, len(prompts), _he_limit,
+        )
+        prompts = prompts[:_he_limit]
+        tests = tests[:_he_limit]
+        entry_points = entry_points[:_he_limit]
+
     if collect is not None:
         collect.extend(prompts)
 
