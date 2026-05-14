@@ -589,6 +589,7 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
                 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
                     torch_chunk_gated_delta_rule,
                     torch_recurrent_gated_delta_rule,
+                    torch_causal_conv1d_update,
                 )
                 _gdn_patched = 0
                 for _name, _mod in model.named_modules():
@@ -597,14 +598,19 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
                             _mod.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
                         if hasattr(_mod, "recurrent_gated_delta_rule"):
                             _mod.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
-                        # None falls through to the torch causal_conv1d path
-                        # in the modeling source. Avoids tilelang's
-                        # causal_conv1d kernel which has the same Hopper
-                        # stability issue.
+                        # Prefill path (line 475 of modeling_qwen3_5_moe.py): code
+                        # checks `if self.causal_conv1d_fn is not None` and falls
+                        # through to torch path if None — so setting to None is
+                        # safe and avoids the tilelang causal_conv1d kernel.
                         if hasattr(_mod, "causal_conv1d_fn"):
                             _mod.causal_conv1d_fn = None
+                        # Decode path (line 458): calls `self.causal_conv1d_update(...)`
+                        # directly with NO None-check. Must set to the torch
+                        # fallback explicitly (default __init__ does
+                        # `causal_conv1d_update or torch_causal_conv1d_update`,
+                        # which we overwrote — restore it explicitly).
                         if hasattr(_mod, "causal_conv1d_update"):
-                            _mod.causal_conv1d_update = None
+                            _mod.causal_conv1d_update = torch_causal_conv1d_update
                         _gdn_patched += 1
                 if _gdn_patched:
                     log.info("Stage 6: forced torch-native fallback for "
