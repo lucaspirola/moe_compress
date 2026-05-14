@@ -118,6 +118,16 @@ class DistillationConfig(BaseModel):
 
     loss: Literal["forward_kld"] = "forward_kld"
     temperature: float = 1.0
+    # Optional linear-ramp on temperature, borrowed from max_quality
+    # stage-5 KD (acts as soft-to-hard curriculum: high T early smooths
+    # the teacher distribution so STE updates aren't chasing sharp peaks
+    # while codebook assignments are still settling; T → endpoint as the
+    # student approaches a basin). When set, the per-step temperature is
+    # linearly interpolated from `temperature_start` at step 0 to
+    # `temperature` (the endpoint) at `total_steps - 1`. When None
+    # (default) the temperature is held constant at `temperature` — the
+    # backward-compatible behaviour for every existing config.
+    temperature_start: float | None = Field(default=None, gt=0)
     optimizer: Literal["adamw_bnb_8bit", "deepspeed_cpu_adam"]
     learning_rate: float = Field(..., gt=0)
     min_learning_rate: float = Field(..., gt=0)

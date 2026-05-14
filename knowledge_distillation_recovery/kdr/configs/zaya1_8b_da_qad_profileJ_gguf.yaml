@@ -128,10 +128,15 @@ quant:
 
 distillation:
   loss: forward_kld
-  # KD-softening: temperature 2.0 (vs 1.0) reduces gradient magnitude on
-  # long-tail tokens where the IQ2_XS expert quantisation is most lossy.
-  # Acts as a cheap regulariser; no compute cost.
-  temperature: 2.0
+  # Temperature curriculum (borrowed from max_quality stage-5 KD):
+  # linear ramp from `temperature_start` (4.0) at step 0 to `temperature`
+  # (1.0) at the final step. High T early smooths the teacher target so
+  # STE updates aren't chasing sharp peaks while IQ2_XS codebook
+  # assignments are still settling; sharpens to a hard target once the
+  # student is in-basin. τ-invariant `raw_kl = loss / T²` is the metric
+  # tracked across this schedule (logged on every committed step).
+  temperature: 1.0
+  temperature_start: 4.0
   optimizer: adamw_bnb_8bit
   # lr revised from 2.0e-4 → 5.0e-5 (4× drop) after the post-warmup
   # divergence observed in the first run (loss 0.64 @ step 10 → 47 @

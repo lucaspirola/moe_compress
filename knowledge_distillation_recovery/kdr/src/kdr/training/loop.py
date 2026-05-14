@@ -45,6 +45,7 @@ from ..config import Config
 from ..eval.quick import run as eval_run
 from ..io.save import (
     SAVE_COMPLETE_SENTINEL,
+    partial_dir_name,
     save_kdr_artifact,
     save_partial,
     save_partial_join,
@@ -602,6 +603,20 @@ class _LoopState:
         # blocks where a Python float is actually needed.
         self._last_real_loss_gpu: torch.Tensor | None = None
 
+        # τ-invariant raw KL (loss / T²) — the comparable-across-schedules
+        # metric. Logged alongside the raw loss in heartbeats / step logs
+        # so analytics work regardless of any temperature ramp. Borrowed
+        # from max_quality stage-5 KD's `raw_kl` channel.
+        self._last_temperature: float = float(self.dconf.temperature)
+        # EMA of raw_kl with α=0.2; matches mq stage-5. Used to pick the
+        # "best so far" step pointer so a precursor-spike + later collapse
+        # (run-1 pattern) doesn't trap us at a late-but-bad checkpoint.
+        self._raw_kl_ema_alpha: float = 0.2
+        self._raw_kl_ema: float | None = None
+        self._best_raw_kl_ema: float | None = None
+        self._best_step: int = 0
+        self._best_metadata: dict[str, Any] = {}
+
         # Observability knobs (env-tunable so YAML edits aren't required).
         # KDR_MICRO_HEARTBEAT=N    -> emit a heartbeat log every N micro-batches
         #                            (0 disables; default 4). Reports the
@@ -679,6 +694,26 @@ class _LoopState:
         self.tokens_dropped_window += self.pending_window_tokens
         self.pending_window_tokens = 0
 
+    def _current_temperature(self) -> float:
+        """Per-step KD temperature.
+
+        When `temperature_start` is unset, returns `temperature` (the
+        constant baseline). When set, linearly interpolates from
+        `temperature_start` at step 0 to `temperature` at
+        `total_steps - 1`. Soft-to-hard curriculum: high T early
+        smooths the teacher distribution so STE updates aren't chasing
+        sharp peaks while IQ2_XS codebook assignments are still
+        settling; T → endpoint as the student approaches a basin.
+        """
+        t_end = float(self.dconf.temperature)
+        t_start = self.dconf.temperature_start
+        if t_start is None:
+            return t_end
+        if self.total_steps <= 1:
+            return t_end
+        frac = min(1.0, max(0.0, self.step / (self.total_steps - 1)))
+        return float(t_start) + frac * (t_end - float(t_start))
+
     def _shard_per_rank(self, batches: list[torch.Tensor]) -> list[torch.Tensor]:
         """Strided slice so each rank consumes a disjoint subset.
 
@@ -711,7 +746,12 @@ class _LoopState:
         with torch.no_grad():
             t_logits = self.teacher(input_ids=ids, use_cache=False).logits
         s_logits = self.student(input_ids=ids, use_cache=False).logits
-        loss = forward_kld_loss(s_logits, t_logits, temperature=self.dconf.temperature)
+        # Schedule-aware temperature (constant by default; linearly ramped
+        # if `temperature_start` is set). Cached on the instance so the
+        # heartbeat / step-log paths can read the same value that produced
+        # the most recent loss.
+        self._last_temperature = self._current_temperature()
+        loss = forward_kld_loss(s_logits, t_logits, temperature=self._last_temperature)
 
         this_micro_tokens = int(ids.numel()) * self.world
         self.tokens_consumed += this_micro_tokens
@@ -762,12 +802,19 @@ class _LoopState:
                 if self._last_real_loss_gpu is not None
                 else float("nan")
             )
+            # τ-invariant raw KL = loss / T². Comparable across any
+            # temperature schedule; primary metric for save-best logic.
+            t_now = self._last_temperature
+            raw_kl_val = loss_val / (t_now * t_now) if t_now else float("nan")
             log.info(
-                "heartbeat step=%d micro=%d/%d loss=%.6f dt=%.1fs (%.1fs/micro)",
+                "heartbeat step=%d micro=%d/%d loss=%.6f raw_kl=%.6f T=%.2f "
+                "dt=%.1fs (%.1fs/micro)",
                 self.step,
                 self.micro_in_window,
                 self.grad_accum,
                 loss_val,
+                raw_kl_val,
+                t_now,
                 dt,
                 dt / max(1, self._micro_heartbeat_every),
             )
@@ -820,6 +867,43 @@ class _LoopState:
             self.consecutive_nan_windows = 0
         self.nan_in_current_window = False
 
+        # Update τ-invariant raw_kl EMA on every committed window (not
+        # only on logged steps) so the best-step pointer reflects the
+        # real curve, not a coarse subsample. Skip on NaN-tagged windows
+        # — they don't carry signal about the basin.
+        loss_val_for_ema: float | None = None
+        if (
+            self.accelerator.is_main_process
+            and self._last_real_loss_gpu is not None
+            and not self.nan_in_current_window
+        ):
+            loss_val_for_ema = float(self._last_real_loss_gpu.item())
+            t_now = self._last_temperature
+            raw_kl_now = loss_val_for_ema / (t_now * t_now) if t_now else float("nan")
+            if (
+                raw_kl_now == raw_kl_now  # not NaN
+                and raw_kl_now != float("inf")
+                and raw_kl_now != float("-inf")
+            ):
+                if self._raw_kl_ema is None:
+                    self._raw_kl_ema = raw_kl_now
+                else:
+                    a = self._raw_kl_ema_alpha
+                    self._raw_kl_ema = a * raw_kl_now + (1.0 - a) * self._raw_kl_ema
+                if (
+                    self._best_raw_kl_ema is None
+                    or self._raw_kl_ema < self._best_raw_kl_ema
+                ):
+                    self._best_raw_kl_ema = self._raw_kl_ema
+                    self._best_step = self.step
+                    self._best_metadata = {
+                        "step": self.step,
+                        "raw_kl": raw_kl_now,
+                        "raw_kl_ema": self._raw_kl_ema,
+                        "temperature": t_now,
+                        "loss": loss_val_for_ema,
+                    }
+
         if self.accelerator.is_main_process and (
             self.step == 1
             or self.step % self.dconf.log_every_n_steps == 0
@@ -827,17 +911,40 @@ class _LoopState:
             now = time.monotonic()
             step_dt = now - self._step_t0
             self._step_t0 = now
+            # Reuse the already-synced value when we just computed it for
+            # the EMA — saves one cudaStreamSynchronize per logged step.
             loss_val = (
-                float(self._last_real_loss_gpu.item())
-                if self._last_real_loss_gpu is not None
-                else float("nan")
+                loss_val_for_ema
+                if loss_val_for_ema is not None
+                else (
+                    float(self._last_real_loss_gpu.item())
+                    if self._last_real_loss_gpu is not None
+                    else float("nan")
+                )
             )
+            t_now = self._last_temperature
+            raw_kl_val = loss_val / (t_now * t_now) if t_now else float("nan")
             log.info(
-                "step=%d/%d lr=%.3e loss=%.6f tok=%.2fB/%.2fB nan_skip=%.2fM step_dt=%.1fs",
+                "step=%d/%d lr=%.3e T=%.2f loss=%.6f raw_kl=%.6f "
+                "raw_kl_ema=%.6f best_raw_kl_ema=%.6f best_step=%d "
+                "tok=%.2fB/%.2fB nan_skip=%.2fM step_dt=%.1fs",
                 self.step,
                 self.total_steps,
                 self.optim.param_groups[0]["lr"],
+                t_now,
                 loss_val,
+                raw_kl_val,
+                (
+                    self._raw_kl_ema
+                    if self._raw_kl_ema is not None
+                    else float("nan")
+                ),
+                (
+                    self._best_raw_kl_ema
+                    if self._best_raw_kl_ema is not None
+                    else float("nan")
+                ),
+                self._best_step,
                 self.tokens_with_grad / 1e9,
                 self.dconf.total_tokens / 1e9,
                 self.tokens_skipped_nan / 1e6,
@@ -876,6 +983,52 @@ class _LoopState:
                 partial=True,
                 async_mode=self.dconf.enable_async_save,
             )
+            # Persist a best-step pointer alongside the partials so a
+            # post-mortem (or the final-save selection logic) can find
+            # the partial corresponding to the lowest raw_kl_ema seen so
+            # far. Cheap (~few hundred bytes JSON) — written every save
+            # tick, atomic via tmp+rename. Borrowed from max_quality
+            # stage-5 KD's `best_raw_kl_ema` save-best discipline.
+            if (
+                self.accelerator.is_main_process
+                and self._best_raw_kl_ema is not None
+            ):
+                self._write_best_pointer()
+
+    def _write_best_pointer(self) -> None:
+        """Persist the best-raw_kl_ema partial pointer to disk.
+
+        Format: ``<artifacts_dir>/kdr_<mode>_best_partial_pointer.json``,
+        atomic via tmp+rename. Records the step and metric values; the
+        partial dir itself is the regular per-step save at
+        ``partial_dir_name(mode, best_step)``. A post-mortem reader (or
+        the final-save selector) resolves the pointer and reads the
+        partial from there.
+
+        Cheap (few hundred bytes), idempotent, written every save tick
+        so a preempt mid-run still leaves a recoverable pointer. Reading
+        and resuming from the best partial is the consumer's choice;
+        the trainer does not auto-rewind.
+        """
+        if self._best_step <= 0:
+            return
+        target = self.artifacts_dir / f"kdr_{self.config.mode}_best_partial_pointer.json"
+        partial_name = partial_dir_name(self.config.mode, self._best_step)
+        payload = {
+            "best_step": self._best_step,
+            "best_partial_dir": partial_name,
+            "metric": "raw_kl_ema",
+            "ema_alpha": self._raw_kl_ema_alpha,
+            "raw_kl_ema": self._best_raw_kl_ema,
+            "raw_kl_at_best": self._best_metadata.get("raw_kl"),
+            "loss_at_best": self._best_metadata.get("loss"),
+            "temperature_at_best": self._best_metadata.get("temperature"),
+            "current_step": self.step,
+            "current_raw_kl_ema": self._raw_kl_ema,
+        }
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        os.replace(tmp, target)
 
     def _all_finite(self, loss: torch.Tensor) -> bool:
         """Collective NaN/Inf check — True iff loss is finite on EVERY rank.
