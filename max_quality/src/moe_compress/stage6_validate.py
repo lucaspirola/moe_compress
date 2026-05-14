@@ -537,6 +537,20 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     if use_torch_compile:
         log.info("Stage 6: applying torch.compile(dynamic=True, mode='default') to model.forward")
         try:
+            # Pin the KV cache shape via StaticCache BEFORE compiling. Without
+            # this, autoregressive generate() grows the KV tensor by 1 every
+            # decode step, each (seq_len, kv_len) pair re-enters
+            # aot_dispatch_base_graph.trace, and on torch 2.11+cu130 + Hopper
+            # the tracer segfaults inside graph capture. StaticCache pre-
+            # allocates the KV at max_cache_len and updates in-place via
+            # index_copy_, so the shape never changes after the first prefill.
+            # generate() internally calls mark_static_address() on the static
+            # cache, so Dynamo sees stable storage. Net effect: exactly two
+            # compile events for the HumanEval+MATH-500 phase (one prefill
+            # bucket, one decode), then full compiled speed per token. See
+            # memory/project_stage6_humaneval_static_cache.md.
+            if hasattr(model, "generation_config") and model.generation_config is not None:
+                model.generation_config.cache_implementation = "static"
             model.forward = torch.compile(model.forward, dynamic=True, mode="default")
             log.info("Stage 6: torch.compile applied successfully")
         except Exception as exc:
@@ -1393,8 +1407,15 @@ def _generate_batched(model, tokenizer, prompts: list[str], *, max_new: int,
     try:
         for i in range(0, len(prompts), batch_size):
             batch_prompts = prompts[i:i + batch_size]
+            # pad_to_multiple_of=64 buckets prompt lengths so torch.compile sees
+            # a small set of stable input shapes across batches — combined with
+            # StaticCache (set at the compile site), the entire HumanEval +
+            # MATH-500 phase trips at most ~2 recompile events instead of one
+            # per (seq_len, kv_len) pair. Avoids the autoregressive-recompile
+            # segfault inside aot_dispatch_base_graph on torch 2.11+cu130.
             encoded = tokenizer(
                 batch_prompts, return_tensors="pt", padding=True,
+                pad_to_multiple_of=64,
                 truncation=False, add_special_tokens=False,
             )
             if _gen_dev is not None:
@@ -1404,6 +1425,12 @@ def _generate_batched(model, tokenizer, prompts: list[str], *, max_new: int,
                 out = model.generate(
                     **encoded,
                     max_new_tokens=max_new,
+                    # min_new_tokens=max_new forces a fixed decode length so
+                    # generate() never early-exits on EOS — that would cut the
+                    # decode loop at a variable step and trigger a recompile.
+                    # The existing eos-truncation logic below trims trailing
+                    # tokens after decode; result quality is unchanged.
+                    min_new_tokens=max_new,
                     do_sample=False,
                     # tokenizer.pad_token_id is set to eos_token_id by the guard
                     # above; fall back to 0 if both are absent so generate() never
