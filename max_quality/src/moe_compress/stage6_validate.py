@@ -537,20 +537,20 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     if use_torch_compile:
         log.info("Stage 6: applying torch.compile(dynamic=True, mode='default') to model.forward")
         try:
-            # Pin the KV cache shape via StaticCache BEFORE compiling. Without
-            # this, autoregressive generate() grows the KV tensor by 1 every
-            # decode step, each (seq_len, kv_len) pair re-enters
-            # aot_dispatch_base_graph.trace, and on torch 2.11+cu130 + Hopper
-            # the tracer segfaults inside graph capture. StaticCache pre-
-            # allocates the KV at max_cache_len and updates in-place via
-            # index_copy_, so the shape never changes after the first prefill.
-            # generate() internally calls mark_static_address() on the static
-            # cache, so Dynamo sees stable storage. Net effect: exactly two
-            # compile events for the HumanEval+MATH-500 phase (one prefill
-            # bucket, one decode), then full compiled speed per token. See
-            # memory/project_stage6_humaneval_static_cache.md.
-            if hasattr(model, "generation_config") and model.generation_config is not None:
-                model.generation_config.cache_implementation = "static"
+            # NOTE: previously set `model.generation_config.cache_implementation = "static"`
+            # here to dodge dynamic-cache recompile storms during autoregressive
+            # generate(). With our other Stage 6 fixes in place (Dynamo bypass on
+            # GatedDeltaNet + torch-native fla/tilelang fallback +
+            # TORCHDYNAMO_CACHE_SIZE_LIMIT=512), the dynamic-cache path now works
+            # without storm. Keeping StaticCache active triggered a transformers
+            # bug at modeling_qwen3_5_moe.py:1396 → create_causal_mask, where the
+            # static-cache prefill path passes a dict instead of a tensor (raises
+            # `AttributeError: 'dict' object has no attribute 'ndim'` during the
+            # FIRST HumanEval forward). The torch.compile path itself is robust
+            # to dynamic shapes here because we capped recompile_limit at 512;
+            # actual unique attention-layer shapes per HumanEval/MATH run are far
+            # below that. So we leave generation_config alone and let HF's default
+            # DynamicCache handle the prefill+decode.
             # Disable torch.compile on the GatedDeltaNet / linear-attention
             # sublayers BEFORE wrapping model.forward. Inductor's codegen for
             # `constant_pad_nd(new_conv_state, pad=4-s87)` produces a Triton
