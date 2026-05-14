@@ -356,14 +356,21 @@ def _dedupe_shared_storage(
         # treat the non-parametrize names as canonical.
         return ".parametrizations." not in name
 
-    # Two-pass: first add canonical entries, then add non-canonical ones
-    # only if their storage is new. Guarantees the canonical name wins
-    # any tie regardless of dict iteration order.
+    # Non-tensor entries (string metadata, ints, etc.) cannot share
+    # storage by definition — pass them through unconditionally, before
+    # the two-pass tensor walk. (Previously they were silently dropped
+    # when their key contained ``.parametrizations.`` because the
+    # iteration only added them under ``pass_canonical=True``.)
+    for key, value in state_dict.items():
+        if not isinstance(value, torch.Tensor):
+            deduped[key] = value
+
+    # Two-pass: first add canonical *tensor* entries, then add
+    # non-canonical ones only if their storage is new. Guarantees the
+    # canonical name wins any tie regardless of dict iteration order.
     for pass_canonical in (True, False):
         for key, value in state_dict.items():
             if not isinstance(value, torch.Tensor):
-                if pass_canonical:
-                    deduped[key] = value
                 continue
             if _is_canonical(key) != pass_canonical:
                 continue

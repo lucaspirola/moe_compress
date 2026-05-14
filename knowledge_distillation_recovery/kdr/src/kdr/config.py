@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .modes import Mode
 from .quant.specs import KVQuantSpec, MixedWeightSpec, UniformWeightSpec
@@ -150,6 +150,29 @@ class DistillationConfig(BaseModel):
     save_every_n_steps: int = Field(..., ge=0, description="0 = skip partial saves; final-only")
     trainable_scope: Literal["full", "experts_only", "factored_only"]
     use_gradient_checkpointing: bool = True
+
+    @model_validator(mode="after")
+    def _validate_temperature_curriculum(self) -> "DistillationConfig":
+        """Ensure the temperature ramp is soft → hard (start > end).
+
+        The curriculum's purpose is to start with a softer teacher target
+        (high T) and tighten to a sharp target (lower T) as the student
+        moves into a basin. A config with `temperature_start <= temperature`
+        would invert the curriculum (cold → hot), which silently changes
+        the regularisation story without surfacing as a runtime error.
+        Catch the typo at config-load time instead.
+        """
+        if (
+            self.temperature_start is not None
+            and self.temperature_start <= self.temperature
+        ):
+            raise ValueError(
+                f"temperature_start ({self.temperature_start}) must be "
+                f"strictly greater than temperature ({self.temperature}) "
+                "to describe a soft-to-hard curriculum. Unset "
+                "temperature_start for constant-temperature training."
+            )
+        return self
 
     # Phase 7+ throughput optimization. See `_probe_max_batch_size` in
     # `kdr/training/loop.py` for the algorithm and the class docstring above
