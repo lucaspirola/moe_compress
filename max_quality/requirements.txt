@@ -34,10 +34,6 @@ ortools>=9.10       # SimpleMinCostFlow for Stage 2 v2 capacitated assignment
 # --- Misc runtime ---
 peft>=0.13.0
 pyyaml>=6.0
-pydantic>=2.5.0     # config validation in kdr (kdr ships in this same image; without
-                    # this dep, kdr's `pip install -e . --no-deps` step in its bootstrap
-                    # leaves pydantic unresolved → ModuleNotFoundError at run_id derive
-                    # time. See knowledge_distillation_recovery/kdr/pyproject.toml.)
 lm-eval>=0.4.5
 trackio>=0.5.0
 nvidia-ml-py>=12.0
