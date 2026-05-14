@@ -551,6 +551,28 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             # memory/project_stage6_humaneval_static_cache.md.
             if hasattr(model, "generation_config") and model.generation_config is not None:
                 model.generation_config.cache_implementation = "static"
+            # Disable torch.compile on the GatedDeltaNet / linear-attention
+            # sublayers BEFORE wrapping model.forward. Inductor's codegen for
+            # `constant_pad_nd(new_conv_state, pad=4-s87)` produces a Triton
+            # store kernel whose index math goes out-of-bounds when s87 >= 4
+            # (every lm_eval prompt has seqlen >= 4), causing illegal GMEM
+            # access from inside the AOT-compiled artifact — segfault. The
+            # block is ~5% of total flops on Qwen3.5-MoE-A3B; running it
+            # eager (or via FLA fused kernel) costs essentially nothing
+            # while attention + MoE blocks (>90% flops) stay compiled.
+            # See pytorch/pytorch#120198 (dynamic-shape Triton + conditional
+            # indexing) for the class of bug.
+            _bypass_names = ("GatedDeltaNet", "LinearAttention", "MoeMamba")
+            _bypassed = 0
+            for _name, _mod in model.named_modules():
+                _cls = type(_mod).__name__
+                if any(b in _cls for b in _bypass_names):
+                    _mod.forward = torch._dynamo.disable(_mod.forward)
+                    _bypassed += 1
+            if _bypassed:
+                log.info("Stage 6: torch._dynamo.disable applied to %d linear-attention "
+                         "sublayer(s) to dodge Inductor codegen bug on constant_pad_nd "
+                         "(pad=4-s87) — keep compile on attention + MoE blocks", _bypassed)
             model.forward = torch.compile(model.forward, dynamic=True, mode="default")
             log.info("Stage 6: torch.compile applied successfully")
         except Exception as exc:
