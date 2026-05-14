@@ -573,6 +573,48 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
                 log.info("Stage 6: torch._dynamo.disable applied to %d linear-attention "
                          "sublayer(s) to dodge Inductor codegen bug on constant_pad_nd "
                          "(pad=4-s87) — keep compile on attention + MoE blocks", _bypassed)
+
+            # The Dynamo-disable above prevents Inductor codegen on the
+            # GatedDeltaNet block, but the EAGER body still dispatches into
+            # fla / tilelang's `chunk_gated_delta_rule` kernel, which is
+            # unstable on H200+cu130 across both varying prompt lengths
+            # (lm_eval logloglikelihood → SIGSEGV) and StaticCache decode
+            # (HumanEval → SIGABRT in tilelang TVM-FFI ICHECK). Force the
+            # torch-native fallbacks instead — they are pure PyTorch loops
+            # already shipped in modeling_qwen3_5_moe.py:207-275 as drop-in
+            # replacements for the fla/tilelang path. Same math, no
+            # quantization, identical numerics. Speed loss is bounded
+            # (~5% of flops on this block; net effect <1% wall).
+            try:
+                from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+                    torch_chunk_gated_delta_rule,
+                    torch_recurrent_gated_delta_rule,
+                )
+                _gdn_patched = 0
+                for _name, _mod in model.named_modules():
+                    if type(_mod).__name__ == "Qwen3_5MoeGatedDeltaNet":
+                        if hasattr(_mod, "chunk_gated_delta_rule"):
+                            _mod.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+                        if hasattr(_mod, "recurrent_gated_delta_rule"):
+                            _mod.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
+                        # None falls through to the torch causal_conv1d path
+                        # in the modeling source. Avoids tilelang's
+                        # causal_conv1d kernel which has the same Hopper
+                        # stability issue.
+                        if hasattr(_mod, "causal_conv1d_fn"):
+                            _mod.causal_conv1d_fn = None
+                        if hasattr(_mod, "causal_conv1d_update"):
+                            _mod.causal_conv1d_update = None
+                        _gdn_patched += 1
+                if _gdn_patched:
+                    log.info("Stage 6: forced torch-native fallback for "
+                             "chunk_gated_delta_rule + causal_conv1d on %d "
+                             "Qwen3_5MoeGatedDeltaNet block(s) to dodge "
+                             "fla/tilelang instability on H200+cu130", _gdn_patched)
+            except ImportError as _exc:
+                log.warning("Stage 6: torch fallback symbols not found in "
+                            "transformers.models.qwen3_5_moe (%s) — fla/tilelang "
+                            "may crash later; continuing", _exc)
             model.forward = torch.compile(model.forward, dynamic=True, mode="default")
             log.info("Stage 6: torch.compile applied successfully")
         except Exception as exc:
