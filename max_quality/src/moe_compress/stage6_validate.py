@@ -534,6 +534,23 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     # fusion but drops graph capture, eliminating the deadlock at the cost of
     # ~10-15% per-forward speed.
     use_torch_compile = s6.get("torch_compile", False)
+    # NOTE: the fla-kernel protections (chunk_gated_delta_rule replacement,
+    # causal_conv1d_fn=None, FusedRMSNormGated→torch swap, _dynamo.disable on
+    # GDN/LinearAttention/MoeMamba submodules) all live INSIDE the
+    # `if use_torch_compile:` block below. They are independently needed to
+    # dodge cu130/Triton crashes — not strictly compile-dependent — but the
+    # production YAML always sets `torch_compile: true`, so this gating is
+    # safe for the A0..A11 sweep. If a future run sets `torch_compile: false`,
+    # hoist that protection block out before relying on it.
+    # If we compile model.forward below, stash the pre-compile bound method
+    # here so the generative block (HumanEval/MATH-500) can restore it.
+    # torch.compile(dynamic=True) on autoregressive generate() drives an
+    # Inductor recompile storm on the growing cache_position plus exposes
+    # a Triton/Inductor codegen path that's unstable on cu130 for batch=1
+    # decode shapes — we keep compile ON for PPL + lm_eval (prefill-only,
+    # works today) and revert to eager for generate() (~minutes of slowdown,
+    # <1% of full ablation wall).
+    _pre_compile_forward = None
     if use_torch_compile:
         log.info("Stage 6: applying torch.compile(dynamic=True, mode='default') to model.forward")
         try:
@@ -587,11 +604,13 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             # (~5% of flops on this block; net effect <1% wall).
             try:
                 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+                    Qwen3_5MoeRMSNormGated as _TorchRMSNormGated,
                     torch_chunk_gated_delta_rule,
                     torch_recurrent_gated_delta_rule,
                     torch_causal_conv1d_update,
                 )
                 _gdn_patched = 0
+                _norm_patched = 0
                 for _name, _mod in model.named_modules():
                     if type(_mod).__name__ == "Qwen3_5MoeGatedDeltaNet":
                         if hasattr(_mod, "chunk_gated_delta_rule"):
@@ -611,21 +630,60 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
                         # which we overwrote — restore it explicitly).
                         if hasattr(_mod, "causal_conv1d_update"):
                             _mod.causal_conv1d_update = torch_causal_conv1d_update
+                        # Replace fla `FusedRMSNormGated` with pure-torch
+                        # `Qwen3_5MoeRMSNormGated` (same module, no Triton).
+                        # fla's Triton kernel JIT-recompiles for the (B*1,
+                        # head_v_dim) decode shape during HumanEval generate
+                        # and segfaults on Hopper + Triton 3.4 — same kernel
+                        # crash class as fla-org/flash-linear-attention#734.
+                        # Same numerics (closed-form RMSNorm + SiLU gate);
+                        # ~0.5% of flops, no measurable wall impact.
+                        if (
+                            hasattr(_mod, "norm")
+                            and type(_mod.norm).__name__ == "FusedRMSNormGated"
+                        ):
+                            _old_norm = _mod.norm
+                            _new_norm = _TorchRMSNormGated(
+                                _mod.head_v_dim, eps=_mod.layer_norm_epsilon
+                            )
+                            # Place the new norm on the model device/dtype
+                            # BEFORE copying weights. If `.to()` raised after
+                            # `.copy_()`, _new_norm would be stranded on CPU
+                            # but already swapped into _mod.norm via the
+                            # assignment below, producing a hard-to-diagnose
+                            # device-mismatch crash on the next forward.
+                            _new_norm.to(
+                                device=_old_norm.weight.device,
+                                dtype=_old_norm.weight.dtype,
+                            )
+                            _new_norm.weight.data.copy_(_old_norm.weight.data)
+                            _mod.norm = _new_norm
+                            _norm_patched += 1
                         _gdn_patched += 1
                 if _gdn_patched:
                     log.info("Stage 6: forced torch-native fallback for "
                              "chunk_gated_delta_rule + causal_conv1d on %d "
                              "Qwen3_5MoeGatedDeltaNet block(s) to dodge "
                              "fla/tilelang instability on H200+cu130", _gdn_patched)
+                if _norm_patched:
+                    log.info("Stage 6: replaced fla FusedRMSNormGated with "
+                             "torch-native Qwen3_5MoeRMSNormGated on %d "
+                             "GDN block(s) to dodge Triton 3.4 decode-shape "
+                             "crash on Hopper", _norm_patched)
             except ImportError as _exc:
                 log.warning("Stage 6: torch fallback symbols not found in "
                             "transformers.models.qwen3_5_moe (%s) — fla/tilelang "
                             "may crash later; continuing", _exc)
+            # Capture the pre-compile bound method BEFORE wrapping so the
+            # generative block can restore it (Option C: keep compile for
+            # prefill-only paths; eager for generate()).
+            _pre_compile_forward = model.forward
             model.forward = torch.compile(model.forward, dynamic=True, mode="default")
             log.info("Stage 6: torch.compile applied successfully")
         except Exception as exc:
             log.warning("Stage 6: torch.compile failed (%s) — continuing without compilation", exc)
             use_torch_compile = False
+            _pre_compile_forward = None
 
     # transformers' LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING is missing an
     # entry for 'linear_attention' in 4.x, but Qwen3.5-MoE's GatedDeltaNet
@@ -722,6 +780,26 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
 
     # 3. Generative — HumanEval + MATH-500 (Optimizations #3, #4: batched generate)
     if s6["generative"]["enabled"]:
+        # Restore uncompiled forward for generate(): see _pre_compile_forward
+        # rationale above. PPL + lm_eval ran with the compiled forward (works
+        # today); generate() runs eager to dodge cu130 decode-shape codegen
+        # bugs and Inductor recompile storms on growing cache_position.
+        if _pre_compile_forward is not None:
+            model.forward = _pre_compile_forward
+            log.info("Stage 6: restored uncompiled model.forward for generative "
+                     "block (keep PPL/lm_eval compiled, generative eager)")
+        # Switch MoE dispatch to batched_mm for the generative block only.
+        # torch._grouped_mm on cu130 crashes on B=1 decode-shape (tiny per-
+        # expert groups + changing `offs` tensor every decode step). batched_mm
+        # is ~5-10% slower per step but generative is single-digit % of Stage 6
+        # wall, so absolute cost is minutes. PPL + lm_eval keep whatever the
+        # YAML/env specified (grouped_mm by default on Hopper).
+        _gen_experts_impl = os.environ.get("EXPERTS_IMPLEMENTATION_GENERATIVE", "batched_mm")
+        if _gen_experts_impl != _experts_impl:
+            log.info("Stage 6: switching experts_implementation %r → %r for "
+                     "generative block (cu130 _grouped_mm decode-shape workaround)",
+                     _experts_impl, _gen_experts_impl)
+            _set_experts_implementation_s6(model, _gen_experts_impl)
         log.info("Stage 6: generative (HumanEval + MATH-500), gen_batch_size=%d", int(gen_batch_size))
         if "humaneval" in s6["generative"]:
             # F-CR2-L-1: schema preservation — accept `num_samples_per_task` for
