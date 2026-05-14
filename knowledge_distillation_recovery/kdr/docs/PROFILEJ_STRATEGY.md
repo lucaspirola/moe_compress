@@ -180,7 +180,9 @@ The current YAML (commit `999dc1a` of `Profile-J GGUF`):
 ```yaml
 distillation:
   loss: forward_kld
-  temperature: 2.0           # softens KD target on long-tail tokens
+  temperature: 1.0           # endpoint of the linear ramp
+  temperature_start: 4.0     # ramps τ 4.0 → 1.0 over the run (soft-to-hard
+                             # curriculum; borrowed from max_quality stage-5)
   optimizer: adamw_bnb_8bit  # 8-bit AdamW from bitsandbytes >= 0.49.2
   learning_rate: 5.0e-5      # was 2.0e-4; see Section 5
   min_learning_rate: 5.0e-6  # was 4.5e-7; keeps ~10× cosine ratio
@@ -198,6 +200,36 @@ distillation:
   trainable_scope: full      # all 8.84B params trainable
   use_gradient_checkpointing: true
 ```
+
+### 4.1 Temperature curriculum and τ-invariant tracking (borrowed from max_quality stage-5 KD)
+
+`temperature_start: 4.0` activates a per-step linear ramp; the
+`forward_kld_loss` call at each micro receives the schedule-aware τ.
+High τ early smooths the teacher's softmax distribution so the STE
+updates aren't chasing sharp logit peaks while IQ2_XS codebook
+assignments are still settling; the schedule sharpens to τ=1.0 by the
+final step once the student is in-basin. Defaults to constant
+`temperature` when `temperature_start` is unset — fully backward
+compatible.
+
+Because raw KD loss is τ-dependent (the formula divides by T inside
+the softmax and multiplies by T² outside), we track
+**`raw_kl = loss / T²`** in addition to loss. `raw_kl` is comparable
+across any τ schedule — it is the metric we use for the save-best
+pointer (Section 6.3).
+
+### 4.2 EMA-best step pointer
+
+Every committed window updates an EMA of `raw_kl` with α=0.2 (mq
+stage-5's choice). When the EMA improves on the best-so-far, the
+current step's metadata (`step`, `raw_kl`, `raw_kl_ema`, `temperature`,
+`loss`) is recorded. At every `save_every_n_steps` boundary the trainer
+writes a small JSON pointer file
+`<artifacts_dir>/kdr_<mode>_best_partial_pointer.json` recording the
+best step and the corresponding partial-dir name. A post-mortem
+(or the final-save selector) resolves the pointer to find the partial
+representing the lowest-EMA basin — robust against the run-1 pattern
+where a precursor spike at step 15 preceded a step-25 collapse.
 
 LR schedule is **linear warmup → cosine decay** to `min_learning_rate`.
 With `total_tokens=50M`, `per_device_batch_size=1`, `seq_length=4096`,
