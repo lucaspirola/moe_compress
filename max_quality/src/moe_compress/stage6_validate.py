@@ -621,6 +621,28 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             log.warning("Stage 6: torch.compile failed (%s) — continuing without compilation", exc)
             use_torch_compile = False
 
+    # transformers' LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING is missing an
+    # entry for 'linear_attention' in 4.x, but Qwen3.5-MoE's GatedDeltaNet
+    # layers register that pattern. create_masks_for_generate (called by
+    # generate's prefill path when cache_implementation='static' is active)
+    # then raises KeyError: 'linear_attention' at masking_utils.py:1479
+    # before the first HumanEval token is produced. Register a passthrough
+    # mapping to the same function as 'full_attention' — GatedDeltaNet
+    # doesn't consume the attention mask anyway (it derives causality from
+    # internal conv1d state via the torch-native fallback we just installed).
+    # Same math, same outputs, no quality compromise.
+    try:
+        from transformers import masking_utils as _mu
+        _mapping = getattr(_mu, "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", None)
+        if isinstance(_mapping, dict) and "linear_attention" not in _mapping:
+            if "full_attention" in _mapping:
+                _mapping["linear_attention"] = _mapping["full_attention"]
+                log.info("Stage 6: registered 'linear_attention' → full_attention mask "
+                         "in LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING (transformers missing "
+                         "entry for Qwen3.5-MoE GatedDeltaNet)")
+    except ImportError:
+        pass
+
     # Read batch size configs with defaults tuned for H200.
     ppl_batch_size = int(s6.get("ppl_batch_size", 8))
     # F-iter4-LOW-2: validate lm_eval_batch_size — accept positive int, an
