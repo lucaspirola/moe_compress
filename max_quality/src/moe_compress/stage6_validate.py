@@ -477,6 +477,97 @@ def _set_experts_implementation_s6(model, impl: str) -> None:
     log.info("Stage 6: MoE experts_implementation = %r", impl)
 
 
+def _apply_stage6_kernel_patches(m, *, role: str) -> None:
+    """Apply the cu130/Hopper segfault-fix patches in-place on a Qwen3.5-MoE
+    model. Idempotent: safe to call multiple times. Called once per model
+    (student AND teacher both need it before torch.compile / generate).
+
+    The patches are necessary on torch 2.11+cu130 + Triton 3.4 + Hopper because:
+      1. Inductor codegen for `constant_pad_nd(pad=4-s87)` indexes OOB inside
+         GatedDeltaNet / LinearAttention / MoeMamba submodules — dodge by
+         `torch._dynamo.disable`-ing those modules' forwards.
+      2. fla/tilelang's `chunk_gated_delta_rule`, `recurrent_gated_delta_rule`,
+         and `causal_conv1d_update` are unstable on this stack (SIGSEGV in
+         lm_eval, SIGABRT in HumanEval). Swap to torch-native fallbacks
+         already shipped in `modeling_qwen3_5_moe.py`.
+      3. fla's `FusedRMSNormGated` Triton kernel JIT-recompiles for the
+         `(B*1, head_v_dim)` decode shape during generate() and segfaults on
+         Hopper + Triton 3.4 (fla-org/flash-linear-attention#734). Swap to
+         the pure-torch `Qwen3_5MoeRMSNormGated` (same numerics).
+
+    Speed impact: ~5% of GatedDeltaNet flops run eager + a few RMSNorm calls;
+    net <1% wall on the full Stage 6 run.
+    """
+    _bypass_names = ("GatedDeltaNet", "LinearAttention", "MoeMamba")
+    _bypassed = 0
+    for _name, _mod in m.named_modules():
+        _cls = type(_mod).__name__
+        if any(b in _cls for b in _bypass_names):
+            _mod.forward = torch._dynamo.disable(_mod.forward)
+            _bypassed += 1
+    if _bypassed:
+        log.info("Stage 6 [%s]: torch._dynamo.disable on %d linear-attention "
+                 "sublayer(s)", role, _bypassed)
+
+    try:
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeRMSNormGated as _TorchRMSNormGated,
+            torch_chunk_gated_delta_rule,
+            torch_recurrent_gated_delta_rule,
+            torch_causal_conv1d_update,
+        )
+    except ImportError as _exc:
+        log.warning("Stage 6 [%s]: torch fallback symbols not found in "
+                    "transformers.models.qwen3_5_moe (%s) — fla/tilelang may "
+                    "crash later; continuing", role, _exc)
+        return
+
+    _gdn_patched = 0
+    _norm_patched = 0
+    for _name, _mod in m.named_modules():
+        if type(_mod).__name__ != "Qwen3_5MoeGatedDeltaNet":
+            continue
+        if hasattr(_mod, "chunk_gated_delta_rule"):
+            _mod.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+        if hasattr(_mod, "recurrent_gated_delta_rule"):
+            _mod.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
+        # Prefill path checks `if causal_conv1d_fn is not None` — None falls
+        # through to torch. Decode path calls `causal_conv1d_update` with no
+        # None-check, so must set explicitly to the torch fallback.
+        if hasattr(_mod, "causal_conv1d_fn"):
+            _mod.causal_conv1d_fn = None
+        if hasattr(_mod, "causal_conv1d_update"):
+            _mod.causal_conv1d_update = torch_causal_conv1d_update
+        if (
+            hasattr(_mod, "norm")
+            and type(_mod.norm).__name__ == "FusedRMSNormGated"
+        ):
+            _old_norm = _mod.norm
+            _new_norm = _TorchRMSNormGated(
+                _mod.head_v_dim, eps=_mod.layer_norm_epsilon
+            )
+            # Move new norm to model device/dtype BEFORE copying weights —
+            # ordering matters: if .to() raised after .copy_(), the stranded
+            # CPU weight would still be swapped in and crash on next forward.
+            _new_norm.to(
+                device=_old_norm.weight.device,
+                dtype=_old_norm.weight.dtype,
+            )
+            _new_norm.weight.data.copy_(_old_norm.weight.data)
+            _mod.norm = _new_norm
+            _norm_patched += 1
+        _gdn_patched += 1
+
+    if _gdn_patched:
+        log.info("Stage 6 [%s]: forced torch-native fallback for "
+                 "chunk_gated_delta_rule + causal_conv1d on %d "
+                 "Qwen3_5MoeGatedDeltaNet block(s)", role, _gdn_patched)
+    if _norm_patched:
+        log.info("Stage 6 [%s]: replaced fla FusedRMSNormGated with "
+                 "torch-native Qwen3_5MoeRMSNormGated on %d GDN block(s)",
+                 role, _norm_patched)
+
+
 def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> Path:
     s6 = config["stage6_validate"]
 
@@ -534,14 +625,13 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     # fusion but drops graph capture, eliminating the deadlock at the cost of
     # ~10-15% per-forward speed.
     use_torch_compile = s6.get("torch_compile", False)
-    # NOTE: the fla-kernel protections (chunk_gated_delta_rule replacement,
-    # causal_conv1d_fn=None, FusedRMSNormGated→torch swap, _dynamo.disable on
-    # GDN/LinearAttention/MoeMamba submodules) all live INSIDE the
-    # `if use_torch_compile:` block below. They are independently needed to
-    # dodge cu130/Triton crashes — not strictly compile-dependent — but the
-    # production YAML always sets `torch_compile: true`, so this gating is
-    # safe for the A0..A11 sweep. If a future run sets `torch_compile: false`,
-    # hoist that protection block out before relying on it.
+    # Apply the cu130/Hopper segfault-fix patches to the student
+    # UNCONDITIONALLY (not gated on use_torch_compile). The fla kernel
+    # crashes happen during eager generate() regardless of compile state,
+    # and the helper is a no-op on models that don't have GatedDeltaNet
+    # modules. Mirrors the unconditional teacher-side patch call below.
+    _apply_stage6_kernel_patches(model, role="student")
+
     # If we compile model.forward below, stash the pre-compile bound method
     # here so the generative block (HumanEval/MATH-500) can restore it.
     # torch.compile(dynamic=True) on autoregressive generate() drives an
@@ -568,112 +658,6 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             # actual unique attention-layer shapes per HumanEval/MATH run are far
             # below that. So we leave generation_config alone and let HF's default
             # DynamicCache handle the prefill+decode.
-            # Disable torch.compile on the GatedDeltaNet / linear-attention
-            # sublayers BEFORE wrapping model.forward. Inductor's codegen for
-            # `constant_pad_nd(new_conv_state, pad=4-s87)` produces a Triton
-            # store kernel whose index math goes out-of-bounds when s87 >= 4
-            # (every lm_eval prompt has seqlen >= 4), causing illegal GMEM
-            # access from inside the AOT-compiled artifact — segfault. The
-            # block is ~5% of total flops on Qwen3.5-MoE-A3B; running it
-            # eager (or via FLA fused kernel) costs essentially nothing
-            # while attention + MoE blocks (>90% flops) stay compiled.
-            # See pytorch/pytorch#120198 (dynamic-shape Triton + conditional
-            # indexing) for the class of bug.
-            _bypass_names = ("GatedDeltaNet", "LinearAttention", "MoeMamba")
-            _bypassed = 0
-            for _name, _mod in model.named_modules():
-                _cls = type(_mod).__name__
-                if any(b in _cls for b in _bypass_names):
-                    _mod.forward = torch._dynamo.disable(_mod.forward)
-                    _bypassed += 1
-            if _bypassed:
-                log.info("Stage 6: torch._dynamo.disable applied to %d linear-attention "
-                         "sublayer(s) to dodge Inductor codegen bug on constant_pad_nd "
-                         "(pad=4-s87) — keep compile on attention + MoE blocks", _bypassed)
-
-            # The Dynamo-disable above prevents Inductor codegen on the
-            # GatedDeltaNet block, but the EAGER body still dispatches into
-            # fla / tilelang's `chunk_gated_delta_rule` kernel, which is
-            # unstable on H200+cu130 across both varying prompt lengths
-            # (lm_eval logloglikelihood → SIGSEGV) and StaticCache decode
-            # (HumanEval → SIGABRT in tilelang TVM-FFI ICHECK). Force the
-            # torch-native fallbacks instead — they are pure PyTorch loops
-            # already shipped in modeling_qwen3_5_moe.py:207-275 as drop-in
-            # replacements for the fla/tilelang path. Same math, no
-            # quantization, identical numerics. Speed loss is bounded
-            # (~5% of flops on this block; net effect <1% wall).
-            try:
-                from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-                    Qwen3_5MoeRMSNormGated as _TorchRMSNormGated,
-                    torch_chunk_gated_delta_rule,
-                    torch_recurrent_gated_delta_rule,
-                    torch_causal_conv1d_update,
-                )
-                _gdn_patched = 0
-                _norm_patched = 0
-                for _name, _mod in model.named_modules():
-                    if type(_mod).__name__ == "Qwen3_5MoeGatedDeltaNet":
-                        if hasattr(_mod, "chunk_gated_delta_rule"):
-                            _mod.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
-                        if hasattr(_mod, "recurrent_gated_delta_rule"):
-                            _mod.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
-                        # Prefill path (line 475 of modeling_qwen3_5_moe.py): code
-                        # checks `if self.causal_conv1d_fn is not None` and falls
-                        # through to torch path if None — so setting to None is
-                        # safe and avoids the tilelang causal_conv1d kernel.
-                        if hasattr(_mod, "causal_conv1d_fn"):
-                            _mod.causal_conv1d_fn = None
-                        # Decode path (line 458): calls `self.causal_conv1d_update(...)`
-                        # directly with NO None-check. Must set to the torch
-                        # fallback explicitly (default __init__ does
-                        # `causal_conv1d_update or torch_causal_conv1d_update`,
-                        # which we overwrote — restore it explicitly).
-                        if hasattr(_mod, "causal_conv1d_update"):
-                            _mod.causal_conv1d_update = torch_causal_conv1d_update
-                        # Replace fla `FusedRMSNormGated` with pure-torch
-                        # `Qwen3_5MoeRMSNormGated` (same module, no Triton).
-                        # fla's Triton kernel JIT-recompiles for the (B*1,
-                        # head_v_dim) decode shape during HumanEval generate
-                        # and segfaults on Hopper + Triton 3.4 — same kernel
-                        # crash class as fla-org/flash-linear-attention#734.
-                        # Same numerics (closed-form RMSNorm + SiLU gate);
-                        # ~0.5% of flops, no measurable wall impact.
-                        if (
-                            hasattr(_mod, "norm")
-                            and type(_mod.norm).__name__ == "FusedRMSNormGated"
-                        ):
-                            _old_norm = _mod.norm
-                            _new_norm = _TorchRMSNormGated(
-                                _mod.head_v_dim, eps=_mod.layer_norm_epsilon
-                            )
-                            # Place the new norm on the model device/dtype
-                            # BEFORE copying weights. If `.to()` raised after
-                            # `.copy_()`, _new_norm would be stranded on CPU
-                            # but already swapped into _mod.norm via the
-                            # assignment below, producing a hard-to-diagnose
-                            # device-mismatch crash on the next forward.
-                            _new_norm.to(
-                                device=_old_norm.weight.device,
-                                dtype=_old_norm.weight.dtype,
-                            )
-                            _new_norm.weight.data.copy_(_old_norm.weight.data)
-                            _mod.norm = _new_norm
-                            _norm_patched += 1
-                        _gdn_patched += 1
-                if _gdn_patched:
-                    log.info("Stage 6: forced torch-native fallback for "
-                             "chunk_gated_delta_rule + causal_conv1d on %d "
-                             "Qwen3_5MoeGatedDeltaNet block(s) to dodge "
-                             "fla/tilelang instability on H200+cu130", _gdn_patched)
-                if _norm_patched:
-                    log.info("Stage 6: replaced fla FusedRMSNormGated with "
-                             "torch-native Qwen3_5MoeRMSNormGated on %d "
-                             "GDN block(s) to dodge Triton 3.4 decode-shape "
-                             "crash on Hopper", _norm_patched)
-            except ImportError as _exc:
-                log.warning("Stage 6: torch fallback symbols not found in "
-                            "transformers.models.qwen3_5_moe (%s) — fla/tilelang "
-                            "may crash later; continuing", _exc)
             # Capture the pre-compile bound method BEFORE wrapping so the
             # generative block can restore it (Option C: keep compile for
             # prefill-only paths; eager for generate()).
@@ -894,13 +878,31 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             )
         teacher.eval()
 
-        # Optimization #5: torch.compile on teacher too.
+        # Apply the same cu130/Hopper segfault-fix patches to the teacher.
+        # Without this the teacher's HumanEval generate() segfaults exactly
+        # like the student's used to (same Qwen3.5-MoE architecture + same
+        # fla FusedRMSNormGated Triton kernel crash on decode shape).
+        _apply_stage6_kernel_patches(teacher, role="teacher")
+
+        # Mirror the student-side initial experts_implementation set so the
+        # later "switch for generative" comparison has a valid baseline (else
+        # `_experts_implementation` is None and the switch log misleadingly
+        # reads "None → batched_mm" on every run).
+        _set_experts_implementation_s6(teacher, _experts_impl)
+
+        # Optimization #5: torch.compile on teacher too. Mode 'default'
+        # (was 'reduce-overhead'): same rationale as student compile —
+        # reduce-overhead's CUDA-graph capture can't keep up with shape
+        # churn under lm-eval and hangs; default mode is robust.
+        _teacher_pre_compile_forward = None
         if use_torch_compile:
             try:
-                teacher.forward = torch.compile(teacher.forward, dynamic=True, mode="reduce-overhead")
-                log.info("Stage 6: torch.compile applied to teacher")
+                _teacher_pre_compile_forward = teacher.forward
+                teacher.forward = torch.compile(teacher.forward, dynamic=True, mode="default")
+                log.info("Stage 6: torch.compile applied to teacher (mode=default)")
             except Exception as exc:
                 log.warning("Stage 6: torch.compile on teacher failed (%s)", exc)
+                _teacher_pre_compile_forward = None
 
         # Optimization #8: Start GGUF conversion in background (CPU-bound)
         # while teacher evaluation runs on GPU. The student checkpoint on disk
@@ -926,6 +928,26 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
                                batch_size=lm_eval_batch_size)
             )
         if s6["generative"]["enabled"]:
+            # Same cu130 generative workarounds as the student-side block:
+            # restore uncompiled teacher.forward (eager generate dodges Inductor
+            # recompile storm on growing cache_position + decode-shape codegen
+            # crashes) and switch experts_implementation to batched_mm
+            # (`torch._grouped_mm` crashes on B=1 decode-shape on cu130).
+            if _teacher_pre_compile_forward is not None:
+                teacher.forward = _teacher_pre_compile_forward
+                log.info("Stage 6: restored uncompiled teacher.forward for "
+                         "generative block (keep PPL/lm_eval compiled, "
+                         "generative eager)")
+            _teacher_gen_experts_impl = os.environ.get(
+                "EXPERTS_IMPLEMENTATION_GENERATIVE", "batched_mm"
+            )
+            _teacher_cfg = getattr(teacher, "_orig_mod", teacher).config
+            _teacher_current_impl = getattr(_teacher_cfg, "_experts_implementation", None)
+            if _teacher_gen_experts_impl != _teacher_current_impl:
+                log.info("Stage 6: switching teacher experts_implementation "
+                         "%r → %r for generative block",
+                         _teacher_current_impl, _teacher_gen_experts_impl)
+                _set_experts_implementation_s6(teacher, _teacher_gen_experts_impl)
             if "humaneval" in s6["generative"]:
                 results["teacher"]["humaneval_pass_at_1"] = _humaneval(
                     teacher, tokenizer, s6["generative"]["humaneval"], device=device,
