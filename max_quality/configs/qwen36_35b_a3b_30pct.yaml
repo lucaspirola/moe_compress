@@ -356,6 +356,30 @@ stage5_router_kd:
                                       # debug hooks in stage5_router_kd.py (commit 02baf4b).
 
 stage6_validate:
+  # Eval mode: "full" runs the comprehensive suite (WikiText PPL + lm-eval +
+  # HumanEval + MATH-500, student + teacher). "thermometer" runs the cheap
+  # stage6alt directional eval (bits-per-token on a held-out reasoning slice +
+  # ARC-Easy/HellaSwag subset) — ~$0.22/row vs ~$50-120/row for full. Use
+  # thermometer to sweep A0..A11, then full on the winning row. Default full.
+  mode: full
+  thermometer:
+    # Held-out BPT corpus: a fixed slice of the Nemotron-Cascade SFT data,
+    # drawn with a seed offset (stage6alt_thermometer.THERMO_SEED_OFFSET) so it
+    # is disjoint from the Stage 2/2.5 training draw. Directional signal only —
+    # NOT leaderboard-comparable absolute scores.
+    num_sequences: 64
+    sequence_length: 2048
+    bpt_batch_size: 8
+    lm_eval_batch_size: "auto:8"
+    arc_easy_limit: 100
+    hellaswag_limit: 200
+    # Reasoning-heavy eval mix, independent of calibration.subset_weights.
+    subset_weights:
+      math: 0.35
+      swe: 0.25
+      chat: 0.25
+      science: 0.15
+    teacher_cache_path:              # null = auto: artifacts_dir/thermometer_teacher_cache.json
   experts_implementation: grouped_mm   # Hopper-fast default; matches stage2 / stage5
                                        # — see that section's comment + memory/project_grouped_mm_blackwell.md.
                                        # Override with EXPERTS_IMPLEMENTATION=eager

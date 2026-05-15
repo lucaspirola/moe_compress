@@ -1486,11 +1486,16 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
 
 
 def _lm_eval_tasks(model, tokenizer, tasks: list[str], *, collect=None,
-                   batch_size="auto:8") -> dict:
+                   batch_size="auto:8", limit=None) -> dict:
     """Delegate to lm-eval's simple_evaluate with configurable batch_size.
 
     lm-eval's 0-shot loglikelihood scoring is deterministic and batch-size-
     independent. Numerically identical to batch_size=1.
+
+    `limit` (int or float in (0,1], default None) caps the number of docs
+    per task — used by the stage6alt thermometer to subsample ARC-Easy /
+    HellaSwag for a cheap directional signal. None = evaluate the full task,
+    which is the behavior every full-Stage-6 caller relies on.
     """
     try:
         from lm_eval import simple_evaluate
@@ -1512,6 +1517,7 @@ def _lm_eval_tasks(model, tokenizer, tasks: list[str], *, collect=None,
         out = simple_evaluate(
             model=lm, tasks=list(tasks), num_fewshot=0,
             log_samples=(collect is not None),
+            limit=limit,
         )
         results = out.get("results", {})
         flat: dict = {}

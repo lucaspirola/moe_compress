@@ -165,6 +165,7 @@ def _build_ablation_config(
     teacher_model_repo: str | None = None,
     stage5_max_calibration_samples: int | None = None,
     stage5_max_sequence_length: int | None = None,
+    stage6_mode: str = "full",
 ) -> dict:
     """Apply per-ablation deltas + the 35%-via-Stage-2-only target to the
     base config. The teacher-cache path forces all 12 ablations to read /
@@ -200,6 +201,16 @@ def _build_ablation_config(
     cfg.setdefault("stage6_validate", {})
     cfg["stage6_validate"].setdefault("teacher_eval_cache", {})
     cfg["stage6_validate"]["teacher_eval_cache"]["cache_path"] = str(teacher_cache_path)
+    # Stage 6 mode: 'thermometer' swaps the expensive full eval for the cheap
+    # stage6alt directional signal. The thermometer's teacher-BPT cache is
+    # sweep-shared (sits beside the full-eval teacher cache in shared_dir) so
+    # all 12 ablations reuse one teacher measurement.
+    cfg["stage6_validate"]["mode"] = stage6_mode
+    if stage6_mode == "thermometer":
+        therm = cfg["stage6_validate"].setdefault("thermometer", {})
+        therm["teacher_cache_path"] = str(
+            teacher_cache_path.parent / "thermometer_teacher_cache.json"
+        )
     # Disable imatrix for ablations: it runs convert_hf_to_gguf.py + llama-imatrix
     # via subprocess (10-30 min CPU work for a 35B model) and produces a GGUF
     # quantization calibration artifact we don't consume in the ablation analysis.
@@ -214,9 +225,19 @@ def _build_ablation_config(
 # ---------------------------------------------------------------------------
 
 
-def _is_complete(ablation_dir: Path) -> bool:
+def _stage6_artifact(stage6_mode: str) -> str:
+    """Final Stage 6 artifact filename for the given mode.
+
+    'full' → stage6_eval.json (stage6_validate); 'thermometer' →
+    stage6alt_eval.json (stage6alt_thermometer). Used as the completion gate
+    and the bucket-upload target.
+    """
+    return "stage6alt_eval.json" if stage6_mode == "thermometer" else "stage6_eval.json"
+
+
+def _is_complete(ablation_dir: Path, stage6_mode: str = "full") -> bool:
     """Skip-if-already-run signal. Stage 6's final artifact is the gate."""
-    return (ablation_dir / "stage6_eval.json").exists()
+    return (ablation_dir / _stage6_artifact(stage6_mode)).exists()
 
 
 def _upload_ablation_bg(
@@ -226,6 +247,7 @@ def _upload_ablation_bg(
     bucket: str,
     hf_token: str,
     upload_shared: bool,
+    stage6_artifact: str = "stage6_eval.json",
 ) -> None:
     """Upload one ablation's results to HF Hub. Runs in a background thread so
     the GPU can start the next ablation immediately. Writes uploaded.flag on
@@ -249,15 +271,17 @@ def _upload_ablation_bg(
             if add_list:
                 api.batch_bucket_files(bucket_id=bucket, add=add_list)
 
-        _log.info("[%s] uploading stage6_eval.json to bucket %s", ablation_id, bucket)
+        _log.info("[%s] uploading %s to bucket %s",
+                  ablation_id, stage6_artifact, bucket)
         api.batch_bucket_files(
             bucket_id=bucket,
-            add=[(str(ablation_dir / "stage6_eval.json"), f"{ablation_id}/stage6_eval.json")],
+            add=[(str(ablation_dir / stage6_artifact),
+                  f"{ablation_id}/{stage6_artifact}")],
         )
 
         (ablation_dir / "uploaded.flag").touch()
-        _log.info("[%s] upload complete → %s/%s/stage6_eval.json",
-                  ablation_id, bucket, ablation_id)
+        _log.info("[%s] upload complete → %s/%s/%s",
+                  ablation_id, bucket, ablation_id, stage6_artifact)
     except Exception as exc:  # noqa: BLE001
         _log.warning("[%s] background upload failed (artifacts remain on disk): %s",
                      ablation_id, exc)
@@ -304,15 +328,17 @@ def _run_one_ablation(
     teacher_model_repo: str | None = None,
     stage5_max_calibration_samples: int | None = None,
     stage5_max_sequence_length: int | None = None,
+    stage6_mode: str = "full",
 ) -> dict[str, Any]:
     """Drive one ablation through Stage 2 → 2.5 → Stage 6. Stage 1 artifacts
     are seeded from ``shared_dir``; Stage 6 reads the shared teacher cache."""
     ablation_dir = ablations_root / ablation_id
     ablation_dir.mkdir(parents=True, exist_ok=True)
+    _s6_artifact = _stage6_artifact(stage6_mode)
 
-    if _is_complete(ablation_dir):
+    if _is_complete(ablation_dir, stage6_mode):
         log.info("[%s] already complete — loading prior result", ablation_id)
-        return json.loads((ablation_dir / "stage6_eval.json").read_text())
+        return json.loads((ablation_dir / _s6_artifact).read_text())
 
     log.info("[%s] starting (deltas=%s)", ablation_id, deltas)
     t_start = time.monotonic()
@@ -348,6 +374,7 @@ def _run_one_ablation(
             teacher_model_repo=teacher_model_repo,
             stage5_max_calibration_samples=stage5_max_calibration_samples,
             stage5_max_sequence_length=stage5_max_sequence_length,
+            stage6_mode=stage6_mode,
         )
         cfg_path = _write_ablation_config(cfg, ablation_dir)
         _seed_stage1_artifacts(ablation_dir, shared_dir)
@@ -382,13 +409,13 @@ def _run_one_ablation(
         if rc2 != 0:
             raise RuntimeError(f"[{ablation_id}] Stage 6 returned exit code {rc2}")
 
-        if not _is_complete(ablation_dir):
+        if not _is_complete(ablation_dir, stage6_mode):
             raise RuntimeError(
-                f"[{ablation_id}] Stage 6 succeeded but stage6_eval.json missing"
+                f"[{ablation_id}] Stage 6 succeeded but {_s6_artifact} missing"
             )
 
         elapsed = time.monotonic() - t_start
-        result = json.loads((ablation_dir / "stage6_eval.json").read_text())
+        result = json.loads((ablation_dir / _s6_artifact).read_text())
         result["_ablation_id"] = ablation_id
         result["_deltas"] = deltas
         result["_elapsed_seconds"] = elapsed
@@ -419,6 +446,7 @@ def _preflight(
     teacher_model_repo: str | None = None,
     stage5_max_calibration_samples: int | None = None,
     stage5_max_sequence_length: int | None = None,
+    stage6_mode: str = "full",
 ) -> None:
     """Run Stage 1 once on the base config. Idempotent — skips if artifacts
     already present. The teacher cache is filled by A0's Stage 6 (no separate
@@ -439,6 +467,7 @@ def _preflight(
         teacher_model_repo=teacher_model_repo,
         stage5_max_calibration_samples=stage5_max_calibration_samples,
         stage5_max_sequence_length=stage5_max_sequence_length,
+        stage6_mode=stage6_mode,
     )
     cfg_path = _write_ablation_config(cfg, shared_dir)
     rc = run_pipeline_main([
@@ -480,6 +509,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Comma-separated subset of ablation IDs to run (e.g., A0,A4,A8). Default: all 12.")
     parser.add_argument("--smoke-test", action="store_true",
                         help="Run A0 only with tiny calibration; for local plumbing verification")
+    parser.add_argument("--stage6-mode", choices=["full", "thermometer"],
+                        default="full",
+                        help="Stage 6 eval mode for the sweep. 'full' (default) "
+                        "runs the comprehensive suite per row (~$50-120/row). "
+                        "'thermometer' runs the cheap stage6alt directional eval "
+                        "(~$0.22/row) — use it to sweep A0..A11, then re-run the "
+                        "winning row with --stage6-mode full for the deliverable.")
     parser.add_argument("--preflight-only", action="store_true",
                         help="Run Stage 1 pre-flight, write _shared/ artifacts, then exit. "
                         "For split-platform workflows: run pre-flight on a high-VRAM GPU "
@@ -544,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
         teacher_model_repo=args.teacher_model_repo,
         stage5_max_calibration_samples=args.stage5_max_calibration_samples,
         stage5_max_sequence_length=args.stage5_max_sequence_length,
+        stage6_mode=args.stage6_mode,
     )
 
     # Stop here if we only wanted the shared Stage 1 artifacts (e.g., the
@@ -578,12 +615,18 @@ def main(argv: list[str] | None = None) -> int:
                 teacher_model_repo=args.teacher_model_repo,
                 stage5_max_calibration_samples=args.stage5_max_calibration_samples,
                 stage5_max_sequence_length=args.stage5_max_sequence_length,
+                stage6_mode=args.stage6_mode,
             )
             results[aid] = result
-            # Sanity: A0 must populate the teacher cache.
-            if aid == "A0" and not teacher_cache_path.exists():
+            # Sanity: A0 must populate the teacher cache so A1..A11 hit it
+            # instead of re-scoring the teacher. The cache file differs by mode.
+            _teacher_cache_file = (
+                teacher_cache_path.parent / "thermometer_teacher_cache.json"
+                if args.stage6_mode == "thermometer" else teacher_cache_path
+            )
+            if aid == "A0" and not _teacher_cache_file.exists():
                 raise RuntimeError(
-                    "A0 completed but teacher_eval_cache.json was not written. "
+                    f"A0 completed but {_teacher_cache_file.name} was not written. "
                     "Subsequent ablations would re-run teacher scoring. Halting."
                 )
             # Kick off background upload immediately — next ablation starts
@@ -592,7 +635,8 @@ def main(argv: list[str] | None = None) -> int:
                 t = threading.Thread(
                     target=_upload_ablation_bg,
                     args=(aid, ablations_root / aid, shared_dir,
-                          upload_bucket, hf_token, first_upload),
+                          upload_bucket, hf_token, first_upload,
+                          _stage6_artifact(args.stage6_mode)),
                     daemon=True,
                     name=f"upload-{aid}",
                 )
