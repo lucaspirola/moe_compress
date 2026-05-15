@@ -37,6 +37,7 @@ from . import (
     stage4_eora,
     stage5_router_kd,
     stage6_validate,
+    stage6alt_thermometer,
 )
 from .utils.hub_upload import (
     hub_repo_base_from_env,
@@ -250,8 +251,21 @@ def main(argv=None) -> int:
         return 0
 
     if start <= 6 <= stop:
-        log.info("=== Stage 6 — Validation ===")
-        stage6_validate.run(model, tokenizer, config, artifacts_dir, device=device)
+        # Stage 6 has two modes: "full" (stage6_validate — WikiText PPL +
+        # lm-eval + HumanEval + MATH-500) and "thermometer" (stage6alt — a
+        # cheap forward-pass BPT signal for the ablation sweep). Default full.
+        _s6_mode = (config.get("stage6_validate", {}) or {}).get("mode", "full")
+        if _s6_mode == "thermometer":
+            stage6alt_thermometer.run(
+                model, tokenizer, config, artifacts_dir, device=device)
+        elif _s6_mode == "full":
+            log.info("=== Stage 6 — Validation ===")
+            stage6_validate.run(
+                model, tokenizer, config, artifacts_dir, device=device)
+        else:
+            raise ValueError(
+                f"stage6_validate.mode must be 'full' or 'thermometer', "
+                f"got {_s6_mode!r}")
 
     wait_for_pending_uploads()
     log.info("Pipeline complete.")
