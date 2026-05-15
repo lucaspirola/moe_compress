@@ -82,6 +82,7 @@ import copy
 import faulthandler
 import json
 import logging
+import math
 import shutil
 import sys
 import threading
@@ -238,6 +239,137 @@ def _stage6_artifact(stage6_mode: str) -> str:
 def _is_complete(ablation_dir: Path, stage6_mode: str = "full") -> bool:
     """Skip-if-already-run signal. Stage 6's final artifact is the gate."""
     return (ablation_dir / _stage6_artifact(stage6_mode)).exists()
+
+
+# ---------------------------------------------------------------------------
+# Sweep progress: leaderboard + summary (regenerated after EVERY ablation)
+# ---------------------------------------------------------------------------
+
+def _fmt(v, prec: int = 4) -> str:
+    """Leaderboard cell formatter — '—' for missing, 'inf' for non-finite."""
+    if v is None:
+        return "—"
+    if isinstance(v, float):
+        return "inf" if not math.isfinite(v) else f"{v:.{prec}f}"
+    return str(v)
+
+
+def _render_leaderboard(results: dict, failures: list, rows: list,
+                        stage6_mode: str) -> str:
+    """Render a ranked markdown leaderboard from the per-ablation results.
+
+    Robust to partial sweeps: only rows present in `results` are tabled;
+    failed and not-yet-run rows are listed below. Regenerated after every
+    ablation by `_persist_progress`, so a mid-sweep process death still
+    leaves rows 0..N-1 visible.
+    """
+    done = {a for a, _ in failures}
+    out = [
+        f"# Ablation leaderboard — stage6 mode: {stage6_mode}",
+        "",
+        f"_completed {len(results)}/{len(rows)} · failed {len(failures)} · "
+        f"regenerated after every row_",
+        "",
+    ]
+    if stage6_mode == "thermometer":
+        # Rank by bpt_gap ascending (lower = less compression damage);
+        # missing/non-finite gaps sink to the bottom.
+        def _gap(r):
+            g = r.get("bpt_gap")
+            return g if isinstance(g, (int, float)) and math.isfinite(g) else float("inf")
+        ranked = sorted(results.items(), key=lambda kv: _gap(kv[1]))
+        out += [
+            "| rank | ablation | bpt_gap | top1_agree | student_bpt | "
+            "teacher_bpt | ARC-E | HSwag | corpus | knob delta |",
+            "|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for i, (aid, r) in enumerate(ranked, 1):
+            corpus = (r.get("corpus") or {}).get("name", "?")
+            deltas = r.get("_deltas") or {}
+            delta_s = ", ".join(f"{k}={v}" for k, v in deltas.items()) or "(baseline)"
+            out.append(
+                f"| {i} | {aid} | {_fmt(r.get('bpt_gap'))} | "
+                f"{_fmt(r.get('top1_agreement'))} | {_fmt(r.get('student_bpt'))} | "
+                f"{_fmt(r.get('teacher_bpt'))} | "
+                f"{_fmt(r.get('student_arc_easy_acc_norm'), 3)} | "
+                f"{_fmt(r.get('student_hellaswag_acc_norm'), 3)} | "
+                f"{corpus} | {delta_s} |"
+            )
+        out += [
+            "",
+            "Ranking: lower `bpt_gap` = less compression damage. On the "
+            "`nemotron` corpus the gap is RELATIVE (Stage-2.5 adaptation is "
+            "common-mode across rows) — rank rows against each other, not "
+            "against zero. Tiebreak: higher `top1_agree`, then ARC-E+HSwag.",
+        ]
+    else:
+        out += ["| ablation | wikitext2_ppl | knob delta |", "|---|---|---|"]
+        for aid, r in results.items():
+            ppl = r.get("student", {}).get("wikitext2_ppl")
+            deltas = r.get("_deltas") or {}
+            delta_s = ", ".join(f"{k}={v}" for k, v in deltas.items()) or "(baseline)"
+            out.append(f"| {aid} | {_fmt(ppl)} | {delta_s} |")
+    if failures:
+        out += ["", "## Failed"]
+        out += [f"- **{aid}**: {err}" for aid, err in failures]
+    pending = [aid for aid, _ in rows if aid not in results and aid not in done]
+    if pending:
+        out += ["", "## Not yet run", ", ".join(pending)]
+    return "\n".join(out) + "\n"
+
+
+def _persist_progress(ablations_root: Path, results: dict, failures: list,
+                      rows: list, stage6_mode: str, upload_bucket: str,
+                      hf_token: str) -> None:
+    """Write `_summary.json` + `_leaderboard.md` and upload them to the bucket.
+
+    Called after EVERY ablation (success or failure) so a mid-sweep process
+    death — e.g. a Stage 6 SIGSEGV, which kills the whole process, not just a
+    row — still leaves the completed rows' results durable on the bucket.
+    Fully guarded: a write/upload failure here must never abort the sweep.
+    """
+    try:
+        summary = {
+            "stage6_mode": stage6_mode,
+            "results": results,
+            "failures": [{"ablation_id": a, "error": e} for a, e in failures],
+            "num_completed": len(results),
+            "num_failed": len(failures),
+            "total_ablations_planned": len(rows),
+        }
+        summary_path = ablations_root / "_summary.json"
+        leaderboard_path = ablations_root / "_leaderboard.md"
+        save_json_artifact(summary, summary_path)
+        leaderboard_path.write_text(
+            _render_leaderboard(results, failures, rows, stage6_mode),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("progress persist (local write) failed: %s", exc)
+        return
+    if upload_bucket and hf_token:
+        # Upload on a daemon thread with a bounded join. A hung HF connection
+        # (TCP open, no response) does NOT raise — without the timeout it would
+        # stall the main GPU thread between rows for the ~15-30 min of OS TCP
+        # keepalive. The local files are already written above, so abandoning a
+        # slow upload only delays bucket visibility by one row.
+        def _upload_progress() -> None:
+            try:
+                from huggingface_hub import HfApi
+                HfApi(token=hf_token).batch_bucket_files(
+                    bucket_id=upload_bucket,
+                    add=[(str(summary_path), "_summary.json"),
+                         (str(leaderboard_path), "_leaderboard.md")],
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("progress upload failed (files remain on disk): %s",
+                            exc)
+        t = threading.Thread(target=_upload_progress, daemon=True,
+                             name="progress-upload")
+        t.start()
+        t.join(timeout=30)
+        if t.is_alive():
+            log.warning("progress upload >30s — abandoning (next row retries)")
 
 
 def _upload_ablation_bg(
@@ -649,6 +781,11 @@ def main(argv: list[str] | None = None) -> int:
             # Continue to the next ablation; failed run is retryable on the
             # next job invocation (the harness is idempotent).
 
+        # Regenerate the leaderboard after EVERY row (success or failure) so a
+        # mid-sweep process death leaves completed rows durable on the bucket.
+        _persist_progress(ablations_root, results, failures, rows,
+                          args.stage6_mode, upload_bucket, hf_token)
+
     # Wait for all background uploads to finish before writing the summary.
     # Each thread has already started; GPU work is done at this point.
     if upload_threads:
@@ -658,28 +795,11 @@ def main(argv: list[str] | None = None) -> int:
             if t.is_alive():
                 log.warning("[%s] upload thread still alive after 10 min — giving up", aid)
 
-    # Aggregate.
-    summary_path = ablations_root / "_summary.json"
-    summary = {
-        "results": results,
-        "failures": [{"ablation_id": a, "error": e} for a, e in failures],
-        "num_completed": len(results),
-        "num_failed": len(failures),
-        "total_ablations_planned": len(rows),
-    }
-    save_json_artifact(summary, summary_path)
-    log.info("Wrote summary to %s", summary_path)
-
-    if upload_bucket and hf_token:
-        try:
-            from huggingface_hub import HfApi
-            HfApi(token=hf_token).batch_bucket_files(
-                bucket_id=upload_bucket,
-                add=[(str(summary_path), "_summary.json")],
-            )
-            log.info("Uploaded _summary.json to bucket %s", upload_bucket)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Summary upload failed (artifact remains on disk): %s", exc)
+    # Final aggregate. The per-row _persist_progress calls already wrote the
+    # summary + leaderboard incrementally; this is the terminal snapshot.
+    _persist_progress(ablations_root, results, failures, rows,
+                      args.stage6_mode, upload_bucket, hf_token)
+    log.info("Wrote summary + leaderboard to %s", ablations_root)
 
     # Concise dashboard line.
     log.info("=" * 60)
@@ -688,11 +808,16 @@ def main(argv: list[str] | None = None) -> int:
     for aid, _ in rows:
         if aid in results:
             r = results[aid]
-            ppl = r.get("student", {}).get("wikitext2_ppl", "?")
-            log.info("  %s : ppl=%s", aid, ppl)
+            if args.stage6_mode == "thermometer":
+                log.info("  %s : bpt_gap=%s top1_agree=%s", aid,
+                         _fmt(r.get("bpt_gap")), _fmt(r.get("top1_agreement")))
+            else:
+                log.info("  %s : ppl=%s", aid,
+                         r.get("student", {}).get("wikitext2_ppl", "?"))
         else:
             log.info("  %s : FAILED or skipped", aid)
     log.info("=" * 60)
+    log.info("Leaderboard: %s", ablations_root / "_leaderboard.md")
 
     return 0 if not failures else 1
 
