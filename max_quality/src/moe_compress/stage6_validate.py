@@ -1617,12 +1617,16 @@ def _generate_batched(model, tokenizer, prompts: list[str], *, max_new: int,
                 out = model.generate(
                     **encoded,
                     max_new_tokens=max_new,
-                    # min_new_tokens=max_new forces a fixed decode length so
-                    # generate() never early-exits on EOS — that would cut the
-                    # decode loop at a variable step and trigger a recompile.
-                    # The existing eos-truncation logic below trims trailing
-                    # tokens after decode; result quality is unchanged.
-                    min_new_tokens=max_new,
+                    # PRIOR: min_new_tokens=max_new was forced to dodge a
+                    # torch.compile recompile cascade on variable decode
+                    # length. That made the model emit `<think>...` filler
+                    # past natural EOS — turning chat-tuned reasoning models
+                    # into 0/164 scorers on HumanEval (project_a0_student_
+                    # diagnosis_2026_05_15.md). With FX-cache-disable +
+                    # spawn-worker + recompile-limit=512 already set as cu130
+                    # mitigations, the original recompile concern is moot.
+                    # Let generate() early-exit on EOS — chat models actually
+                    # finish responses.
                     do_sample=False,
                     # tokenizer.pad_token_id is set to eos_token_id by the guard
                     # above; fall back to 0 if both are absent so generate() never
@@ -1648,6 +1652,84 @@ def _generate_batched(model, tokenizer, prompts: list[str], *, max_new: int,
         tokenizer.pad_token_id = original_pad_token_id
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Chat-template + thinking-mode helpers for generative evals
+# ---------------------------------------------------------------------------
+
+
+def _stage6_enable_thinking() -> bool:
+    """Env knob for thinking-mode in HumanEval/MATH-500.
+
+    Default True: we are verifying that the compressed student retains
+    chain-of-thought reasoning capability. Set STAGE6_ENABLE_THINKING=false
+    for pure-completion code-gen evals (faster, lower scores).
+    """
+    val = os.environ.get("STAGE6_ENABLE_THINKING", "true").strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
+def _chat_format_prompts(
+    tokenizer,
+    raw_prompts: list[str],
+    *,
+    system: str | None = None,
+) -> list[str]:
+    """Wrap each raw user prompt with the model's chat template.
+
+    Returns text strings (not token ids) — `_generate_batched` will re-tokenize
+    them with left-padding. Adds `add_generation_prompt=True` so the templated
+    string ends at the assistant-open tag and generation starts there.
+
+    Qwen3.5/3.6 chat models default to thinking-mode ON. We pass an explicit
+    `enable_thinking` flag per `_stage6_enable_thinking()`.
+    """
+    enable_thinking = _stage6_enable_thinking()
+    out: list[str] = []
+    for p in raw_prompts:
+        msgs = []
+        if system is not None:
+            msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": p})
+        try:
+            text = tokenizer.apply_chat_template(
+                msgs,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            # Older tokenizers may not accept enable_thinking kwarg — fall back.
+            text = tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True,
+            )
+        out.append(text)
+    return out
+
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_PY_FENCE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
+
+
+def _extract_code_from_chat_response(text: str, entry_point: str) -> str:
+    """Pull executable Python out of a chat-formatted completion.
+
+    Steps:
+      1. Strip any <think>...</think> reasoning block (Qwen thinking-mode).
+      2. Prefer a ```python ... ``` fenced block (most common).
+      3. Fall back to text starting at the first `def <entry_point>(`.
+      4. Return empty string if no code can be located → check_humaneval fails.
+    """
+    s = _THINK_BLOCK_RE.sub("", text)
+    m = _PY_FENCE_RE.search(s)
+    if m:
+        return m.group(1)
+    needle = f"def {entry_point}("
+    idx = s.find(needle)
+    if idx >= 0:
+        return s[idx:]
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1680,10 +1762,14 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None,
         log.warning("HumanEval dataset load failed (%s); skipping.", last_err)
         return float("nan")
 
-    max_new = int(cfg.get("max_new_tokens", 512))
+    # Bumped default 512 → 2048 to leave room for thinking-mode traces
+    # (Qwen3.5/3.6 think blocks are routinely 1-2k tokens). Override via
+    # cfg.max_new_tokens or env STAGE6_MAX_NEW_HE if needed.
+    _he_max = int(os.environ.get("STAGE6_MAX_NEW_HE", cfg.get("max_new_tokens", 2048)) or 2048)
+    max_new = _he_max
     exec_timeout_secs = int(cfg.get("exec_timeout_secs", 10))
 
-    prompts = [row["prompt"] for row in ds]
+    raw_prompts = [row["prompt"] for row in ds]
     tests = [row["test"] for row in ds]
     entry_points = [row["entry_point"] for row in ds]
 
@@ -1692,20 +1778,36 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None,
     # no cap. Truncate prompts/tests/entry_points in lockstep so pass@1
     # arithmetic still divides by the actual count.
     _he_limit = int(os.environ.get("HUMANEVAL_LIMIT", cfg.get("limit", 0)) or 0)
-    if _he_limit > 0 and _he_limit < len(prompts):
+    if _he_limit > 0 and _he_limit < len(raw_prompts):
         log.warning(
             "Stage 6 HumanEval: HUMANEVAL_LIMIT=%d active — truncating from "
             "%d → %d problems (smoke mode; pass@1 computed on subset)",
-            _he_limit, len(prompts), _he_limit,
+            _he_limit, len(raw_prompts), _he_limit,
         )
-        prompts = prompts[:_he_limit]
+        raw_prompts = raw_prompts[:_he_limit]
         tests = tests[:_he_limit]
         entry_points = entry_points[:_he_limit]
 
     if collect is not None:
-        collect.extend(prompts)
+        collect.extend(raw_prompts)
 
-    log.info("Stage 6 HumanEval: %d problems, batch_size=%d", len(prompts), batch_size)
+    # Wrap each HumanEval stub with the model's chat template so the chat-
+    # tuned student/teacher actually engage their normal response behavior.
+    # Sending raw stubs to a thinking-mode-default chat model produced 0/164
+    # for the teacher and ~28% for the student in the prior run — the model
+    # decoded `<think>...` filler past max_new_tokens because EOS never fires
+    # on a raw-prompt continuation. (project_a0_student_diagnosis_2026_05_15.md)
+    _enable_thinking = _stage6_enable_thinking()
+    prompts = _chat_format_prompts(
+        tokenizer, raw_prompts,
+        system=(
+            "Complete the Python function. Reply with the full function "
+            "definition inside a ```python code block."
+        ),
+    )
+    log.info("Stage 6 HumanEval: %d problems, batch_size=%d, max_new=%d, "
+             "enable_thinking=%s, chat_template=on",
+             len(prompts), batch_size, max_new, _enable_thinking)
     # H-1 — Security note (emitted once for the full eval, not per problem):
     # _check_humaneval executes model-generated Python via exec() in a daemon thread
     # with a wall-clock timeout.  This is best-effort sandboxing only — no process
@@ -1726,11 +1828,14 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None,
     passes = 0
     total = len(prompts)
     leaked_counter = [0]  # mutable box so _check_humaneval can increment it
-    for i, (prompt, completion, test, ep) in enumerate(
-        zip(prompts, completions, tests, entry_points)
+    # Pair RAW stub (for exec fallback) with the model's chat-formatted reply.
+    # `_check_humaneval` will prefer code extracted from the reply when the
+    # reply contains `def <entry_point>(...)`; else falls back to stub + reply.
+    for i, (raw_stub, completion, test, ep) in enumerate(
+        zip(raw_prompts, completions, tests, entry_points)
     ):
         if _check_humaneval(
-            prompt, completion, test, ep,
+            raw_stub, completion, test, ep,
             exec_timeout_secs=exec_timeout_secs,
             _leaked_counter=leaked_counter,
             _problem_index=i,
@@ -1762,7 +1867,9 @@ def _math500(model, tokenizer, cfg: dict, *, device=None, collect=None,
         log.warning("MATH-500 dataset load failed (%s); skipping.", err)
         return float("nan")
 
-    max_new = int(cfg.get("max_new_tokens", 1024))
+    # Bumped default 1024 → 4096 for thinking-mode (math reasoning traces
+    # are routinely 2-4k tokens before the boxed answer).
+    max_new = int(os.environ.get("STAGE6_MAX_NEW_MATH", cfg.get("max_new_tokens", 4096)) or 4096)
     n = int(cfg.get("num_samples", 500))
     if n > len(ds):
         # N5: Warn explicitly rather than silently clamping, so config errors are visible.
@@ -1782,13 +1889,28 @@ def _math500(model, tokenizer, cfg: dict, *, device=None, collect=None,
         )
 
     selected = ds.select(range(n_total))
-    prompts = [f"Problem: {row['problem']}\nAnswer:" for row in selected]
+    raw_problems = [row["problem"] for row in selected]
     answers = [row.get("answer", "") for row in selected]
 
     if collect is not None:
-        collect.extend(prompts)
+        collect.extend(raw_problems)
 
-    log.info("Stage 6 MATH-500: %d problems, batch_size=%d", n_total, batch_size)
+    # Wrap each problem with the model's chat template — thinking-mode chat
+    # models produce CoT reasoning + a \boxed{answer}. The downstream
+    # _check_math uses _extract_boxed / _last_numeric which work on
+    # free-form text. Same harness fix as HumanEval; see
+    # project_a0_student_diagnosis_2026_05_15.md.
+    _enable_thinking = _stage6_enable_thinking()
+    prompts = _chat_format_prompts(
+        tokenizer, raw_problems,
+        system=(
+            "Solve the math problem. Show your reasoning, then write the "
+            "final answer inside \\boxed{...}."
+        ),
+    )
+    log.info("Stage 6 MATH-500: %d problems, batch_size=%d, max_new=%d, "
+             "enable_thinking=%s, chat_template=on",
+             n_total, batch_size, max_new, _enable_thinking)
     completions = _generate_batched(
         model, tokenizer, prompts, max_new=max_new,
         device=device, batch_size=batch_size,
@@ -1814,10 +1936,20 @@ def _check_humaneval(
     # the full eval before the loop starts).  exec() is used here inside a
     # daemon thread; the outer function owns the one-time security log.
     log.debug(
-        "HumanEval exec() (problem %d): exec in daemon thread, timeout=%.0fs",
+        "HumanEval problem %d: running in daemon thread, timeout=%.0fs",
         _problem_index, exec_timeout_secs,
     )
-    src = prompt + completion + "\n" + test_src + f"\ncheck({entry_point})\n"
+    # Chat-formatted completions wrap reasoning + code in markdown / think
+    # tags. _extract_code_from_chat_response strips <think>...</think> and
+    # prefers ```python fences. If the extracted code already contains a full
+    # `def <entry_point>(`, run it standalone; otherwise fall back to the
+    # legacy `stub + body` concatenation (preserves the raw-completion path
+    # used by non-chat models in earlier runs).
+    code = _extract_code_from_chat_response(completion, entry_point)
+    if code and f"def {entry_point}(" in code:
+        src = code + "\n" + test_src + f"\ncheck({entry_point})\n"
+    else:
+        src = prompt + completion + "\n" + test_src + f"\ncheck({entry_point})\n"
     ns: dict = {}
     _exc_holder: list = []
 
