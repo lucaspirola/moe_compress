@@ -31,6 +31,13 @@ import os
 # needed once this env var is set before torch's CUDA initialization.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# Cap the hf-xet (HF Xet storage) tokio worker pool BEFORE any huggingface_hub
+# import. Left unbounded it spawns ~79 threads per HF transfer; together with
+# OpenMP + pyarrow worker pools that pushed the process past ~185 live threads
+# — the thread-count blowup that made the periodic faulthandler watchdog
+# (removed below) race frame mutation and segfault. 8 is ample for our I/O.
+os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "8")
+
 # Disable inductor's GEMM autotuner BEFORE torch imports. torch 2.11.0+cu130's
 # `torch._grouped_mm` routes through inductor autotune on dynamic group-size
 # signatures; with the Qwen3.6-35B-A3B MoE Stage 2 REAP profile (active-experts
@@ -92,12 +99,19 @@ from typing import Any
 
 import yaml
 
-# DIAG: layer-1 hang investigation — install a periodic Python stack dumper.
-# Every 120s, if any thread is alive, dump a full stack trace of ALL threads
-# to stderr. Combined with the docker logs SSH tail, this exposes exactly
-# where the harness is when it appears stuck. Negligible overhead at idle.
+# Install faulthandler's fatal-signal handler so a genuine SIGSEGV/SIGABRT
+# still dumps a Python traceback to stderr.
+#
+# We deliberately do NOT arm faulthandler.dump_traceback_later(repeat=True):
+# that periodic watchdog walks EVERY thread's frame chain without the GIL,
+# and with the ~185 threads this harness spawns (hf-xet tokio pool, OpenMP,
+# pyarrow) it races frame mutation and SIGSEGVs *inside the dumper thread
+# itself* — confirmed 2026-05-16 via core-dump backtrace (crash in
+# PyCode_Addr2Line with rdi=0x20, a freed frame's garbage f_code pointer).
+# It fired whenever a Stage 2/2.5 step ran longer than 120s, which for days
+# masqueraded as random multi-host "hardware" instability. Hang forensics
+# are covered instead by the per-ablation _last_alive.json breadcrumb.
 faulthandler.enable()
-faulthandler.dump_traceback_later(120, repeat=True, file=sys.stderr)
 
 from .run_pipeline import main as run_pipeline_main
 from .utils.model_io import load_json_artifact, save_json_artifact
