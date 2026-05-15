@@ -1687,11 +1687,24 @@ def _chat_format_prompts(
     """
     enable_thinking = _stage6_enable_thinking()
     out: list[str] = []
+    # De-spam: log the first degradation as a warning, downgrade subsequent
+    # ones to debug. A non-chat tokenizer would otherwise emit 164 warnings
+    # for HumanEval / 500 for MATH-500 and bury legitimate signals.
+    _warned_once = False
     for p in raw_prompts:
         msgs = []
         if system is not None:
             msgs.append({"role": "system", "content": system})
         msgs.append({"role": "user", "content": p})
+        # Try (a) full kwargs (Qwen3.x with thinking control), (b) without
+        # enable_thinking (older tokenizers), (c) degrade to raw prompt
+        # (non-chat tokenizer / jinja template raises). Catches the broad
+        # set of exception types apply_chat_template can raise: TypeError
+        # (unknown kwarg), ValueError (malformed messages / role rejected),
+        # jinja2.TemplateError (template missing or rejects), AttributeError
+        # (method missing on tokenizer), plus anything else — fail safe to
+        # raw prompt rather than crashing the whole eval.
+        text = None
         try:
             text = tokenizer.apply_chat_template(
                 msgs,
@@ -1700,16 +1713,44 @@ def _chat_format_prompts(
                 enable_thinking=enable_thinking,
             )
         except TypeError:
-            # Older tokenizers may not accept enable_thinking kwarg — fall back.
-            text = tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True,
+            try:
+                text = tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                )
+            except Exception as exc:           # noqa: BLE001
+                (log.warning if not _warned_once else log.debug)(
+                    "Stage 6: apply_chat_template fallback failed (%s); "
+                    "using raw prompt for this entry", exc,
+                )
+                _warned_once = True
+        except Exception as exc:               # noqa: BLE001
+            (log.warning if not _warned_once else log.debug)(
+                "Stage 6: apply_chat_template raised %s — using raw prompt "
+                "for this entry (tokenizer has no usable chat template)",
+                exc,
             )
-        out.append(text)
+            _warned_once = True
+        # Treat empty-string template output as "no usable output" — fall
+        # back to the raw prompt rather than silently sending an empty
+        # input to generate() (which would score the problem as a failure
+        # for the wrong reason).
+        out.append(text if text else p)
     return out
 
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _PY_FENCE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
+# After a `def <name>(...):` body, the function ends at the first line that
+# is non-blank, not indented, and not a `def`/`class`/`async def`/decorator/
+# import. That line (and everything after) is trailing prose like
+# "This function works by..." — must be trimmed before running. The negative
+# lookahead lets us keep continuations (another top-level def, a decorator,
+# imports needed by the body).
+_TRAILING_PROSE_RE = re.compile(
+    r"\n(?=[A-Za-z][^\n]*$)"            # next line starts with a letter (not indent, not symbol)
+    r"(?!def |class |async def |@|from |import )",  # but is not Python top-level construct
+    re.MULTILINE,
+)
 
 
 def _extract_code_from_chat_response(text: str, entry_point: str) -> str:
@@ -1718,7 +1759,9 @@ def _extract_code_from_chat_response(text: str, entry_point: str) -> str:
     Steps:
       1. Strip any <think>...</think> reasoning block (Qwen thinking-mode).
       2. Prefer a ```python ... ``` fenced block (most common).
-      3. Fall back to text starting at the first `def <entry_point>(`.
+      3. Fall back to text starting at the first `def <entry_point>(`,
+         trimmed at the first top-level prose line so trailing explanation
+         ("This function works by...") doesn't break exec().
       4. Return empty string if no code can be located → check_humaneval fails.
     """
     s = _THINK_BLOCK_RE.sub("", text)
@@ -1728,7 +1771,9 @@ def _extract_code_from_chat_response(text: str, entry_point: str) -> str:
     needle = f"def {entry_point}("
     idx = s.find(needle)
     if idx >= 0:
-        return s[idx:]
+        body = s[idx:]
+        trim = _TRAILING_PROSE_RE.search(body)
+        return body[:trim.start()] if trim else body
     return ""
 
 
