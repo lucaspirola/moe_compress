@@ -7,15 +7,28 @@ speeds), this stage measures a single forward-pass signal good enough to tell
 the operator whether an ablation knob HELPED or HURT vs the prior row.
 
 Primary metric — bits-per-token (BPT): mean next-token NLL (in bits) over a
-fixed, deterministic 64-seq x 2048-token held-out slice of the Nemotron-Cascade
-SFT dataset. Pure forward pass, no generation. Reports `student_bpt` and
-`bpt_gap = student_bpt - teacher_bpt`.
+fixed 64-seq x 2048-token corpus. Pure forward pass, no generation. Reports
+`student_bpt`, `teacher_bpt`, and `bpt_gap = student_bpt - teacher_bpt`.
 
-Secondary tiebreaker — ARC-Easy (limit 100) + HellaSwag (limit 200) zero-shot
-`acc_norm`, summed. Consult only when two rows' `bpt_gap` are within ~0.02 bits.
+CORPUS CHOICE (config `thermometer.corpus`) — critical for interpreting bpt_gap:
+  - "wikitext": WikiText-2 test split. General text the student was NOT
+    Stage-2.5-trained on, so `bpt_gap` is a FAIR teacher-vs-student
+    compression-damage number (expected sign: positive — student worse).
+  - "nemotron" (default): a held-out slice of the Nemotron-Cascade SFT data.
+    This is the SAME distribution Stage 2.5 Router KD trains the student on,
+    so `bpt_gap` here CONFLATES compression damage with the student's
+    distribution adaptation (it can go negative). Trust it only for cross-row
+    A0..A11 RANKING — where the adaptation is common-mode and cancels — never
+    as an absolute teacher-vs-student claim.
 
-The teacher BPT is computed once and cached to a sweep-shared file so all 12
-ablation rows reuse it (the teacher is identical across rows).
+Secondary signals — ARC-Easy/HellaSwag zero-shot `acc_norm` summed, and
+`top1_agreement`: the fraction of corpus positions where student and teacher
+argmax the same next token. Agreement is a training-distribution-independent
+damage measure (it asks "did the student stay faithful to the teacher",
+not "did the student get good at this text").
+
+The teacher BPT, lm-eval, and per-token argmax are computed once and cached to
+a sweep-shared file so all 12 ablation rows reuse them (teacher is constant).
 
 Selected via `config["stage6_validate"]["mode"] == "thermometer"`; see
 run_pipeline.py's Stage 6 dispatch. Default mode is "full" (stage6_validate).
@@ -32,7 +45,12 @@ from pathlib import Path
 
 import torch
 
-from .stage6_validate import _STAGE6_ATTN_IMPLEMENTATION, _lm_eval_tasks
+from .stage6_validate import (
+    _STAGE6_ATTN_IMPLEMENTATION,
+    _apply_stage6_kernel_patches,
+    _lm_eval_tasks,
+    _set_experts_implementation_s6,
+)
 from .utils.calibration import (
     CalibrationSpec,
     build_calibration_tensor,
@@ -50,7 +68,10 @@ log = logging.getLogger(__name__)
 THERMO_SEED_OFFSET = 715
 
 # Bump on any change to the thermometer_teacher_cache.json schema.
-THERMO_TEACHER_CACHE_FORMAT_VERSION = 1
+# v2: added `teacher_argmax` (per-token predictions for the top1_agreement
+#     metric) and switched the cache key from a Nemotron-only spec hash to a
+#     corpus-agnostic `corpus_id` (so wikitext/nemotron results never collide).
+THERMO_TEACHER_CACHE_FORMAT_VERSION = 2
 
 # Default eval subset mix — reasoning-heavy, independent of the chat-dominant
 # calibration.subset_weights used for compression. Overridable via the
@@ -63,15 +84,23 @@ _DEFAULT_SUBSET_WEIGHTS = {"math": 0.35, "swe": 0.25, "chat": 0.25, "science": 0
 # ---------------------------------------------------------------------------
 
 
-def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int) -> float:
+def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int,
+                  collect_argmax: bool = False):
     """Mean next-token NLL in bits over a pre-tokenized calibration tensor.
 
     Adapted from `stage6_validate._wikitext2_ppl`'s NLL loop, but returns
     bits-per-token (mean NLL in nats / ln 2) instead of exp(mean NLL), and
     takes a ready-made `(num_seqs, seq_len)` int64 tensor instead of loading
-    WikiText. Returns `float("inf")` if any batch is skipped — a loud failure
-    rather than a partial-corpus number that would corrupt a directional
-    comparison.
+    WikiText.
+
+    Returns `float("inf")` if any batch is skipped — a loud failure rather
+    than a partial-corpus number that would corrupt a directional comparison.
+
+    When `collect_argmax=True`, returns `(bpt, argmax)` where `argmax` is a
+    CPU int64 tensor of shape `(num_seqs, seq_len-1)` holding the model's
+    predicted next-token id at each position — used by the top1_agreement
+    metric. On the skip/inf path `argmax` is `None`. When `collect_argmax`
+    is False (default) the bare `float` is returned, as before.
     """
     # Batch-size-invariant numerics require eager attention (same requirement
     # as Stage 6's PPL / lm-eval paths). The student is loaded eager by
@@ -96,6 +125,7 @@ def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int) ->
     tok_count = 0
     skipped = 0
     total = 0
+    argmax_chunks: list[torch.Tensor] = []
     n_seqs = calib_ids.shape[0]
     log.info("Stage 6alt BPT: %d sequences x len=%d, batch_size=%d",
              n_seqs, calib_ids.shape[1], batch_size)
@@ -121,6 +151,13 @@ def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int) ->
                 predicted = batch.numel() - batch.shape[0]
                 nll_sum += loss_val * predicted
                 tok_count += predicted
+                if collect_argmax:
+                    # logits[:, t] predicts token t+1 → predicted-next id at
+                    # positions 0..L-2. Move to CPU so 32 batches' worth of
+                    # predictions don't accumulate on the GPU.
+                    argmax_chunks.append(
+                        out.logits[:, :-1, :].argmax(dim=-1).to("cpu")
+                    )
             except Exception as exc:           # noqa: BLE001
                 log.warning("stage6alt _bpt_from_nll: batch error (%s); skipping", exc)
                 skipped += 1
@@ -128,14 +165,21 @@ def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int) ->
             if (i + 1) % max(1, 64 // batch_size) == 0:
                 log.info("  BPT forward %d/%d batches", i + 1,
                          math.ceil(n_seqs / batch_size))
-    if tok_count == 0 or skipped > 0:
+    if skipped > 0:
         log.error("stage6alt _bpt_from_nll: %d/%d batches skipped — returning inf "
                   "(directional comparison must not run on a partial corpus).",
                   skipped, total)
-        return float("inf")
+        return (float("inf"), None) if collect_argmax else float("inf")
+    if tok_count == 0:
+        log.error("stage6alt _bpt_from_nll: corpus produced no tokens "
+                  "(empty calib_ids?) — returning inf.")
+        return (float("inf"), None) if collect_argmax else float("inf")
     # BPT = mean NLL in nats / ln(2). Computed directly from the running sum —
     # never round-tripped through exp().
-    return nll_sum / tok_count / math.log(2)
+    bpt = nll_sum / tok_count / math.log(2)
+    if collect_argmax:
+        return bpt, torch.cat(argmax_chunks, dim=0)
+    return bpt
 
 
 # ---------------------------------------------------------------------------
@@ -164,23 +208,126 @@ def _thermo_corpus_spec(config: dict) -> CalibrationSpec:
     )
 
 
+def _thermo_wikitext_tensor(tokenizer, *, num_sequences: int,
+                            sequence_length: int, dataset: str, subset: str,
+                            split: str) -> torch.Tensor:
+    """Build the first `num_sequences` full-length chunks of WikiText.
+
+    Mirrors `stage6_validate._wikitext2_ppl`'s tokenization exactly: rows are
+    concatenated with "\\n\\n", the whole corpus is tokenized in one call with
+    `add_special_tokens=True` (BOS applied once), then chunked into
+    `sequence_length`-token rows. The chunk order is fixed by the dataset, so
+    the draw is fully deterministic. WikiText test text is not in the Stage 2/
+    2.5 training distribution, so no seed-offset disjointness logic is needed.
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset(dataset, subset, split=split)
+    concatenated = "\n\n".join(row.get("text", "") for row in ds)
+    all_ids = tokenizer(
+        concatenated, add_special_tokens=True, return_tensors=None,
+    )["input_ids"]
+    n_full = len(all_ids) // sequence_length
+    if n_full == 0:
+        raise RuntimeError(
+            f"thermometer wikitext corpus: {dataset}/{subset}:{split} has no "
+            f"full {sequence_length}-token sequence."
+        )
+    take = min(num_sequences, n_full)
+    if take < num_sequences:
+        log.warning("thermometer wikitext: only %d full sequences available "
+                    "(< %d requested) — using %d", n_full, num_sequences, take)
+    return torch.tensor(
+        all_ids[: take * sequence_length], dtype=torch.long
+    ).view(take, sequence_length)
+
+
+def _build_thermo_corpus(config: dict, tokenizer, artifacts_dir: Path):
+    """Build the thermometer's evaluation corpus.
+
+    Returns `(calib_ids, corpus_meta, corpus_id)`:
+      - `calib_ids`: `(num_seqs, seq_len)` int64 tensor for `_bpt_from_nll`.
+      - `corpus_meta`: JSON-able dict recorded in `stage6alt_eval.json`.
+      - `corpus_id`: stable string folded into the teacher cache key so a
+        corpus switch (nemotron <-> wikitext, or a spec change) auto-
+        invalidates the sweep-shared teacher cache.
+
+    Selected by `thermometer.corpus` ("nemotron" default, or "wikitext").
+    See the module docstring for why the choice changes how `bpt_gap` is read.
+    """
+    therm = config.get("stage6_validate", {}).get("thermometer", {}) or {}
+    corpus = str(therm.get("corpus", "nemotron")).lower()
+    seq_len = int(therm.get("sequence_length", 2048))
+    n_seq = int(therm.get("num_sequences", 64))
+    # Class-qualified fallback so a tokenizer that lacks name_or_path (e.g. an
+    # in-memory instance) doesn't yield a tokenizer-blind corpus_id — mirrors
+    # build_calibration_tensor's defensive identity.
+    tok_id = (getattr(tokenizer, "name_or_path", None)
+              or f"{tokenizer.__class__.__module__}."
+                 f"{tokenizer.__class__.__name__}")
+
+    if corpus == "wikitext":
+        wt = therm.get("wikitext", {}) or {}
+        dataset = wt.get("dataset", "wikitext")
+        subset = wt.get("subset", "wikitext-2-raw-v1")
+        split = wt.get("split", "test")
+        calib = _thermo_wikitext_tensor(
+            tokenizer, num_sequences=n_seq, sequence_length=seq_len,
+            dataset=dataset, subset=subset, split=split,
+        )
+        corpus_meta = {
+            "name": "wikitext", "dataset": dataset, "subset": subset,
+            "split": split, "num_sequences": int(calib.shape[0]),
+            "sequence_length": seq_len,
+        }
+        corpus_id = (f"wikitext:{dataset}:{subset}:{split}:"
+                     f"{calib.shape[0]}x{seq_len}:{tok_id}")
+        log.info("Stage 6alt corpus: wikitext (%s/%s:%s) %d x %d",
+                 dataset, subset, split, calib.shape[0], seq_len)
+        return calib, corpus_meta, corpus_id
+
+    if corpus == "nemotron":
+        spec = _thermo_corpus_spec(config)
+        calib = build_calibration_tensor(
+            tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache",
+        )
+        corpus_meta = {
+            "name": "nemotron",
+            "num_sequences": spec.num_sequences,
+            "sequence_length": spec.sequence_length,
+            "effective_seed": spec.seed,
+            "seed_offset": THERMO_SEED_OFFSET,
+            "subset_weights": spec.subset_weights,
+        }
+        corpus_id = f"nemotron:{spec.cache_key(tok_id)}"
+        log.info("Stage 6alt corpus: nemotron (held-out slice) %d x %d "
+                 "— bpt_gap is RANKING-ONLY (Stage-2.5 adaptation confound)",
+                 spec.num_sequences, spec.sequence_length)
+        return calib, corpus_meta, corpus_id
+
+    raise ValueError(
+        f"thermometer.corpus must be 'nemotron' or 'wikitext', got {corpus!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Teacher BPT cache (sweep-shared)
 # ---------------------------------------------------------------------------
 
 
-def _thermo_teacher_cache_key(config: dict, spec: CalibrationSpec, tokenizer) -> str:
+def _thermo_teacher_cache_key(config: dict, corpus_id: str) -> str:
     """SHA-256 over everything that affects teacher BPT + lm-eval subset.
 
-    The corpus spec hash already folds in num_sequences, sequence_length, the
-    effective seed (incl. THERMO_SEED_OFFSET), subset_weights, dataset, and
-    tokenizer name — so a corpus or seed-offset change auto-invalidates.
+    `corpus_id` (from `_build_thermo_corpus`) already identifies the corpus
+    fully — kind (nemotron/wikitext), size, seed/spec, dataset, and tokenizer
+    name — so a corpus, seed-offset, or wikitext-subset change auto-
+    invalidates the sweep-shared teacher cache.
     """
     therm = config.get("stage6_validate", {}).get("thermometer", {}) or {}
     model_cfg = config["model"]
     payload = json.dumps({
         "format_version": THERMO_TEACHER_CACHE_FORMAT_VERSION,
-        "corpus_spec_hash": spec.cache_key(tokenizer.name_or_path),
+        "corpus_id": corpus_id,
         "teacher_repo": model_cfg["name_or_path"],
         "teacher_revision": model_cfg.get("revision", "main"),
         "torch_dtype": str(model_cfg.get("torch_dtype", "bfloat16")),
@@ -279,15 +426,27 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
 
     log.info("=== Stage 6alt — Thermometer ===")
 
-    # 1. Build the held-out corpus tensor (cached on disk by build_calibration_tensor).
-    spec = _thermo_corpus_spec(config)
-    calib = build_calibration_tensor(
-        tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache",
+    # Apply the cu130/Hopper segfault-fix patches to the student before any
+    # forward pass. Mirrors stage6_validate.run(): without these, fla's
+    # FusedRMSNormGated Triton kernel and chunk_gated_delta_rule SIGSEGV on
+    # H-series GPUs partway through lm-eval loglikelihood scoring. Both helpers
+    # are idempotent and no-op on models without GatedDeltaNet modules.
+    _experts_impl = os.environ.get(
+        "EXPERTS_IMPLEMENTATION", s6.get("experts_implementation", "batched_mm")
+    )
+    _set_experts_implementation_s6(model, _experts_impl)
+    _apply_stage6_kernel_patches(model, role="student")
+
+    # 1. Build the evaluation corpus — see _build_thermo_corpus + module docstring.
+    calib, corpus_meta, corpus_id = _build_thermo_corpus(
+        config, tokenizer, artifacts_dir,
     )
 
     # 2. STUDENT — already on GPU from run_pipeline._load_for_stage.
     log.info("Stage 6alt: scoring student")
-    student_bpt = _bpt_from_nll(model, calib, device=device, batch_size=bpt_batch)
+    student_bpt, student_argmax = _bpt_from_nll(
+        model, calib, device=device, batch_size=bpt_batch, collect_argmax=True,
+    )
     student_lm = _lm_eval_subset(model, tokenizer, arc_limit=arc_limit,
                                  hellaswag_limit=hsw_limit, batch_size=lm_batch)
 
@@ -296,7 +455,7 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
         therm.get("teacher_cache_path")
         or artifacts_dir / "thermometer_teacher_cache.json"
     )
-    cache_key = _thermo_teacher_cache_key(config, spec, tokenizer)
+    cache_key = _thermo_teacher_cache_key(config, corpus_id)
     teacher_results = _load_thermo_teacher_cache(cache_path, cache_key)
     teacher_cache_hit = teacher_results is not None
 
@@ -330,8 +489,14 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             trust_remote_code=model_cfg.get("trust_remote_code", False),
         )
         teacher.train(False)
-        teacher_bpt = _bpt_from_nll(teacher, calib, device=device,
-                                    batch_size=bpt_batch)
+        # Same cu130/Hopper segfault-fix patches as the student — mirrors
+        # stage6_validate.run()'s teacher-side patch calls.
+        _set_experts_implementation_s6(teacher, _experts_impl)
+        _apply_stage6_kernel_patches(teacher, role="teacher")
+        teacher_bpt, teacher_argmax = _bpt_from_nll(
+            teacher, calib, device=device, batch_size=bpt_batch,
+            collect_argmax=True,
+        )
         teacher_lm = _lm_eval_subset(teacher, tokenizer, arc_limit=arc_limit,
                                      hellaswag_limit=hsw_limit, batch_size=lm_batch)
         teacher_results = {
@@ -339,6 +504,11 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             "teacher_arc_easy_acc_norm": teacher_lm["arc_easy_acc_norm"],
             "teacher_hellaswag_acc_norm": teacher_lm["hellaswag_acc_norm"],
             "teacher_acc_norm_sum": teacher_lm["acc_norm_sum"],
+            # Per-token argmax for top1_agreement, cached so cache-hit sweep
+            # rows still score agreement against the (constant) teacher.
+            # None when BPT skipped a batch (partial corpus).
+            "teacher_argmax": (teacher_argmax.tolist()
+                               if teacher_argmax is not None else None),
         }
         _save_thermo_teacher_cache(cache_path, cache_key, teacher_results)
         # Free the teacher and restore the student to GPU. Guarded for the
@@ -356,6 +526,24 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     teacher_bpt = teacher_results["teacher_bpt"]
     teacher_acc_sum = teacher_results.get("teacher_acc_norm_sum")
     student_acc_sum = student_lm["acc_norm_sum"]
+
+    # top1_agreement — fraction of corpus positions where student and teacher
+    # argmax the same next token. Unlike bpt_gap this does not depend on what
+    # text the student was trained on, so it is a fair compression-damage
+    # signal on ANY corpus. None if either model skipped a BPT batch.
+    top1_agreement = None
+    _t_argmax = teacher_results.get("teacher_argmax")
+    if student_argmax is not None and _t_argmax is not None:
+        _teacher_argmax = torch.as_tensor(_t_argmax, dtype=torch.long)
+        if _teacher_argmax.shape == student_argmax.shape:
+            top1_agreement = float(
+                (student_argmax == _teacher_argmax).float().mean()
+            )
+        else:
+            log.warning("Stage 6alt: student/teacher argmax shape mismatch "
+                        "(%s vs %s) — top1_agreement left None",
+                        tuple(student_argmax.shape),
+                        tuple(_teacher_argmax.shape))
     results = {
         "stage": "6alt",
         "mode": "thermometer",
@@ -374,13 +562,8 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
                              if (student_acc_sum is not None
                                  and teacher_acc_sum is not None)
                              else None),
-        "corpus": {
-            "num_sequences": spec.num_sequences,
-            "sequence_length": spec.sequence_length,
-            "effective_seed": spec.seed,
-            "seed_offset": THERMO_SEED_OFFSET,
-            "subset_weights": spec.subset_weights,
-        },
+        "top1_agreement": top1_agreement,
+        "corpus": corpus_meta,
         "teacher_cache": {
             "path": str(cache_path),
             "key": cache_key,
@@ -393,6 +576,8 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     }
     path = artifacts_dir / "stage6alt_eval.json"
     save_json_artifact(results, path)
-    log.info("Stage 6alt complete: student_bpt=%.4f teacher_bpt=%.4f bpt_gap=%s "
-             "-> %s", student_bpt, teacher_bpt, results["bpt_gap"], path)
+    log.info("Stage 6alt complete: corpus=%s student_bpt=%.4f teacher_bpt=%.4f "
+             "bpt_gap=%s top1_agreement=%s -> %s",
+             corpus_meta.get("name"), student_bpt, teacher_bpt,
+             results["bpt_gap"], top1_agreement, path)
     return path
