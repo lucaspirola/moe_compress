@@ -91,6 +91,7 @@ import json
 import logging
 import math
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -113,7 +114,7 @@ import yaml
 # are covered instead by the per-ablation _last_alive.json breadcrumb.
 faulthandler.enable()
 
-from .run_pipeline import main as run_pipeline_main
+from .run_pipeline import main as run_pipeline_main  # noqa: F401 (subprocess entry below)
 from .utils.model_io import load_json_artifact, save_json_artifact
 from .utils.runtime_monitor import (
     flush as _rt_flush,
@@ -527,14 +528,22 @@ def _run_one_ablation(
 
         # Stage 2 + Stage 2.5 — one pipeline call (Stage 2.5 is folded into the
         # Stage-2 block of run_pipeline.main, so --stop-after-stage 2 runs both).
-        rc1 = run_pipeline_main([
-            "--config", str(cfg_path),
-            "--model", model_repo,
-            "--artifacts-dir", str(ablation_dir),
-            "--target-ratio", "0.35",
-            "--resume-from-stage", "2",
-            "--stop-after-stage", "2",
-        ])
+        # Run as a FRESH SUBPROCESS, not in-process: doing Stage 2/2.5 and then
+        # Stage 6 in one long-lived process accumulates ~130 GB of non-freed
+        # resident memory, so the Stage-6 step OOM-kills at ~182 GB (host RAM
+        # 178 GB, and the leftover is not swap-reclaimable). A subprocess is
+        # reaped on exit, returning all memory to the OS — each stage-group
+        # starts clean. Identical work and args; env/cwd inherited.
+        rc1 = subprocess.run(
+            [sys.executable, "-m", "moe_compress.run_pipeline",
+             "--config", str(cfg_path),
+             "--model", model_repo,
+             "--artifacts-dir", str(ablation_dir),
+             "--target-ratio", "0.35",
+             "--resume-from-stage", "2",
+             "--stop-after-stage", "2"],
+            check=False,
+        ).returncode
         if rc1 != 0:
             raise RuntimeError(f"[{ablation_id}] Stage 2/2.5 returned exit code {rc1}")
 
@@ -544,14 +553,19 @@ def _run_one_ablation(
         # fallback handles both the full-pipeline path (stage5_final/ present)
         # and the ablation harness path (stage2p5_final/ only) without a
         # filesystem-side workaround.
-        rc2 = run_pipeline_main([
-            "--config", str(cfg_path),
-            "--model", model_repo,
-            "--artifacts-dir", str(ablation_dir),
-            "--target-ratio", "0.35",
-            "--resume-from-stage", "6",
-            "--stop-after-stage", "6",
-        ])
+        # Stage 6 — also a fresh subprocess (see the Stage 2/2.5 note above):
+        # this is the step that OOM-killed when it inherited the accumulated
+        # process. Clean process => ~125 GB peak, well within 178 GB RAM.
+        rc2 = subprocess.run(
+            [sys.executable, "-m", "moe_compress.run_pipeline",
+             "--config", str(cfg_path),
+             "--model", model_repo,
+             "--artifacts-dir", str(ablation_dir),
+             "--target-ratio", "0.35",
+             "--resume-from-stage", "6",
+             "--stop-after-stage", "6"],
+            check=False,
+        ).returncode
         if rc2 != 0:
             raise RuntimeError(f"[{ablation_id}] Stage 6 returned exit code {rc2}")
 
