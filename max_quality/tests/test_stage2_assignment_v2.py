@@ -581,6 +581,8 @@ def _make_post_alignment_test_setup(monkeypatch):
     with controlled inputs. We patch ``build_banks`` and substitute fake
     accumulators for ream_acc / cov_acc.
     """
+    import threading
+
     import torch
     from moe_compress import stage2_reap_ream
 
@@ -609,7 +611,20 @@ def _make_post_alignment_test_setup(monkeypatch):
     class _FakeReamAcc:
         """Minimal accumulator that returns deterministic stub values so the
         cost-matrix builder can run end-to-end without real calibration data.
+
+        After the Stage 2 vectorization, ``_ream_cost_matrix`` reads the
+        accumulator's ``_lock`` / ``_total_tokens_by_layer`` / ``_sim_tensor``
+        directly (no longer per-pair ``compute_delta_expert``). An empty
+        ``_total_tokens_by_layer`` (total == 0) makes
+        ``_extract_sim_expert_matrix_from_tensor`` return a full-0.5 δ̃_expert
+        matrix — the same neutral value the old ``compute_delta_expert`` stub
+        produced, so this fixture's expected costs are unchanged.
         """
+
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._total_tokens_by_layer: dict[int, int] = {}
+            self._sim_tensor: dict[int, torch.Tensor] = {}
 
         def get_neuron_mean(self, layer_idx, expert_idx):
             return None  # disable C_act in alignment
@@ -621,9 +636,6 @@ def _make_post_alignment_test_setup(monkeypatch):
             # argpartition selects first), which is fine for unit testing.
             n = len(expert_ids)
             return torch.zeros(n, n)
-
-        def compute_delta_expert(self, layer_idx, child, centroid):
-            return 0.5  # neutral after the (cos+1)/2 rescale
 
     class _FakeLayerRef:
         layer_idx = 0

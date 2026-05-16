@@ -80,6 +80,35 @@ def _build_acc(
     return acc
 
 
+def _actual_pairs_from_sim_tensor(
+    acc: ReamCostAccumulator,
+    *,
+    layer_idx: int = 0,
+) -> dict[tuple[int, int], float]:
+    """Read the dense ``_sim_tensor`` accumulator back into an ordered-pair
+    dict matching the historic ``gated_output_sim`` shape.
+
+    Mirrors the old ``{(e_i, e_j): sim_sum}`` view: every off-diagonal
+    non-zero entry of the symmetric [E, E] matrix becomes one pair. The
+    ``!= 0.0`` filter matches the reference's `if v == 0.0` drop, so an
+    all-zero (or absent) tensor yields an empty dict.
+    """
+    t = acc.get_sim_tensor(layer_idx)
+    if t is None:
+        return {}
+    mat = t.numpy()
+    actual: dict[tuple[int, int], float] = {}
+    n = mat.shape[0]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            v = float(mat[i, j])
+            if v != 0.0:
+                actual[(i, j)] = v
+    return actual
+
+
 def _assert_matches_reference(
     acc: ReamCostAccumulator,
     expected: dict[tuple[int, int], float],
@@ -88,11 +117,7 @@ def _assert_matches_reference(
     rtol: float = 1e-4,
     atol: float = 1e-5,
 ) -> None:
-    actual = {
-        (k[1], k[2]): v
-        for k, v in acc.gated_output_sim.items()
-        if k[0] == layer_idx
-    }
+    actual = _actual_pairs_from_sim_tensor(acc, layer_idx=layer_idx)
     actual_keys = set(actual.keys())
     expected_keys = set(expected.keys())
     assert actual_keys == expected_keys, (
@@ -195,8 +220,8 @@ def test_zero_norm_expert_contributes_zero():
 # Fixture 4 — no multi-active tokens: early return
 # ---------------------------------------------------------------------------
 def test_no_multi_active_tokens_early_return():
-    """When every token is active in exactly 1 expert, ``gated_output_sim``
-    must stay empty."""
+    """When every token is active in exactly 1 expert, the sim accumulator
+    must stay empty (no pair entries)."""
     num_experts, d_hid = 4, 8
     per_expert = {
         e: (torch.tensor([e * 10, e * 10 + 1], dtype=torch.long),
@@ -205,10 +230,11 @@ def test_no_multi_active_tokens_early_return():
     }
     acc = _build_acc(per_expert, num_experts=num_experts)
     acc.finalize_batch(0, num_experts, compute_device=torch.device("cpu"))
-    # No layer-0 entries should have been written.
-    assert all(k[0] != 0 for k in acc.gated_output_sim), (
-        f"unexpected gated_output_sim entries: {dict(acc.gated_output_sim)}"
-    )
+    # No layer-0 pair entries should have been written. finalize_batch
+    # early-returns before _ensure_sim_tensor when there are no multi-active
+    # tokens, so the tensor is either absent or all-zero.
+    actual = _actual_pairs_from_sim_tensor(acc, layer_idx=0)
+    assert actual == {}, f"unexpected sim entries: {actual}"
 
 
 # ---------------------------------------------------------------------------
@@ -216,11 +242,12 @@ def test_no_multi_active_tokens_early_return():
 # ---------------------------------------------------------------------------
 def test_empty_layer_no_op():
     """Layer with no per-expert entries: ``finalize_batch`` must not raise
-    and ``gated_output_sim`` must remain empty."""
+    and the sim accumulator must remain empty."""
     num_experts = 4
     acc = ReamCostAccumulator(num_experts=num_experts)
     acc.finalize_batch(0, num_experts, compute_device=torch.device("cpu"))
-    assert len(acc.gated_output_sim) == 0
+    assert acc.get_sim_tensor(0) is None
+    assert _actual_pairs_from_sim_tensor(acc, layer_idx=0) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -299,19 +326,18 @@ def test_symmetric_write_contract():
     }
     acc = _build_acc(per_expert, num_experts=num_experts)
     acc.finalize_batch(0, num_experts, compute_device=torch.device("cpu"))
-    for (layer, i, j), v in list(acc.gated_output_sim.items()):
-        if layer != 0:
-            continue
-        mirror = acc.gated_output_sim.get((layer, j, i))
-        assert mirror is not None, f"missing mirror for ({i}, {j})"
-        assert mirror == v, f"({i},{j})={v} but ({j},{i})={mirror}"
+    t = acc.get_sim_tensor(0)
+    assert t is not None, "expected a populated sim tensor"
+    # Symmetric write contract: entry [i, j] == entry [j, i] for all pairs.
+    assert torch.equal(t, t.t()), "sim tensor is not symmetric"
 
 
 # ---------------------------------------------------------------------------
 # Fixture 9 — self-pair exclusion
 # ---------------------------------------------------------------------------
 def test_no_self_pair_entries():
-    """``(e, e)`` self-pair entries must never appear in ``gated_output_sim``."""
+    """``(e, e)`` self-pair entries must never appear — the sim tensor
+    diagonal must be exactly zero."""
     torch.manual_seed(13); np.random.seed(13)
     num_experts, n_tokens, d_hid = 5, 30, 8
     per_expert = {
@@ -321,8 +347,10 @@ def test_no_self_pair_entries():
     }
     acc = _build_acc(per_expert, num_experts=num_experts)
     acc.finalize_batch(0, num_experts, compute_device=torch.device("cpu"))
-    for (_layer, i, j) in acc.gated_output_sim:
-        assert i != j, f"self-pair leaked: ({i}, {j})"
+    t = acc.get_sim_tensor(0)
+    assert t is not None, "expected a populated sim tensor"
+    diag = torch.diagonal(t)
+    assert torch.all(diag == 0.0), f"self-pair leaked on diagonal: {diag}"
 
 
 # ---------------------------------------------------------------------------
