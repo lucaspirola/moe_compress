@@ -178,6 +178,11 @@ ABLATION_DELTAS: list[tuple[str, dict[str, Any]]] = [
     ("R3", {"cost_alignment": "post", "capacity_util_threshold": 0}),
     ("R4", {"em_refinement_rounds": 3}),
     ("R5", {"expert_distill_steps": 500}),
+    # --- Phase 2 diagnostic: post-alignment cost paired with the optimizing
+    #     solvers. Tests whether a better cost rescues auto/sinkhorn (=> the pre
+    #     cost was mis-specified) or not (=> hard optimization is intrinsically bad).
+    ("R6", {"cost_alignment": "post", "capacity_util_threshold": 0, "assignment_solver": "auto"}),
+    ("R7", {"cost_alignment": "post", "capacity_util_threshold": 0, "assignment_solver": "sinkhorn"}),
 ]
 
 
