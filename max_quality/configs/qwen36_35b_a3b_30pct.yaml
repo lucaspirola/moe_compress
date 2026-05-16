@@ -133,7 +133,10 @@ stage2_reap_ream:
                                        # override via env
                                        # `EXPERTS_IMPLEMENTATION=eager` if you
                                        # must run Stage 2 on B200.
-  batch_size: 6                    # H200: model ~70GB leaves ~71GB headroom; bs=6 is ~50% faster than bs=4
+  batch_size: 32                   # H200: model ~70GB, ~75-90GB free. Bumped 6->32 after the
+                                   # finalize_batch/cost-matrix vectorization removed the per-batch
+                                   # Python bottleneck — fewer launches + better MoE arithmetic
+                                   # intensity. Numerically neutral (sum over the same tokens).
   num_calibration_samples: 4000
   reap_min_active_tokens: 32      # skip experts whose token activation count < this from centroid candidates
   covariance_storage_dtype: float16   # fp16 (10 mantissa bits) avoids the bf16 (7 bits) precision loss
