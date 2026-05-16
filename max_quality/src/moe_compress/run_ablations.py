@@ -168,6 +168,16 @@ ABLATION_DELTAS: list[tuple[str, dict[str, Any]]] = [
     ("A9",  {**_A8_BASE, "assignment_solver": "sinkhorn"}),
     ("A10", {**_A8_BASE, "expert_distill_steps": 200}),
     ("A11", {**_A8_BASE, "expert_distill_min_freq_sum": 0.5}),
+    # --- Redesigned sweep, Phase 1: OFAT screen from baseline B = greedy/all-off.
+    #     R0 = fresh B (same-code baseline + vectorization end-to-end check).
+    #     Each R-row flips exactly ONE flag from B. R3 opens the capacity gate
+    #     (capacity_util_threshold:0) so the cost_alignment=post path actually runs.
+    ("R0", {}),
+    ("R1", {"assignment_solver": "sinkhorn"}),
+    ("R2", {"assignment_solver": "auto"}),
+    ("R3", {"cost_alignment": "post", "capacity_util_threshold": 0}),
+    ("R4", {"em_refinement_rounds": 3}),
+    ("R5", {"expert_distill_steps": 500}),
 ]
 
 
