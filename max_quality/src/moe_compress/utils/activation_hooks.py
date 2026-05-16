@@ -97,9 +97,10 @@ class ReamCostAccumulator:
         can be negative and unbounded, giving the full [-1, 1] cosine
         similarity range (post-softmax weights are non-negative,
         compressing cosine to [0, 1]).
-      - gated_output_sim/count: incremental pairwise cosine similarity of
+      - _sim_tensor[layer_idx]: incremental pairwise cosine similarity of
         gated expert outputs per batch (paper Eq. 8, approximated as
-        cosine(mean_gated_i, mean_gated_j) per batch).
+        cosine(mean_gated_i, mean_gated_j) per batch), stored as a dense
+        [E, E] float64 CPU tensor.
 
     Pre-softmax routing scores are captured via ``capture_router_outputs`` (a
     pre-forward hook on the router module that recomputes
@@ -117,11 +118,19 @@ class ReamCostAccumulator:
     gate_logit_profiles: dict[int, list[tuple[int, torch.Tensor]]] = field(
         default_factory=lambda: defaultdict(list)
     )
-    # Incremental pairwise cosine similarity of gated expert outputs.
-    # gated_output_sim accumulates Σ_{t in shared} cos_sim for each pair.
-    # The final δ̃_expert(i,j) divides by |X| (total calibration tokens),
-    # NOT by jointly-active count, per REAM Eq. 8 and spec §5 Step 2.
-    gated_output_sim: defaultdict[tuple[int, int, int], float] = field(default_factory=lambda: defaultdict(float))  # auto-vivifies with 0.0
+    # Incremental pairwise cosine similarity of gated expert outputs, stored
+    # as a dense [E, E] float64 CPU tensor per layer (keyed by layer_idx).
+    # Entry [i, j] accumulates Σ_{t in shared} cos_sim for the ordered pair
+    # (i, j); the matrix is symmetric and the diagonal is always 0. The final
+    # δ̃_expert(i,j) divides by |X| (total calibration tokens), NOT by
+    # jointly-active count, per REAM Eq. 8 and spec §5 Step 2.
+    #
+    # float64 is deliberate: the prior storage was a defaultdict keyed by
+    # (layer, e_i, e_j) holding Python floats (IEEE-754 binary64), so a
+    # float64 tensor is a bit-for-bit precision match — zero regression — at
+    # a cost of E²·8 bytes ≈ 512 KB/layer at E=256 (negligible vs. the
+    # ~2.35M dict ops/layer the dense form eliminates).
+    _sim_tensor: dict[int, torch.Tensor] = field(default_factory=dict)
     # Total calibration tokens seen per layer (denominator for Eq. 8).
     _total_tokens_by_layer: dict[int, int] = field(default_factory=lambda: defaultdict(int))
     # Temporary per-batch storage: (layer, expert) → (global_indices [T_active],
@@ -211,6 +220,43 @@ class ReamCostAccumulator:
         with self._lock:
             self._total_tokens_by_layer[layer_idx] += n_tokens
 
+    def _ensure_sim_tensor(self, layer_idx: int, num_experts: int) -> torch.Tensor:
+        """Return the dense [E, E] float64 CPU sim accumulator for ``layer_idx``.
+
+        Lazily allocates a zero ``torch.zeros(num_experts, num_experts,
+        dtype=torch.float64)`` on first access; on reuse, asserts the stored
+        shape matches ``num_experts`` (R5 — guards against a layer being
+        finalized with an inconsistent expert count).
+
+        Caller MUST hold ``self._lock`` — this both reads and writes the
+        shared ``_sim_tensor`` dict.
+        """
+        t = self._sim_tensor.get(layer_idx)
+        if t is None:
+            t = torch.zeros(num_experts, num_experts, dtype=torch.float64)
+            self._sim_tensor[layer_idx] = t
+        elif t.shape != (num_experts, num_experts):
+            raise AssertionError(
+                f"_ensure_sim_tensor: layer {layer_idx} sim tensor shape "
+                f"{tuple(t.shape)} != expected ({num_experts}, {num_experts})"
+            )
+        return t
+
+    def get_sim_tensor(self, layer_idx: int) -> "torch.Tensor | None":
+        """Return the dense [E, E] float64 sim-sum tensor for ``layer_idx``.
+
+        Public accessor for the gated-output cosine-similarity numerator
+        (REAM Eq. 8). Entry ``[i, j]`` holds Σ_{t ∈ jointly-active(i,j)}
+        cos(g_i[t], g_j[t]) accumulated across all finalized batches; the
+        matrix is symmetric with a zero diagonal. Returns ``None`` if no
+        batch has been finalized for the layer.
+
+        The returned tensor is the live accumulator (not a copy); callers
+        that mutate it must hold ``self._lock``.
+        """
+        with self._lock:
+            return self._sim_tensor.get(layer_idx)
+
     def finalize_batch(
         self, layer_idx: int, num_experts: int,
         *, compute_device: "torch.device | None" = None,
@@ -257,7 +303,7 @@ class ReamCostAccumulator:
 
         Token counting for the Eq. 8 denominator is handled separately by
         record_batch_token_count() — this function only updates the
-        numerator (gated_output_sim).
+        numerator (the dense ``_sim_tensor[layer_idx]`` accumulator).
         """
         # Resolve the compute device once, BEFORE the drain. The drain then
         # moves each expert's gated tensor onto this device (a no-op when the
@@ -387,21 +433,19 @@ class ReamCostAccumulator:
             flat_idx = flat_i * num_experts + flat_j
             sim_sum.view(-1).scatter_add_(0, flat_idx, flat_sim)
 
-        # 9. Drop self-pairs and dict-merge under the lock. Single host sync.
+        # 9. Drop self-pairs and accumulate into the dense [E, E] sim tensor
+        #    under the lock. Single host sync (the .cpu()). The whole [E, E]
+        #    batch result is added in one tensor op, replacing the former
+        #    O(E²/2) Python dict-merge loop. sim_sum is already symmetric
+        #    (built from a symmetric bmm) so a plain add preserves the
+        #    symmetric write contract — entry [i, j] == entry [j, i].
         sim_sum.fill_diagonal_(0.0)
-        sim_sum_cpu = sim_sum.cpu().numpy()
-
-        expert_ids = sorted(e for e, _, _ in per_expert)
+        # Promote to float64 on-host so the accumulator and the per-batch
+        # increment share dtype (the prior dict held Python float64).
+        sim_sum_f64 = sim_sum.cpu().to(torch.float64)
         with self._lock:
-            for i_idx, e_i in enumerate(expert_ids):
-                for e_j in expert_ids[i_idx + 1:]:
-                    v = float(sim_sum_cpu[e_i, e_j])
-                    if v == 0.0:
-                        continue
-                    k1 = (layer_idx, e_i, e_j)
-                    k2 = (layer_idx, e_j, e_i)
-                    self.gated_output_sim[k1] += v
-                    self.gated_output_sim[k2] += v
+            t = self._ensure_sim_tensor(layer_idx, num_experts)
+            t.add_(sim_sum_f64)
 
     def compute_gate_similarity_matrix(
         self, layer_idx: int, expert_ids: list[int],
@@ -511,11 +555,19 @@ class ReamCostAccumulator:
         tokens contribute zero to the numerator (expert output not computed); they
         still appear in the denominator |X| (via record_batch_token_count). This
         is a faithful implementation of Eq. 8 under sparse routing, not a deviation.
+
+        NOTE: After the Stage 2 vectorization, the hot-path consumer
+        (``_ream_cost_matrix``) reads ``_sim_tensor`` directly via
+        ``_extract_sim_expert_matrix_from_tensor``. This per-pair method is
+        retained as the public single-pair API (and is exercised by tests);
+        it reads the same dense ``_sim_tensor`` so the two paths agree.
         """
-        key = (layer_idx, expert_i, expert_j)
         with self._lock:
             total = self._total_tokens_by_layer.get(layer_idx, 0)
-            sim_val = self.gated_output_sim.get(key, 0.0)
+            t = self._sim_tensor.get(layer_idx)
+            sim_val = (
+                float(t[expert_i, expert_j].item()) if t is not None else 0.0
+            )
         if total == 0:
             # no profiling data — return NaN sentinel; callers must check math.isnan
             return float("nan")
@@ -558,9 +610,7 @@ class ReamCostAccumulator:
         """Free memory for a processed layer."""
         with self._lock:
             self.gate_logit_profiles.pop(layer_idx, None)
-            keys_to_clear = [k for k in self.gated_output_sim if k[0] == layer_idx]
-            for k in keys_to_clear:
-                self.gated_output_sim.pop(k, None)
+            self._sim_tensor.pop(layer_idx, None)
             self._total_tokens_by_layer.pop(layer_idx, None)
             batch_keys = [k for k in self._batch_gated_indexed if k[0] == layer_idx]
             for k in batch_keys:
