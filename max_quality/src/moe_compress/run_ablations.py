@@ -206,11 +206,9 @@ def _build_ablation_config(
     # would leave Stage 2 at its YAML-specified value (4000 in prod). Cap it here so the
     # --num-sequences flag actually bounds Stage 2 work.
     s2["num_calibration_samples"] = num_sequences
-    for k, v in deltas.items():
-        if k == "stage5_router_kd" and isinstance(v, dict):
-            cfg.setdefault("stage5_router_kd", {}).update(v)
-        else:
-            s2[k] = v
+    # Global CLI Stage-5 overrides FIRST, then per-ablation deltas — so a
+    # per-row stage5_router_kd delta (e.g. A1_oldkd's max_calibration_samples)
+    # always wins over the uniform CLI levers and is never silently clobbered.
     s5 = cfg.setdefault("stage5_router_kd", {})
     if teacher_model_repo:
         s5["teacher_model_repo"] = teacher_model_repo
@@ -218,6 +216,11 @@ def _build_ablation_config(
         s5["max_calibration_samples"] = stage5_max_calibration_samples
     if stage5_max_sequence_length is not None:
         s5["max_sequence_length"] = stage5_max_sequence_length
+    for k, v in deltas.items():
+        if k == "stage5_router_kd" and isinstance(v, dict):
+            s5.update(v)
+        else:
+            s2[k] = v
     cfg.setdefault("stage6_validate", {})
     cfg["stage6_validate"].setdefault("teacher_eval_cache", {})
     cfg["stage6_validate"]["teacher_eval_cache"]["cache_path"] = str(teacher_cache_path)
