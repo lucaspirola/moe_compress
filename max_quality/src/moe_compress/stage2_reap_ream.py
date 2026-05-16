@@ -982,7 +982,11 @@ def run(
         torch.cuda.empty_cache()
 
     out_dir = artifacts_dir / "stage2_pruned"
-    _save_covariance(cov_acc, artifacts_dir / "_stage2_input_covariance.pt")
+    if os.environ.get("MOE_SKIP_STAGE2_COV_SAVE") == "1":
+        log.info("Skipping _stage2_input_covariance.pt save "
+                 "(MOE_SKIP_STAGE2_COV_SAVE=1; Stages 3/4 disabled, file unused)")
+    else:
+        _save_covariance(cov_acc, artifacts_dir / "_stage2_input_covariance.pt")
     save_compressed_checkpoint(
         model, tokenizer, out_dir,
         pipeline_stage="stage2_pruned",
