@@ -1354,6 +1354,57 @@ def _profile_layer(
 # ---------------------------------------------------------------------------
 
 
+def _extract_sim_expert_matrix_from_tensor(
+    sim_tensor: "torch.Tensor | None",
+    noncentroid_ids: list[int],
+    centroid_ids: list[int],
+    total_tokens: int,
+) -> np.ndarray:
+    """Vectorized δ̃_expert(child, centroid) submatrix from the dense sim tensor.
+
+    Replaces the former ``n_nc × n_c`` double loop over
+    ``ReamCostAccumulator.compute_delta_expert`` (one lock-protected call per
+    pair, ~14.6K calls/layer at Qwen scale). Reads the dense ``[E, E]``
+    float64 ``_sim_tensor`` once and broadcasts the REAM Eq. 8 rescale over
+    the whole submatrix.
+
+    Args:
+        sim_tensor: the layer's ``[E, E]`` float64 gated-output cosine-sum
+            accumulator (``ReamCostAccumulator._sim_tensor[layer_idx]``), or
+            ``None`` if no batch was finalized for the layer.
+        noncentroid_ids: child (row) expert IDs.
+        centroid_ids: centroid (column) expert IDs.
+        total_tokens: |X|, the Eq. 8 denominator (total calibration tokens).
+
+    Returns:
+        ``(n_nc, n_c)`` float64 ndarray of δ̃_expert similarities ∈ [0, 1].
+
+    Equivalence with the old per-pair path: ``compute_delta_expert`` returns
+        * ``NaN`` when ``total_tokens == 0`` (or no sim data) — the caller
+          substituted ``0.5`` (neutral after the (cos+1)/2 rescale);
+        * else ``clip((sim_val / total + 1) / 2, 0, 1)``.
+      A ``None`` sim_tensor means ``sim_val == 0`` for every pair, so the old
+      path yielded ``clip((0/total + 1)/2, 0, 1) == 0.5`` — identical to the
+      ``total_tokens == 0`` neutral fill. We therefore collapse both
+      degenerate cases to a full-0.5 matrix.
+    """
+    n_nc = len(noncentroid_ids)
+    n_c = len(centroid_ids)
+    if total_tokens == 0 or sim_tensor is None:
+        # Degenerate: no joint-activation data → neutral 0.5 everywhere
+        # (matches compute_delta_expert's NaN→0.5 substitution and the
+        # sim_val==0 → 0.5 algebra; see docstring).
+        return np.full((n_nc, n_c), 0.5, dtype=np.float64)
+    # Index the [E, E] accumulator down to the (child, centroid) submatrix.
+    # advanced indexing on the first axis then the second produces the
+    # n_nc × n_c block in C-row order matching the old nested loop.
+    nc_idx = torch.as_tensor(noncentroid_ids, dtype=torch.long)
+    c_idx = torch.as_tensor(centroid_ids, dtype=torch.long)
+    sub = sim_tensor.to(torch.float64)[nc_idx][:, c_idx]  # (n_nc, n_c)
+    sim = ((sub / total_tokens + 1.0) / 2.0).clamp_(0.0, 1.0)
+    return sim.numpy().copy()
+
+
 def _ream_cost_matrix(
     layer_ref: MoELayerRef,
     noncentroid_ids: list[int],
@@ -1426,25 +1477,30 @@ def _ream_cost_matrix(
     c_cols  = [id_to_full_row[e] for e in centroid_ids]
     sim_gate_sub = sim_gate_full[np.ix_(nc_rows, c_cols)].numpy().astype(np.float64)  # (n_nc, n_c)
 
-    cost = np.zeros((n_nc, n_c), dtype=np.float64)
+    # δ̃_expert submatrix (REAM Eq. 8): vectorized read of the dense [E, E]
+    # gated-output cosine-sum accumulator, replacing a former n_nc × n_c
+    # double loop over compute_delta_expert (~14.6K lock-protected calls per
+    # layer at Qwen3.6 scale). The NaN→0.5 substitution that the old loop
+    # applied per pair is folded into _extract_sim_expert_matrix_from_tensor
+    # (degenerate total_tokens==0 / no-data → full-0.5 matrix); see its
+    # docstring for the equivalence argument.
+    #
+    # Lock discipline (R4): snapshot the total-token count and the sim
+    # tensor reference under ream_acc._lock, then compute outside the lock.
+    # This is safe because Stage 2 finalizes ALL batches for a layer before
+    # calling _ream_cost_matrix — there is no concurrent finalize_batch
+    # mutating _sim_tensor[li] during this read. Snapshotting the dict
+    # reference under the lock still guards against a concurrent clear_layer.
+    with ream_acc._lock:
+        total_tokens = ream_acc._total_tokens_by_layer.get(li, 0)
+        sim_t = ream_acc._sim_tensor.get(li)
+    sim_expert_matrix = _extract_sim_expert_matrix_from_tensor(
+        sim_t, noncentroid_ids, centroid_ids, total_tokens,
+    )  # (n_nc, n_c) float64
 
-    for ci in range(n_nc):
-        child = noncentroid_ids[ci]
-        for cj in range(n_c):
-            centroid = centroid_ids[cj]
-            sim_gate   = float(sim_gate_sub[ci, cj])
-            sim_expert = ream_acc.compute_delta_expert(li, child, centroid)
-            if math.isnan(sim_expert):
-                # When δ̃_expert returns NaN (degenerate: no joint-activation
-                # data for this pair), substitute 0.5 — neutral after the
-                # (cos+1)/2 rescale — matching the per-token NaN convention
-                # in finalize_batch (activation_hooks.py) per
-                # D-ream-sparse-routing.
-                sim_expert = 0.5  # neutral; matches per-token NaN handling
-            # δ_REAM = (δ_gate + δ̃_expert) / 2 ∈ [0,1]; cost = 1 − δ_REAM ∈ [0,1].
-            # Lower cost = more similar (spec §5 Step 2, reference ream/ream.py L46-53).
-            cost[ci, cj] = 1.0 - (sim_gate + sim_expert) / 2.0
-
+    # δ_REAM = (δ_gate + δ̃_expert) / 2 ∈ [0,1]; cost = 1 − δ_REAM ∈ [0,1].
+    # Lower cost = more similar (spec §5 Step 2, reference ream/ream.py L46-53).
+    cost = 1.0 - (sim_gate_sub + sim_expert_matrix) / 2.0
     np.clip(cost, 0.0, 1.0, out=cost)
 
     if cost_alignment == "pre":
