@@ -347,6 +347,22 @@ stage5_router_kd:
     - norm
     - embed
     - lm_head
+  # Direction E — Stage 2.5 merge-repair (strong form). Default OFF: when
+  # enabled=false the Stage-2.5 run is byte-identical to pre-Direction-E
+  # behaviour (router-only KD, frozen experts, pure vocab-KL loss).
+  # When enabled=true, the merged centroid experts (kept experts that absorbed
+  # others during the Stage-2 merge — identified from stage2_pruned/
+  # merge_map.json) are ALSO trained, and a per-layer MoE-block-output MSE
+  # term against the teacher is added to the vocab-logit KL.
+  # NOTE: enabling this requires a live teacher (run the teacher forward) —
+  # it is incompatible with teacher_logits_cache, which holds only vocab
+  # logits and no per-layer hidden states (run() fails loud on that combo).
+  merge_repair:
+    enabled: false                    # master gate; false = pre-E behaviour
+    mse_weight: 1.0                   # scalar weight on the per-layer MSE term
+                                      # (loss = vocab_KL + mse_weight × MSE)
+    merge_map_path: null              # null = stage2_pruned/merge_map.json;
+                                      # relative paths resolve under artifacts_dir
   torch_compile: true                 # 20-40% forward speedup on H200/B200 Hopper/Blackwell.
                                       # Briefly disabled 2026-05-13 02:08 UTC as a NaN hypothesis;
                                       # the 02:25 UTC relaunch with torch_compile=false STILL
