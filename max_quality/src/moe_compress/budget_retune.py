@@ -39,8 +39,12 @@ the run's own artifacts:
                                      so this is the routed-expert count N_l)
   * each layer's current budget   -> ``per_layer_target_experts`` in the input
                                      ``stage1_budgets.json``
-  * per-layer floor               -> ``total_experts // 2`` (GRAPE's own floor
-                                     convention; see ALGORITHM_REFERENCE.md §4)
+  * per-layer floor               -> ``max(N_l // 2, n_protected_l)`` — GRAPE's
+                                     half-experts floor, raised so a layer is
+                                     never dropped below its count of protected
+                                     (blacklisted super-) experts, read from
+                                     ``stage1_blacklist.json`` when present
+                                     (see ALGORITHM_REFERENCE.md §4)
 
 ----------------------------------------------------------------------
 The marginal-cost damage model
@@ -88,6 +92,11 @@ DEFAULT_OUTPUT_NAME = "stage1_budgets.retuned.json"
 # about any particular model.
 _PARTIAL_DIRNAME = "_stage2_partial"
 _MERGE_JSON_GLOB = "merge_*.json"
+
+# Stage-1 blacklist artifact. Its ``blacklist`` key maps str(layer) -> list of
+# protected (super-)expert ids that Stage 2 never merges. Used to raise the
+# per-layer floor. A layout fact of this pipeline, not a model-specific one.
+_BLACKLIST_NAME = "stage1_blacklist.json"
 
 
 # ---------------------------------------------------------------------------
@@ -236,14 +245,44 @@ def load_stage1_budgets(budgets_path: Path) -> dict:
     return payload
 
 
+def load_protected_counts(blacklist_path: Path) -> dict[int, int]:
+    """Read per-layer protected-expert counts from stage1_blacklist.json.
+
+    Stage 1 (GRAPE) blacklists *super-experts* — experts whose ablation damage
+    is so high they must never be merged. Stage 2 always keeps every protected
+    expert, so a layer's true kept-experts floor is ``max(N_l // 2,
+    n_protected_l)``, not ``N_l // 2`` alone.
+
+    The artifact's ``blacklist`` key maps ``str(layer_idx) -> [expert_idx,...]``;
+    this returns ``{layer_idx: n_protected}``. Layers absent from the blacklist
+    have no protected experts (the caller's ``.get(li, 0)`` maps them to 0).
+
+    Fully model-agnostic: the count is whatever Stage 1 recorded for the model
+    under compression.
+    """
+    payload = json.loads(blacklist_path.read_text(encoding="utf-8"))
+    if "blacklist" not in payload:
+        raise ValueError(
+            f"{blacklist_path} has no 'blacklist' key — not a valid Stage-1 "
+            "blacklist artifact (stage1_blacklist.json)."
+        )
+    return {int(k): len(v) for k, v in payload["blacklist"].items()}
+
+
 def assemble_layers(
     stage1_payload: dict,
     stage2_damage: dict[int, tuple[int, float | None]],
+    protected_counts: dict[int, int] | None = None,
 ) -> list[LayerDamage]:
     """Join Stage-1 budgets with Stage-2 measured damage into LayerDamage rows.
 
     The layer set must agree between the two artifacts: a mismatch means the
     budgets file and the Stage-2 run describe different models / runs.
+
+    ``protected_counts`` maps ``layer_idx -> n_protected`` (from
+    :func:`load_protected_counts`); it raises the per-layer floor so the
+    retune can never strand a blacklisted super-expert. When ``None`` the
+    floor falls back to ``N_l // 2`` alone.
     """
     s1_budgets = {
         int(k): int(v) for k, v in stage1_payload["per_layer_target_experts"].items()
@@ -263,9 +302,13 @@ def assemble_layers(
     for li in sorted(s1_layers):
         total_experts, mcp = stage2_damage[li]
         current_budget = s1_budgets[li]
-        # GRAPE's per-layer floor convention (ALGORITHM_REFERENCE.md §4):
-        # never drop a layer below half its experts.
-        floor = total_experts // 2
+        # Per-layer floor. GRAPE never drops a layer below half its experts
+        # (ALGORITHM_REFERENCE.md §4) AND always keeps every protected
+        # (blacklisted super-) expert, so the true floor is the larger of the
+        # two. Without a blacklist artifact n_protected is 0 and this reduces
+        # to the N//2 convention.
+        n_protected = (protected_counts or {}).get(li, 0)
+        floor = max(total_experts // 2, n_protected)
         if not (0 < current_budget <= total_experts):
             raise ValueError(
                 f"Layer {li}: current budget {current_budget} is outside "
@@ -278,9 +321,10 @@ def assemble_layers(
             # run used a different floor than total_experts // 2.
             raise ValueError(
                 f"Layer {li}: current budget {current_budget} is below the "
-                f"floor {floor} (= {total_experts} // 2). The input budgets "
-                "file was produced with a different floor convention; "
-                "retuning against it would be unsound."
+                f"floor {floor} (= max({total_experts} // 2, "
+                f"n_protected={n_protected})). The input budgets file was "
+                "produced with a different floor convention; retuning "
+                "against it would be unsound."
             )
         layers.append(
             LayerDamage(
@@ -444,6 +488,7 @@ def retune_from_artifacts(
     artifacts_dir: str | Path,
     *,
     budgets_path: str | Path | None = None,
+    blacklist_path: str | Path | None = None,
     output_path: str | Path | None = None,
 ) -> tuple[RetuneResult, Path]:
     """End-to-end: read artifacts, retune, write a new stage1_budgets.json.
@@ -453,6 +498,10 @@ def retune_from_artifacts(
             contain ``stage1_budgets.json`` and ``_stage2_partial/merge_*.json``.
         budgets_path: override path to the input stage1_budgets.json
             (default: ``<artifacts_dir>/stage1_budgets.json``).
+        blacklist_path: override path to ``stage1_blacklist.json``
+            (default: ``<artifacts_dir>/stage1_blacklist.json``). Used to raise
+            the per-layer floor by each layer's protected-expert count. When the
+            file is absent the floor falls back to ``N//2`` with a warning.
         output_path: where to write the retuned budgets
             (default: ``<artifacts_dir>/stage1_budgets.retuned.json``).
             MUST differ from the input path — the input is never clobbered.
@@ -475,9 +524,25 @@ def retune_from_artifacts(
             f"budgets_path ({budgets_path}) — the input must not be clobbered."
         )
 
+    blacklist_path = (
+        Path(blacklist_path) if blacklist_path is not None
+        else artifacts_dir / _BLACKLIST_NAME
+    )
+    protected_counts: dict[int, int] | None = None
+    if blacklist_path.is_file():
+        protected_counts = load_protected_counts(blacklist_path)
+    else:
+        log.warning(
+            "No blacklist artifact at %s — falling back to the N//2 per-layer "
+            "floor. For a model that blacklists more than half of a layer's "
+            "experts as super-experts this floor is too low; pass an explicit "
+            "--blacklist-path to retune such a model soundly.",
+            blacklist_path,
+        )
+
     stage1_payload = load_stage1_budgets(budgets_path)
     stage2_damage = load_stage2_damage(artifacts_dir)
-    layers = assemble_layers(stage1_payload, stage2_damage)
+    layers = assemble_layers(stage1_payload, stage2_damage, protected_counts)
     result = retune_budgets(layers)
 
     out_payload = result.as_output_payload(stage1_payload)
@@ -522,6 +587,13 @@ def _build_parser() -> argparse.ArgumentParser:
              "(default: <artifacts_dir>/stage1_budgets.json).",
     )
     p.add_argument(
+        "--blacklist-path", default=None,
+        help="Override the stage1_blacklist.json path "
+             "(default: <artifacts_dir>/stage1_blacklist.json). Raises the "
+             "per-layer floor by each layer's protected-expert count; if "
+             "absent the floor falls back to N//2 with a warning.",
+    )
+    p.add_argument(
         "--output-path", default=None,
         help="Where to write the retuned budgets "
              f"(default: <artifacts_dir>/{DEFAULT_OUTPUT_NAME}). "
@@ -543,6 +615,7 @@ def main(argv: list[str] | None = None) -> int:
         result, output_path = retune_from_artifacts(
             args.artifacts_dir,
             budgets_path=args.budgets_path,
+            blacklist_path=args.blacklist_path,
             output_path=args.output_path,
         )
     except (FileNotFoundError, ValueError, NoDamageSignalError) as exc:
