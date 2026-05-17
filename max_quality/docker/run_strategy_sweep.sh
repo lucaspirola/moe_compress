@@ -144,11 +144,28 @@ row_done() {  # $1 = row id — true if the thermometer eval landed
 }
 
 # ---------------------------------------------------------------------------
-# Step 1 — baseline S0 (also runs the shared Stage-1 pre-flight). S0's Stage 2
-# keeps _stage2_partial/ (MOE_KEEP_STAGE2_PARTIAL=1) for the retune below.
+# Step 1 — Stage-1 pre-flight, then baseline S0.
+#
+# Pre-flight MUST be its own process: run_ablations._preflight loads the model
+# for Stage 1 IN-PROCESS, which leaves ~114 GiB of model/CKA tensors resident
+# on the GPU in the parent process. If S0 then runs in that same process its
+# Stage-2 subprocess only sees ~26 GiB free and OOMs. A separate
+# --preflight-only invocation frees all of it on exit; the subsequent --only S0
+# process starts GPU-clean and its Stage-2 subprocess gets the full 141 GiB.
+# (This is the split the docker README documents as the "recommended pattern".)
+# S0's Stage 2 keeps _stage2_partial/ (MOE_KEEP_STAGE2_PARTIAL=1) for the retune.
 # ---------------------------------------------------------------------------
-log "STEP 1/5 — baseline S0 (+ Stage-1 pre-flight)"
 export MOE_KEEP_STAGE2_PARTIAL=1
+log "STEP 1/5 — Stage-1 pre-flight (separate process)"
+python -m moe_compress.run_ablations \
+    --config "$HARNESS_DIR/$CONFIG_PATH" \
+    --model "$MODEL_REPO" \
+    --ablations-root "$ABLATIONS_ROOT" \
+    --num-sequences "$NUM_SEQUENCES" \
+    --stage6-mode "$STAGE6_MODE" \
+    --teacher-model-repo "$TEACHER_MODEL_REPO" \
+    --preflight-only
+log "STEP 1/5 — baseline S0"
 run_ablations "S0"
 row_done S0 || { log "FATAL: S0 did not complete — cannot retune. See $ABLATIONS_ROOT/S0"; exit 1; }
 
