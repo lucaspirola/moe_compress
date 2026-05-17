@@ -68,7 +68,16 @@ RUN pip install --no-build-isolation -c /tmp/torch-constraint.txt \
 # run_strategy_sweep.sh seed the runtime HF cache from this copy. metadata.json
 # is self-healed here (kernels>=0.14.0 strict-validates name/id). The build
 # variant resolves from the installed torch (no GPU needed at fetch time).
-RUN HF_HOME=/opt/kernels-hub python3 - <<'PYEOF'
+#
+# The fetch is AUTHENTICATED via a BuildKit secret (id=hf_token, wired in
+# .github/workflows/docker-build.yml). Unauthenticated, HF's anonymous rate
+# limit makes the ~1200-file burst 429-storm for hours until the build job
+# times out — that is why every build after the bake was first added failed.
+# The secret is optional: if absent, HF_TOKEN is empty and the step degrades to
+# the old unauthenticated behaviour (and the runtime fallback still re-fetches).
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    HF_HOME=/opt/kernels-hub python3 - <<'PYEOF'
 import glob, hashlib, json
 from kernels import get_kernel
 for repo in ("kernels-community/deep-gemm", "kernels-community/finegrained-fp8"):
