@@ -2060,13 +2060,9 @@ def _output_space_cost(
         k = min(top_k, sigma.shape[-1])
         topk_idx = torch.topk(sigma, k=k, dim=-1).indices  # (T, k)
 
-        # --- Pre-pass (serial, cheap) -------------------------------------
         # Per non-centroid m: σ_m masked to tokens that route to m, and m's
-        # own expert output E_m(x) (computed once per m, reused across its
-        # K candidate centroids). A row whose m receives no calibration token
-        # falls back to the cheap cost here; every other (m → c) candidate
-        # becomes an independent pair task for the parallel pass below.
-        pair_tasks = []  # list of (ci, cj, m_id, c_id, E_m, gate_m)
+        # own expert output E_m(x). Computed once per m (reused across its
+        # K candidate centroids).
         for ci in range(n_nc):
             m_id = noncentroid_ids[ci]
             # routing-weighted mask: σ_m(x) on tokens that route to m, else 0.
@@ -2095,49 +2091,20 @@ def _output_space_cost(
             top_cj = np.argpartition(cheap_cost[ci], k_cand - 1)[:k_cand]
             for cj in top_cj:
                 cj = int(cj)
-                pair_tasks.append(
-                    (ci, cj, m_id, centroid_ids[cj], E_m, gate_m)
-                )
-
-        # --- Batched pass --------------------------------------------------
-        # Each (m → c) pair is independent. The per-pair tentative merge keeps
-        # its serial Hungarian permutation solve (that does not vectorize), but
-        # the SwiGLU forwards — the dominant cost — are batched: the old serial
-        # loop launched ~n_nc·topk tiny GPU forwards and was launch-overhead
-        # bound (GPU ~2% util, hours per row at production scale); batching
-        # collapses each TILE of pairs into three large GEMMs. Per-pair results
-        # are unchanged up to the float reassociation of a batched vs a single
-        # matmul — the independent-recomputation tests bound that tolerance.
-        _TILE = 64  # pairs per batched SwiGLU tile — bounds peak GPU memory
-        for t0 in range(0, len(pair_tasks), _TILE):
-            tile = pair_tasks[t0:t0 + _TILE]
-            # Per-pair tentative merge (serial — contains the Hungarian solve).
-            gate_w, up_w, down_w = [], [], []
-            for (_ci, _cj, _m_id, c_id, _E_m, _gate_m) in tile:
+                c_id = centroid_ids[cj]
                 merged = _tentative_merged_weights(
-                    layer_ref, c_id, _m_id, freq, ream_acc, perm_cache,
+                    layer_ref, c_id, m_id, freq, ream_acc, perm_cache,
                 )
-                gate_w.append(merged["gate_proj"].to(device, torch.float32))
-                up_w.append(merged["up_proj"].to(device, torch.float32))
-                down_w.append(merged["down_proj"].to(device, torch.float32))
-            # Batched SwiGLU over the tile. F.linear(x, W) == x @ Wᵀ; the
-            # leading pair axis broadcasts through torch.matmul. This is the
-            # same arithmetic _swiglu_forward does, one tile at a time.
-            Wg = torch.stack(gate_w)              # (P, d_int, hidden)
-            Wu = torch.stack(up_w)                # (P, d_int, hidden)
-            Wd = torch.stack(down_w)              # (P, hidden, d_int)
-            g = torch.matmul(x_all, Wg.transpose(-2, -1))   # (P, T, d_int)
-            u = torch.matmul(x_all, Wu.transpose(-2, -1))   # (P, T, d_int)
-            E_merged = torch.matmul(
-                F.silu(g) * u, Wd.transpose(-2, -1),
-            )                                                # (P, T, hidden)
-            # E_m / gate_m per pair (pairs that share m reuse the same tensor).
-            E_m_b = torch.stack([t[4] for t in tile])        # (P, T, hidden)
-            gate_b = torch.stack([t[5] for t in tile])       # (P, T)
-            per_token = (E_m_b - E_merged).pow(2).sum(dim=-1)  # (P, T)
-            costs = (gate_b * per_token).sum(dim=-1) / gate_b.sum(dim=-1)  # (P,)
-            for (ci, cj, *_rest), c in zip(tile, costs.tolist()):
-                out[ci, cj] = c
+                merged = {name: merged[name].to(device, torch.float32)
+                          for name in MATRIX_NAMES}
+                E_merged = _swiglu_forward(
+                    merged["gate_proj"], merged["up_proj"], merged["down_proj"],
+                    x_all,
+                )  # (T, hidden)
+                # Routing-weighted mean squared output change for expert m.
+                per_token = (E_m - E_merged).pow(2).sum(dim=-1)  # (T,)
+                cost = (gate_m * per_token).sum() / gate_m.sum()
+                out[ci, cj] = float(cost)
 
     return out
 
