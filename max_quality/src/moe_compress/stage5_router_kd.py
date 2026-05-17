@@ -653,6 +653,8 @@ def run(
     _resume_best_raw_kl_ema = None
     _resume_best_step = None
     _resume_prev_ema = None
+    _resume_no_improve_windows = None
+    _resume_es_ref_ema = None
 
     # `no_resume=True` means "don't pick up existing checkpoints"; it does
     # NOT mean "don't write new ones". Spec §8 mandates step-boundary
@@ -770,6 +772,12 @@ def run(
                 _resume_best_step = int(payload.get("best_step", -1))
             if payload.get("prev_ema") is not None:
                 _resume_prev_ema = float(payload["prev_ema"])
+            # `no_improve_windows` is absent from pre-2026-05-17 (and v1)
+            # checkpoints — leave it None there so patience starts fresh.
+            if payload.get("no_improve_windows") is not None:
+                _resume_no_improve_windows = int(payload["no_improve_windows"])
+            if payload.get("es_ref_ema") is not None:
+                _resume_es_ref_ema = float(payload["es_ref_ema"])
             log.info("Stage 5: resumed from step %d (epoch %d, batch %d)",
                      resume_step, resume_epoch, resume_batch_i)
 
@@ -812,10 +820,25 @@ def run(
 
     # Temperature ramp closure (Move B). Uses total_optim_steps so the ramp
     # endpoint coincides with the cosine endpoint.
+    #
+    # kd_temperature_ramp_fraction (default 1.0): the ramp completes over the
+    # first `fraction` of total_optim_steps, then T is held at T_end. At the
+    # default 1.0 the ramp spans the whole schedule and this is byte-identical
+    # to pre-2026-05-17 `main`. A value < 1.0 finishes the 4.0→1.0 ramp early
+    # and holds T_end for the remainder — opt-in mitigation for the late
+    # sharpening that drives the back-half overfit (see tasks/kd_fix_plan.md).
+    _T_ramp_fraction = float(s5.get("kd_temperature_ramp_fraction", 1.0))
+    if not (0.0 < _T_ramp_fraction <= 1.0):
+        raise ValueError(
+            f"Stage 5: kd_temperature_ramp_fraction={_T_ramp_fraction} must be "
+            "in (0.0, 1.0]; 1.0 ramps over the whole schedule (default)."
+        )
+    _T_ramp_steps = max(1, int(total_optim_steps * _T_ramp_fraction))
+
     def _current_T(global_step: int) -> float:
         if T_start == T_end:
             return T_start
-        p = min(max(global_step / max(1, total_optim_steps), 0.0), 1.0)
+        p = min(max(global_step / _T_ramp_steps, 0.0), 1.0)
         return T_start + (T_end - T_start) * p
 
     # Best-tracker state (Move A). Initialized here so resume-restore below can
@@ -825,6 +848,28 @@ def run(
     best_raw_kl_ema = float("inf")
     best_step = -1
     prev_ema = float("inf")
+
+    # --- Early stopping (2026-05-17 overfit fix) ---
+    # Patience-based on the SAME raw_kl EMA the best-tracker uses. After
+    # `_early_stop_patience` consecutive log windows with no improvement on
+    # best_raw_kl_ema, training stops cleanly (best.pt already holds the
+    # optimum). 0 = disabled — the loop runs the full schedule, byte-identical
+    # to pre-2026-05-17 `main`. The no-improve counter is persisted in the
+    # resume checkpoint so a crash-resume does not lose accumulated patience.
+    _early_stop_patience = int(s5.get("early_stop_patience", 0))
+    if _early_stop_patience < 0:
+        raise ValueError(
+            f"Stage 5: early_stop_patience={_early_stop_patience} must be >= 0 "
+            "(0 disables early stopping)."
+        )
+    no_improve_windows = 0
+    _early_stopped = False
+    # Running-minimum raw_kl EMA used purely by the early-stop patience test.
+    # Distinct from best_raw_kl_ema, which is only updated when save_best is on
+    # — _es_ref_ema must track improvement even with save_best=false so early
+    # stopping is independent of the checkpoint-export knob. Restored from the
+    # resume payload below when present.
+    _es_ref_ema = float("inf")
 
     # --- Resume restore for scheduler + best-tracker ---
     # v2 checkpoint: load scheduler state verbatim, restore best/prev EMA.
@@ -842,6 +887,10 @@ def run(
         best_step = _resume_best_step if _resume_best_step is not None else -1
     if _resume_prev_ema is not None:
         prev_ema = _resume_prev_ema
+    if _resume_no_improve_windows is not None:
+        no_improve_windows = _resume_no_improve_windows
+    if _resume_es_ref_ema is not None:
+        _es_ref_ema = _resume_es_ref_ema
 
     _trainable_param_count = sum(1 for _ in student.parameters() if _.requires_grad)
     log.info("Stage 5: %d routers trainable; %d steps total / %d remaining (grad-accum=%d, resume_step=%d)",
@@ -865,6 +914,11 @@ def run(
         "stage5/config/epochs": int(s5["epochs"]),
         "stage5/config/kd_temperature_start": T_start,
         "stage5/config/kd_temperature_end": T_end,
+        "stage5/config/kd_temperature_ramp_fraction": _T_ramp_fraction,
+        "stage5/config/early_stop_patience": int(_early_stop_patience),
+        "stage5/config/shuffle_batches_each_epoch": bool(
+            s5.get("shuffle_batches_each_epoch", False)
+        ),
         "stage5/config/lr_schedule": str(s5.get("lr_schedule", "none")),
         "stage5/config/warmup_ratio": float(s5.get("warmup_ratio", 0.05)),
         "stage5/config/lr_min_ratio": float(s5.get("lr_min_ratio", 0.10)),
@@ -928,6 +982,33 @@ def run(
     # the resumed path, which is when we need it most (router weights may
     # have been NaN-poisoned in the previous run).
     _first_batch_probed = False
+    # --- Per-epoch batch reshuffle (2026-05-17 overfit fix, config-gated) ---
+    # When shuffle_batches_each_epoch is true, each epoch iterates the batch
+    # list in a permuted order to reduce identical-replay memorisation. The
+    # permutation is derived from a per-epoch seed so it is fully deterministic
+    # — crash-resume reconstructs the identical order, keeping the positional
+    # `i <= resume_batch_i` fast-forward correct. Default false → the order is
+    # range(len(batches)) every epoch, byte-identical to pre-2026-05-17 `main`.
+    _shuffle_epochs = bool(s5.get("shuffle_batches_each_epoch", False))
+    if _shuffle_epochs and teacher_logits_cache is not None:
+        raise RuntimeError(
+            "Stage 5: shuffle_batches_each_epoch=true is incompatible with "
+            "teacher_logits_cache — the cache is indexed positionally by "
+            "(epoch * len(batches) + i), so a shuffled student-batch order "
+            "would pair each batch with the wrong cached teacher logits. "
+            "Disable one of the two."
+        )
+    _shuffle_seed = int(s5.get("seed", config.get("seed", 0)))
+
+    def _epoch_batch_order(epoch_idx: int) -> list[int]:
+        """Deterministic batch-index iteration order for one epoch."""
+        n = len(batches)
+        if not _shuffle_epochs:
+            return list(range(n))
+        g = torch.Generator()
+        g.manual_seed(_shuffle_seed + epoch_idx)
+        return torch.randperm(n, generator=g).tolist()
+
     for epoch in range(s5["epochs"]):
         if epoch < resume_epoch:
             continue
@@ -939,7 +1020,14 @@ def run(
         # remains comparable across the run and across runs with different T
         # schedules. Used by the best-checkpoint tracker.
         window_raw_kl_acc: list[torch.Tensor] = []
-        for i, batch in enumerate(batches):
+        # `i` is the iteration POSITION within the epoch (drives the grad-accum
+        # window, resume fast-forward and checkpoint batch_idx). `_batch_order`
+        # maps it to the actual batch index, which differs from `i` only when
+        # shuffle_batches_each_epoch is on. With shuffle off, _batch_order is
+        # range(len(batches)) so `batches[_batch_order[i]] is batches[i]`.
+        _batch_order = _epoch_batch_order(epoch)
+        for i, _batch_idx in enumerate(_batch_order):
+            batch = batches[_batch_idx]
             # Fast-forward: skip batches already processed in the resumed run.
             # resume_batch_i is the last batch of the grad-accum window that
             # triggered the checkpoint — the optimizer step has already occurred
@@ -1154,6 +1242,23 @@ def run(
                         best_step = step
                         _save_best_router_state(partial_dir, student, step, epoch, ema)
 
+                    # --- Early-stopping counter (2026-05-17 overfit fix) ---
+                    # `_es_ref_ema` holds the best raw_kl EMA seen so far; it is
+                    # independent of `_save_best` (which gates only the best.pt
+                    # WRITE) so early stopping works even with save_best=false.
+                    # A window that improves on the running minimum resets the
+                    # no-improve counter; one that does not increments it. With
+                    # _early_stop_patience == 0 the whole block is skipped, so
+                    # the loop is byte-identical to pre-2026-05-17 `main`.
+                    if _early_stop_patience > 0:
+                        if ema < _es_ref_ema:
+                            no_improve_windows = 0
+                        else:
+                            no_improve_windows += 1
+                        _es_ref_ema = min(_es_ref_ema, ema)
+                        if no_improve_windows >= _early_stop_patience:
+                            _early_stopped = True
+
                     current_lr = scheduler.get_last_lr()[0]
                     current_T = _current_T(step)
 
@@ -1174,6 +1279,7 @@ def run(
                         "stage5/lr": current_lr,
                         "stage5/temperature": current_T,
                         "stage5/grad_norm": grad_norm,
+                        "stage5/no_improve_windows": no_improve_windows,
                     }
                     _trackio_log(payload)
 
@@ -1202,6 +1308,8 @@ def run(
                         best_raw_kl_ema=best_raw_kl_ema,
                         best_step=best_step,
                         prev_ema=prev_ema,
+                        no_improve_windows=no_improve_windows,
+                        es_ref_ema=_es_ref_ema,
                     )
                     # Keep only the two most recent checkpoints to bound disk use.
                     # Sort by step number (ascending) and delete all but the newest two.
@@ -1211,9 +1319,43 @@ def run(
                     )
                     for old_ckpt in all_ckpts[:-2]:
                         old_ckpt.unlink(missing_ok=True)
+
+                # --- Early-stopping break (2026-05-17 overfit fix) ---
+                # Triggered inside the optimizer-step block (where the counter
+                # is updated) so the break lands on an optimizer-step boundary,
+                # consistent with the checkpoint cadence. A final checkpoint is
+                # written unconditionally so a subsequent resume sees the exact
+                # stopping point rather than re-running to the schedule end.
+                # No-op when _early_stop_patience == 0 (_early_stopped stays
+                # False) — byte-identical to pre-2026-05-17 `main`.
+                if _early_stopped:
+                    log.info(
+                        "Stage %s: early stopping at step %d — raw_kl EMA did "
+                        "not improve for %d consecutive log windows "
+                        "(early_stop_patience=%d). best_ema=%.6f@step%d; "
+                        "remaining %d scheduled steps skipped.",
+                        stage_key, step, no_improve_windows, _early_stop_patience,
+                        best_raw_kl_ema, best_step, max(0, total_steps - step),
+                    )
+                    if partial_dir is not None:
+                        _save_stage5_checkpoint(
+                            partial_dir, step, epoch, i, student, optim,
+                            grad_accum=grad_accum,
+                            scheduler=scheduler,
+                            best_raw_kl_ema=best_raw_kl_ema,
+                            best_step=best_step,
+                            prev_ema=prev_ema,
+                            no_improve_windows=no_improve_windows,
+                            es_ref_ema=_es_ref_ema,
+                        )
+                    break
         # Trailing-batch accounting is computed once before the epoch loop
         # (see the run-start log.warning above); no per-epoch repeat here.
         optim.zero_grad()
+        # Early-stop also breaks the outer epoch loop. No-op when
+        # _early_stop_patience == 0 (_early_stopped stays False).
+        if _early_stopped:
+            break
 
     # --- Direction E: tear down merge-repair hooks ---
     # Remove the gradient-mask hooks and forward-capture hooks before the final
@@ -1325,6 +1467,8 @@ def _save_stage5_checkpoint(
     best_raw_kl_ema: float | None = None,
     best_step: int | None = None,
     prev_ema: float | None = None,
+    no_improve_windows: int | None = None,
+    es_ref_ema: float | None = None,
 ) -> None:
     # F3 fix: when torch.compile is active, `student` is a compiled wrapper
     # whose named_parameters() may enumerate names that differ from the
@@ -1355,6 +1499,10 @@ def _save_stage5_checkpoint(
         "best_raw_kl_ema": best_raw_kl_ema,
         "best_step": best_step,
         "prev_ema": prev_ema,
+        # 2026-05-17 early-stop additions. None for callers that don't pass
+        # them; resume tolerates None (patience restarts fresh).
+        "no_improve_windows": no_improve_windows,
+        "es_ref_ema": es_ref_ema,
     }
     tmp = partial_dir / f"step_{step}.pt.tmp"
     final = partial_dir / f"step_{step}.pt"

@@ -263,16 +263,22 @@ stage5_router_kd:
                                   # the optimum. The paper does not specify this,
                                   # but our empirical loss curve was textbook
                                   # overfit; 0.01 is the AdamW default.
-  epochs: 3                       # 2026-05-13 (Move B): bumped 1 → 3. The
-                                  # earlier overfit signature on the 2-epoch run
-                                  # (loss bottom at step 950 → drift back by step
-                                  # 1400) is now addressed via cosine LR decay
-                                  # and save-best by EMA-smoothed raw KL (see
-                                  # lr_schedule / save_best below) — extra
-                                  # epochs buy more passes over the calibration
-                                  # corpus without re-introducing the drift,
-                                  # because we export the best checkpoint, not
-                                  # the last. Net wall: ~+40 min per ablation.
+  epochs: 1                       # 2026-05-17: reverted 3 → 1. The S0 live run
+                                  # showed Move B's epochs=3 did NOT cure the
+                                  # overfit — it amplified it: the pure
+                                  # teacher↔student raw_kl rises 7× (0.028 @
+                                  # step250 → 0.20 @ step1950) and save-best
+                                  # pins best.pt at step ~250. So epochs 2 & 3
+                                  # (~1500 redundant 35B-teacher forwards over a
+                                  # byte-identical replayed corpus — iter_batches
+                                  # materialises the batch list once and the
+                                  # epoch loop replays it with no reshuffle) are
+                                  # discarded compute. We export the step-~250
+                                  # best regardless, so epochs=1 is zero quality
+                                  # loss and ~−40 min wall/row. With epochs=1 the
+                                  # teacher_logits_cache guard (stage5_router_kd
+                                  # .py:894) is inert → the cache is usable again.
+                                  # See tasks/kd_fix_plan.md.
   # Move A — LR schedule + best-checkpoint export.
   lr_schedule: cosine             # 'cosine' = linear warmup → cosine decay to
                                   # lr_min_ratio × peak. 'none' = constant LR
@@ -300,7 +306,40 @@ stage5_router_kd:
   kd_temperature_end: 1.0         # Hard targets late — tighter posterior pulls
                                   # the router toward the teacher's modes.
                                   # Linear interpolation between start/end over
-                                  # the full optimizer step count.
+                                  # the first kd_temperature_ramp_fraction of
+                                  # the optimizer step count, then held at
+                                  # kd_temperature_end.
+  kd_temperature_ramp_fraction: 1.0  # 2026-05-17 (overfit fix, opt-in). Fraction
+                                  # of total_optim_steps over which the 4.0→1.0
+                                  # ramp completes. 1.0 = ramp spans the whole
+                                  # schedule (current behaviour — DEFAULT, byte-
+                                  # identical to main). Set <1.0 (e.g. 0.5) to
+                                  # finish the ramp early and hold T_end for the
+                                  # rest: shortens the late T→1 sharpening that
+                                  # the S0 run showed drives the back-half
+                                  # overfit. Result-changing — opt-in only.
+  # 2026-05-17 — overfit-fix knobs. All default to a NO-OP / current behaviour;
+  # the flag-off path is byte-identical to main. See tasks/kd_fix_plan.md.
+  early_stop_patience: 8          # >0 enables patience-based early stopping on
+                                  # the SAME raw_kl EMA that save_best tracks.
+                                  # After this many consecutive log windows with
+                                  # no EMA improvement, training stops cleanly
+                                  # (best.pt already holds the optimum). 0 =
+                                  # disabled (loop runs the full schedule, byte-
+                                  # identical to main). Default 8: at
+                                  # log_every_n_steps the S0 raw_kl had drifted
+                                  # monotonically up for >>8 windows past its
+                                  # step-~250 optimum, so 8 stops well before the
+                                  # wasted back half without risking a premature
+                                  # cut on transient noise.
+  shuffle_batches_each_epoch: false  # When true, permute the batch ITERATION
+                                  # order each epoch with a deterministic
+                                  # epoch-seeded RNG (reduces identical-replay
+                                  # memorisation). Only meaningful for epochs>1;
+                                  # with the epochs=1 default it is a no-op.
+                                  # Refuses to combine with teacher_logits_cache
+                                  # (the cache is positionally indexed). DEFAULT
+                                  # false = byte-identical to main.
   # batch_size × gradient_accumulation = effective batch (=8).
   # H200 (141 GB VRAM): teacher BF16 (~70 GB) + student BF16 (~50 GB) = ~120 GB.
   # At bs=8, vocab logits + small KV-cache headroom consume ~6 GB, leaving ~15 GB headroom.
@@ -323,22 +362,26 @@ stage5_router_kd:
                                   # kd_temperature_start/end (above). Kept
                                   # for any pre-Move-B code path that still
                                   # reads this scalar.
-  # Do NOT enable teacher_logits_cache with epochs > 1 — the existing runtime
-  # guard at stage5_router_kd.py:744 raises in that combination. Multi-epoch
-  # KD reuses calibration batches across epochs; the cache index would walk
-  # off the end and replay epoch-0 logits against epoch-N inputs.
+  # teacher_logits_cache: a precomputed teacher-logits sidecar that lets Stage
+  # 2.5 skip the live 35B teacher forward entirely (see hf_jobs/
+  # precompute_teacher_logits.py). With epochs=1 (the default) the cache is
+  # fully supported. Do NOT enable it with epochs > 1 — the runtime guard in
+  # stage5_router_kd.run() (the `epochs > 1 and teacher_logits_cache` check)
+  # raises in that combination, because the calibration batches are replayed
+  # identically across epochs while the cache index advances per (epoch,batch),
+  # mispairing epoch-0 logits with epoch-N inputs.
   kd_seq_chunk_size: 512            # H200: full sequence in one chunk (~2.4 GB peak at B=8, |V|≈150K).
                                     # Eliminates chunk-boundary Python loop overhead.
                                     # On smaller VRAM (A100): set to 128 to bound peak at ~600 MB.
-  max_calibration_samples: 6000   # Bumped 2026-05-13 from 3000 → 6000 to give
-                                  # later epochs more diverse calibration coverage.
-                                  # Combined with epochs=3 (Move B): 6000 samples
-                                  # × 3 epochs / batch_size=8 = 2250 optimizer
-                                  # steps (vs 375 in the 3000×1 baseline). Each
-                                  # epoch walks the full 6k; pairs with the
-                                  # epochs=3 bump for max KD signal — cosine LR
-                                  # + save-best (above) ensure we export the
-                                  # optimum rather than the last step.
+  max_calibration_samples: 3000   # 2026-05-17: reverted 6000 → 3000. The 6000
+                                  # bump existed only to feed epochs=3; with
+                                  # epochs=1 (see above) that rationale is void.
+                                  # 3000 samples / batch_size=8 = 375 optimizer
+                                  # steps — comfortably past the observed
+                                  # step-~250 raw_kl optimum, and early_stop
+                                  # (below) ends the run earlier still. Halves
+                                  # the Stage-2.5 calibration build + wall.
+                                  # See tasks/kd_fix_plan.md.
   checkpoint_every_n_steps: 100    # save router+optim state every N optimizer steps for crash-resume
   # Only router weights update. Enumerated paths are matched as substrings.
   trainable_name_patterns:
