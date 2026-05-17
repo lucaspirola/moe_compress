@@ -20,7 +20,22 @@ import pytest
 from moe_compress.stage2_reap_ream import (
     _apply_skip_merge_floor,
     _assign_children_to_centroids,
+    _assign_sinkhorn,
 )
+
+
+def test_sinkhorn_orphans_fully_masked_child() -> None:
+    """A child whose entire cost row is +inf must become -1 under sinkhorn too,
+    so the skip-merge floor's orphan semantics hold for every solver (not just
+    greedy/hungarian/mcf)."""
+    cost = np.array([
+        [0.10, 0.20],          # child 0 — normal
+        [np.inf, np.inf],      # child 1 — fully masked by the skip-merge floor
+        [0.30, 0.15],          # child 2 — normal
+    ], dtype=np.float64)
+    assignment = _assign_sinkhorn(cost, n_children=3, n_centroids=2, max_group_cap=2)
+    assert assignment[1] == -1, "fully-masked child must orphan under sinkhorn"
+    assert assignment[0] >= 0 and assignment[2] >= 0, "unmasked children stay assigned"
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +112,7 @@ def test_masked_child_unassigned_then_orphan_eligible():
         dtype=np.float64,
     )
     masked, n_masked = _apply_skip_merge_floor(delta, skip_merge_percentile=60.0)
-    assert n_masked >= 2  # both of child 2's entries masked
+    assert n_masked == 2  # exactly child 2's two entries masked (deterministic)
     assert np.all(np.isinf(masked[2, :]))
     assert np.all(np.isfinite(masked[:2, :]))
 
