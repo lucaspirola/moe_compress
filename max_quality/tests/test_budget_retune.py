@@ -17,6 +17,7 @@ import pytest
 from moe_compress.budget_retune import (
     NoDamageSignalError,
     assemble_layers,
+    load_protected_counts,
     load_stage1_budgets,
     load_stage2_damage,
     retune_budgets,
@@ -41,7 +42,9 @@ def _write_stage1_budgets(artifacts_dir, per_layer_budget, *, name="stage1_budge
     return path
 
 
-def _write_merge_json(partial_dir, layer_idx, total_experts, mean_cost_per_pair):
+def _write_merge_json(
+    partial_dir, layer_idx, total_experts, mean_cost_per_pair, *, format_version=2
+):
     """Write one Stage-2 v2 merge_<layer>.json.
 
     Only the fields budget_retune actually reads are load-bearing here:
@@ -49,8 +52,8 @@ def _write_merge_json(partial_dir, layer_idx, total_experts, mean_cost_per_pair)
     ``mean_cost_per_pair``. The rest mirror the real schema for realism.
     """
     payload = {
-        "format_version": 2,
-        "final_kept_ids": list(range(min(total_experts, total_experts))),
+        "format_version": format_version,
+        "final_kept_ids": list(range(total_experts)),
         "grouped": {"0": [0]},
         # freq keys must be range(total_experts) — Stage 2 enforces this and
         # budget_retune relies on len(freq) == N_l.
@@ -67,9 +70,24 @@ def _write_merge_json(partial_dir, layer_idx, total_experts, mean_cost_per_pair)
     return path
 
 
+def _write_blacklist(artifacts_dir, protected_counts):
+    """Write a minimal stage1_blacklist.json.
+
+    ``protected_counts`` maps ``layer_idx -> n_protected``; the artifact's
+    ``blacklist`` key stores the (synthetic) protected expert-id lists.
+    """
+    payload = {
+        "blacklist": {str(li): list(range(n)) for li, n in protected_counts.items()},
+    }
+    path = artifacts_dir / "stage1_blacklist.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
 def _make_run(
     artifacts_dir,
     layers,  # {layer_idx: (total_experts, current_budget, mean_cost_per_pair)}
+    blacklist=None,  # optional {layer_idx: n_protected}
 ):
     """Materialise a full synthetic Stage-1+Stage-2 artifacts dir."""
     partial_dir = artifacts_dir / "_stage2_partial"
@@ -78,6 +96,8 @@ def _make_run(
     _write_stage1_budgets(artifacts_dir, per_layer_budget)
     for li, (total, _cur, mcp) in layers.items():
         _write_merge_json(partial_dir, li, total, mcp)
+    if blacklist is not None:
+        _write_blacklist(artifacts_dir, blacklist)
     return artifacts_dir
 
 
@@ -328,4 +348,70 @@ def test_zero_cost_treated_as_no_signal(tmp_path):
     }
     _make_run(tmp_path, layers)
     with pytest.raises(NoDamageSignalError):
+        retune_from_artifacts(tmp_path)
+
+
+def test_format_version_mismatch_rejected(tmp_path):
+    # A pre-v2 merge JSON must be rejected loudly, not silently misparsed.
+    partial_dir = tmp_path / "_stage2_partial"
+    partial_dir.mkdir()
+    _write_stage1_budgets(tmp_path, {0: 5})
+    _write_merge_json(partial_dir, 0, 8, 0.1, format_version=1)
+    with pytest.raises(ValueError, match="format_version"):
+        retune_from_artifacts(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Blacklist-aware floor: a layer is never dropped below its protected-expert
+# count, even when that exceeds N//2 (model-agnostic — heavy-blacklist models).
+# ---------------------------------------------------------------------------
+def test_load_protected_counts(tmp_path):
+    path = _write_blacklist(tmp_path, {0: 3, 2: 0, 5: 7})
+    assert load_protected_counts(path) == {0: 3, 2: 0, 5: 7}
+
+
+def test_load_protected_counts_rejects_bad_artifact(tmp_path):
+    bad = tmp_path / "stage1_blacklist.json"
+    bad.write_text(json.dumps({"not_blacklist": {}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="blacklist"):
+        load_protected_counts(bad)
+
+
+def test_blacklist_raises_per_layer_floor(tmp_path):
+    # Layer 0 is the cheap donor; 6 of its 8 experts are protected, so its
+    # floor is max(8//2, 6) == 6, not 4. The retune must stop draining it at 6.
+    layers = {
+        0: (8, 8, 0.01),   # cheap donor
+        1: (8, 4, 0.90),   # expensive recipient, already at its N//2 floor
+    }
+    _make_run(tmp_path, layers, blacklist={0: 6, 1: 0})
+    result, _ = retune_from_artifacts(tmp_path)
+    assert result.new_budgets[0] == 6, "protected floor must stop the drain at 6"
+    assert result.new_budgets[1] == 6
+    assert sum(result.new_budgets.values()) == 12  # total conserved
+
+
+def test_no_blacklist_drains_to_half_floor(tmp_path):
+    # Same layers as above WITHOUT a blacklist artifact: layer 0 drains all the
+    # way to N//2 == 4. This is the contrast that proves the blacklist is what
+    # raised the floor in test_blacklist_raises_per_layer_floor.
+    layers = {
+        0: (8, 8, 0.01),
+        1: (8, 4, 0.90),
+    }
+    _make_run(tmp_path, layers)  # no blacklist
+    result, _ = retune_from_artifacts(tmp_path)
+    assert result.new_budgets[0] == 4
+    assert result.new_budgets[1] == 8
+
+
+def test_protected_count_above_current_budget_rejected(tmp_path):
+    # Layer 0 keeps 5 experts but 6 are protected -> the input itself violates
+    # the blacklist-raised floor (6); retune must refuse rather than proceed.
+    layers = {
+        0: (8, 5, 0.10),
+        1: (8, 6, 0.20),
+    }
+    _make_run(tmp_path, layers, blacklist={0: 6, 1: 0})
+    with pytest.raises(ValueError, match="below the floor"):
         retune_from_artifacts(tmp_path)
