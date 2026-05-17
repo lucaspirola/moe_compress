@@ -12,14 +12,35 @@ record to ``<artifacts>/_stage2_partial/merge_<layer>.json`` whose
 that were merged in that layer — i.e. the average damage incurred per merge.
 
 This module is a *budget-retune tool*.  Given a completed baseline Stage-2 run,
-it reads the measured per-layer damage, then re-solves the per-layer budget
-allocation with a knapsack-style greedy transfer:
+it reads the measured per-layer damage, then performs a **damage-aware
+allocation re-solve** of the per-layer budget.
 
-  * the **total** kept-expert count is held fixed (conserved exactly);
-  * kept-experts are shifted away from layers that merge *cheaply* toward
-    layers that merge *expensively*;
-  * a per-layer **floor** (``total_experts // 2``) and **ceiling**
-    (the layer's full expert count) are respected.
+----------------------------------------------------------------------
+Why a re-solve and not a conserved-per-layer-total knapsack
+----------------------------------------------------------------------
+The original Direction A held the *total* kept-expert count fixed and shifted
+single experts between layers that already carried a damage signal.  That
+proved to be a structural no-op: GRAPE hard-floors every *merged* layer at
+``N // 2`` and the retune floor was also ``N // 2``, so no merged layer could
+donate, while the layers GRAPE *protected* at ``N`` carry no damage signal at
+all (Stage 2 never merged them) — leaving the knapsack with zero donor freedom.
+
+The redesign (Direction A proposal, option d) replaces the conserved-total
+exchange with a *global-budget-conserving* re-allocation:
+
+  * the **global** kept-expert total is conserved (so achieved compression is
+    still pinned) — but the *per-layer split* is fully re-solved;
+  * the per-layer **floor** is ``max(N_l // floor_divisor, n_protected_l)``
+    with a configurable ``floor_divisor`` (default ``2`` — byte-identical to
+    GRAPE's ``N // 2`` invariant; ``> 2`` is opt-in and lets donor layers
+    exist *below* ``N // 2``);
+  * layers GRAPE protected at ``N`` (no measured ``mean_cost_per_pair``) are
+    scored with a **redundancy prior** derived from GRAPE's own
+    ``per_layer_redundancy`` so they too can be re-allocated — clearly flagged
+    as *predicted, not measured* in the output provenance;
+  * if the floors make the global budget infeasible the tool **fails loud**
+    with :class:`BudgetInfeasibleError` instead of silently shipping an
+    under-compressed model.
 
 It writes a NEW ``stage1_budgets.json`` (a different path — the input is never
 clobbered) carrying the reallocated ``per_layer_target_experts``.  Stage 2 can
@@ -39,38 +60,48 @@ the run's own artifacts:
                                      so this is the routed-expert count N_l)
   * each layer's current budget   -> ``per_layer_target_experts`` in the input
                                      ``stage1_budgets.json``
-  * per-layer floor               -> ``max(N_l // 2, n_protected_l)`` — GRAPE's
-                                     half-experts floor, raised so a layer is
-                                     never dropped below its count of protected
-                                     (blacklisted super-) experts, read from
-                                     ``stage1_blacklist.json`` when present
-                                     (see ALGORITHM_REFERENCE.md §4)
+  * per-layer floor               -> ``max(N_l // floor_divisor,
+                                     n_protected_l)`` — GRAPE's half-experts
+                                     floor (``floor_divisor == 2``) raised so a
+                                     layer is never dropped below its count of
+                                     protected (blacklisted super-) experts,
+                                     read from ``stage1_blacklist.json`` when
+                                     present (see ALGORITHM_REFERENCE.md §4)
+  * redundancy prior              -> ``per_layer_redundancy`` in the input
+                                     ``stage1_budgets.json`` (GRAPE's R̃^l)
 
 ----------------------------------------------------------------------
 The marginal-cost damage model
 ----------------------------------------------------------------------
-We only have ONE scalar of measured damage per layer: ``mean_cost_per_pair``.
+We have at most ONE scalar of measured damage per layer: ``mean_cost_per_pair``.
 We do not have a full damage-vs-budget curve.  The honest, conservative model
 used here is:
 
-    predicted_layer_damage(kept) = mean_cost_per_pair_l * n_merged_pairs(kept)
+    predicted_layer_damage(kept) = marginal_cost_l * n_merged_pairs(kept)
 
 where ``n_merged_pairs(kept) = N_l - kept`` is the number of non-centroid
 experts folded into a centroid when ``kept`` experts survive.  This treats the
-*per-pair* damage as a layer-local constant (the only thing Stage 2 actually
-measured) and the *count* of merges as the lever.  Under that model the
-marginal cost of removing one more expert from a layer is exactly
-``mean_cost_per_pair_l`` and the marginal saving of adding one back is the
-same.  The greedy transfer therefore moves a unit of budget whenever the
-most-expensive recipient layer's per-pair cost strictly exceeds the
-cheapest-marginal donor layer's per-pair cost — a standard exchange argument
-that is optimal for this separable, constant-marginal model.
+*per-pair* damage as a layer-local constant and the *count* of merges as the
+lever.  Under that model the marginal cost of removing one more expert from a
+layer is exactly ``marginal_cost_l``, so minimising the total predicted damage
+for a fixed global budget is a separable, constant-marginal allocation: start
+every layer at its ceiling ``N_l`` and repeatedly remove one expert from the
+layer with the smallest ``marginal_cost`` that is still above its floor, until
+the global budget is met.  This is the standard exchange argument applied to
+the *whole* allocation rather than to conserved-total transfers — and, unlike
+the old knapsack, it can move a layer off ``N``.
 
-Layers whose ``mean_cost_per_pair`` is ``null`` (Stage 2 writes ``null`` when
-nothing was merged, e.g. budget >= N_l, or all-zero pair costs) carry no usable
-damage signal: they are pinned at their current budget and excluded from the
-transfer on both sides.  If *no* layer has a usable signal the tool refuses to
-run rather than inventing one.
+``marginal_cost_l`` is:
+
+  * the **measured** ``mean_cost_per_pair`` when Stage 2 merged that layer
+    (``has_signal`` is true);
+  * a **predicted** prior derived from GRAPE's ``per_layer_redundancy`` for
+    signal-less layers — more redundant (smaller R̃^l) ⇒ cheaper to merge.
+    These layers are flagged ``predicted=True`` so downstream can audit the
+    measured-vs-predicted split.
+
+If *no* layer has a usable measured signal the tool refuses to run rather than
+inventing a damage model from priors alone.
 """
 from __future__ import annotations
 
@@ -109,8 +140,9 @@ class LayerDamage:
     layer_idx: int
     total_experts: int          # N_l — routed experts in the layer (ceiling)
     current_budget: int         # kept-experts assigned by GRAPE (Stage 1)
-    floor: int                  # minimum kept-experts: total_experts // 2
+    floor: int                  # minimum kept-experts: max(N_l//K, n_protected)
     mean_cost_per_pair: float | None  # measured Stage-2 damage; None == no signal
+    redundancy: float | None = None   # GRAPE per_layer_redundancy R̃^l prior
 
     @property
     def has_signal(self) -> bool:
@@ -124,11 +156,13 @@ class RetuneResult:
 
     new_budgets: dict[int, int]                 # layer_idx -> retuned kept-experts
     old_budgets: dict[int, int]                 # layer_idx -> original kept-experts
-    total_kept: int                             # conserved total (sum of either)
-    transfers: int                              # number of one-expert moves applied
+    total_kept: int                             # conserved GLOBAL budget (sum)
+    transfers: int                              # net experts moved vs the input
     predicted_damage_before: float
     predicted_damage_after: float
+    floor_divisor: int = 2                      # the N//K floor divisor used
     layers_without_signal: list[int] = field(default_factory=list)
+    layers_predicted: list[int] = field(default_factory=list)
 
     def as_output_payload(self, source_payload: dict) -> dict:
         """Build the JSON payload for the new stage1_budgets.json.
@@ -136,6 +170,11 @@ class RetuneResult:
         ``source_payload`` is the parsed input stage1_budgets.json; every key
         other than ``per_layer_target_experts`` / ``achieved_budget`` is copied
         through unchanged so Stage 2 / downstream see a familiar artifact.
+
+        The ``budget_retune`` provenance block records the global-budget
+        conservation, the ``floor_divisor`` used, and the measured-vs-predicted
+        split (``layers_predicted`` are the signal-less layers whose marginal
+        cost came from the redundancy prior, not from a Stage-2 measurement).
         """
         out = dict(source_payload)
         out["per_layer_target_experts"] = {
@@ -147,13 +186,35 @@ class RetuneResult:
             "transfers_applied": self.transfers,
             "predicted_damage_before": self.predicted_damage_before,
             "predicted_damage_after": self.predicted_damage_after,
+            "floor_divisor": int(self.floor_divisor),
+            "global_budget_conserved": int(self.total_kept),
             "layers_without_damage_signal": sorted(self.layers_without_signal),
+            # layers_cost_predicted == layers_without_damage_signal by
+            # construction; their cost is redundancy-prior-derived OR — when
+            # the layer carries no redundancy value — a conservative max-cost
+            # fallback, so "predicted" here is not always a true prediction.
+            "layers_cost_predicted": sorted(self.layers_predicted),
+            "n_layers_measured": (
+                len(self.new_budgets) - len(self.layers_predicted)
+            ),
+            "n_layers_predicted": len(self.layers_predicted),
         }
         return out
 
 
 class NoDamageSignalError(RuntimeError):
     """Raised when the Stage-2 artifacts carry no usable per-layer damage signal."""
+
+
+class BudgetInfeasibleError(RuntimeError):
+    """Raised when the per-layer floors make the global budget unreachable.
+
+    The damage-aware re-solve must place exactly ``global_budget`` kept-experts
+    across the layers, each within ``[floor_l, N_l]``.  If the global budget is
+    below ``sum(floor_l)`` or above ``sum(N_l)`` no valid allocation exists.
+    Rather than silently shipping an under- or over-compressed model the tool
+    fails loud — this is the §4 robustness fix from the Direction A proposal.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +334,8 @@ def assemble_layers(
     stage1_payload: dict,
     stage2_damage: dict[int, tuple[int, float | None]],
     protected_counts: dict[int, int] | None = None,
+    *,
+    floor_divisor: int = 2,
 ) -> list[LayerDamage]:
     """Join Stage-1 budgets with Stage-2 measured damage into LayerDamage rows.
 
@@ -282,8 +345,24 @@ def assemble_layers(
     ``protected_counts`` maps ``layer_idx -> n_protected`` (from
     :func:`load_protected_counts`); it raises the per-layer floor so the
     retune can never strand a blacklisted super-expert. When ``None`` the
-    floor falls back to ``N_l // 2`` alone.
+    floor falls back to ``N_l // floor_divisor`` alone.
+
+    ``floor_divisor`` (default ``2``) sets the per-layer floor as
+    ``max(N_l // floor_divisor, n_protected_l)``.  ``2`` reproduces GRAPE's
+    ``N // 2`` invariant exactly (byte-identical default path).  A value
+    ``> 2`` deliberately lowers the floor below ``N // 2`` so donor layers can
+    exist — this is an opt-in, unvalidated quality regime; the caller is
+    expected to have logged a loud warning.
+
+    Per-layer ``redundancy`` is taken from the input artifact's optional
+    ``per_layer_redundancy`` block (GRAPE's R̃^l, written by Stage 1).  It is
+    only consulted as a *prior* for signal-less layers; absence leaves it
+    ``None`` and the retune treats those layers conservatively.
     """
+    if floor_divisor < 1:
+        raise ValueError(
+            f"floor_divisor must be >= 1, got {floor_divisor}."
+        )
     s1_budgets = {
         int(k): int(v) for k, v in stage1_payload["per_layer_target_experts"].items()
     }
@@ -298,17 +377,23 @@ def assemble_layers(
             f"{only_s2}. The two artifacts must come from the same run."
         )
 
+    # Optional GRAPE redundancy prior — used only for signal-less layers.
+    raw_red = stage1_payload.get("per_layer_redundancy") or {}
+    redundancies: dict[int, float] = {
+        int(k): float(v) for k, v in raw_red.items()
+    }
+
     layers: list[LayerDamage] = []
     for li in sorted(s1_layers):
         total_experts, mcp = stage2_damage[li]
         current_budget = s1_budgets[li]
-        # Per-layer floor. GRAPE never drops a layer below half its experts
-        # (ALGORITHM_REFERENCE.md §4) AND always keeps every protected
-        # (blacklisted super-) expert, so the true floor is the larger of the
-        # two. Without a blacklist artifact n_protected is 0 and this reduces
-        # to the N//2 convention.
+        # Per-layer floor. With floor_divisor == 2 this is GRAPE's
+        # half-experts floor (ALGORITHM_REFERENCE.md §4); the floor is also
+        # raised so a layer is never dropped below its count of protected
+        # (blacklisted super-) experts. Without a blacklist artifact
+        # n_protected is 0 and this reduces to the N//floor_divisor convention.
         n_protected = (protected_counts or {}).get(li, 0)
-        floor = max(total_experts // 2, n_protected)
+        floor = max(total_experts // floor_divisor, n_protected)
         if not (0 < current_budget <= total_experts):
             raise ValueError(
                 f"Layer {li}: current budget {current_budget} is outside "
@@ -316,12 +401,13 @@ def assemble_layers(
                 "with the Stage-2 expert counts."
             )
         if current_budget < floor:
-            # The input already violates the floor. We surface this rather
-            # than silently 'fixing' it, because it means the upstream Stage-1
-            # run used a different floor than total_experts // 2.
+            # The input already violates the (configured) floor. We surface
+            # this rather than silently 'fixing' it, because it means the
+            # upstream Stage-1 run used a different floor than the one the
+            # retune was configured with.
             raise ValueError(
                 f"Layer {li}: current budget {current_budget} is below the "
-                f"floor {floor} (= max({total_experts} // 2, "
+                f"floor {floor} (= max({total_experts} // {floor_divisor}, "
                 f"n_protected={n_protected})). The input budgets file was "
                 "produced with a different floor convention; retuning "
                 "against it would be unsound."
@@ -333,66 +419,132 @@ def assemble_layers(
                 current_budget=current_budget,
                 floor=floor,
                 mean_cost_per_pair=mcp,
+                redundancy=redundancies.get(li),
             )
         )
     return layers
 
 
 # ---------------------------------------------------------------------------
-# Knapsack reallocation
+# Damage-aware allocation re-solve
 # ---------------------------------------------------------------------------
+def _predicted_marginal_costs(
+    layers: list[LayerDamage],
+) -> tuple[dict[int, float], list[int]]:
+    """Per-layer marginal merge cost for the re-solve.
+
+    For a layer with a measured Stage-2 signal the marginal cost is the
+    measured ``mean_cost_per_pair`` directly.
+
+    For a *signal-less* layer (GRAPE protected it at ``N``, so Stage 2 never
+    merged it) there is no measurement.  We fall back to a **prior** derived
+    from GRAPE's ``per_layer_redundancy`` R̃^l: a more redundant layer (smaller
+    R̃) is cheaper to merge, so the predicted marginal cost rises with R̃.  The
+    prior is anchored into the *measured* cost range — ``[min_measured,
+    max_measured]`` — so a predicted layer competes on the same scale as the
+    measured ones rather than dominating or being dominated by an arbitrary
+    constant.  When the measured range is degenerate (single signal layer) the
+    prior collapses to that single measured cost.
+
+    A signal-less layer with no redundancy value at all is given the *maximum*
+    measured cost — the conservative choice: it is treated as expensive to
+    merge, so the re-solve will not drain it without strong evidence.
+
+    Returns ``(marginal_cost_by_layer, predicted_layer_idxs)``.
+    """
+    measured = [
+        ld.mean_cost_per_pair for ld in layers if ld.has_signal
+    ]  # all floats, > 0
+    lo = min(measured)  # type: ignore[type-var]
+    hi = max(measured)  # type: ignore[type-var]
+    span = hi - lo
+
+    costs: dict[int, float] = {}
+    predicted: list[int] = []
+    for ld in layers:
+        if ld.has_signal:
+            costs[ld.layer_idx] = float(ld.mean_cost_per_pair)  # type: ignore[arg-type]
+            continue
+        predicted.append(ld.layer_idx)
+        if ld.redundancy is None:
+            # No prior available — be conservative: treat as the most
+            # expensive layer so the re-solve won't drain it unjustified.
+            costs[ld.layer_idx] = float(hi)
+        else:
+            # R̃ ∈ [0, 1] (GRAPE min-max normalises it). Higher R̃ -> diverse
+            # experts -> more expensive to merge. Clamp defensively.
+            r = min(1.0, max(0.0, float(ld.redundancy)))
+            costs[ld.layer_idx] = float(lo + span * r)
+    return costs, predicted
+
+
 def _predicted_total_damage(
-    budgets: dict[int, int], layers_by_idx: dict[int, LayerDamage]
+    budgets: dict[int, int],
+    layers_by_idx: dict[int, LayerDamage],
+    marginal_costs: dict[int, float],
 ) -> float:
     """Sum of predicted damage over all layers under the constant-marginal model.
 
-    predicted_layer_damage = mean_cost_per_pair * n_merged_pairs
-                           = mean_cost_per_pair * (N_l - kept)
+    predicted_layer_damage = marginal_cost_l * n_merged_pairs
+                           = marginal_cost_l * (N_l - kept)
 
-    Layers without a damage signal contribute 0 (we have nothing to predict).
+    Every layer contributes — measured layers via their measured per-pair cost,
+    signal-less layers via their redundancy-prior cost.
     """
     total = 0.0
     for li, kept in budgets.items():
         ld = layers_by_idx[li]
-        if not ld.has_signal:
-            continue
         n_merged = ld.total_experts - kept
-        total += ld.mean_cost_per_pair * n_merged  # type: ignore[operator]
+        total += marginal_costs[li] * n_merged
     return total
 
 
-def retune_budgets(layers: list[LayerDamage]) -> RetuneResult:
-    """Greedy knapsack reallocation of kept-experts against measured damage.
+def retune_budgets(
+    layers: list[LayerDamage], *, floor_divisor: int = 2
+) -> RetuneResult:
+    """Damage-aware re-solve of the per-layer expert budget.
 
-    Algorithm (cheapest-marginal donor -> most-expensive recipient):
+    This replaces the original conserved-per-layer-total knapsack with a
+    **global-budget-conserving allocation re-solve** (Direction A proposal,
+    option d).
 
-      Repeat:
-        * DONOR candidates  = layers with a damage signal that can still give
-          up one expert without breaching their floor (kept > floor).
-        * RECIPIENT candidates = layers with a damage signal that can still
-          take one expert without breaching their ceiling (kept < N_l).
-        * Pick the donor with the SMALLEST mean_cost_per_pair and the recipient
-          with the LARGEST mean_cost_per_pair.
-        * If recipient.cost > donor.cost (strictly), move one expert
-          donor -> recipient and repeat. Otherwise stop.
+    Algorithm:
 
-    Each move is damage-neutral-or-better: it removes one merge from the
-    recipient (saving ``recipient_cost``) and adds one merge to the donor
-    (costing ``donor_cost``); the net change is ``donor_cost - recipient_cost``
-    which is strictly negative by the loop condition. The total kept-expert
-    count is invariant (one out, one in). Termination is guaranteed: total
-    predicted damage strictly decreases each step and is bounded below by 0,
-    and the integer lattice of budgets is finite.
+      1. The conserved quantity is the **global** kept-expert total
+         ``global_budget = sum(current_budget_l)`` — achieved compression is
+         still pinned, but the per-layer split is fully re-solved.
+      2. Each layer is assigned a constant ``marginal_cost`` — its measured
+         ``mean_cost_per_pair`` when Stage 2 merged it, else a redundancy-prior
+         estimate (see :func:`_predicted_marginal_costs`).
+      3. Feasibility: a valid allocation places ``kept_l ∈ [floor_l, N_l]`` on
+         every layer summing to ``global_budget``. If ``global_budget`` is
+         outside ``[sum(floor_l), sum(N_l)]`` the floors make the target
+         unreachable -> :class:`BudgetInfeasibleError` (fail loud rather than
+         ship an under-/over-compressed model).
+      4. Greedy minimiser: start every layer at its ceiling ``N_l``; repeatedly
+         remove one expert from the layer with the smallest ``marginal_cost``
+         that is still above its floor, until ``sum(kept) == global_budget``.
+         For the separable constant-marginal model this is the exact minimiser
+         of total predicted damage — the standard exchange argument applied to
+         the whole allocation (it *can* move a layer off ``N``, unlike the old
+         conserved-total knapsack).
 
-    Layers without a usable damage signal are pinned at their current budget.
+    At least one layer must carry a *measured* signal: with no measurement at
+    all the redundancy prior has nothing to anchor to, and the tool refuses to
+    invent a damage model (:class:`NoDamageSignalError`).
+
+    ``transfers`` is reported as the net number of experts that moved versus
+    the input allocation (``sum |new - old| / 2``) — a like-for-like
+    "how much did the retune change things" scalar.
     """
     if not layers:
         raise ValueError("retune_budgets: no layers supplied.")
 
     layers_by_idx = {ld.layer_idx: ld for ld in layers}
-    budgets: dict[int, int] = {ld.layer_idx: ld.current_budget for ld in layers}
-    old_budgets = dict(budgets)
-    total_kept = sum(budgets.values())
+    old_budgets: dict[int, int] = {
+        ld.layer_idx: ld.current_budget for ld in layers
+    }
+    global_budget = sum(old_budgets.values())
 
     signal_layers = [ld for ld in layers if ld.has_signal]
     no_signal = [ld.layer_idx for ld in layers if not ld.has_signal]
@@ -402,56 +554,75 @@ def retune_budgets(layers: list[LayerDamage]) -> RetuneResult:
             "No layer carries a usable Stage-2 damage signal "
             "(every merge JSON has mean_cost_per_pair == null or <= 0). "
             "There is nothing measured to retune against — aborting rather "
-            "than inventing a damage model. Check that the Stage-2 run "
-            "actually performed merges (budgets below the layer expert "
-            "counts) and recorded non-zero pair costs."
+            "than inventing a damage model from priors alone. Check that the "
+            "Stage-2 run actually performed merges (budgets below the layer "
+            "expert counts) and recorded non-zero pair costs."
         )
 
-    damage_before = _predicted_total_damage(budgets, layers_by_idx)
+    # ---- Feasibility check (the §4 robustness fix) -----------------------
+    sum_floor = sum(ld.floor for ld in layers)
+    sum_ceil = sum(ld.total_experts for ld in layers)
+    if global_budget < sum_floor or global_budget > sum_ceil:
+        raise BudgetInfeasibleError(
+            f"Global kept-expert budget {global_budget} is outside the "
+            f"feasible range [{sum_floor}, {sum_ceil}] implied by the "
+            f"per-layer floors (floor_divisor={floor_divisor}) and ceilings. "
+            "The floors make the target compression unreachable; the re-solve "
+            "cannot place the budget without breaching a floor or ceiling. "
+            "Lower the compression ratio, or pass a larger --floor-divisor so "
+            "donor layers can drop below N//2 (an opt-in, unvalidated quality "
+            "regime)."
+        )
 
-    transfers = 0
-    # Hard cap on iterations: each transfer strictly reduces an integer-bounded
-    # quantity, but cap anyway as a defensive guard against any future bug.
-    max_iters = total_kept * len(layers) + len(layers) + 1
-    for _ in range(max_iters):
-        donors = [
-            ld for ld in signal_layers if budgets[ld.layer_idx] > ld.floor
-        ]
-        recipients = [
-            ld for ld in signal_layers if budgets[ld.layer_idx] < ld.total_experts
-        ]
-        if not donors or not recipients:
+    marginal_costs, predicted = _predicted_marginal_costs(layers)
+    damage_before = _predicted_total_damage(
+        old_budgets, layers_by_idx, marginal_costs
+    )
+
+    # ---- Greedy re-solve: start at the ceiling, remove cheapest ----------
+    # Start every layer at its ceiling N_l, then remove the cheapest-marginal
+    # expert until the global budget is met. Because the marginal cost is a
+    # layer-local constant, the cheapest layer should be drained *fully* (down
+    # to its floor) before the next-cheapest is touched — that is the exact
+    # minimiser for the separable constant-marginal model. Ties on marginal
+    # cost are broken by layer index for a deterministic, reproducible result.
+    budgets: dict[int, int] = {
+        ld.layer_idx: ld.total_experts for ld in layers
+    }
+    n_to_remove = sum_ceil - global_budget
+    order = sorted(
+        layers, key=lambda ld: (marginal_costs[ld.layer_idx], ld.layer_idx)
+    )
+    removed = 0
+    for ld in order:
+        if removed >= n_to_remove:
             break
-
-        # Cheapest donor: smallest per-pair cost. Most-expensive recipient:
-        # largest per-pair cost. mean_cost_per_pair is not None for signal layers.
-        donor = min(donors, key=lambda ld: ld.mean_cost_per_pair)  # type: ignore[arg-type,return-value]
-        recipient = max(recipients, key=lambda ld: ld.mean_cost_per_pair)  # type: ignore[arg-type,return-value]
-
-        if donor.layer_idx == recipient.layer_idx:
-            # Only one signal layer is simultaneously the cheapest donor and
-            # most-expensive recipient — no cross-layer transfer possible.
-            break
-
-        if recipient.mean_cost_per_pair <= donor.mean_cost_per_pair:  # type: ignore[operator]
-            # No strictly-improving transfer remains.
-            break
-
-        budgets[donor.layer_idx] -= 1
-        budgets[recipient.layer_idx] += 1
-        transfers += 1
-    else:
-        # Loop ran to the cap without converging — should be impossible.
+        # Drain this (cheapest-remaining) layer as far as its floor allows,
+        # capped by how many experts still need removing globally.
+        sheddable = min(ld.total_experts - ld.floor, n_to_remove - removed)
+        budgets[ld.layer_idx] -= sheddable
+        removed += sheddable
+    if removed != n_to_remove:
+        # Unreachable: feasibility was checked above. Defensive guard only.
         raise RuntimeError(
-            "budget_retune greedy loop hit its iteration cap without "
-            "converging — this indicates a bug in the transfer logic."
+            "budget_retune re-solve could not place the global budget "
+            "despite passing the feasibility check — this indicates a "
+            "bug in the re-solve logic."
         )
 
-    damage_after = _predicted_total_damage(budgets, layers_by_idx)
+    damage_after = _predicted_total_damage(
+        budgets, layers_by_idx, marginal_costs
+    )
+    # Net experts moved vs. the input allocation (each move is one out + one
+    # in across two layers, hence the /2).
+    transfers = sum(
+        abs(budgets[li] - old_budgets[li]) for li in budgets
+    ) // 2
 
     # ---- Hard invariants -------------------------------------------------
-    assert sum(budgets.values()) == total_kept, (
-        f"total kept-experts not conserved: {sum(budgets.values())} != {total_kept}"
+    assert sum(budgets.values()) == global_budget, (
+        f"global kept-experts not conserved: "
+        f"{sum(budgets.values())} != {global_budget}"
     )
     for ld in layers:
         b = budgets[ld.layer_idx]
@@ -459,25 +630,22 @@ def retune_budgets(layers: list[LayerDamage]) -> RetuneResult:
             f"layer {ld.layer_idx}: retuned budget {b} breaches "
             f"[floor={ld.floor}, ceiling={ld.total_experts}]"
         )
-    for ld in layers:
-        if not ld.has_signal:
-            assert budgets[ld.layer_idx] == old_budgets[ld.layer_idx], (
-                f"layer {ld.layer_idx} has no damage signal but its budget "
-                "changed — signal-less layers must be pinned."
-            )
     assert damage_after <= damage_before + 1e-9, (
         f"predicted damage increased ({damage_before} -> {damage_after}) — "
-        "greedy transfer must be monotone non-increasing."
+        "under the constant-marginal damage model the greedy re-solve must be "
+        "monotone non-increasing; a non-constant model would invalidate this."
     )
 
     return RetuneResult(
         new_budgets=budgets,
         old_budgets=old_budgets,
-        total_kept=total_kept,
+        total_kept=global_budget,
         transfers=transfers,
         predicted_damage_before=damage_before,
         predicted_damage_after=damage_after,
+        floor_divisor=floor_divisor,
         layers_without_signal=no_signal,
+        layers_predicted=predicted,
     )
 
 
@@ -490,6 +658,7 @@ def retune_from_artifacts(
     budgets_path: str | Path | None = None,
     blacklist_path: str | Path | None = None,
     output_path: str | Path | None = None,
+    floor_divisor: int = 2,
 ) -> tuple[RetuneResult, Path]:
     """End-to-end: read artifacts, retune, write a new stage1_budgets.json.
 
@@ -501,14 +670,39 @@ def retune_from_artifacts(
         blacklist_path: override path to ``stage1_blacklist.json``
             (default: ``<artifacts_dir>/stage1_blacklist.json``). Used to raise
             the per-layer floor by each layer's protected-expert count. When the
-            file is absent the floor falls back to ``N//2`` with a warning.
+            file is absent the floor falls back to ``N//floor_divisor`` with a
+            warning.
         output_path: where to write the retuned budgets
             (default: ``<artifacts_dir>/stage1_budgets.retuned.json``).
             MUST differ from the input path — the input is never clobbered.
+        floor_divisor: per-layer floor is ``max(N//floor_divisor,
+            n_protected)``. Default ``2`` reproduces GRAPE's ``N//2`` invariant
+            (byte-identical default path). A value ``> 2`` lowers the floor
+            below ``N//2`` so donor layers can exist — an opt-in, unvalidated
+            quality regime; a loud warning is emitted in that case.
 
     Returns:
         ``(RetuneResult, written_output_path)``.
     """
+    if floor_divisor < 1:
+        raise ValueError(f"floor_divisor must be >= 1, got {floor_divisor}.")
+    if floor_divisor > 2:
+        log.warning(
+            "budget_retune: floor_divisor=%d > 2 — the per-layer floor is "
+            "BELOW the N//2 spec invariant. Donor layers may drop below half "
+            "their experts; this is an unvalidated quality regime. Measure "
+            "the quality cost (thermometer bpt_gap) before adopting any sweep "
+            "that uses this.",
+            floor_divisor,
+        )
+    elif floor_divisor < 2:
+        log.warning(
+            "budget_retune: floor_divisor=%d (< 2) makes every layer's floor "
+            "equal its ceiling N — the re-solve cannot place any budget below "
+            "N and will raise BudgetInfeasibleError for any real compression "
+            "target. Almost certainly a misconfiguration.",
+            floor_divisor,
+        )
     artifacts_dir = Path(artifacts_dir)
     budgets_path = (
         Path(budgets_path) if budgets_path is not None
@@ -542,8 +736,11 @@ def retune_from_artifacts(
 
     stage1_payload = load_stage1_budgets(budgets_path)
     stage2_damage = load_stage2_damage(artifacts_dir)
-    layers = assemble_layers(stage1_payload, stage2_damage, protected_counts)
-    result = retune_budgets(layers)
+    layers = assemble_layers(
+        stage1_payload, stage2_damage, protected_counts,
+        floor_divisor=floor_divisor,
+    )
+    result = retune_budgets(layers, floor_divisor=floor_divisor)
 
     out_payload = result.as_output_payload(stage1_payload)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -552,12 +749,13 @@ def retune_from_artifacts(
     tmp.replace(output_path)
 
     log.info(
-        "budget_retune: %d transfers; predicted damage %.6g -> %.6g "
-        "(total kept-experts %d, conserved); %d layer(s) had no damage signal; "
+        "budget_retune: %d experts moved; predicted damage %.6g -> %.6g "
+        "(global kept-experts %d, conserved); %d layer(s) had no damage "
+        "signal (cost predicted from redundancy prior); floor_divisor=%d; "
         "wrote %s",
         result.transfers, result.predicted_damage_before,
         result.predicted_damage_after, result.total_kept,
-        len(result.layers_without_signal), output_path,
+        len(result.layers_predicted), result.floor_divisor, output_path,
     )
     return result, output_path
 
@@ -572,8 +770,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "Direction A: retune the per-layer expert budget against the "
             "measured Stage-2 merge damage. Reads a completed baseline "
             "Stage-2 run's artifacts and writes a new stage1_budgets.json "
-            "with the kept-experts reallocated toward the layers that merge "
-            "most expensively. Total kept-expert count is conserved exactly."
+            "with the kept-experts re-solved toward the layers that merge "
+            "most expensively. The GLOBAL kept-expert count is conserved "
+            "exactly (achieved compression is pinned); signal-less layers "
+            "are scored with GRAPE's redundancy prior."
         ),
     )
     p.add_argument(
@@ -591,7 +791,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override the stage1_blacklist.json path "
              "(default: <artifacts_dir>/stage1_blacklist.json). Raises the "
              "per-layer floor by each layer's protected-expert count; if "
-             "absent the floor falls back to N//2 with a warning.",
+             "absent the floor falls back to N//floor_divisor with a warning.",
+    )
+    p.add_argument(
+        "--floor-divisor", type=int, default=2,
+        help="Per-layer floor = max(N // floor-divisor, n_protected). "
+             "Default 2 reproduces GRAPE's N//2 invariant exactly. A value "
+             ">2 lowers the floor below N//2 so donor layers can exist — an "
+             "opt-in, UNVALIDATED quality regime; measure the quality cost "
+             "(thermometer bpt_gap) before using it in a sweep.",
     )
     p.add_argument(
         "--output-path", default=None,
@@ -617,23 +825,31 @@ def main(argv: list[str] | None = None) -> int:
             budgets_path=args.budgets_path,
             blacklist_path=args.blacklist_path,
             output_path=args.output_path,
+            floor_divisor=args.floor_divisor,
         )
-    except (FileNotFoundError, ValueError, NoDamageSignalError) as exc:
+    except (
+        FileNotFoundError, ValueError, NoDamageSignalError,
+        BudgetInfeasibleError,
+    ) as exc:
         log.error("budget_retune failed: %s", exc)
         return 1
 
     if args.verbose:
-        print(f"\n{'layer':>6} {'old':>5} {'new':>5} {'delta':>6}  signal")
+        print(f"\n{'layer':>6} {'old':>5} {'new':>5} {'delta':>6}  cost-source")
         for li in sorted(result.new_budgets):
             old = result.old_budgets[li]
             new = result.new_budgets[li]
             delta = new - old
-            sig = "no" if li in result.layers_without_signal else "yes"
+            src = "predicted" if li in result.layers_predicted else "measured"
             mark = "" if delta == 0 else ("  <-- " + ("+" if delta > 0 else "") + str(delta))
-            print(f"{li:>6} {old:>5} {new:>5} {delta:>+6}  {sig}{mark}")
+            print(f"{li:>6} {old:>5} {new:>5} {delta:>+6}  {src}{mark}")
         print(
-            f"\ntotal kept-experts: {result.total_kept} (conserved)  |  "
-            f"transfers: {result.transfers}  |  "
+            f"\nglobal kept-experts: {result.total_kept} (conserved)  |  "
+            f"experts moved: {result.transfers}  |  "
+            f"floor_divisor: {result.floor_divisor}  |  "
+            f"layers measured/predicted: "
+            f"{len(result.new_budgets) - len(result.layers_predicted)}/"
+            f"{len(result.layers_predicted)}  |  "
             f"predicted damage: {result.predicted_damage_before:.6g} -> "
             f"{result.predicted_damage_after:.6g}"
         )

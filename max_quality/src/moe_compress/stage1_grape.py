@@ -603,12 +603,52 @@ def run(
     global_budget = decomposition.global_expert_budget
     gamma = float(s1.get("entropy_tolerance", 0.1))
 
+    # Direction-A second-phase knobs. Both default to a strict no-op:
+    # `grape_floor_divisor` absent -> 2 (the spec §12 D5 `N // 2` floor);
+    # `merge_cost_prior` absent -> None (selection stays `min R[li]`).
+    # When the config keys are unset the GRAPE output is byte-identical to
+    # the historical behaviour.
+    grape_floor_divisor = int(s1.get("grape_floor_divisor", 2))
+    if grape_floor_divisor > 2:
+        log.warning(
+            "Stage 1: grape_floor_divisor=%d > 2 — GRAPE may drive layers "
+            "BELOW the N//2 spec invariant. This is an opt-in, unvalidated "
+            "quality regime intended for the Direction-A second Stage-1 pass.",
+            grape_floor_divisor,
+        )
+    elif grape_floor_divisor < 2:
+        log.warning(
+            "Stage 1: grape_floor_divisor=%d (< 2) sets the per-layer floor to "
+            "(near) the full expert count — GRAPE can merge little or nothing. "
+            "Almost certainly a misconfiguration.",
+            grape_floor_divisor,
+        )
+    raw_cost_prior = s1.get("merge_cost_prior")
+    merge_cost_prior: dict[int, float] | None = None
+    if raw_cost_prior:
+        # Config stores it as {str(layer_idx): cost}; GRAPE keys layers by int.
+        # Every layer GRAPE will consider must have a prior entry.
+        merge_cost_prior = {int(k): float(v) for k, v in raw_cost_prior.items()}
+        missing = sorted(set(per_layer_counts) - set(merge_cost_prior))
+        if missing:
+            raise ValueError(
+                f"merge_cost_prior is missing entries for layers {missing}; "
+                "the prior must cover every MoE layer GRAPE allocates."
+            )
+        log.info(
+            "Stage 1: merge_cost_prior supplied for %d layers — GRAPE "
+            "best-layer selection minimises R[li] * cost_prior[li].",
+            len(merge_cost_prior),
+        )
+
     budgets = _grape_greedy_merge(
         D_matrices=D_matrices,
         global_budget=global_budget,
         per_layer_counts=per_layer_counts,
         blacklist=blacklist,
         gamma=gamma,
+        floor_divisor=grape_floor_divisor,
+        merge_cost_prior=merge_cost_prior,
     )
 
     # Logging: per-layer redundancy R̃^l (spec §4, Eq. 3)
@@ -1277,12 +1317,32 @@ def _grape_greedy_merge(
     per_layer_counts: dict[int, int],
     blacklist: dict[int, list[int]],
     gamma: float,
+    floor_divisor: int = 2,
+    merge_cost_prior: dict[int, float] | None = None,
 ) -> dict[int, int]:
     """GRAPE Algorithm 1 (2604.06542, §3.3).
 
-    Returns per-layer surviving expert counts (budgets). Floor is per_layer_counts[li] // 2
-    computed independently for each layer, so heterogeneous architectures are handled correctly.
+    Returns per-layer surviving expert counts (budgets). Floor is
+    ``per_layer_counts[li] // floor_divisor`` computed independently for each
+    layer, so heterogeneous architectures are handled correctly.
+
+    Optional Direction-A second-phase knobs (both default to a strict no-op):
+
+      * ``floor_divisor`` (default ``2``): the per-layer floor divisor. ``2``
+        reproduces the spec §12 D5 ``N // 2`` invariant exactly. A value
+        ``> 2`` lets GRAPE drive layers below ``N // 2`` so the budget-retune
+        tool and a second Stage-1 pass agree on the floor.
+      * ``merge_cost_prior`` (default ``None``): an optional ``layer_idx ->
+        cost`` map. When supplied, ``best_layer`` selection minimises
+        ``R[li] * merge_cost_prior[li]`` instead of ``R[li]`` alone, so
+        Stage 1 can be biased by *measured* merge damage from a prior Stage-2
+        run. When ``None`` selection is byte-identical to the original
+        ``min R[li]`` behaviour.
     """
+    if floor_divisor < 1:
+        raise ValueError(
+            f"_grape_greedy_merge: floor_divisor must be >= 1, got {floor_divisor}."
+        )
     sorted_layers = sorted(per_layer_counts.keys())
     n_moe_layers = len(sorted_layers)
 
@@ -1354,11 +1414,14 @@ def _grape_greedy_merge(
     # GRAPE tracks only non-blacklisted experts in cluster_counts, so
     # cluster_counts[li] must not drop below floors[li].
     # NOTE: `min_experts_per_layer` is a config key consumed by the budget solver
-    # for global feasibility, but Stage 1 hardcodes the per-layer floor as
-    # `per_layer_counts[li] // 2` per spec §12 D5 ("min_experts_per_layer =
-    # num_routed_experts // 2"). Stage 1 does not read the config value here.
+    # for global feasibility; Stage 1's per-layer floor is
+    # `per_layer_counts[li] // floor_divisor`. With the default
+    # `floor_divisor == 2` this is exactly the spec §12 D5 `N // 2` invariant
+    # ("min_experts_per_layer = num_routed_experts // 2") — byte-identical to
+    # the historical hardcoded floor. `floor_divisor` is only ever non-2 when
+    # a caller explicitly opts in (Direction-A second pass).
     floors: dict[int, int] = {
-        li: max(per_layer_counts[li] // 2 - len(blacklist.get(li, [])), 0)
+        li: max(per_layer_counts[li] // floor_divisor - len(blacklist.get(li, [])), 0)
         for li in sorted_layers
     }
 
@@ -1477,8 +1540,18 @@ def _grape_greedy_merge(
             if cluster_counts[li] <= floors[li]:
                 floor_blocked.add(li)
                 continue
-            if R[li] < best_R:
-                best_R = R[li]
+            # Selection score. With merge_cost_prior unset (the default) this
+            # is `R[li]` verbatim — byte-identical to the original
+            # `if R[li] < best_R` greedy. When a prior IS supplied (Direction-A
+            # second pass) the score is `R[li] * merge_cost_prior[li]`, biasing
+            # selection toward layers that are both activation-redundant AND
+            # cheap to merge per measured Stage-2 damage.
+            if merge_cost_prior is None:
+                score = R[li]
+            else:
+                score = R[li] * merge_cost_prior[li]
+            if score < best_R:
+                best_R = score
                 best_layer = li
 
         if best_layer is None:
