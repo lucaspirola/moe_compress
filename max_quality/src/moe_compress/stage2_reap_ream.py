@@ -2129,13 +2129,16 @@ def _two_opt_refine(
                 if not (np.isfinite(cur) and np.isfinite(new)):
                     continue
                 if new < cur:
-                    # A swap is size-neutral for both groups; caps already hold.
-                    # Defensive re-check keeps the invariant explicit.
-                    if group_size[g_i] <= cap and group_size[g_j] <= cap:
-                        result[i] = g_j
-                        result[j] = g_i
-                        g_i = g_j
-                        improved = True
+                    # A swap is size-neutral for both groups, so caps are
+                    # preserved by construction. Assert the invariant loudly
+                    # rather than silently skipping an improving swap.
+                    assert group_size[g_i] <= cap and group_size[g_j] <= cap, (
+                        "2-opt: group size exceeded cap before a size-neutral swap"
+                    )
+                    result[i] = g_j
+                    result[j] = g_i
+                    g_i = g_j
+                    improved = True
 
     return result
 
