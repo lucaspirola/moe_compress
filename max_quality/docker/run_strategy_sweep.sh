@@ -6,20 +6,28 @@
 # all orchestration lives here in the repo so changing it never needs an image
 # rebuild. Invoke with the image's entrypoint overridden, e.g.:
 #
-#   docker run --gpus all -v /data/cache:/cache \
+#   docker run -d --gpus all -v /data/cache:/cache \
 #     -e HF_TOKEN=hf_... \
 #     --entrypoint bash ghcr.io/lucaspirola/moe-compress:latest -c '
 #       set -e
-#       git clone --depth 1 -b main https://github.com/lucaspirola/moe_compress \
-#         /cache/code/moe_compress 2>/dev/null \
-#         || git -C /cache/code/moe_compress fetch origin main \
-#            && git -C /cache/code/moe_compress reset --hard origin/main
+#       if [ -d /cache/code/moe_compress/.git ]; then
+#         git -C /cache/code/moe_compress fetch origin main
+#         git -C /cache/code/moe_compress reset --hard origin/main
+#       else
+#         git clone --depth 1 -b main https://github.com/lucaspirola/moe_compress \
+#           /cache/code/moe_compress
+#       fi
 #       exec bash /cache/code/moe_compress/max_quality/docker/run_strategy_sweep.sh'
 #
 # Why a dedicated script (not bootstrap.sh): Direction A needs a budget_retune
 # step BETWEEN S0 and the SA/SAB rows — bootstrap.sh runs run_ablations exactly
 # once and has no hook for that. It also needs --stage6-mode thermometer and
 # MOE_KEEP_STAGE2_PARTIAL=1, neither of which bootstrap.sh passes.
+#
+# Disk: each row's Stage-2/2.5 model dirs (stage2_pruned, stage2p5_final) are
+# ~50 GB. A scalar-bpt_gap sweep does not need to hoard 6 compressed models, so
+# each row's heavy dirs are deleted once its thermometer eval is on disk (and,
+# via run_ablations, uploaded to the bucket). KEEP_HEAVY_ARTIFACTS=1 disables.
 set -euo pipefail
 
 : "${HF_TOKEN:?HF_TOKEN is required (set via -e HF_TOKEN=...)}"
@@ -32,17 +40,14 @@ NUM_SEQUENCES="${NUM_SEQUENCES:-1000}"
 STAGE6_MODE="${STAGE6_MODE:-thermometer}"
 HF_ARTIFACTS_BUCKET="${HF_ARTIFACTS_BUCKET:-pirola/moe-ablations}"
 TRACKIO_SPACE_ID="${TRACKIO_SPACE_ID:-pirola/trackio}"
+KEEP_HEAVY_ARTIFACTS="${KEEP_HEAVY_ARTIFACTS:-0}"
 ABLATIONS_ROOT="$CACHE_MOUNT/ablations"
 
 export HF_HOME="${HF_HOME:-$CACHE_MOUNT/hf}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 export HF_ARTIFACTS_BUCKET TRACKIO_SPACE_ID
-# Direction A: budget_retune reads the per-layer damage from _stage2_partial/,
-# which Stage 2 deletes on a successful finish unless this is set. Exported so
-# every run_ablations subprocess inherits it (harmless extra disk for non-A rows).
-export MOE_KEEP_STAGE2_PARTIAL=1
 
-log() { printf '[strategy-sweep] %s\n' "$*" >&2; }
+log() { printf '[strategy-sweep] %s :: %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
 log "================================================================"
 log " moe_compress strategy sweep — directions D/B/A/C/E"
@@ -55,9 +60,6 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 
 mkdir -p "$CACHE_MOUNT/hf" "$ABLATIONS_ROOT" "$CACHE_MOUNT/code"
 
-# ---------------------------------------------------------------------------
-# Code: the wrapper -c above already cloned/updated it; verify + record HEAD.
-# ---------------------------------------------------------------------------
 [[ -d "$CODE_DIR/.git" ]] || { log "FATAL: code not cloned at $CODE_DIR"; exit 1; }
 HARNESS_DIR="$CODE_DIR/max_quality"
 log "code HEAD = $(git -C "$CODE_DIR" rev-parse --short HEAD)"
@@ -126,18 +128,35 @@ run_ablations() {  # $1 = comma-separated ablation ids
         --only "$1"
 }
 
+# Drop a completed row's ~50 GB model dirs; keep the eval JSON + stage1 inputs.
+# Only runs once the row's thermometer result is on disk (so a failed/partial
+# row keeps its artifacts for diagnosis).
+clean_row() {  # $1 = row id
+    local d="$ABLATIONS_ROOT/$1"
+    [[ "$KEEP_HEAVY_ARTIFACTS" == "1" ]] && return 0
+    [[ -f "$d/stage6alt_eval.json" ]] || { log "clean_row $1: no result yet — keeping artifacts"; return 0; }
+    rm -rf "$d/stage2_pruned" "$d/stage2p5_final" "$d/_stage2_partial"
+    log "clean_row $1: dropped stage2_pruned / stage2p5_final / _stage2_partial"
+}
+
+row_done() {  # $1 = row id — true if the thermometer eval landed
+    [[ -f "$ABLATIONS_ROOT/$1/stage6alt_eval.json" ]]
+}
+
 # ---------------------------------------------------------------------------
 # Step 1 — baseline S0 (also runs the shared Stage-1 pre-flight). S0's Stage 2
 # keeps _stage2_partial/ (MOE_KEEP_STAGE2_PARTIAL=1) for the retune below.
 # ---------------------------------------------------------------------------
-log "STEP 1/4 — baseline S0 (+ Stage-1 pre-flight)"
+log "STEP 1/5 — baseline S0 (+ Stage-1 pre-flight)"
+export MOE_KEEP_STAGE2_PARTIAL=1
 run_ablations "S0"
+row_done S0 || { log "FATAL: S0 did not complete — cannot retune. See $ABLATIONS_ROOT/S0"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Step 2 — Direction A: retune the per-layer expert budget against S0's
 # measured Stage-2 merge damage.
 # ---------------------------------------------------------------------------
-log "STEP 2/4 — budget_retune on S0"
+log "STEP 2/5 — budget_retune on S0"
 RETUNED="$ABLATIONS_ROOT/S0/stage1_budgets.retuned.json"
 python -m moe_compress.budget_retune "$ABLATIONS_ROOT/S0" --output-path "$RETUNED" --verbose
 [[ -f "$RETUNED" ]] || { log "FATAL: budget_retune produced no $RETUNED"; exit 1; }
@@ -145,20 +164,40 @@ python -m moe_compress.budget_retune "$ABLATIONS_ROOT/S0" --output-path "$RETUNE
 # ---------------------------------------------------------------------------
 # Step 3 — pre-place the retuned budgets into SA/ and SAB/ so _seed_stage1_-
 # artifacts keeps them (its _hardlink_or_copy skips a dest that already exists).
+# Then S0 no longer needs its heavy dirs.
 # ---------------------------------------------------------------------------
-log "STEP 3/4 — pre-placing retuned budgets into SA/ and SAB/"
+log "STEP 3/5 — pre-placing retuned budgets into SA/ and SAB/"
 for row in SA SAB; do
     mkdir -p "$ABLATIONS_ROOT/$row"
     cp "$RETUNED" "$ABLATIONS_ROOT/$row/stage1_budgets.json"
     log "  $row/stage1_budgets.json <- retuned"
 done
+clean_row S0
+# Non-S0 rows do not need the partials kept — let Stage 2 auto-delete them.
+unset MOE_KEEP_STAGE2_PARTIAL
 
 # ---------------------------------------------------------------------------
-# Step 4 — the remaining rows: A, A+B, C, C+D, E.
+# Step 4 — the remaining rows, one at a time, cleaning each on completion.
 # ---------------------------------------------------------------------------
-log "STEP 4/4 — SA, SAB, SC, SCD, SE"
-run_ablations "SA,SAB,SC,SCD,SE"
+log "STEP 4/5 — SA, SAB, SC, SCD, SE"
+for row in SA SAB SC SCD SE; do
+    log "--- row $row ---"
+    run_ablations "$row" || log "row $row: run_ablations returned non-zero (see leaderboard)"
+    clean_row "$row"
+done
+
+# ---------------------------------------------------------------------------
+# Step 5 — regenerate the full leaderboard. Every row is _is_complete (its
+# stage6alt_eval.json is kept), so this does no GPU work — it just reloads the
+# six results and rewrites _leaderboard.md / _summary.json.
+# ---------------------------------------------------------------------------
+log "STEP 5/5 — regenerating combined leaderboard"
+run_ablations "S0,SA,SAB,SC,SCD,SE" || true
 
 log "================================================================"
-log " >>> STRATEGY SWEEP COMPLETE — leaderboard: $ABLATIONS_ROOT/_leaderboard.md"
+log " >>> STRATEGY SWEEP COMPLETE"
+log " >>> leaderboard: $ABLATIONS_ROOT/_leaderboard.md"
+for r in S0 SA SAB SC SCD SE; do
+    row_done "$r" && log "   $r: done" || log "   $r: MISSING result"
+done
 log "================================================================"
