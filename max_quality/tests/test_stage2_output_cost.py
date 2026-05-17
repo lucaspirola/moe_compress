@@ -20,6 +20,8 @@ Coverage:
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -368,3 +370,38 @@ def test_output_cost_requires_layer_inputs(tiny_model):
             freq={0: 1, 1: 1, 2: 1},
             layer_inputs=None,
         )
+
+
+def test_router_routing_weights_applies_bias_terms():
+    """_router_routing_weights must add BOTH ``bias`` and ``e_score_correction_bias``
+    to the pre-softmax logits.
+
+    The ``tiny_model`` fixture's router carries neither term, so without this
+    test the bias branches in ``_router_routing_weights`` have zero coverage —
+    yet ``e_score_correction_bias`` is a real parameter in Qwen3-MoE's
+    aux-loss-free routing scheme. The recomputation here is independent
+    (canonical ``+bias`` expression), so a sign/axis/broadcast error in the
+    production path would diverge from ``expected``."""
+    torch.manual_seed(0)
+    hidden, n_exp = 6, 4
+    router = SimpleNamespace(
+        weight=torch.randn(n_exp, hidden),
+        bias=torch.randn(n_exp),
+        e_score_correction_bias=torch.randn(n_exp),
+    )
+    layer_ref = SimpleNamespace(router=router)
+    x = torch.randn(5, hidden)
+
+    sigma = _router_routing_weights(layer_ref, x)
+
+    expected = F.softmax(
+        (F.linear(x, router.weight) + router.bias
+         + router.e_score_correction_bias).float(),
+        dim=-1,
+    )
+    torch.testing.assert_close(sigma, expected)
+
+    # The bias terms must actually move the result — guards against a path
+    # that accepts the attributes but never adds them.
+    no_bias = F.softmax(F.linear(x, router.weight).float(), dim=-1)
+    assert not torch.allclose(sigma, no_bias)

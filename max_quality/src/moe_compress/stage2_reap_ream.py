@@ -698,9 +698,10 @@ def run(
                         assignment, delta, max_group_cap,
                     )
                 # Stage 2 v2 EM refinement (spec § 5 step 4T(e) / M4).
-                # Only meaningful when cost_alignment == "post"; otherwise the
-                # cost matrix doesn't depend on centroid weights and EM is a
-                # no-op. _em_refine_assignment guards on this internally.
+                # Runs only when cost_alignment == "post": "pre" is a no-op
+                # (cost is centroid-independent) and "output" is deferred (EM
+                # would help but needs layer_inputs threaded — see
+                # _em_refine_assignment). It guards on this internally.
                 assignment, delta, em_rounds_done = _em_refine_assignment(
                     layer_ref,
                     initial_assignment=assignment,
@@ -2618,6 +2619,11 @@ def _em_refine_assignment(
       - ``cost_alignment == "pre"`` (the cheap symmetric cost does not depend
         on centroid weights, so a tentative merge does not change the cost
         matrix and the assignment cannot improve).
+      - ``cost_alignment == "output"`` — the output-space cost *does* depend on
+        the (tentative) centroid weights, so EM would be meaningful here; it is
+        deferred only because ``_em_refine_assignment`` does not thread the
+        per-layer ``layer_inputs`` calibration tensors that ``_output_space_cost``
+        needs. See the TODO at the cost-matrix recompute below.
     """
     if em_rounds <= 0 or cost_alignment != "post":
         return initial_assignment, initial_delta, 0
@@ -2648,7 +2654,12 @@ def _em_refine_assignment(
             cost_whitening=cost_whitening,
             cost_asymmetric=cost_asymmetric,
             cost_topk_filter=cost_topk_filter,
-            freq=freq if cost_asymmetric else None,
+            # freq is also needed by the "output" cost (freq-weighted tentative
+            # merge), not just the asymmetric "post" cost — keep consistent with
+            # the main _ream_cost_matrix call site. TODO: admitting "output" to
+            # the EM guard above additionally requires threading layer_inputs
+            # here so _output_space_cost has its calibration tokens.
+            freq=freq if (cost_asymmetric or cost_alignment == "output") else None,
             cov_acc=cov_acc,
             perm_cache=perm_cache,
             tentative_centroid_weights=tentative,
