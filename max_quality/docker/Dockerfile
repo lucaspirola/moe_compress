@@ -72,8 +72,14 @@ RUN HF_HOME=/opt/kernels-hub python3 - <<'PYEOF'
 import glob, hashlib, json
 from kernels import get_kernel
 for repo in ("kernels-community/deep-gemm", "kernels-community/finegrained-fp8"):
-    get_kernel(repo)
-    print(f"[bake] cached {repo}", flush=True)
+    # A transient HF 429 during the build must NOT fail the image build — the
+    # runtime fallback in run_strategy_sweep.sh re-fetches when /opt/kernels-hub
+    # is absent/empty. So warn and continue rather than aborting the RUN layer.
+    try:
+        get_kernel(repo)
+        print(f"[bake] cached {repo}", flush=True)
+    except Exception as exc:
+        print(f"[bake] {repo} fetch failed ({exc}) — runtime will fall back", flush=True)
 patched = 0
 for p in glob.glob("/opt/kernels-hub/hub/kernels--*/snapshots/*/build/*/metadata.json"):
     with open(p) as f:
