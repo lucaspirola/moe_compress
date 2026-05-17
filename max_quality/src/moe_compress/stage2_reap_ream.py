@@ -366,6 +366,9 @@ def run(
     capacity_util_threshold: float = float(s2.get("capacity_util_threshold", 0.25))
     em_refinement_rounds: int = int(s2.get("em_refinement_rounds", 0))
     em_convergence_break: bool = bool(s2.get("em_convergence_break", True))
+    # Direction D — greedy + 2-opt local refinement. Only active when
+    # assignment_solver == "greedy"; strictly-improving so it cannot regress.
+    two_opt_refine: bool = bool(s2.get("two_opt_refine", False))
     sinkhorn_epsilon_init: float = float(s2.get("sinkhorn_epsilon_init", 1.0))
     sinkhorn_epsilon_final: float = float(s2.get("sinkhorn_epsilon_final", 0.01))
     sinkhorn_iters: int = int(s2.get("sinkhorn_iters", 200))
@@ -404,6 +407,7 @@ def run(
         "stage2/config/capacity_util_threshold": capacity_util_threshold,
         "stage2/config/em_refinement_rounds": em_refinement_rounds,
         "stage2/config/em_convergence_break": em_convergence_break,
+        "stage2/config/two_opt_refine": two_opt_refine,
         "stage2/config/expert_distill_steps": expert_distill_steps,
         "stage2/config/expert_distill_token_cap": expert_distill_token_cap,
         "stage2/config/expert_distill_lr": expert_distill_lr,
@@ -617,6 +621,14 @@ def run(
                     sinkhorn_epsilon_final=sinkhorn_epsilon_final,
                     sinkhorn_iters=sinkhorn_iters,
                 )
+                # Direction D — greedy + 2-opt local refinement (spec §5 step 3.5).
+                # Strictly-improving local search; runs only for the greedy solver
+                # and only when the flag is set. It cannot regress vs. the greedy
+                # assignment, so the EM step below still sees a feasible input.
+                if two_opt_refine and assignment_solver == "greedy":
+                    assignment = _two_opt_refine(
+                        assignment, delta, max_group_cap,
+                    )
                 # Stage 2 v2 EM refinement (spec § 5 step 4T(e) / M4).
                 # Only meaningful when cost_alignment == "post"; otherwise the
                 # cost matrix doesn't depend on centroid weights and EM is a
@@ -2010,6 +2022,122 @@ def _em_compute_tentative_weights(
         out[centroid] = {name: accs[name] for name in banks}
 
     return out
+
+
+def _two_opt_refine(
+    assignment: list[int],
+    cost: np.ndarray,
+    max_group_cap: int,
+) -> list[int]:
+    """Direction D — greedy + one 2-opt local-refinement loop (spec §5 step 3.5).
+
+    Strictly-improving local search over an already-feasible child→centroid
+    assignment. Operates purely on the assignment list, the cost matrix and the
+    per-centroid capacity cap, so it is model-agnostic (no expert-count, dim,
+    top-k or activation assumptions).
+
+    ``assignment`` is a list of length ``n_children``; ``assignment[ch]`` is the
+    centroid *index* in ``[0, n_centroids)`` that child ``ch`` is assigned to, or
+    ``-1`` if unassigned. ``cost`` has shape ``(n_children, n_centroids)``.
+
+    Two move types, both applied only when *strictly* lowering total cost:
+
+      * **swap** — for a pair of children ``(i, j)`` in *different* groups,
+        exchange their centroids if
+        ``cost[i, g_j] + cost[j, g_i] < cost[i, g_i] + cost[j, g_j]``.
+        A swap leaves every group size unchanged, so capacity is preserved by
+        construction — but we still verify post-swap group sizes defensively.
+
+      * **move** — relocate a single child ``i`` to a different centroid ``g``
+        when ``g`` has spare capacity and ``cost[i, g] < cost[i, g_i]``.
+
+    Capacity is re-checked on every accepted move; with ``max_group_cap <= 0``
+    (uncapped, ablation-only path) groups are treated as unbounded. Passes
+    repeat until a full pass makes no improving move; each pass is O(n²) and
+    ``n`` (non-centroid expert count) is small. The function NEVER accepts a
+    non-improving move, so the returned assignment's total cost is provably
+    ``<=`` the input's.
+
+    Unassigned children (``-1``) and any child whose current cost is non-finite
+    are skipped — 2-opt only reshuffles already-feasible finite-cost merges and
+    never assigns a previously-unassigned child.
+
+    Returns a new assignment list (the input is not mutated).
+    """
+    n_children = len(assignment)
+    if n_children == 0 or cost.size == 0:
+        return list(assignment)
+
+    n_centroids = cost.shape[1]
+    result = list(assignment)
+
+    # Per-centroid occupancy (number of non-centroid children currently in each
+    # group). Unassigned children (-1) contribute to no group.
+    group_size = [0] * n_centroids
+    for g in result:
+        if g >= 0:
+            group_size[g] += 1
+
+    # max_group_cap <= 0 → uncapped; use an effectively-infinite cap so the
+    # capacity guards become no-ops without special-casing every check.
+    cap = max_group_cap if max_group_cap > 0 else n_children
+
+    def _cost(ch: int, g: int) -> float:
+        return float(cost[ch, g])
+
+    improved = True
+    while improved:
+        improved = False
+
+        # --- single moves ---------------------------------------------------
+        for i in range(n_children):
+            g_i = result[i]
+            if g_i < 0:
+                continue
+            cur = _cost(i, g_i)
+            if not np.isfinite(cur):
+                continue
+            best_g = g_i
+            best_cost = cur
+            for g in range(n_centroids):
+                if g == g_i:
+                    continue
+                if group_size[g] >= cap:
+                    continue
+                c = _cost(i, g)
+                if np.isfinite(c) and c < best_cost:
+                    best_cost = c
+                    best_g = g
+            if best_g != g_i:
+                # Strict improvement, target has spare capacity.
+                group_size[g_i] -= 1
+                group_size[best_g] += 1
+                result[i] = best_g
+                improved = True
+
+        # --- pairwise swaps -------------------------------------------------
+        for i in range(n_children):
+            g_i = result[i]
+            if g_i < 0:
+                continue
+            for j in range(i + 1, n_children):
+                g_j = result[j]
+                if g_j < 0 or g_j == g_i:
+                    continue
+                cur = _cost(i, g_i) + _cost(j, g_j)
+                new = _cost(i, g_j) + _cost(j, g_i)
+                if not (np.isfinite(cur) and np.isfinite(new)):
+                    continue
+                if new < cur:
+                    # A swap is size-neutral for both groups; caps already hold.
+                    # Defensive re-check keeps the invariant explicit.
+                    if group_size[g_i] <= cap and group_size[g_j] <= cap:
+                        result[i] = g_j
+                        result[j] = g_i
+                        g_i = g_j
+                        improved = True
+
+    return result
 
 
 def _em_refine_assignment(
