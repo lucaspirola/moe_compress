@@ -326,20 +326,19 @@ def test_flag_off_freeze_set_is_unchanged(tiny_model, tiny_config):
 def test_flag_off_loss_equals_pure_kl():
     """When merge_repair is off the combined loss is exactly the vocab KL.
 
-    Mirrors the `run()` loss-combination branch: `loss = kl_loss` on the
-    flag-off path, so the loss tensor is byte-identical to pre-E `main`.
+    Exercises the *production* `_combine_kd_loss` — the same function `run()`
+    calls — with `mse_term=None` (the flag-off path). It must return the exact
+    `kl_loss` tensor object, so `loss` is byte-identical to pre-E `main`.
     """
     torch.manual_seed(0)
     student_logits = torch.randn(1, 5, 32, requires_grad=True)
     teacher_logits = torch.randn(1, 5, 32)
     kl_loss = s5m._chunked_vocab_kl(student_logits, teacher_logits, 1.0, chunk_size=512)
 
-    merge_repair_enabled = False
-    if merge_repair_enabled:  # pragma: no cover - flag-off path under test
-        loss = kl_loss + 1.0
-    else:
-        loss = kl_loss
-    assert loss is kl_loss  # same object, no MSE term added
+    # Flag-off path: run() passes mse_term=None. mse_weight is irrelevant and
+    # must not change the result (test a non-zero weight to prove it).
+    loss = s5m._combine_kd_loss(kl_loss, None, mse_weight=3.0)
+    assert loss is kl_loss  # SAME object — no MSE term, no new graph node
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +408,10 @@ def test_merge_repair_with_logits_cache_fails_loud(tiny_model, tiny_config, tmp_
 
 
 def test_loss_combination_applies_mse_weight():
-    """`loss = kl_loss + mse_weight * mse_term` — the weight scales only MSE."""
+    """`loss = kl_loss + mse_weight * mse_term` — the weight scales only MSE.
+
+    Exercises the production `_combine_kd_loss` directly (the function `run()`
+    uses), so a regression in the combine formula is caught here."""
     kl_loss = torch.tensor(2.0)
     s = {0: torch.full((1, 2, 3), 1.0)}
     t = {0: torch.full((1, 2, 3), 3.0)}  # per-element (1-3)^2 = 4 -> mse = 4.0
@@ -417,7 +419,5 @@ def test_loss_combination_applies_mse_weight():
     assert torch.allclose(mse_term, torch.tensor(4.0))
 
     for w in (0.0, 0.5, 1.0, 3.0):
-        loss = kl_loss + w * mse_term.to(kl_loss.dtype)
+        loss = s5m._combine_kd_loss(kl_loss, mse_term, mse_weight=w)
         assert torch.allclose(loss, torch.tensor(2.0 + w * 4.0))
-    # mse_weight=0 collapses the combined loss back to the pure KL.
-    assert torch.allclose(kl_loss + 0.0 * mse_term, kl_loss)

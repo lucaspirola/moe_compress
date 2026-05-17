@@ -544,11 +544,31 @@ def run(
     # memorization. weight_decay=0.01 (AdamW default) regularizes router
     # weights to counter that. The paper doesn't specify, but empirics on this
     # model say 0.0 over-fits.
-    optim = torch.optim.AdamW(
-        [p for p in student.parameters() if p.requires_grad],
-        lr=s5["learning_rate"],
-        weight_decay=float(s5.get("weight_decay", 0.0)),
-    )
+    _wd = float(s5.get("weight_decay", 0.0))
+    _trainable_params = [p for p in student.parameters() if p.requires_grad]
+    if _merge_repair_grad_handles:
+        # merge-repair unfroze whole stacked expert tensors; a gradient-mask
+        # hook zeroes every non-centroid row so only the merged centroids get
+        # gradient. AdamW weight decay, however, is applied to the *parameter*
+        # independently of its gradient — with weight_decay>0 it would drift
+        # every non-centroid expert row too. Put the expert tensors in their
+        # own param group with weight_decay=0.0 (the mask still selects rows).
+        _expert_ids = set(_merge_repair_grad_handles)
+        _expert_params = [p for p in _trainable_params if id(p) in _expert_ids]
+        _router_params = [p for p in _trainable_params if id(p) not in _expert_ids]
+        optim = torch.optim.AdamW(
+            [
+                {"params": _router_params, "weight_decay": _wd},
+                {"params": _expert_params, "weight_decay": 0.0},
+            ],
+            lr=s5["learning_rate"],
+        )
+    else:
+        optim = torch.optim.AdamW(
+            _trainable_params,
+            lr=s5["learning_rate"],
+            weight_decay=_wd,
+        )
 
     # torch.compile applied AFTER freeze+optimizer construction so the compiled
     # graph reflects the final frozen parameter layout. named_parameters() on
@@ -1021,17 +1041,17 @@ def run(
 
             # --- Direction E: per-layer merge-repair MSE term ---
             # Added to the vocab KL with a config-scalar weight. The KL path
-            # above is untouched; when merge_repair is off this branch is
-            # skipped entirely and `loss` is exactly the KL as on `main`.
+            # above is untouched; when merge_repair is off mse_term stays None
+            # and _combine_kd_loss returns the exact kl_loss tensor — `loss` is
+            # then byte-identical to pre-Direction-E `main`.
+            mse_term = None
             if _merge_repair_enabled and _merge_repair_layer_indices:
                 mse_term = _merge_repair_mse(
                     _student_capture.outputs if _student_capture is not None else {},
                     _teacher_layer_outputs,
                     _merge_repair_layer_indices,
                 )
-                loss = kl_loss + _merge_repair_mse_weight * mse_term.to(kl_loss.dtype)
-            else:
-                loss = kl_loss
+            loss = _combine_kd_loss(kl_loss, mse_term, _merge_repair_mse_weight)
 
             # --- First-batch sanity probe (added 2026-05-13) ---
             # On the FIRST non-skipped iteration of the run (cold start OR
@@ -1498,17 +1518,16 @@ def _select_merge_repair_layers(student: nn.Module, merge_map: dict) -> list:
 def _experts_param_tensors(experts_module: nn.Module) -> list:
     """Return the stacked expert weight ``nn.Parameter``s of an experts module.
 
-    Covers both the fused Qwen3-style experts (``gate_up_proj`` / ``down_proj``)
-    and the Stage-3 ``FactoredExperts`` factor tensors. In every case the
-    leading axis is the expert axis, which is what the gradient mask keys on.
-    Stage 2.5 runs before Stage 3 so the fused path is the live one, but the
-    factored path is handled so the tool stays architecture-agnostic.
+    Stage 2.5 runs *after* Stage-2 merging and *before* Stage-3 SVD
+    factorization, so the experts are always the fused stacked form
+    (``gate_up_proj`` / ``down_proj``) with the expert axis leading — which is
+    what the gradient mask keys on. Any MoE whose experts module exposes those
+    stacked parameters works; nothing here is Qwen-specific. (A post-Stage-3
+    ``FactoredExperts`` module is intentionally NOT handled: its factors are
+    not plain leading-axis ``nn.Parameter``s, and merge-repair never runs on a
+    factored checkpoint — the explicit error below surfaces that misuse.)
     """
-    names = (
-        "gate_up_proj", "down_proj",                       # fused
-        "gate_proj_U", "gate_proj_V", "up_proj_U",         # factored
-        "up_proj_V", "down_proj_U", "down_proj_V",
-    )
+    names = ("gate_up_proj", "down_proj")
     out = []
     for name in names:
         t = getattr(experts_module, name, None)
@@ -1516,9 +1535,11 @@ def _experts_param_tensors(experts_module: nn.Module) -> list:
             out.append(t)
     if not out:
         raise RuntimeError(
-            "Stage 2.5 merge_repair: could not find any stacked expert weight "
-            f"parameter on {type(experts_module).__name__}; merge_repair cannot "
-            "unfreeze merged experts on this architecture."
+            "Stage 2.5 merge_repair: could not find the stacked expert weight "
+            f"parameters (gate_up_proj / down_proj) on "
+            f"{type(experts_module).__name__}; merge_repair cannot unfreeze "
+            "merged experts on this architecture (a factored / post-Stage-3 "
+            "experts module is not supported)."
         )
     return out
 
@@ -1541,7 +1562,11 @@ def _unfreeze_merged_experts(student: nn.Module, repair_layers: list) -> dict:
         for p in _experts_param_tensors(ref.experts_module):
             p.requires_grad_(True)
             # Capture row_idx by default-arg so each closure binds its own.
+            # row_idx is built on CPU; move it to the gradient's device inside
+            # the hook so the fancy-index works when training on GPU (a CPU
+            # index tensor against a CUDA grad raises a device-mismatch error).
             def _mask_grad(grad, _rows=row_idx):
+                _rows = _rows.to(grad.device)
                 masked = torch.zeros_like(grad)
                 masked[_rows] = grad[_rows]
                 return masked
@@ -1616,8 +1641,10 @@ def _merge_repair_mse(
             raise RuntimeError(
                 f"Stage 2.5 merge_repair: layer {li} output missing from "
                 f"{'student' if li not in student_outputs else 'teacher'} "
-                "capture — forward hook did not fire. The MoE block layout "
-                "differs between teacher and student."
+                "capture — the MoE-block forward hook did not fire. Likely "
+                "causes: the teacher/student MoE block layout differs, or "
+                "torch.compile inlined the block forward so its submodule "
+                "hook no longer runs."
             )
         s = student_outputs[li].to(torch.float32)
         t = teacher_outputs[li].to(device=s.device, dtype=torch.float32)
@@ -1628,6 +1655,23 @@ def _merge_repair_mse(
             )
         terms.append(F.mse_loss(s, t))
     return torch.stack(terms).mean()
+
+
+def _combine_kd_loss(
+    kl_loss: torch.Tensor,
+    mse_term: "torch.Tensor | None",
+    mse_weight: float,
+) -> torch.Tensor:
+    """Stage-2.5 total loss = vocab-KL + weighted merge-repair MSE.
+
+    When merge-repair is off the caller passes ``mse_term=None`` and this
+    returns the *exact* ``kl_loss`` tensor object — so the flag-off loss is
+    byte-identical to pre-Direction-E ``main``. When on, the MSE term is cast
+    to the KL's dtype and added with the config-scalar ``mse_weight``.
+    """
+    if mse_term is None:
+        return kl_loss
+    return kl_loss + mse_weight * mse_term.to(kl_loss.dtype)
 
 
 
