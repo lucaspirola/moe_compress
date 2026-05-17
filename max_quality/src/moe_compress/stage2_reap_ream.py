@@ -369,6 +369,18 @@ def run(
     sinkhorn_epsilon_init: float = float(s2.get("sinkhorn_epsilon_init", 1.0))
     sinkhorn_epsilon_final: float = float(s2.get("sinkhorn_epsilon_final", 0.01))
     sinkhorn_iters: int = int(s2.get("sinkhorn_iters", 200))
+    # Direction B — skip-merge floor. Per-layer percentile P over the *finite*
+    # entries of the cost matrix; every entry strictly above P is masked to
+    # +inf so those pairs fall through to orphan promotion (singleton kept
+    # experts). OFF sentinel: 100.0 (the 100th percentile is the max finite
+    # cost, so nothing is strictly above it -> no entry masked -> byte-identical
+    # to the unmasked run). Valid range [0.0, 100.0].
+    skip_merge_percentile: float = float(s2.get("skip_merge_percentile", 100.0))
+    if not (0.0 <= skip_merge_percentile <= 100.0):
+        raise ValueError(
+            f"stage2_reap_ream.skip_merge_percentile={skip_merge_percentile}; "
+            "must be in [0.0, 100.0] (100.0 = off, mask nothing)."
+        )
     if em_refinement_rounds < 0:
         raise ValueError(
             f"stage2_reap_ream.em_refinement_rounds={em_refinement_rounds}; "
@@ -610,6 +622,21 @@ def run(
                     cov_acc=cov_acc if effective_cost_alignment == "post" else None,
                     perm_cache=perm_cache,
                 )
+                # Direction B — skip-merge floor. Mask high-cost pairs to +inf
+                # so they fall through to orphan promotion. When the flag is at
+                # its OFF sentinel (100.0) this is a no-op on delta's values.
+                if skip_merge_percentile < 100.0:
+                    delta, _n_skip_masked = _apply_skip_merge_floor(
+                        delta, skip_merge_percentile,
+                    )
+                    if _n_skip_masked > 0:
+                        log.info(
+                            "layer %d: skip-merge floor (P%.1f) masked %d/%d "
+                            "cost entries to +inf — affected children fall "
+                            "through to orphan promotion",
+                            layer_ref.layer_idx, skip_merge_percentile,
+                            _n_skip_masked, delta.size,
+                        )
                 assignment = _assign_children_to_centroids(
                     delta, n_ream_nc, n_ream_c, max_group_cap,
                     solver=assignment_solver,
@@ -1352,6 +1379,42 @@ def _profile_layer(
 # ---------------------------------------------------------------------------
 # REAM cost + assignment
 # ---------------------------------------------------------------------------
+
+
+def _apply_skip_merge_floor(
+    delta: np.ndarray, skip_merge_percentile: float,
+) -> tuple[np.ndarray, int]:
+    """Direction B — skip-merge floor.
+
+    Compute the ``skip_merge_percentile`` percentile ``P`` over the *finite*
+    entries of the cost matrix ``delta`` and mask every entry strictly greater
+    than ``P`` to ``+inf``. Masked pairs are forbidden to the assignment solver,
+    so the affected children fall through the greedy ``-1`` path and become
+    singleton ("orphan-promoted") kept experts downstream.
+
+    ``skip_merge_percentile == 100.0`` is the OFF sentinel: the 100th percentile
+    equals the maximum finite cost, nothing is strictly above it, and ``delta``
+    is returned unchanged (a fresh copy, byte-identical in value).
+
+    Returns ``(masked_delta, n_masked)`` where ``masked_delta`` is a new array
+    (the input is never mutated) and ``n_masked`` is the count of entries newly
+    set to ``+inf`` (entries that were already non-finite are not counted).
+    """
+    out = delta.astype(np.float64, copy=True)
+    if out.size == 0:
+        return out, 0
+    finite_mask = np.isfinite(out)
+    if not finite_mask.any():
+        # No finite costs at all — percentile is undefined; mask nothing.
+        return out, 0
+    finite_vals = out[finite_mask]
+    p = float(np.percentile(finite_vals, skip_merge_percentile))
+    # Strictly above P, and only entries that are currently finite (so we do
+    # not "re-mask" already-+inf entries and inflate the reported count).
+    above = finite_mask & (out > p)
+    n_masked = int(above.sum())
+    out[above] = np.inf
+    return out, n_masked
 
 
 def _ream_cost_matrix(
