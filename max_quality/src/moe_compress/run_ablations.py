@@ -183,6 +183,18 @@ ABLATION_DELTAS: list[tuple[str, dict[str, Any]]] = [
     #     cost was mis-specified) or not (=> hard optimization is intrinsically bad).
     ("R6", {"cost_alignment": "post", "capacity_util_threshold": 0, "assignment_solver": "auto"}),
     ("R7", {"cost_alignment": "post", "capacity_util_threshold": 0, "assignment_solver": "sinkhorn"}),
+    # --- Strategy sweep (2026-05-17): the 5 "beyond greedy" directions, run
+    #     baseline -> A -> A+B -> C -> C+D -> E. Baseline B = greedy/all-off.
+    #     SA / SAB consume a budget_retune'd stage1_budgets.json that
+    #     run_strategy_sweep.sh pre-places in their ablation dir between S0 and
+    #     SA (the _seed_stage1_artifacts hardlink is skipped when the dest
+    #     already exists), so their deltas are just baseline / +skip-merge.
+    ("S0",  {}),                                                           # baseline
+    ("SA",  {}),                                                           # A: retuned budgets pre-placed
+    ("SAB", {"skip_merge_percentile": 90.0}),                              # A+B: retuned budgets + skip-merge floor
+    ("SC",  {"cost_alignment": "output", "capacity_util_threshold": 0}),    # C: output-space merge cost
+    ("SCD", {"cost_alignment": "output", "capacity_util_threshold": 0, "two_opt_refine": True}),  # C+D
+    ("SE",  {"stage5_router_kd": {"merge_repair": {"enabled": True, "mse_weight": 1.0}}}),         # E: merge-repair
 ]
 
 
