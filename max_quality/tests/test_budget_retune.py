@@ -197,8 +197,9 @@ def test_resolve_drains_cheapest_layer_fully_first(tmp_path):
     }
     _make_run(tmp_path, layers)
     result, _ = retune_from_artifacts(tmp_path)
-    # Global budget 24, 4 layers of ceiling 8 -> remove 8 experts. Cheapest
-    # (layer 0) sheds 8-4=4, then layer 1 sheds 4. Layers 2 and 3 stay at 8.
+    # Global budget 24; the re-solve starts every layer at ceiling N=8 (not
+    # the old budget 6) -> remove 8 experts. Cheapest (layer 0) sheds 8-4=4,
+    # then layer 1 sheds 4. Layers 2 and 3 stay at 8.
     assert result.new_budgets[0] == 4
     assert result.new_budgets[1] == 4
     assert result.new_budgets[2] == 8
