@@ -153,3 +153,47 @@ def test_early_stop_state_persisted_in_checkpoint(
     assert payload["es_ref_ema"] is not None
     # The early-stop break fires when the counter reaches `patience`.
     assert int(payload["no_improve_windows"]) >= 3
+
+
+def test_early_stop_state_restored_on_resume(
+    tiny_model, patched_stage5, tmp_path, monkeypatch
+):
+    """A crash-resume must RESTORE the early-stop counter, not reset it to 0.
+
+    Run 1 trains until early-stop fires at step S1 — its final checkpoint
+    carries ``no_improve_windows == patience``. Run 2 resumes from that
+    checkpoint: if ``no_improve_windows`` (and ``es_ref_ema``) are restored, the
+    counter is already at ``patience``, so the first still-plateaued window
+    pushes it over and run 2 stops ~1 step later. If either field were reset on
+    resume, run 2 would re-train ~``patience`` more non-improving windows.
+    Asserting run 2 stops below ``S1 + patience`` proves the resume restore
+    path — a typo in a restore key re-counts from zero and fails this. (Test 3
+    only checks the fields are *written*; this checks they are *read back*.)
+    """
+    _prepare_model_and_merge_map(tiny_model, patched_stage5, tmp_path, monkeypatch)
+    state = copy.deepcopy(tiny_model.state_dict())
+
+    n_samples, patience = 40, 4
+    cfg = _cfg_for_early_stop(patched_stage5, n_samples=n_samples, patience=patience)
+
+    # --- Run 1: trains until early-stop fires. ---
+    tiny_model.load_state_dict(state)
+    _run_stage5_self_kd(tiny_model, cfg, tmp_path, monkeypatch)
+    s1 = _latest_ckpt_step(tmp_path)
+    assert s1 < n_samples, "run 1 should have early-stopped before the schedule end"
+    v1 = int(torch.load(
+        tmp_path / "_stage5_partial" / f"step_{s1}.pt", map_location="cpu"
+    )["no_improve_windows"])
+    assert v1 >= patience, (
+        f"run 1 early-stopped — its checkpoint counter should be ≥{patience}, got {v1}"
+    )
+
+    # --- Run 2: resume from the early-stopped checkpoint. ---
+    tiny_model.load_state_dict(state)
+    _run_stage5_self_kd(tiny_model, cfg, tmp_path, monkeypatch)
+    s2 = _latest_ckpt_step(tmp_path)
+    assert s2 < s1 + patience, (
+        f"resume must RESTORE no_improve_windows (was {v1} at step {s1}) — run 2 "
+        f"ran to step {s2}; a counter reset to 0 on resume would re-train "
+        f"~{patience} non-improving windows and reach step ~{s1 + patience}"
+    )
