@@ -60,6 +60,41 @@ RUN pip install --no-build-isolation -c /tmp/torch-constraint.txt \
         "causal-conv1d>=1.4.0" \
         "flash-linear-attention>=0.1.2"
 
+# Pre-bake the FP8 KD-teacher kernels (deep-gemm + finegrained-fp8) into the
+# image. A fresh container otherwise fetches ~1200 small deep-gemm files from
+# HF at the first FP8 forward — that request burst trips HF's 429 rate limiter
+# and stalls Stage 2.5 for 20-40 min. Baked into /opt/kernels-hub (NOT /cache,
+# which is a VOLUME that would shadow anything baked under it); bootstrap.sh /
+# run_strategy_sweep.sh seed the runtime HF cache from this copy. metadata.json
+# is self-healed here (kernels>=0.14.0 strict-validates name/id). The build
+# variant resolves from the installed torch (no GPU needed at fetch time).
+RUN HF_HOME=/opt/kernels-hub python3 - <<'PYEOF'
+import glob, hashlib, json
+from kernels import get_kernel
+for repo in ("kernels-community/deep-gemm", "kernels-community/finegrained-fp8"):
+    get_kernel(repo)
+    print(f"[bake] cached {repo}", flush=True)
+patched = 0
+for p in glob.glob("/opt/kernels-hub/hub/kernels--*/snapshots/*/build/*/metadata.json"):
+    with open(p) as f:
+        m = json.load(f)
+    ch = False
+    if "name" not in m:
+        for part in p.split("/"):
+            if part.startswith("kernels--") and part.count("--") >= 2:
+                m["name"] = part.split("--", 2)[2].replace("_", "-")
+                ch = True
+                break
+    if "id" not in m:
+        m["id"] = "_" + hashlib.md5(p.encode()).hexdigest()[:14]
+        ch = True
+    if ch:
+        with open(p, "w") as f:
+            json.dump(m, f, indent=2)
+        patched += 1
+print(f"[bake] kernels baked + {patched} metadata file(s) patched", flush=True)
+PYEOF
+
 WORKDIR /workspace
 
 COPY docker/bootstrap.sh /usr/local/bin/bootstrap.sh
