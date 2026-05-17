@@ -990,7 +990,14 @@ def run(
     )
     save_json_artifact(merge_map, out_dir / "merge_map.json")
     if partial_dir is not None:
-        shutil.rmtree(partial_dir, ignore_errors=True)
+        if os.environ.get("MOE_KEEP_STAGE2_PARTIAL") == "1":
+            # Direction A — budget retune reads per-layer measured damage from
+            # _stage2_partial/merge_*.json. Keep the dir so a baseline run's
+            # damage signal survives for the retune tool.
+            log.info("Keeping %s (MOE_KEEP_STAGE2_PARTIAL=1) for budget retune",
+                     partial_dir)
+        else:
+            shutil.rmtree(partial_dir, ignore_errors=True)
     log.info("Stage 2 complete — pruned checkpoint at %s", out_dir)
     return out_dir
 
