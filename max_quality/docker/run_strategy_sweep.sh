@@ -38,9 +38,15 @@ CACHE_MOUNT="${CACHE_MOUNT:-/cache}"
 CODE_DIR="${CODE_DIR:-$CACHE_MOUNT/code/moe_compress}"
 NUM_SEQUENCES="${NUM_SEQUENCES:-1000}"
 STAGE6_MODE="${STAGE6_MODE:-thermometer}"
-HF_ARTIFACTS_BUCKET="${HF_ARTIFACTS_BUCKET:-pirola/moe-ablations}"
+# Fresh bucket for the genuine-35% strategy sweep — kept separate from the old
+# pirola/moe-ablations, whose A0-A11/R rows were measured at ~22% compression.
+HF_ARTIFACTS_BUCKET="${HF_ARTIFACTS_BUCKET:-pirola/moe-strategy-35pct}"
 TRACKIO_SPACE_ID="${TRACKIO_SPACE_ID:-pirola/trackio}"
 KEEP_HEAVY_ARTIFACTS="${KEEP_HEAVY_ARTIFACTS:-0}"
+# Direction A floor divisor for the budget_retune re-solve. K=2 = no-op
+# (byte-identical to GRAPE's N//2 floor); K>2 lets donor layers drop below
+# N//2, giving the retune real freedom — the opt-in regime Direction A tests.
+FLOOR_DIVISOR="${FLOOR_DIVISOR:-4}"
 ABLATIONS_ROOT="$CACHE_MOUNT/ablations"
 
 export HF_HOME="${HF_HOME:-$CACHE_MOUNT/hf}"
@@ -182,9 +188,10 @@ row_done S0 || { log "FATAL: S0 did not complete — cannot retune. See $ABLATIO
 # Step 2 — Direction A: retune the per-layer expert budget against S0's
 # measured Stage-2 merge damage.
 # ---------------------------------------------------------------------------
-log "STEP 2/5 — budget_retune on S0"
+log "STEP 2/5 — budget_retune on S0 (floor_divisor=$FLOOR_DIVISOR)"
 RETUNED="$ABLATIONS_ROOT/S0/stage1_budgets.retuned.json"
-python -m moe_compress.budget_retune "$ABLATIONS_ROOT/S0" --output-path "$RETUNED" --verbose
+python -m moe_compress.budget_retune "$ABLATIONS_ROOT/S0" \
+    --output-path "$RETUNED" --floor-divisor "$FLOOR_DIVISOR" --verbose
 [[ -f "$RETUNED" ]] || { log "FATAL: budget_retune produced no $RETUNED"; exit 1; }
 
 # ---------------------------------------------------------------------------
