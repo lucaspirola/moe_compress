@@ -349,11 +349,23 @@ def run(
     assignment_solver: SolverName = _solver_value  # type: ignore[assignment]
 
     # Stage 2 v2 cost matrix variants (spec § 5 step 4 / § 6).
+    # Direction C adds "output": an output-space merge cost that measures the
+    # actual change in the layer's gated routed-expert output on calibration
+    # tokens when a child is tentatively merged into a centroid. A strictly
+    # better merge-damage proxy than the weight-space "pre"/"post" costs.
     cost_alignment_cfg: str = str(s2.get("cost_alignment", "pre")).lower()
-    if cost_alignment_cfg not in ("pre", "post"):
+    if cost_alignment_cfg not in ("pre", "post", "output"):
         raise ValueError(
             f"stage2_reap_ream.cost_alignment={cost_alignment_cfg!r}; "
-            "expected 'pre' or 'post'."
+            "expected 'pre', 'post', or 'output'."
+        )
+    # Direction C — output-space cost calibration-token cap. Only consumed when
+    # cost_alignment == "output"; bounds the per-pair SwiGLU residual compute.
+    cost_output_token_cap: int = int(s2.get("cost_output_token_cap", 1024))
+    if cost_output_token_cap < 1:
+        raise ValueError(
+            f"stage2_reap_ream.cost_output_token_cap={cost_output_token_cap}; "
+            "must be >= 1 (number of calibration tokens for the output cost)."
         )
     cost_whitening: str = str(s2.get("cost_whitening", "none")).lower()
     if cost_whitening not in ("none", "diag", "full"):
@@ -449,12 +461,27 @@ def run(
         # Phase 3 (M8): capture layer-input hidden states only when
         # per-expert distillation is enabled, to keep host-RAM cost zero
         # for runs that don't use the feature.
+        # Direction C: the output-space cost (cost_alignment == "output") also
+        # needs the layer-input calibration tokens, so the accumulator is
+        # likewise enabled in that mode. When BOTH are active the buffer must
+        # be large enough for the larger consumer. The accumulator stays None
+        # (no capture, no host-RAM cost) for every "pre"/"post" run — keeping
+        # those paths byte-identical to main.
+        _need_layer_inputs = expert_distill_steps > 0 or cost_alignment_cfg == "output"
+        _layer_input_cap = (
+            max(
+                expert_distill_token_cap if expert_distill_steps > 0 else 0,
+                cost_output_token_cap if cost_alignment_cfg == "output" else 0,
+            )
+            if _need_layer_inputs
+            else 0
+        )
         layer_input_acc = (
             _LayerInputAccumulator(
-                max_samples=expert_distill_token_cap,
+                max_samples=_layer_input_cap,
                 seed=layer_ref.layer_idx,  # per-layer seed for bit-reproducibility
             )
-            if expert_distill_steps > 0
+            if _need_layer_inputs
             else None
         )
         torch.cuda.empty_cache()
@@ -622,9 +649,23 @@ def run(
                     cost_whitening=cost_whitening,
                     cost_asymmetric=effective_cost_asymmetric,
                     cost_topk_filter=cost_topk_filter,
-                    freq=freq if effective_cost_asymmetric else None,
+                    freq=(
+                        freq
+                        if (effective_cost_asymmetric
+                            or effective_cost_alignment == "output")
+                        else None
+                    ),
                     cov_acc=cov_acc if effective_cost_alignment == "post" else None,
                     perm_cache=perm_cache,
+                    # Direction C: calibration tokens for the output-space cost.
+                    # None for "pre"/"post" — those paths never read it.
+                    layer_inputs=(
+                        layer_input_acc.get()
+                        if (effective_cost_alignment == "output"
+                            and layer_input_acc is not None)
+                        else None
+                    ),
+                    output_token_cap=cost_output_token_cap,
                 )
                 # Direction B — skip-merge floor. Mask high-cost pairs to +inf
                 # so they fall through to orphan promotion. When the flag is at
@@ -657,9 +698,10 @@ def run(
                         assignment, delta, max_group_cap,
                     )
                 # Stage 2 v2 EM refinement (spec § 5 step 4T(e) / M4).
-                # Only meaningful when cost_alignment == "post"; otherwise the
-                # cost matrix doesn't depend on centroid weights and EM is a
-                # no-op. _em_refine_assignment guards on this internally.
+                # Runs only when cost_alignment == "post": "pre" is a no-op
+                # (cost is centroid-independent) and "output" is deferred (EM
+                # would help but needs layer_inputs threaded — see
+                # _em_refine_assignment). It guards on this internally.
                 assignment, delta, em_rounds_done = _em_refine_assignment(
                     layer_ref,
                     initial_assignment=assignment,
@@ -1508,10 +1550,12 @@ def _ream_cost_matrix(
     cov_acc: "InputCovarianceAccumulator | None" = None,
     perm_cache: "_PermAlignCache | None" = None,
     tentative_centroid_weights: dict[int, dict[str, torch.Tensor]] | None = None,
+    layer_inputs: torch.Tensor | None = None,
+    output_token_cap: int = 1024,
 ) -> np.ndarray:
     """Compute the (n_nc × n_c) REAM cost matrix.
 
-    Two modes (Stage 2 v2 spec § 5 step 4):
+    Three modes (Stage 2 v2 spec § 5 step 4 + Direction C):
 
     - ``cost_alignment="pre"`` (default, v1 behavior): symmetric δ_REAM cost
       ``1 - (δ_gate + δ̃_expert)/2`` over all pairs.
@@ -1523,6 +1567,13 @@ def _ream_cost_matrix(
       § 5 step 4T(c)(ii)). All other entries get +∞ so the assignment solver
       treats them as forbidden. Permutations and residuals are stashed in
       ``perm_cache`` for the merge step to reuse (M1).
+    - ``cost_alignment="output"`` (Direction C): for each non-centroid m,
+      take the top-K candidates by cheap cost; for those candidates compute
+      the *output-space* cost — the routing-weighted change in expert m's
+      gated routed output on the captured calibration tokens when m is
+      tentatively merged into the centroid. See ``_output_space_cost``.
+      Requires ``layer_inputs`` (the layer-input calibration buffer) and
+      ``freq`` (for the freq-weighted tentative merge).
 
     When ``cost_asymmetric=True`` and ``freq`` is provided, the post-alignment
     residual is multiplied by ``freq_m / (freq_c + freq_m)`` (spec § 5 step
@@ -1594,10 +1645,27 @@ def _ream_cost_matrix(
     if cost_alignment == "pre":
         return cost
 
+    if cost_alignment == "output":
+        # Direction C — output-space merge cost. ``cost`` (the cheap symmetric
+        # δ_REAM) is reused only as the top-K candidate filter, exactly like
+        # the "post" path uses it.
+        return _output_space_cost(
+            layer_ref,
+            noncentroid_ids,
+            centroid_ids,
+            cheap_cost=cost,
+            ream_acc=ream_acc,
+            perm_cache=perm_cache,
+            topk=cost_topk_filter,
+            freq=freq,
+            layer_inputs=layer_inputs,
+            token_cap=output_token_cap,
+        )
+
     if cost_alignment != "post":
         raise ValueError(
             f"_ream_cost_matrix: unknown cost_alignment={cost_alignment!r}; "
-            "expected 'pre' or 'post'."
+            "expected 'pre', 'post', or 'output'."
         )
 
     # Stage 2 v2: post-alignment whitened residual path (spec § 5 step 4T).
@@ -1798,6 +1866,239 @@ def _post_alignment_cost(
                 residual = residual * factor
 
             out[ci, cj] = float(residual)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Direction C — output-space merge cost (cost_alignment == "output")
+# ---------------------------------------------------------------------------
+
+
+def _router_routing_weights(
+    layer_ref: MoELayerRef,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Full-softmax routing weights ``σ(x)_e`` for every routed expert.
+
+    Recomputes the layer router's pre-softmax routing scores from the layer
+    input ``x`` and applies a softmax over the expert axis — the same
+    bias-adjusted pre-softmax → softmax path that ``capture_router_outputs``
+    uses during profiling. Model-agnostic: it reads ``layer_ref.router``'s
+    ``weight`` / ``bias`` / ``e_score_correction_bias`` attributes, none of
+    which are Qwen-specific (any linear MoE router exposes ``weight``; the
+    bias terms are simply skipped when absent).
+
+    ``x`` : ``(n_tokens, hidden)``. Returns ``(n_tokens, n_experts)`` float32.
+    """
+    router = layer_ref.router
+    w = router.weight
+    logits = F.linear(x.to(w.dtype), w)
+    bias = getattr(router, "bias", None)
+    if bias is not None:
+        logits = logits + bias
+    esc = getattr(router, "e_score_correction_bias", None)
+    if esc is not None:
+        logits = logits + esc
+    return F.softmax(logits.float(), dim=-1)
+
+
+def _tentative_merged_weights(
+    layer_ref: MoELayerRef,
+    centroid_id: int,
+    child_id: int,
+    freq: dict[int, int],
+    ream_acc: "ReamCostAccumulator | None",
+    perm_cache: "_PermAlignCache | None",
+) -> dict[str, torch.Tensor]:
+    """Freq-weighted, permutation-aligned merge of ``child_id`` into
+    ``centroid_id`` — the two-member case of ``_em_compute_tentative_weights``.
+
+    ``W_merged = w_c · W_c + w_m · perm_m(W_m)`` where the weights are
+    ``freq_e / (freq_c + freq_m)`` and ``perm_m`` aligns the child's
+    intermediate neurons to the centroid (identity for the centroid itself).
+    Returns float32 weights keyed by ``MATRIX_NAMES``. Model-agnostic: expert
+    weights come through ``build_banks`` / ``MATRIX_NAMES``.
+
+    Read-only on model params — wrapped in ``torch.no_grad()`` so the leaf
+    ``nn.Parameter``s' ``requires_grad=True`` does not build an autograd graph
+    (mirrors ``_post_alignment_cost``).
+    """
+    li = layer_ref.layer_idx
+    banks = build_banks(layer_ref)
+
+    f_c = max(int(freq.get(centroid_id, 0)), 0)
+    f_m = max(int(freq.get(child_id, 0)), 0)
+    denom = f_c + f_m
+    if denom > 0:
+        w_c, w_m = f_c / denom, f_m / denom
+    else:
+        w_c, w_m = 0.5, 0.5  # both zero — neutral average
+
+    with torch.no_grad():
+        ref_gate = banks["gate_proj"].get(centroid_id).to(torch.float32)
+        ref_up   = banks["up_proj"].get(centroid_id).to(torch.float32)
+        child_gate = banks["gate_proj"].get(child_id).to(torch.float32)
+        child_up   = banks["up_proj"].get(child_id).to(torch.float32)
+
+        cached = perm_cache.get((li, centroid_id, child_id)) if perm_cache is not None else None
+        if cached is not None:
+            perm = cached[0]
+        else:
+            ref_act   = ream_acc.get_neuron_mean(li, centroid_id) if ream_acc else None
+            child_act = ream_acc.get_neuron_mean(li, child_id) if ream_acc else None
+            perm = _permutation_align_to_centroid(
+                ref_gate, ref_up, child_gate, child_up,
+                ref_act_mean=ref_act, child_act_mean=child_act,
+            )
+        perm_t = torch.as_tensor(perm, dtype=torch.long, device=ref_gate.device)
+
+        merged: dict[str, torch.Tensor] = {}
+        for name in MATRIX_NAMES:
+            W_c = banks[name].get(centroid_id).to(torch.float32)
+            W_m = banks[name].get(child_id).to(torch.float32)
+            # gate/up permute the intermediate (row) axis; down permutes the
+            # intermediate (column) axis. Mirrors _aligned_whitened_residual.
+            if name == "down_proj":
+                W_m = W_m[:, perm_t]
+            else:
+                W_m = W_m[perm_t, :]
+            merged[name] = w_c * W_c + w_m * W_m
+    return merged
+
+
+def _output_space_cost(
+    layer_ref: MoELayerRef,
+    noncentroid_ids: list[int],
+    centroid_ids: list[int],
+    *,
+    cheap_cost: np.ndarray,
+    ream_acc: "ReamCostAccumulator | None",
+    perm_cache: "_PermAlignCache | None",
+    topk: int,
+    freq: dict[int, int] | None,
+    layer_inputs: torch.Tensor | None,
+    token_cap: int,
+) -> np.ndarray:
+    """Direction C — output-space merge cost matrix (spec STRATEGY_NEXT §C).
+
+    For each non-centroid ``m`` and each of its top-K cheapest candidate
+    centroids ``c``, the cost is the routing-weighted change in expert ``m``'s
+    *gated routed output* on the calibration tokens when ``m`` is tentatively
+    merged into ``c``::
+
+        cost(m→c) = mean_t [ σ_m(x_t) · ‖ E_m(x_t) − E_merged(x_t) ‖² ]
+
+    where ``E_m`` is expert ``m``'s SwiGLU forward, ``E_merged`` is the
+    forward of the freq-weighted permutation-aligned tentative merge of
+    ``m`` into ``c``, and ``σ_m(x_t)`` is token ``t``'s full-softmax routing
+    weight for expert ``m``, masked to zero on tokens where ``m`` is not in
+    the token's top-``top_k`` routed set (so the cost only counts tokens that
+    actually reach expert ``m`` — the topk-routing bound from the spec).
+
+    This is a strictly better merge-damage proxy than the weight-space
+    ``pre`` / ``post`` costs: it measures the realised change in what the
+    layer emits, not a norm on the weights.
+
+    All non-candidate entries get ``+inf`` so the assignment solver treats
+    them as forbidden, exactly like the ``post`` path.
+
+    Model-agnostic: expert count / dims come from ``build_banks`` /
+    ``MATRIX_NAMES``; ``top_k`` from ``layer_ref.top_k``; routing weights from
+    ``layer_ref.router``; the FFN forward is ``_swiglu_forward`` — the same
+    activation abstraction the ``post`` and distillation paths already use.
+    """
+    n_nc = len(noncentroid_ids)
+    n_c = len(centroid_ids)
+
+    if topk < 1:
+        raise ValueError(
+            f"_output_space_cost: cost_topk_filter={topk} < 1 — must be at "
+            "least the per-centroid capacity to leave a feasible assignment."
+        )
+    if layer_inputs is None or layer_inputs.shape[0] == 0:
+        raise RuntimeError(
+            "_output_space_cost: no layer-input calibration tokens were "
+            "captured — the _LayerInputAccumulator must be enabled when "
+            "cost_alignment == 'output' (check the Stage 2 driver)."
+        )
+    if freq is None:
+        raise ValueError(
+            "_output_space_cost: freq dict is required (the tentative merge "
+            "is freq-weighted)."
+        )
+
+    out = np.full((n_nc, n_c), np.inf, dtype=np.float64)
+
+    banks = build_banks(layer_ref)
+    # Resolve the compute device + dtype from the model's own expert weights
+    # so the cost computation runs wherever the model lives (CPU or GPU),
+    # with no hardcoded device.
+    _probe = banks["gate_proj"].get(centroid_ids[0] if n_c else noncentroid_ids[0])
+    device = _probe.device
+
+    with torch.no_grad():
+        # Calibration tokens: deterministic per-layer subsample, capped so the
+        # per-pair SwiGLU forward stays bounded (~1k tokens by default).
+        x_all = layer_inputs.reshape(-1, layer_inputs.shape[-1])
+        n_tokens = x_all.shape[0]
+        if n_tokens > token_cap:
+            rng = torch.Generator(device="cpu").manual_seed(layer_ref.layer_idx)
+            idx = torch.randperm(n_tokens, generator=rng)[:token_cap]
+            x_all = x_all[idx]
+        x_all = x_all.to(device, dtype=torch.float32)
+
+        # Full-softmax routing weights + the token's top-k routed expert set.
+        sigma = _router_routing_weights(layer_ref, x_all)  # (T, n_experts)
+        top_k = layer_ref.top_k
+        k = min(top_k, sigma.shape[-1])
+        topk_idx = torch.topk(sigma, k=k, dim=-1).indices  # (T, k)
+
+        # Per non-centroid m: σ_m masked to tokens that route to m, and m's
+        # own expert output E_m(x). Computed once per m (reused across its
+        # K candidate centroids).
+        for ci in range(n_nc):
+            m_id = noncentroid_ids[ci]
+            # routing-weighted mask: σ_m(x) on tokens that route to m, else 0.
+            routed_m = (topk_idx == m_id).any(dim=-1)  # (T,) bool
+            gate_m = sigma[:, m_id] * routed_m.to(sigma.dtype)  # (T,)
+            if float(gate_m.sum()) <= 0.0:
+                # No calibration token routes to m — the output cost is
+                # undefined (every merge is "free" on unseen inputs). Leave
+                # the whole row at +inf so the bump loop / orphan-promotion
+                # path handles it, exactly as the post path does for a child
+                # with no finite candidate. The cheap-cost top-K still picks
+                # candidates, but a finite fallback is needed so the solver
+                # has a feasible arc — fall back to the cheap symmetric cost.
+                k_cand = min(topk, n_c)
+                for cj in np.argpartition(cheap_cost[ci], k_cand - 1)[:k_cand]:
+                    out[ci, int(cj)] = float(cheap_cost[ci, int(cj)])
+                continue
+
+            W_m = {name: banks[name].get(m_id).to(device, torch.float32)
+                   for name in MATRIX_NAMES}
+            E_m = _swiglu_forward(
+                W_m["gate_proj"], W_m["up_proj"], W_m["down_proj"], x_all,
+            )  # (T, hidden)
+
+            k_cand = min(topk, n_c)
+            top_cj = np.argpartition(cheap_cost[ci], k_cand - 1)[:k_cand]
+            for cj in top_cj:
+                cj = int(cj)
+                c_id = centroid_ids[cj]
+                merged = _tentative_merged_weights(
+                    layer_ref, c_id, m_id, freq, ream_acc, perm_cache,
+                )
+                merged = {name: merged[name].to(device, torch.float32)
+                          for name in MATRIX_NAMES}
+                E_merged = _swiglu_forward(
+                    merged["gate_proj"], merged["up_proj"], merged["down_proj"],
+                    x_all,
+                )  # (T, hidden)
+                # Routing-weighted mean squared output change for expert m.
+                per_token = (E_m - E_merged).pow(2).sum(dim=-1)  # (T,)
+                cost = (gate_m * per_token).sum() / gate_m.sum()
+                out[ci, cj] = float(cost)
 
     return out
 
@@ -2318,6 +2619,11 @@ def _em_refine_assignment(
       - ``cost_alignment == "pre"`` (the cheap symmetric cost does not depend
         on centroid weights, so a tentative merge does not change the cost
         matrix and the assignment cannot improve).
+      - ``cost_alignment == "output"`` — the output-space cost *does* depend on
+        the (tentative) centroid weights, so EM would be meaningful here; it is
+        deferred only because ``_em_refine_assignment`` does not thread the
+        per-layer ``layer_inputs`` calibration tensors that ``_output_space_cost``
+        needs. See the TODO at the cost-matrix recompute below.
     """
     if em_rounds <= 0 or cost_alignment != "post":
         return initial_assignment, initial_delta, 0
@@ -2348,7 +2654,12 @@ def _em_refine_assignment(
             cost_whitening=cost_whitening,
             cost_asymmetric=cost_asymmetric,
             cost_topk_filter=cost_topk_filter,
-            freq=freq if cost_asymmetric else None,
+            # freq is also needed by the "output" cost (freq-weighted tentative
+            # merge), not just the asymmetric "post" cost — keep consistent with
+            # the main _ream_cost_matrix call site. TODO: admitting "output" to
+            # the EM guard above additionally requires threading layer_inputs
+            # here so _output_space_cost has its calibration tokens.
+            freq=freq if (cost_asymmetric or cost_alignment == "output") else None,
             cov_acc=cov_acc,
             perm_cache=perm_cache,
             tentative_centroid_weights=tentative,
@@ -2389,9 +2700,11 @@ def _pick_effective_alignment(
     Capacity-utilization gate:
         u = n_NC / (N'_l × C_max).
     When ``u < threshold`` the layer has so much slack capacity that the
-    heavyweight post-alignment cost matrix is unlikely to change the
-    assignment meaningfully — return ``"pre"`` regardless of the configured
-    value.  Otherwise return the configured value (``"pre"`` or ``"post"``).
+    heavyweight cost matrix is unlikely to change the assignment meaningfully
+    — return ``"pre"`` regardless of the configured value.  Otherwise return
+    the configured value (``"pre"``, ``"post"``, or Direction C's
+    ``"output"``). The output-space cost is heavyweight too, so it is gated
+    identically to ``"post"`` (downgraded to ``"pre"`` on slack layers).
 
     With ``max_group_cap == 0`` (uncapped, ablation-only path) we treat the
     layer as fully slack (u = 0).
