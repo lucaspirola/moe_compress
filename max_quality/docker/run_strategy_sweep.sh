@@ -128,15 +128,18 @@ run_ablations() {  # $1 = comma-separated ablation ids
         --only "$1"
 }
 
-# Drop a completed row's ~50 GB model dirs; keep the eval JSON + stage1 inputs.
+# Drop a completed row's heavy artifacts; keep the eval JSON + stage1 inputs.
 # Only runs once the row's thermometer result is on disk (so a failed/partial
-# row keeps its artifacts for diagnosis).
+# row keeps its artifacts for diagnosis). _stage2_input_covariance.pt (~53 GB)
+# and _stage2_partial (~53 GB) are the biggest items — they MUST be in this
+# list or the volume overruns within ~2 rows.
 clean_row() {  # $1 = row id
     local d="$ABLATIONS_ROOT/$1"
     [[ "$KEEP_HEAVY_ARTIFACTS" == "1" ]] && return 0
     [[ -f "$d/stage6alt_eval.json" ]] || { log "clean_row $1: no result yet — keeping artifacts"; return 0; }
-    rm -rf "$d/stage2_pruned" "$d/stage2p5_final" "$d/_stage2_partial"
-    log "clean_row $1: dropped stage2_pruned / stage2p5_final / _stage2_partial"
+    rm -rf "$d/stage2_pruned" "$d/stage2p5_final" "$d/_stage2_partial" \
+           "$d/_stage2p5_partial" "$d/_stage2_input_covariance.pt"
+    log "clean_row $1: dropped stage2_pruned / stage2p5_final / _stage2_partial / covariance"
 }
 
 row_done() {  # $1 = row id — true if the thermometer eval landed
