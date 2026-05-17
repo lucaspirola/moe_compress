@@ -652,6 +652,7 @@ def run(
                     layer_ref,
                     initial_assignment=assignment,
                     initial_delta=delta,
+                    skip_merge_percentile=skip_merge_percentile,
                     ream_centroid_ids=ream_centroid_ids,
                     ream_noncentroid_ids=ream_noncentroid_ids,
                     perm_cache=perm_cache,
@@ -1393,8 +1394,9 @@ def _apply_skip_merge_floor(
     singleton ("orphan-promoted") kept experts downstream.
 
     ``skip_merge_percentile == 100.0`` is the OFF sentinel: the 100th percentile
-    equals the maximum finite cost, nothing is strictly above it, and ``delta``
-    is returned unchanged (a fresh copy, byte-identical in value).
+    equals the maximum finite cost, nothing is strictly above it, so this helper
+    returns a fresh copy with no entries masked. (The Stage-2 ``run()`` call site
+    skips this helper entirely at the sentinel, leaving the original array as-is.)
 
     Returns ``(masked_delta, n_masked)`` where ``masked_delta`` is a new array
     (the input is never mutated) and ``n_masked`` is the count of entries newly
@@ -2098,6 +2100,7 @@ def _em_refine_assignment(
     sinkhorn_epsilon_init: float = 1.0,
     sinkhorn_epsilon_final: float = 0.01,
     sinkhorn_iters: int = 200,
+    skip_merge_percentile: float = 100.0,
 ) -> tuple[list[int], np.ndarray, int]:
     """EM refinement loop (spec § 5 step 4T(e) / M4).
 
@@ -2152,6 +2155,10 @@ def _em_refine_assignment(
             perm_cache=perm_cache,
             tentative_centroid_weights=tentative,
         )
+        # Direction B — re-apply the skip-merge floor each EM round; the freshly
+        # recomputed cost matrix would otherwise un-mask the high-cost pairs.
+        if skip_merge_percentile < 100.0:
+            new_delta, _ = _apply_skip_merge_floor(new_delta, skip_merge_percentile)
         new_assignment = _assign_children_to_centroids(
             new_delta, n_nc, n_c, max_group_cap,
             solver=assignment_solver,
@@ -2654,7 +2661,15 @@ def _assign_sinkhorn(
 
     # Argmax over real centroids per real child (drop the dummy row).
     real_log_T = log_T[:n_children, :]
-    return [int(np.argmax(row)) for row in real_log_T]
+    assignment = [int(np.argmax(row)) for row in real_log_T]
+    # Direction B / skip-merge floor: a child whose entire cost row is +inf
+    # (all candidate merges forbidden) must orphan — not be force-merged by the
+    # argmax over the normalized sentinel. Match the greedy/hungarian/mcf
+    # "-1 -> orphan promotion" contract so the floor holds for every solver.
+    for ch in range(n_children):
+        if not finite_mask[ch].any():
+            assignment[ch] = -1
+    return assignment
 
 
 # ---------------------------------------------------------------------------
