@@ -392,7 +392,10 @@ stage6_validate:
     #     distribution → bpt_gap is a fair teacher-vs-student damage number.
     # See stage6alt_thermometer.py module docstring. top1_agreement is fair
     # on either corpus.
-    corpus: nemotron
+    # Strategy sweep (2026-05-17): wikitext — the directions D/B/A/C/E must be
+    # ranked on a FAIR teacher-vs-student damage number (out-of-KD-distribution),
+    # comparable to the prior greedy/all-off baseline bpt_gap 0.2507.
+    corpus: wikitext
     wikitext:                        # only consulted when corpus == wikitext
       dataset: wikitext
       subset: wikitext-2-raw-v1
