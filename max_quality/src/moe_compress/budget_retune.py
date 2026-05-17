@@ -189,6 +189,10 @@ class RetuneResult:
             "floor_divisor": int(self.floor_divisor),
             "global_budget_conserved": int(self.total_kept),
             "layers_without_damage_signal": sorted(self.layers_without_signal),
+            # layers_cost_predicted == layers_without_damage_signal by
+            # construction; their cost is redundancy-prior-derived OR — when
+            # the layer carries no redundancy value — a conservative max-cost
+            # fallback, so "predicted" here is not always a true prediction.
             "layers_cost_predicted": sorted(self.layers_predicted),
             "n_layers_measured": (
                 len(self.new_budgets) - len(self.layers_predicted)
@@ -628,7 +632,8 @@ def retune_budgets(
         )
     assert damage_after <= damage_before + 1e-9, (
         f"predicted damage increased ({damage_before} -> {damage_after}) — "
-        "the cost-minimising re-solve must be monotone non-increasing."
+        "under the constant-marginal damage model the greedy re-solve must be "
+        "monotone non-increasing; a non-constant model would invalidate this."
     )
 
     return RetuneResult(
@@ -688,6 +693,14 @@ def retune_from_artifacts(
             "their experts; this is an unvalidated quality regime. Measure "
             "the quality cost (thermometer bpt_gap) before adopting any sweep "
             "that uses this.",
+            floor_divisor,
+        )
+    elif floor_divisor < 2:
+        log.warning(
+            "budget_retune: floor_divisor=%d (< 2) makes every layer's floor "
+            "equal its ceiling N — the re-solve cannot place any budget below "
+            "N and will raise BudgetInfeasibleError for any real compression "
+            "target. Almost certainly a misconfiguration.",
             floor_divisor,
         )
     artifacts_dir = Path(artifacts_dir)

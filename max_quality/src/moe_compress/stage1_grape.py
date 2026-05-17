@@ -616,6 +616,13 @@ def run(
             "quality regime intended for the Direction-A second Stage-1 pass.",
             grape_floor_divisor,
         )
+    elif grape_floor_divisor < 2:
+        log.warning(
+            "Stage 1: grape_floor_divisor=%d (< 2) sets the per-layer floor to "
+            "(near) the full expert count — GRAPE can merge little or nothing. "
+            "Almost certainly a misconfiguration.",
+            grape_floor_divisor,
+        )
     raw_cost_prior = s1.get("merge_cost_prior")
     merge_cost_prior: dict[int, float] | None = None
     if raw_cost_prior:
