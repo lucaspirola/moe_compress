@@ -89,7 +89,7 @@ print('snapshot_download complete')
 if [ -d /opt/kernels-hub/hub ]; then
     log "seeding FP8 kernels from image-baked /opt/kernels-hub (no HF fetch)"
     mkdir -p "$HF_HOME/hub"
-    cp -rn /opt/kernels-hub/hub/kernels--* "$HF_HOME/hub/" 2>/dev/null || true
+    cp -rn /opt/kernels-hub/hub/kernels--* "$HF_HOME/hub/" || true
 else
     log "no baked kernels in image — fetching + patching FP8 kernels live"
     python3 - <<'PYEOF'
@@ -180,6 +180,14 @@ python -m moe_compress.run_ablations \
     --stage6-mode "$STAGE6_MODE" \
     --teacher-model-repo "$TEACHER_MODEL_REPO" \
     --preflight-only
+# Re-run guard: if a prior run left S0 "complete" (stage6alt_eval.json present)
+# but clean_row already deleted S0/_stage2_partial, budget_retune (Step 2) would
+# fail with a FileNotFoundError. Force a fresh S0 in that stale state so the
+# Stage-2 merge data Direction A needs is regenerated.
+if [[ -f "$ABLATIONS_ROOT/S0/stage6alt_eval.json" && ! -d "$ABLATIONS_ROOT/S0/_stage2_partial" ]]; then
+    log "STEP 1/5 — S0 is complete but _stage2_partial/ was cleaned — wiping S0/ for a fresh run (budget_retune needs it)"
+    rm -rf "$ABLATIONS_ROOT/S0"
+fi
 log "STEP 1/5 — baseline S0"
 run_ablations "S0"
 row_done S0 || { log "FATAL: S0 did not complete — cannot retune. See $ABLATIONS_ROOT/S0"; exit 1; }
@@ -230,7 +238,12 @@ run_ablations "S0,SA,SAB,SC,SCD,SE" || true
 log "================================================================"
 log " >>> STRATEGY SWEEP COMPLETE"
 log " >>> leaderboard: $ABLATIONS_ROOT/_leaderboard.md"
+_all_done=1
 for r in S0 SA SAB SC SCD SE; do
-    row_done "$r" && log "   $r: done" || log "   $r: MISSING result"
+    if row_done "$r"; then log "   $r: done"; else log "   $r: MISSING result"; _all_done=0; fi
 done
 log "================================================================"
+if [[ "$_all_done" != "1" ]]; then
+    log "FATAL: one or more rows are missing a result — sweep INCOMPLETE (see above)"
+    exit 1
+fi

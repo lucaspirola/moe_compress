@@ -697,6 +697,12 @@ def run(
                     assignment = _two_opt_refine(
                         assignment, delta, max_group_cap,
                     )
+                elif two_opt_refine:
+                    log.warning(
+                        "two_opt_refine=true is ignored: it only applies to the "
+                        "greedy assignment solver, but assignment_solver=%r.",
+                        assignment_solver,
+                    )
                 # Stage 2 v2 EM refinement (spec § 5 step 4T(e) / M4).
                 # Runs only when cost_alignment == "post": "pre" is a no-op
                 # (cost is centroid-independent) and "output" is deferred (EM
