@@ -75,13 +75,18 @@ print('snapshot_download complete')
 "
 
 # ---------------------------------------------------------------------------
-# FP8 KD-teacher kernel prefetch + metadata self-heal (mirrors bootstrap.sh
-# step 5.5 — required because we use the FP8 teacher). The deep-gemm /
-# finegrained-fp8 kernels lazy-load mid-Stage-2.5; their metadata.json is
-# missing name/id that kernels>=0.14.0 strict-validates. Fetch + patch eagerly.
+# FP8 KD-teacher kernels. Seed the runtime HF cache from the image-baked copy
+# (/opt/kernels-hub, populated in the Dockerfile) — no HF fetch, so the
+# deep-gemm 429 rate-limit storm cannot recur. Falls back to a live fetch +
+# metadata self-heal if the image predates the bake.
 # ---------------------------------------------------------------------------
-log "pre-fetching + patching FP8 KD-teacher kernels"
-python3 - <<'PYEOF'
+if [ -d /opt/kernels-hub/hub ]; then
+    log "seeding FP8 kernels from image-baked /opt/kernels-hub (no HF fetch)"
+    mkdir -p "$HF_HOME/hub"
+    cp -rn /opt/kernels-hub/hub/kernels--* "$HF_HOME/hub/" 2>/dev/null || true
+else
+    log "no baked kernels in image — fetching + patching FP8 kernels live"
+    python3 - <<'PYEOF'
 import glob, hashlib, json, os, sys
 try:
     from kernels import get_kernel
@@ -112,6 +117,7 @@ for p in glob.glob(f"{os.environ.get('HF_HOME', '/cache/hf')}/hub/kernels--*/sna
         patched += 1
 print(f"[kernels-prefetch] complete: {patched} metadata file(s) patched", flush=True)
 PYEOF
+fi
 
 cd "$HARNESS_DIR"
 export PYTHONPATH="$HARNESS_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
