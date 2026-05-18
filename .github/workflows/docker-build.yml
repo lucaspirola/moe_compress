@@ -89,10 +89,12 @@ jobs:
           # Authenticates the FP8-kernel pre-bake (Dockerfile `id=hf_token`
           # secret). Without it the anonymous HF rate limit 429-storms the
           # ~1200-file deep-gemm fetch and the build job times out. Expects an
-          # HF_TOKEN repo secret holding a read-scoped HF token; if unset the
-          # value is empty and the bake degrades to unauthenticated.
-          secrets: |
-            hf_token=${{ secrets.HF_TOKEN }}
+          # HF_TOKEN repo secret holding a read-scoped HF token. The secret is
+          # passed ONLY when set — an empty `hf_token=` line trips buildx's CSV
+          # parser, so when HF_TOKEN is absent no secret is passed at all and
+          # the bake degrades to unauthenticated (Dockerfile handles the
+          # missing /run/secrets/hf_token gracefully).
+          secrets: ${{ secrets.HF_TOKEN != '' && format('hf_token={0}', secrets.HF_TOKEN) || '' }}
 
       - name: Image digest
         run: echo "Pushed ${{ steps.meta.outputs.tags }} @ ${{ steps.meta.outputs.digest }}"
