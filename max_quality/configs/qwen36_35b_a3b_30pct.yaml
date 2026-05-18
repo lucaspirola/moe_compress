@@ -370,9 +370,14 @@ stage5_router_kd:
   # raises in that combination, because the calibration batches are replayed
   # identically across epochs while the cache index advances per (epoch,batch),
   # mispairing epoch-0 logits with epoch-N inputs.
-  kd_seq_chunk_size: 512            # H200: full sequence in one chunk (~2.4 GB peak at B=8, |V|≈150K).
-                                    # Eliminates chunk-boundary Python loop overhead.
-                                    # On smaller VRAM (A100): set to 128 to bound peak at ~600 MB.
+  kd_seq_chunk_size: 32             # Bounds the vocab-KL peak. The full-sequence
+                                    # chunk (512) measured ~3.78 GiB and OOM'd
+                                    # Stage 2.5 on the SC/SCD/SE rows (GPU left
+                                    # ~0.6-2 GiB free after student+teacher);
+                                    # 32 brings the peak to ~0.24 GiB. Chunking
+                                    # is correctness-neutral — KL is summed over
+                                    # the token axis identically at any chunk
+                                    # size (see _chunked_vocab_kl docstring).
   max_calibration_samples: 3000   # 2026-05-17: reverted 6000 → 3000. The 6000
                                   # bump existed only to feed epochs=3; with
                                   # epochs=1 (see above) that rationale is void.
