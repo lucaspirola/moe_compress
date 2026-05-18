@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # moe_compress portable runtime image.
 #
 # Targets vast.ai / RunPod / Lambda / any GPU host that supports `docker run --gpus all`.
