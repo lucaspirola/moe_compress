@@ -21,6 +21,7 @@ Stage (N-1) checkpoint if it exists on disk.
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import sys
 import time
@@ -198,6 +199,18 @@ def main(argv=None) -> int:
                                  no_resume=args.no_resume)
             repo2 = upload_stage_to_hub(2, artifacts_dir, repo_base=hub_base) if hub_base else None
             _finish_stage(2, t2, repo2)
+
+        # Free Stage 2's CUDA caching-allocator pool before Stage 2.5.
+        # Stage 2's REAP/REAM cost computation — the cost_alignment="output"
+        # path especially — can leave a large reserved pool. Stage 2.5 then
+        # loads the FP8 teacher alongside the student and needs a multi-GiB
+        # contiguous block for the vocab-KL; after a long output-cost Stage 2
+        # the leftover reserved pool starves it and Stage 2.5 OOMs (row SC:
+        # 3.78 GiB ask, 659 MiB free of 139.8 GiB). Releasing the unused
+        # reserved blocks is correctness-neutral — live tensors are untouched.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Stage 2.5 — Router KD post-merge: recalibrate routers so Stage 3
         # covariance collection sees already-adapted routing decisions.
