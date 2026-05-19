@@ -140,12 +140,17 @@ Recalibrates routing after Stage-2 merging via knowledge distillation from the
 - **Loss**: temperature-scaled **vocab-KL** between student and teacher final
   logits, computed in sequence chunks (`_chunked_vocab_kl`; `kd_seq_chunk_size`
   — see §5.3). Optimizer **AdamW** (weight decay regularizes routers).
-- **Temperature ramp**: `kd_temperature_start` (4.0) → `kd_temperature_end`
-  (1.0) over `kd_temperature_ramp_fraction` of training; legacy scalar
-  `kd_temperature` fallback.
-- **Recipe**: `epochs` (1 in current config — reduced from a 2-epoch overfit),
-  ~375 steps, calibration from `nvidia/Nemotron-Cascade-2-SFT-Data`, save-best
-  router state, teacher-logits cache.
+- **Temperature**: **constant `kd_temperature` = 1.0**. An earlier
+  `kd_temperature_start` (4.0) → `kd_temperature_end` (1.0) ramp was removed
+  (2026-05-19): under a ramp, the logged `raw_kl` is temperature-scaled and
+  drifts as T changes, so it is not a faithful teacher↔student signal — it
+  corrupted save-best and produced a spurious "step-~950 overfit" reading.
+  At T=1, `raw_kl == loss` and the metric trajectory is honest.
+- **Recipe**: `epochs` (1 in current config), ~375 steps, calibration from
+  `nvidia/Nemotron-Cascade-2-SFT-Data`, save-best router state, teacher-logits
+  cache. *Caveat*: `epochs=1` / `weight_decay=0.01` / `early_stop_patience=8`
+  were tuned against the now-discredited ramp-era "overfit" reading; a
+  re-audit (epochs=2 diagnostic at T=1, watching the honest KL) is pending.
 - **Direction E — `merge_repair`**: ALSO unfreezes the **merged centroid
   experts** and adds a **per-layer MSE** term between student and teacher
   MoE-block outputs on merge-affected layers (averaged over layers; `mse_weight`
