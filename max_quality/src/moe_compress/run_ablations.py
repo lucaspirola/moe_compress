@@ -195,9 +195,10 @@ ABLATION_DELTAS: list[tuple[str, dict[str, Any]]] = [
     ("SC",  {"cost_alignment": "output", "capacity_util_threshold": 0}),    # C: output-space merge cost
     ("SCD", {"cost_alignment": "output", "capacity_util_threshold": 0, "two_opt_refine": True}),  # C+D
     ("SE",  {"stage5_router_kd": {"merge_repair": {"enabled": True, "mse_weight": 1.0}}}),         # E: merge-repair
-    # H: per-layer merge-heal (Direction E re-scoped to one layer at a time).
-    #    merge_heal_sidecar_path is injected at runtime from --heal-sidecar-path.
-    ("SH",  {"merge_heal_enabled": True}),                                 # H: per-layer merge-heal
+    # H: per-layer merge-heal by self-distillation. SH heals experts + router;
+    #    SHR heals experts only (router frozen at its resize — Stage 2.5 owns it).
+    ("SH",  {"merge_heal_enabled": True, "merge_heal_train_router": True}),   # H: heal experts + router
+    ("SHR", {"merge_heal_enabled": True, "merge_heal_train_router": False}),  # H: heal experts, router frozen
 ]
 
 
@@ -733,11 +734,6 @@ def main(argv: list[str] | None = None) -> int:
                         help="Lever (b): override stage5_router_kd.max_sequence_length. "
                         "Shorter sequences also shrink the activation peak. "
                         "Default: null (use config value).")
-    parser.add_argument("--heal-sidecar-path", default=None,
-                        help="Path to the teacher-layer-output sidecar "
-                        "(_stage2_teacher_layer_outputs.pt produced by "
-                        "hf_jobs/precompute_teacher_layer_outputs.py). REQUIRED "
-                        "when running sweep row SH (per-layer merge-heal).")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -769,24 +765,6 @@ def main(argv: list[str] | None = None) -> int:
         rows = ABLATION_DELTAS[:1]  # A0 only
     else:
         rows = ABLATION_DELTAS
-
-    # Sweep row SH (per-layer merge-heal) needs a precomputed teacher-layer-
-    # output sidecar. Fail fast if SH is selected without one, and inject the
-    # resolved path into SH's delta dict (so it lands in stage2_reap_ream).
-    if any(aid == "SH" for aid, _ in rows):
-        if not args.heal_sidecar_path:
-            parser.error(
-                "sweep row SH requires --heal-sidecar-path (the sidecar from "
-                "hf_jobs/precompute_teacher_layer_outputs.py)"
-            )
-        _heal_sidecar = Path(args.heal_sidecar_path)
-        if not _heal_sidecar.exists():
-            parser.error(f"--heal-sidecar-path {_heal_sidecar} does not exist")
-        rows = [
-            (aid, ({**d, "merge_heal_sidecar_path": str(_heal_sidecar)}
-                   if aid == "SH" else d))
-            for aid, d in rows
-        ]
 
     log.info("Will run %d ablation(s): %s", len(rows), [r[0] for r in rows])
 
