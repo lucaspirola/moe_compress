@@ -397,10 +397,18 @@ class _CascadeBuffer:
     def _layer_kwargs(self, bs: int, layer_idx: int) -> dict:
         """Return ``layers[layer_idx]``'s call kwargs for a batch of ``bs`` rows.
 
-        For a ``full_attention`` layer the replayed ``attention_mask`` must not
-        be ``None`` — a ``None`` mask would make the layer attend bidirectionally
-        (non-causal) and corrupt the cascade. This hard-assert catches any
-        future regression in the per-layer capture.
+        For a ``full_attention`` layer under ``eager`` attention the replayed
+        ``attention_mask`` must not be ``None`` — eager has no ``is_causal``
+        short-circuit, so a ``None`` mask would make the layer attend
+        bidirectionally. Under ``sdpa`` / flash attention a ``None`` mask is the
+        CORRECT value: ``create_causal_mask`` deliberately returns ``None`` for
+        an unpadded full-attention layer (transformers
+        ``masking_utils._ignore_causal_mask_sdpa``) and causality is applied via
+        SDPA's ``is_causal`` flag (the attention module carries
+        ``is_causal=True``). The capture is a faithful pre-hook record of the
+        exact kwargs the model passed, so replaying ``None`` reproduces the
+        model's causal behaviour. The hard-assert therefore only fires for
+        ``eager``, where a ``None`` mask is a genuine capture bug.
         """
         by_layer = self._kwargs_by_bs.get(bs)
         if by_layer is None:
@@ -416,17 +424,24 @@ class _CascadeBuffer:
         layer_types = getattr(
             getattr(self._tower, "config", None), "layer_types", None
         )
+        attn_impl = str(getattr(
+            getattr(self._tower, "config", None), "_attn_implementation", ""
+        )).lower()
+        causal_via_flag = attn_impl in (
+            "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4",
+        )
         if (
             layer_types is not None
             and 0 <= layer_idx < len(layer_types)
             and str(layer_types[layer_idx]) == "full_attention"
             and kw.get("attention_mask") is None
+            and not causal_via_flag
         ):
             raise RuntimeError(
                 f"_CascadeBuffer: layer {layer_idx} is a full_attention layer "
-                "but its replayed attention_mask is None — the captured kwargs "
-                "would make it attend bidirectionally (non-causal). The "
-                "per-layer kwargs capture is broken."
+                f"under attn_implementation={attn_impl!r} but its replayed "
+                "attention_mask is None — eager attention needs an explicit "
+                "causal mask, so the per-layer kwargs capture is broken."
             )
         return kw
 
