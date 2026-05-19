@@ -3150,11 +3150,15 @@ def _heal_layer(
     def _shared_out(x_in: torch.Tensor) -> torch.Tensor:
         if shared_expert is None:
             return torch.zeros_like(x_in)
-        sdev = next(shared_expert.parameters()).device
+        sp = next(shared_expert.parameters())
+        sdev, sdtype = sp.device, sp.dtype
+        # The heal runs in fp32, but the frozen shared expert keeps the model's
+        # native dtype (bf16) — feed it in its own dtype to avoid a matmul
+        # dtype mismatch, then cast the (frozen) result back to fp32.
         with torch.no_grad():
-            so = shared_expert(x_in.to(sdev))
+            so = shared_expert(x_in.to(sdev, sdtype))
             if shared_gate is not None:
-                so = torch.sigmoid(shared_gate(x_in.to(sdev))) * so
+                so = torch.sigmoid(shared_gate(x_in.to(sdev, sdtype))) * so
         return so.to(x_in.device, torch.float32)
 
     shared_train = _shared_out(x_train)
