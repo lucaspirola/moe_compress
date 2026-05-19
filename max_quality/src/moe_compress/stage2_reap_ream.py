@@ -1543,29 +1543,45 @@ def run(
         heal_state: dict | None = None
         if heal_cfg.enabled and cascade_buffer is not None and heal_sidecar is not None:
             cascade_buffer.advance_to(layer_ref.layer_idx)
-            _teacher_out = heal_sidecar["layer_outputs"].get(layer_ref.layer_idx)
-            if _teacher_out is None:
-                raise RuntimeError(
-                    f"Stage-2 merge-heal: sidecar has no teacher output for "
-                    f"layer {layer_ref.layer_idx} (layer_indices="
-                    f"{heal_sidecar.get('layer_indices')})."
+            # Heal ONLY layers that actually merged >=1 child. An unmerged layer
+            # is byte-identical to the teacher's layer, so its heal loss would
+            # reflect only inherited upstream drift — training the router to
+            # absorb that distorts a correct layer and overfits expert-mixing
+            # to the calibration tokens. Accumulated/global drift is Stage
+            # 2.5's job; the per-layer Stage-2 heal's scope is each layer's
+            # OWN merge damage. The cascade buffer is still advanced THROUGH
+            # every layer below — only the heal *training* is conditional.
+            layer_merged = any(len(m) > 1 for m in grouped.values())
+            if layer_merged:
+                _teacher_out = heal_sidecar["layer_outputs"].get(layer_ref.layer_idx)
+                if _teacher_out is None:
+                    raise RuntimeError(
+                        f"Stage-2 merge-heal: sidecar has no teacher output for "
+                        f"layer {layer_ref.layer_idx} (layer_indices="
+                        f"{heal_sidecar.get('layer_indices')})."
+                    )
+                heal_state = _heal_layer(
+                    layer_ref=layer_ref,
+                    grouped=grouped,
+                    final_kept_ids=final_kept_ids,
+                    cascade_buffer=cascade_buffer,
+                    teacher_layer_output=_teacher_out,
+                    heal_cfg=heal_cfg,
+                    device=(
+                        device if device is not None
+                        else layer_ref.router.weight.device
+                    ),
                 )
-            heal_state = _heal_layer(
-                layer_ref=layer_ref,
-                grouped=grouped,
-                final_kept_ids=final_kept_ids,
-                cascade_buffer=cascade_buffer,
-                teacher_layer_output=_teacher_out,
-                heal_cfg=heal_cfg,
-                device=(
-                    device if device is not None
-                    else layer_ref.router.weight.device
-                ),
-            )
-            # Release this layer's teacher target — each layer's slice of the
-            # ~84 GB mmap'd sidecar is used exactly once, so drop the reference
-            # to let the OS reclaim the pages instead of holding all 40 layers.
-            del _teacher_out
+                del _teacher_out
+            else:
+                log.info(
+                    "  merge-heal layer %d: skipped (0 merges — unmerged layer "
+                    "is teacher-identical, nothing to heal)",
+                    layer_ref.layer_idx,
+                )
+            # Release this layer's teacher target either way — each layer's
+            # slice of the ~84 GB mmap'd sidecar is used at most once, so drop
+            # it to let the OS reclaim the pages instead of holding all 40.
             heal_sidecar["layer_outputs"].pop(layer_ref.layer_idx, None)
 
         # Correctness depends on the RuntimeError guard above ensuring no protected expert
@@ -1611,11 +1627,14 @@ def run(
                 heal_state=heal_state,
             )
 
-        # Merge-heal: advance the cascade buffer THROUGH the just-healed layer
-        # so the next layer's heal sees the correct (merged + healed) input.
-        # Done after the checkpoint so a crash between heal and advance simply
-        # re-advances on resume (advance is idempotent via the cursor).
-        if heal_cfg.enabled and cascade_buffer is not None and heal_state is not None:
+        # Merge-heal: advance the cascade buffer THROUGH this layer so the next
+        # layer's heal sees the correct input. This MUST happen for EVERY layer
+        # under the heal path — merged or not — or token alignment with the
+        # teacher sidecar breaks. Only the heal *training* above is conditional;
+        # the buffer propagation is not. Done after the checkpoint so a crash
+        # between heal and advance simply re-advances on resume (idempotent via
+        # the cursor).
+        if heal_cfg.enabled and cascade_buffer is not None and heal_sidecar is not None:
             cascade_buffer.advance_through(layer_ref.layer_idx)
 
         max_group = max((len(g) for g in grouped.values()), default=0)
