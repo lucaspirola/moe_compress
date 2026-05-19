@@ -61,6 +61,9 @@ def _tiny_moe_model():
 
 
 def _random_expert(hidden: int, d_int: int) -> dict[str, torch.Tensor]:
+    # SwiGLU weight shapes are asymmetric: gate_proj / up_proj map hidden -> d_int
+    # so they are [d_int, hidden]; down_proj maps the intermediate d_int back to
+    # hidden so it is [hidden, d_int]. This matches the Qwen MoE expert layout.
     return {
         "gate_proj": torch.randn(d_int, hidden),
         "up_proj": torch.randn(d_int, hidden),
@@ -80,8 +83,17 @@ def _merge_layer(ref, final_kept_ids: list[int]) -> None:
     _resize_router_for_kept_experts(ref, final_kept_ids)
 
 
-def _id_batches(model, n_seq: int = 16, seq_len: int = 8, chunk: int = 4):
-    ids = torch.randint(0, model.config.vocab_size, (n_seq, seq_len))
+def _id_batches(model, n_seq: int = 16, seq_len: int = 8, chunk: int = 4,
+                seed: int = 0):
+    """Deterministic synthetic token batches.
+
+    The token draw is seeded via an explicit `torch.Generator` so the accept-
+    based heal tests are reproducible run-to-run (an unseeded `torch.randint`
+    made them flaky near the accept margin).
+    """
+    gen = torch.Generator().manual_seed(seed)
+    ids = torch.randint(0, model.config.vocab_size, (n_seq, seq_len),
+                        generator=gen)
     return [ids[i:i + chunk] for i in range(0, n_seq, chunk)]
 
 
@@ -217,8 +229,10 @@ def test_heal_config_rejects_bad_grad_clip():
 def test_capture_mlp_io_pools_aligned():
     """`_capture_mlp_io` records row-aligned (mlp_input, mlp_output) pairs at
     the MoE-block boundary. Feeding the captured input back through the (still
-    original) mlp must reproduce the captured target — confirms the hook is on
-    the right module and the i/o correspond."""
+    original) mlp must reproduce the captured target by ABSOLUTE error —
+    confirms the hook is on the right module, the i/o correspond, AND the
+    captured magnitudes are correct (a scale bug would survive a scale-
+    invariant check but not an allclose)."""
     model = _tiny_moe_model()
     ref = list(iter_moe_layers(model))[1]
     batches = _id_batches(model, n_seq=4, seq_len=8, chunk=2)
@@ -235,17 +249,31 @@ def test_capture_mlp_io_pools_aligned():
         out = ref.mlp(x3d)
     out = (out[0] if isinstance(out, tuple) else out).reshape(
         -1, model.config.hidden_size)
-    cos = torch.nn.functional.cosine_similarity(out.float(), cap_out.float(), dim=-1)
-    assert cos.min().item() > 0.99, f"capture i/o mismatch: min cos {cos.min()}"
+    # Absolute-error check is the primary assertion — it catches magnitude
+    # bugs that a scale-invariant cosine would miss. Tolerances are loose
+    # because the captured pools are stored bf16.
+    assert torch.allclose(out.float(), cap_out.float(), rtol=1e-2, atol=1e-2), (
+        f"capture i/o magnitude mismatch: max abs err "
+        f"{(out.float() - cap_out.float()).abs().max().item()}"
+    )
 
 
 def test_capture_mlp_io_respects_pool_size():
-    """The pool is capped at pool_size; the forward loop stops early."""
+    """The pool is capped at pool_size; the forward loop stops early. The cap
+    is a genuine PREFIX — capturing the same batches uncapped must reproduce
+    the capped pool as its leading rows."""
     model = _tiny_moe_model()
     ref = list(iter_moe_layers(model))[0]
     batches = _id_batches(model, n_seq=16, seq_len=8, chunk=4)  # 128 tokens
     cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=40)
     assert cap_in.shape[0] == 40 and cap_out.shape[0] == 40
+
+    # Same batches, large pool_size — the capped capture must be its prefix.
+    cap_in_big, cap_out_big = _capture_mlp_io(
+        model, ref, batches, device=_CPU, pool_size=10_000)
+    assert cap_in_big.shape[0] == 128
+    assert torch.equal(cap_in, cap_in_big[:40]), "pool cap is not a prefix"
+    assert torch.equal(cap_out, cap_out_big[:40]), "pool cap is not a prefix"
 
 
 # ---------------------------------------------------------------------------
@@ -270,10 +298,11 @@ def _heal_cfg(**overrides) -> _HealConfig:
 def test_heal_layer_runs_after_bank_select_reindexing():
     """`_heal_layer` runs AFTER `bank.select()` re-indexed the banks to
     0..n_kept-1; it must index by post-select POSITION. With a reachable
-    self-distillation target the heal is accepted and the weights move."""
+    self-distillation target the heal is accepted by a comfortable margin and
+    the weights move."""
     model = _tiny_moe_model()
     ref = list(iter_moe_layers(model))[1]
-    batches = _id_batches(model)
+    batches = _id_batches(model, n_seq=64)  # ~512 tokens -> ~51 holdout
 
     # Capture BEFORE merge — target = the layer's own pre-merge MoE output.
     cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
@@ -286,7 +315,15 @@ def test_heal_layer_runs_after_bank_select_reindexing():
         heal_cfg=_heal_cfg(), device=_CPU,
     )
     assert state["steps"] > 0
-    assert state["stop_reason"] in ("max_steps", "patience")
+    # The heal must clear the accept threshold by a comfortable margin, not
+    # marginally — a near-tie would be flaky. The heal is fully deterministic
+    # (all RNG seeded) and stably converges to ~0.70× the plain-merged MSE on
+    # this tiny model; 0.85 leaves ample headroom yet still rejects a near-no-op
+    # heal (ratio -> 1.0).
+    assert state["holdout_mse"] < 0.85 * state["plain_merged_holdout_mse"], (
+        f"heal barely improved: holdout {state['holdout_mse']:.6e} vs "
+        f"plain-merged {state['plain_merged_holdout_mse']:.6e}"
+    )
     assert state["accepted"] is True
     after = build_banks(ref)["gate_proj"].get(0).detach()
     assert not torch.equal(before, after), "merged centroid weights did not change"
@@ -298,7 +335,7 @@ def test_heal_layer_all_experts_trainable():
     its weights must move when the heal is accepted."""
     model = _tiny_moe_model()
     ref = list(iter_moe_layers(model))[1]
-    batches = _id_batches(model)
+    batches = _id_batches(model, n_seq=64)  # ~512 tokens -> ~51 holdout
     cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
     _merge_layer(ref, _KEPT)
     singleton_before = build_banks(ref)["down_proj"].get(1).detach().clone()
@@ -308,6 +345,7 @@ def test_heal_layer_all_experts_trainable():
         captured_input=cap_in, captured_target=cap_out,
         heal_cfg=_heal_cfg(), device=_CPU,
     )
+    assert state["holdout_mse"] < 0.85 * state["plain_merged_holdout_mse"]
     assert state["accepted"] is True
     singleton_after = build_banks(ref)["down_proj"].get(1).detach()
     assert not torch.equal(singleton_before, singleton_after), (
@@ -322,6 +360,9 @@ def test_heal_layer_accept_reject_revert():
     only move away → rejected, banks + router byte-identical to the merge."""
     model = _tiny_moe_model()
     ref = list(iter_moe_layers(model))[1]
+    # Default n_seq=16 pool is fine here: the reject path starts at the bf16
+    # noise floor, so the verdict does not depend on pool size — no need for
+    # the n_seq=64 pool the accept tests use.
     batches = _id_batches(model)
     _merge_layer(ref, _KEPT)
     # Target == the plain-merged layer's own output.
@@ -340,6 +381,11 @@ def test_heal_layer_accept_reject_revert():
         device=_CPU,
     )
     assert state["accepted"] is False
+    # Guard against a degenerate _heal_layer that returned accepted=False
+    # without ever training: training ran, and the rejection came from
+    # patience exhaustion (held-out MSE never beat the plain merge).
+    assert state["steps"] > 0
+    assert state["stop_reason"] == "patience"
     banks2 = build_banks(ref)
     for n in MATRIX_NAMES:
         for p in range(len(_KEPT)):
@@ -351,15 +397,17 @@ def test_heal_layer_accept_reject_revert():
 
 def test_heal_layer_router_flag():
     """`merge_heal_train_router` gates router training: the resized router
-    changes iff the flag is True (experts always train regardless)."""
+    changes iff the flag is True. Experts always train regardless — so when
+    the router is frozen the kept experts must STILL move."""
     for train_router in (True, False):
         model = _tiny_moe_model()
         ref = list(iter_moe_layers(model))[1]
-        batches = _id_batches(model)
+        batches = _id_batches(model, n_seq=64)  # ~512 tokens -> ~51 holdout
         cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU,
                                           pool_size=10_000)
         _merge_layer(ref, _KEPT)
         router_after_resize = ref.router.weight.detach().clone()
+        experts_before = build_banks(ref)["gate_proj"].get(0).detach().clone()
 
         state = _heal_layer(
             layer_ref=ref, final_kept_ids=_KEPT,
@@ -367,12 +415,27 @@ def test_heal_layer_router_flag():
             heal_cfg=_heal_cfg(merge_heal_train_router=train_router),
             device=_CPU,
         )
+        assert state["holdout_mse"] < 0.85 * state["plain_merged_holdout_mse"]
         assert state["accepted"] is True
-        router_changed = not torch.equal(
-            ref.router.weight.detach(), router_after_resize)
+
+        router_now = ref.router.weight.detach()
+        router_changed = not torch.equal(router_now, router_after_resize)
         assert router_changed is train_router, (
             f"train_router={train_router} but router_changed={router_changed}"
         )
+        if train_router:
+            # A trained router must move by a MEANINGFUL magnitude, not just
+            # a numerically-noisy `not equal`.
+            delta = (router_now - router_after_resize).abs().max().item()
+            assert delta > 1e-4, f"router barely moved: max |Δ| {delta}"
+        else:
+            # F14/L5: router frozen — but experts still all train, so the
+            # kept-expert banks must have changed.
+            experts_after = build_banks(ref)["gate_proj"].get(0).detach()
+            assert not torch.equal(experts_before, experts_after), (
+                "router frozen but experts did not heal — all kept experts "
+                "must train regardless of merge_heal_train_router"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -381,16 +444,40 @@ def test_heal_layer_router_flag():
 
 
 def test_heal_weights_roundtrip_all_experts(tmp_path):
-    """The per-layer healed-weight checkpoint round-trips EVERY kept expert
-    (merged + singleton) and the router, under format_version 2."""
+    """The per-layer healed-weight checkpoint round-trips the genuinely
+    POST-HEAL weights of EVERY kept expert (merged + singleton) and the
+    router, under format_version 2.
+
+    The checkpoint is written AFTER `_heal_layer` runs (with a pre-merge
+    target so the heal is accepted and the weights genuinely move) — writing
+    immediately after `_merge_layer` would only round-trip plain-merged
+    weights and silently pass even if the heal output were dropped.
+    """
     model = _tiny_moe_model()
     ref = list(iter_moe_layers(model))[1]
-    _merge_layer(ref, _KEPT)
+    batches = _id_batches(model, n_seq=64)
 
+    # Capture BEFORE merge so the heal has a reachable target and is accepted.
+    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU,
+                                      pool_size=10_000)
+    _merge_layer(ref, _KEPT)
+    plain_merged = build_banks(ref)["gate_proj"].get(0).detach().clone()
+
+    state = _heal_layer(
+        layer_ref=ref, final_kept_ids=_KEPT,
+        captured_input=cap_in, captured_target=cap_out,
+        heal_cfg=_heal_cfg(), device=_CPU,
+    )
+    assert state["accepted"] is True, "heal must be accepted for this test"
+
+    # Snapshot the POST-HEAL banks + router — these moved off the plain merge.
     banks = build_banks(ref)
     expected = {n: [banks[n].get(p).detach().clone() for p in range(len(_KEPT))]
                 for n in MATRIX_NAMES}
     router_expected = ref.router.weight.detach().clone()
+    assert not torch.equal(expected["gate_proj"][0], plain_merged), (
+        "heal did not move the weights — round-trip would be vacuous"
+    )
 
     _write_heal_weights(tmp_path, ref, _KEPT, accepted=True)
     pt = tmp_path / f"_heal_weights_layer_{ref.layer_idx}.pt"
@@ -400,7 +487,8 @@ def test_heal_weights_roundtrip_all_experts(tmp_path):
     assert payload["accepted"] is True
     assert len(payload["healed_experts"]) == len(_KEPT)  # ALL kept experts
 
-    # Perturb the banks, then reload — every kept expert must be restored.
+    # Perturb the banks, then reload — every kept expert must be restored to
+    # its POST-HEAL state.
     banks2 = build_banks(ref)
     with torch.no_grad():
         for n in MATRIX_NAMES:
@@ -415,3 +503,8 @@ def test_heal_weights_roundtrip_all_experts(tmp_path):
                 f"{n}[{p}] did not round-trip"
             )
     assert torch.allclose(ref.router.weight.detach(), router_expected, atol=1e-5)
+
+    # F14: the `accepted` payload field round-trips False as well as True.
+    _write_heal_weights(tmp_path, ref, _KEPT, accepted=False)
+    payload_rej = torch.load(pt, map_location="cpu", weights_only=True)
+    assert payload_rej["accepted"] is False

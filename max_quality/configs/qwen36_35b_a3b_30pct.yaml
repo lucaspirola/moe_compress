@@ -199,7 +199,7 @@ stage2_reap_ream:
                                    # false: router frozen (resized only),
                                    # experts still all train
   merge_heal_lr: 1.0e-4            # fp32 AdamW learning rate
-  merge_heal_adamw_betas: [0.9, 0.95]
+  merge_heal_adamw_betas: [0.9, 0.95]  # AdamW beta1 / beta2
   merge_heal_grad_clip: 1.0        # max grad norm (clip_grad_norm_)
   merge_heal_holdout_fraction: 0.10  # 90/10 train/held-out split
   merge_heal_patience: 5           # early-stop: held-out evals w/o improvement
