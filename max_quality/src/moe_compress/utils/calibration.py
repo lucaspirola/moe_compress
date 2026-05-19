@@ -103,6 +103,18 @@ class CalibrationSpec:
 # ---------------------------------------------------------------------------
 
 
+def shared_calibration_cache_dir(artifacts_dir: str | Path) -> Path:
+    """Resolve the calibration-tensor cache dir to the run-shared ``_shared/``.
+
+    A calibration tensor depends only on the corpus + tokenizer + spec — never
+    on which ablation row is running. Caching it under a per-ablation dir means
+    every row (and every re-run, since per-ablation dirs get wiped) re-streams
+    the corpus from scratch. ``artifacts_dir`` is an ablation row's dir; its
+    parent is the ablations root that holds the persistent ``_shared/``.
+    """
+    return Path(artifacts_dir).parent / "_shared" / "_calibration_cache"
+
+
 def build_calibration_tensor(
     tokenizer,
     spec: CalibrationSpec,

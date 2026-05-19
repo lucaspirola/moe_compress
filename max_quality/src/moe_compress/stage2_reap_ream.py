@@ -60,7 +60,12 @@ from .utils.activation_hooks import (
     instrument_experts,
     record_reap,
 )
-from .utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
+from .utils.calibration import (
+    build_calibration_tensor,
+    iter_batches,
+    shared_calibration_cache_dir,
+    spec_from_config,
+)
 from .utils.model_io import (
     MATRIX_NAMES,
     MoELayerRef,
@@ -233,7 +238,8 @@ def run(
 
     spec = spec_from_config(cal, num_sequences_override=s2["num_calibration_samples"])
     calib = build_calibration_tensor(
-        tokenizer, spec, cache_dir=(os.environ.get("MOE_CALIB_CACHE_DIR") or (artifacts_dir / "_calibration_cache"))
+        tokenizer, spec,
+        cache_dir=(os.environ.get("MOE_CALIB_CACHE_DIR") or shared_calibration_cache_dir(artifacts_dir)),
     )
     batches = iter_batches(calib, batch_size=s2["batch_size"])
     assert isinstance(batches, list), "iter_batches must return a list for multi-pass re-iteration"

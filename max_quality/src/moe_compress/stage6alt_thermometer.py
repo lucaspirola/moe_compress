@@ -55,6 +55,7 @@ from .utils.calibration import (
     CalibrationSpec,
     build_calibration_tensor,
     iter_batches,
+    shared_calibration_cache_dir,
     spec_from_config,
 )
 from .utils.model_io import load_model, save_json_artifact
@@ -289,7 +290,8 @@ def _build_thermo_corpus(config: dict, tokenizer, artifacts_dir: Path):
     if corpus == "nemotron":
         spec = _thermo_corpus_spec(config)
         calib = build_calibration_tensor(
-            tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache",
+            tokenizer, spec,
+            cache_dir=(os.environ.get("MOE_CALIB_CACHE_DIR") or shared_calibration_cache_dir(artifacts_dir)),
         )
         corpus_meta = {
             "name": "nemotron",
