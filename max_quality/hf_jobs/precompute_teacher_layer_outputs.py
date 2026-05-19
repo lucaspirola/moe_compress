@@ -42,9 +42,14 @@ Run it:
 #     "huggingface_hub>=0.26.0",
 #     "einops>=0.8.0",
 #     "numpy>=1.26.0",
+#     "scipy>=1.11.0",
 #     "pyyaml>=6.0",
 # ]
 # ///
+#
+# NOTE: scipy is required transitively — this script imports
+# `moe_compress.stage2_reap_ream` (for `_HEAL_SIDECAR_FORMAT_VERSION`), and that
+# module imports `scipy.optimize.linear_sum_assignment`.
 
 from __future__ import annotations
 
