@@ -114,6 +114,16 @@ class _HealConfig:
         self.train_router: bool = bool(s2.get("merge_heal_train_router", True))
         self.lr: float = float(s2.get("merge_heal_lr", 1.0e-4))
         _betas = s2.get("merge_heal_adamw_betas", [0.9, 0.95])
+        # This guard runs unconditionally (not gated on self.enabled) because
+        # the (float(_betas[0]), float(_betas[1])) unpack below is itself
+        # unconditional — a scalar or a string would otherwise crash there with
+        # an opaque TypeError / produce float("0")-style nonsense.
+        if not isinstance(_betas, (list, tuple)) or len(_betas) != 2:
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_adamw_betas={_betas}; "
+                "must be a length-2 list [beta1, beta2] of exactly two "
+                "numeric values."
+            )
         self.adamw_betas: tuple[float, float] = (float(_betas[0]), float(_betas[1]))
         self.grad_clip: float = float(s2.get("merge_heal_grad_clip", 1.0))
         self.holdout_fraction: float = float(s2.get("merge_heal_holdout_fraction", 0.10))
@@ -135,6 +145,16 @@ class _HealConfig:
                 f"stage2_reap_ream.merge_heal_grad_clip={self.grad_clip}; "
                 "must be > 0."
             )
+        if self.lr <= 0.0:
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_lr={self.lr}; must be > 0."
+            )
+        for _idx, _beta in enumerate(self.adamw_betas):
+            if not (0.0 <= _beta < 1.0):
+                raise ValueError(
+                    f"stage2_reap_ream.merge_heal_adamw_betas[{_idx}]={_beta}; "
+                    "must be in [0.0, 1.0)."
+                )
         if not (0.0 < self.holdout_fraction < 1.0):
             raise ValueError(
                 f"stage2_reap_ream.merge_heal_holdout_fraction="
@@ -151,6 +171,15 @@ class _HealConfig:
                 raise ValueError(
                     f"stage2_reap_ream.{_name}={_val}; must be >= 1."
                 )
+        # The held-out eval (and hence accept/reject + save-best) only fires
+        # at multiples of eval_interval. If eval_interval > max_steps it never
+        # runs, so every layer would be silently REJECTED — fail fast instead.
+        if self.eval_interval > self.max_steps:
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_eval_interval={self.eval_interval} "
+                f"exceeds merge_heal_max_steps={self.max_steps}; the held-out "
+                "eval would never run and every layer would be rejected."
+            )
 
 
 def run(
@@ -404,8 +433,13 @@ def run(
 
             # Merge-heal resume: a completed layer's post-heal weights are not
             # reconstructible from merge_*.json — reload them so the in-memory
-            # model matches the state the heal left.
-            if heal_cfg.enabled:
+            # model matches the state the heal left. A 0-merge layer has no
+            # heal-weights file (the heal is skipped, heal_state stays None);
+            # its banks are already fully reconstructed above, so gate the load
+            # on the file existing — mirror the _write_heal_weights condition.
+            if heal_cfg.enabled and (
+                partial_dir / f"_heal_weights_layer_{ref.layer_idx}.pt"
+            ).exists():
                 _load_heal_weights(partial_dir, ref, final_kept_ids)
 
             try:
@@ -2518,23 +2552,31 @@ def _capture_mlp_io(
 
     Returns two CPU bf16 ``[n, hidden]`` tensors with ``n == min(pool_size,
     total calibration tokens)``; row ``i`` of both is the same token. The
-    pools are a contiguous prefix of the (already randomly-drawn) calibration
-    tokens — no reservoir sampling needed, and the forward loop stops early
-    once ``pool_size`` rows are in hand.
+    pools are a contiguous prefix of the calibration tokens, and the forward
+    loop stops early once ``pool_size`` rows are in hand.
+
+    The prefix is an UNBIASED uniform sample — NOT because of any sampling
+    here, but because :func:`build_calibration_tensor`
+    (``utils/calibration.py``) globally shuffles every calibration sequence
+    with ``torch.randperm`` before they are batched. The first N sequences
+    are therefore already a uniform random draw from the full corpus, so a
+    contiguous prefix of their tokens is itself a uniform random sample. No
+    reservoir sampling is needed (and adding it would be redundant).
     """
     layer_idx = layer_ref.layer_idx
     in_chunks: list[torch.Tensor] = []
     out_chunks: list[torch.Tensor] = []
-    captured = [0]
+    captured = 0
 
     def _hook(_module, inputs, output):
+        nonlocal captured
         x_in = inputs[0]
         x_out = output[0] if isinstance(output, tuple) else output
         in_flat = x_in.reshape(-1, x_in.shape[-1]).detach().to("cpu", torch.bfloat16)
         out_flat = x_out.reshape(-1, x_out.shape[-1]).detach().to("cpu", torch.bfloat16)
         in_chunks.append(in_flat)
         out_chunks.append(out_flat)
-        captured[0] += in_flat.shape[0]
+        captured += in_flat.shape[0]
 
     handle = layer_ref.mlp.register_forward_hook(_hook)
     was_training = model.training
@@ -2542,7 +2584,10 @@ def _capture_mlp_io(
     try:
         with early_exit_after_layer(model, layer_idx):
             for batch in calib_batches:
-                if captured[0] >= pool_size:
+                if captured >= pool_size:
+                    # Checked once per batch, so capture may overshoot
+                    # pool_size by up to one full batch — deliberate; the
+                    # final [:pool_size] slice below truncates the excess.
                     break
                 with torch.no_grad():
                     try:
@@ -2561,10 +2606,27 @@ def _capture_mlp_io(
         )
     x_in = torch.cat(in_chunks, dim=0)[:pool_size].contiguous()
     x_out = torch.cat(out_chunks, dim=0)[:pool_size].contiguous()
+    if x_in.shape[0] < pool_size:
+        log.warning(
+            "  merge-heal capture: layer %d — calibration data starved: "
+            "%d token rows captured vs requested pool_size=%d; healing will "
+            "proceed with the smaller pool.",
+            layer_idx, x_in.shape[0], pool_size,
+        )
     if x_in.shape != x_out.shape:
         raise RuntimeError(
             f"merge-heal capture: layer {layer_idx} input/target pools "
             f"misaligned ({tuple(x_in.shape)} vs {tuple(x_out.shape)})."
+        )
+    # Sanity-check the captured feature dimension against the model's hidden
+    # size: a wrong hook point (or a tuple-unpack bug) would surface here as a
+    # mismatched last dim rather than as a confusing downstream matmul error.
+    expected_hidden = layer_ref.router.weight.shape[-1]
+    if x_in.shape[-1] != expected_hidden:
+        raise RuntimeError(
+            f"merge-heal capture: layer {layer_idx} captured feature dim "
+            f"{x_in.shape[-1]} != model hidden size {expected_hidden} — the "
+            "mlp forward hook captured the wrong tensor."
         )
     log.info(
         "  merge-heal capture: layer %d — %d (input,target) token rows "
@@ -2848,10 +2910,17 @@ def _heal_layer(
                       for n in MATRIX_NAMES}
                 for cid in healed_experts
             },
-            "router_weight": router_weight.detach().to("cpu").clone(),
+            # Router params are cloned only when trained — the restore block
+            # below is guarded by `if heal_cfg.train_router`, so a frozen
+            # router's snapshot data would be dead weight.
+            "router_weight": (
+                router_weight.detach().to("cpu").clone()
+                if heal_cfg.train_router else None
+            ),
             "router_bias": (
                 router_bias_p.detach().to("cpu").clone()
-                if router_bias_p is not None else None
+                if (heal_cfg.train_router and router_bias_p is not None)
+                else None
             ),
         }
 
@@ -2921,17 +2990,23 @@ def _heal_layer(
             pos = pos_of[cid]  # banks are post-select position-indexed
             for name in MATRIX_NAMES:
                 banks[name].set(pos, restore_state["experts"][cid][name].to(bank_dtype))
-        _rw = router.weight
-        router.weight = nn.Parameter(
-            restore_state["router_weight"].to(device=_rw.device, dtype=_rw.dtype),
-            requires_grad=_rw.requires_grad,
-        )
-        if getattr(router, "bias", None) is not None and restore_state["router_bias"] is not None:
-            _rb = router.bias
-            router.bias = nn.Parameter(
-                restore_state["router_bias"].to(device=_rb.device, dtype=_rb.dtype),
-                requires_grad=_rb.requires_grad,
+        # Only reinstall the router when it was actually trained. With
+        # train_router=False the router was never an optimizer parameter, so
+        # router.weight/bias still hold exactly what the mechanical resize
+        # left — reinstalling would be a wasteful no-op that also obscures the
+        # frozen-router contract.
+        if heal_cfg.train_router:
+            _rw = router.weight
+            router.weight = nn.Parameter(
+                restore_state["router_weight"].to(device=_rw.device, dtype=_rw.dtype),
+                requires_grad=_rw.requires_grad,
             )
+            if getattr(router, "bias", None) is not None and restore_state["router_bias"] is not None:
+                _rb = router.bias
+                router.bias = nn.Parameter(
+                    restore_state["router_bias"].to(device=_rb.device, dtype=_rb.dtype),
+                    requires_grad=_rb.requires_grad,
+                )
 
     # heal_gap pairs the best held-out MSE with the train MSE recorded at the
     # SAME step (train_mse_at_best). If no eval ever improved on the initial
@@ -3021,9 +3096,16 @@ def _load_heal_weights(
 
     Used by the resume path: a layer that completed its heal in a prior run
     has a healed-weights file; reload it so the in-memory model matches the
-    state the heal left. A missing file is fatal (the post-heal weights cannot
-    be regenerated from ``merge_*.json``) — the operator must delete
+    state the heal left. A missing file is fatal — the operator must delete
     ``_stage2_partial/`` and re-run.
+
+    For an ACCEPTED layer the persisted weights are genuinely post-heal and
+    are NOT reconstructible from ``merge_*.json``. For a REJECTED layer the
+    banks were reverted to the plain merge, so the file simply re-persists
+    that plain-merged state. The file is written for every *merged* layer
+    regardless of the accept/reject outcome, and reloaded here on resume
+    whenever it is present; a 0-merge layer has no heal-weights file (the
+    heal is skipped), so the caller gates this load on the file existing.
     """
     layer_idx = layer_ref.layer_idx
     path = partial_dir / f"_heal_weights_layer_{layer_idx}.pt"

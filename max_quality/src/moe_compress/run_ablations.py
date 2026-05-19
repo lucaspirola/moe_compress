@@ -195,10 +195,14 @@ ABLATION_DELTAS: list[tuple[str, dict[str, Any]]] = [
     ("SC",  {"cost_alignment": "output", "capacity_util_threshold": 0}),    # C: output-space merge cost
     ("SCD", {"cost_alignment": "output", "capacity_util_threshold": 0, "two_opt_refine": True}),  # C+D
     ("SE",  {"stage5_router_kd": {"merge_repair": {"enabled": True, "mse_weight": 1.0}}}),         # E: merge-repair
-    # H: per-layer merge-heal by self-distillation. SH heals experts + router;
-    #    SHR heals experts only (router frozen at its resize — Stage 2.5 owns it).
-    ("SH",  {"merge_heal_enabled": True, "merge_heal_train_router": True}),   # H: heal experts + router
-    ("SHR", {"merge_heal_enabled": True, "merge_heal_train_router": False}),  # H: heal experts, router frozen
+    # H: per-layer merge-heal by self-distillation. BOTH rows heal ALL kept
+    #    experts (merged centroids + singletons). They differ only in the
+    #    router: SH also trains the resized router; SHR freezes the router at
+    #    its mechanical resize (merge_heal_train_router=False) but STILL heals
+    #    every kept expert — SHR is not a no-op heal, it leaves the router to
+    #    Stage 2.5's router-KD.
+    ("SH",  {"merge_heal_enabled": True, "merge_heal_train_router": True}),   # SH: heal all experts + router
+    ("SHR", {"merge_heal_enabled": True, "merge_heal_train_router": False}),  # SHR: heal all experts, router frozen
 ]
 
 
