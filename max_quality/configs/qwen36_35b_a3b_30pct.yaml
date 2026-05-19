@@ -187,28 +187,27 @@ stage2_reap_ream:
   expert_distill_loss_plateau_eps: 1.0e-4
   expert_distill_parallel_groups: 1
   expert_distill_optimizer_dtype: "fp32"
-  # Per-layer merge-heal (opt-in; sweep row SH). After a layer is merged, heal
-  # its merged centroids + router toward the teacher's same-layer MoE-block
-  # output (a precomputed disk sidecar). All keys default OFF/inert — with
-  # merge_heal_enabled=false Stage 2 output is byte-identical to the baseline.
+  # Per-layer merge-heal (opt-in; sweep rows SH / SHR). After a layer is
+  # merged, heal it by SELF-DISTILLATION: train its kept experts (+ optionally
+  # the resized router) so the merged layer reproduces its OWN pre-merge
+  # MoE-block output on calibration tokens captured in-process — no teacher,
+  # no sidecar. A monotone-safe accept/reject guard reverts any layer the heal
+  # fails to improve. All keys default OFF/inert — with merge_heal_enabled=false
+  # Stage 2 output is byte-identical to the baseline.
   merge_heal_enabled: false        # master gate
-  merge_heal_sidecar_path: null    # teacher-layer-output sidecar from
-                                   # hf_jobs/precompute_teacher_layer_outputs.py;
-                                   # relative paths resolve under artifacts_dir
-  merge_heal_token_budget: 524288  # heal calibration tokens (anti-overfit floor)
-  merge_heal_seed_offset: 2        # calibration seed namespace; MUST be disjoint
-                                   # from Stage 2.5's (5) and match the sidecar
-  merge_heal_optimizer: "muon"     # "muon" | "adamw"
-  merge_heal_lr: 2.0e-3
-  merge_heal_muon_momentum: 0.95
+  merge_heal_train_router: true    # true: heal the resized router too;
+                                   # false: router frozen (resized only),
+                                   # experts still all train
+  merge_heal_lr: 1.0e-4            # fp32 AdamW learning rate
   merge_heal_adamw_betas: [0.9, 0.95]
+  merge_heal_grad_clip: 1.0        # max grad norm (clip_grad_norm_)
   merge_heal_holdout_fraction: 0.10  # 90/10 train/held-out split
   merge_heal_patience: 5           # early-stop: held-out evals w/o improvement
   merge_heal_eval_interval: 25     # steps between held-out MSE evals
   merge_heal_max_steps: 2000       # safety cap; step count is early-stop-driven
-  merge_heal_token_cap: 65536      # max tokens trained on per layer (fixed pool)
+  merge_heal_token_cap: 262144     # captured (input,target) pool size per layer
   merge_heal_minibatch_size: 8192  # rows per training step / held-out eval chunk
-                                   # — minibatches drawn from the fixed pool;
+                                   # — minibatches drawn from the captured pool;
                                    # bounds peak GPU memory on wide layers
 
 stage3_svd:

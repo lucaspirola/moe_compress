@@ -64,14 +64,12 @@ from .utils.calibration import build_calibration_tensor, iter_batches, spec_from
 from .utils.model_io import (
     MATRIX_NAMES,
     MoELayerRef,
-    _find_text_tower,
     build_banks,
     iter_moe_layers,
     load_json_artifact,
     save_compressed_checkpoint,
     save_json_artifact,
 )
-from .utils.muon import Muon
 from .utils.runtime_monitor import snapshot_telemetry as _rt_snap, update as _rt_update
 from .utils.trackio_log import trackio_log as _trackio_log
 
@@ -81,21 +79,19 @@ log = logging.getLogger(__name__)
 # ===========================================================================
 # Stage-2 per-layer merge-heal (opt-in; inert when merge_heal_enabled=False)
 # ---------------------------------------------------------------------------
-# After Stage 2 merges a layer, optionally fine-tune that layer's merged
-# centroid experts + its resized router so the layer reproduces the TEACHER's
-# same-layer MoE-block output on calibration tokens. The teacher signal is a
-# precomputed disk sidecar (Stage 2 loads no teacher object).
+# After Stage 2 merges a layer, optionally fine-tune that layer's kept experts
+# (+ optionally its resized router) by SELF-DISTILLATION: the layer is trained
+# to reproduce its OWN pre-merge MoE-block output on calibration tokens. The
+# (input, target) pairs are captured in-process from the layer itself just
+# before the merge — no teacher object, no disk sidecar, no cascade buffer.
 #
 # Every code path below is reached ONLY when `merge_heal_enabled` is True. With
 # the flag off, none of this runs and Stage 2 behaviour is byte-identical to
 # the pre-feature code.
 # ===========================================================================
 
-# Sidecar payload schema version produced by
-# hf_jobs/precompute_teacher_layer_outputs.py. Must match exactly.
-_HEAL_SIDECAR_FORMAT_VERSION = 1
 # Per-layer healed-weight checkpoint schema version.
-_HEAL_WEIGHTS_FORMAT_VERSION = 1
+_HEAL_WEIGHTS_FORMAT_VERSION = 2
 
 
 class _HealConfig:
@@ -108,34 +104,23 @@ class _HealConfig:
     """
 
     __slots__ = (
-        "enabled", "sidecar_path", "token_budget", "seed_offset", "optimizer",
-        "lr", "muon_momentum", "adamw_betas", "holdout_fraction", "patience",
-        "eval_interval", "max_steps", "token_cap", "minibatch_size",
+        "enabled", "train_router", "lr", "adamw_betas", "grad_clip",
+        "holdout_fraction", "patience", "eval_interval", "max_steps",
+        "token_cap", "minibatch_size",
     )
 
-    def __init__(self, s2: dict, artifacts_dir: Path) -> None:
+    def __init__(self, s2: dict) -> None:
         self.enabled: bool = bool(s2.get("merge_heal_enabled", False))
-
-        raw_path = s2.get("merge_heal_sidecar_path", None)
-        if raw_path is None:
-            self.sidecar_path: Path | None = None
-        else:
-            p = Path(str(raw_path)).expanduser()
-            # Relative paths resolve under artifacts_dir.
-            self.sidecar_path = p if p.is_absolute() else (artifacts_dir / p)
-
-        self.token_budget: int = int(s2.get("merge_heal_token_budget", 524288))
-        self.seed_offset: int = int(s2.get("merge_heal_seed_offset", 2))
-        self.optimizer: str = str(s2.get("merge_heal_optimizer", "muon")).lower()
-        self.lr: float = float(s2.get("merge_heal_lr", 2.0e-3))
-        self.muon_momentum: float = float(s2.get("merge_heal_muon_momentum", 0.95))
+        self.train_router: bool = bool(s2.get("merge_heal_train_router", True))
+        self.lr: float = float(s2.get("merge_heal_lr", 1.0e-4))
         _betas = s2.get("merge_heal_adamw_betas", [0.9, 0.95])
         self.adamw_betas: tuple[float, float] = (float(_betas[0]), float(_betas[1]))
+        self.grad_clip: float = float(s2.get("merge_heal_grad_clip", 1.0))
         self.holdout_fraction: float = float(s2.get("merge_heal_holdout_fraction", 0.10))
         self.patience: int = int(s2.get("merge_heal_patience", 5))
         self.eval_interval: int = int(s2.get("merge_heal_eval_interval", 25))
         self.max_steps: int = int(s2.get("merge_heal_max_steps", 2000))
-        self.token_cap: int = int(s2.get("merge_heal_token_cap", 65536))
+        self.token_cap: int = int(s2.get("merge_heal_token_cap", 262144))
         self.minibatch_size: int = int(
             s2.get("merge_heal_minibatch_size", 8192)
         )
@@ -145,16 +130,10 @@ class _HealConfig:
 
         # Validate only when the feature is active so a disabled run with a
         # partially-specified block never fails.
-        if self.sidecar_path is None:
-            raise RuntimeError(
-                "stage2_reap_ream.merge_heal_enabled=True but "
-                "merge_heal_sidecar_path is unset — point it at the sidecar "
-                "produced by hf_jobs/precompute_teacher_layer_outputs.py."
-            )
-        if self.optimizer not in ("muon", "adamw"):
+        if self.grad_clip <= 0.0:
             raise ValueError(
-                f"stage2_reap_ream.merge_heal_optimizer={self.optimizer!r}; "
-                "expected 'muon' or 'adamw'."
+                f"stage2_reap_ream.merge_heal_grad_clip={self.grad_clip}; "
+                "must be > 0."
             )
         if not (0.0 < self.holdout_fraction < 1.0):
             raise ValueError(
@@ -162,7 +141,6 @@ class _HealConfig:
                 f"{self.holdout_fraction}; must be in (0.0, 1.0)."
             )
         for _name, _val in (
-            ("merge_heal_token_budget", self.token_budget),
             ("merge_heal_patience", self.patience),
             ("merge_heal_eval_interval", self.eval_interval),
             ("merge_heal_max_steps", self.max_steps),
@@ -173,380 +151,6 @@ class _HealConfig:
                 raise ValueError(
                     f"stage2_reap_ream.{_name}={_val}; must be >= 1."
                 )
-
-
-def _load_heal_sidecar(
-    heal_cfg: "_HealConfig",
-    heal_spec,
-    model_name: str,
-) -> dict:
-    """Load + validate the precomputed teacher-layer-output sidecar.
-
-    The sidecar is ``torch.load``-ed memory-mapped (it is ~84 GB on disk for
-    the production budget). Validation is strict: a mismatch means the sidecar
-    was produced for a different model / calibration slice and using it would
-    silently train every layer toward the wrong target.
-
-    Args:
-        heal_cfg:    the validated merge-heal config (``sidecar_path`` set).
-        heal_spec:   the ``CalibrationSpec`` the consumer built for the heal
-                     calibration slice — its ``cache_key`` must match the
-                     sidecar's recorded ``calib_cache_key``.
-        model_name:  ``config["model"]["name_or_path"]`` — feeds the cache key.
-
-    Returns the loaded payload dict.
-    """
-    path = heal_cfg.sidecar_path
-    if path is None or not path.exists():
-        raise RuntimeError(
-            f"Stage-2 merge-heal: teacher sidecar not found at {path}. "
-            "Produce it with hf_jobs/precompute_teacher_layer_outputs.py and "
-            "set stage2_reap_ream.merge_heal_sidecar_path."
-        )
-    payload = torch.load(path, map_location="cpu", mmap=True)
-
-    fv = int(payload.get("format_version", 0))
-    if fv != _HEAL_SIDECAR_FORMAT_VERSION:
-        raise RuntimeError(
-            f"Stage-2 merge-heal sidecar {path} has format_version={fv} "
-            f"(expected {_HEAL_SIDECAR_FORMAT_VERSION}) — regenerate it with "
-            "the current hf_jobs/precompute_teacher_layer_outputs.py."
-        )
-    seed_off = int(payload.get("calibration_seed_offset", -1))
-    if seed_off != heal_cfg.seed_offset:
-        raise RuntimeError(
-            f"Stage-2 merge-heal sidecar {path} was built with "
-            f"calibration_seed_offset={seed_off}, but the configured "
-            f"merge_heal_seed_offset={heal_cfg.seed_offset}. The heal "
-            "calibration slice would not be row-aligned with the sidecar — "
-            "regenerate the sidecar or fix merge_heal_seed_offset."
-        )
-    expected_key = heal_spec.cache_key(model_name)
-    sidecar_key = str(payload.get("calib_cache_key", ""))
-    if sidecar_key != expected_key:
-        raise RuntimeError(
-            f"Stage-2 merge-heal sidecar {path} calib_cache_key={sidecar_key!r} "
-            f"does not match the heal calibration spec key {expected_key!r}. "
-            "The sidecar was produced for a different model / calibration "
-            "configuration — regenerate it against this run's config."
-        )
-    if "layer_outputs" not in payload or "n_tokens" not in payload:
-        raise RuntimeError(
-            f"Stage-2 merge-heal sidecar {path} is missing required keys "
-            "('layer_outputs' / 'n_tokens') — file is corrupt."
-        )
-    return payload
-
-
-def _capture_decoder_layer_kwargs(
-    model,
-    text_tower,
-    sample_ids: torch.Tensor,
-    device,
-) -> dict[int, dict]:
-    """Capture the exact non-hidden-state kwargs EVERY decoder layer is called with.
-
-    Advancing the activation-cascade buffer means calling each decoder layer
-    directly with a ``[chunk, seq_len, hidden]`` tensor. Decoder layers need
-    ``position_embeddings`` (RoPE cos/sin), an attention mask, and
-    ``position_ids``. CRITICALLY, these are NOT uniform across layers:
-    Qwen3.5-MoE interleaves ``linear_attention`` and ``full_attention`` layer
-    types (``config.layer_types``) and the tower's forward selects a DIFFERENT
-    attention mask per layer type — ``layers[0]`` (``linear_attention``) gets a
-    ``None`` mask, a ``full_attention`` layer gets the causal mask. So the
-    kwargs must be captured PER LAYER INDEX, not once.
-
-    A temporary ``forward_pre_hook`` is registered on EVERY ``text_tower.layers[i]``;
-    each records the exact ``(args, kwargs)`` that layer was invoked with. One
-    real model forward over a representative batch then snapshots every layer's
-    call kwargs at once. The hidden-state positional arg is dropped (the caller
-    supplies its own).
-
-    Args:
-        model:       the full model (so ``model(input_ids=...)`` runs the
-                     normal forward, building RoPE + the per-layer-type masks).
-        text_tower:  the decoder tower (owns ``.layers``).
-        sample_ids:  ``[batch, seq_len]`` input-id batch — its batch size
-                     defines the shape these kwargs are valid for.
-        device:      device to place ``sample_ids`` on for the forward.
-
-    Returns ``dict[layer_idx] -> kwargs`` — each kwargs dict has the
-    hidden-state arg removed, keyed by the decoder layer's keyword parameter
-    names (``position_embeddings``, ``attention_mask``, ``position_ids``, ...).
-    """
-    captured: dict[int, dict] = {}
-
-    def _make_pre_hook(layer_idx: int):
-        def _pre_hook(_module, args, kwargs):
-            # Decoder layer is called as forward(hidden_states,
-            # position_embeddings=..., attention_mask=..., position_ids=...,
-            # **kwargs). The target Qwen3.5-MoE tower passes position_embeddings
-            # as a keyword; the args[1] recovery below is defensive in case a
-            # tower passes it positionally — harmless when it does not.
-            kw = dict(kwargs)
-            if len(args) >= 2 and "position_embeddings" not in kw:
-                kw["position_embeddings"] = args[1]
-            # Neutralise KV-cache state: the capture forward runs with
-            # config.use_cache=True, so the model hands every layer a shared,
-            # stateful DynamicCache. Replaying decoder layers with that cache
-            # would APPEND keys/values (full-attention layers then see
-            # 2*seq_len KV against a seq_len query → shape error / silent
-            # corruption). The cascade replay is always a fresh, cacheless
-            # forward — force a stateless call.
-            kw["past_key_values"] = None
-            kw["use_cache"] = False
-            captured[layer_idx] = kw
-        return _pre_hook
-
-    handles = [
-        layer.register_forward_pre_hook(_make_pre_hook(i), with_kwargs=True)
-        for i, layer in enumerate(text_tower.layers)
-    ]
-    try:
-        was_training = model.training
-        model.train(False)
-        with torch.no_grad():
-            model(input_ids=sample_ids.to(device))
-        if was_training:
-            model.train(True)
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    if len(captured) != len(text_tower.layers):
-        raise RuntimeError(
-            "Stage-2 merge-heal: failed to capture decoder-layer call kwargs "
-            f"for every layer (got {len(captured)} / {len(text_tower.layers)} "
-            "— a forward_pre_hook never fired)."
-        )
-    return captured
-
-
-class _CascadeBuffer:
-    """CPU bf16 ``[n_tokens, hidden]`` activation buffer for the merge-heal.
-
-    Healing layer N needs the STUDENT's layer-N input, row-aligned with the
-    teacher sidecar's ``layer_outputs[N]`` and reflecting every already-merged-
-    and-healed upstream layer. This buffer is seeded with the first decoder
-    layer's input (token embeddings) and advanced ONE decoder layer at a time,
-    in lockstep with the Stage-2 merge loop.
-
-    Memory: ~2 GB for 512k tokens at hidden=2048 bf16 — kept on CPU; each chunk
-    is moved to the model device for the layer call and the result moved back.
-    """
-
-    def __init__(
-        self,
-        model,
-        text_tower,
-        heal_calib_ids: torch.Tensor,
-        *,
-        seq_len: int,
-        batch_size: int,
-        device,
-    ) -> None:
-        self._model = model
-        self._tower = text_tower
-        self._seq_len = int(seq_len)
-        self._batch_size = int(batch_size)
-        self._device = device
-        # Cursor over text_tower.layers — index of the NEXT decoder layer the
-        # buffer will be advanced through. 0 = buffer holds layers[0]'s input.
-        self.cursor = 0
-
-        n_seq = heal_calib_ids.shape[0]
-        if heal_calib_ids.shape[1] != self._seq_len:
-            raise RuntimeError(
-                f"_CascadeBuffer: heal_calib_ids seq dim {heal_calib_ids.shape[1]} "
-                f"!= seq_len {self._seq_len}"
-            )
-        self._heal_calib_ids = heal_calib_ids
-
-        # Per-layer-type attention masks differ across decoder layers, so the
-        # call kwargs are captured PER LAYER INDEX (see
-        # _capture_decoder_layer_kwargs). They are also batch-shaped, so we
-        # capture once per distinct batch size: the full batch size and the
-        # last partial batch size (if any). Capturing is done EAGERLY here, in
-        # __init__, while the model is still pristine — no full forward is run
-        # mid-merge-loop.
-        # captured[batch_size][layer_idx] -> kwargs dict.
-        self._kwargs_by_bs: dict[int, dict[int, dict]] = {}
-        distinct_bs: list[int] = [self._batch_size]
-        last_bs = n_seq % self._batch_size
-        if last_bs and last_bs != self._batch_size:
-            distinct_bs.append(last_bs)
-        for bs in distinct_bs:
-            self._kwargs_by_bs[bs] = _capture_decoder_layer_kwargs(
-                self._model, self._tower, heal_calib_ids[:bs], self._device,
-            )
-
-        # Seed: first decoder layer's input = embed_tokens(heal_calib_ids),
-        # computed batch-by-batch in fixed token order.
-        embed = self._tower.embed_tokens
-        embed_dev = next(embed.parameters()).device
-        seeds: list[torch.Tensor] = []
-        with torch.no_grad():
-            for i in range(0, n_seq, self._batch_size):
-                ids = heal_calib_ids[i:i + self._batch_size].to(embed_dev)
-                h = embed(ids)  # [chunk, seq_len, hidden]
-                seeds.append(h.reshape(-1, h.shape[-1]).to("cpu", torch.bfloat16))
-        self.buffer = torch.cat(seeds, dim=0).contiguous()
-        self.n_tokens = self.buffer.shape[0]
-        self.hidden = self.buffer.shape[1]
-
-    def _layer_kwargs(self, bs: int, layer_idx: int) -> dict:
-        """Return ``layers[layer_idx]``'s call kwargs for a batch of ``bs`` rows.
-
-        For a ``full_attention`` layer under ``eager`` attention the replayed
-        ``attention_mask`` must not be ``None`` — eager has no ``is_causal``
-        short-circuit, so a ``None`` mask would make the layer attend
-        bidirectionally. Under ``sdpa`` / flash attention a ``None`` mask is the
-        CORRECT value: ``create_causal_mask`` deliberately returns ``None`` for
-        an unpadded full-attention layer (transformers
-        ``masking_utils._ignore_causal_mask_sdpa``) and causality is applied via
-        SDPA's ``is_causal`` flag (the attention module carries
-        ``is_causal=True``). The capture is a faithful pre-hook record of the
-        exact kwargs the model passed, so replaying ``None`` reproduces the
-        model's causal behaviour. The hard-assert therefore only fires for
-        ``eager``, where a ``None`` mask is a genuine capture bug.
-        """
-        by_layer = self._kwargs_by_bs.get(bs)
-        if by_layer is None:
-            raise RuntimeError(
-                f"_CascadeBuffer: no captured kwargs for batch size {bs} "
-                f"(captured sizes: {sorted(self._kwargs_by_bs)})."
-            )
-        kw = by_layer.get(layer_idx)
-        if kw is None:
-            raise RuntimeError(
-                f"_CascadeBuffer: no captured kwargs for layer {layer_idx}."
-            )
-        layer_types = getattr(
-            getattr(self._tower, "config", None), "layer_types", None
-        )
-        attn_impl = str(getattr(
-            getattr(self._tower, "config", None), "_attn_implementation", ""
-        )).lower()
-        causal_via_flag = attn_impl in (
-            "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4",
-        )
-        if (
-            layer_types is not None
-            and 0 <= layer_idx < len(layer_types)
-            and str(layer_types[layer_idx]) == "full_attention"
-            and kw.get("attention_mask") is None
-            and not causal_via_flag
-        ):
-            raise RuntimeError(
-                f"_CascadeBuffer: layer {layer_idx} is a full_attention layer "
-                f"under attn_implementation={attn_impl!r} but its replayed "
-                "attention_mask is None — eager attention needs an explicit "
-                "causal mask, so the per-layer kwargs capture is broken."
-            )
-        return kw
-
-    def _run_decoder_layer(self, layer_idx: int) -> None:
-        """Advance the whole buffer through ``text_tower.layers[layer_idx]``."""
-        layer = self._tower.layers[layer_idx]
-        layer_dev = next(layer.parameters()).device
-        n_seq = self.n_tokens // self._seq_len
-        chunk_seq = self._batch_size
-        out_rows: list[torch.Tensor] = []
-        was_training = self._model.training
-        self._model.train(False)
-        with torch.no_grad():
-            for s in range(0, n_seq, chunk_seq):
-                bs = min(chunk_seq, n_seq - s)
-                row0 = s * self._seq_len
-                row1 = row0 + bs * self._seq_len
-                x = (
-                    self.buffer[row0:row1]
-                    .to(layer_dev, torch.bfloat16)
-                    .reshape(bs, self._seq_len, self.hidden)
-                )
-                kw = self._layer_kwargs(bs, layer_idx)
-                # Move any tensor kwargs onto the layer's device.
-                call_kw = {
-                    k: (v.to(layer_dev) if isinstance(v, torch.Tensor) else v)
-                    for k, v in kw.items()
-                }
-                if isinstance(kw.get("position_embeddings"), tuple):
-                    call_kw["position_embeddings"] = tuple(
-                        t.to(layer_dev) if isinstance(t, torch.Tensor) else t
-                        for t in kw["position_embeddings"]
-                    )
-                out = layer(x, **call_kw)
-                out = out[0] if isinstance(out, tuple) else out
-                out_rows.append(
-                    out.reshape(-1, self.hidden).to("cpu", torch.bfloat16)
-                )
-        if was_training:
-            self._model.train(True)
-        self.buffer = torch.cat(out_rows, dim=0).contiguous()
-
-    def advance_to(self, target_idx: int) -> None:
-        """Advance the buffer so it holds the input of ``layers[target_idx]``.
-
-        Runs every decoder layer in ``[cursor, target_idx)`` — i.e. any
-        non-MoE layers sitting between the previous MoE layer and this one.
-        Idempotent when already at ``target_idx``.
-        """
-        if target_idx < self.cursor:
-            raise RuntimeError(
-                f"_CascadeBuffer.advance_to({target_idx}) but cursor is already "
-                f"at {self.cursor} — the cascade buffer cannot move backwards."
-            )
-        while self.cursor < target_idx:
-            self._run_decoder_layer(self.cursor)
-            self.cursor += 1
-
-    def advance_through(self, layer_idx: int) -> None:
-        """Advance the buffer THROUGH ``layers[layer_idx]`` (post-heal step).
-
-        After healing MoE layer N the buffer must reflect the just-healed
-        layer, so the next layer's heal sees the correct input.
-        """
-        if layer_idx != self.cursor:
-            raise RuntimeError(
-                f"_CascadeBuffer.advance_through({layer_idx}) but cursor is at "
-                f"{self.cursor} — call advance_to({layer_idx}) first."
-            )
-        self._run_decoder_layer(layer_idx)
-        self.cursor += 1
-
-
-def _build_heal_optimizers(
-    params_2d: list[nn.Parameter],
-    params_1d: list[nn.Parameter],
-    heal_cfg: "_HealConfig",
-) -> list[torch.optim.Optimizer]:
-    """Build the optimizer(s) for one layer's heal.
-
-    Muon optimizes 2D matrices only — when ``merge_heal_optimizer == "muon"``
-    the 2D params (expert projections + ``router.weight``) go to a ``Muon``
-    optimizer and any 1D params (router bias) go to a parallel ``AdamW``.
-    With ``"adamw"`` everything goes to a single ``AdamW``.
-    """
-    optims: list[torch.optim.Optimizer] = []
-    if heal_cfg.optimizer == "muon":
-        if params_2d:
-            optims.append(Muon(
-                params_2d, lr=heal_cfg.lr, momentum=heal_cfg.muon_momentum,
-                nesterov=True, ns_steps=5, weight_decay=0.0,
-            ))
-        if params_1d:
-            optims.append(torch.optim.AdamW(
-                params_1d, lr=heal_cfg.lr, betas=heal_cfg.adamw_betas,
-                weight_decay=0.0,
-            ))
-    else:  # "adamw"
-        all_params = params_2d + params_1d
-        if all_params:
-            optims.append(torch.optim.AdamW(
-                all_params, lr=heal_cfg.lr, betas=heal_cfg.adamw_betas,
-                weight_decay=0.0,
-            ))
-    return optims
 
 
 def run(
@@ -622,59 +226,23 @@ def run(
     # Stage-2 per-layer merge-heal setup (opt-in; inert when disabled).
     # When `merge_heal_enabled` is False, heal_cfg.enabled is False and every
     # heal code path below is skipped — Stage 2 behaviour is byte-identical to
-    # the pre-feature code (no sidecar load, no cascade buffer, no capture).
+    # the pre-feature code (no capture, no heal). When enabled, each layer's
+    # (input, target) pairs are captured in-process just before the merge —
+    # no teacher object, no sidecar, no cascade buffer.
     # -----------------------------------------------------------------------
-    heal_cfg = _HealConfig(s2, artifacts_dir)
-    heal_sidecar: dict | None = None
-    cascade_buffer: "_CascadeBuffer | None" = None
+    heal_cfg = _HealConfig(s2)
+    _heal_device: torch.device | None = None
     if heal_cfg.enabled:
-        # Build the heal calibration tensor — the SAME token set the teacher
-        # precompute used, so the cascade buffer is row-aligned with the
-        # sidecar's layer_outputs. seq_len comes from the calibration config;
-        # num_sequences is derived from the token budget exactly as the
-        # precompute script does.
-        _heal_seq_len = int(cal["sequence_length"])
-        _heal_num_seq = max(1, heal_cfg.token_budget // _heal_seq_len)
-        heal_spec = spec_from_config(
-            cal,
-            num_sequences_override=_heal_num_seq,
-            sequence_length_override=_heal_seq_len,
-            seed_offset=heal_cfg.seed_offset,
-        )
-        _model_name = config["model"]["name_or_path"]
-        heal_sidecar = _load_heal_sidecar(heal_cfg, heal_spec, _model_name)
-        heal_calib = build_calibration_tensor(
-            tokenizer, heal_spec,
-            cache_dir=(os.environ.get("MOE_CALIB_CACHE_DIR")
-                       or (artifacts_dir / "_calibration_cache")),
-        )
-        if heal_calib.shape[0] * heal_calib.shape[1] != int(heal_sidecar["n_tokens"]):
-            raise RuntimeError(
-                f"Stage-2 merge-heal: heal calibration tensor has "
-                f"{heal_calib.shape[0] * heal_calib.shape[1]} tokens but the "
-                f"sidecar recorded n_tokens={heal_sidecar['n_tokens']} — the "
-                "token sets are not aligned (check seq_len / token_budget)."
-            )
         _heal_device = device
         if _heal_device is None:
             try:
                 _heal_device = next(model.parameters()).device
             except StopIteration:
                 _heal_device = torch.device("cpu")
-        cascade_buffer = _CascadeBuffer(
-            model, _find_text_tower(model), heal_calib,
-            seq_len=_heal_seq_len, batch_size=s2["batch_size"],
-            device=_heal_device,
-        )
-        if cascade_buffer.n_tokens != int(heal_sidecar["n_tokens"]):
-            raise RuntimeError(
-                f"Stage-2 merge-heal: cascade buffer has "
-                f"{cascade_buffer.n_tokens} token rows but the sidecar "
-                f"recorded n_tokens={heal_sidecar['n_tokens']}."
-            )
         log.info(
-            "Stage-2 merge-heal enabled: sidecar=%s, %d tokens, optimizer=%s",
-            heal_cfg.sidecar_path, cascade_buffer.n_tokens, heal_cfg.optimizer,
+            "Stage-2 merge-heal enabled: self-distillation, "
+            "pool=%d tokens/layer, train_router=%s, lr=%g",
+            heal_cfg.token_cap, heal_cfg.train_router, heal_cfg.lr,
         )
 
     # -----------------------------------------------------------------------
@@ -711,26 +279,6 @@ def run(
                     pt_path.name, ref.layer_idx,
                 )
                 pt_path.unlink()
-
-        # Merge-heal resume safety: the cascade buffer is advanced strictly in
-        # MoE-layer order, so a completed layer it skips past MUST be a
-        # contiguous prefix of moe_layers — otherwise advance_to() would run an
-        # un-merged intermediate layer forward and corrupt the cascade silently.
-        # Assert the completed set is a contiguous 0..k prefix before resuming.
-        if heal_cfg.enabled:
-            _completed_positions = [
-                pos for pos, ref in enumerate(moe_layers)
-                if (partial_dir / f"merge_{ref.layer_idx}.json").exists()
-                and (partial_dir / f"layer_{ref.layer_idx}.pt").exists()
-            ]
-            if _completed_positions != list(range(len(_completed_positions))):
-                raise RuntimeError(
-                    "Stage-2 merge-heal resume: completed layers do not form a "
-                    "contiguous prefix of the MoE layer order (completed "
-                    f"positions={_completed_positions}). The cascade buffer can "
-                    "only resume from a contiguous prefix — delete "
-                    "_stage2_partial/ and re-run Stage 2."
-                )
 
         for ref in moe_layers:
             merge_path = partial_dir / f"merge_{ref.layer_idx}.json"
@@ -854,14 +402,11 @@ def run(
                 bank.select(final_kept_ids)
             _resize_router_for_kept_experts(ref, final_kept_ids)
 
-            # Merge-heal resume: a completed layer's healed weights are not
-            # reconstructible from merge_*.json — reload them and advance the
-            # cascade buffer through the layer so the first non-completed
-            # layer sees the correct (merged + healed) input.
-            if heal_cfg.enabled and cascade_buffer is not None:
-                cascade_buffer.advance_to(ref.layer_idx)
+            # Merge-heal resume: a completed layer's post-heal weights are not
+            # reconstructible from merge_*.json — reload them so the in-memory
+            # model matches the state the heal left.
+            if heal_cfg.enabled:
                 _load_heal_weights(partial_dir, ref, final_kept_ids)
-                cascade_buffer.advance_through(ref.layer_idx)
 
             try:
                 cov_acc.load_layer_from_disk(ref.layer_idx, partial_dir)
@@ -1467,6 +1012,21 @@ def run(
         if n_assigned > 0 and mean_assigned_cost > 0.0 and not (c_fail and effective_target >= n_experts):
             _layer_mean_costs.append(mean_assigned_cost)
 
+        # Stage-2 merge-heal: capture this layer's pre-merge (input, target)
+        # pairs for self-distillation. Done BEFORE _merge_experts_inplace,
+        # while layer_ref.mlp is still its original self — so the captured
+        # output is the self-distillation target. Skipped for 0-merge layers:
+        # a layer that merged nothing is unchanged, so the heal would be a
+        # guaranteed no-op the accept/reject guard rejects anyway.
+        cap_in: torch.Tensor | None = None
+        cap_out: torch.Tensor | None = None
+        layer_merged = any(len(m) > 1 for m in grouped.values())
+        if heal_cfg.enabled and layer_merged:
+            cap_in, cap_out = _capture_mlp_io(
+                model, layer_ref, batches,
+                device=_heal_device, pool_size=heal_cfg.token_cap,
+            )
+
         # Phase 3 (M8): snapshot pre-merge expert weights BEFORE the merge
         # mutates the bank. The snapshot is consumed only by the per-group
         # distillation step below; released as soon as that finishes for
@@ -1536,53 +1096,32 @@ def run(
             bank.select(final_kept_ids)
         _resize_router_for_kept_experts(layer_ref, final_kept_ids)
 
-        # Stage-2 per-layer merge-heal (opt-in). Heal this layer's merged
-        # centroids + router toward the teacher's same-layer MoE-block output
-        # right after the router resize, BEFORE the checkpoint block — so the
-        # persisted weights and the heal_state field reflect the healed layer.
+        # Stage-2 per-layer merge-heal (opt-in). Heal this layer's kept
+        # experts (+ optionally the router) by self-distillation toward its
+        # OWN pre-merge MoE-block output — right after the router resize,
+        # BEFORE the checkpoint block so the persisted weights and the
+        # heal_state field reflect the healed layer.
         heal_state: dict | None = None
-        if heal_cfg.enabled and cascade_buffer is not None and heal_sidecar is not None:
-            cascade_buffer.advance_to(layer_ref.layer_idx)
-            # Heal ONLY layers that actually merged >=1 child. An unmerged layer
-            # is byte-identical to the teacher's layer, so its heal loss would
-            # reflect only inherited upstream drift — training the router to
-            # absorb that distorts a correct layer and overfits expert-mixing
-            # to the calibration tokens. Accumulated/global drift is Stage
-            # 2.5's job; the per-layer Stage-2 heal's scope is each layer's
-            # OWN merge damage. The cascade buffer is still advanced THROUGH
-            # every layer below — only the heal *training* is conditional.
-            layer_merged = any(len(m) > 1 for m in grouped.values())
-            if layer_merged:
-                _teacher_out = heal_sidecar["layer_outputs"].get(layer_ref.layer_idx)
-                if _teacher_out is None:
-                    raise RuntimeError(
-                        f"Stage-2 merge-heal: sidecar has no teacher output for "
-                        f"layer {layer_ref.layer_idx} (layer_indices="
-                        f"{heal_sidecar.get('layer_indices')})."
-                    )
+        if heal_cfg.enabled:
+            if cap_in is not None and cap_out is not None:
                 heal_state = _heal_layer(
                     layer_ref=layer_ref,
-                    grouped=grouped,
                     final_kept_ids=final_kept_ids,
-                    cascade_buffer=cascade_buffer,
-                    teacher_layer_output=_teacher_out,
+                    captured_input=cap_in,
+                    captured_target=cap_out,
                     heal_cfg=heal_cfg,
                     device=(
                         device if device is not None
                         else layer_ref.router.weight.device
                     ),
                 )
-                del _teacher_out
+                del cap_in, cap_out
             else:
                 log.info(
-                    "  merge-heal layer %d: skipped (0 merges — unmerged layer "
-                    "is teacher-identical, nothing to heal)",
+                    "  merge-heal layer %d: skipped (0 merges — layer "
+                    "unchanged, nothing to heal)",
                     layer_ref.layer_idx,
                 )
-            # Release this layer's teacher target either way — each layer's
-            # slice of the ~84 GB mmap'd sidecar is used at most once, so drop
-            # it to let the OS reclaim the pages instead of holding all 40.
-            heal_sidecar["layer_outputs"].pop(layer_ref.layer_idx, None)
 
         # Correctness depends on the RuntimeError guard above ensuring no protected expert
         # appears in grouped. Without that guard, the else-branch would silently emit [eid]
@@ -1606,7 +1145,8 @@ def run(
             # _write_merge_json so the .pt-before-.json resume invariant holds.
             if heal_cfg.enabled and heal_state is not None:
                 _write_heal_weights(
-                    partial_dir, layer_ref, grouped, final_kept_ids,
+                    partial_dir, layer_ref, final_kept_ids,
+                    accepted=bool(heal_state["accepted"]),
                 )
             _write_merge_json(
                 partial_dir, layer_ref.layer_idx, final_kept_ids, grouped, freq,
@@ -1626,16 +1166,6 @@ def run(
                 ),
                 heal_state=heal_state,
             )
-
-        # Merge-heal: advance the cascade buffer THROUGH this layer so the next
-        # layer's heal sees the correct input. This MUST happen for EVERY layer
-        # under the heal path — merged or not — or token alignment with the
-        # teacher sidecar breaks. Only the heal *training* above is conditional;
-        # the buffer propagation is not. Done after the checkpoint so a crash
-        # between heal and advance simply re-advances on resume (idempotent via
-        # the cursor).
-        if heal_cfg.enabled and cascade_buffer is not None and heal_sidecar is not None:
-            cascade_buffer.advance_through(layer_ref.layer_idx)
 
         max_group = max((len(g) for g in grouped.values()), default=0)
         n_noncentroid_members = sum(len(g) - 1 for g in grouped.values())
@@ -2968,6 +2498,82 @@ def _distill_merged_group(
 # ===========================================================================
 
 
+def _capture_mlp_io(
+    model,
+    layer_ref: MoELayerRef,
+    calib_batches,
+    *,
+    device: torch.device,
+    pool_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Capture row-aligned ``(mlp_input, mlp_output)`` pools for one MoE layer.
+
+    Runs a forward over ``calib_batches`` with :func:`early_exit_after_layer`
+    so each pass stops right after ``layer_ref.layer_idx``. A forward hook on
+    ``layer_ref.mlp`` records the MoE-block INPUT (``inputs[0]`` — the
+    post-attention / post-layernorm hidden state fed into the block) and the
+    MoE-block OUTPUT. This MUST be called BEFORE the layer is merged, while
+    ``layer_ref.mlp`` is still its original pre-merge self — so the captured
+    output is the self-distillation target.
+
+    Returns two CPU bf16 ``[n, hidden]`` tensors with ``n == min(pool_size,
+    total calibration tokens)``; row ``i`` of both is the same token. The
+    pools are a contiguous prefix of the (already randomly-drawn) calibration
+    tokens — no reservoir sampling needed, and the forward loop stops early
+    once ``pool_size`` rows are in hand.
+    """
+    layer_idx = layer_ref.layer_idx
+    in_chunks: list[torch.Tensor] = []
+    out_chunks: list[torch.Tensor] = []
+    captured = [0]
+
+    def _hook(_module, inputs, output):
+        x_in = inputs[0]
+        x_out = output[0] if isinstance(output, tuple) else output
+        in_flat = x_in.reshape(-1, x_in.shape[-1]).detach().to("cpu", torch.bfloat16)
+        out_flat = x_out.reshape(-1, x_out.shape[-1]).detach().to("cpu", torch.bfloat16)
+        in_chunks.append(in_flat)
+        out_chunks.append(out_flat)
+        captured[0] += in_flat.shape[0]
+
+    handle = layer_ref.mlp.register_forward_hook(_hook)
+    was_training = model.training
+    model.train(False)
+    try:
+        with early_exit_after_layer(model, layer_idx):
+            for batch in calib_batches:
+                if captured[0] >= pool_size:
+                    break
+                with torch.no_grad():
+                    try:
+                        model(input_ids=batch.to(device))
+                    except _EarlyExitException:
+                        pass  # expected — target layer completed
+    finally:
+        handle.remove()
+        if was_training:
+            model.train()
+
+    if not in_chunks:
+        raise RuntimeError(
+            f"merge-heal capture: layer {layer_idx} mlp forward hook never "
+            "fired — calib_batches empty or layer never reached."
+        )
+    x_in = torch.cat(in_chunks, dim=0)[:pool_size].contiguous()
+    x_out = torch.cat(out_chunks, dim=0)[:pool_size].contiguous()
+    if x_in.shape != x_out.shape:
+        raise RuntimeError(
+            f"merge-heal capture: layer {layer_idx} input/target pools "
+            f"misaligned ({tuple(x_in.shape)} vs {tuple(x_out.shape)})."
+        )
+    log.info(
+        "  merge-heal capture: layer %d — %d (input,target) token rows "
+        "captured (pool_size=%d)",
+        layer_idx, x_in.shape[0], pool_size,
+    )
+    return x_in, x_out
+
+
 def _heal_student_moe_output(
     *,
     x: torch.Tensor,
@@ -2991,9 +2597,8 @@ def _heal_student_moe_output(
       3. routed output ``= Σ_k topk_vals[:,k] · SwiGLU_{expert(k)}(x)``.
       4. block output ``= routed_output + shared_expert_output``.
 
-    This returns that single block-output hidden-state tensor — the Qwen3.5
-    ``Qwen3_5MoeSparseMoeBlock.forward`` returns the hidden state directly (not
-    a tuple), and that is exactly what the teacher sidecar captured.
+    This returns that single block-output hidden-state tensor — the same
+    quantity ``_capture_mlp_io`` records as the self-distillation target.
 
     The ``e_score_correction_bias`` term is added to the pre-softmax logits
     when the router exposes it (mirrors ``_router_routing_weights``); the base
@@ -3048,49 +2653,49 @@ def _heal_student_moe_output(
 def _heal_layer(
     *,
     layer_ref: MoELayerRef,
-    grouped: dict[int, list[int]],
     final_kept_ids: list[int],
-    cascade_buffer: "_CascadeBuffer",
-    teacher_layer_output: torch.Tensor,
+    captured_input: torch.Tensor,
+    captured_target: torch.Tensor,
     heal_cfg: "_HealConfig",
     device: torch.device,
 ) -> dict:
-    """Per-layer merge-heal: fine-tune merged centroids + router toward the
-    teacher's same-layer MoE-block output (spec — Direction-E re-scoped).
+    """Per-layer merge-heal by SELF-DISTILLATION.
 
-    Trains, for one already-merged layer:
-      * every kept centroid expert that absorbed >= 1 child (``len(grouped[c])
-        > 1``) — singleton kept experts have nothing to repair and are frozen;
-      * the resized ``router.weight`` (and ``router.bias`` if present) — the
-        whole router, since routing affects singletons too.
+    Fine-tunes one already-merged layer so it reproduces its OWN pre-merge
+    MoE-block output:
+      * EVERY kept expert trains — merged centroids AND singletons. The router
+        was resized, so even a singleton's contribution to the block output is
+        perturbed and benefits from healing.
+      * the resized ``router.weight`` (+ ``router.bias`` if present) trains
+        only when ``heal_cfg.train_router`` is True; otherwise the router is
+        frozen at its mechanical resize.
 
-    Loss = ``F.mse_loss(student_moe_out, teacher_sidecar_rows)`` in fp32, where
-    ``student_moe_out`` is :func:`_heal_student_moe_output` over the cascade
-    buffer's layer-N input (row-aligned with ``teacher_layer_output``).
+    Loss = ``F.mse_loss(student_moe_out, captured_target)`` in fp32, where
+    ``student_moe_out`` is :func:`_heal_student_moe_output` over
+    ``captured_input`` (the layer's own pre-merge MoE-block input, row-aligned
+    with ``captured_target`` — both from :func:`_capture_mlp_io`).
 
     90/10 train/held-out split (``layer_idx``-seeded), patience early-stop on
-    held-out MSE, best-held-out snapshot restored at the end. Healed expert
-    weights are written back to the banks; the healed router weight/bias are
-    re-installed as ``nn.Parameter``s.
+    held-out MSE. **Monotone-safe accept/reject:** the un-healed plain-merged
+    weights are snapshotted before training; if the best healed held-out MSE
+    does not beat the plain-merged held-out MSE the layer is REVERTED to the
+    plain merge (worst case per layer == the no-heal baseline).
 
     Returns a JSON-able state dict:
         ``{"steps", "train_mse", "train_mse_at_best", "holdout_mse",
-        "heal_gap", "stop_reason"}`` — ``train_mse`` is the final-step train
-        MSE; ``train_mse_at_best`` is the train MSE at the step the best
-        held-out MSE was recorded, and ``heal_gap = holdout_mse −
-        train_mse_at_best``.
+        "plain_merged_holdout_mse", "heal_gap", "accepted", "stop_reason"}``.
     """
     layer_idx = layer_ref.layer_idx
     router = layer_ref.router
 
-    # --- Row-alignment hard-assert (the buffer must match the sidecar) ------
-    x_buf = cascade_buffer.buffer
-    if x_buf.shape[0] != teacher_layer_output.shape[0]:
+    # --- Row-alignment hard-assert (input pool must match target pool) -----
+    if captured_input.shape != captured_target.shape:
         raise RuntimeError(
-            f"merge-heal layer {layer_idx}: cascade buffer has "
-            f"{x_buf.shape[0]} token rows but the teacher sidecar has "
-            f"{teacher_layer_output.shape[0]} — token alignment is broken."
+            f"merge-heal layer {layer_idx}: captured input pool "
+            f"{tuple(captured_input.shape)} != target pool "
+            f"{tuple(captured_target.shape)} — token alignment is broken."
         )
+    x_buf = captured_input
 
     banks = build_banks(layer_ref)
     # CRITICAL indexing contract: `_heal_layer` runs AFTER `bank.select(
@@ -3099,83 +2704,80 @@ def _heal_layer(
     # post-select POSITION, not by the original expert id. Position `pos`
     # corresponds to original id `final_kept_ids[pos]`, and the resized router
     # row `pos` likewise — so `pos` is the consistent index across banks +
-    # router. `expert_params` / `healed_centroids` stay keyed by original
+    # router. `expert_params` / `healed_experts` stay keyed by original
     # `cid` (that is what `centroid_order=final_kept_ids` expects downstream).
     pos_of: dict[int, int] = {cid: i for i, cid in enumerate(final_kept_ids)}
     bank_dtype = banks["gate_proj"].get(0).dtype
 
-    # --- Trainable expert params: centroids that absorbed >= 1 child --------
-    # expert_params holds an fp32 leaf for every kept centroid (frozen
-    # singletons keep requires_grad=False so the student forward is correct,
-    # but they contribute no gradient / optimizer state).
+    # --- Trainable expert params: EVERY kept expert (merged + singleton) ----
+    # expert_params holds a trainable fp32 leaf for every kept expert.
     expert_params: dict[int, dict[str, torch.Tensor]] = {}
     trainable_2d: list[nn.Parameter] = []
-    healed_centroids: list[int] = []
+    healed_experts: list[int] = list(final_kept_ids)
     for pos, cid in enumerate(final_kept_ids):
-        members = grouped.get(cid, [cid])
-        is_merged = len(members) > 1
         ep: dict[str, torch.Tensor] = {}
         for name in MATRIX_NAMES:
             # .detach() is essential: banks[name].get(pos) is a VIEW of the
             # model's stacked-experts nn.Parameter (requires_grad=True during
-            # Stage 2). Without detach, the singleton path below keeps a graph
-            # edge back to that Parameter, so loss.backward() would accumulate
+            # Stage 2). Without detach, loss.backward() would accumulate
             # gradients onto the full model's expert tensors — an unbounded
             # GPU memory leak across the heal run.
             w = banks[name].get(pos).detach().to(device, torch.float32).clone()
-            if is_merged:
-                p = nn.Parameter(w, requires_grad=True)
-                trainable_2d.append(p)
-                ep[name] = p
-            else:
-                ep[name] = w  # frozen, detached leaf tensor (no grad)
+            p = nn.Parameter(w, requires_grad=True)
+            trainable_2d.append(p)
+            ep[name] = p
         expert_params[cid] = ep
-        if is_merged:
-            healed_centroids.append(cid)
 
-    # --- Trainable router: whole resized router.weight (+ bias if present) --
-    router_weight = nn.Parameter(
-        router.weight.detach().to(device, torch.float32).clone(), requires_grad=True,
-    )
-    trainable_2d.append(router_weight)
+    # --- Router: whole resized router.weight (+ bias) — trained iff flagged -
     trainable_1d: list[nn.Parameter] = []
-    router_bias_p: nn.Parameter | None = None
-    if getattr(router, "bias", None) is not None:
-        router_bias_p = nn.Parameter(
-            router.bias.detach().to(device, torch.float32).clone(), requires_grad=True,
+    router_bias_p: torch.Tensor | None = None
+    if heal_cfg.train_router:
+        router_weight: torch.Tensor = nn.Parameter(
+            router.weight.detach().to(device, torch.float32).clone(),
+            requires_grad=True,
         )
-        trainable_1d.append(router_bias_p)
+        trainable_2d.append(router_weight)
+        if getattr(router, "bias", None) is not None:
+            router_bias_p = nn.Parameter(
+                router.bias.detach().to(device, torch.float32).clone(),
+                requires_grad=True,
+            )
+            trainable_1d.append(router_bias_p)
+    else:
+        # Frozen: detached tensors (no grad / not optimized) — still fed to
+        # the student forward so routing is correct.
+        router_weight = router.weight.detach().to(device, torch.float32)
+        if getattr(router, "bias", None) is not None:
+            router_bias_p = router.bias.detach().to(device, torch.float32)
     # e_score_correction_bias (if any) is part of the router's pre-softmax
     # path but is NOT trained here — kept frozen, mirrors _router_routing_weights.
     esc = getattr(router, "e_score_correction_bias", None)
     esc_bias = esc.detach().to(device, torch.float32) if esc is not None else None
 
-    # router_weight is unconditionally appended to trainable_2d above, so the
-    # optimizer always has at least one parameter — no empty-build guard needed.
+    # Every kept expert is trainable, so trainable_2d is always non-empty —
+    # the optimizer always has at least one parameter.
     top_k = layer_ref.top_k
 
-    # --- Calibration token rows: cap + 90/10 split (layer-idx-seeded) -------
+    # --- Calibration token rows: 90/10 split (layer-idx-seeded) ------------
     n_rows = x_buf.shape[0]
     gen = torch.Generator(device="cpu").manual_seed(layer_idx)
     perm = torch.randperm(n_rows, generator=gen)
-    if n_rows > heal_cfg.token_cap:
-        perm = perm[:heal_cfg.token_cap]
     n_use = perm.shape[0]
     n_holdout = max(1, int(round(n_use * heal_cfg.holdout_fraction)))
     n_holdout = min(n_holdout, n_use - 1)  # leave at least 1 training row
     holdout_idx = perm[:n_holdout]
     train_idx = perm[n_holdout:]
 
-    # Move the (capped) token rows + teacher targets to device, fp32.
+    # Move the token rows + self-distillation targets to device, fp32.
     x_train = x_buf[train_idx].to(device, torch.float32)
     x_holdout = x_buf[holdout_idx].to(device, torch.float32)
-    t_train = teacher_layer_output[train_idx].to(device, torch.float32)
-    t_holdout = teacher_layer_output[holdout_idx].to(device, torch.float32)
+    t_train = captured_target[train_idx].to(device, torch.float32)
+    t_holdout = captured_target[holdout_idx].to(device, torch.float32)
 
     # --- Frozen shared-expert output (precomputed; not trained) ------------
-    # The teacher sidecar captured the full MoE-block output, which includes
-    # the sigmoid-gated shared expert. The shared expert is protected by Stage
-    # 2 (untouched), so we run the model's own shared_expert / shared_expert_gate
+    # The captured target is the full MoE-block output, which includes the
+    # sigmoid-gated shared expert. The shared expert is protected by Stage 2
+    # (untouched), so we run the model's own shared_expert / shared_expert_gate
     # and add the result back — exactly like Qwen3_5MoeSparseMoeBlock.forward.
     mlp = layer_ref.mlp
     shared_expert = layer_ref.shared_expert  # canonical MoELayerRef accessor
@@ -3198,7 +2800,14 @@ def _heal_layer(
     shared_train = _shared_out(x_train)
     shared_holdout = _shared_out(x_holdout)
 
-    optims = _build_heal_optimizers(trainable_2d, trainable_1d, heal_cfg)
+    # Single fp32 AdamW over every trainable param (all kept experts, plus the
+    # router when heal_cfg.train_router). weight_decay=0 — the self-distillation
+    # target already anchors the weights to the pre-merge function.
+    opt = torch.optim.AdamW(
+        trainable_2d + trainable_1d, lr=heal_cfg.lr,
+        betas=heal_cfg.adamw_betas, weight_decay=0.0,
+    )
+    clip_params = trainable_2d + trainable_1d
 
     def _forward(x_in, shared_in):
         return _heal_student_moe_output(
@@ -3237,7 +2846,7 @@ def _heal_layer(
             "experts": {
                 cid: {n: expert_params[cid][n].detach().to("cpu").clone()
                       for n in MATRIX_NAMES}
-                for cid in healed_centroids
+                for cid in healed_experts
             },
             "router_weight": router_weight.detach().to("cpu").clone(),
             "router_bias": (
@@ -3246,7 +2855,11 @@ def _heal_layer(
             ),
         }
 
-    best_holdout = _holdout_mse()
+    # plain_merged_* is the un-healed baseline for the monotone-safe accept/
+    # reject guard: the initial holdout MSE + an independent weight snapshot.
+    plain_merged_holdout_mse = _holdout_mse()
+    plain_merged_state = _snapshot()
+    best_holdout = plain_merged_holdout_mse
     best_state = _snapshot()
     # train_mse_at_best pairs with best_holdout — the train MSE recorded at the
     # SAME step the best held-out was seen, so heal_gap is a like-for-like
@@ -3257,7 +2870,7 @@ def _heal_layer(
     stop_reason = "max_steps"
     steps_done = 0
 
-    # --- Minibatch sampler over the fixed (capped) training pool -----------
+    # --- Minibatch sampler over the fixed training pool --------------------
     # Each step draws a fresh random minibatch of merge_heal_minibatch_size
     # rows from x_train; seeded for reproducibility across resumes.
     n_train = x_train.shape[0]
@@ -3271,13 +2884,12 @@ def _heal_layer(
             tb = t_train.index_select(0, sel.to(t_train.device))
         else:
             xb, sb, tb = x_train, shared_train, t_train
-        for opt in optims:
-            opt.zero_grad(set_to_none=True)
+        opt.zero_grad(set_to_none=True)
         student = _forward(xb, sb)
         loss = F.mse_loss(student, tb)
         loss.backward()
-        for opt in optims:
-            opt.step()
+        torch.nn.utils.clip_grad_norm_(clip_params, heal_cfg.grad_clip)
+        opt.step()
         steps_done = step + 1
         last_train_mse = float(loss.detach().item())
 
@@ -3294,24 +2906,30 @@ def _heal_layer(
                     stop_reason = "patience"
                     break
 
-    # --- Restore the best-held-out snapshot --------------------------------
+    # --- Accept/reject: monotone-safe guard --------------------------------
+    # Accept the healed weights only if the best healed held-out MSE strictly
+    # beats the plain-merged baseline; otherwise REVERT the layer to the plain
+    # merge (worst case per layer == the no-heal baseline).
+    accepted = bool(best_holdout < plain_merged_holdout_mse)
+    restore_state = best_state if accepted else plain_merged_state
+
     # bank.set() casts dtype + moves device internally; the router params are
     # re-installed with an explicit dtype+device cast so they land back on the
     # router's original device (the snapshot lives on CPU).
     with torch.no_grad():
-        for cid in healed_centroids:
+        for cid in healed_experts:
             pos = pos_of[cid]  # banks are post-select position-indexed
             for name in MATRIX_NAMES:
-                banks[name].set(pos, best_state["experts"][cid][name].to(bank_dtype))
+                banks[name].set(pos, restore_state["experts"][cid][name].to(bank_dtype))
         _rw = router.weight
         router.weight = nn.Parameter(
-            best_state["router_weight"].to(device=_rw.device, dtype=_rw.dtype),
+            restore_state["router_weight"].to(device=_rw.device, dtype=_rw.dtype),
             requires_grad=_rw.requires_grad,
         )
-        if router_bias_p is not None and best_state["router_bias"] is not None:
+        if getattr(router, "bias", None) is not None and restore_state["router_bias"] is not None:
             _rb = router.bias
             router.bias = nn.Parameter(
-                best_state["router_bias"].to(device=_rb.device, dtype=_rb.dtype),
+                restore_state["router_bias"].to(device=_rb.device, dtype=_rb.dtype),
                 requires_grad=_rb.requires_grad,
             )
 
@@ -3327,17 +2945,20 @@ def _heal_layer(
     heal_gap = best_holdout - gap_train_mse
     log.info(
         "  merge-heal layer %d: %d steps (%s) — train_mse=%.6e (at_best=%.6e) "
-        "holdout_mse=%.6e heal_gap=%.6e (%d merged centroids healed, %d kept "
-        "experts)",
+        "holdout_mse=%.6e plain_merged_holdout_mse=%.6e heal_gap=%.6e "
+        "accepted=%s (%d kept experts, train_router=%s)",
         layer_idx, steps_done, stop_reason, last_train_mse, gap_train_mse,
-        best_holdout, heal_gap, len(healed_centroids), len(final_kept_ids),
+        best_holdout, plain_merged_holdout_mse, heal_gap, accepted,
+        len(final_kept_ids), heal_cfg.train_router,
     )
     return {
         "steps": steps_done,
         "train_mse": last_train_mse,
         "train_mse_at_best": gap_train_mse,
         "holdout_mse": best_holdout,
+        "plain_merged_holdout_mse": plain_merged_holdout_mse,
         "heal_gap": heal_gap,
+        "accepted": accepted,
         "stop_reason": stop_reason,
     }
 
@@ -3345,30 +2966,31 @@ def _heal_layer(
 def _write_heal_weights(
     partial_dir: Path,
     layer_ref: MoELayerRef,
-    grouped: dict[int, list[int]],
     final_kept_ids: list[int],
+    *,
+    accepted: bool,
 ) -> None:
-    """Persist the healed expert tensors + router weight/bias for one layer.
+    """Persist the post-heal expert tensors + router weight/bias for one layer.
 
-    Healed weights are NOT reconstructible from ``merge_N.json`` (the heal
+    Post-heal weights are NOT reconstructible from ``merge_N.json`` (the heal
     fine-tunes them), so a per-layer ``_heal_weights_layer_{N}.pt`` is written
     into ``partial_dir`` — atomically, and BEFORE ``_write_merge_json`` so the
     ``.pt``-before-``.json`` resume invariant holds.
 
-    Only centroids that absorbed >= 1 child are stored (singletons were not
-    healed); resume reloads exactly those.
+    EVERY kept expert is stored (all kept experts are trained by the heal);
+    when the layer's heal was rejected the banks already hold the plain-merged
+    weights, so the file faithfully captures whatever final state the layer is
+    in. ``accepted`` is recorded as telemetry.
     """
     layer_idx = layer_ref.layer_idx
     banks = build_banks(layer_ref)
     router = layer_ref.router
 
     # Keyed by post-select POSITION (banks were re-indexed to 0..n_kept-1 by
-    # bank.select()); _load_heal_weights replays by the same position. Only
-    # centroids that absorbed >= 1 child were healed, so only those are stored.
+    # bank.select()); _load_heal_weights replays by the same position. All
+    # kept experts are stored.
     healed: dict[str, dict[str, torch.Tensor]] = {}
-    for pos, cid in enumerate(final_kept_ids):
-        if len(grouped.get(cid, [cid])) <= 1:
-            continue
+    for pos, _cid in enumerate(final_kept_ids):
         healed[str(pos)] = {
             name: banks[name].get(pos).detach().cpu().clone()
             for name in MATRIX_NAMES
@@ -3376,6 +2998,7 @@ def _write_heal_weights(
     payload = {
         "format_version": _HEAL_WEIGHTS_FORMAT_VERSION,
         "layer_idx": layer_idx,
+        "accepted": bool(accepted),
         "healed_experts": healed,
         "router_weight": router.weight.detach().cpu().clone(),
         "router_bias": (
@@ -3398,10 +3021,9 @@ def _load_heal_weights(
 
     Used by the resume path: a layer that completed its heal in a prior run
     has a healed-weights file; reload it so the in-memory model matches the
-    state the heal left. A missing file is fatal (the healed weights cannot be
-    regenerated cheaply, and silently keeping the un-healed merged weights
-    would corrupt every downstream layer's cascade buffer) — the operator must
-    delete ``_stage2_partial/`` and re-run.
+    state the heal left. A missing file is fatal (the post-heal weights cannot
+    be regenerated from ``merge_*.json``) — the operator must delete
+    ``_stage2_partial/`` and re-run.
     """
     layer_idx = layer_ref.layer_idx
     path = partial_dir / f"_heal_weights_layer_{layer_idx}.pt"
@@ -3432,7 +3054,8 @@ def _load_heal_weights(
             if not (0 <= pos < n_kept):
                 raise RuntimeError(
                     f"{path}: healed-expert position {pos} out of range "
-                    f"[0, {n_kept}) — sidecar inconsistent with merge_*.json."
+                    f"[0, {n_kept}) — heal-weights file inconsistent with "
+                    "merge_*.json."
                 )
             for name in MATRIX_NAMES:
                 banks[name].set(pos, mats[name].to(bank_dtype))

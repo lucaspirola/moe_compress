@@ -1,4 +1,4 @@
-"""Component tests for the Stage-2 per-layer merge-heal.
+"""Component tests for the Stage-2 per-layer merge-heal (self-distillation v2).
 
 Covers the correctness-critical pieces of the opt-in merge-heal feature
 (``stage2_reap_ream``):
@@ -6,39 +6,41 @@ Covers the correctness-critical pieces of the opt-in merge-heal feature
 - ``_heal_student_moe_output`` — the faithful replica of the Qwen MoE block's
   routed forward (softmax → top-k → renormalize → weighted SwiGLU sum + shared
   expert). Verified against hand-computed references, not a re-implementation.
-- ``_build_heal_optimizers`` — the Muon (2D) + AdamW (1D) optimizer split.
 - ``_HealConfig`` — validation gating (inert when disabled, strict when on).
-- ``_CascadeBuffer`` — advancing decoder layers reproduces a plain forward
-  (catches the stale-KV-cache and wrong-mask classes of bug).
+- ``_capture_mlp_io`` — captures row-aligned (mlp_input, mlp_output) pools at
+  the MoE-block boundary (the correct hook point for self-distillation).
 - ``_heal_layer`` — runs end-to-end on a tiny real MoE *after* ``bank.select``
-  has re-indexed the expert banks (catches original-id-vs-position bugs).
+  has re-indexed the expert banks; checks ALL kept experts train, the router
+  flag, and the monotone-safe accept/reject guard.
+- ``_write_heal_weights`` / ``_load_heal_weights`` — the per-layer checkpoint
+  round-trip (all kept experts + router, format v2).
 
-The last two use a tiny randomly-initialized ``Qwen3MoeForCausalLM`` — small
-enough to run on CPU; the full-scale behaviour is validated by the on-GPU
+The model-level tests use a tiny randomly-initialized ``Qwen3MoeForCausalLM`` —
+small enough to run on CPU; full-scale behaviour is validated by the on-GPU
 smoke run.
 """
 from __future__ import annotations
-
-from pathlib import Path
 
 import pytest
 import torch
 
 from moe_compress.stage2_reap_ream import (
-    _build_heal_optimizers,
-    _CascadeBuffer,
     _HealConfig,
+    _capture_mlp_io,
     _heal_layer,
     _heal_student_moe_output,
+    _load_heal_weights,
     _resize_router_for_kept_experts,
     _swiglu_forward,
+    _write_heal_weights,
 )
 from moe_compress.utils.model_io import (
-    _find_text_tower,
+    MATRIX_NAMES,
     build_banks,
     iter_moe_layers,
 )
-from moe_compress.utils.muon import Muon
+
+_CPU = torch.device("cpu")
 
 
 def _tiny_moe_model():
@@ -64,6 +66,23 @@ def _random_expert(hidden: int, d_int: int) -> dict[str, torch.Tensor]:
         "up_proj": torch.randn(d_int, hidden),
         "down_proj": torch.randn(hidden, d_int),
     }
+
+
+def _merge_layer(ref, final_kept_ids: list[int]) -> None:
+    """Apply a merge to one layer: select kept experts + resize the router.
+
+    This is the post-merge state `_heal_layer` expects (it runs AFTER
+    `bank.select()` has re-indexed the banks to 0..n_kept-1).
+    """
+    banks = build_banks(ref)
+    for bank in banks.values():
+        bank.select(final_kept_ids)
+    _resize_router_for_kept_experts(ref, final_kept_ids)
+
+
+def _id_batches(model, n_seq: int = 16, seq_len: int = 8, chunk: int = 4):
+    ids = torch.randint(0, model.config.vocab_size, (n_seq, seq_len))
+    return [ids[i:i + chunk] for i in range(0, n_seq, chunk)]
 
 
 # ---------------------------------------------------------------------------
@@ -161,169 +180,238 @@ def test_heal_moe_output_centroid_order_indirection():
 
 
 # ---------------------------------------------------------------------------
-# _build_heal_optimizers
-# ---------------------------------------------------------------------------
-
-
-def test_build_heal_optimizers_muon_splits_2d_and_1d():
-    cfg = _HealConfig({"merge_heal_optimizer": "muon"}, Path("/tmp"))
-    p2d = [torch.nn.Parameter(torch.randn(4, 4))]
-    p1d = [torch.nn.Parameter(torch.randn(4))]
-    optims = _build_heal_optimizers(p2d, p1d, cfg)
-    assert len(optims) == 2
-    assert any(isinstance(o, Muon) for o in optims)
-    assert any(isinstance(o, torch.optim.AdamW) for o in optims)
-
-
-def test_build_heal_optimizers_muon_no_1d_params():
-    cfg = _HealConfig({"merge_heal_optimizer": "muon"}, Path("/tmp"))
-    optims = _build_heal_optimizers([torch.nn.Parameter(torch.randn(4, 4))], [], cfg)
-    assert len(optims) == 1 and isinstance(optims[0], Muon)
-
-
-def test_build_heal_optimizers_adamw_single_group():
-    cfg = _HealConfig({"merge_heal_optimizer": "adamw"}, Path("/tmp"))
-    p2d = [torch.nn.Parameter(torch.randn(4, 4))]
-    p1d = [torch.nn.Parameter(torch.randn(4))]
-    optims = _build_heal_optimizers(p2d, p1d, cfg)
-    assert len(optims) == 1 and isinstance(optims[0], torch.optim.AdamW)
-
-
-# ---------------------------------------------------------------------------
 # _HealConfig
 # ---------------------------------------------------------------------------
 
 
 def test_heal_config_disabled_is_inert():
     """A disabled config must not validate — an empty block is legal."""
-    cfg = _HealConfig({}, Path("/tmp"))
+    cfg = _HealConfig({})
     assert cfg.enabled is False
 
 
-def test_heal_config_enabled_requires_sidecar_path():
-    with pytest.raises(RuntimeError, match="sidecar_path"):
-        _HealConfig({"merge_heal_enabled": True}, Path("/tmp"))
-
-
-def test_heal_config_rejects_bad_optimizer():
-    with pytest.raises(ValueError, match="merge_heal_optimizer"):
-        _HealConfig(
-            {"merge_heal_enabled": True, "merge_heal_sidecar_path": "/tmp/x.pt",
-             "merge_heal_optimizer": "sgd"},
-            Path("/tmp"),
-        )
+def test_heal_config_enabled_defaults():
+    cfg = _HealConfig({"merge_heal_enabled": True})
+    assert cfg.enabled is True
+    assert cfg.train_router is True          # default ON
+    assert cfg.lr == pytest.approx(1.0e-4)
+    assert cfg.token_cap == 262144
 
 
 def test_heal_config_rejects_bad_holdout_fraction():
     with pytest.raises(ValueError, match="holdout_fraction"):
-        _HealConfig(
-            {"merge_heal_enabled": True, "merge_heal_sidecar_path": "/tmp/x.pt",
-             "merge_heal_holdout_fraction": 1.5},
-            Path("/tmp"),
-        )
+        _HealConfig({"merge_heal_enabled": True,
+                     "merge_heal_holdout_fraction": 1.5})
 
 
-def test_heal_config_relative_sidecar_resolves_under_artifacts():
-    cfg = _HealConfig(
-        {"merge_heal_enabled": True, "merge_heal_sidecar_path": "sub/x.pt"},
-        Path("/art"),
-    )
-    assert cfg.sidecar_path == Path("/art/sub/x.pt")
+def test_heal_config_rejects_bad_grad_clip():
+    with pytest.raises(ValueError, match="grad_clip"):
+        _HealConfig({"merge_heal_enabled": True, "merge_heal_grad_clip": 0.0})
 
 
 # ---------------------------------------------------------------------------
-# _CascadeBuffer — on a tiny real Qwen3-MoE model
+# _capture_mlp_io — on a tiny real Qwen3-MoE model
 # ---------------------------------------------------------------------------
 
 
-def test_cascade_buffer_matches_reference_forward():
-    """Advancing the cascade buffer through decoder layers must reproduce the
-    plain model forward's layer input. This catches (a) the stale-KV-cache bug
-    — replaying with a captured DynamicCache would append KV and crash/corrupt
-    every full-attention layer — and (b) any wrong attention mask.
-    """
+def test_capture_mlp_io_pools_aligned():
+    """`_capture_mlp_io` records row-aligned (mlp_input, mlp_output) pairs at
+    the MoE-block boundary. Feeding the captured input back through the (still
+    original) mlp must reproduce the captured target — confirms the hook is on
+    the right module and the i/o correspond."""
     model = _tiny_moe_model()
-    tower = _find_text_tower(model)
-    n_seq, seq_len = 4, 8
-    ids = torch.randint(0, model.config.vocab_size, (n_seq, seq_len))
+    ref = list(iter_moe_layers(model))[1]
+    batches = _id_batches(model, n_seq=4, seq_len=8, chunk=2)
 
-    # Reference: capture the input hidden-state of layer 2 in a plain forward.
-    ref: dict = {}
-
-    def _grab(_m, args, _kw):
-        ref["x"] = args[0].detach()
-
-    h = tower.layers[2].register_forward_pre_hook(_grab, with_kwargs=True)
-    with torch.no_grad():
-        model(input_ids=ids)
-    h.remove()
-
-    # Cascade buffer: seed + advance through layers 0,1 → should hold layer-2 input.
-    cb = _CascadeBuffer(
-        model, tower, ids, seq_len=seq_len, batch_size=2, device=torch.device("cpu"),
+    cap_in, cap_out = _capture_mlp_io(
+        model, ref, batches, device=_CPU, pool_size=10_000,
     )
-    cb.advance_to(2)
-    buf = cb.buffer.reshape(n_seq, seq_len, -1).float()
+    assert cap_in.shape == cap_out.shape
+    assert cap_in.shape == (4 * 8, model.config.hidden_size)
+    assert cap_in.dtype == torch.bfloat16 and cap_out.dtype == torch.bfloat16
 
-    # The buffer runs in bf16; compare with a tolerance via per-row cosine sim.
-    a = buf.reshape(-1, buf.shape[-1])
-    b = ref["x"].reshape(-1, ref["x"].shape[-1]).float()
-    cos = torch.nn.functional.cosine_similarity(a, b, dim=-1)
-    assert cos.min().item() > 0.98, f"cascade buffer diverged: min cos {cos.min()}"
+    x3d = cap_in.to(torch.float32).reshape(1, -1, model.config.hidden_size)
+    with torch.no_grad():
+        out = ref.mlp(x3d)
+    out = (out[0] if isinstance(out, tuple) else out).reshape(
+        -1, model.config.hidden_size)
+    cos = torch.nn.functional.cosine_similarity(out.float(), cap_out.float(), dim=-1)
+    assert cos.min().item() > 0.99, f"capture i/o mismatch: min cos {cos.min()}"
+
+
+def test_capture_mlp_io_respects_pool_size():
+    """The pool is capped at pool_size; the forward loop stops early."""
+    model = _tiny_moe_model()
+    ref = list(iter_moe_layers(model))[0]
+    batches = _id_batches(model, n_seq=16, seq_len=8, chunk=4)  # 128 tokens
+    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=40)
+    assert cap_in.shape[0] == 40 and cap_out.shape[0] == 40
 
 
 # ---------------------------------------------------------------------------
 # _heal_layer — end-to-end after bank.select() re-indexing
 # ---------------------------------------------------------------------------
 
+# Kept ids chosen so the max kept id (7) exceeds n_kept (4): a heal that indexed
+# banks by original expert id instead of post-select position would raise.
+_KEPT = [0, 2, 5, 7]
+
+
+def _heal_cfg(**overrides) -> _HealConfig:
+    base = {
+        "merge_heal_enabled": True, "merge_heal_lr": 1.0e-3,
+        "merge_heal_max_steps": 300, "merge_heal_eval_interval": 20,
+        "merge_heal_patience": 20, "merge_heal_minibatch_size": 16,
+    }
+    base.update(overrides)
+    return _HealConfig(base)
+
 
 def test_heal_layer_runs_after_bank_select_reindexing():
-    """`_heal_layer` runs AFTER `bank.select()` has re-indexed the expert banks
-    to 0..n_kept-1. It must index banks by post-select POSITION, not by the
-    original expert id — kept ids deliberately include ids >= n_kept here, so
-    an original-id index would raise (or read the wrong expert)."""
+    """`_heal_layer` runs AFTER `bank.select()` re-indexed the banks to
+    0..n_kept-1; it must index by post-select POSITION. With a reachable
+    self-distillation target the heal is accepted and the weights move."""
     model = _tiny_moe_model()
-    tower = _find_text_tower(model)
-    refs = list(iter_moe_layers(model))
-    ref = refs[1]  # heal the middle layer
+    ref = list(iter_moe_layers(model))[1]
+    batches = _id_batches(model)
 
-    n_seq, seq_len = 4, 8
-    ids = torch.randint(0, model.config.vocab_size, (n_seq, seq_len))
-    cb = _CascadeBuffer(
-        model, tower, ids, seq_len=seq_len, batch_size=2, device=torch.device("cpu"),
-    )
-    cb.advance_to(ref.layer_idx)
-
-    # Simulate a merge: keep 4 of 8 experts, ids chosen so max kept id (7) > n_kept (4).
-    final_kept_ids = [0, 2, 5, 7]
-    grouped = {0: [0, 1], 2: [2], 5: [5], 7: [7, 4, 6]}  # 0 and 7 absorbed children
-    banks = build_banks(ref)
-    for bank in banks.values():
-        bank.select(final_kept_ids)
-    _resize_router_for_kept_experts(ref, final_kept_ids)
-
-    # Pre-heal snapshot of a merged centroid (post-select position 0 == id 0).
-    before = banks["gate_proj"].get(0).detach().clone()
-
-    heal_cfg = _HealConfig(
-        {
-            "merge_heal_enabled": True, "merge_heal_sidecar_path": "dummy.pt",
-            "merge_heal_optimizer": "muon", "merge_heal_max_steps": 30,
-            "merge_heal_eval_interval": 10, "merge_heal_patience": 3,
-            "merge_heal_token_cap": 256, "merge_heal_minibatch_size": 16,
-        },
-        Path("/tmp"),
-    )
-    teacher_out = torch.randn(cb.n_tokens, model.config.hidden_size, dtype=torch.bfloat16)
+    # Capture BEFORE merge — target = the layer's own pre-merge MoE output.
+    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+    _merge_layer(ref, _KEPT)
+    before = build_banks(ref)["gate_proj"].get(0).detach().clone()
 
     state = _heal_layer(
-        layer_ref=ref, grouped=grouped, final_kept_ids=final_kept_ids,
-        cascade_buffer=cb, teacher_layer_output=teacher_out,
-        heal_cfg=heal_cfg, device=torch.device("cpu"),
+        layer_ref=ref, final_kept_ids=_KEPT,
+        captured_input=cap_in, captured_target=cap_out,
+        heal_cfg=_heal_cfg(), device=_CPU,
     )
-
     assert state["steps"] > 0
     assert state["stop_reason"] in ("max_steps", "patience")
-    # A merged centroid must have been updated by the heal.
+    assert state["accepted"] is True
     after = build_banks(ref)["gate_proj"].get(0).detach()
     assert not torch.equal(before, after), "merged centroid weights did not change"
+
+
+def test_heal_layer_all_experts_trainable():
+    """Every kept expert trains — including singletons. (The old SH design
+    wrongly froze singletons.) Position 1 (id 2) is a singleton kept expert;
+    its weights must move when the heal is accepted."""
+    model = _tiny_moe_model()
+    ref = list(iter_moe_layers(model))[1]
+    batches = _id_batches(model)
+    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+    _merge_layer(ref, _KEPT)
+    singleton_before = build_banks(ref)["down_proj"].get(1).detach().clone()
+
+    state = _heal_layer(
+        layer_ref=ref, final_kept_ids=_KEPT,
+        captured_input=cap_in, captured_target=cap_out,
+        heal_cfg=_heal_cfg(), device=_CPU,
+    )
+    assert state["accepted"] is True
+    singleton_after = build_banks(ref)["down_proj"].get(1).detach()
+    assert not torch.equal(singleton_before, singleton_after), (
+        "singleton kept expert was frozen — all kept experts must train"
+    )
+
+
+def test_heal_layer_accept_reject_revert():
+    """Monotone-safe guard: when the heal cannot beat the plain merge the layer
+    is REVERTED. Capturing the target AFTER the merge makes the plain-merged
+    output the target — the heal starts at ~0 MSE and (with a large lr) can
+    only move away → rejected, banks + router byte-identical to the merge."""
+    model = _tiny_moe_model()
+    ref = list(iter_moe_layers(model))[1]
+    batches = _id_batches(model)
+    _merge_layer(ref, _KEPT)
+    # Target == the plain-merged layer's own output.
+    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+
+    banks = build_banks(ref)
+    snap = {n: [banks[n].get(p).detach().clone() for p in range(len(_KEPT))]
+            for n in MATRIX_NAMES}
+    router_snap = ref.router.weight.detach().clone()
+
+    state = _heal_layer(
+        layer_ref=ref, final_kept_ids=_KEPT,
+        captured_input=cap_in, captured_target=cap_out,
+        heal_cfg=_heal_cfg(merge_heal_lr=1.0e-2, merge_heal_max_steps=60,
+                           merge_heal_eval_interval=10, merge_heal_patience=3),
+        device=_CPU,
+    )
+    assert state["accepted"] is False
+    banks2 = build_banks(ref)
+    for n in MATRIX_NAMES:
+        for p in range(len(_KEPT)):
+            assert torch.equal(banks2[n].get(p), snap[n][p]), (
+                f"rejected heal left {n}[{p}] modified — must revert to plain merge"
+            )
+    assert torch.equal(ref.router.weight.detach(), router_snap)
+
+
+def test_heal_layer_router_flag():
+    """`merge_heal_train_router` gates router training: the resized router
+    changes iff the flag is True (experts always train regardless)."""
+    for train_router in (True, False):
+        model = _tiny_moe_model()
+        ref = list(iter_moe_layers(model))[1]
+        batches = _id_batches(model)
+        cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU,
+                                          pool_size=10_000)
+        _merge_layer(ref, _KEPT)
+        router_after_resize = ref.router.weight.detach().clone()
+
+        state = _heal_layer(
+            layer_ref=ref, final_kept_ids=_KEPT,
+            captured_input=cap_in, captured_target=cap_out,
+            heal_cfg=_heal_cfg(merge_heal_train_router=train_router),
+            device=_CPU,
+        )
+        assert state["accepted"] is True
+        router_changed = not torch.equal(
+            ref.router.weight.detach(), router_after_resize)
+        assert router_changed is train_router, (
+            f"train_router={train_router} but router_changed={router_changed}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _write_heal_weights / _load_heal_weights — checkpoint round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_heal_weights_roundtrip_all_experts(tmp_path):
+    """The per-layer healed-weight checkpoint round-trips EVERY kept expert
+    (merged + singleton) and the router, under format_version 2."""
+    model = _tiny_moe_model()
+    ref = list(iter_moe_layers(model))[1]
+    _merge_layer(ref, _KEPT)
+
+    banks = build_banks(ref)
+    expected = {n: [banks[n].get(p).detach().clone() for p in range(len(_KEPT))]
+                for n in MATRIX_NAMES}
+    router_expected = ref.router.weight.detach().clone()
+
+    _write_heal_weights(tmp_path, ref, _KEPT, accepted=True)
+    pt = tmp_path / f"_heal_weights_layer_{ref.layer_idx}.pt"
+    assert pt.exists()
+    payload = torch.load(pt, map_location="cpu", weights_only=True)
+    assert payload["format_version"] == 2
+    assert payload["accepted"] is True
+    assert len(payload["healed_experts"]) == len(_KEPT)  # ALL kept experts
+
+    # Perturb the banks, then reload — every kept expert must be restored.
+    banks2 = build_banks(ref)
+    with torch.no_grad():
+        for n in MATRIX_NAMES:
+            for p in range(len(_KEPT)):
+                banks2[n].set(p, torch.zeros_like(banks2[n].get(p)))
+    _load_heal_weights(tmp_path, ref, _KEPT)
+
+    banks3 = build_banks(ref)
+    for n in MATRIX_NAMES:
+        for p in range(len(_KEPT)):
+            assert torch.allclose(banks3[n].get(p), expected[n][p], atol=1e-5), (
+                f"{n}[{p}] did not round-trip"
+            )
+    assert torch.allclose(ref.router.weight.detach(), router_expected, atol=1e-5)
