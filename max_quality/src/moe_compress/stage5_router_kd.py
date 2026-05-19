@@ -33,7 +33,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
+from .utils.calibration import (
+    build_calibration_tensor,
+    iter_batches,
+    shared_calibration_cache_dir,
+    spec_from_config,
+)
 from .utils.model_io import (
     iter_moe_layers,
     load_model,
@@ -612,7 +617,8 @@ def run(
         seed_offset=_seed_offset,
     )
     calib = build_calibration_tensor(
-        tokenizer, spec, cache_dir=(os.environ.get("MOE_CALIB_CACHE_DIR") or (artifacts_dir / "_calibration_cache"))
+        tokenizer, spec,
+        cache_dir=(os.environ.get("MOE_CALIB_CACHE_DIR") or shared_calibration_cache_dir(artifacts_dir)),
     )
     batches = iter_batches(calib, batch_size=s5["batch_size"])
     grad_accum = s5["gradient_accumulation"]
