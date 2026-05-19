@@ -157,7 +157,7 @@ _A8_BASE: dict[str, Any] = {**_A7_BASE, "expert_distill_steps": 500}
 ABLATION_DELTAS: list[tuple[str, dict[str, Any]]] = [
     ("A0",  {}),
     ("A1",  {"assignment_solver": "auto"}),
-    ("A1_oldkd", {"assignment_solver": "auto", "stage5_router_kd": {"epochs": 1, "max_calibration_samples": 3000, "kd_temperature_start": 1.0, "kd_temperature_end": 1.0}}),
+    ("A1_oldkd", {"assignment_solver": "auto", "stage5_router_kd": {"epochs": 1, "max_calibration_samples": 3000, "kd_temperature": 1.0}}),
     ("A2",  {"assignment_solver": "auto", "cost_alignment": "post", "cost_whitening": "diag"}),
     ("A3",  {"assignment_solver": "auto", "cost_alignment": "post", "cost_whitening": "diag", "cost_asymmetric": True}),
     ("A4",  _A4_BASE),

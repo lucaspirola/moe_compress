@@ -616,12 +616,16 @@ def run(
     )
     batches = iter_batches(calib, batch_size=s5["batch_size"])
     grad_accum = s5["gradient_accumulation"]
-    # Temperature ramp (Move B): linear from start → end over the full
-    # optimizer-step count. If start == end, behaves as a constant temperature
-    # (rollback / legacy). Falls back to the legacy scalar `kd_temperature` if
-    # the start/end keys are absent.
-    T_start = float(s5.get("kd_temperature_start", s5.get("kd_temperature", 1.0)))
-    T_end = float(s5.get("kd_temperature_end", s5.get("kd_temperature", 1.0)))
+    # Distillation temperature — a CONSTANT, deliberately not a curriculum.
+    # Post-merge router recovery is self-healing, not cross-capacity
+    # distillation: the student is the (compressed) teacher being repaired, so
+    # Hinton's soft-target "dark knowledge" rationale does not apply. T>1 only
+    # optimizes a softened proxy distribution nobody runs at serve time, and a
+    # downward *ramp* additionally makes the logged KL non-stationary
+    # (loss/T^2 is the softened-distribution KL — it drifts with T regardless
+    # of model quality), which corrupts the save-best / early-stop guards. T=1
+    # makes the loss the true forward-KL to the teacher == the deploy target.
+    T = float(s5.get("kd_temperature", 1.0))
     ckpt_every = int(s5.get("checkpoint_every_n_steps", 100))
     if ckpt_every <= 0:
         raise ValueError(
@@ -818,29 +822,6 @@ def run(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optim, _lr_lambda)
 
-    # Temperature ramp closure (Move B). Uses total_optim_steps so the ramp
-    # endpoint coincides with the cosine endpoint.
-    #
-    # kd_temperature_ramp_fraction (default 1.0): the ramp completes over the
-    # first `fraction` of total_optim_steps, then T is held at T_end. At the
-    # default 1.0 the ramp spans the whole schedule and this is byte-identical
-    # to pre-2026-05-17 `main`. A value < 1.0 finishes the 4.0→1.0 ramp early
-    # and holds T_end for the remainder — opt-in mitigation for the late
-    # sharpening that drives the back-half overfit (see tasks/kd_fix_plan.md).
-    _T_ramp_fraction = float(s5.get("kd_temperature_ramp_fraction", 1.0))
-    if not (0.0 < _T_ramp_fraction <= 1.0):
-        raise ValueError(
-            f"Stage 5: kd_temperature_ramp_fraction={_T_ramp_fraction} must be "
-            "in (0.0, 1.0]; 1.0 ramps over the whole schedule (default)."
-        )
-    _T_ramp_steps = max(1, int(total_optim_steps * _T_ramp_fraction))
-
-    def _current_T(global_step: int) -> float:
-        if T_start == T_end:
-            return T_start
-        p = min(max(global_step / _T_ramp_steps, 0.0), 1.0)
-        return T_start + (T_end - T_start) * p
-
     # Best-tracker state (Move A). Initialized here so resume-restore below can
     # overwrite when restarting from a v2 checkpoint.
     _best_ema_alpha = float(s5.get("best_metric_ema_alpha", 0.2))
@@ -912,9 +893,7 @@ def run(
         "stage5/config/calib_total_tokens": int(spec.num_sequences * spec.sequence_length),
         "stage5/config/grad_accum": int(grad_accum),
         "stage5/config/epochs": int(s5["epochs"]),
-        "stage5/config/kd_temperature_start": T_start,
-        "stage5/config/kd_temperature_end": T_end,
-        "stage5/config/kd_temperature_ramp_fraction": _T_ramp_fraction,
+        "stage5/config/kd_temperature": T,
         "stage5/config/early_stop_patience": int(_early_stop_patience),
         "stage5/config/shuffle_batches_each_epoch": bool(
             s5.get("shuffle_batches_each_epoch", False)
@@ -1016,9 +995,10 @@ def run(
         # and pay one .item() sync at log-emission time, instead of paying
         # device→host sync per microbatch (~375/epoch at full scale).
         window_loss_acc: list[torch.Tensor] = []
-        # Raw KL = loss / T^2 — invariant under the temperature ramp, so it
-        # remains comparable across the run and across runs with different T
-        # schedules. Used by the best-checkpoint tracker.
+        # raw_kl = loss / T^2 strips Hinton's gradient-scaling factor. With a
+        # CONSTANT temperature (no ramp) it is stationary across the run, so it
+        # is a sound save-best / early-stop metric; at the default T=1 it
+        # equals the loss itself — the true forward-KL to the teacher.
         window_raw_kl_acc: list[torch.Tensor] = []
         # `i` is the iteration POSITION within the epoch (drives the grad-accum
         # window, resume fast-forward and checkpoint batch_idx). `_batch_order`
@@ -1122,9 +1102,6 @@ def run(
             # to 512 here so a missing config can't degrade to a non-spec
             # chunked loop.
             seq_chunk = int(s5.get("kd_seq_chunk_size", 512))
-            # Temperature ramps with the optimizer step (piece-wise constant
-            # across the grad_accum micro-batches that compose one step).
-            T = _current_T(step)
             kl_loss = _chunked_vocab_kl(s_logits_shift, t_logits_shift, T, chunk_size=seq_chunk)
 
             # --- Direction E: per-layer merge-repair MSE term ---
@@ -1260,13 +1237,12 @@ def run(
                             _early_stopped = True
 
                     current_lr = scheduler.get_last_lr()[0]
-                    current_T = _current_T(step)
 
                     log.info(
                         "  epoch=%d step=%d window_loss=%.6f raw_kl=%.6f "
                         "ema=%.6f best_ema=%.6f@%d lr=%.3e T=%.3f grad_norm=%.4f | %s",
                         epoch, step, loss_val, raw_kl_val, ema, best_raw_kl_ema,
-                        best_step, current_lr, current_T, grad_norm, _rt_snap(),
+                        best_step, current_lr, T, grad_norm, _rt_snap(),
                     )
                     payload = {
                         "stage5/epoch": epoch,
@@ -1277,7 +1253,7 @@ def run(
                         "stage5/best_raw_kl_ema": best_raw_kl_ema,
                         "stage5/best_step": best_step,
                         "stage5/lr": current_lr,
-                        "stage5/temperature": current_T,
+                        "stage5/temperature": T,
                         "stage5/grad_norm": grad_norm,
                         "stage5/no_improve_windows": no_improve_windows,
                     }

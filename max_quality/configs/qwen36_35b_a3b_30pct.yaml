@@ -323,38 +323,21 @@ stage5_router_kd:
                                   # best-tracker; α=0.2 damps the first ~5
                                   # log windows so the early noise floor can't
                                   # win the best slot.
-  # Move B — temperature ramp.
-  kd_temperature_start: 4.0       # Soft targets early — broader posterior helps
-                                  # the router escape the cold-start regime.
-  kd_temperature_end: 1.0         # Hard targets late — tighter posterior pulls
-                                  # the router toward the teacher's modes.
-                                  # Linear interpolation between start/end over
-                                  # the first kd_temperature_ramp_fraction of
-                                  # the optimizer step count, then held at
-                                  # kd_temperature_end.
-  kd_temperature_ramp_fraction: 1.0  # 2026-05-17 (overfit fix, opt-in). Fraction
-                                  # of total_optim_steps over which the 4.0→1.0
-                                  # ramp completes. 1.0 = ramp spans the whole
-                                  # schedule (current behaviour — DEFAULT, byte-
-                                  # identical to main). Set <1.0 (e.g. 0.5) to
-                                  # finish the ramp early and hold T_end for the
-                                  # rest: shortens the late T→1 sharpening that
-                                  # the S0 run showed drives the back-half
-                                  # overfit. Result-changing — opt-in only.
-  # 2026-05-17 — overfit-fix knobs. All default to a NO-OP / current behaviour;
-  # the flag-off path is byte-identical to main. See tasks/kd_fix_plan.md.
+  # Temperature: see `kd_temperature` below — CONSTANT T=1, no ramp. The
+  # former kd_temperature_start/end/ramp_fraction curriculum was removed: a
+  # downward ramp makes the logged raw_kl non-stationary (it is the softened-
+  # distribution KL, which drifts with T) and corrupts save-best / early-stop.
   early_stop_patience: 8          # >0 enables patience-based early stopping on
                                   # the SAME raw_kl EMA that save_best tracks.
                                   # After this many consecutive log windows with
                                   # no EMA improvement, training stops cleanly
                                   # (best.pt already holds the optimum). 0 =
-                                  # disabled (loop runs the full schedule, byte-
-                                  # identical to main). Default 8: at
-                                  # log_every_n_steps the S0 raw_kl had drifted
-                                  # monotonically up for >>8 windows past its
-                                  # step-~250 optimum, so 8 stops well before the
-                                  # wasted back half without risking a premature
-                                  # cut on transient noise.
+                                  # disabled (loop runs the full schedule).
+                                  # NOTE: the original "8" was justified by S0's
+                                  # raw_kl "drifting monotonically up" — but that
+                                  # drift was confounded by the now-removed
+                                  # temperature ramp (raw_kl rises as T falls).
+                                  # Re-audit this value at constant T=1.
   shuffle_batches_each_epoch: false  # When true, permute the batch ITERATION
                                   # order each epoch with a deterministic
                                   # epoch-seeded RNG (reduces identical-replay
@@ -381,10 +364,13 @@ stage5_router_kd:
   # (enforced at load time in stage5_router_kd._get_teacher).
   teacher_model_repo: null
   max_sequence_length: 512
-  kd_temperature: 1.0             # Legacy scalar fallback. Active runs use
-                                  # kd_temperature_start/end (above). Kept
-                                  # for any pre-Move-B code path that still
-                                  # reads this scalar.
+  kd_temperature: 1.0             # Distillation temperature — CONSTANT, no
+                                  # ramp. Post-merge router recovery is self-
+                                  # healing (the student is the compressed
+                                  # teacher), not cross-capacity KD; T=1 makes
+                                  # the loss the true forward-KL to the teacher,
+                                  # the logged metric stationary + honest, and
+                                  # the objective == the deploy target. Keep 1.0.
   # teacher_logits_cache: a precomputed teacher-logits sidecar that lets Stage
   # 2.5 skip the live 35B teacher forward entirely (see hf_jobs/
   # precompute_teacher_logits.py). With epochs=1 (the default) the cache is

@@ -58,9 +58,9 @@ def _cfg_for_early_stop(
     s5["max_calibration_samples"] = n_samples
     s5["early_stop_patience"] = patience
     # Constant temperature so raw_kl == loss and the metric trajectory is the
-    # genuine teacher↔student signal, not a T-ramp artefact.
-    s5["kd_temperature_start"] = 1.0
-    s5["kd_temperature_end"] = 1.0
+    # genuine teacher↔student signal, not a T-ramp artefact. (T=1 is now the
+    # only mode — the ramp was removed — but set it explicitly for clarity.)
+    s5["kd_temperature"] = 1.0
     cfg["logging"] = dict(cfg.get("logging", {}))
     cfg["logging"]["log_every_n_steps"] = log_every
     return cfg
