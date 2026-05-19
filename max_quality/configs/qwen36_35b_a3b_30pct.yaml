@@ -204,7 +204,7 @@ stage2_reap_ream:
   merge_heal_holdout_fraction: 0.10  # 90/10 train/held-out split
   merge_heal_patience: 5           # early-stop: held-out evals w/o improvement
   merge_heal_eval_interval: 25     # steps between held-out MSE evals
-  merge_heal_max_steps: 2000       # safety cap; step count is early-stop-driven
+  merge_heal_max_steps: 80000      # safety cap; step count is early-stop-driven
   merge_heal_token_cap: 262144     # captured (input,target) pool size per layer
   merge_heal_minibatch_size: 8192  # rows per training step / held-out eval chunk
                                    # — minibatches drawn from the captured pool;
