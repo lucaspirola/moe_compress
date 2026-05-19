@@ -2964,16 +2964,26 @@ def _heal_layer(
 
         if steps_done % heal_cfg.eval_interval == 0:
             h = _holdout_mse()
-            if h < best_holdout:
+            improved = h < best_holdout
+            if improved:
                 best_holdout = h
                 best_state = _snapshot()
                 train_mse_at_best = last_train_mse
                 evals_since_improve = 0
             else:
                 evals_since_improve += 1
-                if evals_since_improve >= heal_cfg.patience:
-                    stop_reason = "patience"
-                    break
+            # Per-eval progress line — without it a layer heals silently for up
+            # to merge_heal_max_steps (80k) steps. Cadence == eval_interval.
+            log.info(
+                "    heal layer %d: step %d/%d — train_mse=%.6e holdout_mse=%.6e "
+                "best=%.6e %s (patience %d/%d)",
+                layer_idx, steps_done, heal_cfg.max_steps, last_train_mse, h,
+                best_holdout, "improved" if improved else "no-improve",
+                evals_since_improve, heal_cfg.patience,
+            )
+            if not improved and evals_since_improve >= heal_cfg.patience:
+                stop_reason = "patience"
+                break
 
     # --- Accept/reject: monotone-safe guard --------------------------------
     # Accept the healed weights only if the best healed held-out MSE strictly
