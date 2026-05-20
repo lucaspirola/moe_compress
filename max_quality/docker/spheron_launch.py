@@ -469,18 +469,34 @@ _TERMINAL_DEPLOYMENT_STATUSES = {
 }
 
 
+def _resolve_volume_handle(client: SpheronClient, volume_id_or_handle: str) -> str:
+    """Spheron volumes carry two ids: a mongo-style `id` (used by
+    /api/volumes/{id} CRUD) and an akash-style `volumeId`
+    (`computefilesystem-…`) used by the deployment attachment payload.
+    Take whichever the caller passed and return the akash handle."""
+    if volume_id_or_handle.startswith("computefilesystem-"):
+        return volume_id_or_handle
+    for vol in client.list_volumes():
+        if vol.get("id") == volume_id_or_handle:
+            return vol.get("volumeId") or volume_id_or_handle
+    return volume_id_or_handle
+
+
 def _check_no_active_deployment_on_volume(
-    client: SpheronClient, volume_id: str,
+    client: SpheronClient, volume_handle: str,
 ) -> None:
     """I2 guard: fail fast if another deployment is still attached to this
-    volume — two GPUs writing to the same `/cache` would corrupt Stage 2."""
+    volume — two GPUs writing to the same `/cache` would corrupt Stage 2.
+
+    `volume_handle` is the akash-style id (the form deployments use in their
+    `volumeIds` array)."""
     for d in client.list_deployments():
         vids = d.get("volumeIds") or []
         status = (d.get("status") or "").lower()
-        if volume_id in vids and status not in _TERMINAL_DEPLOYMENT_STATUSES:
+        if volume_handle in vids and status not in _TERMINAL_DEPLOYMENT_STATUSES:
             raise RuntimeError(
-                f"volume {volume_id} is already attached to deployment "
-                f"{d.get('_id') or d.get('id')} (status={status}, "
+                f"volume {volume_handle} is already attached to deployment "
+                f"{d.get('id') or d.get('_id')} (status={status}, "
                 f"name={d.get('name')}). Two phases on the same volume would "
                 "corrupt Stage 2 output. Teardown that deployment first."
             )
@@ -493,7 +509,11 @@ def _launch_phase(*, phase: str, offer_id: str, volume_id: str,
     after `create_deployment` succeeds, deletes the deployment before
     re-raising so we never leak a billing GPU instance (C3)."""
     client = SpheronClient(_read_spheron_key())
-    _check_no_active_deployment_on_volume(client, volume_id)
+    # `volume_id` may be the user-facing mongo-style id; the deployment
+    # payload needs the akash-style `volumeId` handle. Resolve either form
+    # to the akash handle for both the concurrency guard and the create.
+    volume_handle = _resolve_volume_handle(client, volume_id)
+    _check_no_active_deployment_on_volume(client, volume_handle)
     hf_token = _read_hf_token()
     cloud_init = _make_cloud_init(
         phase=phase, branch=branch, hf_token=hf_token,
@@ -501,10 +521,10 @@ def _launch_phase(*, phase: str, offer_id: str, volume_id: str,
     )
     name = f"moe-sh-{phase}-{int(time.time())}"
     team_id = client.get_team_id()
-    log.info("creating %s deployment %s (offer=%s, volume=%s, team=%s)",
-             phase, name, offer_id, volume_id, team_id)
+    log.info("creating %s deployment %s (offer=%s, volume=%s [handle=%s], team=%s)",
+             phase, name, offer_id, volume_id, volume_handle, team_id)
     dep = client.create_deployment(
-        offer_id=offer_id, ssh_key_id=ssh_key_id, volume_ids=[volume_id],
+        offer_id=offer_id, ssh_key_id=ssh_key_id, volume_ids=[volume_handle],
         cloud_init=cloud_init, name=name, team_id=team_id,
     )
     dep_id = dep.get("_id") or dep.get("id")
