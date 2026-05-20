@@ -65,7 +65,10 @@ HF_TOKEN_PATH = Path(
 PROVIDER = "spheron-es"
 REGION = "US Central 1"
 RTX6000_OFFER_ID = "US Central 1::gpu-rtx6000::1gpu-24vcpu-218gb"     # $2.405/hr
+RTX6000_GPU_TYPE = "RTXPRO6000_PCIE"
 H200_OFFER_ID = "US Central 1::gpu-h200-sxm::1gpu-16vcpu-200gb"        # $4.615/hr
+H200_GPU_TYPE = "H200_SXM5"
+DEFAULT_GPU_COUNT = 1
 OS_IMAGE = "Ubuntu 24.04 (CUDA 13)"
 DEFAULT_VOLUME_NAME = "moe-sh-split"
 DEFAULT_VOLUME_SIZE_GB = 500
@@ -191,12 +194,15 @@ class SpheronClient:
         return payload if isinstance(payload, list) else payload.get("deployments", [])
 
     def create_deployment(
-        self, *, offer_id: str, ssh_key_id: str, volume_ids: list[str],
-        cloud_init: str, name: str, team_id: str,
+        self, *, offer_id: str, gpu_type: str, gpu_count: int,
+        ssh_key_id: str, volume_ids: list[str], cloud_init: str,
+        name: str, team_id: str,
     ) -> dict[str, Any]:
         body = {
             "provider": PROVIDER,
             "offerId": offer_id,
+            "gpuType": gpu_type,
+            "gpuCount": gpu_count,
             "region": REGION,
             "operatingSystem": OS_IMAGE,
             "instanceType": "DEDICATED",
@@ -502,7 +508,7 @@ def _check_no_active_deployment_on_volume(
             )
 
 
-def _launch_phase(*, phase: str, offer_id: str, volume_id: str,
+def _launch_phase(*, phase: str, offer_id: str, gpu_type: str, volume_id: str,
                   volume_name: str, branch: str, hf_bucket: str,
                   ssh_key_id: str, timeout_s: int) -> tuple[SpheronClient, dict[str, Any]]:
     """Create the deployment, wait for it to be SSH-able. On ANY failure
@@ -524,7 +530,8 @@ def _launch_phase(*, phase: str, offer_id: str, volume_id: str,
     log.info("creating %s deployment %s (offer=%s, volume=%s [handle=%s], team=%s)",
              phase, name, offer_id, volume_id, volume_handle, team_id)
     dep = client.create_deployment(
-        offer_id=offer_id, ssh_key_id=ssh_key_id, volume_ids=[volume_handle],
+        offer_id=offer_id, gpu_type=gpu_type, gpu_count=DEFAULT_GPU_COUNT,
+        ssh_key_id=ssh_key_id, volume_ids=[volume_handle],
         cloud_init=cloud_init, name=name, team_id=team_id,
     )
     dep_id = dep.get("_id") or dep.get("id")
@@ -625,8 +632,8 @@ def _safe_teardown(client: SpheronClient, dep_id: str, reason: str) -> None:
 
 
 def _phase_run_and_teardown(
-    *, phase: str, offer_id: str, volume_id: str, volume_name: str,
-    branch: str, hf_bucket: str, ssh_key_id: str,
+    *, phase: str, offer_id: str, gpu_type: str, volume_id: str,
+    volume_name: str, branch: str, hf_bucket: str, ssh_key_id: str,
     provisioning_timeout: int, run_timeout: int, keep_running: bool,
 ) -> dict[str, Any]:
     """Full lifecycle for one phase: launch → SSH-poll until done → teardown.
@@ -644,9 +651,10 @@ def _phase_run_and_teardown(
     box up burns $2-5/hr without yielding diagnostic value the volume
     doesn't already carry."""
     client, dep = _launch_phase(
-        phase=phase, offer_id=offer_id, volume_id=volume_id,
-        volume_name=volume_name, branch=branch, hf_bucket=hf_bucket,
-        ssh_key_id=ssh_key_id, timeout_s=provisioning_timeout,
+        phase=phase, offer_id=offer_id, gpu_type=gpu_type,
+        volume_id=volume_id, volume_name=volume_name, branch=branch,
+        hf_bucket=hf_bucket, ssh_key_id=ssh_key_id,
+        timeout_s=provisioning_timeout,
     )
     dep_id = dep.get("_id") or dep.get("id")
     ip = dep.get("ipAddress") or dep.get("ip")
@@ -700,7 +708,7 @@ def cmd_phase1(args: argparse.Namespace) -> int:
     client = SpheronClient(_read_spheron_key())
     ssh_key = args.ssh_key_id or _pick_default_ssh_key(client)
     result = _phase_run_and_teardown(
-        phase="stage2", offer_id=RTX6000_OFFER_ID,
+        phase="stage2", offer_id=RTX6000_OFFER_ID, gpu_type=RTX6000_GPU_TYPE,
         volume_id=args.volume_id, volume_name=args.volume_name,
         branch=args.branch, hf_bucket=args.hf_bucket, ssh_key_id=ssh_key,
         provisioning_timeout=POLL_DEPLOYMENT_READY_TIMEOUT,
@@ -715,7 +723,7 @@ def cmd_phase2(args: argparse.Namespace) -> int:
     client = SpheronClient(_read_spheron_key())
     ssh_key = args.ssh_key_id or _pick_default_ssh_key(client)
     result = _phase_run_and_teardown(
-        phase="stage2p5", offer_id=H200_OFFER_ID,
+        phase="stage2p5", offer_id=H200_OFFER_ID, gpu_type=H200_GPU_TYPE,
         volume_id=args.volume_id, volume_name=args.volume_name,
         branch=args.branch, hf_bucket=args.hf_bucket, ssh_key_id=ssh_key,
         provisioning_timeout=POLL_DEPLOYMENT_READY_TIMEOUT,
@@ -736,7 +744,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     volume_id = _resolve_or_create_volume(client, args.volume_name, args.size_gb)
     log.info("=== Phase 1: Stage 2 on RTX PRO 6000 ===")
     p1 = _phase_run_and_teardown(
-        phase="stage2", offer_id=RTX6000_OFFER_ID,
+        phase="stage2", offer_id=RTX6000_OFFER_ID, gpu_type=RTX6000_GPU_TYPE,
         volume_id=volume_id, volume_name=args.volume_name,
         branch=args.branch, hf_bucket=args.hf_bucket, ssh_key_id=ssh_key,
         provisioning_timeout=POLL_DEPLOYMENT_READY_TIMEOUT,
@@ -745,7 +753,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     log.info("=== Phase 2: Stage 2.5 + Stage 6 on H200 ===")
     p2 = _phase_run_and_teardown(
-        phase="stage2p5", offer_id=H200_OFFER_ID,
+        phase="stage2p5", offer_id=H200_OFFER_ID, gpu_type=H200_GPU_TYPE,
         volume_id=volume_id, volume_name=args.volume_name,
         branch=args.branch, hf_bucket=args.hf_bucket, ssh_key_id=ssh_key,
         provisioning_timeout=POLL_DEPLOYMENT_READY_TIMEOUT,
