@@ -272,22 +272,33 @@ def _make_cloud_init(*, phase: str, branch: str, hf_token: str,
         echo "[cloud-init] starting at $(date -u +%FT%TZ)"
 
         # ----- 1. Volume mount -------------------------------------------------
-        # Spheron's standard mount path is /mnt/<volume-name>. We probe in this
-        # order: (a) is it already a mountpoint? Done. (b) discover the
-        # attached block device via lsblk (any disk with no mountpoint) and
-        # mount it. (c) HARD-FAIL if neither works — Stage 2 writing to local
-        # disk would be silently lost on teardown.
+        # Spheron may pre-mount the volume at /mnt/<mountTag> (where mountTag
+        # is the volume name with non-alphanumeric chars stripped). We probe:
+        #   (a) is our target path already a mountpoint? Done.
+        #   (b) is the volume mounted somewhere ELSE under /mnt? bind-mount.
+        #   (c) is there an unmounted disk? mount it at our path.
+        #   (d) HARD-FAIL — Stage 2 writes to ephemeral local disk would be
+        #       silently lost on teardown (catastrophic).
         mkdir -p {volume_mount}
+        if ! mountpoint -q {volume_mount}; then
+            EXISTING_MNT=$(findmnt -lno TARGET --types ext4,xfs,btrfs 2>/dev/null \
+                | grep -E '^/mnt/' | grep -v '^{volume_mount}$' | head -1)
+            if [ -n "$EXISTING_MNT" ]; then
+                echo "[cloud-init] volume pre-mounted at $EXISTING_MNT — bind-mounting to {volume_mount}"
+                mount --bind "$EXISTING_MNT" {volume_mount} || true
+            fi
+        fi
         if ! mountpoint -q {volume_mount}; then
             DEV=$(lsblk -dnpo NAME,MOUNTPOINT,TYPE | awk '$3=="disk" && $2==""{{print $1; exit}}')
             if [ -n "$DEV" ]; then
-                echo "[cloud-init] mounting $DEV at {volume_mount}"
+                echo "[cloud-init] mounting unmounted disk $DEV at {volume_mount}"
                 mount "$DEV" {volume_mount} || true
             fi
         fi
         if ! mountpoint -q {volume_mount}; then
             echo "[cloud-init] FATAL: {volume_mount} is not a mountpoint — refusing to run"
             echo "[cloud-init] available disks:"; lsblk -p
+            echo "[cloud-init] existing mounts:"; findmnt -ln
             exit 1
         fi
         df -h {volume_mount}
@@ -353,20 +364,24 @@ def _resolve_or_create_volume(
     client: SpheronClient, name: str, size_gb: int,
 ) -> str:
     """Idempotent: return an existing volume's id if one with this name is
-    already provisioned in the target region; otherwise create one."""
+    already provisioned; otherwise create one. Spheron enforces unique
+    volume names per account, so a name match is sufficient (no need to
+    re-match on provider/region — the API returns `providerId` here, not
+    `provider`, and the responsibility for region matching is the API's)."""
     for vol in client.list_volumes():
-        if (vol.get("name") == name
-                and vol.get("provider") == PROVIDER
-                and vol.get("region") == REGION):
-            log.info("reusing existing volume id=%s name=%s size=%sGB status=%s",
-                     vol.get("_id") or vol.get("id"), name,
-                     vol.get("sizeInGb"), vol.get("status"))
-            return vol.get("_id") or vol.get("id")
+        if vol.get("name") == name:
+            log.info(
+                "reusing existing volume id=%s name=%s size=%sGB status=%s "
+                "(provider=%s region=%s)",
+                vol.get("id") or vol.get("_id"), name, vol.get("sizeInGb"),
+                vol.get("status"), vol.get("providerId"), vol.get("region"),
+            )
+            return vol.get("id") or vol.get("_id")
     log.info("creating volume name=%s size=%dGB on %s/%s ($%.4f/hr → $%.2f/day)",
              name, size_gb, PROVIDER, REGION,
              size_gb * 0.0001320313, size_gb * 0.0001320313 * 24)
     created = client.create_volume(name, size_gb)
-    vid = created.get("_id") or created.get("id")
+    vid = created.get("id") or created.get("_id")
     if not vid:
         raise RuntimeError(f"volume create returned no id: {created}")
     log.info("created volume id=%s", vid)
