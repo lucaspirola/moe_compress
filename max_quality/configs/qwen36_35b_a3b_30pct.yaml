@@ -204,10 +204,12 @@ stage2_reap_ream:
   merge_heal_holdout_fraction: 0.10  # 90/10 train/held-out split
   merge_heal_patience: 5           # early-stop: held-out evals w/o improvement
   merge_heal_eval_interval: 25     # steps between held-out MSE evals
-  merge_heal_min_rel_delta: 0.01   # patience resets only if h < best*(1 - this).
-                                   # 0 reproduces the historical never-stops bug
-                                   # (noise-level gains reset patience forever);
-                                   # 0.01 stops layer near its convergence knee.
+  merge_heal_min_rel_delta: 0.002  # patience resets only if h < best*(1 - this).
+                                   # 0 reproduces the historical never-stops bug;
+                                   # 0.01 stops near the convergence knee but
+                                   # left ~25% of available local-MSE descent
+                                   # on the table in the first H200 run; 0.002
+                                   # rides each layer to ~95% of available gain.
                                    # See tasks/heal_convergence_review.md.
   merge_heal_max_steps: 20000      # real safety cap; convergence is min-rel-delta-
                                    # patience-driven and fires well before this.
@@ -215,6 +217,31 @@ stage2_reap_ream:
   merge_heal_minibatch_size: 8192  # rows per training step / held-out eval chunk
                                    # — minibatches drawn from the captured pool;
                                    # bounds peak GPU memory on wide layers
+
+  # LR schedule (opt-in, inert when omitted). Linear warmup `0 → lr` over
+  # `lr_warmup_steps`, then half-cosine decay `lr → lr_min` over `lr_decay_steps`,
+  # then flat at `lr_min`. Defaults below target the heavy 128-merge layer's
+  # slow component (half-life ≈ 16k steps from the convergence-design data):
+  # heavy layers ride deeper into the decay; light layers stop early under
+  # min_rel_delta=0.002 and see LR at ~25–35% of peak (still meaningful refinement
+  # without over-cooling the early descent). Stacks with min_rel_delta=0.002 to
+  # lower the asymptote that the patience gate then halts against.
+  merge_heal_lr_warmup_steps: 200  # linear ramp; 200 ≈ AdamW moment warm-up.
+  merge_heal_lr_min: 1.0e-5        # cosine floor; 10% of peak lr.
+  merge_heal_lr_decay_steps: 16000 # cosine half-window; tuned to the slow
+                                   # component half-life of the heavy layer.
+
+  # Cross-domain (WikiText) holdout — telemetry only, never feeds gradients
+  # / accept-reject / save-best. Captures a parallel (input, target) pool from
+  # WikiText (same dataset/subset/split as the thermometer BPT eval) and
+  # evaluates a second `holdout_mse_xd` each eval. Diagnoses whether per-layer
+  # MSE learned on the Nemotron heal pool transfers to the WikiText routing
+  # distribution that `bpt_gap` actually measures.
+  merge_heal_cross_domain_holdout_enabled: true
+  merge_heal_xd_holdout_tokens: 26214  # = round(10% × merge_heal_token_cap)
+                                       # = round(0.10 × 262144) — matches the
+                                       # Nemotron 10% holdout row count for
+                                       # like-for-like MSE comparison.
 
 stage3_svd:
   scope: moe_experts_only         # NEVER change; attention SVD is off-spec

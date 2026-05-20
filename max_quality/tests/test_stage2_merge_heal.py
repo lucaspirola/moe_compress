@@ -28,6 +28,7 @@ from moe_compress.stage2_reap_ream import (
     _HealConfig,
     _capture_mlp_io,
     _heal_layer,
+    _heal_lr_at_step,
     _heal_student_moe_output,
     _load_heal_weights,
     _resize_router_for_kept_experts,
@@ -219,6 +220,298 @@ def test_heal_config_rejects_bad_holdout_fraction():
 def test_heal_config_rejects_bad_grad_clip():
     with pytest.raises(ValueError, match="grad_clip"):
         _HealConfig({"merge_heal_enabled": True, "merge_heal_grad_clip": 0.0})
+
+
+# ---------------------------------------------------------------------------
+# LR schedule — _HealConfig knobs, the helper, and end-to-end wiring
+# ---------------------------------------------------------------------------
+
+
+def test_heal_config_lr_schedule_defaults_are_inert():
+    """With only `merge_heal_enabled: true` the three LR-schedule knobs default
+    to inert values that reproduce the constant-LR Adam path: warmup=0, decay=0,
+    lr_min == lr."""
+    cfg = _HealConfig({"merge_heal_enabled": True})
+    assert cfg.lr_warmup_steps == 0
+    assert cfg.lr_decay_steps == 0
+    assert cfg.lr_min == cfg.lr
+
+
+def test_heal_config_rejects_bad_lr_min():
+    """`lr_min <= 0` and `lr_min > lr` both raise — out of (0, lr] range."""
+    with pytest.raises(ValueError, match="lr_min"):
+        _HealConfig({
+            "merge_heal_enabled": True, "merge_heal_lr": 1.0e-4,
+            "merge_heal_lr_min": 0.0,
+        })
+    with pytest.raises(ValueError, match="lr_min"):
+        _HealConfig({
+            "merge_heal_enabled": True, "merge_heal_lr": 1.0e-4,
+            "merge_heal_lr_min": 1.0e-3,  # > lr
+        })
+
+
+def test_heal_config_rejects_bad_decay_steps():
+    """Negative counts raise; warmup or warmup+decay exceeding max_steps raises;
+    a cosine with `lr_min == lr` (no-op) raises."""
+    # Negative warmup.
+    with pytest.raises(ValueError, match="lr_warmup_steps"):
+        _HealConfig({
+            "merge_heal_enabled": True, "merge_heal_lr_warmup_steps": -1,
+        })
+    # Negative decay.
+    with pytest.raises(ValueError, match="lr_decay_steps"):
+        _HealConfig({
+            "merge_heal_enabled": True, "merge_heal_lr_decay_steps": -1,
+        })
+    # Warmup >= max_steps (warmup never completes).
+    with pytest.raises(ValueError, match="warmup would never complete"):
+        _HealConfig({
+            "merge_heal_enabled": True,
+            "merge_heal_lr_warmup_steps": 2000, "merge_heal_max_steps": 2000,
+        })
+    # Warmup + decay > max_steps (cosine cannot reach lr_min).
+    with pytest.raises(ValueError, match="cosine schedule cannot reach lr_min"):
+        _HealConfig({
+            "merge_heal_enabled": True,
+            "merge_heal_lr_warmup_steps": 200,
+            "merge_heal_lr_decay_steps": 2000,
+            "merge_heal_lr_min": 1.0e-5,
+            "merge_heal_max_steps": 2000,
+        })
+    # decay > 0 with lr_min == lr: cosine would be a no-op.
+    with pytest.raises(ValueError, match="cosine.*would be a no-op"):
+        _HealConfig({
+            "merge_heal_enabled": True, "merge_heal_lr_decay_steps": 100,
+        })
+    # lr_min < lr with decay_steps == 0: asymptote unreachable.
+    with pytest.raises(ValueError, match="asymptote is unreachable"):
+        _HealConfig({
+            "merge_heal_enabled": True, "merge_heal_lr": 1.0e-4,
+            "merge_heal_lr_min": 1.0e-5,
+            "merge_heal_lr_decay_steps": 0,
+        })
+
+
+def test_lr_schedule_warmup_then_cosine_then_floor():
+    """Pure-math test of `_heal_lr_at_step` — sample LRs at every phase boundary
+    and at one interior point of each phase; assert linear ramp, cosine endpoint
+    equalities, monotone decrease across the cosine, and held floor past end."""
+    lr, lr_min, warmup, decay = 1.0e-4, 1.0e-5, 100, 1000
+    kw = dict(lr=lr, lr_min=lr_min, warmup_steps=warmup, decay_steps=decay)
+
+    # Defensive: step < 0 raises.
+    with pytest.raises(ValueError, match="step="):
+        _heal_lr_at_step(-1, **kw)
+
+    # Linear warmup: step s takes lr * (s+1)/warmup.
+    assert _heal_lr_at_step(0, **kw) == pytest.approx(lr / warmup)         # first ramp step
+    assert _heal_lr_at_step(warmup // 2, **kw) == pytest.approx(
+        lr * (warmup // 2 + 1) / warmup)
+    assert _heal_lr_at_step(warmup - 1, **kw) == pytest.approx(lr)         # last ramp step
+
+    # Cosine first step (t=0) is continuous with warmup endpoint.
+    assert _heal_lr_at_step(warmup, **kw) == pytest.approx(lr)
+    # Mid-cosine (t = decay/2): cos(π/2) = 0, cos_term = 0.5.
+    assert _heal_lr_at_step(warmup + decay // 2, **kw) == pytest.approx(
+        lr_min + (lr - lr_min) * 0.5, rel=1e-9)
+    # Cosine endpoint (step = warmup+decay) lands at lr_min via the flat branch.
+    assert _heal_lr_at_step(warmup + decay, **kw) == pytest.approx(lr_min)
+    # Held floor past the end.
+    assert _heal_lr_at_step(warmup + decay + 9999, **kw) == pytest.approx(lr_min)
+
+    # Cosine is monotone non-increasing on its interval.
+    cosine_vals = [
+        _heal_lr_at_step(warmup + t, **kw)
+        for t in range(0, decay + 1, 50)
+    ]
+    for a, b in zip(cosine_vals, cosine_vals[1:]):
+        assert b <= a + 1e-15, f"cosine not monotone: {a} → {b}"
+
+    # Inert defaults: warmup=0, decay=0, lr_min==lr ⇒ constant lr at every step.
+    for s in (0, 1, 100, 99999):
+        assert _heal_lr_at_step(
+            s, lr=lr, lr_min=lr, warmup_steps=0, decay_steps=0
+        ) == pytest.approx(lr)
+
+
+def test_heal_config_cross_domain_holdout_inert_by_default():
+    """With only `merge_heal_enabled: true` the cross-domain holdout is OFF,
+    so Stage 2 will skip the WikiText capture entirely — disabled-default
+    contract."""
+    cfg = _HealConfig({"merge_heal_enabled": True})
+    assert cfg.cross_domain_holdout_enabled is False
+    # The token count still has a sensible default (only consulted when on).
+    assert cfg.xd_holdout_tokens >= 1
+
+
+def test_heal_config_rejects_bad_xd_holdout_tokens():
+    """When the cross-domain holdout is enabled, `xd_holdout_tokens < 1` is
+    rejected so a malformed YAML can't silently disable the capture."""
+    with pytest.raises(ValueError, match="xd_holdout_tokens"):
+        _HealConfig({
+            "merge_heal_enabled": True,
+            "merge_heal_cross_domain_holdout_enabled": True,
+            "merge_heal_xd_holdout_tokens": 0,
+        })
+
+
+def test_heal_layer_with_xd_holdout_reports_telemetry_and_leaves_decision_unchanged():
+    """When `_heal_layer` receives `xd_input`/`xd_target`, the returned state
+    dict carries the two cross-domain numbers — and accept/reject is keyed on
+    the SAME Nemotron metric the no-xd path uses, i.e. the verdict is identical
+    whether xd is fed in or not. (Determinism note: every RNG used by
+    `_heal_layer` is seeded by `layer_idx`, so a back-to-back invocation on
+    the same model state is byte-deterministic.)"""
+    # Build the same scenario the existing accept tests use, then run the heal
+    # twice: once without xd, once with a hand-crafted xd pool (random tokens
+    # the heal has never seen). The xd path must:
+    #   1. Populate `holdout_mse_xd` and `plain_merged_holdout_mse_xd` as
+    #      finite floats (no NaN passthrough when xd is supplied).
+    #   2. Leave `holdout_mse`, `accepted`, and `steps` byte-equal to the
+    #      no-xd run.
+    model = _tiny_moe_model()
+    ref = list(iter_moe_layers(model))[1]
+    batches = _id_batches(model, n_seq=64)  # the accept-margin pool
+    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+
+    # A second model freshly seeded the same way and merged identically — the
+    # heal must see the same starting weights on both runs, so we don't reuse
+    # the same `ref` (which gets mutated by _merge_layer + _heal_layer).
+    model_a = _tiny_moe_model()
+    ref_a = list(iter_moe_layers(model_a))[1]
+    _merge_layer(ref_a, _KEPT)
+    no_xd = _heal_layer(
+        layer_ref=ref_a, final_kept_ids=_KEPT,
+        captured_input=cap_in, captured_target=cap_out,
+        heal_cfg=_heal_cfg(), device=_CPU,
+    )
+    # `holdout_mse_xd` keys must exist in the no-xd return shape, NaN-valued,
+    # so downstream consumers can rely on the shape regardless of toggle.
+    assert "holdout_mse_xd" in no_xd
+    assert "plain_merged_holdout_mse_xd" in no_xd
+    import math as _math
+    assert _math.isnan(no_xd["holdout_mse_xd"])
+    assert _math.isnan(no_xd["plain_merged_holdout_mse_xd"])
+
+    # Build a synthetic xd pool: half the rows of cap_in, drawn from the tail
+    # so they are different rows from anything the heal will train on. Using
+    # the same `cap_out` rows as targets is fine — the test only checks that
+    # the MSE *computation* works and that xd is plumbed through; it does NOT
+    # check cross-corpus interpretability (that's what the H200 run is for).
+    n = cap_in.shape[0]
+    xd_in = cap_in[n // 2:].clone()
+    xd_out = cap_out[n // 2:].clone()
+
+    model_b = _tiny_moe_model()
+    ref_b = list(iter_moe_layers(model_b))[1]
+    _merge_layer(ref_b, _KEPT)
+    with_xd = _heal_layer(
+        layer_ref=ref_b, final_kept_ids=_KEPT,
+        captured_input=cap_in, captured_target=cap_out,
+        xd_input=xd_in, xd_target=xd_out,
+        heal_cfg=_heal_cfg(), device=_CPU,
+    )
+    # xd telemetry populated as finite floats.
+    assert _math.isfinite(with_xd["holdout_mse_xd"])
+    assert _math.isfinite(with_xd["plain_merged_holdout_mse_xd"])
+    assert with_xd["holdout_mse_xd"] >= 0.0
+    assert with_xd["plain_merged_holdout_mse_xd"] >= 0.0
+    # Accept/reject + step count + every Nemotron-derived metric is unaffected
+    # by the added telemetry — the xd path is read-only. Assert byte-equality
+    # (not approx) because both runs see identical seeded model state, identical
+    # captured tensors, and identical optimiser trajectories; pytest's `==`
+    # failure message is informative enough on a leak.
+    assert with_xd["accepted"] == no_xd["accepted"]
+    assert with_xd["steps"] == no_xd["steps"]
+    assert with_xd["stop_reason"] == no_xd["stop_reason"]
+    assert with_xd["holdout_mse"] == no_xd["holdout_mse"]
+    assert with_xd["plain_merged_holdout_mse"] == no_xd["plain_merged_holdout_mse"]
+    assert with_xd["heal_gap"] == no_xd["heal_gap"]
+    assert with_xd["train_mse"] == no_xd["train_mse"]
+    assert with_xd["train_mse_at_best"] == no_xd["train_mse_at_best"]
+
+
+def test_heal_layer_with_xd_holdout_raises_on_misaligned_pools():
+    """A shape mismatch between `xd_input` and `xd_target` indicates a token
+    alignment bug at the capture site — fail fast, don't silently produce a
+    bogus MSE."""
+    model = _tiny_moe_model()
+    ref = list(iter_moe_layers(model))[1]
+    batches = _id_batches(model, n_seq=16)
+    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+    _merge_layer(ref, _KEPT)
+    # Same first-axis size but a deliberately-broken second axis: simulates a
+    # capture-site bug where the input pool's hidden dim diverges from the
+    # target pool's.
+    bad_xd_in = cap_in.clone()
+    bad_xd_out = cap_out[:, :-1].clone()  # one fewer hidden dim
+    # The XD shape-mismatch site raises ValueError (Nemotron mismatch raises
+    # RuntimeError); pin to "cross-domain" so a future refactor that
+    # converted the Nemotron message to ValueError can't make this test
+    # silently match the wrong site.
+    with pytest.raises(ValueError, match="cross-domain.*token alignment"):
+        _heal_layer(
+            layer_ref=ref, final_kept_ids=_KEPT,
+            captured_input=cap_in, captured_target=cap_out,
+            xd_input=bad_xd_in, xd_target=bad_xd_out,
+            heal_cfg=_heal_cfg(), device=_CPU,
+        )
+
+
+def test_heal_layer_applies_lr_schedule(monkeypatch):
+    """`_heal_layer` mutates `opt.param_groups[0]['lr']` each step per the
+    schedule. Record the LR seen by `AdamW.step` over a short heal and assert
+    the sequence matches `_heal_lr_at_step` exactly — proves the schedule is
+    actually wired into the optimiser, not just computed and discarded."""
+    model = _tiny_moe_model()
+    ref = list(iter_moe_layers(model))[1]
+    batches = _id_batches(model, n_seq=16)
+    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+    _merge_layer(ref, _KEPT)
+
+    lr_peak, lr_min = 1.0e-3, 1.0e-4
+    warmup, decay = 4, 20
+    cfg = _heal_cfg(
+        merge_heal_lr=lr_peak,
+        merge_heal_lr_warmup_steps=warmup,
+        merge_heal_lr_min=lr_min,
+        merge_heal_lr_decay_steps=decay,
+        # Cap right at end-of-cosine so we exercise warmup + cosine + final-step,
+        # while staying under the validator's `warmup+decay <= max_steps` rule.
+        merge_heal_max_steps=warmup + decay,
+        merge_heal_eval_interval=2,
+        # Disable patience as a stopping mechanism — we want the full schedule.
+        merge_heal_patience=10_000,
+    )
+
+    recorded: list[float] = []
+    orig_step = torch.optim.AdamW.step
+
+    def record_step(self, *args, **kwargs):
+        recorded.append(self.param_groups[0]["lr"])
+        return orig_step(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", record_step)
+
+    _heal_layer(
+        layer_ref=ref, final_kept_ids=_KEPT,
+        captured_input=cap_in, captured_target=cap_out,
+        heal_cfg=cfg, device=_CPU,
+    )
+
+    assert len(recorded) == warmup + decay, (
+        f"expected {warmup + decay} optimiser steps, got {len(recorded)}"
+    )
+    expected = [
+        _heal_lr_at_step(s, lr=lr_peak, lr_min=lr_min,
+                         warmup_steps=warmup, decay_steps=decay)
+        for s in range(len(recorded))
+    ]
+    assert recorded == expected, (
+        f"applied LR sequence diverged from schedule.\n"
+        f"  recorded[:6] = {recorded[:6]}\n  expected[:6] = {expected[:6]}"
+    )
 
 
 # ---------------------------------------------------------------------------

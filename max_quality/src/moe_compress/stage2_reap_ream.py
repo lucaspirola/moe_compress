@@ -112,6 +112,8 @@ class _HealConfig:
         "enabled", "train_router", "lr", "adamw_betas", "grad_clip",
         "holdout_fraction", "patience", "eval_interval", "max_steps",
         "token_cap", "minibatch_size", "min_rel_delta",
+        "lr_warmup_steps", "lr_min", "lr_decay_steps",
+        "cross_domain_holdout_enabled", "xd_holdout_tokens",
     )
 
     def __init__(self, s2: dict) -> None:
@@ -147,6 +149,31 @@ class _HealConfig:
         # *fraction* to reset patience; the best snapshot still updates on
         # any strict improvement, so the accept/reject guard is unaffected.
         self.min_rel_delta: float = float(s2.get("merge_heal_min_rel_delta", 0.0))
+        # LR schedule knobs (linear warmup → cosine decay → floor at lr_min).
+        # All three are inert by default: warmup_steps=0 skips warmup,
+        # decay_steps=0 skips cosine, lr_min defaults to `lr` so even a stray
+        # decay term resolves to a constant lr. The three-knob inert state
+        # reproduces the historical constant-LR Adam path bit-for-bit.
+        # Types are coerced unconditionally (consistent with `lr` above);
+        # a malformed YAML value crashes even with `enabled: false`.
+        self.lr_warmup_steps: int = int(s2.get("merge_heal_lr_warmup_steps", 0))
+        self.lr_min: float = float(s2.get("merge_heal_lr_min", self.lr))
+        self.lr_decay_steps: int = int(s2.get("merge_heal_lr_decay_steps", 0))
+        # Cross-domain telemetry knob (option A diagnostic). When enabled, the
+        # heal capture phase also gathers a small WikiText (input, target) pool
+        # per layer; `_heal_layer` evaluates a second `_holdout_mse_xd` against
+        # it each eval — read-only, never gradients/accept-reject. Inert when
+        # disabled. WikiText dataset/subset/split are inherited from the
+        # thermometer config (top-level `stage6_validate.thermometer.wikitext`)
+        # so heal and BPT eval use the same corpus identity.
+        self.cross_domain_holdout_enabled: bool = bool(
+            s2.get("merge_heal_cross_domain_holdout_enabled", False)
+        )
+        # Default 26214 = round(0.10 × default token_cap 262144) — matches the
+        # Nemotron 10% holdout row count when both run at their defaults.
+        self.xd_holdout_tokens: int = int(
+            s2.get("merge_heal_xd_holdout_tokens", 26214)
+        )
 
         if not self.enabled:
             return
@@ -197,6 +224,61 @@ class _HealConfig:
                 f"stage2_reap_ream.merge_heal_eval_interval={self.eval_interval} "
                 f"exceeds merge_heal_max_steps={self.max_steps}; the held-out "
                 "eval would never run and every layer would be rejected."
+            )
+        # LR-schedule validation. Layout is `[0..warmup) linear; [warmup,
+        # warmup+decay] cosine; (warmup+decay..) flat at lr_min`.
+        # The two count knobs are non-negative step counts; lr_min must be a
+        # positive LR no larger than the peak `lr`; and an asymptote below the
+        # peak (lr_min < lr) is unreachable without a cosine phase, so reject
+        # the misconfig at construction.
+        if self.lr_warmup_steps < 0:
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_lr_warmup_steps="
+                f"{self.lr_warmup_steps}; must be >= 0."
+            )
+        if self.lr_decay_steps < 0:
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_lr_decay_steps="
+                f"{self.lr_decay_steps}; must be >= 0."
+            )
+        if not (0.0 < self.lr_min <= self.lr):
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_lr_min={self.lr_min}; "
+                f"must satisfy 0 < lr_min <= merge_heal_lr ({self.lr})."
+            )
+        # --- Unreachable / no-op cosine guards (pair) ---
+        if self.lr_min < self.lr and self.lr_decay_steps == 0:
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_lr_min={self.lr_min} < "
+                f"merge_heal_lr={self.lr} but merge_heal_lr_decay_steps=0; "
+                "the asymptote is unreachable. Set lr_decay_steps > 0 to "
+                "schedule the descent, or set lr_min == merge_heal_lr."
+            )
+        if self.lr_warmup_steps >= self.max_steps:
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_lr_warmup_steps={self.lr_warmup_steps} "
+                f">= merge_heal_max_steps={self.max_steps}; warmup would never "
+                "complete before the hard step cap."
+            )
+        if self.lr_warmup_steps + self.lr_decay_steps > self.max_steps:
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_lr_warmup_steps + "
+                f"merge_heal_lr_decay_steps ({self.lr_warmup_steps + self.lr_decay_steps}) "
+                f"exceeds merge_heal_max_steps={self.max_steps}; the cosine schedule "
+                "cannot reach lr_min within the hard step cap."
+            )
+        if self.lr_decay_steps > 0 and self.lr_min == self.lr:
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_lr_decay_steps={self.lr_decay_steps} "
+                f"but merge_heal_lr_min == merge_heal_lr ({self.lr}); the cosine "
+                "schedule would be a no-op. Set lr_min < merge_heal_lr to enable "
+                "decay, or set lr_decay_steps = 0."
+            )
+        if self.cross_domain_holdout_enabled and self.xd_holdout_tokens < 1:
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_xd_holdout_tokens="
+                f"{self.xd_holdout_tokens}; must be >= 1 when "
+                "merge_heal_cross_domain_holdout_enabled is true."
             )
 
 
@@ -280,6 +362,10 @@ def run(
     # -----------------------------------------------------------------------
     heal_cfg = _HealConfig(s2)
     _heal_device: torch.device | None = None
+    # Cross-domain (WikiText) batches — pre-tokenised once and reused across
+    # layers when `cross_domain_holdout_enabled`. None when disabled, so the
+    # per-layer capture block below short-circuits.
+    xd_batches: list | None = None
     if heal_cfg.enabled:
         _heal_device = device
         if _heal_device is None:
@@ -292,6 +378,36 @@ def run(
             "pool=%d tokens/layer, train_router=%s, lr=%g",
             heal_cfg.token_cap, heal_cfg.train_router, heal_cfg.lr,
         )
+        if heal_cfg.cross_domain_holdout_enabled:
+            # Read WikiText corpus identity from the thermometer config so the
+            # heal-time cross-domain holdout matches the BPT eval corpus
+            # exactly (same dataset / subset / split). Defaults mirror the
+            # thermometer defaults; the `_thermo_wikitext_tensor` call is the
+            # same tokenisation path the BPT eval uses.
+            from .stage6alt_thermometer import _thermo_wikitext_tensor
+            therm = config.get("stage6_validate", {}).get("thermometer", {}) or {}
+            wt = therm.get("wikitext", {}) or {}
+            wt_dataset = wt.get("dataset", "wikitext")
+            wt_subset = wt.get("subset", "wikitext-2-raw-v1")
+            wt_split = wt.get("split", "test")
+            wt_seq_len = int(therm.get("sequence_length", 2048))
+            # Sequences = ceil(xd_holdout_tokens / wt_seq_len) + 4 absolute
+            # pad. `_capture_mlp_io`'s pool cap stops the forward as soon as
+            # the target row count is reached, so over-provisioning the
+            # source sequence count is essentially free.
+            wt_n_seq = max(
+                1, (heal_cfg.xd_holdout_tokens + wt_seq_len - 1) // wt_seq_len + 4
+            )
+            log.info(
+                "Stage-2 merge-heal: building WikiText cross-domain holdout "
+                "(%d seqs × %d tokens, target %d-row pool/layer)",
+                wt_n_seq, wt_seq_len, heal_cfg.xd_holdout_tokens,
+            )
+            xd_calib = _thermo_wikitext_tensor(
+                tokenizer, num_sequences=wt_n_seq, sequence_length=wt_seq_len,
+                dataset=wt_dataset, subset=wt_subset, split=wt_split,
+            )
+            xd_batches = iter_batches(xd_calib, batch_size=s2["batch_size"])
 
     # -----------------------------------------------------------------------
     # Crash-resume: scan partial_dir for layers already completed in a prior
@@ -1073,12 +1189,21 @@ def run(
         # guaranteed no-op the accept/reject guard rejects anyway.
         cap_in: torch.Tensor | None = None
         cap_out: torch.Tensor | None = None
+        # Cross-domain (WikiText) capture: telemetry only. Built before merge
+        # so target == pre-merge MoE-block output on WikiText tokens.
+        xd_cap_in: torch.Tensor | None = None
+        xd_cap_out: torch.Tensor | None = None
         layer_merged = any(len(m) > 1 for m in grouped.values())
         if heal_cfg.enabled and layer_merged:
             cap_in, cap_out = _capture_mlp_io(
                 model, layer_ref, batches,
                 device=_heal_device, pool_size=heal_cfg.token_cap,
             )
+            if xd_batches is not None:
+                xd_cap_in, xd_cap_out = _capture_mlp_io(
+                    model, layer_ref, xd_batches,
+                    device=_heal_device, pool_size=heal_cfg.xd_holdout_tokens,
+                )
 
         # Phase 3 (M8): snapshot pre-merge expert weights BEFORE the merge
         # mutates the bank. The snapshot is consumed only by the per-group
@@ -1162,13 +1287,15 @@ def run(
                     final_kept_ids=final_kept_ids,
                     captured_input=cap_in,
                     captured_target=cap_out,
+                    xd_input=xd_cap_in,
+                    xd_target=xd_cap_out,
                     heal_cfg=heal_cfg,
                     device=(
                         device if device is not None
                         else layer_ref.router.weight.device
                     ),
                 )
-                del cap_in, cap_out
+                del cap_in, cap_out, xd_cap_in, xd_cap_out
             else:
                 log.info(
                     "  merge-heal layer %d: skipped (0 merges — layer "
@@ -2731,6 +2858,48 @@ def _heal_student_moe_output(
     return routed + shared_out
 
 
+def _heal_lr_at_step(
+    step: int,
+    *,
+    lr: float,
+    lr_min: float,
+    warmup_steps: int,
+    decay_steps: int,
+) -> float:
+    """Effective LR for merge-heal training at zero-indexed ``step``.
+
+    Schedule layout (all step counts are zero-indexed and clamped):
+      ``[0, warmup_steps)``                       linear  ``lr/warmup_steps → lr``
+      ``[warmup_steps, warmup_steps+decay_steps)`` cosine  ``lr → lr_min``
+      ``[warmup_steps+decay_steps, ∞)``            flat at ``lr_min``
+
+    Linear-warmup convention: step ``s`` (0-indexed) takes
+    ``lr * (s + 1) / warmup_steps`` — i.e. the first step is one step *into*
+    the ramp (LR > 0), and step ``warmup_steps - 1`` lands exactly at ``lr``.
+    Step ``warmup_steps`` is therefore the first cosine step (``t = 0`` →
+    cosine value = ``lr``), giving continuity across the warmup/cosine
+    boundary.
+
+    Inert behaviours (all preserve the historical constant-LR Adam path):
+      * ``warmup_steps == 0`` with ``decay_steps == 0`` or ``lr_min == lr``
+        → constant ``lr``.
+      * ``decay_steps == 0`` or ``lr_min == lr`` → constant ``lr`` after
+        any warmup ramp.
+    """
+    if step < 0:
+        raise ValueError(f"_heal_lr_at_step: step={step}; must be >= 0.")
+    if warmup_steps > 0 and step < warmup_steps:
+        return lr * (step + 1) / warmup_steps
+    if decay_steps == 0:
+        return lr
+    t = step - warmup_steps
+    if t >= decay_steps:
+        return lr_min
+    # Half-cosine from lr (t=0) to lr_min (t=decay_steps).
+    cos_term = (1.0 + math.cos(math.pi * t / decay_steps)) * 0.5
+    return lr_min + (lr - lr_min) * cos_term
+
+
 def _heal_layer(
     *,
     layer_ref: MoELayerRef,
@@ -2739,6 +2908,8 @@ def _heal_layer(
     captured_target: torch.Tensor,
     heal_cfg: "_HealConfig",
     device: torch.device,
+    xd_input: torch.Tensor | None = None,
+    xd_target: torch.Tensor | None = None,
 ) -> dict:
     """Per-layer merge-heal by SELF-DISTILLATION.
 
@@ -2881,14 +3052,47 @@ def _heal_layer(
     shared_train = _shared_out(x_train)
     shared_holdout = _shared_out(x_holdout)
 
+    # Cross-domain (WikiText) holdout — telemetry only. Identical pipeline to
+    # the Nemotron holdout (move to device fp32, precompute shared output),
+    # but evaluated independently: never feeds gradients, accept/reject, or
+    # save-best. Both targets are pre-merge MoE-block outputs on their
+    # respective corpora, captured by `_capture_mlp_io` before this merge.
+    x_xd: torch.Tensor | None = None
+    t_xd: torch.Tensor | None = None
+    shared_xd: torch.Tensor | None = None
+    if xd_input is not None and xd_target is not None:
+        if xd_input.shape != xd_target.shape:
+            raise ValueError(
+                f"_heal_layer: cross-domain input pool "
+                f"{tuple(xd_input.shape)} != target pool "
+                f"{tuple(xd_target.shape)} — token alignment is broken."
+            )
+        x_xd = xd_input.to(device, torch.float32)
+        t_xd = xd_target.to(device, torch.float32)
+        shared_xd = _shared_out(x_xd)
+
     # Single fp32 AdamW over every trainable param (all kept experts, plus the
     # router when heal_cfg.train_router). weight_decay=0 — the self-distillation
     # target already anchors the weights to the pre-merge function.
+    # Per-step LR follows `_heal_lr_at_step`; inert under defaults.
     opt = torch.optim.AdamW(
         trainable_2d + trainable_1d, lr=heal_cfg.lr,
         betas=heal_cfg.adamw_betas, weight_decay=0.0,
     )
     clip_params = trainable_2d + trainable_1d
+    lr_schedule_active = (
+        heal_cfg.lr_warmup_steps > 0
+        or (heal_cfg.lr_decay_steps > 0 and heal_cfg.lr_min < heal_cfg.lr)
+    )
+
+    def _lr_at(s: int) -> float:
+        return _heal_lr_at_step(
+            s,
+            lr=heal_cfg.lr,
+            lr_min=heal_cfg.lr_min,
+            warmup_steps=heal_cfg.lr_warmup_steps,
+            decay_steps=heal_cfg.lr_decay_steps,
+        )
 
     def _forward(x_in, shared_in):
         return _heal_student_moe_output(
@@ -2915,6 +3119,21 @@ def _heal_layer(
         for c in range(0, x_holdout.shape[0], mb):
             pred = _forward(x_holdout[c:c + mb], shared_holdout[c:c + mb])
             tgt = t_holdout[c:c + mb]
+            sq_sum += float(((pred - tgt) ** 2).sum().item())
+            n_elem += tgt.numel()
+        return sq_sum / max(1, n_elem)
+
+    # Telemetry-only WikiText holdout MSE; returns NaN when the cross-domain
+    # pool is not provided so the caller can treat the metric as missing.
+    @torch.no_grad()
+    def _holdout_mse_xd() -> float:
+        if x_xd is None or t_xd is None or shared_xd is None:
+            return float("nan")
+        sq_sum = 0.0
+        n_elem = 0
+        for c in range(0, x_xd.shape[0], mb):
+            pred = _forward(x_xd[c:c + mb], shared_xd[c:c + mb])
+            tgt = t_xd[c:c + mb]
             sq_sum += float(((pred - tgt) ** 2).sum().item())
             n_elem += tgt.numel()
         return sq_sum / max(1, n_elem)
@@ -2949,6 +3168,12 @@ def _heal_layer(
     plain_merged_state = _snapshot()
     best_holdout = plain_merged_holdout_mse
     best_state = _snapshot()
+    # Cross-domain baseline + at-best snapshots, in the analogue role for the
+    # WikiText pool. NaN whenever the cross-domain pool is not provided —
+    # downstream consumers (logs + state dict) propagate the NaN to make
+    # "metric absent" obvious.
+    plain_merged_holdout_mse_xd = _holdout_mse_xd()
+    xd_holdout_at_best = plain_merged_holdout_mse_xd
     # train_mse_at_best pairs with best_holdout — the train MSE recorded at the
     # SAME step the best held-out was seen, so heal_gap is a like-for-like
     # (held-out − train) comparison rather than best-vs-final.
@@ -2964,7 +3189,16 @@ def _heal_layer(
     n_train = x_train.shape[0]
     mb_gen = torch.Generator(device="cpu").manual_seed(layer_idx + 1)
 
+    # Most-recent applied LR; surfaced in the eval-time log line. Always
+    # computed from `_lr_at(0)` so the value tracked in the log matches what
+    # the optimiser will see on iter 0 (under inert defaults this equals
+    # `heal_cfg.lr` exactly).
+    last_lr = _lr_at(0)
     for step in range(heal_cfg.max_steps):
+        if lr_schedule_active:
+            last_lr = _lr_at(step)
+            for pg in opt.param_groups:
+                pg["lr"] = last_lr
         if n_train > mb:
             sel = torch.randperm(n_train, generator=mb_gen)[:mb]
             xb = x_train.index_select(0, sel.to(x_train.device))
@@ -2992,22 +3226,35 @@ def _heal_layer(
             # behaviour matches the historical strict-< criterion.
             strict_improved = h < best_holdout
             improved = h < best_holdout * (1.0 - heal_cfg.min_rel_delta)
+            # Compute the cross-domain holdout once per eval (read-only); when
+            # strict_improved fires, snapshot xd_holdout_at_best in lockstep
+            # with best_holdout so the two metrics are sampled at the SAME step.
+            h_xd = _holdout_mse_xd()
             if strict_improved:
                 best_holdout = h
                 best_state = _snapshot()
                 train_mse_at_best = last_train_mse
+                xd_holdout_at_best = h_xd
             if improved:
                 evals_since_improve = 0
             else:
                 evals_since_improve += 1
             # Per-eval progress line — without it a layer heals silently for up
-            # to merge_heal_max_steps steps. Cadence == eval_interval.
+            # to merge_heal_max_steps steps. Cadence == eval_interval. The
+            # cross-domain `holdout_mse_xd` field is appended only when the
+            # telemetry is active (it is NaN otherwise) — keeps the historical
+            # log shape for inert runs.
+            xd_log = (
+                f" holdout_mse_xd={h_xd:.6e}" if not math.isnan(h_xd) else ""
+            )
             log.info(
-                "    heal layer %d: step %d/%d — train_mse=%.6e holdout_mse=%.6e "
-                "best=%.6e %s (patience %d/%d, min_rel_delta=%.4f)",
+                "    heal layer %d: step %d/%d — train_mse=%.6e holdout_mse=%.6e"
+                "%s best=%.6e %s (patience %d/%d, min_rel_delta=%.4f, lr=%.3e)",
                 layer_idx, steps_done, heal_cfg.max_steps, last_train_mse, h,
-                best_holdout, "improved" if improved else "no-improve",
+                xd_log, best_holdout,
+                "improved" if improved else "no-improve",
                 evals_since_improve, heal_cfg.patience, heal_cfg.min_rel_delta,
+                last_lr,
             )
             if not improved and evals_since_improve >= heal_cfg.patience:
                 stop_reason = "patience"
@@ -3056,12 +3303,19 @@ def _heal_layer(
         else last_train_mse
     )
     heal_gap = best_holdout - gap_train_mse
+    # End-of-layer summary: append the cross-domain pair only when present so
+    # disabled runs keep the historical shape.
+    xd_summary = (
+        f" holdout_mse_xd={xd_holdout_at_best:.6e} "
+        f"plain_merged_holdout_mse_xd={plain_merged_holdout_mse_xd:.6e}"
+        if not math.isnan(plain_merged_holdout_mse_xd) else ""
+    )
     log.info(
         "  merge-heal layer %d: %d steps (%s) — train_mse=%.6e (at_best=%.6e) "
-        "holdout_mse=%.6e plain_merged_holdout_mse=%.6e heal_gap=%.6e "
+        "holdout_mse=%.6e plain_merged_holdout_mse=%.6e heal_gap=%.6e%s "
         "accepted=%s (%d kept experts, train_router=%s)",
         layer_idx, steps_done, stop_reason, last_train_mse, gap_train_mse,
-        best_holdout, plain_merged_holdout_mse, heal_gap, accepted,
+        best_holdout, plain_merged_holdout_mse, heal_gap, xd_summary, accepted,
         len(final_kept_ids), heal_cfg.train_router,
     )
     return {
@@ -3073,6 +3327,10 @@ def _heal_layer(
         "heal_gap": heal_gap,
         "accepted": accepted,
         "stop_reason": stop_reason,
+        # NaN when cross-domain telemetry was disabled for this layer; live
+        # consumers should treat NaN as "metric not collected".
+        "holdout_mse_xd": xd_holdout_at_best,
+        "plain_merged_holdout_mse_xd": plain_merged_holdout_mse_xd,
     }
 
 
