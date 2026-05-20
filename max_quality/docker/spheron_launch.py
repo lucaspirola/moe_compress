@@ -92,6 +92,19 @@ POLL_RUN_TIMEOUT_PHASE2 = 3 * 3600    # 3 h cap on Phase 2 (Stage 2.5 + Stage 6 
 SSH_KEY_PATH = Path(os.environ.get(
     "SPHERON_SSH_KEY", str(Path.home() / ".ssh" / "id_ed25519")
 ))
+# Spheron-es specifics (see memory project_spheron_api_gotchas):
+#   * the deployment API always returns sshPort=None — SSH actually
+#     listens on port 22 of the deployment's ipAddress;
+#   * the default SSH user is `ubuntu` with passwordless sudo, not root;
+#   * the cloudInit field is silently dropped, so we SSH-bootstrap;
+#   * the volumeIds field at deployment-create time doesn't actually
+#     attach the volume — POST /api/volumes/{id}/attach is required
+#     AFTER the deployment is up.
+SSH_USER = "ubuntu"
+SSH_PORT = 22
+POLL_SSH_READY = 15
+POLL_SSH_READY_TIMEOUT = 1200      # 20 min cap to reach SSH
+POLL_VOLUME_DEV_TIMEOUT = 300      # 5 min cap waiting for the volume block device
 
 # ---------------------------------------------------------------------------
 # Logging — uniform format, no external deps.
@@ -223,6 +236,22 @@ class SpheronClient:
     def list_ssh_keys(self) -> list[dict[str, Any]]:
         return self._request("GET", "/api/ssh-keys")
 
+    def attach_volume(self, volume_akash_id: str, deployment_id: str) -> dict[str, Any]:
+        """POST /api/volumes/{akash-id}/attach with {"deploymentId": id}.
+        On spheron-es this is the REAL attachment trigger — passing volumeIds
+        in /api/deployments only records the relation; the hypervisor
+        only attaches the disk when this call lands."""
+        return self._request(
+            "POST", f"/api/volumes/{volume_akash_id}/attach",
+            json={"deploymentId": deployment_id},
+        )
+
+    def detach_volume(self, volume_akash_id: str, deployment_id: str) -> dict[str, Any]:
+        return self._request(
+            "POST", f"/api/volumes/{volume_akash_id}/detach",
+            json={"deploymentId": deployment_id},
+        )
+
     def get_team_id(self) -> str:
         """Discover the user's teamId from any existing resource (ssh key,
         volume, …) — the API marks `teamId` as required-when-authenticated
@@ -255,9 +284,13 @@ def _bash_single_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-def _make_cloud_init(*, phase: str, branch: str, hf_token: str,
-                     hf_bucket: str, volume_name: str) -> str:
-    """Produce the bash payload that runs on the deployment after boot.
+def _build_bootstrap_script(*, phase: str, branch: str, hf_token: str,
+                            hf_bucket: str, volume_name: str) -> str:
+    """Produce the bash payload that runs on the deployment via SSH bootstrap.
+
+    Empirically, Spheron's `cloudInit` field is silently dropped on the
+    spheron-es provider — we SCP this script onto the VM after SSH comes up
+    and exec it as `sudo nohup bash …`.
 
     Responsibilities:
       - mount the attached volume (Spheron names it /mnt/<volume-name>);
@@ -287,11 +320,12 @@ def _make_cloud_init(*, phase: str, branch: str, hf_token: str,
     bucket_q = _bash_single_quote(hf_bucket)
     return textwrap.dedent(f"""\
         #!/bin/bash
-        # Spheron cloudInit for moe-compress SH split run — PHASE={phase}, BRANCH={branch}
+        # Spheron SSH-bootstrap for moe-compress SH split run — PHASE={phase}, BRANCH={branch}
         # NOTE: `set -x` is intentionally OFF in the secret-handling block below.
         set -uo pipefail
-        exec > >(tee -a /var/log/moe-launch.log) 2>&1
-        echo "[cloud-init] starting at $(date -u +%FT%TZ)"
+        # When invoked via `sudo nohup bash <script> > /var/log/moe-launch.log 2>&1`
+        # the caller already redirects stdout/stderr; we don't `exec tee` again.
+        echo "[bootstrap] starting at $(date -u +%FT%TZ) (script $0)"
 
         # ----- 1. Volume mount -------------------------------------------------
         # Spheron may pre-mount the volume at /mnt/<mountTag> (where mountTag
@@ -437,27 +471,131 @@ def _pick_default_ssh_key(client: SpheronClient) -> str:
     return keys[0].get("_id") or keys[0].get("id")
 
 
-def _wait_for_deployment_ready(
+def _wait_for_deployment_ip(
     client: SpheronClient, deployment_id: str, timeout_s: int,
 ) -> dict[str, Any]:
-    """Block until the deployment has an IP + sshPort populated (i.e. the
-    provisioner has finished and SSH is up). Returns the deployment dict."""
+    """Block until the deployment has an `ipAddress` populated. On spheron-es
+    `sshPort` is always None — we probe port 22 directly via `_wait_for_ssh`
+    after this returns."""
     t0 = time.monotonic()
     while True:
         dep = client.get_deployment(deployment_id)
         status = dep.get("status", "?")
         ip = dep.get("ipAddress") or dep.get("ip")
-        ssh_port = dep.get("sshPort")
-        log.info("deployment %s status=%s ip=%s sshPort=%s elapsed=%ds",
-                 deployment_id, status, ip, ssh_port,
+        log.info("deployment %s status=%s ip=%s elapsed=%ds",
+                 deployment_id, status, ip,
                  int(time.monotonic() - t0))
-        if ip and ssh_port:
+        if ip:
             return dep
         if time.monotonic() - t0 > timeout_s:
             raise TimeoutError(
-                f"deployment {deployment_id} did not come up within {timeout_s}s"
+                f"deployment {deployment_id} did not allocate an IP within {timeout_s}s"
             )
         time.sleep(POLL_DEPLOYMENT_READY)
+
+
+def _tcp_open(host: str, port: int, timeout: float = 3.0) -> bool:
+    """Cheap TCP-handshake probe — returns True if the port accepts a SYN."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_ssh(ip: str, timeout_s: int = POLL_SSH_READY_TIMEOUT) -> None:
+    """Block until SSH on port 22 of `ip` accepts a TCP connection AND
+    authenticates with our key (an early TCP open + key-rejection is the
+    common case during cloud-init)."""
+    t0 = time.monotonic()
+    while True:
+        elapsed = int(time.monotonic() - t0)
+        if _tcp_open(ip, SSH_PORT, 3.0):
+            rc, out = _ssh_exec(ip=ip, port=SSH_PORT, command="true", timeout=15)
+            if rc == 0:
+                log.info("SSH ready on %s:%d after %ds", ip, SSH_PORT, elapsed)
+                return
+            log.info("SSH tcp/%d open but auth not ready yet (rc=%d) elapsed=%ds",
+                     SSH_PORT, rc, elapsed)
+        else:
+            log.info("SSH tcp/%d not open yet, elapsed=%ds", SSH_PORT, elapsed)
+        if elapsed > timeout_s:
+            raise TimeoutError(
+                f"SSH on {ip}:{SSH_PORT} did not become reachable within {timeout_s}s"
+            )
+        time.sleep(POLL_SSH_READY)
+
+
+def _scp_to_remote(*, ip: str, local_path: str, remote_path: str,
+                   timeout: int = 60) -> None:
+    """SCP a local file to the deployment via the standard `scp` binary
+    (argv-list form — no shell, no injection). Targets root via sudo:
+    we scp to /tmp first then `sudo mv` so we don't need root SSH access."""
+    if shutil.which("scp") is None:
+        raise RuntimeError("`scp` binary not on PATH")
+    tmp_remote = f"/tmp/{Path(remote_path).name}.upload"
+    argv = [
+        "scp",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", f"ConnectTimeout={min(timeout, 30)}",
+        "-P", str(SSH_PORT),
+        "-i", str(SSH_KEY_PATH),
+        local_path, f"{SSH_USER}@{ip}:{tmp_remote}",
+    ]
+    out = subprocess.run(  # noqa: S603 — argv-list, no shell
+        argv, capture_output=True, text=True, timeout=timeout, check=False,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"scp {local_path} -> {ip}:{tmp_remote} failed rc={out.returncode}: "
+            f"{out.stderr[:500]}"
+        )
+    # Move to the final path via sudo. The remote_path may need root perms.
+    move_cmd = (
+        f"sudo install -m 0755 {shlex.quote(tmp_remote)} {shlex.quote(remote_path)} "
+        f"&& rm -f {shlex.quote(tmp_remote)}"
+    )
+    rc, mv_out = _ssh_exec(ip=ip, port=SSH_PORT, command=move_cmd, timeout=15)
+    if rc != 0:
+        raise RuntimeError(f"sudo install -> {remote_path} failed rc={rc}: {mv_out[:500]}")
+
+
+def _wait_for_volume_device(*, ip: str, expected_size_gb: int,
+                            timeout_s: int = POLL_VOLUME_DEV_TIMEOUT) -> str:
+    """Poll `lsblk` over SSH until a new block device of the expected size
+    appears (excluding the boot disk + cloud-init seed). Returns the
+    discovered device path (e.g. `/dev/vdc`)."""
+    t0 = time.monotonic()
+    # Allow a ~2% spread on size (Spheron may round).
+    target_gb_lo = int(expected_size_gb * 0.98)
+    target_gb_hi = int(expected_size_gb * 1.02)
+    cmd = ("lsblk -dnbpo NAME,SIZE,TYPE | awk '$3==\"disk\"{print $1, $2}'")
+    while True:
+        rc, out = _ssh_exec(ip=ip, port=SSH_PORT, command=cmd, timeout=15)
+        if rc == 0:
+            for line in out.strip().splitlines():
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                dev, size_bytes = parts[0], int(parts[1])
+                size_gb = size_bytes // (1024 ** 3)
+                # Skip the boot disk (the only mounted disk at this point).
+                if dev.startswith(("/dev/vda", "/dev/sda", "/dev/nvme0n1")):
+                    continue
+                if target_gb_lo <= size_gb <= target_gb_hi:
+                    log.info("volume device %s (%d GB) appeared after %ds",
+                             dev, size_gb, int(time.monotonic() - t0))
+                    return dev
+        elapsed = int(time.monotonic() - t0)
+        log.info("volume device not yet present (rc=%d) elapsed=%ds", rc, elapsed)
+        if elapsed > timeout_s:
+            raise TimeoutError(
+                f"volume of size ≈{expected_size_gb} GB did not appear "
+                f"as a block device within {timeout_s}s — lsblk output: {out!r}"
+            )
+        time.sleep(15)
 
 
 # Deployment statuses that count as "no longer using the volume" — invert
@@ -509,19 +647,28 @@ def _check_no_active_deployment_on_volume(
 
 
 def _launch_phase(*, phase: str, offer_id: str, gpu_type: str, volume_id: str,
-                  volume_name: str, branch: str, hf_bucket: str,
-                  ssh_key_id: str, timeout_s: int) -> tuple[SpheronClient, dict[str, Any]]:
-    """Create the deployment, wait for it to be SSH-able. On ANY failure
-    after `create_deployment` succeeds, deletes the deployment before
-    re-raising so we never leak a billing GPU instance (C3)."""
+                  volume_name: str, volume_size_gb: int, branch: str,
+                  hf_bucket: str, ssh_key_id: str,
+                  timeout_s: int) -> tuple[SpheronClient, dict[str, Any]]:
+    """End-to-end provisioning for one phase on spheron-es:
+
+      1. POST /api/deployments (no cloudInit — silently dropped).
+      2. Wait for the deployment's ipAddress to populate.
+      3. Wait for SSH port 22 to accept our key.
+      4. POST /api/volumes/{akash}/attach to actually attach the volume
+         (the volumeIds field on the create call doesn't trigger this).
+      5. Wait for the volume to appear as a block device in `lsblk`.
+      6. SCP the bootstrap script + HF token onto the box.
+      7. SSH-exec the script via `sudo nohup … &` so it survives our SSH
+         disconnect.
+
+    On ANY failure after `create_deployment` succeeds, the deployment is
+    deleted before re-raising — we never leak a billing GPU."""
     client = SpheronClient(_read_spheron_key())
-    # `volume_id` may be the user-facing mongo-style id; the deployment
-    # payload needs the akash-style `volumeId` handle. Resolve either form
-    # to the akash handle for both the concurrency guard and the create.
     volume_handle = _resolve_volume_handle(client, volume_id)
     _check_no_active_deployment_on_volume(client, volume_handle)
     hf_token = _read_hf_token()
-    cloud_init = _make_cloud_init(
+    bootstrap_script = _build_bootstrap_script(
         phase=phase, branch=branch, hf_token=hf_token,
         hf_bucket=hf_bucket, volume_name=volume_name,
     )
@@ -529,17 +676,85 @@ def _launch_phase(*, phase: str, offer_id: str, gpu_type: str, volume_id: str,
     team_id = client.get_team_id()
     log.info("creating %s deployment %s (offer=%s, volume=%s [handle=%s], team=%s)",
              phase, name, offer_id, volume_id, volume_handle, team_id)
+    # We keep passing volumeIds in the create body (harmless — Spheron
+    # accepts it and records the relation) but the real attachment is
+    # the explicit POST /api/volumes/{id}/attach call below.
+    # cloud_init is left out entirely on spheron-es: empirically dropped,
+    # so passing it does no good and only wastes a few KB on every request.
     dep = client.create_deployment(
         offer_id=offer_id, gpu_type=gpu_type, gpu_count=DEFAULT_GPU_COUNT,
         ssh_key_id=ssh_key_id, volume_ids=[volume_handle],
-        cloud_init=cloud_init, name=name, team_id=team_id,
+        cloud_init="", name=name, team_id=team_id,
     )
-    dep_id = dep.get("_id") or dep.get("id")
+    dep_id = dep.get("id") or dep.get("_id")
     if not dep_id:
         raise RuntimeError(f"create_deployment returned no id: {dep}")
     log.info("deployment created id=%s name=%s", dep_id, name)
+
     try:
-        return client, _wait_for_deployment_ready(client, dep_id, timeout_s)
+        # (2) wait for IP
+        dep = _wait_for_deployment_ip(client, dep_id, timeout_s)
+        ip = dep.get("ipAddress") or dep.get("ip")
+        log.info("deployment %s has ip=%s — probing SSH on port %d",
+                 dep_id, ip, SSH_PORT)
+
+        # (3) wait for SSH (TCP open + key accepts)
+        _wait_for_ssh(ip)
+
+        # (4) attach the volume (the real trigger — volumeIds in the create
+        # body sets the relation but doesn't make the disk show up)
+        log.info("attaching volume %s to deployment %s", volume_handle, dep_id)
+        client.attach_volume(volume_handle, dep_id)
+
+        # (5) wait for the volume to appear as a block device
+        log.info("waiting for volume block device (~%d GB)", volume_size_gb)
+        device = _wait_for_volume_device(ip=ip, expected_size_gb=volume_size_gb)
+
+        # Mount it at /mnt/<volume_name> from outside the bootstrap so the
+        # bootstrap can assume the mount is already there. We use sudo;
+        # the partition may or may not have a filesystem (Spheron formats
+        # the volume on first attach, but a fresh ext4 mkfs is idempotent
+        # for our purposes — only run mkfs if mount fails first).
+        mount_path = _volume_mount_for(volume_name)
+        mount_cmd = (
+            f"sudo mkdir -p {shlex.quote(mount_path)} && "
+            f"(sudo mountpoint -q {shlex.quote(mount_path)} || "
+            f" sudo mount {shlex.quote(device)} {shlex.quote(mount_path)} || "
+            f" (sudo mkfs.ext4 -F {shlex.quote(device)} && "
+            f"  sudo mount {shlex.quote(device)} {shlex.quote(mount_path)})) && "
+            f"sudo df -h {shlex.quote(mount_path)} && "
+            f"sudo chown -R {SSH_USER}:{SSH_USER} {shlex.quote(mount_path)}"
+        )
+        rc, out = _ssh_exec(ip=ip, command=mount_cmd, timeout=60)
+        if rc != 0:
+            raise RuntimeError(f"volume mount failed rc={rc}: {out[:500]}")
+        log.info("volume mounted at %s on %s", mount_path, ip)
+
+        # (6) SCP the bootstrap script onto the VM
+        local_script = Path(f"/tmp/spheron_bootstrap_{phase}_{dep_id[:8]}.sh")
+        local_script.write_text(bootstrap_script)
+        local_script.chmod(0o755)
+        _scp_to_remote(ip=ip, local_path=str(local_script),
+                       remote_path="/root/moe_bootstrap.sh")
+        local_script.unlink(missing_ok=True)
+        log.info("bootstrap script uploaded to /root/moe_bootstrap.sh on %s", ip)
+
+        # (7) launch in the background via sudo nohup. We capture stdout/
+        # stderr to /var/log/moe-launch.log on the host — the SSH-poll
+        # later watches the status file at <volume>/.spheron_launch_status.json.
+        # nohup + setsid + disown so the docker run survives our SSH close.
+        launch_cmd = (
+            "sudo nohup setsid bash /root/moe_bootstrap.sh "
+            "> /var/log/moe-launch.log 2>&1 < /dev/null & "
+            "sleep 2; "
+            "echo started; "
+            "sudo ls -la /var/log/moe-launch.log"
+        )
+        rc, out = _ssh_exec(ip=ip, command=launch_cmd, timeout=30)
+        if rc != 0:
+            raise RuntimeError(f"bootstrap launch failed rc={rc}: {out[:500]}")
+        log.info("bootstrap launched on %s — output: %s", ip, out.strip()[:200])
+        return client, dep
     except Exception:
         log.error("provisioning failed for %s — tearing down deployment %s "
                   "to avoid leaking billing", phase, dep_id)
@@ -553,11 +768,11 @@ def _launch_phase(*, phase: str, offer_id: str, gpu_type: str, volume_id: str,
         raise
 
 
-def _ssh_exec(*, ip: str, port: int, command: str, timeout: int = 30) -> tuple[int, str]:
+def _ssh_exec(*, ip: str, port: int = SSH_PORT, command: str,
+              timeout: int = 30, user: str = SSH_USER) -> tuple[int, str]:
     """Run a one-shot SSH command via argv-list subprocess (no shell, no
-    injection). Returns (returncode, combined output). Uses the system `ssh`
-    binary so we avoid a paramiko dependency for an environment where this
-    script is run once or twice per experiment."""
+    injection). Returns (returncode, combined output). Defaults to
+    `ubuntu@<ip>:22` per spheron-es convention."""
     if not SSH_KEY_PATH.exists():
         raise FileNotFoundError(
             f"SSH private key not found at {SSH_KEY_PATH}. "
@@ -566,8 +781,6 @@ def _ssh_exec(*, ip: str, port: int, command: str, timeout: int = 30) -> tuple[i
         )
     if shutil.which("ssh") is None:
         raise RuntimeError("`ssh` binary not on PATH")
-    # argv-list form — no shell — `command` is a single remote arg and is
-    # never interpreted by the local shell.
     argv = [
         "ssh",
         "-o", "StrictHostKeyChecking=no",
@@ -575,7 +788,7 @@ def _ssh_exec(*, ip: str, port: int, command: str, timeout: int = 30) -> tuple[i
         "-o", f"ConnectTimeout={min(timeout, 30)}",
         "-i", str(SSH_KEY_PATH),
         "-p", str(port),
-        f"root@{ip}", command,
+        f"{user}@{ip}", command,
     ]
     try:
         out = subprocess.run(  # noqa: S603 — argv-list, no shell
@@ -587,18 +800,16 @@ def _ssh_exec(*, ip: str, port: int, command: str, timeout: int = 30) -> tuple[i
 
 
 def _poll_until_done(
-    *, ip: str, port: int, volume_name: str, timeout_s: int,
+    *, ip: str, volume_name: str, timeout_s: int,
 ) -> dict[str, Any]:
-    """SSH-poll the `.spheron_launch_status.json` file on the deployment
-    until the docker container exits. Returns the parsed status dict on
-    success; raises TimeoutError otherwise."""
+    """SSH-poll `.spheron_launch_status.json` on the deployment until the
+    docker container exits. Returns the parsed status dict on success;
+    raises TimeoutError otherwise."""
     flag_path = f"{_volume_mount_for(volume_name)}/.spheron_launch_status.json"
-    # Use shlex.quote on the path even though it's controlled by us — defense
-    # in depth in case volume_name ever flows from user input later.
-    remote_cmd = f"cat {shlex.quote(flag_path)} 2>/dev/null || echo MISSING"
+    remote_cmd = f"sudo cat {shlex.quote(flag_path)} 2>/dev/null || echo MISSING"
     t0 = time.monotonic()
     while True:
-        rc, out = _ssh_exec(ip=ip, port=port, command=remote_cmd, timeout=30)
+        rc, out = _ssh_exec(ip=ip, command=remote_cmd, timeout=30)
         elapsed = int(time.monotonic() - t0)
         if rc == 0 and out.strip() and out.strip() != "MISSING":
             try:
@@ -613,8 +824,8 @@ def _poll_until_done(
             raise TimeoutError(
                 f"container did not finish within {timeout_s}s "
                 f"(last poll rc={rc}, out={out[:200]!r}). "
-                f"Live tail: ssh -p {port} root@{ip} "
-                "'tail -F /var/log/moe-launch.log'"
+                f"Live tail: ssh -p {SSH_PORT} {SSH_USER}@{ip} "
+                "'sudo tail -F /var/log/moe-launch.log'"
             )
         time.sleep(POLL_RUN)
 
@@ -633,7 +844,8 @@ def _safe_teardown(client: SpheronClient, dep_id: str, reason: str) -> None:
 
 def _phase_run_and_teardown(
     *, phase: str, offer_id: str, gpu_type: str, volume_id: str,
-    volume_name: str, branch: str, hf_bucket: str, ssh_key_id: str,
+    volume_name: str, volume_size_gb: int, branch: str,
+    hf_bucket: str, ssh_key_id: str,
     provisioning_timeout: int, run_timeout: int, keep_running: bool,
 ) -> dict[str, Any]:
     """Full lifecycle for one phase: launch → SSH-poll until done → teardown.
@@ -652,17 +864,17 @@ def _phase_run_and_teardown(
     doesn't already carry."""
     client, dep = _launch_phase(
         phase=phase, offer_id=offer_id, gpu_type=gpu_type,
-        volume_id=volume_id, volume_name=volume_name, branch=branch,
+        volume_id=volume_id, volume_name=volume_name,
+        volume_size_gb=volume_size_gb, branch=branch,
         hf_bucket=hf_bucket, ssh_key_id=ssh_key_id,
         timeout_s=provisioning_timeout,
     )
-    dep_id = dep.get("_id") or dep.get("id")
+    dep_id = dep.get("id") or dep.get("_id")
     ip = dep.get("ipAddress") or dep.get("ip")
-    port = dep.get("sshPort")
     log.info("deployment %s ready — SSH-polling for completion "
-             "(timeout=%ds). Live tail: ssh -p %s root@%s "
-             "'tail -F /var/log/moe-launch.log'",
-             phase, run_timeout, port, ip)
+             "(timeout=%ds). Live tail: ssh -p %d %s@%s "
+             "'sudo tail -F /var/log/moe-launch.log'",
+             phase, run_timeout, SSH_PORT, SSH_USER, ip)
 
     # Note: --keep-running is documented as a clean-exit debug aid (the user
     # wants to SSH into a healthy container). Timeout / interrupt / SSH
@@ -671,7 +883,7 @@ def _phase_run_and_teardown(
     # box yields no diagnostic value the volume doesn't already carry.
     try:
         status = _poll_until_done(
-            ip=ip, port=port, volume_name=volume_name, timeout_s=run_timeout,
+            ip=ip, volume_name=volume_name, timeout_s=run_timeout,
         )
     except KeyboardInterrupt:
         log.warning("interrupted during phase %s poll — tearing down %s",
@@ -700,17 +912,28 @@ def _phase_run_and_teardown(
         log.info("--keep-running set; deployment %s left up", dep_id)
     else:
         _safe_teardown(client, dep_id, f"phase={phase} clean")
-    return {"deployment_id": dep_id, "ip": ip, "ssh_port": port,
+    return {"deployment_id": dep_id, "ip": ip, "ssh_port": SSH_PORT,
             "phase": phase, "status": status}
+
+
+def _resolve_volume_size_gb(client: SpheronClient, volume_id_or_handle: str) -> int:
+    """Look up the volume's `sizeInGb` so we can validate the block device
+    that appears in the deployment matches what we provisioned."""
+    for vol in client.list_volumes():
+        if vol.get("id") == volume_id_or_handle or vol.get("volumeId") == volume_id_or_handle:
+            return int(vol.get("sizeInGb"))
+    raise RuntimeError(f"volume {volume_id_or_handle} not found via list_volumes")
 
 
 def cmd_phase1(args: argparse.Namespace) -> int:
     client = SpheronClient(_read_spheron_key())
     ssh_key = args.ssh_key_id or _pick_default_ssh_key(client)
+    size_gb = _resolve_volume_size_gb(client, args.volume_id)
     result = _phase_run_and_teardown(
         phase="stage2", offer_id=RTX6000_OFFER_ID, gpu_type=RTX6000_GPU_TYPE,
         volume_id=args.volume_id, volume_name=args.volume_name,
-        branch=args.branch, hf_bucket=args.hf_bucket, ssh_key_id=ssh_key,
+        volume_size_gb=size_gb, branch=args.branch, hf_bucket=args.hf_bucket,
+        ssh_key_id=ssh_key,
         provisioning_timeout=POLL_DEPLOYMENT_READY_TIMEOUT,
         run_timeout=POLL_RUN_TIMEOUT_PHASE1,
         keep_running=args.keep_running,
@@ -722,10 +945,12 @@ def cmd_phase1(args: argparse.Namespace) -> int:
 def cmd_phase2(args: argparse.Namespace) -> int:
     client = SpheronClient(_read_spheron_key())
     ssh_key = args.ssh_key_id or _pick_default_ssh_key(client)
+    size_gb = _resolve_volume_size_gb(client, args.volume_id)
     result = _phase_run_and_teardown(
         phase="stage2p5", offer_id=H200_OFFER_ID, gpu_type=H200_GPU_TYPE,
         volume_id=args.volume_id, volume_name=args.volume_name,
-        branch=args.branch, hf_bucket=args.hf_bucket, ssh_key_id=ssh_key,
+        volume_size_gb=size_gb, branch=args.branch, hf_bucket=args.hf_bucket,
+        ssh_key_id=ssh_key,
         provisioning_timeout=POLL_DEPLOYMENT_READY_TIMEOUT,
         run_timeout=POLL_RUN_TIMEOUT_PHASE2,
         keep_running=args.keep_running,
@@ -742,11 +967,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     client = SpheronClient(_read_spheron_key())
     ssh_key = args.ssh_key_id or _pick_default_ssh_key(client)
     volume_id = _resolve_or_create_volume(client, args.volume_name, args.size_gb)
+    size_gb = _resolve_volume_size_gb(client, volume_id)
     log.info("=== Phase 1: Stage 2 on RTX PRO 6000 ===")
     p1 = _phase_run_and_teardown(
         phase="stage2", offer_id=RTX6000_OFFER_ID, gpu_type=RTX6000_GPU_TYPE,
         volume_id=volume_id, volume_name=args.volume_name,
-        branch=args.branch, hf_bucket=args.hf_bucket, ssh_key_id=ssh_key,
+        volume_size_gb=size_gb, branch=args.branch, hf_bucket=args.hf_bucket,
+        ssh_key_id=ssh_key,
         provisioning_timeout=POLL_DEPLOYMENT_READY_TIMEOUT,
         run_timeout=POLL_RUN_TIMEOUT_PHASE1,
         keep_running=False,
@@ -755,7 +982,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     p2 = _phase_run_and_teardown(
         phase="stage2p5", offer_id=H200_OFFER_ID, gpu_type=H200_GPU_TYPE,
         volume_id=volume_id, volume_name=args.volume_name,
-        branch=args.branch, hf_bucket=args.hf_bucket, ssh_key_id=ssh_key,
+        volume_size_gb=size_gb, branch=args.branch, hf_bucket=args.hf_bucket,
+        ssh_key_id=ssh_key,
         provisioning_timeout=POLL_DEPLOYMENT_READY_TIMEOUT,
         run_timeout=POLL_RUN_TIMEOUT_PHASE2,
         keep_running=False,
