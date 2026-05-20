@@ -111,7 +111,7 @@ class _HealConfig:
     __slots__ = (
         "enabled", "train_router", "lr", "adamw_betas", "grad_clip",
         "holdout_fraction", "patience", "eval_interval", "max_steps",
-        "token_cap", "minibatch_size",
+        "token_cap", "minibatch_size", "min_rel_delta",
     )
 
     def __init__(self, s2: dict) -> None:
@@ -139,6 +139,14 @@ class _HealConfig:
         self.minibatch_size: int = int(
             s2.get("merge_heal_minibatch_size", 8192)
         )
+        # Minimum relative improvement that counts as "improvement" for the
+        # patience early-stop. Without this (the historical 0.0), an asymptotic
+        # curve is always microscopically descending — noise-level micro-gains
+        # reset patience forever and every layer runs to max_steps. Setting
+        # this > 0 means an eval must beat the running best by at least this
+        # *fraction* to reset patience; the best snapshot still updates on
+        # any strict improvement, so the accept/reject guard is unaffected.
+        self.min_rel_delta: float = float(s2.get("merge_heal_min_rel_delta", 0.0))
 
         if not self.enabled:
             return
@@ -176,6 +184,11 @@ class _HealConfig:
                 raise ValueError(
                     f"stage2_reap_ream.{_name}={_val}; must be >= 1."
                 )
+        if not (0.0 <= self.min_rel_delta < 1.0):
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_min_rel_delta="
+                f"{self.min_rel_delta}; must be in [0.0, 1.0)."
+            )
         # The held-out eval (and hence accept/reject + save-best) only fires
         # at multiples of eval_interval. If eval_interval > max_steps it never
         # runs, so every layer would be silently REJECTED — fail fast instead.
@@ -2970,22 +2983,31 @@ def _heal_layer(
 
         if steps_done % heal_cfg.eval_interval == 0:
             h = _holdout_mse()
-            improved = h < best_holdout
-            if improved:
+            # Snapshot the TRUE best on any strict improvement — the
+            # accept/reject guard restores best_state and must not lag the
+            # actual best. Patience reset, by contrast, requires a *meaningful*
+            # improvement (>= min_rel_delta fraction of the running best);
+            # this is the fix for the "noise-level gain resets patience
+            # forever" bug. With min_rel_delta=0 the two checks coincide and
+            # behaviour matches the historical strict-< criterion.
+            strict_improved = h < best_holdout
+            improved = h < best_holdout * (1.0 - heal_cfg.min_rel_delta)
+            if strict_improved:
                 best_holdout = h
                 best_state = _snapshot()
                 train_mse_at_best = last_train_mse
+            if improved:
                 evals_since_improve = 0
             else:
                 evals_since_improve += 1
             # Per-eval progress line — without it a layer heals silently for up
-            # to merge_heal_max_steps (80k) steps. Cadence == eval_interval.
+            # to merge_heal_max_steps steps. Cadence == eval_interval.
             log.info(
                 "    heal layer %d: step %d/%d — train_mse=%.6e holdout_mse=%.6e "
-                "best=%.6e %s (patience %d/%d)",
+                "best=%.6e %s (patience %d/%d, min_rel_delta=%.4f)",
                 layer_idx, steps_done, heal_cfg.max_steps, last_train_mse, h,
                 best_holdout, "improved" if improved else "no-improve",
-                evals_since_improve, heal_cfg.patience,
+                evals_since_improve, heal_cfg.patience, heal_cfg.min_rel_delta,
             )
             if not improved and evals_since_improve >= heal_cfg.patience:
                 stop_reason = "patience"
