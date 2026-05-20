@@ -192,7 +192,7 @@ class SpheronClient:
 
     def create_deployment(
         self, *, offer_id: str, ssh_key_id: str, volume_ids: list[str],
-        cloud_init: str, name: str,
+        cloud_init: str, name: str, team_id: str,
     ) -> dict[str, Any]:
         body = {
             "provider": PROVIDER,
@@ -204,6 +204,7 @@ class SpheronClient:
             "volumeIds": volume_ids,
             "cloudInit": cloud_init,
             "name": name,
+            "teamId": team_id,
         }
         return self._request("POST", "/api/deployments", json=body)
 
@@ -215,6 +216,21 @@ class SpheronClient:
 
     def list_ssh_keys(self) -> list[dict[str, Any]]:
         return self._request("GET", "/api/ssh-keys")
+
+    def get_team_id(self) -> str:
+        """Discover the user's teamId from any existing resource (ssh key,
+        volume, …) — the API marks `teamId` as required-when-authenticated
+        but exposes no `/api/me` endpoint to read it directly."""
+        keys = self.list_ssh_keys()
+        if keys and keys[0].get("teamId"):
+            return keys[0]["teamId"]
+        vols = self.list_volumes()
+        if vols and vols[0].get("teamId"):
+            return vols[0]["teamId"]
+        raise RuntimeError(
+            "Could not discover teamId — no SSH keys or volumes on this "
+            "account expose it. Register at least one SSH key on Spheron first."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -484,11 +500,12 @@ def _launch_phase(*, phase: str, offer_id: str, volume_id: str,
         hf_bucket=hf_bucket, volume_name=volume_name,
     )
     name = f"moe-sh-{phase}-{int(time.time())}"
-    log.info("creating %s deployment %s (offer=%s, volume=%s)",
-             phase, name, offer_id, volume_id)
+    team_id = client.get_team_id()
+    log.info("creating %s deployment %s (offer=%s, volume=%s, team=%s)",
+             phase, name, offer_id, volume_id, team_id)
     dep = client.create_deployment(
         offer_id=offer_id, ssh_key_id=ssh_key_id, volume_ids=[volume_id],
-        cloud_init=cloud_init, name=name,
+        cloud_init=cloud_init, name=name, team_id=team_id,
     )
     dep_id = dep.get("_id") or dep.get("id")
     if not dep_id:
