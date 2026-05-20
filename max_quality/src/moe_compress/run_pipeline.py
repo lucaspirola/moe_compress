@@ -214,8 +214,17 @@ def main(argv=None) -> int:
 
         # Stage 2.5 — Router KD post-merge: recalibrate routers so Stage 3
         # covariance collection sees already-adapted routing decisions.
-        # Always runs immediately after Stage 2 unless stage2p5_final/ is
-        # already on disk (in which case skip_stage25 was set above).
+        # Always runs immediately after Stage 2 unless (a) stage2p5_final/ is
+        # already on disk (skip_stage25 set above on resume), or (b) the
+        # caller explicitly requested --skip-stage2p5 (split-machine flow:
+        # Stage 2 on a cheaper GPU produces stage2_pruned/, Stage 2.5 then
+        # runs on a higher-memory GPU via --resume-from-stage 2 in a separate
+        # invocation).
+        if args.skip_stage2p5:
+            log.info("--skip-stage2p5: leaving stage2_pruned/ as terminal output "
+                     "(Stage 2.5 + downstream stages must run on another machine)")
+            wait_for_pending_uploads()
+            return 0
         if not skip_stage25:
             log.info("=== Stage 2.5 — Post-Merge Router KD ===")
             t2p5 = time.monotonic()
@@ -309,7 +318,25 @@ def _parse(argv) -> argparse.Namespace:
         "--no-resume", action="store_true",
         help="Disable crash-resume I/O for stages 2–5. Each stage runs from scratch.",
     )
-    return p.parse_args(argv)
+    p.add_argument(
+        "--skip-stage2p5", action="store_true",
+        help="Skip Stage 2.5 (Router-KD post-merge) — only meaningful when the "
+             "Stage 2 block would otherwise run (--resume-from-stage <= 2 and "
+             "--stop-after-stage >= 2). Splits the heavy work across machines: "
+             "Stage 2 on a cheaper GPU writes stage2_pruned/, Stage 2.5 then "
+             "runs on a higher-memory GPU via --resume-from-stage 2.",
+    )
+    args = p.parse_args(argv)
+    if args.skip_stage2p5 and (
+        args.resume_from_stage > 2 or args.stop_after_stage < 2
+    ):
+        p.error(
+            f"--skip-stage2p5 only takes effect when Stage 2 would run, but "
+            f"--resume-from-stage={args.resume_from_stage} and "
+            f"--stop-after-stage={args.stop_after_stage} bypass it entirely. "
+            "Drop --skip-stage2p5 or fix the resume/stop window."
+        )
+    return args
 
 
 def _load_config(path) -> dict:

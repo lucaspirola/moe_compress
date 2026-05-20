@@ -437,10 +437,21 @@ def _upload_ablation_bg(
     hf_token: str,
     upload_shared: bool,
     stage6_artifact: str = "stage6_eval.json",
+    phase: str = "complete",
 ) -> None:
     """Upload one ablation's results to HF Hub. Runs in a background thread so
-    the GPU can start the next ablation immediately. Writes uploaded.flag on
-    success so the orchestrator knows this ablation is durable on Hub."""
+    the GPU can start the next ablation immediately.
+
+    `phase` controls what gets pushed:
+      - "complete" (default): the stage6 eval JSON. Used when the full
+        Stage 2 → 2.5 → Stage 6 pipeline ran end-to-end on this machine.
+      - "stage2": every file under ``stage2_pruned/``. Used in split-machine
+        flows (--skip-stage2p5), where Stage 2 ran on a cheaper GPU and
+        Stage 2.5 + Stage 6 will run on a different machine — the bucket
+        copy is the durability backstop if the cross-machine volume is lost.
+
+    Writes ``uploaded.flag`` (complete) or ``uploaded.stage2.flag`` (stage2)
+    so the orchestrator can tell which phase has been pushed."""
     _log = logging.getLogger(__name__)
     try:
         from huggingface_hub import HfApi
@@ -459,6 +470,30 @@ def _upload_ablation_bg(
                 add_list.append((str(f), f"_shared/{rel_str}"))
             if add_list:
                 api.batch_bucket_files(bucket_id=bucket, add=add_list)
+
+        if phase == "stage2":
+            stage2_dir = ablation_dir / "stage2_pruned"
+            if not stage2_dir.exists():
+                _log.warning("[%s] phase=stage2 upload requested but %s missing",
+                             ablation_id, stage2_dir)
+                return
+            _log.info("[%s] uploading stage2_pruned/ to bucket %s "
+                      "(split-machine durability insurance)", ablation_id, bucket)
+            add_list = []
+            for f in stage2_dir.rglob("*"):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(stage2_dir)
+                rel_str = str(rel)
+                if rel_str.endswith(".lock") or "__pycache__" in rel_str:
+                    continue
+                add_list.append((str(f), f"{ablation_id}/stage2_pruned/{rel_str}"))
+            if add_list:
+                api.batch_bucket_files(bucket_id=bucket, add=add_list)
+            (ablation_dir / "uploaded.stage2.flag").touch()
+            _log.info("[%s] stage2_pruned/ upload complete → %s/%s/stage2_pruned/ "
+                      "(%d files)", ablation_id, bucket, ablation_id, len(add_list))
+            return
 
         _log.info("[%s] uploading %s to bucket %s",
                   ablation_id, stage6_artifact, bucket)
@@ -518,6 +553,7 @@ def _run_one_ablation(
     stage5_max_calibration_samples: int | None = None,
     stage5_max_sequence_length: int | None = None,
     stage6_mode: str = "full",
+    skip_stage2p5: bool = False,
 ) -> dict[str, Any]:
     """Drive one ablation through Stage 2 → 2.5 → Stage 6. Stage 1 artifacts
     are seeded from ``shared_dir``; Stage 6 reads the shared teacher cache."""
@@ -528,6 +564,31 @@ def _run_one_ablation(
     if _is_complete(ablation_dir, stage6_mode):
         log.info("[%s] already complete — loading prior result", ablation_id)
         return json.loads((ablation_dir / _s6_artifact).read_text())
+
+    # Split-machine flow: when --skip-stage2p5, the completion signal is a
+    # FULLY-WRITTEN `stage2_pruned/` (Stage 2.5 + Stage 6 happen on a different
+    # machine). A bare `mkdir + first-shard then crash` would leave the dir
+    # present but the model unloadable, so we require the standard HF model
+    # shard manifest files (config.json + the safetensors index) — the same
+    # file set `run_pipeline._load_for_stage` trusts on the resume side.
+    if skip_stage2p5 and not (ablation_dir / "stage2p5_final").exists():
+        s2_dir = ablation_dir / "stage2_pruned"
+        s2_complete = (
+            s2_dir.is_dir()
+            and (s2_dir / "config.json").exists()
+            and (s2_dir / "model.safetensors.index.json").exists()
+        )
+        if s2_complete:
+            log.info("[%s] stage2_pruned/ present + complete and --skip-stage2p5 — "
+                     "Stage 2 phase already done on this machine", ablation_id)
+            return {"ablation_id": ablation_id, "phase_complete": "stage2",
+                    "_deltas": deltas,
+                    "stage2_pruned_dir": str(s2_dir)}
+        if s2_dir.exists():
+            log.warning("[%s] stage2_pruned/ present but missing required shard "
+                        "manifest (config.json / model.safetensors.index.json) — "
+                        "treating as crashed partial; will re-run Stage 2",
+                        ablation_id)
 
     log.info("[%s] starting (deltas=%s)", ablation_id, deltas)
     t_start = time.monotonic()
@@ -576,18 +637,36 @@ def _run_one_ablation(
         # 178 GB, and the leftover is not swap-reclaimable). A subprocess is
         # reaped on exit, returning all memory to the OS — each stage-group
         # starts clean. Identical work and args; env/cwd inherited.
-        rc1 = subprocess.run(
-            [sys.executable, "-m", "moe_compress.run_pipeline",
-             "--config", str(cfg_path),
-             "--model", model_repo,
-             "--artifacts-dir", str(ablation_dir),
-             "--target-ratio", "0.35",
-             "--resume-from-stage", "2",
-             "--stop-after-stage", "2"],
-            check=False,
-        ).returncode
+        _pipeline_argv = [
+            sys.executable, "-m", "moe_compress.run_pipeline",
+            "--config", str(cfg_path),
+            "--model", model_repo,
+            "--artifacts-dir", str(ablation_dir),
+            "--target-ratio", "0.35",
+            "--resume-from-stage", "2",
+            "--stop-after-stage", "2",
+        ]
+        if skip_stage2p5:
+            _pipeline_argv.append("--skip-stage2p5")
+        rc1 = subprocess.run(_pipeline_argv, check=False).returncode
         if rc1 != 0:
-            raise RuntimeError(f"[{ablation_id}] Stage 2/2.5 returned exit code {rc1}")
+            raise RuntimeError(
+                f"[{ablation_id}] Stage 2"
+                f"{'' if skip_stage2p5 else '/2.5'} returned exit code {rc1}"
+            )
+
+        # Split-machine flow: stop after Stage 2 wrote stage2_pruned/.
+        # Stage 6 has nothing to evaluate without Stage 2.5's stage2p5_final/,
+        # so skipping the Stage-6 subprocess here is necessary, not optional.
+        if skip_stage2p5:
+            elapsed = time.monotonic() - t_start
+            log.info("[%s] --skip-stage2p5: Stage 2 done in %.1fs — "
+                     "stage2_pruned/ ready at %s",
+                     ablation_id, elapsed, ablation_dir / "stage2_pruned")
+            return {"ablation_id": ablation_id, "phase_complete": "stage2",
+                    "_deltas": deltas,
+                    "stage2_pruned_dir": str(ablation_dir / "stage2_pruned"),
+                    "elapsed_seconds": elapsed}
 
         # Stage 6 loads from stage2p5_final/ via run_pipeline._load_for_stage's
         # fallback path (0871b98). The previous `stage5_final → stage2p5_final`
@@ -734,6 +813,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="Lever (b): override stage5_router_kd.max_calibration_samples. "
                         "Smaller calibration set → smaller Stage 2.5 activation peak "
                         "and fewer KD steps. Default: null (use config value).")
+    parser.add_argument("--skip-stage2p5", action="store_true",
+                        help="Split-machine flow: run Stage 2 then stop (no Stage "
+                             "2.5, no Stage 6). stage2_pruned/ is the terminal "
+                             "artifact. Designed to be paired with a follow-up "
+                             "invocation (same --only) on a different machine "
+                             "whose volume mounts the same ablation directory — "
+                             "the regular flow will resume from stage2_pruned/ "
+                             "and complete Stage 2.5 + Stage 6.")
     parser.add_argument("--stage5-max-sequence-length", type=int, default=None,
                         help="Lever (b): override stage5_router_kd.max_sequence_length. "
                         "Shorter sequences also shrink the activation peak. "
@@ -818,6 +905,7 @@ def main(argv: list[str] | None = None) -> int:
                 stage5_max_calibration_samples=args.stage5_max_calibration_samples,
                 stage5_max_sequence_length=args.stage5_max_sequence_length,
                 stage6_mode=args.stage6_mode,
+                skip_stage2p5=args.skip_stage2p5,
             )
             results[aid] = result
             # Sanity: A0 must populate the teacher cache so A1..A11 hit it
@@ -832,13 +920,20 @@ def main(argv: list[str] | None = None) -> int:
                     "Subsequent ablations would re-run teacher scoring. Halting."
                 )
             # Kick off background upload immediately — next ablation starts
-            # on the GPU while CPU streams this one to HF Hub.
+            # on the GPU while CPU streams this one to HF Hub. Split-machine
+            # Phase 1 (--skip-stage2p5) uploads stage2_pruned/; the full
+            # end-to-end case uploads the stage6 eval JSON.
             if upload_bucket and hf_token:
+                _upload_phase = (
+                    "stage2" if result.get("phase_complete") == "stage2"
+                    else "complete"
+                )
                 t = threading.Thread(
                     target=_upload_ablation_bg,
                     args=(aid, ablations_root / aid, shared_dir,
                           upload_bucket, hf_token, first_upload,
                           _stage6_artifact(args.stage6_mode)),
+                    kwargs={"phase": _upload_phase},
                     daemon=True,
                     name=f"upload-{aid}",
                 )
@@ -858,12 +953,26 @@ def main(argv: list[str] | None = None) -> int:
 
     # Wait for all background uploads to finish before writing the summary.
     # Each thread has already started; GPU work is done at this point.
+    # Split-machine Phase 1 uploads the full ~70 GB stage2_pruned/ — at a
+    # realistic 100 MB/s upload rate that's ~700s, so 600s would routinely
+    # time out and abandon partial uploads, defeating the durability
+    # insurance. Scale the timeout up to 1 h when any row carried a stage2
+    # upload; tiny-JSON Stage 6 uploads keep the original 600s.
     if upload_threads:
-        log.info("Waiting for %d background upload(s) to finish…", len(upload_threads))
+        any_stage2_upload = any(
+            r.get("phase_complete") == "stage2" for r in results.values()
+        )
+        upload_timeout = 3600 if any_stage2_upload else 600
+        log.info(
+            "Waiting for %d background upload(s) to finish (timeout=%ds, "
+            "stage2_uploads=%s)…",
+            len(upload_threads), upload_timeout, any_stage2_upload,
+        )
         for aid, t in upload_threads:
-            t.join(timeout=600)
+            t.join(timeout=upload_timeout)
             if t.is_alive():
-                log.warning("[%s] upload thread still alive after 10 min — giving up", aid)
+                log.warning("[%s] upload thread still alive after %ds — giving up",
+                            aid, upload_timeout)
 
     # Final aggregate. The per-row _persist_progress calls already wrote the
     # summary + leaderboard incrementally; this is the terminal snapshot.
