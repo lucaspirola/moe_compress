@@ -797,7 +797,17 @@ def _launch_phase(*, phase: str, offer_id: str, gpu_type: str, volume_id: str,
         # stderr to /var/log/moe-launch.log on the host — the SSH-poll
         # later watches the status file at <volume>/.spheron_launch_status.json.
         # nohup + setsid + disown so the docker run survives our SSH close.
+        # The `> /var/log/moe-launch.log` redirect is opened by the CALLING
+        # shell (ssh's `ubuntu@…` shell) BEFORE `sudo` runs, so ubuntu — not
+        # root — needs write permission on /var/log/moe-launch.log. By default
+        # /var/log/ is root-only, so we touch + chown the file with sudo
+        # first, then run the unprivileged-redirect form. Alternatively:
+        # `sudo bash -c 'nohup … > /var/log/moe-launch.log …'` which opens the
+        # file under root, but that loses the sub-shell's stdin redirect and
+        # is harder to reason about across distros. The touch+chown is cleaner.
         launch_cmd = (
+            "sudo touch /var/log/moe-launch.log && "
+            f"sudo chown {SSH_USER}:{SSH_USER} /var/log/moe-launch.log && "
             "sudo nohup setsid bash /root/moe_bootstrap.sh "
             "> /var/log/moe-launch.log 2>&1 < /dev/null & "
             "sleep 2; "
