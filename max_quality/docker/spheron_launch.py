@@ -406,6 +406,10 @@ def _build_bootstrap_script(*, phase: str, branch: str, hf_token: str,
         chmod 600 {volume_mount}/hf_token
 
         # ----- 4. Run (now safe to enable xtrace) -----------------------------
+        # Clear any stale completion flag BEFORE the new docker run starts so
+        # the orchestrator's SSH poll cannot see the previous phase's exit
+        # value before this run finishes writing its own.
+        rm -f {volume_mount}/.spheron_launch_status.json
         set -x
         docker pull {DOCKER_IMAGE}
         docker rm -f moe-run 2>/dev/null || true
@@ -418,6 +422,12 @@ def _build_bootstrap_script(*, phase: str, branch: str, hf_token: str,
             {forwarded_env_flags} \\
             --entrypoint bash {DOCKER_IMAGE} -c '
                 set -e
+                # The /cache/code dir survives across docker runs (volume-
+                # backed). On re-run, git complains about "dubious ownership"
+                # because the prior container created the dir under a
+                # different effective UID context. Bypass the check — we
+                # control the volume content and the container UID is root.
+                git config --global --add safe.directory "*"
                 if [ -d /cache/code/moe_compress/.git ]; then
                     git -C /cache/code/moe_compress fetch --depth 1 origin "${{MOE_BRANCH}}"
                     git -C /cache/code/moe_compress reset --hard "origin/${{MOE_BRANCH}}"
