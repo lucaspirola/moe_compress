@@ -27,17 +27,26 @@ target:
   expert_svd_ratio: 2.0
 
 calibration:
-  # Source: Tülu-3 SFT mixture — the broadest open instruction-tuning corpus
-  # today (WildChat + FLAN + ShareGPT + OpenAssistant + math + code). Rows
-  # are OpenAI-style ``messages=[...]`` and get rendered through the model's
-  # chat template (required for instruct models per Gemma 3 QAT docs).
+  # Source: Qwen3 pretrain-distribution proxy mix. Five sources blended,
+  # ALL rendered through the model's chat template (Gemma 3 QAT rule):
+  #   tulu3 (25%):    allenai/tulu-3-sft-mixture           SFT / chat
+  #   fineweb (40%):  HuggingFaceFW/fineweb-edu            high-quality web
+  #   math (15%):     nvidia/OpenMathInstruct-2            math problems
+  #   code (15%):     nickrosh/Evol-Instruct-Code-80k-v1   code instructions
+  #   papers (5%):    allenai/peS2o                        academic papers
   #
-  # Why not nvidia-cascade: empirically (2026-05-21 SH 100x run) the cascade
-  # mix is too topic-narrow — in-domain holdout MSE dropped 3.3x in heal
-  # while WikiText-XD MSE moved 2%. The diversity (not the pool size) is
-  # the dominant variable for cross-domain transfer.
-  source: tulu3-sft-mix
-  dataset: allenai/tulu-3-sft-mixture
+  # Why: empirically (2026-05-21) Tülu-3 (chat-format SFT only) gave us
+  # ~7% mean cross-domain MSE drop per heal layer — better than nvidia-
+  # cascade (~2%) but still far from closing the bpt_gap. Qwen3.6 was
+  # pretrained on web + code + STEM + papers + multilingual; calibrating
+  # on SFT-only never activates the pretrain-experts that hold web/code/
+  # math content, so heal targets miss those activation patterns. This
+  # mix injects pretrain-style content via chat-format wrappers so the
+  # pretrain-experts get exercised during calibration.
+  #
+  # Mix is hard-coded in calibration.py; dataset/subset_weights here are
+  # ignored. To experiment with a different mix, register a new adapter.
+  source: qwen3-pretrain-mix
   seed: 1337
   num_sequences: 4000
   sequence_length: 2048

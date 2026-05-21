@@ -875,3 +875,266 @@ register_corpus(CorpusAdapter(
     parse_yaml=_parse_yaml_c4_math_code,
     stream_texts=_stream_texts_c4_math_code,
 ))
+
+
+# ---------------------------------------------------------------------------
+# qwen3-pretrain-mix — broad multi-source mix approximating Qwen3's
+# pretraining distribution. All sources go through ``apply_chat_template``
+# so the instruct-tuned router stays in-distribution (Gemma 3 QAT rule).
+# ---------------------------------------------------------------------------
+#
+# Rationale (2026-05-21): nvidia-cascade and tulu3 are both SFT-only mixes;
+# experiments here show in-domain heal-MSE drops ~70%/layer but WikiText
+# cross-domain MSE only drops 2-11%/layer. Qwen3.6's pretraining (36T
+# tokens) is heavy on web crawls + OCR-PDFs + code + STEM + multilingual;
+# the SFT-only calibration never activates the experts that specialise
+# on web/code/math content from pretraining, so the merged experts can't
+# transfer back to raw-text eval distributions. This adapter mixes
+# pretraining-style content into calibration, all wrapped as chat.
+#
+# Sub-sources (approximate Qwen3-pretrain proxies):
+#   tulu3 (25%):     allenai/tulu-3-sft-mixture (SFT/chat; our base)
+#   fineweb (40%):   HuggingFaceFW/fineweb-edu  (high-quality CC, edu-filtered)
+#   math (15%):      nvidia/OpenMathInstruct-2  (math problems + solutions)
+#   code (15%):      nickrosh/Evol-Instruct-Code-80k-v1 (code instructions)
+#   papers (5%):     allenai/peS2o              (academic papers)
+
+_QWEN3_MIX_WEIGHTS = {
+    "tulu3":   0.25,
+    "fineweb": 0.40,
+    "math":    0.15,
+    "code":    0.15,
+    "papers":  0.05,
+}
+
+# Rough avg-tokens-per-row used for row-count budgeting. Underestimating is
+# OK — `_tokenize_to_fixed_length` truncates to exactly the requested token
+# budget; overshoot is just unused rows. Underestimating risks running out.
+_QWEN3_MIX_AVG_TOKENS = {
+    "tulu3":   600,
+    "fineweb": 1500,
+    "math":    800,
+    "code":    300,
+    "papers":  3000,
+}
+
+_QWEN3_MIX_DATASET = {
+    "tulu3":   "allenai/tulu-3-sft-mixture",
+    "fineweb": "HuggingFaceFW/fineweb-edu",
+    "math":    "nvidia/OpenMathInstruct-2",
+    "code":    "nickrosh/Evol-Instruct-Code-80k-v1",
+    "papers":  "allenai/peS2o",
+}
+
+
+def _parse_yaml_qwen3_pretrain_mix(
+    cal_cfg: dict, num_sequences: int, sequence_length: int, seed: int,
+) -> CalibrationSpec:
+    """Yaml → CalibrationSpec for ``qwen3-pretrain-mix``.
+
+    Ignores ``dataset`` / ``subset_weights`` from the YAML — the mix is
+    hard-coded above to keep the experimental signal clean. If you need
+    a custom mix, register a new adapter.
+    """
+    return CalibrationSpec(
+        num_sequences=num_sequences,
+        sequence_length=sequence_length,
+        seed=seed,
+        source="qwen3-pretrain-mix",
+    )
+
+
+def _make_subset_seed(base_seed: int, subset: str) -> int:
+    subset_offset = int(
+        hashlib.md5(subset.encode(), usedforsecurity=False).hexdigest(), 16
+    ) % 1_000_000
+    return (base_seed + subset_offset) % (2**32)
+
+
+def _shuffled_stream(dataset_name: str, count: int, seed: int):
+    """Open a streaming HF dataset and return a shuffled iterator + circuit
+    limit. Caller iterates and breaks when `count` non-empty rows yielded."""
+    from datasets import load_dataset
+    try:
+        ds = load_dataset(dataset_name, split="train", streaming=True)
+    except Exception as err:                          # noqa: BLE001
+        log.error("load_dataset(%s) failed: %s", dataset_name, err)
+        raise
+    circuit_limit = _CIRCUIT_BREAKER_MULTIPLIER * count
+    ds = ds.shuffle(
+        seed=seed,
+        buffer_size=min(max(10_000, circuit_limit), 200_000),
+    )
+    return ds, circuit_limit
+
+
+def _stream_messages_native(dataset_name: str, count: int, tokenizer, seed: int) -> list[str]:
+    """For datasets with a native ``messages=[...]`` field (e.g. Tülu-3)."""
+    ds, circuit_limit = _shuffled_stream(dataset_name, count, seed)
+    out: list[str] = []
+    rows_seen = 0
+    for row in ds:
+        rows_seen += 1
+        text = _render_messages(row.get("messages"), tokenizer)
+        if text:
+            out.append(text)
+            if len(out) >= count:
+                break
+        if rows_seen >= circuit_limit:
+            log.warning("_stream_messages_native: circuit-breaker fired at %d rows on %s",
+                        rows_seen, dataset_name)
+            break
+    if len(out) < count:
+        log.warning("%s yielded %d/%d rows", dataset_name, len(out), count)
+    return out
+
+
+def _stream_raw_wrapped(
+    dataset_name: str, text_field: str, count: int, tokenizer, seed: int,
+    *, user_prompt: str,
+) -> list[str]:
+    """Plain-text dataset → wrap each row as a chat turn (user prompt +
+    text as assistant response), then run through ``apply_chat_template``."""
+    ds, circuit_limit = _shuffled_stream(dataset_name, count, seed)
+    out: list[str] = []
+    rows_seen = 0
+    for row in ds:
+        rows_seen += 1
+        text = (row.get(text_field) or "").strip()
+        if text:
+            messages = [
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": text},
+            ]
+            rendered = _render_messages(messages, tokenizer)
+            if rendered:
+                out.append(rendered)
+                if len(out) >= count:
+                    break
+        if rows_seen >= circuit_limit:
+            log.warning("_stream_raw_wrapped: circuit-breaker fired at %d rows on %s",
+                        rows_seen, dataset_name)
+            break
+    if len(out) < count:
+        log.warning("%s yielded %d/%d rows", dataset_name, len(out), count)
+    return out
+
+
+def _stream_problem_solution(
+    dataset_name: str, count: int, tokenizer, seed: int,
+    *, problem_field: str, solution_field: str,
+) -> list[str]:
+    """Problem/solution-pair dataset (e.g. OpenMathInstruct-2) → messages."""
+    ds, circuit_limit = _shuffled_stream(dataset_name, count, seed)
+    out: list[str] = []
+    rows_seen = 0
+    for row in ds:
+        rows_seen += 1
+        problem = (row.get(problem_field) or "").strip()
+        solution = (row.get(solution_field) or "").strip()
+        if problem and solution:
+            messages = [
+                {"role": "user", "content": problem},
+                {"role": "assistant", "content": solution},
+            ]
+            rendered = _render_messages(messages, tokenizer)
+            if rendered:
+                out.append(rendered)
+                if len(out) >= count:
+                    break
+        if rows_seen >= circuit_limit:
+            log.warning("_stream_problem_solution: circuit-breaker fired at %d rows on %s",
+                        rows_seen, dataset_name)
+            break
+    if len(out) < count:
+        log.warning("%s yielded %d/%d rows", dataset_name, len(out), count)
+    return out
+
+
+def _stream_instruction_output(
+    dataset_name: str, count: int, tokenizer, seed: int,
+) -> list[str]:
+    """Alpaca-style ``instruction``/``input``/``output`` dataset → messages."""
+    ds, circuit_limit = _shuffled_stream(dataset_name, count, seed)
+    out: list[str] = []
+    rows_seen = 0
+    for row in ds:
+        rows_seen += 1
+        instruction = (row.get("instruction") or "").strip()
+        input_part = (row.get("input") or "").strip()
+        output = (row.get("output") or "").strip()
+        if instruction and output:
+            user_content = instruction + (("\n\n" + input_part) if input_part else "")
+            messages = [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": output},
+            ]
+            rendered = _render_messages(messages, tokenizer)
+            if rendered:
+                out.append(rendered)
+                if len(out) >= count:
+                    break
+        if rows_seen >= circuit_limit:
+            log.warning("_stream_instruction_output: circuit-breaker fired at %d rows on %s",
+                        rows_seen, dataset_name)
+            break
+    if len(out) < count:
+        log.warning("%s yielded %d/%d rows", dataset_name, len(out), count)
+    return out
+
+
+def _stream_texts_qwen3_pretrain_mix(spec: CalibrationSpec, tokenizer) -> list[str]:
+    """Multi-source Qwen3-pretrain-distribution mix, all chat-templated."""
+    target_total_tokens = spec.num_sequences * spec.sequence_length
+    texts: list[str] = []
+    for subset, weight in _QWEN3_MIX_WEIGHTS.items():
+        target_subset_tokens = int(target_total_tokens * weight)
+        avg_tok = _QWEN3_MIX_AVG_TOKENS[subset]
+        # 2x oversample — `_tokenize_to_fixed_length` truncates anyway, and
+        # we'd rather have leftover rows than fall short on token budget.
+        n_rows = max(1, int((target_subset_tokens / avg_tok) * 2.0))
+        seed = _make_subset_seed(spec.seed, subset)
+        ds_name = _QWEN3_MIX_DATASET[subset]
+        log.info("qwen3-pretrain-mix: %s — streaming %d rows from %s "
+                 "(weight=%.2f, target_tokens=%d, avg_tok=%d, seed=%d)",
+                 subset, n_rows, ds_name, weight, target_subset_tokens, avg_tok, seed)
+        try:
+            if subset == "tulu3":
+                subset_texts = _stream_messages_native(ds_name, n_rows, tokenizer, seed)
+            elif subset == "fineweb":
+                subset_texts = _stream_raw_wrapped(
+                    ds_name, "text", n_rows, tokenizer, seed,
+                    user_prompt="Read this passage carefully and reproduce it faithfully.",
+                )
+            elif subset == "math":
+                subset_texts = _stream_problem_solution(
+                    ds_name, n_rows, tokenizer, seed,
+                    problem_field="problem", solution_field="generated_solution",
+                )
+            elif subset == "code":
+                subset_texts = _stream_instruction_output(ds_name, n_rows, tokenizer, seed)
+            elif subset == "papers":
+                subset_texts = _stream_raw_wrapped(
+                    ds_name, "text", n_rows, tokenizer, seed,
+                    user_prompt="Read this academic excerpt and reproduce it faithfully.",
+                )
+            else:
+                raise ValueError(f"unknown qwen3-pretrain-mix subset {subset!r}")
+        except Exception as err:                      # noqa: BLE001
+            # One source failing shouldn't tank the whole calibration build;
+            # log + continue with what we have. If too many fail,
+            # `_tokenize_to_fixed_length` will warn about a short token pool.
+            log.error("qwen3-pretrain-mix: subset %s (%s) failed: %s — continuing",
+                      subset, ds_name, err)
+            continue
+        log.info("qwen3-pretrain-mix: %s — yielded %d rows", subset, len(subset_texts))
+        texts.extend(subset_texts)
+    log.info("qwen3-pretrain-mix: total %d rendered rows across all subsets", len(texts))
+    return texts
+
+
+register_corpus(CorpusAdapter(
+    name="qwen3-pretrain-mix",
+    parse_yaml=_parse_yaml_qwen3_pretrain_mix,
+    stream_texts=_stream_texts_qwen3_pretrain_mix,
+))
