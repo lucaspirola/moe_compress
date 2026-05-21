@@ -31,9 +31,16 @@ from moe_compress.stage2_reap_ream import (
     _heal_lr_at_step,
     _heal_student_moe_output,
     _load_heal_weights,
+    _make_shared_out_fn,
     _resize_router_for_kept_experts,
     _swiglu_forward,
     _write_heal_weights,
+)
+from moe_compress.utils.activation_shards import (
+    HealActivationDataset,
+    ShardManifest,
+    ShardWriter,
+    load_manifest,
 )
 from moe_compress.utils.model_io import (
     MATRIX_NAMES,
@@ -42,6 +49,89 @@ from moe_compress.utils.model_io import (
 )
 
 _CPU = torch.device("cpu")
+
+
+# ---------------------------------------------------------------------------
+# Test helpers: bridge the shard-based capture API to the in-memory contracts
+# the test bodies were written against.  These keep tests focused on behavior
+# rather than ShardWriter plumbing.
+# ---------------------------------------------------------------------------
+
+
+def _capture_to_writer(tmp_path, model, layer_ref, batches, *,
+                        device, pool_size, shard_rows=32):
+    """Capture (input, target) activations into a fresh ShardWriter at tmp_path.
+
+    Defaults to ``shard_rows=32`` because the tiny CPU MoE used in tests only
+    captures a few hundred rows — too few for the production default
+    (``shard_rows=4096``) to span multiple shards, which the whole-shard
+    train/holdout split requires.
+
+    Returns the (unfinalized) writer.  Callers that need to read the captured
+    rows as tensors should call ``_writer_to_tensors``; callers that need a
+    finalized manifest for ``_heal_layer`` should call ``_finalize_for_heal``.
+    """
+    hidden = layer_ref.router.weight.shape[-1]
+    writer = ShardWriter(
+        tmp_path, layer_idx=layer_ref.layer_idx, hidden_dim=hidden,
+        shard_rows=shard_rows,
+    )
+    _capture_mlp_io(
+        model, layer_ref, batches, device=device, pool_size=pool_size,
+        shard_writer=writer,
+    )
+    return writer
+
+
+def _writer_to_tensors(writer):
+    """Read all input/output shards back as two concatenated bf16 tensors,
+    preserving the original capture order."""
+    assert writer._buf_rows == 0, (
+        "_writer_to_tensors: writer has unflushed rows — call "
+        "close_pending() or finalize() first"
+    )
+    from safetensors.torch import safe_open
+    ins, outs = [], []
+    for entry in writer.shard_entries:
+        with safe_open(str(writer.out_dir / entry.path), framework="pt") as f:
+            ins.append(f.get_tensor("input"))
+            outs.append(f.get_tensor("output"))
+    if not ins:
+        h = writer.hidden_dim
+        return (
+            torch.empty(0, h, dtype=writer.dtype),
+            torch.empty(0, h, dtype=writer.dtype),
+        )
+    return torch.cat(ins, dim=0), torch.cat(outs, dim=0)
+
+
+def _finalize_for_heal(writer, layer_ref, *, holdout_fraction=0.1):
+    """Compute shared companions + finalize the writer for ``_heal_layer``.
+
+    Returns ``(manifest, manifest_dir)``.  Uses the layer-idx seed so the
+    train/holdout split is deterministic across calls — same contract as the
+    production pipeline.
+    """
+    shared_fn = _make_shared_out_fn(layer_ref)
+    writer.compute_shared_companions(shared_fn)
+    manifest = writer.finalize(
+        split_ratio=1.0 - holdout_fraction, seed=layer_ref.layer_idx,
+    )
+    return manifest, writer.out_dir
+
+
+def _build_manifest_from_tensors(tmp_path, layer_ref, cap_in, cap_out, *,
+                                  shard_rows=32, holdout_fraction=0.1):
+    """Direct-tensor variant: append two pre-built tensors into a fresh writer,
+    compute shared companions, finalize.  Used by tests that construct
+    activations by hand rather than via the capture hook."""
+    hidden = cap_in.size(1)
+    writer = ShardWriter(
+        tmp_path, layer_idx=layer_ref.layer_idx, hidden_dim=hidden,
+        shard_rows=shard_rows,
+    )
+    writer.append(cap_in, cap_out)
+    return _finalize_for_heal(writer, layer_ref, holdout_fraction=holdout_fraction)
 
 
 def _tiny_moe_model():
@@ -356,16 +446,16 @@ def test_heal_config_rejects_bad_xd_holdout_tokens():
         })
 
 
-def test_heal_layer_with_xd_holdout_reports_telemetry_and_leaves_decision_unchanged():
-    """When `_heal_layer` receives `xd_input`/`xd_target`, the returned state
+def test_heal_layer_with_xd_holdout_reports_telemetry_and_leaves_decision_unchanged(tmp_path):
+    """When `_heal_layer` receives a cross-domain manifest, the returned state
     dict carries the two cross-domain numbers — and accept/reject is keyed on
     the SAME Nemotron metric the no-xd path uses, i.e. the verdict is identical
     whether xd is fed in or not. (Determinism note: every RNG used by
     `_heal_layer` is seeded by `layer_idx`, so a back-to-back invocation on
     the same model state is byte-deterministic.)"""
     # Build the same scenario the existing accept tests use, then run the heal
-    # twice: once without xd, once with a hand-crafted xd pool (random tokens
-    # the heal has never seen). The xd path must:
+    # twice: once without xd, once with a hand-crafted xd manifest (rows the
+    # heal has never seen).  The xd path must:
     #   1. Populate `holdout_mse_xd` and `plain_merged_holdout_mse_xd` as
     #      finite floats (no NaN passthrough when xd is supplied).
     #   2. Leave `holdout_mse`, `accepted`, and `steps` byte-equal to the
@@ -373,7 +463,10 @@ def test_heal_layer_with_xd_holdout_reports_telemetry_and_leaves_decision_unchan
     model = _tiny_moe_model()
     ref = list(iter_moe_layers(model))[1]
     batches = _id_batches(model, n_seq=64)  # the accept-margin pool
-    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+    writer_main = _capture_to_writer(
+        tmp_path / "main", model, ref, batches, device=_CPU, pool_size=10_000,
+    )
+    cap_in, cap_out = _writer_to_tensors(writer_main)
 
     # A second model freshly seeded the same way and merged identically — the
     # heal must see the same starting weights on both runs, so we don't reuse
@@ -381,9 +474,12 @@ def test_heal_layer_with_xd_holdout_reports_telemetry_and_leaves_decision_unchan
     model_a = _tiny_moe_model()
     ref_a = list(iter_moe_layers(model_a))[1]
     _merge_layer(ref_a, _KEPT)
+    manifest_a, dir_a = _build_manifest_from_tensors(
+        tmp_path / "noxd_main", ref_a, cap_in, cap_out,
+    )
     no_xd = _heal_layer(
         layer_ref=ref_a, final_kept_ids=_KEPT,
-        captured_input=cap_in, captured_target=cap_out,
+        manifest=manifest_a, manifest_dir=dir_a,
         heal_cfg=_heal_cfg(), device=_CPU,
     )
     # `holdout_mse_xd` keys must exist in the no-xd return shape, NaN-valued,
@@ -406,10 +502,16 @@ def test_heal_layer_with_xd_holdout_reports_telemetry_and_leaves_decision_unchan
     model_b = _tiny_moe_model()
     ref_b = list(iter_moe_layers(model_b))[1]
     _merge_layer(ref_b, _KEPT)
+    manifest_b, dir_b = _build_manifest_from_tensors(
+        tmp_path / "xd_main", ref_b, cap_in, cap_out,
+    )
+    xd_manifest, xd_dir = _build_manifest_from_tensors(
+        tmp_path / "xd_extra", ref_b, xd_in, xd_out,
+    )
     with_xd = _heal_layer(
         layer_ref=ref_b, final_kept_ids=_KEPT,
-        captured_input=cap_in, captured_target=cap_out,
-        xd_input=xd_in, xd_target=xd_out,
+        manifest=manifest_b, manifest_dir=dir_b,
+        xd_manifest=xd_manifest, xd_manifest_dir=xd_dir,
         heal_cfg=_heal_cfg(), device=_CPU,
     )
     # xd telemetry populated as finite floats.
@@ -432,34 +534,49 @@ def test_heal_layer_with_xd_holdout_reports_telemetry_and_leaves_decision_unchan
     assert with_xd["train_mse_at_best"] == no_xd["train_mse_at_best"]
 
 
-def test_heal_layer_with_xd_holdout_raises_on_misaligned_pools():
-    """A shape mismatch between `xd_input` and `xd_target` indicates a token
-    alignment bug at the capture site — fail fast, don't silently produce a
+def test_heal_layer_with_xd_holdout_raises_on_misaligned_pools(tmp_path):
+    """A hidden_dim mismatch between the main manifest and the xd manifest
+    indicates a token alignment bug — fail fast, don't silently produce a
     bogus MSE."""
     model = _tiny_moe_model()
     ref = list(iter_moe_layers(model))[1]
     batches = _id_batches(model, n_seq=16)
-    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+    writer = _capture_to_writer(
+        tmp_path / "main", model, ref, batches, device=_CPU, pool_size=10_000,
+    )
+    cap_in, cap_out = _writer_to_tensors(writer)
     _merge_layer(ref, _KEPT)
-    # Same first-axis size but a deliberately-broken second axis: simulates a
-    # capture-site bug where the input pool's hidden dim diverges from the
-    # target pool's.
-    bad_xd_in = cap_in.clone()
-    bad_xd_out = cap_out[:, :-1].clone()  # one fewer hidden dim
-    # The XD shape-mismatch site raises ValueError (Nemotron mismatch raises
-    # RuntimeError); pin to "cross-domain" so a future refactor that
-    # converted the Nemotron message to ValueError can't make this test
-    # silently match the wrong site.
-    with pytest.raises(ValueError, match="cross-domain.*token alignment"):
+    manifest, manifest_dir = _build_manifest_from_tensors(
+        tmp_path / "main_manifest", ref, cap_in, cap_out,
+    )
+    # Build an xd manifest with a deliberately broken hidden_dim: one fewer
+    # column than the main pool.  Simulates a capture-site bug where the xd
+    # corpus pool was built against a different model hidden size.
+    hidden = cap_in.size(1)
+    bad_xd_in = torch.randn(8, hidden - 1, dtype=torch.bfloat16)
+    bad_xd_out = torch.randn(8, hidden - 1, dtype=torch.bfloat16)
+    bad_writer = ShardWriter(
+        tmp_path / "bad_xd", layer_idx=ref.layer_idx,
+        hidden_dim=hidden - 1, shard_rows=4,
+    )
+    bad_writer.append(bad_xd_in, bad_xd_out)
+    # Skip shared companions for the broken pool — finalize directly so we
+    # get a manifest with the wrong hidden_dim.  HealActivationDataset only
+    # reads shared shards on minibatch sampling; the mismatch fires before
+    # any read because _heal_layer validates manifest.hidden_dim eagerly.
+    bad_xd_manifest = bad_writer.finalize(split_ratio=0.9, seed=ref.layer_idx)
+    # Pin to "cross-domain" so a future refactor that touches the main-pool
+    # mismatch wording doesn't make this test silently match the wrong site.
+    with pytest.raises(ValueError, match="cross-domain.*hidden_dim"):
         _heal_layer(
             layer_ref=ref, final_kept_ids=_KEPT,
-            captured_input=cap_in, captured_target=cap_out,
-            xd_input=bad_xd_in, xd_target=bad_xd_out,
+            manifest=manifest, manifest_dir=manifest_dir,
+            xd_manifest=bad_xd_manifest, xd_manifest_dir=bad_writer.out_dir,
             heal_cfg=_heal_cfg(), device=_CPU,
         )
 
 
-def test_heal_layer_applies_lr_schedule(monkeypatch):
+def test_heal_layer_applies_lr_schedule(monkeypatch, tmp_path):
     """`_heal_layer` mutates `opt.param_groups[0]['lr']` each step per the
     schedule. Record the LR seen by `AdamW.step` over a short heal and assert
     the sequence matches `_heal_lr_at_step` exactly — proves the schedule is
@@ -467,8 +584,11 @@ def test_heal_layer_applies_lr_schedule(monkeypatch):
     model = _tiny_moe_model()
     ref = list(iter_moe_layers(model))[1]
     batches = _id_batches(model, n_seq=16)
-    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+    writer = _capture_to_writer(
+        tmp_path, model, ref, batches, device=_CPU, pool_size=10_000,
+    )
     _merge_layer(ref, _KEPT)
+    manifest, manifest_dir = _finalize_for_heal(writer, ref)
 
     lr_peak, lr_min = 1.0e-3, 1.0e-4
     warmup, decay = 4, 20
@@ -496,7 +616,7 @@ def test_heal_layer_applies_lr_schedule(monkeypatch):
 
     _heal_layer(
         layer_ref=ref, final_kept_ids=_KEPT,
-        captured_input=cap_in, captured_target=cap_out,
+        manifest=manifest, manifest_dir=manifest_dir,
         heal_cfg=cfg, device=_CPU,
     )
 
@@ -519,7 +639,7 @@ def test_heal_layer_applies_lr_schedule(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_capture_mlp_io_pools_aligned():
+def test_capture_mlp_io_pools_aligned(tmp_path):
     """`_capture_mlp_io` records row-aligned (mlp_input, mlp_output) pairs at
     the MoE-block boundary. Feeding the captured input back through the (still
     original) mlp must reproduce the captured target by ABSOLUTE error —
@@ -530,9 +650,11 @@ def test_capture_mlp_io_pools_aligned():
     ref = list(iter_moe_layers(model))[1]
     batches = _id_batches(model, n_seq=4, seq_len=8, chunk=2)
 
-    cap_in, cap_out = _capture_mlp_io(
-        model, ref, batches, device=_CPU, pool_size=10_000,
+    writer = _capture_to_writer(
+        tmp_path, model, ref, batches, device=_CPU, pool_size=10_000,
+        shard_rows=8,  # forces multiple shards on the 32-row pool
     )
+    cap_in, cap_out = _writer_to_tensors(writer)
     assert cap_in.shape == cap_out.shape
     assert cap_in.shape == (4 * 8, model.config.hidden_size)
     assert cap_in.dtype == torch.bfloat16 and cap_out.dtype == torch.bfloat16
@@ -551,19 +673,25 @@ def test_capture_mlp_io_pools_aligned():
     )
 
 
-def test_capture_mlp_io_respects_pool_size():
-    """The pool is capped at pool_size; the forward loop stops early. The cap
-    is a genuine PREFIX — capturing the same batches uncapped must reproduce
-    the capped pool as its leading rows."""
+def test_capture_mlp_io_respects_pool_size(tmp_path):
+    """The pool is capped at pool_size EXACTLY — the per-hook truncation slice
+    means the total never overshoots. The cap is a genuine PREFIX: capturing
+    the same batches uncapped must reproduce the capped pool as its leading
+    rows."""
     model = _tiny_moe_model()
     ref = list(iter_moe_layers(model))[0]
     batches = _id_batches(model, n_seq=16, seq_len=8, chunk=4)  # 128 tokens
-    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=40)
+    writer_small = _capture_to_writer(
+        tmp_path / "small", model, ref, batches, device=_CPU, pool_size=40,
+    )
+    cap_in, cap_out = _writer_to_tensors(writer_small)
     assert cap_in.shape[0] == 40 and cap_out.shape[0] == 40
 
     # Same batches, large pool_size — the capped capture must be its prefix.
-    cap_in_big, cap_out_big = _capture_mlp_io(
-        model, ref, batches, device=_CPU, pool_size=10_000)
+    writer_big = _capture_to_writer(
+        tmp_path / "big", model, ref, batches, device=_CPU, pool_size=10_000,
+    )
+    cap_in_big, cap_out_big = _writer_to_tensors(writer_big)
     assert cap_in_big.shape[0] == 128
     assert torch.equal(cap_in, cap_in_big[:40]), "pool cap is not a prefix"
     assert torch.equal(cap_out, cap_out_big[:40]), "pool cap is not a prefix"
@@ -588,7 +716,7 @@ def _heal_cfg(**overrides) -> _HealConfig:
     return _HealConfig(base)
 
 
-def test_heal_layer_runs_after_bank_select_reindexing():
+def test_heal_layer_runs_after_bank_select_reindexing(tmp_path):
     """`_heal_layer` runs AFTER `bank.select()` re-indexed the banks to
     0..n_kept-1; it must index by post-select POSITION. With a reachable
     self-distillation target the heal is accepted by a comfortable margin and
@@ -598,13 +726,16 @@ def test_heal_layer_runs_after_bank_select_reindexing():
     batches = _id_batches(model, n_seq=64)  # ~512 tokens -> ~51 holdout
 
     # Capture BEFORE merge — target = the layer's own pre-merge MoE output.
-    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+    writer = _capture_to_writer(
+        tmp_path, model, ref, batches, device=_CPU, pool_size=10_000,
+    )
     _merge_layer(ref, _KEPT)
+    manifest, manifest_dir = _finalize_for_heal(writer, ref)
     before = build_banks(ref)["gate_proj"].get(0).detach().clone()
 
     state = _heal_layer(
         layer_ref=ref, final_kept_ids=_KEPT,
-        captured_input=cap_in, captured_target=cap_out,
+        manifest=manifest, manifest_dir=manifest_dir,
         heal_cfg=_heal_cfg(), device=_CPU,
     )
     assert state["steps"] > 0
@@ -622,20 +753,23 @@ def test_heal_layer_runs_after_bank_select_reindexing():
     assert not torch.equal(before, after), "merged centroid weights did not change"
 
 
-def test_heal_layer_all_experts_trainable():
+def test_heal_layer_all_experts_trainable(tmp_path):
     """Every kept expert trains — including singletons. (The old SH design
     wrongly froze singletons.) Position 1 (id 2) is a singleton kept expert;
     its weights must move when the heal is accepted."""
     model = _tiny_moe_model()
     ref = list(iter_moe_layers(model))[1]
     batches = _id_batches(model, n_seq=64)  # ~512 tokens -> ~51 holdout
-    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+    writer = _capture_to_writer(
+        tmp_path, model, ref, batches, device=_CPU, pool_size=10_000,
+    )
     _merge_layer(ref, _KEPT)
+    manifest, manifest_dir = _finalize_for_heal(writer, ref)
     singleton_before = build_banks(ref)["down_proj"].get(1).detach().clone()
 
     state = _heal_layer(
         layer_ref=ref, final_kept_ids=_KEPT,
-        captured_input=cap_in, captured_target=cap_out,
+        manifest=manifest, manifest_dir=manifest_dir,
         heal_cfg=_heal_cfg(), device=_CPU,
     )
     assert state["holdout_mse"] < 0.85 * state["plain_merged_holdout_mse"]
@@ -646,7 +780,7 @@ def test_heal_layer_all_experts_trainable():
     )
 
 
-def test_heal_layer_accept_reject_revert():
+def test_heal_layer_accept_reject_revert(tmp_path):
     """Monotone-safe guard: when the heal cannot beat the plain merge the layer
     is REVERTED. Capturing the target AFTER the merge makes the plain-merged
     output the target — the heal starts at ~0 MSE and (with a large lr) can
@@ -659,7 +793,10 @@ def test_heal_layer_accept_reject_revert():
     batches = _id_batches(model)
     _merge_layer(ref, _KEPT)
     # Target == the plain-merged layer's own output.
-    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU, pool_size=10_000)
+    writer = _capture_to_writer(
+        tmp_path, model, ref, batches, device=_CPU, pool_size=10_000,
+    )
+    manifest, manifest_dir = _finalize_for_heal(writer, ref)
 
     banks = build_banks(ref)
     snap = {n: [banks[n].get(p).detach().clone() for p in range(len(_KEPT))]
@@ -668,7 +805,7 @@ def test_heal_layer_accept_reject_revert():
 
     state = _heal_layer(
         layer_ref=ref, final_kept_ids=_KEPT,
-        captured_input=cap_in, captured_target=cap_out,
+        manifest=manifest, manifest_dir=manifest_dir,
         heal_cfg=_heal_cfg(merge_heal_lr=1.0e-2, merge_heal_max_steps=60,
                            merge_heal_eval_interval=10, merge_heal_patience=3),
         device=_CPU,
@@ -688,7 +825,7 @@ def test_heal_layer_accept_reject_revert():
     assert torch.equal(ref.router.weight.detach(), router_snap)
 
 
-def test_heal_layer_router_flag():
+def test_heal_layer_router_flag(tmp_path):
     """`merge_heal_train_router` gates router training: the resized router
     changes iff the flag is True. Experts always train regardless — so when
     the router is frozen the kept experts must STILL move."""
@@ -696,15 +833,18 @@ def test_heal_layer_router_flag():
         model = _tiny_moe_model()
         ref = list(iter_moe_layers(model))[1]
         batches = _id_batches(model, n_seq=64)  # ~512 tokens -> ~51 holdout
-        cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU,
-                                          pool_size=10_000)
+        writer = _capture_to_writer(
+            tmp_path / f"router_{train_router}", model, ref, batches,
+            device=_CPU, pool_size=10_000,
+        )
         _merge_layer(ref, _KEPT)
+        manifest, manifest_dir = _finalize_for_heal(writer, ref)
         router_after_resize = ref.router.weight.detach().clone()
         experts_before = build_banks(ref)["gate_proj"].get(0).detach().clone()
 
         state = _heal_layer(
             layer_ref=ref, final_kept_ids=_KEPT,
-            captured_input=cap_in, captured_target=cap_out,
+            manifest=manifest, manifest_dir=manifest_dir,
             heal_cfg=_heal_cfg(merge_heal_train_router=train_router),
             device=_CPU,
         )
@@ -751,14 +891,17 @@ def test_heal_weights_roundtrip_all_experts(tmp_path):
     batches = _id_batches(model, n_seq=64)
 
     # Capture BEFORE merge so the heal has a reachable target and is accepted.
-    cap_in, cap_out = _capture_mlp_io(model, ref, batches, device=_CPU,
-                                      pool_size=10_000)
+    writer = _capture_to_writer(
+        tmp_path / "_heal_cap", model, ref, batches,
+        device=_CPU, pool_size=10_000,
+    )
     _merge_layer(ref, _KEPT)
+    manifest, manifest_dir = _finalize_for_heal(writer, ref)
     plain_merged = build_banks(ref)["gate_proj"].get(0).detach().clone()
 
     state = _heal_layer(
         layer_ref=ref, final_kept_ids=_KEPT,
-        captured_input=cap_in, captured_target=cap_out,
+        manifest=manifest, manifest_dir=manifest_dir,
         heal_cfg=_heal_cfg(), device=_CPU,
     )
     assert state["accepted"] is True, "heal must be accepted for this test"
@@ -801,3 +944,196 @@ def test_heal_weights_roundtrip_all_experts(tmp_path):
     _write_heal_weights(tmp_path, ref, _KEPT, accepted=False)
     payload_rej = torch.load(pt, map_location="cpu", weights_only=True)
     assert payload_rej["accepted"] is False
+
+
+# ---------------------------------------------------------------------------
+# ShardWriter / HealActivationDataset round-trip + corpus registry tests
+# ---------------------------------------------------------------------------
+
+
+def test_shard_writer_roundtrip(tmp_path):
+    """ShardWriter buffers rows, flushes safetensors shards, splits 90/10, and
+    HealActivationDataset reads them back as fp32 on-device tensors.  The
+    test exercises:
+      * Multi-chunk appends that span shard boundaries.
+      * Shared-companion computation via a deterministic ``shared_fn``.
+      * Whole-shard train/holdout split + manifest JSON round-trip.
+      * Minibatch sampling shape + holdout iteration totals.
+    """
+    torch.manual_seed(0)
+    hidden = 16
+    total_rows = 96
+    shard_rows = 16
+    x_in_all = torch.randn(total_rows, hidden).to(torch.bfloat16)
+    x_out_all = torch.randn(total_rows, hidden).to(torch.bfloat16)
+
+    writer = ShardWriter(
+        tmp_path, layer_idx=7, hidden_dim=hidden, shard_rows=shard_rows,
+    )
+    # Three uneven chunks so we exercise the leftover-buffer path.
+    writer.append(x_in_all[:20], x_out_all[:20])
+    writer.append(x_in_all[20:70], x_out_all[20:70])
+    writer.append(x_in_all[70:], x_out_all[70:])
+    # Stand-in shared_fn: shared = 2 * input.  Cheap, deterministic, easy
+    # to verify within bf16 precision below.
+    writer.compute_shared_companions(lambda x: x * 2.0)
+    manifest = writer.finalize(split_ratio=0.75, seed=7)
+
+    # Manifest sanity: rows split correctly, train > holdout per ratio.
+    assert manifest.n_train + manifest.n_holdout == total_rows
+    assert manifest.n_train > manifest.n_holdout
+    assert manifest.hidden_dim == hidden
+    assert manifest.layer_idx == 7
+
+    # JSON round-trip via load_manifest reads the on-disk file.
+    m2 = load_manifest(tmp_path)
+    assert m2.n_train == manifest.n_train
+    assert m2.n_holdout == manifest.n_holdout
+    assert [s.path for s in m2.train_shards] == [s.path for s in manifest.train_shards]
+
+    # Read back via the dataset; check sampling shape + dtype.
+    ds = HealActivationDataset(manifest, tmp_path, device=_CPU)
+    gen = torch.Generator().manual_seed(42)
+    xb, sb, tb = ds.sample_minibatch(mb=24, generator=gen)
+    assert xb.shape == (24, hidden)
+    assert sb.shape == (24, hidden)
+    assert tb.shape == (24, hidden)
+    assert xb.dtype == torch.float32
+
+    # Shared companions: shared rows must equal 2 × input rows, modulo
+    # bf16 rounding (storage dtype on disk).
+    holdout_rows = 0
+    for xh, sh, _th in ds.iter_holdout(batch_size=16):
+        max_err = (sh - 2.0 * xh).abs().max().item()
+        assert max_err < 0.05, f"shared = 2*input failed: max abs err {max_err}"
+        holdout_rows += xh.size(0)
+    assert holdout_rows == manifest.n_holdout
+
+
+def test_heal_layer_streaming_is_deterministic(tmp_path):
+    """Two back-to-back ``_heal_layer`` calls with the same seeded model state
+    and the same manifest must produce byte-identical state dicts.  Validates
+    that the shard-streaming dataset doesn't introduce non-determinism via
+    file-system order or cache eviction effects."""
+    def _run_one(subdir: str) -> dict:
+        model = _tiny_moe_model()
+        ref = list(iter_moe_layers(model))[1]
+        batches = _id_batches(model, n_seq=64)
+        writer = _capture_to_writer(
+            tmp_path / subdir / "cap", model, ref, batches,
+            device=_CPU, pool_size=10_000,
+        )
+        _merge_layer(ref, _KEPT)
+        manifest, manifest_dir = _finalize_for_heal(writer, ref)
+        return _heal_layer(
+            layer_ref=ref, final_kept_ids=_KEPT,
+            manifest=manifest, manifest_dir=manifest_dir,
+            heal_cfg=_heal_cfg(), device=_CPU,
+        )
+
+    state_a = _run_one("run_a")
+    state_b = _run_one("run_b")
+    # Every metric is computed deterministically — same seed, same model state,
+    # same capture, same split, same minibatch sequence.  Byte equality is the
+    # strong contract; pytest's `==` message is informative on a leak.
+    assert state_a["steps"] == state_b["steps"]
+    assert state_a["accepted"] == state_b["accepted"]
+    assert state_a["stop_reason"] == state_b["stop_reason"]
+    assert state_a["holdout_mse"] == state_b["holdout_mse"]
+    assert state_a["plain_merged_holdout_mse"] == state_b["plain_merged_holdout_mse"]
+    assert state_a["train_mse"] == state_b["train_mse"]
+
+
+def test_calibration_corpus_registry_pluggable(tmp_path):
+    """Registering a new calibration corpus is one decorator + one
+    ``register_corpus`` call away — no edits to ``build_calibration_tensor`` or
+    ``spec_from_config``.  The new corpus dispatches end-to-end: cache key,
+    text streaming, tokenization."""
+    from moe_compress.utils.calibration import (
+        CalibrationSpec, CorpusAdapter, _unregister_corpus,
+        build_calibration_tensor, register_corpus, spec_from_config,
+    )
+
+    name = "test-fake-corpus"
+
+    # The yaml parser pulls a single custom field (``fake_payload``) into the
+    # spec.dataset slot so changing it invalidates the cache key — same
+    # convention the built-in corpora use for their source-specific fields.
+    def _parse_yaml(cfg, num_sequences, sequence_length, seed):
+        return CalibrationSpec(
+            num_sequences=num_sequences,
+            sequence_length=sequence_length,
+            seed=seed,
+            source=name,
+            dataset=str(cfg.get("fake_payload", "default-payload")),
+        )
+
+    # Deterministic text generator so the cache key is reproducible across
+    # this test's two invocations (different fake_payload → different key).
+    def _stream_texts(spec, tokenizer):
+        return [f"{spec.dataset} row {i} " * 8 for i in range(spec.num_sequences)]
+
+    adapter = CorpusAdapter(
+        name=name, parse_yaml=_parse_yaml, stream_texts=_stream_texts,
+    )
+    register_corpus(adapter)
+    try:
+        # spec_from_config dispatches to the new adapter without any
+        # changes to its body.
+        spec_x = spec_from_config({
+            "source": name, "num_sequences": 4, "sequence_length": 32,
+            "fake_payload": "x",
+        })
+        spec_y = spec_from_config({
+            "source": name, "num_sequences": 4, "sequence_length": 32,
+            "fake_payload": "y",
+        })
+        assert spec_x.source == name
+        assert spec_x.dataset == "x"
+        # Cache keys diverge on source-specific yaml input, so swapping
+        # corpora cannot silently reuse a stale calibration tensor.
+        assert spec_x.cache_key("any-tok") != spec_y.cache_key("any-tok")
+
+        # Smoke test build_calibration_tensor through the new adapter using a
+        # minimal tokenizer stub — enough to round-trip text → int64 tensor.
+        class _StubTokenizer:
+            name_or_path = "test-stub"
+            eos_token_id = 0
+            def __call__(self, text, **kw):
+                # Return one int per character so the captured tokens vary
+                # per text — checks that the adapter's texts actually flow
+                # through tokenization.
+                return {"input_ids": [ord(c) % 128 for c in text]}
+
+        tok = _StubTokenizer()
+        tensor = build_calibration_tensor(
+            tok, spec_x, cache_dir=tmp_path / "cache",
+        )
+        assert tensor.shape == (4, 32)
+        assert tensor.dtype == torch.long
+
+        # Second call hits the cache. Verify the cache key is stable: delete
+        # the cached file, call again, confirm exactly one cache file exists,
+        # confirm its name matches the original (proving the key is
+        # reproducible), and confirm the returned tensors are equal.
+        cached_files = list((tmp_path / "cache").glob("calib_*.pt"))
+        assert len(cached_files) == 1, f"expected 1 cache file, got {cached_files}"
+        original_cache_name = cached_files[0].name
+        cached_files[0].unlink()
+        tensor_again = build_calibration_tensor(
+            tok, spec_x, cache_dir=tmp_path / "cache",
+        )
+        cached_files_after = list((tmp_path / "cache").glob("calib_*.pt"))
+        assert len(cached_files_after) == 1, (
+            f"expected 1 cache file after rebuild, got {cached_files_after}"
+        )
+        assert cached_files_after[0].name == original_cache_name, (
+            f"cache key changed across rebuild: "
+            f"{original_cache_name} -> {cached_files_after[0].name}"
+        )
+        assert torch.equal(tensor, tensor_again), (
+            "rebuilt calibration tensor differs from the original — adapter is "
+            "non-deterministic or cache key collides across content"
+        )
+    finally:
+        _unregister_corpus(name)

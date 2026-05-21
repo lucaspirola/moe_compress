@@ -26,6 +26,7 @@ import os
 import re
 from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
+from typing import Callable
 
 import torch
 
@@ -99,6 +100,92 @@ class CalibrationSpec:
 
 
 # ---------------------------------------------------------------------------
+# Corpus registry — pluggable faucet
+# ---------------------------------------------------------------------------
+#
+# To add a new calibration corpus, define two functions and one adapter:
+#
+#     def _parse_yaml_<name>(cal_cfg, num_sequences, sequence_length, seed) -> CalibrationSpec:
+#         ...validate/extract source-specific yaml fields...
+#
+#     def _stream_texts_<name>(spec, tokenizer) -> list[str]:
+#         ...iterate the dataset, return rendered text rows...
+#
+#     register_corpus(CorpusAdapter(
+#         name="<name>", parse_yaml=_parse_yaml_<name>, stream_texts=_stream_texts_<name>,
+#     ))
+#
+# Everything downstream (build_calibration_tensor, spec_from_config) dispatches
+# by name through the registry. The cache key already includes the source
+# string, so swapping corpora correctly invalidates cached calibration tensors.
+
+
+@dataclass(frozen=True)
+class CorpusAdapter:
+    """Source-specific behavior for one calibration corpus.
+
+    - ``parse_yaml`` builds a :class:`CalibrationSpec` from the ``calibration:``
+      section of the run YAML. Receives ``(cal_cfg, num_sequences, sequence_length, seed)``
+      and is responsible for validating source-specific fields (e.g. that
+      ``subset_weights`` is non-empty for nvidia-cascade).
+    - ``stream_texts`` produces the list of rendered text rows for the spec.
+      Receives ``(spec, tokenizer)``. Order does not matter — the caller
+      reshuffles globally before tokenizing.
+    """
+    name: str
+    parse_yaml: Callable[[dict, int, int, int], "CalibrationSpec"]
+    stream_texts: Callable[["CalibrationSpec", object], list[str]]
+
+
+_CORPUS_REGISTRY: dict[str, CorpusAdapter] = {}
+
+
+def register_corpus(adapter: CorpusAdapter) -> CorpusAdapter:
+    """Register a corpus adapter under its ``name``. Idempotent re-registration
+    of an equal adapter is allowed (helps in test fixtures and across module
+    reloads — ``CorpusAdapter`` is ``frozen=True`` and compares by value, so a
+    reload that re-runs the module-bottom ``register_corpus`` calls succeeds);
+    registering a different adapter under an existing name raises."""
+    existing = _CORPUS_REGISTRY.get(adapter.name)
+    if existing is not None and existing != adapter:
+        raise ValueError(
+            f"Corpus {adapter.name!r} is already registered with a different adapter"
+        )
+    _CORPUS_REGISTRY[adapter.name] = adapter
+    return adapter
+
+
+def _unregister_corpus(name: str) -> None:
+    """Private test affordance — do not call from production code.
+
+    Removes a registered corpus. No-op if not present. The leading underscore
+    marks this as a test-only API; production callers should never need to
+    unregister a corpus.
+    """
+    _CORPUS_REGISTRY.pop(name, None)
+
+
+def get_corpus_adapter(name: str) -> CorpusAdapter:
+    """Look up the adapter for ``name`` or raise ``ValueError`` listing the
+    registered corpora — gives a much clearer error than a bare ``KeyError``.
+
+    Raises ``ValueError`` (not ``KeyError``) because the lookup name comes from
+    config-driven user input, not from internal dict-access.
+    """
+    adapter = _CORPUS_REGISTRY.get(name)
+    if adapter is None:
+        raise ValueError(
+            f"Unknown calibration source {name!r}; registered: {sorted(_CORPUS_REGISTRY)}"
+        )
+    return adapter
+
+
+def registered_corpora() -> list[str]:
+    """Snapshot of registered corpus names, sorted."""
+    return sorted(_CORPUS_REGISTRY)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -145,52 +232,8 @@ def build_calibration_tensor(
         "Building calibration tensor: %d x %d tokens, source=%s",
         spec.num_sequences, spec.sequence_length, spec.source,
     )
-    texts: list[str] = []
-    if spec.source == "nvidia-cascade":
-        if not spec.subset_weights:
-            raise ValueError(
-                "CalibrationSpec.subset_weights must be non-empty for source='nvidia-cascade'"
-            )
-        for k in spec.subset_weights:
-            if k not in _CASCADE_SUBSETS:
-                raise ValueError(
-                    f"Unknown cascade subset: {k!r}. Valid: {list(_CASCADE_SUBSETS)}"
-                )
-        per = _distribute_counts(spec.num_sequences, spec.subset_weights)
-        log.info("  per-subset sequence counts: %s", per)
-        for subset, count in per.items():
-            if count <= 0:
-                continue
-            # Per-subset seed offset so subsets draw from independent shuffles
-            # even when the same base seed is reused across stages.
-            subset_offset = int(hashlib.md5(subset.encode(), usedforsecurity=False).hexdigest(), 16) % 1_000_000
-            subset_seed = (spec.seed + subset_offset) % (2**32)
-            texts.extend(_stream_cascade_texts(
-                spec.dataset, subset, count, tokenizer, seed=subset_seed,
-            ))
-    elif spec.source == "c4-math-code":
-        if not spec.domain_mix:
-            raise ValueError(
-                "CalibrationSpec.domain_mix must be non-empty for source='c4-math-code'"
-            )
-        unknown = set(spec.domain_mix) - _LEGACY_DOMAINS
-        if unknown:
-            raise ValueError(
-                f"Unknown legacy calibration domains: {sorted(unknown)}. "
-                f"Valid: {sorted(_LEGACY_DOMAINS)}"
-            )
-        per = _distribute_counts(spec.num_sequences, spec.domain_mix)
-        for domain, count in per.items():
-            if count <= 0:
-                continue
-            # Per-domain seed offset so domains draw from independent shuffles
-            # (mirrors the per-subset seed offset used for nvidia-cascade).
-            domain_offset = int(hashlib.md5(domain.encode(), usedforsecurity=False).hexdigest(), 16) % 1_000_000
-            domain_seed = (spec.seed + domain_offset) % (2**32)
-            texts.extend(_stream_legacy_texts(domain, count, spec, seed=domain_seed))
-    else:
-        # All recognised sources are handled above; anything else is a config error.
-        raise ValueError(f"Unknown calibration source: {spec.source}")
+    adapter = get_corpus_adapter(spec.source)
+    texts = adapter.stream_texts(spec, tokenizer)
 
     if not texts:
         raise ValueError(
@@ -306,82 +349,8 @@ def spec_from_config(
         raise ValueError(f"calibration config: num_sequences must be > 0, got {num_sequences}")
     if sequence_length <= 0:
         raise ValueError(f"calibration config: sequence_length must be > 0, got {sequence_length}")
-    if source == "nvidia-cascade":
-        # "dataset" and "subset_weights" are required keys for this source;
-        # raise a descriptive error rather than a bare KeyError if absent.
-        try:
-            dataset = str(cal_cfg["dataset"]).strip()
-            subset_weights = dict(cal_cfg["subset_weights"])
-        except KeyError as exc:
-            raise KeyError(
-                f"calibration config is missing required key {exc} for source='nvidia-cascade'"
-            ) from exc
-        unknown = set(subset_weights) - _CASCADE_SUBSETS.keys()
-        if unknown:
-            raise ValueError(
-                f"spec_from_config: unknown subset_weights keys {sorted(unknown)!r}; "
-                f"valid keys are {sorted(_CASCADE_SUBSETS)!r}"
-            )
-        if any(w < 0 for w in subset_weights.values()):
-            raise ValueError(f"subset_weights contains negative values: {subset_weights}")
-        if not any(w > 0 for w in subset_weights.values()):
-            raise ValueError(f"subset_weights are all zero — at least one weight must be positive: {subset_weights}")
-        return CalibrationSpec(
-            num_sequences=num_sequences,
-            sequence_length=sequence_length,
-            seed=seed,
-            source=source,
-            dataset=dataset,
-            subset_weights=subset_weights,
-        )
-    # Legacy schema (kept so synthetic-MoE tests work unchanged).
-    if source != "c4-math-code":
-        # Preserve the original source value so the cache key reflects the actual
-        # config.  Two configs that differ only by their `source` field must
-        # produce different cache keys; normalizing unknown sources to a canonical
-        # string defeats that invariant.
-        raise ValueError(
-            f"spec_from_config: unrecognized source {source!r}. "
-            f"Valid sources are 'nvidia-cascade' and 'c4-math-code'."
-        )
-    if "domain_mix" not in cal_cfg:
-        raise KeyError("calibration config is missing required key 'domain_mix'")
-    # Warn if cascade-specific keys are present but ignored under this source.
-    ignored = {k for k in ("subset_weights", "dataset") if k in cal_cfg}
-    if ignored:
-        log.warning(
-            "spec_from_config: source=%r — the following keys are ignored for "
-            "the legacy c4-math-code source: %s",
-            source, sorted(ignored),
-        )
-    # Always use the hardcoded default for c4_dataset here — the cascade
-    # "dataset" key is genuinely ignored in the legacy path (as the warning
-    # above states).  Legacy callers should not repurpose the cascade "dataset"
-    # key; use the dedicated "c4_dataset" config key instead.
-    domain_mix_raw = cal_cfg["domain_mix"]
-    if not isinstance(domain_mix_raw, dict):
-        raise ValueError(
-            f"calibration config 'domain_mix' must be a dict mapping subset names to weights, "
-            f"got {type(domain_mix_raw).__name__!r}"
-        )
-    if not domain_mix_raw:
-        raise ValueError("calibration config: 'domain_mix' must be non-empty")
-    domain_mix = dict(domain_mix_raw)
-    if any(w < 0 for w in domain_mix.values()):
-        raise ValueError(f"domain_mix contains negative values: {domain_mix}")
-    if not any(w > 0 for w in domain_mix.values()):
-        raise ValueError(f"domain_mix are all zero — at least one weight must be positive (source={source!r}): {domain_mix}")
-    return CalibrationSpec(
-        num_sequences=num_sequences,
-        sequence_length=sequence_length,
-        seed=seed,
-        source=source,
-        domain_mix=domain_mix,
-        c4_dataset=cal_cfg.get("c4_dataset", "allenai/c4"),
-        c4_subset=cal_cfg.get("c4_subset", "en"),
-        math_dataset=cal_cfg.get("math_dataset", "hendrycks/competition_math"),
-        code_dataset=cal_cfg.get("code_dataset", "bigcode/the-stack-smol"),
-    )
+    adapter = get_corpus_adapter(source)
+    return adapter.parse_yaml(cal_cfg, num_sequences, sequence_length, seed)
 
 
 # ---------------------------------------------------------------------------
@@ -668,3 +637,159 @@ def _tokenize_to_fixed_length(
     else:
         all_ids = all_ids[:need]
     return torch.tensor(all_ids, dtype=torch.long).view(num_sequences, seq_len)
+
+
+# ---------------------------------------------------------------------------
+# Built-in corpus adapters
+# ---------------------------------------------------------------------------
+
+
+def _parse_yaml_nvidia_cascade(
+    cal_cfg: dict, num_sequences: int, sequence_length: int, seed: int,
+) -> CalibrationSpec:
+    """Yaml → CalibrationSpec for the ``nvidia-cascade`` source."""
+    try:
+        dataset = str(cal_cfg["dataset"]).strip()
+        subset_weights = dict(cal_cfg["subset_weights"])
+    except KeyError as exc:
+        raise KeyError(
+            f"calibration config is missing required key {exc} for source='nvidia-cascade'"
+        ) from exc
+    unknown = set(subset_weights) - _CASCADE_SUBSETS.keys()
+    if unknown:
+        raise ValueError(
+            f"spec_from_config: unknown subset_weights keys {sorted(unknown)!r}; "
+            f"valid keys are {sorted(_CASCADE_SUBSETS)!r}"
+        )
+    if any(w < 0 for w in subset_weights.values()):
+        raise ValueError(f"subset_weights contains negative values: {subset_weights}")
+    if not any(w > 0 for w in subset_weights.values()):
+        raise ValueError(
+            f"subset_weights are all zero — at least one weight must be positive: {subset_weights}"
+        )
+    return CalibrationSpec(
+        num_sequences=num_sequences,
+        sequence_length=sequence_length,
+        seed=seed,
+        source="nvidia-cascade",
+        dataset=dataset,
+        subset_weights=subset_weights,
+    )
+
+
+def _stream_texts_nvidia_cascade(spec: CalibrationSpec, tokenizer) -> list[str]:
+    """CalibrationSpec → text rows for the ``nvidia-cascade`` source."""
+    if not spec.subset_weights:
+        raise ValueError(
+            "CalibrationSpec.subset_weights must be non-empty for source='nvidia-cascade'"
+        )
+    for k in spec.subset_weights:
+        if k not in _CASCADE_SUBSETS:
+            raise ValueError(
+                f"Unknown cascade subset: {k!r}. Valid: {list(_CASCADE_SUBSETS)}"
+            )
+    per = _distribute_counts(spec.num_sequences, spec.subset_weights)
+    log.info("  per-subset sequence counts: %s", per)
+    texts: list[str] = []
+    for subset, count in per.items():
+        if count <= 0:
+            continue
+        # Per-subset seed offset so subsets draw from independent shuffles
+        # even when the same base seed is reused across stages.
+        subset_offset = int(
+            hashlib.md5(subset.encode(), usedforsecurity=False).hexdigest(), 16
+        ) % 1_000_000
+        subset_seed = (spec.seed + subset_offset) % (2**32)
+        texts.extend(_stream_cascade_texts(
+            spec.dataset, subset, count, tokenizer, seed=subset_seed,
+        ))
+    return texts
+
+
+def _parse_yaml_c4_math_code(
+    cal_cfg: dict, num_sequences: int, sequence_length: int, seed: int,
+) -> CalibrationSpec:
+    """Yaml → CalibrationSpec for the legacy ``c4-math-code`` source."""
+    if "domain_mix" not in cal_cfg:
+        raise KeyError("calibration config is missing required key 'domain_mix'")
+    # Warn if cascade-specific keys are present but ignored under this source.
+    ignored = {k for k in ("subset_weights", "dataset") if k in cal_cfg}
+    if ignored:
+        log.warning(
+            "spec_from_config: source='c4-math-code' — the following keys are ignored "
+            "for the legacy source: %s",
+            sorted(ignored),
+        )
+    domain_mix_raw = cal_cfg["domain_mix"]
+    if not isinstance(domain_mix_raw, dict):
+        raise ValueError(
+            f"calibration config 'domain_mix' must be a dict mapping subset names to weights, "
+            f"got {type(domain_mix_raw).__name__!r}"
+        )
+    if not domain_mix_raw:
+        raise ValueError("calibration config: 'domain_mix' must be non-empty")
+    domain_mix = dict(domain_mix_raw)
+    unknown = set(domain_mix) - _LEGACY_DOMAINS
+    if unknown:
+        raise ValueError(
+            f"calibration config 'domain_mix' has unknown domain keys "
+            f"{sorted(unknown)!r}; valid keys are {sorted(_LEGACY_DOMAINS)!r}"
+        )
+    if any(w < 0 for w in domain_mix.values()):
+        raise ValueError(f"domain_mix contains negative values: {domain_mix}")
+    if not any(w > 0 for w in domain_mix.values()):
+        raise ValueError(
+            f"domain_mix are all zero — at least one weight must be positive: {domain_mix}"
+        )
+    return CalibrationSpec(
+        num_sequences=num_sequences,
+        sequence_length=sequence_length,
+        seed=seed,
+        source="c4-math-code",
+        domain_mix=domain_mix,
+        c4_dataset=cal_cfg.get("c4_dataset", "allenai/c4"),
+        c4_subset=cal_cfg.get("c4_subset", "en"),
+        math_dataset=cal_cfg.get("math_dataset", "hendrycks/competition_math"),
+        code_dataset=cal_cfg.get("code_dataset", "bigcode/the-stack-smol"),
+    )
+
+
+def _stream_texts_c4_math_code(spec: CalibrationSpec, tokenizer) -> list[str]:
+    """CalibrationSpec → text rows for the legacy ``c4-math-code`` source."""
+    del tokenizer  # rendering happens lower down; the legacy loader is plain text
+    if not spec.domain_mix:
+        raise ValueError(
+            "CalibrationSpec.domain_mix must be non-empty for source='c4-math-code'"
+        )
+    unknown = set(spec.domain_mix) - _LEGACY_DOMAINS
+    if unknown:
+        raise ValueError(
+            f"Unknown legacy calibration domains: {sorted(unknown)}. "
+            f"Valid: {sorted(_LEGACY_DOMAINS)}"
+        )
+    per = _distribute_counts(spec.num_sequences, spec.domain_mix)
+    texts: list[str] = []
+    for domain, count in per.items():
+        if count <= 0:
+            continue
+        # Per-domain seed offset so domains draw from independent shuffles
+        # (mirrors the per-subset seed offset used for nvidia-cascade).
+        domain_offset = int(
+            hashlib.md5(domain.encode(), usedforsecurity=False).hexdigest(), 16
+        ) % 1_000_000
+        domain_seed = (spec.seed + domain_offset) % (2**32)
+        texts.extend(_stream_legacy_texts(domain, count, spec, seed=domain_seed))
+    return texts
+
+
+register_corpus(CorpusAdapter(
+    name="nvidia-cascade",
+    parse_yaml=_parse_yaml_nvidia_cascade,
+    stream_texts=_stream_texts_nvidia_cascade,
+))
+
+register_corpus(CorpusAdapter(
+    name="c4-math-code",
+    parse_yaml=_parse_yaml_c4_math_code,
+    stream_texts=_stream_texts_c4_math_code,
+))

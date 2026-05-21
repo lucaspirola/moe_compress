@@ -60,6 +60,12 @@ from .utils.activation_hooks import (
     instrument_experts,
     record_reap,
 )
+from .utils.activation_shards import (
+    HealActivationDataset,
+    ShardManifest,
+    ShardWriter,
+    load_manifest,
+)
 from .utils.calibration import (
     build_calibration_tensor,
     iter_batches,
@@ -114,6 +120,7 @@ class _HealConfig:
         "token_cap", "minibatch_size", "min_rel_delta",
         "lr_warmup_steps", "lr_min", "lr_decay_steps",
         "cross_domain_holdout_enabled", "xd_holdout_tokens",
+        "shard_rows", "shard_dir", "keep_shards",
     )
 
     def __init__(self, s2: dict) -> None:
@@ -174,6 +181,19 @@ class _HealConfig:
         self.xd_holdout_tokens: int = int(
             s2.get("merge_heal_xd_holdout_tokens", 26214)
         )
+        # Shard storage knobs: heal activations live on disk as bf16 safetensors
+        # shards (one safetensors file per `shard_rows` rows). The pool stops
+        # scaling with RAM, so token_cap can be raised ~100× without OOM.
+        self.shard_rows: int = int(s2.get("merge_heal_shard_rows", 4096))
+        # ``None`` defers the path to the call site, which derives it from
+        # ``artifacts_dir`` (canonical: ``artifacts_dir/_stage2_heal_shards``).
+        # An explicit string overrides that — useful for routing shards to a
+        # fast NVMe distinct from the artifacts NFS mount.
+        _sd = s2.get("merge_heal_shard_dir")
+        self.shard_dir: str | None = str(_sd) if _sd is not None else None
+        # When False (default), each layer's shard dir is deleted after the
+        # heal completes — bounded disk use. Flip True only for debugging.
+        self.keep_shards: bool = bool(s2.get("merge_heal_keep_shards", False))
 
         if not self.enabled:
             return
@@ -206,6 +226,7 @@ class _HealConfig:
             ("merge_heal_max_steps", self.max_steps),
             ("merge_heal_token_cap", self.token_cap),
             ("merge_heal_minibatch_size", self.minibatch_size),
+            ("merge_heal_shard_rows", self.shard_rows),
         ):
             if _val < 1:
                 raise ValueError(
@@ -279,6 +300,26 @@ class _HealConfig:
                 f"stage2_reap_ream.merge_heal_xd_holdout_tokens="
                 f"{self.xd_holdout_tokens}; must be >= 1 when "
                 "merge_heal_cross_domain_holdout_enabled is true."
+            )
+        # The whole-shard 90/10 split inside ShardWriter.finalize() needs at
+        # least 2 shards' worth of captured rows. Catch the misconfig at
+        # construction time so it fails before any corpus pass.
+        if self.token_cap < 2 * self.shard_rows:
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_token_cap={self.token_cap} "
+                f"must be >= 2 * merge_heal_shard_rows ({2 * self.shard_rows}); "
+                "the whole-shard train/holdout split needs at least 2 shards."
+            )
+        if (
+            self.cross_domain_holdout_enabled
+            and self.xd_holdout_tokens < 2 * self.shard_rows
+        ):
+            raise ValueError(
+                f"stage2_reap_ream.merge_heal_xd_holdout_tokens="
+                f"{self.xd_holdout_tokens} must be >= 2 * merge_heal_shard_rows "
+                f"({2 * self.shard_rows}) when "
+                "merge_heal_cross_domain_holdout_enabled is true; the "
+                "whole-shard train/holdout split needs at least 2 shards."
             )
 
 
@@ -1187,22 +1228,44 @@ def run(
         # output is the self-distillation target. Skipped for 0-merge layers:
         # a layer that merged nothing is unchanged, so the heal would be a
         # guaranteed no-op the accept/reject guard rejects anyway.
-        cap_in: torch.Tensor | None = None
-        cap_out: torch.Tensor | None = None
-        # Cross-domain (WikiText) capture: telemetry only. Built before merge
-        # so target == pre-merge MoE-block output on WikiText tokens.
-        xd_cap_in: torch.Tensor | None = None
-        xd_cap_out: torch.Tensor | None = None
+        #
+        # Captures stream to bf16 safetensors shards on disk so peak RAM is
+        # bounded by a small LRU cache, NOT by ``token_cap``. One layer at a
+        # time = bounded total disk use. Companion ``shared_*`` shards are
+        # computed AFTER bank.select / router resize (the shared expert is
+        # untouched by the merge, so timing is purely a convenience).
+        nemo_writer: ShardWriter | None = None
+        xd_writer: ShardWriter | None = None
         layer_merged = any(len(m) > 1 for m in grouped.values())
         if heal_cfg.enabled and layer_merged:
-            cap_in, cap_out = _capture_mlp_io(
+            heal_shard_root = (
+                Path(heal_cfg.shard_dir) if heal_cfg.shard_dir
+                else artifacts_dir / "_stage2_heal_shards"
+            )
+            layer_shard_dir = heal_shard_root / f"layer_{layer_ref.layer_idx}"
+            hidden_dim = layer_ref.router.weight.shape[-1]
+            nemo_writer = ShardWriter(
+                layer_shard_dir / "nemo",
+                layer_idx=layer_ref.layer_idx,
+                hidden_dim=hidden_dim,
+                shard_rows=heal_cfg.shard_rows,
+            )
+            _capture_mlp_io(
                 model, layer_ref, batches,
                 device=_heal_device, pool_size=heal_cfg.token_cap,
+                shard_writer=nemo_writer,
             )
             if xd_batches is not None:
-                xd_cap_in, xd_cap_out = _capture_mlp_io(
+                xd_writer = ShardWriter(
+                    layer_shard_dir / "xd",
+                    layer_idx=layer_ref.layer_idx,
+                    hidden_dim=hidden_dim,
+                    shard_rows=heal_cfg.shard_rows,
+                )
+                _capture_mlp_io(
                     model, layer_ref, xd_batches,
                     device=_heal_device, pool_size=heal_cfg.xd_holdout_tokens,
+                    shard_writer=xd_writer,
                 )
 
         # Phase 3 (M8): snapshot pre-merge expert weights BEFORE the merge
@@ -1281,22 +1344,59 @@ def run(
         # heal_state field reflect the healed layer.
         heal_state: dict | None = None
         if heal_cfg.enabled:
-            if cap_in is not None and cap_out is not None:
-                heal_state = _heal_layer(
-                    layer_ref=layer_ref,
-                    final_kept_ids=final_kept_ids,
-                    captured_input=cap_in,
-                    captured_target=cap_out,
-                    xd_input=xd_cap_in,
-                    xd_target=xd_cap_out,
-                    heal_cfg=heal_cfg,
-                    device=(
-                        device if device is not None
-                        else layer_ref.router.weight.device
-                    ),
-                )
-                del cap_in, cap_out, xd_cap_in, xd_cap_out
+            # `nemo_writer is not None` iff this layer had merges
+            # (`heal_cfg.enabled and layer_merged` above). `_capture_mlp_io`
+            # raises when it captures 0 rows, so reaching this point with a
+            # non-None writer means there's something to heal — the
+            # `n_captured > 0` sub-condition is dead code.
+            if nemo_writer is not None:
+                try:
+                    # The shared expert is Stage-2 protected (untouched by
+                    # merge/bank.select/resize), so we can run it on the captured
+                    # inputs now and store the result in companion shards. Then
+                    # finalize each writer with a layer-idx-seeded whole-shard
+                    # 90/10 split (controlled by ``holdout_fraction``).
+                    _shared_fn = _make_shared_out_fn(layer_ref)
+                    nemo_writer.compute_shared_companions(_shared_fn)
+                    nemo_manifest = nemo_writer.finalize(
+                        split_ratio=1.0 - heal_cfg.holdout_fraction,
+                        seed=layer_ref.layer_idx,
+                    )
+                    xd_manifest: ShardManifest | None = None
+                    if xd_writer is not None:
+                        xd_writer.compute_shared_companions(_shared_fn)
+                        xd_manifest = xd_writer.finalize(
+                            split_ratio=1.0 - heal_cfg.holdout_fraction,
+                            seed=layer_ref.layer_idx,
+                        )
+                    heal_state = _heal_layer(
+                        layer_ref=layer_ref,
+                        final_kept_ids=final_kept_ids,
+                        manifest=nemo_manifest,
+                        manifest_dir=nemo_writer.out_dir,
+                        xd_manifest=xd_manifest,
+                        xd_manifest_dir=(
+                            xd_writer.out_dir if xd_writer is not None else None
+                        ),
+                        heal_cfg=heal_cfg,
+                        device=(
+                            device if device is not None
+                            else layer_ref.router.weight.device
+                        ),
+                    )
+                finally:
+                    # Bounded disk use: drop the layer's shard dir even on
+                    # exception. `cleanup()` is idempotent and safe when the
+                    # writer never created its out_dir (lazy mkdir).
+                    # `keep_shards=True` opts into debugging mode and keeps
+                    # shards on disk.
+                    if not heal_cfg.keep_shards:
+                        nemo_writer.cleanup()
+                        if xd_writer is not None:
+                            xd_writer.cleanup()
             else:
+                # nemo_writer is None => layer had 0 merges (the layer is
+                # unchanged, so there is nothing to heal).
                 log.info(
                     "  merge-heal layer %d: skipped (0 merges — layer "
                     "unchanged, nothing to heal)",
@@ -2678,6 +2778,40 @@ def _distill_merged_group(
 # ===========================================================================
 
 
+def _make_shared_out_fn(layer_ref: MoELayerRef):
+    """Build a closure that runs the frozen shared expert on a CPU fp32 tensor.
+
+    The shared expert is protected by Stage 2 (untouched by REAP / REAM), so we
+    feed activations through ``layer_ref.shared_expert`` (gated by
+    ``shared_expert_gate`` when present) to reconstruct the shared contribution
+    that the self-distillation target included. The closure handles device +
+    dtype shuttling: input is moved to the expert's device + dtype for the
+    matmul, output is cast back to fp32 on the input's original device.
+
+    Returns ``None`` if the layer has no shared expert (the heal student just
+    skips the shared addition in that case).
+    """
+    mlp = layer_ref.mlp
+    shared_expert = layer_ref.shared_expert
+    shared_gate = getattr(mlp, "shared_expert_gate", None)
+
+    def _shared_out(x_in: torch.Tensor) -> torch.Tensor:
+        if shared_expert is None:
+            return torch.zeros_like(x_in)
+        sp = next(shared_expert.parameters())
+        sdev, sdtype = sp.device, sp.dtype
+        # Heal runs in fp32, but the frozen shared expert keeps the model's
+        # native dtype (bf16) — feed it in its own dtype to avoid a matmul
+        # dtype mismatch, then cast back to fp32.
+        with torch.no_grad():
+            so = shared_expert(x_in.to(sdev, sdtype))
+            if shared_gate is not None:
+                so = torch.sigmoid(shared_gate(x_in.to(sdev, sdtype))) * so
+        return so.to(x_in.device, torch.float32)
+
+    return _shared_out
+
+
 def _capture_mlp_io(
     model,
     layer_ref: MoELayerRef,
@@ -2685,8 +2819,9 @@ def _capture_mlp_io(
     *,
     device: torch.device,
     pool_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Capture row-aligned ``(mlp_input, mlp_output)`` pools for one MoE layer.
+    shard_writer: ShardWriter,
+) -> int:
+    """Capture row-aligned ``(mlp_input, mlp_output)`` rows into ``shard_writer``.
 
     Runs a forward over ``calib_batches`` with :func:`early_exit_after_layer`
     so each pass stops right after ``layer_ref.layer_idx``. A forward hook on
@@ -2696,33 +2831,38 @@ def _capture_mlp_io(
     ``layer_ref.mlp`` is still its original pre-merge self — so the captured
     output is the self-distillation target.
 
-    Returns two CPU bf16 ``[n, hidden]`` tensors with ``n == min(pool_size,
-    total calibration tokens)``; row ``i`` of both is the same token. The
-    pools are a contiguous prefix of the calibration tokens, and the forward
-    loop stops early once ``pool_size`` rows are in hand.
+    The hook appends each batch's flattened ``[N_tokens, hidden]`` rows to
+    ``shard_writer``, which buffers and flushes safetensors shards on disk
+    once ``shard_writer.shard_rows`` is reached. The forward loop stops as
+    soon as ``shard_writer.n_captured >= pool_size``; a per-hook prefix slice
+    truncates the final batch so the total never exceeds ``pool_size`` (exact
+    cap, not approximate). The writer is left un-finalized — the caller is
+    responsible for ``compute_shared_companions`` + ``finalize``. Returns the
+    total rows captured.
 
-    The prefix is an UNBIASED uniform sample — NOT because of any sampling
-    here, but because :func:`build_calibration_tensor`
-    (``utils/calibration.py``) globally shuffles every calibration sequence
-    with ``torch.randperm`` before they are batched. The first N sequences
-    are therefore already a uniform random draw from the full corpus, so a
-    contiguous prefix of their tokens is itself a uniform random sample. No
-    reservoir sampling is needed (and adding it would be redundant).
+    The captured prefix is an UNBIASED uniform sample of the calibration
+    corpus because :func:`build_calibration_tensor` globally shuffles every
+    calibration sequence with ``torch.randperm`` before they are batched.
+    A contiguous prefix is therefore a uniform random sample; no reservoir
+    sampling is needed (and adding it would be redundant).
     """
     layer_idx = layer_ref.layer_idx
-    in_chunks: list[torch.Tensor] = []
-    out_chunks: list[torch.Tensor] = []
     captured = 0
 
     def _hook(_module, inputs, output):
         nonlocal captured
         x_in = inputs[0]
         x_out = output[0] if isinstance(output, tuple) else output
-        in_flat = x_in.reshape(-1, x_in.shape[-1]).detach().to("cpu", torch.bfloat16)
-        out_flat = x_out.reshape(-1, x_out.shape[-1]).detach().to("cpu", torch.bfloat16)
-        in_chunks.append(in_flat)
-        out_chunks.append(out_flat)
-        captured += in_flat.shape[0]
+        in_flat = x_in.reshape(-1, x_in.shape[-1]).detach()
+        out_flat = x_out.reshape(-1, x_out.shape[-1]).detach()
+        remaining = pool_size - captured
+        if remaining <= 0:
+            return
+        if in_flat.size(0) > remaining:
+            in_flat = in_flat[:remaining]
+            out_flat = out_flat[:remaining]
+        shard_writer.append(in_flat, out_flat)
+        captured += int(in_flat.size(0))
 
     handle = layer_ref.mlp.register_forward_hook(_hook)
     was_training = model.training
@@ -2731,9 +2871,6 @@ def _capture_mlp_io(
         with early_exit_after_layer(model, layer_idx):
             for batch in calib_batches:
                 if captured >= pool_size:
-                    # Checked once per batch, so capture may overshoot
-                    # pool_size by up to one full batch — deliberate; the
-                    # final [:pool_size] slice below truncates the excess.
                     break
                 with torch.no_grad():
                     try:
@@ -2745,41 +2882,33 @@ def _capture_mlp_io(
         if was_training:
             model.train()
 
-    if not in_chunks:
+    shard_writer.close_pending()
+
+    if captured == 0:
         raise RuntimeError(
             f"merge-heal capture: layer {layer_idx} mlp forward hook never "
             "fired — calib_batches empty or layer never reached."
         )
-    x_in = torch.cat(in_chunks, dim=0)[:pool_size].contiguous()
-    x_out = torch.cat(out_chunks, dim=0)[:pool_size].contiguous()
-    if x_in.shape[0] < pool_size:
+    expected_hidden = layer_ref.router.weight.shape[-1]
+    if shard_writer.hidden_dim != expected_hidden:
+        raise RuntimeError(
+            f"merge-heal capture: layer {layer_idx} writer hidden_dim "
+            f"{shard_writer.hidden_dim} != model hidden size {expected_hidden} — "
+            "shard_writer was constructed with the wrong hidden_dim."
+        )
+    if captured < pool_size:
         log.warning(
             "  merge-heal capture: layer %d — calibration data starved: "
             "%d token rows captured vs requested pool_size=%d; healing will "
             "proceed with the smaller pool.",
-            layer_idx, x_in.shape[0], pool_size,
-        )
-    if x_in.shape != x_out.shape:
-        raise RuntimeError(
-            f"merge-heal capture: layer {layer_idx} input/target pools "
-            f"misaligned ({tuple(x_in.shape)} vs {tuple(x_out.shape)})."
-        )
-    # Sanity-check the captured feature dimension against the model's hidden
-    # size: a wrong hook point (or a tuple-unpack bug) would surface here as a
-    # mismatched last dim rather than as a confusing downstream matmul error.
-    expected_hidden = layer_ref.router.weight.shape[-1]
-    if x_in.shape[-1] != expected_hidden:
-        raise RuntimeError(
-            f"merge-heal capture: layer {layer_idx} captured feature dim "
-            f"{x_in.shape[-1]} != model hidden size {expected_hidden} — the "
-            "mlp forward hook captured the wrong tensor."
+            layer_idx, captured, pool_size,
         )
     log.info(
         "  merge-heal capture: layer %d — %d (input,target) token rows "
-        "captured (pool_size=%d)",
-        layer_idx, x_in.shape[0], pool_size,
+        "captured to %d shards (pool_size=%d)",
+        layer_idx, captured, len(shard_writer.shard_entries), pool_size,
     )
-    return x_in, x_out
+    return captured
 
 
 def _heal_student_moe_output(
@@ -2904,14 +3033,14 @@ def _heal_layer(
     *,
     layer_ref: MoELayerRef,
     final_kept_ids: list[int],
-    captured_input: torch.Tensor,
-    captured_target: torch.Tensor,
+    manifest: ShardManifest,
+    manifest_dir: Path,
     heal_cfg: "_HealConfig",
     device: torch.device,
-    xd_input: torch.Tensor | None = None,
-    xd_target: torch.Tensor | None = None,
+    xd_manifest: ShardManifest | None = None,
+    xd_manifest_dir: Path | None = None,
 ) -> dict:
-    """Per-layer merge-heal by SELF-DISTILLATION.
+    """Per-layer merge-heal by SELF-DISTILLATION (disk-shard variant).
 
     Fine-tunes one already-merged layer so it reproduces its OWN pre-merge
     MoE-block output:
@@ -2922,32 +3051,47 @@ def _heal_layer(
         only when ``heal_cfg.train_router`` is True; otherwise the router is
         frozen at its mechanical resize.
 
-    Loss = ``F.mse_loss(student_moe_out, captured_target)`` in fp32, where
-    ``student_moe_out`` is :func:`_heal_student_moe_output` over
-    ``captured_input`` (the layer's own pre-merge MoE-block input, row-aligned
-    with ``captured_target`` — both from :func:`_capture_mlp_io`).
+    Pool: ``manifest`` indexes per-layer ``(input, target, shared)`` shards on
+    disk (bf16, written by :class:`ShardWriter`), already split 90/10 into
+    train/holdout shards at finalize time. ``HealActivationDataset`` streams
+    minibatches off disk per step and decodes to fp32 on-device — peak RAM is
+    bounded by a small LRU shard cache, NOT by the total pool size.
 
-    90/10 train/held-out split (``layer_idx``-seeded), patience early-stop on
-    held-out MSE. **Monotone-safe accept/reject:** the un-healed plain-merged
-    weights are snapshotted before training; if the best healed held-out MSE
-    does not beat the plain-merged held-out MSE the layer is REVERTED to the
-    plain merge (worst case per layer == the no-heal baseline).
+    Loss = ``F.mse_loss(student_moe_out, target)``, where ``student_moe_out``
+    is :func:`_heal_student_moe_output` over the streamed input rows + the
+    precomputed shared-expert output that lives in the companion ``shared_*``
+    shards. The shared addition was computed at capture time against the
+    (Stage-2 protected) shared expert, so the heal target faithfully
+    reproduces ``Qwen3_5MoeSparseMoeBlock.forward``.
+
+    **Monotone-safe accept/reject:** the un-healed plain-merged weights are
+    snapshotted before training; if the best healed held-out MSE does not
+    beat the plain-merged held-out MSE the layer is REVERTED to the plain
+    merge (worst case per layer == the no-heal baseline).
+
+    ``xd_manifest`` is an optional cross-domain (e.g. WikiText) pool used for
+    telemetry only — read-only MSE evaluation each eval interval, never
+    backpropped and never consulted for accept/reject.
 
     Returns a JSON-able state dict:
         ``{"steps", "train_mse", "train_mse_at_best", "holdout_mse",
-        "plain_merged_holdout_mse", "heal_gap", "accepted", "stop_reason"}``.
+        "plain_merged_holdout_mse", "heal_gap", "accepted", "stop_reason",
+        "holdout_mse_xd", "plain_merged_holdout_mse_xd"}``.
     """
     layer_idx = layer_ref.layer_idx
     router = layer_ref.router
 
-    # --- Row-alignment hard-assert (input pool must match target pool) -----
-    if captured_input.shape != captured_target.shape:
+    if manifest.layer_idx != layer_idx:
         raise RuntimeError(
-            f"merge-heal layer {layer_idx}: captured input pool "
-            f"{tuple(captured_input.shape)} != target pool "
-            f"{tuple(captured_target.shape)} — token alignment is broken."
+            f"merge-heal layer {layer_idx}: manifest layer_idx "
+            f"{manifest.layer_idx} != layer_ref.layer_idx — wrong manifest."
         )
-    x_buf = captured_input
+    expected_hidden = layer_ref.router.weight.shape[-1]
+    if manifest.hidden_dim != expected_hidden:
+        raise RuntimeError(
+            f"merge-heal layer {layer_idx}: manifest hidden_dim "
+            f"{manifest.hidden_dim} != model hidden size {expected_hidden}."
+        )
 
     banks = build_banks(layer_ref)
     # CRITICAL indexing contract: `_heal_layer` runs AFTER `bank.select(
@@ -3010,66 +3154,36 @@ def _heal_layer(
     # the optimizer always has at least one parameter.
     top_k = layer_ref.top_k
 
-    # --- Calibration token rows: 90/10 split (layer-idx-seeded) ------------
-    n_rows = x_buf.shape[0]
-    gen = torch.Generator(device="cpu").manual_seed(layer_idx)
-    perm = torch.randperm(n_rows, generator=gen)
-    n_use = perm.shape[0]
-    n_holdout = max(1, int(round(n_use * heal_cfg.holdout_fraction)))
-    n_holdout = min(n_holdout, n_use - 1)  # leave at least 1 training row
-    holdout_idx = perm[:n_holdout]
-    train_idx = perm[n_holdout:]
+    # --- Shard-backed activation dataset ----------------------------------
+    # Pool rows live on disk as bf16 safetensors shards (one per ``shard_rows``
+    # rows). ``HealActivationDataset`` streams minibatches per step into fp32
+    # on-device tensors, with a small LRU shard cache so repeated reads of the
+    # same shard within one step cost zero I/O. The 90/10 train/holdout split
+    # was done at finalize time (whole-shard granularity, seeded by layer_idx),
+    # so the heal step trains on ``manifest.train_shards`` and evaluates on
+    # ``manifest.holdout_shards``.
+    dataset = HealActivationDataset(
+        manifest, manifest_dir, device=device, compute_dtype=torch.float32,
+    )
 
-    # Move the token rows + self-distillation targets to device, fp32.
-    x_train = x_buf[train_idx].to(device, torch.float32)
-    x_holdout = x_buf[holdout_idx].to(device, torch.float32)
-    t_train = captured_target[train_idx].to(device, torch.float32)
-    t_holdout = captured_target[holdout_idx].to(device, torch.float32)
-
-    # --- Frozen shared-expert output (precomputed; not trained) ------------
-    # The captured target is the full MoE-block output, which includes the
-    # sigmoid-gated shared expert. The shared expert is protected by Stage 2
-    # (untouched), so we run the model's own shared_expert / shared_expert_gate
-    # and add the result back — exactly like Qwen3_5MoeSparseMoeBlock.forward.
-    mlp = layer_ref.mlp
-    shared_expert = layer_ref.shared_expert  # canonical MoELayerRef accessor
-    shared_gate = getattr(mlp, "shared_expert_gate", None)  # no MoELayerRef field
-
-    def _shared_out(x_in: torch.Tensor) -> torch.Tensor:
-        if shared_expert is None:
-            return torch.zeros_like(x_in)
-        sp = next(shared_expert.parameters())
-        sdev, sdtype = sp.device, sp.dtype
-        # The heal runs in fp32, but the frozen shared expert keeps the model's
-        # native dtype (bf16) — feed it in its own dtype to avoid a matmul
-        # dtype mismatch, then cast the (frozen) result back to fp32.
-        with torch.no_grad():
-            so = shared_expert(x_in.to(sdev, sdtype))
-            if shared_gate is not None:
-                so = torch.sigmoid(shared_gate(x_in.to(sdev, sdtype))) * so
-        return so.to(x_in.device, torch.float32)
-
-    shared_train = _shared_out(x_train)
-    shared_holdout = _shared_out(x_holdout)
-
-    # Cross-domain (WikiText) holdout — telemetry only. Identical pipeline to
-    # the Nemotron holdout (move to device fp32, precompute shared output),
-    # but evaluated independently: never feeds gradients, accept/reject, or
-    # save-best. Both targets are pre-merge MoE-block outputs on their
-    # respective corpora, captured by `_capture_mlp_io` before this merge.
-    x_xd: torch.Tensor | None = None
-    t_xd: torch.Tensor | None = None
-    shared_xd: torch.Tensor | None = None
-    if xd_input is not None and xd_target is not None:
-        if xd_input.shape != xd_target.shape:
+    # Cross-domain (e.g. WikiText) dataset — telemetry only. Identical streaming
+    # contract; evaluated independently of accept/reject and save-best.
+    xd_dataset: HealActivationDataset | None = None
+    if xd_manifest is not None:
+        if xd_manifest_dir is None:
             raise ValueError(
-                f"_heal_layer: cross-domain input pool "
-                f"{tuple(xd_input.shape)} != target pool "
-                f"{tuple(xd_target.shape)} — token alignment is broken."
+                "_heal_layer: xd_manifest was provided but xd_manifest_dir is None — "
+                "both are required to construct the cross-domain dataset."
             )
-        x_xd = xd_input.to(device, torch.float32)
-        t_xd = xd_target.to(device, torch.float32)
-        shared_xd = _shared_out(x_xd)
+        if xd_manifest.hidden_dim != manifest.hidden_dim:
+            raise ValueError(
+                f"_heal_layer: cross-domain manifest hidden_dim "
+                f"{xd_manifest.hidden_dim} != main manifest hidden_dim "
+                f"{manifest.hidden_dim} — token alignment is broken."
+            )
+        xd_dataset = HealActivationDataset(
+            xd_manifest, xd_manifest_dir, device=device, compute_dtype=torch.float32,
+        )
 
     # Single fp32 AdamW over every trainable param (all kept experts, plus the
     # router when heal_cfg.train_router). weight_decay=0 — the self-distillation
@@ -3116,26 +3230,27 @@ def _heal_layer(
     def _holdout_mse() -> float:
         sq_sum = 0.0
         n_elem = 0
-        for c in range(0, x_holdout.shape[0], mb):
-            pred = _forward(x_holdout[c:c + mb], shared_holdout[c:c + mb])
-            tgt = t_holdout[c:c + mb]
-            sq_sum += float(((pred - tgt) ** 2).sum().item())
-            n_elem += tgt.numel()
+        for xb, sb, tb in dataset.iter_holdout(batch_size=mb):
+            pred = _forward(xb, sb)
+            sq_sum += float(((pred - tb) ** 2).sum().item())
+            n_elem += tb.numel()
         return sq_sum / max(1, n_elem)
 
-    # Telemetry-only WikiText holdout MSE; returns NaN when the cross-domain
-    # pool is not provided so the caller can treat the metric as missing.
+    # Telemetry-only cross-domain holdout MSE; returns NaN when no xd dataset
+    # was provided so the caller can treat the metric as missing.
     @torch.no_grad()
     def _holdout_mse_xd() -> float:
-        if x_xd is None or t_xd is None or shared_xd is None:
+        if xd_dataset is None:
             return float("nan")
         sq_sum = 0.0
         n_elem = 0
-        for c in range(0, x_xd.shape[0], mb):
-            pred = _forward(x_xd[c:c + mb], shared_xd[c:c + mb])
-            tgt = t_xd[c:c + mb]
-            sq_sum += float(((pred - tgt) ** 2).sum().item())
-            n_elem += tgt.numel()
+        # Iterate the full XD pool (train + holdout shards); the train/holdout
+        # split on this manifest is purely structural — telemetry has no
+        # gradient-bearing distinction so all captured XD rows are eval rows.
+        for xb, sb, tb in xd_dataset.iter_all(batch_size=mb):
+            pred = _forward(xb, sb)
+            sq_sum += float(((pred - tb) ** 2).sum().item())
+            n_elem += tb.numel()
         return sq_sum / max(1, n_elem)
 
     # --- Best-snapshot bookkeeping -----------------------------------------
@@ -3183,10 +3298,14 @@ def _heal_layer(
     stop_reason = "max_steps"
     steps_done = 0
 
-    # --- Minibatch sampler over the fixed training pool --------------------
-    # Each step draws a fresh random minibatch of merge_heal_minibatch_size
-    # rows from x_train; seeded for reproducibility across resumes.
-    n_train = x_train.shape[0]
+    # --- Minibatch sampler over the shard-backed training pool ------------
+    # Each step pulls a fresh random minibatch of merge_heal_minibatch_size
+    # rows from train shards; seeded for reproducibility across resumes.
+    # ``sample_minibatch`` reads ``ceil(mb / shard_rows)`` random shards from
+    # disk (with an LRU cache so a re-pick within a few steps is free) and
+    # returns ``(xb, sb, tb)`` already on device in fp32. When the entire
+    # training pool is smaller than ``mb`` it returns all rows.
+    n_train = dataset.n_train
     mb_gen = torch.Generator(device="cpu").manual_seed(layer_idx + 1)
 
     # Most-recent applied LR; surfaced in the eval-time log line. Always
@@ -3199,13 +3318,7 @@ def _heal_layer(
             last_lr = _lr_at(step)
             for pg in opt.param_groups:
                 pg["lr"] = last_lr
-        if n_train > mb:
-            sel = torch.randperm(n_train, generator=mb_gen)[:mb]
-            xb = x_train.index_select(0, sel.to(x_train.device))
-            sb = shared_train.index_select(0, sel.to(shared_train.device))
-            tb = t_train.index_select(0, sel.to(t_train.device))
-        else:
-            xb, sb, tb = x_train, shared_train, t_train
+        xb, sb, tb = dataset.sample_minibatch(mb, generator=mb_gen)
         opt.zero_grad(set_to_none=True)
         student = _forward(xb, sb)
         loss = F.mse_loss(student, tb)
