@@ -73,7 +73,7 @@ DEFAULT_GPU_COUNT = 1
 OS_IMAGE = "Ubuntu 24.04 (CUDA 13)"
 DEFAULT_VOLUME_NAME = "moe-sh-split"
 DEFAULT_VOLUME_SIZE_GB = 500
-DEFAULT_BRANCH = "feat/heal-lr-schedule"
+DEFAULT_BRANCH = "main"
 DEFAULT_HF_BUCKET = "pirola/moe-strategy-35pct"
 GH_REPO_URL = "https://github.com/lucaspirola/moe_compress.git"
 DOCKER_IMAGE = "ghcr.io/lucaspirola/moe-compress:latest"
@@ -286,6 +286,17 @@ def _bash_single_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+# Env vars on the orchestrator host that, if set, are forwarded verbatim
+# into the docker run on the remote VM. Used by callers like the 100x
+# experiment to override merge_heal_token_cap / xd_holdout without
+# touching the YAML config in the repo.
+_FORWARDED_ENV_VARS = (
+    "PHASE0_TOKEN_CAP",
+    "MOE_TOKEN_CAP",
+    "MOE_XD_HOLDOUT_TOKENS",
+)
+
+
 def _build_bootstrap_script(*, phase: str, branch: str, hf_token: str,
                             hf_bucket: str, volume_name: str) -> str:
     """Produce the bash payload that runs on the deployment via SSH bootstrap.
@@ -320,6 +331,18 @@ def _build_bootstrap_script(*, phase: str, branch: str, hf_token: str,
     branch_q = _bash_single_quote(branch)
     phase_q = _bash_single_quote(phase)
     bucket_q = _bash_single_quote(hf_bucket)
+    # Bake forwarded env vars into the docker invocation at orchestrator-
+    # build time (the remote VM has no copy of our shell environment).
+    # Each emitted line carries its own `-e NAME=value \` so it nests
+    # cleanly into the docker run \-continuation list. If no var is set
+    # we leave the empty string — the template's own trailing ` \` on the
+    # placeholder line still produces a valid continuation, just with no
+    # extra flag in the middle.
+    forwarded_env_flags = " ".join(
+        f"-e {name}={_bash_single_quote(os.environ[name])}"
+        for name in _FORWARDED_ENV_VARS
+        if os.environ.get(name)
+    )
     return textwrap.dedent(f"""\
         #!/bin/bash
         # Spheron SSH-bootstrap for moe-compress SH split run — PHASE={phase}, BRANCH={branch}
@@ -391,6 +414,7 @@ def _build_bootstrap_script(*, phase: str, branch: str, hf_token: str,
             -e HF_ARTIFACTS_BUCKET={bucket_q} \\
             -e MOE_PHASE={phase_q} \\
             -e MOE_BRANCH={branch_q} \\
+            {forwarded_env_flags} \\
             --entrypoint bash {DOCKER_IMAGE} -c '
                 set -e
                 if [ -d /cache/code/moe_compress/.git ]; then

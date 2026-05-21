@@ -57,6 +57,26 @@ mkdir -p "$CACHE_MOUNT/hf" "$ABLATIONS_ROOT" "$CACHE_MOUNT/code"
 [[ -d "$CODE_DIR/.git" ]] || { log "FATAL: code not cloned at $CODE_DIR"; exit 1; }
 HARNESS_DIR="$CODE_DIR/max_quality"
 
+# Optional config overrides (MOE_TOKEN_CAP / MOE_XD_HOLDOUT_TOKENS) live
+# in a function so we can call it after the phase1/phase2 git reset wipes
+# the working tree. Phase 0 doesn't need this — phase0_prep.py takes
+# --token-cap directly on the CLI and writes its own pool-size metadata.
+maybe_override_config() {
+    [[ -z "${MOE_TOKEN_CAP:-}" && -z "${MOE_XD_HOLDOUT_TOKENS:-}" ]] && return 0
+    local cfg="$HARNESS_DIR/$CONFIG_PATH"
+    [[ -f "$cfg" ]] || { log "FATAL: config not found at $cfg"; exit 1; }
+    if [[ -n "${MOE_TOKEN_CAP:-}" ]]; then
+        log "overriding merge_heal_token_cap=$MOE_TOKEN_CAP in $cfg"
+        sed -i -E "s/^([[:space:]]*merge_heal_token_cap:)[[:space:]]*[0-9]+(.*)$/\\1 $MOE_TOKEN_CAP\\2/" "$cfg"
+    fi
+    if [[ -n "${MOE_XD_HOLDOUT_TOKENS:-}" ]]; then
+        log "overriding merge_heal_xd_holdout_tokens=$MOE_XD_HOLDOUT_TOKENS in $cfg"
+        sed -i -E "s/^([[:space:]]*merge_heal_xd_holdout_tokens:)[[:space:]]*[0-9]+(.*)$/\\1 $MOE_XD_HOLDOUT_TOKENS\\2/" "$cfg"
+    fi
+    log "post-override config values:"
+    grep -E "^[[:space:]]*(merge_heal_token_cap|merge_heal_xd_holdout_tokens):" "$cfg" | sed 's/^/  /'
+}
+
 # ---------------------------------------------------------------------------
 # Phase 0 (CPU prep) — early dispatch
 # ---------------------------------------------------------------------------
@@ -103,6 +123,10 @@ git -C "$CODE_DIR" fetch --depth=1 origin "$MOE_BRANCH"
 git -C "$CODE_DIR" checkout "$MOE_BRANCH" 2>/dev/null || git -C "$CODE_DIR" checkout -b "$MOE_BRANCH" "origin/$MOE_BRANCH"
 git -C "$CODE_DIR" reset --hard "origin/$MOE_BRANCH"
 log "code HEAD = $(git -C "$CODE_DIR" rev-parse --short HEAD) on $(git -C "$CODE_DIR" rev-parse --abbrev-ref HEAD)"
+
+# Re-apply any config overrides AFTER the git reset (which would otherwise
+# wipe the sed edits made in a prior phase or earlier in this run).
+maybe_override_config
 
 # ---------------------------------------------------------------------------
 # Model snapshot prefetch (idempotent). Phase 1 hits this fresh on a new
