@@ -797,21 +797,21 @@ def _launch_phase(*, phase: str, offer_id: str, gpu_type: str, volume_id: str,
         # stderr to /var/log/moe-launch.log on the host — the SSH-poll
         # later watches the status file at <volume>/.spheron_launch_status.json.
         # nohup + setsid + disown so the docker run survives our SSH close.
-        # The `> /var/log/moe-launch.log` redirect is opened by the CALLING
-        # shell (ssh's `ubuntu@…` shell) BEFORE `sudo` runs, so ubuntu — not
-        # root — needs write permission on /var/log/moe-launch.log. By default
-        # /var/log/ is root-only, so we touch + chown the file with sudo
-        # first, then run the unprivileged-redirect form. Alternatively:
-        # `sudo bash -c 'nohup … > /var/log/moe-launch.log …'` which opens the
-        # file under root, but that loses the sub-shell's stdin redirect and
-        # is harder to reason about across distros. The touch+chown is cleaner.
+        # Fire-and-forget the bootstrap so the SSH channel closes promptly.
+        # The earlier `sudo nohup … > /var/log/moe-launch.log & sleep 2; …`
+        # form hung the SSH session for 30 s (rc=124 timeout): even with
+        # nohup + setsid + < /dev/null, the backgrounded chain in the outer
+        # bash kept the channel's stdout/stderr FDs open long enough that
+        # ssh wouldn't return. Empirically the only reliable pattern on
+        # spheron-es is `sudo bash -c 'nohup … &'` — the redirect opens the
+        # log file under root inside sudo's child shell, the `&` is parsed
+        # by THAT shell which exits immediately, sudo returns, the outer
+        # shell continues, and ssh closes within a second.
         launch_cmd = (
-            "sudo touch /var/log/moe-launch.log && "
-            f"sudo chown {SSH_USER}:{SSH_USER} /var/log/moe-launch.log && "
-            "sudo nohup setsid bash /root/moe_bootstrap.sh "
-            "> /var/log/moe-launch.log 2>&1 < /dev/null & "
-            "sleep 2; "
-            "echo started; "
+            "sudo bash -c 'nohup bash /root/moe_bootstrap.sh "
+            "</dev/null >/var/log/moe-launch.log 2>&1 &' && "
+            "sleep 2 && "
+            "echo started && "
             "sudo ls -la /var/log/moe-launch.log"
         )
         rc, out = _ssh_exec(ip=ip, command=launch_cmd, timeout=30)
