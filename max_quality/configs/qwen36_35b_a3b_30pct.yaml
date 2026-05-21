@@ -27,13 +27,14 @@ target:
   expert_svd_ratio: 2.0
 
 calibration:
-  # Source: Qwen3 pretrain-distribution proxy mix. Five sources blended,
+  # Source: Qwen3 pretrain-distribution proxy mix. Four sources blended,
   # ALL rendered through the model's chat template (Gemma 3 QAT rule):
   #   tulu3 (25%):    allenai/tulu-3-sft-mixture           SFT / chat
-  #   fineweb (40%):  HuggingFaceFW/fineweb-edu            high-quality web
+  #   fineweb (45%):  HuggingFaceFW/fineweb-edu            high-quality web
   #   math (15%):     nvidia/OpenMathInstruct-2            math problems
   #   code (15%):     nickrosh/Evol-Instruct-Code-80k-v1   code instructions
-  #   papers (5%):    allenai/peS2o                        academic papers
+  # (peS2o papers dropped: ships a .py script loader, not supported by
+  #  datasets>=4.5; 5% weight rolled into fineweb's edu-filtered content.)
   #
   # Why: empirically (2026-05-21) Tülu-3 (chat-format SFT only) gave us
   # ~7% mean cross-domain MSE drop per heal layer — better than nvidia-

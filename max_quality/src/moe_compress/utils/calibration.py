@@ -894,17 +894,23 @@ register_corpus(CorpusAdapter(
 #
 # Sub-sources (approximate Qwen3-pretrain proxies):
 #   tulu3 (25%):     allenai/tulu-3-sft-mixture (SFT/chat; our base)
-#   fineweb (40%):   HuggingFaceFW/fineweb-edu  (high-quality CC, edu-filtered)
+#   fineweb (45%):   HuggingFaceFW/fineweb-edu  (high-quality CC, edu-filtered)
 #   math (15%):      nvidia/OpenMathInstruct-2  (math problems + solutions)
 #   code (15%):      nickrosh/Evol-Instruct-Code-80k-v1 (code instructions)
-#   papers (5%):     allenai/peS2o              (academic papers)
+#
+# Originally included ``papers (5%): allenai/peS2o``, but peS2o ships with
+# a .py loader script which datasets>=4.5 refuses to execute ("Dataset
+# scripts are no longer supported"). FineWeb-Edu's edu filter already
+# captures academic-style content; the 5% was rolled into fineweb. To
+# bring papers back, swap in a parquet-only dataset (e.g. ccdv/arxiv-
+# summarization, gfissore/arxiv-abstracts-2021) — both are non-gated and
+# parquet-stored.
 
 _QWEN3_MIX_WEIGHTS = {
     "tulu3":   0.25,
-    "fineweb": 0.40,
+    "fineweb": 0.45,
     "math":    0.15,
     "code":    0.15,
-    "papers":  0.05,
 }
 
 # Rough avg-tokens-per-row used for row-count budgeting. Underestimating is
@@ -915,7 +921,6 @@ _QWEN3_MIX_AVG_TOKENS = {
     "fineweb": 1500,
     "math":    800,
     "code":    300,
-    "papers":  3000,
 }
 
 _QWEN3_MIX_DATASET = {
@@ -923,7 +928,6 @@ _QWEN3_MIX_DATASET = {
     "fineweb": "HuggingFaceFW/fineweb-edu",
     "math":    "nvidia/OpenMathInstruct-2",
     "code":    "nickrosh/Evol-Instruct-Code-80k-v1",
-    "papers":  "allenai/peS2o",
 }
 
 
@@ -1113,11 +1117,6 @@ def _stream_texts_qwen3_pretrain_mix(spec: CalibrationSpec, tokenizer) -> list[s
                 )
             elif subset == "code":
                 subset_texts = _stream_instruction_output(ds_name, n_rows, tokenizer, seed)
-            elif subset == "papers":
-                subset_texts = _stream_raw_wrapped(
-                    ds_name, "text", n_rows, tokenizer, seed,
-                    user_prompt="Read this academic excerpt and reproduce it faithfully.",
-                )
             else:
                 raise ValueError(f"unknown qwen3-pretrain-mix subset {subset!r}")
         except Exception as err:                      # noqa: BLE001
