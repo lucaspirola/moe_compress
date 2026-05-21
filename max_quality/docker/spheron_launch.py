@@ -455,9 +455,14 @@ def cmd_volume_create(args: argparse.Namespace) -> int:
 
 def cmd_volume_delete(args: argparse.Namespace) -> int:
     client = SpheronClient(_read_spheron_key())
-    log.info("deleting volume %s", args.volume_id)
-    client.delete_volume(args.volume_id)
-    log.info("volume %s deleted", args.volume_id)
+    # DELETE /api/volumes/{id} requires the akash-style handle
+    # (computefilesystem-…), NOT the mongo `id`. Wrong-form returns
+    # 404 "Volume not found" even though the volume is right there.
+    # Auto-resolve so callers can pass either form.
+    handle = _resolve_volume_handle(client, args.volume_id)
+    log.info("deleting volume %s (handle=%s)", args.volume_id, handle)
+    client.delete_volume(handle)
+    log.info("volume %s deleted", handle)
     return 0
 
 
