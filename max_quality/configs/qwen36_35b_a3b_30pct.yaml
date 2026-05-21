@@ -27,22 +27,20 @@ target:
   expert_svd_ratio: 2.0
 
 calibration:
-  # Source: single multi-subset SFT dataset. Subset weights reflect the
-  # expected deployment mix (general chat-dominant, math/science heavy tails
-  # for reasoning, agent traces for tool-use coverage).
-  source: nvidia-cascade
-  dataset: nvidia/Nemotron-Cascade-2-SFT-Data
+  # Source: Tülu-3 SFT mixture — the broadest open instruction-tuning corpus
+  # today (WildChat + FLAN + ShareGPT + OpenAssistant + math + code). Rows
+  # are OpenAI-style ``messages=[...]`` and get rendered through the model's
+  # chat template (required for instruct models per Gemma 3 QAT docs).
+  #
+  # Why not nvidia-cascade: empirically (2026-05-21 SH 100x run) the cascade
+  # mix is too topic-narrow — in-domain holdout MSE dropped 3.3x in heal
+  # while WikiText-XD MSE moved 2%. The diversity (not the pool size) is
+  # the dominant variable for cross-domain transfer.
+  source: tulu3-sft-mix
+  dataset: allenai/tulu-3-sft-mixture
   seed: 1337
   num_sequences: 4000
   sequence_length: 2048
-  subset_weights:
-    math: 0.21
-    science: 0.11
-    chat: 0.56
-    instruction_following: 0.0338
-    conversational_agent: 0.0331
-    swe: 0.02
-    terminal_agent: 0.0331
 
 # Stage 0 is removed — SE detection is now Phase B of Stage 1.
 

@@ -788,6 +788,88 @@ register_corpus(CorpusAdapter(
     stream_texts=_stream_texts_nvidia_cascade,
 ))
 
+
+# ---------------------------------------------------------------------------
+# tulu3-sft-mix — broad diverse SFT mixture (Tülu 3) for instruct calibration
+# ---------------------------------------------------------------------------
+# Rationale: nvidia-cascade is a narrow technical SFT slice (math, science,
+# chat, IF, conv-agent, swe, terminal-agent). For an instruct-tuned MoE
+# like Qwen3.6-A3B, the heal step's cross-domain transfer (e.g. WikiText
+# BPT) barely moves when calibration is pool-narrow — empirically observed
+# 2026-05-21 (this branch, 100x SH run): in-domain holdout MSE dropped
+# 3.3x while WikiText-XD holdout dropped 2%.
+#
+# Tülu-3 is the most diverse open SFT mix today (WildChat + FLAN +
+# ShareGPT + OpenAssistant + math + code). Rows have OpenAI-style
+# ``messages=[{role,content}, ...]``; we render via the same
+# ``_render_messages`` helper as nvidia-cascade so the chat template gets
+# applied (instruct-model calibration requires it per Gemma 3 QAT docs).
+
+
+def _parse_yaml_tulu3(
+    cal_cfg: dict, num_sequences: int, sequence_length: int, seed: int,
+) -> CalibrationSpec:
+    """Yaml → CalibrationSpec for the ``tulu3-sft-mix`` source.
+
+    Only ``dataset`` is honoured (defaults to ``allenai/tulu-3-sft-mixture``);
+    Tülu-3 is already an internal mix so we don't sub-weight by source.
+    """
+    dataset = str(cal_cfg.get("dataset", "allenai/tulu-3-sft-mixture")).strip()
+    return CalibrationSpec(
+        num_sequences=num_sequences,
+        sequence_length=sequence_length,
+        seed=seed,
+        source="tulu3-sft-mix",
+        dataset=dataset,
+    )
+
+
+def _stream_texts_tulu3(spec: CalibrationSpec, tokenizer) -> list[str]:
+    """Stream Tülu-3 rows, render each through the tokenizer's chat template."""
+    from datasets import load_dataset
+
+    log.info("Streaming %d tulu3-sft-mix samples from %s (seed=%d)",
+             spec.num_sequences, spec.dataset, spec.seed)
+    try:
+        ds = load_dataset(spec.dataset, split="train", streaming=True)
+    except Exception as err:                          # noqa: BLE001
+        log.error("load_dataset(%s) failed: %s", spec.dataset, err)
+        raise
+
+    circuit_limit = _CIRCUIT_BREAKER_MULTIPLIER * spec.num_sequences
+    ds = ds.shuffle(
+        seed=spec.seed,
+        buffer_size=min(max(10_000, circuit_limit), 200_000),
+    )
+
+    out: list[str] = []
+    rows_seen = 0
+    for row in ds:
+        rows_seen += 1
+        text = _render_messages(row.get("messages"), tokenizer)
+        if text:
+            out.append(text)
+            if len(out) >= spec.num_sequences:
+                break
+        if rows_seen >= circuit_limit:
+            log.warning(
+                "_stream_texts_tulu3: circuit-breaker fired after %d rows examined "
+                "for content (circuit_limit=%d); dataset may be smaller than expected",
+                rows_seen, circuit_limit,
+            )
+            break
+    if len(out) < spec.num_sequences:
+        log.warning("tulu3-sft-mix only produced %d/%d non-empty rows",
+                    len(out), spec.num_sequences)
+    return out
+
+
+register_corpus(CorpusAdapter(
+    name="tulu3-sft-mix",
+    parse_yaml=_parse_yaml_tulu3,
+    stream_texts=_stream_texts_tulu3,
+))
+
 register_corpus(CorpusAdapter(
     name="c4-math-code",
     parse_yaml=_parse_yaml_c4_math_code,
