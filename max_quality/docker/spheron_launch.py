@@ -636,6 +636,31 @@ def _resolve_volume_handle(client: SpheronClient, volume_id_or_handle: str) -> s
     return volume_id_or_handle
 
 
+def _resolve_volume_mount_tag(client: SpheronClient, volume_id_or_handle: str) -> str:
+    """Look up the virtiofs `mountTag` for a Spheron-ES NETWORK_SSD volume.
+
+    NETWORK_SSD volumes are virtiofs-backed — `mount -t virtiofs <mountTag>
+    /mnt/<name>` is the canonical mount command (docs.spheron.ai/connecting/
+    volume-mounting). The tag lives in the volume's `extras.mountTag` field.
+
+    Accepts either the mongo `id` or the akash `volumeId`/handle and returns
+    the tag. Raises RuntimeError if the volume is missing the field — this
+    is the canary that the volume was created on a non-virtiofs provider and
+    needs a different mount path entirely.
+    """
+    for vol in client.list_volumes():
+        if vol.get("id") == volume_id_or_handle or vol.get("volumeId") == volume_id_or_handle:
+            tag = (vol.get("extras") or {}).get("mountTag")
+            if not tag:
+                raise RuntimeError(
+                    f"volume {volume_id_or_handle} has no extras.mountTag — "
+                    f"either a non-virtiofs provider or a stale volume record. "
+                    f"Raw extras: {vol.get('extras')!r}"
+                )
+            return tag
+    raise RuntimeError(f"volume {volume_id_or_handle} not found in list_volumes()")
+
+
 def _check_no_active_deployment_on_volume(
     client: SpheronClient, volume_handle: str,
 ) -> None:
@@ -665,9 +690,13 @@ def _launch_phase(*, phase: str, offer_id: str, gpu_type: str, volume_id: str,
       1. POST /api/deployments (no cloudInit — silently dropped).
       2. Wait for the deployment's ipAddress to populate.
       3. Wait for SSH port 22 to accept our key.
-      4. POST /api/volumes/{akash}/attach to actually attach the volume
-         (the volumeIds field on the create call doesn't trigger this).
-      5. Wait for the volume to appear as a block device in `lsblk`.
+      4. POST /api/volumes/{akash}/attach to actually attach the volume.
+         Per docs, this hot-attach RESTARTS the VM (the volumeIds field at
+         create time is silently dropped on spheron-es, so the zero-restart
+         path is unavailable). Sleep + re-wait for SSH afterwards.
+      5. Mount the volume via `mount -t virtiofs <mountTag> /mnt/<name>`
+         (NETWORK_SSD volumes on spheron-es are virtiofs-backed, not block
+         devices — the mountTag lives in `volume.extras.mountTag`).
       6. SCP the bootstrap script + HF token onto the box.
       7. SSH-exec the script via `sudo nohup … &` so it survives our SSH
          disconnect.
@@ -676,6 +705,7 @@ def _launch_phase(*, phase: str, offer_id: str, gpu_type: str, volume_id: str,
     deleted before re-raising — we never leak a billing GPU."""
     client = SpheronClient(_read_spheron_key())
     volume_handle = _resolve_volume_handle(client, volume_id)
+    mount_tag = _resolve_volume_mount_tag(client, volume_id)
     _check_no_active_deployment_on_volume(client, volume_handle)
     hf_token = _read_hf_token()
     bootstrap_script = _build_bootstrap_script(
@@ -711,34 +741,46 @@ def _launch_phase(*, phase: str, offer_id: str, gpu_type: str, volume_id: str,
         # (3) wait for SSH (TCP open + key accepts)
         _wait_for_ssh(ip)
 
-        # (4) attach the volume (the real trigger — volumeIds in the create
-        # body sets the relation but doesn't make the disk show up)
-        log.info("attaching volume %s to deployment %s", volume_handle, dep_id)
+        # (4) attach the volume. Per docs.spheron.ai/connecting/volume-mounting:
+        # "Attaching or detaching a Spheron ES volume on a running instance
+        # restarts the VM." So this API call kicks the VM into a reboot;
+        # we have to wait for SSH to come back before any further commands.
+        # (The deployment's `volumeIds` field is silently dropped at create
+        # time on spheron-es, so we're forced into the hot-attach path that
+        # incurs the restart — there's no zero-restart alternative.)
+        log.info("attaching volume %s to deployment %s (triggers VM restart)",
+                 volume_handle, dep_id)
         client.attach_volume(volume_handle, dep_id)
 
-        # (5) wait for the volume to appear as a block device
-        log.info("waiting for volume block device (~%d GB)", volume_size_gb)
-        device = _wait_for_volume_device(ip=ip, expected_size_gb=volume_size_gb)
+        # Give the hypervisor a moment to begin the restart before we probe
+        # SSH again — sshd from the pre-restart VM is still up for a second
+        # or two after the API returns, and we want to wait for the NEW
+        # sshd, not the dying one.
+        log.info("waiting 30s for VM restart to begin, then re-waiting for SSH")
+        time.sleep(30)
+        _wait_for_ssh(ip)
+        log.info("SSH back up on %s after volume-attach restart", ip)
 
-        # Mount it at /mnt/<volume_name> from outside the bootstrap so the
-        # bootstrap can assume the mount is already there. We use sudo;
-        # the partition may or may not have a filesystem (Spheron formats
-        # the volume on first attach, but a fresh ext4 mkfs is idempotent
-        # for our purposes — only run mkfs if mount fails first).
+        # (5) mount the volume via virtiofs. Spheron-ES NETWORK_SSD volumes
+        # are virtiofs-backed (passthrough); the mountTag we looked up earlier
+        # is the source name. No mkfs, no block-device discovery.
         mount_path = _volume_mount_for(volume_name)
         mount_cmd = (
             f"sudo mkdir -p {shlex.quote(mount_path)} && "
             f"(sudo mountpoint -q {shlex.quote(mount_path)} || "
-            f" sudo mount {shlex.quote(device)} {shlex.quote(mount_path)} || "
-            f" (sudo mkfs.ext4 -F {shlex.quote(device)} && "
-            f"  sudo mount {shlex.quote(device)} {shlex.quote(mount_path)})) && "
+            f" sudo mount -t virtiofs {shlex.quote(mount_tag)} "
+            f"{shlex.quote(mount_path)}) && "
             f"sudo df -h {shlex.quote(mount_path)} && "
             f"sudo chown -R {SSH_USER}:{SSH_USER} {shlex.quote(mount_path)}"
         )
         rc, out = _ssh_exec(ip=ip, command=mount_cmd, timeout=60)
         if rc != 0:
-            raise RuntimeError(f"volume mount failed rc={rc}: {out[:500]}")
-        log.info("volume mounted at %s on %s", mount_path, ip)
+            raise RuntimeError(
+                f"virtiofs mount failed rc={rc} (tag={mount_tag}, "
+                f"path={mount_path}): {out[:500]}"
+            )
+        log.info("volume mounted at %s via virtiofs tag=%s on %s",
+                 mount_path, mount_tag, ip)
 
         # (6) SCP the bootstrap script onto the VM
         local_script = Path(f"/tmp/spheron_bootstrap_{phase}_{dep_id[:8]}.sh")
