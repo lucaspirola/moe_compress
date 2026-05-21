@@ -292,6 +292,7 @@ def _bash_single_quote(s: str) -> str:
 # touching the YAML config in the repo.
 _FORWARDED_ENV_VARS = (
     "PHASE0_TOKEN_CAP",
+    "PHASE0_ARTIFACTS_BUCKET",
     "MOE_TOKEN_CAP",
     "MOE_XD_HOLDOUT_TOKENS",
 )
@@ -904,14 +905,25 @@ def _poll_until_done(
     while True:
         rc, out = _ssh_exec(ip=ip, command=remote_cmd, timeout=30)
         elapsed = int(time.monotonic() - t0)
-        if rc == 0 and out.strip() and out.strip() != "MISSING":
-            try:
-                status = json.loads(out.strip().splitlines()[-1])
+        if rc == 0 and out.strip() and "MISSING" not in out:
+            # `_ssh_run` merges stdout+stderr; SSH's "Warning: Permanently
+            # added '<ip>' ..." line may bracket the actual JSON. Find the
+            # FIRST line that parses as JSON instead of trusting the last.
+            status = None
+            for line in out.splitlines():
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    status = json.loads(line)
+                    break
+                except Exception:
+                    continue
+            if status is not None:
                 log.info("container finished elapsed=%ds status=%s",
                          elapsed, status)
                 return status
-            except Exception:
-                log.debug("status file unparseable yet: %r", out[:200])
+            log.debug("status file unparseable yet: %r", out[:200])
         log.info("polling … elapsed=%ds (rc=%d)", elapsed, rc)
         if elapsed > timeout_s:
             raise TimeoutError(
