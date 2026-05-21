@@ -279,12 +279,17 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Volume root %s does not exist or is not a directory", volume_root)
         return 2
 
-    hub_dir = volume_root / "hf_cache" / "hub"
-    artifacts_root = volume_root / "artifacts"
+    # Path layout MUST match run_sh_split.sh:
+    #   HF_HOME=$CACHE_MOUNT/hf  ABLATIONS_ROOT=$CACHE_MOUNT/ablations
+    # Drift here (e.g. phase 0 writing to /cache/hf_cache while phase 1
+    # reads /cache/hf) silently wastes 25-40 min of model re-download AND
+    # forces Stage 1 to re-run from scratch (Stage 1 OOMs the 96 GB RTX
+    # 6000 Pro). 2026-05-21 paid ~$1 in wall before this was caught.
+    hub_dir = volume_root / "hf" / "hub"
+    artifacts_root = volume_root / "ablations"
     hub_dir.mkdir(parents=True, exist_ok=True)
     artifacts_root.mkdir(parents=True, exist_ok=True)
-    # HF cache vars — point everything at the volume so re-mounts find the cache.
-    os.environ["HF_HOME"] = str(volume_root / "hf_cache")
+    os.environ["HF_HOME"] = str(volume_root / "hf")
     os.environ["HF_HUB_CACHE"] = str(hub_dir)
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
     log.info("HF_HOME=%s HF_HUB_CACHE=%s", os.environ["HF_HOME"], os.environ["HF_HUB_CACHE"])
