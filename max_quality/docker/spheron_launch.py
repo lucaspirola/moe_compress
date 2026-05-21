@@ -21,11 +21,12 @@ is the path of least surprise.
 
 Usage:
   python3 spheron_launch.py volume-create [--size-gb 500] [--volume-name ...]
-  python3 spheron_launch.py phase1 --volume-id ID [--branch feat/heal-lr-schedule]
-  python3 spheron_launch.py phase2 --volume-id ID [--branch feat/heal-lr-schedule]
+  python3 spheron_launch.py phase0 --volume-id ID [--branch main]   # CPU prep (HF snapshots + tokenize)
+  python3 spheron_launch.py phase1 --volume-id ID [--branch main]   # Stage 2 on RTX 6000 Pro
+  python3 spheron_launch.py phase2 --volume-id ID [--branch main]   # Stage 2.5 + Stage 6 on H200
   python3 spheron_launch.py status [--deployment-id ID]
   python3 spheron_launch.py teardown --deployment-id ID [--keep-volume] [--volume-id ID]
-  python3 spheron_launch.py run [--size-gb 500]      # end-to-end (phase1 + phase2 + teardown)
+  python3 spheron_launch.py run [--size-gb 500] [--skip-phase0]     # end-to-end
 
 Auth: reads `sai_pk_*` from ~/.config/spheron/credentials.
 HF token: reads ~/.cache/huggingface/token (passed through to the cloudInit).
@@ -87,6 +88,7 @@ def _volume_mount_for(volume_name: str) -> str:
 POLL_DEPLOYMENT_READY = 20         # how often to check IF the deployment came up
 POLL_DEPLOYMENT_READY_TIMEOUT = 3600   # 1 h cap on provisioning (marketplace can run 20-25 min)
 POLL_RUN = 60                      # how often to SSH-poll the container status flag
+POLL_RUN_TIMEOUT_PHASE0 = 2 * 3600    # 2 h cap on Phase 0 (CPU prep: model snapshot + tokenize)
 POLL_RUN_TIMEOUT_PHASE1 = 8 * 3600    # 8 h cap on Phase 1 (Stage 2 alone)
 POLL_RUN_TIMEOUT_PHASE2 = 3 * 3600    # 3 h cap on Phase 2 (Stage 2.5 + Stage 6 alt)
 SSH_KEY_PATH = Path(os.environ.get(
@@ -977,6 +979,28 @@ def _resolve_volume_size_gb(client: SpheronClient, volume_id_or_handle: str) -> 
     raise RuntimeError(f"volume {volume_id_or_handle} not found via list_volumes")
 
 
+def cmd_phase0(args: argparse.Namespace) -> int:
+    """CPU prep — runs phase0_prep.py on the cheapest available instance
+    on the volume's provider (spheron-es has no CPU-only offer, so we
+    use the RTX 6000 Pro offer; we eat the GPU rate while the prep does
+    HF snapshots + CPU tokenization).
+    """
+    client = SpheronClient(_read_spheron_key())
+    ssh_key = args.ssh_key_id or _pick_default_ssh_key(client)
+    size_gb = _resolve_volume_size_gb(client, args.volume_id)
+    result = _phase_run_and_teardown(
+        phase="phase0", offer_id=RTX6000_OFFER_ID, gpu_type=RTX6000_GPU_TYPE,
+        volume_id=args.volume_id, volume_name=args.volume_name,
+        volume_size_gb=size_gb, branch=args.branch, hf_bucket=args.hf_bucket,
+        ssh_key_id=ssh_key,
+        provisioning_timeout=POLL_DEPLOYMENT_READY_TIMEOUT,
+        run_timeout=POLL_RUN_TIMEOUT_PHASE0,
+        keep_running=args.keep_running,
+    )
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def cmd_phase1(args: argparse.Namespace) -> int:
     client = SpheronClient(_read_spheron_key())
     ssh_key = args.ssh_key_id or _pick_default_ssh_key(client)
@@ -1012,14 +1036,30 @@ def cmd_phase2(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """End-to-end: volume-create → phase1 → phase2 → optional volume-delete.
+    """End-to-end: volume-create → phase0 → phase1 → phase2 → optional volume-delete.
 
     Each phase tears down its own deployment on clean exit; failures leave
-    the box up for diagnosis. The volume persists across phases by design."""
+    the box up for diagnosis. The volume persists across phases by design.
+    Phase 0 (CPU prep) is skipped with --skip-phase0 once the volume already
+    holds the snapshot + calibration cache from a prior run."""
     client = SpheronClient(_read_spheron_key())
     ssh_key = args.ssh_key_id or _pick_default_ssh_key(client)
     volume_id = _resolve_or_create_volume(client, args.volume_name, args.size_gb)
     size_gb = _resolve_volume_size_gb(client, volume_id)
+    p0 = None
+    if not getattr(args, "skip_phase0", False):
+        log.info("=== Phase 0: CPU prep (HF snapshots + tokenize) on RTX PRO 6000 ===")
+        p0 = _phase_run_and_teardown(
+            phase="phase0", offer_id=RTX6000_OFFER_ID, gpu_type=RTX6000_GPU_TYPE,
+            volume_id=volume_id, volume_name=args.volume_name,
+            volume_size_gb=size_gb, branch=args.branch, hf_bucket=args.hf_bucket,
+            ssh_key_id=ssh_key,
+            provisioning_timeout=POLL_DEPLOYMENT_READY_TIMEOUT,
+            run_timeout=POLL_RUN_TIMEOUT_PHASE0,
+            keep_running=False,
+        )
+    else:
+        log.info("--skip-phase0 set; assuming volume already prepared")
     log.info("=== Phase 1: Stage 2 on RTX PRO 6000 ===")
     p1 = _phase_run_and_teardown(
         phase="stage2", offer_id=RTX6000_OFFER_ID, gpu_type=RTX6000_GPU_TYPE,
@@ -1043,7 +1083,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.delete_volume:
         log.info("deleting volume %s (--delete-volume)", volume_id)
         client.delete_volume(volume_id)
-    print(json.dumps({"volume_id": volume_id, "phase1": p1, "phase2": p2}, indent=2))
+    print(json.dumps({"volume_id": volume_id, "phase0": p0, "phase1": p1, "phase2": p2}, indent=2))
     return 0
 
 
@@ -1094,6 +1134,16 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     vd.add_argument("--volume-id", required=True)
     vd.set_defaults(func=cmd_volume_delete)
 
+    p0 = sub.add_parser("phase0", help="Launch CPU-prep phase (HF snapshots + tokenize on RTX 6000 Pro hardware).")
+    p0.add_argument("--volume-id", required=True)
+    p0.add_argument("--volume-name", default=DEFAULT_VOLUME_NAME)
+    p0.add_argument("--branch", default=DEFAULT_BRANCH)
+    p0.add_argument("--hf-bucket", default=DEFAULT_HF_BUCKET)
+    p0.add_argument("--ssh-key-id", default=None)
+    p0.add_argument("--keep-running", action="store_true",
+                    help="Skip auto-teardown after prep exits (debugging only).")
+    p0.set_defaults(func=cmd_phase0)
+
     p1 = sub.add_parser("phase1", help="Launch RTX 6000 Pro Phase 1 (Stage 2 only).")
     p1.add_argument("--volume-id", required=True)
     p1.add_argument("--volume-name", default=DEFAULT_VOLUME_NAME,
@@ -1118,12 +1168,15 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                     help="Skip auto-teardown (debugging — burns $4.615/hr).")
     p2.set_defaults(func=cmd_phase2)
 
-    rn = sub.add_parser("run", help="End-to-end: volume-create → phase1 → phase2.")
+    rn = sub.add_parser("run", help="End-to-end: volume-create → phase0 → phase1 → phase2.")
     rn.add_argument("--volume-name", default=DEFAULT_VOLUME_NAME)
     rn.add_argument("--size-gb", type=int, default=DEFAULT_VOLUME_SIZE_GB)
     rn.add_argument("--branch", default=DEFAULT_BRANCH)
     rn.add_argument("--hf-bucket", default=DEFAULT_HF_BUCKET)
     rn.add_argument("--ssh-key-id", default=None)
+    rn.add_argument("--skip-phase0", action="store_true",
+                    help="Skip the CPU-prep phase (use when the volume already "
+                         "carries the HF snapshot + calibration cache).")
     rn.add_argument("--delete-volume", action="store_true",
                     help="Delete the volume on clean end-to-end exit "
                          "(default: keep it for follow-up runs).")

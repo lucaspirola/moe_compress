@@ -24,8 +24,8 @@
 set -euo pipefail
 
 : "${HF_TOKEN:?HF_TOKEN is required (set via -e HF_TOKEN=...)}"
-: "${MOE_PHASE:?MOE_PHASE is required: 'stage2' (Phase 1: RTX 6000 Pro) or 'stage2p5' (Phase 2: H200)}"
-case "$MOE_PHASE" in stage2|stage2p5) ;; *) echo "FATAL: MOE_PHASE=$MOE_PHASE must be 'stage2' or 'stage2p5'" >&2; exit 2 ;; esac
+: "${MOE_PHASE:?MOE_PHASE is required: 'phase0' (CPU prep), 'stage2' (Phase 1: RTX 6000 Pro) or 'stage2p5' (Phase 2: H200)}"
+case "$MOE_PHASE" in phase0|stage2|stage2p5) ;; *) echo "FATAL: MOE_PHASE=$MOE_PHASE must be 'phase0', 'stage2' or 'stage2p5'" >&2; exit 2 ;; esac
 
 MOE_BRANCH="${MOE_BRANCH:-main}"
 ROW_ID="${ROW_ID:-SH}"
@@ -52,13 +52,49 @@ log " BRANCH=$MOE_BRANCH  MODEL=$MODEL_REPO"
 log " ablations_root=$ABLATIONS_ROOT  config=$CONFIG_PATH"
 log "================================================================"
 
-command -v nvidia-smi >/dev/null 2>&1 || { log "FATAL: no nvidia-smi (start container with --gpus all)"; exit 1; }
-nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
-
 mkdir -p "$CACHE_MOUNT/hf" "$ABLATIONS_ROOT" "$CACHE_MOUNT/code"
 
 [[ -d "$CODE_DIR/.git" ]] || { log "FATAL: code not cloned at $CODE_DIR"; exit 1; }
 HARNESS_DIR="$CODE_DIR/max_quality"
+
+# ---------------------------------------------------------------------------
+# Phase 0 (CPU prep) — early dispatch
+# ---------------------------------------------------------------------------
+# Runs `phase0_prep.py` on the volume: snapshots the base + FP8 teacher
+# models from HF into $HF_HOME/hub, pulls Stage-1 GRAPE artifacts from the
+# strategy bucket, and tokenizes the calibration corpus once on CPU. Skips
+# every GPU stage. Spheron-ES has no CPU-only offer, so this runs on the
+# same RTX 6000 Pro hardware as Phase 1 — we eat the GPU rate during prep
+# in exchange for keeping Phase 1's bootstrap minimal and warm-cached.
+#
+# Env-var overrides recognised in phase0:
+#   PHASE0_TOKEN_CAP        — override merge_heal_token_cap (e.g. 26214400 for 100×)
+#   PHASE0_SEQUENCE_LENGTH  — override calibration sequence_length
+#   PHASE0_NO_TEACHER       — set to "1" to skip the FP8 teacher snapshot
+#   PHASE0_ARTIFACTS_BUCKET — override the Stage-1 bucket (default pirola/moe-strategy-35pct)
+if [[ "$MOE_PHASE" == "phase0" ]]; then
+    log "PHASE 0 (CPU prep) — running phase0_prep.py"
+    PHASE0_ARGS=(--volume-root "$CACHE_MOUNT" --config "$HARNESS_DIR/$CONFIG_PATH" \
+                 --model-repo "$MODEL_REPO" --teacher-repo "$TEACHER_MODEL_REPO" \
+                 --artifacts-bucket "${PHASE0_ARTIFACTS_BUCKET:-$HF_ARTIFACTS_BUCKET}")
+    if [[ -n "${PHASE0_TOKEN_CAP:-}" ]]; then
+        PHASE0_ARGS+=(--token-cap "$PHASE0_TOKEN_CAP")
+    fi
+    if [[ -n "${PHASE0_SEQUENCE_LENGTH:-}" ]]; then
+        PHASE0_ARGS+=(--sequence-length "$PHASE0_SEQUENCE_LENGTH")
+    fi
+    if [[ "${PHASE0_NO_TEACHER:-0}" == "1" ]]; then
+        PHASE0_ARGS+=(--no-teacher)
+    fi
+    log "phase0_prep.py args: ${PHASE0_ARGS[*]}"
+    PYTHONPATH="$HARNESS_DIR/src" python3 "$HARNESS_DIR/scripts/phase0_prep.py" "${PHASE0_ARGS[@]}"
+    log "PHASE 0 DONE — volume prepared at $CACHE_MOUNT"
+    exit 0
+fi
+
+# Phase 1 / Phase 2 GPU checks (skipped on phase0).
+command -v nvidia-smi >/dev/null 2>&1 || { log "FATAL: no nvidia-smi (start container with --gpus all)"; exit 1; }
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 # Honor MOE_BRANCH: fetch + reset --hard so the volume's checked-out branch
 # matches what this phase intends to run (the volume persists across phases,
 # so without this Phase 2 would silently use whatever Phase 1 left behind).
