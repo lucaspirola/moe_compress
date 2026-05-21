@@ -579,7 +579,17 @@ def _wait_for_volume_device(*, ip: str, expected_size_gb: int,
                 parts = line.split()
                 if len(parts) < 2:
                     continue
-                dev, size_bytes = parts[0], int(parts[1])
+                # Defensive: SSH stderr lines like "Warning: Permanently
+                # added 'X' to the list of known hosts" get merged into
+                # stdout — skip anything that isn't a /dev/* row before
+                # parsing the size column as an int.
+                if not parts[0].startswith("/dev/"):
+                    continue
+                try:
+                    size_bytes = int(parts[1])
+                except ValueError:
+                    continue
+                dev = parts[0]
                 size_gb = size_bytes // (1024 ** 3)
                 # Skip the boot disk (the only mounted disk at this point).
                 if dev.startswith(("/dev/vda", "/dev/sda", "/dev/nvme0n1")):
