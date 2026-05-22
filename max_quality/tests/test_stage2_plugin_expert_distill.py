@@ -125,14 +125,14 @@ def test_pre_merge_snapshot_disabled_writes_none():
 
 def test_merge_disabled_overwrites_distill_state_none():
     """With distillation OFF the merge hook overwrites ``distill_state`` (which
-    LegacyAdapter.merge defaults to None) — still None, no crash."""
+    LayerMergePlugin.merge defaults to None) — still None, no crash."""
     ctx = PipelineContext()
     ctx.set("layer_ref", object())
     ctx.set("grouped", {})
     ctx.set("freq", {})
     ctx.set("layer_input_acc", None)
     ctx.set("pre_merge_weights", None)
-    ctx.set("distill_state", None)  # LegacyAdapter.merge default
+    ctx.set("distill_state", None)  # LayerMergePlugin.merge default
     _make_plugin(expert_distill_steps=0).merge(ctx)
     assert ctx.get("distill_state") is None
 
@@ -145,8 +145,8 @@ def test_distill_on_path_matches_reference(tiny_model):
     independent deepcopy.
 
     Both paths faithfully reproduce the production composite merge sequence:
-    ``LegacyAdapter.merge`` runs ``_merge_experts_inplace`` FIRST (mutating the
-    centroid bank weights) and ``ExpertDistillPlugin.merge`` runs the
+    ``LayerMergePlugin.merge`` runs ``_merge_experts_inplace`` FIRST (mutating
+    the centroid bank weights) and ``ExpertDistillPlugin.merge`` runs the
     ``_distill_merged_group`` loop SECOND — so distillation starts from
     POST-MERGE centroid weights. The pre-merge snapshot (the distillation
     target) is captured BEFORE the merge on both paths.
@@ -180,7 +180,7 @@ def test_distill_on_path_matches_reference(tiny_model):
     # distillation target. The snapshot is taken BEFORE _merge_experts_inplace
     # mutates the centroid bank weights.
     ref_pre = _snapshot_pre_merge_layer_experts(ref_layer)
-    # Production sequence: LegacyAdapter.merge runs _merge_experts_inplace
+    # Production sequence: LayerMergePlugin.merge runs _merge_experts_inplace
     # FIRST (mutating the centroid bank weights), THEN ExpertDistillPlugin.merge
     # distills the merged centroid. Replicate that here so the reference starts
     # from POST-MERGE centroid weights, exactly like the plugin path.
@@ -220,12 +220,12 @@ def test_distill_on_path_matches_reference(tiny_model):
     ctx.set("grouped", grouped)
     ctx.set("freq", freq)
     ctx.set("layer_input_acc", _StubAcc(layer_inputs.clone()))
-    ctx.set("distill_state", None)  # LegacyAdapter.merge default
+    ctx.set("distill_state", None)  # LayerMergePlugin.merge default
 
     plugin.pre_merge_snapshot(ctx)
     assert ctx.get("pre_merge_weights") is not None
 
-    # The orchestrator runs LegacyAdapter.merge (which calls
+    # The orchestrator runs LayerMergePlugin.merge (which calls
     # _merge_experts_inplace) BEFORE the ExpertDistillPlugin.merge hook —
     # replicate that here so distillation starts from POST-MERGE centroid
     # weights, identically to the reference path above.
@@ -253,7 +253,7 @@ def test_no_stale_monkeypatch_of_distill_symbols():
     """`_distill_merged_group` / `_snapshot_pre_merge_layer_experts` moved to
     pipeline.plugins.expert_distill in T16. Any test that patches either on the
     monolith namespace must also patch it on the new module (or the live
-    LegacyAdapter / legacy-loop path drifts). Fails loudly otherwise.
+    plugin path drifts). Fails loudly otherwise.
 
     No existing test patches these symbols (verified during T16 planning) —
     this guard is anticipatory, protecting against future drift.

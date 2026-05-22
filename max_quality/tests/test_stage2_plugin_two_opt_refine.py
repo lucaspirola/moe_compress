@@ -47,7 +47,7 @@ def test_is_enabled_false_when_block_missing():
 def test_no_stale_monkeypatch_of_two_opt_refine():
     """`_two_opt_refine` moved to pipeline.plugins.two_opt_refine in T14. Any
     test that patches it on the monolith namespace must also patch it on the
-    new module (or the live LegacyAdapter path drifts). Fails loudly otherwise."""
+    new module (or the live plugin path drifts). Fails loudly otherwise."""
     tests_dir = pathlib.Path(__file__).parent
     needle = 'setattr(stage2_reap_ream, "_two_opt_refine"'
     offenders = []

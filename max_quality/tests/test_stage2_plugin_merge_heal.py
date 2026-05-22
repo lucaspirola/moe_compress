@@ -98,14 +98,14 @@ def test_is_enabled_false_when_block_missing():
 def test_exposes_live_phase_hooks():
     """S2-11: the plugin owns the ``pre_merge_snapshot`` + ``post_merge``
     phases. It must NOT declare ``write_artifacts`` — the
-    ``_summarize_distill_state`` telemetry stays in LegacyAdapter.
+    ``_summarize_distill_state`` telemetry stays in LayerMergePlugin.
     """
     plugin = _disabled_plugin()
     assert callable(getattr(plugin, "pre_merge_snapshot", None))
     assert callable(getattr(plugin, "post_merge", None))
     assert not hasattr(plugin, "write_artifacts"), (
         "MergeHealPlugin must not declare write_artifacts — telemetry stays "
-        "in LegacyAdapter.write_artifacts"
+        "in LayerMergePlugin.write_artifacts"
     )
     # merge is NOT a hook of this plugin (expert-distill owns the merge phase).
     assert not hasattr(plugin, "merge")
@@ -131,7 +131,7 @@ def test_pre_merge_snapshot_disabled_writes_none(tmp_path):
 
 def test_post_merge_disabled_overwrites_heal_state_none(tmp_path):
     """With merge-heal OFF the post_merge hook overwrites ``heal_state`` (which
-    LegacyAdapter.post_merge defaults to None) — still None, no crash."""
+    LayerMergePlugin.post_merge defaults to None) — still None, no crash."""
     ctx = PipelineContext()
 
     class _FakeLayer:
@@ -141,7 +141,7 @@ def test_post_merge_disabled_overwrites_heal_state_none(tmp_path):
     ctx.set("final_kept_ids", (0, 1))
     ctx.set("nemo_writer", None)
     ctx.set("xd_writer", None)
-    ctx.set("heal_state", None)  # LegacyAdapter.post_merge default
+    ctx.set("heal_state", None)  # LayerMergePlugin.post_merge default
     _make_plugin(
         heal_cfg=_HealConfig({}), artifacts_dir=tmp_path,
         model=object(), batches=[],
@@ -266,11 +266,11 @@ def test_merge_heal_on_path_matches_reference(tmp_path):
     assert ctx.get("nemo_writer") is not None
     assert ctx.get("xd_writer") is None
 
-    # The orchestrator applies the merge (LegacyAdapter.post_merge) BEFORE the
-    # MergeHealPlugin.post_merge hook runs — replicate that here.
+    # The orchestrator applies the merge (LayerMergePlugin.post_merge) BEFORE
+    # the MergeHealPlugin.post_merge hook runs — replicate that here.
     _merge_layer(plug_layer, _KEPT)
     ctx.set("final_kept_ids", tuple(_KEPT))
-    ctx.set("heal_state", None)  # LegacyAdapter.post_merge default
+    ctx.set("heal_state", None)  # LayerMergePlugin.post_merge default
 
     plugin.post_merge(ctx)
     plug_state = ctx.get("heal_state")

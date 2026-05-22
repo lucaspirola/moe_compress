@@ -1265,19 +1265,19 @@ def _captured_trackio_emits(monkeypatch):
     emits afterward.
 
     Both namespaces are patched: the per-layer emit lives in
-    ``stage2.plugins.legacy_adapter`` under the Stage 2 plugin refactor (it
-    imports ``trackio_log`` into its own module binding), while the static
-    config emit still lives in ``stage2_reap_ream``. Patching only one
+    ``stage2.plugins.layer_merge`` (``LayerMergePlugin.write_artifacts`` calls
+    ``_trackio_log``, imported into that module's own binding), while the
+    static config emit still lives in ``stage2_reap_ream``. Patching only one
     namespace would silently miss the other code path."""
     from moe_compress import stage2_reap_ream
-    from moe_compress.stage2.plugins import legacy_adapter as _legacy_adapter
+    from moe_compress.stage2.plugins import layer_merge
     captured: list[dict] = []
 
     def _capture(metrics: dict) -> None:
         captured.append(dict(metrics))
 
     monkeypatch.setattr(stage2_reap_ream, "_trackio_log", _capture)
-    monkeypatch.setattr(_legacy_adapter, "_trackio_log", _capture)
+    monkeypatch.setattr(layer_merge, "_trackio_log", _capture)
     return captured
 
 

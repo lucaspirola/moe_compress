@@ -1,8 +1,8 @@
 """S2-9 — the refine_assignment CHAIN (TwoOptRefinePlugin then EmRefinePlugin).
 
 ``refine_assignment`` is a CHAIN, not a single-winner ``dispatch_first`` slot:
-both refiners may run, in registry order (two-opt first, then EM), and the
-neutered ``LegacyAdapter`` trails the chain as a dead fallback returning None.
+both refiners may run, in registry order (two-opt first, then EM). A chain
+link declining the slot (returning None) is skipped cleanly.
 
 Coverage:
   * plugin contract — both plugins satisfy ``PipelinePlugin``;
@@ -150,7 +150,7 @@ class _ListHandler(logging.Handler):
 
 def test_two_opt_refine_non_greedy_warns_and_passes_through():
     """Non-greedy solver + flag set → asg is returned UNCHANGED and the elif
-    warning fires (byte-identical string vs the old LegacyAdapter)."""
+    warning fires."""
     asg, cost = _two_opt_test_inputs()
     plugin = TwoOptRefinePlugin(
         two_opt_refine=True, assignment_solver="hungarian", max_group_cap=2,
@@ -207,8 +207,9 @@ def _make_em_layer_ctx(*, cost_alignment="pre"):
 
 
 def test_em_refine_byte_identical_vs_direct_call():
-    """EmRefinePlugin.refine_assignment threads exactly the args the old
-    LegacyAdapter passed: its output equals a direct _em_refine_assignment call.
+    """EmRefinePlugin.refine_assignment threads exactly the args
+    ``_em_refine_assignment`` expects: its output equals a direct
+    ``_em_refine_assignment`` call.
 
     Uses cost_alignment="pre" so EM is a no-op (no model needed) — the path
     under test is the ctx-slot read + arg threading, not EM's internals."""
@@ -321,8 +322,8 @@ def test_chain_runs_two_opt_before_em_and_threads_em_rounds():
 
 
 def test_chain_skips_plugins_returning_none():
-    """A chain link declining the slot (returns None — e.g. the neutered
-    LegacyAdapter, or a refiner whose gate is off) is skipped cleanly."""
+    """A chain link declining the slot (returns None — e.g. a refiner whose
+    gate is off this layer) is skipped cleanly."""
 
     class _DeclineAll:
         name = "decline"
@@ -344,12 +345,12 @@ def test_chain_skips_plugins_returning_none():
 
 
 def test_chain_neither_refiner_enabled_is_noop():
-    """When registry.enabled drops both refiners, only the dead-fallback
-    LegacyAdapter (returns None) remains — the chain is a clean no-op and
-    em_rounds_done stays 0."""
+    """When registry.enabled drops both refiners, the refine_assignment chain
+    is empty — a stand-in link that declines the slot (returns None) leaves the
+    chain a clean no-op and em_rounds_done stays 0."""
 
-    class _DeadAdapter:
-        name = "legacy_adapter"
+    class _RefineDecliner:
+        name = "refine_decliner"
 
         def refine_assignment(self, ctx, asg, delta):
             return None
@@ -357,7 +358,7 @@ def test_chain_neither_refiner_enabled_is_noop():
     asg_in = [0, 1, 0]
     delta_in = np.array([[0.1, 0.2]], dtype=np.float64)
     asg, delta, em_rounds = _run_refine_chain(
-        [_DeadAdapter()], None, asg_in, delta_in,
+        [_RefineDecliner()], None, asg_in, delta_in,
     )
     assert asg == asg_in
     assert delta is delta_in
@@ -369,7 +370,7 @@ def test_chain_neither_refiner_enabled_is_noop():
 # ---------------------------------------------------------------------------
 def test_registry_orders_two_opt_before_em_before_adapter():
     """In the Stage-2 registry the two refiners appear after the solver
-    plugins, two-opt FIRST then EM, immediately before the LegacyAdapter."""
+    plugins, two-opt FIRST then EM, immediately before the LayerMergePlugin."""
     import inspect
 
     from moe_compress.stage2 import orchestrator
@@ -377,9 +378,11 @@ def test_registry_orders_two_opt_before_em_before_adapter():
     src = inspect.getsource(orchestrator.run)
     i_two_opt = src.index("TwoOptRefinePlugin(")
     i_em = src.index("EmRefinePlugin(")
-    i_adapter = src.index("\n        adapter,\n")
+    # S2-12: the merge-spine registry entry is the ``layer_merge`` instance
+    # (the ``LayerMergePlugin`` that replaced the retired ``LegacyAdapter``).
+    i_adapter = src.index("\n        layer_merge,\n")
     i_auto = src.index("AutoSolverPlugin(**_solver_plugin_kwargs)")
     assert i_auto < i_two_opt < i_em < i_adapter, (
         "registry order must be ...AutoSolverPlugin, TwoOptRefinePlugin, "
-        "EmRefinePlugin, adapter"
+        "EmRefinePlugin, layer_merge"
     )

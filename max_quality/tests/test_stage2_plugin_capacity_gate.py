@@ -34,7 +34,7 @@ def test_ream_cost_plugin_imports_from_capacity_gate():
     the sibling ``capacity_gate`` module — not the monolith — so monkeypatching
     ``stage2_reap_ream`` will not silently no-op the gate.
 
-    (Pre-S2-5 this guarded ``LegacyAdapter.compute_assignment``; S2-5
+    (Pre-S2-5 this guarded the monolithic ``compute_assignment`` hook; S2-5
     decomposed that, S2-6 moved the cost path into
     ``ream_cost._compute_cost_for_plugin``, and S2-10 moved the gate itself
     into ``CapacityGatePlugin.select_alignment``.)"""
@@ -178,10 +178,10 @@ def test_zero_threshold_always_tight():
 
 def test_no_monolith_only_monkeypatch_of_moved_symbol():
     """No test may patch `_pick_effective_alignment` via the monolith namespace
-    only — after T11 such a patch silently no-ops for LegacyAdapter (which now
-    imports from `capacity_gate`). Investigation found none; this guard fails
-    loudly if a future edit introduces one without a matching capacity_gate
-    patch."""
+    only — after T11 such a patch silently no-ops for the live plugin path
+    (which now imports from `capacity_gate`). Investigation found none; this
+    guard fails loudly if a future edit introduces one without a matching
+    capacity_gate patch."""
     tests_dir = pathlib.Path(__file__).parent
     needle = 'setattr(stage2_reap_ream, "_pick_effective_alignment"'
     offenders = []

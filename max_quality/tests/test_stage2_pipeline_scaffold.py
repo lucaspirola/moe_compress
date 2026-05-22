@@ -77,8 +77,9 @@ def test_pipeline_phases_are_declared_in_canonical_order():
     (``compute_cost``, ``apply_cost_mask``, ``solve_assignment``,
     ``refine_assignment``) are an open vocabulary discovered reflectively by
     the tolerant phase walk and are NOT iterated by ``walk_phases`` over this
-    schedule — the LegacyAdapter folds them into ``compute_assignment`` to
-    preserve the bump-loop control flow.
+    schedule — ``orchestrator._run_assignment`` drives them inside the
+    compound ``compute_assignment`` slot to preserve the bump-loop control
+    flow.
     """
     assert _STAGE2_LAYER_PHASES == (
         "on_layer_setup",

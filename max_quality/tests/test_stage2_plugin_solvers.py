@@ -123,7 +123,7 @@ def _solver_ctx(n_nc: int, n_c: int) -> PipelineContext:
 
 def test_greedy_plugin_solve_assignment_byte_identical():
     """GreedySolverPlugin.solve_assignment produces the same assignment as a
-    direct _assign_children_to_centroids call (== LegacyAdapter-equivalent)."""
+    direct _assign_children_to_centroids call."""
     cost = _cost()  # 4 children, 3 centroids
     plugin = solver_greedy.GreedySolverPlugin(
         max_group_cap=2, assignment_solver="greedy",
@@ -205,7 +205,7 @@ def test_auto_plugin_solve_assignment_byte_identical():
 # --- S2-8: PluginRegistry wiring ------------------------------------------
 
 class _AlwaysOnPlugin:
-    """Minimal always-enabled plugin standing in for the LegacyAdapter."""
+    """Minimal always-enabled plugin standing in for the LayerMergePlugin."""
 
     name = "always_on_adapter_stub"
 
@@ -249,13 +249,15 @@ def test_registry_wiring_one_solver_enabled_before_adapter(solver_name):
 
 def test_orchestrator_registers_solvers_after_skip_merge_before_adapter():
     """The orchestrator source registers the five solver plugins after
-    ``SkipMergeFloorPlugin`` and before ``adapter`` in the registry list."""
+    ``SkipMergeFloorPlugin`` and before the merge spine in the registry list.
+    S2-12: the merge-spine entry is the ``layer_merge`` (``LayerMergePlugin``)
+    instance that replaced the retired ``LegacyAdapter``."""
     src = (
         pathlib.Path(__file__).parents[1]
         / "src/moe_compress/stage2/orchestrator.py"
     ).read_text()
     smf = src.index("SkipMergeFloorPlugin(skip_merge_percentile=")
-    adapter = src.index("\n        adapter,\n    ])")
+    adapter = src.index("\n        layer_merge,\n")
     for name in (
         "GreedySolverPlugin(**_solver_plugin_kwargs)",
         "HungarianSolverPlugin(**_solver_plugin_kwargs)",

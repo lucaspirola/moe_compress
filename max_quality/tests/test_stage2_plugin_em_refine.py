@@ -76,7 +76,7 @@ def test_no_stale_monkeypatch_of_em_symbols():
     """`_em_refine_assignment` / `_em_compute_tentative_weights` moved to
     pipeline.plugins.em_refine in T15. Any test that patches either on the
     monolith namespace must also patch it on the new module (or the live
-    LegacyAdapter / legacy-loop path drifts). Fails loudly otherwise."""
+    plugin path drifts). Fails loudly otherwise."""
     tests_dir = pathlib.Path(__file__).parent
     needles = (
         'setattr(stage2_reap_ream, "_em_refine_assignment"',

@@ -1,9 +1,9 @@
-"""Tests for the Stage 2 phase walk + the LegacyAdapter wiring.
+"""Tests for the Stage 2 phase walk + the LayerMergePlugin wiring.
 
 Three layers of coverage:
   1. Pipeline contract — ``walk_phases`` order, hook dispatch, partial_dir
      threading via the ``partial_dir`` context slot.
-  2. LegacyAdapter unit — each hook moves the right ctx state.
+  2. LayerMergePlugin unit — each hook moves the right ctx state.
   3. End-to-end smoke — Stage 2 via the plugin pipeline produces a valid
      ``merge_map.json`` + a checkpoint directory. (The legacy escape hatch
      was removed in Task 18; the byte-identical gate it backed is retired.)
@@ -28,32 +28,9 @@ from moe_compress.stage2.orchestrator import (
     _STAGE2_PRE_ASSIGN_PHASES,
     _run_assignment,
 )
-from moe_compress.stage2.plugins.legacy_adapter import LegacyAdapter
-from moe_compress.pipeline.plugin import PipelinePlugin
+from moe_compress.stage2.plugins.layer_merge import LayerMergePlugin
 from moe_compress.tools.phase_walker import walk_phases
 from moe_compress.utils.model_io import iter_moe_layers
-
-
-def test_legacy_adapter_structural_conformance():
-    """LegacyAdapter satisfies the universal PipelinePlugin contract.
-
-    LegacyAdapter cannot be bare-instantiated (its __init__ takes ~39
-    keyword-only args), so its conformance is asserted at the class level:
-    every PipelinePlugin metadata attribute is present with the right type,
-    and the two universal core methods exist.
-    """
-    for attr in ("name", "paper", "config_key", "reads", "writes", "provides"):
-        assert hasattr(LegacyAdapter, attr), f"LegacyAdapter missing {attr!r}"
-    assert isinstance(LegacyAdapter.name, str)
-    assert isinstance(LegacyAdapter.paper, str)
-    assert isinstance(LegacyAdapter.config_key, str)
-    assert isinstance(LegacyAdapter.reads, tuple)
-    assert isinstance(LegacyAdapter.writes, tuple)
-    assert isinstance(LegacyAdapter.provides, tuple)
-    assert callable(getattr(LegacyAdapter, "is_enabled", None))
-    assert callable(getattr(LegacyAdapter, "contribute_artifact", None))
-    # The class object structurally satisfies the runtime_checkable Protocol.
-    assert isinstance(LegacyAdapter, PipelinePlugin)
 
 
 def _make_run_ctx(*, model, tokenizer, config, artifacts_dir,
@@ -296,12 +273,12 @@ def test_write_artifacts_reads_partial_dir_none_in_no_resume_mode(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: LegacyAdapter unit coverage
+# Layer 2: LayerMergePlugin unit coverage
 # ---------------------------------------------------------------------------
 
 
-def _build_minimal_adapter(model, tiny_config, tmp_path, *, moe_layers,
-                           cov_acc=None, merge_map=None, mean_costs=None):
+def _build_minimal_layer_merge_plugin(model, tiny_config, tmp_path, *, moe_layers,
+                                      cov_acc=None, merge_map=None, mean_costs=None):
     from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
     s2 = tiny_config["stage2_reap_ream"]
     if cov_acc is None:
@@ -310,41 +287,28 @@ def _build_minimal_adapter(model, tiny_config, tmp_path, *, moe_layers,
         merge_map = {}
     if mean_costs is None:
         mean_costs = []
-    return LegacyAdapter(
+    return LayerMergePlugin(
         s2_cfg=s2, heal_cfg=stage2_reap_ream._HealConfig(s2),
-        heal_device=None, xd_batches=None, batches=[],
-        model=model,
+        batches=[], model=model,
         cov_acc=cov_acc, merge_map=merge_map,
         layer_mean_costs=mean_costs, partial_dir=tmp_path,
         max_group_cap=0, cost_sigma=float("inf"),
         cost_bump_ratio=0.1, min_active_tokens=1,
         assignment_solver="greedy", cost_alignment_cfg="pre",
-        cost_output_token_cap=8, cost_whitening="none",
-        cost_asymmetric=False, cost_topk_filter=2,
-        capacity_util_threshold=0.0, em_refinement_rounds=0,
-        em_convergence_break=True, two_opt_refine=False,
-        sinkhorn_epsilon_init=1.0, sinkhorn_epsilon_final=0.01,
-        sinkhorn_iters=10, skip_merge_percentile=100.0,
-        expert_distill_steps=0, expert_distill_lr=1e-4,
-        expert_distill_betas=(0.9, 0.95),
-        expert_distill_token_cap=8,
-        expert_distill_skip_singletons=True,
-        expert_distill_plateau_steps=2,
-        expert_distill_plateau_eps=1e-4,
-        per_layer_target={ref.layer_idx: 2 for ref in moe_layers},
-        blacklist={},
-        artifacts_dir=tmp_path, device=None,
+        cost_output_token_cap=8, cost_asymmetric=False,
+        expert_distill_steps=0, expert_distill_token_cap=8,
+        blacklist={}, device=None,
     )
 
 
-def test_legacy_adapter_on_layer_setup_populates_accumulators(tiny_model, patched_stage2,
-                                                              tmp_path):
+def test_layer_merge_on_layer_setup_populates_accumulators(tiny_model, patched_stage2,
+                                                           tmp_path):
     """on_layer_setup creates ream_acc + perm_cache; layer_input_acc None in default mode.
 
     Updated for T7: ``ctx.reap_acc`` is now created by ``ReapScoringPlugin.on_layer_setup``,
-    which is registered before the LegacyAdapter in ``stage2_reap_ream.run``.
+    which is registered before the LayerMergePlugin in ``stage2_reap_ream.run``.
     We invoke it here to mirror the production wiring, then check that
-    LegacyAdapter does NOT overwrite it.
+    LayerMergePlugin does NOT overwrite it.
     """
     _run_stage1(tiny_model, patched_stage2, tmp_path)
     from moe_compress.utils.activation_hooks import ReamCostAccumulator, ReapAccumulator
@@ -352,14 +316,14 @@ def test_legacy_adapter_on_layer_setup_populates_accumulators(tiny_model, patche
     from moe_compress.stage2.plugins.reap_scoring import ReapScoringPlugin
 
     moe_layers = list(iter_moe_layers(tiny_model))
-    adapter = _build_minimal_adapter(tiny_model, patched_stage2, tmp_path,
-                                     moe_layers=moe_layers)
+    plugin = _build_minimal_layer_merge_plugin(tiny_model, patched_stage2, tmp_path,
+                                               moe_layers=moe_layers)
     ctx = _make_layer_ctx(PipelineContext(),
                           layer_idx=moe_layers[0].layer_idx,
                           layer_ref=moe_layers[0],
                           n_experts=moe_layers[0].num_routed_experts, target=2)
     ReapScoringPlugin().on_layer_setup(ctx)
-    adapter.on_layer_setup(ctx)
+    plugin.on_layer_setup(ctx)
     assert isinstance(ctx.get("reap_acc"), ReapAccumulator)
     assert isinstance(ctx.get("ream_acc"), ReamCostAccumulator)
     assert isinstance(ctx.get("perm_cache"), _PermAlignCache)
@@ -367,26 +331,26 @@ def test_legacy_adapter_on_layer_setup_populates_accumulators(tiny_model, patche
     assert ctx.get("layer_input_acc") is None
 
 
-def test_legacy_adapter_on_layer_teardown_clears_state(tiny_model, patched_stage2,
-                                                       tmp_path):
+def test_layer_merge_on_layer_teardown_clears_state(tiny_model, patched_stage2,
+                                                    tmp_path):
     """on_layer_teardown drops the per-layer accumulators."""
     _run_stage1(tiny_model, patched_stage2, tmp_path)
     from moe_compress.stage2.plugins.reap_scoring import ReapScoringPlugin
 
     moe_layers = list(iter_moe_layers(tiny_model))
-    adapter = _build_minimal_adapter(tiny_model, patched_stage2, tmp_path,
-                                     moe_layers=moe_layers)
+    plugin = _build_minimal_layer_merge_plugin(tiny_model, patched_stage2, tmp_path,
+                                               moe_layers=moe_layers)
     ctx = _make_layer_ctx(PipelineContext(),
                           layer_idx=moe_layers[0].layer_idx,
                           layer_ref=moe_layers[0],
                           n_experts=moe_layers[0].num_routed_experts, target=2)
     ReapScoringPlugin().on_layer_setup(ctx)
-    adapter.on_layer_setup(ctx)
+    plugin.on_layer_setup(ctx)
     assert ctx.get("reap_acc") is not None and ctx.get("ream_acc") is not None
     # teardown nulls all 8 per-layer slots unconditionally (overwrite=True is
     # an upsert), so no pre-seed is needed even for slots the pre-merge / merge
     # phases would normally write.
-    adapter.on_layer_teardown(ctx)
+    plugin.on_layer_teardown(ctx)
     assert ctx.get("reap_acc") is None
     assert ctx.get("ream_acc") is None
     assert ctx.get("perm_cache") is None
@@ -416,34 +380,12 @@ _ASSIGNMENT_SLOTS = (
 )
 
 
-def test_legacy_adapter_exposes_four_assignment_slots():
-    """LegacyAdapter exposes the four fine-grained cost/mask/solve/refine
-    assignment slots and no longer carries the monolithic ``compute_assignment``
-    hook (S2-5).
-
-    S2-10: ``select_alignment`` (the capacity gate) is NOT a LegacyAdapter slot
-    — it is serviced by ``CapacityGatePlugin`` — so it is excluded here.
-    """
-    for slot in ("compute_cost", "apply_cost_mask",
-                 "solve_assignment", "refine_assignment"):
-        assert callable(getattr(LegacyAdapter, slot, None)), (
-            f"LegacyAdapter missing assignment slot {slot!r}"
-        )
-    assert not hasattr(LegacyAdapter, "select_alignment"), (
-        "LegacyAdapter must NOT declare select_alignment — the capacity gate "
-        "is serviced by CapacityGatePlugin (S2-10)"
-    )
-    assert not hasattr(LegacyAdapter, "compute_assignment"), (
-        "LegacyAdapter.compute_assignment must be gone after the S2-5 "
-        "decomposition — the bump loop now lives in orchestrator._run_assignment"
-    )
-
-
 def _make_capacity_gate():
-    """Build a CapacityGatePlugin with the same gate knobs ``_build_minimal_adapter``
-    passes the LegacyAdapter (max_group_cap=0 / capacity_util_threshold=0.0 /
-    cost_alignment_cfg="pre" / cost_asymmetric=False). S2-10: the hand-built
-    plugin lists need it to service the ``select_alignment`` slot.
+    """Build a CapacityGatePlugin with the same gate knobs
+    ``_build_minimal_layer_merge_plugin`` uses (max_group_cap=0 /
+    capacity_util_threshold=0.0 / cost_alignment_cfg="pre" /
+    cost_asymmetric=False). S2-10: the hand-built plugin lists need it to
+    service the ``select_alignment`` slot.
     """
     from moe_compress.stage2.plugins.capacity_gate import CapacityGatePlugin
     return CapacityGatePlugin(
@@ -452,53 +394,98 @@ def _make_capacity_gate():
     )
 
 
+def _build_assignment_slot_plugins():
+    """Build the real plugins that service the four post-gate assignment slots.
+
+    S2-12 retired ``LegacyAdapter`` and its dead ``compute_cost`` /
+    ``apply_cost_mask`` / ``solve_assignment`` fallbacks. The live slots are
+    serviced by the production cost / skip-merge / solver plugins — instantiate
+    them here with the same knobs ``_build_minimal_layer_merge_plugin`` uses
+    (cost_alignment="pre", greedy solver, skip-merge OFF sentinel). Returns
+    ``(cost_plugin, skip_plugin, solver_plugin)``.
+    """
+    from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
+    from moe_compress.stage2.plugins.ream_cost import ReamCostPrePlugin
+    from moe_compress.stage2.plugins.skip_merge_floor import SkipMergeFloorPlugin
+    from moe_compress.stage2.plugins.solver_greedy import GreedySolverPlugin
+
+    cost_plugin = ReamCostPrePlugin(
+        cov_acc=InputCovarianceAccumulator(),
+        cost_alignment_cfg="pre", cost_whitening="none",
+        cost_topk_filter=2, cost_output_token_cap=8,
+    )
+    skip_plugin = SkipMergeFloorPlugin(skip_merge_percentile=100.0)
+    solver_plugin = GreedySolverPlugin(
+        max_group_cap=0, assignment_solver="greedy",
+        sinkhorn_epsilon_init=1.0, sinkhorn_epsilon_final=0.01,
+        sinkhorn_iters=10,
+    )
+    return cost_plugin, skip_plugin, solver_plugin
+
+
 def _prepare_layer_for_assignment(tiny_model, patched_stage2, tmp_path):
     """Run stage1 + the pre-assign phases so a layer ctx is ready for
-    ``_run_assignment``. Returns ``(adapter, plugins, ctx)``."""
+    ``_run_assignment``. Returns ``(layer_merge, plugins, ctx)``."""
     from moe_compress.stage2.plugins.reap_scoring import ReapScoringPlugin
 
     _run_stage1(tiny_model, patched_stage2, tmp_path)
     moe_layers = list(iter_moe_layers(tiny_model))
-    adapter = _build_minimal_adapter(tiny_model, patched_stage2, tmp_path,
-                                     moe_layers=moe_layers)
+    layer_merge = _build_minimal_layer_merge_plugin(
+        tiny_model, patched_stage2, tmp_path, moe_layers=moe_layers)
     # S2-10: CapacityGatePlugin services the select_alignment slot — without it
     # _run_assignment's ``assert _alignment is not None`` would fire.
-    plugins = [ReapScoringPlugin(), _make_capacity_gate(), adapter]
+    # S2-12: the real cost / skip-merge / solver plugins service the
+    # compute_cost / apply_cost_mask / solve_assignment slots (the dead
+    # LegacyAdapter fallbacks they used to lean on are gone). LayerMergePlugin
+    # stays in the list so _run_assignment's isinstance(p, LayerMergePlugin)
+    # scratchpad lookup resolves.
+    cost_plugin, skip_plugin, solver_plugin = _build_assignment_slot_plugins()
+    plugins = [
+        ReapScoringPlugin(), _make_capacity_gate(),
+        cost_plugin, skip_plugin, solver_plugin, layer_merge,
+    ]
     layer_ref = moe_layers[0]
     ctx = _make_layer_ctx(PipelineContext(),
                           layer_idx=layer_ref.layer_idx,
                           layer_ref=layer_ref,
                           n_experts=layer_ref.num_routed_experts, target=2)
     walk_phases(_STAGE2_PRE_ASSIGN_PHASES, plugins, ctx)
-    return adapter, plugins, ctx
+    return layer_merge, plugins, ctx
 
 
 def test_run_assignment_dispatches_slots(tiny_model, patched_stage2, tmp_path):
     """`_run_assignment` drives the four assignment slots, in canonical order,
     once per bump iteration.
 
-    A probe plugin is inserted ahead of the LegacyAdapter: it records every
-    slot call (in order) and delegates to the adapter's real slot method so the
-    bump loop still produces a valid grouping. The adapter stays in the plugin
-    list so ``_run_assignment``'s ``isinstance(p, LegacyAdapter)`` lookup for
-    the run-scope scratchpad still resolves.
+    A probe plugin is inserted ahead of the real slot plugins: it records every
+    slot call (in order) and delegates to the production slot plugin so the
+    bump loop still produces a valid grouping. The ``LayerMergePlugin`` stays
+    in the plugin list so ``_run_assignment``'s
+    ``isinstance(p, LayerMergePlugin)`` lookup for the run-scope scratchpad
+    still resolves.
 
-    S2-9: ``refine_assignment`` is now a CHAIN — the probe is one chain link
-    and its ``refine_assignment`` delegates to ``adapter.refine_assignment``
-    (the neutered dead fallback, returns ``None``). The chain loop handles the
-    ``None`` cleanly, so the probe still records exactly one
-    ``refine_assignment`` call per bump and the canonical slot order holds.
+    S2-9: ``refine_assignment`` is a CHAIN — the probe is one chain link and
+    its ``refine_assignment`` declines the slot (returns ``None``, no refiner
+    is wired here). The chain loop handles the ``None`` cleanly, so the probe
+    still records exactly one ``refine_assignment`` call per bump and the
+    canonical slot order holds.
 
     S2-10: ``select_alignment`` (the capacity gate) is the first slot
     ``_run_assignment`` dispatches per bump — the probe delegates it to a real
     ``CapacityGatePlugin`` so the gate slots are published before
     ``compute_cost`` reads them back.
+
+    S2-12: ``compute_cost`` / ``apply_cost_mask`` / ``solve_assignment`` are
+    serviced by the production cost / skip-merge / solver plugins (the dead
+    ``LegacyAdapter`` fallbacks are gone) — the probe delegates each to its
+    real plugin.
     """
-    adapter, plugins, ctx = _prepare_layer_for_assignment(
+    layer_merge, plugins, ctx = _prepare_layer_for_assignment(
         tiny_model, patched_stage2, tmp_path)
 
     calls: list[str] = []
     gate = _make_capacity_gate()
+    cost_plugin, skip_plugin, solver_plugin = _build_assignment_slot_plugins()
 
     class _SlotProbe:
         name = "slot_probe"
@@ -509,24 +496,24 @@ def test_run_assignment_dispatches_slots(tiny_model, patched_stage2, tmp_path):
 
         def compute_cost(self, ctx):
             calls.append("compute_cost")
-            return adapter.compute_cost(ctx)
+            return cost_plugin.compute_cost(ctx)
 
         def apply_cost_mask(self, ctx, delta):
             calls.append("apply_cost_mask")
-            return adapter.apply_cost_mask(ctx, delta)
+            return skip_plugin.apply_cost_mask(ctx, delta)
 
         def solve_assignment(self, ctx, delta):
             calls.append("solve_assignment")
-            return adapter.solve_assignment(ctx, delta)
+            return solver_plugin.solve_assignment(ctx, delta)
 
         def refine_assignment(self, ctx, asg, delta):
             calls.append("refine_assignment")
-            return adapter.refine_assignment(ctx, asg, delta)
+            return None  # no refiner wired — chain link declines the slot
 
-    # Probe first so dispatch_first lands on it; adapter still present for the
-    # isinstance lookup + run-scope state.
+    # Probe first so dispatch_first lands on it; LayerMergePlugin still present
+    # for the isinstance lookup + run-scope state.
     from moe_compress.stage2.plugins.reap_scoring import ReapScoringPlugin
-    probed = [_SlotProbe(), ReapScoringPlugin(), adapter]
+    probed = [_SlotProbe(), ReapScoringPlugin(), layer_merge]
     # ReapScoringPlugin.on_score already ran in _prepare_layer_for_assignment;
     # we reuse the same ctx (scores/freq already published).
     _run_assignment(probed, ctx)
@@ -548,7 +535,7 @@ def test_run_assignment_publishes_layer_output_slots(tiny_model, patched_stage2,
                                                      tmp_path):
     """`_run_assignment` publishes every per-layer output slot the post-assign
     phases consume — all resolve to non-sentinel values after the driver runs."""
-    adapter, plugins, ctx = _prepare_layer_for_assignment(
+    layer_merge, plugins, ctx = _prepare_layer_for_assignment(
         tiny_model, patched_stage2, tmp_path)
 
     _run_assignment(plugins, ctx)
@@ -644,8 +631,8 @@ def test_stage2_pipeline_path_handles_resume(tiny_model, patched_stage2,
     assert len(moe_layers) >= 2, "Need at least 2 MoE layers for this test"
 
     # First run: crash after layer 0 fully processed.
-    # ``_profile_layer`` is dispatched by ``LegacyAdapter.on_profile`` via the
-    # ``moe_compress.stage2_reap_ream`` namespace (so monkeypatching is
+    # ``_profile_layer`` is dispatched by ``LayerMergePlugin.on_profile`` via
+    # the ``moe_compress.stage2_reap_ream`` namespace (so monkeypatching is
     # observable) — patch that module, not the slim orchestrator.
     original_profile = _stage2_monolith._profile_layer
     call_count = [0]

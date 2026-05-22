@@ -3,8 +3,7 @@
 Pins the SkipMergeFloorPlugin contract, the is_enabled numeric gate, the
 apply_cost_mask delegation to grouping._apply_skip_merge_floor, the OFF-sentinel
 passthrough, a monkeypatch-drift guard (T9–T11 lesson), and (S2-7) the live
-``apply_cost_mask`` slot: the INFO log line, byte-identity to
-``LegacyAdapter.apply_cost_mask``, and the ``PluginRegistry`` wiring.
+``apply_cost_mask`` slot: the INFO log line and the ``PluginRegistry`` wiring.
 """
 from __future__ import annotations
 
@@ -17,7 +16,6 @@ from moe_compress.pipeline.context import PipelineContext
 from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.pipeline.registry import PluginRegistry
 from moe_compress.stage2.grouping import _apply_skip_merge_floor
-from moe_compress.stage2.plugins.legacy_adapter import LegacyAdapter
 from moe_compress.stage2.plugins.skip_merge_floor import (
     SkipMergeFloorPlugin,
     make_skip_merge_floor_plugin,
@@ -113,8 +111,8 @@ def test_apply_cost_mask_does_not_mutate_input():
 
 
 def test_apply_cost_mask_off_sentinel_returns_input_unchanged():
-    """At percentile 100.0 the plugin returns the SAME array object (no copy),
-    matching the LegacyAdapter live path which skips the helper entirely."""
+    """At percentile 100.0 the plugin returns the SAME array object (no copy):
+    the OFF sentinel skips the ``_apply_skip_merge_floor`` helper entirely."""
     delta = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
     plugin = SkipMergeFloorPlugin(skip_merge_percentile=100.0)
     masked, info = plugin.apply_cost_mask(None, delta)
@@ -136,7 +134,7 @@ def test_no_stale_monkeypatch_of_skip_merge_floor():
     """`_apply_skip_merge_floor` did not move in T12 (it stayed in grouping.py
     since T5), so no namespace went stale. This guard fails loudly if a future
     edit patches the symbol on the monolith namespace only while the live
-    LegacyAdapter path imports it from `pipeline.grouping`."""
+    plugin path imports it from `pipeline.grouping`."""
     tests_dir = pathlib.Path(__file__).parent
     needle = 'setattr(stage2_reap_ream, "_apply_skip_merge_floor"'
     offenders = []
@@ -160,33 +158,6 @@ class _LayerRefStub:
 
     def __init__(self, layer_idx: int) -> None:
         self.layer_idx = layer_idx
-
-
-def _legacy_adapter_for_skip_merge(percentile: float) -> LegacyAdapter:
-    """Build a ``LegacyAdapter`` whose ``apply_cost_mask`` is exercisable.
-
-    ``apply_cost_mask`` reads only ``self.skip_merge_percentile`` and
-    ``ctx.get("layer_ref")``; every other ctor kwarg is inert filler.
-    """
-    return LegacyAdapter(
-        s2_cfg={"ream": {"frequency_weighted_merge": True}},
-        heal_cfg=None, heal_device=None, xd_batches=None, batches=[],
-        model=None, cov_acc=None, merge_map={},
-        layer_mean_costs=[], partial_dir=None,
-        max_group_cap=0, cost_sigma=float("inf"), cost_bump_ratio=0.1,
-        min_active_tokens=1, assignment_solver="greedy",
-        cost_alignment_cfg="pre", cost_output_token_cap=8,
-        cost_whitening="none", cost_asymmetric=False, cost_topk_filter=2,
-        capacity_util_threshold=0.0, em_refinement_rounds=0,
-        em_convergence_break=True, two_opt_refine=False,
-        sinkhorn_epsilon_init=1.0, sinkhorn_epsilon_final=0.01,
-        sinkhorn_iters=10, skip_merge_percentile=percentile,
-        expert_distill_steps=0, expert_distill_lr=1e-4,
-        expert_distill_betas=(0.9, 0.95), expert_distill_token_cap=8,
-        expert_distill_skip_singletons=True, expert_distill_plateau_steps=2,
-        expert_distill_plateau_eps=1e-4, per_layer_target={},
-        blacklist={}, artifacts_dir=pathlib.Path("."), device=None,
-    )
 
 
 def test_apply_cost_mask_emits_log_when_masked(caplog):
@@ -220,42 +191,10 @@ def test_apply_cost_mask_emits_log_when_masked(caplog):
     assert f"masked {info['n_masked']}/{masked.size}" in msg
 
 
-def test_apply_cost_mask_byte_identical_to_legacy_adapter():
-    """``SkipMergeFloorPlugin.apply_cost_mask`` and the (dead-for-<100.0)
-    ``LegacyAdapter.apply_cost_mask`` produce an identical ``(delta, info)``."""
-    rng = np.random.default_rng(2)
-    delta = rng.random((6, 7)).astype(np.float64) * 10.0
-
-    ctx = PipelineContext()
-    ctx.set("layer_ref", _LayerRefStub(layer_idx=3))
-
-    plugin_masked, plugin_info = SkipMergeFloorPlugin(
-        skip_merge_percentile=50.0
-    ).apply_cost_mask(ctx, delta.copy())
-    legacy_masked, legacy_info = _legacy_adapter_for_skip_merge(
-        50.0
-    ).apply_cost_mask(ctx, delta.copy())
-
-    np.testing.assert_array_equal(plugin_masked, legacy_masked)
-    assert plugin_info == legacy_info
-
-    # 100.0 OFF sentinel: both return the SAME object unchanged, no copy.
-    sentinel = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
-    p_out, p_info = SkipMergeFloorPlugin(
-        skip_merge_percentile=100.0
-    ).apply_cost_mask(ctx, sentinel)
-    l_out, l_info = _legacy_adapter_for_skip_merge(
-        100.0
-    ).apply_cost_mask(ctx, sentinel)
-    assert p_out is sentinel
-    assert l_out is sentinel
-    assert p_info == l_info == {"n_masked": 0, "percentile": 100.0}
-
-
 # --- S2-7: PluginRegistry wiring --------------------------------------------
 
 class _AlwaysOnPlugin:
-    """Minimal always-enabled plugin standing in for the LegacyAdapter."""
+    """Minimal always-enabled plugin standing in for the LayerMergePlugin."""
 
     name = "always_on_adapter_stub"
 
@@ -287,12 +226,14 @@ def test_registry_wiring_skip_merge_floor():
 
 def test_orchestrator_registers_skip_merge_floor_before_adapter():
     """The orchestrator source registers ``SkipMergeFloorPlugin`` after the
-    three cost plugins and before ``adapter`` in the ``PluginRegistry`` list."""
+    three cost plugins and before the merge spine in the ``PluginRegistry``
+    list. S2-12: the merge-spine entry is the ``layer_merge``
+    (``LayerMergePlugin``) instance that replaced the retired ``LegacyAdapter``."""
     src = (
         pathlib.Path(__file__).parents[1]
         / "src/moe_compress/stage2/orchestrator.py"
     ).read_text()
     smf = src.index("SkipMergeFloorPlugin(skip_merge_percentile=")
     out_cost = src.index("OutputSpaceCostPlugin(**_cost_plugin_kwargs)")
-    adapter = src.index("\n        adapter,\n    ])")
+    adapter = src.index("\n        layer_merge,\n")
     assert out_cost < smf < adapter

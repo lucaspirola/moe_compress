@@ -3,7 +3,7 @@
 Pins the ``ReamCostPrePlugin.is_enabled`` truth table, a CPU-only
 ``cost_alignment="pre"`` smoke test, and (S2-6) the live ``compute_cost`` slot:
 the plugin services the ``compute_cost`` assignment slot and produces a finite
-cost matrix byte-identical to ``LegacyAdapter.compute_cost``.
+cost matrix.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from moe_compress.utils.model_io import iter_moe_layers
 
 
 # Representative cost knobs for constructing a cost plugin in a unit test —
-# the same shape the orchestrator passes (mirrors LegacyAdapter's cost knobs).
+# the same shape the orchestrator passes.
 # S2-10: the capacity-gate knobs (max_group_cap / capacity_util_threshold /
 # cost_asymmetric) moved to CapacityGatePlugin and are no longer cost-plugin
 # ctor args.
@@ -140,57 +140,3 @@ def test_compute_cost_is_live_slot(tiny_model):
     assert delta.shape == (n_nc, n_c)
     assert np.isfinite(delta).all()
 
-
-def test_compute_cost_byte_identical_to_legacy_adapter(tiny_model, tmp_path):
-    """Strongest guard: the S2-10 gate-then-cost path
-    (`CapacityGatePlugin.select_alignment` followed by
-    `ReamCostPrePlugin.compute_cost`) produces an identical `delta` to the
-    (dead) `LegacyAdapter.compute_cost` fallback (which self-contains the
-    gate) on the same prepared ctx — the wiring is behaviour-preserving."""
-    from moe_compress.stage2.plugins.capacity_gate import CapacityGatePlugin
-    from moe_compress.stage2.plugins.legacy_adapter import LegacyAdapter
-
-    cov_acc = InputCovarianceAccumulator()
-
-    # Plugin path: select_alignment FIRST (publishes the gate slots), then
-    # compute_cost reads them back — mirrors the orchestrator's bump iteration.
-    layer_ref, ctx_plugin = _prepare_cost_ctx(tiny_model)
-    gate = CapacityGatePlugin(
-        max_group_cap=0, capacity_util_threshold=0.0,
-        cost_alignment_cfg="pre", cost_asymmetric=False,
-    )
-    gate.select_alignment(ctx_plugin)
-    plugin = ReamCostPrePlugin(**_cost_kwargs(cov_acc))
-    delta_plugin = plugin.compute_cost(ctx_plugin)
-
-    # LegacyAdapter path — a fresh ctx prepared identically (the empty
-    # ReamCostAccumulator + identical _iter_* slots make both deterministic).
-    _, ctx_legacy = _prepare_cost_ctx(tiny_model)
-    adapter = LegacyAdapter(
-        s2_cfg={"ream": {"frequency_weighted_merge": True}},
-        heal_cfg=None, heal_device=None, xd_batches=None, batches=[],
-        model=tiny_model, cov_acc=cov_acc, merge_map={},
-        layer_mean_costs=[], partial_dir=tmp_path,
-        max_group_cap=0, cost_sigma=float("inf"), cost_bump_ratio=0.1,
-        min_active_tokens=1, assignment_solver="greedy",
-        cost_alignment_cfg="pre", cost_output_token_cap=8,
-        cost_whitening="none", cost_asymmetric=False, cost_topk_filter=2,
-        capacity_util_threshold=0.0, em_refinement_rounds=0,
-        em_convergence_break=True, two_opt_refine=False,
-        sinkhorn_epsilon_init=1.0, sinkhorn_epsilon_final=0.01,
-        sinkhorn_iters=10, skip_merge_percentile=100.0,
-        expert_distill_steps=0, expert_distill_lr=1e-4,
-        expert_distill_betas=(0.9, 0.95), expert_distill_token_cap=8,
-        expert_distill_skip_singletons=True, expert_distill_plateau_steps=2,
-        expert_distill_plateau_eps=1e-4, per_layer_target={},
-        blacklist={}, artifacts_dir=tmp_path, device=None,
-    )
-    delta_legacy = adapter.compute_cost(ctx_legacy)
-
-    np.testing.assert_array_equal(delta_plugin, delta_legacy)
-    assert (ctx_plugin.get("capacity_util_value")
-            == ctx_legacy.get("capacity_util_value"))
-    assert (ctx_plugin.get("effective_cost_alignment")
-            == ctx_legacy.get("effective_cost_alignment"))
-    assert (ctx_plugin.get("effective_cost_asymmetric")
-            == ctx_legacy.get("effective_cost_asymmetric"))

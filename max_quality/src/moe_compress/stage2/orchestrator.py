@@ -383,9 +383,9 @@ def _run_assignment(plugins, ctx) -> None:
             # order (TwoOptRefinePlugin then EmRefinePlugin). The chain calls
             # EVERY enabled plugin's refine_assignment — there is no
             # dispatch_first early-return — so each refiner threads its result
-            # forward to the next. A plugin declining the slot (returns None,
-            # e.g. LegacyAdapter, which trails the chain as a dead fallback,
-            # or a refiner whose own gate is off this layer) is skipped.
+            # forward to the next. A plugin declining the slot — returning
+            # None, e.g. a refiner whose own gate is off this layer — is
+            # skipped.
             # em_rounds_done was already reset to 0 at the top of this bump
             # iteration (F1: the persisted JSON reflects the committed bump);
             # the chain below only overwrites it when EmRefinePlugin runs.
@@ -937,7 +937,6 @@ def run(
     from .plugins.capacity_gate import CapacityGatePlugin
     from .plugins.expert_distill import ExpertDistillPlugin
     from .plugins.layer_merge import LayerMergePlugin
-    from .plugins.legacy_adapter import LegacyAdapter
     from .plugins.merge_heal import MergeHealPlugin
     from .plugins.output_space_cost import OutputSpaceCostPlugin
     from .plugins.ream_cost import ReamCostPrePlugin
@@ -971,36 +970,6 @@ def run(
     # the stage-2 plugins (the `device=device` kwarg below). Readers of
     # run_ctx.get("device") must not expect a torch.device.
     run_ctx.set("device", str(device) if device is not None else "cpu")
-    adapter = LegacyAdapter(
-        s2_cfg=s2, heal_cfg=heal_cfg,
-        heal_device=_heal_device, xd_batches=xd_batches,
-        batches=batches, model=model,
-        cov_acc=cov_acc, merge_map=merge_map,
-        layer_mean_costs=_layer_mean_costs,
-        partial_dir=partial_dir,
-        max_group_cap=max_group_cap, cost_sigma=cost_sigma,
-        cost_bump_ratio=cost_bump_ratio, min_active_tokens=min_active_tokens,
-        assignment_solver=assignment_solver, cost_alignment_cfg=cost_alignment_cfg,
-        cost_output_token_cap=cost_output_token_cap, cost_whitening=cost_whitening,
-        cost_asymmetric=cost_asymmetric, cost_topk_filter=cost_topk_filter,
-        capacity_util_threshold=capacity_util_threshold,
-        em_refinement_rounds=em_refinement_rounds,
-        em_convergence_break=em_convergence_break,
-        two_opt_refine=two_opt_refine,
-        sinkhorn_epsilon_init=sinkhorn_epsilon_init,
-        sinkhorn_epsilon_final=sinkhorn_epsilon_final,
-        sinkhorn_iters=sinkhorn_iters,
-        skip_merge_percentile=skip_merge_percentile,
-        expert_distill_steps=expert_distill_steps,
-        expert_distill_lr=expert_distill_lr,
-        expert_distill_betas=expert_distill_betas,
-        expert_distill_token_cap=expert_distill_token_cap,
-        expert_distill_skip_singletons=expert_distill_skip_singletons,
-        expert_distill_plateau_steps=expert_distill_plateau_steps,
-        expert_distill_plateau_eps=expert_distill_plateau_eps,
-        per_layer_target=per_layer_target, blacklist=blacklist,
-        artifacts_dir=artifacts_dir, device=device,
-    )
     # S2-12a: the per-layer merge spine. ``LayerMergePlugin`` now owns the SIX
     # live phase hooks (on_layer_setup / on_profile / merge / post_merge /
     # write_artifacts / on_layer_teardown) that ``LegacyAdapter`` used to carry.
@@ -1023,18 +992,17 @@ def run(
         blacklist=blacklist, device=device,
     )
     # Registration order matters: ReapScoringPlugin.on_layer_setup must run
-    # BEFORE LegacyAdapter.on_layer_setup (which now reads ctx.reap_acc into
-    # _profile_layer via on_profile). ``walk_phases`` dispatches each phase to
-    # every plugin in sequence order, so listing ReapScoringPlugin first
-    # satisfies the dependency.
+    # BEFORE LayerMergePlugin.on_profile (which reads ctx.reap_acc into
+    # _profile_layer). ``walk_phases`` dispatches each phase to every plugin
+    # in sequence order, so listing ReapScoringPlugin first satisfies the
+    # dependency.
     #
     # S2-6: the three live cost plugins are registered BETWEEN ReapScoringPlugin
-    # and the adapter so they win the ``compute_cost`` ``dispatch_first`` slot
-    # over the (now-dead) ``LegacyAdapter.compute_cost`` fallback. Each is
-    # constructed with the SAME parsed cost knobs + the SAME ``cov_acc`` object
-    # the adapter received. ``registry.enabled(config)`` drops the two cost
-    # plugins whose ``is_enabled`` gate is False, leaving exactly one cost
-    # plugin (the one matching ``cost_alignment``) ahead of the adapter.
+    # and the merge spine so the enabled one wins the ``compute_cost``
+    # ``dispatch_first`` slot. Each is constructed with the SAME parsed cost
+    # knobs + the SAME ``cov_acc`` object. ``registry.enabled(config)`` drops
+    # the two cost plugins whose ``is_enabled`` gate is False, leaving exactly
+    # one cost plugin (the one matching ``cost_alignment``).
     # S2-10: the capacity-util gate moved out of the cost plugins into
     # CapacityGatePlugin (the ``select_alignment`` slot). The cost plugins no
     # longer take ``max_group_cap`` / ``capacity_util_threshold`` /
@@ -1048,19 +1016,16 @@ def run(
         cost_output_token_cap=cost_output_token_cap,
     )
     # S2-7: the skip-merge floor plugin is registered AFTER the three cost
-    # plugins and BEFORE the adapter so it wins the ``apply_cost_mask``
-    # ``dispatch_first`` slot over the (now-dead-for-<100.0) ``LegacyAdapter.
-    # apply_cost_mask`` fallback. Constructed directly from the already-parsed
-    # and range-validated ``skip_merge_percentile`` local. ``registry.enabled``
-    # drops it at the OFF sentinel (>= 100.0), leaving the adapter's sentinel
-    # branch to service the slot.
+    # plugins so it wins the ``apply_cost_mask`` ``dispatch_first`` slot.
+    # Constructed directly from the already-parsed and range-validated
+    # ``skip_merge_percentile`` local. ``registry.enabled`` drops it at the OFF
+    # sentinel (>= 100.0); with no plugin servicing the slot ``dispatch_first``
+    # returns None and ``_run_assignment`` leaves the cost matrix unmasked.
     # S2-8: the five solver plugins are registered AFTER the skip-merge floor
-    # plugin and BEFORE the adapter so the enabled one wins the
-    # ``solve_assignment`` ``dispatch_first`` slot over the (now-dead)
-    # ``LegacyAdapter.solve_assignment`` fallback. Each is constructed with the
-    # SAME parsed assignment knobs the adapter received. ``registry.enabled``
-    # gates each on ``assignment_solver``, leaving exactly one solver plugin
-    # (the one matching the configured solver) ahead of the adapter.
+    # plugin so the enabled one wins the ``solve_assignment`` ``dispatch_first``
+    # slot. Each is constructed with the SAME parsed assignment knobs.
+    # ``registry.enabled`` gates each on ``assignment_solver``, leaving exactly
+    # one solver plugin (the one matching the configured solver).
     _solver_plugin_kwargs = dict(
         max_group_cap=max_group_cap,
         assignment_solver=assignment_solver,
@@ -1091,13 +1056,11 @@ def run(
         SinkhornSolverPlugin(**_solver_plugin_kwargs),
         AutoSolverPlugin(**_solver_plugin_kwargs),
         # S2-9: the two refinement plugins are registered AFTER the solver
-        # plugins and BEFORE the adapter. refine_assignment is a CHAIN
-        # (two-opt THEN EM), so unlike the single-winner cost / mask / solve
-        # slots both may run — registry order is chain order, two-opt first.
-        # Each is constructed from the SAME parsed knobs the adapter received
-        # (notably the SAME cov_acc object). registry.enabled drops whichever
-        # refiner's gate is off; the neutered LegacyAdapter.refine_assignment
-        # trails as a dead fallback that always returns None.
+        # plugins. refine_assignment is a CHAIN (two-opt THEN EM), so unlike
+        # the single-winner cost / mask / solve slots both may run — registry
+        # order is chain order, two-opt first. Each is constructed from the
+        # SAME parsed knobs (notably the SAME cov_acc object). registry.enabled
+        # drops whichever refiner's gate is off.
         TwoOptRefinePlugin(
             two_opt_refine=two_opt_refine,
             assignment_solver=assignment_solver,
@@ -1117,24 +1080,21 @@ def run(
             sinkhorn_epsilon_final=sinkhorn_epsilon_final,
             sinkhorn_iters=sinkhorn_iters,
         ),
-        # S2-12a: the per-layer merge spine. ``LayerMergePlugin`` carries the
-        # SIX live phase hooks relocated out of ``LegacyAdapter``. It is
-        # registered IMMEDIATELY BEFORE ``adapter`` so the phase-major walk
-        # lands its hooks exactly where the adapter's used to. ``adapter`` stays
-        # in the registry this step as pure dead code (its ``name`` differs —
-        # ``legacy_adapter`` vs ``layer_merge`` — so no dup-name ValueError);
-        # the byte-identical gate proves the relocation is exact before S2-12b
-        # deletes the ``LegacyAdapter`` class.
+        # S2-12: the per-layer merge spine. ``LayerMergePlugin`` carries the
+        # SIX live phase hooks relocated out of the retired ``LegacyAdapter``
+        # (S2-12a) — its registry position is exactly where the adapter's used
+        # to be, so the phase-major walk lands its hooks unchanged. S2-12b
+        # deleted the ``LegacyAdapter`` class entirely.
         layer_merge,
-        adapter,
         # S2-11: the per-merge-group expert distillation + per-layer merge-heal
-        # plugins are registered AFTER the adapter — the LAST elements, reversed
-        # vs. the S2-6..S2-10 ordering. ``pre_merge_snapshot`` / ``merge`` /
-        # ``post_merge`` are ``walk_phases`` PHASES (every plugin's hook runs,
-        # phase-major / plugin-minor), not ``dispatch_first`` slots. These two
-        # plugins must run AFTER the adapter so ``ExpertDistillPlugin.merge``
-        # lands after ``LegacyAdapter._merge_experts_inplace`` and
-        # ``MergeHealPlugin.post_merge`` lands after ``LegacyAdapter``'s
+        # plugins are registered AFTER the merge spine — the LAST elements,
+        # reversed vs. the S2-6..S2-10 ordering. ``pre_merge_snapshot`` /
+        # ``merge`` / ``post_merge`` are ``walk_phases`` PHASES (every plugin's
+        # hook runs, phase-major / plugin-minor), not ``dispatch_first`` slots.
+        # These two plugins must run AFTER the merge spine so
+        # ``ExpertDistillPlugin.merge`` lands after
+        # ``LayerMergePlugin._merge_experts_inplace`` and
+        # ``MergeHealPlugin.post_merge`` lands after ``LayerMergePlugin``'s
         # ``bank.select`` + router resize. ``registry.enabled(config)`` drops
         # each when its gate is off (expert_distill_steps == 0 /
         # merge_heal_enabled == False) — inert by default.
