@@ -1,9 +1,5 @@
-"""Stage 3 — Non-uniform SVD factorization (plugin architecture).
-
-Scaffold stage (S3-1): run delegates to the legacy stage3_svd.run monolith.
-Plugin extraction lands in S3-2..S3-6; the real orchestrator + monolith
-deletion land in S3-7.
-"""
+"""Stage 3 — Non-uniform SVD factorization (plugin architecture)."""
 from .orchestrator import run
+from .stage import STAGE3
 
-__all__ = ["run"]
+__all__ = ["run", "STAGE3"]
