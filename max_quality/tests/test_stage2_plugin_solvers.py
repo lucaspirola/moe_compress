@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import moe_compress.stage2_reap_ream as s2
+from moe_compress.stage2 import orchestrator as s2
 from moe_compress.stage2.plugins import (
     solver_auto, solver_dispatch, solver_greedy,
     solver_hungarian, solver_mcf, solver_sinkhorn,

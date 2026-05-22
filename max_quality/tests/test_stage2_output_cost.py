@@ -27,7 +27,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from moe_compress.stage2_reap_ream import (
+from moe_compress.stage2.orchestrator import (
     _output_space_cost,
     _router_routing_weights,
     _tentative_merged_weights,

@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from moe_compress.stage2_reap_ream import (
+from moe_compress.stage2.orchestrator import (
     _assign_children_to_centroids,
     _assign_greedy,
     _assign_hungarian,
@@ -396,7 +396,7 @@ def test_mcf_handles_large_scale_costs_without_overflow():
 
 
 def test_perm_align_cache_basic_get_put():
-    from moe_compress.stage2_reap_ream import _PermAlignCache
+    from moe_compress.stage2.orchestrator import _PermAlignCache
 
     cache = _PermAlignCache()
     perm = np.array([2, 0, 1, 3])
@@ -416,7 +416,7 @@ def test_perm_align_cache_basic_get_put():
 def test_aligned_whitened_residual_zero_when_centroid_equals_aligned_child():
     """If the centroid weights exactly equal the permuted child weights, the
     residual should be 0 regardless of whitening mode."""
-    from moe_compress.stage2_reap_ream import _aligned_whitened_residual
+    from moe_compress.stage2.orchestrator import _aligned_whitened_residual
     import torch
 
     torch.manual_seed(0)
@@ -443,7 +443,7 @@ def test_aligned_whitened_residual_grows_with_perturbation():
     """Adding a small random perturbation to the child weights should produce
     a strictly positive residual that increases with perturbation magnitude.
     """
-    from moe_compress.stage2_reap_ream import _aligned_whitened_residual
+    from moe_compress.stage2.orchestrator import _aligned_whitened_residual
     import torch
 
     torch.manual_seed(1)
@@ -481,7 +481,7 @@ def test_aligned_whitened_residual_grows_with_perturbation():
 def test_aligned_whitened_residual_respects_permutation():
     """Permuting the child rows should be undone by the same permutation
     passed to the helper, yielding the original residual."""
-    from moe_compress.stage2_reap_ream import _aligned_whitened_residual
+    from moe_compress.stage2.orchestrator import _aligned_whitened_residual
     import torch
 
     torch.manual_seed(2)
@@ -517,7 +517,7 @@ def test_aligned_whitened_residual_respects_permutation():
 
 
 def test_capacity_util_gate_slack_below_threshold_returns_pre():
-    from moe_compress.stage2_reap_ream import _pick_effective_alignment
+    from moe_compress.stage2.orchestrator import _pick_effective_alignment
 
     # n_nc=2, n_c=4, cap=8 → util = 2/32 = 0.0625, below 0.25 threshold.
     result = _pick_effective_alignment(
@@ -527,7 +527,7 @@ def test_capacity_util_gate_slack_below_threshold_returns_pre():
 
 
 def test_capacity_util_gate_tight_at_or_above_threshold_returns_configured():
-    from moe_compress.stage2_reap_ream import _pick_effective_alignment
+    from moe_compress.stage2.orchestrator import _pick_effective_alignment
 
     # n_nc=12, n_c=2, cap=8 → util = 12/16 = 0.75, well above threshold.
     result = _pick_effective_alignment(
@@ -538,7 +538,7 @@ def test_capacity_util_gate_tight_at_or_above_threshold_returns_configured():
 
 def test_capacity_util_gate_uncapped_treats_as_slack():
     """max_group_cap=0 (uncapped, ablation-only path) → util=0 → SLACK."""
-    from moe_compress.stage2_reap_ream import _pick_effective_alignment
+    from moe_compress.stage2.orchestrator import _pick_effective_alignment
 
     result = _pick_effective_alignment(
         n_nc=100, n_c=10, max_group_cap=0, threshold=0.25, configured="post",
@@ -549,7 +549,7 @@ def test_capacity_util_gate_uncapped_treats_as_slack():
 def test_capacity_util_gate_configured_pre_stays_pre():
     """When the user explicitly configures 'pre', the gate should never
     upgrade to 'post' regardless of utilization."""
-    from moe_compress.stage2_reap_ream import _pick_effective_alignment
+    from moe_compress.stage2.orchestrator import _pick_effective_alignment
 
     result = _pick_effective_alignment(
         n_nc=12, n_c=2, max_group_cap=8, threshold=0.25, configured="pre",
@@ -584,7 +584,7 @@ def _make_post_alignment_test_setup(monkeypatch):
     import threading
 
     import torch
-    from moe_compress import stage2_reap_ream
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
 
     d_int, hidden = 4, 6
 
@@ -660,7 +660,7 @@ def test_asymmetric_factor_uses_freq_m_over_freq_c_plus_m(monkeypatch):
     the merged centroid). This directly verifies the freq_m/(freq_c+freq_m)
     direction — a regression to freq_c/(freq_c+freq_m) would invert the order.
     """
-    from moe_compress.stage2_reap_ream import _post_alignment_cost, _PermAlignCache
+    from moe_compress.stage2.orchestrator import _post_alignment_cost, _PermAlignCache
 
     layer_ref, ream_acc, _ = _make_post_alignment_test_setup(monkeypatch)
     perm_cache = _PermAlignCache()
@@ -702,7 +702,7 @@ def test_asymmetric_factor_uses_freq_m_over_freq_c_plus_m(monkeypatch):
 def test_asymmetric_factor_zero_when_freq_m_is_zero(monkeypatch):
     """A non-centroid with freq_m = 0 cannot wash out the centroid's identity,
     so its asymmetric cost factor should be 0 (free to absorb)."""
-    from moe_compress.stage2_reap_ream import _post_alignment_cost, _PermAlignCache
+    from moe_compress.stage2.orchestrator import _post_alignment_cost, _PermAlignCache
 
     layer_ref, ream_acc, _ = _make_post_alignment_test_setup(monkeypatch)
     perm_cache = _PermAlignCache()
@@ -730,7 +730,7 @@ def test_asymmetric_factor_zero_when_freq_m_is_zero(monkeypatch):
 def test_post_alignment_fills_top_k_only_rest_inf(monkeypatch):
     """Verify the K-prefilter: only the top-K cheapest centroids per
     non-centroid get finite costs; the rest are +inf."""
-    from moe_compress.stage2_reap_ream import _post_alignment_cost, _PermAlignCache
+    from moe_compress.stage2.orchestrator import _post_alignment_cost, _PermAlignCache
 
     layer_ref, ream_acc, _ = _make_post_alignment_test_setup(monkeypatch)
     # Set up a 3rd centroid (re-use the existing weight bank). The fake banks
@@ -760,7 +760,7 @@ def test_post_alignment_fills_top_k_only_rest_inf(monkeypatch):
 
 
 def test_post_alignment_writes_perm_cache(monkeypatch):
-    from moe_compress.stage2_reap_ream import _post_alignment_cost, _PermAlignCache
+    from moe_compress.stage2.orchestrator import _post_alignment_cost, _PermAlignCache
 
     layer_ref, ream_acc, _ = _make_post_alignment_test_setup(monkeypatch)
     perm_cache = _PermAlignCache()
@@ -789,7 +789,7 @@ def test_post_alignment_writes_perm_cache(monkeypatch):
 
 
 def test_post_alignment_topk_validation_raises_on_zero():
-    from moe_compress.stage2_reap_ream import _post_alignment_cost, _PermAlignCache
+    from moe_compress.stage2.orchestrator import _post_alignment_cost, _PermAlignCache
 
     class _DummyLayerRef:
         layer_idx = 0
@@ -813,7 +813,7 @@ def test_post_alignment_topk_validation_raises_on_zero():
 
 
 def test_post_alignment_whitening_requires_cov_acc():
-    from moe_compress.stage2_reap_ream import _post_alignment_cost, _PermAlignCache
+    from moe_compress.stage2.orchestrator import _post_alignment_cost, _PermAlignCache
 
     class _DummyLayerRef:
         layer_idx = 0
@@ -837,7 +837,7 @@ def test_post_alignment_whitening_requires_cov_acc():
 
 
 def test_post_alignment_asymmetric_requires_freq():
-    from moe_compress.stage2_reap_ream import _post_alignment_cost, _PermAlignCache
+    from moe_compress.stage2.orchestrator import _post_alignment_cost, _PermAlignCache
 
     class _DummyLayerRef:
         layer_idx = 0
@@ -874,7 +874,7 @@ def test_post_alignment_asymmetric_requires_freq():
 def test_em_zero_rounds_returns_initial_unchanged(monkeypatch):
     """em_refinement_rounds=0 must be a no-op: returns the input assignment
     and cost matrix verbatim, with rounds_completed=0."""
-    from moe_compress.stage2_reap_ream import (
+    from moe_compress.stage2.orchestrator import (
         _em_refine_assignment, _PermAlignCache,
     )
 
@@ -911,7 +911,7 @@ def test_em_pre_alignment_is_noop(monkeypatch):
     """Even with em_rounds > 0, EM must be a no-op when cost_alignment='pre'
     because the cheap symmetric cost does not depend on centroid weights —
     a tentative merge cannot change the assignment."""
-    from moe_compress.stage2_reap_ream import (
+    from moe_compress.stage2.orchestrator import (
         _em_refine_assignment, _PermAlignCache,
     )
 
@@ -947,7 +947,7 @@ def test_em_pre_alignment_is_noop(monkeypatch):
 def test_em_breaks_early_when_assignment_stable(monkeypatch):
     """If round-1's reassignment matches round-0's, EM should stop after
     round 1 (em_convergence_break=True)."""
-    from moe_compress.stage2_reap_ream import (
+    from moe_compress.stage2.orchestrator import (
         _em_refine_assignment, _PermAlignCache,
     )
 
@@ -986,7 +986,7 @@ def test_em_breaks_early_when_assignment_stable(monkeypatch):
 def test_em_runs_full_rounds_when_break_disabled(monkeypatch):
     """With em_convergence_break=False, EM should run all configured rounds
     even if the assignment stabilizes earlier."""
-    from moe_compress.stage2_reap_ream import (
+    from moe_compress.stage2.orchestrator import (
         _em_refine_assignment, _PermAlignCache,
     )
 
@@ -1021,7 +1021,7 @@ def test_em_singleton_only_skips_immediately(monkeypatch):
     """If every group is a singleton (no non-centroid assigned), the
     tentative-merge step has nothing to do; rounds_completed must be 0
     and the early break must fire on the first iteration."""
-    from moe_compress.stage2_reap_ream import (
+    from moe_compress.stage2.orchestrator import (
         _em_refine_assignment, _PermAlignCache,
     )
 
@@ -1056,7 +1056,7 @@ def test_em_singleton_only_skips_immediately(monkeypatch):
 def test_em_compute_tentative_weights_singleton_skipped(monkeypatch):
     """A singleton group (centroid only, no absorbed members) must not
     appear in the tentative-weights output."""
-    from moe_compress.stage2_reap_ream import (
+    from moe_compress.stage2.orchestrator import (
         _em_compute_tentative_weights, _PermAlignCache,
     )
 
@@ -1075,7 +1075,7 @@ def test_em_compute_tentative_weights_singleton_skipped(monkeypatch):
 def test_em_compute_tentative_weights_freq_weighted_average(monkeypatch):
     """For a 2-member group, the tentative weight must be the freq-weighted
     average of centroid and member (after permutation alignment)."""
-    from moe_compress.stage2_reap_ream import (
+    from moe_compress.stage2.orchestrator import (
         _em_compute_tentative_weights, _PermAlignCache,
     )
     import torch
@@ -1111,7 +1111,7 @@ def test_em_compute_tentative_weights_freq_weighted_average(monkeypatch):
 def test_em_rounds_completed_persisted_in_partial_json(tmp_path, monkeypatch):
     """The em_rounds_completed field must round-trip through the partial
     JSON write path (spec § 12.1 schema bump 1→2 reserved this field)."""
-    from moe_compress.stage2_reap_ream import _write_merge_json
+    from moe_compress.stage2.orchestrator import _write_merge_json
     import json
 
     _write_merge_json(
@@ -1145,7 +1145,7 @@ def test_config_rejects_asymmetric_without_freq_weighted_merge(tmp_path, monkeyp
     the merge weight; running asymmetric cost with non-freq-weighted merge
     silently drives the assignment in a direction the merge formula doesn't
     follow."""
-    from moe_compress import stage2_reap_ream
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
 
     bad_config = {
         "stage2_reap_ream": {
@@ -1207,7 +1207,7 @@ def test_summarize_distill_state_empty_returns_empty_dict():
     """When distill_state is None or empty, the helper returns {} so the
     per-layer Trackio emit naturally omits the four `stage2/distill_*` keys
     on layers where distillation didn't run (singleton-only or disabled)."""
-    from moe_compress.stage2_reap_ream import _summarize_distill_state
+    from moe_compress.stage2.orchestrator import _summarize_distill_state
 
     assert _summarize_distill_state(None) == {}
     assert _summarize_distill_state({}) == {}
@@ -1216,7 +1216,7 @@ def test_summarize_distill_state_empty_returns_empty_dict():
 def test_summarize_distill_state_skips_trivial_groups():
     """Groups marked ``{"steps": 0, "skip": "trivial"}`` (singleton or
     zero-steps no-op) must not pollute the means."""
-    from moe_compress.stage2_reap_ream import _summarize_distill_state
+    from moe_compress.stage2.orchestrator import _summarize_distill_state
 
     state = {
         0: {"steps": 0, "skip": "trivial"},
@@ -1236,7 +1236,7 @@ def test_summarize_distill_state_skips_trivial_groups():
 def test_summarize_distill_state_aggregates_real_groups():
     """Aggregate count, mean final_loss, mean steps, plateau-break count
     across non-trivial groups."""
-    from moe_compress.stage2_reap_ream import _summarize_distill_state
+    from moe_compress.stage2.orchestrator import _summarize_distill_state
 
     state = {
         0: {"steps": 100, "final_loss": 0.10, "initial_loss": 1.0, "break_reason": "plateau"},
@@ -1269,7 +1269,7 @@ def _captured_trackio_emits(monkeypatch):
     ``_trackio_log``, imported into that module's own binding), while the
     static config emit still lives in ``stage2_reap_ream``. Patching only one
     namespace would silently miss the other code path."""
-    from moe_compress import stage2_reap_ream
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
     from moe_compress.stage2.plugins import layer_merge
     captured: list[dict] = []
 
@@ -1318,7 +1318,7 @@ def _patch_calib_and_save(monkeypatch):
     Stage 1) can run end-to-end on the synthetic _TinyModel without hitting
     HuggingFace or writing a real checkpoint."""
     import torch
-    from moe_compress import stage2_reap_ream
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
     from moe_compress.utils import calibration as cal_mod
     from moe_compress.utils import model_io as mio
     from pathlib import Path
@@ -1365,7 +1365,7 @@ def test_trackio_emits_v2_config_keys_once_at_start(
     config flag under the ``stage2/config/*`` namespace. Stubs out the
     per-layer loop via empty iter_moe_layers so this test exercises only
     the config emit path."""
-    from moe_compress import stage2_reap_ream
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
     _patch_calib_and_save(monkeypatch)
     monkeypatch.setattr(
         stage2_reap_ream, "load_json_artifact",
@@ -1428,7 +1428,7 @@ def test_trackio_v1_and_v2_per_layer_keys_present(
     """Combined regression guard + v2-coverage test: with v2 flags ON, the
     per-layer emit must carry both the legacy v1 key set (no renames /
     removals) AND the new v2 keys with expected types."""
-    from moe_compress import stage2_reap_ream
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
     _patch_calib_and_save(monkeypatch)
 
     cfg = _enable_v2_flags_for_telemetry(tiny_config)
@@ -1475,7 +1475,7 @@ def test_trackio_distill_keys_absent_when_distillation_disabled(
     """When ``expert_distill_steps == 0``, the four ``stage2/distill_*``
     keys must NOT appear on the per-layer emit. Avoids dashboard noise
     from runs that don't use the feature."""
-    from moe_compress import stage2_reap_ream
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
     _patch_calib_and_save(monkeypatch)
 
     cfg = _enable_v2_flags_for_telemetry(tiny_config, distill_steps=0)

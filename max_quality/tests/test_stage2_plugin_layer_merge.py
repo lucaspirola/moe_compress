@@ -44,7 +44,7 @@ def _build_plugin(tiny_config, tmp_path, *, expert_distill_steps=0,
     """Construct a ``LayerMergePlugin`` with the trimmed knob set its
     ``__init__`` requires — the same superset the orchestrator passes."""
     s2 = tiny_config["stage2_reap_ream"]
-    from moe_compress import stage2_reap_ream as _srr
+    from moe_compress.stage2 import orchestrator as _srr
     return LayerMergePlugin(
         s2_cfg=s2, heal_cfg=_srr._HealConfig(s2),
         batches=[], model=None,

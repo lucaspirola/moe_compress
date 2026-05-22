@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from moe_compress import stage1, stage2_reap_ream
+from moe_compress import stage1
+from moe_compress.stage2 import orchestrator as stage2_reap_ream
 from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.utils.model_io import iter_moe_layers
 

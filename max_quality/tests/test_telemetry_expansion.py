@@ -50,7 +50,8 @@ def _patched_calib(monkeypatch):
     network."""
     from moe_compress.utils import calibration as cal_mod
     from moe_compress.utils import model_io as mio
-    from moe_compress import stage2_reap_ream, stage5_router_kd
+    from moe_compress import stage5_router_kd
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
 
     def _fake_build(tokenizer, spec, cache_dir=None):
         torch.manual_seed(spec.seed)
@@ -79,9 +80,10 @@ def _captured_emits(monkeypatch):
         captured.append(dict(metrics))
 
     from moe_compress import (
-        run_pipeline, stage2_reap_ream, stage3_svd,
+        run_pipeline, stage3_svd,
         stage4_eora, stage5_router_kd, stage6_validate,
     )
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
     # The plugin-based Stage 1 emits Trackio telemetry from three modules
     # (orchestrator + the grape_merge / ma_detection plugins), replacing the
     # single stage1_grape monolith.
@@ -210,7 +212,7 @@ def test_stage4_summarize_distill_helper_present_for_consistency():
     helper-naming reference for aggregation patterns) is still importable.
     Stage 4 doesn't aggregate the same way, but this guards against
     accidental removal of the precedent."""
-    from moe_compress.stage2_reap_ream import _summarize_distill_state
+    from moe_compress.stage2.orchestrator import _summarize_distill_state
     assert callable(_summarize_distill_state)
 
 

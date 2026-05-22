@@ -138,7 +138,6 @@ def _solve_for_plugin(plugin, ctx, delta):
     """Shared solve_assignment slot body — verbatim lift of
     LegacyAdapter.solve_assignment. Assumes `plugin` survived
     registry.enabled(), so plugin.assignment_solver == config.assignment_solver."""
-    from ...stage2_reap_ream import _assign_children_to_centroids
     n_ream_nc = ctx.get("_iter_n_ream_nc")
     n_ream_c = ctx.get("_iter_n_ream_c")
     return _assign_children_to_centroids(

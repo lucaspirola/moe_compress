@@ -350,7 +350,7 @@ def test_merge_repair_with_logits_cache_fails_loud(tiny_model, tiny_config, tmp_
                                                    monkeypatch):
     """`run()` must refuse merge_repair when a vocab-logits cache is set: the
     cache has no per-layer hidden states, so the MSE term is impossible."""
-    from moe_compress import stage2_reap_ream
+    from moe_compress import stage2
     from moe_compress.utils import model_io as mio
 
     # Build a real (trivial) teacher-logits cache so the cache branch in run()

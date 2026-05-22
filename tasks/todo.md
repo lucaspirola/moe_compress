@@ -49,7 +49,8 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S2-12a Introduce LayerMergePlugin (6 live hooks), wire live, neuter LegacyAdapter
 - [x] S2-12b+c Delete legacy_adapter.py + remove orchestrator refs + retarget 12 test files
 - [x] S2-13a Expose STAGE2 Stage object (stage2/stage.py) + __init__ exports + tests
-- [ ] S2-13b Rewire run_pipeline.py to stage2 pkg + delete stage2_reap_ream.py monolith + rewrite stage2_plugin_guide.md
+- [x] S2-13b Rewire run_pipeline.py to stage2 pkg + delete stage2_reap_ream.py monolith (19 test files retargeted)
+- [ ] S2-13c Rewrite stage2_plugin_guide.md for the final S2-12/S2-13 architecture
 
 ## Stage 3 — SVD (Part 5.1)
 - [ ] S3-0  Capture stage-3 golden

@@ -191,13 +191,13 @@ class LayerMergePlugin:
 
         Verbatim slice of lines 728–737 of stage2_reap_ream.run() (pre-T6).
         """
-        # Look up ``_profile_layer`` via the stage2_reap_ream namespace so
+        # Look up ``_profile_layer`` via the stage2.orchestrator namespace so
         # existing tests (e.g. test_smoke_stage2_resume.py) that
-        # ``monkeypatch.setattr(stage2_reap_ream, "_profile_layer", ...)``
+        # ``monkeypatch.setattr(stage2.orchestrator, "_profile_layer", ...)``
         # still take effect through the pipeline path. The plain
         # module-level import would bind the symbol at import time and
         # bypass the monkey-patch.
-        from ... import stage2_reap_ream as _srr
+        from .. import orchestrator as _srr
         layer_ref = ctx.get("layer_ref")
         _srr._profile_layer(
             self.model, layer_ref, self.batches,
@@ -293,7 +293,7 @@ class LayerMergePlugin:
         orchestrator and inherited by the layer child); it is ``None`` in
         no-resume mode.
         """
-        from ...stage2_reap_ream import _summarize_distill_state
+        from .merge_heal import _summarize_distill_state
 
         partial_dir = ctx.get("partial_dir")
         layer_ref = ctx.get("layer_ref")

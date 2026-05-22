@@ -18,7 +18,6 @@ import pytest
 import torch
 
 from moe_compress import stage1
-from moe_compress import stage2_reap_ream as _stage2_monolith
 from moe_compress.stage2 import orchestrator as stage2_reap_ream
 from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.pipeline.context import PipelineContext
@@ -645,10 +644,10 @@ def test_stage2_pipeline_path_handles_resume(tiny_model, patched_stage2,
     assert len(moe_layers) >= 2, "Need at least 2 MoE layers for this test"
 
     # First run: crash after layer 0 fully processed.
-    # ``_profile_layer`` is dispatched by ``LayerMergePlugin.on_profile`` via
-    # the ``moe_compress.stage2_reap_ream`` namespace (so monkeypatching is
-    # observable) — patch that module, not the slim orchestrator.
-    original_profile = _stage2_monolith._profile_layer
+    # ``_profile_layer`` is dispatched by ``LayerMergePlugin.on_profile`` via a
+    # late ``from .. import orchestrator`` lookup, so patching it on the
+    # orchestrator module is observable inside the running merge.
+    original_profile = stage2_reap_ream._profile_layer
     call_count = [0]
 
     def _crashing_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs):
@@ -657,14 +656,14 @@ def test_stage2_pipeline_path_handles_resume(tiny_model, patched_stage2,
             raise RuntimeError("simulated crash after layer 0")
         return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs)
 
-    monkeypatch.setattr(_stage2_monolith, "_profile_layer", _crashing_profile)
+    monkeypatch.setattr(stage2_reap_ream, "_profile_layer", _crashing_profile)
     with pytest.raises(RuntimeError, match="simulated crash"):
         stage2_reap_ream.run(tiny_model, _TinyTokenizer(), patched_stage2,
                              tmp_path, device=None)
 
     # Restore profile, restart from the pre-stage-2 snapshot (the in-memory
     # `tiny_model` has been partially mutated by the crashed run).
-    monkeypatch.setattr(_stage2_monolith, "_profile_layer", original_profile)
+    monkeypatch.setattr(stage2_reap_ream, "_profile_layer", original_profile)
     resume_model = copy.deepcopy(pre_s2)
     stage2_reap_ream.run(resume_model, _TinyTokenizer(), patched_stage2,
                          tmp_path, device=None)

@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from moe_compress.stage2_reap_ream import _extract_sim_expert_matrix_from_tensor
+from moe_compress.stage2.orchestrator import _extract_sim_expert_matrix_from_tensor
 
 
 # ---------------------------------------------------------------------------

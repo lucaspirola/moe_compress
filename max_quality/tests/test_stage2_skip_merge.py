@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from moe_compress.stage2_reap_ream import (
+from moe_compress.stage2.orchestrator import (
     _apply_skip_merge_floor,
     _assign_children_to_centroids,
     _assign_sinkhorn,

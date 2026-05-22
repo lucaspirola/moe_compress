@@ -33,7 +33,7 @@ import yaml
 from .budget import solver as budget_solver
 from . import (
     stage1,
-    stage2_reap_ream,
+    stage2,
     stage3_svd,
     stage4_eora,
     stage5_router_kd,
@@ -102,7 +102,7 @@ def main(argv=None) -> int:
     # and load the cached model. Saves the ~80-min Stage 2 re-profile after
     # a downstream-stage failure (e.g., Stage 2.5 deps missing, eval crash).
     # --no-resume defeats this and forces a full Stage 2 re-run, matching
-    # stage2_reap_ream.run's own _stage2_partial/ cleanup semantics.
+    # stage2.run's own _stage2_partial/ cleanup semantics.
     skip_stage2 = False
     skip_stage25 = False
     stage2_resume_dir: Path | None = None
@@ -195,8 +195,8 @@ def main(argv=None) -> int:
         if not skip_stage2:
             log.info("=== Stage 2 — REAP + REAM ===")
             t2 = time.monotonic()
-            stage2_reap_ream.run(model, tokenizer, config, artifacts_dir, device=device,
-                                 no_resume=args.no_resume)
+            stage2.run(model, tokenizer, config, artifacts_dir, device=device,
+                       no_resume=args.no_resume)
             repo2 = upload_stage_to_hub(2, artifacts_dir, repo_base=hub_base) if hub_base else None
             _finish_stage(2, t2, repo2)
 
