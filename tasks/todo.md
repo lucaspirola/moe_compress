@@ -87,7 +87,7 @@ stage golden snapshot, not a speculative standalone test.
 
 ## Stage 6 — validation (Part 5.4)
 - [x] S6-0  Capture stage-6 golden — test_stage6_golden_snapshot.py (stage6_eval.json byte-identical; all evals disabled + teacher cache-hit forced → integer/bool-only artifact)
-- [ ] S6-1  Scaffold stage6/ package
+- [x] S6-1  Scaffold stage6/ package — __init__/context/orchestrator + plugins/; orchestrator delegates to legacy stage6_validate.run + test_stage6_scaffold.py
 - [ ] S6-2  eval_environment plugin
 - [ ] S6-3  wikitext_ppl + zero_shot_lm_eval plugins
 - [ ] S6-4  humaneval + math500 plugins
