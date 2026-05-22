@@ -27,6 +27,15 @@ Holds:
   optional-SymPy guard, plus ``Math500Plugin`` with an ``is_enabled`` gated on
   ``stage6_validate.generative.enabled`` AND a ``math500`` sub-key and an inert
   ``eval_task`` hook).
+* ``teacher_provider.py`` (added by S6-5 — the Stage 6 teacher-provider
+  concern: the relocated ``TEACHER_CACHE_FORMAT_VERSION`` constant +
+  ``_safe_pkg_version`` / ``_teacher_cache_key`` / ``_load_teacher_cache`` /
+  ``_save_teacher_cache`` / ``_preload_teacher_to_cpu`` helpers plus
+  ``TeacherProviderPlugin`` with an unconditional ``is_enabled`` and an inert
+  ``provide_teacher_side`` hook that reproduces the monolith's teacher-side
+  eval block — cache-hit shortcut, preload-thread join, kernel-patch +
+  experts-impl shim, the four conditional teacher-side eval calls, cache
+  save).
 
 The Stage 6 validation algorithm — WikiText-2 PPL, zero-shot (ARC-C,
 HellaSwag), generative (HumanEval, MATH-500), imatrix pipeline, and threshold

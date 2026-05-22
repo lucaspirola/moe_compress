@@ -54,9 +54,6 @@ identical to the batch_size=1 baseline.
 """
 from __future__ import annotations
 
-import hashlib
-import importlib.metadata as _md
-import json
 import logging
 import math
 import os
@@ -143,6 +140,23 @@ from .stage6.plugins.math500 import (  # noqa: F401
     _math_fallback_extract,
 )
 
+# S6-5: teacher-eval-cache machinery (cache key + format version + load/save +
+# the CPU preload helper) relocated to stage6/plugins/teacher_provider.
+# Re-imported so run() and external callers/tests (e.g.
+# test_teacher_eval_cache_key_invariant) keep their stage6_validate import
+# paths. These are the Pattern-A relocated symbols; the teacher-side eval
+# block in run() is NOT modified (S6-5 is mixed Pattern A + Pattern B; the
+# Pattern-B teacher-side hook is reproduced in the plugin module and stays
+# INERT until S6-8 deletes run()).
+from .stage6.plugins.teacher_provider import (  # noqa: F401
+    TEACHER_CACHE_FORMAT_VERSION,
+    _safe_pkg_version,
+    _teacher_cache_key,
+    _load_teacher_cache,
+    _save_teacher_cache,
+    _preload_teacher_to_cpu,
+)
+
 # F-C-H-1: Spec F-S-M-1 mandates eager attention for both teacher and student
 # during the Stage 6 gate run. Constant — never override at call sites.
 _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
@@ -154,190 +168,14 @@ _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 _EVAL_TEXT_CONCAT_FILENAME: str = "eval_text_concat.txt"
 
 
-# ---------------------------------------------------------------------------
-# Teacher eval caching (Optimization #7)
-# ---------------------------------------------------------------------------
-
-# F-iter4-LOW-5: bump this whenever the cache file schema changes. _load_teacher_cache
-# rejects (and triggers re-evaluation) when the on-disk version does not match.
-TEACHER_CACHE_FORMAT_VERSION: int = 1
-
-
-def _safe_pkg_version(name: str) -> str:
-    """Return importlib.metadata.version(name) or 'unknown' if not installed.
-
-    Avoids hard-failing the cache key when an optional package isn't installed
-    (e.g. lm-eval missing in a smoke environment).
-    """
-    try:
-        return _md.version(name)
-    except Exception:  # noqa: BLE001
-        return "unknown"
-
-
-def _teacher_cache_key(config: dict) -> str:
-    """Compute a deterministic SHA-256 cache key from the 9 spec-mandated components.
-
-    Per spec F-S-H-3, the cache key MUST cover every input that can change the
-    teacher's evaluation numbers, so a stale cache cannot mask a meaningful
-    config change.
-
-    Components (sorted-keys JSON, no whitespace):
-      1. model_name              — config.model.name_or_path
-      2. model_revision          — config.model.revision (default "main")
-      3. tokenizer_revision      — config.model.tokenizer_revision (default model_revision)
-      4. dataset_revisions       — canonical sorted-keys mapping from config
-      5. lm_eval_version         — importlib.metadata.version("lm-eval")
-      6. transformers_version    — importlib.metadata.version("transformers")
-      7. dtype                   — config.model.torch_dtype
-      8. attn_impl               — pinned to "eager" per F-S-M-1
-      9. eval_config_subset      — wikitext2 + zero_shot + generative subdicts
-    """
-    s6 = config["stage6_validate"]
-    model_cfg = config["model"]
-    model_revision = model_cfg.get("revision") or "main"
-    tokenizer_revision = model_cfg.get("tokenizer_revision") or model_revision
-    dataset_revisions = _resolve_dataset_revisions(config)
-    # F-iter4-NIT-3: explicitly canonicalize dataset_revisions to a sorted-keys
-    # JSON string; do not rely solely on the outer json.dumps(..., sort_keys=)
-    # for nested-dict canonicalization (sort_keys recurses but specifying it
-    # explicitly here documents the contract — Spec §9 line 816 states the
-    # mapping is "JSON-canonicalized ... with sorted keys before concatenation").
-    dataset_revisions_canonical = json.dumps(
-        dataset_revisions, sort_keys=True, separators=(",", ":"),
-    )
-    # F-iter4-HIGH-1: fold the lm-eval task list (and any per-task config we
-    # configure here) into the cache key so the cache invalidates if the
-    # lm-eval task set changes — even when we cannot pin per-dataset SHAs.
-    lm_eval_task_config = {
-        "tasks": list(s6.get("zero_shot", {}).get("tasks", [])),
-        "lm_eval_batch_size": s6.get("lm_eval_batch_size"),
-    }
-    lm_eval_task_config_hash = hashlib.sha256(
-        json.dumps(lm_eval_task_config, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    payload = {
-        "model_name": model_cfg["name_or_path"],
-        "model_revision": model_revision,
-        "tokenizer_revision": tokenizer_revision,
-        "dataset_revisions_canonical": dataset_revisions_canonical,
-        "lm_eval_version": _safe_pkg_version("lm-eval"),
-        "lm_eval_task_config_hash": lm_eval_task_config_hash,
-        "transformers_version": _safe_pkg_version("transformers"),
-        "dtype": str(model_cfg.get("torch_dtype", "bfloat16")),
-        "attn_impl": _STAGE6_ATTN_IMPLEMENTATION,
-        "eval_config_subset": {
-            "wikitext2": s6.get("wikitext2", {}),
-            "zero_shot": s6.get("zero_shot", {}),
-            "generative": s6.get("generative", {}),
-        },
-    }
-    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(blob).hexdigest()
-
-
-def _load_teacher_cache(cache_path: Path, cache_key: str) -> dict | None:
-    """Load cached teacher eval results if they exist and the key matches.
-
-    Returns a dict with keys "results" and optionally "param_counts", or None.
-    """
-    if not cache_path.exists():
-        return None
-    try:
-        data = json.loads(cache_path.read_text())
-        # F-iter4-LOW-5: reject mismatched schema versions so a stale cache
-        # written by an older format never silently feeds wrong values.
-        on_disk_version = data.get("format_version")
-        if on_disk_version is not None and on_disk_version != TEACHER_CACHE_FORMAT_VERSION:
-            log.warning(
-                "Teacher cache format_version mismatch (expected %d, found %r) — "
-                "re-evaluating.",
-                TEACHER_CACHE_FORMAT_VERSION, on_disk_version,
-            )
-            return None
-        if data.get("cache_key") != cache_key:
-            log.info("Teacher cache key mismatch (expected %s, found %s) — re-evaluating.",
-                     cache_key, data.get("cache_key"))
-            return None
-        # F-CR2-N-2: prefer .get() with explicit None check + a precise warning
-        # message over relying on a broad except KeyError.
-        teacher_results = data.get("teacher_results")
-        if teacher_results is None:
-            log.warning(
-                "Teacher cache invalid: 'teacher_results' key missing from cache file %s "
-                "— re-evaluating.",
-                cache_path,
-            )
-            return None
-        param_counts = data.get("teacher_param_counts")
-        if param_counts is None:
-            log.warning(
-                "Teacher eval cache HIT (%s) but cache lacks 'teacher_param_counts' "
-                "(legacy cache file). _measured_reduction will load the teacher model "
-                "from scratch to count parameters — this may take several minutes.",
-                cache_key,
-            )
-        else:
-            log.info("Teacher eval cache HIT (%s) — skipping teacher load+eval entirely.", cache_key)
-        return {
-            "results": teacher_results,
-            "param_counts": param_counts,
-        }
-    except (json.JSONDecodeError, TypeError) as exc:
-        log.warning("Teacher cache corrupted (%s) — re-evaluating.", exc)
-        return None
-
-
-def _save_teacher_cache(
-    cache_path: Path, cache_key: str, teacher_results: dict,
-    *, teacher_param_counts: dict | None = None,
-) -> None:
-    """Save teacher eval results + param counts to cache file (atomic write)."""
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    data = {
-        "cache_key": cache_key,
-        "teacher_results": teacher_results,
-    }
-    if teacher_param_counts is not None:
-        data["teacher_param_counts"] = teacher_param_counts
-    # F-iter4-LOW-5: stamp a format_version so a future schema bump can be
-    # detected at load time (see _load_teacher_cache).
-    data["format_version"] = TEACHER_CACHE_FORMAT_VERSION
-    # F-iter4-LOW-1: use the same `<file>.<ext>.tmp` convention as
-    # _atomic_write_text (e.g. "teacher_eval_cache.json.tmp"); the previous
-    # `.with_suffix(".tmp")` produced "teacher_eval_cache.tmp" which dropped
-    # the .json extension and made temp files harder to identify.
-    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    # F-3: Split the try/except into two blocks so that a parent-dir fsync
-    # failure after a successful os.replace does not cause a misleading re-raise.
-    # After os.replace the cache file is durably on disk; the parent fsync is a
-    # belt-and-suspenders flush and its failure should not invalidate the write.
-    try:
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        # F-CR2-N-1: open read-only solely to fsync — no bytes are written here.
-        fd = os.open(str(tmp), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, cache_path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-    # Parent-dir fsync: best-effort only — file is already on disk after os.replace.
-    try:
-        parent_fd = os.open(str(cache_path.parent), os.O_RDONLY)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
-    except Exception as _fsync_exc:
-        log.debug(
-            "_save_teacher_cache: parent-dir fsync failed (%s); "
-            "cache file was already written by os.replace — continuing.",
-            _fsync_exc,
-        )
-    log.info("Teacher eval cache saved → %s (key=%s)", cache_path, cache_key)
+# S6-5: teacher-eval-cache machinery (TEACHER_CACHE_FORMAT_VERSION constant +
+# _safe_pkg_version / _teacher_cache_key / _load_teacher_cache /
+# _save_teacher_cache / _preload_teacher_to_cpu) relocated to
+# stage6/plugins/teacher_provider — re-imported in the S6-5 ``# noqa: F401``
+# block near the top of this module. The teacher-side INLINE block in run()
+# is intentionally UNCHANGED at S6-5 (Pattern B is reproduced in the plugin's
+# inert ``provide_teacher_side`` hook; the monolith run() owns the live code
+# until S6-8).
 
 
 # ---------------------------------------------------------------------------
@@ -904,47 +742,6 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
             {k: v for k, v in _bool_checks.items() if not v},
         )
     return path
-
-
-# ---------------------------------------------------------------------------
-# Teacher preload (Optimization #6)
-# ---------------------------------------------------------------------------
-
-def _preload_teacher_to_cpu(config: dict, result_q: queue.Queue) -> None:
-    """Load teacher model weights to CPU RAM in a background thread."""
-    # H2: 4-bit quantisation requires CUDA; skip CPU preload to avoid guaranteed crash.
-    if config.get("model", {}).get("load_in_4bit", False):
-        log.warning(
-            "_preload_teacher_to_cpu: skipping CPU preload because load_in_4bit=True requires CUDA"
-        )
-        return  # get_nowait() will return None → main thread does direct load
-    try:
-        # F-C-H-1: attn_implementation="eager" pinned per Spec F-S-M-1.
-        log.info(
-            "Teacher preload: loading %s to CPU (attn_implementation=%r forced per spec F-S-M-1)...",
-            config["model"]["name_or_path"], _STAGE6_ATTN_IMPLEMENTATION,
-        )
-        t0 = time.monotonic()
-        teacher, _ = load_model(
-            config["model"]["name_or_path"],
-            revision=config["model"].get("revision", "main"),
-            torch_dtype=config["model"]["torch_dtype"],
-            device_map="cpu",
-            attn_implementation=_STAGE6_ATTN_IMPLEMENTATION,
-            load_in_4bit=config["model"].get("load_in_4bit", False),
-            trust_remote_code=config["model"].get("trust_remote_code", False),
-        )
-        dt = time.monotonic() - t0
-        # M4: Log "complete" before put_nowait so this message only fires when
-        # the teacher was successfully loaded; if put_nowait fails the load was
-        # still successful but the result won't be available to the main thread.
-        log.info("Teacher preload complete in %.1fs (on CPU)", dt)
-        try:
-            result_q.put_nowait(teacher)
-        except Exception as exc:
-            log.debug("_preload_teacher_to_cpu: put_nowait failed (%s); main thread will load directly", exc)
-    except Exception as exc:
-        log.warning("Teacher preload failed (%s) — will fall back to direct load", exc)
 
 
 # ---------------------------------------------------------------------------
