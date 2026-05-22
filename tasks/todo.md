@@ -75,7 +75,7 @@ stage golden snapshot, not a speculative standalone test.
 
 ## Router-KD — stages 2.5 ≡ 5 (Part 5.3)
 - [x] RK-0  Capture router-KD goldens ×2 — test_router_kd_golden_snapshot.py (stage2p5+stage5; metadata+loss-trace)
-- [ ] RK-1  Scaffold router_kd/ package
+- [x] RK-1  Scaffold router_kd/ package — __init__/context/orchestrator/plugins + make_router_kd_stage factory
 - [ ] RK-2  trainable_scope plugin
 - [ ] RK-3  kd_optimizer plugin
 - [ ] RK-4  vocab_kd plugin
