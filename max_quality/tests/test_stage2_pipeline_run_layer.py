@@ -228,6 +228,20 @@ def test_phases_tuple_matches_t6_canonical_order():
     )
 
 
+def test_orchestrator_run_returns_path(tiny_model, patched_stage2, tmp_path):
+    """``orchestrator.run`` returns a ``Path`` equal to the ``stage2_pruned``
+    output dir — the contract ``STAGE2.run`` writes onto the ctx slot."""
+    _run_stage1(tiny_model, patched_stage2, tmp_path)
+
+    result = stage2_reap_ream.run(
+        tiny_model, _TinyTokenizer(), patched_stage2, tmp_path,
+        device=None, no_resume=True,
+    )
+    assert isinstance(result, Path)
+    assert result == tmp_path / "stage2_pruned"
+    assert result.is_dir()
+
+
 def test_write_artifacts_reads_partial_dir_from_context(tmp_path):
     """write_artifacts reads partial_dir off the per-layer context slot.
 
