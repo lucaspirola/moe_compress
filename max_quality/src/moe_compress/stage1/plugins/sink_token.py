@@ -32,7 +32,7 @@ The plugin's ``writes`` field is ``("sink_acc", "candidate_bag")`` —
 reason — see `tasks/refactor_stage1/subtask_8_plan.md` §2.4 for the
 rationale on extending ``run`` to own the candidate-add step.
 
-The plugin's ``accumulators`` field is ``("sink_routing",)`` — declarative
+The plugin's ``provides`` field is ``("sink_routing",)`` — declarative
 metadata advertising that Phase B needs the sink-routing accumulator. The
 string label is conceptual in sub-task 7 (no consumer wires it); sub-task
 10's orchestrator translates it to a :class:`HookSpec` declaring
@@ -44,7 +44,6 @@ from __future__ import annotations
 import logging
 
 from .._framework.candidates import CandidateBag
-from .._framework.plugin import StagePlugin  # noqa: F401  (Protocol import for type-checkers)
 from .._framework.safe_json import safe_float
 from ...utils.sink_token_routing import (
     SinkTokenRoutingAccumulator,
@@ -108,7 +107,7 @@ class SinkTokenDetectorPlugin:
     # 7; sub-task 10's orchestrator translates it to a CalibrationEngine
     # HookSpec declaring HookKind.ROUTER_LOGITS_PER_BATCH +
     # HookKind.INPUT_IDS_PER_BATCH.
-    accumulators: tuple[str, ...] = ("sink_routing",)
+    provides: tuple[str, ...] = ("sink_routing",)
 
     def is_enabled(self, config: dict) -> bool:
         """Read ``config["stage1_grape"]["super_expert_detection"]["sink_token_enabled"]``;
@@ -139,7 +138,7 @@ class SinkTokenDetectorPlugin:
         ``sink_acc.finalize()``; the plugin's :meth:`contribute_artifact`
         then reads the finalized per-(l, e) dicts.
 
-        Not on the ``StagePlugin`` Protocol — see sub-task 7 plan §2.4.
+        Not on the ``PipelinePlugin`` Protocol — see sub-task 7 plan §2.4.
         Sub-task 10 introduces a ``SetupCapablePlugin`` Protocol subtype
         (or an opt-in registry method) when more plugins need a pre-Phase-B
         setup step.

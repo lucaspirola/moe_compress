@@ -36,7 +36,6 @@ from pathlib import Path
 
 import torch
 
-from .._framework.plugin import StagePlugin  # noqa: F401  (Protocol import for type-checkers)
 from ...utils.activation_hooks import instrument_experts
 from ...utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from ...utils.model_io import iter_moe_layers, save_json_artifact
@@ -94,7 +93,7 @@ class AblationFilterPlugin:
     )
     # Phase D runs its own dedicated ablation forward pass (one per candidate);
     # it does not consume any shared accumulator from Phase B.
-    accumulators: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
     def is_enabled(self, config: dict) -> bool:
         """Read ``config["stage1_grape"]["ablation_filter"]["enabled"]``; default True.

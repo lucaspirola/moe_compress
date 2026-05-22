@@ -11,7 +11,7 @@ rule, same first-layer Q99 absolute-outlier check, same 0.75-depth
 fallback when L is empty. Verified via the golden snapshot test (the
 ``dual_signal`` block of ``stage1_blacklist.json``).
 
-Phase A runs its OWN dedicated calibration pass — ``accumulators`` is
+Phase A runs its OWN dedicated calibration pass — ``provides`` is
 empty. It cannot use the shared ``CalibrationEngine`` because it hooks
 whole decoder-layer / MoE-block module outputs, not the per-expert
 channels the engine wires (see subtask_9_plan.md §2.2).
@@ -24,7 +24,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .._framework.plugin import StagePlugin  # noqa: F401  (Protocol import for type-checkers)
 from .._framework.safe_json import safe_float
 from ...utils.activation_hooks import run_calibration_early_exit
 from ...utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
@@ -64,7 +63,7 @@ class MADetectionPlugin:
 
     Mandatory — :meth:`is_enabled` returns ``True`` unconditionally
     (Phase A always runs; there is no flag). Runs its own dedicated
-    early-exit calibration pass; ``accumulators`` is empty.
+    early-exit calibration pass; ``provides`` is empty.
 
     Reads ``model`` / ``tokenizer`` / ``config`` / ``artifacts_dir`` /
     ``device`` from the context; writes the four Phase-A outputs:
@@ -89,7 +88,7 @@ class MADetectionPlugin:
     # Phase A runs its OWN dedicated early-exit forward pass — it does not
     # consume any shared accumulator from Phase B's CalibrationEngine. See
     # subtask_9_plan.md §2.2 for why the hook semantics differ.
-    accumulators: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
     def is_enabled(self, config: dict) -> bool:
         """Mandatory — Phase A always runs. There is no flag."""

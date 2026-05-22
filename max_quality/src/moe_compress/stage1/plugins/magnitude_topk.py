@@ -31,7 +31,6 @@ from __future__ import annotations
 import logging
 
 from .._framework.candidates import CandidateBag
-from .._framework.plugin import StagePlugin  # noqa: F401  (Protocol import for type-checkers)
 from ..context import Stage1Context
 
 log = logging.getLogger(__name__)
@@ -67,7 +66,7 @@ class MagnitudeTopkPlugin:
     writes: tuple[str, ...] = (
         "candidate_bag",
     )
-    accumulators: tuple[str, ...] = ("downproj_max",)
+    provides: tuple[str, ...] = ("downproj_max",)
 
     def is_enabled(self, config: dict) -> bool:
         """Read ``config["stage1_grape"]["super_expert_detection"]

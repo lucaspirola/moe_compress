@@ -3,7 +3,7 @@
 Verifies:
 
 1. The plugin's class-level Protocol attributes match the registry
-   contract (``StagePlugin``).
+   contract (``PipelinePlugin``).
 2. ``is_enabled`` reads
    ``config["stage1_grape"]["super_expert_detection"]["magnitude_topk_per_l_layer"]``
    and returns ``True`` iff the value > 0 (default 16).
@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 from moe_compress.stage1._framework.candidates import CandidateBag
-from moe_compress.stage1._framework.plugin import StagePlugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.magnitude_topk import (
     MagnitudeTopkPlugin,
@@ -94,11 +94,11 @@ def test_plugin_protocol_attributes():
     )
     assert p.reads == ("max_acc", "L", "candidate_bag", "config")
     assert p.writes == ("candidate_bag",)
-    assert p.accumulators == ("downproj_max",)
+    assert p.provides == ("downproj_max",)
 
 
-def test_plugin_is_runtime_checkable_stageplugin():
-    assert isinstance(MagnitudeTopkPlugin(), StagePlugin)
+def test_plugin_is_runtime_checkable_pipelineplugin():
+    assert isinstance(MagnitudeTopkPlugin(), PipelinePlugin)
 
 
 # ---------------------------------------------------------------------------

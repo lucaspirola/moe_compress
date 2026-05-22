@@ -38,7 +38,6 @@ import logging
 import torch
 
 from .._framework.candidates import CandidateBag
-from .._framework.plugin import StagePlugin  # noqa: F401  (Protocol import for type-checkers)
 from .._framework.safe_json import safe_float
 from ...utils.aimer import aimer_bottom_pct_per_layer, aimer_score_tensor
 from ..context import Stage1Context
@@ -96,7 +95,7 @@ class AimerDetectorPlugin:
         "candidate_bag",    # sub-task 8: mutated in place via .add(l, e, "aimer").
     )
     # AIMER is weight-only; no Phase-B activation accumulator is consumed.
-    accumulators: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
     def is_enabled(self, config: dict) -> bool:
         """Read ``config["stage1_grape"]["super_expert_detection"]["aimer_enabled"]``;

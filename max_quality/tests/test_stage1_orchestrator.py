@@ -9,7 +9,7 @@ orchestrator path. This file adds focused orchestrator unit tests:
 2. ``run`` produces all three Stage 1 JSON artifacts.
 3. ``stage1_blacklist.json`` has exactly the 7-key schema.
 4. ``STAGE1_PLUGIN_MANIFEST`` is in the canonical execution order.
-5. ``required_accumulators`` returns the byte-identity-critical order
+5. ``provides`` returns the byte-identity-critical order
    ``(downproj_max, sink_routing, output_reservoir)``.
 6-9. The ``_build_accumulator`` factory for each accumulator name + the
    unknown-name guard.
@@ -31,7 +31,7 @@ import pytest
 from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.stage1._framework.artifact_assembly import REQUIRED_BLACKLIST_TOP_LEVEL_KEYS
 from moe_compress.stage1._framework.calibration_engine import HookKind, HookSpec
-from moe_compress.stage1._framework.plugin import PluginRegistry
+from moe_compress.pipeline.registry import PluginRegistry
 from moe_compress.stage1 import orchestrator
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins import STAGE1_PLUGIN_MANIFEST
@@ -125,13 +125,13 @@ def test_plugin_manifest_order():
 
 
 # ---------------------------------------------------------------------------
-# 5. required_accumulators order (byte-identity hazard)
+# 5. provides order (byte-identity hazard)
 # ---------------------------------------------------------------------------
 
 
-def test_required_accumulators_order(tiny_config):
+def test_provides_order(tiny_config):
     registry = PluginRegistry(STAGE1_PLUGIN_MANIFEST)
-    assert registry.required_accumulators(tiny_config) == (
+    assert registry.provides(tiny_config) == (
         "downproj_max", "sink_routing", "output_reservoir",
     )
 
@@ -198,7 +198,7 @@ def test_sink_disabled_omits_sink_routing(tiny_model, tiny_config, tmp_path):
     cfg["stage1_grape"]["super_expert_detection"]["sink_token_enabled"] = False
 
     registry = PluginRegistry(STAGE1_PLUGIN_MANIFEST)
-    assert "sink_routing" not in registry.required_accumulators(cfg)
+    assert "sink_routing" not in registry.provides(cfg)
 
     blacklist_path, _ = orchestrator.run(
         tiny_model, _TinyTokenizer(), cfg, tmp_path, _decomp(),

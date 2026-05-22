@@ -3,7 +3,7 @@
 Verifies:
 
 1. The plugin's class-level Protocol attributes match the registry
-   contract (``StagePlugin``).
+   contract (``PipelinePlugin``).
 2. ``is_enabled`` correctly reads
    ``config["stage1_grape"]["ablation_filter"]["enabled"]`` (default True).
 3. ``run`` populates the five write slots from the legacy
@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import pytest
 
-from moe_compress.stage1._framework.plugin import StagePlugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.ablation_filter import (
     AblationFilterPlugin,
@@ -87,11 +87,11 @@ def test_plugin_protocol_attributes():
         "ablation_filter_threshold",
         "ablation_filter_config",
     )
-    assert p.accumulators == ()
+    assert p.provides == ()
 
 
-def test_plugin_is_runtime_checkable_stageplugin():
-    assert isinstance(AblationFilterPlugin(), StagePlugin)
+def test_plugin_is_runtime_checkable_pipelineplugin():
+    assert isinstance(AblationFilterPlugin(), PipelinePlugin)
 
 
 # ---------------------------------------------------------------------------

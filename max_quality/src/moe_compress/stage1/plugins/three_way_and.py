@@ -36,7 +36,6 @@ import logging
 import numpy as np
 
 from .._framework.candidates import CandidateBag
-from .._framework.plugin import StagePlugin  # noqa: F401  (Protocol import for type-checkers)
 from ..context import Stage1Context
 
 log = logging.getLogger(__name__)
@@ -77,7 +76,7 @@ class ThreeWayAndPlugin:
         "a_max_threshold",
         "candidate_bag",
     )
-    accumulators: tuple[str, ...] = ("downproj_max",)
+    provides: tuple[str, ...] = ("downproj_max",)
 
     def is_enabled(self, config: dict) -> bool:
         """Mandatory paper criterion — always ``True``.

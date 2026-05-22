@@ -2,7 +2,7 @@
 
 ``STAGE1_PLUGIN_MANIFEST`` is the ordered plugin tuple the orchestrator
 (``stage1/orchestrator.py``) feeds to
-:class:`~moe_compress.stage1._framework.plugin.PluginRegistry`. The orchestrator
+:class:`~moe_compress.pipeline.registry.PluginRegistry`. The orchestrator
 invokes plugins by explicit, sequential ``run()`` calls — it does *not*
 iterate this manifest to execute them — so the manifest order is kept
 aligned with the orchestrator's call sequence by convention. Adding a new

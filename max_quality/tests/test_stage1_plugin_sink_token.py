@@ -3,7 +3,7 @@
 Verifies:
 
 1. The plugin's class-level Protocol attributes match the registry
-   contract (``StagePlugin``).
+   contract (``PipelinePlugin``).
 2. ``is_enabled`` reads
    ``config["stage1_grape"]["super_expert_detection"]["sink_token_enabled"]``
    (default True).
@@ -28,7 +28,7 @@ from dataclasses import dataclass
 import pytest
 
 from moe_compress.stage1._framework.candidates import CandidateBag
-from moe_compress.stage1._framework.plugin import StagePlugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.sink_token import SinkTokenDetectorPlugin
 from moe_compress.utils.sink_token_routing import SinkTokenRoutingAccumulator
@@ -104,11 +104,11 @@ def test_plugin_protocol_attributes():
         "candidate_bag",
     )
     assert p.writes == ("sink_acc", "candidate_bag")
-    assert p.accumulators == ("sink_routing",)
+    assert p.provides == ("sink_routing",)
 
 
-def test_plugin_is_runtime_checkable_stageplugin():
-    assert isinstance(SinkTokenDetectorPlugin(), StagePlugin)
+def test_plugin_is_runtime_checkable_pipelineplugin():
+    assert isinstance(SinkTokenDetectorPlugin(), PipelinePlugin)
 
 
 # ---------------------------------------------------------------------------

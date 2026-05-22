@@ -3,7 +3,7 @@
 Verifies:
 
 1. The plugin's class-level Protocol attributes match the registry
-   contract (``StagePlugin``).
+   contract (``PipelinePlugin``).
 2. ``is_enabled`` reads
    ``config["stage1_grape"]["super_expert_detection"]["aimer_enabled"]``
    (default True).
@@ -30,7 +30,7 @@ import pytest
 import torch
 
 from moe_compress.stage1._framework.candidates import CandidateBag
-from moe_compress.stage1._framework.plugin import StagePlugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.aimer import (
     AimerDetectorPlugin,
@@ -129,11 +129,11 @@ def test_plugin_protocol_attributes():
         "candidate_bag",
     )
     assert p.writes == ("aimer_scores", "bottom_pct_by_layer", "candidate_bag")
-    assert p.accumulators == ()
+    assert p.provides == ()
 
 
-def test_plugin_is_runtime_checkable_stageplugin():
-    assert isinstance(AimerDetectorPlugin(), StagePlugin)
+def test_plugin_is_runtime_checkable_pipelineplugin():
+    assert isinstance(AimerDetectorPlugin(), PipelinePlugin)
 
 
 # ---------------------------------------------------------------------------

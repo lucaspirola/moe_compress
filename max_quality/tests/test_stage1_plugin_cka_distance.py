@@ -3,7 +3,7 @@
 Verifies:
 
 1. The plugin's class-level Protocol attributes match the registry
-   contract (``StagePlugin``).
+   contract (``PipelinePlugin``).
 2. The plugin's ``run`` is byte-equivalent to calling the legacy
    ``_cka_distance_matrix`` helper directly on the same synthetic input
    — i.e. the migration is observation-preserving.
@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from moe_compress.stage1._framework.plugin import StagePlugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.cka_distance import (
     CKADistancePlugin,
@@ -90,11 +90,11 @@ def test_plugin_protocol_attributes():
     assert plugin.config_key == "stage1_grape"
     assert plugin.reads == ("output_acc", "moe_layers", "config")
     assert plugin.writes == ("D_matrices",)
-    assert plugin.accumulators == ("output_reservoir",)
+    assert plugin.provides == ("output_reservoir",)
 
 
-def test_plugin_is_runtime_checkable_stageplugin():
-    assert isinstance(CKADistancePlugin(), StagePlugin)
+def test_plugin_is_runtime_checkable_pipelineplugin():
+    assert isinstance(CKADistancePlugin(), PipelinePlugin)
 
 
 def test_plugin_is_enabled_always_true():

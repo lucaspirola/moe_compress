@@ -3,7 +3,7 @@
 Verifies:
 
 1. The plugin's class-level Protocol attributes match the registry
-   contract (``StagePlugin``).
+   contract (``PipelinePlugin``).
 2. ``is_enabled`` is always ``True`` (mandatory paper criterion — no flag).
 3. ``_compute_se_thresholds`` is byte-equivalent to the legacy helper
    (P99.5 + a_max over l ∈ L) — including empty-L / empty-input cases.
@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 
 from moe_compress.stage1._framework.candidates import CandidateBag
-from moe_compress.stage1._framework.plugin import StagePlugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.three_way_and import (
     ThreeWayAndPlugin,
@@ -94,11 +94,11 @@ def test_plugin_protocol_attributes():
     assert p.config_key == "stage1_grape.super_expert_detection"
     assert p.reads == ("max_acc", "L", "candidate_bag", "config")
     assert p.writes == ("p995", "a_max", "a_max_threshold", "candidate_bag")
-    assert p.accumulators == ("downproj_max",)
+    assert p.provides == ("downproj_max",)
 
 
-def test_plugin_is_runtime_checkable_stageplugin():
-    assert isinstance(ThreeWayAndPlugin(), StagePlugin)
+def test_plugin_is_runtime_checkable_pipelineplugin():
+    assert isinstance(ThreeWayAndPlugin(), PipelinePlugin)
 
 
 # ---------------------------------------------------------------------------

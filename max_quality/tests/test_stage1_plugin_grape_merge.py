@@ -3,7 +3,7 @@
 Verifies:
 
 1. The plugin's class-level Protocol attributes match the registry
-   contract (``StagePlugin``).
+   contract (``PipelinePlugin``).
 2. The plugin's ``run`` is byte-equivalent to calling the legacy
    ``_grape_greedy_merge`` helper directly on the same input — i.e.
    the migration is observation-preserving.
@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from moe_compress.budget.solver import BudgetDecomposition
-from moe_compress.stage1._framework.plugin import StagePlugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.grape_merge import (
     GrapeMergePlugin,
@@ -110,12 +110,12 @@ def test_plugin_protocol_attributes():
         "requested_budget",
         "grape_config",
     )
-    assert plugin.accumulators == ()
+    assert plugin.provides == ()
 
 
-def test_plugin_is_runtime_checkable_stageplugin():
+def test_plugin_is_runtime_checkable_pipelineplugin():
     """``isinstance`` against the runtime-checkable Protocol must succeed."""
-    assert isinstance(GrapeMergePlugin(), StagePlugin)
+    assert isinstance(GrapeMergePlugin(), PipelinePlugin)
 
 
 def test_plugin_is_enabled_always_true():

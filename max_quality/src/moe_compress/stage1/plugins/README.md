@@ -32,7 +32,7 @@ Six moving parts. Know which one your new code touches.
 
 - **`stage1/plugins/__init__.py`** — the `STAGE1_PLUGIN_MANIFEST` tuple. The
   orchestrator feeds this tuple straight to `PluginRegistry`, which it uses
-  for `enabled()` resolution and `required_accumulators()`, and to build the
+  for `enabled()` resolution and `provides()`, and to build the
   `by_name` lookup table its explicit `run()` calls index into. The manifest
   does **not** drive `run()` invocation — that is the orchestrator's explicit
   call sequence (§5.1). By convention the manifest tuple is ordered to match
@@ -41,11 +41,11 @@ Six moving parts. Know which one your new code touches.
   one `__all__` entry here, **plus** the explicit `run()` call in
   `orchestrator.py` (§6 step 5).
 
-- **`_framework/plugin.py`** — the cross-stage framework. Defines the
-  `StagePlugin` Protocol (the contract every plugin satisfies — §4) and
-  `PluginRegistry` (ordered, immutable-after-construction; exposes `enabled()`
-  and `required_accumulators()`). The registry rejects duplicate plugin names
-  at construction time.
+- **`pipeline/plugin.py`** — the universal plugin framework. Defines the
+  `PipelinePlugin` Protocol (the contract every plugin satisfies — §4).
+  **`pipeline/registry.py`** defines `PluginRegistry` (ordered,
+  immutable-after-construction; exposes `enabled()` and `provides()`). The
+  registry rejects duplicate plugin names at construction time.
 
 - **`stage1/context.py` → `Stage1Context`** — the typed shared-state holder.
   Backed by a `dict[str, Any]` with strict `get` / `set` / `drop` / `has`
@@ -56,7 +56,7 @@ Six moving parts. Know which one your new code touches.
 
 - **`_framework/calibration_engine.py` → `CalibrationEngine`** — the shared
   Phase-B profiling driver. Plugins declare which named accumulators they need
-  via their `accumulators` tuple; the orchestrator maps each name to a concrete
+  via their `provides` tuple; the orchestrator maps each name to a concrete
   `(accumulator, HookSpec)` pair via `_build_accumulator`, and the engine wires
   **all** hooks in **one** forward pass over the calibration batches.
 
@@ -87,7 +87,7 @@ setup() on setup-capable plugins    -- sink_token.setup() builds                
    |  writes: sink_acc                  the SinkTokenRoutingAccumulator         |
    v                                                                           |
 CalibrationEngine  (ONE shared forward pass)                                   |
-   |  registry.required_accumulators(config) -> {downproj_max,                  |
+   |  registry.provides(config) -> {downproj_max,                               |
    |      output_reservoir, sink_routing}                                       |
    |  orchestrator._build_accumulator(name) -> (accumulator, HookSpec)          |
    |  writes: max_acc, output_acc  (sink_acc already on ctx)                    |
@@ -143,20 +143,20 @@ plugin to this tuple **and** add a matching explicit `run()` call to
 
 ---
 
-## 4. The `StagePlugin` Protocol contract
+## 4. The `PipelinePlugin` Protocol contract
 
 A plugin is a plain class — **no base class to inherit**. It structurally
-satisfies the `StagePlugin` Protocol from `_framework/plugin.py`:
+satisfies the `PipelinePlugin` Protocol from `pipeline/plugin.py`:
 
 ```python
 @runtime_checkable
-class StagePlugin(Protocol):
+class PipelinePlugin(Protocol):
     name: str
     paper: str
     config_key: str
     reads: tuple[str, ...]
     writes: tuple[str, ...]
-    accumulators: tuple[str, ...]
+    provides: tuple[str, ...]
 
     def is_enabled(self, config: dict) -> bool: ...
     def run(self, ctx: "Any") -> None: ...
@@ -172,8 +172,8 @@ Every member, with its exact type and meaning:
 | `config_key` | `str` | Dotted path into the YAML where the plugin's sub-config / flag lives, e.g. `"stage1_grape.super_expert_detection.aimer_enabled"`. Documentation / introspection only — `is_enabled` reads the config itself; nothing parses this string. |
 | `reads` | `tuple[str, ...]` | `Stage1Context` slots the plugin consumes. Honesty contract — enables a future static check that nothing reads a slot no prior plugin wrote. |
 | `writes` | `tuple[str, ...]` | `Stage1Context` slots the plugin produces. List a slot here even if it is mutated in place (not rebound) — e.g. `candidate_bag`. |
-| `accumulators` | `tuple[str, ...]` | Named accumulators the shared `CalibrationEngine` must run for this plugin. Empty `()` if the plugin needs no Phase-B data (it runs its own forward pass, or is weight-only). |
-| `is_enabled(config) -> bool` | method | Whether the plugin is "on" per config. **See §5.1 ("`is_enabled` gates `required_accumulators`, NOT `run`") — `run()` is always called; `is_enabled` only drives `required_accumulators`.** |
+| `provides` | `tuple[str, ...]` | Named accumulators the shared `CalibrationEngine` must run for this plugin. Empty `()` if the plugin needs no Phase-B data (it runs its own forward pass, or is weight-only). |
+| `is_enabled(config) -> bool` | method | Whether the plugin is "on" per config. **See §5.1 ("`is_enabled` gates `provides`, NOT `run`") — `run()` is always called; `is_enabled` only drives `provides`.** |
 | `run(ctx) -> None` | method | The phase logic. Reads slots in `reads`, writes slots in `writes`. Must produce well-formed output even on the disabled path. |
 | `contribute_artifact(ctx) -> dict` | method | A JSON-ready dict — a *fragment* merged into `stage1_blacklist.json`, a *whole-file* payload, or `{}`. See subtlety §5.2. |
 
@@ -217,7 +217,7 @@ The actual sequence, as written in `orchestrator.run()`:
    None)` on every plugin (only `sink_token` has one today). This *is* a loop,
    but it calls the optional `setup()`, not `run()`.
 3. **STEP 5-7 — calibration:** builds the `CalibrationEngine`, registers the
-   accumulators from `registry.required_accumulators(config)`, runs the single
+   accumulators from `registry.provides(config)`, runs the single
    shared forward pass, finalizes the accumulators.
 4. **STEP 8 — the 4 detectors:** a `for name in ("three_way_and", "aimer",
    "sink_token", "magnitude_topk"): by_name[name].run(ctx)` loop over a
@@ -229,18 +229,18 @@ The actual sequence, as written in `orchestrator.run()`:
 7. **STEP 11 — artifacts/telemetry:** `_write_artifacts` and `_emit_telemetry`.
 
 `STAGE1_PLUGIN_MANIFEST` is used to construct the `PluginRegistry` and thereby
-to drive `enabled()`, `required_accumulators()`, and the `by_name` table — it
+to drive `enabled()`, `provides()`, and the `by_name` table — it
 is **not** iterated to call `run()`. Adding a plugin therefore always includes
 adding its explicit `run()` call to `orchestrator.py` (§6 step 5).
 
-### `is_enabled` gates `required_accumulators`, NOT `run`
+### `is_enabled` gates `provides`, NOT `run`
 
 Every `run()` call above is **unconditional** — the orchestrator never checks
 `is_enabled` before calling `run()`. A plugin must short-circuit *internally*
 on its own flag — e.g. `aimer.run` returns empty results when
 `aimer_enabled=False`; `ablation_filter.run` uses the candidate set verbatim
 when disabled. `is_enabled` is consumed *only* by
-`PluginRegistry.required_accumulators` — so a disabled plugin does not make the
+`PluginRegistry.provides` — so a disabled plugin does not make the
 `CalibrationEngine` wire a hook nobody reads. Your new plugin's `run()` must
 therefore produce well-formed (possibly empty) outputs even on the disabled
 path.
@@ -278,15 +278,15 @@ payload.
 
 2. **Implement the Protocol.** Write a plain class declaring all six
    class-level attributes (`name`, `paper`, `config_key`, `reads`, `writes`,
-   `accumulators`) and the three methods (`is_enabled`, `run`,
+   `provides`) and the three methods (`is_enabled`, `run`,
    `contribute_artifact`). No base class. Import the Protocol only for the
-   type-checker: `from .._framework.plugin import StagePlugin  # noqa: F401`.
+   type-checker: `from ..pipeline.plugin import PipelinePlugin  # noqa: F401`.
 
-3. **Declare `accumulators` if you need calibration data.** If your plugin
+3. **Declare `provides` if you need calibration data.** If your plugin
    reads per-expert activations or router logits, name the accumulator(s) you
    need. Three names exist today: `"downproj_max"`, `"output_reservoir"`,
    `"sink_routing"`. If you need a *new* accumulator name, see step 6. If your
-   plugin is weight-only or runs its own forward pass, use `accumulators = ()`.
+   plugin is weight-only or runs its own forward pass, use `provides = ()`.
 
 4. **Register in `STAGE1_PLUGIN_MANIFEST`.** In `stage1/plugins/__init__.py`:
    add the `from .<your_plugin> import <YourPlugin>` import, insert the
@@ -294,7 +294,7 @@ payload.
    correct phase position** (a detector among positions 2-5; a post-processing
    step after `ablation_filter`), and add the class name to `__all__`. This
    registers the plugin with the `PluginRegistry` (so it participates in
-   `enabled()`, `required_accumulators()`, and the `by_name` lookup). It does
+   `enabled()`, `provides()`, and the `by_name` lookup). It does
    **not**, on its own, make the plugin run — see step 5.
 
 5. **Add the explicit `run()` call to `orchestrator.py`.** The orchestrator
@@ -353,7 +353,7 @@ payload.
 ## 7. Copy-paste plugin template
 
 A complete skeleton — paste it, rename it, fill it in. Accurate against the
-current `StagePlugin` Protocol.
+current `PipelinePlugin` Protocol.
 
 ```python
 """Phase X — <paper name> detector.
@@ -364,7 +364,7 @@ from __future__ import annotations
 
 import logging
 
-from .._framework.plugin import StagePlugin  # noqa: F401  (Protocol, type-checkers only)
+from ..pipeline.plugin import PipelinePlugin  # noqa: F401  (Protocol, type-checkers only)
 from ..context import Stage1Context
 # Allowed imports: .._framework.*, ...utils.*, ..context, stdlib, torch/numpy.
 # NEVER:  from .other_plugin import ...   (the architectural invariant — see §8)
@@ -380,10 +380,10 @@ class MyDetectorPlugin:
     config_key: str = "stage1_grape.super_expert_detection.my_detector_enabled"
     reads: tuple[str, ...] = ("max_acc", "L", "candidate_bag", "config")
     writes: tuple[str, ...] = ("candidate_bag",)
-    accumulators: tuple[str, ...] = ("downproj_max",)  # or () if none
+    provides: tuple[str, ...] = ("downproj_max",)  # or () if none
 
     def is_enabled(self, config: dict) -> bool:
-        """Reflect the YAML flag. NOTE: this gates required_accumulators,
+        """Reflect the YAML flag. NOTE: this gates provides,
         NOT run() -- run() is always called and must short-circuit itself."""
         se = config.get("stage1_grape", {}).get("super_expert_detection", {})
         return bool(se.get("my_detector_enabled", True))

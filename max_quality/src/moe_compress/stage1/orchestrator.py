@@ -19,7 +19,7 @@ What the orchestrator does
 - emits the same Trackio telemetry.
 
 The orchestrator owns only *glue*: the accumulator factory
-(``_build_accumulator`` — the plugin-declared ``accumulators`` name → a
+(``_build_accumulator`` — the plugin-declared ``provides`` name → a
 concrete accumulator + :class:`HookSpec` mapping), the artifact assembly
 (``_write_artifacts``), and the telemetry block (``_emit_telemetry``).
 All phase logic lives inside the eight plugins under ``stage1/plugins/``.
@@ -36,7 +36,7 @@ from ..budget.solver import BudgetDecomposition
 from ._framework.artifact_assembly import ArtifactBuilder
 from ._framework.calibration_engine import CalibrationEngine, HookKind, HookSpec
 from ._framework.candidates import CandidateBag
-from ._framework.plugin import PluginRegistry
+from ..pipeline.registry import PluginRegistry
 from ..utils.activation_hooks import DownProjMaxAccumulator, ExpertOutputAccumulator
 from ..utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from ..utils.model_io import iter_moe_layers, save_json_artifact
@@ -107,12 +107,12 @@ def _build_accumulator(
     tokenizer,
     ctx: Stage1Context,
 ) -> tuple[object, HookSpec]:
-    """Map an accumulator NAME (as declared by a plugin's ``accumulators``
+    """Map an accumulator NAME (as declared by a plugin's ``provides``
     tuple) to a concrete ``(accumulator_instance, HookSpec)`` pair the
     :class:`CalibrationEngine` can register.
 
     The orchestrator owns this mapping because it is the glue between the
-    plugin's declarative ``accumulators=(...)`` metadata and the engine's
+    plugin's declarative ``provides=(...)`` metadata and the engine's
     imperative ``register_accumulator(name, acc, spec)``.
 
     The ``downproj_max`` / ``output_reservoir`` accumulators are
@@ -255,7 +255,7 @@ def run(
     # by_name is built from the FULL manifest, not the enabled subset: the
     # detector/cka/grape/ablation run() calls are unconditional (each plugin
     # short-circuits internally on its own flag — matching the legacy run()).
-    # is_enabled / enabled() is used ONLY to drive required_accumulators.
+    # is_enabled / enabled() is used ONLY to drive provides.
     # See plan §4.6.
     by_name = {p.name: p for p in registry}
 
@@ -277,7 +277,7 @@ def run(
             setup(ctx)
 
     # ---- STEP 5: build the CalibrationEngine, register accumulators -------
-    needed = registry.required_accumulators(config)   # ordered tuple
+    needed = registry.provides(config)   # ordered tuple
     engine = CalibrationEngine()
     built: dict[str, object] = {}
     for acc_name in needed:

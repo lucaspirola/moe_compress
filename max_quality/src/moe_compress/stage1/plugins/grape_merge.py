@@ -17,7 +17,6 @@ import math
 import numpy as np
 import torch
 
-from .._framework.plugin import StagePlugin  # noqa: F401  (Protocol import for type-checkers)
 from ...utils.trackio_log import trackio_flush as _trackio_flush
 from ...utils.trackio_log import trackio_log as _trackio_log
 from ..context import Stage1Context
@@ -52,7 +51,7 @@ class GrapeMergePlugin:
         "grape_config",
     )
     # Phase F is a pure post-processing step over D + blacklist.
-    accumulators: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
     def is_enabled(self, config: dict) -> bool:
         """GRAPE is mandatory — every Stage 1 run executes Phase F."""

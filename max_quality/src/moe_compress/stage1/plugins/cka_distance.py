@@ -18,7 +18,6 @@ import math
 
 import torch
 
-from .._framework.plugin import StagePlugin  # noqa: F401  (Protocol import for type-checkers)
 from ...utils.activation_hooks import ExpertOutputAccumulator
 from ...utils.model_io import MATRIX_NAMES, build_banks
 from ..context import Stage1Context
@@ -56,7 +55,7 @@ class CKADistancePlugin:
     # Declared here so sub-task 10's orchestrator can wire the accumulator from the
     # CalibrationEngine. In this sub-task the legacy Phase B still populates the
     # accumulator inline; the plugin only consumes it via ``ctx.get("output_acc")``.
-    accumulators: tuple[str, ...] = (
+    provides: tuple[str, ...] = (
         "output_reservoir",
     )
 

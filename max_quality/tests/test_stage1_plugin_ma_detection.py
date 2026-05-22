@@ -3,7 +3,7 @@
 Verifies:
 
 1. The plugin's class-level Protocol attributes match the registry
-   contract (``StagePlugin``).
+   contract (``PipelinePlugin``).
 2. ``is_enabled`` is always ``True`` (mandatory phase — no flag).
 3. ``_flag_layer_dual_signal`` is byte-equivalent to the legacy helper
    (the OR truth table).
@@ -23,7 +23,7 @@ import math
 
 import pytest
 
-from moe_compress.stage1._framework.plugin import StagePlugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.ma_detection import (
     MADetectionPlugin,
@@ -76,11 +76,11 @@ def test_plugin_protocol_attributes():
         "moe_output_growth",
         "moe_output_max",
     )
-    assert p.accumulators == ()
+    assert p.provides == ()
 
 
-def test_plugin_is_runtime_checkable_stageplugin():
-    assert isinstance(MADetectionPlugin(), StagePlugin)
+def test_plugin_is_runtime_checkable_pipelineplugin():
+    assert isinstance(MADetectionPlugin(), PipelinePlugin)
 
 
 # ---------------------------------------------------------------------------
