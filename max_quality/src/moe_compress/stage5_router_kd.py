@@ -60,113 +60,18 @@ from .router_kd.plugins.kd_optimizer import (  # noqa: F401
     _move_optimizer_state_to_device,
 )
 
+# RK-4: the vocab-KL kernel (_chunked_vocab_kl / _combine_kd_loss) and the
+# NaN sanity probes relocated to router_kd/plugins/vocab_kd. Re-imported so
+# run() + external callers/tests keep their import paths.
+from .router_kd.plugins.vocab_kd import (  # noqa: F401
+    _chunked_vocab_kl,
+    _combine_kd_loss,
+    _log_first_batch_sanity,
+    _dump_nan_diagnostics,
+    _check_param_sanity,
+)
+
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Debug instrumentation (added 2026-05-13 after the Stage 2.5 NaN crash on
-# vast.ai B200 contract 36639423). Stage 2.5 had been running for the first
-# time and the previous bare-bones per-50-step logger gave no signal about
-# WHERE NaN entered (teacher? student? KL? params?). These helpers provide:
-#   1. A first-batch sanity probe (always on) — log teacher/student logit
-#      stats and the initial loss BEFORE the optimizer touches anything.
-#   2. A NaN tripwire (always on) — abort on the FIRST non-finite loss with
-#      a structured dump of teacher/student/param state.
-#   3. Per-step debug log (env STAGE5_DEBUG_PER_STEP=1) — fine-grained loss
-#      trajectory for the first N steps instead of the 50-step window mean.
-#   4. Periodic param sanity (env STAGE5_PARAM_CHECK_EVERY=K) — scan trainable
-#      params for NaN/Inf every K steps, halt if any go non-finite silently.
-# ---------------------------------------------------------------------------
-
-
-def _log_first_batch_sanity(
-    teacher_logits: torch.Tensor,
-    student_logits: torch.Tensor,
-    loss: torch.Tensor,
-) -> None:
-    """First-batch sanity probe — log forward-pass stats and abort if any
-    NaN/Inf is present BEFORE the optimizer runs."""
-    try:
-        t_finite = bool(torch.isfinite(teacher_logits).all())
-        s_finite = bool(torch.isfinite(student_logits).all())
-        loss_finite = bool(torch.isfinite(loss))
-        log.info(
-            "Stage 5 first-batch sanity: "
-            "teacher shape=%s dtype=%s finite=%s abs_max=%.3e mean=%.3e std=%.3e ; "
-            "student shape=%s dtype=%s finite=%s abs_max=%.3e mean=%.3e std=%.3e ; "
-            "initial_loss=%.6e finite=%s",
-            tuple(teacher_logits.shape), teacher_logits.dtype, t_finite,
-            float(teacher_logits.detach().abs().max()),
-            float(teacher_logits.detach().mean()),
-            float(teacher_logits.detach().std()),
-            tuple(student_logits.shape), student_logits.dtype, s_finite,
-            float(student_logits.detach().abs().max()),
-            float(student_logits.detach().mean()),
-            float(student_logits.detach().std()),
-            float(loss.detach()), loss_finite,
-        )
-        if not (t_finite and s_finite and loss_finite):
-            raise RuntimeError(
-                "Stage 5 first-batch sanity FAILED: "
-                f"teacher_finite={t_finite} student_finite={s_finite} loss_finite={loss_finite}. "
-                "Halting before any optimizer step to surface the actual failure mode "
-                "(teacher vs student vs KL) instead of training 50 batches of NaN."
-            )
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        log.warning("Stage 5 first-batch sanity probe raised %s (non-fatal — continuing)", exc)
-
-
-def _dump_nan_diagnostics(
-    *,
-    loss: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    student_logits: torch.Tensor,
-    student: nn.Module,
-    epoch: int,
-    step: int,
-    batch_i: int,
-) -> None:
-    """Structured dump on non-finite loss — teacher/student stats + first 5
-    non-finite trainable params (routers only)."""
-    try:
-        def _stats(t: torch.Tensor) -> str:
-            t_det = t.detach()
-            n_total = max(1, t_det.numel())
-            n_nan = int(torch.isnan(t_det).sum())
-            n_inf = int(torch.isinf(t_det).sum())
-            return (
-                f"shape={tuple(t.shape)} dtype={t.dtype} "
-                f"abs_max={float(t_det.abs().max()):.3e} mean={float(t_det.mean()):.3e} "
-                f"pct_nan={100.0 * n_nan / n_total:.2f} pct_inf={100.0 * n_inf / n_total:.2f}"
-            )
-        log.error("Stage 5 NaN-tripwire at epoch=%d step=%d batch=%d: loss=%s",
-                  epoch, step, batch_i, float(loss.detach()))
-        log.error("  teacher logits: %s", _stats(teacher_logits))
-        log.error("  student logits: %s", _stats(student_logits))
-        bad_params = _check_param_sanity(student, step)
-        if bad_params:
-            log.error("  non-finite trainable params (first %d): %s", len(bad_params), bad_params)
-        else:
-            log.error("  all trainable params still finite — NaN originates in forward, not weights.")
-    except Exception as exc:
-        log.error("Stage 5 NaN diagnostics raised: %s", exc)
-
-
-def _check_param_sanity(student: nn.Module, step: int) -> list[str]:
-    """Cheap O(params) scan: names of trainable params containing NaN/Inf,
-    capped at 5 for log brevity."""
-    bad: list[str] = []
-    base = getattr(student, "_orig_mod", student)
-    for name, p in base.named_parameters():
-        if not p.requires_grad:
-            continue
-        if not torch.isfinite(p.data).all():
-            bad.append(name)
-            if len(bad) >= 5:
-                break
-    return bad
 
 
 def _set_experts_implementation(model: nn.Module, impl: str) -> None:
@@ -1409,47 +1314,6 @@ def run(
     return out_dir
 
 
-def _chunked_vocab_kl(
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    temperature: float,
-    chunk_size: int = 128,
-) -> torch.Tensor:
-    """Compute vocab-level KL(teacher ‖ student) in sequence chunks.
-
-    Processes ``chunk_size`` sequence positions at a time to bound peak
-    intermediate memory. At chunk_size=128 with |V|=150K and B=4:
-      Peak intermediate per chunk ≈ 4 × 128 × 150K × 4 bytes ≈ 300 MB
-      vs ≈1.2 GB for the full sequence at L=512.
-
-    Returns scalar loss = (τ²/N_tokens) × Σ_t KL(teacher_t ‖ student_t).
-
-    Note: n_tokens = B × (L−1) is the per-position-mean denominator (paper
-    Eq. 3's N_x for fully-packed sequences with no padding).
-
-    ASSUMPTION: fully-packed sequences (no padding) — see spec §8 N_x note.
-    Under this invariant, paper Eq. 3's mask `m_{t+1}=1` everywhere and
-    `N_x = Σ_t m_{t+1} = B × (L−1) = n_tokens`, so the `+ ε` zero-mask
-    safety constant from paper Eq. 3 is unnecessary. If a future calibration
-    source ever introduces padding, this normalization (and the `+ ε`) must
-    be revisited.
-    """
-    B, L, V = student_logits.shape
-    total_kl = torch.zeros((), device=student_logits.device, dtype=torch.float32)
-    n_tokens = 0
-    for start in range(0, L, chunk_size):
-        end = min(start + chunk_size, L)
-        s_chunk = student_logits[:, start:end, :]
-        t_chunk = teacher_logits[:, start:end, :]
-        t_p = F.softmax(t_chunk / temperature, dim=-1)
-        s_lp = F.log_softmax(s_chunk / temperature, dim=-1)
-        chunk_kl = F.kl_div(s_lp, t_p, reduction="none").sum(dim=-1)  # [B, chunk_len]
-        total_kl = total_kl + chunk_kl.sum()
-        n_tokens += chunk_kl.numel()
-        del t_p, s_lp, chunk_kl  # free intermediates eagerly
-    return (total_kl / max(n_tokens, 1)) * (temperature ** 2)
-
-
 def _save_stage5_checkpoint(
     partial_dir: Path,
     step: int,
@@ -1780,23 +1644,4 @@ def _merge_repair_mse(
             )
         terms.append(F.mse_loss(s, t))
     return torch.stack(terms).mean()
-
-
-def _combine_kd_loss(
-    kl_loss: torch.Tensor,
-    mse_term: "torch.Tensor | None",
-    mse_weight: float,
-) -> torch.Tensor:
-    """Stage-2.5 total loss = vocab-KL + weighted merge-repair MSE.
-
-    When merge-repair is off the caller passes ``mse_term=None`` and this
-    returns the *exact* ``kl_loss`` tensor object — so the flag-off loss is
-    byte-identical to pre-Direction-E ``main``. When on, the MSE term is cast
-    to the KL's dtype and added with the config-scalar ``mse_weight``.
-    """
-    if mse_term is None:
-        return kl_loss
-    return kl_loss + mse_weight * mse_term.to(kl_loss.dtype)
-
-
 

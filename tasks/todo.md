@@ -78,7 +78,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] RK-1  Scaffold router_kd/ package — __init__/context/orchestrator/plugins + make_router_kd_stage factory
 - [x] RK-2  trainable_scope plugin — _freeze_non_routers relocated + conflict-check reproduced in inert hook
 - [x] RK-3  kd_optimizer plugin — split-group AdamW + _lr_lambda reproduced; _move_optimizer_state_to_device relocated
-- [ ] RK-4  vocab_kd plugin
+- [x] RK-4  vocab_kd plugin — _chunked_vocab_kl/_combine_kd_loss + NaN probes relocated
 - [ ] RK-5  teacher_cache + teacher_live slot plugins
 - [ ] RK-6  merge_repair plugin
 - [ ] RK-7  early_stop plugin
