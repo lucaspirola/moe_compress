@@ -295,12 +295,18 @@ def test_stage5_source_emits_config_block():
 def test_stage3_source_emits_config_and_c5_extensions():
     """Source-level check that Stage 3 emits the new config keys
     (cross_cov_enabled, t_budget, alpha_by_type/*) and the Phase C.5
-    block carries the new training-shape keys."""
-    src_path = (
-        Path(__file__).resolve().parents[1]
-        / "src" / "moe_compress" / "stage3_svd.py"
+    block carries the new training-shape keys.
+
+    S3-6: ``_phase_c5_block_refine`` (which emits the ``c5_*`` keys) was
+    relocated verbatim into ``stage3/plugins/block_refine.py``; the config
+    keys still emit from the ``stage3_svd.py`` monolith. The source scan
+    therefore spans both files.
+    """
+    src_root = Path(__file__).resolve().parents[1] / "src" / "moe_compress"
+    src = (
+        (src_root / "stage3_svd.py").read_text()
+        + (src_root / "stage3" / "plugins" / "block_refine.py").read_text()
     )
-    src = src_path.read_text()
     expected_keys = [
         "stage3/config/cross_cov_enabled",
         "stage3/config/scope",

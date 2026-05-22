@@ -20,6 +20,7 @@ import torch
 
 from moe_compress import stage1
 from moe_compress import stage3_svd
+from moe_compress.stage3.plugins import block_refine as stage3_block_refine
 from moe_compress.stage2 import orchestrator as stage2_reap_ream
 from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.utils.model_io import FactoredExperts, iter_moe_layers
@@ -233,7 +234,11 @@ def test_stage3_phase_c5_emits_loss_metrics(
         if isinstance(metrics, dict):
             captured.append(dict(metrics))
 
-    monkeypatch.setattr(stage3_svd, "_trackio_log", _capture_metrics)
+    # S3-6: Phase C.5 telemetry is emitted from inside the relocated
+    # ``stage3/plugins/block_refine`` module (``_phase_c5_block_refine`` calls
+    # that module's ``_trackio_log`` binding) — patch it there, not on the
+    # ``stage3_svd`` monolith.
+    monkeypatch.setattr(stage3_block_refine, "_trackio_log", _capture_metrics)
 
     decomp = _run_stages_012(tiny_model, config, tmp_path)
     stage3_svd.run(

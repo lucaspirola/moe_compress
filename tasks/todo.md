@@ -59,7 +59,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S3-3  d_rank_allocate plugin — _GroupStats/_group_stat/_pad/_compute_T_budget/_d_rank_allocate relocated
 - [x] S3-4  swift_svd_alpha plugin — both α-searches + redistribute + snapshot/restore + wikitext PPL relocated
 - [x] S3-5  aa_svd_factor plugin — AA-SVD core (_EighDecomp/_precompute_eigh/_aa_svd*/_cov_lookup) relocated
-- [ ] S3-6  block_refine plugin
+- [x] S3-6  block_refine plugin — _phase_c5_block_refine/_advance_streams relocated, first config-gated stage-3 plugin
 - [ ] S3-7  Wire orchestrator + STAGE3
 - [ ] S3-8  Stage-3 orchestrator test
 
