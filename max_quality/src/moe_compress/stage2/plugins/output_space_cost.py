@@ -306,38 +306,36 @@ class OutputSpaceCostPlugin:
     ``cost_alignment`` resolves to ``"output"`` the orchestrator registers this
     plugin ahead of the ``LegacyAdapter`` so it wins
     ``PluginRegistry.dispatch_first`` for the slot. The slot body — the
-    capacity-util gate + ``_ream_cost_matrix`` call — lives in the shared
-    module-level helper ``ream_cost._compute_cost_for_plugin`` (one source of
-    truth for all three cost plugins; the gate may downgrade ``output``→``pre``
-    per layer on slack-capacity layers, which is correct).
+    ``_ream_cost_matrix`` call — lives in the shared module-level helper
+    ``ream_cost._compute_cost_for_plugin`` (one source of truth for all three
+    cost plugins). S2-10 moved the capacity-util gate out into
+    ``CapacityGatePlugin.select_alignment`` (which may still downgrade
+    ``output``→``pre`` per layer on slack-capacity layers, run earlier in the
+    bump iteration); this slot reads the gate's decision back off ``ctx``.
     """
 
     name = "output_space_cost"
     paper = "Direction C: output-space REAM merge-cost matrix builder."
     config_key = "stage2_reap_ream.cost_alignment"
     reads: tuple[str, ...] = _COST_PLUGIN_READS
-    writes: tuple[str, ...] = _COST_PLUGIN_WRITES
+    writes: tuple[str, ...] = _COST_PLUGIN_WRITES  # () — S2-10 moved the gate out
     provides: tuple[str, ...] = ()
 
     def __init__(
         self,
         *,
         cov_acc,
-        max_group_cap: int,
-        capacity_util_threshold: float,
         cost_alignment_cfg: str,
-        cost_asymmetric: bool,
         cost_whitening: str,
         cost_topk_filter: int,
         cost_output_token_cap: int,
     ) -> None:
         # Store every knob the shared compute_cost body reads. NO logic — a
         # faithful mirror of the matching subset of LegacyAdapter.__init__.
+        # ``cost_alignment_cfg`` is retained for ``is_enabled``; the capacity
+        # gate's knobs moved to CapacityGatePlugin (S2-10).
         self.cov_acc = cov_acc
-        self.max_group_cap = max_group_cap
-        self.capacity_util_threshold = capacity_util_threshold
         self.cost_alignment_cfg = cost_alignment_cfg
-        self.cost_asymmetric = cost_asymmetric
         self.cost_whitening = cost_whitening
         self.cost_topk_filter = cost_topk_filter
         self.cost_output_token_cap = cost_output_token_cap
@@ -357,11 +355,12 @@ class OutputSpaceCostPlugin:
         return {}
 
     def compute_cost(self, ctx: PipelineContext) -> Any | None:
-        """Slot ``compute_cost`` — capacity-util gate + REAM cost matrix.
+        """Slot ``compute_cost`` — REAM cost matrix.
 
         Delegates to the shared ``ream_cost._compute_cost_for_plugin`` helper
-        (same body as the other two cost plugins). Returns the cost matrix
-        ``delta``.
+        (same body as the other two cost plugins). Reads the capacity-gate
+        decision off ``ctx`` (published by ``CapacityGatePlugin.select_alignment``
+        earlier in the bump iteration). Returns the cost matrix ``delta``.
         """
         from .ream_cost import _compute_cost_for_plugin
         return _compute_cost_for_plugin(self, ctx)

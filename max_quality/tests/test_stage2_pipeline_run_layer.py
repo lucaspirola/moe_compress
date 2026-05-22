@@ -400,14 +400,15 @@ def test_legacy_adapter_on_layer_teardown_clears_state(tiny_model, patched_stage
 # ---------------------------------------------------------------------------
 
 
-# The four fine-grained assignment slots ``_run_assignment`` drives per bump,
-# in canonical call order. ``compute_cost`` / ``apply_cost_mask`` /
-# ``solve_assignment`` are single-winner ``dispatch_first`` slots;
-# ``refine_assignment`` is a CHAIN (S2-9 — two-opt then EM, every enabled
-# plugin runs). The probe below is one chain link, so it still records exactly
-# one ``refine_assignment`` call per bump and the canonical four-slot order
-# holds.
+# The five fine-grained assignment slots ``_run_assignment`` drives per bump,
+# in canonical call order. ``select_alignment`` (S2-10 — the capacity gate),
+# ``compute_cost`` / ``apply_cost_mask`` / ``solve_assignment`` are
+# single-winner ``dispatch_first`` slots; ``refine_assignment`` is a CHAIN
+# (S2-9 — two-opt then EM, every enabled plugin runs). The probe below is one
+# chain link, so it still records exactly one ``refine_assignment`` call per
+# bump and the canonical five-slot order holds.
 _ASSIGNMENT_SLOTS = (
+    "select_alignment",
     "compute_cost",
     "apply_cost_mask",
     "solve_assignment",
@@ -416,15 +417,38 @@ _ASSIGNMENT_SLOTS = (
 
 
 def test_legacy_adapter_exposes_four_assignment_slots():
-    """LegacyAdapter exposes exactly the four fine-grained assignment slots and
-    no longer carries the monolithic ``compute_assignment`` hook (S2-5)."""
-    for slot in _ASSIGNMENT_SLOTS:
+    """LegacyAdapter exposes the four fine-grained cost/mask/solve/refine
+    assignment slots and no longer carries the monolithic ``compute_assignment``
+    hook (S2-5).
+
+    S2-10: ``select_alignment`` (the capacity gate) is NOT a LegacyAdapter slot
+    — it is serviced by ``CapacityGatePlugin`` — so it is excluded here.
+    """
+    for slot in ("compute_cost", "apply_cost_mask",
+                 "solve_assignment", "refine_assignment"):
         assert callable(getattr(LegacyAdapter, slot, None)), (
             f"LegacyAdapter missing assignment slot {slot!r}"
         )
+    assert not hasattr(LegacyAdapter, "select_alignment"), (
+        "LegacyAdapter must NOT declare select_alignment — the capacity gate "
+        "is serviced by CapacityGatePlugin (S2-10)"
+    )
     assert not hasattr(LegacyAdapter, "compute_assignment"), (
         "LegacyAdapter.compute_assignment must be gone after the S2-5 "
         "decomposition — the bump loop now lives in orchestrator._run_assignment"
+    )
+
+
+def _make_capacity_gate():
+    """Build a CapacityGatePlugin with the same gate knobs ``_build_minimal_adapter``
+    passes the LegacyAdapter (max_group_cap=0 / capacity_util_threshold=0.0 /
+    cost_alignment_cfg="pre" / cost_asymmetric=False). S2-10: the hand-built
+    plugin lists need it to service the ``select_alignment`` slot.
+    """
+    from moe_compress.stage2.plugins.capacity_gate import CapacityGatePlugin
+    return CapacityGatePlugin(
+        max_group_cap=0, capacity_util_threshold=0.0,
+        cost_alignment_cfg="pre", cost_asymmetric=False,
     )
 
 
@@ -437,7 +461,9 @@ def _prepare_layer_for_assignment(tiny_model, patched_stage2, tmp_path):
     moe_layers = list(iter_moe_layers(tiny_model))
     adapter = _build_minimal_adapter(tiny_model, patched_stage2, tmp_path,
                                      moe_layers=moe_layers)
-    plugins = [ReapScoringPlugin(), adapter]
+    # S2-10: CapacityGatePlugin services the select_alignment slot — without it
+    # _run_assignment's ``assert _alignment is not None`` would fire.
+    plugins = [ReapScoringPlugin(), _make_capacity_gate(), adapter]
     layer_ref = moe_layers[0]
     ctx = _make_layer_ctx(PipelineContext(),
                           layer_idx=layer_ref.layer_idx,
@@ -461,15 +487,25 @@ def test_run_assignment_dispatches_slots(tiny_model, patched_stage2, tmp_path):
     and its ``refine_assignment`` delegates to ``adapter.refine_assignment``
     (the neutered dead fallback, returns ``None``). The chain loop handles the
     ``None`` cleanly, so the probe still records exactly one
-    ``refine_assignment`` call per bump and the canonical four-slot order holds.
+    ``refine_assignment`` call per bump and the canonical slot order holds.
+
+    S2-10: ``select_alignment`` (the capacity gate) is the first slot
+    ``_run_assignment`` dispatches per bump — the probe delegates it to a real
+    ``CapacityGatePlugin`` so the gate slots are published before
+    ``compute_cost`` reads them back.
     """
     adapter, plugins, ctx = _prepare_layer_for_assignment(
         tiny_model, patched_stage2, tmp_path)
 
     calls: list[str] = []
+    gate = _make_capacity_gate()
 
     class _SlotProbe:
         name = "slot_probe"
+
+        def select_alignment(self, ctx):
+            calls.append("select_alignment")
+            return gate.select_alignment(ctx)
 
         def compute_cost(self, ctx):
             calls.append("compute_cost")
@@ -498,10 +534,11 @@ def test_run_assignment_dispatches_slots(tiny_model, patched_stage2, tmp_path):
     # At least one bump iteration ran the success branch (the tiny model is
     # feasible with max_group_cap=0), so every slot fired.
     assert calls, "no assignment slots were dispatched"
-    n_bumps = len(calls) // 4
+    n_slots = len(_ASSIGNMENT_SLOTS)
+    n_bumps = len(calls) // n_slots
     assert n_bumps >= 1
     # Per-bump invocation: the recorded calls are whole repeats of the
-    # canonical four-slot order.
+    # canonical five-slot order.
     assert calls == list(_ASSIGNMENT_SLOTS) * n_bumps, (
         f"slot calls not in canonical per-bump order: {calls}"
     )

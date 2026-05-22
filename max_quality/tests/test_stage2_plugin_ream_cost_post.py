@@ -21,18 +21,13 @@ from moe_compress.utils.model_io import iter_moe_layers
 def _cost_kwargs(cov_acc=None, *, cost_alignment_cfg="post"):
     """Representative cost knobs — same shape the orchestrator passes.
 
-    ``max_group_cap=0`` (uncapped) makes the capacity gate treat every layer
-    as fully slack (u = 0); ``capacity_util_threshold=1.0`` then downgrades the
-    configured ``post`` -> ``pre`` per layer (the documented gate behaviour),
-    so the live ``compute_cost`` slot runs the cheap symmetric path without
-    needing input covariance.
+    S2-10: the capacity-gate knobs (max_group_cap / capacity_util_threshold /
+    cost_asymmetric) moved to CapacityGatePlugin and are no longer cost-plugin
+    ctor args. The cost slot now READS the gate's decision off the ctx.
     """
     return dict(
         cov_acc=cov_acc if cov_acc is not None else InputCovarianceAccumulator(),
-        max_group_cap=0,
-        capacity_util_threshold=1.0,
         cost_alignment_cfg=cost_alignment_cfg,
-        cost_asymmetric=False,
         cost_whitening="none",
         cost_topk_filter=2,
         cost_output_token_cap=8,
@@ -70,14 +65,15 @@ def test_plugin_name():
 # --- S2-6: the live compute_cost slot ---------------------------------------
 
 def test_compute_cost_is_live_slot(tiny_model):
-    """S2-6: `ReamCostPostPlugin.compute_cost` is a live slot — it runs the
-    capacity-util gate + `_ream_cost_matrix` and returns a finite cost matrix
-    of the right shape, NOT None.
+    """S2-6 / S2-10: `ReamCostPostPlugin.compute_cost` is a live slot — it runs
+    `_ream_cost_matrix` and returns a finite cost matrix of the right shape,
+    NOT None.
 
-    With ``max_group_cap=0`` the capacity gate downgrades ``post`` -> ``pre``
-    (the configured ``post`` mode is unreachable when the cap is uncapped), so
-    the cheap symmetric path runs and every entry is finite — exactly the
-    documented per-layer gate behaviour.
+    S2-10: the capacity gate moved out into ``CapacityGatePlugin.select_alignment``;
+    ``compute_cost`` now READS ``effective_cost_alignment`` /
+    ``effective_cost_asymmetric`` off the ctx. The test pre-sets them to ``pre``
+    (the cheap symmetric path) — exactly what the gate publishes on a slack
+    layer — so every entry is finite without needing input covariance.
     """
     from moe_compress.stage2.permutation_align import _PermAlignCache
 
@@ -97,6 +93,9 @@ def test_compute_cost_is_live_slot(tiny_model):
     ctx.set("_iter_ream_noncentroid_ids", tuple(noncentroid_ids))
     ctx.set("_iter_n_ream_c", len(centroid_ids))
     ctx.set("_iter_n_ream_nc", len(noncentroid_ids))
+    # Gate decision the orchestrator's select_alignment slot publishes first.
+    ctx.set("effective_cost_alignment", "pre")
+    ctx.set("effective_cost_asymmetric", False)
 
     plugin = ReamCostPostPlugin(**_cost_kwargs())
     delta = plugin.compute_cost(ctx)
@@ -105,6 +104,3 @@ def test_compute_cost_is_live_slot(tiny_model):
     assert isinstance(delta, np.ndarray)
     assert delta.shape == (len(noncentroid_ids), len(centroid_ids))
     assert np.isfinite(delta).all()
-    # max_group_cap=0 -> capacity gate downgrades the configured 'post' to
-    # 'pre' (uncapped layers always take the cheap symmetric path).
-    assert ctx.get("effective_cost_alignment") == "pre"

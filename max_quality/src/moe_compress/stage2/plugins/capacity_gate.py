@@ -16,11 +16,12 @@ no cycle at module load. ``LegacyAdapter.compute_assignment`` imports
 ``_pick_effective_alignment`` from *this* module (its true home), not via the
 monolith re-import.
 
-``CapacityGatePlugin`` is the future plugin home for the gate. For T11 it is an
-inert shell: ``compute_cost`` is a documented no-op because the legacy bump
-loop (``LegacyAdapter.compute_assignment``) still calls
-``_pick_effective_alignment`` directly. Wiring the gate into the phase walk is
-deferred until the assignment phase is decomposed (T13+).
+``CapacityGatePlugin`` is the LIVE capacity gate. S2-10 wired it into the
+``select_alignment`` assignment slot: ``_run_assignment`` dispatches
+``select_alignment`` once per bump iteration BEFORE the ``compute_cost`` slot.
+The gate computes ``capacity_util_value`` / ``effective_cost_alignment`` /
+``effective_cost_asymmetric`` and writes them to ctx; the cost plugins'
+``compute_cost`` then just READS those slots back.
 """
 from __future__ import annotations
 
@@ -62,22 +63,43 @@ def _pick_effective_alignment(
 
 
 class CapacityGatePlugin:
-    """Plugin home for the per-layer capacity-utilization gate (M3).
+    """Live plugin home for the per-layer capacity-utilization gate (M3).
 
-    T11 status: inert shell. ``LegacyAdapter.compute_assignment`` still calls
-    ``_pick_effective_alignment`` directly inside the bump loop, so this
-    plugin's ``compute_cost`` hook is a deliberate no-op. The plugin exists now
-    so the gate has a stable home; wiring it into the phase walk is deferred
-    until the assignment phase is decomposed (T13+).
+    S2-10 wired the gate into the ``select_alignment`` assignment slot:
+    ``_run_assignment`` dispatches ``select_alignment`` once per bump iteration
+    BEFORE the ``compute_cost`` slot. ``select_alignment`` computes
+    ``capacity_util_value`` / ``effective_cost_alignment`` /
+    ``effective_cost_asymmetric`` and writes them to ctx; the cost plugins'
+    ``compute_cost`` then just READS those slots back. The gate may downgrade a
+    ``post`` / ``output``-configured run to ``pre`` per layer (slack-capacity
+    layers) — that is correct and intentional.
     """
 
     name = "capacity_gate"
     paper = "Capacity-utilization gate: SLACK vs TIGHT cost-path selection (M3)."
     config_key = "stage2_reap_ream"
-    # () until a later task wires the live hook
-    reads: tuple[str, ...] = ()
-    writes: tuple[str, ...] = ()
+    # select_alignment reads the per-bump non-centroid / centroid counts and
+    # writes the three gate slots the compute_cost slot reads back.
+    reads: tuple[str, ...] = ("_iter_n_ream_c", "_iter_n_ream_nc")
+    writes: tuple[str, ...] = (
+        "capacity_util_value", "effective_cost_alignment", "effective_cost_asymmetric",
+    )
     provides: tuple[str, ...] = ()
+
+    def __init__(
+        self,
+        *,
+        max_group_cap: int,
+        capacity_util_threshold: float,
+        cost_alignment_cfg: str,
+        cost_asymmetric: bool,
+    ) -> None:
+        # Store every knob the gate body reads. NO logic — a faithful mirror of
+        # the matching subset of LegacyAdapter.__init__ / the run() locals.
+        self.max_group_cap = max_group_cap
+        self.capacity_util_threshold = capacity_util_threshold
+        self.cost_alignment_cfg = cost_alignment_cfg
+        self.cost_asymmetric = cost_asymmetric
 
     def is_enabled(self, config: dict) -> bool:
         """The gate always runs (it may be a no-op downgrade, but it decides)."""
@@ -86,10 +108,46 @@ class CapacityGatePlugin:
     def contribute_artifact(self, ctx) -> dict:
         return {}
 
-    def compute_cost(self, ctx: PipelineContext) -> Any | None:
-        """No-op for T11. See class docstring.
+    def select_alignment(self, ctx: PipelineContext) -> Any | None:
+        """Slot ``select_alignment`` — the per-layer capacity-utilization gate.
 
-        Returning ``None`` makes ``PluginRegistry.dispatch_first`` skip this
-        plugin so the legacy bump loop remains the sole cost-matrix producer.
+        Verbatim lift of the capacity-gate block that used to live inside
+        ``ream_cost._compute_cost_for_plugin``: reads the ``_iter_n_ream_*``
+        bump-loop scratch counts, computes ``capacity_util_value``, calls
+        ``_pick_effective_alignment``, derives ``effective_cost_asymmetric`` and
+        writes all three back to ``ctx`` (``overwrite=True``). Runs BEFORE the
+        ``compute_cost`` slot so the cost plugins read these slots back.
+
+        Returns ``effective_cost_alignment`` (a non-None string) so
+        ``PluginRegistry.dispatch_first`` registers this plugin as the winner.
         """
-        return None
+        n_ream_c = ctx.get("_iter_n_ream_c")
+        n_ream_nc = ctx.get("_iter_n_ream_nc")
+
+        # Stage 2 v2 capacity-utilization gate (M3, spec § 5 step 3):
+        #   u = n_NC / (N'_l × C_max). When u < threshold, the layer
+        #   has so much slack capacity that the heavyweight
+        #   post-alignment cost matrix is unlikely to change the
+        #   assignment meaningfully — fall back to the cheap symmetric
+        #   path. This is what skips ~half the layers' compute.
+        # Capture the actual u value into the layer-scope variable
+        # so the per-layer Trackio emit can surface it; mirrors the
+        # division done inside _pick_effective_alignment.
+        if self.max_group_cap <= 0:
+            capacity_util_value = 0.0
+        else:
+            capacity_util_value = n_ream_nc / max(n_ream_c * self.max_group_cap, 1)
+        effective_cost_alignment = _pick_effective_alignment(
+            n_nc=n_ream_nc,
+            n_c=n_ream_c,
+            max_group_cap=self.max_group_cap,
+            threshold=self.capacity_util_threshold,
+            configured=self.cost_alignment_cfg,
+        )
+        effective_cost_asymmetric = (
+            self.cost_asymmetric and effective_cost_alignment == "post"
+        )
+        ctx.set("capacity_util_value", capacity_util_value, overwrite=True)
+        ctx.set("effective_cost_alignment", effective_cost_alignment, overwrite=True)
+        ctx.set("effective_cost_asymmetric", effective_cost_asymmetric, overwrite=True)
+        return effective_cost_alignment

@@ -1,7 +1,7 @@
-"""Task 11 — capacity-utilization gate plugin module.
+"""Task 11 / S2-10 — capacity-utilization gate plugin module.
 
-Pins the `CapacityGatePlugin` contract, the gate decision logic, and a
-monkeypatch-drift guard (T9/T10 lesson).
+Pins the `CapacityGatePlugin` contract, the gate decision logic, the live
+``select_alignment`` slot, and a monkeypatch-drift guard (T9/T10 lesson).
 """
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import pathlib
 
 import pytest
 
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage2.plugins.capacity_gate import (
     CapacityGatePlugin,
@@ -16,25 +17,37 @@ from moe_compress.stage2.plugins.capacity_gate import (
 )
 
 
+# Representative gate knobs — the same shape the orchestrator passes (the four
+# parsed ``run()`` locals the gate stores).
+def _gate_kwargs(*, cost_alignment_cfg="pre", max_group_cap=8,
+                 capacity_util_threshold=0.25, cost_asymmetric=False):
+    return dict(
+        max_group_cap=max_group_cap,
+        capacity_util_threshold=capacity_util_threshold,
+        cost_alignment_cfg=cost_alignment_cfg,
+        cost_asymmetric=cost_asymmetric,
+    )
+
+
 def test_ream_cost_plugin_imports_from_capacity_gate():
-    """The live cost path resolves the gate from the sibling capacity_gate
-    module — not the monolith — so monkeypatching ``stage2_reap_ream`` will
-    not silently no-op the gate for any of the three live cost plugins.
+    """``CapacityGatePlugin.select_alignment`` resolves the gate decision from
+    the sibling ``capacity_gate`` module — not the monolith — so monkeypatching
+    ``stage2_reap_ream`` will not silently no-op the gate.
 
     (Pre-S2-5 this guarded ``LegacyAdapter.compute_assignment``; S2-5
-    decomposed that and S2-6 moved the live cost path into
-    ``ream_cost._compute_cost_for_plugin``.)"""
+    decomposed that, S2-6 moved the cost path into
+    ``ream_cost._compute_cost_for_plugin``, and S2-10 moved the gate itself
+    into ``CapacityGatePlugin.select_alignment``.)"""
     import inspect
-    import moe_compress.stage2.plugins.ream_cost as ream_cost_mod
-    src = inspect.getsource(ream_cost_mod._compute_cost_for_plugin)
-    assert "from .capacity_gate import _pick_effective_alignment" in src
+    src = inspect.getsource(CapacityGatePlugin.select_alignment)
+    assert "_pick_effective_alignment(" in src
     assert "from ...stage2_reap_ream import _pick_effective_alignment" not in src
 
 
 # --- CapacityGatePlugin contract -------------------------------------------
 
 def test_plugin_conforms_to_pipeline_plugin():
-    assert isinstance(CapacityGatePlugin(), PipelinePlugin)
+    assert isinstance(CapacityGatePlugin(**_gate_kwargs()), PipelinePlugin)
 
 
 def test_plugin_name():
@@ -43,16 +56,54 @@ def test_plugin_name():
 
 def test_plugin_always_enabled():
     """The gate always runs → is_enabled is True for every config shape."""
-    assert CapacityGatePlugin().is_enabled({}) is True
-    assert CapacityGatePlugin().is_enabled({"stage2_reap_ream": {}}) is True
-    assert CapacityGatePlugin().is_enabled(
+    assert CapacityGatePlugin(**_gate_kwargs()).is_enabled({}) is True
+    assert CapacityGatePlugin(**_gate_kwargs()).is_enabled(
+        {"stage2_reap_ream": {}}) is True
+    assert CapacityGatePlugin(**_gate_kwargs()).is_enabled(
         {"stage2_reap_ream": {"cost_alignment": "post"}}
     ) is True
 
 
-def test_plugin_compute_cost_is_noop():
-    """T11 shell: compute_cost returns None so dispatch_first skips it."""
-    assert CapacityGatePlugin().compute_cost(ctx=None) is None
+def test_select_alignment_writes_gate_slots_and_returns_winner():
+    """S2-10: ``select_alignment`` is the live gate slot — it writes the three
+    gate slots to ctx and returns a non-None winner so ``dispatch_first``
+    registers it.
+
+    ``max_group_cap=8``, ``n_nc=12``, ``n_c=2`` → u = 12/(2*8) = 0.75 ≥ 0.25
+    threshold → TIGHT → the configured ``post`` wins.
+    """
+    ctx = PipelineContext()
+    ctx.set("_iter_n_ream_c", 2)
+    ctx.set("_iter_n_ream_nc", 12)
+
+    plugin = CapacityGatePlugin(**_gate_kwargs(
+        cost_alignment_cfg="post", cost_asymmetric=True))
+    result = plugin.select_alignment(ctx)
+
+    # Non-None winner so PluginRegistry.dispatch_first registers this plugin.
+    assert result is not None
+    assert result == "post"
+    # The three gate slots were published to ctx.
+    assert ctx.get("effective_cost_alignment") == "post"
+    assert ctx.get("effective_cost_asymmetric") is True
+    assert ctx.get("capacity_util_value") == 12 / (2 * 8)
+
+
+def test_select_alignment_slack_downgrades_to_pre():
+    """A slack-capacity layer (u < threshold) downgrades the configured
+    ``post`` → ``pre``; ``effective_cost_asymmetric`` follows to False."""
+    ctx = PipelineContext()
+    ctx.set("_iter_n_ream_c", 4)
+    ctx.set("_iter_n_ream_nc", 2)  # u = 2/(4*8) = 0.0625 < 0.25 → SLACK
+
+    plugin = CapacityGatePlugin(**_gate_kwargs(
+        cost_alignment_cfg="post", cost_asymmetric=True))
+    result = plugin.select_alignment(ctx)
+
+    assert result == "pre"
+    assert ctx.get("effective_cost_alignment") == "pre"
+    assert ctx.get("effective_cost_asymmetric") is False
+    assert ctx.get("capacity_util_value") == 2 / (4 * 8)
 
 
 # --- _pick_effective_alignment decision logic ------------------------------

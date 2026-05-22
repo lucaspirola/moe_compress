@@ -363,7 +363,13 @@ def _run_assignment(plugins, ctx) -> None:
             ctx.set("_iter_ream_noncentroid_ids", tuple(ream_noncentroid_ids), overwrite=True)
             ctx.set("_iter_n_ream_c", n_ream_c, overwrite=True)
             ctx.set("_iter_n_ream_nc", n_ream_nc, overwrite=True)
-            # Slot 1: compute_cost — capacity-util gate + REAM cost matrix.
+            # Slot 0: select_alignment — the per-layer capacity-utilization
+            # gate (CapacityGatePlugin). Runs BEFORE compute_cost; it publishes
+            # capacity_util_value / effective_cost_alignment /
+            # effective_cost_asymmetric to ctx, which the cost slot reads back.
+            _alignment = PluginRegistry.dispatch_first(plugins, "select_alignment", ctx)
+            assert _alignment is not None, "select_alignment slot returned None"
+            # Slot 1: compute_cost — REAM cost matrix (reads the gate slots).
             delta = PluginRegistry.dispatch_first(plugins, "compute_cost", ctx)
             assert delta is not None, "compute_cost slot returned None"
             # Slot 2: apply_cost_mask — Direction B skip-merge floor. The
@@ -931,6 +937,7 @@ def run(
     from ..pipeline.context import PipelineContext
     from ..pipeline.registry import PluginRegistry
     from ..tools.phase_walker import walk_phases
+    from .plugins.capacity_gate import CapacityGatePlugin
     from .plugins.legacy_adapter import LegacyAdapter
     from .plugins.output_space_cost import OutputSpaceCostPlugin
     from .plugins.ream_cost import ReamCostPrePlugin
@@ -1007,12 +1014,14 @@ def run(
     # the adapter received. ``registry.enabled(config)`` drops the two cost
     # plugins whose ``is_enabled`` gate is False, leaving exactly one cost
     # plugin (the one matching ``cost_alignment``) ahead of the adapter.
+    # S2-10: the capacity-util gate moved out of the cost plugins into
+    # CapacityGatePlugin (the ``select_alignment`` slot). The cost plugins no
+    # longer take ``max_group_cap`` / ``capacity_util_threshold`` /
+    # ``cost_asymmetric`` — those knobs are passed to CapacityGatePlugin
+    # instead.
     _cost_plugin_kwargs = dict(
         cov_acc=cov_acc,
-        max_group_cap=max_group_cap,
-        capacity_util_threshold=capacity_util_threshold,
         cost_alignment_cfg=cost_alignment_cfg,
-        cost_asymmetric=cost_asymmetric,
         cost_whitening=cost_whitening,
         cost_topk_filter=cost_topk_filter,
         cost_output_token_cap=cost_output_token_cap,
@@ -1040,6 +1049,17 @@ def run(
     )
     registry = PluginRegistry([
         ReapScoringPlugin(),
+        # S2-10: the capacity-utilization gate. Registered AFTER ReapScoringPlugin
+        # and BEFORE the three cost plugins so its ``select_alignment`` slot runs
+        # earlier in the bump iteration and publishes the gate decision
+        # (effective_cost_alignment / effective_cost_asymmetric /
+        # capacity_util_value) the cost plugins' ``compute_cost`` slot reads back.
+        CapacityGatePlugin(
+            max_group_cap=max_group_cap,
+            capacity_util_threshold=capacity_util_threshold,
+            cost_alignment_cfg=cost_alignment_cfg,
+            cost_asymmetric=cost_asymmetric,
+        ),
         ReamCostPrePlugin(**_cost_plugin_kwargs),
         ReamCostPostPlugin(**_cost_plugin_kwargs),
         OutputSpaceCostPlugin(**_cost_plugin_kwargs),

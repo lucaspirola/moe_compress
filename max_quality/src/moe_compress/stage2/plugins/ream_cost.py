@@ -19,7 +19,12 @@ wired its ``compute_cost`` hook into the ``compute_cost`` assignment slot: when
 ``cost_alignment`` resolves to ``"pre"`` this plugin is registered ahead of the
 ``LegacyAdapter`` and wins ``PluginRegistry.dispatch_first`` for the slot. All
 three cost plugins share the verbatim slot body via the module-level helper
-``_compute_cost_for_plugin`` below to avoid three drifting copies.
+``_compute_cost_for_plugin`` below to avoid three drifting copies. S2-10 moved
+the per-layer capacity-utilization gate out into
+``CapacityGatePlugin.select_alignment`` (a separate slot that runs earlier in
+the bump iteration); ``_compute_cost_for_plugin`` now just reads the gate's
+decision (``effective_cost_alignment`` / ``effective_cost_asymmetric``) back
+off ``ctx``.
 """
 from __future__ import annotations
 
@@ -252,23 +257,20 @@ def _ream_cost_matrix(
 def _compute_cost_for_plugin(plugin, ctx: PipelineContext) -> np.ndarray:
     """Shared ``compute_cost`` slot body for the three live cost plugins.
 
-    Verbatim lift of ``LegacyAdapter.compute_cost`` — the capacity-utilization
-    gate + ``_ream_cost_matrix`` call from the old ``compute_assignment``
-    bump-loop ``if not b_fail`` branch. The cost config knobs are read off
-    ``plugin.`` (each cost plugin stores them as instance attributes mirroring
-    ``LegacyAdapter.__init__``) instead of ``self.``; everything else — the ctx
-    reads, the capacity gate, the three ``ctx.set(..., overwrite=True)`` writes,
-    the ``_ream_cost_matrix`` call — is byte-identical to the legacy adapter.
+    The cost config knobs are read off ``plugin.`` (each cost plugin stores
+    them as instance attributes mirroring ``LegacyAdapter.__init__``); the ctx
+    reads and the ``_ream_cost_matrix`` call are byte-identical to the legacy
+    adapter.
 
-    The gate may downgrade a ``post``/``output``-configured plugin to ``pre``
-    per layer (slack-capacity layers) — that is correct and intentional, so all
-    three plugins keep the full gate. Writes ``capacity_util_value`` /
-    ``effective_cost_alignment`` / ``effective_cost_asymmetric`` back to ``ctx``
-    (``overwrite=True``). Reads the ``_iter_*`` scratch slots published by the
-    orchestrator. Returns the cost matrix ``delta``.
+    S2-10: the per-layer capacity-utilization gate moved out into
+    ``CapacityGatePlugin.select_alignment``, which the orchestrator dispatches
+    earlier in the same bump iteration (before this ``compute_cost`` slot). This
+    helper therefore just READS ``effective_cost_alignment`` /
+    ``effective_cost_asymmetric`` back off ``ctx`` (already published by the
+    gate) and threads them into the ``_ream_cost_matrix`` call exactly as
+    before. Reads the ``_iter_*`` scratch slots published by the orchestrator.
+    Returns the cost matrix ``delta``.
     """
-    from .capacity_gate import _pick_effective_alignment
-
     layer_ref = ctx.get("layer_ref")
     ream_acc = ctx.get("ream_acc")
     perm_cache = ctx.get("perm_cache")
@@ -278,35 +280,13 @@ def _compute_cost_for_plugin(plugin, ctx: PipelineContext) -> np.ndarray:
     protected = set(ctx.get("protected"))
     ream_centroid_ids = list(ctx.get("_iter_ream_centroid_ids"))
     ream_noncentroid_ids = list(ctx.get("_iter_ream_noncentroid_ids"))
-    n_ream_c = ctx.get("_iter_n_ream_c")
-    n_ream_nc = ctx.get("_iter_n_ream_nc")
 
-    # Stage 2 v2 capacity-utilization gate (M3, spec § 5 step 3):
-    #   u = n_NC / (N'_l × C_max). When u < threshold, the layer
-    #   has so much slack capacity that the heavyweight
-    #   post-alignment cost matrix is unlikely to change the
-    #   assignment meaningfully — fall back to the cheap symmetric
-    #   path. This is what skips ~half the layers' compute.
-    # Capture the actual u value into the layer-scope variable
-    # so the per-layer Trackio emit can surface it; mirrors the
-    # division done inside _pick_effective_alignment.
-    if plugin.max_group_cap <= 0:
-        capacity_util_value = 0.0
-    else:
-        capacity_util_value = n_ream_nc / max(n_ream_c * plugin.max_group_cap, 1)
-    effective_cost_alignment = _pick_effective_alignment(
-        n_nc=n_ream_nc,
-        n_c=n_ream_c,
-        max_group_cap=plugin.max_group_cap,
-        threshold=plugin.capacity_util_threshold,
-        configured=plugin.cost_alignment_cfg,
-    )
-    effective_cost_asymmetric = (
-        plugin.cost_asymmetric and effective_cost_alignment == "post"
-    )
-    ctx.set("capacity_util_value", capacity_util_value, overwrite=True)
-    ctx.set("effective_cost_alignment", effective_cost_alignment, overwrite=True)
-    ctx.set("effective_cost_asymmetric", effective_cost_asymmetric, overwrite=True)
+    # Capacity-gate outputs published by CapacityGatePlugin.select_alignment
+    # earlier in this bump iteration (S2-10). The gate may have downgraded a
+    # post/output-configured run to "pre" on a slack-capacity layer — that is
+    # correct and intentional; this slot simply consumes its decision.
+    effective_cost_alignment = ctx.get("effective_cost_alignment")
+    effective_cost_asymmetric = ctx.get("effective_cost_asymmetric")
     delta = _ream_cost_matrix(
         layer_ref, ream_noncentroid_ids, ream_centroid_ids,
         ream_acc=ream_acc,
@@ -337,15 +317,16 @@ def _compute_cost_for_plugin(plugin, ctx: PipelineContext) -> np.ndarray:
 
 
 # The ctx slots ``_compute_cost_for_plugin`` reads — shared by all three cost
-# plugins' ``reads`` metadata. ``writes`` is the three capacity-gate slots.
+# plugins' ``reads`` metadata. S2-10: the capacity-gate slots
+# ``effective_cost_alignment`` / ``effective_cost_asymmetric`` are now read in
+# (published by CapacityGatePlugin.select_alignment earlier in the bump
+# iteration); the cost plugins write nothing.
 _COST_PLUGIN_READS: tuple[str, ...] = (
     "layer_ref", "ream_acc", "perm_cache", "layer_input_acc", "freq",
     "protected", "_iter_ream_centroid_ids", "_iter_ream_noncentroid_ids",
-    "_iter_n_ream_c", "_iter_n_ream_nc",
+    "effective_cost_alignment", "effective_cost_asymmetric",
 )
-_COST_PLUGIN_WRITES: tuple[str, ...] = (
-    "capacity_util_value", "effective_cost_alignment", "effective_cost_asymmetric",
-)
+_COST_PLUGIN_WRITES: tuple[str, ...] = ()
 
 
 class ReamCostPrePlugin:
@@ -355,37 +336,35 @@ class ReamCostPrePlugin:
     ``cost_alignment`` resolves to ``"pre"`` the orchestrator registers this
     plugin ahead of the ``LegacyAdapter`` so it wins
     ``PluginRegistry.dispatch_first`` for the slot. The slot body — the
-    capacity-util gate + ``_ream_cost_matrix`` call — lives in the shared
-    module-level helper ``_compute_cost_for_plugin`` (one source of truth for
-    all three cost plugins).
+    ``_ream_cost_matrix`` call — lives in the shared module-level helper
+    ``_compute_cost_for_plugin`` (one source of truth for all three cost
+    plugins). S2-10 moved the capacity-util gate out into
+    ``CapacityGatePlugin.select_alignment``, which runs earlier in the bump
+    iteration; this slot just reads the gate's decision back off ``ctx``.
     """
 
     name = "ream_cost_pre"
     paper = "REAM symmetric pre-alignment cost matrix builder."
     config_key = "stage2_reap_ream.cost_alignment"
     reads: tuple[str, ...] = _COST_PLUGIN_READS
-    writes: tuple[str, ...] = _COST_PLUGIN_WRITES
+    writes: tuple[str, ...] = _COST_PLUGIN_WRITES  # () — S2-10 moved the gate out
     provides: tuple[str, ...] = ()
 
     def __init__(
         self,
         *,
         cov_acc,
-        max_group_cap: int,
-        capacity_util_threshold: float,
         cost_alignment_cfg: str,
-        cost_asymmetric: bool,
         cost_whitening: str,
         cost_topk_filter: int,
         cost_output_token_cap: int,
     ) -> None:
         # Store every knob the shared compute_cost body reads. NO logic — a
         # faithful mirror of the matching subset of LegacyAdapter.__init__.
+        # ``cost_alignment_cfg`` is retained for ``is_enabled``; the capacity
+        # gate's knobs moved to CapacityGatePlugin (S2-10).
         self.cov_acc = cov_acc
-        self.max_group_cap = max_group_cap
-        self.capacity_util_threshold = capacity_util_threshold
         self.cost_alignment_cfg = cost_alignment_cfg
-        self.cost_asymmetric = cost_asymmetric
         self.cost_whitening = cost_whitening
         self.cost_topk_filter = cost_topk_filter
         self.cost_output_token_cap = cost_output_token_cap
@@ -405,10 +384,12 @@ class ReamCostPrePlugin:
         return {}
 
     def compute_cost(self, ctx: PipelineContext) -> Any | None:
-        """Slot ``compute_cost`` — capacity-util gate + REAM cost matrix.
+        """Slot ``compute_cost`` — REAM cost matrix.
 
         Delegates to the shared ``_compute_cost_for_plugin`` helper (same body
         as the other two cost plugins and the dead ``LegacyAdapter.compute_cost``
-        fallback). Returns the cost matrix ``delta``.
+        fallback). Reads the capacity-gate decision off ``ctx`` (published by
+        ``CapacityGatePlugin.select_alignment`` earlier in the bump iteration).
+        Returns the cost matrix ``delta``.
         """
         return _compute_cost_for_plugin(self, ctx)

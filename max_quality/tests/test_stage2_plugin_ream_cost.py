@@ -22,13 +22,13 @@ from moe_compress.utils.model_io import iter_moe_layers
 
 # Representative cost knobs for constructing a cost plugin in a unit test —
 # the same shape the orchestrator passes (mirrors LegacyAdapter's cost knobs).
+# S2-10: the capacity-gate knobs (max_group_cap / capacity_util_threshold /
+# cost_asymmetric) moved to CapacityGatePlugin and are no longer cost-plugin
+# ctor args.
 def _cost_kwargs(cov_acc=None, *, cost_alignment_cfg="pre"):
     return dict(
         cov_acc=cov_acc if cov_acc is not None else InputCovarianceAccumulator(),
-        max_group_cap=0,
-        capacity_util_threshold=0.0,
         cost_alignment_cfg=cost_alignment_cfg,
-        cost_asymmetric=False,
         cost_whitening="none",
         cost_topk_filter=2,
         cost_output_token_cap=8,
@@ -116,12 +116,21 @@ def _prepare_cost_ctx(tiny_model):
 
 
 def test_compute_cost_is_live_slot(tiny_model):
-    """S2-6: `ReamCostPrePlugin.compute_cost` is now a live slot — it runs the
-    capacity-util gate + `_ream_cost_matrix` and returns a finite cost matrix
-    of the right shape, NOT None."""
+    """S2-6 / S2-10: `ReamCostPrePlugin.compute_cost` is a live slot — it runs
+    `_ream_cost_matrix` and returns a finite cost matrix of the right shape,
+    NOT None.
+
+    S2-10: the capacity gate moved out into ``CapacityGatePlugin.select_alignment``;
+    ``compute_cost`` now READS ``effective_cost_alignment`` /
+    ``effective_cost_asymmetric`` off the ctx, so the test pre-sets them (as the
+    orchestrator's earlier ``select_alignment`` dispatch would).
+    """
     layer_ref, ctx = _prepare_cost_ctx(tiny_model)
     n_nc = ctx.get("_iter_n_ream_nc")
     n_c = ctx.get("_iter_n_ream_c")
+    # Gate decision the orchestrator's select_alignment slot publishes first.
+    ctx.set("effective_cost_alignment", "pre")
+    ctx.set("effective_cost_asymmetric", False)
 
     plugin = ReamCostPrePlugin(**_cost_kwargs())
     delta = plugin.compute_cost(ctx)
@@ -130,22 +139,27 @@ def test_compute_cost_is_live_slot(tiny_model):
     assert isinstance(delta, np.ndarray)
     assert delta.shape == (n_nc, n_c)
     assert np.isfinite(delta).all()
-    # The gate also wrote the three capacity slots back onto ctx.
-    assert ctx.get("effective_cost_alignment") == "pre"
-    assert ctx.get("effective_cost_asymmetric") is False
-    assert ctx.get("capacity_util_value") == 0.0
 
 
 def test_compute_cost_byte_identical_to_legacy_adapter(tiny_model, tmp_path):
-    """Strongest guard: `ReamCostPrePlugin.compute_cost` and the (dead)
-    `LegacyAdapter.compute_cost` fallback produce an identical `delta` on the
-    same prepared ctx — the S2-6 wiring is behaviour-preserving."""
+    """Strongest guard: the S2-10 gate-then-cost path
+    (`CapacityGatePlugin.select_alignment` followed by
+    `ReamCostPrePlugin.compute_cost`) produces an identical `delta` to the
+    (dead) `LegacyAdapter.compute_cost` fallback (which self-contains the
+    gate) on the same prepared ctx — the wiring is behaviour-preserving."""
+    from moe_compress.stage2.plugins.capacity_gate import CapacityGatePlugin
     from moe_compress.stage2.plugins.legacy_adapter import LegacyAdapter
 
     cov_acc = InputCovarianceAccumulator()
 
-    # Plugin path.
+    # Plugin path: select_alignment FIRST (publishes the gate slots), then
+    # compute_cost reads them back — mirrors the orchestrator's bump iteration.
     layer_ref, ctx_plugin = _prepare_cost_ctx(tiny_model)
+    gate = CapacityGatePlugin(
+        max_group_cap=0, capacity_util_threshold=0.0,
+        cost_alignment_cfg="pre", cost_asymmetric=False,
+    )
+    gate.select_alignment(ctx_plugin)
     plugin = ReamCostPrePlugin(**_cost_kwargs(cov_acc))
     delta_plugin = plugin.compute_cost(ctx_plugin)
 
