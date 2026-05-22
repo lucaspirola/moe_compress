@@ -81,7 +81,6 @@ try:
 except Exception:  # noqa: BLE001
     _SYMPY_AVAILABLE = False
 
-from .utils.calibration import iter_batches
 from .utils.model_io import (
     count_expert_parameters,
     count_parameters_effective,
@@ -112,7 +111,17 @@ from .stage6.plugins.eval_environment import (  # noqa: F401
     _apply_stage6_kernel_patches,
 )
 
-_ZERO_SHOT_TASKS: frozenset[str] = frozenset({"arc_challenge_acc", "hellaswag_acc"})
+# S6-3: WikiText-2 PPL + zero-shot lm-eval relocated to stage6/plugins/
+# {wikitext_ppl,zero_shot_lm_eval}. Re-imported so run(), _check_thresholds()
+# and external callers/tests (e.g. stage6alt_thermometer) keep their
+# stage6_validate import paths. _wikitext2_ppl / _lm_eval_tasks are the
+# Pattern-A relocated functions; _ZERO_SHOT_TASKS is the relocated constant
+# (re-imported, not re-declared, so its identity stays single-sourced).
+from .stage6.plugins.wikitext_ppl import _wikitext2_ppl  # noqa: F401
+from .stage6.plugins.zero_shot_lm_eval import (  # noqa: F401
+    _ZERO_SHOT_TASKS,
+    _lm_eval_tasks,
+)
 
 # F-C-H-1: Spec F-S-M-1 mandates eager attention for both teacher and student
 # during the Stage 6 gate run. Constant — never override at call sites.
@@ -1085,221 +1094,11 @@ def _run_llama_imatrix_with_prebuilt_gguf(
 
 
 # ---------------------------------------------------------------------------
-# WikiText-2 perplexity (Optimization #1: configurable batch_size)
+# WikiText-2 perplexity (Optimization #1) + zero-shot lm-eval (Optimization #2)
+# relocated to stage6/plugins/{wikitext_ppl,zero_shot_lm_eval} by S6-3.
+# _wikitext2_ppl, _ZERO_SHOT_TASKS and _lm_eval_tasks are re-imported in the
+# S6-3 # noqa: F401 block near the top of this module.
 # ---------------------------------------------------------------------------
-
-
-def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
-                   batch_size: int = 8,
-                   dataset_revisions: dict[str, str | None] | None = None) -> float:
-    """Standard next-token NLL → exp(mean_NLL), seq_len=2048.
-
-    Batching doesn't change NLL computation — each sequence is scored
-    independently; out.loss is the mean over tokens in each batch element,
-    and we scale by (batch.numel() - batch.shape[0]) to recover the sum.
-    Numerically identical to batch_size=1.
-
-    F-C-H-3: pass revision= to load_dataset when a pinned SHA is configured.
-
-    F-iter4-CRIT-1: assert that the model is running under eager attention.
-    Spec §9 lines 821, 838 require eager attn for the Stage 6 gate run for
-    BOTH teacher and student to remove cross-batch sdpa-kernel variance and
-    preserve the bs=1 ↔ bs>1 numerical-equivalence claim of Optimization #1.
-    F-iter4-L-4: assert sequence_length == 2048 (Spec §9 line 769).
-    """
-    # F-iter4-L-4: PPL chunk length is fixed by spec.
-    assert int(cfg.get("sequence_length", 0)) == 2048, (
-        f"_wikitext2_ppl: cfg['sequence_length'] must be 2048 per Spec §9 "
-        f"line 769; got {cfg.get('sequence_length')!r}"
-    )
-    # F-iter4-CRIT-1: verify eager attention pin took effect.
-    try:
-        model_attn = getattr(model.config, "_attn_implementation", None)
-    except Exception:  # noqa: BLE001
-        model_attn = None
-    assert model_attn == _STAGE6_ATTN_IMPLEMENTATION, (
-        f"_wikitext2_ppl: model.config._attn_implementation={model_attn!r} "
-        f"but Spec §9 lines 821, 838 require {_STAGE6_ATTN_IMPLEMENTATION!r} "
-        f"for the Stage 6 gate run. The student must be loaded with "
-        f"attn_implementation='eager' (see run_pipeline._load_for_stage)."
-    )
-    from datasets import load_dataset
-
-    revision = (dataset_revisions or {}).get("wikitext_ppl")
-    try:
-        ds = load_dataset(cfg["dataset"], cfg["subset"], split=cfg["split"], revision=revision)
-    except Exception as exc:
-        log.warning("_wikitext2_ppl: load_dataset failed (%s); returning inf PPL", exc)
-        return float("inf")
-    # F-CR2-H-1/H-2 (Spec §9 / F-S-C-1): tokenize the entire concatenated corpus
-    # in a single call with add_special_tokens=True. This:
-    #   - applies BOS exactly once (closes F-CR2-H-2),
-    #   - inserts no inter-row separator tokens beyond the natural newline that
-    #     wikitext-2-raw-v1 already uses (closes F-CR2-H-1),
-    #   - matches the canonical HF / lm-eval WikiText-2 PPL recipe.
-    rows: list[str] = []
-    for row in ds:
-        text = row.get("text", "")
-        # Spec §9 / F-S-C-1 says BOS is applied once on the concatenated text;
-        # the row-to-row joiner is "\n\n" matching the canonical HF / lm-eval
-        # PPL recipe. Empty rows ARE preserved here (canonical recipe keeps
-        # them, producing a "\n\n" + "" + "\n\n" sequence that turns into the
-        # expected paragraph-spacing tokens). Filtering empties would change
-        # the token stream and chunk boundaries vs. the cited recipe.
-        if collect is not None and text.strip():
-            collect.append(text)
-        rows.append(text)
-    concatenated = "\n\n".join(rows)
-    all_ids: list[int] = tokenizer(
-        concatenated, add_special_tokens=True, return_tensors=None,
-    )["input_ids"]
-
-    seq_len = cfg["sequence_length"]
-    n_full = len(all_ids) // seq_len
-    if n_full == 0:
-        log.warning("WikiText-2 has no full-length sequences; returning inf.")
-        return float("inf")
-    chunks = torch.tensor(all_ids[: n_full * seq_len], dtype=torch.long).view(n_full, seq_len)
-
-    nll_sum = 0.0
-    tok_count = 0
-    log.info("Stage 6 PPL: %d sequences × len=%d, batch_size=%d", n_full, seq_len, batch_size)
-    # Infer device from model when not explicitly set (e.g. device_map="auto")
-    _ppl_dev = device
-    if _ppl_dev is None:
-        try:
-            _ppl_dev = next(model.parameters()).device
-        except StopIteration:
-            pass
-
-    skipped_batches = 0
-    total_batches = 0
-    with torch.no_grad():
-        for i, batch in enumerate(iter_batches(chunks, batch_size=batch_size)):
-            total_batches += 1
-            if _ppl_dev is not None:
-                batch = batch.to(_ppl_dev)
-            # out.loss is the mean NLL over all B*(seq_len-1) predicted tokens in the batch.
-            try:
-                out = model(input_ids=batch, labels=batch)
-                if out.loss is None:
-                    log.warning("_wikitext2_ppl: model returned None loss for batch; skipping")
-                    skipped_batches += 1
-                    continue
-                loss_val = float(out.loss.item())
-                if not math.isfinite(loss_val):
-                    log.warning("_wikitext2_ppl: non-finite loss %.2e for batch; skipping", loss_val)
-                    skipped_batches += 1
-                    continue
-                # L-3: Assumes the model uses the standard causal LM convention of
-                # shifting labels by one position, computing loss over (seq_len - 1)
-                # tokens per row.  The factor (batch.numel() - batch.shape[0]) equals
-                # B * (seq_len - 1), recovering the total NLL sum from the mean loss.
-                # Incorrect for models with non-standard label conventions (prefix
-                # labels, pad-masked losses, etc.).
-                nll = loss_val * (batch.numel() - batch.shape[0])
-                nll_sum += nll
-                tok_count += batch.numel() - batch.shape[0]
-            except Exception as exc:
-                log.warning("_wikitext2_ppl: error processing batch (%s); skipping", exc)
-                skipped_batches += 1
-                continue
-            if (i + 1) % max(1, 64 // batch_size) == 0:  # log every ~64 sequences regardless of batch size
-                log.info("  PPL forward %d/%d batches (%d/%d seqs)",
-                         i + 1, math.ceil(n_full / batch_size), min((i + 1) * batch_size, n_full), n_full)
-    if tok_count == 0:
-        # M1: All batches were skipped — PPL is entirely undefined, not just degraded.
-        log.error(
-            "_wikitext2_ppl: All batches skipped (%d/%d); PPL is undefined — returning inf",
-            skipped_batches, total_batches,
-        )
-        return float("inf")
-    if skipped_batches > 0:
-        # Spec §9 PPL formula is over ALL retained chunks (drop-last-partial only).
-        # A runtime skip would silently change the reported PPL's domain, so a
-        # gating decision could pass on a partially-broken student. Force inf
-        # to fail the gate rather than report a sub-corpus PPL.
-        log.error(
-            "_wikitext2_ppl: %d/%d batches were skipped (non-finite loss or runtime error); "
-            "spec §9 mandates PPL over the full retained-chunk corpus — returning inf to "
-            "fail the gate rather than report a sub-corpus PPL.",
-            skipped_batches, total_batches,
-        )
-        return float("inf")
-    try:
-        return math.exp(nll_sum / tok_count)
-    except OverflowError:
-        return float("inf")
-
-
-# ---------------------------------------------------------------------------
-# Zero-shot (ARC-C + HellaSwag) via lm-eval (Optimization #2: batch_size=auto:8)
-# ---------------------------------------------------------------------------
-
-
-def _lm_eval_tasks(model, tokenizer, tasks: list[str], *, collect=None,
-                   batch_size="auto:8", limit=None) -> dict:
-    """Delegate to lm-eval's simple_evaluate with configurable batch_size.
-
-    lm-eval's 0-shot loglikelihood scoring is deterministic and batch-size-
-    independent. Numerically identical to batch_size=1.
-
-    `limit` (int or float in (0,1], default None) caps the number of docs
-    per task — used by the stage6alt thermometer to subsample ARC-Easy /
-    HellaSwag for a cheap directional signal. None = evaluate the full task,
-    which is the behavior every full-Stage-6 caller relies on.
-    """
-    try:
-        from lm_eval import simple_evaluate
-        from lm_eval.models.huggingface import HFLM
-    except Exception as err:           # noqa: BLE001
-        log.warning("lm-eval not available (%s); skipping zero-shot.", err)
-        return {}
-
-    # Spec §9 #2: lm-eval batch-size invariance requires eager attention.
-    _attn_impl = getattr(model.config, "_attn_implementation", None)
-    if _attn_impl != _STAGE6_ATTN_IMPLEMENTATION:
-        raise RuntimeError(
-            f"Stage 6 _lm_eval_tasks: model.config._attn_implementation="
-            f"{_attn_impl!r}, expected {_STAGE6_ATTN_IMPLEMENTATION!r} per "
-            "spec §9 #2 (batch-size-independent loglikelihood requires eager attn)."
-        )
-    try:
-        lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
-        out = simple_evaluate(
-            model=lm, tasks=list(tasks), num_fewshot=0,
-            log_samples=(collect is not None),
-            limit=limit,
-        )
-        results = out.get("results", {})
-        flat: dict = {}
-        for task, metrics in results.items():
-            # ARC-C canonical metric is acc_norm,none (normalized); prefer it first.
-            # Use key-existence check (not truthiness) so acc=0.0 is not skipped.
-            for _k in ("acc_norm,none", "acc,none", "acc"):
-                if _k in metrics:
-                    acc = metrics[_k]
-                    break
-            else:
-                acc = None
-            if acc is not None:
-                flat[f"{task}_acc"] = float(acc)
-        if collect is not None and "samples" in out:
-            for task_samples in out["samples"].values():
-                seen: set[str] = set()
-                for s in task_samples:
-                    try:
-                        args = s.get("arguments", ())
-                        ctx = args[0] if args else None
-                        if ctx and isinstance(ctx, str) and ctx not in seen:
-                            seen.add(ctx)
-                            collect.append(ctx)
-                    except (KeyError, IndexError, TypeError):
-                        pass
-        return flat
-    except Exception as err:           # noqa: BLE001
-        log.warning("lm-eval evaluation failed: %s", err, exc_info=True)
-        return {}
 
 
 # ---------------------------------------------------------------------------
