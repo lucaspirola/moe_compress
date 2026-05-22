@@ -1,4 +1,4 @@
-"""Unit tests for ``moe_compress.stage1._framework.candidates``.
+"""Unit tests for ``moe_compress.pipeline.candidates``.
 
 Verifies the ``CandidateBag`` data structure's add / by_tag / merge /
 to_provenance_dict semantics, including the byte-identical shape match against
@@ -7,7 +7,7 @@ the legacy ``_collect_candidates`` return value.
 
 from __future__ import annotations
 
-from moe_compress.stage1._framework.candidates import CandidateBag
+from moe_compress.pipeline.candidates import CandidateBag
 
 
 def test_candidate_bag_add_and_tags_for():

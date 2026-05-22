@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 
-from .._framework.candidates import CandidateBag
+from ...pipeline.candidates import CandidateBag
 from ..context import Stage1Context
 
 log = logging.getLogger(__name__)

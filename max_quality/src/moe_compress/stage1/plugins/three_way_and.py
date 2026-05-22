@@ -35,7 +35,7 @@ import logging
 
 import numpy as np
 
-from .._framework.candidates import CandidateBag
+from ...pipeline.candidates import CandidateBag
 from ..context import Stage1Context
 
 log = logging.getLogger(__name__)

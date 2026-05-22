@@ -1,19 +1,23 @@
 """``CandidateBag`` — ordered union of (layer, expert) candidates with provenance tags.
 
-Replaces the inline ``dict[(layer_idx, expert_idx) -> list[str]]`` pattern
-scattered through Stage 1's candidate-collection phase. Legacy logic
-(relocated into the detector plugins in sub-tasks 5-8):
+``CandidateBag`` is a shared pipeline primitive: an ordered union of
+``(layer_idx, expert_idx)`` candidate sets carrying provenance tags. It
+replaces the ad-hoc ``dict[(layer_idx, expert_idx) -> list[str]]`` pattern
+with a single dict-of-sets source of truth that materialises deterministic
+sorted output on every read.
 
-* The legacy ``_collect_candidates`` built a
+Reference semantics it reproduces byte-identically:
+
+* A candidate collector builds a
   ``dict[(layer_idx, expert_idx) -> sorted list[str]]`` by
   ``setdefault((l, e), set()).add(tag)`` and then
   ``{key: sorted(tags) for key, tags in out.items()}`` at return.
-* The legacy ``_candidates_by_provenance`` inverted that:
-  given a single tag string, returned ``{str(li): sorted([expert_idx, ...])}``
-  for all (l, e) whose tag list contains that tag.
+* A by-provenance inversion takes a single tag string and returns
+  ``{str(li): sorted([expert_idx, ...])}`` for all (l, e) whose tag list
+  contains that tag.
 
 ``CandidateBag`` reproduces those return shapes byte-identically so the
-golden snapshot stays green when later sub-tasks switch to it.
+golden snapshot stays green for any consumer that switches to it.
 """
 
 from __future__ import annotations

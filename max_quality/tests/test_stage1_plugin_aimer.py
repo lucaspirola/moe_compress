@@ -29,7 +29,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from moe_compress.stage1._framework.candidates import CandidateBag
+from moe_compress.pipeline.candidates import CandidateBag
 from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.aimer import (
@@ -449,7 +449,7 @@ def test_plugin_contribute_artifact_byte_equivalent_to_legacy_inline():
             "candidates": _candidates_by_provenance("aimer"),
         }
     """
-    from moe_compress.stage1._framework.safe_json import safe_float
+    from moe_compress.pipeline.safe_json import safe_float
 
     aimer_scores = {(0, 0): 0.5, (0, 1): float("nan"), (1, 2): 0.99}
     bottom_pct_by_layer = {0: [1], 1: [2]}

@@ -35,7 +35,7 @@ import torch
 from ..budget.solver import BudgetDecomposition
 from ._framework.artifact_assembly import ArtifactBuilder
 from ._framework.calibration_engine import CalibrationEngine, HookKind, HookSpec
-from ._framework.candidates import CandidateBag
+from ..pipeline.candidates import CandidateBag
 from ..pipeline.registry import PluginRegistry
 from ..utils.activation_hooks import DownProjMaxAccumulator, ExpertOutputAccumulator
 from ..utils.calibration import build_calibration_tensor, iter_batches, spec_from_config

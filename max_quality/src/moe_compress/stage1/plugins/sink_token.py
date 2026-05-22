@@ -43,8 +43,8 @@ from __future__ import annotations
 
 import logging
 
-from .._framework.candidates import CandidateBag
-from .._framework.safe_json import safe_float
+from ...pipeline.candidates import CandidateBag
+from ...pipeline.safe_json import safe_float
 from ...utils.sink_token_routing import (
     SinkTokenRoutingAccumulator,
     apply_sink_token_candidate_selection,

@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .._framework.safe_json import safe_float
+from ...pipeline.safe_json import safe_float
 from ...utils.activation_hooks import run_calibration_early_exit
 from ...utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from ...utils.model_io import iter_decoder_layers, iter_moe_layers

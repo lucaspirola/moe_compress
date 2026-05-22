@@ -27,7 +27,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from moe_compress.stage1._framework.candidates import CandidateBag
+from moe_compress.pipeline.candidates import CandidateBag
 from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.sink_token import SinkTokenDetectorPlugin
@@ -432,7 +432,7 @@ def test_plugin_contribute_artifact_byte_equivalent_to_legacy_inline():
             "candidates": _candidates_by_provenance("sink_token"),
         }
     """
-    from moe_compress.stage1._framework.safe_json import safe_float
+    from moe_compress.pipeline.safe_json import safe_float
 
     sink_acc = SinkTokenRoutingAccumulator(
         num_layers=2, num_experts=4, bos_token_id=None,

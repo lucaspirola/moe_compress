@@ -60,11 +60,11 @@ Six moving parts. Know which one your new code touches.
   `(accumulator, HookSpec)` pair via `_build_accumulator`, and the engine wires
   **all** hooks in **one** forward pass over the calibration batches.
 
-- **`_framework/candidates.py` → `CandidateBag`** and
+- **`pipeline/candidates.py` → `CandidateBag`** and
   **`_framework/artifact_assembly.py` → `ArtifactBuilder`** — the candidate-union
   data structure (the 4 detectors all `add()` into one shared bag) and the
   `stage1_blacklist.json` assembler (validates the 7-top-level-key schema —
-  see `REQUIRED_BLACKLIST_TOP_LEVEL_KEYS`). **`_framework/safe_json.py` →
+  see `REQUIRED_BLACKLIST_TOP_LEVEL_KEYS`). **`pipeline/safe_json.py` →
   `safe_float`** turns NaN / ±Inf into JSON `null`; call it on every float
   inside `contribute_artifact` before the float enters a JSON fragment.
 

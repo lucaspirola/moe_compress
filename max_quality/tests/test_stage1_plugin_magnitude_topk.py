@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from moe_compress.stage1._framework.candidates import CandidateBag
+from moe_compress.pipeline.candidates import CandidateBag
 from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.magnitude_topk import (

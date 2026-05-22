@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from moe_compress.stage1._framework.candidates import CandidateBag
+from moe_compress.pipeline.candidates import CandidateBag
 from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage1.context import Stage1Context
 from moe_compress.stage1.plugins.three_way_and import (

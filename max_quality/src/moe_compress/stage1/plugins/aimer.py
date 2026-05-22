@@ -37,8 +37,8 @@ import logging
 
 import torch
 
-from .._framework.candidates import CandidateBag
-from .._framework.safe_json import safe_float
+from ...pipeline.candidates import CandidateBag
+from ...pipeline.safe_json import safe_float
 from ...utils.aimer import aimer_bottom_pct_per_layer, aimer_score_tensor
 from ..context import Stage1Context
 
@@ -62,7 +62,7 @@ class AimerDetectorPlugin:
     :meth:`contribute_artifact`. The block has exactly three keys:
 
     - ``scores``: ``{f"L{li}E{e}": float | None}`` — every (l, e) score
-      with NaN/±Inf scrubbed to ``None`` via ``_framework.safe_json.safe_float``.
+      with NaN/±Inf scrubbed to ``None`` via ``pipeline.safe_json.safe_float``.
     - ``bottom_pct_per_layer``: ``{str(li): [int, ...]}`` — expert ids
       per layer, lowest score first.
     - ``candidates``: ``{str(li): sorted([int, ...])}`` — derived by

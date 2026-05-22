@@ -1,10 +1,10 @@
-"""Unit tests for ``moe_compress.stage1._framework.safe_json``."""
+"""Unit tests for ``moe_compress.pipeline.safe_json``."""
 
 from __future__ import annotations
 
 import math
 
-from moe_compress.stage1._framework.safe_json import safe_float
+from moe_compress.pipeline.safe_json import safe_float
 
 
 def test_safe_float_passes_finite_floats():
