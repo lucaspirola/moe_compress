@@ -53,7 +53,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S2-13c Rewrite stage2_plugin_guide.md for the final S2-12/S2-13 architecture
 
 ## Stage 3 — SVD (Part 5.1)
-- [ ] S3-0  Capture stage-3 golden
+- [x] S3-0  Capture stage-3 golden — test_stage3_golden_snapshot.py (rank_map.json, fp32+bf16)
 - [ ] S3-1  Scaffold stage3/ package
 - [ ] S3-2  covariance_collection plugin
 - [ ] S3-3  d_rank_allocate plugin
