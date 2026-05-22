@@ -1,11 +1,11 @@
 """Single all-in-one Stage 2 plugin holding the legacy per-layer loop body.
 
 Temporary scaffolding plugin for Task 6 of the plugin-architecture refactor:
-it gives ``Stage2Pipeline.run_layer`` something to drive while preserving
-byte-identical behaviour vs. the pre-refactor inline loop. Each phase hook on
-this class is a verbatim slice of the legacy loop body, with long explanatory
-comments preserved (the original lines are the load-bearing documentation of
-the assignment / bump / heal / distill semantics).
+it gives the universal ``walk_phases`` phase walk something to drive while
+preserving byte-identical behaviour vs. the pre-refactor inline loop. Each
+phase hook on this class is a verbatim slice of the legacy loop body, with long
+explanatory comments preserved (the original lines are the load-bearing
+documentation of the assignment / bump / heal / distill semantics).
 
 Tasks T7–T17 peel one algorithm out of this adapter into its own real plugin
 (e.g. ``plugins/reap_scoring.py``, ``plugins/solver_greedy.py``,
@@ -963,17 +963,19 @@ class LegacyAdapter:
     # ------------------------------------------------------------------
     # Phase 8: write_artifacts
     # ------------------------------------------------------------------
-    def write_artifacts(self, ctx: PipelineContext, partial_dir: Any) -> dict[str, Any]:
+    def write_artifacts(self, ctx: PipelineContext) -> dict[str, Any]:
         """Mutate run-scope merge_map; cov remap; write partial JSON + .pt.
 
         Verbatim slice of lines 1327–1409 of stage2_reap_ream.run() (pre-T6).
-        The pipeline resolves ``partial_dir`` from ``self.partial_dir`` and
-        passes it as this argument; this method reads the argument value
-        (not the instance attribute) so a future plugin can swap routing
-        without touching this hook.
+        ``partial_dir`` is read from the per-layer context slot
+        (``ctx.get("partial_dir")``, set on the run-scope context by the
+        orchestrator and inherited by the layer child); it is ``None`` in
+        no-resume mode. The ``self.partial_dir`` instance attribute is kept
+        for the resume path elsewhere in the adapter.
         """
         from ...stage2_reap_ream import _summarize_distill_state
 
+        partial_dir = ctx.get("partial_dir")
         layer_ref = ctx.get("layer_ref")
         grouped = ctx.get("grouped")
         freq = ctx.get("freq")

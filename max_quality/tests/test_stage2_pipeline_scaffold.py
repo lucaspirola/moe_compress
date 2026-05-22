@@ -1,8 +1,9 @@
 """Unit tests for the Stage 2 pipeline scaffolding.
 
 Validates ``PipelineContext`` set-once / child-scope semantics and the
-``Stage2Pipeline`` shell's phase declaration + setup / teardown fan-out.
-Plugins are plain classes that satisfy the universal
+universal ``walk_phases`` phase walk's setup / teardown fan-out plus the
+canonical ``_STAGE2_LAYER_PHASES`` schedule. Plugins are plain classes that
+satisfy the universal
 :class:`~moe_compress.pipeline.plugin.PipelinePlugin` Protocol structurally;
 there is no stage-2-specific plugin base class or mutable registry. No torch /
 numpy needed at this layer.
@@ -13,10 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from moe_compress.stage2._framework import (
-    PipelineContext,
-    Stage2Pipeline,
-)
+from moe_compress.pipeline.context import PipelineContext
+from moe_compress.stage2.orchestrator import _STAGE2_LAYER_PHASES
+from moe_compress.tools.phase_walker import walk_phases
 
 
 # ---------------------------------------------------------------------------
@@ -71,16 +71,16 @@ def _make_layer_ctx() -> PipelineContext:
 
 
 def test_pipeline_phases_are_declared_in_canonical_order():
-    """Stage2Pipeline.phases documents the per-layer execution order.
+    """_STAGE2_LAYER_PHASES documents the per-layer execution order.
 
     The tuple is 9 entries. The four fine-grained sub-hooks
     (``compute_cost``, ``apply_cost_mask``, ``solve_assignment``,
     ``refine_assignment``) are an open vocabulary discovered reflectively by
-    the tolerant phase walk and are NOT iterated by ``run_layer`` — the
-    LegacyAdapter folds them into ``compute_assignment`` to preserve the
-    bump-loop control flow.
+    the tolerant phase walk and are NOT iterated by ``walk_phases`` over this
+    schedule — the LegacyAdapter folds them into ``compute_assignment`` to
+    preserve the bump-loop control flow.
     """
-    assert Stage2Pipeline.phases == (
+    assert _STAGE2_LAYER_PHASES == (
         "on_layer_setup",
         "on_profile",
         "on_score",
@@ -94,13 +94,13 @@ def test_pipeline_phases_are_declared_in_canonical_order():
 
 
 def test_run_setup_and_teardown_fan_out_in_order(tmp_path):
-    """run_setup / run_teardown invoke every plugin's hook in registration order."""
+    """walk_phases invokes every plugin's run-scope hook in registration order."""
     a, b = _RecordingPlugin(), _RecordingPlugin()
-    pipeline = Stage2Pipeline(plugins=[a, b])
+    plugins = [a, b]
     run_ctx = _make_run_ctx(tmp_path)
 
-    pipeline.run_setup(run_ctx)
-    pipeline.run_teardown(run_ctx)
+    walk_phases(("on_run_setup",), plugins, run_ctx)
+    walk_phases(("on_run_teardown",), plugins, run_ctx)
 
     assert [name for name, _ in a.calls] == ["on_run_setup", "on_run_teardown"]
     assert [name for name, _ in b.calls] == ["on_run_setup", "on_run_teardown"]

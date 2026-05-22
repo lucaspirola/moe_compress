@@ -12,8 +12,8 @@ directly inside the bump loop, and the monolith's ``_em_refine_assignment``
 re-applies it each EM round. T12 does NOT change those call sites. The
 ``apply_cost_mask`` hook below is fully functional (it delegates to
 ``_apply_skip_merge_floor``) so the plugin is testable today, but the
-``Stage2Pipeline`` phase walk does not yet invoke ``apply_cost_mask`` — that
-invocation arrives when ``compute_assignment`` is decomposed (T13+). Until then
+universal ``walk_phases`` phase walk does not yet invoke ``apply_cost_mask`` —
+that invocation arrives when ``compute_assignment`` is decomposed (T13+). Until then
 this plugin is constructed but not added to the ``run()`` plugin list, exactly
 like the T8–T11 cost shells.
 
@@ -41,8 +41,9 @@ class SkipMergeFloorPlugin:
 
     T12 status: functional but off the live phase walk. ``apply_cost_mask``
     delegates to ``grouping._apply_skip_merge_floor`` and is unit-tested, but
-    the ``Stage2Pipeline`` does not yet call ``apply_cost_mask`` — the
-    LegacyAdapter still owns the live call path inside its bump loop. Wiring
+    the universal ``walk_phases`` phase walk does not yet call
+    ``apply_cost_mask`` — the LegacyAdapter still owns the live call path
+    inside its bump loop. Wiring
     this hook into the phase walk is deferred until the assignment phase is
     decomposed (T13+).
 

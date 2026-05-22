@@ -1053,7 +1053,7 @@ class MergeHealPlugin:
         """
         return None
 
-    def write_artifacts(self, ctx: PipelineContext, partial_dir: Any) -> dict[str, Any]:
+    def write_artifacts(self, ctx: PipelineContext) -> dict[str, Any]:
         """Documented no-op for T17.
 
         The live ``_summarize_distill_state`` telemetry emission still belongs

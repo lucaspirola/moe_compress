@@ -1,7 +1,8 @@
-"""Tests for Stage2Pipeline.run_layer + the LegacyAdapter wiring (Task 6).
+"""Tests for the Stage 2 phase walk + the LegacyAdapter wiring.
 
 Three layers of coverage:
-  1. Pipeline contract — phase-walk order, hook dispatch, partial_dir threading.
+  1. Pipeline contract — ``walk_phases`` order, hook dispatch, partial_dir
+     threading via the ``partial_dir`` context slot.
   2. LegacyAdapter unit — each hook moves the right ctx state.
   3. End-to-end smoke — Stage 2 via the plugin pipeline produces a valid
      ``merge_map.json`` + a checkpoint directory. (The legacy escape hatch
@@ -20,12 +21,11 @@ from moe_compress import stage1
 from moe_compress import stage2_reap_ream as _stage2_monolith
 from moe_compress.stage2 import orchestrator as stage2_reap_ream
 from moe_compress.budget.solver import BudgetDecomposition
-from moe_compress.stage2._framework import (
-    PipelineContext,
-    Stage2Pipeline,
-)
+from moe_compress.pipeline.context import PipelineContext
+from moe_compress.stage2.orchestrator import _STAGE2_LAYER_PHASES
 from moe_compress.stage2.plugins.legacy_adapter import LegacyAdapter
 from moe_compress.pipeline.plugin import PipelinePlugin
+from moe_compress.tools.phase_walker import walk_phases
 from moe_compress.utils.model_io import iter_moe_layers
 
 
@@ -169,7 +169,7 @@ class _CountingPlugin:
     def post_merge(self, ctx):
         self.calls.append("post_merge")
 
-    def write_artifacts(self, ctx, partial_dir):
+    def write_artifacts(self, ctx):
         self.calls.append("write_artifacts")
         return {}
 
@@ -178,32 +178,35 @@ class _CountingPlugin:
 
 
 def test_run_layer_visits_each_phase_in_canonical_order(tmp_path):
-    """Stage2Pipeline.run_layer visits every phase in declared order, once per plugin."""
+    """walk_phases visits every phase in declared order, once per plugin."""
     plugin = _CountingPlugin()
-    pipeline = Stage2Pipeline(plugins=[plugin])
+    plugins = [plugin]
     run_ctx = _make_run_ctx(
         model=object(), tokenizer=object(), config={},
         artifacts_dir=tmp_path, partial_dir=tmp_path, device="cpu",
     )
-    pipeline.run_setup(run_ctx)
-    pipeline.run_layer(_make_layer_ctx(run_ctx, layer_idx=0, layer_ref=object(),
-                                       n_experts=4, target=2))
-    pipeline.run_teardown(run_ctx)
+    walk_phases(("on_run_setup",), plugins, run_ctx)
+    walk_phases(
+        _STAGE2_LAYER_PHASES, plugins,
+        _make_layer_ctx(run_ctx, layer_idx=0, layer_ref=object(),
+                        n_experts=4, target=2),
+    )
+    walk_phases(("on_run_teardown",), plugins, run_ctx)
     assert plugin.calls == [
         "on_run_setup",
-        *list(Stage2Pipeline.phases),
+        *list(_STAGE2_LAYER_PHASES),
         "on_run_teardown",
     ]
 
 
 def test_phases_tuple_matches_t6_canonical_order():
-    """The T7 phase tuple is the 9-element execution order (bump-loop is compound).
+    """The phase tuple is the 9-element execution order (bump-loop is compound).
 
     Updated for T7: ``on_score`` is inserted between ``on_profile`` and
     ``compute_assignment`` to let ReapScoringPlugin publish ctx.scores/freq
     before LegacyAdapter.compute_assignment reads them.
     """
-    assert Stage2Pipeline.phases == (
+    assert _STAGE2_LAYER_PHASES == (
         "on_layer_setup",
         "on_profile",
         "on_score",
@@ -216,45 +219,47 @@ def test_phases_tuple_matches_t6_canonical_order():
     )
 
 
-def test_run_layer_passes_partial_dir_to_write_artifacts(tmp_path):
-    """write_artifacts receives partial_dir from any plugin that exposes it."""
+def test_write_artifacts_reads_partial_dir_from_context(tmp_path):
+    """write_artifacts reads partial_dir off the per-layer context slot.
+
+    The orchestrator stores ``partial_dir`` on the run-scope context; a layer
+    child inherits it. ``walk_phases`` passes only ``ctx`` — the plugin must
+    pull the value via ``ctx.get("partial_dir")``.
+    """
     seen: dict[str, object] = {}
 
     class _SnoopPlugin:
         name = "snoop"
 
-        def __init__(self, partial_dir):
-            self.partial_dir = partial_dir
-
-        def write_artifacts(self, ctx, partial_dir):
-            seen["partial_dir"] = partial_dir
+        def write_artifacts(self, ctx):
+            seen["partial_dir"] = ctx.get("partial_dir")
             return {}
 
     custom_partial = tmp_path / "my_partial"
-    plugin = _SnoopPlugin(partial_dir=custom_partial)
-    pipeline = Stage2Pipeline(plugins=[plugin])
-    pipeline.run_layer(_make_layer_ctx(PipelineContext(), layer_idx=0,
-                                       layer_ref=object(),
-                                       n_experts=4, target=2))
+    run_ctx = PipelineContext()
+    run_ctx.set("partial_dir", custom_partial)
+    child = _make_layer_ctx(run_ctx, layer_idx=0, layer_ref=object(),
+                            n_experts=4, target=2)
+    walk_phases(("write_artifacts",), [_SnoopPlugin()], child)
     assert seen["partial_dir"] == custom_partial
 
 
-def test_run_layer_threads_partial_dir_none_when_no_plugin_exposes_it(tmp_path):
-    """A plugin without `partial_dir` attr still receives None at write_artifacts."""
+def test_write_artifacts_reads_partial_dir_none_in_no_resume_mode(tmp_path):
+    """In no-resume mode partial_dir is None; write_artifacts must see None."""
     seen: dict[str, object] = {"partial_dir": "<sentinel>"}
 
     class _SnoopPlugin:
         name = "snoop"
 
-        def write_artifacts(self, ctx, partial_dir):
-            seen["partial_dir"] = partial_dir
+        def write_artifacts(self, ctx):
+            seen["partial_dir"] = ctx.get("partial_dir")
             return {}
 
-    plugin = _SnoopPlugin()
-    pipeline = Stage2Pipeline(plugins=[plugin])
-    pipeline.run_layer(_make_layer_ctx(PipelineContext(), layer_idx=0,
-                                       layer_ref=object(),
-                                       n_experts=4, target=2))
+    run_ctx = PipelineContext()
+    run_ctx.set("partial_dir", None)
+    child = _make_layer_ctx(run_ctx, layer_idx=0, layer_ref=object(),
+                            n_experts=4, target=2)
+    walk_phases(("write_artifacts",), [_SnoopPlugin()], child)
     assert seen["partial_dir"] is None
 
 

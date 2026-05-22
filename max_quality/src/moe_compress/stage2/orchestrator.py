@@ -171,6 +171,22 @@ from .plugins.merge_heal import (  # noqa: F401
 
 log = logging.getLogger(__name__)
 
+# Canonical per-layer phase schedule for Stage 2. Copied byte-for-byte from the
+# retired ``Stage2Pipeline.phases`` 9-tuple; ``walk_phases`` drives plugins
+# through these phases in phase-major / plugin-minor order (see
+# max_quality/docs/stage2_plugin_guide.md).
+_STAGE2_LAYER_PHASES: tuple[str, ...] = (
+    "on_layer_setup",
+    "on_profile",
+    "on_score",
+    "compute_assignment",
+    "pre_merge_snapshot",
+    "merge",
+    "post_merge",
+    "write_artifacts",
+    "on_layer_teardown",
+)
+
 
 def run(
     model,
@@ -491,12 +507,13 @@ def run(
         "stage2/config/format_version": 2,
     })
 
-    # ---- Per-layer work is driven by Stage2Pipeline -------------------------
+    # ---- Per-layer work is driven by the universal phase walker -------------
     # Each layer flows through the 9-phase plugin walk (see
     # max_quality/docs/stage2_plugin_guide.md). Shared setup (above) and the
     # final-checkpoint save (below) run once, around the layer loop.
-    from ._framework import Stage2Pipeline
     from ..pipeline.context import PipelineContext
+    from ..pipeline.registry import PluginRegistry
+    from ..tools.phase_walker import walk_phases
     from .plugins.legacy_adapter import LegacyAdapter
     from .plugins.reap_scoring import ReapScoringPlugin
 
@@ -510,10 +527,10 @@ def run(
     run_ctx.set("tokenizer", tokenizer)
     run_ctx.set("config", config)
     run_ctx.set("artifacts_dir", artifacts_dir)
-    run_ctx.set(
-        "partial_dir",
-        partial_dir if partial_dir is not None else artifacts_dir,
-    )
+    # Store the TRUE partial_dir, including ``None`` in no-resume mode:
+    # ``write_artifacts`` branches on ``if partial_dir is not None:`` and must
+    # see ``None`` (not a fallback path) when resume is disabled.
+    run_ctx.set("partial_dir", partial_dir)
     # The "device" ctx slot holds the *stringified* device ("cpu" / "cuda:0"),
     # not a torch.device — the original device object is passed separately to
     # LegacyAdapter (the `device=device` kwarg below). Readers of
@@ -551,11 +568,12 @@ def run(
     )
     # Registration order matters: ReapScoringPlugin.on_layer_setup must run
     # BEFORE LegacyAdapter.on_layer_setup (which now reads ctx.reap_acc into
-    # _profile_layer via on_profile). The pipeline dispatches each phase to
-    # every plugin in registration order, so listing ReapScoringPlugin first
+    # _profile_layer via on_profile). ``walk_phases`` dispatches each phase to
+    # every plugin in sequence order, so listing ReapScoringPlugin first
     # satisfies the dependency.
-    pipeline = Stage2Pipeline(plugins=[ReapScoringPlugin(), adapter])
-    pipeline.run_setup(run_ctx)
+    registry = PluginRegistry([ReapScoringPlugin(), adapter])
+    plugins = registry.enabled(config)
+    walk_phases(("on_run_setup",), plugins, run_ctx)
     for k, layer_ref in enumerate(moe_layers):
         if layer_ref.layer_idx in completed_layers:
             log.info(
@@ -574,8 +592,8 @@ def run(
         ctx.set("n_experts", layer_ref.num_routed_experts)
         ctx.set("target", target)
         ctx.set("blacklist", tuple(blacklist.get(layer_ref.layer_idx, [])))
-        pipeline.run_layer(ctx)
-    pipeline.run_teardown(run_ctx)
+        walk_phases(_STAGE2_LAYER_PHASES, plugins, ctx)
+    walk_phases(("on_run_teardown",), plugins, run_ctx)
 
     out_dir = artifacts_dir / "stage2_pruned"
     if os.environ.get("MOE_SKIP_STAGE2_COV_SAVE") == "1":
