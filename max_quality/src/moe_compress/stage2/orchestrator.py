@@ -175,17 +175,418 @@ log = logging.getLogger(__name__)
 # retired ``Stage2Pipeline.phases`` 9-tuple; ``walk_phases`` drives plugins
 # through these phases in phase-major / plugin-minor order (see
 # max_quality/docs/stage2_plugin_guide.md).
-_STAGE2_LAYER_PHASES: tuple[str, ...] = (
+#
+# S2-5: ``compute_assignment`` is no longer a plain ``walk_phases`` phase — the
+# bump loop is an explicit multi-pass driver (``_run_assignment``) that the
+# per-layer loop calls between the pre-assign and post-assign phase walks. The
+# schedule is split into the two halves below; ``_STAGE2_LAYER_PHASES`` stays as
+# a derived back-compat constant so external callers / tests that expect the
+# full 9-tuple keep working.
+_STAGE2_PRE_ASSIGN_PHASES: tuple[str, ...] = (
     "on_layer_setup",
     "on_profile",
     "on_score",
-    "compute_assignment",
+)
+_STAGE2_POST_ASSIGN_PHASES: tuple[str, ...] = (
     "pre_merge_snapshot",
     "merge",
     "post_merge",
     "write_artifacts",
     "on_layer_teardown",
 )
+# Derived back-compat constant: the full 9-phase schedule with the compound
+# ``compute_assignment`` slot wedged between the two halves. Not walked directly
+# anymore (``_run_assignment`` owns that slot) — kept so the canonical-order
+# contract test and any external importer still see the historical tuple.
+_STAGE2_LAYER_PHASES: tuple[str, ...] = (
+    _STAGE2_PRE_ASSIGN_PHASES + ("compute_assignment",) + _STAGE2_POST_ASSIGN_PHASES
+)
+
+
+def _run_assignment(plugins, ctx) -> None:
+    """Stage-2 assignment driver — the bump loop, decomposed into four slots.
+
+    Reproduces the body of the retired ``LegacyAdapter.compute_assignment``
+    line-for-line, EXCEPT the per-bump cost / mask / solve / refine work is now
+    reached via ``PluginRegistry.dispatch_first`` over the four fine-grained
+    slots ``compute_cost`` / ``apply_cost_mask`` / ``solve_assignment`` /
+    ``refine_assignment``. Because the Stage-2 registry is
+    ``[ReapScoringPlugin(), adapter]`` and ReapScoringPlugin declares none of
+    those slots, every dispatch lands on ``LegacyAdapter``'s extracted methods
+    — behaviour is byte-identical to the pre-S2-5 monolithic hook. S2-6+ wires
+    the real cost / solver / refine plugins ahead of the adapter so they win
+    the slot.
+
+    ``_run_assignment`` owns the bump-loop control flow, the b_fail / c_fail
+    gates, the orphan-promotion grouping, and the final ``ctx.set`` of all
+    per-layer output slots — exactly the responsibilities the monolithic
+    ``compute_assignment`` carried.
+    """
+    from ..pipeline.registry import PluginRegistry
+    from .plugins.legacy_adapter import LegacyAdapter
+    from .plugins.reap_scoring import select_centroids_by_reap
+
+    layer_ref = ctx.get("layer_ref")
+    reap_acc = ctx.get("reap_acc")
+    ream_acc = ctx.get("ream_acc")
+    perm_cache = ctx.get("perm_cache")
+    layer_input_acc = ctx.get("layer_input_acc")
+    target = ctx.get("target")
+    # scores / freq are published by ReapScoringPlugin.on_score (T7); read
+    # them off the ctx slots rather than re-deriving from reap_acc here.
+    scores = ctx.get("scores")
+    freq = ctx.get("freq")
+    n_experts = ctx.get("n_experts")
+
+    # The LegacyAdapter instance owns the run-scope scratchpad (blacklist,
+    # _layer_mean_costs). Locate it in the plugin list — it is the plugin
+    # exposing the four assignment slots.
+    adapter = next(p for p in plugins if isinstance(p, LegacyAdapter))
+    _layer_mean_costs = adapter._layer_mean_costs
+
+    protected = set(adapter.blacklist.get(layer_ref.layer_idx, []))
+    # Protected experts (super experts + shared experts from stage1_blacklist.json)
+    # are completely excluded from REAM — not centroids, not non-centroids.
+    # Their weights pass through Stage 2 unchanged (spec §5 "Blacklisted Expert Exclusion").
+    n_protected = len(protected)
+    # Publish ``protected`` on ctx up front so the cost / refine slots can read
+    # it during the bump loop. The pre-S2-5 ``compute_assignment`` set this slot
+    # only at the very end; here it is set once early and the final output-slot
+    # block below leaves it as-is (already a tuple of the same value).
+    ctx.set("protected", tuple(sorted(protected)))
+
+    if target > n_experts:
+        raise RuntimeError(
+            f"Layer {layer_ref.layer_idx}: budget target {target} > n_experts {n_experts}; "
+            "budget allocation is inconsistent with layer expert count"
+        )
+    if target == n_experts:
+        log.warning(
+            "layer %d: budget target (%d) equals total expert count (%d) — "
+            "no merging will occur; check budget configuration.",
+            layer_ref.layer_idx, target, n_experts,
+        )
+
+    effective_target = target
+    ream_centroid_ids: list[int] = []
+    ream_noncentroid_ids: list[int] = []
+    grouped: dict[int, list[int]] = {}
+    delta = np.empty((0, 0))
+    assignment: list[int] = []
+    running_mean: float = float("nan")
+    em_rounds_done: int = 0  # populated by _em_refine_assignment in the bump loop
+    # Stage 2 v2: hoist effective_cost_alignment / effective_cost_asymmetric
+    # from the bump-loop's "if not b_fail" branch to layer scope so the
+    # per-layer Trackio emit at the bottom of the loop sees them whether
+    # or not the bump loop's success branch ran (b_fail / zero-merge
+    # fallback leaves the defaults as-is, which is the right thing to
+    # log: "no cost matrix was actually built for this layer"). Same for
+    # capacity_util_value — defaults to 0.0 (uncapped / fully-slack).
+    effective_cost_alignment: str = adapter.cost_alignment_cfg
+    effective_cost_asymmetric: bool = adapter.cost_asymmetric
+    capacity_util_value: float = 0.0
+    mean_assigned_cost: float = 0.0
+    assigned_cost: float = 0.0
+    # Invariant: after the bump loop, assignment is either:
+    #   (a) a list of length len(ream_noncentroid_ids) with centroid indices (normal path), or
+    #   (b) [] with ream_noncentroid_ids also [] (zero-merge fallback path).
+    # (c) c_fail last-resort: assignment holds the last above-threshold assignment
+    #     (len == len(ream_noncentroid_ids)); applied as best-available merge below.
+    # b_fail / c_fail are initialized here so the post-loop fallback check never raises
+    # NameError if the range were somehow empty.
+    b_fail: bool = False
+    c_fail: bool = False
+    _warned_ream_target_zero: bool = False
+
+    _original_ream_target = max(effective_target - n_protected, 0)  # target on first attempt
+
+    # Loop runs (1 + n_experts - target) times: 1 initial attempt plus up to
+    # (n_experts - target) bumps, one per additional kept expert.
+    for _bump_attempt in range(n_experts - target + 1):
+        # F1 fix: reset em_rounds_done per bump iteration so the value
+        # persisted in the partial JSON reflects the iteration whose
+        # assignment is actually committed (not a stale value from a
+        # prior bump iteration).
+        em_rounds_done = 0
+        # REAM centroid count = total target minus the protected slots.
+        ream_target = max(effective_target - n_protected, 0)
+
+        if ream_target == 0:
+            if not _warned_ream_target_zero:
+                log.warning(
+                    "layer %d: ream_target=0 — all %d non-protected experts will be dropped "
+                    "(budget fully consumed by %d protected experts); "
+                    "check budget configuration.",
+                    layer_ref.layer_idx, n_experts - len(protected), len(protected),
+                )
+                _warned_ream_target_zero = True
+            break
+
+        # Select top-ream_target non-protected experts by REAP score (descending).
+        # This is the greedy centroid selection order: highest-saliency centroid
+        # gets priority in the assignment pass (spec §5 Step 3). The pure
+        # helper also emits the under-budget warning when the
+        # min_active_tokens filter eliminates candidates.
+        ream_centroid_ids = select_centroids_by_reap(
+            scores,
+            freq,
+            ream_target=ream_target,
+            min_active_tokens=adapter.min_active_tokens,
+            protected=protected,
+            layer_idx=layer_ref.layer_idx,
+            log=log,
+        )
+
+        ream_centroid_set = set(ream_centroid_ids)
+        ream_noncentroid_ids = [
+            e for e in range(n_experts)
+            if e not in protected and e not in ream_centroid_set
+        ]
+
+        n_ream_c  = len(ream_centroid_ids)
+        n_ream_nc = len(ream_noncentroid_ids)
+
+        # Feasibility check (spec §5 Step 3, reference ream/ream.py L60-62):
+        # every non-centroid must be absorbable within the per-centroid cap.
+        b_fail = (adapter.max_group_cap > 0) and (n_ream_nc > n_ream_c * adapter.max_group_cap)
+
+        delta = np.empty((0, 0))
+        assignment = []
+        mean_cost = 0.0
+        c_fail = False
+
+        if not b_fail:
+            # Publish the per-bump scratch slots the four assignment slots
+            # read. Always ``overwrite=True`` — a fresh value every bump
+            # iteration, the previous iteration's value is stale.
+            ctx.set("_iter_ream_centroid_ids", tuple(ream_centroid_ids), overwrite=True)
+            ctx.set("_iter_ream_noncentroid_ids", tuple(ream_noncentroid_ids), overwrite=True)
+            ctx.set("_iter_n_ream_c", n_ream_c, overwrite=True)
+            ctx.set("_iter_n_ream_nc", n_ream_nc, overwrite=True)
+            # Slot 1: compute_cost — capacity-util gate + REAM cost matrix.
+            delta = PluginRegistry.dispatch_first(plugins, "compute_cost", ctx)
+            assert delta is not None, "compute_cost slot returned None"
+            # Slot 2: apply_cost_mask — Direction B skip-merge floor. The
+            # masker may decline (None) — keep delta unchanged in that case.
+            masked = PluginRegistry.dispatch_first(plugins, "apply_cost_mask", ctx, delta)
+            if masked is not None:
+                delta, _mask_info = masked
+            # Slot 3: solve_assignment — child→centroid assignment solver.
+            assignment = PluginRegistry.dispatch_first(plugins, "solve_assignment", ctx, delta)
+            assert assignment is not None, "solve_assignment slot returned None"
+            # Slot 4: refine_assignment — 2-opt local search + EM refinement.
+            refined = PluginRegistry.dispatch_first(
+                plugins, "refine_assignment", ctx, assignment, delta
+            )
+            assert refined is not None, "refine_assignment slot returned None"
+            assignment, delta, em_rounds_done = refined
+            # The slots wrote effective_cost_alignment / effective_cost_asymmetric
+            # / capacity_util_value back to ctx — pull them back into the loop's
+            # layer-scope variables so the post-loop output emit sees them.
+            effective_cost_alignment = ctx.get("effective_cost_alignment")
+            effective_cost_asymmetric = ctx.get("effective_cost_asymmetric")
+            capacity_util_value = ctx.get("capacity_util_value")
+            _iter_n_assigned = sum(1 for a in assignment if a >= 0)
+            _iter_assigned_cost = (
+                sum(float(delta[ch, assignment[ch]])
+                    for ch in range(n_ream_nc) if assignment[ch] >= 0)
+                if delta.size > 0 else 0.0
+            )
+            if _iter_n_assigned == 0 and n_ream_nc == 0:
+                # No non-centroid experts exist — nothing to merge, cost is
+                # genuinely zero.  Skip the c_fail gate entirely: there is no
+                # merge to gate on, and inf would cause a spurious bump.
+                mean_cost = 0.0
+                # c_fail remains False (already set above); do not evaluate gate.
+            else:
+                # When nothing was assigned despite having non-centroids, use inf
+                # rather than 0.0: a zero mean_cost would be a false negative,
+                # making an unassigned layer look cheaper than any real merge and
+                # preventing the cost-threshold bump from triggering.
+                mean_cost = (
+                    _iter_assigned_cost / _iter_n_assigned
+                    if _iter_n_assigned > 0 else float("inf")
+                )
+                # Require at least 4 prior-layer samples before applying the cost-sigma
+                # gate: fewer samples make the running mean too noisy to be meaningful.
+                # Invariant: running_mean is always computed in the same branch as
+                # c_fail = True, so running_mean is guaranteed to be set before
+                # c_fail can become True. Future refactors must preserve this ordering
+                # to avoid referencing running_mean when it is still 0.0 (its default).
+                if len(_layer_mean_costs) >= 4:
+                    running_mean = float(np.mean(_layer_mean_costs))
+                    c_fail = mean_cost > running_mean * (1.0 + adapter.cost_sigma)
+
+        if not b_fail and not c_fail:
+            break
+
+        # Spec D-ream-budget-bump: BOTH gates use the same bump formula
+        # max(1, ceil(effective_target * cost_bump_ratio)) — applies to
+        # feasibility (b_fail) AND quality (c_fail) gates uniformly.
+        # Previously the ratio was only applied on c_fail, making
+        # b_fail-only iterations bump by exactly 1 (slow convergence).
+        bump = max(1, math.ceil(effective_target * adapter.cost_bump_ratio))
+        new_effective = min(effective_target + bump, n_experts)
+        if b_fail:
+            log.warning(
+                "  layer %d: infeasible (ream_c=%d × cap=%d < nc=%d) — "
+                "bumping target %d→%d",
+                layer_ref.layer_idx, n_ream_c, adapter.max_group_cap, n_ream_nc,
+                effective_target, new_effective,
+            )
+        # running_mean is always current here: c_fail=True can only be set inside the
+        # cost block (not b_fail path), which assigns running_mean before setting c_fail.
+        if c_fail:
+            assert not math.isnan(running_mean), (
+                "running_mean must be set before c_fail can be True; "
+                "check that the c_fail assignment is co-located with the running_mean assignment"
+            )
+            log.warning(
+                "  layer %d: mean_cost=%.4f > threshold=%.4f — bumping target %d→%d",
+                layer_ref.layer_idx, mean_cost,
+                running_mean * (1.0 + adapter.cost_sigma),
+                effective_target, new_effective,
+            )
+        effective_target = new_effective
+        # We break BEFORE computing a new assignment at effective_target==n_experts;
+        # the last assignment from the previous iteration is used as the fallback.
+        if effective_target >= n_experts:
+            break
+
+    # Post-loop: if the loop exited because effective_target >= n_experts but c_fail
+    # was still True (cost gate never cleared), the last above-threshold assignment
+    # is used as last resort. Warn so this silent state is observable.
+    if c_fail and effective_target >= n_experts:
+        log.warning(
+            "REAM layer %d: bump loop exhausted (c_fail=True, b_fail=%s, effective_target=%d >= n_experts=%d); "
+            "applying above-threshold assignment as last resort",
+            layer_ref.layer_idx, b_fail, effective_target, n_experts,
+        )
+    # Fallback: if the bump loop exhausted without achieving feasibility
+    # (b_fail still True and no assignment was built), log a WARNING and fall back
+    # to keeping all non-protected experts as centroids (zero merges). This is the
+    # safest fallback — it produces the least compression but loses no expert weights.
+
+    # Zero-target case: budget fully consumed by protected experts — no REAM
+    # centroids or non-centroids should exist and no merges should be produced.
+    # The bump loop broke out early, so ream_centroid_ids/ream_noncentroid_ids/
+    # assignment may still hold stale values from a previous attempt (or their
+    # initial [] defaults). Reset them explicitly so the grouping code below
+    # produces an empty grouped dict and all protected experts flow to final_kept_ids.
+    if _original_ream_target == 0:
+        ream_centroid_ids = []
+        ream_noncentroid_ids = []
+        assignment = []
+        delta = np.empty((0, 0))
+        b_fail = False
+        c_fail = False
+
+    # When b_fail: assignment is [] (reset at iteration top; b_fail skips _assign_children_to_centroids).
+    # When c_fail last-resort (effective_target >= n_experts break): assignment holds the last
+    # computed above-threshold result and is intentionally applied in the grouping step below.
+    if b_fail and ream_noncentroid_ids:
+        log.warning(
+            "  layer %d: bump loop exhausted (effective_target=%d == n_experts=%d) "
+            "without achieving feasibility — falling back to zero-merge "
+            "(all non-protected experts kept as centroids). "
+            "No expert weights are lost, but compression target is not met.",
+            layer_ref.layer_idx, effective_target, n_experts,
+        )
+        # Explicitly set ream_centroid_ids to all non-protected experts (zero-merge
+        # fallback). We cannot rely on the last bump iteration's ream_centroid_ids
+        # because the loop broke before recomputing it with the final effective_target.
+        ream_centroid_ids = [
+            e for e in range(n_experts) if e not in protected
+        ]
+        ream_noncentroid_ids = []
+        assignment = []
+        delta = np.empty((0, 0))
+
+    if not ream_centroid_ids and ream_noncentroid_ids and _original_ream_target > 0:
+        log.warning(
+            "REAM layer %d: no centroids selected (all non-protected experts may have failed "
+            "min_active_tokens or cost gate); promoting all non-protected experts to singleton "
+            "centroids (zero-merge fallback).",
+            layer_ref.layer_idx,
+        )
+        ream_centroid_ids = list(ream_noncentroid_ids)
+        ream_noncentroid_ids = []
+        assignment = []
+        delta = np.empty((0, 0))
+
+    # Build REAM merge groups (keyed by REAM centroid only — protected experts
+    # are not in grouped and their weights are not touched by _merge_experts_inplace).
+    grouped = {c: [c] for c in ream_centroid_ids}
+    # Protected experts should never appear as REAM centroids; verify the invariant.
+    _protected_centroids = [eid for eid in protected if eid in grouped]
+    if _protected_centroids:
+        raise RuntimeError(
+            f"Layer {layer_ref.layer_idx}: protected expert(s) {_protected_centroids} "
+            "appeared as REAM centroids — invariant violated"
+        )
+    for child_pos, centroid_pos in enumerate(assignment):
+        if centroid_pos >= 0:
+            grouped[ream_centroid_ids[centroid_pos]].append(
+                ream_noncentroid_ids[child_pos]
+            )
+
+    _promote_orphans(
+        grouped,
+        ream_centroid_ids,
+        ream_noncentroid_ids,
+        assignment,
+        layer_idx=layer_ref.layer_idx,
+        log=log,
+    )
+    ream_centroid_ids = sorted(set(ream_centroid_ids))
+
+    assigned_cost = (
+        sum(float(delta[ch, assignment[ch]])
+            for ch in range(len(ream_noncentroid_ids)) if assignment[ch] >= 0)
+        if delta.size > 0 else 0.0
+    )
+    n_assigned = sum(1 for a in assignment if a >= 0)
+    mean_assigned_cost = assigned_cost / max(n_assigned, 1)
+
+    # Guard mirrors the resume-path condition (val > 0.0): exclude zero costs
+    # so that layers with all-zero pair costs don't bias the running mean low
+    # and suppress the cost-sigma bump gate for subsequent layers.
+    # Also exclude last-resort c_fail assignments (bump loop exhausted with
+    # effective_target >= n_experts) — those costs would inflate the running mean
+    # and progressively suppress the c_fail gate for subsequent layers.
+    if n_assigned > 0 and mean_assigned_cost > 0.0 and not (c_fail and effective_target >= n_experts):
+        _layer_mean_costs.append(mean_assigned_cost)
+
+    # Surface bump-loop outputs on ctx for downstream phases. ``scores`` and
+    # ``freq`` are NOT re-published here: ReapScoringPlugin.on_score already
+    # wrote those slots to the same objects (set-once would reject a second
+    # write, and the re-assignment was a behavior-preserving no-op anyway).
+    # ``protected`` is also NOT re-set here: it was published up front (before
+    # the bump loop) so the cost / refine slots could read it; the value is the
+    # same tuple, so the early set already satisfies this slot.
+    ctx.set("ream_centroid_ids", tuple(ream_centroid_ids))
+    ctx.set("ream_noncentroid_ids", tuple(ream_noncentroid_ids))
+    ctx.set("assignment", assignment)
+    ctx.set("delta", delta)
+    ctx.set("grouped", grouped)
+    ctx.set("mean_assigned_cost", mean_assigned_cost)
+    ctx.set("n_protected", n_protected)
+    ctx.set("assigned_cost", assigned_cost)
+    ctx.set("n_assigned", n_assigned)
+    ctx.set("b_fail", b_fail)
+    ctx.set("c_fail", c_fail)
+    ctx.set("em_rounds_done", em_rounds_done)
+    # effective_cost_alignment / effective_cost_asymmetric / capacity_util_value
+    # were written to ctx by the compute_cost slot during the bump loop's
+    # success branch (overwrite=True). On the b_fail / zero-merge fallback path
+    # the slot never ran, so set them here from the layer-scope defaults — at
+    # most one of these two writes happens per layer per slot, so set-once is
+    # safe only for the slots the bump loop did not already write. Use
+    # overwrite=True uniformly to cover both paths.
+    ctx.set("effective_cost_alignment", effective_cost_alignment, overwrite=True)
+    ctx.set("effective_cost_asymmetric", effective_cost_asymmetric, overwrite=True)
+    ctx.set("capacity_util_value", capacity_util_value, overwrite=True)
+    ctx.set("effective_target", effective_target)
 
 
 def run(
@@ -592,7 +993,14 @@ def run(
         ctx.set("n_experts", layer_ref.num_routed_experts)
         ctx.set("target", target)
         ctx.set("blacklist", tuple(blacklist.get(layer_ref.layer_idx, [])))
-        walk_phases(_STAGE2_LAYER_PHASES, plugins, ctx)
+        # S2-5: the assignment phase is no longer a plain ``walk_phases`` slot.
+        # The pre-assign phases run, then ``_run_assignment`` drives the bump
+        # loop over the four fine-grained assignment slots, then the
+        # post-assign phases run. ``_STAGE2_LAYER_PHASES`` (the derived 9-tuple)
+        # is the back-compat view of this same canonical order.
+        walk_phases(_STAGE2_PRE_ASSIGN_PHASES, plugins, ctx)
+        _run_assignment(plugins, ctx)
+        walk_phases(_STAGE2_POST_ASSIGN_PHASES, plugins, ctx)
     walk_phases(("on_run_teardown",), plugins, run_ctx)
 
     out_dir = artifacts_dir / "stage2_pruned"

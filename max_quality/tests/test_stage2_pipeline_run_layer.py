@@ -22,7 +22,12 @@ from moe_compress import stage2_reap_ream as _stage2_monolith
 from moe_compress.stage2 import orchestrator as stage2_reap_ream
 from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.pipeline.context import PipelineContext
-from moe_compress.stage2.orchestrator import _STAGE2_LAYER_PHASES
+from moe_compress.stage2.orchestrator import (
+    _STAGE2_LAYER_PHASES,
+    _STAGE2_POST_ASSIGN_PHASES,
+    _STAGE2_PRE_ASSIGN_PHASES,
+    _run_assignment,
+)
 from moe_compress.stage2.plugins.legacy_adapter import LegacyAdapter
 from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.tools.phase_walker import walk_phases
@@ -178,34 +183,61 @@ class _CountingPlugin:
 
 
 def test_run_layer_visits_each_phase_in_canonical_order(tmp_path):
-    """walk_phases visits every phase in declared order, once per plugin."""
+    """The per-layer walk visits every phase in declared order, once per plugin.
+
+    S2-5: the per-layer loop no longer walks ``compute_assignment`` as a plain
+    ``walk_phases`` phase — the bump loop is the explicit ``_run_assignment``
+    driver. The phase walks are now the pre-assign and post-assign halves, so
+    ``_CountingPlugin`` records every phase EXCEPT ``compute_assignment``.
+    """
     plugin = _CountingPlugin()
     plugins = [plugin]
     run_ctx = _make_run_ctx(
         model=object(), tokenizer=object(), config={},
         artifacts_dir=tmp_path, partial_dir=tmp_path, device="cpu",
     )
+    layer_ctx = _make_layer_ctx(run_ctx, layer_idx=0, layer_ref=object(),
+                                n_experts=4, target=2)
     walk_phases(("on_run_setup",), plugins, run_ctx)
-    walk_phases(
-        _STAGE2_LAYER_PHASES, plugins,
-        _make_layer_ctx(run_ctx, layer_idx=0, layer_ref=object(),
-                        n_experts=4, target=2),
-    )
+    walk_phases(_STAGE2_PRE_ASSIGN_PHASES, plugins, layer_ctx)
+    walk_phases(_STAGE2_POST_ASSIGN_PHASES, plugins, layer_ctx)
     walk_phases(("on_run_teardown",), plugins, run_ctx)
     assert plugin.calls == [
         "on_run_setup",
-        *list(_STAGE2_LAYER_PHASES),
+        *list(_STAGE2_PRE_ASSIGN_PHASES),
+        *list(_STAGE2_POST_ASSIGN_PHASES),
         "on_run_teardown",
     ]
+    # The compound bump-loop slot is driven by ``_run_assignment``, not the
+    # plain phase walk — it must not appear in the walked-phase calls.
+    assert "compute_assignment" not in plugin.calls
 
 
 def test_phases_tuple_matches_t6_canonical_order():
-    """The phase tuple is the 9-element execution order (bump-loop is compound).
+    """The phase tuples are the canonical Stage-2 execution order.
 
-    Updated for T7: ``on_score`` is inserted between ``on_profile`` and
-    ``compute_assignment`` to let ReapScoringPlugin publish ctx.scores/freq
-    before LegacyAdapter.compute_assignment reads them.
+    S2-5: the schedule is split into the pre-assign and post-assign halves;
+    ``_STAGE2_LAYER_PHASES`` is the derived 9-tuple back-compat constant with
+    the compound ``compute_assignment`` slot wedged between the two halves.
     """
+    assert _STAGE2_PRE_ASSIGN_PHASES == (
+        "on_layer_setup",
+        "on_profile",
+        "on_score",
+    )
+    assert _STAGE2_POST_ASSIGN_PHASES == (
+        "pre_merge_snapshot",
+        "merge",
+        "post_merge",
+        "write_artifacts",
+        "on_layer_teardown",
+    )
+    # The derived back-compat 9-tuple = pre-assign + compute_assignment + post.
+    assert _STAGE2_LAYER_PHASES == (
+        _STAGE2_PRE_ASSIGN_PHASES
+        + ("compute_assignment",)
+        + _STAGE2_POST_ASSIGN_PHASES
+    )
     assert _STAGE2_LAYER_PHASES == (
         "on_layer_setup",
         "on_profile",
@@ -361,6 +393,136 @@ def test_legacy_adapter_on_layer_teardown_clears_state(tiny_model, patched_stage
     assert ctx.get("layer_input_acc") is None
     assert ctx.get("pre_merge_weights") is None
     assert ctx.get("distill_state") is None
+
+
+# ---------------------------------------------------------------------------
+# Layer 2b: _run_assignment driver coverage (S2-5)
+# ---------------------------------------------------------------------------
+
+
+# The four fine-grained assignment slots ``_run_assignment`` drives via
+# ``PluginRegistry.dispatch_first``, in canonical per-bump call order.
+_ASSIGNMENT_SLOTS = (
+    "compute_cost",
+    "apply_cost_mask",
+    "solve_assignment",
+    "refine_assignment",
+)
+
+
+def test_legacy_adapter_exposes_four_assignment_slots():
+    """LegacyAdapter exposes exactly the four fine-grained assignment slots and
+    no longer carries the monolithic ``compute_assignment`` hook (S2-5)."""
+    for slot in _ASSIGNMENT_SLOTS:
+        assert callable(getattr(LegacyAdapter, slot, None)), (
+            f"LegacyAdapter missing assignment slot {slot!r}"
+        )
+    assert not hasattr(LegacyAdapter, "compute_assignment"), (
+        "LegacyAdapter.compute_assignment must be gone after the S2-5 "
+        "decomposition — the bump loop now lives in orchestrator._run_assignment"
+    )
+
+
+def _prepare_layer_for_assignment(tiny_model, patched_stage2, tmp_path):
+    """Run stage1 + the pre-assign phases so a layer ctx is ready for
+    ``_run_assignment``. Returns ``(adapter, plugins, ctx)``."""
+    from moe_compress.stage2.plugins.reap_scoring import ReapScoringPlugin
+
+    _run_stage1(tiny_model, patched_stage2, tmp_path)
+    moe_layers = list(iter_moe_layers(tiny_model))
+    adapter = _build_minimal_adapter(tiny_model, patched_stage2, tmp_path,
+                                     moe_layers=moe_layers)
+    plugins = [ReapScoringPlugin(), adapter]
+    layer_ref = moe_layers[0]
+    ctx = _make_layer_ctx(PipelineContext(),
+                          layer_idx=layer_ref.layer_idx,
+                          layer_ref=layer_ref,
+                          n_experts=layer_ref.num_routed_experts, target=2)
+    walk_phases(_STAGE2_PRE_ASSIGN_PHASES, plugins, ctx)
+    return adapter, plugins, ctx
+
+
+def test_run_assignment_dispatches_slots(tiny_model, patched_stage2, tmp_path):
+    """`_run_assignment` drives the four assignment slots, in canonical order,
+    once per bump iteration.
+
+    A probe plugin is inserted ahead of the LegacyAdapter: it records every
+    slot call (in order) and delegates to the adapter's real slot method so the
+    bump loop still produces a valid grouping. The adapter stays in the plugin
+    list so ``_run_assignment``'s ``isinstance(p, LegacyAdapter)`` lookup for
+    the run-scope scratchpad still resolves.
+    """
+    adapter, plugins, ctx = _prepare_layer_for_assignment(
+        tiny_model, patched_stage2, tmp_path)
+
+    calls: list[str] = []
+
+    class _SlotProbe:
+        name = "slot_probe"
+
+        def compute_cost(self, ctx):
+            calls.append("compute_cost")
+            return adapter.compute_cost(ctx)
+
+        def apply_cost_mask(self, ctx, delta):
+            calls.append("apply_cost_mask")
+            return adapter.apply_cost_mask(ctx, delta)
+
+        def solve_assignment(self, ctx, delta):
+            calls.append("solve_assignment")
+            return adapter.solve_assignment(ctx, delta)
+
+        def refine_assignment(self, ctx, asg, delta):
+            calls.append("refine_assignment")
+            return adapter.refine_assignment(ctx, asg, delta)
+
+    # Probe first so dispatch_first lands on it; adapter still present for the
+    # isinstance lookup + run-scope state.
+    from moe_compress.stage2.plugins.reap_scoring import ReapScoringPlugin
+    probed = [_SlotProbe(), ReapScoringPlugin(), adapter]
+    # ReapScoringPlugin.on_score already ran in _prepare_layer_for_assignment;
+    # we reuse the same ctx (scores/freq already published).
+    _run_assignment(probed, ctx)
+
+    # At least one bump iteration ran the success branch (the tiny model is
+    # feasible with max_group_cap=0), so every slot fired.
+    assert calls, "no assignment slots were dispatched"
+    n_bumps = len(calls) // 4
+    assert n_bumps >= 1
+    # Per-bump invocation: the recorded calls are whole repeats of the
+    # canonical four-slot order.
+    assert calls == list(_ASSIGNMENT_SLOTS) * n_bumps, (
+        f"slot calls not in canonical per-bump order: {calls}"
+    )
+
+
+def test_run_assignment_publishes_layer_output_slots(tiny_model, patched_stage2,
+                                                     tmp_path):
+    """`_run_assignment` publishes every per-layer output slot the post-assign
+    phases consume — all resolve to non-sentinel values after the driver runs."""
+    adapter, plugins, ctx = _prepare_layer_for_assignment(
+        tiny_model, patched_stage2, tmp_path)
+
+    _run_assignment(plugins, ctx)
+
+    # The ~16 output slots the retired compute_assignment used to set; every
+    # one must resolve (ctx.get raises KeyError on an unset slot).
+    output_slots = (
+        "protected", "ream_centroid_ids", "ream_noncentroid_ids",
+        "assignment", "delta", "grouped", "mean_assigned_cost", "n_protected",
+        "assigned_cost", "n_assigned", "b_fail", "c_fail", "em_rounds_done",
+        "effective_cost_alignment", "effective_cost_asymmetric",
+        "capacity_util_value", "effective_target",
+    )
+    for slot in output_slots:
+        ctx.get(slot)  # raises KeyError if the slot was never published
+    # Spot-check structural sanity of a few slots.
+    assert isinstance(ctx.get("grouped"), dict)
+    assert isinstance(ctx.get("ream_centroid_ids"), tuple)
+    assert isinstance(ctx.get("protected"), tuple)
+    assert isinstance(ctx.get("b_fail"), bool)
+    assert isinstance(ctx.get("c_fail"), bool)
+    assert isinstance(ctx.get("effective_target"), int)
 
 
 # ---------------------------------------------------------------------------
