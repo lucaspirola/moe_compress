@@ -1329,7 +1329,7 @@ def _patch_calib_and_save(monkeypatch):
 def _run_stage1_for_telemetry(model, cfg, tmp_path):
     """Run Stage 1 with a fixed BudgetDecomposition so Stage 2 has the
     required artifacts (stage1_blacklist.json, stage1_budgets.json) on disk."""
-    from moe_compress import stage1_grape
+    from moe_compress import stage1
     from moe_compress.budget.solver import BudgetDecomposition
 
     decomp = BudgetDecomposition(
@@ -1337,7 +1337,7 @@ def _run_stage1_for_telemetry(model, cfg, tmp_path):
         svd_rank_ratio=0.14, global_expert_budget=4,
         min_experts_per_layer=2, blacklisted_experts={},
     )
-    stage1_grape.run(model, _TinyTokenizerForTelemetry(), cfg, tmp_path, decomp)
+    stage1.run(model, _TinyTokenizerForTelemetry(), cfg, tmp_path, decomp)
 
 
 def test_trackio_emits_v2_config_keys_once_at_start(

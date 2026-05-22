@@ -32,7 +32,7 @@ import yaml
 
 from .budget import solver as budget_solver
 from . import (
-    stage1_grape,
+    stage1,
     stage2_reap_ream,
     stage3_svd,
     stage4_eora,
@@ -151,7 +151,7 @@ def main(argv=None) -> int:
         )
 
         # Stage 1: SE detection + CKA + GRAPE
-        blacklist_path, budgets_path = stage1_grape.run(
+        blacklist_path, budgets_path = stage1.run(
             model, tokenizer, config, artifacts_dir, decomposition, device=device,
         )
 

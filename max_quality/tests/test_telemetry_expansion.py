@@ -50,7 +50,7 @@ def _patched_calib(monkeypatch):
     network."""
     from moe_compress.utils import calibration as cal_mod
     from moe_compress.utils import model_io as mio
-    from moe_compress import stage1_grape, stage2_reap_ream, stage5_router_kd
+    from moe_compress import stage2_reap_ream, stage5_router_kd
 
     def _fake_build(tokenizer, spec, cache_dir=None):
         torch.manual_seed(spec.seed)
@@ -79,11 +79,18 @@ def _captured_emits(monkeypatch):
         captured.append(dict(metrics))
 
     from moe_compress import (
-        run_pipeline, stage1_grape, stage2_reap_ream, stage3_svd,
+        run_pipeline, stage2_reap_ream, stage3_svd,
         stage4_eora, stage5_router_kd, stage6_validate,
     )
-    for mod in (run_pipeline, stage1_grape, stage2_reap_ream, stage3_svd,
-                stage4_eora, stage5_router_kd, stage6_validate):
+    # The plugin-based Stage 1 emits Trackio telemetry from three modules
+    # (orchestrator + the grape_merge / ma_detection plugins), replacing the
+    # single stage1_grape monolith.
+    from moe_compress.stage1 import orchestrator as stage1_orchestrator
+    from moe_compress.stage1.plugins import grape_merge as stage1_grape_merge
+    from moe_compress.stage1.plugins import ma_detection as stage1_ma_detection
+    for mod in (run_pipeline, stage2_reap_ream, stage3_svd,
+                stage4_eora, stage5_router_kd, stage6_validate,
+                stage1_orchestrator, stage1_grape_merge, stage1_ma_detection):
         monkeypatch.setattr(mod, "_trackio_log", _capture, raising=False)
 
     return captured
@@ -99,7 +106,7 @@ def test_stage1_grape_emits_summary_keys(
 ):
     """Stage 1's GRAPE inner function should emit a summary dict with the
     new entropy / merge / exit_reason keys at the end of greedy."""
-    from moe_compress import stage1_grape
+    from moe_compress import stage1
     from moe_compress.budget.solver import BudgetDecomposition
 
     decomp = BudgetDecomposition(
@@ -107,7 +114,7 @@ def test_stage1_grape_emits_summary_keys(
         svd_rank_ratio=0.14, global_expert_budget=4,
         min_experts_per_layer=2, blacklisted_experts={},
     )
-    stage1_grape.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
+    stage1.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
 
     # Find the GRAPE summary emit (has exit_reason).
     grape_emits = [
@@ -141,7 +148,7 @@ def test_stage1_grape_emits_phase_a_c_summary(
     _captured_emits, _patched_calib, tiny_model, tiny_config, tmp_path,
 ):
     """Stage 1 should emit a Phase A/C summary with MA layers count + thresholds."""
-    from moe_compress import stage1_grape
+    from moe_compress import stage1
     from moe_compress.budget.solver import BudgetDecomposition
 
     decomp = BudgetDecomposition(
@@ -149,7 +156,7 @@ def test_stage1_grape_emits_phase_a_c_summary(
         svd_rank_ratio=0.14, global_expert_budget=4,
         min_experts_per_layer=2, blacklisted_experts={},
     )
-    stage1_grape.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
+    stage1.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
 
     pa_emits = [
         e for e in _captured_emits
@@ -170,7 +177,7 @@ def test_stage1_existing_per_layer_emits_unchanged(
 ):
     """Regression guard: pre-expansion per-layer SE / GRAPE-budget emits
     must still appear with their original keys."""
-    from moe_compress import stage1_grape
+    from moe_compress import stage1
     from moe_compress.budget.solver import BudgetDecomposition
 
     decomp = BudgetDecomposition(
@@ -178,7 +185,7 @@ def test_stage1_existing_per_layer_emits_unchanged(
         svd_rank_ratio=0.14, global_expert_budget=4,
         min_experts_per_layer=2, blacklisted_experts={},
     )
-    stage1_grape.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
+    stage1.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
 
     se_emits = [e for e in _captured_emits if "stage1/se_layer_idx" in e]
     assert se_emits, "v1 per-layer SE emits regressed"

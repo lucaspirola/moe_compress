@@ -17,7 +17,7 @@ residual-stream signal that Phase A measures, miscalibrating the
 `ma_growth_ratio = 5.0` threshold (which was tuned on Qwen3-30B without
 output gating).
 
-Mirrors `_detect_ma_layers` in `stage1_grape.py` exactly, but exposes the
+Mirrors `_detect_ma_layers` in `stage1/plugins/ma_detection.py` exactly, but exposes the
 `layer_max` dict (currently discarded) and tries multiple thresholds offline
 in a single forward pass.
 
@@ -51,7 +51,7 @@ from moe_compress.utils.model_io import iter_decoder_layers, iter_moe_layers
 
 LOG = logging.getLogger("phase_a_diagnostic")
 
-# Production thresholds (mirror stage1_grape.py:45-46) — for cross-reference.
+# Production thresholds (mirror stage1/plugins/ma_detection.py) — for cross-reference.
 _MA_RATIO = 100.0
 _MA_GROWTH_RATIO = 5.0
 
@@ -61,7 +61,7 @@ def _detect_with_layer_max_capture(
     batches,
     moe_layer_indices: list[int],
 ):
-    """Mirror of stage1_grape._detect_ma_layers but RETURN layer_max + first-layer Q99.
+    """Mirror of ma_detection._detect_ma_layers but RETURN layer_max + first-layer Q99.
 
     Hooks every decoder layer (MoE and non-MoE) and captures the cumulative
     cross-batch max of |H_l| per layer. Also buffers the first-MoE-layer's

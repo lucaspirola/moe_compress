@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from moe_compress import stage1_grape, stage2_reap_ream
+from moe_compress import stage1, stage2_reap_ream
 from moe_compress import stage5_router_kd
 from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.utils.model_io import iter_moe_layers
@@ -97,7 +97,7 @@ def _prepare_model_and_merge_map(model, config, tmp_path, monkeypatch):
         min_experts_per_layer=2,
         blacklisted_experts={},
     )
-    stage1_grape.run(model, _TinyTokenizer(), config, tmp_path, decomp)
+    stage1.run(model, _TinyTokenizer(), config, tmp_path, decomp)
     stage2_reap_ream.run(model, _TinyTokenizer(), config, tmp_path, device=None)
 
     # Overwrite merge_map.json with a trivial identity map (each new expert → itself).
