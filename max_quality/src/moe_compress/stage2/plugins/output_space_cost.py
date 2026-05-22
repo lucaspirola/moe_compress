@@ -37,7 +37,7 @@ import torch.nn.functional as F
 from ...utils.activation_hooks import ReamCostAccumulator  # noqa: F401 — string type hint
 from ...utils.model_io import MATRIX_NAMES, MoELayerRef, build_banks
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
+from ...pipeline.context import PipelineContext
 from ..permutation_align import (
     _PermAlignCache,  # noqa: F401 — resolves the string type hint
     _permutation_align_to_centroid,
@@ -324,7 +324,7 @@ class OutputSpaceCostPlugin(Stage2Plugin):
         s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
         return str(s2.get("cost_alignment", "pre")).lower() == "output"
 
-    def compute_cost(self, ctx: LayerContext) -> Any | None:
+    def compute_cost(self, ctx: PipelineContext) -> Any | None:
         """No-op for T10. See class docstring.
 
         Returning ``None`` makes ``PluginRegistry.dispatch_first`` skip this

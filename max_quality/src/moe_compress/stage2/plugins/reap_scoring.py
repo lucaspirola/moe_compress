@@ -1,7 +1,7 @@
 """REAP scoring plugin: owns the per-layer ReapAccumulator and derives
-``ctx.scores`` / ``ctx.freq`` so downstream phases (centroid selection,
-cost-matrix construction) can read them as plain typed slots on
-``LayerContext``.
+the ``scores`` / ``freq`` slots so downstream phases (centroid selection,
+cost-matrix construction) can read them as plain slots on the per-layer
+:class:`PipelineContext`.
 
 This plugin is the first real extraction out of ``LegacyAdapter`` (T7 of the
 plugin refactor). The pure-function ``select_centroids_by_reap`` packages the
@@ -15,9 +15,9 @@ from typing import Iterable
 
 import numpy as np
 
+from ...pipeline.context import PipelineContext
 from ...utils.activation_hooks import ReapAccumulator
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
 
 log = logging.getLogger(__name__)
 
@@ -32,14 +32,14 @@ class ReapScoringPlugin(Stage2Plugin):
     # Phase: on_layer_setup (runs BEFORE LegacyAdapter.on_layer_setup
     # because ReapScoringPlugin is registered first; see stage2_reap_ream.py).
     # ------------------------------------------------------------------
-    def on_layer_setup(self, ctx: LayerContext) -> None:
+    def on_layer_setup(self, ctx: PipelineContext) -> None:
         """Create the per-layer ReapAccumulator and stash it on ctx."""
-        ctx.reap_acc = ReapAccumulator()
+        ctx.set("reap_acc", ReapAccumulator())
 
     # ------------------------------------------------------------------
     # Phase: on_score (NEW in T7; runs between on_profile and compute_assignment)
     # ------------------------------------------------------------------
-    def on_score(self, ctx: LayerContext) -> None:
+    def on_score(self, ctx: PipelineContext) -> None:
         """Finalize the accumulator and populate ctx.scores + ctx.freq.
 
         ``scores`` is an ``np.ndarray`` of length ``n_experts`` containing the
@@ -48,23 +48,24 @@ class ReapScoringPlugin(Stage2Plugin):
         token count (used by `min_active_tokens` filtering and by some cost
         matrices).
         """
-        layer_ref = ctx.layer_ref
+        layer_ref = ctx.get("layer_ref")
         layer_idx = layer_ref.layer_idx
         n_experts = layer_ref.num_routed_experts
 
+        reap_acc = ctx.get("reap_acc")
         # Single finalize call; mirrors the pre-T7 LegacyAdapter.on_profile slice.
-        ctx.reap_acc.finalize_layer(layer_idx)
+        reap_acc.finalize_layer(layer_idx)
 
         # Derive the per-expert score vector and the freq dict. Build them as
         # plain numpy + dict so downstream consumers (and unit tests) do not
         # take a hidden dependency on ReapAccumulator's internal layout.
-        ctx.scores = np.array(
-            [ctx.reap_acc.score(layer_idx, e) for e in range(n_experts)]
-        )
-        ctx.freq = {
-            e: ctx.reap_acc.freq.get((layer_idx, e), 0)
+        ctx.set("scores", np.array(
+            [reap_acc.score(layer_idx, e) for e in range(n_experts)]
+        ))
+        ctx.set("freq", {
+            e: reap_acc.freq.get((layer_idx, e), 0)
             for e in range(n_experts)
-        }
+        })
 
 
 def select_centroids_by_reap(

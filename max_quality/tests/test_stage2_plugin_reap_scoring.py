@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from moe_compress.stage2._framework.context import LayerContext
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage2.plugins.reap_scoring import (
     ReapScoringPlugin,
     select_centroids_by_reap,
@@ -127,24 +127,29 @@ def test_reap_scoring_plugin_lifecycle():
     """on_layer_setup creates a fresh accumulator; on_score finalizes + publishes."""
     plugin = ReapScoringPlugin()
     layer_ref = SimpleNamespace(layer_idx=3, num_routed_experts=4)
-    ctx = LayerContext(layer_idx=3, layer_ref=layer_ref, n_experts=4, target=2)
+    ctx = PipelineContext().child()
+    ctx.set("layer_idx", 3)
+    ctx.set("layer_ref", layer_ref)
+    ctx.set("n_experts", 4)
+    ctx.set("target", 2)
 
     plugin.on_layer_setup(ctx)
-    assert isinstance(ctx.reap_acc, ReapAccumulator)
+    assert isinstance(ctx.get("reap_acc"), ReapAccumulator)
 
     # Inject contributions for experts 1 and 2; experts 0 and 3 stay absent.
     # Using a CPU tensor + 0-dim scalar mirrors what ReapAccumulator.add_gpu()
     # receives in production (per-expert REAP saliency sum).
     n_tokens = 17
-    ctx.reap_acc.add_gpu((3, 1), torch.tensor(2.0), n_tokens)
-    ctx.reap_acc.add_gpu((3, 2), torch.tensor(4.0), n_tokens)
+    ctx.get("reap_acc").add_gpu((3, 1), torch.tensor(2.0), n_tokens)
+    ctx.get("reap_acc").add_gpu((3, 2), torch.tensor(4.0), n_tokens)
 
     plugin.on_score(ctx)
 
-    assert isinstance(ctx.scores, np.ndarray)
-    assert ctx.scores.shape == (4,)
-    assert ctx.scores[0] == 0.0
-    assert ctx.scores[1] > 0.0
-    assert ctx.scores[2] > 0.0
-    assert ctx.scores[3] == 0.0
-    assert ctx.freq == {0: 0, 1: n_tokens, 2: n_tokens, 3: 0}
+    scores = ctx.get("scores")
+    assert isinstance(scores, np.ndarray)
+    assert scores.shape == (4,)
+    assert scores[0] == 0.0
+    assert scores[1] > 0.0
+    assert scores[2] > 0.0
+    assert scores[3] == 0.0
+    assert ctx.get("freq") == {0: 0, 1: n_tokens, 2: n_tokens, 3: 0}

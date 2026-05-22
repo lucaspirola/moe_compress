@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
+from ...pipeline.context import PipelineContext
 from .solver_hungarian import _assign_hungarian
 from .solver_mcf import _assign_mcf
 
@@ -62,7 +62,7 @@ class AutoSolverPlugin(Stage2Plugin):
         s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
         return str(s2.get("assignment_solver", "greedy")).lower() == "auto"
 
-    def solve_assignment(self, ctx: LayerContext, delta: Any) -> Any | None:
+    def solve_assignment(self, ctx: PipelineContext, delta: Any) -> Any | None:
         """Wrap `_assign_auto`. NOTE: not invoked by the current phase walk
         (the bump loop calls `_assign_children_to_centroids` directly); kept as
         a functional hook for the T18 decomposition. Returns None when delta is

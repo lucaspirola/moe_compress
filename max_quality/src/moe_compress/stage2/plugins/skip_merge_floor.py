@@ -30,7 +30,7 @@ from __future__ import annotations
 from typing import Any
 
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
+from ...pipeline.context import PipelineContext
 from ..grouping import _apply_skip_merge_floor
 
 # OFF sentinel: percentile >= this value masks nothing (see grouping docstring).
@@ -48,7 +48,7 @@ class SkipMergeFloorPlugin(Stage2Plugin):
     decomposed (T13+).
 
     The percentile is stored at construction: ``apply_cost_mask`` only receives
-    a ``LayerContext`` (which carries no cfg), so the value cannot be read at
+    a ``PipelineContext`` (which carries no cfg), so the value cannot be read at
     call time. Use :func:`make_skip_merge_floor_plugin` to build the plugin
     from a config dict.
     """
@@ -79,7 +79,7 @@ class SkipMergeFloorPlugin(Stage2Plugin):
         return float(s2.get("skip_merge_percentile", _SKIP_MERGE_OFF)) < _SKIP_MERGE_OFF
 
     def apply_cost_mask(
-        self, ctx: LayerContext, delta: Any
+        self, ctx: PipelineContext, delta: Any
     ) -> tuple[Any, dict] | None:
         """Mask cost-matrix entries above the skip-merge percentile to +inf.
 

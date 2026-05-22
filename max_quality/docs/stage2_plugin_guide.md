@@ -36,8 +36,7 @@ compatibility contract.
 | `Stage2Pipeline` | `stage2/_framework/pipeline.py` | Holds an ordered list of plugin instances. `run_setup` / `run_layer` / `run_teardown`. `run_layer` walks `Stage2Pipeline.phases` and dispatches each phase to every plugin in registration order. |
 | `Stage2Plugin` | `stage2/_framework/base.py` | Base class. Every hook is a no-op default. Class attrs `name`, `enabled_by`; classmethod `is_enabled(cfg)`. |
 | `PluginRegistry` | `stage2/_framework/registry.py` | Ordered list of plugin *classes*. `register`, `classes`, `active(cfg)` (instantiates the `is_enabled`-true subset), and the static `dispatch_first` helper for slot-style hooks. |
-| `LayerContext` | `stage2/_framework/context.py` | Per-layer state object passed to every per-layer hook. |
-| `RunContext` | `stage2/_framework/context.py` | Per-run state object passed to `on_run_setup` / `on_run_teardown`. Frozen and extras-less by design — run-scope mutable scratchpad lives on the plugin instance (as `LegacyAdapter` does). |
+| `PipelineContext` | `pipeline/context.py` | Named-slot state object. The root instance is the per-run context passed to `on_run_setup` / `on_run_teardown`; each layer opens a `child()` scope passed to every per-layer hook. Run-scope mutable scratchpad lives on the plugin instance (as `LegacyAdapter` does). |
 
 ### `Stage2Pipeline.phases`
 
@@ -165,7 +164,7 @@ from __future__ import annotations
 from typing import Any
 
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
+from ...pipeline.context import PipelineContext
 
 
 class ExampleScorePlugin(Stage2Plugin):
@@ -174,7 +173,7 @@ class ExampleScorePlugin(Stage2Plugin):
     name = "example_score"
     enabled_by = ("example_score_enabled",)  # stage2_reap_ream.example_score_enabled
 
-    def on_score(self, ctx: LayerContext) -> None:
+    def on_score(self, ctx: PipelineContext) -> None:
         # ctx.scores / ctx.freq are published here by ReapScoringPlugin;
         # mutate or augment them, then leave them on ctx for downstream phases.
         ...
@@ -223,7 +222,8 @@ Each plugin gets `tests/test_plugin_<name>.py`. Use
 - **Monkeypatch-drift guard** — assert the plugin delegates to the canonical
   helper rather than holding a stale private copy (the T9-T11 lesson).
 - **Hook behaviour** — call the hook directly with a constructed
-  `LayerContext` and assert the expected `ctx` mutation.
+  `PipelineContext` (a `child()` scope for per-layer hooks) and assert the
+  expected `ctx` mutation.
 
 ---
 

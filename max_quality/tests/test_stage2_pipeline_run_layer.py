@@ -21,13 +21,37 @@ from moe_compress import stage2_reap_ream as _stage2_monolith
 from moe_compress.stage2 import orchestrator as stage2_reap_ream
 from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.stage2._framework import (
-    LayerContext,
-    RunContext,
+    PipelineContext,
     Stage2Pipeline,
     Stage2Plugin,
 )
 from moe_compress.stage2.plugins.legacy_adapter import LegacyAdapter
 from moe_compress.utils.model_io import iter_moe_layers
+
+
+def _make_run_ctx(*, model, tokenizer, config, artifacts_dir,
+                  partial_dir, device):
+    """Build a root PipelineContext with the six Stage-2 run-scope slots."""
+    rc = PipelineContext()
+    rc.set("model", model)
+    rc.set("tokenizer", tokenizer)
+    rc.set("config", config)
+    rc.set("artifacts_dir", artifacts_dir)
+    rc.set("partial_dir", partial_dir)
+    rc.set("device", device)
+    return rc
+
+
+def _make_layer_ctx(root, *, layer_idx, layer_ref, n_experts, target,
+                    blacklist=()):
+    """Open a per-layer child scope and populate the orchestrator's slots."""
+    ctx = root.child()
+    ctx.set("layer_idx", layer_idx)
+    ctx.set("layer_ref", layer_ref)
+    ctx.set("n_experts", n_experts)
+    ctx.set("target", target)
+    ctx.set("blacklist", tuple(blacklist))
+    return ctx
 
 
 class _TinyTokenizer:
@@ -136,13 +160,13 @@ def test_run_layer_visits_each_phase_in_canonical_order(tmp_path):
     """Stage2Pipeline.run_layer visits every phase in declared order, once per plugin."""
     plugin = _CountingPlugin()
     pipeline = Stage2Pipeline(plugins=[plugin])
-    run_ctx = RunContext(
+    run_ctx = _make_run_ctx(
         model=object(), tokenizer=object(), config={},
         artifacts_dir=tmp_path, partial_dir=tmp_path, device="cpu",
     )
     pipeline.run_setup(run_ctx)
-    pipeline.run_layer(LayerContext(layer_idx=0, layer_ref=object(),
-                                    n_experts=4, target=2))
+    pipeline.run_layer(_make_layer_ctx(run_ctx, layer_idx=0, layer_ref=object(),
+                                       n_experts=4, target=2))
     pipeline.run_teardown(run_ctx)
     assert plugin.calls == [
         "on_run_setup",
@@ -189,8 +213,9 @@ def test_run_layer_passes_partial_dir_to_write_artifacts(tmp_path):
     custom_partial = tmp_path / "my_partial"
     plugin = _SnoopPlugin(partial_dir=custom_partial)
     pipeline = Stage2Pipeline(plugins=[plugin])
-    pipeline.run_layer(LayerContext(layer_idx=0, layer_ref=object(),
-                                    n_experts=4, target=2))
+    pipeline.run_layer(_make_layer_ctx(PipelineContext(), layer_idx=0,
+                                       layer_ref=object(),
+                                       n_experts=4, target=2))
     assert seen["partial_dir"] == custom_partial
 
 
@@ -208,8 +233,9 @@ def test_run_layer_threads_partial_dir_none_when_no_plugin_exposes_it(tmp_path):
 
     plugin = _SnoopPlugin()
     pipeline = Stage2Pipeline(plugins=[plugin])
-    pipeline.run_layer(LayerContext(layer_idx=0, layer_ref=object(),
-                                    n_experts=4, target=2))
+    pipeline.run_layer(_make_layer_ctx(PipelineContext(), layer_idx=0,
+                                       layer_ref=object(),
+                                       n_experts=4, target=2))
     assert seen["partial_dir"] is None
 
 
@@ -272,16 +298,17 @@ def test_legacy_adapter_on_layer_setup_populates_accumulators(tiny_model, patche
     moe_layers = list(iter_moe_layers(tiny_model))
     adapter = _build_minimal_adapter(tiny_model, patched_stage2, tmp_path,
                                      moe_layers=moe_layers)
-    ctx = LayerContext(layer_idx=moe_layers[0].layer_idx,
-                       layer_ref=moe_layers[0],
-                       n_experts=moe_layers[0].num_routed_experts, target=2)
+    ctx = _make_layer_ctx(PipelineContext(),
+                          layer_idx=moe_layers[0].layer_idx,
+                          layer_ref=moe_layers[0],
+                          n_experts=moe_layers[0].num_routed_experts, target=2)
     ReapScoringPlugin().on_layer_setup(ctx)
     adapter.on_layer_setup(ctx)
-    assert isinstance(ctx.reap_acc, ReapAccumulator)
-    assert isinstance(ctx.ream_acc, ReamCostAccumulator)
-    assert isinstance(ctx.perm_cache, _PermAlignCache)
+    assert isinstance(ctx.get("reap_acc"), ReapAccumulator)
+    assert isinstance(ctx.get("ream_acc"), ReamCostAccumulator)
+    assert isinstance(ctx.get("perm_cache"), _PermAlignCache)
     # default mode: expert_distill_steps=0 and cost_alignment_cfg="pre" → no input capture.
-    assert ctx.layer_input_acc is None
+    assert ctx.get("layer_input_acc") is None
 
 
 def test_legacy_adapter_on_layer_teardown_clears_state(tiny_model, patched_stage2,
@@ -293,27 +320,23 @@ def test_legacy_adapter_on_layer_teardown_clears_state(tiny_model, patched_stage
     moe_layers = list(iter_moe_layers(tiny_model))
     adapter = _build_minimal_adapter(tiny_model, patched_stage2, tmp_path,
                                      moe_layers=moe_layers)
-    ctx = LayerContext(layer_idx=moe_layers[0].layer_idx,
-                       layer_ref=moe_layers[0],
-                       n_experts=moe_layers[0].num_routed_experts, target=2)
+    ctx = _make_layer_ctx(PipelineContext(),
+                          layer_idx=moe_layers[0].layer_idx,
+                          layer_ref=moe_layers[0],
+                          n_experts=moe_layers[0].num_routed_experts, target=2)
     ReapScoringPlugin().on_layer_setup(ctx)
     adapter.on_layer_setup(ctx)
-    assert ctx.reap_acc is not None and ctx.ream_acc is not None
+    assert ctx.get("reap_acc") is not None and ctx.get("ream_acc") is not None
+    # teardown nulls all 8 per-layer slots unconditionally (overwrite=True is
+    # an upsert), so no pre-seed is needed even for slots the pre-merge / merge
+    # phases would normally write.
     adapter.on_layer_teardown(ctx)
-    assert ctx.reap_acc is None
-    assert ctx.ream_acc is None
-    assert ctx.perm_cache is None
-    assert ctx.distill_state is None
-
-
-def test_legacy_adapter_does_not_add_extras_to_run_context(tmp_path):
-    """RunContext stays frozen + extras-less; LegacyAdapter holds run-scope state internally."""
-    rc = RunContext(model=object(), tokenizer=object(), config={},
-                    artifacts_dir=tmp_path, partial_dir=tmp_path, device="cpu")
-    assert not hasattr(rc, "extras"), (
-        "RunContext must not regrow an `extras` dict — T1 invariant. Run-scope "
-        "mutable state lives on the LegacyAdapter instance for T6."
-    )
+    assert ctx.get("reap_acc") is None
+    assert ctx.get("ream_acc") is None
+    assert ctx.get("perm_cache") is None
+    assert ctx.get("layer_input_acc") is None
+    assert ctx.get("pre_merge_weights") is None
+    assert ctx.get("distill_state") is None
 
 
 # ---------------------------------------------------------------------------

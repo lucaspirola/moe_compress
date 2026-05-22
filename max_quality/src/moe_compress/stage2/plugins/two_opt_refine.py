@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
+from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -171,7 +171,7 @@ class TwoOptRefinePlugin(Stage2Plugin):
     enabled_by: tuple[str, ...] = ("two_opt_refine",)
 
     def refine_assignment(
-        self, ctx: LayerContext, asg: Any, delta: Any
+        self, ctx: PipelineContext, asg: Any, delta: Any
     ) -> tuple[Any, Any, dict] | None:
         """Documented no-op for T14.
 

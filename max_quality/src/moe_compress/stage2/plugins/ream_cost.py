@@ -33,7 +33,7 @@ from ...utils.activation_hooks import (
 )
 from ...utils.model_io import MoELayerRef
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
+from ...pipeline.context import PipelineContext
 from ..permutation_align import _PermAlignCache  # noqa: F401 — string type hint
 
 
@@ -277,7 +277,7 @@ class ReamCostPrePlugin(Stage2Plugin):
         s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
         return str(s2.get("cost_alignment", "pre")).lower() == "pre"
 
-    def compute_cost(self, ctx: LayerContext) -> Any | None:
+    def compute_cost(self, ctx: PipelineContext) -> Any | None:
         """No-op for T8. See class docstring.
 
         Returning ``None`` makes ``PluginRegistry.dispatch_first`` skip this

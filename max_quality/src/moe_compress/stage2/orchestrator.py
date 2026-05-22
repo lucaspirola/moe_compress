@@ -495,21 +495,30 @@ def run(
     # Each layer flows through the 9-phase plugin walk (see
     # max_quality/docs/stage2_plugin_guide.md). Shared setup (above) and the
     # final-checkpoint save (below) run once, around the layer loop.
-    from ._framework import LayerContext, RunContext, Stage2Pipeline
+    from ._framework import Stage2Pipeline
+    from ..pipeline.context import PipelineContext
     from .plugins.legacy_adapter import LegacyAdapter
     from .plugins.reap_scoring import ReapScoringPlugin
 
-    # RunContext stays frozen + extras-less by T1 design. Run-scope
-    # mutable scratchpad (cov_acc, merge_map, _layer_mean_costs,
-    # partial_dir) lives on the LegacyAdapter instance instead — the
-    # adapter is constructed once per run() invocation and is the
-    # natural home for single-run-scoped state.
-    run_ctx = RunContext(
-        model=model, tokenizer=tokenizer, config=config,
-        artifacts_dir=artifacts_dir,
-        partial_dir=(partial_dir if partial_dir is not None else artifacts_dir),
-        device=str(device) if device is not None else "cpu",
+    # The run-scope context is the root PipelineContext; each layer opens a
+    # child() scope. Run-scope mutable scratchpad (cov_acc, merge_map,
+    # _layer_mean_costs, partial_dir) lives on the LegacyAdapter instance
+    # instead — the adapter is constructed once per run() invocation and is
+    # the natural home for single-run-scoped state.
+    run_ctx = PipelineContext()
+    run_ctx.set("model", model)
+    run_ctx.set("tokenizer", tokenizer)
+    run_ctx.set("config", config)
+    run_ctx.set("artifacts_dir", artifacts_dir)
+    run_ctx.set(
+        "partial_dir",
+        partial_dir if partial_dir is not None else artifacts_dir,
     )
+    # The "device" ctx slot holds the *stringified* device ("cpu" / "cuda:0"),
+    # not a torch.device — the original device object is passed separately to
+    # LegacyAdapter (the `device=device` kwarg below). Readers of
+    # run_ctx.get("device") must not expect a torch.device.
+    run_ctx.set("device", str(device) if device is not None else "cpu")
     adapter = LegacyAdapter(
         s2_cfg=s2, heal_cfg=heal_cfg,
         heal_device=_heal_device, xd_batches=xd_batches,
@@ -559,13 +568,12 @@ def run(
             "Stage 2 layer %d/%d (idx=%d) — profiling then merging to %d experts",
             k + 1, len(moe_layers), layer_ref.layer_idx, target,
         )
-        ctx = LayerContext(
-            layer_idx=layer_ref.layer_idx,
-            layer_ref=layer_ref,
-            n_experts=layer_ref.num_routed_experts,
-            target=target,
-            blacklist=tuple(blacklist.get(layer_ref.layer_idx, [])),
-        )
+        ctx = run_ctx.child()
+        ctx.set("layer_idx", layer_ref.layer_idx)
+        ctx.set("layer_ref", layer_ref)
+        ctx.set("n_experts", layer_ref.num_routed_experts)
+        ctx.set("target", target)
+        ctx.set("blacklist", tuple(blacklist.get(layer_ref.layer_idx, [])))
         pipeline.run_layer(ctx)
     pipeline.run_teardown(run_ctx)
 

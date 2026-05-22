@@ -36,7 +36,7 @@ from ...utils.activation_hooks import (
 )
 from ...utils.model_io import MoELayerRef, build_banks
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
+from ...pipeline.context import PipelineContext
 from ..grouping import _apply_skip_merge_floor, _build_grouped_from_assignment
 from ..permutation_align import (
     _PermAlignCache,  # noqa: F401 — resolves the string type hint
@@ -274,7 +274,7 @@ class EmRefinePlugin(Stage2Plugin):
             return False
 
     def refine_assignment(
-        self, ctx: LayerContext, asg: Any, delta: Any
+        self, ctx: PipelineContext, asg: Any, delta: Any
     ) -> tuple[Any, Any, dict] | None:
         """Documented no-op for T15.
 

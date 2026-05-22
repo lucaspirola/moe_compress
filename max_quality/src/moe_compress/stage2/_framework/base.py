@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .context import LayerContext, RunContext
+from ...pipeline.context import PipelineContext
 
 
 class Stage2Plugin:
@@ -30,43 +30,43 @@ class Stage2Plugin:
     # ------------------------------------------------------------------
     # Run-scope hooks
     # ------------------------------------------------------------------
-    def on_run_setup(self, run_ctx: RunContext) -> None:
+    def on_run_setup(self, run_ctx: PipelineContext) -> None:
         """Called once before any layer is processed."""
 
-    def on_run_teardown(self, run_ctx: RunContext) -> None:
+    def on_run_teardown(self, run_ctx: PipelineContext) -> None:
         """Called once after all layers are processed."""
 
     # ------------------------------------------------------------------
     # Per-layer lifecycle (in execution order)
     # ------------------------------------------------------------------
-    def on_layer_setup(self, ctx: LayerContext) -> None:
+    def on_layer_setup(self, ctx: PipelineContext) -> None:
         """Called at the start of a layer, before any profiling."""
 
-    def on_profile(self, ctx: LayerContext) -> None:
+    def on_profile(self, ctx: PipelineContext) -> None:
         """Attach forward hooks / collect activations for this layer."""
 
-    def on_score(self, ctx: LayerContext) -> None:
+    def on_score(self, ctx: PipelineContext) -> None:
         """Compute and publish per-layer saliency scores (REAP) for downstream phases."""
 
-    def compute_cost(self, ctx: LayerContext) -> Any | None:
+    def compute_cost(self, ctx: PipelineContext) -> Any | None:
         """Return a cost matrix for this layer, or None to defer to another plugin."""
         return None
 
-    def apply_cost_mask(self, ctx: LayerContext, delta: Any) -> tuple[Any, dict] | None:
+    def apply_cost_mask(self, ctx: PipelineContext, delta: Any) -> tuple[Any, dict] | None:
         """Optionally mutate the cost matrix (e.g. skip-merge floor); return (new_delta, info)."""
         return None
 
-    def solve_assignment(self, ctx: LayerContext, delta: Any) -> Any | None:
+    def solve_assignment(self, ctx: PipelineContext, delta: Any) -> Any | None:
         """Return an Assignment for this layer, or None to defer to another plugin."""
         return None
 
     def refine_assignment(
-        self, ctx: LayerContext, asg: Any, delta: Any
+        self, ctx: PipelineContext, asg: Any, delta: Any
     ) -> tuple[Any, Any, dict] | None:
         """Optionally refine an assignment (two-opt, EM); return (new_asg, new_delta, info)."""
         return None
 
-    def compute_assignment(self, ctx: LayerContext) -> None:
+    def compute_assignment(self, ctx: PipelineContext) -> None:
         """Compound phase: cost → solve → refine → grouping (the bump loop).
 
         T6 keeps this collapsed into a single hook on the LegacyAdapter; tasks
@@ -77,18 +77,18 @@ class Stage2Plugin:
         only care about other phases can stay quiet.
         """
 
-    def pre_merge_snapshot(self, ctx: LayerContext) -> None:
+    def pre_merge_snapshot(self, ctx: PipelineContext) -> None:
         """Snapshot pre-merge layer state (used by distill / heal plugins)."""
 
-    def merge(self, ctx: LayerContext) -> None:
+    def merge(self, ctx: PipelineContext) -> None:
         """Execute the in-place merge for this layer."""
 
-    def post_merge(self, ctx: LayerContext) -> None:
+    def post_merge(self, ctx: PipelineContext) -> None:
         """Run post-merge work (per-group distill, layer heal)."""
 
-    def write_artifacts(self, ctx: LayerContext, partial_dir: Any) -> dict[str, Any]:
+    def write_artifacts(self, ctx: PipelineContext, partial_dir: Any) -> dict[str, Any]:
         """Return extra key/value pairs to merge into merge_*.json."""
         return {}
 
-    def on_layer_teardown(self, ctx: LayerContext) -> None:
+    def on_layer_teardown(self, ctx: PipelineContext) -> None:
         """Release per-layer resources (detach hooks, drop accumulators)."""

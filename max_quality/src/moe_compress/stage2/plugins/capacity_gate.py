@@ -27,7 +27,7 @@ from __future__ import annotations
 from typing import Any
 
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
+from ...pipeline.context import PipelineContext
 
 
 def _pick_effective_alignment(
@@ -78,7 +78,7 @@ class CapacityGatePlugin(Stage2Plugin):
     # AND-of-flags is_enabled returns True for every config.
     enabled_by: tuple[str, ...] = ()
 
-    def compute_cost(self, ctx: LayerContext) -> Any | None:
+    def compute_cost(self, ctx: PipelineContext) -> Any | None:
         """No-op for T11. See class docstring.
 
         Returning ``None`` makes ``PluginRegistry.dispatch_first`` skip this

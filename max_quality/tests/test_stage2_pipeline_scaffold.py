@@ -11,9 +11,8 @@ from pathlib import Path
 import pytest
 
 from moe_compress.stage2._framework import (
-    LayerContext,
+    PipelineContext,
     PluginRegistry,
-    RunContext,
     Stage2Pipeline,
     Stage2Plugin,
 )
@@ -82,19 +81,25 @@ class _BoomCostPlugin(Stage2Plugin):
 # ---------------------------------------------------------------------------
 
 
-def _make_run_ctx(tmp_path: Path, cfg: dict | None = None) -> RunContext:
-    return RunContext(
-        model=object(),
-        tokenizer=object(),
-        config=cfg or {},
-        artifacts_dir=tmp_path,
-        partial_dir=tmp_path / "_partial",
-        device="cpu",
-    )
+def _make_run_ctx(tmp_path: Path, cfg: dict | None = None) -> PipelineContext:
+    rc = PipelineContext()
+    rc.set("model", object())
+    rc.set("tokenizer", object())
+    rc.set("config", cfg or {})
+    rc.set("artifacts_dir", tmp_path)
+    rc.set("partial_dir", tmp_path / "_partial")
+    rc.set("device", "cpu")
+    return rc
 
 
-def _make_layer_ctx() -> LayerContext:
-    return LayerContext(layer_idx=0, layer_ref=object(), n_experts=4, target=2)
+def _make_layer_ctx() -> PipelineContext:
+    ctx = PipelineContext().child()
+    ctx.set("layer_idx", 0)
+    ctx.set("layer_ref", object())
+    ctx.set("n_experts", 4)
+    ctx.set("target", 2)
+    ctx.set("blacklist", ())
+    return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -273,28 +278,27 @@ def test_run_setup_and_teardown_fan_out_in_order(tmp_path):
 
     assert [name for name, _ in a.calls] == ["on_run_setup", "on_run_teardown"]
     assert [name for name, _ in b.calls] == ["on_run_setup", "on_run_teardown"]
-    # Same RunContext instance passed to every plugin.
+    # Same run-scope PipelineContext instance passed to every plugin.
     assert all(arg is run_ctx for _, arg in a.calls)
     assert all(arg is run_ctx for _, arg in b.calls)
 
 
-def test_run_context_is_frozen():
-    """RunContext is immutable so plugins cannot accidentally mutate run-scope state."""
+def test_run_context_slots_are_set_once():
+    """PipelineContext slots are set-once: a second write without overwrite raises."""
     rc = _make_run_ctx(Path("/tmp"))
-    with pytest.raises(Exception):  # FrozenInstanceError subclasses AttributeError / dataclasses.FrozenInstanceError
-        rc.device = "cuda"  # type: ignore[misc]
+    with pytest.raises(KeyError):
+        rc.set("device", "cuda")  # already written by _make_run_ctx
+    # overwrite=True is the explicit escape hatch.
+    rc.set("device", "cuda", overwrite=True)
+    assert rc.get("device") == "cuda"
 
 
-def test_run_context_has_no_extras_field():
-    """RunContext intentionally has no `extras` escape hatch — plugin-private state lives on LayerContext."""
-    rc = _make_run_ctx(Path("/tmp"))
-    assert not hasattr(rc, "extras")
-
-
-def test_layer_context_is_mutable_and_has_extras_dict():
-    """LayerContext is mutable and provides a free-form extras dict for plugins."""
+def test_child_context_accepts_arbitrary_slots():
+    """A child PipelineContext is an open namespace — any plugin can add a slot."""
     lc = _make_layer_ctx()
-    lc.scores = "fake-scores"
-    lc.extras["my_plugin"] = {"foo": 1}
-    assert lc.scores == "fake-scores"
-    assert lc.extras == {"my_plugin": {"foo": 1}}
+    lc.set("scores", "fake-scores")
+    lc.set("my_plugin", {"foo": 1})
+    assert lc.get("scores") == "fake-scores"
+    assert lc.get("my_plugin") == {"foo": 1}
+    # Run-scope slots resolve through the parent chain via get/has.
+    assert lc.has("layer_idx")

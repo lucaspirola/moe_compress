@@ -33,7 +33,7 @@ import torch.nn.functional as F
 
 from ...utils.model_io import MATRIX_NAMES, MoELayerRef, build_banks
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
+from ...pipeline.context import PipelineContext
 from .output_space_cost import _swiglu_forward
 
 
@@ -225,7 +225,7 @@ class ExpertDistillPlugin(Stage2Plugin):
         except (TypeError, ValueError):
             return False
 
-    def pre_merge_snapshot(self, ctx: LayerContext) -> None:
+    def pre_merge_snapshot(self, ctx: PipelineContext) -> None:
         """Documented no-op for T16.
 
         The live pre-merge snapshot still belongs to
@@ -237,7 +237,7 @@ class ExpertDistillPlugin(Stage2Plugin):
         """
         return None
 
-    def post_merge(self, ctx: LayerContext) -> None:
+    def post_merge(self, ctx: PipelineContext) -> None:
         """Documented no-op for T16.
 
         The live per-group distillation still belongs to

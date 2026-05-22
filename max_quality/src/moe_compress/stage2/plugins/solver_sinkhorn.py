@@ -21,7 +21,7 @@ import numpy as np
 from scipy.special import logsumexp
 
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
+from ...pipeline.context import PipelineContext
 from .solver_greedy import _assign_greedy
 
 log = logging.getLogger(__name__)
@@ -165,7 +165,7 @@ class SinkhornSolverPlugin(Stage2Plugin):
         s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
         return str(s2.get("assignment_solver", "greedy")).lower() == "sinkhorn"
 
-    def solve_assignment(self, ctx: LayerContext, delta: Any) -> Any | None:
+    def solve_assignment(self, ctx: PipelineContext, delta: Any) -> Any | None:
         """Wrap `_assign_sinkhorn`. NOTE: not invoked by the current phase walk
         (the bump loop calls `_assign_children_to_centroids` directly); kept as
         a functional hook for the T18 decomposition. Returns None when delta is

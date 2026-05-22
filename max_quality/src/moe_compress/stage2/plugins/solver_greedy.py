@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 
 from .._framework.base import Stage2Plugin
-from .._framework.context import LayerContext
+from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ class GreedySolverPlugin(Stage2Plugin):
         s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
         return str(s2.get("assignment_solver", "greedy")).lower() == "greedy"
 
-    def solve_assignment(self, ctx: LayerContext, delta: Any) -> Any | None:
+    def solve_assignment(self, ctx: PipelineContext, delta: Any) -> Any | None:
         """Wrap `_assign_greedy`. NOTE: not invoked by the current phase walk
         (the bump loop calls `_assign_children_to_centroids` directly); kept as
         a functional hook for the T18 decomposition. Returns None when delta is

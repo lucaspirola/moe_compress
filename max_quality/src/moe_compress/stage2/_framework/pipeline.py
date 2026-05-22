@@ -12,8 +12,8 @@ when they extract real cost / solver / refine plugins. See
 """
 from __future__ import annotations
 
+from ...pipeline.context import PipelineContext
 from .base import Stage2Plugin
-from .context import LayerContext, RunContext
 
 
 class Stage2Pipeline:
@@ -39,17 +39,17 @@ class Stage2Pipeline:
     def __init__(self, plugins: list[Stage2Plugin]) -> None:
         self.plugins: list[Stage2Plugin] = list(plugins)
 
-    def run_setup(self, run_ctx: RunContext) -> None:
+    def run_setup(self, run_ctx: PipelineContext) -> None:
         """Call ``on_run_setup`` on every plugin in registration order."""
         for plugin in self.plugins:
             plugin.on_run_setup(run_ctx)
 
-    def run_teardown(self, run_ctx: RunContext) -> None:
+    def run_teardown(self, run_ctx: PipelineContext) -> None:
         """Call ``on_run_teardown`` on every plugin in registration order."""
         for plugin in self.plugins:
             plugin.on_run_teardown(run_ctx)
 
-    def run_layer(self, ctx: LayerContext) -> None:
+    def run_layer(self, ctx: PipelineContext) -> None:
         """Drive one layer through every phase in canonical order.
 
         For each phase, every plugin's hook is called in registration order.
@@ -57,7 +57,7 @@ class Stage2Pipeline:
         (``partial_dir``); the pipeline pulls that value from the LegacyAdapter
         plugin (or any plugin exposing ``partial_dir`` as an instance
         attribute) so the T6 contract stays narrow. T13/T16/T17 will surface
-        ``partial_dir`` on ``LayerContext`` directly when those tasks land.
+        ``partial_dir`` on the per-layer context directly when those tasks land.
         """
         # Discover ``partial_dir`` from any plugin that exposes it as a
         # run-scope attribute. LegacyAdapter sets ``self.partial_dir`` during
