@@ -1,0 +1,77 @@
+{
+  "ablation_filter_threshold": 0.001,
+  "baseline_mean_nll": 3.6745035743713377,
+  "blacklist_count": 0,
+  "candidate_count": 8,
+  "candidates": {
+    "L0E0": {
+      "delta_nll": -2.479553220524622e-07,
+      "passed_filter": false,
+      "provenance": [
+        "magnitude_topk"
+      ]
+    },
+    "L0E1": {
+      "delta_nll": -5.149841304508129e-07,
+      "passed_filter": false,
+      "provenance": [
+        "magnitude_topk"
+      ]
+    },
+    "L0E2": {
+      "delta_nll": 2.2411346436435053e-06,
+      "passed_filter": false,
+      "provenance": [
+        "aimer",
+        "magnitude_topk"
+      ]
+    },
+    "L0E3": {
+      "delta_nll": -5.292892455877052e-06,
+      "passed_filter": false,
+      "provenance": [
+        "magnitude_topk",
+        "phase_c"
+      ]
+    },
+    "L1E0": {
+      "delta_nll": -7.152557373046875e-07,
+      "passed_filter": false,
+      "provenance": [
+        "magnitude_topk"
+      ]
+    },
+    "L1E1": {
+      "delta_nll": 6.303787231765057e-06,
+      "passed_filter": false,
+      "provenance": [
+        "magnitude_topk"
+      ]
+    },
+    "L1E2": {
+      "delta_nll": 2.1934509280008285e-06,
+      "passed_filter": false,
+      "provenance": [
+        "magnitude_topk"
+      ]
+    },
+    "L1E3": {
+      "delta_nll": 4.825592041068916e-06,
+      "passed_filter": false,
+      "provenance": [
+        "aimer",
+        "magnitude_topk"
+      ]
+    }
+  },
+  "config": {
+    "ablation_filter_batch_size": 32,
+    "ablation_filter_threshold": 0.001,
+    "holdout_samples": 100,
+    "ma_formation_layers": [
+      0,
+      1
+    ],
+    "magnitude_topk_per_l_layer": 16
+  }
+}
