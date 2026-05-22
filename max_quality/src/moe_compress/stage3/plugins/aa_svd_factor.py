@@ -53,23 +53,16 @@ from typing import Any
 import torch
 
 from ...pipeline.context import PipelineContext
+from ...tools.dtype_noise_floor import _NOISE_FLOOR_BY_DTYPE  # noqa: F401
 from ...utils.model_io import MATRIX_NAMES, FactoredExperts
 from ...utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 
-
-_NOISE_FLOOR_BY_DTYPE: dict[torch.dtype, float] = {
-    # Relative threshold above which an eigenvalue of B is considered signal
-    # rather than storage-quantization noise. Driven by the storage dtype's
-    # mantissa bits: bf16 has 7 (~2⁻⁷ ≈ 8e-3 noise), fp16 has 10 (~2⁻¹⁰ ≈ 1e-3),
-    # fp32 has 23 (~2⁻²³). Set the floor a small margin above noise to ensure
-    # we don't keep noise-inflated directions.
-    torch.bfloat16: 1e-2,
-    torch.float16:  1e-3,
-    torch.float32:  1e-6,
-    torch.float64:  1e-12,
-}
+# S4-3: ``_NOISE_FLOOR_BY_DTYPE`` relocated to tools/dtype_noise_floor (a pure
+# literal shared by stage 3 AA-SVD and stage 4 EoRA). Re-imported above so
+# ``_precompute_eigh`` below + ``stage3_svd``'s S3-5 re-export block + the
+# stage-3 plugin tests keep their existing ``aa_svd_factor`` import paths.
 
 
 @dataclass

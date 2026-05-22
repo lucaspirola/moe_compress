@@ -68,7 +68,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S4-0  Capture stage-4 golden — test_stage4_golden_snapshot.py (eora_ranks.json, fp32+bf16)
 - [x] S4-1  Scaffold stage4/ package — __init__/context/orchestrator/plugins, run delegates to legacy
 - [x] S4-2  eora_inputs plugin — EoraInputsPlugin + inert load_eora_inputs hook (monolith untouched)
-- [ ] S4-3  eora_compensation plugin
+- [x] S4-3  eora_compensation plugin — _compute_eora_factors/_spill_layer relocated + tools/dtype_noise_floor
 - [ ] S4-4  Wire orchestrator + STAGE4
 - [ ] S4-5  Stage-4 orchestrator test
 
