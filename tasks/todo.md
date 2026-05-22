@@ -70,7 +70,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S4-2  eora_inputs plugin — EoraInputsPlugin + inert load_eora_inputs hook (monolith untouched)
 - [x] S4-3  eora_compensation plugin — _compute_eora_factors/_spill_layer relocated + tools/dtype_noise_floor
 - [x] S4-4a Rewrite stage-4 orchestrator on the plugin schedule + flip stage4_eora.run to a shim
-- [ ] S4-4b Expose STAGE4 Stage object + stage4/__init__ export
+- [x] S4-4b Expose STAGE4 Stage object + stage4/__init__ export
 - [ ] S4-5  Stage-4 orchestrator test
 
 ## Router-KD — stages 2.5 ≡ 5 (Part 5.3)
