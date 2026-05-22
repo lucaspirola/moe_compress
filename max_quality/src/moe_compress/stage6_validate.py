@@ -55,7 +55,6 @@ identical to the batch_size=1 baseline.
 from __future__ import annotations
 
 import logging
-import math
 import os
 import queue
 import re
@@ -170,6 +169,22 @@ from .stage6.plugins.imatrix_export import (  # noqa: F401
     _run_llama_imatrix_with_prebuilt_gguf,
     _generate_imatrix,
     _find_llama_cpp_dir,
+)
+
+# S6-7: final-report concern (_deltas, _measured_reduction, _check_thresholds)
+# relocated to stage6/plugins/validation_report. Re-imported so run() and
+# external callers/tests keep their stage6_validate import paths. These are
+# the Pattern-A relocated symbols; the inline final-block in run() (results
+# dict assembly + JSON write + Trackio flatten) is intentionally UNCHANGED
+# at S6-7 (Pattern B is reproduced in the plugin's inert ``assemble_report``
+# hook; the monolith run() owns the live code until S6-8). The `import math`
+# previously needed by these three function bodies was removed in the import
+# block at the top of this module; only callers (`run()`) of these symbols
+# remain, and `run()` does not reference `math.` directly.
+from .stage6.plugins.validation_report import (  # noqa: F401
+    _deltas,
+    _measured_reduction,
+    _check_thresholds,
 )
 
 # F-C-H-1: Spec F-S-M-1 mandates eager attention for both teacher and student
@@ -791,157 +806,11 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
 
 
 # ---------------------------------------------------------------------------
-# Deltas + threshold check
+# Deltas + threshold check (_deltas, _measured_reduction, _check_thresholds)
+# relocated to stage6/plugins/validation_report by S6-7. All three symbols are
+# re-imported in the S6-7 # noqa: F401 block near the top of this module so
+# run() keeps calling them via their original names.
 # ---------------------------------------------------------------------------
-
-
-def _deltas(student: dict, teacher: dict) -> dict:
-    # delta = student - teacher: positive means student is worse for PPL
-    # (higher is worse), negative means student is worse for accuracy tasks
-    # (lower is worse). _check_thresholds interprets each metric's sign.
-    out = {}
-    non_finite: list[str] = []           # student non-finite → auto-fail in _check_thresholds
-    teacher_non_finite: list[str] = []   # teacher non-finite → skip check (not a student failure)
-    for k in sorted(set(student) | set(teacher)):
-        s = student.get(k)
-        t = teacher.get(k)
-        if s is None or t is None:
-            continue
-        try:
-            s_finite = math.isfinite(s)
-            t_finite = math.isfinite(t)
-        except (TypeError, ValueError):
-            log.warning("_deltas: non-numeric value for key %r (student=%r, teacher=%r); skipping", k, s, t)
-            continue
-        # M-1: Check each operand independently so a non-finite *teacher* value
-        # (e.g. teacher eval failed → inf PPL) does not trigger auto-failure of
-        # the student threshold check.
-        if not s_finite:
-            # Student non-finite → auto-fail downstream.
-            log.warning(
-                "_deltas: student value non-finite for key %r (student=%s, teacher=%s); "
-                "recording as student non-finite",
-                k, s, t,
-            )
-            non_finite.append(k)
-        elif not t_finite:
-            # Teacher non-finite → skip threshold check entirely (teacher issue, not student).
-            log.warning(
-                "_deltas: teacher value non-finite for key %r (teacher=%s); "
-                "skipping threshold check for this metric",
-                k, t,
-            )
-            teacher_non_finite.append(k)
-        else:
-            delta = s - t
-            if not math.isfinite(delta):
-                # Both operands finite but difference is not (e.g. inf - inf).
-                log.warning(
-                    "_deltas: delta non-finite for key %r (student=%s, teacher=%s) "
-                    "despite finite operands; treating as student non-finite",
-                    k, s, t,
-                )
-                non_finite.append(k)
-            else:
-                out[k] = {"student": s, "teacher": t, "delta": delta}
-    # Record skipped keys so downstream consumers can distinguish "not computed"
-    # from "computed but non-finite and omitted".
-    if non_finite:
-        out["_non_finite_skipped"] = non_finite
-    if teacher_non_finite:
-        out["_teacher_non_finite_skipped"] = teacher_non_finite
-    return out
-
-
-def _measured_reduction(
-    student_model,
-    *,
-    student_total: int | None = None,
-    student_expert: int | None = None,
-    teacher_model=None,
-    cached_teacher_param_counts: dict | None = None,
-    config: dict | None = None,
-) -> dict:
-    # F-iter4-CRIT-2: use count_parameters_effective to honor FactoredExperts
-    # per-expert effective ranks (Spec §9 line 785). For models with no
-    # FactoredExperts (e.g. teacher) this equals count_parameters().
-    s_total = student_total if student_total is not None else count_parameters_effective(student_model)
-    s_expert = student_expert if student_expert is not None else count_expert_parameters(student_model, routed_only=True)
-
-    if teacher_model is not None:
-        t_total = count_parameters_effective(teacher_model)
-        t_expert = count_expert_parameters(teacher_model, routed_only=True)
-    elif cached_teacher_param_counts is not None:
-        t_total = cached_teacher_param_counts["total"]
-        t_expert = cached_teacher_param_counts["expert"]
-        log.info("Using cached teacher param counts: total=%d, expert=%d", t_total, t_expert)
-    else:
-        if config is None:
-            raise RuntimeError("_measured_reduction: config required when teacher_model and cached_teacher_param_counts are both None")
-        log.info("Computing teacher param counts via CPU model load")
-        try:
-            _load_in_4bit = config["model"].get("load_in_4bit", False)
-            if _load_in_4bit:
-                log.warning(
-                    "_measured_reduction: load_in_4bit=True is incompatible with "
-                    "device_map='cpu'; loading in full precision."
-                )
-                _load_in_4bit = False
-            # F-C-H-1: attn_implementation="eager" pinned per Spec F-S-M-1.
-            teacher_tmp, _ = load_model(
-                config["model"]["name_or_path"],
-                revision=config["model"].get("revision", "main"),
-                torch_dtype=config["model"]["torch_dtype"],
-                device_map="cpu",
-                attn_implementation=_STAGE6_ATTN_IMPLEMENTATION,
-                load_in_4bit=_load_in_4bit,
-                trust_remote_code=config["model"].get("trust_remote_code", False),
-            )
-            try:
-                # F-iter4-CRIT-2: effective count (no FactoredExperts in teacher,
-                # so equivalent to count_parameters).
-                t_total = count_parameters_effective(teacher_tmp)
-                t_expert = count_expert_parameters(teacher_tmp, routed_only=True)
-            finally:
-                del teacher_tmp
-        except Exception as exc:
-            log.warning("Could not load teacher for param counting (%s) — using 0", exc)
-            t_total = 0
-            t_expert = 0
-
-    # L-2: When teacher total param count is 0 (param counting failed), the
-    # total_reduction_ratio formula produces a meaningless result (1.0 always).
-    # Return None so _check_thresholds can skip this check instead of treating it
-    # as a pass.
-    if t_total == 0:
-        log.warning(
-            "_measured_reduction: teacher total_params=0 (count failed); "
-            "total_reduction_ratio is unreliable — skipping measured_reduction threshold check"
-        )
-        return {
-            "total_student": s_total,
-            "total_teacher": t_total,
-            "total_reduction_ratio": None,
-            "expert_student": s_expert,
-            "expert_teacher": t_expert,
-            "expert_reduction_ratio": None,
-        }
-
-    # F-2: When t_expert == 0 (non-MoE teacher), max(t_expert, 1) yields 1 and
-    # s_expert is also 0, so the formula would produce expert_reduction_ratio=1.0 —
-    # misleadingly suggesting 100% expert reduction.  Use None instead.
-    expert_reduction_ratio = (
-        None if t_expert == 0
-        else 1.0 - (s_expert / t_expert)
-    )
-    return {
-        "total_student": s_total,
-        "total_teacher": t_total,
-        "total_reduction_ratio": 1.0 - (s_total / max(t_total, 1)),
-        "expert_student": s_expert,
-        "expert_teacher": t_expert,
-        "expert_reduction_ratio": expert_reduction_ratio,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -952,195 +821,3 @@ def _measured_reduction(
 # ---------------------------------------------------------------------------
 
 
-def _check_thresholds(results: dict, thresholds: dict, *, s6_cfg: dict | None = None) -> dict:
-    """Return a dict with boolean per-check results plus a 'skipped_checks' sub-dict.
-
-    The 'skipped_checks' dict maps threshold key names to a reason string so
-    downstream consumers can distinguish "threshold not configured" from
-    "eval disabled, threshold configured but skipped".
-    """
-    checks: dict[str, bool] = {}
-    # Keys whose threshold was configured but whose eval was disabled — value is reason string.
-    skipped_checks: dict[str, str] = {}
-
-    delta = results.get("delta", {})
-    wt = delta.get("wikitext2_ppl")
-    wt_thresh = thresholds.get("wikitext2_ppl_relative_max_increase", None)
-    # Elif ordering matters — non-finite auto-fails must come BEFORE the
-    # `wt is None and wt_thresh is None` catch-all, otherwise a student with
-    # inf/nan PPL passes silently when no threshold is configured.
-    # Actual branch order:
-    #   1.  Both wt and wt_thresh present → perform the relative check.
-    #   2.  wikitext2_ppl student non-finite → auto-FAIL (H3/M5), regardless of threshold.
-    #   3.  wikitext2_ppl teacher non-finite → skip (teacher issue, not student failure).
-    #   4.  wt is None AND wt_thresh is None → no eval, no threshold; debug only.
-    #   5.  wt_thresh is None → threshold unconfigured; skip (no penalty).
-    #   6.  wt is None → data missing despite threshold being set.
-    if wt is not None and wt_thresh is not None:
-        # Use pre-computed delta (student - teacher): positive = student PPL higher = worse.
-        if wt["teacher"] <= 0:
-            log.warning(
-                "_check_thresholds: teacher PPL <= 0 (%s); skipping relative wikitext2 check",
-                wt["teacher"],
-            )
-            skipped_checks["wikitext2_ppl_increase_ok"] = f"teacher PPL <= 0 ({wt['teacher']})"
-        else:
-            # rel is a fraction (e.g. 0.03 = 3%).  wt_thresh is stored as a fraction
-            # in config (e.g. 0.03 for the ≤ 3% spec limit).  Both sides use the
-            # same unit so the comparison is correct.  Log as % for human readability.
-            #
-            # Defensive sanity check: a threshold > 1.0 means > 100% relative PPL
-            # increase is acceptable, which is almost certainly a misconfigured
-            # percentage (e.g. 3 instead of 0.03).  Warn loudly so operators catch it.
-            if wt_thresh > 1.0:
-                log.warning(
-                    "_check_thresholds: wikitext2_ppl_relative_max_increase=%.4g looks like "
-                    "a percentage (>1.0); expected a fraction (e.g. 0.03 for 3%%).  "
-                    "Check your config — the quality gate may be too lenient.",
-                    wt_thresh,
-                )
-            rel = wt["delta"] / wt["teacher"]
-            passed = rel <= wt_thresh
-            log.info(
-                "_check_thresholds: wikitext2_ppl relative increase = %.4f%% "
-                "(threshold %.4f%%) → %s",
-                rel * 100, wt_thresh * 100, "PASS" if passed else "FAIL",
-            )
-            checks["wikitext2_ppl_increase_ok"] = passed
-    elif "wikitext2_ppl" in delta.get("_non_finite_skipped", []):
-        # H3 / M5: A non-finite student PPL (inf/nan) is an automatic failure.
-        # MUST be checked BEFORE the `wt is None and wt_thresh is None` catch-all:
-        # when wt_thresh is unconfigured, both conditions are true and the catch-all
-        # would silence this auto-fail, allowing overall_pass=True for a model with
-        # infinite PPL.  Non-finite student values always auto-fail regardless of
-        # whether a threshold was configured.
-        log.warning(
-            "_check_thresholds: wikitext2_ppl was non-finite (student PPL=inf/nan); "
-            "treating as automatic threshold FAILURE rather than a skipped check.",
-        )
-        checks["wikitext2_ppl_increase_ok"] = False
-    elif "wikitext2_ppl" in delta.get("_teacher_non_finite_skipped", []):
-        # M-1: Teacher PPL was non-finite (teacher eval failed); this is a teacher issue,
-        # not a student failure — skip the check rather than auto-failing the student.
-        log.warning(
-            "_check_thresholds: wikitext2_ppl teacher value was non-finite; "
-            "skipping threshold check (teacher eval issue, not student failure).",
-        )
-        skipped_checks["wikitext2_ppl_increase_ok"] = "teacher wikitext2_ppl non-finite (teacher eval issue)"
-    elif wt is None and wt_thresh is None:
-        # Neither eval result nor threshold is present — nothing to do.
-        # N-2: This is a by-design configuration, not an unexpected condition; use DEBUG.
-        log.debug("Threshold key 'wikitext2_ppl_relative_max_increase' missing from config and no wikitext2_ppl result — skipping check")
-    elif wt_thresh is None:
-        # Threshold not configured but wt result exists — unconfigured threshold, skip.
-        log.warning("Threshold key 'wikitext2_ppl_relative_max_increase' missing from config — skipping check")
-    else:  # wt is None, wt_thresh is not None
-        wikitext2_enabled = (s6_cfg or {}).get("wikitext2", {}).get("enabled", True)
-        if not wikitext2_enabled:
-            log.warning("wikitext2_ppl threshold configured but eval was disabled; skipping check.")
-            skipped_checks["wikitext2_ppl_increase_ok"] = "wikitext2 eval disabled in config"
-        else:
-            log.warning("wikitext2_ppl threshold configured but no result was produced; marking as failed.")
-            checks["wikitext2_ppl_increase_ok"] = False
-    for task, key_name in [
-        ("arc_challenge_acc", "arc_c_absolute_max_drop"),
-        ("hellaswag_acc", "hellaswag_absolute_max_drop"),
-        ("humaneval_pass_at_1", "humaneval_absolute_max_drop"),
-        ("math500_accuracy", "math500_absolute_max_drop"),
-    ]:
-        thresh = thresholds.get(key_name, None)
-        if thresh is None:
-            log.warning("Threshold key '%s' missing from config — skipping check for %s",
-                        key_name, task)
-            continue
-        # Defensive sanity check: accuracy drop thresholds > 1.0 (i.e. > 100pp)
-        # almost certainly mean the config stored a percentage instead of a fraction.
-        if thresh > 1.0:
-            log.warning(
-                "_check_thresholds: %s threshold %.4g looks like a percentage (>1.0); "
-                "expected a fraction (e.g. 0.015 for 1.5pp).  "
-                "Check your config — the quality gate may be too lenient.",
-                key_name, thresh,
-            )
-        d = delta.get(task)
-        if d is not None:
-            # delta = student - teacher (from _deltas); for accuracy tasks a negative
-            # delta means student is worse. drop = teacher - student = -delta.
-            # thresh is stored as a fraction in config (e.g. 0.015 for 1.5pp).
-            drop = -d["delta"]
-            passed = drop <= thresh
-            log.info(
-                "_check_thresholds: %s drop = %.4f (%.2fpp), threshold %.4f (%.2fpp) → %s",
-                task, drop, drop * 100, thresh, thresh * 100, "PASS" if passed else "FAIL",
-            )
-            checks[f"{task}_drop_ok"] = passed
-        else:
-            # Metric absent from delta dict — check whether the eval was disabled,
-            # whether the teacher value was non-finite (skip), or whether the
-            # student value was non-finite (auto-fail).
-            _non_finite_skipped = delta.get("_non_finite_skipped", [])
-            _teacher_non_finite_skipped = delta.get("_teacher_non_finite_skipped", [])
-            if task in _teacher_non_finite_skipped:
-                # M-1: Teacher value was non-finite — teacher eval issue, not student
-                # failure.  Skip the check rather than auto-failing the student.
-                log.warning(
-                    "Threshold check for %s: teacher value non-finite (teacher eval issue); "
-                    "skipping check (not a student failure).",
-                    task,
-                )
-                skipped_checks[f"{task}_drop_ok"] = "teacher value non-finite (teacher eval issue)"
-            elif task in _non_finite_skipped:
-                # H3 / M5: Non-finite student value is an automatic failure, not a skip.
-                # Putting it in skipped_checks would allow overall_pass=True even though
-                # the student produced inf/nan for this metric.
-                log.warning(
-                    "Threshold check for %s: non-finite student value (inf/nan); "
-                    "treating as automatic FAILURE rather than a skipped check.",
-                    task,
-                )
-                checks[f"{task}_drop_ok"] = False
-            else:
-                if task in _ZERO_SHOT_TASKS:
-                    eval_enabled = (s6_cfg or {}).get("zero_shot", {}).get("enabled", True)
-                    eval_name = "zero_shot"
-                else:
-                    eval_enabled = (s6_cfg or {}).get("generative", {}).get("enabled", True)
-                    eval_name = "generative"
-                if not eval_enabled:
-                    log.warning(
-                        "Threshold check for %s skipped — %s eval was disabled in config",
-                        task, eval_name,
-                    )
-                    skipped_checks[f"{task}_drop_ok"] = f"{eval_name} eval disabled in config"
-                else:
-                    log.warning(
-                        "Threshold check for %s failed — metric missing from results "
-                        "(lm-eval task name mismatch or evaluation error)", task,
-                    )
-                    checks[f"{task}_drop_ok"] = False
-    mr_thresh = thresholds.get("measured_reduction_min", None)
-    if mr_thresh is not None:
-        mr = results.get("measured_reduction", {})
-        mr_ratio = mr.get("total_reduction_ratio")
-        # L-2: total_reduction_ratio is None when teacher param count failed (t_total=0).
-        # Also skip when it is NaN (shouldn't normally occur, but guard defensively).
-        if mr_ratio is None or (isinstance(mr_ratio, float) and math.isnan(mr_ratio)):
-            log.warning(
-                "_check_thresholds: measured_reduction.total_reduction_ratio is %s "
-                "(teacher param count failed); skipping measured_reduction threshold check",
-                mr_ratio,
-            )
-            skipped_checks["measured_reduction_ok"] = (
-                "total_reduction_ratio unavailable (teacher param count failed)"
-            )
-        else:
-            checks["measured_reduction_ok"] = mr_ratio >= mr_thresh
-    else:
-        log.warning("Threshold key 'measured_reduction_min' missing from config — skipping check")
-
-    # Merge skipped_checks into output so artifact consumers can distinguish
-    # "not configured" (key absent) from "configured but eval disabled" (key in skipped_checks).
-    result_dict: dict = dict(checks)
-    if skipped_checks:
-        result_dict["skipped_checks"] = skipped_checks
-    return result_dict

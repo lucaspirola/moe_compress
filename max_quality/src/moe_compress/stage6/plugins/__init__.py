@@ -48,6 +48,20 @@ Holds:
   (late-phase join + llama-imatrix dispatch + eval-text-concat write, with
   the F-CR2-M-1 ``imatrix_skipped`` sentinel emitted to trackio on the
   bg-thread-timeout path).
+* ``validation_report.py`` (added by S6-7 — the Stage 6 FINAL-REPORT
+  concern: the relocated ``_deltas`` (master plan §8 NaN/Inf hotspot —
+  every branch preserved character-identical), ``_measured_reduction``
+  and ``_check_thresholds`` helpers plus ``ValidationReportPlugin`` with
+  an unconditional ``is_enabled`` (Stage 6 always emits the
+  ``stage6_eval.json`` artifact, even when every sub-eval is disabled)
+  and one inert ``assemble_report`` hook that reproduces the monolith's
+  final block — delta computation, measured-reduction, threshold gating,
+  ``overall_pass`` aggregation across boolean-valued threshold results,
+  ``stage6_eval.json`` artifact write, and the Trackio scalar flatten
+  with the ``stage6/student/...`` / ``stage6/teacher/...`` /
+  ``stage6/delta/.../{student,teacher,delta}`` /
+  ``stage6/measured_reduction/...`` / ``stage6/non_finite_count`` /
+  ``stage6/overall_pass`` key naming the monolith uses).
 
 The Stage 6 validation algorithm — WikiText-2 PPL, zero-shot (ARC-C,
 HellaSwag), generative (HumanEval, MATH-500), imatrix pipeline, and threshold
