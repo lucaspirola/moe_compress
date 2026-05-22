@@ -63,7 +63,7 @@ def test_post_merge_returns_none():
 
 
 def test_write_artifacts_returns_empty_dict():
-    assert MergeHealPlugin().write_artifacts(ctx=None, partial_dir=None) == {}
+    assert MergeHealPlugin().write_artifacts(ctx=None) == {}
 
 
 # --- monkeypatch-drift guard (T9-T16 lesson) -----------------------------

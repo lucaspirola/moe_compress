@@ -2,20 +2,18 @@
 
 Plugin home for Direction B — the skip-merge percentile mask. The mask logic
 itself (``_apply_skip_merge_floor``) was extracted into ``pipeline.grouping`` in
-Task 5 and stays there; T12 does not move it. This module only adds the
-``SkipMergeFloorPlugin`` shell that *owns the call site* in the eventual
-decomposed phase walk.
+Task 5 and stays there; T12 does not move it. This module adds the
+``SkipMergeFloorPlugin`` that *owns the live ``apply_cost_mask`` call site* in
+the decomposed phase walk.
 
-Wiring status (T12): the live call path still belongs to the LegacyAdapter.
-``LegacyAdapter.compute_assignment`` calls ``grouping._apply_skip_merge_floor``
-directly inside the bump loop, and the monolith's ``_em_refine_assignment``
-re-applies it each EM round. T12 does NOT change those call sites. The
-``apply_cost_mask`` hook below is fully functional (it delegates to
-``_apply_skip_merge_floor``) so the plugin is testable today, but the
-universal ``walk_phases`` phase walk does not yet invoke ``apply_cost_mask`` —
-that invocation arrives when ``compute_assignment`` is decomposed (T13+). Until then
-this plugin is constructed but not added to the ``run()`` plugin list, exactly
-like the T8–T11 cost shells.
+Wiring status (S2-7): this plugin is now LIVE. ``run()`` registers it in the
+``PluginRegistry`` after the three cost plugins and before the ``LegacyAdapter``,
+so when it is enabled (``skip_merge_percentile < 100.0``) it wins the
+``apply_cost_mask`` ``dispatch_first`` slot in ``_run_assignment``'s bump loop.
+``registry.enabled(config)`` drops it at the OFF sentinel (``>= 100.0``), so
+``dispatch_first`` then reaches ``LegacyAdapter.apply_cost_mask`` — its sentinel
+branch returns the delta object unchanged. The monolith's ``_em_refine_assignment``
+still re-applies the floor each EM round; S2-7 does not change that call site.
 
 Config gate: enabled iff ``stage2_reap_ream.skip_merge_percentile < 100.0``.
 ``100.0`` is the OFF sentinel (the 100th percentile equals the max finite cost,
@@ -27,10 +25,13 @@ Circular-import note: this module imports only ``pipeline.base``,
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from ...pipeline.context import PipelineContext
 from ..grouping import _apply_skip_merge_floor
+
+log = logging.getLogger(__name__)
 
 # OFF sentinel: percentile >= this value masks nothing (see grouping docstring).
 _SKIP_MERGE_OFF = 100.0
@@ -39,13 +40,15 @@ _SKIP_MERGE_OFF = 100.0
 class SkipMergeFloorPlugin:
     """Plugin home for the Direction B skip-merge percentile mask.
 
-    T12 status: functional but off the live phase walk. ``apply_cost_mask``
-    delegates to ``grouping._apply_skip_merge_floor`` and is unit-tested, but
-    the universal ``walk_phases`` phase walk does not yet call
-    ``apply_cost_mask`` — the LegacyAdapter still owns the live call path
-    inside its bump loop. Wiring
-    this hook into the phase walk is deferred until the assignment phase is
-    decomposed (T13+).
+    S2-7 status: LIVE. ``run()`` registers this plugin after the three cost
+    plugins and before the ``LegacyAdapter``; when enabled
+    (``skip_merge_percentile < 100.0``) it wins the ``apply_cost_mask``
+    ``dispatch_first`` slot in ``_run_assignment``'s bump loop, servicing the
+    skip-merge floor that ``LegacyAdapter.apply_cost_mask`` used to own. At the
+    OFF sentinel ``registry.enabled`` drops it and the LegacyAdapter's sentinel
+    branch services the slot instead. ``apply_cost_mask`` delegates to
+    ``grouping._apply_skip_merge_floor`` — byte-identical to the LegacyAdapter
+    block it replaces.
 
     The percentile is stored at construction: ``apply_cost_mask`` only receives
     a ``PipelineContext`` (which carries no cfg), so the value cannot be read at
@@ -56,8 +59,9 @@ class SkipMergeFloorPlugin:
     name = "skip_merge_floor"
     paper = "Direction B: skip-merge percentile mask on the cost matrix."
     config_key = "stage2_reap_ream.skip_merge_percentile"
-    # () until a later task wires the live hook
-    reads: tuple[str, ...] = ()
+    # S2-7: the live ``apply_cost_mask`` slot reads ``layer_ref`` for the
+    # INFO log line emitted when entries are masked.
+    reads: tuple[str, ...] = ("layer_ref",)
     writes: tuple[str, ...] = ()
     provides: tuple[str, ...] = ()
 
@@ -93,12 +97,23 @@ class SkipMergeFloorPlugin:
         entirely at the sentinel.
 
         Returns ``(masked_delta, info)`` with ``info = {"n_masked": int,
-        "percentile": float}``. ``ctx`` is unused (the percentile is an
-        instance field) and accepted only to satisfy the hook signature.
+        "percentile": float}``. Byte-identical to
+        ``LegacyAdapter.apply_cost_mask``, including the INFO log line emitted
+        when entries are masked. ``ctx`` carries ``layer_ref`` for that log; it
+        is ``None`` in unit tests, so the log is guarded on ``ctx is not None``.
         """
         if self.skip_merge_percentile >= _SKIP_MERGE_OFF:
             return delta, {"n_masked": 0, "percentile": self.skip_merge_percentile}
         masked, n_masked = _apply_skip_merge_floor(delta, self.skip_merge_percentile)
+        if n_masked > 0 and ctx is not None:
+            layer_ref = ctx.get("layer_ref")
+            log.info(
+                "layer %d: skip-merge floor (P%.1f) masked %d/%d "
+                "cost entries to +inf — affected children fall "
+                "through to orphan promotion",
+                layer_ref.layer_idx, self.skip_merge_percentile,
+                n_masked, masked.size,
+            )
         return masked, {"n_masked": n_masked, "percentile": self.skip_merge_percentile}
 
 

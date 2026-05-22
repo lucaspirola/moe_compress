@@ -920,6 +920,7 @@ def run(
     from .plugins.ream_cost import ReamCostPrePlugin
     from .plugins.ream_cost_post import ReamCostPostPlugin
     from .plugins.reap_scoring import ReapScoringPlugin
+    from .plugins.skip_merge_floor import SkipMergeFloorPlugin
 
     # The run-scope context is the root PipelineContext; each layer opens a
     # child() scope. Run-scope mutable scratchpad (cov_acc, merge_map,
@@ -993,11 +994,19 @@ def run(
         cost_topk_filter=cost_topk_filter,
         cost_output_token_cap=cost_output_token_cap,
     )
+    # S2-7: the skip-merge floor plugin is registered AFTER the three cost
+    # plugins and BEFORE the adapter so it wins the ``apply_cost_mask``
+    # ``dispatch_first`` slot over the (now-dead-for-<100.0) ``LegacyAdapter.
+    # apply_cost_mask`` fallback. Constructed directly from the already-parsed
+    # and range-validated ``skip_merge_percentile`` local. ``registry.enabled``
+    # drops it at the OFF sentinel (>= 100.0), leaving the adapter's sentinel
+    # branch to service the slot.
     registry = PluginRegistry([
         ReapScoringPlugin(),
         ReamCostPrePlugin(**_cost_plugin_kwargs),
         ReamCostPostPlugin(**_cost_plugin_kwargs),
         OutputSpaceCostPlugin(**_cost_plugin_kwargs),
+        SkipMergeFloorPlugin(skip_merge_percentile=skip_merge_percentile),
         adapter,
     ])
     plugins = registry.enabled(config)

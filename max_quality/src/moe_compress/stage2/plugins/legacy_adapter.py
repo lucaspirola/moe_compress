@@ -368,6 +368,13 @@ class LegacyAdapter:
     def apply_cost_mask(self, ctx: PipelineContext, delta):
         """Slot ``apply_cost_mask`` — Direction B skip-merge floor.
 
+        DEAD FALLBACK as of S2-7 for ``< 100.0``; still services the
+        ``>= 100.0`` sentinel until S2-12. The live ``SkipMergeFloorPlugin`` is
+        registered ahead of this adapter and wins the ``apply_cost_mask`` slot
+        whenever it is enabled (``skip_merge_percentile < 100.0``); at the OFF
+        sentinel that plugin is dropped by ``registry.enabled`` and this
+        method's sentinel branch services the slot.
+
         Verbatim lift of the skip-merge-floor block from the old
         ``compute_assignment``. When ``skip_merge_percentile < 100.0`` the
         cost matrix is masked and ``(delta, info)`` is returned. At the
