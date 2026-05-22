@@ -71,7 +71,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S4-3  eora_compensation plugin — _compute_eora_factors/_spill_layer relocated + tools/dtype_noise_floor
 - [x] S4-4a Rewrite stage-4 orchestrator on the plugin schedule + flip stage4_eora.run to a shim
 - [x] S4-4b Expose STAGE4 Stage object + stage4/__init__ export
-- [ ] S4-5  Stage-4 orchestrator test
+- [x] S4-5  Stage-4 orchestrator test — test_stage4_orchestrator.py (registry/phase-order/sidecar-deletion)
 
 ## Router-KD — stages 2.5 ≡ 5 (Part 5.3)
 - [ ] RK-0  Capture router-KD goldens ×2
