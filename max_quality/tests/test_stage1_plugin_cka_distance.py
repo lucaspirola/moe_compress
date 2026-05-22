@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from moe_compress.pipeline.plugin import PipelinePlugin
-from moe_compress.stage1.context import Stage1Context
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage1.plugins.cka_distance import (
     CKADistancePlugin,
     _cka_distance_matrix,
@@ -64,14 +64,14 @@ class _FakeRef:
         self.num_routed_experts = num_routed_experts
 
 
-def _make_ctx(*, R: torch.Tensor, layers, config: dict | None = None) -> Stage1Context:
-    """Build a populated ``Stage1Context`` for a CKA run.
+def _make_ctx(*, R: torch.Tensor, layers, config: dict | None = None) -> PipelineContext:
+    """Build a populated ``PipelineContext`` for a CKA run.
 
     ``config`` defaults to ``{"stage1_grape": {}}``; tests that exercise
     the weight-space override pass ``{"stage1_grape": {"similarity_metric":
     "cosine"}}`` etc.
     """
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("output_acc", _FakeAcc(R))
     ctx.set("moe_layers", layers)
     ctx.set("config", config if config is not None else {"stage1_grape": {}})
@@ -151,7 +151,7 @@ def test_plugin_run_writes_D_matrices_per_layer():
 
 def test_plugin_run_rejects_missing_output_acc():
     """``output_acc`` slot missing -> KeyError with the slot name."""
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("moe_layers", [_FakeRef(layer_idx=0, num_routed_experts=2)])
     ctx.set("config", {"stage1_grape": {}})
 
@@ -162,7 +162,7 @@ def test_plugin_run_rejects_missing_output_acc():
 def test_plugin_run_rejects_missing_moe_layers():
     torch.manual_seed(0)
     R = torch.randn(32, 16)
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("output_acc", _FakeAcc(R))
     ctx.set("config", {"stage1_grape": {}})
 
@@ -173,7 +173,7 @@ def test_plugin_run_rejects_missing_moe_layers():
 def test_plugin_run_rejects_missing_config():
     torch.manual_seed(0)
     R = torch.randn(32, 16)
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("output_acc", _FakeAcc(R))
     ctx.set("moe_layers", [_FakeRef(layer_idx=0, num_routed_experts=2)])
 
@@ -229,7 +229,7 @@ def test_plugin_run_weight_space_short_circuits_cka():
     torch.manual_seed(42)
     layers = [_RefWithExperts(layer_idx=0, n=2, hidden=8, intermediate=4)]
 
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("output_acc", _FakeAccRaises())
     ctx.set("moe_layers", layers)
     ctx.set("config", {"stage1_grape": {"similarity_metric": "cosine"}})

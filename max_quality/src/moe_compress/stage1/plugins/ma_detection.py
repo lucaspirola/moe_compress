@@ -29,7 +29,7 @@ from ...utils.activation_hooks import run_calibration_early_exit
 from ...utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from ...utils.model_io import iter_decoder_layers, iter_moe_layers
 from ...utils.trackio_log import trackio_log as _trackio_log
-from ..context import Stage1Context
+from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ class MADetectionPlugin:
         """Mandatory — Phase A always runs. There is no flag."""
         return True
 
-    def run(self, ctx: Stage1Context) -> None:
+    def run(self, ctx: PipelineContext) -> None:
         """Execute Phase A end-to-end: build calibration batches, run the
         dedicated early-exit pass with decoder + MoE hooks, detect L.
 
@@ -157,7 +157,7 @@ class MADetectionPlugin:
         ctx.set("moe_output_growth", moe_output_growth)
         ctx.set("moe_output_max", moe_output_max)
 
-    def contribute_artifact(self, ctx: Stage1Context) -> dict:
+    def contribute_artifact(self, ctx: PipelineContext) -> dict:
         """Return the ``dual_signal`` block of ``stage1_blacklist.json``.
 
         Three keys; per-layer growth ratios, NaN/±Inf serialised as JSON

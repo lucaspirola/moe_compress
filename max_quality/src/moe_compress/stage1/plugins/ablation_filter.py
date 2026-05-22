@@ -39,7 +39,7 @@ import torch
 from ...utils.activation_hooks import instrument_experts
 from ...utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from ...utils.model_io import iter_moe_layers, save_json_artifact
-from ..context import Stage1Context
+from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ class AblationFilterPlugin:
         af = s1.get("ablation_filter", {})
         return bool(af.get("enabled", True))
 
-    def run(self, ctx: Stage1Context) -> None:
+    def run(self, ctx: PipelineContext) -> None:
         """Execute Phase D end-to-end.
 
         Reads ``candidates``, ``model``, ``tokenizer``, ``config``,
@@ -153,7 +153,7 @@ class AblationFilterPlugin:
             },
         )
 
-    def contribute_artifact(self, ctx: Stage1Context) -> dict:
+    def contribute_artifact(self, ctx: PipelineContext) -> dict:
         """Return the ``stage1_ablation_filter.json`` payload.
 
         Identical six-key schema to the legacy

@@ -29,7 +29,7 @@ import pytest
 
 from moe_compress.pipeline.candidates import CandidateBag
 from moe_compress.pipeline.plugin import PipelinePlugin
-from moe_compress.stage1.context import Stage1Context
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage1.plugins.sink_token import SinkTokenDetectorPlugin
 from moe_compress.utils.sink_token_routing import SinkTokenRoutingAccumulator
 
@@ -70,8 +70,8 @@ def _populated_ctx(
     tokenizer=None,
     config=None,
     n_per_layer: int = 128,
-) -> Stage1Context:
-    ctx = Stage1Context()
+) -> PipelineContext:
+    ctx = PipelineContext()
     ctx.set(
         "moe_layers",
         moe_layers if moe_layers is not None else [_FakeRef(0), _FakeRef(1)],
@@ -201,9 +201,9 @@ def test_plugin_setup_handles_empty_moe_layers():
 # ---------------------------------------------------------------------------
 
 
-def _run_ctx_with_sink_acc(sink_acc, config=None) -> Stage1Context:
+def _run_ctx_with_sink_acc(sink_acc, config=None) -> PipelineContext:
     """Build a run-ready ctx: ``sink_acc`` + ``candidate_bag`` + ``config``."""
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("sink_acc", sink_acc)
     ctx.set("candidate_bag", CandidateBag())
     ctx.set("config", config if config is not None else _default_config())
@@ -253,7 +253,7 @@ def test_plugin_run_noop_when_disabled():
 
 def test_plugin_run_rejects_missing_sink_acc():
     plugin = SinkTokenDetectorPlugin()
-    ctx = Stage1Context()  # never called setup
+    ctx = PipelineContext()  # never called setup
     ctx.set("config", _default_config())
 
     with pytest.raises(KeyError, match="sink_acc"):
@@ -262,7 +262,7 @@ def test_plugin_run_rejects_missing_sink_acc():
 
 def test_plugin_run_rejects_missing_config():
     plugin = SinkTokenDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("sink_acc", None)
     ctx.set("candidate_bag", CandidateBag())
 
@@ -281,7 +281,7 @@ def test_plugin_run_rejects_missing_candidate_bag():
         mean_router_score_normal={(0, 3): 0.05},
         freq_on_sink={(0, 3): 1.0},
     )
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("sink_acc", sink_acc)
     ctx.set("config", _default_config())
     # candidate_bag deliberately omitted.
@@ -298,13 +298,13 @@ def test_plugin_run_rejects_missing_candidate_bag():
 def _ctx_with_artifact_inputs(
     sink_acc=None,
     candidates=None,
-) -> Stage1Context:
+) -> PipelineContext:
     """Build a ctx pre-populated with finalized sink_acc + candidates.
 
     The plugin doesn't run Phase B; we set the finalized per-(l, e) dicts
     on the accumulator directly so contribute_artifact can read them.
     """
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     if sink_acc is None:
         sink_acc = SinkTokenRoutingAccumulator(
             num_layers=1, num_experts=4, bos_token_id=None,
@@ -396,7 +396,7 @@ def test_plugin_contribute_artifact_disabled_returns_empty_score_dicts():
     legacy inline ``if sink_acc is not None else {}`` behaviour). The
     ``candidates`` key is still computed normally from the ctx slot."""
     plugin = SinkTokenDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("sink_acc", None)
     ctx.set("candidates", {(0, 1): ["sink_token"]})
 
@@ -495,7 +495,7 @@ def test_plugin_contribute_artifact_byte_equivalent_to_legacy_inline():
 
 def test_plugin_setup_rejects_missing_moe_layers():
     plugin = SinkTokenDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("tokenizer", _FakeTokenizer())
     ctx.set("config", _default_config())
     ctx.set("n_per_layer", 4)
@@ -506,7 +506,7 @@ def test_plugin_setup_rejects_missing_moe_layers():
 
 def test_plugin_setup_rejects_missing_tokenizer():
     plugin = SinkTokenDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("moe_layers", [])
     ctx.set("config", _default_config())
     ctx.set("n_per_layer", 4)
@@ -517,7 +517,7 @@ def test_plugin_setup_rejects_missing_tokenizer():
 
 def test_plugin_setup_rejects_missing_config():
     plugin = SinkTokenDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("moe_layers", [])
     ctx.set("tokenizer", _FakeTokenizer())
     ctx.set("n_per_layer", 4)
@@ -528,7 +528,7 @@ def test_plugin_setup_rejects_missing_config():
 
 def test_plugin_setup_rejects_missing_n_per_layer():
     plugin = SinkTokenDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("moe_layers", [])
     ctx.set("tokenizer", _FakeTokenizer())
     ctx.set("config", _default_config())
@@ -539,7 +539,7 @@ def test_plugin_setup_rejects_missing_n_per_layer():
 
 def test_plugin_contribute_artifact_rejects_missing_sink_acc():
     plugin = SinkTokenDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("candidates", {})
 
     with pytest.raises(KeyError, match="sink_acc"):
@@ -548,7 +548,7 @@ def test_plugin_contribute_artifact_rejects_missing_sink_acc():
 
 def test_plugin_contribute_artifact_rejects_missing_candidates():
     plugin = SinkTokenDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("sink_acc", None)
 
     with pytest.raises(KeyError, match="candidates"):

@@ -7,7 +7,7 @@ exactly one paper / detector / phase. Adding a new paper to Stage 1 means
 explicit `run()` call in `orchestrator.py` at the correct phase position** —
 the orchestrator is the single place the pipeline sequence is declared, by
 design (see §5.1). Plugins never import each other; all shared state flows
-through one `Stage1Context` instance threaded through every phase. This guide
+through one `PipelineContext` instance threaded through every phase. This guide
 is a working document: read it top-to-bottom once, then use the checklist (§6)
 and the copy-paste template (§7) as a recipe. The checklist tells you exactly
 which lines to add to `orchestrator.py` — you do not need to reverse-engineer
@@ -22,7 +22,7 @@ Six moving parts. Know which one your new code touches.
 - **`stage1/orchestrator.py`** — the thin phase sequencer. Owns only *glue*:
   the accumulator factory (`_build_accumulator`), artifact assembly
   (`_write_artifacts`), and telemetry (`_emit_telemetry`). It threads one
-  `Stage1Context` through Phase A → calibration pass → 4 detectors → ablation
+  `PipelineContext` through Phase A → calibration pass → 4 detectors → ablation
   → CKA → GRAPE → artifact write. It contains **no** phase logic — every phase
   lives inside a plugin. The orchestrator invokes each plugin via an
   **explicit, hand-written `run()` call in a fixed sequence** — it does *not*
@@ -47,21 +47,22 @@ Six moving parts. Know which one your new code touches.
   immutable-after-construction; exposes `enabled()` and `provides()`). The
   registry rejects duplicate plugin names at construction time.
 
-- **`stage1/context.py` → `Stage1Context`** — the typed shared-state holder.
+- **`pipeline/context.py` → `PipelineContext`** — the shared-state holder.
   Backed by a `dict[str, Any]` with strict `get` / `set` / `drop` / `has`
-  accessors (defined on the `PipelineContext` base in `pipeline/context.py`).
-  Reads of an unwritten slot raise `KeyError`; `set` is **set-once** (pass
-  `overwrite=True` to replace a binding). Shared mutable state (e.g. a
-  `CandidateBag`) is `set` once and then mutated in place.
+  accessors. Reads of an unwritten slot raise `KeyError`; `set` is
+  **set-once** (pass `overwrite=True` to replace a binding). Shared mutable
+  state (e.g. a `CandidateBag`) is `set` once and then mutated in place.
 
-- **`_framework/calibration_engine.py` → `CalibrationEngine`** — the shared
-  Phase-B profiling driver. Plugins declare which named accumulators they need
-  via their `provides` tuple; the orchestrator maps each name to a concrete
-  `(accumulator, HookSpec)` pair via `_build_accumulator`, and the engine wires
-  **all** hooks in **one** forward pass over the calibration batches.
+- **`tools/calibration_pass.py` → `CalibrationEngine` / `run_calibration_pass`**
+  — the shared Phase-B profiling driver. Plugins declare which named
+  accumulators they need via their `provides` tuple; the orchestrator maps
+  each name to a concrete `(accumulator, HookSpec)` pair via
+  `_build_accumulator`, then hands the ordered registration triples to
+  `run_calibration_pass`, which wires **all** hooks in **one** forward pass
+  over the calibration batches.
 
 - **`pipeline/candidates.py` → `CandidateBag`** and
-  **`_framework/artifact_assembly.py` → `ArtifactBuilder`** — the candidate-union
+  **`tools/artifact_builder.py` → `ArtifactBuilder`** — the candidate-union
   data structure (the 4 detectors all `add()` into one shared bag) and the
   `stage1_blacklist.json` assembler (validates the 7-top-level-key schema —
   see `REQUIRED_BLACKLIST_TOP_LEVEL_KEYS`). **`pipeline/safe_json.py` →
@@ -76,7 +77,7 @@ Data flow, top to bottom. This mirrors `orchestrator.run` STEP 3-11. Use it to
 see where a new plugin slots in.
 
 ```
-                       Stage1Context  (one instance threaded through all phases)
+                       PipelineContext  (one instance threaded through all phases)
                               |
    +--------------------------+-------------------------------------------------+
    |                                                                           |
@@ -86,7 +87,7 @@ Phase A: ma_detection.run()         -- own dedicated early-exit pass            
 setup() on setup-capable plugins    -- sink_token.setup() builds                |
    |  writes: sink_acc                  the SinkTokenRoutingAccumulator         |
    v                                                                           |
-CalibrationEngine  (ONE shared forward pass)                                   |
+run_calibration_pass  (ONE shared forward pass)                                |
    |  registry.provides(config) -> {downproj_max,                               |
    |      output_reservoir, sink_routing}                                       |
    |  orchestrator._build_accumulator(name) -> (accumulator, HookSpec)          |
@@ -170,9 +171,9 @@ Every member, with its exact type and meaning:
 | `name` | `str` | Unique plugin id, e.g. `"ma_detection"`. Duplicate names in the manifest raise `ValueError` at `PluginRegistry` construction. Used as the `by_name` key in the orchestrator. |
 | `paper` | `str` | One-line citation. Informational only. |
 | `config_key` | `str` | Dotted path into the YAML where the plugin's sub-config / flag lives, e.g. `"stage1_grape.super_expert_detection.aimer_enabled"`. Documentation / introspection only — `is_enabled` reads the config itself; nothing parses this string. |
-| `reads` | `tuple[str, ...]` | `Stage1Context` slots the plugin consumes. Honesty contract — enables a future static check that nothing reads a slot no prior plugin wrote. |
-| `writes` | `tuple[str, ...]` | `Stage1Context` slots the plugin produces. List a slot here even if it is mutated in place (not rebound) — e.g. `candidate_bag`. |
-| `provides` | `tuple[str, ...]` | Named accumulators the shared `CalibrationEngine` must run for this plugin. Empty `()` if the plugin needs no Phase-B data (it runs its own forward pass, or is weight-only). |
+| `reads` | `tuple[str, ...]` | `PipelineContext` slots the plugin consumes. Honesty contract — enables a future static check that nothing reads a slot no prior plugin wrote. |
+| `writes` | `tuple[str, ...]` | `PipelineContext` slots the plugin produces. List a slot here even if it is mutated in place (not rebound) — e.g. `candidate_bag`. |
+| `provides` | `tuple[str, ...]` | Named accumulators the shared calibration pass must run for this plugin. Empty `()` if the plugin needs no Phase-B data (it runs its own forward pass, or is weight-only). |
 | `is_enabled(config) -> bool` | method | Whether the plugin is "on" per config. **See §5.1 ("`is_enabled` gates `provides`, NOT `run`") — `run()` is always called; `is_enabled` only drives `provides`.** |
 | `run(ctx) -> None` | method | The phase logic. Reads slots in `reads`, writes slots in `writes`. Must produce well-formed output even on the disabled path. |
 | `contribute_artifact(ctx) -> dict` | method | A JSON-ready dict — a *fragment* merged into `stage1_blacklist.json`, a *whole-file* payload, or `{}`. See subtlety §5.2. |
@@ -183,7 +184,7 @@ Not on the Protocol. If a plugin needs to build an accumulator *before* the
 calibration pass, it implements:
 
 ```python
-def setup(self, ctx: Stage1Context) -> None: ...
+def setup(self, ctx: PipelineContext) -> None: ...
 ```
 
 The orchestrator calls it via `getattr(plugin, "setup", None)` on **every**
@@ -323,7 +324,7 @@ payload.
    introduced a name not in `{downproj_max, output_reservoir, sink_routing}`,
    add a branch to `_build_accumulator` in `stage1/orchestrator.py` mapping the
    name to a concrete `(accumulator, HookSpec)`. Pick the right `HookKind`(s)
-   from `_framework/calibration_engine.py`: `DOWN_PROJ`, `EXPERT_INPUT`,
+   from `tools/calibration_pass.py`: `DOWN_PROJ`, `EXPERT_INPUT`,
    `EXPERT_INTERMEDIATE`, `EXPERT_GATE_UP_OUT`, `ROUTER_LOGITS_PER_BATCH`,
    `INPUT_IDS_PER_BATCH`. A `HookSpec` carries `kinds` (a `frozenset` of
    `HookKind`), an optional per-expert `expert_callback`, and an optional
@@ -339,7 +340,7 @@ payload.
 
 8. **If your plugin contributes to `stage1_blacklist.json`, return a
    fragment** from `contribute_artifact` AND add its top-level key name to
-   `REQUIRED_BLACKLIST_TOP_LEVEL_KEYS` in `_framework/artifact_assembly.py` AND
+   `REQUIRED_BLACKLIST_TOP_LEVEL_KEYS` in `stage1/artifacts.py` AND
    wire `builder.add_fragment("<key>", plugin.contribute_artifact(ctx))` into
    the orchestrator's `_write_artifacts`. If instead your plugin emits a
    whole-file artifact, wire its `contribute_artifact` call + a
@@ -364,9 +365,9 @@ from __future__ import annotations
 
 import logging
 
-from ..pipeline.plugin import PipelinePlugin  # noqa: F401  (Protocol, type-checkers only)
-from ..context import Stage1Context
-# Allowed imports: .._framework.*, ...utils.*, ..context, stdlib, torch/numpy.
+from ...pipeline.plugin import PipelinePlugin  # noqa: F401  (Protocol, type-checkers only)
+from ...pipeline.context import PipelineContext
+# Allowed imports: ...pipeline.*, ...tools.*, ...utils.*, stdlib, torch/numpy.
 # NEVER:  from .other_plugin import ...   (the architectural invariant — see §8)
 
 log = logging.getLogger(__name__)
@@ -388,7 +389,7 @@ class MyDetectorPlugin:
         se = config.get("stage1_grape", {}).get("super_expert_detection", {})
         return bool(se.get("my_detector_enabled", True))
 
-    def run(self, ctx: Stage1Context) -> None:
+    def run(self, ctx: PipelineContext) -> None:
         """Phase logic. Read ctx slots in `reads`, write those in `writes`.
         Must produce well-formed output even when is_enabled() is False."""
         config = ctx.get("config")
@@ -398,14 +399,14 @@ class MyDetectorPlugin:
         # ... detection logic ...
         # candidate_bag.add(layer_idx, expert_idx, "my_detector")
 
-    def contribute_artifact(self, ctx: Stage1Context) -> dict:
+    def contribute_artifact(self, ctx: PipelineContext) -> dict:
         """Return a JSON fragment, a whole-file payload, or {} (no
         contribution). Scrub non-finite floats with safe_float()."""
         return {}
 
 
 # Optional -- only if the plugin builds an accumulator before Phase B:
-#   def setup(self, ctx: Stage1Context) -> None: ...
+#   def setup(self, ctx: PipelineContext) -> None: ...
 ```
 
 ---
@@ -414,13 +415,14 @@ class MyDetectorPlugin:
 
 > **Plugins NEVER import each other.** No file under `stage1/plugins/` may
 > contain `from .<other_plugin> import ...`. A plugin imports only from
-> `_framework/` (the cross-stage framework), `utils/` (cross-stage utilities),
-> `stage1/context` (the shared-state *type* — importing `Stage1Context` is the
-> prescribed pattern, not a violation), the standard library, and third-party
+> `pipeline/` (the universal plugin framework), `tools/` (cross-stage
+> primitives), `utils/` (cross-stage utilities), `pipeline/context`
+> (the shared-state *type* — importing `PipelineContext` is the prescribed
+> pattern, not a violation), the standard library, and third-party
 > libraries (torch, numpy). All inter-plugin data flow goes through the one
-> `Stage1Context` instance — never a direct import.
+> `PipelineContext` instance — never a direct import.
 >
-> If two plugins need the same helper, it belongs in `_framework/` or `utils/`,
+> If two plugins need the same helper, it belongs in `tools/` or `utils/`,
 > not in one plugin imported by the other. CI enforces this:
 >
 > ```bash

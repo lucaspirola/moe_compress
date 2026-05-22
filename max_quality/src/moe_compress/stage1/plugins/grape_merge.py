@@ -19,7 +19,7 @@ import torch
 
 from ...utils.trackio_log import trackio_flush as _trackio_flush
 from ...utils.trackio_log import trackio_log as _trackio_log
-from ..context import Stage1Context
+from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ class GrapeMergePlugin:
         """GRAPE is mandatory — every Stage 1 run executes Phase F."""
         return True
 
-    def run(self, ctx: Stage1Context) -> None:
+    def run(self, ctx: PipelineContext) -> None:
         """Execute Phase F end-to-end.
 
         Reads slots ``D_matrices``, ``blacklist``, ``per_layer_targets``,
@@ -186,7 +186,7 @@ class GrapeMergePlugin:
         ctx.set("requested_budget", decomposition.global_expert_budget)
         ctx.set("grape_config", dict(s1))
 
-    def contribute_artifact(self, ctx: Stage1Context) -> dict:
+    def contribute_artifact(self, ctx: PipelineContext) -> dict:
         """Return the ``stage1_budgets.json`` payload.
 
         The orchestrator calls this method to obtain the dict that

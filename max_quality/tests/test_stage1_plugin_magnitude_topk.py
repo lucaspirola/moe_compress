@@ -24,7 +24,7 @@ import pytest
 
 from moe_compress.pipeline.candidates import CandidateBag
 from moe_compress.pipeline.plugin import PipelinePlugin
-from moe_compress.stage1.context import Stage1Context
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage1.plugins.magnitude_topk import (
     MagnitudeTopkPlugin,
     _magnitude_topk_candidates,
@@ -60,8 +60,8 @@ def _populated_ctx(
     L=None,
     config=None,
     candidate_bag=None,
-) -> Stage1Context:
-    ctx = Stage1Context()
+) -> PipelineContext:
+    ctx = PipelineContext()
     ctx.set(
         "max_acc",
         SimpleNamespace(
@@ -192,7 +192,7 @@ def test_run_empty_L_is_noop():
 
 def test_run_rejects_missing_max_acc():
     plugin = MagnitudeTopkPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("L", {5})
     ctx.set("candidate_bag", CandidateBag())
     ctx.set("config", _config())
@@ -203,7 +203,7 @@ def test_run_rejects_missing_max_acc():
 
 def test_run_rejects_missing_L():
     plugin = MagnitudeTopkPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("max_acc", SimpleNamespace(per_expert_max={}))
     ctx.set("candidate_bag", CandidateBag())
     ctx.set("config", _config())
@@ -214,7 +214,7 @@ def test_run_rejects_missing_L():
 
 def test_run_rejects_missing_candidate_bag():
     plugin = MagnitudeTopkPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("max_acc", SimpleNamespace(per_expert_max={}))
     ctx.set("L", {5})
     ctx.set("config", _config())
@@ -225,7 +225,7 @@ def test_run_rejects_missing_candidate_bag():
 
 def test_run_rejects_missing_config():
     plugin = MagnitudeTopkPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("max_acc", SimpleNamespace(per_expert_max={}))
     ctx.set("L", {5})
     ctx.set("candidate_bag", CandidateBag())

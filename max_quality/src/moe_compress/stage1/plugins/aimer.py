@@ -9,7 +9,7 @@ The plugin owns three responsibilities (sub-task 8 added the third):
    ``utils.aimer.aimer_score_tensor`` and per-layer bottom-pct selections
    from ``utils.aimer.aimer_bottom_pct_per_layer``. Written to the
    ``aimer_scores`` and ``bottom_pct_by_layer`` slots on the
-   ``Stage1Context``.
+   ``PipelineContext``.
 2. **Candidate-pool contribution** — :meth:`run` also gates the
    bottom-pct selections by per-layer activation max (``max_acc`` ×
    ``a_max``) and adds each surviving (l, e) to the shared
@@ -40,7 +40,7 @@ import torch
 from ...pipeline.candidates import CandidateBag
 from ...pipeline.safe_json import safe_float
 from ...utils.aimer import aimer_bottom_pct_per_layer, aimer_score_tensor
-from ..context import Stage1Context
+from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ class AimerDetectorPlugin:
         se = s1.get("super_expert_detection", {})
         return bool(se.get("aimer_enabled", True))
 
-    def run(self, ctx: Stage1Context) -> None:
+    def run(self, ctx: PipelineContext) -> None:
         """Execute Phase C₂ pre-computation + candidate-add.
 
         Reads ``moe_layers``, ``L``, ``config`` from ``ctx``; writes
@@ -188,7 +188,7 @@ class AimerDetectorPlugin:
                 for e in exps:
                     candidate_bag.add(int(li), int(e), "aimer")
 
-    def contribute_artifact(self, ctx: Stage1Context) -> dict:
+    def contribute_artifact(self, ctx: PipelineContext) -> dict:
         """Return the three-key ``aimer`` block of ``stage1_blacklist.json``.
 
         Identical schema to the legacy inline construction (pre-sub-task-6):

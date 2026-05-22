@@ -27,7 +27,7 @@ from __future__ import annotations
 import pytest
 
 from moe_compress.pipeline.plugin import PipelinePlugin
-from moe_compress.stage1.context import Stage1Context
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage1.plugins.ablation_filter import (
     AblationFilterPlugin,
     _apply_threshold_filter,
@@ -43,8 +43,8 @@ from moe_compress.stage1.plugins.ablation_filter import (
 # ---------------------------------------------------------------------------
 
 
-def _disabled_ctx(candidates: dict | None = None) -> Stage1Context:
-    """Build a populated ``Stage1Context`` for the disabled-path tests.
+def _disabled_ctx(candidates: dict | None = None) -> PipelineContext:
+    """Build a populated ``PipelineContext`` for the disabled-path tests.
 
     The disabled-path short-circuit in ``run_ablation_filter`` does not
     touch model/tokenizer/artifacts_dir/device, so they can all be
@@ -56,7 +56,7 @@ def _disabled_ctx(candidates: dict | None = None) -> Stage1Context:
             (10, 1): ["sink_token"],
             (5, 3): ["magnitude_topk"],
         }
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("candidates", candidates)
     ctx.set("model", None)
     ctx.set("tokenizer", None)
@@ -179,7 +179,7 @@ def test_plugin_run_enabled_path_wires_run_ablation_filter_return(monkeypatch):
         fake_run_ablation_filter,
     )
 
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("candidates", {(0, 1): ["aimer"]})
     ctx.set("model", "MODEL")
     ctx.set("tokenizer", "TOK")
@@ -332,10 +332,10 @@ def test_plugin_contribute_artifact_respects_config_overwrite():
 # ---------------------------------------------------------------------------
 
 
-def _ctx_missing(slot: str) -> Stage1Context:
+def _ctx_missing(slot: str) -> PipelineContext:
     """Build a fully-populated disabled-path ctx, then drop the named slot."""
     ctx = _disabled_ctx()
-    new = Stage1Context()
+    new = PipelineContext()
     for k in ctx.keys():
         if k == slot:
             continue

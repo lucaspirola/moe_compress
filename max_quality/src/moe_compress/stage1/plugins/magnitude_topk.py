@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 
 from ...pipeline.candidates import CandidateBag
-from ..context import Stage1Context
+from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ class MagnitudeTopkPlugin:
         se = s1.get("super_expert_detection", {})
         return int(se.get("magnitude_topk_per_l_layer", 16)) > 0
 
-    def run(self, ctx: Stage1Context) -> None:
+    def run(self, ctx: PipelineContext) -> None:
         """Add top-K magnitude candidates per ``l ∈ L`` to the shared bag.
 
         Reads ``max_acc``, ``L``, ``candidate_bag``, ``config`` from
@@ -123,7 +123,7 @@ class MagnitudeTopkPlugin:
         for (li, e) in pairs:
             candidate_bag.add(int(li), int(e), "magnitude_topk")
 
-    def contribute_artifact(self, ctx: Stage1Context) -> dict:
+    def contribute_artifact(self, ctx: PipelineContext) -> dict:
         """Return ``{}`` — magnitude-topk parameter lives in ``blacklist_config``.
 
         The orchestrator reads ``magnitude_topk_per_l_layer`` directly

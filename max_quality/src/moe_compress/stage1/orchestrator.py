@@ -6,15 +6,16 @@ code path; callers reach it via ``moe_compress.stage1.run``.
 
 What the orchestrator does
 --------------------------
-- threads **one** :class:`~moe_compress.stage1.context.Stage1Context`
+- threads **one** :class:`~moe_compress.pipeline.context.PipelineContext`
   through all six phases,
 - runs Phase A (``MADetectionPlugin`` — its own dedicated forward pass),
-- runs **one** shared :class:`~moe_compress.stage1._framework.calibration_engine.CalibrationEngine`
-  pass (replacing the legacy inline Phase B),
+- runs **one** shared calibration pass via
+  :func:`~moe_compress.tools.calibration_pass.run_calibration_pass`
+  (replacing the legacy inline Phase B),
 - runs the four candidate-detector plugins, then ``ablation_filter``,
   ``cka_distance``, ``grape_merge``,
 - assembles ``stage1_blacklist.json`` via
-  :class:`~moe_compress.stage1._framework.artifact_assembly.ArtifactBuilder` and
+  :class:`~moe_compress.tools.artifact_builder.ArtifactBuilder` and
   writes the two output files,
 - emits the same Trackio telemetry.
 
@@ -33,16 +34,18 @@ from pathlib import Path
 import torch
 
 from ..budget.solver import BudgetDecomposition
-from ._framework.artifact_assembly import ArtifactBuilder
-from ._framework.calibration_engine import CalibrationEngine, HookKind, HookSpec
 from ..pipeline.candidates import CandidateBag
+from ..pipeline.context import PipelineContext
 from ..pipeline.registry import PluginRegistry
+from ..tools.artifact_builder import ArtifactBuilder
+from ..tools.calibration_pass import HookKind, HookSpec, run_calibration_pass
+from ..tools.phase_walker import walk_phases
 from ..utils.activation_hooks import DownProjMaxAccumulator, ExpertOutputAccumulator
 from ..utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from ..utils.model_io import iter_moe_layers, save_json_artifact
 from ..utils.trackio_log import trackio_flush as _trackio_flush
 from ..utils.trackio_log import trackio_log as _trackio_log
-from .context import Stage1Context
+from .artifacts import REQUIRED_BLACKLIST_TOP_LEVEL_KEYS
 from .plugins import STAGE1_PLUGIN_MANIFEST
 
 log = logging.getLogger(__name__)
@@ -105,15 +108,15 @@ def _build_accumulator(
     n_per_layer: int,
     moe_layers: list,
     tokenizer,
-    ctx: Stage1Context,
+    ctx: PipelineContext,
 ) -> tuple[object, HookSpec]:
     """Map an accumulator NAME (as declared by a plugin's ``provides``
     tuple) to a concrete ``(accumulator_instance, HookSpec)`` pair the
-    :class:`CalibrationEngine` can register.
+    calibration pass can register.
 
     The orchestrator owns this mapping because it is the glue between the
-    plugin's declarative ``provides=(...)`` metadata and the engine's
-    imperative ``register_accumulator(name, acc, spec)``.
+    plugin's declarative ``provides=(...)`` metadata and the calibration
+    pass's imperative ``(name, acc, spec)`` registration triples.
 
     The ``downproj_max`` / ``output_reservoir`` accumulators are
     constructed here. The ``sink_routing`` accumulator is NOT constructed
@@ -207,7 +210,7 @@ def run(
 ) -> tuple[Path, Path]:
     """Run Stage 1 — SE detection + GRAPE budgets — via the plugin pipeline.
 
-    Threads one :class:`Stage1Context` through all six phases. Returns
+    Threads one :class:`PipelineContext` through all six phases. Returns
     ``(blacklist_path, budgets_path)`` — same as the legacy ``run()``.
     """
     # ---- STEP 1: resolve config + moe layers ------------------------------
@@ -237,8 +240,8 @@ def run(
                 old_key,
             )
 
-    # ---- STEP 2: one Stage1Context + the PluginRegistry -------------------
-    ctx = Stage1Context()
+    # ---- STEP 2: one PipelineContext + the PluginRegistry -----------------
+    ctx = PipelineContext()
     ctx.set("model", model)
     ctx.set("tokenizer", tokenizer)
     ctx.set("config", config)
@@ -276,16 +279,19 @@ def run(
         if callable(setup):
             setup(ctx)
 
-    # ---- STEP 5: build the CalibrationEngine, register accumulators -------
+    # ---- STEP 5: build the ordered accumulator registrations --------------
+    # ``registry.provides(config)`` returns the byte-identity-critical
+    # accumulator order; iterating it preserves that order in the
+    # registration triples handed to ``run_calibration_pass``.
     needed = registry.provides(config)   # ordered tuple
-    engine = CalibrationEngine()
+    registrations: list[tuple[str, object, HookSpec]] = []
     built: dict[str, object] = {}
     for acc_name in needed:
         acc, spec = _build_accumulator(
             acc_name, n_per_layer=n_per_layer,
             moe_layers=moe_layers, tokenizer=tokenizer, ctx=ctx,
         )
-        engine.register_accumulator(acc_name, acc, spec)
+        registrations.append((acc_name, acc, spec))
         built[acc_name] = acc
 
     # Publish the built accumulators onto the ctx under the slot names the
@@ -294,7 +300,7 @@ def run(
     ctx.set("max_acc", built["downproj_max"])          # always present
     ctx.set("output_acc", built["output_reservoir"])   # always present
 
-    # ---- STEP 6: run the calibration engine ONCE --------------------------
+    # ---- STEP 6: run the calibration pass ONCE ----------------------------
     cal = config["calibration"]
     spec_cal = spec_from_config(
         cal, num_sequences_override=s1.get("num_calibration_samples"),
@@ -311,8 +317,9 @@ def run(
         "L=%s, CKA for all layers)",
         len(moe_layers), len(batches), sorted(L),
     )
-    engine.run(
+    run_calibration_pass(
         model, batches,
+        registrations=registrations,
         moe_layers=moe_layers, device=device,
         progress_label="phase_b",
         per_batch_hooks=(progress_cb,),
@@ -326,9 +333,14 @@ def run(
 
     # ---- STEP 8: run the four candidate-detector plugins, in order --------
     # Unconditional — each plugin short-circuits internally on its own flag,
-    # exactly mirroring the legacy run().
-    for name in ("three_way_and", "aimer", "sink_token", "magnitude_topk"):
-        by_name[name].run(ctx)
+    # exactly mirroring the legacy run(). The four detectors are peers within
+    # one "run" phase, so the phase walker drives them; the manifest slice
+    # fixes their order.
+    detector_plugins = (
+        by_name["three_way_and"], by_name["aimer"],
+        by_name["sink_token"], by_name["magnitude_topk"],
+    )
+    walk_phases(("run",), detector_plugins, ctx)
     candidates = ctx.get("candidate_bag").to_provenance_dict()
     ctx.set("candidates", candidates)
     log.info(
@@ -358,7 +370,7 @@ def run(
 # ---------------------------------------------------------------------------
 
 
-def _write_artifacts(ctx: Stage1Context, by_name: dict) -> tuple[Path, Path]:
+def _write_artifacts(ctx: PipelineContext, by_name: dict) -> tuple[Path, Path]:
     """Assemble + write the three Stage 1 JSON artifacts.
 
     Writes ``stage1_blacklist.json`` (7-key schema via
@@ -424,7 +436,9 @@ def _write_artifacts(ctx: Stage1Context, by_name: dict) -> tuple[Path, Path]:
                          by_name["aimer"].contribute_artifact(ctx))
     builder.add_fragment("sink_token",
                          by_name["sink_token"].contribute_artifact(ctx))
-    blacklist_payload = builder.assemble()   # validates the 7-key schema
+    blacklist_payload = builder.assemble(
+        required_keys=REQUIRED_BLACKLIST_TOP_LEVEL_KEYS,
+    )   # validates the 7-key schema
 
     blacklist_path = artifacts_dir / "stage1_blacklist.json"
     save_json_artifact(blacklist_payload, blacklist_path)
@@ -466,7 +480,7 @@ def _write_artifacts(ctx: Stage1Context, by_name: dict) -> tuple[Path, Path]:
 # ---------------------------------------------------------------------------
 
 
-def _emit_telemetry(ctx: Stage1Context, by_name: dict) -> None:
+def _emit_telemetry(ctx: PipelineContext, by_name: dict) -> None:
     """Emit the Phase A/C/D Trackio block.
 
     The GRAPE per-layer + summary emits already fire inside

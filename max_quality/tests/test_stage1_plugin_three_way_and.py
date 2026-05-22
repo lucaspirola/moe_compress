@@ -27,7 +27,7 @@ import pytest
 
 from moe_compress.pipeline.candidates import CandidateBag
 from moe_compress.pipeline.plugin import PipelinePlugin
-from moe_compress.stage1.context import Stage1Context
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage1.plugins.three_way_and import (
     ThreeWayAndPlugin,
     _apply_paper_criterion,
@@ -63,8 +63,8 @@ def _populated_ctx(
     L=None,
     config=None,
     candidate_bag=None,
-) -> Stage1Context:
-    ctx = Stage1Context()
+) -> PipelineContext:
+    ctx = PipelineContext()
     ctx.set(
         "max_acc",
         SimpleNamespace(
@@ -223,7 +223,7 @@ def test_run_empty_L_writes_zero_stats_and_no_candidates():
 
 def test_run_rejects_missing_max_acc():
     plugin = ThreeWayAndPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("L", {5})
     ctx.set("candidate_bag", CandidateBag())
     ctx.set("config", _default_config())
@@ -234,7 +234,7 @@ def test_run_rejects_missing_max_acc():
 
 def test_run_rejects_missing_L():
     plugin = ThreeWayAndPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("max_acc", SimpleNamespace(per_expert_max={}))
     ctx.set("candidate_bag", CandidateBag())
     ctx.set("config", _default_config())
@@ -245,7 +245,7 @@ def test_run_rejects_missing_L():
 
 def test_run_rejects_missing_candidate_bag():
     plugin = ThreeWayAndPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("max_acc", SimpleNamespace(per_expert_max={}))
     ctx.set("L", {5})
     ctx.set("config", _default_config())
@@ -256,7 +256,7 @@ def test_run_rejects_missing_candidate_bag():
 
 def test_run_rejects_missing_config():
     plugin = ThreeWayAndPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("max_acc", SimpleNamespace(per_expert_max={}))
     ctx.set("L", {5})
     ctx.set("candidate_bag", CandidateBag())

@@ -12,7 +12,7 @@ Rationale
    sink_acc, aimer_scores, bottom_pct_by_layer, candidates, blacklist,
    candidate_deltas, baseline_nll, D_matrices, per_layer_target_experts,
    per_layer_redundancy, achieved_budget, requested_budget``). A dataclass
-   would force every new plugin to edit a shared ``Stage1Context`` file —
+   would force every new plugin to edit a shared typed-context file —
    exactly the cross-plugin coupling the refactor wants to eliminate. Plugins
    should be able to add a new field to the context with zero churn outside
    their own module.

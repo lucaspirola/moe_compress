@@ -9,7 +9,7 @@ The plugin owns three responsibilities:
 1. **Accumulator construction** — :meth:`setup` builds the
    :class:`~moe_compress.utils.sink_token_routing.SinkTokenRoutingAccumulator`
    (or assigns ``None`` when ``sink_token_enabled=False``) and writes the
-   ``sink_acc`` slot on the :class:`Stage1Context`. Called BEFORE Phase B's
+   ``sink_acc`` slot on the :class:`PipelineContext`. Called BEFORE Phase B's
    calibration pass so the :class:`CalibrationEngine`'s per-batch handler
    can read the instance for its ``sink_acc.update(...)`` calls — wired via
    the ``ROUTER_LOGITS_PER_BATCH`` + ``INPUT_IDS_PER_BATCH`` hook kinds.
@@ -49,7 +49,7 @@ from ...utils.sink_token_routing import (
     SinkTokenRoutingAccumulator,
     apply_sink_token_candidate_selection,
 )
-from ..context import Stage1Context
+from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -123,7 +123,7 @@ class SinkTokenDetectorPlugin:
         se = s1.get("super_expert_detection", {})
         return bool(se.get("sink_token_enabled", True))
 
-    def setup(self, ctx: Stage1Context) -> None:
+    def setup(self, ctx: PipelineContext) -> None:
         """Construct the :class:`SinkTokenRoutingAccumulator` for Phase B.
 
         Reads ``moe_layers``, ``tokenizer``, ``config``, ``n_per_layer``
@@ -174,7 +174,7 @@ class SinkTokenDetectorPlugin:
 
         ctx.set("sink_acc", sink_acc)
 
-    def run(self, ctx: Stage1Context) -> None:
+    def run(self, ctx: PipelineContext) -> None:
         """Execute Phase C₃ candidate generation (sub-task 8).
 
         Reads ``sink_acc`` + ``candidate_bag`` + ``config`` from ``ctx``.
@@ -233,7 +233,7 @@ class SinkTokenDetectorPlugin:
             sink_max_per_layer_cap,
         )
 
-    def contribute_artifact(self, ctx: Stage1Context) -> dict:
+    def contribute_artifact(self, ctx: PipelineContext) -> dict:
         """Return the four-key ``sink_token`` block of ``stage1_blacklist.json``.
 
         Identical schema to the legacy inline construction (pre-sub-task-7):

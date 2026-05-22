@@ -29,12 +29,12 @@ from pathlib import Path
 import pytest
 
 from moe_compress.budget.solver import BudgetDecomposition
-from moe_compress.stage1._framework.artifact_assembly import REQUIRED_BLACKLIST_TOP_LEVEL_KEYS
-from moe_compress.stage1._framework.calibration_engine import HookKind, HookSpec
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.pipeline.registry import PluginRegistry
 from moe_compress.stage1 import orchestrator
-from moe_compress.stage1.context import Stage1Context
+from moe_compress.stage1.artifacts import REQUIRED_BLACKLIST_TOP_LEVEL_KEYS
 from moe_compress.stage1.plugins import STAGE1_PLUGIN_MANIFEST
+from moe_compress.tools.calibration_pass import HookKind, HookSpec
 from moe_compress.utils.activation_hooks import (
     DownProjMaxAccumulator,
     ExpertOutputAccumulator,
@@ -142,7 +142,7 @@ def test_provides_order(tiny_config):
 
 
 def test_accumulator_factory_downproj_max():
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     acc, spec = orchestrator._build_accumulator(
         "downproj_max", n_per_layer=4, moe_layers=[], tokenizer=None, ctx=ctx,
     )
@@ -153,7 +153,7 @@ def test_accumulator_factory_downproj_max():
 
 
 def test_accumulator_factory_output_reservoir():
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     acc, spec = orchestrator._build_accumulator(
         "output_reservoir", n_per_layer=4, moe_layers=[], tokenizer=None, ctx=ctx,
     )
@@ -167,7 +167,7 @@ def test_accumulator_factory_sink_routing():
     """The factory READS ``ctx['sink_acc']`` (built by ``setup()``) and
     returns that exact instance + a router/input-ids HookSpec."""
     sentinel = object()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("sink_acc", sentinel)
     acc, spec = orchestrator._build_accumulator(
         "sink_routing", n_per_layer=4, moe_layers=[], tokenizer=None, ctx=ctx,
@@ -180,7 +180,7 @@ def test_accumulator_factory_sink_routing():
 
 
 def test_accumulator_factory_unknown_name_raises():
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     with pytest.raises(ValueError):
         orchestrator._build_accumulator(
             "not_a_real_accumulator", n_per_layer=4, moe_layers=[],
@@ -218,13 +218,18 @@ def test_sink_disabled_omits_sink_routing(tiny_model, tiny_config, tmp_path):
 def test_setup_called_before_calibration(tiny_model, tiny_config, tmp_path, monkeypatch):
     """``SinkTokenDetectorPlugin.setup`` must run before
     ``CalibrationEngine.run`` — the factory reads the accumulator setup()
-    builds, so a swapped order would break instance identity."""
-    from moe_compress.stage1._framework import calibration_engine
+    builds, so a swapped order would break instance identity.
+
+    The orchestrator now calls ``run_calibration_pass``, which internally
+    constructs a ``CalibrationEngine`` and calls ``.run`` — patching the
+    class method still intercepts that call.
+    """
+    from moe_compress.tools import calibration_pass
     from moe_compress.stage1.plugins.sink_token import SinkTokenDetectorPlugin
 
     order: list[str] = []
     real_setup = SinkTokenDetectorPlugin.setup
-    real_run = calibration_engine.CalibrationEngine.run
+    real_run = calibration_pass.CalibrationEngine.run
 
     def _spy_setup(self, ctx):
         order.append("setup")
@@ -236,7 +241,7 @@ def test_setup_called_before_calibration(tiny_model, tiny_config, tmp_path, monk
 
     monkeypatch.setattr(SinkTokenDetectorPlugin, "setup", _spy_setup)
     monkeypatch.setattr(
-        calibration_engine.CalibrationEngine, "run", _spy_run)
+        calibration_pass.CalibrationEngine, "run", _spy_run)
 
     orchestrator.run(
         tiny_model, _TinyTokenizer(), tiny_config, tmp_path, _decomp(),

@@ -24,7 +24,7 @@ import math
 import pytest
 
 from moe_compress.pipeline.plugin import PipelinePlugin
-from moe_compress.stage1.context import Stage1Context
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage1.plugins.ma_detection import (
     MADetectionPlugin,
     _detect_ma_layers,
@@ -49,8 +49,8 @@ class _TinyTokenizer:
         return None
 
 
-def _populated_ctx(tiny_model, tiny_config, tmp_path) -> Stage1Context:
-    ctx = Stage1Context()
+def _populated_ctx(tiny_model, tiny_config, tmp_path) -> PipelineContext:
+    ctx = PipelineContext()
     ctx.set("model", tiny_model)
     ctx.set("tokenizer", _TinyTokenizer())
     ctx.set("config", tiny_config)
@@ -213,7 +213,7 @@ def test_ma_formation_fallback_when_L_empty(tiny_model, tiny_config, tmp_path):
 
 
 def test_contribute_artifact_three_keys():
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("residual_growth", {0: float("nan"), 1: 2.5})
     ctx.set("moe_output_growth", {0: 0.0, 1: float("inf")})
     ctx.set("moe_output_max", {0: 1.0, 1: 3.0})
@@ -237,7 +237,7 @@ def test_contribute_artifact_three_keys():
 def test_contribute_artifact_first_layer_nan_becomes_null():
     """The golden-snapshot-critical case: a NaN first-layer residual_growth
     entry must serialise to JSON null."""
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("residual_growth", {3: float("nan"), 4: 1.2})
     ctx.set("moe_output_growth", {3: 0.0, 4: 1.1})
     ctx.set("moe_output_max", {3: 5.0, 4: 6.0})
@@ -258,7 +258,7 @@ def test_contribute_artifact_first_layer_nan_becomes_null():
 )
 def test_run_rejects_missing_slot(tiny_model, tiny_config, tmp_path, missing):
     ctx = _populated_ctx(tiny_model, tiny_config, tmp_path)
-    new = Stage1Context()
+    new = PipelineContext()
     for k in ctx.keys():
         if k == missing:
             continue
@@ -268,7 +268,7 @@ def test_run_rejects_missing_slot(tiny_model, tiny_config, tmp_path, missing):
 
 
 def test_contribute_artifact_rejects_missing_residual_growth():
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("moe_output_growth", {0: 0.0})
     ctx.set("moe_output_max", {0: 1.0})
     with pytest.raises(KeyError, match="residual_growth"):

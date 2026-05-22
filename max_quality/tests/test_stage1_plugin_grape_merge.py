@@ -22,7 +22,7 @@ import torch
 
 from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.pipeline.plugin import PipelinePlugin
-from moe_compress.stage1.context import Stage1Context
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage1.plugins.grape_merge import (
     GrapeMergePlugin,
     _grape_greedy_merge,
@@ -74,8 +74,8 @@ def _build_synthetic_inputs() -> dict:
     }
 
 
-def _populate_context(inputs: dict) -> Stage1Context:
-    ctx = Stage1Context()
+def _populate_context(inputs: dict) -> PipelineContext:
+    ctx = PipelineContext()
     ctx.set("D_matrices", inputs["D_matrices"])
     ctx.set("blacklist", inputs["blacklist"])
     ctx.set("per_layer_targets", inputs["per_layer_counts"])
@@ -250,7 +250,7 @@ def test_plugin_run_rejects_missing_slot(missing_slot):
     inputs = _build_synthetic_inputs()
     # Slot-name mapping: "per_layer_targets" is the context slot, but the
     # inputs dict uses "per_layer_counts" — both are populated below.
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     populators = {
         "D_matrices": ("D_matrices", inputs["D_matrices"]),
         "blacklist": ("blacklist", inputs["blacklist"]),

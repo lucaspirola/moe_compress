@@ -20,7 +20,7 @@ import torch
 
 from ...utils.activation_hooks import ExpertOutputAccumulator
 from ...utils.model_io import MATRIX_NAMES, build_banks
-from ..context import Stage1Context
+from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ class CKADistancePlugin:
         """
         return True
 
-    def run(self, ctx: Stage1Context) -> None:
+    def run(self, ctx: PipelineContext) -> None:
         """Execute Phase E end-to-end.
 
         Reads slots ``output_acc``, ``moe_layers``, ``config`` from ``ctx``;
@@ -108,7 +108,7 @@ class CKADistancePlugin:
 
         ctx.set("D_matrices", D_matrices)
 
-    def contribute_artifact(self, ctx: Stage1Context) -> dict:
+    def contribute_artifact(self, ctx: PipelineContext) -> dict:
         """Phase E does not contribute to any JSON artifact.
 
         ``D_matrices`` is consumed in-memory by Phase F (GRAPE merge); it is

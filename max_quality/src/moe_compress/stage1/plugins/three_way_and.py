@@ -36,7 +36,7 @@ import logging
 import numpy as np
 
 from ...pipeline.candidates import CandidateBag
-from ..context import Stage1Context
+from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ class ThreeWayAndPlugin:
         """
         return True
 
-    def run(self, ctx: Stage1Context) -> None:
+    def run(self, ctx: PipelineContext) -> None:
         """Compute (p995, a_max) statistics, write three slots, add candidates.
 
         Reads ``max_acc``, ``L``, ``candidate_bag``, ``config`` from
@@ -137,7 +137,7 @@ class ThreeWayAndPlugin:
         ctx.set("a_max", float(a_max))
         ctx.set("a_max_threshold", float(a_max_threshold))
 
-    def contribute_artifact(self, ctx: Stage1Context) -> dict:
+    def contribute_artifact(self, ctx: PipelineContext) -> dict:
         """Return ``{}`` — three-way AND statistics live in ``blacklist_config``.
 
         The orchestrator reads ``p995`` / ``a_max`` / ``a_max_threshold``

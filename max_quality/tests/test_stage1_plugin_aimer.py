@@ -31,7 +31,7 @@ import torch
 
 from moe_compress.pipeline.candidates import CandidateBag
 from moe_compress.pipeline.plugin import PipelinePlugin
-from moe_compress.stage1.context import Stage1Context
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage1.plugins.aimer import (
     AimerDetectorPlugin,
     _get_expert_down_proj_weight,
@@ -86,8 +86,8 @@ def _populated_ctx(
     per_expert_max=None,
     a_max=None,
     candidate_bag=None,
-) -> Stage1Context:
-    ctx = Stage1Context()
+) -> PipelineContext:
+    ctx = PipelineContext()
     ctx.set("moe_layers", moe_layers if moe_layers is not None else [_fake_ref()])
     ctx.set("L", L if L is not None else {0})
     ctx.set("config", config if config is not None else _default_config())
@@ -336,8 +336,8 @@ def _ctx_with_artifact_inputs(
     aimer_scores: dict | None = None,
     bottom_pct_by_layer: dict | None = None,
     candidates: dict | None = None,
-) -> Stage1Context:
-    ctx = Stage1Context()
+) -> PipelineContext:
+    ctx = PipelineContext()
     ctx.set(
         "aimer_scores",
         aimer_scores if aimer_scores is not None else {(0, 0): 0.5, (0, 1): 0.7},
@@ -495,7 +495,7 @@ def test_plugin_contribute_artifact_byte_equivalent_to_legacy_inline():
 
 def test_plugin_run_rejects_missing_moe_layers():
     plugin = AimerDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("L", set())
     ctx.set("config", _default_config())
 
@@ -505,7 +505,7 @@ def test_plugin_run_rejects_missing_moe_layers():
 
 def test_plugin_run_rejects_missing_L():
     plugin = AimerDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("moe_layers", [])
     ctx.set("config", _default_config())
 
@@ -515,7 +515,7 @@ def test_plugin_run_rejects_missing_L():
 
 def test_plugin_run_rejects_missing_config():
     plugin = AimerDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("moe_layers", [])
     ctx.set("L", set())
 
@@ -523,7 +523,7 @@ def test_plugin_run_rejects_missing_config():
         plugin.run(ctx)
 
 
-def _ctx_with_aimer_candidates_minus(skip_slot: str) -> Stage1Context:
+def _ctx_with_aimer_candidates_minus(skip_slot: str) -> PipelineContext:
     """Build a run-ready ctx that produces a non-empty ``bottom_pct_by_layer``
     (so the candidate-add block executes) but omits one of the three new
     sub-task-8 read slots (``max_acc`` / ``a_max`` / ``candidate_bag``)."""
@@ -534,7 +534,7 @@ def _ctx_with_aimer_candidates_minus(skip_slot: str) -> Stage1Context:
         num_routed_experts=4,
         experts_module=_FakeExperts(down_proj=torch.nn.Parameter(w)),
     )
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("moe_layers", [ref])
     ctx.set("L", {0})
     ctx.set("config", _default_config(aimer_enabled=True, aimer_bottom_pct=0.5))
@@ -573,7 +573,7 @@ def test_plugin_run_rejects_missing_candidate_bag():
 
 def test_plugin_contribute_artifact_rejects_missing_candidates():
     plugin = AimerDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("aimer_scores", {})
     ctx.set("bottom_pct_by_layer", {})
 
@@ -583,7 +583,7 @@ def test_plugin_contribute_artifact_rejects_missing_candidates():
 
 def test_plugin_contribute_artifact_rejects_missing_aimer_scores():
     plugin = AimerDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("candidates", {})
     ctx.set("bottom_pct_by_layer", {})
 
@@ -593,7 +593,7 @@ def test_plugin_contribute_artifact_rejects_missing_aimer_scores():
 
 def test_plugin_contribute_artifact_rejects_missing_bottom_pct_by_layer():
     plugin = AimerDetectorPlugin()
-    ctx = Stage1Context()
+    ctx = PipelineContext()
     ctx.set("candidates", {})
     ctx.set("aimer_scores", {})
 
