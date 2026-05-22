@@ -6,24 +6,35 @@ Master plan: `~/.claude/plans/our-tool-has-two-streamed-minsky.md`
 Execution per task: planner agent → implementer agent → (reviewer → fixer)* until clean → run tests → commit.
 
 ## Framework (Part 2)
-- [ ] F-1  PipelinePlugin + BasePlugin (`pipeline/plugin.py`)
-- [ ] F-2  PipelineContext (`pipeline/context.py`)
-- [ ] F-3  PluginRegistry (`pipeline/registry.py`)
-- [ ] F-4  Stage protocol (`pipeline/stage.py`)
-- [ ] F-5  tools/ + phase_walker + artifact_builder
-- [ ] F-6  tools/calibration_pass + whitening + eigh_decomp
-- [ ] F-7  tools/kd_loop + model_factor
-- [ ] F-8  tools/eval_harness + eval_environment + teacher_cache
+- [x] F-1  PipelinePlugin + BasePlugin (`pipeline/plugin.py`) — committed a7c0e08
+- [x] F-2  PipelineContext (`pipeline/context.py`) — committed 4665b06
+- [x] F-3  PluginRegistry (`pipeline/registry.py`) — committed 6eff639
+- [x] F-4  Stage protocol (`pipeline/stage.py`) — committed fbf5eb6
+- [x] F-5  tools/ + phase_walker + artifact_builder — committed 5deb26f
+- [~] F-6  tools/calibration_pass + whitening + eigh_decomp — DEFERRED, folded into S1-3 (calibration_pass) / S3 (whitening, eigh_decomp)
+- [~] F-7  tools/kd_loop + model_factor — DEFERRED, folded into RK / S3
+- [~] F-8  tools/eval_harness + eval_environment + teacher_cache — DEFERRED, folded into S6 / S6alt
+
+Rationale: plan Part 2 sanctions folding F-6..F-8 into the first consuming
+stage. These are concrete numerical/training/eval modules — built with their
+real consumer so the API fits and byte-identical correctness is gated by the
+stage golden snapshot, not a speculative standalone test.
 
 ## Stage 1 adaptation (Part 3)
-- [ ] S1-1  Port stage-1 package
-- [ ] S1-2  Migrate 8 plugins to PipelinePlugin
-- [ ] S1-3  Re-wire orchestrator on shared primitives
-- [ ] S1-4  Expose STAGE1 Stage object
-- [ ] S1-5  Stage-1 regression sweep
+- [x] S1-1  Port stage-1 package — committed 743073f
+- [x] S1-2  Migrate 8 plugins to PipelinePlugin — committed 20f8e0b
+- [x] S1-3a Create tools/calibration_pass.py (folded F-6) — committed f3b2219
+- [x] S1-3b Relocate candidates + safe_json into pipeline/ — committed d510d7c
+- [x] S1-3c Rewire orchestrator + collapse Stage1Context + dismantle _framework/ — committed 19cf449
+- [x] S1-4a Expose STAGE1 Stage object (stage1/stage.py) — committed 267cc4c
+- [x] S1-4b Rewire run_pipeline.py to plugin stage1 + delete monoliths — committed 4e3979b
+      (+ ccfe5a6 chore: fixed pre-existing stale stage-5 format_version test)
+- [x] S1-5  Stage-1 regression sweep — 339 passed (stage1 + pipeline + tools)
 
 ## Stage 2 adaptation (Part 4)
-- [ ] S2-1  Port stage-2 package
+- [ ] S2-1a Port stage-2 framework (_framework/) + helpers
+- [ ] S2-1b Port stage-2 plugins (stage2/plugins/, 19 files)
+- [ ] S2-1c Port slim orchestrator + run_layer behavioral gate
 - [ ] S2-2  Migrate context typed→dict
 - [ ] S2-3  Migrate Stage2Plugin→PipelinePlugin
 - [ ] S2-4  Migrate registry + pipeline
