@@ -62,7 +62,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S3-6  block_refine plugin — _phase_c5_block_refine/_advance_streams relocated, first config-gated stage-3 plugin
 - [x] S3-7a Rewrite stage-3 orchestrator on the plugin schedule + flip stage3_svd.run to a shim
 - [x] S3-7b Expose STAGE3 Stage object + stage3/__init__ export
-- [ ] S3-8  Stage-3 orchestrator test
+- [x] S3-8  Stage-3 orchestrator test — test_stage3_orchestrator.py (registry/phase-order/artifact-set)
 
 ## Stage 4 — EoRA (Part 5.2)
 - [ ] S4-0  Capture stage-4 golden
