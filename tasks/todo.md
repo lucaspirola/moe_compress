@@ -81,7 +81,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] RK-4  vocab_kd plugin — _chunked_vocab_kl/_combine_kd_loss + NaN probes relocated
 - [x] RK-5  teacher_cache + teacher_live slot plugins — provide_teacher_logits slot, cache wins under dispatch_first
 - [x] RK-6  merge_repair plugin — 7 symbols relocated; stage-gated is_enabled (stage2p5-only)
-- [ ] RK-7  early_stop plugin
+- [x] RK-7  early_stop plugin — _save_best_router_state relocated; best-tracker EMA + patience reproduced
 - [ ] RK-8  Wire orchestrator + resume + factory
 - [ ] RK-9  Router-KD dual-invocation test
 

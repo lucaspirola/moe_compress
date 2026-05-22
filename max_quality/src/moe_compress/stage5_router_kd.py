@@ -84,6 +84,14 @@ from .router_kd.plugins.merge_repair import (  # noqa: F401
     _merge_repair_mse,
 )
 
+# RK-7: _save_best_router_state relocated to router_kd/plugins/early_stop.
+# Re-imported so run() keeps its import path; the inline best-tracker /
+# early-stop run() glue is reproduced (Pattern B) in EarlyStopPlugin's
+# inert hooks — the monolith run() loop is otherwise UNTOUCHED.
+from .router_kd.plugins.early_stop import (  # noqa: F401
+    _save_best_router_state,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -1393,43 +1401,9 @@ def _save_stage5_checkpoint(
     log.info("Stage 5: checkpoint saved at step %d (epoch %d, batch %d)", step, epoch, batch_idx)
 
 
-def _save_best_router_state(
-    partial_dir: Path,
-    student: nn.Module,
-    step: int,
-    epoch: int,
-    raw_kl_ema: float,
-) -> None:
-    """Atomically rewrite best.pt with the trainable (router) params only.
-
-    File size is ~10-50 MB (router weights only) vs ~5 GB for the full
-    optim+student checkpoint, so we can afford to rewrite on every
-    improvement. The slim payload also keeps the end-of-training reload
-    boundaried: only trainable params land via load_state_dict(strict=False).
-    """
-    unwrapped = getattr(student, "_orig_mod", student)
-    router_state = {
-        name: p.data.cpu().clone()
-        for name, p in unwrapped.named_parameters()
-        if p.requires_grad
-    }
-    payload = {
-        "format_version": 1,  # best.pt format; independent of step_*.pt versioning
-        "step": int(step),
-        "epoch": int(epoch),
-        "raw_kl_ema": float(raw_kl_ema),
-        "router_state": router_state,
-    }
-    tmp = partial_dir / "best.pt.tmp"
-    final = partial_dir / "best.pt"
-    torch.save(payload, tmp)
-    fd = os.open(str(tmp), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, final)
-
+# RK-7: _save_best_router_state relocated to router_kd/plugins/early_stop —
+# see that module's docstring. It is re-imported in the module-top import
+# region (alongside the RK-2/3/4/6 blocks).
 
 # RK-6: the Stage-2.5 merge-repair pieces (Direction E) are relocated to
 # router_kd/plugins/merge_repair — see that module's docstring. They are
