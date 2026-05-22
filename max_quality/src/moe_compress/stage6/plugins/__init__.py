@@ -15,6 +15,18 @@ Holds:
   the relocated ``_ZERO_SHOT_TASKS`` constant and ``_lm_eval_tasks`` helper
   plus ``ZeroShotLmEvalPlugin`` with an ``is_enabled`` gated on
   ``stage6_validate.zero_shot.enabled`` and an inert ``eval_task`` hook).
+* ``humaneval.py`` (added by S6-4 — the HumanEval pass@1 generative sub-metric:
+  the relocated ``_humaneval`` driver and ``_check_humaneval`` scorer plus
+  ``HumanEvalPlugin`` with an ``is_enabled`` gated on
+  ``stage6_validate.generative.enabled`` AND a ``humaneval`` sub-key and an
+  inert ``eval_task`` hook). Its shared batched-generation / chat-format
+  primitives live in ``tools/eval_harness`` (also added by S6-4).
+* ``math500.py`` (added by S6-4 — the MATH-500 accuracy generative sub-metric:
+  the relocated ``_math500`` driver, its ``_extract_boxed`` / ``_last_numeric``
+  / ``_check_math`` / ``_math_fallback_extract`` grading helpers and the
+  optional-SymPy guard, plus ``Math500Plugin`` with an ``is_enabled`` gated on
+  ``stage6_validate.generative.enabled`` AND a ``math500`` sub-key and an inert
+  ``eval_task`` hook).
 
 The Stage 6 validation algorithm — WikiText-2 PPL, zero-shot (ARC-C,
 HellaSwag), generative (HumanEval, MATH-500), imatrix pipeline, and threshold

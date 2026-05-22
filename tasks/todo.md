@@ -90,7 +90,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S6-1  Scaffold stage6/ package — __init__/context/orchestrator + plugins/; orchestrator delegates to legacy stage6_validate.run + test_stage6_scaffold.py
 - [x] S6-2  eval_environment plugin — EvalEnvironmentPlugin; Pattern-A relocates 8 env-setup symbols, inert setup_environment hook (experts-impl, model.eval, revision-pin, imatrix corpus, kernel patches, torch.compile, masking_utils patch)
 - [x] S6-3  wikitext_ppl + zero_shot_lm_eval plugins — WikitextPplPlugin + ZeroShotLmEvalPlugin; Pattern-A relocates _wikitext2_ppl / _lm_eval_tasks / _ZERO_SHOT_TASKS, inert eval_task hooks
-- [ ] S6-4  humaneval + math500 plugins
+- [x] S6-4  humaneval + math500 plugins — HumanEvalPlugin + Math500Plugin + new tools/eval_harness.py (shared batched-gen + chat-format); 14 symbols + sympy guard relocated, inert eval_task hooks
 - [ ] S6-5  teacher_provider plugin
 - [ ] S6-6  imatrix_export plugin
 - [ ] S6-7  validation_report plugin
