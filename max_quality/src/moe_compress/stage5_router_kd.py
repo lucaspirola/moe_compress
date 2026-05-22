@@ -71,6 +71,19 @@ from .router_kd.plugins.vocab_kd import (  # noqa: F401
     _check_param_sanity,
 )
 
+# RK-6: the Stage-2.5 merge-repair pieces relocated to
+# router_kd/plugins/merge_repair. Re-imported so run() + external
+# callers/tests (test_stage5_merge_repair.py) keep their import paths.
+from .router_kd.plugins.merge_repair import (  # noqa: F401
+    _load_merge_map,
+    _merged_centroid_rows,
+    _select_merge_repair_layers,
+    _experts_param_tensors,
+    _unfreeze_merged_experts,
+    _LayerOutputCapture,
+    _merge_repair_mse,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -1418,230 +1431,7 @@ def _save_best_router_state(
     os.replace(tmp, final)
 
 
-# ---------------------------------------------------------------------------
-# Direction E — Stage 2.5 merge-repair (config-gated, default-off).
-#
-# The strong form of merge-repair (spec §E / tasks §E): in Stage 2.5, in
-# addition to training the router, also train the *merged centroid experts*
-# (the kept experts that absorbed others during Stage-2 merging) against a
-# direct per-layer MoE-output MSE target taken from the teacher.
-#
-# Everything below is dead code unless `stage5_router_kd.merge_repair.enabled`
-# is true — `run()` only calls into it behind that flag, so the flag-off path
-# is byte-identical to pre-Direction-E `main`.
-# ---------------------------------------------------------------------------
-
-
-def _load_merge_map(artifacts_dir: Path, override_path: "str | None") -> dict:
-    """Load the Stage-2 merge map ``{layer_idx: {new_idx: [orig_ids...]}}``.
-
-    The canonical artifact is ``stage2_pruned/merge_map.json`` written by
-    Stage 2 (``stage2_reap_ream._write_merge_json`` / ``save_json_artifact``).
-    ``override_path`` lets a caller point elsewhere; relative paths resolve
-    against ``artifacts_dir``.
-
-    Keys arrive as strings from JSON; they are normalized to ``int``.
-    """
-    if override_path:
-        path = Path(override_path)
-        if not path.is_absolute():
-            path = artifacts_dir / path
-    else:
-        path = artifacts_dir / "stage2_pruned" / "merge_map.json"
-    if not path.exists():
-        raise RuntimeError(
-            f"Stage 2.5 merge_repair: merge map not found at {path}. "
-            "merge_repair needs the Stage-2 merge artifact to identify which "
-            "experts are merged centroids. Run Stage 2 first, or set "
-            "stage5_router_kd.merge_repair.merge_map_path."
-        )
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    out: dict[int, dict[int, list[int]]] = {}
-    for layer_k, groups in raw.items():
-        out[int(layer_k)] = {
-            int(new_idx): [int(x) for x in members]
-            for new_idx, members in groups.items()
-        }
-    return out
-
-
-def _merged_centroid_rows(merge_map: dict, layer_idx: int) -> list[int]:
-    """Return the post-merge expert row indices that are *merged centroids*.
-
-    A new-index expert is a merged centroid iff the Stage-2 merge map records
-    it as having absorbed >1 original expert (member-list length > 1). A
-    length-1 entry is an expert kept untouched — it is NOT a repair target.
-
-    Model-agnostic: the new-index keys ARE the post-merge expert rows in the
-    fused stacked weight tensors, regardless of architecture.
-    """
-    groups = merge_map.get(layer_idx, {})
-    return sorted(new_idx for new_idx, members in groups.items() if len(members) > 1)
-
-
-def _select_merge_repair_layers(student: nn.Module, merge_map: dict) -> list:
-    """Return ``(MoELayerRef, merged_rows)`` for every layer with ≥1 merged
-    centroid, derived live from the model via ``iter_moe_layers``.
-
-    Layer count / structure / expert count are all read from the model — no
-    hardcoding. A layer with zero merged centroids contributes nothing.
-    """
-    selected = []
-    for ref in iter_moe_layers(getattr(student, "_orig_mod", student)):
-        rows = _merged_centroid_rows(merge_map, ref.layer_idx)
-        if not rows:
-            continue
-        n = ref.num_routed_experts
-        bad = [r for r in rows if not (0 <= r < n)]
-        if bad:
-            raise RuntimeError(
-                f"Stage 2.5 merge_repair: layer {ref.layer_idx} merge map names "
-                f"centroid row(s) {bad} outside the post-merge expert range "
-                f"[0, {n}). The merge map does not match this student — "
-                "regenerate Stage 2 or correct merge_map_path."
-            )
-        selected.append((ref, rows))
-    return selected
-
-
-def _experts_param_tensors(experts_module: nn.Module) -> list:
-    """Return the stacked expert weight ``nn.Parameter``s of an experts module.
-
-    Stage 2.5 runs *after* Stage-2 merging and *before* Stage-3 SVD
-    factorization, so the experts are always the fused stacked form
-    (``gate_up_proj`` / ``down_proj``) with the expert axis leading — which is
-    what the gradient mask keys on. Any MoE whose experts module exposes those
-    stacked parameters works; nothing here is Qwen-specific. (A post-Stage-3
-    ``FactoredExperts`` module is intentionally NOT handled: its factors are
-    not plain leading-axis ``nn.Parameter``s, and merge-repair never runs on a
-    factored checkpoint — the explicit error below surfaces that misuse.)
-    """
-    names = ("gate_up_proj", "down_proj")
-    out = []
-    for name in names:
-        t = getattr(experts_module, name, None)
-        if isinstance(t, nn.Parameter):
-            out.append(t)
-    if not out:
-        raise RuntimeError(
-            "Stage 2.5 merge_repair: could not find the stacked expert weight "
-            f"parameters (gate_up_proj / down_proj) on "
-            f"{type(experts_module).__name__}; merge_repair cannot unfreeze "
-            "merged experts on this architecture (a factored / post-Stage-3 "
-            "experts module is not supported)."
-        )
-    return out
-
-
-def _unfreeze_merged_experts(student: nn.Module, repair_layers: list) -> dict:
-    """Unfreeze the merged-centroid experts for merge-repair.
-
-    The expert weights are stored as a single stacked ``nn.Parameter`` per
-    projection (leading axis = expert), so ``requires_grad`` cannot be set per
-    row. We instead set ``requires_grad=True`` on the whole stacked tensor and
-    register a gradient hook that zeroes every non-centroid expert row — so the
-    optimizer updates *only* the merged centroids, exactly as the spec asks.
-
-    Returns ``{id(param): grad-hook-handle}`` so the hooks can be removed and a
-    record of which params were touched (for verification / checkpoint scope).
-    """
-    handles: dict = {}
-    for ref, rows in repair_layers:
-        row_idx = torch.tensor(sorted(rows), dtype=torch.long)
-        for p in _experts_param_tensors(ref.experts_module):
-            p.requires_grad_(True)
-            # Capture row_idx by default-arg so each closure binds its own.
-            # row_idx is built on CPU; move it to the gradient's device inside
-            # the hook so the fancy-index works when training on GPU (a CPU
-            # index tensor against a CUDA grad raises a device-mismatch error).
-            def _mask_grad(grad, _rows=row_idx):
-                _rows = _rows.to(grad.device)
-                masked = torch.zeros_like(grad)
-                masked[_rows] = grad[_rows]
-                return masked
-            handles[id(p)] = p.register_hook(_mask_grad)
-    return handles
-
-
-class _LayerOutputCapture:
-    """Forward-hook capture of every MoE block's output hidden-state.
-
-    Registers a ``register_forward_hook`` on each layer's ``mlp`` module (the
-    MoE block). The hook stores that block's output tensor keyed by layer
-    index. Works on teacher and student alike — the captured tensor is the
-    block output regardless of architecture.
-
-    ``detach`` controls whether captured tensors keep autograd history: the
-    teacher capture detaches (it is a fixed target); the student capture keeps
-    grad so the MSE term backpropagates into the merged experts + router.
-    """
-
-    def __init__(self, model: nn.Module, layer_indices: "set[int]", *, detach: bool):
-        self._detach = detach
-        self.outputs: dict[int, torch.Tensor] = {}
-        self._handles: list = []
-        base = getattr(model, "_orig_mod", model)
-        wanted = set(layer_indices)
-        for ref in iter_moe_layers(base):
-            if ref.layer_idx not in wanted:
-                continue
-            self._handles.append(
-                ref.mlp.register_forward_hook(self._make_hook(ref.layer_idx))
-            )
-
-    def _make_hook(self, layer_idx: int):
-        def _hook(_module, _inp, output):
-            # An MoE block returns either the hidden-state tensor directly or
-            # a tuple whose first element is it (router-logits may follow).
-            tensor = output[0] if isinstance(output, tuple) else output
-            self.outputs[layer_idx] = tensor.detach() if self._detach else tensor
-        return _hook
-
-    def clear(self) -> None:
-        self.outputs.clear()
-
-    def remove(self) -> None:
-        for h in self._handles:
-            h.remove()
-        self._handles.clear()
-
-
-def _merge_repair_mse(
-    student_outputs: dict[int, torch.Tensor],
-    teacher_outputs: dict[int, torch.Tensor],
-    layer_indices: "list[int]",
-) -> torch.Tensor:
-    """Mean per-layer MSE between student and teacher MoE-block outputs.
-
-    Averaged over the repair layers so the term's scale is independent of how
-    many layers had merges (the config ``mse_weight`` is the only knob). The
-    teacher tensor is cast to the student's dtype/device before the diff.
-    Returns a scalar tensor with grad flowing into the student outputs.
-    """
-    if not layer_indices:
-        # Defensive: with no repair layers the MSE term is identically zero.
-        any_s = next(iter(student_outputs.values()), None)
-        if any_s is None:
-            return torch.zeros((), dtype=torch.float32)
-        return torch.zeros((), device=any_s.device, dtype=torch.float32)
-    terms = []
-    for li in layer_indices:
-        if li not in student_outputs or li not in teacher_outputs:
-            raise RuntimeError(
-                f"Stage 2.5 merge_repair: layer {li} output missing from "
-                f"{'student' if li not in student_outputs else 'teacher'} "
-                "capture — the MoE-block forward hook did not fire. Likely "
-                "causes: the teacher/student MoE block layout differs, or "
-                "torch.compile inlined the block forward so its submodule "
-                "hook no longer runs."
-            )
-        s = student_outputs[li].to(torch.float32)
-        t = teacher_outputs[li].to(device=s.device, dtype=torch.float32)
-        if s.shape != t.shape:
-            raise RuntimeError(
-                f"Stage 2.5 merge_repair: layer {li} student/teacher MoE-output "
-                f"shape mismatch {tuple(s.shape)} vs {tuple(t.shape)}."
-            )
-        terms.append(F.mse_loss(s, t))
-    return torch.stack(terms).mean()
+# RK-6: the Stage-2.5 merge-repair pieces (Direction E) are relocated to
+# router_kd/plugins/merge_repair — see that module's docstring. They are
+# re-imported in the module-top import region (alongside the RK-2/3/4 blocks).
 

@@ -80,7 +80,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] RK-3  kd_optimizer plugin — split-group AdamW + _lr_lambda reproduced; _move_optimizer_state_to_device relocated
 - [x] RK-4  vocab_kd plugin — _chunked_vocab_kl/_combine_kd_loss + NaN probes relocated
 - [x] RK-5  teacher_cache + teacher_live slot plugins — provide_teacher_logits slot, cache wins under dispatch_first
-- [ ] RK-6  merge_repair plugin
+- [x] RK-6  merge_repair plugin — 7 symbols relocated; stage-gated is_enabled (stage2p5-only)
 - [ ] RK-7  early_stop plugin
 - [ ] RK-8  Wire orchestrator + resume + factory
 - [ ] RK-9  Router-KD dual-invocation test
