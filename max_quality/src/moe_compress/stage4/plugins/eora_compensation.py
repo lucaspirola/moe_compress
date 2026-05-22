@@ -403,17 +403,9 @@ class EoraCompensationPlugin:
 
         rank_map.update(rank_map_layer)
         compensated_params += layer_compensated_params
-        # S4-4 WIRING HAZARD: ``compensated_params`` is a scalar running total.
-        # ``PipelineContext.set`` always writes the LOCAL scope — if S4-4
-        # dispatches ``compensate_layer`` via ``loop_over`` with a per-layer
-        # CHILD ctx (the ``aa_svd_factor.factor_layer`` pattern), this
-        # ``ctx.set`` shadows the parent in the child scope and the total will
-        # NOT accumulate across layers: each layer's child reads the parent's
-        # stale value via the read above. ``rank_map`` escapes this because it
-        # is a shared mutable dict mutated in place (``rank_map.update``); a
-        # scalar int rebind does not. S4-4 MUST either dispatch
-        # ``compensate_layer`` against the ROOT ctx, OR convert
-        # ``compensated_params`` to a shared mutable container.
+        # S4-4: dispatched against the ROOT ctx by a plain for-loop (not
+        # loop_over); the overwrite=True rebind of the root scalar accumulates
+        # across layers.
         ctx.set("compensated_params", compensated_params, overwrite=True)
 
         # Atomically persist this layer's FactoredExperts state for crash-resume.

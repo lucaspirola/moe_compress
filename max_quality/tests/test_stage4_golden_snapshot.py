@@ -84,7 +84,9 @@ def patched_stage4(request, monkeypatch, tiny_config, tiny_config_bf16):
     seeded fakes on the ``utils.calibration`` source module and on the
     ``stage2.orchestrator`` / ``stage3_svd`` modules (which bind the names by
     direct import), and stubs ``save_compressed_checkpoint`` to a no-op on
-    ``model_io`` plus the stage-2/3/4 modules. Stage 1 imports
+    ``model_io`` plus the stage-2/3 modules. S4-4a's plugin-driven Stage 4
+    orchestrator calls ``save_compressed_checkpoint`` module-qualified through
+    ``utils.model_io``, so the ``model_io`` patch covers it. Stage 1 imports
     ``build_calibration_tensor`` by direct name into its own modules and is
     intentionally left on the real loader — matching the established
     ``test_smoke_stage4_resume.py`` / ``test_stage3_golden_snapshot.py``
@@ -119,7 +121,8 @@ def patched_stage4(request, monkeypatch, tiny_config, tiny_config_bf16):
     monkeypatch.setattr(mio, "save_compressed_checkpoint", _noop_save)
     monkeypatch.setattr(stage2_reap_ream, "save_compressed_checkpoint", _noop_save)
     monkeypatch.setattr(stage3_svd, "save_compressed_checkpoint", _noop_save)
-    monkeypatch.setattr(stage4_eora, "save_compressed_checkpoint", _noop_save)
+    # S4-4a: the Stage 4 orchestrator calls save_compressed_checkpoint
+    # module-qualified through utils.model_io — the `mio` patch above covers it.
 
     return tiny_config
 

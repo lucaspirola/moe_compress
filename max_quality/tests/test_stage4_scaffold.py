@@ -1,15 +1,16 @@
 """Tests for the ``stage4/`` package surface.
 
-S4-1 creates the ``stage4/`` package skeleton — an ``__init__`` re-exporting
-``run``, an ``orchestrator`` module whose ``run`` is a thin delegation to the
-legacy ``stage4_eora.run`` monolith, a ``context`` re-export shim, and a
-``plugins`` package. Tasks S4-2..S4-3 extract the EoRA algorithm into
-``stage4/plugins/``; S4-4 then makes ``stage4/orchestrator.run`` the REAL
-plugin-driven orchestrator and deletes the monolith.
+S4-1 created the ``stage4/`` package skeleton — an ``__init__`` re-exporting
+``run``, an ``orchestrator`` module, a ``context`` re-export shim, and a
+``plugins`` package. S4-2..S4-3 extracted the EoRA algorithm into
+``stage4/plugins/``; S4-4a made ``stage4/orchestrator.run`` the REAL
+plugin-driven orchestrator and flipped ``stage4_eora.run`` to a thin shim that
+delegates to IT (the inverse of the S4-1 scaffold direction).
 
-These tests guard the S4-1 scaffold surface: the package imports cleanly, and
-``stage4.orchestrator.run`` delegates to ``stage4_eora.run`` with a matching
-signature (the seam S4-4 swaps).
+These tests guard the package surface: the package imports cleanly, and
+``stage4_eora.run`` delegates to ``stage4.orchestrator.run`` with a matching
+signature. The byte-identity of the new orchestrator is covered by
+``test_stage4_golden_snapshot.py``.
 """
 from __future__ import annotations
 
@@ -27,10 +28,12 @@ def test_stage4_package_imports():
     assert callable(stage4.run)
 
 
-def test_stage4_orchestrator_delegates_to_legacy(monkeypatch):
-    """S4-1: ``stage4.orchestrator.run`` is a thin shim — it forwards every
-    argument unchanged to ``stage4_eora.run`` (4 positionals + the kw-only
-    ``no_resume``). Pure unit test, no model."""
+def test_stage4_eora_run_delegates_to_orchestrator(monkeypatch):
+    """S4-4a: ``stage4_eora.run`` is now the thin shim — it forwards every
+    argument unchanged to ``stage4.orchestrator.run`` (4 positionals + the
+    kw-only ``no_resume``). Pure unit test, no model."""
+    from moe_compress.stage4 import orchestrator
+
     calls: list[tuple] = []
     sentinel_result = object()
 
@@ -38,22 +41,22 @@ def test_stage4_orchestrator_delegates_to_legacy(monkeypatch):
         calls.append((args, kwargs))
         return sentinel_result
 
-    # The orchestrator binds the monolith as ``_legacy_stage4`` (the module
-    # object) and calls ``_legacy_stage4.run`` — patching the ``run``
-    # attribute on the ``stage4_eora`` module is what it resolves.
-    monkeypatch.setattr(stage4_eora, "run", _sentinel)
+    # The shim does a function-local ``from .stage4.orchestrator import run``;
+    # patching the ``run`` attribute on the orchestrator module is what it
+    # resolves.
+    monkeypatch.setattr(orchestrator, "run", _sentinel)
 
     model = object()
     tokenizer = object()
     config = {"stage4_eora": {}}
     artifacts_dir = object()
 
-    result = stage4.orchestrator.run(
+    result = stage4_eora.run(
         model, tokenizer, config, artifacts_dir, no_resume=True,
     )
 
     assert result is sentinel_result
-    assert len(calls) == 1, "stage4_eora.run must be called exactly once"
+    assert len(calls) == 1, "stage4.orchestrator.run must be called exactly once"
 
     args, kwargs = calls[0]
     assert args == (model, tokenizer, config, artifacts_dir)

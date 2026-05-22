@@ -81,7 +81,7 @@ def _captured_emits(monkeypatch):
 
     from moe_compress import (
         run_pipeline,
-        stage4_eora, stage5_router_kd, stage6_validate,
+        stage5_router_kd, stage6_validate,
     )
     from moe_compress.stage2 import orchestrator as stage2_reap_ream
     # The plugin-based Stage 1 emits Trackio telemetry from three modules
@@ -94,8 +94,14 @@ def _captured_emits(monkeypatch):
     # plugin-driven orchestrator's own ``_trackio_log`` binding; the legacy
     # ``stage3_svd`` is now a thin shim that no longer imports ``_trackio_log``.
     from moe_compress.stage3 import orchestrator as stage3_orchestrator
+    # After S4-4a, Stage 4 runtime telemetry emits fire from the two stage-4
+    # plugin modules (eora_inputs / eora_compensation); the legacy
+    # ``stage4_eora`` is now a thin shim that no longer imports ``_trackio_log``.
+    from moe_compress.stage4.plugins import eora_inputs as stage4_eora_inputs
+    from moe_compress.stage4.plugins import eora_compensation as stage4_eora_comp
     for mod in (run_pipeline, stage2_reap_ream, stage3_orchestrator,
-                stage4_eora, stage5_router_kd, stage6_validate,
+                stage4_eora_inputs, stage4_eora_comp,
+                stage5_router_kd, stage6_validate,
                 stage1_orchestrator, stage1_grape_merge, stage1_ma_detection):
         monkeypatch.setattr(mod, "_trackio_log", _capture, raising=False)
 
@@ -238,12 +244,17 @@ def test_stage4_per_layer_emit_includes_new_aggregate_keys():
     runtime test — Stage 4 requires Stages 1–3 outputs to run, which is
     out of scope for a unit test. The structural check ensures the keys
     were not silently dropped by a future refactor.
+
+    S4-4a: the monolith ``stage4_eora.py`` ``run()`` body was retired — the
+    config-key emits (``stage4/config/*``) now fire from
+    ``stage4/plugins/eora_inputs.py`` and the per-matrix emits from
+    ``stage4/plugins/eora_compensation.py``. The source scan spans both.
     """
-    src_path = (
-        Path(__file__).resolve().parents[1]
-        / "src" / "moe_compress" / "stage4_eora.py"
+    src_root = Path(__file__).resolve().parents[1] / "src" / "moe_compress"
+    src = (
+        (src_root / "stage4" / "plugins" / "eora_inputs.py").read_text()
+        + (src_root / "stage4" / "plugins" / "eora_compensation.py").read_text()
     )
-    src = src_path.read_text()
     # The per-matrix keys use f-string templates ``f"stage4/{name}_..."``;
     # search for the post-``{name}`` literal segment, which is unique enough
     # to confirm the key was added.
