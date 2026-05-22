@@ -74,7 +74,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S4-5  Stage-4 orchestrator test — test_stage4_orchestrator.py (registry/phase-order/sidecar-deletion)
 
 ## Router-KD — stages 2.5 ≡ 5 (Part 5.3)
-- [ ] RK-0  Capture router-KD goldens ×2
+- [x] RK-0  Capture router-KD goldens ×2 — test_router_kd_golden_snapshot.py (stage2p5+stage5; metadata+loss-trace)
 - [ ] RK-1  Scaffold router_kd/ package
 - [ ] RK-2  trainable_scope plugin
 - [ ] RK-3  kd_optimizer plugin
