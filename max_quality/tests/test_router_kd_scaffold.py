@@ -1,18 +1,19 @@
 """Tests for the ``router_kd/`` package surface.
 
 RK-1 created the ``router_kd/`` package skeleton — an ``__init__`` re-exporting
-``run`` and ``make_router_kd_stage``, an ``orchestrator`` module whose ``run``
-is a thin delegation to the legacy ``stage5_router_kd.run`` monolith, a
-``context`` re-export shim, an (empty) ``plugins`` package, and a ``stage``
-module exposing the ``make_router_kd_stage(stage_id)`` factory. RK-2..RK-7
-extract the unified Router-KD algorithm into ``router_kd/plugins/``; RK-8 swaps
-``router_kd.orchestrator.run`` for the real plugin-driven orchestrator.
+``run`` and ``make_router_kd_stage``, an ``orchestrator`` module, a ``context``
+re-export shim, an (empty) ``plugins`` package, and a ``stage`` module exposing
+the ``make_router_kd_stage(stage_id)`` factory. RK-2..RK-7 extracted the unified
+Router-KD algorithm into ``router_kd/plugins/``; RK-8 made
+``router_kd.orchestrator.run`` the real plugin-driven orchestrator and flipped
+``stage5_router_kd.run`` to a thin shim that delegates TO it.
 
 These tests guard the package surface: the package imports cleanly,
-``orchestrator.run`` delegates to the legacy monolith with a matching
-signature, and the ``make_router_kd_stage`` factory produces ``Stage``-conforming
-objects that thread the correct ``stage_key``. The byte-identity of the
-delegating orchestrator is covered by ``test_router_kd_golden_snapshot.py``.
+``stage5_router_kd.run`` delegates to ``router_kd.orchestrator.run`` with a
+matching signature, and the ``make_router_kd_stage`` factory produces
+``Stage``-conforming objects that thread the correct ``stage_key``. The
+byte-identity of the orchestrator is covered by
+``test_router_kd_golden_snapshot.py``.
 """
 from __future__ import annotations
 
@@ -36,9 +37,9 @@ def test_router_kd_package_imports():
     assert callable(router_kd.make_router_kd_stage)
 
 
-def test_orchestrator_run_delegates_to_legacy(monkeypatch):
-    """RK-1: ``router_kd.orchestrator.run`` is a thin delegation — it forwards
-    every argument unchanged to the legacy ``stage5_router_kd.run`` monolith
+def test_legacy_run_delegates_to_orchestrator(monkeypatch):
+    """RK-8: ``stage5_router_kd.run`` is a thin shim — it forwards every
+    argument unchanged to the real ``router_kd.orchestrator.run`` orchestrator
     (4 positionals + the kw-only ``device`` / ``no_resume`` / ``stage_key``).
     Pure unit test, no model."""
     from moe_compress.router_kd import orchestrator
@@ -50,10 +51,11 @@ def test_orchestrator_run_delegates_to_legacy(monkeypatch):
         calls.append((args, kwargs))
         return sentinel_result
 
-    # ``orchestrator.py`` does ``from .. import stage5_router_kd as
-    # _legacy_router_kd`` then ``_legacy_router_kd.run(...)`` — patching the
-    # ``run`` attribute on the legacy module is what it resolves.
-    monkeypatch.setattr(stage5_router_kd, "run", _sentinel)
+    # ``stage5_router_kd.run`` does a function-local ``from
+    # .router_kd.orchestrator import run as _orchestrator_run`` then
+    # ``_orchestrator_run(...)`` — patching the ``run`` attribute on the
+    # orchestrator module is what that import resolves.
+    monkeypatch.setattr(orchestrator, "run", _sentinel)
 
     student = object()
     tokenizer = object()
@@ -61,13 +63,13 @@ def test_orchestrator_run_delegates_to_legacy(monkeypatch):
     artifacts_dir = object()
     device = object()
 
-    result = orchestrator.run(
+    result = stage5_router_kd.run(
         student, tokenizer, config, artifacts_dir,
         device=device, no_resume=True, stage_key="stage2p5",
     )
 
     assert result is sentinel_result
-    assert len(calls) == 1, "stage5_router_kd.run must be called exactly once"
+    assert len(calls) == 1, "router_kd.orchestrator.run must be called exactly once"
 
     args, kwargs = calls[0]
     assert args == (student, tokenizer, config, artifacts_dir)
@@ -77,8 +79,8 @@ def test_orchestrator_run_delegates_to_legacy(monkeypatch):
 def test_orchestrator_signature_matches_legacy():
     """``router_kd.orchestrator.run`` and ``stage5_router_kd.run`` have
     identical signatures — parameter names, kinds, defaults, annotations, and
-    return annotation. The delegating wrapper and the legacy monolith must
-    stay swap-compatible (the seam RK-8 swaps)."""
+    return annotation. The real orchestrator and the thin shim must stay
+    swap-compatible (the seam RK-8 swapped)."""
     orch_sig = inspect.signature(router_kd.orchestrator.run)
     legacy_sig = inspect.signature(stage5_router_kd.run)
 

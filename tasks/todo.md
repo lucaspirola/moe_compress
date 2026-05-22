@@ -82,7 +82,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] RK-5  teacher_cache + teacher_live slot plugins — provide_teacher_logits slot, cache wins under dispatch_first
 - [x] RK-6  merge_repair plugin — 7 symbols relocated; stage-gated is_enabled (stage2p5-only)
 - [x] RK-7  early_stop plugin — _save_best_router_state relocated; best-tracker EMA + patience reproduced
-- [ ] RK-8  Wire orchestrator + resume + factory
+- [x] RK-8  Wire orchestrator + resume + factory — router_kd.orchestrator drives the plugin schedule; stage5_router_kd.run shimmed
 - [ ] RK-9  Router-KD dual-invocation test
 
 ## Stage 6 — validation (Part 5.4)

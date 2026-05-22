@@ -83,6 +83,11 @@ def _captured_emits(monkeypatch):
         run_pipeline,
         stage5_router_kd, stage6_validate,
     )
+    # After RK-8, Router-KD runtime telemetry emits fire from the real
+    # plugin-driven orchestrator ``router_kd/orchestrator.py``; the legacy
+    # ``stage5_router_kd`` is now a thin shim that no longer imports
+    # ``_trackio_log``.
+    from moe_compress.router_kd import orchestrator as router_kd_orchestrator
     from moe_compress.stage2 import orchestrator as stage2_reap_ream
     # The plugin-based Stage 1 emits Trackio telemetry from three modules
     # (orchestrator + the grape_merge / ma_detection plugins), replacing the
@@ -101,7 +106,7 @@ def _captured_emits(monkeypatch):
     from moe_compress.stage4.plugins import eora_compensation as stage4_eora_comp
     for mod in (run_pipeline, stage2_reap_ream, stage3_orchestrator,
                 stage4_eora_inputs, stage4_eora_comp,
-                stage5_router_kd, stage6_validate,
+                stage5_router_kd, router_kd_orchestrator, stage6_validate,
                 stage1_orchestrator, stage1_grape_merge, stage1_ma_detection):
         monkeypatch.setattr(mod, "_trackio_log", _capture, raising=False)
 
@@ -281,10 +286,15 @@ def test_stage5_source_emits_config_block():
     """Source-level check: Stage 5's run() emits a one-shot config block
     under stage5/config/* with the new keys. The Stage 2.5 integration
     test (test_smoke_stage2_to_stage2p5) already runs the Stage 5 freeze
-    pattern; this structural check guards the keys stay in place."""
+    pattern; this structural check guards the keys stay in place.
+
+    After RK-8 the one-shot config emit fires from the real plugin-driven
+    orchestrator ``router_kd/orchestrator.py``; the legacy ``stage5_router_kd``
+    is now a thin shim with no config-key emits — the source scan therefore
+    targets the orchestrator."""
     src_path = (
         Path(__file__).resolve().parents[1]
-        / "src" / "moe_compress" / "stage5_router_kd.py"
+        / "src" / "moe_compress" / "router_kd" / "orchestrator.py"
     )
     src = src_path.read_text()
     expected_keys = [

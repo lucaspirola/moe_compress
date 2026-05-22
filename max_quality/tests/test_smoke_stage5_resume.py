@@ -18,6 +18,8 @@ import torch
 
 from moe_compress import stage1
 from moe_compress import stage5_router_kd
+from moe_compress.router_kd import orchestrator as rk_orchestrator
+from moe_compress.router_kd.plugins import teacher as rk_teacher
 from moe_compress.stage2 import orchestrator as stage2_reap_ream
 from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.utils.model_io import iter_moe_layers
@@ -56,12 +58,14 @@ def patched_stage5(monkeypatch, tiny_config):
     monkeypatch.setattr(cal_mod, "build_calibration_tensor", _fake_build)
     monkeypatch.setattr(cal_mod, "build_super_expert_slice", _fake_slice)
     monkeypatch.setattr(stage2_reap_ream, "build_calibration_tensor", _fake_build)
-    monkeypatch.setattr(stage5_router_kd, "build_calibration_tensor", _fake_build)
+    # RK-8: the real Router-KD orchestrator binds build_calibration_tensor /
+    # save_compressed_checkpoint by direct import — patch them there.
+    monkeypatch.setattr(rk_orchestrator, "build_calibration_tensor", _fake_build)
 
     from moe_compress.utils import model_io as mio
     monkeypatch.setattr(mio, "save_compressed_checkpoint", _noop_save)
     monkeypatch.setattr(stage2_reap_ream, "save_compressed_checkpoint", _noop_save)
-    monkeypatch.setattr(stage5_router_kd, "save_compressed_checkpoint", _noop_save)
+    monkeypatch.setattr(rk_orchestrator, "save_compressed_checkpoint", _noop_save)
 
     # Stage 5 needs a merge_map. Build one from stages 0+1+2.
     cfg = dict(tiny_config)
@@ -148,20 +152,21 @@ def _run_stage5_self_kd(student, config, tmp_path, monkeypatch):
     original_run = stage5_router_kd.run
 
     def _patched_run(student, tokenizer, config, artifacts_dir, *, device=None):
-        # Monkeypatch load_model inside stage5 so teacher = student.
+        # Monkeypatch load_model on the live-teacher plugin so teacher = student.
         from moe_compress.utils import model_io as mio
         original_load = mio.load_model
+        original_teacher_load = rk_teacher.load_model
 
         def _load_student(*args, **kwargs):
             return student, tokenizer
 
         monkeypatch.setattr(mio, "load_model", _load_student)
-        monkeypatch.setattr(stage5_router_kd, "load_model", _load_student)
+        monkeypatch.setattr(rk_teacher, "load_model", _load_student)
         try:
             return original_run(student, tokenizer, config, artifacts_dir, device=device)
         finally:
             monkeypatch.setattr(mio, "load_model", original_load)
-            monkeypatch.setattr(stage5_router_kd, "load_model", original_load)
+            monkeypatch.setattr(rk_teacher, "load_model", original_teacher_load)
 
     return _patched_run(student, _TinyTokenizer(), config, tmp_path)
 
@@ -263,7 +268,9 @@ def test_stage5_resume_step_counter_continues(
     tiny_model.load_state_dict(state_after_2)
     steps_seen: list[int] = []
 
-    original_save = stage5_router_kd._save_stage5_checkpoint
+    # RK-8: _save_stage5_checkpoint relocated to router_kd.orchestrator (the
+    # orchestrator is now its only caller) — patch it there.
+    original_save = rk_orchestrator._save_stage5_checkpoint
 
     def _capture_save(partial_dir, step, epoch, batch_idx, student, optim, grad_accum=1, **_kw):
         steps_seen.append(step)
@@ -271,7 +278,7 @@ def test_stage5_resume_step_counter_continues(
             partial_dir, step, epoch, batch_idx, student, optim, grad_accum=grad_accum, **_kw
         )
 
-    monkeypatch.setattr(stage5_router_kd, "_save_stage5_checkpoint", _capture_save)
+    monkeypatch.setattr(rk_orchestrator, "_save_stage5_checkpoint", _capture_save)
 
     _run_stage5_self_kd(tiny_model, cfg, tmp_path, monkeypatch)
 

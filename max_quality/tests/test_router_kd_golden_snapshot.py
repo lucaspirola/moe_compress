@@ -142,28 +142,29 @@ def patched_router_kd(monkeypatch, tiny_config):
 
     Replaces ``build_calibration_tensor`` / ``build_super_expert_slice`` with
     seeded fakes on the ``utils.calibration`` source module and on the modules
-    that bind those names by direct import (``stage2.orchestrator`` and
-    ``stage5_router_kd`` — the latter only imports ``build_calibration_tensor``,
-    so ``build_super_expert_slice`` is patched there only if present).
+    that bind those names by direct import (``stage2.orchestrator`` and — after
+    RK-8 — ``router_kd.orchestrator``, which is the real Router-KD phase
+    sequencer; it binds only ``build_calibration_tensor``).
 
     ``save_compressed_checkpoint`` is stubbed to a no-op on ``utils.model_io``
-    and ``stage2.orchestrator`` ONLY — ``stage5_router_kd.save_compressed_checkpoint``
-    is intentionally left REAL so the ``{stage_key}_final/compressed_metadata.json``
+    and ``stage2.orchestrator`` ONLY — ``router_kd.orchestrator`` calls the REAL
+    ``save_compressed_checkpoint`` so the ``{stage_key}_final/compressed_metadata.json``
     artifact this golden pins is actually produced.
 
-    ``stage5_router_kd.load_model`` is patched so the teacher == the student
-    (same Python object, copied from ``test_smoke_stage5_resume.py``): the tiny
-    model has no real teacher checkpoint to load. KL divergence converges to
-    zero once teacher and student share weights, which is fine — this golden
-    pins whatever the deterministic run produces.
+    ``load_model`` is patched on ``router_kd.plugins.teacher`` (where the live
+    teacher plugin binds it) so the teacher == the student (same Python object):
+    the tiny model has no real teacher checkpoint to load. KL divergence
+    converges to zero once teacher and student share weights, which is fine —
+    this golden pins whatever the deterministic run produces.
 
-    ``stage5_router_kd._trackio_log`` is patched to a capture closure that
+    ``router_kd.orchestrator._trackio_log`` is patched to a capture closure that
     appends every emitted ``payload`` dict to ``captured`` — the loss trace is
     read off this list (there is no loss-trace disk artifact).
 
     Returns ``(tiny_config_unchanged, captured_list)``.
     """
     from moe_compress.utils import calibration as cal_mod
+    from moe_compress.router_kd import orchestrator as rk_orchestrator
 
     def _fake_build(tokenizer, spec, cache_dir=None):
         torch.manual_seed(spec.seed)
@@ -178,38 +179,47 @@ def patched_router_kd(monkeypatch, tiny_config):
     monkeypatch.setattr(cal_mod, "build_calibration_tensor", _fake_build)
     monkeypatch.setattr(cal_mod, "build_super_expert_slice", _fake_slice)
     monkeypatch.setattr(stage2_reap_ream, "build_calibration_tensor", _fake_build)
-    monkeypatch.setattr(stage5_router_kd, "build_calibration_tensor", _fake_build)
-    # stage5_router_kd binds only build_calibration_tensor by direct import;
-    # patch build_super_expert_slice on it only if it is actually bound there.
-    if hasattr(stage5_router_kd, "build_super_expert_slice"):
-        monkeypatch.setattr(stage5_router_kd, "build_super_expert_slice", _fake_slice)
+    # RK-8: the real Router-KD orchestrator binds build_calibration_tensor by
+    # direct import — patch it there.
+    monkeypatch.setattr(rk_orchestrator, "build_calibration_tensor", _fake_build)
+    # router_kd.orchestrator binds only build_calibration_tensor by direct
+    # import; patch build_super_expert_slice on it only if it is bound there.
+    if hasattr(rk_orchestrator, "build_super_expert_slice"):
+        monkeypatch.setattr(rk_orchestrator, "build_super_expert_slice", _fake_slice)
 
     from moe_compress.utils import model_io as mio
     monkeypatch.setattr(mio, "save_compressed_checkpoint", _noop_save)
     monkeypatch.setattr(stage2_reap_ream, "save_compressed_checkpoint", _noop_save)
-    # NOTE: stage5_router_kd.save_compressed_checkpoint is intentionally NOT
-    # patched — the {stage_key}_final/compressed_metadata.json it writes is the
-    # byte-pinned artifact under test.
+    # NOTE: router_kd.orchestrator.save_compressed_checkpoint is intentionally
+    # NOT patched — the {stage_key}_final/compressed_metadata.json it writes is
+    # the byte-pinned artifact under test.
 
     captured: list[dict] = []
 
     def _capture_trackio(payload):
         captured.append(dict(payload))
 
-    monkeypatch.setattr(stage5_router_kd, "_trackio_log", _capture_trackio)
+    # RK-8: the Router-KD orchestrator emits trackio from its own module.
+    monkeypatch.setattr(rk_orchestrator, "_trackio_log", _capture_trackio)
 
     return tiny_config, captured
 
 
 def _load_student_factory(student, tokenizer, monkeypatch):
-    """Patch load_model on model_io + stage5_router_kd so teacher == student."""
+    """Patch load_model so teacher == student.
+
+    RK-8: the live-teacher plugin (``router_kd.plugins.teacher``) binds
+    ``load_model`` by direct import — patch it there. ``utils.model_io`` is
+    also patched so any other consumer of the source name sees the stub.
+    """
     from moe_compress.utils import model_io as mio
+    from moe_compress.router_kd.plugins import teacher as rk_teacher
 
     def _load_student(*_args, **_kwargs):
         return student, tokenizer
 
     monkeypatch.setattr(mio, "load_model", _load_student)
-    monkeypatch.setattr(stage5_router_kd, "load_model", _load_student)
+    monkeypatch.setattr(rk_teacher, "load_model", _load_student)
 
 
 @pytest.mark.parametrize("stage_id", ["stage2p5", "stage5"])
