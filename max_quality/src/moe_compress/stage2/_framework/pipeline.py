@@ -40,19 +40,37 @@ class Stage2Pipeline:
         self.plugins: list[Stage2Plugin] = list(plugins)
 
     def run_setup(self, run_ctx: PipelineContext) -> None:
-        """Call ``on_run_setup`` on every plugin in registration order."""
+        """Call ``on_run_setup`` on every plugin in registration order.
+
+        Hook lookup is tolerant (``getattr`` + ``callable``): a plugin that
+        does not implement the hook is skipped, matching
+        :func:`tools.phase_walker.walk_phases`. Plugins no longer rely on a
+        base class supplying no-op defaults.
+        """
         for plugin in self.plugins:
-            plugin.on_run_setup(run_ctx)
+            hook = getattr(plugin, "on_run_setup", None)
+            if callable(hook):
+                hook(run_ctx)
 
     def run_teardown(self, run_ctx: PipelineContext) -> None:
-        """Call ``on_run_teardown`` on every plugin in registration order."""
+        """Call ``on_run_teardown`` on every plugin in registration order.
+
+        Tolerant hook lookup — see :meth:`run_setup`.
+        """
         for plugin in self.plugins:
-            plugin.on_run_teardown(run_ctx)
+            hook = getattr(plugin, "on_run_teardown", None)
+            if callable(hook):
+                hook(run_ctx)
 
     def run_layer(self, ctx: PipelineContext) -> None:
         """Drive one layer through every phase in canonical order.
 
         For each phase, every plugin's hook is called in registration order.
+        Hook lookup is tolerant (``getattr`` + ``callable``): a plugin that
+        does not implement a given phase is skipped — plugins no longer rely
+        on a base class supplying no-op defaults, matching
+        :func:`tools.phase_walker.walk_phases`.
+
         ``write_artifacts`` is the only hook with a second positional argument
         (``partial_dir``); the pipeline pulls that value from the LegacyAdapter
         plugin (or any plugin exposing ``partial_dir`` as an instance
@@ -71,7 +89,9 @@ class Stage2Pipeline:
 
         for phase in self.phases:
             for plugin in self.plugins:
-                hook = getattr(plugin, phase)
+                hook = getattr(plugin, phase, None)
+                if not callable(hook):
+                    continue
                 if phase == "write_artifacts":
                     hook(ctx, partial_dir)
                 else:
