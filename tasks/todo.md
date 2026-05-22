@@ -83,7 +83,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] RK-6  merge_repair plugin — 7 symbols relocated; stage-gated is_enabled (stage2p5-only)
 - [x] RK-7  early_stop plugin — _save_best_router_state relocated; best-tracker EMA + patience reproduced
 - [x] RK-8  Wire orchestrator + resume + factory — router_kd.orchestrator drives the plugin schedule; stage5_router_kd.run shimmed
-- [ ] RK-9  Router-KD dual-invocation test
+- [x] RK-9  Router-KD dual-invocation test — test_router_kd_orchestrator.py (8 tests; registry roster/order, dual-factory Stage conformance, stage-gated merge_repair, stage_id→dir-name propagation ×2)
 
 ## Stage 6 — validation (Part 5.4)
 - [ ] S6-0  Capture stage-6 golden
