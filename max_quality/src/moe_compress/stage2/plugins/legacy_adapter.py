@@ -407,6 +407,15 @@ class LegacyAdapter:
     def solve_assignment(self, ctx: PipelineContext, delta):
         """Slot ``solve_assignment`` — child→centroid assignment solver.
 
+        DEAD FALLBACK as of S2-8 — the five solver plugins
+        (``GreedySolverPlugin`` / ``HungarianSolverPlugin`` / ``McfSolverPlugin``
+        / ``SinkhornSolverPlugin`` / ``AutoSolverPlugin``) are registered ahead
+        of this adapter and one always wins the ``solve_assignment``
+        ``dispatch_first`` slot; ``assignment_solver`` is validated to one of
+        those five so this method is unreachable on the production path. Kept
+        intact (byte-identical to ``solver_dispatch._solve_for_plugin``) only as
+        a defensive fallback; S2-12 deletes the whole ``LegacyAdapter`` class.
+
         Verbatim lift of the ``_assign_children_to_centroids`` call from the
         old ``compute_assignment``. Reads the ``_iter_n_ream_nc`` /
         ``_iter_n_ream_c`` scratch slots. Returns the assignment list.

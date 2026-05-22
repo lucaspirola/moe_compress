@@ -132,3 +132,19 @@ def _assign_children_to_centroids(
             "one of 'greedy', 'hungarian', 'mcf', 'auto', 'sinkhorn'."
         )
     return fn(cost, n_children, n_centroids, max_group_cap)
+
+
+def _solve_for_plugin(plugin, ctx, delta):
+    """Shared solve_assignment slot body — verbatim lift of
+    LegacyAdapter.solve_assignment. Assumes `plugin` survived
+    registry.enabled(), so plugin.assignment_solver == config.assignment_solver."""
+    from ...stage2_reap_ream import _assign_children_to_centroids
+    n_ream_nc = ctx.get("_iter_n_ream_nc")
+    n_ream_c = ctx.get("_iter_n_ream_c")
+    return _assign_children_to_centroids(
+        delta, n_ream_nc, n_ream_c, plugin.max_group_cap,
+        solver=plugin.assignment_solver,
+        sinkhorn_epsilon_init=plugin.sinkhorn_epsilon_init,
+        sinkhorn_epsilon_final=plugin.sinkhorn_epsilon_final,
+        sinkhorn_iters=plugin.sinkhorn_iters,
+    )

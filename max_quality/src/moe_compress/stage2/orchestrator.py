@@ -921,6 +921,11 @@ def run(
     from .plugins.ream_cost_post import ReamCostPostPlugin
     from .plugins.reap_scoring import ReapScoringPlugin
     from .plugins.skip_merge_floor import SkipMergeFloorPlugin
+    from .plugins.solver_auto import AutoSolverPlugin
+    from .plugins.solver_greedy import GreedySolverPlugin
+    from .plugins.solver_hungarian import HungarianSolverPlugin
+    from .plugins.solver_mcf import McfSolverPlugin
+    from .plugins.solver_sinkhorn import SinkhornSolverPlugin
 
     # The run-scope context is the root PipelineContext; each layer opens a
     # child() scope. Run-scope mutable scratchpad (cov_acc, merge_map,
@@ -1001,12 +1006,31 @@ def run(
     # and range-validated ``skip_merge_percentile`` local. ``registry.enabled``
     # drops it at the OFF sentinel (>= 100.0), leaving the adapter's sentinel
     # branch to service the slot.
+    # S2-8: the five solver plugins are registered AFTER the skip-merge floor
+    # plugin and BEFORE the adapter so the enabled one wins the
+    # ``solve_assignment`` ``dispatch_first`` slot over the (now-dead)
+    # ``LegacyAdapter.solve_assignment`` fallback. Each is constructed with the
+    # SAME parsed assignment knobs the adapter received. ``registry.enabled``
+    # gates each on ``assignment_solver``, leaving exactly one solver plugin
+    # (the one matching the configured solver) ahead of the adapter.
+    _solver_plugin_kwargs = dict(
+        max_group_cap=max_group_cap,
+        assignment_solver=assignment_solver,
+        sinkhorn_epsilon_init=sinkhorn_epsilon_init,
+        sinkhorn_epsilon_final=sinkhorn_epsilon_final,
+        sinkhorn_iters=sinkhorn_iters,
+    )
     registry = PluginRegistry([
         ReapScoringPlugin(),
         ReamCostPrePlugin(**_cost_plugin_kwargs),
         ReamCostPostPlugin(**_cost_plugin_kwargs),
         OutputSpaceCostPlugin(**_cost_plugin_kwargs),
         SkipMergeFloorPlugin(skip_merge_percentile=skip_merge_percentile),
+        GreedySolverPlugin(**_solver_plugin_kwargs),
+        HungarianSolverPlugin(**_solver_plugin_kwargs),
+        McfSolverPlugin(**_solver_plugin_kwargs),
+        SinkhornSolverPlugin(**_solver_plugin_kwargs),
+        AutoSolverPlugin(**_solver_plugin_kwargs),
         adapter,
     ])
     plugins = registry.enabled(config)

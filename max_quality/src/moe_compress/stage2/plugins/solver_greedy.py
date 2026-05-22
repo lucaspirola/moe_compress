@@ -114,22 +114,35 @@ def _assign_greedy(
 
 
 class GreedySolverPlugin:
-    """Plugin home for the greedy assignment solver (Task 13 scaffold).
+    """Plugin home for the greedy assignment solver.
 
-    Scaffold only: not yet on the live phase walk. The bump loop in
-    LegacyAdapter still calls `_assign_children_to_centroids`; this class
-    exists so T18 has a per-solver plugin to wire into the decomposed
-    `solve_assignment` phase. `is_enabled` selects this solver when
+    LIVE (S2-8): services the solve_assignment slot when assignment_solver
+    selects this solver. `is_enabled` selects this solver when
     `stage2_reap_ream.assignment_solver == "greedy"`.
     """
 
     name = "solver_greedy"
     paper = "Greedy descending-saliency assignment solver."
     config_key = "stage2_reap_ream.assignment_solver"
-    # () until a later task wires the live hook
-    reads: tuple[str, ...] = ()
+    # S2-8: the live solve_assignment slot reads the per-bump scratch slots.
+    reads: tuple[str, ...] = ("_iter_n_ream_nc", "_iter_n_ream_c")
     writes: tuple[str, ...] = ()
     provides: tuple[str, ...] = ()
+
+    def __init__(
+        self,
+        *,
+        max_group_cap: int = 0,
+        assignment_solver: str = "greedy",
+        sinkhorn_epsilon_init: float = 1.0,
+        sinkhorn_epsilon_final: float = 0.01,
+        sinkhorn_iters: int = 200,
+    ) -> None:
+        self.max_group_cap = max_group_cap
+        self.assignment_solver = assignment_solver
+        self.sinkhorn_epsilon_init = sinkhorn_epsilon_init
+        self.sinkhorn_epsilon_final = sinkhorn_epsilon_final
+        self.sinkhorn_iters = sinkhorn_iters
 
     def is_enabled(self, config: dict) -> bool:
         s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
@@ -139,8 +152,10 @@ class GreedySolverPlugin:
         return {}
 
     def solve_assignment(self, ctx: PipelineContext, delta: Any) -> Any | None:
-        """Wrap `_assign_greedy`. NOTE: not invoked by the current phase walk
-        (the bump loop calls `_assign_children_to_centroids` directly); kept as
-        a functional hook for the T18 decomposition. Returns None when delta is
-        not a usable cost matrix so `dispatch_first` can skip cleanly."""
-        return None
+        """Slot ``solve_assignment`` — child→centroid assignment solver.
+
+        Delegates to the shared ``_solve_for_plugin`` helper (verbatim lift of
+        ``LegacyAdapter.solve_assignment``). Reaches this plugin only when
+        ``registry.enabled`` kept it, i.e. ``assignment_solver == "greedy"``."""
+        from .solver_dispatch import _solve_for_plugin
+        return _solve_for_plugin(self, ctx, delta)
