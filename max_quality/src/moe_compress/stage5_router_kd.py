@@ -47,6 +47,13 @@ from .utils.model_io import (
 from .utils.runtime_monitor import snapshot_telemetry as _rt_snap, update as _rt_update
 from .utils.trackio_log import trackio_log as _trackio_log
 
+# RK-2: _freeze_non_routers relocated to router_kd/plugins/trainable_scope.
+# Re-imported so run() + external callers/tests (test_stage5_merge_repair.py)
+# keep their import paths.
+from .router_kd.plugins.trainable_scope import (  # noqa: F401
+    _freeze_non_routers,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -1552,11 +1559,6 @@ def _move_optimizer_state_to_device(optim: torch.optim.Optimizer, device) -> Non
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
                 state[k] = v.to(device)
-
-
-def _freeze_non_routers(model: nn.Module, trainable_patterns: list[str]) -> None:
-    for name, p in model.named_parameters():
-        p.requires_grad_(any(pat in name for pat in trainable_patterns))
 
 
 # ---------------------------------------------------------------------------
