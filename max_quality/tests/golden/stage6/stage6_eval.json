@@ -1,0 +1,24 @@
+{
+  "delta": {},
+  "measured_reduction": {
+    "expert_reduction_ratio": null,
+    "expert_student": 3072,
+    "expert_teacher": 0,
+    "total_reduction_ratio": null,
+    "total_student": 5024,
+    "total_teacher": 0
+  },
+  "overall_pass": false,
+  "student": {},
+  "teacher": {},
+  "thresholds": {
+    "skipped_checks": {
+      "arc_challenge_acc_drop_ok": "zero_shot eval disabled in config",
+      "hellaswag_acc_drop_ok": "zero_shot eval disabled in config",
+      "humaneval_pass_at_1_drop_ok": "generative eval disabled in config",
+      "math500_accuracy_drop_ok": "generative eval disabled in config",
+      "measured_reduction_ok": "total_reduction_ratio unavailable (teacher param count failed)",
+      "wikitext2_ppl_increase_ok": "wikitext2 eval disabled in config"
+    }
+  }
+}
