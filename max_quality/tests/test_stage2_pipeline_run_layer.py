@@ -400,8 +400,13 @@ def test_legacy_adapter_on_layer_teardown_clears_state(tiny_model, patched_stage
 # ---------------------------------------------------------------------------
 
 
-# The four fine-grained assignment slots ``_run_assignment`` drives via
-# ``PluginRegistry.dispatch_first``, in canonical per-bump call order.
+# The four fine-grained assignment slots ``_run_assignment`` drives per bump,
+# in canonical call order. ``compute_cost`` / ``apply_cost_mask`` /
+# ``solve_assignment`` are single-winner ``dispatch_first`` slots;
+# ``refine_assignment`` is a CHAIN (S2-9 — two-opt then EM, every enabled
+# plugin runs). The probe below is one chain link, so it still records exactly
+# one ``refine_assignment`` call per bump and the canonical four-slot order
+# holds.
 _ASSIGNMENT_SLOTS = (
     "compute_cost",
     "apply_cost_mask",
@@ -451,6 +456,12 @@ def test_run_assignment_dispatches_slots(tiny_model, patched_stage2, tmp_path):
     bump loop still produces a valid grouping. The adapter stays in the plugin
     list so ``_run_assignment``'s ``isinstance(p, LegacyAdapter)`` lookup for
     the run-scope scratchpad still resolves.
+
+    S2-9: ``refine_assignment`` is now a CHAIN — the probe is one chain link
+    and its ``refine_assignment`` delegates to ``adapter.refine_assignment``
+    (the neutered dead fallback, returns ``None``). The chain loop handles the
+    ``None`` cleanly, so the probe still records exactly one
+    ``refine_assignment`` call per bump and the canonical four-slot order holds.
     """
     adapter, plugins, ctx = _prepare_layer_for_assignment(
         tiny_model, patched_stage2, tmp_path)

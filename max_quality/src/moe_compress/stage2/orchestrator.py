@@ -375,11 +375,27 @@ def _run_assignment(plugins, ctx) -> None:
             assignment = PluginRegistry.dispatch_first(plugins, "solve_assignment", ctx, delta)
             assert assignment is not None, "solve_assignment slot returned None"
             # Slot 4: refine_assignment — 2-opt local search + EM refinement.
-            refined = PluginRegistry.dispatch_first(
-                plugins, "refine_assignment", ctx, assignment, delta
-            )
-            assert refined is not None, "refine_assignment slot returned None"
-            assignment, delta, em_rounds_done = refined
+            # S2-9: unlike the single-winner cost / mask / solve slots,
+            # refine_assignment is a CHAIN: BOTH refiners may run, in registry
+            # order (TwoOptRefinePlugin then EmRefinePlugin). The chain calls
+            # EVERY enabled plugin's refine_assignment — there is no
+            # dispatch_first early-return — so each refiner threads its result
+            # forward to the next. A plugin declining the slot (returns None,
+            # e.g. LegacyAdapter, which trails the chain as a dead fallback,
+            # or a refiner whose own gate is off this layer) is skipped.
+            # em_rounds_done was already reset to 0 at the top of this bump
+            # iteration (F1: the persisted JSON reflects the committed bump);
+            # the chain below only overwrites it when EmRefinePlugin runs.
+            for p in plugins:
+                hook = getattr(p, "refine_assignment", None)
+                if not callable(hook):
+                    continue
+                result = hook(ctx, assignment, delta)
+                if result is None:
+                    continue
+                assignment, delta, info = result
+                if "em_rounds" in info:
+                    em_rounds_done = int(info["em_rounds"])
             # The slots wrote effective_cost_alignment / effective_cost_asymmetric
             # / capacity_util_value back to ctx — pull them back into the loop's
             # layer-scope variables so the post-loop output emit sees them.
@@ -926,6 +942,8 @@ def run(
     from .plugins.solver_hungarian import HungarianSolverPlugin
     from .plugins.solver_mcf import McfSolverPlugin
     from .plugins.solver_sinkhorn import SinkhornSolverPlugin
+    from .plugins.two_opt_refine import TwoOptRefinePlugin
+    from .plugins.em_refine import EmRefinePlugin
 
     # The run-scope context is the root PipelineContext; each layer opens a
     # child() scope. Run-scope mutable scratchpad (cov_acc, merge_map,
@@ -1031,6 +1049,33 @@ def run(
         McfSolverPlugin(**_solver_plugin_kwargs),
         SinkhornSolverPlugin(**_solver_plugin_kwargs),
         AutoSolverPlugin(**_solver_plugin_kwargs),
+        # S2-9: the two refinement plugins are registered AFTER the solver
+        # plugins and BEFORE the adapter. refine_assignment is a CHAIN
+        # (two-opt THEN EM), so unlike the single-winner cost / mask / solve
+        # slots both may run — registry order is chain order, two-opt first.
+        # Each is constructed from the SAME parsed knobs the adapter received
+        # (notably the SAME cov_acc object). registry.enabled drops whichever
+        # refiner's gate is off; the neutered LegacyAdapter.refine_assignment
+        # trails as a dead fallback that always returns None.
+        TwoOptRefinePlugin(
+            two_opt_refine=two_opt_refine,
+            assignment_solver=assignment_solver,
+            max_group_cap=max_group_cap,
+        ),
+        EmRefinePlugin(
+            em_refinement_rounds=em_refinement_rounds,
+            em_convergence_break=em_convergence_break,
+            max_group_cap=max_group_cap,
+            assignment_solver=assignment_solver,
+            cost_whitening=cost_whitening,
+            cost_asymmetric=cost_asymmetric,
+            cost_topk_filter=cost_topk_filter,
+            skip_merge_percentile=skip_merge_percentile,
+            cov_acc=cov_acc,
+            sinkhorn_epsilon_init=sinkhorn_epsilon_init,
+            sinkhorn_epsilon_final=sinkhorn_epsilon_final,
+            sinkhorn_iters=sinkhorn_iters,
+        ),
         adapter,
     ])
     plugins = registry.enabled(config)

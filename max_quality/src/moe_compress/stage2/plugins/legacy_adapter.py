@@ -434,71 +434,17 @@ class LegacyAdapter:
         return assignment
 
     def refine_assignment(self, ctx: PipelineContext, asg, delta):
-        """Slot ``refine_assignment`` — 2-opt local search + EM refinement.
+        """Slot ``refine_assignment`` — DEAD FALLBACK as of S2-9.
 
-        Verbatim lift of the Direction-D 2-opt block (including the
-        greedy-only guard + ``elif`` warning) and the Stage 2 v2 EM
-        refinement from the old ``compute_assignment``. Returns
-        ``(assignment, delta, em_rounds_done)``.
+        ``refine_assignment`` is a CHAIN serviced by ``TwoOptRefinePlugin``
+        then ``EmRefinePlugin``, both registered ahead of this adapter; a chain
+        calls every enabled plugin's ``refine_assignment`` (no
+        ``dispatch_first`` early-return), so this adapter must decline the slot
+        — otherwise the 2-opt + EM work would run a SECOND time. Returns
+        ``None`` to decline. The method is kept (a drift-guard test asserts it
+        is ``callable``); S2-12 deletes the whole ``LegacyAdapter`` class.
         """
-        from ...stage2_reap_ream import _em_refine_assignment, _two_opt_refine
-
-        layer_ref = ctx.get("layer_ref")
-        ream_acc = ctx.get("ream_acc")
-        perm_cache = ctx.get("perm_cache")
-        cov_acc = self.cov_acc
-        freq = ctx.get("freq")
-        protected = set(ctx.get("protected"))
-        ream_centroid_ids = list(ctx.get("_iter_ream_centroid_ids"))
-        ream_noncentroid_ids = list(ctx.get("_iter_ream_noncentroid_ids"))
-        effective_cost_alignment = ctx.get("effective_cost_alignment")
-        effective_cost_asymmetric = ctx.get("effective_cost_asymmetric")
-
-        assignment = asg
-        # Direction D — greedy + 2-opt local refinement (spec §5 step 3.5).
-        # Strictly-improving local search; runs only for the greedy solver
-        # and only when the flag is set. It cannot regress vs. the greedy
-        # assignment, so the EM step below still sees a feasible input.
-        if self.two_opt_refine and self.assignment_solver == "greedy":
-            assignment = _two_opt_refine(
-                assignment, delta, self.max_group_cap,
-            )
-        elif self.two_opt_refine:
-            log.warning(
-                "two_opt_refine=true is ignored: it only applies to the "
-                "greedy assignment solver, but assignment_solver=%r.",
-                self.assignment_solver,
-            )
-        # Stage 2 v2 EM refinement (spec § 5 step 4T(e) / M4).
-        # Runs only when cost_alignment == "post": "pre" is a no-op
-        # (cost is centroid-independent) and "output" is deferred (EM
-        # would help but needs layer_inputs threaded — see
-        # _em_refine_assignment). It guards on this internally.
-        assignment, delta, em_rounds_done = _em_refine_assignment(
-            layer_ref,
-            initial_assignment=assignment,
-            initial_delta=delta,
-            skip_merge_percentile=self.skip_merge_percentile,
-            ream_centroid_ids=ream_centroid_ids,
-            ream_noncentroid_ids=ream_noncentroid_ids,
-            perm_cache=perm_cache,
-            ream_acc=ream_acc,
-            cov_acc=cov_acc if effective_cost_alignment == "post" else None,
-            freq=freq,
-            max_group_cap=self.max_group_cap,
-            cost_alignment=effective_cost_alignment,
-            cost_whitening=self.cost_whitening,
-            cost_asymmetric=effective_cost_asymmetric,
-            cost_topk_filter=self.cost_topk_filter,
-            assignment_solver=self.assignment_solver,
-            em_rounds=self.em_refinement_rounds,
-            em_break=self.em_convergence_break,
-            blacklisted_ids=protected,
-            sinkhorn_epsilon_init=self.sinkhorn_epsilon_init,
-            sinkhorn_epsilon_final=self.sinkhorn_epsilon_final,
-            sinkhorn_iters=self.sinkhorn_iters,
-        )
-        return assignment, delta, em_rounds_done
+        return None
 
     # ------------------------------------------------------------------
     # Phase 5: pre_merge_snapshot

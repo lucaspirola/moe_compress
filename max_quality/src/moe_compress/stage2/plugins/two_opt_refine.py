@@ -9,12 +9,11 @@ The monolith re-imports ``_two_opt_refine`` so external callers (tests, the
 ``MOE_STAGE2_LEGACY_LOOP=1`` legacy-loop path, ``LegacyAdapter``) keep their
 import paths working unchanged.
 
-``TwoOptRefinePlugin`` is a scaffold-only plugin — not yet on the live
-phase walk (``LegacyAdapter.compute_assignment`` still calls ``_two_opt_refine``
-directly inside the bump loop); it gives T18 a per-refiner plugin to wire into
-the decomposed ``refine_assignment`` phase. Circular-import note: this module
-imports only ``pipeline.base`` and ``pipeline.context``, neither of which
-imports ``stage2_reap_ream``.
+``TwoOptRefinePlugin`` is LIVE as of S2-9: it is the first link of the
+``refine_assignment`` chain (two-opt THEN EM), registered ahead of
+``EmRefinePlugin`` and the dead-fallback ``LegacyAdapter``. Circular-import
+note: this module imports only ``pipeline.base`` and ``pipeline.context``,
+neither of which imports ``stage2_reap_ream``.
 """
 from __future__ import annotations
 
@@ -148,32 +147,49 @@ def _two_opt_refine(
 
 
 class TwoOptRefinePlugin:
-    """Plugin home for Direction D — the 2-opt local-refinement pass (T14 scaffold).
+    """Plugin home for Direction D — the 2-opt local-refinement pass (LIVE, S2-9).
 
-    Scaffold only: not yet on the live phase walk. ``LegacyAdapter.compute_assignment``
-    still calls ``_two_opt_refine`` directly inside the bump loop, and the
-    ``MOE_STAGE2_LEGACY_LOOP=1`` path in ``stage2_reap_ream.run()`` does too.
-    This class exists so T18 has a per-refiner plugin to wire into the decomposed
-    ``refine_assignment`` phase.
+    LIVE: the first link of the ``refine_assignment`` chain (two-opt THEN EM).
+    The orchestrator's ``_run_assignment`` calls this plugin's
+    ``refine_assignment`` inside the bump loop, ahead of ``EmRefinePlugin`` and
+    the dead-fallback ``LegacyAdapter``.
 
     Config gate: enabled iff ``stage2_reap_ream.two_opt_refine`` is truthy.
     ``two_opt_refine`` is a plain bool (default ``False``).
 
     The greedy-only guard (``two_opt_refine`` is ignored unless
-    ``assignment_solver == "greedy"``) is orchestration and STAYS in
-    ``LegacyAdapter.compute_assignment``; T14 does not move it.
+    ``assignment_solver == "greedy"``) is applied INSIDE ``refine_assignment``,
+    NOT in ``is_enabled`` — a non-greedy solver still enables the plugin so the
+    ``elif`` warning fires once per layer, byte-identical to the old
+    ``LegacyAdapter.refine_assignment``.
     """
 
     name = "two_opt_refine"
     paper = "Direction D: greedy + 2-opt local refinement of the assignment."
     config_key = "stage2_reap_ream.two_opt_refine"
-    # () until a later task wires the live hook
+    # Two-opt operates purely on the assignment list, the cost matrix and the
+    # per-centroid cap (all passed as call args) — it reads no ctx slots.
     reads: tuple[str, ...] = ()
     writes: tuple[str, ...] = ()
     provides: tuple[str, ...] = ()
 
+    def __init__(
+        self,
+        *,
+        two_opt_refine: bool = False,
+        assignment_solver: str = "greedy",
+        max_group_cap: int = 0,
+    ) -> None:
+        self.two_opt_refine = two_opt_refine
+        self.assignment_solver = assignment_solver
+        self.max_group_cap = max_group_cap
+
     def is_enabled(self, config: dict) -> bool:
-        """True iff ``stage2_reap_ream.two_opt_refine`` is truthy."""
+        """True iff ``stage2_reap_ream.two_opt_refine`` is truthy.
+
+        Gates on ``two_opt_refine`` ALONE — the greedy-only check lives in
+        ``refine_assignment`` so the non-greedy ``elif`` warning still fires.
+        """
         s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
         return bool(s2.get("two_opt_refine"))
 
@@ -183,12 +199,26 @@ class TwoOptRefinePlugin:
     def refine_assignment(
         self, ctx: PipelineContext, asg: Any, delta: Any
     ) -> tuple[Any, Any, dict] | None:
-        """Documented no-op for T14.
+        """Chain link 1 — Direction D 2-opt local refinement (LIVE, S2-9).
 
-        The live refinement call still belongs to the LegacyAdapter bump loop
-        (and the legacy-loop path), which invoke ``_two_opt_refine`` directly.
-        Returning ``None`` makes ``PluginRegistry.dispatch_first`` skip this
-        plugin cleanly. T18 wires the real call here once ``compute_assignment``
-        is decomposed into the fine-grained phase walk.
+        Verbatim lift of the 2-opt block (greedy-only guard + ``elif``
+        warning) from the old ``LegacyAdapter.refine_assignment``. Returns
+        ``(asg, delta, {"two_opt": True})`` — the info dict carries NO
+        ``em_rounds`` key (only EM owns that count).
+
+        Always returns a non-``None`` tuple, including when
+        ``two_opt_refine`` is false at the instance level (``asg``/``delta``
+        unchanged) — the refine chain skips ``None`` returns, so a non-``None``
+        passthrough is uniform and harmless. In production the plugin is
+        excluded by :meth:`is_enabled` before a false-flag instance is ever
+        constructed; the false-flag path is exercised only by tests.
         """
-        return None
+        if self.two_opt_refine and self.assignment_solver == "greedy":
+            asg = _two_opt_refine(asg, delta, self.max_group_cap)
+        elif self.two_opt_refine:
+            log.warning(
+                "two_opt_refine=true is ignored: it only applies to the "
+                "greedy assignment solver, but assignment_solver=%r.",
+                self.assignment_solver,
+            )
+        return asg, delta, {"two_opt": True}

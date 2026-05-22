@@ -43,13 +43,6 @@ def test_is_enabled_false_when_block_missing():
     assert TwoOptRefinePlugin().is_enabled({}) is False
 
 
-# --- refine_assignment is a documented no-op (scaffold) -------------------
-def test_refine_assignment_returns_none():
-    """T14 scaffold: refine_assignment defers (returns None) so dispatch_first
-    skips it; the LegacyAdapter still owns the live 2-opt call."""
-    assert TwoOptRefinePlugin().refine_assignment(ctx=None, asg=[0], delta=None) is None
-
-
 # --- monkeypatch-drift guard (T9-T11 lesson) ------------------------------
 def test_no_stale_monkeypatch_of_two_opt_refine():
     """`_two_opt_refine` moved to pipeline.plugins.two_opt_refine in T14. Any

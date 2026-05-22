@@ -17,11 +17,9 @@ Circular-import note: this module imports only ``pipeline.base``,
 ``em_refine``. There is therefore no cycle at module load, and every import
 below is a plain module-top import (no function-scope late imports needed).
 
-``EmRefinePlugin`` is a scaffold-only plugin — not yet on the live
-phase walk (``LegacyAdapter.compute_assignment`` still calls
-``_em_refine_assignment`` directly inside the bump loop, and the
-``MOE_STAGE2_LEGACY_LOOP=1`` path does too); it gives T18 a per-refiner plugin
-to wire into the decomposed ``refine_assignment`` phase.
+``EmRefinePlugin`` is LIVE as of S2-9: it is the second link of the
+``refine_assignment`` chain (two-opt THEN EM), registered after
+``TwoOptRefinePlugin`` and ahead of the dead-fallback ``LegacyAdapter``.
 """
 from __future__ import annotations
 
@@ -237,11 +235,10 @@ def _em_refine_assignment(
 class EmRefinePlugin:
     """Plugin home for Stage 2 v2 EM refinement (spec § 5 step 4T(e) / M4).
 
-    T15 status: scaffold only — NOT on the live phase walk.
-    ``LegacyAdapter.compute_assignment`` still calls ``_em_refine_assignment``
-    directly inside the bump loop, and the ``MOE_STAGE2_LEGACY_LOOP=1`` path in
-    ``stage2_reap_ream.run()`` does too. This class exists so T18 has a
-    per-refiner plugin to wire into the decomposed ``refine_assignment`` phase.
+    LIVE as of S2-9: the second link of the ``refine_assignment`` chain
+    (two-opt THEN EM). The orchestrator's ``_run_assignment`` calls this
+    plugin's ``refine_assignment`` inside the bump loop, after
+    ``TwoOptRefinePlugin`` and ahead of the dead-fallback ``LegacyAdapter``.
 
     Config gate: enabled iff ``stage2_reap_ream.em_refinement_rounds`` is a
     positive integer. ``em_refinement_rounds`` is a numeric knob (default 0).
@@ -250,10 +247,44 @@ class EmRefinePlugin:
     name = "em_refine"
     paper = "Stage 2 v2 EM refinement loop (spec § 5 step 4T(e) / M4)."
     config_key = "stage2_reap_ream.em_refinement_rounds"
-    # () until a later task wires the live hook
-    reads: tuple[str, ...] = ()
+    # S2-9: the live refine_assignment slot reads the per-bump scratch slots
+    # the orchestrator publishes plus the per-layer cost-alignment slots.
+    reads: tuple[str, ...] = (
+        "layer_ref", "ream_acc", "perm_cache", "freq", "protected",
+        "_iter_ream_centroid_ids", "_iter_ream_noncentroid_ids",
+        "effective_cost_alignment", "effective_cost_asymmetric",
+    )
     writes: tuple[str, ...] = ()
     provides: tuple[str, ...] = ()
+
+    def __init__(
+        self,
+        *,
+        em_refinement_rounds: int = 0,
+        em_convergence_break: bool = True,
+        max_group_cap: int = 0,
+        assignment_solver: str = "greedy",
+        cost_whitening: str = "none",
+        cost_asymmetric: bool = False,
+        cost_topk_filter: int = 48,
+        skip_merge_percentile: float = 100.0,
+        cov_acc=None,
+        sinkhorn_epsilon_init: float = 1.0,
+        sinkhorn_epsilon_final: float = 0.01,
+        sinkhorn_iters: int = 200,
+    ) -> None:
+        self.em_refinement_rounds = em_refinement_rounds
+        self.em_convergence_break = em_convergence_break
+        self.max_group_cap = max_group_cap
+        self.assignment_solver = assignment_solver
+        self.cost_whitening = cost_whitening
+        self.cost_asymmetric = cost_asymmetric
+        self.cost_topk_filter = cost_topk_filter
+        self.skip_merge_percentile = skip_merge_percentile
+        self.cov_acc = cov_acc
+        self.sinkhorn_epsilon_init = sinkhorn_epsilon_init
+        self.sinkhorn_epsilon_final = sinkhorn_epsilon_final
+        self.sinkhorn_iters = sinkhorn_iters
 
     def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.em_refinement_rounds`` > 0.
@@ -275,13 +306,47 @@ class EmRefinePlugin:
     def refine_assignment(
         self, ctx: PipelineContext, asg: Any, delta: Any
     ) -> tuple[Any, Any, dict] | None:
-        """Documented no-op for T15.
+        """Chain link 2 — Stage 2 v2 EM refinement (LIVE, S2-9).
 
-        The live EM call still belongs to the LegacyAdapter bump loop (and the
-        ``MOE_STAGE2_LEGACY_LOOP=1`` legacy-loop path), which invoke
-        ``_em_refine_assignment`` directly. Returning ``None`` makes
-        ``PluginRegistry.dispatch_first`` skip this plugin cleanly. T18 wires
-        the real call here once ``compute_assignment`` is decomposed into the
-        fine-grained phase walk.
+        Verbatim lift of the EM block from the old
+        ``LegacyAdapter.refine_assignment``: reads the per-bump scratch slots
+        + per-layer cost-alignment slots off ``ctx``, calls
+        ``_em_refine_assignment`` directly, and returns
+        ``(assignment, delta, {"em_rounds": em_rounds_done})``. The orchestrator
+        reads ``em_rounds`` out of the info dict.
         """
-        return None
+        layer_ref = ctx.get("layer_ref")
+        ream_acc = ctx.get("ream_acc")
+        perm_cache = ctx.get("perm_cache")
+        freq = ctx.get("freq")
+        protected = set(ctx.get("protected"))
+        ream_centroid_ids = list(ctx.get("_iter_ream_centroid_ids"))
+        ream_noncentroid_ids = list(ctx.get("_iter_ream_noncentroid_ids"))
+        effective_cost_alignment = ctx.get("effective_cost_alignment")
+        effective_cost_asymmetric = ctx.get("effective_cost_asymmetric")
+
+        assignment, delta, em_rounds_done = _em_refine_assignment(
+            layer_ref,
+            initial_assignment=asg,
+            initial_delta=delta,
+            skip_merge_percentile=self.skip_merge_percentile,
+            ream_centroid_ids=ream_centroid_ids,
+            ream_noncentroid_ids=ream_noncentroid_ids,
+            perm_cache=perm_cache,
+            ream_acc=ream_acc,
+            cov_acc=self.cov_acc if effective_cost_alignment == "post" else None,
+            freq=freq,
+            max_group_cap=self.max_group_cap,
+            cost_alignment=effective_cost_alignment,
+            cost_whitening=self.cost_whitening,
+            cost_asymmetric=effective_cost_asymmetric,
+            cost_topk_filter=self.cost_topk_filter,
+            assignment_solver=self.assignment_solver,
+            em_rounds=self.em_refinement_rounds,
+            em_break=self.em_convergence_break,
+            blacklisted_ids=protected,
+            sinkhorn_epsilon_init=self.sinkhorn_epsilon_init,
+            sinkhorn_epsilon_final=self.sinkhorn_epsilon_final,
+            sinkhorn_iters=self.sinkhorn_iters,
+        )
+        return assignment, delta, {"em_rounds": em_rounds_done}
