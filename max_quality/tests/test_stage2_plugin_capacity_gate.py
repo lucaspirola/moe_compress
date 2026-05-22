@@ -16,13 +16,19 @@ from moe_compress.stage2.plugins.capacity_gate import (
 )
 
 
-def test_legacy_adapter_imports_from_capacity_gate():
-    """LegacyAdapter resolves the gate from the sibling module, not the monolith."""
+def test_ream_cost_plugin_imports_from_capacity_gate():
+    """The live cost path resolves the gate from the sibling capacity_gate
+    module — not the monolith — so monkeypatching ``stage2_reap_ream`` will
+    not silently no-op the gate for any of the three live cost plugins.
+
+    (Pre-S2-5 this guarded ``LegacyAdapter.compute_assignment``; S2-5
+    decomposed that and S2-6 moved the live cost path into
+    ``ream_cost._compute_cost_for_plugin``.)"""
     import inspect
-    import moe_compress.stage2.plugins.legacy_adapter as legacy_adapter
-    src = inspect.getsource(legacy_adapter.LegacyAdapter.compute_assignment)
+    import moe_compress.stage2.plugins.ream_cost as ream_cost_mod
+    src = inspect.getsource(ream_cost_mod._compute_cost_for_plugin)
     assert "from .capacity_gate import _pick_effective_alignment" in src
-    assert "_pick_effective_alignment," not in src  # not in the monolith tuple
+    assert "from ...stage2_reap_ream import _pick_effective_alignment" not in src
 
 
 # --- CapacityGatePlugin contract -------------------------------------------

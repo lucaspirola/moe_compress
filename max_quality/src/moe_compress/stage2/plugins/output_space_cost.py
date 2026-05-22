@@ -20,11 +20,11 @@ scope*, kept symmetric with the ``post`` branch's ``_post_alignment_cost``
 import; either could be module-top now, but symmetry costs nothing once the
 module is cached.
 
-``OutputSpaceCostPlugin`` is the future plugin home for the ``output`` cost
-path. For T10 it is an inert shell: its ``compute_cost`` hook is a documented
-no-op because the legacy bump loop still calls ``_ream_cost_matrix`` directly.
-Wiring ``compute_cost`` into the phase walk is deferred until the assignment
-phase is decomposed (T13+).
+``OutputSpaceCostPlugin`` is the live plugin home for the ``output`` cost path.
+S2-6 wired its ``compute_cost`` hook into the ``compute_cost`` assignment slot
+via the shared ``ream_cost._compute_cost_for_plugin`` helper: when
+``cost_alignment`` resolves to ``"output"`` this plugin is registered ahead of
+the ``LegacyAdapter`` and wins ``PluginRegistry.dispatch_first`` for the slot.
 """
 from __future__ import annotations
 
@@ -41,6 +41,10 @@ from ..permutation_align import (
     _PermAlignCache,  # noqa: F401 — resolves the string type hint
     _permutation_align_to_centroid,
 )
+# Shared cost-plugin metadata (reads/writes slot tuples). ream_cost imports
+# output_space_cost only at function scope, so this module-top import is
+# cycle-free.
+from .ream_cost import _COST_PLUGIN_READS, _COST_PLUGIN_WRITES
 
 
 # ---------------------------------------------------------------------------
@@ -296,22 +300,47 @@ def _output_space_cost(
 
 
 class OutputSpaceCostPlugin:
-    """Plugin home for the REAM output-space (Direction C) cost path.
+    """Live plugin home for the REAM output-space (Direction C) cost path.
 
-    T10 status: inert shell. The legacy bump loop still calls
-    ``_ream_cost_matrix`` directly, so this plugin's ``compute_cost`` hook is a
-    deliberate no-op. The plugin exists now so the ``output`` path has a stable
-    home; wiring ``compute_cost`` into the phase walk is deferred until the
-    assignment phase is decomposed (T13+).
+    S2-6 wired ``compute_cost`` into the ``compute_cost`` assignment slot. When
+    ``cost_alignment`` resolves to ``"output"`` the orchestrator registers this
+    plugin ahead of the ``LegacyAdapter`` so it wins
+    ``PluginRegistry.dispatch_first`` for the slot. The slot body — the
+    capacity-util gate + ``_ream_cost_matrix`` call — lives in the shared
+    module-level helper ``ream_cost._compute_cost_for_plugin`` (one source of
+    truth for all three cost plugins; the gate may downgrade ``output``→``pre``
+    per layer on slack-capacity layers, which is correct).
     """
 
     name = "output_space_cost"
     paper = "Direction C: output-space REAM merge-cost matrix builder."
     config_key = "stage2_reap_ream.cost_alignment"
-    # () until a later task wires the live hook
-    reads: tuple[str, ...] = ()
-    writes: tuple[str, ...] = ()
+    reads: tuple[str, ...] = _COST_PLUGIN_READS
+    writes: tuple[str, ...] = _COST_PLUGIN_WRITES
     provides: tuple[str, ...] = ()
+
+    def __init__(
+        self,
+        *,
+        cov_acc,
+        max_group_cap: int,
+        capacity_util_threshold: float,
+        cost_alignment_cfg: str,
+        cost_asymmetric: bool,
+        cost_whitening: str,
+        cost_topk_filter: int,
+        cost_output_token_cap: int,
+    ) -> None:
+        # Store every knob the shared compute_cost body reads. NO logic — a
+        # faithful mirror of the matching subset of LegacyAdapter.__init__.
+        self.cov_acc = cov_acc
+        self.max_group_cap = max_group_cap
+        self.capacity_util_threshold = capacity_util_threshold
+        self.cost_alignment_cfg = cost_alignment_cfg
+        self.cost_asymmetric = cost_asymmetric
+        self.cost_whitening = cost_whitening
+        self.cost_topk_filter = cost_topk_filter
+        self.cost_output_token_cap = cost_output_token_cap
 
     def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.cost_alignment`` resolves to ``"output"``.
@@ -328,9 +357,11 @@ class OutputSpaceCostPlugin:
         return {}
 
     def compute_cost(self, ctx: PipelineContext) -> Any | None:
-        """No-op for T10. See class docstring.
+        """Slot ``compute_cost`` — capacity-util gate + REAM cost matrix.
 
-        Returning ``None`` makes ``PluginRegistry.dispatch_first`` skip this
-        plugin so the legacy bump loop remains the sole cost-matrix producer.
+        Delegates to the shared ``ream_cost._compute_cost_for_plugin`` helper
+        (same body as the other two cost plugins). Returns the cost matrix
+        ``delta``.
         """
-        return None
+        from .ream_cost import _compute_cost_for_plugin
+        return _compute_cost_for_plugin(self, ctx)

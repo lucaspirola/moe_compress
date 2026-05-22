@@ -281,6 +281,14 @@ class LegacyAdapter:
     def compute_cost(self, ctx: PipelineContext):
         """Slot ``compute_cost`` — capacity-util gate + REAM cost matrix.
 
+        DEAD FALLBACK as of S2-6: the three live cost plugins
+        (``ReamCostPrePlugin`` / ``ReamCostPostPlugin`` / ``OutputSpaceCostPlugin``)
+        are now registered ahead of this adapter and win the ``compute_cost``
+        ``dispatch_first`` slot for every configured ``cost_alignment``, so this
+        method is never reached on the production path. It is kept intact
+        (byte-identical to ``ream_cost._compute_cost_for_plugin``) only as a
+        defensive fallback; S2-12 deletes the whole ``LegacyAdapter`` class.
+
         Verbatim lift of the capacity-utilization gate + ``_ream_cost_matrix``
         call from the old ``compute_assignment`` bump-loop ``if not b_fail``
         branch. Writes ``capacity_util_value`` / ``effective_cost_alignment`` /

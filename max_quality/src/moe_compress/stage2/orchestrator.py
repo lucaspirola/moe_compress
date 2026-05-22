@@ -916,6 +916,9 @@ def run(
     from ..pipeline.registry import PluginRegistry
     from ..tools.phase_walker import walk_phases
     from .plugins.legacy_adapter import LegacyAdapter
+    from .plugins.output_space_cost import OutputSpaceCostPlugin
+    from .plugins.ream_cost import ReamCostPrePlugin
+    from .plugins.ream_cost_post import ReamCostPostPlugin
     from .plugins.reap_scoring import ReapScoringPlugin
 
     # The run-scope context is the root PipelineContext; each layer opens a
@@ -972,7 +975,31 @@ def run(
     # _profile_layer via on_profile). ``walk_phases`` dispatches each phase to
     # every plugin in sequence order, so listing ReapScoringPlugin first
     # satisfies the dependency.
-    registry = PluginRegistry([ReapScoringPlugin(), adapter])
+    #
+    # S2-6: the three live cost plugins are registered BETWEEN ReapScoringPlugin
+    # and the adapter so they win the ``compute_cost`` ``dispatch_first`` slot
+    # over the (now-dead) ``LegacyAdapter.compute_cost`` fallback. Each is
+    # constructed with the SAME parsed cost knobs + the SAME ``cov_acc`` object
+    # the adapter received. ``registry.enabled(config)`` drops the two cost
+    # plugins whose ``is_enabled`` gate is False, leaving exactly one cost
+    # plugin (the one matching ``cost_alignment``) ahead of the adapter.
+    _cost_plugin_kwargs = dict(
+        cov_acc=cov_acc,
+        max_group_cap=max_group_cap,
+        capacity_util_threshold=capacity_util_threshold,
+        cost_alignment_cfg=cost_alignment_cfg,
+        cost_asymmetric=cost_asymmetric,
+        cost_whitening=cost_whitening,
+        cost_topk_filter=cost_topk_filter,
+        cost_output_token_cap=cost_output_token_cap,
+    )
+    registry = PluginRegistry([
+        ReapScoringPlugin(),
+        ReamCostPrePlugin(**_cost_plugin_kwargs),
+        ReamCostPostPlugin(**_cost_plugin_kwargs),
+        OutputSpaceCostPlugin(**_cost_plugin_kwargs),
+        adapter,
+    ])
     plugins = registry.enabled(config)
     walk_phases(("on_run_setup",), plugins, run_ctx)
     for k, layer_ref in enumerate(moe_layers):

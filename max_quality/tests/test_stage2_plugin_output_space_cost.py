@@ -1,17 +1,45 @@
-"""Task 10 — output-space (Direction C) cost plugin module.
+"""Task 10 / S2-6 — output-space (Direction C) cost plugin module.
 
-Pins the ``OutputSpaceCostPlugin.is_enabled`` truth table. Algorithm coverage
-is provided by the existing ``test_stage2_output_cost.py`` suite. Also guards
-against monkeypatch drift: no test may patch one of the 4 moved symbols via
-the monolith namespace only.
+Pins the ``OutputSpaceCostPlugin.is_enabled`` truth table and (S2-6) the live
+``compute_cost`` slot. Algorithm coverage is provided by the existing
+``test_stage2_output_cost.py`` suite. Also guards against monkeypatch drift:
+no test may patch one of the 4 moved symbols via the monolith namespace only.
 """
 from __future__ import annotations
 
 import pathlib
 
+import numpy as np
 import pytest
 
+from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage2.plugins.output_space_cost import OutputSpaceCostPlugin
+from moe_compress.utils.activation_hooks import (
+    InputCovarianceAccumulator,
+    ReamCostAccumulator,
+)
+from moe_compress.utils.model_io import iter_moe_layers
+
+
+def _cost_kwargs(cov_acc=None, *, cost_alignment_cfg="output"):
+    """Representative cost knobs — same shape the orchestrator passes.
+
+    ``max_group_cap=0`` (uncapped) makes the capacity gate treat every layer
+    as fully slack (u = 0); ``capacity_util_threshold=1.0`` then downgrades the
+    configured ``output`` -> ``pre`` per layer (the documented gate behaviour),
+    so the live ``compute_cost`` slot runs the cheap symmetric path without
+    needing the layer-input calibration buffer.
+    """
+    return dict(
+        cov_acc=cov_acc if cov_acc is not None else InputCovarianceAccumulator(),
+        max_group_cap=0,
+        capacity_util_threshold=1.0,
+        cost_alignment_cfg=cost_alignment_cfg,
+        cost_asymmetric=False,
+        cost_whitening="none",
+        cost_topk_filter=2,
+        cost_output_token_cap=8,
+    )
 
 
 def test_output_branch_uses_plugin_module():
@@ -34,26 +62,65 @@ def test_output_branch_uses_plugin_module():
 ])
 def test_is_enabled_explicit(cost_alignment, expected):
     cfg = {"stage2_reap_ream": {"cost_alignment": cost_alignment}}
-    assert OutputSpaceCostPlugin().is_enabled(cfg) is expected
+    assert OutputSpaceCostPlugin(**_cost_kwargs()).is_enabled(cfg) is expected
 
 
 def test_is_enabled_default_missing_key():
     """Missing `cost_alignment` -> default 'pre' -> output plugin disabled."""
-    assert OutputSpaceCostPlugin().is_enabled({"stage2_reap_ream": {}}) is False
+    assert OutputSpaceCostPlugin(**_cost_kwargs()).is_enabled(
+        {"stage2_reap_ream": {}}) is False
 
 
 def test_is_enabled_missing_block():
     """Missing `stage2_reap_ream` block -> default 'pre' -> output disabled."""
-    assert OutputSpaceCostPlugin().is_enabled({}) is False
-
-
-def test_compute_cost_is_noop():
-    """T10: compute_cost is a documented no-op (legacy bump loop still owns it)."""
-    assert OutputSpaceCostPlugin().compute_cost(ctx=None) is None  # type: ignore[arg-type]
+    assert OutputSpaceCostPlugin(**_cost_kwargs()).is_enabled({}) is False
 
 
 def test_plugin_name():
     assert OutputSpaceCostPlugin.name == "output_space_cost"
+
+
+# --- S2-6: the live compute_cost slot ---------------------------------------
+
+def test_compute_cost_is_live_slot(tiny_model):
+    """S2-6: `OutputSpaceCostPlugin.compute_cost` is a live slot — it runs the
+    capacity-util gate + `_ream_cost_matrix` and returns a finite cost matrix
+    of the right shape, NOT None.
+
+    With ``max_group_cap=0`` + ``capacity_util_threshold=1.0`` the capacity
+    gate downgrades the configured ``output`` -> ``pre`` (the heavyweight
+    output-space path is gated identically to ``post``), so the cheap symmetric
+    path runs and every entry is finite.
+    """
+    from moe_compress.stage2.permutation_align import _PermAlignCache
+
+    layer_ref = list(iter_moe_layers(tiny_model))[0]
+    n_exp = layer_ref.num_routed_experts
+    noncentroid_ids = [0, 1]
+    centroid_ids = [e for e in range(n_exp) if e not in (0, 1)]
+
+    ctx = PipelineContext()
+    ctx.set("layer_ref", layer_ref)
+    ctx.set("ream_acc", ReamCostAccumulator())
+    ctx.set("perm_cache", _PermAlignCache())
+    ctx.set("layer_input_acc", None)
+    ctx.set("freq", {e: 1 for e in range(n_exp)})
+    ctx.set("protected", ())
+    ctx.set("_iter_ream_centroid_ids", tuple(centroid_ids))
+    ctx.set("_iter_ream_noncentroid_ids", tuple(noncentroid_ids))
+    ctx.set("_iter_n_ream_c", len(centroid_ids))
+    ctx.set("_iter_n_ream_nc", len(noncentroid_ids))
+
+    plugin = OutputSpaceCostPlugin(**_cost_kwargs())
+    delta = plugin.compute_cost(ctx)
+
+    assert delta is not None
+    assert isinstance(delta, np.ndarray)
+    assert delta.shape == (len(noncentroid_ids), len(centroid_ids))
+    assert np.isfinite(delta).all()
+    # max_group_cap=0 -> capacity gate downgrades the configured 'output' to
+    # 'pre' (heavyweight output path gated like 'post' on slack layers).
+    assert ctx.get("effective_cost_alignment") == "pre"
 
 
 # --- monkeypatch-drift guard (the T9 lesson) --------------------------------
