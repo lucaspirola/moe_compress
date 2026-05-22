@@ -46,7 +46,9 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S2-9  Wire refinement plugins live — committed b269495
 - [x] S2-10 Wire CapacityGatePlugin live — committed df0a406
 - [x] S2-11 Wire post-merge plugins live — ExpertDistill (merge phase) + MergeHeal (post_merge phase)
-- [ ] S2-12 Delete LegacyAdapter
+- [x] S2-12a Introduce LayerMergePlugin (6 live hooks), wire live, neuter LegacyAdapter
+- [ ] S2-12b Delete legacy_adapter.py + remove orchestrator references
+- [ ] S2-12c Retarget legacy_adapter-referencing tests
 - [ ] S2-13 Expose STAGE2 Stage object (+ rewrite stage2_plugin_guide.md — mid-migration stale)
 
 ## Stage 3 — SVD (Part 5.1)

@@ -208,14 +208,11 @@ def _run_assignment(plugins, ctx) -> None:
 
     Reproduces the body of the retired ``LegacyAdapter.compute_assignment``
     line-for-line, EXCEPT the per-bump cost / mask / solve / refine work is now
-    reached via ``PluginRegistry.dispatch_first`` over the four fine-grained
-    slots ``compute_cost`` / ``apply_cost_mask`` / ``solve_assignment`` /
-    ``refine_assignment``. Because the Stage-2 registry is
-    ``[ReapScoringPlugin(), adapter]`` and ReapScoringPlugin declares none of
-    those slots, every dispatch lands on ``LegacyAdapter``'s extracted methods
-    — behaviour is byte-identical to the pre-S2-5 monolithic hook. S2-6+ wires
-    the real cost / solver / refine plugins ahead of the adapter so they win
-    the slot.
+    reached via ``PluginRegistry.dispatch_first`` over the fine-grained slots
+    ``select_alignment`` / ``compute_cost`` / ``apply_cost_mask`` /
+    ``solve_assignment`` / ``refine_assignment``. S2-6..S2-10 wired the real
+    capacity-gate / cost / solver / refinement plugins, which win every slot;
+    behaviour is byte-identical to the pre-S2-5 monolithic hook.
 
     ``_run_assignment`` owns the bump-loop control flow, the b_fail / c_fail
     gates, the orphan-promotion grouping, and the final ``ctx.set`` of all
@@ -223,7 +220,7 @@ def _run_assignment(plugins, ctx) -> None:
     ``compute_assignment`` carried.
     """
     from ..pipeline.registry import PluginRegistry
-    from .plugins.legacy_adapter import LegacyAdapter
+    from .plugins.layer_merge import LayerMergePlugin
     from .plugins.reap_scoring import select_centroids_by_reap
 
     layer_ref = ctx.get("layer_ref")
@@ -238,10 +235,10 @@ def _run_assignment(plugins, ctx) -> None:
     freq = ctx.get("freq")
     n_experts = ctx.get("n_experts")
 
-    # The LegacyAdapter instance owns the run-scope scratchpad (blacklist,
-    # _layer_mean_costs). Locate it in the plugin list — it is the plugin
-    # exposing the four assignment slots.
-    adapter = next(p for p in plugins if isinstance(p, LegacyAdapter))
+    # The LayerMergePlugin instance owns the run-scope scratchpad (blacklist,
+    # _layer_mean_costs). Locate it in the plugin list — S2-12a relocated the
+    # run-scope state off ``LegacyAdapter`` onto this always-on plugin.
+    adapter = next(p for p in plugins if isinstance(p, LayerMergePlugin))
     _layer_mean_costs = adapter._layer_mean_costs
 
     protected = set(adapter.blacklist.get(layer_ref.layer_idx, []))
@@ -939,6 +936,7 @@ def run(
     from ..tools.phase_walker import walk_phases
     from .plugins.capacity_gate import CapacityGatePlugin
     from .plugins.expert_distill import ExpertDistillPlugin
+    from .plugins.layer_merge import LayerMergePlugin
     from .plugins.legacy_adapter import LegacyAdapter
     from .plugins.merge_heal import MergeHealPlugin
     from .plugins.output_space_cost import OutputSpaceCostPlugin
@@ -956,8 +954,8 @@ def run(
 
     # The run-scope context is the root PipelineContext; each layer opens a
     # child() scope. Run-scope mutable scratchpad (cov_acc, merge_map,
-    # _layer_mean_costs, partial_dir) lives on the LegacyAdapter instance
-    # instead — the adapter is constructed once per run() invocation and is
+    # _layer_mean_costs, partial_dir) lives on the LayerMergePlugin instance
+    # instead — the plugin is constructed once per run() invocation and is
     # the natural home for single-run-scoped state.
     run_ctx = PipelineContext()
     run_ctx.set("model", model)
@@ -970,7 +968,7 @@ def run(
     run_ctx.set("partial_dir", partial_dir)
     # The "device" ctx slot holds the *stringified* device ("cpu" / "cuda:0"),
     # not a torch.device — the original device object is passed separately to
-    # LegacyAdapter (the `device=device` kwarg below). Readers of
+    # the stage-2 plugins (the `device=device` kwarg below). Readers of
     # run_ctx.get("device") must not expect a torch.device.
     run_ctx.set("device", str(device) if device is not None else "cpu")
     adapter = LegacyAdapter(
@@ -1002,6 +1000,27 @@ def run(
         expert_distill_plateau_eps=expert_distill_plateau_eps,
         per_layer_target=per_layer_target, blacklist=blacklist,
         artifacts_dir=artifacts_dir, device=device,
+    )
+    # S2-12a: the per-layer merge spine. ``LayerMergePlugin`` now owns the SIX
+    # live phase hooks (on_layer_setup / on_profile / merge / post_merge /
+    # write_artifacts / on_layer_teardown) that ``LegacyAdapter`` used to carry.
+    # Constructed from the SAME parsed run() locals — the knob/scratchpad
+    # superset = (a) every knob the 6 live hooks read off ``self`` PLUS (b) the
+    # eight attributes ``_run_assignment`` reads off the plugin instance.
+    layer_merge = LayerMergePlugin(
+        s2_cfg=s2, heal_cfg=heal_cfg,
+        batches=batches, model=model,
+        cov_acc=cov_acc, merge_map=merge_map,
+        layer_mean_costs=_layer_mean_costs,
+        partial_dir=partial_dir,
+        max_group_cap=max_group_cap, cost_sigma=cost_sigma,
+        cost_bump_ratio=cost_bump_ratio, min_active_tokens=min_active_tokens,
+        assignment_solver=assignment_solver, cost_alignment_cfg=cost_alignment_cfg,
+        cost_output_token_cap=cost_output_token_cap,
+        cost_asymmetric=cost_asymmetric,
+        expert_distill_steps=expert_distill_steps,
+        expert_distill_token_cap=expert_distill_token_cap,
+        blacklist=blacklist, device=device,
     )
     # Registration order matters: ReapScoringPlugin.on_layer_setup must run
     # BEFORE LegacyAdapter.on_layer_setup (which now reads ctx.reap_acc into
@@ -1098,6 +1117,15 @@ def run(
             sinkhorn_epsilon_final=sinkhorn_epsilon_final,
             sinkhorn_iters=sinkhorn_iters,
         ),
+        # S2-12a: the per-layer merge spine. ``LayerMergePlugin`` carries the
+        # SIX live phase hooks relocated out of ``LegacyAdapter``. It is
+        # registered IMMEDIATELY BEFORE ``adapter`` so the phase-major walk
+        # lands its hooks exactly where the adapter's used to. ``adapter`` stays
+        # in the registry this step as pure dead code (its ``name`` differs —
+        # ``legacy_adapter`` vs ``layer_merge`` — so no dup-name ValueError);
+        # the byte-identical gate proves the relocation is exact before S2-12b
+        # deletes the ``LegacyAdapter`` class.
+        layer_merge,
         adapter,
         # S2-11: the per-merge-group expert distillation + per-layer merge-heal
         # plugins are registered AFTER the adapter — the LAST elements, reversed
