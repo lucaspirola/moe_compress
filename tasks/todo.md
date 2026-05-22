@@ -56,7 +56,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S3-0  Capture stage-3 golden — test_stage3_golden_snapshot.py (rank_map.json, fp32+bf16)
 - [x] S3-1  Scaffold stage3/ package — __init__/context/orchestrator/plugins, run delegates to legacy
 - [x] S3-2  covariance_collection plugin — _collect_covariances + _load_stage2_covariance relocated
-- [ ] S3-3  d_rank_allocate plugin
+- [x] S3-3  d_rank_allocate plugin — _GroupStats/_group_stat/_pad/_compute_T_budget/_d_rank_allocate relocated
 - [ ] S3-4  swift_svd_alpha plugin
 - [ ] S3-5  aa_svd_factor plugin
 - [ ] S3-6  block_refine plugin

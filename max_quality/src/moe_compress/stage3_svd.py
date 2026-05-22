@@ -60,15 +60,15 @@ from .stage3.plugins.covariance_collection import (  # noqa: F401
     _load_stage2_covariance,
 )
 
-
-@dataclass
-class _GroupStats:
-    d_out: int
-    d_in: int
-    n_experts: int
-    singular_values_mean: torch.Tensor
-    effective_rank: float
-    omega: float
+# S3-3: D-Rank group-stats + rank allocation relocated to
+# stage3/plugins/d_rank_allocate. Re-imported so run() keeps its import paths.
+from .stage3.plugins.d_rank_allocate import (  # noqa: F401
+    _GroupStats,
+    _group_stat,
+    _pad,
+    _compute_T_budget,
+    _d_rank_allocate,
+)
 
 
 def run(
@@ -649,144 +649,9 @@ def run(
 # ---------------------------------------------------------------------------
 # Group stats + allocations
 # ---------------------------------------------------------------------------
-
-
-def _group_stat(n_experts: int, bank, A_g: torch.Tensor | None = None) -> _GroupStats:
-    """Per-group statistics for D-Rank allocation.
-
-    Spec §6 Phase B.1/B.2 (paper 2509.25622 Eq. 1): the effective rank must
-    be computed from the **whitened** SVD `sv(S_g · W_g^T)` where
-    `S_g = chol(A_g)` (FP64) and `A_g = X_g^T X_g` is the group-average
-    pre-prune input covariance from Stage 2. Raw `sv(W)` is not
-    input-distribution-aware.
-
-    When `A_g` is None (no Stage 2 covariance available), fall back to raw
-    `sv(W)` and warn — this is a degraded path that should only fire on
-    test fixtures or Stage 2 reruns.
-    """
-    d_out, d_in = bank.shape()
-    L_A = None
-    if A_g is not None:
-        try:
-            A64 = A_g.to(torch.float64)
-            A64 = 0.5 * (A64 + A64.T)
-            jitter = 1e-6 * A64.diag().mean().clamp_min(1e-12) * torch.eye(
-                A64.shape[0], dtype=torch.float64, device=A64.device)
-            L_A = torch.linalg.cholesky(A64 + jitter).to(torch.float32)
-        except Exception as exc:
-            log.warning("D-Rank whitening: Cholesky on A_g failed (%s); "
-                        "falling back to raw SVD for this group.", exc)
-            L_A = None
-
-    svs: list[torch.Tensor] = []
-    for e in range(n_experts):
-        W = bank.get(e).detach().to(torch.float32)  # [d_out, d_in]
-        if L_A is not None:
-            # Spec §6 Step B.2: σ_i = sv(S_g · W_g^T). PyTorch stores W as
-            # [d_out × d_in]; transpose to [d_in × d_out] then S @ that
-            # gives the whitened operator whose singular values match the
-            # paper's whitened spectrum.
-            M = L_A @ W.T  # [d_in, d_out]
-            s = torch.linalg.svdvals(M)
-        else:
-            s = torch.linalg.svdvals(W)
-        svs.append(_pad(s, min(d_out, d_in)))
-    mean_s = torch.stack(svs).mean(0)
-    p = mean_s ** 2
-    p = p / p.sum().clamp(min=1e-12)
-    eff_rank = float(torch.exp(-(p * p.clamp(min=1e-12).log()).sum()).item())
-    omega = n_experts * (d_out + d_in)
-    return _GroupStats(d_out, d_in, n_experts, mean_s, eff_rank, omega)
-
-
-def _pad(x: torch.Tensor, n: int) -> torch.Tensor:
-    if x.numel() >= n:
-        return x[:n]
-    return torch.cat([x, torch.zeros(n - x.numel(), device=x.device, dtype=x.dtype)])
-
-
-def _compute_T_budget(group_stats: dict, svd_rank_ratio: float) -> int:
-    """T_budget solved so that reconstructed weight cost is ~= (1 - svd_rank_ratio) · original."""
-    total_full = 0
-    costs: list[float] = []
-    for g, s in group_stats.items():
-        total_full += s.n_experts * s.d_out * s.d_in
-        costs.append(s.n_experts * (s.d_out + s.d_in))
-    target_params = total_full * (1.0 - svd_rank_ratio)
-    avg_cost = np.mean(costs) if costs else 1.0
-    return int(max(1, target_params / max(avg_cost, 1.0)))
-
-
-def _d_rank_allocate(
-    group_stats: dict,
-    T_budget: int,
-    proj_weights: dict[str, float] | None = None,
-) -> dict:
-    """Distribute T_budget rank across all (layer, matrix) groups.
-
-    proj_weights biases the allocation toward specific projection types without
-    changing the total budget — e.g. {"gate_proj": 1.75, "up_proj": 1.35,
-    "down_proj": 0.35} gives gate/up more rank at down_proj's expense.
-    """
-    pw = proj_weights or {}
-
-    def _weight(g, s):
-        return math.sqrt(s.effective_rank / s.omega) * pw.get(g[1], 1.0)
-
-    def _cap(s):
-        return min(s.d_out, s.d_in) - 1
-
-    denom = sum(_weight(g, s) for g, s in group_stats.items()) or 1.0
-    raw: dict = {g: _weight(g, s) * T_budget / denom for g, s in group_stats.items()}
-    out: dict = {g: max(1, min(int(round(raw[g])), _cap(s)))
-                 for g, s in group_stats.items()}
-
-    # Correction: rounding+clamping perturbs the total away from T_budget.
-    # Redistribute the residual to under-allocated groups (those still below
-    # their cap) up to a configurable tolerance.
-    target = int(T_budget)
-    actual = sum(out.values())
-    diff = target - actual
-    if diff != 0:
-        # Sort by (cap_room when adding, allocated rank when subtracting) so
-        # the largest groups absorb most of the correction proportionally.
-        sign = 1 if diff > 0 else -1
-        # Iterate while there's residual to assign and at least one group
-        # can accept it. Bounded by T_budget iterations as a safety.
-        for _ in range(abs(diff)):
-            if sign > 0:
-                # Pick the group with the largest fractional remainder that
-                # still has room below its cap.
-                cands = [
-                    (raw[g] - out[g], g) for g, s in group_stats.items()
-                    if out[g] < _cap(s)
-                ]
-                if not cands:
-                    break
-                cands.sort(reverse=True)
-                _, g = cands[0]
-                out[g] += 1
-            else:
-                # Pick the group with the smallest fractional remainder that
-                # still has room above the floor (rank ≥ 1).
-                cands = [(raw[g] - out[g], g) for g in group_stats if out[g] > 1]
-                if not cands:
-                    break
-                cands.sort()
-                _, g = cands[0]
-                out[g] -= 1
-
-    final_total = sum(out.values())
-    drift = abs(final_total - target)
-    if drift > 0:
-        log.warning("D-Rank budget conservation: residual drift %d after "
-                    "correction (target=%d, actual=%d) — bounded by per-group "
-                    "rank caps", drift, target, final_total)
-    elif diff != 0:
-        log.info("D-Rank budget redistributed %+d ranks across groups "
-                 "(target=%d, conserved)", diff, target)
-    return out
-
+# S3-3: ``_GroupStats`` / ``_group_stat`` / ``_pad`` / ``_compute_T_budget`` /
+# ``_d_rank_allocate`` relocated to ``stage3/plugins/d_rank_allocate`` and
+# re-imported above (see the S3-3 ``# noqa: F401`` block).
 
 
 def _snapshot_originals(
