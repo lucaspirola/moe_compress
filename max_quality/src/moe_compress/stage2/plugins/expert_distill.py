@@ -14,17 +14,20 @@ Circular-import note: this module imports only ``moe_compress.utils.model_io``,
 ``expert_distill``. There is therefore no cycle at module load, and every
 import below is a plain module-top import (no function-scope late imports).
 
-``ExpertDistillPlugin`` is a scaffold-only plugin — not yet on the
-live phase walk. ``LegacyAdapter.pre_merge_snapshot`` / ``LegacyAdapter.merge``
-still call ``_snapshot_pre_merge_layer_experts`` / ``_distill_merged_group``
-directly (via a late ``from ...stage2_reap_ream import ...``), and the
-``MOE_STAGE2_LEGACY_LOOP=1`` path in ``stage2_reap_ream.run()`` does too. This
-class gives T17/T18 a per-distiller plugin to wire into the decomposed
-``pre_merge_snapshot`` / ``post_merge`` phases.
+``ExpertDistillPlugin`` is LIVE as of S2-11: it owns the per-merge-group
+expert distillation on the decomposed phase walk. Its ``pre_merge_snapshot``
+hook snapshots the pre-merge expert weights and its ``merge`` hook runs the
+``_distill_merged_group`` loop (between ``_merge_experts_inplace`` and
+``bank.select``). The orchestrator registers it AFTER ``LegacyAdapter`` so its
+``merge`` phase runs after the adapter's ``_merge_experts_inplace``.
+``LegacyAdapter.pre_merge_snapshot`` is now a no-op and its ``merge`` no longer
+distills (it only sets a ``distill_state=None`` default that this plugin
+overwrites). ``registry.enabled`` drops this plugin when
+``expert_distill_steps`` is 0.
 """
 from __future__ import annotations
 
-from typing import Any
+import logging
 
 import numpy as np
 import torch
@@ -34,6 +37,8 @@ import torch.nn.functional as F
 from ...utils.model_io import MATRIX_NAMES, MoELayerRef, build_banks
 from ...pipeline.context import PipelineContext
 from .output_space_cost import _swiglu_forward
+
+log = logging.getLogger(__name__)
 
 
 # ===========================================================================
@@ -187,13 +192,14 @@ class ExpertDistillPlugin:
     """Plugin home for Stage 2 per-merge-group expert distillation
     (spec § 5 step 7b / M8).
 
-    T16 status: scaffold only — NOT on the live phase walk.
-    ``LegacyAdapter.pre_merge_snapshot`` still calls
-    ``_snapshot_pre_merge_layer_experts`` and ``LegacyAdapter.merge`` still
-    calls ``_distill_merged_group`` directly; the ``MOE_STAGE2_LEGACY_LOOP=1``
-    path in ``stage2_reap_ream.run()`` does too. This class exists so T17/T18
-    have a per-distiller plugin to wire into the decomposed
-    ``pre_merge_snapshot`` / ``post_merge`` phases.
+    LIVE as of S2-11: this plugin owns the per-merge-group expert distillation
+    on the decomposed phase walk. ``pre_merge_snapshot`` snapshots every
+    expert's weights BEFORE the merge mutates the bank; ``merge`` runs the
+    ``_distill_merged_group`` loop AFTER ``LegacyAdapter`` has done
+    ``_merge_experts_inplace`` — the orchestrator registers this plugin after
+    the adapter so the phase-major / plugin-minor walk lands its ``merge`` hook
+    after the adapter's. The distillation MUST run in the ``merge`` phase
+    (between ``_merge_experts_inplace`` and ``bank.select``), NOT ``post_merge``.
 
     Config gate: enabled iff ``stage2_reap_ream.expert_distill_steps`` is a
     positive integer. ``expert_distill_steps`` is a numeric knob (default 0).
@@ -202,10 +208,40 @@ class ExpertDistillPlugin:
     name = "expert_distill"
     paper = "Per-merge-group expert distillation (spec § 5 step 7b / M8)."
     config_key = "stage2_reap_ream.expert_distill_steps"
-    # () until a later task wires the live hook
-    reads: tuple[str, ...] = ()
-    writes: tuple[str, ...] = ()
+    # S2-11 LIVE: pre_merge_snapshot reads layer_ref and writes
+    # pre_merge_weights; merge reads the merge-group state + accumulators and
+    # overwrites distill_state.
+    reads: tuple[str, ...] = (
+        "layer_ref", "pre_merge_weights", "grouped", "freq", "layer_input_acc",
+    )
+    writes: tuple[str, ...] = ("pre_merge_weights", "distill_state")
     provides: tuple[str, ...] = ()
+
+    def __init__(
+        self,
+        *,
+        expert_distill_steps: int,
+        expert_distill_lr: float,
+        expert_distill_betas: tuple[float, float],
+        expert_distill_token_cap: int,
+        expert_distill_skip_singletons: bool,
+        expert_distill_plateau_steps: int,
+        expert_distill_plateau_eps: float,
+    ) -> None:
+        """Store every distill knob the live hooks read.
+
+        The knob set mirrors the ``expert_distill_*`` block of
+        ``LegacyAdapter.__init__`` exactly — no logic in ``__init__``, just a
+        faithful re-host of the local variables the distill code read off
+        ``self`` in the pre-S2-11 adapter.
+        """
+        self.expert_distill_steps = expert_distill_steps
+        self.expert_distill_lr = expert_distill_lr
+        self.expert_distill_betas = expert_distill_betas
+        self.expert_distill_token_cap = expert_distill_token_cap
+        self.expert_distill_skip_singletons = expert_distill_skip_singletons
+        self.expert_distill_plateau_steps = expert_distill_plateau_steps
+        self.expert_distill_plateau_eps = expert_distill_plateau_eps
 
     def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.expert_distill_steps`` > 0.
@@ -225,24 +261,82 @@ class ExpertDistillPlugin:
         return {}
 
     def pre_merge_snapshot(self, ctx: PipelineContext) -> None:
-        """Documented no-op for T16.
+        """Snapshot pre-merge expert weights for distillation (LIVE S2-11).
 
-        The live pre-merge snapshot still belongs to
-        ``LegacyAdapter.pre_merge_snapshot`` (and the
-        ``MOE_STAGE2_LEGACY_LOOP=1`` path), which call
-        ``_snapshot_pre_merge_layer_experts`` directly. Returning ``None``
-        makes this hook a clean no-op. T17/T18 wire the real call here once
-        ``pre_merge_snapshot`` is decomposed into the fine-grained phase walk.
+        Verbatim lift of the distill-snapshot part of
+        ``LegacyAdapter.pre_merge_snapshot``: snapshot every expert's gate/up/
+        down weights BEFORE ``_merge_experts_inplace`` mutates the bank, so the
+        per-group distillation step in ``merge`` can compute the pre-merge
+        group-member forward as the self-distillation target. Snapshots only
+        when distillation is enabled (``expert_distill_steps > 0``) — keeps
+        host-RAM cost zero for disabled runs. Writes the ``pre_merge_weights``
+        ctx slot (``None`` when disabled).
         """
-        return None
+        layer_ref = ctx.get("layer_ref")
+        # Phase 3 (M8): snapshot pre-merge expert weights BEFORE the merge
+        # mutates the bank. The snapshot is consumed only by the per-group
+        # distillation step in ``merge``; released as soon as that finishes
+        # for this layer (Python GC since no module-level reference is held).
+        pre_merge_weights: dict[int, dict[str, torch.Tensor]] | None = (
+            _snapshot_pre_merge_layer_experts(layer_ref)
+            if self.expert_distill_steps > 0
+            else None
+        )
+        ctx.set("pre_merge_weights", pre_merge_weights)
 
-    def post_merge(self, ctx: PipelineContext) -> None:
-        """Documented no-op for T16.
+    def merge(self, ctx: PipelineContext) -> None:
+        """Per-merge-group expert distillation (LIVE S2-11).
 
-        The live per-group distillation still belongs to
-        ``LegacyAdapter.merge`` (and the ``MOE_STAGE2_LEGACY_LOOP=1`` path),
-        which call ``_distill_merged_group`` directly. Returning ``None``
-        makes this hook a clean no-op. T17/T18 wire the real call here once
-        the post-merge phase is decomposed.
+        Verbatim lift of the distillation block from ``LegacyAdapter.merge``
+        (the per-group ``_distill_merged_group`` loop). Runs in the ``merge``
+        phase AFTER ``LegacyAdapter._merge_experts_inplace`` (the orchestrator
+        registers this plugin after the adapter) and BEFORE ``bank.select`` in
+        ``LegacyAdapter.post_merge``. Overwrites the ``distill_state`` ctx slot
+        (``LegacyAdapter.merge`` sets it to ``None`` as a default first).
         """
-        return None
+        layer_ref = ctx.get("layer_ref")
+        grouped = ctx.get("grouped")
+        freq = ctx.get("freq")
+        layer_input_acc = ctx.get("layer_input_acc")
+        pre_merge_weights = ctx.get("pre_merge_weights")
+
+        # Phase 3 (M8): per-merge-group expert distillation (spec § 5 step 7b).
+        distill_state: dict[int, dict] | None = None
+        if self.expert_distill_steps > 0 and pre_merge_weights is not None:
+            layer_inputs_buf = (
+                layer_input_acc.get() if layer_input_acc is not None else None
+            )
+            if layer_inputs_buf is None or layer_inputs_buf.shape[0] == 0:
+                log.warning(
+                    "layer %d: expert distillation enabled but no layer-input "
+                    "samples were captured during profile — skipping.",
+                    layer_ref.layer_idx,
+                )
+            else:
+                distill_state = {}
+                target_device = layer_ref.layer_module.parameters().__next__().device
+                for centroid, members in grouped.items():
+                    if self.expert_distill_skip_singletons and len(members) <= 1:
+                        continue
+                    state = _distill_merged_group(
+                        layer_ref=layer_ref,
+                        centroid_id=centroid,
+                        members=members,
+                        freq=freq,
+                        pre_merge_weights=pre_merge_weights,
+                        layer_inputs=layer_inputs_buf,
+                        steps=self.expert_distill_steps,
+                        lr=self.expert_distill_lr,
+                        betas=self.expert_distill_betas,
+                        plateau_steps=self.expert_distill_plateau_steps,
+                        plateau_eps=self.expert_distill_plateau_eps,
+                        token_cap=self.expert_distill_token_cap,
+                        device=target_device,
+                    )
+                    distill_state[centroid] = state
+                log.info(
+                    "  layer %d distillation: %d non-singleton groups distilled",
+                    layer_ref.layer_idx, len(distill_state),
+                )
+
+        ctx.set("distill_state", distill_state, overwrite=True)

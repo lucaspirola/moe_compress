@@ -32,20 +32,22 @@ Circular-import note: this module imports only ``moe_compress.utils.*``
 ``merge_heal``. There is therefore no cycle at module load, and every import
 below is a plain module-top import (no function-scope late imports).
 
-``MergeHealPlugin`` is a scaffold-only plugin — not yet on the live
-phase walk. ``LegacyAdapter.pre_merge_snapshot`` / ``post_merge`` /
-``write_artifacts`` still call ``_capture_mlp_io`` / ``_make_shared_out_fn`` /
-``_heal_layer`` / ``_summarize_distill_state`` directly (via a late
-``from ...stage2_reap_ream import ...``), and the ``MOE_STAGE2_LEGACY_LOOP=1``
-path in ``stage2_reap_ream.run()`` does too. This class gives T18 a per-layer
-merge-heal plugin to wire into the decomposed phase walk.
+``MergeHealPlugin`` is LIVE as of S2-11: it owns the per-layer merge-heal on
+the decomposed phase walk. Its ``pre_merge_snapshot`` hook captures the
+pre-merge mlp I/O shards and its ``post_merge`` hook runs ``_heal_layer``
+AFTER ``LegacyAdapter`` has done ``bank.select`` + the router resize (the
+orchestrator registers this plugin after the adapter so the phase-major walk
+lands its hooks after the adapter's). ``LegacyAdapter.pre_merge_snapshot`` is
+now a no-op and its ``post_merge`` no longer heals (it only sets a
+``heal_state=None`` default that this plugin overwrites).
+``_summarize_distill_state`` telemetry stays in ``LegacyAdapter.write_artifacts``.
+``registry.enabled`` drops this plugin when ``merge_heal_enabled`` is False.
 """
 from __future__ import annotations
 
 import logging
 import math
 from pathlib import Path
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -1001,16 +1003,15 @@ def _summarize_distill_state(
 class MergeHealPlugin:
     """Per-layer merge-heal (Task 17 of the plugin-architecture refactor).
 
-    T17 status: scaffold only — NOT on the live phase walk.
-    ``LegacyAdapter.pre_merge_snapshot`` still calls ``_capture_mlp_io``,
-    ``LegacyAdapter.post_merge`` still calls ``_make_shared_out_fn`` +
-    ``_heal_layer``, and ``LegacyAdapter.write_artifacts`` still calls
-    ``_summarize_distill_state`` — all via a late
-    ``from ...stage2_reap_ream import ...``. The ``MOE_STAGE2_LEGACY_LOOP=1``
-    path in ``stage2_reap_ream.run()`` calls all five directly too. This class
-    exists so T18 has a per-layer merge-heal plugin to wire into the
-    decomposed ``pre_merge_snapshot`` / ``post_merge`` / ``write_artifacts``
-    phases.
+    LIVE as of S2-11: this plugin owns the per-layer merge-heal on the
+    decomposed phase walk. ``pre_merge_snapshot`` captures the pre-merge mlp
+    I/O shards (``_capture_mlp_io``); ``post_merge`` runs ``_heal_layer`` AFTER
+    ``LegacyAdapter`` has done ``bank.select`` + the router resize — the
+    orchestrator registers this plugin after the adapter so the phase-major /
+    plugin-minor walk lands its hooks after the adapter's.
+    ``_summarize_distill_state`` telemetry stays in
+    ``LegacyAdapter.write_artifacts`` — this plugin does NOT declare a
+    ``write_artifacts`` hook.
 
     Config gate: enabled iff ``stage2_reap_ream.merge_heal_enabled`` is truthy.
     ``merge_heal_enabled`` is a plain boolean flag (default False).
@@ -1019,10 +1020,39 @@ class MergeHealPlugin:
     name = "merge_heal"
     paper = "Per-layer merge-heal by self-distillation toward pre-merge output."
     config_key = "stage2_reap_ream.merge_heal_enabled"
-    # () until a later task wires the live hook
-    reads: tuple[str, ...] = ()
-    writes: tuple[str, ...] = ()
+    # S2-11 LIVE: pre_merge_snapshot reads grouped/layer_ref and writes the
+    # nemo_writer/xd_writer shard writers; post_merge reads final_kept_ids +
+    # those writers + layer_ref and overwrites heal_state.
+    reads: tuple[str, ...] = (
+        "grouped", "layer_ref", "final_kept_ids", "nemo_writer", "xd_writer",
+    )
+    writes: tuple[str, ...] = ("nemo_writer", "xd_writer", "heal_state")
     provides: tuple[str, ...] = ()
+
+    def __init__(
+        self,
+        *,
+        heal_cfg: "_HealConfig",
+        heal_device,
+        xd_batches,
+        batches,
+        model,
+        artifacts_dir: Path,
+        device,
+    ) -> None:
+        """Store every knob the live heal hooks read.
+
+        The knob set mirrors what the heal blocks of ``LegacyAdapter``'s
+        ``pre_merge_snapshot`` / ``post_merge`` read off ``self`` — no logic in
+        ``__init__``, just a faithful re-host of those instance attributes.
+        """
+        self.heal_cfg = heal_cfg
+        self.heal_device = heal_device
+        self.xd_batches = xd_batches
+        self.batches = batches
+        self.model = model
+        self.artifacts_dir = artifacts_dir
+        self.device = device
 
     def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.merge_heal_enabled`` is truthy."""
@@ -1033,33 +1063,152 @@ class MergeHealPlugin:
         return {}
 
     def pre_merge_snapshot(self, ctx: PipelineContext) -> None:
-        """Documented no-op for T17.
+        """Capture this layer's pre-merge mlp I/O for self-distillation (LIVE S2-11).
 
-        The live pre-merge mlp-I/O capture still belongs to
-        ``LegacyAdapter.pre_merge_snapshot`` (and the
-        ``MOE_STAGE2_LEGACY_LOOP=1`` path), which call ``_capture_mlp_io``
-        directly. Returning ``None`` makes this hook a clean no-op. T18 wires
-        the real call here once ``pre_merge_snapshot`` is decomposed.
+        Verbatim lift of the ``nemo_writer`` / ``xd_writer`` heal-capture block
+        from ``LegacyAdapter.pre_merge_snapshot``: capture the layer's pre-merge
+        (input, target) activation pairs to bf16 shards on disk BEFORE
+        ``_merge_experts_inplace`` mutates the layer, while ``layer_ref.mlp`` is
+        still its original self — so the captured output is the
+        self-distillation target. Skipped for 0-merge layers (a layer that
+        merged nothing is unchanged, so the heal would be a guaranteed no-op).
+        ``layer_merged`` is computed locally — nothing else reads it. Writes the
+        ``nemo_writer`` / ``xd_writer`` ctx slots (``None`` when no capture).
         """
-        return None
+        layer_ref = ctx.get("layer_ref")
+        grouped = ctx.get("grouped")
+
+        # Stage-2 merge-heal: capture this layer's pre-merge (input, target)
+        # pairs for self-distillation. Done BEFORE _merge_experts_inplace,
+        # while layer_ref.mlp is still its original self — so the captured
+        # output is the self-distillation target. Skipped for 0-merge layers:
+        # a layer that merged nothing is unchanged, so the heal would be a
+        # guaranteed no-op the accept/reject guard rejects anyway.
+        #
+        # Captures stream to bf16 safetensors shards on disk so peak RAM is
+        # bounded by a small LRU cache, NOT by ``token_cap``. One layer at a
+        # time = bounded total disk use. Companion ``shared_*`` shards are
+        # computed AFTER bank.select / router resize (the shared expert is
+        # untouched by the merge, so timing is purely a convenience).
+        nemo_writer: ShardWriter | None = None
+        xd_writer: ShardWriter | None = None
+        layer_merged = any(len(m) > 1 for m in grouped.values())
+        if self.heal_cfg.enabled and layer_merged:
+            heal_shard_root = (
+                Path(self.heal_cfg.shard_dir) if self.heal_cfg.shard_dir
+                else self.artifacts_dir / "_stage2_heal_shards"
+            )
+            layer_shard_dir = heal_shard_root / f"layer_{layer_ref.layer_idx}"
+            hidden_dim = layer_ref.router.weight.shape[-1]
+            nemo_writer = ShardWriter(
+                layer_shard_dir / "nemo",
+                layer_idx=layer_ref.layer_idx,
+                hidden_dim=hidden_dim,
+                shard_rows=self.heal_cfg.shard_rows,
+            )
+            _capture_mlp_io(
+                self.model, layer_ref, self.batches,
+                device=self.heal_device, pool_size=self.heal_cfg.token_cap,
+                shard_writer=nemo_writer,
+            )
+            if self.xd_batches is not None:
+                xd_writer = ShardWriter(
+                    layer_shard_dir / "xd",
+                    layer_idx=layer_ref.layer_idx,
+                    hidden_dim=hidden_dim,
+                    shard_rows=self.heal_cfg.shard_rows,
+                )
+                _capture_mlp_io(
+                    self.model, layer_ref, self.xd_batches,
+                    device=self.heal_device, pool_size=self.heal_cfg.xd_holdout_tokens,
+                    shard_writer=xd_writer,
+                )
+
+        ctx.set("nemo_writer", nemo_writer)
+        ctx.set("xd_writer", xd_writer)
 
     def post_merge(self, ctx: PipelineContext) -> None:
-        """Documented no-op for T17.
+        """Per-layer merge-heal by self-distillation (LIVE S2-11).
 
-        The live per-layer heal still belongs to ``LegacyAdapter.post_merge``
-        (and the ``MOE_STAGE2_LEGACY_LOOP=1`` path), which call
-        ``_make_shared_out_fn`` + ``_heal_layer`` directly. Returning ``None``
-        makes this hook a clean no-op. T18 wires the real call here.
+        Verbatim lift of the ``_heal_layer`` heal block from
+        ``LegacyAdapter.post_merge`` (the part AFTER ``bank.select``). Runs in
+        the ``post_merge`` phase AFTER ``LegacyAdapter.post_merge`` has done
+        ``final_kept_ids`` + ``bank.select`` + ``_resize_router_for_kept_experts``
+        — the orchestrator registers this plugin after the adapter so the
+        phase-major walk lands this hook after the adapter's. Overwrites the
+        ``heal_state`` ctx slot (``LegacyAdapter.post_merge`` sets it to
+        ``None`` as a default first).
         """
-        return None
+        layer_ref = ctx.get("layer_ref")
+        final_kept_ids = list(ctx.get("final_kept_ids"))
+        nemo_writer: ShardWriter | None = ctx.get("nemo_writer")
+        xd_writer: ShardWriter | None = ctx.get("xd_writer")
 
-    def write_artifacts(self, ctx: PipelineContext) -> dict[str, Any]:
-        """Documented no-op for T17.
+        # Stage-2 per-layer merge-heal (opt-in). Heal this layer's kept
+        # experts (+ optionally the router) by self-distillation toward its
+        # OWN pre-merge MoE-block output — right after the router resize,
+        # BEFORE the checkpoint block so the persisted weights and the
+        # heal_state field reflect the healed layer.
+        heal_state: dict | None = None
+        if self.heal_cfg.enabled:
+            # `nemo_writer is not None` iff this layer had merges
+            # (`heal_cfg.enabled and layer_merged` above). `_capture_mlp_io`
+            # raises when it captures 0 rows, so reaching this point with a
+            # non-None writer means there's something to heal — the
+            # `n_captured > 0` sub-condition is dead code.
+            if nemo_writer is not None:
+                try:
+                    # The shared expert is Stage-2 protected (untouched by
+                    # merge/bank.select/resize), so we can run it on the captured
+                    # inputs now and store the result in companion shards. Then
+                    # finalize each writer with a layer-idx-seeded whole-shard
+                    # 90/10 split (controlled by ``holdout_fraction``).
+                    _shared_fn = _make_shared_out_fn(layer_ref)
+                    nemo_writer.compute_shared_companions(_shared_fn)
+                    nemo_manifest = nemo_writer.finalize(
+                        split_ratio=1.0 - self.heal_cfg.holdout_fraction,
+                        seed=layer_ref.layer_idx,
+                    )
+                    xd_manifest: ShardManifest | None = None
+                    if xd_writer is not None:
+                        xd_writer.compute_shared_companions(_shared_fn)
+                        xd_manifest = xd_writer.finalize(
+                            split_ratio=1.0 - self.heal_cfg.holdout_fraction,
+                            seed=layer_ref.layer_idx,
+                        )
+                    heal_state = _heal_layer(
+                        layer_ref=layer_ref,
+                        final_kept_ids=final_kept_ids,
+                        manifest=nemo_manifest,
+                        manifest_dir=nemo_writer.out_dir,
+                        xd_manifest=xd_manifest,
+                        xd_manifest_dir=(
+                            xd_writer.out_dir if xd_writer is not None else None
+                        ),
+                        heal_cfg=self.heal_cfg,
+                        device=(
+                            self.device if self.device is not None
+                            else layer_ref.router.weight.device
+                        ),
+                    )
+                finally:
+                    # Bounded disk use: drop the layer's shard dir even on
+                    # exception. `cleanup()` is idempotent and safe when the
+                    # writer never created its out_dir (lazy mkdir).
+                    # `keep_shards=True` opts into debugging mode and keeps
+                    # shards on disk.
+                    if not self.heal_cfg.keep_shards:
+                        nemo_writer.cleanup()
+                        if xd_writer is not None:
+                            xd_writer.cleanup()
+            else:
+                # nemo_writer is None => layer had 0 merges (the layer is
+                # unchanged, so there is nothing to heal).
+                log.info(
+                    "  merge-heal layer %d: skipped (0 merges — layer "
+                    "unchanged, nothing to heal)",
+                    layer_ref.layer_idx,
+                )
 
-        The live ``_summarize_distill_state`` telemetry emission still belongs
-        to ``LegacyAdapter.write_artifacts``. T17 returns an empty dict (the
-        base contract's neutral value) so the plugin contributes nothing to
-        the merged artifact payload until T18 decomposes this phase.
-        """
-        return {}
+        ctx.set("heal_state", heal_state, overwrite=True)
 

@@ -32,21 +32,22 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S1-5  Stage-1 regression sweep — 339 passed (stage1 + pipeline + tools)
 
 ## Stage 2 adaptation (Part 4)
-- [ ] S2-1a Port stage-2 framework (_framework/) + helpers
-- [ ] S2-1b Port stage-2 plugins (stage2/plugins/, 19 files)
-- [ ] S2-1c Port slim orchestrator + run_layer behavioral gate
-- [ ] S2-2  Migrate context typed→dict
-- [ ] S2-3  Migrate Stage2Plugin→PipelinePlugin
-- [ ] S2-4  Migrate registry + pipeline
-- [ ] S2-5  Decompose compute_assignment
-- [ ] S2-6  Wire cost plugins live
-- [ ] S2-7  Wire SkipMergeFloorPlugin live
-- [ ] S2-8  Wire solver plugins live
-- [ ] S2-9  Wire refinement plugins live
-- [ ] S2-10 Wire CapacityGatePlugin live
-- [ ] S2-11 Wire post-merge plugins live
+- [x] S2-1a Port stage-2 framework (_framework/) + helpers — committed 9c76be9
+- [x] S2-1b Port stage-2 plugins (stage2/plugins/, 19 files) — committed dcae454
+- [x] S2-1c Port slim orchestrator + run_layer behavioral gate — committed db340cc
+- [x] S2-2  Migrate context typed→dict — committed 379bc0d
+- [x] S2-3a Make Stage2Pipeline phase walk tolerant (getattr+callable) — committed 0abc333
+- [x] S2-3b Migrate 16 plugins to PipelinePlugin + tests + delete _framework/base.py & registry.py — committed dca1ca3
+- [x] S2-4  Migrate registry + pipeline (walk_phases, delete _framework/) — committed ffef12e
+- [x] S2-5  Decompose compute_assignment — committed 675cec5
+- [x] S2-6  Wire cost plugins live — committed 56a5d46
+- [x] S2-7  Wire SkipMergeFloorPlugin live — committed f24b257
+- [x] S2-8  Wire solver plugins live — committed 4cc8487
+- [x] S2-9  Wire refinement plugins live — committed b269495
+- [x] S2-10 Wire CapacityGatePlugin live — committed df0a406
+- [x] S2-11 Wire post-merge plugins live — ExpertDistill (merge phase) + MergeHeal (post_merge phase)
 - [ ] S2-12 Delete LegacyAdapter
-- [ ] S2-13 Expose STAGE2 Stage object
+- [ ] S2-13 Expose STAGE2 Stage object (+ rewrite stage2_plugin_guide.md — mid-migration stale)
 
 ## Stage 3 — SVD (Part 5.1)
 - [ ] S3-0  Capture stage-3 golden

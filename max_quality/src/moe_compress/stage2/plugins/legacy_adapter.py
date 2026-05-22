@@ -31,7 +31,6 @@ import numpy as np
 import torch
 
 from ...utils.activation_hooks import ReamCostAccumulator
-from ...utils.activation_shards import ShardManifest, ShardWriter
 from ...utils.model_io import build_banks
 from ...utils.trackio_log import trackio_log as _trackio_log
 from ...pipeline.context import PipelineContext
@@ -57,10 +56,15 @@ class LegacyAdapter:
     name = "legacy_adapter"
     paper = "All-in-one adapter holding the legacy per-layer loop body."
     config_key = "stage2_reap_ream"
+    # S2-11: ``pre_merge_weights`` / ``nemo_writer`` / ``xd_writer`` /
+    # ``layer_merged`` dropped — those slots are owned by ExpertDistillPlugin /
+    # MergeHealPlugin now. The adapter still READS ``heal_state`` /
+    # ``distill_state`` in ``write_artifacts`` and WRITES them as defaults in
+    # ``merge`` / ``post_merge`` (the two plugins overwrite the live values).
     reads: tuple[str, ...] = (
         "layer_ref", "reap_acc", "ream_acc", "layer_input_acc", "perm_cache",
-        "target", "scores", "freq", "grouped", "pre_merge_weights", "protected",
-        "ream_centroid_ids", "nemo_writer", "xd_writer", "final_kept_ids",
+        "target", "scores", "freq", "grouped", "protected",
+        "ream_centroid_ids", "final_kept_ids",
         "heal_state", "distill_state", "n_experts", "n_protected",
         "assigned_cost", "n_assigned", "c_fail", "em_rounds_done",
         "effective_cost_alignment", "effective_cost_asymmetric",
@@ -72,9 +76,8 @@ class LegacyAdapter:
         "grouped", "mean_assigned_cost", "n_protected", "assigned_cost",
         "n_assigned", "b_fail", "c_fail", "em_rounds_done",
         "effective_cost_alignment", "effective_cost_asymmetric",
-        "capacity_util_value", "effective_target", "nemo_writer", "xd_writer",
-        "pre_merge_weights", "layer_merged", "distill_state", "final_kept_ids",
-        "heal_state", "reap_acc",
+        "capacity_util_value", "effective_target",
+        "distill_state", "final_kept_ids", "heal_state", "reap_acc",
     )
     provides: tuple[str, ...] = ()
 
@@ -450,94 +453,33 @@ class LegacyAdapter:
     # Phase 5: pre_merge_snapshot
     # ------------------------------------------------------------------
     def pre_merge_snapshot(self, ctx: PipelineContext) -> None:
-        """Snapshot pre-merge expert weights (for distill) + capture mlp I/O (for heal).
-
-        Verbatim slice of lines 1146–1198 of stage2_reap_ream.run() (pre-T6).
+        """DEAD as of S2-11 — ``pre_merge_snapshot`` is a ``walk_phases`` phase;
+        ``ExpertDistillPlugin`` + ``MergeHealPlugin`` own it; this declines to
+        avoid double-run; S2-12 deletes the class.
         """
-        from ...stage2_reap_ream import (
-            _capture_mlp_io,
-            _snapshot_pre_merge_layer_experts,
-        )
-
-        layer_ref = ctx.get("layer_ref")
-        grouped = ctx.get("grouped")
-
-        # Stage-2 merge-heal: capture this layer's pre-merge (input, target)
-        # pairs for self-distillation. Done BEFORE _merge_experts_inplace,
-        # while layer_ref.mlp is still its original self — so the captured
-        # output is the self-distillation target. Skipped for 0-merge layers:
-        # a layer that merged nothing is unchanged, so the heal would be a
-        # guaranteed no-op the accept/reject guard rejects anyway.
-        #
-        # Captures stream to bf16 safetensors shards on disk so peak RAM is
-        # bounded by a small LRU cache, NOT by ``token_cap``. One layer at a
-        # time = bounded total disk use. Companion ``shared_*`` shards are
-        # computed AFTER bank.select / router resize (the shared expert is
-        # untouched by the merge, so timing is purely a convenience).
-        nemo_writer: ShardWriter | None = None
-        xd_writer: ShardWriter | None = None
-        layer_merged = any(len(m) > 1 for m in grouped.values())
-        if self.heal_cfg.enabled and layer_merged:
-            heal_shard_root = (
-                Path(self.heal_cfg.shard_dir) if self.heal_cfg.shard_dir
-                else self.artifacts_dir / "_stage2_heal_shards"
-            )
-            layer_shard_dir = heal_shard_root / f"layer_{layer_ref.layer_idx}"
-            hidden_dim = layer_ref.router.weight.shape[-1]
-            nemo_writer = ShardWriter(
-                layer_shard_dir / "nemo",
-                layer_idx=layer_ref.layer_idx,
-                hidden_dim=hidden_dim,
-                shard_rows=self.heal_cfg.shard_rows,
-            )
-            _capture_mlp_io(
-                self.model, layer_ref, self.batches,
-                device=self.heal_device, pool_size=self.heal_cfg.token_cap,
-                shard_writer=nemo_writer,
-            )
-            if self.xd_batches is not None:
-                xd_writer = ShardWriter(
-                    layer_shard_dir / "xd",
-                    layer_idx=layer_ref.layer_idx,
-                    hidden_dim=hidden_dim,
-                    shard_rows=self.heal_cfg.shard_rows,
-                )
-                _capture_mlp_io(
-                    self.model, layer_ref, self.xd_batches,
-                    device=self.heal_device, pool_size=self.heal_cfg.xd_holdout_tokens,
-                    shard_writer=xd_writer,
-                )
-
-        # Phase 3 (M8): snapshot pre-merge expert weights BEFORE the merge
-        # mutates the bank. The snapshot is consumed only by the per-group
-        # distillation step below; released as soon as that finishes for
-        # this layer (Python GC since no module-level reference is held).
-        pre_merge_weights: dict[int, dict[str, torch.Tensor]] | None = None
-        if self.expert_distill_steps > 0:
-            pre_merge_weights = _snapshot_pre_merge_layer_experts(layer_ref)
-
-        ctx.set("nemo_writer", nemo_writer)
-        ctx.set("xd_writer", xd_writer)
-        ctx.set("pre_merge_weights", pre_merge_weights)
-        ctx.set("layer_merged", layer_merged)
+        return None
 
     # ------------------------------------------------------------------
     # Phase 6: merge
     # ------------------------------------------------------------------
     def merge(self, ctx: PipelineContext) -> None:
-        """Merge experts in place + per-group distillation.
+        """Merge experts in place (trimmed S2-11).
 
-        Verbatim slice of lines 1200–1244 of stage2_reap_ream.run() (pre-T6).
+        Verbatim slice of the ``_merge_experts_inplace`` call from
+        stage2_reap_ream.run() (pre-T6). The per-merge-group distillation block
+        MOVED OUT to ``ExpertDistillPlugin.merge`` as of S2-11 (registered after
+        this adapter, so its ``merge`` hook runs after ``_merge_experts_inplace``
+        and before ``bank.select``). This sets ``distill_state=None`` only as a
+        DEFAULT — ``ExpertDistillPlugin.merge`` overwrites it when distillation
+        is enabled, and the default prevents a ``KeyError`` in
+        ``write_artifacts`` / ``on_layer_teardown`` when distill is disabled
+        (``ExpertDistillPlugin`` is dropped by ``registry.enabled``).
         """
-        from ...stage2_reap_ream import _distill_merged_group
-
         layer_ref = ctx.get("layer_ref")
         grouped = ctx.get("grouped")
         freq = ctx.get("freq")
         ream_acc = ctx.get("ream_acc")
         perm_cache = ctx.get("perm_cache")
-        layer_input_acc = ctx.get("layer_input_acc")
-        pre_merge_weights = ctx.get("pre_merge_weights")
 
         _merge_experts_inplace(
             layer_ref, grouped, freq,
@@ -546,65 +488,28 @@ class LegacyAdapter:
             perm_cache=perm_cache,
         )
 
-        # Phase 3 (M8): per-merge-group expert distillation (spec § 5 step 7b).
-        distill_state: dict[int, dict] | None = None
-        if self.expert_distill_steps > 0 and pre_merge_weights is not None:
-            layer_inputs_buf = (
-                layer_input_acc.get() if layer_input_acc is not None else None
-            )
-            if layer_inputs_buf is None or layer_inputs_buf.shape[0] == 0:
-                log.warning(
-                    "layer %d: expert distillation enabled but no layer-input "
-                    "samples were captured during profile — skipping.",
-                    layer_ref.layer_idx,
-                )
-            else:
-                distill_state = {}
-                target_device = layer_ref.layer_module.parameters().__next__().device
-                for centroid, members in grouped.items():
-                    if self.expert_distill_skip_singletons and len(members) <= 1:
-                        continue
-                    state = _distill_merged_group(
-                        layer_ref=layer_ref,
-                        centroid_id=centroid,
-                        members=members,
-                        freq=freq,
-                        pre_merge_weights=pre_merge_weights,
-                        layer_inputs=layer_inputs_buf,
-                        steps=self.expert_distill_steps,
-                        lr=self.expert_distill_lr,
-                        betas=self.expert_distill_betas,
-                        plateau_steps=self.expert_distill_plateau_steps,
-                        plateau_eps=self.expert_distill_plateau_eps,
-                        token_cap=self.expert_distill_token_cap,
-                        device=target_device,
-                    )
-                    distill_state[centroid] = state
-                log.info(
-                    "  layer %d distillation: %d non-singleton groups distilled",
-                    layer_ref.layer_idx, len(distill_state),
-                )
-
-        ctx.set("distill_state", distill_state)
+        ctx.set("distill_state", None)
 
     # ------------------------------------------------------------------
     # Phase 7: post_merge
     # ------------------------------------------------------------------
     def post_merge(self, ctx: PipelineContext) -> None:
-        """bank.select, router resize, optional merge-heal.
+        """bank.select + router resize (trimmed S2-11).
 
-        Verbatim slice of lines 1246–1325 of stage2_reap_ream.run() (pre-T6).
+        Verbatim slice of the ``final_kept_ids`` / ``bank.select`` /
+        ``_resize_router_for_kept_experts`` block from stage2_reap_ream.run()
+        (pre-T6). The ``_heal_layer`` merge-heal block MOVED OUT to
+        ``MergeHealPlugin.post_merge`` as of S2-11 (registered after this
+        adapter, so its ``post_merge`` hook runs after ``bank.select`` + the
+        router resize). This sets ``heal_state=None`` only as a DEFAULT —
+        ``MergeHealPlugin.post_merge`` overwrites it when healing is enabled,
+        and the default prevents a ``KeyError`` in ``write_artifacts`` when
+        merge-heal is disabled (``MergeHealPlugin`` is dropped by
+        ``registry.enabled``).
         """
-        from ...stage2_reap_ream import (
-            _heal_layer,
-            _make_shared_out_fn,
-        )
-
         layer_ref = ctx.get("layer_ref")
         protected = list(ctx.get("protected"))
         ream_centroid_ids = list(ctx.get("ream_centroid_ids"))
-        nemo_writer: ShardWriter | None = ctx.get("nemo_writer")
-        xd_writer: ShardWriter | None = ctx.get("xd_writer")
 
         # Final kept set = protected experts (untouched) + REAM centroids (post-merge).
         # Protected experts' rows are preserved in gate.weight and expert tensors.
@@ -621,74 +526,8 @@ class LegacyAdapter:
             bank.select(final_kept_ids)
         _resize_router_for_kept_experts(layer_ref, final_kept_ids)
 
-        # Stage-2 per-layer merge-heal (opt-in). Heal this layer's kept
-        # experts (+ optionally the router) by self-distillation toward its
-        # OWN pre-merge MoE-block output — right after the router resize,
-        # BEFORE the checkpoint block so the persisted weights and the
-        # heal_state field reflect the healed layer.
-        heal_state: dict | None = None
-        if self.heal_cfg.enabled:
-            # `nemo_writer is not None` iff this layer had merges
-            # (`heal_cfg.enabled and layer_merged` above). `_capture_mlp_io`
-            # raises when it captures 0 rows, so reaching this point with a
-            # non-None writer means there's something to heal — the
-            # `n_captured > 0` sub-condition is dead code.
-            if nemo_writer is not None:
-                try:
-                    # The shared expert is Stage-2 protected (untouched by
-                    # merge/bank.select/resize), so we can run it on the captured
-                    # inputs now and store the result in companion shards. Then
-                    # finalize each writer with a layer-idx-seeded whole-shard
-                    # 90/10 split (controlled by ``holdout_fraction``).
-                    _shared_fn = _make_shared_out_fn(layer_ref)
-                    nemo_writer.compute_shared_companions(_shared_fn)
-                    nemo_manifest = nemo_writer.finalize(
-                        split_ratio=1.0 - self.heal_cfg.holdout_fraction,
-                        seed=layer_ref.layer_idx,
-                    )
-                    xd_manifest: ShardManifest | None = None
-                    if xd_writer is not None:
-                        xd_writer.compute_shared_companions(_shared_fn)
-                        xd_manifest = xd_writer.finalize(
-                            split_ratio=1.0 - self.heal_cfg.holdout_fraction,
-                            seed=layer_ref.layer_idx,
-                        )
-                    heal_state = _heal_layer(
-                        layer_ref=layer_ref,
-                        final_kept_ids=final_kept_ids,
-                        manifest=nemo_manifest,
-                        manifest_dir=nemo_writer.out_dir,
-                        xd_manifest=xd_manifest,
-                        xd_manifest_dir=(
-                            xd_writer.out_dir if xd_writer is not None else None
-                        ),
-                        heal_cfg=self.heal_cfg,
-                        device=(
-                            self.device if self.device is not None
-                            else layer_ref.router.weight.device
-                        ),
-                    )
-                finally:
-                    # Bounded disk use: drop the layer's shard dir even on
-                    # exception. `cleanup()` is idempotent and safe when the
-                    # writer never created its out_dir (lazy mkdir).
-                    # `keep_shards=True` opts into debugging mode and keeps
-                    # shards on disk.
-                    if not self.heal_cfg.keep_shards:
-                        nemo_writer.cleanup()
-                        if xd_writer is not None:
-                            xd_writer.cleanup()
-            else:
-                # nemo_writer is None => layer had 0 merges (the layer is
-                # unchanged, so there is nothing to heal).
-                log.info(
-                    "  merge-heal layer %d: skipped (0 merges — layer "
-                    "unchanged, nothing to heal)",
-                    layer_ref.layer_idx,
-                )
-
         ctx.set("final_kept_ids", tuple(final_kept_ids))
-        ctx.set("heal_state", heal_state)
+        ctx.set("heal_state", None)
 
     # ------------------------------------------------------------------
     # Phase 8: write_artifacts

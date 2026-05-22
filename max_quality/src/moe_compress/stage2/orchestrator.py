@@ -938,7 +938,9 @@ def run(
     from ..pipeline.registry import PluginRegistry
     from ..tools.phase_walker import walk_phases
     from .plugins.capacity_gate import CapacityGatePlugin
+    from .plugins.expert_distill import ExpertDistillPlugin
     from .plugins.legacy_adapter import LegacyAdapter
+    from .plugins.merge_heal import MergeHealPlugin
     from .plugins.output_space_cost import OutputSpaceCostPlugin
     from .plugins.ream_cost import ReamCostPrePlugin
     from .plugins.ream_cost_post import ReamCostPostPlugin
@@ -1097,6 +1099,35 @@ def run(
             sinkhorn_iters=sinkhorn_iters,
         ),
         adapter,
+        # S2-11: the per-merge-group expert distillation + per-layer merge-heal
+        # plugins are registered AFTER the adapter — the LAST elements, reversed
+        # vs. the S2-6..S2-10 ordering. ``pre_merge_snapshot`` / ``merge`` /
+        # ``post_merge`` are ``walk_phases`` PHASES (every plugin's hook runs,
+        # phase-major / plugin-minor), not ``dispatch_first`` slots. These two
+        # plugins must run AFTER the adapter so ``ExpertDistillPlugin.merge``
+        # lands after ``LegacyAdapter._merge_experts_inplace`` and
+        # ``MergeHealPlugin.post_merge`` lands after ``LegacyAdapter``'s
+        # ``bank.select`` + router resize. ``registry.enabled(config)`` drops
+        # each when its gate is off (expert_distill_steps == 0 /
+        # merge_heal_enabled == False) — inert by default.
+        ExpertDistillPlugin(
+            expert_distill_steps=expert_distill_steps,
+            expert_distill_lr=expert_distill_lr,
+            expert_distill_betas=expert_distill_betas,
+            expert_distill_token_cap=expert_distill_token_cap,
+            expert_distill_skip_singletons=expert_distill_skip_singletons,
+            expert_distill_plateau_steps=expert_distill_plateau_steps,
+            expert_distill_plateau_eps=expert_distill_plateau_eps,
+        ),
+        MergeHealPlugin(
+            heal_cfg=heal_cfg,
+            heal_device=_heal_device,
+            xd_batches=xd_batches,
+            batches=batches,
+            model=model,
+            artifacts_dir=artifacts_dir,
+            device=device,
+        ),
     ])
     plugins = registry.enabled(config)
     walk_phases(("on_run_setup",), plugins, run_ctx)
