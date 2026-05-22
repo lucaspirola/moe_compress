@@ -92,99 +92,37 @@ from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 
+# S6-2: eval-environment setup (dataset revision pinning, the cu130/Hopper
+# kernel patches, the MoE experts-implementation shim, the imatrix
+# calibration-corpus build + its atomic-write helper) relocated to
+# stage6/plugins/eval_environment. Re-imported so run() + external callers/
+# tests keep their stage6_validate import paths.
+from .stage6.plugins.eval_environment import (  # noqa: F401
+    # _CANONICAL_DATASET_REVISION_KEYS is NOT consumed by surviving monolith
+    # code — it is re-exported solely to keep the `stage6_validate` external/
+    # test API surface stable (callers/tests that imported it pre-S6-2 still
+    # resolve it here). Do NOT delete it as "unused".
+    _CANONICAL_DATASET_REVISION_KEYS,
+    _resolve_dataset_revisions,
+    _enforce_revision_pinning,
+    _atomic_write_text,
+    _IMATRIX_CALIB_FILENAME,
+    _build_imatrix_calibration_corpus,
+    _set_experts_implementation_s6,
+    _apply_stage6_kernel_patches,
+)
+
 _ZERO_SHOT_TASKS: frozenset[str] = frozenset({"arc_challenge_acc", "hellaswag_acc"})
 
 # F-C-H-1: Spec F-S-M-1 mandates eager attention for both teacher and student
 # during the Stage 6 gate run. Constant — never override at call sites.
 _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 
-# F-C-C-1: Spec §9 — imatrix calibration corpus is the WikiText-2 *train* split,
-# written to calibration_wiki_train.txt. The eval-text concat (eval prompts seen
-# by the model during PPL/zero-shot/generative) is captured separately to
-# eval_text_concat.txt as a debugging side-channel ONLY.
-_IMATRIX_CALIB_FILENAME: str = "calibration_wiki_train.txt"
+# F-C-C-1: Spec §9 — the eval-text concat (eval prompts seen by the model
+# during PPL/zero-shot/generative) is captured to eval_text_concat.txt as a
+# debugging side-channel ONLY. The imatrix calibration corpus filename
+# (_IMATRIX_CALIB_FILENAME) is re-imported in the S6-2 block above.
 _EVAL_TEXT_CONCAT_FILENAME: str = "eval_text_concat.txt"
-
-# ---------------------------------------------------------------------------
-# Dataset revision pinning (F-C-H-3)
-# ---------------------------------------------------------------------------
-
-
-_CANONICAL_DATASET_REVISION_KEYS = ("wikitext_ppl", "humaneval", "math500")
-
-
-def _resolve_dataset_revisions(config: dict) -> dict[str, str | None]:
-    """Return the per-dataset revision mapping from stage6_validate config.
-
-    Restricted to the canonical 3-key set per spec §9 line 840:
-    {"wikitext_ppl", "humaneval", "math500"}. Any extra keys present in the
-    config are dropped with a warning so the cache key is not contaminated
-    by operator-only metadata.
-    """
-    s6 = config.get("stage6_validate", {}) or {}
-    raw = s6.get("dataset_revisions") or {}
-    if not isinstance(raw, dict):
-        log.warning(
-            "_resolve_dataset_revisions: dataset_revisions config is not a dict (%r); ignoring",
-            type(raw).__name__,
-        )
-        return {}
-    extra = set(raw.keys()) - set(_CANONICAL_DATASET_REVISION_KEYS)
-    if extra:
-        log.warning(
-            "_resolve_dataset_revisions: dropping non-canonical keys %s "
-            "(spec restricts to %s).",
-            sorted(extra), list(_CANONICAL_DATASET_REVISION_KEYS),
-        )
-    out: dict[str, str | None] = {}
-    for k in _CANONICAL_DATASET_REVISION_KEYS:
-        if k not in raw:
-            continue
-        v = raw[k]
-        if v is None:
-            out[k] = None
-        elif isinstance(v, str):
-            out[k] = v
-        else:
-            raise TypeError(
-                f"_resolve_dataset_revisions: revision for {k!r} must be a "
-                f"string SHA or null; got {type(v).__name__} (value={v!r}). "
-                f"Fix the config under stage6_validate.dataset_revisions."
-            )
-    return out
-
-
-def _enforce_revision_pinning(
-    config: dict, required_keys: tuple[str, ...] = (
-        # F-iter4-HIGH-1: hellaswag/arc_challenge dropped from required keys.
-        # lm-eval pulls dataset revisions internally and our load path cannot
-        # enforce a SHA at simple_evaluate time. The cache key invalidates on
-        # lm_eval_version + lm-eval task config hash changes (see
-        # _teacher_cache_key); precise SHA control requires editing lm-eval
-        # task YAMLs out-of-band.
-        "wikitext_ppl", "humaneval", "math500",
-    ),
-) -> dict[str, str | None]:
-    """Validate dataset_revisions when strict_revision_pinning is on.
-
-    Raises RuntimeError listing every missing/null required key. Returns the
-    resolved revisions dict regardless of strict mode (so callers can still
-    pass-through whatever revisions are pinned).
-    """
-    s6 = config.get("stage6_validate", {}) or {}
-    revisions = _resolve_dataset_revisions(config)
-    strict = bool(s6.get("strict_revision_pinning", True))
-    if not strict:
-        return revisions
-    missing = [k for k in required_keys if not revisions.get(k)]
-    if missing:
-        raise RuntimeError(
-            "Stage 6: strict_revision_pinning=true but dataset_revisions are "
-            f"missing or null for: {missing}. Pin each dataset SHA in "
-            "configs/<…>.yaml under stage6_validate.dataset_revisions, or "
-            "set strict_revision_pinning=false to opt out (NOT for production)."
-        )
-    return revisions
 
 
 # ---------------------------------------------------------------------------
@@ -267,90 +205,6 @@ def _teacher_cache_key(config: dict) -> str:
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(blob).hexdigest()
-
-
-# ---------------------------------------------------------------------------
-# imatrix calibration corpus — WikiText-2 *train* split (F-C-C-1)
-# ---------------------------------------------------------------------------
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write `text` to `path` atomically per Spec §11 (tmp → fsync → replace → fsync parent)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        # F-CR2-N-1: open read-only solely to fsync — no bytes are written here.
-        # O_RDONLY is the most accurate intent (write+append flags were misleading).
-        fd = os.open(str(tmp), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-    try:
-        parent_fd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("_atomic_write_text: parent-dir fsync failed (%s); file already on disk", exc)
-
-
-def _build_imatrix_calibration_corpus(
-    artifacts_dir: Path, dataset_revisions: dict[str, str | None],
-) -> Path | None:
-    """Download WikiText-2 *train* split and write `calibration_wiki_train.txt` atomically.
-
-    Returns the path on success, or None if the dataset cannot be loaded
-    (operator can supply the file out-of-band; imatrix run will be skipped
-    upstream when no calibration file exists).
-    """
-    target = artifacts_dir / _IMATRIX_CALIB_FILENAME
-    if target.exists() and target.stat().st_size > 0:
-        log.info("imatrix calibration: %s already exists — reusing", target)
-        return target
-    try:
-        from datasets import load_dataset
-    except Exception as exc:  # noqa: BLE001
-        log.warning("imatrix calibration: `datasets` not available (%s); skipping corpus build", exc)
-        return None
-    revision = dataset_revisions.get("wikitext_ppl")
-    log.info(
-        "imatrix calibration: downloading Salesforce/wikitext (wikitext-2-raw-v1, train, revision=%s)",
-        revision,
-    )
-    try:
-        ds = load_dataset(
-            "Salesforce/wikitext", "wikitext-2-raw-v1",
-            split="train", revision=revision,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("imatrix calibration: load_dataset(train) failed (%s); skipping corpus build", exc)
-        return None
-    rows = []
-    for row in ds:
-        text = row.get("text", "")
-        # Preserve empty rows for symmetry with _wikitext2_ppl: both inputs
-        # use the canonical HF/lm-eval recipe (empty rows produce the
-        # expected paragraph-spacing tokens via the "\n\n" joiner). Filtering
-        # empties here would drift imatrix activation statistics from the
-        # PPL gate's token distribution beyond the joiner-only alignment
-        # the spec describes.
-        rows.append(text)
-    # Spec §9 line 783: shared "\n\n" joiner across PPL eval and imatrix
-    # calibration so imatrix activation statistics see comparable tokens.
-    joined = "\n\n".join(rows)
-    if not joined.strip():
-        log.warning("imatrix calibration: WikiText-2 train split is empty after filtering; skipping write")
-        return None
-    _atomic_write_text(target, joined)
-    log.info("imatrix calibration: wrote %s (%d rows, %d chars)", target, len(rows), len(joined))
-    return target
 
 
 def _load_teacher_cache(cache_path: Path, cache_key: str) -> dict | None:
@@ -461,111 +315,9 @@ def _save_teacher_cache(
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def _set_experts_implementation_s6(model, impl: str) -> None:
-    """Override MoE experts forward dispatch on `model` (Stage 6 variant).
-
-    Mirror of `stage5_router_kd._set_experts_implementation`. See that
-    function's docstring for the rationale (Blackwell `grouped_mm` deadlock
-    workaround) and the registered impl values (`grouped_mm`, `batched_mm`,
-    `sonicmoe`, `eager`).
-    """
-    base = getattr(model, "_orig_mod", model)
-    cfg = base.config
-    if hasattr(cfg, "text_config"):
-        cfg.text_config._experts_implementation = impl
-    cfg._experts_implementation = impl
-    log.info("Stage 6: MoE experts_implementation = %r", impl)
-
-
-def _apply_stage6_kernel_patches(m, *, role: str) -> None:
-    """Apply the cu130/Hopper segfault-fix patches in-place on a Qwen3.5-MoE
-    model. Idempotent: safe to call multiple times. Called once per model
-    (student AND teacher both need it before torch.compile / generate).
-
-    The patches are necessary on torch 2.11+cu130 + Triton 3.4 + Hopper because:
-      1. Inductor codegen for `constant_pad_nd(pad=4-s87)` indexes OOB inside
-         GatedDeltaNet / LinearAttention / MoeMamba submodules — dodge by
-         `torch._dynamo.disable`-ing those modules' forwards.
-      2. fla/tilelang's `chunk_gated_delta_rule`, `recurrent_gated_delta_rule`,
-         and `causal_conv1d_update` are unstable on this stack (SIGSEGV in
-         lm_eval, SIGABRT in HumanEval). Swap to torch-native fallbacks
-         already shipped in `modeling_qwen3_5_moe.py`.
-      3. fla's `FusedRMSNormGated` Triton kernel JIT-recompiles for the
-         `(B*1, head_v_dim)` decode shape during generate() and segfaults on
-         Hopper + Triton 3.4 (fla-org/flash-linear-attention#734). Swap to
-         the pure-torch `Qwen3_5MoeRMSNormGated` (same numerics).
-
-    Speed impact: ~5% of GatedDeltaNet flops run eager + a few RMSNorm calls;
-    net <1% wall on the full Stage 6 run.
-    """
-    _bypass_names = ("GatedDeltaNet", "LinearAttention", "MoeMamba")
-    _bypassed = 0
-    for _name, _mod in m.named_modules():
-        _cls = type(_mod).__name__
-        if any(b in _cls for b in _bypass_names):
-            _mod.forward = torch._dynamo.disable(_mod.forward)
-            _bypassed += 1
-    if _bypassed:
-        log.info("Stage 6 [%s]: torch._dynamo.disable on %d linear-attention "
-                 "sublayer(s)", role, _bypassed)
-
-    try:
-        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-            Qwen3_5MoeRMSNormGated as _TorchRMSNormGated,
-            torch_chunk_gated_delta_rule,
-            torch_recurrent_gated_delta_rule,
-            torch_causal_conv1d_update,
-        )
-    except ImportError as _exc:
-        log.warning("Stage 6 [%s]: torch fallback symbols not found in "
-                    "transformers.models.qwen3_5_moe (%s) — fla/tilelang may "
-                    "crash later; continuing", role, _exc)
-        return
-
-    _gdn_patched = 0
-    _norm_patched = 0
-    for _name, _mod in m.named_modules():
-        if type(_mod).__name__ != "Qwen3_5MoeGatedDeltaNet":
-            continue
-        if hasattr(_mod, "chunk_gated_delta_rule"):
-            _mod.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
-        if hasattr(_mod, "recurrent_gated_delta_rule"):
-            _mod.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
-        # Prefill path checks `if causal_conv1d_fn is not None` — None falls
-        # through to torch. Decode path calls `causal_conv1d_update` with no
-        # None-check, so must set explicitly to the torch fallback.
-        if hasattr(_mod, "causal_conv1d_fn"):
-            _mod.causal_conv1d_fn = None
-        if hasattr(_mod, "causal_conv1d_update"):
-            _mod.causal_conv1d_update = torch_causal_conv1d_update
-        if (
-            hasattr(_mod, "norm")
-            and type(_mod.norm).__name__ == "FusedRMSNormGated"
-        ):
-            _old_norm = _mod.norm
-            _new_norm = _TorchRMSNormGated(
-                _mod.head_v_dim, eps=_mod.layer_norm_epsilon
-            )
-            # Move new norm to model device/dtype BEFORE copying weights —
-            # ordering matters: if .to() raised after .copy_(), the stranded
-            # CPU weight would still be swapped in and crash on next forward.
-            _new_norm.to(
-                device=_old_norm.weight.device,
-                dtype=_old_norm.weight.dtype,
-            )
-            _new_norm.weight.data.copy_(_old_norm.weight.data)
-            _mod.norm = _new_norm
-            _norm_patched += 1
-        _gdn_patched += 1
-
-    if _gdn_patched:
-        log.info("Stage 6 [%s]: forced torch-native fallback for "
-                 "chunk_gated_delta_rule + causal_conv1d on %d "
-                 "Qwen3_5MoeGatedDeltaNet block(s)", role, _gdn_patched)
-    if _norm_patched:
-        log.info("Stage 6 [%s]: replaced fla FusedRMSNormGated with "
-                 "torch-native Qwen3_5MoeRMSNormGated on %d GDN block(s)",
-                 role, _norm_patched)
+# S6-2: _set_experts_implementation_s6 + _apply_stage6_kernel_patches relocated
+# to stage6/plugins/eval_environment — re-imported in the S6-2 ``# noqa: F401``
+# block near the top of this module.
 
 
 def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> Path:
