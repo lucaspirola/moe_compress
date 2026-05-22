@@ -80,7 +80,7 @@ def _captured_emits(monkeypatch):
         captured.append(dict(metrics))
 
     from moe_compress import (
-        run_pipeline, stage3_svd,
+        run_pipeline,
         stage4_eora, stage5_router_kd, stage6_validate,
     )
     from moe_compress.stage2 import orchestrator as stage2_reap_ream
@@ -90,7 +90,11 @@ def _captured_emits(monkeypatch):
     from moe_compress.stage1 import orchestrator as stage1_orchestrator
     from moe_compress.stage1.plugins import grape_merge as stage1_grape_merge
     from moe_compress.stage1.plugins import ma_detection as stage1_ma_detection
-    for mod in (run_pipeline, stage2_reap_ream, stage3_svd,
+    # After S3-7a, Stage 3 runtime config/telemetry emits fire from the
+    # plugin-driven orchestrator's own ``_trackio_log`` binding; the legacy
+    # ``stage3_svd`` is now a thin shim that no longer imports ``_trackio_log``.
+    from moe_compress.stage3 import orchestrator as stage3_orchestrator
+    for mod in (run_pipeline, stage2_reap_ream, stage3_orchestrator,
                 stage4_eora, stage5_router_kd, stage6_validate,
                 stage1_orchestrator, stage1_grape_merge, stage1_ma_detection):
         monkeypatch.setattr(mod, "_trackio_log", _capture, raising=False)
@@ -298,13 +302,16 @@ def test_stage3_source_emits_config_and_c5_extensions():
     block carries the new training-shape keys.
 
     S3-6: ``_phase_c5_block_refine`` (which emits the ``c5_*`` keys) was
-    relocated verbatim into ``stage3/plugins/block_refine.py``; the config
-    keys still emit from the ``stage3_svd.py`` monolith. The source scan
-    therefore spans both files.
+    relocated verbatim into ``stage3/plugins/block_refine.py``.
+    S3-7a: the monolith ``stage3_svd.py`` ``run()`` body was retired — the
+    config-key Trackio emits (``stage3/config/*``) now fire from the real
+    orchestrator ``stage3/orchestrator.py``. The source scan therefore spans
+    all three files.
     """
     src_root = Path(__file__).resolve().parents[1] / "src" / "moe_compress"
     src = (
         (src_root / "stage3_svd.py").read_text()
+        + (src_root / "stage3" / "orchestrator.py").read_text()
         + (src_root / "stage3" / "plugins" / "block_refine.py").read_text()
     )
     expected_keys = [

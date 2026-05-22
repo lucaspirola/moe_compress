@@ -493,18 +493,42 @@ class BlockRefinePlugin:
         return {}
 
     def refine_blocks(self, ctx: PipelineContext) -> None:
-        """Phase hook — Phase C.5 block-level joint refinement (S3-7 wiring
-        surface).
+        """Phase hook — Phase C.5 block-level joint refinement (S3-7a live).
 
-        INERT at S3-6: no orchestrator walk or test invokes this hook. The
-        Phase C.5 invocation in the monolith ``run()`` — the gated call to
-        ``_phase_c5_block_refine`` that refines every factored MoE block —
-        is NOT relocated by S3-6. S3-7 replaces the Stage 3 orchestrator body
-        with the plugin sequencer and fills this hook with that call.
-
-        Dead code at S3-6; kept minimal — S3-7 builds it out.
+        Filled at S3-7a with the VERBATIM Phase C.5 invocation from the
+        monolith ``run()`` — the gated ``_phase_c5_block_refine`` call,
+        including the ``teacher_model is None`` guard. This plugin is
+        config-gated (``is_enabled`` on ``stage3_svd.block_refine.enabled``),
+        so the orchestrator drops it from the enabled set when block-refine is
+        off and ``walk_phases(("refine_blocks",), ...)`` becomes a no-op —
+        byte-identical to the monolith's ``if _block_refine_enabled:`` skip.
         """
-        # Required slots — direct get(): a missing one is a wiring bug and
-        # SHOULD raise. Optional slots are has()-guarded.
-        if not ctx.has("moe_layers"):
-            return
+        model = ctx.get("model")
+        teacher_model = ctx.get("teacher_model")
+        moe_layers = ctx.get("moe_layers")
+        teacher_moe_layers = ctx.get("teacher_moe_layers")
+        calib = ctx.get("calib")
+        config = ctx.get("config")
+        artifacts_dir = ctx.get("artifacts_dir")
+        no_resume = ctx.get("no_resume")
+        device = ctx.get("device")
+
+        s3 = config["stage3_svd"]
+        # ---- VERBATIM Phase C.5 invocation from the monolith run() ----------
+        if teacher_model is None or teacher_moe_layers is None:
+            raise RuntimeError(
+                "Stage 3 Phase C.5 requires the teacher model to be resident. "
+                "Either disable stage3_svd.block_refine.enabled or ensure "
+                "Phase A loaded the teacher (check aa_svd.cross_covariance "
+                "and the resume path)."
+            )
+        br = s3["block_refine"]
+        _phase_c5_block_refine(
+            model, teacher_model, moe_layers, teacher_moe_layers, calib,
+            batch_size=int(br.get("batch_size", 32)),
+            learning_rate=float(br.get("learning_rate", 1.0e-4)),
+            epochs=int(br.get("epochs", 25)),
+            warmup_ratio=float(br.get("warmup_ratio", 0.1)),
+            weight_decay=float(br.get("weight_decay", 0.0)),
+            artifacts_dir=artifacts_dir, no_resume=no_resume, device=device,
+        )

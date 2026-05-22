@@ -319,7 +319,7 @@ class CovarianceCollectionPlugin:
     config_key = "stage3_svd.aa_svd.cross_covariance"
     reads: tuple[str, ...] = (
         "model", "moe_layers", "batches", "B_acc", "device",
-        "spill_dir", "teacher_model", "teacher_moe_layers",
+        "bcov_spill_dir", "teacher_model", "teacher_moe_layers",
         "C_acc", "ccov_spill_dir",
     )
     writes: tuple[str, ...] = ("B_acc", "C_acc")
@@ -358,7 +358,9 @@ class CovarianceCollectionPlugin:
             ctx.get("batches"),
             ctx.get("B_acc"),
             device=ctx.get("device"),
-            spill_dir=ctx.get("spill_dir") if ctx.has("spill_dir") else None,
+            spill_dir=(
+                ctx.get("bcov_spill_dir") if ctx.has("bcov_spill_dir") else None
+            ),
             teacher_model=(
                 ctx.get("teacher_model") if ctx.has("teacher_model") else None
             ),

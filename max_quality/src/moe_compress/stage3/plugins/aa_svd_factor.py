@@ -53,6 +53,8 @@ from typing import Any
 import torch
 
 from ...pipeline.context import PipelineContext
+from ...utils.model_io import MATRIX_NAMES, FactoredExperts
+from ...utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 
@@ -318,10 +320,18 @@ class AaSvdFactorPlugin:
         "(Theorem 3.2) / M = W·L_B (Corollary 3.3) (paper 2604.02119)."
     )
     config_key = "stage3_svd.aa_svd.cross_covariance"
+    # ``factor_layer`` runs inside a per-layer ``loop_over`` child scope: it
+    # reads the layer ref under ``layer_ref`` (the loop item key) and the
+    # remaining slots through the parent ctx chain.
     reads: tuple[str, ...] = (
-        "model", "moe_layers", "ranks", "per_expert_ranks", "A_cov",
-        "B_acc", "C_acc", "config", "device",
+        "layer_ref", "ranks", "per_expert_ranks", "A_cov", "B_acc", "C_acc",
+        "B_cov_dtype", "rank_map", "device", "originals",
+        "bcov_spill_dir", "ccov_spill_dir",
     )
+    # ``rank_map`` is the slot this plugin produces — it is a shared mutable
+    # dict the hook MUTATES in place across loop iterations (HAZARD H1)
+    # rather than rebinding via ``ctx.set``, but it remains this plugin's
+    # declared write surface.
     writes: tuple[str, ...] = ("rank_map",)
     provides: tuple[str, ...] = ()
 
@@ -339,19 +349,171 @@ class AaSvdFactorPlugin:
         return {}
 
     def factor_layer(self, ctx: PipelineContext) -> None:
-        """Phase hook — AA-SVD per-layer factoring (S3-7 wiring surface).
+        """Phase hook — AA-SVD per-layer factoring (S3-7a live).
 
-        INERT at S3-5: no orchestrator walk or test invokes this hook. The
-        per-layer factoring LOOP BODY in the monolith ``run()`` — the loop that
-        walks the MoE layers, calls ``_precompute_eigh`` / ``_aa_svd`` /
-        ``_aa_svd_precomputed`` per expert and installs ``FactoredExperts`` while
-        populating ``rank_map`` — is NOT relocated by S3-5. S3-7 replaces the
-        Stage 3 orchestrator body with the plugin sequencer and fills this hook
-        with that loop.
-
-        Dead code at S3-5; kept minimal — S3-7 builds it out.
+        Filled at S3-7a with the VERBATIM per-layer factoring loop body from
+        the monolith ``run()`` (the ``for ref in moe_layers:`` body). The
+        layer ref arrives under ``ctx["layer_ref"]`` (the ``loop_over``
+        item key); ``ranks`` / ``per_expert_ranks`` / ``A_cov`` / ``B_acc`` /
+        ``C_acc`` / ``B_cov_dtype`` / ``rank_map`` / ``device`` / ``originals``
+        resolve through the parent ctx chain. ``rank_map`` is the ONE shared
+        mutable dict set on the root ctx — this hook mutates it in place
+        across loop iterations (HAZARD H1).
         """
-        # Required slots — direct get(): a missing one is a wiring bug and
-        # SHOULD raise. Optional slots are has()-guarded.
-        if not ctx.has("moe_layers"):
-            return
+        ref = ctx.get("layer_ref")
+        ranks = ctx.get("ranks")
+        per_expert_ranks = ctx.get("per_expert_ranks")
+        A_cov = ctx.get("A_cov")
+        B_acc = ctx.get("B_acc")
+        C_acc = ctx.get("C_acc")
+        B_cov_dtype = ctx.get("B_cov_dtype")
+        rank_map = ctx.get("rank_map")
+        device = ctx.get("device")
+        originals = ctx.get("originals")
+        bcov_spill_dir = ctx.get("bcov_spill_dir")
+        ccov_spill_dir = ctx.get("ccov_spill_dir")
+
+        # ---- VERBATIM per-layer factoring loop body from the monolith run() --
+        # When Swift-SVD+ gives per-expert ranks, allocate at the max rank
+        # across experts for each matrix type (the slot width). Experts with
+        # lower rank will be zero-padded; effective_ranks tracks the true rank.
+        if per_expert_ranks is not None:
+            ranks_layer = {
+                name: max(
+                    per_expert_ranks.get((ref.layer_idx, name, e), ranks[(ref.layer_idx, name)])
+                    for e in range(ref.num_routed_experts)
+                )
+                for name in MATRIX_NAMES
+            }
+        else:
+            ranks_layer = {
+                name: ranks[(ref.layer_idx, name)] for name in MATRIX_NAMES
+            }
+        # Lazy-load this layer's B-cov from the per-layer spill files.
+        # Keeps in-memory cov bounded to ~one layer (~3-5 GB at bf16).
+        # Assert (not silent fall-through) — a missing spill at this
+        # point would mean _aa_svd silently falls back to plain SVD for
+        # this whole layer's experts, ignoring the activation-aware
+        # weighting; we'd ship a degraded model. Crash loud instead.
+        loaded = B_acc.load_layer_from_disk(ref.layer_idx, bcov_spill_dir)
+        if not loaded:
+            raise RuntimeError(
+                f"Stage 3 factor: B-cov spill missing for layer {ref.layer_idx} "
+                f"at {bcov_spill_dir}/layer_{ref.layer_idx}.pt. The B-cov phase "
+                "should have produced this file. Investigate before proceeding."
+            )
+        # Also load cross-covariance C for this layer (if dual-forward was run).
+        if C_acc is not None and ccov_spill_dir is not None:
+            c_loaded = C_acc.load_layer_from_disk(ref.layer_idx, ccov_spill_dir)
+            if not c_loaded:
+                log.warning(
+                    "Stage 3 factor: cross-cov spill missing for layer %d — "
+                    "falling back to auto-covariance for this layer.",
+                    ref.layer_idx,
+                )
+        # Build FactoredExperts on the same device / dtype.
+        # Originals are already snapshotted to CPU (before α search);
+        # offload the dense expert module before allocating FactoredExperts
+        # to avoid brief double-occupancy OOM on 80 GB A100s.
+        ex = ref.experts_module
+        dtype = ex.gate_up_proj.dtype
+        dev = ex.gate_up_proj.device
+        ex.to("cpu")
+        torch.cuda.empty_cache()
+        new_factored = FactoredExperts(
+            num_experts=ref.num_routed_experts,
+            hidden_dim=ex.gate_up_proj.shape[-1],
+            intermediate_dim=ex.gate_up_proj.shape[1] // 2,
+            ranks=ranks_layer, dtype=dtype, device=dev,
+        )
+        # Fill factors by per-expert AA-SVD. Track relative reconstruction
+        # error per (layer, matrix) so the dashboard shows whether the chosen
+        # rank is enough — a "convergence in spirit" signal for the SVD.
+        # Per-expert weighted relative error: mean of ||(W-UV)L_B||/||WL_B|| across experts.
+        #
+        # Optimization: gate_proj and up_proj share the same B and C covariance
+        # (``_cov_lookup`` falls back from up_proj to gate_proj).  We precompute
+        # the eigh(B) decomposition + rhs product once per expert and reuse it
+        # for both projections, eliminating one eigh(2048×2048) call per expert
+        # (~7,200 redundant calls across 40 layers).
+        err_sum: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
+        n_per_matrix: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
+        k_eff_clip_count: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
+        for e in range(ref.num_routed_experts):
+            # --- Precompute shared eigh for gate_proj / up_proj ---
+            B_shared = _cov_lookup(B_acc.covariance, ref.layer_idx, e, "gate_proj")
+            A_shared = _cov_lookup(A_cov, ref.layer_idx, e, "gate_proj")
+            C_shared = None
+            if C_acc is not None:
+                C_shared = _cov_lookup(C_acc.covariance, ref.layer_idx, e, "gate_proj")
+            gate_up_decomp: _EighDecomp | None = None
+            if B_shared is not None:
+                try:
+                    gate_up_decomp = _precompute_eigh(
+                        B_shared, A_shared, C_shared,
+                        device=dev, storage_dtype=B_cov_dtype,
+                    )
+                except ValueError:
+                    pass  # falls through to plain SVD per matrix below
+
+            for name in MATRIX_NAMES:
+                W = originals[(ref.layer_idx, e, name)].to(device=dev, dtype=torch.float32)
+                # Per-expert rank from Swift-SVD+ if available, else group-uniform.
+                if per_expert_ranks is not None:
+                    k = per_expert_ranks.get((ref.layer_idx, name, e), ranks_layer[name])
+                else:
+                    k = ranks_layer[name]
+                if name in ("gate_proj", "up_proj") and gate_up_decomp is not None:
+                    # Reuse the precomputed eigh for gate_proj and up_proj.
+                    U_k, V_k, rel_err, k_eff = _aa_svd_precomputed(
+                        W, gate_up_decomp, k, device=dev,
+                    )
+                else:
+                    # down_proj has its own B (intermediate-dim covariance),
+                    # or gate_up_decomp failed — fall back to full _aa_svd.
+                    A = _cov_lookup(A_cov, ref.layer_idx, e, name)
+                    B = _cov_lookup(B_acc.covariance, ref.layer_idx, e, name)
+                    C = None
+                    if C_acc is not None:
+                        C = _cov_lookup(C_acc.covariance, ref.layer_idx, e, name)
+                    U_k, V_k, rel_err, k_eff = _aa_svd(
+                        W, A, B, k, C=C, device=dev, storage_dtype=B_cov_dtype,
+                    )
+                if k_eff < k:
+                    k_eff_clip_count[name] += 1
+                new_factored.set_factors(e, name, U_k, V_k, effective_rank=k_eff)
+                rank_map[f"L{ref.layer_idx}_E{e}_{name}"] = k
+                err_sum[name] += rel_err
+                n_per_matrix[name] += 1
+        # Swap in.
+        setattr(ref.mlp, "experts", new_factored)
+        ref.experts_module = new_factored
+        recon_metrics: dict[str, float] = {"stage3/recon_layer_idx": float(ref.layer_idx)}
+        for name in MATRIX_NAMES:
+            if n_per_matrix[name] > 0:
+                rel = err_sum[name] / n_per_matrix[name]
+                # Renamed from `recon_rel_err` post-bf16 fix: this is the
+                # B-weighted singular-value-tail ratio of M = W·L_B. The old
+                # key is dual-emitted as an alias so existing trackio
+                # dashboards keep working — TODO(post-launch): drop the alias
+                # once dashboards are migrated to `b_weighted_tail_ratio`.
+                recon_metrics[f"stage3/b_weighted_tail_ratio/{name}"] = rel
+                recon_metrics[f"stage3/recon_rel_err/{name}"] = rel
+                recon_metrics[f"stage3/k_eff_clip_count/{name}"] = float(k_eff_clip_count[name])
+                recon_metrics[f"stage3/k_eff_clip_ratio/{name}"] = (
+                    k_eff_clip_count[name] / max(n_per_matrix[name], 1)
+                )
+                # `b_weighted_tail_ratio` = ‖tail_S(M)‖/‖S(M)‖, the singular-
+                # value-tail proxy for ‖(W−UV)L_B‖/‖WL_B‖. Pre-fix code logged
+                # this same key as `rel_recon_err`; numbers from before commit
+                # e7e0fbf are not directly comparable.
+                log.info("  L%d %s rank=%d b_weighted_tail_ratio=%.4f k_eff_clipped=%d/%d",
+                         ref.layer_idx, name, ranks_layer[name], rel,
+                         k_eff_clip_count[name], n_per_matrix[name])
+        _trackio_log(recon_metrics)
+        log.info("  layer %d factored at ranks=%s", ref.layer_idx, ranks_layer)
+        # Drop this layer's B-cov and C-cov from memory now that we're done factoring
+        # it. The next iteration will lazy-load the next layer's spill.
+        B_acc.unload_layer(ref.layer_idx)
+        if C_acc is not None:
+            C_acc.unload_layer(ref.layer_idx)
