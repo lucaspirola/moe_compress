@@ -21,17 +21,17 @@ from moe_compress.stage2.plugins.ream_cost_post import ReamCostPostPlugin
 ])
 def test_is_enabled_explicit(cost_alignment, expected):
     cfg = {"stage2_reap_ream": {"cost_alignment": cost_alignment}}
-    assert ReamCostPostPlugin.is_enabled(cfg) is expected
+    assert ReamCostPostPlugin().is_enabled(cfg) is expected
 
 
 def test_is_enabled_default_missing_key():
     """Missing `cost_alignment` -> default 'pre' -> post plugin disabled."""
-    assert ReamCostPostPlugin.is_enabled({"stage2_reap_ream": {}}) is False
+    assert ReamCostPostPlugin().is_enabled({"stage2_reap_ream": {}}) is False
 
 
 def test_is_enabled_missing_block():
     """Missing `stage2_reap_ream` block -> default 'pre' -> post disabled."""
-    assert ReamCostPostPlugin.is_enabled({}) is False
+    assert ReamCostPostPlugin().is_enabled({}) is False
 
 
 def test_compute_cost_is_noop():

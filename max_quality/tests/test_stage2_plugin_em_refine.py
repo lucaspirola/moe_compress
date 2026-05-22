@@ -10,74 +10,63 @@ from __future__ import annotations
 
 import pathlib
 
-from moe_compress.stage2._framework.base import Stage2Plugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage2.plugins.em_refine import EmRefinePlugin
 
 
 # --- plugin contract ------------------------------------------------------
-def test_plugin_is_stage2plugin_subclass():
-    assert issubclass(EmRefinePlugin, Stage2Plugin)
+def test_plugin_conforms_to_pipeline_plugin():
+    assert isinstance(EmRefinePlugin(), PipelinePlugin)
 
 
 def test_plugin_name():
     assert EmRefinePlugin.name == "em_refine"
 
 
-def test_enabled_by_is_empty():
-    """Numeric-threshold gate → enabled_by stays empty, is_enabled overridden."""
-    assert EmRefinePlugin.enabled_by == ()
-
-
-def test_overrides_is_enabled():
-    """em_refinement_rounds is an int threshold, not a bool flag — the plugin
-    must override the base AND-of-flags is_enabled (mirrors ReamCost*Plugin)."""
-    assert EmRefinePlugin.is_enabled.__func__ is not Stage2Plugin.is_enabled.__func__
-
-
 # --- is_enabled numeric gate ---------------------------------------------
 def test_is_enabled_true_when_rounds_positive():
-    assert EmRefinePlugin.is_enabled(
+    assert EmRefinePlugin().is_enabled(
         {"stage2_reap_ream": {"em_refinement_rounds": 1}}
     ) is True
 
 
 def test_is_enabled_true_when_rounds_large():
-    assert EmRefinePlugin.is_enabled(
+    assert EmRefinePlugin().is_enabled(
         {"stage2_reap_ream": {"em_refinement_rounds": 5}}
     ) is True
 
 
 def test_is_enabled_false_when_rounds_zero():
-    assert EmRefinePlugin.is_enabled(
+    assert EmRefinePlugin().is_enabled(
         {"stage2_reap_ream": {"em_refinement_rounds": 0}}
     ) is False
 
 
 def test_is_enabled_false_when_rounds_negative():
     """A negative round count is as inert as 0 — EM's own guard is em_rounds<=0."""
-    assert EmRefinePlugin.is_enabled(
+    assert EmRefinePlugin().is_enabled(
         {"stage2_reap_ream": {"em_refinement_rounds": -1}}
     ) is False
 
 
 def test_is_enabled_false_when_key_missing():
-    assert EmRefinePlugin.is_enabled({"stage2_reap_ream": {}}) is False
+    assert EmRefinePlugin().is_enabled({"stage2_reap_ream": {}}) is False
 
 
 def test_is_enabled_false_when_block_missing():
-    assert EmRefinePlugin.is_enabled({}) is False
+    assert EmRefinePlugin().is_enabled({}) is False
 
 
 def test_is_enabled_false_when_non_numeric():
     """A non-numeric value falls back to disabled rather than crashing."""
-    assert EmRefinePlugin.is_enabled(
+    assert EmRefinePlugin().is_enabled(
         {"stage2_reap_ream": {"em_refinement_rounds": "abc"}}
     ) is False
 
 
 def test_is_enabled_coerces_numeric_string():
     """A numeric string is coerced via int() — '2' enables the plugin."""
-    assert EmRefinePlugin.is_enabled(
+    assert EmRefinePlugin().is_enabled(
         {"stage2_reap_ream": {"em_refinement_rounds": "2"}}
     ) is True
 

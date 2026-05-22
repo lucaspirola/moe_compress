@@ -9,7 +9,7 @@ The monolith re-imports ``_two_opt_refine`` so external callers (tests, the
 ``MOE_STAGE2_LEGACY_LOOP=1`` legacy-loop path, ``LegacyAdapter``) keep their
 import paths working unchanged.
 
-``TwoOptRefinePlugin`` is a scaffold-only ``Stage2Plugin`` — not yet on the live
+``TwoOptRefinePlugin`` is a scaffold-only plugin — not yet on the live
 phase walk (``LegacyAdapter.compute_assignment`` still calls ``_two_opt_refine``
 directly inside the bump loop); it gives T18 a per-refiner plugin to wire into
 the decomposed ``refine_assignment`` phase. Circular-import note: this module
@@ -23,7 +23,6 @@ from typing import Any
 
 import numpy as np
 
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
@@ -148,7 +147,7 @@ def _two_opt_refine(
     return result
 
 
-class TwoOptRefinePlugin(Stage2Plugin):
+class TwoOptRefinePlugin:
     """Plugin home for Direction D — the 2-opt local-refinement pass (T14 scaffold).
 
     Scaffold only: not yet on the live phase walk. ``LegacyAdapter.compute_assignment``
@@ -158,9 +157,7 @@ class TwoOptRefinePlugin(Stage2Plugin):
     ``refine_assignment`` phase.
 
     Config gate: enabled iff ``stage2_reap_ream.two_opt_refine`` is truthy.
-    ``two_opt_refine`` is a plain bool (default ``False``), so the base
-    ``Stage2Plugin.is_enabled`` (AND-of-``enabled_by``-flags) expresses the gate
-    directly — no override needed.
+    ``two_opt_refine`` is a plain bool (default ``False``).
 
     The greedy-only guard (``two_opt_refine`` is ignored unless
     ``assignment_solver == "greedy"``) is orchestration and STAYS in
@@ -168,7 +165,20 @@ class TwoOptRefinePlugin(Stage2Plugin):
     """
 
     name = "two_opt_refine"
-    enabled_by: tuple[str, ...] = ("two_opt_refine",)
+    paper = "Direction D: greedy + 2-opt local refinement of the assignment."
+    config_key = "stage2_reap_ream.two_opt_refine"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
+
+    def is_enabled(self, config: dict) -> bool:
+        """True iff ``stage2_reap_ream.two_opt_refine`` is truthy."""
+        s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
+        return bool(s2.get("two_opt_refine"))
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def refine_assignment(
         self, ctx: PipelineContext, asg: Any, delta: Any

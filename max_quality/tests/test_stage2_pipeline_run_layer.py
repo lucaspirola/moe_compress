@@ -23,10 +23,32 @@ from moe_compress.budget.solver import BudgetDecomposition
 from moe_compress.stage2._framework import (
     PipelineContext,
     Stage2Pipeline,
-    Stage2Plugin,
 )
 from moe_compress.stage2.plugins.legacy_adapter import LegacyAdapter
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.utils.model_io import iter_moe_layers
+
+
+def test_legacy_adapter_structural_conformance():
+    """LegacyAdapter satisfies the universal PipelinePlugin contract.
+
+    LegacyAdapter cannot be bare-instantiated (its __init__ takes ~39
+    keyword-only args), so its conformance is asserted at the class level:
+    every PipelinePlugin metadata attribute is present with the right type,
+    and the two universal core methods exist.
+    """
+    for attr in ("name", "paper", "config_key", "reads", "writes", "provides"):
+        assert hasattr(LegacyAdapter, attr), f"LegacyAdapter missing {attr!r}"
+    assert isinstance(LegacyAdapter.name, str)
+    assert isinstance(LegacyAdapter.paper, str)
+    assert isinstance(LegacyAdapter.config_key, str)
+    assert isinstance(LegacyAdapter.reads, tuple)
+    assert isinstance(LegacyAdapter.writes, tuple)
+    assert isinstance(LegacyAdapter.provides, tuple)
+    assert callable(getattr(LegacyAdapter, "is_enabled", None))
+    assert callable(getattr(LegacyAdapter, "contribute_artifact", None))
+    # The class object structurally satisfies the runtime_checkable Protocol.
+    assert isinstance(LegacyAdapter, PipelinePlugin)
 
 
 def _make_run_ctx(*, model, tokenizer, config, artifacts_dir,
@@ -112,11 +134,10 @@ def _run_stage1(model, config, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-class _CountingPlugin(Stage2Plugin):
+class _CountingPlugin:
     """Records every phase invocation in declaration order."""
 
     name = "counting"
-    enabled_by = ()
 
     def __init__(self):
         self.calls: list[str] = []
@@ -199,9 +220,8 @@ def test_run_layer_passes_partial_dir_to_write_artifacts(tmp_path):
     """write_artifacts receives partial_dir from any plugin that exposes it."""
     seen: dict[str, object] = {}
 
-    class _SnoopPlugin(Stage2Plugin):
+    class _SnoopPlugin:
         name = "snoop"
-        enabled_by = ()
 
         def __init__(self, partial_dir):
             self.partial_dir = partial_dir
@@ -223,9 +243,8 @@ def test_run_layer_threads_partial_dir_none_when_no_plugin_exposes_it(tmp_path):
     """A plugin without `partial_dir` attr still receives None at write_artifacts."""
     seen: dict[str, object] = {"partial_dir": "<sentinel>"}
 
-    class _SnoopPlugin(Stage2Plugin):
+    class _SnoopPlugin:
         name = "snoop"
-        enabled_by = ()
 
         def write_artifacts(self, ctx, partial_dir):
             seen["partial_dir"] = partial_dir

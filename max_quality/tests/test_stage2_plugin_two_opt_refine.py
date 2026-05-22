@@ -9,48 +9,38 @@ from __future__ import annotations
 
 import pathlib
 
-from moe_compress.stage2._framework.base import Stage2Plugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage2.plugins.two_opt_refine import TwoOptRefinePlugin
 
 
 # --- plugin contract ------------------------------------------------------
-def test_plugin_is_stage2plugin_subclass():
-    assert issubclass(TwoOptRefinePlugin, Stage2Plugin)
+def test_plugin_conforms_to_pipeline_plugin():
+    assert isinstance(TwoOptRefinePlugin(), PipelinePlugin)
 
 
 def test_plugin_name():
     assert TwoOptRefinePlugin.name == "two_opt_refine"
 
 
-def test_enabled_by_is_the_flag():
-    """Plain-bool gate → enabled_by carries the flag, base is_enabled used."""
-    assert TwoOptRefinePlugin.enabled_by == ("two_opt_refine",)
-
-
-def test_uses_base_is_enabled():
-    """No is_enabled override — the base AND-of-flags handles the bool gate."""
-    assert TwoOptRefinePlugin.is_enabled.__func__ is Stage2Plugin.is_enabled.__func__
-
-
 # --- is_enabled boolean gate ----------------------------------------------
 def test_is_enabled_true_when_flag_set():
-    assert TwoOptRefinePlugin.is_enabled(
+    assert TwoOptRefinePlugin().is_enabled(
         {"stage2_reap_ream": {"two_opt_refine": True}}
     ) is True
 
 
 def test_is_enabled_false_when_flag_false():
-    assert TwoOptRefinePlugin.is_enabled(
+    assert TwoOptRefinePlugin().is_enabled(
         {"stage2_reap_ream": {"two_opt_refine": False}}
     ) is False
 
 
 def test_is_enabled_false_when_key_missing():
-    assert TwoOptRefinePlugin.is_enabled({"stage2_reap_ream": {}}) is False
+    assert TwoOptRefinePlugin().is_enabled({"stage2_reap_ream": {}}) is False
 
 
 def test_is_enabled_false_when_block_missing():
-    assert TwoOptRefinePlugin.is_enabled({}) is False
+    assert TwoOptRefinePlugin().is_enabled({}) is False
 
 
 # --- refine_assignment is a documented no-op (scaffold) -------------------

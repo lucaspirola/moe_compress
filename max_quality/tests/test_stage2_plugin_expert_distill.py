@@ -10,77 +10,63 @@ from __future__ import annotations
 
 import pathlib
 
-from moe_compress.stage2._framework.base import Stage2Plugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage2.plugins.expert_distill import ExpertDistillPlugin
 
 
 # --- plugin contract ------------------------------------------------------
-def test_plugin_is_stage2plugin_subclass():
-    assert issubclass(ExpertDistillPlugin, Stage2Plugin)
+def test_plugin_conforms_to_pipeline_plugin():
+    assert isinstance(ExpertDistillPlugin(), PipelinePlugin)
 
 
 def test_plugin_name():
     assert ExpertDistillPlugin.name == "expert_distill"
 
 
-def test_enabled_by_is_empty():
-    """Numeric-threshold gate → enabled_by stays empty, is_enabled overridden."""
-    assert ExpertDistillPlugin.enabled_by == ()
-
-
-def test_overrides_is_enabled():
-    """expert_distill_steps is an int threshold, not a bool flag — the plugin
-    must override the base AND-of-flags is_enabled (mirrors EmRefinePlugin)."""
-    assert (
-        ExpertDistillPlugin.is_enabled.__func__
-        is not Stage2Plugin.is_enabled.__func__
-    )
-
-
 # --- is_enabled numeric gate ---------------------------------------------
 def test_is_enabled_true_when_steps_positive():
-    assert ExpertDistillPlugin.is_enabled(
+    assert ExpertDistillPlugin().is_enabled(
         {"stage2_reap_ream": {"expert_distill_steps": 1}}
     ) is True
 
 
 def test_is_enabled_true_when_steps_large():
-    assert ExpertDistillPlugin.is_enabled(
+    assert ExpertDistillPlugin().is_enabled(
         {"stage2_reap_ream": {"expert_distill_steps": 500}}
     ) is True
 
 
 def test_is_enabled_false_when_steps_zero():
-    assert ExpertDistillPlugin.is_enabled(
+    assert ExpertDistillPlugin().is_enabled(
         {"stage2_reap_ream": {"expert_distill_steps": 0}}
     ) is False
 
 
 def test_is_enabled_false_when_steps_negative():
     """A negative step count is as inert as 0 — the distill guard is steps<=0."""
-    assert ExpertDistillPlugin.is_enabled(
+    assert ExpertDistillPlugin().is_enabled(
         {"stage2_reap_ream": {"expert_distill_steps": -1}}
     ) is False
 
 
 def test_is_enabled_false_when_key_missing():
-    assert ExpertDistillPlugin.is_enabled({"stage2_reap_ream": {}}) is False
+    assert ExpertDistillPlugin().is_enabled({"stage2_reap_ream": {}}) is False
 
 
 def test_is_enabled_false_when_block_missing():
-    assert ExpertDistillPlugin.is_enabled({}) is False
+    assert ExpertDistillPlugin().is_enabled({}) is False
 
 
 def test_is_enabled_false_when_non_numeric():
     """A non-numeric value falls back to disabled rather than crashing."""
-    assert ExpertDistillPlugin.is_enabled(
+    assert ExpertDistillPlugin().is_enabled(
         {"stage2_reap_ream": {"expert_distill_steps": "abc"}}
     ) is False
 
 
 def test_is_enabled_coerces_numeric_string():
     """A numeric string is coerced via int() — '3' enables the plugin."""
-    assert ExpertDistillPlugin.is_enabled(
+    assert ExpertDistillPlugin().is_enabled(
         {"stage2_reap_ream": {"expert_distill_steps": "3"}}
     ) is True
 

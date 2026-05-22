@@ -29,7 +29,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 from ..grouping import _apply_skip_merge_floor
 
@@ -37,7 +36,7 @@ from ..grouping import _apply_skip_merge_floor
 _SKIP_MERGE_OFF = 100.0
 
 
-class SkipMergeFloorPlugin(Stage2Plugin):
+class SkipMergeFloorPlugin:
     """Plugin home for the Direction B skip-merge percentile mask.
 
     T12 status: functional but off the live phase walk. ``apply_cost_mask``
@@ -54,10 +53,12 @@ class SkipMergeFloorPlugin(Stage2Plugin):
     """
 
     name = "skip_merge_floor"
-    # Not a boolean-flag opt-in: the gate is a numeric threshold, so the base
-    # AND-of-flags is_enabled cannot express "skip_merge_percentile < 100.0".
-    # enabled_by stays empty and is_enabled is overridden below.
-    enabled_by: tuple[str, ...] = ()
+    paper = "Direction B: skip-merge percentile mask on the cost matrix."
+    config_key = "stage2_reap_ream.skip_merge_percentile"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
     def __init__(self, skip_merge_percentile: float = _SKIP_MERGE_OFF) -> None:
         """Store the percentile for ``apply_cost_mask``.
@@ -67,16 +68,18 @@ class SkipMergeFloorPlugin(Stage2Plugin):
         """
         self.skip_merge_percentile = float(skip_merge_percentile)
 
-    @classmethod
-    def is_enabled(cls, cfg: dict[str, Any]) -> bool:
+    def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.skip_merge_percentile`` is < 100.0.
 
         ``100.0`` (the default) and any missing key → False (OFF). Values
         above 100.0 are also OFF (nothing can sit strictly above a >100th
         percentile clamp). Only a value strictly below 100.0 turns it on.
         """
-        s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
+        s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
         return float(s2.get("skip_merge_percentile", _SKIP_MERGE_OFF)) < _SKIP_MERGE_OFF
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def apply_cost_mask(
         self, ctx: PipelineContext, delta: Any

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 
 
@@ -62,7 +61,7 @@ def _pick_effective_alignment(
     return configured
 
 
-class CapacityGatePlugin(Stage2Plugin):
+class CapacityGatePlugin:
     """Plugin home for the per-layer capacity-utilization gate (M3).
 
     T11 status: inert shell. ``LegacyAdapter.compute_assignment`` still calls
@@ -73,10 +72,19 @@ class CapacityGatePlugin(Stage2Plugin):
     """
 
     name = "capacity_gate"
-    # The gate is not a boolean-flag opt-in: it always runs (it may be a no-op
-    # downgrade, but it always *decides*). enabled_by stays empty so the base
-    # AND-of-flags is_enabled returns True for every config.
-    enabled_by: tuple[str, ...] = ()
+    paper = "Capacity-utilization gate: SLACK vs TIGHT cost-path selection (M3)."
+    config_key = "stage2_reap_ream"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
+
+    def is_enabled(self, config: dict) -> bool:
+        """The gate always runs (it may be a no-op downgrade, but it decides)."""
+        return True
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def compute_cost(self, ctx: PipelineContext) -> Any | None:
         """No-op for T11. See class docstring.

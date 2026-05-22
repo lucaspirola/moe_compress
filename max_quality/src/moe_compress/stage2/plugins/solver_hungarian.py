@@ -8,7 +8,7 @@ Imports ``_assign_mcf`` from ``solver_mcf`` as the capacitated-case fallback
 (when ``n_children > n_centroids`` Hungarian alone cannot solve the problem).
 The monolith re-imports ``_assign_hungarian``.
 
-``HungarianSolverPlugin`` is a scaffold-only ``Stage2Plugin`` (see
+``HungarianSolverPlugin`` is a scaffold-only plugin (see
 ``solver_greedy``). Circular-import note: this module imports only ``numpy``,
 ``scipy``, ``solver_mcf``, ``pipeline.base`` and ``pipeline.context`` — none of
 which import ``stage2_reap_ream``.
@@ -20,7 +20,6 @@ from typing import Any
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 from .solver_mcf import _assign_mcf
 
@@ -70,7 +69,7 @@ def _assign_hungarian(
     return assignment
 
 
-class HungarianSolverPlugin(Stage2Plugin):
+class HungarianSolverPlugin:
     """Plugin home for the Hungarian assignment solver (Task 13 scaffold).
 
     Scaffold only: not yet on the live phase walk. The bump loop in
@@ -81,12 +80,19 @@ class HungarianSolverPlugin(Stage2Plugin):
     """
 
     name = "solver_hungarian"
-    enabled_by: tuple[str, ...] = ()  # selector is a string match, not a flag
+    paper = "Rectangular Hungarian assignment solver via scipy."
+    config_key = "stage2_reap_ream.assignment_solver"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
-    @classmethod
-    def is_enabled(cls, cfg: dict[str, Any]) -> bool:
-        s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
+    def is_enabled(self, config: dict) -> bool:
+        s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
         return str(s2.get("assignment_solver", "greedy")).lower() == "hungarian"
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def solve_assignment(self, ctx: PipelineContext, delta: Any) -> Any | None:
         """Wrap `_assign_hungarian`. NOTE: not invoked by the current phase

@@ -10,7 +10,7 @@ import pathlib
 
 import numpy as np
 
-from moe_compress.stage2._framework.base import Stage2Plugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage2.grouping import _apply_skip_merge_floor
 from moe_compress.stage2.plugins.skip_merge_floor import (
     SkipMergeFloorPlugin,
@@ -20,52 +20,47 @@ from moe_compress.stage2.plugins.skip_merge_floor import (
 
 # --- plugin contract --------------------------------------------------------
 
-def test_plugin_is_stage2plugin_subclass():
-    assert issubclass(SkipMergeFloorPlugin, Stage2Plugin)
+def test_plugin_conforms_to_pipeline_plugin():
+    assert isinstance(SkipMergeFloorPlugin(), PipelinePlugin)
 
 
 def test_plugin_name():
     assert SkipMergeFloorPlugin.name == "skip_merge_floor"
 
 
-def test_enabled_by_is_empty():
-    """Numeric threshold gate → enabled_by stays empty, is_enabled overridden."""
-    assert SkipMergeFloorPlugin.enabled_by == ()
-
-
 # --- is_enabled numeric gate ------------------------------------------------
 
 def test_is_enabled_true_below_100():
-    assert SkipMergeFloorPlugin.is_enabled(
+    assert SkipMergeFloorPlugin().is_enabled(
         {"stage2_reap_ream": {"skip_merge_percentile": 95.0}}
     ) is True
 
 
 def test_is_enabled_false_at_off_sentinel():
     """100.0 is the OFF sentinel → disabled."""
-    assert SkipMergeFloorPlugin.is_enabled(
+    assert SkipMergeFloorPlugin().is_enabled(
         {"stage2_reap_ream": {"skip_merge_percentile": 100.0}}
     ) is False
 
 
 def test_is_enabled_false_when_key_missing():
     """Missing key defaults to 100.0 → disabled."""
-    assert SkipMergeFloorPlugin.is_enabled({"stage2_reap_ream": {}}) is False
+    assert SkipMergeFloorPlugin().is_enabled({"stage2_reap_ream": {}}) is False
 
 
 def test_is_enabled_false_when_block_missing():
-    assert SkipMergeFloorPlugin.is_enabled({}) is False
+    assert SkipMergeFloorPlugin().is_enabled({}) is False
 
 
 def test_is_enabled_false_above_100():
     """Values > 100 are also OFF (nothing sits strictly above a >100 clamp)."""
-    assert SkipMergeFloorPlugin.is_enabled(
+    assert SkipMergeFloorPlugin().is_enabled(
         {"stage2_reap_ream": {"skip_merge_percentile": 150.0}}
     ) is False
 
 
 def test_is_enabled_boundary_just_below_100():
-    assert SkipMergeFloorPlugin.is_enabled(
+    assert SkipMergeFloorPlugin().is_enabled(
         {"stage2_reap_ream": {"skip_merge_percentile": 99.9}}
     ) is True
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pathlib
 
-from moe_compress.stage2._framework.base import Stage2Plugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage2.plugins.merge_heal import MergeHealPlugin
 
 _HEAL_NAMES = (
@@ -24,48 +24,33 @@ _HEAL_NAMES = (
 
 
 # --- plugin contract ------------------------------------------------------
-def test_plugin_is_stage2plugin_subclass():
-    assert issubclass(MergeHealPlugin, Stage2Plugin)
+def test_plugin_conforms_to_pipeline_plugin():
+    assert isinstance(MergeHealPlugin(), PipelinePlugin)
 
 
 def test_plugin_name():
     assert MergeHealPlugin.name == "merge_heal"
 
 
-def test_enabled_by_is_merge_heal_enabled():
-    """Plain bool flag — base AND-of-flags is_enabled is used directly."""
-    assert MergeHealPlugin.enabled_by == ("merge_heal_enabled",)
-
-
-def test_does_not_override_is_enabled():
-    """merge_heal_enabled is a plain bool flag, so the base AND-of-flags
-    is_enabled expresses the gate exactly — no override (unlike
-    ExpertDistillPlugin / EmRefinePlugin)."""
-    assert (
-        MergeHealPlugin.is_enabled.__func__
-        is Stage2Plugin.is_enabled.__func__
-    )
-
-
 # --- is_enabled boolean gate ---------------------------------------------
 def test_is_enabled_true_when_flag_true():
-    assert MergeHealPlugin.is_enabled(
+    assert MergeHealPlugin().is_enabled(
         {"stage2_reap_ream": {"merge_heal_enabled": True}}
     ) is True
 
 
 def test_is_enabled_false_when_flag_false():
-    assert MergeHealPlugin.is_enabled(
+    assert MergeHealPlugin().is_enabled(
         {"stage2_reap_ream": {"merge_heal_enabled": False}}
     ) is False
 
 
 def test_is_enabled_false_when_key_missing():
-    assert MergeHealPlugin.is_enabled({"stage2_reap_ream": {}}) is False
+    assert MergeHealPlugin().is_enabled({"stage2_reap_ream": {}}) is False
 
 
 def test_is_enabled_false_when_block_missing():
-    assert MergeHealPlugin.is_enabled({}) is False
+    assert MergeHealPlugin().is_enabled({}) is False
 
 
 # --- pre_merge_snapshot / post_merge / write_artifacts are no-ops (scaffold)

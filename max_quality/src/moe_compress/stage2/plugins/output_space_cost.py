@@ -36,7 +36,6 @@ import torch.nn.functional as F
 
 from ...utils.activation_hooks import ReamCostAccumulator  # noqa: F401 — string type hint
 from ...utils.model_io import MATRIX_NAMES, MoELayerRef, build_banks
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 from ..permutation_align import (
     _PermAlignCache,  # noqa: F401 — resolves the string type hint
@@ -296,7 +295,7 @@ def _output_space_cost(
     return out
 
 
-class OutputSpaceCostPlugin(Stage2Plugin):
+class OutputSpaceCostPlugin:
     """Plugin home for the REAM output-space (Direction C) cost path.
 
     T10 status: inert shell. The legacy bump loop still calls
@@ -307,13 +306,14 @@ class OutputSpaceCostPlugin(Stage2Plugin):
     """
 
     name = "output_space_cost"
-    # enabled_by stays empty: the pre/post/output choice is a single tri-state
-    # config value, not a set of boolean flags, so the base AND-of-flags
-    # is_enabled cannot express "cost_alignment == 'output'". We override below.
-    enabled_by: tuple[str, ...] = ()
+    paper = "Direction C: output-space REAM merge-cost matrix builder."
+    config_key = "stage2_reap_ream.cost_alignment"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
-    @classmethod
-    def is_enabled(cls, cfg: dict[str, Any]) -> bool:
+    def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.cost_alignment`` resolves to ``"output"``.
 
         ``"output"`` is not the default, so a missing key or a missing
@@ -321,8 +321,11 @@ class OutputSpaceCostPlugin(Stage2Plugin):
         to match the ``str(...).lower()`` normalization done in
         ``stage2_reap_ream.run()`` (config validation).
         """
-        s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
+        s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
         return str(s2.get("cost_alignment", "pre")).lower() == "output"
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def compute_cost(self, ctx: PipelineContext) -> Any | None:
         """No-op for T10. See class docstring.

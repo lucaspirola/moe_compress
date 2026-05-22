@@ -17,16 +17,26 @@ import numpy as np
 
 from ...pipeline.context import PipelineContext
 from ...utils.activation_hooks import ReapAccumulator
-from .._framework.base import Stage2Plugin
 
 log = logging.getLogger(__name__)
 
 
-class ReapScoringPlugin(Stage2Plugin):
+class ReapScoringPlugin:
     """Construct and finalize the layer's ReapAccumulator; publish scores/freq."""
 
     name = "reap_scoring"
-    enabled_by = ()  # always-on; REAP scoring is mandatory for REAM centroid choice.
+    paper = "REAP scoring: per-layer ReapAccumulator deriving scores/freq slots."
+    config_key = "stage2_reap_ream"
+    reads: tuple[str, ...] = ("layer_ref",)
+    writes: tuple[str, ...] = ("reap_acc", "scores", "freq")
+    provides: tuple[str, ...] = ("reap_acc",)
+
+    def is_enabled(self, config: dict) -> bool:
+        """Always-on; REAP scoring is mandatory for REAM centroid choice."""
+        return True
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     # ------------------------------------------------------------------
     # Phase: on_layer_setup (runs BEFORE LegacyAdapter.on_layer_setup

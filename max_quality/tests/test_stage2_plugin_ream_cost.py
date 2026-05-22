@@ -24,17 +24,17 @@ from moe_compress.utils.model_io import iter_moe_layers
 ])
 def test_is_enabled_explicit(cost_alignment, expected):
     cfg = {"stage2_reap_ream": {"cost_alignment": cost_alignment}}
-    assert ReamCostPrePlugin.is_enabled(cfg) is expected
+    assert ReamCostPrePlugin().is_enabled(cfg) is expected
 
 
 def test_is_enabled_default_missing_key():
     """Missing `cost_alignment` -> default 'pre' -> enabled."""
-    assert ReamCostPrePlugin.is_enabled({"stage2_reap_ream": {}}) is True
+    assert ReamCostPrePlugin().is_enabled({"stage2_reap_ream": {}}) is True
 
 
 def test_is_enabled_missing_block():
     """Missing `stage2_reap_ream` block -> default 'pre' -> enabled."""
-    assert ReamCostPrePlugin.is_enabled({}) is True
+    assert ReamCostPrePlugin().is_enabled({}) is True
 
 
 def test_compute_cost_is_noop():

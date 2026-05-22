@@ -31,7 +31,6 @@ from ...utils.activation_hooks import (
     ReamCostAccumulator,
 )
 from ...utils.model_io import MoELayerRef, build_banks
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 from ..permutation_align import (
     _PermAlignCache,  # noqa: F401 — resolves the string type hint
@@ -225,7 +224,7 @@ def _post_alignment_cost(
     return out
 
 
-class ReamCostPostPlugin(Stage2Plugin):
+class ReamCostPostPlugin:
     """Plugin home for the REAM post-alignment whitened-residual cost path.
 
     T9 status: inert shell. The legacy bump loop still calls
@@ -236,13 +235,14 @@ class ReamCostPostPlugin(Stage2Plugin):
     """
 
     name = "ream_cost_post"
-    # enabled_by stays empty: the pre/post/output choice is a single tri-state
-    # config value, not a set of boolean flags, so the base AND-of-flags
-    # is_enabled cannot express "cost_alignment == 'post'". We override below.
-    enabled_by: tuple[str, ...] = ()
+    paper = "REAM post-alignment whitened-residual cost matrix builder."
+    config_key = "stage2_reap_ream.cost_alignment"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
-    @classmethod
-    def is_enabled(cls, cfg: dict[str, Any]) -> bool:
+    def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.cost_alignment`` resolves to ``"post"``.
 
         Unlike ``"pre"``, ``"post"`` is not the default, so a missing key or a
@@ -250,8 +250,11 @@ class ReamCostPostPlugin(Stage2Plugin):
         Case-insensitive to match the ``str(...).lower()`` normalization done
         in ``stage2_reap_ream.run()`` (config validation).
         """
-        s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
+        s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
         return str(s2.get("cost_alignment", "pre")).lower() == "post"
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def compute_cost(self, ctx: PipelineContext) -> Any | None:
         """No-op for T9. See class docstring.

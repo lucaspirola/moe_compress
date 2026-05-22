@@ -34,17 +34,17 @@ def test_output_branch_uses_plugin_module():
 ])
 def test_is_enabled_explicit(cost_alignment, expected):
     cfg = {"stage2_reap_ream": {"cost_alignment": cost_alignment}}
-    assert OutputSpaceCostPlugin.is_enabled(cfg) is expected
+    assert OutputSpaceCostPlugin().is_enabled(cfg) is expected
 
 
 def test_is_enabled_default_missing_key():
     """Missing `cost_alignment` -> default 'pre' -> output plugin disabled."""
-    assert OutputSpaceCostPlugin.is_enabled({"stage2_reap_ream": {}}) is False
+    assert OutputSpaceCostPlugin().is_enabled({"stage2_reap_ream": {}}) is False
 
 
 def test_is_enabled_missing_block():
     """Missing `stage2_reap_ream` block -> default 'pre' -> output disabled."""
-    assert OutputSpaceCostPlugin.is_enabled({}) is False
+    assert OutputSpaceCostPlugin().is_enabled({}) is False
 
 
 def test_compute_cost_is_noop():

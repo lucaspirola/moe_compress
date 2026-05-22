@@ -32,7 +32,7 @@ Circular-import note: this module imports only ``moe_compress.utils.*``
 ``merge_heal``. There is therefore no cycle at module load, and every import
 below is a plain module-top import (no function-scope late imports).
 
-``MergeHealPlugin`` is a scaffold-only ``Stage2Plugin`` — not yet on the live
+``MergeHealPlugin`` is a scaffold-only plugin — not yet on the live
 phase walk. ``LegacyAdapter.pre_merge_snapshot`` / ``post_merge`` /
 ``write_artifacts`` still call ``_capture_mlp_io`` / ``_make_shared_out_fn`` /
 ``_heal_layer`` / ``_summarize_distill_state`` directly (via a late
@@ -58,7 +58,6 @@ from ...utils.activation_shards import (
     ShardWriter,
 )
 from ...utils.model_io import MATRIX_NAMES, MoELayerRef, build_banks
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 from .output_space_cost import _swiglu_forward
 
@@ -999,7 +998,7 @@ def _summarize_distill_state(
     }
 
 
-class MergeHealPlugin(Stage2Plugin):
+class MergeHealPlugin:
     """Per-layer merge-heal (Task 17 of the plugin-architecture refactor).
 
     T17 status: scaffold only — NOT on the live phase walk.
@@ -1014,17 +1013,24 @@ class MergeHealPlugin(Stage2Plugin):
     phases.
 
     Config gate: enabled iff ``stage2_reap_ream.merge_heal_enabled`` is truthy.
-    Unlike ``ExpertDistillPlugin`` / ``EmRefinePlugin`` (numeric-threshold
-    knobs), ``merge_heal_enabled`` is a plain boolean flag (default False), so
-    the base ``Stage2Plugin.is_enabled`` (AND-of-truthy-``enabled_by``-flags)
-    expresses the gate exactly — no ``is_enabled`` override is needed. This is
-    the first plugin in the refactor to use a non-empty ``enabled_by`` tuple
-    with the base ``is_enabled``.
+    ``merge_heal_enabled`` is a plain boolean flag (default False).
     """
 
     name = "merge_heal"
-    # Plain bool flag: the base AND-of-flags is_enabled works directly.
-    enabled_by: tuple[str, ...] = ("merge_heal_enabled",)
+    paper = "Per-layer merge-heal by self-distillation toward pre-merge output."
+    config_key = "stage2_reap_ream.merge_heal_enabled"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
+
+    def is_enabled(self, config: dict) -> bool:
+        """True iff ``stage2_reap_ream.merge_heal_enabled`` is truthy."""
+        s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
+        return bool(s2.get("merge_heal_enabled"))
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def pre_merge_snapshot(self, ctx: PipelineContext) -> None:
         """Documented no-op for T17.

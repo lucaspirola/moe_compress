@@ -35,7 +35,6 @@ from ...utils.activation_shards import ShardManifest, ShardWriter
 from ...utils.model_io import build_banks
 from ...utils.trackio_log import trackio_log as _trackio_log
 from ...pipeline.context import PipelineContext
-from .._framework.base import Stage2Plugin
 from ..grouping import _apply_skip_merge_floor, _promote_orphans
 from ..merging import _merge_experts_inplace, _resize_router_for_kept_experts
 from ..permutation_align import _PermAlignCache
@@ -52,11 +51,39 @@ from .reap_scoring import select_centroids_by_reap
 log = logging.getLogger(__name__)
 
 
-class LegacyAdapter(Stage2Plugin):
+class LegacyAdapter:
     """All-in-one adapter — every phase hook is a verbatim slice of the legacy loop."""
 
     name = "legacy_adapter"
-    enabled_by = ()  # always on; pipeline composes exactly [LegacyAdapter] for T6.
+    paper = "All-in-one adapter holding the legacy per-layer loop body."
+    config_key = "stage2_reap_ream"
+    reads: tuple[str, ...] = (
+        "layer_ref", "reap_acc", "ream_acc", "layer_input_acc", "perm_cache",
+        "target", "scores", "freq", "grouped", "pre_merge_weights", "protected",
+        "ream_centroid_ids", "nemo_writer", "xd_writer", "final_kept_ids",
+        "heal_state", "distill_state", "n_experts", "n_protected",
+        "assigned_cost", "n_assigned", "c_fail", "em_rounds_done",
+        "effective_cost_alignment", "effective_cost_asymmetric",
+        "capacity_util_value", "effective_target", "mean_assigned_cost",
+    )
+    writes: tuple[str, ...] = (
+        "ream_acc", "perm_cache", "layer_input_acc", "protected",
+        "ream_centroid_ids", "ream_noncentroid_ids", "assignment", "delta",
+        "grouped", "mean_assigned_cost", "n_protected", "assigned_cost",
+        "n_assigned", "b_fail", "c_fail", "em_rounds_done",
+        "effective_cost_alignment", "effective_cost_asymmetric",
+        "capacity_util_value", "effective_target", "nemo_writer", "xd_writer",
+        "pre_merge_weights", "layer_merged", "distill_state", "final_kept_ids",
+        "heal_state", "reap_acc",
+    )
+    provides: tuple[str, ...] = ()
+
+    def is_enabled(self, config: dict) -> bool:
+        """Always on; pipeline composes exactly [LegacyAdapter] for T6."""
+        return True
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def __init__(
         self,

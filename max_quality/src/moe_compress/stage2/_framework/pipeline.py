@@ -12,8 +12,9 @@ when they extract real cost / solver / refine plugins. See
 """
 from __future__ import annotations
 
+from typing import Any
+
 from ...pipeline.context import PipelineContext
-from .base import Stage2Plugin
 
 
 class Stage2Pipeline:
@@ -21,9 +22,10 @@ class Stage2Pipeline:
 
     # Canonical per-layer phase order (T6 execution tuple). The four fine-grained
     # sub-hooks (``compute_cost``, ``apply_cost_mask``, ``solve_assignment``,
-    # ``refine_assignment``) remain declared on ``Stage2Plugin`` for future tasks
-    # but are NOT iterated here — the LegacyAdapter folds them into
-    # ``compute_assignment`` so the bump-loop control flow stays intact.
+    # ``refine_assignment``) are an open vocabulary discovered reflectively by
+    # the tolerant ``getattr`` walk below; they are NOT iterated here — the
+    # LegacyAdapter folds them into ``compute_assignment`` so the bump-loop
+    # control flow stays intact.
     phases: tuple[str, ...] = (
         "on_layer_setup",
         "on_profile",
@@ -36,8 +38,8 @@ class Stage2Pipeline:
         "on_layer_teardown",
     )
 
-    def __init__(self, plugins: list[Stage2Plugin]) -> None:
-        self.plugins: list[Stage2Plugin] = list(plugins)
+    def __init__(self, plugins: list[Any]) -> None:
+        self.plugins: list[Any] = list(plugins)
 
     def run_setup(self, run_ctx: PipelineContext) -> None:
         """Call ``on_run_setup`` on every plugin in registration order.

@@ -38,18 +38,18 @@ def test_solver_mcf_module_imports_without_ortools():
 def test_is_enabled_matches_only_its_solver(plugin_cls, solver_name):
     for candidate in ["greedy", "hungarian", "mcf", "sinkhorn", "auto"]:
         cfg = {"stage2_reap_ream": {"assignment_solver": candidate}}
-        assert plugin_cls.is_enabled(cfg) is (candidate == solver_name)
+        assert plugin_cls().is_enabled(cfg) is (candidate == solver_name)
 
 
 def test_is_enabled_missing_key_defaults_to_greedy():
     # assignment_solver defaults to "greedy" -> only GreedySolverPlugin on.
     empty = {"stage2_reap_ream": {}}
-    assert solver_greedy.GreedySolverPlugin.is_enabled(empty) is True
+    assert solver_greedy.GreedySolverPlugin().is_enabled(empty) is True
     for cls in (solver_hungarian.HungarianSolverPlugin,
                 solver_mcf.McfSolverPlugin,
                 solver_sinkhorn.SinkhornSolverPlugin,
                 solver_auto.AutoSolverPlugin):
-        assert cls.is_enabled(empty) is False
+        assert cls().is_enabled(empty) is False
 
 
 # --- dispatcher == direct solver call (greedy/hungarian/sinkhorn) ---------

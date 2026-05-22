@@ -17,7 +17,7 @@ Circular-import note: this module imports only ``pipeline.base``,
 ``em_refine``. There is therefore no cycle at module load, and every import
 below is a plain module-top import (no function-scope late imports needed).
 
-``EmRefinePlugin`` is a scaffold-only ``Stage2Plugin`` — not yet on the live
+``EmRefinePlugin`` is a scaffold-only plugin — not yet on the live
 phase walk (``LegacyAdapter.compute_assignment`` still calls
 ``_em_refine_assignment`` directly inside the bump loop, and the
 ``MOE_STAGE2_LEGACY_LOOP=1`` path does too); it gives T18 a per-refiner plugin
@@ -35,7 +35,6 @@ from ...utils.activation_hooks import (
     ReamCostAccumulator,
 )
 from ...utils.model_io import MoELayerRef, build_banks
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 from ..grouping import _apply_skip_merge_floor, _build_grouped_from_assignment
 from ..permutation_align import (
@@ -235,7 +234,7 @@ def _em_refine_assignment(
     return assignment, delta, rounds_done
 
 
-class EmRefinePlugin(Stage2Plugin):
+class EmRefinePlugin:
     """Plugin home for Stage 2 v2 EM refinement (spec § 5 step 4T(e) / M4).
 
     T15 status: scaffold only — NOT on the live phase walk.
@@ -245,21 +244,18 @@ class EmRefinePlugin(Stage2Plugin):
     per-refiner plugin to wire into the decomposed ``refine_assignment`` phase.
 
     Config gate: enabled iff ``stage2_reap_ream.em_refinement_rounds`` is a
-    positive integer. ``em_refinement_rounds`` is a numeric knob (default 0),
-    not a boolean flag, so the base ``Stage2Plugin.is_enabled``
-    (AND-of-truthy-``enabled_by``-flags) cannot express the ``> 0`` threshold
-    precisely — we override ``is_enabled`` below, mirroring the
-    ``ReamCostPrePlugin`` / ``ReamCostPostPlugin`` numeric/tri-state pattern.
+    positive integer. ``em_refinement_rounds`` is a numeric knob (default 0).
     """
 
     name = "em_refine"
-    # enabled_by stays empty: em_refinement_rounds is an int threshold knob,
-    # not a boolean flag, so the base AND-of-flags is_enabled cannot express
-    # "em_refinement_rounds > 0". We override below.
-    enabled_by: tuple[str, ...] = ()
+    paper = "Stage 2 v2 EM refinement loop (spec § 5 step 4T(e) / M4)."
+    config_key = "stage2_reap_ream.em_refinement_rounds"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
-    @classmethod
-    def is_enabled(cls, cfg: dict[str, Any]) -> bool:
+    def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.em_refinement_rounds`` > 0.
 
         Defaults to 0 (EM off) → a missing key / block leaves the plugin
@@ -267,11 +263,14 @@ class EmRefinePlugin(Stage2Plugin):
         guard inside ``_em_refine_assignment``; a non-numeric value falls back
         to disabled rather than crashing config discovery.
         """
-        s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
+        s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
         try:
             return int(s2.get("em_refinement_rounds", 0)) > 0
         except (TypeError, ValueError):
             return False
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def refine_assignment(
         self, ctx: PipelineContext, asg: Any, delta: Any

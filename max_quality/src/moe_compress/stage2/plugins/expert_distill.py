@@ -14,7 +14,7 @@ Circular-import note: this module imports only ``moe_compress.utils.model_io``,
 ``expert_distill``. There is therefore no cycle at module load, and every
 import below is a plain module-top import (no function-scope late imports).
 
-``ExpertDistillPlugin`` is a scaffold-only ``Stage2Plugin`` — not yet on the
+``ExpertDistillPlugin`` is a scaffold-only plugin — not yet on the
 live phase walk. ``LegacyAdapter.pre_merge_snapshot`` / ``LegacyAdapter.merge``
 still call ``_snapshot_pre_merge_layer_experts`` / ``_distill_merged_group``
 directly (via a late ``from ...stage2_reap_ream import ...``), and the
@@ -32,7 +32,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...utils.model_io import MATRIX_NAMES, MoELayerRef, build_banks
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 from .output_space_cost import _swiglu_forward
 
@@ -184,7 +183,7 @@ def _distill_merged_group(
     }
 
 
-class ExpertDistillPlugin(Stage2Plugin):
+class ExpertDistillPlugin:
     """Plugin home for Stage 2 per-merge-group expert distillation
     (spec § 5 step 7b / M8).
 
@@ -197,21 +196,18 @@ class ExpertDistillPlugin(Stage2Plugin):
     ``pre_merge_snapshot`` / ``post_merge`` phases.
 
     Config gate: enabled iff ``stage2_reap_ream.expert_distill_steps`` is a
-    positive integer. ``expert_distill_steps`` is a numeric knob (default 0),
-    not a boolean flag, so the base ``Stage2Plugin.is_enabled``
-    (AND-of-truthy-``enabled_by``-flags) cannot express the ``> 0`` threshold
-    precisely — we override ``is_enabled`` below, mirroring ``EmRefinePlugin``
-    and the ``ReamCost*Plugin`` numeric/tri-state pattern.
+    positive integer. ``expert_distill_steps`` is a numeric knob (default 0).
     """
 
     name = "expert_distill"
-    # enabled_by stays empty: expert_distill_steps is an int threshold knob,
-    # not a boolean flag, so the base AND-of-flags is_enabled cannot express
-    # "expert_distill_steps > 0". We override below.
-    enabled_by: tuple[str, ...] = ()
+    paper = "Per-merge-group expert distillation (spec § 5 step 7b / M8)."
+    config_key = "stage2_reap_ream.expert_distill_steps"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
-    @classmethod
-    def is_enabled(cls, cfg: dict[str, Any]) -> bool:
+    def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.expert_distill_steps`` > 0.
 
         Defaults to 0 (distillation off) → a missing key / block leaves the
@@ -219,11 +215,14 @@ class ExpertDistillPlugin(Stage2Plugin):
         ``steps <= 0`` guard inside ``_distill_merged_group``; a non-numeric
         value falls back to disabled rather than crashing config discovery.
         """
-        s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
+        s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
         try:
             return int(s2.get("expert_distill_steps", 0)) > 0
         except (TypeError, ValueError):
             return False
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def pre_merge_snapshot(self, ctx: PipelineContext) -> None:
         """Documented no-op for T16.

@@ -32,7 +32,6 @@ from ...utils.activation_hooks import (
     ReamCostAccumulator,
 )
 from ...utils.model_io import MoELayerRef
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 from ..permutation_align import _PermAlignCache  # noqa: F401 — string type hint
 
@@ -249,7 +248,7 @@ def _ream_cost_matrix(
     )
 
 
-class ReamCostPrePlugin(Stage2Plugin):
+class ReamCostPrePlugin:
     """Plugin home for the REAM symmetric ``pre`` cost path.
 
     T8 status: inert shell. ``LegacyAdapter.compute_assignment`` still calls
@@ -260,13 +259,14 @@ class ReamCostPrePlugin(Stage2Plugin):
     """
 
     name = "ream_cost_pre"
-    # enabled_by stays empty: the pre/post/output choice is a single tri-state
-    # config value, not a set of boolean flags, so the base AND-of-flags
-    # is_enabled cannot express "cost_alignment == 'pre'". We override below.
-    enabled_by: tuple[str, ...] = ()
+    paper = "REAM symmetric pre-alignment cost matrix builder."
+    config_key = "stage2_reap_ream.cost_alignment"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
-    @classmethod
-    def is_enabled(cls, cfg: dict[str, Any]) -> bool:
+    def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.cost_alignment`` resolves to ``"pre"``.
 
         ``"pre"`` is also the default, so a missing key / missing
@@ -274,8 +274,11 @@ class ReamCostPrePlugin(Stage2Plugin):
         match the ``str(...).lower()`` normalization done in
         ``stage2_reap_ream.run()`` (config validation).
         """
-        s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
+        s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
         return str(s2.get("cost_alignment", "pre")).lower() == "pre"
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def compute_cost(self, ctx: PipelineContext) -> Any | None:
         """No-op for T8. See class docstring.

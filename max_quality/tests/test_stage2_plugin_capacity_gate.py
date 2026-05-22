@@ -9,7 +9,7 @@ import pathlib
 
 import pytest
 
-from moe_compress.stage2._framework.base import Stage2Plugin
+from moe_compress.pipeline.plugin import PipelinePlugin
 from moe_compress.stage2.plugins.capacity_gate import (
     CapacityGatePlugin,
     _pick_effective_alignment,
@@ -27,8 +27,8 @@ def test_legacy_adapter_imports_from_capacity_gate():
 
 # --- CapacityGatePlugin contract -------------------------------------------
 
-def test_plugin_is_stage2plugin_subclass():
-    assert issubclass(CapacityGatePlugin, Stage2Plugin)
+def test_plugin_conforms_to_pipeline_plugin():
+    assert isinstance(CapacityGatePlugin(), PipelinePlugin)
 
 
 def test_plugin_name():
@@ -36,11 +36,10 @@ def test_plugin_name():
 
 
 def test_plugin_always_enabled():
-    """enabled_by is empty → is_enabled is True for every config shape."""
-    assert CapacityGatePlugin.enabled_by == ()
-    assert CapacityGatePlugin.is_enabled({}) is True
-    assert CapacityGatePlugin.is_enabled({"stage2_reap_ream": {}}) is True
-    assert CapacityGatePlugin.is_enabled(
+    """The gate always runs → is_enabled is True for every config shape."""
+    assert CapacityGatePlugin().is_enabled({}) is True
+    assert CapacityGatePlugin().is_enabled({"stage2_reap_ream": {}}) is True
+    assert CapacityGatePlugin().is_enabled(
         {"stage2_reap_ream": {"cost_alignment": "post"}}
     ) is True
 

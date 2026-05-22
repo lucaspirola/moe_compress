@@ -7,7 +7,7 @@ Extracted verbatim from ``stage2_reap_ream`` in Task 13.
 Imports ``_assign_greedy`` from ``solver_greedy`` as the infeasible-slack /
 no-finite-entries fallback. The monolith re-imports ``_assign_sinkhorn``.
 
-``SinkhornSolverPlugin`` is a scaffold-only ``Stage2Plugin`` (see
+``SinkhornSolverPlugin`` is a scaffold-only plugin (see
 ``solver_greedy``). Circular-import note: this module imports only ``numpy``,
 ``scipy``, ``solver_greedy``, ``pipeline.base`` and ``pipeline.context`` — none
 of which import ``stage2_reap_ream``.
@@ -20,7 +20,6 @@ from typing import Any
 import numpy as np
 from scipy.special import logsumexp
 
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 from .solver_greedy import _assign_greedy
 
@@ -147,7 +146,7 @@ def _assign_sinkhorn(
     return assignment
 
 
-class SinkhornSolverPlugin(Stage2Plugin):
+class SinkhornSolverPlugin:
     """Plugin home for the Sinkhorn assignment solver (Task 13 scaffold).
 
     Scaffold only: not yet on the live phase walk. The bump loop in
@@ -158,12 +157,19 @@ class SinkhornSolverPlugin(Stage2Plugin):
     """
 
     name = "solver_sinkhorn"
-    enabled_by: tuple[str, ...] = ()  # selector is a string match, not a flag
+    paper = "Capacitated entropy-regularized OT assignment via Sinkhorn-Knopp."
+    config_key = "stage2_reap_ream.assignment_solver"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
-    @classmethod
-    def is_enabled(cls, cfg: dict[str, Any]) -> bool:
-        s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
+    def is_enabled(self, config: dict) -> bool:
+        s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
         return str(s2.get("assignment_solver", "greedy")).lower() == "sinkhorn"
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def solve_assignment(self, ctx: PipelineContext, delta: Any) -> Any | None:
         """Wrap `_assign_sinkhorn`. NOTE: not invoked by the current phase walk

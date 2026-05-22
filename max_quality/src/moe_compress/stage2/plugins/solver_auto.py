@@ -11,7 +11,7 @@ Imports ``_assign_hungarian`` and ``_assign_mcf`` from the sibling solver
 modules; it deliberately does **not** import the full ``SOLVERS`` registry —
 ``solver_dispatch`` is the hub, ``solver_auto`` only owns the auto heuristic.
 
-``AutoSolverPlugin`` is a scaffold-only ``Stage2Plugin`` (see ``solver_greedy``).
+``AutoSolverPlugin`` is a scaffold-only plugin (see ``solver_greedy``).
 Circular-import note: this module imports only ``solver_hungarian``,
 ``solver_mcf``, ``pipeline.base`` and ``pipeline.context`` — none of which
 import ``stage2_reap_ream``.
@@ -22,7 +22,6 @@ from typing import Any
 
 import numpy as np
 
-from .._framework.base import Stage2Plugin
 from ...pipeline.context import PipelineContext
 from .solver_hungarian import _assign_hungarian
 from .solver_mcf import _assign_mcf
@@ -44,7 +43,7 @@ def _assign_auto(
     return _assign_mcf(cost, n_children, n_centroids, max_group_cap)
 
 
-class AutoSolverPlugin(Stage2Plugin):
+class AutoSolverPlugin:
     """Plugin home for the auto-pick assignment solver (Task 13 scaffold).
 
     Scaffold only: not yet on the live phase walk. The bump loop in
@@ -55,12 +54,19 @@ class AutoSolverPlugin(Stage2Plugin):
     """
 
     name = "solver_auto"
-    enabled_by: tuple[str, ...] = ()  # selector is a string match, not a flag
+    paper = "Auto-pick assignment solver: hungarian in slack, mcf in tight."
+    config_key = "stage2_reap_ream.assignment_solver"
+    # () until a later task wires the live hook
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
 
-    @classmethod
-    def is_enabled(cls, cfg: dict[str, Any]) -> bool:
-        s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
+    def is_enabled(self, config: dict) -> bool:
+        s2 = config.get("stage2_reap_ream", {}) if isinstance(config, dict) else {}
         return str(s2.get("assignment_solver", "greedy")).lower() == "auto"
+
+    def contribute_artifact(self, ctx) -> dict:
+        return {}
 
     def solve_assignment(self, ctx: PipelineContext, delta: Any) -> Any | None:
         """Wrap `_assign_auto`. NOTE: not invoked by the current phase walk
