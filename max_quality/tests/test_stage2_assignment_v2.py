@@ -606,7 +606,17 @@ def _make_post_alignment_test_setup(monkeypatch):
         "down_proj": _FakeBank({eid: weights[eid]["down_proj"] for eid in weights}),
     }
 
+    # ``_post_alignment_cost`` lives in ``stage2.plugins.ream_cost_post`` and
+    # ``_em_compute_tentative_weights`` in ``stage2.plugins.em_refine`` under the
+    # Stage 2 plugin refactor; each function resolves ``build_banks`` from its
+    # OWN module namespace, so both bindings must be patched. The
+    # ``stage2_reap_ream`` patch is kept defensively for any other
+    # monolith-resident code path a test in this file might exercise.
+    import moe_compress.stage2.plugins.em_refine as _em_refine
+    import moe_compress.stage2.plugins.ream_cost_post as _ream_cost_post
     monkeypatch.setattr(stage2_reap_ream, "build_banks", lambda layer_ref: banks)
+    monkeypatch.setattr(_ream_cost_post, "build_banks", lambda layer_ref: banks)
+    monkeypatch.setattr(_em_refine, "build_banks", lambda layer_ref: banks)
 
     class _FakeReamAcc:
         """Minimal accumulator that returns deterministic stub values so the
@@ -1250,16 +1260,24 @@ def test_summarize_distill_state_aggregates_real_groups():
 
 @pytest.fixture
 def _captured_trackio_emits(monkeypatch):
-    """Monkey-patch ``_trackio_log`` in stage2_reap_ream to record every dict
-    passed to it during Stage 2. Returns the list reference so tests can
-    inspect the captured emits afterward."""
+    """Monkey-patch ``_trackio_log`` to record every dict passed to it during
+    Stage 2. Returns the list reference so tests can inspect the captured
+    emits afterward.
+
+    Both namespaces are patched: the per-layer emit lives in
+    ``stage2.plugins.legacy_adapter`` under the Stage 2 plugin refactor (it
+    imports ``trackio_log`` into its own module binding), while the static
+    config emit still lives in ``stage2_reap_ream``. Patching only one
+    namespace would silently miss the other code path."""
     from moe_compress import stage2_reap_ream
+    from moe_compress.stage2.plugins import legacy_adapter as _legacy_adapter
     captured: list[dict] = []
 
     def _capture(metrics: dict) -> None:
         captured.append(dict(metrics))
 
     monkeypatch.setattr(stage2_reap_ream, "_trackio_log", _capture)
+    monkeypatch.setattr(_legacy_adapter, "_trackio_log", _capture)
     return captured
 
 
