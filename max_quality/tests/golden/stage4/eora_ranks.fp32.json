@@ -1,0 +1,9 @@
+{
+  "compensated_params": 0,
+  "config": {
+    "compensation_budget_pct": 0.03,
+    "eigenspace_rank_cap": 4,
+    "per_expert": true
+  },
+  "rank_map": {}
+}

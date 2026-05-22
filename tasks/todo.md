@@ -65,7 +65,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S3-8  Stage-3 orchestrator test — test_stage3_orchestrator.py (registry/phase-order/artifact-set)
 
 ## Stage 4 — EoRA (Part 5.2)
-- [ ] S4-0  Capture stage-4 golden
+- [x] S4-0  Capture stage-4 golden — test_stage4_golden_snapshot.py (eora_ranks.json, fp32+bf16)
 - [ ] S4-1  Scaffold stage4/ package
 - [ ] S4-2  eora_inputs plugin
 - [ ] S4-3  eora_compensation plugin
