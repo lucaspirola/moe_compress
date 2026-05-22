@@ -77,7 +77,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] RK-0  Capture router-KD goldens ×2 — test_router_kd_golden_snapshot.py (stage2p5+stage5; metadata+loss-trace)
 - [x] RK-1  Scaffold router_kd/ package — __init__/context/orchestrator/plugins + make_router_kd_stage factory
 - [x] RK-2  trainable_scope plugin — _freeze_non_routers relocated + conflict-check reproduced in inert hook
-- [ ] RK-3  kd_optimizer plugin
+- [x] RK-3  kd_optimizer plugin — split-group AdamW + _lr_lambda reproduced; _move_optimizer_state_to_device relocated
 - [ ] RK-4  vocab_kd plugin
 - [ ] RK-5  teacher_cache + teacher_live slot plugins
 - [ ] RK-6  merge_repair plugin

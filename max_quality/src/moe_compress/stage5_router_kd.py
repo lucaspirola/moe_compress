@@ -54,6 +54,12 @@ from .router_kd.plugins.trainable_scope import (  # noqa: F401
     _freeze_non_routers,
 )
 
+# RK-3: _move_optimizer_state_to_device relocated to
+# router_kd/plugins/kd_optimizer. Re-imported so run() keeps its import path.
+from .router_kd.plugins.kd_optimizer import (  # noqa: F401
+    _move_optimizer_state_to_device,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -1546,19 +1552,6 @@ def _save_best_router_state(
     finally:
         os.close(fd)
     os.replace(tmp, final)
-
-
-def _move_optimizer_state_to_device(optim: torch.optim.Optimizer, device) -> None:
-    """Move all optimizer state tensors to the target device.
-
-    Required after load_state_dict() when the checkpoint was saved on CPU
-    but the training params live on a CUDA device — otherwise the first
-    optimizer step silently mixes CPU and CUDA tensors.
-    """
-    for state in optim.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                state[k] = v.to(device)
 
 
 # ---------------------------------------------------------------------------
