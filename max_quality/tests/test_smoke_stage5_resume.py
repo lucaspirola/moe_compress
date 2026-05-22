@@ -188,7 +188,9 @@ def test_stage5_checkpoint_written_at_interval(
 
     # Validate checkpoint structure.
     payload = torch.load(ckpts[-1], map_location="cpu")
-    assert payload["format_version"] == 1
+    # step_*.pt interval checkpoints are format_version 2 (stage5_router_kd.py);
+    # best.pt is independently versioned at 1.
+    assert payload["format_version"] == 2
     assert "router_state" in payload
     assert "optim_state" in payload
     assert "step" in payload
