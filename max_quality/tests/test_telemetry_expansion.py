@@ -104,9 +104,17 @@ def _captured_emits(monkeypatch):
     # ``stage4_eora`` is now a thin shim that no longer imports ``_trackio_log``.
     from moe_compress.stage4.plugins import eora_inputs as stage4_eora_inputs
     from moe_compress.stage4.plugins import eora_compensation as stage4_eora_comp
+    # After S6-8, Stage 6 runtime telemetry emits fire from the real
+    # orchestrator ``stage6/orchestrator.py`` (and the validation_report +
+    # imatrix_export plugins); the legacy ``stage6_validate`` is now a thin
+    # shim. Mirrors the post-flip pattern established by RK-8 / S3-7a / S4-4a.
+    from moe_compress.stage6 import orchestrator as stage6_orchestrator
+    from moe_compress.stage6.plugins import validation_report as stage6_report
+    from moe_compress.stage6.plugins import imatrix_export as stage6_imatrix
     for mod in (run_pipeline, stage2_reap_ream, stage3_orchestrator,
                 stage4_eora_inputs, stage4_eora_comp,
                 stage5_router_kd, router_kd_orchestrator, stage6_validate,
+                stage6_orchestrator, stage6_report, stage6_imatrix,
                 stage1_orchestrator, stage1_grape_merge, stage1_ma_detection):
         monkeypatch.setattr(mod, "_trackio_log", _capture, raising=False)
 
@@ -355,9 +363,17 @@ def test_stage3_source_emits_config_and_c5_extensions():
 
 
 def test_stage6_source_emits_config_block():
+    """Source-level check: Stage 6 emits a one-shot config block under
+    stage6/config/*.
+
+    S6-8: the monolith ``stage6_validate.py`` ``run()`` body was retired —
+    the config-key Trackio emits (``stage6/config/*``) now fire from the
+    real orchestrator ``stage6/orchestrator.py``. The source scan
+    therefore targets the orchestrator (mirror of the Stage 3 /
+    Router-KD post-flip updates above)."""
     src_path = (
         Path(__file__).resolve().parents[1]
-        / "src" / "moe_compress" / "stage6_validate.py"
+        / "src" / "moe_compress" / "stage6" / "orchestrator.py"
     )
     src = src_path.read_text()
     expected_keys = [

@@ -93,15 +93,42 @@ def patched_stage6(monkeypatch, tiny_config):
       ``{"results": {}, "param_counts": {"total": 0, "expert": 0}}``. This forces
       the cache-hit branch, bypassing teacher loading, the background preload
       thread and the GGUF/imatrix pipeline entirely.
-    * ``_trackio_log`` (a module-level name on ``stage6_validate``) is patched to
-      a capture list so the test can assert the run emitted at least one payload.
+    * ``_trackio_log`` is patched on the orchestrator module so the test can
+      assert the run emitted at least one payload.
 
     ``imatrix.enabled`` is also set to ``False`` (belt-and-suspenders); on the
     cache-hit path no background GGUF thread is started anyway, and
     ``_generate_imatrix``'s own ``enabled`` guard returns early.
 
+    HAZARD H3 — post-S6-8 patch surface
+    -----------------------------------
+    Pre-S6-8 the three patches targeted attributes on ``stage6_validate``
+    (the monolith bound them all at module top). Post-S6-8 the orchestrator
+    body lives at ``stage6.orchestrator`` and the eval-environment helper
+    lives at ``stage6.plugins.eval_environment``; the patches must repoint to
+    the module each name is actually resolved from at call time:
+
+    * ``_build_imatrix_calibration_corpus`` is called by
+      ``EvalEnvironmentPlugin.setup_environment`` from its OWN module scope
+      → patch ``stage6.plugins.eval_environment._build_imatrix_calibration_corpus``.
+    * ``_load_teacher_cache`` is imported by the orchestrator at module top
+      and called directly in its preamble (HAZARD H3) → patch
+      ``stage6.orchestrator._load_teacher_cache``.
+    * ``_trackio_log`` is imported by the orchestrator at module top and used
+      for the one-shot Stage 6 config emit (HAZARD H3) → patch
+      ``stage6.orchestrator._trackio_log``.
+
     Returns ``(deep_copied_config, captured_list)``.
     """
+    # Function-local imports so the H3 patch targets are resolved exactly
+    # where the orchestrator + plugin module attribute lookup will resolve
+    # them at call time. The orchestrator binds _load_teacher_cache /
+    # _trackio_log via `from ... import` at module top, and the plugin binds
+    # _build_imatrix_calibration_corpus inside its own module — those are the
+    # attributes that need to be replaced for the patches to take effect.
+    from moe_compress.stage6 import orchestrator as _s6_orch
+    from moe_compress.stage6.plugins import eval_environment as _eval_env_mod
+
     cfg = copy.deepcopy(tiny_config)
     s6 = cfg["stage6_validate"]
     s6["strict_revision_pinning"] = False
@@ -109,11 +136,11 @@ def patched_stage6(monkeypatch, tiny_config):
     s6["imatrix"] = {"enabled": False}
 
     monkeypatch.setattr(
-        stage6_validate, "_build_imatrix_calibration_corpus",
+        _eval_env_mod, "_build_imatrix_calibration_corpus",
         lambda *a, **k: None,
     )
     monkeypatch.setattr(
-        stage6_validate, "_load_teacher_cache",
+        _s6_orch, "_load_teacher_cache",
         lambda *a, **k: {
             "results": {},
             "param_counts": {"total": 0, "expert": 0},
@@ -122,7 +149,7 @@ def patched_stage6(monkeypatch, tiny_config):
 
     captured: list[dict] = []
     monkeypatch.setattr(
-        stage6_validate, "_trackio_log",
+        _s6_orch, "_trackio_log",
         lambda payload: captured.append(dict(payload)),
     )
 

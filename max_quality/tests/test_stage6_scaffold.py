@@ -1,19 +1,17 @@
 """Tests for the ``stage6/`` package surface.
 
-S6-1 creates the ``stage6/`` package skeleton — an ``__init__`` re-exporting
+S6-1 created the ``stage6/`` package skeleton — an ``__init__`` re-exporting
 ``run``, an ``orchestrator`` module, a ``context`` re-export shim, and an
-(empty) ``plugins`` package. Tasks S6-2..S6-7 will extract the Stage 6
-validation algorithm into ``stage6/plugins/``; S6-8 flips the relationship
-so ``stage6.orchestrator.run`` becomes the REAL orchestrator and
-``stage6_validate.run`` becomes the thin shim that delegates to it.
+(empty) ``plugins`` package. S6-2..S6-7 extracted the Stage 6 validation
+algorithm into ``stage6/plugins/``; S6-8 made ``stage6/orchestrator.run`` the
+REAL plugin-driven orchestrator and flipped ``stage6_validate.run`` to a thin
+shim that delegates to IT (the inverse of the S6-1 scaffold direction).
 
-These tests guard the scaffold package surface: the package imports cleanly,
-``stage6.orchestrator.run`` delegates to ``stage6_validate.run`` with the
-matching signature, and the signatures are identical. The byte-identity of
-the monolith is covered by ``test_stage6_golden_snapshot.py``.
-
-At S6-8 these tests will be updated to reflect the flipped delegation
-direction (as was done for stage3 at S3-7a and stage4 at S4-4a).
+These tests guard the package surface only. The S6-1 delegation-direction
+test (``stage6.orchestrator.run`` → ``stage6_validate.run``) was retired at
+S6-8: the orchestrator no longer delegates, it IS the implementation, and
+``stage6_validate.run`` is now the delegator. The byte-identity of the new
+orchestrator is covered by ``test_stage6_golden_snapshot.py``.
 """
 from __future__ import annotations
 
@@ -21,6 +19,8 @@ import inspect
 
 from moe_compress import stage6
 from moe_compress import stage6_validate
+from moe_compress.pipeline.stage import Stage
+from moe_compress.stage6 import STAGE6
 
 
 def test_stage6_package_imports():
@@ -31,11 +31,11 @@ def test_stage6_package_imports():
     assert callable(stage6.run)
 
 
-def test_stage6_orchestrator_delegates_to_monolith(monkeypatch):
-    """S6-1 scaffold: ``stage6.orchestrator.run`` is the thin shim — it
-    forwards every argument unchanged to ``stage6_validate.run`` (4
-    positionals + the kw-only ``device``). Pure unit test, no model."""
-    import moe_compress.stage6_validate as _monolith
+def test_stage6_shim_delegates_to_orchestrator(monkeypatch):
+    """S6-8: ``stage6_validate.run`` is now the thin shim — it forwards every
+    argument unchanged to ``stage6.orchestrator.run`` (4 positionals + the
+    kw-only ``device``). Pure unit test, no model."""
+    from moe_compress.stage6 import orchestrator
 
     calls: list[tuple] = []
     sentinel_result = object()
@@ -44,7 +44,10 @@ def test_stage6_orchestrator_delegates_to_monolith(monkeypatch):
         calls.append((args, kwargs))
         return sentinel_result
 
-    monkeypatch.setattr(_monolith, "run", _sentinel)
+    # The shim does a function-local ``from .stage6.orchestrator import run``;
+    # patching the ``run`` attribute on the orchestrator module is what it
+    # resolves.
+    monkeypatch.setattr(orchestrator, "run", _sentinel)
 
     model = object()
     tokenizer = object()
@@ -52,12 +55,12 @@ def test_stage6_orchestrator_delegates_to_monolith(monkeypatch):
     artifacts_dir = object()
     device = object()
 
-    result = stage6.run(
+    result = stage6_validate.run(
         model, tokenizer, config, artifacts_dir, device=device,
     )
 
     assert result is sentinel_result
-    assert len(calls) == 1, "stage6_validate.run must be called exactly once"
+    assert len(calls) == 1, "stage6.orchestrator.run must be called exactly once"
 
     args, kwargs = calls[0]
     assert args == (model, tokenizer, config, artifacts_dir)
@@ -67,8 +70,8 @@ def test_stage6_orchestrator_delegates_to_monolith(monkeypatch):
 def test_stage6_orchestrator_signature_matches_monolith():
     """``stage6.orchestrator.run`` and ``stage6_validate.run`` have identical
     signatures — parameter names, kinds, defaults, annotations, and return
-    annotation. The delegating shim and the legacy monolith must stay
-    swap-compatible (the seam S6-8 will swap)."""
+    annotation. The delegating shim and the real orchestrator must stay
+    swap-compatible."""
     from moe_compress.stage6 import orchestrator
 
     orch_sig = inspect.signature(orchestrator.run)
@@ -84,3 +87,18 @@ def test_stage6_orchestrator_signature_matches_monolith():
         assert op.default == mp.default, f"default mismatch for {op.name}"
         assert op.annotation == mp.annotation, f"annotation mismatch for {op.name}"
     assert orch_sig.return_annotation == mono_sig.return_annotation
+
+
+def test_stage6_stage_object():
+    """``STAGE6`` is a ``Stage``-conforming object — it satisfies the
+    structural :class:`Stage` Protocol, exposes ``stage_id == "6"``, and has
+    callable ``is_enabled`` / ``run`` methods. Mirrors the
+    ``test_stage3_stage_object`` / ``test_stage4_stage_object`` pattern.
+    """
+    assert isinstance(STAGE6, Stage)
+    assert STAGE6.stage_id == "6"
+    assert callable(STAGE6.is_enabled)
+    assert callable(STAGE6.run)
+    # is_enabled never gates Stage 6 itself — stage selection belongs to the
+    # universal orchestrator, not to the stage. Mirrors STAGE3 / STAGE4.
+    assert STAGE6.is_enabled({}) is True
