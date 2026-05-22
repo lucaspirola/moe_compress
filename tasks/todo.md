@@ -92,7 +92,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S6-3  wikitext_ppl + zero_shot_lm_eval plugins — WikitextPplPlugin + ZeroShotLmEvalPlugin; Pattern-A relocates _wikitext2_ppl / _lm_eval_tasks / _ZERO_SHOT_TASKS, inert eval_task hooks
 - [x] S6-4  humaneval + math500 plugins — HumanEvalPlugin + Math500Plugin + new tools/eval_harness.py (shared batched-gen + chat-format); 14 symbols + sympy guard relocated, inert eval_task hooks
 - [x] S6-5  teacher_provider plugin — TeacherProviderPlugin; Pattern-A relocates TEACHER_CACHE_FORMAT_VERSION + 5 functions (_safe_pkg_version/_teacher_cache_key/_load/_save/_preload_teacher_to_cpu), inert provide_teacher_side hook
-- [ ] S6-6  imatrix_export plugin
+- [x] S6-6  imatrix_export plugin — ImatrixExportPlugin; Pattern-A relocates 5 functions + _EVAL_TEXT_CONCAT_FILENAME; Option-C two-hook design (start_gguf_convert + export_imatrix); is_enabled defaults True matching monolith
 - [ ] S6-7  validation_report plugin
 - [ ] S6-8  Wire orchestrator + STAGE6
 - [ ] S6-9  Stage-6 orchestrator test

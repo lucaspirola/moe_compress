@@ -59,11 +59,7 @@ import math
 import os
 import queue
 import re
-import shutil
-import subprocess
-import sys
 import threading
-import time
 from pathlib import Path
 
 import torch
@@ -157,15 +153,34 @@ from .stage6.plugins.teacher_provider import (  # noqa: F401
     _preload_teacher_to_cpu,
 )
 
+# S6-6: imatrix / GGUF pipeline (_background_gguf_convert,
+# _write_eval_text_concat, _run_llama_imatrix_with_prebuilt_gguf,
+# _generate_imatrix and _find_llama_cpp_dir) relocated to
+# stage6/plugins/imatrix_export. Re-imported so run() keeps calling them via
+# their original names. The _EVAL_TEXT_CONCAT_FILENAME constant is NOT
+# re-imported here -- only the relocated _write_eval_text_concat references
+# it, and the plugin module's module-local copy is the single source of
+# truth. The stdlib imports (`subprocess`, `shutil`, `sys`, `time`) that the
+# monolith previously needed for these bodies were removed in the import
+# block at the top of this module; only callers (`run()`) of these symbols
+# remain.
+from .stage6.plugins.imatrix_export import (  # noqa: F401
+    _background_gguf_convert,
+    _write_eval_text_concat,
+    _run_llama_imatrix_with_prebuilt_gguf,
+    _generate_imatrix,
+    _find_llama_cpp_dir,
+)
+
 # F-C-H-1: Spec F-S-M-1 mandates eager attention for both teacher and student
 # during the Stage 6 gate run. Constant — never override at call sites.
 _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 
-# F-C-C-1: Spec §9 — the eval-text concat (eval prompts seen by the model
-# during PPL/zero-shot/generative) is captured to eval_text_concat.txt as a
-# debugging side-channel ONLY. The imatrix calibration corpus filename
-# (_IMATRIX_CALIB_FILENAME) is re-imported in the S6-2 block above.
-_EVAL_TEXT_CONCAT_FILENAME: str = "eval_text_concat.txt"
+# S6-6: _EVAL_TEXT_CONCAT_FILENAME relocated to stage6/plugins/imatrix_export
+# alongside _write_eval_text_concat (its sole consumer). It is NOT re-imported
+# here — surviving monolith run() code never references the constant directly;
+# only the relocated _write_eval_text_concat does, and that function resolves
+# the constant from the plugin module's own module-local copy.
 
 
 # S6-5: teacher-eval-cache machinery (TEACHER_CACHE_FORMAT_VERSION constant +
@@ -745,169 +760,13 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
 
 
 # ---------------------------------------------------------------------------
-# Background GGUF conversion (Optimization #8)
+# Background GGUF conversion (Optimization #8) + post-eval imatrix pipeline
+# (_background_gguf_convert, _write_eval_text_concat,
+# _run_llama_imatrix_with_prebuilt_gguf, _generate_imatrix and
+# _find_llama_cpp_dir) relocated to stage6/plugins/imatrix_export by S6-6.
+# All five symbols are re-imported in the S6-6 # noqa: F401 block near the top
+# of this module so run() keeps calling them via their original names.
 # ---------------------------------------------------------------------------
-
-def _background_gguf_convert(icfg: dict, artifacts_dir: Path, result: dict) -> None:
-    """Convert the student model to F16 GGUF in background (CPU-bound)."""
-    if not icfg.get("enabled", True):
-        return
-
-    llama_cpp_dir = _find_llama_cpp_dir(icfg.get("llama_cpp_dir"))
-    if llama_cpp_dir is None:
-        log.warning("GGUF convert (background): llama.cpp not found — skipping.")
-        return
-
-    convert_py = llama_cpp_dir / "convert_hf_to_gguf.py"
-    if not convert_py.exists():
-        log.warning("GGUF convert (background): convert script missing — skipping.")
-        return
-
-    model_dir = artifacts_dir / "stage5_final"
-    if not model_dir.exists():
-        log.warning("GGUF convert (background): stage5_final not found — skipping.")
-        return
-
-    free_gb = shutil.disk_usage(artifacts_dir).free / 1e9
-    if free_gb < 40:
-        log.warning("GGUF convert (background): only %.1f GB free — skipping.", free_gb)
-        return
-
-    f16_path = artifacts_dir / "model_f16.gguf"
-    f16_tmp = artifacts_dir / "model_f16.gguf.tmp"
-    log.info("GGUF convert (background): %s → F16 GGUF", model_dir)
-    env = {
-        **os.environ,
-        "LD_LIBRARY_PATH": str(llama_cpp_dir / "build" / "bin") + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
-    }
-    try:
-        t0 = time.monotonic()
-        stderr_log = artifacts_dir / "gguf_convert_stderr.log"
-        with open(stderr_log, "w") as _stderr_fh:
-            subprocess.run(
-                [sys.executable, str(convert_py), str(model_dir),
-                 "--outtype", "f16", "--outfile", str(f16_tmp)],
-                env=env, check=True, timeout=3600, stderr=_stderr_fh,
-            )
-        os.replace(f16_tmp, f16_path)
-        dt = time.monotonic() - t0
-        result["f16_path"] = f16_path
-        log.info("GGUF convert (background): done in %.1fs (%.1f GB)",
-                 dt, f16_path.stat().st_size / 1e9)
-    except subprocess.TimeoutExpired as exc:
-        log.error("GGUF convert (background): timed out after 3600s (%s)", exc)
-        f16_tmp.unlink(missing_ok=True)
-        return
-    except subprocess.CalledProcessError as exc:
-        stderr_snippet = ""
-        if stderr_log.exists():
-            try:
-                stderr_snippet = stderr_log.read_text(errors="replace")[-2000:]
-            except Exception:
-                pass
-        log.warning("GGUF convert (background): failed (%s): %s", exc, stderr_snippet)
-        f16_tmp.unlink(missing_ok=True)
-        return
-    except Exception as exc:
-        log.warning("GGUF convert (background): failed (%s)", exc)
-        f16_tmp.unlink(missing_ok=True)
-        return
-
-
-def _write_eval_text_concat(texts: list[str], artifacts_dir: Path) -> Path:
-    """Write the eval-text concat (debug side-channel) atomically.
-
-    F-C-C-1: this file is the concatenation of every prompt seen by the model
-    during PPL/zero-shot/generative evals. It is NOT the imatrix calibration
-    corpus — that is `calibration_wiki_train.txt` per Spec §9.
-    """
-    path = artifacts_dir / _EVAL_TEXT_CONCAT_FILENAME
-    joined = "\n\n".join(t.strip() for t in texts if t and t.strip())
-    _atomic_write_text(path, joined)
-    log.info(
-        "eval_text_concat: %d docs (%d chars) → %s (debug only — not used by imatrix)",
-        len(texts), len(joined), path,
-    )
-    return path
-
-
-def _run_llama_imatrix_with_prebuilt_gguf(
-    eval_text_concat: list[str], icfg: dict, artifacts_dir: Path, gguf_result: dict,
-) -> None:
-    """Run llama-imatrix using the pre-built F16 GGUF from background thread.
-
-    F-C-C-1: imatrix calibration corpus is the WikiText-2 *train* split
-    (calibration_wiki_train.txt). The eval_text_concat list captured during
-    PPL/zero-shot/generative evals is written as a debugging side-channel
-    (eval_text_concat.txt) but is NOT used by llama-imatrix.
-    """
-    # Always write eval_text_concat.txt as a debug artifact.
-    _write_eval_text_concat(eval_text_concat, artifacts_dir)
-
-    if not icfg.get("enabled", True):
-        return
-
-    # F-C-C-1: imatrix calibration source is the WikiText-2 *train* split.
-    calib_path = artifacts_dir / _IMATRIX_CALIB_FILENAME
-    if not calib_path.exists() or calib_path.stat().st_size == 0:
-        log.warning(
-            "imatrix: calibration corpus %s missing/empty; skipping imatrix generation. "
-            "Spec §9 requires this file (WikiText-2 train split). "
-            "It is built automatically at the top of run() — check the earlier warning "
-            "from _build_imatrix_calibration_corpus.",
-            calib_path,
-        )
-        return
-
-    f16_path = gguf_result.get("f16_path")
-    if f16_path is None or not f16_path.exists():
-        log.warning("imatrix: pre-built GGUF not available — falling back to full pipeline")
-        _generate_imatrix(eval_text_concat, icfg, artifacts_dir)
-        return
-
-    llama_cpp_dir = _find_llama_cpp_dir(icfg.get("llama_cpp_dir"))
-    if llama_cpp_dir is None:
-        log.warning("llama_cpp_dir not found; skipping imatrix generation via prebuilt GGUF")
-        return
-
-    imatrix_bin = llama_cpp_dir / "build" / "bin" / "llama-imatrix"
-    if not imatrix_bin.exists():
-        log.warning("imatrix: llama-imatrix binary not found — skipping.")
-        return
-
-    imatrix_out = artifacts_dir / "imatrix.gguf"
-    ngl = int(icfg.get("ngl", 99))
-    ctx = int(icfg.get("ctx_size", 2048))
-    env = {
-        **os.environ,
-        "LD_LIBRARY_PATH": str(llama_cpp_dir / "build" / "bin") + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
-    }
-    log.info("imatrix: running llama-imatrix (ngl=%d, ctx=%d) → %s", ngl, ctx, imatrix_out)
-    imatrix_stderr_log = artifacts_dir / "llama_imatrix_stderr.log"
-    try:
-        with open(imatrix_stderr_log, "w") as _stderr_fh:
-            subprocess.run(
-                [str(imatrix_bin),
-                 "-m", str(f16_path), "-f", str(calib_path),
-                 "-o", str(imatrix_out), "--output-format", "gguf",
-                 "--no-ppl", "-ngl", str(ngl), "-c", str(ctx)],
-                env=env, check=True, timeout=7200, stderr=_stderr_fh,
-            )
-        log.info("imatrix: saved (%.1f MB)", imatrix_out.stat().st_size / 1e6)
-    except subprocess.TimeoutExpired as exc:
-        log.warning("imatrix subprocess timed out after %ss; skipping imatrix", exc.timeout)
-        return
-    except subprocess.CalledProcessError as exc:
-        stderr_snippet = ""
-        if imatrix_stderr_log.exists():
-            try:
-                stderr_snippet = imatrix_stderr_log.read_text(errors="replace")[-2000:]
-            except Exception:
-                pass
-        log.warning("imatrix: llama-imatrix failed (%s): %s. Calibration text at %s.",
-                    exc, stderr_snippet, calib_path)
-    except Exception as exc:
-        log.warning("imatrix: llama-imatrix failed (%s). Calibration text at %s.", exc, calib_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1086,133 +945,11 @@ def _measured_reduction(
 
 
 # ---------------------------------------------------------------------------
-# imatrix calibration + GGUF conversion (full sequential path)
+# imatrix calibration + GGUF conversion (full sequential path) — relocated
+# to stage6/plugins/imatrix_export by S6-6 along with _find_llama_cpp_dir.
+# Both _generate_imatrix and _find_llama_cpp_dir are re-imported in the S6-6
+# # noqa: F401 block near the top of this module.
 # ---------------------------------------------------------------------------
-
-
-def _generate_imatrix(eval_text_concat: list[str], icfg: dict, artifacts_dir: Path) -> None:
-    """Sequential GGUF + llama-imatrix fallback path.
-
-    F-C-C-1: imatrix calibration corpus is `calibration_wiki_train.txt` (the
-    WikiText-2 train split written at the top of run()). The eval_text_concat
-    list captured during evals is written as a debug-only side-channel.
-    """
-    # Always write the eval-text concat as a debug artifact, regardless of imatrix enable.
-    _write_eval_text_concat(eval_text_concat, artifacts_dir)
-
-    if not icfg.get("enabled", True):
-        log.info("imatrix: disabled via config.")
-        return
-
-    calib_path = artifacts_dir / _IMATRIX_CALIB_FILENAME
-    if not calib_path.exists() or calib_path.stat().st_size == 0:
-        log.warning(
-            "imatrix: calibration corpus %s missing/empty; skipping imatrix generation. "
-            "Spec §9 requires this file (WikiText-2 train split).",
-            calib_path,
-        )
-        return
-
-    llama_cpp_dir = _find_llama_cpp_dir(icfg.get("llama_cpp_dir"))
-    if llama_cpp_dir is None:
-        log.warning("imatrix: llama.cpp not found; skipping imatrix generation.")
-        return
-
-    imatrix_bin = llama_cpp_dir / "build" / "bin" / "llama-imatrix"
-    convert_py  = llama_cpp_dir / "convert_hf_to_gguf.py"
-    if not imatrix_bin.exists() or not convert_py.exists():
-        log.warning("imatrix: binaries missing under %s; skipping.", llama_cpp_dir)
-        return
-
-    model_dir = artifacts_dir / "stage5_final"
-    if not model_dir.exists():
-        log.warning("imatrix: stage5_final not found at %s; skipping.", model_dir)
-        return
-
-    free_gb = shutil.disk_usage(artifacts_dir).free / 1e9
-    if free_gb < 40:
-        log.warning("imatrix: only %.1f GB free; skipping GGUF conversion.", free_gb)
-        return
-
-    f16_path = artifacts_dir / "model_f16.gguf"
-    f16_tmp = artifacts_dir / "model_f16.gguf.tmp"
-    env = {
-        **os.environ,
-        "LD_LIBRARY_PATH": str(llama_cpp_dir / "build" / "bin") + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
-    }
-    log.info("imatrix: converting %s → F16 GGUF", model_dir)
-    stderr_log = artifacts_dir / "gguf_convert_stderr.log"
-    try:
-        f16_tmp.unlink(missing_ok=True)
-        with open(stderr_log, "w") as stderr_fh:
-            subprocess.run(
-                [sys.executable, str(convert_py), str(model_dir),
-                 "--outtype", "f16", "--outfile", str(f16_tmp)],
-                env=env, check=True, timeout=3600, stderr=stderr_fh,
-            )
-        os.replace(f16_tmp, f16_path)
-        log.info("imatrix: GGUF ready (%.1f GB)", f16_path.stat().st_size / 1e9)
-    except subprocess.TimeoutExpired as exc:
-        f16_tmp.unlink(missing_ok=True)
-        log.warning("imatrix: GGUF conversion timed out after %ss: %s; skipping.", exc.timeout, exc)
-        return
-    except subprocess.CalledProcessError as exc:
-        f16_tmp.unlink(missing_ok=True)
-        try:
-            tail = stderr_log.read_text()[-2000:]
-        except Exception:
-            tail = ""
-        log.warning("imatrix: GGUF conversion failed (%s): %s; skipping.", exc, tail)
-        return
-    except Exception as exc:  # noqa: BLE001
-        f16_tmp.unlink(missing_ok=True)
-        log.warning("imatrix: GGUF conversion failed (%s); skipping.", exc)
-        return
-
-    imatrix_out = artifacts_dir / "imatrix.gguf"
-    ngl = int(icfg.get("ngl", 99))
-    ctx = int(icfg.get("ctx_size", 2048))
-    log.info("imatrix: running llama-imatrix (ngl=%d, ctx=%d) → %s", ngl, ctx, imatrix_out)
-    imatrix_stderr_log = artifacts_dir / "llama_imatrix_stderr.log"
-    try:
-        with open(imatrix_stderr_log, "w") as stderr_fh:
-            subprocess.run(
-                [str(imatrix_bin),
-                 "-m", str(f16_path), "-f", str(calib_path),
-                 "-o", str(imatrix_out), "--output-format", "gguf",
-                 "--no-ppl", "-ngl", str(ngl), "-c", str(ctx)],
-                env=env, check=True, timeout=7200, stderr=stderr_fh,
-            )
-        log.info("imatrix: saved (%.1f MB)", imatrix_out.stat().st_size / 1e6)
-    except subprocess.TimeoutExpired as exc:
-        log.error("imatrix: llama-imatrix timed out after 7200s (%s). Calibration text at %s.", exc, calib_path)
-        return
-    except subprocess.CalledProcessError as exc:
-        try:
-            tail = imatrix_stderr_log.read_text()[-2000:]
-        except Exception:
-            tail = ""
-        log.warning("imatrix: llama-imatrix failed (%s): %s. Calibration text at %s.", exc, tail, calib_path)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("imatrix: llama-imatrix failed (%s). Calibration text at %s.", exc, calib_path)
-
-
-def _find_llama_cpp_dir(override: str | None = None) -> Path | None:
-    candidates: list[Path] = []
-    if override:
-        candidates.append(Path(override))
-    env_dir = os.environ.get("LLAMA_CPP_DIR")
-    if env_dir:
-        candidates.append(Path(env_dir))
-    on_path = shutil.which("llama-imatrix")
-    if on_path:
-        candidates.append(Path(on_path).parent.parent.parent)
-    # No further fallback beyond the three candidates above (config, env var, PATH search).
-
-    for p in candidates:
-        if (p / "build" / "bin" / "llama-imatrix").exists() and (p / "convert_hf_to_gguf.py").exists():
-            return p
-    return None
 
 
 def _check_thresholds(results: dict, thresholds: dict, *, s6_cfg: dict | None = None) -> dict:

@@ -36,6 +36,18 @@ Holds:
   eval block — cache-hit shortcut, preload-thread join, kernel-patch +
   experts-impl shim, the four conditional teacher-side eval calls, cache
   save).
+* ``imatrix_export.py`` (added by S6-6 — the Stage 6 post-eval imatrix /
+  GGUF pipeline: the relocated ``_EVAL_TEXT_CONCAT_FILENAME`` constant +
+  ``_background_gguf_convert`` / ``_write_eval_text_concat`` /
+  ``_run_llama_imatrix_with_prebuilt_gguf`` / ``_generate_imatrix`` /
+  ``_find_llama_cpp_dir`` helpers plus ``ImatrixExportPlugin`` with an
+  ``is_enabled`` gated on ``stage6_validate.imatrix.enabled`` and TWO inert
+  hooks — ``start_gguf_convert`` (early-phase kickoff of the
+  ``_background_gguf_convert`` background thread, publishing the handle to
+  ``ctx.gguf_thread`` / ``ctx.gguf_result``) and ``export_imatrix``
+  (late-phase join + llama-imatrix dispatch + eval-text-concat write, with
+  the F-CR2-M-1 ``imatrix_skipped`` sentinel emitted to trackio on the
+  bg-thread-timeout path).
 
 The Stage 6 validation algorithm — WikiText-2 PPL, zero-shot (ARC-C,
 HellaSwag), generative (HumanEval, MATH-500), imatrix pipeline, and threshold
