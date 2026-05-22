@@ -54,7 +54,7 @@ stage golden snapshot, not a speculative standalone test.
 
 ## Stage 3 — SVD (Part 5.1)
 - [x] S3-0  Capture stage-3 golden — test_stage3_golden_snapshot.py (rank_map.json, fp32+bf16)
-- [ ] S3-1  Scaffold stage3/ package
+- [x] S3-1  Scaffold stage3/ package — __init__/context/orchestrator/plugins, run delegates to legacy
 - [ ] S3-2  covariance_collection plugin
 - [ ] S3-3  d_rank_allocate plugin
 - [ ] S3-4  swift_svd_alpha plugin
