@@ -621,6 +621,22 @@ def run(
     s2 = config["stage2_reap_ream"]
     cal = config["calibration"]
 
+    # Stage 2 v2 (spec § 6 / D-asymmetric-freq): cost_asymmetric is valid
+    # only under freq-weighted merge — the asymmetric factor freq_m/(freq_c+freq_m)
+    # is the per-pair version of the merge weight. Reject the combination
+    # at the very top of `run` so misconfigured pipelines fail fast before
+    # spending compute on calibration / Stage-1 artifact loading. CRITICAL
+    # to keep this BEFORE the `_set_experts_implementation` Blackwell workaround
+    # below: that call touches `model.config` and would surface a confusing
+    # AttributeError on misconfigured tests / dry-runs that pass a stub model,
+    # masking the real ValueError we want users to see.
+    if bool(s2.get("cost_asymmetric", False)) and not s2["ream"]["frequency_weighted_merge"]:
+        raise ValueError(
+            "stage2_reap_ream.cost_asymmetric=True requires "
+            "ream.frequency_weighted_merge=True (spec § 5 step 4T(c)(iii) "
+            "/ D-asymmetric-freq)."
+        )
+
     # Blackwell sm_100 workaround: transformers' default MoE forward uses
     # `torch.nn.functional.grouped_mm`, which deadlocks on B200 partway
     # through Stage 2 (reproduced as a 2-min main-thread hang then SIGSEGV
@@ -635,18 +651,6 @@ def run(
         "EXPERTS_IMPLEMENTATION", s2.get("experts_implementation", "batched_mm")
     )
     _set_experts_implementation(model, _experts_impl)
-
-    # Stage 2 v2 (spec § 6 / D-asymmetric-freq): cost_asymmetric is valid
-    # only under freq-weighted merge — the asymmetric factor freq_m/(freq_c+freq_m)
-    # is the per-pair version of the merge weight. Reject the combination
-    # at the very top of `run` so misconfigured pipelines fail fast before
-    # spending compute on calibration / Stage-1 artifact loading.
-    if bool(s2.get("cost_asymmetric", False)) and not s2["ream"]["frequency_weighted_merge"]:
-        raise ValueError(
-            "stage2_reap_ream.cost_asymmetric=True requires "
-            "ream.frequency_weighted_merge=True (spec § 5 step 4T(c)(iii) "
-            "/ D-asymmetric-freq)."
-        )
 
     if stage1_budget_path is None:
         stage1_budget_path = artifacts_dir / "stage1_budgets.json"

@@ -25,6 +25,20 @@ from moe_compress.stage2.orchestrator import (
     _assign_sinkhorn,
 )
 
+# ``_assign_mcf`` requires the optional ``ortools>=9.10`` package. Tests that
+# exercise the MCF solver (and tests that cross-check Sinkhorn or the ``auto``
+# dispatcher against MCF) need ortools at runtime. When the package is absent
+# they SKIP cleanly via this marker instead of erroring with a RuntimeError.
+try:
+    import ortools  # noqa: F401
+    _HAS_ORTOOLS = True
+except ImportError:
+    _HAS_ORTOOLS = False
+_requires_ortools = pytest.mark.skipif(
+    not _HAS_ORTOOLS,
+    reason="ortools>=9.10 not installed; MCF solver tests skipped",
+)
+
 
 # ---------------------------------------------------------------------------
 # Compatibility invariant: dispatcher with default solver = greedy is
@@ -126,6 +140,7 @@ def test_hungarian_optimal_1to1():
 # ---------------------------------------------------------------------------
 
 
+@_requires_ortools
 def test_mcf_optimal_on_tight_capacity_counterexample():
     """The reviewer's counterexample (group_size=3 → max_group_cap=2):
 
@@ -162,6 +177,7 @@ def test_mcf_optimal_on_tight_capacity_counterexample():
     assert mcf_cost == pytest.approx(1.10, abs=1e-6)
 
 
+@_requires_ortools
 def test_mcf_matches_hungarian_on_1to1():
     """When capacity ≥ 1 and n_children ≤ n_centroids, MCF and Hungarian
     must produce the same total cost (both optimal on the same problem)."""
@@ -176,6 +192,7 @@ def test_mcf_matches_hungarian_on_1to1():
     assert mcf_total == pytest.approx(hung_total, abs=1e-6)
 
 
+@_requires_ortools
 def test_mcf_handles_inf_entries():
     """+∞ cost entries should be excluded from the assignment (forbidden
     pairs). MCF must still find an optimal feasible solution."""
@@ -206,6 +223,7 @@ def test_auto_dispatches_hungarian_on_slack():
     assert auto_result == hung_result
 
 
+@_requires_ortools
 def test_auto_dispatches_mcf_on_tight():
     """n_children > n_centroids → auto must hit the MCF branch and produce
     the MCF answer (which dominates greedy)."""
@@ -275,6 +293,7 @@ def test_sinkhorn_capacitated_respects_cap_in_argmax():
     assert max(assignments_per_centroid) <= 4  # always true; we just want no NaNs
 
 
+@_requires_ortools
 def test_sinkhorn_converges_to_mcf_at_low_epsilon():
     """As epsilon → 0, the Sinkhorn solution should harden toward the MCF
     optimum. With epsilon_final small enough, the total cost of the
@@ -318,9 +337,20 @@ def test_sinkhorn_handles_inf_entries():
 def test_sinkhorn_infeasible_falls_back_to_greedy(caplog):
     """If n_C × C_max < n_NC, the slack would be negative — Sinkhorn must
     fall back to greedy with a clear warning."""
+    import logging as _logging
     cost = np.zeros((10, 2))  # 10 children, 2 centroids, cap=1 → infeasible
-    with caplog.at_level("WARNING"):
+    # Pytest's caplog plugin sets ``propagate=False`` on captured loggers by
+    # default (to prevent double-emit if the app also installs handlers).
+    # That breaks propagation to caplog's root-attached handler, so we have
+    # to opt back in explicitly. caplog.set_level doesn't restore propagate.
+    _solver_log = _logging.getLogger("moe_compress.stage2.plugins.solver_sinkhorn")
+    _saved_propagate = _solver_log.propagate
+    _solver_log.propagate = True
+    try:
+        caplog.set_level("WARNING")
         result = _assign_sinkhorn(cost, 10, 2, max_group_cap=1)
+    finally:
+        _solver_log.propagate = _saved_propagate
     # Greedy on this all-zeros cost will assign all 10 to centroid 0
     # (or 1, given ties), but at minimum returns finite indices.
     assert len(result) == 10
@@ -372,6 +402,7 @@ def test_sinkhorn_dispatch_returns_finite_assignment():
 # ---------------------------------------------------------------------------
 
 
+@_requires_ortools
 def test_mcf_handles_large_scale_costs_without_overflow():
     """Construct costs spanning ~1e6 magnitude and confirm MCF still finds
     the same assignment as on the same matrix divided by 1e6 (positive
@@ -1378,8 +1409,14 @@ def test_trackio_emits_v2_config_keys_once_at_start(
 
     cfg = _enable_v2_flags_for_telemetry(tiny_config)
 
+    # The dummy needs a mutable ``config`` because Stage 2's Blackwell
+    # workaround calls ``_set_experts_implementation(model, ...)`` at the
+    # top of ``run()`` which sets ``model.config._experts_implementation``.
+    # SimpleNamespace is mutable; no real model loading is needed because
+    # ``iter_moe_layers`` is monkeypatched to an empty iterator above.
+    import types as _types
     class _Dummy:
-        pass
+        config = _types.SimpleNamespace()
 
     stage2_reap_ream.run(
         _Dummy(), tokenizer=None, config=cfg,
