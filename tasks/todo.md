@@ -105,7 +105,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S6A-4 thermo_teacher_provider plugin — Pattern-A relocates THERMO_TEACHER_CACHE_FORMAT_VERSION + cache key/load/save; inert provide_thermo_teacher_side hook; hashlib/json orphans removed
 - [x] S6A-5 thermo_report plugin — pure Pattern B; ThermoReportPlugin with inert assemble_thermo_report hook (top1_agreement + bpt_gap + acc_norm_sum_gap + 16-key results assembly); zero monolith changes
 - [x] S6A-6 Wire orchestrator + STAGE6ALT — orchestrator-rewrite flip; stage6alt_thermometer.run is now a thin shim; STAGE6ALT Stage object exposed; H3 monkeypatches (6 targets) repointed; golden byte-identical
-- [ ] S6A-7 Stage-6alt orchestrator test
+- [x] S6A-7 Stage-6alt orchestrator test — test_stage6alt_orchestrator.py (6 tests: 6-plugin roster + order, phase-hook ownership, STAGE6ALT conformance, instrumented phase-order, JSON output, cache-hit short-circuit)
 
 ## Cleanup
 - [ ] Z-1  Delete StagePlugin/Stage2Plugin back-compat shims; full-suite green
