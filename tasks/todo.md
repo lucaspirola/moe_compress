@@ -95,7 +95,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S6-6  imatrix_export plugin — ImatrixExportPlugin; Pattern-A relocates 5 functions + _EVAL_TEXT_CONCAT_FILENAME; Option-C two-hook design (start_gguf_convert + export_imatrix); is_enabled defaults True matching monolith
 - [x] S6-7  validation_report plugin — ValidationReportPlugin; Pattern-A relocates _deltas/_measured_reduction/_check_thresholds (§8 NaN hotspot preserved verbatim); inert assemble_report hook reproduces JSON-assembly + Trackio flatten
 - [x] S6-8  Wire orchestrator + STAGE6 — orchestrator-rewrite flip; stage6_validate.run is now a thin shim; STAGE6 Stage object exposed; H3 monkeypatch repointed; golden byte-identical
-- [ ] S6-9  Stage-6 orchestrator test
+- [x] S6-9  Stage-6 orchestrator test — test_stage6_orchestrator.py (6 tests: 8-plugin roster + order, phase-hook ownership, STAGE6 conformance, imatrix default-True gating, instrumented phase-order, cache-hit short-circuit)
 
 ## Stage 6alt — thermometer (Part 5.5)
 - [ ] S6A-0 Capture stage-6alt golden
