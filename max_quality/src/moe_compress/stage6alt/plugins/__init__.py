@@ -32,6 +32,14 @@ Holds:
   and an inert ``provide_thermo_teacher_side`` hook that reproduces
   the monolith's teacher block — cache-hit shortcut + cache-miss
   load/score/save path).
+* ``thermo_report.py`` (added by S6A-5 — the thermometer final-report
+  assembly concern, **pure Pattern B**: no standalone helpers to
+  relocate. Houses a ``ThermoReportPlugin`` with an unconditional
+  ``is_enabled`` and an inert ``assemble_thermo_report`` hook that
+  reproduces the monolith's inline final-assembly block — the
+  top1_agreement / bpt_gap / acc_norm_sum_gap computations, the
+  16-key results dict pinned by the S6A-0 golden, and the
+  ``stage6alt_eval.json`` artifact write).
 
 The Stage 6alt thermometer algorithm — environment setup, calibration-
 corpus build, BPT measurement, zero-shot subset, teacher-cache provider,
