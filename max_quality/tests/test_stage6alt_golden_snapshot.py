@@ -86,39 +86,57 @@ class _TinyTokenizer:
 def patched_stage6alt(monkeypatch, tiny_config):
     """Patch Stage 6alt so ``run()`` completes CPU-only with no real evals.
 
-    Six things are neutralized on the ``stage6alt_thermometer`` monolith:
+    Six things are neutralized on the post-S6A-6 plugin modules (HAZARD
+    H3 — the orchestrator flip moved the call sites off
+    ``stage6alt_thermometer`` and onto the plugins). Each patch targets
+    the module that *owns the call site*, so ``monkeypatch.setattr`` on
+    the plugin module attribute bites the live invocation:
 
-    * ``_set_experts_implementation_s6`` → no-op (the tiny_model has no
-      Qwen3_5 fused-experts implementation switch to twiddle).
-    * ``_apply_stage6_kernel_patches`` → no-op (no fla / GatedDeltaNet on
-      the tiny_model).
-    * ``_build_thermo_corpus`` → returns a constant
-      ``(calib_ids, corpus_meta, corpus_id)`` so no dataset is loaded.
-      ``corpus_meta`` mirrors the nemotron branch of the monolith
-      (``name, num_sequences, sequence_length, effective_seed,
-      seed_offset, subset_weights``) — the exact dict shape that lands
-      in the JSON.
-    * ``_bpt_from_nll`` → returns ``(3.0, None)``: a finite student BPT
-      and no argmax (forces ``top1_agreement`` to ``None``, which is
-      the desired fixed shape).
-    * ``_lm_eval_subset`` → returns all-None metrics (avoids any
-      lm-eval import / harness call).
-    * ``_load_thermo_teacher_cache`` → returns a pre-baked teacher
-      dict (cache HIT, ``teacher_bpt=2.5``, all other metrics None,
-      no per-token argmax) so the teacher-load branch is bypassed
-      entirely.
+    * ``_set_experts_implementation_s6`` on
+      ``stage6alt.plugins.thermo_environment`` → no-op (the tiny_model
+      has no Qwen3_5 fused-experts implementation switch to twiddle).
+    * ``_apply_stage6_kernel_patches`` on
+      ``stage6alt.plugins.thermo_environment`` → no-op (no fla /
+      GatedDeltaNet on the tiny_model).
+    * ``_build_thermo_corpus`` on ``stage6alt.plugins.thermo_corpus``
+      → returns a constant ``(calib_ids, corpus_meta, corpus_id)`` so
+      no dataset is loaded. ``corpus_meta`` mirrors the nemotron branch
+      of the monolith (``name, num_sequences, sequence_length,
+      effective_seed, seed_offset, subset_weights``) — the exact dict
+      shape that lands in the JSON.
+    * ``_bpt_from_nll`` on ``stage6alt.plugins.bpt_metric`` → returns
+      ``(3.0, None)``: a finite student BPT and no argmax (forces
+      ``top1_agreement`` to ``None``, which is the desired fixed shape).
+    * ``_lm_eval_subset`` on ``stage6alt.plugins.zero_shot_subset``
+      → returns all-None metrics (avoids any lm-eval import / harness
+      call).
+    * ``_load_thermo_teacher_cache`` on
+      ``stage6alt.plugins.thermo_teacher_provider`` → returns a
+      pre-baked teacher dict (cache HIT, ``teacher_bpt=2.5``, all other
+      metrics None, no per-token argmax) so the teacher-load branch is
+      bypassed entirely.
 
     Additionally the config's ``thermometer`` sub-dict is overlaid with a
     fixed ``teacher_cache_path`` (``/dev/null/stub_teacher_cache.json``)
     so the JSON's ``teacher_cache.path`` field does not embed pytest's
-    volatile ``tmp_path`` — the BLOCKER fix that lets the snapshot be
-    byte-stable across runs.
-
-    The monolith does NOT call ``_trackio_log``, so no log-capture list
-    is returned (cf. the Stage 6 sibling snapshot which captures one).
+    volatile ``tmp_path`` — the BLOCKER fix (preserved from S6A-0) that
+    lets the snapshot be byte-stable across runs.
 
     Returns the deep-copied, overlaid config.
     """
+    # Function-local imports of the plugin modules — the H3 patches now
+    # target the plugin modules that own the call sites (post-S6A-6
+    # flip), not the legacy ``stage6alt_thermometer`` monolith. Importing
+    # at function scope mirrors the test-isolation discipline used by
+    # the sibling stage6 golden.
+    from moe_compress.stage6alt.plugins import (
+        bpt_metric,
+        thermo_corpus,
+        thermo_environment,
+        thermo_teacher_provider,
+        zero_shot_subset,
+    )
+
     cfg = copy.deepcopy(tiny_config)
     s6 = cfg["stage6_validate"]
     s6["mode"] = "thermometer"
@@ -136,13 +154,16 @@ def patched_stage6alt(monkeypatch, tiny_config):
         "teacher_cache_path": "/dev/null/stub_teacher_cache.json",
     }
 
-    # 1. Kernel/impl switches → no-op.
+    # 1. Kernel/impl switches → no-op (on the thermo_environment plugin
+    # module, which is what the live ``setup_thermo_environment`` hook
+    # resolves via ``from ...stage6.plugins.eval_environment import ...``
+    # re-exported at module scope).
     monkeypatch.setattr(
-        stage6alt_thermometer, "_set_experts_implementation_s6",
+        thermo_environment, "_set_experts_implementation_s6",
         lambda *a, **k: None,
     )
     monkeypatch.setattr(
-        stage6alt_thermometer, "_apply_stage6_kernel_patches",
+        thermo_environment, "_apply_stage6_kernel_patches",
         lambda *a, **k: None,
     )
 
@@ -159,19 +180,19 @@ def patched_stage6alt(monkeypatch, tiny_config):
         },
     }
     monkeypatch.setattr(
-        stage6alt_thermometer, "_build_thermo_corpus",
+        thermo_corpus, "_build_thermo_corpus",
         lambda *a, **k: (_calib, _corpus_meta, "nemotron:stub"),
     )
 
     # 3. BPT → (3.0, None). Finite BPT + no argmax → top1_agreement None.
     monkeypatch.setattr(
-        stage6alt_thermometer, "_bpt_from_nll",
+        bpt_metric, "_bpt_from_nll",
         lambda *a, **k: (3.0, None),
     )
 
     # 4. lm-eval subset → all-None.
     monkeypatch.setattr(
-        stage6alt_thermometer, "_lm_eval_subset",
+        zero_shot_subset, "_lm_eval_subset",
         lambda *a, **k: {
             "arc_easy_acc_norm": None,
             "hellaswag_acc_norm": None,
@@ -181,7 +202,7 @@ def patched_stage6alt(monkeypatch, tiny_config):
 
     # 5. Teacher cache → HIT with teacher_bpt=2.5, no argmax.
     monkeypatch.setattr(
-        stage6alt_thermometer, "_load_thermo_teacher_cache",
+        thermo_teacher_provider, "_load_thermo_teacher_cache",
         lambda *a, **k: {
             "teacher_bpt": 2.5,
             "teacher_arc_easy_acc_norm": None,
