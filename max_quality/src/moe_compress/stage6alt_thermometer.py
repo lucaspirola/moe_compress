@@ -48,10 +48,8 @@ import torch
 from .stage6_validate import (
     _STAGE6_ATTN_IMPLEMENTATION,
     _apply_stage6_kernel_patches,
-    _lm_eval_tasks,
     _set_experts_implementation_s6,
 )
-from .utils.calibration import iter_batches
 from .utils.model_io import load_model, save_json_artifact
 
 # S6A-2: re-export the Stage 6alt thermometer corpus Pattern-A symbols
@@ -71,6 +69,23 @@ from .stage6alt.plugins.thermo_corpus import (  # noqa: F401
 )
 from .stage6alt.plugins.thermo_environment import ThermoEnvironmentPlugin  # noqa: F401
 
+# S6A-3: re-export the Stage 6alt thermometer BPT-metric + zero-shot-subset
+# Pattern-A symbols (the two helper functions) from their plugin homes so the
+# existing import path keeps working. The S6A-0 golden snapshot patches
+# ``stage6alt_thermometer._bpt_from_nll`` / ``stage6alt_thermometer._lm_eval_subset``
+# directly via ``monkeypatch.setattr``; the re-import puts the SAME function
+# object on the monolith namespace, so that patch-by-attribute keeps biting.
+# The plugin classes ``BptMetricPlugin`` / ``ZeroShotSubsetPlugin`` are imported
+# alongside so an external registry walker can pick them up via the monolith too.
+from .stage6alt.plugins.bpt_metric import (  # noqa: F401
+    _bpt_from_nll,
+    BptMetricPlugin,
+)
+from .stage6alt.plugins.zero_shot_subset import (  # noqa: F401
+    _lm_eval_subset,
+    ZeroShotSubsetPlugin,
+)
+
 log = logging.getLogger(__name__)
 
 # S6A-2: `THERMO_SEED_OFFSET` and `_DEFAULT_SUBSET_WEIGHTS` are relocated to
@@ -85,107 +100,10 @@ log = logging.getLogger(__name__)
 THERMO_TEACHER_CACHE_FORMAT_VERSION = 2
 
 
-# ---------------------------------------------------------------------------
-# Bits-per-token
-# ---------------------------------------------------------------------------
-
-
-def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int,
-                  collect_argmax: bool = False):
-    """Mean next-token NLL in bits over a pre-tokenized calibration tensor.
-
-    Adapted from `stage6_validate._wikitext2_ppl`'s NLL loop, but returns
-    bits-per-token (mean NLL in nats / ln 2) instead of exp(mean NLL), and
-    takes a ready-made `(num_seqs, seq_len)` int64 tensor instead of loading
-    WikiText.
-
-    Returns `float("inf")` if any batch is skipped — a loud failure rather
-    than a partial-corpus number that would corrupt a directional comparison.
-
-    When `collect_argmax=True`, returns `(bpt, argmax)` where `argmax` is a
-    CPU int64 tensor of shape `(num_seqs, seq_len-1)` holding the model's
-    predicted next-token id at each position — used by the top1_agreement
-    metric. On the skip/inf path `argmax` is `None`. When `collect_argmax`
-    is False (default) the bare `float` is returned, as before.
-    """
-    # Batch-size-invariant numerics require eager attention (same requirement
-    # as Stage 6's PPL / lm-eval paths). The student is loaded eager by
-    # run_pipeline._load_for_stage; the teacher must be loaded eager explicitly.
-    _attn_impl = getattr(model.config, "_attn_implementation", None)
-    if _attn_impl != _STAGE6_ATTN_IMPLEMENTATION:
-        raise RuntimeError(
-            f"stage6alt _bpt_from_nll: model.config._attn_implementation="
-            f"{_attn_impl!r}, expected {_STAGE6_ATTN_IMPLEMENTATION!r} "
-            "(batch-size-invariant NLL requires eager attention)."
-        )
-    model.train(False)  # inference mode (equivalent to model.eval())
-
-    _dev = device
-    if _dev is None:
-        try:
-            _dev = next(model.parameters()).device
-        except StopIteration:
-            pass
-
-    nll_sum = 0.0
-    tok_count = 0
-    skipped = 0
-    total = 0
-    argmax_chunks: list[torch.Tensor] = []
-    n_seqs = calib_ids.shape[0]
-    log.info("Stage 6alt BPT: %d sequences x len=%d, batch_size=%d",
-             n_seqs, calib_ids.shape[1], batch_size)
-    with torch.no_grad():
-        for i, batch in enumerate(iter_batches(calib_ids, batch_size=batch_size)):
-            total += 1
-            if _dev is not None:
-                batch = batch.to(_dev)
-            try:
-                out = model(input_ids=batch, labels=batch)
-                if out.loss is None:
-                    log.warning("stage6alt _bpt_from_nll: None loss; skipping batch")
-                    skipped += 1
-                    continue
-                loss_val = float(out.loss.item())
-                if not math.isfinite(loss_val):
-                    log.warning("stage6alt _bpt_from_nll: non-finite loss %.2e; "
-                                "skipping batch", loss_val)
-                    skipped += 1
-                    continue
-                # (batch.numel() - batch.shape[0]) == B*(seq_len-1): the count
-                # of predicted tokens under the standard causal-LM label shift.
-                predicted = batch.numel() - batch.shape[0]
-                nll_sum += loss_val * predicted
-                tok_count += predicted
-                if collect_argmax:
-                    # logits[:, t] predicts token t+1 → predicted-next id at
-                    # positions 0..L-2. Move to CPU so 32 batches' worth of
-                    # predictions don't accumulate on the GPU.
-                    argmax_chunks.append(
-                        out.logits[:, :-1, :].argmax(dim=-1).to("cpu")
-                    )
-            except Exception as exc:           # noqa: BLE001
-                log.warning("stage6alt _bpt_from_nll: batch error (%s); skipping", exc)
-                skipped += 1
-                continue
-            if (i + 1) % max(1, 64 // batch_size) == 0:
-                log.info("  BPT forward %d/%d batches", i + 1,
-                         math.ceil(n_seqs / batch_size))
-    if skipped > 0:
-        log.error("stage6alt _bpt_from_nll: %d/%d batches skipped — returning inf "
-                  "(directional comparison must not run on a partial corpus).",
-                  skipped, total)
-        return (float("inf"), None) if collect_argmax else float("inf")
-    if tok_count == 0:
-        log.error("stage6alt _bpt_from_nll: corpus produced no tokens "
-                  "(empty calib_ids?) — returning inf.")
-        return (float("inf"), None) if collect_argmax else float("inf")
-    # BPT = mean NLL in nats / ln(2). Computed directly from the running sum —
-    # never round-tripped through exp().
-    bpt = nll_sum / tok_count / math.log(2)
-    if collect_argmax:
-        return bpt, torch.cat(argmax_chunks, dim=0)
-    return bpt
+# S6A-3: `_bpt_from_nll` is relocated to `stage6alt/plugins/bpt_metric.py` and
+# re-imported above (see the `# noqa: F401` block); call sites below resolve
+# it through that re-import. The orphaned `iter_batches` import (only used by
+# `_bpt_from_nll`) was removed alongside the relocation.
 
 
 # S6A-2: `_thermo_corpus_spec`, `_thermo_wikitext_tensor`, `_build_thermo_corpus`
@@ -264,31 +182,9 @@ def _save_thermo_teacher_cache(cache_path: Path, cache_key: str,
     log.info("stage6alt: teacher BPT cache saved -> %s (key=%s)", cache_path, cache_key)
 
 
-# ---------------------------------------------------------------------------
-# lm-eval subset
-# ---------------------------------------------------------------------------
-
-
-def _lm_eval_subset(model, tokenizer, *, arc_limit: int, hellaswag_limit: int,
-                    batch_size) -> dict:
-    """ARC-Easy + HellaSwag zero-shot on a subsample. Two calls (limits differ).
-
-    Returns {arc_easy_acc_norm, hellaswag_acc_norm, acc_norm_sum}. Any metric
-    that lm-eval could not produce (e.g. lm-eval not installed) is recorded as
-    None and acc_norm_sum is None — BPT alone still carries the signal.
-    """
-    arc = _lm_eval_tasks(model, tokenizer, ["arc_easy"],
-                         batch_size=batch_size, limit=arc_limit)
-    hsw = _lm_eval_tasks(model, tokenizer, ["hellaswag"],
-                         batch_size=batch_size, limit=hellaswag_limit)
-    arc_acc = arc.get("arc_easy_acc")
-    hsw_acc = hsw.get("hellaswag_acc")
-    acc_sum = (arc_acc + hsw_acc) if (arc_acc is not None and hsw_acc is not None) else None
-    return {
-        "arc_easy_acc_norm": arc_acc,
-        "hellaswag_acc_norm": hsw_acc,
-        "acc_norm_sum": acc_sum,
-    }
+# S6A-3: `_lm_eval_subset` is relocated to `stage6alt/plugins/zero_shot_subset.py`
+# and re-imported above (see the `# noqa: F401` block); call sites below resolve
+# it through that re-import.
 
 
 # ---------------------------------------------------------------------------

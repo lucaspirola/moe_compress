@@ -101,7 +101,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S6A-0 Capture stage-6alt golden — test_stage6alt_golden_snapshot.py (stage6alt_eval.json byte-identical; teacher cache-hit forced + lm-eval mocked; teacher_cache_path stubbed to /dev/null to stabilize the path embedded in JSON)
 - [x] S6A-1 Scaffold stage6alt/ package — __init__/context/orchestrator + plugins/; orchestrator delegates to legacy stage6alt_thermometer.run via function-local import; test_stage6alt_scaffold.py
 - [x] S6A-2 thermo_environment + thermo_corpus plugins — ThermoEnvironmentPlugin (Pattern-B; reuses stage6/eval_environment helpers) + ThermoCorpusPlugin (Pattern-A relocates 5 corpus symbols incl. THERMO_SEED_OFFSET + _build_thermo_corpus)
-- [ ] S6A-3 bpt_metric + zero_shot_subset plugins
+- [x] S6A-3 bpt_metric + zero_shot_subset plugins — Pattern-A relocates _bpt_from_nll + _lm_eval_subset; inert hooks; iter_batches and _lm_eval_tasks orphans removed
 - [ ] S6A-4 thermo_teacher_provider plugin
 - [ ] S6A-5 thermo_report plugin
 - [ ] S6A-6 Wire orchestrator + STAGE6ALT
