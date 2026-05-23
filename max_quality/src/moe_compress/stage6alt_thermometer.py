@@ -51,33 +51,38 @@ from .stage6_validate import (
     _lm_eval_tasks,
     _set_experts_implementation_s6,
 )
-from .utils.calibration import (
-    CalibrationSpec,
-    build_calibration_tensor,
-    iter_batches,
-    shared_calibration_cache_dir,
-    spec_from_config,
-)
+from .utils.calibration import iter_batches
 from .utils.model_io import load_model, save_json_artifact
+
+# S6A-2: re-export the Stage 6alt thermometer corpus Pattern-A symbols
+# (constants + functions) from their plugin home so existing import paths
+# (this module's own `run()`, plus external callers like
+# `stage2/orchestrator.py`'s xD calibration that imports
+# `_thermo_wikitext_tensor`) keep working unchanged. The plugin classes
+# `ThermoEnvironmentPlugin` / `ThermoCorpusPlugin` are imported alongside
+# so an external registry walker can pick them up via the monolith too.
+from .stage6alt.plugins.thermo_corpus import (  # noqa: F401
+    THERMO_SEED_OFFSET,
+    _DEFAULT_SUBSET_WEIGHTS,
+    _thermo_corpus_spec,
+    _thermo_wikitext_tensor,
+    _build_thermo_corpus,
+    ThermoCorpusPlugin,
+)
+from .stage6alt.plugins.thermo_environment import ThermoEnvironmentPlugin  # noqa: F401
 
 log = logging.getLogger(__name__)
 
-# Held-out draw: shifts the calibration seed so the thermometer's eval
-# sequences do not overlap the Stage 2/2.5 training draw. Bumping this value
-# changes the effective seed inside CalibrationSpec.cache_key, which in turn
-# changes _thermo_teacher_cache_key — so the teacher cache auto-invalidates.
-THERMO_SEED_OFFSET = 715
+# S6A-2: `THERMO_SEED_OFFSET` and `_DEFAULT_SUBSET_WEIGHTS` are relocated to
+# `stage6alt/plugins/thermo_corpus.py` and re-imported above (see the
+# `# noqa: F401` block) so existing call sites in this module / external
+# callers still resolve them via `stage6alt_thermometer.THERMO_SEED_OFFSET`.
 
 # Bump on any change to the thermometer_teacher_cache.json schema.
 # v2: added `teacher_argmax` (per-token predictions for the top1_agreement
 #     metric) and switched the cache key from a Nemotron-only spec hash to a
 #     corpus-agnostic `corpus_id` (so wikitext/nemotron results never collide).
 THERMO_TEACHER_CACHE_FORMAT_VERSION = 2
-
-# Default eval subset mix — reasoning-heavy, independent of the chat-dominant
-# calibration.subset_weights used for compression. Overridable via the
-# `thermometer.subset_weights` config key.
-_DEFAULT_SUBSET_WEIGHTS = {"math": 0.35, "swe": 0.25, "chat": 0.25, "science": 0.15}
 
 
 # ---------------------------------------------------------------------------
@@ -183,133 +188,10 @@ def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int,
     return bpt
 
 
-# ---------------------------------------------------------------------------
-# Corpus spec
-# ---------------------------------------------------------------------------
-
-
-def _thermo_corpus_spec(config: dict) -> CalibrationSpec:
-    """Build the held-out CalibrationSpec for the thermometer corpus.
-
-    Copies `config["calibration"]`, overlays the thermometer's own
-    `subset_weights` (reasoning-heavy, not the chat-dominant training mix),
-    and applies `THERMO_SEED_OFFSET` so the draw is disjoint from Stage 2/2.5.
-    Never mutates `config["calibration"]` — Stage 2/2.5 read it.
-    """
-    therm = config.get("stage6_validate", {}).get("thermometer", {}) or {}
-    cal_cfg = dict(config["calibration"])  # shallow copy — we replace one key
-    cal_cfg["subset_weights"] = dict(
-        therm.get("subset_weights") or _DEFAULT_SUBSET_WEIGHTS
-    )
-    return spec_from_config(
-        cal_cfg,
-        num_sequences_override=int(therm.get("num_sequences", 64)),
-        sequence_length_override=int(therm.get("sequence_length", 2048)),
-        seed_offset=THERMO_SEED_OFFSET,
-    )
-
-
-def _thermo_wikitext_tensor(tokenizer, *, num_sequences: int,
-                            sequence_length: int, dataset: str, subset: str,
-                            split: str) -> torch.Tensor:
-    """Build the first `num_sequences` full-length chunks of WikiText.
-
-    Mirrors `stage6_validate._wikitext2_ppl`'s tokenization exactly: rows are
-    concatenated with "\\n\\n", the whole corpus is tokenized in one call with
-    `add_special_tokens=True` (BOS applied once), then chunked into
-    `sequence_length`-token rows. The chunk order is fixed by the dataset, so
-    the draw is fully deterministic. WikiText test text is not in the Stage 2/
-    2.5 training distribution, so no seed-offset disjointness logic is needed.
-    """
-    from datasets import load_dataset
-
-    ds = load_dataset(dataset, subset, split=split)
-    concatenated = "\n\n".join(row.get("text", "") for row in ds)
-    all_ids = tokenizer(
-        concatenated, add_special_tokens=True, return_tensors=None,
-    )["input_ids"]
-    n_full = len(all_ids) // sequence_length
-    if n_full == 0:
-        raise RuntimeError(
-            f"thermometer wikitext corpus: {dataset}/{subset}:{split} has no "
-            f"full {sequence_length}-token sequence."
-        )
-    take = min(num_sequences, n_full)
-    if take < num_sequences:
-        log.warning("thermometer wikitext: only %d full sequences available "
-                    "(< %d requested) — using %d", n_full, num_sequences, take)
-    return torch.tensor(
-        all_ids[: take * sequence_length], dtype=torch.long
-    ).view(take, sequence_length)
-
-
-def _build_thermo_corpus(config: dict, tokenizer, artifacts_dir: Path):
-    """Build the thermometer's evaluation corpus.
-
-    Returns `(calib_ids, corpus_meta, corpus_id)`:
-      - `calib_ids`: `(num_seqs, seq_len)` int64 tensor for `_bpt_from_nll`.
-      - `corpus_meta`: JSON-able dict recorded in `stage6alt_eval.json`.
-      - `corpus_id`: stable string folded into the teacher cache key so a
-        corpus switch (nemotron <-> wikitext, or a spec change) auto-
-        invalidates the sweep-shared teacher cache.
-
-    Selected by `thermometer.corpus` ("nemotron" default, or "wikitext").
-    See the module docstring for why the choice changes how `bpt_gap` is read.
-    """
-    therm = config.get("stage6_validate", {}).get("thermometer", {}) or {}
-    corpus = str(therm.get("corpus", "nemotron")).lower()
-    seq_len = int(therm.get("sequence_length", 2048))
-    n_seq = int(therm.get("num_sequences", 64))
-    # Class-qualified fallback so a tokenizer that lacks name_or_path (e.g. an
-    # in-memory instance) doesn't yield a tokenizer-blind corpus_id — mirrors
-    # build_calibration_tensor's defensive identity.
-    tok_id = (getattr(tokenizer, "name_or_path", None)
-              or f"{tokenizer.__class__.__module__}."
-                 f"{tokenizer.__class__.__name__}")
-
-    if corpus == "wikitext":
-        wt = therm.get("wikitext", {}) or {}
-        dataset = wt.get("dataset", "wikitext")
-        subset = wt.get("subset", "wikitext-2-raw-v1")
-        split = wt.get("split", "test")
-        calib = _thermo_wikitext_tensor(
-            tokenizer, num_sequences=n_seq, sequence_length=seq_len,
-            dataset=dataset, subset=subset, split=split,
-        )
-        corpus_meta = {
-            "name": "wikitext", "dataset": dataset, "subset": subset,
-            "split": split, "num_sequences": int(calib.shape[0]),
-            "sequence_length": seq_len,
-        }
-        corpus_id = (f"wikitext:{dataset}:{subset}:{split}:"
-                     f"{calib.shape[0]}x{seq_len}:{tok_id}")
-        log.info("Stage 6alt corpus: wikitext (%s/%s:%s) %d x %d",
-                 dataset, subset, split, calib.shape[0], seq_len)
-        return calib, corpus_meta, corpus_id
-
-    if corpus == "nemotron":
-        spec = _thermo_corpus_spec(config)
-        calib = build_calibration_tensor(
-            tokenizer, spec,
-            cache_dir=(os.environ.get("MOE_CALIB_CACHE_DIR") or shared_calibration_cache_dir(artifacts_dir)),
-        )
-        corpus_meta = {
-            "name": "nemotron",
-            "num_sequences": spec.num_sequences,
-            "sequence_length": spec.sequence_length,
-            "effective_seed": spec.seed,
-            "seed_offset": THERMO_SEED_OFFSET,
-            "subset_weights": spec.subset_weights,
-        }
-        corpus_id = f"nemotron:{spec.cache_key(tok_id)}"
-        log.info("Stage 6alt corpus: nemotron (held-out slice) %d x %d "
-                 "— bpt_gap is RANKING-ONLY (Stage-2.5 adaptation confound)",
-                 spec.num_sequences, spec.sequence_length)
-        return calib, corpus_meta, corpus_id
-
-    raise ValueError(
-        f"thermometer.corpus must be 'nemotron' or 'wikitext', got {corpus!r}"
-    )
+# S6A-2: `_thermo_corpus_spec`, `_thermo_wikitext_tensor`, `_build_thermo_corpus`
+# are relocated to `stage6alt/plugins/thermo_corpus.py` and re-imported above
+# (see the `# noqa: F401` block); call sites below resolve them through that
+# re-import.
 
 
 # ---------------------------------------------------------------------------
