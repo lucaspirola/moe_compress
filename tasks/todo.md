@@ -98,7 +98,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S6-9  Stage-6 orchestrator test — test_stage6_orchestrator.py (6 tests: 8-plugin roster + order, phase-hook ownership, STAGE6 conformance, imatrix default-True gating, instrumented phase-order, cache-hit short-circuit)
 
 ## Stage 6alt — thermometer (Part 5.5)
-- [ ] S6A-0 Capture stage-6alt golden
+- [x] S6A-0 Capture stage-6alt golden — test_stage6alt_golden_snapshot.py (stage6alt_eval.json byte-identical; teacher cache-hit forced + lm-eval mocked; teacher_cache_path stubbed to /dev/null to stabilize the path embedded in JSON)
 - [ ] S6A-1 Scaffold stage6alt/ package
 - [ ] S6A-2 thermo_environment + thermo_corpus plugins
 - [ ] S6A-3 bpt_metric + zero_shot_subset plugins
