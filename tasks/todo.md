@@ -99,7 +99,7 @@ stage golden snapshot, not a speculative standalone test.
 
 ## Stage 6alt — thermometer (Part 5.5)
 - [x] S6A-0 Capture stage-6alt golden — test_stage6alt_golden_snapshot.py (stage6alt_eval.json byte-identical; teacher cache-hit forced + lm-eval mocked; teacher_cache_path stubbed to /dev/null to stabilize the path embedded in JSON)
-- [ ] S6A-1 Scaffold stage6alt/ package
+- [x] S6A-1 Scaffold stage6alt/ package — __init__/context/orchestrator + plugins/; orchestrator delegates to legacy stage6alt_thermometer.run via function-local import; test_stage6alt_scaffold.py
 - [ ] S6A-2 thermo_environment + thermo_corpus plugins
 - [ ] S6A-3 bpt_metric + zero_shot_subset plugins
 - [ ] S6A-4 thermo_teacher_provider plugin
