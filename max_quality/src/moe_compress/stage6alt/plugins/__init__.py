@@ -23,11 +23,15 @@ Holds:
   ``is_enabled`` and an inert ``compute_zero_shot_subset`` hook;
   the underlying ``_lm_eval_tasks`` harness wrapper stays in its S6-3
   home, ``stage6.plugins.zero_shot_lm_eval``).
-* ``teacher_provider.py`` (deferred — the thermometer teacher-cache
-  provider concern: ``_thermo_teacher_cache_key`` /
-  ``_load_thermo_teacher_cache`` / ``_save_thermo_teacher_cache`` helpers
-  plus a ``TeacherProviderPlugin`` with an unconditional ``is_enabled``
-  and an inert ``provide_teacher_side`` hook).
+* ``thermo_teacher_provider.py`` (added by S6A-4 — the thermometer
+  teacher-cache provider concern: the relocated
+  ``THERMO_TEACHER_CACHE_FORMAT_VERSION`` /
+  ``_thermo_teacher_cache_key`` / ``_load_thermo_teacher_cache`` /
+  ``_save_thermo_teacher_cache`` symbols plus a
+  ``ThermoTeacherProviderPlugin`` with an unconditional ``is_enabled``
+  and an inert ``provide_thermo_teacher_side`` hook that reproduces
+  the monolith's teacher block — cache-hit shortcut + cache-miss
+  load/score/save path).
 
 The Stage 6alt thermometer algorithm — environment setup, calibration-
 corpus build, BPT measurement, zero-shot subset, teacher-cache provider,

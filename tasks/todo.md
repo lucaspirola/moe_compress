@@ -102,7 +102,7 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S6A-1 Scaffold stage6alt/ package — __init__/context/orchestrator + plugins/; orchestrator delegates to legacy stage6alt_thermometer.run via function-local import; test_stage6alt_scaffold.py
 - [x] S6A-2 thermo_environment + thermo_corpus plugins — ThermoEnvironmentPlugin (Pattern-B; reuses stage6/eval_environment helpers) + ThermoCorpusPlugin (Pattern-A relocates 5 corpus symbols incl. THERMO_SEED_OFFSET + _build_thermo_corpus)
 - [x] S6A-3 bpt_metric + zero_shot_subset plugins — Pattern-A relocates _bpt_from_nll + _lm_eval_subset; inert hooks; iter_batches and _lm_eval_tasks orphans removed
-- [ ] S6A-4 thermo_teacher_provider plugin
+- [x] S6A-4 thermo_teacher_provider plugin — Pattern-A relocates THERMO_TEACHER_CACHE_FORMAT_VERSION + cache key/load/save; inert provide_thermo_teacher_side hook; hashlib/json orphans removed
 - [ ] S6A-5 thermo_report plugin
 - [ ] S6A-6 Wire orchestrator + STAGE6ALT
 - [ ] S6A-7 Stage-6alt orchestrator test
