@@ -108,7 +108,109 @@ stage golden snapshot, not a speculative standalone test.
 - [x] S6A-7 Stage-6alt orchestrator test — test_stage6alt_orchestrator.py (6 tests: 6-plugin roster + order, phase-hook ownership, STAGE6ALT conformance, instrumented phase-order, JSON output, cache-hit short-circuit)
 
 ## Cleanup
-- [ ] Z-1  Delete StagePlugin/Stage2Plugin back-compat shims; full-suite green
+- [x] Z-1  Delete StagePlugin/Stage2Plugin back-compat shims; full-suite green
 
 ## Review
-(completion notes added here as tasks land)
+
+### Z-1 — Final cleanup (2026-05-23)
+
+Branch `feat/universal-plugin-interface` — the universal-plugin-interface
+refactor is **complete**. Z-1 removed the last back-compat dead-weight that
+had accumulated during the 9-stage migration; the full test suite remains
+byte-identical green against every golden snapshot.
+
+#### Refactor scope
+
+All nine stage entry points (`stage1`, `stage2`, `stage3`, `stage4`,
+`stage5_router_kd`, `stage2p5` ≡ same code via `make_router_kd_stage`,
+`stage6_validate`, `stage6alt_thermometer`) now run through the universal
+``PipelinePlugin`` + ``PluginRegistry`` + ``PipelineContext`` framework. Each
+stage exposes a ``Stage`` object:
+
+- ``stage1.STAGE1`` — 8 plugins
+- ``stage2.STAGE2`` — 19 plugins (incl. layer_merge + 6 solver variants)
+- ``stage3.STAGE3`` — 5 plugins
+- ``stage4.STAGE4`` — 2 plugins
+- ``router_kd.make_router_kd_stage(stage_id)`` — factory returns one
+  ``Stage`` per invocation (stages 2.5 and 5 share the implementation) — 6
+  plugins; merge_repair is stage-gated to stage2p5 only
+- ``stage6.STAGE6`` — 8 plugins
+- ``stage6alt.STAGE6ALT`` — 6 plugins
+
+`run_pipeline.STAGE_REGISTRY` is the single dispatch point.
+
+#### Framework files created (Part 2)
+
+- ``pipeline/plugin.py`` — ``PipelinePlugin`` Protocol + ``BasePlugin``
+- ``pipeline/context.py`` — ``PipelineContext`` (typed dict-like artifact carrier)
+- ``pipeline/registry.py`` — ``PluginRegistry`` + ``walk_phases``
+- ``pipeline/stage.py`` — ``Stage`` Protocol (registry + phase schedule + ``run``)
+- ``pipeline/candidates.py`` — stage-1 candidate model (relocated from `_framework`)
+- ``tools/phase_walker.py`` — reflective phase-hook walker (``getattr``-driven)
+- ``tools/artifact_builder.py`` — stage-artifact JSON assembler
+- ``tools/calibration_pass.py`` — multiplexed activation/covariance pass (folded F-6)
+- ``tools/eval_harness.py`` — shared batched-gen + chat-format + ``_THINK_BLOCK_RE``
+- ``tools/dtype_noise_floor.py`` — bf16/fp32 noise-floor guards
+
+#### Stages migrated (Parts 3–5)
+
+- **Stage 1 (GRAPE)** — 8 plugins live under `stage1/plugins/`; legacy
+  `_framework/` package dismantled (S1-3c). Monolith fully retired
+  (`stage1.STAGE1` is the only entry point).
+- **Stage 2 (REAP/REAM)** — 19 plugins under `stage2/plugins/`;
+  `stage2_reap_ream.py` deleted at S2-13b (19 test files retargeted).
+  LayerMergePlugin owns the 6 merge-time hooks; legacy_adapter purged.
+- **Stage 3 (SVD)** — 5 plugins under `stage3/plugins/`; orchestrator drives
+  the plugin schedule; `stage3_svd.run` reduced to a thin shim (178 LOC).
+- **Stage 4 (EoRA)** — 2 plugins under `stage4/plugins/`; `stage4_eora.run`
+  reduced to a thin shim (67 LOC).
+- **Router-KD (stages 2.5 & 5)** — 6 plugins under `router_kd/plugins/`;
+  `make_router_kd_stage` factory dispatches to the same orchestrator for
+  both invocations. `stage5_router_kd.run` is a shim (126 LOC); merge_repair
+  is stage-gated.
+- **Stage 6 (validation)** — 8 plugins under `stage6/plugins/`;
+  `stage6_validate.run` flipped to thin shim at S6-8 (now 273 LOC with all
+  re-export blocks). H3 monkeypatch repointed.
+- **Stage 6alt (thermometer)** — 6 plugins under `stage6alt/plugins/`;
+  `stage6alt_thermometer.run` is a thin shim (142 LOC); H3 monkeypatches
+  (6 targets) repointed.
+
+#### Byte-identical guarantees — 6 golden snapshot tests
+
+- `test_stage1_golden_snapshot.py`
+- `test_stage3_golden_snapshot.py`
+- `test_stage4_golden_snapshot.py`
+- `test_router_kd_golden_snapshot.py` (covers stages 2.5 and 5)
+- `test_stage6_golden_snapshot.py`
+- `test_stage6alt_golden_snapshot.py`
+
+Each pins the per-stage artifact JSON byte-for-byte against the pre-refactor
+output; the suite stayed green through all 9 stage migrations and through
+the Z-1 cleanup.
+
+#### Z-1 cleanup itself
+
+- **`stage6_validate.py`**: deleted dead top-level imports — `os`, `queue`,
+  `re`, `threading`, `torch`, `torch.nn.functional as F`,
+  `count_expert_parameters`, `count_parameters_effective`, `load_model`,
+  `save_json_artifact`, `trackio_log as _trackio_log`. Kept `logging`,
+  `Path`, all `# noqa: F401` re-export blocks (S6-2..S6-7),
+  `_STAGE6_ATTN_IMPLEMENTATION` constant, tombstone comments, the 6-line
+  `run()` shim body.
+- **`stage6alt_thermometer.py`**: deleted dead top-level imports — `math`,
+  `os`, `torch`, `_STAGE6_ATTN_IMPLEMENTATION`, `_apply_stage6_kernel_patches`,
+  `_set_experts_implementation_s6`, `load_model`, `save_json_artifact`. Kept
+  `logging`, `Path`, all 5 `# noqa: F401` re-export blocks (S6A-2..S6A-4),
+  tombstone comments, the function-local-import `run()` shim body.
+- **`stage2/orchestrator.py`** (line 713): retargeted the function-local
+  `_thermo_wikitext_tensor` import from `..stage6alt_thermometer` to
+  `..stage6alt.plugins.thermo_corpus` — the last functional dependency on
+  the stage6alt monolith namespace from outside its own re-export block.
+- **`pipeline/plugin.py`**: rewrote the `BasePlugin` docstring sentence that
+  compared against a non-existent `Stage2Plugin`. The comparison was stale
+  (`Stage2Plugin` never formally existed in the universal interface); the
+  sentence now states the design choice directly without the comparison.
+- **Full grep** confirmed no remaining `Stage2Plugin` / `StagePlugin` refs
+  in `max_quality/src/` or `max_quality/tests/`.
+
+No behavior change. No test changes. Refactor complete.

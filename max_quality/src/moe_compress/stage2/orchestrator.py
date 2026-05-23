@@ -710,7 +710,7 @@ def run(
             # exactly (same dataset / subset / split). Defaults mirror the
             # thermometer defaults; the `_thermo_wikitext_tensor` call is the
             # same tokenisation path the BPT eval uses.
-            from ..stage6alt_thermometer import _thermo_wikitext_tensor
+            from ..stage6alt.plugins.thermo_corpus import _thermo_wikitext_tensor
             therm = config.get("stage6_validate", {}).get("thermometer", {}) or {}
             wt = therm.get("wikitext", {}) or {}
             wt_dataset = wt.get("dataset", "wikitext")

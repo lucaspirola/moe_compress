@@ -55,22 +55,7 @@ identical to the batch_size=1 baseline.
 from __future__ import annotations
 
 import logging
-import os
-import queue
-import re
-import threading
 from pathlib import Path
-
-import torch
-import torch.nn.functional as F
-
-from .utils.model_io import (
-    count_expert_parameters,
-    count_parameters_effective,
-    load_model,
-    save_json_artifact,
-)
-from .utils.trackio_log import trackio_log as _trackio_log
 
 log = logging.getLogger(__name__)
 

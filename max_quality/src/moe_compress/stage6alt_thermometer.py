@@ -37,18 +37,7 @@ run_pipeline.py's Stage 6 dispatch. Default mode is "full" (stage6_validate).
 from __future__ import annotations
 
 import logging
-import math
-import os
 from pathlib import Path
-
-import torch
-
-from .stage6_validate import (
-    _STAGE6_ATTN_IMPLEMENTATION,
-    _apply_stage6_kernel_patches,
-    _set_experts_implementation_s6,
-)
-from .utils.model_io import load_model, save_json_artifact
 
 # S6A-2: re-export the Stage 6alt thermometer corpus Pattern-A symbols
 # (constants + functions) from their plugin home so existing import paths

@@ -74,10 +74,10 @@ class BasePlugin:
     may subclass ``BasePlugin`` *or* satisfy :class:`PipelinePlugin`
     structurally — both styles are first-class.
 
-    Unlike stage-2's ``Stage2Plugin``, this base carries *only* the universal
-    core (``is_enabled``, ``contribute_artifact``); it intentionally declares
-    no phase-specific hooks, since those are an open vocabulary discovered
-    reflectively by the phase walker.
+    This base carries *only* the universal core (``is_enabled``,
+    ``contribute_artifact``); it intentionally declares no phase-specific
+    hooks, since those are an open vocabulary discovered reflectively by
+    the phase walker.
     """
 
     name: str = ""
