@@ -141,11 +141,15 @@ Deviation: D-proxy-deploy-alignment — proxy/deployed allocator parity
 ---------------------------------------------------------------------
 The proxy objective in ``_swift_svd_plus_alpha_search._evaluate_alpha``
 and the deployed allocator in ``_redistribute_ranks_swift_svd_plus``
-BOTH apply paper §A.3 / Algorithm 2's δ-floor (δ = 0.5): every expert
-starts at ``floor(k̄·δ)`` and the remaining ``k̄·L·(1−δ)`` flexible
-pool is distributed by score share. This keeps the proxy searching
-the same objective the allocator actually deploys (the iter-1
-reviewer flagged the prior misalignment as H2/M3). Paper §A.3 warns
+apply paper §A.3 / Algorithm 2's δ-floor (δ = 0.5) IDENTICALLY: every
+expert starts at ``floor(k̄·δ)`` and the remaining ``k̄·L·(1−δ)``
+flexible pool is distributed by score share, AND both run the
+rounding-residual reconciliation loop (high-score experts nudged up
+by ``diff`` units when per-expert ranks don't sum to
+``k_group · n_experts``). This keeps the proxy searching the exact
+same objective the allocator deploys — full parity, not just the
+δ-floor (the iter-1 reviewer flagged the prior misalignment as
+H2/M3; iter-2 closed the rounding-residual gap). Paper §A.3 warns
 that δ = 0 is numerically unstable, so we never expose it.
 
 Deviation: D-raw-svd-fallback — raw SVD when A_cov is None
@@ -253,6 +257,21 @@ def _warn_raw_svd_fallback_once(reason: str) -> None:
             "paper-compliant for production. See D-raw-svd-fallback in module "
             "docstring.", reason,
         )
+
+
+def _reset_raw_svd_fallback_warning() -> None:
+    """Reset the per-process warn-once latch for the D-raw-svd-fallback warning.
+
+    Test-fixture use case: pytest does NOT reload modules between tests, so the
+    module-global `_RAW_SVD_FALLBACK_WARNED = True` set by one test would
+    silence the warning in every subsequent test that exercises the
+    A_cov=None branch. A test that needs to verify the warning fires (or wants
+    a clean per-test latch) calls this helper in its setUp / fixture teardown.
+    Production code MUST NOT call this — the warn-once policy is intentional
+    for live runs.
+    """
+    global _RAW_SVD_FALLBACK_WARNED
+    _RAW_SVD_FALLBACK_WARNED = False
 
 
 def _snapshot_originals(
@@ -580,6 +599,14 @@ def _swift_svd_plus_alpha_search_validation(
     model (~34 GB) during eval → ~107 GB headroom on 141 GB.
     """
     svd_plus_cfg = config["stage3_svd"]["swift_svd_plus"]
+    # L2: cfg-schema source-of-truth lives on `SwiftSvdAlphaPlugin.select_alpha`
+    # (default = 0 → spectral-proxy only; production explicitly sets a positive
+    # value to engage the paper-exact PPL grid). The 512 here is a DIRECT-CALL
+    # BACKSTOP only — callers reaching this function bypass `select_alpha` and
+    # haven't seen the schema default, so a non-zero fallback prevents an
+    # accidental no-op grid. Keep the two values in sync only when changing
+    # `select_alpha`'s default in step with the schema; the backstop is
+    # documentation-as-code that the paper-exact path is supported.
     validation_samples = int(svd_plus_cfg.get("validation_samples", 512))
     validation_batch_size = int(svd_plus_cfg.get("validation_batch_size", 16))
 
@@ -686,7 +713,6 @@ def _swift_svd_plus_alpha_search(
     # S3-4 lazy import: _cov_lookup stays monolith-resident (S3-5 target);
     # a module-top import would deadlock the import cycle (see module docstring).
     from ...stage3_svd import _cov_lookup  # noqa: PLC0415
-    import math as _math
 
     # Collect per-expert singular value spectra, grouped by matrix type.
     # When A_cov is available (D8 fix), compute activation-weighted SVD
@@ -700,10 +726,14 @@ def _swift_svd_plus_alpha_search(
     grouped_svs: dict[str, dict[tuple[int, int], torch.Tensor]] = {
         n: {} for n in MATRIX_NAMES
     }
+    # N3: hoist O(1) layer_idx → ref lookup once at function entry — replaces
+    # the per-(layer, matrix-type) list comprehension `[r for r in moe_layers
+    # if r.layer_idx == li][0]`. Removes the IndexError footgun if a stale
+    # group_stats key ever references a missing layer_idx (dict lookup raises
+    # KeyError with a clear message instead of an opaque slice-out-of-range).
+    moe_layers_by_idx = {ref.layer_idx: ref for ref in moe_layers}
     for (li, name), gs in group_stats.items():
-        # L4: `[0]` indexing assumes layer_idx is unique within moe_layers — it
-        # is, by construction (one MoELayerRef per layer in the Qwen3 stack).
-        banks = build_banks([ref for ref in moe_layers if ref.layer_idx == li][0])
+        banks = build_banks(moe_layers_by_idx[li])
         for e in range(gs.n_experts):
             W = banks[name].get(e).detach().to(torch.float32)
             # D8 fix: activation-weighted singular values when A_cov available.
@@ -734,13 +764,14 @@ def _swift_svd_plus_alpha_search(
         """Total weighted reconstruction error for this α across all experts
         in the given projection type.
 
-        H2/M3 / D-proxy-deploy-alignment: this proxy MUST allocate per-expert
-        ranks using the same δ=0.5 floor as the deployed allocator in
+        D-proxy-deploy-alignment: this proxy MUST allocate per-expert ranks
+        using the same δ=0.5 floor AND the same rounding-residual
+        reconciliation loop as the deployed allocator in
         `_redistribute_ranks_swift_svd_plus`. Otherwise the proxy minimises a
-        different objective than what we actually deploy, and the chosen α
-        biases toward unbounded reallocation regimes that the deployed
-        allocator forbids (paper §A.3 — δ-floor mandatory, δ=0 numerically
-        unstable).
+        slightly different objective than what we actually deploy (per-group
+        drift bounded by `n_experts` rank units), and the chosen α can bias
+        toward allocator regimes that the deployment never reaches. Paper §A.3
+        warns that δ=0 is numerically unstable so we never expose it.
         """
         group_keys = [(li, n) for (li, n) in base_ranks if n == name]
         total_err = 0.0
@@ -758,9 +789,10 @@ def _swift_svd_plus_alpha_search(
                 total_energy = float(s2.sum().clamp_min(1e-30).item())
                 energies.append(total_energy)
                 # ε*_i at reference rank k_group. M4 boundary: when
-                # `k_group >= len(svs)` the slice `s2[k_group:]` is empty and
-                # `tail = 0` — full-rank case, no truncation residual. Matches
-                # paper convention ``Σ_{j=k+1}^{rank(Y)} = 0`` at k = rank(Y).
+                # `k_group < len(s2)` is false (i.e. `k_group >= len(s2)`) the
+                # slice `s2[k_group:]` is empty and `tail = 0` — full-rank
+                # case, no truncation residual. Matches paper convention
+                # ``Σ_{j=k+1}^{rank(Y)} = 0`` at k = rank(Y).
                 tail = float(s2[k_group:].sum().item()) if k_group < len(s2) else 0.0
                 epsilons.append((tail / total_energy) ** 0.5)
             # β_i = energy_i / total_energy_in_group (D8 — within-group, not
@@ -770,22 +802,45 @@ def _swift_svd_plus_alpha_search(
             # Blending scores
             scores = []
             for beta, eps in zip(betas, epsilons):
-                s = (beta ** alpha) * (_math.log(_math.e + eps) ** (1.0 - alpha))
+                s = (beta ** alpha) * (math.log(math.e + eps) ** (1.0 - alpha))
                 scores.append(max(s, 1e-12))
-            # H2/M3 fix: apply paper Algorithm 2 / §A.3 δ-floor (δ=0.5) so the
-            # proxy searches the same objective the deployed allocator uses.
+            # D-proxy-deploy-alignment: apply paper Algorithm 2 / §A.3 δ-floor
+            # (δ=0.5) so the proxy searches the same objective the deployed
+            # allocator uses. Mirror lines exactly with
+            # `_redistribute_ranks_swift_svd_plus` (L1: local name `per_e`
+            # matches the deployed allocator's local name).
             total_score = sum(scores) or 1.0
+            total_group_rank = k_group * gs.n_experts
             cap = min(gs.d_out, gs.d_in) - 1
             delta = 0.5
             rank_floor = max(1, int(math.floor(k_group * delta)))
             flexible_pool = k_group * gs.n_experts * (1.0 - delta)
-            per_expert_ranks = [
+            per_e = [
                 max(rank_floor, min(cap, rank_floor + int(math.floor(flexible_pool * (sc / total_score)))))
                 for sc in scores
             ]
+            # Reconcile rounding residual — parity with deployed allocator.
+            # Nudges high-score experts up (or low-score down) by `diff` units
+            # so per-group total equals `k_group · n_experts`. Bounded by
+            # `n_experts` rank units per group; drift > 0 indicates every
+            # expert is pinned at cap/floor (logged in deployed allocator,
+            # silent here — proxy is a fitness function, the deployed log
+            # path is the source of truth).
+            diff = total_group_rank - sum(per_e)
+            if diff != 0:
+                order = sorted(range(gs.n_experts),
+                               key=lambda i: scores[i], reverse=(diff > 0))
+                for idx in order:
+                    if diff == 0:
+                        break
+                    step = 1 if diff > 0 else -1
+                    new_val = per_e[idx] + step
+                    if rank_floor <= new_val <= cap:
+                        per_e[idx] = new_val
+                        diff -= step
             # Evaluate: sum of tail energy at allocated rank per expert. Same
             # M4 boundary handling as above.
-            for e, k_e in zip(expert_ids, per_expert_ranks):
+            for e, k_e in zip(expert_ids, per_e):
                 svs = grouped_svs[n][(li, e)]
                 s2 = svs * svs
                 tail = float(s2[k_e:].sum().item()) if k_e < len(s2) else 0.0
@@ -843,7 +898,10 @@ def _redistribute_ranks_swift_svd_plus(
     # S3-4 lazy import: _cov_lookup stays monolith-resident (S3-5 target);
     # a module-top import would deadlock the import cycle (see module docstring).
     from ...stage3_svd import _cov_lookup  # noqa: PLC0415
-    import math as _math
+
+    # N3: hoist O(1) layer_idx → ref lookup once at function entry — see same
+    # note in `_swift_svd_plus_alpha_search`.
+    moe_layers_by_idx = {ref.layer_idx: ref for ref in moe_layers}
 
     out: dict[tuple[int, str, int], int] = {}
     for (li, name), gs in group_stats.items():
@@ -851,10 +909,7 @@ def _redistribute_ranks_swift_svd_plus(
         alpha = alpha_by_type.get(name, alpha_by_type.get("all", 0.5))
 
         # Collect per-expert singular values (activation-weighted when A_cov available).
-        # L4: see same note in `_swift_svd_plus_alpha_search` — `build_banks` is
-        # cheap (view-wrapper) so we rebuild per (layer, matrix-type) for code
-        # simplicity. `[0]` is safe — one MoELayerRef per layer_idx.
-        banks = build_banks([ref for ref in moe_layers if ref.layer_idx == li][0])
+        banks = build_banks(moe_layers_by_idx[li])
         energies: list[float] = []
         epsilons: list[float] = []
         for e in range(gs.n_experts):
@@ -883,8 +938,9 @@ def _redistribute_ranks_swift_svd_plus(
             s2 = svs * svs
             total_e = float(s2.sum().clamp_min(1e-30).item())
             energies.append(total_e)
-            # M4 boundary: `k_group >= len(svs)` → empty slice → tail=0, the
-            # full-rank case (no truncation residual). Matches paper convention
+            # M4 boundary: `k_group < len(s2)` is false (i.e. `k_group >=
+            # len(s2)`) → empty slice → tail=0, the full-rank case (no
+            # truncation residual). Matches paper convention
             # ``Σ_{j=k+1}^{rank(Y)} = 0`` when k = rank(Y).
             tail = float(s2[k_group:].sum().item()) if k_group < len(s2) else 0.0
             epsilons.append((tail / total_e) ** 0.5)
@@ -892,7 +948,7 @@ def _redistribute_ranks_swift_svd_plus(
         group_energy = sum(energies) or 1.0
         betas = [e_val / group_energy for e_val in energies]
         scores = [
-            max((b ** alpha) * (_math.log(_math.e + eps) ** (1.0 - alpha)), 1e-12)
+            max((b ** alpha) * (math.log(math.e + eps) ** (1.0 - alpha)), 1e-12)
             for b, eps in zip(betas, epsilons)
         ]
         total_score = sum(scores) or 1.0
@@ -1020,6 +1076,13 @@ class SwiftSvdAlphaPlugin:
         svd_plus_cfg = s3.get("swift_svd_plus", {})
         alpha_grid = svd_plus_cfg.get("alpha_grid")
         per_group_type = svd_plus_cfg.get("per_group_type", True)
+        # L2: cfg-schema source-of-truth for `validation_samples`. Default = 0
+        # means the plugin sequencer skips the paper-exact end-to-end PPL grid
+        # and uses the cheap spectral-proxy path. Production runs that want
+        # paper §3.2.2 parity set this to a positive integer (the operating
+        # value is 512; see `_swift_svd_plus_alpha_search_validation`'s
+        # direct-call backstop). Keep this default authoritative — the
+        # backstop in the validation helper is documentation-only.
         validation_samples = int(svd_plus_cfg.get("validation_samples", 0))
 
         if alpha_grid and len(alpha_grid) > 1:
