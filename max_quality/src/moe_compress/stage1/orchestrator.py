@@ -450,7 +450,7 @@ def _write_artifacts(ctx: PipelineContext, by_name: dict) -> tuple[Path, Path]:
         "holdout_samples": int(s1.get("ablation_filter", {}).get("holdout_samples", 100)),
         "magnitude_topk_per_l_layer": blacklist_config["magnitude_topk_per_l_layer"],
         "ablation_filter_threshold": blacklist_config["ablation_filter_threshold"],
-        "ablation_filter_batch_size": int(s1.get("ablation_filter", {}).get("batch_size", 32)),
+        "ablation_filter_batch_size": int(s1.get("ablation_filter", {}).get("batch_size", 8)),
         "ma_formation_layers": sorted(L),
     }, overwrite=True)
     af_payload = by_name["ablation_filter"].contribute_artifact(ctx)

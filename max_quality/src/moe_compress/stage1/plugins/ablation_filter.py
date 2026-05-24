@@ -8,9 +8,10 @@ The Super-Experts paper arXiv:2507.23279 validates its detected SE set via
 *global* ablation experiments — pruning the full SE set together vs.
 pruning random expert sets of the same size — and reports Avg. / ARC-c /
 WikiPPL / etc. impact on downstream task suites (audit/spec_compliance/
-01_papers/2507.23279/source.md L379–L380 Table 3 framing, L574–L584
-table content). It does NOT use ablation as a *per-expert* filter to
-admit/reject candidates one at a time.
+01_papers/2507.23279/source.md L379-L383 (dynamic-SE-pruning motivation)
++ L574-L588 (Table 3 caption + Baseline/Prune SEs/Random rows)).
+It does NOT use ablation as a *per-expert* filter to admit/reject
+candidates one at a time.
 
 This plugin runs a per-candidate ablation pass: for every ``(l, e)`` in
 the Phase-C candidate pool, install a forward hook that zeros expert
@@ -70,8 +71,12 @@ The ``down`` callback in :func:`instrument_experts` receives the
 weights and ``index_add_``-ed into the layer's output. Calling
 ``tensor.zero_()`` on the callback argument therefore zeroes the tensor
 that the next two lines of the wrapped forward consume — see
-``activation_hooks.py`` lines 1099-1103 (factored) and 1132-1135 (fused).
-The forward runs under ``torch.no_grad()`` so in-place mutation is safe.
+``activation_hooks.py`` ``wrapped_factored`` (L1300 ``_cb("down", ...)``,
+L1301-L1302 routing-weight multiply + ``final.index_add_``) and
+``wrapped_fused`` (L1332 ``_cb("down", ...)``, L1333-L1334 same two-line
+consumer). Line numbers may drift across edits; the function names are
+the stable anchor. The forward runs under ``torch.no_grad()`` so
+in-place mutation is safe.
 
 Git archaeology
 ---------------
@@ -125,6 +130,21 @@ When ``stage1_grape.ablation_filter.enabled`` is ``False`` the worker
 falls back to using the candidate set verbatim as the blacklist (empty
 ``candidate_deltas`` and ``baseline_nll = 0.0``) — matching the legacy
 short-circuit at the top of :func:`run_ablation_filter`.
+
+Naming-note: ``blacklist_threshold`` vs ``ablation_filter_threshold``
+---------------------------------------------------------------------
+The config key is ``stage1_grape.ablation_filter.blacklist_threshold``
+(read at :func:`run` / :func:`run_ablation_filter`); the context slot
++ artifact key is ``ablation_filter_threshold`` (written by
+:func:`run` / read by :meth:`contribute_artifact`). They refer to the
+*same value* via the v6 ablation-as-load-bearing-blacklist-filter
+architecture rename — the YAML keeps the original "blacklist" framing
+(the per-candidate threshold for admission to the final blacklist) and
+the downstream artifact uses the v6 "ablation_filter" framing. Both
+names are intentionally kept (YAML compat for in-flight configs + clear
+artifact provenance) and are NOT to be unified by rename — both are
+referenced elsewhere (configs/*.yaml, stage1_ablation_filter.json
+consumers).
 """
 
 from __future__ import annotations
@@ -174,7 +194,8 @@ class AblationFilterPlugin:
     paper: str = (
         "Causal-ΔNLL per-expert ablation filter (project-original; no paper). "
         "arXiv:2507.23279 validates SE detection via global ablations only "
-        "(source.md L379-L380, Table 3); official code "
+        "(source.md L379-L383 dynamic-SE-pruning motivation + L574-L588 "
+        "Table 3 caption + Baseline/Prune SEs/Random rows); official code "
         "ZunhaiSu/Super-Experts-Profilling @ "
         "573aead3127ae593ba267758b832944f8fed1485 implements no per-expert "
         "ablation-filter blacklist construction. Deviation: "
@@ -209,10 +230,29 @@ class AblationFilterPlugin:
     def is_enabled(self, config: dict) -> bool:
         """Read ``config["stage1_grape"]["ablation_filter"]["enabled"]``; default True.
 
-        ``False`` does **not** skip Phase D entirely — the plugin still
-        runs and the candidate set is used as the blacklist verbatim.
-        ``is_enabled`` reflects the orchestrator-visible flag for
-        the orchestrator's gating.
+        Two-layer gating semantics — these two paths are NOT equivalent:
+
+          1. **Orchestrator gate (primary).** Returning ``False`` here
+             typically tells the orchestrator *not to invoke* :meth:`run`
+             at all. Whether the orchestrator honors this gate (and what
+             it does to fill the downstream ``blacklist`` / ``candidate_deltas``
+             / ``baseline_nll`` slots when it skips) is the orchestrator's
+             responsibility — see :mod:`moe_compress.stage1.orchestrator`.
+          2. **Inner short-circuit (fallback).** If the orchestrator does
+             invoke :meth:`run` *anyway* (e.g. tests calling the plugin
+             directly, or a future orchestrator policy that always runs
+             every plugin), the short-circuit at the top of
+             :func:`run_ablation_filter` (re-reads ``af["enabled"]``)
+             falls back to using the candidate set verbatim as the
+             blacklist with empty ``candidate_deltas`` and
+             ``baseline_nll = 0.0``.
+
+        The inner short-circuit is the fallback path only if ``run`` IS
+        invoked while ``enabled=False`` — it is NOT what ``is_enabled``
+        itself reports. Inverting the gate so this method always returns
+        ``True`` and the inner short-circuit becomes the sole disabled-
+        config path would change orchestrator behavior and is therefore
+        deferred; the current dual-path design is preserved.
         """
         s1 = config.get("stage1_grape", {})
         af = s1.get("ablation_filter", {})
@@ -260,7 +300,7 @@ class AblationFilterPlugin:
             {
                 "holdout_samples": int(af.get("holdout_samples", 100)),
                 "ablation_filter_threshold": threshold,
-                "ablation_filter_batch_size": int(af.get("batch_size", 32)),
+                "ablation_filter_batch_size": int(af.get("batch_size", 8)),
             },
         )
 
@@ -504,7 +544,7 @@ def run_ablation_filter(
 
     Reads ``config["stage1_grape"]["ablation_filter"]``:
       enabled (default True), holdout_samples (default 100),
-      blacklist_threshold (default 0.001), batch_size (default 32).
+      blacklist_threshold (default 0.001), batch_size (default 8).
     """
     s1 = config["stage1_grape"]
     af = s1.get("ablation_filter", {})
@@ -521,7 +561,7 @@ def run_ablation_filter(
 
     holdout_samples = int(af.get("holdout_samples", 100))
     threshold = float(af.get("blacklist_threshold", 0.001))
-    batch_size = int(af.get("batch_size", 32))
+    batch_size = int(af.get("batch_size", 8))
 
     spec = spec_from_config(
         config["calibration"], num_sequences_override=holdout_samples, seed_offset=999

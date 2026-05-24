@@ -144,7 +144,7 @@ def test_plugin_run_disabled_writes_threshold_and_config_slots():
     assert ctx.get("ablation_filter_config") == {
         "holdout_samples": 100,
         "ablation_filter_threshold": 0.001,
-        "ablation_filter_batch_size": 32,
+        "ablation_filter_batch_size": 8,
     }
 
 
