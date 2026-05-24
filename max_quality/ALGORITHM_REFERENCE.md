@@ -296,198 +296,18 @@ Same step-boundary checkpointing as Stage 5, under `_stage2p5_partial/`.
 
 ---
 
-## 6. Stage 3 — Non-Uniform SVD Factorization
-
-**File:** [`stage3_svd.py`](src/moe_compress/stage3_svd.py)
-**Papers:**
-- D-Rank: Spectral entropy for rank allocation (2509.25622), Eq. 1, 2, 7
-- AA-SVD: Anchored Adaptive SVD (2604.02119), Theorem 3.2, Corollary 3.3
-- SVD-LLM V2: Heterogeneous rank allocation (2503.12340)
-- Swift-SVD: Dynamic rank allocation (2604.01609), Algorithm 2
-**Hardware:** H200 (141 GB). Pruned student (~45 GB post-Stage-2.5) stays resident from Stage 2.5. Original BF16 teacher (~70 GB) is loaded for the Phase A cross-covariance dual-forward (~115 GB combined) and **stays resident through Phase C.5** so its block forwards can be invoked on-demand during block refinement. Phase C.5 trains one block at a time; per-block trainables ~525 M params (~1 GB BF16; fp32 AdamW state ~6.3 GB at 12 B/param) plus per-block activations + grads (~5–10 GB at batch 32, seq 2048) leaves ~9–15 GB headroom. The previous spec variant freed the teacher after Phase A and fed Phase C.5 from a 215 GB on-disk teacher-block-output cache (Phase A.X) — that path was an A100-era constraint and is **removed** on H200. (See Phase C.5 "Optimizer-precision rationale" for the per-component breakdown.)
-
-### What
-
-Replaces each surviving expert's 3 dense matrices (`gate_proj`, `up_proj`, `down_proj`) with rank-k factors `W ≈ U · V`, where `U ∈ ℝ^{d_out × k}` and `V ∈ ℝ^{k × d_in}`. Rank `k` varies across (layer, matrix_type) groups — high-entropy matrices get more rank, low-entropy matrices get less.
-
-### Why
-
-SVD factorization reduces parameters from `d_out × d_in` to `k × (d_out + d_in)` per expert. With activation-aware rank allocation and weighting, the factorization concentrates error into directions the model rarely uses, preserving quality far better than plain truncated SVD.
-
-### How
-
-#### Phase A: Covariance Collection (B and cross-covariance C)
-
-**Dual-forward collection on H200:** Both the original (teacher) model and the pruned (student) model are loaded in VRAM simultaneously (~70 GB + ~50 GB = ~120 GB on H200's 141 GB). For each calibration batch, the teacher forwards first, then the student. Hooks on both models collect:
-
-**B-covariance** `B = X_post^T X_post`: Auto-covariance of the pruned model's per-expert inputs. Reflects the input distribution the compressed model will see at inference.
-
-**A-covariance reuse:** The pre-prune input auto-covariance `A = X_pre^T X_pre` referenced by Phase C Path 2 and by Phase B.2's activation-weighted `ε*` (per D8) is **not collected here** — it is reused from Stage 2's calibration pass (`_stage2_input_covariance.pt`, see §5 "Covariance Side-Collection") to avoid a redundant teacher forward.
-
-**Cross-covariance** `C = X_pre^T X_post`: For each (layer, student_expert), the teacher's hidden state at the same token positions that the student routes to that expert is captured. `C` is accumulated as `X_pre^T @ X_post` per batch. This gives the exact cross-covariance required by AA-SVD Theorem 3.2 (paper 2604.02119): "what would the original model have produced for the inputs that the compressed model actually receives."
-
-The teacher model is **not** freed after Phase A. It remains resident through Phase C.5 so that the original block forwards `ℒ_i(X)` required by Phase C.5's anchored objective can be invoked on-demand during refinement (see Phase C.5 below). The teacher is freed only after Phase C.5 of the final block completes; the factoring step (Phase B/B.2/C) does not use the teacher and could free it earlier on hardware tighter than H200, but on H200 the cost of keeping it resident is zero relative to the simpler control flow.
-
-**Per-layer spill:** All 40 MoE layers are hooked simultaneously in a single calibration pass (not one pass per layer). After each layer's accumulation is finalised, both B and C covariances are spilled to disk (`_stage3_bcov_partial/` and `_stage3_ccov_partial/`). Background I/O thread overlaps spill with the next batch's forward pass, keeping the resident footprint bounded.
-
-#### Phase B: D-Rank Allocation (Paper 2509.25622, Eq. 1, 2 & 7)
-
-For each (layer, matrix_type) group, effective rank is computed from the **whitened** weight matrix, not raw W. This makes rank allocation input-distribution-aware.
-
-**Step B.1 — FP64 Cholesky whitening (Paper 2509.25622, §3.1, inputs to Eq. 1–2):**
-
-For each group `g` (identified by (layer, matrix_type)), retrieve the pre-prune input auto-covariance A_g = X_pre^T X_pre from Stage 2 (A_gate_up / A_down from _stage2_input_covariance.pt — this is the A-covariance, not the B-covariance defined in Phase A):
-- For `gate_proj` and `up_proj` groups: use `A_gate_up` from `_stage2_input_covariance.pt` (hidden-state input covariance, dimension `hidden_size × hidden_size`)
-- For `down_proj` groups: use `A_down` from `_stage2_input_covariance.pt` (intermediate-activation input covariance, dimension `moe_intermediate_size × moe_intermediate_size`)
-
-Compute the Cholesky factor in **FP64**:
-
-```
-X_g^T X_g = S_g S_g^T,   S_g = chol(X_g^T X_g)    [computed in FP64 per paper; S_g is lower-triangular]
-```
-
-Then compute the whitened weight matrix `S_g · W_g^T` (where `W_g^T` transposes from PyTorch's stored `[d_out × d_in]` to `[d_in × d_out]`, giving a `[d_in × d_out]` result; applied per-expert). The singular values used for effective rank are those of `S_g · W_g^T`, not of raw `W_g`. The per-group covariance `X_g^T X_g` is the average over all experts in the group (shared input distribution for the same matrix type within a layer). (Equivalent to paper Eq. 1; the transpose is a storage-convention transform — singular values identical.)
-
-> **Note:** Using the group-average covariance for whitening (rather than a per-expert covariance) is a deliberate efficiency choice — collecting per-expert input covariances would require per-expert dispatch instrumentation equivalent to the cross-covariance infrastructure. The group average is a valid approximation when experts within a group see similar input distributions (which the REAM merging of similar experts enforces).
-
-**Step B.2 — Effective rank from whitened SVD:**
-
-```
-σ_i = singular values of (S_g · W_g^T)           (whitened singular values; W_g^T transposes from stored [d_out×d_in] to [d_in×d_out])
-p_i = σ_i² / Σ_j σ_j²                            (Eq. 1 — normalized squared singular values)
-R_eff(g) = exp(−Σ_i p_i · log(p_i))              (Eq. 2 — effective rank from whitened spectrum)
-```
-
-**Step B.3 — Rank allocation:**
-
-```
-k_g = √(R_eff(g) / ω) × T_budget / Σ_{g'} √(R_eff(g') · ω)   (Eq. 7 — rank allocation; Eq. 6 gives proportionality only)
-```
-
-where `ω = n_experts × (d_out + d_in)` is the per-rank parameter cost and `T_budget` is the global rank budget derived from `svd_rank_ratio`.
-
-Each expert is factored independently with no shared basis; the D-Rank ω adaptation is per-expert (D7). **Per-projection bias** (approximately budget-neutral): `gate_proj=1.33`, `up_proj=0.67`, `down_proj=1.0`. The ratio `gate:up:down = 4:2:3` is adopted from jangq's MLP-asymmetry analysis for SwiGLU quantization (`397B-MLP-ASYMMETRY.md` §3.1), translated from bit space to rank space. Rationale: gate errors are amplified multiplicatively through `SiLU(gate)·up`; down errors propagate to the residual stream of every downstream layer; up errors are bounded and linear. The multipliers sum to 3.0 across the three projection types, approximately parameter-budget-preserving: exactly preserved when gate/up/down receive the same `k_g` and share the same `ω_g` (which holds under SwiGLU symmetry where gate/up have identical input dimensions). In the general case, the multipliers redistribute rank between projection types and may shift the post-bias parameter total by a few percent. See [D7a](#12-known-deviations-from-papers). The mean rank `k̄` used in `ε*` is the bias-adjusted group rank (i.e., after applying the gate/up/down multipliers from Step B.3 — deviation from paper: the paper defines k̄ as the plain uniform rank k̄ = (m×n)/(m+n) × ρ; see D7a).
-
-#### Phase B.2: Swift-SVD Per-Expert Rank Redistribution (Paper 2604.01609, Algorithm 2)
-
-Within each (layer, matrix_type) group, D-Rank gives a uniform rank `k_g` to every expert. Swift-SVD refines this by redistributing the group's total rank budget `k_g × N_experts` across individual experts using a blending score:
-
-```
-s_i = β_i^α · (log(e + ε*_i))^{1-α}
-```
-
-where e ≈ 2.718
-
-- `β_i = σ_i² / Σ_j σ_j²` — spectral energy proportion (how much of the group's total spectral energy this expert contributes; see [D8](#12-known-deviations-from-papers))
-- `ε*_i = √(Σ_{j>k̄} σ̃_j² / Σ_j σ̃_j²)` — activation-weighted reconstruction error at the group's mean rank `k̄`, where `σ̃_j` are the singular values of `A^{1/2}·W` (Stage 2 input auto-covariance from §5; see [D8](#12-known-deviations-from-papers) — ε* is now activation-weighted, not spectral-only). Higher = this expert needs more rank. This equals `‖A^{1/2}·W − A^{1/2}·Ŵ(k̄)‖_F / ‖A^{1/2}·W‖_F` = `‖A^{1/2}·(W − Ŵ(k̄))‖_F / ‖A^{1/2}·W‖_F` (relative reconstruction error in the activation-weighted norm, where A^{1/2} left-multiplies W as in ‖XW − XW_k‖_F = ‖A^{1/2}(W − W_k)‖_F), i.e., the activation-weighted analogue of the paper's spectral ε*. (Deviation from paper: the paper's ε* is absolute truncation error; the spec normalizes to a relative ratio for cross-expert comparability — see §12 D-eps-star.) (`k̄` is the bias-adjusted group rank from Step B.3, per D7a.)
-- `α ∈ [0, 1]` — balances the two signals
-
-**α selection (paper §3.2.2 — validation-based):** For each candidate α ∈ {0.0, 0.1, ..., 1.0}, the full model is factored at the corresponding per-expert ranks using the closed-form solution from Swift-SVD Eq. 3: W*_k = W V_k V_k^T, where V_k are the top-k right singular vectors of XW, equivalently the top-k eigenvectors of W^T A W (activation-weighted weight covariance, computed as W^T @ A_g @ W for each expert; A_g is the Stage 2 pre-prune input covariance from _stage2_input_covariance.pt — paper-exact per Theorem 3.1 / Eq. 3) and evaluated on WikiText-2 PPL (computed per the §9 'WikiText-2 PPL Protocol' subsection (corpus, chunking, NLL aggregation), with `validation_samples: 512` chunks; project-tunable — Swift-SVD §3.2.2 and Appendix do not specify a sample count for the WikiText-2 PPL grid search). The α yielding the lowest end-to-end perplexity is selected. This implements the paper's exact procedure: *"For each candidate corresponding to α_i, the optimal low-rank approximation of every layer is computed using the closed-form solution in (3). The resulting compressed models are then evaluated on a validation set, and the candidate that yields the best end-to-end performance is selected."*
-
-The factoring reuses cached spectral components from Phase A's B-covariance collection; each candidate requires ~2 minutes for a full 40-layer factor pass and ~20 seconds for PPL evaluation on H200. No model copies are made — originals are snapshotted to CPU RAM (~50 GB; H200 has 256 GB host RAM) and restored after each evaluation. Total α search: ~33 minutes for 11 candidates.
-
-**Paper-compliance contract.** The α search MUST complete the paper-exact end-to-end PPL validation (Swift-SVD §3.2.2). If host RAM headroom at α-search entry is insufficient (<15 GB available), Stage 3 raises `RuntimeError` immediately rather than degrade to a spectral proxy — silently producing a non-paper-compliant model is worse than failing fast. Operators must provision adequate host RAM (~50 GB for the Qwen3-30B snapshot plus working set) or reduce `validation_samples` to fit. The previously-shipped silent spectral fallback was deviation D9 and was removed from Ch. 12 specifically because the pipeline now refuses to run that path.
-
-> **Implementation follow-up:** Replace the current OOM auto-fallback at `stage3_svd.py:285-301` with a hard `RuntimeError` to bring the code in line with this contract.
-
-**Redistribution rule (paper 2604.01609 Algorithm 2 lines 4–9):** Every expert starts at the minimum rank `k̄ · δ`, and the remaining flexible pool `b = k̄ · L · (1 − δ)` (where `L = N_experts`) is distributed by score share:
-
-```
-k_i ← floor(k̄ · δ) + floor(b · s_i / Σ_j s_j),   b = k̄ · L · (1 − δ),   δ = 0.5
-```
-
-Paper line 4 sets `k_i ← k̄ · δ` real-valued and line 9 uses bracketed `[b · s_i / Σ_j s_j]` (paper convention typically denotes rounding); the spec applies `floor(·)` to both terms because per-expert ranks must be integers. The paper §A.1 warns that δ = 0 is unsafe — without a minimum-rank floor the score-weighted reallocation can drive low-score experts to rank zero and propagate reconstruction error, so the floor `δ = 0.5` is required for the redistribution to be well-behaved. After redistribution the per-expert rank is clamped above the floor `k_i ← max(k_i, floor(k̄ · δ))` (defensive against rounding residuals; structurally the redistribution rule already enforces it).
-
-Per-expert ranks are stored in the `FactoredExperts` slot at the max rank across experts in the group (zero-padded for experts with lower rank). `effective_ranks` tracks the true per-expert rank for honest parameter counting.
-
-#### Phase C: Hybrid Activation-Aware SVD
-
-For each (layer, expert, matrix):
-
-**Path 1 — Anchored-adaptive objective, Theorem 3.2 (primary on H200, cross-covariance C available; see D-AASVD-objective):**
-
-```
-M = W · C · B⁻¹ · L_B        where C = X_pre^T X_post
-```
-
-This is the exact AA-SVD Theorem 3.2 formula. `L_B` is the eigendecomposition-based square root of B. The cross-covariance `C` is collected during Phase A's dual-forward pass.
-
-**Path 2 — Auto-covariance approximation (C unavailable, A available):**
-
-```
-M = W · A · B⁻¹ · L_B        where A = X_pre^T X_pre
-```
-
-Substitutes pre-prune auto-covariance for cross-covariance. The two coincide when pre/post distributions are similar (light pruning). Active when `aa_svd.cross_covariance: false` in config. This hybrid (auto-cov substituted into the AA-SVD `B⁻¹·L_B` machinery) is not a paper-recognised variant — see [D6](#12-known-deviations-from-papers) for its rationale.
-
-**Path 3 — Corollary 3.3 fallback (B only):**
-
-```
-M = W · L_B
-```
-
-Then: `SVD(M) = U Σ V^T`, `U_k = U[:,:k] · diag(Σ[:k])`, `V_k^T = V^T[:k,:] · L_B⁻¹`. The rank-k reconstruction is `W ≈ U_k · V_k^T`. **L_B convention:** the spec uses `L_B` for the **lower-triangular** Cholesky factor satisfying `L_B · L_B^T = B` (paper Algorithm 1 line 4 writes the same factor as `R` and uses the `R^T` transpose to compute `M = W·R^T = W·L_B^T`). Spec Path 3 writes `M = W·L_B` rather than `W·L_B^T` because under A=B the singular values (and hence the rank-k truncation) are invariant to right-multiplying the chol factor or its transpose, so the single-letter form drops the transpose for legibility. The back-projection `L_B⁻¹` in the V_k^T expression is the inverse of the **same** lower-triangular factor.
-
-**Path selection rule:** Path 1 when full cross-cov C is available; Path 2 when only auto-cov A and B (input-side) are available (gate/up — D6 hybrid); Path 3 when only B is available (down_proj fallback under Corollary 3.3 with A=B).
-
-**Eigendecomposition caching (gate_proj ↔ up_proj):** `gate_proj` and `up_proj` share the same input covariance (post-router pre-MLP hidden state) and the same eigendecomposition is reused for both. The eigendecomposition of B (`eigh`) and the derived right-hand-side product (CQ·diag(1/√λ), AQ·diag(1/√λ), or L_B depending on the path) are precomputed once per expert via `_precompute_eigh` and cached in an `_EighDecomp` dataclass. Both `gate_proj` and `up_proj` then call `_aa_svd_precomputed`, which skips directly to `M = W @ rhs`, SVD, and back-solve. `down_proj` has its own B (intermediate-dim covariance, 512×512) and goes through the full `_aa_svd` path.
-
-This eliminates N_experts × N_layers redundant `eigh(2048×2048)` calls (~7,200 for 180 experts × 40 layers). The optimization is **mathematically identical** — same eigendecomposition, same rhs matrix, same floating-point operations on the same inputs; the only change is that the result is computed once and reused. Estimated wall-clock reduction: ~25% on Phase C.
-
-**Numerical safeguards:**
-- Eigendecomposition replaces Cholesky (handles rank-deficient B natively)
-- Dtype-aware noise floor: `bf16→1e-2`, `fp16→1e-3`, `fp32→1e-6`
-- `k_eff = min(k, r_eff)` — never allocates rank beyond B's effective rank
-- Zero-padding when `k_eff < k` so FactoredExperts tensors stay shape-stable
-- If `_precompute_eigh` raises (e.g. all-zero B), the per-matrix loop falls back to full `_aa_svd` which itself falls back to plain SVD
-
-#### Phase C.5: Block-Level Iterative Refinement (Paper 2604.02119, Algorithm 2, §3.3)
-
-After all linear sub-layers (attention projections and MLP gate/up/down projections for all experts) within a single decoder block have been individually factorized via Phase C (Paths 1/2/3), AA-SVD performs a **block-level joint refinement pass** that jointly optimizes the factorized weight factors and the block's normalization parameters to minimize the block's output error against the original model. This is the central contribution of AA-SVD over standard per-layer SVD.
-
-**Block definition:** One transformer block `ℒ_i` = one decoder layer, comprising all its linear layers (attention projections + MLP gate/up/down projections for all routed experts in that layer), all non-linear operations, and all normalization layers. Attention projections in Stage 3 are **not** factorized (§10 Protected Components); the joint objective's factorized-factor variables `{U_j, V_j}` therefore range over the MoE expert matrices only. The refinement is applied sequentially, block by block, after each block's Phase C factorization — upstream blocks remain frozen while the current block is refined. For Qwen3's architecture, each block includes the sliding-window SDPA attention and the MoE MLP; both of their RMSNorm scales are updated during refinement (see "RMSNorm scope" below).
-
-**Objective (Section 3.3):**
-
-```
-ℓ_i = E_{X∼𝒟_i}[‖ℒ_i(X) − ℒ'_i(X')‖²]
-```
-
-where:
-- `ℒ_i(X)` — the original (unfactorized) block's output on calibration activations `X` (the hidden states arriving at block `i` from the original model). **Computed on-the-fly by invoking the still-resident teacher's block `i` forward on the cumulative teacher upstream activations.** No disk cache is used.
-- `ℒ'_i(X')` — the compressed block's output on shifted calibration activations `X'` (the hidden states produced by the already-refined upstream compressed blocks)
-
-In practice this is the mean over the calibration batch at each gradient step. The calibration tensor is split into full batches of `batch_size`; any trailing partial batch (when `N_calib_seqs % batch_size ≠ 0`) is dropped to keep the cached attention-mask / position-embedding kwargs shape-stable across the AdamW loop. With the default config (256 calibration sequences × batch_size 32) this is exact (256 = 8 × 32) and no sequences are dropped.
-
-This anchors the compressed block to the original block's output while conditioning on the **actual shifted input** produced by compression of prior layers — precisely the anchored-adaptive formulation of Theorem 3.2 extended to the block level.
-
-**Optimization procedure (Algorithm 2, line 9; Appendix B.2):**
-
-Minimize `ℓ_i` jointly over:
-1. All factorized weight factors `{U_j, V_j}` for every linear layer `j` in block `i`
-2. Block-local parameters `θ_i` — the **RMSNorm scale parameters** (and biases, if any) within block `i`
-
-Optimizer: **standard `torch.optim.AdamW`** (fp32 moments `m`/`v`, fp32 master weights — *not* 8-bit AdamW), learning rate `1×10⁻⁴`, cosine learning rate schedule with linear warmup, **25 epochs** over the calibration data, batch size 32. All parameters in items 1 and 2 are updated simultaneously in each gradient step — this is a joint optimization, not an alternating coordinate-descent loop.
-
-**Optimizer-precision rationale (H200-specific).** The paper specifies "AdamW" without pinning precision. On H200 (141 GB), per-block trainables are ~525M params (~1 GB BF16); fp32 AdamW state at 12 B/param is ~6.3 GB. Combined with the resident teacher (~70 GB), compressed student (~45 GB), and per-block activations + grads (~5–10 GB at batch 32, seq 2048), the fp32 optimizer fits with ~9–14 GB headroom. 8-bit AdamW (e.g. `bitsandbytes.optim.AdamW8bit`) would save ~5 GB at the cost of stochastic-rounding noise on the moments — a fidelity hit at `lr = 1×10⁻⁴` over only 25 epochs that the headroom does not require. The 8-bit variant remains available as an A100-tier escape hatch but is **not** the default and must not be used silently.
-
-**Convergence:** Fixed epoch count of **25 epochs**. No delta-objective threshold is specified by the paper; training always runs for the full 25 epochs.
-
-**Interaction with Paths 1/2/3:** Phase C factorization (Paths 1/2/3) provides the initialization for `{U_j, V_j}`. Phase C.5 refines these initializations via gradient descent; it does not re-invoke the Theorem 3.2 closed form. The B/C covariances computed in Phase A are used only for the Phase C initialization — Phase C.5 uses the calibration activations directly via forward passes through the (partially compressed) student model, and computes `ℒ_i(X)` by invoking the still-resident teacher's block `i` forward.
-
-**Teacher activation stream:** At block `i`, `X_i^{teacher}` is the cumulative teacher upstream — the teacher's hidden state at block `i`'s input, produced by running the teacher from layer 0 through layer `i−1` on the calibration sequence. Both `X_i^{teacher}` and `X'_i^{student}` (input to refined student block `i`, produced by the already-refined upstream student blocks) are **constant during block i's 25 inner AdamW epochs** — neither stream is recomputed per gradient step, since upstream layers are frozen for the duration of block `i`'s refinement. The streams are advanced **once per block transition** (`X_{i+1}^{teacher} = ℒ_i(X_i^{teacher})`, `X'_{i+1} = ℒ'_i(X'_i)`) using the teacher's block forward and the refined student block respectively. Per-batch streams live in CPU RAM (~2 GB per stream × 2 = 4 GB for 256 calib seqs × 2048 × 5120 × bf16) and are swapped to GPU per gradient step. All decoder layers participate in the stream advance (including any non-MoE dense interlayers); only MoE blocks receive AdamW refinement.
-
-**RMSNorm scope:** Only the RMSNorm layers **within** block `i` have their scale parameters updated; norms in all other blocks remain frozen. The block-local set covers (a) the two block-level norms — `input_layernorm` (pre-attention) and `post_attention_layernorm` (pre-MLP) — and (b) any per-head attention norms the architecture defines, e.g. for Qwen3 the `self_attn.q_norm` and `self_attn.k_norm` modules. The model-level `norm` and any embedding norms are out of scope. See §10 for the updated protected-component policy.
-
-**Sequential execution (Algorithm 2 lines 2–11):** After block `i`'s Phase C.5 completes, the refined compressed block `ℒ'_i` is used to produce `X'_{i+1}` (the input to block `i+1`) via a forward pass through `ℒ'_i`. This updated `X'` feeds into block `i+1`'s Phase C factorization and Phase C.5 refinement. Blocks are processed strictly in order 0 → (N_layers − 1). Non-MoE decoder layers (dense interlayers, if the architecture has any) participate in the stream advance but skip the AdamW refinement — they have no factorized `{U_j, V_j}` to update; their RMSNorm scales remain frozen. See [D-c5-moe-only](#12-known-deviations-from-papers).
-
-### Resume
-
-- B-cov spill files at `_stage3_bcov_partial/layer_{idx}.pt` — layers whose spill files already exist are skipped on re-entry
-- C-cov spill files at `_stage3_ccov_partial/layer_{idx}.pt`
-- Phase C.5 per-block checkpoint at `_stage3_phase_c5_partial/block_{i}.pt` — saves the refined `{U_j, V_j}` and updated RMSNorm scales for each completed block; on re-entry, blocks with existing checkpoints are skipped and Phase C.5 resumes at the first un-refined block. The teacher must still be resident on resume; a re-entry from before Phase A completes triggers a full Phase A re-run, while a re-entry between Phase C.5 of block `i` and block `i+1` only re-loads the teacher (Phase A spills already on disk).
-- B/C spill directories are cleaned up on successful Stage 3 completion; the Phase C.5 checkpoint directory is removed after the final block.
-- Original weights snapshot (`_stage3_original_weights.pt`) is saved for Stage 4 residual computation
+<!-- §6 Stage 3 (Non-Uniform SVD Factorization) — CONSUMED by
+     stage3/plugins/* (commits pending). Full §6 narrative —
+     papers (AA-SVD arXiv:2604.02119 + D-Rank arXiv:2509.25622 +
+     Swift-SVD arXiv:2604.01609 + SVD-LLM V2 arXiv:2503.12340),
+     hardware framing, Phases A/B/C/C.5/D (covariance collection,
+     D-Rank effective-rank allocation, AA-SVD per-(layer, expert)
+     factorization, AdamW block refinement, Swift-SVD+ α selection),
+     all deviations (D6-D8, D-eps-star, D-per-type-alpha,
+     D-no-intra-block-cascade, D-c5-moe-only, D-drank-premerge-A,
+     D-cov-storage-fp16 — SHARED with Stage 2), and resume narrative
+     — all relocated into the per-plugin module docstrings under
+     stage3/plugins/. -->
 
 ---
 
@@ -898,7 +718,7 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 <!-- D-per-type-alpha — CONSUMED by stage3/plugins/swift_svd_alpha.py (commit pending). -->
 <!-- D-no-intra-block-cascade — CONSUMED by stage3/plugins/aa_svd_factor.py (commit pending). -->
 <!-- D-drank-premerge-A — CONSUMED by stage3/plugins/d_rank_allocate.py (commit pending). -->
-| D-c5-moe-only | 3 | Phase C.5 refines MoE blocks only, not every transformer block | 2604.02119 Algorithm 2 (lines 2–11) iterates the block refinement over **every** block `Lᵢ ∈ M`; paper applies the joint AdamW objective to each block's full parameter set (factorized factors + RMSNorm scales). | Stage 3 only factorizes MoE expert matrices (`gate_proj` / `up_proj` / `down_proj`) per §10 Protected Components; attention projections, embeddings, lm_head, shared experts, and dense (non-MoE) decoder layers are untouched. Phase C.5 therefore only fires on MoE decoder layers, where there are factorized `{U_j, V_j}` to update. Non-MoE decoder layers (if any in the architecture) participate in the stream-advance forward but skip the AdamW refinement; their RMSNorm scales remain frozen. | The skipped quality lift is bounded: dense interlayers contribute only RMSNorm scale corrections to the paper's objective. For Qwen3-30B-A3B (the project's target model) every non-shared decoder layer is MoE, so the deviation is **vacuous in practice** — every layer with refinable factors is refined. The deviation is named explicitly so a future port to a mixed dense/MoE architecture cannot silently drop the dense-block refinement step. |
+<!-- D-c5-moe-only — CONSUMED by stage3/plugins/block_refine.py (commit pending). -->
 | D-humaneval-greedy | 6 | HumanEval pass@1 protocol (greedy + in-process exec) | Chen et al. 2021 (canonical HumanEval): stochastic pass@1 estimated from n=10 samples per problem at temperature T=0.2 with top_p=0.95, then unbiased pass@k formula; **exec-based scoring runs each problem in a subprocess sandbox** | (a) Greedy decoding pass@1 (do_sample=False, n=1, no temperature, no top_p), single sample per problem. (b) Exec-based scoring runs **in-process**, NOT in a subprocess sandbox: tests can leak `sys.modules` / signal handlers / `os.environ` mutations across problems. Both teacher and student see the same in-process leakage so the relative-to-teacher gate is not biased. | Greedy is lower-variance and reproducible across runs without seed plumbing, sufficient for **relative-to-teacher gating** (the gate is a 3pp absolute drop vs the same-protocol teacher score, not against published baselines). **Absolute pass@1 numbers will not match published Chen et al. 2021 baselines** and must not be compared to them. The gate's batched-vs-bs=1 numerical-identity claim (#3, #4) holds under greedy decoding only. In-process exec is documented because subprocess isolation would slow eval substantially with no signal-quality benefit for the relative gate; see `stage6_validate.py` module docstring "Known limitations" subsection for the operational caveats (daemon-thread leakage, no syscall interruption, no seccomp/landlock). |
 
 ---

@@ -1,7 +1,67 @@
-"""Phase C.5 block-level joint refinement (S3-6 of the Stage 3 plugin refactor).
+"""AA-SVD block-level joint refinement (Algorithm 2 §3.3, gated).
 
-Home of the Phase C.5 block-refine core relocated VERBATIM from the legacy
-``stage3_svd.py`` monolith:
+Paper
+-----
+"AA-SVD: Activation-Aware SVD" — arXiv:2604.02119 Algorithm 2 §3.3.
+audit/spec_compliance/01_papers/2604.02119/source.md.
+
+After each block's per-(layer, expert) factorization
+(:mod:`stage3.plugins.aa_svd_factor`), all factorized weight factors
+``{U_j, V_j}`` and block-local RMSNorm scale parameters ``θ_i`` are
+jointly optimized via AdamW (lr=1e-4, 25 epochs, cosine schedule,
+batch 32) to minimize block output MSE against the original model:
+
+    min ‖ℒ_i(X) − ℒ'_i(X')‖²
+
+where ``ℒ_i`` is the teacher's block-``i`` forward, ``ℒ'_i`` is the
+student's block-``i`` forward with factorized weights, and ``X / X'``
+are the teacher's / student's block-``i`` inputs (cross-block cascade
+restoration — see deviation D-no-intra-block-cascade at
+:mod:`stage3.plugins.aa_svd_factor`).
+
+This plugin is **gated** by ``block_refine.enabled`` and only fires
+on MoE decoder blocks (see deviation D-c5-moe-only below).
+
+Official code
+-------------
+``atulkumarin/AA-SVD`` @ commit
+``1fa1b686cd9b13a77607a676564e37d438a176c8`` (2026-04-22) —
+github.com/atulkumarin/AA-SVD. Cross-checked against the project's
+Phase C.5 implementation for the per-block AdamW loop + stream-advance
+mechanics.
+
+Deviation: D-c5-moe-only
+------------------------
+Paper Algorithm 2 (lines 2-11) iterates the block refinement over
+**every** block ``L_i ∈ M``; the paper applies the joint AdamW
+objective to each block's full parameter set (factorized factors +
+RMSNorm scales).
+
+This plugin's Stage 3 only factorizes MoE expert matrices
+(``gate_proj`` / ``up_proj`` / ``down_proj``) per project §10
+Protected Components; attention projections, embeddings, lm_head,
+shared experts, and dense (non-MoE) decoder layers are untouched.
+Phase C.5 therefore only fires on MoE decoder layers, where there are
+factorized ``{U_j, V_j}`` to update. Non-MoE decoder layers (if any
+in the architecture) participate in the stream-advance forward but
+skip the AdamW refinement; their RMSNorm scales remain frozen.
+
+Rationale: the skipped quality lift is bounded — dense interlayers
+contribute only RMSNorm scale corrections to the paper's objective.
+For Qwen3-30B-A3B (the project's target model) every non-shared
+decoder layer is MoE, so the deviation is **vacuous in practice** —
+every layer with refinable factors is refined. The deviation is named
+explicitly so a future port to a mixed dense/MoE architecture cannot
+silently drop the dense-block refinement step.
+
+Naming-history note
+-------------------
+"Phase C.5" (legacy Stage 3 monolith terminology) is naming-historical.
+The current plugin architecture has no phase taxonomy; new prose
+drops the labels. Existing log lines / Trackio keys preserved for
+dashboard back-compat.
+
+Tool inventory (relocated verbatim):
 
 * ``_phase_c5_block_refine`` — block-level joint refinement of the factored
   U/V slots and the block-local RMSNorm scales via AdamW on the anchored MSE
@@ -459,10 +519,12 @@ class BlockRefinePlugin:
 
     name = "block_refine"
     paper = (
-        "Phase C.5 block-level joint refinement — per-block AdamW refinement "
-        "of the factored U/V slots + block-local RMSNorm scales on the "
-        "anchored MSE objective ‖ℒ_i(X) − ℒ'_i(X')‖² "
-        "(paper 2604.02119, Algorithm 2 §3.3)."
+        "AA-SVD Algorithm 2 §3.3 block-level joint refinement — "
+        "arXiv:2604.02119 (atulkumarin/AA-SVD @ "
+        "1fa1b686cd9b13a77607a676564e37d438a176c8). "
+        "Per-block AdamW MSE refinement of factored {U_j, V_j} + "
+        "block-local RMSNorm scales. Deviation D-c5-moe-only "
+        "(MoE-only — vacuous on Qwen3-30B-A3B). See module docstring."
     )
     config_key = "stage3_svd.block_refine.enabled"
     reads: tuple[str, ...] = (
