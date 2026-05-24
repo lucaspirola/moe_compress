@@ -1,4 +1,4 @@
-"""Thermometer calibration-corpus build (S6A-2 of the Stage 6alt plugin-architecture refactor).
+"""Thermometer calibration-corpus build (live Stage 6alt plugin).
 
 Paper / dataset
 ----------------
@@ -12,7 +12,11 @@ Stage 6alt thermometer corpus: ONE of two evaluation corpora —
   - **WikiText-2 test split** — Merity et al. 2017 arXiv:1609.07843,
     same source as :mod:`stage6.plugins.wikitext_ppl` but the
     **test** split (Stage 6 uses test too; the thermometer uses the
-    same chunked form).
+    same chunked form). Non-overlapping ``sequence_length``-token
+    chunks are taken in dataset order — a Stage-6alt-internal
+    convention (defensible for BPT scoring) that deliberately differs
+    from Merity Table-4's sliding-window protocol; the thermometer is
+    NOT used for externally-comparable PPL.
 
 Project-original sweep harness; no upstream thermometer paper.
 
@@ -25,24 +29,25 @@ config key, and builds the ``(num_seqs, seq_len)`` int64 tensor that
 
 Pattern A vs Pattern B
 ----------------------
-S6A-2's corpus slice covers a MIXED pattern:
+This module covers a MIXED pattern:
 
 * **Pattern A — relocated verbatim**: the five standalone symbols below
   (``THERMO_SEED_OFFSET``, ``_DEFAULT_SUBSET_WEIGHTS``,
   ``_thermo_corpus_spec``, ``_thermo_wikitext_tensor``,
-  ``_build_thermo_corpus``) are character-identical copies of the monolith
-  bodies. ``stage6alt_thermometer.py`` re-imports them (the ``# noqa: F401``
-  block) so ``run()`` and external callers/tests (notably
+  ``_build_thermo_corpus``) are the canonical bodies; the legacy
+  ``stage6alt_thermometer.py`` monolith re-imports them (the
+  ``# noqa: F401`` block) so external callers/tests (notably
   ``stage2/orchestrator.py``'s xD calibration path that imports
   ``_thermo_wikitext_tensor``) keep their existing import paths.
-* **Pattern B — reproduced in an inert hook**: the monolith ``run()``'s
-  inline corpus-build call site (the ``_build_thermo_corpus(config,
+* **Pattern B — live hook**: the monolith ``run()``'s former inline
+  corpus-build call site (the ``_build_thermo_corpus(config,
   tokenizer, artifacts_dir)`` call that returns
-  ``(calib, corpus_meta, corpus_id)``) is reproduced in the inert
-  ``build_corpus`` hook below. The monolith ``run()`` is NOT modified for
-  it. This is an intentional, temporary logic duplication that resolves at
-  S6A-6 when the orchestrator flip wires this hook live and the monolith
-  ``run()`` becomes a thin shim.
+  ``(calib, corpus_meta, corpus_id)``) now lives in the
+  :meth:`ThermoCorpusPlugin.build_corpus` hook below. The Stage 6alt
+  orchestrator (:mod:`stage6alt.orchestrator`) dispatches the hook
+  via ``walk_phases(("build_corpus",), ...)``; the monolith ``run()``
+  has been reduced to a thin shim that re-exports symbols for
+  backward compat.
 
 Circular-import contract (mirror of ``stage6/plugins/wikitext_ppl.py``):
 this module imports only from ``..context`` / ``...utils.calibration`` /
@@ -52,16 +57,24 @@ The monolith re-imports *this* module's symbols at load time, so a
 ``from ..stage6alt_thermometer import ...`` here would deadlock the
 import; nothing in this module does that.
 
-``ThermoCorpusPlugin`` is registered-but-INERT at S6A-2 — no orchestrator
-walk or test invokes its ``build_corpus`` hook. S6A-6 plugs the hook into
-the live Stage 6alt plugin sequencer.
+Dataset revision pinning
+------------------------
+The WikiText-2 corpus is loaded via ``datasets.load_dataset`` with the
+``revision=`` pin resolved from
+``config["stage6_validate"]["dataset_revisions"]["wikitext_ppl"]`` — the
+same canonical key used by :mod:`stage6.plugins.wikitext_ppl` so the
+Stage 6 PPL gate and the Stage 6alt thermometer share one SHA per sweep.
+The Stage 6alt :class:`PipelineContext` currently does NOT publish a
+``dataset_revisions`` slot of its own (unlike Stage 6's orchestrator);
+the resolution lives off ``config`` and ``config`` is already in
+:attr:`ThermoCorpusPlugin.reads`. If a future S6A-stage adds a
+``dataset_revisions`` ctx slot, prefer that and append to ``reads``.
 """
 from __future__ import annotations
 
 import logging
 import os
 from pathlib import Path
-from typing import Any
 
 import torch
 
@@ -117,7 +130,8 @@ def _thermo_corpus_spec(config: dict) -> CalibrationSpec:
 
 def _thermo_wikitext_tensor(tokenizer, *, num_sequences: int,
                             sequence_length: int, dataset: str, subset: str,
-                            split: str) -> torch.Tensor:
+                            split: str,
+                            revision: str | None = None) -> torch.Tensor:
     """Build the first `num_sequences` full-length chunks of WikiText.
 
     Mirrors `stage6_validate._wikitext2_ppl`'s tokenization exactly: rows are
@@ -126,10 +140,25 @@ def _thermo_wikitext_tensor(tokenizer, *, num_sequences: int,
     `sequence_length`-token rows. The chunk order is fixed by the dataset, so
     the draw is fully deterministic. WikiText test text is not in the Stage 2/
     2.5 training distribution, so no seed-offset disjointness logic is needed.
+
+    Chunks are NON-OVERLAPPING (`all_ids[: n_full * seq_len]` reshaped to
+    `(n_full, seq_len)`). This deliberately diverges from Merity et al. 2017
+    Table 4's sliding-window protocol — the thermometer reports BPT for
+    sweep-internal ranking, not an externally-comparable PPL number.
+
+    Pass ``revision`` to pin the HuggingFace dataset commit SHA — mirrors the
+    Stage 6 PPL plugin's pinning (:mod:`stage6.plugins.wikitext_ppl`) so the
+    Stage 6 gate and the Stage 6alt thermometer load the same SHA per sweep.
     """
     from datasets import load_dataset
 
-    ds = load_dataset(dataset, subset, split=split)
+    # Fail-loud on load_dataset error: unlike stage6/wikitext_ppl.py which
+    # warns + returns inf PPL (a metric the gate can still surface), this
+    # corpus is an INPUT to the thermometer — every downstream BPT / teacher /
+    # report plugin reads ``calib_ids``. Swallowing the load error here would
+    # produce a misleading "no full-length sequence" exception two frames
+    # deeper, hiding the real (network / SHA / dataset-name) root cause.
+    ds = load_dataset(dataset, subset, split=split, revision=revision)
     concatenated = "\n\n".join(row.get("text", "") for row in ds)
     all_ids = tokenizer(
         concatenated, add_special_tokens=True, return_tensors=None,
@@ -178,19 +207,29 @@ def _build_thermo_corpus(config: dict, tokenizer, artifacts_dir: Path):
         dataset = wt.get("dataset", "wikitext")
         subset = wt.get("subset", "wikitext-2-raw-v1")
         split = wt.get("split", "test")
+        # Resolve the dataset revision off config["stage6_validate"]
+        # ["dataset_revisions"]["wikitext_ppl"] — same canonical key as
+        # stage6.plugins.wikitext_ppl, so the Stage 6 gate and the Stage 6alt
+        # thermometer pin one SHA per sweep. ``config`` is already in
+        # ThermoCorpusPlugin.reads; no ctx-slot dependency is added.
+        s6 = config.get("stage6_validate", {}) or {}
+        dataset_revisions = s6.get("dataset_revisions") or {}
+        revision = (dataset_revisions or {}).get("wikitext_ppl")
         calib = _thermo_wikitext_tensor(
             tokenizer, num_sequences=n_seq, sequence_length=seq_len,
-            dataset=dataset, subset=subset, split=split,
+            dataset=dataset, subset=subset, split=split, revision=revision,
         )
         corpus_meta = {
             "name": "wikitext", "dataset": dataset, "subset": subset,
-            "split": split, "num_sequences": int(calib.shape[0]),
+            "split": split, "revision": revision,
+            "num_sequences": int(calib.shape[0]),
             "sequence_length": seq_len,
         }
-        corpus_id = (f"wikitext:{dataset}:{subset}:{split}:"
+        corpus_id = (f"wikitext:{dataset}:{subset}:{split}:{revision or 'none'}:"
                      f"{calib.shape[0]}x{seq_len}:{tok_id}")
-        log.info("Stage 6alt corpus: wikitext (%s/%s:%s) %d x %d",
-                 dataset, subset, split, calib.shape[0], seq_len)
+        log.info("Stage 6alt corpus: wikitext (%s/%s:%s rev=%s) %d x %d",
+                 dataset, subset, split, revision or "none",
+                 calib.shape[0], seq_len)
         return calib, corpus_meta, corpus_id
 
     if corpus == "nemotron":
@@ -219,29 +258,25 @@ def _build_thermo_corpus(config: dict, tokenizer, artifacts_dir: Path):
 
 
 class ThermoCorpusPlugin:
-    """Stage 6alt thermometer calibration-corpus plugin (S6A-2 — registered-but-INERT).
+    """Stage 6alt thermometer calibration-corpus plugin.
 
     Owns the Stage 6alt corpus-build concern: the relocated
     ``_thermo_corpus_spec`` / ``_thermo_wikitext_tensor`` / ``_build_thermo_corpus``
-    helpers (Pattern A) plus an inert ``build_corpus`` hook (Pattern B) that
-    reproduces the monolith's inline corpus-build call site.
+    helpers (Pattern A) plus the live ``build_corpus`` hook (Pattern B) that
+    reproduces the monolith's former inline corpus-build call site.
 
-    S6A-2 wires this class into the plugin registry as metadata only — no
-    orchestrator walk or test invokes ``build_corpus``. S6A-6 plugs the hook
-    into the live Stage 6alt plugin sequencer.
+    The Stage 6alt orchestrator (:mod:`stage6alt.orchestrator`) dispatches the
+    hook via ``walk_phases(("build_corpus",), ...)``; the legacy monolith
+    ``stage6alt_thermometer.run()`` is a thin shim that re-exports the
+    Pattern-A symbols for backward-compat callers.
     """
 
     name = "thermo_corpus"
-    paper = "Stage 6alt thermometer corpus build — Nemotron held-out or WikiText-2 test (project-original sweep harness; D11 calibration deviation owner is :mod:`stage2.plugins.reap_scoring`). See module docstring."
+    paper = "Stage 6alt thermometer corpus build (project-original sweep harness). See module docstring."
     config_key = "stage6_validate.thermometer.corpus"
     reads: tuple[str, ...] = (
         "model", "tokenizer", "config", "artifacts_dir",
     )
-    writes: tuple[str, ...] = ("calib_ids", "corpus_meta", "corpus_id")
-    # No calibration-pass accumulator — `_build_thermo_corpus` already
-    # produces the tensor in one call, no per-layer sweep is needed.
-    provides: tuple[str, ...] = ()
-
     writes: tuple[str, ...] = ("calib_ids", "corpus_meta", "corpus_id")
     # No calibration-pass accumulator — `_build_thermo_corpus` already
     # produces the tensor in one call, no per-layer sweep is needed.
@@ -255,20 +290,17 @@ class ThermoCorpusPlugin:
         """
         return True
 
-    def contribute_artifact(self, ctx: Any) -> dict:
+    def contribute_artifact(self, ctx: PipelineContext) -> dict:
         return {}
 
     def build_corpus(self, ctx: PipelineContext) -> None:
-        """Phase hook — Stage 6alt thermometer corpus build (S6A-6 wiring surface).
+        """Phase hook — Stage 6alt thermometer corpus build.
 
-        INERT at S6A-2: no orchestrator walk or test invokes this hook. S6A-6
-        replaces the Stage 6alt orchestrator body with the plugin sequencer
-        and dispatches this hook in place of the monolith ``run()``'s inline
-        ``_build_thermo_corpus`` call. The body below reproduces that inline
-        call faithfully — it is dead code at S6A-2 but S6A-6 relies on it
-        once the monolith ``run()`` becomes a thin shim.
+        The Stage 6alt orchestrator's ``walk_phases(("build_corpus",), ...)``
+        call dispatches this hook in place of the monolith ``run()``'s former
+        inline ``_build_thermo_corpus`` call.
 
-        Reproduces the monolith ``run()``'s student-side call:
+        Reproduces the monolith's former student-side call:
 
             calib, corpus_meta, corpus_id = _build_thermo_corpus(
                 config, tokenizer, artifacts_dir,
