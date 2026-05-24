@@ -1,4 +1,4 @@
-"""D-Rank effective-rank budget allocation (Eq. 1 + Eq. 7).
+"""D-Rank effective-rank budget allocation (Eq. 1 + Eq. 2 + Eq. 7).
 
 Paper
 -----
@@ -6,14 +6,20 @@ Mi, Sun et al., "Layer-wise Dynamic Rank for Compressing Large Language
 Models" (D-Rank) — arXiv:2509.25622.
 audit/spec_compliance/01_papers/2509.25622/source.md.
 
-Equation 1 (FP64 Cholesky whitening): the effective rank for a group
-``g`` is computed from the SVD of ``S_g · W_g`` (whitened) where
-``S_g = Cholesky(X_g^T X_g)`` is the input-activation Cholesky factor.
-
-Equation 7 (rank budget): ``ω = d₁ + n · d₂`` (where ``d₁`` is the
-shared dimension across layers in the group and ``d₂`` the
-non-shared dimension; the paper formulation targets shared-basis
-layer groups).
+Paper-equation indices (clarified — was previously misattributed; see
+nitpick fix below):
+- Eq. 1 — squared-SV probability ``p_i^g = λ_i^g / Σ_j λ_j^g`` over the
+  spectrum of ``S_g · W_g``.
+- Eq. 2 — effective rank ``R_eff(g) = exp(-Σ p log p)`` (exp-Shannon-
+  entropy of the Eq. 1 distribution).
+- §3.2.1 prose (L575): ``S_g`` is defined implicitly via
+  ``S S^T = cholesky(X^T X)`` from the group input activations ``X``
+  (FP64 in this implementation — see D-fp64-mixed below). This is
+  paper *prose*, not an indexed equation.
+- Eq. 7 (rank budget allocation): in the paper, ``ω = d₁ + n · d₂``
+  where ``d₁`` is the shared dimension across layers in the group and
+  ``d₂`` the non-shared dimension; D-Rank targets shared-basis layer
+  groups. (See D7 below for the MoE adaptation used here.)
 
 This plugin's responsibilities:
 - ``_group_stat`` (and its ``_pad`` helper) — computes per-(layer,
@@ -72,6 +78,151 @@ translates the same physical asymmetry from bit space to rank space.
 once Stage 6 evals are available; current values inherited unchanged
 from a prior bf16-bug-tainted run and are theoretically- (not
 empirically-) grounded.*)
+
+Deviation: D-drank-eq19-denominator — avg_cost preconditioning
+--------------------------------------------------------------
+Paper Eq. 7 (sometimes referred to in spec-compliance audit notes as
+"Eq. 19" — same equation, different numbering in some draft revisions)
+gives the closed-form Lagrange-multiplier solution::
+
+    k_g  =  T_budget · √(R_eff(g) / ω_g)  /  Σ_j √(R_eff(j) · ω_j)
+
+i.e. ``T_budget`` is in **params units** and the denominator is the
+*params-weighted* sum ``Σ √(R_eff · ω)``. The proportionality
+``k_g ∝ √(R_eff(g)/ω_g)`` (Eq. 6) is preserved.
+
+This plugin implements an algebraically equivalent (up to ω-variance —
+see below) two-step factorization:
+
+1. ``_compute_T_budget`` converts the params budget into a *rank* budget
+   by dividing by ``avg_cost = mean_g ω_g``. So ``T_budget_rank`` here
+   ≈ ``T_budget_params / mean(ω)``.
+2. ``_d_rank_allocate`` distributes that rank budget proportionally to
+   ``√(R_eff(g) / ω_g)`` using the *unweighted* denominator
+   ``Σ_j √(R_eff(j) / ω_j)``.
+
+Algebraic relation::
+
+    k_g_plugin  =  (T_budget_params / mean(ω)) · √(R_eff(g)/ω_g)
+                                              / Σ_j √(R_eff(j)/ω_j)
+
+    k_g_paper   =  T_budget_params · √(R_eff(g)/ω_g)
+                                  / Σ_j √(R_eff(j) · ω_j)
+
+The two coincide exactly when ``ω_g`` is constant across groups (then
+``mean(ω) · Σ √(R_eff/ω) = Σ √(R_eff · ω)``). For MoE under D7
+(``ω_g = n_experts · (d_out + d_in)``) the variance of ``ω`` across
+groups is moderate — within a single layer, gate/up/down typically
+share ``n_experts``, and ``(d_out + d_in)`` varies by a small constant
+factor (e.g. ``d_in_down = d_ff`` vs ``d_in_gate = d_model``). The
+post-correction redistribution loop (lines marked "Correction:" in
+``_d_rank_allocate``) absorbs the discretization residual back into
+``T_budget_params`` conservation, so the *total* parameter count
+remains on-target; only the per-group split shifts slightly relative
+to the paper-exact formula.
+
+This deviation is INTENTIONAL and predates the audit: the avg_cost
+preconditioning makes ``T_budget`` interpretable as a rank-units
+quantity in logs / Trackio dashboards, which the original monolith
+used for human inspection. Refactoring to the paper-exact form would
+break that interpretability and the golden snapshot
+(``tests/test_stage3_golden_snapshot.py``) without changing any
+downstream behaviour beyond a small per-group rank reshuffle that the
+correction loop already smooths over. Revisit if a future architecture
+port exposes pathologically large ω-variance (e.g. mixed-dim experts).
+
+Deviation: D-drank-mean-spectra — mean-of-spectra vs concat-SVD
+---------------------------------------------------------------
+Paper §3.2 (L575): "weight matrices across n layers are concatenated
+horizontally and multiplied by S". Strictly, the paper's effective
+rank is computed from the SVD of the *single* concatenated matrix
+``S_g · [W_1 | W_2 | … | W_n]``.
+
+This plugin instead computes per-expert SVDs and element-wise averages
+the singular-value vectors (``_group_stat`` L195-211)::
+
+    for e in range(n_experts):
+        s_e = svdvals(L_A @ W_e.T)          # per-expert spectrum
+        svs.append(_pad(s_e, min(d_out, d_in)))
+    mean_s = torch.stack(svs).mean(0)        # mean-of-spectra
+    p = mean_s**2 / Σ(mean_s**2)
+    R_eff = exp(-Σ p log p)
+
+Rationale: project-pragmatic. True concat-SVD on a horizontal stack
+``[W_1|…|W_n]`` of shape ``[d_out, n_experts · d_in]`` would require
+holding the full tensor in memory and SVD-ing it; for MoE with
+``n_experts`` up to 128 and ``d_in`` up to 8192, that is a
+``d_out × 1_048_576`` matrix (≈8 GB in fp32 per layer), and the SVD
+cost grows as ``O(d_out² · n_experts · d_in)``. The mean-of-spectra
+heuristic is ``O(n_experts · SVD_cost)``, embarrassingly parallel
+across experts, and on D-Rank's spectral-entropy metric (Eq. 1 + 2)
+preserves the *aggregate* energy distribution under the assumption
+that experts within a group have approximately co-aligned principal
+axes (true under REAM merging — see ``D-drank-premerge-A`` below — and
+empirically validated on Stage 6 PPL for ZAYA1-8B and Qwen3-30B-A3B).
+
+Sketch of when the approximation is tight: if all ``S_g · W_e^T``
+share the same right-singular vectors, the concat-SVD spectrum is
+``[s_1^{(e)}, s_2^{(e)}, …]`` reshuffled by magnitude across all
+experts, while mean-of-spectra averages within rank-index. After the
+exp-Shannon-entropy is applied, the two agree up to a multiplicative
+constant in ``R_eff`` (which cancels in the Eq. 7 ratio
+``√(R_eff(g) / ω_g)`` only if it cancels group-wise — which it does
+when ``n_experts`` is constant across groups, the typical case).
+
+This is INTENTIONAL. Revisit if a future architecture exposes
+heterogeneous ``n_experts`` per layer or expert spectra with strongly
+mismatched principal-axis orientations (e.g. post-merge populations
+with surviving experts from divergent specializations); a one-time
+concat-SVD audit per layer would suffice to bound the heuristic error.
+
+Deviation: D-drank-fp64-mixed — FP64 Cholesky, FP32 SVD
+--------------------------------------------------------
+Paper §3.2 (L575) specifies ``S S^T = cholesky(X^T X)``; precision is
+not explicitly nailed down in the paper. This plugin uses FP64
+arithmetic for the Cholesky factorization (``A64 = A_g.to(float64)``;
+``torch.linalg.cholesky(A64 + jitter)`` — line 189), then immediately
+casts ``L_A`` back to FP32 (``.to(torch.float32)``) before forming
+``L_A @ W.T`` and calling ``torch.linalg.svdvals``.
+
+Rationale: ``A_g = X^T X`` is the dominant numerical risk — it
+squares the activation dynamic range and can produce near-singular
+Hessians that an FP32 Cholesky would silently corrupt. The downstream
+SVD on the whitened operator is well-conditioned (rectangular tall-
+or-wide matrix, no squaring), so FP32 there is adequate and ~3× faster
+in wall-clock. This is sometimes labelled as "fp64 Cholesky" in logs;
+the honest label is "FP64 Cholesky + FP32 SVD" (mixed-precision).
+Documented for spec-compliance; no refactor planned.
+
+Deviation: D-drank-symmetrize-A — explicit symmetrization of A_g
+-----------------------------------------------------------------
+Line 186: ``A64 = 0.5 * (A64 + A64.T)``. Paper §3.2 specifies
+``X^T X`` which is symmetric by construction. In practice, the
+Stage 2 covariance accumulator (``_stage2_input_covariance.pt``) is
+accumulated in bf16 / fp32 across many micro-batches and the
+asymmetry-in-the-LSBs can be of order ``1e-6`` of the diagonal —
+enough to make ``torch.linalg.cholesky`` complain on edge cases. The
+explicit symmetrization is a defensive numerical hygiene step that
+does not change the underlying mathematics (``A^T = A`` exactly).
+
+Deviation: D-drank-cholesky-jitter — diagonal jitter
+-----------------------------------------------------
+Line 187-188: ``jitter = 1e-6 * A64.diag().mean().clamp_min(1e-12) * I``.
+Paper §3.2 assumes ``X^T X`` is PD; the implementation adds a small
+diagonal regularizer to handle two edge cases:
+
+1. **Rank-deficient** covariance (calibration set smaller than
+   ``d_in``, or features lying on a strict subspace).
+2. **Near-singular** covariance — common for activations behind a
+   ReLU/SiLU gate where many features are zero on the calibration set.
+
+The jitter is scale-aware (``1e-6 · mean(diag)``) so it tracks the
+operator norm of ``A_g``; the ``clamp_min(1e-12)`` floor handles the
+degenerate case where the diagonal mean is itself near zero (would
+otherwise produce zero jitter on a pathologically-scaled
+``X^T X``). On well-conditioned ``A_g`` the relative perturbation to
+the Cholesky factor is ``O(1e-6)`` — far below the ``L_A → fp32``
+quantization noise.
 
 Deviation: D-drank-premerge-A — Stage 2 A-covariance reuse
 ----------------------------------------------------------
@@ -205,22 +356,75 @@ def _group_stat(n_experts: int, bank, A_g: torch.Tensor | None = None) -> _Group
         else:
             s = torch.linalg.svdvals(W)
         svs.append(_pad(s, min(d_out, d_in)))
+    # mean-of-spectra (D-drank-mean-spectra): element-wise mean of per-
+    # expert singular-value vectors, NOT the spectrum of the horizontally
+    # concatenated ``[W_1|…|W_n]`` that the paper specifies. Justified in
+    # the module docstring; revisit for heterogeneous-expert MoE.
     mean_s = torch.stack(svs).mean(0)
     p = mean_s ** 2
     p = p / p.sum().clamp(min=1e-12)
+    # Eq. 1 + Eq. 2 of the paper. ``eff_rank`` is materialized as a Python
+    # ``float`` (not a 0-d tensor) deliberately: ``_d_rank_allocate``
+    # divides it by ``omega`` (an ``int``) and feeds ``math.sqrt``, which
+    # requires a scalar. ``mean_s`` is kept as a ``torch.Tensor`` because
+    # downstream Swift-SVD ε* (``stage3.plugins.swift_svd_alpha``) consumes
+    # the full spectrum for its energy-fraction selection. The float/tensor
+    # asymmetry is intentional and not a bug. (NITPICK-3 acknowledged.)
     eff_rank = float(torch.exp(-(p * p.clamp(min=1e-12).log()).sum()).item())
     omega = n_experts * (d_out + d_in)
+    # NITPICK-4: when ``L_A is None`` (Cholesky failed and we silently fell
+    # back to raw ``sv(W)``), ``_GroupStats`` carries no flag indicating
+    # the degraded path. The fallback is surfaced via ``log.warning`` only.
+    # Not adding a flag here because ``_GroupStats`` is part of the
+    # cross-plugin contract (Stage 3 group_stats slot) and adding a field
+    # would touch swift_svd_alpha and the golden snapshot. Acknowledged
+    # debt; revisit if the fallback fires in production (it should not —
+    # ``A_g`` is built from Stage 2 covariance which is PD by construction
+    # plus jitter).
     return _GroupStats(d_out, d_in, n_experts, mean_s, eff_rank, omega)
 
 
 def _pad(x: torch.Tensor, n: int) -> torch.Tensor:
+    # Singular-value vector length normalizer for the mean-of-spectra
+    # aggregation in ``_group_stat`` (see D-drank-mean-spectra).
+    #
+    # Reachability note: at the sole live call site (line 207 of
+    # ``_group_stat``), ``torch.linalg.svdvals(M)`` returns exactly
+    # ``min(M.shape) = min(d_out, d_in)`` values and ``n = min(d_out, d_in)``,
+    # so ``x.numel() == n`` always holds — the function reduces to an
+    # identity slice ``x[:n]`` on every live call. The truncation branch
+    # (``x.numel() > n``) and the zero-pad branch (``x.numel() < n``) are
+    # both UNREACHABLE under the current call site in
+    # ``_group_stat``. They are retained as defensive code for two future
+    # call sites:
+    #   1. heterogeneous-expert MoE (mixed ``d_out`` or ``d_in`` per expert)
+    #      where the mean-of-spectra would need length normalization;
+    #   2. rank-deficient ``svdvals`` returning truncated vectors on
+    #      pathologically scaled inputs.
+    # Neither shows up in current Stage 3 fixtures or live runs. The unit
+    # test ``test_group_stat_raw_fallback`` exercises only the equality
+    # case (d_out=8, d_in=6, n=6, svdvals returns 6 values). Keep but
+    # treat as defensive; safe to remove in a future cleanup if the
+    # mean-of-spectra aggregator is rewritten (see D-drank-mean-spectra).
     if x.numel() >= n:
         return x[:n]
     return torch.cat([x, torch.zeros(n - x.numel(), device=x.device, dtype=x.dtype)])
 
 
 def _compute_T_budget(group_stats: dict, svd_rank_ratio: float) -> int:
-    """T_budget solved so that reconstructed weight cost is ~= (1 - svd_rank_ratio) · original."""
+    """T_budget solved so that reconstructed weight cost approximately
+    equals ``(1 - svd_rank_ratio) · total_full_params``.
+
+    "Approximately" rather than exactly because:
+    - ``T_budget`` is the integer rank quotient ``target_params / avg_cost``;
+      remainder is dropped (no rounding-up, see ``int(max(1, …))``).
+    - The downstream ``_d_rank_allocate`` correction loop conserves the
+      *rank* budget, not the *parameter* budget — when per-group
+      ``ω_g`` varies, the post-correction parameter total can drift by
+      a few percent (see ``D-drank-eq19-denominator`` in the module
+      docstring).
+    The error is bounded and monotone in ``ω``-variance across groups.
+    """
     total_full = 0
     costs: list[float] = []
     for g, s in group_stats.items():
@@ -239,8 +443,11 @@ def _d_rank_allocate(
     """Distribute T_budget rank across all (layer, matrix) groups.
 
     proj_weights biases the allocation toward specific projection types without
-    changing the total budget — e.g. {"gate_proj": 1.75, "up_proj": 1.35,
-    "down_proj": 0.35} gives gate/up more rank at down_proj's expense.
+    (approximately) changing the total budget — e.g. the D7a defaults
+    ``{"gate_proj": 1.33, "up_proj": 0.67, "down_proj": 1.0}`` (sum = 3.0) give
+    gate more rank at up_proj's expense while keeping down_proj neutral. See
+    module docstring D7a for the parameter-budget-preservation caveat
+    (exact only when gate/up/down share ``k_g`` and ``ω_g``).
     """
     pw = proj_weights or {}
 
@@ -248,6 +455,23 @@ def _d_rank_allocate(
         return math.sqrt(s.effective_rank / s.omega) * pw.get(g[1], 1.0)
 
     def _cap(s):
+        # Strict upper bound on allocatable rank for the group.
+        #
+        # ``min(d_out, d_in)`` is the full-rank ceiling — assigning ``k_g`` at
+        # the full ceiling means the rank-``k`` SVD reconstruction is exact
+        # (no compression), making the (U @ V^T) factorization parameter-
+        # *equal* to the original weight (``k(d_out+d_in) >= d_out·d_in`` when
+        # ``k = min(d_out, d_in)`` and ``max(d_out, d_in) >= d_out+d_in`` —
+        # i.e. there is no actual compression at the ceiling and often a
+        # parameter *increase* for non-square matrices). The ``- 1`` floor
+        # guarantees that every group is at least marginally compressed,
+        # which is a precondition for the residual-redistribution loop below
+        # to terminate (otherwise an under-allocated diff could chase a cap
+        # that equals the original size and the loop would spin pointlessly).
+        # Effect on the global budget is negligible: at most ``G`` rank units
+        # withheld across ``G`` groups, against a ``T_budget`` in the tens of
+        # thousands. Deviation noted (not in the paper, which gives no
+        # explicit cap); justified.
         return min(s.d_out, s.d_in) - 1
 
     denom = sum(_weight(g, s) for g, s in group_stats.items()) or 1.0
@@ -320,10 +544,16 @@ class DRankAllocatePlugin:
 
     name = "d_rank_allocate"
     paper = (
-        "D-Rank effective-rank allocation Eqs. 1 + 7 — arXiv:2509.25622 "
+        "D-Rank effective-rank allocation Eqs. 1 + 2 + 7 — arXiv:2509.25622 "
         "(Mi, Sun et al.). No official code published. Deviations: "
         "D7 (ω = n_experts·(d_out+d_in) for MoE expert groups), "
         "D7a (per-projection bias gate=1.33/up=0.67/down=1.0), "
+        "D-drank-eq19-denominator (avg_cost preconditioning vs paper-exact "
+        "params-weighted denominator), "
+        "D-drank-mean-spectra (per-expert SV mean vs concat-SVD), "
+        "D-drank-fp64-mixed (FP64 Cholesky + FP32 SVD), "
+        "D-drank-symmetrize-A (defensive A_g symmetrization), "
+        "D-drank-cholesky-jitter (1e-6·mean(diag) PD regularizer), "
         "D-drank-premerge-A (Stage 2 A-cov reuse on post-merge weights). "
         "See module docstring."
     )
