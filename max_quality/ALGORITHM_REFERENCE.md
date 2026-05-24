@@ -255,134 +255,22 @@ Shared experts (`mlp.shared_expert`) are **not in the blacklist** and are not pr
 
 ---
 
-## 5.5. Stage 2.5 — Post-Merge Router Calibration
-
-**File:** [`stage5_router_kd.py`](src/moe_compress/stage5_router_kd.py) (same code as Stage 5)
-**Paper:** Router Knowledge Distillation for MoE Compression (2603.02217), Eq. 3, Table 1, §F.3
-**Hardware:** H200 required. VRAM accounting: teacher BF16 ~70 GB + student BF16 ~50 GB + logits/activation buffer ~6 GB → ~126 GB live; ~15 GB headroom on H200's 141 GB. (At Stage 5 the student is post-Stage-4 FactoredExperts and is smaller than 50 GB, so the ~120 GB / ~126 GB / ~15 GB headroom is conservative for Stage 5; exact at Stage 2.5 where the student is the pre-SVD pruned model.)
-
-### What
-
-Runs the Router KD algorithm (identical to Stage 5) on the Stage 2 output — before SVD factorization. Only `mlp.gate.weight` is trainable; all expert, backbone (attention, embeddings, lm_head, RMSNorm) parameters remain frozen, per Router-KD paper §4. Gradients flow through the soft-gating weights of the selected experts during the forward pass (so the router's gate signal reaches the loss); only `mlp.gate.weight` parameter values are updated.
-
-### Why
-
-After Stage 2, the router has been **resized** (rows for deleted experts removed) but never retrained. The surviving router weights were calibrated for the original 256-expert landscape. They now route among ~180–200 merged experts whose weight distributions have shifted. Stage 3's covariance collection runs on this degraded routing — better routing at this point means the cross-covariance and B-covariance collected by Stage 3 are more representative of actual inference-time token distribution per expert.
-
-**Stage 2 v2 interaction (revision spec).** When Stage 2's per-merge-group expert distillation (`expert_distill_steps > 0`) is enabled, Stage 2.5 receives a model whose merged-centroid weights have **already been distilled** to match a freq-weighted target of pre-merge group-member outputs. Stage 2.5's job is therefore purely router calibration on top of pre-distilled experts — not expert recovery. The freeze pattern is unchanged: only `mlp.gate.weight` is trainable; expert/backbone weights stay frozen.
-
-Stage 2.5 is distinct from Stage 5: Stage 5 recalibrates routers after SVD factorization and EoRA. Stage 2.5 recalibrates after merging only. Both are needed: the model changes again in Stages 3 and 4, making Stage 2.5's routers stale again — Stage 5 corrects this. The full chain is: merge → heal routers (2.5) → factorize → compensate → heal routers again (5).
-
-### How
-
-Identical to Stage 5 (§8), with two differences:
-
-| Parameter | Stage 2.5 | Stage 5 |
-|---|---|---|
-| Input model | Stage 2 output (dense merged experts) | Stage 4 output (FactoredExperts + EoRA) |
-| Teacher precision | BF16 (both stages) | BF16 (both stages) |
-| Checkpoint prefix | `_stage2p5_partial/` | `_stage5_partial/` |
-| Hub artifact | `<base>-stage2p5` | `<base>-stage5` |
-
-All other hyperparameters (lr=5e-5, bs=8, τ=1.0, epochs=1, max_samples=3000, seq_len=512) inherit from §8. (See §8's batch-size hyperparameter table for the bs=8/accum=1 ↔ paper's bs=2/accum=4 equivalence rationale.)
-
-**Calibration data:** Nemotron weighted subsets per §2 (D11) — same calibration source as Stage 2 and Stage 5; canonical reference is §2.
-
-**Teacher loading fallbacks:** Stage 2.5 may use the same 4-bit / cache fallbacks as Stage 5 if VRAM is tight — teacher loadable in 4-bit via bitsandbytes, or precomputed teacher vocabulary logits loaded from a sidecar cache file (`teacher_logits_cache` config key) to skip the live teacher entirely (cache wins on conflict — see §8 Teacher Loading for the precedence rule). See §8 "Teacher Loading" for details.
-
-### Resume
-
-Same step-boundary checkpointing as Stage 5, under `_stage2p5_partial/`.
+<!-- §5.5 Stage 2.5 (Post-Merge Router Calibration) — CONSUMED by
+     router_kd/plugins/* (commits pending). Full §5.5 narrative —
+     paper (Router-KD arXiv:2603.02217), Stage-2.5-vs-Stage-5
+     parameter table, calibration deviation D11 (SHARED — owner
+     stage2/plugins/reap_scoring.py), teacher loading fallbacks —
+     all relocated into router_kd/plugins/* module docstrings. -->
 
 ---
 
-<!-- §6 Stage 3 (Non-Uniform SVD Factorization) — CONSUMED by
-     stage3/plugins/* (commits pending). Full §6 narrative —
-     papers (AA-SVD arXiv:2604.02119 + D-Rank arXiv:2509.25622 +
-     Swift-SVD arXiv:2604.01609 + SVD-LLM V2 arXiv:2503.12340),
-     hardware framing, Phases A/B/C/C.5/D (covariance collection,
-     D-Rank effective-rank allocation, AA-SVD per-(layer, expert)
-     factorization, AdamW block refinement, Swift-SVD+ α selection),
-     all deviations (D6-D8, D-eps-star, D-per-type-alpha,
-     D-no-intra-block-cascade, D-c5-moe-only, D-drank-premerge-A,
-     D-cov-storage-fp16 — SHARED with Stage 2), and resume narrative
-     — all relocated into the per-plugin module docstrings under
-     stage3/plugins/. -->
-
----
-
-<!-- §7 Stage 4 (EoRA Residual Compensation) — CONSUMED by
-     stage4/plugins/* (commits pending). Full §7 narrative —
-     paper (EoRA arXiv:2410.21271), hardware framing, Algorithm 1
-     description, multi-sample X̃ reading, deviations D10 +
-     D-eora-budget-pct, and resume narrative — all relocated
-     into the per-plugin module docstrings under stage4/plugins/. -->
-
----
-
-## 8. Stage 5 — Router Knowledge Distillation (Final)
-
-**File:** [`stage5_router_kd.py`](src/moe_compress/stage5_router_kd.py)
-**Paper:** Router Knowledge Distillation for MoE Compression (2603.02217), Eq. 3, Table 1, §F.3
-**Hardware:** H200. EoRA-compensated student model stays resident from Stage 4. Teacher loads in BF16 (~70 GB); combined VRAM ~70 GB teacher + ~50 GB student + logits/activation buffer ~6 GB → 126 GB total (with bs=8 logits).
-
-### What
-
-Trains **only** the router gate weights to match the original (uncompressed) teacher's output distribution via vocabulary-level KL divergence. Only `mlp.gate.weight` is trainable; all expert, backbone (attention, embeddings, lm_head, RMSNorm) parameters remain frozen, per Router-KD paper §4. Gradients flow through the soft-gating weights of the selected experts during the forward pass (so the router's gate signal reaches the loss); only `mlp.gate.weight` parameter values are updated.
-
-### Why
-
-After Stages 2–4, the expert weights have changed but the router weights still reflect the original expert set. The router sends tokens to suboptimal experts, degrading quality. Router KD recalibrates routing decisions to the new expert landscape by matching the teacher's next-token prediction distribution — the gradient signal flows backward through the routing decisions, naturally adapting them.
-
-The paper explicitly uses vocabulary-level output distillation (not router-gate-level): "By distilling output logits rather than matching router gate values explicitly, Router KD avoids requiring the teacher and student to share identical expert sets or gate dimensionalities."
-
-### How — Vocabulary-Level KD (Paper Eq. 3)
-
-```
-L_RKD = (τ² / N_x) × Σ_t m_{t+1} · KL(softmax(z_T^t / τ) ‖ softmax(z_S^t / τ))
-```
-
-where `z_T, z_S ∈ ℝ^{|V|}` are teacher/student vocabulary logits, `m_{t+1} ∈ {0,1}` is the padding mask, `N_x = Σ_t m_{t+1}` is the count of unmasked positions, and `τ=1.0` is the temperature. Calibration sequences are fully packed so `m_{t+1}=1` everywhere in practice. *Paper Eq. 3 includes a `+ ε` zero-mask safety constant; the spec drops it under the fully-packed-sequences invariant (no padding → m=1 everywhere → N_x ≥ 1 deterministically). If a future calibration source ever introduces padding, the `+ ε` must be restored.*
-
-**Implementation:**
-1. Teacher forward pass (no_grad) → vocabulary logits `[B, L, |V|]`
-2. Student forward pass (with gradients) → vocabulary logits `[B, L, |V|]`
-3. Shift logits: position `t` predicts token `t+1` (standard causal LM)
-4. Chunked KL: process `chunk_size` sequence positions at a time to bound peak memory at `B × chunk × |V| × 4` bytes. On H200 with ~15 GB VRAM headroom at bs=8, `chunk_size=512` (the full sequence length) is safe — peak intermediate is ~2.4 GB. Chunking is retained as a configurable parameter (`kd_seq_chunk_size`) for smaller-VRAM hardware; on H200 the overhead of chunk-boundary Python loops is eliminated by setting chunk=seq_len.
-5. `F.kl_div(log_softmax(student/τ), softmax(teacher/τ))` = KL(teacher ‖ student) — correct forward KL direction (here "forward KL" = teacher-as-reference, matching paper Eq. 3's `D_KL(p_T ‖ p_S)` convention). *Proof:* `F.kl_div(input=log_q, target=p)` computes `Σ p · (log p − log q) = KL(p ‖ q)`. With input=`log_softmax(student/τ)` and target=`softmax(teacher/τ)`, this yields KL(teacher ‖ student) = paper Eq. 3. Substituting `p = softmax(z_T/τ)` and `q = softmax(z_S/τ)` gives `Σ softmax(z_T/τ) · (log_softmax(z_T/τ) − log_softmax(z_S/τ)) = KL(softmax(z_T/τ) ‖ softmax(z_S/τ))` = paper Eq. 3 form.
-
-**`torch.compile` acceleration (Stages 2.5 and 5):** When `torch_compile: true` in the stage config, both teacher and student models are compiled via `torch.compile(model, mode="reduce-overhead")` before the KD training loop. On H200 (Hopper architecture), this enables kernel fusion and reduced launch overhead across the MoE dispatch + expert matmul sequence. Expected speedup: 20–40% on forward pass throughput after a one-time ~2–5 min compilation cost. Compilation is skipped when the model uses custom `instrument_experts` hooks (Stage 2's profiling pass), since the monkey-patched forward breaks torch.compile's graph tracing. Quality impact: zero — `torch.compile` produces numerically identical outputs in default mode.
-
-### Hyperparameters (Paper Table 1, §F.3)
-
-| Parameter | Value | Source |
-|-----------|-------|--------|
-| Optimizer | AdamW (`weight_decay=0.0`) | Adapted (paper unspecified — paper §F.3 Table 1 lists no optimizer; AdamW is the project default. `weight_decay=0.0` overrides PyTorch's 0.01 default to avoid regularizing the small router-gate matrix toward zero, since only `mlp.gate.weight` is trainable and there are no other parameters absorbing the decay term.) |
-| Learning rate | **5×10⁻⁵** | Paper Table 1 (implementation previously used 1e-5; corrected to match paper) |
-| Epochs | 1 | Paper |
-| Batch size | 8 | Adapted (paper: 2 with grad-accum=4 → effective 8; spec uses 8 with grad-accum=1, mathematically equivalent). (Loss is per-sequence-normalized by `N_x` per Eq. 3, so microbatch grouping does not rescale individual sequence contributions.) |
-| Gradient accumulation | 1 | Adapted (paper: 4) |
-| **Effective batch size** | **8** | Same as paper (8×1 = 2×4). **Equivalence requires the accumulation reduction policy be `sum`-then-divide-once-by-8 (not per-microbatch `mean` averaged across 4 steps).** Concretely: each microbatch loss is the per-sequence τ²/N_x-normalized KL summed over its sequences; under bs=2/accum=4, the four microbatch summed losses are accumulated by `loss.backward()` (which adds gradients in PyTorch) and the optimizer step divides the accumulated gradient by 8 (= total sequences). Under bs=8/accum=1, the eight summed losses are produced in one microbatch and divided by 8 once. Both produce the same gradient. **If the accumulation uses per-microbatch `mean` averaging, gradients differ by a factor of accum_steps and the equivalence breaks** — implementations must pin sum-style accumulation. |
-| Max sequence length | 512 | Paper |
-| KD temperature (τ) | 1.0 | Paper |
-| Max calibration samples | 3000 | Paper |
-| Teacher precision | BF16 | H200 (141 GB VRAM) fits teacher+student in BF16 with ~15 GB headroom at bs=8. Student is always BF16. |
-| KL sequence chunk size | 512 | H200 (full sequence in one chunk — ~2.4 GB peak). Configurable via `kd_seq_chunk_size` for smaller hardware. |
-| torch.compile | true | H200 Hopper. 20–40% forward pass speedup. Set false for debugging or hardware without compile support. |
-
-### Teacher Loading
-
-**Calibration data:** Nemotron weighted subsets per §2 (D11) — canonical reference is §2; same calibration source as Stages 2 and 2.5.
-
-On H200 (141 GB VRAM), both teacher and student load in BF16 (~70 GB + ~50 GB = ~120 GB). At bs=8 with seq_len=512, vocabulary logits + small KV-cache headroom consume ~6 GB, leaving ~15 GB headroom. Alternatively, precomputed teacher vocabulary logits can be loaded from a cache file (`teacher_logits_cache` config key) to skip the live teacher entirely.
-
-**4-bit teacher fallback (`teacher_load_in_4bit: true`):** loads the teacher via bitsandbytes NF4 quantization (~17 GB live VRAM vs ~70 GB BF16), `compute_dtype=bfloat16`. Use when host VRAM is insufficient for full BF16 teacher (e.g., A100-40G nodes). Marginal logits drift expected (NF4 quantization noise on the teacher logits is small in spot checks); acceptable when accompanied by per-batch teacher logits caching during Stage 5 to avoid running 4-bit forward repeatedly. Mutually exclusive with `teacher_logits_cache` — if both are configured, the cache wins.
-
-Frozen-scope reminder: only `mlp.gate.weight` is trainable at Stage 2.5/5. No Phase C.5-style RMSNorm carve-out applies at Stage 2.5/5; that exception is scoped to Stage 3 only, per §10. Gradients flow through the soft-gating weights of the selected experts during the forward pass (so the router's gate signal reaches the loss); only `mlp.gate.weight` parameter values are updated.
-
-### Resume
-
-Step-boundary checkpointing to `_stage5_partial/step_{N}.pt` (every 100 optimizer steps). Each checkpoint contains router parameter state + optimizer state + the (epoch, batch_idx) cursor. On resume, the optimizer state is restored exactly; the training loop fast-forwards through `resume_batch_i` inclusive (the gradient signal of any batch that was already absorbed into the last checkpointed optimizer step is correctly skipped, not re-applied). (The (epoch, batch_idx) cursor is captured AFTER the optimizer.step() that consumed those batches, so fast-forward through resume_batch_i inclusive cannot drop or double-count any sequence.) Only the two most recent checkpoints are retained.
+<!-- §8 Stage 5 (Router Knowledge Distillation — Final) — CONSUMED by
+     router_kd/plugins/* (commits pending). Full §8 narrative —
+     paper (Router-KD arXiv:2603.02217 §F.3 Eq. 3 Table 1), 4-bit
+     teacher fallback, teacher-logits cache (SHA-256 key), KL
+     direction proof, frozen-scope clauses, batch-size table, vocab
+     guard, hyperparameter table, calibration deviation D11 (SHARED)
+     — all relocated into router_kd/plugins/* module docstrings. -->
 
 ---
 

@@ -1,5 +1,32 @@
 """Early-stop concern (RK-7 of the Router-KD plugin-architecture refactor).
 
+Paper
+-----
+Hyeon & Do, "Is Retraining-Free Enough? The Necessity of Router
+Calibration for Efficient MoE Compression" — arXiv:2603.02217 (§F.3,
+Eq. 3, Table 1). audit/spec_compliance/01_papers/2603.02217/source.md.
+
+Equation 3: the per-batch vocab-KL distillation objective
+    L_KD = KL(softmax(s_t / τ) || softmax(s_s / τ)) · τ²
+where ``s_t``, ``s_s`` are the teacher and student vocabulary logits
+and ``τ`` is the distillation temperature.
+
+§F.3 fixes the calibration data and hyperparameters; Table 1 reports
+the resulting recovery on Mixtral/Qwen-MoE post-pruning/post-merging.
+
+Official code
+-------------
+**None published.** Verified 2026-05: the paper's source.md contains
+no code link; first author Sieun Hyeon (Seoul National University) has
+no public router-KD repo.
+
+Calibration deviation D11 (SHARED with Stage 2 / Stage 2.5)
+-----------------------------------------------------------
+Paper §F.3 Table 1 uses ``c4``. The project uses multi-domain
+Nemotron-Cascade-2-SFT-Data with weighted subsets — task-aware
+calibration better matches target deployment distribution. The D11
+row's canonical owner is :mod:`stage2.plugins.reap_scoring`.
+
 Home of the Router-KD *best-tracker + early-stop* concern — the last
 Router-KD plugin extraction — carved out of the legacy
 ``stage5_router_kd.py`` monolith. RK-7 is a MIXED pattern: one Pattern-A
@@ -126,7 +153,12 @@ class EarlyStopPlugin:
     """
 
     name = "early_stop"
-    paper = "Router Knowledge Distillation (paper 2603.02217, Eq. 3)."
+    paper = (
+        "Router KD vocab-KL distillation Eq. 3 — arXiv:2603.02217 "
+        "(Hyeon & Do); no official code. Concern: best-tracker EMA + best.pt save + patience early-stop. "
+        "Calibration D11 (SHARED — see :mod:`stage2.plugins.reap_scoring`). "
+        "See module docstring."
+    )
     config_key = "stage5_router_kd.early_stop_patience"
     # ``config`` drives the one-time setup (EMA alpha, save_best, patience);
     # ``partial_dir`` is the best.pt / resume-checkpoint directory; ``student``
