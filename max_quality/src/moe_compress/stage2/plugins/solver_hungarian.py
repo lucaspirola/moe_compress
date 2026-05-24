@@ -1,8 +1,66 @@
-"""Hungarian assignment solver (Task 13 of the plugin-architecture refactor).
+"""Hungarian (rectangular linear-sum-assignment) solver.
 
-Plugin home for ``_assign_hungarian`` — the rectangular Hungarian solver backed
-by ``scipy.optimize.linear_sum_assignment``. Extracted verbatim from
-``stage2_reap_ream`` in Task 13.
+Paper
+-----
+Classic linear-sum-assignment algorithm — Kuhn (1955), Munkres (1957);
+implemented via SciPy's ``scipy.optimize.linear_sum_assignment``
+(O(n³) Jonker-Volgenant variant).
+
+This plugin is part of deviation D-mcf-assignment from
+arXiv:2604.04356 (REAM): the project adds an optimal-assignment
+alternative to the paper-faithful descending-saliency greedy (see
+:mod:`stage2.plugins.solver_greedy`). The Hungarian branch handles the
+**slack-capacity** case (``n_children ≤ n_centroids``); the
+capacitated branch dispatches to MCF (see
+:mod:`stage2.plugins.solver_mcf`).
+
+Official code
+-------------
+SciPy ``linear_sum_assignment``: scientific-python/scipy upstream
+implementation (released; standard library). No project-specific
+upstream code to pin.
+
+Deviation: D-mcf-assignment (Hungarian branch)
+----------------------------------------------
+REAM §4 (arXiv:2604.04356) uses descending-saliency single-pass greedy
+with a per-centroid cap (``group_size``) — picks the highest-saliency
+centroid first, absorbs up to ``C_max`` non-centroids by lowest cost.
+Greedy is biased toward the highest-saliency centroid because it picks
+first.
+
+Stage 2 v2 adds
+``assignment_solver: "greedy" | "hungarian" | "mcf" | "auto" | "sinkhorn"``
+(default ``"greedy"`` reproduces v1 bit-identically). The Hungarian
+branch uses ``scipy.linear_sum_assignment`` with ``+∞`` → large-finite
+sentinel for forbidden arcs.
+
+Hungarian is the integer-optimal LP solution for the slack-capacity
+1-1 assignment problem (the transportation polytope is totally
+unimodular — Ahuja-Magnanti-Orlin §9). Synthetic counterexamples
+(STRATEGY_NEXT reviewer report §2) show greedy 28-34 % above the
+optimum on tight-capacity instances. At the project's
+``N = 256, N'_l ∈ [128, 200], C_max = 7`` the gap is expected smaller
+(loose capacity), but Hungarian is essentially free (~10 ms / layer ×
+40 layers).
+
+Capacitated fallback
+--------------------
+When ``n_children > n_centroids`` Hungarian alone cannot solve the
+problem (per-centroid cap > 1 needed). This module imports
+``_assign_mcf`` from :mod:`stage2.plugins.solver_mcf` and falls back
+when ``HungarianSolverPlugin`` is invoked on a tight-capacity layer.
+The ``"auto"`` solver (see :mod:`stage2.plugins.solver_auto`)
+implements this dispatch as a separate plugin.
+
+Output context contract
+-----------------------
+Pure callable plugin (no state). Returns the layer's assignment from
+the input cost matrix + scores + frequencies.
+
+Naming-history note
+-------------------
+Step 3 of the REAM pipeline alternative-solver branch. Existing log
+lines / Trackio keys preserved for dashboard back-compat.
 
 Imports ``_assign_mcf`` from ``solver_mcf`` as the capacitated-case fallback
 (when ``n_children > n_centroids`` Hungarian alone cannot solve the problem).
@@ -78,7 +136,14 @@ class HungarianSolverPlugin:
     """
 
     name = "solver_hungarian"
-    paper = "Rectangular Hungarian assignment solver via scipy."
+    paper = (
+        "Hungarian (Kuhn 1955 / Munkres 1957) rectangular linear-sum-"
+        "assignment via scipy.optimize.linear_sum_assignment. "
+        "Alternative to REAM §4 greedy (see :mod:`stage2.plugins.solver_greedy`); "
+        "implements deviation D-mcf-assignment slack-capacity branch from "
+        "baseline REAM arXiv:2604.04356. Capacitated case falls back to "
+        ":mod:`stage2.plugins.solver_mcf`. See module docstring."
+    )
     config_key = "stage2_reap_ream.assignment_solver"
     # S2-8: the live solve_assignment slot reads the per-bump scratch slots.
     reads: tuple[str, ...] = ("_iter_n_ream_nc", "_iter_n_ream_c")
