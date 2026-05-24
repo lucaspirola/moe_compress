@@ -554,7 +554,12 @@ class EvalEnvironmentPlugin:
         # here so the value lives in ctx for HumanEval/Math500 to consume.
         # We do NOT switch the model here — the switch belongs to the
         # generative plugins (see docstring "Downstream contract"), matching
-        # teacher_provider.py L607-616. Default matches teacher-side default.
+        # teacher_provider.py L607-616.
+        # Default is the YAML/env-var default 'batched_mm' (matches the
+        # student-side initial impl). teacher_provider.py L142-149 documents
+        # a Hopper preference for grouped_mm on PPL/lm_eval; that's a
+        # teacher-side choice and does not constrain the generative-block
+        # default.
         experts_implementation_generative = os.environ.get(
             "EXPERTS_IMPLEMENTATION_GENERATIVE", "batched_mm"
         )
