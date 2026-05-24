@@ -30,8 +30,10 @@ across datasets" claim is at source.md line 405-406.
 Official implementation (golden reference)
 ------------------------------------------
 ``github.com/ZunhaiSu/Super-Experts-Profilling`` pinned to commit
-``573aead3127ae593ba267758b832944f8fed1485`` (default branch ``main``
-HEAD, dated 2025-09-25). Two artefacts matter for this plugin:
+``573aead3127ae593ba267758b832944f8fed1485`` (dated 2025-09-25; the
+SHA is the authoritative pin — branch labels may move). Two artefacts
+matter for this plugin (line numbers verified against the pinned raw
+source on 2026-05-24):
 
 * ``run.py:28`` declares the CLI flag
   ``--include_layers type=float default=0.75``.
@@ -60,7 +62,45 @@ massive activation — not merely propagating one that formed earlier.
 The detector is primary; the 0.75-depth heuristic is the secondary
 fallback when the dynamic detector returns ∅.
 
-* **First MoE layer** (no predecessor to compare): absolute-outlier
+Documented deviations from Algorithm 1 Stage 1 as written
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+1. **L is restricted to MoE layers (not all decoder layers).**
+   Algorithm 1 Stage 1 line 7 reads "for each layer l in the model";
+   this plugin's outer loop iterates only the model's MoE layers
+   (``sorted_moe_layer_indices``). This narrowing is safe because
+   Algorithm 1 Stage 2 (source.md lines 1978-2003) loops
+   ``for each layer l ∈ L`` and SEs are defined as
+   ``(layer, expert)`` tuples — non-MoE layers have no experts and
+   thus cannot host an SE. ``L`` is therefore a subset of MoE layers
+   by construction; dense / linear-attention decoder layers are
+   excluded from candidacy without loss of paper-defined SE coverage.
+2. **Asymmetric predecessor choice for the two growth signals.**
+   The residual-stream growth ratio uses the *physically adjacent*
+   decoder layer (``l-1`` in decoder-index order, which may be a dense
+   or linear-attention layer in hybrid architectures such as
+   DeepSeek-V2-Lite or Qwen3.5/3.6). The MoE-output growth ratio uses
+   the *logically adjacent* MoE layer (``prev_moe_idx`` in
+   sorted-MoE-index order — possibly several decoder layers earlier).
+   Rationale: the residual stream is a continuous signal across every
+   decoder layer (each layer reads from and writes to it), so the
+   physical neighbour is the only correct denominator for measuring
+   residual growth. The MoE branch only exists at MoE layers and is
+   undefined at intermediate dense / linear-attention layers, so its
+   growth must be measured against the previous *MoE* output. This
+   asymmetry is intentional, not an oversight.
+3. **First-MoE-layer fallback wording.** The "no predecessor"
+   absolute-outlier check below applies when there is no preceding
+   *MoE* layer (i.e. for the first MoE layer in
+   ``sorted_moe_layer_indices``); preceding *decoder* layers may
+   still exist (and typically do — most architectures have dense
+   layers before the first MoE block). The fallback is needed because
+   the MoE-output growth ratio is undefined when there is no prior
+   MoE output to compare against; the residual-growth ratio could be
+   computed but the absolute outlier check is the unified first-MoE
+   rule.
+
+* **First MoE layer** (no preceding MoE layer; preceding dense /
+  linear-attention decoder layers may still exist): absolute-outlier
   check — ``max|H_l(x)| > _MA_RATIO × Q_99(|H_l(x)|)``. The LHS is the
   max magnitude across all calibration tokens; the RHS is the 99th
   percentile across all token magnitudes seen during the pass.
@@ -125,6 +165,22 @@ Sampling parameters (project-chosen — paper does not prescribe)
   saturates the per-layer max accumulator at low cost; the AIMER paper
   (arXiv:2603.18492) calibration-sensitivity figure reports < 5%
   Frobenius drift between 1024 and 4000 samples.
+
+Memory cost of the first-MoE-layer Q99 buffer
+---------------------------------------------
+The first-MoE-layer absolute-outlier check requires the 99th
+percentile of ``|H_l(x)|`` across all calibration tokens at the first
+MoE layer; ``first_layer_q99_buffer`` accumulates every batch's
+flattened ``|H_l|`` array on CPU as float32. For a 1024-sample
+calibration set at seq_len=2048 and hidden=4096 this is
+``1024 × 2048 × 4096 × 4 B ≈ 34 GiB`` of pinned host RAM at peak (the
+final ``np.concatenate`` doubles it transiently). A streaming-quantile
+approximation (T-digest / P-square) would reduce this to O(1) memory,
+but would change the byte-level output of the golden snapshot
+(``tests/test_stage1_golden_snapshot.py``). The exact-percentile
+implementation is intentional; operators running on small-RAM hosts
+should reduce ``num_calibration_samples`` or run on a host with ≥ 64
+GiB of RAM.
 
 Output context slots
 --------------------
@@ -197,7 +253,10 @@ def _phase_a_progress_cb(n_total: int, log_every: int = 64):
     """
     def _cb(i: int) -> None:
         n_done = i + 1
-        if log_every > 0 and n_done % log_every == 0:
+        # Emit on the periodic modulo tick AND on the final batch — short runs
+        # (n_total < log_every, or n_total not a multiple of log_every)
+        # would otherwise see no Trackio progress at all.
+        if log_every > 0 and (n_done % log_every == 0 or n_done == n_total):
             _trackio_log({
                 "stage1/phase_a/calibration_progress": n_done / n_total,
                 "stage1/phase_a/calibration_step": n_done,
@@ -379,14 +438,26 @@ def _detect_ma_layers(
     """Forward pass 1: identify MA-formation layers via dual-signal OR rule.
 
     Returns (L, residual_growth, moe_output_growth, moe_output_max):
-      L                   — set of MA-formation layer indices.
-      residual_growth     — per-MoE-layer max|H_l|/max|H_{l-1}| (residual stream).
-                            First MoE layer entry is float('nan') (no predecessor).
-      moe_output_growth   — per-MoE-layer max|MoE_l|/max|MoE_{l-1}| (post-routing-weighted-sum,
-                            pre-residual-add). First MoE layer entry is 0.0 (no predecessor).
+      L                   — set of MA-formation layer indices (subset of MoE
+                            layer indices; see module-docstring deviation #1).
+      residual_growth     — per-MoE-layer max|H_l|/max|H_{l-1}| where l-1 is
+                            the *physically adjacent decoder layer* in
+                            ``sorted_decoder_layer_indices`` order — may be a
+                            dense / linear-attention layer in hybrid models
+                            (see module-docstring deviation #2). First MoE
+                            layer entry is float('nan') (no predecessor at
+                            all).
+      moe_output_growth   — per-MoE-layer max|MoE_l|/max|MoE_{prev_moe}| where
+                            prev_moe is the *logically adjacent MoE layer* in
+                            ``sorted_moe_layer_indices`` order (possibly
+                            several decoder positions earlier — see
+                            module-docstring deviation #2). Post-routing-
+                            weighted-sum, pre-residual-add. First MoE layer
+                            entry is 0.0 (no prior MoE output).
       moe_output_max      — per-MoE-layer raw max|MoE_l| (for diagnostics).
 
-    See the module docstring (Paper / Deviation sections) for the OR rule rationale.
+    See the module docstring (Paper / Deviation sections) for the OR rule
+    rationale and the full predecessor-choice asymmetry argument.
     """
     sorted_moe_layer_indices = sorted(ref.layer_idx for ref in moe_layers)
     if not sorted_moe_layer_indices:
@@ -464,6 +535,9 @@ def _detect_ma_layers(
     residual_growth: dict[int, float] = {}
     moe_output_growth: dict[int, float] = {}
     decoder_index_pos = {idx: pos for pos, idx in enumerate(sorted_decoder_layer_indices)}
+    # O(1) MoE-index-to-position lookup; previously used list.index() inside
+    # the loop, which was O(N²) overall.
+    moe_index_pos = {idx: pos for pos, idx in enumerate(sorted_moe_layer_indices)}
 
     for layer_idx in sorted_moe_layer_indices:
         if layer_idx == first_moe_layer_idx:
@@ -485,7 +559,7 @@ def _detect_ma_layers(
         res_ratio = (layer_max[layer_idx] / prev_max) if prev_max > 0 else 0.0
         residual_growth[layer_idx] = res_ratio
         # MoE ratio against the previous MoE layer in the sorted order
-        prev_moe_pos = sorted_moe_layer_indices.index(layer_idx) - 1
+        prev_moe_pos = moe_index_pos[layer_idx] - 1
         prev_moe_idx = sorted_moe_layer_indices[prev_moe_pos]
         prev_moe_max = moe_block_max[prev_moe_idx]
         moe_ratio = (moe_block_max[layer_idx] / prev_moe_max) if prev_moe_max > 0 else 0.0
