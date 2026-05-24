@@ -80,11 +80,11 @@ Two ctx slots are populated by ``setup_environment`` for that purpose:
 Failure to honor either contract is benign while
 ``experts_implementation=batched_mm`` and ``torch_compile=false``.
 Note that ``experts_implementation`` defaults to ``'batched_mm'`` as an
-in-code fallback when the YAML key is absent (line 549); production YAML
-(``configs/qwen36_35b_a3b_30pct.yaml`` L519) pins it to ``'grouped_mm'``
+in-code fallback when the YAML key is absent (line 553); production YAML
+(``max_quality/configs/qwen36_35b_a3b_30pct.yaml`` L519) pins it to ``'grouped_mm'``
 for Hopper-fast paths, and that file also enables ``torch_compile=true``
 and points Hopper PPL/lm_eval defaults toward ``grouped_mm`` per
-``configs/qwen36_35b_a3b_30pct.yaml`` L519-522 (stage6_validate.experts_implementation: grouped_mm Hopper-fast comment).
+``max_quality/configs/qwen36_35b_a3b_30pct.yaml`` L519-522 (stage6_validate.experts_implementation: grouped_mm Hopper-fast comment).
 
 Circular-import contract (mirror of ``router_kd/plugins/trainable_scope.py``):
 this module imports only from ``..context`` / stdlib / torch — NEVER from
@@ -519,7 +519,7 @@ class EvalEnvironmentPlugin:
 
           Failure to do this leaves whichever PPL/lm_eval experts impl is
           active during generate; ``grouped_mm`` (Hopper PPL/lm_eval
-          default per ``configs/qwen36_35b_a3b_30pct.yaml`` L519-522
+          default per ``max_quality/configs/qwen36_35b_a3b_30pct.yaml`` L519-522
           (stage6_validate.experts_implementation: grouped_mm Hopper-fast
           comment)) crashes on B=1 decode-shape on cu130.
 
@@ -560,7 +560,7 @@ class EvalEnvironmentPlugin:
         # generative plugins (see docstring "Downstream contract"), matching
         # teacher_provider.py L607-616.
         # Default is the YAML/env-var default 'batched_mm' (matches the
-        # student-side initial impl). configs/qwen36_35b_a3b_30pct.yaml
+        # student-side initial impl). max_quality/configs/qwen36_35b_a3b_30pct.yaml
         # L519-522 (stage6_validate.experts_implementation: grouped_mm
         # Hopper-fast comment) documents a Hopper preference for grouped_mm
         # on PPL/lm_eval; that's a teacher-side choice and does not
