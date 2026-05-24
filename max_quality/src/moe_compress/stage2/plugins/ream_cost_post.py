@@ -41,9 +41,9 @@ Hungarian permutation ``P_cm`` is computed once per ``(c, m)`` pair via
 
 The whitened residual measures merge error in the directions that
 actually carry calibration signal (AA-SVD lineage, arXiv:2604.02119,
-already used by Stage 3). Explicitly **not** AIM (arXiv:2502.02421),
-whose actual formulation uses per-channel diagonal scaling by
-``mean(‖x_i‖)`` — a different scheme.
+already used by Stage 3). Explicitly **not** AIM — a different
+activation scheme; AIM's formulation is documented in
+arXiv:2502.02421.
 
 The K-prefilter (``cost_topk_filter``, default 48) bounds the per-pair
 Hungarian compute: per non-centroid ``m``, only the top-K candidate
@@ -206,98 +206,98 @@ def _post_alignment_cost(
     # nn.Parameters' requires_grad=True does not poison the .numpy() calls
     # in _permutation_align_to_centroid.
     with torch.no_grad():
-     for ci in range(n_nc):
-        m_id = noncentroid_ids[ci]
-        # Top-K centroid indices by cheap cost (smallest first).
-        # If n_c <= K, we score all centroids.
-        k = min(topk, n_c)
-        top_cj = np.argpartition(cheap_cost[ci], k - 1)[:k]
-        for cj in top_cj:
-            cj = int(cj)
-            c_id = centroid_ids[cj]
-            cache_key = (li, c_id, m_id)
-            cached = perm_cache.get(cache_key) if perm_cache is not None else None
-            # When EM provides a tentative merged centroid weight, the cache
-            # entry for the original centroid is stale — recompute against
-            # the tentative weights instead. F3 fix: single boolean gates
-            # both the residual-reuse and perm-reuse branches so they cannot
-            # diverge under future refactors.
-            tentative_active = (
-                tentative_centroid_weights is not None
-                and c_id in tentative_centroid_weights
-            )
-            cache_usable = (cached is not None) and not tentative_active
-            if cache_usable and cached[1] is not None:
-                # Already computed — reuse both perm and residual.
-                residual = cached[1]
-            else:
-                if tentative_active:
-                    tw = tentative_centroid_weights[c_id]  # type: ignore[index]
-                    ref_gate = tw["gate_proj"].to(torch.float32)
-                    ref_up   = tw["up_proj"].to(torch.float32)
-                    ref_down = tw["down_proj"].to(torch.float32)
+        for ci in range(n_nc):
+            m_id = noncentroid_ids[ci]
+            # Top-K centroid indices by cheap cost (smallest first).
+            # If n_c <= K, we score all centroids.
+            k = min(topk, n_c)
+            top_cj = np.argpartition(cheap_cost[ci], k - 1)[:k]
+            for cj in top_cj:
+                cj = int(cj)
+                c_id = centroid_ids[cj]
+                cache_key = (li, c_id, m_id)
+                cached = perm_cache.get(cache_key) if perm_cache is not None else None
+                # When EM provides a tentative merged centroid weight, the cache
+                # entry for the original centroid is stale — recompute against
+                # the tentative weights instead. F3 fix: single boolean gates
+                # both the residual-reuse and perm-reuse branches so they cannot
+                # diverge under future refactors.
+                tentative_active = (
+                    tentative_centroid_weights is not None
+                    and c_id in tentative_centroid_weights
+                )
+                cache_usable = (cached is not None) and not tentative_active
+                if cache_usable and cached[1] is not None:
+                    # Already computed — reuse both perm and residual.
+                    residual = cached[1]
                 else:
-                    ref_gate = banks["gate_proj"].get(c_id).to(torch.float32)
-                    ref_up   = banks["up_proj"].get(c_id).to(torch.float32)
-                    ref_down = banks["down_proj"].get(c_id).to(torch.float32)
-                child_gate = banks["gate_proj"].get(m_id).to(torch.float32)
-                child_up   = banks["up_proj"].get(m_id).to(torch.float32)
-                child_down = banks["down_proj"].get(m_id).to(torch.float32)
+                    if tentative_active:
+                        tw = tentative_centroid_weights[c_id]  # type: ignore[index]
+                        ref_gate = tw["gate_proj"].to(torch.float32)
+                        ref_up   = tw["up_proj"].to(torch.float32)
+                        ref_down = tw["down_proj"].to(torch.float32)
+                    else:
+                        ref_gate = banks["gate_proj"].get(c_id).to(torch.float32)
+                        ref_up   = banks["up_proj"].get(c_id).to(torch.float32)
+                        ref_down = banks["down_proj"].get(c_id).to(torch.float32)
+                    child_gate = banks["gate_proj"].get(m_id).to(torch.float32)
+                    child_up   = banks["up_proj"].get(m_id).to(torch.float32)
+                    child_down = banks["down_proj"].get(m_id).to(torch.float32)
 
-                ref_act   = ream_acc.get_neuron_mean(li, c_id) if ream_acc else None
-                child_act = ream_acc.get_neuron_mean(li, m_id) if ream_acc else None
+                    ref_act   = ream_acc.get_neuron_mean(li, c_id) if ream_acc else None
+                    child_act = ream_acc.get_neuron_mean(li, m_id) if ream_acc else None
 
-                # When the tentative-centroid override is active, the cached
-                # perm is stale (it was computed against the original centroid
-                # weights) — recompute against the tentative weights.
-                if cache_usable:
-                    perm = cached[0]
-                else:
-                    perm = _permutation_align_to_centroid(
-                        ref_gate, ref_up, child_gate, child_up,
-                        ref_act_mean=ref_act, child_act_mean=child_act,
+                    # When the tentative-centroid override is active, the cached
+                    # perm is stale (it was computed against the original centroid
+                    # weights) — recompute against the tentative weights.
+                    if cache_usable:
+                        perm = cached[0]
+                    else:
+                        perm = _permutation_align_to_centroid(
+                            ref_gate, ref_up, child_gate, child_up,
+                            ref_act_mean=ref_act, child_act_mean=child_act,
+                        )
+
+                    # Whitening still uses the *centroid's own* covariance even
+                    # when the tentative-centroid weights replace the centroid's
+                    # row in the residual computation. The covariance is a property
+                    # of which input distribution the centroid sees post-merge,
+                    # which is approximated by A_c (the original centroid's input
+                    # statistics). Using A_c here keeps the whitening consistent
+                    # across EM rounds; otherwise we'd need to recompute A from
+                    # scratch each round.
+                    a_sqrt_gate_up = _get_a_sqrt(c_id, "gate_proj")
+                    a_sqrt_down    = _get_a_sqrt(c_id, "down_proj")
+                    residual = _aligned_whitened_residual(
+                        ref_gate=ref_gate, ref_up=ref_up, ref_down=ref_down,
+                        child_gate=child_gate, child_up=child_up, child_down=child_down,
+                        perm=perm,
+                        a_sqrt_gate_up=a_sqrt_gate_up,
+                        a_sqrt_down=a_sqrt_down,
+                        whitening_mode=whitening_mode,
                     )
 
-                # Whitening still uses the *centroid's own* covariance even
-                # when the tentative-centroid weights replace the centroid's
-                # row in the residual computation. The covariance is a property
-                # of which input distribution the centroid sees post-merge,
-                # which is approximated by A_c (the original centroid's input
-                # statistics). Using A_c here keeps the whitening consistent
-                # across EM rounds; otherwise we'd need to recompute A from
-                # scratch each round.
-                a_sqrt_gate_up = _get_a_sqrt(c_id, "gate_proj")
-                a_sqrt_down    = _get_a_sqrt(c_id, "down_proj")
-                residual = _aligned_whitened_residual(
-                    ref_gate=ref_gate, ref_up=ref_up, ref_down=ref_down,
-                    child_gate=child_gate, child_up=child_up, child_down=child_down,
-                    perm=perm,
-                    a_sqrt_gate_up=a_sqrt_gate_up,
-                    a_sqrt_down=a_sqrt_down,
-                    whitening_mode=whitening_mode,
-                )
+                    # Only persist to the cache when the residual reflects the
+                    # *original* centroid weights (no tentative override). The
+                    # tentative residual is per-EM-round and would be stale by
+                    # the time the merge step consumes it.
+                    if perm_cache is not None and not tentative_active:
+                        perm_cache.put(cache_key, perm, residual)
 
-                # Only persist to the cache when the residual reflects the
-                # *original* centroid weights (no tentative override). The
-                # tentative residual is per-EM-round and would be stale by
-                # the time the merge step consumes it.
-                if perm_cache is not None and not tentative_active:
-                    perm_cache.put(cache_key, perm, residual)
+                if asymmetric:
+                    # freq is guaranteed non-None here by the precondition check
+                    # at the top of _post_alignment_cost.
+                    assert freq is not None
+                    f_c = max(int(freq.get(c_id, 0)), 0)
+                    f_m = max(int(freq.get(m_id, 0)), 0)
+                    denom = f_c + f_m
+                    if denom > 0:
+                        factor = f_m / denom
+                    else:
+                        factor = 0.5  # both zero — neutral
+                    residual = residual * factor
 
-            if asymmetric:
-                # freq is guaranteed non-None here by the precondition check
-                # at the top of _post_alignment_cost.
-                assert freq is not None
-                f_c = max(int(freq.get(c_id, 0)), 0)
-                f_m = max(int(freq.get(m_id, 0)), 0)
-                denom = f_c + f_m
-                if denom > 0:
-                    factor = f_m / denom
-                else:
-                    factor = 0.5  # both zero — neutral
-                residual = residual * factor
-
-            out[ci, cj] = float(residual)
+                out[ci, cj] = float(residual)
 
     return out
 
