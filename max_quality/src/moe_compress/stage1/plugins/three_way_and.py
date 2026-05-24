@@ -24,8 +24,8 @@ criterion as the loop body:
             S ← S ∪ {(l, e)}
 
 The ``l ∈ L`` factor is enforced one nesting level up — Algorithm 1
-line 16 ``for each layer l ∈ L`` — so it does not appear inside the
-inner ``if``. The paper's two renderings (§3.2.1 prose with ``l ∈ L``
+step 16 (source.md:1981) ``for each layer l ∈ L`` — so it does not
+appear inside the inner ``if``. The paper's two renderings (§3.2.1 prose with ``l ∈ L``
 inside Eq. 6, and Algorithm 1's pseudocode with ``l ∈ L`` at the
 layer-loop header) are mathematically equivalent.
 
@@ -93,12 +93,14 @@ improvement over the paper's fixed value.
 
 **D-amax-mult-real-vs-floor — real multiplication, not floor-divide**.
 
-* Paper Algorithm 1 line 28 uses real division: ``a_{l,e} > (1/10)·a_max``.
-* Official code (``eval_utils.py:642``) uses Python integer
-  floor-divide on a NumPy scalar: ``np.max(output_max_values) // 10``
-  — which produces a different threshold whenever ``a_max`` is not
-  a multiple of 10 (e.g., ``a_max=99.7`` → paper threshold 9.97,
-  official threshold 9.0; the official threshold is *looser*).
+* Paper Algorithm 1 step 28 (source.md:1997-1999) uses real division:
+  ``a_{l,e} > (1/10)·a_max``.
+* Official code (``eval_utils.py:642``) uses NumPy floor-divide
+  (``//``) on a float scalar: ``np.max(output_max_values) // 10``,
+  which returns ``floor(a_max / 10)`` — looser than the paper's real
+  ``a_max/10`` whenever ``a_max`` is not a multiple of 10
+  (e.g., ``a_max=99.7`` → paper threshold 9.97, official threshold
+  ``np.float64(9.0)``; the official threshold is *looser*).
 * Implementation follows the paper: ``a_max_threshold =
   a_max_fraction * a_max`` (real ``float`` multiplication, see
   ``run`` below). This was a deliberate choice: the paper's
