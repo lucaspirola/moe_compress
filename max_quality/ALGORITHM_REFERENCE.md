@@ -378,7 +378,7 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
      ablation_filter; (5) num_calibration_samples → SHARED across Stage 1
      plugins. Resolve items (3)–(5) in Phase 9 when their owning plugins are
      processed. -->
-| D-ma-detector (items 3-5 — sampling caps, batch sizes, num_calibration_samples) | 1 | <!-- SHARED — re-check at end --> | <!-- SHARED — items (3)-(5) of the original row remain; items (1)-(2) consumed by ma_detection --> | The 3.0 / 2.0 detector thresholds (item 1) and the 0.75 fallback (item 2) are now documented in the `ma_detection` plugin docstring; this row retains only the cross-plugin sampling items. | Resolve in Phase 9. |
+<!-- D-ma-detector items 3-5 (sampling caps, batch sizes, num_calibration_samples) — CONSUMED by stage1/__init__.py (cross-stage Stage 1 narrative) + stage1/plugins/ablation_filter.py (bs=8 archaeology). -->
 <!-- D-se-blacklist-merge — CONSUMED by stage1/plugins/grape_merge.py (commit pending). -->
 <!-- D-grape-restart-merge (lag-corrected post-selection restart) — CONSUMED by stage1/plugins/grape_merge.py (commit pending). -->
 <!-- D5a — CONSUMED by stage2/plugins/layer_merge.py (commit pending). -->
@@ -397,17 +397,17 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 <!-- D-expert-distill-mse — CONSUMED by stage2/plugins/expert_distill.py (commit pending). -->
 <!-- D-expert-distill-mse-v1 — CONSUMED by stage2/plugins/expert_distill.py (commit pending). -->
 <!-- D-sinkhorn-soft-assign — CONSUMED by stage2/plugins/solver_sinkhorn.py (commit pending). -->
-| D-protocol-blend | 2.5 | Protocol combination: REAM + Router KD in sequence | 2604.04356 (REAM): explicitly evaluates "without any fine-tuning after compression"; 2603.02217 (Router KD): designed as a standalone step, not as a post-REAM patch | Spec applies Router KD (Stage 2.5) immediately after the REAM merge | Router KD restores routing accuracy degraded by weight averaging; REAM's static evaluation does not cover post-merge routing drift. Combined protocol not ablated against REAM-static-only baseline: empirical_pending |
+<!-- D-protocol-blend — CONSUMED by router_kd/__init__.py + router_kd/plugins/merge_repair.py (commit pending). -->
 <!-- D6 — CONSUMED by stage3/plugins/covariance_collection.py (commit pending). -->
-| D-AASVD-objective | 3 | AA-SVD primary objective variant | 2604.02119 §4.3 Table 5 recommends input-aware (A=B=X, Corollary 3.3 with pre-prune covariance) + block refinement as primary recipe (PPL 6.89 at ρ=0.8 LLaMA-7B) | Spec uses anchored-adaptive (A=X_pre, B=X_post, Theorem 3.2) + block refinement (Path 1). Quality gap ~0.2 PPL at ρ=0.8 on LLaMA-7B; Qwen3-30B-A3B comparison empirical_pending. | Anchored-adaptive is the paper's central theoretical contribution and expected to outperform in high-compression regimes where upstream drift is larger; empirical validation on Qwen3-30B-A3B pending |
+<!-- D-AASVD-objective — CONSUMED by stage3/plugins/aa_svd_factor.py (commit pending). -->
 <!-- D7 — CONSUMED by stage3/plugins/d_rank_allocate.py (commit pending). -->
 <!-- D7a — CONSUMED by stage3/plugins/d_rank_allocate.py (commit pending). -->
 <!-- D8 — CONSUMED by stage3/plugins/swift_svd_alpha.py (commit pending). -->
 <!-- D-eps-star — CONSUMED by stage3/plugins/swift_svd_alpha.py (commit pending). -->
 <!-- D10 — CONSUMED by stage4/plugins/eora_compensation.py (commit pending). -->
 <!-- D-eora-budget-pct — CONSUMED by stage4/plugins/eora_compensation.py (commit pending). -->
-| D11 | 2, 2.5, 5 | Calibration data source | 2603.02217 §F.3 Table 1: c4; 2510.13999 §4: c4 + evol-codealpaca (used identically across all experiments) | Multi-domain Nemotron-Cascade-2-SFT-Data with weighted subsets (chat 0.56, math 0.21, science 0.11, etc.) | Task-aware calibration better matches target deployment distribution; c4 and evol-codealpaca are general pre-training / instruction-tuning data with limited reasoning/code coverage relative to the target deployment mix |
-| D-cal-size | 2 | Calibration sequence count | 2604.04356 §4: 3072 sequences × 512 tokens (1.57M tokens total); 2510.13999: 1024 sequences × 2048 tokens (2.1M tokens total) | 4000 sequences × 2048 tokens (8.19M tokens total) (Nemotron weighted subsets) | Exceeds both papers' calibration volumes (5.2× REAM in tokens, 3.9× REAP in tokens); longer 2048-token sequences match the deployment context length and capture more inter-token routing patterns per sequence. Task-aware Nemotron dataset documented in D11 |
+<!-- D11 — CONSUMED by stage2/plugins/reap_scoring.py (commit pending); cross-referenced from router_kd/plugins/*. -->
+<!-- D-cal-size — CONSUMED by stage2/plugins/reap_scoring.py (commit pending). -->
 <!-- D-aimer-cross-check — CONSUMED by stage1/plugins/aimer.py (commit pending). -->
 
 <!-- D-sink-token-routing — CONSUMED by stage1/plugins/sink_token.py (commit pending). -->

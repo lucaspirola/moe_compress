@@ -1,10 +1,41 @@
 """Stage 2 partial-dir discovery for crash-resume.
 
-Extracted from ``stage2_reap_ream.run()`` in Task 2 of the plugin-architecture
-refactor. This module owns the *file IO half* of resume: scan ``partial_dir``,
-delete orphan ``layer_*.pt`` files whose ``merge_*.json`` is absent, parse each
-completed layer's JSON, optionally load the per-expert neuron-mean artefact,
-and return one ``ResumedLayerRecord`` per completed layer.
+Paper / spec source
+--------------------
+No paper. Project-original durability + crash-resume contract,
+covering Stage 2's per-layer atomic checkpointing.
+
+Durability invariants (project-wide; all stages):
+
+  - **Atomic writes via ``.tmp + os.replace``** — every artifact is
+    written to ``<name>.tmp`` then renamed in one syscall to ``<name>``.
+    A crash mid-write leaves at most one ``.tmp`` file (cleaned up on
+    the next run start) and never a half-written ``<name>``.
+  - **`.pt` before `.json` ordering invariant** — for any layer, the
+    binary checkpoint (``layer_{idx}.pt``) must be persisted to disk
+    BEFORE the manifest JSON (``merge_{idx}.json``). A crash between
+    the two leaves an orphan ``.pt`` file with no JSON — orphans are
+    safe to delete (no manifest = no completed-layer claim). The
+    inverse ordering would risk a JSON claim with a missing/corrupt
+    ``.pt``.
+  - **Strict format-version match on resume** — the resume code
+    refuses to mix v1 and v2 partial directories within a single run.
+    Operators upgrading mid-pipeline must finish a stage on one
+    version or restart cleanly.
+
+What this module owns: the *file IO half* of resume — scan
+``partial_dir``, delete orphan ``layer_*.pt`` files whose
+``merge_*.json`` is absent, parse each completed layer's JSON,
+optionally load the per-expert neuron-mean artefact, and return one
+``ResumedLayerRecord`` per completed layer.
+
+What stays in :mod:`stage2.plugins.layer_merge`: the *model-mutation
+half* — re-applying the merge in-place, resizing the router, reloading
+covariance + heal weights into the live model.
+
+Original module-header note: extracted from
+``stage2_reap_ream.run()`` in Task 2 of the plugin-architecture
+refactor.
 
 The *model-mutation half* (re-applying the merge in-place, resizing the router,
 reloading covariance + heal weights into the live model) stays in

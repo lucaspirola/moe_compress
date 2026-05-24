@@ -1,8 +1,24 @@
-"""Activation-aware covariance whitening helpers for Stage 2 v2.
+"""Activation-aware covariance whitening helpers — AA-SVD eigen-square-root.
 
-This module provides the eigen-square-root of an input-covariance matrix used
-to weight the Stage 2 v2 post-alignment cost matrix per the AA-SVD lineage
-(arXiv 2604.02119; cited by upstream ALGORITHM_REFERENCE.md § 6).
+Paper
+-----
+"AA-SVD: Activation-Aware SVD with Cross-Covariance Calibration" —
+arXiv:2604.02119. Official code: ``atulkumarin/AA-SVD`` @ commit
+``1fa1b686cd9b13a77607a676564e37d438a176c8``.
+
+Consumer plugins:
+- :mod:`stage2.plugins.ream_cost_post` — deviation D-whitened-cost.
+- :mod:`stage3.plugins.covariance_collection` /
+  :mod:`stage3.plugins.aa_svd_factor` /
+  :mod:`stage3.plugins.swift_svd_alpha` — AA-SVD Theorem 3.2 /
+  Corollary 3.3 + Swift-SVD ε* (deviations D6, D-eps-star,
+  D-no-intra-block-cascade).
+- :mod:`stage4.plugins.eora_compensation` — EoRA Algorithm 1 √Λ
+  projection (paper arXiv:2410.21271).
+
+Original module header retained below.
+
+Activation-aware covariance whitening helpers for Stage 2 v2.
 
 The cost being minimized at the merge step is::
 

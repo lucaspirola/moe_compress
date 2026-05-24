@@ -1,4 +1,38 @@
-"""Budget decomposition solver: splits a configurable compression target between expert pruning and SVD rank reduction.
+"""Budget decomposition solver — splits a target into ep:sp via project heuristic.
+
+Paper
+-----
+**No paper.** Project-original heuristic. The analytical starting point
+and iterative scaling rule below are not derived from any cited paper;
+they are an engineering layer that converts a target compression ratio
+(params or VRAM) into a per-stage parameter budget consumed by
+:mod:`stage1`-:mod:`stage3`. Because this is glue, not a divergence
+*from* a paper, no §12 D-row is warranted.
+
+Algorithm overview
+------------------
+Given a ``target_total_reduction`` (e.g. 0.30) and an
+``expert_svd_ratio`` (e.g. 2.0 meaning pruning removes 2× the params
+SVD removes), the solver iteratively finds
+``(expert_prune_ratio, svd_rank_ratio)`` such that the projected total
+savings hits the target within a 0.5 % tolerance:
+
+  1. Analytical starting point:
+     ``sp ≈ target × total_params / (expert_params × (ratio + 1))``.
+  2. Project savings: ``ep × expert_params`` → surviving experts →
+     ``after_prune × (1 − sp)`` → total savings.
+  3. If outside tolerance, scale both knobs by ``target / projected``,
+     maintaining the ep:sp ratio exactly.
+  4. Converges in ≤ 3 iterations for typical targets.
+
+Floor constraints: no layer can go below ``min_experts_per_layer``
+(default: ``num_routed_experts // 2`` = 128 for 256-expert layers) or
+below the number of blacklisted experts. The solver enforces these
+when projecting the expert budget.
+
+Original module header retained below.
+
+Budget decomposition solver: splits a configurable compression target between expert pruning and SVD rank reduction.
 
 The total-reduction target is met by compounding two knobs.  As a
 *simplified approximation* (before discretisation):

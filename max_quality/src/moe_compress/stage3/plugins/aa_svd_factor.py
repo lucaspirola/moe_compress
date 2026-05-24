@@ -57,6 +57,24 @@ the practical gap; the paper itself reports that Phase C.5
 line 5 cascade. Trade-off accepted; revisit if Stage 6 PPL regresses
 on a future architecture port.
 
+Deviation: D-AASVD-objective — anchored-adaptive vs paper's input-aware
+---------------------------------------------------------------------
+Paper §4.3 Table 5 recommends **input-aware** (``A = B = X``,
+Corollary 3.3 with pre-prune covariance) + block refinement as the
+primary recipe (PPL 6.89 at ρ=0.8 on LLaMA-7B).
+
+This plugin uses **anchored-adaptive** (``A = X_pre``, ``B = X_post``,
+Theorem 3.2 Path 1) + block refinement. Quality gap is ~0.2 PPL at
+ρ=0.8 on LLaMA-7B per the paper's Table 5 comparison; Qwen3-30B-A3B
+comparison is empirical_pending.
+
+Rationale: anchored-adaptive is the paper's central theoretical
+contribution and is expected to outperform input-aware in
+high-compression regimes where upstream activation drift is larger.
+The project compresses to ρ ≈ 0.7 (30 % total reduction), where
+the gap is observable but not large; the choice is empirically
+contingent and revisitable once Stage 6 evals are available.
+
 Naming-history note
 -------------------
 "Phase C" (legacy Stage 3 monolith terminology) is naming-historical.

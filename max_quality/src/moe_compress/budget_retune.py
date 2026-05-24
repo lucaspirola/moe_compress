@@ -1,4 +1,33 @@
-"""Direction A — retune the per-layer expert budget against *measured* Stage-2 damage.
+"""Damage-aware retune of GRAPE per-layer expert budget against measured Stage-2 merge cost.
+
+Paper
+-----
+**No paper.** Project-original tool — STRATEGY_NEXT "Direction A". The
+baseline Stage 1 GRAPE allocation (see :mod:`stage1.plugins.grape_merge`,
+arXiv:2604.06542) uses CKA-redundancy + entropy gate; this retune
+re-solves the per-layer budget against the *measured* Stage-2 REAM
+merge cost so high-damage layers can keep more experts (and
+low-damage layers donate).
+
+Official code
+-------------
+None — Direction A is project-original. Documented at
+``STRATEGY_NEXT.md`` §A in the project root.
+
+Why a re-solve and not a conserved-per-layer-total knapsack
+-----------------------------------------------------------
+The original Direction A held the total kept-expert count fixed and
+shifted single experts between layers that already carried a damage
+signal. That proved to be a structural no-op: GRAPE hard-floors every
+merged layer at ``N // 2`` and the retune floor was also ``N // 2``,
+so no merged layer could donate; meanwhile the layers GRAPE protected
+at ``N`` carry no damage signal at all (they had no merges). Direction
+A v2 re-solves the **global** budget under the GRAPE entropy gate
+biased by per-layer ``mean_cost_per_pair``.
+
+Original module header retained:
+
+Direction A — retune the per-layer expert budget against *measured* Stage-2 damage.
 
 Stage 1 (GRAPE) allocates a non-uniform per-layer expert budget
 (``per_layer_target_experts`` in ``stage1_budgets.json``) using CKA-redundancy
