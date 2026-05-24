@@ -1,7 +1,71 @@
-"""Per-layer merge-heal by self-distillation (Task 17 of the plugin-architecture refactor).
+"""Per-layer merge-heal via self-distillation toward pre-merge MoE output.
 
-Home of the Stage-2 merge-heal toolchain — all opt-in, all inert when
-``merge_heal_enabled`` is False:
+Paper
+-----
+**No paper.** Project-original. The closest published-paper analog is
+SlimMoE (arXiv:2506.18349) and MoE-Pruner (arXiv:2410.12013), both of
+which distill at the **full MoE-block** level with router updates
+concurrent. This plugin instead operates **per-layer post-merge** with
+self-supervision (the layer is its own teacher via captured pre-merge
+I/O).
+
+Baseline REAM (arXiv:2604.04356) does NOT have a post-merge heal step.
+
+The complementary :mod:`stage2.plugins.expert_distill` plugin
+implements per-merge-group MSE distillation (D-expert-distill-mse);
+merge_heal here is a coarser per-LAYER refinement that runs AFTER
+``bank.select`` + the router resize. Both are opt-in; in production
+they can be enabled together (expert_distill first, then merge_heal),
+selected separately, or both disabled.
+
+Official code
+-------------
+None — this implementation is project-original. The pre-merge I/O
+capture mechanism (in-process, no disk sidecar, no cascade buffer)
+is specific to this stage's plugin architecture.
+
+What it does
+------------
+After Stage 2 merges a layer, optionally fine-tune that layer's kept
+experts (+ optionally its resized router) by SELF-DISTILLATION: the
+layer is trained to reproduce its OWN pre-merge MoE-block output on
+calibration tokens. The ``(input, target)`` pairs are captured
+in-process from the layer itself just before the merge.
+
+Tool inventory (all opt-in, all inert when ``merge_heal_enabled`` is
+False):
+
+  * ``_HealConfig``  — validated, frozen view of the merge_heal_*
+    knobs.
+  * ``_make_shared_out_fn`` — frozen-shared-expert closure builder.
+  * ``_capture_mlp_io`` — pre-merge ``(input, target)`` activation
+    capture.
+  * ``_heal_student_moe_output`` — faithful student replica of the
+    MoE block.
+  * ``_heal_lr_at_step`` — warmup → cosine → floor LR schedule.
+  * ``_heal_layer`` — per-layer self-distillation trainer.
+  * ``_summarize_distill_state`` — per-layer distill telemetry
+    aggregator.
+
+Every code path here is reached ONLY when ``merge_heal_enabled`` is
+True; with the flag off, none of this runs and Stage 2 behaviour is
+byte-identical to the pre-feature code.
+
+No deviation row in §12
+-----------------------
+Merge-heal does not have a dedicated §12 row in ALGORITHM_REFERENCE.md
+— it is an opt-in, default-off auxiliary; the baseline REAM
+arXiv:2604.04356 has no post-merge heal step at all, so there is no
+paper-claim to deviate from. Documented here for self-containment.
+
+Naming-history note
+-------------------
+"Task 17" refers to the plugin-architecture refactor task numbering.
+The current plugin architecture has no task-numbering taxonomy; new
+prose drops the labels. Existing log lines / Trackio keys preserved
+for dashboard back-compat.
+
+Original module header — toolchain inventory follows:
   * ``_HealConfig``            — validated, frozen view of the merge_heal_* knobs.
   * ``_make_shared_out_fn``    — frozen-shared-expert closure builder.
   * ``_capture_mlp_io``        — pre-merge (input, target) activation capture.
@@ -1018,7 +1082,15 @@ class MergeHealPlugin:
     """
 
     name = "merge_heal"
-    paper = "Per-layer merge-heal by self-distillation toward pre-merge output."
+    paper = (
+        "Per-layer merge-heal by self-distillation toward pre-merge MoE "
+        "output (project-original; no paper). SlimMoE arXiv:2506.18349 / "
+        "MoE-Pruner arXiv:2410.12013 are the closest published-paper "
+        "analogs (full-block distill). Baseline REAM arXiv:2604.04356 "
+        "has no post-merge heal. Opt-in via merge_heal_enabled. "
+        "Complementary to :mod:`stage2.plugins.expert_distill` "
+        "(per-merge-group). See module docstring."
+    )
     config_key = "stage2_reap_ream.merge_heal_enabled"
     # S2-11 LIVE: pre_merge_snapshot reads grouped/layer_ref and writes the
     # nemo_writer/xd_writer shard writers; post_merge reads final_kept_ids +
