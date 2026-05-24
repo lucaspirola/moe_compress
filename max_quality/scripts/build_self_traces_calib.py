@@ -146,6 +146,36 @@ def _iter_prompts_from_qwen3_pretrain_mix(
                 if instr:
                     yield (instr + (("\n\n" + inp) if inp else ""), subset)
                     n += 1
+            elif subset == "qa":
+                # databricks-dolly-15k: instruction/context/response.
+                instr = (row.get("instruction") or "").strip()
+                ctx = (row.get("context") or "").strip()
+                if instr:
+                    yield (instr + (("\n\n" + ctx) if ctx else ""), subset)
+                    n += 1
+            elif subset == "creative":
+                # euclaise/writingprompts: prompt/story — use prompt as the
+                # user turn (teacher generates a new story / reasoning trace).
+                prompt = (row.get("prompt") or "").strip()
+                if prompt:
+                    yield prompt, subset
+                    n += 1
+            elif subset == "multilingual":
+                # CohereForAI/aya_dataset: inputs/targets across 65+ languages.
+                inputs = (row.get("inputs") or "").strip()
+                if inputs:
+                    yield inputs, subset
+                    n += 1
+            elif subset == "papers":
+                # gfissore/arxiv-abstracts-2021: title/abstract — ask the
+                # teacher to write the abstract given the paper's title.
+                title = (row.get("title") or "").strip()
+                if title:
+                    yield (
+                        f"Write the abstract for an academic paper titled:\n\n{title}",
+                        subset,
+                    )
+                    n += 1
             if n >= count:
                 break
         total_yielded += n

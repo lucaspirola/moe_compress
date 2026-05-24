@@ -919,56 +919,82 @@ register_corpus(CorpusAdapter(
 
 
 # ---------------------------------------------------------------------------
-# qwen3-pretrain-mix — broad multi-source mix approximating Qwen3's
-# pretraining distribution. All sources go through ``apply_chat_template``
+# qwen3-pretrain-mix — broad multi-source SFT-target mix for instruct/
+# thinking-mode calibration. All sources go through ``apply_chat_template``
 # so the instruct-tuned router stays in-distribution (Gemma 3 QAT rule).
 # ---------------------------------------------------------------------------
 #
-# Rationale (2026-05-21): nvidia-cascade and tulu3 are both SFT-only mixes;
-# experiments here show in-domain heal-MSE drops ~70%/layer but WikiText
-# cross-domain MSE only drops 2-11%/layer. Qwen3.6's pretraining (36T
-# tokens) is heavy on web crawls + OCR-PDFs + code + STEM + multilingual;
-# the SFT-only calibration never activates the experts that specialise
-# on web/code/math content from pretraining, so the merged experts can't
-# transfer back to raw-text eval distributions. This adapter mixes
-# pretraining-style content into calibration, all wrapped as chat.
+# Naming note: the historical name "qwen3-pretrain-mix" is kept as a stable
+# config-key identifier; the actual SHAPE of the mix is instruct/SFT-target,
+# NOT pretrain-shape. Our compression target is a chat-tuned thinking-mode
+# student that emits ``<think>...</think>`` at deploy — calibration must
+# match that distribution, with a small raw-text anti-forgetting replay
+# slice. The eight subsets all map to domains Qwen3 explicitly documents:
+#   * pretraining: "web + STEM + code + math + multilingual + books + synthetic"
+#   * post-training SFT: "coding + math + instruction + multilingual +
+#       creative writing + QA + role-playing"
+# (Qwen has not published the granular percentages for either stage — these
+# weights are an instruct-target choice, not a Qwen-published target.)
 #
-# Sub-sources (approximate Qwen3-pretrain proxies):
-#   tulu3 (25%):     allenai/tulu-3-sft-mixture (SFT/chat; our base)
-#   fineweb (45%):   HuggingFaceFW/fineweb-edu  (high-quality CC, edu-filtered)
-#   math (15%):      nvidia/OpenMathInstruct-2  (math problems + solutions)
-#   code (15%):      nickrosh/Evol-Instruct-Code-80k-v1 (code instructions)
+# Empirical motivation (2026-05-21 SH heal experiments):
+#   * nvidia-cascade or tulu3 alone: in-domain heal-MSE drops ~70%/layer but
+#     WikiText cross-domain MSE only drops 2-11%/layer — too narrow.
+#   * qwen3-pretrain-mix (4-subset, pretrain-leaning): WikiText XD transfer
+#     improves to 15-19%/layer on the qwen3_mix_seals.txt run.
+#   * This expanded 8-subset SFT-target mix is the next iteration: ~90%
+#     chat/reasoning + ~10% raw-text replay.
 #
-# Originally included ``papers (5%): allenai/peS2o``, but peS2o ships with
-# a .py loader script which datasets>=4.5 refuses to execute ("Dataset
-# scripts are no longer supported"). FineWeb-Edu's edu filter already
-# captures academic-style content; the 5% was rolled into fineweb. To
-# bring papers back, swap in a parquet-only dataset (e.g. ccdv/arxiv-
-# summarization, gfissore/arxiv-abstracts-2021) — both are non-gated and
-# parquet-stored.
+# Sub-sources (instruct-target weights, sum = 1.00):
+#   tulu3 (30%):        allenai/tulu-3-sft-mixture           — SFT/chat
+#   math (15%):         nvidia/OpenMathInstruct-2            — math reasoning
+#   code (15%):         nickrosh/Evol-Instruct-Code-80k-v1   — code reasoning
+#   qa (10%):           databricks/databricks-dolly-15k      — instruction QA
+#   creative (10%):     euclaise/writingprompts              — long-form gen
+#   multilingual (10%): CohereForAI/aya_dataset              — 65+ language SFT
+#   fineweb (5%):       HuggingFaceFW/fineweb-edu            — raw-text replay
+#   papers (5%):        gfissore/arxiv-abstracts-2021        — academic reasoning
+#
+# Anti-forgetting replay: fineweb-edu + papers are the only non-chat-shaped
+# subsets; 10% combined keeps general knowledge / vocabulary stable while
+# the other 90% supervise the routers + merged experts on deploy-shaped
+# inputs. Drop these to 0% if a future experiment shows pure-SFT is fine.
+#
+# All datasets are parquet-stored (no datasets>=4.5 script-loader gotcha).
 
 _QWEN3_MIX_WEIGHTS = {
-    "tulu3":   0.25,
-    "fineweb": 0.45,
-    "math":    0.15,
-    "code":    0.15,
+    "tulu3":        0.30,
+    "math":         0.15,
+    "code":         0.15,
+    "qa":           0.10,
+    "creative":     0.10,
+    "multilingual": 0.10,
+    "fineweb":      0.05,
+    "papers":       0.05,
 }
 
 # Rough avg-tokens-per-row used for row-count budgeting. Underestimating is
 # OK — `_tokenize_to_fixed_length` truncates to exactly the requested token
 # budget; overshoot is just unused rows. Underestimating risks running out.
 _QWEN3_MIX_AVG_TOKENS = {
-    "tulu3":   600,
-    "fineweb": 1500,
-    "math":    800,
-    "code":    300,
+    "tulu3":        600,
+    "math":         800,
+    "code":         300,
+    "qa":           400,
+    "creative":     600,
+    "multilingual": 400,
+    "fineweb":      1500,
+    "papers":       300,
 }
 
 _QWEN3_MIX_DATASET = {
-    "tulu3":   "allenai/tulu-3-sft-mixture",
-    "fineweb": "HuggingFaceFW/fineweb-edu",
-    "math":    "nvidia/OpenMathInstruct-2",
-    "code":    "nickrosh/Evol-Instruct-Code-80k-v1",
+    "tulu3":        "allenai/tulu-3-sft-mixture",
+    "math":         "nvidia/OpenMathInstruct-2",
+    "code":         "nickrosh/Evol-Instruct-Code-80k-v1",
+    "qa":           "databricks/databricks-dolly-15k",
+    "creative":     "euclaise/writingprompts",
+    "multilingual": "CohereForAI/aya_dataset",
+    "fineweb":      "HuggingFaceFW/fineweb-edu",
+    "papers":       "gfissore/arxiv-abstracts-2021",
 }
 
 
@@ -1098,16 +1124,25 @@ def _stream_problem_solution(
 
 def _stream_instruction_output(
     dataset_name: str, count: int, tokenizer, seed: int,
+    *,
+    instruction_field: str = "instruction",
+    input_field: str = "input",
+    output_field: str = "output",
 ) -> list[str]:
-    """Alpaca-style ``instruction``/``input``/``output`` dataset → messages."""
+    """Alpaca-style ``instruction``/``input``/``output`` dataset → messages.
+
+    Field names default to the canonical Alpaca schema but are overridable so
+    the same adapter handles e.g. databricks-dolly-15k (``response`` instead
+    of ``output``, ``context`` instead of ``input``).
+    """
     ds, circuit_limit = _shuffled_stream(dataset_name, count, seed)
     out: list[str] = []
     rows_seen = 0
     for row in ds:
         rows_seen += 1
-        instruction = (row.get("instruction") or "").strip()
-        input_part = (row.get("input") or "").strip()
-        output = (row.get("output") or "").strip()
+        instruction = (row.get(instruction_field) or "").strip()
+        input_part = (row.get(input_field) or "").strip()
+        output = (row.get(output_field) or "").strip()
         if instruction and output:
             user_content = instruction + (("\n\n" + input_part) if input_part else "")
             messages = [
@@ -1158,6 +1193,32 @@ def _stream_texts_qwen3_pretrain_mix(spec: CalibrationSpec, tokenizer) -> list[s
                 )
             elif subset == "code":
                 subset_texts = _stream_instruction_output(ds_name, n_rows, tokenizer, seed)
+            elif subset == "qa":
+                # databricks-dolly-15k: instruction/context/response (not output).
+                subset_texts = _stream_instruction_output(
+                    ds_name, n_rows, tokenizer, seed,
+                    input_field="context", output_field="response",
+                )
+            elif subset == "creative":
+                # euclaise/writingprompts: prompt/story.
+                subset_texts = _stream_problem_solution(
+                    ds_name, n_rows, tokenizer, seed,
+                    problem_field="prompt", solution_field="story",
+                )
+            elif subset == "multilingual":
+                # CohereForAI/aya_dataset: inputs/targets across 65+ languages.
+                subset_texts = _stream_problem_solution(
+                    ds_name, n_rows, tokenizer, seed,
+                    problem_field="inputs", solution_field="targets",
+                )
+            elif subset == "papers":
+                # gfissore/arxiv-abstracts-2021: title/abstract. "Given a title,
+                # write the abstract" exercises academic-style reasoning without
+                # the giant full-paper token bill.
+                subset_texts = _stream_problem_solution(
+                    ds_name, n_rows, tokenizer, seed,
+                    problem_field="title", solution_field="abstract",
+                )
             else:
                 raise ValueError(f"unknown qwen3-pretrain-mix subset {subset!r}")
         except Exception as err:                      # noqa: BLE001
