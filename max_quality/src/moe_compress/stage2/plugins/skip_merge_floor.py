@@ -34,11 +34,12 @@ bump loop (D-ream-budget-bump), the mask reduces the rate of
 high-cost merges in heterogeneous layers where the GRAPE budget is
 slack.
 
-Config gate: enabled iff
-``stage2_reap_ream.skip_merge_percentile < 100.0``. ``100.0`` is the
-OFF sentinel (the 100th percentile equals the max finite cost, so
-nothing is strictly above it). A missing key defaults to ``100.0`` →
-OFF.
+Config gate
+-----------
+Enabled iff ``stage2_reap_ream.skip_merge_percentile < 100.0``.
+``100.0`` is the OFF sentinel (the 100th percentile equals the max
+finite cost, so nothing is strictly above it). A missing key defaults
+to ``100.0`` → OFF. Values above 100.0 are also OFF.
 
 Naming-history note
 -------------------
@@ -47,34 +48,43 @@ architecture has no direction-letter taxonomy; new prose drops the
 label. Existing log lines / Trackio keys are preserved for dashboard
 back-compat.
 
-Wiring status: this plugin is LIVE. ``run()`` registers it in the
-``PluginRegistry`` after the three cost plugins and before the
-``LegacyAdapter``, so when it is enabled it wins the
-``apply_cost_mask`` ``dispatch_first`` slot in ``_run_assignment``'s
-bump loop. ``registry.enabled(config)`` drops it at the OFF sentinel,
-so ``dispatch_first`` then reaches ``LegacyAdapter.apply_cost_mask`` —
-its sentinel branch returns the delta object unchanged. The monolith's
+Wiring status
+-------------
+LIVE. ``stage2.orchestrator.run()`` registers this plugin in the
+``PluginRegistry`` after the three cost plugins and before the merge
+spine (``LayerMergePlugin``), so when it is enabled
+(``skip_merge_percentile < 100.0``) it wins the ``apply_cost_mask``
+``dispatch_first`` slot in ``_run_assignment``'s bump loop. At the OFF
+sentinel ``registry.enabled(config)`` filters this plugin out entirely;
+``dispatch_first`` then finds no servicer for ``apply_cost_mask`` and
+returns ``None``, which the orchestrator handles via
+``if masked is not None:`` — the delta is left unmasked. The monolith's
 ``_em_refine_assignment`` still re-applies the floor each EM round.
 
-Circular-import note: this module imports only ``pipeline.base``,
-``pipeline.context`` and ``pipeline.grouping`` — none of which import
-``stage2_reap_ream``. No cycle at module load.
+OFF-branch return contract
+--------------------------
+The documented plugin protocol for ``apply_cost_mask`` (see
+``docs/stage2_plugin_guide.md``) is "return ``(masked, info)`` or
+``None`` to leave the matrix unmasked." This plugin deliberately
+diverges in its OFF branch: when ``skip_merge_percentile >= 100.0`` and
+the method is invoked directly (e.g. unit tests), it returns
+``(delta, {"n_masked": 0, "percentile": ...})`` — the same array object
+unchanged, plus a diagnostic info dict. The production OFF path never
+hits this branch because ``is_enabled`` already filters the plugin out
+before ``dispatch_first`` reaches it. The 2-tuple return is preserved
+for unit-test ergonomics (caller can always unpack and inspect
+``info["n_masked"] == 0``).
 
-Wiring status (S2-7): this plugin is now LIVE. ``run()`` registers it in the
-``PluginRegistry`` after the three cost plugins and before the ``LegacyAdapter``,
-so when it is enabled (``skip_merge_percentile < 100.0``) it wins the
-``apply_cost_mask`` ``dispatch_first`` slot in ``_run_assignment``'s bump loop.
-``registry.enabled(config)`` drops it at the OFF sentinel (``>= 100.0``), so
-``dispatch_first`` then reaches ``LegacyAdapter.apply_cost_mask`` — its sentinel
-branch returns the delta object unchanged. The monolith's ``_em_refine_assignment``
-still re-applies the floor each EM round; S2-7 does not change that call site.
+Note: the OFF branch returns the input array un-copied, while the
+active branch promotes via ``_apply_skip_merge_floor`` (which copies
+and works in float64). Dtype is therefore not stable across the
+OFF/active boundary — callers that need a guaranteed copy must
+copy themselves.
 
-Config gate: enabled iff ``stage2_reap_ream.skip_merge_percentile < 100.0``.
-``100.0`` is the OFF sentinel (the 100th percentile equals the max finite cost,
-so nothing is strictly above it). A missing key defaults to ``100.0`` → OFF.
-
-Circular-import note: this module imports only ``pipeline.base``,
-``pipeline.context`` and ``pipeline.grouping`` — none of which import
+Circular-import note
+--------------------
+This module imports only ``...pipeline.context`` and ``..grouping``
+(i.e. ``stage2.grouping``) — neither of which imports
 ``stage2_reap_ream``. No cycle at module load.
 """
 from __future__ import annotations
@@ -94,20 +104,24 @@ _SKIP_MERGE_OFF = 100.0
 class SkipMergeFloorPlugin:
     """Plugin home for the Direction B skip-merge percentile mask.
 
-    S2-7 status: LIVE. ``run()`` registers this plugin after the three cost
-    plugins and before the ``LegacyAdapter``; when enabled
-    (``skip_merge_percentile < 100.0``) it wins the ``apply_cost_mask``
-    ``dispatch_first`` slot in ``_run_assignment``'s bump loop, servicing the
-    skip-merge floor that ``LegacyAdapter.apply_cost_mask`` used to own. At the
-    OFF sentinel ``registry.enabled`` drops it and the LegacyAdapter's sentinel
-    branch services the slot instead. ``apply_cost_mask`` delegates to
-    ``grouping._apply_skip_merge_floor`` — byte-identical to the LegacyAdapter
-    block it replaces.
+    LIVE. ``stage2.orchestrator.run()`` registers this plugin after the three
+    cost plugins and before the merge spine (``LayerMergePlugin``); when
+    enabled (``skip_merge_percentile < 100.0``) it wins the ``apply_cost_mask``
+    ``dispatch_first`` slot in ``_run_assignment``'s bump loop. ``apply_cost_mask``
+    delegates to ``grouping._apply_skip_merge_floor``. At the OFF sentinel
+    ``registry.enabled`` filters this plugin out, ``dispatch_first`` returns
+    ``None``, and the orchestrator's ``if masked is not None:`` branch leaves
+    the delta unmasked.
 
     The percentile is stored at construction: ``apply_cost_mask`` only receives
     a ``PipelineContext`` (which carries no cfg), so the value cannot be read at
     call time. Use :func:`make_skip_merge_floor_plugin` to build the plugin
-    from a config dict.
+    from a config dict — the factory keeps the constructor's
+    ``skip_merge_percentile`` aligned with the config's
+    ``stage2_reap_ream.skip_merge_percentile``. ``is_enabled(config)`` reads
+    the **config** percentile and ignores ``self.skip_merge_percentile`` —
+    callers that construct the plugin directly are responsible for keeping
+    the two consistent.
     """
 
     name = "skip_merge_floor"
@@ -143,6 +157,7 @@ class SkipMergeFloorPlugin:
         return float(s2.get("skip_merge_percentile", _SKIP_MERGE_OFF)) < _SKIP_MERGE_OFF
 
     def contribute_artifact(self, ctx) -> dict:
+        """Return an empty artifact dict; this plugin contributes none."""
         return {}
 
     def apply_cost_mask(
@@ -151,15 +166,21 @@ class SkipMergeFloorPlugin:
         """Mask cost-matrix entries above the skip-merge percentile to +inf.
 
         Delegates to ``grouping._apply_skip_merge_floor``. At the OFF sentinel
-        (percentile >= 100.0) returns the input array unchanged (no copy) to
-        match the LegacyAdapter live-path semantics, which skip the helper
-        entirely at the sentinel.
+        (percentile >= 100.0) returns the input array unchanged (no copy) and
+        an info dict with ``n_masked == 0`` — see the module-level
+        "OFF-branch return contract" note for the deliberate divergence from
+        the documented ``None``-to-decline protocol. In production the OFF
+        branch is unreachable: ``is_enabled`` filters the plugin out before
+        ``dispatch_first`` reaches it.
 
         Returns ``(masked_delta, info)`` with ``info = {"n_masked": int,
-        "percentile": float}``. Byte-identical to
-        ``LegacyAdapter.apply_cost_mask``, including the INFO log line emitted
-        when entries are masked. ``ctx`` carries ``layer_ref`` for that log; it
-        is ``None`` in unit tests, so the log is guarded on ``ctx is not None``.
+        "percentile": float}``, plus an INFO log line emitted when entries
+        are masked. ``ctx`` carries ``layer_ref`` for that log; it is ``None``
+        in unit tests, so the log is guarded on ``ctx is not None``.
+
+        Dtype note: the active path runs through ``_apply_skip_merge_floor``
+        which promotes to float64; the OFF branch returns the input array
+        with its original dtype. Dtype is not stable across the boundary.
         """
         if self.skip_merge_percentile >= _SKIP_MERGE_OFF:
             return delta, {"n_masked": 0, "percentile": self.skip_merge_percentile}
