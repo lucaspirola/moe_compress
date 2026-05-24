@@ -163,12 +163,17 @@ class _EighDecomp:
         inv_sqrt:     1/√(eigvals_keep), for the back-solve.              [r_eff]
         rhs:          The right-hand-side matrix such that M = W @ rhs.
                       Shape [d_in, r_eff].  Content depends on the path:
-                      - Path 1 (Theorem 3.2): CQ · diag(1/√λ)
+                      - Path 1 (Theorem 3.2): C · (L_B^T)^{-1} = CQ · diag(1/√λ)
                       - Path 3 (Cor. 3.3):    L_B = Q · diag(√λ)
-        rhs_pinv:     Pseudo-inverse of rhs, shape [r_eff, d_in].
-                      Used in the back-solve: V_k = Vh[:k] @ rhs_pinv.
-                      - Path 3: exact inverse = diag(1/√λ) · Q^T (no extra SVD)
-                      - Path 1: torch.linalg.pinv(rhs)
+        rhs_pinv:     The paper back-solve matrix L_B^{-1} = Λ^{-1/2} · Q^T.
+                      Shape [r_eff, d_in]. Identical for both paths because
+                      the cross-cov C in Path 1 is absorbed into ``rhs`` /
+                      ``M = W @ rhs``; the back-solve W'⋆ = SVDk(M) · L_B^{-1}
+                      reduces to V_k = Vh[:k] @ rhs_pinv. Computed
+                      analytically from the eigendecomposition — no extra
+                      SVD/pinv. (The name ``rhs_pinv`` is historical: this
+                      is mathematically ``L_B^{-1}``, NOT ``pinv(rhs)``
+                      except in the Path-3 special case where they coincide.)
         r_eff:        Number of retained eigenvalues (= rhs.shape[1]).
     """
     eigvals_keep: torch.Tensor
@@ -223,18 +228,29 @@ def _precompute_eigh(
     # only, never used in the SVD step. The variable ``A`` is kept in the
     # signature for backward compatibility but is intentionally unused here.
     del A  # explicit: A must not influence the rank-k factorization
+    # Back-solve matrix L_B^{-1} = Λ^{-1/2}·Q^T (paper Appendix A.1).
+    # With the eigendecomposition B = Q·Λ·Q^T, the Cholesky-style factor
+    # L_B = Q·Λ^{1/2} satisfies L_B·L_B^T = B; its inverse is Λ^{-1/2}·Q^T.
+    # The paper back-solve is W'⋆ = SVDk(M)·L_B^{-1} for both paths —
+    # Path 1 absorbs the cross-cov C into M = W·C·(L_B^T)^{-1}, leaving the
+    # right-hand back-solve identical to Path 3. Upstream
+    # atulkumarin/AA-SVD @ 1fa1b686cd · compression/decompose.py::
+    # ``_compress_module_obj34`` (alpha=1) computes
+    # ``V = (diag(sq) @ Vt[:rank] @ L_inv_T.T).t()`` where
+    # ``L_inv_T.T = L^{-1}`` — i.e. V_factor = Vh @ L_B^{-1}, matching the
+    # derivation above and never using pinv(W_tilde).
+    rhs_pinv = inv_sqrt.unsqueeze(1) * eigvecs_keep.T            # [r_eff, d_in]
     if C is not None:
-        # Path 1: Paper-exact Theorem 3.2 — rhs = C @ Q · diag(1/√λ).
+        # Path 1: Paper-exact Theorem 3.2 — rhs = C · (L_B^T)^{-1}
+        #                                       = C · Q · diag(1/√λ).
+        # M = W · rhs absorbs the cross-cov; back-solve uses L_B^{-1} above.
         C = C.to(device=device, dtype=torch.float32)
         CQ = C @ eigvecs_keep                                    # [d_in, r_eff]
         rhs = CQ * inv_sqrt.unsqueeze(0)                         # [d_in, r_eff]
-        # pinv(C·Q·Λ^{-1/2}) ≠ Λ^{-1/2}·Q^T — must compute pseudo-inverse explicitly.
-        rhs_pinv = torch.linalg.pinv(rhs)                        # [r_eff, d_in]
     else:
         # Path 3: Corollary 3.3 — rhs = L_B = Q · diag(√λ).
+        # Back-solve uses the same L_B^{-1} = Λ^{-1/2}·Q^T above.
         rhs = eigvecs_keep * eigvals_keep.sqrt().unsqueeze(0)    # [d_in, r_eff]
-        # Exact inverse: (Q·Λ^{1/2})^{-1} = Λ^{-1/2}·Q^T — no extra SVD.
-        rhs_pinv = inv_sqrt.unsqueeze(1) * eigvecs_keep.T        # [r_eff, d_in]
 
     return _EighDecomp(
         eigvals_keep=eigvals_keep,
@@ -262,18 +278,25 @@ def _aa_svd_precomputed(
     Returns (U_k, V_k, rel_err, k_eff).
     """
     d_out, d_in = W.shape
-    k = max(1, min(k, min(d_out, d_in) - 1))
+    # Paper allows full rank up to min(d_out, d_in); the prior ``- 1``
+    # gratuitously dropped one column near-full-rank with no derivation
+    # backing it. Upstream atulkumarin/AA-SVD @ 1fa1b686cd takes
+    # ``min(weight.shape)`` outright; we match.
+    k = max(1, min(k, min(d_out, d_in)))
     try:
         M = W @ decomp.rhs                                      # [d_out, r_eff]
 
         U, S, Vh = torch.linalg.svd(M, full_matrices=False)
         k_eff = max(1, min(k, decomp.r_eff))
         U_eff = U[:, :k_eff] * S[:k_eff]
-        # Back-solve: V_k = Vh[:k_eff] @ rhs_pinv where rhs_pinv = pinv(rhs).
-        # Path 3: rhs_pinv = Λ^{-1/2}·Q^T (exact, precomputed analytically).
-        # Path 1: rhs_pinv = pinv(C·Q·Λ^{-1/2}) (precomputed via torch.linalg.pinv).
-        # Using the path-specific rhs_pinv is critical for Path 1 — the naive
-        # Λ^{-1/2}·Q^T back-solve ignores the C factor and produces wrong V_k.
+        # Paper back-solve (Theorem 3.2 / Cor. 3.3 / Appendix A.1):
+        #   W'⋆ = SVDk(M) · L_B^{-1}   with   L_B^{-1} = Λ^{-1/2} · Q^T.
+        # ``decomp.rhs_pinv`` holds the analytic ``L_B^{-1}`` (same form for
+        # both paths). In Path 1 the cross-cov C is already absorbed into
+        # ``rhs`` / ``M = W @ rhs``, so the right-hand factor is L_B^{-1},
+        # NOT ``pinv(C·Q·Λ^{-1/2})``. Cross-checked against upstream
+        # atulkumarin/AA-SVD @ 1fa1b686cd / compression/decompose.py
+        # ``_compress_module_obj34`` (alpha=1) — V_factor = Vh @ L_B^{-1}.
         V_eff = Vh[:k_eff, :] @ decomp.rhs_pinv                 # [k_eff, d_in]
         # Numerically stable rel_err: tail singular values of M.
         S2 = S * S
@@ -294,13 +317,23 @@ def _aa_svd_precomputed(
     except Exception as err:                         # noqa: BLE001
         log.warning("AA-SVD (precomputed) fallback to plain SVD (%s)", err)
         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-        U_k = U[:, :k] * S[:k]
-        V_k = Vh[:k, :]
+        # Honest k_eff: the plain SVD can only yield as many directions as
+        # ``min(d_out, d_in)``. Reporting ``k_eff = k`` when ``k`` exceeds
+        # that floor would mask k_eff_clip_count signal on the dashboard.
+        k_eff = max(1, min(k, S.numel()))
+        U_eff = U[:, :k_eff] * S[:k_eff]
+        V_eff = Vh[:k_eff, :]
+        if k_eff < k:
+            U_k = torch.zeros(d_out, k, device=device, dtype=U_eff.dtype)
+            V_k = torch.zeros(k, d_in, device=device, dtype=V_eff.dtype)
+            U_k[:, :k_eff] = U_eff
+            V_k[:k_eff, :] = V_eff
+        else:
+            U_k, V_k = U_eff, V_eff
         with torch.no_grad():
             R = W - U_k @ V_k
             w_norm = W.norm()
             rel_err = float((R.norm() / w_norm).item()) if w_norm > 0 else 0.0
-        k_eff = k
     return U_k, V_k, rel_err, k_eff
 
 
@@ -345,20 +378,30 @@ def _aa_svd(
        covariance via ``_cov_lookup`` fallback.
     """
     d_out, d_in = W.shape
-    k = max(1, min(k, min(d_out, d_in) - 1))
+    # Match ``_aa_svd_precomputed``: paper allows full rank up to
+    # min(d_out, d_in).
+    k = max(1, min(k, min(d_out, d_in)))
     try:
         decomp = _precompute_eigh(B, A, C, device=device, storage_dtype=storage_dtype)
         return _aa_svd_precomputed(W, decomp, k, device=device)
     except Exception as err:                         # noqa: BLE001
         log.warning("AA-SVD fallback to plain SVD (%s)", err)
         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-        U_k = U[:, :k] * S[:k]
-        V_k = Vh[:k, :]
+        # Honest k_eff: see ``_aa_svd_precomputed`` fallback above.
+        k_eff = max(1, min(k, S.numel()))
+        U_eff = U[:, :k_eff] * S[:k_eff]
+        V_eff = Vh[:k_eff, :]
+        if k_eff < k:
+            U_k = torch.zeros(d_out, k, device=device, dtype=U_eff.dtype)
+            V_k = torch.zeros(k, d_in, device=device, dtype=V_eff.dtype)
+            U_k[:, :k_eff] = U_eff
+            V_k[:k_eff, :] = V_eff
+        else:
+            U_k, V_k = U_eff, V_eff
         with torch.no_grad():
             R = W - U_k @ V_k
             w_norm = W.norm()
             rel_err = float((R.norm() / w_norm).item()) if w_norm > 0 else 0.0
-        k_eff = k
     return U_k, V_k, rel_err, k_eff
 
 
@@ -409,7 +452,15 @@ class AaSvdFactorPlugin:
     # ``rank_map`` is the slot this plugin produces — it is a shared mutable
     # dict the hook MUTATES in place across loop iterations (HAZARD H1)
     # rather than rebinding via ``ctx.set``, but it remains this plugin's
-    # declared write surface.
+    # declared write surface. ``rank_map`` values record the *slot* rank
+    # (= FactoredExperts allocation width), which may be larger than the
+    # *effective* rank ``k_eff`` returned by ``_aa_svd`` when the eigh
+    # threshold or W's true rank caps the spannable directions; the
+    # k_eff_clip_count / k_eff_clip_ratio metrics expose that drift.
+    # Out-of-band: ``factor_layer`` also calls ``setattr(ref.mlp, 'experts',
+    # new_factored)`` and updates ``ref.experts_module`` — those mutate the
+    # model, not the ctx slots, so they are not part of the ``writes``
+    # contract but are noted here for auditors.
     writes: tuple[str, ...] = ("rank_map",)
     provides: tuple[str, ...] = ()
 
@@ -438,18 +489,25 @@ class AaSvdFactorPlugin:
         mutable dict set on the root ctx — this hook mutates it in place
         across loop iterations (HAZARD H1).
         """
+        # Required slots — fail loud if missing (these are core to factoring).
         ref = ctx.get("layer_ref")
         ranks = ctx.get("ranks")
-        per_expert_ranks = ctx.get("per_expert_ranks")
-        A_cov = ctx.get("A_cov")
         B_acc = ctx.get("B_acc")
-        C_acc = ctx.get("C_acc")
         B_cov_dtype = ctx.get("B_cov_dtype")
         rank_map = ctx.get("rank_map")
         device = ctx.get("device")
         originals = ctx.get("originals")
         bcov_spill_dir = ctx.get("bcov_spill_dir")
-        ccov_spill_dir = ctx.get("ccov_spill_dir")
+        # Optional slots — Path-3 fallback or cross-cov-disabled runs may
+        # legitimately omit these. ``ctx.get`` raises KeyError when a slot
+        # was never written, so guard each one via ``ctx.has`` (the standard
+        # idiom used by swift_svd_alpha / covariance_collection sibling
+        # plugins). Treating missing == None keeps the downstream branches
+        # (``if C_acc is not None`` etc.) doing the right thing.
+        per_expert_ranks = ctx.get("per_expert_ranks") if ctx.has("per_expert_ranks") else None
+        A_cov = ctx.get("A_cov") if ctx.has("A_cov") else None
+        C_acc = ctx.get("C_acc") if ctx.has("C_acc") else None
+        ccov_spill_dir = ctx.get("ccov_spill_dir") if ctx.has("ccov_spill_dir") else None
 
         # ---- VERBATIM per-layer factoring loop body from the monolith run() --
         # When Swift-SVD+ gives per-expert ranks, allocate at the max rank
@@ -498,10 +556,21 @@ class AaSvdFactorPlugin:
         dev = ex.gate_up_proj.device
         ex.to("cpu")
         torch.cuda.empty_cache()
+        # ``gate_up_proj`` is the FUSED [gate || up] projection HF layout
+        # (shape [E, 2·intermediate_dim, hidden_dim]); ``// 2`` recovers
+        # the single-projection intermediate width. A non-fused arch port
+        # (separate gate_proj / up_proj weights) would never hit this
+        # branch; if a future port does, this assumption is the first
+        # thing to revisit.
+        fused_out_dim = ex.gate_up_proj.shape[1]
+        assert fused_out_dim % 2 == 0, (
+            f"Expected fused gate_up_proj out-dim to be even; got {fused_out_dim}. "
+            "Non-fused gate/up layouts are unsupported here."
+        )
         new_factored = FactoredExperts(
             num_experts=ref.num_routed_experts,
             hidden_dim=ex.gate_up_proj.shape[-1],
-            intermediate_dim=ex.gate_up_proj.shape[1] // 2,
+            intermediate_dim=fused_out_dim // 2,
             ranks=ranks_layer, dtype=dtype, device=dev,
         )
         # Fill factors by per-expert AA-SVD. Track relative reconstruction
