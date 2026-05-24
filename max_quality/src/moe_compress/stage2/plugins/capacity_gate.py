@@ -44,7 +44,9 @@ dispatches ``select_alignment`` once per bump iteration BEFORE the
 ``compute_cost`` slot. The gate computes ``capacity_util_value`` /
 ``effective_cost_alignment`` / ``effective_cost_asymmetric`` and
 writes them to ``ctx``; the cost plugins' ``compute_cost`` then just
-READS those slots back.
+READS those slots back. ``LegacyAdapter.compute_assignment`` imports
+``_pick_effective_alignment`` from *this* module (its true home), not
+via the monolith re-import.
 
 Circular-import note: this module imports only ``pipeline.base`` and
 ``pipeline.context`` — neither imports ``stage2_reap_ream``. There is
@@ -55,30 +57,30 @@ Naming-history note
 "M3" is the STRATEGY_NEXT label. The current plugin architecture has
 no module-letter taxonomy; new prose drops the label. Existing log
 lines / Trackio keys preserved for dashboard back-compat.
-
-The gate decides which cost path runs per layer: when utilization
-``u = n_NC / (N'_l × C_max)`` falls below ``capacity_util_threshold`` the layer
-has slack capacity and the cheap symmetric ``"pre"`` cost is used regardless of
-the configured (tighter) alignment; otherwise the configured value wins.
-
-Circular-import note: this module imports only ``pipeline.base`` and
-``pipeline.context`` — neither imports ``stage2_reap_ream``. There is therefore
-no cycle at module load. ``LegacyAdapter.compute_assignment`` imports
-``_pick_effective_alignment`` from *this* module (its true home), not via the
-monolith re-import.
-
-``CapacityGatePlugin`` is the LIVE capacity gate. S2-10 wired it into the
-``select_alignment`` assignment slot: ``_run_assignment`` dispatches
-``select_alignment`` once per bump iteration BEFORE the ``compute_cost`` slot.
-The gate computes ``capacity_util_value`` / ``effective_cost_alignment`` /
-``effective_cost_asymmetric`` and writes them to ctx; the cost plugins'
-``compute_cost`` then just READS those slots back.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from ...pipeline.context import PipelineContext
+
+
+def _compute_util(*, n_nc: int, n_c: int, max_group_cap: int) -> float:
+    """Per-layer capacity utilization ``u = n_NC / (N'_l × C_max)``.
+
+    With ``max_group_cap <= 0`` (uncapped, ablation-only path) the layer is
+    treated as fully slack (``u = 0``). The ``max(..., 1)`` floor on the
+    denominator prevents a ZeroDivisionError when ``n_c == 0``.
+
+    Single source of truth for the gate's ``u`` — both
+    ``_pick_effective_alignment`` and ``CapacityGatePlugin.select_alignment``
+    call this so the per-layer Trackio-emit value matches the value the gate
+    decision is taken on.
+    """
+    if max_group_cap <= 0:
+        return 0.0
+    capacity = max(n_c * max_group_cap, 1)
+    return n_nc / capacity
 
 
 def _pick_effective_alignment(
@@ -103,11 +105,7 @@ def _pick_effective_alignment(
     With ``max_group_cap == 0`` (uncapped, ablation-only path) we treat the
     layer as fully slack (u = 0).
     """
-    if max_group_cap <= 0:
-        util = 0.0
-    else:
-        capacity = max(n_c * max_group_cap, 1)
-        util = n_nc / capacity
+    util = _compute_util(n_nc=n_nc, n_c=n_c, max_group_cap=max_group_cap)
     if util < threshold:
         return "pre"
     return configured
@@ -186,13 +184,12 @@ class CapacityGatePlugin:
         #   post-alignment cost matrix is unlikely to change the
         #   assignment meaningfully — fall back to the cheap symmetric
         #   path. This is what skips ~half the layers' compute.
-        # Capture the actual u value into the layer-scope variable
-        # so the per-layer Trackio emit can surface it; mirrors the
-        # division done inside _pick_effective_alignment.
-        if self.max_group_cap <= 0:
-            capacity_util_value = 0.0
-        else:
-            capacity_util_value = n_ream_nc / max(n_ream_c * self.max_group_cap, 1)
+        # Share the same ``_compute_util`` source-of-truth with
+        # ``_pick_effective_alignment`` so the value surfaced to Trackio
+        # matches the value the gate decision is taken on.
+        capacity_util_value = _compute_util(
+            n_nc=n_ream_nc, n_c=n_ream_c, max_group_cap=self.max_group_cap,
+        )
         effective_cost_alignment = _pick_effective_alignment(
             n_nc=n_ream_nc,
             n_c=n_ream_c,
@@ -200,6 +197,15 @@ class CapacityGatePlugin:
             threshold=self.capacity_util_threshold,
             configured=self.cost_alignment_cfg,
         )
+        # Asymmetric coupling is only well-defined for the whitened
+        # post-alignment cost (the per-pair Hungarian aligns the
+        # residual before the Frobenius norm). The "pre" and "output"
+        # branches have no per-pair alignment to be asymmetric about,
+        # so the ``== "post"`` gate here clears asymmetric both on a
+        # SLACK downgrade to "pre" AND for an "output"-configured run
+        # in the TIGHT regime — the module docstring's "gated
+        # identically to post" framing applies to the SLACK→pre
+        # downgrade, not to asymmetric coupling.
         effective_cost_asymmetric = (
             self.cost_asymmetric and effective_cost_alignment == "post"
         )
