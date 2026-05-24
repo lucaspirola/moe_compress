@@ -240,135 +240,18 @@ Shared experts (`mlp.shared_expert`) are **not in the blacklist** and are not pr
 
 ---
 
-## 5. Stage 2 — REAP Scoring + REAM Pseudo-Pruning
-
-**File:** [`stage2_reap_ream.py`](src/moe_compress/stage2_reap_ream.py)
-**Papers:**
-- REAP: Routing-Expert Activation Pruning (2510.13999), Eq. 9
-- REAM: Routing Expert Activation Merging (2604.04356), §3–4, Eq. 4–8 (Eq. 7 the aggregator)
-**Hardware:** H200. Model (70 GB BF16) stays loaded from Stage 1. 71 GB VRAM headroom enables `batch_size=6` for profiling.
-
-### What
-
-Reduces the number of routed experts per layer from 256 to ~180–200 by merging similar experts (not deleting — merged experts' knowledge is preserved via frequency-weighted averaging, with intermediate-neuron permutation alignment so that the averaged neurons correspond w.r.t. the centroid expert (REAM §4)). Simultaneously collects input covariance matrices (A) consumed by Stages 3 and 4.
-
-### Why
-
-Expert merging preserves more knowledge than deletion. REAM's pseudo-pruning (scoring + assignment + merge) was shown to retain ~98.5% of the original model's quality (derived: 69.8/70.9 GEN average, Table 1) on Qwen3-30B-A3B at ~25% expert reduction (128→96 experts, Table 1), outperforming pure pruning methods.
-
-### How
-
-**Sequential profiling with early-exit (REAM paper §4, Fig. 1(b)):** The REAM paper (2604.04356) introduces *sequential merging* as a core contribution: after merging layer ℓ, activations must be recomputed through the merged layer before profiling layer ℓ+1, ensuring each layer's REAP scores and REAM cost matrices reflect the actual input distribution it will see at inference time (not stale pre-merge statistics). The paper's ablation (§5.4) measures ΔAVG = −1.0 when sequential merging is removed — a meaningful fraction of the quality budget.
-
-**Implementation:** For each layer L (processed in order 0→39), the profiling forward pass runs from the input embedding through layers 0…L, collecting REAP/REAM/covariance data from layer L's hooks. Layers L+1…39 are **not executed** — their computation is pure waste because all metrics collected for layer L (REAP scores, δ_gate, δ̃_expert, input covariance) depend only on the hidden states that *arrive at* layer L, not on what happens after it. An **early-exit forward hook** registered on the decoder layer immediately after layer L raises a sentinel exception that aborts the forward pass cleanly. The profiling runs under `torch.no_grad()`, so no autograd graph is corrupted.
-
-This gives a ~2× wall-clock speedup over the naïve approach (running all 40 layers for each of the 40 profiling passes): the total layer-forward count drops from 40×40=1600 to 1+2+3+…+40=820. The REAM paper's sequential merging semantics are preserved exactly — each layer is profiled on hidden states that reflect all prior merges.
-
-**Vectorized accumulators (planned follow-up, zero quality impact):**
-
-The REAM cost matrix computation involves two pairwise similarity metrics across all experts in a layer (up to 256 experts). A future optimization replaces Python dicts with dense tensors for O(1) vectorized operations:
-
-- **Gate logit profiles** (`ReamCostAccumulator`): Instead of `dict[expert_id → dict[token_idx → float]]`, a pre-allocated `torch.Tensor(num_experts, total_calibration_tokens)` on CPU in float16 stores each expert's pre-softmax router logit for each calibration token. The full `[N_experts × N_experts]` δ_gate similarity matrix is computed in one `F.normalize` + `matmul` call (~milliseconds for 256×256): normalize each row to unit length, compute the gram matrix (inner products = cosine similarities of unit vectors), convert to Euclidean distances via `d = sqrt(2 − 2·cos)`, then apply `dist2sim`. This replaces O(N²) Python-level loops. **Memory note:** at the updated calibration size of 4000 × 2048 = 8.19M tokens with 256 experts, the logit tensor is 256 × 8.19M × 2 bytes ≈ 4.2 GB per layer in FP16 on host RAM. This is materially larger than the prior 1024-sequence budget (~1.1 GB). The H200's host RAM (512 GB) comfortably accommodates this; the tensor is allocated and freed per layer, not held across layers simultaneously.
-
-- **Gated-output pairwise similarity** (`finalize_batch`): Per-batch pairwise cosine similarity of gated expert outputs is computed via a single batched `F.cosine_similarity` over the jointly-active token intersection per expert pair, accumulated incrementally as before but with vectorized inner loops.
-
-These optimizations are purely implementation-level data-structure changes. The mathematical computation is identical — same cosine similarities, same REAP scores, same cost matrix entries. Estimated wall-clock reduction on the cost-matrix phase: 10–100× (from minutes of Python iteration to seconds of tensor ops). Not yet implemented — the current accumulators use Python dicts (functionally correct, slower). The early-exit optimization provides the dominant ~2× speedup; vectorized accumulators are additive.
-
-**Per-layer merge execution (sequential — must see prior merges):**
-
-#### Blacklisted Expert Exclusion
-
-Before any REAP/REAM computation, **super experts (SEs)** are excluded from the routed expert pool — they are not candidates for the centroid set and not candidates for the non-centroid set; their weights pass through Stage 2 unchanged. SEs are identified by the (layer, expert) pairs in `stage1_blacklist.json`. Placing an SE in the centroid set would allow non-centroid weights to be merged into it, modifying the SE's weights — defeating the purpose of blacklisting.
-
-**Shared experts** (`mlp.shared_expert`) are never in scope: they live in a separate model attribute, are not indexed as routed experts, and are never iterated by `iter_moe_layers`. No explicit exclusion logic is needed for them in Stage 2.
-
-GRAPE outputs per-layer **budgets** (N'_l — how many routed experts to keep per layer), not individual expert blacklists. The floor constraint (min 128 per layer) is enforced on N'_l; REAM then selects which N'_l routed non-SE experts become centroids via REAP score.
-
-All counts below (N'_l, feasibility checks, group sizes) refer to non-SE routed experts only.
-
-#### Step 1: REAP Scoring (Paper 2510.13999, Eq. 9)
-
-> **Note on routing weight notation:** REAP (2510.13999) uses `g_j(x)` for the post-softmax routing weight, masked to zero for non-top-k experts. REAM (2604.04356) uses `σ(x)_j` for the **full unmasked softmax** (always strictly positive for every expert on every token). In §5 below, `g_j(x)` follows REAP notation (masked, zero for non-active) and is taken **as dispatched in the model's forward pass** — for Qwen3-MoE this is the renormalized top-k weight (top-k softmax outputs renormalized to sum=1 over the top-k set); REAP's paper Eq. 9 is silent on renormalization, and the spec uses the dispatched value to match the experts' actual contribution to the forward output. The REAM Eq. 8 formula uses `σ(x)_j` as the **full unmasked softmax** (no top-k mask, no renormalization) — confirmed by the reference implementation: `F.softmax(router_logits, dim=-1)` over all experts with no top-k masking (`ream/moe_utils.py` lines 157–158, 173–174 — upstream REAM repository, not this codebase).
-
-For each expert `j`, compute importance as the conditional average of gate-weighted output norm over active tokens (Eq. 9):
-
-```
-S_j = (1/|X_j|) × Σ_{x ∈ X_j} g_j(x) · ‖f_j(x)‖₂
-```
-
-where `X_j = {x | j ∈ TopK(σ(x))}`, `g_j(x)` is the post-softmax routing weight, and `f_j(x)` is the expert output vector.
-
-#### Step 2: REAM Cost Matrix (Paper 2604.04356, Eq. 5, 7, 8)
-
-**Activation-space similarities** (NOT weight-space; higher = more similar; both components scaled to [0, 1]):
-
-- **δ_gate(i,j)** (Eq. 5): Similarity between **pre-softmax** router logit profile vectors. Each expert's profile is a vector of length |X| (one pre-softmax logit per calibration token). Profiles are **L2-row-normalized** (each expert's profile vector is unit-normalized), then pairwise Euclidean distances are computed; `dist2sim` converts to similarity by dividing by the matrix-wide maximum distance and subtracting from 1. δ_gate ∈ [0, 1]; higher = more similar. (Reference: `ream/ream.py` lines 37–41; reference paths point at the upstream REAM repository, not this codebase.) The L2-norm + Euclidean + `dist2sim` chain is a monotone transform of the paper's raw cosine into [0, 1] (since `dist = √(2 − 2·cos)` on unit vectors, and `1 − dist/max(dist)` is monotone-decreasing in `dist`); greedy ranking is preserved [D-ream-similarity-rescale].
-
-- **δ̃_expert(i,j)** (Eq. 8): `(1/|X|) Σ_{x∈X} sim(σ(x)_i · E_i(x), σ(x)_j · E_j(x))` — mean per-token cosine similarity of the two experts' **full-softmax-gated** outputs (`σ(x)_i` is the full unmasked softmax weight), averaged over all |X| calibration tokens (not just jointly-active tokens). The raw cosine similarity ∈ [−1, 1] is **rescaled to [0, 1]** as `(cosine_sim + 1) / 2` [D-ream-similarity-rescale]; this rescaling is monotone, so greedy ranking is preserved. δ̃_expert ∈ [0, 1]; higher = more similar. (Reference: `ream/ream.py` lines 99–113, `moe_utils.py` lines 157–158, 173–174.) **Sparse-routing note:** Eq. 8 calls for `σ(x)_e · E_e(x)`; we use the full-softmax weight `σ(x)_e` directly (paper-faithful — note: this is the un-renormalized softmax, not the dispatched top-k routing weight) but `E_e(x)` is only computed on top-k tokens, so non-jointly-active tokens contribute zero to the numerator and still appear in the denominator |X| (see [D-ream-sparse-routing]). **NaN-handling:** if a jointly-active token produces a zero gated-output vector for one of the two experts (extremely rare; cosine is undefined), the per-token cosine is treated as `0` (after rescale: `0.5`, neutral) rather than excluded from the |X| denominator — same `[D-ream-sparse-routing]` rationale: skipped/degenerate token positions count toward |X| but contribute zero similarity signal.
-
-- **δ_REAM(i,j) = (δ_gate(i,j) + δ̃_expert(i,j)) / 2**: Equal-weight average of gate and expert similarities; both components already in [0, 1]. δ_REAM ∈ [0, 1]; **higher = more similar**. The working distance is `cost(i,j) = 1 − δ_REAM(i,j) ∈ [0, 1]`; lower cost = more similar — the greedy assignment selects non-centroids with the **lowest cost**. (Reference: `ream/ream.py` lines 46–53.) Note: REAM Eq. 7 sums the two components (`δ_REAM = δ_g + δ̃_E`); the spec's mean is monotone in each component cosine; the joint greedy ranking matches the paper's exactly only when components agree on the pair, and is a project-original re-weighting otherwise. The /2 normalization keeps cost values in [0,1] for cross-stage diagnostic comparability [D-ream-aggregation].
-
-#### Step 3: Greedy Pseudo-Pruning Assignment (Paper §4)
-
-**Feasibility check:** Before the greedy pass, validate that `N'_l × max_merge_group_size ≥ N_l − N'_l` (where N_l is the total number of non-blacklisted routed experts in the layer, N'_l is the centroid count, and `max_merge_group_size` caps the **non-centroids** absorbed into each centroid — see Step 4). If this is violated, bump `effective_target` by 1 (or by `ceil(effective_target × cost_bump_ratio)` whichever is larger) and retry. If `effective_target` reaches `n_experts` without achieving feasibility, fall back to zero-merge: keep all non-protected experts as centroids (no merges performed for this layer). This guarantees no expert weights are lost at the cost of not meeting the compression target. (Reference: `ream/ream.py` lines 60–62 — upstream repository.)
-
-**Quality-gate exhaustion (last-resort apply-anyway):** distinct from the feasibility-fallback above, if the **quality** gate (`ream_cost_sigma_threshold`, see [D-ream-budget-bump]) is still active when `effective_target` reaches `n_experts`, the spec applies the most recent above-threshold assignment instead of zero-merging — the rationale is that quality-gate failures often coincide with naturally high cost layers where any single-cap-respecting assignment is the best available, and zero-merging would unnecessarily cost compression. This is **project-original behavior**, not in the REAM paper, and is documented under [D-ream-budget-bump].
-
-**Orphan-singleton promotion:** if the capped greedy assignment leaves any non-centroid unassigned (rare edge case where every centroid's cap is saturated by lower-cost candidates), the orphan is promoted to a singleton centroid for that layer (no merge). This is also project-original (the spec's Step-3 feasibility check is designed to prevent this, but the promotion path exists as a defensive safety net). Documented under [D-ream-budget-bump].
-
-Top-N'_l experts by REAP score become **centroids**. Non-centroids are assigned to centroids via a **single-pass greedy algorithm**: iterate centroids in **descending saliency order** (most salient centroid first — order is important); for each centroid, absorb up to `max_merge_group_size` unassigned non-centroids with the **lowest cost** (most similar), in order. The loop exits early once all non-centroids are assigned. **Every non-centroid is guaranteed to be assigned** — the feasibility check ensures full coverage. (Reference: `ream/ream.py` lines 63–87.)
-
-#### Step 4: Frequency-Weighted Merge (Paper Eq. 6)
-
-```
-W_merged = Σ_i (freq_i / Σ_j freq_j) × P_i(W_i)
-        (Note: paper Eq. 6 uses raw `S_i^freq = freq_i/|X|` weights without group-renormalization, so paper-Eq.-6 weights generally do not sum to 1 over a merge group. The spec's group-renormalized form `freq_i/Σ_j freq_j` produces a convex combination — necessary for a well-formed weight average — and is mathematically equivalent to renormalizing paper-Eq.-6's `S_i^freq` weights post-hoc within the group. The spec form differs from a literal reading of Eq. 6 but is the only consistent way to interpret "weighted average" since the paper does not explicitly state how the un-normalized weights should be combined into a single tensor.)
-```
-
-where the denominator `Σ_j freq_j` sums over merge group members only (not all N experts). `P_i` denotes the neuron permutation alignment as described in the paper's surrounding text (Hungarian algorithm on combined cost matrix `C = C_act + C_wt`) that aligns each child expert's intermediate neurons to the centroid before averaging; it is not an explicit formula component in the paper. `C_wt` is the gate+up Frobenius weight distance (implementation choice: gate_proj and up_proj; paper does not specify). Implementation: `C_wt[p,q] = ‖W^p_gate − W^q_gate‖_F + ‖W^p_up − W^q_up‖_F` (sum of independent gate and up Frobenius distances — note: this is **not** the block-Frobenius `‖[W^p_gate, W^p_up] − [W^q_gate, W^q_up]‖_F = √(‖ΔW_gate‖_F² + ‖ΔW_up‖_F²)`; the spec uses the L1-of-Frobenius-distances aggregation instead, then min-max normalizes the resulting matrix as a single C_wt component). (See D5b for the C_wt + C_act decomposition; both components min-max normalized to [0,1].) `C_act` is the per-neuron mean activation L2 distance, where activation vectors H̄ are normalized before computing the distance (normalization method unspecified in the paper). Implementation: gate-output rows are L2-normalized per-row before computing pairwise Euclidean distances; equivalent to cosine distance on the normalized rows. `freq_i` is the count of calibration tokens for which expert i is in the top-k active set, equivalent to `S_i^freq × |X|` in the paper's notation (REAM Eq. 2).
-
-#### Step 5: Router Resize
-
-Remove merged non-centroid experts' rows from `gate.weight`. Update `num_experts` on the MoE block. SE rows are **not removed** — they remain in the router and expert list unchanged.
-
-### Covariance Side-Collection
-
-During the profiling forward pass, two covariance matrices are accumulated per (layer, expert):
-- **A_gate_up** (`gate_proj`): Input covariance for gate_proj and up_proj (shared tensor)
-- **A_down** (`down_proj`): Input covariance for down_proj (intermediate activations)
-
-Stored in `_stage2_input_covariance.pt` (fp16 persisted dtype per [D-cov-storage-fp16]; eigendecomposition still runs in fp64 in-memory in Stage 3, so numerical conditioning is preserved). On H200 with `batch_size=6`, the covariance accumulates signal across all 4000 calibration samples, providing well-conditioned A matrices for Stage 3.
-
-### Budget Bump Loop
-
-Two safety gates can raise the effective target if merge quality is poor (project-original feasibility/quality gate; see [D-ream-budget-bump]):
-- **`max_merge_group_size=8`** [D5a]: If any group exceeds this, bump target. The REAM paper uses C=16 at 25% reduction (128→96 experts) and C=32 at 50% reduction (128→64 experts) on a 128-expert pool — in both cases C is far larger than the average absorption per centroid. Our pipeline targets ~30% expert reduction on a 256-expert pool; at the floor budget (256→128), each centroid absorbs an average of 1.0 non-centroid, so C=8 provides 8× headroom above the average. The budget-bump fallback catches any groups that do exceed the cap.
-- **`ream_cost_sigma_threshold=1.5`** [D-ream-budget-bump]: If mean cost exceeds `running_mean × (1 + 1.5)`, bump target (inactive for the first 4 layers that contribute valid mean-cost samples — layers without merges or with all-zero pair costs are excluded from the running history)
-
-### Resume
-
-Per-layer atomic checkpointing to `_stage2_partial/` (see §11 for the `.tmp + os.replace` idiom and `.pt`-before-`.json` ordering invariant):
-- `merge_{layer_idx}.json`: centroid IDs, groupings, frequencies, merge map
-- `layer_{layer_idx}.pt`: covariance snapshot for this layer
-
-On resume, completed layers are replayed from partial files (fast, no forward pass). The model must be passed in pre-merge state (Stage 1 output) — a guard checks `num_routed_experts` matches the pre-merge count.
-
-**Critical invariant:** Covariance remapping (`_remap_covariance_for_layer`) must happen BEFORE the snapshot. Snapshotting before remapping persists pre-merge expert keys, corrupting Stage 3 inputs on resume.
-
-### Stage 2 v2 (revision spec: `max_quality/docs/stage2_assignment_revision.md`)
-
-The **assignment + cost-matrix + merge** pipeline above is the v1 baseline (greedy + symmetric δ_REAM cost + freq-weighted merge, all preserved bit-identically when the v2 flags below are at their defaults). Stage 2 v2 layers the following opt-in features on top, gated by config flags under `stage2_reap_ream:`. Defaults are baseline-off; flipping them on activates each feature in isolation for ablation. See `max_quality/docs/stage2_assignment_revision.md` for the full design and the § 8 ablation matrix that locks in production defaults.
-
-- **`assignment_solver`** (default `"greedy"`) — replaces the legacy descending-saliency greedy with a configurable solver: `hungarian` (rectangular `scipy.linear_sum_assignment` for slack-capacity 1-1 assignment), `mcf` (capacitated min-cost flow via OR-Tools `SimpleMinCostFlow`), `auto` (dispatch hungarian↔mcf based on `n_NC ≤ N'_l`), or `sinkhorn` (capacitated entropy-regularized OT via log-domain Sinkhorn-Knopp with linear ε-annealing and a slack-child dummy-row construction). [D-mcf-assignment, D-sinkhorn-soft-assign]
-- **`cost_alignment`** (default `"pre"`) — when `"post"`, replaces the symmetric δ_REAM cost with the per-pair **Hungarian-aligned whitened residual** `‖(W_c − P_cm·W_m) · A^{1/2}‖_F` (sum over gate/up/down per the AA-SVD lineage; `A^{1/2}` multiplies ΔW on the **right**, input axis). The Hungarian permutation `P_cm` is cached and reused by the merge step, so each pair is aligned exactly once. [D-whitened-cost]
-- **`cost_whitening`** (default `"none"`) — `"diag"` uses `sqrt(diag(A))` (cheap fallback), `"full"` uses the eigen-sqrt `V·diag(sqrt(λ_clamped))·V^T` (AA-SVD form, mirrors `stage3_svd._precompute_eigh`).
-- **`cost_asymmetric`** (default `false`) — multiplies the post-alignment residual by `freq_m / (freq_c + freq_m)` so high-frequency non-centroids are penalized when they would dominate (wash out) a low-frequency centroid. Valid only with `ream.frequency_weighted_merge=true` (rejected at run-time otherwise). [D-asymmetric-freq]
-- **`cost_topk_filter`** (default `48`, only used when `cost_alignment="post"`) — the K-prefilter: per non-centroid m, only the top-K candidate centroids by cheap symmetric δ_REAM get the expensive whitened residual computed; the rest get `+∞` and the assignment solver treats them as forbidden arcs.
-- **`capacity_util_threshold`** (default `0.25`) — capacity-utilization gate (M3): `u = n_NC / (N'_l × C_max)`. When `u < threshold` the layer falls back to the cheap `"pre"` path regardless of `cost_alignment`, since slack capacity makes the heavy machinery unlikely to change the assignment. [D-capacity-util-gate]
-- **`em_refinement_rounds`** (default `0`) — EM-style assignment refinement (M4 / Sub-MoE): tentatively merge each non-singleton group with current assignment, recompute the cost matrix against the merged centroid, re-solve the assignment, repeat. Only meaningful under `cost_alignment="post"` (the cheap symmetric cost doesn't depend on centroid weights). Stops early if `em_convergence_break=true` (default) and the assignment stops changing. [D-em-refinement]
-- **`expert_distill_steps`** (default `0`) — per-merge-group MSE distillation (M8): for each non-singleton group, snapshot the pre-merge expert weights, then run AdamW (default 500 steps, lr=1e-4, betas=(0.9, 0.95)) to optimize the merged centroid against a freq-weighted target of pre-merge group-member outputs on reservoir-sampled layer-input tokens. Plateau early-break, fp32 optimizer with bf16 forward, bank weights restored to original dtype on writeback. [D-expert-distill-mse, D-expert-distill-mse-v1]
-
-**Resume schema (v2).** `_stage2_partial/merge_{layer_idx}.json` bumped from `format_version: 1` to `format_version: 2` to carry the new forensic / resume fields: `assignment_solver_used`, `cost_alignment_used`, `em_rounds_completed`, `distill_state` (per merged-group dict). **No backward-compat shim** — operators upgrading mid-pipeline must finish a stage on one version or restart cleanly (per § 11 strict version match).
+<!-- §5 Stage 2 (REAP Scoring + REAM Pseudo-Pruning) — CONSUMED by
+     stage2/plugins/* (commits pending). Full §5 narrative —
+     papers (REAP arXiv:2510.13999 + REAM arXiv:2604.04356),
+     hardware framing, sequential profiling with early-exit
+     optimization, blacklisted-expert exclusion, Step 1
+     (REAP Eq. 9 scoring), Step 2 (REAM Eqs. 5/7/8 cost matrix),
+     Step 3 (greedy pseudo-pruning + feasibility/quality bumps),
+     Step 4 (Eq. 6 freq-weighted merge + Hungarian alignment),
+     Step 5 (router resize), covariance side-collection, budget
+     bump loop, resume, and Stage 2 v2 opt-in feature catalog —
+     all relocated into the per-plugin module docstrings under
+     stage2/plugins/. -->
 
 ---
 
@@ -976,12 +859,12 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 | D-ma-detector (items 3-5 — sampling caps, batch sizes, num_calibration_samples) | 1 | <!-- SHARED — re-check at end --> | <!-- SHARED — items (3)-(5) of the original row remain; items (1)-(2) consumed by ma_detection --> | The 3.0 / 2.0 detector thresholds (item 1) and the 0.75 fallback (item 2) are now documented in the `ma_detection` plugin docstring; this row retains only the cross-plugin sampling items. | Resolve in Phase 9. |
 <!-- D-se-blacklist-merge — CONSUMED by stage1/plugins/grape_merge.py (commit pending). -->
 <!-- D-grape-restart-merge (lag-corrected post-selection restart) — CONSUMED by stage1/plugins/grape_merge.py (commit pending). -->
-| D5a | 2 | Cap on the number of experts merged into one survivor (max_merge_group_size) | 2604.04356 §4 / experiments: C=16 at 25% reduction (Qwen3-30B-A3B 96 centroids on 128 experts); C=32 at 50% reduction (64 centroids on 128 experts) | `max_merge_group_size = 8`; if any group exceeds the cap, the budget-bump loop raises `effective_target` until feasibility holds (or falls back to zero-merge for the layer) | Smaller groups reduce destructive averaging on long-tail experts: at our floor budget (256→128, ~30% reduction on a 256-expert pool) the per-centroid average absorption is 1.0 non-centroid, so C=8 provides 8× headroom above the average while still bounding any single survivor's merge breadth. The budget-bump loop catches feasibility violations (D-ream-budget-bump) so no expert weights are silently dropped. |
-| D5b | 2 | Cost matrix choice for neuron permutation alignment in merge | 2604.04356 Eq. 6: frequency-weighted average with neuron permutation alignment (Ainsworth et al., 2023) w.r.t. the centroid expert; cost matrix C unspecified | Hungarian permutation `P_i` with cost matrix `C = C_wt + C_act` (gate+up Frobenius weight distance + per-neuron mean-activation L2 distance) | Paper prescribes permutation but leaves the cost form open. Spec uses `C_wt + C_act`: weight-space Frobenius distance captures structural similarity; activation-weighted neuron L2 distance captures functional importance. *TODO: Ablation of cost matrix choice (C_wt only vs. C_wt + C_act vs. activation-only) pending Stage 6 evals.* |
+<!-- D5a — CONSUMED by stage2/plugins/layer_merge.py (commit pending). -->
+<!-- D5b — CONSUMED by stage2/plugins/layer_merge.py (commit pending). -->
 <!-- D-ream-aggregation — CONSUMED by stage2/plugins/ream_cost.py (commit pending). -->
 <!-- D-ream-similarity-rescale — CONSUMED by stage2/plugins/ream_cost.py (commit pending). -->
 <!-- D-ream-sparse-routing — CONSUMED by stage2/plugins/ream_cost.py (commit pending). -->
-| D-ream-budget-bump | 2 | Per-layer feasibility / quality gate around REAM target | 2604.04356: no feasibility-bump loop or cost-threshold gate described | Two project-original gates raise the layer's effective centroid count: (1) feasibility — if `N'_l × max_merge_group_size < N_l − N'_l` (i.e., the per-centroid cap, which counts non-centroids only per §5 Step 4, cannot absorb every non-centroid), bump `effective_target` by `max(1, ceil(effective_target × cost_bump_ratio))` and retry; falls back to zero-merge if `effective_target` reaches `n_experts` without feasibility. The §5 Step 3 form (`N'_l × max_merge_group_size ≥ N_l − N'_l`) is canonical; the implementation matches it (`stage2_reap_ream.py` line 381: `n_ream_nc > n_ream_c * max_group_cap`, where `n_ream_nc = N_l − N'_l`). (2) quality — if mean assigned cost exceeds `running_mean × (1 + ream_cost_sigma_threshold)` with `ream_cost_sigma_threshold = 1.5` (mean-relative multiplier; inactive for the first 4 layers that contribute valid mean-cost samples while the running mean stabilizes), bump target. | Feasibility gate guarantees every non-centroid is assignable under the D5a cap — without it, a large `max_merge_group_size` violation would silently drop expert weights. Quality gate prevents a layer from being forced through a high-cost (poor-similarity) merge configuration when the REAP/REAM signal indicates the target is too aggressive for that layer; the threshold value 1.5 is mean-relative (post-warm-up) and was tuned to fire only on outlier layers, leaving most layers at their GRAPE-allocated target. **Quality-gate exhaustion:** distinct from the feasibility-fallback above, if the quality gate is still active when `effective_target = n_experts`, the spec applies the most recent above-threshold assignment (last-resort apply-anyway) instead of zero-merging; rationale: quality-gate failures often coincide with naturally high-cost layers where any single-cap-respecting assignment is the best available, and zero-merging would unnecessarily cost compression. **Orphan-singleton promotion:** if the capped greedy assignment leaves any non-centroid unassigned (rare edge case where every centroid's cap is saturated by lower-cost candidates), the orphan is promoted to a singleton centroid (no merge) for that layer — defensive safety net; the Step-3 feasibility check is designed to prevent this. |
+<!-- D-ream-budget-bump — CONSUMED by stage2/plugins/layer_merge.py (commit pending). -->
 <!-- D-reap-routing-weight — CONSUMED by stage2/plugins/reap_scoring.py (commit pending). -->
 <!-- D-ream-resume-fallback — CONSUMED by stage2/plugins/ream_cost.py (commit pending). -->
 <!-- D-mcf-assignment — CONSUMED by stage2/plugins/solver_hungarian.py + solver_mcf.py + solver_auto.py (commits pending). -->

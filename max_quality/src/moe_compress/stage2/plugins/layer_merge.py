@@ -1,11 +1,249 @@
-"""Stage-2 per-layer merge spine — the always-on ``LayerMergePlugin``.
+"""Stage 2 per-layer merge spine — REAM Eq. 6 + sequential-profiling orchestration.
 
-S2-12a relocates the SIX live phase hooks of the retired ``LegacyAdapter``
-(``on_layer_setup`` / ``on_profile`` / ``merge`` / ``post_merge`` /
-``write_artifacts`` / ``on_layer_teardown``) into this one always-on plugin.
-Each hook below is a verbatim slice of the legacy loop body, with long
-explanatory comments preserved (the original lines are the load-bearing
-documentation of the accumulator / merge / artifact semantics).
+This plugin owns the always-on per-layer merge orchestration: the
+accumulator construction, the early-exit forward profile, the REAM
+Eq. 6 frequency-weighted merge with Hungarian intermediate-neuron
+alignment, the budget-bump feasibility/quality loop, the router
+resize, the covariance snapshot, and the artifact write. Specific
+cost/solver/refine/distill/heal plugins live as siblings in this
+package; this plugin is the merge spine that wires them through the
+six live phase hooks.
+
+Paper
+-----
+Liu et al., "REAM: Routing Expert Activation Merging for MoE
+Compression" — arXiv:2604.04356.
+audit/spec_compliance/01_papers/2604.04356/source.md.
+
+Equation 6 (frequency-weighted merge):
+
+    W_merged = Σ_i (freq_i / Σ_j freq_j) · P_i(W_i)
+
+where ``P_i`` is the Hungarian neuron-permutation alignment of
+``W_i`` to the centroid expert (intermediate-neuron axis), and
+``Σ_j freq_j`` sums over the merge-group members only (group
+renormalization — see D-ream-aggregation in
+:mod:`stage2.plugins.ream_cost` for the renormalization rationale).
+
+Plus the surrounding §3-§4 sequential-profiling pipeline:
+
+- Sequential merging (paper §4 / Fig. 1(b)): after merging layer ℓ,
+  activations are recomputed through the merged layer before profiling
+  layer ℓ+1. The paper's ablation (§5.4) measures ΔAVG = −1.0 when
+  sequential merging is removed.
+- Early-exit forward pass (project-pragmatic optimization, paper-
+  equivalent): for each layer ``L``, run forward from input embedding
+  through layers 0...L only, collecting metrics from layer ``L``'s
+  hooks. Layers L+1..N-1 are skipped via an exception-raising hook on
+  the next decoder layer. Pure ~2× wall-clock speedup; semantics
+  preserved exactly because every layer-L metric depends only on
+  hidden states arriving AT layer ``L``.
+
+Official code
+-------------
+``SamsungSAILMontreal/ream`` @ commit
+``84a3030716a0059589e9d10e2ea049e32b76cfa6`` (2026-04-16) —
+github.com/SamsungSAILMontreal/ream. The reference implementation
+(``ream/ream.py`` lines 60-87 for assignment, plus the broader
+sequential pipeline in the same repo) is the basis for this plugin.
+
+Deviation: D5a — per-centroid cap
+---------------------------------
+REAM §4 / experiments use ``C = 16`` at 25 % reduction (Qwen3-30B-A3B,
+96 centroids on 128 experts) and ``C = 32`` at 50 % reduction
+(64 centroids on 128 experts). This plugin uses
+``max_merge_group_size = 8`` (configurable).
+
+Rationale: smaller groups reduce destructive averaging on long-tail
+experts. At the project's floor budget (256 → 128, ~30 % reduction
+on a 256-expert pool), the per-centroid average absorption is 1.0
+non-centroid, so ``C = 8`` provides 8× headroom above the average
+while still bounding any single survivor's merge breadth. The
+budget-bump loop catches feasibility violations (D-ream-budget-bump)
+so no expert weights are silently dropped.
+
+Deviation: D5b — cost matrix for neuron permutation alignment
+-------------------------------------------------------------
+REAM Eq. 6's ``P_i`` is described as a Hungarian alignment of
+intermediate neurons to the centroid (Ainsworth et al. 2023), but the
+**cost matrix** ``C`` for that Hungarian is **unspecified** by the
+paper.
+
+This plugin uses ``C = C_wt + C_act`` (both min-max normalized to
+``[0, 1]``):
+
+- ``C_wt`` is the gate+up Frobenius weight distance:
+  ``C_wt[p, q] = ‖W_gate^p − W_gate^q‖_F + ‖W_up^p − W_up^q‖_F``
+  (sum of independent gate and up Frobenius distances — note: this
+  is **not** the block-Frobenius
+  ``‖[W_gate^p, W_up^p] − [W_gate^q, W_up^q]‖_F``; the spec uses the
+  L1-of-Frobenius-distances aggregation instead). Min-max normalized
+  to ``[0, 1]``.
+- ``C_act`` is the per-neuron mean-activation L2 distance.
+  Gate-output rows are L2-normalized per-row before computing
+  pairwise Euclidean distances (equivalent to cosine distance on the
+  normalized rows). Min-max normalized to ``[0, 1]``.
+
+Rationale: paper prescribes Hungarian permutation but leaves the cost
+form open. ``C_wt`` captures structural similarity; ``C_act``
+captures functional importance. (Ablation of cost matrix choice —
+``C_wt`` only vs ``C_wt + C_act`` vs ``C_act`` only — is a TODO
+pending Stage 6 evals.)
+
+Deviation: D-ream-budget-bump — feasibility / quality gates
+-----------------------------------------------------------
+REAM does not describe a feasibility-bump loop or cost-threshold
+quality gate. Two project-original gates raise the per-layer effective
+centroid count:
+
+  (1) **Feasibility gate**: if
+      ``N'_l × max_merge_group_size < N_l − N'_l`` (the per-centroid
+      cap, which counts non-centroids only, cannot absorb every
+      non-centroid), bump ``effective_target`` by
+      ``max(1, ceil(effective_target × cost_bump_ratio))`` and retry.
+      Falls back to zero-merge if ``effective_target`` reaches
+      ``n_experts`` without feasibility — guaranteeing no expert
+      weights are silently dropped.
+  (2) **Quality gate**: if mean assigned cost exceeds
+      ``running_mean × (1 + ream_cost_sigma_threshold)`` with
+      ``ream_cost_sigma_threshold = 1.5`` (mean-relative multiplier;
+      inactive for the first 4 layers that contribute valid mean-cost
+      samples while the running mean stabilizes), bump target.
+
+**Quality-gate exhaustion (last-resort apply-anyway):** distinct from
+the feasibility-fallback above, if the quality gate is still active
+when ``effective_target = n_experts``, the plugin applies the most
+recent above-threshold assignment instead of zero-merging — rationale:
+quality-gate failures often coincide with naturally high-cost layers
+where any single-cap-respecting assignment is the best available, and
+zero-merging would unnecessarily cost compression.
+
+**Orphan-singleton promotion:** if the capped greedy assignment leaves
+any non-centroid unassigned (rare edge case where every centroid's cap
+is saturated by lower-cost candidates), the orphan is promoted to a
+singleton centroid for that layer (no merge) — defensive safety net;
+the feasibility check is designed to prevent this.
+
+Blacklisted-expert exclusion
+----------------------------
+Before any REAP/REAM computation, super experts (SEs) are excluded
+from the routed expert pool — they are not candidates for the
+centroid set and not candidates for the non-centroid set; their
+weights pass through Stage 2 unchanged. SEs are identified by the
+``(layer, expert)`` pairs in ``stage1_blacklist.json``. Placing an SE
+in the centroid set would allow non-centroid weights to be merged
+into it, modifying the SE's weights — defeating the purpose of
+blacklisting.
+
+Shared experts (``mlp.shared_expert``) are never in scope: they live
+in a separate model attribute, are not indexed as routed experts, and
+are never iterated by ``iter_moe_layers``. No explicit exclusion logic
+needed.
+
+All counts here (``N'_l``, feasibility checks, group sizes) refer to
+**non-SE routed experts only**.
+
+Router resize (Step 5)
+----------------------
+Remove merged non-centroid experts' rows from ``gate.weight``. Update
+``num_experts`` on the MoE block. SE rows are **not removed** — they
+remain in the router and expert list unchanged.
+
+Covariance side-collection (also used by Stage 3 / 4)
+-----------------------------------------------------
+During the profiling forward pass, two covariance matrices are
+accumulated per ``(layer, expert)``:
+
+- ``A_gate_up`` (``gate_proj``): input covariance for ``gate_proj``
+  and ``up_proj`` (shared tensor).
+- ``A_down`` (``down_proj``): input covariance for ``down_proj``
+  (intermediate activations).
+
+Stored in ``_stage2_input_covariance.pt`` (fp16 persisted dtype per
+D-cov-storage-fp16 — SHARED with Stage 3; consumed there at
+:mod:`stage3.plugins.covariance_collection` / ``swift_svd_alpha``).
+Eigendecomposition still runs in fp64 in-memory in Stage 3, so
+numerical conditioning is preserved.
+
+Resume
+------
+Per-layer atomic checkpointing to ``_stage2_partial/`` (see project
+§11 for the ``.tmp + os.replace`` idiom and ``.pt``-before-``.json``
+ordering invariant):
+
+- ``merge_{layer_idx}.json``: centroid IDs, groupings, frequencies,
+  merge map.
+- ``layer_{layer_idx}.pt``: covariance snapshot for this layer.
+
+On resume, completed layers are replayed from partial files (fast, no
+forward pass). The model must be passed in pre-merge state (Stage 1
+output) — a guard checks ``num_routed_experts`` matches the pre-merge
+count.
+
+**Critical invariant**: covariance remapping
+(``_remap_covariance_for_layer``) must happen BEFORE the snapshot.
+Snapshotting before remapping persists pre-merge expert keys,
+corrupting Stage 3 inputs on resume.
+
+Resume schema v2: ``_stage2_partial/merge_{layer_idx}.json`` bumped
+from ``format_version: 1`` to ``format_version: 2`` to carry the new
+forensic / resume fields: ``assignment_solver_used``,
+``cost_alignment_used``, ``em_rounds_completed``, ``distill_state``
+(per merged-group dict). **No backward-compat shim** — operators
+upgrading mid-pipeline must finish a stage on one version or restart
+cleanly (per project §11 strict version match).
+
+Sequential profiling with early-exit (project-pragmatic optimization)
+---------------------------------------------------------------------
+The REAM paper §4 introduces *sequential merging* as a core
+contribution: after merging layer ℓ, activations are recomputed
+through the merged layer before profiling layer ℓ+1, ensuring each
+layer's REAP scores and REAM cost matrices reflect the actual input
+distribution it will see at inference time (not stale pre-merge
+statistics). The paper's ablation (§5.4) measures ΔAVG = −1.0 when
+sequential merging is removed.
+
+Implementation: for each layer ``L`` (processed in order 0→39), the
+profiling forward pass runs from the input embedding through layers
+0...L, collecting REAP/REAM/covariance data from layer L's hooks.
+Layers L+1...39 are **not executed** — their computation is pure
+waste because all metrics collected for layer ``L`` (REAP scores,
+δ_gate, δ̃_expert, input covariance) depend only on the hidden states
+that *arrive at* layer ``L``, not on what happens after it. An
+**early-exit forward hook** registered on the decoder layer
+immediately after layer ``L`` raises a sentinel exception that aborts
+the forward pass cleanly. The profiling runs under
+``torch.no_grad()``, so no autograd graph is corrupted.
+
+This gives a ~2× wall-clock speedup over the naïve approach (running
+all 40 layers for each of the 40 profiling passes): the total
+layer-forward count drops from 40 × 40 = 1600 to
+1 + 2 + 3 + ... + 40 = 820. The REAM paper's sequential merging
+semantics are preserved exactly — each layer is profiled on hidden
+states that reflect all prior merges.
+
+Six live phase hooks (S2-12a)
+-----------------------------
+S2-12a relocates the SIX live phase hooks of the retired
+``LegacyAdapter`` (``on_layer_setup`` / ``on_profile`` / ``merge`` /
+``post_merge`` / ``write_artifacts`` / ``on_layer_teardown``) into
+this one always-on plugin. Each hook is a verbatim slice of the
+legacy loop body, with long explanatory comments preserved (the
+original lines are the load-bearing documentation of the accumulator
+/ merge / artifact semantics).
+
+The dead ``dispatch_first``-slot fallbacks (``compute_cost`` /
+``apply_cost_mask`` / ``solve_assignment`` / ``refine_assignment`` /
+``pre_merge_snapshot``) are NOT relocated — they stay behind on the
+(now 100 %-dead) ``LegacyAdapter`` until S2-12b deletes that file.
+
+Naming-history note
+-------------------
+"Step 1-5" labels (project §5) and "Phase F" (legacy stage-1 monolith
+terminology occasionally reused in stage-2 logs) are
+naming-historical. The current plugin architecture has no
+step-numbering taxonomy; new prose drops the labels. Existing log
+lines / Trackio keys preserved for dashboard back-compat.
 
 The dead ``dispatch_first``-slot fallbacks (``compute_cost`` /
 ``apply_cost_mask`` / ``solve_assignment`` / ``refine_assignment`` /
@@ -51,8 +289,15 @@ class LayerMergePlugin:
 
     name = "layer_merge"
     paper = (
-        "Stage-2 per-layer merge spine: accumulators, profiling, in-place "
-        "merge, kept-set selection, artifacts."
+        "REAM Eq. 6 frequency-weighted merge + §3-4 sequential profiling — "
+        "arXiv:2604.04356 (Liu et al.). Official code: SamsungSAILMontreal/ream "
+        "@ 84a3030716a0059589e9d10e2ea049e32b76cfa6. "
+        "Deviations: D5a (max_merge_group_size=8 vs paper C=16/32), "
+        "D5b (C = C_wt + C_act for Hungarian neuron-alignment Hungarian; "
+        "paper leaves cost unspecified), D-ream-budget-bump (feasibility + "
+        "quality gates around N'_l). Calibration: D11 + D-cal-size "
+        "(see :mod:`stage2.plugins.reap_scoring`); covariance: "
+        "D-cov-storage-fp16 (shared with Stage 3). See module docstring."
     )
     config_key = "stage2_reap_ream"
     # reads / writes carried forward from LegacyAdapter, trimmed to exactly
