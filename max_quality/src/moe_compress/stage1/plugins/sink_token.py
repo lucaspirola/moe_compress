@@ -10,8 +10,10 @@ Appendix F Figures 20–21 (source.md L2479–L2486) document the paper's
 empirical observation:
 
     "This routing behavior of SEs ensures that the attention sink token is
-     strongly activated at the SEs. ... The sink token subsequently produces
-     activation outliers."   — source.md L721, L723
+     strongly activated at the SEs. Notably, this behavior is independent
+     of the input dataset (see Appendix F), which also explains why SEs
+     distributions are model-specific. The sink token subsequently produces
+     activation outliers."   — source.md L721–L723
 
 Figures 6 / 20 / 21 are descriptive histograms of expert-router score
 distributions for sink vs non-sink tokens, confirming sink-token-dominated
