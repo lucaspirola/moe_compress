@@ -1,4 +1,4 @@
-"""Thermometer bits-per-token (BPT) metric (S6A-3 of the Stage 6alt plugin-architecture refactor).
+"""Thermometer bits-per-token (BPT) metric — Stage 6alt plugin.
 
 Paper / spec source
 --------------------
@@ -19,50 +19,35 @@ more readable side-by-side ablation table.
 Pure forward pass, no generation. ``_bpt_from_nll`` turns mean NLL
 into BPT.
 
-Home of the Stage 6alt thermometer BPT-measurement concern, extracted
-from the legacy ``stage6alt_thermometer.py`` monolith. The thermometer's
-primary metric is bits-per-token: mean next-token NLL (in bits) over the
-fixed evaluation corpus that ``ThermoCorpusPlugin`` produced. Pure
-forward pass, no generation — ``_bpt_from_nll`` is the helper that turns
-a model + ``(num_seqs, seq_len)`` int64 calib tensor into a single BPT
-float (plus an optional per-token argmax tensor for the
-``top1_agreement`` metric).
+Home of the Stage 6alt thermometer BPT-measurement concern. The
+thermometer's primary metric is bits-per-token: mean next-token NLL (in
+bits) over the fixed evaluation corpus that ``ThermoCorpusPlugin``
+produced. Pure forward pass, no generation — ``_bpt_from_nll`` is the
+helper that turns a model + ``(num_seqs, seq_len)`` int64 calib tensor
+into a single BPT float (plus an optional per-token argmax tensor for
+the ``top1_agreement`` metric).
 
-Pattern A vs Pattern B
-----------------------
-S6A-3's BPT slice covers a MIXED pattern:
-
-* **Pattern A — relocated verbatim**: ``_bpt_from_nll`` below is a
-  character-identical copy of the monolith body. ``stage6alt_thermometer.py``
-  re-imports it (the ``# noqa: F401`` block) so ``run()`` and any external
-  caller / test that monkey-patches ``stage6alt_thermometer._bpt_from_nll``
-  keeps working unchanged — the re-import puts the SAME function object
-  on the monolith namespace.
-* **Pattern B — reproduced in an inert hook**: the monolith ``run()``'s
-  student-side BPT call site (``_bpt_from_nll(model, calib, device=device,
-  batch_size=bpt_batch, collect_argmax=True)`` writing ``student_bpt`` and
-  ``student_argmax``) is reproduced in the inert ``compute_bpt`` hook
-  below. The monolith ``run()`` is NOT modified for it. This is an
-  intentional, temporary logic duplication that resolves at S6A-6 when
-  the orchestrator flip wires this hook live and the monolith ``run()``
-  becomes a thin shim.
+Wiring
+------
+``BptMetricPlugin`` is **live-wired** by ``stage6alt.orchestrator``:
+the orchestrator constructs ``BptMetricPlugin()`` in its
+``PluginRegistry`` and dispatches ``walk_phases(("compute_bpt",), ...)``
+on the run context, which invokes the ``compute_bpt`` hook below. The
+hook reads ``model`` / ``calib_ids`` / ``config`` from the context and
+publishes ``student_bpt`` / ``student_argmax`` for downstream phases
+(zero-shot subset, teacher-side, report assembly).
 
 The dedup of the NLL loop against Stage 6's ``_wikitext2_ppl`` (a sibling
-NLL loop in ``stage6.plugins.wikitext_ppl``) is DEFERRED per the
-refactor plan (Option B): both copies stay independent for now so this
-slice remains a pure relocation.
+NLL loop in ``stage6.plugins.wikitext_ppl``) is intentionally NOT done:
+the two metrics serve different orchestrators with different attention
+contracts and corpus shapes, and keeping them independent avoids
+cross-stage coupling.
 
 Circular-import contract (mirror of ``stage6alt/plugins/thermo_corpus.py``):
 this module imports only from ``..context`` / ``...utils.calibration``
-/ stdlib / torch — NEVER from ``stage6alt_thermometer`` or
-``stage6alt.orchestrator`` at any scope (module-top OR function-local).
-The monolith re-imports *this* module's symbols at load time, so a
-``from ..stage6alt_thermometer import ...`` here would deadlock the
-import; nothing in this module does that.
-
-``BptMetricPlugin`` is registered-but-INERT at S6A-3 — no orchestrator
-walk or test invokes its ``compute_bpt`` hook. S6A-6 plugs the hook into
-the live Stage 6alt plugin sequencer.
+/ stdlib / torch — NEVER from ``stage6alt.orchestrator`` at any scope
+(module-top OR function-local), so the orchestrator can freely import
+this module without risk of an import cycle.
 """
 from __future__ import annotations
 
@@ -169,7 +154,11 @@ def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int,
                 log.warning("stage6alt _bpt_from_nll: batch error (%s); skipping", exc)
                 skipped += 1
                 continue
-            if (i + 1) % max(1, 64 // batch_size) == 0:
+            # round (not floor) so batch_size > 64 still rounds to every-batch
+            # logging instead of dividing by zero — keeps the "every ~64
+            # sequences" intent symmetric around the 64-token boundary.
+            # Mirrors stage6/plugins/wikitext_ppl.py cadence discipline.
+            if (i + 1) % max(1, round(64 / batch_size)) == 0:
                 log.info("  BPT forward %d/%d batches", i + 1,
                          math.ceil(n_seqs / batch_size))
     if skipped > 0:
@@ -190,15 +179,15 @@ def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int,
 
 
 class BptMetricPlugin:
-    """Stage 6alt thermometer BPT-metric plugin (S6A-3 — registered-but-INERT).
+    """Stage 6alt thermometer BPT-metric plugin.
 
-    Owns the Stage 6alt BPT-measurement concern: the relocated
-    ``_bpt_from_nll`` helper (Pattern A) plus an inert ``compute_bpt`` hook
-    (Pattern B) that reproduces the monolith's student-side call site.
+    Owns the Stage 6alt BPT-measurement concern: the ``_bpt_from_nll``
+    helper plus the ``compute_bpt`` phase hook that runs the student-side
+    BPT pass.
 
-    S6A-3 wires this class into the plugin registry as metadata only — no
-    orchestrator walk or test invokes ``compute_bpt``. S6A-6 plugs the hook
-    into the live Stage 6alt plugin sequencer.
+    Live-wired by ``stage6alt.orchestrator``: registered in the
+    ``PluginRegistry`` and invoked via ``walk_phases(("compute_bpt",), ...)``
+    after the corpus is built and before the zero-shot subset phase.
     """
 
     name = "bpt_metric"
@@ -224,25 +213,18 @@ class BptMetricPlugin:
         return {}
 
     def compute_bpt(self, ctx: PipelineContext) -> None:
-        """Phase hook — Stage 6alt thermometer student-BPT (S6A-6 wiring surface).
+        """Phase hook — Stage 6alt thermometer student-BPT.
 
-        INERT at S6A-3: no orchestrator walk or test invokes this hook. S6A-6
-        replaces the Stage 6alt orchestrator body with the plugin sequencer
-        and dispatches this hook in place of the monolith ``run()``'s inline
-        ``_bpt_from_nll`` student-side call. The body below reproduces that
-        inline call faithfully — it is dead code at S6A-3 but S6A-6 relies on
-        it once the monolith ``run()`` becomes a thin shim.
+        Live-wired: ``stage6alt.orchestrator.run`` dispatches
+        ``walk_phases(("compute_bpt",), plugins, run_ctx)`` after
+        ``build_corpus`` and before ``compute_zero_shot_subset``, which
+        invokes this method.
 
-        Reproduces the monolith ``run()``'s student-side call:
-
-            bpt_batch = int(therm.get("bpt_batch_size", 8))
-            student_bpt, student_argmax = _bpt_from_nll(
-                model, calib, device=device, batch_size=bpt_batch,
-                collect_argmax=True,
-            )
-
-        The two return values are written to ``student_bpt`` /
-        ``student_argmax`` ctx slots.
+        Reads ``model`` / ``calib_ids`` / ``config`` from ``ctx``, resolves
+        ``bpt_batch_size`` from ``config.stage6_validate.thermometer``,
+        calls ``_bpt_from_nll`` with ``collect_argmax=True``, and writes
+        the two return values to the ``student_bpt`` / ``student_argmax``
+        ctx slots for the downstream report-assembly phase.
         """
         # Required slots — direct get(): a missing one is a wiring bug and
         # SHOULD raise.
