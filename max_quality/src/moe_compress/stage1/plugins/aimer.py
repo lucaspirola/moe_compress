@@ -67,7 +67,7 @@ applies Eq. (5) to whatever tensor ``w`` it receives — the FORMULA is
 paper-exact. This plugin then calls it with **only** the expert's
 ``down_proj`` weight tensor (see :meth:`AimerDetectorPlugin.run` —
 ``aimer_scores[(ref.layer_idx, e)] = aimer_score_tensor(w_down)``),
-**not** the gate+up+down concatenation Algorithm 1 prescribes.
+**not** the gate+up+down combination prescribed by Algorithm 1 / Eq. (5).
 
 Rationale (introduced in commit ``507a979`` "feat(stage1): AIMER
 weight-only expert score utility"; preserved in S1-1 commit

@@ -1,4 +1,4 @@
-"""AIMER: Activation-Independent Magnitude-Energy Ratio for expert scoring.
+"""AIMER: Absolute mean over root mean square IMportance for Expert Ranking.
 
 AIMER (arxiv:2603.18492) measures weight-vector "peakedness":
 
