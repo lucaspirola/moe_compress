@@ -24,6 +24,11 @@ where ``P_i`` is the Hungarian neuron-permutation alignment of
 ``Σ_j freq_j`` sums over the merge-group members only (group
 renormalization — see D-ream-aggregation in
 :mod:`stage2.plugins.ream_cost` for the renormalization rationale).
+Note: the paper's per-expert ``S^freq_i = freq_i / |X|`` (selection
+frequency normalized by token count) cancels the ``|X|`` factor
+through the ``Σ_j`` denominator, so using raw ``freq_i`` here is
+algebraically equivalent — the ratios ``freq_i / Σ_j freq_j`` and
+``S^freq_i / Σ_j S^freq_j`` are identical.
 
 Plus the surrounding §3-§4 sequential-profiling pipeline:
 
@@ -49,45 +54,81 @@ sequential pipeline in the same repo) is the basis for this plugin.
 
 Deviation: D5a — per-centroid cap
 ---------------------------------
-REAM §4 / experiments use ``C = 16`` at 25 % reduction (Qwen3-30B-A3B,
-96 centroids on 128 experts) and ``C = 32`` at 50 % reduction
-(64 centroids on 128 experts). This plugin uses
-``max_merge_group_size = 8`` (configurable).
+**Semantics difference (read carefully).** The paper's ``group_size``
+parameter and this plugin's ``max_merge_group_size`` count different
+things:
+
+- Official REAM (``ream/ream.py`` L75-82 @
+  ``84a3030716a0059589e9d10e2ea049e32b76cfa6``): ``group = [centroid]``
+  then ``break when len(group) >= group_size`` — i.e. ``group_size`` is
+  the **total** group size **including** the centroid itself.
+- This plugin: ``max_merge_group_size`` is a cap on **non-centroids
+  only** (the centroid is implicit and not counted).
+
+Equivalence: plugin ``max_merge_group_size = 8`` → total group of 9
+(centroid + 8 non-centroids); paper ``group_size = 16`` → 15
+non-centroids (in plugin semantics); paper ``group_size = 32`` → 31
+non-centroids.
+
+REAM §4 / experiments use ``group_size = 16`` at 25 % reduction
+(Qwen3-30B-A3B, 96 centroids on 128 experts) and ``group_size = 32``
+at 50 % reduction (64 centroids on 128 experts). In plugin semantics
+that is ~15 and ~31 non-centroids respectively. This plugin uses
+``max_merge_group_size = 8`` (configurable) — so the cap is roughly
+**half as permissive** as the paper's 25 %-reduction recipe (8 vs
+~15 in plugin semantics).
 
 Rationale: smaller groups reduce destructive averaging on long-tail
 experts. At the project's floor budget (256 → 128, ~30 % reduction
 on a 256-expert pool), the per-centroid average absorption is 1.0
 non-centroid, so ``C = 8`` provides 8× headroom above the average
 while still bounding any single survivor's merge breadth. The
-budget-bump loop catches feasibility violations (D-ream-budget-bump)
-so no expert weights are silently dropped.
+budget-bump loop (D-ream-budget-bump) catches feasibility violations
+and bumps ``effective_target`` upward as needed, so no expert weights
+are silently dropped when the tighter cap would otherwise be
+infeasible.
 
 Deviation: D5b — cost matrix for neuron permutation alignment
 -------------------------------------------------------------
-REAM Eq. 6's ``P_i`` is described as a Hungarian alignment of
-intermediate neurons to the centroid (Ainsworth et al. 2023), but the
-**cost matrix** ``C`` for that Hungarian is **unspecified** by the
-paper.
+REAM §4 (L399-415 of ``source.md``) explicitly defines the Hungarian
+cost matrix as ``C = C_act + C_wt`` — a **raw sum** of the activation
+and weight components, with ``[C_wt]_pq = ‖W^p_{c_i} − W^q_j‖_2`` (a
+single ``W`` per expert, the paper does not specify which projection
+of an SwiGLU expert is meant).
 
-This plugin uses ``C = C_wt + C_act`` (both min-max normalized to
-``[0, 1]``):
+This plugin's deviation from the paper is twofold:
 
-- ``C_wt`` is the gate+up Frobenius weight distance:
-  ``C_wt[p, q] = ‖W_gate^p − W_gate^q‖_F + ‖W_up^p − W_up^q‖_F``
-  (sum of independent gate and up Frobenius distances — note: this
-  is **not** the block-Frobenius
-  ``‖[W_gate^p, W_up^p] − [W_gate^q, W_up^q]‖_F``; the spec uses the
-  L1-of-Frobenius-distances aggregation instead). Min-max normalized
-  to ``[0, 1]``.
-- ``C_act`` is the per-neuron mean-activation L2 distance.
-  Gate-output rows are L2-normalized per-row before computing
-  pairwise Euclidean distances (equivalent to cosine distance on the
-  normalized rows). Min-max normalized to ``[0, 1]``.
+1. **Normalization.** This plugin min-max normalizes both ``C_wt`` and
+   ``C_act`` to ``[0, 1]`` independently **before** summing, rather
+   than summing the raw distances as written in the paper. Rationale:
+   the two components live on very different numerical scales (weight
+   Frobenius distances vs activation L2 distances on normalized
+   rows); raw summation would let whichever component has the larger
+   dynamic range dominate the Hungarian assignment. Min-max
+   normalization equalizes their influence.
 
-Rationale: paper prescribes Hungarian permutation but leaves the cost
-form open. ``C_wt`` captures structural similarity; ``C_act``
-captures functional importance. (Ablation of cost matrix choice —
-``C_wt`` only vs ``C_wt + C_act`` vs ``C_act`` only — is a TODO
+2. **SwiGLU gate+up aggregation.** The paper writes a single ``W`` per
+   expert and does not say which projection of an SwiGLU expert is
+   used. This plugin combines gate and up via separate Frobenius
+   distances summed (L1-of-Frobenius), not via a block-Frobenius over
+   ``[W_gate, W_up]``:
+
+   ``C_wt[p, q] = ‖W_gate^p − W_gate^q‖_F + ‖W_up^p − W_up^q‖_F``
+
+   This is **not** the block-Frobenius
+   ``‖[W_gate^p, W_up^p] − [W_gate^q, W_up^q]‖_F``.
+
+Components (each min-max normalized to ``[0, 1]`` before summing):
+
+- ``C_wt``: gate+up Frobenius weight distance, as defined above.
+- ``C_act``: per-neuron mean-activation L2 distance. Gate-output rows
+  are L2-normalized per-row before computing pairwise Euclidean
+  distances (equivalent to cosine distance on the normalized rows).
+
+Rationale: ``C_wt`` captures structural similarity; ``C_act``
+captures functional importance; normalization keeps both components
+comparable. (Ablation of cost matrix choice — ``C_wt`` only vs
+``C_wt + C_act`` vs ``C_act`` only, raw vs normalized — is a TODO
 pending Stage 6 evals.)
 
 Deviation: D-ream-budget-bump — feasibility / quality gates
@@ -210,10 +251,12 @@ Layers L+1...39 are **not executed** — their computation is pure
 waste because all metrics collected for layer ``L`` (REAP scores,
 δ_gate, δ̃_expert, input covariance) depend only on the hidden states
 that *arrive at* layer ``L``, not on what happens after it. An
-**early-exit forward hook** registered on the decoder layer
-immediately after layer ``L`` raises a sentinel exception that aborts
-the forward pass cleanly. The profiling runs under
-``torch.no_grad()``, so no autograd graph is corrupted.
+**early-exit forward hook** is registered on decoder layer ``L+1``'s
+input forward hook (i.e. it fires as ``L+1`` begins to consume the
+hidden state ``L`` just produced, before any ``L+1`` compute runs);
+the hook raises a sentinel exception that aborts the forward pass
+cleanly. The profiling runs under ``torch.no_grad()``, so no autograd
+graph is corrupted.
 
 This gives a ~2× wall-clock speedup over the naïve approach (running
 all 40 layers for each of the 40 profiling passes): the total
@@ -244,11 +287,6 @@ terminology occasionally reused in stage-2 logs) are
 naming-historical. The current plugin architecture has no
 step-numbering taxonomy; new prose drops the labels. Existing log
 lines / Trackio keys preserved for dashboard back-compat.
-
-The dead ``dispatch_first``-slot fallbacks (``compute_cost`` /
-``apply_cost_mask`` / ``solve_assignment`` / ``refine_assignment`` /
-``pre_merge_snapshot``) are NOT relocated — they stay behind on the (now
-100%-dead) ``LegacyAdapter`` until S2-12b deletes that file.
 
 Run-scope mutable scratchpad (``cov_acc``, ``merge_map``,
 ``_layer_mean_costs``, ``partial_dir``) lives as instance attributes on this
@@ -293,7 +331,7 @@ class LayerMergePlugin:
         "arXiv:2604.04356 (Liu et al.). Official code: SamsungSAILMontreal/ream "
         "@ 84a3030716a0059589e9d10e2ea049e32b76cfa6. "
         "Deviations: D5a (max_merge_group_size=8 vs paper C=16/32), "
-        "D5b (C = C_wt + C_act for Hungarian neuron-alignment Hungarian; "
+        "D5b (C = C_wt + C_act for Hungarian neuron-alignment; "
         "paper leaves cost unspecified), D-ream-budget-bump (feasibility + "
         "quality gates around N'_l). Calibration: D11 + D-cal-size "
         "(see :mod:`stage2.plugins.reap_scoring`); covariance: "
