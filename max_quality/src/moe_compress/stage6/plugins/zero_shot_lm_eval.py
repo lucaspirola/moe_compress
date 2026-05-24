@@ -20,9 +20,11 @@ SHA. Invoked via the ``lm_eval`` package.
 
 Version contract: this plugin targets lm-eval ``>=0.4.5,<0.5``. The
 ``0.4.x`` series stabilised the ``acc_norm,none`` / ``acc,none`` metric
-keys we depend on at L122 / L128; lm-eval has historically renamed
-metric keys between minor releases, so a future ``0.5.x`` upgrade MUST
-be re-validated against this plugin before relaxing the upper bound.
+keys the metric-key preference list in ``_lm_eval_tasks`` depends on
+(line numbers are unstable; grep ``"acc_norm,none"`` in this file);
+lm-eval has historically renamed metric keys between minor releases, so
+a future ``0.5.x`` upgrade MUST be re-validated against this plugin
+before relaxing the upper bound.
 The upper bound is documented here rather than pinned in
 ``requirements.txt`` because Stage 6's exit-criteria deviation contract
 lives next to the metric-key logic it constrains.
@@ -33,9 +35,10 @@ ARC-Challenge accuracy is reported under the ``arc_challenge_acc`` key
 but the underlying lm-eval metric returned is ``acc_norm,none`` (length-
 normalised loglikelihood accuracy), NOT the raw ``acc`` reported in the
 original ARC paper (Clark et al. 2018, arXiv:1803.05457). The metric-
-key preference list at L122 — ``("acc_norm,none", "acc,none")`` — picks
-``acc_norm,none`` first whenever it is present, which it always is for
-ARC-C in lm-eval ``>=0.4.x``.
+key preference list inside ``_lm_eval_tasks`` —
+``("acc_norm,none", "acc,none")`` — picks ``acc_norm,none`` first
+whenever it is present, which it always is for ARC-C in lm-eval
+``>=0.4.x``.
 
 Rationale: this matches the EleutherAI Open-LLM-Leaderboard convention
 for ARC-Challenge (which the broader capability-tracking community
@@ -109,7 +112,8 @@ _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 # L3-fix (iter 1): this frozenset holds the FLAT METRIC KEYS we expose on the
 # Stage 6 result dict (each is ``"<lm_eval_task_id>_acc"``), NOT the bare lm-eval
 # task IDs (``arc_challenge`` / ``hellaswag``). The ``_acc`` suffix is the
-# project-side convention added by ``_lm_eval_tasks`` at L128 below.
+# project-side convention added by ``_lm_eval_tasks`` below (the ``f"{task}_acc"``
+# write into ``flat``).
 # ``_ZERO_SHOT_METRIC_KEYS`` is the canonical name; ``_ZERO_SHOT_TASKS`` is kept
 # as a back-compat alias for ``stage6_validate`` / ``validation_report`` and
 # tests that already import the historical name. Both bindings point at the
@@ -166,10 +170,10 @@ def _lm_eval_tasks(model, tokenizer, tasks: list[str], *, collect=None,
             "spec §9 #2 (batch-size-independent loglikelihood requires eager attn)."
         )
 
-    # L1-fix (iter 1): no outer try/except around the eval body. Real failures
-    # (CUDA OOM, lm-eval task-id typo, tokenizer mismatch, etc.) propagate to
-    # the caller with full traceback so Stage 6 fails loud rather than silently
-    # reporting an empty zero-shot dict.
+    # No outer try/except around the eval body. Real failures (CUDA OOM,
+    # lm-eval task-id typo, tokenizer mismatch, etc.) propagate to the caller
+    # with full traceback so Stage 6 fails loud rather than silently reporting
+    # an empty zero-shot dict.
     lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
     out = simple_evaluate(
         model=lm, tasks=list(tasks), num_fewshot=0,
@@ -231,7 +235,13 @@ class ZeroShotLmEvalPlugin:
         "See module docstring; Deviation D-arc-acc-norm applies."
     )
     config_key = "stage6_validate.zero_shot.enabled"
-    reads: tuple[str, ...] = ("model", "tokenizer", "config")
+    reads: tuple[str, ...] = (
+        "config",
+        "model",
+        "tokenizer",
+        "eval_results",
+        "eval_text_concat",
+    )
     writes: tuple[str, ...] = ("eval_results",)
     # eval_results is a shared collector the orchestrator pre-creates per side
     # and every eval plugin appends to; it is NOT a calibration-pass accumulator,
@@ -286,7 +296,6 @@ class ZeroShotLmEvalPlugin:
         ctx slot so the call shape matches even though that side-channel is not
         S6-3's concern.
         """
-        # N3-fix (iter 1): ``re`` is now imported at module scope.
         model = ctx.get("model")
         tokenizer = ctx.get("tokenizer")
         config = ctx.get("config")

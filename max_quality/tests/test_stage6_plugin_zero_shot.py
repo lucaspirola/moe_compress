@@ -147,7 +147,13 @@ def test_plugin_metadata():
     assert isinstance(plugin.reads, tuple)
     assert isinstance(plugin.writes, tuple)
     assert isinstance(plugin.provides, tuple)
-    assert plugin.reads == ("model", "tokenizer", "config")
+    assert plugin.reads == (
+        "config",
+        "model",
+        "tokenizer",
+        "eval_results",
+        "eval_text_concat",
+    )
     assert plugin.writes == ("eval_results",)
     # eval_results is a shared collector (in `writes`), not a calibration-pass
     # accumulator — `provides` is empty.
