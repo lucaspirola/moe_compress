@@ -33,12 +33,22 @@ Determinism
 -----------
 Greedy decoding (``do_sample=False``) under a fixed teacher + tokenizer +
 prompt set produces byte-identical traces, so the JSONL is reproducible and
-the cache invalidates correctly when (teacher_revision, prompts_hash,
-max_new_tokens, batch_size, load_in_4bit) change. The cache-key is folded
-into the output filename so multiple variants can coexist on disk. Note that
-``batch_size`` IS part of the key because eager attention's softmax reduction
-order varies with batch shape, so byte-identical output is only guaranteed
-when batch_size is held constant.
+the cache invalidates correctly when ANY of the nine cache-key components
+changes. The full key is:
+
+  1. ``teacher_repo``        — HF repo id of the teacher
+  2. ``teacher_revision``    — git revision / branch / tag at the repo
+  3. ``prompts_source``      — composite of source-id + num_prompts + seed
+  4. ``num_prompts``         — count of prompts requested (also in prompts_source)
+  5. ``max_new_tokens``      — generation cap
+  6. ``batch_size``          — folded in because eager-attention softmax
+                                reduction order varies with batch shape
+  7. ``load_in_4bit``        — NF4 vs BF16 teacher are not interchangeable
+  8. ``decode``              — currently fixed to "greedy"
+  9. ``schema_version``      — bump to invalidate ALL prior caches at once
+
+The cache-key is folded into the output filename so multiple variants can
+coexist on disk.
 
 Output schema
 -------------
@@ -59,7 +69,7 @@ Cost
 batch=8, BF16 teacher, kernel-cached). Pass ``--load-in-4bit`` (bitsandbytes
 NF4 with ``bnb_4bit_compute_dtype=bfloat16``) to roughly halve VRAM at the
 cost of ~10-15% throughput; FP8 throughput is achieved by passing an
-already-FP8-quantized teacher repo.
+already-FP8-quantized teacher repo (no validation; operator's responsibility).
 
 This is a ONE-SHOT pre-step — the JSONL is reused across every Stage-2 / 2.5
 run that points ``calibration.source: self-traces``. Re-run only when
@@ -88,7 +98,7 @@ log = logging.getLogger("build_self_traces_calib")
 
 
 def _iter_prompts_from_qwen3_pretrain_mix(
-    tokenizer, num_prompts: int, seed: int,
+    num_prompts: int, seed: int,
 ) -> Iterator[tuple[str, str]]:
     """Yield ``(prompt, domain)`` pairs drawn from the qwen3-pretrain-mix
     datasets, with per-subset counts that preserve the corpus's intended mix.
@@ -339,20 +349,44 @@ def _trim_at_first_eos(row_ids: Iterable[int], eos_ids: set[int]) -> list[int]:
 def _generate_traces(
     model, tokenizer, prompts: list[tuple[str, str]], *,
     batch_size: int, max_new_tokens: int,
+    already_done: int = 0,
 ) -> Iterator[dict]:
     """Greedy-generate teacher traces; yield
     ``{"messages": [...], "domain": "..."}`` rows. The ``domain`` field
     propagates the source-subset tag from the prompt iterator so the
     downstream self-traces loader can preserve the empirical domain mix
     at every draw.
+
+    ``already_done`` is the number of rows the caller has already persisted
+    (e.g. from a prior --resume scan). It is added to the progress LOG ONLY
+    so the operator sees absolute progress across the full requested set,
+    not just this session's slice. It does NOT shift the loop indexing —
+    ``prompts`` is the post-resume slice the caller passes in.
     """
     import torch
 
     # N2: only fall back to eos as pad when the tokenizer truly lacks a pad
     # token (Qwen3 ships with a distinct <|endoftext|> pad; preserving it
-    # keeps eos distinguishable from pad in gen_only).
+    # keeps eos distinguishable from pad in gen_only). L2: if the tokenizer
+    # exposes eos only as a list of ids (no string form / no eos_token_id),
+    # peel off the first id and set pad_token_id directly so we don't end up
+    # with pad_token=None silently.
     if tokenizer.pad_token is None and tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        eos_str = getattr(tokenizer, "eos_token", None)
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_str is not None:
+            tokenizer.pad_token = eos_str
+        elif isinstance(eos_id, (list, tuple)) and eos_id:
+            tokenizer.pad_token_id = int(eos_id[0])
+        elif isinstance(eos_id, int):
+            tokenizer.pad_token_id = eos_id
+        else:
+            raise RuntimeError(
+                f"tokenizer {type(tokenizer).__name__} has neither pad_token "
+                "nor a usable eos_token / eos_token_id to fall back on; "
+                "batched generation will fail without padding. Set pad_token "
+                "explicitly on this tokenizer before running."
+            )
     # Left-pad so batched generate output is right-aligned for slicing.
     tokenizer.padding_side = "left"
 
@@ -440,10 +474,17 @@ def _generate_traces(
         # L4: report both throughput metrics — prompts/s for batch-pacing,
         # s/trace based on what actually landed in the JSONL.
         s_per_trace = elapsed / yielded if yielded > 0 else float("inf")
+        # L3: surface ABSOLUTE progress across the full requested set, not
+        # just this session's slice. Loop indexing is unchanged — we only
+        # offset the numbers in the log.
+        log_done = already_done + done
+        log_total = already_done + total
+        log_yielded = already_done + yielded
         log.info(
             "[%d/%d prompts processed, %d traces yielded] — "
             "%.1fs elapsed (%.1f s/trace avg, %.1f s/prompt avg)",
-            done, total, yielded, elapsed, s_per_trace, elapsed / max(done, 1),
+            log_done, log_total, log_yielded,
+            elapsed, s_per_trace, elapsed / max(done, 1),
         )
 
 
@@ -452,11 +493,19 @@ def _generate_traces(
 # ---------------------------------------------------------------------------
 
 
-def _repo_exists_on_hub(repo: str, revision: str) -> bool:
-    """Best-effort HF Hub preflight (L1). Returns True if reachable OR if the
-    huggingface_hub helper is unavailable (don't block on missing optional
-    dep). Returns False ONLY when the hub responds with a clean "not found"
-    for the given repo+revision.
+def _repo_exists_on_hub(repo: str) -> bool:
+    """Best-effort HF Hub preflight (L1). Returns True if the repo id is
+    reachable OR if the huggingface_hub helper is unavailable (don't block on
+    a missing optional dep). Returns False ONLY when the hub responds with a
+    clean "not found" for the repo id.
+
+    Note: ``huggingface_hub.repo_exists`` checks repo-id existence only
+    (signature: ``(repo_id, *, repo_type=None, token=None)``); it does NOT
+    accept a ``revision=`` kwarg — revision-level existence is a separate
+    ``revision_exists()`` helper. For this preflight we just need to catch
+    typo'd / private / missing repo ids before paying the model-load bill;
+    revision / structural / version-mismatch errors are surfaced by
+    AutoModel.from_pretrained downstream.
     """
     try:
         from huggingface_hub import repo_exists  # type: ignore
@@ -464,11 +513,12 @@ def _repo_exists_on_hub(repo: str, revision: str) -> bool:
         log.info("repo_exists preflight skipped (huggingface_hub unavailable).")
         return True
     try:
-        return bool(repo_exists(repo, revision=revision))
+        return bool(repo_exists(repo))
     except Exception as err:  # noqa: BLE001
-        log.info("repo_exists preflight inconclusive for %s@%s (%s) — "
-                 "proceeding; AutoModel.from_pretrained will surface real errors.",
-                 repo, revision, err)
+        log.info("repo_exists preflight inconclusive for %s (%s) — "
+                 "proceeding; AutoModel.from_pretrained will surface "
+                 "revision / structural / version-mismatch errors.",
+                 repo, err)
         return True
 
 
@@ -510,11 +560,12 @@ def main() -> int:
     # L1: HF Hub preflight catches the user's typo before we burn ~1-2s on
     # tokenizer-load + several seconds on model-load. We don't block on
     # network/auth failures — only on a confirmed "repo not found".
-    if not _repo_exists_on_hub(args.teacher, args.teacher_revision):
+    if not _repo_exists_on_hub(args.teacher):
         log.error(
-            "teacher %s@%s does not exist on the Hugging Face Hub. Check "
-            "for a typo, a missing revision, or a private repo you're not "
-            "authenticated for.", args.teacher, args.teacher_revision,
+            "teacher %s does not exist on the Hugging Face Hub. Check "
+            "for a typo or a private repo you're not authenticated for. "
+            "(Revision %s is validated downstream by AutoModel.from_pretrained.)",
+            args.teacher, args.teacher_revision,
         )
         return 1
 
@@ -548,7 +599,9 @@ def main() -> int:
 
     log.info("output -> %s (cache_key=%s)", out_path, cache_key)
 
-    # Resolve prompts.
+    # Resolve prompts. Preload the tokenizer once (still reused by
+    # _load_teacher below via L2) — the prompt iterator itself doesn't need
+    # it, but the cached load avoids a duplicate hub round-trip.
     bootstrap_tok = None
     if args.prompts == "qwen3-pretrain-mix":
         from transformers import AutoTokenizer
@@ -556,7 +609,7 @@ def main() -> int:
             args.teacher, revision=args.teacher_revision,
         )
         prompts_iter = _iter_prompts_from_qwen3_pretrain_mix(
-            bootstrap_tok, args.num_prompts, args.seed,
+            args.num_prompts, args.seed,
         )
     else:
         prompts_iter = _iter_prompts_from_jsonl(Path(args.prompts))
@@ -701,6 +754,7 @@ def main() -> int:
             model, tokenizer, prompts,
             batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens,
+            already_done=already_done,
         ):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
