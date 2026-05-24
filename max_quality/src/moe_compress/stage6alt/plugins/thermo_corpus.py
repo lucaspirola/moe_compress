@@ -1,5 +1,21 @@
 """Thermometer calibration-corpus build (S6A-2 of the Stage 6alt plugin-architecture refactor).
 
+Paper / dataset
+----------------
+Stage 6alt thermometer corpus: ONE of two evaluation corpora —
+
+  - **Nemotron held-out slice** (default) — same Nemotron-Cascade-2-SFT-Data
+    distribution as Stage-2 / 2.5 / 5 calibration (D11 — owner
+    :mod:`stage2.plugins.reap_scoring`), drawn with a distinct
+    ``seed_offset`` so the thermometer eval is disjoint from
+    calibration.
+  - **WikiText-2 test split** — Merity et al. 2017 arXiv:1609.07843,
+    same source as :mod:`stage6.plugins.wikitext_ppl` but the
+    **test** split (Stage 6 uses test too; the thermometer uses the
+    same chunked form).
+
+Project-original sweep harness; no upstream thermometer paper.
+
 Home of the Stage 6alt thermometer calibration-corpus concern, extracted
 from the legacy ``stage6alt_thermometer.py`` monolith. The thermometer
 selects ONE of two evaluation corpora — the nemotron held-out slice
@@ -216,16 +232,16 @@ class ThermoCorpusPlugin:
     """
 
     name = "thermo_corpus"
-    paper = (
-        "Stage 6alt thermometer — calibration-corpus build "
-        "(nemotron held-out slice vs WikiText-2 test split); see "
-        "stage6alt_thermometer.py module docstring for the bpt_gap "
-        "interpretation per corpus choice."
-    )
+    paper = "Stage 6alt thermometer corpus build — Nemotron held-out or WikiText-2 test (project-original sweep harness; D11 calibration deviation owner is :mod:`stage2.plugins.reap_scoring`). See module docstring."
     config_key = "stage6_validate.thermometer.corpus"
     reads: tuple[str, ...] = (
         "model", "tokenizer", "config", "artifacts_dir",
     )
+    writes: tuple[str, ...] = ("calib_ids", "corpus_meta", "corpus_id")
+    # No calibration-pass accumulator — `_build_thermo_corpus` already
+    # produces the tensor in one call, no per-layer sweep is needed.
+    provides: tuple[str, ...] = ()
+
     writes: tuple[str, ...] = ("calib_ids", "corpus_meta", "corpus_id")
     # No calibration-pass accumulator — `_build_thermo_corpus` already
     # produces the tensor in one call, no per-layer sweep is needed.
