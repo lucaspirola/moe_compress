@@ -33,6 +33,13 @@ import torch
 log = logging.getLogger(__name__)
 
 
+# One-shot guard so the enable_thinking fallback warning (L1) fires at most
+# once per process. Callers depending on ``<think>...</think>`` preservation
+# (e.g. self-traces) get a heads-up when the tokenizer silently drops the
+# kwarg; subsequent rows stay quiet to avoid log spam.
+_enable_thinking_unsupported_warned = False
+
+
 # Valid domain names for the legacy c4-math-code source.
 _LEGACY_DOMAINS = frozenset({"c4", "math", "code"})
 
@@ -519,6 +526,18 @@ def _render_messages(
                     messages, enable_thinking=True, **kwargs,
                 ).strip()
             except TypeError:
+                global _enable_thinking_unsupported_warned
+                if not _enable_thinking_unsupported_warned:
+                    tok_name = getattr(tokenizer, "name_or_path", None) or type(tokenizer).__name__
+                    log.warning(
+                        "_render_messages: tokenizer %r does not accept "
+                        "enable_thinking=True — falling back to plain "
+                        "apply_chat_template. Reasoning-mode markers "
+                        "(<think>...</think>) may not render correctly. "
+                        "This warning fires once per process.",
+                        tok_name,
+                    )
+                    _enable_thinking_unsupported_warned = True
                 rendered = tokenizer.apply_chat_template(messages, **kwargs).strip()
         else:
             rendered = tokenizer.apply_chat_template(messages, **kwargs).strip()
@@ -961,6 +980,15 @@ register_corpus(CorpusAdapter(
 #
 # All datasets are parquet-stored (no datasets>=4.5 script-loader gotcha).
 
+# Best-effort weights (L3): the per-subset streamers
+# (_stream_messages_native, _stream_raw_wrapped, _stream_problem_solution,
+# _stream_instruction_output) absorb per-row exceptions and continue. If a
+# subset's underlying dataset throws on many rows (network blip, schema
+# drift, encoding error), the configured weight will UNDER-represent that
+# subset in the final mix. _stream_texts_qwen3_pretrain_mix itself also
+# catches subset-level failures and skips the subset entirely. These weights
+# describe INTENT; emit a token-shortfall warning from
+# _tokenize_to_fixed_length to detect material drift.
 _QWEN3_MIX_WEIGHTS = {
     "tulu3":        0.30,
     "math":         0.15,
@@ -1167,6 +1195,13 @@ def _stream_texts_qwen3_pretrain_mix(spec: CalibrationSpec, tokenizer) -> list[s
     """Multi-source Qwen3-pretrain-distribution mix, all chat-templated."""
     target_total_tokens = spec.num_sequences * spec.sequence_length
     texts: list[str] = []
+    # N4: corpus identifier "qwen3-pretrain-mix" is the historical config-compat
+    # name; the SHAPE is instruct/SFT-target (see file-top note ~lines 941-980).
+    log.info(
+        "qwen3-pretrain-mix: building broad-instruct-mix (legacy name retained "
+        "for config compat) for %d sequences x %d tokens (target_total=%d).",
+        spec.num_sequences, spec.sequence_length, target_total_tokens,
+    )
     for subset, weight in _QWEN3_MIX_WEIGHTS.items():
         target_subset_tokens = int(target_total_tokens * weight)
         avg_tok = _QWEN3_MIX_AVG_TOKENS[subset]
@@ -1312,15 +1347,25 @@ register_corpus(CorpusAdapter(
 #       # the cache key so changing the file auto-invalidates the
 #       # calibration cache.
 
+# Default self-traces JSONL location. Resolved relative to CWD by
+# ``_stream_texts_self_traces`` (M2 documented assumption): the pipeline
+# driver invokes from the repo root, so this default lands at
+# ``<repo>/artifacts/_shared/self_traces.jsonl``. Operators running from a
+# different CWD MUST set ``calibration.jsonl_path`` to an absolute path in
+# their YAML to avoid silent FileNotFoundError or pointing at the wrong file.
 _DEFAULT_SELF_TRACES_PATH = "artifacts/_shared/self_traces.jsonl"
 
 # Per-process state for the self-traces blacklist, keyed by absolute JSONL
 # path so multiple datasets (e.g. different teachers) coexist. Each entry:
 #     {
-#         "rows":      list[dict]          # parsed JSONL rows in file order
-#         "by_domain": dict[str, list[int]] # domain → row-indices in rows
-#         "weights":   dict[str, float]    # empirical domain weights (sum=1)
-#         "blacklist": set[int]            # row-indices already served this run
+#         "rows":      list[dict]               # parsed JSONL rows in file order
+#         "by_domain": dict[str, list[int]]     # domain → row-indices in rows
+#         "weights":   dict[str, float]         # empirical domain weights (sum=1)
+#         "blacklist": dict[str, set[int]]      # PER-DOMAIN row-indices already
+#                                               # served this run (H2 — domains
+#                                               # exhaust independently; only the
+#                                               # offending domain is whitelisted
+#                                               # on quota miss).
 #     }
 #
 # Why per-process: every stage that calls build_calibration_tensor
@@ -1343,25 +1388,25 @@ def _reset_self_traces_state() -> None:
 def _load_self_traces_state(path) -> dict:
     """Load + cache the JSONL once per path; partition rows by ``domain`` field
     and compute empirical domain weights from row counts. Initialise an empty
-    blacklist. Subsequent calls return the cached state (and growing blacklist).
+    per-domain blacklist map. Subsequent calls return the cached state (and
+    its growing per-domain blacklists).
     """
-    from pathlib import Path
-    import json as _json
-
     key = str(Path(path).resolve())
     cached = _SELF_TRACES_STATE.get(key)
     if cached is not None:
         return cached
 
     rows: list[dict] = []
-    with open(path, "r", encoding="utf-8") as f:
+    # errors="replace" so a single malformed UTF-8 byte doesn't crash the
+    # whole load (M3) — JSONDecodeError-per-line is already absorbed below.
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                rows.append(_json.loads(line))
-            except _json.JSONDecodeError as exc:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
                 log.warning("self-traces: skipping malformed JSONL line: %s", exc)
                 continue
 
@@ -1384,11 +1429,26 @@ def _load_self_traces_state(path) -> dict:
         {d: f"{w:.2%}" for d, w in sorted(weights.items())},
     )
 
+    # L2 — if NO row carried a ``domain`` field, the mix degenerates to a
+    # single "unknown" bucket and every per-domain affordance becomes a no-op.
+    # Warn loudly so the operator regenerates with a domain-tagged builder.
+    if set(by_domain.keys()) == {"unknown"}:
+        log.warning(
+            "self-traces: every row at %s lacks a 'domain' field — the "
+            "empirical mix degenerated to {'unknown': 1.0} and per-domain "
+            "blacklist + quota mechanics are no-ops. Regenerate the JSONL "
+            "with a domain-tagged build script (see "
+            "max_quality/scripts/build_self_traces_calib.py).",
+            path,
+        )
+
     state = {
         "rows": rows,
         "by_domain": by_domain,
         "weights": weights,
-        "blacklist": set(),
+        # H2 — per-domain blacklist map; lazy-initialised in
+        # _draw_self_traces_indices via setdefault(d, set()).
+        "blacklist": {},
     }
     _SELF_TRACES_STATE[key] = state
     return state
@@ -1398,86 +1458,140 @@ def _draw_self_traces_indices(
     state: dict, n_requested: int, seed: int,
 ) -> list[int]:
     """Draw ``n_requested`` row-indices, respecting the empirical domain mix
-    AND the per-process blacklist.
+    AND the per-domain blacklists.
 
     Algorithm:
-      1. Allocate per-domain quota = ``max(1, round(n_requested * weight_d))``.
+      1. Allocate per-domain quotas via ``_distribute_counts`` so they sum
+         exactly to ``n_requested`` (largest-remainder; M1 fix — the prior
+         ``max(1, round(...))`` formulation drifted from n_requested and
+         over-represented tiny-weight domains at small ``n``).
       2. For each domain, sample ``quota_d`` indices from
-         ``by_domain[d] \\ blacklist`` (deterministic shuffle, seeded by spec.seed
-         + domain hash).
-      3. If ANY domain can't fill its quota out of the un-blacklisted pool,
-         reset the GLOBAL blacklist (this matches the contract: "only when we
-         blacklist all samples do we whitelist everything and restart") and
-         retry step 2 once. If a domain still can't fill — its full row pool is
-         smaller than the per-domain quota — take what's available and log a
-         warning.
-      4. Add the drawn indices to the blacklist before returning.
+         ``by_domain[d]`` after removing that domain's own blacklist set
+         (deterministic shuffle, seeded by ``spec.seed`` + stable md5(d)).
+      3. If a domain can't fill its quota out of its un-blacklisted pool,
+         reset ONLY that domain's blacklist (per-domain contract: a small
+         domain exhausting MUST NOT whitelist still-flush domains' un-served
+         rows) and retry step 2 once. If the domain's TOTAL pool is smaller
+         than its quota, take what's available and log a warning that names
+         the offending domain(s).
+      4. Update each domain's blacklist with the indices selected from it
+         before returning.
     """
     import random as _random
 
     by_domain = state["by_domain"]
     weights = state["weights"]
-    blacklist: set[int] = state["blacklist"]
-    rows = state["rows"]
+    blacklist: dict[str, set[int]] = state["blacklist"]
 
-    # Per-domain quotas preserve the empirical mix at every draw.
-    per_domain_quota = {
-        d: max(1, round(n_requested * w)) for d, w in weights.items()
-    }
+    # Per-domain quotas via largest-remainder so they sum exactly to
+    # n_requested (M1). _distribute_counts can emit zero-quota entries for
+    # tiny weights; that's intentional (avoids forcing one row from a domain
+    # with negligible weight at small n).
+    per_domain_quota = _distribute_counts(n_requested, weights)
 
-    def _try_draw(domain_subsets: dict[str, list[int]]) -> tuple[list[int], bool]:
-        """Returns (selected, all_quotas_met). On all_quotas_met=False the
-        caller must reset the blacklist and retry."""
+    def _domain_rng(d: str) -> _random.Random:
+        # PEP 456 randomises ``hash(str)`` per interpreter invocation, so the
+        # previous ``hash(d)`` formulation broke the "deterministic shuffle"
+        # promise across processes. md5 is stable + matches the offset hash
+        # pattern used by ``_make_subset_seed`` (lines 1018-1022).
+        domain_offset = int(
+            hashlib.md5(d.encode(), usedforsecurity=False).hexdigest(), 16
+        ) & 0x7FFFFFFF
+        return _random.Random((seed * 1009 + domain_offset) & 0xFFFFFFFF)
+
+    def _try_draw(
+        domain_subsets: dict[str, list[int]],
+    ) -> tuple[list[int], list[str]]:
+        """Returns (selected, shortfall_domains). A non-empty
+        ``shortfall_domains`` flags which domain(s) need a per-domain
+        blacklist reset (H2 contract: blacklists are PER-DOMAIN; we whitelist
+        only the offending domain, not the global pool)."""
         selected_local: list[int] = []
-        ok = True
+        shortfall: list[str] = []
         for d, quota in per_domain_quota.items():
             pool = domain_subsets.get(d, [])
             if len(pool) < quota:
-                ok = False
-                break
-            rng = _random.Random((seed * 1009 + (hash(d) & 0x7FFFFFFF)) & 0xFFFFFFFF)
+                shortfall.append(d)
+                continue
+            rng = _domain_rng(d)
             shuffled = list(pool)
             rng.shuffle(shuffled)
             selected_local.extend(shuffled[:quota])
-        return selected_local, ok
+        return selected_local, shortfall
 
-    # First try with current blacklist.
-    available = {d: [i for i in idx_list if i not in blacklist]
-                 for d, idx_list in by_domain.items()}
-    selected, all_met = _try_draw(available)
+    # First try: filter each domain pool by ITS OWN blacklist (H2 — per-
+    # domain blacklists; a small domain exhausting must not whitelist the
+    # rest of the run).
+    def _available(blist_map: dict[str, set[int]]) -> dict[str, list[int]]:
+        return {
+            d: [i for i in idx_list
+                if i not in blist_map.setdefault(d, set())]
+            for d, idx_list in by_domain.items()
+        }
 
-    if not all_met:
-        # "Only if during the run we blacklist all samples, we whitelist
-        # everything and restart the blacklist as we provide more data."
-        log.info(
-            "self-traces: blacklist would prevent quota (%d/%d consumed, %d "
-            "rows total) — resetting blacklist to empty and re-drawing.",
-            len(blacklist), len(rows), len(rows),
-        )
-        blacklist.clear()
-        available = {d: list(idx_list) for d, idx_list in by_domain.items()}
-        selected, all_met = _try_draw(available)
-        if not all_met:
-            # Even on a fresh blacklist some domain has fewer rows than its
-            # quota — the JSONL is undersized for this n_requested at the
-            # current mix. Take what's available and log loudly so the
-            # operator knows to regenerate with --num-prompts increased.
+    available = _available(blacklist)
+    selected, shortfall = _try_draw(available)
+
+    if shortfall:
+        # PER-DOMAIN reset: only the domain(s) that exhausted get whitelisted.
+        # Original contract ("only when we blacklist all samples do we whitelist
+        # everything") still holds — it just applies per-domain so that no
+        # un-served row from a still-flush domain is recycled prematurely.
+        for d in shortfall:
+            d_total = len(by_domain.get(d, []))
+            d_used = len(blacklist.get(d, set()))
+            log.info(
+                "self-traces: domain %r blacklist exhausted (%d/%d consumed) — "
+                "resetting that domain's blacklist and re-drawing it.",
+                d, d_used, d_total,
+            )
+            blacklist[d] = set()
+        available = _available(blacklist)
+        selected, shortfall = _try_draw(available)
+        if shortfall:
+            # Even with a fresh per-domain blacklist some domain has fewer rows
+            # than its quota — JSONL is undersized for this n_requested at the
+            # current mix. Take what's available and name the offenders so the
+            # operator knows which domain(s) to grow.
+            undersized = [
+                (d, len(by_domain.get(d, [])), per_domain_quota[d])
+                for d in shortfall
+            ]
+            details = ", ".join(
+                f"{d}={n_rows} rows vs quota {q}"
+                for d, n_rows, q in undersized
+            )
             log.warning(
-                "self-traces: JSONL is undersized — at least one domain has "
-                "fewer rows than quota even after blacklist reset. Regenerate "
-                "with --num-prompts >= %d. Filling with all available rows "
-                "per domain (mix will be approximated, not exact).",
-                n_requested * 2,
+                "self-traces: JSONL undersized — domain(s) short of quota even "
+                "after per-domain blacklist reset: %s. Regenerate with "
+                "--num-prompts large enough that every shortfall domain "
+                "exceeds its quota (per-domain bottleneck — global "
+                "n_requested*2 isn't sufficient when one domain has small "
+                "weight). Filling with all available rows per domain (mix "
+                "will be approximated, not exact).",
+                details,
             )
             selected = []
             for d, quota in per_domain_quota.items():
                 pool = available.get(d, [])
-                rng = _random.Random((seed * 1009 + (hash(d) & 0x7FFFFFFF)) & 0xFFFFFFFF)
+                rng = _domain_rng(d)
                 shuffled = list(pool)
                 rng.shuffle(shuffled)
                 selected.extend(shuffled[:quota])
 
-    blacklist.update(selected)
+    # Update each domain's blacklist with the indices we just served.
+    selected_by_domain: dict[str, set[int]] = {}
+    domain_of: dict[int, str] = {}
+    for d, idx_list in by_domain.items():
+        for i in idx_list:
+            domain_of[i] = d
+    for i in selected:
+        d = domain_of.get(i)
+        if d is None:
+            continue
+        selected_by_domain.setdefault(d, set()).add(i)
+    for d, ids in selected_by_domain.items():
+        blacklist.setdefault(d, set()).update(ids)
     return selected
 
 
@@ -1502,10 +1616,19 @@ def _stream_texts_self_traces(
     Each row carries ``{"messages": [...], "domain": "..."}`` — the loader
     partitions by ``domain``, preserves the empirical domain mix at every
     draw (so a 1000-sample request returns the same percentage split as a
-    5000-sample request), and runs a per-process row-index blacklist so no
-    sample is served twice within one ``run_pipeline.py`` invocation. The
-    blacklist resets to empty automatically when it can no longer satisfy
-    a per-domain quota — see ``_draw_self_traces_indices`` for the contract.
+    5000-sample request), and runs PER-DOMAIN row-index blacklists so no
+    sample is served twice within one ``run_pipeline.py`` invocation. Each
+    domain's blacklist resets independently only when THAT domain can no
+    longer satisfy its quota — a tiny domain exhausting does NOT recycle
+    still-flush domains' un-served rows. See ``_draw_self_traces_indices``
+    for the full contract.
+
+    Path resolution note (M2): a relative ``spec.dataset`` is resolved
+    against ``Path.cwd()`` — the pipeline driver invokes from the repo
+    root, so the default ``artifacts/_shared/self_traces.jsonl`` lands
+    correctly. Operators running from a different directory should set
+    ``calibration.jsonl_path`` to an absolute path in YAML to avoid
+    relative-path surprises.
 
     Each selected row's ``messages`` list (already containing the teacher's
     reasoning + answer trace in the assistant turn) is rendered through the
@@ -1513,8 +1636,6 @@ def _stream_texts_self_traces(
     tokenizers (Qwen3-thinking, DeepSeek-R1, etc.) keep the in-block markers
     in the output token stream.
     """
-    from pathlib import Path
-
     path = Path(spec.dataset)
     if not path.is_absolute():
         path = Path.cwd() / path
@@ -1553,11 +1674,17 @@ def _stream_texts_self_traces(
         if rendered:
             out.append(rendered)
 
+    blacklist_total = sum(len(s) for s in state["blacklist"].values())
+    per_domain_bl = {
+        d: f"{len(state['blacklist'].get(d, set()))}/{len(state['by_domain'][d])}"
+        for d in sorted(state["by_domain"].keys())
+    }
     log.info(
-        "self-traces: served %d rows from %s (blacklist=%d/%d, "
-        "seed=%d, requested=%d)",
+        "self-traces: served %d rows from %s (blacklist=%d/%d total, "
+        "per-domain=%s, seed=%d, requested=%d)",
         len(out), path,
-        len(state["blacklist"]), len(state["rows"]),
+        blacklist_total, len(state["rows"]),
+        per_domain_bl,
         spec.seed, spec.num_sequences,
     )
     return out
