@@ -5,12 +5,12 @@ Paper
 Su et al., "Unveiling Super Experts in Mixture-of-Experts Large Language
 Models" — arXiv:2507.23279 (audit/spec_compliance/01_papers/2507.23279/source.md).
 
-§3.3 Figure 6 (source.md L728–L733) and Appendix G Figures 20–21 (source.md
-L2479, L2485) document the paper's empirical observation:
+§5.1 Figure 6 (source.md L728–L734) and Appendix F Figures 20–21 (source.md
+L2479–L2486) document the paper's empirical observation:
 
     "This routing behavior of SEs ensures that the attention sink token is
-     strongly activated at the SEs. The sink token subsequently produces
-     activation outliers ... attention sinks."   — source.md L721–L728
+     strongly activated at the SEs. ... The sink token subsequently produces
+     activation outliers."   — source.md L721–L723
 
 Figures 6 / 20 / 21 are descriptive histograms of expert-router score
 distributions for sink vs non-sink tokens, confirming sink-token-dominated
@@ -34,8 +34,11 @@ SEs), and this plugin operationalizes it as a candidate-pool contributor.
 Deviation: D-sink-token-routing
 -------------------------------
 Project-original detection criterion derived from the paper's descriptive
-observation. The detector hooks each MoE layer's router output during the
-calibration pass and aggregates per-(layer, expert):
+observation. During the calibration pass the orchestrator-wired
+:class:`CalibrationEngine` hooks each MoE layer's router output + input-ids
+and routes per-batch updates into the
+:class:`SinkTokenRoutingAccumulator`; this plugin aggregates the resulting
+per-(layer, expert) statistics:
 
     mean_router_score_on_sink_tokens          (``score_sink``)
     mean_router_score_on_normal_tokens        (``score_normal``)
@@ -179,7 +182,7 @@ class SinkTokenDetectorPlugin:
     paper: str = (
         "Sink-token routing as a Super-Expert structural signature — "
         "arXiv:2507.23279 (Su et al., 'Unveiling Super Experts in MoE LLMs') "
-        "§3.3 Figure 6 + Appendix G Figures 20-21 (descriptive observation); "
+        "§5.1 Figure 6 + Appendix F Figures 20-21 (descriptive observation); "
         "official code ZunhaiSu/Super-Experts-Profilling @ "
         "573aead3127ae593ba267758b832944f8fed1485 implements no sink-token "
         "detector. Detection criterion is project-original — see deviation "
@@ -259,7 +262,7 @@ class SinkTokenDetectorPlugin:
             sink_acc = None
 
         log.info(
-            "Stage 1 Phase C3 (sink-token) setup: enabled=%s, num_layers=%d, "
+            "Stage 1 Phase C₃ (sink-token) setup: enabled=%s, num_layers=%d, "
             "num_experts=%d, bos_token_id=%s.",
             sink_token_enabled,
             len(moe_layers),
