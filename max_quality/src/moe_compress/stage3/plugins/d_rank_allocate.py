@@ -17,7 +17,7 @@ nitpick fix below):
   (FP64 in this implementation — see D-fp64-mixed below). This is
   paper *prose*, not an indexed equation. The L575 line sits in
   §3.2.2 "RANK ALLOCATION VIA LAGRANGE MULTIPLIERS", not §3.2.1
-  (which spans paper lines L396-L451).
+  (which spans paper lines L396-L450).
 - Eq. 7 (rank budget allocation): in the paper, ``ω = d₁ + n · d₂``
   where ``d₁`` is the shared dimension across layers in the group and
   ``d₂`` the non-shared dimension; D-Rank targets shared-basis layer
@@ -83,9 +83,10 @@ empirically-) grounded.*)
 
 Deviation: D-drank-eq19-denominator — avg_cost preconditioning
 --------------------------------------------------------------
-Paper Eq. 7 (sometimes referred to in spec-compliance audit notes as
-"Eq. 19" — same equation, different numbering in some draft revisions)
-gives the closed-form Lagrange-multiplier solution::
+Paper Eq. 7 in §3.2.2 / restated as Eq. 19 in Appendix A.3 of
+arXiv:2509.25622v2 (the appendix repeats the same closed form after
+the full Lagrangian derivation) gives the closed-form
+Lagrange-multiplier solution::
 
     k_g  =  T_budget · √(R_eff(g) / ω_g)  /  Σ_j √(R_eff(j) · ω_j)
 
