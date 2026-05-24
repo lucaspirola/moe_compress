@@ -25,8 +25,10 @@ damage:
   logits + gated-expert-output cosine — alignment-invariant and cheap,
   but doesn't capture the block-level interaction with other surviving
   experts.
-- ``post`` (D-whitened-cost) measures weight-space residual along the
-  activation-covariance eigenbasis — captures the AA-SVD-style
+- ``post`` (``D-whitened-cost`` — see
+  :mod:`stage2.plugins.ream_cost` and the ``post`` branch in
+  ``_aligned_whitened_residual``) measures weight-space residual along
+  the activation-covariance eigenbasis — captures the AA-SVD-style
   whitened ΔW norm but is still a weight-only proxy.
 - ``output`` (this branch, Direction C) measures the actual MoE-block
   output divergence under a **tentative merge**: for each candidate
@@ -42,9 +44,18 @@ The four module-level helpers implement this:
   (gate / up / down). Also called by monolith-resident
   ``_distill_merged_group`` and ``_heal_student_moe_output``, so its
   re-import in ``stage2_reap_ream.py`` is load-bearing.
-- ``_router_routing_weights`` — top-k routing replica that matches the
-  resized router's dispatch behavior (renormalized top-k softmax,
-  per D-reap-routing-weight).
+- ``_router_routing_weights`` — returns the **full unmasked softmax**
+  ``σ(x)_e`` over all experts (REAM convention), with no top-k masking
+  and no renormalization. The merge-cost call site
+  (``_output_space_cost``) then multiplies by a 0/1 top-k membership
+  mask to obtain ``σ_m(x)·1[m∈topk(x)]`` — i.e. REAP's masked gate
+  ``g_j(x)`` **un-renormalized**. This deviates from both REAM's raw
+  ``σ(x)`` and from ``D-reap-routing-weight`` (which renormalizes the
+  top-k softmax, as used by :mod:`stage2.plugins.reap_scoring`); call
+  this hybrid ``D-output-space-routing-weight``. Kept un-renormalized
+  on purpose: the cost is a routing-weight-weighted mean (denominator
+  = Σ_t gate_m(t)), so a per-token renormalization would cancel out of
+  both numerator and denominator and only matter as an overall scale.
 - ``_tentative_merged_weights`` — in-memory freq-weighted weighted
   average of ``{c, m}``'s gate/up/down (no model mutation), with the
   same Hungarian neuron permutation alignment used by the merge step
@@ -69,12 +80,6 @@ Naming-history note
 cost form. The current plugin architecture has no direction-letter
 taxonomy. New prose drops the label; existing log lines and Trackio
 keys retain "Direction C" identifiers for dashboard back-compat.
-
-Original module-header circular-import note retained
-----------------------------------------------------
-``_swiglu_forward`` is additionally called by monolith-resident code
-(``_distill_merged_group``, ``_heal_student_moe_output``), so its
-re-import is load-bearing.
 
 Circular-import note: this module imports only ``pipeline.permutation_align``,
 ``pipeline.base``, ``pipeline.context`` and ``moe_compress.utils.*`` — none of
@@ -140,15 +145,23 @@ def _router_routing_weights(
     layer_ref: MoELayerRef,
     x: torch.Tensor,
 ) -> torch.Tensor:
-    """Full-softmax routing weights ``σ(x)_e`` for every routed expert.
+    """Full **unmasked** softmax routing weights ``σ(x)_e`` for every expert.
 
     Recomputes the layer router's pre-softmax routing scores from the layer
     input ``x`` and applies a softmax over the expert axis — the same
     bias-adjusted pre-softmax → softmax path that ``capture_router_outputs``
-    uses during profiling. Model-agnostic: it reads ``layer_ref.router``'s
-    ``weight`` / ``bias`` / ``e_score_correction_bias`` attributes, none of
-    which are Qwen-specific (any linear MoE router exposes ``weight``; the
-    bias terms are simply skipped when absent).
+    uses during profiling. No top-k masking and no renormalization are
+    applied here: this returns the raw REAM ``σ(x)`` distribution over all
+    experts. The merge-cost call site (``_output_space_cost``) multiplies
+    this by a 0/1 top-k membership mask to obtain the un-renormalized
+    masked gate used as a per-token weight (see ``D-output-space-routing-weight``
+    in the module docstring; distinct from ``D-reap-routing-weight``, which
+    renormalizes the top-k softmax).
+
+    Model-agnostic: it reads ``layer_ref.router``'s ``weight`` / ``bias`` /
+    ``e_score_correction_bias`` attributes, none of which are Qwen-specific
+    (any linear MoE router exposes ``weight``; the bias terms are simply
+    skipped when absent).
 
     ``x`` : ``(n_tokens, hidden)``. Returns ``(n_tokens, n_experts)`` float32.
     """
@@ -246,16 +259,28 @@ def _output_space_cost(
     For each non-centroid ``m`` and each of its top-K cheapest candidate
     centroids ``c``, the cost is the routing-weighted change in expert ``m``'s
     *gated routed output* on the calibration tokens when ``m`` is tentatively
-    merged into ``c``::
+    merged into ``c``. Concretely, with the per-token weight
 
-        cost(m→c) = mean_t [ σ_m(x_t) · ‖ E_m(x_t) − E_merged(x_t) ‖² ]
+        gate_m(t) = σ_m(x_t) · 1[m ∈ topk(x_t)]
 
-    where ``E_m`` is expert ``m``'s SwiGLU forward, ``E_merged`` is the
+    (full unmasked softmax from ``_router_routing_weights``, then masked
+    by top-k membership at this call site — ``D-output-space-routing-weight``
+    in the module docstring; un-renormalized), the cost is a
+    **routing-weight-weighted mean** over tokens::
+
+        cost(m→c) = Σ_t gate_m(t) · ‖ E_m(x_t) − E_merged(x_t) ‖²
+                    ─────────────────────────────────────────────
+                                  Σ_t gate_m(t)
+
+    where ``E_m`` is expert ``m``'s SwiGLU forward and ``E_merged`` is the
     forward of the freq-weighted permutation-aligned tentative merge of
-    ``m`` into ``c``, and ``σ_m(x_t)`` is token ``t``'s full-softmax routing
-    weight for expert ``m``, masked to zero on tokens where ``m`` is not in
-    the token's top-``top_k`` routed set (so the cost only counts tokens that
-    actually reach expert ``m`` — the topk-routing bound from the spec).
+    ``m`` into ``c``. The denominator is ``Σ_t gate_m(t)`` (not the token
+    count ``T``); tokens that do not route to ``m`` carry ``gate_m=0`` and
+    drop out of both sums — the cost counts only tokens that actually
+    reach expert ``m`` (the topk-routing bound from the spec). Because
+    both numerator and denominator share the same per-token weight,
+    any per-token renormalization of ``σ`` over the top-k set would
+    cancel — which is why we keep ``σ`` un-renormalized.
 
     This is a strictly better merge-damage proxy than the weight-space
     ``pre`` / ``post`` costs: it measures the realised change in what the
@@ -291,11 +316,23 @@ def _output_space_cost(
 
     out = np.full((n_nc, n_c), np.inf, dtype=np.float64)
 
+    # Edge guards (LOW-2):
+    #  * If both ``centroid_ids`` and ``noncentroid_ids`` are empty the device-probe
+    #    below would IndexError; upstream invariants should prevent this (the
+    #    bump loop only calls this cost path when at least one side is non-
+    #    empty), but we return the empty matrix to make the contract explicit.
+    #  * If either side is empty there is no (m, c) pair to score: return early.
+    #  * If ``n_c == 0`` the ``argpartition(..., k_cand-1)`` below would degrade
+    #    to ``argpartition(..., -1)`` (a silent off-by-one); guarded here.
+    if n_nc == 0 or n_c == 0:
+        return out
+
     banks = build_banks(layer_ref)
     # Resolve the compute device + dtype from the model's own expert weights
     # so the cost computation runs wherever the model lives (CPU or GPU),
-    # with no hardcoded device.
-    _probe = banks["gate_proj"].get(centroid_ids[0] if n_c else noncentroid_ids[0])
+    # with no hardcoded device. Safe to index ``centroid_ids[0]`` — the empty
+    # case is handled by the early-return above.
+    _probe = banks["gate_proj"].get(centroid_ids[0])
     device = _probe.device
 
     with torch.no_grad():
@@ -309,10 +346,16 @@ def _output_space_cost(
             x_all = x_all[idx]
         x_all = x_all.to(device, dtype=torch.float32)
 
-        # Full-softmax routing weights + the token's top-k routed expert set.
+        # Full-softmax routing weights from ``_router_routing_weights`` — no
+        # masking and no renormalization. We multiply by a 0/1 top-k membership
+        # mask below to obtain the un-renormalized masked gate ``g_j(x)``
+        # (``D-output-space-routing-weight``; see module docstring).
+        # ``router_top_k`` (the router's dispatch-time top-k) is named to
+        # disambiguate from the ``topk`` parameter above, which is the
+        # cost-matrix candidate-prefilter K (``cost_topk_filter``).
         sigma = _router_routing_weights(layer_ref, x_all)  # (T, n_experts)
-        top_k = layer_ref.top_k
-        k = min(top_k, sigma.shape[-1])
+        router_top_k = layer_ref.top_k
+        k = min(router_top_k, sigma.shape[-1])
         topk_idx = torch.topk(sigma, k=k, dim=-1).indices  # (T, k)
 
         # Per non-centroid m: σ_m masked to tokens that route to m, and m's
