@@ -26,34 +26,79 @@ rank redistribution).
 
 Deviation: D8 — Swift-SVD β adapted for MoE
 -------------------------------------------
-Paper Algorithm 2 defines β = end-to-end layer importance,
-min-max-normalized to ``[1, 2]``. This plugin uses β = **per-expert
-spectral energy share** ``σ_i² / Σ σ_j²`` in range ``(0, 1]``.
+Paper Algorithm 2 defines β = **end-to-end layer importance**,
+measured ACROSS LAYERS (one β per layer) and min-max-normalized to
+``[1, 2]``. The paper's β captures a "negative-correlation" signal:
+layers whose downstream performance is most sensitive to pruning get
+β ≈ 2 (amplified rank), inert layers get β ≈ 1.
 
-The range difference changes blending behavior: paper's β ∈ [1, 2]
-means ``β^α`` always **amplifies**; the project's β ∈ (0, 1] can
-**suppress** low-energy experts. This is intentional — per-expert
-spectral energy within a group is the natural adaptation of per-layer
-importance for MoE expert redistribution. ε* is now activation-weighted
-via Stage 2 A-covariance (no longer a deviation in its own right;
-absorbed into D-eps-star below).
+This plugin uses β = **per-expert spectral energy share within a
+single (layer, matrix-type) group** ``σ_i² / Σ_j σ_j²`` in range
+``(0, 1]``. The semantic divergence is significant:
+
+* **Axis differs** — paper varies β across layers; this plugin varies
+  β across experts WITHIN a layer. Cross-layer importance is handled
+  separately by the global rank-budget allocator (D-rank, arXiv
+  2509.25622) and by the per-projection bias multipliers in
+  :mod:`stage3.plugins.d_rank_allocate` (D7a). Swift-SVD+'s α-blending
+  is reduced here to a within-group redistribution knob.
+* **Range differs** — paper's β ∈ [1, 2] means ``β^α`` always
+  **amplifies**; the project's β ∈ (0, 1] can **suppress** low-energy
+  experts. This means α→1 here drives ranks toward the highest-energy
+  expert, whereas paper's α→1 drives ranks toward the most-important
+  *layer*. Different objective surfaces, related but distinct knob
+  semantics.
+* **Source signal differs** — paper β is computed from end-to-end
+  validation sensitivity (a forward-pass proxy); this β is computed
+  from intrinsic spectral energy (no forward pass needed). Cheaper,
+  but cannot capture downstream sensitivity.
+
+ε* is activation-weighted via Stage 2 A-covariance (no longer a
+deviation in its own right; absorbed into D-eps-star below).
 
 Deviation: D-eps-star — Swift-SVD ε* normalization
 --------------------------------------------------
-Paper Eq. 4 defines ``ε*_k = (Σ_{j > k} σ_j²)^{1/2}`` — absolute
-truncation error. This plugin uses
+Paper Eq. 4 defines ``ε*_k = (Σ_{j=k+1}^{rank(Y)} σ_j²)^{1/2}`` —
+**absolute** Frobenius truncation error, in the units of the
+activation-weighted output. This plugin uses
 
     ε*_i = √(Σ_{j > k̄} σ̃_j² / Σ_j σ̃_j²)
 
-— a **relative ratio** normalized by total spectral energy. The
+— a **relative ratio** in ``[0, 1]``, dimensionless. The
 normalization makes ε* scale-invariant across experts with different
 total spectral energy, enabling meaningful cross-expert comparison
 within the redistribution step. The ``log()`` in the blending score
 damps large outliers regardless.
 
-Additionally: ``σ̃_j = sv(A^{1/2} · W)``, not ``sv(W · A^{1/2})`` —
-``A^{1/2}`` left-multiplies ``W`` to match the activation-weighted
-output error ``‖XW − XW_k‖_F``.
+**Argument-of-log calibration**: paper's ``log(e + ε*)`` has ε* in
+absolute Frobenius units, so the additive constant ``e ≈ 2.718``
+keeps ``log`` finite for ε* ≈ 0 but dominates for small ε*. With our
+dimensionless ε* ∈ [0, 1], ``log(e + ε*)`` ranges over roughly
+``[1.0, 1.31]``, a ~31% dynamic range — narrower than the paper's
+unbounded ε* but enough to differentiate experts. We keep ``e`` as
+the additive constant to preserve numerical form parity with the
+paper's formula even though the underlying units differ; an
+alternative calibration would re-scale by ``√Σ_j σ̃_j²`` per group,
+but that would re-introduce the inter-expert scale variance that
+prompted the ratio in the first place. Pragmatic engineering choice;
+documented for the auditor.
+
+**Index convention**: ``Σ_{j > k̄}`` denotes ``Σ_{j=k̄+1}^{len(svs)}``,
+equivalent to paper's ``Σ_{j=k+1}^{rank(Y)}`` because ``svdvals``
+returns exactly ``rank(Y)`` non-zero values (zero-pads dropped). At
+the boundary ``k̄ == len(svs)`` the tail sum is **0 by definition**
+(no truncation residual — full rank retained); this is implemented as
+``s2[k_group:]`` which yields an empty tensor → tail=0, matching the
+paper.
+
+Additionally: ``σ̃_j = sv(A^{1/2} · W)`` in paper notation, which in
+the PyTorch ``(d_out, d_in)`` weight layout is implemented as
+``sv(W @ L_A)`` where ``L_A L_A^T = A`` (Cholesky-like factor of the
+activation covariance). The right-multiplication ``W @ L_A`` IS the
+left-multiplication ``A^{1/2} · W`` once you account for the row/col
+convention swap between paper math (column-vector inputs) and
+PyTorch's row-vector inputs. This matches the activation-weighted
+output error ``‖XW − XW_k‖_F`` ↔ ``‖W − W_k‖_{A,F}``.
 
 Deviation: D-per-type-alpha — per-projection-type α refinement (opt-in)
 -----------------------------------------------------------------------
@@ -61,22 +106,61 @@ Paper §3.2.2 selects a single global α via end-to-end WikiText-2 PPL
 validation; the chosen α is used for every projection.
 
 When ``swift_svd_plus.per_group_type: true`` (production default),
-this plugin first runs the **paper-exact validation search** to pick
-``best_global_alpha``, then runs a **per-projection-type
-spectral-proxy refinement** (``_swift_svd_plus_alpha_search``) seeded
-from that global α. The final factoring uses the per-type
-``alpha_by_type`` map, NOT the validation-winning global α directly.
+this plugin runs the **paper-exact validation search** to log
+``best_global_alpha`` on the PPL grid, then runs an
+**independent per-projection-type spectral-proxy search**
+(``_swift_svd_plus_alpha_search``) over the FULL ``alpha_grid``. The
+final factoring uses the per-type ``alpha_by_type`` map. The
+validation-search's ``best_global_alpha`` is currently used ONLY when
+``per_group_type=False`` (where it directly drives the factoring) —
+when ``per_group_type=True`` it is computed for telemetry /
+audit-trail visibility but does not seed or constrain the per-type
+search.
 
 Rationale: project extension. Paper's single-α assumption pools
 gate/up/down into one allocation regime; per-type allows the
 gate-vs-up-vs-down spectral asymmetry (separately documented as the
 per-projection bias multipliers in
 :mod:`stage3.plugins.d_rank_allocate`, D7a) to also influence
-redistribution. The seed from global validation keeps the search
-anchored near the paper-compliant region; the per-type refinement is
-bounded by the spectral proxy (cheap, no model forward). Disable by
-setting ``per_group_type: false`` to restore strict paper compliance
-— operator choice, opt-in.
+redistribution. The per-type refinement is bounded by the spectral
+proxy (cheap, no model forward). Disable by setting
+``per_group_type: false`` to restore strict paper compliance —
+operator choice, opt-in.
+
+**Honest-cost note (L2)**: when ``validation_samples > 0`` AND
+``per_group_type = True``, the ~31-min validation grid runs but its
+winning α is discarded for the factoring step. Operators who want to
+avoid the wasted cycles should either (a) set
+``validation_samples = 0`` to skip the validation grid (pure spectral
+proxy), or (b) set ``per_group_type = false`` to use the validation
+α directly. The current default keeps the validation grid for
+audit/parity logging vs. paper §3.2.2 — it is intentional, not a
+bug.
+
+Deviation: D-proxy-deploy-alignment — proxy/deployed allocator parity
+---------------------------------------------------------------------
+The proxy objective in ``_swift_svd_plus_alpha_search._evaluate_alpha``
+and the deployed allocator in ``_redistribute_ranks_swift_svd_plus``
+BOTH apply paper §A.3 / Algorithm 2's δ-floor (δ = 0.5): every expert
+starts at ``floor(k̄·δ)`` and the remaining ``k̄·L·(1−δ)`` flexible
+pool is distributed by score share. This keeps the proxy searching
+the same objective the allocator actually deploys (the iter-1
+reviewer flagged the prior misalignment as H2/M3). Paper §A.3 warns
+that δ = 0 is numerically unstable, so we never expose it.
+
+Deviation: D-raw-svd-fallback — raw SVD when A_cov is None
+----------------------------------------------------------
+Paper Eq. 4/9 always uses the activation-weighted spectrum (the
+denoised SVD of ``W @ L_A``). When ``A_cov`` is not provided (e.g.
+unit tests, smoke runs, or a configuration that disables Stage 2
+activation collection), this plugin falls back to ``svdvals(W)`` —
+raw weight SVD, no activation weighting. This is a non-paper-compliant
+degradation: ε* and β are computed in raw weight space, which can
+mis-rank low-energy directions that activations actually exercise. A
+warning is logged once per process at first fall-through. Production
+runs MUST provide ``A_cov`` (Stage 2 output). Test harnesses that
+intentionally bypass A-cov accept the degradation; flag with
+``D-raw-svd-fallback`` in any compliance report.
 
 Naming-history note
 -------------------
@@ -148,6 +232,27 @@ from ...pipeline.context import PipelineContext
 from .d_rank_allocate import _GroupStats
 
 log = logging.getLogger(__name__)
+
+# M1 / D-raw-svd-fallback: emit ONE warning per process the first time we fall
+# through to raw svdvals(W) because A_cov is None. Subsequent calls are silent
+# (one warning is enough — flooding the log buys nothing). Reset by reloading
+# the module (test fixtures that exercise both branches re-import).
+_RAW_SVD_FALLBACK_WARNED = False
+
+
+def _warn_raw_svd_fallback_once(reason: str) -> None:
+    """Emit the D-raw-svd-fallback warning at most once per process."""
+    global _RAW_SVD_FALLBACK_WARNED
+    if not _RAW_SVD_FALLBACK_WARNED:
+        _RAW_SVD_FALLBACK_WARNED = True
+        log.warning(
+            "Swift-SVD+ D-raw-svd-fallback: A_cov unavailable (%s) — falling "
+            "back to raw torch.linalg.svdvals(W). ε* / β computed in "
+            "weight-space, not activation-weighted (paper Eq. 4/9 requires "
+            "A^{1/2}·W). This is acceptable for tests/smoke runs but NOT "
+            "paper-compliant for production. See D-raw-svd-fallback in module "
+            "docstring.", reason,
+        )
 
 
 def _snapshot_originals(
@@ -588,10 +693,16 @@ def _swift_svd_plus_alpha_search(
     # (SVD of W @ L_A) instead of raw SVD. This gives ε* that reflects
     # actual reconstruction error weighted by input distribution.
     # grouped_svs[name][(layer_idx, expert_idx)] = singular_values tensor
+    # L4: banks are rebuilt per (layer, matrix-type). The current group_stats
+    # cardinality (~40 layers × 3 matrix types = 120 entries) makes this O(120)
+    # `build_banks` calls — cheap (banks is just a view-wrapper, ~µs each), so
+    # we leave the simple form. Memoise here if profiling ever flags it.
     grouped_svs: dict[str, dict[tuple[int, int], torch.Tensor]] = {
         n: {} for n in MATRIX_NAMES
     }
     for (li, name), gs in group_stats.items():
+        # L4: `[0]` indexing assumes layer_idx is unique within moe_layers — it
+        # is, by construction (one MoELayerRef per layer in the Qwen3 stack).
         banks = build_banks([ref for ref in moe_layers if ref.layer_idx == li][0])
         for e in range(gs.n_experts):
             W = banks[name].get(e).detach().to(torch.float32)
@@ -607,14 +718,30 @@ def _swift_svd_plus_alpha_search(
                     M_A = W @ L_A
                     svs = torch.linalg.svdvals(M_A)
                 else:
+                    _warn_raw_svd_fallback_once(
+                        "A_cov is rank-zero / empty after eigh thresholding "
+                        "(in _swift_svd_plus_alpha_search)"
+                    )
                     svs = torch.linalg.svdvals(W)
             else:
+                _warn_raw_svd_fallback_once(
+                    "A_cov=None passed to _swift_svd_plus_alpha_search"
+                )
                 svs = torch.linalg.svdvals(W)
             grouped_svs[name][(li, e)] = svs
 
     def _evaluate_alpha(name: str, alpha: float) -> float:
         """Total weighted reconstruction error for this α across all experts
-        in the given projection type."""
+        in the given projection type.
+
+        H2/M3 / D-proxy-deploy-alignment: this proxy MUST allocate per-expert
+        ranks using the same δ=0.5 floor as the deployed allocator in
+        `_redistribute_ranks_swift_svd_plus`. Otherwise the proxy minimises a
+        different objective than what we actually deploy, and the chosen α
+        biases toward unbounded reallocation regimes that the deployed
+        allocator forbids (paper §A.3 — δ-floor mandatory, δ=0 numerically
+        unstable).
+        """
         group_keys = [(li, n) for (li, n) in base_ranks if n == name]
         total_err = 0.0
         for (li, n) in group_keys:
@@ -630,10 +757,14 @@ def _swift_svd_plus_alpha_search(
                 s2 = (svs * svs)
                 total_energy = float(s2.sum().clamp_min(1e-30).item())
                 energies.append(total_energy)
-                # ε*_i at reference rank k_group
+                # ε*_i at reference rank k_group. M4 boundary: when
+                # `k_group >= len(svs)` the slice `s2[k_group:]` is empty and
+                # `tail = 0` — full-rank case, no truncation residual. Matches
+                # paper convention ``Σ_{j=k+1}^{rank(Y)} = 0`` at k = rank(Y).
                 tail = float(s2[k_group:].sum().item()) if k_group < len(s2) else 0.0
                 epsilons.append((tail / total_energy) ** 0.5)
-            # β_i = energy_i / total_energy_in_group
+            # β_i = energy_i / total_energy_in_group (D8 — within-group, not
+            # cross-layer; see D8 deviation entry).
             group_energy = sum(energies) or 1.0
             betas = [e_val / group_energy for e_val in energies]
             # Blending scores
@@ -641,15 +772,19 @@ def _swift_svd_plus_alpha_search(
             for beta, eps in zip(betas, epsilons):
                 s = (beta ** alpha) * (_math.log(_math.e + eps) ** (1.0 - alpha))
                 scores.append(max(s, 1e-12))
-            # Redistribute group rank budget proportionally to scores.
+            # H2/M3 fix: apply paper Algorithm 2 / §A.3 δ-floor (δ=0.5) so the
+            # proxy searches the same objective the deployed allocator uses.
             total_score = sum(scores) or 1.0
-            total_group_rank = k_group * gs.n_experts
+            cap = min(gs.d_out, gs.d_in) - 1
+            delta = 0.5
+            rank_floor = max(1, int(math.floor(k_group * delta)))
+            flexible_pool = k_group * gs.n_experts * (1.0 - delta)
             per_expert_ranks = [
-                max(1, min(min(gs.d_out, gs.d_in) - 1,
-                           int(round(total_group_rank * (sc / total_score)))))
+                max(rank_floor, min(cap, rank_floor + int(math.floor(flexible_pool * (sc / total_score)))))
                 for sc in scores
             ]
-            # Evaluate: sum of tail energy at allocated rank per expert.
+            # Evaluate: sum of tail energy at allocated rank per expert. Same
+            # M4 boundary handling as above.
             for e, k_e in zip(expert_ids, per_expert_ranks):
                 svs = grouped_svs[n][(li, e)]
                 s2 = svs * svs
@@ -658,6 +793,14 @@ def _swift_svd_plus_alpha_search(
         return total_err
 
     if per_group_type:
+        # N2: MATRIX_NAMES is the stable {gate_proj, up_proj, down_proj} set
+        # for Qwen3 MoE. If the model is extended (e.g. a 4th projection like
+        # a router-bias) the per-type search will simply not produce an α for
+        # the new type and `alpha_by_type.get(name, alpha_by_type.get("all",
+        # 0.5))` in `_redistribute_ranks_swift_svd_plus` will default to 0.5
+        # for it. Paper does not guarantee Algorithm 2 generalises to types
+        # outside the gate/up/down triad — verify on a new architecture
+        # before relying on per-type α.
         best_alphas: dict[str, float] = {}
         for name in MATRIX_NAMES:
             best_alpha = 0.5
@@ -708,6 +851,9 @@ def _redistribute_ranks_swift_svd_plus(
         alpha = alpha_by_type.get(name, alpha_by_type.get("all", 0.5))
 
         # Collect per-expert singular values (activation-weighted when A_cov available).
+        # L4: see same note in `_swift_svd_plus_alpha_search` — `build_banks` is
+        # cheap (view-wrapper) so we rebuild per (layer, matrix-type) for code
+        # simplicity. `[0]` is safe — one MoELayerRef per layer_idx.
         banks = build_banks([ref for ref in moe_layers if ref.layer_idx == li][0])
         energies: list[float] = []
         epsilons: list[float] = []
@@ -724,12 +870,22 @@ def _redistribute_ranks_swift_svd_plus(
                     L_A = eigvecs_a[:, keep_a] * eigvals_a[keep_a].clamp_min(1e-12).sqrt().unsqueeze(0)
                     svs = torch.linalg.svdvals(W @ L_A)
                 else:
+                    _warn_raw_svd_fallback_once(
+                        "A_cov is rank-zero / empty after eigh thresholding "
+                        "(in _redistribute_ranks_swift_svd_plus)"
+                    )
                     svs = torch.linalg.svdvals(W)
             else:
+                _warn_raw_svd_fallback_once(
+                    "A_cov=None passed to _redistribute_ranks_swift_svd_plus"
+                )
                 svs = torch.linalg.svdvals(W)
             s2 = svs * svs
             total_e = float(s2.sum().clamp_min(1e-30).item())
             energies.append(total_e)
+            # M4 boundary: `k_group >= len(svs)` → empty slice → tail=0, the
+            # full-rank case (no truncation residual). Matches paper convention
+            # ``Σ_{j=k+1}^{rank(Y)} = 0`` when k = rank(Y).
             tail = float(s2[k_group:].sum().item()) if k_group < len(s2) else 0.0
             epsilons.append((tail / total_e) ** 0.5)
 
@@ -742,10 +898,13 @@ def _redistribute_ranks_swift_svd_plus(
         total_score = sum(scores) or 1.0
         total_group_rank = k_group * gs.n_experts
         cap = min(gs.d_out, gs.d_in) - 1
-        # Spec §6 Phase B.2 redistribution rule (paper 2604.01609 Algorithm 2
-        # lines 4–9): every expert starts at floor(k̄·δ); the remaining pool
-        # `b = k̄·L·(1−δ)` is distributed by score share. δ = 0.5 — paper
-        # warns δ = 0 is numerically unstable.
+        # N3: paper 2604.01609 Algorithm 2 — δ-floor + flexible-pool
+        # redistribution. The "lines 4-9" cite was loose; the actual pseudocode
+        # bracket varies by reading. Substance: every expert starts at
+        # floor(k̄·δ); the remaining pool `b = k̄·L·(1−δ)` is distributed by
+        # score share. δ = 0.5 — paper §A.3 warns δ = 0 is numerically
+        # unstable. Proxy in `_swift_svd_plus_alpha_search._evaluate_alpha`
+        # applies the same δ-floor (D-proxy-deploy-alignment).
         delta = 0.5
         rank_floor = max(1, int(math.floor(k_group * delta)))
         flexible_pool = k_group * gs.n_experts * (1.0 - delta)
@@ -802,10 +961,13 @@ class SwiftSvdAlphaPlugin:
         "Reference code: sramshetty/ShortGPT @ "
         "78d9615fdcae6d90368832bd0a86c49c323549b9. "
         "Deviations: D8 (β = per-expert spectral energy in (0,1] vs "
-        "paper β ∈ [1,2]), D-eps-star (ε* relative ratio + A^{1/2}·W "
-        "left-multiplication), D-per-type-alpha (opt-in per-projection "
-        "spectral-proxy refinement seeded from paper-exact global α). "
-        "See module docstring."
+        "paper's cross-layer β ∈ [1,2]), D-eps-star (ε* relative ratio + "
+        "A^{1/2}·W left-multiplication, dimensionless), D-per-type-alpha "
+        "(opt-in per-projection spectral-proxy search; global validation α "
+        "is logged-only when per-type is on), D-proxy-deploy-alignment "
+        "(proxy applies same δ=0.5 floor as deployed allocator), "
+        "D-raw-svd-fallback (raw svdvals(W) when A_cov is None, "
+        "warn-once). See module docstring."
     )
     config_key = "stage3_svd.swift_svd_plus.alpha_grid"
     reads: tuple[str, ...] = (
