@@ -4,10 +4,14 @@ Paper
 -----
 "EoRA: Eigenspace Low-Rank Approximation for Post-Training Compression
 of LLMs" — arXiv:2410.21271. Algorithm 1 reads the input
-auto-covariance ``A = X̃ X̃^T`` (the d_in × d_in right-side activation
-moment — see the shape check in
+auto-covariance ``A = X̃^T X̃`` (with ``X̃ ∈ ℝ^{N×d_in}`` the per-token
+activation matrix, rows=tokens — so ``A ∈ ℝ^{d_in × d_in}`` is the
+d_in × d_in right-side activation moment; see the shape check in
 :func:`stage4.plugins.eora_compensation._compute_eora_factors` against
-``(d_in, d_in)``) and the factorization residual
+``(d_in, d_in)``). Convention source-of-truth:
+:mod:`stage4.plugins.eora_compensation` (module docstring L38 and
+``_compute_eora_factors`` Step 2) — keep this notation aligned with
+that sibling plugin. Algorithm 1 also reads the factorization residual
 ``ΔW = W_orig − Ŵ`` (where ``Ŵ`` is the post-Stage-3 factored
 expert), then computes the √Λ-scaled eigenspace projection of ΔW and
 back-projects a rank-r correction.
