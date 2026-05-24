@@ -78,10 +78,13 @@ Two ctx slots are populated by ``setup_environment`` for that purpose:
   B=1 decode-shape crash on cu130 when YAML pins ``experts_implementation=grouped_mm``.
 
 Failure to honor either contract is benign while
-``experts_implementation=batched_mm`` (the current default) and
-``torch_compile=false``, but production qwen36_35b_a3b_30pct.yaml sets
-``torch_compile=true`` and Hopper PPL/lm_eval defaults toward
-``grouped_mm`` per ``teacher_provider.py`` L142-149.
+``experts_implementation=batched_mm`` and ``torch_compile=false``.
+Note that ``experts_implementation`` defaults to ``'batched_mm'`` as an
+in-code fallback when the YAML key is absent (line 549); production YAML
+(``configs/qwen36_35b_a3b_30pct.yaml`` L519) pins it to ``'grouped_mm'``
+for Hopper-fast paths, and that file also enables ``torch_compile=true``
+and points Hopper PPL/lm_eval defaults toward ``grouped_mm`` per
+``configs/qwen36_35b_a3b_30pct.yaml`` L519-522 (stage6_validate.experts_implementation: grouped_mm Hopper-fast comment).
 
 Circular-import contract (mirror of ``router_kd/plugins/trainable_scope.py``):
 this module imports only from ``..context`` / stdlib / torch — NEVER from
@@ -516,8 +519,9 @@ class EvalEnvironmentPlugin:
 
           Failure to do this leaves whichever PPL/lm_eval experts impl is
           active during generate; ``grouped_mm`` (Hopper PPL/lm_eval
-          default per ``teacher_provider.py`` L142-149) crashes on B=1
-          decode-shape on cu130.
+          default per ``configs/qwen36_35b_a3b_30pct.yaml`` L519-522
+          (stage6_validate.experts_implementation: grouped_mm Hopper-fast
+          comment)) crashes on B=1 decode-shape on cu130.
 
         The teacher-side equivalents are already implemented at
         ``teacher_provider.py`` L602-616; the student-side equivalents
@@ -556,10 +560,11 @@ class EvalEnvironmentPlugin:
         # generative plugins (see docstring "Downstream contract"), matching
         # teacher_provider.py L607-616.
         # Default is the YAML/env-var default 'batched_mm' (matches the
-        # student-side initial impl). teacher_provider.py L142-149 documents
-        # a Hopper preference for grouped_mm on PPL/lm_eval; that's a
-        # teacher-side choice and does not constrain the generative-block
-        # default.
+        # student-side initial impl). configs/qwen36_35b_a3b_30pct.yaml
+        # L519-522 (stage6_validate.experts_implementation: grouped_mm
+        # Hopper-fast comment) documents a Hopper preference for grouped_mm
+        # on PPL/lm_eval; that's a teacher-side choice and does not
+        # constrain the generative-block default.
         experts_implementation_generative = os.environ.get(
             "EXPERTS_IMPLEMENTATION_GENERATIVE", "batched_mm"
         )
