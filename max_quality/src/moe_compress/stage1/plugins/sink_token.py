@@ -5,7 +5,7 @@ Paper
 Su et al., "Unveiling Super Experts in Mixture-of-Experts Large Language
 Models" — arXiv:2507.23279 (audit/spec_compliance/01_papers/2507.23279/source.md).
 
-§5.1 paragraph at L717–L723 + Figure 6 caption L728–L734 (source.md) and
+§5.1 paragraph at L716–L723 + Figure 6 caption L728–L734 (source.md) and
 Appendix F Figures 20–21 (source.md L2479–L2486) document the paper's
 empirical observation:
 
