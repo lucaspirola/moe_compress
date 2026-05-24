@@ -5,7 +5,7 @@ Paper
 Zhang et al., "Does a Global Perspective Help Prune Sparse MoEs
 Elegantly?" — arXiv:2604.06542. (NB: this plugin's earlier docstring
 attributed the paper to "Liu et al."; the actual first author is
-Zeliang Zhang. Corrected during the ALGORITHM_REFERENCE.md retirement.)
+Zeliang Zhang.)
 
 §3.3 defines the greedy merge with restart (Algorithm 1):
 

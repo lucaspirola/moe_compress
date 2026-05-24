@@ -142,7 +142,7 @@ def discover_completed_layers(
             # Stage 2 v2 (spec § 12.1): format_version bumped 1 → 2 to
             # accommodate the new assignment_solver_used / em_rounds_completed
             # / distill_state fields. NO backward-compat shim — see
-            # ALGORITHM_REFERENCE.md § 11. Operators upgrading mid-pipeline
+            # the durability invariants in :mod:`stage2.resume`. Operators upgrading mid-pipeline
             # must finish a stage on one version or restart cleanly.
             raise RuntimeError(
                 f"_stage2_partial/merge_{ref.layer_idx}.json has format_version={fv} "

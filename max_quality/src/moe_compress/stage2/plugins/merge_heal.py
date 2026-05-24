@@ -53,7 +53,7 @@ byte-identical to the pre-feature code.
 
 No deviation row in §12
 -----------------------
-Merge-heal does not have a dedicated §12 row in ALGORITHM_REFERENCE.md
+Merge-heal had no dedicated §12 deviation row pre-retirement
 — it is an opt-in, default-off auxiliary; the baseline REAM
 arXiv:2604.04356 has no post-merge heal step at all, so there is no
 paper-claim to deviate from. Documented here for self-containment.

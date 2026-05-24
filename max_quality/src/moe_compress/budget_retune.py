@@ -95,7 +95,7 @@ the run's own artifacts:
                                      layer is never dropped below its count of
                                      protected (blacklisted super-) experts,
                                      read from ``stage1_blacklist.json`` when
-                                     present (see ALGORITHM_REFERENCE.md §4)
+                                     present (see :mod:`stage1` package docstring)
   * redundancy prior              -> ``per_layer_redundancy`` in the input
                                      ``stage1_budgets.json`` (GRAPE's R̃^l)
 
@@ -417,7 +417,7 @@ def assemble_layers(
         total_experts, mcp = stage2_damage[li]
         current_budget = s1_budgets[li]
         # Per-layer floor. With floor_divisor == 2 this is GRAPE's
-        # half-experts floor (ALGORITHM_REFERENCE.md §4); the floor is also
+        # half-experts floor (see :mod:`stage1` package docstring); the floor is also
         # raised so a layer is never dropped below its count of protected
         # (blacklisted super-) experts. Without a blacklist artifact
         # n_protected is 0 and this reduces to the N//floor_divisor convention.

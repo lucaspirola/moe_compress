@@ -67,7 +67,7 @@ but may deviate when the expert floor is binding (floor-clamp branch), or when
 either ceiling cap (_MAX_EP, _MAX_SP) is binding at the analytical start.
 
 .. note:: **Spec naming difference (F-01).**
-   §3 of ALGORITHM_REFERENCE.md calls this parameter ``expert_svd_ratio`` and
+   This parameter is conventionally called ``expert_svd_ratio`` and
    documents it as a *savings* ratio (e.g. "2.0 meaning pruning removes 2× the
    params that SVD removes").  That description refers to the ratio of savings
    contributions (``ep / (sp*(1-ep))``), not the knob ratio.  This
@@ -116,7 +116,7 @@ class BudgetDecomposition:
     routed experts across all layers).  Per-layer budgets N'_l are allocated by
     GRAPE in Stage 1 (``stage1/``), which distributes ``global_expert_budget``
     non-uniformly across layers using activation-aware CKA similarity, subject to
-    the ``min_experts_per_layer`` floor (see ALGORITHM_REFERENCE.md §4).
+    the ``min_experts_per_layer`` floor (see :mod:`stage1` package docstring).
     """
     total_reduction_ratio: float            # target, e.g. 0.30
     expert_prune_ratio: float               # knob value passed to Stage 2; actual pruning fraction may differ when the expert floor is binding
@@ -270,7 +270,7 @@ def solve(
     # capacity for that layer) is NOT checked here.  The global min_pool check
     # below handles the degenerate case where ALL layers are fully protected
     # (min_pool == 0).  For the general case, per-layer budget infeasibility is
-    # detected and handled by GRAPE in Stage 1 (ALGORITHM_REFERENCE.md §4),
+    # detected and handled by GRAPE in Stage 1 (see :mod:`stage1` package docstring),
     # which distributes global_expert_budget non-uniformly and enforces
     # min_experts_per_layer per layer.  Adding a solver-level per-layer warning
     # would duplicate GRAPE's own feasibility logic without spec mandate (§3
