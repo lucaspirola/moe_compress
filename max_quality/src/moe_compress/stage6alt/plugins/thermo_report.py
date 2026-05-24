@@ -1,5 +1,19 @@
 """Thermometer final-report assembly (S6A-5 of the Stage 6alt plugin-architecture refactor).
 
+Paper / spec source
+--------------------
+Stage 6alt thermometer final-report — assembles
+``stage6alt_eval.json`` with:
+
+  - Per-token ``top1_agreement`` (student vs teacher argmax fraction).
+  - ``bpt_gap`` (``math.isfinite``-guarded delta of student-vs-teacher
+    BPT).
+  - ``acc_norm_sum_gap`` (sum of deltas across the zero-shot subset's
+    ``acc_norm`` columns).
+  - Threshold-check pass/fail dict, JSON write.
+
+Project-original sweep harness; no upstream paper.
+
 Home of the Stage 6alt thermometer FINAL-REPORT concern, extracted from
 the legacy ``stage6alt_thermometer.py`` monolith. The thermo-report
 plugin owns the post-eval assembly of the ``stage6alt_eval.json``
@@ -82,15 +96,7 @@ class ThermoReportPlugin:
     """
 
     name = "thermo_report"
-    paper = (
-        "Stage 6alt thermometer final-report assembly — top1_agreement "
-        "(per-token student-vs-teacher argmax match rate), bpt_gap "
-        "(student_bpt - teacher_bpt, finite-guarded), acc_norm_sum_gap "
-        "(student_acc_sum - teacher_acc_sum, None-guarded), the 16-key "
-        "results dict pinned by the S6A-0 golden, and the "
-        "stage6alt_eval.json artifact write. See stage6alt_thermometer.py "
-        "module docstring for the bpt_gap / top1_agreement interpretation."
-    )
+    paper = "Stage 6alt thermometer final report — top1_agreement + bpt_gap + acc_norm_sum_gap (project-original sweep harness). See module docstring."
     config_key = "stage6_validate.thermometer"
     reads: tuple[str, ...] = (
         "config",
