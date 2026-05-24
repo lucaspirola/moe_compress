@@ -3,8 +3,8 @@
 Paper
 -----
 Hyeon & Do, "Is Retraining-Free Enough? The Necessity of Router
-Calibration for Efficient MoE Compression" — arXiv:2603.02217 (§F.3,
-Eq. 3, Table 1). audit/spec_compliance/01_papers/2603.02217/source.md.
+Calibration for Efficient MoE Compression" — arXiv:2603.02217 (§5 Eq. 3,
+§F.3 Table 1). audit/spec_compliance/01_papers/2603.02217/source.md.
 
 Equation 3 (abbreviated; per-sequence form): the vocab-KL distillation
 objective
@@ -22,7 +22,7 @@ the resulting recovery on Mixtral/Qwen-MoE post-pruning/post-merging.
 
 Official code
 -------------
-**None published.** Verified 2026-05: the paper's source.md contains
+**None published.** Verified 2026-05-13: the paper's source.md contains
 no code link; first author Sieun Hyeon (Seoul National University) has
 no public router-KD repo.
 
