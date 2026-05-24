@@ -36,9 +36,9 @@ measurable per-candidate ΔNLL.
 Why this detector exists
 ------------------------
 The static three-way AND threshold from arXiv:2507.23279 is tuned for
-the paper's measured models (Qwen3-30B-A3B initial release / DeepSeek-V2-Lite /
-Mixtral-8x7B); on architecture-shifted models the right thresholds shift
-too. The v3 Phase F audit (commits in the 2026-05-10 series) surfaced
+the paper's measured models (e.g. Qwen3-30B-A3B initial release /
+DeepSeek-V2-Lite / DeepSeek-R1 / Mixtral-8x7B; see Table 1); on
+architecture-shifted models the right thresholds shift too. The v3 Phase F audit (commits in the 2026-05-10 series) surfaced
 non-blacklisted experts with measurable ablation ΔNLL — e.g.,
 ``L34E85`` with ΔNLL ≈ −0.025 — that the static three-way AND missed.
 A magnitude-top-K source per layer catches these by widening the
@@ -48,7 +48,8 @@ ablation-gated).
 K = 16 is set to **2× the model's active-experts-per-token** (top-8
 routing on the target Qwen3-30B-A3B-2507 architecture). The 2× factor is
 broad enough to recover SEs that fell just below the three-way AND's
-P99.5 outlier cut while still bounding the per-layer ablation cost.
+full criterion (``a_{l,e} > P99.5 ∧ a_{l,e} > a_max/10 ∧ l ∈ L``;
+arXiv:2507.23279 Eq. 6) while still bounding the per-layer ablation cost.
 
 Git archaeology
 ---------------
@@ -69,9 +70,11 @@ Naming-history note
 The legacy stage-1 monolith called this "Phase C₄" (fourth sub-source of
 the unified Phase C candidate-collection stage). The current plugin
 architecture has no phase taxonomy — plugin enable/disable is the flag
-that gates execution. The existing log string ``"Stage 1 Phase C₄"`` and
-the Trackio-keyed ``"phase_c"`` provenance label are retained for
-dashboard back-compat; new prose drops the labels.
+that gates execution. Only the legacy log string ``"Stage 1 Phase C₄"``
+is retained for dashboard back-compat; the provenance tag attached to
+candidates produced by this plugin is ``"magnitude_topk"`` (see line
+where ``candidate_bag.add(..., "magnitude_topk")`` is called), not
+``"phase_c"``. New prose drops the legacy labels.
 
 Plugin contract
 ---------------
@@ -230,6 +233,14 @@ def _magnitude_topk_candidates(
 
     Moved verbatim from the legacy Stage 1 module in sub-task 8. Sole
     caller: :class:`MagnitudeTopkPlugin.run`.
+
+    Implementation note
+    -------------------
+    Ties on ``per_expert_max[(l, e)]`` are broken by **ascending expert
+    index** via the secondary sort key ``(-v, e)``. This makes the
+    selection deterministic across Python/CPython releases (which is
+    otherwise dependent on ``dict``-iteration order of
+    ``per_expert_max``) and reproducible across runs.
     """
     if top_k <= 0 or not L:
         return set()
@@ -239,7 +250,9 @@ def _magnitude_topk_candidates(
             by_layer.setdefault(int(li), []).append((int(e), float(v)))
     out: set[tuple[int, int]] = set()
     for li, lst in by_layer.items():
-        lst.sort(key=lambda t: -t[1])
+        # Primary: descending magnitude. Secondary: ascending expert id
+        # for deterministic tie-break (see Implementation note above).
+        lst.sort(key=lambda t: (-t[1], t[0]))
         for e, _ in lst[:top_k]:
             out.add((li, e))
     return out
