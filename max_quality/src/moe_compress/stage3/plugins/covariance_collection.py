@@ -6,24 +6,29 @@ Paper
 arXiv:2604.02119 (audit/spec_compliance/01_papers/2604.02119/source.md).
 
 Theorem 3.2 of AA-SVD prescribes the factorization
-``M = W·C·S⁻¹·L_B`` where ``B`` is the post-prune input data matrix
-``X_post`` (rows = tokens), ``S = B·B^T = E[X_post X_post^T]`` is the
-post-prune input *covariance*, ``L_B`` is the symmetric factor of
-``S`` (i.e. ``S = L_B · L_B^T``), and ``C = E[X_pre X_post^T]`` is the
+``M = W·C·S⁻¹·L_B^T`` where ``B`` is the post-prune input data matrix
+``X_post`` (rows = tokens — code/numpy convention; the paper uses
+cols = tokens so its ``B·B^T`` becomes ``B^T·B`` here),
+``S = B^T·B = E[X_post^T X_post]`` is the post-prune input
+*covariance*, ``L_B`` is the symmetric factor of ``S`` (i.e.
+``S = L_B · L_B^T``), and ``C = E[X_pre^T X_post]`` is the
 cross-covariance between pre- and post-prune layer inputs. Corollary
-3.3 (the special case ``A = S``) reduces to ``M = W · L_B`` when only
+3.3 (the special case ``A = S``) reduces to ``M = W · L_B^T`` when only
 the post-prune covariance is available.
 
 Naming bridge (paper ↔ code): the paper's covariance ``S`` is what
 this codebase calls ``B_cov`` / ``B_acc`` / the ``B`` accumulator —
 i.e. the variable named ``B`` in the *code* IS paper-``S``, not the
-paper's data matrix. The rest of this docstring uses paper notation
-(``S`` for covariance) when discussing math and the code symbol
-(``B_acc``, ``_bcov_*.pt``) when discussing artifacts.
+paper's data matrix. From here on this docstring uses paper notation
+(``S`` for the covariance) exclusively when discussing math, and the
+code symbol (``B_acc``, ``_bcov_*.pt``) only when discussing artifacts.
+The paper-data-matrix sense of ``B`` is NOT reused after this
+paragraph.
 
 This plugin owns the post-prune covariance pass: for every MoE
-``(layer, expert, matrix)`` tuple, accumulate ``B`` (always) and
-``C`` (gate_proj only — see deviation D6 below) during a single
+``(layer, expert, matrix)`` tuple, accumulate ``S`` (always; into the
+code accumulator ``B_acc``) and ``C`` (gate_proj only — see deviation
+D6 below) during a single
 dual-forward pass against the teacher (pre-prune model) and the
 post-prune student. Also loads the Stage 2 input-covariance sidecar
 (``A_cov`` from ``_stage2_input_covariance.pt``) which downstream
@@ -41,18 +46,19 @@ Live factorisation paths (after Path 2 retirement)
 Downstream ``aa_svd_factor.py`` (the ``_aa_svd`` factor function)
 implements two paths only:
 
-  * **Path 1 — Theorem 3.2 (paper-exact)**: ``M = W·C·S⁻¹·L_B`` when
+  * **Path 1 — Theorem 3.2 (paper-exact)**: ``M = W·C·S⁻¹·L_B^T`` when
     both ``C`` (cross-cov from this plugin's dual-forward) and ``S``
-    (post-prune input covariance — code symbol ``B_acc`` / ``B_cov``)
-    are available. This is the default when ``aa_svd.cross_covariance:
-    true`` (the configured default).
-  * **Path 3 — Corollary 3.3 (B-only fallback)**: ``M = W·L_B`` when
+    (post-prune input covariance — code symbol ``B_acc`` / ``B_cov``
+    that IS paper-``S``, per the Naming bridge above) are available.
+    This is the default when ``aa_svd.cross_covariance: true`` (the
+    configured default).
+  * **Path 3 — Corollary 3.3 (S-only fallback)**: ``M = W·L_B^T`` when
     ``C`` is unavailable. Used when ``aa_svd.cross_covariance: false``
     or when the teacher load is suppressed.
 
 An earlier "Path 2" substituted the pre-prune *auto*-covariance ``A``
 (from Stage 2) into the Theorem 3.2 slot in place of ``C``. That path
-was retired: it produced ``U·V ≈ W·A·S⁻¹·L_B`` rather than
+was retired: it produced ``U·V ≈ W·A·S⁻¹·L_B^T`` rather than
 approximating ``W``, breaking ``FactoredExperts`` forward and Stage 4
 EoRA residual (see the Path-2-retirement comment block in ``_aa_svd``
 of ``aa_svd_factor.py`` / tests in ``test_aa_svd_correctness.py``).
@@ -192,13 +198,14 @@ def _collect_covariances(
     C_acc: InputCovarianceAccumulator | None = None,
     ccov_spill_dir=None,
 ) -> None:
-    """Collect post-prune input covariance B and (optionally) cross-covariance C.
+    """Collect post-prune input covariance S and (optionally) cross-covariance C.
 
-    **B-covariance** (always): ``B = X_post^T X_post`` per (layer, expert,
-    matrix), collected by hooking the pruned (student) model's expert
-    inputs. ``InputCovarianceAccumulator`` redirects ``matrix_name="up_proj"``
-    to the ``gate_proj`` entry internally (auto-cov share, same hidden state
-    pre-routing).
+    **S-covariance** (always; code symbol ``B_acc`` IS paper-``S`` — see
+    module-docstring Naming bridge): ``S = X_post^T X_post`` per
+    (layer, expert, matrix), collected by hooking the pruned (student)
+    model's expert inputs. ``InputCovarianceAccumulator`` redirects
+    ``matrix_name="up_proj"`` to the ``gate_proj`` entry internally
+    (auto-cov share, same hidden state pre-routing).
 
     **Cross-covariance** (when teacher_model provided): ``C = X_pre^T X_post``
     per ``(layer, student_expert)`` on **gate_proj inputs only**, collected by
@@ -311,8 +318,11 @@ def _collect_covariances(
                 # Cross term on the input device so the in-place add inside
                 # update_cross stays on-device (matches B_acc.update's
                 # contract; finalize_layer does the single GPU→CPU
-                # transfer per key, applying ``storage_dtype``).
-                cross = (X_pre.T @ X_post).to(device=tensor.device)
+                # transfer per key, applying ``storage_dtype``). The per-row
+                # ``.to(tgt_device)`` above already pinned every X_pre vector
+                # to ``tensor.device``, so the matmul output lives there by
+                # construction — no trailing ``.to(tensor.device)`` needed.
+                cross = X_pre.T @ X_post
                 # Public entry: holds C_acc._lock around _pending writes
                 # and routes through finalize_layer's storage_dtype cast
                 # (D-cov-storage-fp16). Direct ``_gpu``/``_pending``
@@ -465,8 +475,9 @@ def _load_stage2_covariance(path: Path):
 class CovarianceCollectionPlugin:
     """Stage 3 covariance-collection plugin (live in the orchestrator sequencer).
 
-    Owns the post-prune covariance-collection phase: B-covariance
-    ``B = X_post^T X_post`` (always) and, when a teacher model is supplied, the
+    Owns the post-prune covariance-collection phase: S-covariance
+    ``S = X_post^T X_post`` (always; code symbol ``B_acc`` IS paper-``S``)
+    and, when a teacher model is supplied, the
     AA-SVD cross-covariance ``C = X_pre^T X_post`` (Theorem 3.2, paper
     2604.02119). The phase logic lives in the module-level
     ``_collect_covariances``. The Stage 3 orchestrator (``stage3/orchestrator.py``)
@@ -480,8 +491,8 @@ class CovarianceCollectionPlugin:
         "AA-SVD Theorem 3.2 cross-covariance + Corollary 3.3 — "
         "arXiv:2604.02119 (atulkumarin/AA-SVD @ "
         "1fa1b686cd9b13a77607a676564e37d438a176c8). "
-        "Live factor paths: Path 1 (W·C·S⁻¹·L_B, default; code symbol "
-        "``B_acc`` IS paper-S) and Path 3 (W·L_B, S-only fallback). "
+        "Live factor paths: Path 1 (W·C·S⁻¹·L_B^T, default; code symbol "
+        "``B_acc`` IS paper-S) and Path 3 (W·L_B^T, S-only fallback). "
         "Path 2 (auto-cov-for-cross-cov) was retired — see the "
         "Path-2-retirement comment block in ``_aa_svd`` of "
         "aa_svd_factor.py. "
