@@ -1,12 +1,112 @@
-"""REAP scoring plugin: owns the per-layer ReapAccumulator and derives
-the ``scores`` / ``freq`` slots so downstream phases (centroid selection,
-cost-matrix construction) can read them as plain slots on the per-layer
-:class:`PipelineContext`.
+"""REAP per-layer expert-saliency scoring (Eq. 9).
 
-This plugin is the first real extraction out of ``LegacyAdapter`` (T7 of the
-plugin refactor). The pure-function ``select_centroids_by_reap`` packages the
-centroid-selection inner loop so it can be unit-tested without spinning up a
-full pipeline.
+Paper
+-----
+Thangarasa et al., "REAP the Experts: Why Pruning Prevails for One-Shot
+MoE Compression" — arXiv:2510.13999 (ICLR 2026).
+audit/spec_compliance/01_papers/2510.13999/source.md.
+
+Equation 9 (per-expert saliency, the centroid-candidacy signal):
+
+    S_j = (1/|X_j|) · Σ_{x ∈ X_j} g_j(x) · ‖f_j(x)‖₂
+
+where ``X_j = {x | j ∈ TopK(σ(x))}`` is the set of calibration tokens on
+which expert ``j`` is dispatched, ``g_j(x)`` is the post-softmax routing
+weight, and ``f_j(x)`` is the expert output.
+
+Official code
+-------------
+``CerebrasResearch/reap`` @ commit
+``1970473c51ca3caeb98c10392f15b3a08a672974`` (2026-04-17) —
+github.com/CerebrasResearch/reap. The reference implementation is the
+basis for the REAP scoring pass.
+
+Deviation: D-reap-routing-weight
+--------------------------------
+Paper Eq. 9 is silent on whether ``g_j(x)`` is the un-renormalized
+masked softmax or the dispatched (top-k renormalized) weight. The
+plugin uses the **dispatched** weight as the model's forward pass
+applies it — for Qwen3-MoE this is
+``softmax(router_logits)[j] / Σ_{k∈top-k} softmax(router_logits)[k]``
+(top-k softmax outputs renormalized to sum=1 over the top-k set).
+
+Rationale: the model's actual forward output uses the renormalized
+top-k weight, so REAP's "expert importance" ``S_j`` is most faithful to
+the model's behavior when computed against the same weight the experts
+actually receive. Both readings (renormalized vs un-renormalized) are
+defensible from Eq. 9 alone. The un-renormalized reading would yield
+the same expert *ranking* only if the per-token sum is constant, which
+it is not (varies per token), so the choice is empirically
+distinguishable — just not in a paper-prescribed direction.
+
+Deviation: D-reap-min-active-tokens
+-----------------------------------
+REAM/REAP do not describe a minimum-active-tokens filter for centroid
+candidacy. The plugin's downstream ``select_centroids_by_reap``
+implements ``reap_min_active_tokens`` (configurable; default ``0`` in
+code, set to ``32`` in the production config) that excludes experts
+with fewer than 32 active calibration tokens from centroid candidacy.
+Filtered experts become non-centroids and are merged.
+
+Rationale: low-frequency experts have noisy gate/expert profiles
+(averaged over <32 tokens), so promoting them to centroids would
+propagate that noise into the merged weights. Filtering them to
+non-centroid status routes them through the Hungarian alignment
+(which projects them onto a higher-frequency centroid's neuron space)
+instead. Compression target may shrink slightly when many low-frequency
+experts are filtered; a WARNING is logged but **no compensating
+budget-bump fires** — surfaces under-target compression without
+silently absorbing it.
+
+Calibration deviations (SHARED — also applies to Stage 2.5 / 5)
+---------------------------------------------------------------
+- **D11 — calibration data source**: REAP (2510.13999 §4) uses
+  c4 + evol-codealpaca. The project uses multi-domain
+  Nemotron-Cascade-2-SFT-Data with weighted subsets
+  (chat 0.56, math 0.21, science 0.11, ...). Task-aware calibration
+  better matches target deployment distribution.
+- **D-cal-size — calibration sequence count**: REAM 2604.04356 §4 uses
+  3072 sequences × 512 tokens (1.57 M tokens); REAP 2510.13999 uses
+  1024 sequences × 2048 tokens (2.1 M tokens). The project uses
+  4000 sequences × 2048 tokens (8.19 M tokens) — 5.2× / 3.9× more
+  tokens; the longer 2048-token sequences match the deployment context
+  length.
+
+Routing-weight notation: REAP / REAM convention
+-----------------------------------------------
+- REAP (2510.13999) uses ``g_j(x)`` for the post-softmax routing
+  weight, **masked** to zero for non-top-k experts.
+- REAM (2604.04356) uses ``σ(x)_j`` for the **full unmasked softmax**
+  (always strictly positive for every expert on every token).
+
+This plugin owns the REAP-side ``g_j(x)`` view. The REAM cost plugin
+(:mod:`stage2.plugins.ream_cost`) owns the ``σ(x)_j`` view for its
+δ̃_expert numerator. Both views derive from the same per-token
+router-logits forward pass.
+
+Output context contract
+-----------------------
+- ``reads``: ``layer_ref``.
+- ``writes``: ``reap_acc`` (the per-layer ``ReapAccumulator``),
+  ``scores`` (per-expert saliency ``np.ndarray``), ``freq`` (per-expert
+  token count ``dict[int, int]``).
+- ``provides``: ``("reap_acc",)`` — declarative metadata for the
+  orchestrator's calibration-pass wiring.
+
+Two phase-hooks: ``on_layer_setup`` (instantiate the per-layer
+``ReapAccumulator`` and stash it on the context); ``on_score``
+(finalize the accumulator and publish ``scores`` + ``freq``).
+
+``contribute_artifact`` returns ``{}`` — REAP scores feed in-memory
+into the downstream cost plugins; nothing is written to disk by this
+plugin.
+
+Naming-history note
+-------------------
+The legacy stage-2 monolith called this "Phase: Step 1 REAP Scoring"
+(per §5 Step 1). Plugin architecture has no phase taxonomy. New prose
+drops the labels; the existing log lines and Trackio keys retain the
+legacy names for dashboard back-compat.
 """
 from __future__ import annotations
 
@@ -22,10 +122,25 @@ log = logging.getLogger(__name__)
 
 
 class ReapScoringPlugin:
-    """Construct and finalize the layer's ReapAccumulator; publish scores/freq."""
+    """REAP per-expert saliency scoring; publishes ``scores`` and ``freq``.
+
+    Implements REAP Eq. 9 (arXiv:2510.13999) — runs at on_score time
+    between profile and compute_assignment. See module docstring for
+    the official-code SHA, the D-reap-routing-weight deviation
+    (renormalized top-k weight chosen as the runtime-faithful reading),
+    the D-reap-min-active-tokens filter, and the shared calibration
+    deviations D11 / D-cal-size.
+    """
 
     name = "reap_scoring"
-    paper = "REAP scoring: per-layer ReapAccumulator deriving scores/freq slots."
+    paper = (
+        "REAP Eq. 9: S_j = (1/|X_j|)·Σ g_j(x)·‖f_j(x)‖₂ — "
+        "arXiv:2510.13999 (Thangarasa et al., ICLR 2026). "
+        "Official code: CerebrasResearch/reap @ "
+        "1970473c51ca3caeb98c10392f15b3a08a672974. "
+        "Deviations: D-reap-routing-weight, D-reap-min-active-tokens; "
+        "calibration: D11 + D-cal-size. See module docstring."
+    )
     config_key = "stage2_reap_ream"
     reads: tuple[str, ...] = ("layer_ref",)
     writes: tuple[str, ...] = ("reap_acc", "scores", "freq")
