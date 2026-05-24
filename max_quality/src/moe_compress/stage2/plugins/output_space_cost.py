@@ -30,20 +30,24 @@ damage:
   ``_aligned_whitened_residual``) measures weight-space residual along
   the activation-covariance eigenbasis — captures the AA-SVD-style
   whitened ΔW norm but is still a weight-only proxy.
-- ``output`` (this branch, Direction C) measures the actual MoE-block
+- ``output`` (this branch, Direction C) measures the actual expert
   output divergence under a **tentative merge**: for each candidate
-  ``(c, m)`` pair, tentatively replace centroid ``c``'s weights with
-  the freq-weighted merge of ``{c, m}``, run the layer-input batch
-  through a faithful student replica of the MoE block (including the
-  resized router), and compare the output against the pre-merge
-  output. Cost = output L2 distance summed over the reservoir batch.
+  ``(c, m)`` pair, build the freq-weighted permutation-aligned merge
+  of ``{c, m}``, run the layer-input batch through a single-expert
+  ``_swiglu_forward`` for both ``E_m`` and ``E_merged`` (the ORIGINAL
+  router σ_m, no full-block replica and no resized router), and
+  compare. Cost = routing-weight-weighted mean squared output distance
+  ``E_m`` vs ``E_merged``, weighted by σ_m from the original router
+  with the dispatch-time top-k membership mask applied.
 
 The four module-level helpers implement this:
 
 - ``_swiglu_forward`` — faithful single-expert SwiGLU forward
-  (gate / up / down). Also called by monolith-resident
-  ``_distill_merged_group`` and ``_heal_student_moe_output``, so its
-  re-import in ``stage2_reap_ream.py`` is load-bearing.
+  (gate / up / down). Also called by ``_distill_merged_group``
+  (``stage2.plugins.expert_distill`` L240/L250) and
+  ``_heal_student_moe_output`` (``stage2.plugins.merge_heal`` L552),
+  so the live re-export from this module via
+  ``stage2.orchestrator`` (L133-L138) is load-bearing.
 - ``_router_routing_weights`` — returns the **full unmasked softmax**
   ``σ(x)_e`` over all experts (REAM convention), with no top-k masking
   and no renormalization. The merge-cost call site
@@ -64,6 +68,29 @@ The four module-level helpers implement this:
   the K-prefilter (``cost_topk_filter``, default 48) and computes the
   output-residual cost for the surviving (c, m) pairs.
 
+Deviation: D-output-space-routing-weight
+----------------------------------------
+The per-token weight used by ``_output_space_cost`` is
+
+    gate_m(t) = σ_m(x_t) · 1[m ∈ topk(x_t)]
+
+where ``σ`` is the **full unmasked softmax** from
+``_router_routing_weights`` and the indicator is the dispatch-time
+top-k membership mask. This is a deliberate hybrid:
+
+- REAM convention uses raw ``σ(x)`` (full softmax, no top-k mask).
+- ``D-reap-routing-weight`` (:mod:`stage2.plugins.reap_scoring`) uses
+  the **renormalized** top-k softmax — the post-renormalization
+  dispatch weight.
+- ``D-output-space-routing-weight`` (this branch) keeps ``σ``
+  **un-renormalized** but masks by top-k membership, yielding REAP's
+  masked gate ``g_j(x)`` minus the renormalization.
+
+Kept un-renormalized on purpose: the cost is a routing-weight-weighted
+mean (denominator ``Σ_t gate_m(t)``), so a per-token renormalization
+over the top-k set would cancel out of both numerator and denominator
+and only matter as an overall scale.
+
 Why this is opt-in (not the default)
 ------------------------------------
 Output-space cost requires a forward pass per candidate pair (or per
@@ -81,8 +108,9 @@ cost form. The current plugin architecture has no direction-letter
 taxonomy. New prose drops the label; existing log lines and Trackio
 keys retain "Direction C" identifiers for dashboard back-compat.
 
-Circular-import note: this module imports only ``pipeline.permutation_align``,
-``pipeline.base``, ``pipeline.context`` and ``moe_compress.utils.*`` — none of
+Circular-import note: this module imports only ``pipeline.context``,
+``moe_compress.utils.activation_hooks``, ``moe_compress.utils.model_io``,
+``..permutation_align`` and ``.ream_cost`` — none of
 which import ``stage2_reap_ream``, ``ream_cost`` or ``output_space_cost``. There
 is therefore no cycle at module load. ``ream_cost._ream_cost_matrix``'s
 ``output`` branch imports ``_output_space_cost`` from *this* module at *function
@@ -322,16 +350,18 @@ def _output_space_cost(
     #    bump loop only calls this cost path when at least one side is non-
     #    empty), but we return the empty matrix to make the contract explicit.
     #  * If either side is empty there is no (m, c) pair to score: return early.
-    #  * If ``n_c == 0`` the ``argpartition(..., k_cand-1)`` below would degrade
-    #    to ``argpartition(..., -1)`` (a silent off-by-one); guarded here.
+    #  * With ``n_c == 0``, ``argpartition(cheap_cost[ci], k_cand-1)`` below
+    #    raises a k-out-of-bounds error on an empty shape — the early-return
+    #    guard here is correct.
     if n_nc == 0 or n_c == 0:
         return out
 
     banks = build_banks(layer_ref)
-    # Resolve the compute device + dtype from the model's own expert weights
-    # so the cost computation runs wherever the model lives (CPU or GPU),
-    # with no hardcoded device. Safe to index ``centroid_ids[0]`` — the empty
-    # case is handled by the early-return above.
+    # Resolve the compute device from the model's own expert weights so the
+    # cost computation runs wherever the model lives (CPU or GPU), with no
+    # hardcoded device. (Dtype is hardcoded to fp32 at the SwiGLU call sites
+    # below.) Safe to index ``centroid_ids[0]`` — the empty case is handled
+    # by the early-return above.
     _probe = banks["gate_proj"].get(centroid_ids[0])
     device = _probe.device
 
@@ -368,12 +398,12 @@ def _output_space_cost(
             gate_m = sigma[:, m_id] * routed_m.to(sigma.dtype)  # (T,)
             if float(gate_m.sum()) <= 0.0:
                 # No calibration token routes to m — the output cost is
-                # undefined (every merge is "free" on unseen inputs). Leave
-                # the whole row at +inf so the bump loop / orphan-promotion
-                # path handles it, exactly as the post path does for a child
-                # with no finite candidate. The cheap-cost top-K still picks
-                # candidates, but a finite fallback is needed so the solver
-                # has a feasible arc — fall back to the cheap symmetric cost.
+                # undefined (every merge is "free" on unseen inputs). The
+                # cheap-cost top-K still picks candidates, and a finite
+                # fallback is needed so the assignment solver retains
+                # feasible arcs for this row — fill those top-K entries
+                # with the cheap symmetric REAM cost (finite fallback),
+                # leaving the remaining entries at the row's initial +∞.
                 k_cand = min(topk, n_c)
                 for cj in np.argpartition(cheap_cost[ci], k_cand - 1)[:k_cand]:
                     out[ci, int(cj)] = float(cheap_cost[ci, int(cj)])
@@ -427,8 +457,9 @@ class OutputSpaceCostPlugin:
         "Output-space merge-cost matrix (project-original; no paper). "
         "Direction C from STRATEGY_NEXT §C. Replaces baseline REAM "
         "arXiv:2604.04356 (see :mod:`stage2.plugins.ream_cost`). "
-        "End-to-end output L2 distance under tentative merge — opt-in via "
-        "cost_alignment='output'; default 'pre'. See module docstring."
+        "Routing-weight-weighted mean squared output distance under "
+        "tentative merge — opt-in via cost_alignment='output'; default "
+        "'pre'. See module docstring."
     )
     config_key = "stage2_reap_ream.cost_alignment"
     reads: tuple[str, ...] = _COST_PLUGIN_READS
