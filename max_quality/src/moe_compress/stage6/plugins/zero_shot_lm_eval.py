@@ -2,7 +2,8 @@
 
 Paper / dataset
 ----------------
-lm-evaluation-harness (Gao et al. 2024) standard zero-shot suite —
+lm-evaluation-harness (Gao et al., EleutherAI/lm-evaluation-harness,
+Zenodo DOI 10.5281/zenodo.10256836) standard zero-shot suite —
 ARC-Challenge (Clark et al. 2018, arXiv:1803.05457) + HellaSwag
 (Zellers et al. 2019, arXiv:1905.07830). Loglikelihood scoring via
 ``lm_eval.simple_evaluate(...)``.
@@ -16,6 +17,38 @@ Reference code
 --------------
 EleutherAI/lm-evaluation-harness — standard library; no project-pinned
 SHA. Invoked via the ``lm_eval`` package.
+
+Version contract: this plugin targets lm-eval ``>=0.4.5,<0.5``. The
+``0.4.x`` series stabilised the ``acc_norm,none`` / ``acc,none`` metric
+keys we depend on at L122 / L128; lm-eval has historically renamed
+metric keys between minor releases, so a future ``0.5.x`` upgrade MUST
+be re-validated against this plugin before relaxing the upper bound.
+The upper bound is documented here rather than pinned in
+``requirements.txt`` because Stage 6's exit-criteria deviation contract
+lives next to the metric-key logic it constrains.
+
+Deviation D-arc-acc-norm
+------------------------
+ARC-Challenge accuracy is reported under the ``arc_challenge_acc`` key
+but the underlying lm-eval metric returned is ``acc_norm,none`` (length-
+normalised loglikelihood accuracy), NOT the raw ``acc`` reported in the
+original ARC paper (Clark et al. 2018, arXiv:1803.05457). The metric-
+key preference list at L122 — ``("acc_norm,none", "acc,none")`` — picks
+``acc_norm,none`` first whenever it is present, which it always is for
+ARC-C in lm-eval ``>=0.4.x``.
+
+Rationale: this matches the EleutherAI Open-LLM-Leaderboard convention
+for ARC-Challenge (which the broader capability-tracking community
+treats as the canonical comparison number). Using ``acc_norm`` gives a
+length-bias-corrected, more defensible cross-model comparison than raw
+``acc``, and preserves dashboard continuity with leaderboard scores
+downstream consumers expect. HellaSwag (Zellers et al. 2019) already
+uses ``acc_norm`` in its original paper so no deviation applies there.
+
+Downstream consumers — notably ``validation_report.py`` — read the
+``arc_challenge_acc`` slot as the canonical ARC-C number; they should
+treat it as the Open-LLM-Leaderboard ``acc_norm`` figure, not the Clark
+2018 raw ``acc``.
 
 Home of the Stage 6 zero-shot concern, extracted from the legacy
 ``stage6_validate.py`` monolith. The zero-shot sub-metric of the Stage 6
@@ -57,6 +90,7 @@ Stage 6 plugin sequencer and deletes the monolith ``run()``.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from ..context import PipelineContext
@@ -72,7 +106,16 @@ log = logging.getLogger(__name__)
 _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 
 
-_ZERO_SHOT_TASKS: frozenset[str] = frozenset({"arc_challenge_acc", "hellaswag_acc"})
+# L3-fix (iter 1): this frozenset holds the FLAT METRIC KEYS we expose on the
+# Stage 6 result dict (each is ``"<lm_eval_task_id>_acc"``), NOT the bare lm-eval
+# task IDs (``arc_challenge`` / ``hellaswag``). The ``_acc`` suffix is the
+# project-side convention added by ``_lm_eval_tasks`` at L128 below.
+# ``_ZERO_SHOT_METRIC_KEYS`` is the canonical name; ``_ZERO_SHOT_TASKS`` is kept
+# as a back-compat alias for ``stage6_validate`` / ``validation_report`` and
+# tests that already import the historical name. Both bindings point at the
+# same frozenset object.
+_ZERO_SHOT_METRIC_KEYS: frozenset[str] = frozenset({"arc_challenge_acc", "hellaswag_acc"})
+_ZERO_SHOT_TASKS: frozenset[str] = _ZERO_SHOT_METRIC_KEYS  # back-compat alias
 
 
 # ---------------------------------------------------------------------------
@@ -92,57 +135,78 @@ def _lm_eval_tasks(model, tokenizer, tasks: list[str], *, collect=None,
     HellaSwag for a cheap directional signal. None = evaluate the full task,
     which is the behavior every full-Stage-6 caller relies on.
     """
+    # L1-fix (iter 1): keep the import branch as a soft-skip (lm-eval is an
+    # optional extra: callers may legitimately run Stage 6 without it and just
+    # want the zero-shot slot empty), but DO NOT wrap the eval body in the same
+    # blanket except — real eval-time failures must bubble up so silent quality
+    # regressions can't hide behind ``return {}``.
     try:
         from lm_eval import simple_evaluate
         from lm_eval.models.huggingface import HFLM
-    except Exception as err:           # noqa: BLE001
-        log.warning("lm-eval not available (%s); skipping zero-shot.", err)
+    except ImportError as err:
+        log.warning("lm-eval not importable (%s); skipping zero-shot.", err)
         return {}
 
+    # L2-fix (iter 1): Spec §9 #2 requires eager attention for batch-size
+    # invariance; if model.config is missing entirely the AttributeError from
+    # ``model.config._attn_implementation`` is unhelpful — guard with an
+    # explicit RuntimeError that names the offending object.
+    _config = getattr(model, "config", None)
+    if _config is None:
+        raise RuntimeError(
+            "Stage 6 _lm_eval_tasks: model has no `.config` attribute; "
+            "cannot verify _attn_implementation contract (spec §9 #2)."
+        )
     # Spec §9 #2: lm-eval batch-size invariance requires eager attention.
-    _attn_impl = getattr(model.config, "_attn_implementation", None)
+    _attn_impl = getattr(_config, "_attn_implementation", None)
     if _attn_impl != _STAGE6_ATTN_IMPLEMENTATION:
         raise RuntimeError(
             f"Stage 6 _lm_eval_tasks: model.config._attn_implementation="
             f"{_attn_impl!r}, expected {_STAGE6_ATTN_IMPLEMENTATION!r} per "
             "spec §9 #2 (batch-size-independent loglikelihood requires eager attn)."
         )
-    try:
-        lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
-        out = simple_evaluate(
-            model=lm, tasks=list(tasks), num_fewshot=0,
-            log_samples=(collect is not None),
-            limit=limit,
-        )
-        results = out.get("results", {})
-        flat: dict = {}
-        for task, metrics in results.items():
-            # ARC-C canonical metric is acc_norm,none (normalized); prefer it first.
-            # Use key-existence check (not truthiness) so acc=0.0 is not skipped.
-            for _k in ("acc_norm,none", "acc,none", "acc"):
-                if _k in metrics:
-                    acc = metrics[_k]
-                    break
-            else:
-                acc = None
-            if acc is not None:
-                flat[f"{task}_acc"] = float(acc)
-        if collect is not None and "samples" in out:
-            for task_samples in out["samples"].values():
-                seen: set[str] = set()
-                for s in task_samples:
-                    try:
-                        args = s.get("arguments", ())
-                        ctx = args[0] if args else None
-                        if ctx and isinstance(ctx, str) and ctx not in seen:
-                            seen.add(ctx)
-                            collect.append(ctx)
-                    except (KeyError, IndexError, TypeError):
-                        pass
-        return flat
-    except Exception as err:           # noqa: BLE001
-        log.warning("lm-eval evaluation failed: %s", err, exc_info=True)
-        return {}
+
+    # L1-fix (iter 1): no outer try/except around the eval body. Real failures
+    # (CUDA OOM, lm-eval task-id typo, tokenizer mismatch, etc.) propagate to
+    # the caller with full traceback so Stage 6 fails loud rather than silently
+    # reporting an empty zero-shot dict.
+    lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
+    out = simple_evaluate(
+        model=lm, tasks=list(tasks), num_fewshot=0,
+        log_samples=(collect is not None),
+        limit=limit,
+    )
+    results = out.get("results", {})
+    flat: dict = {}
+    for task, metrics in results.items():
+        # ARC-C canonical metric is acc_norm,none (normalized); prefer it first.
+        # See module docstring "Deviation D-arc-acc-norm" for the rationale.
+        # Use key-existence check (not truthiness) so acc=0.0 is not skipped.
+        # N1-fix (iter 1): the bare-``"acc"`` fallback was pre-0.4.0 lm-eval
+        # back-compat; the ``>=0.4.5,<0.5`` version contract (module docstring)
+        # excludes that era, so the preference list is now just the two
+        # comma-suffixed canonical keys.
+        for _k in ("acc_norm,none", "acc,none"):
+            if _k in metrics:
+                acc = metrics[_k]
+                break
+        else:
+            acc = None
+        if acc is not None:
+            flat[f"{task}_acc"] = float(acc)
+    if collect is not None and "samples" in out:
+        for task_samples in out["samples"].values():
+            seen: set[str] = set()
+            for s in task_samples:
+                try:
+                    args = s.get("arguments", ())
+                    ctx = args[0] if args else None
+                    if ctx and isinstance(ctx, str) and ctx not in seen:
+                        seen.add(ctx)
+                        collect.append(ctx)
+                except (KeyError, IndexError, TypeError):
+                    pass
+    return flat
 
 
 class ZeroShotLmEvalPlugin:
@@ -159,7 +223,13 @@ class ZeroShotLmEvalPlugin:
     """
 
     name = "zero_shot_lm_eval"
-    paper = "lm-eval zero-shot (Gao et al. 2024) ARC-Challenge + HellaSwag — EleutherAI/lm-evaluation-harness. See module docstring."
+    paper = (
+        "lm-eval zero-shot harness (Gao et al., EleutherAI/"
+        "lm-evaluation-harness, Zenodo DOI 10.5281/zenodo.10256836) — "
+        "ARC-Challenge (Clark et al. 2018, arXiv:1803.05457) + "
+        "HellaSwag (Zellers et al. 2019, arXiv:1905.07830). "
+        "See module docstring; Deviation D-arc-acc-norm applies."
+    )
     config_key = "stage6_validate.zero_shot.enabled"
     reads: tuple[str, ...] = ("model", "tokenizer", "config")
     writes: tuple[str, ...] = ("eval_results",)
@@ -216,8 +286,7 @@ class ZeroShotLmEvalPlugin:
         ctx slot so the call shape matches even though that side-channel is not
         S6-3's concern.
         """
-        import re
-
+        # N3-fix (iter 1): ``re`` is now imported at module scope.
         model = ctx.get("model")
         tokenizer = ctx.get("tokenizer")
         config = ctx.get("config")
@@ -257,4 +326,9 @@ class ZeroShotLmEvalPlugin:
         )
 
 
-__all__ = ["_ZERO_SHOT_TASKS", "_lm_eval_tasks", "ZeroShotLmEvalPlugin"]
+__all__ = [
+    "_ZERO_SHOT_METRIC_KEYS",
+    "_ZERO_SHOT_TASKS",  # back-compat alias of _ZERO_SHOT_METRIC_KEYS
+    "_lm_eval_tasks",
+    "ZeroShotLmEvalPlugin",
+]
