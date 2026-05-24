@@ -90,7 +90,13 @@ def _populated_ctx(
 def test_plugin_protocol_attributes():
     p = ThreeWayAndPlugin()
     assert p.name == "three_way_and"
-    assert p.paper.startswith("Super-Expert three-way AND")
+    # `paper` must cite the source paper (arXiv:2507.23279 Eq. 6 — the
+    # three-way AND SE criterion) AND the golden official-code commit
+    # (ZunhaiSu/Super-Experts-Profilling @
+    # 573aead3127ae593ba267758b832944f8fed1485).
+    assert "arXiv:2507.23279" in p.paper
+    assert "Equation 6" in p.paper
+    assert "573aead3127ae593ba267758b832944f8fed1485" in p.paper
     assert p.config_key == "stage1_grape.super_expert_detection"
     assert p.reads == ("max_acc", "L", "candidate_bag", "config")
     assert p.writes == ("p995", "a_max", "a_max_threshold", "candidate_bag")
