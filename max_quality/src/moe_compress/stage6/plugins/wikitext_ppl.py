@@ -3,10 +3,25 @@
 Paper / dataset
 ----------------
 WikiText-2 perplexity protocol — Merity et al. 2017 "Pointer Sentinel
-Mixture Models" (arXiv:1609.07843). PPL = ``exp(mean per-token NLL)``
+Mixture Models" (ICLR 2017, arXiv:1609.07843). PPL = ``exp(mean per-token NLL)``
 over the 2048-token-chunked corpus with row-join ``"\n\n"`` (project
 convention matching HF / lm-eval recipe and the imatrix calibration
 corpus build).
+
+Declared deviations from Merity et al. 2017 Table 4
+---------------------------------------------------
+1. **Non-overlapping chunking** (sliding-window in paper). Each
+   2048-token chunk's first ~k tokens are scored with little-to-no
+   left context, inflating PPL versus the paper's sliding-window
+   full-context recipe. This is the canonical HF / lm-eval recipe
+   convention. **Reported numbers are NOT directly comparable to
+   Merity et al. 2017 Table 4.**
+2. **Drop-last-partial** (paper reports over ALL tokens). The trailing
+   ``len(all_ids) % 2048`` tokens are discarded — the reported PPL is
+   computed over ``n_full × 2048`` tokens. On the standard
+   ``wikitext-2-raw-v1`` test split this covers ~99% of the corpus,
+   but for short / non-standard splits the dropped fraction can shift
+   the reported number non-trivially.
 
 Stage 6 implementation note: configurable ``batch_size``;
 **numerically identical to ``batch_size=1``** (no per-batch noise).
@@ -70,6 +85,14 @@ log = logging.getLogger(__name__)
 # contract). Both copies must stay in sync until S6-8 collapses the monolith.
 _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 
+# N3: single source of truth for the WikiText PPL forward batch size default.
+# Referenced by both ``_wikitext2_ppl(... batch_size=...)`` and the eval_task
+# hook's ``s6.get("ppl_batch_size", _DEFAULT_PPL_BATCH_SIZE)`` so the two sites
+# cannot drift out of sync via manual edit. Optimization #1 guarantees the
+# computed PPL is numerically identical across batch sizes, so the default's
+# value here affects only throughput / log cadence, not the reported number.
+_DEFAULT_PPL_BATCH_SIZE: int = 8
+
 
 # ---------------------------------------------------------------------------
 # WikiText-2 perplexity (Optimization #1: configurable batch_size)
@@ -77,7 +100,7 @@ _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 
 
 def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
-                   batch_size: int = 8,
+                   batch_size: int = _DEFAULT_PPL_BATCH_SIZE,
                    dataset_revisions: dict[str, str | None] | None = None) -> float:
     """Standard next-token NLL → exp(mean_NLL), seq_len=2048.
 
@@ -191,7 +214,10 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
                 log.warning("_wikitext2_ppl: error processing batch (%s); skipping", exc)
                 skipped_batches += 1
                 continue
-            if (i + 1) % max(1, 64 // batch_size) == 0:  # log every ~64 sequences regardless of batch size
+            # N2: round (not floor) so batch_size > 64 still rounds to every-batch
+            # logging instead of dividing by zero — keeps the "every ~64 sequences"
+            # intent symmetric around the 64-token boundary.
+            if (i + 1) % max(1, round(64 / batch_size)) == 0:  # log every ~64 sequences regardless of batch size
                 log.info("  PPL forward %d/%d batches (%d/%d seqs)",
                          i + 1, math.ceil(n_full / batch_size), min((i + 1) * batch_size, n_full), n_full)
     if tok_count == 0:
@@ -232,7 +258,14 @@ class WikitextPplPlugin:
     """
 
     name = "wikitext_ppl"
-    paper = "WikiText-2 PPL — Merity et al. 2016 arXiv:1609.07843; project batched bs-invariant. See module docstring."
+    paper = (
+        "WikiText-2 PPL — Merity et al. 2017 (ICLR) arXiv:1609.07843; "
+        "project batched bs-invariant. NOTE: this implementation uses the "
+        "HF / lm-eval non-overlapping 2048-token chunking convention with "
+        "drop-last-partial, so reported PPL is NOT directly comparable to "
+        "Merity et al. 2017 Table 4 (sliding-window full-context). See "
+        "module docstring for the full deviation list."
+    )
     config_key = "stage6_validate.wikitext2.enabled"
     reads: tuple[str, ...] = ("model", "tokenizer", "config", "dataset_revisions")
     writes: tuple[str, ...] = ("eval_results",)
@@ -293,7 +326,9 @@ class WikitextPplPlugin:
         s6 = config["stage6_validate"]
 
         # Reproduces the monolith's `ppl_batch_size = int(s6.get("ppl_batch_size", 8))`.
-        ppl_batch_size = int(s6.get("ppl_batch_size", 8))
+        # N3: default sourced from module-level _DEFAULT_PPL_BATCH_SIZE so this
+        # site and `_wikitext2_ppl`'s own kwarg default cannot drift apart.
+        ppl_batch_size = int(s6.get("ppl_batch_size", _DEFAULT_PPL_BATCH_SIZE))
         # The run-scoped `device` / `eval_text_concat` are optional context
         # side-channels in the plugin world (the monolith threads them through
         # run()); default to None when a wiring stage has not provided them.
