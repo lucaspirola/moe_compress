@@ -13,8 +13,9 @@ projection matrices of one expert (with ``W_gate, W_up ∈ ℝ^{m×d}``
 and ``W_down ∈ ℝ^{d×m}``)::
 
     N = N_gate + N_up + N_down
-    P = ‖W_gate‖₁ + ‖W_up‖₁ + ‖W_down‖₁          (paper Eq. 3)
+    P = ‖W_gate‖₁ + ‖W_up‖₁ + ‖W_down‖₁
     Q = ‖W_gate‖²_F + ‖W_up‖²_F + ‖W_down‖²_F
+    (paper Eq. 3 labels all three rows of the (N, P, Q) block)
 
     AIMER = (P / N) / sqrt(Q / N) = P / sqrt(N · Q)   (paper Eq. 4)
 
@@ -31,8 +32,10 @@ root-mean-square ``‖w‖₂ / √N``. Paper Eq. (7) gives the bounds
     upper bound 1.0  — all entries equal magnitude (most distributed)
     lower bound 1/√N — single non-zero entry (most concentrated)
 
-Paper Algorithm 1 ("PyTorch-style expert ranking with AIMER", page 5
-of the arXiv PDF) implements the score per expert by summing the abs /
+Paper Algorithm 1 ("PyTorch-style expert ranking with AIMER", pages
+4-5 of the arXiv PDF — the AIMER criterion section spans both, with
+the algorithm box and Eq. (5)/(6)/(7) on page 5) implements the
+score per expert by summing the abs /
 square reductions over all three projections, then taking the ratio,
 and ranks ``torch.sort(scores, descending=True)`` so the
 HIGHEST-score (most-distributed) experts come first. **The paper
