@@ -94,7 +94,21 @@ def test_plugin_protocol_attributes():
     """Class-level attributes match the plan exactly."""
     plugin = GrapeMergePlugin()
     assert plugin.name == "grape_merge"
-    assert plugin.paper.startswith("Liu")
+    # `paper` must cite arXiv:2604.06542 (GRAPE, Zhang et al. — NOT Liu;
+    # the prior assertion mis-attributed first authorship), the
+    # "no official code" finding, and the five GRAPE-specific deviations.
+    assert "arXiv:2604.06542" in plugin.paper
+    assert "Zhang" in plugin.paper
+    assert "Algorithm 1" in plugin.paper
+    for deviation_token in (
+        "D3",
+        "D4",
+        "D5",
+        "D-grape-restart-merge",
+        "D-se-blacklist-merge",
+        "D-cka-distance",
+    ):
+        assert deviation_token in plugin.paper
     assert plugin.config_key == "stage1_grape"
     assert plugin.reads == (
         "D_matrices",

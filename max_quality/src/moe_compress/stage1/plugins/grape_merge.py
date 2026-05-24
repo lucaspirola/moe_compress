@@ -1,12 +1,189 @@
-"""Phase F — GRAPE Algorithm 1 (entropy-aware greedy merge with restart).
+"""GRAPE entropy-aware greedy MoE pruning with restart.
 
-Paper: 2604.06542 §3.3. Migrated from the legacy Stage 1 module (Phase-F
-block) in sub-task 3 of the Stage 1 → plugin-architecture refactor.
+Paper
+-----
+Zhang et al., "Does a Global Perspective Help Prune Sparse MoEs
+Elegantly?" — arXiv:2604.06542. (NB: this plugin's earlier docstring
+attributed the paper to "Liu et al."; the actual first author is
+Zeliang Zhang. Corrected during the ALGORITHM_REFERENCE.md retirement.)
 
-The plugin's externally observable behaviour is **byte-identical** to the
-legacy inline Phase F: same per-layer budget allocation, same redundancy
-normalisation, same artifact schema. Verified via the golden snapshot
-test.
+§3.3 defines the greedy merge with restart (Algorithm 1):
+
+    Input:  similarity blocks {D^l}, target experts K, entropy tolerance γ
+    Output: clusters {C^l} with Σ_l |C^l| = K
+    1: C^l ← {{0}, ..., {N-1}}, R^l ← Σ_{i≠j} D^l_{ij}
+    2: E ← Entropy({C^l}), Ê ← E·(1−γ), F ← ∅
+    3: while Σ_l |C^l| > K:
+    4:   if F = {1, ..., L}: F ← ∅            # all-frozen restart
+    5:   l* ← argmax_{l ∉ F} R^l
+    6:   (i*, j*) ← argmax_{i ≠ j} D^{l*}_{ij}
+    7:   C^{l*} ← Union(C^{l*}, i*, j*)
+    8:   D^{l*}_{i*, j*}, D^{l*}_{j*, i*} ← 0    # paper line 9
+    9:   R^{l*} ← R^{l*} − 2·D^{l*}_{i*, j*}    # paper line 10
+   10:   E ← Entropy({C^l})
+   11:   if E < Ê: F ← F ∪ {l*}                # freeze
+
+Where Eq. (10) defines Ê = E·(1−γ), Eq. (11) defines
+R^l = Σ_{i≠j} D^l_{ij}.
+
+Official code
+-------------
+**None published.** Verified 2026-05 — arxiv.org/abs/2604.06542 carries
+no code link in the HTML version; the first author's GitHub does not
+host a GRAPE repository. This implementation is reference-free against
+the paper's pseudocode.
+
+Deviations
+==========
+
+D-cka-distance — distance vs similarity (sign-flip)
+---------------------------------------------------
+Plugin consumes ``D^l`` in the distance form ``1 − CKA`` produced by
+:mod:`stage1.plugins.cka_distance`; selection therefore uses ``argmin``
+on both layer (``R^l``) and pair (``D^{l*}_{ij}``) instead of the
+paper's ``argmax``. The transformation is a sign-flip
+(``R^l_dist = N(N−1) − R^l_sim`` under the ``i ≠ j`` convention) that
+preserves layer ranking, pair ranking, and final budget allocation. See
+the full derivation in :mod:`stage1.plugins.cka_distance`.
+
+D3 — entropy tolerance γ default
+--------------------------------
+GRAPE Eq. (10) defines ``γ ∈ [0, 1]`` but leaves the default
+unspecified. This plugin uses ``γ = 0.1`` (config key
+``stage1_grape.entropy_tolerance``), project-chosen empirically. The
+``γ = 0`` / ``γ < 0`` / ``γ ≥ 1`` edge cases emit explicit log
+warnings flagging the degenerate convergence regimes
+(``every-merge-freezes`` / ``inflated-threshold`` / ``entropy-gate-disabled``).
+
+D4 — D^l update: zero entire row/column vs paper's pair entry
+-------------------------------------------------------------
+Paper line 9 zeros only the ``(i*, j*)`` / ``(j*, i*)`` pair entries;
+this plugin zeros the absorbed expert's *entire* row and column in
+``D^l``. Paper line 10 then computes ``R^l ← R^l − 2·D^{l*}_{i*, j*}``,
+which is consistent with the sum-over-``i ≠ j`` form of ``R^l`` (the
+2× covers ``D[i*, j*]`` and ``D[j*, i*]``) **for one step** — but
+leaves stale similarity entries in row/column ``j*`` that would let the
+absorbed expert influence later pair selections. Zeroing the full
+row/column prevents this drift; ``R^l`` is updated by subtracting the
+absorbed expert's full row+column contribution (defensively minus the
+self-distance to be robust against any future non-zero diagonal).
+
+D5 — per-layer floor without layer bonuses
+------------------------------------------
+GRAPE has no floor constraint. This plugin enforces
+``min_experts_per_layer = num_routed_experts // floor_divisor`` (default
+``floor_divisor = 2``, yielding the spec invariant ``N // 2`` = 128 for
+the 256-expert Qwen3-30B-A3B layer). The floor is enforced *during* the
+greedy: any layer at or below its floor is skipped in the
+``argmin R^l`` step (added to a ``floor_blocked`` set with a one-iteration
+lag tolerance — see ``best_layer is None`` branch below). No early/late
+layer bonuses — 50 % max removal per layer bounds compression to the
+range where the paper demonstrates results.
+
+The ``floor_divisor > 2`` knob is opt-in (Direction-A second-pass
+budget-retune); it warns loudly because it can drive layers below the
+``N // 2`` spec invariant.
+
+D-grape-restart-merge — two restart paths
+-----------------------------------------
+The paper has one restart path: line 4 ``if F = {1,...,L} then F ← ∅``
+(all-frozen restart at the top of the while loop), which falls through
+to lines 5-11 within the same iteration — exactly one merge per
+restart cycle. This plugin implements **two** restart paths:
+
+  (1) **Top-of-loop all-frozen restart** — paper-literal (lines 4-11).
+      One extra merge per restart cycle by design, allowing GRAPE to
+      escape local optima.
+
+  (2) **Lag-corrected post-selection restart** — project-original
+      (second path). After the layer-selection loop fails (``best_layer
+      is None``), re-evaluate the restart condition with the now-complete
+      ``floor_blocked`` set: ``floor_blocked`` is populated *lazily*
+      during selection, so a layer whose ``cluster_count`` was just
+      decremented to its floor in the current iteration is not yet in
+      ``floor_blocked`` at the top-of-loop check. The lag-corrected
+      restart catches this case by clearing ``frozen`` and ``continue``-
+      ing without merging. Bounded by the budget-termination check.
+
+D-se-blacklist-merge — SE blacklist integration
+-----------------------------------------------
+arXiv:2507.23279 (SE detection) and arXiv:2604.06542 (GRAPE) describe
+their algorithms independently; neither specifies how SEs interact with
+the greedy merge. This plugin's integration is project-original:
+
+  - Each blacklisted SE's row and column in ``D^l`` are zeroed before
+    the greedy loop (``_zero_blacklisted``), so SEs never participate
+    in pair selection and contribute zero to ``R^l``.
+  - SE cluster slots are subtracted from ``cluster_counts``: GRAPE
+    tracks only non-blacklisted experts.
+  - The termination condition compares against
+    ``effective_budget = max(0, global_budget − total_blacklisted)``
+    (the non-blacklisted budget). When ``total_blacklisted >
+    global_budget`` the effective budget clamps to 0 with a warning.
+  - The per-layer floor is applied to the non-SE pool only:
+    ``floor_l = max(per_layer_counts[li] // floor_divisor −
+    |SE_l|, 0)``.
+
+Rationale: SEs must be preserved exactly (per arXiv:2507.23279 Table 3
+catastrophic-collapse evidence on SE pruning); they cannot be merge
+candidates. Subtracting SE slots from the budget keeps the post-Stage-1
+surviving count consistent with the user-specified
+``expert_prune_ratio``. Applying the floor only to non-SEs scales
+floor protection with the available redundancy pool, not with the
+protected count. The plugin's output is the **total** per-layer
+centroid count (blacklisted + non-blacklisted) for Stage 2 consumption.
+
+Convergence guarantees
+----------------------
+The greedy loop bound is ``max_iterations = current_total ·
+n_moe_layers · 2``. This is well above the tight bound
+``current_total + n_moe_layers`` (at most ``current_total`` merges +
+at most ``n_moe_layers`` structural-blocking skip-iterations, since
+each layer joins ``structurally_blocked`` at most once;
+lag-corrected restarts use ``continue`` and burn one extra iteration
+without merging). ``exit_reason`` ∈ ``{"budget", "no_layer",
+"max_iter"}`` captures which guard fired.
+
+Optional Direction-A second-phase knobs
+----------------------------------------
+Both default to a strict no-op (the output is byte-identical to the
+historical behaviour):
+
+  - ``stage1_grape.grape_floor_divisor`` (default ``2``) — see D5.
+  - ``stage1_grape.merge_cost_prior`` (default ``None``) — ``layer_idx
+    -> cost`` map. When supplied, ``best_layer`` selection minimises
+    ``R[li] · merge_cost_prior[li]`` instead of ``R[li]`` alone, so
+    Stage 1 can be biased by *measured* merge damage from a prior
+    Stage-2 run. When ``None``, selection is byte-identical to the
+    original ``argmin R[li]`` behaviour.
+
+Output context contract
+-----------------------
+- ``reads``: ``D_matrices``, ``blacklist``, ``per_layer_targets``,
+  ``decomposition``, ``config``.
+- ``writes``: ``per_layer_target_experts``, ``per_layer_redundancy``
+  (Eq. 3 min-max normalised ``R̃^l``, for logging), ``achieved_budget``,
+  ``requested_budget``, ``grape_config``.
+
+``contribute_artifact`` returns the 5-key ``stage1_budgets.json`` payload
+(``per_layer_target_experts``, ``per_layer_redundancy``,
+``achieved_budget``, ``requested_budget``, ``config``). Whole-file
+contributor pattern (Phase D's ablation_filter is the other one) —
+returned as a complete file payload, written by the orchestrator via
+:func:`utils.model_io.save_json_artifact`.
+
+What GRAPE contributes to Stage 2 is **per-layer budgets** (``N'_l``),
+not individual expert blacklists. Stage 2 uses ``N'_l`` as its
+target centroid count per layer; REAP scores then decide which
+``N'_l`` non-blacklisted experts become centroids.
+
+Naming-history note
+-------------------
+The legacy stage-1 monolith called this "Phase F" (GRAPE budget
+allocation in the A → B → C → D → E → F chain). The current plugin
+architecture has no phase taxonomy. Log strings ("GRAPE iter ...",
+"Stage 1 Phase F") and Trackio keys retain the legacy names for
+dashboard back-compat; new prose drops the labels.
 """
 
 from __future__ import annotations
@@ -25,16 +202,35 @@ log = logging.getLogger(__name__)
 
 
 class GrapeMergePlugin:
-    """GRAPE greedy merge plugin (Phase F).
+    """GRAPE entropy-aware greedy MoE pruning with restart.
 
-    Reads CKA distance matrices, the SE blacklist, per-layer expert counts,
-    and the global budget; writes per-layer target counts + redundancy +
-    achieved/requested budgets. Contributes the ``stage1_budgets.json``
-    payload via :meth:`contribute_artifact`.
+    Reads CKA distance matrices, the SE blacklist, per-layer expert
+    counts, and the global budget; writes per-layer target counts +
+    redundancy + achieved/requested budgets. Contributes the
+    ``stage1_budgets.json`` payload via :meth:`contribute_artifact`.
+
+    See the module docstring for the paper citation (arXiv:2604.06542
+    Algorithm 1), the negative official-code finding, and the five
+    deviations: D3 (γ default), D4 (full row/col zero), D5 (per-layer
+    floor), D-grape-restart-merge (lag-corrected second restart path),
+    D-se-blacklist-merge (SE integration). The sign-flip from paper's
+    similarity-form D^l to this plugin's distance form (consumed from
+    :mod:`stage1.plugins.cka_distance`) is D-cka-distance.
     """
 
     name: str = "grape_merge"
-    paper: str = "Liu et al., GRAPE 2024 (arXiv 2604.06542), Algorithm 1"
+    paper: str = (
+        "GRAPE: Zhang et al. arXiv:2604.06542 §3.3 Algorithm 1. "
+        "No official code published. Deviations: D3 (γ=0.1 project default), "
+        "D4 (D^l update zeros full row/col vs paper line 9 pair entry), "
+        "D5 (per-layer floor N//2 with no layer bonuses), "
+        "D-grape-restart-merge (two restart paths: paper-literal "
+        "top-of-loop + project-original lag-corrected post-selection), "
+        "D-se-blacklist-merge (SE-blacklist integration into greedy "
+        "loop), D-cka-distance (consumed in distance form with argmin). "
+        "See module docstring for full Algorithm 1 transcription + "
+        "per-deviation derivations."
+    )
     config_key: str = "stage1_grape"
     reads: tuple[str, ...] = (
         "D_matrices",
