@@ -73,7 +73,8 @@ no cap. Empirically on Qwen3-30B-A3B-2507 (the project's target model),
 v4's ``freq_on_sink`` saturated at 1.0 for many non-SE experts — sink-token
 routing turns out to be broadly distributed on this architecture rather
 than SE-specific. v4 produced a 158-expert blacklist of which 146 came from
-this detector; only 1 of those 146 had measurable ablation-pass ΔNLL.
+this detector; only 1 of those 146 had measurable ablation-pass ΔNLL (per
+the v4 ablation-filter audit, commits in the 2026-05-10 series).
 
 v6 (this code) demotes the detector from auto-extension to
 candidate-pool-only and tightens the thresholds:
@@ -108,7 +109,9 @@ Git archaeology
 
 Output context slots / artifact contract
 ----------------------------------------
-Three methods (one more than the ``PipelinePlugin`` Protocol mandates):
+Two methods beyond the Protocol's ``is_enabled`` + ``contribute_artifact``:
+``setup`` (pre-calibration-pass accumulator init) and ``run`` (candidate
+generation):
 
 1. ``setup`` — runs BEFORE the calibration pass. Constructs the
    ``SinkTokenRoutingAccumulator`` (or assigns ``None`` when
@@ -138,7 +141,8 @@ earlier per-expert Python loop that was the dominant calibration-pass
 walltime cost on H200 (~5 sec/batch). The vectorization also fixed a
 num_layers-fold double-count in ``freq_on_sink`` (the 2026-05-10 H200
 run artifact had max ``freq_on_sink = 1/40 = 0.025`` instead of 1.0,
-which left the 0.95 threshold unreachable).
+which left the 0.95 threshold unreachable) (pre-fix; current code's
+vectorized reduction does not exhibit this double-count).
 """
 
 from __future__ import annotations
@@ -173,7 +177,8 @@ class SinkTokenDetectorPlugin:
 
     See the module docstring for the paper / official-code citations, the
     full deviation rationale, the v6-vs-v4 threshold tightening, and the
-    three-method (``setup`` / ``run`` / ``contribute_artifact``) contract.
+    contract for the two Protocol-extension methods
+    (``setup`` / ``run``) alongside ``is_enabled`` / ``contribute_artifact``.
 
     The ``candidate_bag`` slot appears in both ``reads`` and ``writes``:
     ``run`` reads the bag instance and mutates it in place via
@@ -288,9 +293,9 @@ class SinkTokenDetectorPlugin:
         - ``sink_acc is None`` (setup ran with ``sink_token_enabled=False``):
           no-op; no candidates added.
         - ``sink_token_enabled=False``: setup wrote ``sink_acc=None``; this
-          branch short-circuits on the None check (matches legacy
-          ``_collect_candidates:991`` ``if sink_enabled and sink_acc is not
-          None:`` guard).
+          branch short-circuits on the None check (matches the legacy
+          pre-sub-task-7 ``_collect_candidates`` ``if sink_enabled and
+          sink_acc is not None:`` guard).
 
         Reads ``sink_acc`` — raises ``KeyError`` if :meth:`setup` was
         skipped. Reads ``candidate_bag`` only when not short-circuiting.
