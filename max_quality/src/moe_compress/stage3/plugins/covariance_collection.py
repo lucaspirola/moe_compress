@@ -6,19 +6,21 @@ Paper
 arXiv:2604.02119 (audit/spec_compliance/01_papers/2604.02119/source.md).
 
 Theorem 3.2 of AA-SVD prescribes the factorization
-``M = W · C · B⁻¹ · L_B`` where ``B`` is the post-prune input
-covariance ``E[X_post X_post^T]`` and ``C`` is the cross-covariance
+``M = W·C·S⁻¹·L_B`` where ``S = B·B^T`` and ``L_B`` is the symmetric
+factor of the post-prune input covariance ``B = E[X_post X_post^T]``
+(i.e. ``B = L_B · L_B^T``), and ``C`` is the cross-covariance
 ``E[X_pre X_post^T]`` between the pre- and post-prune layer inputs.
 Corollary 3.3 (the special case ``A = B``) reduces to ``M = W · L_B``
 when only the auto-covariance is available.
 
 This plugin owns the post-prune covariance pass: for every MoE
 ``(layer, expert, matrix)`` tuple, accumulate ``B`` (always) and
-``C`` (gate_proj / up_proj only — see deviation D6 below) during a
-single dual-forward pass against the teacher (pre-prune model) and the
+``C`` (gate_proj only — see deviation D6 below) during a single
+dual-forward pass against the teacher (pre-prune model) and the
 post-prune student. Also loads the Stage 2 input-covariance sidecar
-(``A_cov`` from ``_stage2_input_covariance.pt``) as the Path 2
-fallback when ``aa_svd.cross_covariance: false``.
+(``A_cov`` from ``_stage2_input_covariance.pt``) which downstream
+factorisation (``aa_svd_factor.py``) consults but does NOT substitute
+into the Theorem 3.2 cross-cov slot (see "Path 2 retirement" below).
 
 Official code
 -------------
@@ -26,30 +28,54 @@ Official code
 ``1fa1b686cd9b13a77607a676564e37d438a176c8`` (2026-04-22) —
 github.com/atulkumarin/AA-SVD.
 
-Deviation: D6 — cross-covariance scope and Path 2 substitution
---------------------------------------------------------------
-Paper Theorem 3.2 requires cross-covariance C for all linear layers.
-This plugin's scope:
+Live factorisation paths (after Path 2 retirement)
+--------------------------------------------------
+Downstream ``aa_svd_factor.py`` (L321-336) implements two paths only:
 
-  (a) Cross-covariance C collected for ``gate_proj`` / ``up_proj``
-      (input-side) via dual-forward; ``down_proj`` falls back to
-      Corollary 3.3 (B-only) because the teacher's per-expert
-      intermediate activations require full expert-dispatch
-      instrumentation that the project does not implement.
-  (b) Path 2 (auto-cov-for-cross-cov substitution, ``A`` from Stage 2)
-      is enabled by ``aa_svd.cross_covariance: false`` for runs where
-      ``C`` is unavailable but ``A`` is. Path 2 is **not a
-      paper-recognised variant**: it slots the pre-prune
-      auto-covariance into the Theorem 3.2 machinery as a strict
-      generalisation of Corollary 3.3 (which uses ``A = B = X_post``).
+  * **Path 1 — Theorem 3.2 (paper-exact)**: ``M = W·C·B⁻¹·L_B`` when
+    both ``C`` (cross-cov from this plugin's dual-forward) and ``B``
+    are available. This is the default when ``aa_svd.cross_covariance:
+    true`` (the configured default).
+  * **Path 3 — Corollary 3.3 (B-only fallback)**: ``M = W·L_B`` when
+    ``C`` is unavailable. Used when ``aa_svd.cross_covariance: false``
+    or when the teacher load is suppressed.
 
-Rationale: gate/up inputs share the same hidden state (pre-routing)
-so one capture covers both; down_proj inputs are expert-internal
-(post gate+up) and differ between teacher and student expert sets.
-Path 2 is a project-original hybrid; the substitution is consistent
-(the two coincide when pre/post distributions are similar — light
-pruning) and degrades gracefully toward Path 3 as the auto-cov
-departs from the cross-cov. Quality vs Path 3 not separately ablated.
+An earlier "Path 2" substituted the pre-prune *auto*-covariance ``A``
+(from Stage 2) into the Theorem 3.2 slot in place of ``C``. That path
+was retired: it produced ``U·V ≈ W·A·B⁻¹·L_B`` rather than
+approximating ``W``, breaking ``FactoredExperts`` forward and Stage 4
+EoRA residual (see ``aa_svd_factor.py`` L331-336 / tests in
+``test_aa_svd_correctness.py``). The ``A_cov`` sidecar load is still
+performed because L-BFGS refinement (Stage 4) consumes it, but the
+Stage 3 rank-k factor uses only ``C`` (Path 1) or omits it (Path 3).
+
+Deviation: D6 — cross-covariance scope (gate-only, MoE-specific)
+----------------------------------------------------------------
+Paper Theorem 3.2 requires cross-covariance C for all linear layers
+and uses a single shared-sample formulation per layer (one ``X_pre``
+/ ``X_post`` per token). This plugin's MoE-specific resolution:
+
+  * Cross-covariance C is collected per ``(layer, student_expert)``
+    on ``gate_proj`` inputs only (``up_proj`` shares the same hidden
+    state pre-routing — covered by the gate_proj entry via the
+    factorisation-time ``_cov_lookup`` fallback). ``down_proj`` has
+    no cross-cov because the teacher's per-expert intermediate
+    activations would need full expert-dispatch instrumentation that
+    the project does not implement; ``down_proj`` therefore falls
+    back to Path 3 (Corollary 3.3, B-only) at factorisation time.
+  * The per-expert formulation is asymmetric with the paper's
+    shared-sample C: each student expert ``e`` accumulates the cross
+    term over the teacher's representation of *the token positions
+    that the student routes to e*. This is the natural MoE
+    generalisation — teacher and student route different subsets, so
+    a single shared C per layer would mis-attribute cross terms
+    between experts. The asymmetry is the price of having any
+    cross-cov at all when routing diverges.
+
+Rationale: gate/up share the same hidden state pre-routing so one
+capture covers both; down_proj is expert-internal (post gate+up) and
+differs between teacher and student expert sets. Per-expert
+attribution is required because teacher/student routing diverges.
 
 Deviation: D-cov-storage-fp16 (SHARED with Stage 2)
 ---------------------------------------------------
@@ -95,9 +121,10 @@ imports only from ``...utils.*``, ``...pipeline.*`` and stdlib — NEVER from
 at load time, so a module-top ``from ..stage3_svd import ...`` here would
 deadlock the import; nothing in this module does that.
 
-``CovarianceCollectionPlugin`` is registered-but-INERT at S3-2 — no walk or
-test invokes its ``collect_covariances`` hook. S3-7 wires it into the live
-Stage 3 plugin sequencer.
+``CovarianceCollectionPlugin`` is wired into the live Stage 3 plugin
+sequencer (``stage3/orchestrator.py``) as the first phase hook
+(``collect_covariances``). The legacy "S3-2 INERT / S3-7 wiring"
+milestone labels are naming-historical.
 """
 from __future__ import annotations
 
@@ -156,15 +183,21 @@ def _collect_covariances(
 ) -> None:
     """Collect post-prune input covariance B and (optionally) cross-covariance C.
 
-    **B-covariance** (always): ``B = X_post^T X_post`` per (layer, expert, matrix),
-    collected by hooking the pruned (student) model's expert inputs.
+    **B-covariance** (always): ``B = X_post^T X_post`` per (layer, expert,
+    matrix), collected by hooking the pruned (student) model's expert
+    inputs. ``InputCovarianceAccumulator`` redirects ``matrix_name="up_proj"``
+    to the ``gate_proj`` entry internally (auto-cov share, same hidden state
+    pre-routing).
 
     **Cross-covariance** (when teacher_model provided): ``C = X_pre^T X_post``
-    per (layer, expert, matrix), collected by running both original (teacher)
-    and pruned (student) models on the same calibration batch. The teacher's
-    expert inputs give X_pre; the student's give X_post. C is accumulated as
-    ``X_pre^T @ X_post`` per batch. This implements the exact covariance pair
-    required by AA-SVD Theorem 3.2 (paper 2604.02119).
+    per ``(layer, student_expert)`` on **gate_proj inputs only**, collected by
+    running both original (teacher) and pruned (student) models on the same
+    calibration batch. The teacher's expert inputs give X_pre; the student's
+    give X_post. C is accumulated as ``X_pre^T @ X_post`` per batch.
+    ``up_proj`` cross-cov is served by ``_cov_lookup``'s gate->up fallback in
+    ``aa_svd_factor.py``; ``down_proj`` falls back to Path 3 (B-only,
+    Corollary 3.3) — see module docstring D6. This implements the
+    MoE-resolved cross-cov required by AA-SVD Theorem 3.2 (paper 2604.02119).
 
     **Expert mapping challenge**: The teacher has 256 experts per layer; the
     student has ~180-200 (post Stage 2 merge). Expert indices don't correspond
@@ -197,7 +230,15 @@ def _collect_covariances(
         """Teacher hook: store the full hidden state for this layer.
         We only need gate_proj input (= hidden state entering the MoE experts).
         Since all experts in a layer receive the same hidden state (pre-routing),
-        we capture it once from any expert and key by (layer, token_positions)."""
+        we capture it once from any expert and key by (layer, token_positions).
+
+        NOTE on B_acc.update's gate/up aliasing: that share applies to
+        auto-covariance (same input on the student side). The cross-cov
+        below is built per-expert against the teacher's hidden state and
+        is written under matrix_name="gate_proj" only; ``up_proj``
+        cross-cov is served at factorisation time by the
+        ``_cov_lookup`` gate->up fallback in ``aa_svd_factor.py``.
+        """
         # Store the raw hidden state indexed by token position.
         # The teacher routes tokens to different experts than the student,
         # but the *input* to the MoE layer (before routing) is the same for
@@ -212,12 +253,25 @@ def _collect_covariances(
             _teacher_hidden[key][tidx] = det[i]
 
     def input_cb(li, e, tensor, ctx):
-        B_acc.update(li, e, "gate_proj", tensor)  # up_proj aliases to gate_proj
+        # NOTE: ``B_acc.update`` redirects ``up_proj`` to ``gate_proj``
+        # internally (auto-cov share, see InputCovarianceAccumulator
+        # docstring). Cross-cov below has no equivalent share inside the
+        # accumulator (``update_cross`` writes the exact matrix_name),
+        # so we explicitly key cross-cov under "gate_proj"; up_proj
+        # cross-cov is served at factor time by ``_cov_lookup``'s
+        # gate->up fallback in aa_svd_factor.py.
+        B_acc.update(li, e, "gate_proj", tensor)
         # Cross-covariance: C += X_pre^T @ X_post for matching token positions.
         if C_acc is not None and li in _teacher_hidden:
             token_idx = ctx["token_idx"].tolist()
             teacher_store = _teacher_hidden[li]
-            # Collect teacher activations for the same token positions
+            # Collect teacher activations for the same token positions.
+            # PERF (MEDIUM-2): the per-token Python loop here and in
+            # _teacher_input_cb is the dominant CPU cost of cross-cov
+            # capture; a vectorised replacement that indexes the teacher
+            # tensor with the student's token_idx (instead of building
+            # a {tidx: row} dict and stacking row-by-row) would remove
+            # ~256 small tensor builds per batch. Not correctness-critical.
             pre_vecs = []
             post_vecs = []
             det_post = tensor.detach().to(torch.float32)
@@ -228,15 +282,19 @@ def _collect_covariances(
             if pre_vecs:
                 X_pre = torch.stack(pre_vecs)   # [n_match, d_in]
                 X_post = torch.stack(post_vecs)  # [n_match, d_in]
-                # Accumulate cross-covariance C = X_pre^T @ X_post
-                cross = X_pre.T @ X_post  # [d_in, d_in]
-                ckey = (li, e, "gate_proj")
-                cur = C_acc._gpu.get(ckey)
-                if cur is None:
-                    C_acc._gpu[ckey] = cross.to(device=tensor.device)
-                else:
-                    cur.add_(cross.to(device=cur.device))
-                C_acc._gpu_token_count[ckey] = C_acc._gpu_token_count.get(ckey, 0) + len(pre_vecs)
+                # Cross term on the input device so the in-place add inside
+                # update_cross stays on-device (matches B_acc.update's
+                # contract; finalize_layer does the single GPU→CPU
+                # transfer per key, applying ``storage_dtype``).
+                cross = (X_pre.T @ X_post).to(device=tensor.device)
+                # Public entry: holds C_acc._lock around _pending writes
+                # and routes through finalize_layer's storage_dtype cast
+                # (D-cov-storage-fp16). Direct ``_gpu``/``_pending``
+                # mutation here would (a) bypass the lock and (b) leave
+                # GPU fp32 tensors alive past finalize.
+                C_acc.update_cross(
+                    li, e, "gate_proj", cross, n_tokens=len(pre_vecs),
+                )
 
     def intermediate_cb(li, e, tensor, ctx):
         B_acc.update(li, e, "down_proj", tensor)
@@ -256,22 +314,27 @@ def _collect_covariances(
         )
 
     # NOTE: This function runs one full calibration pass PER MoE layer
-    # (sequential, not simultaneous). This differs from the spec §6 Phase A
-    # which describes a single simultaneous pass over all 40 layers. The
-    # sequential design was chosen because holding all 40 layers' hook state
-    # simultaneously is memory-intensive; per-layer spill to disk bounds peak
-    # RAM to ~one layer's covariance at a time (~5 GB). Wall-clock cost is
-    # ~40× the simultaneous design, but GPU memory stays within H200 budget.
-    # This deviation is documented in §12 (allowed deviation D9).
+    # (sequential, not simultaneous). The original spec described a single
+    # simultaneous pass over all MoE layers; the sequential design was
+    # chosen because holding all layers' hook state simultaneously is
+    # memory-intensive — per-layer spill to disk bounds peak RAM to ~one
+    # layer's covariance at a time (~5 GB). Wall-clock cost is ~N× the
+    # simultaneous design (for N MoE layers), but GPU memory stays within
+    # H200 budget. Documented as an allowed deviation in the project
+    # deviation log (legacy label: D9; "Phase A" naming-historical).
     n = len(moe_layers)
     try:
         for k, ref in enumerate(moe_layers):
             if spill_dir is not None:
                 b_spilled = (spill_dir / f"layer_{ref.layer_idx}.pt").exists()
-                c_spilled = (
-                    ccov_spill_dir is None
-                    or (ccov_spill_dir / f"layer_{ref.layer_idx}.pt").exists()
-                )
+                # When ccov_spill_dir is None (cross-cov disabled OR no
+                # spill destination configured), there is no C-cov file
+                # to wait on — treat it as satisfied so the B-only resume
+                # path skips early instead of redoing the calibration pass.
+                if ccov_spill_dir is None:
+                    c_spilled = True
+                else:
+                    c_spilled = (ccov_spill_dir / f"layer_{ref.layer_idx}.pt").exists()
                 if b_spilled and c_spilled:
                     log.info("Stage 3 cov layer %d/%d (idx=%d) — already spilled, skipping",
                              k + 1, n, ref.layer_idx)
@@ -374,17 +437,16 @@ def _load_stage2_covariance(path: Path):
 
 
 class CovarianceCollectionPlugin:
-    """Stage 3 covariance-collection plugin (S3-2 — registered-but-INERT).
+    """Stage 3 covariance-collection plugin (live in the orchestrator sequencer).
 
     Owns the post-prune covariance-collection phase: B-covariance
     ``B = X_post^T X_post`` (always) and, when a teacher model is supplied, the
     AA-SVD cross-covariance ``C = X_pre^T X_post`` (Theorem 3.2, paper
-    2604.02119). The phase logic lives in the module-level ``_collect_covariances``
-    relocated verbatim from the monolith.
-
-    S3-2 wires this class into the plugin registry as metadata only — no walk
-    or test invokes ``collect_covariances``. S3-7 plugs the hook into the live
-    Stage 3 plugin sequencer.
+    2604.02119). The phase logic lives in the module-level
+    ``_collect_covariances``. The Stage 3 orchestrator (``stage3/orchestrator.py``)
+    dispatches ``collect_covariances`` as the first phase hook; the legacy
+    "S3-2 INERT / S3-7 wires it in" milestone labels are naming-historical
+    (the wiring landed; this docstring is the post-wiring snapshot).
     """
 
     name = "covariance_collection"
@@ -392,9 +454,12 @@ class CovarianceCollectionPlugin:
         "AA-SVD Theorem 3.2 cross-covariance + Corollary 3.3 — "
         "arXiv:2604.02119 (atulkumarin/AA-SVD @ "
         "1fa1b686cd9b13a77607a676564e37d438a176c8). "
-        "Deviations: D6 (gate/up cross-cov only; down falls back to Corollary "
-        "3.3; Path 2 auto-cov substitution opt-in), D-cov-storage-fp16 "
-        "(SHARED with Stage 2 — fp16 persisted, fp64 in-memory eigh). "
+        "Live factor paths: Path 1 (W·C·B⁻¹·L_B, default) and Path 3 "
+        "(W·L_B, B-only fallback). Path 2 (auto-cov-for-cross-cov) was "
+        "retired — see aa_svd_factor.py L321-336. "
+        "Deviations: D6 (gate-only cross-cov, per-expert MoE resolution; "
+        "down falls back to Corollary 3.3), D-cov-storage-fp16 (SHARED "
+        "with Stage 2 — fp16 persisted, fp64 in-memory eigh). "
         "See module docstring."
     )
     config_key = "stage3_svd.aa_svd.cross_covariance"
@@ -421,13 +486,13 @@ class CovarianceCollectionPlugin:
         return {}
 
     def collect_covariances(self, ctx: PipelineContext) -> None:
-        """Phase hook — covariance collection (S3-7 wiring surface).
+        """Phase hook — covariance collection.
 
-        INERT at S3-2: no orchestrator walk or test invokes this hook. S3-7
-        replaces the Stage 3 orchestrator body with the plugin sequencer and
-        dispatches this hook in place of the monolith's inline
-        ``_collect_covariances`` call. The body reads the calibration args off
-        ``ctx`` and delegates to the relocated ``_collect_covariances``.
+        Reads the calibration args off ``ctx`` and delegates to the
+        module-level ``_collect_covariances``. The Stage 3 orchestrator
+        invokes this hook in place of the legacy monolith's inline call;
+        the (legacy) "S3-2 INERT / S3-7 wiring" milestone labels are
+        naming-historical.
         """
         # Required slots — direct get(): a missing one is a wiring bug and
         # SHOULD raise. Optional slots (params that default to None in

@@ -1008,6 +1008,37 @@ class InputCovarianceAccumulator:
                 cur.add_(cov)
             self._gpu_token_count[key] = self._gpu_token_count.get(key, 0) + n_tok
 
+    def update_cross(
+        self, layer_idx: int, expert_idx: int, matrix_name: str,
+        cross: torch.Tensor, n_tokens: int,
+    ) -> None:
+        """Accumulate a *precomputed* cross-covariance ``X_pre^T @ X_post``.
+
+        Mirrors :meth:`update`'s lock discipline and ``_pending`` storage
+        contract: pending tensors stay on the input device until
+        :meth:`finalize_layer` drains them, applying ``storage_dtype`` once
+        per key. This is the public entry point for the Stage 3 cross-cov
+        collector (``stage3/plugins/covariance_collection.py``), which
+        constructs the cross term on the fly from teacher + student hidden
+        states. Aliasing rules differ from auto-cov: cross-cov has no
+        gate/up share, so ``matrix_name == "up_proj"`` is NOT redirected
+        here — callers writing cross-cov for gate_proj only (the live
+        scope, see D6) should pass ``matrix_name="gate_proj"`` explicitly.
+        """
+        if cross.numel() == 0 or n_tokens <= 0:
+            return
+        key = (layer_idx, expert_idx, matrix_name)
+        cross_f32 = cross.to(torch.float32)
+        with self._lock:
+            cur = self._pending.get(key)
+            if cur is None:
+                # Clone to break aliasing with the caller's tensor and to
+                # ensure subsequent in-place add_() owns the storage.
+                self._pending[key] = cross_f32.clone()
+            else:
+                cur.add_(cross_f32.to(device=cur.device))
+            self._gpu_token_count[key] = self._gpu_token_count.get(key, 0) + n_tokens
+
     def finalize_layer(self, layer_idx: int) -> None:
         # Phase 1: pop pending tensors under lock to prevent concurrent update()
         # calls from racing on _pending while we drain it.
