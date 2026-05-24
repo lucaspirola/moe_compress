@@ -5,7 +5,10 @@ Paper
 Sinkhorn-Knopp algorithm for entropy-regularized optimal transport;
 Cuturi (2013), "Sinkhorn Distances: Lightspeed Computation of Optimal
 Transport". This plugin uses a log-domain Sinkhorn-Knopp with linear
-ε-annealing.
+ε-annealing. The linear ε-anneal is **not** in Cuturi 2013 (Algorithm
+1 uses a single fixed λ); it is post-Cuturi standard numerical
+practice (cf. Schmitzer 2019 "Stabilized Sparse Scaling Algorithms for
+Entropy Regularized Transport Problems"; Chizat et al. 2018) (LOW-1).
 
 This plugin is deviation D-sinkhorn-soft-assign from arXiv:2604.04356
 (REAM): the project adds an OT-based alternative to the paper-faithful
@@ -31,10 +34,14 @@ non-centroid for the hard assignment.
 
 The capacity inequality ``Σ_m T_cm ≤ C_max`` is converted to equality
 via a **dummy slack child** with marginal ``n_C · C_max − n_NC`` and
-uniform high cost — standard partial-OT trick (Cuturi 2013 + dummy
-marginal). Cost matrix normalized to ``[0, 1]`` before Sinkhorn
-iterations so ε values are scale-invariant (positive affine
-transformation invariance of OT).
+uniform high cost — standard dummy-bin / unbalanced-partial-OT trick
+predating Cuturi 2013 (see unbalanced-OT literature: Chizat et al.
+2018 "Scaling Algorithms for Unbalanced Optimal Transport Problems";
+Caffarelli & McCann 2010 "Free boundaries in optimal transport"). Cost
+matrix normalized to ``[0, 1]`` before Sinkhorn iterations so ε is
+scale-comparable across layers; the LP-OT optimum is exactly invariant
+under positive affine transforms of the cost, while the entropic-OT
+objective is invariant only up to a corresponding rescaling of ε.
 
 This is **not** Sparsity-Constrained OT (arXiv:2209.15466), which uses
 quadratic regularization with a first-order semi-dual solver and
@@ -49,6 +56,11 @@ dummy column.
 
 Sinkhorn falls back to greedy on infeasibility
 (``n_C · C_max < n_NC``) with a clear warning.
+
+LOW-3: ``iters`` is a fixed iteration count with no early-stopping on
+the row-marginal residual ``‖T·1 − a‖``. This is a deliberate choice
+(cost-bounded outer loop, deterministic budget); early-stopping is
+left as a future-work item.
 
 Currently opt-in (default off); gated default flip on
 ``A9 vs A8 ≥ +0.1 GEN-avg`` per STRATEGY_NEXT §8 ablation matrix.
@@ -85,6 +97,15 @@ from .solver_greedy import _assign_greedy
 log = logging.getLogger(__name__)
 
 
+# MEDIUM-1: distinct sentinels to disambiguate "+inf forbidden" entries from
+# the dummy-slack-child kernel weight. The forbidden sentinel must be large
+# enough that exp(-FORBIDDEN_KERNEL / eps) ≈ 0 even at the largest eps the
+# anneal touches (eps_init = 1.0); 1e6 gives ~exp(-1e6) ≈ 0 with plenty of
+# margin. The dummy-slack constant remains a moderate value so the dummy row
+# absorbs leftover capacity without distorting the real-row argmax.
+FORBIDDEN_KERNEL = 1e6
+
+
 def _assign_sinkhorn(
     cost: np.ndarray,
     n_children: int,
@@ -116,9 +137,10 @@ def _assign_sinkhorn(
 
     Costs are normalized to ``[0, 1]`` before the Sinkhorn iterations so
     that ``epsilon`` values are independent of cost magnitude (relevant
-    when post-alignment whitened residuals carry an unbounded scale —
-    optimal-transport solutions are invariant under positive affine cost
-    transforms).
+    when post-alignment whitened residuals carry an unbounded scale). The
+    LP-OT optimum is exactly invariant under positive affine transforms of
+    the cost; the entropic-regularized OT objective is invariant only up
+    to a redefinition of ε after scaling by ``finite_range`` (LOW-2).
 
     Defensive: returns ``[-1] * n_children`` for empty inputs.
     """
@@ -130,6 +152,8 @@ def _assign_sinkhorn(
         # the supply side has effectively unlimited capacity.
         max_group_cap = n_children
 
+    # NITPICK-3: slack == 0 is the exact-balance case (supply == demand);
+    # the dummy slack child still exists but carries zero marginal mass.
     slack = n_centroids * max_group_cap - n_children
     if slack < 0:
         log.warning(
@@ -156,7 +180,10 @@ def _assign_sinkhorn(
         (cost - finite_min) / finite_range,
         # +∞ sentinel → very large finite value so the entry is effectively
         # forbidden but Sinkhorn-Knopp doesn't underflow exp(-inf/eps).
-        100.0,
+        # MEDIUM-1: keep this strictly larger than ``big_dummy`` so a
+        # real-pair forbidden entry is *not* confused with the dummy-child
+        # kernel weight; exp(-FORBIDDEN_KERNEL / eps) ≈ 0 across the anneal.
+        FORBIDDEN_KERNEL,
     )
 
     big_dummy = 100.0  # cost of dummy slack child to every centroid
@@ -193,8 +220,10 @@ def _assign_sinkhorn(
     log_T = f[:, np.newaxis] + log_K + g[np.newaxis, :]
 
     # Argmax over real centroids per real child (drop the dummy row).
+    # NITPICK-1: vectorized argmax over rows (cosmetic speedup; identical
+    # result to the per-row list-comprehension).
     real_log_T = log_T[:n_children, :]
-    assignment = [int(np.argmax(row)) for row in real_log_T]
+    assignment = np.argmax(real_log_T, axis=1).tolist()
     # Direction B / skip-merge floor: a child whose entire cost row is +inf
     # (all candidate merges forbidden) must orphan — not be force-merged by the
     # argmax over the normalized sentinel. Match the greedy/hungarian/mcf
@@ -214,13 +243,12 @@ class SinkhornSolverPlugin:
     """
 
     name = "solver_sinkhorn"
+    # NITPICK-4: one-line summary; full attribution / deviation discussion /
+    # ε-anneal credit (LOW-1) lives in the module docstring.
     paper = (
-        "Capacitated entropy-regularized OT via log-domain Sinkhorn-Knopp "
-        "(Cuturi 2013) with linear ε-anneal and slack-child dummy. "
-        "Alternative to REAM §4 greedy (see :mod:`stage2.plugins.solver_greedy`); "
-        "implements deviation D-sinkhorn-soft-assign from baseline REAM "
-        "arXiv:2604.04356. Falls back to greedy on infeasibility. "
-        "See module docstring."
+        "Cuturi 2013 Sinkhorn-Knopp + post-Cuturi linear ε-anneal "
+        "(Schmitzer 2019) + unbalanced-OT dummy-slack child "
+        "(Chizat et al. 2018). See module docstring."
     )
     config_key = "stage2_reap_ream.assignment_solver"
     # S2-8: the live solve_assignment slot reads the per-bump scratch slots.
