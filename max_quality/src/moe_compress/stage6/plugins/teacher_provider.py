@@ -1,5 +1,26 @@
 """Teacher provider (S6-5 of the Stage 6 plugin-architecture refactor).
 
+Paper / spec source
+--------------------
+No upstream paper for the teacher provider per se; this plugin owns
+the Stage 6 teacher-side eval loop:
+
+- **Cache-key invariant** (project ``VALIDATED_STRATEGIES`` §Stage 6
+  Optimization #9): SHA-256 cache key over teacher checkpoint SHA,
+  per-task ``dataset_revisions`` (wikitext_ppl, humaneval, math500 —
+  the lm-eval-managed tasks like hellaswag/arc_challenge are NOT in
+  the key; they're handled by ``lm_eval_version`` + a SHA-256 of the
+  lm-eval task config), greedy/sampling protocol, tokenizer SHA, and
+  batched-vs-bs=1 invariance flag.
+- **Background CPU preload** + teacher-side eval loop running the
+  same four eval families against the teacher.
+- **Cache load/save** with atomic ``.tmp + os.replace`` writes
+  (project §11 durability contract).
+
+The cache hit invariance is what makes Stage 6 ~8-12× faster — the
+teacher's eval results are deterministic given the cache key, so a
+re-run of the student against the same teacher reuses the cache.
+
 Home of the Stage 6 teacher-provider concern, extracted from the legacy
 ``stage6_validate.py`` monolith. The teacher provider owns the teacher
 side of the Stage 6 validation gate: the eval-cache key + load/save, the
@@ -323,11 +344,7 @@ class TeacherProviderPlugin:
     """
 
     name = "teacher_provider"
-    paper = (
-        "Teacher-baseline eval for Stage 6 validation gate (uncompressed "
-        "model re-evaluated on the same slices for per-task deltas -- "
-        "VALIDATED_STRATEGIES §Stage 6 / Spec F-S-H-3 / Optimizations #6-#8)."
-    )
+    paper = "Stage 6 teacher provider — cache-key invariant + background preload (no upstream paper; VALIDATED_STRATEGIES §Stage 6 Opt #9). See module docstring."
     config_key = "stage6_validate.teacher_eval_cache"
     reads: tuple[str, ...] = (
         "config", "artifacts_dir", "tokenizer", "dataset_revisions",
