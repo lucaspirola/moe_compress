@@ -1,5 +1,26 @@
 """Imatrix export (S6-6 of the Stage 6 plugin-architecture refactor).
 
+Paper / spec source
+--------------------
+**Imatrix** = importance matrix, the per-channel calibration profile
+produced by ``llama-imatrix`` for use by GGUF post-training quantizers
+(K/M-quants, IQ-quants). Not a single paper; the ``llama-imatrix``
+tool ships with llama.cpp upstream.
+
+Stage 6 implementation note: convert the student to F16 GGUF (the
+quantization-input format), run ``llama-imatrix`` against the
+WikiText-2-train calibration corpus
+(:mod:`stage6.plugins.eval_environment` builds the corpus), and write
+the ``eval_text_concat.txt`` debug side-channel.
+
+Gated by ``imatrix.enabled`` (default off; opt-in for users targeting
+quantized GGUF deployment).
+
+Reference code
+--------------
+``ggerganov/llama.cpp`` — ``llama-imatrix`` CLI; standard library, no
+project-pinned SHA. Invoked as a subprocess.
+
 Home of the Stage 6 imatrix / GGUF concern, extracted from the legacy
 ``stage6_validate.py`` monolith. The imatrix-export plugin owns the
 post-eval pipeline that converts the student checkpoint to F16 GGUF,
@@ -392,11 +413,7 @@ class ImatrixExportPlugin:
     """
 
     name = "imatrix_export"
-    paper = (
-        "imatrix-guided quantisation (llama.cpp `llama-imatrix` against the "
-        "WikiText-2 train split per Spec §9; Stage 6 post-eval export -- "
-        "Optimization #8 overlaps GGUF conversion with teacher eval)."
-    )
+    paper = "Stage 6 imatrix / GGUF export — llama.cpp llama-imatrix; opt-in via imatrix.enabled. See module docstring."
     config_key = "stage6_validate.imatrix.enabled"
     reads: tuple[str, ...] = (
         "config", "artifacts_dir", "eval_text_concat", "cached_teacher_results",
