@@ -5,12 +5,13 @@ Paper
 Su et al., "Unveiling Super Experts in Mixture-of-Experts Large Language
 Models" — arXiv:2507.23279 (audit/spec_compliance/01_papers/2507.23279/source.md).
 
-§5.1 Figure 6 (source.md L728–L734) and Appendix F Figures 20–21 (source.md
-L2479–L2486) document the paper's empirical observation:
+§5.1 paragraph at L717–L723 + Figure 6 caption L728–L734 (source.md) and
+Appendix F Figures 20–21 (source.md L2479–L2486) document the paper's
+empirical observation:
 
     "This routing behavior of SEs ensures that the attention sink token is
      strongly activated at the SEs. ... The sink token subsequently produces
-     activation outliers."   — source.md L721–L723
+     activation outliers."   — source.md L721, L723
 
 Figures 6 / 20 / 21 are descriptive histograms of expert-router score
 distributions for sink vs non-sink tokens, confirming sink-token-dominated
