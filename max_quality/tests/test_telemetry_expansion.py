@@ -50,7 +50,8 @@ def _patched_calib(monkeypatch):
     network."""
     from moe_compress.utils import calibration as cal_mod
     from moe_compress.utils import model_io as mio
-    from moe_compress import stage1_grape, stage2_reap_ream, stage5_router_kd
+    from moe_compress import stage5_router_kd
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
 
     def _fake_build(tokenizer, spec, cache_dir=None):
         torch.manual_seed(spec.seed)
@@ -79,11 +80,42 @@ def _captured_emits(monkeypatch):
         captured.append(dict(metrics))
 
     from moe_compress import (
-        run_pipeline, stage1_grape, stage2_reap_ream, stage3_svd,
-        stage4_eora, stage5_router_kd, stage6_validate,
+        run_pipeline,
+        stage5_router_kd, stage6_validate,
     )
-    for mod in (run_pipeline, stage1_grape, stage2_reap_ream, stage3_svd,
-                stage4_eora, stage5_router_kd, stage6_validate):
+    # After RK-8, Router-KD runtime telemetry emits fire from the real
+    # plugin-driven orchestrator ``router_kd/orchestrator.py``; the legacy
+    # ``stage5_router_kd`` is now a thin shim that no longer imports
+    # ``_trackio_log``.
+    from moe_compress.router_kd import orchestrator as router_kd_orchestrator
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
+    # The plugin-based Stage 1 emits Trackio telemetry from three modules
+    # (orchestrator + the grape_merge / ma_detection plugins), replacing the
+    # single stage1_grape monolith.
+    from moe_compress.stage1 import orchestrator as stage1_orchestrator
+    from moe_compress.stage1.plugins import grape_merge as stage1_grape_merge
+    from moe_compress.stage1.plugins import ma_detection as stage1_ma_detection
+    # After S3-7a, Stage 3 runtime config/telemetry emits fire from the
+    # plugin-driven orchestrator's own ``_trackio_log`` binding; the legacy
+    # ``stage3_svd`` is now a thin shim that no longer imports ``_trackio_log``.
+    from moe_compress.stage3 import orchestrator as stage3_orchestrator
+    # After S4-4a, Stage 4 runtime telemetry emits fire from the two stage-4
+    # plugin modules (eora_inputs / eora_compensation); the legacy
+    # ``stage4_eora`` is now a thin shim that no longer imports ``_trackio_log``.
+    from moe_compress.stage4.plugins import eora_inputs as stage4_eora_inputs
+    from moe_compress.stage4.plugins import eora_compensation as stage4_eora_comp
+    # After S6-8, Stage 6 runtime telemetry emits fire from the real
+    # orchestrator ``stage6/orchestrator.py`` (and the validation_report +
+    # imatrix_export plugins); the legacy ``stage6_validate`` is now a thin
+    # shim. Mirrors the post-flip pattern established by RK-8 / S3-7a / S4-4a.
+    from moe_compress.stage6 import orchestrator as stage6_orchestrator
+    from moe_compress.stage6.plugins import validation_report as stage6_report
+    from moe_compress.stage6.plugins import imatrix_export as stage6_imatrix
+    for mod in (run_pipeline, stage2_reap_ream, stage3_orchestrator,
+                stage4_eora_inputs, stage4_eora_comp,
+                stage5_router_kd, router_kd_orchestrator, stage6_validate,
+                stage6_orchestrator, stage6_report, stage6_imatrix,
+                stage1_orchestrator, stage1_grape_merge, stage1_ma_detection):
         monkeypatch.setattr(mod, "_trackio_log", _capture, raising=False)
 
     return captured
@@ -99,7 +131,7 @@ def test_stage1_grape_emits_summary_keys(
 ):
     """Stage 1's GRAPE inner function should emit a summary dict with the
     new entropy / merge / exit_reason keys at the end of greedy."""
-    from moe_compress import stage1_grape
+    from moe_compress import stage1
     from moe_compress.budget.solver import BudgetDecomposition
 
     decomp = BudgetDecomposition(
@@ -107,7 +139,7 @@ def test_stage1_grape_emits_summary_keys(
         svd_rank_ratio=0.14, global_expert_budget=4,
         min_experts_per_layer=2, blacklisted_experts={},
     )
-    stage1_grape.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
+    stage1.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
 
     # Find the GRAPE summary emit (has exit_reason).
     grape_emits = [
@@ -141,7 +173,7 @@ def test_stage1_grape_emits_phase_a_c_summary(
     _captured_emits, _patched_calib, tiny_model, tiny_config, tmp_path,
 ):
     """Stage 1 should emit a Phase A/C summary with MA layers count + thresholds."""
-    from moe_compress import stage1_grape
+    from moe_compress import stage1
     from moe_compress.budget.solver import BudgetDecomposition
 
     decomp = BudgetDecomposition(
@@ -149,7 +181,7 @@ def test_stage1_grape_emits_phase_a_c_summary(
         svd_rank_ratio=0.14, global_expert_budget=4,
         min_experts_per_layer=2, blacklisted_experts={},
     )
-    stage1_grape.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
+    stage1.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
 
     pa_emits = [
         e for e in _captured_emits
@@ -170,7 +202,7 @@ def test_stage1_existing_per_layer_emits_unchanged(
 ):
     """Regression guard: pre-expansion per-layer SE / GRAPE-budget emits
     must still appear with their original keys."""
-    from moe_compress import stage1_grape
+    from moe_compress import stage1
     from moe_compress.budget.solver import BudgetDecomposition
 
     decomp = BudgetDecomposition(
@@ -178,7 +210,7 @@ def test_stage1_existing_per_layer_emits_unchanged(
         svd_rank_ratio=0.14, global_expert_budget=4,
         min_experts_per_layer=2, blacklisted_experts={},
     )
-    stage1_grape.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
+    stage1.run(tiny_model, _TinyTokenizer(), tiny_config, tmp_path, decomp)
 
     se_emits = [e for e in _captured_emits if "stage1/se_layer_idx" in e]
     assert se_emits, "v1 per-layer SE emits regressed"
@@ -203,7 +235,7 @@ def test_stage4_summarize_distill_helper_present_for_consistency():
     helper-naming reference for aggregation patterns) is still importable.
     Stage 4 doesn't aggregate the same way, but this guards against
     accidental removal of the precedent."""
-    from moe_compress.stage2_reap_ream import _summarize_distill_state
+    from moe_compress.stage2.orchestrator import _summarize_distill_state
     assert callable(_summarize_distill_state)
 
 
@@ -225,12 +257,17 @@ def test_stage4_per_layer_emit_includes_new_aggregate_keys():
     runtime test — Stage 4 requires Stages 1–3 outputs to run, which is
     out of scope for a unit test. The structural check ensures the keys
     were not silently dropped by a future refactor.
+
+    S4-4a: the monolith ``stage4_eora.py`` ``run()`` body was retired — the
+    config-key emits (``stage4/config/*``) now fire from
+    ``stage4/plugins/eora_inputs.py`` and the per-matrix emits from
+    ``stage4/plugins/eora_compensation.py``. The source scan spans both.
     """
-    src_path = (
-        Path(__file__).resolve().parents[1]
-        / "src" / "moe_compress" / "stage4_eora.py"
+    src_root = Path(__file__).resolve().parents[1] / "src" / "moe_compress"
+    src = (
+        (src_root / "stage4" / "plugins" / "eora_inputs.py").read_text()
+        + (src_root / "stage4" / "plugins" / "eora_compensation.py").read_text()
     )
-    src = src_path.read_text()
     # The per-matrix keys use f-string templates ``f"stage4/{name}_..."``;
     # search for the post-``{name}`` literal segment, which is unique enough
     # to confirm the key was added.
@@ -257,10 +294,15 @@ def test_stage5_source_emits_config_block():
     """Source-level check: Stage 5's run() emits a one-shot config block
     under stage5/config/* with the new keys. The Stage 2.5 integration
     test (test_smoke_stage2_to_stage2p5) already runs the Stage 5 freeze
-    pattern; this structural check guards the keys stay in place."""
+    pattern; this structural check guards the keys stay in place.
+
+    After RK-8 the one-shot config emit fires from the real plugin-driven
+    orchestrator ``router_kd/orchestrator.py``; the legacy ``stage5_router_kd``
+    is now a thin shim with no config-key emits — the source scan therefore
+    targets the orchestrator."""
     src_path = (
         Path(__file__).resolve().parents[1]
-        / "src" / "moe_compress" / "stage5_router_kd.py"
+        / "src" / "moe_compress" / "router_kd" / "orchestrator.py"
     )
     src = src_path.read_text()
     expected_keys = [
@@ -286,12 +328,21 @@ def test_stage5_source_emits_config_block():
 def test_stage3_source_emits_config_and_c5_extensions():
     """Source-level check that Stage 3 emits the new config keys
     (cross_cov_enabled, t_budget, alpha_by_type/*) and the Phase C.5
-    block carries the new training-shape keys."""
-    src_path = (
-        Path(__file__).resolve().parents[1]
-        / "src" / "moe_compress" / "stage3_svd.py"
+    block carries the new training-shape keys.
+
+    S3-6: ``_phase_c5_block_refine`` (which emits the ``c5_*`` keys) was
+    relocated verbatim into ``stage3/plugins/block_refine.py``.
+    S3-7a: the monolith ``stage3_svd.py`` ``run()`` body was retired — the
+    config-key Trackio emits (``stage3/config/*``) now fire from the real
+    orchestrator ``stage3/orchestrator.py``. The source scan therefore spans
+    all three files.
+    """
+    src_root = Path(__file__).resolve().parents[1] / "src" / "moe_compress"
+    src = (
+        (src_root / "stage3_svd.py").read_text()
+        + (src_root / "stage3" / "orchestrator.py").read_text()
+        + (src_root / "stage3" / "plugins" / "block_refine.py").read_text()
     )
-    src = src_path.read_text()
     expected_keys = [
         "stage3/config/cross_cov_enabled",
         "stage3/config/scope",
@@ -312,9 +363,17 @@ def test_stage3_source_emits_config_and_c5_extensions():
 
 
 def test_stage6_source_emits_config_block():
+    """Source-level check: Stage 6 emits a one-shot config block under
+    stage6/config/*.
+
+    S6-8: the monolith ``stage6_validate.py`` ``run()`` body was retired —
+    the config-key Trackio emits (``stage6/config/*``) now fire from the
+    real orchestrator ``stage6/orchestrator.py``. The source scan
+    therefore targets the orchestrator (mirror of the Stage 3 /
+    Router-KD post-flip updates above)."""
     src_path = (
         Path(__file__).resolve().parents[1]
-        / "src" / "moe_compress" / "stage6_validate.py"
+        / "src" / "moe_compress" / "stage6" / "orchestrator.py"
     )
     src = src_path.read_text()
     expected_keys = [

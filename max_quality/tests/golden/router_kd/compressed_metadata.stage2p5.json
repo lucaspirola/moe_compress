@@ -1,0 +1,11 @@
+{
+  "factored_effective_ranks": {},
+  "factored_layers": [],
+  "factored_ranks": {},
+  "per_layer_num_experts": {
+    "0": 2,
+    "1": 2
+  },
+  "pipeline_stage": "stage2p5_final",
+  "version": 1
+}

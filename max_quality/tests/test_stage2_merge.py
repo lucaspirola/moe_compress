@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import torch
 
-from moe_compress.stage2_reap_ream import (
+from moe_compress.stage2.orchestrator import (
     _assign_children_to_centroids,
     _merge_experts_inplace,
     _permutation_align_to_centroid,
@@ -107,7 +107,7 @@ def test_permutation_align_no_implicit_cpu_calls():
     """
     import ast
     import inspect
-    from moe_compress.stage2_reap_ream import _permutation_align_to_centroid as fn
+    from moe_compress.stage2.orchestrator import _permutation_align_to_centroid as fn
     src = inspect.getsource(fn)
     # AST-walk to find .cpu() calls, ignoring occurrences inside comments / strings.
     tree = ast.parse(src)

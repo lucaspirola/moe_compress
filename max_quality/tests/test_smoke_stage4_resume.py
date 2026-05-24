@@ -13,9 +13,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from moe_compress import stage1_grape, stage2_reap_ream, stage3_svd
+from moe_compress import stage1, stage3_svd
 from moe_compress import stage4_eora
+from moe_compress.stage2 import orchestrator as stage2_reap_ream
 from moe_compress.budget.solver import BudgetDecomposition
+from moe_compress.stage4.plugins import eora_compensation
 from moe_compress.utils.model_io import MATRIX_NAMES, FactoredExperts, iter_moe_layers
 
 
@@ -58,7 +60,8 @@ def patched_stages(monkeypatch, tiny_config):
     monkeypatch.setattr(mio, "save_compressed_checkpoint", _noop_save)
     monkeypatch.setattr(stage2_reap_ream, "save_compressed_checkpoint", _noop_save)
     monkeypatch.setattr(stage3_svd, "save_compressed_checkpoint", _noop_save)
-    monkeypatch.setattr(stage4_eora, "save_compressed_checkpoint", _noop_save)
+    # S4-4a: the Stage 4 orchestrator calls save_compressed_checkpoint
+    # module-qualified through utils.model_io — the `mio` patch above covers it.
 
     return tiny_config
 
@@ -72,7 +75,7 @@ def _run_stages_0123(model, config, tmp_path):
         min_experts_per_layer=2,
         blacklisted_experts={},
     )
-    stage1_grape.run(model, _TinyTokenizer(), config, tmp_path, decomp)
+    stage1.run(model, _TinyTokenizer(), config, tmp_path, decomp)
     stage2_reap_ream.run(model, _TinyTokenizer(), config, tmp_path, device=None)
     stage3_svd.run(model, _TinyTokenizer(), config, tmp_path, decomp, device=None)
     return decomp
@@ -93,8 +96,10 @@ def test_stage4_resume_skips_completed_layers(
 
     # --- First run: crash after layer 0's spill is written ---
     # We intercept _spill_layer: let the first call succeed (layer 0 done),
-    # then raise on the second call (layer 1 attempt).
-    original_spill = stage4_eora._spill_layer
+    # then raise on the second call (layer 1 attempt). S4-4a: _spill_layer is
+    # now called inside EoraCompensationPlugin.compensate_layer — patch it on
+    # the eora_compensation module (the namespace that resolves the call).
+    original_spill = eora_compensation._spill_layer
     spill_call_count = [0]
 
     def _crash_after_first_spill(partial_dir, layer_idx, fe, rank_map_layer, compensated):
@@ -103,7 +108,7 @@ def test_stage4_resume_skips_completed_layers(
             return original_spill(partial_dir, layer_idx, fe, rank_map_layer, compensated)
         raise RuntimeError("simulated crash after layer 0")
 
-    monkeypatch.setattr(stage4_eora, "_spill_layer", _crash_after_first_spill)
+    monkeypatch.setattr(eora_compensation, "_spill_layer", _crash_after_first_spill)
 
     with pytest.raises(RuntimeError, match="simulated crash after layer 0"):
         stage4_eora.run(tiny_model, _TinyTokenizer(), patched_stages, tmp_path)
@@ -126,14 +131,14 @@ def test_stage4_resume_skips_completed_layers(
     tiny_model.load_state_dict(state_after_3)
 
     # --- Second run: resume without crash ---
-    monkeypatch.setattr(stage4_eora, "_spill_layer", original_spill)
+    monkeypatch.setattr(eora_compensation, "_spill_layer", original_spill)
     resumed_spill_count = [0]
 
     def _counting_spill(partial_dir, layer_idx, fe, rank_map_layer, compensated):
         resumed_spill_count[0] += 1
         return original_spill(partial_dir, layer_idx, fe, rank_map_layer, compensated)
 
-    monkeypatch.setattr(stage4_eora, "_spill_layer", _counting_spill)
+    monkeypatch.setattr(eora_compensation, "_spill_layer", _counting_spill)
 
     stage4_eora.run(tiny_model, _TinyTokenizer(), patched_stages, tmp_path)
 
@@ -195,7 +200,7 @@ def test_stage4_resume_restores_factored_experts_from_spill(
     partial_dir.mkdir(parents=True, exist_ok=True)
 
     fe0 = layers[0].experts_module
-    from moe_compress.stage4_eora import _spill_layer
+    from moe_compress.stage4.plugins.eora_compensation import _spill_layer
     _spill_layer(partial_dir, layer0_idx, fe0,
                  rank_map_layer={f"L{layer0_idx}_{n}": fe0.ranks[n] for n in MATRIX_NAMES},
                  compensated_params_layer=0)

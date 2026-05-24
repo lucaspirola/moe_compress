@@ -19,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from moe_compress.stage2_reap_ream import (
+from moe_compress.stage2.orchestrator import (
     _assign_greedy,
     _two_opt_refine,
 )

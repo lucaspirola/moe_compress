@@ -1,0 +1,37 @@
+{
+  "acc_norm_sum_gap": null,
+  "bpt_gap": 0.5,
+  "corpus": {
+    "effective_seed": 0,
+    "name": "nemotron",
+    "num_sequences": 4,
+    "seed_offset": 715,
+    "sequence_length": 16,
+    "subset_weights": {
+      "chat": 0.25,
+      "math": 0.35,
+      "science": 0.15,
+      "swe": 0.25
+    }
+  },
+  "lm_eval": {
+    "arc_easy_limit": 2,
+    "hellaswag_limit": 2
+  },
+  "mode": "thermometer",
+  "stage": "6alt",
+  "student_acc_norm_sum": null,
+  "student_arc_easy_acc_norm": null,
+  "student_bpt": 3.0,
+  "student_hellaswag_acc_norm": null,
+  "teacher_acc_norm_sum": null,
+  "teacher_arc_easy_acc_norm": null,
+  "teacher_bpt": 2.5,
+  "teacher_cache": {
+    "hit": true,
+    "key": "72b0dd108043457122c5027ab7464ebc69a1e98a86c456a4672f1f34bd150c23",
+    "path": "/dev/null/stub_teacher_cache.json"
+  },
+  "teacher_hellaswag_acc_norm": null,
+  "top1_agreement": null
+}

@@ -1,5 +1,5 @@
 """Tests for Phase D ablation filter and the legacy Phase F helper."""
-from moe_compress.stage1_ablation_filter import (
+from moe_compress.stage1.plugins.ablation_filter import (
     _apply_threshold_filter,
     rank_top_nonblacklisted,
 )

@@ -1,0 +1,27 @@
+{
+  "achieved_budget": 5,
+  "config": {
+    "early_layer_bonus": 0,
+    "early_layer_bonus_depth": 0,
+    "late_layer_bonus": 0,
+    "late_layer_bonus_depth": 0,
+    "min_experts_per_layer": 2,
+    "num_calibration_samples": 4,
+    "similarity_metric": "cosine",
+    "super_expert_detection": {
+      "global_blacklist_cap_pct": 0.5,
+      "max_blacklisted_per_layer": 1,
+      "zscore_threshold": 1.0
+    },
+    "target_total_experts_per_layer_avg": 3
+  },
+  "per_layer_redundancy": {
+    "0": 0.0,
+    "1": 1.0
+  },
+  "per_layer_target_experts": {
+    "0": 2,
+    "1": 3
+  },
+  "requested_budget": 5
+}

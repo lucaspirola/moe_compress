@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from moe_compress import stage1_grape, stage2_reap_ream
+from moe_compress import stage1
+from moe_compress.stage2 import orchestrator as stage2_reap_ream
 from moe_compress.budget import solver
 
 
@@ -51,7 +52,7 @@ def test_stage1_smoke(tiny_model, patched_calibration, tmp_path):
         min_experts_per_layer=2,
         blacklisted_experts={},
     )
-    stage1_grape.run(tiny_model, _TinyTokenizer(), patched_calibration, tmp_path, decomp)
+    stage1.run(tiny_model, _TinyTokenizer(), patched_calibration, tmp_path, decomp)
     payload = json.loads((tmp_path / "stage1_budgets.json").read_text())
     # The output schema names this `requested_budget` (carries
     # decomposition.global_expert_budget); the test was stale from a rename.
@@ -69,7 +70,7 @@ def test_stage2_smoke_full_chain(tiny_model, patched_calibration, tmp_path):
         min_experts_per_layer=2,
         blacklisted_experts={},
     )
-    stage1_grape.run(tiny_model, _TinyTokenizer(), patched_calibration, tmp_path, decomp)
+    stage1.run(tiny_model, _TinyTokenizer(), patched_calibration, tmp_path, decomp)
     # 2 — monkey-patch save_compressed_checkpoint to a no-op since tiny model
     # isn't HF-pretrained.
     from moe_compress.utils import model_io as mio
@@ -138,7 +139,7 @@ def test_stage2_max_merge_group_size_enforced(tiny_model, patched_calibration, t
         min_experts_per_layer=1,
         blacklisted_experts={},
     )
-    stage1_grape.run(model, _TinyTokenizer(), cfg, tmp_path, decomp)
+    stage1.run(model, _TinyTokenizer(), cfg, tmp_path, decomp)
 
     def _noop_save(m, tok, path, **kwargs):
         Path(path).mkdir(parents=True, exist_ok=True)

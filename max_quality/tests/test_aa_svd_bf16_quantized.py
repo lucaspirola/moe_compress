@@ -115,17 +115,21 @@ def test_aa_svd_bf16_B_does_not_fall_back_to_plain_svd(monkeypatch):
     """The eigh path must succeed on bf16-quantized B; the plain-SVD fallback
     is a defensive last-resort and should not be hit on this input.
     """
-    import moe_compress.stage3_svd as m
+    # S3-5: ``_aa_svd`` was relocated to ``stage3/plugins/aa_svd_factor`` and
+    # now logs the "fallback to plain SVD" warning through THAT module's
+    # ``log``. Spy on the new module's logger — a spy on ``stage3_svd.log``
+    # would silently never fire and this test would pass vacuously.
+    import moe_compress.stage3.plugins.aa_svd_factor as aa
 
     fallback_calls = {"n": 0}
-    real_warning = m.log.warning
+    real_warning = aa.log.warning
 
     def _spy(msg, *a, **kw):
         if isinstance(msg, str) and "fallback to plain SVD" in msg:
             fallback_calls["n"] += 1
         return real_warning(msg, *a, **kw)
 
-    monkeypatch.setattr(m.log, "warning", _spy)
+    monkeypatch.setattr(aa.log, "warning", _spy)
 
     d_out, d_in = _D_OUT, _D_IN
     g = torch.Generator().manual_seed(5)
@@ -133,3 +137,66 @@ def test_aa_svd_bf16_B_does_not_fall_back_to_plain_svd(monkeypatch):
     B = _bf16_roundtrip_B(d_in, _N, seed=6)
     _aa_svd(W, None, B, 200, device="cpu")
     assert fallback_calls["n"] == 0, "plain-SVD fallback fired on bf16-quantized B"
+
+
+def test_aa_svd_fallback_warning_fires_on_bad_B(monkeypatch):
+    """Positive counterpart to the test above: when the eigh path genuinely
+    cannot proceed, ``_aa_svd`` MUST log the fallback warning and still return
+    a valid plain-SVD factorization.
+
+    Without this test, a future change that silenced
+    ``aa_svd_factor.log.warning`` would go undetected — the
+    "does_not_fall_back" test only asserts the spy stays at zero, which a
+    permanently-mute logger also satisfies.
+
+    Trigger: an all-NaN covariance B. NaN propagates through
+    ``B = 0.5*(B + B.T)`` and ``torch.linalg.eigh``; the NaN eigenvalues then
+    fail the ``eigvals > thresh`` comparison (NaN compares False), so
+    ``_precompute_eigh`` raises ``ValueError`` ("no positive eigenvalues above
+    threshold") — the cheapest deterministic way to force the fallback branch
+    without a real model (the implementer's note: "NaN B → eigh raises").
+    """
+    import moe_compress.stage3.plugins.aa_svd_factor as aa
+
+    fallback_calls = {"n": 0, "msgs": []}
+    real_warning = aa.log.warning
+
+    def _spy(msg, *a, **kw):
+        if isinstance(msg, str) and "fallback to plain SVD" in msg:
+            fallback_calls["n"] += 1
+            fallback_calls["msgs"].append(msg)
+        return real_warning(msg, *a, **kw)
+
+    monkeypatch.setattr(aa.log, "warning", _spy)
+
+    d_out, d_in = _D_OUT, _D_IN
+    g = torch.Generator().manual_seed(7)
+    W = torch.randn(d_out, d_in, generator=g, dtype=torch.float32)
+    # All-NaN B: a structurally-valid-shape covariance whose contents force
+    # _precompute_eigh down the failure path and thus _aa_svd into fallback.
+    B = torch.full((d_in, d_in), float("nan"), dtype=torch.float32)
+
+    k = 64
+    U_k, V_k, rel_err, k_eff = _aa_svd(W, None, B, k, device="cpu")
+
+    # (a) the spy genuinely fired.
+    assert fallback_calls["n"] >= 1, (
+        "fallback warning did NOT fire on all-NaN B — the eigh path either "
+        "did not fail or the warning is silenced"
+    )
+    # (b) the warning message names the fallback.
+    assert all(
+        "fallback to plain SVD" in m for m in fallback_calls["msgs"]
+    ), f"unexpected fallback warning text: {fallback_calls['msgs']}"
+    # (c) _aa_svd still returns a valid plain-SVD factorization — it falls
+    # back, it does not crash, and the factors are finite.
+    assert U_k.shape == (d_out, k) and V_k.shape == (k, d_in), (
+        f"fallback returned wrong shapes: U={U_k.shape} V={V_k.shape}"
+    )
+    assert torch.isfinite(U_k).all() and torch.isfinite(V_k).all(), (
+        "fallback produced non-finite factors"
+    )
+    assert 0.0 <= rel_err <= 1.0 + 1e-3, (
+        f"fallback rel_err escaped [0,1]: {rel_err}"
+    )
+    assert k_eff == k, f"plain-SVD fallback should report k_eff=k; got {k_eff}"

@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 
 from moe_compress import stage5_router_kd as s5m
+from moe_compress.router_kd import orchestrator as rk_orchestrator
 from moe_compress.utils.model_io import iter_moe_layers
 
 # conftest.py provides the `tiny_model` / `tiny_config` fixtures (a synthetic
@@ -350,7 +351,7 @@ def test_merge_repair_with_logits_cache_fails_loud(tiny_model, tiny_config, tmp_
                                                    monkeypatch):
     """`run()` must refuse merge_repair when a vocab-logits cache is set: the
     cache has no per-layer hidden states, so the MSE term is impossible."""
-    from moe_compress import stage2_reap_ream
+    from moe_compress import stage2
     from moe_compress.utils import model_io as mio
 
     # Build a real (trivial) teacher-logits cache so the cache branch in run()
@@ -386,8 +387,10 @@ def test_merge_repair_with_logits_cache_fails_loud(tiny_model, tiny_config, tmp_
         Path(path).mkdir(parents=True, exist_ok=True)
         return Path(path)
 
-    monkeypatch.setattr(s5m, "save_compressed_checkpoint", _noop_save)
-    monkeypatch.setattr(s5m, "build_calibration_tensor",
+    # RK-8: the real Router-KD orchestrator binds save_compressed_checkpoint /
+    # build_calibration_tensor by direct import — patch them there.
+    monkeypatch.setattr(rk_orchestrator, "save_compressed_checkpoint", _noop_save)
+    monkeypatch.setattr(rk_orchestrator, "build_calibration_tensor",
                         lambda *a, **k: torch.zeros(n_samples, seq_len, dtype=torch.long))
 
     class _TinyTok:

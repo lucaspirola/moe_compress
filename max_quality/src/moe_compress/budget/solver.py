@@ -80,7 +80,7 @@ class BudgetDecomposition:
     ``per_layer_target_experts`` (N'_l in the spec) is **not** a solver output.
     The solver produces only the global ``global_expert_budget`` (total surviving
     routed experts across all layers).  Per-layer budgets N'_l are allocated by
-    GRAPE in Stage 1 (``stage1_grape.py``), which distributes ``global_expert_budget``
+    GRAPE in Stage 1 (``stage1/``), which distributes ``global_expert_budget``
     non-uniformly across layers using activation-aware CKA similarity, subject to
     the ``min_experts_per_layer`` floor (see ALGORITHM_REFERENCE.md §4).
     """

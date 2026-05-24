@@ -1,31 +1,33 @@
-"""Phase D — Ablation Filter (load-bearing) for Stage 1 SE blacklist construction.
+"""Phase D — Ablation Filter (load-bearing causal-ΔNLL filter).
 
-Phase C produces a *candidate* set by union of four detectors (three-way AND,
-AIMER, sink-token routing, magnitude top-K). This module ablates every candidate
-on a held-out calibration slice and keeps only those whose ΔNLL exceeds
-``ablation_filter_threshold`` — that becomes the final blacklist written to
-``stage1_blacklist.json``. Per-candidate ΔNLL (kept and rejected alike) is
-retained in ``stage1_ablation_filter.json`` for audit.
+Paper: ALGORITHM_REFERENCE.md §4 Phase D and §12 D-causal-ablation-validation.
+Migrated from the legacy Stage 1 ablation-filter module in sub-task 5 of the
+Stage 1 → plugin-architecture refactor.
 
-This was Phase F (report-only post-hoc validation) in v5; v6 promotes it to the
-authoritative final filter because v4's static-threshold blacklist contained
-~91% dead-weight (158 entries → 5 with measurable ΔNLL). See
-``ALGORITHM_REFERENCE.md`` §4 Phase D and §12 D-causal-ablation-validation.
-
-The legacy ``run_phase_f`` entry point is kept as a deprecated compatibility
-shim for callers that still pass a fixed blacklist; new code should call
-``run_ablation_filter`` with the candidate dict from Phase C.
+The plugin's externally observable behaviour is **byte-identical** to the
+legacy ``run_ablation_filter`` + ``_write_ablation_filter_artifact`` pair:
+same baseline-NLL semantics, same per-candidate ablation forward-pass, same
+threshold-filter rule (ΔNLL > threshold), same six-key JSON payload schema.
+Verified via the golden snapshot test for ``stage1_ablation_filter.json``
+and ``stage1_blacklist.json`` (Phase D feeds the Phase-C-artifact assembly
+below).
 
 Ablation semantics
 ------------------
 The ``down`` callback in :func:`instrument_experts` receives the down_proj
 output by reference *before* it is multiplied by routing weights and
-``index_add_``-ed into the layer's output. Calling ``tensor.zero_()`` on the
-callback argument therefore zeroes the tensor that the next two lines of
-the wrapped forward consume — see ``activation_hooks.py`` lines 1099-1103
-(factored) and 1132-1135 (fused). The forward runs under
+``index_add_``-ed into the layer's output. Calling ``tensor.zero_()`` on
+the callback argument therefore zeroes the tensor that the next two lines
+of the wrapped forward consume — see ``activation_hooks.py`` lines 1099-
+1103 (factored) and 1132-1135 (fused). The forward runs under
 ``torch.no_grad()`` so in-place mutation is safe.
+
+The legacy ``run_phase_f`` v5 entry point is kept here verbatim for
+back-compat with any out-of-tree caller. New code calls
+:class:`AblationFilterPlugin` (or the module-level ``run_ablation_filter``
+directly).
 """
+
 from __future__ import annotations
 
 import logging
@@ -34,11 +36,177 @@ from pathlib import Path
 
 import torch
 
-from .utils.activation_hooks import instrument_experts
-from .utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
-from .utils.model_io import iter_moe_layers, save_json_artifact
+from ...utils.activation_hooks import instrument_experts
+from ...utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
+from ...utils.model_io import iter_moe_layers, save_json_artifact
+from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
+
+
+class AblationFilterPlugin:
+    """Causal-ΔNLL ablation filter (Phase D — load-bearing final-blacklist producer).
+
+    Reads the Phase C candidate set + a held-out calibration slice; ablates
+    each candidate by zeroing its down_proj output during a forward pass;
+    keeps candidates whose ΔNLL exceeds ``ablation_filter_threshold``.
+
+    The plugin produces two outputs:
+
+    1. **In-memory:** the three context slots ``blacklist``,
+       ``candidate_deltas``, ``baseline_nll`` (read by the downstream
+       Phase-C-artifact assembly and the Phase E/F delegations).
+    2. **JSON file:** the ``stage1_ablation_filter.json`` payload returned
+       by :meth:`contribute_artifact` — the orchestrator writes it via
+       :func:`utils.model_io.save_json_artifact`. The plugin itself does
+       not write to disk.
+
+    When ``stage1_grape.ablation_filter.enabled`` is ``False`` the plugin
+    falls back to using the candidate set verbatim as the blacklist (with
+    empty ``candidate_deltas`` and ``baseline_nll=0.0``) — matching the
+    legacy short-circuit at the top of ``run_ablation_filter``.
+    """
+
+    name: str = "ablation_filter"
+    paper: str = (
+        "Stage 1 ALGORITHM_REFERENCE.md §4 Phase D — D-causal-ablation-validation"
+    )
+    config_key: str = "stage1_grape.ablation_filter"
+    reads: tuple[str, ...] = (
+        "candidates",
+        "model",
+        "tokenizer",
+        "config",
+        "artifacts_dir",
+        "device",
+    )
+    writes: tuple[str, ...] = (
+        "blacklist",
+        "candidate_deltas",
+        "baseline_nll",
+        # Private bookkeeping for ``contribute_artifact`` — not consumed by
+        # any downstream plugin or the legacy orchestrator code. Kept in
+        # ``writes`` so the Protocol contract is honest about every slot
+        # the plugin touches.
+        "ablation_filter_threshold",
+        "ablation_filter_config",
+    )
+    # Phase D runs its own dedicated ablation forward pass (one per candidate);
+    # it does not consume any shared accumulator from Phase B.
+    provides: tuple[str, ...] = ()
+
+    def is_enabled(self, config: dict) -> bool:
+        """Read ``config["stage1_grape"]["ablation_filter"]["enabled"]``; default True.
+
+        ``False`` does **not** skip Phase D entirely — the plugin still
+        runs and the candidate set is used as the blacklist verbatim.
+        ``is_enabled`` reflects the orchestrator-visible flag for
+        the orchestrator's gating.
+        """
+        s1 = config.get("stage1_grape", {})
+        af = s1.get("ablation_filter", {})
+        return bool(af.get("enabled", True))
+
+    def run(self, ctx: PipelineContext) -> None:
+        """Execute Phase D end-to-end.
+
+        Reads ``candidates``, ``model``, ``tokenizer``, ``config``,
+        ``artifacts_dir``, ``device`` from ``ctx``; writes ``blacklist``,
+        ``candidate_deltas``, ``baseline_nll``, ``ablation_filter_threshold``,
+        ``ablation_filter_config`` back.
+
+        Delegates the ablation work to :func:`run_ablation_filter` (the
+        moved legacy worker — byte-identical to the original).
+        """
+        candidates = ctx.get("candidates")
+        model = ctx.get("model")
+        tokenizer = ctx.get("tokenizer")
+        config = ctx.get("config")
+        artifacts_dir = ctx.get("artifacts_dir")
+        device = ctx.get("device")
+
+        s1 = config["stage1_grape"]
+        af = s1.get("ablation_filter", {})
+        threshold = float(af.get("blacklist_threshold", 0.001))
+
+        blacklist, candidate_deltas, baseline_nll = run_ablation_filter(
+            model, tokenizer, config, artifacts_dir,
+            candidates=candidates,
+            device=device,
+        )
+
+        ctx.set("blacklist", blacklist)
+        ctx.set("candidate_deltas", candidate_deltas)
+        ctx.set("baseline_nll", baseline_nll)
+        ctx.set("ablation_filter_threshold", threshold)
+        # Plugin-internal default config dict — only the three keys the
+        # plugin itself can derive from its own inputs. The orchestrator
+        # may overwrite this slot with a wider mix that includes Phase-C
+        # state, in which case the golden-snapshot byte-anchor uses the
+        # wider dict.
+        ctx.set(
+            "ablation_filter_config",
+            {
+                "holdout_samples": int(af.get("holdout_samples", 100)),
+                "ablation_filter_threshold": threshold,
+                "ablation_filter_batch_size": int(af.get("batch_size", 32)),
+            },
+        )
+
+    def contribute_artifact(self, ctx: PipelineContext) -> dict:
+        """Return the ``stage1_ablation_filter.json`` payload.
+
+        Identical six-key schema to the legacy
+        :func:`_write_ablation_filter_artifact` (the pre-sub-task-5
+        ablation-filter module):
+
+        Returns
+        -------
+        dict
+            Exactly six top-level keys:
+              - ``baseline_mean_nll`` : float
+              - ``ablation_filter_threshold`` : float
+              - ``candidate_count`` : int
+              - ``blacklist_count`` : int
+              - ``candidates`` : dict[str, {"delta_nll", "provenance",
+                "passed_filter"}]
+              - ``config`` : dict (whatever ``ablation_filter_config``
+                holds at call time — the plugin's default subset OR the
+                orchestrator's wider overlay; see the overwrite path in
+                §4.2.3 of subtask_5_plan.md)
+        """
+        candidates: dict[tuple[int, int], list[str]] = ctx.get("candidates")
+        deltas: dict[tuple[int, int], float] = ctx.get("candidate_deltas")
+        baseline_nll: float = ctx.get("baseline_nll")
+        threshold: float = ctx.get("ablation_filter_threshold")
+        blacklist: dict[int, list[int]] = ctx.get("blacklist")
+        config_dict: dict = ctx.get("ablation_filter_config")
+
+        blacklisted_pairs = {(li, e) for li, exps in blacklist.items() for e in exps}
+        candidates_payload: dict[str, dict] = {}
+        for (li, e), provenance in candidates.items():
+            key = f"L{li}E{e}"
+            delta = deltas.get((int(li), int(e)))
+            candidates_payload[key] = {
+                "delta_nll": float(delta) if delta is not None else None,
+                "provenance": list(provenance),
+                "passed_filter": (int(li), int(e)) in blacklisted_pairs,
+            }
+
+        return {
+            "baseline_mean_nll": float(baseline_nll),
+            "ablation_filter_threshold": float(threshold),
+            "candidate_count": len(candidates),
+            "blacklist_count": sum(len(v) for v in blacklist.values()),
+            "candidates": candidates_payload,
+            "config": dict(config_dict),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers — moved verbatim from the legacy Stage 1
+# ablation-filter module (pre-sub-task-5). This is the single source of truth.
+# ---------------------------------------------------------------------------
 
 
 def rank_top_nonblacklisted(

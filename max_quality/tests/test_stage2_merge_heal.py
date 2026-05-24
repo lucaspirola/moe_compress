@@ -24,7 +24,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from moe_compress.stage2_reap_ream import (
+from moe_compress.stage2.orchestrator import (
     _HealConfig,
     _capture_mlp_io,
     _heal_layer,

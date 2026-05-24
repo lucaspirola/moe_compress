@@ -18,7 +18,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from moe_compress.stage2_reap_ream import (
+from moe_compress.stage2.orchestrator import (
     _LayerInputAccumulator,
     _swiglu_forward,
     _snapshot_pre_merge_layer_experts,
