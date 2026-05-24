@@ -1,29 +1,96 @@
-"""Phase C₄ — Magnitude top-K detector.
+"""Magnitude top-K Super-Expert candidate detector (project-original).
 
-Catches large-magnitude experts within MA-formation layers (``l ∈ L``)
-that don't quite cross the three-way AND criterion but should still
-be ablation-tested. See `ALGORITHM_REFERENCE.md` §12 [D-magnitude-topk-candidates].
+Paper
+-----
+**None — there is no paper for this detector.** It is project-original.
+arXiv:2507.23279 (the SE paper this stage otherwise derives from)
+prescribes the three-way AND criterion (see ``three_way_and.py``) as the
+sole SE-detection rule and contains no top-K-by-magnitude heuristic.
 
-Migrated from the legacy Stage 1 module in sub-task 8 of the Stage 1 →
-plugin-architecture refactor. The plugin dismantles the inline
-``_magnitude_topk_candidates`` helper and the magnitude-topk branch
-of ``_collect_candidates``.
+The GRAPE proposal (arXiv:2604.06542) is occasionally near this file
+because Stage 1 lives in the ``grape`` config block, but it is unrelated
+to expert ranking by per-layer magnitude.
 
-The plugin owns two responsibilities:
+Official code
+-------------
+None. The companion paper's official repo
+(ZunhaiSu/Super-Experts-Profilling @
+``573aead3127ae593ba267758b832944f8fed1485``) implements only the
+three-way AND criterion. This detector has no upstream reference
+implementation.
 
-1. **Top-K selection** — for each ``l ∈ L``, pick the top-K experts by
-   ``per_expert_max[(l, e)]`` and add each to the shared
-   ``CandidateBag`` with tag ``"magnitude_topk"``.
-2. **No artifact contribution** — the magnitude-topk parameter
-   (``magnitude_topk_per_l_layer``) lives inside the orchestrator-built
-   ``blacklist_config`` block. The plugin's :meth:`contribute_artifact`
-   returns ``{}``.
+Deviation: D-magnitude-topk-candidates
+--------------------------------------
+Project-original candidate-pool extension. For each MA-formation layer
+``l ∈ L``, augment the candidate pool with the top-``magnitude_topk_per_l_layer``
+experts ranked by ``per_expert_max[(l, e)]`` (down-projection-output
+absolute-max accumulated over the calibration pass), regardless of
+whether they pass the three-way AND threshold. Provenance tagged
+``"magnitude_topk"``.
 
-The plugin's ``writes`` tuple is ``("candidate_bag",)`` — only the
-shared bag is mutated. The plugin is gated by
-``magnitude_topk_per_l_layer > 0`` (default 16; the typical disable
-value is 0). See ``tasks/refactor_stage1/subtask_8_plan.md`` §2.10 for
-the is_enabled contract.
+The final blacklist is gated by the downstream ablation-filter pass —
+magnitude-top-K candidacy is necessary, not sufficient. False positives
+cost ablation walltime but cannot reach the final blacklist without
+measurable per-candidate ΔNLL.
+
+Why this detector exists
+------------------------
+The static three-way AND threshold from arXiv:2507.23279 is tuned for
+the paper's measured models (Qwen3-30B-A3B initial release / DeepSeek-V2-Lite /
+Mixtral-8x7B); on architecture-shifted models the right thresholds shift
+too. The v3 Phase F audit (commits in the 2026-05-10 series) surfaced
+non-blacklisted experts with measurable ablation ΔNLL — e.g.,
+``L34E85`` with ΔNLL ≈ −0.025 — that the static three-way AND missed.
+A magnitude-top-K source per layer catches these by widening the
+candidate pool without weakening the final filter (which remains
+ablation-gated).
+
+K = 16 is set to **2× the model's active-experts-per-token** (top-8
+routing on the target Qwen3-30B-A3B-2507 architecture). The 2× factor is
+broad enough to recover SEs that fell just below the three-way AND's
+P99.5 outlier cut while still bounding the per-layer ablation cost.
+
+Git archaeology
+---------------
+- ``3ad418b``/``3c48d76`` (2026-05-10) "feat(stage1): magnitude top-K +
+  tightened sink-token candidate selection" — initial extraction of
+  ``_magnitude_topk_candidates(per_expert_max, L, top_k)`` from
+  ``_collect_candidates`` into a named helper.
+- ``a2e34db``/``aa2ed94`` (same v6 wave as sink-token tightening) —
+  ``magnitude_topk_per_l_layer: 16`` added as the production-config
+  default. Same commit raised the sink-token thresholds; both are part
+  of the v6 "candidate-pool + ablation-filter" architecture switch.
+- ``94b5526``/``9bdbda8`` "spec(stage1): §12 rewrites
+  — candidates+ablation-filter for AIMER/sink/topk" — recorded the
+  ``L34E85 ΔNLL ≈ −0.025`` motivating anecdote.
+
+Naming-history note
+-------------------
+The legacy stage-1 monolith called this "Phase C₄" (fourth sub-source of
+the unified Phase C candidate-collection stage). The current plugin
+architecture has no phase taxonomy — plugin enable/disable is the flag
+that gates execution. The existing log string ``"Stage 1 Phase C₄"`` and
+the Trackio-keyed ``"phase_c"`` provenance label are retained for
+dashboard back-compat; new prose drops the labels.
+
+Plugin contract
+---------------
+``writes = ("candidate_bag",)`` — only the shared bag is mutated, via
+``add(l, e, "magnitude_topk")``. ``provides = ("downproj_max",)`` is the
+declarative metadata advertising that this detector reads from the
+``per_expert_max`` accumulator (shared with the three-way AND plugin —
+the calibration pass collects it once for both consumers).
+
+``contribute_artifact`` returns ``{}`` — the magnitude-top-K parameter
+(``magnitude_topk_per_l_layer``) lives inside the orchestrator-built
+``config`` (``blacklist_config``) top-level block of
+``stage1_blacklist.json``; this plugin contributes no top-level fragment.
+The candidates' per-layer breakdown is emitted by the shared candidate
+bag's ``to_provenance_dict()`` under ``magnitude_topk.candidates``.
+
+``is_enabled`` gates on ``magnitude_topk_per_l_layer > 0``; the value
+``0`` disables the detector entirely (also short-circuited inside the
+helper as ``top_k <= 0``).
 """
 
 from __future__ import annotations
@@ -37,16 +104,17 @@ log = logging.getLogger(__name__)
 
 
 class MagnitudeTopkPlugin:
-    """Magnitude top-K detector (Phase C₄).
+    """Magnitude top-K Super-Expert candidate detector (project-original).
 
     For each ``l ∈ L``, picks the top-``magnitude_topk_per_l_layer``
     experts by ``per_expert_max[(l, e)]`` and adds each to the shared
-    ``CandidateBag`` with tag ``"magnitude_topk"``.
+    ``CandidateBag`` with tag ``"magnitude_topk"``. There is no paper
+    for this detector — see deviation D-magnitude-topk-candidates in
+    the module docstring for the rationale, the K=16 = 2×top-routing
+    derivation, and the v3 Phase F motivating evidence.
 
     Gated by ``magnitude_topk_per_l_layer > 0`` via :meth:`is_enabled`.
-    Default top-K is 16 (matching the legacy default). The orchestrator
-    gates the plugin on :meth:`is_enabled`; :meth:`run` also short-circuits
-    on the top_k=0 check inside :func:`_magnitude_topk_candidates`.
+    Default K is 16. Final blacklist requires ablation-filter evidence.
 
     No artifact fragment is contributed (:meth:`contribute_artifact`
     returns ``{}``). The 7-top-level-keys schema invariant is
@@ -55,7 +123,14 @@ class MagnitudeTopkPlugin:
     """
 
     name: str = "magnitude_topk"
-    paper: str = "Magnitude top-K per-layer Super-Expert candidate (D-magnitude-topk-candidates)"
+    paper: str = (
+        "Magnitude top-K candidate source (project-original; no paper). "
+        "arXiv:2507.23279 prescribes only the three-way AND criterion — "
+        "official code ZunhaiSu/Super-Experts-Profilling @ "
+        "573aead3127ae593ba267758b832944f8fed1485 implements no top-K-by-"
+        "magnitude heuristic. See deviation D-magnitude-topk-candidates "
+        "in the module docstring."
+    )
     config_key: str = "stage1_grape.super_expert_detection.magnitude_topk_per_l_layer"
     reads: tuple[str, ...] = (
         "max_acc",
@@ -72,10 +147,10 @@ class MagnitudeTopkPlugin:
         """Read ``config["stage1_grape"]["super_expert_detection"]
         ["magnitude_topk_per_l_layer"]``; return ``True`` iff the value > 0.
 
-        Default value 16 (per the legacy default). When ``0`` (or
-        any value ≤ 0), the plugin is disabled. The orchestrator gates
-        the plugin on this; the run also short-circuits on
-        the top_k=0 check.
+        Default value 16 (per the v6 production-config default). When
+        ``0`` (or any value ≤ 0), the plugin is disabled. The orchestrator
+        gates the plugin on this; the run also short-circuits on the
+        top_k=0 check inside :func:`_magnitude_topk_candidates`.
         """
         s1 = config.get("stage1_grape", {})
         se = s1.get("super_expert_detection", {})
@@ -135,8 +210,8 @@ class MagnitudeTopkPlugin:
 
 
 # ---------------------------------------------------------------------------
-# Phase C₄ private helper — moved verbatim from the legacy Stage 1 module
-# in sub-task 8. Sole caller: :class:`MagnitudeTopkPlugin.run`.
+# Private helper — moved verbatim from the legacy Stage 1 module in
+# sub-task 8. Sole caller: :class:`MagnitudeTopkPlugin.run`.
 # ---------------------------------------------------------------------------
 
 
@@ -148,8 +223,10 @@ def _magnitude_topk_candidates(
     """For each ``l ∈ L``, pick the top-``top_k`` experts by ``per_expert_max``.
 
     Catches large-magnitude experts within MA-formation layers that don't
-    quite cross the three-way AND but should still go through Phase D
-    ablation. See [D-magnitude-topk-candidates] in ALGORITHM_REFERENCE.md §12.
+    quite cross the three-way AND but should still go through the
+    ablation filter. See deviation D-magnitude-topk-candidates in the
+    module docstring for the rationale and the v3 Phase F motivating
+    evidence.
 
     Moved verbatim from the legacy Stage 1 module in sub-task 8. Sole
     caller: :class:`MagnitudeTopkPlugin.run`.

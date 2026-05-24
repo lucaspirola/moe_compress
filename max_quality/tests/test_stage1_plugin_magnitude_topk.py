@@ -87,7 +87,13 @@ def _populated_ctx(
 def test_plugin_protocol_attributes():
     p = MagnitudeTopkPlugin()
     assert p.name == "magnitude_topk"
-    assert p.paper.startswith("Magnitude top-K")
+    # `paper` must declare project-original (no paper) AND cite the SE
+    # paper + official-code SHA negatively (to be explicit that neither
+    # implements this heuristic) AND name the deviation.
+    assert "project-original" in p.paper
+    assert "arXiv:2507.23279" in p.paper
+    assert "573aead3127ae593ba267758b832944f8fed1485" in p.paper
+    assert "D-magnitude-topk-candidates" in p.paper
     assert (
         p.config_key
         == "stage1_grape.super_expert_detection.magnitude_topk_per_l_layer"
