@@ -357,6 +357,12 @@ def main() -> int:
     p.add_argument("--output", default="artifacts/_shared/self_traces.jsonl")
     p.add_argument("--no-cache-suffix", action="store_true",
                    help="Skip the cache-key suffix on the output filename.")
+    p.add_argument("--resume", action="store_true",
+                   help="If a .tmp file from a prior run exists, count its "
+                        "valid rows and skip that many prompts (in deterministic "
+                        "gather order) before generating. Refuses to resume if "
+                        "the first row's prompt doesn't match the first gathered "
+                        "prompt (seed / prompt-source drift detected).")
     args = p.parse_args()
 
     # Determinism: teacher.generate(do_sample=False) is greedy → deterministic
@@ -409,13 +415,63 @@ def main() -> int:
         d: f"{c} ({c / total_p:.1%})" for d, c in sorted(domain_counts.items())
     })
 
+    # --- Crash recovery via --resume -------------------------------------
+    # If a .tmp file from a prior run exists, count its valid rows and skip
+    # that many prompts. Determinism guarantees the gather order matches the
+    # prior run (same seed + same prompt source); we sanity-check by
+    # comparing the .tmp's first user-prompt against prompts[0] and refuse
+    # to resume if they differ.
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    already_done = 0
+    if args.resume and tmp_path.exists():
+        log.info("resume: scanning existing .tmp at %s ...", tmp_path)
+        first_existing_prompt = None
+        with tmp_path.open("r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    log.warning("resume: malformed JSONL at line %d — stopping "
+                                "the resume scan here (%d valid rows so far).",
+                                i + 1, already_done)
+                    break
+                if not row.get("messages"):
+                    continue
+                if first_existing_prompt is None:
+                    first_existing_prompt = row["messages"][0].get("content")
+                already_done += 1
+        if already_done > 0:
+            if first_existing_prompt != prompts[0][0]:
+                log.error(
+                    "resume: .tmp's first user-prompt does NOT match the first "
+                    "gathered prompt under the current seed/source. The prompt "
+                    "stream has drifted since the prior run — refusing to mix "
+                    "runs silently. Delete %s and start fresh, or restore the "
+                    "prior seed / --prompts source.", tmp_path,
+                )
+                return 1
+            log.info("resume: %d valid rows in .tmp; skipping first %d of %d "
+                     "gathered prompts.", already_done, already_done, len(prompts))
+            prompts = prompts[already_done:]
+            if not prompts:
+                log.info("resume: .tmp already contains all %d prompts — "
+                         "promoting %s → %s and exiting cleanly.",
+                         already_done, tmp_path, out_path)
+                os.replace(tmp_path, out_path)
+                return 0
+    elif tmp_path.exists() and not args.resume:
+        log.warning("existing .tmp at %s will be OVERWRITTEN (--resume not set). "
+                    "Pass --resume to recover its rows instead.", tmp_path)
+
     model, tokenizer = _load_teacher(
         args.teacher, args.teacher_revision, args.load_in_4bit,
     )
 
-    n_written = 0
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
+    # Open in append mode when resuming with rows already present, else
+    # write/truncate. The os.replace at the end gives an atomic rename.
+    mode = "a" if already_done > 0 else "w"
+    n_new = 0
+    with tmp_path.open(mode, encoding="utf-8") as f:
         for row in _generate_traces(
             model, tokenizer, prompts,
             batch_size=args.batch_size,
@@ -423,9 +479,11 @@ def main() -> int:
         ):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
-            n_written += 1
+            n_new += 1
+    n_total = already_done + n_new
     os.replace(tmp_path, out_path)
-    log.info("wrote %d traces -> %s", n_written, out_path)
+    log.info("wrote %d traces (%d resumed + %d new) -> %s",
+             n_total, already_done, n_new, out_path)
     return 0
 
 
