@@ -1,9 +1,39 @@
-"""EoRA input load (S4-2 of the Stage 4 plugin-architecture refactor).
+"""EoRA inputs loader — A-cov + Stage 3 originals + ranks snapshot.
 
-Home of the ``EoraInputsPlugin``, which owns the EoRA ``load_eora_inputs``
-phase: the A-covariance / Stage-3 originals load, the file-deleted
-double-widen guard, the ``stage3_ranks`` snapshot, and the crash-resume
-partial-directory setup.
+Paper
+-----
+"EoRA: Eigenspace Low-Rank Approximation for Post-Training Compression
+of LLMs" — arXiv:2410.21271. Algorithm 1 reads the input
+auto-covariance ``A = X̃^T X̃`` and the factorization residual
+``ΔW = W_orig − Ŵ`` (where ``Ŵ`` is the post-Stage-3 factored
+expert), then computes the √Λ-scaled eigenspace projection of ΔW
+and back-projects a rank-r correction.
+
+This plugin owns the **inputs** half of the Stage 4 pipeline: load
+the post-Stage-3 A-covariance (reusing the Stage 2 covariance sidecar
+``_stage2_input_covariance.pt`` per D-drank-premerge-A — consumed at
+:mod:`stage3.plugins.d_rank_allocate`), load the Stage 3 ranks
+sidecar (``rank_map.json``) for snapshot, and set up the crash-resume
+partial directory.
+
+The compensation half (the per-(layer, expert) residual SVD and
+factor widening) lives at
+:mod:`stage4.plugins.eora_compensation`.
+
+Official code
+-------------
+``NVlabs/EoRA`` @ commit
+``6a42e2edcc7559422d14ccf79b0105b2d8a78c76`` (2026-04-21) —
+github.com/NVlabs/EoRA. Reference implementation for the
+√Λ-eigenspace projection + correction.
+
+Naming-history note
+-------------------
+"S4-2" / "load_eora_inputs phase" are stage-naming-historical. The
+current plugin architecture has no phase taxonomy; new prose drops
+the labels. Existing log lines / Trackio keys preserved.
+
+Original module header retained:
 
 S4-2 deviates from the verbatim-relocation pattern of S3-2/S3-3. The three
 pieces this plugin covers — the A-cov / originals load, the file-deleted
@@ -71,8 +101,10 @@ class EoraInputsPlugin:
 
     name = "eora_inputs"
     paper = (
-        "EoRA residual compensation — √Λ-scaled eigenspace projection of the "
-        "factorization residual ΔW (paper 2410.21271, Algorithm 1)."
+        "EoRA inputs loader (Algorithm 1 prereqs) — arXiv:2410.21271 "
+        "(NVlabs/EoRA @ 6a42e2edcc7559422d14ccf79b0105b2d8a78c76). "
+        "Loads post-Stage-3 A-cov + Stage 3 originals + ranks snapshot. "
+        "See module docstring."
     )
     config_key = "stage4_eora.compensation_budget_pct"
     reads: tuple[str, ...] = (

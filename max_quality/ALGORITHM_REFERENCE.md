@@ -311,59 +311,12 @@ Same step-boundary checkpointing as Stage 5, under `_stage2p5_partial/`.
 
 ---
 
-## 7. Stage 4 — EoRA Residual Compensation
-
-**File:** [`stage4_eora.py`](src/moe_compress/stage4_eora.py)
-**Paper:** EoRA: Training-Free Compensation for Compressed LLMs (2410.21271), Algorithm 1
-**Hardware:** H200. One calibration forward pass to collect per-expert input activation samples `X̃_expert ∈ ℝ^{N_e × d_in}` (rows = per-token activations for tokens routed to expert e). FactoredExperts model stays resident from Stage 3; `_stage3_original_weights.pt` remains in CPU RAM.
-
-### What
-
-For each factored expert matrix, computes the residual `ΔW = W_original − U·V` and adds a rank-r correction that concentrates on the **most important input directions** (as measured by the eigenspectrum of the per-expert input Gram matrix `X̃^T X̃`). The correction is appended to the existing factored representation by widening U and V along the rank dimension.
-
-**Convention:** `X̃ ∈ ℝ^{N × d_in}` is token-major (rows = per-token activation samples for tokens routed to this expert during one calibration pass). `A = X̃^T X̃ ∈ ℝ^{d_in × d_in}` is the (un-normalized) input Gram matrix; its rank is at most `min(N, d_in)` and in practice is bounded by the number of routed tokens collected for the expert. Paper §3 (line 183) states "the average of the input activations over the calibration set"; this average is by construction rank-1 (a single d_in-vector). The spec deliberately reinterprets X̃ as the multi-sample stack ∈ ℝ^{N_e × d_in} so that A = X̃^T X̃ has rank ≤ min(N_e, d_in) (D10 deviation), restoring meaning to rank-128 corrections matching the paper's experimental results.
-
-Note on notation: §7 Step 7's "B·A" uses the paper's EoRA Algorithm 1 step 7 convention where A is the EoRA correction-factor matrix V_corr (see Step 5), distinct from the Gram matrix A = X̃^T X̃ defined above. Both follow paper notation; rename to G for the Gram in mental models if needed.
-
-### Why
-
-EoRA recovers quality lost to rank truncation in Stage 3. The paper reports +10.84pp ARC-C on LLaMA3-8B (GPTQ-3-bit-class quantization residuals; Stage 3 SVD residuals at moderate ρ are several orders of magnitude smaller — uplift not directly portable to our BF16 pipeline; cited only as magnitude context for the method's ceiling on heavily-corrupted weights). The key innovation over naive SVD of the residual is the √Λ-weighted eigenspace projection, which concentrates the correction rank budget on directions the model actually uses.
-
-### How — Paper Algorithm 1
-
-For each (layer, expert, matrix):
-
-1. **Residual:** `ΔW = W_orig − U_old · V_old` — shape `[d_out × d_in]`
-
-2. **Build input Gram matrix and eigendecompose:** For each (layer, expert), collect the per-token activation samples `X̃_expert ∈ ℝ^{N_e × d_in}` for tokens routed to expert `e` during the calibration pass. Form the input Gram matrix `A = X̃_expert^T X̃_expert`, shape `[d_in × d_in]`, with rank up to `min(N_e, d_in)`. Eigendecompose: `A = Q Λ Q^T`. Sort eigenvalues in descending order and keep `n_keep = |{j : λ_j > τ_floor}|` eigenpairs, where `τ_floor` is a dtype-aware noise-floor threshold (relative to `λ_1`). Under typical calibration volumes (`N_e ≫ 128`), `n_keep` is bounded by the noise floor and routing volume; the rank cap then clamps `take_eff` (Step 5) below `n_keep` rather than vice-versa. Small-eigenvalue directions discarded by the floor are noise-dominated activation modes. (See D10 / D-S-H-1: under the multi-sample reading the importance signal is the full eigenspectrum of `X̃^T X̃`, weighting each eigendirection by its activation energy `λ_j`.)
-
-3. **√Λ-scaled projection:** `Q' = Q_keep · √Λ_keep` — shape `[d_in × n_keep]`. This is the **full** signal eigenspace, NOT truncated to `r`. The √Λ scaling importance-weights each direction by its activation variance.
-
-4. **Full projection:** `ΔW' = ΔW · Q'` — shape `[d_out × n_keep]`
-
-5. **Rank-r SVD:** `SVD(ΔW') → U', Σ', V'^T`. Take top `take_eff = min(r, min(d_out, n_keep))`, where `r = min(rank_budget, eigenspace_rank_cap)` is the per-matrix EoRA rank from the budget step. Under the multi-sample reading the rank cap is operative: `n_keep` typically exceeds 128, so `take_eff` is set by `r` (and ultimately by `eigenspace_rank_cap`) rather than collapsing to 1.
-
-6. **Correction factors:**
-   - `U_corr = U'[:, :take_eff] · Σ'[:take_eff]` — shape `[d_out × take_eff]`
-   - `V_corr = V'^T[:take_eff] · (√Λ_keep)⁻¹ · Q_keep^T` — shape `[take_eff × d_in]` (back-projected to original weight space)
-
-7. **Widen:** `new_U = [U_old | U_corr]`, `new_V = [V_old; V_corr]` — algebraically equivalent to `Ŵ·x + B·A·x` (paper Algorithm 1 step 7; Eq. 4 of the paper consolidates `B·A` into a single `B′`), where `B = U_corr` and `A = V_corr` are the EoRA correction factors appended to the existing factorization.
-
-### Budget
-
-`compensation_budget_pct=3%` of Stage 3 per-matrix parameter savings (project-chosen: 3% empirically selected to keep Stage 4's parameter footprint small relative to Stage 3 savings; **not from paper** — see D-eora-budget-pct), capped at `eigenspace_rank_cap=128` rank per expert. Rank 128 is a common reporting rank in the EoRA paper (Tables 2–3) and lies within the paper's evaluated range {64, 128, 256, 512}; it is a project choice from the paper's range, not a unique "paper default".
-
-### Correctness Notes
-
-- The √Λ scaling is the **core** innovation of EoRA. Without it, the algorithm degenerates toward ZeroQuant-V2 (plain SVD on ΔW with no activation weighting) — Act-S is a separate method that uses per-channel L1-magnitude diagonal scaling, unrelated to eigenvector projection.
-- Pre-truncating to `r` eigenvectors before SVD (the previous bug) eliminates the joint optimization that makes EoRA better than Act-S. The SVD must operate on the full `[d_out × n_keep]` projected error to optimally select the best `r` directions.
-- The back-projection `V_corr = (V'^T · (√Λ)⁻¹) · Q^T` is critical — without the `(√Λ)⁻¹` term, the correction adapter operates in eigenspace rather than weight space, and the errors compound.
-
-### Resume
-
-Per-layer atomic checkpointing to `_stage4_partial/layer_{layer_idx}.pt` (format_version=1). Each checkpoint contains the full FactoredExperts U/V state, ranks, effective ranks, and parameter counts. On resume, completed layers are loaded directly; failed layers re-run from the Stage 3 output.
-
-Stage 4 is the final consumer of both `_stage3_original_weights.pt` (Step 1, residual) and `_stage2_input_covariance.pt` (Step 2, input Gram for the √Λ projection); both are deleted on Stage 4 success. They remain durable on their per-stage Hub repos (`<base>-stage2`, `<base>-stage3`); on-bucket retention only inflates the entrypoint's job-exit aux upload to the aggregate result repo. On Stage 4 failure both are kept so a re-run can pick up cleanly.
+<!-- §7 Stage 4 (EoRA Residual Compensation) — CONSUMED by
+     stage4/plugins/* (commits pending). Full §7 narrative —
+     paper (EoRA arXiv:2410.21271), hardware framing, Algorithm 1
+     description, multi-sample X̃ reading, deviations D10 +
+     D-eora-budget-pct, and resume narrative — all relocated
+     into the per-plugin module docstrings under stage4/plugins/. -->
 
 ---
 
@@ -702,8 +655,8 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 <!-- D7a — CONSUMED by stage3/plugins/d_rank_allocate.py (commit pending). -->
 <!-- D8 — CONSUMED by stage3/plugins/swift_svd_alpha.py (commit pending). -->
 <!-- D-eps-star — CONSUMED by stage3/plugins/swift_svd_alpha.py (commit pending). -->
-| D10 | 4 | Eigenspace noise-floor truncation | 2410.21271 Alg. 1: full Q ∈ ℝ^{k×k} used; QQ^T = I guarantees Theorem 1 exactness | Multi-sample reading: `X̃ ∈ ℝ^{N×d_in}` is the matrix of per-token activation samples for tokens routed to the expert, so `A = X̃^T X̃ ∈ ℝ^{d_in × d_in}` has rank ≤ min(N, d_in) (typically ≫ 1 under our calibration volume). The noise-floor threshold keeps only eigenvalues above a dtype-aware floor; small-eigenvalue directions below the floor are discarded. | This is a **real, deliberate deviation** from Theorem 1 exactness — not exact. When A has rank > 1, noise-floor truncation discards small-eigenvalue directions (noise-dominated activation modes). The discarded **activation-weighted reconstruction-error component** is upper-bounded by `‖ΔW‖_2^2 · Σ_{j > n_keep} λ_j` (where `ΔW = W_orig − Ŵ`). (Loewner-trace majorant: the discarded contribution to tr(ΔW · A_tail · ΔW^T) is bounded by ‖ΔW‖_2^2 · Σ_{j > n_keep} λ_j where A_tail = Σ_{j > n_keep} λ_j q_j q_j^T.) For the eigendirections kept, Theorem-1-style exactness holds in the kept subspace. This residual is dominated by Stage 3 SVD residual / quantization residual at moderate-to-high compression ratios. The trade-off is intentional — preserving every tiny eigendirection would waste rank budget on noise; the rank cap (`eigenspace_rank_cap=128`) further bounds `take_eff` so the correction concentrates on the highest-energy directions. See §7 Step 2 and the D-S-H-1 / Stage 4 spec rewrite (2026-05-06) for resolution of the prior rank-1 framing. |
-| D-eora-budget-pct | 4 | EoRA per-matrix rank budget = 3% of Stage 3 savings | 2410.21271: paper sweeps fixed correction ranks {64, 128, 256, 512} per matrix in its experiments; no "% of savings" rule | `compensation_budget_pct=3%` of Stage 3 per-matrix parameter savings, then capped at `eigenspace_rank_cap=128` rank | Project-chosen, **not from paper**. 3% empirically selected to keep Stage 4's added parameter footprint small relative to Stage 3 savings (net compression remains favorable while still recovering quality on the most-truncated matrices). The cap at 128 keeps per-matrix EoRA rank within the paper's evaluated range {64, 128, 256, 512}. *TODO: ablate 1% / 3% / 5% once Stage 6 evals are available.* |
+<!-- D10 — CONSUMED by stage4/plugins/eora_compensation.py (commit pending). -->
+<!-- D-eora-budget-pct — CONSUMED by stage4/plugins/eora_compensation.py (commit pending). -->
 | D11 | 2, 2.5, 5 | Calibration data source | 2603.02217 §F.3 Table 1: c4; 2510.13999 §4: c4 + evol-codealpaca (used identically across all experiments) | Multi-domain Nemotron-Cascade-2-SFT-Data with weighted subsets (chat 0.56, math 0.21, science 0.11, etc.) | Task-aware calibration better matches target deployment distribution; c4 and evol-codealpaca are general pre-training / instruction-tuning data with limited reasoning/code coverage relative to the target deployment mix |
 | D-cal-size | 2 | Calibration sequence count | 2604.04356 §4: 3072 sequences × 512 tokens (1.57M tokens total); 2510.13999: 1024 sequences × 2048 tokens (2.1M tokens total) | 4000 sequences × 2048 tokens (8.19M tokens total) (Nemotron weighted subsets) | Exceeds both papers' calibration volumes (5.2× REAM in tokens, 3.9× REAP in tokens); longer 2048-token sequences match the deployment context length and capture more inter-token routing patterns per sequence. Task-aware Nemotron dataset documented in D11 |
 <!-- D-aimer-cross-check — CONSUMED by stage1/plugins/aimer.py (commit pending). -->

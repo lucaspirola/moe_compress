@@ -1,10 +1,97 @@
-"""EoRA residual compensation (S4-3 of the Stage 4 plugin-architecture refactor).
+"""EoRA per-layer residual compensation kernel (Algorithm 1).
 
-Home of the ``EoraCompensationPlugin``, which owns the EoRA per-layer
-``compensate_layer`` phase: the per-matrix compensation-budget calculation,
-the per-expert ``_compute_eora_factors`` loop, the in-process double-widen
-``assert``, the ``FactoredExperts.widen_rank`` call, the trackio emit, and the
-per-layer crash-resume spill.
+Paper
+-----
+"EoRA: Eigenspace Low-Rank Approximation for Post-Training Compression
+of LLMs" — arXiv:2410.21271 (NVlabs).
+audit/spec_compliance/01_papers/2410.21271/source.md.
+
+Algorithm 1 (the EoRA kernel): given a factorization residual
+``ΔW = W_orig − Ŵ`` (where ``Ŵ = U · V`` is the post-Stage-3 factored
+expert), compute the activation-weighted eigenspace correction by:
+
+  1. Eigendecompose the input auto-covariance ``A = Q Λ Q^T``.
+  2. Project the residual onto the eigenbasis: ``ΔW' = ΔW · Q · √Λ``.
+  3. Rank-r SVD of ``ΔW'`` (where r is the EoRA budget for this matrix).
+  4. Back-project the rank-r left+right factors through ``Q · √Λ⁻¹``.
+  5. **Widen** the FactoredExperts ``U / V`` slots by appending the
+     correction columns.
+
+Theorem 1 guarantees exactness if Q is full (``QQ^T = I``). See
+deviation D10 below for the noise-floor truncation that takes the
+implementation slightly off the exact Theorem-1 path.
+
+Official code
+-------------
+``NVlabs/EoRA`` @ commit
+``6a42e2edcc7559422d14ccf79b0105b2d8a78c76`` (2026-04-21) —
+github.com/NVlabs/EoRA. Reference implementation for the √Λ-eigenspace
+projection + correction.
+
+Deviation: D10 — Eigenspace noise-floor truncation
+--------------------------------------------------
+Paper Algorithm 1 uses the full ``Q ∈ ℝ^{k×k}``; ``QQ^T = I``
+guarantees Theorem 1 exactness.
+
+This plugin's reading: ``X̃ ∈ ℝ^{N×d_in}`` is the matrix of per-token
+activation samples for tokens routed to the expert, so
+``A = X̃^T X̃ ∈ ℝ^{d_in × d_in}`` has rank ≤ ``min(N, d_in)``
+(typically ≫ 1 under the project's calibration volume). The
+noise-floor threshold keeps only eigenvalues above a dtype-aware
+floor; small-eigenvalue directions below the floor are discarded.
+
+This is a **real, deliberate deviation** from Theorem 1 exactness —
+not exact. When A has rank > 1, noise-floor truncation discards
+small-eigenvalue directions (noise-dominated activation modes). The
+discarded **activation-weighted reconstruction-error component** is
+upper-bounded by ``‖ΔW‖_2² · Σ_{j > n_keep} λ_j`` (where
+``ΔW = W_orig − Ŵ``). Loewner-trace majorant: the discarded
+contribution to ``tr(ΔW · A_tail · ΔW^T)`` is bounded by
+``‖ΔW‖_2² · Σ_{j > n_keep} λ_j`` where
+``A_tail = Σ_{j > n_keep} λ_j · q_j q_j^T``. For the eigendirections
+kept, Theorem-1-style exactness holds in the kept subspace.
+
+This residual is dominated by Stage 3 SVD residual / quantization
+residual at moderate-to-high compression ratios. The trade-off is
+intentional — preserving every tiny eigendirection would waste rank
+budget on noise; the rank cap (``eigenspace_rank_cap = 128``) further
+bounds ``take_eff`` so the correction concentrates on the
+highest-energy directions.
+
+Deviation: D-eora-budget-pct — 3 % of Stage 3 per-matrix savings
+----------------------------------------------------------------
+Paper sweeps fixed correction ranks ``{64, 128, 256, 512}`` per
+matrix in its experiments; no "% of savings" rule.
+
+This plugin uses ``compensation_budget_pct = 3 %`` of Stage 3
+per-matrix parameter savings, then caps at
+``eigenspace_rank_cap = 128`` rank. Project-chosen, **not from
+paper**. 3 % empirically selected to keep Stage 4's added parameter
+footprint small relative to Stage 3 savings (net compression remains
+favorable while still recovering quality on the most-truncated
+matrices). The cap at 128 keeps per-matrix EoRA rank within the
+paper's evaluated range ``{64, 128, 256, 512}``.
+
+(*TODO: ablate 1 % / 3 % / 5 % once Stage 6 evals are available.*)
+
+Activation-cov reuse
+--------------------
+This plugin reads the **post-merge** A-covariance from Stage 2's
+sidecar. The "pre-merge A on post-merge weights" mismatch documented
+under D-drank-premerge-A (consumed at
+:mod:`stage3.plugins.d_rank_allocate`) is intentionally absorbed
+here: the EoRA √Λ projection is computed on the **post-merge** A
+re-collected for Stage 4, so the activation-aware projection sees
+the true post-merge distribution.
+
+Naming-history note
+-------------------
+"S4-3" / "Phase D" (legacy Stage 4 monolith terminology) are
+naming-historical. The current plugin architecture has no phase
+taxonomy; new prose drops the labels. Existing log lines / Trackio
+keys preserved for dashboard back-compat.
+
+Original module header retained:
 
 S4-3 is a MIXED relocation — it has three parts:
 
@@ -224,10 +311,11 @@ class EoraCompensationPlugin:
 
     name = "eora_compensation"
     paper = (
-        "EoRA residual compensation — √Λ-scaled eigenspace projection of the "
-        "factorization residual ΔW, rank-r SVD of the full projected error, "
-        "back-projected widen of FactoredExperts U/V (paper 2410.21271, "
-        "Algorithm 1)."
+        "EoRA Algorithm 1 residual compensation — arXiv:2410.21271 "
+        "(NVlabs/EoRA @ 6a42e2edcc7559422d14ccf79b0105b2d8a78c76). "
+        "Deviations: D10 (eigenspace noise-floor truncation — bounded "
+        "by ‖ΔW‖_2²·Σ_{j>n_keep} λ_j), D-eora-budget-pct (3% of Stage 3 "
+        "per-matrix savings, cap rank=128). See module docstring."
     )
     config_key = "stage4_eora.compensation_budget_pct"
     # ``compensate_layer`` runs inside a per-layer scope: it reads the layer
