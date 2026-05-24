@@ -12,10 +12,12 @@ nitpick fix below):
   spectrum of ``S_g · W_g``.
 - Eq. 2 — effective rank ``R_eff(g) = exp(-Σ p log p)`` (exp-Shannon-
   entropy of the Eq. 1 distribution).
-- §3.2.1 prose (L575): ``S_g`` is defined implicitly via
+- §3.2 prose (L575): ``S_g`` is defined implicitly via
   ``S S^T = cholesky(X^T X)`` from the group input activations ``X``
   (FP64 in this implementation — see D-fp64-mixed below). This is
-  paper *prose*, not an indexed equation.
+  paper *prose*, not an indexed equation. The L575 line sits in
+  §3.2.2 "RANK ALLOCATION VIA LAGRANGE MULTIPLIERS", not §3.2.1
+  (which spans paper lines L396-L451).
 - Eq. 7 (rank budget allocation): in the paper, ``ω = d₁ + n · d₂``
   where ``d₁`` is the shared dimension across layers in the group and
   ``d₂`` the non-shared dimension; D-Rank targets shared-basis layer
@@ -116,10 +118,19 @@ groups is moderate — within a single layer, gate/up/down typically
 share ``n_experts``, and ``(d_out + d_in)`` varies by a small constant
 factor (e.g. ``d_in_down = d_ff`` vs ``d_in_gate = d_model``). The
 post-correction redistribution loop (lines marked "Correction:" in
-``_d_rank_allocate``) absorbs the discretization residual back into
-``T_budget_params`` conservation, so the *total* parameter count
-remains on-target; only the per-group split shifts slightly relative
-to the paper-exact formula.
+``_d_rank_allocate``) conserves the **rank** sum (``Σ_g k_g = T_budget``,
+up to a residual bounded by the per-group caps), NOT the parameter
+sum. When ``ω_g`` varies across groups, the total reconstructed
+parameter count ``Σ_g k_g · ω_g`` therefore drifts away from the
+target ``T_budget_params``. The drift is bounded: each ±1 rank unit
+exchanged between two groups ``g, h`` shifts the parameter total by
+``|ω_g - ω_h|``, so the worst-case total drift is bounded by
+``G · max_g ω_g`` for ``G`` groups (with ``G ≈ n_layers × 3`` for
+gate/up/down across MoE layers). Empirically the observed drift on
+ZAYA1-8B / Qwen3-30B-A3B is a few percent of the target params budget
+— small enough to ignore against the per-group rank reshuffle (which
+the rank-conservation loop already smooths over) and the discretization
+error from ``int(round(…))``.
 
 This deviation is INTENTIONAL and predates the audit: the avg_cost
 preconditioning makes ``T_budget`` interpretable as a rank-units
@@ -139,7 +150,9 @@ rank is computed from the SVD of the *single* concatenated matrix
 ``S_g · [W_1 | W_2 | … | W_n]``.
 
 This plugin instead computes per-expert SVDs and element-wise averages
-the singular-value vectors (``_group_stat`` L195-211)::
+the singular-value vectors (the per-expert ``svdvals`` loop inside
+``_group_stat`` that builds ``svs`` and then takes
+``torch.stack(svs).mean(0)``)::
 
     for e in range(n_experts):
         s_e = svdvals(L_A @ W_e.T)          # per-expert spectrum
@@ -180,10 +193,11 @@ Deviation: D-drank-fp64-mixed — FP64 Cholesky, FP32 SVD
 --------------------------------------------------------
 Paper §3.2 (L575) specifies ``S S^T = cholesky(X^T X)``; precision is
 not explicitly nailed down in the paper. This plugin uses FP64
-arithmetic for the Cholesky factorization (``A64 = A_g.to(float64)``;
-``torch.linalg.cholesky(A64 + jitter)`` — line 189), then immediately
-casts ``L_A`` back to FP32 (``.to(torch.float32)``) before forming
-``L_A @ W.T`` and calling ``torch.linalg.svdvals``.
+arithmetic for the Cholesky factorization (``A64 = A_g.to(float64)``,
+followed by the ``torch.linalg.cholesky(A64 + jitter)`` call in
+``_group_stat``), then immediately casts ``L_A`` back to FP32
+(``.to(torch.float32)``) before forming ``L_A @ W.T`` and calling
+``torch.linalg.svdvals``.
 
 Rationale: ``A_g = X^T X`` is the dominant numerical risk — it
 squares the activation dynamic range and can produce near-singular
@@ -196,8 +210,10 @@ Documented for spec-compliance; no refactor planned.
 
 Deviation: D-drank-symmetrize-A — explicit symmetrization of A_g
 -----------------------------------------------------------------
-Line 186: ``A64 = 0.5 * (A64 + A64.T)``. Paper §3.2 specifies
-``X^T X`` which is symmetric by construction. In practice, the
+The ``A64 = 0.5 * (A64 + A64.T)`` symmetrization line in
+``_group_stat`` (immediately after the FP64 cast and before the
+jitter+Cholesky call). Paper §3.2 specifies ``X^T X`` which is
+symmetric by construction. In practice, the
 Stage 2 covariance accumulator (``_stage2_input_covariance.pt``) is
 accumulated in bf16 / fp32 across many micro-batches and the
 asymmetry-in-the-LSBs can be of order ``1e-6`` of the diagonal —
@@ -207,7 +223,9 @@ does not change the underlying mathematics (``A^T = A`` exactly).
 
 Deviation: D-drank-cholesky-jitter — diagonal jitter
 -----------------------------------------------------
-Line 187-188: ``jitter = 1e-6 * A64.diag().mean().clamp_min(1e-12) * I``.
+The ``jitter = 1e-6 * A64.diag().mean().clamp_min(1e-12) * I``
+expression in ``_group_stat`` (built immediately before being added
+to ``A64`` inside ``torch.linalg.cholesky``).
 Paper §3.2 assumes ``X^T X`` is PD; the implementation adds a small
 diagonal regularizer to handle two edge cases:
 
@@ -388,8 +406,10 @@ def _pad(x: torch.Tensor, n: int) -> torch.Tensor:
     # Singular-value vector length normalizer for the mean-of-spectra
     # aggregation in ``_group_stat`` (see D-drank-mean-spectra).
     #
-    # Reachability note: at the sole live call site (line 207 of
-    # ``_group_stat``), ``torch.linalg.svdvals(M)`` returns exactly
+    # Reachability note: at the sole live call site (the
+    # ``svs.append(_pad(s, min(d_out, d_in)))`` line inside the
+    # per-expert loop of ``_group_stat``), ``torch.linalg.svdvals(M)``
+    # returns exactly
     # ``min(M.shape) = min(d_out, d_in)`` values and ``n = min(d_out, d_in)``,
     # so ``x.numel() == n`` always holds — the function reduces to an
     # identity slice ``x[:n]`` on every live call. The truncation branch
@@ -460,10 +480,12 @@ def _d_rank_allocate(
         # ``min(d_out, d_in)`` is the full-rank ceiling — assigning ``k_g`` at
         # the full ceiling means the rank-``k`` SVD reconstruction is exact
         # (no compression), making the (U @ V^T) factorization parameter-
-        # *equal* to the original weight (``k(d_out+d_in) >= d_out·d_in`` when
-        # ``k = min(d_out, d_in)`` and ``max(d_out, d_in) >= d_out+d_in`` —
-        # i.e. there is no actual compression at the ceiling and often a
-        # parameter *increase* for non-square matrices). The ``- 1`` floor
+        # *equal-or-worse* relative to the original weight: with
+        # ``k = min(d_out, d_in)`` we get ``k(d_out + d_in) >= d_out · d_in``
+        # (since ``k = min`` and ``d_out + d_in >= max(d_out, d_in)`` ⇒
+        # ``k(d_out+d_in) >= min·max = d_out·d_in``). I.e. there is no
+        # actual compression at the ceiling, and a parameter *increase*
+        # for non-square matrices. The ``- 1`` floor
         # guarantees that every group is at least marginally compressed,
         # which is a precondition for the residual-redistribution loop below
         # to terminate (otherwise an under-allocated diff could chase a cap
