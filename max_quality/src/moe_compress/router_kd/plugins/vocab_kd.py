@@ -82,19 +82,39 @@ def _chunked_vocab_kl(
       Peak intermediate per chunk ≈ 4 × 128 × 150K × 4 bytes ≈ 300 MB
       vs ≈1.2 GB for the full sequence at L=512.
 
-    Returns scalar loss = (τ²/N_tokens) × Σ_t KL(teacher_t ‖ student_t).
+    Returns scalar loss = (τ²/N_x) × Σ_t KL(teacher_t ‖ student_t).
 
-    Note: n_tokens = B × (L−1) is the per-position-mean denominator (paper
-    Eq. 3's N_x for fully-packed sequences with no padding).
+    Note: ``n_tokens = B × student_logits.shape[1]`` is the per-position-mean
+    denominator (paper Eq. 3's ``N_x`` for fully-packed sequences). The caller
+    is responsible for the causal shift ``[:, :-1, :]``, so under the packed
+    invariant this equals ``B × (L−1)``.
 
-    ASSUMPTION: fully-packed sequences (no padding) — see spec §8 N_x note.
-    Under this invariant, paper Eq. 3's mask `m_{t+1}=1` everywhere and
-    `N_x = Σ_t m_{t+1} = B × (L−1) = n_tokens`, so the `+ ε` zero-mask
-    safety constant from paper Eq. 3 is unnecessary. If a future calibration
-    source ever introduces padding, this normalization (and the `+ ε`) must
-    be revisited.
+    ASSUMPTION: fully-packed sequences (uniform length, no padding) — see
+    spec §8 N_x note. A ``torch._assert`` at function entry enforces this on
+    every call so any future padded caller fails loudly instead of silently
+    over-counting tokens.
+
+    Deviations from paper Eq. 3 (L764–768):
+      (a) No per-position mask ``m_{t+1}``. Under the fully-packed invariant
+          ``m_{t+1}=1`` everywhere, so ``Σ_t m_{t+1} = n_tokens`` and the
+          mask multiplier collapses to a no-op.
+      (b) No additive ``+ ε`` in ``N_x``. The paper's ``ε`` guards an empty
+          mask (``Σ m = 0`` → divide-by-zero). With ``n_tokens > 0``
+          enforced by the packed invariant (and a tensor-shape assert), ``ε``
+          is redundant. ``max(n_tokens, 1)`` is kept as a defensive belt.
+    If a future calibration source ever introduces padding, both deviations
+    must be revisited (mask reintroduced, ``ε`` reinstated).
     """
     B, L, V = student_logits.shape
+    # Enforce the fully-packed invariant (L1): teacher must match student
+    # shape (same B, L, V) AND L > 0. Tensor-shape equality is sufficient
+    # because both come from the same forward pass on the same packed batch.
+    torch._assert(
+        teacher_logits.shape == student_logits.shape,
+        "vocab_kd: teacher/student logits shape mismatch — fully-packed "
+        "invariant violated; reintroduce mask `m_{t+1}` and ε in N_x.",
+    )
+    torch._assert(L > 0, "vocab_kd: empty sequence dim — N_x would be 0.")
     total_kl = torch.zeros((), device=student_logits.device, dtype=torch.float32)
     n_tokens = 0
     for start in range(0, L, chunk_size):
@@ -104,7 +124,9 @@ def _chunked_vocab_kl(
         t_p = F.softmax(t_chunk / temperature, dim=-1)
         s_lp = F.log_softmax(s_chunk / temperature, dim=-1)
         chunk_kl = F.kl_div(s_lp, t_p, reduction="none").sum(dim=-1)  # [B, chunk_len]
-        total_kl = total_kl + chunk_kl.sum()
+        # N4: explicit fp32 sum — chunk_kl may be bf16; upcast before reduce
+        # to avoid bf16 accumulation rounding before the final divide.
+        total_kl = total_kl + chunk_kl.float().sum()
         n_tokens += chunk_kl.numel()
         del t_p, s_lp, chunk_kl  # free intermediates eagerly
     return (total_kl / max(n_tokens, 1)) * (temperature ** 2)
