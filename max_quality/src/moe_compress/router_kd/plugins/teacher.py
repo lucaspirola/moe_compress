@@ -5,9 +5,9 @@ Paper
 Hyeon & Do, "Is Retraining-Free Enough? The Necessity of Router
 Calibration for Efficient MoE Compression" — arXiv:2603.02217 (§5
 Eq. 1 — teacher θ_T = original uncompressed MoE; Eq. 3 — token-level
-KL with padding mask m_{t+1}; §F.3 Table 1 — shared Router-KD
-hyperparameters: c4, epochs=1, batch=2, grad-accum=4, lr=5e-5, seq=512,
-τ=1.0, samples=3000). audit/spec_compliance/01_papers/2603.02217/source.md.
+KL with padding mask m_{t+1}; §F.3 Table 1 (source.md L3577-3594) —
+shared Router-KD hyperparameters: c4, epochs=1, batch=2, grad-accum=4,
+lr=5e-5, seq=512, τ=1.0, samples=3000). audit/spec_compliance/01_papers/2603.02217/source.md.
 
 Two plugins:
 
