@@ -1,9 +1,73 @@
-"""EM refinement (Task 15 of the plugin-architecture refactor).
+"""EM-style assignment refinement (iterative re-solve under tentative merges).
 
-Home of ``_em_refine_assignment`` — the Stage 2 v2 EM refinement loop
-(spec § 5 step 4T(e) / M4) — and its helper ``_em_compute_tentative_weights``.
-Both moved verbatim out of ``stage2_reap_ream.py``; that module re-imports them
-so external callers and tests keep their existing import paths.
+Paper
+-----
+Inspiration: Sub-MoE (arXiv:2506.23266) demonstrates iterative
+refinement of K-means-style expert merging by re-running assignment
+after each tentative merge. This plugin applies the same idea to
+**capacitated assignment** (the Stage 2 v2 cost-matrix machinery).
+
+Baseline REAM (arXiv:2604.04356) and the alternative single-shot
+solvers (REAP arXiv:2510.13999, GRAPE arXiv:2604.06542) all use
+**single-shot** assignment with no iterative refinement.
+
+Official code
+-------------
+None for this specific Sub-MoE-inspired EM loop. The Sub-MoE paper
+(arXiv:2506.23266) is the conceptual reference for the
+re-assignment-after-tentative-merge pattern; the implementation in
+``_em_refine_assignment`` + ``_em_compute_tentative_weights`` is
+project-original adapted for the Stage 2 v2 capacitated-assignment
+setting.
+
+Deviation: D-em-refinement
+--------------------------
+Stage 2 v2 adds ``em_refinement_rounds`` (default ``0``) iterations
+of:
+
+  1. Tentatively merge each non-singleton group with the current
+     assignment (no model mutation; freq-weighted weights computed
+     in-memory).
+  2. Recompute the cost matrix against the tentative merged centroids.
+  3. Re-solve the assignment.
+
+Stops early on ``em_convergence_break=True`` (default) and assignment
+stability. EM is a no-op under ``cost_alignment="pre"`` (the cheap
+symmetric cost doesn't depend on centroid weights).
+
+Why this exists
+---------------
+The merge formula is non-linear in inputs but linear in weights:
+``forward(linear_combo(W_e)) ≠ linear_combo(forward(W_e))``. After one
+merge, the centroid's weights are no longer the original — a new
+assignment under the new centroid weights may produce a lower-cost
+matching. Sub-MoE demonstrates this iterative refinement on K-means-
+style merging; the Stage 2 v2 EM round is the same idea applied to
+capacitated assignment.
+
+Cache invariant: the cached perm becomes stale under tentative
+weights, so the inner cost recomputes the perm; the cache is **not**
+updated with tentative residuals so the merge step's perm-cache reuse
+is preserved.
+
+Wiring
+------
+``EmRefinePlugin`` is LIVE as of S2-9: it is the second link of the
+``refine_assignment`` slot chain, AFTER two_opt_refine.
+
+Circular-import note: this module imports only ``pipeline.base``,
+``pipeline.context``, ``pipeline.permutation_align``,
+``pipeline.grouping``, ``pipeline.plugins.solver_dispatch``,
+``pipeline.plugins.ream_cost`` and ``moe_compress.utils.*`` — none of
+which import ``stage2_reap_ream`` or ``em_refine``. There is therefore
+no cycle at module load, and every import below is a plain module-top
+import (no function-scope late imports needed).
+
+Naming-history note
+-------------------
+"M4" is the STRATEGY_NEXT § 5 step 4T(e) label. The current plugin
+architecture has no module-letter taxonomy; new prose drops the label.
+Existing log lines / Trackio keys preserved for dashboard back-compat.
 
 EM is an iterative re-assignment refiner: each round rebuilds the current
 groups, computes tentative freq-weighted merged centroid weights, recomputes
@@ -245,7 +309,13 @@ class EmRefinePlugin:
     """
 
     name = "em_refine"
-    paper = "Stage 2 v2 EM refinement loop (spec § 5 step 4T(e) / M4)."
+    paper = (
+        "EM-style iterative re-assignment under tentative merges. "
+        "Inspired by Sub-MoE arXiv:2506.23266 (no official code). "
+        "Deviation D-em-refinement vs baseline REAM arXiv:2604.04356 "
+        "(single-shot). STRATEGY_NEXT § 5 step 4T(e) / M4. "
+        "See module docstring."
+    )
     config_key = "stage2_reap_ream.em_refinement_rounds"
     # S2-9: the live refine_assignment slot reads the per-bump scratch slots
     # the orchestrator publishes plus the per-layer cost-alignment slots.
