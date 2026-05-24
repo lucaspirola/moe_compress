@@ -1,5 +1,18 @@
 """WikiText-2 perplexity eval (S6-3 of the Stage 6 plugin-architecture refactor).
 
+Paper / dataset
+----------------
+WikiText-2 perplexity protocol — Merity et al. 2017 "Pointer Sentinel
+Mixture Models" (arXiv:1609.07843). PPL = ``exp(mean per-token NLL)``
+over the 2048-token-chunked corpus with row-join ``"\n\n"`` (project
+convention matching HF / lm-eval recipe and the imatrix calibration
+corpus build).
+
+Stage 6 implementation note: configurable ``batch_size``;
+**numerically identical to ``batch_size=1``** (no per-batch noise).
+This is the project's ``VALIDATED_STRATEGIES`` §Stage 6 Optimization
+#1.
+
 Home of the Stage 6 WikiText-2 perplexity concern, extracted from the legacy
 ``stage6_validate.py`` monolith. WikiText-2 PPL is the first sub-metric of the
 Stage 6 validation gate: standard next-token NLL → ``exp(mean_NLL)`` over the
@@ -219,11 +232,7 @@ class WikitextPplPlugin:
     """
 
     name = "wikitext_ppl"
-    paper = (
-        "WikiText-2 perplexity — Merity et al. 2016, Pointer Sentinel Mixture "
-        "Models (arXiv:1609.07843); Stage 6 validation gate, Spec §9 / "
-        "Optimization #1."
-    )
+    paper = "WikiText-2 PPL — Merity et al. 2016 arXiv:1609.07843; project batched bs-invariant. See module docstring."
     config_key = "stage6_validate.wikitext2.enabled"
     reads: tuple[str, ...] = ("model", "tokenizer", "config", "dataset_revisions")
     writes: tuple[str, ...] = ("eval_results",)
