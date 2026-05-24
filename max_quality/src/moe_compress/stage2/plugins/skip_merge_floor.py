@@ -1,10 +1,64 @@
-"""Skip-merge floor plugin (Task 12 of the plugin-architecture refactor).
+"""Skip-merge percentile-mask on the assignment cost matrix.
 
-Plugin home for Direction B — the skip-merge percentile mask. The mask logic
-itself (``_apply_skip_merge_floor``) was extracted into ``pipeline.grouping`` in
-Task 5 and stays there; T12 does not move it. This module adds the
-``SkipMergeFloorPlugin`` that *owns the live ``apply_cost_mask`` call site* in
-the decomposed phase walk.
+Paper
+-----
+**No paper.** Project-original "Direction B" mask — a per-layer
+percentile cutoff applied to the assignment cost matrix before the
+solver runs. Any candidate ``(centroid, non-centroid)`` pair whose
+cost lies above the percentile threshold is masked out (set to ``+∞``),
+forcing the solver to either find a lower-cost match or leave the
+non-centroid unassigned (orphan-singleton promotion catches that, per
+D-ream-budget-bump consumed at :mod:`stage2.plugins.layer_merge`).
+
+The baseline REAM cost (arXiv:2604.04356, see
+:mod:`stage2.plugins.ream_cost`) has no such mask.
+
+Official code
+-------------
+None — Direction B is project-original. The mask logic lives in
+:func:`stage2.grouping._apply_skip_merge_floor`.
+
+Why a percentile-mask
+---------------------
+The cost matrix's distribution is heavy-tailed at low merge budgets:
+a small fraction of ``(c, m)`` pairs have near-zero cost (genuinely
+similar experts) and the long tail represents pairs whose merge would
+materially damage the centroid. The percentile mask is a coarse
+"don't merge anything in the tail" gate — set at e.g. the 75th
+percentile, the solver is allowed to consider only the bottom-quartile
+pairs.
+
+Combined with the per-centroid cap (``max_merge_group_size``,
+D5a — consumed at :mod:`stage2.plugins.layer_merge`) and the budget
+bump loop (D-ream-budget-bump), the mask reduces the rate of
+high-cost merges in heterogeneous layers where the GRAPE budget is
+slack.
+
+Config gate: enabled iff
+``stage2_reap_ream.skip_merge_percentile < 100.0``. ``100.0`` is the
+OFF sentinel (the 100th percentile equals the max finite cost, so
+nothing is strictly above it). A missing key defaults to ``100.0`` →
+OFF.
+
+Naming-history note
+-------------------
+"Direction B" is the project's STRATEGY_NEXT label. The current plugin
+architecture has no direction-letter taxonomy; new prose drops the
+label. Existing log lines / Trackio keys are preserved for dashboard
+back-compat.
+
+Wiring status: this plugin is LIVE. ``run()`` registers it in the
+``PluginRegistry`` after the three cost plugins and before the
+``LegacyAdapter``, so when it is enabled it wins the
+``apply_cost_mask`` ``dispatch_first`` slot in ``_run_assignment``'s
+bump loop. ``registry.enabled(config)`` drops it at the OFF sentinel,
+so ``dispatch_first`` then reaches ``LegacyAdapter.apply_cost_mask`` —
+its sentinel branch returns the delta object unchanged. The monolith's
+``_em_refine_assignment`` still re-applies the floor each EM round.
+
+Circular-import note: this module imports only ``pipeline.base``,
+``pipeline.context`` and ``pipeline.grouping`` — none of which import
+``stage2_reap_ream``. No cycle at module load.
 
 Wiring status (S2-7): this plugin is now LIVE. ``run()`` registers it in the
 ``PluginRegistry`` after the three cost plugins and before the ``LegacyAdapter``,
@@ -57,7 +111,12 @@ class SkipMergeFloorPlugin:
     """
 
     name = "skip_merge_floor"
-    paper = "Direction B: skip-merge percentile mask on the cost matrix."
+    paper = (
+        "Skip-merge percentile mask (project-original; no paper). "
+        "STRATEGY_NEXT 'Direction B'. Baseline REAM cost arXiv:2604.04356 "
+        "has no such mask. Opt-in via skip_merge_percentile < 100.0. "
+        "See module docstring."
+    )
     config_key = "stage2_reap_ream.skip_merge_percentile"
     # S2-7: the live ``apply_cost_mask`` slot reads ``layer_ref`` for the
     # INFO log line emitted when entries are masked.
