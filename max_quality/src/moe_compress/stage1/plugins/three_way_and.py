@@ -34,21 +34,25 @@ Official implementation (golden reference)
 ``github.com/ZunhaiSu/Super-Experts-Profilling`` pinned to commit
 ``573aead3127ae593ba267758b832944f8fed1485`` (default branch ``main``
 HEAD, dated 2025-09-25). The criterion lives at
-``eval_utils.py:619-651`` (``_identify_super_experts``):
+``eval_utils.py:619-651`` (``_identify_super_experts``); the exact
+filter is line 642:
 
-    quantile=99.5
-    percentile = np.percentile(output_max_values, quantile)
     if item['output_max'] > percentile and \\
-       item['output_max'] > np.max(output_max_values) // times:  # times=10
+       item['output_max'] > np.max(output_max_values) // times:
+        # quantile=99.5, times=10 (defaults from the signature)
         Super_Experts.append(...)
 
-The ``// times`` integer-divide with ``times=10`` is the official
-code's encoding of the ``a_max / 10`` (equivalently ``0.1 · a_max``)
-threshold. Note: the official function operates on the **union**
-``output_max_values`` over all layers — the ``l ∈ L`` restriction is
-NOT enforced in this function; the official code applies the
-``include_layers=0.75`` depth heuristic at a different layer
-(``_super_experts_analysis``) to filter the candidate set.
+The ``// times`` integer-floor-divide with ``times=10`` is the
+official code's encoding of the paper's ``a_max / 10`` threshold.
+Note: the official function operates on the **union**
+``output_max_values`` over all layers — the ``l ∈ L`` restriction
+is NOT enforced inside ``_identify_super_experts``. The official
+pipeline instead applies an unrelated ``include_layers=0.75`` depth
+heuristic in ``_super_experts_analysis``
+(``eval_utils.py:470-479``); that heuristic filters by absolute
+layer index (``layer_index < round(total_layers * 0.75)``), not by
+``L``. The official ``L``-equivalent (the MA-formation layer set)
+does not exist as a code object — only as Algorithm 1 pseudocode.
 
 Deviations from paper
 ---------------------
@@ -66,11 +70,14 @@ pseudocode ambiguity in the paper).
 
 Implementation follows Algorithm 1 (the procedurally precise
 rendering). The §3.2.1 prose is imprecise and contradicted by the
-pseudocode. External validation: the authors' official code matches
-Algorithm 1 — confirmed against the pinned commit (``run.py:28``
-+ ``eval_utils.py:470`` apply the depth filter at the
-``_super_experts_analysis`` step, then ``_identify_super_experts``
-runs the SE criterion on the filtered set).
+pseudocode. Note: the authors' official code does NOT validate
+either reading — it uses a depth-fraction heuristic
+(``include_layers=0.75``: keep layers with
+``layer_index < round(total_layers * 0.75)``; see ``run.py:28``
+declaring the CLI arg and ``eval_utils.py:470-479`` consuming it),
+which is unrelated to the MA-formation layer set ``L`` from Stage 1.
+The plugin therefore implements the paper's Algorithm 1 directly,
+without an official-code analogue for the ``l ∈ L`` clause.
 
 **D-a-max-fraction — ``a_max_fraction`` is a configurable knob**.
 
@@ -83,6 +90,23 @@ runs the SE criterion on the filtered set).
 The knob exists so an operator can sweep ablations on the second
 SE-criterion threshold without code changes; it is not a quality
 improvement over the paper's fixed value.
+
+**D-amax-mult-real-vs-floor — real multiplication, not floor-divide**.
+
+* Paper Algorithm 1 line 28 uses real division: ``a_{l,e} > (1/10)·a_max``.
+* Official code (``eval_utils.py:642``) uses Python integer
+  floor-divide on a NumPy scalar: ``np.max(output_max_values) // 10``
+  — which produces a different threshold whenever ``a_max`` is not
+  a multiple of 10 (e.g., ``a_max=99.7`` → paper threshold 9.97,
+  official threshold 9.0; the official threshold is *looser*).
+* Implementation follows the paper: ``a_max_threshold =
+  a_max_fraction * a_max`` (real ``float`` multiplication, see
+  ``run`` below). This was a deliberate choice: the paper's
+  mathematical formulation is the authoritative specification;
+  the official-code ``//`` is an implementation accident (likely
+  a transcription bug from ``/`` → ``//``) and produces no useful
+  semantic difference for the heavy-tail regime the criterion
+  targets, but yields a stricter, paper-faithful threshold here.
 
 Output context slots
 --------------------
@@ -145,7 +169,8 @@ class ThreeWayAndPlugin:
     """Three-way AND criterion detector — paper Eq. 6 (load-bearing).
 
     See the module docstring for paper text + verified line refs +
-    official-code citation + the D-SE-A / D-a-max-fraction deviations.
+    official-code citation + the D-SE-A, D-a-max-fraction, and
+    D-amax-mult-real-vs-floor deviations.
 
     Mandatory paper criterion — :meth:`is_enabled` returns ``True``
     unconditionally; the three-way AND is the central SE-definition
@@ -174,7 +199,9 @@ class ThreeWayAndPlugin:
         "`quantile=99.5`, `times=10`). Deviations: D-SE-A (A restricted "
         "to l ∈ L per Algorithm 1; resolves a prose-vs-pseudocode "
         "ambiguity); D-a-max-fraction (the 1/10 multiplier exposed as "
-        "the `a_max_fraction` config knob, default 0.1 matches paper). "
+        "the `a_max_fraction` config knob, default 0.1 matches paper); "
+        "D-amax-mult-real-vs-floor (real `0.1 * a_max` per Algorithm 1, "
+        "not the official code's `np.max(...) // 10` floor-divide). "
         "See module docstring for full justifications."
     )
     config_key: str = "stage1_grape.super_expert_detection"  # mandatory; no flag
@@ -214,11 +241,11 @@ class ThreeWayAndPlugin:
         with tag ``"phase_c"``.
 
         Empty-L semantics: if ``L`` is empty, ``_compute_se_thresholds``
-        returns ``(0.0, 0.0)``, ``a_max_threshold = 0.0``, and the
-        per-(l, e) loop short-circuits because ``per_expert_max[(l, e)]
-        > 0.0`` cannot be satisfied for any ``l ∈ L = ∅``. The three
-        statistics are still written to ctx so the ``blacklist_config``
-        block reads valid floats.
+        returns ``(0.0, 0.0)``, ``a_max_threshold = 0.0``, and
+        ``_apply_paper_criterion`` early-returns ``{}`` (its first guard
+        is ``if not L: return {}``), so no candidates are added. The
+        three statistics are still written to ctx so the
+        ``blacklist_config`` block reads valid floats.
         """
         max_acc = ctx.get("max_acc")
         L: set[int] = ctx.get("L")
