@@ -1,4 +1,4 @@
-"""Teacher provider (S6-5 of the Stage 6 plugin-architecture refactor).
+"""Teacher provider — Stage 6 teacher-side eval (live since S6-8, commit 17134b2).
 
 Paper / spec source
 --------------------
@@ -6,12 +6,15 @@ No upstream paper for the teacher provider per se; this plugin owns
 the Stage 6 teacher-side eval loop:
 
 - **Cache-key invariant** (project ``VALIDATED_STRATEGIES`` §Stage 6
-  Optimization #9): SHA-256 cache key over teacher checkpoint SHA,
-  per-task ``dataset_revisions`` (wikitext_ppl, humaneval, math500 —
-  the lm-eval-managed tasks like hellaswag/arc_challenge are NOT in
-  the key; they're handled by ``lm_eval_version`` + a SHA-256 of the
-  lm-eval task config), greedy/sampling protocol, tokenizer SHA, and
-  batched-vs-bs=1 invariance flag.
+  Optimization #9): SHA-256 cache key over the 10 components enumerated
+  in ``_teacher_cache_key`` (model_name, model_revision,
+  tokenizer_revision, canonicalised dataset_revisions, lm_eval_version,
+  lm_eval_task_config_hash, transformers_version, dtype, attn_impl,
+  eval_config_subset). NOTE: ``model_revision`` / ``tokenizer_revision``
+  are revision *name strings* (default "main"), NOT content SHAs — the
+  HF revision hash collapses upstream-checkpoint changes when the
+  revision label is stable; pin the revision to a commit SHA in YAML
+  if you need full content sensitivity.
 - **Background CPU preload** + teacher-side eval loop running the
   same four eval families against the teacher.
 - **Cache load/save** with atomic ``.tmp + os.replace`` writes
@@ -21,48 +24,22 @@ The cache hit invariance is what makes Stage 6 ~8-12× faster — the
 teacher's eval results are deterministic given the cache key, so a
 re-run of the student against the same teacher reuses the cache.
 
-Home of the Stage 6 teacher-provider concern, extracted from the legacy
-``stage6_validate.py`` monolith. The teacher provider owns the teacher
-side of the Stage 6 validation gate: the eval-cache key + load/save, the
-background CPU preload, and the teacher-side eval loop (WikiText-2 PPL +
-lm-eval zero-shot + HumanEval + MATH-500) whose results are compared
-against the student's metrics to produce per-task deltas.
-
-Pattern A vs Pattern B
-----------------------
-S6-5 covers a MIXED pattern (mirror of S6-2 / S6-3 / S6-4):
-
-* **Pattern A -- relocated verbatim**: ``TEACHER_CACHE_FORMAT_VERSION``,
-  ``_safe_pkg_version``, ``_teacher_cache_key``, ``_load_teacher_cache``,
-  ``_save_teacher_cache`` and ``_preload_teacher_to_cpu`` below are
-  character-identical copies of the monolith bodies. ``stage6_validate.py``
-  re-imports them (a ``# noqa: F401`` block) so ``run()`` and external
-  callers/tests (e.g. ``test_teacher_eval_cache_key_invariant``) keep their
-  original import path.
-* **Pattern B -- reproduced in an inert hook**: the ``run()`` teacher-side
-  block (cache-hit shortcut, preload-thread join + queue.get_nowait
-  fallback, ``teacher.eval()`` / kernel patches / experts-impl shim /
-  optional torch.compile, the four conditional teacher-side eval calls,
-  cache save) is INLINE ``run()`` code in the monolith -- there is nothing
-  standalone to relocate. The ``provide_teacher_side`` hook below
-  REPRODUCES that inline block faithfully; the monolith ``run()`` is NOT
-  modified for it. This is an intentional, temporary logic duplication
-  that resolves at S6-8 when the monolith ``run()`` is deleted and this
-  hook is wired live.
+Live wiring (S6-8 landed in 17134b2)
+------------------------------------
+``TeacherProviderPlugin`` is the live Stage 6 teacher-side entry point.
+``stage6.orchestrator.run()`` registers it (orchestrator L104-141) and
+invokes ``walk_phases(("provide_teacher_side",), plugins, run_ctx)``
+(orchestrator L268-275). The legacy ``stage6_validate.run()`` is now a
+thin delegator into the orchestrator. Tests invoke this hook directly via
+``TeacherProviderPlugin().provide_teacher_side(ctx)`` (mirror of the
+pattern documented in ``eval_environment.py:44-51``).
 
 Circular-import contract (mirror of ``stage6/plugins/eval_environment.py``):
 this module imports only from ``..context`` / ``...utils`` / sibling
 plugin modules (``eval_environment``, ``wikitext_ppl``,
-``zero_shot_lm_eval``, ``humaneval``, ``math500``) / stdlib / torch --
+``zero_shot_lm_eval``, ``humaneval``, ``math500``) / stdlib / torch —
 NEVER from ``stage6_validate``, ``stage6.orchestrator`` or
-``orchestrator`` at any scope (module-top OR function-local). The monolith
-re-imports *this* module at load time, so a ``from ..stage6_validate
-import ...`` here would deadlock the import; nothing in this module does
-that.
-
-``TeacherProviderPlugin`` is registered-but-INERT at S6-5 -- no orchestrator
-walk or test invokes its ``provide_teacher_side`` hook. S6-8 plugs the hook
-into the live Stage 6 plugin sequencer and deletes the monolith ``run()``.
+``orchestrator`` at any scope (module-top OR function-local).
 """
 from __future__ import annotations
 
@@ -99,10 +76,9 @@ log = logging.getLogger(__name__)
 
 
 # F-C-H-1: Spec F-S-M-1 mandates eager attention for both teacher and student
-# during the Stage 6 gate run. Constant -- never override at call sites. This is
-# a module-LOCAL copy of the monolith's ``_STAGE6_ATTN_IMPLEMENTATION``: the
-# monolith keeps its own definition and is NOT imported here (circular-import
-# contract). Both copies must stay in sync until S6-8 collapses the monolith.
+# during the Stage 6 gate run. Constant -- never override at call sites.
+# Module-local definition (the legacy ``stage6_validate`` thin shim does not
+# re-import this; the orchestrator and plugins consume it from here directly).
 _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 
 
@@ -124,22 +100,25 @@ def _safe_pkg_version(name: str) -> str:
 
 
 def _teacher_cache_key(config: dict) -> str:
-    """Compute a deterministic SHA-256 cache key from the 9 spec-mandated components.
+    """Compute a deterministic SHA-256 cache key from the 10 spec-mandated components.
 
     Per spec F-S-H-3, the cache key MUST cover every input that can change the
     teacher's evaluation numbers, so a stale cache cannot mask a meaningful
     config change.
 
     Components (sorted-keys JSON, no whitespace):
-      1. model_name              — config.model.name_or_path
-      2. model_revision          — config.model.revision (default "main")
-      3. tokenizer_revision      — config.model.tokenizer_revision (default model_revision)
-      4. dataset_revisions       — canonical sorted-keys mapping from config
-      5. lm_eval_version         — importlib.metadata.version("lm-eval")
-      6. transformers_version    — importlib.metadata.version("transformers")
-      7. dtype                   — config.model.torch_dtype
-      8. attn_impl               — pinned to "eager" per F-S-M-1
-      9. eval_config_subset      — wikitext2 + zero_shot + generative subdicts
+      1. model_name                  — config.model.name_or_path
+      2. model_revision              — config.model.revision (default "main";
+                                       a revision *name string*, not a content SHA)
+      3. tokenizer_revision          — config.model.tokenizer_revision (default model_revision)
+      4. dataset_revisions_canonical — sorted-keys JSON of _resolve_dataset_revisions(config)
+      5. lm_eval_version             — importlib.metadata.version("lm-eval")
+      6. lm_eval_task_config_hash    — SHA-256 of {tasks, lm_eval_batch_size}
+                                       (F-iter4-HIGH-1: catches lm-eval task-set churn)
+      7. transformers_version        — importlib.metadata.version("transformers")
+      8. dtype                       — config.model.torch_dtype
+      9. attn_impl                   — pinned to "eager" per F-S-M-1
+     10. eval_config_subset          — wikitext2 + zero_shot + generative subdicts
     """
     s6 = config["stage6_validate"]
     model_cfg = config["model"]
@@ -148,11 +127,10 @@ def _teacher_cache_key(config: dict) -> str:
     dataset_revisions = _resolve_dataset_revisions(config)
     # F-iter4-NIT-3: explicitly canonicalize dataset_revisions to a sorted-keys
     # JSON string; do not rely solely on the outer json.dumps(..., sort_keys=)
-    # for nested-dict canonicalization (sort_keys recurses but specifying it
-    # explicitly here documents the contract — Spec §9 line 816 states the
-    # mapping is "JSON-canonicalized ... with sorted keys before concatenation").
+    # for nested-dict canonicalization. sort_keys recurses but specifying it
+    # explicitly here documents the canonicalisation contract.
     dataset_revisions_canonical = json.dumps(
-        dataset_revisions, sort_keys=True, separators=(",", ":"),
+        dataset_revisions, sort_keys=True, separators=(",", ":")
     )
     # F-iter4-HIGH-1: fold the lm-eval task list (and any per-task config we
     # configure here) into the cache key so the cache invalidates if the
@@ -326,21 +304,22 @@ def _preload_teacher_to_cpu(config: dict, result_q: queue.Queue) -> None:
 
 
 class TeacherProviderPlugin:
-    """Stage 6 teacher-provider plugin (S6-5 -- registered-but-INERT).
+    """Stage 6 teacher-provider plugin (live since S6-8, commit 17134b2).
 
     Owns the Stage 6 teacher concern: the eval-cache key + load/save, the
     background CPU preload, and the teacher-side eval loop (WikiText-2 PPL +
     lm-eval zero-shot + HumanEval + MATH-500). The standalone helpers
-    (Pattern A) are relocated verbatim above and re-imported by the monolith;
-    the ordering glue around them (cache-hit shortcut, preload-join,
-    post-load patches, the four conditional teacher-side eval calls, cache
-    save) is reproduced in the ``provide_teacher_side`` hook below
-    (Pattern B).
+    (``_teacher_cache_key`` / ``_load_teacher_cache`` / ``_save_teacher_cache``
+    / ``_preload_teacher_to_cpu``) are imported by the orchestrator pre-amble
+    (orchestrator L104-109) so the cache lookup and background-preload kickoff
+    can run BEFORE the ``provide_teacher_side`` phase walk. The ordering glue
+    inside the phase (cache-hit shortcut, preload-join, post-load patches,
+    the four conditional teacher-side eval calls, cache save) lives in
+    ``provide_teacher_side`` below.
 
-    S6-5 wires this class into the plugin registry as metadata only -- no
-    orchestrator walk or test invokes ``provide_teacher_side``. S6-8 plugs
-    the hook into the live Stage 6 plugin sequencer and deletes the
-    monolith ``run()``.
+    The orchestrator invokes this hook via
+    ``walk_phases(("provide_teacher_side",), plugins, run_ctx)`` at
+    orchestrator L275.
     """
 
     name = "teacher_provider"
@@ -351,10 +330,10 @@ class TeacherProviderPlugin:
         "experts_impl", "use_torch_compile",
     )
     writes: tuple[str, ...] = ("teacher_results", "teacher_param_counts")
-    # teacher_results is a per-side collector dict (analogue of the monolith's
-    # `results["teacher"]`) -- a result collector is NOT a calibration-pass
-    # accumulator, so it belongs in `writes`, not `provides`. (S6-8 wires the
-    # collector.) Mirrors the S6-3 zero_shot / wikitext convention.
+    # teacher_results is a per-side collector dict (the `results["teacher"]`
+    # analogue) -- a result collector is NOT a calibration-pass accumulator,
+    # so it belongs in `writes`, not `provides`. Mirrors the zero_shot /
+    # wikitext plugins' convention.
     provides: tuple[str, ...] = ()
 
     def is_enabled(self, config: dict) -> bool:
@@ -373,50 +352,43 @@ class TeacherProviderPlugin:
         return {}
 
     def provide_teacher_side(self, ctx: PipelineContext) -> None:
-        """Phase hook -- Stage 6 teacher-side eval (S6-8 wiring surface).
+        """Phase hook — Stage 6 teacher-side eval (live).
 
-        INERT at S6-5: no orchestrator walk or test invokes this hook. S6-8
-        replaces the Stage 6 orchestrator body with the plugin sequencer and
-        dispatches this hook in place of the monolith's inline ``run()``
-        teacher-side block. The body below reproduces that inline block
-        faithfully -- it is dead code at S6-5 but S6-8 relies on it once the
-        monolith ``run()`` is deleted.
+        Dispatched by the Stage 6 orchestrator via
+        ``walk_phases(("provide_teacher_side",), plugins, run_ctx)``
+        (orchestrator L275). Executes, in order:
 
-        Reproduces, in order, the monolith ``run()``'s teacher-side block:
-
-        1. **Cache-hit shortcut** -- if ``cached_teacher_results`` is already
+        1. **Cache-hit shortcut** — if ``cached_teacher_results`` is already
            in ctx (the orchestrator pre-resolved the cache), write it
            straight to ``teacher_results`` and return without touching the
            model.
-        2. **Preload-thread join + queue.get_nowait fallback** -- wait for
+        2. **Preload-thread join + queue.get_nowait fallback** — wait for
            the background CPU preload to finish; if the queue is empty or
            the thread did not start, load the teacher directly via
            ``load_model(...)`` (attn pinned to ``eager`` per Spec F-S-M-1).
-        3. **inference-mode + kernel patches + experts-impl shim** --
-           switch to inference mode, apply the cu130/Hopper segfault-fix
-           patches, mirror the student-side experts-impl so the
-           generative-switch comparison has a baseline.
-        4. **Optional ``torch.compile``** -- guarded by ``use_torch_compile``
+        3. **eval() mode + kernel patches + experts-impl shim** — switch
+           to eval() mode (preserve numerics — dropout/batchnorm off; we
+           deliberately do NOT enter ``torch.inference_mode()`` so
+           autograd-touching paths inside lm-eval / HumanEval generate()
+           continue to work), apply the cu130/Hopper segfault-fix patches,
+           mirror the student-side experts-impl so the generative-switch
+           comparison has a baseline.
+        4. **Optional ``torch.compile``** — guarded by ``use_torch_compile``
            ctx slot; on failure logs a warning and falls through.
-        5. **Conditional teacher-side eval calls** -- gated by the same
+        5. **Conditional teacher-side eval calls** — gated by the same
            ``s6["wikitext2"]["enabled"]`` / ``s6["zero_shot"]["enabled"]`` /
-           ``s6["generative"]["enabled"]`` flags ``run()`` uses, writing
-           each result to a local ``teacher_results`` dict. The generative
-           sub-block restores uncompiled ``teacher.forward`` and switches
+           ``s6["generative"]["enabled"]`` flags. The generative sub-block
+           restores uncompiled ``teacher.forward`` and switches
            ``experts_implementation`` to ``batched_mm`` (cu130 _grouped_mm
            decode-shape workaround), same as the student-side block.
-        6. **Cache save** -- if ``teacher_cache_enabled`` was on, save the
+        6. **Cache save** — if ``teacher_cache_enabled`` was on, save the
            results + param counts via ``_save_teacher_cache``; failure is a
            warning, never a re-raise.
-        7. **ctx writes** -- ``teacher_results`` and ``teacher_param_counts``
-           (the latter is None on the cache-HIT path -- that's the same
-           lifetime the monolith honors).
+        7. **ctx writes** — ``teacher_results`` and ``teacher_param_counts``.
 
-        S6-8 will add the gguf thread start when the imatrix plugin is wired
-        -- at S6-5 the ``_background_gguf_convert`` thread launch from the
-        monolith is intentionally OMITTED here (it is an imatrix concern,
-        not the teacher provider's, and the imatrix plugin has not been
-        extracted yet).
+        GGUF kickoff is owned by the orchestrator pre-amble
+        (orchestrator L255-266), gated on cache-MISS — intentionally NOT
+        this hook's concern.
         """
         # Required slots -- direct get(): a missing one is a wiring bug and
         # SHOULD raise.
@@ -544,10 +516,9 @@ class TeacherProviderPlugin:
                 log.warning("Stage 6: torch.compile on teacher failed (%s)", exc)
                 _teacher_pre_compile_forward = None
 
-        # S6-8 will add the gguf thread start when the imatrix plugin is
-        # wired (the monolith run() starts _background_gguf_convert here,
-        # immediately before the teacher-side eval calls below; it is an
-        # imatrix concern, not the teacher provider's).
+        # GGUF kickoff is owned by the orchestrator pre-amble
+        # (orchestrator.py:255-266), gated on cache-MISS — intentionally
+        # NOT this hook's concern.
 
         # Read eval batch-size configs the same way run() does so the
         # teacher-side calls match the student-side ones from the wikitext /
@@ -604,9 +575,20 @@ class TeacherProviderPlugin:
                 log.info("Stage 6: restored uncompiled teacher.forward for "
                          "generative block (keep PPL/lm_eval compiled, "
                          "generative eager)")
-            _teacher_gen_experts_impl = os.environ.get(
-                "EXPERTS_IMPLEMENTATION_GENERATIVE", "batched_mm"
-            )
+            # ctx (set by EvalEnvironmentPlugin at eval_environment.py:666)
+            # is the canonical source-of-truth; mirror the humaneval.py:476-480
+            # / math500.py:418-419 ctx-first pattern, with env-var / "batched_mm"
+            # only as the fallback when ctx has not published the slot (covers
+            # legacy callers that drive this hook directly in tests without
+            # walking setup_environment first).
+            if ctx.has("experts_implementation_generative"):
+                _teacher_gen_experts_impl = ctx.get(
+                    "experts_implementation_generative"
+                )
+            else:
+                _teacher_gen_experts_impl = os.environ.get(
+                    "EXPERTS_IMPLEMENTATION_GENERATIVE", "batched_mm"
+                )
             _teacher_cfg = getattr(teacher, "_orig_mod", teacher).config
             _teacher_current_impl = getattr(_teacher_cfg, "_experts_implementation", None)
             if _teacher_gen_experts_impl != _teacher_current_impl:
@@ -625,21 +607,22 @@ class TeacherProviderPlugin:
                     batch_size=gen_batch_size, dataset_revisions=dataset_revisions,
                 )
 
-        # Step 6: save teacher results to cache for future runs. teacher_pc
-        # is computed ONLY when the cache is enabled — matches the monolith,
-        # which leaves `teacher_param_counts` unbound on the non-cache path
-        # and lets _measured_reduction count live teacher params from the
-        # model itself. When caching is disabled the ctx slot is set to None.
+        # Step 6: param counts + optional cache save.
+        # L3 fix: always compute teacher_pc when the teacher is loaded — even
+        # when caching is disabled — so validation_report.py:580
+        # (teacher_model=None) can read it via cached_teacher_param_counts on
+        # ctx and avoid a multi-minute CPU re-load of the teacher inside
+        # ``_measured_reduction``. The legacy monolith left this unbound on
+        # the no-cache path; that was a perf wart, not a contract.
         # F-iter4-CRIT-2: teacher has no FactoredExperts modules so the
         # effective count == physical count, but use the same effective
         # function for symmetry and so the cached value compares apples-to-
         # apples with the student's effective live param count.
-        teacher_pc: dict[str, int] | None = None
+        teacher_pc: dict[str, int] = {
+            "total": count_parameters_effective(teacher),
+            "expert": count_expert_parameters(teacher, routed_only=True),
+        }
         if teacher_cache_enabled:
-            teacher_pc = {
-                "total": count_parameters_effective(teacher),
-                "expert": count_expert_parameters(teacher, routed_only=True),
-            }
             try:
                 _save_teacher_cache(
                     cache_path, cache_key, teacher_results,
