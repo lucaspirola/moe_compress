@@ -17,9 +17,11 @@ plugin owns the Stage 6alt thermometer teacher-side concern:
   revision *name string* (default "main"), NOT a content SHA — pin the
   revision to a commit SHA in YAML if you need full content sensitivity
   (same revision-vs-SHA caveat as the Stage 6 sibling). The tokenizer
-  name is folded in indirectly via ``corpus_id`` (``thermo_corpus.py``
-  L216-228 hashes ``tok_id`` into the corpus id), so a tokenizer change
-  invalidates the cache transitively through the corpus.
+  name is folded in indirectly via ``corpus_id``: the wikitext +
+  nemotron branches of ``_build_thermo_corpus`` in ``thermo_corpus.py``
+  hash ``tok_id`` into the corpus id (line numbers intentionally omitted
+  to avoid future drift), so a tokenizer change invalidates the cache
+  transitively through the corpus.
 - **Cache scope-of-validity**: thermometer caches are scoped to a SINGLE
   SWEEP (a short-lived host process). The cache key intentionally OMITS
   ``lm_eval_version`` / ``transformers_version`` /
@@ -43,8 +45,8 @@ teacher-side entry point. ``stage6alt.orchestrator.run()`` registers it
 a 2-line shim delegating into the orchestrator. Tests invoke this hook
 directly via
 ``ThermoTeacherProviderPlugin().provide_thermo_teacher_side(ctx)``
-(mirror of the pattern documented in
-``stage6/plugins/teacher_provider.py:30-35``).
+(mirror of the pattern documented in the ``TeacherProviderPlugin``
+docstring in ``stage6/plugins/teacher_provider.py``).
 
 The standalone helpers (``THERMO_TEACHER_CACHE_FORMAT_VERSION`` /
 ``_thermo_teacher_cache_key`` / ``_load_thermo_teacher_cache`` /
@@ -131,8 +133,12 @@ def _thermo_teacher_cache_key(config: dict, corpus_id: str) -> str:
                                 same caveat as the Stage 6 sibling)
       5. torch_dtype          — config.model.torch_dtype (default bfloat16)
       6. attn_implementation  — pinned to "eager" per Spec F-S-M-1
-      7. arc_easy_limit       — thermometer.arc_easy_limit (default 100)
-      8. hellaswag_limit      — thermometer.hellaswag_limit (default 200)
+      7. arc_easy_limit       — thermometer.arc_easy_limit (default 100;
+                                helper-local default, not a paper/spec
+                                constant)
+      8. hellaswag_limit      — thermometer.hellaswag_limit (default 200;
+                                helper-local default, not a paper/spec
+                                constant)
 
     Scope-of-validity boundary
     --------------------------
