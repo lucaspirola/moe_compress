@@ -1,34 +1,121 @@
-"""Phase C₂ — AIMER (Activation-Independent Magnitude-Energy Ratio) detector.
+"""AIMER weight-only expert importance scorer (calibration-free, per-expert).
 
-Paper: arXiv:2603.18492 (AIMER). Migrated from the legacy Stage 1 module
-in sub-task 6 of the Stage 1 → plugin-architecture refactor.
+Paper
+-----
+Liu et al., "AIMER: Calibration-Free Task-Agnostic MoE Pruning",
+arXiv:2603.18492 (2026). Acronym expansion (paper Eq. 1-2 + abstract):
+**AIMER = Absolute mean over root mean square IMportance for Expert
+Ranking.**
 
-The plugin owns three responsibilities (sub-task 8 added the third):
+Paper Equation 4 defines the AIMER score for an expert whose
+gate+up+down weights are flattened and concatenated into a single
+vector ``w ∈ ℝ^N`` (with ``N = N_gate + N_up + N_down``):
 
-1. **Pre-computation** — per-(layer, expert) AIMER scores from
-   ``utils.aimer.aimer_score_tensor`` and per-layer bottom-pct selections
-   from ``utils.aimer.aimer_bottom_pct_per_layer``. Written to the
-   ``aimer_scores`` and ``bottom_pct_by_layer`` slots on the
-   ``PipelineContext``.
-2. **Candidate-pool contribution** — :meth:`run` also gates the
-   bottom-pct selections by per-layer activation max (``max_acc`` ×
-   ``a_max``) and adds each surviving (l, e) to the shared
-   ``CandidateBag`` with tag ``"aimer"``. The gate inputs (``max_acc``,
-   ``a_max``) travel via ctx — ``a_max`` is written by
-   ``ThreeWayAndPlugin.run`` earlier in the Phase-C plugin sequence.
-3. **Artifact contribution** — returns the three-key ``aimer`` block of
-   ``stage1_blacklist.json`` via :meth:`contribute_artifact`. The
-   ``candidates`` key is derived from the unified ``candidates`` dict
-   materialised from the shared ``CandidateBag`` via
-   ``bag.to_provenance_dict()``; the plugin only INVERTS that dict's
-   tag list for the fragment.
+    AIMER(w) = ‖w‖₁ / (√N · ‖w‖₂)         (Eq. 4)
 
-The plugin's ``writes`` field is ``("aimer_scores", "bottom_pct_by_layer",
-"candidate_bag")``. The ``candidate_bag`` slot appears in both ``reads``
-and ``writes`` — it is read (the bag instance) and mutated in place via
-``add(l, e, "aimer")``. See `tasks/refactor_stage1/subtask_8_plan.md`
-§2.4 for the rationale on extending ``run`` to own the candidate-add
-step.
+Equivalently the ratio of the absolute mean ``‖w‖₁ / N`` to the
+root-mean-square ``‖w‖₂ / √N``. The score is in ``(0, 1]``:
+
+    upper bound 1.0 — all entries equal magnitude (most distributed)
+    lower bound 1/√N — single non-zero entry (most concentrated)
+
+Paper Algorithm 1 (pyhton-style pseudocode, source PDF lines 414-430)
+implements the score per expert by summing the abs / square reductions
+over all three projections, then taking the ratio. **The paper uses
+AIMER as a PRUNING criterion**: "we prune experts with larger AIMER
+scores" (most-distributed = lowest information density = safe to
+remove).
+
+Official implementation (golden reference)
+------------------------------------------
+``github.com/ZongfangLiu/AIMER`` pinned to commit
+``fcf8e28f9253810bb117bc3a57c65e98780f4706`` (default branch HEAD,
+dated 2026-03-23).
+
+Two deliberate project deviations from the paper
+------------------------------------------------
+**(1) — Down_proj-only score** (this project) vs **concatenated
+gate+up+down** (paper).
+
+The shared scoring utility ``utils.aimer.aimer_score_tensor(w)``
+applies Eq. 4 to whatever tensor ``w`` it receives — the FORMULA is
+paper-exact. This plugin then calls it with **only** the expert's
+``down_proj`` weight tensor (see ``aimer.py`` line ~155:
+``aimer_score_tensor(_get_expert_down_proj_weight(ref, e))``),
+**not** the gate+up+down concatenation Algorithm 1 prescribes.
+
+Rationale (introduced in commit ``507a979`` "feat(stage1): AIMER
+weight-only expert score utility"; preserved in S1-1 commit
+``743073f`` when the package was ported): "down_proj weights have
+concentrated energy (the structural signature of an SE that may
+have been missed by the residual-stream-based detector)". Restricting
+to ``down_proj`` aligns AIMER with the Super Experts paper's
+formulation, where SE-defining magnitudes are measured on the
+``down_proj`` output (arXiv:2507.23279 Algorithm 1 line 19 —
+``a_{l,e} = max|h_{l,e}(x) · W^{l,e}_{down_proj}|``). Cross-projection
+mixing was judged less informative for SE-detection than for the
+paper's task-agnostic pruning use case.
+
+**(2) — AIMER repurposed as SE-CANDIDATE signal**, not as a pruning
+criterion (D-aimer-cross-check).
+
+The paper uses AIMER to PRUNE high-score (most-distributed) experts.
+This project uses AIMER to PROTECT low-score (most-concentrated)
+experts — bottom-``aimer_bottom_pct`` (= 1% by default) per layer
+enter the Phase-C SE-candidate pool, gated by a per-layer activation-
+max threshold. The two usages are operationally inverse but
+mathematically dual: protecting the most-concentrated is the same
+ranking as pruning the most-distributed under the AIMER ordering.
+
+Final inclusion in ``stage1_blacklist.json`` requires ablation
+evidence from :class:`AblationFilterPlugin` (paper has no equivalent
+filter; both ``static-threshold detection`` and ``ablation filtering``
+are project-original additions). The bottom-pct + activation-max
+gate together keep the candidate-pool size small relative to a
+layer-wide AIMER sweep.
+
+Plugin responsibilities
+-----------------------
+1. **Pre-computation** — per-(layer, expert) AIMER scores via
+   ``utils.aimer.aimer_score_tensor`` on ``down_proj`` weights, and
+   per-layer bottom-pct selections via
+   ``utils.aimer.aimer_bottom_pct_per_layer``. Written to the
+   ``aimer_scores`` and ``bottom_pct_by_layer`` ctx slots.
+2. **Candidate-pool contribution** — :meth:`run` gates the bottom-pct
+   selections by ``per_expert_max[(l, e)] > aimer_layer_max_fraction
+   · a_max`` (where ``a_max`` is written by
+   :class:`ThreeWayAndPlugin`) and adds each surviving (l, e) to the
+   shared ``CandidateBag`` with provenance tag ``"aimer"``.
+3. **Artifact contribution** — returns the three-key ``aimer`` block
+   of ``stage1_blacklist.json`` via :meth:`contribute_artifact`:
+     * ``scores`` — every (l, e) score (NaN/Inf scrubbed to JSON null)
+     * ``bottom_pct_per_layer`` — expert IDs per layer, lowest first
+     * ``candidates`` — derived by inverting the shared CandidateBag
+       on the ``"aimer"`` tag
+
+Output context slots
+--------------------
+Reads:
+  * ``moe_layers``, ``L``, ``config`` — model structure + MA-formation
+    layer set + the ``aimer_bottom_pct`` + ``aimer_layer_max_fraction``
+    config knobs.
+  * ``max_acc`` — per-expert down_proj max magnitude (from the shared
+    calibration pass).
+  * ``a_max`` — global max written by :class:`ThreeWayAndPlugin`.
+  * ``candidate_bag`` — shared :class:`CandidateBag`, mutated in place.
+
+Writes:
+  * ``aimer_scores``, ``bottom_pct_by_layer``, ``candidate_bag``.
+
+``provides`` is empty — AIMER is weight-only; no activation
+accumulator from the shared :class:`CalibrationEngine` is required.
+
+Naming-history note
+-------------------
+The legacy log strings and the "Phase C₂" prefix in code comments
+trace to the pre-refactor Stage 1 monolith; they are preserved
+unchanged for Trackio-dashboard compatibility. The concern is
+"AIMER candidate-source for SE detection", not "Phase C₂".
 """
 
 from __future__ import annotations
@@ -79,7 +166,23 @@ class AimerDetectorPlugin:
     """
 
     name: str = "aimer"
-    paper: str = "AIMER: Activation-Independent Magnitude-Energy Ratio (arXiv:2603.18492)"
+    paper: str = (
+        "Liu et al., 'AIMER: Calibration-Free Task-Agnostic MoE Pruning' "
+        "(arXiv:2603.18492, 2026). Acronym = Absolute mean over root mean "
+        "square IMportance for Expert Ranking; Eq. 4: "
+        "AIMER(w) = ‖w‖₁ / (√N · ‖w‖₂). Official code: "
+        "github.com/ZongfangLiu/AIMER @ commit "
+        "fcf8e28f9253810bb117bc3a57c65e98780f4706 (2026-03-23). "
+        "Two project deviations from the paper: (1) score computed on "
+        "down_proj weights only (paper Algorithm 1 concatenates "
+        "gate+up+down) — narrows AIMER to the SE structural signature; "
+        "(2) D-aimer-cross-check — repurposed as SE-candidate signal "
+        "(protect low-score / most-concentrated experts) rather than "
+        "the paper's pruning criterion (prune high-score / most-"
+        "distributed experts). See module docstring for full "
+        "justifications + git-archaeology (commit 507a979 introduced "
+        "the down_proj-only choice)."
+    )
     config_key: str = "stage1_grape.super_expert_detection.aimer_enabled"
     reads: tuple[str, ...] = (
         "moe_layers",

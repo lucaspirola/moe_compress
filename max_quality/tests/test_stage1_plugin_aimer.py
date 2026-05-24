@@ -118,7 +118,13 @@ def _populated_ctx(
 def test_plugin_protocol_attributes():
     p = AimerDetectorPlugin()
     assert p.name == "aimer"
-    assert p.paper.startswith("AIMER")
+    # `paper` must cite the source paper (arXiv:2603.18492) AND the golden
+    # official-code commit (ZongfangLiu/AIMER @
+    # fcf8e28f9253810bb117bc3a57c65e98780f4706). Two deviations from the
+    # paper (down_proj-only score; repurposed as SE-candidate signal) are
+    # also surfaced in the paper field — see module docstring for detail.
+    assert "arXiv:2603.18492" in p.paper
+    assert "fcf8e28f9253810bb117bc3a57c65e98780f4706" in p.paper
     assert p.config_key == "stage1_grape.super_expert_detection.aimer_enabled"
     assert p.reads == (
         "moe_layers",
