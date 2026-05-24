@@ -27,6 +27,53 @@ Nemotron-Cascade-2-SFT-Data with weighted subsets — task-aware
 calibration better matches target deployment distribution. The D11
 row's canonical owner is :mod:`stage2.plugins.reap_scoring`.
 
+Deviation D-merge-repair-grad-flow (CANONICAL OWNER — declared here)
+--------------------------------------------------------------------
+Paper §5 (audit/spec_compliance/01_papers/2603.02217/source.md L824–834)
+fixes the Eq. 3 frozen-experts contract:
+
+    "although the distillation loss is defined on the output token
+    distribution, gradients are backpropagated and applied exclusively
+    to the student router parameters θ_R, while all expert and backbone
+    parameters remain frozen … parameter updates are restricted to the
+    router."
+
+Direction E (this plugin, opt-in via ``stage5_router_kd.merge_repair.enabled``)
+deviates from that contract along TWO axes:
+
+  (a) **Centroid-row unfreeze.** :func:`_unfreeze_merged_experts` sets
+      ``requires_grad=True`` on the stacked ``gate_up_proj`` / ``down_proj``
+      expert parameters of every layer that has merged centroids, and
+      registers a per-row gradient mask so the optimizer updates *only*
+      the centroid rows. From the paper's strict reading "expert
+      parameters remain frozen" this is the deviation: those rows
+      receive gradient. The router param-group remains the primary
+      trainable surface; the unfrozen expert rows form a second AdamW
+      group with ``weight_decay=0.0`` (the downstream realization lives
+      in :class:`router_kd.plugins.kd_optimizer.KdOptimizerPlugin` — see
+      its module docstring's "Deviation D-merge-repair-grad-flow"
+      cross-ref row, which points HERE as the canonical owner).
+
+  (b) **Per-layer MoE-output MSE term.** Eq. 3 is a single vocab-KL
+      objective. This plugin's :func:`_merge_repair_mse` adds a
+      ``mse_weight * mean_layers F.mse_loss(student_block_out,
+      teacher_block_out)`` term to the loss (combined in
+      :meth:`VocabKdPlugin.compute_kd_loss`). The student block-output
+      capture keeps autograd history; the teacher capture is detached
+      (fixed MSE target). This term is project-original — Eq. 3 does
+      not include any per-layer hidden-state regression.
+
+**Default-off invariant.** When
+``stage5_router_kd.merge_repair.enabled`` is false (the default),
+:meth:`MergeRepairPlugin.is_enabled` returns ``False`` for every
+``stage_key`` value. No centroid rows are unfrozen, no MoE-block
+forward hooks are registered, no MSE term is published, and the
+KdOptimizerPlugin falls back to its single ``weight_decay=_wd`` AdamW
+group over router-only trainables. The flag-off behaviour is therefore
+byte-identical to pre-Direction-E ``main`` and paper-faithful w.r.t.
+the Eq. 3 frozen-parameter scope. The deviation is gated entirely by
+that one config flag.
+
 Home of the Router-KD Stage-2.5 *merge-repair* concern (Direction E),
 extracted from the legacy ``stage5_router_kd.py`` monolith.
 
@@ -35,7 +82,8 @@ Stage 2.5, in addition to training the router, also train the *merged
 centroid experts* (the kept experts that absorbed others during Stage-2
 merging) against a direct per-layer MoE-output MSE target taken from the
 teacher. It is config-gated and default-off, so the flag-off path is
-byte-identical to pre-Direction-E ``main``.
+byte-identical to pre-Direction-E ``main`` (see the "Default-off
+invariant" in the D-merge-repair-grad-flow block above).
 
 Piece A — relocated verbatim (Pattern A, the RK-2/RK-3/RK-4 pattern):
   SEVEN STANDALONE module-level symbols are relocated here character-for-
@@ -236,6 +284,20 @@ class _LayerOutputCapture:
     ``detach`` controls whether captured tensors keep autograd history: the
     teacher capture detaches (it is a fixed target); the student capture keeps
     grad so the MSE term backpropagates into the merged experts + router.
+
+    Shared-expert pass-through note (Qwen3-MoE family). The Qwen3-MoE block
+    returns ``shared_expert(x) + sum_i g_i(x) * routed_expert_i(x)``. The hook
+    fires on the block as a whole, so the captured tensor is the *sum* of the
+    shared-expert and routed-expert paths — not the routed contribution alone.
+    Merge-repair unfreezes only the routed-expert centroid rows
+    (:func:`_experts_param_tensors` walks ``gate_up_proj`` / ``down_proj`` on
+    ``experts_module``, never on the shared expert). Consequence: the
+    shared-expert contribution is the SAME tensor at student and teacher iff
+    no upstream stage has modified the shared expert, in which case the term
+    cancels in the difference and the MSE depends only on the routed-expert
+    output gap. If Stage 2 / Stage 3 (or any future stage) ever edits the
+    shared expert, that pass-through becomes a non-zero residual baked into
+    the MSE — visible at flag-on but invisible at flag-off.
     """
 
     def __init__(self, model: nn.Module, layer_indices: "set[int]", *, detach: bool):
@@ -279,6 +341,26 @@ def _merge_repair_mse(
     many layers had merges (the config ``mse_weight`` is the only knob). The
     teacher tensor is cast to the student's dtype/device before the diff.
     Returns a scalar tensor with grad flowing into the student outputs.
+
+    Averaging convention (double mean). Each per-layer term is
+    ``F.mse_loss(s, t)`` — the elementwise squared error averaged over ALL
+    elements of the block-output tensor (``batch × seq_len × hidden_size``).
+    The per-layer terms are then ``torch.stack(...).mean()``'d across the
+    repair layers. The final scalar is therefore a mean-over-elements then
+    mean-over-layers; its absolute magnitude scales with how well the routed-
+    expert paths already agree but is independent of ``hidden_size``,
+    ``seq_len`` and the count of repair layers (each is normalized out).
+
+    ``mse_weight`` tuning guidance. The default ``mse_weight=1.0`` (see
+    :meth:`MergeRepairPlugin.setup_merge_repair`) was chosen for plumbing
+    parity, not as a calibrated coefficient. The natural scale of the
+    vocab-KL Eq. 3 term (``KL(softmax(s_t/τ) || softmax(s_s/τ)) · τ²``)
+    differs from a hidden-state MSE by orders of magnitude depending on the
+    student/teacher dtype, the activation magnitudes at each block boundary,
+    and τ. When enabling Direction E for a real recovery run, ``mse_weight``
+    should be tuned (typical sweep range 1e-3 … 1e1) so the MSE term does
+    not dominate or vanish next to the vocab-KL term in
+    :meth:`VocabKdPlugin.compute_kd_loss`.
     """
     if not layer_indices:
         # Defensive: with no repair layers the MSE term is identically zero.
