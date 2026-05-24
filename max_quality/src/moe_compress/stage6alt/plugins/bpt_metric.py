@@ -1,5 +1,24 @@
 """Thermometer bits-per-token (BPT) metric (S6A-3 of the Stage 6alt plugin-architecture refactor).
 
+Paper / spec source
+--------------------
+Standard bits-per-token (BPT) metric — ``BPT = mean_NLL / log(2)``.
+BPT is the cross-entropy-in-bits-per-token equivalent of PPL
+(``PPL = exp(mean_NLL)``); both characterize the model's next-token
+distribution on a fixed corpus. No specific paper for the metric —
+it is the natural information-theoretic counterpart of PPL going back
+to the language-modelling literature (Shannon 1951 entropy +
+modern-LM PPL conventions).
+
+Project-original sweep usage: BPT is preferred over PPL for the
+thermometer because differences across compressed models are
+linear-in-bits (additive) rather than exponential-in-bits
+(multiplicative — small NLL gaps compound under ``exp``), giving a
+more readable side-by-side ablation table.
+
+Pure forward pass, no generation. ``_bpt_from_nll`` turns mean NLL
+into BPT.
+
 Home of the Stage 6alt thermometer BPT-measurement concern, extracted
 from the legacy ``stage6alt_thermometer.py`` monolith. The thermometer's
 primary metric is bits-per-token: mean next-token NLL (in bits) over the
@@ -183,12 +202,7 @@ class BptMetricPlugin:
     """
 
     name = "bpt_metric"
-    paper = (
-        "Stage 6alt thermometer — bits-per-token (BPT) as the cheap "
-        "directional eval signal. Mean next-token NLL in bits over a "
-        "fixed pre-tokenized corpus; see stage6alt_thermometer.py module "
-        "docstring for the bpt_gap / top1_agreement interpretation."
-    )
+    paper = "Stage 6alt thermometer BPT metric — mean_NLL / log(2) (standard information-theoretic BPT; no specific paper). See module docstring."
     config_key = "stage6_validate.thermometer"
     reads: tuple[str, ...] = ("model", "calib_ids", "config")
     writes: tuple[str, ...] = ("student_bpt", "student_argmax")
