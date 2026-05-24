@@ -56,7 +56,8 @@ Fallback
 --------
 Imports ``_assign_greedy`` from
 :mod:`stage2.plugins.solver_greedy` and falls back when MCF has no
-finite entries / a non-optimal status return from OR-Tools.
+finite entries / a non-optimal status return from OR-Tools. The
+monolith re-imports ``_assign_mcf``.
 
 Output context contract
 -----------------------
@@ -67,17 +68,6 @@ Naming-history note
 -------------------
 Step 3 of the REAM pipeline alternative-solver branch. Existing log
 lines / Trackio keys preserved for dashboard back-compat.
-
-ortools-safety contract (CRITICAL): this module **must be importable in an
-environment without ``ortools``**. The ``from ortools... import
-SimpleMinCostFlow`` statement stays **inside the body of ``_assign_mcf``** — it
-is never a module-scope import. Module load needs only ``numpy``, ``logging``,
-``_assign_greedy`` (the fallback), and the plugin-class imports. When ``ortools``
-is absent, ``_assign_mcf`` raises a ``RuntimeError`` *at call time*, not an
-``ImportError`` at import time.
-
-Imports ``_assign_greedy`` from ``solver_greedy`` as the no-finite-entries /
-non-optimal-status fallback. The monolith re-imports ``_assign_mcf``.
 
 ``McfSolverPlugin`` is a scaffold-only plugin (see ``solver_greedy``).
 """
@@ -92,6 +82,12 @@ from ...pipeline.context import PipelineContext
 from .solver_greedy import _assign_greedy
 
 log = logging.getLogger(__name__)
+
+# Promoted to module-level so cross-module tuning / tests can reach it
+# without re-defining the constant. OR-Tools' SimpleMinCostFlow takes
+# integer costs; we normalize the finite cost range to ``[0, MCF_INT_SCALE]``
+# before rounding (see ``_assign_mcf``'s "Cost normalization" note).
+MCF_INT_SCALE = 1_000_000
 
 
 def _assign_mcf(
@@ -122,6 +118,15 @@ def _assign_mcf(
     if n_children == 0 or n_centroids == 0:
         return [-1] * n_children
 
+    # Capture the caller-provided cap BEFORE the uncapped-sentinel rewrite.
+    # The greedy fallback below gates on ``max_group_cap == 0`` to enter the
+    # uncapped child-iteration path (see solver_greedy._assign_greedy); passing
+    # the mutated ``n_children`` value would force it into the centroid-ordered
+    # capped path and silently change semantics. LOW-2: negative values are
+    # silently reinterpreted as the v1 ``== 0`` "uncapped" sentinel — this
+    # preserves back-compat with callers that derive the cap from a signed
+    # subtraction. Callers wanting strict validation should pre-check.
+    orig_max_group_cap = max_group_cap
     if max_group_cap < 1:
         # Reduce to assignment when no capacity bound is enforced — still
         # correct for the v1 ``max_group_cap == 0`` "uncapped" semantics by
@@ -147,42 +152,51 @@ def _assign_mcf(
             "_assign_mcf: cost matrix has no finite entries — falling back "
             "to greedy (which will leave all children unassigned)."
         )
-        return _assign_greedy(cost, n_children, n_centroids, max_group_cap)
+        return _assign_greedy(cost, n_children, n_centroids, orig_max_group_cap)
+
+    # NaN entries are treated as +∞ by ``np.isfinite`` (and therefore dropped
+    # below). Surface a debug line so silent-drop pathologies are diagnosable.
+    nan_count = int(np.isnan(cost).sum())
+    if nan_count > 0:
+        log.debug(
+            "_assign_mcf: %d NaN entries in cost matrix treated as +inf "
+            "(arcs omitted).",
+            nan_count,
+        )
 
     finite_min = float(cost[finite_mask].min())
     finite_max = float(cost[finite_mask].max())
     finite_range = finite_max - finite_min
-    MCF_INT_SCALE = 1_000_000
 
-    def _to_int_cost(c: float) -> int:
-        if finite_range <= 0.0:
-            return 0
-        normalized = (c - finite_min) / finite_range
-        return int(round(normalized * MCF_INT_SCALE))
+    # LOW-1: vectorize the affine cost normalization once instead of calling a
+    # closure per finite arc. ``int_cost`` is only valid where ``finite_mask``
+    # holds; non-finite cells are zero-filled (their arcs are skipped below).
+    int_cost = np.zeros(cost.shape, dtype=np.int64)
+    if finite_range > 0.0:
+        finite_cost = cost[finite_mask]
+        normalized = (finite_cost - finite_min) / finite_range
+        int_cost[finite_mask] = np.rint(normalized * MCF_INT_SCALE).astype(np.int64)
 
     smcf = SimpleMinCostFlow()
 
     # Node ids: 0 = source, 1..n_children = child nodes,
     # n_children+1..n_children+n_centroids = centroid nodes,
     # n_children+n_centroids+1 = sink.
+    # child_node(i) = 1 + i; cent_node(j) = 1 + n_children + j.
     SRC = 0
     SINK = n_children + n_centroids + 1
-    # Inline arithmetic instead of lambdas for clarity.
-    # child_node(i) = 1 + i
-    # cent_node(j)  = 1 + n_children + j
 
     # Source → child arcs
     for i in range(n_children):
         smcf.add_arc_with_capacity_and_unit_cost(SRC, 1 + i, 1, 0)
 
-    # Child → centroid arcs (skip +∞)
+    # Child → centroid arcs (skip +∞ / NaN)
     for i in range(n_children):
         for j in range(n_centroids):
-            c_ij = cost[i, j]
-            if not np.isfinite(c_ij):
+            if not finite_mask[i, j]:
                 continue
             smcf.add_arc_with_capacity_and_unit_cost(
-                1 + i, 1 + n_children + j, 1, _to_int_cost(float(c_ij)),
+                1 + i, 1 + n_children + j, 1, int(int_cost[i, j]),
             )
 
     # Centroid → sink arcs
@@ -204,7 +218,7 @@ def _assign_mcf(
             "back to greedy.",
             status,
         )
-        return _assign_greedy(cost, n_children, n_centroids, max_group_cap)
+        return _assign_greedy(cost, n_children, n_centroids, orig_max_group_cap)
 
     assignment = [-1] * n_children
     for arc in range(smcf.num_arcs()):
