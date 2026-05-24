@@ -1,7 +1,70 @@
-"""AA-SVD rank-k factorization core (S3-5 of the Stage 3 plugin refactor).
+"""AA-SVD activation-aware rank-k factorization core (Theorem 3.2 / Corollary 3.3).
 
-Home of the activation-aware SVD core relocated VERBATIM from the legacy
-``stage3_svd.py`` monolith:
+Paper
+-----
+"AA-SVD: Activation-Aware SVD with Cross-Covariance Calibration" —
+arXiv:2604.02119 (audit/spec_compliance/01_papers/2604.02119/source.md).
+This plugin implements the per-(layer, expert) rank-k factorization
+core; the covariance-collection prerequisite lives at
+:mod:`stage3.plugins.covariance_collection`, and the per-block joint
+refinement lives at :mod:`stage3.plugins.block_refine`.
+
+Theorem 3.2: ``M = W · C · B⁻¹ · L_B`` (Path 1 — cross-covariance
+form).
+
+Corollary 3.3: ``M = W · L_B`` (Path 3 — auto-covariance fallback,
+``A = B``).
+
+Path 2 — see :mod:`stage3.plugins.covariance_collection` D6 for the
+project-original ``A ≠ B`` hybrid (auto-cov substitution).
+
+Official code
+-------------
+``atulkumarin/AA-SVD`` @ commit
+``1fa1b686cd9b13a77607a676564e37d438a176c8`` (2026-04-22) —
+github.com/atulkumarin/AA-SVD. Cross-checked against the project's
+implementation for the eigh-precompute + per-W rank-k construction.
+
+Deviation: D-no-intra-block-cascade
+-----------------------------------
+Paper Algorithm 2 lines 4-8 + Algorithm 1 line 5: within each block,
+when compressing ``W_j``, the input ``X'_j`` must be produced by a
+forward pass through ``L'_i`` with the **already-compressed**
+``W_{j' < j}`` of the same block. Compression of ``W_{j+1}`` should
+therefore see the post-compression activations of ``W_j``.
+
+This plugin's Phase C (the per-(layer, expert) factor loop) factorizes
+every ``W_j`` in the model from the **static** covariances collected
+once in the pre-factorization dual-forward against the un-cascaded
+student (:mod:`stage3.plugins.covariance_collection`). The
+within-block cascade Algorithm 1 line 5 prescribes is **skipped**.
+
+Phase C.5 (:mod:`stage3.plugins.block_refine`, see also deviation
+D-c5-moe-only) restores **cross-block** sequential consistency (after
+block ``i`` is refined, ``X'_{i+1}`` reflects the refined block
+``i``) but does **not** revisit the intra-block layer-``j`` cascade.
+
+Rationale: project-pragmatic. Doing the paper's per-``W_j`` cascade
+requires per-(layer, sublayer-j) targeted dual-forwards
+(40 × 5 ≈ 200 forward passes through partial models, with covariance
+recollection at each), versus one-shot Phase A. The activation-aware
+AA-SVD weighting (B-cov from un-cascaded student is a close
+approximation of the cascade B-cov for moderate compression ratios;
+cross-block cascade restoration in Phase C.5 absorbs most of the
+residual) and the joint Phase C.5 AdamW refinement together minimise
+the practical gap; the paper itself reports that Phase C.5
+(Algorithm 2 line 9) is the dominant quality lever over Algorithm 1's
+line 5 cascade. Trade-off accepted; revisit if Stage 6 PPL regresses
+on a future architecture port.
+
+Naming-history note
+-------------------
+"Phase C" (legacy Stage 3 monolith terminology) is naming-historical.
+The current plugin architecture has no phase taxonomy; new prose
+drops the labels. Existing log lines / Trackio keys preserved for
+dashboard back-compat.
+
+Tool inventory (relocated verbatim):
 
 * ``_NOISE_FLOOR_BY_DTYPE`` — module-level dict mapping a storage dtype to the
   relative eigenvalue noise floor (mantissa-bits driven);
@@ -309,8 +372,12 @@ class AaSvdFactorPlugin:
 
     name = "aa_svd_factor"
     paper = (
-        "AA-SVD activation-aware rank-k factorization — M = W·C·B⁻¹·L_B "
-        "(Theorem 3.2) / M = W·L_B (Corollary 3.3) (paper 2604.02119)."
+        "AA-SVD Theorem 3.2 + Corollary 3.3 rank-k factorization — "
+        "arXiv:2604.02119 (atulkumarin/AA-SVD @ "
+        "1fa1b686cd9b13a77607a676564e37d438a176c8). "
+        "Deviation D-no-intra-block-cascade (paper Alg. 1 line 5 cascade "
+        "skipped; cross-block cascade restored via Phase C.5 — see "
+        ":mod:`stage3.plugins.block_refine`). See module docstring."
     )
     config_key = "stage3_svd.aa_svd.cross_covariance"
     # ``factor_layer`` runs inside a per-layer ``loop_over`` child scope: it
