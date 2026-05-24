@@ -29,11 +29,11 @@ cost ordering missed (e.g. when two centroids both want the same
 non-centroid but the second-choice for one is much cheaper than for
 the other).
 
-In practice the 2-opt pass is cheap — swap phase is O(n_NC²), move
-phase is O(n_NC × n_centroids); total O(n_NC × (n_NC + n_centroids))
-per round — and converges in 1-2 rounds on production layers. It is
-opt-in and disabled by default — see ``two_opt_refine`` (bool) in
-the Stage 2 config.
+In practice the 2-opt pass is cheap — move phase is
+O(n_NC × n_centroids), swap phase is O(n_NC²); total
+O(n_NC × (n_NC + n_centroids)) per round — and converges in 1-2
+rounds on production layers. It is opt-in and disabled by default —
+see ``two_opt_refine`` (bool) in the Stage 2 config.
 
 Refine-chain ordering
 ---------------------
@@ -75,7 +75,7 @@ def _two_opt_refine(
     cost: np.ndarray,
     max_group_cap: int,
 ) -> list[int]:
-    """Direction D — greedy + one 2-opt local-refinement loop (spec §5 step 3.5).
+    """Greedy + one 2-opt local-refinement loop (spec §5 step 3.5).
 
     Strictly-improving local search over an already-feasible child→centroid
     assignment. Operates purely on the assignment list, the cost matrix and the
@@ -193,7 +193,7 @@ def _two_opt_refine(
 
 
 class TwoOptRefinePlugin:
-    """Plugin home for Direction D — the 2-opt local-refinement pass (LIVE, S2-9).
+    """Plugin home for the 2-opt local-refinement pass (LIVE, S2-9).
 
     LIVE: the first link of the ``refine_assignment`` chain (two-opt THEN EM).
     The orchestrator's ``_run_assignment`` calls this plugin's
@@ -211,10 +211,7 @@ class TwoOptRefinePlugin:
     """
 
     name = "two_opt_refine"
-    paper = (
-        "2-opt local-search refinement of the assignment "
-        "(project-original; no paper). See module docstring."
-    )
+    paper = "Project-original; see module docstring."
     config_key = "stage2_reap_ream.two_opt_refine"
     # Two-opt operates purely on the assignment list, the cost matrix and the
     # per-centroid cap (all passed as call args) — it reads no ctx slots.
@@ -248,7 +245,7 @@ class TwoOptRefinePlugin:
     def refine_assignment(
         self, ctx: PipelineContext, asg: Any, delta: Any
     ) -> tuple[Any, Any, dict] | None:
-        """Chain link 1 — Direction D 2-opt local refinement (LIVE, S2-9).
+        """Chain link 1 — 2-opt local refinement (LIVE, S2-9).
 
         Verbatim lift of the 2-opt block (greedy-only guard + ``elif``
         warning) from the old ``LegacyAdapter.refine_assignment``. Returns
