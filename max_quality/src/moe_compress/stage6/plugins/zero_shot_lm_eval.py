@@ -1,5 +1,22 @@
 """Zero-shot lm-eval harness (S6-3 of the Stage 6 plugin-architecture refactor).
 
+Paper / dataset
+----------------
+lm-evaluation-harness (Gao et al. 2024) standard zero-shot suite —
+ARC-Challenge (Clark et al. 2018, arXiv:1803.05457) + HellaSwag
+(Zellers et al. 2019, arXiv:1905.07830). Loglikelihood scoring via
+``lm_eval.simple_evaluate(...)``.
+
+Stage 6 implementation note: ``batch_size=auto:8`` (lm-eval
+deterministic loglikelihood, numerically identical to
+``batch_size=1``). This is the project's ``VALIDATED_STRATEGIES``
+§Stage 6 Optimization #2.
+
+Reference code
+--------------
+EleutherAI/lm-evaluation-harness — standard library; no project-pinned
+SHA. Invoked via the ``lm_eval`` package.
+
 Home of the Stage 6 zero-shot concern, extracted from the legacy
 ``stage6_validate.py`` monolith. The zero-shot sub-metric of the Stage 6
 validation gate delegates to lm-eval's ``simple_evaluate`` for ARC-Challenge
@@ -142,12 +159,7 @@ class ZeroShotLmEvalPlugin:
     """
 
     name = "zero_shot_lm_eval"
-    paper = (
-        "Zero-shot ARC-Challenge (Clark et al. 2018, arXiv:1803.05457) + "
-        "HellaSwag (Zellers et al. 2019, arXiv:1905.07830) via EleutherAI "
-        "lm-evaluation-harness; Stage 6 validation gate, Spec §9 / "
-        "Optimization #2."
-    )
+    paper = "lm-eval zero-shot (Gao et al. 2024) ARC-Challenge + HellaSwag — EleutherAI/lm-evaluation-harness. See module docstring."
     config_key = "stage6_validate.zero_shot.enabled"
     reads: tuple[str, ...] = ("model", "tokenizer", "config")
     writes: tuple[str, ...] = ("eval_results",)
