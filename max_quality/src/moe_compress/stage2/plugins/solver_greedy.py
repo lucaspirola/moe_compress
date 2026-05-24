@@ -19,24 +19,47 @@ Every non-centroid is guaranteed to be assigned — the feasibility
 check (see :mod:`stage2.plugins.layer_merge`, D-ream-budget-bump)
 ensures full coverage.
 
-Reference: ``ream/ream.py`` lines 63-87 in the upstream
+Reference: ``ream/ream.py`` lines 64-94 in the upstream
 ``SamsungSAILMontreal/ream`` repository, pinned at commit
-``84a3030716a0059589e9d10e2ea049e32b76cfa6`` (2026-04-16).
+``84a3030716a0059589e9d10e2ea049e32b76cfa6`` (2026-04-16). Verified
+range covers centroid-index selection (L64), centroid-label seeding
+(L67-68), the capped greedy loop with ``group_size > 0`` (L70-87),
+and the MC-SMoE-style uncapped fallback (L88-94).
 
 Official code
 -------------
 ``SamsungSAILMontreal/ream`` @ ``84a3030716a0059589e9d10e2ea049e32b76cfa6``,
-``ream/ream.py:63-87``. The plugin's ``_assign_greedy`` is a verbatim
-re-implementation of that loop in NumPy.
+``ream/ream.py:64-94``. The plugin's ``_assign_greedy`` is a
+**behaviorally equivalent (up to tie-breaking) re-implementation** of
+that loop in NumPy — see Deviations below.
 
 Deviations
 ----------
-None — this branch is paper-faithful. The alternative solvers (Hungarian,
-MCF, Sinkhorn) implement deviation D-mcf-assignment /
-D-sinkhorn-soft-assign; see their respective modules.
+This branch is paper-faithful in algorithm semantics but has two
+documented, non-semantic deviations from the upstream reference:
+
+  * **Tie-breaking (documented, not corrected).** Upstream selects the
+    next child via ``np.argsort(d[centroid])`` at ``ream/ream.py:75``,
+    which uses NumPy's default non-stable quicksort. The plugin uses a
+    strict ``<`` linear scan that keeps the **lowest-indexed**
+    candidate. Outputs agree whenever all candidate costs are distinct;
+    they may differ only under exact-tie cost entries, in which case
+    the plugin's output is deterministic on input-row order while
+    upstream's depends on quicksort's internal partitioning. This is a
+    behavioral subset of upstream (deterministic refinement), not an
+    algorithmic change.
+  * **Inf-cost handling (documented extension).** Upstream asserts
+    ``np.isfinite(dist)`` at ``ream/ream.py:60`` and assumes every cost
+    entry is finite. The plugin extends that contract by emitting
+    ``-1`` sentinels on rows/columns whose minimum cost is ``+inf``,
+    leaving orphan-promotion to the caller (see ``layer_merge``).
+
+The alternative solvers (Hungarian, MCF, Sinkhorn) implement
+deviation D-mcf-assignment / D-sinkhorn-soft-assign; see their
+respective modules.
 
 The default ``assignment_solver`` is ``"greedy"``, reproducing the
-v1 baseline byte-identically.
+v1 baseline up to the tie-breaking refinement above.
 
 Output context contract
 -----------------------
@@ -78,10 +101,43 @@ log = logging.getLogger(__name__)
 def _assign_greedy(
     cost: np.ndarray, n_children: int, n_centroids: int, max_group_cap: int,
 ) -> list[int]:
-    """Legacy greedy path — extracted from the v1 implementation verbatim.
+    """Legacy greedy path — behaviorally equivalent (up to tie-breaking) to upstream.
 
-    Preserves the bit-identical assignment under the v1 default (greedy +
-    descending-saliency centroid order).
+    Reproduces the v1 default (greedy + descending-saliency centroid order)
+    with one deterministic refinement vs upstream's ``np.argsort(d[centroid])``
+    (``ream/ream.py:75``): on exact-tie cost entries this plugin keeps the
+    **lowest-indexed** candidate (strict ``<`` linear scan), while upstream's
+    quicksort-based argsort is non-stable and depends on partitioning. See
+    the module docstring's "Deviations" section.
+
+    Column-order contract
+    ---------------------
+    The capped path (``max_group_cap > 0``) assumes the caller has already
+    sorted ``cost``'s **centroid columns by descending saliency**, since we
+    iterate ``c_idx`` in column order. This matches upstream's outer loop
+    ``for centroid in centroid_inds`` where ``centroid_inds`` is the
+    descending-saliency top-k (``ream/ream.py:64,74``). This invariant is
+    not asserted here; ``layer_merge`` is responsible for upholding it.
+
+    Complexity
+    ----------
+    O(n_children · n_centroids · max_group_cap) for the capped path
+    (linear scan per fill slot, per centroid); vs upstream's O(n log n)
+    per centroid via a single ``np.argsort``. Pathological for very large
+    expert counts — see the inline note on pre-sorting.
+
+    Argument note
+    -------------
+    ``n_children`` and ``n_centroids`` are redundant with ``cost.shape``;
+    kept as explicit parameters for legibility at call sites and
+    back-compat with v1 callers that already had these counts on hand.
+
+    Inf-cost handling
+    -----------------
+    Extension over upstream (which asserts ``np.isfinite(dist)`` at
+    ``ream/ream.py:60``): if a child's minimum cost is ``+inf``, the
+    plugin leaves that slot as ``-1`` and emits a warning; callers
+    (``layer_merge``) handle orphan-promotion.
 
     Defensive: returns ``[-1] * n_children`` for empty inputs so this helper
     can be called from fallback paths in :func:`_assign_hungarian` /
@@ -170,9 +226,11 @@ class GreedySolverPlugin:
     name = "solver_greedy"
     paper = (
         "REAM §4 descending-saliency single-pass greedy assignment — "
-        "arXiv:2604.04356 (Liu et al.). Paper-faithful (no deviations). "
-        "Official code: SamsungSAILMontreal/ream @ "
-        "84a3030716a0059589e9d10e2ea049e32b76cfa6 (ream/ream.py L63-87). "
+        "arXiv:2604.04356 (Liu et al.). Behaviorally equivalent to upstream "
+        "up to tie-breaking on exact-tie costs (plugin keeps lowest-indexed "
+        "candidate; upstream uses non-stable argsort). Official code: "
+        "SamsungSAILMontreal/ream @ "
+        "84a3030716a0059589e9d10e2ea049e32b76cfa6 (ream/ream.py L64-94). "
         "Default assignment_solver; alternative solvers implement "
         "D-mcf-assignment / D-sinkhorn-soft-assign."
     )
