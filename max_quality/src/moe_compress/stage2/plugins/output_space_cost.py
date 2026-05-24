@@ -108,9 +108,13 @@ cost form. The current plugin architecture has no direction-letter
 taxonomy. New prose drops the label; existing log lines and Trackio
 keys retain "Direction C" identifiers for dashboard back-compat.
 
-Circular-import note: this module imports only ``pipeline.context``,
-``moe_compress.utils.activation_hooks``, ``moe_compress.utils.model_io``,
-``..permutation_align`` and ``.ream_cost`` — none of
+Circular-import note: this module's top-level imports are
+``...utils.activation_hooks`` (``ReamCostAccumulator``),
+``...utils.model_io`` (``MATRIX_NAMES``, ``MoELayerRef``, ``build_banks``),
+``...pipeline.context`` (``PipelineContext``),
+``..permutation_align`` (``_PermAlignCache``,
+``_permutation_align_to_centroid``) and ``.ream_cost``
+(``_COST_PLUGIN_READS``, ``_COST_PLUGIN_WRITES``) — none of
 which import ``stage2_reap_ream``, ``ream_cost`` or ``output_space_cost``. There
 is therefore no cycle at module load. ``ream_cost._ream_cost_matrix``'s
 ``output`` branch imports ``_output_space_cost`` from *this* module at *function
@@ -385,6 +389,7 @@ def _output_space_cost(
         # cost-matrix candidate-prefilter K (``cost_topk_filter``).
         sigma = _router_routing_weights(layer_ref, x_all)  # (T, n_experts)
         router_top_k = layer_ref.top_k
+        # clamp in case top_k exceeds n_experts on degenerate configs
         k = min(router_top_k, sigma.shape[-1])
         topk_idx = torch.topk(sigma, k=k, dim=-1).indices  # (T, k)
 
@@ -396,6 +401,8 @@ def _output_space_cost(
             # routing-weighted mask: σ_m(x) on tokens that route to m, else 0.
             routed_m = (topk_idx == m_id).any(dim=-1)  # (T,) bool
             gate_m = sigma[:, m_id] * routed_m.to(sigma.dtype)  # (T,)
+            # gate_m = softmax(·) * {0,1} is nonneg, so == 0.0 would suffice;
+            # kept as <= 0.0 defensively in case of fp underflow / NaN guards.
             if float(gate_m.sum()) <= 0.0:
                 # No calibration token routes to m — the output cost is
                 # undefined (every merge is "free" on unseen inputs). The
