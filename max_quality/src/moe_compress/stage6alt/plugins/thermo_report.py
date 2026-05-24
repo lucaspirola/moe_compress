@@ -1,63 +1,51 @@
-"""Thermometer final-report assembly (S6A-5 of the Stage 6alt plugin-architecture refactor).
+"""Thermometer final-report assembly plugin for the Stage 6alt plugin pipeline.
 
 Paper / spec source
 --------------------
-Stage 6alt thermometer final-report — assembles
-``stage6alt_eval.json`` with:
+No upstream paper — Stage 6alt's "thermometer" sweep is a
+project-original cheap ablation harness. This plugin owns the
+post-eval assembly of the ``stage6alt_eval.json`` artifact:
 
   - Per-token ``top1_agreement`` (student vs teacher argmax fraction).
   - ``bpt_gap`` (``math.isfinite``-guarded delta of student-vs-teacher
     BPT).
-  - ``acc_norm_sum_gap`` (sum of deltas across the zero-shot subset's
-    ``acc_norm`` columns).
-  - Threshold-check pass/fail dict, JSON write.
+  - ``acc_norm_sum_gap`` (delta of student-vs-teacher acc_norm_sum
+    over arc_easy + hellaswag).
+  - JSON write of the 16-key ``results`` dict via
+    ``save_json_artifact``.
 
-Project-original sweep harness; no upstream paper.
+Note: Stage 6alt's thermometer has NO threshold-check pass/fail logic
+— that responsibility belongs to Stage 6's
+``validation_report._check_thresholds``. The thermometer just emits
+raw scalars and gaps; downstream consumers decide what to gate on.
 
-Home of the Stage 6alt thermometer FINAL-REPORT concern, extracted from
-the legacy ``stage6alt_thermometer.py`` monolith. The thermo-report
-plugin owns the post-eval assembly of the ``stage6alt_eval.json``
-artifact: the per-token ``top1_agreement`` computation (student vs
-teacher argmax), the ``bpt_gap`` computation (with ``math.isfinite``
-guard on both operands), the ``acc_norm_sum_gap`` computation, the
-final ``results`` dict assembly with the 16 top-level keys pinned by
-the S6A-0 golden snapshot, and the ``stage6alt_eval.json`` artifact
-write.
-
-Pattern A vs Pattern B
+Byte-identity contract
 ----------------------
-S6A-5 is **pure Pattern B**:
+The body of ``assemble_thermo_report`` is the source-of-truth for the
+``stage6alt_eval.json`` layout. The S6A-0 golden snapshot at
+``max_quality/tests/golden/stage6alt/stage6alt_eval.json`` pins:
 
-* **No Pattern A** — there is nothing standalone to relocate. The
-  monolith ``run()``'s final-assembly block (top-1 agreement, gap
-  computations, results dict assembly, ``save_json_artifact`` call) is
-  ALL INLINE ``run()`` code; no module-level helper exists for this
-  concern. Therefore S6A-5 introduces ZERO new top-level symbols
-  re-exported by the monolith — only the plugin class.
-* **Pattern B — reproduced in ONE inert hook**: the
-  ``assemble_thermo_report`` hook below REPRODUCES the monolith's
-  inline final-assembly block faithfully; the monolith ``run()`` is
-  NOT modified for it. This is an intentional, temporary logic
-  duplication that resolves at S6A-6 when the orchestrator flip wires
-  this hook live and the monolith ``run()`` becomes a thin shim.
+* the exact 16 top-level key set and order,
+* the gap-None semantics (``bpt_gap`` requires both operands finite;
+  ``acc_norm_sum_gap`` requires both operands present and finite),
+* the ``teacher_cache`` / ``lm_eval`` sub-dict shapes.
 
-The S6A-0 golden snapshot's existing ``stage6alt_eval.json`` pins the
-exact key set (16 top-level keys) and the exact gap-None semantics
-(both operands must be finite/not-None, else the gap is ``None``); any
-deviation in this hook would break the future S6A-6 orchestrator flip.
+Any drift here breaks the golden test; do not reorder keys or relax
+the finite guards without regenerating the snapshot.
 
-Circular-import contract (mirror of ``stage6alt/plugins/thermo_teacher_provider.py``):
-this module imports only from ``..context`` / ``...utils.model_io`` /
-stdlib / torch — NEVER from ``stage6alt_thermometer`` or
-``stage6alt.orchestrator`` at any scope (module-top OR function-local).
-The monolith re-imports *this* module at load time, so a
-``from ..stage6alt_thermometer import ...`` here would deadlock the
-import; nothing in this module does that.
+Live wiring
+-----------
+``ThermoReportPlugin.assemble_thermo_report`` is dispatched by
+``stage6alt.orchestrator.run`` via
+``walk_phases(("assemble_thermo_report",), plugins, run_ctx)`` as the
+final step of the pipeline. The legacy ``stage6alt_thermometer.run()``
+is a thin shim that delegates to the orchestrator.
 
-``ThermoReportPlugin`` is registered-but-INERT at S6A-5 — no
-orchestrator walk or test invokes its ``assemble_thermo_report`` hook.
-S6A-6 plugs the hook into the live Stage 6alt plugin sequencer and
-deletes the monolith ``run()``'s inline final-assembly block.
+Circular-import contract (mirror of
+``stage6alt/plugins/thermo_teacher_provider.py``): this module imports
+only from ``..context`` / ``...utils.model_io`` / stdlib / torch —
+NEVER from ``stage6alt_thermometer`` or ``stage6alt.orchestrator`` at
+any scope (module-top OR function-local).
 """
 from __future__ import annotations
 
@@ -75,7 +63,7 @@ log = logging.getLogger(__name__)
 
 
 class ThermoReportPlugin:
-    """Stage 6alt thermometer final-report plugin (S6A-5 — registered-but-INERT).
+    """Stage 6alt thermometer final-report plugin.
 
     Owns the Stage 6alt thermometer final-report assembly: the
     ``top1_agreement`` computation, the ``bpt_gap`` / ``acc_norm_sum_gap``
@@ -84,15 +72,10 @@ class ThermoReportPlugin:
     ``stage6alt_eval.json`` artifact write, and the
     ``stage6alt_eval_path`` ctx publish.
 
-    Pure Pattern B — no standalone helpers to relocate; the monolith
-    ``run()``'s inline final-assembly block is reproduced in the inert
-    ``assemble_thermo_report`` hook below. The monolith ``run()`` is
-    NOT modified by S6A-5.
-
-    S6A-5 wires this class into the plugin registry as metadata only —
-    no orchestrator walk or test invokes ``assemble_thermo_report``.
-    S6A-6 plugs the hook into the live Stage 6alt plugin sequencer and
-    deletes the monolith ``run()``'s final-assembly block.
+    Dispatched live by ``stage6alt.orchestrator.run`` via
+    ``walk_phases(("assemble_thermo_report",), plugins, run_ctx)`` as
+    the final step of the pipeline; the legacy
+    ``stage6alt_thermometer.run()`` is a thin delegating shim.
     """
 
     name = "thermo_report"
@@ -135,27 +118,17 @@ class ThermoReportPlugin:
         return {}
 
     def assemble_thermo_report(self, ctx: PipelineContext) -> None:
-        """Phase hook — Stage 6alt thermometer final-report (S6A-6 wiring surface).
+        """Phase hook — Stage 6alt thermometer final-report assembly.
 
-        INERT at S6A-5: no orchestrator walk or test invokes this hook.
-        S6A-6 replaces the Stage 6alt orchestrator body with the plugin
-        sequencer and dispatches this hook in place of the monolith
-        ``run()``'s inline final-assembly block. The body below
-        reproduces that inline block faithfully — it is dead code at
-        S6A-5 but S6A-6 relies on it once the monolith ``run()`` is
-        deleted.
-
-        Reproduces, in order, the monolith ``run()``'s final-assembly
-        block:
+        Steps, in order:
 
         1. **Read required slots** from ctx — config, artifacts_dir,
            student_bpt, student_argmax, the three student lm-eval
            scalars, teacher_results dict, teacher_cache_{hit,path,key},
            corpus_meta.
-        2. **Re-derive arc / hsw limits** from the thermometer config
-           sub-tree, matching the monolith run()'s top-of-function
-           ``int(therm.get("arc_easy_limit", 100))`` /
-           ``int(therm.get("hellaswag_limit", 200))`` calls.
+        2. **Read arc / hsw limits** from the thermometer config
+           sub-tree (defaults: 100 / 200) for emission into the
+           ``lm_eval`` sub-dict of the results.
         3. **top1_agreement** — None unless both ``student_argmax`` and
            ``teacher_results["teacher_argmax"]`` are present AND their
            shapes match; otherwise log a shape-mismatch warning and
@@ -163,7 +136,7 @@ class ThermoReportPlugin:
         4. **bpt_gap** — ``student_bpt - teacher_bpt`` only if BOTH are
            finite (``math.isfinite``); else ``None``.
         5. **acc_norm_sum_gap** — ``student_acc_sum - teacher_acc_sum``
-           only if BOTH are not None; else ``None``.
+           only if BOTH are not None AND finite; else ``None``.
         6. **Assemble results** — 16-key dict in the exact order +
            shape pinned by the S6A-0 golden snapshot.
         7. **Save** ``stage6alt_eval.json`` via ``save_json_artifact``.
@@ -203,9 +176,8 @@ class ThermoReportPlugin:
         cache_key = ctx.get("teacher_cache_key")
         corpus_meta = ctx.get("corpus_meta")
 
-        # Re-derive arc / hsw limits from the thermometer config sub-tree.
-        # Mirrors the monolith run()'s top-of-function logic; the limits
-        # are emitted into the ``lm_eval`` sub-dict of the results.
+        # Limits read from the thermometer config sub-tree; emitted into
+        # the ``lm_eval`` sub-dict of the results.
         s6 = config["stage6_validate"]
         therm = s6.get("thermometer", {}) or {}
         arc_limit = int(therm.get("arc_easy_limit", 100))
@@ -218,7 +190,7 @@ class ThermoReportPlugin:
         # teacher argmax the same next token. Unlike bpt_gap this does not
         # depend on what text the student was trained on, so it is a fair
         # compression-damage signal on ANY corpus. None if either model
-        # skipped a BPT batch.
+        # skipped a BPT batch OR the two argmax shapes disagree.
         top1_agreement = None
         _t_argmax = teacher_results.get("teacher_argmax")
         if student_argmax is not None and _t_argmax is not None:
@@ -249,7 +221,9 @@ class ThermoReportPlugin:
             "teacher_acc_norm_sum": teacher_acc_sum,
             "acc_norm_sum_gap": (student_acc_sum - teacher_acc_sum
                                  if (student_acc_sum is not None
-                                     and teacher_acc_sum is not None)
+                                     and teacher_acc_sum is not None
+                                     and math.isfinite(student_acc_sum)
+                                     and math.isfinite(teacher_acc_sum))
                                  else None),
             "top1_agreement": top1_agreement,
             "corpus": corpus_meta,
