@@ -71,13 +71,11 @@ from .eval_environment import _IMATRIX_CALIB_FILENAME, _atomic_write_text
 log = logging.getLogger(__name__)
 
 
-# F-C-C-1 (see ``max_quality/docs/spec_constraints.md`` for the full glossary
-# of F-C-C / F-CR2-M constraint IDs): Spec §9 -- the eval-text concat (eval
-# prompts seen by the model during PPL/zero-shot/generative) is captured to
-# eval_text_concat.txt as a debugging side-channel ONLY. The imatrix
-# calibration-corpus filename (_IMATRIX_CALIB_FILENAME) lives in
-# stage6/plugins/eval_environment and is imported above. Single source of
-# truth for the eval-text-concat filename.
+# F-C-C-1: Spec §9 -- the eval-text concat (eval prompts seen by the model
+# during PPL/zero-shot/generative) is captured to eval_text_concat.txt as a
+# debugging side-channel ONLY. The imatrix calibration-corpus filename
+# (_IMATRIX_CALIB_FILENAME) lives in stage6/plugins/eval_environment and is
+# imported above. Single source of truth for the eval-text-concat filename.
 _EVAL_TEXT_CONCAT_FILENAME: str = "eval_text_concat.txt"
 
 
@@ -419,7 +417,7 @@ class ImatrixExportPlugin:
     """
 
     name = "imatrix_export"
-    paper = "Stage 6 imatrix / GGUF export — llama.cpp llama-imatrix; opt-in via imatrix.enabled. See module docstring."
+    paper = "Stage 6 imatrix / GGUF export — llama.cpp llama-imatrix; opt-out via imatrix.enabled=false (default ON). See module docstring."
     config_key = "stage6_validate.imatrix.enabled"
     reads: tuple[str, ...] = (
         "config", "artifacts_dir", "eval_text_concat", "cached_teacher_results",
