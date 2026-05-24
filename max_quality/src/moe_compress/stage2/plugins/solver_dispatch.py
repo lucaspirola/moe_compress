@@ -35,6 +35,7 @@ none of which import ``stage2_reap_ream``. No cycle at module load.
 """
 from __future__ import annotations
 
+import typing
 from typing import Callable, Literal
 
 import numpy as np
@@ -47,7 +48,7 @@ from .solver_sinkhorn import _assign_sinkhorn
 
 # Stage 2 v2 — solver dispatch literal. Adding new solvers requires
 # updating both this Literal AND the SOLVERS registry dict below.
-# Keep them in sync.
+# The module-level assert below enforces this invariant at import time.
 SolverName = Literal["greedy", "hungarian", "mcf", "auto", "sinkhorn"]
 
 # name -> callable(cost, n_children, n_centroids, max_group_cap) -> list[int]
@@ -61,6 +62,13 @@ SOLVERS: dict[str, Callable[..., list[int]]] = {
     "auto": _assign_auto,
     "sinkhorn": _assign_sinkhorn,
 }
+
+# Enforce SolverName Literal ↔ SOLVERS registry agreement at import time,
+# so adding a solver in one place without the other fails loudly.
+assert set(SOLVERS.keys()) == set(typing.get_args(SolverName)), (
+    "SolverName Literal and SOLVERS registry are out of sync: "
+    f"Literal={set(typing.get_args(SolverName))}, SOLVERS={set(SOLVERS.keys())}"
+)
 
 
 def _assign_children_to_centroids(
@@ -127,8 +135,9 @@ def _assign_children_to_centroids(
     if n_children == 0 or n_centroids == 0:
         return [-1] * n_children
 
-    solver_lower = solver.lower()
-    if solver_lower == "sinkhorn":
+    # `solver` is typed as the SolverName Literal (strictly lowercase); we
+    # rely on that contract instead of normalising at runtime.
+    if solver == "sinkhorn":
         # Sinkhorn needs the three sinkhorn_* kwargs; special-case it so the
         # other solver signatures stay byte-identical (no dead **kwargs).
         return _assign_sinkhorn(
@@ -138,11 +147,11 @@ def _assign_children_to_centroids(
             iters=sinkhorn_iters,
         )
 
-    fn = SOLVERS.get(solver_lower)
+    fn = SOLVERS.get(solver)
     if fn is None:
         raise ValueError(
-            f"_assign_children_to_centroids: unknown solver {solver!r}; expected "
-            "one of 'greedy', 'hungarian', 'mcf', 'auto', 'sinkhorn'."
+            f"_assign_children_to_centroids: unknown solver {solver!r}; "
+            f"expected one of {sorted(SOLVERS.keys())!r}."
         )
     return fn(cost, n_children, n_centroids, max_group_cap)
 
