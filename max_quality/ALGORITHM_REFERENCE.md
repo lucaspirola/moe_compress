@@ -209,13 +209,15 @@ Phase C produces a **candidate set** by union of four detectors. The candidate s
      158→5 motivation, and the bs=32→8 job-6a00caf0 OOM archaeology now
      live in the plugin module docstring. -->
 
-#### Phase E: CKA Distance Matrices
-
-For each MoE layer, compute the pairwise CKA **distance** matrix `D^l ∈ ℝ^{N×N}` where `D^l_{ij} = 1 − CKA(f_i, f_j)` (distance, not raw similarity: 0 = identical, 1 = maximally different). CKA measures functional similarity between experts based on their response patterns to actual inputs — two experts that produce similar outputs on the calibration data have high CKA and thus low distance D^l_{ij}. The paper's `D^l` is a *similarity* (GRAPE 2604.06542 line 245) and selects pairs with `argmax`; this spec uses the distance form `1 − CKA` and `argmin`, an equivalent sign-flip documented at [D-cka-distance](#12-known-deviations-from-papers).
-
-Paper §3.3 explicitly allows "CKA, mean squared error, or other similarity measures" for D^l. CKA is the metric used by Zhang et al. (2025), cited in GRAPE §3.2 as the reference for intra-layer redundancy assessment.
-
-With 256 samples × 2048 tokens ≈ 524K total token activations across the layer (each expert sees only its top-k/N routed fraction; for top-8 over 256 experts that is ≈ 16K per expert before sampling), reservoir-sampled to 256 per expert for CKA so the kernel matrices are well-conditioned for 256-expert layers.
+<!-- §4 Phase E (CKA Distance Matrices) — CONSUMED by
+     stage1/plugins/cka_distance.py (commit pending). Full distance-form
+     definition (D^l_{ij} = 1 − CKA), GRAPE-line-245 similarity-vs-distance
+     citation, D-cka-distance sign-flip derivation, Kornblith CKA primitive
+     citation + official-code SHA, GPU/CPU implementation paths, and the
+     reservoir-sampling rationale (256/expert from ~16K routed tokens) now
+     live in the plugin module docstring. SHARED notes: Phase F's downstream
+     argmin / R^l consumption of these matrices remains documented under
+     §4 Phase F + the D-cka-distance §12 row is also consumed below. -->
 
 #### Phase F: GRAPE Budget Allocation
 
@@ -983,7 +985,13 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 | D3 | 1 | γ entropy tolerance | 2604.06542 Eq. 10: γ∈[0,1], no default given | γ=0.1 (project-chosen, not from paper) | Paper leaves γ unspecified; 0.1 chosen empirically |
 | D4 | 1 | D^l update after merge | 2604.06542 Algorithm 1 lines 9–10: zero only pair entry D_{i*,j*} and D_{j*,i*} (line 9); update R^l ← R^l − 2·D_{i*,j*} (line 10) | Zeros the absorbed expert's entire row and column in D^l; recomputes R^l from updated matrix | Prevents the absorbed expert from influencing future pair-selection; the paper's update assumes the merged expert cannot be re-selected, but only zeroing the pair entry leaves stale similarity values that can distort R^l and layer selection in subsequent iterations |
 | D5 | 1 | Floor without layer bonuses | GRAPE has no floor constraints | min_experts_per_layer = num_routed_experts // 2 (=128); no early/late layer bonuses; floor enforced during greedy by skipping any layer at-or-below floor when picking argmax/argmin (computed dynamically as num_routed_experts // 2 per model (=128 for 256-expert Qwen3-30B-A3B; would be 64 for 128-expert layers, etc.)) | 50% max removal per layer bounds the compression within the range where papers demonstrate results; bonuses removed — the floor alone is sufficient. Greedy-time enforcement (skipping floor-saturated layers in the argmin step) prevents the layer from being selected after it has reached its protected size. |
-| D-cka-distance | 1 | CKA distance vs paper similarity; argmin vs argmax | 2604.06542 line 245 defines `D^l` as a CKA *similarity* matrix; Algorithm 1 lines 6–7 select pairs with `argmax D^l` and pick the most-redundant layer with `argmax R^l` (the sum of off-diagonal similarities) | `D^l_{ij} = 1 − CKA(f_i, f_j)` (distance form, 0 = identical, 1 = maximally different); the greedy uses `argmin D^l` and `argmin R^l` on this distance matrix | Distance form chosen so the redundancy criterion `R^l = Σ_{i≠j} D^l_{ij}` reads as "higher = more redundant by Σ-of-distances" while still producing the same expert pair under argmin. The transformation is a sign-flip relative to the paper: `argmin distance = argmax similarity` and `R^l_{distance} = N(N−1) − R^l_{similarity}` (constant offset; identity assumes the i=j diagonal is excluded (Σ_{i≠j}) — including it would break the offset because 1−CKA(f_i,f_i)=0 vs CKA(f_i,f_i)=1), so layer ranking, pair ranking, and final budget are mathematically equivalent. The polarity of the Eq. 3 normalization `R̃^l` is inverted but the cross-layer ranking is preserved. |
+<!-- D-cka-distance — CONSUMED by stage1/plugins/cka_distance.py (commit
+     pending). Full sign-flip derivation (argmin distance ↔ argmax
+     similarity; R^l_dist = N(N−1) − R^l_sim under i ≠ j; R̃^l polarity
+     inversion) now lives in the plugin module docstring. SHARED note:
+     Phase F's grape_merge plugin also depends on this deviation for the
+     argmin layer/pair selection; re-check at the §4 Phase F consumption
+     step. -->
 <!-- D-ma-detector items (1)–(2) — dynamic detector thresholds + 0.75-depth
      fallback — CONSUMED by stage1/plugins/ma_detection.py (commit pending).
      Items (3) CKA reservoir cap → SHARED with cka_distance; (4) phase_b /

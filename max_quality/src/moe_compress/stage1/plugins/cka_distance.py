@@ -1,14 +1,107 @@
-"""Phase E — CKA pairwise distance matrices.
+"""Per-layer CKA pairwise distance matrices for downstream GRAPE merge.
 
-Paper: Kornblith et al., "Similarity of Neural Network Representations
-Revisited", ICML 2019 (arXiv 1905.00414). Migrated from the legacy Stage 1
-module in sub-task 4 of the Stage 1 -> plugin-architecture refactor.
+Papers
+------
+This plugin sits at the intersection of two papers:
 
-The plugin's externally observable behaviour is **byte-identical** to the
-legacy inline Phase E: same vectorized GPU path (uniform m_min over the
-active set), same CPU per-pair m_common fallback, same biased HSIC centering,
-same weight-space (cosine/mse) ablation override. Verified via the golden
-snapshot test for ``stage1_budgets.json`` (Phase E -> Phase F coupling).
+1. **Kornblith et al.**, "Similarity of Neural Network Representations
+   Revisited", ICML 2019 — arXiv:1905.00414. Defines the CKA
+   similarity primitive: ``CKA(X, Y) = HSIC(X, Y) / sqrt(HSIC(X, X) *
+   HSIC(Y, Y))`` with the biased HSIC linear-kernel centering of Gretton
+   (2005): ``K_c = K - row_mean - col_mean + grand_mean``. **Faithfully
+   implemented here** for both the GPU-batched and CPU-per-pair paths.
+
+   Official reference implementation: google-research/google-research
+   ``representation_similarity/Demo.ipynb`` @ directory-touching commit
+   ``89e3921863e276cdbe49bd25077905f75e981f4e`` (2019-06-10) —
+   github.com/google-research/google-research/blob/89e3921863e276cdbe49bd25077905f75e981f4e/representation_similarity/Demo.ipynb.
+
+2. **Zhang et al.** (GRAPE), "Does a Global Perspective Help Prune
+   Sparse MoEs Elegantly?" — arXiv:2604.06542. §3.2 defines
+   ``D^l ∈ ℝ^{N×N}`` as a *similarity* matrix
+   (source.md L245-L249: "Let D^l ... denote the pairwise similarity
+   matrix of experts in the l-th MoE layer... D^l can be instantiated
+   using CKA (Davari et al.), mean squared error, or other similarity
+   measures."). Algorithm 1 lines 8-9 select the most-redundant layer
+   with ``argmax R^l`` (where ``R^l = Σ_{i≠j} D^l_{ij}``) and the
+   most-similar within-layer pair with ``argmax D^l``.
+
+   No official code repository for GRAPE was published at paper release
+   (verified 2026-05; arxiv.org/abs/2604.06542 has no code link, the
+   first author's GitHub has no GRAPE repo). This stage's GRAPE
+   greedy-merge implementation is therefore reference-free.
+
+Deviation: D-cka-distance
+-------------------------
+The plugin builds ``D^l_{ij} = 1 − CKA(f_i, f_j)`` (distance form,
+``[0, 1]``: 0 = identical, 1 = maximally different), inverting the GRAPE
+paper's similarity-form ``D^l``. Downstream consumers (the GRAPE merge
+plugin) use ``argmin`` on the distance matrix instead of the paper's
+``argmax`` on the similarity matrix; they also evaluate the redundancy
+score ``R^l = Σ_{i≠j} D^l_{ij}`` as a *distance* sum (smaller = more
+redundant) instead of the paper's *similarity* sum (larger = more
+redundant) and use ``argmin R^l`` accordingly.
+
+**The transformation is a sign-flip, not a numerical deviation.** Under
+the identity ``R^l_distance = N(N−1) − R^l_similarity`` (constant offset,
+which holds because the ``i = j`` diagonal is excluded; the diagonal
+would break the offset since ``1 − CKA(f_i, f_i) = 0`` vs
+``CKA(f_i, f_i) = 1``), layer ranking, pair ranking, and the final
+budget allocation are mathematically equivalent. Polarity of the
+Eq. (3) normalization is inverted in the distance form (``R̃^l_dist =
+1 − R̃^l_sim``) but the cross-layer rank order is preserved.
+
+Why the distance form: the merge plugin's redundancy criterion reads as
+"higher = more redundant by Σ-of-distances" with the standard
+small-distance / near-duplicate intuition; the ``argmin`` flow matches
+how Phase F's greedy queue is consumed elsewhere in the stage.
+
+Output context contract
+-----------------------
+- ``reads``: ``output_acc`` (the calibration-pass-populated
+  ``ExpertOutputAccumulator`` — per-(layer, expert) output reservoir,
+  cap 256 tokens/expert), ``moe_layers``, ``config``.
+- ``writes``: ``D_matrices`` — ``dict[int, torch.Tensor]`` mapping
+  ``layer_idx`` to the ``N×N`` distance matrix (CPU fp32).
+- ``provides``: ``("output_reservoir",)`` — declarative metadata
+  advertising the per-(layer, expert) output reservoir as a hook needed
+  during the calibration pass.
+
+``contribute_artifact`` returns ``{}`` — ``D_matrices`` is consumed
+in-memory by the downstream merge plugin and is never written to disk.
+
+Implementation paths
+--------------------
+Two byte-equivalent (within fp32 tolerance) paths share the same biased
+HSIC centering:
+
+- **GPU vectorized** (default for prod): subsamples every active expert
+  to a single ``m_min`` over the active set, batches the Gram matrices,
+  computes the full ``N×N`` HSIC table in O(N · m² · d) GPU work.
+  ~1 sec/layer on H200 vs ~10 min/layer for the CPU per-pair path.
+- **CPU per-pair fallback**: original implementation. Activated when
+  the vectorized path is unsafe — ``m_min < 32`` OR ``m_min < m_max // 4``.
+  Used by tests with tiny calibration sets and as a safety net when
+  reservoir under-fill would force every pair to use a low ``m``.
+
+With the prod default of ``num_calibration_samples = 1024`` and the
+``ExpertOutputAccumulator`` reservoir cap of 256 tokens/expert, all
+active experts saturate at ``m = 256`` and the GPU path is bit-equivalent
+(within fp32 tolerance) to the original.
+
+A weight-space ablation override (``cosine`` / ``mse`` via
+``stage1_grape.similarity_metric``) is supplied for cross-metric
+sanity tests; it computes distances on concatenated
+``gate_proj | up_proj | down_proj`` weight banks and produces an
+incommensurable ``R`` scale (do not compare across metric switches).
+
+Naming-history note
+-------------------
+The legacy stage-1 monolith called this "Phase E" (the CKA-distance
+slot in the A → B → C → D → E → F phase chain). The current plugin
+architecture has no phase taxonomy. Log strings retain
+``"Stage 1 Phase E"`` for dashboard back-compat; new prose drops the
+labels.
 """
 
 from __future__ import annotations
@@ -30,18 +123,35 @@ _SIMILARITY_METRIC_DEFAULT = "cka"
 
 
 class CKADistancePlugin:
-    """CKA distance-matrix plugin (Phase E).
+    """Per-layer CKA pairwise distance-matrix builder.
 
-    Reads the Phase-B expert-output reservoir (``output_acc``) and the MoE
-    layer list, computes the pairwise CKA distance matrix per layer
-    (``D = 1 - CKA``), and writes the per-layer distance-matrix dict back to
-    the context. Supports a weight-space ablation override
+    Reads the calibration-pass-populated expert-output reservoir
+    (``output_acc``) and the MoE layer list, computes the per-layer
+    pairwise CKA distance matrix ``D = 1 − CKA``, and writes the
+    per-layer dict back to the context for the downstream GRAPE merge
+    plugin. Supports a weight-space ablation override
     (``stage1_grape.similarity_metric`` in {``"cka"``, ``"cosine"``, ``"mse"``})
     via :func:`_pairwise_distance_matrix`.
+
+    See the module docstring for the dual paper citation (Kornblith CKA
+    primitive + GRAPE consumer with the D-cka-distance sign-flip
+    deviation), the official-code reference for the CKA primitive, and
+    the two implementation paths (GPU vectorized / CPU per-pair).
     """
 
     name: str = "cka_distance"
-    paper: str = "Kornblith et al., 'Similarity of Neural Network Representations Revisited', ICML 2019 (arXiv 1905.00414)"
+    paper: str = (
+        "CKA primitive: Kornblith et al. ICML 2019 — arXiv:1905.00414 "
+        "(faithfully implemented; reference code "
+        "google-research/google-research/representation_similarity @ "
+        "89e3921863e276cdbe49bd25077905f75e981f4e). "
+        "Consumer context: GRAPE (Zhang et al., arXiv:2604.06542) defines "
+        "D^l as a similarity matrix; this plugin emits D^l in distance "
+        "form (1 − CKA) with downstream argmin — deviation "
+        "D-cka-distance (sign-flip; mathematically equivalent layer / "
+        "pair ranking). No official code for GRAPE published. See module "
+        "docstring for the full deviation derivation."
+    )
     config_key: str = "stage1_grape"
     reads: tuple[str, ...] = (
         "output_acc",

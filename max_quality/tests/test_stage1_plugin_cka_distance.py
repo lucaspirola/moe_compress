@@ -86,7 +86,14 @@ def _make_ctx(*, R: torch.Tensor, layers, config: dict | None = None) -> Pipelin
 def test_plugin_protocol_attributes():
     plugin = CKADistancePlugin()
     assert plugin.name == "cka_distance"
-    assert plugin.paper.startswith("Kornblith")
+    # `paper` must cite Kornblith CKA (the primitive — faithfully
+    # implemented), its golden official-code SHA, the GRAPE consumer
+    # context (arXiv:2604.06542), and the D-cka-distance deviation
+    # (the sign-flip from similarity → distance form).
+    assert "arXiv:1905.00414" in plugin.paper
+    assert "89e3921863e276cdbe49bd25077905f75e981f4e" in plugin.paper
+    assert "arXiv:2604.06542" in plugin.paper
+    assert "D-cka-distance" in plugin.paper
     assert plugin.config_key == "stage1_grape"
     assert plugin.reads == ("output_acc", "moe_layers", "config")
     assert plugin.writes == ("D_matrices",)
