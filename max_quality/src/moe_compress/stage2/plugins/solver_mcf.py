@@ -1,8 +1,72 @@
-"""Min-cost-flow assignment solver (Task 13 of the plugin-architecture refactor).
+"""Capacitated min-cost-flow assignment solver.
 
-Plugin home for ``_assign_mcf`` — the capacitated min-cost-flow solver backed by
-OR-Tools' ``SimpleMinCostFlow``. Extracted verbatim from ``stage2_reap_ream`` in
-Task 13.
+Paper
+-----
+Standard capacitated min-cost-flow (MCF) algorithm — Ahuja, Magnanti
+& Orlin, "Network Flows" §9 (the transportation polytope is totally
+unimodular, so the LP relaxation has integer optima). Implemented via
+OR-Tools' ``SimpleMinCostFlow``.
+
+This plugin is the capacitated branch of deviation D-mcf-assignment
+from arXiv:2604.04356 (REAM): the project adds an optimal capacitated
+assignment alternative to the paper-faithful descending-saliency
+greedy (see :mod:`stage2.plugins.solver_greedy`). The slack-capacity
+case is handled by Hungarian (see
+:mod:`stage2.plugins.solver_hungarian`).
+
+Official code
+-------------
+OR-Tools ``SimpleMinCostFlow``: google/or-tools upstream
+implementation (released; standard distribution). No project-specific
+upstream code to pin.
+
+Deviation: D-mcf-assignment (MCF branch)
+----------------------------------------
+REAM §4 (arXiv:2604.04356) uses descending-saliency single-pass greedy
+with a per-centroid cap (``group_size``) — picks the highest-saliency
+centroid first, absorbs up to ``C_max`` non-centroids by lowest cost.
+The greedy is biased toward the highest-saliency centroid because it
+picks first.
+
+Stage 2 v2's ``assignment_solver="mcf"`` (or ``"auto"`` falling through
+to mcf when ``n_NC > N'_l``) uses OR-Tools' ``SimpleMinCostFlow`` with
+cost-range normalization to int.
+
+Why MCF
+-------
+MCF is integer-optimal under LP relaxation (transportation polytope is
+totally unimodular, Ahuja-Magnanti-Orlin §9). Synthetic counterexamples
+(STRATEGY_NEXT reviewer report §2) show greedy 28-34 % above the MCF
+optimum on tight-capacity instances. At project scale
+(``N = 256, N'_l ∈ [128, 200], C_max = 7``) the gap is expected
+smaller (loose capacity), but MCF is essentially free (~10 ms / layer
+× 40 layers).
+
+ortools-safety contract (CRITICAL)
+-----------------------------------
+This module **must be importable in an environment without
+``ortools``**. The ``from ortools... import SimpleMinCostFlow``
+statement stays **inside the body of ``_assign_mcf``** — it is never a
+module-scope import. Module load needs only ``numpy``, ``logging``,
+``_assign_greedy`` (the fallback), and the plugin-class imports. When
+``ortools`` is absent, ``_assign_mcf`` raises a ``RuntimeError`` *at
+call time*, not an ``ImportError`` at import time.
+
+Fallback
+--------
+Imports ``_assign_greedy`` from
+:mod:`stage2.plugins.solver_greedy` and falls back when MCF has no
+finite entries / a non-optimal status return from OR-Tools.
+
+Output context contract
+-----------------------
+Pure callable plugin (no state). Returns the layer's assignment from
+the input cost matrix + scores + frequencies.
+
+Naming-history note
+-------------------
+Step 3 of the REAM pipeline alternative-solver branch. Existing log
+lines / Trackio keys preserved for dashboard back-compat.
 
 ortools-safety contract (CRITICAL): this module **must be importable in an
 environment without ``ortools``**. The ``from ortools... import
@@ -165,7 +229,14 @@ class McfSolverPlugin:
     """
 
     name = "solver_mcf"
-    paper = "Capacitated min-cost-flow assignment solver via OR-Tools."
+    paper = (
+        "Capacitated min-cost-flow (Ahuja-Magnanti-Orlin §9) via OR-Tools "
+        "SimpleMinCostFlow. Alternative to REAM §4 greedy "
+        "(see :mod:`stage2.plugins.solver_greedy`); implements deviation "
+        "D-mcf-assignment capacitated branch from baseline REAM "
+        "arXiv:2604.04356. Falls back to greedy on infeasibility / no-finite-"
+        "entries. See module docstring."
+    )
     config_key = "stage2_reap_ream.assignment_solver"
     # S2-8: the live solve_assignment slot reads the per-bump scratch slots.
     reads: tuple[str, ...] = ("_iter_n_ream_nc", "_iter_n_ream_c")
