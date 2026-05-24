@@ -1,15 +1,80 @@
-"""Output-space (Direction C) REAM cost plugin (Task 10 of the
-plugin-architecture refactor).
+"""Direction C: output-space REAM cost matrix.
 
-Home of the four output-space-cost helpers — ``_swiglu_forward``,
-``_router_routing_weights``, ``_tentative_merged_weights`` and
-``_output_space_cost`` — that together implement the ``cost_alignment="output"``
-branch of the REAM cost matrix (Direction C, spec STRATEGY_NEXT §C). All four
-were moved verbatim out of ``stage2_reap_ream.py``; that module re-imports them
-at module scope so external callers, tests and the ``MOE_STAGE2_LEGACY_LOOP=1``
-path keep their existing import paths. ``_swiglu_forward`` is additionally
-called by monolith-resident code (``_distill_merged_group``,
-``_heal_student_moe_output``), so its re-import is load-bearing.
+Paper
+-----
+**No paper for this cost form.** Direction C is project-original —
+introduced in the project's ``STRATEGY_NEXT`` document §C as a third
+``cost_alignment`` mode (alongside ``pre`` and ``post``) for the Stage 2
+v2 cost-matrix machinery. The baseline REAM symmetric cost comes from
+arXiv:2604.04356 (see :mod:`stage2.plugins.ream_cost`); this branch
+replaces the weight-/activation-space proxies with a forward-pass
+MoE-block output residual.
+
+Official code
+-------------
+None — this cost form is project-original. The reference REAM
+implementation (``SamsungSAILMontreal/ream``) implements only the
+symmetric ``δ_REAM`` cost.
+
+Why "output space"
+------------------
+The ``pre`` and ``post`` cost forms are proxies for end-to-end merge
+damage:
+
+- ``pre`` (REAM Eq. 7) measures input-side similarity through router
+  logits + gated-expert-output cosine — alignment-invariant and cheap,
+  but doesn't capture the block-level interaction with other surviving
+  experts.
+- ``post`` (D-whitened-cost) measures weight-space residual along the
+  activation-covariance eigenbasis — captures the AA-SVD-style
+  whitened ΔW norm but is still a weight-only proxy.
+- ``output`` (this branch, Direction C) measures the actual MoE-block
+  output divergence under a **tentative merge**: for each candidate
+  ``(c, m)`` pair, tentatively replace centroid ``c``'s weights with
+  the freq-weighted merge of ``{c, m}``, run the layer-input batch
+  through a faithful student replica of the MoE block (including the
+  resized router), and compare the output against the pre-merge
+  output. Cost = output L2 distance summed over the reservoir batch.
+
+The four module-level helpers implement this:
+
+- ``_swiglu_forward`` — faithful single-expert SwiGLU forward
+  (gate / up / down). Also called by monolith-resident
+  ``_distill_merged_group`` and ``_heal_student_moe_output``, so its
+  re-import in ``stage2_reap_ream.py`` is load-bearing.
+- ``_router_routing_weights`` — top-k routing replica that matches the
+  resized router's dispatch behavior (renormalized top-k softmax,
+  per D-reap-routing-weight).
+- ``_tentative_merged_weights`` — in-memory freq-weighted weighted
+  average of ``{c, m}``'s gate/up/down (no model mutation), with the
+  same Hungarian neuron permutation alignment used by the merge step
+  (cached for that consumer; see D5b).
+- ``_output_space_cost`` — the top-level cost-matrix builder that runs
+  the K-prefilter (``cost_topk_filter``, default 48) and computes the
+  output-residual cost for the surviving (c, m) pairs.
+
+Why this is opt-in (not the default)
+------------------------------------
+Output-space cost requires a forward pass per candidate pair (or per
+top-K-prefiltered pair); even with the K-prefilter and the layer-input
+reservoir, it is materially more expensive than ``post`` (per-pair
+Frobenius norm) and ``pre`` (cosines off a single calibration pass).
+Gated behind ``cost_alignment="output"`` (default: ``"pre"`` → baseline
+REAM); used selectively when ablations indicate the merge damage is
+sensitive to the block-level interaction the proxies miss.
+
+Naming-history note
+-------------------
+"Direction C" is the project's STRATEGY_NEXT document label for this
+cost form. The current plugin architecture has no direction-letter
+taxonomy. New prose drops the label; existing log lines and Trackio
+keys retain "Direction C" identifiers for dashboard back-compat.
+
+Original module-header circular-import note retained
+----------------------------------------------------
+``_swiglu_forward`` is additionally called by monolith-resident code
+(``_distill_merged_group``, ``_heal_student_moe_output``), so its
+re-import is load-bearing.
 
 Circular-import note: this module imports only ``pipeline.permutation_align``,
 ``pipeline.base``, ``pipeline.context`` and ``moe_compress.utils.*`` — none of
@@ -315,7 +380,13 @@ class OutputSpaceCostPlugin:
     """
 
     name = "output_space_cost"
-    paper = "Direction C: output-space REAM merge-cost matrix builder."
+    paper = (
+        "Output-space merge-cost matrix (project-original; no paper). "
+        "Direction C from STRATEGY_NEXT §C. Replaces baseline REAM "
+        "arXiv:2604.04356 (see :mod:`stage2.plugins.ream_cost`). "
+        "End-to-end output L2 distance under tentative merge — opt-in via "
+        "cost_alignment='output'; default 'pre'. See module docstring."
+    )
     config_key = "stage2_reap_ream.cost_alignment"
     reads: tuple[str, ...] = _COST_PLUGIN_READS
     writes: tuple[str, ...] = _COST_PLUGIN_WRITES  # () — S2-10 moved the gate out
