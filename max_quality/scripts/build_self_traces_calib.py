@@ -33,19 +33,20 @@ Determinism
 -----------
 Greedy decoding (``do_sample=False``) under a fixed teacher + tokenizer +
 prompt set produces byte-identical traces, so the JSONL is reproducible and
-the cache invalidates correctly when ANY of the nine cache-key components
+the cache invalidates correctly when ANY of the ten cache-key components
 changes. The full key is:
 
   1. ``teacher_repo``        — HF repo id of the teacher
   2. ``teacher_revision``    — git revision / branch / tag at the repo
   3. ``prompts_source``      — composite of source-id + num_prompts + seed
   4. ``num_prompts``         — count of prompts requested (also in prompts_source)
-  5. ``max_new_tokens``      — generation cap
-  6. ``batch_size``          — folded in because eager-attention softmax
+  5. ``seed``                — RNG seed driving prompt shuffling (also in prompts_source)
+  6. ``max_new_tokens``      — generation cap
+  7. ``batch_size``          — folded in because eager-attention softmax
                                 reduction order varies with batch shape
-  7. ``load_in_4bit``        — NF4 vs BF16 teacher are not interchangeable
-  8. ``decode``              — currently fixed to "greedy"
-  9. ``schema_version``      — bump to invalidate ALL prior caches at once
+  8. ``load_in_4bit``        — NF4 vs BF16 teacher are not interchangeable
+  9. ``decode``              — currently fixed to "greedy"
+  10. ``schema_version``     — bump to invalidate ALL prior caches at once
 
 The cache-key is folded into the output filename so multiple variants can
 coexist on disk.
@@ -119,7 +120,7 @@ def _iter_prompts_from_qwen3_pretrain_mix(
         subset: max(1, int(num_prompts * weight))
         for subset, weight in _QWEN3_MIX_WEIGHTS.items()
     }
-    # H2: warn when num_prompts is too small for the smallest-weight subset to
+    # Warn when num_prompts is too small for the smallest-weight subset to
     # get its expected share. Threshold = 2 * num_subsets / min_weight; below
     # that point the int()-floor in per_subset truncates the smallest subsets
     # to 1 row each and the iteration-order short-circuit at the end of the
@@ -246,18 +247,22 @@ def _trace_cache_key(
     teacher_revision: str,
     prompts_source: str,
     num_prompts: int,
+    seed: int,
     max_new_tokens: int,
     batch_size: int,
     load_in_4bit: bool,
 ) -> str:
     """Compute the cache key.
 
-    ``batch_size`` and ``load_in_4bit`` are folded in (M1, M4) because:
+    ``batch_size`` and ``load_in_4bit`` are folded in because:
       * eager attention softmax reduction order varies with batch shape, so
         byte-identical greedy output is only guaranteed when batch_size is
         held constant;
       * NF4 quantization (load_in_4bit) materially changes teacher logits vs
         BF16, so the two are NOT interchangeable runs.
+    ``seed`` is a standalone payload field for symmetry with ``num_prompts``
+    (which is also embedded in ``prompts_source``); the redundancy makes the
+    invariance contract obvious from the payload alone.
     Bumping ``schema_version`` invalidates ALL prior caches at once.
     """
     payload = json.dumps({
@@ -265,11 +270,12 @@ def _trace_cache_key(
         "teacher_revision": teacher_revision,
         "prompts_source": prompts_source,
         "num_prompts": num_prompts,
+        "seed": int(seed),
         "max_new_tokens": max_new_tokens,
         "batch_size": batch_size,
         "load_in_4bit": bool(load_in_4bit),
         "decode": "greedy",
-        "schema_version": 2,
+        "schema_version": 3,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -281,7 +287,7 @@ def _trace_cache_key(
 
 def _load_teacher(repo: str, revision: str, load_in_4bit: bool, tokenizer=None):
     """Load the teacher model. Optionally accepts a pre-loaded ``tokenizer``
-    to avoid the duplicate HF-hub fetch (L2)."""
+    to avoid the duplicate HF-hub fetch."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -299,7 +305,7 @@ def _load_teacher(repo: str, revision: str, load_in_4bit: bool, tokenizer=None):
     }
     if load_in_4bit:
         from transformers import BitsAndBytesConfig
-        # M4: BF16 compute dtype is required for sane numerics on H100/H200;
+        # BF16 compute dtype is required for sane numerics on H100/H200;
         # without it bnb defaults to FP32 compute and the 4-bit path silently
         # diverges from the BF16 path in subtle (slow + slightly off) ways.
         kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -365,9 +371,9 @@ def _generate_traces(
     """
     import torch
 
-    # N2: only fall back to eos as pad when the tokenizer truly lacks a pad
+    # Only fall back to eos as pad when the tokenizer truly lacks a pad
     # token (Qwen3 ships with a distinct <|endoftext|> pad; preserving it
-    # keeps eos distinguishable from pad in gen_only). L2: if the tokenizer
+    # keeps eos distinguishable from pad in gen_only). If the tokenizer
     # exposes eos only as a list of ids (no string form / no eos_token_id),
     # peel off the first id and set pad_token_id directly so we don't end up
     # with pad_token=None silently.
@@ -390,7 +396,7 @@ def _generate_traces(
     # Left-pad so batched generate output is right-aligned for slicing.
     tokenizer.padding_side = "left"
 
-    # H1: precompute the EOS-id set once. Qwen3-thinking exposes multiple eos
+    # Precompute the EOS-id set once. Qwen3-thinking exposes multiple eos
     # ids (list); trimming by token-id before decoding is the only way to drop
     # the trailing padding/eos cleanly without relying on the string form of
     # `tokenizer.eos_token` (which is None when the tokenizer has multiple).
@@ -398,7 +404,7 @@ def _generate_traces(
 
     total = len(prompts)
     t0 = time.monotonic()
-    yielded = 0  # L4: count what we actually emit, not what we tried.
+    yielded = 0  # count what we actually emit, not what we tried.
     for i in range(0, total, batch_size):
         batch = prompts[i:i + batch_size]
         batch_prompts = [p for p, _ in batch]
@@ -420,7 +426,7 @@ def _generate_traces(
                 )
             rendered.append(text)
 
-        # M5: detect truncation. Tokenize once without a max_length cap so we
+        # Detect truncation. Tokenize once without a max_length cap so we
         # can compare the natural length against the 2048 ceiling and warn the
         # operator when a prompt is actually being clipped (math/code prompts
         # with long context windows). The double-tokenize cost is negligible
@@ -448,7 +454,7 @@ def _generate_traces(
             )
 
         gen_only = out_ids[:, inputs.input_ids.shape[1]:]
-        # H1: trim by token-id BEFORE decode. Handles single int eos_token_id,
+        # Trim by token-id BEFORE decode. Handles single int eos_token_id,
         # list-of-ints eos_token_id, and rows with no eos in gen uniformly.
         trimmed_rows = [
             _trim_at_first_eos(row.tolist(), eos_ids) for row in gen_only
@@ -471,18 +477,23 @@ def _generate_traces(
 
         elapsed = time.monotonic() - t0
         done = i + len(batch_prompts)
-        # L4: report both throughput metrics — prompts/s for batch-pacing,
-        # s/trace based on what actually landed in the JSONL.
+        # Report both throughput metrics — prompts/s for batch-pacing,
+        # s/trace based on what actually landed in the JSONL. The bracketed
+        # counters are absolute (lifetime) progress across resumed runs, but
+        # the s/trace + s/prompt averages are computed from this session's
+        # elapsed clock only — label them "session-avg" so the operator
+        # doesn't misread them as lifetime averages after --resume.
         s_per_trace = elapsed / yielded if yielded > 0 else float("inf")
-        # L3: surface ABSOLUTE progress across the full requested set, not
-        # just this session's slice. Loop indexing is unchanged — we only
-        # offset the numbers in the log.
+        # Surface ABSOLUTE progress across the full requested set, not just
+        # this session's slice. Loop indexing is unchanged — we only offset
+        # the numbers in the log.
         log_done = already_done + done
         log_total = already_done + total
         log_yielded = already_done + yielded
         log.info(
             "[%d/%d prompts processed, %d traces yielded] — "
-            "%.1fs elapsed (%.1f s/trace avg, %.1f s/prompt avg)",
+            "%.1fs session elapsed (%.1f s/trace session-avg, "
+            "%.1f s/prompt session-avg)",
             log_done, log_total, log_yielded,
             elapsed, s_per_trace, elapsed / max(done, 1),
         )
@@ -494,7 +505,7 @@ def _generate_traces(
 
 
 def _repo_exists_on_hub(repo: str) -> bool:
-    """Best-effort HF Hub preflight (L1). Returns True if the repo id is
+    """Best-effort HF Hub preflight. Returns True if the repo id is
     reachable OR if the huggingface_hub helper is unavailable (don't block on
     a missing optional dep). Returns False ONLY when the hub responds with a
     clean "not found" for the repo id.
@@ -557,7 +568,7 @@ def main() -> int:
                         "current prompt set, it is promoted to the final file.")
     args = p.parse_args()
 
-    # L1: HF Hub preflight catches the user's typo before we burn ~1-2s on
+    # HF Hub preflight catches the user's typo before we burn ~1-2s on
     # tokenizer-load + several seconds on model-load. We don't block on
     # network/auth failures — only on a confirmed "repo not found".
     if not _repo_exists_on_hub(args.teacher):
@@ -575,7 +586,7 @@ def main() -> int:
     cache_key = _trace_cache_key(
         args.teacher, args.teacher_revision,
         f"{args.prompts}#{args.num_prompts}#{args.seed}",
-        args.num_prompts, args.max_new_tokens,
+        args.num_prompts, args.seed, args.max_new_tokens,
         args.batch_size, args.load_in_4bit,
     )
     out_path = Path(args.output)
@@ -585,7 +596,7 @@ def main() -> int:
         )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
-        # L3: --resume + already-finished output is a no-op success, not an
+        # --resume + already-finished output is a no-op success, not an
         # error. The cache_key in the filename guarantees the prior run was
         # produced by the same (teacher, prompts, decode) tuple.
         if args.resume:
@@ -599,9 +610,9 @@ def main() -> int:
 
     log.info("output -> %s (cache_key=%s)", out_path, cache_key)
 
-    # Resolve prompts. Preload the tokenizer once (still reused by
-    # _load_teacher below via L2) — the prompt iterator itself doesn't need
-    # it, but the cached load avoids a duplicate hub round-trip.
+    # Resolve prompts. Preload the tokenizer once (reused by _load_teacher
+    # below) — the prompt iterator itself doesn't need it, but the cached
+    # load avoids a duplicate hub round-trip.
     bootstrap_tok = None
     if args.prompts == "qwen3-pretrain-mix":
         from transformers import AutoTokenizer
@@ -623,7 +634,7 @@ def main() -> int:
         log.error("no prompts gathered — check --prompts source.")
         return 1
 
-    # M3: underfill detection. When the source is exhausted before we hit
+    # Underfill detection. When the source is exhausted before we hit
     # --num-prompts the cache_key (which contains num_prompts) lies about the
     # actual content. Loud-warn so the operator notices on log scan, and stop
     # the run unless the user explicitly opts in to a smaller dataset by
@@ -641,7 +652,7 @@ def main() -> int:
 
     # Log empirical per-domain breakdown so the operator can verify the mix
     # before paying the teacher-forward bill.
-    from collections import Counter  # N3: drop the underscore alias.
+    from collections import Counter
     domain_counts = Counter(d for _, d in prompts)
     total_p = len(prompts)
     log.info("gathered %d prompts; per-domain mix: %s", total_p, {
@@ -679,13 +690,13 @@ def main() -> int:
                 last_existing_prompt = first_user
                 already_done += 1
         if already_done > 0:
-            # C1: CRITICAL guard. If the .tmp holds more rows than the
-            # current run's prompt list, the old `prompts = prompts[already_done:]`
-            # slice silently emptied the list and the "no more work" branch
-            # promoted a .tmp with MORE rows than the requested num_prompts
-            # to a final file whose cache_key claims a smaller count. Abort
-            # loudly instead — the user must either delete the .tmp or raise
-            # --num-prompts to match.
+            # Critical guard: if the .tmp holds more rows than the current
+            # run's prompt list, the naive `prompts = prompts[already_done:]`
+            # slice would silently empty the list and the "no more work"
+            # branch would promote a .tmp with MORE rows than the requested
+            # num_prompts to a final file whose cache_key claims a smaller
+            # count. Abort loudly instead — the user must either delete the
+            # .tmp or raise --num-prompts to match.
             if already_done > len(prompts):
                 log.error(
                     "resume: .tmp at %s contains %d valid rows but the current "
@@ -698,7 +709,7 @@ def main() -> int:
                     args.num_prompts, already_done,
                 )
                 return 1
-            # M2: compare both ends of the resumed range. Drift at row 2+ is
+            # Compare both ends of the resumed range. Drift at row 2+ is
             # caught by the LAST-row check; row-0 drift was already caught.
             if first_existing_prompt != prompts[0][0]:
                 log.error(
@@ -730,7 +741,7 @@ def main() -> int:
                 return 0
             prompts = prompts[already_done:]
     elif args.resume and not tmp_path.exists():
-        # L5: --resume but no .tmp is a benign "fresh start"; surface it so
+        # --resume but no .tmp is a benign "fresh start"; surface it so
         # the operator notices if they expected a recovery.
         log.info("resume: --resume requested but no .tmp found at %s; "
                  "starting a fresh run.", tmp_path)
@@ -738,7 +749,7 @@ def main() -> int:
         log.warning("existing .tmp at %s will be OVERWRITTEN (--resume not set). "
                     "Pass --resume to recover its rows instead.", tmp_path)
 
-    # L2: reuse the bootstrap tokenizer when present to avoid a second hub
+    # Reuse the bootstrap tokenizer when present to avoid a second hub
     # round-trip for the exact same repo+revision.
     model, tokenizer = _load_teacher(
         args.teacher, args.teacher_revision, args.load_in_4bit,
