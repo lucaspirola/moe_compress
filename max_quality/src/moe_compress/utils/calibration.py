@@ -39,6 +39,12 @@ log = logging.getLogger(__name__)
 # kwarg; subsequent rows stay quiet to avoid log spam.
 _enable_thinking_unsupported_warned = False
 
+# N-C — one-shot guard for the qwen3-pretrain-mix intro log. Without it the
+# "broad-instruct-mix (legacy name retained)" banner repeats once per
+# build_calibration_tensor call (~6× per pipeline run); the message is
+# orientation, not progress, so cap it at one emission per process.
+_broad_instruct_mix_intro_logged: bool = False
+
 
 # Valid domain names for the legacy c4-math-code source.
 _LEGACY_DOMAINS = frozenset({"c4", "math", "code"})
@@ -1197,11 +1203,17 @@ def _stream_texts_qwen3_pretrain_mix(spec: CalibrationSpec, tokenizer) -> list[s
     texts: list[str] = []
     # N4: corpus identifier "qwen3-pretrain-mix" is the historical config-compat
     # name; the SHAPE is instruct/SFT-target (see file-top note ~lines 941-980).
-    log.info(
-        "qwen3-pretrain-mix: building broad-instruct-mix (legacy name retained "
-        "for config compat) for %d sequences x %d tokens (target_total=%d).",
-        spec.num_sequences, spec.sequence_length, target_total_tokens,
-    )
+    # N-C — fire the orientation banner once per process; per-call repeats add
+    # noise without information across the ~6 build_calibration_tensor calls
+    # in a pipeline run.
+    global _broad_instruct_mix_intro_logged
+    if not _broad_instruct_mix_intro_logged:
+        log.info(
+            "qwen3-pretrain-mix: building broad-instruct-mix (legacy name retained "
+            "for config compat) for %d sequences x %d tokens (target_total=%d).",
+            spec.num_sequences, spec.sequence_length, target_total_tokens,
+        )
+        _broad_instruct_mix_intro_logged = True
     for subset, weight in _QWEN3_MIX_WEIGHTS.items():
         target_subset_tokens = int(target_total_tokens * weight)
         avg_tok = _QWEN3_MIX_AVG_TOKENS[subset]
@@ -1416,9 +1428,14 @@ def _load_self_traces_state(path) -> dict:
         )
 
     by_domain: dict[str, list[int]] = {}
+    # N-D — build the inverted index ``domain_of`` once at load time so each
+    # draw can look up an index's domain in O(1) rather than rebuilding the
+    # O(total_rows) inverse from ``by_domain`` on every call.
+    domain_of: dict[int, str] = {}
     for i, row in enumerate(rows):
         d = row.get("domain") or "unknown"
         by_domain.setdefault(d, []).append(i)
+        domain_of[i] = d
 
     total = sum(len(v) for v in by_domain.values())
     weights = {d: len(v) / total for d, v in by_domain.items()}
@@ -1445,6 +1462,9 @@ def _load_self_traces_state(path) -> dict:
     state = {
         "rows": rows,
         "by_domain": by_domain,
+        # N-D — cached inverted index for O(1) row-index → domain lookup
+        # in _draw_self_traces_indices (avoids rebuilding it per draw).
+        "domain_of": domain_of,
         "weights": weights,
         # H2 — per-domain blacklist map; lazy-initialised in
         # _draw_self_traces_indices via setdefault(d, set()).
@@ -1523,9 +1543,14 @@ def _draw_self_traces_indices(
     # domain blacklists; a small domain exhausting must not whitelist the
     # rest of the run).
     def _available(blist_map: dict[str, set[int]]) -> dict[str, list[int]]:
+        # N-A — ``get`` keeps this a pure read; ``setdefault`` would mutate
+        # ``blist_map`` mid-read by inserting empty-set entries for every
+        # domain. Harmless (empty sets are idempotent for the ``not in``
+        # filter) but clearer to avoid the side effect. ``get`` returns a
+        # fresh local empty set for absent keys — no shared-state risk.
         return {
             d: [i for i in idx_list
-                if i not in blist_map.setdefault(d, set())]
+                if i not in blist_map.get(d, set())]
             for d, idx_list in by_domain.items()
         }
 
@@ -1571,6 +1596,15 @@ def _draw_self_traces_indices(
                 "will be approximated, not exact).",
                 details,
             )
+            # N-B — rebuilding ``selected`` from scratch here repeats the
+            # shuffles ``_try_draw`` already performed for non-shortfall
+            # domains. Because ``_domain_rng(d)`` is deterministic per
+            # (seed, domain) and non-shortfall blacklists haven't moved
+            # since the second ``_try_draw``, the rebuilt selection
+            # coincides with what ``_try_draw`` would have produced —
+            # the redundant shuffle work is cheap and only fires on this
+            # rare undersized-JSONL fallback path. Trade-off: clearer
+            # code over reusing the prior partial selection.
             selected = []
             for d, quota in per_domain_quota.items():
                 pool = available.get(d, [])
@@ -1580,11 +1614,11 @@ def _draw_self_traces_indices(
                 selected.extend(shuffled[:quota])
 
     # Update each domain's blacklist with the indices we just served.
+    # N-D — reuse the cached inverted index from _load_self_traces_state
+    # (built once at load time) instead of rebuilding the O(total_rows)
+    # inverse on every draw.
+    domain_of: dict[int, str] = state["domain_of"]
     selected_by_domain: dict[str, set[int]] = {}
-    domain_of: dict[int, str] = {}
-    for d, idx_list in by_domain.items():
-        for i in idx_list:
-            domain_of[i] = d
     for i in selected:
         d = domain_of.get(i)
         if d is None:
