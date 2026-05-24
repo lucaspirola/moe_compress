@@ -67,7 +67,14 @@ def _populated_ctx(tiny_model, tiny_config, tmp_path) -> PipelineContext:
 def test_plugin_protocol_attributes():
     p = MADetectionPlugin()
     assert p.name == "ma_detection"
-    assert p.paper.startswith("MA-formation")
+    # `paper` must cite the source paper (arXiv:2507.23279, "Super Experts in
+    # MoE Models", Algorithm 1 Appendix L Stage 1) AND the golden official-code
+    # commit (ZunhaiSu/Super-Experts-Profilling @
+    # 573aead3127ae593ba267758b832944f8fed1485) since the dual-signal detector
+    # is project-original — paper Algorithm 1 line 8 is deliberately undefined.
+    assert "arXiv:2507.23279" in p.paper
+    assert "Algorithm 1" in p.paper
+    assert "573aead3127ae593ba267758b832944f8fed1485" in p.paper
     assert p.config_key == "stage1_grape.super_expert_detection"
     assert p.reads == ("model", "tokenizer", "config", "artifacts_dir", "device")
     assert p.writes == (

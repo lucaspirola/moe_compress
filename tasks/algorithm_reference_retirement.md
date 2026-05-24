@@ -34,12 +34,30 @@ For each plugin's citations:
     line numbers and the paper's PDF line/§ numbers may differ — use the
     `source.md` (project-canonical) numbering.
   * **Claims attributed to the paper** that are NOT in `source.md` must be
-    treated as suspect — either drop them or re-attribute to the actual source
-    (often the paper's official code).
+    treated as suspect — never silently drop them. **Run git archaeology**
+    (`git log --all -p -S "<value>"` on the relevant file, including the
+    pre-refactor monoliths) to find the origin: many "paper" values turn
+    out to be project's earlier empirical calibrations encoded into source
+    code, then mis-attributed by `ALGORITHM_REFERENCE.md` to the paper.
+    Preserve full project history (commit SHAs of the introduction and any
+    later changes) in the plugin's docstring.
   * When a paper has officially-released code, fetch the **default-branch HEAD
     SHA** via `gh api repos/<owner>/<repo>/commits/HEAD --jq .sha` and pin it
-    in the docstring. Re-verify the SHA only if the upstream repo's behaviour
-    changes; otherwise the pinned SHA is the golden reference.
+    in the docstring. Cross-check the relevant code paths against the
+    pinned SHA — many "paper says X" claims turn out to be "official code
+    says X" claims (and vice versa). Re-verify the SHA only if the upstream
+    repo's behaviour changes; otherwise the pinned SHA is the golden
+    reference.
+
+**Worked example (ma_detection):** ALGORITHM_REFERENCE.md said *"the paper's
+5.0 calibration applies"* for un-gated architectures. The paper has no 5.0;
+the official code has no 5.0 either (it uses only the 0.75 depth heuristic).
+Git archaeology found 5.0 introduced in commit `3db7d80` (as an
+"implementation choice"), confirmed as the production value on Qwen3-30B in
+`40956e3`, then recalibrated to 3.0 for Qwen3.5/3.6 in `172e72e`. Truth:
+both 5.0 and 3.0 are project-original empirical calibrations attested by
+git history; ALGORITHM_REFERENCE.md was wrong to attribute 5.0 to the paper.
+The redone ma_detection docstring preserves the full archaeology.
 
 ## Policy — Phase A/B/C/D/E/F labels
 
