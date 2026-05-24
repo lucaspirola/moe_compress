@@ -1,5 +1,43 @@
 """HumanEval pass@1 generative eval (S6-4 of the Stage 6 plugin refactor).
 
+Paper / dataset
+----------------
+HumanEval — Chen et al. 2021 "Evaluating Large Language Models Trained
+on Code" (arXiv:2107.03374). pass@1 metric: each problem stub is
+wrapped in the model's chat template, the model generates a
+completion, and the completion is scored by exec'ing the dataset's
+reference unit test.
+
+Deviation: D-humaneval-greedy
+-----------------------------
+Paper protocol: **stochastic** pass@1 estimated from ``n=10`` samples
+per problem at ``T=0.2, top_p=0.95``, then unbiased pass@k formula;
+**exec-based scoring runs each problem in a subprocess sandbox**.
+
+This plugin's protocol:
+
+  (a) **Greedy decoding** pass@1: ``do_sample=False, n=1``, no
+      temperature, no top_p, single sample per problem.
+  (b) Exec-based scoring runs **in-process**, NOT in a subprocess
+      sandbox: tests can leak ``sys.modules`` / signal handlers /
+      ``os.environ`` mutations across problems. Both teacher and
+      student see the same in-process leakage so the
+      relative-to-teacher gate is not biased.
+
+Rationale: greedy is lower-variance and reproducible across runs
+without seed plumbing, sufficient for **relative-to-teacher gating**
+(the gate is a 3pp absolute drop vs the same-protocol teacher score,
+not against published baselines). **Absolute pass@1 numbers will not
+match published Chen et al. 2021 baselines** and must not be compared
+to them. The gate's batched-vs-bs=1 numerical-identity claim (#3, #4
+in ``VALIDATED_STRATEGIES``) holds under greedy decoding only.
+
+In-process exec is documented because subprocess isolation would slow
+eval substantially with no signal-quality benefit for the relative
+gate; see ``stage6_validate.py`` module docstring "Known limitations"
+subsection for the operational caveats (daemon-thread leakage, no
+syscall interruption, no seccomp / landlock).
+
 Home of the Stage 6 HumanEval concern, extracted from the legacy
 ``stage6_validate.py`` monolith. HumanEval is the code-generation half of the
 Stage 6 generative gate: each problem stub is wrapped in the model's chat
@@ -254,11 +292,7 @@ class HumanEvalPlugin:
     """
 
     name = "humaneval"
-    paper = (
-        "HumanEval pass@1 -- Chen et al. 2021, Evaluating Large Language "
-        "Models Trained on Code (arXiv:2107.03374); Stage 6 validation gate, "
-        "generative half, Spec D-humaneval-greedy (greedy single-sample)."
-    )
+    paper = "HumanEval pass@1 — Chen et al. 2021 arXiv:2107.03374. Deviation D-humaneval-greedy (greedy n=1 + in-process exec; relative-to-teacher gating only). See module docstring."
     config_key = "stage6_validate.generative.enabled"
     reads: tuple[str, ...] = ("model", "tokenizer", "config", "dataset_revisions")
     writes: tuple[str, ...] = ("eval_results",)

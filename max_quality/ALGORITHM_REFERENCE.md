@@ -274,154 +274,15 @@ Shared experts (`mlp.shared_expert`) are **not in the blacklist** and are not pr
 
 ---
 
-## 9. Stage 6 — Validation
-
-**File:** [`stage6_validate.py`](src/moe_compress/stage6_validate.py)
-**Hardware:** Runs on the same H200 instance as Stage 5 (student model stays resident).
-
-### What
-
-Evaluates the compressed model against the uncompressed teacher on 5 metrics, enforces hard quality gates, and produces an imatrix file for downstream GGUF quantization. On H200 the larger VRAM headroom allows larger batch sizes for all evaluation phases.
-
-### Metrics
-
-| Metric | Method | Threshold |
-|--------|--------|-----------|
-| WikiText-2 PPL | Per "WikiText-2 PPL Protocol" below (F-S-C-1: 2048-token non-overlapping chunks, drop last partial, micro-averaged shifted-position NLL) | ≤ +3% relative |
-| ARC-C accuracy | lm-eval harness, 0-shot | ≤ 1.5pp absolute drop |
-| HellaSwag accuracy | lm-eval harness, 0-shot | ≤ 1.5pp absolute drop |
-| HumanEval pass@1 | Greedy pass@1 (do_sample=False, n=1) — NOT Chen et al. 2021 stochastic pass@1 (n=10, T=0.2, top_p=0.95). See [D-humaneval-greedy](#12-known-deviations-from-papers). Exec-based scoring (**in-process**, NOT Chen et al.'s subprocess sandbox — see [D-humaneval-greedy] for the in-process safety/correctness disclosure). | ≤ 3pp absolute drop |
-| MATH-500 accuracy | `HuggingFaceH4/MATH-500` (revision pinned in run config under `dataset_revisions`); in-tree grader (`stage6_validate.py:_check_math`): `\boxed{}` extraction first; if missing, `_parse_latex` fallback; final SymPy `simplify(comp − ref) == 0` check with numeric (`_last_numeric`) tie-break. Grader is project-original (NOT the Hendrycks et al. 2021 `math_equivalence.py`); absolute MATH-500 numbers may differ from published Hendrycks-grader baselines but are consistent across teacher/student under the same project grader, sufficient for the relative-to-teacher gate | ≤ 3pp absolute drop |
-
-#### WikiText-2 PPL Protocol (F-S-C-1)
-
-This protocol is the canonical Stage 6 PPL definition; §6 Phase B.2's α-search PPL evaluation (line ~503) is required to use the **identical** protocol so that Stage 3 selection and Stage 6 gating are consistent. (§6 Phase D α-search must use this identical protocol — the back-reference in §6 line ~503 is added in Track C iter-3.)
-
-- **Corpus.** `wikitext-2-raw-v1`, `test` split (HuggingFace dataset id `Salesforce/wikitext`, name `wikitext-2-raw-v1`). The exact dataset revision (commit sha) is recorded in `dataset_revisions` and folded into the teacher cache key.
-- **Concatenation.** All test rows are concatenated into a single token stream. **BOS policy:** apply the tokenizer's default `add_special_tokens=True` once on the concatenated text (one BOS at stream head if the tokenizer adds one; otherwise no BOS — both are spec-compliant; the chosen policy is "delegate to tokenizer default" so the same tokenizer config produces identical chunking across runs). For Qwen3-30B-A3B, the default tokenizer does not add BOS, so the stream begins at the first wikitext token. **Cross-model portability:** if a future target model's tokenizer adds a BOS by default, the policy still applies — the BOS counts as one token in the first chunk; the chunking (non-overlapping 2048-token blocks, drop last partial) is unchanged. No per-row BOS injection. Row-to-row separator: the **two-newline (`"\n\n"`) join** is the project convention, matching the canonical HF `evaluate` / `lm-eval` WikiText-2 PPL recipe; the same join is also used by the imatrix calibration corpus build (see "imatrix Generation" below) so the PPL eval and imatrix activation statistics see comparable token distributions. (F-iter4-M-1.)
-- **Chunking.** Non-overlapping fixed-length chunks of **2048 tokens**. Stride = chunk_len (no overlap, no sliding window). The seq_len choice matches Swift-SVD's 2048-token calibration-sample length (Appendix A.2 of 2604.01609); the project re-uses this length for non-overlapping evaluation chunks. The drop-last-partial and concatenation-with-BOS conventions are project-chosen (community-convention HuggingFace `evaluate` / `lm-eval` PPL recipes).
-- **Last-chunk policy.** The incomplete final chunk is **dropped** (no padding, no shorter-chunk inclusion).
-- **NLL aggregation.** Micro-average over all shifted token positions across all retained chunks:
-  ```
-  PPL = exp( Σ_{chunks} Σ_t NLL_t  /  Σ_{chunks} (chunk_len − 1) )
-  ```
-  Each retained chunk contributes exactly `chunk_len − 1 = 2047` shifted positions; the denominator is therefore `(num_chunks_retained) × 2047`.
-
-### Measured Reduction
-
-The actual parameter reduction is computed from live parameter counts (accounting for effective ranks in FactoredExperts). Must be ≥ 30.0%.
-
-**Definition (per F-S-M-3).**
-```
-Measured Reduction = 1 − live_param_count(student) / live_param_count(teacher)
-```
-where `live_param_count(model)` includes **all** model parameters: token embeddings, attention projections (DeltaNet linear attention + full attention), MoE expert weights (routed experts, including FactoredExperts U/V factors counted at their per-expert effective ranks; routers; shared experts), all RMSNorm scale parameters (must be registered as `nn.Parameter`, not buffers — true for Qwen3-30B-A3B and the target model), and `lm_head`. Excludes optimizer state, KV cache, and activation buffers (these are not model parameters). Both numerator and denominator are computed via the same iteration over `model.parameters()` with `requires_grad`-agnostic counting; if a future architecture registers any of the listed components as a buffer, the iteration must be extended to `chain(model.parameters(), filtered_buffers)` to maintain ratio symmetry.
-
-### Execution Model (Compute-Time Optimized)
-
-Stage 6 runs the following phases. All optimizations are purely computational scheduling — larger batches, cached known-constants, overlapped I/O, and torch.compile. **No metric, formula, threshold, or evaluation methodology is changed.** Outputs are numerically equivalent to the batch_size=1 baseline up to torch.compile/CUDA-graph kernel-selection variance (optimizations #1–#4 are bit-identical under the protocol prerequisites listed below; #5 `torch.compile(mode="reduce-overhead")` introduces non-bit-level run-to-run variance that does not change algorithmic correctness — see #5 row in the Spec Compliance table for the precise scope).
-
-#### Phase 1: Student Evaluation
-
-| Sub-phase | Optimization | Config Key | Default |
-|-----------|-------------|------------|---------|
-| WikiText-2 PPL | **#1** — batch_size=1→8 | `ppl_batch_size` | 8 |
-| ARC-C + HellaSwag | **#2** — lm-eval batch_size=1→auto:8 | `lm_eval_batch_size` | `"auto:8"` |
-| HumanEval (164 prompts) | **#3** — batched model.generate() | `gen_batch_size` | 8 |
-| MATH-500 (500 prompts) | **#4** — batched model.generate() | `gen_batch_size` | 8 |
-
-**Pinned generation configuration for #3 / #4 (binding requirements for the bs=1 / batched argmax-identity claim per F-S-H-2):**
-- `tokenizer.padding_side = "left"` (left-padding is mandatory; right-padding would break the KV-cache identity)
-- `attention_mask` zeroed at pad positions (mandatory; keeps attention output unaffected by padded tokens)
-- `tokenizer.pad_token_id` is set explicitly (HumanEval/MATH-500 prompts must have a deterministic pad token)
-- `attn_implementation = "eager"` (forced by Stage 6 regardless of upstream config; see F-S-M-1)
-- `do_sample = False`, `n = 1` (greedy single-sample; see D-humaneval-greedy)
-- KV-cache reuse enabled (`use_cache=True`, the HF default)
-
-**torch.compile** (**#5**, `torch_compile: true`): Before any evaluation begins, `model.forward` is compiled via `torch.compile(model.forward, dynamic=True, mode="reduce-overhead")`. `dynamic=True` handles variable-length padded batches from lm-eval. One-time compilation cost (~3–5 min on H200) is amortized across 1000+ forward passes. **Only** the forward pass is compiled — `model.generate()` is **not** wrapped with `torch.compile`, but each decoding step internally calls the compiled `model.forward`, so generative evals (HumanEval, MATH-500) DO benefit from the compiled forward; only the generate-loop control flow itself runs eagerly. Wrapping `model.generate()` directly was avoided because the prefill-vs-decode shape transition can still trigger one extra recompile; the per-step forward path is the dominant cost and is fully captured.
-
-#### Phase 2 (Background): Teacher I/O Overlap — concurrent with Phase 1 (#6)
-
-The teacher preload begins as early as Phase 1 entry (host-RAM-only, GPU-independent — no contention with student evals). In the most conservative scheduling, it begins during Phase 1's generative evals (after the zero-shot harness completes), but starting earlier (during PPL or zero-shot) is also safe and may better hide the load: a background thread loads the teacher model to **host RAM** (device_map="cpu") while the GPU runs HumanEval and MATH-500. When Phase 1 completes, the student is moved to CPU, and the pre-loaded teacher is moved to GPU — eliminating the ~3–5 min dead time that a blocking teacher load would cause.
-
-#### Phase 3: Teacher Evaluation (or Cache Hit)
-
-**Teacher eval caching** (**#7**, `teacher_eval_cache.enabled: true`): The teacher (uncompressed Qwen3-30B-A3B) is a fixed, known model. Every Stage 6 run re-evaluates the same teacher on the same benchmarks with the same results. When caching is enabled:
-
-- **First run:** Teacher is evaluated normally (PPL + zero-shot + generative). Results and param counts are saved to `teacher_eval_cache.json` with a cache key composed of the following inputs (each component is either an HF revision-sha or a `pkg.__version__` string), joined and hashed via SHA-256 (per F-S-H-3):
-  ```
-  sha256(model_name + "\x1f" + revision + "\x1f" + tokenizer_revision
-       + "\x1f" + dataset_revisions + "\x1f" + lm_eval_version
-       + "\x1f" + transformers_version + "\x1f" + dtype
-       + "\x1f" + attn_impl + "\x1f" + eval_config_subset)
-  ```
-  Implementation: components are assembled into a Python dict with the listed keys, then serialized via `json.dumps(payload, sort_keys=True, separators=(",",":"))` and SHA-256 hashed. The pseudocode `+ "\x1f" +` notation above is illustrative of the deterministic-byte-representation goal; the canonical-JSON serialization with sorted keys provides equivalent reproducibility (and is what the implementation uses). `eval_config_subset` is the run config's `wikitext2`, `zero_shot`, `generative` subdicts as-is (operators must avoid putting non-numerical-affecting keys like file paths or log levels inside those three blocks; the cache will invalidate if such a key is changed, which is conservative but harmless). `dataset_revisions` is the JSON-canonicalized mapping `{"wikitext_ppl": "<sha>", "humaneval": "<sha>", "math500": "<sha>"}` serialized with sorted keys before concatenation. **F-iter4-HIGH-1 limitation:** the lm-eval-managed datasets (HellaSwag, ARC-Challenge) are intentionally **not** pinned in this mapping — `lm-eval` resolves their revisions internally and our `simple_evaluate(...)` call cannot enforce a SHA at load time. The cache key compensates by folding in `lm_eval_version` and a SHA-256 of the lm-eval task config (task list + lm_eval_batch_size); precise per-dataset SHA control for those tasks requires editing lm-eval task YAMLs out-of-band.
-  The cache file is atomically written only after ALL configured teacher metrics have been computed; partial caches are never persisted. See §11 for the full atomic-write contract.
-- **Subsequent runs:** Cached teacher results are loaded directly. No teacher model load, no teacher evaluation. This eliminates ~50% of total Stage 6 wall-clock time.
-- **Auto-invalidation:** If any cache-key component changes (model/tokenizer/dataset revision, lm-eval or transformers package version, dtype, attention implementation, or any parameter in the recorded eval-config subset), the cache key mismatches and the teacher is re-evaluated.
-
-When the cache misses, teacher evaluation uses the same batch sizes and torch.compile as student evaluation. To remove cross-batch kernel variance, the gate run pins `attn_implementation='eager'` (per F-S-M-1; see "Spec Compliance of Optimizations" below).
-
-#### Phase 4: GGUF Conversion Overlap (#8)
-
-When the teacher is being evaluated on GPU, the GGUF conversion (`convert_hf_to_gguf.py`) runs simultaneously in a **background CPU thread**. This is safe because GGUF conversion reads from the saved Stage 5 checkpoint on disk (CPU-only, ~5–10 min) — the checkpoint is durable per §11's atomic-write contract before this thread starts — teacher evaluation runs on GPU, and CPU and GPU work are fully independent. When teacher eval finishes and the teacher is freed, the F16 GGUF is ready — `llama-imatrix` can start immediately. **On a teacher-cache HIT** (no teacher evaluation runs), there is no GPU work to overlap GGUF conversion with after Phase 3, so the GGUF conversion runs **sequentially** as part of Phase 4/5 (`_generate_imatrix` calls `convert_hf_to_gguf.py` then `llama-imatrix` in order on the main thread). The cache-hit path therefore loses the ~5–10 min overlap benefit but still completes Phase 4+5 in a single sequential pass after student evals.
-
-**GGUF dtype path (F-S-L-3).** `convert_hf_to_gguf.py` reads BF16 / F32 weights from the HF checkpoint and writes an **F16 GGUF** (`model_f16.gguf`) as the conversion target — F16 is the source dtype for imatrix-guided quantization downstream; no quantization happens at this step.
-
-#### Phase 5: imatrix Generation
-
-After the teacher is freed from VRAM, `llama-imatrix` runs on the F16 GGUF (pre-built in Phase 4) with a **benchmark-independent calibration corpus** (per F-S-H-4 option (a); see "imatrix Generation" below).
-
-### Spec Compliance of Optimizations
-
-| Optimization | Why Numerically Identical |
-|---|---|
-| #1 PPL batch_size=8 | Numerically identical to bs=1 **under the F-S-C-1 protocol** (concatenated 2048-token chunks, drop last partial). The identity `out.loss × (chunk_len − 1) × num_chunks_in_batch` recovers the exact summed NLL because every chunk has the same shifted-position count and there is no padding. With ragged batches or padding, the identity does not hold. (per F-S-H-1) |
-| #2 lm-eval batch_size=auto:8 | Task-equivalent within harness tolerance (lm-eval `auto` adapts to GPU memory; sdpa kernel may produce non-bitwise outputs across batch sizes). The Stage 6 gate run pins `attn_implementation='eager'` to remove this source of variance; under eager attention plus left-padding with a causal attention mask, loglikelihood scoring is batch-size-independent. (per F-S-M-1) |
-| #3, #4 Batched generate | **Greedy bs=1 vs batched: argmax-identical when left-padded with attention-mask zeros, KV-cache reuse, AND `attn_implementation="eager"` (the same eager-pin used for #2) — true under do_sample=False.** Under SDPA/flash, batched-vs-bs=1 logits can drift by ~1e-5–1e-4 and flip argmax on near-tied tokens, breaking the claimed identity; eager attention removes this. This identity would NOT hold under stochastic sampling. (per F-S-H-2; eager pin per F-S-M-1) |
-| #5 torch.compile | No algorithmic approximation in default/reduce-overhead modes. Bit-level equivalence is **not guaranteed across runs** in `reduce-overhead` mode because CUDA-graph capture is order-sensitive and selected kernels can vary. The spec already documents torch_compile as valid in Stage 5. (per F-S-L-2) |
-| #6 Teacher I/O overlap | Computation unchanged — only I/O scheduling differs |
-| #7 Teacher eval cache | Teacher is deterministic — same model + same eval = same numbers. Cache key composition is fully specified above (Phase 3) and includes model/tokenizer/dataset revisions, lm-eval and transformers versions, dtype, attn_impl, and eval-config subset. |
-| #8 GGUF overlap | GGUF conversion reads from saved checkpoint, independent of GPU evaluation |
-
-### vLLM Note
-
-vLLM is **NOT viable** for this model. The compressed model uses a custom `FactoredExperts` nn.Module that replaces the standard `Qwen3_5MoeExperts`. vLLM requires its own model-specific forward implementation and weight loader — it cannot load arbitrary custom nn.Module subclasses. The weight names (`gate_proj_U`, `gate_proj_V`, etc.) don't match what vLLM's Qwen3MoE loader expects. Stick with HuggingFace `model.forward()` and `model.generate()`.
-
-### imatrix Generation
-
-**Calibration corpus (F-S-H-4, option (a) — community convention).** Stage 6 uses a **benchmark-independent calibration corpus** for `llama-imatrix`: the **WikiText-2 `train` split** (`wikitext-2-raw-v1`, dataset id `Salesforce/wikitext`, name `wikitext-2-raw-v1`). Eval-text reuse was rejected to match community convention and to avoid biasing imatrix statistics toward the eval distribution. After the teacher is freed, the final frozen model is converted to F16 GGUF and `llama-imatrix` runs on the wiki.train calibration text, producing `imatrix.gguf`. The concatenation of eval-text is still emitted to `eval_text_concat.txt` as a debugging side-channel (it is **not** the imatrix calibration input).
-
-**Artifacts:**
-
-| File | Description |
-|------|-------------|
-| `stage6_eval.json` | Quality gate results (metrics + pass/fail) |
-| `teacher_eval_cache.json` | Cached teacher eval results + param counts (when caching enabled). Atomic-write contract per §11. |
-| `calibration_wiki_train.txt` | wiki.train calibration corpus actually fed to `llama-imatrix` (the input that produced `imatrix.gguf`). |
-| `eval_text_concat.txt` | Concatenated eval text from all benchmarks (debugging side-channel only; **not** the imatrix calibration input). |
-| `model_f16.gguf` | Intermediate F16 GGUF of the compressed student (per F-S-L-3 path) |
-| `imatrix.gguf` | Final importance matrix for GGUF quantization |
-
-llama.cpp is built in the background by the job entrypoint (daemon thread, starts when Stage 1 begins) so the ~5-minute build does not add to wall-clock time. If llama.cpp is unavailable, `eval_text_concat.txt` is still written and Stage 6 passes normally.
-
-### Expected Wall-Clock Impact
-
-| Scenario | Student Evals (incl. compile) | Teacher Evals | imatrix | Total |
-|---|---|---|---|---|
-| Baseline (batch_size=1, no cache) | ~90–150 min | ~90–150 min | ~20 min | ~200–320 min |
-| After P0 (#7 cache, #2 lm-eval) | ~30–50 min | 0 min (cached) | ~20 min | ~50–70 min |
-| After P0 + P1 (#1 PPL, #3/#4 gen) | ~10–20 min | 0 min | ~20 min | ~30–40 min |
-| After all optimizations | ~11–20 min (incl. ~3–5 min torch.compile) | 0 min | ~15 min (overlapped) | ~25–30 min |
-
-Per F-S-N-2: the one-time torch.compile cost (~3–5 min on H200) is folded into the "Student Evals" line for honesty rather than reported as a separately amortized cost.
-
-Expected improvement: **~8–12× end-to-end wall-clock reduction**, from ~3–5 hours down to ~25–30 minutes.
-
-### Resume
-
-Stage 6 is stateless. Re-running is always safe. The teacher eval cache persists across runs (it's a JSON file in the artifacts directory, also uploaded to Hub).
-
+<!-- §9 Stage 6 (Validation) — CONSUMED by stage6/plugins/*
+     (commits pending). Full §9 narrative — eval-task papers
+     (WikiText-2 arXiv:1609.07843, HumanEval arXiv:2107.03374,
+     MATH-500 arXiv:2103.03874 / Lightman 2024, lm-eval-harness
+     ARC + HellaSwag), validation gate thresholds, teacher-cache
+     SHA-256 invariant + dataset-revision pinning, batched
+     bs-invariant claims, deviation D-humaneval-greedy, imatrix
+     export flow, and validation_report assembly — all relocated
+     into stage6/plugins/* module docstrings. -->
 
 ---
 
@@ -560,7 +421,7 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 <!-- D-no-intra-block-cascade — CONSUMED by stage3/plugins/aa_svd_factor.py (commit pending). -->
 <!-- D-drank-premerge-A — CONSUMED by stage3/plugins/d_rank_allocate.py (commit pending). -->
 <!-- D-c5-moe-only — CONSUMED by stage3/plugins/block_refine.py (commit pending). -->
-| D-humaneval-greedy | 6 | HumanEval pass@1 protocol (greedy + in-process exec) | Chen et al. 2021 (canonical HumanEval): stochastic pass@1 estimated from n=10 samples per problem at temperature T=0.2 with top_p=0.95, then unbiased pass@k formula; **exec-based scoring runs each problem in a subprocess sandbox** | (a) Greedy decoding pass@1 (do_sample=False, n=1, no temperature, no top_p), single sample per problem. (b) Exec-based scoring runs **in-process**, NOT in a subprocess sandbox: tests can leak `sys.modules` / signal handlers / `os.environ` mutations across problems. Both teacher and student see the same in-process leakage so the relative-to-teacher gate is not biased. | Greedy is lower-variance and reproducible across runs without seed plumbing, sufficient for **relative-to-teacher gating** (the gate is a 3pp absolute drop vs the same-protocol teacher score, not against published baselines). **Absolute pass@1 numbers will not match published Chen et al. 2021 baselines** and must not be compared to them. The gate's batched-vs-bs=1 numerical-identity claim (#3, #4) holds under greedy decoding only. In-process exec is documented because subprocess isolation would slow eval substantially with no signal-quality benefit for the relative gate; see `stage6_validate.py` module docstring "Known limitations" subsection for the operational caveats (daemon-thread leakage, no syscall interruption, no seccomp/landlock). |
+<!-- D-humaneval-greedy — CONSUMED by stage6/plugins/humaneval.py (commit pending). -->
 
 ---
 
