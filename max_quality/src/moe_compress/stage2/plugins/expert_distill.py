@@ -4,10 +4,17 @@ Paper
 -----
 Inspiration:
 
-- SlimMoE (arXiv:2506.18349) — distills the full MoE-block output,
-  with router updates concurrent in some phases.
-- MoE-Pruner (arXiv:2410.12013) — similar distill-after-prune pattern
-  with router updates concurrent.
+- MoE-Pruner (arXiv:2410.12013) — **expert-wise** distillation, NOT
+  block-level. Its Eq. 10 reads
+  ``L_KD = L_CE + λ · Σ_{j,i} MSE(E_i^{j,teacher}, E_i^{j,student})``,
+  i.e. a sum of per-expert MSEs between the (unpruned) teacher expert
+  and the same-index (pruned) student expert across layers ``j`` and
+  experts ``i`` (plus an LM cross-entropy term). The teacher of expert
+  ``i`` is the pretrained unpruned expert ``i``.
+- SlimMoE (arXiv:2506.18349) — top-8-logits KL on the **full model
+  next-token distribution** (Eq. 1 / Eq. 3), NOT on MoE-block outputs.
+  KL is computed between ``p_{teacher, top-8}(X)`` and ``p_W(X)``,
+  with router updates concurrent across the multi-stage schedule.
 
 Baseline REAM (arXiv:2604.04356) does NOT have a post-merge distill
 step; the merge formula is a one-shot weighted average and no further
@@ -15,9 +22,12 @@ refinement.
 
 Official code
 -------------
-None for the specific per-merge-group distill loop implemented here.
-SlimMoE and MoE-Pruner take the full-block route (not per-group); the
-implementation in ``_distill_merged_group`` is project-original.
+MoE-Pruner has official code at github.com/yanyue-xie/moe-pruner, but
+no project-aligned per-merge-group implementation exists: their
+expert-wise loss pairs teacher expert ``i`` with student expert ``i``
+across the unpruned/pruned bank, whereas this plugin pairs the merged
+centroid with the *additive contribution of its pre-merge group
+members*. The ``_distill_merged_group`` loop is project-original.
 
 Deviation: D-expert-distill-mse
 -------------------------------
@@ -33,17 +43,26 @@ frozen. Trainable: only the merged centroid's gate / up / down.
 Plateau early-break, fp32 optimizer with bf16 forward, bank dtype
 preserved on writeback.
 
-Two project-original differences from SlimMoE / MoE-Pruner:
+Two project-original differences vs. SlimMoE / MoE-Pruner:
 
-  (a) We distill the per-merge-group **additive contribution** (only
-      the merged centroid changes; other experts and the rest of the
-      MoE block are untouched) so the loss attributes cleanly to the
-      centroid being trained, rather than the full MoE-block output
-      where errors compound across all experts.
+  (a) **Additive-target form against pre-merge MEMBERS within the
+      merged group.** MoE-Pruner is expert-wise but its target is the
+      *teacher's same-index expert* (one-to-one expert correspondence
+      across teacher/student banks); SlimMoE distills at the full
+      next-token distribution level. We have neither structure:
+      experts are *merged into a centroid*, so there is no
+      same-index teacher expert, and we deliberately avoid the
+      block / model-level form to keep gradient attribution local to
+      the centroid. Instead, the centroid is trained to reproduce the
+      additive (freq- or routing-weighted) sum of the pre-merge
+      members of its own group. This per-group additive target is
+      what is novel — it is neither MoE-Pruner's per-expert pairing
+      nor SlimMoE's full-model logit KL.
   (b) Expert-only training is strictly separated from router-only
       training (Stage 2.5) for resume-isolation and stage-boundary
-      clarity. SlimMoE's distillation phases can update both router
-      and experts concurrently.
+      clarity. SlimMoE's distillation phases update both router and
+      experts concurrently; MoE-Pruner's fine-tunes the full pruned
+      model end-to-end.
 
 The pre-merge router row is carried over verbatim to the post-resize
 router (centroid expert's original row), so ``g_g^merged(x)`` is the
@@ -57,10 +76,11 @@ Deviation: D-expert-distill-mse-v1
 ----------------------------------
 The contract above is the *target*. The v1 implementation in
 ``_distill_merged_group`` simplifies for engineering tractability in
-two ways:
+two ways — both coupled departures from the spec target, not minor:
 
   (i) Target uses **freq-weighted-only** mixing
-      ``Σ (freq_e / Σ freq) · E_e^orig(x)`` — no per-token routing
+      ``Σ (freq_e / Σ freq) · E_e^orig(x)`` — drops both the TopK
+      gate (``e ∈ TopK(σ_orig(x))``) AND the per-token routing
       weight ``g_e^orig(x)``.
   (ii) Input tokens are the **reservoir-sampled layer-input** captured
        during profile (cap at ``expert_distill_token_cap = 8192``,
@@ -73,9 +93,13 @@ reconstructing ``X_g`` from ``ReamCostAccumulator.gate_logit_profiles``
 keys (additional plumbing). v1 produces a correctly-signed
 merge-error gradient on a uniform-token sample — the merged centroid
 is still pulled toward a freq-weighted average of original-expert
-outputs. Phase 3 v2 will lift both simplifications; the
-STRATEGY_NEXT § 8 ablation matrix row A8 measures v1, A8' (planned)
-measures the spec form.
+outputs. **The gap between v1 and the spec target can be empirically
+substantial** (the dropped TopK gate means group members that are not
+even activated on a token still contribute to its target; the dropped
+per-token weight flattens token-level importance) — Phase 3 v2 will
+lift both simplifications, and the STRATEGY_NEXT § 8 ablation matrix
+row A8 measures v1, A8' (planned) measures the spec form. Track A8
+vs A8' separately when reporting.
 
 Wiring
 ------
@@ -95,31 +119,16 @@ Circular-import note: this module imports only
 ``moe_compress.utils.model_io``, ``pipeline.base``, ``pipeline.context``
 and ``pipeline.plugins.output_space_cost`` (for ``_swiglu_forward``) —
 none of which import ``stage2_reap_ream`` or ``expert_distill``. No
-cycle at module load.
+cycle at module load, and every import below is a plain module-top
+import (no function-scope late imports).
 
-Naming-history note
--------------------
+Back-compat / naming-history note
+---------------------------------
 "M8" / "step 7b" / "Phase 3 of the Stage 2 v2 plan" are STRATEGY_NEXT
 labels. The current plugin architecture has no module-letter taxonomy;
-new prose drops the labels. Existing log lines / Trackio keys preserved
-for dashboard back-compat.
-
-Circular-import note: this module imports only ``moe_compress.utils.model_io``,
-``pipeline.base``, ``pipeline.context`` and ``pipeline.plugins.output_space_cost``
-(for ``_swiglu_forward``) — none of which import ``stage2_reap_ream`` or
-``expert_distill``. There is therefore no cycle at module load, and every
-import below is a plain module-top import (no function-scope late imports).
-
-``ExpertDistillPlugin`` is LIVE as of S2-11: it owns the per-merge-group
-expert distillation on the decomposed phase walk. Its ``pre_merge_snapshot``
-hook snapshots the pre-merge expert weights and its ``merge`` hook runs the
-``_distill_merged_group`` loop (between ``_merge_experts_inplace`` and
-``bank.select``). The orchestrator registers it AFTER ``LegacyAdapter`` so its
-``merge`` phase runs after the adapter's ``_merge_experts_inplace``.
-``LegacyAdapter.pre_merge_snapshot`` is now a no-op and its ``merge`` no longer
-distills (it only sets a ``distill_state=None`` default that this plugin
-overwrites). ``registry.enabled`` drops this plugin when
-``expert_distill_steps`` is 0.
+new prose drops the labels. Existing log lines / Trackio keys preserve
+those names for dashboard back-compat — this is the single canonical
+disclaimer (referenced once, not repeated downstream).
 """
 from __future__ import annotations
 
@@ -151,6 +160,14 @@ def _snapshot_pre_merge_layer_experts(
     Used by step 7b (distillation) to compute the pre-merge group-member
     forward as the distillation target. Released by the per-layer driver
     once distillation finishes for the layer.
+
+    v1-waste note: this snapshots ALL ``num_routed_experts`` experts for
+    the layer, but ``_distill_merged_group`` only reads members of each
+    merge group (``pre_merge_weights[m]`` for ``m in members``). The
+    spec-form v2 target only needs the group's members, so the
+    non-member entries are dead weight in host RAM. v2 should narrow
+    the snapshot to ``set().union(*grouped.values())`` once ``grouped``
+    is available pre-merge.
     """
     banks = build_banks(layer_ref)
     out: dict[int, dict[str, torch.Tensor]] = {}
@@ -216,6 +233,19 @@ def _distill_merged_group(
     )
 
     # Token cap: subsample deterministically per layer for reproducibility.
+    #
+    # M-2 caveat: the reservoir feeding ``layer_inputs`` was itself
+    # reservoir-sampled at profile time. Re-seeding here with
+    # ``layer_idx`` ONLY (no global seed mix-in, no group / centroid
+    # information) produces a deterministic second sub-sample that is
+    # *not* a fresh random draw from the reservoir — every group in
+    # the same layer trains on the same ``token_cap`` rows. That is
+    # intentional for resume-determinism, but it does bias the training
+    # pool: rare-token coverage hinges on whichever ``token_cap``
+    # indices ``randperm(layer_idx)`` happens to pick. A future
+    # randomized-sub-sampling pass (e.g., seed mixed with centroid id +
+    # step) would decouple this from the reservoir's draw without
+    # breaking resume.
     rng = torch.Generator(device="cpu").manual_seed(layer_ref.layer_idx)
     n_tokens = layer_inputs.shape[0]
     if n_tokens > token_cap:
@@ -239,10 +269,20 @@ def _distill_merged_group(
             W_d = pre_merge_weights[m]["down_proj"].to(device, dtype=torch.float32)
             target = target + float(w) * _swiglu_forward(W_g, W_u, W_d, x_all)
 
-    initial_loss = None
+    # LOW-1 fix: snapshot the *pre-step-0* loss as the relative-loss
+    # baseline. Previously this was set inside the loop after step 0's
+    # update, which meant "relative_loss = final / initial" measured
+    # progress against a baseline that already incorporated one AdamW
+    # update — optimistically biased. The fp32 no-grad forward below is
+    # the true distillation starting point (post-merge centroid vs.
+    # freq-weighted target on the same token batch).
+    with torch.no_grad():
+        student0 = _swiglu_forward(p_gate, p_up, p_down, x_all)
+        initial_loss = max(float(F.mse_loss(student0, target).item()), 1e-12)
+
     plateau_counter = 0
     last_step = 0
-    final_loss = float("inf")
+    final_loss = float(initial_loss)
     break_reason = "max_steps"
 
     for step in range(steps):
@@ -253,9 +293,6 @@ def _distill_merged_group(
         optim.step()
         last_step = step + 1
         final_loss = float(loss.detach().item())
-
-        if initial_loss is None:
-            initial_loss = max(final_loss, 1e-12)
 
         # Plateau early-break: ``relative_loss = final / initial`` falling
         # below ``plateau_eps`` for ``plateau_steps`` consecutive steps stops
@@ -270,6 +307,17 @@ def _distill_merged_group(
             plateau_counter = 0
 
     # Write the trained weights back to the bank in the original dtype.
+    #
+    # Resume disclaimer (LOW-3): we train in fp32 but cast the result
+    # back to the bank dtype (typically bf16) on writeback. The
+    # optimizer state is NOT persisted (see the docstring above) — a
+    # resume that re-enters this loop after a crash will:
+    #   1. read the bank's bf16 centroid as the new fp32 init, and
+    #   2. start AdamW from that bf16-rounded point, not from the
+    #      pre-crash fp32 trajectory.
+    # That is intentional (no optimizer-state on disk) but worth noting:
+    # the resumed trajectory is NOT bit-equal to the non-crash
+    # trajectory because of the bf16 round-trip at the resume boundary.
     bank_dtype = banks["gate_proj"].get(centroid_id).dtype
     with torch.no_grad():
         banks["gate_proj"].set(centroid_id, p_gate.detach().to(bank_dtype))
@@ -304,12 +352,15 @@ class ExpertDistillPlugin:
     name = "expert_distill"
     paper = (
         "Per-merge-group MSE distillation against routing-gated original "
-        "outputs. Inspired by SlimMoE arXiv:2506.18349 and MoE-Pruner "
-        "arXiv:2410.12013 (no project-aligned official code); REAM baseline "
-        "arXiv:2604.04356 has no post-merge distill. Deviations: "
-        "D-expert-distill-mse (per-group additive target; expert/router "
-        "separated), D-expert-distill-mse-v1 (freq-weighted target + "
-        "reservoir tokens). See module docstring."
+        "outputs. Inspired by MoE-Pruner arXiv:2410.12013 (expert-wise MSE, "
+        "Eq. 10; official code at github.com/yanyue-xie/moe-pruner) and "
+        "SlimMoE arXiv:2506.18349 (top-8 logits KL on full model output, "
+        "Eq. 3) — no project-aligned per-merge-group code in either. REAM "
+        "baseline arXiv:2604.04356 has no post-merge distill. Deviations: "
+        "D-expert-distill-mse (per-group additive target against pre-merge "
+        "members; expert/router training separated), D-expert-distill-mse-v1 "
+        "(freq-weighted target + reservoir tokens — drops TopK gate AND "
+        "per-token routing weight). See module docstring."
     )
     config_key = "stage2_reap_ream.expert_distill_steps"
     # S2-11 LIVE: pre_merge_snapshot reads layer_ref and writes
