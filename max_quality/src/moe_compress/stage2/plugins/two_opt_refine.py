@@ -1,9 +1,57 @@
-"""Two-opt assignment refinement (Task 14 of the plugin-architecture refactor).
+"""Greedy + 2-opt local-refinement of the assignment.
 
-Plugin home for Direction D — the 2-opt local-refinement pass (spec §5 step 3.5).
-``_two_opt_refine`` was extracted verbatim from ``stage2_reap_ream`` in Task 14;
-this is a pure relocation, not a refactor — the algorithm, docstring and comments
-are byte-identical to the former monolith definition.
+Paper
+-----
+**No paper.** Project-original — STRATEGY_NEXT "Direction D" /
+project §5 step 3.5. 2-opt is a classic combinatorial local-search
+heuristic (Lin 1965, originally for TSP); applied here to capacitated
+expert-assignment.
+
+Baseline REAM (arXiv:2604.04356), REAP (arXiv:2510.13999), and the
+solver-plugin alternatives (Hungarian / MCF / Sinkhorn) all produce a
+single-shot assignment. This plugin applies a 2-opt local-refinement
+pass on top of the chosen solver's output: repeatedly swap
+non-centroid → centroid assignments when the swap lowers total cost.
+
+Official code
+-------------
+None — this implementation is project-original. 2-opt is a textbook
+local-search primitive.
+
+Why a 2-opt pass exists
+-----------------------
+Even the optimal single-shot capacitated solver produces a globally
+optimal assignment **with respect to the static cost matrix**. The
+cost matrix itself is a proxy for end-to-end merge damage; 2-opt's
+locality lets the refinement chase low-cost swaps that the static
+cost ordering missed (e.g. when two centroids both want the same
+non-centroid but the second-choice for one is much cheaper than for
+the other).
+
+In practice the 2-opt pass is cheap (~O(n_NC²) per round) and
+converges in 1-2 rounds on production layers. It is opt-in and
+disabled by default — see ``two_opt_refine_rounds`` in the Stage 2
+config.
+
+Refine-chain ordering
+---------------------
+``TwoOptRefinePlugin`` is the **first** link of the
+``refine_assignment`` chain (two-opt THEN EM), registered ahead of
+:mod:`stage2.plugins.em_refine` and the dead-fallback
+``LegacyAdapter``. 2-opt operates on the **static** cost matrix
+(cheap); EM re-runs assignment under tentative merged-centroid
+weights (expensive). Running 2-opt first lets EM start from a
+locally-optimal seed.
+
+Naming-history note
+-------------------
+"Direction D" / "step 3.5" are STRATEGY_NEXT labels. The current
+plugin architecture has no direction-letter taxonomy; new prose drops
+the labels. Existing log lines / Trackio keys preserved for dashboard
+back-compat.
+
+Circular-import note: this module imports only ``pipeline.base`` and
+``pipeline.context``, neither of which imports ``stage2_reap_ream``.
 
 The monolith re-imports ``_two_opt_refine`` so external callers (tests, the
 ``MOE_STAGE2_LEGACY_LOOP=1`` legacy-loop path, ``LegacyAdapter``) keep their
@@ -165,7 +213,14 @@ class TwoOptRefinePlugin:
     """
 
     name = "two_opt_refine"
-    paper = "Direction D: greedy + 2-opt local refinement of the assignment."
+    paper = (
+        "2-opt local-search refinement of the assignment "
+        "(project-original; no paper). 2-opt classic Lin 1965 for TSP; "
+        "applied here to capacitated expert-assignment. "
+        "STRATEGY_NEXT Direction D / §5 step 3.5. "
+        "Baseline REAM arXiv:2604.04356 is single-shot. "
+        "See module docstring."
+    )
     config_key = "stage2_reap_ream.two_opt_refine"
     # Two-opt operates purely on the assignment list, the cost matrix and the
     # per-centroid cap (all passed as call args) — it reads no ctx slots.
