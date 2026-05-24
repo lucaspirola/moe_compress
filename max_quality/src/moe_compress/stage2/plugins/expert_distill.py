@@ -1,12 +1,108 @@
-"""Per-merge-group expert distillation (Task 16 of the plugin-architecture refactor).
+"""Per-merge-group expert distillation against routing-gated original outputs.
 
-Home of ``_distill_merged_group`` — the Phase 3 / step-7b MSE distillation
-trainer that fine-tunes each merged centroid against the freq-weighted
-pre-merge group-member forward — and its helper
-``_snapshot_pre_merge_layer_experts``, which CPU-snapshots every expert's
-weights before the merge mutates the bank. Both moved verbatim out of
-``stage2_reap_ream.py``; that module re-imports them so external callers and
-tests keep their existing import paths.
+Paper
+-----
+Inspiration:
+
+- SlimMoE (arXiv:2506.18349) — distills the full MoE-block output,
+  with router updates concurrent in some phases.
+- MoE-Pruner (arXiv:2410.12013) — similar distill-after-prune pattern
+  with router updates concurrent.
+
+Baseline REAM (arXiv:2604.04356) does NOT have a post-merge distill
+step; the merge formula is a one-shot weighted average and no further
+refinement.
+
+Official code
+-------------
+None for the specific per-merge-group distill loop implemented here.
+SlimMoE and MoE-Pruner take the full-block route (not per-group); the
+implementation in ``_distill_merged_group`` is project-original.
+
+Deviation: D-expert-distill-mse
+-------------------------------
+Stage 2 v2 adds ``expert_distill_steps`` (default ``0``) of AdamW MSE
+distillation per non-singleton group. Target = routing-gated additive
+contribution of pre-merge group members:
+
+    target = Σ_{e ∈ g, e ∈ TopK(σ_orig(x))} g_e^orig(x) · E_e^orig(x)
+
+(on tokens from ``X_g``; pre-merge router used). Student =
+``g_g^merged(x) · E_g^merged(x)`` with the post-resize router row
+frozen. Trainable: only the merged centroid's gate / up / down.
+Plateau early-break, fp32 optimizer with bf16 forward, bank dtype
+preserved on writeback.
+
+Two project-original differences from SlimMoE / MoE-Pruner:
+
+  (a) We distill the per-merge-group **additive contribution** (only
+      the merged centroid changes; other experts and the rest of the
+      MoE block are untouched) so the loss attributes cleanly to the
+      centroid being trained, rather than the full MoE-block output
+      where errors compound across all experts.
+  (b) Expert-only training is strictly separated from router-only
+      training (Stage 2.5) for resume-isolation and stage-boundary
+      clarity. SlimMoE's distillation phases can update both router
+      and experts concurrently.
+
+The pre-merge router row is carried over verbatim to the post-resize
+router (centroid expert's original row), so ``g_g^merged(x)`` is the
+original centroid's routing weight evaluated under the new (smaller)
+softmax denominator — Stage 2.5 retrains it. **Stage 2.5 consequently
+sees a model whose merged centroids are already distilled — its job
+becomes purely router calibration on top of pre-distilled experts,
+not expert recovery (see § 5.5 of the Stage 2.5 plugin's docstring).**
+
+Deviation: D-expert-distill-mse-v1
+----------------------------------
+The contract above is the *target*. The v1 implementation in
+``_distill_merged_group`` simplifies for engineering tractability in
+two ways:
+
+  (i) Target uses **freq-weighted-only** mixing
+      ``Σ (freq_e / Σ freq) · E_e^orig(x)`` — no per-token routing
+      weight ``g_e^orig(x)``.
+  (ii) Input tokens are the **reservoir-sampled layer-input** captured
+       during profile (cap at ``expert_distill_token_cap = 8192``,
+       seeded per-layer for reproducibility), not the routing-restricted
+       ``X_g`` set.
+
+Rationale: the full routing-gated form requires storing
+``g_e^orig(x)`` per ``(expert, token)`` pair (additional memory) and
+reconstructing ``X_g`` from ``ReamCostAccumulator.gate_logit_profiles``
+keys (additional plumbing). v1 produces a correctly-signed
+merge-error gradient on a uniform-token sample — the merged centroid
+is still pulled toward a freq-weighted average of original-expert
+outputs. Phase 3 v2 will lift both simplifications; the
+STRATEGY_NEXT § 8 ablation matrix row A8 measures v1, A8' (planned)
+measures the spec form.
+
+Wiring
+------
+``ExpertDistillPlugin`` is LIVE as of S2-11: it owns the per-merge-group
+expert distillation on the decomposed phase walk. Its
+``pre_merge_snapshot`` hook snapshots the pre-merge expert weights and
+its ``merge`` hook runs the ``_distill_merged_group`` loop (between
+``_merge_experts_inplace`` and ``bank.select``). The orchestrator
+registers it AFTER ``LegacyAdapter`` so its ``merge`` phase runs after
+the adapter's ``_merge_experts_inplace``. ``LegacyAdapter.pre_merge_snapshot``
+is now a no-op and its ``merge`` no longer distills (it only sets a
+``distill_state=None`` default that this plugin overwrites).
+``registry.enabled`` drops this plugin when ``expert_distill_steps`` is
+0.
+
+Circular-import note: this module imports only
+``moe_compress.utils.model_io``, ``pipeline.base``, ``pipeline.context``
+and ``pipeline.plugins.output_space_cost`` (for ``_swiglu_forward``) —
+none of which import ``stage2_reap_ream`` or ``expert_distill``. No
+cycle at module load.
+
+Naming-history note
+-------------------
+"M8" / "step 7b" / "Phase 3 of the Stage 2 v2 plan" are STRATEGY_NEXT
+labels. The current plugin architecture has no module-letter taxonomy;
+new prose drops the labels. Existing log lines / Trackio keys preserved
+for dashboard back-compat.
 
 Circular-import note: this module imports only ``moe_compress.utils.model_io``,
 ``pipeline.base``, ``pipeline.context`` and ``pipeline.plugins.output_space_cost``
@@ -206,7 +302,15 @@ class ExpertDistillPlugin:
     """
 
     name = "expert_distill"
-    paper = "Per-merge-group expert distillation (spec § 5 step 7b / M8)."
+    paper = (
+        "Per-merge-group MSE distillation against routing-gated original "
+        "outputs. Inspired by SlimMoE arXiv:2506.18349 and MoE-Pruner "
+        "arXiv:2410.12013 (no project-aligned official code); REAM baseline "
+        "arXiv:2604.04356 has no post-merge distill. Deviations: "
+        "D-expert-distill-mse (per-group additive target; expert/router "
+        "separated), D-expert-distill-mse-v1 (freq-weighted target + "
+        "reservoir tokens). See module docstring."
+    )
     config_key = "stage2_reap_ream.expert_distill_steps"
     # S2-11 LIVE: pre_merge_snapshot reads layer_ref and writes
     # pre_merge_weights; merge reads the merge-group state + accumulators and
