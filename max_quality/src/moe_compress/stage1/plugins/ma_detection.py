@@ -35,11 +35,14 @@ SHA is the authoritative pin — branch labels may move). Two artefacts
 matter for this plugin (line numbers verified against the pinned raw
 source on 2026-05-24):
 
-* ``run.py:25`` declares the CLI flag
+* ``run.py:28`` declares the CLI flag
   ``--include_layers type=float default=0.75``.
-* ``eval_utils.py:438`` defines
-  ``_super_experts_analysis(..., include_layers=0.75)`` and line 444
-  filters layers via ``if int(each['layer_index']) < include_layers:``.
+* ``eval_utils.py:470`` defines
+  ``_super_experts_analysis(..., include_layers=0.75)``;
+  ``eval_utils.py:471`` computes
+  ``include_layers = round(total_layers * include_layers)``;
+  ``eval_utils.py:479`` filters layers via
+  ``if int(each['layer_index']) < include_layers:``.
 
 The official code therefore **does not implement dynamic MA-formation
 detection at all** — it uses a fixed depth heuristic
