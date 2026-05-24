@@ -23,6 +23,13 @@ Zeliang Zhang.)
    10:   E ← Entropy({C^l})
    11:   if E < Ê: F ← F ∪ {l*}                # freeze
 
+// note: this transcription collapses paper lines 4 (`if F = {1,...,L}`)
+// and 5 (`F ← ∅`) into one all-frozen-restart entry (local line 4), so
+// subsequent local line numbers differ from the paper by 1 — local
+// 5/6/7/8/9/10/11 correspond to paper 6/7/8/9/10/11/12. The inline
+// `# paper line 9` / `# paper line 10` comments above flag the
+// D-update / R-update pair so the offset stays auditable.
+
 Where Eq. (10) defines Ê = E·(1−γ), Eq. (11) defines
 R^l = Σ_{i≠j} D^l_{ij}.
 
@@ -54,6 +61,15 @@ unspecified. This plugin uses ``γ = 0.1`` (config key
 ``γ = 0`` / ``γ < 0`` / ``γ ≥ 1`` edge cases emit explicit log
 warnings flagging the degenerate convergence regimes
 (``every-merge-freezes`` / ``inflated-threshold`` / ``entropy-gate-disabled``).
+
+D-grape-count-only — Cluster identities reduced to per-layer counts
+-------------------------------------------------------------------
+Paper Algorithm 1 line 8 (``C^{l*} ← Union(C^{l*}, i*, j*)``) is reduced
+to a ``|C^{l*}| -= 1`` decrement; ``i*`` is unused. Paper-equivalent
+because entropy (Eq. 7) and Stage-2's per-layer-budget contract depend
+only on per-layer cluster counts, not centroid identities. GRAPE's
+purpose here is to produce per-layer budgets ``N'_l``, not pair
+assignments.
 
 D4 — D^l update: zero entire row/column vs paper's pair entry
 -------------------------------------------------------------
@@ -210,8 +226,9 @@ class GrapeMergePlugin:
     ``stage1_budgets.json`` payload via :meth:`contribute_artifact`.
 
     See the module docstring for the paper citation (arXiv:2604.06542
-    Algorithm 1), the negative official-code finding, and the five
-    deviations: D3 (γ default), D4 (full row/col zero), D5 (per-layer
+    Algorithm 1), the negative official-code finding, and the six
+    deviations: D3 (γ default), D-grape-count-only (Union reduced to
+    per-layer count decrement), D4 (full row/col zero), D5 (per-layer
     floor), D-grape-restart-merge (lag-corrected second restart path),
     D-se-blacklist-merge (SE integration). The sign-flip from paper's
     similarity-form D^l to this plugin's distance form (consumed from
@@ -722,7 +739,11 @@ def _grape_greedy_merge(
         flat_idx = int(np.argmin(tmp))
         # n is the original matrix dimension (total experts), not the count of
         # remaining unabsorbed experts.
-        # i_star is intentionally discarded: GRAPE's contribution to Stage 2 is the per-layer budget N'_l, not pair assignments — Stage 2 re-derives centroids via covariance (spec §4 line 271).
+        # D-grape-count-only: i_star is intentionally discarded. Paper line 8's
+        # Union(C^{l*}, i*, j*) is reduced here to a cluster_counts[l*] -= 1
+        # decrement below. GRAPE's contribution to Stage 2 is the per-layer
+        # budget N'_l, not pair assignments — Stage 2 re-derives centroids via
+        # covariance (spec §4 line 271).
         _, j_star = divmod(flat_idx, n)
 
         # D4: zero entire row/column of absorbed expert j_star and update R.
