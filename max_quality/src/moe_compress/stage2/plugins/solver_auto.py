@@ -1,11 +1,40 @@
-"""Auto-pick assignment solver wrapper (Task 13 of the plugin-architecture
-refactor).
+"""Auto-pick between Hungarian (slack) and MCF (tight) assignment.
 
-Plugin home for ``_assign_auto`` — a tiny wrapper that promotes the dispatcher's
-former inline ``"auto"`` branch into a first-class registry callable. It picks
-``hungarian`` when ``n_children <= n_centroids`` (the slack / 1-1 case where
-rectangular Hungarian is optimal) and ``mcf`` otherwise (the capacitated /
-tight case). This is the spec § 5 step 4d "auto" rule.
+Paper
+-----
+**No paper.** Project-original meta-router for deviation
+D-mcf-assignment (consumed at :mod:`stage2.plugins.solver_hungarian`).
+
+The auto-rule is the STRATEGY_NEXT §5 step 4d dispatch heuristic:
+
+  - ``n_children ≤ n_centroids`` (slack / 1-1 capacity) → Hungarian
+    (rectangular linear-sum-assignment is optimal).
+  - ``n_children > n_centroids`` (tight / capacitated) → MCF
+    (Hungarian alone cannot solve the capacitated problem).
+
+When the ``assignment_solver`` config is set to ``"auto"``, this
+plugin's callable dispatches into the appropriate sibling solver.
+
+Official code
+-------------
+None — the heuristic is project-original. Sibling solvers'
+implementations live at :mod:`stage2.plugins.solver_hungarian` (scipy
+``linear_sum_assignment``, Kuhn/Munkres) and
+:mod:`stage2.plugins.solver_mcf` (OR-Tools ``SimpleMinCostFlow``).
+
+Why a separate plugin (not inline in the dispatcher)
+----------------------------------------------------
+The auto-rule was originally an ``if/elif`` branch inside the public
+dispatcher. Promoting it to a first-class registry callable means
+operators can configure ``assignment_solver="auto"`` and the dispatcher
+just looks it up in the registry — no special-case branch. It also
+lets the meta-router be unit-tested in isolation.
+
+Naming-history note
+-------------------
+STRATEGY_NEXT § 5 step 4d label. The current plugin architecture has
+no step-numbering taxonomy; new prose drops the label. Existing log
+lines / Trackio keys preserved for dashboard back-compat.
 
 Imports ``_assign_hungarian`` and ``_assign_mcf`` from the sibling solver
 modules; it deliberately does **not** import the full ``SOLVERS`` registry —
@@ -52,7 +81,13 @@ class AutoSolverPlugin:
     """
 
     name = "solver_auto"
-    paper = "Auto-pick assignment solver: hungarian in slack, mcf in tight."
+    paper = (
+        "Auto-router for D-mcf-assignment: hungarian when n_children ≤ "
+        "n_centroids (slack), mcf otherwise (tight). Project-original "
+        "(no paper). STRATEGY_NEXT §5 step 4d. See "
+        ":mod:`stage2.plugins.solver_hungarian` for the D-mcf-assignment "
+        "deviation. See module docstring."
+    )
     config_key = "stage2_reap_ream.assignment_solver"
     # S2-8: the live solve_assignment slot reads the per-bump scratch slots.
     reads: tuple[str, ...] = ("_iter_n_ream_nc", "_iter_n_ream_c")

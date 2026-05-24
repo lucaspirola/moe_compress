@@ -1,5 +1,18 @@
-"""Assignment-solver dispatcher + registry (Task 13 of the plugin-architecture
-refactor).
+"""Stage 2 assignment-solver dispatcher + registry.
+
+Paper
+-----
+**No paper for the dispatcher itself.** This module is the registry
+hub that maps the config-driven ``assignment_solver`` choice to a
+sibling solver-plugin callable:
+
+- ``"greedy"`` (default, paper-faithful): see
+  :mod:`stage2.plugins.solver_greedy` — arXiv:2604.04356 §4 baseline.
+- ``"hungarian"`` / ``"mcf"`` / ``"auto"``: see
+  :mod:`stage2.plugins.solver_hungarian` / ``solver_mcf`` /
+  ``solver_auto`` — deviation D-mcf-assignment from baseline REAM.
+- ``"sinkhorn"``: see :mod:`stage2.plugins.solver_sinkhorn` —
+  deviation D-sinkhorn-soft-assign from baseline REAM.
 
 This is the **hub** of the solver import DAG: it imports all five solver
 callables (``greedy``, ``hungarian``, ``mcf``, ``sinkhorn``, ``auto``) and owns:
