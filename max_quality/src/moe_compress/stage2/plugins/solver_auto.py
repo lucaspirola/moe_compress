@@ -7,8 +7,8 @@ D-mcf-assignment (consumed at :mod:`stage2.plugins.solver_hungarian`).
 
 The auto-rule is the STRATEGY_NEXT §5 step 4d dispatch heuristic:
 
-  - ``n_children ≤ n_centroids`` (slack / 1-1 capacity) → Hungarian
-    (rectangular linear-sum-assignment is optimal).
+  - ``n_children < n_centroids`` (slack) or ``n_children == n_centroids``
+    (square 1-1) → Hungarian (rectangular linear-sum-assignment is optimal).
   - ``n_children > n_centroids`` (tight / capacitated) → MCF
     (Hungarian alone cannot solve the capacitated problem).
 
@@ -32,15 +32,16 @@ lets the meta-router be unit-tested in isolation.
 
 Naming-history note
 -------------------
-STRATEGY_NEXT § 5 step 4d label. The current plugin architecture has
-no step-numbering taxonomy; new prose drops the label. Existing log
-lines / Trackio keys preserved for dashboard back-compat.
+STRATEGY_NEXT § 5 step 4d label is retained throughout this module for
+dashboard / Trackio back-compat; the current plugin architecture does
+not require the step-numbering taxonomy, but the label is kept
+consistently in prose and code comments so historical log lines and
+keys keep their referent.
 
 Imports ``_assign_hungarian`` and ``_assign_mcf`` from the sibling solver
 modules; it deliberately does **not** import the full ``SOLVERS`` registry —
 ``solver_dispatch`` is the hub, ``solver_auto`` only owns the auto heuristic.
 
-``AutoSolverPlugin`` is a scaffold-only plugin (see ``solver_greedy``).
 Circular-import note: this module imports only ``solver_hungarian``,
 ``solver_mcf``, ``pipeline.base`` and ``pipeline.context`` — none of which
 import ``stage2_reap_ream``.
@@ -61,11 +62,18 @@ def _assign_auto(
 ) -> list[int]:
     """Auto-pick wrapper (spec § 5 step 4d).
 
-    Picks the rectangular Hungarian solver when ``n_children <= n_centroids``
-    (the slack / 1-1 capacity case where Hungarian is optimal) and the
-    capacitated min-cost-flow solver otherwise. This is the same heuristic the
-    dispatcher's former inline ``"auto"`` branch applied; it is now a
-    first-class entry in the ``SOLVERS`` registry.
+    Picks the rectangular Hungarian solver when ``n_children < n_centroids``
+    (slack) or ``n_children == n_centroids`` (square 1-1, no slack), where
+    Hungarian is optimal, and the capacitated min-cost-flow solver otherwise.
+    This is the same heuristic the dispatcher's former inline ``"auto"`` branch
+    applied; it is now a first-class entry in the ``SOLVERS`` registry.
+
+    Note: ``_assign_hungarian`` itself already falls back to ``_assign_mcf``
+    for ``n_children > n_centroids`` (see solver_hungarian.py:114-115), so
+    the explicit branch below is semantically equivalent to calling
+    ``_assign_hungarian`` unconditionally. We keep the branch for log /
+    Trackio key clarity (the dispatch decision is observable here) rather
+    than for correctness.
     """
     if n_children <= n_centroids:
         return _assign_hungarian(cost, n_children, n_centroids, max_group_cap)
@@ -103,6 +111,12 @@ class AutoSolverPlugin:
         sinkhorn_epsilon_final: float = 0.01,
         sinkhorn_iters: int = 200,
     ) -> None:
+        # NOTE: ``assignment_solver`` and the three ``sinkhorn_*`` kwargs are
+        # vestigial-but-required here — ``_assign_auto`` itself never reads
+        # them, but the shared ``_solve_for_plugin`` helper (see
+        # ``solver_dispatch``) expects every solver plugin to expose the same
+        # ``__init__`` signature so it can hydrate plugins uniformly from the
+        # stage-2 config dict. Removing them would break plugin construction.
         self.max_group_cap = max_group_cap
         self.assignment_solver = assignment_solver
         self.sinkhorn_epsilon_init = sinkhorn_epsilon_init
