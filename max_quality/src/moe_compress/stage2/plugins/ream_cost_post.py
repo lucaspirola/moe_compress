@@ -1,23 +1,98 @@
-"""Post-alignment REAM cost plugin (Task 9 of the plugin-architecture refactor).
+"""Post-alignment whitened-residual REAM cost matrix builder.
 
-Home of ``_post_alignment_cost`` — the ``cost_alignment="post"`` branch of the
-REAM cost matrix (Stage 2 v2 spec § 5 step 4T). Moved verbatim out of
-``stage2_reap_ream.py``; that module re-imports it so external callers and
-tests keep their existing import paths.
+Paper
+-----
+**No paper for this cost form.** It is project-original — Stage 2 v2's
+``cost_alignment="post"`` branch, layered on top of the baseline REAM
+greedy (arXiv:2604.04356 — see :mod:`stage2.plugins.ream_cost` for the
+REAM Eq. 5/7/8 baseline this replaces). Activation-aware whitening
+inherits the AA-SVD lineage from arXiv:2604.02119 (Stage 3) — see
+:mod:`stage2.plugins.ream_cost_post` activation-aware framing in
+deviation D-whitened-cost below.
 
-Circular-import note: this module imports only ``pipeline.permutation_align``,
-``pipeline.base``, ``pipeline.context`` and ``moe_compress.utils.*`` — none of
-which import ``stage2_reap_ream`` or ``ream_cost``. There is therefore no cycle
-at module load. ``ream_cost._ream_cost_matrix`` still imports
-``_post_alignment_cost`` at *function scope* inside its ``post`` branch: that
-keeps the call symmetric with the still-monolith ``output`` branch and costs
-nothing once the module is cached.
+Official code
+-------------
+None — the post-alignment cost is project-original. SamsungSAILMontreal/
+ream's baseline (commit pinned in :mod:`stage2.plugins.ream_cost`)
+implements only the symmetric ``δ_REAM`` cost.
 
-``ReamCostPostPlugin`` is the live plugin home for the ``post`` cost path. S2-6
-wired its ``compute_cost`` hook into the ``compute_cost`` assignment slot via
-the shared ``ream_cost._compute_cost_for_plugin`` helper: when ``cost_alignment``
-resolves to ``"post"`` this plugin is registered ahead of the ``LegacyAdapter``
-and wins ``PluginRegistry.dispatch_first`` for the slot.
+Deviation: D-whitened-cost
+--------------------------
+The pre-alignment δ_REAM cost (REAM Eq. 7) is alignment-invariant —
+output cosine and gate-logit cosine don't depend on neuron permutations
+— but it lacks a weight-space residual term. This branch computes a
+per-pair **Hungarian-aligned whitened residual**:
+
+    cost(c, m) = ‖(W_c − P_cm·W_m) · A^{1/2}‖_F   summed over gate/up/down
+
+where ``A^{1/2}`` multiplies ``ΔW`` on the **right** (input axis),
+matching the AA-SVD derivation
+``E_x ‖ΔW · x‖² = tr(ΔW · A · ΔW^T) = ‖ΔW · A^{1/2}‖_F²``. The
+Hungarian permutation ``P_cm`` is computed once per ``(c, m)`` pair via
+``_permutation_align_to_centroid`` and **cached for the merge step**
+(single Hungarian, two consumers).
+
+``cost_whitening`` selects the whitening form:
+
+- ``"diag"`` — ``sqrt(diag(A))`` (cheap fallback).
+- ``"full"`` — ``V · diag(sqrt(λ_clamped)) · V^T`` from
+  ``torch.linalg.eigh``, mirroring ``stage3_svd._precompute_eigh``.
+- Default ``"none"`` reproduces the v1 (pre-alignment) baseline.
+
+The whitened residual measures merge error in the directions that
+actually carry calibration signal (AA-SVD lineage, arXiv:2604.02119,
+already used by Stage 3). Explicitly **not** AIM (arXiv:2502.02421),
+whose actual formulation uses per-channel diagonal scaling by
+``mean(‖x_i‖)`` — a different scheme.
+
+The K-prefilter (``cost_topk_filter``, default 48) bounds the per-pair
+Hungarian compute: per non-centroid ``m``, only the top-K candidate
+centroids by cheap symmetric ``δ_REAM`` get the expensive whitened
+residual computed; the rest get ``+∞`` and the assignment solver
+treats them as forbidden arcs.
+
+Deviation: D-asymmetric-freq (opt-in)
+-------------------------------------
+``cost_asymmetric=true`` (default ``false``) multiplies the
+post-alignment whitened residual by ``freq_m / (freq_c + freq_m)``.
+Valid only with ``ream.frequency_weighted_merge=true`` (rejected at
+run-time otherwise — fail-fast).
+
+Rationale: the merge formula ``W_merged = Σ (freq_e / Σ freq) · P_e(W_e)``
+weights each member by its freq share. A high-freq non-centroid merged
+into a low-freq centroid dominates the merged weight (freq washout);
+the symmetric cost matrix cannot distinguish merge direction. The
+asymmetric factor is the per-pair version of the merge weight:
+``freq_m / (freq_c + freq_m)`` is exactly the share of ``freq_m`` in a
+2-element merge group ``{c, m}``, so the cost penalizes pairs where
+``m`` would dominate ``c``. Under saliency-weighted merge the
+analogous factor would be ``sal_m / (sal_c + sal_m)``.
+
+Both-zero edge case → 0.5 neutral.
+
+Naming-history note
+-------------------
+The post-alignment branch is referred to as "M2" in the Stage 2 v2
+revision spec (``docs/stage2_assignment_revision.md``). The plugin
+architecture has no module-naming taxonomy. New prose drops the M2
+label; existing log lines and Trackio keys keep the historical
+identifiers.
+
+Circular-import note: this module imports only
+``pipeline.permutation_align``, ``pipeline.base``, ``pipeline.context``
+and ``moe_compress.utils.*`` — none of which import
+``stage2_reap_ream`` or ``ream_cost``. There is therefore no cycle at
+module load. ``ream_cost._ream_cost_matrix`` still imports
+``_post_alignment_cost`` at *function scope* inside its ``post`` branch:
+that keeps the call symmetric with the still-monolith ``output`` branch
+and costs nothing once the module is cached.
+
+``ReamCostPostPlugin`` is the live plugin home for the ``post`` cost
+path. S2-6 wired its ``compute_cost`` hook into the ``compute_cost``
+assignment slot via the shared ``ream_cost._compute_cost_for_plugin``
+helper: when ``cost_alignment`` resolves to ``"post"`` this plugin is
+registered ahead of the ``LegacyAdapter`` and wins
+``PluginRegistry.dispatch_first`` for the slot.
 """
 from __future__ import annotations
 
@@ -243,7 +318,14 @@ class ReamCostPostPlugin:
     """
 
     name = "ream_cost_post"
-    paper = "REAM post-alignment whitened-residual cost matrix builder."
+    paper = (
+        "Post-alignment whitened-residual cost (project-original; no paper). "
+        "AA-SVD lineage from arXiv:2604.02119 (Stage 3). Replaces baseline "
+        "REAM cost arXiv:2604.04356 (see :mod:`stage2.plugins.ream_cost`). "
+        "Deviations: D-whitened-cost (Hungarian-aligned ‖ΔW·A^{1/2}‖_F per "
+        "pair, with cached P_cm), D-asymmetric-freq (opt-in "
+        "freq_m/(freq_c+freq_m) factor). See module docstring."
+    )
     config_key = "stage2_reap_ream.cost_alignment"
     reads: tuple[str, ...] = _COST_PLUGIN_READS
     writes: tuple[str, ...] = _COST_PLUGIN_WRITES  # () — S2-10 moved the gate out
