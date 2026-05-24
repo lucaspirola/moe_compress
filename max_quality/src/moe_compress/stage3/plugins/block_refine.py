@@ -54,6 +54,44 @@ every layer with refinable factors is refined. The deviation is named
 explicitly so a future port to a mixed dense/MoE architecture cannot
 silently drop the dense-block refinement step.
 
+Deviation: D-c5-no-bias
+-----------------------
+Paper §3.3 / Appendix B.2 names θ_i as "normalization scales **and
+biases**" for each block. This plugin currently collects only the
+RMSNorm scale parameters (``input_layernorm`` / ``post_attention_layernorm`` /
+``self_attn.q_norm`` / ``self_attn.k_norm`` — see ``norm_module_paths``)
+and not block-local ``*.bias`` parameters.
+
+**Vacuous for Qwen3-30B-A3B**: the target architecture has
+``attention_bias=False`` (no bias on q/k/v/o projections), RMSNorm has
+no bias by construction, and the MoE expert factorization replaces
+gate/up/down ``nn.Linear`` modules with biasless ``FactoredExperts``
+slots. There are no block-local bias parameters to train.
+
+The deviation is named so a future port to an architecture that DOES
+carry biases (e.g. Llama-2's ``mlp.gate_proj.bias`` if a variant ships
+biases, or any model with ``attention_bias=True``) cannot silently
+drop bias updates from θ_i.
+
+Deviation: D-c5-lr-offset
+-------------------------
+Upstream ``finetune_layer`` (commit 1fa1b686, llama_adapter.py L226-L238)
+defines its LR schedule with the raw step index ``step`` (0-indexed):
+``step / warmup_steps`` during warmup and
+``(step - warmup_steps) / (total_steps - warmup_steps)`` after.
+
+This plugin uses ``s = step + 1`` and ``total_steps - warmup_steps + 1``
+in the denominator so the very first step uses a non-zero warmup
+fraction (``1 / warmup_steps``) rather than literally ``0``, and the
+cosine tail never lands exactly on the floor at the last step. Paper
+§B.2 prose ("cosine schedule with linear warmup") does not pin a
+specific edge convention, but the pinned upstream code is the
+deviation reference and uses no offset.
+
+Numerical impact is bounded (one step of warmup ramp shifted by 1/N).
+Named explicitly per project §6 "deviations from pinned upstream are
+named".
+
 Naming-history note
 -------------------
 "Phase C.5" (legacy Stage 3 monolith terminology) is naming-historical.
@@ -93,16 +131,19 @@ such import is needed.
 
 ``BlockRefinePlugin`` is the FIRST genuinely config-GATED stage-3 plugin: its
 ``is_enabled`` returns the ``stage3_svd.block_refine.enabled`` flag (default
-False) rather than an unconditional ``True``. It is registered-but-INERT at
-S3-6 — no walk or test invokes its ``refine_blocks`` hook. S3-7 wires it into
-the live Stage 3 plugin sequencer.
+False) rather than an unconditional ``True``. S3-7a wired it into the live
+Stage 3 plugin sequencer (``stage3.orchestrator`` —
+``walk_phases(("refine_blocks",), ...)``); when the gate is off the plugin
+is dropped from the enabled set and the walk is a no-op.
 """
 from __future__ import annotations
 
 import logging
 import math
+import os
+import shutil
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -114,7 +155,9 @@ from ...utils.model_io import (
     iter_decoder_layers,
 )
 from ...utils.trackio_log import trackio_log as _trackio_log
-from ...pipeline.context import PipelineContext
+
+if TYPE_CHECKING:
+    from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
 
@@ -196,6 +239,17 @@ def _phase_c5_block_refine(
     # Capture per-layer kwargs once via a forward pre-hook on each layer.
     # kwargs are stable across batches with the same shape (attention masks,
     # position_ids, position_embeddings); we capture from batch 0 and reuse.
+    #
+    # Precondition (enforced by the upstream calibration assembly): every
+    # batch is the SAME shape ``(batch_size, seq_len)`` carved from one
+    # ``calib_tensor`` of shape ``(n_seq, seq_len)`` (see ``batches``
+    # construction above with ``drop_last`` semantics). Causal masks,
+    # ``position_ids``, and rotary ``position_embeddings`` are pure functions
+    # of that shape — not of token-id contents — so the batch-0 capture is
+    # bit-identical to the per-batch recapture for batches 1..N-1. A divergent
+    # mask/position tensor would imply variable seq_len across batches, which
+    # would have already failed the ``batches`` slice. The recapture is
+    # therefore omitted as an optimization, not a correctness hazard.
     def _capture_first_pass(model_, layers_by_idx, sample_batch):
         captured_kwargs: dict[int, dict] = {}
         captured_inputs: dict[int, torch.Tensor] = {}
@@ -354,8 +408,15 @@ def _phase_c5_block_refine(
                 norm_params.append(mod.weight)
         trainables.extend(norm_params)
 
-        # Spec §6 Phase C.5: AdamW must run with fp32 moments + fp32 master
-        # weights. Vanilla `torch.optim.AdamW` initializes `exp_avg`/`exp_avg_sq`
+        # Project §6 (NOT paper §B.2): AdamW must run with fp32 moments +
+        # fp32 master weights. The paper (arXiv:2604.02119 Appendix B.2)
+        # only names "AdamW, lr=1e-4, 25 epochs, batch=32" — it does not
+        # specify optimizer-state precision. The fp32-moments / fp32-master
+        # convention is a PROJECT decision (project §6 numerical-stability
+        # rules) and is paper-faithful by construction (a strictly more
+        # precise realization of the same optimizer).
+        #
+        # Vanilla `torch.optim.AdamW` initializes `exp_avg`/`exp_avg_sq`
         # with the same dtype as the parameter — so for bf16 params, moments
         # are bf16, losing the precision rationale. Promote trainables to
         # fp32 in-place before the optimizer is constructed; restore the
@@ -372,15 +433,17 @@ def _phase_c5_block_refine(
         warmup_steps = max(1, int(warmup_ratio * total_steps))
 
         def _lr_at(step: int) -> float:
-            # Step is 0-indexed; offset by 1 so the first step uses a non-zero
-            # warmup fraction rather than lr=0 (paper-typical schedules ramp
-            # from a small fraction up to 1.0, not literally 0). Likewise the
-            # cosine never reaches exactly 0 at total_steps − 1.
+            # LR schedule — linear warmup then cosine decay with a 10% floor,
+            # matching upstream AA-SVD finetune_layer (commit 1fa1b686,
+            # llama_adapter.py L226-L238):
+            #     0.1 + 0.9 * 0.5 * (1 + cos(pi * progress))
+            # i.e. the cosine never decays below 10% of the peak learning rate.
+            # See deviation D-c5-lr-offset for the (s = step + 1) edge handling.
             s = step + 1
             if s <= warmup_steps:
                 return s / max(1, warmup_steps)
             progress = (s - warmup_steps) / max(1, total_steps - warmup_steps + 1)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
 
         # Pre-compute teacher targets once per batch (no grad).
         teacher_targets: list[torch.Tensor] = []
@@ -411,6 +474,13 @@ def _phase_c5_block_refine(
                 lr_now = learning_rate * _lr_at(step)
                 for g in opt.param_groups:
                     g["lr"] = lr_now
+                # Gradient clipping — matches upstream AA-SVD finetune_layer
+                # (commit 1fa1b686, llama_adapter.py L291): clip every step
+                # to ``max_norm=1.0``. Stabilizes AdamW updates against the
+                # occasional large MSE gradient spike on a freshly factored
+                # block. Scope: the trainable subset only (factored U/V slots
+                # + RMSNorm scales); frozen params have no grad to clip.
+                torch.nn.utils.clip_grad_norm_(trainables, max_norm=1.0)
                 opt.step()
                 step += 1
                 if loss_first is None:
@@ -424,14 +494,23 @@ def _phase_c5_block_refine(
             if target_dtype is not None and p.dtype != target_dtype:
                 p.data = p.data.to(target_dtype)
 
-        rel_drop = (loss_first - loss_last) / max(loss_first or 1e-12, 1e-12) if loss_first else 0.0
+        # ``loss_first`` / ``loss_last`` are populated on EVERY refined block
+        # (the outer ``epochs * len(batches)`` loop runs at least once — see
+        # ``total_steps = max(1, ...)`` and the ``n_batches == 0`` guard
+        # above). Defensive ``is None`` fallbacks below protect against a
+        # future refactor where the loop becomes skippable; an exact-zero
+        # loss is a valid numeric outcome (self-distillation degenerate
+        # case) and MUST NOT collapse to the ``0.0`` placeholder branch.
+        _lf = loss_first if loss_first is not None else 0.0
+        _ll = loss_last if loss_last is not None else 0.0
+        rel_drop = (_lf - _ll) / max(_lf, 1e-12) if loss_first is not None else 0.0
         log.info("  Phase C.5 block %d/%d (idx=%d) loss %.4e → %.4e (%.1f%%↓)",
                  block_pos + 1, n_blocks, layer_idx,
-                 loss_first or 0.0, loss_last or 0.0, 100 * rel_drop)
+                 _lf, _ll, 100 * rel_drop)
         _trackio_log({
             "stage3/c5_layer_idx": float(layer_idx),
-            "stage3/c5_loss_init": loss_first or 0.0,
-            "stage3/c5_loss_final": loss_last or 0.0,
+            "stage3/c5_loss_init": _lf,
+            "stage3/c5_loss_final": _ll,
             "stage3/c5_loss_rel_drop": rel_drop,
             # Additive: training-loop shape and warmup configuration. All in scope.
             "stage3/c5_total_steps": int(total_steps),
@@ -440,6 +519,16 @@ def _phase_c5_block_refine(
         })
 
         # Save per-block checkpoint atomically.
+        #
+        # Save/resume symmetry invariant: the set of norm-module paths
+        # iterated here MUST exactly match the set iterated by the resume
+        # branch above (search ``input_layernorm`` in this file). Resume
+        # restores only keys present in the payload — if a key is added
+        # here without being added there, resumed runs would silently drop
+        # the refined norm scale; if a key is added there without being
+        # added here, the resume guard ``path in payload`` skips it
+        # cleanly. The MATRIX_NAMES iteration shares the source-of-truth
+        # constant on both sides, so U/V symmetry is automatic.
         if ckpt_path is not None:
             payload = {"format_version": 1, "layer_idx": layer_idx}
             for path in ("input_layernorm", "post_attention_layernorm",
@@ -456,8 +545,7 @@ def _phase_c5_block_refine(
                 payload[f"{name}_V"] = getattr(fe, f"{name}_V").detach().cpu()
             tmp = ckpt_path.with_suffix(".pt.tmp")
             torch.save(payload, tmp)
-            import os as _os
-            _os.replace(tmp, ckpt_path)
+            os.replace(tmp, ckpt_path)
 
         # Advance streams for the next block (no grad).
         X_student, X_teacher = _advance_streams(
@@ -468,8 +556,7 @@ def _phase_c5_block_refine(
 
     # Cleanup: remove checkpoint dir on success.
     if partial_dir is not None and partial_dir.exists():
-        import shutil as _shutil
-        _shutil.rmtree(partial_dir, ignore_errors=True)
+        shutil.rmtree(partial_dir, ignore_errors=True)
         log.info("Stage 3 Phase C.5: removed checkpoint dir (run completed cleanly)")
 
 
@@ -497,7 +584,7 @@ def _advance_streams(s_layer, t_layer, X_student, X_teacher,
 
 
 class BlockRefinePlugin:
-    """Stage 3 Phase C.5 block-refine plugin (S3-6 — registered-but-INERT).
+    """Stage 3 Phase C.5 block-refine plugin (S3-7a — live in orchestrator).
 
     Owns the block-level joint refinement core: ``_phase_c5_block_refine``
     (the per-block AdamW refinement of the factored U/V slots and the
@@ -512,9 +599,11 @@ class BlockRefinePlugin:
     ``stage3_svd.block_refine.enabled`` flag (default False) rather than an
     unconditional ``True``.
 
-    S3-6 wires this class into the plugin registry as metadata only — no walk
-    or test invokes ``refine_blocks``. S3-7 plugs the hook into the live
-    Stage 3 plugin sequencer.
+    S3-7a wired this plugin into the live Stage 3 sequencer:
+    ``stage3.orchestrator`` invokes ``walk_phases(("refine_blocks",), ...)``
+    after the factorization loop. When the config gate is off, the plugin
+    is dropped from the enabled set and the walk is a no-op — byte-identical
+    to the monolith's ``if _block_refine_enabled:`` skip.
     """
 
     name = "block_refine"
@@ -585,12 +674,18 @@ class BlockRefinePlugin:
                 "and the resume path)."
             )
         br = s3["block_refine"]
+        # ``weight_decay`` default 0.01: matches pinned upstream AA-SVD
+        # ``finetune_layer`` (commit 1fa1b686, llama_adapter.py L226:
+        # ``torch.optim.AdamW(..., weight_decay=0.01)``). Paper §B.2 names
+        # AdamW but not the WD value, so upstream is authoritative. Configs
+        # that set ``stage3_svd.block_refine.weight_decay`` explicitly are
+        # honored verbatim.
         _phase_c5_block_refine(
             model, teacher_model, moe_layers, teacher_moe_layers, calib,
             batch_size=int(br.get("batch_size", 32)),
             learning_rate=float(br.get("learning_rate", 1.0e-4)),
             epochs=int(br.get("epochs", 25)),
             warmup_ratio=float(br.get("warmup_ratio", 0.1)),
-            weight_decay=float(br.get("weight_decay", 0.0)),
+            weight_decay=float(br.get("weight_decay", 0.01)),
             artifacts_dir=artifacts_dir, no_resume=no_resume, device=device,
         )
