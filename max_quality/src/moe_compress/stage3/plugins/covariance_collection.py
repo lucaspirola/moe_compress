@@ -6,12 +6,20 @@ Paper
 arXiv:2604.02119 (audit/spec_compliance/01_papers/2604.02119/source.md).
 
 Theorem 3.2 of AA-SVD prescribes the factorization
-``M = W·C·S⁻¹·L_B`` where ``S = B·B^T`` and ``L_B`` is the symmetric
-factor of the post-prune input covariance ``B = E[X_post X_post^T]``
-(i.e. ``B = L_B · L_B^T``), and ``C`` is the cross-covariance
-``E[X_pre X_post^T]`` between the pre- and post-prune layer inputs.
-Corollary 3.3 (the special case ``A = B``) reduces to ``M = W · L_B``
-when only the auto-covariance is available.
+``M = W·C·S⁻¹·L_B`` where ``B`` is the post-prune input data matrix
+``X_post`` (rows = tokens), ``S = B·B^T = E[X_post X_post^T]`` is the
+post-prune input *covariance*, ``L_B`` is the symmetric factor of
+``S`` (i.e. ``S = L_B · L_B^T``), and ``C = E[X_pre X_post^T]`` is the
+cross-covariance between pre- and post-prune layer inputs. Corollary
+3.3 (the special case ``A = S``) reduces to ``M = W · L_B`` when only
+the post-prune covariance is available.
+
+Naming bridge (paper ↔ code): the paper's covariance ``S`` is what
+this codebase calls ``B_cov`` / ``B_acc`` / the ``B`` accumulator —
+i.e. the variable named ``B`` in the *code* IS paper-``S``, not the
+paper's data matrix. The rest of this docstring uses paper notation
+(``S`` for covariance) when discussing math and the code symbol
+(``B_acc``, ``_bcov_*.pt``) when discussing artifacts.
 
 This plugin owns the post-prune covariance pass: for every MoE
 ``(layer, expert, matrix)`` tuple, accumulate ``B`` (always) and
@@ -30,10 +38,12 @@ github.com/atulkumarin/AA-SVD.
 
 Live factorisation paths (after Path 2 retirement)
 --------------------------------------------------
-Downstream ``aa_svd_factor.py`` (L321-336) implements two paths only:
+Downstream ``aa_svd_factor.py`` (the ``_aa_svd`` factor function)
+implements two paths only:
 
-  * **Path 1 — Theorem 3.2 (paper-exact)**: ``M = W·C·B⁻¹·L_B`` when
-    both ``C`` (cross-cov from this plugin's dual-forward) and ``B``
+  * **Path 1 — Theorem 3.2 (paper-exact)**: ``M = W·C·S⁻¹·L_B`` when
+    both ``C`` (cross-cov from this plugin's dual-forward) and ``S``
+    (post-prune input covariance — code symbol ``B_acc`` / ``B_cov``)
     are available. This is the default when ``aa_svd.cross_covariance:
     true`` (the configured default).
   * **Path 3 — Corollary 3.3 (B-only fallback)**: ``M = W·L_B`` when
@@ -42,12 +52,13 @@ Downstream ``aa_svd_factor.py`` (L321-336) implements two paths only:
 
 An earlier "Path 2" substituted the pre-prune *auto*-covariance ``A``
 (from Stage 2) into the Theorem 3.2 slot in place of ``C``. That path
-was retired: it produced ``U·V ≈ W·A·B⁻¹·L_B`` rather than
+was retired: it produced ``U·V ≈ W·A·S⁻¹·L_B`` rather than
 approximating ``W``, breaking ``FactoredExperts`` forward and Stage 4
-EoRA residual (see ``aa_svd_factor.py`` L331-336 / tests in
-``test_aa_svd_correctness.py``). The ``A_cov`` sidecar load is still
-performed because L-BFGS refinement (Stage 4) consumes it, but the
-Stage 3 rank-k factor uses only ``C`` (Path 1) or omits it (Path 3).
+EoRA residual (see the Path-2-retirement comment block in ``_aa_svd``
+of ``aa_svd_factor.py`` / tests in ``test_aa_svd_correctness.py``).
+The ``A_cov`` sidecar load is still performed because L-BFGS
+refinement (Stage 4) consumes it, but the Stage 3 rank-k factor uses
+only ``C`` (Path 1) or omits it (Path 3).
 
 Deviation: D6 — cross-covariance scope (gate-only, MoE-specific)
 ----------------------------------------------------------------
@@ -223,8 +234,11 @@ def _collect_covariances(
     """
 
     # --- Storage for teacher's per-layer hidden states (for cross-cov) ---
-    # Key: layer_idx → Tensor [n_tokens_in_batch, d_in]
-    _teacher_hidden: dict[int, torch.Tensor] = {}
+    # Structure: layer_idx → {token_idx → row Tensor [d_in]}. The nested
+    # dict is populated incrementally by ``_teacher_input_cb`` (one entry
+    # per token position the teacher dispatches through this MoE layer)
+    # and consumed by ``input_cb`` via per-token lookup.
+    _teacher_hidden: dict[int, dict[int, torch.Tensor]] = {}
 
     def _teacher_input_cb(li, e, tensor, ctx):
         """Teacher hook: store the full hidden state for this layer.
@@ -253,13 +267,14 @@ def _collect_covariances(
             _teacher_hidden[key][tidx] = det[i]
 
     def input_cb(li, e, tensor, ctx):
-        # NOTE: ``B_acc.update`` redirects ``up_proj`` to ``gate_proj``
-        # internally (auto-cov share, see InputCovarianceAccumulator
-        # docstring). Cross-cov below has no equivalent share inside the
-        # accumulator (``update_cross`` writes the exact matrix_name),
-        # so we explicitly key cross-cov under "gate_proj"; up_proj
-        # cross-cov is served at factor time by ``_cov_lookup``'s
-        # gate->up fallback in aa_svd_factor.py.
+        # The student-side B accumulation uses the InputCovarianceAccumulator's
+        # built-in up_proj→gate_proj alias on the auto-cov path (one entry
+        # serves both, since gate/up share the pre-routing hidden state).
+        # The cross-cov path below has no such alias inside the accumulator
+        # — ``update_cross`` writes the exact ``matrix_name`` — so we key
+        # the cross term under "gate_proj" here and rely on the
+        # factor-time ``_cov_lookup`` gate→up fallback in
+        # ``aa_svd_factor.py`` to serve ``up_proj``.
         B_acc.update(li, e, "gate_proj", tensor)
         # Cross-covariance: C += X_pre^T @ X_post for matching token positions.
         if C_acc is not None and li in _teacher_hidden:
@@ -275,9 +290,20 @@ def _collect_covariances(
             pre_vecs = []
             post_vecs = []
             det_post = tensor.detach().to(torch.float32)
+            # Cross-device safety: with ``device_map="auto"`` teacher and
+            # student copies of the same MoE layer can land on different
+            # GPUs. ``det_post`` lives on the student tensor's device;
+            # teacher rows in ``_teacher_hidden`` were detached on the
+            # teacher's device. Coerce each teacher row onto
+            # ``tensor.device`` before stacking so the X_pre.T @ X_post
+            # matmul (and the in-place add inside ``update_cross``) is
+            # single-device. The .to() is a no-op when devices already
+            # match (common single-GPU case) and a cheap H2D/D2D copy
+            # under sharding.
+            tgt_device = tensor.device
             for i, tidx in enumerate(token_idx):
                 if tidx in teacher_store:
-                    pre_vecs.append(teacher_store[tidx])
+                    pre_vecs.append(teacher_store[tidx].to(device=tgt_device))
                     post_vecs.append(det_post[i])
             if pre_vecs:
                 X_pre = torch.stack(pre_vecs)   # [n_match, d_in]
@@ -454,9 +480,11 @@ class CovarianceCollectionPlugin:
         "AA-SVD Theorem 3.2 cross-covariance + Corollary 3.3 — "
         "arXiv:2604.02119 (atulkumarin/AA-SVD @ "
         "1fa1b686cd9b13a77607a676564e37d438a176c8). "
-        "Live factor paths: Path 1 (W·C·B⁻¹·L_B, default) and Path 3 "
-        "(W·L_B, B-only fallback). Path 2 (auto-cov-for-cross-cov) was "
-        "retired — see aa_svd_factor.py L321-336. "
+        "Live factor paths: Path 1 (W·C·S⁻¹·L_B, default; code symbol "
+        "``B_acc`` IS paper-S) and Path 3 (W·L_B, S-only fallback). "
+        "Path 2 (auto-cov-for-cross-cov) was retired — see the "
+        "Path-2-retirement comment block in ``_aa_svd`` of "
+        "aa_svd_factor.py. "
         "Deviations: D6 (gate-only cross-cov, per-expert MoE resolution; "
         "down falls back to Corollary 3.3), D-cov-storage-fp16 (SHARED "
         "with Stage 2 — fp16 persisted, fp64 in-memory eigh). "
