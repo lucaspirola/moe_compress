@@ -1181,28 +1181,42 @@ register_corpus(CorpusAdapter(
 
 
 # ---------------------------------------------------------------------------
-# qwen3-self-traces — thinking-mode self-distillation calibration
+# self-traces — model-self-distillation calibration (FIRST STEP FOR ANY NEW MODEL)
 # ---------------------------------------------------------------------------
+#
+# This corpus is generic — it works for ANY teacher model (Qwen3.x-thinking,
+# Llama-3, DeepSeek-R1, Gemma-3, etc.). The corpus name is intentionally
+# model-agnostic; the teacher's own outputs become the calibration text.
 #
 # Why this corpus exists
 # ----------------------
 # All other calibration sources (nvidia-cascade, tulu3-sft-mix, c4-math-code,
 # qwen3-pretrain-mix) render the chat template around the OUTER role headers
 # and EOS markers — that's the Gemma 3 QAT rule, and it stops the model from
-# "forgetting how to chat" post-compression. But for Qwen3.6-thinking-mode
-# models, the most reasoning-critical token positions live INSIDE the
-# ``<think>...</think>`` block in the assistant turn — and none of the
-# above sources have ``<think>`` traces in their assistant content. So the
-# routers (Stage 2.5 KD) and merged expert weights (Stage 2 SH heal) are
-# never supervised on the token positions that matter most at serve time.
+# "forgetting how to chat" post-compression. But for reasoning-mode models
+# (any model that emits ``<think>...</think>`` or analogous CoT markers in
+# its assistant turn) the most reasoning-critical token positions live
+# INSIDE that block — and none of the above sources have such traces in
+# their assistant content. So the routers (Stage 2.5 KD) and merged expert
+# weights (Stage 2 SH heal) are never supervised on the token positions
+# that matter most at serve time.
 #
 # Empirical motivation:
 #  * Project memory ``project_sh_lr_schedule_xd_result`` (2026-05-21):
 #    cross-domain telemetry showed Nemotron-Cascade-only heal moved
 #    Nemotron MSE by ~70% but WikiText MSE by only 5-30%. The local-MSE
-#    objective was Nemotron-specific.
-#  * Same logic applies to thinking-mode: a heal/KD optimized on non-thinking
-#    chat text won't transfer to ``<think>...</think>`` token positions.
+#    objective was calibration-distribution-bound.
+#  * Same logic applies to reasoning-mode: a heal/KD optimized on non-
+#    thinking chat text won't transfer to ``<think>...</think>`` token
+#    positions at deploy.
+#
+# When to use self-traces
+# -----------------------
+# **This is the FIRST step for any new model.** Before running the pipeline
+# against a new teacher, you must generate the trace JSONL once. The
+# pipeline fails loudly at Stage 1 calibration build if the JSONL is missing
+# (see the FileNotFoundError in _stream_texts_self_traces below — it prints
+# the exact command for the current model).
 #
 # Schema
 # ------
@@ -1210,36 +1224,37 @@ register_corpus(CorpusAdapter(
 #  * ``{"messages": [{"role": "user", "content": ...},
 #                    {"role": "assistant", "content": "<think>...</think>final answer"}]}``
 #  * Or any other valid ``messages`` shape that ``apply_chat_template``
-#    accepts; the loader passes ``enable_thinking=True`` so Qwen3-thinking
-#    tokenizers render the trace correctly.
+#    accepts; the loader passes ``enable_thinking=True`` so reasoning-mode
+#    tokenizers (Qwen3-thinking, DeepSeek-R1 distill, etc.) render the
+#    trace correctly. The kwarg is silently ignored by tokenizers that
+#    don't know about it (TypeError fallback).
 #
 # How to generate it
 # ------------------
-# See ``max_quality/scripts/build_self_traces_calib.py`` — one-shot script
-# that runs the teacher with ``enable_thinking=True`` over a prompt set and
-# captures the deterministic greedy ``<think>...</think>answer`` traces into
-# the JSONL. Cache lives at
-# ``artifacts/_shared/qwen3_self_traces.jsonl`` by default.
+# One-shot pre-step — see ``max_quality/scripts/build_self_traces_calib.py``.
+# Greedy generation under fixed (teacher_repo, revision, prompts,
+# max_new_tokens) is deterministic, so the JSONL is reproducible and the
+# cache invalidates correctly when any of those change.
 #
 # YAML
 # ----
 # .. code-block:: yaml
 #
 #     calibration:
-#       source: qwen3-self-traces
+#       source: self-traces
 #       seed: 1337
 #       num_sequences: 4000
 #       sequence_length: 2048
-#       jsonl_path: artifacts/_shared/qwen3_self_traces.jsonl   # optional;
-#       # defaults to ``artifacts/_shared/qwen3_self_traces.jsonl`` when
-#       # omitted. Path is folded into ``CalibrationSpec.dataset`` and hashed
-#       # into the cache key so changing the file auto-invalidates the
+#       jsonl_path: artifacts/_shared/self_traces.jsonl   # optional;
+#       # defaults to ``artifacts/_shared/self_traces.jsonl`` when omitted.
+#       # Path is folded into ``CalibrationSpec.dataset`` and hashed into
+#       # the cache key so changing the file auto-invalidates the
 #       # calibration cache.
 
-_DEFAULT_SELF_TRACES_PATH = "artifacts/_shared/qwen3_self_traces.jsonl"
+_DEFAULT_SELF_TRACES_PATH = "artifacts/_shared/self_traces.jsonl"
 
 
-def _parse_yaml_qwen3_self_traces(
+def _parse_yaml_self_traces(
     cal_cfg: dict, num_sequences: int, sequence_length: int, seed: int,
 ) -> CalibrationSpec:
     jsonl_path = str(cal_cfg.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH))
@@ -1247,20 +1262,21 @@ def _parse_yaml_qwen3_self_traces(
         num_sequences=num_sequences,
         sequence_length=sequence_length,
         seed=seed,
-        source="qwen3-self-traces",
+        source="self-traces",
         dataset=jsonl_path,
     )
 
 
-def _stream_texts_qwen3_self_traces(
+def _stream_texts_self_traces(
     spec: CalibrationSpec, tokenizer
 ) -> list[str]:
     """Stream rows from the local JSONL produced by build_self_traces_calib.py.
 
-    Each row's ``messages`` list (already containing the teacher's thinking +
+    Each row's ``messages`` list (already containing the teacher's reasoning +
     answer trace in the assistant turn) is rendered through the model's chat
-    template with ``enable_thinking=True`` so the Qwen3-thinking templater
-    keeps the ``<think>...</think>`` markers in the output token stream.
+    template with ``enable_thinking=True`` so reasoning-mode tokenizers
+    (Qwen3-thinking, DeepSeek-R1, etc.) keep the in-block markers in the
+    output token stream.
     """
     from pathlib import Path
     import json as _json
@@ -1272,10 +1288,22 @@ def _stream_texts_qwen3_self_traces(
         # pipeline driver invokes scripts under the repo root).
         path = Path.cwd() / path
     if not path.exists():
+        # Pull the current model name (best-effort — fall back to a generic
+        # placeholder) so the error message is directly actionable for the
+        # user. The tokenizer carries ``name_or_path`` for any HF model.
+        teacher_hint = getattr(tokenizer, "name_or_path", None) or "<TEACHER_REPO>"
         raise FileNotFoundError(
-            f"qwen3-self-traces: JSONL not found at {path}. Generate it with "
-            "max_quality/scripts/build_self_traces_calib.py before running the "
-            "pipeline with calibration.source=qwen3-self-traces."
+            "self-traces calibration JSONL not found at "
+            f"{path}.\n\n"
+            "This is the FIRST step for any new model. Generate the traces "
+            "with the teacher you want to distil against:\n\n"
+            "    python max_quality/scripts/build_self_traces_calib.py \\\n"
+            f"        --teacher {teacher_hint} \\\n"
+            "        --num-prompts 4000 --max-new-tokens 4096 \\\n"
+            f"        --output {path}\n\n"
+            "Then re-run the pipeline. The trace JSONL is reusable across "
+            "every Stage-2 / 2.5 run for this teacher (regenerate only when "
+            "the teacher revision or prompt set changes)."
         )
 
     # Deterministic shuffle by spec.seed so different (stage_key, seed_offset)
@@ -1291,13 +1319,13 @@ def _stream_texts_qwen3_self_traces(
             try:
                 row = _json.loads(line)
             except _json.JSONDecodeError as exc:
-                log.warning("qwen3-self-traces: skipping malformed JSONL line: %s", exc)
+                log.warning("self-traces: skipping malformed JSONL line: %s", exc)
                 continue
             rows.append(row)
 
     if not rows:
         raise ValueError(
-            f"qwen3-self-traces: JSONL at {path} contained zero parseable rows."
+            f"self-traces: JSONL at {path} contained zero parseable rows."
         )
 
     rng.shuffle(rows)
@@ -1317,12 +1345,12 @@ def _stream_texts_qwen3_self_traces(
             out.append(rendered)
 
     log.info(
-        "qwen3-self-traces: %d rendered rows from %s (seed=%d, num_sequences=%d)",
+        "self-traces: %d rendered rows from %s (seed=%d, num_sequences=%d)",
         len(out), path, spec.seed, spec.num_sequences,
     )
     if len(out) < spec.num_sequences:
         log.warning(
-            "qwen3-self-traces: only %d rows yielded vs %d requested — "
+            "self-traces: only %d rows yielded vs %d requested — "
             "regenerate the JSONL with a larger prompt budget.",
             len(out), spec.num_sequences,
         )
@@ -1330,7 +1358,7 @@ def _stream_texts_qwen3_self_traces(
 
 
 register_corpus(CorpusAdapter(
-    name="qwen3-self-traces",
-    parse_yaml=_parse_yaml_qwen3_self_traces,
-    stream_texts=_stream_texts_qwen3_self_traces,
+    name="self-traces",
+    parse_yaml=_parse_yaml_self_traces,
+    stream_texts=_stream_texts_self_traces,
 ))

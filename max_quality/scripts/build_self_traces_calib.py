@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the ``qwen3-self-traces`` calibration JSONL by running the teacher
+"""Build the ``self-traces`` calibration JSONL by running the teacher
 with ``enable_thinking=True`` over a prompt set and capturing its deterministic
 ``<think>...</think>answer`` traces.
 
@@ -14,7 +14,7 @@ live INSIDE that block. The routers (Stage 2.5 KD) and merged expert weights
 
 This script closes the gap: it runs THE SAME teacher the pipeline distils
 against, in thinking-mode, over a prompt set, and writes the full chat-
-formatted sequences as a JSONL the ``qwen3-self-traces`` corpus loader reads.
+formatted sequences as a JSONL the ``self-traces`` corpus loader reads.
 
 Usage
 -----
@@ -26,7 +26,7 @@ Usage
         --prompts qwen3-pretrain-mix \
         --num-prompts 4000 \
         --max-new-tokens 4096 \
-        --output artifacts/_shared/qwen3_self_traces.jsonl
+        --output artifacts/_shared/self_traces.jsonl
 
 
 Determinism
@@ -56,7 +56,7 @@ Cost
 batch=8, BF16 teacher, kernel-cached). FP8 teacher cuts this to ~4h.
 
 This is a ONE-SHOT pre-step — the JSONL is reused across every Stage-2 / 2.5
-run that points ``calibration.source: qwen3-self-traces``. Re-run only when
+run that points ``calibration.source: self-traces``. Re-run only when
 the teacher revision or the prompt set changes.
 """
 from __future__ import annotations
@@ -304,7 +304,7 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--max-new-tokens", type=int, default=4096)
-    p.add_argument("--output", default="artifacts/_shared/qwen3_self_traces.jsonl")
+    p.add_argument("--output", default="artifacts/_shared/self_traces.jsonl")
     p.add_argument("--no-cache-suffix", action="store_true",
                    help="Skip the cache-key suffix on the output filename.")
     args = p.parse_args()

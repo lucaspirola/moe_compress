@@ -19,6 +19,43 @@ Plan file: `~/.claude/plans/using-https-huggingface-co-pirola-moe-co-mutable-gal
 | 5 | `stage5_router_kd` | router-only KL distillation | ~20 min |
 | 6 | `stage6_validate` | WikiText-2 PPL + zero-shot + gen | ~10 min |
 
+## First step for any new model: generate calibration self-traces
+
+This tool is model-agnostic — the test case here is Qwen3.6-35B-A3B but the
+pipeline works against any HF MoE teacher. **Before the first run for a new
+teacher**, you must generate a calibration trace JSONL by running the teacher
+once in reasoning mode over a prompt set. The pipeline fails loudly at Stage 1
+if the trace JSONL is missing and prints the exact command for your model.
+
+Why: every stage that consumes calibration (Stage 1 GRAPE profiling, Stage 2
+REAP+REAM merge cost, Stage 2 SH per-layer heal, Stage 2.5 router-KD) sees
+THE SAME `calibration.source`. Generic chat-templated SFT corpora (Tülu-3,
+FineWeb, OpenMath, ...) get you the outer chat-template wrapping (Gemma 3 QAT
+rule — necessary for the model to keep speaking chat post-compression), but
+they do NOT contain the teacher's actual `<think>...</think>` reasoning
+traces. For reasoning-mode models the most quality-critical token positions
+are *inside* that block — and without self-traces, the routers (Stage 2.5)
+and merged expert weights (Stage 2 SH heal) are never supervised there.
+
+```bash
+# One-shot pre-step. ~6h on a single H200 with a BF16 teacher; deterministic
+# under (teacher_repo, revision, prompts, max_new_tokens) so the JSONL is
+# reproducible and the cache invalidates automatically. Cache-key suffix
+# is folded into the output filename → multiple teachers coexist on disk.
+python max_quality/scripts/build_self_traces_calib.py \
+    --teacher <YOUR_TEACHER_REPO> \
+    --num-prompts 4000 --max-new-tokens 4096 \
+    --output artifacts/_shared/self_traces.jsonl
+
+# Then point the run config at the source:
+#   calibration:
+#     source: self-traces
+#     jsonl_path: artifacts/_shared/self_traces_<hash16>.jsonl   # printed by the script
+```
+
+Re-run the script only when the teacher revision or the prompt set changes.
+See the script's `--help` for full options.
+
 ## Quick start (A100 80 GB)
 
 ```bash
