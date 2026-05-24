@@ -34,8 +34,11 @@ Determinism
 Greedy decoding (``do_sample=False``) under a fixed teacher + tokenizer +
 prompt set produces byte-identical traces, so the JSONL is reproducible and
 the cache invalidates correctly when (teacher_revision, prompts_hash,
-max_new_tokens) change. The cache-key is folded into the output filename so
-multiple variants can coexist on disk.
+max_new_tokens, batch_size, load_in_4bit) change. The cache-key is folded
+into the output filename so multiple variants can coexist on disk. Note that
+``batch_size`` IS part of the key because eager attention's softmax reduction
+order varies with batch shape, so byte-identical output is only guaranteed
+when batch_size is held constant.
 
 Output schema
 -------------
@@ -53,7 +56,10 @@ tokenizer keeps the ``<think>`` markers in the calibration token stream.
 Cost
 ----
 ~6h on a single H200 SXM5 for 4000 traces at avg 2000 tokens (greedy,
-batch=8, BF16 teacher, kernel-cached). FP8 teacher cuts this to ~4h.
+batch=8, BF16 teacher, kernel-cached). Pass ``--load-in-4bit`` (bitsandbytes
+NF4 with ``bnb_4bit_compute_dtype=bfloat16``) to roughly halve VRAM at the
+cost of ~10-15% throughput; FP8 throughput is achieved by passing an
+already-FP8-quantized teacher repo.
 
 This is a ONE-SHOT pre-step — the JSONL is reused across every Stage-2 / 2.5
 run that points ``calibration.source: self-traces``. Re-run only when
@@ -69,7 +75,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 log = logging.getLogger("build_self_traces_calib")
 
@@ -103,6 +109,25 @@ def _iter_prompts_from_qwen3_pretrain_mix(
         subset: max(1, int(num_prompts * weight))
         for subset, weight in _QWEN3_MIX_WEIGHTS.items()
     }
+    # H2: warn when num_prompts is too small for the smallest-weight subset to
+    # get its expected share. Threshold = 2 * num_subsets / min_weight; below
+    # that point the int()-floor in per_subset truncates the smallest subsets
+    # to 1 row each and the iteration-order short-circuit at the end of the
+    # function may drop later subsets entirely.
+    try:
+        min_w = min(_QWEN3_MIX_WEIGHTS.values())
+        threshold = int(2 * len(_QWEN3_MIX_WEIGHTS) / min_w) if min_w > 0 else 0
+        if num_prompts < threshold:
+            log.warning(
+                "num_prompts=%d is below the diversity threshold (~%d) for "
+                "qwen3-pretrain-mix's %d subsets (min weight=%.2f). Smallest "
+                "domains may be under-represented or dropped by iteration-"
+                "order short-circuit. Raise --num-prompts for production runs.",
+                num_prompts, threshold, len(_QWEN3_MIX_WEIGHTS), min_w,
+            )
+    except Exception:  # noqa: BLE001 — diagnostic only
+        pass
+
     total_yielded = 0
     for subset, count in per_subset.items():
         ds_name = _QWEN3_MIX_DATASET[subset]
@@ -212,15 +237,29 @@ def _trace_cache_key(
     prompts_source: str,
     num_prompts: int,
     max_new_tokens: int,
+    batch_size: int,
+    load_in_4bit: bool,
 ) -> str:
+    """Compute the cache key.
+
+    ``batch_size`` and ``load_in_4bit`` are folded in (M1, M4) because:
+      * eager attention softmax reduction order varies with batch shape, so
+        byte-identical greedy output is only guaranteed when batch_size is
+        held constant;
+      * NF4 quantization (load_in_4bit) materially changes teacher logits vs
+        BF16, so the two are NOT interchangeable runs.
+    Bumping ``schema_version`` invalidates ALL prior caches at once.
+    """
     payload = json.dumps({
         "teacher_repo": teacher_repo,
         "teacher_revision": teacher_revision,
         "prompts_source": prompts_source,
         "num_prompts": num_prompts,
         "max_new_tokens": max_new_tokens,
+        "batch_size": batch_size,
+        "load_in_4bit": bool(load_in_4bit),
         "decode": "greedy",
-        "schema_version": 1,
+        "schema_version": 2,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -230,14 +269,19 @@ def _trace_cache_key(
 # ---------------------------------------------------------------------------
 
 
-def _load_teacher(repo: str, revision: str, load_in_4bit: bool):
+def _load_teacher(repo: str, revision: str, load_in_4bit: bool, tokenizer=None):
+    """Load the teacher model. Optionally accepts a pre-loaded ``tokenizer``
+    to avoid the duplicate HF-hub fetch (L2)."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    log.info("loading teacher %s (revision=%s, 4bit=%s)",
-             repo, revision, load_in_4bit)
-    tok = AutoTokenizer.from_pretrained(repo, revision=revision)
-    kwargs = {
+    dtype_name = "int4-nf4(compute=bf16)" if load_in_4bit else "bfloat16"
+    log.info("loading teacher %s (revision=%s, dtype=%s)",
+             repo, revision, dtype_name)
+    tok = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
+        repo, revision=revision,
+    )
+    kwargs: dict = {
         "revision": revision,
         "torch_dtype": torch.bfloat16,
         "device_map": "auto",
@@ -245,7 +289,15 @@ def _load_teacher(repo: str, revision: str, load_in_4bit: bool):
     }
     if load_in_4bit:
         from transformers import BitsAndBytesConfig
-        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+        # M4: BF16 compute dtype is required for sane numerics on H100/H200;
+        # without it bnb defaults to FP32 compute and the 4-bit path silently
+        # diverges from the BF16 path in subtle (slow + slightly off) ways.
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
         kwargs.pop("torch_dtype")
     model = AutoModelForCausalLM.from_pretrained(repo, **kwargs)
     # Switch PyTorch nn.Module to inference mode (disables dropout/batchnorm
@@ -253,6 +305,35 @@ def _load_teacher(repo: str, revision: str, load_in_4bit: bool):
     # Python's built-in eval() function.
     model.eval()
     return model, tok
+
+
+def _coerce_eos_ids(eos_token_id) -> set[int]:
+    """Normalize ``tokenizer.eos_token_id`` (int, list, tuple, or None) into
+    a set of ints. Qwen3-thinking tokenizers often expose multiple EOS ids
+    (e.g. ``<|im_end|>`` and ``<|endoftext|>``) as a list."""
+    if eos_token_id is None:
+        return set()
+    if isinstance(eos_token_id, int):
+        return {eos_token_id}
+    if isinstance(eos_token_id, (list, tuple, set)):
+        return {int(t) for t in eos_token_id if t is not None}
+    # Fallback for exotic tokenizer types — coerce via iteration.
+    try:
+        return {int(t) for t in eos_token_id if t is not None}  # type: ignore[union-attr]
+    except TypeError:
+        return set()
+
+
+def _trim_at_first_eos(row_ids: Iterable[int], eos_ids: set[int]) -> list[int]:
+    """Return the prefix of ``row_ids`` up to (but not including) the first
+    occurrence of any token in ``eos_ids``. If no eos token is present, the
+    full row is returned."""
+    out: list[int] = []
+    for t in row_ids:
+        if int(t) in eos_ids:
+            break
+        out.append(int(t))
+    return out
 
 
 def _generate_traces(
@@ -267,13 +348,23 @@ def _generate_traces(
     """
     import torch
 
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    # N2: only fall back to eos as pad when the tokenizer truly lacks a pad
+    # token (Qwen3 ships with a distinct <|endoftext|> pad; preserving it
+    # keeps eos distinguishable from pad in gen_only).
+    if tokenizer.pad_token is None and tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
     # Left-pad so batched generate output is right-aligned for slicing.
     tokenizer.padding_side = "left"
 
+    # H1: precompute the EOS-id set once. Qwen3-thinking exposes multiple eos
+    # ids (list); trimming by token-id before decoding is the only way to drop
+    # the trailing padding/eos cleanly without relying on the string form of
+    # `tokenizer.eos_token` (which is None when the tokenizer has multiple).
+    eos_ids = _coerce_eos_ids(getattr(tokenizer, "eos_token_id", None))
+
     total = len(prompts)
     t0 = time.monotonic()
+    yielded = 0  # L4: count what we actually emit, not what we tried.
     for i in range(0, total, batch_size):
         batch = prompts[i:i + batch_size]
         batch_prompts = [p for p, _ in batch]
@@ -295,6 +386,20 @@ def _generate_traces(
                 )
             rendered.append(text)
 
+        # M5: detect truncation. Tokenize once without a max_length cap so we
+        # can compare the natural length against the 2048 ceiling and warn the
+        # operator when a prompt is actually being clipped (math/code prompts
+        # with long context windows). The double-tokenize cost is negligible
+        # vs the teacher forward pass.
+        natural = tokenizer(rendered, padding=False, truncation=False)
+        max_natural = max((len(ids) for ids in natural["input_ids"]), default=0)
+        if max_natural > 2048:
+            log.warning(
+                "prompt(s) in this batch exceed 2048 tokens (max=%d); "
+                "truncating to 2048. Consider raising the truncation ceiling "
+                "if your teacher's context window allows it.", max_natural,
+            )
+
         inputs = tokenizer(
             rendered, return_tensors="pt", padding=True, truncation=True,
             max_length=2048,
@@ -309,14 +414,19 @@ def _generate_traces(
             )
 
         gen_only = out_ids[:, inputs.input_ids.shape[1]:]
-        decoded = tokenizer.batch_decode(gen_only, skip_special_tokens=False)
-        for prompt, domain, completion in zip(batch_prompts, batch_domains, decoded):
-            # Trim trailing pad/eos tokens — keep the <think>...</think> and
-            # final answer intact.
-            ans = completion.split(tokenizer.eos_token)[0] if tokenizer.eos_token else completion
-            ans = ans.strip()
+        # H1: trim by token-id BEFORE decode. Handles single int eos_token_id,
+        # list-of-ints eos_token_id, and rows with no eos in gen uniformly.
+        trimmed_rows = [
+            _trim_at_first_eos(row.tolist(), eos_ids) for row in gen_only
+        ]
+        decoded = [
+            tokenizer.decode(ids, skip_special_tokens=False).strip()
+            for ids in trimmed_rows
+        ]
+        for prompt, domain, ans in zip(batch_prompts, batch_domains, decoded):
             if not ans:
                 continue
+            yielded += 1
             yield {
                 "messages": [
                     {"role": "user", "content": prompt},
@@ -327,13 +437,39 @@ def _generate_traces(
 
         elapsed = time.monotonic() - t0
         done = i + len(batch_prompts)
-        log.info("[%d/%d] traces generated — %.1fs elapsed (%.1f s/trace avg)",
-                 done, total, elapsed, elapsed / max(done, 1))
+        # L4: report both throughput metrics — prompts/s for batch-pacing,
+        # s/trace based on what actually landed in the JSONL.
+        s_per_trace = elapsed / yielded if yielded > 0 else float("inf")
+        log.info(
+            "[%d/%d prompts processed, %d traces yielded] — "
+            "%.1fs elapsed (%.1f s/trace avg, %.1f s/prompt avg)",
+            done, total, yielded, elapsed, s_per_trace, elapsed / max(done, 1),
+        )
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def _repo_exists_on_hub(repo: str, revision: str) -> bool:
+    """Best-effort HF Hub preflight (L1). Returns True if reachable OR if the
+    huggingface_hub helper is unavailable (don't block on missing optional
+    dep). Returns False ONLY when the hub responds with a clean "not found"
+    for the given repo+revision.
+    """
+    try:
+        from huggingface_hub import repo_exists  # type: ignore
+    except Exception:  # noqa: BLE001
+        log.info("repo_exists preflight skipped (huggingface_hub unavailable).")
+        return True
+    try:
+        return bool(repo_exists(repo, revision=revision))
+    except Exception as err:  # noqa: BLE001
+        log.info("repo_exists preflight inconclusive for %s@%s (%s) — "
+                 "proceeding; AutoModel.from_pretrained will surface real errors.",
+                 repo, revision, err)
+        return True
 
 
 def main() -> int:
@@ -343,10 +479,14 @@ def main() -> int:
     )
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--teacher", default="Qwen/Qwen3.6-35B-A3B",
-                   help="HF repo id of the teacher to distill against.")
+                   help="HF repo id of the teacher to distill against. "
+                        "Default targets this project's production model "
+                        "(see max_quality/configs/qwen36_35b_a3b_30pct.yaml).")
     p.add_argument("--teacher-revision", default="main")
     p.add_argument("--load-in-4bit", action="store_true",
-                   help="Load teacher in 4-bit via bitsandbytes (lower VRAM).")
+                   help="Load teacher in 4-bit (bnb NF4 with bf16 compute) "
+                        "for lower VRAM. NOTE: changes teacher logits vs BF16 "
+                        "and so produces a DIFFERENT output cache key.")
     p.add_argument("--prompts", default="qwen3-pretrain-mix",
                    help="Prompt source: 'qwen3-pretrain-mix' or path to a "
                         "JSONL with {'prompt': '...'} rows.")
@@ -361,16 +501,31 @@ def main() -> int:
                    help="If a .tmp file from a prior run exists, count its "
                         "valid rows and skip that many prompts (in deterministic "
                         "gather order) before generating. Refuses to resume if "
-                        "the first row's prompt doesn't match the first gathered "
-                        "prompt (seed / prompt-source drift detected).")
+                        "the first OR last row's prompt doesn't match the "
+                        "corresponding gathered prompt (seed / prompt-source "
+                        "drift detected). If the .tmp already covers the full "
+                        "current prompt set, it is promoted to the final file.")
     args = p.parse_args()
 
+    # L1: HF Hub preflight catches the user's typo before we burn ~1-2s on
+    # tokenizer-load + several seconds on model-load. We don't block on
+    # network/auth failures — only on a confirmed "repo not found".
+    if not _repo_exists_on_hub(args.teacher, args.teacher_revision):
+        log.error(
+            "teacher %s@%s does not exist on the Hugging Face Hub. Check "
+            "for a typo, a missing revision, or a private repo you're not "
+            "authenticated for.", args.teacher, args.teacher_revision,
+        )
+        return 1
+
     # Determinism: teacher.generate(do_sample=False) is greedy → deterministic
-    # under fixed (teacher_repo, revision, prompts, max_new_tokens).
+    # under fixed (teacher_repo, revision, prompts, max_new_tokens, batch_size,
+    # load_in_4bit).
     cache_key = _trace_cache_key(
         args.teacher, args.teacher_revision,
         f"{args.prompts}#{args.num_prompts}#{args.seed}",
         args.num_prompts, args.max_new_tokens,
+        args.batch_size, args.load_in_4bit,
     )
     out_path = Path(args.output)
     if not args.no_cache_suffix:
@@ -379,6 +534,13 @@ def main() -> int:
         )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
+        # L3: --resume + already-finished output is a no-op success, not an
+        # error. The cache_key in the filename guarantees the prior run was
+        # produced by the same (teacher, prompts, decode) tuple.
+        if args.resume:
+            log.info("output already exists: %s — --resume given and the "
+                     "final file is present; nothing to do.", out_path)
+            return 0
         log.warning("output already exists: %s — refusing to overwrite. "
                     "Delete the file (or pick a different --output) to regenerate.",
                     out_path)
@@ -387,6 +549,7 @@ def main() -> int:
     log.info("output -> %s (cache_key=%s)", out_path, cache_key)
 
     # Resolve prompts.
+    bootstrap_tok = None
     if args.prompts == "qwen3-pretrain-mix":
         from transformers import AutoTokenizer
         bootstrap_tok = AutoTokenizer.from_pretrained(
@@ -406,10 +569,27 @@ def main() -> int:
     if not prompts:
         log.error("no prompts gathered — check --prompts source.")
         return 1
+
+    # M3: underfill detection. When the source is exhausted before we hit
+    # --num-prompts the cache_key (which contains num_prompts) lies about the
+    # actual content. Loud-warn so the operator notices on log scan, and stop
+    # the run unless the user explicitly opts in to a smaller dataset by
+    # rerunning with the actual count.
+    if len(prompts) < args.num_prompts:
+        log.error(
+            "prompt source exhausted: gathered %d but --num-prompts=%d. The "
+            "cache_key in the output filename encodes the REQUESTED count, "
+            "not the actual count, so silently continuing would let a smaller "
+            "dataset masquerade as the full one. Re-run with --num-prompts=%d "
+            "(or fix the prompt source) to proceed.",
+            len(prompts), args.num_prompts, len(prompts),
+        )
+        return 1
+
     # Log empirical per-domain breakdown so the operator can verify the mix
     # before paying the teacher-forward bill.
-    from collections import Counter as _Counter
-    domain_counts = _Counter(d for _, d in prompts)
+    from collections import Counter  # N3: drop the underscore alias.
+    domain_counts = Counter(d for _, d in prompts)
     total_p = len(prompts)
     log.info("gathered %d prompts; per-domain mix: %s", total_p, {
         d: f"{c} ({c / total_p:.1%})" for d, c in sorted(domain_counts.items())
@@ -419,13 +599,15 @@ def main() -> int:
     # If a .tmp file from a prior run exists, count its valid rows and skip
     # that many prompts. Determinism guarantees the gather order matches the
     # prior run (same seed + same prompt source); we sanity-check by
-    # comparing the .tmp's first user-prompt against prompts[0] and refuse
-    # to resume if they differ.
+    # comparing the .tmp's first AND last user-prompts against
+    # prompts[0]/prompts[already_done-1] and refuse to resume if either
+    # differs.
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     already_done = 0
     if args.resume and tmp_path.exists():
         log.info("resume: scanning existing .tmp at %s ...", tmp_path)
         first_existing_prompt = None
+        last_existing_prompt = None
         with tmp_path.open("r", encoding="utf-8") as f:
             for i, line in enumerate(f):
                 try:
@@ -435,36 +617,79 @@ def main() -> int:
                                 "the resume scan here (%d valid rows so far).",
                                 i + 1, already_done)
                     break
-                if not row.get("messages"):
+                msgs = row.get("messages") or []
+                if not msgs:
                     continue
+                first_user = msgs[0].get("content")
                 if first_existing_prompt is None:
-                    first_existing_prompt = row["messages"][0].get("content")
+                    first_existing_prompt = first_user
+                last_existing_prompt = first_user
                 already_done += 1
         if already_done > 0:
+            # C1: CRITICAL guard. If the .tmp holds more rows than the
+            # current run's prompt list, the old `prompts = prompts[already_done:]`
+            # slice silently emptied the list and the "no more work" branch
+            # promoted a .tmp with MORE rows than the requested num_prompts
+            # to a final file whose cache_key claims a smaller count. Abort
+            # loudly instead — the user must either delete the .tmp or raise
+            # --num-prompts to match.
+            if already_done > len(prompts):
+                log.error(
+                    "resume: .tmp at %s contains %d valid rows but the current "
+                    "run only gathered %d prompts. Continuing would promote "
+                    "more rows to %s than the cache_key (num_prompts=%d) "
+                    "advertises — refusing to corrupt the cache. Either:\n"
+                    "  (a) delete the .tmp and start fresh, or\n"
+                    "  (b) re-run with --num-prompts >= %d to match the .tmp.",
+                    tmp_path, already_done, len(prompts), out_path,
+                    args.num_prompts, already_done,
+                )
+                return 1
+            # M2: compare both ends of the resumed range. Drift at row 2+ is
+            # caught by the LAST-row check; row-0 drift was already caught.
             if first_existing_prompt != prompts[0][0]:
                 log.error(
-                    "resume: .tmp's first user-prompt does NOT match the first "
+                    "resume: .tmp's FIRST user-prompt does NOT match the first "
                     "gathered prompt under the current seed/source. The prompt "
                     "stream has drifted since the prior run — refusing to mix "
                     "runs silently. Delete %s and start fresh, or restore the "
                     "prior seed / --prompts source.", tmp_path,
                 )
                 return 1
+            expected_last = prompts[already_done - 1][0]
+            if last_existing_prompt != expected_last:
+                log.error(
+                    "resume: .tmp's LAST user-prompt (row %d) does NOT match "
+                    "the corresponding gathered prompt under the current "
+                    "seed/source. Mid-stream drift detected — refusing to "
+                    "mix runs silently. Delete %s and start fresh, or restore "
+                    "the prior seed / --prompts source.",
+                    already_done, tmp_path,
+                )
+                return 1
             log.info("resume: %d valid rows in .tmp; skipping first %d of %d "
                      "gathered prompts.", already_done, already_done, len(prompts))
-            prompts = prompts[already_done:]
-            if not prompts:
+            if already_done == len(prompts):
                 log.info("resume: .tmp already contains all %d prompts — "
                          "promoting %s → %s and exiting cleanly.",
                          already_done, tmp_path, out_path)
                 os.replace(tmp_path, out_path)
                 return 0
+            prompts = prompts[already_done:]
+    elif args.resume and not tmp_path.exists():
+        # L5: --resume but no .tmp is a benign "fresh start"; surface it so
+        # the operator notices if they expected a recovery.
+        log.info("resume: --resume requested but no .tmp found at %s; "
+                 "starting a fresh run.", tmp_path)
     elif tmp_path.exists() and not args.resume:
         log.warning("existing .tmp at %s will be OVERWRITTEN (--resume not set). "
                     "Pass --resume to recover its rows instead.", tmp_path)
 
+    # L2: reuse the bootstrap tokenizer when present to avoid a second hub
+    # round-trip for the exact same repo+revision.
     model, tokenizer = _load_teacher(
         args.teacher, args.teacher_revision, args.load_in_4bit,
+        tokenizer=bootstrap_tok,
     )
 
     # Open in append mode when resuming with rows already present, else
