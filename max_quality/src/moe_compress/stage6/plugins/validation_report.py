@@ -28,19 +28,23 @@ JSON-artifact write, and the Trackio scalar flatten.
 Byte-identity contract
 ----------------------
 ``_deltas``, ``_measured_reduction`` and ``_check_thresholds`` below are
-character-identical copies of the legacy monolith bodies. **Master plan
-§8 HOTSPOT** -- ``_deltas`` byte-identity is load-bearing for the S6-0
-golden snapshot: every NaN/Inf branch (student-non-finite,
-teacher-non-finite, missing-key continue, non-numeric continue, the
-defensive ``not math.isfinite(delta)`` branch that is unreachable in
-IEEE 754 but preserved, and the ``_non_finite_skipped`` /
-``_teacher_non_finite_skipped`` sentinel-list assembly) is preserved
-character-for-character. ``_check_thresholds`` is similarly
-byte-identical -- the ``skipped_checks`` sub-dict's exact key names
-(``arc_challenge_acc_drop_ok``, ``hellaswag_acc_drop_ok``,
+the source-of-truth bodies for these helpers; the legacy
+``stage6_validate.py`` monolith re-imports them (see
+``stage6_validate.py:170-172``) so external callers and ``run()`` keep
+their historical import paths. The plugin IS the body, not a copy.
+**Master plan §8 HOTSPOT** -- the helpers' output must remain
+byte-stable against the S6-0 golden snapshot at
+``max_quality/tests/golden/stage6/stage6_eval.json``. For ``_deltas``
+this pins every NaN/Inf branch (student-non-finite, teacher-non-finite,
+missing-key continue, non-numeric continue, the defensive
+``not math.isfinite(delta)`` branch that is unreachable in IEEE 754 but
+preserved, and the ``_non_finite_skipped`` /
+``_teacher_non_finite_skipped`` sentinel-list assembly). For
+``_check_thresholds`` this pins the ``skipped_checks`` sub-dict's exact
+key names (``arc_challenge_acc_drop_ok``, ``hellaswag_acc_drop_ok``,
 ``humaneval_pass_at_1_drop_ok``, ``math500_accuracy_drop_ok``,
-``measured_reduction_ok``, ``wikitext2_ppl_increase_ok``) are pinned by
-the S6-0 golden's ``stage6_eval.json`` and must not drift.
+``measured_reduction_ok``, ``wikitext2_ppl_increase_ok``) — these names
+are load-bearing for the golden and must not drift.
 
 Circular-import contract (mirror of ``stage6/plugins/teacher_provider.py``
 / ``stage6/plugins/imatrix_export.py``): this module imports only from
