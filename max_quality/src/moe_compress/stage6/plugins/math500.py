@@ -1,15 +1,28 @@
-"""MATH-500 accuracy generative eval (S6-4 of the Stage 6 plugin refactor).
+r"""MATH-500 accuracy generative eval (S6-4 of the Stage 6 plugin refactor).
 
 Paper / dataset
 ----------------
 MATH-500 — Hendrycks et al. 2021 (arXiv:2103.03874) original MATH
-benchmark; the 500-problem subset is Lightman et al. 2024 (OpenAI's
-``prm800k`` curation). Scoring: ``\boxed{...}`` extraction +
-SymPy symbolic equivalence.
+benchmark; the 500-problem subset is Lightman et al. 2023 (OpenAI's
+``prm800k`` curation, "Let's Verify Step by Step", arXiv:2305.20050).
+Scoring: ``\boxed{...}`` extraction + SymPy symbolic equivalence.
 
 Stage 6 implementation note: each problem is wrapped in the model's
 chat template, the model generates chain-of-thought +
 ``\boxed{answer}``, and the gate is computed over all 500 prompts.
+
+Deviations
+----------
+
+**D-math500-maxnew** — Hendrycks 2021 MATH protocol uses comparatively
+small decode budgets (typically ≤1024 tokens). This plugin defaults
+``max_new_tokens=4096`` (was 1024) because thinking-mode-default chat
+models (Qwen3.5/3.6 class) routinely emit 2-4k tokens of
+``<think>...</think>`` chain-of-thought before the final
+``\boxed{answer}``. Override via ``cfg.max_new_tokens`` or env
+``STAGE6_MAX_NEW_MATH`` for non-thinking models. Has no effect on
+relative-to-teacher gating (both sides decode with the same budget)
+but widens the gap from Hendrycks 2021 absolute accuracy numbers.
 
 Reference code
 --------------
@@ -84,6 +97,12 @@ log = logging.getLogger(__name__)
 # monolith keeps its own definition and is NOT imported here (circular-import
 # contract). Both copies must stay in sync until S6-8 collapses the monolith.
 _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
+
+
+# N2: Pre-compile the ``\boxed{`` scan pattern once at module load rather than
+# re-compiling per loop iteration inside ``_extract_boxed`` (called per
+# completion; up to 500× per eval).
+_BOXED_RE = re.compile(r"\\boxed\{")
 
 
 # N3: sympy is optional — imported once at module level to avoid repeated
@@ -171,8 +190,11 @@ def _math500(model, tokenizer, cfg: dict, *, device=None, collect=None,
             correct += 1
         if (i + 1) % 25 == 0:
             log.info("  MATH-500 eval %d/%d (correct=%d)", i + 1, n_total, correct)
-    log.info("  MATH-500 final: %d/%d = %.3f", correct, n_total, correct / max(n_total, 1))
-    return correct / max(n_total, 1)
+    # N3: `n_total >= 500` is guaranteed by the spec-gate raise above (the
+    # ValueError fires when `n_total < len(ds)`, and MATH-500 has 500 rows),
+    # so direct division is safe — no `max(n_total, 1)` belt-and-braces guard.
+    log.info("  MATH-500 final: %d/%d = %.3f", correct, n_total, correct / n_total)
+    return correct / n_total
 
 
 def _extract_boxed(s: str) -> str | None:
@@ -184,10 +206,10 @@ def _extract_boxed(s: str) -> str | None:
     results = []
     idx = 0
     while True:
-        m = re.search(r'\\boxed\{', s[idx:])
+        m = _BOXED_RE.search(s, idx)
         if not m:
             break
-        start = idx + m.end()
+        start = m.end()
         depth = 1
         i = start
         while i < len(s) and depth > 0:
@@ -293,9 +315,20 @@ class Math500Plugin:
     """
 
     name = "math500"
-    paper = "MATH-500 — Hendrycks et al. 2021 arXiv:2103.03874 (subset Lightman et al. 2024); SymPy-graded \boxed extraction. See module docstring."
+    paper = r"MATH-500 — Hendrycks et al. 2021 arXiv:2103.03874 (subset Lightman et al. 2023 arXiv:2305.20050); SymPy-graded \boxed extraction. See module docstring."
     config_key = "stage6_validate.generative.enabled"
-    reads: tuple[str, ...] = ("model", "tokenizer", "config", "dataset_revisions")
+    # C1: `pre_compile_forward` + `experts_implementation_generative` are
+    # populated by `EvalEnvironmentPlugin.setup_environment` and MUST be
+    # consumed by `eval_task` before calling `model.generate()` (see
+    # eval_environment.py L498-518 contract).
+    reads: tuple[str, ...] = (
+        "model",
+        "tokenizer",
+        "config",
+        "dataset_revisions",
+        "pre_compile_forward",
+        "experts_implementation_generative",
+    )
     writes: tuple[str, ...] = ("eval_results",)
     # eval_results is a shared collector the orchestrator pre-creates per side
     # and every eval plugin appends to; it is NOT a calibration-pass accumulator,
@@ -366,6 +399,31 @@ class Math500Plugin:
         # run()); default to None when a wiring stage has not provided them.
         device = ctx.get("device") if ctx.has("device") else None
         collect = ctx.get("eval_text_concat") if ctx.has("eval_text_concat") else None
+
+        # C1 — Honor the EvalEnvironmentPlugin downstream contract
+        # (eval_environment.py L498-518) before calling `model.generate()`
+        # via `_math500` → `_generate_batched`. Mirrors the teacher-side
+        # equivalent at `teacher_provider.py` L602-616.
+        #
+        # Without this, generate() runs against:
+        #   (a) the compiled `model.forward` — torch 2.11+cu130 + Triton 3.4
+        #       Inductor recompile storm on growing cache_position + B=1
+        #       decode-shape codegen crash; AND
+        #   (b) the PPL/lm_eval experts impl (often `grouped_mm` on Hopper),
+        #       which torch._grouped_mm crashes on at B=1 decode shape.
+        _pre = ctx.get("pre_compile_forward") if ctx.has("pre_compile_forward") else None
+        if _pre is not None:
+            model.forward = _pre
+        _gen_impl = (
+            ctx.get("experts_implementation_generative")
+            if ctx.has("experts_implementation_generative")
+            else None
+        )
+        if _gen_impl is not None:
+            _cfg = getattr(model, "_orig_mod", model).config
+            if _gen_impl != getattr(_cfg, "_experts_implementation", None):
+                from .eval_environment import _set_experts_implementation_s6
+                _set_experts_implementation_s6(model, _gen_impl)
 
         log.info("Stage 6: MATH-500 (student), batch_size=%d", int(gen_batch_size))
         eval_results = ctx.get("eval_results")

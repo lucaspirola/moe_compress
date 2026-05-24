@@ -8,11 +8,13 @@ wrapped in the model's chat template, the model generates a
 completion, and the completion is scored by exec'ing the dataset's
 reference unit test.
 
-Deviation: D-humaneval-greedy
------------------------------
-Paper protocol: **stochastic** pass@1 estimated from ``n=10`` samples
-per problem at ``T=0.2, top_p=0.95``, then unbiased pass@k formula;
-**exec-based scoring runs each problem in a subprocess sandbox**.
+Deviations
+----------
+
+**D-humaneval-greedy** — Paper protocol: **stochastic** pass@1
+estimated from ``n=10`` samples per problem at ``T=0.2, top_p=0.95``,
+then unbiased pass@k formula; **exec-based scoring runs each problem
+in a subprocess sandbox**.
 
 This plugin's protocol:
 
@@ -37,6 +39,26 @@ eval substantially with no signal-quality benefit for the relative
 gate; see ``stage6_validate.py`` module docstring "Known limitations"
 subsection for the operational caveats (daemon-thread leakage, no
 syscall interruption, no seccomp / landlock).
+
+**D-humaneval-maxnew** — Paper / Chen 2021 §2.2 uses comparatively
+small decode budgets (the original eval scores standalone completions
+that rarely exceed a few hundred tokens). This plugin defaults
+``max_new_tokens=2048`` (was 512) to leave room for thinking-mode
+traces on Qwen3.5/3.6-class chat models, where ``<think>...</think>``
+blocks routinely consume 1-2k tokens before the actual code emerges.
+Override via ``cfg.max_new_tokens`` or env ``STAGE6_MAX_NEW_HE`` for
+non-thinking models. Has no effect on relative-to-teacher gating
+(both sides decode with the same budget) but further widens the gap
+from Chen et al. 2021 absolute pass@1 numbers.
+
+**D-humaneval-limit** — When ``HUMANEVAL_LIMIT`` env (or ``cfg.limit``)
+is set to a positive integer less than 164, prompts/tests/entry_points
+are truncated in lockstep and pass@1 is rebased to the subset count.
+This is a **smoke-subset** mode (segfault-fix / wiring smoke runs);
+any non-zero ``HUMANEVAL_LIMIT`` invalidates direct comparison against
+164-problem published baselines OR against full-eval prior runs.
+Relative-to-teacher gating remains valid only if teacher and student
+share the same limit.
 
 Home of the Stage 6 HumanEval concern, extracted from the legacy
 ``stage6_validate.py`` monolith. HumanEval is the code-generation half of the
@@ -96,6 +118,13 @@ from ...tools.eval_harness import (
     _generate_batched,
     _stage6_enable_thinking,
 )
+# C1: imported at module top so the eval_task hook can call the canonical
+# experts-impl shim without a function-local import (which would be
+# re-resolved per call and complicate static analysis). The eval_environment
+# plugin module only imports from ..context / stdlib / model internals, so
+# this is safe wrt the circular-import contract documented in the module
+# docstring.
+from .eval_environment import _set_experts_implementation_s6
 
 log = logging.getLogger(__name__)
 
@@ -105,7 +134,11 @@ log = logging.getLogger(__name__)
 # is a module-LOCAL copy of the monolith's ``_STAGE6_ATTN_IMPLEMENTATION``: the
 # monolith keeps its own definition and is NOT imported here (circular-import
 # contract). Both copies must stay in sync until S6-8 collapses the monolith.
-_STAGE6_ATTN_IMPLEMENTATION: str = "eager"
+# N1: Currently unreferenced *inside this module* (the attention selection is
+# enforced by eval_environment.py before this plugin runs); retained so tests
+# pinning the constant's existence/value and the future S6-8 plug-in collapse
+# both find it here. Do NOT remove without coordinated test + monolith edits.
+_STAGE6_ATTN_IMPLEMENTATION: str = "eager"  # noqa: F841 — see N1 comment above
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +289,15 @@ def _check_humaneval(
     _exc_holder: list = []
 
     def _exec_target() -> None:
+        # N3: this body runs inside a non-main daemon thread, which means
+        # signal.alarm / signal.SIGALRM based interruption is NOT available
+        # here — Python only delivers signals to the main thread. The H1
+        # caveat (best-effort wall-clock timeout via Thread.join leaving the
+        # offending thread alive as a daemon) is therefore structural, not a
+        # TODO. Do NOT try to "fix" it by adding signal.alarm: it would
+        # raise ValueError: signal only works in main thread and break every
+        # problem. Subprocess isolation is the only real fix and is
+        # intentionally out of scope (D-humaneval-greedy rationale).
         try:
             exec(src, ns, ns)           # noqa: S102 — controlled benchmark use
         except Exception as _e:         # noqa: BLE001
@@ -292,9 +334,35 @@ class HumanEvalPlugin:
     """
 
     name = "humaneval"
-    paper = "HumanEval pass@1 — Chen et al. 2021 arXiv:2107.03374. Deviation D-humaneval-greedy (greedy n=1 + in-process exec; relative-to-teacher gating only). See module docstring."
+    # N2: split citation from deviation list, mirroring sibling Stage 6
+    # plugins. ``paper`` is the canonical citation only; ``deviation`` is the
+    # one-line summary pointing to the module docstring for the full list.
+    paper = "HumanEval pass@1 — Chen et al. 2021 arXiv:2107.03374."
+    deviation = (
+        "D-humaneval-greedy (greedy n=1 + in-process exec; relative-to-teacher "
+        "gating only), D-humaneval-maxnew (max_new_tokens=2048 for thinking-mode "
+        "traces), D-humaneval-limit (HUMANEVAL_LIMIT rebases pass@1 to subset "
+        "count). See module docstring for full Deviations section."
+    )
     config_key = "stage6_validate.generative.enabled"
-    reads: tuple[str, ...] = ("model", "tokenizer", "config", "dataset_revisions")
+    # M1: reads tuple includes the run-scoped ctx side-channels the body
+    # actually consumes — device, eval_text_concat, eval_results — plus the
+    # mandatory generative-side restore handles published by
+    # eval_environment.py (pre_compile_forward, experts_implementation_generative).
+    # Failure to declare these here would let the ctx-validation layer reject
+    # the slots even though the body legitimately reads them under ``ctx.has(...)``
+    # guards.
+    reads: tuple[str, ...] = (
+        "model",
+        "tokenizer",
+        "config",
+        "dataset_revisions",
+        "device",
+        "eval_text_concat",
+        "eval_results",
+        "pre_compile_forward",
+        "experts_implementation_generative",
+    )
     writes: tuple[str, ...] = ("eval_results",)
     # eval_results is a shared collector the orchestrator pre-creates per side
     # and every eval plugin appends to; it is NOT a calibration-pass accumulator,
@@ -384,6 +452,43 @@ class HumanEvalPlugin:
         collect = ctx.get("eval_text_concat") if ctx.has("eval_text_concat") else None
 
         log.info("Stage 6: HumanEval (student), batch_size=%d", int(gen_batch_size))
+
+        # C1: Honor the downstream contract published by eval_environment.py
+        # (commit 6cca08f, reaffirmed in 7f53280 / 2f4465bc; canonical code
+        # block at eval_environment.py L496-524). Before any model.generate(...)
+        # on the generative side we MUST:
+        #   (1) restore the uncompiled forward (avoids cu130 Inductor recompile
+        #       storm on growing cache_position + decode-shape codegen crashes
+        #       under torch 2.11+cu130 / Triton 3.4 on Hopper);
+        #   (2) switch experts_implementation to the generative impl (the
+        #       PPL/lm_eval default grouped_mm crashes on B=1 decode-shape on
+        #       cu130 — torch._grouped_mm requires the prefill batch geometry).
+        # Mirror of the teacher-side block at teacher_provider.py L602-616.
+        # Both slots are optional ctx publications (pre-S6-8 wiring may omit
+        # them in tests); fall through quietly when absent.
+        _pre = ctx.get("pre_compile_forward") if ctx.has("pre_compile_forward") else None
+        if _pre is not None:
+            model.forward = _pre
+            log.info(
+                "Stage 6 HumanEval: restored uncompiled model.forward for "
+                "generative block (keep PPL/lm_eval compiled, generative eager)"
+            )
+        _gen_impl = (
+            ctx.get("experts_implementation_generative")
+            if ctx.has("experts_implementation_generative")
+            else None
+        )
+        if _gen_impl is not None:
+            _cfg = getattr(model, "_orig_mod", model).config
+            _current_impl = getattr(_cfg, "_experts_implementation", None)
+            if _gen_impl != _current_impl:
+                log.info(
+                    "Stage 6 HumanEval: switching experts_implementation "
+                    "%r → %r for generative block",
+                    _current_impl, _gen_impl,
+                )
+                _set_experts_implementation_s6(model, _gen_impl)
+
         eval_results = ctx.get("eval_results")
         eval_results["humaneval_pass_at_1"] = _humaneval(
             model, tokenizer, s6["generative"]["humaneval"], device=device,

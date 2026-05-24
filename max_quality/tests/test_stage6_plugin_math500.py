@@ -100,7 +100,16 @@ def test_plugin_metadata():
     assert isinstance(plugin.reads, tuple)
     assert isinstance(plugin.writes, tuple)
     assert isinstance(plugin.provides, tuple)
-    assert plugin.reads == ("model", "tokenizer", "config", "dataset_revisions")
+    # C1: pre_compile_forward + experts_implementation_generative are consumed
+    # by `eval_task` before generate() (eval_environment.py L498-518 contract).
+    assert plugin.reads == (
+        "model",
+        "tokenizer",
+        "config",
+        "dataset_revisions",
+        "pre_compile_forward",
+        "experts_implementation_generative",
+    )
     assert plugin.writes == ("eval_results",)
     # eval_results is a shared collector (in `writes`), not a calibration-pass
     # accumulator — `provides` is empty.
