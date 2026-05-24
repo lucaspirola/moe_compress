@@ -1,17 +1,18 @@
-"""Early-stop concern (RK-7 of the Router-KD plugin-architecture refactor).
+"""Early-stop concern of the Router-KD plugin-architecture refactor.
 
 Paper
 -----
 Hyeon & Do, "Is Retraining-Free Enough? The Necessity of Router
-Calibration for Efficient MoE Compression" — arXiv:2603.02217 (§F.3,
-Eq. 3, Table 1). audit/spec_compliance/01_papers/2603.02217/source.md.
+Calibration for Efficient MoE Compression" — arXiv:2603.02217
+(§5 Eq. 3, §F.3 Table 1). audit/spec_compliance/01_papers/2603.02217/source.md.
 
-Equation 3: the per-batch vocab-KL distillation objective
+Equation 3 (§5): the per-batch vocab-KL distillation objective
     L_KD = KL(softmax(s_t / τ) || softmax(s_s / τ)) · τ²
 where ``s_t``, ``s_s`` are the teacher and student vocabulary logits
 and ``τ`` is the distillation temperature.
 
-§F.3 fixes the calibration data and hyperparameters; Table 1 reports
+§F.3 Table 1 fixes the calibration data and the training-schedule
+hyperparameters (steps / batch size / LR / temperature); Table 1 reports
 the resulting recovery on Mixtral/Qwen-MoE post-pruning/post-merging.
 
 Official code
@@ -27,37 +28,70 @@ Nemotron-Cascade-2-SFT-Data with weighted subsets — task-aware
 calibration better matches target deployment distribution. The D11
 row's canonical owner is :mod:`stage2.plugins.reap_scoring`.
 
+Deviation D-router-kd-early-stop (PROJECT-ORIGINAL, this plugin's owner)
+------------------------------------------------------------------------
+What IS in the paper: §F.3 Table 1 specifies only the Router-KD training
+schedule — steps, batch size, learning rate, distillation temperature.
+The paper does NOT prescribe any best-checkpoint tracking, EMA-smoothed
+raw-KL save criterion, ``best.pt`` snapshot/reload, or patience-based
+early-stop heuristic.
+
+What this plugin ADDS beyond the paper (added 2026-05-17 as an overfit
+fix; see inline markers in :meth:`setup_early_stop` and
+:meth:`update_best_tracker`):
+  1. EMA-smoothed running estimate of per-window raw vocab-KL
+     (``raw_kl_ema``; ``best_metric_ema_alpha`` controls smoothing).
+  2. ``best.pt`` snapshot of the trainable (router) params on every
+     EMA-improvement window, via :func:`_save_best_router_state`'s atomic
+     ``torch.save`` → file fsync → ``os.replace`` → directory fsync dance.
+  3. Patience-counter early-stop: training halts cleanly once the EMA
+     fails to improve for ``early_stop_patience`` consecutive log
+     windows. ``early_stop_patience == 0`` disables the patience block
+     entirely — byte-identical to the pre-2026-05-17 behaviour.
+  4. End-of-training reload of ``best.pt`` so the exported router weights
+     are the best snapshot seen rather than the last-step state.
+  5. Resume-restore of best-tracker / early-stop state from v2 resume
+     checkpoints, so a crash-restart does not lose accumulated patience.
+
+Rationale: Router-KD over many epochs on a small calibration set can
+overfit the per-window raw KL — empirically the validation curve plateaus
+then degrades. The best-tracker + patience guard exports the best
+snapshot the run saw and avoids burning compute past the inflection.
+Independent of any paper claim; convergence aid only.
+
 Home of the Router-KD *best-tracker + early-stop* concern — the last
 Router-KD plugin extraction — carved out of the legacy
-``stage5_router_kd.py`` monolith. RK-7 is a MIXED pattern: one Pattern-A
-relocation plus one Pattern-B inline reproduction.
+``stage5_router_kd.py`` monolith. The split is a MIXED pattern: one
+Pattern-A relocation plus one Pattern-B inline reproduction.
 
 Piece A — relocated verbatim (Pattern A, the RK-2/RK-3/RK-4/RK-6 pattern):
   ONE STANDALONE module-level function is relocated here character-for-
   character — ``_save_best_router_state`` (the atomic ``best.pt`` writer:
   it snapshots the trainable router params to a slim payload and rewrites
-  ``best.pt`` with the ``torch.save`` → ``os.fsync`` → ``os.replace`` atomic
-  dance). It is relocated verbatim; the ``stage5_router_kd.py`` monolith
-  re-imports it (``# noqa: F401`` block) so ``run()`` keeps its import path.
+  ``best.pt`` with the ``torch.save`` → file fsync → ``os.replace`` →
+  directory fsync atomic dance). It is relocated verbatim; the legacy
+  ``stage5_router_kd.py`` shim re-imports it (``# noqa: F401`` block) so
+  third-party callers that pinned the old import path keep working.
 
-Piece B — the inert hooks (Pattern B): :class:`EarlyStopPlugin` carries
+Piece B — the live hooks (Pattern B): :class:`EarlyStopPlugin` carries
 four phase hooks — ``setup_early_stop`` / ``update_best_tracker`` /
-``check_early_stop`` / ``reload_best_checkpoint`` — that REPRODUCE the
-inline best-tracker / early-stop glue scattered through the monolith
-``run()`` (the best-tracker + early-stop state init and the resume-restore;
-the per-log-window EMA-update / ``best.pt``-save / patience-counter loop
-body; the early-stop break DECISION; the end-of-training ``best.pt``
-reload). They are INERT at RK-7 — no orchestrator walk or test invokes
-them, and the monolith ``run()`` is NOT modified for any of the Pattern-B
-glue: the inline early-stop code stays exactly where it was. The hooks
-exist as the RK-8 wiring surface; RK-8 plugs them into the live Router-KD
-plugin sequencer and deletes the monolith ``run()``.
+``check_early_stop`` / ``reload_best_checkpoint`` — that reproduce the
+best-tracker / early-stop glue formerly inlined in the monolith
+``run()``. RK-8 has SHIPPED: the live caller is
+:mod:`moe_compress.router_kd.orchestrator`, which constructs the plugin
+in its ``_BUILTIN_PLUGINS`` registry and dispatches the hooks via
+``walk_phases(("setup_early_stop",), …)`` before the epoch loop,
+``walk_phases(("update_best_tracker", "check_early_stop"), …)`` per log
+window inside the optimizer-step block, and
+``walk_phases(("reload_best_checkpoint",), …)`` once after the epoch
+loop / before the final export. ``stage5_router_kd.py`` is now a thin
+shim whose ``run()`` simply delegates to the orchestrator.
 
-NOTE — the orchestrator/monolith boundary: :meth:`check_early_stop` only
+NOTE — the orchestrator/plugin boundary: :meth:`check_early_stop` only
 makes the early-stop DECISION (it sets the ``early_stop_should_stop`` flag
 and logs the stop line). The actual loop ``break`` and the final
-crash-resume checkpoint write stay orchestrator-level / monolith-owned —
-the plugin owns the *policy*, not the loop control flow.
+crash-resume checkpoint write stay orchestrator-level — the plugin owns
+the *policy*, not the training-loop control flow.
 
 Unconditional ``is_enabled`` (mirror of ``VocabKdPlugin``, NOT the
 stage-gated ``MergeRepairPlugin``): every Router-KD run carries a
@@ -69,12 +103,9 @@ that knob, it does not gate the plugin as a whole.
 Circular-import note (mirror of ``vocab_kd.py`` / ``merge_repair.py``):
 this module imports only from ``..context`` / stdlib / torch — NEVER from
 ``stage5_router_kd`` or ``router_kd.orchestrator`` at any scope (module-top
-OR function-local). The monolith re-imports *this* module at load time, so
+OR function-local). The shim re-imports *this* module at load time, so
 a ``from ..stage5_router_kd import ...`` here would deadlock the import;
 nothing in this module does that.
-
-``EarlyStopPlugin`` is registered-but-INERT at RK-7 — RK-8 plugs the hooks
-into the live Router-KD plugin sequencer.
 """
 from __future__ import annotations
 
@@ -128,16 +159,31 @@ def _save_best_router_state(
     finally:
         os.close(fd)
     os.replace(tmp, final)
+    # POSIX-durable atomic rename: data fsync above persists the file bytes;
+    # the directory fsync below persists the rename (the new dirent entry).
+    # Wrapped in try/except OSError because O_DIRECTORY is POSIX-only — on
+    # filesystems / platforms that reject opening a directory (notably
+    # Windows) we silently fall back to the rename-only semantics.
+    try:
+        dir_fd = os.open(str(partial_dir), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 class EarlyStopPlugin:
-    """Router-KD best-tracker + early-stop plugin (RK-7 — registered-but-INERT).
+    """Router-KD best-tracker + early-stop plugin (LIVE — RK-8 dispatched).
 
     Owns the Router-KD *best-tracker + early-stop* concern: the EMA-smoothed
     raw-KL tracking, the ``best.pt`` save-on-improvement, the patience-based
     early-stop decision and the end-of-training best-checkpoint reload. The
     one standalone function above (``_save_best_router_state``) is relocated
-    verbatim (the monolith re-imports it).
+    verbatim (the legacy ``stage5_router_kd.py`` shim re-imports it).
 
     Best-tracking is UNCONDITIONAL — every Router-KD run exports the best
     ``best.pt`` it saw — so :meth:`is_enabled` always returns ``True``
@@ -146,18 +192,21 @@ class EarlyStopPlugin:
     ``early_stop_patience > 0`` inside the hooks.
 
     The four hooks (``setup_early_stop`` / ``update_best_tracker`` /
-    ``check_early_stop`` / ``reload_best_checkpoint``) REPRODUCE the inline
-    best-tracker / early-stop ``run()`` glue; they are INERT at RK-7 — no
-    orchestrator walk or test invokes them, and the monolith ``run()`` is
-    untouched. RK-8 plugs them into the live Router-KD plugin sequencer.
+    ``check_early_stop`` / ``reload_best_checkpoint``) are LIVE: the live
+    caller :mod:`moe_compress.router_kd.orchestrator` dispatches them via
+    its ``walk_phases`` calls (setup before the epoch loop; update+check
+    per log window; reload once after the epoch loop). See module
+    docstring's "Piece B" section for the exact dispatch sites.
     """
 
     name = "early_stop"
     paper = (
-        "Router KD vocab-KL distillation Eq. 3 — arXiv:2603.02217 "
-        "(Hyeon & Do); no official code. Concern: best-tracker EMA + best.pt save + patience early-stop. "
-        "Calibration D11 (SHARED — see :mod:`stage2.plugins.reap_scoring`). "
-        "See module docstring."
+        "Router KD vocab-KL distillation — arXiv:2603.02217 (Hyeon & Do) "
+        "§5 Eq. 3, §F.3 Table 1. Calibration deviation D11 (SHARED — "
+        "see :mod:`stage2.plugins.reap_scoring`). "
+        "Deviation D-router-kd-early-stop (PROJECT-ORIGINAL convergence "
+        "aid, NOT in the paper): best-tracker EMA + best.pt snapshot/reload "
+        "+ patience-based early-stop. See module docstring."
     )
     config_key = "stage5_router_kd.early_stop_patience"
     # ``config`` drives the one-time setup (EMA alpha, save_best, patience);
@@ -206,21 +255,20 @@ class EarlyStopPlugin:
     def setup_early_stop(self, ctx: PipelineContext) -> None:
         """One-time setup hook — best-tracker + early-stop state init.
 
-        INERT at RK-7: no orchestrator walk or test invokes this hook. RK-8
-        calls it once before the epoch loop. The body reproduces the monolith
-        ``run()`` inline best-tracker + early-stop setup block (and the
-        resume-restore) faithfully — dead code at RK-7 but RK-8 + unit tests
-        rely on it.
+        LIVE: the orchestrator dispatches this once via
+        ``walk_phases(("setup_early_stop",), …)`` before the epoch loop.
+        The body reproduces (in the order the legacy monolith executed it)
+        the best-tracker + early-stop setup block and the resume-restore.
 
-        Reproduces (in monolith order): read ``best_metric_ema_alpha`` /
-        ``save_best`` from ``stage5_router_kd`` config and seed the
+        Reads ``best_metric_ema_alpha`` /
+        ``save_best`` from ``stage5_router_kd`` config and seeds the
         best-tracker (``best_raw_kl_ema`` / ``best_step`` / ``prev_ema``);
-        read + validate ``early_stop_patience`` (must be >= 0) and seed the
-        early-stop state (``no_improve_windows`` / ``es_ref_ema``); then apply
-        the resume-restore — when a v2 resume checkpoint published the
-        optional ``resume_*`` slots, overwrite the freshly-seeded state from
-        them so a crash-resume does not lose accumulated patience. Publishes
-        ``best_ema_alpha`` / ``save_best`` / ``best_raw_kl_ema`` /
+        reads + validates ``early_stop_patience`` (must be >= 0) and seeds
+        the early-stop state (``no_improve_windows`` / ``es_ref_ema``); then
+        applies the resume-restore — when a v2 resume checkpoint published
+        the optional ``resume_*`` slots, overwrite the freshly-seeded state
+        from them so a crash-resume does not lose accumulated patience.
+        Publishes ``best_ema_alpha`` / ``save_best`` / ``best_raw_kl_ema`` /
         ``best_step`` / ``prev_ema`` / ``early_stop_patience`` /
         ``no_improve_windows`` / ``es_ref_ema``.
         """
@@ -298,13 +346,11 @@ class EarlyStopPlugin:
     def update_best_tracker(self, ctx: PipelineContext) -> None:
         """Per-log-window hook — EMA update + best.pt save + patience counter.
 
-        INERT at RK-7: no orchestrator walk or test invokes this hook. RK-8
-        dispatches it once per log window inside the optimizer-step block. The
-        body reproduces the monolith ``run()`` inline per-window best-tracker
-        + early-stop-counter block faithfully — dead code at RK-7 but RK-8 +
-        unit tests rely on it.
+        LIVE: the orchestrator dispatches this once per log window inside
+        the optimizer-step block (paired with :meth:`check_early_stop`) via
+        ``walk_phases(("update_best_tracker", "check_early_stop"), …)``.
 
-        Reproduces (in monolith order): EMA of ``raw_kl_val`` across log
+        Reproduces (in legacy-monolith order): EMA of ``raw_kl_val`` across log
         boundaries (``prev_ema=+inf`` bootstraps ``ema = raw_kl_val``); the
         save-best comparison (``save_best`` AND ``ema < best_raw_kl_ema`` →
         update best + ``_save_best_router_state``); then the early-stop
@@ -341,7 +387,10 @@ class EarlyStopPlugin:
         # Save-best by EMA-smoothed raw KL. +inf seed of best_raw_kl_ema
         # guarantees the first log boundary always writes a best.pt, so the
         # run always exports SOMETHING even if it crashes before any
-        # improvement.
+        # improvement. Strict-``<`` is intentional: an exact-equality
+        # plateau is treated as no-improve so we do not pointlessly rewrite
+        # best.pt on bit-identical windows (rare under FP drift; possible
+        # on fully converged runs and on synthetic fixtures).
         if save_best and ema < best_raw_kl_ema:
             best_raw_kl_ema = ema
             best_step = step
@@ -353,7 +402,9 @@ class EarlyStopPlugin:
         # early stopping works even with save_best=false. A window that
         # improves on the running minimum resets the no-improve counter; one
         # that does not increments it. With early_stop_patience == 0 the whole
-        # block is skipped.
+        # block is skipped. Strict-``<``: equality counts as no-improve so a
+        # plateau (e.g., bit-identical converged windows or fixture inputs)
+        # still ticks patience and breaks ties toward stopping.
         if early_stop_patience > 0:
             if ema < es_ref_ema:
                 no_improve_windows = 0
@@ -369,22 +420,22 @@ class EarlyStopPlugin:
         ctx.set("es_ref_ema", es_ref_ema, overwrite=True)
 
     def check_early_stop(self, ctx: PipelineContext) -> None:
-        """Per-window hook — the early-stop DECISION (RK-8 wiring surface).
+        """Per-window hook — the early-stop DECISION.
 
-        INERT at RK-7: no orchestrator walk or test invokes this hook. RK-8
-        dispatches it right after :meth:`update_best_tracker`. The body
-        reproduces the monolith ``run()`` early-stop DECISION faithfully —
-        dead code at RK-7 but RK-8 + unit tests rely on it.
+        LIVE: the orchestrator dispatches this right after
+        :meth:`update_best_tracker` in the same per-log-window
+        ``walk_phases(("update_best_tracker", "check_early_stop"), …)``
+        sweep; the orchestrator then reads ``early_stop_should_stop`` to
+        decide whether to break the training loop.
 
         BOUNDARY: this hook only makes the *decision* — it sets the
         ``early_stop_should_stop`` flag (``True`` once
         ``no_improve_windows >= early_stop_patience``, with
         ``early_stop_patience > 0``) and logs the stop line. The actual loop
         ``break`` and the final crash-resume checkpoint write stay
-        orchestrator-level / monolith-owned: the plugin owns the early-stop
-        *policy*, not the training-loop control flow. With
-        ``early_stop_patience == 0`` the flag stays ``False`` — byte-identical
-        to pre-2026-05-17 ``main``.
+        orchestrator-level: the plugin owns the early-stop *policy*, not
+        the training-loop control flow. With ``early_stop_patience == 0``
+        the flag stays ``False`` — byte-identical to pre-2026-05-17 ``main``.
 
         Reproduces: the ``no_improve_windows >= early_stop_patience`` test and
         the stop-line ``log.info``. Publishes ``early_stop_should_stop``.
@@ -407,17 +458,18 @@ class EarlyStopPlugin:
                 stage_key, step, no_improve_windows, early_stop_patience,
                 best_raw_kl_ema, best_step,
             )
-        ctx.set("early_stop_should_stop", should_stop, overwrite=ctx.has(
-            "early_stop_should_stop"
-        ))
+        # Per-window dispatch always overwrites: every check_early_stop
+        # call republishes the flag (False until the patience threshold is
+        # crossed, True afterwards). overwrite=True is the simpler
+        # invariant than `ctx.has(...)`-conditional re-publishing.
+        ctx.set("early_stop_should_stop", should_stop, overwrite=True)
 
     def reload_best_checkpoint(self, ctx: PipelineContext) -> None:
-        """End-of-training hook — best.pt param swap (RK-8 wiring surface).
+        """End-of-training hook — best.pt param swap.
 
-        INERT at RK-7: no orchestrator walk or test invokes this hook. RK-8
-        calls it once after the epoch loop, before the final export. The body
-        reproduces the monolith ``run()`` inline best-checkpoint reload block
-        faithfully — dead code at RK-7 but RK-8 + unit tests rely on it.
+        LIVE: the orchestrator dispatches this once after the epoch loop /
+        before the final export via
+        ``walk_phases(("reload_best_checkpoint",), …)``.
 
         Reproduces: if ``save_best`` was active and a ``best.pt`` was written
         during training, load it and swap the trainable (router) params for
@@ -435,7 +487,13 @@ class EarlyStopPlugin:
         stage_key = ctx.get("stage_key")
         best_path = partial_dir / "best.pt"
         if best_path.exists():
-            best_blob = torch.load(best_path, map_location="cpu")
+            # weights_only=True: best.pt's payload is a self-written dict of
+            # plain Python scalars + CPU tensors (see _save_best_router_state).
+            # Safer (no arbitrary-code unpickling) and silences the
+            # PyTorch >= 2.6 FutureWarning on the unrestricted default.
+            best_blob = torch.load(
+                best_path, map_location="cpu", weights_only=True
+            )
             base = getattr(student, "_orig_mod", student)
             missing, unexpected = base.load_state_dict(
                 best_blob["router_state"], strict=False
