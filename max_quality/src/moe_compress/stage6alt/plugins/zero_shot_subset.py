@@ -1,5 +1,22 @@
 """Thermometer ARC-Easy + HellaSwag zero-shot subset (S6A-3 of the Stage 6alt plugin-architecture refactor).
 
+Paper / dataset
+----------------
+Stage 6alt thermometer ARC-Easy + HellaSwag subset — same lm-eval-harness
+(Gao et al. 2024) wrappers as :mod:`stage6.plugins.zero_shot_lm_eval`,
+but with **small-subsample limits** (``ARC-Easy limit=N``,
+``HellaSwag limit=M``) so the thermometer runs in seconds rather than
+minutes.
+
+Datasets: ARC-Easy + ARC-Challenge are Clark et al. 2018
+(arXiv:1803.05457); HellaSwag is Zellers et al. 2019
+(arXiv:1905.07830).
+
+Reference code
+--------------
+EleutherAI/lm-evaluation-harness — standard library, no
+project-pinned SHA.
+
 Home of the Stage 6alt thermometer zero-shot-subset concern, extracted
 from the legacy ``stage6alt_thermometer.py`` monolith. The thermometer
 runs a small subsample of ARC-Easy + HellaSwag via lm-eval to produce
@@ -95,12 +112,7 @@ class ZeroShotSubsetPlugin:
     """
 
     name = "zero_shot_subset"
-    paper = (
-        "Stage 6alt thermometer — ARC-Easy + HellaSwag zero-shot subset "
-        "as a cheap secondary signal alongside BPT; see "
-        "stage6alt_thermometer.py module docstring for the role of the "
-        "acc_norm_sum / acc_norm_sum_gap metrics."
-    )
+    paper = "Stage 6alt thermometer zero-shot subset — ARC-Easy + HellaSwag (Clark 2018 / Zellers 2019) via lm-eval (Gao et al. 2024); small-N limits for sweep speed. See module docstring."
     config_key = "stage6_validate.thermometer"
     reads: tuple[str, ...] = ("model", "tokenizer", "config")
     writes: tuple[str, ...] = (
