@@ -1,31 +1,130 @@
-"""Phase D — Ablation Filter (load-bearing causal-ΔNLL filter).
+"""Causal-ΔNLL ablation filter — load-bearing final-blacklist producer.
 
-Paper: ALGORITHM_REFERENCE.md §4 Phase D and §12 D-causal-ablation-validation.
-Migrated from the legacy Stage 1 ablation-filter module in sub-task 5 of the
-Stage 1 → plugin-architecture refactor.
+Paper
+-----
+**None — there is no paper for this filter.** It is project-original.
 
-The plugin's externally observable behaviour is **byte-identical** to the
-legacy ``run_ablation_filter`` + ``_write_ablation_filter_artifact`` pair:
-same baseline-NLL semantics, same per-candidate ablation forward-pass, same
-threshold-filter rule (ΔNLL > threshold), same six-key JSON payload schema.
-Verified via the golden snapshot test for ``stage1_ablation_filter.json``
-and ``stage1_blacklist.json`` (Phase D feeds the Phase-C-artifact assembly
-below).
+The Super-Experts paper arXiv:2507.23279 validates its detected SE set via
+*global* ablation experiments — pruning the full SE set together vs.
+pruning random expert sets of the same size — and reports Avg. / ARC-c /
+WikiPPL / etc. impact on downstream task suites (audit/spec_compliance/
+01_papers/2507.23279/source.md L379–L380 Table 3 framing, L574–L584
+table content). It does NOT use ablation as a *per-expert* filter to
+admit/reject candidates one at a time.
+
+This plugin runs a per-candidate ablation pass: for every ``(l, e)`` in
+the Phase-C candidate pool, install a forward hook that zeros expert
+``e``'s ``down_proj`` output, measure ΔNLL on a held-out slice, and admit
+``(l, e)`` to the final blacklist only when ``ΔNLL > ablation_filter_threshold``.
+
+Official code
+-------------
+None. The companion paper's official repo
+(ZunhaiSu/Super-Experts-Profilling @
+``573aead3127ae593ba267758b832944f8fed1485``) implements the three-way AND
+detector and Table 3-style global-ablation evaluation, but does not
+implement per-expert ablation-filter blacklist construction.
+
+Deviation: D-causal-ablation-validation
+---------------------------------------
+Project-original (and load-bearing) — this filter produces Stage 1's
+final blacklist. Procedure:
+
+  1. Held-out slice: ``holdout_samples`` (=100) calibration sequences
+     drawn with a deterministic seed offset distinct from earlier
+     calibration passes; cached at ``_calibration_cache_phase_d/``.
+  2. Baseline: forward over the slice with no ablation; record mean
+     per-token NLL ``baseline_nll``.
+  3. For each candidate ``(l, e)``: install a forward hook that zeros
+     expert ``e``'s ``down_proj`` output; measure ``ablated_nll``;
+     ``ΔNLL = ablated_nll − baseline_nll``. Remove hook; restore.
+  4. Filter: ``blacklist = {(l, e) | ΔNLL > ablation_filter_threshold}``
+     (default ``0.001`` ≈ 0.1 % PPL impact). Per-candidate ΔNLL retained
+     in ``stage1_ablation_filter.json`` for audit.
+
+Cost: ``|candidates|`` × held-out-forward time. At
+``ablation_filter_batch_size = 8`` and 100 holdout samples
+(~13 batches per candidate) each candidate takes ~15 s →
+~15–30 min for a 60–100-candidate pool. The earlier-pipeline
+accumulators stay resident through this pass (downstream CKA still
+needs them), so resident memory is the earlier-pass footprint plus the
+held-out cache.
+
+Why this is load-bearing
+------------------------
+v4 produced a 158-expert blacklist of which only 5 had measurable
+ablation ΔNLL (144 dead-weight, 9 false positives that *hurt* PPL when
+protected). Static-threshold detection is fragile across architectures —
+each new architecture shifts the right thresholds and the right values
+are unknown until the model is run. Ablation evidence is ground truth.
+
+v6 promoted ablation from report-only (the legacy ``run_phase_f``) to
+the load-bearing final filter and rewrote Phase C as a candidate-pool
+generator (three-way AND ∪ AIMER ∪ sink-token ∪ magnitude-top-K) gated
+by this pass.
 
 Ablation semantics
 ------------------
-The ``down`` callback in :func:`instrument_experts` receives the down_proj
-output by reference *before* it is multiplied by routing weights and
-``index_add_``-ed into the layer's output. Calling ``tensor.zero_()`` on
-the callback argument therefore zeroes the tensor that the next two lines
-of the wrapped forward consume — see ``activation_hooks.py`` lines 1099-
-1103 (factored) and 1132-1135 (fused). The forward runs under
-``torch.no_grad()`` so in-place mutation is safe.
+The ``down`` callback in :func:`instrument_experts` receives the
+``down_proj`` output by reference *before* it is multiplied by routing
+weights and ``index_add_``-ed into the layer's output. Calling
+``tensor.zero_()`` on the callback argument therefore zeroes the tensor
+that the next two lines of the wrapped forward consume — see
+``activation_hooks.py`` lines 1099-1103 (factored) and 1132-1135 (fused).
+The forward runs under ``torch.no_grad()`` so in-place mutation is safe.
 
-The legacy ``run_phase_f`` v5 entry point is kept here verbatim for
-back-compat with any out-of-tree caller. New code calls
-:class:`AblationFilterPlugin` (or the module-level ``run_ablation_filter``
-directly).
+Git archaeology
+---------------
+- ``1b4e3bd``/``da71126`` (2026-05-10) "feat(stage1): run_ablation_filter
+  — promote ablation from report to filter" — the v5→v6 architectural
+  switch. ``run_ablation_filter`` accepts the Phase-C candidate dict and
+  returns ``(validated_blacklist, per_candidate_dnll, baseline_nll)``;
+  ``_apply_threshold_filter`` extracted as a unit-testable threshold
+  helper; ``_write_ablation_filter_artifact`` introduced for the new
+  ``stage1_ablation_filter.json`` schema. Same commit marks the legacy
+  ``run_phase_f`` as deprecated.
+- ``51c49bf``/``473241b``: "Phase C now candidate generation; Phase D
+  ablation filter" — orchestrator wiring of the v6 architecture.
+- ``0e497fd``/``f236d82``: "Merge stage1 v6: ablation-as-filter
+  architecture" — landed the architectural switch on the integration
+  branch.
+- ``7bc65b3``/``10fdf05`` (2026-05-10, after job 6a00caf0) "fix(stage1):
+  drop ablation_filter.batch_size 32→8 (v4-proven; bs=32 OOM)" — the
+  first H200 run OOM'd on the baseline ``_measure_corpus_nll`` forward
+  because the ``ForCausalLMLoss`` bf16→fp32 logits upcast wanted
+  ``32 × 2048 × 151936 × 4`` ≈ 38 GB at bs=32. Dropped to bs=8 (logits
+  upcast ~9.5 GB); matches the v4-proven Phase F batch size and leaves
+  ~40 GB free with the model + earlier-pipeline accumulators resident.
+
+Naming-history note
+-------------------
+The legacy stage-1 monolith called this "Phase D" (the ablation filter
+slot in the A → B → C → D → E → F phase chain). The current plugin
+architecture has no phase taxonomy. Log strings and Trackio keys retain
+``"Stage 1 Phase D"`` for dashboard back-compat; the deprecated
+``run_phase_f`` (v5 entry point) keeps its name verbatim for any
+out-of-tree caller. New prose drops the labels.
+
+Plugin contract
+---------------
+``writes`` covers five slots: the three downstream-readable outputs
+(``blacklist``, ``candidate_deltas``, ``baseline_nll``) plus two
+internal bookkeeping slots (``ablation_filter_threshold``,
+``ablation_filter_config``) consumed only by :meth:`contribute_artifact`.
+``provides = ()`` — this filter runs its own dedicated ablation forward
+pass (one per candidate) and does NOT consume any shared accumulator
+from the earlier calibration pass.
+
+``contribute_artifact`` returns the six-key
+``stage1_ablation_filter.json`` payload: ``baseline_mean_nll``,
+``ablation_filter_threshold``, ``candidate_count``, ``blacklist_count``,
+``candidates`` (per-key ``{delta_nll, provenance, passed_filter}``),
+``config`` (the resident ``ablation_filter_config`` dict).
+
+When ``stage1_grape.ablation_filter.enabled`` is ``False`` the worker
+falls back to using the candidate set verbatim as the blacklist (empty
+``candidate_deltas`` and ``baseline_nll = 0.0``) — matching the legacy
+short-circuit at the top of :func:`run_ablation_filter`.
 """
 
 from __future__ import annotations
@@ -45,11 +144,15 @@ log = logging.getLogger(__name__)
 
 
 class AblationFilterPlugin:
-    """Causal-ΔNLL ablation filter (Phase D — load-bearing final-blacklist producer).
+    """Causal-ΔNLL per-expert ablation filter — load-bearing final-blacklist producer.
 
-    Reads the Phase C candidate set + a held-out calibration slice; ablates
-    each candidate by zeroing its down_proj output during a forward pass;
-    keeps candidates whose ΔNLL exceeds ``ablation_filter_threshold``.
+    Reads the Phase-C candidate pool + a held-out calibration slice;
+    ablates each candidate by zeroing its ``down_proj`` output during a
+    forward pass; keeps candidates whose ΔNLL exceeds
+    ``ablation_filter_threshold``. See the module docstring for the
+    paper / official-code citations (both negative — the filter is
+    project-original), the full deviation rationale, and the v4→v6
+    ablation-as-filter promotion archaeology.
 
     The plugin produces two outputs:
 
@@ -69,7 +172,15 @@ class AblationFilterPlugin:
 
     name: str = "ablation_filter"
     paper: str = (
-        "Stage 1 ALGORITHM_REFERENCE.md §4 Phase D — D-causal-ablation-validation"
+        "Causal-ΔNLL per-expert ablation filter (project-original; no paper). "
+        "arXiv:2507.23279 validates SE detection via global ablations only "
+        "(source.md L379-L380, Table 3); official code "
+        "ZunhaiSu/Super-Experts-Profilling @ "
+        "573aead3127ae593ba267758b832944f8fed1485 implements no per-expert "
+        "ablation-filter blacklist construction. Deviation: "
+        "D-causal-ablation-validation — see module docstring for the v6 "
+        "ablation-as-filter rationale, the 158→5 v4-evidence motivation, "
+        "and the load-bearing role in final-blacklist construction."
     )
     config_key: str = "stage1_grape.ablation_filter"
     reads: tuple[str, ...] = (
@@ -276,9 +387,10 @@ def run_phase_f(
     ΔNLL + top-K non-blacklisted ΔNLL).
     """
     warnings.warn(
-        "run_phase_f is deprecated; v6 uses run_ablation_filter on the Phase C "
-        "candidate set as the load-bearing final filter. See ALGORITHM_REFERENCE.md "
-        "§4 Phase D and §12 D-causal-ablation-validation.",
+        "run_phase_f is deprecated; v6 uses run_ablation_filter on the candidate "
+        "pool as the load-bearing final filter. See deviation "
+        "D-causal-ablation-validation in the AblationFilterPlugin module "
+        "docstring.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -456,7 +568,7 @@ def _write_ablation_filter_artifact(
     blacklist: dict[int, list[int]],
     config_dict: dict,
 ) -> Path:
-    """Write ``stage1_ablation_filter.json`` per the v6 schema (see ALGORITHM_REFERENCE.md §4)."""
+    """Write ``stage1_ablation_filter.json`` per the v6 schema (see :class:`AblationFilterPlugin.contribute_artifact`)."""
     blacklisted_pairs = {(li, e) for li, exps in blacklist.items() for e in exps}
     candidates_payload: dict[str, dict] = {}
     for (li, e), provenance in candidates.items():

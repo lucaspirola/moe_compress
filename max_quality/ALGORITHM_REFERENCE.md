@@ -203,23 +203,11 @@ Phase C produces a **candidate set** by union of four detectors. The candidate s
 
 **Empirical scale (paper 2507.23279):** SEs account for fewer than 0.5% of all experts across the MoE models studied (Table 1: 0.05% for Qwen3-30B-A3B, 0.06% for DeepSeek-R1, 0.11% for DeepSeek-V2-Lite-Chat, 0.39% for Mixtral-8x7B-Instruct-v0.1). Source 1 alone reproduces the paper's canonical SE set on Qwen3-30B-A3B (Table 2: L1E68, L2E92, L3E82); v6 broadens the candidate pool with sources 2-4 to catch architecture-shifted SEs that the static three-way AND threshold misses on Qwen3.6.
 
-#### Phase D: Ablation Filter (replaces static-threshold blacklist construction; see [D-causal-ablation-validation](#12-known-deviations-from-papers))
-
-Phase D ablates each candidate produced by Phase C and keeps only those with measurable causal impact.
-
-**Procedure:**
-
-1. **Held-out slice**: 100 calibration samples drawn with a deterministic seed offset distinct from Phase A/B, cached at `_calibration_cache_phase_d/`.
-
-2. **Baseline**: forward over the held-out slice with no ablation; record mean per-token NLL `baseline_nll`.
-
-3. **For each candidate `(l, e)`**: install a forward hook that zeros expert `e`'s `down_proj` output during the forward; measure `ablated_nll`; ΔNLL = `ablated_nll − baseline_nll`. Remove hook; restore.
-
-4. **Filter**: blacklist = `{(l, e) | ΔNLL > ablation_filter_threshold}` (default 0.001 ≈ 0.1% PPL impact). Per-candidate ΔNLL retained in artifact for audit.
-
-**Cost**: ~`|candidates|` × forward-pass time. At `ablation_filter_batch_size = 8` and 100 holdout samples (~13 batches per candidate), each candidate takes ~15 sec → ~15–30 min for a 60–100 candidate set. Phase D runs while Phase B's accumulators are still resident (Phase E (CKA) consumes them), so Phase D's resident memory is Phase B's footprint **plus** the held-out cache (~99 GB resident before Phase D on H200 per job 6a00caf0; bs=8 puts the per-batch logits upcast at ~9.5 GB with ample headroom).
-
-**Why this is load-bearing**: the v4 run produced a 158-expert blacklist of which only 5 had measurable ablation impact (144 dead-weight, 9 false positives that *hurt* PPL when protected). Static thresholds are fragile across architectures; ablation is ground truth.
+<!-- §4 Phase D (Ablation Filter) — CONSUMED by stage1/plugins/ablation_filter.py
+     (commit pending). Full procedure (held-out slice / baseline /
+     per-candidate ablation / threshold filter), cost estimate, the v4
+     158→5 motivation, and the bs=32→8 job-6a00caf0 OOM archaeology now
+     live in the plugin module docstring. -->
 
 #### Phase E: CKA Distance Matrices
 
@@ -1036,7 +1024,7 @@ Every partial checkpoint carries a `format_version` field. On resume, the versio
 <!-- D-aimer-cross-check — CONSUMED by stage1/plugins/aimer.py (commit pending). -->
 
 <!-- D-sink-token-routing — CONSUMED by stage1/plugins/sink_token.py (commit pending). -->
-| D-causal-ablation-validation | 1 | Phase D ablation filter (project-original; load-bearing — produces final blacklist) | None — paper validates SE detection via global ablations (Table 3) but not as a per-expert filter | Phase D ablates every Phase C candidate over a held-out 100-sample slice (deterministic seed offset distinct from Phase A/B; cached at `_calibration_cache_phase_d/`). For each `(l, e)` candidate, install a forward hook that zeros `down_proj` output, measure ΔNLL = ablated_nll − baseline_nll, and include `(l, e)` in the final blacklist iff `ΔNLL > ablation_filter_threshold` (=0.001 ≈ 0.1% PPL impact). Per-candidate ΔNLL retained in `stage1_ablation_filter.json` for audit. Default `ablation_filter_batch_size = 8` over 100 samples (~13 batches/candidate) → ~15–30 min for 60–100 candidates on H200. (bs=32 was the v6-prep default; OOM'd on 2026-05-10 job 6a00caf0 because the bf16→fp32 logits upcast wanted 38 GB at bs=32 vs ~9.5 GB at bs=8.) | v4 produced a 158-expert blacklist of which only 5 had measurable ΔNLL; 144 were dead-weight, 9 were active false positives that *hurt* PPL when protected. Static-threshold detection is fragile across architectures (each new architecture shifts the right thresholds and the right values are unknown until the model is run); ablation evidence is ground truth. v6 promoted ablation from report-only to the load-bearing final filter and rewrote Phase C as a candidate-pool generator gated by Phase D evidence. |
+<!-- D-causal-ablation-validation — CONSUMED by stage1/plugins/ablation_filter.py (commit pending). -->
 <!-- D-magnitude-topk-candidates — CONSUMED by stage1/plugins/magnitude_topk.py (commit pending). -->
 | D-reap-min-active-tokens | 2 | Centroid-candidacy filter on min active-token count | REAM/REAP: no minimum-active-tokens filter described | `reap_min_active_tokens=32` (configurable; default 0 in code, set to 32 in production config) excludes experts with fewer than 32 active calibration tokens from REAM-centroid candidacy. Filtered experts become non-centroids and are merged. If `len(ream_centroid_ids) < ream_target` after filtering, a WARNING is logged but no compensating bump fires | Low-frequency experts have noisy gate/expert profiles (averaged over <32 tokens), so promoting them to centroids would propagate that noise into the merged weights. Filtering them to non-centroid status routes them through the Hungarian alignment (which projects them onto a higher-frequency centroid's neuron space) instead. Compression target may shrink slightly when many low-frequency experts are filtered; the WARNING surfaces this without silent silent compression shortfall. |
 | D-cov-storage-fp16 | 2, 3 | Stage 2 covariance + Stage 3 B-cov persisted in fp16 (not fp32) | Spec §5 "Covariance Side-Collection" originally stated fp32 storage citing Swift-SVD certification | Persisted as fp16 (10 mantissa bits) for both `_stage2_input_covariance.pt` and `_bcov_*.pt`; eigendecomposition still runs in fp64 in-memory | fp16 mantissa precision (10 bits) is strictly higher than bf16 (7 bits) and produced cleaner Stage 3 rank-deficiency outcomes than bf16 in spot checks. Halves the persisted-covariance disk footprint vs fp32 (~2× saving on the gigabyte-scale covariance artifact) without measurable downstream PPL/zero-shot drift. Switching back to fp32 is a one-line config flip if a future model exposes precision sensitivity. |

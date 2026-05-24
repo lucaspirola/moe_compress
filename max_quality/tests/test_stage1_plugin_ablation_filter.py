@@ -77,7 +77,14 @@ def _disabled_ctx(candidates: dict | None = None) -> PipelineContext:
 def test_plugin_protocol_attributes():
     p = AblationFilterPlugin()
     assert p.name == "ablation_filter"
-    assert p.paper.startswith("Stage 1 ALGORITHM_REFERENCE")
+    # `paper` must declare project-original (no paper) AND cite the SE
+    # paper + official-code SHA negatively (paper does only global
+    # Table 3 ablations; official repo implements no per-expert filter)
+    # AND name the deviation.
+    assert "project-original" in p.paper
+    assert "arXiv:2507.23279" in p.paper
+    assert "573aead3127ae593ba267758b832944f8fed1485" in p.paper
+    assert "D-causal-ablation-validation" in p.paper
     assert p.config_key == "stage1_grape.ablation_filter"
     assert p.reads == ("candidates", "model", "tokenizer", "config", "artifacts_dir", "device")
     assert p.writes == (
