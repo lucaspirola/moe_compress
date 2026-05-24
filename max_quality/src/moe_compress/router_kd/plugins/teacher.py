@@ -3,8 +3,11 @@
 Paper
 -----
 Hyeon & Do, "Is Retraining-Free Enough? The Necessity of Router
-Calibration for Efficient MoE Compression" — arXiv:2603.02217 (§F.3,
-Eq. 3, Table 1). audit/spec_compliance/01_papers/2603.02217/source.md.
+Calibration for Efficient MoE Compression" — arXiv:2603.02217 (§5
+Eq. 1 — teacher θ_T = original uncompressed MoE; Eq. 3 — token-level
+KL with padding mask m_{t+1}; §F.3 Table 1 — shared Router-KD
+hyperparameters: c4, epochs=1, batch=2, grad-accum=4, lr=5e-5, seq=512,
+τ=1.0, samples=3000). audit/spec_compliance/01_papers/2603.02217/source.md.
 
 Two plugins:
 
@@ -12,22 +15,61 @@ Two plugins:
   from a precomputed SHA-256-keyed sidecar cache file. Registered
   FIRST in the ``provide_teacher_logits`` ``dispatch_first`` slot so
   it wins if a cache is available.
-- ``TeacherLivePlugin`` — loads the teacher model (optionally in 4-bit
-  via bitsandbytes per §F.3 fallback), runs the per-batch forward,
-  and returns vocabulary logits. Wins ``dispatch_first`` when no
-  cache plugin returned a result.
+- ``TeacherLivePlugin`` — loads the teacher model (BF16 by default;
+  optionally bitsandbytes-4-bit or an externally-quantized repo as
+  PROJECT-LEVEL deviations — see "Deviations" below), runs the per-
+  batch forward, and returns vocabulary logits. Wins ``dispatch_first``
+  when no cache plugin returned a result.
 
 Vocab guard: both plugins assert the teacher and student share the
-same vocab dimension (4-bit teacher cannot be smaller than the
-student per §F.3 4-bit cache compatibility).
+same vocab dimension; any tokenizer mismatch (incl. an override repo
+on a different tokenizer) fails fast at load time.
 
 Official code
 -------------
 **None published.** See :mod:`router_kd.plugins.trainable_scope` for
 the negative finding.
 
-Calibration deviation D11 (SHARED) — canonical owner is
-:mod:`stage2.plugins.reap_scoring`.
+Deviations
+----------
+- **Calibration D11 (SHARED)** — canonical owner
+  :mod:`stage2.plugins.reap_scoring`. The Router-KD calibration source
+  diverges from paper §F.3 Table 1's ``c4``; both teacher plugins
+  inherit that calibration corpus and are otherwise faithful to §F.3.
+- **D-teacher-4bit-load** (project-level, NOT paper-sanctioned) —
+  ``stage5_router_kd.teacher_load_in_4bit`` lets the live teacher load
+  via bitsandbytes 4-bit quantization. Paper §F.3 source.md L3577-3594
+  contains ONLY Table 1 hyperparameters; the words "4-bit",
+  "bitsandbytes", "bnb" and "fallback" do not appear anywhere in the
+  paper. The flag exists purely to fit the ~70 GB BF16 teacher into
+  VRAM-constrained hosts; KD signal under 4-bit is an approximation
+  of the paper's ``θ_T``. Default is False (BF16, faithful).
+- **D-teacher-repo-override** (project-level, NOT paper-sanctioned) —
+  ``stage5_router_kd.teacher_model_repo`` lets an operator substitute
+  an externally-quantized (e.g. FP8) checkpoint for the original
+  uncompressed teacher. Paper §5 Eq. 1 (source.md L700-708) defines
+  ``θ_T`` as "the parameters of the original (Teacher) MoE model";
+  any quantized substitute changes the KD target distribution. Use
+  for VRAM relief on hosts that cannot host the full BF16 teacher;
+  the vocab-size + topology guards still fire, but the KL target is
+  no longer the paper's ``θ_T``. Default is None (faithful).
+- **D-teacher-compile** (project-level, NOT paper-sanctioned) —
+  ``stage5_router_kd.torch_compile`` wraps the loaded teacher with
+  ``torch.compile(mode='default')`` for forward-pass throughput.
+  Pure execution-engine optimization; mathematically a no-op on the
+  KD signal but not paper-prescribed. Auto-disabled when a
+  ``teacher_model_repo`` override is in use (FP8 + reduce-overhead is
+  unstable). Default False.
+- **D-teacher-cache** (project-level, NOT paper-sanctioned) — the
+  precomputed-teacher-logits sidecar (``TeacherCachePlugin``) is an
+  engineering optimization: paper §5 assumes a live teacher forward
+  per training batch. Precomputing ``z_T`` once on a deterministic
+  sample order and replaying it on each Router-KD run preserves the
+  KD math exactly (the sidecar IS the live teacher's output) as long
+  as: (i) the cache vocab + token-count topology matches the student
+  (enforced — see ``load_teacher_cache``), and (ii) epochs=1 (the
+  orchestrator hard-rejects multi-epoch + cache; see orchestrator.py
+  L585-594). No paper analogue; pure project-level acceleration.
 
 Home of the Router-KD teacher-logits concern: where the per-batch teacher
 vocabulary logits come from. RK-5 ships TWO plugins — ``TeacherCachePlugin``
@@ -147,7 +189,8 @@ class TeacherCachePlugin:
         "Router KD Eq. 3 — arXiv:2603.02217 (Hyeon & Do); no official code. "
         "Concern: precomputed-teacher-logits cache slot (SHA-256-keyed). "
         "Registered FIRST in dispatch_first(provide_teacher_logits) so it "
-        "wins on cache-hit. See module docstring."
+        "wins on cache-hit. Project-level deviation D-teacher-cache (no "
+        "paper analogue — paper assumes live forward); see module docstring."
     )
     config_key = "stage5_router_kd.teacher_logits_cache"
     # ``config`` / ``student`` / ``artifacts_dir`` drive the one-time cache
@@ -202,15 +245,19 @@ class TeacherCachePlugin:
             if not cache_path.is_absolute():
                 cache_path = artifacts_dir / cache_path
             if cache_path.exists():
-                # Spec §8 mutual-exclusion rule: if both teacher_logits_cache
-                # and teacher_load_in_4bit are configured, cache wins. Surface
-                # the override so an operator who set 4-bit isn't surprised
-                # when the cache path supersedes it.
+                # Project-level mutual-exclusion: deviations D-teacher-cache
+                # and D-teacher-4bit-load both target VRAM relief; the cache
+                # ALSO eliminates the teacher forward entirely, so when both
+                # are configured the cache wins (the 4-bit live teacher is
+                # never loaded). Surface the override so an operator who set
+                # 4-bit isn't surprised when the cache path supersedes it.
                 if s5.get("teacher_load_in_4bit"):
                     log.warning(
                         "Stage 5: teacher_load_in_4bit=true is configured but "
-                        "teacher_logits_cache=%s exists; per spec §8 'cache wins on "
-                        "conflict' the cache supersedes the 4-bit load — 4-bit will not run.",
+                        "teacher_logits_cache=%s exists; cache supersedes 4-bit "
+                        "(both are project-level VRAM-budget deviations — see "
+                        "module docstring D-teacher-cache, D-teacher-4bit-load); "
+                        "4-bit will not run.",
                         cache_path,
                     )
                 log.info("Stage 5: loading precomputed teacher logits from %s", cache_path)
@@ -229,11 +276,24 @@ class TeacherCachePlugin:
                     )
                 cached_bs = int(cache_payload.get("batch_size", -1))
                 if cached_bs != int(s5["batch_size"]):
+                    # WHY this is a warning (not a hard error): the per-batch
+                    # slice arithmetic in provide_teacher_logits below uses the
+                    # CONFIG batch_size (not the cached one), so the slice
+                    # `[token_start : token_start + B*L]` always reads exactly
+                    # `cfg_batch_size * cfg_seq_len` flat tokens. The cache's
+                    # `logits` tensor is stored flat ([N*L, |V|]) — the cached
+                    # `batch_size` is purely metadata describing how the
+                    # precompute script grouped its writes; KL is computed
+                    # per-token, so any re-grouping that preserves token order
+                    # is correctness-preserving. Mismatch here means only
+                    # "regenerated under different batch grouping", not "wrong
+                    # data".
                     log.warning(
                         "Stage 5: teacher_logits_cache batch_size=%d disagrees with "
-                        "stage5_router_kd.batch_size=%d. The cache is logically valid "
-                        "as long as token order matches; batch grouping is irrelevant "
-                        "to KL correctness — proceeding.",
+                        "stage5_router_kd.batch_size=%d. Tolerated: per-batch slicing "
+                        "uses the CONFIG batch_size and reads the flat `logits` tensor "
+                        "in token order; cached batch_size is metadata only, KL is "
+                        "per-token so re-grouping is correctness-preserving. Proceeding.",
                         cached_bs, int(s5["batch_size"]),
                     )
                 if int(cache_payload.get("sequence_length", -1)) != int(s5["max_sequence_length"]):
@@ -241,22 +301,13 @@ class TeacherCachePlugin:
                         "Teacher-logits cache sequence_length disagrees with config — "
                         "re-run precompute or align configs."
                     )
-                # F3 fix: also verify num_samples matches. A cache built with
-                # fewer samples than Stage 5 expects would silently return
-                # zero-length slices for late batches → degenerate KD signal.
+                # Verify num_samples matches. A cache built with fewer samples
+                # than Stage 5 expects would silently return zero-length slices
+                # for late batches → degenerate KD signal. The orchestrator
+                # (orchestrator.py L585-594) hard-rejects epochs>1 + cache, so
+                # epochs is guaranteed = 1 here and cache_n must equal cfg_n.
                 cache_n = int(cache_payload.get("num_samples", -1))
                 cfg_n = int(s5["max_calibration_samples"])
-                epochs_cfg = int(s5.get("epochs", 1))
-                # Accept caches sized for either single-epoch (cfg_n) or
-                # multi-epoch (epochs_cfg * cfg_n) coverage. The training loop
-                # indexes into the cache via (epoch * len(batches) + i) *
-                # cache_tokens_per_batch, so a cache sized at epochs_cfg * cfg_n
-                # is the canonical multi-epoch layout.
-                # The multi-epoch + cache combination is hard-rejected later (the
-                # student input replays identically across epochs while cache
-                # advances — silent KD corruption). So at this point only
-                # epochs_cfg=1 with cache_n=cfg_n is valid; reject anything else
-                # with a clear message that points at the right config knob.
                 if cache_n != cfg_n:
                     raise RuntimeError(
                         f"Teacher-logits cache num_samples={cache_n} disagrees with "
@@ -289,26 +340,10 @@ class TeacherCachePlugin:
                         f"num_samples × sequence_length ({cache_n} × {cache_seq_len_meta} = "
                         f"{expected_tokens}) — wrong cache for this student."
                     )
-                # F1 fix: verify the cache covers all epochs, not just one pass.
-                # With multi-epoch training the token index advances as
-                # (epoch * num_batches + i) * cache_tokens_per_batch; a cache that
-                # only covers one epoch would be silently re-read from position 0
-                # for epochs 2..N, replaying epoch-1 teacher logits against later
-                # student batches — a corrupted KD signal.
-                if epochs_cfg > 1 and cache_n < epochs_cfg * cfg_n:
-                    # Hard-fail: training-loop index `(epoch * num_batches + i) *
-                    # cache_tokens_per_batch` would read past the end of a
-                    # single-epoch cache for epochs >= 1. Reading past end yields
-                    # zero-length slices → degenerate (silently zero) KD signal,
-                    # which silently corrupts router updates. Refuse to proceed.
-                    raise RuntimeError(
-                        f"Stage 5: teacher_logits_cache num_samples={cache_n} covers only "
-                        f"{cache_n // max(cfg_n, 1)} epoch(s) of data but "
-                        f"stage5_router_kd.epochs={epochs_cfg}. The training loop would "
-                        "read past cache end for later epochs, silently corrupting the "
-                        "KD signal. Regenerate a multi-epoch cache (num_samples="
-                        f"{epochs_cfg * cfg_n}) or set epochs=1."
-                    )
+                # Note: multi-epoch + cache is hard-rejected by the orchestrator
+                # (orchestrator.py L585-594) — a per-epoch coverage check here
+                # would be unreachable. The single equality `cache_n == cfg_n`
+                # above is the only valid combination.
                 log.info("Stage 5: cache covers %d samples, %d sequence_length",
                          cache_payload.get("num_samples"), cache_payload.get("sequence_length"))
             else:
@@ -365,10 +400,12 @@ class TeacherCachePlugin:
                 "the trailing partial batch misaligns the cache slice "
                 "across subsequent batches/epochs."
             )
-        # F1 fix: incorporate the epoch offset so that epoch N reads the
-        # correct slice of the cache instead of wrapping back to position 0
-        # (which would replay epoch-0 teacher logits against epoch-N student
-        # batches — wrong KD signal).
+        # Incorporate the epoch offset for slot-signature uniformity with the
+        # live plugin; under the current orchestrator (epochs>1 + cache is
+        # hard-rejected, see orchestrator.py L585-594) `epoch` is always 0
+        # when this hook fires, so this collapses to `batch_index *
+        # cache_tokens_per_batch`. Kept as-is for future-proofing if the
+        # orchestrator gains a deterministic multi-epoch shuffle.
         token_start = (epoch * num_batches + batch_index) * cache_tokens_per_batch
         token_end = token_start + (input_ids.shape[0] * input_ids.shape[1])
         teacher_vocab_logits = teacher_logits_cache["logits"][token_start:token_end]
@@ -401,10 +438,11 @@ class TeacherLivePlugin:
 
     name = "teacher_live"
     paper = (
-        "Router KD Eq. 3 — arXiv:2603.02217 (Hyeon & Do); no official code. "
-        "Concern: live teacher forward (optionally 4-bit bnb per §F.3 "
-        "fallback) + vocab-dim guard. Wins dispatch_first when no cache. "
-        "See module docstring."
+        "Router KD Eq. 1+3 — arXiv:2603.02217 (Hyeon & Do); no official code. "
+        "Concern: live teacher forward (faithful BF16 path) + vocab/topology "
+        "guard. Wins dispatch_first when no cache. Project-level deviations "
+        "D-teacher-4bit-load, D-teacher-repo-override, D-teacher-compile are "
+        "OPT-IN and NOT paper-sanctioned; see module docstring."
     )
     config_key = "stage5_router_kd.teacher_model_repo"
     # The live teacher load reads model/config knobs + the student (for
@@ -436,12 +474,13 @@ class TeacherLivePlugin:
         """Lazily materialize + validate the live teacher model (cached).
 
         Pattern-B REPRODUCTION of the monolith ``run()`` ``_get_teacher``
-        closure: resolves 4-bit / ``teacher_model_repo`` override, derives the
-        device map, calls ``load_model``, applies ``_set_experts_implementation``,
-        switches to inference mode, runs the vocab-size + MoE-topology
-        ``RuntimeError`` guards, and optionally ``torch.compile``s the teacher.
-        Caches the result into ``self._teacher`` — the second call returns it
-        directly.
+        closure: resolves the project-level overrides (D-teacher-4bit-load,
+        D-teacher-repo-override, D-teacher-compile — all NOT paper-sanctioned,
+        see module docstring), derives the device map, calls ``load_model``,
+        applies ``_set_experts_implementation``, switches to inference mode,
+        runs the vocab-size + MoE-topology ``RuntimeError`` guards, and
+        optionally ``torch.compile``s the teacher. Caches the result into
+        ``self._teacher`` — the second call returns it directly.
         """
         if self._teacher is not None:
             return self._teacher
@@ -452,21 +491,25 @@ class TeacherLivePlugin:
         s5 = config["stage5_router_kd"]
         student = ctx.get("student")
         device = ctx.get("device") if ctx.has("device") else None
-        # torch.compile acceleration (spec §8) — config-gated, default off.
+        # torch.compile acceleration (deviation D-teacher-compile — project-
+        # level, NOT paper-sanctioned). Config-gated, default off.
         use_compile = bool(s5.get("torch_compile", False))
         # Student MoE-layer count — the topology guard's reference.
         student_refs_count = sum(
             1 for _ in iter_moe_layers(getattr(student, "_orig_mod", student))
         )
 
-        load_in_4bit = bool(s5.get("teacher_load_in_4bit", False))
         teacher_repo_override = s5.get("teacher_model_repo") or None
+        # Resolve `load_in_4bit` AFTER the override-vs-4bit conflict check so
+        # the final value already reflects the override forcing it False
+        # (L1 cosmetic cleanup — single source of truth).
+        load_in_4bit_cfg = bool(s5.get("teacher_load_in_4bit", False))
         teacher_name_or_path = (
             teacher_repo_override
             if teacher_repo_override
             else config["model"]["name_or_path"]
         )
-        if teacher_repo_override and load_in_4bit:
+        if teacher_repo_override and load_in_4bit_cfg:
             # An override repo is already quantized (e.g. FP8); stacking
             # bitsandbytes 4-bit on top is incoherent. Honor the override.
             log.warning(
@@ -475,6 +518,8 @@ class TeacherLivePlugin:
                 teacher_repo_override,
             )
             load_in_4bit = False
+        else:
+            load_in_4bit = load_in_4bit_cfg
         if config["model"].get("load_in_4bit", False) and not load_in_4bit and not teacher_repo_override:
             log.warning(
                 "Stage 5: config['model']['load_in_4bit']=true but "
@@ -564,12 +609,17 @@ class TeacherLivePlugin:
         # FIRST, THEN run the MoE-topology guard. The monolith assigns
         # `_teacher_state["model"] = _t` *before* the layer-count RuntimeError,
         # so on a topology mismatch `_teacher_state["model"]` is already set —
-        # this plugin matches that exactly (`self._teacher` set before the
-        # guard fires). Do NOT reorder to "guard first": RK-5 is a faithful
-        # byte-identical reproduction of the monolith, not an improvement.
+        # this plugin matches that ordering. The monolith's `_teacher_state`
+        # is scoped to a single `run()` call and discarded, so a topology
+        # mismatch never re-surfaces an unusable model. In the plugin,
+        # `self._teacher` outlives a single call, so on a topology raise we
+        # must clear it (L3 fix) — otherwise a caller that catches the raise
+        # and retries would skip the load on L446-447 and use the unvalidated
+        # model.
         self._teacher = _t
         _teacher_refs_count = sum(1 for _ in iter_moe_layers(getattr(_t, "_orig_mod", _t)))
         if _teacher_refs_count != student_refs_count:
+            self._teacher = None
             raise RuntimeError(
                 f"Teacher/student MoE layer count mismatch: "
                 f"{_teacher_refs_count} (teacher) vs {student_refs_count} "
@@ -602,7 +652,22 @@ class TeacherLivePlugin:
 
         ``epoch`` / ``batch_index`` / ``num_batches`` are accepted for
         slot-signature uniformity with :meth:`TeacherCachePlugin.provide_teacher_logits`
-        even though the live path — a stateless forward — ignores them.
+        — the live path is a stateless forward and ignores them (cache path
+        needs them to index the precomputed sidecar). ``reads = ("config",
+        "student", "device")`` — kept narrower than the cache plugin's
+        ``reads`` because the live path consumes batch tensors via the slot
+        kwargs rather than the ctx.
+
+        Padding invariant (mirrors :mod:`router_kd.plugins.vocab_kd`): the
+        Router-KD calibration loader produces fully-packed batches (uniform
+        length, no padding), so `attention_mask` is omitted — the teacher's
+        causal mask suffices and the vocab-KD kernel asserts shape parity
+        between teacher and student. Paper §5 Eq. 3 (L764) masks padding via
+        ``m_{t+1}``; under the packed invariant ``m_{t+1}=1`` everywhere and
+        the mask collapses to a no-op. If a future calibration source ever
+        introduces padding, the call below must pass ``attention_mask`` and
+        the vocab-KD loss must reinstate ``m_{t+1}`` + ``ε`` (cross-ref the
+        vocab_kd module deviations block).
         """
         with torch.no_grad():
             teacher = self._load_teacher(ctx)
