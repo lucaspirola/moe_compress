@@ -1,5 +1,21 @@
 """Validation final-report (S6-7 of the Stage 6 plugin-architecture refactor).
 
+Paper / spec source
+--------------------
+No upstream paper; this plugin owns the Stage 6 FINAL-REPORT assembly:
+
+- Per-metric ``(student, teacher, delta)`` triples computed by
+  ``_deltas``.
+- Measured-reduction ratio via ``_measured_reduction``.
+- Threshold-check pass/fail / skipped-checks dict via
+  ``_check_thresholds``.
+- ``stage6_eval.json`` artifact write + flatten-to-Trackio emit.
+
+NaN handling: see project ``VALIDATED_STRATEGIES`` §Stage 6 risk
+hotspots — ``_deltas`` skips NaN students/teachers as "not measured"
+rather than crashing the report (gates on a NaN delta would otherwise
+fail-pass arbitrarily depending on test order).
+
 Home of the Stage 6 FINAL-REPORT concern, extracted from the legacy
 ``stage6_validate.py`` monolith. The validation-report plugin owns the
 post-eval assembly of the ``stage6_eval.json`` artifact: the per-metric
@@ -448,12 +464,7 @@ class ValidationReportPlugin:
     """
 
     name = "validation_report"
-    paper = (
-        "Stage 6 final-report assembly -- per-metric student/teacher/delta "
-        "triples (_deltas), measured-reduction ratio (_measured_reduction), "
-        "threshold gating (_check_thresholds), overall_pass aggregation, "
-        "stage6_eval.json artifact write + Trackio scalar flatten."
-    )
+    paper = "Stage 6 validation final report (no upstream paper; VALIDATED_STRATEGIES §Stage 6). See module docstring."
     config_key = "stage6_validate"
     reads: tuple[str, ...] = (
         "config",
