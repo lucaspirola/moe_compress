@@ -1,4 +1,4 @@
-"""Imatrix export (S6-6 of the Stage 6 plugin-architecture refactor).
+"""Imatrix export — live owner of the Stage 6 post-eval imatrix / GGUF phase.
 
 Paper / spec source
 --------------------
@@ -13,60 +13,44 @@ WikiText-2-train calibration corpus
 (:mod:`stage6.plugins.eval_environment` builds the corpus), and write
 the ``eval_text_concat.txt`` debug side-channel.
 
-Gated by ``imatrix.enabled`` (default off; opt-in for users targeting
-quantized GGUF deployment).
+Gated by ``imatrix.enabled`` (default ON when the ``imatrix`` subdict is
+present or omitted; opt-out by setting ``imatrix.enabled: false`` in the
+Stage 6 config). The default-True behaviour matches the production YAML
+contract (``configs/qwen36_35b_a3b_30pct.yaml`` sets it explicitly).
 
 Reference code
 --------------
 ``ggerganov/llama.cpp`` — ``llama-imatrix`` CLI; standard library, no
 project-pinned SHA. Invoked as a subprocess.
 
-Home of the Stage 6 imatrix / GGUF concern, extracted from the legacy
-``stage6_validate.py`` monolith. The imatrix-export plugin owns the
-post-eval pipeline that converts the student checkpoint to F16 GGUF,
-runs ``llama-imatrix`` against the WikiText-2-train calibration corpus,
-and writes the ``eval_text_concat.txt`` debug side-channel.
+This plugin is the LIVE owner of the Stage 6 post-eval imatrix / GGUF
+pipeline. The orchestrator walks ``start_gguf_convert`` (cache-MISS
+only, before the teacher-side eval loop) and later ``export_imatrix``
+(after evals complete) — see ``stage6/orchestrator.py``. Together they
+convert the student checkpoint to F16 GGUF, run ``llama-imatrix``
+against the WikiText-2-train calibration corpus, and write the
+``eval_text_concat.txt`` debug side-channel.
 
-Pattern A vs Pattern B
-----------------------
-S6-6 covers a MIXED pattern (mirror of S6-5):
+Hook layout
+-----------
+* ``start_gguf_convert(ctx)`` — kicks off the background F16-GGUF
+  conversion thread (Optimization #8) so the CPU-bound conversion
+  overlaps with the GPU-bound teacher eval. Publishes ``gguf_thread``
+  and ``gguf_result`` to ``ctx``.
+* ``export_imatrix(ctx)`` — joins the bg thread, dispatches one of
+  three imatrix branches (skip / prebuilt-GGUF / sequential fallback),
+  and unconditionally writes ``eval_text_concat.txt``.
 
-* **Pattern A -- relocated verbatim**: ``_EVAL_TEXT_CONCAT_FILENAME``,
-  ``_background_gguf_convert``, ``_write_eval_text_concat``,
-  ``_run_llama_imatrix_with_prebuilt_gguf``, ``_generate_imatrix`` and
-  ``_find_llama_cpp_dir`` below are character-identical copies of the
-  monolith bodies. ``stage6_validate.py`` re-imports the 5 FUNCTIONS
-  (a ``# noqa: F401`` block) so ``run()`` and external callers/tests
-  keep their original import path. The ``_EVAL_TEXT_CONCAT_FILENAME``
-  constant is NOT re-imported by the monolith: only the relocated
-  ``_write_eval_text_concat`` references it, and the plugin module's
-  module-local copy is the single source of truth.
-* **Pattern B -- reproduced in TWO inert hooks**: the imatrix pipeline
-  in the monolith ``run()`` is split across two phases -- an EARLY
-  kickoff (``threading.Thread(target=_background_gguf_convert,
-  ...).start()`` immediately before the teacher-side eval loop) and a
-  LATE join + llama-imatrix dispatch + eval-text-concat write
-  (``gguf_thread.join(...)`` then one of the three imatrix branches
-  followed by ``_write_eval_text_concat``). Both blocks are INLINE
-  ``run()`` code in the monolith -- there is nothing standalone to
-  relocate. The ``start_gguf_convert`` and ``export_imatrix`` hooks
-  below REPRODUCE those inline blocks faithfully; the monolith
-  ``run()`` is NOT modified for them. This is an intentional,
-  temporary logic duplication that resolves at S6-8 when the monolith
-  ``run()`` is deleted and these hooks are wired live.
+The module-level helpers (``_background_gguf_convert``,
+``_write_eval_text_concat``, ``_run_llama_imatrix_with_prebuilt_gguf``,
+``_generate_imatrix``, ``_find_llama_cpp_dir``) are subprocess-driving
+implementation details consumed by the hooks above; they are kept
+module-private (PEP 8 leading-underscore) and are not part of the
+public surface.
 
 Circular-import contract (mirror of ``stage6/plugins/teacher_provider.py``):
 this module imports only from ``..context`` / ``...utils`` / sibling
-plugin modules (``eval_environment``) / stdlib -- NEVER from
-``stage6_validate``, ``stage6.orchestrator`` or ``orchestrator`` at any
-scope (module-top OR function-local). The monolith re-imports *this*
-module at load time, so a ``from ..stage6_validate import ...`` here
-would deadlock the import; nothing in this module does that.
-
-``ImatrixExportPlugin`` is registered-but-INERT at S6-6 -- no orchestrator
-walk or test invokes its ``start_gguf_convert`` or ``export_imatrix``
-hooks. S6-8 plugs the hooks into the live Stage 6 plugin sequencer and
-deletes the monolith ``run()``.
+plugin modules (``eval_environment``) / stdlib.
 """
 from __future__ import annotations
 
@@ -87,13 +71,13 @@ from .eval_environment import _IMATRIX_CALIB_FILENAME, _atomic_write_text
 log = logging.getLogger(__name__)
 
 
-# F-C-C-1: Spec §9 -- the eval-text concat (eval prompts seen by the model
-# during PPL/zero-shot/generative) is captured to eval_text_concat.txt as a
-# debugging side-channel ONLY. The imatrix calibration-corpus filename
-# (_IMATRIX_CALIB_FILENAME) lives in stage6/plugins/eval_environment and is
-# imported above. Module-LOCAL constant -- the monolith does NOT re-import it
-# (only _write_eval_text_concat references it, and that function is also
-# relocated here, so the single source of truth lives in this module).
+# F-C-C-1 (see ``max_quality/docs/spec_constraints.md`` for the full glossary
+# of F-C-C / F-CR2-M constraint IDs): Spec §9 -- the eval-text concat (eval
+# prompts seen by the model during PPL/zero-shot/generative) is captured to
+# eval_text_concat.txt as a debugging side-channel ONLY. The imatrix
+# calibration-corpus filename (_IMATRIX_CALIB_FILENAME) lives in
+# stage6/plugins/eval_environment and is imported above. Single source of
+# truth for the eval-text-concat filename.
 _EVAL_TEXT_CONCAT_FILENAME: str = "eval_text_concat.txt"
 
 
@@ -121,9 +105,17 @@ def _background_gguf_convert(icfg: dict, artifacts_dir: Path, result: dict) -> N
         log.warning("GGUF convert (background): stage5_final not found — skipping.")
         return
 
-    free_gb = shutil.disk_usage(artifacts_dir).free / 1e9
-    if free_gb < 40:
-        log.warning("GGUF convert (background): only %.1f GB free — skipping.", free_gb)
+    # L2/L3: free-space check is parametrized (default 40 GB ≈ Llama-3-8B F16
+    # headroom; raise for larger MoE F16 GGUFs via icfg.min_free_gb) and
+    # tolerant of artifacts_dir not yet existing (fall back to parent).
+    disk_root = artifacts_dir if artifacts_dir.exists() else artifacts_dir.parent
+    free_gb = shutil.disk_usage(str(disk_root)).free / 1e9
+    min_free_gb = float(icfg.get("min_free_gb", 40))
+    if free_gb < min_free_gb:
+        log.warning(
+            "GGUF convert (background): only %.1f GB free (< min_free_gb=%.1f) — skipping.",
+            free_gb, min_free_gb,
+        )
         return
 
     f16_path = artifacts_dir / "model_f16.gguf"
@@ -214,7 +206,17 @@ def _run_llama_imatrix_with_prebuilt_gguf(
 
     f16_path = gguf_result.get("f16_path")
     if f16_path is None or not f16_path.exists():
-        log.warning("imatrix: pre-built GGUF not available — falling back to full pipeline")
+        # M1: safe fall-through. By contract, export_imatrix only invokes this
+        # prebuilt path AFTER the bg thread has been joined; if it timed out
+        # with the thread still alive, export_imatrix takes the skip-imatrix
+        # branch instead (see imatrix_skipped sentinel). So reaching here
+        # means the bg thread is DEAD but produced no f16_path (failed /
+        # disabled / no llama.cpp). Sequential _generate_imatrix is the only
+        # writer of model_f16.gguf in that case — no concurrent-writer race.
+        log.warning(
+            "imatrix: pre-built GGUF not available (bg thread joined without "
+            "producing f16_path) — falling back to sequential _generate_imatrix"
+        )
         _generate_imatrix(eval_text_concat, icfg, artifacts_dir)
         return
 
@@ -307,9 +309,16 @@ def _generate_imatrix(eval_text_concat: list[str], icfg: dict, artifacts_dir: Pa
         log.warning("imatrix: stage5_final not found at %s; skipping.", model_dir)
         return
 
-    free_gb = shutil.disk_usage(artifacts_dir).free / 1e9
-    if free_gb < 40:
-        log.warning("imatrix: only %.1f GB free; skipping GGUF conversion.", free_gb)
+    # L2/L3: parametrized free-space threshold + tolerant of artifacts_dir
+    # not yet existing (fall back to parent for the disk_usage probe).
+    disk_root = artifacts_dir if artifacts_dir.exists() else artifacts_dir.parent
+    free_gb = shutil.disk_usage(str(disk_root)).free / 1e9
+    min_free_gb = float(icfg.get("min_free_gb", 40))
+    if free_gb < min_free_gb:
+        log.warning(
+            "imatrix: only %.1f GB free (< min_free_gb=%.1f); skipping GGUF conversion.",
+            free_gb, min_free_gb,
+        )
         return
 
     f16_path = artifacts_dir / "model_f16.gguf"
@@ -394,22 +403,19 @@ def _find_llama_cpp_dir(override: str | None = None) -> Path | None:
 
 
 class ImatrixExportPlugin:
-    """Stage 6 imatrix-export plugin (S6-6 -- registered-but-INERT).
+    """Stage 6 imatrix-export plugin -- live owner of the post-eval pipeline.
 
-    Owns the Stage 6 post-eval imatrix / GGUF pipeline: the background
-    F16-GGUF conversion that overlaps with teacher eval (Optimization #8),
-    the late-phase llama-imatrix dispatch (with prebuilt-GGUF + sequential
-    fallback branches), and the eval-text-concat debug write. The
-    standalone helpers (Pattern A) are relocated verbatim above and
-    re-imported by the monolith; the ordering glue around them (the early
-    thread-start + the late join + dispatch + concat write) is reproduced
-    in the ``start_gguf_convert`` and ``export_imatrix`` hooks below
-    (Pattern B).
+    Owns the Stage 6 post-eval imatrix / GGUF pipeline:
 
-    S6-6 wires this class into the plugin registry as metadata only -- no
-    orchestrator walk or test invokes ``start_gguf_convert`` /
-    ``export_imatrix``. S6-8 plugs the hooks into the live Stage 6 plugin
-    sequencer and deletes the monolith ``run()``.
+    * Background F16-GGUF conversion that overlaps with teacher eval
+      (Optimization #8), kicked off by ``start_gguf_convert``.
+    * Late-phase llama-imatrix dispatch (with prebuilt-GGUF +
+      sequential fallback branches), dispatched by ``export_imatrix``.
+    * Unconditional eval-text-concat debug write (spec §9).
+
+    The orchestrator walks ``start_gguf_convert`` on the cache-MISS path
+    before the teacher-side eval loop, and walks ``export_imatrix``
+    after evals complete — see ``stage6/orchestrator.py``.
     """
 
     name = "imatrix_export"
@@ -434,15 +440,14 @@ class ImatrixExportPlugin:
     provides: tuple[str, ...] = ()
 
     def is_enabled(self, config: dict) -> bool:
-        """Gate on ``stage6_validate.imatrix.enabled`` (default True).
+        """Gate on ``stage6_validate.imatrix.enabled`` (default ON).
 
-        Defaults to ``True`` to faithfully reproduce the monolith ``run()``'s
-        per-call-site default at line ``if s6.get("imatrix", {}).get("enabled",
-        True):`` -- a Stage 6 config that omits the ``imatrix`` subdict
-        triggers the GGUF + llama-imatrix pipeline exactly as the monolith
-        does. At S6-8 the registry-level gate must match the monolith's
-        behavior for byte-identical-by-construction wiring; "safer defaults"
-        belong at the YAML/config layer, not the plugin metadata.
+        A Stage 6 config that omits the ``imatrix`` subdict (or omits the
+        ``enabled`` key inside it) triggers the GGUF + llama-imatrix
+        pipeline; opt out by setting ``imatrix.enabled: false``. The
+        production YAML (``configs/qwen36_35b_a3b_30pct.yaml``) sets the
+        key explicitly to ``true``, so the in-code default only affects
+        users who omit the subdict entirely (smoke tests, ad-hoc configs).
         """
         return bool(
             (config.get("stage6_validate", {}) or {})
@@ -454,17 +459,15 @@ class ImatrixExportPlugin:
         return {}
 
     def start_gguf_convert(self, ctx: PipelineContext) -> None:
-        """Phase hook -- early-phase GGUF thread kickoff (S6-8 wiring surface).
+        """Phase hook -- early-phase background F16-GGUF conversion kickoff.
 
-        INERT at S6-6: no orchestrator walk or test invokes this hook. S6-8
-        replaces the Stage 6 orchestrator body with the plugin sequencer and
-        dispatches this hook in place of the monolith's inline ``run()``
-        thread-start. The body below reproduces that inline block faithfully
-        -- it is dead code at S6-6 but S6-8 relies on it once the monolith
-        ``run()`` is deleted.
+        Dispatched by ``stage6/orchestrator.py`` on the cache-MISS path,
+        immediately before the teacher-side eval loop. The CPU-bound
+        GGUF conversion runs concurrently with the GPU-bound teacher eval
+        (Optimization #8); the resulting ``f16_path`` is consumed by the
+        late ``export_imatrix`` hook.
 
-        Reproduces the monolith ``run()``'s thread-start (immediately before
-        the teacher-side eval loop)::
+        Behaviour::
 
             if s6.get("imatrix", {}).get("enabled", True):
                 gguf_thread = threading.Thread(
@@ -475,14 +478,9 @@ class ImatrixExportPlugin:
                 )
                 gguf_thread.start()
 
-        Note the monolith only starts the thread on the **non-cache-hit**
-        path (inside the ``else:`` of ``if cached_teacher_results is not
-        None``). The orchestrator's phase dispatch sequence at S6-8 wires
-        this hook AFTER the teacher-provider's cache-hit shortcut has
-        returned, so the same gating happens by construction; this hook
-        body therefore reproduces ONLY the inner
-        ``if s6.get("imatrix", ...): ... start()`` block and does NOT
-        re-check ``cached_teacher_results`` itself.
+        The orchestrator already gates this hook by the teacher-cache
+        result (only invoked on cache MISS), so the body does NOT
+        re-check ``cached_teacher_results``.
 
         The thread handle + the result dict are published to ctx so
         ``export_imatrix`` can join the thread and read ``f16_path``.
@@ -491,13 +489,11 @@ class ImatrixExportPlugin:
         artifacts_dir = ctx.get("artifacts_dir")
         s6 = config["stage6_validate"]
 
-        # Reproduce the monolith's default-True semantics here (matches the
-        # `if s6.get("imatrix", {}).get("enabled", True):` form in run()).
-        # NOTE: intentionally a different default than `is_enabled`
-        # (False) -- `is_enabled` decides whether the plugin runs AT ALL on
-        # a given config; the inner guard here matches the monolith's
-        # per-call-site default for the icfg passed to the background
-        # thread.
+        # Inner gate (default ON): when imatrix is disabled in config we
+        # publish empty handles so ``export_imatrix`` can short-circuit
+        # consistently. ``is_enabled`` is the registry-level gate (whole
+        # plugin); this inner check covers configs where the orchestrator
+        # invokes the hook anyway (e.g. is_enabled is bypassed in tests).
         if not s6.get("imatrix", {}).get("enabled", True):
             ctx.set("gguf_thread", None)
             ctx.set("gguf_result", {})
@@ -516,20 +512,19 @@ class ImatrixExportPlugin:
         ctx.set("gguf_result", gguf_result)
 
     def export_imatrix(self, ctx: PipelineContext) -> None:
-        """Phase hook -- late-phase imatrix dispatch (S6-8 wiring surface).
+        """Phase hook -- late-phase imatrix dispatch.
 
-        INERT at S6-6: no orchestrator walk or test invokes this hook. S6-8
-        replaces the Stage 6 orchestrator body with the plugin sequencer and
-        dispatches this hook in place of the monolith's inline ``run()``
-        post-eval imatrix block. The body below reproduces that inline
-        block faithfully -- it is dead code at S6-6 but S6-8 relies on it
-        once the monolith ``run()`` is deleted.
-
-        Reproduces the monolith ``run()``'s post-eval block:
+        Dispatched by ``stage6/orchestrator.py`` after the eval loop has
+        completed (GPU is now free from the teacher). The hook:
 
         1. **Wait for the background GGUF thread** -- ``gguf_thread.join(
-           timeout=3700)``; if the thread is still alive, set the
-           F-CR2-M-1 ``imatrix_skipped`` sentinel and surface to trackio.
+           timeout=3700)``. If the thread is still alive at timeout AND
+           the bg thread has not already published a valid ``f16_path``,
+           set the F-CR2-M-1 ``imatrix_skipped`` sentinel and surface to
+           trackio. If ``f16_path`` is published AND exists on disk we
+           treat the thread as effectively done (the bg-thread contract
+           is: ``f16_path`` is set only after ``os.replace`` of the tmp
+           file completes — no race possible).
         2. **Imatrix-skipped path** -- write the eval-text-concat debug
            artifact (unconditional per spec §9) and return.
         3. **Prebuilt-GGUF path** -- when the teacher cache MISSED AND
@@ -539,7 +534,11 @@ class ImatrixExportPlugin:
            bg thread failed) invoke ``_generate_imatrix``; its internal
            ``enabled`` guard short-circuits when imatrix is disabled.
 
-        Optional ctx slots (with the monolith's same defaults):
+        L1: if ``_find_llama_cpp_dir`` returns ``None`` along the fall-
+        through path we set ``imatrix_skipped`` for observability parity
+        with the bg-thread-timeout sentinel.
+
+        Optional ctx slots:
           * ``eval_text_concat`` (list[str] -- empty list if missing)
           * ``cached_teacher_results`` (dict | None -- None if missing,
             i.e. treat as cache MISS for the gating)
@@ -564,27 +563,42 @@ class ImatrixExportPlugin:
         log.info("Stage 6: starting post-eval imatrix pipeline")
         # Optimization #8: If GGUF conversion was running in background, wait for it.
         # Then run llama-imatrix (which needs the GPU, now freed from teacher).
-        gguf_thread_timed_out = False
         imatrix_skipped = False
         if gguf_thread is not None:
             log.info("Stage 6: waiting for background GGUF conversion to complete")
             gguf_thread.join(timeout=3700)
             if gguf_thread.is_alive():
-                # F-CR2-M-1: SKIP imatrix entirely when the bg thread is still alive after
-                # the timeout. The daemon bg thread continues writing to model_f16.gguf.tmp
-                # and would race with _generate_imatrix's sequential fallback, both of which
-                # call os.replace on the same target path. By skipping, no concurrent writer
-                # exists; the bg thread's eventual replace just updates the GGUF for the next
-                # run. The prebuilt-only GGUF (without imatrix) remains acceptable for
-                # downstream serving.
-                log.error(
-                    "GGUF convert thread still alive after %.0f s timeout; SKIPPING imatrix "
-                    "entirely to avoid concurrent-writer race on model_f16.gguf",
-                    3700,
-                )
-                gguf_thread_timed_out = True
-                imatrix_skipped = True
-        f16_path = None if gguf_thread_timed_out else gguf_result.get("f16_path")
+                # M2: bg thread contract — f16_path is set only AFTER os.replace
+                # of the tmp file completes, so a populated+on-disk f16_path
+                # means the conversion is effectively done even if the Python
+                # Thread object hasn't fully wound down. Only skip when there
+                # is no usable f16_path.
+                published = gguf_result.get("f16_path")
+                if published is not None and published.exists():
+                    log.warning(
+                        "GGUF convert thread still flagged alive after %.0f s, "
+                        "but f16_path=%s is populated and exists on disk — "
+                        "treating bg thread as effectively done and proceeding "
+                        "with prebuilt-GGUF path.",
+                        3700, published,
+                    )
+                else:
+                    # F-CR2-M-1: SKIP imatrix entirely when the bg thread is still
+                    # alive AND has not published a usable f16_path. The daemon bg
+                    # thread continues writing to model_f16.gguf.tmp and would race
+                    # with _generate_imatrix's sequential fallback, both of which
+                    # call os.replace on the same target path. By skipping, no
+                    # concurrent writer exists; the bg thread's eventual replace
+                    # just updates the GGUF for the next run.
+                    log.error(
+                        "GGUF convert thread still alive after %.0f s timeout AND no "
+                        "f16_path published; SKIPPING imatrix entirely to avoid "
+                        "concurrent-writer race on model_f16.gguf",
+                        3700,
+                    )
+                    imatrix_skipped = True
+        f16_path = None if imatrix_skipped else gguf_result.get("f16_path")
+
         if imatrix_skipped:
             # Sentinel: surface to dashboard via trackio. Do NOT call _generate_imatrix:
             # it would spawn a sequential GGUF write that races the still-live bg thread.
@@ -597,7 +611,26 @@ class ImatrixExportPlugin:
                 _write_eval_text_concat(eval_text_concat, artifacts_dir)
             except Exception as exc:  # noqa: BLE001
                 log.warning("imatrix-skipped path: eval_text_concat write failed (%s)", exc)
-        elif cached_teacher_results is None and f16_path is not None:
+            return
+
+        # L1: observability parity — if the llama.cpp binaries are missing we
+        # cannot run imatrix at all. Surface that as ``imatrix_skipped`` on the
+        # context (same sentinel emitted by the bg-thread-timeout path above).
+        # We only set the sentinel; the eval-text-concat write happens inside
+        # the helper paths below regardless of imatrix availability.
+        icfg = s6.get("imatrix", {})
+        if icfg.get("enabled", True) and _find_llama_cpp_dir(icfg.get("llama_cpp_dir")) is None:
+            log.warning(
+                "imatrix: llama.cpp not found at any candidate location — "
+                "setting imatrix_skipped sentinel for observability parity."
+            )
+            _trackio_log({"stage6/imatrix_skipped": 1.0})
+            ctx.set("imatrix_skipped", True)
+            # Still proceed below: the helper paths will short-circuit on the
+            # same llama.cpp-missing check and will produce the eval_text_concat
+            # debug write per spec §9.
+
+        if cached_teacher_results is None and f16_path is not None:
             _run_llama_imatrix_with_prebuilt_gguf(
                 eval_text_concat, s6.get("imatrix", {}), artifacts_dir, gguf_result,
             )
@@ -615,6 +648,12 @@ class ImatrixExportPlugin:
             _generate_imatrix(eval_text_concat, s6.get("imatrix", {}), artifacts_dir)
 
 
+# N3: the leading-underscore helpers below are module-private per PEP 8
+# but remain in ``__all__`` for legacy ``stage6_validate`` monolith
+# re-import compat (see ``stage6_validate.py`` re-export block) and for
+# the unit-test suite that imports them by name from this module. They
+# should be dropped from ``__all__`` when the monolith re-export is
+# removed; the public surface is ``ImatrixExportPlugin`` alone.
 __all__ = [
     "_EVAL_TEXT_CONCAT_FILENAME",
     "_background_gguf_convert",
