@@ -4,7 +4,8 @@ Paper
 -----
 Classic linear-sum-assignment algorithm — Kuhn (1955), Munkres (1957);
 implemented via SciPy's ``scipy.optimize.linear_sum_assignment``
-(O(n³) Jonker-Volgenant variant).
+(per scipy docs: "a modified Jonker-Volgenant algorithm with no
+initialization").
 
 This plugin is part of deviation D-mcf-assignment from
 arXiv:2604.04356 (REAM): the project adds an optimal-assignment
@@ -40,8 +41,8 @@ unimodular — Ahuja-Magnanti-Orlin §9). Synthetic counterexamples
 (STRATEGY_NEXT reviewer report §2) show greedy 28-34 % above the
 optimum on tight-capacity instances. At the project's
 ``N = 256, N'_l ∈ [128, 200], C_max = 7`` the gap is expected smaller
-(loose capacity), but Hungarian is essentially free (~10 ms / layer ×
-40 layers).
+(loose capacity); Hungarian is cheap at these sizes (project-anecdotal
+timing; no benchmark in tree).
 
 Capacitated fallback
 --------------------
@@ -62,13 +63,16 @@ Naming-history note
 Step 3 of the REAM pipeline alternative-solver branch. Existing log
 lines / Trackio keys preserved for dashboard back-compat.
 
-Imports ``_assign_mcf`` from ``solver_mcf`` as the capacitated-case fallback
-(when ``n_children > n_centroids`` Hungarian alone cannot solve the problem).
-The monolith re-imports ``_assign_hungarian``.
+Monolith re-export
+------------------
+The monolith re-imports ``_assign_hungarian`` from this module so the
+legacy ``stage2_reap_ream`` entry-points see the same helper.
 
+Back-compat notes
+-----------------
 ``HungarianSolverPlugin`` is a scaffold-only plugin (see
-``solver_greedy``). Circular-import note: this module imports only ``numpy``,
-``scipy``, ``solver_mcf``, ``pipeline.base`` and ``pipeline.context`` — none of
+``solver_greedy``). Circular-import note: this module imports only
+``numpy``, ``scipy``, ``solver_mcf`` and ``pipeline.context`` — none of
 which import ``stage2_reap_ream``.
 """
 from __future__ import annotations
@@ -153,6 +157,9 @@ class HungarianSolverPlugin:
     def __init__(
         self,
         *,
+        # ``max_group_cap`` is unused by Hungarian itself (1-1 assignment) but
+        # is accepted on the signature because it forwards to ``_assign_mcf``
+        # for the capacitated fallback branch (see ``_assign_hungarian``).
         max_group_cap: int = 0,
         assignment_solver: str = "greedy",
         sinkhorn_epsilon_init: float = 1.0,
