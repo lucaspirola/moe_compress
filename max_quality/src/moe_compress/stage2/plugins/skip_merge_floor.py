@@ -58,8 +58,9 @@ spine (``LayerMergePlugin``), so when it is enabled
 sentinel ``registry.enabled(config)`` filters this plugin out entirely;
 ``dispatch_first`` then finds no servicer for ``apply_cost_mask`` and
 returns ``None``, which the orchestrator handles via
-``if masked is not None:`` — the delta is left unmasked. The monolith's
-``_em_refine_assignment`` still re-applies the floor each EM round.
+``if masked is not None:`` — the delta is left unmasked. The EM refiner
+(``stage2.plugins.em_refine._em_refine_assignment``) still re-applies the
+floor each EM round.
 
 OFF-branch return contract
 --------------------------
@@ -201,8 +202,8 @@ def make_skip_merge_floor_plugin(cfg: dict[str, Any]) -> SkipMergeFloorPlugin:
     """Construct a :class:`SkipMergeFloorPlugin` from a Stage 2 config dict.
 
     Reads ``cfg["stage2_reap_ream"]["skip_merge_percentile"]`` (default
-    ``100.0``). Mirrors how ``stage2_reap_ream.run()`` will wire the plugin
-    once ``compute_assignment`` is decomposed (T13+).
+    ``100.0``). Used by tests; the live orchestrator constructs
+    ``SkipMergeFloorPlugin`` directly (see ``stage2.orchestrator.run``).
     """
     s2 = cfg.get("stage2_reap_ream", {}) if isinstance(cfg, dict) else {}
     return SkipMergeFloorPlugin(
