@@ -38,6 +38,9 @@ defensible from Eq. 9 alone. The un-renormalized reading would yield
 the same expert *ranking* only if the per-token sum is constant, which
 it is not (varies per token), so the choice is empirically
 distinguishable — just not in a paper-prescribed direction.
+Aligns with the upstream CLI default
+(``renormalize_router_weights=True`` at
+``CerebrasResearch/reap`` ``src/reap/args.py:142``).
 
 Deviation: D-reap-min-active-tokens
 -----------------------------------
@@ -60,12 +63,12 @@ silently absorbing it.
 
 Calibration deviations (SHARED — also applies to Stage 2.5 / 5)
 ---------------------------------------------------------------
-- **D11 — calibration data source**: REAP (2510.13999 §4) uses
+- **D11 — calibration data source**: REAP (2510.13999 §5) uses
   c4 + evol-codealpaca. The project uses multi-domain
   Nemotron-Cascade-2-SFT-Data with weighted subsets
   (chat 0.56, math 0.21, science 0.11, ...). Task-aware calibration
   better matches target deployment distribution.
-- **D-cal-size — calibration sequence count**: REAM 2604.04356 §4 uses
+- **D-cal-size — calibration sequence count**: REAM 2604.04356 §5 uses
   3072 sequences × 512 tokens (1.57 M tokens); REAP 2510.13999 uses
   1024 sequences × 2048 tokens (2.1 M tokens). The project uses
   4000 sequences × 2048 tokens (8.19 M tokens) — 5.2× / 3.9× more
