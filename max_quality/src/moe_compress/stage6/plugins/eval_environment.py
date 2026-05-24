@@ -1,5 +1,25 @@
 """Eval-environment setup (S6-2 of the Stage 6 plugin-architecture refactor).
 
+Paper / spec source
+--------------------
+This plugin owns Stage 6's per-side environment-setup concern, not a
+specific paper. It enforces:
+
+- **Dataset revision pinning** — every eval dataset is loaded at a
+  canonical SHA-256-keyed revision so cached evals invalidate when a
+  dataset is silently updated upstream.
+- **Kernel patches** — torch.compile / SDPA backend selection for the
+  prefill-dominant eval forward.
+- **Experts-impl shim** — swap the project's ``FactoredExperts`` for
+  the upstream eager experts impl on the eval path so lm-eval and
+  HumanEval generation see the same shape as the GPU pipeline.
+- **Imatrix corpus build** — concatenate the WikiText-2-train corpus
+  for downstream consumption by :mod:`stage6.plugins.imatrix_export`.
+
+The setup choices follow the project's ``VALIDATED_STRATEGIES.md``
+§Stage 6 record (no upstream paper for the Stage-6 validation gate
+itself; eval tasks are paper-anchored at their individual plugins).
+
 Home of the Stage 6 environment-setup concern, extracted from the legacy
 ``stage6_validate.py`` monolith. S6-2 owns the five environment concerns that
 ``stage6_validate.run()`` performs before any eval family executes:
@@ -366,7 +386,7 @@ class EvalEnvironmentPlugin:
     """
 
     name = "eval_environment"
-    paper = "Stage 6 validation gate — WikiText-2 PPL + lm-eval zero-shot + generative (VALIDATED_STRATEGIES §Stage 6)."
+    paper = "Stage 6 per-side eval environment setup (no upstream paper; VALIDATED_STRATEGIES §Stage 6). See module docstring."
     config_key = "stage6_validate.experts_implementation"
     reads: tuple[str, ...] = ("model", "config", "artifacts_dir")
     writes: tuple[str, ...] = (
