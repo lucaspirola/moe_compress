@@ -24,7 +24,7 @@ Usage
     python max_quality/scripts/build_self_traces_calib.py \
         --teacher Qwen/Qwen3.6-35B-A3B \
         --prompts qwen3-pretrain-mix \
-        --num-prompts 4000 \
+        --num-prompts 5000 \
         --max-new-tokens 4096 \
         --output artifacts/_shared/self_traces.jsonl
 
@@ -83,11 +83,14 @@ log = logging.getLogger("build_self_traces_calib")
 
 def _iter_prompts_from_qwen3_pretrain_mix(
     tokenizer, num_prompts: int, seed: int,
-) -> Iterator[str]:
-    """Yield user prompts drawn from the qwen3-pretrain-mix datasets.
+) -> Iterator[tuple[str, str]]:
+    """Yield ``(prompt, domain)`` pairs drawn from the qwen3-pretrain-mix
+    datasets, with per-subset counts that preserve the corpus's intended mix.
 
     Reuses the corpus's existing dataset loaders but strips back to the user
     turn only — the teacher generates fresh thinking-mode responses below.
+    The ``domain`` tag travels into the output JSONL so the downstream
+    self-traces loader can preserve the same percentages at every draw.
     """
     from moe_compress.utils.calibration import (  # type: ignore
         _QWEN3_MIX_DATASET,
@@ -120,25 +123,28 @@ def _iter_prompts_from_qwen3_pretrain_mix(
                     None,
                 )
                 if isinstance(user, str) and user.strip():
-                    yield user.strip()
+                    yield user.strip(), subset
                     n += 1
             elif subset == "fineweb":
                 text = (row.get("text") or "").strip()
                 if text:
                     # Wrap as a "summarize/extend" prompt to give the teacher
                     # something to reason about.
-                    yield f"Read the following passage and explain its key ideas:\n\n{text[:2000]}"
+                    yield (
+                        f"Read the following passage and explain its key ideas:\n\n{text[:2000]}",
+                        subset,
+                    )
                     n += 1
             elif subset == "math":
                 problem = (row.get("problem") or "").strip()
                 if problem:
-                    yield problem
+                    yield problem, subset
                     n += 1
             elif subset == "code":
                 instr = (row.get("instruction") or "").strip()
                 inp = (row.get("input") or "").strip()
                 if instr:
-                    yield instr + (("\n\n" + inp) if inp else "")
+                    yield (instr + (("\n\n" + inp) if inp else ""), subset)
                     n += 1
             if n >= count:
                 break
@@ -147,14 +153,20 @@ def _iter_prompts_from_qwen3_pretrain_mix(
             break
 
 
-def _iter_prompts_from_jsonl(path: Path) -> Iterator[str]:
-    """Yield user prompts from a JSONL file with rows ``{"prompt": "..."}``."""
+def _iter_prompts_from_jsonl(path: Path) -> Iterator[tuple[str, str]]:
+    """Yield ``(prompt, domain)`` pairs from a JSONL file. Each row must
+    carry ``{"prompt": "...", "domain": "..."}`` (or aliases ``user`` /
+    ``input`` for the prompt). Rows without a ``domain`` are tagged
+    ``"unknown"`` so the downstream loader's domain-mix partitioning still
+    has somewhere to put them.
+    """
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             row = json.loads(line)
             p = row.get("prompt") or row.get("user") or row.get("input")
+            d = row.get("domain") or "unknown"
             if isinstance(p, str) and p.strip():
-                yield p.strip()
+                yield p.strip(), str(d)
 
 
 # ---------------------------------------------------------------------------
@@ -214,10 +226,15 @@ def _load_teacher(repo: str, revision: str, load_in_4bit: bool):
 
 
 def _generate_traces(
-    model, tokenizer, prompts: list[str], *,
+    model, tokenizer, prompts: list[tuple[str, str]], *,
     batch_size: int, max_new_tokens: int,
 ) -> Iterator[dict]:
-    """Greedy-generate teacher traces; yield ``{"messages": [...]}`` rows."""
+    """Greedy-generate teacher traces; yield
+    ``{"messages": [...], "domain": "..."}`` rows. The ``domain`` field
+    propagates the source-subset tag from the prompt iterator so the
+    downstream self-traces loader can preserve the empirical domain mix
+    at every draw.
+    """
     import torch
 
     if tokenizer.pad_token_id is None:
@@ -228,7 +245,9 @@ def _generate_traces(
     total = len(prompts)
     t0 = time.monotonic()
     for i in range(0, total, batch_size):
-        batch_prompts = prompts[i:i + batch_size]
+        batch = prompts[i:i + batch_size]
+        batch_prompts = [p for p, _ in batch]
+        batch_domains = [d for _, d in batch]
         # Render each prompt with add_generation_prompt=True so the template
         # lands at the assistant cursor — the model's generation extends from
         # there with the <think> opener.
@@ -261,7 +280,7 @@ def _generate_traces(
 
         gen_only = out_ids[:, inputs.input_ids.shape[1]:]
         decoded = tokenizer.batch_decode(gen_only, skip_special_tokens=False)
-        for prompt, completion in zip(batch_prompts, decoded):
+        for prompt, domain, completion in zip(batch_prompts, batch_domains, decoded):
             # Trim trailing pad/eos tokens — keep the <think>...</think> and
             # final answer intact.
             ans = completion.split(tokenizer.eos_token)[0] if tokenizer.eos_token else completion
@@ -272,7 +291,8 @@ def _generate_traces(
                 "messages": [
                     {"role": "user", "content": prompt},
                     {"role": "assistant", "content": ans},
-                ]
+                ],
+                "domain": domain,
             }
 
         elapsed = time.monotonic() - t0
@@ -300,7 +320,7 @@ def main() -> int:
     p.add_argument("--prompts", default="qwen3-pretrain-mix",
                    help="Prompt source: 'qwen3-pretrain-mix' or path to a "
                         "JSONL with {'prompt': '...'} rows.")
-    p.add_argument("--num-prompts", type=int, default=4000)
+    p.add_argument("--num-prompts", type=int, default=5000)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--max-new-tokens", type=int, default=4096)
@@ -342,15 +362,22 @@ def main() -> int:
     else:
         prompts_iter = _iter_prompts_from_jsonl(Path(args.prompts))
 
-    prompts: list[str] = []
-    for p_text in prompts_iter:
-        prompts.append(p_text)
+    prompts: list[tuple[str, str]] = []
+    for entry in prompts_iter:
+        prompts.append(entry)
         if len(prompts) >= args.num_prompts:
             break
     if not prompts:
         log.error("no prompts gathered — check --prompts source.")
         return 1
-    log.info("gathered %d prompts", len(prompts))
+    # Log empirical per-domain breakdown so the operator can verify the mix
+    # before paying the teacher-forward bill.
+    from collections import Counter as _Counter
+    domain_counts = _Counter(d for _, d in prompts)
+    total_p = len(prompts)
+    log.info("gathered %d prompts; per-domain mix: %s", total_p, {
+        d: f"{c} ({c / total_p:.1%})" for d, c in sorted(domain_counts.items())
+    })
 
     model, tokenizer = _load_teacher(
         args.teacher, args.teacher_revision, args.load_in_4bit,

@@ -1253,6 +1253,172 @@ register_corpus(CorpusAdapter(
 
 _DEFAULT_SELF_TRACES_PATH = "artifacts/_shared/self_traces.jsonl"
 
+# Per-process state for the self-traces blacklist, keyed by absolute JSONL
+# path so multiple datasets (e.g. different teachers) coexist. Each entry:
+#     {
+#         "rows":      list[dict]          # parsed JSONL rows in file order
+#         "by_domain": dict[str, list[int]] # domain → row-indices in rows
+#         "weights":   dict[str, float]    # empirical domain weights (sum=1)
+#         "blacklist": set[int]            # row-indices already served this run
+#     }
+#
+# Why per-process: every stage that calls build_calibration_tensor
+# (Stage 1 main + ablation_filter, Stage 2, Stage 2.5 / 5, Stage 3, Stage 6alt
+# thermo_corpus) reaches the loader through _stream_texts_self_traces. They
+# share this module's globals, so the blacklist accumulates across stages
+# within ONE python invocation. The on-disk calibration cache is keyed by
+# spec.cache_key (which folds in spec.seed) — different stages have distinct
+# seed_offsets so each one calls into this loader at least once.
+_SELF_TRACES_STATE: dict[str, dict] = {}
+
+
+def _reset_self_traces_state() -> None:
+    """Test affordance — clear the cached JSONL parses + blacklists. Production
+    callers don't need this; the state lives for the lifetime of the process.
+    """
+    _SELF_TRACES_STATE.clear()
+
+
+def _load_self_traces_state(path) -> dict:
+    """Load + cache the JSONL once per path; partition rows by ``domain`` field
+    and compute empirical domain weights from row counts. Initialise an empty
+    blacklist. Subsequent calls return the cached state (and growing blacklist).
+    """
+    from pathlib import Path
+    import json as _json
+
+    key = str(Path(path).resolve())
+    cached = _SELF_TRACES_STATE.get(key)
+    if cached is not None:
+        return cached
+
+    rows: list[dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(_json.loads(line))
+            except _json.JSONDecodeError as exc:
+                log.warning("self-traces: skipping malformed JSONL line: %s", exc)
+                continue
+
+    if not rows:
+        raise ValueError(
+            f"self-traces: JSONL at {path} contained zero parseable rows."
+        )
+
+    by_domain: dict[str, list[int]] = {}
+    for i, row in enumerate(rows):
+        d = row.get("domain") or "unknown"
+        by_domain.setdefault(d, []).append(i)
+
+    total = sum(len(v) for v in by_domain.values())
+    weights = {d: len(v) / total for d, v in by_domain.items()}
+
+    log.info(
+        "self-traces: loaded %d rows from %s with empirical mix %s",
+        len(rows), path,
+        {d: f"{w:.2%}" for d, w in sorted(weights.items())},
+    )
+
+    state = {
+        "rows": rows,
+        "by_domain": by_domain,
+        "weights": weights,
+        "blacklist": set(),
+    }
+    _SELF_TRACES_STATE[key] = state
+    return state
+
+
+def _draw_self_traces_indices(
+    state: dict, n_requested: int, seed: int,
+) -> list[int]:
+    """Draw ``n_requested`` row-indices, respecting the empirical domain mix
+    AND the per-process blacklist.
+
+    Algorithm:
+      1. Allocate per-domain quota = ``max(1, round(n_requested * weight_d))``.
+      2. For each domain, sample ``quota_d`` indices from
+         ``by_domain[d] \\ blacklist`` (deterministic shuffle, seeded by spec.seed
+         + domain hash).
+      3. If ANY domain can't fill its quota out of the un-blacklisted pool,
+         reset the GLOBAL blacklist (this matches the contract: "only when we
+         blacklist all samples do we whitelist everything and restart") and
+         retry step 2 once. If a domain still can't fill — its full row pool is
+         smaller than the per-domain quota — take what's available and log a
+         warning.
+      4. Add the drawn indices to the blacklist before returning.
+    """
+    import random as _random
+
+    by_domain = state["by_domain"]
+    weights = state["weights"]
+    blacklist: set[int] = state["blacklist"]
+    rows = state["rows"]
+
+    # Per-domain quotas preserve the empirical mix at every draw.
+    per_domain_quota = {
+        d: max(1, round(n_requested * w)) for d, w in weights.items()
+    }
+
+    def _try_draw(domain_subsets: dict[str, list[int]]) -> tuple[list[int], bool]:
+        """Returns (selected, all_quotas_met). On all_quotas_met=False the
+        caller must reset the blacklist and retry."""
+        selected_local: list[int] = []
+        ok = True
+        for d, quota in per_domain_quota.items():
+            pool = domain_subsets.get(d, [])
+            if len(pool) < quota:
+                ok = False
+                break
+            rng = _random.Random((seed * 1009 + (hash(d) & 0x7FFFFFFF)) & 0xFFFFFFFF)
+            shuffled = list(pool)
+            rng.shuffle(shuffled)
+            selected_local.extend(shuffled[:quota])
+        return selected_local, ok
+
+    # First try with current blacklist.
+    available = {d: [i for i in idx_list if i not in blacklist]
+                 for d, idx_list in by_domain.items()}
+    selected, all_met = _try_draw(available)
+
+    if not all_met:
+        # "Only if during the run we blacklist all samples, we whitelist
+        # everything and restart the blacklist as we provide more data."
+        log.info(
+            "self-traces: blacklist would prevent quota (%d/%d consumed, %d "
+            "rows total) — resetting blacklist to empty and re-drawing.",
+            len(blacklist), len(rows), len(rows),
+        )
+        blacklist.clear()
+        available = {d: list(idx_list) for d, idx_list in by_domain.items()}
+        selected, all_met = _try_draw(available)
+        if not all_met:
+            # Even on a fresh blacklist some domain has fewer rows than its
+            # quota — the JSONL is undersized for this n_requested at the
+            # current mix. Take what's available and log loudly so the
+            # operator knows to regenerate with --num-prompts increased.
+            log.warning(
+                "self-traces: JSONL is undersized — at least one domain has "
+                "fewer rows than quota even after blacklist reset. Regenerate "
+                "with --num-prompts >= %d. Filling with all available rows "
+                "per domain (mix will be approximated, not exact).",
+                n_requested * 2,
+            )
+            selected = []
+            for d, quota in per_domain_quota.items():
+                pool = available.get(d, [])
+                rng = _random.Random((seed * 1009 + (hash(d) & 0x7FFFFFFF)) & 0xFFFFFFFF)
+                shuffled = list(pool)
+                rng.shuffle(shuffled)
+                selected.extend(shuffled[:quota])
+
+    blacklist.update(selected)
+    return selected
+
 
 def _parse_yaml_self_traces(
     cal_cfg: dict, num_sequences: int, sequence_length: int, seed: int,
@@ -1272,25 +1438,26 @@ def _stream_texts_self_traces(
 ) -> list[str]:
     """Stream rows from the local JSONL produced by build_self_traces_calib.py.
 
-    Each row's ``messages`` list (already containing the teacher's reasoning +
-    answer trace in the assistant turn) is rendered through the model's chat
-    template with ``enable_thinking=True`` so reasoning-mode tokenizers
-    (Qwen3-thinking, DeepSeek-R1, etc.) keep the in-block markers in the
-    output token stream.
+    Each row carries ``{"messages": [...], "domain": "..."}`` — the loader
+    partitions by ``domain``, preserves the empirical domain mix at every
+    draw (so a 1000-sample request returns the same percentage split as a
+    5000-sample request), and runs a per-process row-index blacklist so no
+    sample is served twice within one ``run_pipeline.py`` invocation. The
+    blacklist resets to empty automatically when it can no longer satisfy
+    a per-domain quota — see ``_draw_self_traces_indices`` for the contract.
+
+    Each selected row's ``messages`` list (already containing the teacher's
+    reasoning + answer trace in the assistant turn) is rendered through the
+    model's chat template with ``enable_thinking=True`` so reasoning-mode
+    tokenizers (Qwen3-thinking, DeepSeek-R1, etc.) keep the in-block markers
+    in the output token stream.
     """
     from pathlib import Path
-    import json as _json
-    import random as _random
 
     path = Path(spec.dataset)
     if not path.is_absolute():
-        # Resolve relative to the current working directory (matches how the
-        # pipeline driver invokes scripts under the repo root).
         path = Path.cwd() / path
     if not path.exists():
-        # Pull the current model name (best-effort — fall back to a generic
-        # placeholder) so the error message is directly actionable for the
-        # user. The tokenizer carries ``name_or_path`` for any HF model.
         teacher_hint = getattr(tokenizer, "name_or_path", None) or "<TEACHER_REPO>"
         raise FileNotFoundError(
             "self-traces calibration JSONL not found at "
@@ -1299,41 +1466,22 @@ def _stream_texts_self_traces(
             "with the teacher you want to distil against:\n\n"
             "    python max_quality/scripts/build_self_traces_calib.py \\\n"
             f"        --teacher {teacher_hint} \\\n"
-            "        --num-prompts 4000 --max-new-tokens 4096 \\\n"
+            "        --num-prompts 5000 --max-new-tokens 4096 \\\n"
             f"        --output {path}\n\n"
             "Then re-run the pipeline. The trace JSONL is reusable across "
             "every Stage-2 / 2.5 run for this teacher (regenerate only when "
             "the teacher revision or prompt set changes)."
         )
 
-    # Deterministic shuffle by spec.seed so different (stage_key, seed_offset)
-    # combinations draw distinct samples without rewriting the file.
-    rng = _random.Random(spec.seed)
+    state = _load_self_traces_state(path)
+    selected = _draw_self_traces_indices(
+        state, n_requested=spec.num_sequences, seed=spec.seed,
+    )
+
     out: list[str] = []
-    rows: list[dict] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = _json.loads(line)
-            except _json.JSONDecodeError as exc:
-                log.warning("self-traces: skipping malformed JSONL line: %s", exc)
-                continue
-            rows.append(row)
-
-    if not rows:
-        raise ValueError(
-            f"self-traces: JSONL at {path} contained zero parseable rows."
-        )
-
-    rng.shuffle(rows)
-    # Cap at num_sequences * 4 to bound memory while leaving headroom for
-    # _tokenize_to_fixed_length to discard short rows.
-    cap = max(spec.num_sequences * 4, len(rows))
-    for row in rows[:cap]:
-        messages = row.get("messages")
+    rows = state["rows"]
+    for i in selected:
+        messages = rows[i].get("messages")
         if not messages:
             continue
         rendered = _render_messages(
@@ -1345,15 +1493,12 @@ def _stream_texts_self_traces(
             out.append(rendered)
 
     log.info(
-        "self-traces: %d rendered rows from %s (seed=%d, num_sequences=%d)",
-        len(out), path, spec.seed, spec.num_sequences,
+        "self-traces: served %d rows from %s (blacklist=%d/%d, "
+        "seed=%d, requested=%d)",
+        len(out), path,
+        len(state["blacklist"]), len(state["rows"]),
+        spec.seed, spec.num_sequences,
     )
-    if len(out) < spec.num_sequences:
-        log.warning(
-            "self-traces: only %d rows yielded vs %d requested — "
-            "regenerate the JSONL with a larger prompt budget.",
-            len(out), spec.num_sequences,
-        )
     return out
 
 
