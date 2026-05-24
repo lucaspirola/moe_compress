@@ -1,17 +1,18 @@
-"""Greedy + 2-opt local-refinement of the assignment.
+"""2-opt local-refinement of an already-feasible assignment.
 
 Paper
 -----
 **No paper.** Project-original — STRATEGY_NEXT "Direction D" /
 project §5 step 3.5. 2-opt is a classic combinatorial local-search
-heuristic (Lin 1965, originally for TSP); applied here to capacitated
-expert-assignment.
+heuristic (Croes 1958, originally for TSP; cf. Lin 1965 (k-opt) and
+Lin-Kernighan 1973); applied here to capacitated expert-assignment.
 
 Baseline REAM (arXiv:2604.04356), REAP (arXiv:2510.13999), and the
 solver-plugin alternatives (Hungarian / MCF / Sinkhorn) all produce a
-single-shot assignment. This plugin applies a 2-opt local-refinement
-pass on top of the chosen solver's output: repeatedly swap
-non-centroid → centroid assignments when the swap lowers total cost.
+single-shot assignment. This plugin REFINES that already-feasible
+input assignment by applying 2-opt swap+move passes on top of the
+chosen solver's output: greedy seeding lives upstream in
+``solver_greedy`` (this plugin does not seed, only refines).
 
 Official code
 -------------
@@ -28,16 +29,17 @@ cost ordering missed (e.g. when two centroids both want the same
 non-centroid but the second-choice for one is much cheaper than for
 the other).
 
-In practice the 2-opt pass is cheap (~O(n_NC²) per round) and
-converges in 1-2 rounds on production layers. It is opt-in and
-disabled by default — see ``two_opt_refine_rounds`` in the Stage 2
-config.
+In practice the 2-opt pass is cheap — swap phase is O(n_NC²), move
+phase is O(n_NC × n_centroids); total O(n_NC × (n_NC + n_centroids))
+per round — and converges in 1-2 rounds on production layers. It is
+opt-in and disabled by default — see ``two_opt_refine`` (bool) in
+the Stage 2 config.
 
 Refine-chain ordering
 ---------------------
-``TwoOptRefinePlugin`` is the **first** link of the
-``refine_assignment`` chain (two-opt THEN EM), registered ahead of
-:mod:`stage2.plugins.em_refine` and the dead-fallback
+``TwoOptRefinePlugin`` is LIVE as of S2-9 and is the **first** link
+of the ``refine_assignment`` chain (two-opt THEN EM), registered ahead
+of :mod:`stage2.plugins.em_refine` and the dead-fallback
 ``LegacyAdapter``. 2-opt operates on the **static** cost matrix
 (cheap); EM re-runs assignment under tentative merged-centroid
 weights (expensive). Running 2-opt first lets EM start from a
@@ -52,16 +54,9 @@ back-compat.
 
 Circular-import note: this module imports only ``pipeline.base`` and
 ``pipeline.context``, neither of which imports ``stage2_reap_ream``.
-
-The monolith re-imports ``_two_opt_refine`` so external callers (tests, the
-``MOE_STAGE2_LEGACY_LOOP=1`` legacy-loop path, ``LegacyAdapter``) keep their
-import paths working unchanged.
-
-``TwoOptRefinePlugin`` is LIVE as of S2-9: it is the first link of the
-``refine_assignment`` chain (two-opt THEN EM), registered ahead of
-``EmRefinePlugin`` and the dead-fallback ``LegacyAdapter``. Circular-import
-note: this module imports only ``pipeline.base`` and ``pipeline.context``,
-neither of which imports ``stage2_reap_ream``.
+The monolith re-imports ``_two_opt_refine`` so external callers (tests,
+the ``MOE_STAGE2_LEGACY_LOOP=1`` legacy-loop path, ``LegacyAdapter``)
+keep their import paths working unchanged.
 """
 from __future__ import annotations
 
@@ -129,8 +124,10 @@ def _two_opt_refine(
         if g >= 0:
             group_size[g] += 1
 
-    # max_group_cap <= 0 → uncapped; use an effectively-infinite cap so the
-    # capacity guards become no-ops without special-casing every check.
+    # max_group_cap <= 0 → uncapped; use a conservative oversized sentinel
+    # (``n_children`` — every child could pile into one group at worst) so the
+    # capacity guards become no-ops without special-casing every check. Not
+    # truly infinite, just large enough that it cannot bind in this routine.
     cap = max_group_cap if max_group_cap > 0 else n_children
 
     def _cost(ch: int, g: int) -> float:
@@ -184,7 +181,8 @@ def _two_opt_refine(
                     # preserved by construction. Assert the invariant loudly
                     # rather than silently skipping an improving swap.
                     assert group_size[g_i] <= cap and group_size[g_j] <= cap, (
-                        "2-opt: group size exceeded cap before a size-neutral swap"
+                        "2-opt: group size invariant violated before a "
+                        "size-neutral swap (expected both <= cap)"
                     )
                     result[i] = g_j
                     result[j] = g_i
@@ -215,11 +213,7 @@ class TwoOptRefinePlugin:
     name = "two_opt_refine"
     paper = (
         "2-opt local-search refinement of the assignment "
-        "(project-original; no paper). 2-opt classic Lin 1965 for TSP; "
-        "applied here to capacitated expert-assignment. "
-        "STRATEGY_NEXT Direction D / §5 step 3.5. "
-        "Baseline REAM arXiv:2604.04356 is single-shot. "
-        "See module docstring."
+        "(project-original; no paper). See module docstring."
     )
     config_key = "stage2_reap_ream.two_opt_refine"
     # Two-opt operates purely on the assignment list, the cost matrix and the
