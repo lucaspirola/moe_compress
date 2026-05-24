@@ -199,7 +199,7 @@ class AimerDetectorPlugin:
         "(arXiv:2603.18492, 2026). Acronym = Absolute mean over root mean "
         "square IMportance for Expert Ranking; paper Eq. (4) "
         "AIMER = P / sqrt(N·Q) over the three projections (Eq. 3 labels "
-        "the P row of the (N, P, Q) definition block), equivalent to the "
+        "all three rows of the (N, P, Q) definition block), equivalent to the "
         "vector form Eq. (5) "
         "AIMER(w) = ‖w‖₁ / (√N · ‖w‖₂) on the flattened concatenation. "
         "Official code: github.com/ZongfangLiu/AIMER @ commit "
