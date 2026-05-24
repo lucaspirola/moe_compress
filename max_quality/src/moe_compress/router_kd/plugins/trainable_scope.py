@@ -4,12 +4,21 @@ Paper
 -----
 Hyeon & Do, "Is Retraining-Free Enough? The Necessity of Router
 Calibration for Efficient MoE Compression" — arXiv:2603.02217 (§F.3,
-Eq. 3, Table 1). audit/spec_compliance/01_papers/2603.02217/source.md.
+Eq. 3, Table 1). See ``audit/spec_compliance/01_papers/2603.02217/source.md``.
 
-Equation 3: the per-batch vocab-KL distillation objective
-    L_KD = KL(softmax(s_t / τ) || softmax(s_s / τ)) · τ²
-where ``s_t``, ``s_s`` are the teacher and student vocabulary logits
-and ``τ`` is the distillation temperature.
+Equation 3 (paper source.md L800-823): the per-sequence vocab-KL
+distillation objective
+
+    L_RKD(x; θ_T, θ_R) = (τ² / N_x) · Σ_{t=1..L-1} m_{t+1} · D_KL(p_T^{(t)} || p_S^{(t)})
+
+where ``p_T^{(t)}``, ``p_S^{(t)}`` are the teacher/student temperature-softened
+next-token vocab distributions at position ``t``, ``m_{t+1}`` is the
+next-token mask (zero on padded positions), ``N_x = Σ m_{t+1}`` is the
+unmasked-position count, ``τ`` is the distillation temperature, and the sum
+runs over the ``L-1`` next-token positions of sequence ``x``. The per-position
+KL term lives in :mod:`router_kd.plugins.vocab_kd`; the mask/normalizer/sum are
+applied there. This plugin owns only the trainable-vs-frozen *parameter*
+scope (the θ_R selection); the loss itself is the vocab_kd plugin's concern.
 
 §F.3 fixes the calibration data and hyperparameters; Table 1 reports
 the resulting recovery on Mixtral/Qwen-MoE post-pruning/post-merging.
@@ -33,28 +42,26 @@ TWO different patterns:
 
 Piece A — relocated verbatim (the S3-2/S3-3/S4-3 pattern):
   ``_freeze_non_routers`` is a STANDALONE function in the monolith. It is
-  relocated here character-for-character; the ``stage5_router_kd.py`` monolith
-  re-imports it (``# noqa: F401`` block) so ``run()`` and external
+  relocated here character-for-character; ``stage5_router_kd.py`` (now a thin
+  shim — see below) re-imports it via a ``# noqa: F401`` block so external
   callers/tests (``test_stage5_merge_repair.py``) keep their import paths.
 
-Piece B — reproduced in an inert hook (the S3-4/S4-2 pattern):
-  the trainable/frozen pattern-conflict check is INLINE ``run()`` code in the
-  monolith, not a standalone function — there is nothing to relocate. The
-  ``setup_trainable_scope`` hook below REPRODUCES that inline logic faithfully;
-  the monolith ``run()`` is NOT modified for it. This is an intentional,
-  temporary logic duplication that resolves at RK-8 when the monolith ``run()``
-  is deleted and this hook is wired live.
+Piece B — the trainable/frozen pattern-conflict check (the S3-4/S4-2 pattern):
+  originally inline ``run()`` code in the monolith, this check is now owned by
+  the ``setup_trainable_scope`` hook below. RK-8 has landed: the Router-KD
+  orchestrator (:mod:`router_kd.orchestrator`) imports, registers, and
+  dispatches this plugin via ``walk_phases(("setup_trainable_scope",), …)``,
+  and ``stage5_router_kd.run`` is a thin shim delegating to it.
 
 Circular-import note (mirror of ``stage4/plugins/eora_inputs.py``): this
 module imports only from ``...pipeline.*`` / ``..context`` / stdlib / torch —
 NEVER from ``stage5_router_kd`` or ``router_kd.orchestrator`` at any scope
-(module-top OR function-local). The monolith re-imports *this* module at load
-time, so a ``from ..stage5_router_kd import ...`` here would deadlock the
+(module-top OR function-local). The monolith shim re-imports *this* module at
+load time, so a ``from ..stage5_router_kd import ...`` here would deadlock the
 import; nothing in this module does that.
 
-``TrainableScopePlugin`` is registered-but-INERT at RK-2 — no orchestrator
-walk or test invokes its ``setup_trainable_scope`` hook. RK-8 plugs the hook
-into the live Router-KD plugin sequencer and deletes the monolith ``run()``.
+``TrainableScopePlugin`` is LIVE: it is enabled-and-dispatched by the
+Router-KD orchestrator at every Stage 5 / Stage 2.5 run.
 """
 from __future__ import annotations
 
@@ -74,7 +81,7 @@ def _freeze_non_routers(model: nn.Module, trainable_patterns: list[str]) -> None
 
 
 class TrainableScopePlugin:
-    """Router-KD trainable-scope plugin (RK-2 — registered-but-INERT).
+    """Router-KD trainable-scope plugin (RK-2 — LIVE since RK-8).
 
     Owns the Router-KD trainable/frozen-parameter scope concern: freezing
     every non-router parameter before the student is compiled
@@ -84,24 +91,30 @@ class TrainableScopePlugin:
     ``frozen_name_patterns``.
 
     RK-2 covers a mixed pattern: ``_freeze_non_routers`` is relocated verbatim
-    (the monolith re-imports it), while the conflict check — inline ``run()``
-    code in the monolith — is reproduced in the ``setup_trainable_scope`` hook
-    below; the monolith ``run()`` is NOT modified for it (see module
-    docstring). RK-2 wires this class into the plugin registry as metadata
-    only — no walk or test invokes ``setup_trainable_scope``. RK-8 plugs the
-    hook into the live Router-KD plugin sequencer.
+    (the monolith shim re-imports it), while the conflict check — originally
+    inline ``run()`` code in the monolith — is now owned by the
+    ``setup_trainable_scope`` hook below. RK-8 has landed: the Router-KD
+    orchestrator imports, registers, and dispatches this plugin (see
+    :mod:`router_kd.orchestrator`); ``stage5_router_kd.run`` is a thin shim
+    delegating to that orchestrator.
     """
 
     name = "trainable_scope"
     paper = (
-        "Router KD vocab-KL distillation Eq. 3 — arXiv:2603.02217 "
-        "(Hyeon & Do); no official code. Concern: trainable/frozen-parameter scope (router-only freezing). "
-        "Calibration D11 (SHARED — see :mod:`stage2.plugins.reap_scoring`). "
-        "See module docstring."
+        "Router-KD vocab-KL distillation Eq. 3 — arXiv:2603.02217 (Hyeon & Do). "
+        "Official code: none published. "
+        "Concern: trainable/frozen-parameter scope (router-only freezing). "
+        "Calibration deviation D11 (SHARED — canonical owner "
+        ":mod:`stage2.plugins.reap_scoring`). "
+        "See module docstring for Eq. 3 expansion and full citation."
     )
+    # Primary config key (asserted by tests). The hook *also* reads
+    # ``stage5_router_kd.frozen_name_patterns`` (optional, informational) for
+    # the conflict-overlap sanity check in ``setup_trainable_scope``.
     config_key = "stage5_router_kd.trainable_name_patterns"
     # ``student``/``model`` are the primary/fallback slot for the model the
-    # hook reads (RK-8 will canonicalize to one); both are declared here.
+    # hook reads (RK-8 keeps both for back-compat with callers that publish
+    # under either name); both are declared here.
     reads: tuple[str, ...] = ("student", "model", "config")
     # Empty: the freeze mutates ``requires_grad`` on the student parameters
     # in place — there is no new context slot to publish.
@@ -122,21 +135,17 @@ class TrainableScopePlugin:
         return {}
 
     def setup_trainable_scope(self, ctx: PipelineContext) -> None:
-        """Phase hook — Router-KD trainable-scope setup (RK-8 wiring surface).
+        """Phase hook — Router-KD trainable-scope setup (live since RK-8).
 
-        INERT at RK-2: no orchestrator walk or test invokes this hook. RK-8
-        replaces the Router-KD orchestrator body with the plugin sequencer and
-        dispatches this hook in place of the monolith's inline ``run()``
-        conflict-check + ``_freeze_non_routers`` call. The body below
-        reproduces that inline block faithfully — it is dead code at RK-2 but
-        RK-8 relies on it once the monolith ``run()`` is deleted.
-
-        Reproduces (in monolith order): read ``frozen_name_patterns`` /
-        ``trainable_name_patterns`` from ``stage5_router_kd`` config, run the
-        trainable/frozen pattern-conflict check against the (compile-unwrapped)
-        student's parameter names — raising the verbatim ``RuntimeError`` on
-        any overlap — then freeze every non-router parameter via the local
-        ``_freeze_non_routers``.
+        Dispatched by :mod:`router_kd.orchestrator` via
+        ``walk_phases(("setup_trainable_scope",), …)`` immediately after
+        ``load_teacher_cache`` and BEFORE the student is compiled. Reproduces
+        (in monolith order) the original inline ``run()`` block: read
+        ``frozen_name_patterns`` / ``trainable_name_patterns`` from
+        ``stage5_router_kd`` config, run the trainable/frozen pattern-conflict
+        check against the compile-unwrapped student's parameter names —
+        raising the verbatim ``RuntimeError`` on any overlap — then freeze
+        every non-router parameter via the local ``_freeze_non_routers``.
         """
         # Required slots — direct get(): a missing one is a wiring bug and
         # SHOULD raise. The student may be published under either "student"
@@ -145,17 +154,26 @@ class TrainableScopePlugin:
         config = ctx.get("config")
         s5 = config["stage5_router_kd"]
 
-        # Sanity check: warn if any parameter name matches BOTH trainable and
-        # frozen patterns (frozen_name_patterns is informational only — it is NOT
-        # consulted by _freeze_non_routers; freeze is driven entirely by
-        # `requires_grad_(any(p in name for p in trainable_name_patterns))`.
-        # Names that match only frozen_name_patterns are still correctly frozen
-        # because they fail the trainable-pattern check. The patterns list exists
-        # solely for the conflict-overlap sanity check below; trainable wins,
-        # but a name in both is almost certainly a config bug).
+        # Sanity check: raise if any parameter name matches BOTH trainable and
+        # frozen patterns. ``frozen_name_patterns`` is informational only — it
+        # is NOT consulted by ``_freeze_non_routers``; the freeze is driven
+        # entirely by
+        #     ``requires_grad_(any(p in name for p in trainable_name_patterns))``.
+        # Names matching only ``frozen_name_patterns`` are still correctly
+        # frozen because they fail the trainable-pattern check. The frozen
+        # patterns list exists solely for this conflict-overlap sanity check
+        # below: trainable wins on overlap, but a name in both is almost
+        # certainly a config bug.
         _frozen_patterns = s5.get("frozen_name_patterns", []) or []
         _trainable_patterns = s5["trainable_name_patterns"]
         if _frozen_patterns:
+            # Unwrap convention (conflict-check ONLY): the conflict scan
+            # walks the compile-unwrapped student so parameter names match
+            # the user's pattern strings (``torch.compile`` prefixes names
+            # with ``_orig_mod.``). ``_freeze_non_routers`` below is called
+            # with the *wrapped* student deliberately — ``requires_grad_``
+            # is shared with the underlying parameter tensor, so the freeze
+            # is identical either way.
             _base_for_check = getattr(student, "_orig_mod", student)
             _conflicts = [
                 name for name, _ in _base_for_check.named_parameters()
