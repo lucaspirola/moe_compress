@@ -1,5 +1,34 @@
 """Teacher-logits slot plugins (RK-5 of the Router-KD plugin-architecture refactor).
 
+Paper
+-----
+Hyeon & Do, "Is Retraining-Free Enough? The Necessity of Router
+Calibration for Efficient MoE Compression" — arXiv:2603.02217 (§F.3,
+Eq. 3, Table 1). audit/spec_compliance/01_papers/2603.02217/source.md.
+
+Two plugins:
+
+- ``TeacherCachePlugin`` — loads per-batch teacher vocabulary logits
+  from a precomputed SHA-256-keyed sidecar cache file. Registered
+  FIRST in the ``provide_teacher_logits`` ``dispatch_first`` slot so
+  it wins if a cache is available.
+- ``TeacherLivePlugin`` — loads the teacher model (optionally in 4-bit
+  via bitsandbytes per §F.3 fallback), runs the per-batch forward,
+  and returns vocabulary logits. Wins ``dispatch_first`` when no
+  cache plugin returned a result.
+
+Vocab guard: both plugins assert the teacher and student share the
+same vocab dimension (4-bit teacher cannot be smaller than the
+student per §F.3 4-bit cache compatibility).
+
+Official code
+-------------
+**None published.** See :mod:`router_kd.plugins.trainable_scope` for
+the negative finding.
+
+Calibration deviation D11 (SHARED) — canonical owner is
+:mod:`stage2.plugins.reap_scoring`.
+
 Home of the Router-KD teacher-logits concern: where the per-batch teacher
 vocabulary logits come from. RK-5 ships TWO plugins — ``TeacherCachePlugin``
 and ``TeacherLivePlugin`` — both implementing the SAME slot hook
@@ -114,7 +143,12 @@ class TeacherCachePlugin:
     """
 
     name = "teacher_cache"
-    paper = "Router Knowledge Distillation (paper 2603.02217, Eq. 3)."
+    paper = (
+        "Router KD Eq. 3 — arXiv:2603.02217 (Hyeon & Do); no official code. "
+        "Concern: precomputed-teacher-logits cache slot (SHA-256-keyed). "
+        "Registered FIRST in dispatch_first(provide_teacher_logits) so it "
+        "wins on cache-hit. See module docstring."
+    )
     config_key = "stage5_router_kd.teacher_logits_cache"
     # ``config`` / ``student`` / ``artifacts_dir`` drive the one-time cache
     # load + validation; ``teacher_logits_cache`` is the loaded payload the
@@ -366,7 +400,12 @@ class TeacherLivePlugin:
     """
 
     name = "teacher_live"
-    paper = "Router Knowledge Distillation (paper 2603.02217, Eq. 3)."
+    paper = (
+        "Router KD Eq. 3 — arXiv:2603.02217 (Hyeon & Do); no official code. "
+        "Concern: live teacher forward (optionally 4-bit bnb per §F.3 "
+        "fallback) + vocab-dim guard. Wins dispatch_first when no cache. "
+        "See module docstring."
+    )
     config_key = "stage5_router_kd.teacher_model_repo"
     # The live teacher load reads model/config knobs + the student (for
     # device-map co-location and the vocab/topology guards).
