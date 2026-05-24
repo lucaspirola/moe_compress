@@ -468,19 +468,60 @@ def _stream_cascade_texts(
     return out
 
 
-def _render_messages(messages, tokenizer) -> str | None:
+def _render_messages(
+    messages,
+    tokenizer,
+    *,
+    enable_thinking: bool = False,
+    add_generation_prompt: bool = False,
+) -> str | None:
     """Render a messages list to a string: try apply_chat_template, fall back to
     role/content concat, and return None on failure so the caller's empty-row
-    filter can discard the row."""
+    filter can discard the row.
+
+    Parameters
+    ----------
+    enable_thinking
+        Pass ``enable_thinking=True`` to ``apply_chat_template`` for Qwen3-
+        thinking-style tokenizers. Required for calibration corpora whose
+        assistant content carries ``<think>...</think>`` traces — without this
+        kwarg the templater may strip the thinking block or fail to insert the
+        ``<|im_start|>think\n`` opener. Older tokenizers that don't accept the
+        kwarg raise ``TypeError``; we retry without it so the call still
+        succeeds (the chat template still applies, just without the explicit
+        thinking-mode flag). Default False preserves byte-identical behaviour
+        for all callers that don't opt in.
+    add_generation_prompt
+        When True the template appends the assistant-cursor opener so the
+        returned string ends at the position where the model would START
+        generating. Useful for teacher-trace generation scripts; False (the
+        default) gives the full sequence including the assistant turn(s).
+
+    See ``scripts/build_self_traces_calib.py`` for the canonical caller that
+    needs ``enable_thinking=True`` + ``add_generation_prompt=True`` to elicit
+    the teacher's thinking + answer trace.
+    """
     if not messages:
         return None
     try:
         # Strip here so both paths return consistently trimmed text (the fallback
         # path already strips; keeping both uniform avoids caller-side compensation).
         # Return None (not "") on empty render so both paths share the same sentinel.
-        rendered = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False,
-        ).strip()
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": add_generation_prompt,
+        }
+        if enable_thinking:
+            # Try the kwarg first; older tokenizers raise TypeError on unknown
+            # kwargs — fall back without it so the chat template still applies.
+            try:
+                rendered = tokenizer.apply_chat_template(
+                    messages, enable_thinking=True, **kwargs,
+                ).strip()
+            except TypeError:
+                rendered = tokenizer.apply_chat_template(messages, **kwargs).strip()
+        else:
+            rendered = tokenizer.apply_chat_template(messages, **kwargs).strip()
         return rendered or None
     except Exception as tmpl_exc:                      # noqa: BLE001 — fall back to plain concat
         log.debug("apply_chat_template failed (%s); falling back to plain role/content concat", tmpl_exc)
@@ -1136,4 +1177,160 @@ register_corpus(CorpusAdapter(
     name="qwen3-pretrain-mix",
     parse_yaml=_parse_yaml_qwen3_pretrain_mix,
     stream_texts=_stream_texts_qwen3_pretrain_mix,
+))
+
+
+# ---------------------------------------------------------------------------
+# qwen3-self-traces — thinking-mode self-distillation calibration
+# ---------------------------------------------------------------------------
+#
+# Why this corpus exists
+# ----------------------
+# All other calibration sources (nvidia-cascade, tulu3-sft-mix, c4-math-code,
+# qwen3-pretrain-mix) render the chat template around the OUTER role headers
+# and EOS markers — that's the Gemma 3 QAT rule, and it stops the model from
+# "forgetting how to chat" post-compression. But for Qwen3.6-thinking-mode
+# models, the most reasoning-critical token positions live INSIDE the
+# ``<think>...</think>`` block in the assistant turn — and none of the
+# above sources have ``<think>`` traces in their assistant content. So the
+# routers (Stage 2.5 KD) and merged expert weights (Stage 2 SH heal) are
+# never supervised on the token positions that matter most at serve time.
+#
+# Empirical motivation:
+#  * Project memory ``project_sh_lr_schedule_xd_result`` (2026-05-21):
+#    cross-domain telemetry showed Nemotron-Cascade-only heal moved
+#    Nemotron MSE by ~70% but WikiText MSE by only 5-30%. The local-MSE
+#    objective was Nemotron-specific.
+#  * Same logic applies to thinking-mode: a heal/KD optimized on non-thinking
+#    chat text won't transfer to ``<think>...</think>`` token positions.
+#
+# Schema
+# ------
+# JSONL where each row is one of:
+#  * ``{"messages": [{"role": "user", "content": ...},
+#                    {"role": "assistant", "content": "<think>...</think>final answer"}]}``
+#  * Or any other valid ``messages`` shape that ``apply_chat_template``
+#    accepts; the loader passes ``enable_thinking=True`` so Qwen3-thinking
+#    tokenizers render the trace correctly.
+#
+# How to generate it
+# ------------------
+# See ``max_quality/scripts/build_self_traces_calib.py`` — one-shot script
+# that runs the teacher with ``enable_thinking=True`` over a prompt set and
+# captures the deterministic greedy ``<think>...</think>answer`` traces into
+# the JSONL. Cache lives at
+# ``artifacts/_shared/qwen3_self_traces.jsonl`` by default.
+#
+# YAML
+# ----
+# .. code-block:: yaml
+#
+#     calibration:
+#       source: qwen3-self-traces
+#       seed: 1337
+#       num_sequences: 4000
+#       sequence_length: 2048
+#       jsonl_path: artifacts/_shared/qwen3_self_traces.jsonl   # optional;
+#       # defaults to ``artifacts/_shared/qwen3_self_traces.jsonl`` when
+#       # omitted. Path is folded into ``CalibrationSpec.dataset`` and hashed
+#       # into the cache key so changing the file auto-invalidates the
+#       # calibration cache.
+
+_DEFAULT_SELF_TRACES_PATH = "artifacts/_shared/qwen3_self_traces.jsonl"
+
+
+def _parse_yaml_qwen3_self_traces(
+    cal_cfg: dict, num_sequences: int, sequence_length: int, seed: int,
+) -> CalibrationSpec:
+    jsonl_path = str(cal_cfg.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH))
+    return CalibrationSpec(
+        num_sequences=num_sequences,
+        sequence_length=sequence_length,
+        seed=seed,
+        source="qwen3-self-traces",
+        dataset=jsonl_path,
+    )
+
+
+def _stream_texts_qwen3_self_traces(
+    spec: CalibrationSpec, tokenizer
+) -> list[str]:
+    """Stream rows from the local JSONL produced by build_self_traces_calib.py.
+
+    Each row's ``messages`` list (already containing the teacher's thinking +
+    answer trace in the assistant turn) is rendered through the model's chat
+    template with ``enable_thinking=True`` so the Qwen3-thinking templater
+    keeps the ``<think>...</think>`` markers in the output token stream.
+    """
+    from pathlib import Path
+    import json as _json
+    import random as _random
+
+    path = Path(spec.dataset)
+    if not path.is_absolute():
+        # Resolve relative to the current working directory (matches how the
+        # pipeline driver invokes scripts under the repo root).
+        path = Path.cwd() / path
+    if not path.exists():
+        raise FileNotFoundError(
+            f"qwen3-self-traces: JSONL not found at {path}. Generate it with "
+            "max_quality/scripts/build_self_traces_calib.py before running the "
+            "pipeline with calibration.source=qwen3-self-traces."
+        )
+
+    # Deterministic shuffle by spec.seed so different (stage_key, seed_offset)
+    # combinations draw distinct samples without rewriting the file.
+    rng = _random.Random(spec.seed)
+    out: list[str] = []
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = _json.loads(line)
+            except _json.JSONDecodeError as exc:
+                log.warning("qwen3-self-traces: skipping malformed JSONL line: %s", exc)
+                continue
+            rows.append(row)
+
+    if not rows:
+        raise ValueError(
+            f"qwen3-self-traces: JSONL at {path} contained zero parseable rows."
+        )
+
+    rng.shuffle(rows)
+    # Cap at num_sequences * 4 to bound memory while leaving headroom for
+    # _tokenize_to_fixed_length to discard short rows.
+    cap = max(spec.num_sequences * 4, len(rows))
+    for row in rows[:cap]:
+        messages = row.get("messages")
+        if not messages:
+            continue
+        rendered = _render_messages(
+            messages, tokenizer,
+            enable_thinking=True,
+            add_generation_prompt=False,
+        )
+        if rendered:
+            out.append(rendered)
+
+    log.info(
+        "qwen3-self-traces: %d rendered rows from %s (seed=%d, num_sequences=%d)",
+        len(out), path, spec.seed, spec.num_sequences,
+    )
+    if len(out) < spec.num_sequences:
+        log.warning(
+            "qwen3-self-traces: only %d rows yielded vs %d requested — "
+            "regenerate the JSONL with a larger prompt budget.",
+            len(out), spec.num_sequences,
+        )
+    return out
+
+
+register_corpus(CorpusAdapter(
+    name="qwen3-self-traces",
+    parse_yaml=_parse_yaml_qwen3_self_traces,
+    stream_texts=_stream_texts_qwen3_self_traces,
 ))
