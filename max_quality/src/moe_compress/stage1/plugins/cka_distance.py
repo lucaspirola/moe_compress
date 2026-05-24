@@ -308,7 +308,7 @@ def _cka_distance_matrix(
             li, m_min, m_max, _CKA_M_MIN_VECTORIZED_FLOOR,
         )
         return _cka_distance_matrix_cpu_per_pair(
-            active_indices, active_reprs, active_lengths, n_experts, dist
+            active_indices, active_reprs, n_experts, dist
         )
 
     # ----- GPU vectorized path (uniform m_min over the active set) -----
@@ -330,10 +330,14 @@ def _cka_distance_matrix(
     K = torch.bmm(X, X.transpose(-2, -1))  # [N_active, m_min, m_min]
 
     # Biased HSIC centering: K_c = K - row_mean - col_mean + grand_mean.
-    row_mean = K.mean(dim=2, keepdim=True)            # [N, m, 1]
-    col_mean = K.mean(dim=1, keepdim=True)            # [N, 1, m]
-    grand_mean = K.mean(dim=(1, 2), keepdim=True)     # [N, 1, 1]
-    Kc = K - row_mean - col_mean + grand_mean
+    # Upcast to fp64 for centering accumulators to match the google-research
+    # Demo.ipynb reference (means computed in float64). Result is cast back to
+    # fp32 below for downstream consumers.
+    K64 = K.to(torch.float64)
+    row_mean = K64.mean(dim=2, keepdim=True)            # [N, m, 1]
+    col_mean = K64.mean(dim=1, keepdim=True)            # [N, 1, m]
+    grand_mean = K64.mean(dim=(1, 2), keepdim=True)     # [N, 1, 1]
+    Kc = K64 - row_mean - col_mean + grand_mean
 
     # HSIC matrix H[i,j] = ⟨Kc_i, Kc_j⟩_F = (Kc_flat @ Kc_flat^T)[i,j].
     Kc_flat = Kc.reshape(Kc.shape[0], -1)             # [N, m*m]
@@ -342,7 +346,7 @@ def _cka_distance_matrix(
     # CKA = H[i,j] / sqrt(max(H[i,i], ε) · max(H[j,j], ε)).
     diag = H.diagonal().clamp(min=_CKA_EPSILON)
     norm = torch.sqrt(diag.unsqueeze(0) * diag.unsqueeze(1))
-    CKA = H / norm
+    CKA = (H / norm).to(torch.float32)
     D_active = (1.0 - CKA).clamp(0.0, 1.0)
     D_active.fill_diagonal_(0.0)
 
@@ -356,7 +360,6 @@ def _cka_distance_matrix(
 def _cka_distance_matrix_cpu_per_pair(
     active_indices: list[int],
     active_reprs: list[torch.Tensor],
-    active_lengths: list[int],
     n_experts: int,
     dist: torch.Tensor,
 ) -> torch.Tensor:
@@ -368,11 +371,11 @@ def _cka_distance_matrix_cpu_per_pair(
     for ii in range(n_active):
         ei = active_indices[ii]
         Xi = active_reprs[ii]
-        mi = active_lengths[ii]
+        mi = Xi.shape[0]
         for jj in range(ii + 1, n_active):
             ej = active_indices[jj]
             Xj = active_reprs[jj]
-            mj = active_lengths[jj]
+            mj = Xj.shape[0]
             m_common = min(mi, mj)
             if m_common <= 1:
                 # H=0 → CKA undefined → maximum distance.
@@ -389,9 +392,11 @@ def _cka_distance_matrix_cpu_per_pair(
             else:
                 Xj_c = Xj
             # Biased HSIC centering (Gretton 2005), identical to the GPU path.
-            Ki_raw = Xi_c @ Xi_c.T
+            # Upcast to fp64 for centering accumulators to match the
+            # google-research Demo.ipynb reference (means computed in float64).
+            Ki_raw = (Xi_c @ Xi_c.T).to(torch.float64)
             Ki = Ki_raw - Ki_raw.mean(dim=1, keepdim=True) - Ki_raw.mean(dim=0, keepdim=True) + Ki_raw.mean()
-            Kj_raw = Xj_c @ Xj_c.T
+            Kj_raw = (Xj_c @ Xj_c.T).to(torch.float64)
             Kj = Kj_raw - Kj_raw.mean(dim=1, keepdim=True) - Kj_raw.mean(dim=0, keepdim=True) + Kj_raw.mean()
             hsic_ij = float((Ki * Kj).sum().item())
             hsic_ii = float((Ki * Ki).sum().item())
