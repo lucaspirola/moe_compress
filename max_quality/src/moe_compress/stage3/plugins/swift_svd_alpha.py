@@ -1,7 +1,91 @@
-"""Swift-SVD+ α-search (S3-4 of the Stage 3 plugin-architecture refactor).
+"""Swift-SVD+ α-selection + per-expert rank redistribution.
 
-Home of the Swift-SVD+ α-selection and rank-redistribution logic relocated
-VERBATIM from the legacy ``stage3_svd.py`` monolith:
+Paper
+-----
+"Swift-SVD: Singular-Value Decomposition with Energy-Aware
+Layer-wise Pruning" — arXiv:2604.01609 §3.2.2 + Algorithm 2.
+audit/spec_compliance/01_papers/2604.01609/source.md.
+
+Selects the global blending coefficient ``α ∈ [0, 1]`` for the
+per-expert rank redistribution score
+``s_i = β_i^α · (log(e + ε*_i))^(1 − α)``, then redistributes ranks
+within each ``(layer, matrix-type)`` group budget-conservingly.
+
+Paper §3.2.2 selects a single ``α`` via end-to-end WikiText-2 PPL
+validation. ε* is the truncation-error term (paper Eq. 4); β is the
+per-layer importance term (paper Algorithm 2).
+
+Official code
+-------------
+``sramshetty/ShortGPT`` @ commit
+``78d9615fdcae6d90368832bd0a86c49c323549b9`` (2024-04-29) —
+github.com/sramshetty/ShortGPT. The Swift-SVD paper's source.md
+references this fork as the reference implementation; the project's
+implementation is structurally similar (validation-driven α search +
+rank redistribution).
+
+Deviation: D8 — Swift-SVD β adapted for MoE
+-------------------------------------------
+Paper Algorithm 2 defines β = end-to-end layer importance,
+min-max-normalized to ``[1, 2]``. This plugin uses β = **per-expert
+spectral energy share** ``σ_i² / Σ σ_j²`` in range ``(0, 1]``.
+
+The range difference changes blending behavior: paper's β ∈ [1, 2]
+means ``β^α`` always **amplifies**; the project's β ∈ (0, 1] can
+**suppress** low-energy experts. This is intentional — per-expert
+spectral energy within a group is the natural adaptation of per-layer
+importance for MoE expert redistribution. ε* is now activation-weighted
+via Stage 2 A-covariance (no longer a deviation in its own right;
+absorbed into D-eps-star below).
+
+Deviation: D-eps-star — Swift-SVD ε* normalization
+--------------------------------------------------
+Paper Eq. 4 defines ``ε*_k = (Σ_{j > k} σ_j²)^{1/2}`` — absolute
+truncation error. This plugin uses
+
+    ε*_i = √(Σ_{j > k̄} σ̃_j² / Σ_j σ̃_j²)
+
+— a **relative ratio** normalized by total spectral energy. The
+normalization makes ε* scale-invariant across experts with different
+total spectral energy, enabling meaningful cross-expert comparison
+within the redistribution step. The ``log()`` in the blending score
+damps large outliers regardless.
+
+Additionally: ``σ̃_j = sv(A^{1/2} · W)``, not ``sv(W · A^{1/2})`` —
+``A^{1/2}`` left-multiplies ``W`` to match the activation-weighted
+output error ``‖XW − XW_k‖_F``.
+
+Deviation: D-per-type-alpha — per-projection-type α refinement (opt-in)
+-----------------------------------------------------------------------
+Paper §3.2.2 selects a single global α via end-to-end WikiText-2 PPL
+validation; the chosen α is used for every projection.
+
+When ``swift_svd_plus.per_group_type: true`` (production default),
+this plugin first runs the **paper-exact validation search** to pick
+``best_global_alpha``, then runs a **per-projection-type
+spectral-proxy refinement** (``_swift_svd_plus_alpha_search``) seeded
+from that global α. The final factoring uses the per-type
+``alpha_by_type`` map, NOT the validation-winning global α directly.
+
+Rationale: project extension. Paper's single-α assumption pools
+gate/up/down into one allocation regime; per-type allows the
+gate-vs-up-vs-down spectral asymmetry (separately documented as the
+per-projection bias multipliers in
+:mod:`stage3.plugins.d_rank_allocate`, D7a) to also influence
+redistribution. The seed from global validation keeps the search
+anchored near the paper-compliant region; the per-type refinement is
+bounded by the spectral proxy (cheap, no model forward). Disable by
+setting ``per_group_type: false`` to restore strict paper compliance
+— operator choice, opt-in.
+
+Naming-history note
+-------------------
+"Phase D" (legacy Stage 3 monolith terminology) is naming-historical.
+The current plugin architecture has no phase taxonomy; new prose
+drops the labels. Existing log lines / Trackio keys preserved for
+dashboard back-compat.
+
+Tool inventory (relocated verbatim):
 
 * ``_snapshot_originals`` — CPU snapshot of all expert weights (shared by the
   validation α search and Stage 4 EoRA residuals);
@@ -714,8 +798,14 @@ class SwiftSvdAlphaPlugin:
 
     name = "swift_svd_alpha"
     paper = (
-        "Swift-SVD+ α selection — blending score s_i = β_i^α · "
-        "(log(e + ε*_i))^(1−α) (paper 2604.01609, §3.2.2 / Algorithm 2)."
+        "Swift-SVD+ α-selection — arXiv:2604.01609 §3.2.2 / Algorithm 2. "
+        "Reference code: sramshetty/ShortGPT @ "
+        "78d9615fdcae6d90368832bd0a86c49c323549b9. "
+        "Deviations: D8 (β = per-expert spectral energy in (0,1] vs "
+        "paper β ∈ [1,2]), D-eps-star (ε* relative ratio + A^{1/2}·W "
+        "left-multiplication), D-per-type-alpha (opt-in per-projection "
+        "spectral-proxy refinement seeded from paper-exact global α). "
+        "See module docstring."
     )
     config_key = "stage3_svd.swift_svd_plus.alpha_grid"
     reads: tuple[str, ...] = (
