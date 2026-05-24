@@ -93,7 +93,14 @@ def _populated_ctx(
 def test_plugin_protocol_attributes():
     p = SinkTokenDetectorPlugin()
     assert p.name == "sink_token"
-    assert p.paper.startswith("Sink-token")
+    # `paper` must cite arXiv:2507.23279 (sink-token Figures 6 / 20 / 21
+    # are the structural-signature observation) AND the golden official-code
+    # commit (ZunhaiSu/Super-Experts-Profilling @
+    # 573aead3127ae593ba267758b832944f8fed1485) — the detection criterion
+    # itself is project-original (deviation D-sink-token-routing).
+    assert "arXiv:2507.23279" in p.paper
+    assert "573aead3127ae593ba267758b832944f8fed1485" in p.paper
+    assert "D-sink-token-routing" in p.paper
     assert p.config_key == "stage1_grape.super_expert_detection.sink_token_enabled"
     assert p.reads == (
         "moe_layers",
