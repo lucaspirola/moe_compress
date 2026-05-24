@@ -3,26 +3,41 @@
 Paper
 -----
 Liu et al., "AIMER: Calibration-Free Task-Agnostic MoE Pruning",
-arXiv:2603.18492 (2026). Acronym expansion (paper Eq. 1-2 + abstract):
+arXiv:2603.18492 (2026). Acronym expansion (paper title + Section 3):
 **AIMER = Absolute mean over root mean square IMportance for Expert
 Ranking.**
 
-Paper Equation 4 defines the AIMER score for an expert whose
-gate+up+down weights are flattened and concatenated into a single
-vector ``w ∈ ℝ^N`` (with ``N = N_gate + N_up + N_down``):
+Paper Section 3 defines the AIMER score in two equivalent forms.
+Equation (4) writes it as a ratio of aggregates over the three
+projection matrices of one expert (with ``W_gate, W_up ∈ ℝ^{m×d}``
+and ``W_down ∈ ℝ^{d×m}``)::
 
-    AIMER(w) = ‖w‖₁ / (√N · ‖w‖₂)         (Eq. 4)
+    N = N_gate + N_up + N_down
+    P = ‖W_gate‖₁ + ‖W_up‖₁ + ‖W_down‖₁          (paper Eq. 3)
+    Q = ‖W_gate‖²_F + ‖W_up‖²_F + ‖W_down‖²_F
 
-Equivalently the ratio of the absolute mean ``‖w‖₁ / N`` to the
-root-mean-square ``‖w‖₂ / √N``. The score is in ``(0, 1]``:
+    AIMER = (P / N) / sqrt(Q / N) = P / sqrt(N · Q)   (paper Eq. 4)
 
-    upper bound 1.0 — all entries equal magnitude (most distributed)
+Equation (5) is the algebraically equivalent vector form, obtained
+by flattening and concatenating the three projection matrices into a
+single vector ``w ∈ ℝ^N``::
+
+    AIMER(w) = ‖w‖₁ / (√N · ‖w‖₂)                    (paper Eq. 5)
+
+i.e. the ratio of the absolute mean ``‖w‖₁ / N`` to the
+root-mean-square ``‖w‖₂ / √N``. Paper Eq. (7) gives the bounds
+``1/√N ≤ AIMER(w) ≤ 1``:
+
+    upper bound 1.0  — all entries equal magnitude (most distributed)
     lower bound 1/√N — single non-zero entry (most concentrated)
 
-Paper Algorithm 1 (pyhton-style pseudocode, source PDF lines 414-430)
-implements the score per expert by summing the abs / square reductions
-over all three projections, then taking the ratio. **The paper uses
-AIMER as a PRUNING criterion**: "we prune experts with larger AIMER
+Paper Algorithm 1 ("PyTorch-style expert ranking with AIMER", page 5
+of the arXiv PDF) implements the score per expert by summing the abs /
+square reductions over all three projections, then taking the ratio,
+and ranks ``torch.sort(scores, descending=True)`` so the
+HIGHEST-score (most-distributed) experts come first. **The paper
+uses AIMER as a PRUNING criterion**: the sentence immediately
+following Eq. (4) reads "and we prune experts with larger AIMER
 scores" (most-distributed = lowest information density = safe to
 remove).
 
@@ -30,7 +45,17 @@ Official implementation (golden reference)
 ------------------------------------------
 ``github.com/ZongfangLiu/AIMER`` pinned to commit
 ``fcf8e28f9253810bb117bc3a57c65e98780f4706`` (default branch HEAD,
-dated 2026-03-23).
+``pushed_at`` = 2026-03-23). The reference scoring is in
+``src/calib_free_prune.py::_aimer_scores_and_rank`` at that SHA
+(verified by raw-blob fetch). The reference formula expands to::
+
+    abs_sum = gate.abs().sum() + up.abs().sum() + down.abs().sum()
+    numel   = gate.numel()    + up.numel()    + down.numel()
+    l2_sq   = gate.square().sum() + up.square().sum() + down.square().sum()
+    score   = (abs_sum / numel) / torch.sqrt(l2_sq / numel)
+
+which is algebraically identical to Eq. (4)/(5) and to the project's
+``utils.aimer.aimer_score_tensor`` (``l1 / (sqrt(n) * l2)``).
 
 Two deliberate project deviations from the paper
 ------------------------------------------------
@@ -38,10 +63,10 @@ Two deliberate project deviations from the paper
 gate+up+down** (paper).
 
 The shared scoring utility ``utils.aimer.aimer_score_tensor(w)``
-applies Eq. 4 to whatever tensor ``w`` it receives — the FORMULA is
+applies Eq. (5) to whatever tensor ``w`` it receives — the FORMULA is
 paper-exact. This plugin then calls it with **only** the expert's
-``down_proj`` weight tensor (see ``aimer.py`` line ~155:
-``aimer_score_tensor(_get_expert_down_proj_weight(ref, e))``),
+``down_proj`` weight tensor (see :meth:`AimerDetectorPlugin.run` —
+``aimer_scores[(ref.layer_idx, e)] = aimer_score_tensor(w_down)``),
 **not** the gate+up+down concatenation Algorithm 1 prescribes.
 
 Rationale (introduced in commit ``507a979`` "feat(stage1): AIMER
@@ -169,10 +194,13 @@ class AimerDetectorPlugin:
     paper: str = (
         "Liu et al., 'AIMER: Calibration-Free Task-Agnostic MoE Pruning' "
         "(arXiv:2603.18492, 2026). Acronym = Absolute mean over root mean "
-        "square IMportance for Expert Ranking; Eq. 4: "
-        "AIMER(w) = ‖w‖₁ / (√N · ‖w‖₂). Official code: "
-        "github.com/ZongfangLiu/AIMER @ commit "
-        "fcf8e28f9253810bb117bc3a57c65e98780f4706 (2026-03-23). "
+        "square IMportance for Expert Ranking; paper Eq. (4) "
+        "AIMER = P / sqrt(N·Q) over the three projections (Eq. 3 defines "
+        "N, P, Q), equivalent to the vector form Eq. (5) "
+        "AIMER(w) = ‖w‖₁ / (√N · ‖w‖₂) on the flattened concatenation. "
+        "Official code: github.com/ZongfangLiu/AIMER @ commit "
+        "fcf8e28f9253810bb117bc3a57c65e98780f4706 (pushed 2026-03-23) — "
+        "reference scoring in src/calib_free_prune.py::_aimer_scores_and_rank. "
         "Two project deviations from the paper: (1) score computed on "
         "down_proj weights only (paper Algorithm 1 concatenates "
         "gate+up+down) — narrows AIMER to the SE structural signature; "
@@ -339,7 +367,7 @@ class AimerDetectorPlugin:
 # ---------------------------------------------------------------------------
 # Per-expert weight accessor (moved verbatim from the legacy Stage 1 module
 # in sub-task 6). Sole caller is :class:`AimerDetectorPlugin.run`. Handles
-# four expert-layout variants:
+# five expert-layout variants:
 #  1. Per-expert ModuleList (legacy) — ``experts[e].down_proj.weight``.
 #  2. Fused stacked nn.Parameter — ``experts.down_proj[e]`` of shape
 #     ``(num_routed_experts, d_hid, d_int)``.
