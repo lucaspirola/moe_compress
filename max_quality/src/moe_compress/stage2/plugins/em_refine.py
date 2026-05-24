@@ -4,7 +4,7 @@ Paper
 -----
 Inspiration: Sub-MoE (arXiv:2506.23266) demonstrates iterative
 refinement of K-means-style expert merging by re-running assignment
-after each tentative merge. This plugin applies the same idea to
+after each tentative merge. This plugin adapts that idea to
 **capacitated assignment** (the Stage 2 v2 cost-matrix machinery).
 
 Baseline REAM (arXiv:2604.04356) and the alternative single-shot
@@ -42,51 +42,54 @@ The merge formula is non-linear in inputs but linear in weights:
 merge, the centroid's weights are no longer the original — a new
 assignment under the new centroid weights may produce a lower-cost
 matching. Sub-MoE demonstrates this iterative refinement on K-means-
-style merging; the Stage 2 v2 EM round is the same idea applied to
-capacitated assignment.
+style merging; the Stage 2 v2 EM round adapts it to the freq-weighted
+merge formula used by capacitated assignment.
 
 Cache invariant: the cached perm becomes stale under tentative
 weights, so the inner cost recomputes the perm; the cache is **not**
 updated with tentative residuals so the merge step's perm-cache reuse
-is preserved.
-
-Wiring
-------
-``EmRefinePlugin`` is LIVE as of S2-9: it is the second link of the
-``refine_assignment`` slot chain, AFTER two_opt_refine.
-
-Circular-import note: this module imports only ``pipeline.base``,
-``pipeline.context``, ``pipeline.permutation_align``,
-``pipeline.grouping``, ``pipeline.plugins.solver_dispatch``,
-``pipeline.plugins.ream_cost`` and ``moe_compress.utils.*`` — none of
-which import ``stage2_reap_ream`` or ``em_refine``. There is therefore
-no cycle at module load, and every import below is a plain module-top
-import (no function-scope late imports needed).
-
-Naming-history note
--------------------
-"M4" is the STRATEGY_NEXT § 5 step 4T(e) label. The current plugin
-architecture has no module-letter taxonomy; new prose drops the label.
-Existing log lines / Trackio keys preserved for dashboard back-compat.
+is preserved. Inside ``_em_compute_tentative_weights`` we also skip
+cache reads after round 0 — see HIGH-1 fix in audit history — because
+the cached perm was aligned against the *original* centroid weights,
+which have drifted under prior EM rounds.
 
 EM is an iterative re-assignment refiner: each round rebuilds the current
 groups, computes tentative freq-weighted merged centroid weights, recomputes
 the post-alignment cost matrix against those tentative centroids, re-solves the
 assignment, and (optionally) breaks on convergence.
 
+Wiring
+------
+``EmRefinePlugin`` is LIVE as of S2-9: it is the second link of the
+``refine_assignment`` slot chain (two-opt THEN EM), registered after
+``TwoOptRefinePlugin`` and ahead of the dead-fallback ``LegacyAdapter``.
+
 Circular-import note: this module imports only ``pipeline.base``,
 ``pipeline.context``, ``pipeline.permutation_align``, ``pipeline.grouping``,
 ``pipeline.plugins.solver_dispatch``, ``pipeline.plugins.ream_cost`` and
 ``moe_compress.utils.*`` — none of which import ``stage2_reap_ream`` or
-``em_refine``. There is therefore no cycle at module load, and every import
-below is a plain module-top import (no function-scope late imports needed).
+``em_refine``. There is therefore no cycle at module load, and every
+import below is a plain module-top import (no function-scope late imports
+needed).
 
-``EmRefinePlugin`` is LIVE as of S2-9: it is the second link of the
-``refine_assignment`` chain (two-opt THEN EM), registered after
-``TwoOptRefinePlugin`` and ahead of the dead-fallback ``LegacyAdapter``.
+Naming-history note
+-------------------
+The historical "M4" / step-4T(e) labels (STRATEGY_NEXT § 5) are no longer
+used in prose; the current plugin architecture has no module-letter
+taxonomy. Existing log lines and Trackio keys preserve those identifiers
+for dashboard back-compat.
+
+Convergence criterion
+---------------------
+Early-exit uses strict assignment equality (``new_assignment ==
+assignment``). With Sinkhorn solvers a single low-confidence flip can
+prevent termination; a Hamming-distance tolerance would be a natural
+future-work knob (see MEDIUM-2 in audit history). Kept strict today to
+preserve byte-identical determinism with the greedy solver.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -109,6 +112,13 @@ from .solver_dispatch import (
     _assign_children_to_centroids,
 )
 
+log = logging.getLogger(__name__)
+
+# Per-layer set of layer_idx values for which we have already emitted the
+# all-zero-freq fallback warning. Module-global because the warning is a
+# one-shot diagnostic (LOW-3), not a per-call counter.
+_ZERO_FREQ_WARNED: set[int] = set()
+
 
 def _em_compute_tentative_weights(
     layer_ref: MoELayerRef,
@@ -116,6 +126,7 @@ def _em_compute_tentative_weights(
     freq: dict[int, int],
     ream_acc: ReamCostAccumulator | None,
     perm_cache: "_PermAlignCache | None",
+    em_round: int = 0,
 ) -> dict[int, dict[str, torch.Tensor]]:
     """Compute the tentative freq-weighted merged centroid weights for every
     non-singleton group, WITHOUT mutating the bank.
@@ -123,12 +134,20 @@ def _em_compute_tentative_weights(
     For each centroid c with members [c, m1, m2, ...]:
         W_c_tentative = Σ (freq_e / Σ freq) · perm_e(W_e)
 
-    Permutations come from ``perm_cache`` if available; otherwise computed
-    fresh via ``_permutation_align_to_centroid`` (the centroid contributes
-    with identity permutation).
+    Permutations come from ``perm_cache`` ONLY on round 0; after round 0 the
+    centroid's weights have drifted under prior tentative merges, so the
+    cached perm (keyed on the *original* centroid) is stale (HIGH-1 fix).
+    From round 1 onward we always recompute the perm against the just-
+    refreshed centroid weights via ``_permutation_align_to_centroid``. The
+    centroid itself always contributes with identity permutation.
 
-    Used by EM refinement (spec § 5 step 4T(e)) to recompute the cost matrix
-    against the tentative merged centroid before reassigning.
+    Used by EM refinement to recompute the cost matrix against the tentative
+    merged centroid before reassigning.
+
+    Memory note (LOW-4): we materialize FP32 copies of gate/up/down per
+    member per round. The accumulator is kept in FP32 and each contribution
+    is cast on add; we deliberately do not pre-allocate a per-name FP32
+    buffer because ``banks[name].get(m)`` may return a view we must not alias.
     """
     li = layer_ref.layer_idx
     banks = build_banks(layer_ref)
@@ -140,6 +159,14 @@ def _em_compute_tentative_weights(
 
         weights = np.array([max(freq.get(m, 0), 0) for m in members], dtype=np.float64)
         if weights.sum() <= 0.0:
+            # LOW-3: surface the degenerate all-zero-freq case once per layer.
+            if li not in _ZERO_FREQ_WARNED:
+                log.warning(
+                    "em_refine: layer %d centroid %d has all-zero freq across "
+                    "members %s — falling back to uniform tentative weights.",
+                    li, centroid, list(members),
+                )
+                _ZERO_FREQ_WARNED.add(li)
             weights[:] = 1.0
         weights /= weights.sum()
 
@@ -156,9 +183,12 @@ def _em_compute_tentative_weights(
             if m == centroid:
                 perm = None
             else:
+                # HIGH-1: only trust the perm cache on round 0; after that
+                # the cached perm aligns against the *original* centroid,
+                # not the drifted tentative centroid.
                 cached = (
                     perm_cache.get((li, centroid, m))
-                    if perm_cache is not None
+                    if perm_cache is not None and em_round == 0
                     else None
                 )
                 if cached is not None:
@@ -178,7 +208,9 @@ def _em_compute_tentative_weights(
                     Wm = bank.get(m).to(torch.float32)
                 if perm is not None:
                     Wm = Wm[perm, :] if name in ("gate_proj", "up_proj") else Wm[:, perm]
-                accs[name] = Wm * w if accs[name] is None else accs[name] + Wm * w
+                # Cast on add: keep accumulator in FP32, add the FP32-cast contribution.
+                contribution = (Wm * w).to(torch.float32)
+                accs[name] = contribution if accs[name] is None else accs[name] + contribution
 
         out[centroid] = {name: accs[name] for name in banks}
 
@@ -210,12 +242,13 @@ def _em_refine_assignment(
     sinkhorn_iters: int = 200,
     skip_merge_percentile: float = 100.0,
 ) -> tuple[list[int], np.ndarray, int]:
-    """EM refinement loop (spec § 5 step 4T(e) / M4).
+    """EM refinement loop.
 
     For each round r in 1..em_rounds:
       1. Build current groups from ``assignment``.
       2. Compute tentative merged centroid weights (freq-weighted average of
-         current group members, using cached perms where available).
+         current group members). On round 0 cached perms are reused; after
+         round 0 perms are recomputed against the drifted centroid (HIGH-1).
       3. Recompute the cost matrix with the tentative centroids substituted.
       4. Re-solve the assignment.
       5. If ``em_break`` and the new assignment equals the old, stop early.
@@ -229,10 +262,17 @@ def _em_refine_assignment(
         on centroid weights, so a tentative merge does not change the cost
         matrix and the assignment cannot improve).
       - ``cost_alignment == "output"`` — the output-space cost *does* depend on
-        the (tentative) centroid weights, so EM would be meaningful here; it is
-        deferred only because ``_em_refine_assignment`` does not thread the
-        per-layer ``layer_inputs`` calibration tensors that ``_output_space_cost``
-        needs. See the TODO at the cost-matrix recompute below.
+        the (tentative) centroid weights, so EM would be meaningful here; it
+        is deferred only because ``_em_refine_assignment`` does not thread the
+        per-layer ``layer_inputs`` calibration tensors that
+        ``_output_space_cost`` needs.
+
+    Convergence: the strict ``new_assignment == assignment`` check at the
+    bottom of the loop can fail to terminate under Sinkhorn when a single
+    low-confidence assignment flips back and forth. A Hamming-tolerance
+    fallback is future-work (MEDIUM-2 in audit history); the strict check is
+    retained today to preserve byte-identical determinism with the greedy
+    solver.
     """
     if em_rounds <= 0 or cost_alignment != "post":
         return initial_assignment, initial_delta, 0
@@ -248,7 +288,7 @@ def _em_refine_assignment(
             assignment, ream_centroid_ids, ream_noncentroid_ids,
         )
         tentative = _em_compute_tentative_weights(
-            layer_ref, grouped, freq, ream_acc, perm_cache,
+            layer_ref, grouped, freq, ream_acc, perm_cache, em_round=r,
         )
         if not tentative:
             # No non-singleton groups → tentative is identical to original →
@@ -263,12 +303,9 @@ def _em_refine_assignment(
             cost_whitening=cost_whitening,
             cost_asymmetric=cost_asymmetric,
             cost_topk_filter=cost_topk_filter,
-            # freq is also needed by the "output" cost (freq-weighted tentative
-            # merge), not just the asymmetric "post" cost — keep consistent with
-            # the main _ream_cost_matrix call site. TODO: admitting "output" to
-            # the EM guard above additionally requires threading layer_inputs
-            # here so _output_space_cost has its calibration tokens.
-            freq=freq if (cost_asymmetric or cost_alignment == "output") else None,
+            # LOW-1: the EM guard above forces cost_alignment == "post", so
+            # only the cost_asymmetric branch can require freq here.
+            freq=freq if cost_asymmetric else None,
             cov_acc=cov_acc,
             perm_cache=perm_cache,
             tentative_centroid_weights=tentative,
@@ -297,7 +334,7 @@ def _em_refine_assignment(
 
 
 class EmRefinePlugin:
-    """Plugin home for Stage 2 v2 EM refinement (spec § 5 step 4T(e) / M4).
+    """Plugin home for Stage 2 v2 EM refinement.
 
     LIVE as of S2-9: the second link of the ``refine_assignment`` chain
     (two-opt THEN EM). The orchestrator's ``_run_assignment`` calls this
@@ -313,12 +350,14 @@ class EmRefinePlugin:
         "EM-style iterative re-assignment under tentative merges. "
         "Inspired by Sub-MoE arXiv:2506.23266 (no official code). "
         "Deviation D-em-refinement vs baseline REAM arXiv:2604.04356 "
-        "(single-shot). STRATEGY_NEXT § 5 step 4T(e) / M4. "
-        "See module docstring."
+        "(single-shot). See module docstring."
     )
     config_key = "stage2_reap_ream.em_refinement_rounds"
     # S2-9: the live refine_assignment slot reads the per-bump scratch slots
     # the orchestrator publishes plus the per-layer cost-alignment slots.
+    # NITPICK-3: ``_iter_*`` keys are per-bump scratch slots the orchestrator
+    # publishes once per inner loop iteration; the un-prefixed keys are
+    # per-layer slots that outlive a single bump. Both flavours appear here.
     reads: tuple[str, ...] = (
         "layer_ref", "ream_acc", "perm_cache", "freq", "protected",
         "_iter_ream_centroid_ids", "_iter_ream_noncentroid_ids",
@@ -404,6 +443,11 @@ class EmRefinePlugin:
             ream_noncentroid_ids=ream_noncentroid_ids,
             perm_cache=perm_cache,
             ream_acc=ream_acc,
+            # LOW-2: ``_em_refine_assignment`` early-returns when
+            # cost_alignment != "post", so the cov_acc selection is read only
+            # in the post branch. The conditional is preserved purely for
+            # readability of intent ("cov_acc is a post-only knob"); it has no
+            # behavioural effect for the other alignments.
             cov_acc=self.cov_acc if effective_cost_alignment == "post" else None,
             freq=freq,
             max_group_cap=self.max_group_cap,
