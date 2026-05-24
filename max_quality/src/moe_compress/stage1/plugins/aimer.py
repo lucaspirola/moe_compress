@@ -77,7 +77,7 @@ have been missed by the residual-stream-based detector)". Restricting
 to ``down_proj`` aligns AIMER with the Super Experts paper's
 formulation, where SE-defining magnitudes are measured on the
 ``down_proj`` output (arXiv:2507.23279 Algorithm 1 line 19 —
-``a_{l,e} = max|h_{l,e}(x) · W^{l,e}_{down_proj}|``). Cross-projection
+``a_{l,e} = max_{x∈D} |h_{l,e}(x) · W^{l,e}_{down_proj}|``). Cross-projection
 mixing was judged less informative for SE-detection than for the
 paper's task-agnostic pruning use case.
 
@@ -195,8 +195,9 @@ class AimerDetectorPlugin:
         "Liu et al., 'AIMER: Calibration-Free Task-Agnostic MoE Pruning' "
         "(arXiv:2603.18492, 2026). Acronym = Absolute mean over root mean "
         "square IMportance for Expert Ranking; paper Eq. (4) "
-        "AIMER = P / sqrt(N·Q) over the three projections (Eq. 3 defines "
-        "N, P, Q), equivalent to the vector form Eq. (5) "
+        "AIMER = P / sqrt(N·Q) over the three projections (Eq. 3 labels "
+        "the P row of the (N, P, Q) definition block), equivalent to the "
+        "vector form Eq. (5) "
         "AIMER(w) = ‖w‖₁ / (√N · ‖w‖₂) on the flattened concatenation. "
         "Official code: github.com/ZongfangLiu/AIMER @ commit "
         "fcf8e28f9253810bb117bc3a57c65e98780f4706 (pushed 2026-03-23) — "
