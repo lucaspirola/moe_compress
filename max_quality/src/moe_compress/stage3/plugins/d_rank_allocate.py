@@ -1,7 +1,110 @@
-"""D-Rank rank allocation (S3-3 of the Stage 3 plugin-architecture refactor).
+"""D-Rank effective-rank budget allocation (Eq. 1 + Eq. 7).
 
-Home of the D-Rank effective-rank allocation logic relocated VERBATIM from
-the legacy ``stage3_svd.py`` monolith:
+Paper
+-----
+Mi, Sun et al., "Layer-wise Dynamic Rank for Compressing Large Language
+Models" (D-Rank) — arXiv:2509.25622.
+audit/spec_compliance/01_papers/2509.25622/source.md.
+
+Equation 1 (FP64 Cholesky whitening): the effective rank for a group
+``g`` is computed from the SVD of ``S_g · W_g`` (whitened) where
+``S_g = Cholesky(X_g^T X_g)`` is the input-activation Cholesky factor.
+
+Equation 7 (rank budget): ``ω = d₁ + n · d₂`` (where ``d₁`` is the
+shared dimension across layers in the group and ``d₂`` the
+non-shared dimension; the paper formulation targets shared-basis
+layer groups).
+
+This plugin's responsibilities:
+- ``_group_stat`` (and its ``_pad`` helper) — computes per-(layer,
+  matrix-type) group statistics: whitened SVD via fp64 Cholesky, the
+  effective-rank vector, and ``ω``.
+- ``_compute_T_budget`` — solves the global rank budget ``T_budget``
+  from the target SVD rank ratio.
+- ``_d_rank_allocate`` — distributes ``T_budget`` across all
+  ``(layer, matrix-type)`` groups, with optional per-projection-weight
+  biasing (see deviation D7a below).
+
+Official code
+-------------
+None published — the D-Rank paper (arXiv:2509.25622, source.md) does
+not link to a code repository, and a GitHub search of the first
+author's profile (Zhendong Mi, Stevens Institute) returned no D-Rank
+repo at retirement time (verified 2026-05). The Eq. 1 + Eq. 7
+implementation here is project-original following the paper text.
+
+Deviation: D7 — ω adapted for MoE
+---------------------------------
+Paper Eq. 7 is ``ω = d₁ + n · d₂``: ``n`` is the number of layers
+sharing a basis, ``d₁`` is the shared dimension, ``d₂`` the
+non-shared dimension. D-Rank targets shared-basis layer groups.
+
+This plugin adapts ``ω`` for MoE expert groups:
+``ω = n_experts × (d_out + d_in)`` — every expert contributes a full
+``d_out × d_in`` parameter slab; ``n`` becomes the number of experts
+in the group, ``d_out + d_in`` becomes the per-expert per-matrix
+parameter cost.
+
+Deviation: D7a — per-projection rank bias + ``k̄`` semantics for ε*
+------------------------------------------------------------------
+Paper Eq. 7 produces a single ``k_g`` per ``(layer, matrix_type)``
+group; no per-projection-type multiplier. Swift-SVD
+(arXiv:2604.01609) defines ``k̄ = (m·n)/(m+n)·ρ`` as the plain uniform
+rank entering ε*.
+
+This plugin scales group ranks from Eq. 7 by per-projection
+multipliers ``(gate = 1.33, up = 0.67, down = 1.0)`` (sum = 3.0; the
+multipliers are approximately parameter-budget-preserving — exactly
+preserved when gate/up/down receive the same ``k_g`` AND share the
+same ``ω_g``, which holds under SwiGLU symmetry where gate/up have
+identical input dimensions; in the general case, the multipliers
+redistribute rank between projection types and may shift the
+post-bias parameter total by a few percent) before per-expert
+redistribution. The bias-adjusted ``k̄`` also flows into the
+Swift-SVD ε* computation (see :mod:`stage3.plugins.swift_svd_alpha`).
+
+Rationale: adapted from jangq's GGUF bit-allocation insight
+(``gate:up:down ≈ 4:2:3`` — see project ``397B-MLP-ASYMMETRY.md``
+§3.1). SwiGLU forward couples gate errors multiplicatively via SiLU,
+while down errors propagate to the residual stream. The ratio
+translates the same physical asymmetry from bit space to rank space.
+(*TODO: empirical re-tune from clean per-projection ``recon_rel_err``
+once Stage 6 evals are available; current values inherited unchanged
+from a prior bf16-bug-tainted run and are theoretically- (not
+empirically-) grounded.*)
+
+Deviation: D-drank-premerge-A — Stage 2 A-covariance reuse
+----------------------------------------------------------
+Paper §3.2.1 assumes the whitening factor ``S_g`` is computed from
+activations of the model being compressed (post-merge for this
+pipeline). This plugin uses ``A_gate_up`` and ``A_down`` from Stage 2's
+``_stage2_input_covariance.pt``, collected during Stage 2 calibration
+on the **pre-merge** expert population. After REAM merging, the
+surviving experts produce slightly different intermediate activations
+than the pre-merge experts they replaced; the down_proj input
+distribution shift is the larger of the two.
+
+Rationale: project-pragmatic. Re-running a Stage 3-specific
+calibration pass to collect post-merge A would cost a full
+teacher+student forward and ~140 GB of new covariance on disk, with
+marginal expected impact: REAM's frequency-weighted merge (REAM Eq. 6)
+preserves expected activations by construction, so the pre/post-merge
+A on a per-(layer, matrix-type) average basis is close to identity
+under expected-merge invariance. Stage 4's EoRA residual compensation
+(see :mod:`stage4.plugins.eora_compensation`, paper 2410.21271) absorbs
+any residual whitening mismatch via the activation-aware √Λ projection
+on the **post-merge** Stage 4 covariance reuse. Trade-off accepted;
+revisit if Stage 6 PPL regresses unexpectedly on a future architecture
+port.
+
+Naming-history note
+-------------------
+"Phase B" (legacy Stage 3 monolith terminology) is naming-historical.
+The current plugin architecture has no phase taxonomy; new prose
+drops the labels. Existing log lines / Trackio keys preserved for
+dashboard back-compat.
+
+Tool inventory (relocated verbatim):
 
 * ``_GroupStats`` — the ``@dataclass`` holding per-(layer, matrix) group stats;
 * ``_group_stat`` — computes per-group statistics (whitened SVD, effective
@@ -216,7 +319,14 @@ class DRankAllocatePlugin:
     """
 
     name = "d_rank_allocate"
-    paper = "D-Rank effective-rank allocation (paper 2509.25622, Eq. 1)."
+    paper = (
+        "D-Rank effective-rank allocation Eqs. 1 + 7 — arXiv:2509.25622 "
+        "(Mi, Sun et al.). No official code published. Deviations: "
+        "D7 (ω = n_experts·(d_out+d_in) for MoE expert groups), "
+        "D7a (per-projection bias gate=1.33/up=0.67/down=1.0), "
+        "D-drank-premerge-A (Stage 2 A-cov reuse on post-merge weights). "
+        "See module docstring."
+    )
     config_key = "stage3_svd.d_rank.per_projection_weight"
     reads: tuple[str, ...] = ("group_stats", "decomposition", "config")
     writes: tuple[str, ...] = ("ranks", "T_budget")
