@@ -1,4 +1,4 @@
-"""Thermometer ARC-Easy + HellaSwag zero-shot subset (S6A-3 of the Stage 6alt plugin-architecture refactor).
+"""Thermometer ARC-Easy + HellaSwag zero-shot subset (Stage 6alt plugin).
 
 Paper / dataset
 ----------------
@@ -12,6 +12,13 @@ Datasets: ARC-Easy + ARC-Challenge are Clark et al. 2018
 (arXiv:1803.05457); HellaSwag is Zellers et al. 2019
 (arXiv:1905.07830).
 
+Stage 6alt implementation note: ``batch_size=auto:8`` (lm-eval
+deterministic loglikelihood, numerically identical to ``batch_size=1``)
+— this is the project's ``VALIDATED_STRATEGIES`` §Stage 6 Optimization
+#2, inherited via the sibling :mod:`stage6.plugins.zero_shot_lm_eval`
+(which also pins the lm-eval ``>=0.4.5,<0.5`` version contract that
+this plugin transitively relies on through ``_lm_eval_tasks``).
+
 Reference code
 --------------
 EleutherAI/lm-evaluation-harness — standard library, no
@@ -22,29 +29,41 @@ from the legacy ``stage6alt_thermometer.py`` monolith. The thermometer
 runs a small subsample of ARC-Easy + HellaSwag via lm-eval to produce
 a cheap secondary signal alongside BPT; ``_lm_eval_subset`` wraps two
 ``_lm_eval_tasks`` calls (one per task, the two limits differ) and
-returns the three result keys + their sum.
+returns the two per-task acc_norm scalars and their sum.
+
+Deviation D-arc-acc-norm (inherited)
+------------------------------------
+``_lm_eval_tasks`` is imported from the sibling
+:mod:`stage6.plugins.zero_shot_lm_eval` and its metric-key preference
+list — ``("acc_norm,none", "acc,none")`` — picks ``acc_norm,none`` first
+whenever it is present, which it always is for ARC-Easy in lm-eval
+``>=0.4.x``. That means the ``arc_easy_acc_norm`` scalar this plugin
+writes (and the downstream ``student_arc_easy_acc_norm`` ctx slot) is
+length-normalised accuracy, NOT the Clark 2018 (arXiv:1803.05457) raw
+``acc`` reported in the original ARC paper. See the sibling's "Deviation
+D-arc-acc-norm" docstring for the full rationale (Open-LLM-Leaderboard
+convention, length-bias correction, dashboard continuity). HellaSwag
+(Zellers et al. 2019) already uses ``acc_norm`` in its original paper so
+no deviation applies there.
 
 Pattern A vs Pattern B
 ----------------------
-S6A-3's zero-shot-subset slice covers a MIXED pattern:
-
-* **Pattern A — relocated verbatim**: ``_lm_eval_subset`` below is a
-  character-identical copy of the monolith body. ``stage6alt_thermometer.py``
-  re-imports it (the ``# noqa: F401`` block) so ``run()`` and any external
-  caller / test that monkey-patches ``stage6alt_thermometer._lm_eval_subset``
-  keeps working unchanged — the re-import puts the SAME function object
-  on the monolith namespace. The underlying ``_lm_eval_tasks`` helper is
-  NOT relocated here: it already lives in ``stage6.plugins.zero_shot_lm_eval``
-  (per S6-3) and is imported from that home — re-relocating it would create
-  two divergent copies of the same harness wrapper.
-* **Pattern B — reproduced in an inert hook**: the monolith ``run()``'s
-  student-side ``_lm_eval_subset`` call site (writing the three
-  ``student_arc_easy_acc_norm`` / ``student_hellaswag_acc_norm`` /
-  ``student_acc_norm_sum`` slots) is reproduced in the inert
-  ``compute_zero_shot_subset`` hook below. The monolith ``run()`` is NOT
-  modified for it. This is an intentional, temporary logic duplication
-  that resolves at S6A-6 when the orchestrator flip wires this hook live
-  and the monolith ``run()`` becomes a thin shim.
+* **Pattern A — relocated**: ``_lm_eval_subset`` below owns the helper;
+  ``stage6alt_thermometer.py`` re-exports it (the ``# noqa: F401`` block
+  at ``stage6alt_thermometer.py:71-74``) purely for monkeypatch-by-
+  attribute back-compat (the S6A-0 golden snapshot still patches
+  ``stage6alt_thermometer._lm_eval_subset`` via ``monkeypatch.setattr``).
+  The underlying ``_lm_eval_tasks`` harness wrapper is NOT relocated
+  here: it already lives in ``stage6.plugins.zero_shot_lm_eval`` and is
+  imported from that home — re-relocating it would create two divergent
+  copies of the same harness wrapper.
+* **Pattern B — live orchestrator entry point**: the
+  ``compute_zero_shot_subset`` hook below is the live student-side
+  ARC-Easy + HellaSwag call site. ``stage6alt.orchestrator.run``
+  registers ``ZeroShotSubsetPlugin()`` and dispatches
+  ``walk_phases(("compute_zero_shot_subset",), ...)`` against it; the
+  monolith ``stage6alt_thermometer.run`` is now a thin shim that
+  delegates to the orchestrator.
 
 Circular-import contract (mirror of ``stage6alt/plugins/thermo_corpus.py``):
 this module imports only from ``..context`` / ``...stage6.plugins.zero_shot_lm_eval``
@@ -53,14 +72,11 @@ this module imports only from ``..context`` / ``...stage6.plugins.zero_shot_lm_e
 The monolith re-imports *this* module's symbols at load time, so a
 ``from ..stage6alt_thermometer import ...`` here would deadlock the
 import; nothing in this module does that.
-
-``ZeroShotSubsetPlugin`` is registered-but-INERT at S6A-3 — no orchestrator
-walk or test invokes its ``compute_zero_shot_subset`` hook. S6A-6 plugs
-the hook into the live Stage 6alt plugin sequencer.
 """
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from ..context import PipelineContext
@@ -97,22 +113,23 @@ def _lm_eval_subset(model, tokenizer, *, arc_limit: int, hellaswag_limit: int,
 
 
 class ZeroShotSubsetPlugin:
-    """Stage 6alt thermometer zero-shot-subset plugin (S6A-3 — registered-but-INERT).
+    """Stage 6alt thermometer zero-shot-subset plugin (live).
 
-    Owns the Stage 6alt ARC-Easy + HellaSwag zero-shot concern: the relocated
-    ``_lm_eval_subset`` helper (Pattern A) plus an inert
-    ``compute_zero_shot_subset`` hook (Pattern B) that reproduces the
-    monolith's student-side call site. The underlying ``_lm_eval_tasks``
-    harness wrapper stays in its S6-3 home
+    Owns the Stage 6alt ARC-Easy + HellaSwag zero-shot concern: the
+    ``_lm_eval_subset`` helper (Pattern A) plus the live
+    ``compute_zero_shot_subset`` hook (Pattern B) that the Stage 6alt
+    orchestrator dispatches against the student. The underlying
+    ``_lm_eval_tasks`` harness wrapper stays in its sibling home
     (``stage6.plugins.zero_shot_lm_eval``) and is imported there.
-
-    S6A-3 wires this class into the plugin registry as metadata only — no
-    orchestrator walk or test invokes ``compute_zero_shot_subset``. S6A-6
-    plugs the hook into the live Stage 6alt plugin sequencer.
     """
 
     name = "zero_shot_subset"
-    paper = "Stage 6alt thermometer zero-shot subset — ARC-Easy + HellaSwag (Clark 2018 / Zellers 2019) via lm-eval (Gao et al. 2024); small-N limits for sweep speed. See module docstring."
+    paper = (
+        "Stage 6alt thermometer zero-shot subset — ARC-Easy + HellaSwag "
+        "(Clark 2018 / Zellers 2019) via lm-eval (Gao et al. 2024); "
+        "small-N limits for sweep speed. See module docstring. "
+        "Deviation D-arc-acc-norm applies (ARC-Easy)."
+    )
     config_key = "stage6_validate.thermometer"
     reads: tuple[str, ...] = ("model", "tokenizer", "config")
     writes: tuple[str, ...] = (
@@ -138,16 +155,16 @@ class ZeroShotSubsetPlugin:
         return {}
 
     def compute_zero_shot_subset(self, ctx: PipelineContext) -> None:
-        """Phase hook — Stage 6alt thermometer zero-shot subset (S6A-6 wiring surface).
+        """Phase hook — Stage 6alt thermometer zero-shot subset (live).
 
-        INERT at S6A-3: no orchestrator walk or test invokes this hook. S6A-6
-        replaces the Stage 6alt orchestrator body with the plugin sequencer
-        and dispatches this hook in place of the monolith ``run()``'s inline
-        ``_lm_eval_subset`` student-side call. The body below reproduces that
-        inline call faithfully — it is dead code at S6A-3 but S6A-6 relies on
-        it once the monolith ``run()`` becomes a thin shim.
+        The Stage 6alt orchestrator (``stage6alt.orchestrator.run``)
+        registers this plugin and dispatches
+        ``walk_phases(("compute_zero_shot_subset",), ...)`` against it as
+        the student-side ARC-Easy + HellaSwag call site. The monolith
+        ``stage6alt_thermometer.run`` is a thin shim that delegates to the
+        orchestrator.
 
-        Reproduces the monolith ``run()``'s student-side call:
+        The hook reproduces the historical inline call:
 
             arc_limit = int(therm.get("arc_easy_limit", 100))
             hsw_limit = int(therm.get("hellaswag_limit", 200))
@@ -160,6 +177,11 @@ class ZeroShotSubsetPlugin:
         The three result-dict entries are written to
         ``student_arc_easy_acc_norm`` / ``student_hellaswag_acc_norm`` /
         ``student_acc_norm_sum`` ctx slots.
+
+        ``lm_eval_batch_size`` is validated inline (positive int or the
+        ``auto`` / ``auto:N`` pattern), mirroring the sibling
+        :mod:`stage6.plugins.zero_shot_lm_eval` validation block so both
+        zero-shot call sites fail loud on the same malformed inputs.
         """
         # Required slots — direct get(): a missing one is a wiring bug and
         # SHOULD raise.
@@ -169,7 +191,31 @@ class ZeroShotSubsetPlugin:
         therm = config.get("stage6_validate", {}).get("thermometer", {}) or {}
         arc_limit = int(therm.get("arc_easy_limit", 100))
         hellaswag_limit = int(therm.get("hellaswag_limit", 200))
-        batch_size = therm.get("lm_eval_batch_size", "auto:8")
+
+        # Mirror the sibling stage6.plugins.zero_shot_lm_eval batch-size
+        # parse/validation block so both zero-shot call sites reject the
+        # same malformed inputs (positive int OR int-string OR auto[:N]).
+        _raw_lebs = therm.get("lm_eval_batch_size", "auto:8")
+        if isinstance(_raw_lebs, int):
+            if _raw_lebs <= 0:
+                raise ValueError(
+                    "stage6_validate.thermometer.lm_eval_batch_size must be > 0; "
+                    f"got {_raw_lebs}"
+                )
+            batch_size = _raw_lebs
+        elif isinstance(_raw_lebs, str):
+            if not (re.fullmatch(r"\d+", _raw_lebs) or re.fullmatch(r"auto(:\d+)?", _raw_lebs)):
+                raise ValueError(
+                    "stage6_validate.thermometer.lm_eval_batch_size must be a "
+                    "positive int or match 'auto' / 'auto:N'; "
+                    f"got {_raw_lebs!r}"
+                )
+            batch_size = int(_raw_lebs) if _raw_lebs.isdigit() else _raw_lebs
+        else:
+            raise TypeError(
+                "stage6_validate.thermometer.lm_eval_batch_size must be int or "
+                f"str; got {type(_raw_lebs).__name__}"
+            )
 
         result = _lm_eval_subset(
             model, tokenizer,
