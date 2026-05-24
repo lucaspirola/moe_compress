@@ -124,9 +124,9 @@ class ThermoEnvironmentPlugin:
         2. **cu130/Hopper kernel patches** — ``_apply_stage6_kernel_patches``
            on the student.
 
-        The resolved ``experts_impl`` is written to ctx so a teacher-side
-        plugin (S6A-3) can apply the matching shim without re-resolving the
-        env var.
+        The resolved ``experts_impl`` is written to ctx so the thermo
+        teacher-side provider plugin can apply the matching shim without
+        re-resolving the env var.
         """
         # Required slots — direct get(): a missing one is a wiring bug and
         # SHOULD raise.
