@@ -1,7 +1,80 @@
-"""Covariance collection (S3-2 of the Stage 3 plugin-architecture refactor).
+"""AA-SVD cross-covariance + B-covariance collection (Theorem 3.2 / Corollary 3.3).
 
-Home of the post-prune covariance-collection logic relocated VERBATIM from
-the legacy ``stage3_svd.py`` monolith:
+Paper
+-----
+"AA-SVD: Activation-Aware SVD with Cross-Covariance Calibration" —
+arXiv:2604.02119 (audit/spec_compliance/01_papers/2604.02119/source.md).
+
+Theorem 3.2 of AA-SVD prescribes the factorization
+``M = W · C · B⁻¹ · L_B`` where ``B`` is the post-prune input
+covariance ``E[X_post X_post^T]`` and ``C`` is the cross-covariance
+``E[X_pre X_post^T]`` between the pre- and post-prune layer inputs.
+Corollary 3.3 (the special case ``A = B``) reduces to ``M = W · L_B``
+when only the auto-covariance is available.
+
+This plugin owns the post-prune covariance pass: for every MoE
+``(layer, expert, matrix)`` tuple, accumulate ``B`` (always) and
+``C`` (gate_proj / up_proj only — see deviation D6 below) during a
+single dual-forward pass against the teacher (pre-prune model) and the
+post-prune student. Also loads the Stage 2 input-covariance sidecar
+(``A_cov`` from ``_stage2_input_covariance.pt``) as the Path 2
+fallback when ``aa_svd.cross_covariance: false``.
+
+Official code
+-------------
+``atulkumarin/AA-SVD`` @ commit
+``1fa1b686cd9b13a77607a676564e37d438a176c8`` (2026-04-22) —
+github.com/atulkumarin/AA-SVD.
+
+Deviation: D6 — cross-covariance scope and Path 2 substitution
+--------------------------------------------------------------
+Paper Theorem 3.2 requires cross-covariance C for all linear layers.
+This plugin's scope:
+
+  (a) Cross-covariance C collected for ``gate_proj`` / ``up_proj``
+      (input-side) via dual-forward; ``down_proj`` falls back to
+      Corollary 3.3 (B-only) because the teacher's per-expert
+      intermediate activations require full expert-dispatch
+      instrumentation that the project does not implement.
+  (b) Path 2 (auto-cov-for-cross-cov substitution, ``A`` from Stage 2)
+      is enabled by ``aa_svd.cross_covariance: false`` for runs where
+      ``C`` is unavailable but ``A`` is. Path 2 is **not a
+      paper-recognised variant**: it slots the pre-prune
+      auto-covariance into the Theorem 3.2 machinery as a strict
+      generalisation of Corollary 3.3 (which uses ``A = B = X_post``).
+
+Rationale: gate/up inputs share the same hidden state (pre-routing)
+so one capture covers both; down_proj inputs are expert-internal
+(post gate+up) and differ between teacher and student expert sets.
+Path 2 is a project-original hybrid; the substitution is consistent
+(the two coincide when pre/post distributions are similar — light
+pruning) and degrades gracefully toward Path 3 as the auto-cov
+departs from the cross-cov. Quality vs Path 3 not separately ablated.
+
+Deviation: D-cov-storage-fp16 (SHARED with Stage 2)
+---------------------------------------------------
+Stage 2 covariance + Stage 3 B-cov persisted in **fp16** (not fp32).
+Paper §5 (covariance side-collection) originally stated fp32 storage
+citing Swift-SVD certification. The project persists fp16 (10
+mantissa bits, strictly higher than bf16's 7 bits) for both
+``_stage2_input_covariance.pt`` and ``_bcov_*.pt``; eigendecomposition
+still runs in fp64 in-memory.
+
+Rationale: fp16 produces cleaner Stage 3 rank-deficiency outcomes
+than bf16 in spot checks. Halves the persisted-covariance disk
+footprint vs fp32 (~2× saving on the gigabyte-scale covariance
+artifact) without measurable downstream PPL / zero-shot drift.
+Switching back to fp32 is a one-line config flip if a future model
+exposes precision sensitivity.
+
+Naming-history note
+-------------------
+"Phase A" (legacy Stage 3 monolith terminology) is naming-historical.
+The current plugin architecture has no phase taxonomy; new prose
+drops the labels. Existing log lines / Trackio keys preserved for
+dashboard back-compat.
+
+Tool inventory (relocated verbatim):
 
 * ``_collect_covariances`` — collects post-prune input covariance B and
   (optionally) cross-covariance C per (layer, expert, matrix);
@@ -315,7 +388,15 @@ class CovarianceCollectionPlugin:
     """
 
     name = "covariance_collection"
-    paper = "AA-SVD cross-covariance C = X_pre^T X_post (Theorem 3.2, paper 2604.02119)."
+    paper = (
+        "AA-SVD Theorem 3.2 cross-covariance + Corollary 3.3 — "
+        "arXiv:2604.02119 (atulkumarin/AA-SVD @ "
+        "1fa1b686cd9b13a77607a676564e37d438a176c8). "
+        "Deviations: D6 (gate/up cross-cov only; down falls back to Corollary "
+        "3.3; Path 2 auto-cov substitution opt-in), D-cov-storage-fp16 "
+        "(SHARED with Stage 2 — fp16 persisted, fp64 in-memory eigh). "
+        "See module docstring."
+    )
     config_key = "stage3_svd.aa_svd.cross_covariance"
     reads: tuple[str, ...] = (
         "model", "moe_layers", "batches", "B_acc", "device",
