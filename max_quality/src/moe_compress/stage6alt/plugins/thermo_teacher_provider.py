@@ -1,59 +1,68 @@
-"""Thermometer teacher-cache provider (S6A-4 of the Stage 6alt plugin-architecture refactor).
+"""Thermometer teacher-cache provider — Stage 6alt teacher-side eval (live).
 
 Paper / spec source
 --------------------
-Sweep-cache mirror of :mod:`stage6.plugins.teacher_provider`. The
-thermometer runs many ablation rows against the SAME uncompressed
-teacher on the SAME fixed corpus, so the teacher's BPT +
-zero-shot-subset + per-token argmax are constant across rows and
-computed ONCE per sweep.
+No upstream paper for the thermometer teacher provider per se; this
+plugin owns the Stage 6alt thermometer teacher-side concern:
 
-Cache invariant: SHA-256 key over teacher SHA, corpus selector, lm-eval
-task config, and tokenizer SHA. Stored as a sidecar parallel to the
-Stage 6 ``teacher_eval_cache`` (separate key namespace so the thermometer
-cache cannot collide with the Stage 6 cache).
+- **Sweep-shared cache**: the thermometer runs many ablation rows against
+  the SAME uncompressed teacher on the SAME fixed corpus, so the
+  teacher's BPT + zero-shot-subset + per-token argmax are constant
+  across rows and computed ONCE per sweep. The first row evaluates the
+  teacher; subsequent rows take the HIT path and never reload it.
+- **Cache-key invariant**: SHA-256 over an 8-component payload —
+  ``format_version`` / ``corpus_id`` / ``teacher_repo`` /
+  ``teacher_revision`` / ``torch_dtype`` / ``attn_implementation`` /
+  ``arc_easy_limit`` / ``hellaswag_limit``. ``teacher_revision`` is a
+  revision *name string* (default "main"), NOT a content SHA — pin the
+  revision to a commit SHA in YAML if you need full content sensitivity
+  (same revision-vs-SHA caveat as the Stage 6 sibling). The tokenizer
+  name is folded in indirectly via ``corpus_id`` (``thermo_corpus.py``
+  L216-228 hashes ``tok_id`` into the corpus id), so a tokenizer change
+  invalidates the cache transitively through the corpus.
+- **Cache scope-of-validity**: thermometer caches are scoped to a SINGLE
+  SWEEP (a short-lived host process). The cache key intentionally OMITS
+  ``lm_eval_version`` / ``transformers_version`` /
+  ``dataset_revisions_canonical`` for arc_easy/hellaswag — a sweep does
+  not survive long enough to encounter an lm-eval or HF-dataset bump,
+  and the on-disk file is regenerated on the next sweep boot. Do NOT
+  reuse a thermometer cache file across host processes whose lm-eval /
+  HF-datasets / transformers versions differ; either delete the file or
+  bump ``THERMO_TEACHER_CACHE_FORMAT_VERSION``.
+- **Sidecar to the Stage 6 cache**: stored as a separate file with a
+  separate key namespace; the thermometer cache cannot collide with
+  ``teacher_eval_cache``.
 
-Project-original sweep harness; no upstream paper.
+Live wiring
+-----------
+``ThermoTeacherProviderPlugin`` is the live Stage 6alt thermometer
+teacher-side entry point. ``stage6alt.orchestrator.run()`` registers it
+(orchestrator L121-128) and invokes
+``walk_phases(("provide_thermo_teacher_side",), plugins, run_ctx)``
+(orchestrator L166). The legacy ``stage6alt_thermometer.run()`` is now
+a 2-line shim delegating into the orchestrator. Tests invoke this hook
+directly via
+``ThermoTeacherProviderPlugin().provide_thermo_teacher_side(ctx)``
+(mirror of the pattern documented in
+``stage6/plugins/teacher_provider.py:30-35``).
 
-Home of the Stage 6alt thermometer teacher-side concern, extracted from
-the legacy ``stage6alt_thermometer.py`` monolith. The thermometer's
-teacher BPT + lm-eval subset + per-token argmax are constant across all
-12 ablation rows (same uncompressed model, same fixed corpus), so the
-teacher results are computed ONCE per sweep and cached on disk under a
-``corpus_id``-keyed SHA-256. Sweep-shared cache: the first row evaluates
-the teacher; rows 2..12 take the HIT path and never reload it.
+The standalone helpers (``THERMO_TEACHER_CACHE_FORMAT_VERSION`` /
+``_thermo_teacher_cache_key`` / ``_load_thermo_teacher_cache`` /
+``_save_thermo_teacher_cache``) are re-exported through the monolith
+namespace (``stage6alt_thermometer.py:84-90``) so tests that
+monkey-patch ``stage6alt_thermometer._load_thermo_teacher_cache`` (etc.)
+keep biting — the re-import puts the SAME function object on the
+monolith namespace.
 
-Pattern A vs Pattern B
-----------------------
-S6A-4's teacher-cache slice covers a MIXED pattern:
-
-* **Pattern A — relocated verbatim**: ``THERMO_TEACHER_CACHE_FORMAT_VERSION``,
-  ``_thermo_teacher_cache_key``, ``_load_thermo_teacher_cache``, and
-  ``_save_thermo_teacher_cache`` below are character-identical copies of
-  the monolith bodies. ``stage6alt_thermometer.py`` re-imports them (a
-  ``# noqa: F401`` block) so ``run()`` and any external caller / test
-  that monkey-patches ``stage6alt_thermometer._load_thermo_teacher_cache``
-  (etc.) keeps working unchanged — the re-import puts the SAME function
-  object on the monolith namespace.
-* **Pattern B — reproduced in an inert hook**: the monolith ``run()``'s
-  teacher-side block (cache-hit shortcut + cache-miss
-  CPU-swap → ``load_model`` → kernel patches → ``_bpt_from_nll`` →
-  ``_lm_eval_subset`` → cache save → student-restore path) is INLINE
-  ``run()`` code in the monolith — there is nothing standalone to
-  relocate. The ``provide_thermo_teacher_side`` hook below REPRODUCES
-  that inline block faithfully; the monolith ``run()`` is NOT modified
-  for it. This is an intentional, temporary logic duplication that
-  resolves at S6A-6 when the orchestrator flip wires this hook live and
-  the monolith ``run()`` becomes a thin shim.
-
-Unlike S6-5's ``TeacherProviderPlugin``, the thermometer teacher-cache
+Unlike the Stage 6 ``TeacherProviderPlugin``, the thermometer teacher
 HAS NO PRELOAD THREAD and HAS NO PARAM-COUNT TRACKING: the load is
 direct (after a guarded student-to-CPU swap), and the cached payload is
 the raw ``teacher_results`` dict (``teacher_bpt`` / ``teacher_argmax`` /
 ``teacher_arc_easy_acc_norm`` / ``teacher_hellaswag_acc_norm`` /
 ``teacher_acc_norm_sum``) — NOT a wrapper carrying ``{"results": ...,
-"param_counts": ...}`` like S6-5. ``_load_thermo_teacher_cache`` returns
-that raw dict directly on a HIT (or ``None`` on miss / mismatch).
+"param_counts": ...}`` like Stage 6. ``_load_thermo_teacher_cache``
+returns that raw dict directly on a HIT (or ``None`` on miss / mismatch
+/ malformed-payload rejection).
 
 Circular-import contract (mirror of ``stage6alt/plugins/bpt_metric.py``):
 this module imports only from ``..context`` / ``...stage6.plugins.eval_environment``
@@ -63,10 +72,6 @@ this module imports only from ``..context`` / ``...stage6.plugins.eval_environme
 (module-top OR function-local). The monolith re-imports *this* module's
 symbols at load time, so a ``from ..stage6alt_thermometer import ...``
 here would deadlock the import; nothing in this module does that.
-
-``ThermoTeacherProviderPlugin`` is registered-but-INERT at S6A-4 — no
-orchestrator walk or test invokes its ``provide_thermo_teacher_side``
-hook. S6A-6 plugs the hook into the live Stage 6alt plugin sequencer.
 """
 from __future__ import annotations
 
@@ -99,7 +104,7 @@ _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 
 
 # ---------------------------------------------------------------------------
-# Teacher BPT cache (sweep-shared) — Pattern A: relocated verbatim
+# Teacher BPT cache (sweep-shared) — format-version constant + helpers
 # ---------------------------------------------------------------------------
 
 
@@ -111,12 +116,35 @@ THERMO_TEACHER_CACHE_FORMAT_VERSION = 2
 
 
 def _thermo_teacher_cache_key(config: dict, corpus_id: str) -> str:
-    """SHA-256 over everything that affects teacher BPT + lm-eval subset.
+    """SHA-256 over the 8-component payload that scopes the sweep cache.
 
-    `corpus_id` (from `_build_thermo_corpus`) already identifies the corpus
-    fully — kind (nemotron/wikitext), size, seed/spec, dataset, and tokenizer
-    name — so a corpus, seed-offset, or wikitext-subset change auto-
-    invalidates the sweep-shared teacher cache.
+    Components (sorted-keys JSON):
+
+      1. format_version       — ``THERMO_TEACHER_CACHE_FORMAT_VERSION``
+      2. corpus_id            — from ``_build_thermo_corpus`` (folds corpus
+                                kind / size / seed-spec / dataset revisions /
+                                tokenizer ``tok_id`` together; this is how
+                                tokenizer churn invalidates the cache)
+      3. teacher_repo         — config.model.name_or_path
+      4. teacher_revision     — config.model.revision (default "main"; a
+                                revision *name string*, not a content SHA —
+                                same caveat as the Stage 6 sibling)
+      5. torch_dtype          — config.model.torch_dtype (default bfloat16)
+      6. attn_implementation  — pinned to "eager" per Spec F-S-M-1
+      7. arc_easy_limit       — thermometer.arc_easy_limit (default 100)
+      8. hellaswag_limit      — thermometer.hellaswag_limit (default 200)
+
+    Scope-of-validity boundary
+    --------------------------
+    Intentionally OMITTED relative to the Stage 6 sibling:
+    ``lm_eval_version``, ``transformers_version``, and
+    ``dataset_revisions_canonical`` for arc_easy/hellaswag. The thermometer
+    cache is scoped to a SINGLE SWEEP (short-lived host process) — a sweep
+    does not survive across an lm-eval / transformers / HF-dataset bump,
+    so folding those into the key would be wasted work. Do NOT carry a
+    thermometer cache file across host processes whose lm-eval /
+    HF-datasets / transformers versions differ; either delete the file or
+    bump ``THERMO_TEACHER_CACHE_FORMAT_VERSION``.
     """
     therm = config.get("stage6_validate", {}).get("thermometer", {}) or {}
     model_cfg = config["model"]
@@ -124,7 +152,7 @@ def _thermo_teacher_cache_key(config: dict, corpus_id: str) -> str:
         "format_version": THERMO_TEACHER_CACHE_FORMAT_VERSION,
         "corpus_id": corpus_id,
         "teacher_repo": model_cfg["name_or_path"],
-        "teacher_revision": model_cfg.get("revision", "main"),
+        "teacher_revision": model_cfg.get("revision") or "main",
         "torch_dtype": str(model_cfg.get("torch_dtype", "bfloat16")),
         "attn_implementation": _STAGE6_ATTN_IMPLEMENTATION,
         "arc_easy_limit": int(therm.get("arc_easy_limit", 100)),
@@ -134,7 +162,18 @@ def _thermo_teacher_cache_key(config: dict, corpus_id: str) -> str:
 
 
 def _load_thermo_teacher_cache(cache_path: Path, cache_key: str) -> dict | None:
-    """Return cached teacher_results on a key+version match, else None."""
+    """Return cached teacher_results on a key+version+schema match, else None.
+
+    Schema validation: a HIT is only returned when the cached
+    ``teacher_results`` dict carries the four scalar keys the cache-hit
+    branch of ``provide_thermo_teacher_side`` publishes to ctx without
+    re-deriving (``teacher_bpt`` / ``teacher_argmax`` /
+    ``teacher_arc_easy_acc_norm`` / ``teacher_hellaswag_acc_norm``).
+    Missing-key payloads are rejected here (mirror of the Stage 6 sibling's
+    ``teacher_provider.py`` L188-197 pattern) so the hit path can use
+    required-key access and a malformed cache cannot publish ``None`` to
+    downstream ctx slots.
+    """
     if not cache_path.exists():
         return None
     try:
@@ -148,7 +187,31 @@ def _load_thermo_teacher_cache(cache_path: Path, cache_key: str) -> dict | None:
     if data.get("cache_key") != cache_key:
         log.info("stage6alt: teacher cache key mismatch; recomputing")
         return None
-    return data.get("teacher_results")
+    teacher_results = data.get("teacher_results")
+    if not isinstance(teacher_results, dict):
+        log.warning(
+            "stage6alt: teacher cache invalid: 'teacher_results' missing or "
+            "non-dict in %s — recomputing.", cache_path,
+        )
+        return None
+    # F-iter1-L3: required-key schema check — any of the four scalars below
+    # being absent means the cache-hit branch would publish a None to ctx
+    # and break downstream bpt_gap / acc_norm_sum / top1_agreement with a
+    # confusing AttributeError far from the cache. Reject here instead.
+    required_keys = (
+        "teacher_bpt",
+        "teacher_argmax",
+        "teacher_arc_easy_acc_norm",
+        "teacher_hellaswag_acc_norm",
+    )
+    missing = [k for k in required_keys if k not in teacher_results]
+    if missing:
+        log.warning(
+            "stage6alt: teacher cache invalid: missing keys %s in %s — "
+            "recomputing.", missing, cache_path,
+        )
+        return None
+    return teacher_results
 
 
 def _save_thermo_teacher_cache(cache_path: Path, cache_key: str,
@@ -176,25 +239,24 @@ def _save_thermo_teacher_cache(cache_path: Path, cache_key: str,
 
 
 # ---------------------------------------------------------------------------
-# Plugin scaffold — Pattern B: inert hook reproducing the monolith block
+# Plugin — live entry point for the thermometer teacher-side phase
 # ---------------------------------------------------------------------------
 
 
 class ThermoTeacherProviderPlugin:
-    """Stage 6alt thermometer teacher-provider plugin (S6A-4 — registered-but-INERT).
+    """Stage 6alt thermometer teacher-provider plugin (live).
 
-    Owns the Stage 6alt thermometer teacher-side concern: the relocated
-    cache-key / load / save helpers (Pattern A) plus an inert
-    ``provide_thermo_teacher_side`` hook (Pattern B) that reproduces the
-    monolith's teacher block — the cache-hit shortcut, the cache-miss
-    student-to-CPU swap, the direct teacher ``load_model`` (attn pinned to
-    ``eager`` per Spec F-S-M-1), the cu130/Hopper kernel patches +
-    experts-impl shim, the ``_bpt_from_nll`` + ``_lm_eval_subset`` calls,
-    the cache save, and the teacher-free + student-restore path.
+    Owns the Stage 6alt thermometer teacher-side concern: the cache-key /
+    load / save helpers plus the ``provide_thermo_teacher_side`` hook —
+    the cache-hit shortcut, the cache-miss student-to-CPU swap, the
+    direct teacher ``load_model`` (attn pinned to ``eager`` per Spec
+    F-S-M-1), the cu130/Hopper kernel patches + experts-impl shim, the
+    ``_bpt_from_nll`` + ``_lm_eval_subset`` calls, the cache save, and the
+    teacher-free + student-restore path.
 
-    S6A-4 wires this class into the plugin registry as metadata only — no
-    orchestrator walk or test invokes ``provide_thermo_teacher_side``.
-    S6A-6 plugs the hook into the live Stage 6alt plugin sequencer.
+    The Stage 6alt orchestrator invokes this hook via
+    ``walk_phases(("provide_thermo_teacher_side",), plugins, run_ctx)``
+    at ``stage6alt/orchestrator.py`` L166.
     """
 
     name = "thermo_teacher_provider"
@@ -234,25 +296,23 @@ class ThermoTeacherProviderPlugin:
         return {}
 
     def provide_thermo_teacher_side(self, ctx: PipelineContext) -> None:
-        """Phase hook — Stage 6alt thermometer teacher-side (S6A-6 wiring surface).
+        """Phase hook — Stage 6alt thermometer teacher-side eval (live).
 
-        INERT at S6A-4: no orchestrator walk or test invokes this hook.
-        S6A-6 replaces the Stage 6alt orchestrator body with the plugin
-        sequencer and dispatches this hook in place of the monolith
-        ``run()``'s inline teacher block. The body below reproduces that
-        inline block faithfully — it is dead code at S6A-4 but S6A-6
-        relies on it once the monolith ``run()`` becomes a thin shim.
-
-        Reproduces, in order, the monolith ``run()``'s teacher block:
+        Dispatched by the Stage 6alt orchestrator via
+        ``walk_phases(("provide_thermo_teacher_side",), plugins, run_ctx)``
+        (orchestrator L166). Executes, in order:
 
         1. **Cache key + path** — ``cache_path`` from ``therm[
            "teacher_cache_path"]`` (falling back to ``artifacts_dir /
            "thermometer_teacher_cache.json"``); ``cache_key`` from
            ``_thermo_teacher_cache_key(config, corpus_id)``.
-        2. **Cache load** — ``_load_thermo_teacher_cache(cache_path,
+        2. **Cache-hit shortcut** — ``_load_thermo_teacher_cache(cache_path,
            cache_key)``; HIT publishes ``teacher_results`` /
+           ``teacher_bpt`` / ``teacher_argmax`` /
            ``teacher_cache_hit=True`` / ``teacher_cache_path`` /
-           ``teacher_cache_key`` to ctx and returns.
+           ``teacher_cache_key`` to ctx and returns. Required-key access on
+           the hit path is safe because ``_load_thermo_teacher_cache``
+           rejects malformed payloads up front (schema validation L1).
         3. **Cache miss** — guard ``model.to("cpu")`` + empty CUDA cache,
            ``load_model(...)`` with ``attn_implementation="eager"``,
            ``teacher.train(False)``, ``_set_experts_implementation_s6`` +
@@ -267,6 +327,18 @@ class ThermoTeacherProviderPlugin:
         4. **ctx writes** — ``teacher_results`` /
            ``teacher_bpt`` / ``teacher_argmax`` / ``teacher_cache_hit`` /
            ``teacher_cache_path`` / ``teacher_cache_key``.
+
+        ``load_model`` call leniency
+        -----------------------------
+        Unlike the Stage 6 sibling (``teacher_provider.py`` L482-490) which
+        requires ``config["model"]["device_map"]`` and
+        ``config["model"]["torch_dtype"]`` to be set, this hook uses
+        ``model_cfg.get(...)`` with defaults for ``device_map`` /
+        ``torch_dtype`` / ``trust_remote_code`` / ``load_in_4bit``. The
+        thermometer is run by sweep harnesses that may set up a minimal
+        ``model`` sub-tree (``name_or_path`` only), so leniency here is
+        intentional — the defaults match what ``load_model`` would resolve
+        on a fresh import.
         """
         # Required slots — direct get(): a missing one is a wiring bug and
         # SHOULD raise.
@@ -317,8 +389,13 @@ class ThermoTeacherProviderPlugin:
                 cache_path,
             )
             ctx.set("teacher_results", teacher_results)
-            ctx.set("teacher_bpt", teacher_results.get("teacher_bpt"))
-            ctx.set("teacher_argmax", teacher_results.get("teacher_argmax"))
+            # F-iter1-L3: required-key access — _load_thermo_teacher_cache
+            # has already validated that the cached payload carries
+            # 'teacher_bpt' / 'teacher_argmax' (rejecting on missing). Using
+            # subscript here mirrors the cache-miss branch and prevents a
+            # silent None publish if validation ever loosens.
+            ctx.set("teacher_bpt", teacher_results["teacher_bpt"])
+            ctx.set("teacher_argmax", teacher_results["teacher_argmax"])
             ctx.set("teacher_cache_hit", True)
             ctx.set("teacher_cache_path", cache_path)
             ctx.set("teacher_cache_key", cache_key)
@@ -344,7 +421,7 @@ class ThermoTeacherProviderPlugin:
         model_cfg = config["model"]
         teacher, _ = load_model(
             model_cfg["name_or_path"],
-            revision=model_cfg.get("revision", "main"),
+            revision=model_cfg.get("revision") or "main",
             torch_dtype=model_cfg.get("torch_dtype", "bfloat16"),
             device_map=model_cfg.get("device_map", "auto"),
             # eager is mandatory for batch-invariant NLL — do NOT inherit
