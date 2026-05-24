@@ -1,5 +1,19 @@
 """Thermometer eval-environment setup (S6A-2 of the Stage 6alt plugin-architecture refactor).
 
+Paper / spec source
+--------------------
+No upstream paper for Stage 6alt's "thermometer" sweep — it is a
+project-original cheap ablation harness (BPT + small lm-eval subset
++ per-token argmax) that runs the same compressed model against a
+fixed corpus for fast quality-temperature readings across many
+ablation rows. See Stage 6 (:mod:`stage6.plugins.eval_environment`)
+for the full eval gate.
+
+This plugin reuses the same two Hopper environment helpers as Stage 6
+(``_set_experts_implementation_s6`` + ``_apply_stage6_kernel_patches``)
+without re-relocating them — they live in
+:mod:`stage6.plugins.eval_environment` per the S6-2 refactor.
+
 Home of the Stage 6alt environment-setup concern, extracted from the legacy
 ``stage6alt_thermometer.py`` monolith. The Stage 6alt thermometer reuses the
 SAME two cu130/Hopper environment helpers as Stage 6 — ``_set_experts_implementation_s6``
@@ -70,12 +84,7 @@ class ThermoEnvironmentPlugin:
     """
 
     name = "thermo_environment"
-    paper = (
-        "Stage 6alt thermometer — cheap directional eval (BPT + lm-eval subset); "
-        "shares the Stage 6 cu130/Hopper kernel-patch + experts-implementation "
-        "shim from VALIDATED_STRATEGIES §Stage 6 / module docstring of "
-        "stage6alt_thermometer.py."
-    )
+    paper = "Stage 6alt thermometer environment setup (project-original; reuses :mod:`stage6.plugins.eval_environment` helpers). See module docstring."
     config_key = "stage6_validate.thermometer"
     reads: tuple[str, ...] = ("model", "config")
     writes: tuple[str, ...] = ("experts_impl",)
