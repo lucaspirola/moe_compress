@@ -1,4 +1,4 @@
-"""Eval-environment setup (S6-2 of the Stage 6 plugin-architecture refactor).
+"""Eval-environment setup (Stage 6 plugin — live setup_environment hook).
 
 Paper / spec source
 --------------------
@@ -8,21 +8,23 @@ specific paper. It enforces:
 - **Dataset revision pinning** — every eval dataset is loaded at a
   canonical SHA-256-keyed revision so cached evals invalidate when a
   dataset is silently updated upstream.
-- **Kernel patches** — torch.compile / SDPA backend selection for the
-  prefill-dominant eval forward.
+- **Kernel patches** — torch._dynamo.disable on linear-attention
+  sublayers + fla→torch fallback swaps for the cu130/Hopper segfault
+  cluster on Qwen3.5-MoE GatedDeltaNet blocks.
 - **Experts-impl shim** — swap the project's ``FactoredExperts`` for
   the upstream eager experts impl on the eval path so lm-eval and
   HumanEval generation see the same shape as the GPU pipeline.
 - **Imatrix corpus build** — concatenate the WikiText-2-train corpus
   for downstream consumption by :mod:`stage6.plugins.imatrix_export`.
 
-The setup choices follow the project's ``VALIDATED_STRATEGIES.md``
-§Stage 6 record (no upstream paper for the Stage-6 validation gate
-itself; eval tasks are paper-anchored at their individual plugins).
+The setup choices follow the project Spec §9 (Stage 6 validation gate)
+— there is no upstream paper for the Stage-6 gate itself; eval tasks
+are paper-anchored at their individual plugins.
 
 Home of the Stage 6 environment-setup concern, extracted from the legacy
-``stage6_validate.py`` monolith. S6-2 owns the five environment concerns that
-``stage6_validate.run()`` performs before any eval family executes:
+``stage6_validate.py`` monolith. This plugin owns the five environment
+concerns that the legacy monolith's ``run()`` performed before any eval
+family executes:
 
 1. **Dataset revision pinning** — resolve the canonical per-dataset revision
    mapping and, under ``strict_revision_pinning``, fail fast on a misconfigured
@@ -39,36 +41,54 @@ Home of the Stage 6 environment-setup concern, extracted from the legacy
    PPL / lm-eval paths, stashing the pre-compile bound method so the generative
    block can restore eager mode.
 
-Pattern A vs Pattern B
-----------------------
-S6-2 covers a MIXED pattern (mirror of RK-2):
+Live wiring (S6-8 landed in 17134b2)
+------------------------------------
+This module's ``EvalEnvironmentPlugin.setup_environment`` is the **live**
+Stage 6 environment-setup entry point. ``stage6.orchestrator.run()`` invokes
+``walk_phases(("setup_environment",), plugins, run_ctx)`` (orchestrator
+L171) and the legacy ``stage6_validate.run()`` is now a thin delegator into
+the orchestrator. Tests invoke this hook directly via
+``EvalEnvironmentPlugin().setup_environment(ctx)``.
 
-* **Pattern A — relocated verbatim**: the eight standalone symbols below
-  (``_CANONICAL_DATASET_REVISION_KEYS``, ``_resolve_dataset_revisions``,
-  ``_enforce_revision_pinning``, ``_atomic_write_text``,
-  ``_IMATRIX_CALIB_FILENAME``, ``_build_imatrix_calibration_corpus``,
-  ``_set_experts_implementation_s6``, ``_apply_stage6_kernel_patches``) are
-  character-identical copies of the monolith bodies. ``stage6_validate.py``
-  re-imports them (the ``# noqa: F401`` block) so ``run()`` and external
-  callers/tests keep their existing import paths.
-* **Pattern B — reproduced in an inert hook**: the torch.compile setup and the
-  ordering glue around the relocated functions is INLINE ``run()`` code in the
-  monolith — there is nothing standalone to relocate. The
-  ``setup_environment`` hook below REPRODUCES that inline logic faithfully; the
-  monolith ``run()`` is NOT modified for it. This is an intentional, temporary
-  logic duplication that resolves at S6-8 when the monolith ``run()`` is
-  deleted and this hook is wired live.
+Downstream contract — generative plugins MUST restore on the student side
+------------------------------------------------------------------------
+The teacher-side restoration of pre-compile forward and the generative
+experts-impl switch is implemented in ``teacher_provider.py``
+(see L602-616, "Option C: keep compile for prefill-only paths; eager
+for generate()"). The legacy monolith ``stage6_validate.py`` (commit
+8d95f8e) ALSO restored the student-side equivalents inline. After the
+plugin split, that student-side restoration is no longer here — it
+belongs to the generative plugins that own ``model.generate()``.
+
+Two ctx slots are populated by ``setup_environment`` for that purpose:
+
+* ``pre_compile_forward`` — the pre-compile bound method, or ``None`` if
+  torch.compile was off or failed. ``HumanEvalPlugin`` and
+  ``Math500Plugin`` **MUST** assign ``model.forward =
+  ctx.get("pre_compile_forward")`` before calling ``model.generate()``
+  when the slot is non-None, to dodge the Inductor recompile storm +
+  cu130 decode-shape codegen crashes.
+* ``experts_implementation_generative`` — the generative-block experts
+  implementation (resolved from env var ``EXPERTS_IMPLEMENTATION_GENERATIVE``,
+  default ``batched_mm``). ``HumanEvalPlugin`` and ``Math500Plugin`` **MUST**
+  call ``_set_experts_implementation_s6(model, ctx.get("experts_implementation_generative"))``
+  before ``model.generate()`` if the current ``_experts_implementation`` on
+  the model config differs — this matches the teacher-side pattern at
+  ``teacher_provider.py`` L607-616 and avoids the ``torch._grouped_mm``
+  B=1 decode-shape crash on cu130 when YAML pins ``experts_implementation=grouped_mm``.
+
+Failure to honor either contract is benign while
+``experts_implementation=batched_mm`` (the current default) and
+``torch_compile=false``, but production qwen36_35b_a3b_30pct.yaml sets
+``torch_compile=true`` and Hopper PPL/lm_eval defaults toward
+``grouped_mm`` per ``teacher_provider.py`` L142-149.
 
 Circular-import contract (mirror of ``router_kd/plugins/trainable_scope.py``):
 this module imports only from ``..context`` / stdlib / torch — NEVER from
 ``stage6_validate`` or ``stage6.orchestrator`` at any scope (module-top OR
-function-local). The monolith re-imports *this* module at load time, so a
+function-local). The legacy monolith re-imports *this* module at load time, so a
 ``from ..stage6_validate import ...`` here would deadlock the import; nothing
 in this module does that.
-
-``EvalEnvironmentPlugin`` is registered-but-INERT at S6-2 — no orchestrator
-walk or test invokes its ``setup_environment`` hook. S6-8 plugs the hook into
-the live Stage 6 plugin sequencer and deletes the monolith ``run()``.
 """
 from __future__ import annotations
 
@@ -96,16 +116,26 @@ _IMATRIX_CALIB_FILENAME: str = "calibration_wiki_train.txt"
 # ---------------------------------------------------------------------------
 
 
+#: Canonical per-dataset revision keys (Spec §9 line 840).
+#:
+#: Deviations from earlier drafts:
+#:   * ``hellaswag`` and ``arc_challenge`` are intentionally absent: lm-eval
+#:     pulls dataset revisions internally and the load path cannot enforce a
+#:     SHA at ``simple_evaluate`` time. The cache key invalidates on
+#:     ``lm_eval_version`` + lm-eval task config hash changes
+#:     (see ``_teacher_cache_key``); precise SHA control requires editing
+#:     lm-eval task YAMLs out-of-band.
 _CANONICAL_DATASET_REVISION_KEYS = ("wikitext_ppl", "humaneval", "math500")
 
 
 def _resolve_dataset_revisions(config: dict) -> dict[str, str | None]:
     """Return the per-dataset revision mapping from stage6_validate config.
 
-    Restricted to the canonical 3-key set per spec §9 line 840:
+    Restricted to the canonical 3-key set per Spec §9 line 840:
     {"wikitext_ppl", "humaneval", "math500"}. Any extra keys present in the
     config are dropped with a warning so the cache key is not contaminated
-    by operator-only metadata.
+    by operator-only metadata. See ``_CANONICAL_DATASET_REVISION_KEYS`` for
+    the deviations record.
     """
     s6 = config.get("stage6_validate", {}) or {}
     raw = s6.get("dataset_revisions") or {}
@@ -141,15 +171,7 @@ def _resolve_dataset_revisions(config: dict) -> dict[str, str | None]:
 
 
 def _enforce_revision_pinning(
-    config: dict, required_keys: tuple[str, ...] = (
-        # F-iter4-HIGH-1: hellaswag/arc_challenge dropped from required keys.
-        # lm-eval pulls dataset revisions internally and our load path cannot
-        # enforce a SHA at simple_evaluate time. The cache key invalidates on
-        # lm_eval_version + lm-eval task config hash changes (see
-        # _teacher_cache_key); precise SHA control requires editing lm-eval
-        # task YAMLs out-of-band.
-        "wikitext_ppl", "humaneval", "math500",
-    ),
+    config: dict, required_keys: tuple[str, ...] = _CANONICAL_DATASET_REVISION_KEYS,
 ) -> dict[str, str | None]:
     """Validate dataset_revisions when strict_revision_pinning is on.
 
@@ -301,14 +323,25 @@ def _apply_stage6_kernel_patches(m, *, role: str) -> None:
     """
     _bypass_names = ("GatedDeltaNet", "LinearAttention", "MoeMamba")
     _bypassed = 0
+    _skipped = 0
     for _name, _mod in m.named_modules():
         _cls = type(_mod).__name__
         if any(b in _cls for b in _bypass_names):
+            # M1 (iter1): sentinel-guard so a second call does not wrap an
+            # already-disabled forward (nested torch._dynamo.disable wraps
+            # break the descriptor and complicate later restoration).
+            if getattr(_mod, "_stage6_dynamo_disabled", False):
+                _skipped += 1
+                continue
             _mod.forward = torch._dynamo.disable(_mod.forward)
+            _mod._stage6_dynamo_disabled = True
             _bypassed += 1
     if _bypassed:
         log.info("Stage 6 [%s]: torch._dynamo.disable on %d linear-attention "
                  "sublayer(s)", role, _bypassed)
+    if _skipped:
+        log.debug("Stage 6 [%s]: skipped %d linear-attention sublayer(s) "
+                  "already marked _stage6_dynamo_disabled", role, _skipped)
 
     try:
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
@@ -370,28 +403,36 @@ def _apply_stage6_kernel_patches(m, *, role: str) -> None:
 
 
 class EvalEnvironmentPlugin:
-    """Stage 6 eval-environment plugin (S6-2 — registered-but-INERT).
+    """Stage 6 eval-environment plugin — live ``setup_environment`` owner.
 
     Owns the Stage 6 environment-setup concern: dataset revision pinning, the
     cu130/Hopper kernel patches, the MoE experts-implementation shim, the
     imatrix calibration-corpus build, and the torch.compile setup. The
-    standalone helpers (Pattern A) are relocated verbatim above and re-imported
-    by the monolith; the ordering glue and the torch.compile setup (Pattern B)
-    are reproduced in the ``setup_environment`` hook below.
+    standalone helpers are relocated verbatim above and re-imported by the
+    legacy ``stage6_validate.py`` shim; the ordering glue and the
+    torch.compile setup live in ``setup_environment`` below.
 
-    S6-2 wires this class into the plugin registry as metadata only — no
-    orchestrator walk or test invokes ``setup_environment``. S6-8 plugs the
-    hook into the live Stage 6 plugin sequencer and deletes the monolith
-    ``run()``.
+    Wiring (live since S6-8, commit 17134b2): ``stage6.orchestrator.run``
+    invokes ``walk_phases(("setup_environment",), plugins, run_ctx)`` once
+    per Stage 6 run. The legacy ``stage6_validate.run()`` is a thin
+    delegator into the orchestrator.
     """
 
     name = "eval_environment"
-    paper = "Stage 6 per-side eval environment setup (no upstream paper; VALIDATED_STRATEGIES §Stage 6). See module docstring."
+    paper = (
+        "Stage 6 per-side eval environment setup. No upstream paper — Spec §9 "
+        "(Stage 6 validation gate); see this module's docstring for the "
+        "downstream contract."
+    )
     config_key = "stage6_validate.experts_implementation"
     reads: tuple[str, ...] = ("model", "config", "artifacts_dir")
     writes: tuple[str, ...] = (
         "dataset_revisions", "imatrix_calib_path", "use_torch_compile",
         "pre_compile_forward", "experts_impl",
+        # C2 (iter1): generative-block experts-impl resolution lives in ctx
+        # so HumanEval/Math500 plugins can match teacher_provider.py's
+        # L607-616 pattern before calling generate().
+        "experts_implementation_generative",
     )
     provides: tuple[str, ...] = ()
 
@@ -409,25 +450,25 @@ class EvalEnvironmentPlugin:
         return {}
 
     def setup_environment(self, ctx: PipelineContext) -> None:
-        """Phase hook — Stage 6 eval-environment setup (S6-8 wiring surface).
+        """Phase hook — Stage 6 eval-environment setup (live).
 
-        INERT at S6-2: no orchestrator walk or test invokes this hook. S6-8
-        replaces the Stage 6 orchestrator body with the plugin sequencer and
-        dispatches this hook in place of the monolith's inline ``run()``
-        environment-setup block. The body below reproduces that inline block
-        faithfully — it is dead code at S6-2 but S6-8 relies on it once the
-        monolith ``run()`` is deleted.
+        Dispatched by ``stage6.orchestrator.run`` via
+        ``walk_phases(("setup_environment",), plugins, run_ctx)`` (S6-8,
+        commit 17134b2). The legacy ``stage6_validate.run()`` is a thin
+        delegator. Tests invoke this hook directly.
 
         This hook performs, in order:
 
         1. **Experts-implementation shim** — ``_set_experts_implementation_s6``
            (env var ``EXPERTS_IMPLEMENTATION`` overrides the YAML default
-           ``batched_mm``).
+           ``batched_mm``). Also resolves the generative-block override
+           ``EXPERTS_IMPLEMENTATION_GENERATIVE`` (default ``batched_mm``) and
+           publishes it via ctx; the actual switch is the responsibility of
+           the generative plugins (see contract below).
         2. **``model.eval()`` switch** — Stage 5 leaves the model in
            ``train()`` mode; the gate must run every sub-metric in inference
-           mode. The monolith ``run()`` flips the model right after the
-           experts-impl shim, so the hook reproduces it in the same relative
-           position.
+           mode. The legacy monolith ``run()`` flipped the model right after
+           the experts-impl shim, so the hook keeps that relative position.
         3. **Strict revision pinning** — ``_enforce_revision_pinning``.
         4. **imatrix calibration-corpus build** —
            ``_build_imatrix_calibration_corpus`` (after mkdir-ing
@@ -440,25 +481,58 @@ class EvalEnvironmentPlugin:
         7. **``masking_utils`` patch** — register ``'linear_attention'`` in
            ``transformers.masking_utils.LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING``
            so ``generate()`` on Qwen3.5-MoE does not raise
-           ``KeyError: 'linear_attention'``. The monolith applies this right
-           after the torch.compile block; the hook keeps that relative order.
+           ``KeyError: 'linear_attention'``. The legacy monolith applied this
+           right after the torch.compile block; the hook keeps that order.
 
-        Each result of steps 1/3/4/6 is written to the corresponding ctx slot
-        named in ``writes``. The step-2 inference-mode switch and the step-7
-        ``masking_utils`` patch are in-place mutations with no ctx slot.
+        ctx writes — each result of steps 1/3/4/6 is published via
+        ``ctx.set(...)`` to the corresponding slot named in ``writes``. The
+        step-2 inference-mode switch, the step-5 kernel patches, and the
+        step-7 ``masking_utils`` patch are in-place mutations with no ctx
+        slot.
 
-        Intentionally DEFERRED — present in the monolith's environment-setup
-        region but NOT this hook's concern:
+        Downstream contract (HumanEval / MATH-500 plugins MUST honor)
+        ------------------------------------------------------------
+        ``pre_compile_forward`` and ``experts_implementation_generative``
+        are populated for use by the generative-side plugins. Those plugins
+        MUST, before calling ``model.generate()``:
+
+        * Restore eager forward when applicable::
+
+              _pre = ctx.get("pre_compile_forward")
+              if _pre is not None:
+                  model.forward = _pre
+
+          Failure to do this leaves a compiled ``model.forward`` active
+          through ``generate()``, which on torch 2.11+cu130 + Triton 3.4
+          triggers an Inductor recompile storm on growing
+          ``cache_position`` and decode-shape codegen crashes (Hopper).
+
+        * Switch experts dispatch::
+
+              _gen_impl = ctx.get("experts_implementation_generative")
+              _cfg = getattr(model, "_orig_mod", model).config
+              if _gen_impl != getattr(_cfg, "_experts_implementation", None):
+                  _set_experts_implementation_s6(model, _gen_impl)
+
+          Failure to do this leaves whichever PPL/lm_eval experts impl is
+          active during generate; ``grouped_mm`` (Hopper PPL/lm_eval
+          default per ``teacher_provider.py`` L142-149) crashes on B=1
+          decode-shape on cu130.
+
+        The teacher-side equivalents are already implemented at
+        ``teacher_provider.py`` L602-616; the student-side equivalents
+        used to live in the legacy ``stage6_validate.py`` monolith
+        (commit 8d95f8e, "Option C: keep compile for prefill-only paths;
+        eager for generate()") and now belong to the generative plugins.
+
+        Intentionally DEFERRED — present in the legacy monolith's
+        environment-setup region but NOT this hook's concern:
 
         * the one-shot **Trackio config emit** (``stage6/config/*`` keys) —
-          deferred to the S6-7 report plugin;
+          owned by the S6-7 report plugin;
         * the **eval batch-size parsing / validation** (``ppl_batch_size``,
-          ``lm_eval_batch_size``, ``gen_batch_size``) — deferred to the
-          S6-3/S6-4 eval plugins that own those evals.
-
-        S6-8 deletes the monolith ``run()`` inline block and must route the
-        two deferred concerns to those plugins; this hook deliberately does
-        NOT reproduce them.
+          ``lm_eval_batch_size``, ``gen_batch_size``) — owned by the
+          S6-3/S6-4 eval plugins.
         """
         # Required slots — direct get(): a missing one is a wiring bug and
         # SHOULD raise.
@@ -475,6 +549,15 @@ class EvalEnvironmentPlugin:
             "EXPERTS_IMPLEMENTATION", s6.get("experts_implementation", "batched_mm")
         )
         _set_experts_implementation_s6(model, experts_impl)
+
+        # (1b) C2 (iter1): Resolve the generative-block experts-impl override
+        # here so the value lives in ctx for HumanEval/Math500 to consume.
+        # We do NOT switch the model here — the switch belongs to the
+        # generative plugins (see docstring "Downstream contract"), matching
+        # teacher_provider.py L607-616. Default matches teacher-side default.
+        experts_implementation_generative = os.environ.get(
+            "EXPERTS_IMPLEMENTATION_GENERATIVE", "batched_mm"
+        )
 
         # (2) Switch the model to inference mode before any sub-metric runs —
         # Stage 5 leaves it in train() mode. Reproduces the monolith run()'s
@@ -534,6 +617,14 @@ class EvalEnvironmentPlugin:
         # doesn't consume the attention mask anyway (it derives causality from
         # internal conv1d state via the torch-native fallback we just installed).
         # Same math, same outputs, no quality compromise.
+        # M2 (iter1): broadened from `except ImportError` to a generic Exception
+        # with a log.warning so a future transformers rename
+        # (`LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING` -> something else) or any
+        # other non-fatal failure surfaces in the log rather than crashing the
+        # whole Stage 6 run. The mapping mutation is process-global; we do not
+        # currently restore it (no teardown hook on PipelineContext) — the
+        # passthrough is semantically a no-op for non-Qwen3.5-MoE imports, so
+        # leaving the entry registered is benign for the rest of the process.
         try:
             from transformers import masking_utils as _mu
             _mapping = getattr(_mu, "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", None)
@@ -543,14 +634,26 @@ class EvalEnvironmentPlugin:
                     log.info("Stage 6: registered 'linear_attention' → full_attention mask "
                              "in LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING (transformers missing "
                              "entry for Qwen3.5-MoE GatedDeltaNet)")
-        except ImportError:
-            pass
+        except Exception as _exc:  # noqa: BLE001
+            log.warning(
+                "Stage 6: masking_utils linear_attention passthrough patch "
+                "skipped (%s: %s) — generate() on Qwen3.5-MoE may raise "
+                "KeyError: 'linear_attention' if transformers has renamed the "
+                "mapping.", type(_exc).__name__, _exc,
+            )
 
         ctx.set("experts_impl", experts_impl)
         ctx.set("dataset_revisions", dataset_revisions)
         ctx.set("imatrix_calib_path", imatrix_calib_path)
         ctx.set("use_torch_compile", use_torch_compile)
+        # C1 (iter1): pre_compile_forward MUST land in ctx whether or not
+        # torch.compile was applied. Generative plugins (HumanEval, Math500)
+        # read this slot to restore eager forward before generate() — see
+        # the "Downstream contract" section in this method's docstring.
         ctx.set("pre_compile_forward", pre_compile_forward)
+        # C2 (iter1): generative experts-impl resolution lives in ctx so
+        # HumanEval/Math500 plugins can match teacher_provider.py L607-616.
+        ctx.set("experts_implementation_generative", experts_implementation_generative)
 
 
 __all__ = [
