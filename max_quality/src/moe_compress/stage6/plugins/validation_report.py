@@ -1,4 +1,4 @@
-"""Validation final-report (S6-7 of the Stage 6 plugin-architecture refactor).
+"""Validation final-report plugin for the Stage 6 plugin orchestrator.
 
 Paper / spec source
 --------------------
@@ -25,48 +25,35 @@ threshold-check pass/fail / skipped-checks dict (via ``_check_thresholds``),
 the ``overall_pass`` aggregation across boolean threshold results, the
 JSON-artifact write, and the Trackio scalar flatten.
 
-Pattern A vs Pattern B
+Byte-identity contract
 ----------------------
-S6-7 covers a MIXED pattern:
-
-* **Pattern A -- relocated verbatim**: ``_deltas``,
-  ``_measured_reduction`` and ``_check_thresholds`` below are
-  character-identical copies of the monolith bodies.
-  ``stage6_validate.py`` re-imports the 3 FUNCTIONS (a ``# noqa: F401``
-  block) so ``run()`` and external callers/tests keep their original
-  import path. **Master plan §8 HOTSPOT** -- ``_deltas`` byte-identity is
-  load-bearing for the S6-0 golden snapshot: every NaN/Inf branch
-  (student-non-finite, teacher-non-finite, missing-key continue,
-  non-numeric continue, the defensive ``not math.isfinite(delta)`` branch
-  that is unreachable in IEEE 754 but preserved, and the
-  ``_non_finite_skipped`` / ``_teacher_non_finite_skipped`` sentinel-list
-  assembly) is preserved character-for-character. ``_check_thresholds``
-  is similarly byte-identical -- the ``skipped_checks`` sub-dict's exact
-  key names (``arc_challenge_acc_drop_ok``, ``hellaswag_acc_drop_ok``,
-  ``humaneval_pass_at_1_drop_ok``, ``math500_accuracy_drop_ok``,
-  ``measured_reduction_ok``, ``wikitext2_ppl_increase_ok``) are pinned by
-  the S6-0 golden's ``stage6_eval.json`` and must not drift.
-* **Pattern B -- reproduced in ONE inert hook**: the FINAL-REPORT block
-  at the tail of the monolith ``run()`` is INLINE ``run()`` code -- there
-  is nothing standalone to relocate. The ``assemble_report`` hook below
-  REPRODUCES that inline block faithfully; the monolith ``run()`` is NOT
-  modified for it. This is an intentional, temporary logic duplication
-  that resolves at S6-8 when the monolith ``run()`` is deleted and this
-  hook is wired live.
+``_deltas``, ``_measured_reduction`` and ``_check_thresholds`` below are
+character-identical copies of the legacy monolith bodies. **Master plan
+§8 HOTSPOT** -- ``_deltas`` byte-identity is load-bearing for the S6-0
+golden snapshot: every NaN/Inf branch (student-non-finite,
+teacher-non-finite, missing-key continue, non-numeric continue, the
+defensive ``not math.isfinite(delta)`` branch that is unreachable in
+IEEE 754 but preserved, and the ``_non_finite_skipped`` /
+``_teacher_non_finite_skipped`` sentinel-list assembly) is preserved
+character-for-character. ``_check_thresholds`` is similarly
+byte-identical -- the ``skipped_checks`` sub-dict's exact key names
+(``arc_challenge_acc_drop_ok``, ``hellaswag_acc_drop_ok``,
+``humaneval_pass_at_1_drop_ok``, ``math500_accuracy_drop_ok``,
+``measured_reduction_ok``, ``wikitext2_ppl_increase_ok``) are pinned by
+the S6-0 golden's ``stage6_eval.json`` and must not drift.
 
 Circular-import contract (mirror of ``stage6/plugins/teacher_provider.py``
 / ``stage6/plugins/imatrix_export.py``): this module imports only from
 ``..context`` / ``...utils`` / sibling plugin modules
 (``zero_shot_lm_eval``) / stdlib -- NEVER from ``stage6_validate``,
 ``stage6.orchestrator`` or ``orchestrator`` at any scope (module-top OR
-function-local). The monolith re-imports *this* module at load time, so
-a ``from ..stage6_validate import ...`` here would deadlock the import;
-nothing in this module does that.
+function-local).
 
-``ValidationReportPlugin`` is registered-but-INERT at S6-7 -- no
-orchestrator walk or test invokes its ``assemble_report`` hook. S6-8
-plugs the hook into the live Stage 6 plugin sequencer and deletes the
-monolith ``run()``.
+``ValidationReportPlugin.assemble_report`` is live since S6-8 (commit
+17134b2): the Stage 6 orchestrator instantiates the plugin and
+dispatches the ``assemble_report`` phase as the final step of the
+pipeline. The surviving ``stage6_validate.run()`` is a thin shim that
+delegates to the orchestrator.
 """
 from __future__ import annotations
 
@@ -445,22 +432,19 @@ def _check_thresholds(results: dict, thresholds: dict, *, s6_cfg: dict | None = 
 
 
 class ValidationReportPlugin:
-    """Stage 6 validation-report plugin (S6-7 -- registered-but-INERT).
+    """Stage 6 validation-report plugin (live since S6-8, commit 17134b2).
 
     Owns the Stage 6 final-report assembly: per-metric ``student``/``teacher``/
-    ``delta`` triples via the relocated ``_deltas``, the measured-reduction
-    ratio via the relocated ``_measured_reduction``, the threshold-check
-    results dict via the relocated ``_check_thresholds``, the ``overall_pass``
-    boolean aggregation across the boolean-valued threshold results, the
-    ``stage6_eval.json`` artifact write, and the Trackio scalar flatten. The
-    3 standalone helpers (Pattern A) are relocated verbatim above and
-    re-imported by the monolith; the inline-in-``run()`` assembly glue is
-    reproduced in the ``assemble_report`` hook below (Pattern B).
+    ``delta`` triples via ``_deltas``, the measured-reduction ratio via
+    ``_measured_reduction``, the threshold-check results dict via
+    ``_check_thresholds``, the ``overall_pass`` boolean aggregation across
+    the boolean-valued threshold results, the ``stage6_eval.json`` artifact
+    write, and the Trackio scalar flatten.
 
-    S6-7 wires this class into the plugin registry as metadata only -- no
-    orchestrator walk or test invokes ``assemble_report``. S6-8 plugs the
-    hook into the live Stage 6 plugin sequencer and deletes the monolith
-    ``run()``.
+    The Stage 6 orchestrator instantiates this plugin and dispatches the
+    ``assemble_report`` phase as the final step of the pipeline; the
+    surviving ``stage6_validate.run()`` is a thin shim that delegates to the
+    orchestrator.
     """
 
     name = "validation_report"
@@ -500,16 +484,10 @@ class ValidationReportPlugin:
         return {}
 
     def assemble_report(self, ctx: PipelineContext) -> None:
-        """Phase hook -- final-report assembly (S6-8 wiring surface).
+        """Phase hook -- final-report assembly (live since S6-8, commit 17134b2).
 
-        INERT at S6-7: no orchestrator walk or test invokes this hook. S6-8
-        replaces the Stage 6 orchestrator body with the plugin sequencer and
-        dispatches this hook in place of the monolith's inline ``run()``
-        final-block. The body below reproduces that inline block faithfully
-        -- it is dead code at S6-7 but S6-8 relies on it once the monolith
-        ``run()`` is deleted.
-
-        Reproduces the monolith ``run()``'s final block:
+        Dispatched by the Stage 6 orchestrator as the final phase of the
+        pipeline. Performs the following steps:
 
         1. Compute ``results["delta"]`` via ``_deltas(student, teacher)``.
         2. Compute ``results["measured_reduction"]`` via
@@ -536,14 +514,15 @@ class ValidationReportPlugin:
           * ``artifacts_dir`` (Path)
           * ``student_results`` (dict[str, float])
           * ``teacher_results`` (dict[str, float])
-          * ``student_param_counts`` (dict with ``total`` / ``expert`` keys)
-          * ``teacher_param_counts`` (dict with ``total`` / ``expert`` keys
-            -- the monolith path that loads the teacher from disk on
-            cache-miss falls back to count_parameters_effective on the live
-            ``teacher`` model; in the plugin path the counts are supplied
-            via this ctx slot, by the teacher-provider plugin)
 
         Optional ctx slots:
+          * ``student_param_counts`` (dict with ``total`` / ``expert`` keys --
+            when absent, ``_measured_reduction`` falls back to
+            ``count_parameters_effective`` on the live ``student_model``).
+          * ``teacher_param_counts`` (dict with ``total`` / ``expert`` keys --
+            normally supplied by the teacher-provider plugin; when absent,
+            ``_measured_reduction`` falls back to a CPU teacher reload via
+            ``config["model"]`` to recompute the counts).
           * ``student_model`` (nn.Module | None -- only consulted when
             ``student_param_counts`` is missing, matching the monolith
             ``run()``'s ``_measured_reduction(model, student_total=...,
@@ -599,6 +578,8 @@ class ValidationReportPlugin:
             results["imatrix_skipped"] = True
 
         # Only boolean entries in thresholds count toward overall_pass; skipped_checks is a dict.
+        # Schema-driven isinstance(v, bool) filter (rather than a hard-coded "skipped_checks"
+        # blocklist) so any future non-bool sub-dicts under thresholds are handled uniformly.
         _bool_checks = {k: v for k, v in results["thresholds"].items() if isinstance(v, bool)}
         if not _bool_checks:
             log.warning("Stage 6: no threshold checks were performed (all keys missing from config); overall_pass=False")
