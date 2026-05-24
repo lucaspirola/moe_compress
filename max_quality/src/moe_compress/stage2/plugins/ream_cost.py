@@ -1,30 +1,155 @@
-"""REAM cost-matrix construction (Task 8 of the plugin-architecture refactor).
+"""REAM symmetric pre-alignment cost matrix builder (Eqs. 5, 7, 8).
 
-Home of ``_ream_cost_matrix`` — the REAM cost-matrix builder with three
-alignment modes (``pre`` / ``post`` / ``output``) — and its vectorized helper
-``_extract_sim_expert_matrix_from_tensor``. Both moved verbatim out of
-``stage2_reap_ream.py``; that module re-imports them so external callers and
-tests keep their existing import paths.
+Paper
+-----
+Liu et al., "REAM: Routing Expert Activation Merging for MoE
+Compression" — arXiv:2604.04356.
+audit/spec_compliance/01_papers/2604.04356/source.md.
 
-Circular-import note: ``stage2_reap_ream`` imports *this* module at load time,
-so a module-top ``from ...stage2_reap_ream import ...`` here would deadlock the
-import — neither branch does that. Both the ``post`` (``ream_cost_post``, T9)
-and the ``output`` (``output_space_cost``, T10) branches now import their cost
-helper from a cycle-free sibling plugin module via a single-dot **function-scope
-import**, kept symmetric. Either could be a module-top import now, but the
-function-scope form costs nothing once the module is cached.
+This module implements the REAM Step 2 cost matrix (project §5 Step 2)
+combining two activation-space similarities into a single greedy-assignment
+cost:
 
-``ReamCostPrePlugin`` is the live plugin home for the ``pre`` cost path. S2-6
-wired its ``compute_cost`` hook into the ``compute_cost`` assignment slot: when
-``cost_alignment`` resolves to ``"pre"`` this plugin is registered ahead of the
-``LegacyAdapter`` and wins ``PluginRegistry.dispatch_first`` for the slot. All
-three cost plugins share the verbatim slot body via the module-level helper
-``_compute_cost_for_plugin`` below to avoid three drifting copies. S2-10 moved
-the per-layer capacity-utilization gate out into
-``CapacityGatePlugin.select_alignment`` (a separate slot that runs earlier in
-the bump iteration); ``_compute_cost_for_plugin`` now just reads the gate's
-decision (``effective_cost_alignment`` / ``effective_cost_asymmetric``) back
-off ``ctx``.
+- δ_gate(i, j) — REAM Eq. 5. Similarity between pre-softmax router-logit
+  profile vectors. Each expert's profile is a vector of length ``|X|``
+  (one pre-softmax logit per calibration token). Profiles are
+  L2-row-normalized, then pairwise Euclidean distances are computed;
+  ``dist2sim`` converts to similarity via ``1 − d / max(d)``.
+  ``δ_gate ∈ [0, 1]`` — higher = more similar.
+
+- δ̃_expert(i, j) — REAM Eq. 8. Mean per-token cosine similarity of the
+  two experts' full-softmax-gated outputs:
+  ``δ̃_expert(i, j) = (1/|X|) · Σ_x sim(σ(x)_i · E_i(x), σ(x)_j · E_j(x))``
+  where ``σ(x)_e`` is the FULL UNMASKED softmax weight (not the
+  dispatched top-k weight). The raw cosine ∈ [−1, 1] is rescaled to
+  [0, 1] via ``(cos + 1) / 2``.
+
+- δ_REAM(i, j) — combination. The working similarity for greedy
+  assignment. ``δ_REAM(i, j) = (δ_gate + δ̃_expert) / 2 ∈ [0, 1]``.
+  The cost passed to the assignment solver is
+  ``cost(i, j) = 1 − δ_REAM(i, j) ∈ [0, 1]``.
+
+Routing-weight notation
+-----------------------
+- REAM (this paper) uses ``σ(x)_j`` for the **full unmasked softmax**
+  weight (strictly positive for every expert on every token).
+- REAP (arXiv:2510.13999) uses ``g_j(x)`` for the **masked** top-k
+  weight (zero for non-top-k experts).
+
+This plugin implements the REAM-side ``σ(x)_j`` view for the Eq. 8
+numerator (full unmasked softmax over all experts with no top-k mask,
+no renormalization; confirmed by the reference implementation at
+``ream/moe_utils.py`` lines 157-158, 173-174 in the upstream repo).
+:mod:`stage2.plugins.reap_scoring` owns the REAP-side ``g_j(x)`` view.
+
+Official code
+-------------
+``SamsungSAILMontreal/ream`` @ commit
+``84a3030716a0059589e9d10e2ea049e32b76cfa6`` (2026-04-16) —
+github.com/SamsungSAILMontreal/ream. Cross-checked formulas against
+``ream/ream.py`` lines 37-41 (δ_gate), 99-113 (δ̃_expert),
+46-53 (δ_REAM aggregation), 60-87 (greedy assignment).
+
+Deviation: D-ream-similarity-rescale
+------------------------------------
+Paper Eqs. 4-5 use the raw cosine similarity directly. This plugin
+rescales both components to [0, 1]:
+
+- δ_gate: L2-row-normalize profiles → pairwise Euclidean distance →
+  ``dist2sim`` (= ``1 − d / max(d)``).
+- δ̃_expert: raw cosine ∈ [−1, 1] rescaled as ``(cos + 1) / 2`` ∈ [0, 1].
+
+Both transforms are monotone in the underlying cosine, so greedy
+ranking (and therefore the centroid→non-centroid assignment) is
+preserved. The [0, 1] range is cross-stage-comparable, lets δ_gate and
+δ̃_expert be averaged on the same footing (D-ream-aggregation), and
+matches the bounded similarity scales used elsewhere (e.g. Stage 3).
+
+For δ_gate specifically: the L2-norm + Euclidean + ``dist2sim`` chain
+is a monotone transform of the paper's raw cosine into [0, 1] (since
+``dist = √(2 − 2·cos)`` on unit vectors, and ``1 − dist/max(dist)`` is
+monotone-decreasing in ``dist``); greedy ranking is preserved.
+
+Deviation: D-ream-aggregation
+-----------------------------
+Paper Eq. 7 sums the two components as ``δ_REAM = δ_g + δ̃_E``. This
+plugin uses the **mean**: ``δ_REAM = (δ_gate + δ̃_expert) / 2``.
+
+Monotone in each component, so the joint greedy ranking matches the
+paper's exactly when components agree on the pair; it is a
+project-original re-weighting otherwise. The /2 normalization keeps
+cost values in [0, 1] for cross-stage diagnostic comparability
+(Stage 3 also uses [0, 1] similarities) and lets the cost-threshold
+logic (``ream_cost_sigma_threshold``) operate on bounded,
+mean-relative quantities.
+
+Deviation: D-ream-sparse-routing
+--------------------------------
+Paper Eq. 8 is defined over expert outputs ``E_e(x)``; it does not
+specify behavior when an expert is not dispatched on token ``x``. This
+plugin's convention:
+
+- For jointly-active tokens: compute ``σ(x)_e · E_e(x)`` with the
+  full-softmax weight ``σ(x)_e`` and the actual computed expert output
+  ``E_e(x)``.
+- For non-jointly-active tokens: contribute zero to the numerator
+  (expert output not computed under top-k dispatch) while keeping the
+  full ``|X|`` in the denominator.
+- NaN-handling: if a jointly-active token produces a zero gated-output
+  vector for one expert (extremely rare; cosine undefined), the
+  per-token cosine is treated as ``0`` (after rescale: ``0.5``,
+  neutral) rather than excluded from ``|X|``.
+
+The convention deflates ``δ̃_expert`` in proportion to the
+jointly-active fraction, biasing greedy assignment toward expert pairs
+that co-fire — desirable, since pairs that rarely co-activate carry
+little merge signal.
+
+Deviation: D-ream-resume-fallback
+---------------------------------
+A separate deviation for the merge step (D5b mandates
+``C = C_act + C_wt`` for the Hungarian intermediate-neuron alignment).
+Resume from a partial directory created **before** the B-iter5-M-2
+fix (which began persisting ``_neuron_means_layer{li}.pt`` per merged
+layer) cannot reconstruct ``C_act`` from disk — the implementation
+logs ERROR and falls back to weight-only
+``C = _safe_norm(C_gate + C_up)``. Merges produced from pre-2026-05-07
+partial directories diverge cosmetically from a fresh run on the
+affected layers. Documented here because the plugin is the entry point
+for the C_act consumer; the actual fallback path lives in the merge
+helper :mod:`stage2.merging`. New runs from scratch always persist
+neuron-means and resume spec-compliantly.
+
+Output context contract
+-----------------------
+``_compute_cost_for_plugin`` is the shared body for all three cost
+plugins (``pre`` / ``post`` / ``output``); each plugin selects the
+appropriate alignment branch via the capacity-utilization gate's
+``effective_cost_alignment`` decision on ``ctx``.
+
+Original module-header circular-import note
+-------------------------------------------
+``stage2_reap_ream`` imports *this* module at load time, so a module-top
+``from ...stage2_reap_ream import ...`` here would deadlock the import —
+neither branch does that. Both the ``post`` (``ream_cost_post``, T9) and
+the ``output`` (``output_space_cost``, T10) branches now import their
+cost helper from a cycle-free sibling plugin module via a single-dot
+**function-scope import**, kept symmetric. Either could be a module-top
+import now, but the function-scope form costs nothing once the module
+is cached.
+
+``ReamCostPrePlugin`` is the live plugin home for the ``pre`` cost path.
+S2-6 wired its ``compute_cost`` hook into the ``compute_cost`` assignment
+slot: when ``cost_alignment`` resolves to ``"pre"`` this plugin is
+registered ahead of the ``LegacyAdapter`` and wins
+``PluginRegistry.dispatch_first`` for the slot. All three cost plugins
+share the verbatim slot body via the module-level helper
+``_compute_cost_for_plugin`` below to avoid three drifting copies. S2-10
+moved the per-layer capacity-utilization gate out into
+``CapacityGatePlugin.select_alignment`` (a separate slot that runs
+earlier in the bump iteration); ``_compute_cost_for_plugin`` now just
+reads the gate's decision (``effective_cost_alignment`` /
+``effective_cost_asymmetric``) back off ``ctx``.
 """
 from __future__ import annotations
 
@@ -344,7 +469,17 @@ class ReamCostPrePlugin:
     """
 
     name = "ream_cost_pre"
-    paper = "REAM symmetric pre-alignment cost matrix builder."
+    paper = (
+        "REAM Eqs. 5/7/8: δ_REAM = (δ_gate + δ̃_expert)/2 — arXiv:2604.04356 "
+        "(Liu et al.). Official code: SamsungSAILMontreal/ream @ "
+        "84a3030716a0059589e9d10e2ea049e32b76cfa6 "
+        "(ream/ream.py L37-41/L99-113/L46-53, moe_utils.py L157-158/L173-174). "
+        "Deviations: D-ream-aggregation (mean vs paper's sum, monotone-rank-"
+        "preserving), D-ream-similarity-rescale (both components rescaled to "
+        "[0,1], monotone), D-ream-sparse-routing (non-jointly-active tokens "
+        "contribute 0 numerator + full |X| denominator), D-ream-resume-fallback "
+        "(weight-only C on pre-2026-05-07 partials). See module docstring."
+    )
     config_key = "stage2_reap_ream.cost_alignment"
     reads: tuple[str, ...] = _COST_PLUGIN_READS
     writes: tuple[str, ...] = _COST_PLUGIN_WRITES  # () — S2-10 moved the gate out
