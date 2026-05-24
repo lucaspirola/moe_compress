@@ -1,8 +1,67 @@
-"""Sinkhorn assignment solver (Task 13 of the plugin-architecture refactor).
+"""Capacitated entropy-regularized OT (Sinkhorn-Knopp) assignment.
 
-Plugin home for ``_assign_sinkhorn`` — the capacitated entropy-regularized
-optimal-transport solver (log-domain Sinkhorn-Knopp with linear ε-annealing).
-Extracted verbatim from ``stage2_reap_ream`` in Task 13.
+Paper
+-----
+Sinkhorn-Knopp algorithm for entropy-regularized optimal transport;
+Cuturi (2013), "Sinkhorn Distances: Lightspeed Computation of Optimal
+Transport". This plugin uses a log-domain Sinkhorn-Knopp with linear
+ε-annealing.
+
+This plugin is deviation D-sinkhorn-soft-assign from arXiv:2604.04356
+(REAM): the project adds an OT-based alternative to the paper-faithful
+descending-saliency greedy (see
+:mod:`stage2.plugins.solver_greedy`). Soft-assignment via OT is then
+projected to a hard assignment by argmax over real centroids per
+non-centroid.
+
+Official code
+-------------
+Standard Sinkhorn-Knopp pseudocode (Cuturi 2013); no upstream code to
+pin. Implementation is project-original (``_assign_sinkhorn``).
+
+Deviation: D-sinkhorn-soft-assign
+---------------------------------
+Solve
+
+    min Σ T_cm · d_cm + ε · Σ T_cm log T_cm
+
+with Sinkhorn-Knopp iterations (linear ε-anneal ``1.0 → 0.01`` over
+``sinkhorn_iters`` ≈ 200), then argmax over real centroids per
+non-centroid for the hard assignment.
+
+The capacity inequality ``Σ_m T_cm ≤ C_max`` is converted to equality
+via a **dummy slack child** with marginal ``n_C · C_max − n_NC`` and
+uniform high cost — standard partial-OT trick (Cuturi 2013 + dummy
+marginal). Cost matrix normalized to ``[0, 1]`` before Sinkhorn
+iterations so ε values are scale-invariant (positive affine
+transformation invariance of OT).
+
+This is **not** Sparsity-Constrained OT (arXiv:2209.15466), which uses
+quadratic regularization with a first-order semi-dual solver and
+cardinality (``‖T‖_0 ≤ k``) constraints — different scheme entirely.
+
+Implementation detail: the STRATEGY_NEXT §5 step 4d spec frames the
+construction as a dummy *centroid*; the implementation uses a dummy
+*child* (rows-side dummy). The two are dual under argmax over real
+centroids and produce the same hard assignment; the slack-child form
+is simpler because the real-children argmax never has to filter out a
+dummy column.
+
+Sinkhorn falls back to greedy on infeasibility
+(``n_C · C_max < n_NC``) with a clear warning.
+
+Currently opt-in (default off); gated default flip on
+``A9 vs A8 ≥ +0.1 GEN-avg`` per STRATEGY_NEXT §8 ablation matrix.
+
+Output context contract
+-----------------------
+Pure callable plugin (no state). Returns the layer's assignment from
+the input cost matrix + scores + frequencies.
+
+Naming-history note
+-------------------
+Step 3 of the REAM pipeline alternative-solver branch. Existing log
+lines / Trackio keys preserved for dashboard back-compat.
 
 Imports ``_assign_greedy`` from ``solver_greedy`` as the infeasible-slack /
 no-finite-entries fallback. The monolith re-imports ``_assign_sinkhorn``.
@@ -155,7 +214,14 @@ class SinkhornSolverPlugin:
     """
 
     name = "solver_sinkhorn"
-    paper = "Capacitated entropy-regularized OT assignment via Sinkhorn-Knopp."
+    paper = (
+        "Capacitated entropy-regularized OT via log-domain Sinkhorn-Knopp "
+        "(Cuturi 2013) with linear ε-anneal and slack-child dummy. "
+        "Alternative to REAM §4 greedy (see :mod:`stage2.plugins.solver_greedy`); "
+        "implements deviation D-sinkhorn-soft-assign from baseline REAM "
+        "arXiv:2604.04356. Falls back to greedy on infeasibility. "
+        "See module docstring."
+    )
     config_key = "stage2_reap_ream.assignment_solver"
     # S2-8: the live solve_assignment slot reads the per-bump scratch slots.
     reads: tuple[str, ...] = ("_iter_n_ream_nc", "_iter_n_ream_c")
