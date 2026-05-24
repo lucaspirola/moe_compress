@@ -1,5 +1,20 @@
 """Thermometer teacher-cache provider (S6A-4 of the Stage 6alt plugin-architecture refactor).
 
+Paper / spec source
+--------------------
+Sweep-cache mirror of :mod:`stage6.plugins.teacher_provider`. The
+thermometer runs many ablation rows against the SAME uncompressed
+teacher on the SAME fixed corpus, so the teacher's BPT +
+zero-shot-subset + per-token argmax are constant across rows and
+computed ONCE per sweep.
+
+Cache invariant: SHA-256 key over teacher SHA, corpus selector, lm-eval
+task config, and tokenizer SHA. Stored as a sidecar parallel to the
+Stage 6 ``teacher_eval_cache`` (separate key namespace so the thermometer
+cache cannot collide with the Stage 6 cache).
+
+Project-original sweep harness; no upstream paper.
+
 Home of the Stage 6alt thermometer teacher-side concern, extracted from
 the legacy ``stage6alt_thermometer.py`` monolith. The thermometer's
 teacher BPT + lm-eval subset + per-token argmax are constant across all
@@ -183,14 +198,7 @@ class ThermoTeacherProviderPlugin:
     """
 
     name = "thermo_teacher_provider"
-    paper = (
-        "Stage 6alt thermometer — sweep-shared teacher BPT + lm-eval subset "
-        "cache. The teacher is constant across all 12 ablation rows (same "
-        "uncompressed model, same fixed corpus), so teacher_results are "
-        "computed once and cached on disk under a corpus_id-keyed SHA-256; "
-        "see stage6alt_thermometer.py module docstring for the bpt_gap / "
-        "top1_agreement interpretation that consumes these results."
-    )
+    paper = "Stage 6alt thermometer teacher-cache provider — SHA-256-keyed per-sweep cache (project-original sweep harness). See module docstring."
     config_key = "stage6_validate.thermometer"
     reads: tuple[str, ...] = (
         "config", "artifacts_dir", "tokenizer", "calib_ids", "corpus_id",
