@@ -1,7 +1,53 @@
-"""Greedy assignment solver (Task 13 of the plugin-architecture refactor).
+"""REAM paper-faithful greedy assignment (descending-saliency single-pass).
 
-Plugin home for ``_assign_greedy`` — the legacy descending-saliency greedy
-assignment path. Extracted verbatim from ``stage2_reap_ream`` in Task 13.
+Paper
+-----
+Liu et al., "REAM" — arXiv:2604.04356, §4.
+audit/spec_compliance/01_papers/2604.04356/source.md.
+
+Step 3 of the REAM pipeline (per project §5 Step 3): top-``N'_l``
+experts by REAP score become **centroids**. Non-centroids are assigned
+to centroids via a **single-pass greedy algorithm**:
+
+  1. Iterate centroids in **descending saliency order** (most salient
+     first — order is important).
+  2. For each centroid, absorb up to ``max_merge_group_size`` unassigned
+     non-centroids with the **lowest cost** (most similar), in order.
+  3. The loop exits early once all non-centroids are assigned.
+
+Every non-centroid is guaranteed to be assigned — the feasibility
+check (see :mod:`stage2.plugins.layer_merge`, D-ream-budget-bump)
+ensures full coverage.
+
+Reference: ``ream/ream.py`` lines 63-87 in the upstream
+``SamsungSAILMontreal/ream`` repository, pinned at commit
+``84a3030716a0059589e9d10e2ea049e32b76cfa6`` (2026-04-16).
+
+Official code
+-------------
+``SamsungSAILMontreal/ream`` @ ``84a3030716a0059589e9d10e2ea049e32b76cfa6``,
+``ream/ream.py:63-87``. The plugin's ``_assign_greedy`` is a verbatim
+re-implementation of that loop in NumPy.
+
+Deviations
+----------
+None — this branch is paper-faithful. The alternative solvers (Hungarian,
+MCF, Sinkhorn) implement deviation D-mcf-assignment /
+D-sinkhorn-soft-assign; see their respective modules.
+
+The default ``assignment_solver`` is ``"greedy"``, reproducing the
+v1 baseline byte-identically.
+
+Output context contract
+-----------------------
+Pure callable plugin (no state). Returns the layer's assignment from
+the input cost matrix + scores + frequencies.
+
+Naming-history note
+-------------------
+Step 3 of the REAM pipeline (project §5 Step 3). The current plugin
+architecture has no step-numbering taxonomy; new prose drops the
+labels. Existing log lines / Trackio keys preserved.
 
 This is the **leaf** of the solver import DAG: it imports nothing from the
 sibling solver modules (greedy never falls back to another solver). The other
@@ -122,7 +168,14 @@ class GreedySolverPlugin:
     """
 
     name = "solver_greedy"
-    paper = "Greedy descending-saliency assignment solver."
+    paper = (
+        "REAM §4 descending-saliency single-pass greedy assignment — "
+        "arXiv:2604.04356 (Liu et al.). Paper-faithful (no deviations). "
+        "Official code: SamsungSAILMontreal/ream @ "
+        "84a3030716a0059589e9d10e2ea049e32b76cfa6 (ream/ream.py L63-87). "
+        "Default assignment_solver; alternative solvers implement "
+        "D-mcf-assignment / D-sinkhorn-soft-assign."
+    )
     config_key = "stage2_reap_ream.assignment_solver"
     # S2-8: the live solve_assignment slot reads the per-bump scratch slots.
     reads: tuple[str, ...] = ("_iter_n_ream_nc", "_iter_n_ream_c")
