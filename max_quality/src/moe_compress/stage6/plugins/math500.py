@@ -1,5 +1,23 @@
 """MATH-500 accuracy generative eval (S6-4 of the Stage 6 plugin refactor).
 
+Paper / dataset
+----------------
+MATH-500 — Hendrycks et al. 2021 (arXiv:2103.03874) original MATH
+benchmark; the 500-problem subset is Lightman et al. 2024 (OpenAI's
+``prm800k`` curation). Scoring: ``\boxed{...}`` extraction +
+SymPy symbolic equivalence.
+
+Stage 6 implementation note: each problem is wrapped in the model's
+chat template, the model generates chain-of-thought +
+``\boxed{answer}``, and the gate is computed over all 500 prompts.
+
+Reference code
+--------------
+No single canonical implementation. The ``\boxed{}`` extraction +
+SymPy grading follows the canonical math-eval recipe (PRM800k /
+DeepSeek-Math / Qwen-Math implementations all converge on this
+form).
+
 Home of the Stage 6 MATH-500 concern, extracted from the legacy
 ``stage6_validate.py`` monolith. MATH-500 is the math-reasoning half of the
 Stage 6 generative gate: each problem is wrapped in the model's chat template,
@@ -275,11 +293,7 @@ class Math500Plugin:
     """
 
     name = "math500"
-    paper = (
-        "MATH-500 accuracy -- Hendrycks et al. 2021, Measuring Mathematical "
-        "Problem Solving (arXiv:2103.03874); the 500-problem subset of Lightman "
-        "et al. 2023 (arXiv:2305.20050); Stage 6 validation gate, generative half."
-    )
+    paper = "MATH-500 — Hendrycks et al. 2021 arXiv:2103.03874 (subset Lightman et al. 2024); SymPy-graded \boxed extraction. See module docstring."
     config_key = "stage6_validate.generative.enabled"
     reads: tuple[str, ...] = ("model", "tokenizer", "config", "dataset_revisions")
     writes: tuple[str, ...] = ("eval_results",)
