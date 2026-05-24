@@ -44,13 +44,13 @@ dispatches ``select_alignment`` once per bump iteration BEFORE the
 ``compute_cost`` slot. The gate computes ``capacity_util_value`` /
 ``effective_cost_alignment`` / ``effective_cost_asymmetric`` and
 writes them to ``ctx``; the cost plugins' ``compute_cost`` then just
-READS those slots back. ``LegacyAdapter.compute_assignment`` imports
-``_pick_effective_alignment`` from *this* module (its true home), not
-via the monolith re-import.
+READS those slots back. ``orchestrator.py`` imports
+``_pick_effective_alignment`` from *this* module (its true home, see
+``orchestrator.py:139``), not via the monolith re-import.
 
-Circular-import note: this module imports only ``pipeline.base`` and
-``pipeline.context`` — neither imports ``stage2_reap_ream``. There is
-therefore no cycle at module load.
+Circular-import note: this module imports only ``pipeline.context`` —
+which does not import ``stage2_reap_ream``. There is therefore no
+cycle at module load.
 
 Naming-history note
 -------------------
@@ -175,8 +175,8 @@ class CapacityGatePlugin:
         Returns ``effective_cost_alignment`` (a non-None string) so
         ``PluginRegistry.dispatch_first`` registers this plugin as the winner.
         """
-        n_ream_c = ctx.get("_iter_n_ream_c")
-        n_ream_nc = ctx.get("_iter_n_ream_nc")
+        n_ream_c = int(ctx.get("_iter_n_ream_c"))
+        n_ream_nc = int(ctx.get("_iter_n_ream_nc"))
 
         # Stage 2 v2 capacity-utilization gate (M3, spec § 5 step 3):
         #   u = n_NC / (N'_l × C_max). When u < threshold, the layer
