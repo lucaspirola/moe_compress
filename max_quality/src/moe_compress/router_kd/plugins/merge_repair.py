@@ -286,18 +286,21 @@ class _LayerOutputCapture:
     grad so the MSE term backpropagates into the merged experts + router.
 
     Shared-expert pass-through note (Qwen3-MoE family). The Qwen3-MoE block
-    returns ``shared_expert(x) + sum_i g_i(x) * routed_expert_i(x)``. The hook
-    fires on the block as a whole, so the captured tensor is the *sum* of the
+    returns ``σ(shared_expert_gate(x)) * shared_expert(x) + sum_i g_i(x) *
+    routed_expert_i(x)`` (the shared-expert output is wrapped by a
+    sigmoid-gated scalar ``shared_expert_gate``). The hook fires on the
+    block as a whole, so the captured tensor is the *sum* of the
     shared-expert and routed-expert paths — not the routed contribution alone.
     Merge-repair unfreezes only the routed-expert centroid rows
     (:func:`_experts_param_tensors` walks ``gate_up_proj`` / ``down_proj`` on
-    ``experts_module``, never on the shared expert). Consequence: the
-    shared-expert contribution is the SAME tensor at student and teacher iff
-    no upstream stage has modified the shared expert, in which case the term
-    cancels in the difference and the MSE depends only on the routed-expert
-    output gap. If Stage 2 / Stage 3 (or any future stage) ever edits the
-    shared expert, that pass-through becomes a non-zero residual baked into
-    the MSE — visible at flag-on but invisible at flag-off.
+    ``experts_module``, never on the shared expert or its gate). Consequence:
+    the shared-expert contribution (gate scalar included) is the SAME tensor
+    at student and teacher iff no upstream stage has modified the shared
+    expert or ``shared_expert_gate``, in which case the term cancels in the
+    difference and the MSE depends only on the routed-expert output gap. If
+    Stage 2 / Stage 3 (or any future stage) ever edits the shared expert or
+    its gate, that pass-through becomes a non-zero residual baked into the
+    MSE — visible at flag-on but invisible at flag-off.
     """
 
     def __init__(self, model: nn.Module, layer_indices: "set[int]", *, detach: bool):
@@ -356,10 +359,10 @@ def _merge_repair_mse(
     parity, not as a calibrated coefficient. The natural scale of the
     vocab-KL Eq. 3 term (``KL(softmax(s_t/τ) || softmax(s_s/τ)) · τ²``)
     differs from a hidden-state MSE by orders of magnitude depending on the
-    student/teacher dtype, the activation magnitudes at each block boundary,
-    and τ. When enabling Direction E for a real recovery run, ``mse_weight``
-    should be tuned (typical sweep range 1e-3 … 1e1) so the MSE term does
-    not dominate or vanish next to the vocab-KL term in
+    activation magnitudes at each block boundary and τ. When enabling
+    Direction E for a real recovery run, ``mse_weight`` should be tuned
+    (typical sweep range 1e-3 … 1e1) so the MSE term does not dominate or
+    vanish next to the vocab-KL term in
     :meth:`VocabKdPlugin.compute_kd_loss`.
     """
     if not layer_indices:
