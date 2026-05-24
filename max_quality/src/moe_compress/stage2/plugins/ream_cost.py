@@ -14,7 +14,9 @@ cost:
   profile vectors. Each expert's profile is a vector of length ``|X|``
   (one pre-softmax logit per calibration token). Profiles are
   L2-row-normalized, then pairwise Euclidean distances are computed;
-  ``dist2sim`` converts to similarity via ``1 − d / max(d)``.
+  ``dist2sim`` converts to similarity via ``1 − d / max(d)``
+  (reference: ``ream/ream.py`` L37-42 — L37 is the gate-logits guard,
+  L42 produces ``sim_gate = dist2sim(d_gate, ...)`` in [0, 1]).
   ``δ_gate ∈ [0, 1]`` — higher = more similar.
 
 - δ̃_expert(i, j) — REAM Eq. 8. Mean per-token cosine similarity of the
@@ -39,7 +41,9 @@ Routing-weight notation
 This plugin implements the REAM-side ``σ(x)_j`` view for the Eq. 8
 numerator (full unmasked softmax over all experts with no top-k mask,
 no renormalization; confirmed by the reference implementation at
-``ream/moe_utils.py`` lines 157-158, 173-174 in the upstream repo).
+``ream/moe_utils.py`` lines 146-147 (full unmasked softmax under the
+``gated_sim`` branch) and 170-171 (per-expert output multiplied by
+``softmax_logits[:, i]``) in the upstream repo).
 :mod:`stage2.plugins.reap_scoring` owns the REAP-side ``g_j(x)`` view.
 
 Official code
@@ -47,8 +51,14 @@ Official code
 ``SamsungSAILMontreal/ream`` @ commit
 ``84a3030716a0059589e9d10e2ea049e32b76cfa6`` (2026-04-16) —
 github.com/SamsungSAILMontreal/ream. Cross-checked formulas against
-``ream/ream.py`` lines 37-41 (δ_gate), 99-113 (δ̃_expert),
-46-53 (δ_REAM aggregation), 60-87 (greedy assignment).
+``ream/ream.py`` lines 37-42 (δ_gate: profile build through
+``sim_gate = dist2sim(...)`` producing the [0,1] bounded similarity),
+99-113 (per-pair cosine ``(cos+1)/2`` in ``expert_similarity``; the
+σ(x)-gating that completes δ̃_expert lives in
+``ream/moe_utils.py`` lines 146-147 / 170-171), 51-61 (δ_REAM
+aggregation ``sim_out = (sim_out + sim_gate[i, j]) / 2`` at L57,
+within the pair distance-loop body L51-61), 60-87 (greedy
+assignment).
 
 Deviation: D-ream-similarity-rescale
 ------------------------------------
@@ -276,7 +286,8 @@ def _ream_cost_matrix(
 
     # Compute δ_gate over the non-protected expert population so that dist2sim
     # normalizes by the global maximum distance among non-protected experts
-    # (spec §5 Step 2, REAM ref ream/ream.py lines 37-41). Including protected
+    # (spec §5 Step 2, REAM ref ream/ream.py lines 37-42 — through the
+    # ``sim_gate = dist2sim(d_gate, ...)`` call at L42). Including protected
     # (super-expert) IDs would let their extreme gate-logit distances dominate
     # d.max(), compressing all noncentroid–centroid similarities toward 1.0
     # — DIST2SIM-PROTECTED-BIAS.
@@ -321,7 +332,9 @@ def _ream_cost_matrix(
     )  # (n_nc, n_c) float64
 
     # δ_REAM = (δ_gate + δ̃_expert) / 2 ∈ [0,1]; cost = 1 − δ_REAM ∈ [0,1].
-    # Lower cost = more similar (spec §5 Step 2, reference ream/ream.py L46-53).
+    # Lower cost = more similar (spec §5 Step 2, reference ream/ream.py L51-61
+    # — the pair distance-loop body; the actual aggregation is the line
+    # ``sim_out = (sim_out + sim_gate[i, j]) / 2`` at L57).
     cost = 1.0 - (sim_gate_sub + sim_expert_matrix) / 2.0
     np.clip(cost, 0.0, 1.0, out=cost)
 
@@ -473,7 +486,12 @@ class ReamCostPrePlugin:
         "REAM Eqs. 5/7/8: δ_REAM = (δ_gate + δ̃_expert)/2 — arXiv:2604.04356 "
         "(Liu et al.). Official code: SamsungSAILMontreal/ream @ "
         "84a3030716a0059589e9d10e2ea049e32b76cfa6 "
-        "(ream/ream.py L37-41/L99-113/L46-53, moe_utils.py L157-158/L173-174). "
+        "(ream/ream.py L37-42 [δ_gate through dist2sim at L42] / L99-113 "
+        "[per-pair (cos+1)/2 in expert_similarity; σ(x)-gating completing "
+        "δ̃_expert lives in moe_utils.py L146-147 + L170-171] / L51-61 "
+        "[δ_REAM aggregation, actual ``sim_out = (sim_out + sim_gate[i, j]) "
+        "/ 2`` at L57], moe_utils.py L146-147 [full unmasked softmax] / "
+        "L170-171 [out *= softmax_logits[:, i]]). "
         "Deviations: D-ream-aggregation (mean vs paper's sum, monotone-rank-"
         "preserving), D-ream-similarity-rescale (both components rescaled to "
         "[0,1], monotone), D-ream-sparse-routing (non-jointly-active tokens "
