@@ -28,7 +28,9 @@ Zeliang Zhang.)
 // subsequent local line numbers differ from the paper by 1 — local
 // 5/6/7/8/9/10/11 correspond to paper 6/7/8/9/10/11/12. The inline
 // `# paper line 9` / `# paper line 10` comments above flag the
-// D-update / R-update pair so the offset stays auditable.
+// D-update / R-update pair so the offset stays auditable. local 11 also
+// collapses paper 12+13 — `if E < Ê then` / `F ← F ∪ {l*}` — into the
+// single guarded-freeze entry.
 
 Where Eq. (10) defines Ê = E·(1−γ), Eq. (11) defines
 R^l = Σ_{i≠j} D^l_{ij}.
@@ -226,19 +228,21 @@ class GrapeMergePlugin:
     ``stage1_budgets.json`` payload via :meth:`contribute_artifact`.
 
     See the module docstring for the paper citation (arXiv:2604.06542
-    Algorithm 1), the negative official-code finding, and the six
-    deviations: D3 (γ default), D-grape-count-only (Union reduced to
-    per-layer count decrement), D4 (full row/col zero), D5 (per-layer
-    floor), D-grape-restart-merge (lag-corrected second restart path),
-    D-se-blacklist-merge (SE integration). The sign-flip from paper's
-    similarity-form D^l to this plugin's distance form (consumed from
-    :mod:`stage1.plugins.cka_distance`) is D-cka-distance.
+    Algorithm 1), the negative official-code finding, and the seven
+    deviations: D-cka-distance (sign-flip from paper similarity-form
+    D^l to this plugin's distance form consumed from
+    :mod:`stage1.plugins.cka_distance`), D3 (γ default),
+    D-grape-count-only (Union reduced to per-layer count decrement),
+    D4 (full row/col zero), D5 (per-layer floor),
+    D-grape-restart-merge (lag-corrected second restart path),
+    D-se-blacklist-merge (SE integration).
     """
 
     name: str = "grape_merge"
     paper: str = (
         "GRAPE: Zhang et al. arXiv:2604.06542 §3.3 Algorithm 1. "
         "No official code published. Deviations: D3 (γ=0.1 project default), "
+        "D-grape-count-only (Union reduced to per-layer count decrement), "
         "D4 (D^l update zeros full row/col vs paper line 9 pair entry), "
         "D5 (per-layer floor N//2 with no layer bonuses), "
         "D-grape-restart-merge (two restart paths: paper-literal "
