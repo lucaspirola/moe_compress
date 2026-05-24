@@ -191,13 +191,13 @@ def _compute_eora_factors(
 
     Steps (matching paper notation, restricted to signal eigenspace):
       1. ΔW = W_orig − Ŵ                           [d_out × d_in]  (caller)
-      2. Eigendecompose X̃X̃ᵀ = QΛQᵀ                [d_in × d_in]
+      2. Eigendecompose A = X̃^T X̃ = QΛQ^T          [d_in × d_in]
          Keep n_keep eigenvectors above noise floor.
       3. Q' = Q_keep · √Λ_keep                      [d_in × n_keep]
       4. ΔW' = ΔW · Q'                              [d_out × n_keep]  (full projection)
       5. SVD(ΔW') full_matrices=False → top take_eff=min(r, min(d_out, n_keep))
-      6. B' = U'[:,:take_eff] · Σ'[:take_eff]       [d_out × take_eff]
-         A  = Vh'[:take_eff] · diag(1/√Λ_keep) @ Q_keep^T   [take_eff × d_in]
+      6. U_corr = U'[:,:take_eff] · Σ'[:take_eff]       [d_out × take_eff]
+         V_corr = Vh'[:take_eff] · diag(1/√Λ_keep) @ Q_keep^T   [take_eff × d_in]
 
     The √Λ scaling is the core innovation of EoRA: it importance-weights the
     eigenspace so SVD concentrates rank budget on high-variance input directions.
@@ -205,6 +205,15 @@ def _compute_eora_factors(
 
     Returns (U, V, take_eff) where `take_eff <= r` is the effective rank.
     When `take_eff < r`, U/V are zero-padded to width r.
+
+    Silent-degrade note: if ``A.shape != (d_in, d_in)`` the kernel logs a
+    WARNING and falls back to plain (unweighted) SVD rather than raising.
+    The contract is that ``EoraInputsPlugin`` delivers a matching covariance
+    (i.e. this fallback indicates an upstream wiring bug, not user input);
+    callers depending on activation-aware EoRA semantics should treat the
+    warning as a hard error and investigate the input pipeline.
+    TODO: consider upgrading the warning to ``raise ValueError`` once the
+    eora_inputs contract is locked down further.
     """
     if r <= 0:
         return (torch.zeros(delta.shape[0], 0, device=device),
@@ -214,10 +223,10 @@ def _compute_eora_factors(
 
     def _plain_svd_padded() -> tuple[torch.Tensor, torch.Tensor, int]:
         # Fallback: plain SVD without activation weighting.
+        # Zero-pad to fixed r so caller's pre-allocated tensors stay shape-stable.
+        # (When rk == r the pad slices are empty — single return path handles both.)
         U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
         rk = min(r, U.shape[1])
-        if rk == r:
-            return U[:, :r] * S[:r], Vh[:r, :], r
         U_out = torch.zeros(d_out, r, device=device, dtype=delta.dtype)
         V_out = torch.zeros(r, d_in, device=device, dtype=delta.dtype)
         U_out[:, :rk] = U[:, :rk] * S[:rk]
@@ -234,13 +243,13 @@ def _compute_eora_factors(
                     A.shape, d_in, d_in)
         return _plain_svd_padded()
 
-    # Step 2: Eigendecompose activation covariance X̃X̃ᵀ = QΛQᵀ  (A shape [d_in × d_in])
+    # Step 2: Eigendecompose activation covariance A = X̃^T X̃ = QΛQ^T  (A shape [d_in × d_in])
     eigvals, eigvecs = torch.linalg.eigh(A)  # ascending order
 
-    sigma_max = float(eigvals[-1].clamp_min(0).item())
+    lambda_max = float(eigvals[-1].clamp_min(0).item())
     # Dtype-aware noise floor — see _NOISE_FLOOR_BY_DTYPE in tools.dtype_noise_floor.
     rel_floor = _NOISE_FLOOR_BY_DTYPE.get(storage_dtype or torch.float32, 1e-6)
-    thresh = max(sigma_max * rel_floor, 1e-12)
+    thresh = max(lambda_max * rel_floor, 1e-12)
 
     keep_mask = eigvals > thresh
     if not keep_mask.any():
@@ -269,9 +278,10 @@ def _compute_eora_factors(
     # Step 6a: B' = U' Σ'
     U_corr = U_p[:, :take_eff] * S_p[:take_eff]              # [d_out, take_eff]
 
-    # Step 6b: Back-project A = V'^T · Q'^{-1}
-    # Q'^{-1} = diag(1/√Λ) · Q^T  (since Q has orthonormal columns)
-    # So: A = V'^T · diag(1/√Λ) · Q^T = (Vh_p[:take_eff] · diag(1/√Λ)) @ Q^T
+    # Step 6b: Back-project V_corr = V'^T · Q'^{+}
+    # Q'^{+} = diag(1/√Λ) · Q^T  (pseudo-inverse — eigvecs_keep is [d_in × n_keep],
+    # non-square after the noise-floor mask, so this is Moore-Penrose, not true inverse)
+    # So: V_corr = V'^T · diag(1/√Λ) · Q^T = (Vh_p[:take_eff] · diag(1/√Λ)) @ Q^T
     inv_sqrt_lambda = eigvals_keep.clamp_min(1e-30).rsqrt()   # [n_keep]
     V_corr = (Vh_p[:take_eff, :] * inv_sqrt_lambda.unsqueeze(0)) @ eigvecs_keep.T
     # V_corr shape: [take_eff, d_in]
@@ -473,9 +483,14 @@ class EoraCompensationPlugin:
                 "stage4/layer_idx": ref.layer_idx,
                 f"stage4/{name}_added_rank": r_per_expert,
                 f"stage4/{name}_new_rank": fe.ranks[name],
-                f"stage4/{name}_residual_before": res_before,
-                f"stage4/{name}_residual_after": res_after,
-                f"stage4/{name}_residual_rel_drop": rel_drop,
+                # NOTE: these are plain Frobenius ‖ΔW‖_F (unweighted), NOT the
+                # activation-weighted objective tr(ΔW·A·ΔW^T)^{1/2} that EoRA
+                # actually optimises (arXiv:2410.21271 Eq. 6, projected
+                # residual ‖ΔW·Q'‖_F). Key renamed to surface that distinction
+                # on dashboards.
+                f"stage4/{name}_residual_unweighted_before": res_before,
+                f"stage4/{name}_residual_unweighted_after": res_after,
+                f"stage4/{name}_residual_unweighted_rel_drop": rel_drop,
                 "stage4/compensated_params": compensated_params + layer_compensated_params,
                 # Additive v2 keys: per-layer aggregates of in-scope variables.
                 f"stage4/{name}_n_eligible_experts": int(n_eligible),
