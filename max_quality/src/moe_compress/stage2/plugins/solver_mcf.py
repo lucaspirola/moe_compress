@@ -132,6 +132,10 @@ def _assign_mcf(
         # correct for the v1 ``max_group_cap == 0`` "uncapped" semantics by
         # treating uncapped as ``n_children`` per centroid (effectively
         # unlimited within the problem).
+        # NITPICK-4: ``n_children`` is a safe upper bound for the uncapped
+        # sentinel because total supply equals ``n_children`` — no centroid
+        # can absorb more than that in any feasible flow, so capping each
+        # centroid arc at ``n_children`` is equivalent to "uncapped".
         max_group_cap = n_children
 
     try:
@@ -196,7 +200,7 @@ def _assign_mcf(
             if not finite_mask[i, j]:
                 continue
             smcf.add_arc_with_capacity_and_unit_cost(
-                1 + i, 1 + n_children + j, 1, int(int_cost[i, j]),
+                1 + i, 1 + n_children + j, 1, int_cost[i, j],
             )
 
     # Centroid → sink arcs
