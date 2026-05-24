@@ -65,18 +65,9 @@ The current plugin architecture has no task-numbering taxonomy; new
 prose drops the labels. Existing log lines / Trackio keys preserved
 for dashboard back-compat.
 
-Original module header — toolchain inventory follows:
-  * ``_HealConfig``            — validated, frozen view of the merge_heal_* knobs.
-  * ``_make_shared_out_fn``    — frozen-shared-expert closure builder.
-  * ``_capture_mlp_io``        — pre-merge (input, target) activation capture.
-  * ``_heal_student_moe_output`` — faithful student replica of the MoE block.
-  * ``_heal_lr_at_step``       — warmup -> cosine -> floor LR schedule.
-  * ``_heal_layer``            — per-layer self-distillation trainer.
-  * ``_summarize_distill_state`` — per-layer distill telemetry aggregator.
-
-All seven moved verbatim out of ``stage2_reap_ream.py``; that module
-re-imports them so external callers and tests keep their existing import
-paths. ``_write_heal_weights`` / ``_load_heal_weights`` live in
+All seven tools above moved verbatim out of ``stage2_reap_ream.py``; that
+module re-imports them so external callers and tests keep their existing
+import paths. ``_write_heal_weights`` / ``_load_heal_weights`` live in
 ``pipeline.shared_io`` (Task 2) and are NOT touched here — none of the seven
 functions reference them.
 
@@ -361,6 +352,9 @@ def _make_shared_out_fn(layer_ref: MoELayerRef):
     Returns ``None`` if the layer has no shared expert (the heal student just
     skips the shared addition in that case).
     """
+    # ``mlp`` is bound solely to read ``shared_expert_gate`` off the live MoE
+    # block on the next line — the shared-gate scalar lives on the MLP module,
+    # not on ``shared_expert`` itself, so we need a handle to the parent block.
     mlp = layer_ref.mlp
     shared_expert = layer_ref.shared_expert
     shared_gate = getattr(mlp, "shared_expert_gate", None)
@@ -422,6 +416,10 @@ def _capture_mlp_io(
     def _hook(_module, inputs, output):
         nonlocal captured
         x_in = inputs[0]
+        # Model-agnostic unpack: Qwen3.5 MoE returns a bare hidden-state
+        # tensor here, but some HF MoE blocks (e.g. Mixtral) return a
+        # ``(hidden_state, router_logits)`` tuple. The fallback keeps this
+        # capture working unchanged on either shape.
         x_out = output[0] if isinstance(output, tuple) else output
         in_flat = x_in.reshape(-1, x_in.shape[-1]).detach()
         out_flat = x_out.reshape(-1, x_out.shape[-1]).detach()
@@ -584,6 +582,16 @@ def _heal_lr_at_step(
         → constant ``lr``.
       * ``decay_steps == 0`` or ``lr_min == lr`` → constant ``lr`` after
         any warmup ramp.
+
+    Schedule-cap boundary note: ``_HealConfig`` accepts
+    ``warmup_steps + decay_steps == max_steps`` (validator uses ``>``, not
+    ``>=``). At that exact equality the training loop's last step index is
+    ``max_steps - 1 = warmup + decay - 1``, so cosine ``t`` reaches
+    ``decay_steps - 1`` but never enters the ``t >= decay_steps`` flat branch
+    — the LR floor at ``lr_min`` is approached asymptotically but never
+    realized within the step cap. Configure
+    ``warmup_steps + decay_steps < max_steps`` if you want at least one step
+    pinned at ``lr_min``.
     """
     if step < 0:
         raise ValueError(f"_heal_lr_at_step: step={step}; must be >= 0.")
@@ -875,7 +883,6 @@ def _heal_layer(
     # disk (with an LRU cache so a re-pick within a few steps is free) and
     # returns ``(xb, sb, tb)`` already on device in fp32. When the entire
     # training pool is smaller than ``mb`` it returns all rows.
-    n_train = dataset.n_train
     mb_gen = torch.Generator(device="cpu").manual_seed(layer_idx + 1)
 
     # Most-recent applied LR; surfaced in the eval-time log line. Always
@@ -927,15 +934,19 @@ def _heal_layer(
             # cross-domain `holdout_mse_xd` field is appended only when the
             # telemetry is active (it is NaN otherwise) — keeps the historical
             # log shape for inert runs.
+            # Consistent log-formatting: all dynamic substrings are built with
+            # f-strings first (xd_log, improved_tag), then injected into the
+            # outer `log.info` template via lazy `%s`. Same idiom as the
+            # per-layer summary at the bottom of this function.
             xd_log = (
                 f" holdout_mse_xd={h_xd:.6e}" if not math.isnan(h_xd) else ""
             )
+            improved_tag = "improved" if improved else "no-improve"
             log.info(
                 "    heal layer %d: step %d/%d — train_mse=%.6e holdout_mse=%.6e"
                 "%s best=%.6e %s (patience %d/%d, min_rel_delta=%.4f, lr=%.3e)",
                 layer_idx, steps_done, heal_cfg.max_steps, last_train_mse, h,
-                xd_log, best_holdout,
-                "improved" if improved else "no-improve",
+                xd_log, best_holdout, improved_tag,
                 evals_since_improve, heal_cfg.patience, heal_cfg.min_rel_delta,
                 last_lr,
             )
@@ -1183,7 +1194,15 @@ class MergeHealPlugin:
                 device=self.heal_device, pool_size=self.heal_cfg.token_cap,
                 shard_writer=nemo_writer,
             )
-            if self.xd_batches is not None:
+            # Belt-and-braces guard: only capture the cross-domain holdout
+            # when the XD telemetry flag is on AND the orchestrator handed us
+            # a non-None xd_batches. Without the flag check, an orchestrator
+            # that always wires xd_batches would silently run the XD capture
+            # work even when the user disabled the feature.
+            if (
+                self.xd_batches is not None
+                and self.heal_cfg.cross_domain_holdout_enabled
+            ):
                 xd_writer = ShardWriter(
                     layer_shard_dir / "xd",
                     layer_idx=layer_ref.layer_idx,
