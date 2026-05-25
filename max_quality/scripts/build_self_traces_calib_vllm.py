@@ -386,23 +386,27 @@ def main() -> int:
     p.add_argument("--no-cache-suffix", action="store_true")
     p.add_argument("--resume", action="store_true",
                    help="Skip prompts that already have rows in the .tmp file.")
-    p.add_argument("--prompt-skip", type=int, default=0,
-                   help="Drop the first N prompts from the deterministic "
-                        "iterator before processing. Use to extend an existing "
-                        "run with NEW traces (positions N..num_prompts-1) "
-                        "without re-generating the first N. The cache_key "
-                        "incorporates this, so the output file is distinct "
-                        "from the unskipped run with the same --num-prompts.")
+    p.add_argument("--prev-num-prompts", type=int, default=0,
+                   help="Per-subset extension mode: yield ONLY the prompts that "
+                        "an earlier --num-prompts=N run would NOT have yielded. "
+                        "For each subset in qwen3-pretrain-mix, the iterator "
+                        "computes its previous per-subset count from N (=PREV) "
+                        "and its target count from --num-prompts (=NEW), then "
+                        "yields rows at deterministic-shuffle positions "
+                        "[prev_count, new_count). The resulting prompts are by "
+                        "construction non-overlapping with the earlier run. "
+                        "Cache_key incorporates this so the output file is "
+                        "distinct from the prev=0 run with the same --num-prompts.")
     args = p.parse_args()
 
     # --- cache_key + paths ----------------------------------------------
-    # prompt-skip is folded into the prompts_source field so a skipped run
-    # writes to a separate cache_key (different filename) from an unskipped
+    # prev_num_prompts is folded into the prompts_source field so an extended
+    # run writes to a separate cache_key (different filename) from a fresh
     # run with the same --num-prompts.
-    _skip_suffix = f"#skip{args.prompt_skip}" if args.prompt_skip else ""
+    _prev_suffix = f"#prev{args.prev_num_prompts}" if args.prev_num_prompts else ""
     cache_key = _trace_cache_key_vllm(
         args.teacher, args.teacher_revision,
-        f"{args.prompts}#{args.num_prompts}#{args.seed}{_skip_suffix}",
+        f"{args.prompts}#{args.num_prompts}#{args.seed}{_prev_suffix}",
         args.num_prompts, args.seed,
         args.max_new_tokens, args.reasoning_budget,
         args.dtype, args.logits_top_k,
@@ -430,8 +434,12 @@ def main() -> int:
     if args.prompts == "qwen3-pretrain-mix":
         prompts_iter = _iter_prompts_from_qwen3_pretrain_mix(
             args.num_prompts, args.seed,
+            prev_num_prompts=(args.prev_num_prompts or None),
         )
     else:
+        if args.prev_num_prompts:
+            log.error("--prev-num-prompts only supported with --prompts=qwen3-pretrain-mix")
+            return 1
         prompts_iter = _iter_prompts_from_jsonl(Path(args.prompts))
 
     prompts: list[tuple[str, str]] = []
@@ -443,21 +451,6 @@ def main() -> int:
         log.error("no prompts gathered.")
         return 1
     log.info("gathered %d prompts", len(prompts))
-
-    # --- apply --prompt-skip --------------------------------------------
-    # Drop the first N from the deterministic ordering. The remaining tail
-    # (positions N..num_prompts-1) is what gets generated. Used to extend
-    # an existing run with new traces without reprocessing.
-    if args.prompt_skip > 0:
-        if args.prompt_skip >= len(prompts):
-            log.error("--prompt-skip %d >= gathered prompts %d; nothing to do",
-                      args.prompt_skip, len(prompts))
-            return 1
-        log.info("--prompt-skip: dropping first %d; processing %d new prompts "
-                 "(positions %d..%d of deterministic order)",
-                 args.prompt_skip, len(prompts) - args.prompt_skip,
-                 args.prompt_skip, len(prompts) - 1)
-        prompts = prompts[args.prompt_skip:]
 
     # --- resume ---------------------------------------------------------
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")

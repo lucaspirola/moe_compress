@@ -120,6 +120,7 @@ log = logging.getLogger("build_self_traces_calib")
 
 def _iter_prompts_from_qwen3_pretrain_mix(
     num_prompts: int, seed: int,
+    prev_num_prompts: int | None = None,
 ) -> Iterator[tuple[str, str]]:
     """Yield ``(prompt, domain)`` pairs drawn from the qwen3-pretrain-mix
     datasets, with per-subset counts that preserve the corpus's intended mix.
@@ -128,6 +129,14 @@ def _iter_prompts_from_qwen3_pretrain_mix(
     turn only — the teacher generates fresh thinking-mode responses below.
     The ``domain`` tag travels into the output JSONL so the downstream
     self-traces loader can preserve the same percentages at every draw.
+
+    When ``prev_num_prompts`` is set, each per-subset stream skips the first
+    ``int(prev_num_prompts * weight)`` rows before yielding — i.e., yields
+    only the rows that an ``iter(prev_num_prompts)`` would NOT have emitted.
+    Use case: extending an existing run of N prompts to M > N prompts without
+    re-generating the original N. The shuffle seed is per-subset deterministic
+    so the prefix [0, prev_count) of any larger pull is bit-identical to a
+    smaller pull's first prev_count rows.
     """
     from moe_compress.utils.calibration import (  # type: ignore
         _QWEN3_MIX_DATASET,
@@ -140,6 +149,25 @@ def _iter_prompts_from_qwen3_pretrain_mix(
         subset: max(1, int(num_prompts * weight))
         for subset, weight in _QWEN3_MIX_WEIGHTS.items()
     }
+    prev_per_subset: dict[str, int] = {}
+    if prev_num_prompts is not None and prev_num_prompts > 0:
+        prev_per_subset = {
+            subset: max(1, int(prev_num_prompts * weight))
+            for subset, weight in _QWEN3_MIX_WEIGHTS.items()
+        }
+        # Sanity: every prev_per_subset[s] must be < per_subset[s] for some
+        # progress to be possible.
+        no_growth = [
+            s for s in per_subset
+            if prev_per_subset.get(s, 0) >= per_subset[s]
+        ]
+        if no_growth:
+            log.warning(
+                "prev_num_prompts=%d gives per-subset counts >= num_prompts=%d "
+                "counts for subsets %s — those subsets will yield zero new "
+                "prompts. Did you mean a larger --num-prompts?",
+                prev_num_prompts, num_prompts, no_growth,
+            )
     # Warn when num_prompts is too small for the smallest-weight subset to
     # get its expected share. Threshold = 2 * num_subsets / min_weight; below
     # that point the int()-floor in per_subset truncates the smallest subsets
@@ -163,15 +191,29 @@ def _iter_prompts_from_qwen3_pretrain_mix(
     for subset, count in per_subset.items():
         ds_name = _QWEN3_MIX_DATASET[subset]
         s = _make_subset_seed(seed, subset)
-        log.info("prompts: %s — pulling %d from %s (seed=%d)",
-                 subset, count, ds_name, s)
+        prev_count = prev_per_subset.get(subset, 0)
+        if prev_count >= count:
+            log.info("prompts: %s — prev_count=%d >= count=%d; SKIPPING entire subset",
+                     subset, prev_count, count)
+            continue
+        log.info("prompts: %s — pulling %d from %s (seed=%d)%s",
+                 subset, count, ds_name, s,
+                 f" [skipping first {prev_count}, yielding {count - prev_count} new]"
+                 if prev_count else "")
         try:
             ds, _ = _shuffled_stream(ds_name, count, s)
         except Exception as err:  # noqa: BLE001
             log.error("prompts: %s failed (%s) — skipping", subset, err)
             continue
-        n = 0
+        n = 0  # number of yields-eligible rows seen for THIS subset (not yielded)
+        emitted = 0  # number actually yielded for THIS subset
         for row in ds:
+            # Per-subset valid-row counter `n` tracks position in the would-be
+            # yield sequence. When prev_count > 0, the first prev_count valid
+            # rows are CONSUMED but NOT yielded — they're exactly what an
+            # earlier iter(prev_num_prompts) call would have yielded for this
+            # subset, and we want the NEW rows that come after.
+            _payload: tuple[str, str] | None = None
             if subset == "tulu3":
                 msgs = row.get("messages") or []
                 user = next(
@@ -179,63 +221,64 @@ def _iter_prompts_from_qwen3_pretrain_mix(
                     None,
                 )
                 if isinstance(user, str) and user.strip():
-                    yield user.strip(), subset
-                    n += 1
+                    _payload = (user.strip(), subset)
             elif subset == "fineweb":
                 text = (row.get("text") or "").strip()
                 if text:
                     # Wrap as a "summarize/extend" prompt to give the teacher
                     # something to reason about.
-                    yield (
+                    _payload = (
                         f"Read the following passage and explain its key ideas:\n\n{text[:2000]}",
                         subset,
                     )
-                    n += 1
             elif subset == "math":
                 problem = (row.get("problem") or "").strip()
                 if problem:
-                    yield problem, subset
-                    n += 1
+                    _payload = (problem, subset)
             elif subset == "code":
                 instr = (row.get("instruction") or "").strip()
                 inp = (row.get("input") or "").strip()
                 if instr:
-                    yield (instr + (("\n\n" + inp) if inp else ""), subset)
-                    n += 1
+                    _payload = (instr + (("\n\n" + inp) if inp else ""), subset)
             elif subset == "qa":
                 # databricks-dolly-15k: instruction/context/response.
                 instr = (row.get("instruction") or "").strip()
                 ctx = (row.get("context") or "").strip()
                 if instr:
-                    yield (instr + (("\n\n" + ctx) if ctx else ""), subset)
-                    n += 1
+                    _payload = (instr + (("\n\n" + ctx) if ctx else ""), subset)
             elif subset == "creative":
                 # euclaise/writingprompts: prompt/story — use prompt as the
                 # user turn (teacher generates a new story / reasoning trace).
                 prompt = (row.get("prompt") or "").strip()
                 if prompt:
-                    yield prompt, subset
-                    n += 1
+                    _payload = (prompt, subset)
             elif subset == "multilingual":
                 # CohereForAI/aya_dataset: inputs/targets across 65+ languages.
                 inputs = (row.get("inputs") or "").strip()
                 if inputs:
-                    yield inputs, subset
-                    n += 1
+                    _payload = (inputs, subset)
             elif subset == "papers":
                 # gfissore/arxiv-abstracts-2021: title/abstract — ask the
                 # teacher to write the abstract given the paper's title.
                 title = (row.get("title") or "").strip()
                 if title:
-                    yield (
+                    _payload = (
                         f"Write the abstract for an academic paper titled:\n\n{title}",
                         subset,
                     )
-                    n += 1
+
+            if _payload is not None:
+                if n >= prev_count:
+                    yield _payload
+                    emitted += 1
+                n += 1
+
             if n >= count:
                 break
-        total_yielded += n
-        if total_yielded >= num_prompts:
+        log.info("prompts: %s — emitted %d (saw %d valid rows, skipped %d)",
+                 subset, emitted, n, prev_count)
+        total_yielded += emitted
+        if total_yielded >= max(1, num_prompts - sum(prev_per_subset.values())):
             break
 
 
