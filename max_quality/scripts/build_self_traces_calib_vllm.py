@@ -152,6 +152,8 @@ def _trace_cache_key_vllm(
 def _load_teacher_vllm(
     repo: str, revision: str, dtype: str,
     gpu_memory_utilization: float, max_model_len: int,
+    max_num_seqs: int | None = None,
+    max_num_batched_tokens: int | None = None,
 ):
     """Instantiate vLLM's offline LLM for the teacher.
 
@@ -165,12 +167,24 @@ def _load_teacher_vllm(
     decode. That's where the throughput wins live. We document it for the
     operator since the determinism contract depends on it being stable
     across runs (i.e., same vLLM version + same teacher revision).
+
+    ``max_num_seqs`` and ``max_num_batched_tokens`` are vLLM's continuous-
+    batching knobs:
+      * max_num_seqs — the cap on concurrent sequences in flight. Default 256;
+        with H200 (141 GB) + Qwen3-class 35B + 16k token sequences we can
+        often push to 384-512 if VRAM headroom allows.
+      * max_num_batched_tokens — the cap on tokens scheduled per forward pass.
+        Higher = better GPU utilization during prefill; trades off latency on
+        long contexts. Default ~8192-16384 depending on vLLM version.
+    Both ``None`` means use vLLM defaults — set explicitly via CLI for
+    throughput tuning when steady-state VRAM observation shows headroom.
     """
     from vllm import LLM  # type: ignore
 
-    log.info("loading teacher via vLLM: %s (revision=%s, dtype=%s)",
-             repo, revision, dtype)
-    return LLM(
+    log.info("loading teacher via vLLM: %s (revision=%s, dtype=%s, "
+             "max_num_seqs=%s, max_num_batched_tokens=%s)",
+             repo, revision, dtype, max_num_seqs, max_num_batched_tokens)
+    kwargs: dict = dict(
         model=repo,
         revision=revision,
         dtype=dtype,                         # "bfloat16" | "float16" | "auto"
@@ -182,6 +196,11 @@ def _load_teacher_vllm(
         # Trust remote code — Qwen3.6's modeling files use custom Python.
         trust_remote_code=True,
     )
+    if max_num_seqs is not None:
+        kwargs["max_num_seqs"] = int(max_num_seqs)
+    if max_num_batched_tokens is not None:
+        kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+    return LLM(**kwargs)
 
 
 def _render_prompts(tokenizer, prompts: Iterable[str]) -> list[str]:
@@ -340,6 +359,20 @@ def main() -> int:
                    help="vLLM context-length budget = prompt (≤2048) + "
                         "max_new_tokens. Slightly larger than the sum to "
                         "give vLLM scheduler headroom.")
+    p.add_argument("--max-num-seqs", type=int, default=None,
+                   help="Cap on concurrent sequences vLLM batches in flight. "
+                        "Default (None) uses vLLM's built-in default (256). "
+                        "Bump on large VRAM (e.g. 384-512 on H200) when "
+                        "steady-state VRAM observation shows >30 GB free. "
+                        "Does NOT change output bytes (vLLM scheduling is "
+                        "deterministic under fixed seed + temp=0), so OK to "
+                        "tune across runs without invalidating cache_key.")
+    p.add_argument("--max-num-batched-tokens", type=int, default=None,
+                   help="Cap on total tokens scheduled per forward pass. "
+                        "Default (None) uses vLLM's default. Higher values "
+                        "improve prefill GPU utilization on H200/B300 but "
+                        "trade off latency. Like --max-num-seqs, doesn't "
+                        "alter output bytes.")
     p.add_argument("--chunk-size", type=int, default=200,
                    help="How many prompts to submit per LLM.generate call. "
                         "Affects crash-recovery granularity, not throughput "
@@ -414,6 +447,8 @@ def main() -> int:
     llm = _load_teacher_vllm(
         args.teacher, args.teacher_revision, args.dtype,
         args.gpu_memory_utilization, args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
     )
     tokenizer = llm.get_tokenizer()
     eos_ids = _coerce_eos_ids(getattr(tokenizer, "eos_token_id", None))
