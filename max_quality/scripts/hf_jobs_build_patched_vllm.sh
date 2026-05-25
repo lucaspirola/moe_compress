@@ -50,7 +50,7 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply calibration hooks patch ==="
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/feat/calibration-v2/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-imatrix-resumable/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
