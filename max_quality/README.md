@@ -38,13 +38,19 @@ are *inside* that block — and without self-traces, the routers (Stage 2.5)
 and merged expert weights (Stage 2 SH heal) are never supervised there.
 
 ```bash
-# One-shot pre-step. ~6h on a single H200 with a BF16 teacher; deterministic
+# One-shot pre-step. ~5-6h on a single H200 with a BF16 teacher; deterministic
 # under (teacher_repo, revision, prompts, max_new_tokens) so the JSONL is
 # reproducible and the cache invalidates automatically. Cache-key suffix
 # is folded into the output filename → multiple teachers coexist on disk.
+#
+# --num-prompts is the GENERATION budget. The script tags each row with
+# `_complete: bool` (true iff </think> + EOS landed in-trace); the downstream
+# loader filters `_complete=false`. For Qwen3-thinking with hard math in
+# the mix, expect ~70-80% completeness → oversize num-prompts by ~1.3× the
+# target complete-row count.
 python max_quality/scripts/build_self_traces_calib.py \
     --teacher <YOUR_TEACHER_REPO> \
-    --num-prompts 4000 --max-new-tokens 4096 \
+    --num-prompts 6500 --max-new-tokens 16384 \
     --output artifacts/_shared/self_traces.jsonl
 
 # Then point the run config at the source:

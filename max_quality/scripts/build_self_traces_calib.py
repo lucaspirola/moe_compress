@@ -24,9 +24,16 @@ Usage
     python max_quality/scripts/build_self_traces_calib.py \
         --teacher Qwen/Qwen3.6-35B-A3B \
         --prompts qwen3-pretrain-mix \
-        --num-prompts 5000 \
-        --max-new-tokens 4096 \
+        --num-prompts 6500 \
+        --max-new-tokens 16384 \
         --output artifacts/_shared/self_traces.jsonl
+
+    # Note: ``--num-prompts`` is the GENERATION budget. The downstream loader
+    # filters rows by ``_complete: true`` (set per-row by this script when the
+    # decoded trace contains ``</think>`` AND the model emitted EOS within
+    # max_new_tokens). For Qwen3-thinking with hard math in the mix, expect
+    # ~70-80% completeness; oversize ``--num-prompts`` by ~1.3x your target
+    # complete-rows count.
 
 
 Determinism
@@ -55,12 +62,25 @@ Output schema
 -------------
 JSONL where each row is::
 
-    {"messages": [
+    {
+      "messages": [
         {"role": "user", "content": "<prompt>"},
-        {"role": "assistant", "content": "<think>...</think>\\n\\n<answer>"}
-    ]}
+        {"role": "assistant", "content": "<think>...</think>\\n\\n<answer>"},
+      ],
+      "domain": "<source-subset tag>",
+      "_complete": true | false,
+      "_attempt_idx": <int>,
+    }
 
-The downstream loader in ``utils/calibration.py`` renders each row through
+``_complete`` is true iff the decoded assistant message contains ``</think>``
+AND the model emitted an EOS token before ``max_new_tokens`` (i.e. the chat-
+template tail is intact). The downstream loader in ``utils/calibration.py``
+filters out ``_complete=false`` rows by default — they're kept on disk for
+debugging but never participate in calibration. ``_attempt_idx`` is the
+deterministic 0-based position in the gathered prompt list and exists for
+crash-recovery / audit; it has no semantic role in calibration.
+
+The downstream loader renders kept rows through
 ``_render_messages(..., enable_thinking=True)`` so the Qwen3-thinking
 tokenizer keeps the ``<think>`` markers in the calibration token stream.
 
@@ -275,7 +295,12 @@ def _trace_cache_key(
         "batch_size": batch_size,
         "load_in_4bit": bool(load_in_4bit),
         "decode": "greedy",
-        "schema_version": 3,
+        # schema_version=4: rows now carry `_complete` + `_attempt_idx`, and
+        # `--max-new-tokens` default raised 4096 → 16384 to fit long reasoning
+        # tails. Older JSONLs are still byte-decodable but lack `_complete`,
+        # so the downstream loader cannot honor the completeness filter on
+        # them — invalidating the cache here forces regen.
+        "schema_version": 4,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -405,10 +430,22 @@ def _generate_traces(
     total = len(prompts)
     t0 = time.monotonic()
     yielded = 0  # count what we actually emit, not what we tried.
+    # Per-domain (kept_complete, total_emitted) tally for the end-of-run
+    # completeness report. A row is "complete" iff its decoded text contains
+    # `</think>` AND the model emitted EOS within max_new_tokens (signalled
+    # by the trimmed length being strictly shorter than the raw generated
+    # row — i.e. _trim_at_first_eos cut at least one token).
+    domain_stats: dict[str, list[int]] = {}  # domain -> [complete, total]
     for i in range(0, total, batch_size):
         batch = prompts[i:i + batch_size]
         batch_prompts = [p for p, _ in batch]
         batch_domains = [d for _, d in batch]
+        # 0-based attempt index for every prompt in this batch, computed
+        # against the gathered prompt list. We add `already_done` so the
+        # index is stable across --resume (prompts here are the post-resume
+        # slice, but the JSONL row's _attempt_idx must reference the FULL
+        # gather to make crash-recovery audit possible without re-tokenizing).
+        batch_attempt_idx = [already_done + i + k for k in range(len(batch))]
         # Render each prompt with add_generation_prompt=True so the template
         # lands at the assistant cursor — the model's generation extends from
         # there with the <think> opener.
@@ -456,23 +493,40 @@ def _generate_traces(
         gen_only = out_ids[:, inputs.input_ids.shape[1]:]
         # Trim by token-id BEFORE decode. Handles single int eos_token_id,
         # list-of-ints eos_token_id, and rows with no eos in gen uniformly.
-        trimmed_rows = [
-            _trim_at_first_eos(row.tolist(), eos_ids) for row in gen_only
-        ]
+        raw_rows = [row.tolist() for row in gen_only]
+        trimmed_rows = [_trim_at_first_eos(r, eos_ids) for r in raw_rows]
+        # EOS-emitted iff _trim_at_first_eos actually cut something. When the
+        # model fills max_new_tokens without producing EOS, trimmed == raw and
+        # the row is by definition a truncated reasoning trace (no clean tail).
+        eos_emitted = [len(t) < len(r) for r, t in zip(raw_rows, trimmed_rows)]
         decoded = [
             tokenizer.decode(ids, skip_special_tokens=False).strip()
             for ids in trimmed_rows
         ]
-        for prompt, domain, ans in zip(batch_prompts, batch_domains, decoded):
+        for prompt, domain, ans, saw_eos, attempt_idx in zip(
+            batch_prompts, batch_domains, decoded, eos_emitted,
+            batch_attempt_idx,
+        ):
             if not ans:
                 continue
             yielded += 1
+            # Completeness: closing think tag emitted AND chat-template tail
+            # reached (EOS). Both are required — `</think>` without EOS means
+            # the answer block got truncated; EOS without `</think>` means
+            # thinking-mode failed to engage (rare but worth filtering).
+            is_complete = bool(saw_eos and "</think>" in ans)
+            stats = domain_stats.setdefault(domain, [0, 0])
+            stats[1] += 1
+            if is_complete:
+                stats[0] += 1
             yield {
                 "messages": [
                     {"role": "user", "content": prompt},
                     {"role": "assistant", "content": ans},
                 ],
                 "domain": domain,
+                "_complete": is_complete,
+                "_attempt_idx": int(attempt_idx),
             }
 
         elapsed = time.monotonic() - t0
@@ -497,6 +551,25 @@ def _generate_traces(
             log_done, log_total, log_yielded,
             elapsed, s_per_trace, elapsed / max(done, 1),
         )
+
+    # End-of-run completeness report. The DOWNSTREAM loader filters by
+    # `_complete=true`, so the kept-row total reported here is what the
+    # calibration pass actually sees. A truncation-heavy domain (typically
+    # `math` / `code` on hard prompts) is the signal to either raise
+    # max_new_tokens further or oversample at gather time.
+    if domain_stats:
+        agg_complete = sum(c for c, _ in domain_stats.values())
+        agg_total    = sum(t for _, t in domain_stats.values())
+        log.info(
+            "completeness summary (this session): %d/%d rows complete "
+            "(%.1f%%); per-domain breakdown follows.",
+            agg_complete, agg_total,
+            100.0 * agg_complete / max(agg_total, 1),
+        )
+        for domain in sorted(domain_stats):
+            c, t = domain_stats[domain]
+            pct = 100.0 * c / max(t, 1)
+            log.info("  %-14s  %4d/%-4d  (%5.1f%% complete)", domain, c, t, pct)
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +627,12 @@ def main() -> int:
     p.add_argument("--num-prompts", type=int, default=5000)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--max-new-tokens", type=int, default=4096)
+    p.add_argument("--max-new-tokens", type=int, default=16384,
+                   help="Generation cap per row. Default 16384 covers the long "
+                        "tail of reasoning chains on math/code prompts so that "
+                        "</think> + chat-template tail land in-trace. Lower it "
+                        "(e.g. 8192) only if VRAM forces it; below 8192 expect "
+                        "30-50%% of math/code rows to be filtered as incomplete.")
     p.add_argument("--output", default="artifacts/_shared/self_traces.jsonl")
     p.add_argument("--no-cache-suffix", action="store_true",
                    help="Skip the cache-key suffix on the output filename.")

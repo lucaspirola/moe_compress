@@ -1409,6 +1409,8 @@ def _load_self_traces_state(path) -> dict:
         return cached
 
     rows: list[dict] = []
+    n_incomplete_filtered = 0
+    n_parsed = 0
     # errors="replace" so a single malformed UTF-8 byte doesn't crash the
     # whole load (M3) — JSONDecodeError-per-line is already absorbed below.
     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -1417,14 +1419,36 @@ def _load_self_traces_state(path) -> dict:
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                row = json.loads(line)
             except json.JSONDecodeError as exc:
                 log.warning("self-traces: skipping malformed JSONL line: %s", exc)
                 continue
+            n_parsed += 1
+            # Completeness filter (schema_version >=4 produced by
+            # build_self_traces_calib.py). A row is kept iff it lacks the
+            # `_complete` field (legacy JSONLs without the flag are trusted)
+            # OR has `_complete=true`. Truncated reasoning traces (no
+            # `</think>` or no EOS) carry `_complete=false` and are dropped
+            # here so Stage 2.5 router-KD never sees malformed chat-template
+            # tails. Logged once per load as a summary line below.
+            if row.get("_complete") is False:
+                n_incomplete_filtered += 1
+                continue
+            rows.append(row)
 
     if not rows:
         raise ValueError(
-            f"self-traces: JSONL at {path} contained zero parseable rows."
+            f"self-traces: JSONL at {path} contained zero parseable rows "
+            f"(out of {n_parsed} parsed, {n_incomplete_filtered} were "
+            "filtered as `_complete=false`). Re-run the trace builder with a "
+            "larger --max-new-tokens or oversample --num-prompts."
+        )
+
+    if n_incomplete_filtered > 0:
+        log.info(
+            "self-traces: filtered %d/%d rows as `_complete=false` "
+            "(truncated reasoning traces); %d kept for calibration.",
+            n_incomplete_filtered, n_parsed, len(rows),
         )
 
     by_domain: dict[str, list[int]] = {}
