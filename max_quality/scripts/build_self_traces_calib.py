@@ -273,6 +273,7 @@ def _trace_cache_key(
     load_in_4bit: bool,
     save_logits: bool = False,
     logits_top_k: int = 50,
+    attn_impl: str = "sdpa",
 ) -> str:
     """Compute the cache key.
 
@@ -304,12 +305,16 @@ def _trace_cache_key(
         # logit caching on/off.
         "save_logits": bool(save_logits),
         "logits_top_k": int(logits_top_k) if save_logits else 0,
-        # schema_version=5: rows carry `_complete` + `_attempt_idx`, and an
-        # optional teacher-logit topk sidecar is co-emitted under
-        # `<output_stem>_logits/`. schema_version=4 rows are decodable but
-        # never carried logits; bumping forces regen so the cache_key suffix
-        # cleanly partitions logit-bearing vs not.
-        "schema_version": 5,
+        # `attn_impl` participates because eager / sdpa / flash_attention_2
+        # produce slightly different logit values (different reduction order
+        # in the attention kernel). Two runs with the same prompts but
+        # different attn impls are NOT interchangeable for cache purposes.
+        "attn_impl": str(attn_impl),
+        # schema_version=6: attn_impl folded into the cache_key. schema=5
+        # runs were eager-only by construction (the script hardcoded
+        # eager); bumping forces the new SDPA/FA2 path to a clean output
+        # filename that won't collide with any partial eager .tmp on disk.
+        "schema_version": 6,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -319,9 +324,21 @@ def _trace_cache_key(
 # ---------------------------------------------------------------------------
 
 
-def _load_teacher(repo: str, revision: str, load_in_4bit: bool, tokenizer=None):
+def _load_teacher(
+    repo: str, revision: str, load_in_4bit: bool,
+    tokenizer=None, attn_impl: str = "sdpa",
+):
     """Load the teacher model. Optionally accepts a pre-loaded ``tokenizer``
-    to avoid the duplicate HF-hub fetch."""
+    to avoid the duplicate HF-hub fetch.
+
+    ``attn_impl`` selects the attention kernel: ``sdpa`` (default) routes
+    through PyTorch's ``scaled_dot_product_attention``, which auto-selects
+    a Flash Attention 2 backend on sm_80+ bf16 paths and keeps memory at
+    O(seq) instead of eager's O(seq²) score-matrix materialization.
+    ``eager`` is kept for byte-identical reproducibility against older
+    schema_version=5 runs. ``flash_attention_2`` requires the
+    ``flash-attn`` pip package; absent it, prefer ``sdpa``.
+    """
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -335,7 +352,7 @@ def _load_teacher(repo: str, revision: str, load_in_4bit: bool, tokenizer=None):
         "revision": revision,
         "torch_dtype": torch.bfloat16,
         "device_map": "auto",
-        "attn_implementation": "eager",
+        "attn_implementation": attn_impl,
     }
     if load_in_4bit:
         from transformers import BitsAndBytesConfig
@@ -709,6 +726,14 @@ def main() -> int:
                    help="K for the teacher-logit topk cache (only used with "
                         "--save-logits). Default 50 covers >99%% of the KL "
                         "mass at typical KD temperatures with ~300 B/token.")
+    p.add_argument("--attn-impl", default="sdpa",
+                   choices=["eager", "sdpa", "flash_attention_2"],
+                   help="Attention backend. Default 'sdpa' uses PyTorch's "
+                        "scaled_dot_product_attention which auto-selects a "
+                        "Flash Attention 2 path on bf16 + sm_80+; memory "
+                        "is O(seq) instead of eager's O(seq^2). 'eager' is "
+                        "kept for reproducibility against older schema_version=5 "
+                        "runs. 'flash_attention_2' requires the flash-attn pip pkg.")
     p.add_argument("--resume", action="store_true",
                    help="If a .tmp file from a prior run exists, count its "
                         "valid rows and skip that many prompts (in deterministic "
@@ -740,6 +765,7 @@ def main() -> int:
         args.num_prompts, args.seed, args.max_new_tokens,
         args.batch_size, args.load_in_4bit,
         save_logits=args.save_logits, logits_top_k=args.logits_top_k,
+        attn_impl=args.attn_impl,
     )
     out_path = Path(args.output)
     if not args.no_cache_suffix:
@@ -913,7 +939,7 @@ def main() -> int:
     # round-trip for the exact same repo+revision.
     model, tokenizer = _load_teacher(
         args.teacher, args.teacher_revision, args.load_in_4bit,
-        tokenizer=bootstrap_tok,
+        tokenizer=bootstrap_tok, attn_impl=args.attn_impl,
     )
 
     # Open in append mode when resuming with rows already present, else
