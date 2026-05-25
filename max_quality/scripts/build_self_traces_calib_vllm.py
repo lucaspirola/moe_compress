@@ -386,12 +386,23 @@ def main() -> int:
     p.add_argument("--no-cache-suffix", action="store_true")
     p.add_argument("--resume", action="store_true",
                    help="Skip prompts that already have rows in the .tmp file.")
+    p.add_argument("--prompt-skip", type=int, default=0,
+                   help="Drop the first N prompts from the deterministic "
+                        "iterator before processing. Use to extend an existing "
+                        "run with NEW traces (positions N..num_prompts-1) "
+                        "without re-generating the first N. The cache_key "
+                        "incorporates this, so the output file is distinct "
+                        "from the unskipped run with the same --num-prompts.")
     args = p.parse_args()
 
     # --- cache_key + paths ----------------------------------------------
+    # prompt-skip is folded into the prompts_source field so a skipped run
+    # writes to a separate cache_key (different filename) from an unskipped
+    # run with the same --num-prompts.
+    _skip_suffix = f"#skip{args.prompt_skip}" if args.prompt_skip else ""
     cache_key = _trace_cache_key_vllm(
         args.teacher, args.teacher_revision,
-        f"{args.prompts}#{args.num_prompts}#{args.seed}",
+        f"{args.prompts}#{args.num_prompts}#{args.seed}{_skip_suffix}",
         args.num_prompts, args.seed,
         args.max_new_tokens, args.reasoning_budget,
         args.dtype, args.logits_top_k,
@@ -432,6 +443,21 @@ def main() -> int:
         log.error("no prompts gathered.")
         return 1
     log.info("gathered %d prompts", len(prompts))
+
+    # --- apply --prompt-skip --------------------------------------------
+    # Drop the first N from the deterministic ordering. The remaining tail
+    # (positions N..num_prompts-1) is what gets generated. Used to extend
+    # an existing run with new traces without reprocessing.
+    if args.prompt_skip > 0:
+        if args.prompt_skip >= len(prompts):
+            log.error("--prompt-skip %d >= gathered prompts %d; nothing to do",
+                      args.prompt_skip, len(prompts))
+            return 1
+        log.info("--prompt-skip: dropping first %d; processing %d new prompts "
+                 "(positions %d..%d of deterministic order)",
+                 args.prompt_skip, len(prompts) - args.prompt_skip,
+                 args.prompt_skip, len(prompts) - 1)
+        prompts = prompts[args.prompt_skip:]
 
     # --- resume ---------------------------------------------------------
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
