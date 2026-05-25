@@ -383,7 +383,7 @@ def _generate_traces(
     already_done: int = 0,
 ) -> Iterator[dict]:
     """Greedy-generate teacher traces; yield
-    ``{"messages": [...], "domain": "..."}`` rows. The ``domain`` field
+    ``{"messages": [...], "domain": "...", "_complete": bool, "_attempt_idx": int}`` rows. The ``domain`` field
     propagates the source-subset tag from the prompt iterator so the
     downstream self-traces loader can preserve the empirical domain mix
     at every draw.
