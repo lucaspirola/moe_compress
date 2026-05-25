@@ -1437,12 +1437,28 @@ def _load_self_traces_state(path) -> dict:
             rows.append(row)
 
     if not rows:
-        raise ValueError(
-            f"self-traces: JSONL at {path} contained zero parseable rows "
-            f"(out of {n_parsed} parsed, {n_incomplete_filtered} were "
-            "filtered as `_complete=false`). Re-run the trace builder with a "
-            "larger --max-new-tokens or oversample --num-prompts."
-        )
+        if n_incomplete_filtered > 0:
+            # Rows decoded successfully but were all dropped by the
+            # `_complete=false` filter — the trace builder produced only
+            # truncated reasoning. Re-running with more headroom recovers them.
+            msg = (
+                f"self-traces: JSONL at {path} produced zero usable rows "
+                f"(out of {n_parsed} JSON-decoded, {n_incomplete_filtered} "
+                "were filtered as `_complete=false`). Re-run the trace "
+                "builder with a larger --max-new-tokens or oversample "
+                "--num-prompts."
+            )
+        else:
+            # No rows decoded at all — file is empty or every line failed
+            # json.loads. Builder-rerun advice on token budget doesn't apply;
+            # operator should verify the path and re-run the builder.
+            msg = (
+                f"self-traces: JSONL at {path} produced zero usable rows "
+                f"({n_parsed} JSON-decoded). The file is empty or every "
+                "line failed JSON decoding. Verify the path and re-run the "
+                "trace builder from scratch."
+            )
+        raise ValueError(msg)
 
     if n_incomplete_filtered > 0:
         log.info(
