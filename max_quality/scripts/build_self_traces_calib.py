@@ -510,26 +510,51 @@ def _generate_traces(
             rendered, return_tensors="pt", padding=True, truncation=True,
             max_length=2048,
         ).to(model.device)
+
+        # Topk-capture per-step logits via a LogitsProcessor that runs
+        # inline during generate(). The processor:
+        #   1. Computes log_softmax over the full [bs, vocab] step logits.
+        #   2. Picks topk on the fly.
+        #   3. Moves the topk tensors to CPU IMMEDIATELY — releasing the
+        #      full-vocab tensor for the next step to reuse.
+        # This keeps GPU memory bounded at O(bs * vocab) — one step at a
+        # time — instead of the O(bs * vocab * T) accumulation that
+        # `output_scores=True` would cause (which OOMs at T=16384, vocab=152k).
+        topk_capture = None
+        gen_extra_kwargs: dict = {}
+        if save_logits:
+            from transformers import LogitsProcessor, LogitsProcessorList  # type: ignore
+
+            class _TopKCapture(LogitsProcessor):
+                def __init__(self, k: int) -> None:
+                    self.k = int(k)
+                    # Per-step CPU tensors, each [bs, k]. After generate(),
+                    # we stack-and-slice per row.
+                    self.top_ids: list[torch.Tensor] = []
+                    self.top_lp: list[torch.Tensor] = []
+
+                def __call__(self, _input_ids, scores):  # noqa: D401
+                    # scores: [bs, vocab] pre-softmax at the current step.
+                    lp = torch.log_softmax(scores.float(), dim=-1)
+                    tlp, tid = torch.topk(lp, k=self.k, dim=-1)
+                    # Move to CPU INSIDE the with-no_grad context; the source
+                    # tensors are autoreleased on the next iteration.
+                    self.top_ids.append(tid.detach().to("cpu", dtype=torch.int32))
+                    self.top_lp.append(tlp.detach().to("cpu", dtype=torch.float16))
+                    return scores  # pass-through; we don't modify generation.
+
+            topk_capture = _TopKCapture(logits_top_k)
+            gen_extra_kwargs["logits_processor"] = LogitsProcessorList([topk_capture])
+
         with torch.no_grad():
-            gen_out = model.generate(
+            out_ids = model.generate(
                 **inputs,
                 do_sample=False,
                 max_new_tokens=max_new_tokens,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
-                # When save_logits is on we need the per-step distributions
-                # to topk-cache the teacher's prediction at every generated
-                # position. Otherwise stay on the cheap path (sequences-only).
-                return_dict_in_generate=save_logits,
-                output_scores=save_logits,
+                **gen_extra_kwargs,
             )
-        out_ids = gen_out.sequences if save_logits else gen_out
-        # gen_out.scores is a tuple of length T (gen steps); each tensor is
-        # [B, vocab] — the teacher's pre-softmax logits at that step. We
-        # convert to log-softmax once below to compute KL against the student
-        # on-the-fly without re-running the teacher. Empty tuple if
-        # save_logits=False (we never request scores in that branch).
-        step_scores = getattr(gen_out, "scores", None) if save_logits else None
 
         gen_only = out_ids[:, inputs.input_ids.shape[1]:]
         # Trim by token-id BEFORE decode. Handles single int eos_token_id,
@@ -570,30 +595,31 @@ def _generate_traces(
             # named by `_attempt_idx` so the downstream `teacher_cache`
             # plugin can resolve `(jsonl_row, position) -> teacher_topk`
             # in O(1).
-            if save_logits and is_complete and step_scores and logits_dir is not None:
-                # gen_only at this batch row is the full RAW generation
-                # (before EOS trim). The trimmed length is the number of
-                # USEFUL prediction positions — token T predicts T+1, so for
-                # an N-token trimmed sequence we keep the first N step
-                # scores (each scores[t] is the prediction at position t).
+            if save_logits and is_complete and topk_capture is not None and logits_dir is not None:
+                # topk_capture has one [bs, k] tensor per generated step,
+                # already on CPU. Per-row save: stack steps 0..n_keep-1 and
+                # slice the b_idx-th batch position. The trimmed length is
+                # the number of USEFUL prediction positions — token T
+                # predicts T+1, so for an N-token trimmed sequence we keep
+                # the first N step entries.
                 n_keep = len(trimmed_rows[b_idx])
                 if n_keep > 0:
                     import numpy as np
-                    # Stack first n_keep step tensors → [n_keep, vocab],
-                    # topk along vocab axis, log-softmax for KL math
-                    # downstream. fp16 storage halves the cache size at
-                    # negligible precision cost for KD targets.
-                    stacked = torch.stack(
-                        [step_scores[t][b_idx] for t in range(n_keep)], dim=0,
-                    )
-                    log_probs = torch.log_softmax(stacked.float(), dim=-1)
-                    top_lp, top_ids = torch.topk(log_probs, k=logits_top_k, dim=-1)
+                    # Stack [n_keep, bs, k] then index [b_idx] → [n_keep, k].
+                    row_top_ids = torch.stack(
+                        [topk_capture.top_ids[t][b_idx] for t in range(n_keep)],
+                        dim=0,
+                    )  # int32 already
+                    row_top_lp = torch.stack(
+                        [topk_capture.top_lp[t][b_idx] for t in range(n_keep)],
+                        dim=0,
+                    )  # fp16 already
                     fp = logits_dir / f"{int(attempt_idx):07d}.npz"
                     np.savez_compressed(
                         fp,
                         token_ids=np.asarray(trimmed_rows[b_idx], dtype=np.int32),
-                        top_ids=top_ids.cpu().numpy().astype(np.int32),
-                        top_logprobs=top_lp.cpu().numpy().astype(np.float16),
+                        top_ids=row_top_ids.numpy(),
+                        top_logprobs=row_top_lp.numpy(),
                         attempt_idx=np.int64(attempt_idx),
                         top_k=np.int32(logits_top_k),
                     )
