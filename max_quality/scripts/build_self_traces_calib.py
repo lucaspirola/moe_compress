@@ -271,6 +271,8 @@ def _trace_cache_key(
     max_new_tokens: int,
     batch_size: int,
     load_in_4bit: bool,
+    save_logits: bool = False,
+    logits_top_k: int = 50,
 ) -> str:
     """Compute the cache key.
 
@@ -295,12 +297,19 @@ def _trace_cache_key(
         "batch_size": batch_size,
         "load_in_4bit": bool(load_in_4bit),
         "decode": "greedy",
-        # schema_version=4: rows now carry `_complete` + `_attempt_idx`, and
-        # `--max-new-tokens` default raised 4096 → 16384 to fit long reasoning
-        # tails. Older JSONLs are still byte-decodable but lack `_complete`,
-        # so the downstream loader cannot honor the completeness filter on
-        # them — invalidating the cache here forces regen.
-        "schema_version": 4,
+        # `save_logits` / `logits_top_k` participate in the cache key only
+        # when save_logits=True. With it off, the trace JSONL is identical to
+        # a no-save-logits run, so we exclude logits_top_k to keep the keys
+        # equal — invalidating the cache only when the user actually flips
+        # logit caching on/off.
+        "save_logits": bool(save_logits),
+        "logits_top_k": int(logits_top_k) if save_logits else 0,
+        # schema_version=5: rows carry `_complete` + `_attempt_idx`, and an
+        # optional teacher-logit topk sidecar is co-emitted under
+        # `<output_stem>_logits/`. schema_version=4 rows are decodable but
+        # never carried logits; bumping forces regen so the cache_key suffix
+        # cleanly partitions logit-bearing vs not.
+        "schema_version": 5,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -381,6 +390,9 @@ def _generate_traces(
     model, tokenizer, prompts: list[tuple[str, str]], *,
     batch_size: int, max_new_tokens: int,
     already_done: int = 0,
+    save_logits: bool = False,
+    logits_top_k: int = 50,
+    logits_dir: Path | None = None,
 ) -> Iterator[dict]:
     """Greedy-generate teacher traces; yield
     ``{"messages": [...], "domain": "...", "_complete": bool, "_attempt_idx": int}`` rows. The ``domain`` field
@@ -482,13 +494,25 @@ def _generate_traces(
             max_length=2048,
         ).to(model.device)
         with torch.no_grad():
-            out_ids = model.generate(
+            gen_out = model.generate(
                 **inputs,
                 do_sample=False,
                 max_new_tokens=max_new_tokens,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
+                # When save_logits is on we need the per-step distributions
+                # to topk-cache the teacher's prediction at every generated
+                # position. Otherwise stay on the cheap path (sequences-only).
+                return_dict_in_generate=save_logits,
+                output_scores=save_logits,
             )
+        out_ids = gen_out.sequences if save_logits else gen_out
+        # gen_out.scores is a tuple of length T (gen steps); each tensor is
+        # [B, vocab] — the teacher's pre-softmax logits at that step. We
+        # convert to log-softmax once below to compute KL against the student
+        # on-the-fly without re-running the teacher. Empty tuple if
+        # save_logits=False (we never request scores in that branch).
+        step_scores = getattr(gen_out, "scores", None) if save_logits else None
 
         gen_only = out_ids[:, inputs.input_ids.shape[1]:]
         # Trim by token-id BEFORE decode. Handles single int eos_token_id,
@@ -503,10 +527,10 @@ def _generate_traces(
             tokenizer.decode(ids, skip_special_tokens=False).strip()
             for ids in trimmed_rows
         ]
-        for prompt, domain, ans, saw_eos, attempt_idx in zip(
+        for b_idx, (prompt, domain, ans, saw_eos, attempt_idx) in enumerate(zip(
             batch_prompts, batch_domains, decoded, eos_emitted,
             batch_attempt_idx,
-        ):
+        )):
             if not ans:
                 continue
             yielded += 1
@@ -519,6 +543,44 @@ def _generate_traces(
             stats[1] += 1
             if is_complete:
                 stats[0] += 1
+
+            # Teacher-logit cache for the `_complete=true` slice — saves the
+            # teacher's TOP-K predicted-next-token distribution at every
+            # generated position so Stage 2.5 router-KD can compute the KD
+            # loss without re-running the teacher in VRAM. We skip incomplete
+            # rows: their tail positions are mid-thought noise and would
+            # poison KD if cached. The on-disk format is one .npz per row,
+            # named by `_attempt_idx` so the downstream `teacher_cache`
+            # plugin can resolve `(jsonl_row, position) -> teacher_topk`
+            # in O(1).
+            if save_logits and is_complete and step_scores and logits_dir is not None:
+                # gen_only at this batch row is the full RAW generation
+                # (before EOS trim). The trimmed length is the number of
+                # USEFUL prediction positions — token T predicts T+1, so for
+                # an N-token trimmed sequence we keep the first N step
+                # scores (each scores[t] is the prediction at position t).
+                n_keep = len(trimmed_rows[b_idx])
+                if n_keep > 0:
+                    import numpy as np
+                    # Stack first n_keep step tensors → [n_keep, vocab],
+                    # topk along vocab axis, log-softmax for KL math
+                    # downstream. fp16 storage halves the cache size at
+                    # negligible precision cost for KD targets.
+                    stacked = torch.stack(
+                        [step_scores[t][b_idx] for t in range(n_keep)], dim=0,
+                    )
+                    log_probs = torch.log_softmax(stacked.float(), dim=-1)
+                    top_lp, top_ids = torch.topk(log_probs, k=logits_top_k, dim=-1)
+                    fp = logits_dir / f"{int(attempt_idx):07d}.npz"
+                    np.savez_compressed(
+                        fp,
+                        token_ids=np.asarray(trimmed_rows[b_idx], dtype=np.int32),
+                        top_ids=top_ids.cpu().numpy().astype(np.int32),
+                        top_logprobs=top_lp.cpu().numpy().astype(np.float16),
+                        attempt_idx=np.int64(attempt_idx),
+                        top_k=np.int32(logits_top_k),
+                    )
+
             yield {
                 "messages": [
                     {"role": "user", "content": prompt},
@@ -636,6 +698,17 @@ def main() -> int:
     p.add_argument("--output", default="artifacts/_shared/self_traces.jsonl")
     p.add_argument("--no-cache-suffix", action="store_true",
                    help="Skip the cache-key suffix on the output filename.")
+    p.add_argument("--save-logits", action="store_true",
+                   help="In addition to the JSONL, persist the teacher's TOP-K "
+                        "log-softmax distribution at every generated position "
+                        "for every `_complete=true` row. Output is a sibling "
+                        "directory `<output_stem>_logits/<attempt_idx>.npz` "
+                        "with arrays (token_ids, top_ids, top_logprobs). "
+                        "Enables Stage 2.5 router-KD to run teacher-free.")
+    p.add_argument("--logits-top-k", type=int, default=50,
+                   help="K for the teacher-logit topk cache (only used with "
+                        "--save-logits). Default 50 covers >99%% of the KL "
+                        "mass at typical KD temperatures with ~300 B/token.")
     p.add_argument("--resume", action="store_true",
                    help="If a .tmp file from a prior run exists, count its "
                         "valid rows and skip that many prompts (in deterministic "
@@ -666,6 +739,7 @@ def main() -> int:
         f"{args.prompts}#{args.num_prompts}#{args.seed}",
         args.num_prompts, args.seed, args.max_new_tokens,
         args.batch_size, args.load_in_4bit,
+        save_logits=args.save_logits, logits_top_k=args.logits_top_k,
     )
     out_path = Path(args.output)
     if not args.no_cache_suffix:
@@ -673,6 +747,14 @@ def main() -> int:
             f"{out_path.stem}_{cache_key}{out_path.suffix}"
         )
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Logit-cache directory lives alongside the JSONL, keyed by the same
+    # cache_key suffix so two runs with/without logit caching coexist on disk.
+    logits_dir: Path | None = None
+    if args.save_logits:
+        logits_dir = out_path.with_name(f"{out_path.stem}_logits")
+        logits_dir.mkdir(parents=True, exist_ok=True)
+        log.info("teacher logits cache -> %s/ (top-k=%d, fp16)",
+                 logits_dir, args.logits_top_k)
     if out_path.exists():
         # --resume + already-finished output is a no-op success, not an
         # error. The cache_key in the filename guarantees the prior run was
@@ -844,6 +926,9 @@ def main() -> int:
             batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens,
             already_done=already_done,
+            save_logits=args.save_logits,
+            logits_top_k=args.logits_top_k,
+            logits_dir=logits_dir,
         ):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
