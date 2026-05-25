@@ -59,6 +59,31 @@ git apply /tmp/calib.patch
 echo "Applied. Status:"
 git status --short
 
+echo "[$(date)] === Phase 5b: normalise pyproject.toml license to dict form ==="
+# vLLM 0.21.0 declares `license = "Apache-2.0"` (SPDX-string form). Strict
+# setuptools/pip validators reject this and require either {file = ...} or
+# {text = ...} dict form. Rewrite to the {text = ...} form in-place; no
+# semantic change.
+python3 - <<'PYEOF'
+import re, pathlib
+p = pathlib.Path("pyproject.toml")
+src = p.read_text()
+# Replace `license = "Apache-2.0"` -> `license = {text = "Apache-2.0"}` if present
+new = re.sub(
+    r'^license\s*=\s*"(.+?)"\s*$',
+    r'license = {text = "\1"}',
+    src,
+    count=1,
+    flags=re.MULTILINE,
+)
+if new != src:
+    p.write_text(new)
+    print("pyproject.toml: license rewritten to dict form")
+else:
+    print("pyproject.toml: license already in compatible form (no change)")
+PYEOF
+grep -n "^license" pyproject.toml || true
+
 echo "[$(date)] === Phase 6: build multi-arch wheel ==="
 export CUDA_HOME=/usr/local/cuda
 export PATH=/usr/local/cuda/bin:${PATH}
