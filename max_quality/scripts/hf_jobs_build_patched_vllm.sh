@@ -29,10 +29,11 @@ echo "[$(date)] === Phase 2: make venv + install build prerequisites ==="
 python3 -m venv /tmp/venv
 # shellcheck disable=SC1091
 . /tmp/venv/bin/activate
-# Pin setuptools<77: newer setuptools enforces strict pyproject.toml license
-# schema; vLLM 0.21.0's pyproject uses the SPDX-string form which the strict
-# schema rejects. setuptools 75.x and earlier accept it.
-pip install --quiet --upgrade pip "wheel<0.50" "setuptools<77"
+# Two-pronged license fix:
+#   - Use setuptools>=77 (accepts PEP 639 license-files field in pyproject)
+#   - Rewrite SPDX-string license to dict form in Phase 5b below (setuptools>=77 rejects it)
+# An older setuptools<77 would accept the SPDX string but reject license-files.
+pip install --quiet --upgrade pip wheel "setuptools>=77"
 pip install --quiet setuptools_scm pybind11 huggingface_hub
 
 echo "[$(date)] === Phase 3: install torch 2.11.0+cu130 ==="
