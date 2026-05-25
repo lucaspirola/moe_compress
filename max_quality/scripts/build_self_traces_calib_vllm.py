@@ -397,7 +397,41 @@ def main() -> int:
                         "construction non-overlapping with the earlier run. "
                         "Cache_key incorporates this so the output file is "
                         "distinct from the prev=0 run with the same --num-prompts.")
+    p.add_argument("--capture-imatrix", action="store_true", default=False,
+                   help="Capture per-input-channel squared-activation statistics "
+                        "for every linear layer reached during calibration and "
+                        "write a llama.cpp-compatible '.imatrix.dat' sidecar at "
+                        "run end. Requires the vLLM calibration-hooks patch "
+                        "(vllm.calibration_imatrix). Auto-enables "
+                        "VLLM_CALIB_CAPTURE_IMATRIX=1, VLLM_CALIB_CAPTURE_EXPERT=1, "
+                        "and VLLM_CALIB_CAPTURE_EXPERT_MID=1 BEFORE any vllm "
+                        "import (the gates are sampled at "
+                        "vllm.calibration_hooks module load). The sidecar is "
+                        "written next to the JSONL with extension '.imatrix.dat'. "
+                        "Failures during dump are logged but do NOT re-raise -- "
+                        "the JSONL is more valuable than the imatrix.")
     args = p.parse_args()
+
+    # Pre-import env gates for the imatrix path. These MUST be set before any
+    # vllm.* import because vllm.calibration_hooks samples them at module
+    # import time (see vllm/calibration_hooks.py for the strict-string rule).
+    if args.capture_imatrix:
+        os.environ["VLLM_CALIB_CAPTURE_IMATRIX"] = "1"
+        # VLLM_CALIB_CAPTURE_EXPERT is REQUIRED so the expert_in callback
+        # dispatches; vllm.calibration_imatrix registers a handler against it
+        # to scatter-reduce per-expert hidden_states into ffn_gate_exps /
+        # ffn_up_exps accumulators.
+        os.environ["VLLM_CALIB_CAPTURE_EXPERT"] = "1"
+        # VLLM_CALIB_CAPTURE_EXPERT_MID is REQUIRED so the expert_mid hook
+        # fires from inside TritonExperts.apply() between SwiGLU and the
+        # pre-down quantize; the imatrix callback consumes the per-expert
+        # silu(gate)·up activations to populate the real ffn_down_exps
+        # entries (replaces the prior uniform-ones placeholder).
+        os.environ["VLLM_CALIB_CAPTURE_EXPERT_MID"] = "1"
+        log.info("--capture-imatrix: enabled VLLM_CALIB_CAPTURE_IMATRIX=1 + "
+                 "VLLM_CALIB_CAPTURE_EXPERT=1 + "
+                 "VLLM_CALIB_CAPTURE_EXPERT_MID=1 "
+                 "(must precede vllm import)")
 
     # --- cache_key + paths ----------------------------------------------
     # prev_num_prompts is folded into the prompts_source field so an extended
@@ -478,6 +512,15 @@ def main() -> int:
     tokenizer = llm.get_tokenizer()
     eos_ids = _coerce_eos_ids(getattr(tokenizer, "eos_token_id", None))
 
+    # --- imatrix accumulator setup (pre-CUDA-graph) ---------------------
+    # The imatrix module must pre-allocate accumulator tensors for every
+    # LinearBase / ParallelLMHead instance BEFORE the first captured
+    # forward; lazy-alloc during CUDA-graph capture is forbidden.
+    if args.capture_imatrix:
+        import vllm.calibration_imatrix as _im  # type: ignore
+        _im.setup(llm)
+        log.info("imatrix: setup complete -- accumulators pre-allocated")
+
     # --- sampling params ------------------------------------------------
     from vllm import SamplingParams  # type: ignore
     # vLLM's reasoning_budget is exposed via `extra_args` (PR #20859 path).
@@ -541,6 +584,24 @@ def main() -> int:
                 total_done, total_target,
                 session_elapsed, session_elapsed / max(n_new, 1),
             )
+
+    # --- imatrix dump ---------------------------------------------------
+    # Run BEFORE the JSONL finalize so a failure here can't corrupt the
+    # rename, but in a try/except so a failure doesn't lose the JSONL.
+    if args.capture_imatrix:
+        total_prompts_processed = already_done + n_new
+        imatrix_path = out_path.with_suffix(".imatrix.dat")
+        try:
+            import vllm.calibration_imatrix as _im  # type: ignore
+            _im.dump_imatrix(str(imatrix_path),
+                             chunk_count=total_prompts_processed)
+            log.info("imatrix -> %s (%d entries from %d prompts)",
+                     imatrix_path, len(_im._accumulators),
+                     total_prompts_processed)
+        except Exception as exc:
+            # Imatrix is a sidecar; cal JSONL is the primary deliverable.
+            # Log and continue.
+            log.error("imatrix dump failed: %s", exc, exc_info=True)
 
     # --- finalize -------------------------------------------------------
     os.replace(tmp_path, out_path)
