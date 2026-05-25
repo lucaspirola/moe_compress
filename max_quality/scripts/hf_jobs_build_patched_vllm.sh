@@ -100,9 +100,32 @@ export NVCC_THREADS=2
 nvcc --version | tail -3
 echo "CPU count: $(nproc)"
 echo "Memory: $(free -h | head -2)"
+
+echo "[$(date)] === Phase 6a: manual cmake configure (to see actual cmake errors) ==="
+# pip wheel hides cmake stdout/stderr behind a Python traceback. Run cmake
+# manually first to capture the real configure errors in the build log.
+mkdir -p /tmp/cmake-test
+cmake -S /tmp/vllm-patched -B /tmp/cmake-test \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DVLLM_TARGET_DEVICE=cuda \
+    -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+    -DTORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
+    -DVLLM_PYTHON_EXECUTABLE=/tmp/venv/bin/python3 \
+    2>&1 | tee /tmp/cmake_configure.log
+CMAKE_RC=${PIPESTATUS[0]}
+echo "cmake configure exit code: ${CMAKE_RC}"
+if [ ${CMAKE_RC} -ne 0 ]; then
+    echo "[$(date)] === cmake configure FAILED; aborting before pip wheel ==="
+    echo "Last 40 lines of cmake log:"
+    tail -40 /tmp/cmake_configure.log
+    exit 1
+fi
+
+echo "[$(date)] === Phase 6b: pip wheel with --verbose ==="
 mkdir -p /tmp/wheels
-# Build the wheel (no editable install — produces a portable .whl)
-pip wheel . --no-deps -w /tmp/wheels --no-build-isolation 2>&1 | tail -50
+# --verbose keeps subprocess output streaming (no buffering).
+pip wheel . --no-deps -w /tmp/wheels --no-build-isolation --verbose 2>&1
 ls -la /tmp/wheels/
 
 echo "[$(date)] === Phase 7: upload wheel to HF Hub ==="
