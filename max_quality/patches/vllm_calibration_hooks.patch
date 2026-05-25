@@ -626,10 +626,10 @@ index 0000000..93d59e6
 +    sys.exit(pytest.main([__file__, "-v"]))
 diff --git a/tests/test_calibration_imatrix_smoke.py b/tests/test_calibration_imatrix_smoke.py
 new file mode 100644
-index 0000000..765c69c
+index 0000000..4a7cd9d
 --- /dev/null
 +++ b/tests/test_calibration_imatrix_smoke.py
-@@ -0,0 +1,750 @@
+@@ -0,0 +1,1090 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_imatrix``.
@@ -1378,6 +1378,346 @@ index 0000000..765c69c
 +    )
 +
 +
++# ---------------------------------------------------------------------------
++# Test 11 -- checkpoint round-trip (dump → load → identity)
++# ---------------------------------------------------------------------------
++
++
++def test_checkpoint_roundtrip(tmp_path):
++    """Dump a checkpoint then load it into a freshly-reloaded module;
++    every accumulator tensor, count, and counter must round-trip exactly.
++
++    Pins the on-disk format contract: a checkpoint written by one
++    instance lifetime is byte-equivalent to its in-memory state when
++    hydrated by the next.
++    """
++    im = _reload_imatrix({
++        "VLLM_CALIB_CAPTURE_IMATRIX": "1",
++        "VLLM_CALIB_IMATRIX_MIN_TOKENS": "0",
++    })
++
++    # Seed a mix of dense + MoE accumulators with deterministic data.
++    im._prefix_to_keys["model.layers.0.self_attn.o_proj"] = [
++        "blk.0.attn_output",
++    ]
++    im._accumulators["blk.0.attn_output"] = torch.tensor(
++        [1.0, 4.0, 9.0, 16.0], dtype=torch.float32,
++    )
++    im._token_counts["blk.0.attn_output"] = 17
++    im._moe_accumulators["blk.0.ffn_gate_exps"] = torch.tensor(
++        [[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32,
++    )
++    im._moe_token_counts_per_expert["blk.0.ffn_gate_exps"] = torch.tensor(
++        [5, 7], dtype=torch.int64,
++    )
++    im._moe_down_accumulators["blk.0.ffn_down_exps"] = torch.tensor(
++        [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]], dtype=torch.float32,
++    )
++    im._moe_down_token_counts_per_expert["blk.0.ffn_down_exps"] = (
++        torch.tensor([11, 13], dtype=torch.int64)
++    )
++    im._N_EXPERTS = 2
++    im.set_n_prompts_accumulated(42)
++
++    ckpt = str(tmp_path / "test.imatrix.ckpt")
++    im.dump_imatrix_checkpoint(ckpt)
++    assert os.path.exists(ckpt), "checkpoint file was not created"
++    assert not os.path.exists(ckpt + ".tmp"), (
++        "temp file should have been atomically renamed"
++    )
++
++    # Reload module (fresh state, no accumulators) and hydrate.
++    im2 = _reload_imatrix({
++        "VLLM_CALIB_CAPTURE_IMATRIX": "1",
++        "VLLM_CALIB_IMATRIX_MIN_TOKENS": "0",
++    })
++    loaded_n = im2.load_imatrix_checkpoint(ckpt)
++    assert loaded_n == 42, f"loaded n={loaded_n}, expected 42"
++    assert im2.get_n_prompts_accumulated() == 42
++
++    # Dense accumulator: identity round-trip.
++    assert torch.equal(
++        im2._accumulators["blk.0.attn_output"],
++        torch.tensor([1.0, 4.0, 9.0, 16.0], dtype=torch.float32),
++    )
++    assert im2._token_counts["blk.0.attn_output"] == 17
++
++    # MoE input accumulator.
++    assert torch.equal(
++        im2._moe_accumulators["blk.0.ffn_gate_exps"],
++        torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32),
++    )
++    assert torch.equal(
++        im2._moe_token_counts_per_expert["blk.0.ffn_gate_exps"],
++        torch.tensor([5, 7], dtype=torch.int64),
++    )
++
++    # MoE down accumulator.
++    assert torch.equal(
++        im2._moe_down_accumulators["blk.0.ffn_down_exps"],
++        torch.tensor(
++            [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]],
++            dtype=torch.float32,
++        ),
++    )
++    assert torch.equal(
++        im2._moe_down_token_counts_per_expert["blk.0.ffn_down_exps"],
++        torch.tensor([11, 13], dtype=torch.int64),
++    )
++
++    # N_EXPERTS + prefix_to_keys hydration.
++    assert im2._N_EXPERTS == 2
++    assert im2._prefix_to_keys[
++        "model.layers.0.self_attn.o_proj"
++    ] == ["blk.0.attn_output"]
++
++
++# ---------------------------------------------------------------------------
++# Test 12 -- two-segment additivity (spot-preemption simulation)
++# ---------------------------------------------------------------------------
++
++
++def test_two_segment_additivity(tmp_path):
++    """The full imatrix from a 6-prompt run must equal a 3-prompt run +
++    checkpoint + 3-prompt resume. Pins the additive contract that makes
++    preemption recovery sound.
++    """
++    prefix = "model.layers.0.self_attn.o_proj"
++    key = "blk.0.attn_output"
++
++    # Deterministic synthetic "prompts" -- six 4-d activation tensors.
++    prompts = [
++        torch.tensor([[float(i + 1)] * 4, [float(i + 2)] * 4],
++                     dtype=torch.float32)
++        for i in range(6)
++    ]
++
++    # Baseline: process all 6 in one shot.
++    im_a = _reload_imatrix({
++        "VLLM_CALIB_CAPTURE_IMATRIX": "1",
++        "VLLM_CALIB_IMATRIX_MIN_TOKENS": "0",
++    })
++    im_a._prefix_to_keys[prefix] = [key]
++    im_a._accumulators[key] = torch.zeros(4, dtype=torch.float32)
++    im_a._token_counts[key] = 0
++    for x in prompts:
++        im_a._imatrix_accumulate_linear(prefix, x)
++    im_a.set_n_prompts_accumulated(6)
++    baseline = im_a._accumulators[key].clone()
++    baseline_count = im_a._token_counts[key]
++
++    # Segment 1: first 3 prompts then checkpoint.
++    im_b = _reload_imatrix({
++        "VLLM_CALIB_CAPTURE_IMATRIX": "1",
++        "VLLM_CALIB_IMATRIX_MIN_TOKENS": "0",
++    })
++    im_b._prefix_to_keys[prefix] = [key]
++    im_b._accumulators[key] = torch.zeros(4, dtype=torch.float32)
++    im_b._token_counts[key] = 0
++    for x in prompts[:3]:
++        im_b._imatrix_accumulate_linear(prefix, x)
++    im_b.set_n_prompts_accumulated(3)
++    ckpt = str(tmp_path / "seg1.imatrix.ckpt")
++    im_b.dump_imatrix_checkpoint(ckpt)
++
++    # Segment 2: fresh module, load checkpoint, process last 3.
++    im_c = _reload_imatrix({
++        "VLLM_CALIB_CAPTURE_IMATRIX": "1",
++        "VLLM_CALIB_IMATRIX_MIN_TOKENS": "0",
++    })
++    # setup()'s allocation step is emulated -- the buffer that load_
++    # checkpoint copies into MUST already exist for the in-place copy_().
++    im_c._prefix_to_keys[prefix] = [key]
++    im_c._accumulators[key] = torch.zeros(4, dtype=torch.float32)
++    im_c._token_counts[key] = 0
++    loaded = im_c.load_imatrix_checkpoint(ckpt)
++    assert loaded == 3
++    for x in prompts[3:]:
++        im_c._imatrix_accumulate_linear(prefix, x)
++    im_c.set_n_prompts_accumulated(6)
++
++    # Assert: segmented run == baseline run, byte-for-byte.
++    assert torch.equal(im_c._accumulators[key], baseline), (
++        f"additive contract broken: segmented={im_c._accumulators[key]}, "
++        f"baseline={baseline}"
++    )
++    assert im_c._token_counts[key] == baseline_count
++    assert im_c.get_n_prompts_accumulated() == 6
++
++
++# ---------------------------------------------------------------------------
++# Test 13 -- atomic write crash safety
++# ---------------------------------------------------------------------------
++
++
++def test_atomic_write_crash_safety(tmp_path, monkeypatch):
++    """A torch.save failure mid-checkpoint must NOT corrupt a prior
++    checkpoint at the same path. The temp+rename contract guarantees
++    the final path is always either v1 or v2, never a half-write.
++    """
++    im = _reload_imatrix({
++        "VLLM_CALIB_CAPTURE_IMATRIX": "1",
++        "VLLM_CALIB_IMATRIX_MIN_TOKENS": "0",
++    })
++    prefix = "model.layers.0.self_attn.o_proj"
++    key = "blk.0.attn_output"
++    im._prefix_to_keys[prefix] = [key]
++    im._accumulators[key] = torch.tensor(
++        [1.0, 1.0, 1.0, 1.0], dtype=torch.float32,
++    )
++    im._token_counts[key] = 1
++    im.set_n_prompts_accumulated(1)
++
++    # Write v1 cleanly.
++    ckpt = str(tmp_path / "test.imatrix.ckpt")
++    im.dump_imatrix_checkpoint(ckpt)
++    with open(ckpt, "rb") as f:
++        v1_bytes = f.read()
++    assert len(v1_bytes) > 0
++
++    # Mutate state and try to write v2, but make torch.save crash.
++    im._accumulators[key] = torch.tensor(
++        [99.0, 99.0, 99.0, 99.0], dtype=torch.float32,
++    )
++
++    import vllm.calibration_imatrix as mod
++
++    def _boom(*args, **kwargs):
++        raise RuntimeError("simulated mid-write crash")
++
++    monkeypatch.setattr(mod.torch, "save", _boom)
++    with pytest.raises(RuntimeError, match="simulated mid-write crash"):
++        im.dump_imatrix_checkpoint(ckpt)
++
++    # v1 must still be intact at the final path.
++    with open(ckpt, "rb") as f:
++        post_bytes = f.read()
++    assert post_bytes == v1_bytes, (
++        "previous checkpoint was corrupted by the crashed write"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 14 -- chunk_count is cumulative after resume
++# ---------------------------------------------------------------------------
++
++
++def test_chunk_count_cumulative_after_resume(tmp_path):
++    """After load_imatrix_checkpoint + additional accumulation,
++    dump_imatrix(path, chunk_count=get_n_prompts_accumulated()) writes
++    the cumulative count to the m_last_chunk field of the .dat file.
++    """
++    im = _reload_imatrix({
++        "VLLM_CALIB_CAPTURE_IMATRIX": "1",
++        "VLLM_CALIB_IMATRIX_MIN_TOKENS": "0",
++    })
++    prefix = "model.layers.0.self_attn.o_proj"
++    key = "blk.0.attn_output"
++    im._prefix_to_keys[prefix] = [key]
++    im._accumulators[key] = torch.zeros(4, dtype=torch.float32)
++    im._token_counts[key] = 0
++
++    # Simulate segment 1: 100 prompts.
++    im._imatrix_accumulate_linear(
++        prefix, torch.ones(2, 4, dtype=torch.float32),
++    )
++    im.set_n_prompts_accumulated(100)
++    ckpt = str(tmp_path / "first.imatrix.ckpt")
++    im.dump_imatrix_checkpoint(ckpt)
++
++    # Fresh module; hydrate; add 50 more.
++    im2 = _reload_imatrix({
++        "VLLM_CALIB_CAPTURE_IMATRIX": "1",
++        "VLLM_CALIB_IMATRIX_MIN_TOKENS": "0",
++    })
++    im2._prefix_to_keys[prefix] = [key]
++    im2._accumulators[key] = torch.zeros(4, dtype=torch.float32)
++    im2._token_counts[key] = 0
++    im2.load_imatrix_checkpoint(ckpt)
++    im2._imatrix_accumulate_linear(
++        prefix, torch.ones(2, 4, dtype=torch.float32),
++    )
++    im2.set_n_prompts_accumulated(150)
++
++    # Final dump with cumulative chunk_count.
++    dat = str(tmp_path / "final.imatrix.dat")
++    im2.dump_imatrix(dat, chunk_count=im2.get_n_prompts_accumulated())
++
++    # Parse m_last_chunk out of the binary file.
++    with open(dat, "rb") as f:
++        data = f.read()
++    # Layout: int32 n_entries, then for each entry:
++    #   int32 name_len, bytes[name_len], int32 ncall, int32 nval,
++    #   float32[nval] values.
++    # Then int32 m_last_chunk, int32 dataset_len, bytes[dataset_len].
++    offset = 0
++    (n_entries,) = struct.unpack_from("<i", data, offset); offset += 4
++    for _ in range(n_entries):
++        (name_len,) = struct.unpack_from("<i", data, offset); offset += 4
++        offset += name_len
++        offset += 4   # ncall
++        (nval,) = struct.unpack_from("<i", data, offset); offset += 4
++        offset += nval * 4
++    (m_last_chunk,) = struct.unpack_from("<i", data, offset)
++    assert m_last_chunk == 150, (
++        f"m_last_chunk={m_last_chunk}, expected cumulative 150"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 15 -- final .dat write is atomic (tmp+rename)
++# ---------------------------------------------------------------------------
++
++
++def test_final_dat_write_is_atomic(tmp_path, monkeypatch):
++    """``dump_imatrix`` → ``_write_dat`` must use the tmp+rename pattern
++    so a kill during the final write leaves any previous .imatrix.dat
++    on disk intact, not half-overwritten.
++    """
++    im = _reload_imatrix({
++        "VLLM_CALIB_CAPTURE_IMATRIX": "1",
++        "VLLM_CALIB_IMATRIX_MIN_TOKENS": "0",
++    })
++    prefix = "model.layers.0.self_attn.o_proj"
++    key = "blk.0.attn_output"
++    im._prefix_to_keys[prefix] = [key]
++    im._accumulators[key] = torch.tensor(
++        [1.0, 1.0, 1.0, 1.0], dtype=torch.float32,
++    )
++    im._token_counts[key] = 1
++
++    # Write v1 cleanly.
++    dat = str(tmp_path / "final.imatrix.dat")
++    im.dump_imatrix(dat, chunk_count=1)
++    with open(dat, "rb") as f:
++        v1_bytes = f.read()
++
++    # Mutate state and try to write v2, but crash mid-write.
++    im._accumulators[key] = torch.tensor(
++        [99.0, 99.0, 99.0, 99.0], dtype=torch.float32,
++    )
++
++    import vllm.calibration_imatrix as mod
++    original_replace = mod.os.replace
++
++    def _boom_replace(src, dst):
++        raise RuntimeError("simulated mid-rename crash")
++
++    monkeypatch.setattr(mod.os, "replace", _boom_replace)
++    with pytest.raises(RuntimeError, match="simulated mid-rename crash"):
++        im.dump_imatrix(dat, chunk_count=2)
++
++    # v1 at the final path must be intact (no half-write).
++    with open(dat, "rb") as f:
++        post_bytes = f.read()
++    assert post_bytes == v1_bytes, (
++        "final .imatrix.dat was corrupted by the crashed write -- "
++        "atomicity contract broken"
++    )
++    # Restore for any post-test cleanup.
++    monkeypatch.setattr(mod.os, "replace", original_replace)
++
++
 +if __name__ == "__main__":
 +    sys.exit(pytest.main([__file__, "-v"]))
 diff --git a/vllm/calibration_hooks.py b/vllm/calibration_hooks.py
@@ -1652,10 +1992,10 @@ index 0000000..19502da
 +    fn(**payload)
 diff --git a/vllm/calibration_imatrix.py b/vllm/calibration_imatrix.py
 new file mode 100644
-index 0000000..eb09167
+index 0000000..8505da3
 --- /dev/null
 +++ b/vllm/calibration_imatrix.py
-@@ -0,0 +1,739 @@
+@@ -0,0 +1,978 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Imatrix capture for llama.cpp-compatible activation statistics.
@@ -1790,6 +2130,10 @@ index 0000000..eb09167
 +__all__ = [
 +    "setup",
 +    "dump_imatrix",
++    "dump_imatrix_checkpoint",
++    "load_imatrix_checkpoint",
++    "get_n_prompts_accumulated",
++    "set_n_prompts_accumulated",
 +]
 +
 +
@@ -1826,6 +2170,27 @@ index 0000000..eb09167
 +# Map from module-prefix (e.g. "model.layers.3.self_attn.qkv_proj") to its
 +# pre-allocated accumulator key(s). Populated by ``setup(llm)``.
 +_prefix_to_keys: dict[str, list[str]] = {}
++
++# ---------------------------------------------------------------------------
++# Spot-preemption resumability (added in calib-v2-imatrix-resumable).
++#
++# ``_n_prompts_accumulated`` is the cumulative count of prompts whose
++# activations have been folded into the accumulators above, across ALL
++# instance lifetimes (it survives ``load_imatrix_checkpoint``). The driver
++# updates it at each chunk boundary; ``dump_imatrix`` reads it for the
++# ``m_last_chunk`` field of the final .dat file.
++#
++# Callbacks do NOT touch this counter — they see tokens / sub-batches and
++# can't tell which (token, slot) pair belongs to which prompt without an
++# extra round-trip from the driver. Keeping the counter driver-owned avoids
++# the bookkeeping ambiguity.
++# ---------------------------------------------------------------------------
++_n_prompts_accumulated: int = 0
++
++# Bump on incompatible changes to the .imatrix.ckpt dict layout; the loader
++# raises ValueError on schema mismatch so a stale checkpoint can't silently
++# corrupt the accumulators.
++_CHECKPOINT_SCHEMA_VERSION: int = 1
 +
 +
 +# ---------------------------------------------------------------------------
@@ -2381,8 +2746,12 @@ index 0000000..eb09167
 +        int32 m_last_chunk
 +        int32 dataset_len
 +        char[dataset_len] dataset
++
++    Atomicity: writes to ``path + ".tmp"`` then ``os.replace(tmp, path)``
++    so a kill mid-write leaves any previous version of ``path`` intact.
 +    """
-+    with open(path, "wb") as f:
++    tmp = path + ".tmp"
++    with open(tmp, "wb") as f:
 +        f.write(struct.pack("<i", len(entries)))
 +        for name, ncall, values in entries:
 +            name_b = name.encode("utf-8")
@@ -2395,6 +2764,216 @@ index 0000000..eb09167
 +        dataset_b = dataset.encode("utf-8")
 +        f.write(struct.pack("<i", len(dataset_b)))
 +        f.write(dataset_b)
++    os.replace(tmp, path)
++
++
++# ---------------------------------------------------------------------------
++# Checkpoint / resume primitives (added in calib-v2-imatrix-resumable).
++# ---------------------------------------------------------------------------
++
++
++def get_n_prompts_accumulated() -> int:
++    """Read-only accessor for the cumulative prompt counter.
++
++    The counter is updated by :func:`set_n_prompts_accumulated` (driver
++    side) and persisted by :func:`dump_imatrix_checkpoint`. It is the
++    canonical source of truth for the ``m_last_chunk`` field passed to
++    :func:`dump_imatrix` at end-of-run.
++    """
++    return _n_prompts_accumulated
++
++
++def set_n_prompts_accumulated(n: int) -> None:
++    """Update the cumulative prompt counter.
++
++    Called by the driver (``build_self_traces_calib_vllm.py``) after each
++    chunked ``LLM.generate`` returns. Tracking is driver-owned because the
++    accumulator callbacks see tokens / sub-batches, not prompt boundaries.
++
++    Args:
++        n: Total prompts whose activations are now folded into the
++           accumulators. MUST be monotonically non-decreasing across calls
++           within one run.
++
++    Raises:
++        ValueError: if ``n < 0``.
++    """
++    global _n_prompts_accumulated
++    if n < 0:
++        raise ValueError(
++            f"n_prompts_accumulated must be >= 0; got {n}"
++        )
++    _n_prompts_accumulated = int(n)
++
++
++def dump_imatrix_checkpoint(path: str) -> None:
++    """Atomically write live accumulator state to ``path`` (.imatrix.ckpt).
++
++    Format: ``torch.save`` of a single dict with stable keys keyed off
++    :data:`_CHECKPOINT_SCHEMA_VERSION`. Tensors are moved to CPU + fp32
++    (or int64 for counts) so the checkpoint is device-agnostic — one
++    dumped on an H200 can be hydrated on an RTX 6000 Pro.
++
++    Atomicity: writes to ``path + ".tmp"`` then ``os.replace(tmp, path)``.
++    A kill mid-write leaves the previous version of ``path`` intact
++    (only ``.tmp`` is partial). This pairs with the atomic write in
++    :func:`_write_dat` so neither the periodic checkpoint nor the final
++    .dat can corrupt their respective committed files.
++
++    Pre-step: ``torch.cuda.synchronize()`` so any in-flight accumulator
++    updates from CUDA-graph-captured forwards are visible before we
++    snapshot them. Vllm joins streams at the request boundary, so this
++    is belt-and-suspenders insurance with negligible cost.
++
++    No-op if ``VLLM_CALIB_CAPTURE_IMATRIX`` is off (matches
++    :func:`dump_imatrix` semantics — callers don't have to gate).
++
++    Args:
++        path: Output path, conventionally ``<jsonl>.imatrix.ckpt``.
++    """
++    if not _CAPTURE_IMATRIX:
++        return
++    if torch.cuda.is_available():
++        torch.cuda.synchronize()
++
++    payload = {
++        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
++        "n_prompts_accumulated": _n_prompts_accumulated,
++        "n_experts": _N_EXPERTS,
++        "prefix_to_keys": dict(_prefix_to_keys),
++        "accumulators": {
++            k: v.detach().to("cpu", dtype=torch.float32, copy=True)
++            for k, v in _accumulators.items()
++        },
++        "token_counts": dict(_token_counts),
++        "moe_accumulators": {
++            k: v.detach().to("cpu", dtype=torch.float32, copy=True)
++            for k, v in _moe_accumulators.items()
++        },
++        "moe_token_counts_per_expert": {
++            k: v.detach().to("cpu", dtype=torch.int64, copy=True)
++            for k, v in _moe_token_counts_per_expert.items()
++        },
++        "moe_down_accumulators": {
++            k: v.detach().to("cpu", dtype=torch.float32, copy=True)
++            for k, v in _moe_down_accumulators.items()
++        },
++        "moe_down_token_counts_per_expert": {
++            k: v.detach().to("cpu", dtype=torch.int64, copy=True)
++            for k, v in _moe_down_token_counts_per_expert.items()
++        },
++    }
++    tmp = path + ".tmp"
++    torch.save(payload, tmp)
++    os.replace(tmp, path)
++
++
++def load_imatrix_checkpoint(path: str) -> int:
++    """Hydrate accumulators from a previous run's checkpoint file.
++
++    Returns the cumulative ``n_prompts_accumulated`` value loaded from
++    the file so the caller knows how many prompts had already been
++    counted (and therefore how many remain to do). Returns ``0`` if
++    ``path`` does not exist (cold-start; non-error).
++
++    Tensors are placed on the same device + dtype as the corresponding
++    pre-allocated accumulator (which :func:`setup` populates from the
++    live model). The in-place ``.copy_()`` preserves the buffer that
++    CUDA-graph capture pinned. For keys NOT in the live dict (e.g. the
++    checkpoint was dumped by a different vLLM build that exposed extra
++    modules), the tensor is added on CPU; the next callback invocation
++    for that prefix will migrate it.
++
++    The cumulative ``_n_prompts_accumulated`` is restored so subsequent
++    chunks add to it rather than restarting from zero.
++
++    Args:
++        path: Input path, conventionally ``<jsonl>.imatrix.ckpt``.
++
++    Returns:
++        The ``n_prompts_accumulated`` value from the checkpoint, or 0
++        if no checkpoint file exists at ``path``.
++
++    Raises:
++        ValueError: on schema_version mismatch (delete the stale
++            checkpoint to restart from scratch).
++    """
++    global _N_EXPERTS, _n_prompts_accumulated
++
++    if not os.path.exists(path):
++        log.info(
++            "calibration_imatrix: no checkpoint at %s; cold start.", path,
++        )
++        return 0
++
++    payload = torch.load(path, map_location="cpu", weights_only=False)
++    schema = int(payload.get("schema_version", 0))
++    if schema != _CHECKPOINT_SCHEMA_VERSION:
++        raise ValueError(
++            f"calibration_imatrix: checkpoint {path} has schema_version "
++            f"{schema}, expected {_CHECKPOINT_SCHEMA_VERSION}. Delete the "
++            f"checkpoint to restart from scratch."
++        )
++    loaded_n = int(payload["n_prompts_accumulated"])
++
++    if _N_EXPERTS is None and payload.get("n_experts") is not None:
++        _N_EXPERTS = int(payload["n_experts"])
++
++    for prefix, keys in payload.get("prefix_to_keys", {}).items():
++        _prefix_to_keys.setdefault(prefix, list(keys))
++
++    def _hydrate_tensor_dict(
++        target: dict[str, torch.Tensor],
++        source: dict[str, torch.Tensor],
++        dtype: torch.dtype,
++    ) -> None:
++        for key, tensor in source.items():
++            existing = target.get(key)
++            if existing is not None:
++                # Preserve the pre-allocated buffer that CUDA-graph capture
++                # pinned: copy in-place into the existing tensor's device.
++                existing.copy_(tensor.to(existing.device, dtype=dtype))
++            else:
++                # Not pre-allocated -- accept on CPU; the first callback
++                # invocation for this key will migrate it on demand.
++                target[key] = tensor.to(dtype=dtype).clone()
++
++    _hydrate_tensor_dict(
++        _accumulators, payload.get("accumulators", {}), torch.float32,
++    )
++    for k, v in payload.get("token_counts", {}).items():
++        _token_counts[k] = int(v)
++    _hydrate_tensor_dict(
++        _moe_accumulators, payload.get("moe_accumulators", {}),
++        torch.float32,
++    )
++    _hydrate_tensor_dict(
++        _moe_token_counts_per_expert,
++        payload.get("moe_token_counts_per_expert", {}),
++        torch.int64,
++    )
++    _hydrate_tensor_dict(
++        _moe_down_accumulators,
++        payload.get("moe_down_accumulators", {}),
++        torch.float32,
++    )
++    _hydrate_tensor_dict(
++        _moe_down_token_counts_per_expert,
++        payload.get("moe_down_token_counts_per_expert", {}),
++        torch.int64,
++    )
++
++    _n_prompts_accumulated = loaded_n
++    log.info(
++        "calibration_imatrix: hydrated checkpoint from %s "
++        "(%d prompts; %d dense + %d moe_exp_in + %d moe_exp_down "
++        "accumulators)",
++        path, loaded_n,
++        len(payload.get("accumulators", {})),
++        len(payload.get("moe_accumulators", {})),
++        len(payload.get("moe_down_accumulators", {})),
++    )
++    return loaded_n
 diff --git a/vllm/envs.py b/vllm/envs.py
 index ded474d..9f54b96 100755
 --- a/vllm/envs.py

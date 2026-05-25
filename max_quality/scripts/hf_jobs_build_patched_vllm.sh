@@ -54,7 +54,10 @@ curl -sL \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected MD5: 9effe235a95940d806f626ee1dc841c8 (3087 lines)
+# Expected MD5: e7f9b8a1a5df7c6d857d17d289588a97 (3666 lines)
+# Adds spot-preemption resumability to imatrix capture: periodic
+# .imatrix.ckpt dump, load-on-resume, atomic .imatrix.dat writes.
+# See max_quality/patches/MANIFEST.md for the change log.
 git apply --check /tmp/calib.patch
 git apply /tmp/calib.patch
 echo "Applied. Status:"
@@ -183,8 +186,8 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-patch-locked`)
-- Patch artifact (3087 lines, MD5 `9effe235a95940d806f626ee1dc841c8`): also uploaded to this repo as `vllm_calibration_hooks.patch`
+- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-imatrix-resumable`)
+- Patch artifact (3666 lines, MD5 `e7f9b8a1a5df7c6d857d17d289588a97`): also uploaded to this repo as `vllm_calibration_hooks.patch`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130
@@ -207,6 +210,21 @@ The patched vLLM accepts new env vars to enable calibration data capture:
 - `VLLM_CALIB_CAPTURE_EXPERT_MID=1` — silu(gate)·up intermediate (input to down_proj; Triton backend)
 - `VLLM_CALIB_CAPTURE_BLOCK=1`      — MoE block pre-residual output
 - `VLLM_CALIB_CAPTURE_IMATRIX=1`    — per-input-channel sum-of-squares for every linear layer (writes llama.cpp-compatible `.imatrix.dat`)
+
+## Spot-preemption resumability
+
+The driver `build_self_traces_calib_vllm.py` writes a periodic
+`<jsonl>.imatrix.ckpt` checkpoint at every chunk boundary (CLI:
+`--imatrix-checkpoint-every-chunks=1` by default). On `--resume`, the
+checkpoint is hydrated into the live accumulators in-place and the
+cumulative prompt counter is restored. The final `.imatrix.dat` and
+the periodic `.imatrix.ckpt` both use the temp-file + `os.replace`
+atomic-rename pattern so a kill mid-write leaves the previous file
+intact. `.npz` logit sidecars are also written atomically.
+
+JSONL resume is hardened against trailing partial lines: each line
+is JSON-validated on resume; the first parse failure triggers a
+truncate to the last good byte offset before counting resumes.
 """
 
 api.upload_file(

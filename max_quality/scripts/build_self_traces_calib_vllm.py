@@ -307,14 +307,21 @@ def _process_outputs(
                     gen.logprobs[:n_keep], logits_top_k,
                 )
                 fp = logits_dir / f"{int(attempt_idx):07d}.npz"
+                # Atomic write: tmp + os.replace so a kill mid-write
+                # leaves any previous .npz at `fp` intact (or no file
+                # at all). The paired JSONL row is written only AFTER
+                # this returns, so resume's re-run of the prompt will
+                # cleanly overwrite either way.
+                tmp_fp = fp.with_suffix(fp.suffix + ".tmp")
                 np.savez_compressed(
-                    fp,
+                    tmp_fp,
                     token_ids=np.asarray(trimmed_ids, dtype=np.int32),
                     top_ids=top_ids,
                     top_logprobs=top_lp,
                     attempt_idx=np.int64(attempt_idx),
                     top_k=np.int32(logits_top_k),
                 )
+                os.replace(tmp_fp, fp)
 
         yield {
             "messages": [
@@ -410,6 +417,15 @@ def main() -> int:
                         "written next to the JSONL with extension '.imatrix.dat'. "
                         "Failures during dump are logged but do NOT re-raise -- "
                         "the JSONL is more valuable than the imatrix.")
+    p.add_argument("--imatrix-checkpoint-every-chunks", type=int, default=1,
+                   help="When --capture-imatrix is set, dump a checkpoint "
+                        "(.imatrix.ckpt) of the live accumulator state every "
+                        "N chunked LLM.generate calls. Default 1 = checkpoint "
+                        "at every JSONL flush boundary, matching the existing "
+                        "crash-recovery granularity. Set 0 to disable periodic "
+                        "checkpointing (final-dump-only). On --resume, the "
+                        "checkpoint at <jsonl>.imatrix.ckpt is hydrated "
+                        "automatically if it exists.")
     args = p.parse_args()
 
     # Pre-import env gates for the imatrix path. These MUST be set before any
@@ -487,13 +503,49 @@ def main() -> int:
     log.info("gathered %d prompts", len(prompts))
 
     # --- resume ---------------------------------------------------------
+    # Hardening: validate every line as JSON and TRUNCATE the file at the
+    # last good offset before counting. This prevents a trailing partial
+    # line (from a kill mid-`f.write`) from being silently counted as a
+    # "done" row, which would skip that prompt forever AND leave garbage
+    # in the eventual finalized .jsonl.
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     already_done = 0
     if args.resume and tmp_path.exists():
-        with tmp_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    already_done += 1
+        last_good_offset = 0
+        bad_line_found = False
+        with tmp_path.open("rb") as f:
+            while True:
+                line_start = f.tell()
+                raw = f.readline()
+                if not raw:
+                    break
+                # Empty/whitespace lines: don't count, but don't truncate
+                # either -- they're harmless.
+                stripped = raw.strip()
+                if not stripped:
+                    last_good_offset = f.tell()
+                    continue
+                try:
+                    json.loads(stripped)
+                except json.JSONDecodeError:
+                    log.warning(
+                        "resume: dropping partial/corrupt line at byte "
+                        "offset %d (len=%d) -- file will be truncated",
+                        line_start, len(raw),
+                    )
+                    bad_line_found = True
+                    # Don't advance last_good_offset; truncate at line_start.
+                    break
+                already_done += 1
+                last_good_offset = f.tell()
+        if bad_line_found:
+            with tmp_path.open("r+b") as f:
+                f.truncate(last_good_offset)
+            log.warning(
+                "resume: truncated %s to %d bytes after dropping partial "
+                "row(s); %d good rows recovered.",
+                tmp_path, last_good_offset, already_done,
+            )
         log.info("resume: %d rows already in %s", already_done, tmp_path)
         if already_done >= len(prompts):
             log.info("resume: all prompts already done — finalizing.")
@@ -520,6 +572,48 @@ def main() -> int:
         import vllm.calibration_imatrix as _im  # type: ignore
         _im.setup(llm)
         log.info("imatrix: setup complete -- accumulators pre-allocated")
+
+        # Spot-preemption resumability: if a prior run wrote a checkpoint
+        # next to the JSONL, hydrate the accumulators NOW (after setup
+        # pre-allocated the buffers CUDA-graph capture needs). The loader
+        # does an in-place .copy_() so the pinned buffers survive.
+        imatrix_ckpt_path = out_path.with_suffix(".imatrix.ckpt")
+        if args.resume and imatrix_ckpt_path.exists():
+            try:
+                loaded_prompts = _im.load_imatrix_checkpoint(
+                    str(imatrix_ckpt_path),
+                )
+                if loaded_prompts != already_done:
+                    # JSONL/checkpoint divergence. Two cases:
+                    #   loaded > already_done : checkpoint is newer than
+                    #     JSONL -- impossible given we checkpoint AFTER
+                    #     flush, unless the user manually edited the JSONL.
+                    #     Trust the checkpoint; warn loudly.
+                    #   loaded < already_done : JSONL was flushed but the
+                    #     subsequent checkpoint dump didn't complete before
+                    #     preemption. The imatrix will have fewer prompts'
+                    #     worth of data than the JSONL claims, but that's
+                    #     honestly recorded in m_last_chunk.
+                    log.warning(
+                        "imatrix: checkpoint has %d prompts but JSONL has "
+                        "%d rows -- proceeding with the cumulative counter "
+                        "from the checkpoint; m_last_chunk in the final "
+                        ".imatrix.dat will reflect actual accumulated count.",
+                        loaded_prompts, already_done,
+                    )
+                else:
+                    log.info(
+                        "imatrix: hydrated %d-prompt checkpoint from %s",
+                        loaded_prompts, imatrix_ckpt_path,
+                    )
+            except ValueError as exc:
+                # Schema mismatch -- delete and restart cleanly.
+                log.error(
+                    "imatrix: checkpoint schema mismatch (%s); deleting "
+                    "stale checkpoint and starting accumulators from zero.",
+                    exc,
+                )
+                imatrix_ckpt_path.unlink()
 
     # --- sampling params ------------------------------------------------
     from vllm import SamplingParams  # type: ignore
@@ -585,19 +679,52 @@ def main() -> int:
                 session_elapsed, session_elapsed / max(n_new, 1),
             )
 
+            # Periodic imatrix checkpoint. Same cadence as the JSONL flush
+            # so a preemption between the two never leaves the checkpoint
+            # ahead of the JSONL. Atomic via tmp+rename inside the dumper,
+            # so a kill during the dump leaves any previous .imatrix.ckpt
+            # intact.
+            if (args.capture_imatrix
+                    and args.imatrix_checkpoint_every_chunks > 0):
+                chunk_idx = chunk_start // args.chunk_size
+                every = args.imatrix_checkpoint_every_chunks
+                if (chunk_idx + 1) % every == 0:
+                    try:
+                        import vllm.calibration_imatrix as _im  # type: ignore
+                        # Driver-owned cumulative counter: reflects all
+                        # prompts ever folded in (across instance lifetimes).
+                        _im.set_n_prompts_accumulated(already_done + n_new)
+                        _im.dump_imatrix_checkpoint(str(imatrix_ckpt_path))
+                        log.info(
+                            "imatrix: checkpointed %d prompts -> %s",
+                            already_done + n_new, imatrix_ckpt_path,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "imatrix checkpoint failed: %s",
+                            exc, exc_info=True,
+                        )
+
     # --- imatrix dump ---------------------------------------------------
     # Run BEFORE the JSONL finalize so a failure here can't corrupt the
     # rename, but in a try/except so a failure doesn't lose the JSONL.
     if args.capture_imatrix:
-        total_prompts_processed = already_done + n_new
         imatrix_path = out_path.with_suffix(".imatrix.dat")
         try:
             import vllm.calibration_imatrix as _im  # type: ignore
+            # Final cumulative-counter sync; this is also what gets written
+            # into the m_last_chunk field of the .imatrix.dat header.
+            _im.set_n_prompts_accumulated(already_done + n_new)
+            total_prompts_processed = _im.get_n_prompts_accumulated()
             _im.dump_imatrix(str(imatrix_path),
                              chunk_count=total_prompts_processed)
             log.info("imatrix -> %s (%d entries from %d prompts)",
                      imatrix_path, len(_im._accumulators),
                      total_prompts_processed)
+            # Periodic checkpoint served its purpose; remove it so the
+            # next clean run (without --resume) doesn't hydrate stale state.
+            if imatrix_ckpt_path.exists():
+                imatrix_ckpt_path.unlink()
         except Exception as exc:
             # Imatrix is a sidecar; cal JSONL is the primary deliverable.
             # Log and continue.
