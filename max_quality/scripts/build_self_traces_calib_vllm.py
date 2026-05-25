@@ -154,6 +154,7 @@ def _load_teacher_vllm(
     gpu_memory_utilization: float, max_model_len: int,
     max_num_seqs: int | None = None,
     max_num_batched_tokens: int | None = None,
+    max_logprobs: int = 50,
 ):
     """Instantiate vLLM's offline LLM for the teacher.
 
@@ -195,6 +196,10 @@ def _load_teacher_vllm(
         reasoning_parser="qwen3",
         # Trust remote code — Qwen3.6's modeling files use custom Python.
         trust_remote_code=True,
+        # vLLM 0.21 defaults max_logprobs=20; we need 50 for the topk teacher
+        # cache. Raise it to match --logits-top-k. Pure runtime validation
+        # cap (not deterministic-output-affecting), so cache_key unchanged.
+        max_logprobs=int(max_logprobs),
     )
     if max_num_seqs is not None:
         kwargs["max_num_seqs"] = int(max_num_seqs)
@@ -449,6 +454,7 @@ def main() -> int:
         args.gpu_memory_utilization, args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        max_logprobs=args.logits_top_k,
     )
     tokenizer = llm.get_tokenizer()
     eos_ids = _coerce_eos_ids(getattr(tokenizer, "eos_token_id", None))
