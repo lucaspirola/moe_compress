@@ -22,7 +22,7 @@ echo "[$(date)] === Phase 1: install base packages ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
-    git python3 python3-pip python3-venv \
+    git python3 python3-pip python3-venv python3-dev python3.12-dev \
     build-essential ninja-build cmake curl ca-certificates
 
 echo "[$(date)] === Phase 2: make venv + install build prerequisites ==="
