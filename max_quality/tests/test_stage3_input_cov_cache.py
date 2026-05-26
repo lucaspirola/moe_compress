@@ -126,6 +126,41 @@ def test_schema_mismatch_raises(tmp_path, monkeypatch):
     assert "Delete the sidecar to regenerate" in msg
 
 
+def test_schema_mismatch_propagates_through_dispatch_first(tmp_path, monkeypatch):
+    """Schema-mismatch ValueError must propagate out of dispatch_first.
+
+    The orchestrator's try/except around the cache lookup narrowed to
+    ``(FileNotFoundError, OSError)`` -- a ``ValueError`` from
+    ``_check_schema`` MUST escape so the user sees the actionable
+    "Delete the sidecar to regenerate" message instead of silently
+    falling back to a stale legacy ``_stage2_input_covariance.pt``.
+
+    Mirror of the orchestrator's wiring: dispatch_first against the
+    cache-provider-only plugin list, with a forced schema bump.
+    """
+    from moe_compress.pipeline.registry import PluginRegistry
+
+    jsonl = _jsonl(tmp_path)
+    save_covariance(_make_payload(), jsonl)
+
+    bumped = dict(SCHEMA_VERSIONS)
+    bumped["covariance"] = 99
+    monkeypatch.setattr(
+        "moe_compress.utils.cached_calibration_signals.SCHEMA_VERSIONS",
+        bumped,
+    )
+
+    plugins = [Stage3InputCovCacheProvider()]
+    with pytest.raises(ValueError) as exc:
+        PluginRegistry.dispatch_first(
+            plugins, "on_load", PipelineContext(), jsonl,
+        )
+    msg = str(exc.value)
+    assert "schema_version=2" in msg
+    assert "expected 99" in msg
+    assert "Delete the sidecar to regenerate" in msg
+
+
 # ---------------------------------------------------------------------------
 # Test 4 -- payload shape matches Stage 2 writer
 # ---------------------------------------------------------------------------
@@ -171,6 +206,10 @@ def test_orchestrator_can_consume_cached_payload(tmp_path):
     """The cache hit's ``payload.sigma_in`` is a drop-in for ``A_cov``:
     ``_cov_lookup`` resolves the same keys against it as it does against
     the legacy Stage 2 file's "covariance" dict.
+
+    The provider now also populates ``ctx.A_cov`` directly (M1 fix:
+    uniform with Stage 4) so the orchestrator reads through the ctx
+    rather than the returned payload.
     """
     from moe_compress.stage3.plugins.aa_svd_factor import _cov_lookup
 
@@ -179,10 +218,16 @@ def test_orchestrator_can_consume_cached_payload(tmp_path):
     save_covariance(payload, jsonl)
 
     provider = Stage3InputCovCacheProvider()
-    result = provider.on_load(PipelineContext(), jsonl)
+    ctx = PipelineContext()
+    result = provider.on_load(ctx, jsonl)
     assert result is not None
+    # M1 fix: on-hit provider populates ctx.A_cov for dispatch_first.
+    assert ctx.has("A_cov")
 
-    A_cov = result.sigma_in
+    A_cov = ctx.get("A_cov")
+    # Same dict as result.sigma_in.
+    assert A_cov is result.sigma_in
+
     # Direct hit: (0, 1, "gate_proj") is in the dict.
     t = _cov_lookup(A_cov, layer_idx=0, expert_idx=1, matrix_name="gate_proj")
     assert t is not None

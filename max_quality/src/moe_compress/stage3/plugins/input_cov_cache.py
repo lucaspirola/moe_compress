@@ -35,27 +35,35 @@ log = logging.getLogger(__name__)
 class Stage3InputCovCacheProvider(BaseCacheProvider):
     """Cache-side provider for the Stage 2/3 input-covariance sidecar.
 
-    On hit, returns the loaded ``CovariancePayload`` so the Stage 3
-    orchestrator can plug ``payload.sigma_in`` straight into ``A_cov``.
-    No ctx mutation -- the orchestrator owns the slot binding because the
-    legacy fallback (``_load_stage2_covariance``) also writes ``A_cov``
-    inline, and the orchestrator picks one or the other.
+    On hit, populates ``ctx.A_cov`` with the loaded ``sigma_in`` dict and
+    returns the ``CovariancePayload`` so the Stage 3 orchestrator's
+    ``dispatch_first("on_load", ...)`` call sees a non-None winner. On
+    miss, returns ``None`` and leaves ``ctx`` untouched so the legacy
+    ``_load_stage2_covariance`` fallback can run unchanged.
+
+    Uniform with :class:`Stage4InputCovCacheProvider`: both providers
+    write ``A_cov`` directly onto the ctx, and both orchestrators read
+    ``ctx.get("A_cov")`` post-dispatch. This routes the cache-vs-live
+    decision through the registry rather than the orchestrator's local
+    glue (the inline-construct anti-pattern that the previous Stage 3
+    implementation used).
     """
 
     name: str = "stage3_input_cov_cache"
     paper: str = (
         "Cache provider for the V2 input-covariance writer "
         "(calibration-v2 Item 1). Reads sidecars/covariance.pt and "
-        "returns a CovariancePayload whose ``sigma_in`` dict is the "
-        "drop-in replacement for the in-memory A_cov dict that the "
-        "Stage 3 orchestrator otherwise loads from "
-        "_stage2_input_covariance.pt."
+        "populates ctx.A_cov so the Stage 3 orchestrator's "
+        "dispatch_first on_load sees a non-None winner and skips the "
+        "legacy _load_stage2_covariance fallback."
     )
     # Informational: this provider is always-enabled (the cache is a
-    # no-op on miss).
-    config_key: str = "stage3_svd.aa_svd.cross_covariance"
+    # no-op on miss). The key names the actual driver knob the provider
+    # depends on -- the calibration JSONL path that locates the sidecar
+    # via ``sidecar_path(jsonl, "covariance")``.
+    config_key: str = "calibration.input_covariance_cache"
     reads: tuple[str, ...] = ()
-    writes: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ("A_cov",)
     provides: tuple[str, ...] = ()
 
     def is_enabled(self, config: dict) -> bool:
@@ -66,20 +74,20 @@ class Stage3InputCovCacheProvider(BaseCacheProvider):
 
     def on_load(self, ctx: PipelineContext,
                 jsonl_path: Path) -> CovariancePayload | None:
-        """Try to load the sidecar; return payload on hit, None on miss.
+        """Try to load the sidecar; on hit set ``ctx.A_cov`` and return
+        the payload; on miss return ``None`` and leave ctx untouched.
 
-        Does NOT mutate ctx -- the Stage 3 orchestrator inspects the
-        returned payload directly (it owns the A_cov binding because the
-        legacy ``_load_stage2_covariance`` fallback also writes A_cov
-        inline; routing both writes through ctx.set would duplicate the
-        binding and obscure the cache-vs-live decision).
+        Schema mismatch surfaces as ``ValueError`` from
+        ``load_covariance`` -- the caller MUST NOT mask that exception
+        (the message is actionable: "Delete the sidecar to regenerate").
         """
         payload = load_covariance(jsonl_path)
         if payload is None:
             return None
+        ctx.set("A_cov", payload.sigma_in)
         log.info(
             "stage3-input-cov-cache: loaded %d-key sidecar (%d layers × "
-            "%d experts) from %s",
+            "%d experts) from %s -- populated ctx.A_cov",
             len(payload.sigma_in), payload.n_layers, payload.n_experts,
             sidecar_path(jsonl_path, "covariance"),
         )

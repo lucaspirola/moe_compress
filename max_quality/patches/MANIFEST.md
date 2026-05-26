@@ -8,11 +8,11 @@ the patch (the HF Jobs build script, the README uploaded to
 
 | Field | Value |
 |---|---|
-| Immutable tag | `calib-v2-input-cov-writer` |
+| Immutable tag | `calib-v2-input-cov-writer-chained-callbacks` |
 | Branch (active) | `feat/calibration-v2` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch line count | **5196** |
-| Patch MD5 | **`304a223fe6f655d95a97cab282d17d5e`** |
+| Patch line count | **5350** |
+| Patch MD5 | **`c35dc497cd3e9268c7448410bdddf80c`** |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -22,9 +22,9 @@ the patch (the HF Jobs build script, the README uploaded to
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: 304a223fe6f655d95a97cab282d17d5e
+# expect: c35dc497cd3e9268c7448410bdddf80c
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 5196
+# expect: 5350
 
 # Re-apply against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -34,7 +34,33 @@ git apply --check /path/to/vllm_calibration_hooks.patch && echo OK
 
 ## Change log
 
-### `calib-v2-input-cov-writer` (current)
+### `calib-v2-input-cov-writer-chained-callbacks` (current)
+Review-fix follow-up to `calib-v2-input-cov-writer`. The single-slot
+callback registry in `vllm/calibration_hooks.py` silently overwrote any
+previous subscriber when a second writer registered for the same hook
+name -- imatrix's `_on_expert_in` and input-cov's `_on_expert_in` could
+not coexist (whichever ran second won; the other's accumulators stayed
+empty without warning).
+
+- `vllm/calibration_hooks.py`: `_callbacks: dict[str, list[Callable]]`
+  (was `dict[str, Callable | None]`). `register_callback(name, fn)` now
+  APPENDS `fn` to the list (identity-based de-dup so the same callable
+  registered twice fires once), or CLEARS the list when `fn is None`.
+  `dispatch(name, ...)` iterates the list in registration order and
+  invokes every callback on the same payload.
+- `tests/test_calibration_hooks_smoke.py`: +3 tests --
+  `test_chained_callbacks_coexist_on_expert_in` pins both writers
+  receiving every dispatch; `test_register_callback_dedup_same_callable`
+  guards against double-fire on duplicate `register_callback` calls
+  (resume / reinit paths); `test_register_callback_none_clears_list`
+  pins the clear-on-None contract.
+- `vllm/calibration_input_cov.py`: extended docstring on `_on_expert_in`
+  explaining the CPU-residency choice (CUDA-graph capture safety), and
+  on `dump_input_cov`'s log message clarifying that the sidecar stores
+  the SHARED gate+up input covariance under `'gate_proj'` (consumers
+  alias up_proj -> gate_proj via `_cov_lookup`).
+
+### `calib-v2-input-cov-writer` (previous)
 Adds the per-(layer, expert, "gate_proj") teacher input-covariance Σ_in
 writer (Item 1 of the calibration-v2 writers campaign).
 - `vllm/calibration_input_cov.py`: new module hooking ``expert_in`` to

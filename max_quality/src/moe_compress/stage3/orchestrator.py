@@ -107,7 +107,17 @@ def run(
     # legacy artifact. The provider is path-scoped (it reads from the
     # calibration JSONL's sibling sidecars/ dir, not from artifacts_dir),
     # so we resolve the calibration JSONL the same way Stage 2 does.
+    #
+    # Wiring: route the cache lookup through the plugin registry via
+    # ``dispatch_first("on_load", ...)`` -- uniform with Stage 4. The
+    # cache provider sets ``ctx.A_cov`` on hit; on miss the ctx is
+    # untouched and the legacy ``_load_stage2_covariance`` runs below.
+    # A throw-away ``cache_ctx`` here keeps the cache binding decoupled
+    # from the main ``run_ctx`` (constructed after the teacher-load
+    # branching) -- we promote ``A_cov`` onto ``run_ctx`` together with
+    # the rest of the slots.
     A_cov = None
+    _cache_ctx = PipelineContext()
     try:
         from pathlib import Path as _Path
         from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
@@ -115,18 +125,25 @@ def run(
         _calib_jsonl_path = _Path(_calib_source)
         if not _calib_jsonl_path.is_absolute():
             _calib_jsonl_path = _Path.cwd() / _calib_jsonl_path
-        _input_cov_cache = Stage3InputCovCacheProvider()
-        _cached_payload = _input_cov_cache.on_load(
-            PipelineContext(), _calib_jsonl_path,
+        # The cache provider is one of the plugins in the registry built
+        # below; reuse the same registry here so an introspection tool
+        # observes one wiring, not two.
+        _cache_only_plugins = [Stage3InputCovCacheProvider()]
+        PluginRegistry.dispatch_first(
+            _cache_only_plugins, "on_load", _cache_ctx, _calib_jsonl_path,
         )
-        if _cached_payload is not None:
-            A_cov = _cached_payload.sigma_in
+        if _cache_ctx.has("A_cov"):
+            A_cov = _cache_ctx.get("A_cov")
             log.info(
                 "Stage 3: V2 input-cov cache HIT (%d keys) -- skipping "
                 "_stage2_input_covariance.pt load", len(A_cov),
             )
-    except Exception as _exc:                       # noqa: BLE001
-        # Cache attempt MUST NOT block the legacy fallback. Log + ignore.
+    except (FileNotFoundError, OSError) as _exc:
+        # Cache attempt MUST NOT block the legacy fallback for routine
+        # filesystem misses. ValueError from _check_schema is NOT caught
+        # here -- a schema mismatch is an actionable user error
+        # ("Delete the sidecar to regenerate") and silently falling back
+        # to the legacy .pt file would mask the upgrade path.
         log.warning("Stage 3: V2 input-cov cache lookup failed (%s) -- "
                     "falling back to _stage2_input_covariance.pt", _exc)
     if A_cov is None:

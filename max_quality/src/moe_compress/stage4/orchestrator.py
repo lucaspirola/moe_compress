@@ -125,10 +125,14 @@ def run(
         PluginRegistry.dispatch_first(
             plugins, "on_load", run_ctx, _calib_jsonl_path,
         )
-    except Exception as _exc:                       # noqa: BLE001
+    except (FileNotFoundError, OSError) as _exc:
         # Cache attempt MUST NOT block the legacy fallback inside
-        # ``EoraInputsPlugin.load_eora_inputs``. Log + ignore so the
-        # walk_phases call below still runs the live load.
+        # ``EoraInputsPlugin.load_eora_inputs`` for routine filesystem
+        # misses. ValueError from the sidecar's _check_schema is NOT
+        # caught here -- a schema mismatch is an actionable user error
+        # ("Delete the sidecar to regenerate"), and silently falling back
+        # to the on-disk _stage2_input_covariance.pt would mask the
+        # upgrade path.
         log.warning("Stage 4: V2 input-cov cache dispatch failed (%s) -- "
                     "falling back to the live load", _exc)
 

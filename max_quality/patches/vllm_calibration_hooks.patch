@@ -1,9 +1,9 @@
 diff --git a/tests/test_calibration_hooks_smoke.py b/tests/test_calibration_hooks_smoke.py
 new file mode 100644
-index 0000000..93d59e6
+index 0000000..c93ec35
 --- /dev/null
 +++ b/tests/test_calibration_hooks_smoke.py
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,714 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_hooks``.
@@ -406,6 +406,100 @@ index 0000000..93d59e6
 +    ch = _reload_hooks({})
 +    with pytest.raises(ValueError):
 +        ch.register_callback("not_a_real_hook", lambda **kw: None)
++
++
++# ---------------------------------------------------------------------------
++# Test 10 — chained callbacks coexist on a single hook (H1 regression)
++# ---------------------------------------------------------------------------
++#
++# Pins the H1 fix: ``vllm.calibration_imatrix.setup()`` and
++# ``vllm.calibration_input_cov.setup()`` both register a ``_on_expert_in``
++# callback for the same ``"expert_in"`` hook. Under the legacy single-slot
++# registry, whichever ran second silently overwrote the first; with the
++# multi-slot registry both subscribers receive every dispatch.
++
++
++def test_chained_callbacks_coexist_on_expert_in():
++    """Multiple callbacks registered for the same hook all fire on dispatch.
++
++    Mirror of the production wiring: imatrix.setup() and
++    input_cov.setup() both register their own ``_on_expert_in``. The
++    list-shaped registry must invoke BOTH on a single dispatch call,
++    preserving registration order.
++    """
++    ch = _reload_hooks({"VLLM_CALIB_CAPTURE_EXPERT": "1"})
++
++    seen_a: list[dict[str, Any]] = []
++    seen_b: list[dict[str, Any]] = []
++
++    def cb_a(**kwargs):
++        seen_a.append(kwargs)
++
++    def cb_b(**kwargs):
++        seen_b.append(kwargs)
++
++    ch.register_callback("expert_in", cb_a)
++    ch.register_callback("expert_in", cb_b)
++
++    payload = _mk_expert_in_payload(0)
++    ch.dispatch("expert_in", **payload)
++
++    # Both callbacks received the exact same payload, exactly once each.
++    assert len(seen_a) == 1
++    assert len(seen_b) == 1
++    assert seen_a[0]["layer_idx"] == 0
++    assert seen_b[0]["layer_idx"] == 0
++    assert torch.equal(seen_a[0]["hidden_states"], payload["hidden_states"])
++    assert torch.equal(seen_b[0]["hidden_states"], payload["hidden_states"])
++
++    # Registration order is preserved: cb_a is at index 0, cb_b at 1.
++    bucket = ch._callbacks["expert_in"]
++    assert bucket[0] is cb_a
++    assert bucket[1] is cb_b
++
++
++def test_register_callback_dedup_same_callable():
++    """Registering the same callable twice does NOT double-fire it.
++
++    Producer modules (imatrix, input_cov, …) call ``setup()`` -> which
++    calls ``register_callback`` -- across resume / driver reinitialisation
++    paths. Without identity-based de-dup the same callback would fire N
++    times per dispatch and double-count its accumulators.
++    """
++    ch = _reload_hooks({"VLLM_CALIB_CAPTURE_EXPERT": "1"})
++
++    seen: list[dict[str, Any]] = []
++
++    def cb(**kwargs):
++        seen.append(kwargs)
++
++    ch.register_callback("expert_in", cb)
++    ch.register_callback("expert_in", cb)  # duplicate -- must be a no-op.
++    ch.register_callback("expert_in", cb)  # ditto.
++
++    ch.dispatch("expert_in", **_mk_expert_in_payload(0))
++
++    assert len(seen) == 1, (
++        f"Duplicate registration fired the callback {len(seen)} times; "
++        f"expected exactly 1."
++    )
++    assert ch._callbacks["expert_in"] == [cb]
++
++
++def test_register_callback_none_clears_list():
++    """Passing fn=None clears every callback registered for the name."""
++    ch = _reload_hooks({"VLLM_CALIB_CAPTURE_EXPERT": "1"})
++
++    seen: list[dict[str, Any]] = []
++    ch.register_callback("expert_in", lambda **kw: seen.append(kw))
++    ch.register_callback("expert_in", lambda **kw: seen.append(kw))
++    assert len(ch._callbacks["expert_in"]) == 2
++
++    ch.register_callback("expert_in", None)
++    assert ch._callbacks["expert_in"] == []
++
++    ch.dispatch("expert_in", **_mk_expert_in_payload(0))
++    assert seen == []
 +
 +
 +# ---------------------------------------------------------------------------
@@ -2500,10 +2594,10 @@ index 0000000..b038437
 +    )
 diff --git a/vllm/calibration_hooks.py b/vllm/calibration_hooks.py
 new file mode 100644
-index 0000000..19502da
+index 0000000..d4c8f8c
 --- /dev/null
 +++ b/vllm/calibration_hooks.py
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,305 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Calibration capture hooks for the MoE forward path.
@@ -2635,6 +2729,19 @@ index 0000000..19502da
 +a single thread, **before** any forward pass that could trigger a dispatch.
 +``dispatch`` reads the dict lock-free; concurrent forward passes are safe.
 +Re-registering during forward is not supported.
++
++Multi-callback (chained) semantics
++----------------------------------
++Each hook name maps to a LIST of callbacks (ordered by registration). A
++single ``dispatch`` call invokes every callback in registration order on
++the same payload. This lets multiple writers share an upstream signal --
++``vllm.calibration_imatrix._on_expert_in`` and
++``vllm.calibration_input_cov._on_expert_in`` can both subscribe to the
++same ``expert_in`` dispatch without one overwriting the other (which was
++the single-slot bug fixed for the calibration-v2 writers campaign). De-
++duplication: registering the SAME callable twice is a no-op (the list
++contains each callable at most once). Clearing: passing ``fn=None`` empties
++the list for that hook.
 +"""
 +from __future__ import annotations
 +
@@ -2679,12 +2786,16 @@ index 0000000..19502da
 +)
 +
 +
-+# Callback registry. None means "no callback registered" — dispatch then
-+# becomes a no-op even if the env var is on. This lets a user toggle env
-+# vars from a launcher script and only register callbacks for the subset
-+# they care about.
-+_callbacks: dict[str, Callable[..., None] | None] = {
-+    name: None for name in VALID_HOOK_NAMES
++# Callback registry. Each hook maps to a LIST of callbacks, dispatched in
++# registration order. An empty list means "no callback registered" --
++# dispatch then becomes a no-op even if the env var is on. The list shape
++# is mandatory because more than one writer may legitimately subscribe to
++# the same upstream signal (e.g. ``calibration_imatrix._on_expert_in`` and
++# ``calibration_input_cov._on_expert_in`` both observe ``expert_in``); a
++# single-slot dict silently overwrote whichever was registered first and
++# corrupted the loser's accumulators.
++_callbacks: dict[str, list[Callable[..., None]]] = {
++    name: [] for name in VALID_HOOK_NAMES
 +}
 +
 +
@@ -2702,7 +2813,10 @@ index 0000000..19502da
 +
 +    Args:
 +        name: One of the entries in :data:`VALID_HOOK_NAMES`.
-+        fn: Callable invoked as ``fn(**payload)``, or ``None`` to clear.
++        fn: Callable invoked as ``fn(**payload)``. Pass ``None`` to clear
++            ALL callbacks for ``name`` (used by tests + the re-import
++            pattern). Registering the SAME callable a second time is a
++            no-op (de-duplication via identity check).
 +
 +    Raises:
 +        ValueError: If ``name`` is not a recognised hook name.
@@ -2710,13 +2824,30 @@ index 0000000..19502da
 +    The callback is invoked inside the MoE forward pass on the same CUDA
 +    stream / device that produced the tensors. See the module docstring
 +    for the ephemeral-tensor contract.
++
++    Multi-callback dispatch: callbacks registered for the same hook are
++    invoked in registration order on every ``dispatch`` call -- see the
++    "Multi-callback (chained) semantics" section of the module docstring.
 +    """
 +    if name not in VALID_HOOK_NAMES:
 +        raise ValueError(
 +            f"Unknown calibration hook name {name!r}; "
 +            f"valid names are {sorted(VALID_HOOK_NAMES)}"
 +        )
-+    _callbacks[name] = fn
++    if fn is None:
++        # Clear the list (preserves the key so dispatch's ``.get`` path
++        # stays a single dict-lookup -- no fallback insertion needed).
++        _callbacks[name] = []
++        return
++    bucket = _callbacks[name]
++    # Identity-based de-dup. The producer side (a calibration module's
++    # setup()) may be called more than once across resume / driver
++    # reinitialisation; without this guard the same callback would fire
++    # multiple times per dispatch and double-count its accumulators.
++    for existing in bucket:
++        if existing is fn:
++            return
++    bucket.append(fn)
 +
 +
 +def dispatch(name: str, **payload: Any) -> None:
@@ -2764,10 +2895,14 @@ index 0000000..19502da
 +        # Unknown name. Be defensive: log nothing, do nothing.
 +        return
 +
-+    fn = _callbacks.get(name)
-+    if fn is None:
++    # Multi-callback fan-out. The list is iterated in registration order
++    # on every dispatch; an empty list is a no-op (the typical case until
++    # a writer module calls ``register_callback`` from its ``setup()``).
++    bucket = _callbacks.get(name)
++    if not bucket:
 +        return
-+    fn(**payload)
++    for fn in bucket:
++        fn(**payload)
 diff --git a/vllm/calibration_imatrix.py b/vllm/calibration_imatrix.py
 new file mode 100644
 index 0000000..8505da3
@@ -3754,10 +3889,10 @@ index 0000000..8505da3
 +    return loaded_n
 diff --git a/vllm/calibration_input_cov.py b/vllm/calibration_input_cov.py
 new file mode 100644
-index 0000000..ded2969
+index 0000000..adff069
 --- /dev/null
 +++ b/vllm/calibration_input_cov.py
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,414 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert, matrix) teacher input covariance capture for
@@ -3975,12 +4110,26 @@ index 0000000..ded2969
 +    fp32 buffer. Matches Stage 2's ``InputCovarianceAccumulator.update``
 +    semantics (the consumer side of the same dict shape).
 +
++    CPU-residency rationale
++    -----------------------
 +    ``hidden_states`` is ephemeral per the calibration_hooks contract,
 +    but we read it into a CPU fp32 copy immediately so the workspace
-+    overwrite on the next forward cannot corrupt our reads. The matmul
-+    happens on CPU -- the row counts per expert are small (~top_k tokens
-+    per expert per forward), and keeping everything on CPU avoids
-+    multi-stream synchronization concerns.
++    overwrite on the next forward cannot corrupt our reads. The
++    ``x^T @ x`` matmul itself ALSO happens on CPU, deliberately. The
++    Stage 2 live ``InputCovarianceAccumulator.update`` keeps the matmul
++    on-device because it runs on a HuggingFace forward path WITHOUT
++    CUDA-graph capture; this writer runs from a vLLM ``expert_in``
++    dispatch INSIDE a CUDA-graph-captured region of the MoE forward,
++    where any device-side allocation or cross-stream sync risks a
++    capture-time crash (lazy alloc is forbidden under graph capture).
++    Keeping the accumulation entirely on CPU eliminates that hazard:
++    the only device-side work is the ``.to("cpu")`` copy, which is
++    safe under capture. Row counts per expert are small (~top_k tokens
++    per expert per forward), so the CPU matmul overhead is bounded.
++    A pre-flight benchmark on the real run will measure whether this
++    becomes a bottleneck; if so, the alternative is a per-batch
++    device-side coalesce -> single CPU copy, NOT a per-expert device
++    matmul (which re-introduces the multi-stream sync hazard).
 +    """
 +    if not _CAPTURE_INPUT_COV:
 +        return
@@ -4088,8 +4237,13 @@ index 0000000..ded2969
 +    )
 +    save_covariance(payload, Path(jsonl_path))
 +    log.info(
-+        "calibration_input_cov: wrote %d-key sidecar (%d layers × %d "
-+        "experts, gate_proj only) next to %s",
++        "calibration_input_cov: wrote %d (layer, expert) entries (%d "
++        "layers × %d experts) next to %s -- each entry stores the "
++        "'gate_proj' matrix representing the SHARED gate+up input "
++        "covariance (consumers alias up_proj -> gate_proj via "
++        "_cov_lookup); down_proj uses separate accumulators that this "
++        "writer does NOT emit (covered by Stage 3's B-only / Corollary "
++        "3.3 fallback).",
 +        len(_COV_ACCUM), _N_LAYERS, _N_EXPERTS, jsonl_path,
 +    )
 +

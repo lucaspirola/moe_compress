@@ -644,6 +644,15 @@ def main() -> int:
     tokenizer = llm.get_tokenizer()
     eos_ids = _coerce_eos_ids(getattr(tokenizer, "eos_token_id", None))
 
+    # Per-writer checkpoint paths. Hoisted out of the per-feature ``if``
+    # blocks so a NameError can't sneak in if a setup() raises before
+    # binding the local (the inner gated references below check
+    # ``is not None`` rather than relying on the feature flag's
+    # truthiness alone -- belt + braces).
+    imatrix_ckpt_path = None
+    reap_ckpt_path = None
+    input_cov_ckpt_path = None
+
     # --- imatrix accumulator setup (pre-CUDA-graph) ---------------------
     # The imatrix module must pre-allocate accumulator tensors for every
     # LinearBase / ParallelLMHead instance BEFORE the first captured
@@ -917,7 +926,7 @@ def main() -> int:
                      total_prompts_processed)
             # Periodic checkpoint served its purpose; remove it so the
             # next clean run (without --resume) doesn't hydrate stale state.
-            if imatrix_ckpt_path.exists():
+            if imatrix_ckpt_path is not None and imatrix_ckpt_path.exists():
                 imatrix_ckpt_path.unlink()
         except Exception as exc:
             # Imatrix is a sidecar; cal JSONL is the primary deliverable.
@@ -939,7 +948,7 @@ def main() -> int:
             )
             # Periodic checkpoint served its purpose; remove it so the
             # next clean run (without --resume) doesn't hydrate stale state.
-            if reap_ckpt_path.exists():
+            if reap_ckpt_path is not None and reap_ckpt_path.exists():
                 reap_ckpt_path.unlink()
         except Exception as exc:
             log.error("reap-scores dump failed: %s", exc, exc_info=True)
@@ -956,7 +965,7 @@ def main() -> int:
                 "input-cov: dumped sidecar from %d prompts (next to %s)",
                 _icov.get_n_prompts_accumulated(), out_path,
             )
-            if input_cov_ckpt_path.exists():
+            if input_cov_ckpt_path is not None and input_cov_ckpt_path.exists():
                 input_cov_ckpt_path.unlink()
         except Exception as exc:
             log.error("input-cov dump failed: %s", exc, exc_info=True)

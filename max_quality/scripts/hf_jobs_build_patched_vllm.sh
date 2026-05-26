@@ -50,11 +50,11 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply calibration hooks patch ==="
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-input-cov-writer/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-input-cov-writer-chained-callbacks/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected MD5: 304a223fe6f655d95a97cab282d17d5e (5196 lines)
+# Expected MD5: c35dc497cd3e9268c7448410bdddf80c (5350 lines)
 # Adds the per-(layer, expert, "gate_proj") teacher input-covariance Σ_in
 # writer (Item 1 of the calibration-v2 writers campaign), on top of the
 # previous REAP-scores writer. Hooks ``expert_in`` to scatter-reduce
@@ -192,8 +192,8 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-input-cov-writer`)
-- Patch artifact (5196 lines, MD5 `304a223fe6f655d95a97cab282d17d5e`): also uploaded to this repo as `vllm_calibration_hooks.patch`
+- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-input-cov-writer-chained-callbacks`)
+- Patch artifact (5350 lines, MD5 `c35dc497cd3e9268c7448410bdddf80c`): also uploaded to this repo as `vllm_calibration_hooks.patch`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130

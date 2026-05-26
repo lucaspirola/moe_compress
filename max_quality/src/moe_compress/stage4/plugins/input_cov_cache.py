@@ -53,9 +53,19 @@ class Stage4InputCovCacheProvider(BaseCacheProvider):
         "short-circuits its _stage2_input_covariance.pt load."
     )
     # Informational only: this provider is always-enabled (cache is a
-    # no-op on miss).
-    config_key: str = "stage4_eora.compensation_budget_pct"
+    # no-op on miss). The key names the actual driver knob the provider
+    # depends on -- the calibration JSONL path that locates the sidecar.
+    config_key: str = "calibration.input_covariance_cache"
     reads: tuple[str, ...] = ()
+    # NOTE: the ``A_cov`` + ``a_storage_dtype`` slots are ALSO listed in
+    # ``EoraInputsPlugin.writes``. The overlap is INTENTIONAL: the
+    # orchestrator dispatches this provider's ``on_load`` BEFORE the live
+    # plugin's ``load_eora_inputs`` hook, and the live plugin's
+    # ``ctx.has("A_cov")`` guard short-circuits on a cache hit (with
+    # ``overwrite=_cache_hit`` so the live plugin's own ctx.set is a
+    # no-op when the cache populated the slots). A future contract-
+    # linting tool that flags write collisions should treat this pair as
+    # an allowed alias rather than a bug.
     writes: tuple[str, ...] = ("A_cov", "a_storage_dtype")
     provides: tuple[str, ...] = ()
 
