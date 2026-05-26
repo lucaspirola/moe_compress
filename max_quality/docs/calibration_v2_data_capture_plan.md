@@ -129,7 +129,7 @@ across all stages and asking *what would it actually consume?*
 | # | Capture | Consuming plugin(s) | How |
 |---|---|---|---|
 | 4 | Per-layer pre-softmax teacher router logits per batch | Stage 1 `SinkTokenDetectorPlugin` (`ROUTER_LOGITS_PER_BATCH`) | Same hook as #3 (joint capture) |
-| 5 | Per-layer expert top-K + post-softmax routing weights per token | Stage 2 `ReapScoringPlugin`, `OutputSpaceCostPlugin`, `ExpertDistillPlugin`, `MergeHealPlugin` | Same hook as #3/#4 (joint capture); ~MB-scale sidecar |
+| 5 | ~~Per-layer expert top-K + post-softmax routing weights per token~~ | **IMPLEMENTATION-REDUNDANT — NOT IMPLEMENTED (campaign decision)**. All four named consumers are already served without this data: `ReapScoringPlugin` uses its live `ReapAccumulator` (or V1+V2 REAP-scores cache); `OutputSpaceCostPlugin` recomputes `σ(x)` from `_router_routing_weights` against the live router + `layer_inputs` reservoir; `ExpertDistillPlugin` v1 drops per-token routing weights entirely (only `freq` from context is used per `D-expert-distill-mse-v1`); `MergeHealPlugin` captures I/O in-process and recomputes routing from the post-resize live router. The three active routing-weight conventions (renormalized top-K, un-renormalized masked, absent) are mutually incompatible — no single pre-baked representation serves all consumers. Per-token storage (8 GB sampled, 410 GB full) was not justified. See `tasks/calib_v2_writers_todo.md`. | — |
 | 6 | Teacher per-expert output activation reservoir `(m_e, d_out)` per `(layer, expert)` | Stage 1 `CKADistancePlugin` (warm-start `output_reservoir`) | vLLM hook on each expert's `down_proj` output, reservoir-sampling |
 
 ### Removed (no consumer in any plugin)
