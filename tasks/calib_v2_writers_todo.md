@@ -28,7 +28,7 @@
 - [x] **Item 10**: ~~Stage 6 teacher cache pre-populate (WikiText-2, ARC-C, HellaSwag, HumanEval, MATH-500).~~ **SCOPE CUT — already implemented.** The `_teacher_cache_key` + `_load_teacher_cache`/`_save_teacher_cache` + `TeacherProviderPlugin.provide_teacher_side` mechanism in `stage6/plugins/teacher_provider.py` is the pre-population mechanism, operating lazily on first Stage 6 run. First run writes all 5 baselines (wikitext2_ppl, ARC-C, HellaSwag, humaneval_pass_at_1, math500_accuracy) to `teacher_eval_cache.json` under a 10-component SHA-256 key; subsequent ablations are cache-hits with zero GPU cost. An offline `precompute_teacher_baselines.py` would shift identical compute earlier but save nothing AND require duplicating eval-environment setup. NO code shipped. Reversible if cross-model pre-warming becomes a concrete need.
 
 ## Phase 5 — Last (your explicit ordering)
-- [ ] **L2**: `max_layer` early-exit source patch to vLLM model runner.
+- [x] **L2**: `max_layer` early-exit source patch to vLLM model runner. Commit `f8511cb`. Loop closed at iter 1. Patch 10101 lines, MD5 `a8da5e321ac7fb30f1648fba3476bea6`. New tag `calib-v2-max-layer-early-exit`. torch.compile-safe (modifies islice bound; no data-dependent break). Public API: `set_calibration_max_layer(N)` + `VLLM_CALIB_MAX_LAYER` env var. 8 in-patch tests.
 - [ ] **L1**: REAP+REAM (default) refactor — N vLLM passes with `update_weights` between rounds.
 
 ## Phase 6 — Deploy
