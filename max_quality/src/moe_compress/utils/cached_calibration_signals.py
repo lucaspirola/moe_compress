@@ -96,15 +96,16 @@ from moe_compress.pipeline.plugin import BasePlugin
 # Schema versions -- central source of truth.
 # ---------------------------------------------------------------------------
 SCHEMA_VERSIONS: dict[str, int] = {
-    "phase_b":          1,
-    "stage2_profile":   1,
-    "covariance":       2,
-    "router_kd_logits": 1,
-    "block_hidden":     1,
-    "teacher_eval":     1,
-    "reap_scores":      1,
-    "per_expert_max":   1,
-    "routing_stats":    1,
+    "phase_b":             1,
+    "stage2_profile":      1,
+    "covariance":          2,
+    "router_kd_logits":    1,
+    "block_hidden":        1,
+    "teacher_eval":        1,
+    "reap_scores":         1,
+    "per_expert_max":      1,
+    "routing_stats":       1,
+    "router_logits_stats": 1,
 }
 
 
@@ -237,6 +238,58 @@ class RoutingStatsPayload:
     n_layers: int
     freq: torch.Tensor          # [n_layers, n_experts] int64
     mean_weight: torch.Tensor   # [n_layers, n_experts] float32
+
+
+@dataclass
+class RouterLogitsStatsPayload:
+    """Per-(layer, expert) sink-vs-normal router-score aggregates.
+
+    Storage choice: aggregate stats (NOT raw per-token logits). The
+    on-disk payload mirrors the finalized output of
+    :class:`SinkTokenRoutingAccumulator` -- per-(layer, expert)
+    ``mean_router_score_sink``, ``mean_router_score_normal``, and
+    ``freq_on_sink`` -- plus the per-layer sink / normal token counts
+    needed to invert the means back into sums if a downstream consumer
+    wants to reweight or merge across multiple captures.
+
+    All POST-softmax aggregates (despite the "router_logits" name -- the
+    hook fires on logits, but the writer softmaxes inline before
+    accumulating).
+
+    Indexing convention: per-(layer, expert) tensors are indexed by
+    ``[layer_rank, expert_id]`` where ``layer_rank`` is the 0-based
+    ordinal into the MoE layer list (NOT the model's absolute
+    ``layer_idx``). The Stage 1 cache reader maps rank -> layer_idx via
+    the live ``MoELayerRef`` list when hydrating a
+    :class:`SinkTokenRoutingAccumulator` from this payload.
+
+    Sink definition (writer-side): a token is "sink" iff
+    ``input_id == bos_token_id`` (when the writer has both the
+    ``input_ids`` tensor and a non-None ``bos_token_id``). When the
+    router-hook payload does not include ``input_ids`` (the current vLLM
+    dispatch contract — see ``vllm/calibration_hooks.py``), the writer
+    falls back to the leading-position-only convention: token at
+    position 0 of the batch is sink. The fallback is documented;
+    consumers that care MUST verify the writer's ``bos_token_id`` field
+    is set and was used (i.e. that the upstream dispatch grew the
+    ``input_ids`` kwarg).
+
+    Consumer: :class:`Stage1RouterLogitsStatsCacheProvider` hydrates a
+    pre-finalized :class:`SinkTokenRoutingAccumulator` from this payload
+    into ``ctx["sink_acc"]`` -- the SAME slot the live
+    ``SinkTokenDetectorPlugin.setup()`` writes -- so the downstream
+    sink-token detector consumes the cached aggregates without
+    rebuilding them from a router-logits pass.
+    """
+    schema_version: int
+    n_experts: int
+    n_layers: int
+    score_sink_sum: torch.Tensor      # [n_layers, n_experts] float32
+    score_normal_sum: torch.Tensor    # [n_layers, n_experts] float32
+    fire_on_sink: torch.Tensor        # [n_layers, n_experts] int64
+    n_sink_tokens: torch.Tensor       # [n_layers] int64
+    n_normal_tokens: torch.Tensor     # [n_layers] int64
+    bos_token_id: int | None          # may be None if not captured
 
 
 @dataclass
@@ -480,6 +533,56 @@ def load_routing_stats(jsonl_path: Path) -> RoutingStatsPayload | None:
 
 
 # ---------------------------------------------------------------------------
+# Signal 2e: router_logits_stats (per-(layer, expert) sink-vs-normal aggregates).
+# ---------------------------------------------------------------------------
+def save_router_logits_stats(payload: RouterLogitsStatsPayload, jsonl_path: Path) -> None:
+    """Atomically write the router-logits-stats sidecar.
+
+    Tensors are moved to CPU before serialization so the sidecar is
+    device-agnostic (H200 -> RTX 6000 Pro round-trip is supported).
+    """
+    cpu_payload = RouterLogitsStatsPayload(
+        schema_version=payload.schema_version,
+        n_experts=payload.n_experts,
+        n_layers=payload.n_layers,
+        score_sink_sum=payload.score_sink_sum.detach().to(
+            "cpu", dtype=torch.float32,
+        ),
+        score_normal_sum=payload.score_normal_sum.detach().to(
+            "cpu", dtype=torch.float32,
+        ),
+        fire_on_sink=payload.fire_on_sink.detach().to(
+            "cpu", dtype=torch.int64,
+        ),
+        n_sink_tokens=payload.n_sink_tokens.detach().to(
+            "cpu", dtype=torch.int64,
+        ),
+        n_normal_tokens=payload.n_normal_tokens.detach().to(
+            "cpu", dtype=torch.int64,
+        ),
+        bos_token_id=(
+            int(payload.bos_token_id)
+            if payload.bos_token_id is not None else None
+        ),
+    )
+    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "router_logits_stats"))
+
+
+def load_router_logits_stats(jsonl_path: Path) -> RouterLogitsStatsPayload | None:
+    """Load the router-logits-stats sidecar.
+
+    Returns None if the sidecar does not exist (cache miss). Raises
+    ValueError on schema_version mismatch with an actionable message.
+    """
+    path = sidecar_path(jsonl_path, "router_logits_stats")
+    if not path.exists():
+        return None
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    _check_schema("router_logits_stats", payload.schema_version, path)
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Signal 3: covariance (teacher-side sigma_in).
 # ---------------------------------------------------------------------------
 def save_covariance(payload: CovariancePayload, jsonl_path: Path) -> None:
@@ -647,6 +750,7 @@ __all__ = [
     "Stage2ReapPayload",
     "Stage1PerExpertMaxPayload",
     "RoutingStatsPayload",
+    "RouterLogitsStatsPayload",
     "CovariancePayload",
     "RouterKDLogitsPayload",
     "BlockHiddenPayload",
@@ -661,6 +765,8 @@ __all__ = [
     "load_per_expert_max",
     "save_routing_stats",
     "load_routing_stats",
+    "save_router_logits_stats",
+    "load_router_logits_stats",
     "save_covariance",
     "load_covariance",
     "save_router_kd_logits",

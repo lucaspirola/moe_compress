@@ -2989,6 +2989,522 @@ index 0000000..b038437
 +        payload.token_counts[0],
 +        torch.tensor([1, 0, 0], dtype=torch.int64),
 +    )
+diff --git a/tests/test_calibration_router_logits_stats_smoke.py b/tests/test_calibration_router_logits_stats_smoke.py
+new file mode 100644
+index 0000000..b768afb
+--- /dev/null
++++ b/tests/test_calibration_router_logits_stats_smoke.py
+@@ -0,0 +1,510 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Smoke tests for ``vllm.calibration_router_logits_stats``.
++
++These exercise the per-(layer, expert) sink-vs-normal aggregate writer
++shipped in Item 4 of the calibration-v2 writers campaign.
++
++Tests:
++
++1. ``test_env_gate_off_no_op`` -- env unset -> ``setup()`` and the
++   callback are no-ops (accumulators untouched).
++2. ``test_sink_mask_via_input_ids_with_bos`` -- dispatch supplies
++   ``input_ids`` + setup recorded ``bos_token_id`` -> the BOS-id
++   branch classifies sink tokens correctly.
++3. ``test_sink_mask_fallback_position_zero_only`` -- dispatch does NOT
++   supply ``input_ids`` -> the writer's fallback marks ONLY token 0 as
++   sink (the de facto active path today).
++4. ``test_score_sink_normal_accumulation_correctness`` -- two batches
++   of synthetic logits accumulate the expected per-(layer, expert)
++   sums (mirrors the projection of softmax(router_logits) onto sink
++   vs normal positions).
++5. ``test_checkpoint_round_trip`` -- dump -> reload module ->
++   load_checkpoint restores byte-identical accumulator state including
++   the ``bos_token_id`` field.
++6. ``test_dump_payload_shape_and_means`` -- after a synthetic run the
++   final ``dump_router_logits_stats`` payload has the right shape and
++   the per-(layer, expert) means (score_sink_sum/n_sink_tokens) match
++   the hand-computed values.
++"""
++from __future__ import annotations
++
++import importlib
++import os
++import sys
++from typing import Any
++
++import torch
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _reload_rls(env: dict[str, str]) -> Any:
++    """Reload ``vllm.calibration_router_logits_stats`` (and hooks) with a
++    fresh env. Module-level ``_CAPTURE_ROUTER_LOGITS_STATS`` is sampled at
++    import; per-test isolation requires a fresh import."""
++    sys.modules.pop("vllm.calibration_router_logits_stats", None)
++    sys.modules.pop("vllm.calibration_hooks", None)
++    for key in (
++        "VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS",
++        "VLLM_CALIB_CAPTURE_ROUTING_STATS",
++        "VLLM_CALIB_CAPTURE_ROUTER",
++        "VLLM_CALIB_CAPTURE_REAP_SCORES",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED",
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX",
++        "VLLM_CALIB_CAPTURE_IMATRIX",
++        "VLLM_CALIB_CAPTURE_EXPERT",
++        "VLLM_CALIB_CAPTURE_BLOCK",
++        "VLLM_CALIB_CAPTURE_EXPERT_MID",
++        "VLLM_CALIB_CAPTURE_INPUT_COV",
++    ):
++        os.environ.pop(key, None)
++    for k, v in env.items():
++        os.environ[k] = v
++    importlib.import_module("vllm.calibration_hooks")
++    return importlib.import_module("vllm.calibration_router_logits_stats")
++
++
++def _seed_layer(rls: Any, layer_idx: int, rank: int, n_experts: int) -> None:
++    """Manually wire up the per-layer accumulators the way setup() would."""
++    rls._LAYER_ID_TO_RANK[layer_idx] = rank
++    if rank + 1 > rls._N_LAYERS:
++        rls._N_LAYERS = rank + 1
++    if n_experts > rls._N_EXPERTS:
++        rls._N_EXPERTS = n_experts
++    rls._SCORE_SINK_SUM[rank] = torch.zeros(n_experts, dtype=torch.float32)
++    rls._SCORE_NORMAL_SUM[rank] = torch.zeros(n_experts, dtype=torch.float32)
++    rls._FIRE_ON_SINK[rank] = torch.zeros(n_experts, dtype=torch.int64)
++    rls._N_SINK_TOKENS[rank] = torch.zeros(1, dtype=torch.int64)
++    rls._N_NORMAL_TOKENS[rank] = torch.zeros(1, dtype=torch.int64)
++
++
++# ---------------------------------------------------------------------------
++# Test 1 -- env-off short-circuit
++# ---------------------------------------------------------------------------
++
++
++def test_env_gate_off_no_op():
++    """Env unset -> setup() is a no-op, and the callback short-circuits
++    before touching any accumulator."""
++    rls = _reload_rls({})
++    assert rls._CAPTURE_ROUTER_LOGITS_STATS is False
++
++    rls.setup(llm=None)
++    # No callback registered; no accumulators allocated.
++    import vllm.calibration_hooks as _ch
++    assert _ch._callbacks["router"] == []
++    assert rls._SCORE_SINK_SUM == {}
++    assert rls._FIRE_ON_SINK == {}
++
++    # Manually seed accumulators; the callback must still short-circuit
++    # because the module-level env flag is False.
++    n_experts = 3
++    _seed_layer(rls, layer_idx=0, rank=0, n_experts=n_experts)
++    rls._on_router(
++        layer_idx=0,
++        router_logits=torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32),
++        topk_weights=torch.tensor([[1.0]], dtype=torch.float32),
++        topk_ids=torch.tensor([[1]], dtype=torch.int64),
++    )
++    assert torch.equal(
++        rls._SCORE_SINK_SUM[0],
++        torch.zeros(n_experts, dtype=torch.float32),
++    )
++    assert torch.equal(
++        rls._SCORE_NORMAL_SUM[0],
++        torch.zeros(n_experts, dtype=torch.float32),
++    )
++    assert torch.equal(
++        rls._FIRE_ON_SINK[0],
++        torch.zeros(n_experts, dtype=torch.int64),
++    )
++    assert torch.equal(rls._N_SINK_TOKENS[0], torch.zeros(1, dtype=torch.int64))
++    assert torch.equal(
++        rls._N_NORMAL_TOKENS[0], torch.zeros(1, dtype=torch.int64),
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 2 -- sink mask via input_ids + BOS detection
++# ---------------------------------------------------------------------------
++
++
++def test_sink_mask_via_input_ids_with_bos():
++    """When the dispatch supplies ``input_ids`` and setup recorded a
++    ``bos_token_id``, every token whose id == BOS is sink; others are
++    normal. Per-expert sums + fire-on-sink reflect exactly that mask."""
++    rls = _reload_rls({
++        "VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    rls._BOS_TOKEN_ID = 7
++    n_experts = 3
++    _seed_layer(rls, layer_idx=0, rank=0, n_experts=n_experts)
++
++    # 4 tokens: ids [7, 3, 7, 5] -> sink mask [T, F, T, F].
++    # router_logits picked so softmax(row) is easy to read.
++    # Row 0 (sink): softmax([1.0, 0.0, 0.0]) approximately [0.576, 0.212, 0.212].
++    # Row 1 (norm): softmax([0.0, 1.0, 0.0]) ~ [0.212, 0.576, 0.212].
++    # Row 2 (sink): softmax([0.0, 0.0, 1.0]) ~ [0.212, 0.212, 0.576].
++    # Row 3 (norm): softmax([1.0, 1.0, 0.0]) ~ [0.422, 0.422, 0.155].
++    input_ids = torch.tensor([7, 3, 7, 5], dtype=torch.int64)
++    router_logits = torch.tensor([
++        [1.0, 0.0, 0.0],
++        [0.0, 1.0, 0.0],
++        [0.0, 0.0, 1.0],
++        [1.0, 1.0, 0.0],
++    ], dtype=torch.float32)
++    topk_ids = torch.tensor([
++        [0],
++        [1],
++        [2],
++        [0],
++    ], dtype=torch.int64)
++    topk_weights = torch.ones((4, 1), dtype=torch.float32)
++
++    rls._on_router(
++        layer_idx=0,
++        router_logits=router_logits,
++        topk_weights=topk_weights,
++        topk_ids=topk_ids,
++        input_ids=input_ids,
++    )
++
++    # Sums: sink rows are 0 + 2; normal rows are 1 + 3.
++    expected_sink = (
++        torch.softmax(router_logits[0], dim=-1)
++        + torch.softmax(router_logits[2], dim=-1)
++    )
++    expected_normal = (
++        torch.softmax(router_logits[1], dim=-1)
++        + torch.softmax(router_logits[3], dim=-1)
++    )
++    assert torch.allclose(rls._SCORE_SINK_SUM[0], expected_sink, atol=1e-6)
++    assert torch.allclose(rls._SCORE_NORMAL_SUM[0], expected_normal, atol=1e-6)
++
++    # Token counts: 2 sink, 2 normal.
++    assert int(rls._N_SINK_TOKENS[0].item()) == 2
++    assert int(rls._N_NORMAL_TOKENS[0].item()) == 2
++
++    # fire_on_sink: sink rows are 0 + 2; topk_ids for those rows are
++    # [0] + [2] => expert 0 fires once, expert 2 fires once, expert 1
++    # never fires for a sink token.
++    assert torch.equal(
++        rls._FIRE_ON_SINK[0],
++        torch.tensor([1, 0, 1], dtype=torch.int64),
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 3 -- fallback sink mask (position 0 only when input_ids=None)
++# ---------------------------------------------------------------------------
++
++
++def test_sink_mask_fallback_position_zero_only():
++    """When the dispatch does NOT supply input_ids, the writer falls
++    back to "only token at position 0 is sink". This is the de facto
++    active path on today's vLLM router dispatch."""
++    rls = _reload_rls({
++        "VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    # Even though setup recorded a BOS id, dispatch-without-input_ids
++    # still uses position-0 fallback (the BOS branch needs BOTH).
++    rls._BOS_TOKEN_ID = 7
++    n_experts = 4
++    _seed_layer(rls, layer_idx=0, rank=0, n_experts=n_experts)
++
++    router_logits = torch.tensor([
++        [1.0, 0.0, 0.0, 0.0],  # position 0 -> sink (fallback)
++        [0.0, 1.0, 0.0, 0.0],
++        [0.0, 0.0, 1.0, 0.0],
++    ], dtype=torch.float32)
++    topk_ids = torch.tensor([
++        [0, 1],
++        [1, 2],
++        [2, 3],
++    ], dtype=torch.int64)
++    topk_weights = torch.ones((3, 2), dtype=torch.float32)
++
++    rls._on_router(
++        layer_idx=0,
++        router_logits=router_logits,
++        topk_weights=topk_weights,
++        topk_ids=topk_ids,
++        # input_ids deliberately omitted.
++    )
++
++    expected_sink = torch.softmax(router_logits[0], dim=-1)
++    expected_normal = (
++        torch.softmax(router_logits[1], dim=-1)
++        + torch.softmax(router_logits[2], dim=-1)
++    )
++    assert torch.allclose(rls._SCORE_SINK_SUM[0], expected_sink, atol=1e-6)
++    assert torch.allclose(rls._SCORE_NORMAL_SUM[0], expected_normal, atol=1e-6)
++    # Token counts: 1 sink (position 0), 2 normal.
++    assert int(rls._N_SINK_TOKENS[0].item()) == 1
++    assert int(rls._N_NORMAL_TOKENS[0].item()) == 2
++    # fire_on_sink: only token 0's top-k contributes -> experts 0, 1 each +1.
++    assert torch.equal(
++        rls._FIRE_ON_SINK[0],
++        torch.tensor([1, 1, 0, 0], dtype=torch.int64),
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 4 -- score_sink + score_normal accumulation correctness across calls
++# ---------------------------------------------------------------------------
++
++
++def test_score_sink_normal_accumulation_correctness():
++    """Two consecutive callback invocations on the same layer must add
++    -- not overwrite -- their per-expert score sums + token counts."""
++    rls = _reload_rls({
++        "VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    rls._BOS_TOKEN_ID = 1
++    n_experts = 3
++    _seed_layer(rls, layer_idx=0, rank=0, n_experts=n_experts)
++
++    # First call: 2 tokens, sink=position 0 (id=1 == BOS).
++    rl_a = torch.tensor([
++        [2.0, 0.0, 0.0],
++        [0.0, 2.0, 0.0],
++    ], dtype=torch.float32)
++    rls._on_router(
++        layer_idx=0,
++        router_logits=rl_a,
++        topk_weights=torch.ones((2, 1), dtype=torch.float32),
++        topk_ids=torch.tensor([[0], [1]], dtype=torch.int64),
++        input_ids=torch.tensor([1, 2], dtype=torch.int64),
++    )
++    after_first_sink = rls._SCORE_SINK_SUM[0].clone()
++    after_first_normal = rls._SCORE_NORMAL_SUM[0].clone()
++    after_first_fire = rls._FIRE_ON_SINK[0].clone()
++    after_first_n_sink = rls._N_SINK_TOKENS[0].clone()
++
++    # Second call: 3 tokens, sink at positions 0 + 2.
++    rl_b = torch.tensor([
++        [0.0, 0.0, 2.0],
++        [1.0, 1.0, 0.0],
++        [0.0, 2.0, 0.0],
++    ], dtype=torch.float32)
++    rls._on_router(
++        layer_idx=0,
++        router_logits=rl_b,
++        topk_weights=torch.ones((3, 1), dtype=torch.float32),
++        topk_ids=torch.tensor([[2], [0], [1]], dtype=torch.int64),
++        input_ids=torch.tensor([1, 5, 1], dtype=torch.int64),
++    )
++
++    # The post-call state must be the elementwise sum of the per-call
++    # contributions (additive accumulator contract).
++    expected_sink_total = after_first_sink + (
++        torch.softmax(rl_b[0], dim=-1)
++        + torch.softmax(rl_b[2], dim=-1)
++    )
++    expected_normal_total = after_first_normal + (
++        torch.softmax(rl_b[1], dim=-1)
++    )
++    assert torch.allclose(rls._SCORE_SINK_SUM[0], expected_sink_total, atol=1e-6)
++    assert torch.allclose(
++        rls._SCORE_NORMAL_SUM[0], expected_normal_total, atol=1e-6,
++    )
++
++    # fire_on_sink: first call added expert 0 once (token 0 -> [0]);
++    # second call added expert 2 (token 0 -> [2]) + expert 1
++    # (token 2 -> [1]).
++    expected_fire = after_first_fire + torch.tensor(
++        [0, 1, 1], dtype=torch.int64,
++    )
++    assert torch.equal(rls._FIRE_ON_SINK[0], expected_fire)
++    # Counts grow additively.
++    assert int(rls._N_SINK_TOKENS[0].item()) == (
++        int(after_first_n_sink.item()) + 2
++    )
++    assert int(rls._N_NORMAL_TOKENS[0].item()) == 1 + 1
++
++
++# ---------------------------------------------------------------------------
++# Test 5 -- checkpoint round-trip preserves bos_token_id
++# ---------------------------------------------------------------------------
++
++
++def test_checkpoint_round_trip(tmp_path):
++    """Dump -> reload module -> load_checkpoint restores byte-identical
++    accumulator state, including the ``bos_token_id`` field (which is a
++    schema concern -- a None must round-trip as None, not 0)."""
++    rls = _reload_rls({
++        "VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    rls._BOS_TOKEN_ID = 151643
++    n_experts = 3
++    _seed_layer(rls, layer_idx=0, rank=0, n_experts=n_experts)
++    _seed_layer(rls, layer_idx=1, rank=1, n_experts=n_experts)
++
++    rls._SCORE_SINK_SUM[0] = torch.tensor(
++        [1.5, 2.5, 0.0], dtype=torch.float32,
++    )
++    rls._SCORE_NORMAL_SUM[0] = torch.tensor(
++        [3.0, 1.0, 0.5], dtype=torch.float32,
++    )
++    rls._FIRE_ON_SINK[0] = torch.tensor([3, 5, 0], dtype=torch.int64)
++    rls._N_SINK_TOKENS[0] = torch.tensor([11], dtype=torch.int64)
++    rls._N_NORMAL_TOKENS[0] = torch.tensor([97], dtype=torch.int64)
++
++    rls._SCORE_SINK_SUM[1] = torch.tensor(
++        [0.0, 0.0, 0.0], dtype=torch.float32,
++    )
++    rls._SCORE_NORMAL_SUM[1] = torch.tensor(
++        [0.1, 0.2, 0.3], dtype=torch.float32,
++    )
++    rls._FIRE_ON_SINK[1] = torch.tensor([0, 0, 0], dtype=torch.int64)
++    rls._N_SINK_TOKENS[1] = torch.tensor([0], dtype=torch.int64)
++    rls._N_NORMAL_TOKENS[1] = torch.tensor([42], dtype=torch.int64)
++    rls.set_n_prompts_accumulated(13)
++
++    ckpt = str(tmp_path / "rls.ckpt")
++    rls.dump_router_logits_stats_checkpoint(ckpt)
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + ".tmp")
++
++    # Reload module -- fresh state -- then hydrate.
++    rls2 = _reload_rls({
++        "VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    assert rls2._SCORE_SINK_SUM == {}
++    assert rls2._BOS_TOKEN_ID is None
++    loaded = rls2.load_router_logits_stats_checkpoint(ckpt)
++    assert loaded == 13
++    assert rls2.get_n_prompts_accumulated() == 13
++    assert rls2._N_LAYERS == 2
++    assert rls2._N_EXPERTS == n_experts
++    assert rls2._BOS_TOKEN_ID == 151643
++    assert torch.equal(
++        rls2._SCORE_SINK_SUM[0],
++        torch.tensor([1.5, 2.5, 0.0], dtype=torch.float32),
++    )
++    assert torch.equal(
++        rls2._SCORE_NORMAL_SUM[0],
++        torch.tensor([3.0, 1.0, 0.5], dtype=torch.float32),
++    )
++    assert torch.equal(
++        rls2._FIRE_ON_SINK[0], torch.tensor([3, 5, 0], dtype=torch.int64),
++    )
++    assert int(rls2._N_SINK_TOKENS[0].item()) == 11
++    assert int(rls2._N_NORMAL_TOKENS[0].item()) == 97
++    assert int(rls2._N_SINK_TOKENS[1].item()) == 0
++    assert int(rls2._N_NORMAL_TOKENS[1].item()) == 42
++    assert rls2._LAYER_ID_TO_RANK == {0: 0, 1: 1}
++
++    # Now exercise the None-BOS path: a fresh ckpt with bos_token_id=None
++    # must round-trip as None (not get coerced to 0 by int(None)).
++    rls2._BOS_TOKEN_ID = None
++    ckpt_none = str(tmp_path / "rls_none.ckpt")
++    rls2.dump_router_logits_stats_checkpoint(ckpt_none)
++    rls3 = _reload_rls({
++        "VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    rls3.load_router_logits_stats_checkpoint(ckpt_none)
++    assert rls3._BOS_TOKEN_ID is None
++
++
++# ---------------------------------------------------------------------------
++# Test 6 -- dump payload shape + per-(layer, expert) means
++# ---------------------------------------------------------------------------
++
++
++def test_dump_payload_shape_and_means(tmp_path, monkeypatch):
++    """After a synthetic two-layer / three-expert run, the final
++    ``dump_router_logits_stats`` payload has shape
++    ``[n_layers, n_experts]`` and the per-(layer, expert) MEAN derived
++    from score_sink_sum / n_sink_tokens matches the hand-computed
++    value. The mean derivation is the consumer's job (the writer
++    persists the raw sums), but the writer must emit the correct sums
++    + counts for that derivation to be possible."""
++    rls = _reload_rls({
++        "VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    rls._BOS_TOKEN_ID = 1
++    n_experts = 3
++    _seed_layer(rls, layer_idx=0, rank=0, n_experts=n_experts)
++    _seed_layer(rls, layer_idx=1, rank=1, n_experts=n_experts)
++
++    # Layer 0: 2 sink tokens with router rows summing to known totals;
++    # 1 normal token.
++    rl0 = torch.tensor([
++        [2.0, 0.0, 0.0],
++        [0.0, 2.0, 0.0],
++        [1.0, 1.0, 1.0],
++    ], dtype=torch.float32)
++    rls._on_router(
++        layer_idx=0, router_logits=rl0,
++        topk_weights=torch.ones((3, 1), dtype=torch.float32),
++        topk_ids=torch.tensor([[0], [1], [2]], dtype=torch.int64),
++        input_ids=torch.tensor([1, 1, 5], dtype=torch.int64),
++    )
++    # Layer 1: 1 sink + 1 normal; different distribution.
++    rl1 = torch.tensor([
++        [0.0, 0.0, 4.0],
++        [1.0, 0.0, 0.0],
++    ], dtype=torch.float32)
++    rls._on_router(
++        layer_idx=1, router_logits=rl1,
++        topk_weights=torch.ones((2, 1), dtype=torch.float32),
++        topk_ids=torch.tensor([[2], [0]], dtype=torch.int64),
++        input_ids=torch.tensor([1, 7], dtype=torch.int64),
++    )
++
++    captured = {}
++
++    def _fake_save(payload, path):
++        captured["payload"] = payload
++        captured["path"] = path
++
++    import moe_compress.utils.cached_calibration_signals as ccs
++    monkeypatch.setattr(ccs, "save_router_logits_stats", _fake_save)
++
++    jsonl = tmp_path / "trace.jsonl"
++    rls.dump_router_logits_stats(jsonl)
++
++    payload = captured["payload"]
++    assert payload is not None
++    assert payload.schema_version == 1
++    assert payload.n_layers == 2
++    assert payload.n_experts == n_experts
++    # Shapes.
++    assert payload.score_sink_sum.shape == (2, n_experts)
++    assert payload.score_normal_sum.shape == (2, n_experts)
++    assert payload.fire_on_sink.shape == (2, n_experts)
++    assert payload.n_sink_tokens.shape == (2,)
++    assert payload.n_normal_tokens.shape == (2,)
++    assert payload.bos_token_id == 1
++
++    # Hand-computed sink sums for layer 0:
++    expected_sink_0 = torch.softmax(rl0[0], dim=-1) + torch.softmax(rl0[1], dim=-1)
++    assert torch.allclose(payload.score_sink_sum[0], expected_sink_0, atol=1e-6)
++    # Mean check: dividing by n_sink_tokens[0] (==2) gives the per-expert
++    # mean over sink tokens.
++    assert int(payload.n_sink_tokens[0].item()) == 2
++    mean_sink_0 = payload.score_sink_sum[0] / float(payload.n_sink_tokens[0].item())
++    assert torch.allclose(mean_sink_0, expected_sink_0 / 2.0, atol=1e-6)
++
++    # Layer 1: one sink token, one normal.
++    expected_sink_1 = torch.softmax(rl1[0], dim=-1)
++    assert torch.allclose(payload.score_sink_sum[1], expected_sink_1, atol=1e-6)
++    assert int(payload.n_sink_tokens[1].item()) == 1
++    assert int(payload.n_normal_tokens[1].item()) == 1
++    # fire_on_sink for layer 1: sink token is row 0, topk = [2] -> only
++    # expert 2 fires.
++    assert torch.equal(
++        payload.fire_on_sink[1], torch.tensor([0, 0, 1], dtype=torch.int64),
++    )
 diff --git a/tests/test_calibration_routing_stats_smoke.py b/tests/test_calibration_routing_stats_smoke.py
 new file mode 100644
 index 0000000..0593101
@@ -5771,6 +6287,457 @@ index 0000000..1b3ca1f
 +    for r, t in payload.get("token_counts", {}).items():
 +        _REAP_TOKEN_COUNTS[int(r)] = t.to(torch.int64).clone()
 +    return _n_prompts_accumulated
+diff --git a/vllm/calibration_router_logits_stats.py b/vllm/calibration_router_logits_stats.py
+new file mode 100644
+index 0000000..1644034
+--- /dev/null
++++ b/vllm/calibration_router_logits_stats.py
+@@ -0,0 +1,445 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-(layer, expert) sink-vs-normal router-score aggregate writer for
++calibration-v2 (Item 4 of the writers campaign).
++
++Computes the aggregate quantities the project's
++:class:`SinkTokenRoutingAccumulator` finalizes after Phase B -- per-
++(layer, expert) sum of router scores on sink tokens, sum on normal
++tokens, fire-count on sink tokens (i.e. how many times each expert was
++in the routed top-k for a sink token) -- plus the per-layer sink /
++normal token counts needed to invert the sums back into means.
++
++All POST-softmax (the writer softmaxes the ``router_logits`` payload
++inline before accumulating; the schema name "router_logits_stats"
++reflects the upstream HOOK name, not the on-disk dtype).
++
++Env-var gating
++--------------
++``VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS=1`` activates the module.
++Requires:
++
++* ``VLLM_CALIB_CAPTURE_ROUTER=1`` (router hook fires).
++
++The driver (``build_self_traces_calib_vllm.py``) sets both BEFORE the
++first vllm import when ``--capture-router-logits-stats`` is passed.
++
++Sink-token definition (writer-side)
++-----------------------------------
++The project's :class:`SinkTokenRoutingAccumulator` defines a sink token
++as ``input_id == bos_token_id`` ∪ ``position == 0``. Today's vLLM router
++dispatch (``vllm.model_executor.layers.fused_moe.runner.moe_runner``)
++does NOT include ``input_ids`` in the payload -- the dispatch kwargs
++are ``layer_idx`` / ``router_logits`` / ``topk_weights`` / ``topk_ids``
++only. So in practice the FALLBACK branch (position-0-only sink) is the
++de facto active path. The writer is forward-compatible: if a future
++dispatch grows the ``input_ids`` kwarg, the writer will pick it up
++automatically and use the BOS-id branch (with the leading-position
++union, matching :class:`SinkTokenRoutingAccumulator`).
++
++CUDA-graph compatibility
++------------------------
++Accumulators live on CPU. The callback is dispatched from Python
++synchronously after the router runs; ``router_logits`` / ``topk_ids``
++are cloned (via ``.detach().cpu()``) at callback entry.
++
++Resumability
++------------
++Mirrors :mod:`vllm.calibration_routing_stats` / per-expert-max /
++input-cov: periodic ``dump_router_logits_stats_checkpoint`` during the
++run, ``load_router_logits_stats_checkpoint`` on ``--resume``. The final
++``dump_router_logits_stats`` writes the payload via
++``moe_compress.utils.cached_calibration_signals.save_router_logits_stats``
++(Item 0).
++
++No-immediate-consumer-divergence note
++-------------------------------------
++Unlike Item 3 (routing_stats), Item 4 DOES have an immediate downstream
++consumer: ``Stage1RouterLogitsStatsCacheProvider`` hydrates a
++pre-finalized :class:`SinkTokenRoutingAccumulator` directly into the
++``sink_acc`` ctx slot, allowing :class:`SinkTokenDetectorPlugin.run`
++to skip the live router-logits + softmax + top-k accumulator pass
++entirely. The Stage 1 orchestrator's STEP 4.7 drops ``"sink_routing"``
++from ``needed`` on cache hit so the live HookSpec is NOT registered.
++"""
++from __future__ import annotations
++
++import logging
++import os
++from pathlib import Path
++from typing import Any
++
++import torch
++
++import vllm.calibration_hooks as _ch
++
++log = logging.getLogger(__name__)
++
++__all__ = [
++    "setup",
++    "dump_router_logits_stats",
++    "dump_router_logits_stats_checkpoint",
++    "load_router_logits_stats_checkpoint",
++    "get_n_prompts_accumulated",
++    "set_n_prompts_accumulated",
++]
++
++# Sampled at import time -- matches calibration_imatrix / per_expert_max /
++# routing_stats pattern.
++_CAPTURE_ROUTER_LOGITS_STATS: bool = (
++    os.getenv("VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS", "0") == "1"
++)
++
++# Per-layer-rank CPU accumulators.
++# All shapes are ``[n_experts]`` (per-rank), stacked at dump time into
++# ``[n_layers, n_experts]``.
++_SCORE_SINK_SUM: dict[int, torch.Tensor] = {}     # rank -> [n_experts] float32
++_SCORE_NORMAL_SUM: dict[int, torch.Tensor] = {}   # rank -> [n_experts] float32
++_FIRE_ON_SINK: dict[int, torch.Tensor] = {}       # rank -> [n_experts] int64
++# Per-rank scalar counts of sink/normal tokens seen so far. Stored as
++# ``[1]`` int64 tensors for clean checkpoint round-trip (matches the
++# tensor-only torch.save contract).
++_N_SINK_TOKENS: dict[int, torch.Tensor] = {}      # rank -> [1] int64
++_N_NORMAL_TOKENS: dict[int, torch.Tensor] = {}    # rank -> [1] int64
++
++_LAYER_ID_TO_RANK: dict[int, int] = {}
++_N_LAYERS: int = 0
++_N_EXPERTS: int = 0
++_BOS_TOKEN_ID: int | None = None
++
++# Cumulative prompt counter mirroring imatrix / reap_scores /
++# per_expert_max / routing_stats.
++_n_prompts_accumulated: int = 0
++_CHECKPOINT_SCHEMA_VERSION: int = 1
++
++
++def get_n_prompts_accumulated() -> int:
++    return _n_prompts_accumulated
++
++
++def set_n_prompts_accumulated(n: int) -> None:
++    global _n_prompts_accumulated
++    if n < 0:
++        raise ValueError(f"n must be >= 0; got {n}")
++    _n_prompts_accumulated = int(n)
++
++
++def _resolve_model(llm: Any) -> Any | None:
++    """Walk well-known attribute paths to find the live nn.Module."""
++    candidates = [
++        ("llm_engine", "model_executor", "driver_worker", "model_runner",
++         "model"),
++        ("llm_engine", "model_executor", "model_runner", "model"),
++        ("model_executor", "driver_worker", "model_runner", "model"),
++        ("model_runner", "model"),
++    ]
++    for path in candidates:
++        obj: Any = llm
++        ok = True
++        for attr in path:
++            obj = getattr(obj, attr, None)
++            if obj is None:
++                ok = False
++                break
++        if ok:
++            return obj
++    return None
++
++
++def setup(llm: Any, bos_token_id: int | None = None) -> None:
++    """Discover MoE layers, pre-allocate accumulators, register callback.
++
++    Stores ``bos_token_id`` on the module so the per-batch callback can
++    build a sink mask when the upstream dispatch supplies ``input_ids``.
++    When the dispatch does NOT supply ``input_ids`` (the current vLLM
++    contract -- see module docstring), the BOS id is unused and the
++    callback falls back to position-0-only sink classification.
++
++    Idempotent: calling twice does not double-allocate (the callback is
++    deduplicated by the chained-callback registry, and the per-rank
++    accumulator dicts are guarded by ``if rank not in ...``).
++    """
++    global _N_LAYERS, _N_EXPERTS, _BOS_TOKEN_ID
++
++    if not _CAPTURE_ROUTER_LOGITS_STATS:
++        log.info("calibration_router_logits_stats: env gate off; no-op setup.")
++        return
++
++    _BOS_TOKEN_ID = int(bos_token_id) if bos_token_id is not None else None
++
++    model = _resolve_model(llm)
++    if model is None:
++        log.warning(
++            "calibration_router_logits_stats: could not resolve model from "
++            "LLM; callback will be registered but accumulators will not have "
++            "their layer->rank mapping populated until first dispatch."
++        )
++
++    # Discover MoE layers by attribute presence -- same pattern as
++    # calibration_reap_scores / calibration_per_expert_max /
++    # calibration_routing_stats so the rank ordering matches across all
++    # writers' sidecars.
++    n_layers = 0
++    n_experts_seen: int | None = None
++    if model is not None:
++        for name, module in model.named_modules():
++            moe_layer_id = getattr(module, "moe_layer_id", None)
++            num_experts = getattr(module, "num_experts", None)
++            if not (isinstance(moe_layer_id, int)
++                    and isinstance(num_experts, int) and num_experts > 0):
++                continue
++            _LAYER_ID_TO_RANK[moe_layer_id] = n_layers
++            if n_experts_seen is None:
++                n_experts_seen = num_experts
++            elif n_experts_seen != num_experts:
++                log.warning(
++                    "calibration_router_logits_stats: mixed expert counts "
++                    "(%d vs first-seen %d at %s); using first.",
++                    num_experts, n_experts_seen, name,
++                )
++            n_layers += 1
++
++    _N_LAYERS = n_layers
++    _N_EXPERTS = int(n_experts_seen) if n_experts_seen is not None else 0
++
++    # Pre-allocate CPU accumulators with zeros (additive accumulators; no
++    # -inf sentinels needed).
++    for rank in range(_N_LAYERS):
++        if rank not in _SCORE_SINK_SUM:
++            _SCORE_SINK_SUM[rank] = torch.zeros(
++                _N_EXPERTS, dtype=torch.float32,
++            )
++            _SCORE_NORMAL_SUM[rank] = torch.zeros(
++                _N_EXPERTS, dtype=torch.float32,
++            )
++            _FIRE_ON_SINK[rank] = torch.zeros(
++                _N_EXPERTS, dtype=torch.int64,
++            )
++            _N_SINK_TOKENS[rank] = torch.zeros(1, dtype=torch.int64)
++            _N_NORMAL_TOKENS[rank] = torch.zeros(1, dtype=torch.int64)
++
++    _ch.register_callback("router", _on_router)
++
++    log.info(
++        "calibration_router_logits_stats: setup complete -- %d MoE layers, "
++        "%d experts/layer; bos_token_id=%s; callback registered for router.",
++        _N_LAYERS, _N_EXPERTS, _BOS_TOKEN_ID,
++    )
++
++
++def _on_router(layer_idx: int, router_logits: torch.Tensor,
++               topk_weights: torch.Tensor, topk_ids: torch.Tensor,
++               input_ids: torch.Tensor | None = None,
++               **_: Any) -> None:
++    """Accumulate per-(layer, expert) sink-vs-normal aggregates.
++
++    Sink mask source-of-truth:
++    1. If ``input_ids is not None and _BOS_TOKEN_ID is not None``:
++       ``sink_mask = (input_ids == _BOS_TOKEN_ID)``. Mirrors the leading
++       position-0 union in :class:`SinkTokenRoutingAccumulator` ONLY
++       when the dispatch supplies the full ``[B, T]`` ids tensor; the
++       writer keeps the conservative BOS-id branch here because the
++       current vLLM dispatch does not -- a forward-only refinement to
++       add the leading-position union would require the dispatch site
++       to grow the kwarg AND surface the per-batch positional metadata
++       to the callback.
++    2. Otherwise: position-0-only sink (``sink_mask = [True, False, ...,
++       False]``) -- the de facto active path on today's dispatch.
++
++    ``router_logits`` is ``[n_tok, n_experts]``; we softmax over the
++    expert dim, then scatter-add per-token rows into the per-(layer,
++    expert) sum accumulators. ``topk_ids[sink_mask]`` is reshaped and
++    scatter-added (one per top-k selection) into ``fire_on_sink``.
++    """
++    if not _CAPTURE_ROUTER_LOGITS_STATS:
++        return
++
++    rank = _LAYER_ID_TO_RANK.get(layer_idx)
++    if rank is None:
++        raise RuntimeError(
++            f"calibration_router_logits_stats: layer_idx={layer_idx} was "
++            f"not discovered by setup() -- the MoE layer must be visible "
++            f"via named_modules() with the moe_layer_id attribute set. "
++            f"Late-discovered layers would force the accumulators to "
++            f"grow, corrupting already-allocated buffers for other "
++            f"layers. Fix the setup() pass to find ALL MoE layers (or "
++            f"this layer's FusedMoE module is missing the moe_layer_id "
++            f"attribute)."
++        )
++
++    # Softmax over experts -- POST-softmax aggregates per the schema.
++    post_softmax = router_logits.detach().to(
++        "cpu", dtype=torch.float32,
++    ).softmax(dim=-1)                                            # [n_tok, E]
++    n_tok = post_softmax.shape[0]
++
++    # Sink mask.
++    if input_ids is not None and _BOS_TOKEN_ID is not None:
++        sink_mask = (input_ids == _BOS_TOKEN_ID).reshape(-1).cpu()
++        # Defensive: dispatch shape disagreement would silently mis-mask.
++        if sink_mask.numel() != n_tok:
++            raise RuntimeError(
++                f"calibration_router_logits_stats: input_ids has "
++                f"{sink_mask.numel()} elements but router_logits has "
++                f"{n_tok} tokens -- the upstream dispatch is supplying "
++                f"a mismatched [B, T] tensor."
++            )
++    else:
++        sink_mask = torch.zeros(n_tok, dtype=torch.bool)
++        if n_tok > 0:
++            sink_mask[0] = True
++
++    # Score sums.
++    if sink_mask.any():
++        _SCORE_SINK_SUM[rank] += post_softmax[sink_mask].sum(dim=0)
++    normal_mask = ~sink_mask
++    if normal_mask.any():
++        _SCORE_NORMAL_SUM[rank] += post_softmax[normal_mask].sum(dim=0)
++
++    # Fire-on-sink: for each sink token, every expert in the top-k
++    # contributes +1 to its expert slot in fire_on_sink[rank].
++    if sink_mask.any():
++        topk_ids_cpu = topk_ids.detach().cpu().to(torch.int64)
++        topk_ids_sink = topk_ids_cpu[sink_mask].reshape(-1)
++        if topk_ids_sink.numel() > 0:
++            ones = torch.ones_like(topk_ids_sink, dtype=torch.int64)
++            _FIRE_ON_SINK[rank].scatter_add_(0, topk_ids_sink, ones)
++
++    # Token counts.
++    n_sink = int(sink_mask.sum().item())
++    _N_SINK_TOKENS[rank] += n_sink
++    _N_NORMAL_TOKENS[rank] += n_tok - n_sink
++
++
++def dump_router_logits_stats(jsonl_path: str | Path) -> None:
++    """Write the final router-logits-stats sidecar via the Item-0 helper.
++
++    Stacks the per-rank accumulator dicts into ``[n_layers, n_experts]``
++    tensors (and ``[n_layers]`` for token counts). Zero-traffic layers
++    fall through as zeros.
++    """
++    if not _CAPTURE_ROUTER_LOGITS_STATS:
++        return
++
++    # Import here (not at module top) so the dependency is lazy.
++    from moe_compress.utils.cached_calibration_signals import (
++        RouterLogitsStatsPayload, save_router_logits_stats, SCHEMA_VERSIONS,
++    )
++
++    if _N_LAYERS == 0 or _N_EXPERTS == 0:
++        log.warning(
++            "calibration_router_logits_stats: no MoE layers seen; "
++            "skipping dump."
++        )
++        return
++
++    sink_rows = []
++    normal_rows = []
++    fire_rows = []
++    n_sink_rows = []
++    n_normal_rows = []
++    for rank in range(_N_LAYERS):
++        sink = _SCORE_SINK_SUM.get(rank)
++        normal = _SCORE_NORMAL_SUM.get(rank)
++        fire = _FIRE_ON_SINK.get(rank)
++        n_sink = _N_SINK_TOKENS.get(rank)
++        n_normal = _N_NORMAL_TOKENS.get(rank)
++        if (sink is None or normal is None or fire is None
++                or n_sink is None or n_normal is None):
++            sink_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.float32))
++            normal_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.float32))
++            fire_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.int64))
++            n_sink_rows.append(torch.zeros(1, dtype=torch.int64))
++            n_normal_rows.append(torch.zeros(1, dtype=torch.int64))
++            continue
++        sink_rows.append(sink.clone())
++        normal_rows.append(normal.clone())
++        fire_rows.append(fire.clone())
++        n_sink_rows.append(n_sink.clone())
++        n_normal_rows.append(n_normal.clone())
++
++    payload = RouterLogitsStatsPayload(
++        schema_version=SCHEMA_VERSIONS["router_logits_stats"],
++        n_experts=_N_EXPERTS,
++        n_layers=_N_LAYERS,
++        score_sink_sum=torch.stack(sink_rows),
++        score_normal_sum=torch.stack(normal_rows),
++        fire_on_sink=torch.stack(fire_rows),
++        n_sink_tokens=torch.cat(n_sink_rows),         # [n_layers]
++        n_normal_tokens=torch.cat(n_normal_rows),     # [n_layers]
++        bos_token_id=_BOS_TOKEN_ID,
++    )
++    save_router_logits_stats(payload, Path(jsonl_path))
++    log.info(
++        "calibration_router_logits_stats: wrote %d-layer x %d-expert "
++        "sidecar next to %s (bos_token_id=%s)",
++        _N_LAYERS, _N_EXPERTS, jsonl_path, _BOS_TOKEN_ID,
++    )
++
++
++def dump_router_logits_stats_checkpoint(ckpt_path: str) -> None:
++    """Atomic checkpoint of raw accumulator state for resume."""
++    if not _CAPTURE_ROUTER_LOGITS_STATS:
++        return
++    payload = {
++        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
++        "n_prompts_accumulated": _n_prompts_accumulated,
++        "n_layers": _N_LAYERS,
++        "n_experts": _N_EXPERTS,
++        "bos_token_id": _BOS_TOKEN_ID,
++        "layer_id_to_rank": dict(_LAYER_ID_TO_RANK),
++        "score_sink_sum": {r: v.clone() for r, v in _SCORE_SINK_SUM.items()},
++        "score_normal_sum": {
++            r: v.clone() for r, v in _SCORE_NORMAL_SUM.items()
++        },
++        "fire_on_sink": {r: v.clone() for r, v in _FIRE_ON_SINK.items()},
++        "n_sink_tokens": {r: v.clone() for r, v in _N_SINK_TOKENS.items()},
++        "n_normal_tokens": {
++            r: v.clone() for r, v in _N_NORMAL_TOKENS.items()
++        },
++    }
++    tmp = ckpt_path + ".tmp"
++    torch.save(payload, tmp)
++    os.replace(tmp, ckpt_path)
++
++
++def load_router_logits_stats_checkpoint(ckpt_path: str) -> int:
++    """Hydrate accumulators from a previous run's checkpoint. Returns
++    n_prompts_accumulated; 0 if file missing."""
++    global _N_LAYERS, _N_EXPERTS, _n_prompts_accumulated, _BOS_TOKEN_ID
++    if not os.path.exists(ckpt_path):
++        return 0
++    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
++    schema = int(payload.get("schema_version", 0))
++    if schema != _CHECKPOINT_SCHEMA_VERSION:
++        raise ValueError(
++            f"calibration_router_logits_stats: checkpoint at {ckpt_path} "
++            f"has schema_version={schema}, expected "
++            f"{_CHECKPOINT_SCHEMA_VERSION}. Delete the checkpoint to "
++            f"restart from scratch."
++        )
++    _n_prompts_accumulated = int(payload["n_prompts_accumulated"])
++    _N_LAYERS = int(payload["n_layers"])
++    _N_EXPERTS = int(payload["n_experts"])
++    bos = payload.get("bos_token_id", None)
++    _BOS_TOKEN_ID = int(bos) if bos is not None else None
++    _LAYER_ID_TO_RANK.clear()
++    _LAYER_ID_TO_RANK.update({
++        int(k): int(v) for k, v in payload.get("layer_id_to_rank", {}).items()
++    })
++    _SCORE_SINK_SUM.clear()
++    _SCORE_NORMAL_SUM.clear()
++    _FIRE_ON_SINK.clear()
++    _N_SINK_TOKENS.clear()
++    _N_NORMAL_TOKENS.clear()
++    for r, t in payload.get("score_sink_sum", {}).items():
++        _SCORE_SINK_SUM[int(r)] = t.to(torch.float32).clone()
++    for r, t in payload.get("score_normal_sum", {}).items():
++        _SCORE_NORMAL_SUM[int(r)] = t.to(torch.float32).clone()
++    for r, t in payload.get("fire_on_sink", {}).items():
++        _FIRE_ON_SINK[int(r)] = t.to(torch.int64).clone()
++    for r, t in payload.get("n_sink_tokens", {}).items():
++        _N_SINK_TOKENS[int(r)] = t.to(torch.int64).clone()
++    for r, t in payload.get("n_normal_tokens", {}).items():
++        _N_NORMAL_TOKENS[int(r)] = t.to(torch.int64).clone()
++    return _n_prompts_accumulated
 diff --git a/vllm/calibration_routing_stats.py b/vllm/calibration_routing_stats.py
 new file mode 100644
 index 0000000..516237c
@@ -6104,10 +7071,10 @@ index 0000000..516237c
 +        _WEIGHT_SUM_ACCUM[int(r)] = t.to(torch.float32).clone()
 +    return _n_prompts_accumulated
 diff --git a/vllm/envs.py b/vllm/envs.py
-index ded474d..db15bb1 100755
+index ded474d..1eea2c8 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -268,6 +268,18 @@ if TYPE_CHECKING:
+@@ -268,6 +268,19 @@ if TYPE_CHECKING:
      VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
      VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
      VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -6123,10 +7090,11 @@ index ded474d..db15bb1 100755
 +    VLLM_CALIB_CAPTURE_INPUT_COV: bool = False
 +    VLLM_CALIB_CAPTURE_PER_EXPERT_MAX: bool = False
 +    VLLM_CALIB_CAPTURE_ROUTING_STATS: bool = False
++    VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS: bool = False
  
  
  def get_default_cache_root():
-@@ -1788,6 +1800,112 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1788,6 +1801,127 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
          int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
      ),
@@ -6235,6 +7203,21 @@ index ded474d..db15bb1 100755
 +    # Default off.
 +    "VLLM_CALIB_CAPTURE_ROUTING_STATS": lambda: bool(
 +        int(os.getenv("VLLM_CALIB_CAPTURE_ROUTING_STATS", "0"))
++    ),
++    # Calibration capture gate for per-(layer, expert) sink-vs-normal
++    # router-score aggregates (Item 4 of the calibration-v2 writers
++    # campaign, ``vllm.calibration_router_logits_stats``). REQUIRES
++    # VLLM_CALIB_CAPTURE_ROUTER=1 so the ``router`` hook dispatches from
++    # the MoE forward path. NO FlashInfer / EXPERT_UNWEIGHTED dependency:
++    # the router hook fires on every MoE backend. The calibration-v2
++    # driver (``build_self_traces_calib_vllm.py
++    # --capture-router-logits-stats``) sets both. Output is the dense
++    # sidecar at ``<jsonl>/sidecars/router_logits_stats.pt`` (schema v1)
++    # with per-(layer, expert) score_sink_sum / score_normal_sum
++    # (float32) + fire_on_sink (int64) + per-layer n_sink_tokens /
++    # n_normal_tokens (int64) + bos_token_id. Default off.
++    "VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS": lambda: bool(
++        int(os.getenv("VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS", "0"))
 +    ),
  }
  

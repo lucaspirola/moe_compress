@@ -8,11 +8,11 @@ the patch (the HF Jobs build script, the README uploaded to
 
 | Field | Value |
 |---|---|
-| Immutable tag | `calib-v2-routing-stats-writer` |
+| Immutable tag | `calib-v2-router-logits-stats-writer` |
 | Branch (active) | `feat/calibration-v2` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch line count | **6841** |
-| Patch MD5 | **`1c5602d20f5a2b268e6edb0f969e4cfe`** |
+| Patch line count | **7824** |
+| Patch MD5 | **`2f05332467dafd54e7083494e4aa7823`** |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -22,9 +22,9 @@ the patch (the HF Jobs build script, the README uploaded to
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: 1c5602d20f5a2b268e6edb0f969e4cfe
+# expect: 2f05332467dafd54e7083494e4aa7823
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 6841
+# expect: 7824
 
 # Re-apply against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -34,7 +34,75 @@ git apply --check /path/to/vllm_calibration_hooks.patch && echo OK
 
 ## Change log
 
-### `calib-v2-routing-stats-writer` (current)
+### `calib-v2-router-logits-stats-writer` (current)
+Adds the per-(layer, expert) sink-vs-normal router-score aggregate
+writer (Item 4 of the calibration-v2 writers campaign).
+- `vllm/calibration_router_logits_stats.py`: new module subscribing the
+  existing ``router`` hook (chained alongside any other ``router``
+  subscriber via the multi-callback registry) to softmax each per-token
+  router-logits row inline, scatter-add per-(layer, expert) score sums
+  partitioned by a sink/normal mask, and scatter-add the top-k ids of
+  sink tokens into a per-expert ``fire_on_sink`` counter. Per-layer
+  ``n_sink_tokens`` / ``n_normal_tokens`` scalars are tracked so the
+  Stage 1 consumer can invert sums -> means. Sink-mask resolution:
+  ``input_id == bos_token_id`` when the dispatch supplies both, else
+  position-0-only fallback (today's vLLM router dispatch does NOT
+  surface ``input_ids`` to the callback, so the fallback is the de
+  facto active path; the writer is forward-compatible if the dispatch
+  grows the kwarg). ``setup(llm, bos_token_id=None)`` extends the
+  per-writer setup() signature to capture the BOS id. NO
+  ``EXPERT_UNWEIGHTED`` / FlashInfer dependency.
+  ``dump_router_logits_stats_checkpoint`` /
+  ``load_router_logits_stats_checkpoint`` mirror the imatrix / REAP /
+  input-cov / per-expert-max / routing-stats resumability cadence
+  (atomic tmp+rename, schema-versioned, CPU-resident accumulators ->
+  CUDA-graph-safe). Final dump writes the ``RouterLogitsStatsPayload``
+  sidecar (schema v1, per-(layer, expert) ``score_sink_sum`` /
+  ``score_normal_sum`` float32 + ``fire_on_sink`` int64 + per-layer
+  ``n_sink_tokens`` / ``n_normal_tokens`` int64 + ``bos_token_id``) via
+  ``moe_compress.utils.cached_calibration_signals.save_router_logits_stats``.
+- `vllm/envs.py`: add ``VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS`` to the
+  ``TYPE_CHECKING`` block + the ``environment_variables`` dispatch
+  dict for discoverability through ``vllm.envs``.
+- `tests/test_calibration_router_logits_stats_smoke.py`: +6 tests
+  covering the env-off short-circuit, the BOS-id sink-mask branch
+  (input_ids supplied), the position-0 fallback branch (input_ids
+  omitted -- the de facto active path), additive accumulation across
+  multiple callback invocations, checkpoint round-trip preserving
+  bos_token_id (incl. the None branch), and the final-dump payload
+  shape + per-(layer, expert) means derivation.
+
+Driver-side companion (`build_self_traces_calib_vllm.py`): new flags
+``--capture-router-logits-stats`` +
+``--router-logits-stats-checkpoint-every-chunks``, parallel env-gating
+block (``VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS=1`` +
+``VLLM_CALIB_CAPTURE_ROUTER=1`` only -- NO FlashInfer or
+EXPERT_UNWEIGHTED requirement), post-``_load_teacher_vllm`` setup
+that passes ``bos_token_id=tokenizer.bos_token_id``, resume hydration,
+periodic in-loop checkpoint, and final dump that removes the now-stale
+ckpt. ``router_logits_ckpt_path`` is hoisted out of the per-feature
+``if`` block (same N1 pattern as prior items).
+
+Stage 1 reader-side companion: ``Stage1RouterLogitsStatsCacheProvider``
+(``max_quality/src/moe_compress/stage1/plugins/router_logits_stats_cache.py``)
+consulted by the Stage 1 orchestrator's STEP 4.7 immediately AFTER
+STEP 4.6 (Item 3's routing_stats attempt) with the same try/except
+guard pattern. On hit the provider hydrates a pre-finalized
+``SinkTokenRoutingAccumulator`` directly into ``ctx.sink_acc``
+(overwriting the live setup-built accumulator) AND the orchestrator
+drops ``"sink_routing"`` from ``needed`` so the live router-logits +
+softmax + top-k HookSpec is NOT registered. The R3 guard
+(``sink_token_enabled=False``) is honored: the provider returns ``None``
+without consulting the sidecar so the user's explicit disable is
+preserved. Topology consistency check raises ``ValueError`` if the
+sidecar's ``n_layers`` disagrees with the live model. STEP 7's
+``finalize()`` guard (``if "sink_routing" in built:``) was already in
+place from prior work and continues to short-circuit cleanly on cache
+hit.
+
+Schema bump: ``SCHEMA_VERSIONS["router_logits_stats"] = 1`` (new entry).
+
+### `calib-v2-routing-stats-writer` (previous)
 Adds the per-(layer, expert) routing-frequency + mean-routing-weight
 writer (Item 3 of the calibration-v2 writers campaign).
 - `vllm/calibration_routing_stats.py`: new module subscribing the
@@ -319,6 +387,7 @@ infrastructure. Bump these when changing the dataclass layout in
 | `reap_scores` | 1 | initial — V1+V2 writers campaign, REAP Eq. 9 (arXiv:2510.13999); `[n_layers, n_experts] float32` + matching `int64` counts |
 | `per_expert_max` | 1 | initial — Item 2 writers campaign, Stage 1 cheap-pruning candidate-ranking signal; `[n_layers, n_experts] float32` (max of `\|f_j(x)\|_inf` over tokens routed to expert j in layer rank l, zero-filled for zero-traffic cells) + matching `int64` token counts |
 | `routing_stats` | 1 | initial — Item 3 writers campaign, per-(layer, expert) routing frequency + mean routing weight; `[n_layers, n_experts]` int64 freq + float32 mean_weight (zero where freq==0, no NaN). NO immediate downstream consumer; payload deposited on `ctx.routing_stats_payload` for future plugins (routing-aware ablation gating, mean-weight-weighted REAP variants). |
+| `router_logits_stats` | 1 | initial — Item 4 writers campaign, per-(layer, expert) sink-vs-normal router-score aggregates; `[n_layers, n_experts]` float32 `score_sink_sum` + float32 `score_normal_sum` + int64 `fire_on_sink` + per-layer int64 `n_sink_tokens` / `n_normal_tokens` + `bos_token_id`. Consumed by Stage 1's `Stage1RouterLogitsStatsCacheProvider` -- on hit hydrates a pre-finalized `SinkTokenRoutingAccumulator` into `ctx.sink_acc` and the orchestrator drops `"sink_routing"` from the live calibration HookSpec set (sink-token detection runs from the cached aggregates). |
 | `covariance` | 2 | Item 1 writers campaign — dict-valued payload, keys `(layer_idx, expert_idx, matrix_name)` -> fp16 `Tensor[d_in, d_in]`, byte-shape-compatible with the Stage 2 writer's `_stage2_input_covariance.pt`. v1 was never persisted by a production writer; forward-only bump. |
 | `router_kd_logits` | 1 | initial — matches the existing .npz writer format in `build_self_traces_calib_vllm.py` |
 | `block_hidden` | 1 | initial |

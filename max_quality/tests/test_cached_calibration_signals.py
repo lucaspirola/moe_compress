@@ -43,6 +43,7 @@ from moe_compress.utils.cached_calibration_signals import (
     CovariancePayload,
     PhaseBPayload,
     RouterKDLogitsPayload,
+    RouterLogitsStatsPayload,
     RoutingStatsPayload,
     Stage1PerExpertMaxPayload,
     Stage2ProfilePayload,
@@ -53,6 +54,7 @@ from moe_compress.utils.cached_calibration_signals import (
     load_per_expert_max,
     load_phase_b,
     load_reap_scores,
+    load_router_logits_stats,
     load_routing_stats,
     load_router_kd_logits,
     load_stage2_profile,
@@ -63,6 +65,7 @@ from moe_compress.utils.cached_calibration_signals import (
     save_per_expert_max,
     save_phase_b,
     save_reap_scores,
+    save_router_logits_stats,
     save_routing_stats,
     save_router_kd_logits,
     save_stage2_profile,
@@ -362,6 +365,91 @@ def test_routing_stats_roundtrip(tmp_path):
 
     expected_path.unlink()
     assert load_routing_stats(jsonl) is None
+
+
+def _make_router_logits_stats(
+    n_layers: int = 2, n_experts: int = 3,
+) -> RouterLogitsStatsPayload:
+    return RouterLogitsStatsPayload(
+        schema_version=SCHEMA_VERSIONS["router_logits_stats"],
+        n_experts=n_experts,
+        n_layers=n_layers,
+        score_sink_sum=torch.arange(
+            n_layers * n_experts, dtype=torch.float32
+        ).reshape(n_layers, n_experts),
+        score_normal_sum=torch.linspace(
+            0.0, 1.0, n_layers * n_experts, dtype=torch.float32,
+        ).reshape(n_layers, n_experts),
+        fire_on_sink=torch.arange(
+            1, n_layers * n_experts + 1, dtype=torch.int64
+        ).reshape(n_layers, n_experts),
+        n_sink_tokens=torch.tensor(
+            [4 * (i + 1) for i in range(n_layers)], dtype=torch.int64,
+        ),
+        n_normal_tokens=torch.tensor(
+            [16 * (i + 1) for i in range(n_layers)], dtype=torch.int64,
+        ),
+        bos_token_id=151643,
+    )
+
+
+def test_router_logits_stats_roundtrip(tmp_path):
+    """Per-(layer, expert) sink-vs-normal router-score aggregates round-trip
+    through save/load with byte-identical tensors and the BOS id preserved.
+
+    Also exercises the bos_token_id=None branch (writer didn't capture
+    the BOS) -- the round-trip must preserve the None as-is, not coerce
+    to 0 or any other sentinel."""
+    jsonl = _jsonl(tmp_path)
+    original = _make_router_logits_stats()
+    save_router_logits_stats(original, jsonl)
+
+    expected_path = sidecar_path(jsonl, "router_logits_stats")
+    assert expected_path.exists()
+    assert not Path(str(expected_path) + ".tmp").exists()
+
+    loaded = load_router_logits_stats(jsonl)
+    assert loaded is not None
+    assert loaded.schema_version == SCHEMA_VERSIONS["router_logits_stats"]
+    assert loaded.n_experts == original.n_experts
+    assert loaded.n_layers == original.n_layers
+    assert torch.equal(loaded.score_sink_sum, original.score_sink_sum.cpu())
+    assert torch.equal(loaded.score_normal_sum, original.score_normal_sum.cpu())
+    assert torch.equal(loaded.fire_on_sink, original.fire_on_sink.cpu())
+    assert torch.equal(loaded.n_sink_tokens, original.n_sink_tokens.cpu())
+    assert torch.equal(loaded.n_normal_tokens, original.n_normal_tokens.cpu())
+    assert loaded.bos_token_id == 151643
+    # Dtypes survive the cast in save_router_logits_stats.
+    assert loaded.score_sink_sum.dtype == torch.float32
+    assert loaded.score_normal_sum.dtype == torch.float32
+    assert loaded.fire_on_sink.dtype == torch.int64
+    assert loaded.n_sink_tokens.dtype == torch.int64
+    assert loaded.n_normal_tokens.dtype == torch.int64
+    # All loaded tensors are on CPU (device-agnostic sidecar contract).
+    assert loaded.score_sink_sum.device.type == "cpu"
+    assert loaded.fire_on_sink.device.type == "cpu"
+
+    # bos_token_id=None branch -- writer didn't capture it. The None must
+    # survive the round-trip (not get coerced to 0 by int(None)).
+    none_bos = RouterLogitsStatsPayload(
+        schema_version=SCHEMA_VERSIONS["router_logits_stats"],
+        n_experts=2,
+        n_layers=1,
+        score_sink_sum=torch.zeros((1, 2), dtype=torch.float32),
+        score_normal_sum=torch.zeros((1, 2), dtype=torch.float32),
+        fire_on_sink=torch.zeros((1, 2), dtype=torch.int64),
+        n_sink_tokens=torch.zeros((1,), dtype=torch.int64),
+        n_normal_tokens=torch.zeros((1,), dtype=torch.int64),
+        bos_token_id=None,
+    )
+    jsonl2 = tmp_path / "trace_none_bos.jsonl"
+    save_router_logits_stats(none_bos, jsonl2)
+    loaded_none = load_router_logits_stats(jsonl2)
+    assert loaded_none is not None
+    assert loaded_none.bos_token_id is None
+
+    expected_path.unlink()
+    assert load_router_logits_stats(jsonl) is None
 
 
 def test_covariance_roundtrip(tmp_path):

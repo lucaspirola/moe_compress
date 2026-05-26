@@ -48,6 +48,9 @@ from ..utils.trackio_log import trackio_log as _trackio_log
 from .artifacts import REQUIRED_BLACKLIST_TOP_LEVEL_KEYS
 from .plugins import STAGE1_PLUGIN_MANIFEST
 from .plugins.per_expert_max_cache import Stage1PerExpertMaxCacheProvider
+from .plugins.router_logits_stats_cache import (
+    Stage1RouterLogitsStatsCacheProvider,
+)
 from .plugins.routing_stats_cache import Stage1RoutingStatsCacheProvider
 
 log = logging.getLogger(__name__)
@@ -364,6 +367,64 @@ def run(
         log.warning("Stage 1: V2 routing_stats cache lookup failed (%s) "
                     "-- ctx.routing_stats_payload not populated", _exc)
 
+    # ---- STEP 4.7: V2 cache-first attempt for router_logits_stats ---------
+    # Try the calibration-v2 sidecar at
+    # ``<jsonl_dir>/sidecars/router_logits_stats.pt`` -- per-(layer,
+    # expert) sink-vs-normal router-score aggregates produced by the
+    # ``--capture-router-logits-stats`` flag (Item 4 of the writers
+    # campaign). On hit the provider OVERWRITES ``ctx.sink_acc`` with
+    # a pre-finalized SinkTokenRoutingAccumulator hydrated from the
+    # cached aggregates -- the same slot SinkTokenDetectorPlugin.setup()
+    # already populated earlier in STEP 4 with a fresh-empty live
+    # accumulator. We then drop ``"sink_routing"`` from ``needed`` so
+    # the live router-logits HookSpec is NOT registered + the live
+    # accumulator is NOT built (the orchestrator already has the
+    # finalized form on ctx).
+    #
+    # R3 (sink_token_enabled=False) is honored by the provider: if the
+    # user has explicitly disabled the sink-token detector, the
+    # provider returns None and STEP 4's ``sink_acc=None`` stays
+    # untouched; we ALSO leave ``needed`` unchanged because the live
+    # path's HookSpec is gated on sink_acc being non-None at the per-
+    # batch closure level anyway.
+    #
+    # Divergence from the canonical provider-pair pattern: Stage 1 has
+    # no "live provider plugin" for sink-routing -- the live path is
+    # the SinkTokenDetectorPlugin.setup() + the orchestrator-built
+    # HookSpec. So we cannot use PluginRegistry.dispatch_first to fall
+    # through cache -> live. Instead, we instantiate the cache provider
+    # directly here; on hit it pre-populates ctx.sink_acc + we drop
+    # "sink_routing" from ``needed`` to skip the live HookSpec
+    # registration; on miss we leave ``needed`` unchanged so the live
+    # router-logits + softmax + top-k pass runs at Phase B.
+    _rlsx_cache_hit = False
+    try:
+        from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
+        cal_cfg = config["calibration"]
+        _calib_source = cal_cfg.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
+        _calib_jsonl_path = Path(_calib_source)
+        if not _calib_jsonl_path.is_absolute():
+            _calib_jsonl_path = Path.cwd() / _calib_jsonl_path
+        _rlsx_provider = Stage1RouterLogitsStatsCacheProvider()
+        _rlsx_payload = _rlsx_provider.on_load(ctx, _calib_jsonl_path)
+        if _rlsx_payload is not None:
+            _rlsx_cache_hit = True
+            log.info(
+                "Stage 1: V2 router_logits_stats cache HIT (%d layers x "
+                "%d experts) -- skipping live sink_routing registration; "
+                "ctx.sink_acc replaced with pre-finalized accumulator",
+                _rlsx_payload.n_layers, _rlsx_payload.n_experts,
+            )
+    except (FileNotFoundError, OSError) as _exc:
+        # Routine filesystem misses should not block the live path.
+        # ValueError from _check_schema is NOT caught here -- a schema
+        # mismatch is an actionable user error ("Delete the sidecar to
+        # regenerate") and silently falling back would mask it.
+        log.warning(
+            "Stage 1: V2 router_logits_stats cache lookup failed (%s) "
+            "-- falling back to live sink-routing accumulator", _exc,
+        )
+
     # ---- STEP 5: build the ordered accumulator registrations --------------
     # ``registry.provides(config)`` returns the byte-identity-critical
     # accumulator order; iterating it preserves that order in the
@@ -375,6 +436,11 @@ def run(
     # ...) still register and run their live calibration.
     if _pem_cache_hit:
         needed = tuple(n for n in needed if n != "downproj_max")
+    # Same surgery for STEP 4.7: the router_logits_stats cache hydrates a
+    # pre-finalized SinkTokenRoutingAccumulator into ctx.sink_acc, so
+    # the live per-batch sink-routing HookSpec is no longer needed.
+    if _rlsx_cache_hit:
+        needed = tuple(n for n in needed if n != "sink_routing")
     registrations: list[tuple[str, object, HookSpec]] = []
     built: dict[str, object] = {}
     for acc_name in needed:
