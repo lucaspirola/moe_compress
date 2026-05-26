@@ -10,7 +10,7 @@
 - [x] **P2**: Wire saliency-weighted merge branch in `stage2/merging.py` (replace `raise ValueError`), thread `scores` from `layer_merge.py`. Commits `4239304` + `3aae40c` (review-fix iter 1). Loop closed at iter 2. 5 new tests, byte-identical equivalence to freq mode with matching weights confirmed.
 
 ## Phase 2 — Infrastructure + first writer (proves the pattern)
-- [ ] **Item 0**: `utils/cached_calibration_signals.py` provider-pair module + schema/loader.
+- [x] **Item 0**: `utils/cached_calibration_signals.py` provider-pair module + schema/loader. Commit `b7e2b72`. Loop closed at iter 1 (no fixer needed). 432 LoC module + 544 LoC tests + MANIFEST "Schema bumps" section. 6 dataclass payloads, 12 load/save fns, 2 ABCs, central `SCHEMA_VERSIONS` dict, atomic-write via tmp+os.replace, multi-arch portable, npz double-extension trap defeated via file-handle pattern.
 - [ ] **V1+V2**: REAP-exact via vLLM hooks — writer in patch (router + expert_out_unweighted scatter-reduce); stage-2 cache-reader plugin (`dispatch_first` slot pattern).
 
 ## Phase 3 — REAP-exact preset
