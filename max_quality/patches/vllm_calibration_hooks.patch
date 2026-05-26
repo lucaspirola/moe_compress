@@ -3382,10 +3382,10 @@ index 0000000..8505da3
 +    return loaded_n
 diff --git a/vllm/calibration_reap_scores.py b/vllm/calibration_reap_scores.py
 new file mode 100644
-index 0000000..3fe95a4
+index 0000000..1b3ca1f
 --- /dev/null
 +++ b/vllm/calibration_reap_scores.py
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,331 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""REAP per-(layer, expert) saliency-score capture for calibration-v2.
@@ -3604,14 +3604,15 @@ index 0000000..3fe95a4
 +
 +    rank = _LAYER_ID_TO_RANK.get(layer_idx)
 +    if rank is None:
-+        # Layer wasn't discovered at setup; allocate lazily.
-+        rank = len(_LAYER_ID_TO_RANK)
-+        _LAYER_ID_TO_RANK[layer_idx] = rank
-+        global _N_LAYERS, _N_EXPERTS
-+        _N_LAYERS = max(_N_LAYERS, rank + 1)
-+        _N_EXPERTS = max(_N_EXPERTS, int(topk_ids.max().item()) + 1)
-+        _REAP_SCORE_ACCUM[rank] = torch.zeros(_N_EXPERTS, dtype=torch.float32)
-+        _REAP_TOKEN_COUNTS[rank] = torch.zeros(_N_EXPERTS, dtype=torch.int64)
++        raise RuntimeError(
++            f"calibration_reap_scores: layer_idx={layer_idx} was not "
++            f"discovered by setup() — the MoE layer must be visible via "
++            f"named_modules() with the moe_layer_id attribute set. "
++            f"Late-discovered layers would force the accumulators to grow, "
++            f"corrupting already-allocated buffers for other layers. Fix "
++            f"the setup() pass to find ALL MoE layers (or this layer's "
++            f"FusedMoE module is missing the moe_layer_id attribute)."
++        )
 +
 +    # Move to CPU + float32 for the math.
 +    uw = unweighted.detach().cpu().to(torch.float32)   # [n_tok, top_k, hidden]
@@ -3626,7 +3627,7 @@ index 0000000..3fe95a4
 +    count_accum.scatter_add_(0, ids, torch.ones_like(ids, dtype=torch.int64))
 +
 +
-+def dump_reap_scores(jsonl_path: Path) -> None:
++def dump_reap_scores(jsonl_path: str | Path) -> None:
 +    """Normalize and write the final S_j sidecar via the Item-0 helper."""
 +    if not _CAPTURE_REAP_SCORES:
 +        return

@@ -1143,18 +1143,25 @@ def run(
     plugins = registry.enabled(config)
     walk_phases(("on_run_setup",), plugins, run_ctx)
 
-    # Run-scope sidecar load (V1+V2 provider-pair). Stage2ReapScoresCacheProvider.on_load
-    # tries to read the REAP-scores sidecar; on hit, the per-layer
-    # ``on_score`` will use cached values and ReapScoringPlugin.on_load is a
-    # no-op so dispatch_first falls through to it on miss.
-    _calib_jsonl_path = None
-    _calib_source = cal.get("jsonl_path") or cal.get("source_path")
-    if _calib_source:
-        _calib_jsonl_path = Path(_calib_source)
-    if _calib_jsonl_path is not None:
-        PluginRegistry.dispatch_first(
-            plugins, "on_load", run_ctx, _calib_jsonl_path,
-        )
+    # Run-scope sidecar load. Stage2ReapScoresCacheProvider.on_load tries
+    # to read the REAP-scores sidecar at <jsonl_dir>/sidecars/reap_scores.pt.
+    # On hit: per-layer Stage2ReapScoresCacheProvider.on_score populates
+    # ctx.scores + ctx.freq so ReapScoringPlugin.on_score's ctx.has("scores")
+    # guard short-circuits the live finalize step. On miss: the live path
+    # runs normally.
+    #
+    # Use the calibration loader's default JSONL path when `jsonl_path` is
+    # absent from the YAML, mirroring the loader's resolution so a user who
+    # wrote the sidecar to the default location is not silently bypassed.
+    from pathlib import Path as _Path
+    from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
+    _calib_source = cal.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
+    _calib_jsonl_path = _Path(_calib_source)
+    if not _calib_jsonl_path.is_absolute():
+        _calib_jsonl_path = _Path.cwd() / _calib_jsonl_path
+    PluginRegistry.dispatch_first(
+        plugins, "on_load", run_ctx, _calib_jsonl_path,
+    )
 
     for k, layer_ref in enumerate(moe_layers):
         if layer_ref.layer_idx in completed_layers:

@@ -2,9 +2,14 @@
 
 Reads pre-computed S_j from a sidecar produced by the
 ``--capture-reap-scores`` calibration flag. On cache hit, populates
-``ctx.scores`` and ``ctx.freq`` so ``ReapScoringPlugin.on_score`` skips
-its live accumulation (see the ctx.has("scores") guard in reap_scoring.py).
-On cache miss, returns None and the live REAP-scoring path runs normally.
+``ctx.scores`` and ``ctx.freq`` so ``ReapScoringPlugin.on_score`` short-
+circuits its live finalize/derive step (via its ``ctx.has("scores")``
+guard). The per-layer profile FORWARD pass still runs as part of
+``LayerMergePlugin.on_profile`` -- it is needed for covariance
+collection consumed by Stage 3/4. The cache hit only avoids the
+finalize + score-derivation at the end of the profile pass; the
+in-forward per-token REAP accumulation is a free side effect that
+gets discarded.
 
 Architecture: provider-pair pattern per
 ``max_quality/docs/calibration_v2_data_capture_plan.md`` Section 0.
@@ -30,19 +35,21 @@ class Stage2ReapScoresCacheProvider:
 
     name: str = "reap_scores_cache"
     paper: str = (
-        "Cache provider for REAP saliency scores "
-        "(S_j = (1/|X_j|)·Σ g_j·‖f_j‖₂, arXiv:2510.13999 Eq. 9). "
-        "Reads sidecars/reap_scores.pt produced by --capture-reap-scores. "
-        "On hit: populates ctx.scores + ctx.freq, suppressing the live "
-        "ReapScoringPlugin.on_score forward via its ctx.has() guard. "
-        "On miss: returns None; the live path runs normally."
+        "Cache provider for REAP S_j (arXiv:2510.13999 Eq. 9). "
+        "Reads sidecars/reap_scores.pt and populates ctx.scores + ctx.freq "
+        "on hit so ReapScoringPlugin.on_score's ctx.has guard short-"
+        "circuits the live finalize step. The per-layer profile forward "
+        "still runs (LayerMergePlugin.on_profile owns it) for covariance."
     )
     config_key: str = "stage2_reap_ream"
-    reads: tuple[str, ...] = ("layer_ref", "_layer_rank")
+    reads: tuple[str, ...] = ("_layer_rank", "reap_scores_payload")
     writes: tuple[str, ...] = ("reap_scores_payload", "scores", "freq")
     provides: tuple[str, ...] = ()
 
     def is_enabled(self, config: dict) -> bool:
+        # Always enabled: cache provider is a no-op on miss (returns None
+        # gracefully, dispatch_first falls through to ReapScoringPlugin).
+        # No need to gate on a YAML knob.
         return True
 
     def contribute_artifact(self, ctx: PipelineContext) -> dict:

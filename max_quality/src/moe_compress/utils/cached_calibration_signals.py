@@ -50,6 +50,25 @@ Sharded signals (``router_kd_logits`` per attempt_idx; ``block_hidden``
 per layer_idx) are naturally collision-free if each shard is written by
 exactly one process.
 
+Sidecar isolation across calibration runs
+-----------------------------------------
+Sidecars are collocated with the JSONL by DIRECTORY, not by JSONL stem.
+Two distinct calibration runs that write to JSONLs in the same parent
+directory will OVERWRITE each other's sidecars. To preserve sidecars
+across runs that produce distinct JSONLs (e.g., different cache_keys),
+either:
+
+* Use distinct output directories per run, OR
+* Rely on the JSONL cache_key suffix being identical across runs that
+  should share sidecars (the typical case — same teacher + same prompt
+  source + same num_prompts produces the same cache_key, so the
+  sidecar from a prior run is the cache hit for the current run).
+
+This is the consequence of the directory-collocation choice (see
+``sidecar_path`` docstring); it is intentional and trades isolation
+for resilience-to-JSONL-rename. Operators running ablation sweeps
+across different cache_keys MUST use distinct output dirs.
+
 Out of scope here
 -----------------
 This module is library-only. The concrete provider subclasses for the 6

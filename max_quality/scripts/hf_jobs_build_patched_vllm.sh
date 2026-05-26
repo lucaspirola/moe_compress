@@ -54,7 +54,7 @@ curl -sL \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected MD5: 654c2ea84aa47b8b63d1c27f12849323 (4408 lines)
+# Expected MD5: e3fba22dc2bb0f5db3822c75a8182ad5 (4409 lines)
 # Adds the REAP-scores writer: per-(layer, expert) saliency-score capture
 # via the router + expert_out_unweighted hooks, with periodic
 # .reap_scores.ckpt resumability mirroring the imatrix path. Final dump
@@ -189,7 +189,7 @@ tags:
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
 - Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-reap-scores-writer`)
-- Patch artifact (4408 lines, MD5 `654c2ea84aa47b8b63d1c27f12849323`): also uploaded to this repo as `vllm_calibration_hooks.patch`
+- Patch artifact (4409 lines, MD5 `e3fba22dc2bb0f5db3822c75a8182ad5`): also uploaded to this repo as `vllm_calibration_hooks.patch`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130
