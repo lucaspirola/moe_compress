@@ -91,6 +91,26 @@ def main(argv=None) -> int:
 
     _validate_config(config)
 
+    _pipe_cfg = config.get("pipeline", {}) or {}
+    _skip_intermediate = bool(_pipe_cfg.get("skip_intermediate_stages", False))
+    _pipe_evaluator = str(_pipe_cfg.get("evaluator", "stage6")).lower()
+    if _pipe_evaluator not in ("stage6", "stage6alt"):
+        raise ValueError(
+            f"pipeline.evaluator must be 'stage6' or 'stage6alt', "
+            f"got {_pipe_evaluator!r}"
+        )
+    if _skip_intermediate:
+        # pipeline.evaluator overrides stage6_validate.mode in REAP-exact
+        # mode to prevent accidentally running the 2-hour full suite on a
+        # screening run. stage6alt is the default; "stage6" is the opt-in.
+        _effective_mode = "full" if _pipe_evaluator == "stage6" else "thermometer"
+        config.setdefault("stage6_validate", {})["mode"] = _effective_mode
+        log.info(
+            "pipeline.skip_intermediate_stages=true: stages 2.5/3/4/5 will "
+            "be skipped; stage 6 evaluator = %s (mode=%s)",
+            _pipe_evaluator, _effective_mode,
+        )
+
     log.info("Artifacts directory: %s", artifacts_dir)
     log.info("Pipeline target: %.1f%% total parameter reduction", config["target"]["total_reduction_ratio"] * 100)
 
@@ -220,6 +240,11 @@ def main(argv=None) -> int:
         # Stage 2 on a cheaper GPU produces stage2_pruned/, Stage 2.5 then
         # runs on a higher-memory GPU via --resume-from-stage 2 in a separate
         # invocation).
+        if _skip_intermediate:
+            log.info(
+                "Stage 2.5 skipped (pipeline.skip_intermediate_stages=true)."
+            )
+            skip_stage25 = True
         if args.skip_stage2p5:
             log.info("--skip-stage2p5: leaving stage2_pruned/ as terminal output "
                      "(Stage 2.5 + downstream stages must run on another machine)")
@@ -232,42 +257,42 @@ def main(argv=None) -> int:
                                  no_resume=args.no_resume, stage_key="stage2p5")
             repo2p5 = upload_stage_to_hub("2p5", artifacts_dir, repo_base=hub_base) if hub_base else None
             _finish_stage("2p5", t2p5, repo2p5)
-    if stop < 3:
+    if stop < 3 and not _skip_intermediate:
         log.info("Stopping after stage %d as requested.", stop)
         wait_for_pending_uploads()
         return 0
 
-    if start <= 3 <= stop:
+    if start <= 3 <= stop and not _skip_intermediate:
         log.info("=== Stage 3 — SVD ===")
         t3 = time.monotonic()
         stage3_svd.run(model, tokenizer, config, artifacts_dir, decomposition, device=device,
                        no_resume=args.no_resume)
         repo3 = upload_stage_to_hub(3, artifacts_dir, repo_base=hub_base) if hub_base else None
         _finish_stage(3, t3, repo3)
-    if stop < 4:
+    if stop < 4 and not _skip_intermediate:
         log.info("Stopping after stage %d as requested.", stop)
         wait_for_pending_uploads()
         return 0
 
-    if start <= 4 <= stop:
+    if start <= 4 <= stop and not _skip_intermediate:
         log.info("=== Stage 4 — EoRA ===")
         t4 = time.monotonic()
         stage4_eora.run(model, tokenizer, config, artifacts_dir, no_resume=args.no_resume)
         repo4 = upload_stage_to_hub(4, artifacts_dir, repo_base=hub_base) if hub_base else None
         _finish_stage(4, t4, repo4)
-    if stop < 5:
+    if stop < 5 and not _skip_intermediate:
         log.info("Stopping after stage %d as requested.", stop)
         wait_for_pending_uploads()
         return 0
 
-    if start <= 5 <= stop:
+    if start <= 5 <= stop and not _skip_intermediate:
         log.info("=== Stage 5 — Router KD ===")
         t5 = time.monotonic()
         stage5_router_kd.run(model, tokenizer, config, artifacts_dir, device=device,
                              no_resume=args.no_resume)
         repo5 = upload_stage_to_hub(5, artifacts_dir, repo_base=hub_base) if hub_base else None
         _finish_stage(5, t5, repo5)
-    if stop < 6:
+    if stop < 6 and not _skip_intermediate:
         log.info("Stopping after stage %d as requested.", stop)
         wait_for_pending_uploads()
         return 0
@@ -482,13 +507,21 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path,
     # stage5_final/ when it exists (full pipeline path), else fall back to
     # stage2p5_final/ (ablation harness path), else hard-fail.
     if stage == 6:
-        for candidate in ("stage5_final", "stage2p5_final"):
+        for candidate in ("stage5_final", "stage2p5_final", "stage2_pruned"):
             prev_path = artifacts_dir / candidate
             if prev_path.exists():
                 if candidate == "stage2p5_final":
                     log.info(
                         "Loading stage 6 input from %s — stage5_final/ not found "
                         "(typical ablation harness path: Stage 2 → 2.5 → 6, skipping 3-5).",
+                        prev_path,
+                    )
+                elif candidate == "stage2_pruned":
+                    log.info(
+                        "Loading stage 6 input from %s — stage5_final/ and "
+                        "stage2p5_final/ not found (REAP-exact mode: stages "
+                        "2.5/3/4/5 were skipped, stage2_pruned/ is the "
+                        "terminal compression artifact).",
                         prev_path,
                     )
                 else:

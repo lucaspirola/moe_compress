@@ -1,0 +1,656 @@
+# Strategy A — Qwen/Qwen3.6-35B-A3B — REAP-exact mode
+#
+# One-shot pure-prune evaluation: Stage 1 + Stage 2 only, then jump directly
+# to Stage 6alt (thermometer) for a fast teacher-vs-student BPT signal.
+# Stages 2.5, 3, 4, 5 are skipped entirely.
+#
+# Purpose: screening tool for REAP-score-based pruning before committing to
+# the full pipeline. NOT a final-quality artifact — use the 30pct config for
+# production runs.
+#
+# Required calibration run:
+#   python max_quality/scripts/build_self_traces_calib_vllm.py \
+#       --capture-reap-scores [--capture-imatrix] ...
+#
+# Invoke:
+#   python -m moe_compress.run_pipeline \
+#       --config configs/qwen36_35b_a3b_reap_exact.yaml \
+#       --artifacts-dir ./artifacts/reap_exact
+
+model:
+  name_or_path: Qwen/Qwen3.6-35B-A3B
+  revision: main
+  tokenizer_revision: main        # F-C-C-2: pinned tokenizer revision (component of teacher cache key)
+  torch_dtype: bfloat16
+  trust_remote_code: false        # transformers>=5.3 has native qwen3_5_moe
+  # For the 16 GB local smoke runs: switch these on in a sibling config.
+  load_in_4bit: false
+  device_map: auto                # uses accelerate; on H200 everything fits on 1 GPU
+  attn_implementation: sdpa       # DeltaNet layers ignore this; full_attention uses it
+                                  # NOTE: Stage 6 forces attn_implementation="eager" (spec F-S-M-1)
+                                  # for both teacher + student during the gate run regardless of this.
+
+target:
+  # Total parameter reduction (measured, not estimated) the pipeline must hit.
+  total_reduction_ratio: 0.30
+  # ep:sp split — expert_prune_ratio / svd_rank_ratio.  2.0 = pruning removes
+  # twice as many params as SVD factorisation.  Tune this if Stage 6 quality
+  # is worse than expected: lower values shift work to SVD (less lossy for
+  # heterogeneous experts); higher values shift work to pruning (faster but
+  # coarser).  SVD-LLM V2 (2503.12340) recommends starting at 2–3 for MoE.
+  expert_svd_ratio: 2.0
+
+calibration:
+  # Source: Qwen3 pretrain-distribution proxy mix. Four sources blended,
+  # ALL rendered through the model's chat template (Gemma 3 QAT rule):
+  #   tulu3 (25%):    allenai/tulu-3-sft-mixture           SFT / chat
+  #   fineweb (45%):  HuggingFaceFW/fineweb-edu            high-quality web
+  #   math (15%):     nvidia/OpenMathInstruct-2            math problems
+  #   code (15%):     nickrosh/Evol-Instruct-Code-80k-v1   code instructions
+  # (peS2o papers dropped: ships a .py script loader, not supported by
+  #  datasets>=4.5; 5% weight rolled into fineweb's edu-filtered content.)
+  #
+  # Why: empirically (2026-05-21) Tülu-3 (chat-format SFT only) gave us
+  # ~7% mean cross-domain MSE drop per heal layer — better than nvidia-
+  # cascade (~2%) but still far from closing the bpt_gap. Qwen3.6 was
+  # pretrained on web + code + STEM + papers + multilingual; calibrating
+  # on SFT-only never activates the pretrain-experts that hold web/code/
+  # math content, so heal targets miss those activation patterns. This
+  # mix injects pretrain-style content via chat-format wrappers so the
+  # pretrain-experts get exercised during calibration.
+  #
+  # Mix is hard-coded in calibration.py; dataset/subset_weights here are
+  # ignored. To experiment with a different mix, register a new adapter.
+  source: qwen3-pretrain-mix
+  seed: 1337
+  num_sequences: 4000
+  sequence_length: 2048
+
+# Stage 0 is removed — SE detection is now Phase B of Stage 1.
+
+stage1_grape:
+  # Phase A/B: calibration forward pass
+  num_calibration_samples: 1024   # Down from 4000 per reviewer (max + 256-token reservoir saturate
+                                  # well before 1024 samples; CKA matrix Frobenius distance
+                                  # changes < 5% between 1024 and 4000 — reviewer report:
+                                  # max_quality/docs/stage1_review_10.05.2026.txt §Q6).
+  phase_a_batch_size: 32          # Phase A has zero accumulators on GPU besides max-magnitude
+                                  # scalars; live H200 runs use 76.2 GB VRAM in this phase
+                                  # (74.6 GB free / 49.5%). bs=32 cuts Phase A forwards from
+                                  # 256 to 32 — wall ~⅛ of bs=4.
+  phase_b_batch_size: 16          # Phase B at bs=8 used 106.1 GB VRAM (44.7 GB free) on the
+                                  # 2026-05-10 H200 run. Activations don't scale linearly with B
+                                  # in eval-mode forward (per-layer tensors released), so bs=8→16
+                                  # adds only ~12 GB → projected ~118 GB total, ~32 GB headroom.
+                                  # Cuts Phase B forwards from 128 to 64.
+  super_expert_detection:
+    # Phase A dual-signal MA-formation detector — see ALGORITHM_REFERENCE.md §4 Phase A.
+    # The OR rule flags a layer if EITHER signal exceeds its threshold.
+    ma_growth_ratio: 3.0          # residual-stream (gated) growth threshold; calibrated for
+                                  # Qwen3.5/3.6 attn_output_gate=true (5.0 × E[sigmoid(gate)≈0.6])
+    moe_output_growth_ratio: 2.0  # MoE block output (ungated) growth threshold; secondary signal
+    ma_ratio: 100.0               # First MoE layer absolute outlier check (unchanged from paper)
+    a_max_fraction: 0.1           # Phase C three-way AND threshold (unchanged from paper Eq. 6)
+
+    # Phase C: AIMER candidate source (see D-aimer-cross-check). Final blacklist
+    # inclusion is gated by Phase D ablation evidence — AIMER auto-extension
+    # was removed in v6 because static thresholds are fragile across architectures.
+    aimer_enabled: true
+    aimer_bottom_pct: 0.01        # bottom 1% by AIMER score per layer (~2-3 experts/256-expert layer)
+    aimer_layer_max_fraction: 0.1 # require layer's expert-max > 0.1 × a_max_absolute
+
+    # Phase C: sink-token routing candidate source (see D-sink-token-routing).
+    # v6 re-enabled with tightened thresholds + per-layer cap; v4 saturated at
+    # freq_on_sink = 1.0 for many non-SE experts on this architecture, so 0.95
+    # threshold over-fired (146 experts, only 1 with measurable ΔNLL). Final
+    # blacklist inclusion gated by Phase D ablation evidence — false candidates
+    # cost ablation time but cannot reach the blacklist without ΔNLL > threshold.
+    sink_token_enabled: true
+    sink_token_score_ratio: 10.0          # tightened from v4's 5.0
+    sink_token_freq_threshold: 0.99       # tightened from v4's 0.95
+    sink_token_max_per_layer_cap: 10      # caps candidate-set size per layer (sorted by score_ratio desc)
+
+    # Phase C: magnitude top-K candidate source (see D-magnitude-topk-candidates).
+    # candidate-only signal; 2× active-experts-per-token (top-8 routing).
+    magnitude_topk_per_l_layer: 16
+
+    # Deprecated keys (warned-and-ignored by code; SE detection uses paper's
+    # three-way AND criterion P99.5 + 0.1·a_max + l ∈ L instead).
+    zscore_threshold: 2.5
+    max_blacklisted_per_layer: 4
+    global_blacklist_cap_pct: 0.05
+
+  # Phase D: Ablation Filter (was Phase F report-only; now load-bearing — see §4 Phase D).
+  ablation_filter:
+    enabled: true
+    holdout_samples: 100               # held-out slice from calibration; deterministic seed_offset=999
+    blacklist_threshold: 0.001         # ΔNLL threshold; ~0.1% PPL impact
+    batch_size: 8                      # H200 first-run telemetry (job 6a00caf0, 2026-05-10): the
+                                       # model+Phase B accumulators+Phase E (CKA) reservoir occupy
+                                       # ~99 GB before Phase D, leaving ~40 GB free. The
+                                       # ForCausalLMLoss bf16→fp32 logits upcast at bs=32 OOM'd
+                                       # (tried to allocate 60.6 GB; logits tensor itself is
+                                       # 32×2048×151936×4 bytes = 38 GB upcast). bs=8 keeps the
+                                       # upcast at ~9.5 GB + intermediates ≈ 16 GB total —
+                                       # comfortably within budget and matches the v4-proven
+                                       # post_hoc_ablation config. ~13 batches per candidate.
+
+  # Phase E/F (unchanged)
+  similarity_metric: cka
+  min_experts_per_layer: 128
+  entropy_tolerance: 0.1
+
+stage2_reap_ream:
+  experts_implementation: grouped_mm   # Hopper (H100/H200): grouped_mm is the
+                                       # fastest kernel AND the only one that
+                                       # fits Stage 2's profiling shape (bs=6 ×
+                                       # 2048 × top-k) — batched_mm's
+                                       # fancy-index expand of gate_up_proj
+                                       # blows up to 384 GB at this shape
+                                       # (verified B200 OOM 2026-05-13), and
+                                       # `eager` is 30-50% of grouped_mm speed.
+                                       # On Blackwell (B200) grouped_mm
+                                       # deadlocks (see
+                                       # memory/project_grouped_mm_blackwell.md);
+                                       # override via env
+                                       # `EXPERTS_IMPLEMENTATION=eager` if you
+                                       # must run Stage 2 on B200.
+  batch_size: 32                   # H200: model ~70GB, ~75-90GB free. Bumped 6->32 after the
+                                   # finalize_batch/cost-matrix vectorization removed the per-batch
+                                   # Python bottleneck — fewer launches + better MoE arithmetic
+                                   # intensity. Numerically neutral (sum over the same tokens).
+  num_calibration_samples: 4000
+  reap_min_active_tokens: 32      # skip experts whose token activation count < this from centroid candidates
+  covariance_storage_dtype: float16   # fp16 (10 mantissa bits) avoids the bf16 (7 bits) precision loss
+                                      # that round-tripped Stage 2 covariance and produced rank-deficient B
+                                      # in Stage 3 (rel_recon_err ≫ 1). Same byte count as bf16.
+  max_merge_group_size: 8         # bump target if any group exceeds this size.
+                                  # REAM paper §A.1 uses C=16 for Qwen3-30B at 25% reduction;
+                                  # 8 is conservative but allows centroids to absorb multiple
+                                  # similar experts as the paper intends. Previous value of 3
+                                  # was too restrictive and prevented meaningful merges.
+  ream_cost_sigma_threshold: 1.5  # bump target if mean_cost_per_pair > running_mean * (1 + threshold)
+                                  # inactive for first 4 freshly-processed layers (bootstrap guard)
+  ream_cost_bump_ratio: 0.10      # bump amount = ceil(target * ratio) when cost gate triggers
+  ream:
+    # gate_weight / expert_weight removed — D-ream-aggregation pins the
+    # combined cost to the unweighted mean (δ_gate + δ̃_expert)/2; per-component
+    # weights are not implemented in code and would silently no-op if set.
+    frequency_weighted_merge: true
+  # ---- Stage 2 v2 revision (max_quality/docs/stage2_assignment_revision.md) ----
+  # All flags below default to baseline (greedy/pre/none/false/0); flipping
+  # them on activates the new cost-matrix + EM + distillation machinery.
+  # With every flag at baseline, Stage 2 output is bit-identical to v1.
+  # Solver dispatch (M7, P1):
+  assignment_solver: "greedy"      # "greedy" (legacy) | "hungarian" | "mcf" | "auto" | "sinkhorn"
+                                   # auto: hungarian when n_NC ≤ N'_l, else mcf
+                                   # sinkhorn: Tier 3 / M9, capacitated entropy-regularized OT
+  # Sinkhorn knobs (only used when assignment_solver == "sinkhorn"):
+  sinkhorn_epsilon_init: 1.0
+  sinkhorn_epsilon_final: 0.01
+  sinkhorn_iters: 200
+  # Cost matrix variants (M1, M2, P3-asymmetric):
+  cost_alignment: "pre"            # "pre" (current δ_REAM) | "post" (Hungarian-aligned whitened residual)
+  cost_whitening: "none"           # "none" | "diag" | "full" (eigen-sqrt; AA-SVD lineage)
+  # REAP-exact: asymmetric cost assumes merging happens (freq_m / (freq_c
+  # + freq_m) weighting). With skip_merge_percentile=0.0 there are no
+  # merges, so the asymmetric weight would be applied to empty sets. Set
+  # false to match the pure-prune posture.
+  cost_asymmetric: false
+  cost_topk_filter: 48             # K candidates per non-centroid for cost_alignment="post"
+  # REAP-exact: mask ALL merges → pure prune. 0th percentile = minimum
+  # finite cost; every entry strictly above it is set to +inf → solver
+  # assigns nothing → non-centroids are pure-dropped, not merged.
+  # OFF sentinel is 100.0; 0.0 is the hardest possible mask.
+  skip_merge_percentile: 0.0
+  # Per-layer regime gate (M3):
+  capacity_util_threshold: 0.25    # u < this → SLACK path (cheap symmetric δ_REAM); >= this → TIGHT path
+  # EM refinement (M4):
+  em_refinement_rounds: 0          # 0 disables; Tier 2 default 3 (set after ablation)
+  em_convergence_break: true       # stop early when assignment stops changing
+  # Per-expert distillation (M8 / Tier 1):
+  # REAP-exact: no per-merge-group distillation. expert_distill_steps=0
+  # is already the default, but stated explicitly for clarity.
+  expert_distill_steps: 0
+  expert_distill_lr: 1.0e-4
+  expert_distill_betas: [0.9, 0.95]
+  expert_distill_token_cap: 8192
+  expert_distill_skip_singletons: true
+  expert_distill_loss_plateau_steps: 50
+  expert_distill_loss_plateau_eps: 1.0e-4
+  expert_distill_parallel_groups: 1
+  expert_distill_optimizer_dtype: "fp32"
+  # Per-layer merge-heal (opt-in; sweep rows SH / SHR). After a layer is
+  # merged, heal it by SELF-DISTILLATION: train its kept experts (+ optionally
+  # the resized router) so the merged layer reproduces its OWN pre-merge
+  # MoE-block output on calibration tokens captured in-process — no teacher,
+  # no sidecar. A monotone-safe accept/reject guard reverts any layer the heal
+  # fails to improve. All keys default OFF/inert — with merge_heal_enabled=false
+  # Stage 2 output is byte-identical to the baseline.
+  # REAP-exact: no post-merge heal. Experts are dropped, not merged, so
+  # there is no merged centroid to heal.
+  merge_heal_enabled: false
+  merge_heal_train_router: true    # true: heal the resized router too;
+                                   # false: router frozen (resized only),
+                                   # experts still all train
+  merge_heal_lr: 1.0e-4            # fp32 AdamW learning rate
+  merge_heal_adamw_betas: [0.9, 0.95]  # AdamW beta1 / beta2
+  merge_heal_grad_clip: 1.0        # max grad norm (clip_grad_norm_)
+  merge_heal_holdout_fraction: 0.10  # 90/10 train/held-out split
+  merge_heal_patience: 5           # early-stop: held-out evals w/o improvement
+  merge_heal_eval_interval: 25     # steps between held-out MSE evals
+  merge_heal_min_rel_delta: 0.002  # patience resets only if h < best*(1 - this).
+                                   # 0 reproduces the historical never-stops bug;
+                                   # 0.01 stops near the convergence knee but
+                                   # left ~25% of available local-MSE descent
+                                   # on the table in the first H200 run; 0.002
+                                   # rides each layer to ~95% of available gain.
+                                   # See tasks/heal_convergence_review.md.
+  merge_heal_max_steps: 20000      # real safety cap; convergence is min-rel-delta-
+                                   # patience-driven and fires well before this.
+  merge_heal_token_cap: 262144     # captured (input,target) pool size per layer
+  merge_heal_minibatch_size: 8192  # rows per training step / held-out eval chunk
+                                   # — minibatches drawn from the captured pool;
+                                   # bounds peak GPU memory on wide layers
+
+  # LR schedule (opt-in, inert when omitted). Linear warmup `0 → lr` over
+  # `lr_warmup_steps`, then half-cosine decay `lr → lr_min` over `lr_decay_steps`,
+  # then flat at `lr_min`. Defaults below target the heavy 128-merge layer's
+  # slow component (half-life ≈ 16k steps from the convergence-design data):
+  # heavy layers ride deeper into the decay; light layers stop early under
+  # min_rel_delta=0.002 and see LR at ~25–35% of peak (still meaningful refinement
+  # without over-cooling the early descent). Stacks with min_rel_delta=0.002 to
+  # lower the asymptote that the patience gate then halts against.
+  merge_heal_lr_warmup_steps: 200  # linear ramp; 200 ≈ AdamW moment warm-up.
+  merge_heal_lr_min: 1.0e-5        # cosine floor; 10% of peak lr.
+  merge_heal_lr_decay_steps: 16000 # cosine half-window; tuned to the slow
+                                   # component half-life of the heavy layer.
+
+  # Cross-domain (WikiText) holdout — telemetry only, never feeds gradients
+  # / accept-reject / save-best. Captures a parallel (input, target) pool from
+  # WikiText (same dataset/subset/split as the thermometer BPT eval) and
+  # evaluates a second `holdout_mse_xd` each eval. Diagnoses whether per-layer
+  # MSE learned on the Nemotron heal pool transfers to the WikiText routing
+  # distribution that `bpt_gap` actually measures.
+  merge_heal_cross_domain_holdout_enabled: true
+  merge_heal_xd_holdout_tokens: 26214  # = round(10% × merge_heal_token_cap)
+                                       # = round(0.10 × 262144) — matches the
+                                       # Nemotron 10% holdout row count for
+                                       # like-for-like MSE comparison.
+
+stage3_svd:
+  scope: moe_experts_only         # NEVER change; attention SVD is off-spec
+  batch_size: 16                  # B-cov forward runs under no_grad → cheap
+                                  # activations; bigger batch amortizes the
+                                  # model-weight HBM read. H200 sweet spot: 16.
+  d_rank:
+    parameter_cost_omega_mode: auto  # ω = n·(d_out + d_in): per-rank param cost for n per-expert factors
+    # Per-projection rank bias (budget-neutral: weights sum to 3× uniform).
+    per_projection_weight:
+      gate_proj: 1.33
+      up_proj:   0.67
+      down_proj: 1.0
+  swift_svd_plus:
+    alpha_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    validation_samples: 512       # WikiText-2 sequences for paper-exact α selection (§3.2.2).
+                                  # For each α candidate, the full model is factored at the
+                                  # corresponding per-expert ranks and evaluated end-to-end.
+                                  # 11 candidates × ~3 min ≈ ~33 min on H200.
+                                  # Set to 0 to use spectral proxy (no forward passes, seconds).
+    validation_batch_size: 16     # Batch size for WikiText-2 PPL evaluation during α search.
+    metric: wikitext2_ppl         # End-to-end metric for α selection.
+    per_group_type: true          # Per-projection-type α refinement via spectral proxy
+                                  # after the global validation-based search. The paper
+                                  # uses a single α; per-type is our extension.
+  aa_svd:
+    use_post_prune_inputs: true   # B = pruned-model inputs
+    cross_covariance: true        # Collect C = X_pre^T X_post via dual-forward (paper-exact
+                                  # Theorem 3.2). Requires original + pruned model in VRAM
+                                  # simultaneously (~120 GB). Set false to fall back to
+                                  # auto-covariance A = X_pre^T X_pre approximation.
+  bcov_storage_dtype: float16     # B post-prune covariance storage; see covariance_storage_dtype above.
+  block_refine:                       # Phase C.5 — block-level joint refinement
+                                      # (paper 2604.02119 §3.3, Algorithm 2 line 9)
+    enabled: true
+    epochs: 25                        # paper Algorithm 2 line 9 / spec §6 Phase C.5
+    batch_size: 32                    # paper Algorithm 2 line 9 / spec §6 Phase C.5
+    learning_rate: 1.0e-4             # paper Appendix B.2 / spec §6 Phase C.5
+    warmup_ratio: 0.1                 # cosine schedule with linear warmup
+    weight_decay: 0.0                 # AdamW default; paper does not specify
+                                      # Optimizer is standard torch.optim.AdamW (fp32 moments
+                                      # + fp32 master) — spec §6 Phase C.5 / H200 sizing
+                                      # rationale. NOT 8-bit AdamW.
+
+stage4_eora:
+  per_expert: true                # spec note: per-expert beats global on MoE
+  compensation_budget_pct: 0.03   # EoRA adds back ≤ 3% of Stage 3 savings
+  eigenspace_rank_cap: 128        # hard cap per matrix (spec §7 Budget)
+
+stage5_router_kd:
+  optimizer: adamw
+  learning_rate: 5.0e-5           # paper Table 1 (§F.3)
+  experts_implementation: grouped_mm   # Hopper (H100/H200) — fastest kernel.
+                                       # Valid values: grouped_mm (Hopper-only —
+                                       # DEADLOCKS on Blackwell sm_100, see
+                                       # memory/project_grouped_mm_blackwell.md),
+                                       # batched_mm (torch.bmm-based, 70-90% of
+                                       # grouped_mm speed, but OOMs at Stage 2
+                                       # shape — Stages 5/6 only),
+                                       # sonicmoe (CUTLASS DSL; deadlocked on
+                                       # B200 in our 2026-05-13 probe),
+                                       # eager (Python loop, 30-50% speed,
+                                       # universal — the B200 fallback).
+                                       # Env var EXPERTS_IMPLEMENTATION
+                                       # overrides this value at runtime for
+                                       # quick A/B or to swap to eager when
+                                       # forced onto Blackwell.
+  weight_decay: 0.01              # Bumped 2026-05-13 from 0.0 → 0.01 after the
+                                  # 2-epoch / 6000-sample run showed the loss
+                                  # bottom out at step 950 (0.117) then RISE
+                                  # back to 0.169 by step 1400 — clear memorization
+                                  # of the calibration corpus. Mild weight decay
+                                  # regularizes router weights against drift past
+                                  # the optimum. The paper does not specify this,
+                                  # but our empirical loss curve was textbook
+                                  # overfit; 0.01 is the AdamW default.
+  epochs: 1                       # 2026-05-17: reverted 3 → 1. The S0 live run
+                                  # showed Move B's epochs=3 did NOT cure the
+                                  # overfit — it amplified it: the pure
+                                  # teacher↔student raw_kl rises 7× (0.028 @
+                                  # step250 → 0.20 @ step1950) and save-best
+                                  # pins best.pt at step ~250. So epochs 2 & 3
+                                  # (~1500 redundant 35B-teacher forwards over a
+                                  # byte-identical replayed corpus — iter_batches
+                                  # materialises the batch list once and the
+                                  # epoch loop replays it with no reshuffle) are
+                                  # discarded compute. We export the step-~250
+                                  # best regardless, so epochs=1 is zero quality
+                                  # loss and ~−40 min wall/row. With epochs=1 the
+                                  # teacher_logits_cache guard (stage5_router_kd
+                                  # .py:894) is inert → the cache is usable again.
+                                  # See tasks/kd_fix_plan.md.
+  # Move A — LR schedule + best-checkpoint export.
+  lr_schedule: cosine             # 'cosine' = linear warmup → cosine decay to
+                                  # lr_min_ratio × peak. 'none' = constant LR
+                                  # (rollback path).
+  warmup_ratio: 0.05              # First 5% of optimizer steps linearly ramp
+                                  # from LR≈0 up to peak. At 2250 steps (=
+                                  # 6000/8 × 3), warmup ≈ 112 steps.
+  lr_min_ratio: 0.10              # Cosine floor: 10% of peak. At peak 5e-5,
+                                  # final LR = 5e-6. Non-zero floor keeps
+                                  # the optimizer alive at the end so the
+                                  # last 10% of training still produces
+                                  # measurable gradient updates rather than
+                                  # idling.
+  save_best: true                 # Export the EMA-smoothed-best router state at
+                                  # the end of training (vs the last-step state).
+                                  # The last-step state is what bit us in the
+                                  # 2-epoch run that drifted past its optimum.
+  best_metric_ema_alpha: 0.2      # EMA on the raw-KL window mean used for the
+                                  # best-tracker; α=0.2 damps the first ~5
+                                  # log windows so the early noise floor can't
+                                  # win the best slot.
+  # Temperature: see `kd_temperature` below — CONSTANT T=1, no ramp. The
+  # former kd_temperature_start/end/ramp_fraction curriculum was removed: a
+  # downward ramp makes the logged raw_kl non-stationary (it is the softened-
+  # distribution KL, which drifts with T) and corrupts save-best / early-stop.
+  early_stop_patience: 8          # >0 enables patience-based early stopping on
+                                  # the SAME raw_kl EMA that save_best tracks.
+                                  # After this many consecutive log windows with
+                                  # no EMA improvement, training stops cleanly
+                                  # (best.pt already holds the optimum). 0 =
+                                  # disabled (loop runs the full schedule).
+                                  # NOTE: the original "8" was justified by S0's
+                                  # raw_kl "drifting monotonically up" — but that
+                                  # drift was confounded by the now-removed
+                                  # temperature ramp (raw_kl rises as T falls).
+                                  # Re-audit this value at constant T=1.
+  shuffle_batches_each_epoch: false  # When true, permute the batch ITERATION
+                                  # order each epoch with a deterministic
+                                  # epoch-seeded RNG (reduces identical-replay
+                                  # memorisation). Only meaningful for epochs>1;
+                                  # with the epochs=1 default it is a no-op.
+                                  # Refuses to combine with teacher_logits_cache
+                                  # (the cache is positionally indexed). DEFAULT
+                                  # false = byte-identical to main.
+  # batch_size × gradient_accumulation = effective batch (=8).
+  # H200 (141 GB VRAM): teacher BF16 (~70 GB) + student BF16 (~50 GB) = ~120 GB.
+  # At bs=8, vocab logits + small KV-cache headroom consume ~6 GB, leaving ~15 GB headroom.
+  # bs=8 with grad_accum=1 eliminates gradient accumulation overhead entirely:
+  # 750 forward passes (= 750 optimizer steps at 6000 samples / 8 batch / 1 epoch).
+  # Same effective batch as paper (8×1 = 2×4 = 8).
+  batch_size: 8
+  gradient_accumulation: 1
+  # Teacher loads in BF16 on H200 — no quantization needed.
+  teacher_load_in_4bit: false
+  # Optional alternate teacher for KD (Stage 2.5 / Stage 5). null = use the
+  # main model from config.model.name_or_path (default: BF16 teacher).
+  # Set to a HF repo (e.g. "Qwen/Qwen3.6-35B-A3B-FP8") to use a smaller /
+  # lower-precision teacher when H200 + BF16 teacher + BF16 student would OOM.
+  # The override must share the main model's MoE layer count and tokenizer/vocab
+  # (enforced at load time in stage5_router_kd._get_teacher).
+  teacher_model_repo: null
+  max_sequence_length: 512
+  kd_temperature: 1.0             # Distillation temperature — CONSTANT, no
+                                  # ramp. Post-merge router recovery is self-
+                                  # healing (the student is the compressed
+                                  # teacher), not cross-capacity KD; T=1 makes
+                                  # the loss the true forward-KL to the teacher,
+                                  # the logged metric stationary + honest, and
+                                  # the objective == the deploy target. Keep 1.0.
+  # teacher_logits_cache: a precomputed teacher-logits sidecar that lets Stage
+  # 2.5 skip the live 35B teacher forward entirely (see hf_jobs/
+  # precompute_teacher_logits.py). With epochs=1 (the default) the cache is
+  # fully supported. Do NOT enable it with epochs > 1 — the runtime guard in
+  # stage5_router_kd.run() (the `epochs > 1 and teacher_logits_cache` check)
+  # raises in that combination, because the calibration batches are replayed
+  # identically across epochs while the cache index advances per (epoch,batch),
+  # mispairing epoch-0 logits with epoch-N inputs.
+  kd_seq_chunk_size: 32             # Bounds the vocab-KL peak. The full-sequence
+                                    # chunk (512) measured ~3.78 GiB and OOM'd
+                                    # Stage 2.5 on the SC/SCD/SE rows (GPU left
+                                    # ~0.6-2 GiB free after student+teacher);
+                                    # 32 brings the peak to ~0.24 GiB. Chunking
+                                    # is correctness-neutral — KL is summed over
+                                    # the token axis identically at any chunk
+                                    # size (see _chunked_vocab_kl docstring).
+  max_calibration_samples: 3000   # 2026-05-17: reverted 6000 → 3000. The 6000
+                                  # bump existed only to feed epochs=3; with
+                                  # epochs=1 (see above) that rationale is void.
+                                  # 3000 samples / batch_size=8 = 375 optimizer
+                                  # steps — comfortably past the observed
+                                  # step-~250 raw_kl optimum, and early_stop
+                                  # (below) ends the run earlier still. Halves
+                                  # the Stage-2.5 calibration build + wall.
+                                  # See tasks/kd_fix_plan.md.
+  checkpoint_every_n_steps: 100    # save router+optim state every N optimizer steps for crash-resume
+  # Only router weights update. Enumerated paths are matched as substrings.
+  trainable_name_patterns:
+    - mlp.gate.weight
+  frozen_name_patterns:
+    - experts
+    - shared_expert
+    - self_attn
+    - norm
+    - embed
+    - lm_head
+  # Direction E — Stage 2.5 merge-repair (strong form). Default OFF: when
+  # enabled=false the Stage-2.5 run is byte-identical to pre-Direction-E
+  # behaviour (router-only KD, frozen experts, pure vocab-KL loss).
+  # When enabled=true, the merged centroid experts (kept experts that absorbed
+  # others during the Stage-2 merge — identified from stage2_pruned/
+  # merge_map.json) are ALSO trained, and a per-layer MoE-block-output MSE
+  # term against the teacher is added to the vocab-logit KL.
+  # NOTE: enabling this requires a live teacher (run the teacher forward) —
+  # it is incompatible with teacher_logits_cache, which holds only vocab
+  # logits and no per-layer hidden states (run() fails loud on that combo).
+  merge_repair:
+    enabled: false                    # master gate; false = pre-E behaviour
+    mse_weight: 1.0                   # scalar weight on the per-layer MSE term
+                                      # (loss = vocab_KL + mse_weight × MSE)
+    merge_map_path: null              # null = stage2_pruned/merge_map.json;
+                                      # relative paths resolve under artifacts_dir
+  torch_compile: true                 # 20-40% forward speedup on H200/B200 Hopper/Blackwell.
+                                      # Briefly disabled 2026-05-13 02:08 UTC as a NaN hypothesis;
+                                      # the 02:25 UTC relaunch with torch_compile=false STILL
+                                      # produced loss=nan grad_norm=nan from step 50, ruling out
+                                      # torch.compile as the NaN cause. Re-enabled to keep the
+                                      # speedup. NaN root-cause now under investigation with the
+                                      # debug hooks in stage5_router_kd.py (commit 02baf4b).
+
+stage6_validate:
+  # Eval mode: "full" runs the comprehensive suite (WikiText PPL + lm-eval +
+  # HumanEval + MATH-500, student + teacher). "thermometer" runs the cheap
+  # stage6alt directional eval (bits-per-token on a held-out reasoning slice +
+  # ARC-Easy/HellaSwag subset) — ~$0.22/row vs ~$50-120/row for full. Use
+  # thermometer to sweep A0..A11, then full on the winning row. Default full.
+  mode: thermometer   # REAP-exact: use the fast BPT signal, not the full suite.
+  thermometer:
+    # Evaluation corpus for the bits-per-token (BPT) metric:
+    #   nemotron — held-out slice of the Nemotron-Cascade SFT data. This is the
+    #     SAME distribution Stage 2.5 Router KD trains the student on, so its
+    #     bpt_gap conflates compression damage with the student's distribution
+    #     adaptation. Trust it ONLY for cross-row A0..A11 ranking (adaptation
+    #     is common-mode), never as an absolute teacher-vs-student number.
+    #   wikitext — WikiText-2 test split, NOT in the Stage 2.5 training
+    #     distribution → bpt_gap is a fair teacher-vs-student damage number.
+    # See stage6alt_thermometer.py module docstring. top1_agreement is fair
+    # on either corpus.
+    # Strategy sweep (2026-05-17): wikitext — the directions D/B/A/C/E must be
+    # ranked on a FAIR teacher-vs-student damage number (out-of-KD-distribution),
+    # comparable to the prior greedy/all-off baseline bpt_gap 0.2507.
+    corpus: wikitext
+    wikitext:                        # only consulted when corpus == wikitext
+      dataset: wikitext
+      subset: wikitext-2-raw-v1
+      split: test
+    # Held-out Nemotron draw: a fixed slice drawn with a seed offset
+    # (stage6alt_thermometer.THERMO_SEED_OFFSET) so it is disjoint from the
+    # Stage 2/2.5 training draw. Directional signal only — NOT
+    # leaderboard-comparable absolute scores.
+    num_sequences: 64
+    sequence_length: 2048
+    bpt_batch_size: 8                # sized for H200 (141 GB); lower to 1-2 on
+                                     # an 80-94 GB card or the BPT pass OOMs.
+    lm_eval_batch_size: "auto:8"
+    arc_easy_limit: 100
+    hellaswag_limit: 200
+    # Reasoning-heavy eval mix, independent of calibration.subset_weights.
+    # Used only by the nemotron corpus.
+    subset_weights:
+      math: 0.35
+      swe: 0.25
+      chat: 0.25
+      science: 0.15
+    teacher_cache_path:              # null = auto: artifacts_dir/thermometer_teacher_cache.json
+  experts_implementation: grouped_mm   # Hopper-fast default; matches stage2 / stage5
+                                       # — see that section's comment + memory/project_grouped_mm_blackwell.md.
+                                       # Override with EXPERTS_IMPLEMENTATION=eager
+                                       # if forced onto Blackwell (B200).
+  # --- Compute-time optimizations (2026-04-30) ---
+  # All optimizations are purely computational scheduling — no metric, formula,
+  # threshold, or evaluation methodology is changed. Numerically identical to
+  # the batch_size=1 baseline.
+  #
+  # Optimization #1: WikiText-2 PPL batch size (default 1 → 8).
+  # VRAM per batch element: ~1.1 GB (logits + KV). At bs=8: ~8.8 GB additional.
+  # Well within the 91 GB headroom (141 GB - 50 GB student).
+  ppl_batch_size: 8
+  #
+  # Optimization #2: lm-eval batch size (default 1 → auto:8).
+  # "auto:X" makes lm-eval binary-search upward from X for the largest safe
+  # batch. On H200 with 91 GB headroom, stabilizes at 32-64.
+  lm_eval_batch_size: "auto:8"
+  #
+  # Optimizations #3, #4: Batched model.generate() for HumanEval/MATH-500.
+  # Greedy decode (do_sample=False) is deterministic regardless of batch.
+  # Left-padding + attention_mask ensures no cross-contamination.
+  gen_batch_size: 8
+  #
+  # Optimization #5: torch.compile for prefill-dominant forward paths.
+  # dynamic=True handles variable-length padded batches. mode="reduce-overhead"
+  # enables CUDA graphs where possible. One-time cost ~3-5 min, amortized over
+  # 1000+ forward passes. Do NOT compile model.generate() — autoregressive
+  # decoding changes shapes every step, causing excessive recompilation.
+  torch_compile: true
+  #
+  # Optimization #7: Cache teacher baselines (deterministic eval = same numbers).
+  # The teacher (uncompressed Qwen3.6-35B-A3B) is a fixed, known model. Every
+  # Stage 6 run re-evaluates the same teacher on the same benchmarks. Caching
+  # eliminates ~50% of total wall-clock time (teacher load + all teacher evals).
+  # Cache key: sha256(model_name + revision + eval_config) — auto-invalidates.
+  teacher_eval_cache:
+    enabled: true
+    cache_path:                     # null = auto: artifacts_dir / "teacher_eval_cache.json"
+  #
+  wikitext2:
+    enabled: true
+    dataset: Salesforce/wikitext        # F-C-H-2: namespaced id pinned by Spec §9.
+    subset: wikitext-2-raw-v1
+    split: test
+    sequence_length: 2048
+  # F-C-H-3: per-dataset revision pinning (Spec §9). When strict_revision_pinning
+  # is true (default), the run aborts if any value is null. Replace the placeholders
+  # below with the actual HF dataset revision SHAs before a production run.
+  # WARNING: this config will RuntimeError at Stage 6 startup until SHAs are pinned.
+  # To run a smoke test that skips Stage 6 verification, set strict_revision_pinning: false.
+  strict_revision_pinning: true   # Production: dataset SHAs are pinned below. Flipping
+                                  # back to false should only be done for non-scientific
+                                  # smoke tests; do NOT use the false path for A0..A11
+                                  # final result reporting (reproducibility requirement).
+  dataset_revisions:
+    # SHAs resolved via huggingface_hub.HfApi().dataset_info(repo_id).sha
+    # on 2026-05-13 04:25 UTC. Update only if a dataset's content changes
+    # AND you intend to re-run all 12 ablations against the new content.
+    wikitext_ppl:    b08601e04326c79dfdd32d625aee71d232d685c3   # Salesforce/wikitext (wikitext-2-raw-v1) — used by _wikitext2_ppl AND imatrix calibration corpus (train split)
+    # F-iter4-HIGH-1: hellaswag/arc_challenge keys removed — lm-eval pulls its
+    # own dataset revisions internally and our load path cannot enforce a SHA
+    # at simple_evaluate time. Pin via lm-eval task YAMLs if precise revision
+    # control is required; otherwise accept lm-eval's default. The cache-key
+    # auto-invalidates on lm_eval_version change (and on the lm-eval task
+    # config hash; see _teacher_cache_key).
+    humaneval:       7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544   # openai/openai_humaneval
+    math500:         6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be   # HuggingFaceH4/MATH-500
+  zero_shot:
+    enabled: true
+    tasks: [arc_challenge, hellaswag]
+  generative:
+    enabled: true
+    humaneval:
+      # F-iter4-NIT-2: num_samples_per_task removed — Stage 6 is greedy pass@1
+      # only (Spec D-humaneval-greedy); the assertion in stage6_validate.py
+      # rejects any non-1 value if a future operator re-adds this key.
+      max_new_tokens: 512
+    math500:
+      num_samples: 500
+      max_new_tokens: 1024
+  thresholds:
+    wikitext2_ppl_relative_max_increase: 0.03
+    arc_c_absolute_max_drop: 0.015
+    hellaswag_absolute_max_drop: 0.015
+    humaneval_absolute_max_drop: 0.03
+    math500_absolute_max_drop: 0.03
+    measured_reduction_min: 0.30
+  imatrix:
+    enabled: true
+    ngl: 99        # GPU layers for llama-imatrix (-ngl 99 = all on GPU)
+    ctx_size: 2048 # context window, aligned with wikitext2 sequence_length
+    llama_cpp_dir: # null = auto-detect via LLAMA_CPP_DIR env var or PATH
+
+logging:
+  level: INFO
+  log_every_n_steps: 50
+  save_intermediate_every_n_layers: 10
+
+# ---- REAP-exact orchestration knobs ----
+# These keys are read ONLY by run_pipeline.py. Stage modules do not see them.
+pipeline:
+  # When true: skip stages 2.5, 3, 4, 5 and jump from stage 2 directly to
+  # stage 6 (or stage6alt per `evaluator` below). Stage 6 loads from
+  # stage2_pruned/ instead of stage5_final/.
+  skip_intermediate_stages: true
+  # Which evaluator to use after the skip. "stage6alt" = cheap BPT
+  # thermometer. "stage6" = full suite. Default stage6alt — REAP-exact is
+  # a screening tool, not a final-quality gate. Override to "stage6" for
+  # a rigorous single-run quality check.
+  evaluator: stage6alt
