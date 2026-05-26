@@ -6,7 +6,7 @@
 **Workflow per item**: planner agent → my sanity check → implementer agent → my integration → review/fix loop to convergence.
 
 ## Phase 1 — Cheap wins, no patch change
-- [ ] **P1**: Fix stale docstring in `stage2/plugins/reap_scoring.py` — point at `config["calibration"]` instead of hardcoded "Nemotron-Cascade".
+- [x] **P1**: Fix stale docstring in `stage2/plugins/reap_scoring.py` — point at `config["calibration"]` instead of hardcoded "Nemotron-Cascade". Commits `0a95560` + `e374c00` (review-fix iter 1). Loop closed at iter 2.
 - [ ] **P2**: Wire saliency-weighted merge branch in `stage2/merging.py` (replace `raise ValueError`), thread `scores` from `layer_merge.py`.
 
 ## Phase 2 — Infrastructure + first writer (proves the pattern)
