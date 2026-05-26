@@ -11,7 +11,7 @@
 
 ## Phase 2 — Infrastructure + first writer (proves the pattern)
 - [x] **Item 0**: `utils/cached_calibration_signals.py` provider-pair module + schema/loader. Commit `b7e2b72`. Loop closed at iter 1 (no fixer needed). 432 LoC module + 544 LoC tests + MANIFEST "Schema bumps" section. 6 dataclass payloads, 12 load/save fns, 2 ABCs, central `SCHEMA_VERSIONS` dict, atomic-write via tmp+os.replace, multi-arch portable, npz double-extension trap defeated via file-handle pattern.
-- [ ] **V1+V2**: REAP-exact via vLLM hooks — writer in patch (router + expert_out_unweighted scatter-reduce); stage-2 cache-reader plugin (`dispatch_first` slot pattern).
+- [x] **V1+V2**: REAP-exact via vLLM hooks — writer in patch (router + expert_out_unweighted scatter-reduce); stage-2 cache-reader plugin (`dispatch_first` slot pattern). Commits `1fd9cc4` + `36f08af` (review-fix iter 1). Loop closed at iter 2. Patch now 4409 lines, MD5 `e3fba22dc2bb0f5db3822c75a8182ad5`. New tag `calib-v2-reap-scores-writer`. 6 vLLM smoke tests + 7 reader tests, all green. Existing stage 2 tests untouched.
 
 ## Phase 3 — REAP-exact preset
 - [ ] **P3**: `configs/qwen36_35b_a3b_reap_exact.yaml` — keep qwen3-pretrain-mix, skip 2.5/3/4/5.
