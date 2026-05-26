@@ -1720,6 +1720,412 @@ index 0000000..4a7cd9d
 +
 +if __name__ == "__main__":
 +    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_calibration_reap_scores_smoke.py b/tests/test_calibration_reap_scores_smoke.py
+new file mode 100644
+index 0000000..b038437
+--- /dev/null
++++ b/tests/test_calibration_reap_scores_smoke.py
+@@ -0,0 +1,400 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Smoke tests for ``vllm.calibration_reap_scores``.
++
++These exercise the per-(layer, expert) accumulator, the env-gate
++contract, checkpoint round-trip + two-segment additivity, the silent
++"router stash miss" guard, and the dump-normalization math.
++
++Tests:
++
++1. ``test_accumulator_math`` -- a synthetic router + expert_out_unweighted
++   pair populates the per-expert accumulators with the expected
++   ``g_j · ||f_j||_2`` contributions.
++2. ``test_no_accumulation_when_env_off`` -- env unset → callbacks dispatched
++   manually leave accumulators at zero (the source-patched dispatch in
++   ``calibration_hooks`` short-circuits, AND the module's own
++   ``_CAPTURE_REAP_SCORES`` guard returns early).
++3. ``test_checkpoint_roundtrip`` -- dump → reload module → load_checkpoint
++   restores byte-identical accumulator state plus the prompt counter.
++4. ``test_two_segment_additivity`` -- 10 tokens + checkpoint + reload +
++   another 10 tokens equals 20-token single run (cumulative addition).
++5. ``test_router_stash_miss_skips_silently`` -- expert_out_unweighted
++   fired without a preceding router dispatch leaves accumulators at zero
++   and logs a warning.
++6. ``test_dump_normalization`` -- single contribution to expert 0 →
++   ``reap_scores[0, 0]`` equals the raw value (count=1), other cells zero.
++"""
++from __future__ import annotations
++
++import importlib
++import os
++import sys
++from typing import Any
++
++import torch
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _reload_reap_scores(env: dict[str, str]) -> Any:
++    """Reload ``vllm.calibration_reap_scores`` (and hooks) with a fresh env.
++
++    Module-level ``_CAPTURE_REAP_SCORES`` is sampled at import; per-test
++    isolation requires a fresh import.
++    """
++    sys.modules.pop("vllm.calibration_reap_scores", None)
++    sys.modules.pop("vllm.calibration_hooks", None)
++    for key in (
++        "VLLM_CALIB_CAPTURE_REAP_SCORES",
++        "VLLM_CALIB_CAPTURE_ROUTER",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED",
++        "VLLM_CALIB_CAPTURE_IMATRIX",
++        "VLLM_CALIB_CAPTURE_EXPERT",
++        "VLLM_CALIB_CAPTURE_BLOCK",
++        "VLLM_CALIB_CAPTURE_EXPERT_MID",
++    ):
++        os.environ.pop(key, None)
++    for k, v in env.items():
++        os.environ[k] = v
++    importlib.import_module("vllm.calibration_hooks")
++    return importlib.import_module("vllm.calibration_reap_scores")
++
++
++def _seed_layer(rs: Any, layer_idx: int, rank: int, n_experts: int) -> None:
++    """Manually wire up the per-layer accumulators the way setup() would."""
++    rs._LAYER_ID_TO_RANK[layer_idx] = rank
++    if rank + 1 > rs._N_LAYERS:
++        rs._N_LAYERS = rank + 1
++    if n_experts > rs._N_EXPERTS:
++        rs._N_EXPERTS = n_experts
++    rs._REAP_SCORE_ACCUM[rank] = torch.zeros(n_experts, dtype=torch.float32)
++    rs._REAP_TOKEN_COUNTS[rank] = torch.zeros(n_experts, dtype=torch.int64)
++
++
++# ---------------------------------------------------------------------------
++# Test 1 -- accumulator math
++# ---------------------------------------------------------------------------
++
++
++def test_accumulator_math():
++    """Synthetic router + expert_out_unweighted populate accumulators with
++    the expected ``g_j · ||f_j||_2`` contributions."""
++    rs = _reload_reap_scores({
++        "VLLM_CALIB_CAPTURE_REAP_SCORES": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    n_experts = 4
++    _seed_layer(rs, layer_idx=0, rank=0, n_experts=n_experts)
++
++    # Two tokens, top-k=2. Token 0 routes to (expert 0, expert 2) with
++    # weights (0.7, 0.3); token 1 routes to (expert 1, expert 2) with
++    # weights (0.6, 0.4). Hidden dim = 3.
++    topk_weights = torch.tensor(
++        [[0.7, 0.3], [0.6, 0.4]], dtype=torch.float32,
++    )
++    topk_ids = torch.tensor([[0, 2], [1, 2]], dtype=torch.int64)
++    # Expert outputs per (token, slot): hidden vectors with known norms.
++    # Use orthonormal-ish small vectors so we can hand-compute norms.
++    unweighted = torch.tensor([
++        [[3.0, 4.0, 0.0],   # token 0 slot 0 (expert 0): norm = 5
++         [0.0, 0.0, 2.0]],  # token 0 slot 1 (expert 2): norm = 2
++        [[1.0, 0.0, 0.0],   # token 1 slot 0 (expert 1): norm = 1
++         [0.0, 3.0, 4.0]],  # token 1 slot 1 (expert 2): norm = 5
++    ], dtype=torch.float32)
++
++    rs._on_router(layer_idx=0, router_logits=torch.zeros(2, n_experts),
++                  topk_weights=topk_weights, topk_ids=topk_ids)
++    rs._on_expert_out_unweighted(layer_idx=0, unweighted=unweighted,
++                                 topk_ids=topk_ids)
++
++    # Hand-computed S_j sum (numerators, before /count normalization):
++    # expert 0: 0.7 * 5 = 3.5
++    # expert 1: 0.6 * 1 = 0.6
++    # expert 2: 0.3 * 2 + 0.4 * 5 = 0.6 + 2.0 = 2.6
++    # expert 3: 0
++    expected_scores = torch.tensor(
++        [3.5, 0.6, 2.6, 0.0], dtype=torch.float32,
++    )
++    expected_counts = torch.tensor([1, 1, 2, 0], dtype=torch.int64)
++    got_scores = rs._REAP_SCORE_ACCUM[0]
++    got_counts = rs._REAP_TOKEN_COUNTS[0]
++    assert torch.allclose(got_scores, expected_scores, atol=1e-5), (
++        f"scores: got {got_scores}, expected {expected_scores}"
++    )
++    assert torch.equal(got_counts, expected_counts), (
++        f"counts: got {got_counts}, expected {expected_counts}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 2 -- env-off short-circuits
++# ---------------------------------------------------------------------------
++
++
++def test_no_accumulation_when_env_off():
++    """Env unset → both the source-patched dispatch and the module's own
++    ``_CAPTURE_REAP_SCORES`` guard keep accumulators at zero."""
++    rs = _reload_reap_scores({})  # env cleared
++    assert rs._CAPTURE_REAP_SCORES is False
++
++    n_experts = 3
++    _seed_layer(rs, layer_idx=0, rank=0, n_experts=n_experts)
++
++    topk_weights = torch.tensor([[0.5, 0.5]], dtype=torch.float32)
++    topk_ids = torch.tensor([[0, 1]], dtype=torch.int64)
++    unweighted = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]], dtype=torch.float32)
++
++    # Call the callbacks directly -- their internal env guard must short-
++    # circuit before touching the accumulators.
++    rs._on_router(layer_idx=0, router_logits=torch.zeros(1, n_experts),
++                  topk_weights=topk_weights, topk_ids=topk_ids)
++    rs._on_expert_out_unweighted(layer_idx=0, unweighted=unweighted,
++                                 topk_ids=topk_ids)
++
++    assert torch.equal(
++        rs._REAP_SCORE_ACCUM[0], torch.zeros(n_experts, dtype=torch.float32),
++    )
++    assert torch.equal(
++        rs._REAP_TOKEN_COUNTS[0], torch.zeros(n_experts, dtype=torch.int64),
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 3 -- checkpoint round-trip
++# ---------------------------------------------------------------------------
++
++
++def test_checkpoint_roundtrip(tmp_path):
++    """Dump → reload module → load_checkpoint restores byte-identical state."""
++    rs = _reload_reap_scores({
++        "VLLM_CALIB_CAPTURE_REAP_SCORES": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    n_experts = 3
++    _seed_layer(rs, layer_idx=0, rank=0, n_experts=n_experts)
++    _seed_layer(rs, layer_idx=1, rank=1, n_experts=n_experts)
++
++    rs._REAP_SCORE_ACCUM[0] = torch.tensor([1.5, 2.5, 0.0], dtype=torch.float32)
++    rs._REAP_TOKEN_COUNTS[0] = torch.tensor([3, 5, 0], dtype=torch.int64)
++    rs._REAP_SCORE_ACCUM[1] = torch.tensor([0.5, 0.0, 4.0], dtype=torch.float32)
++    rs._REAP_TOKEN_COUNTS[1] = torch.tensor([1, 0, 7], dtype=torch.int64)
++    rs.set_n_prompts_accumulated(42)
++
++    ckpt = str(tmp_path / "test.reap.ckpt")
++    rs.dump_reap_scores_checkpoint(ckpt)
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + ".tmp")
++
++    # Fresh module load -- accumulators must hydrate from disk.
++    rs2 = _reload_reap_scores({
++        "VLLM_CALIB_CAPTURE_REAP_SCORES": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    assert rs2._REAP_SCORE_ACCUM == {}  # fresh state
++    loaded = rs2.load_reap_scores_checkpoint(ckpt)
++    assert loaded == 42
++    assert rs2.get_n_prompts_accumulated() == 42
++    assert rs2._N_LAYERS == 2
++    assert rs2._N_EXPERTS == n_experts
++    assert torch.equal(
++        rs2._REAP_SCORE_ACCUM[0],
++        torch.tensor([1.5, 2.5, 0.0], dtype=torch.float32),
++    )
++    assert torch.equal(
++        rs2._REAP_TOKEN_COUNTS[0],
++        torch.tensor([3, 5, 0], dtype=torch.int64),
++    )
++    assert torch.equal(
++        rs2._REAP_SCORE_ACCUM[1],
++        torch.tensor([0.5, 0.0, 4.0], dtype=torch.float32),
++    )
++    assert torch.equal(
++        rs2._REAP_TOKEN_COUNTS[1],
++        torch.tensor([1, 0, 7], dtype=torch.int64),
++    )
++    assert rs2._LAYER_ID_TO_RANK == {0: 0, 1: 1}
++
++
++# ---------------------------------------------------------------------------
++# Test 4 -- two-segment additivity
++# ---------------------------------------------------------------------------
++
++
++def test_two_segment_additivity(tmp_path):
++    """10 tokens + checkpoint + reload + 10 tokens == 20-token single run.
++
++    Critical for spot-preemption: a run split across two instance
++    lifetimes must produce the same accumulator state as a single run.
++    """
++    n_experts = 4
++    n_tokens_per = 10
++    top_k = 2
++
++    # Deterministic data.
++    torch.manual_seed(7)
++    tw_all = torch.rand(2 * n_tokens_per, top_k, dtype=torch.float32)
++    ids_all = torch.randint(0, n_experts, (2 * n_tokens_per, top_k),
++                            dtype=torch.int64)
++    uw_all = torch.randn(2 * n_tokens_per, top_k, 5, dtype=torch.float32)
++
++    # --- single 20-token reference run ---------------------------------
++    ref = _reload_reap_scores({
++        "VLLM_CALIB_CAPTURE_REAP_SCORES": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    _seed_layer(ref, layer_idx=0, rank=0, n_experts=n_experts)
++    ref._on_router(layer_idx=0, router_logits=torch.zeros(2 * n_tokens_per, n_experts),
++                   topk_weights=tw_all, topk_ids=ids_all)
++    ref._on_expert_out_unweighted(layer_idx=0, unweighted=uw_all,
++                                  topk_ids=ids_all)
++    expected_scores = ref._REAP_SCORE_ACCUM[0].clone()
++    expected_counts = ref._REAP_TOKEN_COUNTS[0].clone()
++
++    # --- split across two segments with a checkpoint + reload ----------
++    seg = _reload_reap_scores({
++        "VLLM_CALIB_CAPTURE_REAP_SCORES": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    _seed_layer(seg, layer_idx=0, rank=0, n_experts=n_experts)
++    # First 10 tokens.
++    seg._on_router(layer_idx=0, router_logits=torch.zeros(n_tokens_per, n_experts),
++                   topk_weights=tw_all[:n_tokens_per],
++                   topk_ids=ids_all[:n_tokens_per])
++    seg._on_expert_out_unweighted(layer_idx=0,
++                                  unweighted=uw_all[:n_tokens_per],
++                                  topk_ids=ids_all[:n_tokens_per])
++    seg.set_n_prompts_accumulated(1)
++    ckpt = str(tmp_path / "twoseg.reap.ckpt")
++    seg.dump_reap_scores_checkpoint(ckpt)
++
++    # Reload module + checkpoint -- simulates a process restart.
++    seg2 = _reload_reap_scores({
++        "VLLM_CALIB_CAPTURE_REAP_SCORES": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    seg2.load_reap_scores_checkpoint(ckpt)
++    # Second 10 tokens.
++    seg2._on_router(layer_idx=0, router_logits=torch.zeros(n_tokens_per, n_experts),
++                    topk_weights=tw_all[n_tokens_per:],
++                    topk_ids=ids_all[n_tokens_per:])
++    seg2._on_expert_out_unweighted(layer_idx=0,
++                                   unweighted=uw_all[n_tokens_per:],
++                                   topk_ids=ids_all[n_tokens_per:])
++
++    assert torch.allclose(seg2._REAP_SCORE_ACCUM[0], expected_scores, atol=1e-5)
++    assert torch.equal(seg2._REAP_TOKEN_COUNTS[0], expected_counts)
++
++
++# ---------------------------------------------------------------------------
++# Test 5 -- router stash miss
++# ---------------------------------------------------------------------------
++
++
++def test_router_stash_miss_skips_silently():
++    """expert_out_unweighted without a preceding router fire → no
++    accumulation, warning logged. The vllm.* loggers set propagate=False
++    via vllm.logger.DEFAULT_LOGGING_CONFIG, so we install a temporary
++    handler directly on the module's logger to capture records here."""
++    import logging
++    rs = _reload_reap_scores({
++        "VLLM_CALIB_CAPTURE_REAP_SCORES": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    n_experts = 3
++    _seed_layer(rs, layer_idx=5, rank=0, n_experts=n_experts)
++
++    captured: list[logging.LogRecord] = []
++
++    class _ListHandler(logging.Handler):
++        def emit(self, record):
++            captured.append(record)
++
++    handler = _ListHandler(level=logging.WARNING)
++    target_logger = logging.getLogger("vllm.calibration_reap_scores")
++    prev_level = target_logger.level
++    target_logger.addHandler(handler)
++    target_logger.setLevel(logging.WARNING)
++    try:
++        topk_ids = torch.tensor([[0, 1]], dtype=torch.int64)
++        unweighted = torch.tensor(
++            [[[1.0, 0.0], [0.0, 1.0]]], dtype=torch.float32,
++        )
++        # Don't fire router; just call expert_out_unweighted directly.
++        rs._on_expert_out_unweighted(layer_idx=5, unweighted=unweighted,
++                                     topk_ids=topk_ids)
++    finally:
++        target_logger.removeHandler(handler)
++        target_logger.setLevel(prev_level)
++
++    # Accumulator untouched.
++    assert torch.equal(
++        rs._REAP_SCORE_ACCUM[0], torch.zeros(n_experts, dtype=torch.float32),
++    )
++    assert torch.equal(
++        rs._REAP_TOKEN_COUNTS[0], torch.zeros(n_experts, dtype=torch.int64),
++    )
++    # Warning surfaced.
++    assert any("stash miss" in rec.getMessage().lower()
++               or "without a preceding router" in rec.getMessage().lower()
++               for rec in captured), (
++        f"expected stash-miss warning; got {[r.getMessage() for r in captured]}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 6 -- dump normalization
++# ---------------------------------------------------------------------------
++
++
++def test_dump_normalization(tmp_path, monkeypatch):
++    """1 token to expert 0 → reap_scores[0,0] equals raw value, others zero."""
++    rs = _reload_reap_scores({
++        "VLLM_CALIB_CAPTURE_REAP_SCORES": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    n_experts = 3
++    _seed_layer(rs, layer_idx=0, rank=0, n_experts=n_experts)
++    # Manually seed: contribution 4.2 to expert 0, count = 1.
++    rs._REAP_SCORE_ACCUM[0][0] = 4.2
++    rs._REAP_TOKEN_COUNTS[0][0] = 1
++
++    # Spy on save_reap_scores to capture the payload (the dump helper
++    # imports it lazily inside the function body).
++    captured = {}
++
++    def _fake_save(payload, path):
++        captured["payload"] = payload
++        captured["path"] = path
++
++    import moe_compress.utils.cached_calibration_signals as ccs
++    monkeypatch.setattr(ccs, "save_reap_scores", _fake_save)
++
++    jsonl = tmp_path / "trace.jsonl"
++    rs.dump_reap_scores(jsonl)
++
++    payload = captured["payload"]
++    assert payload is not None
++    assert payload.schema_version == 1
++    assert payload.n_layers == 1
++    assert payload.n_experts == n_experts
++    assert torch.allclose(
++        payload.reap_scores[0],
++        torch.tensor([4.2, 0.0, 0.0], dtype=torch.float32),
++        atol=1e-5,
++    )
++    assert torch.equal(
++        payload.token_counts[0],
++        torch.tensor([1, 0, 0], dtype=torch.int64),
++    )
 diff --git a/vllm/calibration_hooks.py b/vllm/calibration_hooks.py
 new file mode 100644
 index 0000000..19502da
@@ -2974,6 +3380,342 @@ index 0000000..8505da3
 +        len(payload.get("moe_down_accumulators", {})),
 +    )
 +    return loaded_n
+diff --git a/vllm/calibration_reap_scores.py b/vllm/calibration_reap_scores.py
+new file mode 100644
+index 0000000..3fe95a4
+--- /dev/null
++++ b/vllm/calibration_reap_scores.py
+@@ -0,0 +1,330 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""REAP per-(layer, expert) saliency-score capture for calibration-v2.
++
++Computes S_j = (1/|X_j|) · sum(g_j(x) · ||f_j(x)||_2) per (layer, expert)
++during a calibration forward pass, via two source-patched hooks:
++
++* ``router`` (vllm/model_executor/layers/fused_moe/moe_runner.py)
++  dispatches ``(layer_idx, router_logits, topk_weights, topk_ids)`` per
++  MoE layer forward. This module stashes ``topk_weights`` keyed by
++  ``layer_idx`` for the immediately-following ``expert_out_unweighted``
++  callback to match.
++
++* ``expert_out_unweighted`` (vllm/model_executor/layers/fused_moe/experts/
++  triton_moe.py) dispatches ``(layer_idx, unweighted, topk_ids)`` after
++  ``invoke_fused_moe_triton_kernel`` returns. This module computes
++  per-token per-top-k ``||f_j||_2``, multiplies by the matching
++  ``topk_weights``, and scatter-accumulates into per-(layer, expert)
++  CPU buffers.
++
++Env-var gating
++--------------
++``VLLM_CALIB_CAPTURE_REAP_SCORES=1`` activates the module. Requires:
++
++* ``VLLM_CALIB_CAPTURE_ROUTER=1`` (router hook fires)
++* ``VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1`` (Triton kernel hook fires)
++* ``VLLM_USE_FLASHINFER_MOE_FP16=0`` (forces Triton MoE backend;
++  ``expert_out_unweighted`` is NOT available on the FlashInfer
++  monolithic path -- ``MoERunner.__init__`` will AssertionError at
++  model load if the FlashInfer path is selected with capture enabled)
++
++The driver (``build_self_traces_calib_vllm.py``) sets all four env vars
++BEFORE the first vllm import when ``--capture-reap-scores`` is passed.
++
++CUDA-graph compatibility
++------------------------
++Accumulators live on CPU. The callbacks are dispatched from Python
++synchronously after the kernel returns; no in-kernel allocation occurs.
++Safe for CUDA-graph capture.
++
++Resumability
++------------
++Mirrors ``vllm.calibration_imatrix``: periodic ``dump_reap_scores_checkpoint``
++during the run, ``load_reap_scores_checkpoint`` on ``--resume``. The final
++``dump_reap_scores`` writes the normalized S_j payload via
++``moe_compress.utils.cached_calibration_signals.save_reap_scores`` (Item 0).
++"""
++from __future__ import annotations
++
++import logging
++import os
++from pathlib import Path
++from typing import Any
++
++import torch
++
++import vllm.calibration_hooks as _ch
++
++log = logging.getLogger(__name__)
++
++__all__ = [
++    "setup",
++    "dump_reap_scores",
++    "dump_reap_scores_checkpoint",
++    "load_reap_scores_checkpoint",
++    "get_n_prompts_accumulated",
++    "set_n_prompts_accumulated",
++]
++
++# Sampled at import time -- matches calibration_imatrix pattern.
++_CAPTURE_REAP_SCORES: bool = (
++    os.getenv("VLLM_CALIB_CAPTURE_REAP_SCORES", "0") == "1"
++)
++
++# Per-layer-rank CPU accumulators.
++_REAP_SCORE_ACCUM: dict[int, torch.Tensor] = {}   # rank -> [n_experts] float32
++_REAP_TOKEN_COUNTS: dict[int, torch.Tensor] = {}  # rank -> [n_experts] int64
++
++# Per-layer router-weight stash. Cleared after each expert_out_unweighted use.
++_ROUTER_WEIGHTS_STASH: dict[int, torch.Tensor] = {}
++
++_LAYER_ID_TO_RANK: dict[int, int] = {}
++_N_LAYERS: int = 0
++_N_EXPERTS: int = 0
++
++# Cumulative prompt counter mirroring imatrix.
++_n_prompts_accumulated: int = 0
++_CHECKPOINT_SCHEMA_VERSION: int = 1
++
++
++def get_n_prompts_accumulated() -> int:
++    return _n_prompts_accumulated
++
++
++def set_n_prompts_accumulated(n: int) -> None:
++    global _n_prompts_accumulated
++    if n < 0:
++        raise ValueError(f"n must be >= 0; got {n}")
++    _n_prompts_accumulated = int(n)
++
++
++def _resolve_model(llm: Any) -> Any | None:
++    """Walk well-known attribute paths to find the live nn.Module."""
++    candidates = [
++        ("llm_engine", "model_executor", "driver_worker", "model_runner",
++         "model"),
++        ("llm_engine", "model_executor", "model_runner", "model"),
++        ("model_executor", "driver_worker", "model_runner", "model"),
++        ("model_runner", "model"),
++    ]
++    for path in candidates:
++        obj: Any = llm
++        ok = True
++        for attr in path:
++            obj = getattr(obj, attr, None)
++            if obj is None:
++                ok = False
++                break
++        if ok:
++            return obj
++    return None
++
++
++def setup(llm: Any) -> None:
++    """Discover MoE layers, pre-allocate accumulators, register callbacks.
++
++    Idempotent: calling twice does not double-allocate.
++    """
++    global _N_LAYERS, _N_EXPERTS
++
++    if not _CAPTURE_REAP_SCORES:
++        log.info("calibration_reap_scores: env gate off; no-op setup.")
++        return
++
++    model = _resolve_model(llm)
++    if model is None:
++        log.warning(
++            "calibration_reap_scores: could not resolve model from LLM; "
++            "callbacks will be registered but accumulators will be lazily "
++            "allocated at first router dispatch."
++        )
++
++    # Discover MoE layers by attribute presence.
++    n_layers = 0
++    n_experts_seen: int | None = None
++    if model is not None:
++        for name, module in model.named_modules():
++            moe_layer_id = getattr(module, "moe_layer_id", None)
++            num_experts = getattr(module, "num_experts", None)
++            if not (isinstance(moe_layer_id, int)
++                    and isinstance(num_experts, int) and num_experts > 0):
++                continue
++            _LAYER_ID_TO_RANK[moe_layer_id] = n_layers
++            if n_experts_seen is None:
++                n_experts_seen = num_experts
++            elif n_experts_seen != num_experts:
++                log.warning(
++                    "calibration_reap_scores: mixed expert counts "
++                    "(%d vs first-seen %d at %s); using first.",
++                    num_experts, n_experts_seen, name,
++                )
++            n_layers += 1
++
++    _N_LAYERS = n_layers
++    _N_EXPERTS = int(n_experts_seen) if n_experts_seen is not None else 0
++
++    # Pre-allocate CPU accumulators.
++    for rank in range(_N_LAYERS):
++        if rank not in _REAP_SCORE_ACCUM:
++            _REAP_SCORE_ACCUM[rank] = torch.zeros(
++                _N_EXPERTS, dtype=torch.float32,
++            )
++            _REAP_TOKEN_COUNTS[rank] = torch.zeros(
++                _N_EXPERTS, dtype=torch.int64,
++            )
++
++    _ch.register_callback("router", _on_router)
++    _ch.register_callback("expert_out_unweighted", _on_expert_out_unweighted)
++
++    log.info(
++        "calibration_reap_scores: setup complete -- %d MoE layers, "
++        "%d experts/layer; callbacks registered for "
++        "router + expert_out_unweighted.",
++        _N_LAYERS, _N_EXPERTS,
++    )
++
++
++def _on_router(layer_idx: int, router_logits: torch.Tensor,
++               topk_weights: torch.Tensor, topk_ids: torch.Tensor,
++               **_: Any) -> None:
++    """Stash per-layer topk_weights for the matching expert_out_unweighted."""
++    if not _CAPTURE_REAP_SCORES:
++        return
++    _ROUTER_WEIGHTS_STASH[layer_idx] = topk_weights.detach().cpu().to(torch.float32)
++
++
++def _on_expert_out_unweighted(layer_idx: int, unweighted: torch.Tensor,
++                              topk_ids: torch.Tensor, **_: Any) -> None:
++    """Scatter-reduce per-expert ``g_j · ||f_j||_2`` into the accumulators.
++
++    ``unweighted`` is ``[n_tok, top_k, hidden]`` bf16 (a slice of the
++    persistent buffer in the Triton kernel); must be cloned immediately
++    because the buffer is overwritten by the next forward.
++    """
++    if not _CAPTURE_REAP_SCORES:
++        return
++
++    tw = _ROUTER_WEIGHTS_STASH.get(layer_idx)
++    if tw is None:
++        log.warning(
++            "calibration_reap_scores: expert_out_unweighted at layer %d "
++            "without a preceding router dispatch (stash miss); skipping.",
++            layer_idx,
++        )
++        return
++
++    rank = _LAYER_ID_TO_RANK.get(layer_idx)
++    if rank is None:
++        # Layer wasn't discovered at setup; allocate lazily.
++        rank = len(_LAYER_ID_TO_RANK)
++        _LAYER_ID_TO_RANK[layer_idx] = rank
++        global _N_LAYERS, _N_EXPERTS
++        _N_LAYERS = max(_N_LAYERS, rank + 1)
++        _N_EXPERTS = max(_N_EXPERTS, int(topk_ids.max().item()) + 1)
++        _REAP_SCORE_ACCUM[rank] = torch.zeros(_N_EXPERTS, dtype=torch.float32)
++        _REAP_TOKEN_COUNTS[rank] = torch.zeros(_N_EXPERTS, dtype=torch.int64)
++
++    # Move to CPU + float32 for the math.
++    uw = unweighted.detach().cpu().to(torch.float32)   # [n_tok, top_k, hidden]
++    norms = uw.norm(dim=-1)                             # [n_tok, top_k]
++    tw_cpu = tw[:uw.shape[0], :uw.shape[1]]             # trim if mismatched
++    contrib = (tw_cpu * norms).reshape(-1)              # [n_tok * top_k]
++    ids = topk_ids.detach().cpu().to(torch.int64).reshape(-1)
++
++    score_accum = _REAP_SCORE_ACCUM[rank]
++    count_accum = _REAP_TOKEN_COUNTS[rank]
++    score_accum.scatter_add_(0, ids, contrib)
++    count_accum.scatter_add_(0, ids, torch.ones_like(ids, dtype=torch.int64))
++
++
++def dump_reap_scores(jsonl_path: Path) -> None:
++    """Normalize and write the final S_j sidecar via the Item-0 helper."""
++    if not _CAPTURE_REAP_SCORES:
++        return
++
++    # Import here (not at module top) so the dependency is lazy.
++    from moe_compress.utils.cached_calibration_signals import (
++        Stage2ReapPayload, save_reap_scores, SCHEMA_VERSIONS,
++    )
++
++    if _N_LAYERS == 0 or _N_EXPERTS == 0:
++        log.warning(
++            "calibration_reap_scores: no MoE layers seen; skipping dump."
++        )
++        return
++
++    score_rows = []
++    count_rows = []
++    for rank in range(_N_LAYERS):
++        scores = _REAP_SCORE_ACCUM.get(rank)
++        counts = _REAP_TOKEN_COUNTS.get(rank)
++        if scores is None or counts is None:
++            score_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.float32))
++            count_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.int64))
++            continue
++        safe = counts.clamp(min=1).to(torch.float32)
++        score_rows.append(scores / safe)
++        count_rows.append(counts)
++    reap_scores = torch.stack(score_rows)
++    token_counts = torch.stack(count_rows)
++
++    payload = Stage2ReapPayload(
++        schema_version=SCHEMA_VERSIONS["reap_scores"],
++        n_experts=_N_EXPERTS,
++        n_layers=_N_LAYERS,
++        reap_scores=reap_scores,
++        token_counts=token_counts,
++    )
++    save_reap_scores(payload, Path(jsonl_path))
++    log.info(
++        "calibration_reap_scores: wrote %d-layer × %d-expert sidecar "
++        "next to %s", _N_LAYERS, _N_EXPERTS, jsonl_path,
++    )
++
++
++def dump_reap_scores_checkpoint(ckpt_path: str) -> None:
++    """Atomic checkpoint of raw accumulator state for resume."""
++    if not _CAPTURE_REAP_SCORES:
++        return
++    payload = {
++        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
++        "n_prompts_accumulated": _n_prompts_accumulated,
++        "n_layers": _N_LAYERS,
++        "n_experts": _N_EXPERTS,
++        "layer_id_to_rank": dict(_LAYER_ID_TO_RANK),
++        "score_accum": {r: v.clone() for r, v in _REAP_SCORE_ACCUM.items()},
++        "token_counts": {r: v.clone() for r, v in _REAP_TOKEN_COUNTS.items()},
++    }
++    tmp = ckpt_path + ".tmp"
++    torch.save(payload, tmp)
++    os.replace(tmp, ckpt_path)
++
++
++def load_reap_scores_checkpoint(ckpt_path: str) -> int:
++    """Hydrate accumulators from a previous run's checkpoint. Returns
++    n_prompts_accumulated; 0 if file missing."""
++    global _N_LAYERS, _N_EXPERTS, _n_prompts_accumulated
++    if not os.path.exists(ckpt_path):
++        return 0
++    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
++    schema = int(payload.get("schema_version", 0))
++    if schema != _CHECKPOINT_SCHEMA_VERSION:
++        raise ValueError(
++            f"calibration_reap_scores: checkpoint at {ckpt_path} has "
++            f"schema_version={schema}, expected {_CHECKPOINT_SCHEMA_VERSION}. "
++            f"Delete the checkpoint to restart from scratch."
++        )
++    _n_prompts_accumulated = int(payload["n_prompts_accumulated"])
++    _N_LAYERS = int(payload["n_layers"])
++    _N_EXPERTS = int(payload["n_experts"])
++    _LAYER_ID_TO_RANK.clear()
++    _LAYER_ID_TO_RANK.update({int(k): int(v) for k, v in payload.get(
++        "layer_id_to_rank", {}).items()})
++    _REAP_SCORE_ACCUM.clear()
++    _REAP_TOKEN_COUNTS.clear()
++    for r, t in payload.get("score_accum", {}).items():
++        _REAP_SCORE_ACCUM[int(r)] = t.to(torch.float32).clone()
++    for r, t in payload.get("token_counts", {}).items():
++        _REAP_TOKEN_COUNTS[int(r)] = t.to(torch.int64).clone()
++    return _n_prompts_accumulated
 diff --git a/vllm/envs.py b/vllm/envs.py
 index ded474d..9f54b96 100755
 --- a/vllm/envs.py

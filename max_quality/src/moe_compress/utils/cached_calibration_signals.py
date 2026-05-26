@@ -83,6 +83,7 @@ SCHEMA_VERSIONS: dict[str, int] = {
     "router_kd_logits": 1,
     "block_hidden":     1,
     "teacher_eval":     1,
+    "reap_scores":      1,
 }
 
 
@@ -135,6 +136,28 @@ class Stage2ProfilePayload:
     a_gate_up: torch.Tensor               # [n_layers, n_experts, intermediate_dim] float32
     a_down: torch.Tensor                  # [n_layers, n_experts, hidden_dim] float32
     token_counts: torch.Tensor            # [n_layers, n_experts] int64
+
+
+@dataclass
+class Stage2ReapPayload:
+    """REAP per-(layer, expert) saliency scores from a calibration run.
+
+    S_j = (1/|X_j|) · Σ g_j(x) · ‖f_j(x)‖₂  (REAP Eq. 9, arXiv:2510.13999).
+
+    Written by the calibration writer at run end (via
+    ``vllm.calibration_reap_scores.dump_reap_scores``); consumed by
+    Stage 2's ``Stage2ReapScoresCacheProvider`` to skip the live
+    per-layer REAP-scoring forward pass.
+
+    Indexing convention: ``reap_scores[layer_rank, expert_id]`` where
+    ``layer_rank`` is the 0-based index into the ordered MoE layer
+    list (same ordering as ``iter_moe_layers``).
+    """
+    schema_version: int
+    n_experts: int
+    n_layers: int
+    reap_scores: torch.Tensor    # [n_layers, n_experts] float32 — S_j
+    token_counts: torch.Tensor   # [n_layers, n_experts] int64 — |X_j|
 
 
 @dataclass
@@ -258,6 +281,39 @@ def load_stage2_profile(jsonl_path: Path) -> Stage2ProfilePayload | None:
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("stage2_profile", loaded.schema_version, path)
     return loaded
+
+
+# ---------------------------------------------------------------------------
+# Signal 2b: reap_scores (Stage 2 REAP saliency per (layer, expert)).
+# ---------------------------------------------------------------------------
+def save_reap_scores(payload: Stage2ReapPayload, jsonl_path: Path) -> None:
+    """Atomically write the Stage 2 REAP-scores sidecar.
+
+    Tensors are moved to CPU before serialization so the sidecar is
+    device-agnostic (H200 → RTX 6000 Pro round-trip is supported).
+    """
+    cpu_payload = Stage2ReapPayload(
+        schema_version=payload.schema_version,
+        n_experts=payload.n_experts,
+        n_layers=payload.n_layers,
+        reap_scores=payload.reap_scores.detach().to("cpu", dtype=torch.float32),
+        token_counts=payload.token_counts.detach().to("cpu", dtype=torch.int64),
+    )
+    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "reap_scores"))
+
+
+def load_reap_scores(jsonl_path: Path) -> Stage2ReapPayload | None:
+    """Load the Stage 2 REAP-scores sidecar.
+
+    Returns None if the sidecar does not exist (cache miss). Raises
+    ValueError on schema_version mismatch with an actionable message.
+    """
+    path = sidecar_path(jsonl_path, "reap_scores")
+    if not path.exists():
+        return None
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    _check_schema("reap_scores", payload.schema_version, path)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +467,7 @@ __all__ = [
     "router_kd_logits_dir",
     "PhaseBPayload",
     "Stage2ProfilePayload",
+    "Stage2ReapPayload",
     "CovariancePayload",
     "RouterKDLogitsPayload",
     "BlockHiddenPayload",
@@ -419,6 +476,8 @@ __all__ = [
     "load_phase_b",
     "save_stage2_profile",
     "load_stage2_profile",
+    "save_reap_scores",
+    "load_reap_scores",
     "save_covariance",
     "load_covariance",
     "save_router_kd_logits",

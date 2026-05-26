@@ -123,6 +123,7 @@ legacy names for dashboard back-compat.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -173,6 +174,14 @@ class ReapScoringPlugin:
         """Create the per-layer ReapAccumulator and stash it on ctx."""
         ctx.set("reap_acc", ReapAccumulator())
 
+    def on_load(self, ctx: PipelineContext, jsonl_path: Path) -> None:
+        """Cache-miss fallthrough for the provider-pair dispatch_first chain.
+
+        The live REAP path does not load from a sidecar; this method
+        always returns None so dispatch_first falls through to other
+        providers (or no-op if none have data)."""
+        return None
+
     # ------------------------------------------------------------------
     # Phase: on_score (NEW in T7; runs between on_profile and compute_assignment)
     # ------------------------------------------------------------------
@@ -185,6 +194,11 @@ class ReapScoringPlugin:
         token count (used by `min_active_tokens` filtering and by some cost
         matrices).
         """
+        # Cache-hit guard: Stage2ReapScoresCacheProvider.on_score runs first
+        # (it is registered before this plugin) and sets scores + freq from a
+        # cached sidecar. Skip the live accumulator path on hit.
+        if ctx.has("scores"):
+            return
         layer_ref = ctx.get("layer_ref")
         layer_idx = layer_ref.layer_idx
         n_experts = layer_ref.num_routed_experts

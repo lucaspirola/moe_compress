@@ -426,6 +426,31 @@ def main() -> int:
                         "checkpointing (final-dump-only). On --resume, the "
                         "checkpoint at <jsonl>.imatrix.ckpt is hydrated "
                         "automatically if it exists.")
+    p.add_argument("--capture-reap-scores", action="store_true", default=False,
+                   help="Capture per-(layer, expert) REAP saliency scores "
+                        "(S_j = (1/|X_j|)·Σ g_j(x)·‖f_j(x)‖₂, arXiv:2510.13999 "
+                        "Eq. 9) during calibration and write a "
+                        "moe_compress-side sidecar at "
+                        "<jsonl>/sidecars/reap_scores.pt at run end. Requires "
+                        "the vLLM calibration-hooks patch "
+                        "(vllm.calibration_reap_scores). Auto-enables "
+                        "VLLM_CALIB_CAPTURE_REAP_SCORES=1, "
+                        "VLLM_CALIB_CAPTURE_ROUTER=1, "
+                        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1, AND "
+                        "VLLM_USE_FLASHINFER_MOE_FP16=0 (forces Triton MoE "
+                        "backend; FlashInfer's monolithic path does not "
+                        "expose expert_out_unweighted) BEFORE any vllm "
+                        "import. Failures during dump are logged but do NOT "
+                        "re-raise -- the JSONL is more valuable than the "
+                        "REAP sidecar.")
+    p.add_argument("--reap-scores-checkpoint-every-chunks", type=int, default=1,
+                   help="When --capture-reap-scores is set, dump a checkpoint "
+                        "(.reap_scores.ckpt) of the live REAP accumulator "
+                        "state every N chunked LLM.generate calls. Default 1 "
+                        "= checkpoint at every JSONL flush boundary. Set 0 to "
+                        "disable periodic checkpointing (final-dump-only). On "
+                        "--resume, the checkpoint at <jsonl>.reap_scores.ckpt "
+                        "is hydrated automatically if it exists.")
     args = p.parse_args()
 
     # Pre-import env gates for the imatrix path. These MUST be set before any
@@ -447,6 +472,23 @@ def main() -> int:
         log.info("--capture-imatrix: enabled VLLM_CALIB_CAPTURE_IMATRIX=1 + "
                  "VLLM_CALIB_CAPTURE_EXPERT=1 + "
                  "VLLM_CALIB_CAPTURE_EXPERT_MID=1 "
+                 "(must precede vllm import)")
+
+    # Pre-import env gates for the REAP-scores path. Same strict-string
+    # rule as imatrix: vllm.calibration_hooks samples these once at
+    # module import. Forces the Triton MoE backend because the
+    # expert_out_unweighted hook is NOT available on FlashInfer's
+    # monolithic path (MoERunner asserts at model load).
+    if args.capture_reap_scores:
+        os.environ["VLLM_CALIB_CAPTURE_REAP_SCORES"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_ROUTER"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED"] = "1"
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
+        log.info("--capture-reap-scores: enabled "
+                 "VLLM_CALIB_CAPTURE_REAP_SCORES=1 + "
+                 "VLLM_CALIB_CAPTURE_ROUTER=1 + "
+                 "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
+                 "VLLM_USE_FLASHINFER_MOE_FP16=0 "
                  "(must precede vllm import)")
 
     # --- cache_key + paths ----------------------------------------------
@@ -615,6 +657,42 @@ def main() -> int:
                 )
                 imatrix_ckpt_path.unlink()
 
+    # --- REAP-scores accumulator setup (pre-CUDA-graph) -----------------
+    # Mirrors the imatrix block: setup() pre-allocates per-(layer, expert)
+    # CPU accumulators so the router + expert_out_unweighted callbacks
+    # have somewhere to land. Resume: hydrate the checkpoint that sits
+    # next to the JSONL at <jsonl>.reap_scores.ckpt.
+    if args.capture_reap_scores:
+        import vllm.calibration_reap_scores as _reap  # type: ignore
+        _reap.setup(llm)
+        log.info("reap-scores: setup complete -- accumulators pre-allocated")
+
+        reap_ckpt_path = out_path.with_suffix(".reap_scores.ckpt")
+        if args.resume and reap_ckpt_path.exists():
+            try:
+                loaded_prompts = _reap.load_reap_scores_checkpoint(
+                    str(reap_ckpt_path),
+                )
+                if loaded_prompts != already_done:
+                    log.warning(
+                        "reap-scores: checkpoint has %d prompts but JSONL "
+                        "has %d rows -- proceeding with the cumulative "
+                        "counter from the checkpoint.",
+                        loaded_prompts, already_done,
+                    )
+                else:
+                    log.info(
+                        "reap-scores: hydrated %d-prompt checkpoint from %s",
+                        loaded_prompts, reap_ckpt_path,
+                    )
+            except ValueError as exc:
+                log.error(
+                    "reap-scores: checkpoint schema mismatch (%s); deleting "
+                    "stale checkpoint and starting accumulators from zero.",
+                    exc,
+                )
+                reap_ckpt_path.unlink()
+
     # --- sampling params ------------------------------------------------
     from vllm import SamplingParams  # type: ignore
     # vLLM's reasoning_budget is exposed via `extra_args` (PR #20859 path).
@@ -705,6 +783,26 @@ def main() -> int:
                             exc, exc_info=True,
                         )
 
+            # Periodic REAP-scores checkpoint -- mirrors imatrix cadence.
+            if (args.capture_reap_scores
+                    and args.reap_scores_checkpoint_every_chunks > 0):
+                chunk_idx = chunk_start // args.chunk_size
+                every = args.reap_scores_checkpoint_every_chunks
+                if (chunk_idx + 1) % every == 0:
+                    try:
+                        import vllm.calibration_reap_scores as _reap  # type: ignore
+                        _reap.set_n_prompts_accumulated(already_done + n_new)
+                        _reap.dump_reap_scores_checkpoint(str(reap_ckpt_path))
+                        log.info(
+                            "reap-scores: checkpointed %d prompts -> %s",
+                            already_done + n_new, reap_ckpt_path,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "reap-scores checkpoint failed: %s",
+                            exc, exc_info=True,
+                        )
+
     # --- imatrix dump ---------------------------------------------------
     # Run BEFORE the JSONL finalize so a failure here can't corrupt the
     # rename, but in a try/except so a failure doesn't lose the JSONL.
@@ -729,6 +827,26 @@ def main() -> int:
             # Imatrix is a sidecar; cal JSONL is the primary deliverable.
             # Log and continue.
             log.error("imatrix dump failed: %s", exc, exc_info=True)
+
+    # --- REAP-scores dump ----------------------------------------------
+    # Run BEFORE the JSONL finalize so a failure here can't corrupt the
+    # rename, but in a try/except so a failure doesn't lose the JSONL.
+    if args.capture_reap_scores:
+        try:
+            import vllm.calibration_reap_scores as _reap  # type: ignore
+            # Final cumulative-counter sync.
+            _reap.set_n_prompts_accumulated(already_done + n_new)
+            _reap.dump_reap_scores(out_path)
+            log.info(
+                "reap-scores: dumped sidecar from %d prompts (next to %s)",
+                _reap.get_n_prompts_accumulated(), out_path,
+            )
+            # Periodic checkpoint served its purpose; remove it so the
+            # next clean run (without --resume) doesn't hydrate stale state.
+            if reap_ckpt_path.exists():
+                reap_ckpt_path.unlink()
+        except Exception as exc:
+            log.error("reap-scores dump failed: %s", exc, exc_info=True)
 
     # --- finalize -------------------------------------------------------
     os.replace(tmp_path, out_path)

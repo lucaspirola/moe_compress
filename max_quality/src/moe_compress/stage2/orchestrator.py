@@ -956,6 +956,7 @@ def run(
     from .plugins.ream_cost import ReamCostPrePlugin
     from .plugins.ream_cost_post import ReamCostPostPlugin
     from .plugins.reap_scoring import ReapScoringPlugin
+    from .plugins.reap_scores_cache import Stage2ReapScoresCacheProvider
     from .plugins.skip_merge_floor import SkipMergeFloorPlugin
     from .plugins.solver_auto import AutoSolverPlugin
     from .plugins.solver_greedy import GreedySolverPlugin
@@ -1048,6 +1049,14 @@ def run(
         sinkhorn_iters=sinkhorn_iters,
     )
     registry = PluginRegistry([
+        # V1+V2 (REAP-exact via vLLM hooks): cache provider runs first.
+        # ``on_load`` tries to hydrate ``ctx.reap_scores_payload`` from a
+        # sidecar produced by ``--capture-reap-scores``; on a per-layer
+        # ``on_score`` hit it populates ``scores`` + ``freq`` so the live
+        # ReapScoringPlugin.on_score (registered next) short-circuits via
+        # its ``ctx.has("scores")`` guard. On miss, this provider is a no-op
+        # and the live REAP path runs unchanged.
+        Stage2ReapScoresCacheProvider(),
         ReapScoringPlugin(),
         # S2-10: the capacity-utilization gate. Registered AFTER ReapScoringPlugin
         # and BEFORE the three cost plugins so its ``select_alignment`` slot runs
@@ -1133,6 +1142,20 @@ def run(
     ])
     plugins = registry.enabled(config)
     walk_phases(("on_run_setup",), plugins, run_ctx)
+
+    # Run-scope sidecar load (V1+V2 provider-pair). Stage2ReapScoresCacheProvider.on_load
+    # tries to read the REAP-scores sidecar; on hit, the per-layer
+    # ``on_score`` will use cached values and ReapScoringPlugin.on_load is a
+    # no-op so dispatch_first falls through to it on miss.
+    _calib_jsonl_path = None
+    _calib_source = cal.get("jsonl_path") or cal.get("source_path")
+    if _calib_source:
+        _calib_jsonl_path = Path(_calib_source)
+    if _calib_jsonl_path is not None:
+        PluginRegistry.dispatch_first(
+            plugins, "on_load", run_ctx, _calib_jsonl_path,
+        )
+
     for k, layer_ref in enumerate(moe_layers):
         if layer_ref.layer_idx in completed_layers:
             log.info(
@@ -1151,6 +1174,11 @@ def run(
         ctx.set("n_experts", layer_ref.num_routed_experts)
         ctx.set("target", target)
         ctx.set("blacklist", tuple(blacklist.get(layer_ref.layer_idx, [])))
+        # ``_layer_rank`` is the 0-based index into the ordered MoE layer
+        # list — the same indexing convention the REAP-scores cache writer
+        # uses. Stage2ReapScoresCacheProvider.on_score reads this to slice
+        # the per-layer row out of the loaded payload.
+        ctx.set("_layer_rank", k)
         # S2-5: the assignment phase is no longer a plain ``walk_phases`` slot.
         # The pre-assign phases run, then ``_run_assignment`` drives the bump
         # loop over the four fine-grained assignment slots, then the

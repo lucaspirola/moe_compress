@@ -50,14 +50,16 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply calibration hooks patch ==="
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-imatrix-resumable/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-reap-scores-writer/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected MD5: e7f9b8a1a5df7c6d857d17d289588a97 (3666 lines)
-# Adds spot-preemption resumability to imatrix capture: periodic
-# .imatrix.ckpt dump, load-on-resume, atomic .imatrix.dat writes.
-# See max_quality/patches/MANIFEST.md for the change log.
+# Expected MD5: 654c2ea84aa47b8b63d1c27f12849323 (4408 lines)
+# Adds the REAP-scores writer: per-(layer, expert) saliency-score capture
+# via the router + expert_out_unweighted hooks, with periodic
+# .reap_scores.ckpt resumability mirroring the imatrix path. Final dump
+# writes the Stage2ReapPayload sidecar consumed by
+# Stage2ReapScoresCacheProvider. See max_quality/patches/MANIFEST.md.
 git apply --check /tmp/calib.patch
 git apply /tmp/calib.patch
 echo "Applied. Status:"
@@ -186,8 +188,8 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-imatrix-resumable`)
-- Patch artifact (3666 lines, MD5 `e7f9b8a1a5df7c6d857d17d289588a97`): also uploaded to this repo as `vllm_calibration_hooks.patch`
+- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-reap-scores-writer`)
+- Patch artifact (4408 lines, MD5 `654c2ea84aa47b8b63d1c27f12849323`): also uploaded to this repo as `vllm_calibration_hooks.patch`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130

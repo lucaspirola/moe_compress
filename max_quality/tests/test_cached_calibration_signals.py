@@ -44,10 +44,12 @@ from moe_compress.utils.cached_calibration_signals import (
     PhaseBPayload,
     RouterKDLogitsPayload,
     Stage2ProfilePayload,
+    Stage2ReapPayload,
     TeacherEvalPayload,
     load_block_hidden,
     load_covariance,
     load_phase_b,
+    load_reap_scores,
     load_router_kd_logits,
     load_stage2_profile,
     load_teacher_eval,
@@ -55,6 +57,7 @@ from moe_compress.utils.cached_calibration_signals import (
     save_block_hidden,
     save_covariance,
     save_phase_b,
+    save_reap_scores,
     save_router_kd_logits,
     save_stage2_profile,
     save_teacher_eval,
@@ -223,6 +226,45 @@ def test_stage2_profile_roundtrip(tmp_path):
     # Dtype preserved across the round-trip (float64 stays float64).
     assert loaded.delta_expert.dtype == torch.float64
     assert loaded.token_counts.dtype == torch.int64
+
+
+def _make_reap_scores(n_layers: int = 2, n_experts: int = 3) -> Stage2ReapPayload:
+    return Stage2ReapPayload(
+        schema_version=SCHEMA_VERSIONS["reap_scores"],
+        n_experts=n_experts,
+        n_layers=n_layers,
+        reap_scores=torch.arange(
+            n_layers * n_experts, dtype=torch.float32
+        ).reshape(n_layers, n_experts),
+        token_counts=torch.full(
+            (n_layers, n_experts), 11, dtype=torch.int64
+        ),
+    )
+
+
+def test_reap_scores_roundtrip(tmp_path):
+    jsonl = _jsonl(tmp_path)
+    original = _make_reap_scores()
+    save_reap_scores(original, jsonl)
+
+    expected_path = sidecar_path(jsonl, "reap_scores")
+    assert expected_path.exists()
+    assert not Path(str(expected_path) + ".tmp").exists()
+
+    loaded = load_reap_scores(jsonl)
+    assert loaded is not None
+    assert loaded.schema_version == SCHEMA_VERSIONS["reap_scores"]
+    assert loaded.n_experts == original.n_experts
+    assert loaded.n_layers == original.n_layers
+    assert torch.equal(loaded.reap_scores, original.reap_scores.cpu())
+    assert torch.equal(loaded.token_counts, original.token_counts.cpu())
+    assert loaded.reap_scores.dtype == torch.float32
+    assert loaded.token_counts.dtype == torch.int64
+    assert loaded.reap_scores.device.type == "cpu"
+    assert loaded.token_counts.device.type == "cpu"
+
+    expected_path.unlink()
+    assert load_reap_scores(jsonl) is None
 
 
 def test_covariance_roundtrip(tmp_path):

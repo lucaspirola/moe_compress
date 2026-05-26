@@ -8,11 +8,11 @@ the patch (the HF Jobs build script, the README uploaded to
 
 | Field | Value |
 |---|---|
-| Immutable tag | `calib-v2-imatrix-resumable` |
+| Immutable tag | `calib-v2-reap-scores-writer` |
 | Branch (active) | `feat/calibration-v2` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch line count | **3666** |
-| Patch MD5 | **`e7f9b8a1a5df7c6d857d17d289588a97`** |
+| Patch line count | **4408** |
+| Patch MD5 | **`654c2ea84aa47b8b63d1c27f12849323`** |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -22,9 +22,9 @@ the patch (the HF Jobs build script, the README uploaded to
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: e7f9b8a1a5df7c6d857d17d289588a97
+# expect: 654c2ea84aa47b8b63d1c27f12849323
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 3666
+# expect: 4408
 
 # Re-apply against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -34,7 +34,41 @@ git apply --check /path/to/vllm_calibration_hooks.patch && echo OK
 
 ## Change log
 
-### `calib-v2-imatrix-resumable` (current)
+### `calib-v2-reap-scores-writer` (current)
+Adds the REAP-scores writer (V1+V2 of the calibration-v2 writers campaign).
+- `vllm/calibration_reap_scores.py`: new module pairing the `router` +
+  `expert_out_unweighted` source-patched hooks to accumulate per-(layer,
+  expert) `g_j · ‖f_j‖₂` contributions and per-expert token counts. Final
+  `dump_reap_scores` normalizes to `S_j = (1/|X_j|)·Σ g_j·‖f_j‖₂` (REAP
+  Eq. 9, arXiv:2510.13999) and writes the sidecar via
+  `moe_compress.utils.cached_calibration_signals.save_reap_scores`. Periodic
+  `dump_reap_scores_checkpoint` mirrors the imatrix resumability cadence;
+  `load_reap_scores_checkpoint` hydrates on `--resume`. Atomic-write
+  contract: tmp + `os.replace`, schema-versioned, CPU-resident
+  accumulators (CUDA-graph-safe).
+- `tests/test_calibration_reap_scores_smoke.py`: +6 tests covering
+  accumulator math, env-off short-circuit, checkpoint round-trip,
+  two-segment additivity, router-stash-miss guard, and dump
+  normalization.
+
+Driver-side companion (`build_self_traces_calib_vllm.py`): new flags
+`--capture-reap-scores` + `--reap-scores-checkpoint-every-chunks`,
+parallel env-gating block (`VLLM_CALIB_CAPTURE_REAP_SCORES=1`,
+`VLLM_CALIB_CAPTURE_ROUTER=1`, `VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1`,
+`VLLM_USE_FLASHINFER_MOE_FP16=0`), post-`_load_teacher_vllm` setup +
+resume hydration, periodic in-loop checkpoint, and final dump that
+removes the now-stale ckpt.
+
+Stage 2 reader-side companion: `Stage2ReapScoresCacheProvider`
+(`max_quality/src/moe_compress/stage2/plugins/reap_scores_cache.py`)
+registered as the FIRST plugin in `PluginRegistry`, BEFORE
+`ReapScoringPlugin`. Its `on_load` hydrates `ctx.reap_scores_payload`
+from the sidecar; its `on_score` populates `ctx.scores` + `ctx.freq`
+from the cached row. `ReapScoringPlugin.on_score` now starts with a
+`ctx.has("scores")` early-return guard so the live REAP forward is
+skipped on a cache hit.
+
+### `calib-v2-imatrix-resumable` (previous)
 Adds spot-preemption resumability for the imatrix capture path.
 - `vllm/calibration_imatrix.py`: new public API
   - `dump_imatrix_checkpoint(path)` — atomic `.imatrix.ckpt` via tmp+rename.
@@ -81,6 +115,7 @@ infrastructure. Bump these when changing the dataclass layout in
 |---|---|---|
 | `phase_b` | 1 | initial |
 | `stage2_profile` | 1 | initial |
+| `reap_scores` | 1 | initial — V1+V2 writers campaign, REAP Eq. 9 (arXiv:2510.13999); `[n_layers, n_experts] float32` + matching `int64` counts |
 | `covariance` | 1 | initial |
 | `router_kd_logits` | 1 | initial — matches the existing .npz writer format in `build_self_traces_calib_vllm.py` |
 | `block_hidden` | 1 | initial |
