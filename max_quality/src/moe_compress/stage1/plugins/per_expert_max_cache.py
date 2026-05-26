@@ -21,6 +21,15 @@ Indexing convention: the live accumulator omits keys for experts that
 received zero tokens. This provider mirrors that by filtering out
 cells where ``per_expert_max[rank, expert_id] == 0.0`` (the writer's
 zero-fill convention for ``-inf`` zero-traffic cells).
+
+Note: This plugin is intentionally NOT in ``STAGE1_PLUGIN_MANIFEST``
+(see ``stage1/plugins/__init__.py``). It is instantiated directly by
+``stage1/orchestrator.py`` at STEP 4.5 because Stage 1's live profile
+path is an accumulator-factory + calibration-pass closure, not a
+registered plugin — there is no canonical "live provider" to fall
+through to via ``PluginRegistry.dispatch_first``. Future refactors
+that promote the calibration pass to a proper plugin should also
+register this cache provider in the manifest.
 """
 from __future__ import annotations
 
@@ -53,7 +62,14 @@ class Stage1PerExpertMaxCacheProvider(BaseCacheProvider):
     """
 
     name: str = "per_expert_max_cache"
-    paper: str | None = None
+    paper: str = (
+        "Cache provider for per-(layer, expert) max|f_j(x)|_∞. Reads "
+        "sidecars/per_expert_max.pt produced by --capture-per-expert-max. "
+        "On hit: populates ctx.max_acc with a hydrated "
+        "DownProjMaxAccumulator (zero-traffic experts excluded to match "
+        "live behavior); the live max-magnitude accumulator is skipped. "
+        "On miss: returns None; live DownProjMaxAccumulator path runs."
+    )
     config_key: str = "calibration.per_expert_max_cache"
     reads: tuple[str, ...] = ("moe_layers",)
     writes: tuple[str, ...] = ("max_acc",)

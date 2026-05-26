@@ -288,15 +288,24 @@ def run(
     # it on ``ctx.max_acc``; we then skip the live registration of
     # ``downproj_max`` (no Phase B forward needed for max-magnitude
     # collection — the other accumulators still register).
+    #
+    # Divergence from the canonical provider-pair pattern (see
+    # cached_calibration_signals.py module docstring): Stage 1 has no
+    # "live provider plugin" for per_expert_max — the live path is the
+    # ``DownProjMaxAccumulator`` factory + the ``run_calibration_pass``
+    # closure that feeds it. So we cannot use ``PluginRegistry.dispatch_first``
+    # to fall through cache → live. Instead, we instantiate the cache
+    # provider directly here; on hit it pre-populates ctx.max_acc and we
+    # drop "downproj_max" from ``needed`` to skip the live accumulator; on
+    # miss we leave ``needed`` unchanged and the live path runs at Phase B.
     _pem_cache_hit = False
     try:
-        from pathlib import Path as _Path
         from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
         cal_cfg = config["calibration"]
         _calib_source = cal_cfg.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
-        _calib_jsonl_path = _Path(_calib_source)
+        _calib_jsonl_path = Path(_calib_source)
         if not _calib_jsonl_path.is_absolute():
-            _calib_jsonl_path = _Path.cwd() / _calib_jsonl_path
+            _calib_jsonl_path = Path.cwd() / _calib_jsonl_path
         _pem_provider = Stage1PerExpertMaxCacheProvider()
         _pem_payload = _pem_provider.on_load(ctx, _calib_jsonl_path)
         if _pem_payload is not None:
