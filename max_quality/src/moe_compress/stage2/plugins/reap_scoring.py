@@ -64,16 +64,21 @@ silently absorbing it.
 Calibration deviations (SHARED — also applies to Stage 2.5 / 5)
 ---------------------------------------------------------------
 - **D11 — calibration data source**: REAP (2510.13999 §5) uses
-  c4 + evol-codealpaca. The project uses multi-domain
-  Nemotron-Cascade-2-SFT-Data with weighted subsets
-  (chat 0.56, math 0.21, science 0.11, ...). Task-aware calibration
-  better matches target deployment distribution.
+  c4 + evol-codealpaca (paper fact; immutable). The project's runtime
+  corpus is controlled entirely by ``config["calibration"]["source"]``
+  in the run YAML — it has changed over the project's life (Nemotron-
+  Cascade-2-SFT-Data → Tülu-3 SFT-mix → qwen3-pretrain-mix) and may
+  change again. Task-aware calibration better matches target deployment
+  distribution; the specific corpus and any subset weights are config-
+  driven, not baked in here.
 - **D-cal-size — calibration sequence count**: REAM 2604.04356 §5 uses
   3072 sequences × 512 tokens (1.57 M tokens); REAP 2510.13999 uses
-  1024 sequences × 2048 tokens (2.1 M tokens). The project uses
-  4000 sequences × 2048 tokens (8.19 M tokens) — 5.2× / 3.9× more
-  tokens; the longer 2048-token sequences match the deployment context
-  length.
+  1024 sequences × 2048 tokens (2.1 M tokens) (paper facts; immutable).
+  The project's sequence count and length are config-driven:
+  ``config["calibration"]["num_sequences"]`` ×
+  ``config["calibration"]["sequence_length"]`` tokens. The longer
+  sequence length matches the deployment context length; the count is
+  tunable without code changes.
 
 Routing-weight notation: REAP / REAM convention
 -----------------------------------------------
