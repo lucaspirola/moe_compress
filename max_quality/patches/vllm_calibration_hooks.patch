@@ -1,3 +1,390 @@
+diff --git a/tests/test_calibration_block_outputs_smoke.py b/tests/test_calibration_block_outputs_smoke.py
+new file mode 100644
+index 0000000..a73dd0b
+--- /dev/null
++++ b/tests/test_calibration_block_outputs_smoke.py
+@@ -0,0 +1,381 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Smoke tests for ``vllm.calibration_block_outputs``.
++
++These exercise the env-gate contract, the subset-close gate (the
++distinctive feature of the block-outputs writer relative to the other
++writers), multi-layer rank-ordering correctness, the payload shape +
++per-batch concatenation contract, checkpoint round-trip + subset-close
++preservation, and the per-layer sidecar dump.
++
++Tests:
++
++1. ``test_env_gate_off_no_op`` -- env unset → ``setup()`` and the
++   callback are no-ops (accumulators untouched).
++2. ``test_subset_close_gate`` -- calling :func:`close_subset` makes
++   subsequent dispatches a no-op even with the env on.
++3. ``test_multi_layer_rank_ordering`` -- multiple layers dispatched in
++   any order populate per-rank buckets honoring the rank table built
++   by setup().
++4. ``test_payload_shape_concat_across_batches`` -- two batches of
++   different ``n_tok`` concatenate along dim 0 into one
++   ``[n_tokens_total, hidden]`` slab per rank.
++5. ``test_checkpoint_round_trip`` -- dump → reload module →
++   load_checkpoint restores byte-identical accumulator state, the
++   subset-closed flag, and the cumulative prompt counter.
++6. ``test_dump_produces_per_layer_sidecars`` -- ``dump_block_outputs``
++   calls ``save_block_hidden`` once per populated rank with the
++   correct ``layer_idx`` keyed by ``_RANK_TO_LAYER_ID``.
++"""
++from __future__ import annotations
++
++import importlib
++import os
++import sys
++from typing import Any
++
++import torch
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _reload_bo(env: dict[str, str]) -> Any:
++    """Reload ``vllm.calibration_block_outputs`` (and hooks) with a fresh env.
++
++    Module-level ``_CAPTURE_BLOCK_OUTPUTS`` + ``_SUBSET_SIZE`` are
++    sampled at import; per-test isolation requires a fresh import.
++    """
++    sys.modules.pop("vllm.calibration_block_outputs", None)
++    sys.modules.pop("vllm.calibration_hooks", None)
++    for key in (
++        "VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS",
++        "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE",
++        "VLLM_CALIB_CAPTURE_BLOCK",
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED",
++        "VLLM_CALIB_CAPTURE_REAP_SCORES",
++        "VLLM_CALIB_CAPTURE_ROUTER",
++        "VLLM_CALIB_CAPTURE_IMATRIX",
++        "VLLM_CALIB_CAPTURE_EXPERT",
++        "VLLM_CALIB_CAPTURE_EXPERT_MID",
++        "VLLM_CALIB_CAPTURE_INPUT_COV",
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX",
++    ):
++        os.environ.pop(key, None)
++    for k, v in env.items():
++        os.environ[k] = v
++    importlib.import_module("vllm.calibration_hooks")
++    return importlib.import_module("vllm.calibration_block_outputs")
++
++
++def _seed_layer(bo: Any, layer_idx: int, rank: int, n_experts: int = 4) -> None:
++    """Manually wire up the per-layer rank table the way setup() would."""
++    bo._LAYER_ID_TO_RANK[layer_idx] = rank
++    bo._RANK_TO_LAYER_ID[rank] = layer_idx
++    if rank + 1 > bo._N_LAYERS:
++        bo._N_LAYERS = rank + 1
++    if n_experts > bo._N_EXPERTS:
++        bo._N_EXPERTS = n_experts
++
++
++# ---------------------------------------------------------------------------
++# Test 1 -- env-off short-circuit
++# ---------------------------------------------------------------------------
++
++
++def test_env_gate_off_no_op():
++    """Env unset → setup() is a no-op and the callback short-circuits
++    before touching any accumulator."""
++    bo = _reload_bo({})
++    assert bo._CAPTURE_BLOCK_OUTPUTS is False
++
++    # setup() with a stub LLM -> should not register callbacks nor
++    # populate the layer-id-to-rank table.
++    bo.setup(llm=None)
++    assert bo._ACCUM == {}
++    assert bo._LAYER_ID_TO_RANK == {}
++    assert bo._RANK_TO_LAYER_ID == {}
++
++    # Seed the rank table manually + dispatch. The internal env guard
++    # must short-circuit before any allocation.
++    _seed_layer(bo, layer_idx=3, rank=0)
++    output = torch.randn(5, 8, dtype=torch.float32)
++    bo._on_block_out(layer_idx=3, output=output)
++    assert bo._ACCUM == {}
++
++
++# ---------------------------------------------------------------------------
++# Test 2 -- subset-close gate
++# ---------------------------------------------------------------------------
++
++
++def test_subset_close_gate():
++    """``close_subset()`` flips the closed-flag; subsequent dispatches
++    no-op even with the env gate on."""
++    bo = _reload_bo({
++        "VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS": "1",
++        "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE": "4",
++        "VLLM_CALIB_CAPTURE_BLOCK": "1",
++    })
++    assert bo._SUBSET_SIZE == 4
++    assert bo._SUBSET_CLOSED is False
++
++    _seed_layer(bo, layer_idx=0, rank=0)
++    output = torch.randn(3, 8, dtype=torch.float32)
++    bo._on_block_out(layer_idx=0, output=output)
++    # First dispatch lands in the accumulator.
++    assert 0 in bo._ACCUM and len(bo._ACCUM[0]) == 1
++    assert bo._ACCUM[0][0].shape == (3, 8)
++    assert bo._ACCUM[0][0].dtype == torch.bfloat16
++
++    # Close the subset.
++    bo.close_subset()
++    assert bo._SUBSET_CLOSED is True
++
++    # Idempotency: calling close_subset twice is harmless.
++    bo.close_subset()
++    assert bo._SUBSET_CLOSED is True
++
++    # Subsequent dispatch is a no-op (rank 0's bucket size stays at 1).
++    output2 = torch.randn(2, 8, dtype=torch.float32)
++    bo._on_block_out(layer_idx=0, output=output2)
++    assert len(bo._ACCUM[0]) == 1
++
++
++# ---------------------------------------------------------------------------
++# Test 3 -- multi-layer rank ordering
++# ---------------------------------------------------------------------------
++
++
++def test_multi_layer_rank_ordering():
++    """Dispatches to multiple layer_idx values populate per-rank buckets
++    honoring the rank table built by setup()."""
++    bo = _reload_bo({
++        "VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS": "1",
++        "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE": "32",
++        "VLLM_CALIB_CAPTURE_BLOCK": "1",
++    })
++    # Layer-ids 3, 7, 11 with ranks 0, 1, 2 respectively (matches a
++    # typical MoE-only subset of a mixed dense/MoE decoder stack).
++    _seed_layer(bo, layer_idx=3, rank=0)
++    _seed_layer(bo, layer_idx=7, rank=1)
++    _seed_layer(bo, layer_idx=11, rank=2)
++
++    # Dispatch the layers OUT OF ORDER (7 → 3 → 11). The accumulator
++    # must key by RANK, not by dispatch order.
++    o7 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
++    o3 = torch.tensor([[5.0, 6.0]], dtype=torch.float32)
++    o11 = torch.tensor([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]],
++                       dtype=torch.float32)
++    bo._on_block_out(layer_idx=7, output=o7)
++    bo._on_block_out(layer_idx=3, output=o3)
++    bo._on_block_out(layer_idx=11, output=o11)
++
++    assert set(bo._ACCUM.keys()) == {0, 1, 2}
++    assert bo._ACCUM[0][0].shape == (1, 2)         # rank 0 = layer 3
++    assert bo._ACCUM[1][0].shape == (2, 2)         # rank 1 = layer 7
++    assert bo._ACCUM[2][0].shape == (3, 2)         # rank 2 = layer 11
++
++    # And the contents survive the bf16 round-trip on these small ints.
++    assert torch.equal(
++        bo._ACCUM[0][0],
++        torch.tensor([[5.0, 6.0]], dtype=torch.bfloat16),
++    )
++    assert torch.equal(
++        bo._ACCUM[1][0],
++        torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16),
++    )
++
++    # Unknown layer_idx -> RuntimeError (no lazy rank growth).
++    try:
++        bo._on_block_out(layer_idx=99, output=o3)
++        raise AssertionError("expected RuntimeError")
++    except RuntimeError as exc:
++        assert "layer_idx=99" in str(exc)
++
++
++# ---------------------------------------------------------------------------
++# Test 4 -- payload shape: concatenation across batches
++# ---------------------------------------------------------------------------
++
++
++def test_payload_shape_concat_across_batches(tmp_path, monkeypatch):
++    """Two batches of different ``n_tok`` concatenate along dim 0 into
++    one ``[n_tokens_total, hidden]`` bf16 slab per rank."""
++    bo = _reload_bo({
++        "VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS": "1",
++        "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE": "32",
++        "VLLM_CALIB_CAPTURE_BLOCK": "1",
++    })
++    _seed_layer(bo, layer_idx=5, rank=0)
++
++    batch1 = torch.randn(3, 4, dtype=torch.float32)
++    batch2 = torch.randn(7, 4, dtype=torch.float32)
++    bo._on_block_out(layer_idx=5, output=batch1)
++    bo._on_block_out(layer_idx=5, output=batch2)
++    assert len(bo._ACCUM[0]) == 2
++
++    captured = {}
++
++    def _fake_save(payload, path):
++        captured.setdefault("calls", []).append((payload, path))
++
++    import moe_compress.utils.cached_calibration_signals as ccs
++    monkeypatch.setattr(ccs, "save_block_hidden", _fake_save)
++
++    bo.set_n_prompts_accumulated(20)
++    jsonl = tmp_path / "trace.jsonl"
++    bo.dump_block_outputs(jsonl)
++
++    assert len(captured["calls"]) == 1
++    payload, _ = captured["calls"][0]
++    assert payload.schema_version == 1
++    assert payload.layer_idx == 5
++    # Subset cap is 32, accumulated 20 -> min(20, 32) = 20.
++    assert payload.n_prompts_in_subset == 20
++    assert payload.hidden_states.shape == (10, 4)
++    assert payload.hidden_states.dtype == torch.bfloat16
++
++    # First 3 rows equal batch1 (bf16 round-trip); rows 3..10 equal
++    # batch2.
++    assert torch.equal(
++        payload.hidden_states[:3],
++        batch1.to(torch.bfloat16),
++    )
++    assert torch.equal(
++        payload.hidden_states[3:],
++        batch2.to(torch.bfloat16),
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 5 -- checkpoint round-trip
++# ---------------------------------------------------------------------------
++
++
++def test_checkpoint_round_trip(tmp_path):
++    """Dump → reload module → load_checkpoint restores byte-identical state.
++
++    Validates the per-rank accumulator lists, the layer-id-to-rank
++    table, the subset-closed flag, the hidden_dim cache, and the
++    cumulative prompt counter all round-trip.
++    """
++    bo = _reload_bo({
++        "VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS": "1",
++        "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE": "8",
++        "VLLM_CALIB_CAPTURE_BLOCK": "1",
++    })
++    _seed_layer(bo, layer_idx=2, rank=0)
++    _seed_layer(bo, layer_idx=4, rank=1)
++
++    bo._on_block_out(
++        layer_idx=2,
++        output=torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32),
++    )
++    bo._on_block_out(
++        layer_idx=4,
++        output=torch.tensor([[5.0, 6.0]], dtype=torch.float32),
++    )
++    bo._on_block_out(
++        layer_idx=2,
++        output=torch.tensor([[7.0, 8.0]], dtype=torch.float32),
++    )
++    bo.set_n_prompts_accumulated(6)
++    bo.close_subset()
++
++    ckpt = str(tmp_path / "test.bo.ckpt")
++    bo.dump_block_outputs_checkpoint(ckpt)
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + ".tmp")
++
++    # Fresh module load -- accumulators must hydrate from disk.
++    bo2 = _reload_bo({
++        "VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS": "1",
++        "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE": "8",
++        "VLLM_CALIB_CAPTURE_BLOCK": "1",
++    })
++    assert bo2._ACCUM == {}                       # fresh state
++    loaded = bo2.load_block_outputs_checkpoint(ckpt)
++    assert loaded == 6
++    assert bo2.get_n_prompts_accumulated() == 6
++    assert bo2._N_LAYERS == 2
++    assert bo2._LAYER_ID_TO_RANK == {2: 0, 4: 1}
++    assert bo2._RANK_TO_LAYER_ID == {0: 2, 1: 4}
++    assert bo2._SUBSET_CLOSED is True
++    assert bo2._HIDDEN_DIM == 2
++    # Rank 0 had two batches stacked.
++    assert len(bo2._ACCUM[0]) == 2
++    assert torch.equal(
++        bo2._ACCUM[0][0],
++        torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16),
++    )
++    assert torch.equal(
++        bo2._ACCUM[0][1],
++        torch.tensor([[7.0, 8.0]], dtype=torch.bfloat16),
++    )
++    # Rank 1 had one batch.
++    assert len(bo2._ACCUM[1]) == 1
++    assert torch.equal(
++        bo2._ACCUM[1][0],
++        torch.tensor([[5.0, 6.0]], dtype=torch.bfloat16),
++    )
++
++    # The subset is closed; further dispatches are no-ops.
++    bo2._on_block_out(
++        layer_idx=2,
++        output=torch.tensor([[99.0, 99.0]], dtype=torch.float32),
++    )
++    assert len(bo2._ACCUM[0]) == 2                 # unchanged
++
++
++# ---------------------------------------------------------------------------
++# Test 6 -- per-layer sidecar dump
++# ---------------------------------------------------------------------------
++
++
++def test_dump_produces_per_layer_sidecars(tmp_path, monkeypatch):
++    """``dump_block_outputs`` calls ``save_block_hidden`` once per
++    populated rank with the matching ``layer_idx``."""
++    bo = _reload_bo({
++        "VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS": "1",
++        "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE": "16",
++        "VLLM_CALIB_CAPTURE_BLOCK": "1",
++    })
++    # 3 layers; one stays untouched. The dump should write only the
++    # two populated ranks (no zero-rows-empty stub for rank 1).
++    _seed_layer(bo, layer_idx=10, rank=0)
++    _seed_layer(bo, layer_idx=20, rank=1)
++    _seed_layer(bo, layer_idx=30, rank=2)
++
++    bo._on_block_out(layer_idx=10, output=torch.ones(2, 3, dtype=torch.float32))
++    bo._on_block_out(layer_idx=30, output=torch.full((5, 3), 4.0,
++                                                     dtype=torch.float32))
++    bo.set_n_prompts_accumulated(12)
++
++    captured: dict[int, Any] = {}
++
++    def _fake_save(payload, path):
++        captured[payload.layer_idx] = (payload, path)
++
++    import moe_compress.utils.cached_calibration_signals as ccs
++    monkeypatch.setattr(ccs, "save_block_hidden", _fake_save)
++
++    jsonl = tmp_path / "trace.jsonl"
++    bo.dump_block_outputs(jsonl)
++
++    # Only layer_idx 10 + 30 should have been written; 20 was untouched.
++    assert set(captured.keys()) == {10, 30}
++    p10, _ = captured[10]
++    assert p10.layer_idx == 10
++    assert p10.hidden_states.shape == (2, 3)
++    assert p10.n_prompts_in_subset == 12
++
++    p30, _ = captured[30]
++    assert p30.layer_idx == 30
++    assert p30.hidden_states.shape == (5, 3)
++    # All entries are 4.0 (bf16-round-tripped).
++    assert torch.all(p30.hidden_states == 4.0)
 diff --git a/tests/test_calibration_hooks_smoke.py b/tests/test_calibration_hooks_smoke.py
 new file mode 100644
 index 0000000..c93ec35
@@ -4375,6 +4762,429 @@ index 0000000..0593101
 +    assert _ch._callbacks["router"] == []
 +    assert rts._FREQ_ACCUM == {}
 +    assert rts._WEIGHT_SUM_ACCUM == {}
+diff --git a/vllm/calibration_block_outputs.py b/vllm/calibration_block_outputs.py
+new file mode 100644
+index 0000000..0ea6b21
+--- /dev/null
++++ b/vllm/calibration_block_outputs.py
+@@ -0,0 +1,417 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-MoE-block hidden-states writer for calibration-v2 (Item 7).
++
++Captures the per-MoE-block output hidden states on a **fixed N-prompt
++subset** (default 128) and writes one sidecar per layer at
++``<jsonl>/sidecars/block_hidden/layer_{idx:04d}.pt`` (schema v1, bf16
++``[n_tokens, hidden_dim]`` tensor). The downstream Stage 3 block-refine
++cache reader hydrates these as anchored teacher targets so the live
++teacher block forward can be skipped.
++
++Hook
++----
++The ``block_out`` hook is dispatched by ``Qwen3MoeSparseMoeBlock.forward``
++(both internal-router and external-gate branches) under the
++``VLLM_CALIB_CAPTURE_BLOCK`` gate. This writer subscribes a callback that
++clones the post-MoE-block hidden states (pre-residual-add) and appends them
++to a per-rank list of CPU bf16 tensors. After ``_SUBSET_SIZE`` prompts have
++been processed the driver calls :func:`close_subset` which flips
++``_SUBSET_CLOSED`` and short-circuits subsequent dispatches.
++
++Env-var gating
++--------------
++* ``VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS=1`` activates the module.
++* ``VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE`` (default 128) caps the
++  prompt-count at which :func:`close_subset` is expected to fire. The
++  module itself does NOT count prompts -- the driver owns the counter
++  and decides when to call :func:`close_subset`. Once the subset is
++  closed the dispatch fast-path early-returns.
++* Requires ``VLLM_CALIB_CAPTURE_BLOCK=1`` (the upstream hook gate).
++
++The driver (``build_self_traces_calib_vllm.py --capture-block-outputs``)
++sets BOTH env vars BEFORE the first vllm import. Strict-string rule per
++``vllm.calibration_hooks`` applies.
++
++Resumability
++------------
++``dump_block_outputs_checkpoint`` / ``load_block_outputs_checkpoint``
++serialize the entire per-rank accumulator list + the closed-flag + the
++cumulative prompt counter. Resume hydrates and continues collecting
++until ``close_subset`` fires (or the previous checkpoint already had the
++subset closed, in which case capture stays a no-op).
++
++Per-layer sidecar contract
++--------------------------
++At dump time, for each layer rank we concatenate the per-batch tensors
++along dim 0 into a single ``[n_tokens, hidden_dim]`` bf16 tensor and
++write it via ``moe_compress.utils.cached_calibration_signals.save_block_hidden``
++to ``<jsonl_path.parent>/sidecars/block_hidden/layer_{layer_idx:04d}.pt``.
++The ``BlockHiddenPayload`` schema is v1 (no bump for Item 7).
++
++Storage budget
++--------------
++For Qwen3-30B-A3B (48 MoE layers, hidden=2048) at 128 prompts of average
++~2700 tokens with bf16 = 2 bytes:
++``128 × 2700 × 2048 × 48 × 2 ≈ 64 GiB`` total across sidecars. Matches
++the campaign plan's ~67 GB estimate; per-layer files average ~1.3 GiB.
++"""
++from __future__ import annotations
++
++import logging
++import os
++from pathlib import Path
++from typing import Any
++
++import torch
++
++import vllm.calibration_hooks as _ch
++
++log = logging.getLogger(__name__)
++
++__all__ = [
++    "setup",
++    "close_subset",
++    "dump_block_outputs",
++    "dump_block_outputs_checkpoint",
++    "load_block_outputs_checkpoint",
++    "get_n_prompts_accumulated",
++    "set_n_prompts_accumulated",
++]
++
++# Sampled at import time -- matches the other writer modules.
++_CAPTURE_BLOCK_OUTPUTS: bool = (
++    os.getenv("VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS", "0") == "1"
++)
++_SUBSET_SIZE: int = int(
++    os.getenv("VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE", "128")
++)
++
++# Per-rank list of CPU bf16 tensors. Each list entry is one
++# ``[n_tokens_in_batch, hidden_dim]`` slice captured by a single
++# ``block_out`` dispatch. Concatenated along dim 0 at dump time.
++_ACCUM: dict[int, list[torch.Tensor]] = {}
++
++_LAYER_ID_TO_RANK: dict[int, int] = {}
++_RANK_TO_LAYER_ID: dict[int, int] = {}
++_N_LAYERS: int = 0
++_N_EXPERTS: int = 0
++_HIDDEN_DIM: int = 0
++
++# Cumulative prompt counter mirroring the other writers. The driver
++# updates this via ``set_n_prompts_accumulated`` at chunk boundaries;
++# this module does NOT itself count prompts.
++_n_prompts_accumulated: int = 0
++
++# Once the subset is closed the dispatch fast-path early-returns. The
++# driver calls ``close_subset`` after the first ``_SUBSET_SIZE`` prompts
++# have been processed; on a resumed run the flag is restored from the
++# checkpoint via ``load_block_outputs_checkpoint``.
++_SUBSET_CLOSED: bool = False
++
++_CHECKPOINT_SCHEMA_VERSION: int = 1
++
++
++def get_n_prompts_accumulated() -> int:
++    return _n_prompts_accumulated
++
++
++def set_n_prompts_accumulated(n: int) -> None:
++    global _n_prompts_accumulated
++    if n < 0:
++        raise ValueError(f"n must be >= 0; got {n}")
++    _n_prompts_accumulated = int(n)
++
++
++def close_subset() -> None:
++    """Lock the subset: subsequent ``block_out`` dispatches are no-ops.
++
++    The driver calls this after the first ``_SUBSET_SIZE`` prompts have
++    been processed. Idempotent: calling twice is harmless. Once closed,
++    the only way to re-open the subset within the same process is via a
++    fresh module import (the test path uses this).
++    """
++    global _SUBSET_CLOSED
++    _SUBSET_CLOSED = True
++
++
++def _resolve_model(llm: Any) -> Any | None:
++    """Walk well-known attribute paths to find the live nn.Module."""
++    candidates = [
++        ("llm_engine", "model_executor", "driver_worker", "model_runner",
++         "model"),
++        ("llm_engine", "model_executor", "model_runner", "model"),
++        ("model_executor", "driver_worker", "model_runner", "model"),
++        ("model_runner", "model"),
++    ]
++    for path in candidates:
++        obj: Any = llm
++        ok = True
++        for attr in path:
++            obj = getattr(obj, attr, None)
++            if obj is None:
++                ok = False
++                break
++        if ok:
++            return obj
++    return None
++
++
++def setup(llm: Any) -> None:
++    """Discover MoE layers, register the ``block_out`` callback.
++
++    Idempotent: calling twice does not double-register (the registry
++    de-duplicates by callable identity).
++    """
++    global _N_LAYERS, _N_EXPERTS
++
++    if not _CAPTURE_BLOCK_OUTPUTS:
++        log.info("calibration_block_outputs: env gate off; no-op setup.")
++        return
++
++    model = _resolve_model(llm)
++    if model is None:
++        log.warning(
++            "calibration_block_outputs: could not resolve model from LLM; "
++            "callback will be registered but layer-rank discovery will be "
++            "skipped (rank table populated lazily would break the "
++            "cross-writer rank consistency invariant). Subscribe-and-pray."
++        )
++
++    # Discover MoE layers by attribute presence. Same ordering convention
++    # as the other writers: named_modules() + moe_layer_id sort key.
++    n_layers = 0
++    n_experts_seen: int | None = None
++    if model is not None:
++        for name, module in model.named_modules():
++            moe_layer_id = getattr(module, "moe_layer_id", None)
++            num_experts = getattr(module, "num_experts", None)
++            if not (isinstance(moe_layer_id, int)
++                    and isinstance(num_experts, int) and num_experts > 0):
++                continue
++            _LAYER_ID_TO_RANK[moe_layer_id] = n_layers
++            _RANK_TO_LAYER_ID[n_layers] = moe_layer_id
++            if n_experts_seen is None:
++                n_experts_seen = num_experts
++            elif n_experts_seen != num_experts:
++                log.warning(
++                    "calibration_block_outputs: mixed expert counts "
++                    "(%d vs first-seen %d at %s); using first.",
++                    num_experts, n_experts_seen, name,
++                )
++            n_layers += 1
++
++    _N_LAYERS = n_layers
++    _N_EXPERTS = int(n_experts_seen) if n_experts_seen is not None else 0
++
++    _ch.register_callback("block_out", _on_block_out)
++
++    log.info(
++        "calibration_block_outputs: setup complete -- %d MoE layers, "
++        "%d experts/layer, subset_size=%d; callback registered for "
++        "block_out.",
++        _N_LAYERS, _N_EXPERTS, _SUBSET_SIZE,
++    )
++
++
++def _on_block_out(layer_idx: int, output: torch.Tensor, **_: Any) -> None:
++    """Append a clone of the block output to the per-rank accumulator.
++
++    ``output`` is the post-MoE-block hidden state pre-residual-add as
++    dispatched from ``Qwen3MoeSparseMoeBlock.forward``. Shape is
++    ``[n_tok, hidden]`` (2D) per the ``block_out`` contract in
++    ``vllm.calibration_hooks``. The tensor is cloned + moved to CPU bf16
++    at callback entry so subsequent forward passes cannot mutate it.
++    """
++    global _HIDDEN_DIM
++
++    if not _CAPTURE_BLOCK_OUTPUTS:
++        return
++    if _SUBSET_CLOSED:
++        return
++
++    rank = _LAYER_ID_TO_RANK.get(layer_idx)
++    if rank is None:
++        raise RuntimeError(
++            f"calibration_block_outputs: layer_idx={layer_idx} was not "
++            f"discovered by setup() — the MoE layer must be visible via "
++            f"named_modules() with the moe_layer_id attribute set. "
++            f"Late-discovered layers would force the rank table to grow, "
++            f"breaking the cross-writer rank consistency invariant."
++        )
++
++    if output is None or output.numel() == 0:
++        return
++
++    # Clone immediately to CPU bf16. The block_out dispatch fires on a
++    # transient tensor; without the clone, the next forward through the
++    # decoder block could overwrite it.
++    t = output.detach().clone().to(device="cpu", dtype=torch.bfloat16)
++    # Block hooks may dispatch a 3D tensor ``[batch, seq, hidden]`` in
++    # some code paths; flatten to 2D so the per-layer sidecar is a
++    # uniform ``[n_tokens, hidden]`` slab regardless of upstream shape.
++    if t.dim() == 3:
++        t = t.reshape(-1, t.shape[-1])
++    elif t.dim() != 2:
++        raise RuntimeError(
++            f"calibration_block_outputs: expected 2D or 3D output tensor "
++            f"from block_out dispatch; got shape {tuple(t.shape)}"
++        )
++
++    if _HIDDEN_DIM == 0:
++        _HIDDEN_DIM = int(t.shape[-1])
++    elif _HIDDEN_DIM != int(t.shape[-1]):
++        raise RuntimeError(
++            f"calibration_block_outputs: hidden_dim mismatch -- first-seen "
++            f"{_HIDDEN_DIM} but layer_idx={layer_idx} dispatched {t.shape[-1]}"
++        )
++
++    bucket = _ACCUM.get(rank)
++    if bucket is None:
++        bucket = []
++        _ACCUM[rank] = bucket
++    bucket.append(t)
++
++
++def dump_block_outputs(jsonl_path: str | Path) -> None:
++    """Write per-layer sidecars via the Item-0 ``save_block_hidden`` helper.
++
++    For each populated rank, concatenate the per-batch tensors along
++    dim 0 into a single ``[n_tokens, hidden_dim]`` bf16 slab and write
++    one sidecar per layer at
++    ``<jsonl_parent>/sidecars/block_hidden/layer_{layer_idx:04d}.pt``.
++
++    Failures during the concatenation/save of a single layer are logged
++    but do not block the other layers.
++    """
++    if not _CAPTURE_BLOCK_OUTPUTS:
++        return
++
++    # Lazy import so the moe_compress dependency is not imposed at module
++    # import time (the dump path is only ever called by the driver).
++    from moe_compress.utils.cached_calibration_signals import (
++        BlockHiddenPayload, save_block_hidden, SCHEMA_VERSIONS,
++    )
++
++    if not _ACCUM:
++        log.warning(
++            "calibration_block_outputs: zero block_out dispatches captured; "
++            "skipping dump."
++        )
++        return
++
++    jsonl_path_obj = Path(jsonl_path)
++    n_prompts_in_subset = min(_n_prompts_accumulated, _SUBSET_SIZE)
++    n_written = 0
++    for rank in sorted(_ACCUM.keys()):
++        batches = _ACCUM[rank]
++        if not batches:
++            continue
++        layer_idx = _RANK_TO_LAYER_ID.get(rank)
++        if layer_idx is None:
++            log.error(
++                "calibration_block_outputs: rank=%d has no mapped "
++                "layer_idx in _RANK_TO_LAYER_ID -- skipping (this should "
++                "be impossible if setup() populated the rank table).",
++                rank,
++            )
++            continue
++        try:
++            hidden = torch.cat(batches, dim=0)
++            payload = BlockHiddenPayload(
++                schema_version=SCHEMA_VERSIONS["block_hidden"],
++                layer_idx=int(layer_idx),
++                n_prompts_in_subset=int(n_prompts_in_subset),
++                hidden_states=hidden,
++            )
++            save_block_hidden(payload, jsonl_path_obj)
++            n_written += 1
++        except Exception as exc:  # noqa: BLE001
++            log.error(
++                "calibration_block_outputs: failed to write sidecar for "
++                "rank=%d layer_idx=%s: %s",
++                rank, layer_idx, exc, exc_info=True,
++            )
++
++    log.info(
++        "calibration_block_outputs: wrote %d per-layer sidecars "
++        "(n_prompts_in_subset=%d) next to %s",
++        n_written, n_prompts_in_subset, jsonl_path,
++    )
++
++
++def dump_block_outputs_checkpoint(ckpt_path: str) -> None:
++    """Atomic checkpoint of raw accumulator state for resume.
++
++    Stores the per-rank accumulator list (each entry already CPU bf16),
++    the layer-id-to-rank table, the subset-closed flag, and the
++    cumulative prompt counter. Atomic-write via tmp + ``os.replace``.
++    """
++    if not _CAPTURE_BLOCK_OUTPUTS:
++        return
++    payload = {
++        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
++        "n_prompts_accumulated": _n_prompts_accumulated,
++        "n_layers": _N_LAYERS,
++        "n_experts": _N_EXPERTS,
++        "subset_size": _SUBSET_SIZE,
++        "subset_closed": _SUBSET_CLOSED,
++        "hidden_dim": _HIDDEN_DIM,
++        "layer_id_to_rank": dict(_LAYER_ID_TO_RANK),
++        "rank_to_layer_id": dict(_RANK_TO_LAYER_ID),
++        # Clone each accumulator tensor so the checkpoint snapshot is
++        # independent of any subsequent in-place changes.
++        "accum": {k: [t.clone() for t in v] for k, v in _ACCUM.items()},
++    }
++    tmp = ckpt_path + ".tmp"
++    torch.save(payload, tmp)
++    os.replace(tmp, ckpt_path)
++
++
++def load_block_outputs_checkpoint(ckpt_path: str) -> int:
++    """Hydrate accumulator state from a previous run's checkpoint.
++
++    Returns ``n_prompts_accumulated``; 0 if the file is missing. A
++    subset-size mismatch between the checkpoint and the current run
++    raises ``ValueError`` -- the two-phase subset-close math depends on a
++    consistent ``_SUBSET_SIZE`` across the full run.
++    """
++    global _N_LAYERS, _N_EXPERTS, _n_prompts_accumulated, _SUBSET_CLOSED
++    global _HIDDEN_DIM
++    if not os.path.exists(ckpt_path):
++        return 0
++    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
++    schema = int(payload.get("schema_version", 0))
++    if schema != _CHECKPOINT_SCHEMA_VERSION:
++        raise ValueError(
++            f"calibration_block_outputs: checkpoint at {ckpt_path} has "
++            f"schema_version={schema}, expected {_CHECKPOINT_SCHEMA_VERSION}. "
++            f"Delete the checkpoint to restart from scratch."
++        )
++    ckpt_subset = int(payload.get("subset_size", _SUBSET_SIZE))
++    if ckpt_subset != _SUBSET_SIZE:
++        raise ValueError(
++            f"calibration_block_outputs: checkpoint at {ckpt_path} was "
++            f"written with subset_size={ckpt_subset} but the current run is "
++            f"configured for subset_size={_SUBSET_SIZE}. The subset-close "
++            f"contract depends on a consistent size across the full run -- "
++            f"delete the checkpoint or restore the matching "
++            f"VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE."
++        )
++    _n_prompts_accumulated = int(payload["n_prompts_accumulated"])
++    _N_LAYERS = int(payload["n_layers"])
++    _N_EXPERTS = int(payload["n_experts"])
++    _HIDDEN_DIM = int(payload.get("hidden_dim", 0))
++    _SUBSET_CLOSED = bool(payload.get("subset_closed", False))
++    _LAYER_ID_TO_RANK.clear()
++    _LAYER_ID_TO_RANK.update(
++        {int(k): int(v) for k, v in payload.get("layer_id_to_rank", {}).items()}
++    )
++    _RANK_TO_LAYER_ID.clear()
++    _RANK_TO_LAYER_ID.update(
++        {int(k): int(v) for k, v in payload.get("rank_to_layer_id", {}).items()}
++    )
++    _ACCUM.clear()
++    for k, batches in payload.get("accum", {}).items():
++        _ACCUM[int(k)] = [t.clone() for t in batches]
++    return _n_prompts_accumulated
 diff --git a/vllm/calibration_hooks.py b/vllm/calibration_hooks.py
 new file mode 100644
 index 0000000..d4c8f8c
@@ -7992,10 +8802,10 @@ index 0000000..516237c
 +        _WEIGHT_SUM_ACCUM[int(r)] = t.to(torch.float32).clone()
 +    return _n_prompts_accumulated
 diff --git a/vllm/envs.py b/vllm/envs.py
-index ded474d..9380288 100755
+index ded474d..c1d8eeb 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -268,6 +268,21 @@ if TYPE_CHECKING:
+@@ -268,6 +268,23 @@ if TYPE_CHECKING:
      VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
      VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
      VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -8014,10 +8824,12 @@ index ded474d..9380288 100755
 +    VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS: bool = False
 +    VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR: bool = False
 +    VLLM_CALIB_OUTPUT_RESERVOIR_CAP: int = 256
++    VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS: bool = False
++    VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE: int = 128
  
  
  def get_default_cache_root():
-@@ -1788,6 +1803,154 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1788,6 +1805,177 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
          int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
      ),
@@ -8168,6 +8980,29 @@ index ded474d..9380288 100755
 +    # ``VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR=1``.
 +    "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": lambda: int(
 +        os.getenv("VLLM_CALIB_OUTPUT_RESERVOIR_CAP", "256")
++    ),
++    # Enables the per-MoE-block hidden-states writer (Item 7 of the
++    # calibration-v2 writers campaign). Activates
++    # ``vllm.calibration_block_outputs`` which subscribes a callback to
++    # the existing ``block_out`` hook (dispatched from
++    # ``Qwen3MoeSparseMoeBlock.forward``). REQUIRES the upstream gate
++    # ``VLLM_CALIB_CAPTURE_BLOCK=1`` so the hook fires; the driver
++    # (``build_self_traces_calib_vllm.py --capture-block-outputs``) sets
++    # both. Output: per-layer sidecars at
++    # ``<jsonl>/sidecars/block_hidden/layer_{idx:04d}.pt`` (schema v1,
++    # ``[n_tokens, hidden]`` bf16 tensor + ``layer_idx`` +
++    # ``n_prompts_in_subset``). Default off.
++    "VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS": lambda: bool(
++        int(os.getenv("VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS", "0"))
++    ),
++    # Prompt-count cap for the block-outputs subset. After this many
++    # prompts have been processed, the driver calls
++    # ``vllm.calibration_block_outputs.close_subset()`` to lock the
++    # accumulators (subsequent ``block_out`` dispatches become no-ops).
++    # Default 128 mirrors the calibration-v2 plan's documented subset.
++    # Only consulted when ``VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS=1``.
++    "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE": lambda: int(
++        os.getenv("VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE", "128")
 +    ),
  }
  

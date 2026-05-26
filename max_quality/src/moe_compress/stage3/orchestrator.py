@@ -57,6 +57,7 @@ from ..utils.model_io import (
 from ..utils.trackio_log import trackio_log as _trackio_log
 
 from .plugins.aa_svd_factor import AaSvdFactorPlugin, _cov_lookup
+from .plugins.block_hidden_cache import Stage3BlockHiddenCacheProvider
 from .plugins.block_refine import BlockRefinePlugin
 from .plugins.covariance_collection import (
     CovarianceCollectionPlugin,
@@ -228,6 +229,7 @@ def run(
     # introspectable + parity with the Stage 2 / Stage 4 wiring.
     registry = PluginRegistry([
         Stage3InputCovCacheProvider(),
+        Stage3BlockHiddenCacheProvider(),
         CovarianceCollectionPlugin(),
         DRankAllocatePlugin(),
         SwiftSvdAlphaPlugin(),
@@ -540,6 +542,42 @@ def run(
     # AdamW (fp32) on the anchored MSE objective. BlockRefinePlugin gates on
     # stage3_svd.block_refine.enabled -- when off it is not in ``plugins`` and
     # this walk is a byte-identical no-op.
+    #
+    # V2 cache-first: try the block-hidden sidecar via dispatch_first on the
+    # Stage3BlockHiddenCacheProvider. On hit, populates
+    # ``ctx.teacher_targets_cache`` so block_refine's per-layer loop can
+    # consume the cached teacher targets and skip the live teacher block
+    # forward. On miss (no sidecars or token-count mismatch), ctx is
+    # untouched and block_refine falls through to the live teacher forward.
+    # Provide_block_targets is a Stage-3-local phase name that ONLY the
+    # block-hidden cache provider implements; the registry's
+    # ``dispatch_first`` returns the first non-None payload winner.
+    if bool(s3.get("block_refine", {}).get("enabled", False)):
+        try:
+            from pathlib import Path as _Path
+            from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
+            _cal_source = cal.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
+            _cal_jsonl_path = _Path(_cal_source)
+            if not _cal_jsonl_path.is_absolute():
+                _cal_jsonl_path = _Path.cwd() / _cal_jsonl_path
+            _bh_providers = [Stage3BlockHiddenCacheProvider()]
+            PluginRegistry.dispatch_first(
+                _bh_providers, "on_load", run_ctx, _cal_jsonl_path,
+            )
+            if run_ctx.has("teacher_targets_cache"):
+                log.info(
+                    "Stage 3: block-hidden cache HIT "
+                    "(%d layers) -- block_refine will skip the live "
+                    "teacher block forward",
+                    len(run_ctx.get("teacher_targets_cache")),
+                )
+        except (FileNotFoundError, OSError) as _exc:
+            log.warning(
+                "Stage 3: block-hidden cache lookup failed (%s) -- "
+                "block_refine will fall through to the live teacher "
+                "block forward.", _exc,
+            )
+
     walk_phases(("refine_blocks",), plugins, run_ctx)
 
     # Free teacher after Phase C.5 (or after factoring if C.5 disabled and the

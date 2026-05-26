@@ -603,6 +603,52 @@ def main() -> int:
                         "the checkpoint at "
                         "<jsonl>.output_reservoir.ckpt is hydrated "
                         "automatically if it exists.")
+    p.add_argument("--capture-block-outputs", action="store_true",
+                   default=False,
+                   help="Capture per-MoE-block output hidden states on a "
+                        "FIXED subset (size controlled by "
+                        "--block-outputs-subset-size, default 128) during "
+                        "calibration and write per-layer sidecars at "
+                        "<jsonl>/sidecars/block_hidden/layer_{idx:04d}.pt "
+                        "at run end (schema v1, [n_tokens, hidden] bf16 "
+                        "tensor + layer_idx + n_prompts_in_subset). Item 7 "
+                        "of the calibration-v2 writers campaign. Hydrates "
+                        "Stage 3 block_refine's teacher targets so the "
+                        "live teacher block forward can be skipped. "
+                        "Auto-enables VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS=1 + "
+                        "VLLM_CALIB_CAPTURE_BLOCK=1 + "
+                        "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE=<value> "
+                        "BEFORE any vllm import. After "
+                        "--block-outputs-subset-size prompts have been "
+                        "processed the driver calls "
+                        "vllm.calibration_block_outputs.close_subset() "
+                        "to lock the accumulators so subsequent "
+                        "block_out dispatches are no-ops. Failures "
+                        "during dump are logged but do NOT re-raise.")
+    p.add_argument("--block-outputs-subset-size", type=int, default=128,
+                   help="Number of prompts to include in the block-"
+                        "outputs subset. Matches the calibration-v2 "
+                        "campaign plan's documented 128-prompt size. "
+                        "Larger values linearly grow the on-disk per-"
+                        "layer sidecar size (e.g., Qwen3-30B-A3B at 128 "
+                        "prompts × ~2700 tokens × 48 layers × 2048 "
+                        "hidden × 2 bytes bf16 ≈ 64 GiB total). Only "
+                        "consulted when --capture-block-outputs is "
+                        "set; baked into "
+                        "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE before "
+                        "vllm import.")
+    p.add_argument("--block-outputs-checkpoint-every-chunks", type=int,
+                   default=1,
+                   help="When --capture-block-outputs is set, dump a "
+                        "checkpoint (.block_outputs.ckpt) of the live "
+                        "per-rank accumulator state every N chunked "
+                        "LLM.generate calls. Default 1 = checkpoint at "
+                        "every JSONL flush boundary. Set 0 to disable "
+                        "periodic checkpointing (final-dump-only). On "
+                        "--resume, the checkpoint at "
+                        "<jsonl>.block_outputs.ckpt is hydrated "
+                        "automatically if it exists (including the "
+                        "subset-closed flag).")
     args = p.parse_args()
 
     # Pre-import env gates for the imatrix path. These MUST be set before any
@@ -723,6 +769,27 @@ def main() -> int:
                  "VLLM_USE_FLASHINFER_MOE_FP16=0 + "
                  "VLLM_CALIB_OUTPUT_RESERVOIR_CAP=%d "
                  "(must precede vllm import)", args.output_reservoir_cap)
+
+    # Pre-import env gates for the block-outputs path. Same strict-
+    # string rule: vllm.calibration_hooks samples these once at module
+    # import. VLLM_CALIB_CAPTURE_BLOCK is REQUIRED so the block_out hook
+    # fires from Qwen3MoeSparseMoeBlock.forward. No FlashInfer
+    # restriction: the block_out hook is dispatched from the model-level
+    # forward, not from a kernel path, so it works on any MoE backend.
+    # The subset size is sampled at writer-module import alongside the
+    # gate so it must also be set BEFORE the first vllm import.
+    if args.capture_block_outputs:
+        os.environ["VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_BLOCK"] = "1"
+        os.environ["VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE"] = str(
+            args.block_outputs_subset_size
+        )
+        log.info("--capture-block-outputs: enabled "
+                 "VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS=1 + "
+                 "VLLM_CALIB_CAPTURE_BLOCK=1 + "
+                 "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE=%d "
+                 "(must precede vllm import)",
+                 args.block_outputs_subset_size)
 
     # --- cache_key + paths ----------------------------------------------
     # prev_num_prompts is folded into the prompts_source field so an extended
@@ -851,6 +918,7 @@ def main() -> int:
     rts_ckpt_path = None
     router_logits_ckpt_path = None
     or_ckpt_path = None
+    bo_ckpt_path = None
 
     # --- imatrix accumulator setup (pre-CUDA-graph) ---------------------
     # The imatrix module must pre-allocate accumulator tensors for every
@@ -1143,6 +1211,49 @@ def main() -> int:
                 )
                 or_ckpt_path.unlink()
 
+    # --- block-outputs accumulator setup (pre-CUDA-graph) ---------------
+    # Subscribes to the existing ``block_out`` hook dispatched by
+    # Qwen3MoeSparseMoeBlock.forward. The driver -- not the writer --
+    # owns the prompt counter; once ``already_done + n_new`` reaches
+    # args.block_outputs_subset_size we call close_subset() to lock the
+    # accumulators. Resume hydrates the closed-flag from the checkpoint,
+    # so a resumed run that already closed the subset stays a no-op for
+    # the rest of the JSONL.
+    if args.capture_block_outputs:
+        import vllm.calibration_block_outputs as _bo  # type: ignore
+        _bo.setup(llm)
+        log.info("block-outputs: setup complete -- "
+                 "block_out callback registered (subset_size=%d)",
+                 args.block_outputs_subset_size)
+
+        bo_ckpt_path = out_path.with_suffix(".block_outputs.ckpt")
+        if args.resume and bo_ckpt_path.exists():
+            try:
+                loaded_prompts = _bo.load_block_outputs_checkpoint(
+                    str(bo_ckpt_path),
+                )
+                if loaded_prompts != already_done:
+                    log.warning(
+                        "block-outputs: checkpoint has %d prompts but "
+                        "JSONL has %d rows -- proceeding with the "
+                        "cumulative counter from the checkpoint.",
+                        loaded_prompts, already_done,
+                    )
+                else:
+                    log.info(
+                        "block-outputs: hydrated %d-prompt checkpoint "
+                        "from %s (subset_closed=%s)",
+                        loaded_prompts, bo_ckpt_path, _bo._SUBSET_CLOSED,
+                    )
+            except ValueError as exc:
+                log.error(
+                    "block-outputs: checkpoint schema mismatch (%s); "
+                    "deleting stale checkpoint and starting accumulators "
+                    "from zero.",
+                    exc,
+                )
+                bo_ckpt_path.unlink()
+
     # --- sampling params ------------------------------------------------
     from vllm import SamplingParams  # type: ignore
     # vLLM's reasoning_budget is exposed via `extra_args` (PR #20859 path).
@@ -1206,6 +1317,28 @@ def main() -> int:
                 total_done, total_target,
                 session_elapsed, session_elapsed / max(n_new, 1),
             )
+
+            # Block-outputs subset gate. Close as soon as the cumulative
+            # prompt counter reaches the configured subset size so any
+            # later chunks no-op the block_out dispatch (saves the
+            # post-subset clone + CPU bf16 copy cost for the remaining
+            # prompts of the calibration run). Idempotent: calling
+            # close_subset() twice is a no-op.
+            if (args.capture_block_outputs
+                    and total_done >= args.block_outputs_subset_size):
+                try:
+                    import vllm.calibration_block_outputs as _bo  # type: ignore
+                    if not _bo._SUBSET_CLOSED:
+                        _bo.close_subset()
+                        log.info(
+                            "block-outputs: subset closed at %d prompts "
+                            "(>= subset_size=%d); subsequent block_out "
+                            "dispatches are no-ops.",
+                            total_done, args.block_outputs_subset_size,
+                        )
+                except Exception as exc:
+                    log.error("block-outputs close_subset failed: %s",
+                              exc, exc_info=True)
 
             # Periodic imatrix checkpoint. Same cadence as the JSONL flush
             # so a preemption between the two never leaves the checkpoint
@@ -1365,6 +1498,31 @@ def main() -> int:
                             exc, exc_info=True,
                         )
 
+            # Periodic block-outputs checkpoint -- same cadence pattern.
+            # Capture only fires until the driver calls close_subset, but
+            # the checkpoint still serializes the closed-flag so a resumed
+            # run that already closed the subset stays a no-op.
+            if (args.capture_block_outputs
+                    and args.block_outputs_checkpoint_every_chunks > 0):
+                chunk_idx = chunk_start // args.chunk_size
+                every = args.block_outputs_checkpoint_every_chunks
+                if (chunk_idx + 1) % every == 0:
+                    try:
+                        import vllm.calibration_block_outputs as _bo  # type: ignore
+                        _bo.set_n_prompts_accumulated(already_done + n_new)
+                        _bo.dump_block_outputs_checkpoint(
+                            str(bo_ckpt_path),
+                        )
+                        log.info(
+                            "block-outputs: checkpointed %d prompts -> %s",
+                            already_done + n_new, bo_ckpt_path,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "block-outputs checkpoint failed: %s",
+                            exc, exc_info=True,
+                        )
+
     # --- imatrix dump ---------------------------------------------------
     # Run BEFORE the JSONL finalize so a failure here can't corrupt the
     # rename, but in a try/except so a failure doesn't lose the JSONL.
@@ -1497,6 +1655,38 @@ def main() -> int:
         except Exception as exc:
             log.error(
                 "output-reservoir dump failed: %s", exc, exc_info=True,
+            )
+
+    # --- block-outputs dump --------------------------------------------
+    # Same try/except policy: the JSONL is the primary deliverable.
+    # close_subset() is called belt-and-braces here even though the
+    # in-loop gate above should already have fired; the subset MUST be
+    # closed before the dump so the n_prompts_in_subset field on the
+    # sidecar payload reflects the actual frozen subset count, not the
+    # (potentially larger) total accumulated.
+    if args.capture_block_outputs:
+        try:
+            import vllm.calibration_block_outputs as _bo  # type: ignore
+            _bo.set_n_prompts_accumulated(already_done + n_new)
+            if not _bo._SUBSET_CLOSED:
+                _bo.close_subset()
+                log.info(
+                    "block-outputs: subset closed pre-dump (run ended "
+                    "with %d prompts < subset_size=%d -- shipping the "
+                    "partial subset).",
+                    already_done + n_new, args.block_outputs_subset_size,
+                )
+            _bo.dump_block_outputs(out_path)
+            log.info(
+                "block-outputs: dumped per-layer sidecars from %d "
+                "prompts (next to %s)",
+                _bo.get_n_prompts_accumulated(), out_path,
+            )
+            if bo_ckpt_path is not None and bo_ckpt_path.exists():
+                bo_ckpt_path.unlink()
+        except Exception as exc:
+            log.error(
+                "block-outputs dump failed: %s", exc, exc_info=True,
             )
 
     # --- finalize -------------------------------------------------------

@@ -121,7 +121,7 @@ across all stages and asking *what would it actually consume?*
 | 1 | Teacher per-expert `Σ_in[layer][expert]` | Stage 3 `d_rank_allocate`, `swift_svd_alpha`; Stage 2 `ReamCostPostPlugin` (warm-start prior) | vLLM hook on expert `up_proj`/`gate_proj` input projection; accumulate covariance in fp32 |
 | 2 | Teacher per-expert output magnitudes (`per_expert_max`) | Stage 1 `ThreeWayAndPlugin`, `MagnitudeTopkPlugin` | vLLM hook on each expert's `down_proj` output |
 | 3 | Teacher routing freq + mean weight per (layer, expert) | Stage 2 `ReapScoringPlugin` (centroid priors); `CapacityGatePlugin` (frequency seeds); Stage 1 `SinkTokenDetectorPlugin` | vLLM hook on each MoE block's router gate output |
-| 7 | Teacher per-MoE-block output hidden states on **fixed 500-prompt subset** `(n_tokens × hidden_dim)` per layer | Stage 2.5 `merge_repair` (block MSE); Stage 3 `block_refine` (anchored objective) | vLLM hook capturing `mlp` module output pre-residual-add; sample on fixed 500-prompt subset only (size budget) |
+| 7 | Teacher per-MoE-block output hidden states on **fixed 128-prompt subset** `(n_tokens × hidden_dim)` per layer | Stage 3 `block_refine` (anchored objective). **Stage 2.5 `merge_repair` consumer SCOPE-CUT** — see note below. | vLLM hook capturing `mlp` module output pre-residual-add; sample on fixed 128-prompt subset only (size budget ~64 GiB on Qwen3-30B-A3B) |
 | 10 | Extend Stage 6 `_teacher_cache_key` to pre-populate WikiText-2 PPL, ARC-C, HellaSwag, HumanEval, MATH-500 baselines | `wikitext_ppl`, `humaneval`, `math500`, `zero_shot_lm_eval`, `teacher_provider`, Stage 6alt `bpt_metric`/`zero_shot_subset` | Run benchmark corpora through teacher at calibration time; write to existing `_teacher_cache_key` format |
 
 ### P2 (specific plugin wins)
@@ -131,6 +131,28 @@ across all stages and asking *what would it actually consume?*
 | 4 | Per-layer pre-softmax teacher router logits per batch | Stage 1 `SinkTokenDetectorPlugin` (`ROUTER_LOGITS_PER_BATCH`) | Same hook as #3 (joint capture) |
 | 5 | ~~Per-layer expert top-K + post-softmax routing weights per token~~ | **IMPLEMENTATION-REDUNDANT — NOT IMPLEMENTED (campaign decision)**. All four named consumers are already served without this data: `ReapScoringPlugin` uses its live `ReapAccumulator` (or V1+V2 REAP-scores cache); `OutputSpaceCostPlugin` recomputes `σ(x)` from `_router_routing_weights` against the live router + `layer_inputs` reservoir; `ExpertDistillPlugin` v1 drops per-token routing weights entirely (only `freq` from context is used per `D-expert-distill-mse-v1`); `MergeHealPlugin` captures I/O in-process and recomputes routing from the post-resize live router. The three active routing-weight conventions (renormalized top-K, un-renormalized masked, absent) are mutually incompatible — no single pre-baked representation serves all consumers. Per-token storage (8 GB sampled, 410 GB full) was not justified. See `tasks/calib_v2_writers_todo.md`. | — |
 | 6 | Teacher per-expert output activation reservoir `(m_e, d_out)` per `(layer, expert)` | Stage 1 `CKADistancePlugin` (warm-start `output_reservoir`) | vLLM hook on each expert's `down_proj` output, reservoir-sampling |
+
+### Scope-cut consumer notes
+
+**Item 7 — Stage 2.5 `merge_repair` cache reader: NOT IMPLEMENTED.** The
+Item 7 writer ships and is consumed by Stage 3 `block_refine` only. The
+Stage 2.5 `merge_repair` plugin captures teacher block outputs via live
+forward hooks on the teacher's `.mlp` module during the router_kd training
+loop (`router_kd/plugins/merge_repair.py::_LayerOutputCapture`), driven by
+the router_kd trainer's OWN dataloader — NOT the calibration JSONL prompts.
+Aligning the Item-7 sidecar (flat `[n_tokens, hidden]` keyed by vLLM
+calibration prompt order) with the router_kd trainer's per-batch
+`input_ids` would require all three of: (a) the trainer to switch its
+dataset to the calibration JSONL, (b) byte-identical chat-template
+rendering between the vLLM driver and the trainer, (c) deterministic batch
+shuffle order. None of these hold today, and forcing them would entangle
+router_kd's dataset selection with the calibration writer choice. The
+Stage 3 reader alone captures the high-cost win (skipping the live teacher
+block forward inside Phase C.5's `_phase_c5_block_refine`); the Stage 2.5
+side stays on its in-process live capture. Reversible: if a future
+router_kd refactor switches the trainer to the calibration JSONL with a
+deterministic order, the cache reader becomes tractable and can be added
+without a schema bump.
 
 ### Removed (no consumer in any plugin)
 

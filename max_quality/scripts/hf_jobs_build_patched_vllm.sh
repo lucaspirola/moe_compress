@@ -50,30 +50,28 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply calibration hooks patch ==="
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-output-reservoir-writer/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-block-outputs-writer/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected MD5: 423b8267b18fc8f0990cd7c9b9f24828 (8774 lines)
-# Adds the per-(layer, expert) expert-output reservoir writer (Item 6
-# of the calibration-v2 writers campaign), on top of the previous
-# router-logits-stats + routing-stats + per-expert-max + input-cov +
-# REAP-scores writers. Subscribes to the existing
-# ``expert_out_unweighted`` hook (chained alongside REAP-scores and
-# per-expert-max via the multi-callback registry; requires Triton
-# MoE backend -- FlashInfer monolithic path disabled). Per callback
-# invocation: flatten unweighted [n_tok, top_k, hidden] +
-# topk_ids[n_tok, top_k]; group rows by expert id; two-phase fill+
-# sample into per-(layer, expert) CPU reservoirs (cap configurable
-# via VLLM_CALIB_OUTPUT_RESERVOIR_CAP, default 256). Writes a dense
-# OutputReservoirPayload sidecar (schema v1,
-# [n_layers, n_experts, max_tokens, hidden] bf16 reservoir +
-# per-(layer, expert) valid_count + total_seen int64 + max_tokens
-# scalar) at run end. Consumed by Stage 1's
-# Stage1OutputReservoirCacheProvider: on hit hydrates a pre-finalized
-# ExpertOutputAccumulator into ctx.output_acc and the live Phase-B
-# per-expert reservoir-sample HookSpec is dropped from the calibration
-# registration set.
+# Expected MD5: e652bb654e3d56dac17c4c6312626a7a (9609 lines)
+# Adds the per-MoE-block hidden-states writer on a fixed N-prompt
+# subset (Item 7 of the calibration-v2 writers campaign), on top of
+# the previous output-reservoir + router-logits-stats + routing-stats
+# + per-expert-max + input-cov + REAP-scores + imatrix writers.
+# Subscribes to the existing ``block_out`` hook (dispatched from
+# Qwen3MoeSparseMoeBlock.forward under VLLM_CALIB_CAPTURE_BLOCK=1);
+# clones the post-MoE-block hidden states (pre-residual-add) to CPU
+# bf16 per-rank lists. The driver owns the cumulative prompt counter
+# and calls close_subset() once the count reaches
+# VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE (default 128); subsequent
+# block_out dispatches early-return. Writes one sidecar per layer at
+# <jsonl>/sidecars/block_hidden/layer_{idx:04d}.pt (schema v1
+# BlockHiddenPayload from Item 0, [n_tokens, hidden] bf16) at run
+# end. Consumed by Stage 3's Stage3BlockHiddenCacheProvider: on hit
+# populates ctx.teacher_targets_cache so Phase C.5 block_refine
+# skips the live teacher block forward. No FlashInfer restriction:
+# block_out fires on any MoE backend.
 # See max_quality/patches/MANIFEST.md.
 git apply --check /tmp/calib.patch
 git apply /tmp/calib.patch
@@ -203,8 +201,8 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-output-reservoir-writer`)
-- Patch artifact (8774 lines, MD5 `423b8267b18fc8f0990cd7c9b9f24828`): also uploaded to this repo as `vllm_calibration_hooks.patch`
+- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-block-outputs-writer`)
+- Patch artifact (9609 lines, MD5 `e652bb654e3d56dac17c4c6312626a7a`): also uploaded to this repo as `vllm_calibration_hooks.patch`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130

@@ -8,11 +8,11 @@ the patch (the HF Jobs build script, the README uploaded to
 
 | Field | Value |
 |---|---|
-| Immutable tag | `calib-v2-output-reservoir-writer` |
+| Immutable tag | `calib-v2-block-outputs-writer` |
 | Branch (active) | `feat/calibration-v2` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch line count | **8774** |
-| Patch MD5 | **`423b8267b18fc8f0990cd7c9b9f24828`** |
+| Patch line count | **9609** |
+| Patch MD5 | **`e652bb654e3d56dac17c4c6312626a7a`** |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -22,9 +22,9 @@ the patch (the HF Jobs build script, the README uploaded to
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: 423b8267b18fc8f0990cd7c9b9f24828
+# expect: e652bb654e3d56dac17c4c6312626a7a
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 8774
+# expect: 9609
 
 # Re-apply against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -34,7 +34,100 @@ git apply --check /path/to/vllm_calibration_hooks.patch && echo OK
 
 ## Change log
 
-### `calib-v2-output-reservoir-writer` (current)
+### `calib-v2-block-outputs-writer` (current)
+Adds the per-MoE-block hidden-states writer on a fixed N-prompt subset
+(Item 7 of the calibration-v2 writers campaign).
+- `vllm/calibration_block_outputs.py`: new module subscribing the
+  existing ``block_out`` hook (dispatched from
+  ``Qwen3MoeSparseMoeBlock.forward`` under
+  ``VLLM_CALIB_CAPTURE_BLOCK=1``) to clone the post-MoE-block hidden
+  states (pre-residual-add) into per-rank CPU bf16 accumulators. The
+  distinguishing trait of this writer is the **subset-close gate**: the
+  driver owns the cumulative prompt counter and calls
+  ``close_subset()`` once the count reaches
+  ``VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE`` (default 128); subsequent
+  ``block_out`` dispatches early-return. ``dump_block_outputs`` writes
+  ONE per-layer sidecar at
+  ``<jsonl_parent>/sidecars/block_hidden/layer_{idx:04d}.pt`` (schema v1
+  ``BlockHiddenPayload`` -- already declared by Item 0, no schema bump
+  needed) by concatenating each rank's per-batch tensors along dim 0
+  into a single ``[n_tokens, hidden]`` bf16 slab.
+  ``dump_block_outputs_checkpoint`` /
+  ``load_block_outputs_checkpoint`` mirror the
+  imatrix / REAP / input-cov / per-expert-max / routing-stats /
+  router-logits-stats / output-reservoir resumability cadence (atomic
+  tmp+rename, schema-versioned, CPU-resident accumulators ->
+  CUDA-graph-safe). Subset size is sampled at module import from
+  ``VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE`` so the subset-close contract
+  stays consistent across a resume; a mismatch on load raises
+  ``ValueError``. The subset-closed flag itself is also serialized in
+  the checkpoint so a resumed run that already closed the subset stays
+  a no-op for the remaining JSONL. NO FlashInfer restriction: the
+  ``block_out`` hook is dispatched from the model-level forward, not
+  from a kernel path, so this writer works on any MoE backend (parallel
+  with routing-stats / router-logits-stats).
+- `vllm/envs.py`: add ``VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS`` +
+  ``VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE`` to the ``TYPE_CHECKING``
+  block and the ``environment_variables`` dispatch dict.
+- `tests/test_calibration_block_outputs_smoke.py`: +6 tests covering
+  the env-off short-circuit, the subset-close gate (idempotent +
+  no-ops subsequent dispatches), multi-layer rank ordering with
+  layer-ids dispatched out of order, payload shape + per-batch
+  concatenation along dim 0 with the bf16 dtype contract,
+  checkpoint round-trip including the subset-closed flag + hidden_dim
+  + cumulative prompt counter, and the per-layer sidecar dump path
+  (one ``save_block_hidden`` call per populated rank).
+
+Driver-side companion (`build_self_traces_calib_vllm.py`): new flags
+``--capture-block-outputs`` + ``--block-outputs-subset-size`` (default
+128) + ``--block-outputs-checkpoint-every-chunks`` (default 1),
+parallel env-gating block (``VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS=1``,
+``VLLM_CALIB_CAPTURE_BLOCK=1``,
+``VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE=<value>``), post-
+``_load_teacher_vllm`` setup + resume hydration, periodic in-loop
+checkpoint, in-loop subset-close at the JSONL flush boundary as soon
+as ``already_done + n_new >= args.block_outputs_subset_size``, and
+final dump (belt-and-braces ``close_subset()`` call right before the
+dump to lock the ``n_prompts_in_subset`` field on the payload).
+``bo_ckpt_path`` is hoisted out of the per-feature ``if`` block (same
+N1 pattern as Item 1 / Item 6).
+
+Stage 3 reader-side companion:
+``Stage3BlockHiddenCacheProvider``
+(``max_quality/src/moe_compress/stage3/plugins/block_hidden_cache.py``)
+registered in the Stage 3 orchestrator's plugin list and consulted via
+``PluginRegistry.dispatch_first("on_load", ...)`` right BEFORE the
+``walk_phases(("refine_blocks",), ...)`` call (gated on
+``stage3_svd.block_refine.enabled``). On hit the provider walks
+``sidecars/block_hidden/``, loads every ``layer_{idx:04d}.pt``,
+reshapes each ``[n_tokens, hidden]`` slab into
+``[n_prompts, seq_len, hidden]`` (inferring seq_len from ``ctx.calib``),
+and chunks into per-batch ``[batch_size, seq_len, hidden]`` bf16 CPU
+tensors (matching the live ``teacher_targets`` shape contract in
+``_phase_c5_block_refine``). The cache is populated on
+``ctx.teacher_targets_cache: dict[int, list[Tensor]]`` and threaded
+through ``BlockRefinePlugin.refine_blocks`` into the
+``_phase_c5_block_refine`` kwarg. On a layer-keyed hit with a
+shape-match the live teacher block forward is SKIPPED; on miss
+(missing sidecars dir, token-count alignment failure, batch-count
+mismatch, or per-batch shape mismatch) block_refine falls through to
+the unchanged live teacher forward with an actionable warning.
+
+Stage 2.5 `merge_repair` cache reader: **SCOPE-CUT**. The router_kd
+trainer drives `_LayerOutputCapture` via its own per-batch dataloader
+(not the calibration JSONL), and the token-map alignment between the
+flat Item-7 sidecar and the trainer's `input_ids` would require all
+three of: (a) the trainer to switch dataset to the calibration JSONL,
+(b) byte-identical chat-template rendering, (c) deterministic batch
+shuffle order. The Stage 3 reader alone captures the high-cost win
+(skipping the live teacher block forward inside Phase C.5). See
+`max_quality/docs/calibration_v2_data_capture_plan.md` "Scope-cut
+consumer notes" for the reversibility plan.
+
+Schema bump: NONE -- ``BlockHiddenPayload`` was already declared with
+``SCHEMA_VERSIONS["block_hidden"] = 1`` by Item 0.
+
+### `calib-v2-output-reservoir-writer` (previous)
 Adds the per-(layer, expert) expert-output reservoir writer
 (Item 6 of the calibration-v2 writers campaign).
 - `vllm/calibration_output_reservoir.py`: new module subscribing the

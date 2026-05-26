@@ -177,6 +177,7 @@ def _phase_c5_block_refine(
     artifacts_dir: Path,
     no_resume: bool,
     device,
+    teacher_targets_cache: "dict[int, list[torch.Tensor]] | None" = None,
 ) -> None:
     """Phase C.5 — block-level joint refinement (paper 2604.02119, Algorithm 2 §3.3).
 
@@ -445,15 +446,51 @@ def _phase_c5_block_refine(
             progress = (s - warmup_steps) / max(1, total_steps - warmup_steps + 1)
             return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
 
-        # Pre-compute teacher targets once per batch (no grad).
-        teacher_targets: list[torch.Tensor] = []
-        with torch.no_grad():
-            for bi, _ in enumerate(batches):
-                x_t = X_teacher[bi].to(device=device, dtype=student_dtype)
-                out = t_layer(x_t, **teacher_kwargs_all.get(layer_idx, {}))
-                if isinstance(out, tuple):
-                    out = out[0]
-                teacher_targets.append(out.detach().to(dtype=torch.bfloat16, device="cpu"))
+        # Pre-compute teacher targets once per batch (no grad). The V2
+        # block-hidden cache (calibration-v2 Item 7) can substitute these
+        # tensors directly, skipping the live teacher block forward
+        # entirely on a cache hit. The cache holds per-batch
+        # ``[batch_size, seq_len, hidden]`` bf16 CPU tensors with the
+        # SAME shape contract as the live path's
+        # ``out.detach().to(dtype=torch.bfloat16, device="cpu")``.
+        # Shape-mismatch on a cached entry falls through to the live
+        # path with a warning (a malformed cache must not corrupt the
+        # refinement objective).
+        teacher_targets: list[torch.Tensor] | None = None
+        if teacher_targets_cache is not None:
+            cached = teacher_targets_cache.get(int(layer_idx))
+            if cached is not None and len(cached) == len(batches):
+                expected_shape = (batch_size, calib_tensor.shape[1])
+                shape_ok = all(
+                    t.dim() == 3 and t.shape[0] == expected_shape[0]
+                    and t.shape[1] == expected_shape[1]
+                    for t in cached
+                )
+                if shape_ok:
+                    teacher_targets = cached
+                    log.info(
+                        "Stage 3 Phase C.5 layer %d: using cached teacher "
+                        "targets (%d batches; skipping live teacher block "
+                        "forward)", layer_idx, len(cached),
+                    )
+                else:
+                    log.warning(
+                        "Stage 3 Phase C.5 layer %d: cached teacher "
+                        "targets shape mismatch (expected per-batch "
+                        "[%d, %d, hidden]) -- falling through to live "
+                        "teacher forward.",
+                        layer_idx, expected_shape[0], expected_shape[1],
+                    )
+
+        if teacher_targets is None:
+            teacher_targets = []
+            with torch.no_grad():
+                for bi, _ in enumerate(batches):
+                    x_t = X_teacher[bi].to(device=device, dtype=student_dtype)
+                    out = t_layer(x_t, **teacher_kwargs_all.get(layer_idx, {}))
+                    if isinstance(out, tuple):
+                        out = out[0]
+                    teacher_targets.append(out.detach().to(dtype=torch.bfloat16, device="cpu"))
 
         # AdamW loop.
         loss_first: float | None = None
@@ -663,6 +700,14 @@ class BlockRefinePlugin:
         artifacts_dir = ctx.get("artifacts_dir")
         no_resume = ctx.get("no_resume")
         device = ctx.get("device")
+        # Optional V2 block-hidden cache populated by
+        # Stage3BlockHiddenCacheProvider via dispatch_first("on_load", ...)
+        # in the orchestrator. None on cache miss; the live teacher
+        # forward runs unchanged in that case.
+        teacher_targets_cache = (
+            ctx.get("teacher_targets_cache")
+            if ctx.has("teacher_targets_cache") else None
+        )
 
         s3 = config["stage3_svd"]
         # ---- VERBATIM Phase C.5 invocation from the monolith run() ----------
@@ -688,4 +733,5 @@ class BlockRefinePlugin:
             warmup_ratio=float(br.get("warmup_ratio", 0.1)),
             weight_decay=float(br.get("weight_decay", 0.01)),
             artifacts_dir=artifacts_dir, no_resume=no_resume, device=device,
+            teacher_targets_cache=teacher_targets_cache,
         )
