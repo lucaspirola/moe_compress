@@ -45,10 +45,22 @@ pip install --quiet torch==2.11.0 --index-url https://download.pytorch.org/whl/c
 python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.version.cuda)"
 
 echo "[$(date)] === Phase 3: install patched vLLM wheel from ${VLLM_WHEEL_REPO} ==="
-# [cli] extra pulls click + the typer-based hf CLI deps.
-pip install --quiet "huggingface_hub[cli]"
-hf download "${VLLM_WHEEL_REPO}" --include "${VLLM_WHEEL_FILE}" \
-    --local-dir /tmp/wheels --quiet
+# Use the Python API instead of the `hf` CLI -- the CLI's click/typer
+# deps are no longer transitive in huggingface_hub 1.16+, and the
+# Python API is what Phase 6 already uses for the results upload.
+pip install --quiet huggingface_hub
+mkdir -p /tmp/wheels
+python - <<PYEOF
+import os
+from huggingface_hub import hf_hub_download
+path = hf_hub_download(
+    repo_id="${VLLM_WHEEL_REPO}",
+    filename="${VLLM_WHEEL_FILE}",
+    local_dir="/tmp/wheels",
+    token=os.environ.get("HF_TOKEN"),
+)
+print(f"downloaded -> {path}")
+PYEOF
 ls -lh /tmp/wheels/
 # Install with deps so transitive vLLM requirements (xformers, ray, etc.)
 # get resolved against PyPI -- this is slower than --no-deps but correct.
