@@ -8,11 +8,11 @@ the patch (the HF Jobs build script, the README uploaded to
 
 | Field | Value |
 |---|---|
-| Immutable tag | `calib-v2-input-cov-writer-chained-callbacks` |
+| Immutable tag | `calib-v2-per-expert-max-writer` |
 | Branch (active) | `feat/calibration-v2` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch line count | **5350** |
-| Patch MD5 | **`c35dc497cd3e9268c7448410bdddf80c`** |
+| Patch line count | **6097** |
+| Patch MD5 | **`15163e64ad096eb8e1e24f961b7f3543`** |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -22,9 +22,9 @@ the patch (the HF Jobs build script, the README uploaded to
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: c35dc497cd3e9268c7448410bdddf80c
+# expect: 15163e64ad096eb8e1e24f961b7f3543
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 5350
+# expect: 6097
 
 # Re-apply against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -34,7 +34,61 @@ git apply --check /path/to/vllm_calibration_hooks.patch && echo OK
 
 ## Change log
 
-### `calib-v2-input-cov-writer-chained-callbacks` (current)
+### `calib-v2-per-expert-max-writer` (current)
+Adds the per-(layer, expert) ``down_proj`` output max-L_inf writer
+(Item 2 of the calibration-v2 writers campaign).
+- `vllm/calibration_per_expert_max.py`: new module subscribing the
+  existing ``expert_out_unweighted`` hook (chained alongside REAP-
+  scores' own subscriber via the multi-callback registry) to scatter-
+  amax per-(layer, expert) ``|f_j(x)|_inf`` into a CPU fp32 accumulator
+  initialized to ``-inf``. Token counts are scatter-added in parallel.
+  ``dump_per_expert_max`` zero-fills the ``-inf`` sentinel for zero-
+  traffic cells and writes the dense ``Stage1PerExpertMaxPayload``
+  sidecar (schema v1, shape ``[n_layers, n_experts] float32`` +
+  matching ``int64`` counts) via
+  ``moe_compress.utils.cached_calibration_signals.save_per_expert_max``.
+  ``dump_per_expert_max_checkpoint`` / ``load_per_expert_max_checkpoint``
+  mirror the imatrix / REAP / input-cov resumability cadence (atomic
+  tmp+rename, schema-versioned, CPU-resident accumulators -> CUDA-
+  graph-safe).
+- `vllm/envs.py`: add ``VLLM_CALIB_CAPTURE_PER_EXPERT_MAX`` to the
+  ``TYPE_CHECKING`` block + the ``environment_variables`` dispatch dict
+  for discoverability through ``vllm.envs``.
+- `tests/test_calibration_per_expert_max_smoke.py`: +6 tests covering
+  accumulator scatter-amax math, env-off short-circuit (setup + callback
+  both no-op), checkpoint round-trip (with ``-inf`` cells preserved),
+  two-segment additivity for the max operation, persistent-buffer clone
+  safety (post-callback mutation of ``unweighted`` does NOT corrupt the
+  accumulator), and the dump-payload shape + zero-fill contract (partial
+  accumulator with -inf cells produces a clean ``[n_layers, n_experts]``
+  payload with all -inf zero-filled).
+
+Driver-side companion (`build_self_traces_calib_vllm.py`): new flags
+``--capture-per-expert-max`` + ``--per-expert-max-checkpoint-every-chunks``,
+parallel env-gating block (``VLLM_CALIB_CAPTURE_PER_EXPERT_MAX=1``,
+``VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1``, ``VLLM_USE_FLASHINFER_MOE_FP16=0``),
+post-``_load_teacher_vllm`` setup + resume hydration, periodic in-loop
+checkpoint, and final dump that removes the now-stale ckpt. ``pem_ckpt_path``
+is hoisted out of the per-feature ``if`` block (same N1 pattern as Item 1).
+
+Stage 1 reader-side companion: ``Stage1PerExpertMaxCacheProvider``
+(``max_quality/src/moe_compress/stage1/plugins/per_expert_max_cache.py``)
+consulted by the Stage 1 orchestrator's STEP 4.5 BEFORE accumulator
+construction (STEP 5). On hit the cached payload's dense tensor is
+unpacked into a ``DownProjMaxAccumulator.per_expert_max`` dict keyed
+by ``(layer_idx, expert_id)`` (mapping rank -> layer_idx via the live
+``MoELayerRef`` list) and the accumulator is set on ``ctx.max_acc``;
+the orchestrator's ``needed`` filter drops ``downproj_max`` from the
+live registrations so the Phase B forward skips max-magnitude
+collection; the STEP 7 ``finalize`` is guarded by
+``if "downproj_max" in built:`` so a cache hit doesn't re-enter the
+live accumulator that was never constructed. Zero-traffic experts
+(cached value exactly 0.0) are omitted from the dict to match the
+live accumulator's absent-key convention.
+
+Schema bump: ``SCHEMA_VERSIONS["per_expert_max"] = 1`` (new entry).
+
+### `calib-v2-input-cov-writer-chained-callbacks` (previous)
 Review-fix follow-up to `calib-v2-input-cov-writer`. The single-slot
 callback registry in `vllm/calibration_hooks.py` silently overwrote any
 previous subscriber when a second writer registered for the same hook
@@ -198,6 +252,7 @@ infrastructure. Bump these when changing the dataclass layout in
 | `phase_b` | 1 | initial |
 | `stage2_profile` | 1 | initial |
 | `reap_scores` | 1 | initial — V1+V2 writers campaign, REAP Eq. 9 (arXiv:2510.13999); `[n_layers, n_experts] float32` + matching `int64` counts |
+| `per_expert_max` | 1 | initial — Item 2 writers campaign, Stage 1 cheap-pruning candidate-ranking signal; `[n_layers, n_experts] float32` (max of `\|f_j(x)\|_inf` over tokens routed to expert j in layer rank l, zero-filled for zero-traffic cells) + matching `int64` token counts |
 | `covariance` | 2 | Item 1 writers campaign — dict-valued payload, keys `(layer_idx, expert_idx, matrix_name)` -> fp16 `Tensor[d_in, d_in]`, byte-shape-compatible with the Stage 2 writer's `_stage2_input_covariance.pt`. v1 was never persisted by a production writer; forward-only bump. |
 | `router_kd_logits` | 1 | initial — matches the existing .npz writer format in `build_self_traces_calib_vllm.py` |
 | `block_hidden` | 1 | initial |

@@ -43,11 +43,13 @@ from moe_compress.utils.cached_calibration_signals import (
     CovariancePayload,
     PhaseBPayload,
     RouterKDLogitsPayload,
+    Stage1PerExpertMaxPayload,
     Stage2ProfilePayload,
     Stage2ReapPayload,
     TeacherEvalPayload,
     load_block_hidden,
     load_covariance,
+    load_per_expert_max,
     load_phase_b,
     load_reap_scores,
     load_router_kd_logits,
@@ -56,6 +58,7 @@ from moe_compress.utils.cached_calibration_signals import (
     router_kd_logits_dir,
     save_block_hidden,
     save_covariance,
+    save_per_expert_max,
     save_phase_b,
     save_reap_scores,
     save_router_kd_logits,
@@ -278,6 +281,45 @@ def test_reap_scores_roundtrip(tmp_path):
 
     expected_path.unlink()
     assert load_reap_scores(jsonl) is None
+
+
+def _make_per_expert_max(n_layers: int = 2, n_experts: int = 3) -> Stage1PerExpertMaxPayload:
+    return Stage1PerExpertMaxPayload(
+        schema_version=SCHEMA_VERSIONS["per_expert_max"],
+        n_experts=n_experts,
+        n_layers=n_layers,
+        per_expert_max=torch.arange(
+            n_layers * n_experts, dtype=torch.float32
+        ).reshape(n_layers, n_experts),
+        token_counts=torch.full(
+            (n_layers, n_experts), 7, dtype=torch.int64
+        ),
+    )
+
+
+def test_per_expert_max_roundtrip(tmp_path):
+    jsonl = _jsonl(tmp_path)
+    original = _make_per_expert_max()
+    save_per_expert_max(original, jsonl)
+
+    expected_path = sidecar_path(jsonl, "per_expert_max")
+    assert expected_path.exists()
+    assert not Path(str(expected_path) + ".tmp").exists()
+
+    loaded = load_per_expert_max(jsonl)
+    assert loaded is not None
+    assert loaded.schema_version == SCHEMA_VERSIONS["per_expert_max"]
+    assert loaded.n_experts == original.n_experts
+    assert loaded.n_layers == original.n_layers
+    assert torch.equal(loaded.per_expert_max, original.per_expert_max.cpu())
+    assert torch.equal(loaded.token_counts, original.token_counts.cpu())
+    assert loaded.per_expert_max.dtype == torch.float32
+    assert loaded.token_counts.dtype == torch.int64
+    assert loaded.per_expert_max.device.type == "cpu"
+    assert loaded.token_counts.device.type == "cpu"
+
+    expected_path.unlink()
+    assert load_per_expert_max(jsonl) is None
 
 
 def test_covariance_roundtrip(tmp_path):

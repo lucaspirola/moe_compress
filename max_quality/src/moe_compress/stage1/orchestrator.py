@@ -47,6 +47,7 @@ from ..utils.trackio_log import trackio_flush as _trackio_flush
 from ..utils.trackio_log import trackio_log as _trackio_log
 from .artifacts import REQUIRED_BLACKLIST_TOP_LEVEL_KEYS
 from .plugins import STAGE1_PLUGIN_MANIFEST
+from .plugins.per_expert_max_cache import Stage1PerExpertMaxCacheProvider
 
 log = logging.getLogger(__name__)
 
@@ -279,11 +280,51 @@ def run(
         if callable(setup):
             setup(ctx)
 
+    # ---- STEP 4.5: V2 cache-first attempt for per_expert_max --------------
+    # Try the calibration-v2 sidecar at
+    # ``<jsonl_dir>/sidecars/per_expert_max.pt`` BEFORE building the live
+    # DownProjMaxAccumulator. On hit, the cache provider constructs the
+    # accumulator with its ``per_expert_max`` dict pre-populated and sets
+    # it on ``ctx.max_acc``; we then skip the live registration of
+    # ``downproj_max`` (no Phase B forward needed for max-magnitude
+    # collection — the other accumulators still register).
+    _pem_cache_hit = False
+    try:
+        from pathlib import Path as _Path
+        from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
+        cal_cfg = config["calibration"]
+        _calib_source = cal_cfg.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
+        _calib_jsonl_path = _Path(_calib_source)
+        if not _calib_jsonl_path.is_absolute():
+            _calib_jsonl_path = _Path.cwd() / _calib_jsonl_path
+        _pem_provider = Stage1PerExpertMaxCacheProvider()
+        _pem_payload = _pem_provider.on_load(ctx, _calib_jsonl_path)
+        if _pem_payload is not None:
+            _pem_cache_hit = True
+            log.info(
+                "Stage 1: V2 per_expert_max cache HIT (%d layers × %d "
+                "experts) -- skipping live downproj_max registration",
+                _pem_payload.n_layers, _pem_payload.n_experts,
+            )
+    except (FileNotFoundError, OSError) as _exc:
+        # Routine filesystem misses should not block the live path.
+        # ValueError from _check_schema is NOT caught here -- a schema
+        # mismatch is an actionable user error ("Delete the sidecar to
+        # regenerate") and silently falling back would mask it.
+        log.warning("Stage 1: V2 per_expert_max cache lookup failed (%s) "
+                    "-- falling back to live downproj_max accumulator", _exc)
+
     # ---- STEP 5: build the ordered accumulator registrations --------------
     # ``registry.provides(config)`` returns the byte-identity-critical
     # accumulator order; iterating it preserves that order in the
     # registration triples handed to ``run_calibration_pass``.
     needed = registry.provides(config)   # ordered tuple
+    # On cache hit, exclude ``downproj_max`` from the live registration set
+    # -- the cache provider has already populated ``ctx.max_acc`` with the
+    # cached values. The other accumulators (output_reservoir, sink_routing,
+    # ...) still register and run their live calibration.
+    if _pem_cache_hit:
+        needed = tuple(n for n in needed if n != "downproj_max")
     registrations: list[tuple[str, object, HookSpec]] = []
     built: dict[str, object] = {}
     for acc_name in needed:
@@ -297,7 +338,10 @@ def run(
     # Publish the built accumulators onto the ctx under the slot names the
     # detector plugins read. ``sink_acc`` is already correct from setup()
     # (the factory reads it, never rebuilds it) — no orchestrator write here.
-    ctx.set("max_acc", built["downproj_max"])          # always present
+    # ``max_acc`` is set by the cache provider on hit; otherwise we publish
+    # the freshly-built live accumulator now.
+    if not _pem_cache_hit:
+        ctx.set("max_acc", built["downproj_max"])      # always present
     ctx.set("output_acc", built["output_reservoir"])   # always present
 
     # ---- STEP 6: run the calibration pass ONCE ----------------------------
@@ -326,7 +370,12 @@ def run(
     )
 
     # ---- STEP 7: finalize accumulators ------------------------------------
-    built["downproj_max"].finalize()
+    # ``downproj_max`` may be absent from ``built`` when the V2
+    # per_expert_max cache hit short-circuited its construction -- in
+    # that case ``ctx.max_acc`` was populated directly by the cache
+    # provider and there is no live accumulator to finalize.
+    if "downproj_max" in built:
+        built["downproj_max"].finalize()
     built["output_reservoir"].finalize()
     if "sink_routing" in built:
         built["sink_routing"].finalize()

@@ -2186,6 +2186,403 @@ index 0000000..c135f9f
 +    )
 +    assert torch.allclose(e0, expected_e0, atol=1e-5), f"e0={e0}"
 +    assert torch.allclose(e1, expected_e1, atol=1e-5), f"e1={e1}"
+diff --git a/tests/test_calibration_per_expert_max_smoke.py b/tests/test_calibration_per_expert_max_smoke.py
+new file mode 100644
+index 0000000..f4f9d32
+--- /dev/null
++++ b/tests/test_calibration_per_expert_max_smoke.py
+@@ -0,0 +1,391 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Smoke tests for ``vllm.calibration_per_expert_max``.
++
++These exercise the per-(layer, expert) scatter-amax accumulator, the
++env-gate contract, checkpoint round-trip + two-segment additivity, the
++persistent-buffer clone guard, and the dump-payload shape + zero-fill
++contract.
++
++Tests:
++
++1. ``test_accumulator_math_single_layer`` -- a synthetic
++   ``[3, 2, 4]`` unweighted + known ``topk_ids`` populates the per-
++   expert accumulator with the expected scatter-amax of
++   ``abs().amax(dim=-1)``.
++2. ``test_env_gate_off_no_op`` -- env unset → ``setup()`` and the
++   callback are no-ops (accumulators untouched).
++3. ``test_checkpoint_round_trip`` -- dump → reload module →
++   load_checkpoint restores byte-identical accumulator state.
++4. ``test_two_segment_additivity`` -- max over 10 tokens + checkpoint +
++   reload + max over 10 more tokens == max over 20 tokens straight.
++5. ``test_persistent_buffer_clone`` -- callback clones ``unweighted`` at
++   entry; post-callback mutation of the input does NOT change the
++   accumulator.
++6. ``test_dump_payload_shape_and_zero_fill`` -- partial accumulator
++   (rank 0 only with some -inf cells) dumped → payload has
++   ``[n_layers, n_experts]`` shape, untouched rank-1 row is all zeros
++   (not -inf), and rank-0's -inf cells are zero-filled.
++"""
++from __future__ import annotations
++
++import importlib
++import os
++import sys
++from typing import Any
++
++import torch
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _reload_pem(env: dict[str, str]) -> Any:
++    """Reload ``vllm.calibration_per_expert_max`` (and hooks) with a fresh env.
++
++    Module-level ``_CAPTURE_PER_EXPERT_MAX`` is sampled at import; per-test
++    isolation requires a fresh import.
++    """
++    sys.modules.pop("vllm.calibration_per_expert_max", None)
++    sys.modules.pop("vllm.calibration_hooks", None)
++    for key in (
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED",
++        "VLLM_CALIB_CAPTURE_REAP_SCORES",
++        "VLLM_CALIB_CAPTURE_ROUTER",
++        "VLLM_CALIB_CAPTURE_IMATRIX",
++        "VLLM_CALIB_CAPTURE_EXPERT",
++        "VLLM_CALIB_CAPTURE_BLOCK",
++        "VLLM_CALIB_CAPTURE_EXPERT_MID",
++        "VLLM_CALIB_CAPTURE_INPUT_COV",
++    ):
++        os.environ.pop(key, None)
++    for k, v in env.items():
++        os.environ[k] = v
++    importlib.import_module("vllm.calibration_hooks")
++    return importlib.import_module("vllm.calibration_per_expert_max")
++
++
++def _seed_layer(pem: Any, layer_idx: int, rank: int, n_experts: int) -> None:
++    """Manually wire up the per-layer accumulators the way setup() would."""
++    pem._LAYER_ID_TO_RANK[layer_idx] = rank
++    if rank + 1 > pem._N_LAYERS:
++        pem._N_LAYERS = rank + 1
++    if n_experts > pem._N_EXPERTS:
++        pem._N_EXPERTS = n_experts
++    pem._PEM_ACCUM[rank] = torch.full(
++        (n_experts,), float("-inf"), dtype=torch.float32,
++    )
++    pem._PEM_TOKEN_COUNTS[rank] = torch.zeros(n_experts, dtype=torch.int64)
++
++
++# ---------------------------------------------------------------------------
++# Test 1 -- accumulator math (single layer)
++# ---------------------------------------------------------------------------
++
++
++def test_accumulator_math_single_layer():
++    """Synthetic ``[3, 2, 4]`` unweighted populates the accumulator with
++    the hand-computed scatter-amax of ``abs().amax(dim=-1)``."""
++    pem = _reload_pem({
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    n_experts = 5
++    _seed_layer(pem, layer_idx=0, rank=0, n_experts=n_experts)
++
++    # 3 tokens, top_k=2, hidden=4. Token (t, k) routes to expert
++    # topk_ids[t, k]; magnitude per (t, k) is abs(uw[t, k]).amax(-1).
++    # Token 0: (e=0 magnitude=3, e=2 magnitude=-2 -> 2)
++    # Token 1: (e=1 magnitude=1, e=2 magnitude=5)   <- expert 2 takes 5
++    # Token 2: (e=0 magnitude=4, e=3 magnitude=0.5) <- expert 0 takes max(3, 4)=4
++    unweighted = torch.tensor([
++        [[ 3.0, 0.0, -1.0, 2.0],   # t0 k0 e0: amax=3
++         [ 0.0, 0.0, -2.0, 1.0]],  # t0 k1 e2: amax=2
++        [[ 1.0, 0.0,  0.0, 0.0],   # t1 k0 e1: amax=1
++         [ 5.0, 0.0,  0.0, 0.0]],  # t1 k1 e2: amax=5
++        [[ 4.0, 0.0,  0.0, 0.0],   # t2 k0 e0: amax=4
++         [ 0.5, 0.0,  0.0, 0.0]],  # t2 k1 e3: amax=0.5
++    ], dtype=torch.float32)
++    topk_ids = torch.tensor(
++        [[0, 2], [1, 2], [0, 3]], dtype=torch.int64,
++    )
++
++    pem._on_expert_out_unweighted(
++        layer_idx=0, unweighted=unweighted, topk_ids=topk_ids,
++    )
++
++    # Hand-computed scatter-amax per expert:
++    # e0: max(3, 4) = 4
++    # e1: 1
++    # e2: max(2, 5) = 5
++    # e3: 0.5
++    # e4: -inf (no traffic)
++    got = pem._PEM_ACCUM[0]
++    assert got[0].item() == 4.0
++    assert got[1].item() == 1.0
++    assert got[2].item() == 5.0
++    assert got[3].item() == 0.5
++    assert got[4].item() == float("-inf")
++
++    # Token counts: e0 sees 2 tokens, e1 1, e2 2, e3 1, e4 0.
++    expected_counts = torch.tensor([2, 1, 2, 1, 0], dtype=torch.int64)
++    assert torch.equal(pem._PEM_TOKEN_COUNTS[0], expected_counts)
++
++
++# ---------------------------------------------------------------------------
++# Test 2 -- env-off short-circuit
++# ---------------------------------------------------------------------------
++
++
++def test_env_gate_off_no_op():
++    """Env unset → setup() is a no-op, and the callback short-circuits
++    before touching any accumulator."""
++    pem = _reload_pem({})  # env cleared
++    assert pem._CAPTURE_PER_EXPERT_MAX is False
++
++    # setup() with a stub LLM -> should not register callbacks nor
++    # allocate accumulators.
++    pem.setup(llm=None)
++    assert pem._PEM_ACCUM == {}
++    assert pem._PEM_TOKEN_COUNTS == {}
++
++    # Manually seed accumulators, then call the callback. The internal
++    # env guard must short-circuit before scatter_reduce_.
++    n_experts = 3
++    _seed_layer(pem, layer_idx=0, rank=0, n_experts=n_experts)
++
++    unweighted = torch.tensor(
++        [[[1.0, 0.0], [0.0, 1.0]]], dtype=torch.float32,
++    )
++    topk_ids = torch.tensor([[0, 1]], dtype=torch.int64)
++    pem._on_expert_out_unweighted(
++        layer_idx=0, unweighted=unweighted, topk_ids=topk_ids,
++    )
++    # Accumulator still at the -inf seed value because the env guard
++    # short-circuits before scatter_reduce_.
++    assert pem._PEM_ACCUM[0][0].item() == float("-inf")
++    assert pem._PEM_ACCUM[0][1].item() == float("-inf")
++    assert torch.equal(
++        pem._PEM_TOKEN_COUNTS[0], torch.zeros(n_experts, dtype=torch.int64),
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 3 -- checkpoint round-trip
++# ---------------------------------------------------------------------------
++
++
++def test_checkpoint_round_trip(tmp_path):
++    """Dump → reload module → load_checkpoint restores byte-identical state."""
++    pem = _reload_pem({
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    n_experts = 3
++    _seed_layer(pem, layer_idx=0, rank=0, n_experts=n_experts)
++    _seed_layer(pem, layer_idx=1, rank=1, n_experts=n_experts)
++
++    pem._PEM_ACCUM[0] = torch.tensor([1.5, 2.5, float("-inf")], dtype=torch.float32)
++    pem._PEM_TOKEN_COUNTS[0] = torch.tensor([3, 5, 0], dtype=torch.int64)
++    pem._PEM_ACCUM[1] = torch.tensor([0.5, float("-inf"), 4.0], dtype=torch.float32)
++    pem._PEM_TOKEN_COUNTS[1] = torch.tensor([1, 0, 7], dtype=torch.int64)
++    pem.set_n_prompts_accumulated(42)
++
++    ckpt = str(tmp_path / "test.pem.ckpt")
++    pem.dump_per_expert_max_checkpoint(ckpt)
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + ".tmp")
++
++    # Fresh module load -- accumulators must hydrate from disk.
++    pem2 = _reload_pem({
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    assert pem2._PEM_ACCUM == {}  # fresh state
++    loaded = pem2.load_per_expert_max_checkpoint(ckpt)
++    assert loaded == 42
++    assert pem2.get_n_prompts_accumulated() == 42
++    assert pem2._N_LAYERS == 2
++    assert pem2._N_EXPERTS == n_experts
++    # -inf cells survive serialization.
++    assert pem2._PEM_ACCUM[0][0].item() == 1.5
++    assert pem2._PEM_ACCUM[0][1].item() == 2.5
++    assert pem2._PEM_ACCUM[0][2].item() == float("-inf")
++    assert torch.equal(
++        pem2._PEM_TOKEN_COUNTS[0],
++        torch.tensor([3, 5, 0], dtype=torch.int64),
++    )
++    assert pem2._PEM_ACCUM[1][0].item() == 0.5
++    assert pem2._PEM_ACCUM[1][1].item() == float("-inf")
++    assert pem2._PEM_ACCUM[1][2].item() == 4.0
++    assert torch.equal(
++        pem2._PEM_TOKEN_COUNTS[1],
++        torch.tensor([1, 0, 7], dtype=torch.int64),
++    )
++    assert pem2._LAYER_ID_TO_RANK == {0: 0, 1: 1}
++
++
++# ---------------------------------------------------------------------------
++# Test 4 -- two-segment additivity (max is idempotent over segment split)
++# ---------------------------------------------------------------------------
++
++
++def test_two_segment_additivity(tmp_path):
++    """max(10 tokens) + ckpt + reload + max(10 tokens) == max(20 tokens).
++
++    Critical for spot-preemption: a max-aggregating writer split across
++    two instance lifetimes must produce the same accumulator state as a
++    single run.
++    """
++    n_experts = 4
++    n_tokens_per = 10
++    top_k = 2
++
++    # Deterministic data.
++    torch.manual_seed(13)
++    ids_all = torch.randint(0, n_experts, (2 * n_tokens_per, top_k),
++                            dtype=torch.int64)
++    uw_all = torch.randn(2 * n_tokens_per, top_k, 5, dtype=torch.float32)
++
++    # --- single 20-token reference run ---------------------------------
++    ref = _reload_pem({
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    _seed_layer(ref, layer_idx=0, rank=0, n_experts=n_experts)
++    ref._on_expert_out_unweighted(
++        layer_idx=0, unweighted=uw_all, topk_ids=ids_all,
++    )
++    expected_max = ref._PEM_ACCUM[0].clone()
++    expected_counts = ref._PEM_TOKEN_COUNTS[0].clone()
++
++    # --- split across two segments with a checkpoint + reload ----------
++    seg = _reload_pem({
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    _seed_layer(seg, layer_idx=0, rank=0, n_experts=n_experts)
++    seg._on_expert_out_unweighted(
++        layer_idx=0,
++        unweighted=uw_all[:n_tokens_per],
++        topk_ids=ids_all[:n_tokens_per],
++    )
++    seg.set_n_prompts_accumulated(1)
++    ckpt = str(tmp_path / "twoseg.pem.ckpt")
++    seg.dump_per_expert_max_checkpoint(ckpt)
++
++    # Reload module + checkpoint -- simulates a process restart.
++    seg2 = _reload_pem({
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    seg2.load_per_expert_max_checkpoint(ckpt)
++    seg2._on_expert_out_unweighted(
++        layer_idx=0,
++        unweighted=uw_all[n_tokens_per:],
++        topk_ids=ids_all[n_tokens_per:],
++    )
++
++    assert torch.allclose(seg2._PEM_ACCUM[0], expected_max, atol=1e-6)
++    assert torch.equal(seg2._PEM_TOKEN_COUNTS[0], expected_counts)
++
++
++# ---------------------------------------------------------------------------
++# Test 5 -- persistent-buffer clone safety
++# ---------------------------------------------------------------------------
++
++
++def test_persistent_buffer_clone():
++    """Callback must clone ``unweighted`` at entry; post-callback mutation
++    of the input does NOT corrupt the accumulator."""
++    pem = _reload_pem({
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    n_experts = 3
++    _seed_layer(pem, layer_idx=0, rank=0, n_experts=n_experts)
++
++    # 1 token, top_k=1, hidden=2. Magnitude = 2.5.
++    unweighted = torch.tensor([[[1.0, -2.5]]], dtype=torch.float32)
++    topk_ids = torch.tensor([[1]], dtype=torch.int64)
++    pem._on_expert_out_unweighted(
++        layer_idx=0, unweighted=unweighted, topk_ids=topk_ids,
++    )
++    assert pem._PEM_ACCUM[0][1].item() == 2.5
++
++    # Now mutate the persistent buffer in place (simulates the Triton
++    # kernel's next forward overwriting it with huge values). The
++    # accumulator must NOT reflect the mutated contents.
++    unweighted.fill_(999.0)
++    assert pem._PEM_ACCUM[0][1].item() == 2.5
++    assert pem._PEM_ACCUM[0][0].item() == float("-inf")
++    assert pem._PEM_ACCUM[0][2].item() == float("-inf")
++
++
++# ---------------------------------------------------------------------------
++# Test 6 -- dump payload shape + zero-fill of -inf cells
++# ---------------------------------------------------------------------------
++
++
++def test_dump_payload_shape_and_zero_fill(tmp_path, monkeypatch):
++    """Partial accumulator (rank 0 only with some -inf cells) dumped →
++    payload has ``[n_layers, n_experts]`` shape; rank-1 (untouched) row
++    is all zeros; rank-0's -inf cells are zero-filled, not -inf."""
++    pem = _reload_pem({
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    n_experts = 4
++    _seed_layer(pem, layer_idx=0, rank=0, n_experts=n_experts)
++    _seed_layer(pem, layer_idx=1, rank=1, n_experts=n_experts)
++    # Only rank 0 sees any traffic; expert 1 + 3 remain at -inf.
++    pem._PEM_ACCUM[0] = torch.tensor(
++        [2.5, float("-inf"), 1.25, float("-inf")], dtype=torch.float32,
++    )
++    pem._PEM_TOKEN_COUNTS[0] = torch.tensor([4, 0, 2, 0], dtype=torch.int64)
++    # Rank 1 stays at -inf (allocated by _seed_layer above).
++
++    # Spy on save_per_expert_max to capture the payload (the dump helper
++    # imports it lazily inside the function body).
++    captured = {}
++
++    def _fake_save(payload, path):
++        captured["payload"] = payload
++        captured["path"] = path
++
++    import moe_compress.utils.cached_calibration_signals as ccs
++    monkeypatch.setattr(ccs, "save_per_expert_max", _fake_save)
++
++    jsonl = tmp_path / "trace.jsonl"
++    pem.dump_per_expert_max(jsonl)
++
++    payload = captured["payload"]
++    assert payload is not None
++    assert payload.schema_version == 1
++    assert payload.n_layers == 2
++    assert payload.n_experts == n_experts
++    # Shape is [n_layers, n_experts].
++    assert payload.per_expert_max.shape == (2, n_experts)
++    assert payload.token_counts.shape == (2, n_experts)
++    # Rank 0: -inf cells zero-filled; positive values preserved.
++    assert torch.equal(
++        payload.per_expert_max[0],
++        torch.tensor([2.5, 0.0, 1.25, 0.0], dtype=torch.float32),
++    )
++    # Rank 1: was all -inf, now all zeros (not -inf).
++    assert torch.equal(
++        payload.per_expert_max[1],
++        torch.zeros(n_experts, dtype=torch.float32),
++    )
++    # Token counts mirror the accumulators (rank 1 stays at zero).
++    assert torch.equal(
++        payload.token_counts[0],
++        torch.tensor([4, 0, 2, 0], dtype=torch.int64),
++    )
++    assert torch.equal(
++        payload.token_counts[1],
++        torch.zeros(n_experts, dtype=torch.int64),
++    )
 diff --git a/tests/test_calibration_reap_scores_smoke.py b/tests/test_calibration_reap_scores_smoke.py
 new file mode 100644
 index 0000000..b038437
@@ -4307,6 +4704,340 @@ index 0000000..adff069
 +        nk = (int(li), int(e), str(name))
 +        _COV_TOKEN_COUNTS[nk] = int(n)
 +    return _n_prompts_accumulated
+diff --git a/vllm/calibration_per_expert_max.py b/vllm/calibration_per_expert_max.py
+new file mode 100644
+index 0000000..8ce03ab
+--- /dev/null
++++ b/vllm/calibration_per_expert_max.py
+@@ -0,0 +1,328 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-(layer, expert) ``down_proj`` output max-L_inf capture for
++calibration-v2 (Item 2 of the writers campaign).
++
++Computes ``max_j(|f_j(x)|_inf)`` per (layer, expert) over every token
++routed to expert ``j`` in layer rank ``l`` across the calibration run.
++This is the cheap-pruning candidate-ranking signal consumed by Stage 1's
++``ThreeWayAndPlugin``, ``MagnitudeTopkPlugin``, and ``ablation_filter`` to
++identify low-magnitude experts.
++
++The single hook used here is ``expert_out_unweighted``
++(``vllm/model_executor/layers/fused_moe/experts/triton_moe.py``), which
++dispatches ``(layer_idx, unweighted, topk_ids)`` after
++``invoke_fused_moe_triton_kernel`` returns. The hook is shared with
++``vllm.calibration_reap_scores``; the chained-callback registry in
++``vllm.calibration_hooks`` (Item 1's review-fix) lets both writers
++subscribe without collision.
++
++Env-var gating
++--------------
++``VLLM_CALIB_CAPTURE_PER_EXPERT_MAX=1`` activates the module. Requires:
++
++* ``VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1`` (Triton kernel hook fires)
++* ``VLLM_USE_FLASHINFER_MOE_FP16=0`` (forces Triton MoE backend;
++  ``expert_out_unweighted`` is NOT available on the FlashInfer
++  monolithic path)
++
++The driver (``build_self_traces_calib_vllm.py``) sets all three env vars
++BEFORE the first vllm import when ``--capture-per-expert-max`` is passed.
++
++CUDA-graph compatibility
++------------------------
++Accumulators live on CPU. The callback is dispatched from Python
++synchronously after the kernel returns; ``unweighted`` is cloned at
++callback entry so subsequent kernel writes into the persistent buffer
++cannot corrupt the per-expert-max math.
++
++Resumability
++------------
++Mirrors ``vllm.calibration_reap_scores``: periodic
++``dump_per_expert_max_checkpoint`` during the run,
++``load_per_expert_max_checkpoint`` on ``--resume``. The final
++``dump_per_expert_max`` writes the payload via
++``moe_compress.utils.cached_calibration_signals.save_per_expert_max``
++(Item 0).
++"""
++from __future__ import annotations
++
++import logging
++import os
++from pathlib import Path
++from typing import Any
++
++import torch
++
++import vllm.calibration_hooks as _ch
++
++log = logging.getLogger(__name__)
++
++__all__ = [
++    "setup",
++    "dump_per_expert_max",
++    "dump_per_expert_max_checkpoint",
++    "load_per_expert_max_checkpoint",
++    "get_n_prompts_accumulated",
++    "set_n_prompts_accumulated",
++]
++
++# Sampled at import time -- matches calibration_imatrix / reap_scores pattern.
++_CAPTURE_PER_EXPERT_MAX: bool = (
++    os.getenv("VLLM_CALIB_CAPTURE_PER_EXPERT_MAX", "0") == "1"
++)
++
++# Per-layer-rank CPU accumulators. ``_PEM_ACCUM[rank][expert_id]`` holds
++# the running max of ``|f_j(x)|_inf`` over every token routed to expert
++# ``expert_id`` in layer rank ``rank``. Initialized to ``-inf`` so the
++# first observation always wins via ``scatter_reduce_(reduce="amax")``;
++# at dump time, experts that received zero tokens are zero-filled.
++_PEM_ACCUM: dict[int, torch.Tensor] = {}        # rank -> [n_experts] float32
++_PEM_TOKEN_COUNTS: dict[int, torch.Tensor] = {}  # rank -> [n_experts] int64
++
++_LAYER_ID_TO_RANK: dict[int, int] = {}
++_N_LAYERS: int = 0
++_N_EXPERTS: int = 0
++
++# Cumulative prompt counter mirroring imatrix / reap_scores.
++_n_prompts_accumulated: int = 0
++_CHECKPOINT_SCHEMA_VERSION: int = 1
++
++
++def get_n_prompts_accumulated() -> int:
++    return _n_prompts_accumulated
++
++
++def set_n_prompts_accumulated(n: int) -> None:
++    global _n_prompts_accumulated
++    if n < 0:
++        raise ValueError(f"n must be >= 0; got {n}")
++    _n_prompts_accumulated = int(n)
++
++
++def _resolve_model(llm: Any) -> Any | None:
++    """Walk well-known attribute paths to find the live nn.Module."""
++    candidates = [
++        ("llm_engine", "model_executor", "driver_worker", "model_runner",
++         "model"),
++        ("llm_engine", "model_executor", "model_runner", "model"),
++        ("model_executor", "driver_worker", "model_runner", "model"),
++        ("model_runner", "model"),
++    ]
++    for path in candidates:
++        obj: Any = llm
++        ok = True
++        for attr in path:
++            obj = getattr(obj, attr, None)
++            if obj is None:
++                ok = False
++                break
++        if ok:
++            return obj
++    return None
++
++
++def setup(llm: Any) -> None:
++    """Discover MoE layers, pre-allocate accumulators, register callback.
++
++    Idempotent: calling twice does not double-allocate.
++    """
++    global _N_LAYERS, _N_EXPERTS
++
++    if not _CAPTURE_PER_EXPERT_MAX:
++        log.info("calibration_per_expert_max: env gate off; no-op setup.")
++        return
++
++    model = _resolve_model(llm)
++    if model is None:
++        log.warning(
++            "calibration_per_expert_max: could not resolve model from LLM; "
++            "callback will be registered but accumulators will be lazily "
++            "allocated at first expert_out_unweighted dispatch."
++        )
++
++    # Discover MoE layers by attribute presence.
++    n_layers = 0
++    n_experts_seen: int | None = None
++    if model is not None:
++        for name, module in model.named_modules():
++            moe_layer_id = getattr(module, "moe_layer_id", None)
++            num_experts = getattr(module, "num_experts", None)
++            if not (isinstance(moe_layer_id, int)
++                    and isinstance(num_experts, int) and num_experts > 0):
++                continue
++            _LAYER_ID_TO_RANK[moe_layer_id] = n_layers
++            if n_experts_seen is None:
++                n_experts_seen = num_experts
++            elif n_experts_seen != num_experts:
++                log.warning(
++                    "calibration_per_expert_max: mixed expert counts "
++                    "(%d vs first-seen %d at %s); using first.",
++                    num_experts, n_experts_seen, name,
++                )
++            n_layers += 1
++
++    _N_LAYERS = n_layers
++    _N_EXPERTS = int(n_experts_seen) if n_experts_seen is not None else 0
++
++    # Pre-allocate CPU accumulators with -inf so the first observation
++    # always wins via scatter_reduce_(reduce="amax").
++    for rank in range(_N_LAYERS):
++        if rank not in _PEM_ACCUM:
++            _PEM_ACCUM[rank] = torch.full(
++                (_N_EXPERTS,), float("-inf"), dtype=torch.float32,
++            )
++            _PEM_TOKEN_COUNTS[rank] = torch.zeros(
++                _N_EXPERTS, dtype=torch.int64,
++            )
++
++    _ch.register_callback("expert_out_unweighted", _on_expert_out_unweighted)
++
++    log.info(
++        "calibration_per_expert_max: setup complete -- %d MoE layers, "
++        "%d experts/layer; callback registered for expert_out_unweighted.",
++        _N_LAYERS, _N_EXPERTS,
++    )
++
++
++def _on_expert_out_unweighted(layer_idx: int, unweighted: torch.Tensor,
++                              topk_ids: torch.Tensor, **_: Any) -> None:
++    """Scatter-amax per-expert ``|f_j(x)|_inf`` into the accumulator.
++
++    ``unweighted`` is ``[n_tok, top_k, hidden]`` bf16 (a slice of the
++    persistent buffer in the Triton kernel); cloned at entry so post-
++    callback mutation of the underlying buffer cannot corrupt this
++    layer's accumulator.
++    """
++    if not _CAPTURE_PER_EXPERT_MAX:
++        return
++
++    rank = _LAYER_ID_TO_RANK.get(layer_idx)
++    if rank is None:
++        raise RuntimeError(
++            f"calibration_per_expert_max: layer_idx={layer_idx} was not "
++            f"discovered by setup() — the MoE layer must be visible via "
++            f"named_modules() with the moe_layer_id attribute set. "
++            f"Late-discovered layers would force the accumulators to grow, "
++            f"corrupting already-allocated buffers for other layers. Fix "
++            f"the setup() pass to find ALL MoE layers (or this layer's "
++            f"FusedMoE module is missing the moe_layer_id attribute)."
++        )
++
++    # Clone immediately + move to CPU + float32 for the math. The clone
++    # is critical: ``unweighted`` is a slice of a persistent Triton
++    # buffer; the next forward overwrites it in place.
++    uw = unweighted.detach().clone().cpu().to(torch.float32)   # [n_tok, top_k, hidden]
++    magnitudes = uw.abs().amax(dim=-1)                          # [n_tok, top_k]
++    flat_mags = magnitudes.reshape(-1)                          # [n_tok * top_k]
++    flat_ids = topk_ids.detach().cpu().to(torch.int64).reshape(-1)
++
++    score_accum = _PEM_ACCUM[rank]
++    count_accum = _PEM_TOKEN_COUNTS[rank]
++    score_accum.scatter_reduce_(
++        0, flat_ids, flat_mags, reduce="amax", include_self=True,
++    )
++    count_accum.scatter_add_(
++        0, flat_ids, torch.ones_like(flat_ids, dtype=torch.int64),
++    )
++
++
++def dump_per_expert_max(jsonl_path: str | Path) -> None:
++    """Write the final per-expert-max sidecar via the Item-0 helper.
++
++    Zero-traffic experts (still at ``-inf`` from the pre-allocation) are
++    replaced with ``0.0`` so downstream consumers see a clean numeric
++    payload (the ``DownProjMaxAccumulator`` in the live path uses an
++    absent-key convention for zero traffic; this writer maps that onto
++    the dense tensor representation by zero-filling).
++    """
++    if not _CAPTURE_PER_EXPERT_MAX:
++        return
++
++    # Import here (not at module top) so the dependency is lazy.
++    from moe_compress.utils.cached_calibration_signals import (
++        Stage1PerExpertMaxPayload, save_per_expert_max, SCHEMA_VERSIONS,
++    )
++
++    if _N_LAYERS == 0 or _N_EXPERTS == 0:
++        log.warning(
++            "calibration_per_expert_max: no MoE layers seen; skipping dump."
++        )
++        return
++
++    max_rows = []
++    count_rows = []
++    for rank in range(_N_LAYERS):
++        scores = _PEM_ACCUM.get(rank)
++        counts = _PEM_TOKEN_COUNTS.get(rank)
++        if scores is None or counts is None:
++            max_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.float32))
++            count_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.int64))
++            continue
++        # Replace -inf (zero-traffic sentinel) with 0.0.
++        cleaned = scores.clone()
++        cleaned[cleaned == float("-inf")] = 0.0
++        max_rows.append(cleaned)
++        count_rows.append(counts)
++    per_expert_max = torch.stack(max_rows)
++    token_counts = torch.stack(count_rows)
++
++    payload = Stage1PerExpertMaxPayload(
++        schema_version=SCHEMA_VERSIONS["per_expert_max"],
++        n_experts=_N_EXPERTS,
++        n_layers=_N_LAYERS,
++        per_expert_max=per_expert_max,
++        token_counts=token_counts,
++    )
++    save_per_expert_max(payload, Path(jsonl_path))
++    log.info(
++        "calibration_per_expert_max: wrote %d-layer × %d-expert sidecar "
++        "next to %s", _N_LAYERS, _N_EXPERTS, jsonl_path,
++    )
++
++
++def dump_per_expert_max_checkpoint(ckpt_path: str) -> None:
++    """Atomic checkpoint of raw accumulator state for resume."""
++    if not _CAPTURE_PER_EXPERT_MAX:
++        return
++    payload = {
++        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
++        "n_prompts_accumulated": _n_prompts_accumulated,
++        "n_layers": _N_LAYERS,
++        "n_experts": _N_EXPERTS,
++        "layer_id_to_rank": dict(_LAYER_ID_TO_RANK),
++        "pem_accum": {r: v.clone() for r, v in _PEM_ACCUM.items()},
++        "token_counts": {r: v.clone() for r, v in _PEM_TOKEN_COUNTS.items()},
++    }
++    tmp = ckpt_path + ".tmp"
++    torch.save(payload, tmp)
++    os.replace(tmp, ckpt_path)
++
++
++def load_per_expert_max_checkpoint(ckpt_path: str) -> int:
++    """Hydrate accumulators from a previous run's checkpoint. Returns
++    n_prompts_accumulated; 0 if file missing."""
++    global _N_LAYERS, _N_EXPERTS, _n_prompts_accumulated
++    if not os.path.exists(ckpt_path):
++        return 0
++    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
++    schema = int(payload.get("schema_version", 0))
++    if schema != _CHECKPOINT_SCHEMA_VERSION:
++        raise ValueError(
++            f"calibration_per_expert_max: checkpoint at {ckpt_path} has "
++            f"schema_version={schema}, expected {_CHECKPOINT_SCHEMA_VERSION}. "
++            f"Delete the checkpoint to restart from scratch."
++        )
++    _n_prompts_accumulated = int(payload["n_prompts_accumulated"])
++    _N_LAYERS = int(payload["n_layers"])
++    _N_EXPERTS = int(payload["n_experts"])
++    _LAYER_ID_TO_RANK.clear()
++    _LAYER_ID_TO_RANK.update({int(k): int(v) for k, v in payload.get(
++        "layer_id_to_rank", {}).items()})
++    _PEM_ACCUM.clear()
++    _PEM_TOKEN_COUNTS.clear()
++    for r, t in payload.get("pem_accum", {}).items():
++        _PEM_ACCUM[int(r)] = t.to(torch.float32).clone()
++    for r, t in payload.get("token_counts", {}).items():
++        _PEM_TOKEN_COUNTS[int(r)] = t.to(torch.int64).clone()
++    return _n_prompts_accumulated
 diff --git a/vllm/calibration_reap_scores.py b/vllm/calibration_reap_scores.py
 new file mode 100644
 index 0000000..1b3ca1f
@@ -4645,10 +5376,10 @@ index 0000000..1b3ca1f
 +        _REAP_TOKEN_COUNTS[int(r)] = t.to(torch.int64).clone()
 +    return _n_prompts_accumulated
 diff --git a/vllm/envs.py b/vllm/envs.py
-index ded474d..61eaf98 100755
+index ded474d..63e79c1 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -268,6 +268,16 @@ if TYPE_CHECKING:
+@@ -268,6 +268,17 @@ if TYPE_CHECKING:
      VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
      VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
      VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -4662,10 +5393,11 @@ index ded474d..61eaf98 100755
 +    VLLM_CALIB_CAPTURE_IMATRIX: bool = False
 +    VLLM_CALIB_CAPTURE_EXPERT_MID: bool = False
 +    VLLM_CALIB_CAPTURE_INPUT_COV: bool = False
++    VLLM_CALIB_CAPTURE_PER_EXPERT_MAX: bool = False
  
  
  def get_default_cache_root():
-@@ -1788,6 +1798,82 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1788,6 +1799,97 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
          int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
      ),
@@ -4744,6 +5476,21 @@ index ded474d..61eaf98 100755
 +    # Default off.
 +    "VLLM_CALIB_CAPTURE_INPUT_COV": lambda: bool(
 +        int(os.getenv("VLLM_CALIB_CAPTURE_INPUT_COV", "0"))
++    ),
++    # Capture per-(layer, expert) down_proj output max L_inf for Stage 1
++    # cheap-pruning candidate ranking. Activates the writer in
++    # ``vllm.calibration_per_expert_max`` (Item 2 of the calibration-v2
++    # writers campaign). REQUIRES VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1
++    # so the ``expert_out_unweighted`` hook fires from the Triton MoE
++    # kernel path, and VLLM_USE_FLASHINFER_MOE_FP16=0 to force the
++    # Triton backend (FlashInfer's monolithic path lacks the hook). The
++    # calibration-v2 driver (``build_self_traces_calib_vllm.py
++    # --capture-per-expert-max``) sets all three. Output is the dense
++    # sidecar at ``<jsonl>/sidecars/per_expert_max.pt`` (schema v1),
++    # shape ``[n_layers, n_experts] float32`` + matching ``int64``
++    # token counts. Default off.
++    "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX": lambda: bool(
++        int(os.getenv("VLLM_CALIB_CAPTURE_PER_EXPERT_MAX", "0"))
 +    ),
  }
  

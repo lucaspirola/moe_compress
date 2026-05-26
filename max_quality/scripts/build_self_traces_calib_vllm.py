@@ -475,6 +475,31 @@ def main() -> int:
                         "(final-dump-only). On --resume, the checkpoint at "
                         "<jsonl>.input_cov.ckpt is hydrated automatically "
                         "if it exists.")
+    p.add_argument("--capture-per-expert-max", action="store_true",
+                   default=False,
+                   help="Capture per-(layer, expert) down_proj output max "
+                        "L_inf during calibration and write a moe_compress-"
+                        "side sidecar at <jsonl>/sidecars/per_expert_max.pt "
+                        "at run end (schema v1, shape [n_layers, n_experts] "
+                        "float32). Consumed by Stage 1's three-way / "
+                        "magnitude-topk / ablation_filter cheap-pruning "
+                        "scoring. Requires the vLLM calibration-hooks patch "
+                        "(vllm.calibration_per_expert_max). Auto-enables "
+                        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX=1 + "
+                        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
+                        "VLLM_USE_FLASHINFER_MOE_FP16=0 BEFORE any vllm "
+                        "import (Triton MoE backend is required). Failures "
+                        "during dump are logged but do NOT re-raise.")
+    p.add_argument("--per-expert-max-checkpoint-every-chunks", type=int,
+                   default=1,
+                   help="When --capture-per-expert-max is set, dump a "
+                        "checkpoint (.per_expert_max.ckpt) of the live "
+                        "accumulator state every N chunked LLM.generate "
+                        "calls. Default 1 = checkpoint at every JSONL flush "
+                        "boundary. Set 0 to disable periodic checkpointing "
+                        "(final-dump-only). On --resume, the checkpoint at "
+                        "<jsonl>.per_expert_max.ckpt is hydrated "
+                        "automatically if it exists.")
     args = p.parse_args()
 
     # Pre-import env gates for the imatrix path. These MUST be set before any
@@ -527,6 +552,23 @@ def main() -> int:
         log.info("--capture-input-covariance: enabled "
                  "VLLM_CALIB_CAPTURE_INPUT_COV=1 + "
                  "VLLM_CALIB_CAPTURE_EXPERT=1 "
+                 "(must precede vllm import)")
+
+    # Pre-import env gates for the per-expert-max path. Same strict-string
+    # rule: vllm.calibration_hooks samples these once at module import.
+    # VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED is REQUIRED so the
+    # expert_out_unweighted callback dispatches; the per-expert-max
+    # callback shares the hook with REAP-scores via the chained-callback
+    # registry. FlashInfer monolithic path is disabled because
+    # expert_out_unweighted is not available on that backend.
+    if args.capture_per_expert_max:
+        os.environ["VLLM_CALIB_CAPTURE_PER_EXPERT_MAX"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED"] = "1"
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
+        log.info("--capture-per-expert-max: enabled "
+                 "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX=1 + "
+                 "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
+                 "VLLM_USE_FLASHINFER_MOE_FP16=0 "
                  "(must precede vllm import)")
 
     # --- cache_key + paths ----------------------------------------------
@@ -652,6 +694,7 @@ def main() -> int:
     imatrix_ckpt_path = None
     reap_ckpt_path = None
     input_cov_ckpt_path = None
+    pem_ckpt_path = None
 
     # --- imatrix accumulator setup (pre-CUDA-graph) ---------------------
     # The imatrix module must pre-allocate accumulator tensors for every
@@ -774,6 +817,46 @@ def main() -> int:
                     exc,
                 )
                 input_cov_ckpt_path.unlink()
+
+    # --- per-expert-max accumulator setup (pre-CUDA-graph) --------------
+    # Mirrors the reap-scores / input-cov blocks: setup() registers the
+    # expert_out_unweighted callback (chained alongside REAP-scores' own
+    # subscriber via the multi-callback registry) and builds the
+    # layer→rank map. Resume: hydrate the checkpoint that sits next to
+    # the JSONL at <jsonl>.per_expert_max.ckpt.
+    if args.capture_per_expert_max:
+        import vllm.calibration_per_expert_max as _pem  # type: ignore
+        _pem.setup(llm)
+        log.info("per-expert-max: setup complete -- "
+                 "expert_out_unweighted callback registered")
+
+        pem_ckpt_path = out_path.with_suffix(".per_expert_max.ckpt")
+        if args.resume and pem_ckpt_path.exists():
+            try:
+                loaded_prompts = _pem.load_per_expert_max_checkpoint(
+                    str(pem_ckpt_path),
+                )
+                if loaded_prompts != already_done:
+                    log.warning(
+                        "per-expert-max: checkpoint has %d prompts but JSONL "
+                        "has %d rows -- proceeding with the cumulative "
+                        "counter from the checkpoint.",
+                        loaded_prompts, already_done,
+                    )
+                else:
+                    log.info(
+                        "per-expert-max: hydrated %d-prompt checkpoint "
+                        "from %s",
+                        loaded_prompts, pem_ckpt_path,
+                    )
+            except ValueError as exc:
+                log.error(
+                    "per-expert-max: checkpoint schema mismatch (%s); "
+                    "deleting stale checkpoint and starting accumulators "
+                    "from zero.",
+                    exc,
+                )
+                pem_ckpt_path.unlink()
 
     # --- sampling params ------------------------------------------------
     from vllm import SamplingParams  # type: ignore
@@ -908,6 +991,28 @@ def main() -> int:
                             exc, exc_info=True,
                         )
 
+            # Periodic per-expert-max checkpoint -- same cadence pattern.
+            if (args.capture_per_expert_max
+                    and args.per_expert_max_checkpoint_every_chunks > 0):
+                chunk_idx = chunk_start // args.chunk_size
+                every = args.per_expert_max_checkpoint_every_chunks
+                if (chunk_idx + 1) % every == 0:
+                    try:
+                        import vllm.calibration_per_expert_max as _pem  # type: ignore
+                        _pem.set_n_prompts_accumulated(already_done + n_new)
+                        _pem.dump_per_expert_max_checkpoint(
+                            str(pem_ckpt_path),
+                        )
+                        log.info(
+                            "per-expert-max: checkpointed %d prompts -> %s",
+                            already_done + n_new, pem_ckpt_path,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "per-expert-max checkpoint failed: %s",
+                            exc, exc_info=True,
+                        )
+
     # --- imatrix dump ---------------------------------------------------
     # Run BEFORE the JSONL finalize so a failure here can't corrupt the
     # rename, but in a try/except so a failure doesn't lose the JSONL.
@@ -969,6 +1074,23 @@ def main() -> int:
                 input_cov_ckpt_path.unlink()
         except Exception as exc:
             log.error("input-cov dump failed: %s", exc, exc_info=True)
+
+    # --- per-expert-max dump -------------------------------------------
+    # Same try/except policy as imatrix / reap-scores / input-cov: the
+    # JSONL is the primary deliverable.
+    if args.capture_per_expert_max:
+        try:
+            import vllm.calibration_per_expert_max as _pem  # type: ignore
+            _pem.set_n_prompts_accumulated(already_done + n_new)
+            _pem.dump_per_expert_max(out_path)
+            log.info(
+                "per-expert-max: dumped sidecar from %d prompts (next to %s)",
+                _pem.get_n_prompts_accumulated(), out_path,
+            )
+            if pem_ckpt_path is not None and pem_ckpt_path.exists():
+                pem_ckpt_path.unlink()
+        except Exception as exc:
+            log.error("per-expert-max dump failed: %s", exc, exc_info=True)
 
     # --- finalize -------------------------------------------------------
     os.replace(tmp_path, out_path)

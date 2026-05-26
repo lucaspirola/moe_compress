@@ -103,6 +103,7 @@ SCHEMA_VERSIONS: dict[str, int] = {
     "block_hidden":     1,
     "teacher_eval":     1,
     "reap_scores":      1,
+    "per_expert_max":   1,
 }
 
 
@@ -177,6 +178,26 @@ class Stage2ReapPayload:
     n_layers: int
     reap_scores: torch.Tensor    # [n_layers, n_experts] float32 — S_j
     token_counts: torch.Tensor   # [n_layers, n_experts] int64 — |X_j|
+
+
+@dataclass
+class Stage1PerExpertMaxPayload:
+    """Per-(layer, expert) max output L_inf for Stage 1 cheap-pruning candidate ranking.
+
+    max_j(|f_j(x)|_inf) over all tokens routed to expert j in layer rank_l
+    across the calibration run. Consumed by Stage 1's ThreeWayAndPlugin,
+    MagnitudeTopkPlugin, and ablation_filter to identify low-magnitude
+    pruning candidates.
+
+    Indexing: per_expert_max[layer_rank, expert_id] where layer_rank is the
+    0-based ordinal index into the MoE layer list (NOT layer_idx). The
+    cache reader maps rank -> layer_idx via the live MoELayerRef list.
+    """
+    schema_version: int
+    n_experts: int
+    n_layers: int
+    per_expert_max: torch.Tensor   # [n_layers, n_experts] float32
+    token_counts: torch.Tensor     # [n_layers, n_experts] int64
 
 
 @dataclass
@@ -354,6 +375,39 @@ def load_reap_scores(jsonl_path: Path) -> Stage2ReapPayload | None:
 
 
 # ---------------------------------------------------------------------------
+# Signal 2c: per_expert_max (Stage 1 per-(layer, expert) down_proj output max).
+# ---------------------------------------------------------------------------
+def save_per_expert_max(payload: Stage1PerExpertMaxPayload, jsonl_path: Path) -> None:
+    """Atomically write the Stage 1 per-expert-max sidecar.
+
+    Tensors are moved to CPU before serialization so the sidecar is
+    device-agnostic (H200 -> RTX 6000 Pro round-trip is supported).
+    """
+    cpu_payload = Stage1PerExpertMaxPayload(
+        schema_version=payload.schema_version,
+        n_experts=payload.n_experts,
+        n_layers=payload.n_layers,
+        per_expert_max=payload.per_expert_max.detach().to("cpu", dtype=torch.float32),
+        token_counts=payload.token_counts.detach().to("cpu", dtype=torch.int64),
+    )
+    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "per_expert_max"))
+
+
+def load_per_expert_max(jsonl_path: Path) -> Stage1PerExpertMaxPayload | None:
+    """Load the Stage 1 per-expert-max sidecar.
+
+    Returns None if the sidecar does not exist (cache miss). Raises
+    ValueError on schema_version mismatch with an actionable message.
+    """
+    path = sidecar_path(jsonl_path, "per_expert_max")
+    if not path.exists():
+        return None
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    _check_schema("per_expert_max", payload.schema_version, path)
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Signal 3: covariance (teacher-side sigma_in).
 # ---------------------------------------------------------------------------
 def save_covariance(payload: CovariancePayload, jsonl_path: Path) -> None:
@@ -519,6 +573,7 @@ __all__ = [
     "PhaseBPayload",
     "Stage2ProfilePayload",
     "Stage2ReapPayload",
+    "Stage1PerExpertMaxPayload",
     "CovariancePayload",
     "RouterKDLogitsPayload",
     "BlockHiddenPayload",
@@ -529,6 +584,8 @@ __all__ = [
     "load_stage2_profile",
     "save_reap_scores",
     "load_reap_scores",
+    "save_per_expert_max",
+    "load_per_expert_max",
     "save_covariance",
     "load_covariance",
     "save_router_kd_logits",
