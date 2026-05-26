@@ -148,7 +148,7 @@ def stage_recorder(monkeypatch):
     return calls
 
 
-def test_normal_mode_no_pipeline_key_runs_full_pipeline(
+def test_normal_mode_runs_all_stages(
     normal_yaml, stage_recorder, tmp_path
 ):
     """Without a `pipeline:` section, the pipeline runs all six stages."""
@@ -177,7 +177,7 @@ def test_normal_mode_no_pipeline_key_runs_full_pipeline(
     assert len(stage_recorder["stage6alt_thermometer"]) == 0
 
 
-def test_normal_mode_explicit_skip_false_runs_full_pipeline(
+def test_explicit_skip_intermediate_false_runs_all_stages(
     normal_yaml, stage_recorder, tmp_path
 ):
     """Explicit `pipeline.skip_intermediate_stages: false` also runs everything."""

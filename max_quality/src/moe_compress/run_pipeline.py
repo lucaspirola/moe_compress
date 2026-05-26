@@ -100,9 +100,10 @@ def main(argv=None) -> int:
             f"got {_pipe_evaluator!r}"
         )
     if _skip_intermediate:
-        # pipeline.evaluator overrides stage6_validate.mode in REAP-exact
-        # mode to prevent accidentally running the 2-hour full suite on a
-        # screening run. stage6alt is the default; "stage6" is the opt-in.
+        # `pipeline.evaluator` overrides `stage6_validate.mode` when stages
+        # 2.5/3/4/5 are skipped, to prevent accidentally running the full
+        # suite on a one-shot screening run. stage6alt is the default;
+        # "stage6" is the opt-in for a rigorous single-run quality check.
         _effective_mode = "full" if _pipe_evaluator == "stage6" else "thermometer"
         config.setdefault("stage6_validate", {})["mode"] = _effective_mode
         log.info(
@@ -116,6 +117,15 @@ def main(argv=None) -> int:
 
     start = args.resume_from_stage
     stop = args.stop_after_stage
+
+    if _skip_intermediate and stop < 6:
+        log.warning(
+            "pipeline.skip_intermediate_stages=true combined with "
+            "--stop-after-stage %d will NOT reach the stage 6 evaluator "
+            "(stages 1+2 will run, then the pipeline exits without "
+            "evaluating). Drop --stop-after-stage to run the full "
+            "REAP-exact flow.", stop,
+        )
 
     # Resume-from-stage-2 shortcut: if a prior run already produced
     # stage2_pruned/ or stage2p5_final/, skip the corresponding stage's work
@@ -519,9 +529,9 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path,
                 elif candidate == "stage2_pruned":
                     log.info(
                         "Loading stage 6 input from %s — stage5_final/ and "
-                        "stage2p5_final/ not found (REAP-exact mode: stages "
-                        "2.5/3/4/5 were skipped, stage2_pruned/ is the "
-                        "terminal compression artifact).",
+                        "stage2p5_final/ not found. stage2_pruned/ is the only "
+                        "terminal compression artifact present (either REAP-exact "
+                        "mode or --skip-stage2p5 + stages 3-5 not run yet).",
                         prev_path,
                     )
                 else:
@@ -534,9 +544,9 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path,
                 )
                 return model, tokenizer
         raise FileNotFoundError(
-            "Cannot resume from stage 6: neither stage5_final/ nor stage2p5_final/ "
-            f"exists under {artifacts_dir}. Run stages 1–2.5 (ablation) or 1–5 "
-            "(full pipeline) first."
+            "Cannot resume from stage 6: none of stage5_final/, stage2p5_final/, or "
+            f"stage2_pruned/ exists under {artifacts_dir}. Run stages 1–2 (REAP-exact), "
+            "1–2.5 (ablation), or 1–5 (full pipeline) first."
         )
     prev_dir_name = STAGE_REGISTRY[stage][1]
     prev_path = artifacts_dir / prev_dir_name

@@ -209,7 +209,7 @@ def test_reap_exact_skips_intermediate_and_runs_stage6alt(
     )
 
 
-def test_reap_exact_evaluator_stage6_runs_full_validate(
+def test_reap_exact_evaluator_stage6_runs_stage6_validate(
     reap_exact_yaml, stage_recorder, tmp_path
 ):
     """pipeline.skip_intermediate_stages=true + evaluator=stage6 -> stage6_validate
