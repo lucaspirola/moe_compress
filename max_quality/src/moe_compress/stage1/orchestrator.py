@@ -47,6 +47,9 @@ from ..utils.trackio_log import trackio_flush as _trackio_flush
 from ..utils.trackio_log import trackio_log as _trackio_log
 from .artifacts import REQUIRED_BLACKLIST_TOP_LEVEL_KEYS
 from .plugins import STAGE1_PLUGIN_MANIFEST
+from .plugins.output_reservoir_cache import (
+    Stage1OutputReservoirCacheProvider,
+)
 from .plugins.per_expert_max_cache import Stage1PerExpertMaxCacheProvider
 from .plugins.router_logits_stats_cache import (
     Stage1RouterLogitsStatsCacheProvider,
@@ -437,6 +440,52 @@ def run(
             "-- falling back to live sink-routing accumulator", _exc,
         )
 
+    # ---- STEP 4.8: V2 cache-first attempt for output_reservoir -----------
+    # Try the calibration-v2 sidecar at
+    # ``<jsonl_dir>/sidecars/output_reservoir.pt`` -- per-(layer, expert)
+    # reservoir-sampled expert outputs produced by the
+    # ``--capture-output-reservoir`` flag (Item 6 of the writers
+    # campaign). On hit the provider populates a pre-finalized
+    # ``ExpertOutputAccumulator`` directly into ``ctx.output_acc`` and
+    # we drop ``"output_reservoir"`` from ``needed`` so the live
+    # accumulator factory is NOT invoked and the Phase-B forward skips
+    # the per-expert reservoir-sample work entirely.
+    #
+    # Divergence from the canonical provider-pair pattern (see
+    # cached_calibration_signals.py module docstring): Stage 1 has no
+    # "live provider plugin" for output_reservoir -- the live path is
+    # the ``ExpertOutputAccumulator`` factory + the
+    # ``run_calibration_pass`` closure. So we cannot use
+    # ``PluginRegistry.dispatch_first`` to fall through cache -> live.
+    # Instead, we instantiate the cache provider directly here; on hit
+    # it pre-populates ctx.output_acc + we drop "output_reservoir" from
+    # ``needed`` to skip the live accumulator; on miss we leave
+    # ``needed`` unchanged and the live path runs at Phase B.
+    _or_cache_hit = False
+    try:
+        _calib_jsonl_path = _resolve_calib_jsonl_path(config)
+        _or_provider = Stage1OutputReservoirCacheProvider()
+        _or_payload = _or_provider.on_load(ctx, _calib_jsonl_path)
+        if _or_payload is not None:
+            _or_cache_hit = True
+            log.info(
+                "Stage 1: V2 output_reservoir cache HIT (%d layers x "
+                "%d experts) -- skipping live output_reservoir "
+                "registration; ctx.output_acc replaced with "
+                "pre-finalized accumulator",
+                _or_payload.n_layers, _or_payload.n_experts,
+            )
+    except (FileNotFoundError, OSError) as _exc:
+        # Routine filesystem misses should not block the live path.
+        # ValueError from _check_schema is NOT caught here -- a schema
+        # mismatch is an actionable user error ("Delete the sidecar to
+        # regenerate") and silently falling back would mask it.
+        log.warning(
+            "Stage 1: V2 output_reservoir cache lookup failed (%s) "
+            "-- falling back to live output_reservoir accumulator",
+            _exc,
+        )
+
     # ---- STEP 5: build the ordered accumulator registrations --------------
     # ``registry.provides(config)`` returns the byte-identity-critical
     # accumulator order; iterating it preserves that order in the
@@ -453,6 +502,11 @@ def run(
     # the live per-batch sink-routing HookSpec is no longer needed.
     if _rlsx_cache_hit:
         needed = tuple(n for n in needed if n != "sink_routing")
+    # Same surgery for STEP 4.8: the output_reservoir cache hydrates a
+    # pre-finalized ExpertOutputAccumulator into ctx.output_acc, so the
+    # live per-batch reservoir-sample HookSpec is no longer needed.
+    if _or_cache_hit:
+        needed = tuple(n for n in needed if n != "output_reservoir")
     registrations: list[tuple[str, object, HookSpec]] = []
     built: dict[str, object] = {}
     for acc_name in needed:
@@ -470,7 +524,10 @@ def run(
     # the freshly-built live accumulator now.
     if not _pem_cache_hit:
         ctx.set("max_acc", built["downproj_max"])      # always present
-    ctx.set("output_acc", built["output_reservoir"])   # always present
+    # ``output_acc`` is set by the cache provider on hit; otherwise we
+    # publish the freshly-built live accumulator now.
+    if not _or_cache_hit:
+        ctx.set("output_acc", built["output_reservoir"])   # always present
 
     # ---- STEP 6: run the calibration pass ONCE ----------------------------
     cal = config["calibration"]
@@ -504,7 +561,8 @@ def run(
     # provider and there is no live accumulator to finalize.
     if "downproj_max" in built:
         built["downproj_max"].finalize()
-    built["output_reservoir"].finalize()
+    if "output_reservoir" in built:
+        built["output_reservoir"].finalize()
     if "sink_routing" in built:
         built["sink_routing"].finalize()
 

@@ -106,6 +106,7 @@ SCHEMA_VERSIONS: dict[str, int] = {
     "per_expert_max":      1,
     "routing_stats":       1,
     "router_logits_stats": 1,
+    "output_reservoir":    1,
 }
 
 
@@ -290,6 +291,59 @@ class RouterLogitsStatsPayload:
     n_sink_tokens: torch.Tensor       # [n_layers] int64
     n_normal_tokens: torch.Tensor     # [n_layers] int64
     bos_token_id: int | None          # may be None if not captured
+
+
+@dataclass
+class OutputReservoirPayload:
+    """Per-(layer, expert) expert-output reservoir for Stage 1 CKA.
+
+    Reservoir-sampled snapshot of unweighted expert outputs (the slice
+    of the Triton MoE persistent buffer corresponding to a routed token,
+    BEFORE the topk-weight multiply). Mirrors the live
+    :class:`ExpertOutputAccumulator` (``activation_hooks.py``) finalized
+    state but stored as a dense 4-D tensor so the sidecar is a single
+    ``torch.save`` write.
+
+    Storage shape: ``[n_layers, n_experts, max_tokens, hidden_dim]``
+    bfloat16. Unfilled cells (``valid_count[rank, e] < max_tokens``) are
+    zero-padded; the cache reader uses ``valid_count`` to slice each
+    reservoir down to its truly-populated head before hydrating
+    ``ExpertOutputAccumulator._finalized``.
+
+    Indexing convention: ``[layer_rank, expert_id]`` where ``layer_rank``
+    is the 0-based ordinal into the MoE layer list (NOT the absolute
+    ``layer_idx``); the Stage 1 cache reader maps rank → layer_idx via
+    the live ``MoELayerRef`` list when hydrating the accumulator.
+
+    Reservoir-sampling math: identical to
+    :meth:`ExpertOutputAccumulator.update` — Phase 1 fills empty slots
+    sequentially while ``seen < max_tokens``; Phase 2 accepts each
+    further token with probability ``max_tokens / (seen + j)`` for the
+    j-th post-fill token and on accept writes to a uniformly-random
+    slot (last-wins on collision). The accepted-token distribution is
+    uniform across slots; statistically equivalent to sequential
+    reservoir sampling.
+
+    Storage budget: ``max_tokens=256`` × ``hidden_dim≈2048`` × 2 bytes
+    (bf16) × ``n_layers≈40`` × ``n_experts≈256`` ≈ 10 GB on disk; the
+    plan-doc estimate of ~17 GB bf16 is the upper-bound covering
+    larger configs (Qwen3.6 has 2880 hidden, 40 layers, 256 experts →
+    ~15 GB).
+
+    Consumer: :class:`Stage1OutputReservoirCacheProvider` hydrates a
+    pre-finalized :class:`ExpertOutputAccumulator` from this payload
+    into ``ctx["output_acc"]`` -- the SAME slot the live Phase B
+    calibration pass writes -- so the downstream CKADistancePlugin
+    consumes the cached reservoirs without rebuilding them from a
+    Phase B forward pass.
+    """
+    schema_version: int
+    n_experts: int
+    n_layers: int
+    reservoir: torch.Tensor      # [n_layers, n_experts, max_tokens, hidden_dim] bfloat16
+    valid_count: torch.Tensor    # [n_layers, n_experts] int64
+    total_seen: torch.Tensor     # [n_layers, n_experts] int64
+    max_tokens: int              # reservoir capacity
 
 
 @dataclass
@@ -583,6 +637,44 @@ def load_router_logits_stats(jsonl_path: Path) -> RouterLogitsStatsPayload | Non
 
 
 # ---------------------------------------------------------------------------
+# Signal 2f: output_reservoir (per-(layer, expert) reservoir-sampled outputs).
+# ---------------------------------------------------------------------------
+def save_output_reservoir(payload: OutputReservoirPayload, jsonl_path: Path) -> None:
+    """Atomically write the output-reservoir sidecar.
+
+    The reservoir tensor is cast to bfloat16 on CPU before serialization
+    (matching the storage-budget contract documented on the dataclass).
+    ``valid_count`` and ``total_seen`` are cast to int64 on CPU. The
+    resulting sidecar is device-agnostic (H200 -> RTX 6000 Pro round-trip
+    is supported).
+    """
+    cpu_payload = OutputReservoirPayload(
+        schema_version=payload.schema_version,
+        n_experts=payload.n_experts,
+        n_layers=payload.n_layers,
+        reservoir=payload.reservoir.detach().to("cpu", dtype=torch.bfloat16),
+        valid_count=payload.valid_count.detach().to("cpu", dtype=torch.int64),
+        total_seen=payload.total_seen.detach().to("cpu", dtype=torch.int64),
+        max_tokens=int(payload.max_tokens),
+    )
+    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "output_reservoir"))
+
+
+def load_output_reservoir(jsonl_path: Path) -> OutputReservoirPayload | None:
+    """Load the output-reservoir sidecar.
+
+    Returns None if the sidecar does not exist (cache miss). Raises
+    ValueError on schema_version mismatch with an actionable message.
+    """
+    path = sidecar_path(jsonl_path, "output_reservoir")
+    if not path.exists():
+        return None
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    _check_schema("output_reservoir", payload.schema_version, path)
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Signal 3: covariance (teacher-side sigma_in).
 # ---------------------------------------------------------------------------
 def save_covariance(payload: CovariancePayload, jsonl_path: Path) -> None:
@@ -751,6 +843,7 @@ __all__ = [
     "Stage1PerExpertMaxPayload",
     "RoutingStatsPayload",
     "RouterLogitsStatsPayload",
+    "OutputReservoirPayload",
     "CovariancePayload",
     "RouterKDLogitsPayload",
     "BlockHiddenPayload",
@@ -767,6 +860,8 @@ __all__ = [
     "load_routing_stats",
     "save_router_logits_stats",
     "load_router_logits_stats",
+    "save_output_reservoir",
+    "load_output_reservoir",
     "save_covariance",
     "load_covariance",
     "save_router_kd_logits",

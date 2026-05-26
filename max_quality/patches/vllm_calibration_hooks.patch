@@ -2186,6 +2186,480 @@ index 0000000..c135f9f
 +    )
 +    assert torch.allclose(e0, expected_e0, atol=1e-5), f"e0={e0}"
 +    assert torch.allclose(e1, expected_e1, atol=1e-5), f"e1={e1}"
+diff --git a/tests/test_calibration_output_reservoir_smoke.py b/tests/test_calibration_output_reservoir_smoke.py
+new file mode 100644
+index 0000000..72a1792
+--- /dev/null
++++ b/tests/test_calibration_output_reservoir_smoke.py
+@@ -0,0 +1,468 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Smoke tests for ``vllm.calibration_output_reservoir``.
++
++These exercise the per-(layer, expert) two-phase fill+sample
++reservoir, the env-gate contract, checkpoint round-trip + two-segment
++additivity (in the fill-only regime so the math is exact), the
++persistent-buffer clone guard, and the dump-payload shape + bf16
++dtype + ``valid_count`` correctness.
++
++Tests:
++
++1. ``test_accumulator_math_fill_only`` -- a synthetic dispatch with
++   ``n_tok * top_k <= max_tokens`` populates the reservoir with the
++   input rows in routing order (Phase 1 fill regime; no Phase 2
++   sampling). Reservoir contents are byte-equal to the input slice.
++2. ``test_env_gate_off_no_op`` -- env unset → ``setup()`` and the
++   callback are no-ops (reservoirs untouched).
++3. ``test_checkpoint_round_trip`` -- dump → reload module →
++   load_checkpoint restores byte-identical reservoir state +
++   bookkeeping.
++4. ``test_two_segment_additivity_fill_only`` -- a fill-only split:
++   first N tokens + checkpoint + reload + remaining tokens ==
++   single-shot input slice. Exact (no randomness because every token
++   is accepted by Phase 1).
++5. ``test_persistent_buffer_clone`` -- callback clones ``unweighted``
++   at entry; post-callback mutation of the input does NOT alter the
++   stored reservoir row.
++6. ``test_dump_payload_shape_dtype_and_valid_count`` -- partial
++   accumulator (rank 0 only, two experts touched with different
++   valid counts) dumped → payload tensor is
++   ``[n_layers, n_experts, max_tokens, hidden]`` bf16; valid_count
++   matches the cell occupancies; rank-1 (untouched) is all zeros.
++"""
++from __future__ import annotations
++
++import importlib
++import os
++import sys
++from typing import Any
++
++import torch
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _reload_or(env: dict[str, str]) -> Any:
++    """Reload ``vllm.calibration_output_reservoir`` (and hooks) with a fresh env.
++
++    Module-level ``_CAPTURE_OUTPUT_RESERVOIR`` + ``_MAX_TOKENS`` are
++    sampled at import; per-test isolation requires a fresh import.
++    """
++    sys.modules.pop("vllm.calibration_output_reservoir", None)
++    sys.modules.pop("vllm.calibration_hooks", None)
++    for key in (
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED",
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX",
++        "VLLM_CALIB_CAPTURE_REAP_SCORES",
++        "VLLM_CALIB_CAPTURE_ROUTER",
++        "VLLM_CALIB_CAPTURE_IMATRIX",
++        "VLLM_CALIB_CAPTURE_EXPERT",
++        "VLLM_CALIB_CAPTURE_BLOCK",
++        "VLLM_CALIB_CAPTURE_EXPERT_MID",
++        "VLLM_CALIB_CAPTURE_INPUT_COV",
++    ):
++        os.environ.pop(key, None)
++    for k, v in env.items():
++        os.environ[k] = v
++    importlib.import_module("vllm.calibration_hooks")
++    return importlib.import_module("vllm.calibration_output_reservoir")
++
++
++def _seed_layer(or_: Any, layer_idx: int, rank: int, n_experts: int) -> None:
++    """Manually wire up the per-layer rank table the way setup() would."""
++    or_._LAYER_ID_TO_RANK[layer_idx] = rank
++    if rank + 1 > or_._N_LAYERS:
++        or_._N_LAYERS = rank + 1
++    if n_experts > or_._N_EXPERTS:
++        or_._N_EXPERTS = n_experts
++
++
++# ---------------------------------------------------------------------------
++# Test 1 -- accumulator math (single layer, fill-only regime)
++# ---------------------------------------------------------------------------
++
++
++def test_accumulator_math_fill_only():
++    """A synthetic dispatch with ``n_tok * top_k <= max_tokens`` populates
++    every reservoir cell with the routed input rows in order.
++
++    With ``max_tokens=8`` and 3 tokens × top_k=2 = 6 routed entries,
++    every entry hits Phase 1 (sequential fill) regardless of expert,
++    making the reservoir contents byte-equal to the input rows in
++    routing order.
++    """
++    or_ = _reload_or({
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": "1",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": "8",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    assert or_._MAX_TOKENS == 8
++    n_experts = 4
++    hidden = 3
++    _seed_layer(or_, layer_idx=0, rank=0, n_experts=n_experts)
++
++    # 3 tokens, top_k=2, hidden=3. Token (t, k) routes to topk_ids[t, k].
++    # Token 0: e=0, e=2
++    # Token 1: e=1, e=2
++    # Token 2: e=0, e=3
++    unweighted = torch.tensor([
++        [[ 1.0,  2.0,  3.0],   # t0 k0 -> e0
++         [ 4.0,  5.0,  6.0]],  # t0 k1 -> e2
++        [[ 7.0,  8.0,  9.0],   # t1 k0 -> e1
++         [10.0, 11.0, 12.0]],  # t1 k1 -> e2
++        [[13.0, 14.0, 15.0],   # t2 k0 -> e0
++         [16.0, 17.0, 18.0]],  # t2 k1 -> e3
++    ], dtype=torch.float32)
++    topk_ids = torch.tensor(
++        [[0, 2], [1, 2], [0, 3]], dtype=torch.int64,
++    )
++
++    or_._on_expert_out_unweighted(
++        layer_idx=0, unweighted=unweighted, topk_ids=topk_ids,
++    )
++
++    # Hand-computed reservoir contents (Phase 1 fill, routing order):
++    # e0: [t0k0=(1,2,3), t2k0=(13,14,15)]  -> valid_count=2
++    # e1: [t1k0=(7,8,9)]                   -> valid_count=1
++    # e2: [t0k1=(4,5,6), t1k1=(10,11,12)]  -> valid_count=2
++    # e3: [t2k1=(16,17,18)]                -> valid_count=1
++    # Unused expert: not in topk_ids → no reservoir allocated.
++    r0 = or_._RESERVOIR[(0, 0)]
++    assert r0.shape == (8, hidden)
++    assert torch.equal(r0[0], torch.tensor([1.0, 2.0, 3.0]))
++    assert torch.equal(r0[1], torch.tensor([13.0, 14.0, 15.0]))
++    # Remaining slots are zeros (initialized).
++    assert torch.equal(r0[2:], torch.zeros(6, hidden))
++    assert or_._VALID_COUNT[(0, 0)] == 2
++    assert or_._SEEN[(0, 0)] == 2
++
++    r1 = or_._RESERVOIR[(0, 1)]
++    assert torch.equal(r1[0], torch.tensor([7.0, 8.0, 9.0]))
++    assert or_._VALID_COUNT[(0, 1)] == 1
++    assert or_._SEEN[(0, 1)] == 1
++
++    r2 = or_._RESERVOIR[(0, 2)]
++    assert torch.equal(r2[0], torch.tensor([4.0, 5.0, 6.0]))
++    assert torch.equal(r2[1], torch.tensor([10.0, 11.0, 12.0]))
++    assert or_._VALID_COUNT[(0, 2)] == 2
++    assert or_._SEEN[(0, 2)] == 2
++
++    r3 = or_._RESERVOIR[(0, 3)]
++    assert torch.equal(r3[0], torch.tensor([16.0, 17.0, 18.0]))
++    assert or_._VALID_COUNT[(0, 3)] == 1
++    assert or_._SEEN[(0, 3)] == 1
++
++
++# ---------------------------------------------------------------------------
++# Test 2 -- env-off short-circuit
++# ---------------------------------------------------------------------------
++
++
++def test_env_gate_off_no_op():
++    """Env unset → setup() is a no-op, and the callback short-circuits
++    before touching any reservoir."""
++    or_ = _reload_or({})  # env cleared
++    assert or_._CAPTURE_OUTPUT_RESERVOIR is False
++
++    # setup() with a stub LLM -> should not register callbacks nor
++    # allocate reservoirs.
++    or_.setup(llm=None)
++    assert or_._RESERVOIR == {}
++    assert or_._SEEN == {}
++    assert or_._VALID_COUNT == {}
++
++    # Seed the rank table manually and call the callback. The internal
++    # env guard must short-circuit before any allocation.
++    n_experts = 2
++    _seed_layer(or_, layer_idx=0, rank=0, n_experts=n_experts)
++
++    unweighted = torch.tensor(
++        [[[1.0, 0.0], [0.0, 1.0]]], dtype=torch.float32,
++    )
++    topk_ids = torch.tensor([[0, 1]], dtype=torch.int64)
++    or_._on_expert_out_unweighted(
++        layer_idx=0, unweighted=unweighted, topk_ids=topk_ids,
++    )
++    assert or_._RESERVOIR == {}
++    assert or_._SEEN == {}
++    assert or_._VALID_COUNT == {}
++
++
++# ---------------------------------------------------------------------------
++# Test 3 -- checkpoint round-trip
++# ---------------------------------------------------------------------------
++
++
++def test_checkpoint_round_trip(tmp_path):
++    """Dump → reload module → load_checkpoint restores byte-identical state.
++
++    Validates the reservoir tensors, ``_SEEN``, ``_VALID_COUNT``,
++    ``_LAYER_ID_TO_RANK``, ``_N_LAYERS``, ``_N_EXPERTS``,
++    ``_MAX_TOKENS``, and ``_n_prompts_accumulated`` all round-trip.
++    """
++    or_ = _reload_or({
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": "1",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": "4",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    n_experts = 3
++    _seed_layer(or_, layer_idx=0, rank=0, n_experts=n_experts)
++    _seed_layer(or_, layer_idx=1, rank=1, n_experts=n_experts)
++
++    # Manually populate a couple of cells with deterministic data.
++    or_._RESERVOIR[(0, 0)] = torch.tensor(
++        [[1.0, 2.0], [3.0, 4.0], [0.0, 0.0], [0.0, 0.0]], dtype=torch.float32,
++    )
++    or_._SEEN[(0, 0)] = 2
++    or_._VALID_COUNT[(0, 0)] = 2
++    or_._RESERVOIR[(1, 2)] = torch.tensor(
++        [[9.0, 8.0], [7.0, 6.0], [5.0, 4.0], [3.0, 2.0]], dtype=torch.float32,
++    )
++    or_._SEEN[(1, 2)] = 7
++    or_._VALID_COUNT[(1, 2)] = 4
++    or_.set_n_prompts_accumulated(42)
++
++    ckpt = str(tmp_path / "test.or.ckpt")
++    or_.dump_output_reservoir_checkpoint(ckpt)
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + ".tmp")
++
++    # Fresh module load -- reservoirs must hydrate from disk.
++    or2 = _reload_or({
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": "1",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": "4",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    assert or2._RESERVOIR == {}  # fresh state
++    loaded = or2.load_output_reservoir_checkpoint(ckpt)
++    assert loaded == 42
++    assert or2.get_n_prompts_accumulated() == 42
++    assert or2._N_LAYERS == 2
++    assert or2._N_EXPERTS == n_experts
++    assert or2._LAYER_ID_TO_RANK == {0: 0, 1: 1}
++    assert or2._SEEN[(0, 0)] == 2
++    assert or2._VALID_COUNT[(0, 0)] == 2
++    assert torch.equal(
++        or2._RESERVOIR[(0, 0)],
++        torch.tensor(
++            [[1.0, 2.0], [3.0, 4.0], [0.0, 0.0], [0.0, 0.0]],
++            dtype=torch.float32,
++        ),
++    )
++    assert or2._SEEN[(1, 2)] == 7
++    assert or2._VALID_COUNT[(1, 2)] == 4
++    assert torch.equal(
++        or2._RESERVOIR[(1, 2)],
++        torch.tensor(
++            [[9.0, 8.0], [7.0, 6.0], [5.0, 4.0], [3.0, 2.0]],
++            dtype=torch.float32,
++        ),
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 4 -- two-segment additivity (fill-only so exact)
++# ---------------------------------------------------------------------------
++
++
++def test_two_segment_additivity_fill_only(tmp_path):
++    """Fill-only split: first N tokens + checkpoint + reload + remaining
++    tokens ≡ a single dispatch of all tokens.
++
++    Critical for spot-preemption: a reservoir-aggregating writer split
++    across two instance lifetimes must produce the same reservoir state
++    as a single run. Exact only in the fill-only regime (total tokens
++    per expert ≤ max_tokens) because Phase 2 sampling is stochastic.
++    """
++    n_experts = 2
++    top_k = 1
++    cap = 8
++    hidden = 2
++    # 6 tokens total, all routing to expert 0 → 6 <= 8 → fill-only.
++    torch.manual_seed(7)
++    n_tok = 6
++    uw_all = torch.randn(n_tok, top_k, hidden, dtype=torch.float32)
++    ids_all = torch.zeros(n_tok, top_k, dtype=torch.int64)
++
++    # --- single 6-token reference run ---------------------------------
++    ref = _reload_or({
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": "1",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": str(cap),
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    _seed_layer(ref, layer_idx=0, rank=0, n_experts=n_experts)
++    ref._on_expert_out_unweighted(
++        layer_idx=0, unweighted=uw_all, topk_ids=ids_all,
++    )
++    expected_reservoir = ref._RESERVOIR[(0, 0)].clone()
++    expected_seen = ref._SEEN[(0, 0)]
++    expected_valid = ref._VALID_COUNT[(0, 0)]
++
++    # --- split across two segments with a checkpoint + reload ----------
++    n_seg = 3
++    seg = _reload_or({
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": "1",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": str(cap),
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    _seed_layer(seg, layer_idx=0, rank=0, n_experts=n_experts)
++    seg._on_expert_out_unweighted(
++        layer_idx=0,
++        unweighted=uw_all[:n_seg],
++        topk_ids=ids_all[:n_seg],
++    )
++    seg.set_n_prompts_accumulated(1)
++    ckpt = str(tmp_path / "twoseg.or.ckpt")
++    seg.dump_output_reservoir_checkpoint(ckpt)
++
++    # Reload module + checkpoint -- simulates a process restart.
++    seg2 = _reload_or({
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": "1",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": str(cap),
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    seg2.load_output_reservoir_checkpoint(ckpt)
++    seg2._on_expert_out_unweighted(
++        layer_idx=0,
++        unweighted=uw_all[n_seg:],
++        topk_ids=ids_all[n_seg:],
++    )
++
++    assert torch.equal(seg2._RESERVOIR[(0, 0)], expected_reservoir)
++    assert seg2._SEEN[(0, 0)] == expected_seen
++    assert seg2._VALID_COUNT[(0, 0)] == expected_valid
++
++
++# ---------------------------------------------------------------------------
++# Test 5 -- persistent-buffer clone safety
++# ---------------------------------------------------------------------------
++
++
++def test_persistent_buffer_clone():
++    """Callback must clone ``unweighted`` at entry; post-callback mutation
++    of the input does NOT corrupt the reservoir."""
++    or_ = _reload_or({
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": "1",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": "4",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    n_experts = 2
++    _seed_layer(or_, layer_idx=0, rank=0, n_experts=n_experts)
++
++    # 1 token, top_k=1, hidden=3.
++    unweighted = torch.tensor([[[1.0, -2.5, 3.5]]], dtype=torch.float32)
++    topk_ids = torch.tensor([[1]], dtype=torch.int64)
++    or_._on_expert_out_unweighted(
++        layer_idx=0, unweighted=unweighted, topk_ids=topk_ids,
++    )
++    stored = or_._RESERVOIR[(0, 1)][0].clone()
++    assert torch.equal(stored, torch.tensor([1.0, -2.5, 3.5]))
++
++    # Mutate the persistent buffer in place (simulates the Triton
++    # kernel's next forward overwriting it). The stored reservoir row
++    # must NOT reflect the mutated contents.
++    unweighted.fill_(999.0)
++    assert torch.equal(or_._RESERVOIR[(0, 1)][0], stored)
++
++
++# ---------------------------------------------------------------------------
++# Test 6 -- dump payload shape + bf16 dtype + valid_count correctness
++# ---------------------------------------------------------------------------
++
++
++def test_dump_payload_shape_dtype_and_valid_count(tmp_path, monkeypatch):
++    """Partial accumulator dumped → payload tensor is
++    ``[n_layers, n_experts, max_tokens, hidden]`` bf16, valid_count matches
++    cell occupancies, and rank-1 (untouched) row is all zeros.
++    """
++    or_ = _reload_or({
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": "1",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": "4",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    })
++    n_experts = 3
++    hidden = 2
++    _seed_layer(or_, layer_idx=0, rank=0, n_experts=n_experts)
++    _seed_layer(or_, layer_idx=1, rank=1, n_experts=n_experts)
++
++    # Only rank 0 sees any traffic; experts 0 + 2 are touched with
++    # different valid counts. Expert 1 in rank 0, and ALL of rank 1,
++    # never see a dispatch.
++    or_._RESERVOIR[(0, 0)] = torch.tensor(
++        [[1.0, 2.0], [3.0, 4.0], [0.0, 0.0], [0.0, 0.0]], dtype=torch.float32,
++    )
++    or_._SEEN[(0, 0)] = 2
++    or_._VALID_COUNT[(0, 0)] = 2
++    or_._RESERVOIR[(0, 2)] = torch.tensor(
++        [[5.0, 6.0], [7.0, 8.0], [9.0, 10.0], [11.0, 12.0]],
++        dtype=torch.float32,
++    )
++    or_._SEEN[(0, 2)] = 6
++    or_._VALID_COUNT[(0, 2)] = 4
++
++    captured = {}
++
++    def _fake_save(payload, path):
++        captured["payload"] = payload
++        captured["path"] = path
++
++    import moe_compress.utils.cached_calibration_signals as ccs
++    monkeypatch.setattr(ccs, "save_output_reservoir", _fake_save)
++
++    jsonl = tmp_path / "trace.jsonl"
++    or_.dump_output_reservoir(jsonl)
++
++    payload = captured["payload"]
++    assert payload is not None
++    assert payload.schema_version == 1
++    assert payload.n_layers == 2
++    assert payload.n_experts == n_experts
++    assert payload.max_tokens == 4
++    # Shape and dtype contract.
++    assert payload.reservoir.shape == (2, n_experts, 4, hidden)
++    # The dump writes a fp32 tensor; save_output_reservoir casts to bf16.
++    # Here we asserted shape; the bf16 cast is exercised by the
++    # cached_calibration_signals round-trip test.
++    assert payload.valid_count.shape == (2, n_experts)
++    assert payload.total_seen.shape == (2, n_experts)
++    # Rank 0 / expert 0 contents preserved.
++    assert torch.equal(
++        payload.reservoir[0, 0],
++        torch.tensor(
++            [[1.0, 2.0], [3.0, 4.0], [0.0, 0.0], [0.0, 0.0]],
++            dtype=torch.float32,
++        ),
++    )
++    # Rank 0 / expert 2 contents preserved.
++    assert torch.equal(
++        payload.reservoir[0, 2],
++        torch.tensor(
++            [[5.0, 6.0], [7.0, 8.0], [9.0, 10.0], [11.0, 12.0]],
++            dtype=torch.float32,
++        ),
++    )
++    # Untouched cells are zeros.
++    assert torch.equal(
++        payload.reservoir[0, 1], torch.zeros(4, hidden, dtype=torch.float32),
++    )
++    assert torch.equal(
++        payload.reservoir[1], torch.zeros(n_experts, 4, hidden, dtype=torch.float32),
++    )
++    # valid_count matches the populated occupancies.
++    assert payload.valid_count[0, 0].item() == 2
++    assert payload.valid_count[0, 1].item() == 0
++    assert payload.valid_count[0, 2].item() == 4
++    assert torch.equal(
++        payload.valid_count[1], torch.zeros(n_experts, dtype=torch.int64),
++    )
++    # total_seen mirrors _SEEN.
++    assert payload.total_seen[0, 0].item() == 2
++    assert payload.total_seen[0, 2].item() == 6
++    assert payload.total_seen[0, 1].item() == 0
 diff --git a/tests/test_calibration_per_expert_max_smoke.py b/tests/test_calibration_per_expert_max_smoke.py
 new file mode 100644
 index 0000000..f4f9d32
@@ -5616,6 +6090,453 @@ index 0000000..adff069
 +        nk = (int(li), int(e), str(name))
 +        _COV_TOKEN_COUNTS[nk] = int(n)
 +    return _n_prompts_accumulated
+diff --git a/vllm/calibration_output_reservoir.py b/vllm/calibration_output_reservoir.py
+new file mode 100644
+index 0000000..660a951
+--- /dev/null
++++ b/vllm/calibration_output_reservoir.py
+@@ -0,0 +1,441 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-(layer, expert) expert-output reservoir capture for calibration-v2
++(Item 6 of the writers campaign).
++
++Collects unweighted expert-output vectors per (layer, expert) via
++reservoir sampling (max ``VLLM_CALIB_OUTPUT_RESERVOIR_CAP`` tokens per
++cell, default 256). The on-disk payload mirrors the live
++``ExpertOutputAccumulator`` finalized state stored as a dense
++``[n_layers, n_experts, max_tokens, hidden_dim]`` bf16 tensor. The
++Stage 1 cache reader hydrates a pre-finalized accumulator from this
++payload into ``ctx["output_acc"]`` so the downstream CKADistancePlugin
++skips the live Phase-B forward pass that would otherwise rebuild the
++reservoir.
++
++The hook used here is ``expert_out_unweighted``
++(``vllm/model_executor/layers/fused_moe/experts/triton_moe.py``), which
++dispatches ``(layer_idx, unweighted, topk_ids)`` after
++``invoke_fused_moe_triton_kernel`` returns. The chained-callback
++registry in ``vllm.calibration_hooks`` (Item 1's review-fix) lets this
++writer subscribe alongside ``vllm.calibration_per_expert_max`` and
++``vllm.calibration_reap_scores`` without collision.
++
++Env-var gating
++--------------
++``VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR=1`` activates the module. Requires:
++
++* ``VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1`` (Triton kernel hook fires)
++* ``VLLM_USE_FLASHINFER_MOE_FP16=0`` (forces Triton MoE backend;
++  ``expert_out_unweighted`` is NOT available on the FlashInfer
++  monolithic path)
++
++``VLLM_CALIB_OUTPUT_RESERVOIR_CAP`` (default ``256``) controls the
++per-cell capacity. The driver
++(``build_self_traces_calib_vllm.py``) sets all gates BEFORE the first
++vllm import when ``--capture-output-reservoir`` is passed.
++
++Reservoir-sampling math
++-----------------------
++Replicates :meth:`ExpertOutputAccumulator.update` semantics exactly:
++
++* Per dispatch, flatten ``unweighted`` from ``[n_tok, top_k, hidden]``
++  to ``[n_tok * top_k, hidden]`` and ``topk_ids`` to
++  ``[n_tok * top_k]``.
++* For every UNIQUE expert id appearing in the flattened ``topk_ids``,
++  gather the rows routed to that expert as one ``[n_e, hidden]`` batch.
++* Phase 1 (fill): if ``seen < max_tokens``, write
++  ``min(max_tokens - seen, n_e)`` tokens sequentially into the head of
++  the reservoir.
++* Phase 2 (sample): for each of the remaining ``n_e_tail`` tokens
++  (indexed 1..n_e_tail), draw a uniform u and accept with probability
++  ``max_tokens / (seen + n_fill + j)``; on accept, choose a uniformly
++  random reservoir slot and overwrite it. PyTorch's indexed-assign is
++  last-wins on collisions, which keeps the slot occupancy uniform.
++
++This is the SAME two-phase fill+sample logic used by the live path; a
++fill-only regime (``total_seen <= max_tokens``) produces a byte-exact
++match against the input slice. The combined-segment additivity test
++(``test_two_segment_additivity``) confirms a checkpoint+reload
++preserves the math.
++
++CUDA-graph compatibility
++------------------------
++Reservoirs live on CPU. The callback is dispatched from Python
++synchronously after the kernel returns; ``unweighted`` is cloned at
++callback entry so subsequent kernel writes into the persistent buffer
++cannot corrupt the sampled tokens.
++
++Resumability
++------------
++Mirrors ``vllm.calibration_per_expert_max``: periodic
++``dump_output_reservoir_checkpoint`` during the run,
++``load_output_reservoir_checkpoint`` on ``--resume``. The final
++``dump_output_reservoir`` writes the payload via
++``moe_compress.utils.cached_calibration_signals.save_output_reservoir``
++(Item 0).
++"""
++from __future__ import annotations
++
++import logging
++import os
++from pathlib import Path
++from typing import Any
++
++import torch
++
++import vllm.calibration_hooks as _ch
++
++log = logging.getLogger(__name__)
++
++__all__ = [
++    "setup",
++    "dump_output_reservoir",
++    "dump_output_reservoir_checkpoint",
++    "load_output_reservoir_checkpoint",
++    "get_n_prompts_accumulated",
++    "set_n_prompts_accumulated",
++]
++
++# Sampled at import time -- matches calibration_imatrix / per_expert_max pattern.
++_CAPTURE_OUTPUT_RESERVOIR: bool = (
++    os.getenv("VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR", "0") == "1"
++)
++# Reservoir capacity. Sampled at import so checkpoint roundtrips with a
++# changed CAP raise via the schema-mismatch path on the cached cap field.
++_MAX_TOKENS: int = int(
++    os.getenv("VLLM_CALIB_OUTPUT_RESERVOIR_CAP", "256")
++)
++
++# Per-(rank, expert_id) CPU reservoirs. Lazily allocated on the first
++# dispatch that observes that expert (matches the live accumulator's
++# lazy allocation; saves the trivial allocation for expert ids that
++# never appear in topk_ids for that layer).
++_RESERVOIR: dict[tuple[int, int], torch.Tensor] = {}  # (rank, e) -> [cap, hidden] fp32
++_SEEN: dict[tuple[int, int], int] = {}                # (rank, e) -> total tokens seen
++_VALID_COUNT: dict[tuple[int, int], int] = {}         # (rank, e) -> min(seen, cap)
++
++_LAYER_ID_TO_RANK: dict[int, int] = {}
++_N_LAYERS: int = 0
++_N_EXPERTS: int = 0
++
++# Cumulative prompt counter mirroring imatrix / per_expert_max.
++_n_prompts_accumulated: int = 0
++_CHECKPOINT_SCHEMA_VERSION: int = 1
++
++
++def get_n_prompts_accumulated() -> int:
++    return _n_prompts_accumulated
++
++
++def set_n_prompts_accumulated(n: int) -> None:
++    global _n_prompts_accumulated
++    if n < 0:
++        raise ValueError(f"n must be >= 0; got {n}")
++    _n_prompts_accumulated = int(n)
++
++
++def _resolve_model(llm: Any) -> Any | None:
++    """Walk well-known attribute paths to find the live nn.Module."""
++    candidates = [
++        ("llm_engine", "model_executor", "driver_worker", "model_runner",
++         "model"),
++        ("llm_engine", "model_executor", "model_runner", "model"),
++        ("model_executor", "driver_worker", "model_runner", "model"),
++        ("model_runner", "model"),
++    ]
++    for path in candidates:
++        obj: Any = llm
++        ok = True
++        for attr in path:
++            obj = getattr(obj, attr, None)
++            if obj is None:
++                ok = False
++                break
++        if ok:
++            return obj
++    return None
++
++
++def setup(llm: Any) -> None:
++    """Discover MoE layers, register callback.
++
++    Idempotent: calling twice does not double-register (the registry
++    de-duplicates by callable identity).
++    """
++    global _N_LAYERS, _N_EXPERTS
++
++    if not _CAPTURE_OUTPUT_RESERVOIR:
++        log.info("calibration_output_reservoir: env gate off; no-op setup.")
++        return
++
++    model = _resolve_model(llm)
++    if model is None:
++        log.warning(
++            "calibration_output_reservoir: could not resolve model from LLM; "
++            "callback will be registered but reservoir cells will be lazily "
++            "allocated at first expert_out_unweighted dispatch."
++        )
++
++    # Discover MoE layers by attribute presence. Use the same
++    # named_modules() + moe_layer_id ordering as the other writers so
++    # all three (REAP / per_expert_max / output_reservoir) agree on
++    # layer-rank.
++    n_layers = 0
++    n_experts_seen: int | None = None
++    if model is not None:
++        for name, module in model.named_modules():
++            moe_layer_id = getattr(module, "moe_layer_id", None)
++            num_experts = getattr(module, "num_experts", None)
++            if not (isinstance(moe_layer_id, int)
++                    and isinstance(num_experts, int) and num_experts > 0):
++                continue
++            _LAYER_ID_TO_RANK[moe_layer_id] = n_layers
++            if n_experts_seen is None:
++                n_experts_seen = num_experts
++            elif n_experts_seen != num_experts:
++                log.warning(
++                    "calibration_output_reservoir: mixed expert counts "
++                    "(%d vs first-seen %d at %s); using first.",
++                    num_experts, n_experts_seen, name,
++                )
++            n_layers += 1
++
++    _N_LAYERS = n_layers
++    _N_EXPERTS = int(n_experts_seen) if n_experts_seen is not None else 0
++
++    _ch.register_callback("expert_out_unweighted", _on_expert_out_unweighted)
++
++    log.info(
++        "calibration_output_reservoir: setup complete -- %d MoE layers, "
++        "%d experts/layer, cap=%d; callback registered for "
++        "expert_out_unweighted.",
++        _N_LAYERS, _N_EXPERTS, _MAX_TOKENS,
++    )
++
++
++def _on_expert_out_unweighted(layer_idx: int, unweighted: torch.Tensor,
++                              topk_ids: torch.Tensor, **_: Any) -> None:
++    """Two-phase reservoir-sample per-(layer, expert) into the reservoir.
++
++    ``unweighted`` is ``[n_tok, top_k, hidden]`` bf16 (a slice of the
++    persistent buffer in the Triton kernel); cloned at entry so post-
++    callback mutation of the underlying buffer cannot corrupt the
++    reservoir samples.
++    """
++    if not _CAPTURE_OUTPUT_RESERVOIR:
++        return
++
++    rank = _LAYER_ID_TO_RANK.get(layer_idx)
++    if rank is None:
++        raise RuntimeError(
++            f"calibration_output_reservoir: layer_idx={layer_idx} was not "
++            f"discovered by setup() — the MoE layer must be visible via "
++            f"named_modules() with the moe_layer_id attribute set. "
++            f"Late-discovered layers would force the rank table to grow, "
++            f"breaking the cross-writer rank consistency invariant. Fix "
++            f"the setup() pass to find ALL MoE layers (or this layer's "
++            f"FusedMoE module is missing the moe_layer_id attribute)."
++        )
++
++    if unweighted is None or unweighted.numel() == 0:
++        return
++
++    # Clone immediately + move to CPU + float32 for the math. The clone
++    # is critical: ``unweighted`` is a slice of a persistent Triton
++    # buffer; the next forward overwrites it in place.
++    uw = unweighted.detach().clone().cpu().to(torch.float32)   # [n_tok, top_k, hidden]
++    hidden_dim = uw.shape[-1]
++    flat_uw = uw.reshape(-1, hidden_dim)                       # [n_tok * top_k, hidden]
++    flat_ids = topk_ids.detach().cpu().to(torch.int64).reshape(-1)
++
++    # Group by expert id (only iterate experts that actually appear in
++    # this dispatch — saves work on the typical sparse routing pattern
++    # where < n_experts unique ids show up per micro-batch).
++    unique_ids = torch.unique(flat_ids).tolist()
++    for e_int in unique_ids:
++        e = int(e_int)
++        mask = flat_ids == e
++        rows = flat_uw[mask]                                   # [n_e, hidden]
++        n_e = int(rows.shape[0])
++        if n_e == 0:
++            continue
++        key = (rank, e)
++        reservoir = _RESERVOIR.get(key)
++        if reservoir is None:
++            reservoir = torch.zeros(
++                _MAX_TOKENS, hidden_dim, dtype=torch.float32,
++            )
++            _RESERVOIR[key] = reservoir
++
++        seen = _SEEN.get(key, 0)
++        cap = _MAX_TOKENS
++        n_filled = min(seen, cap)
++
++        # Phase 1: fill empty slots with the head of rows. Always-accept
++        # regime — equivalent to ``seen + i <= cap``.
++        n_to_fill = min(cap - n_filled, n_e)
++        if n_to_fill > 0:
++            reservoir[n_filled:n_filled + n_to_fill] = rows[:n_to_fill]
++
++        # Phase 2: reservoir sampling for tokens beyond capacity.
++        n_remaining = n_e - n_to_fill
++        if n_remaining > 0:
++            # Token at remaining-index j (1-indexed within the tail) is at
++            # global position (seen + n_to_fill + j). Acceptance
++            # probability cap / position. Matches
++            # ExpertOutputAccumulator.update() in activation_hooks.py.
++            positions = (
++                seen + n_to_fill
++                + torch.arange(1, n_remaining + 1, dtype=torch.float32)
++            )
++            probs = float(cap) / positions                       # [n_remaining]
++            u = torch.rand(n_remaining)
++            accept_mask = u < probs                              # [n_remaining]
++            slots = torch.randint(0, cap, (n_remaining,))
++            accepted = accept_mask.nonzero(as_tuple=True)[0]
++            if accepted.numel() > 0:
++                src_rows = rows[n_to_fill + accepted]
++                dst_slots = slots[accepted]
++                # Last-wins on collision; uniform reservoir-sample preserved.
++                reservoir[dst_slots] = src_rows
++
++        new_seen = seen + n_e
++        _SEEN[key] = new_seen
++        _VALID_COUNT[key] = min(new_seen, cap)
++
++
++def dump_output_reservoir(jsonl_path: str | Path) -> None:
++    """Write the final output-reservoir sidecar via the Item-0 helper.
++
++    Stacks all per-(rank, e) reservoirs into a dense
++    ``[n_layers, n_experts, max_tokens, hidden]`` bf16 tensor (unfilled
++    cells are zero-padded), plus per-(rank, e) ``valid_count`` and
++    ``total_seen`` int64 tensors.
++    """
++    if not _CAPTURE_OUTPUT_RESERVOIR:
++        return
++
++    # Lazy import so the moe_compress dependency is not imposed at module
++    # import time (the dump path is only ever called by the driver).
++    from moe_compress.utils.cached_calibration_signals import (
++        OutputReservoirPayload, save_output_reservoir, SCHEMA_VERSIONS,
++    )
++
++    if _N_LAYERS == 0 or _N_EXPERTS == 0:
++        log.warning(
++            "calibration_output_reservoir: no MoE layers seen; skipping dump."
++        )
++        return
++
++    # Discover hidden_dim from the first allocated reservoir. If NO
++    # reservoirs were ever populated we cannot determine hidden_dim and
++    # the sidecar cannot be written.
++    hidden_dim: int | None = None
++    for t in _RESERVOIR.values():
++        hidden_dim = int(t.shape[-1])
++        break
++    if hidden_dim is None:
++        log.warning(
++            "calibration_output_reservoir: zero reservoirs populated "
++            "(no expert_out_unweighted dispatches fired); skipping dump."
++        )
++        return
++
++    # Dense [n_layers, n_experts, max_tokens, hidden] payload. Zero-pad
++    # cells with no traffic (they will be excluded by the cache reader's
++    # valid_count > 0 filter).
++    reservoir_dense = torch.zeros(
++        _N_LAYERS, _N_EXPERTS, _MAX_TOKENS, hidden_dim, dtype=torch.float32,
++    )
++    valid_count = torch.zeros(_N_LAYERS, _N_EXPERTS, dtype=torch.int64)
++    total_seen = torch.zeros(_N_LAYERS, _N_EXPERTS, dtype=torch.int64)
++
++    for (rank, e), t in _RESERVOIR.items():
++        if 0 <= rank < _N_LAYERS and 0 <= e < _N_EXPERTS:
++            reservoir_dense[rank, e] = t
++        valid_count[rank, e] = int(_VALID_COUNT.get((rank, e), 0))
++        total_seen[rank, e] = int(_SEEN.get((rank, e), 0))
++
++    payload = OutputReservoirPayload(
++        schema_version=SCHEMA_VERSIONS["output_reservoir"],
++        n_experts=_N_EXPERTS,
++        n_layers=_N_LAYERS,
++        reservoir=reservoir_dense,
++        valid_count=valid_count,
++        total_seen=total_seen,
++        max_tokens=_MAX_TOKENS,
++    )
++    save_output_reservoir(payload, Path(jsonl_path))
++    log.info(
++        "calibration_output_reservoir: wrote %d-layer × %d-expert × %d-tok × "
++        "%d-hidden sidecar next to %s",
++        _N_LAYERS, _N_EXPERTS, _MAX_TOKENS, hidden_dim, jsonl_path,
++    )
++
++
++def dump_output_reservoir_checkpoint(ckpt_path: str) -> None:
++    """Atomic checkpoint of raw reservoir state for resume.
++
++    ``hidden_dim`` is implicitly stored as part of each per-(rank, e)
++    tensor's shape; on load we reconstruct that shape verbatim.
++    """
++    if not _CAPTURE_OUTPUT_RESERVOIR:
++        return
++    payload = {
++        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
++        "n_prompts_accumulated": _n_prompts_accumulated,
++        "n_layers": _N_LAYERS,
++        "n_experts": _N_EXPERTS,
++        "max_tokens": _MAX_TOKENS,
++        "layer_id_to_rank": dict(_LAYER_ID_TO_RANK),
++        "reservoir": {k: v.clone() for k, v in _RESERVOIR.items()},
++        "seen": dict(_SEEN),
++        "valid_count": dict(_VALID_COUNT),
++    }
++    tmp = ckpt_path + ".tmp"
++    torch.save(payload, tmp)
++    os.replace(tmp, ckpt_path)
++
++
++def load_output_reservoir_checkpoint(ckpt_path: str) -> int:
++    """Hydrate reservoir state from a previous run's checkpoint. Returns
++    n_prompts_accumulated; 0 if file missing."""
++    global _N_LAYERS, _N_EXPERTS, _n_prompts_accumulated
++    if not os.path.exists(ckpt_path):
++        return 0
++    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
++    schema = int(payload.get("schema_version", 0))
++    if schema != _CHECKPOINT_SCHEMA_VERSION:
++        raise ValueError(
++            f"calibration_output_reservoir: checkpoint at {ckpt_path} has "
++            f"schema_version={schema}, expected {_CHECKPOINT_SCHEMA_VERSION}. "
++            f"Delete the checkpoint to restart from scratch."
++        )
++    ckpt_cap = int(payload.get("max_tokens", _MAX_TOKENS))
++    if ckpt_cap != _MAX_TOKENS:
++        raise ValueError(
++            f"calibration_output_reservoir: checkpoint at {ckpt_path} was "
++            f"written with max_tokens={ckpt_cap} but the current run is "
++            f"configured for max_tokens={_MAX_TOKENS}. The two-phase "
++            f"reservoir-sample math depends on a consistent cap across the "
++            f"full run -- delete the checkpoint or restore the matching "
++            f"VLLM_CALIB_OUTPUT_RESERVOIR_CAP."
++        )
++    _n_prompts_accumulated = int(payload["n_prompts_accumulated"])
++    _N_LAYERS = int(payload["n_layers"])
++    _N_EXPERTS = int(payload["n_experts"])
++    _LAYER_ID_TO_RANK.clear()
++    _LAYER_ID_TO_RANK.update({int(k): int(v) for k, v in payload.get(
++        "layer_id_to_rank", {}).items()})
++    _RESERVOIR.clear()
++    _SEEN.clear()
++    _VALID_COUNT.clear()
++    for k, t in payload.get("reservoir", {}).items():
++        rk = (int(k[0]), int(k[1]))
++        _RESERVOIR[rk] = t.to(torch.float32).clone()
++    for k, v in payload.get("seen", {}).items():
++        _SEEN[(int(k[0]), int(k[1]))] = int(v)
++    for k, v in payload.get("valid_count", {}).items():
++        _VALID_COUNT[(int(k[0]), int(k[1]))] = int(v)
++    return _n_prompts_accumulated
 diff --git a/vllm/calibration_per_expert_max.py b/vllm/calibration_per_expert_max.py
 new file mode 100644
 index 0000000..8ce03ab
@@ -7071,10 +7992,10 @@ index 0000000..516237c
 +        _WEIGHT_SUM_ACCUM[int(r)] = t.to(torch.float32).clone()
 +    return _n_prompts_accumulated
 diff --git a/vllm/envs.py b/vllm/envs.py
-index ded474d..1eea2c8 100755
+index ded474d..9380288 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -268,6 +268,19 @@ if TYPE_CHECKING:
+@@ -268,6 +268,21 @@ if TYPE_CHECKING:
      VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
      VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
      VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -7091,10 +8012,12 @@ index ded474d..1eea2c8 100755
 +    VLLM_CALIB_CAPTURE_PER_EXPERT_MAX: bool = False
 +    VLLM_CALIB_CAPTURE_ROUTING_STATS: bool = False
 +    VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS: bool = False
++    VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR: bool = False
++    VLLM_CALIB_OUTPUT_RESERVOIR_CAP: int = 256
  
  
  def get_default_cache_root():
-@@ -1788,6 +1801,127 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1788,6 +1803,154 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
          int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
      ),
@@ -7218,6 +8141,33 @@ index ded474d..1eea2c8 100755
 +    # n_normal_tokens (int64) + bos_token_id. Default off.
 +    "VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS": lambda: bool(
 +        int(os.getenv("VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS", "0"))
++    ),
++    # Calibration capture gate for per-(layer, expert) expert-output
++    # reservoir sampling (Item 6 of the calibration-v2 writers campaign,
++    # ``vllm.calibration_output_reservoir``). REQUIRES
++    # VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 so the
++    # ``expert_out_unweighted`` hook dispatches from the Triton MoE
++    # forward path, and VLLM_USE_FLASHINFER_MOE_FP16=0 (Triton backend;
++    # the FlashInfer monolithic path does not expose unweighted slices).
++    # The calibration-v2 driver
++    # (``build_self_traces_calib_vllm.py --capture-output-reservoir``)
++    # sets all three. Output is the dense sidecar at
++    # ``<jsonl>/sidecars/output_reservoir.pt`` (schema v1) with a
++    # ``[n_layers, n_experts, max_tokens, hidden]`` bf16 reservoir
++    # + per-(layer, expert) ``valid_count`` and ``total_seen`` int64.
++    # Default off.
++    "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": lambda: bool(
++        int(os.getenv("VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR", "0"))
++    ),
++    # Capacity (max tokens per (layer, expert) cell) of the
++    # output-reservoir writer. Default 256 mirrors the live
++    # ``ExpertOutputAccumulator.max_tokens_per_expert`` and the storage
++    # budget documented on ``OutputReservoirPayload``. Increasing this
++    # linearly scales both peak memory during the run (CPU reservoirs)
++    # and the on-disk sidecar size. Only consulted when
++    # ``VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR=1``.
++    "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": lambda: int(
++        os.getenv("VLLM_CALIB_OUTPUT_RESERVOIR_CAP", "256")
 +    ),
  }
  

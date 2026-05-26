@@ -50,28 +50,29 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply calibration hooks patch ==="
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-router-logits-stats-writer/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-output-reservoir-writer/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected MD5: 2f05332467dafd54e7083494e4aa7823 (7824 lines)
-# Adds the per-(layer, expert) sink-vs-normal router-score aggregate
-# writer (Item 4 of the calibration-v2 writers campaign), on top of
-# the previous routing-stats + per-expert-max + input-cov + REAP-
-# scores writers. Subscribes to the existing ``router`` hook (no
-# FlashInfer or EXPERT_UNWEIGHTED requirement -- the router hook
-# fires on every MoE backend) via the chained-callback registry. Per
-# callback invocation: softmax the router_logits row, partition tokens
-# by a sink/normal mask (BOS-id when input_ids supplied, else
-# position-0-only fallback), scatter-add per-(layer, expert) sums +
-# fire-on-sink counts + per-layer token counts into CPU accumulators.
-# Writes a dense RouterLogitsStatsPayload sidecar (schema v1,
-# per-(layer, expert) score_sink_sum / score_normal_sum float32 +
-# fire_on_sink int64 + per-layer n_sink_tokens / n_normal_tokens int64
-# + bos_token_id) at run end. Consumed by Stage 1's
-# Stage1RouterLogitsStatsCacheProvider: on hit hydrates a pre-finalized
-# SinkTokenRoutingAccumulator into ctx.sink_acc and the live router-
-# logits + softmax + top-k HookSpec is dropped from the calibration
+# Expected MD5: 423b8267b18fc8f0990cd7c9b9f24828 (8774 lines)
+# Adds the per-(layer, expert) expert-output reservoir writer (Item 6
+# of the calibration-v2 writers campaign), on top of the previous
+# router-logits-stats + routing-stats + per-expert-max + input-cov +
+# REAP-scores writers. Subscribes to the existing
+# ``expert_out_unweighted`` hook (chained alongside REAP-scores and
+# per-expert-max via the multi-callback registry; requires Triton
+# MoE backend -- FlashInfer monolithic path disabled). Per callback
+# invocation: flatten unweighted [n_tok, top_k, hidden] +
+# topk_ids[n_tok, top_k]; group rows by expert id; two-phase fill+
+# sample into per-(layer, expert) CPU reservoirs (cap configurable
+# via VLLM_CALIB_OUTPUT_RESERVOIR_CAP, default 256). Writes a dense
+# OutputReservoirPayload sidecar (schema v1,
+# [n_layers, n_experts, max_tokens, hidden] bf16 reservoir +
+# per-(layer, expert) valid_count + total_seen int64 + max_tokens
+# scalar) at run end. Consumed by Stage 1's
+# Stage1OutputReservoirCacheProvider: on hit hydrates a pre-finalized
+# ExpertOutputAccumulator into ctx.output_acc and the live Phase-B
+# per-expert reservoir-sample HookSpec is dropped from the calibration
 # registration set.
 # See max_quality/patches/MANIFEST.md.
 git apply --check /tmp/calib.patch
@@ -202,8 +203,8 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-router-logits-stats-writer`)
-- Patch artifact (7824 lines, MD5 `2f05332467dafd54e7083494e4aa7823`): also uploaded to this repo as `vllm_calibration_hooks.patch`
+- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-output-reservoir-writer`)
+- Patch artifact (8774 lines, MD5 `423b8267b18fc8f0990cd7c9b9f24828`): also uploaded to this repo as `vllm_calibration_hooks.patch`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130

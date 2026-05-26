@@ -41,6 +41,7 @@ from moe_compress.utils.cached_calibration_signals import (
     BaseLiveProvider,
     BlockHiddenPayload,
     CovariancePayload,
+    OutputReservoirPayload,
     PhaseBPayload,
     RouterKDLogitsPayload,
     RouterLogitsStatsPayload,
@@ -51,6 +52,7 @@ from moe_compress.utils.cached_calibration_signals import (
     TeacherEvalPayload,
     load_block_hidden,
     load_covariance,
+    load_output_reservoir,
     load_per_expert_max,
     load_phase_b,
     load_reap_scores,
@@ -62,6 +64,7 @@ from moe_compress.utils.cached_calibration_signals import (
     router_kd_logits_dir,
     save_block_hidden,
     save_covariance,
+    save_output_reservoir,
     save_per_expert_max,
     save_phase_b,
     save_reap_scores,
@@ -450,6 +453,77 @@ def test_router_logits_stats_roundtrip(tmp_path):
 
     expected_path.unlink()
     assert load_router_logits_stats(jsonl) is None
+
+
+def _make_output_reservoir(
+    n_layers: int = 2, n_experts: int = 3,
+    max_tokens: int = 4, hidden_dim: int = 5,
+) -> OutputReservoirPayload:
+    # Deterministic small payload; reservoir is fp32 on the writer side
+    # and gets cast to bf16 inside save_output_reservoir.
+    reservoir = torch.arange(
+        n_layers * n_experts * max_tokens * hidden_dim, dtype=torch.float32,
+    ).reshape(n_layers, n_experts, max_tokens, hidden_dim)
+    valid_count = torch.tensor(
+        [[max_tokens, max_tokens - 1, 0],
+         [max_tokens - 2, max_tokens, 1]],
+        dtype=torch.int64,
+    )
+    total_seen = torch.tensor(
+        [[max_tokens, max_tokens - 1, 0],
+         [max_tokens * 3, max_tokens * 5, 1]],
+        dtype=torch.int64,
+    )
+    return OutputReservoirPayload(
+        schema_version=SCHEMA_VERSIONS["output_reservoir"],
+        n_experts=n_experts,
+        n_layers=n_layers,
+        reservoir=reservoir,
+        valid_count=valid_count,
+        total_seen=total_seen,
+        max_tokens=max_tokens,
+    )
+
+
+def test_output_reservoir_roundtrip(tmp_path):
+    """Per-(layer, expert) output reservoir round-trips through save/load.
+
+    Validates: (a) the sidecar lands at the documented path, (b) the
+    reservoir tensor survives the bf16 cast (equal modulo dtype precision),
+    (c) valid_count + total_seen are preserved as int64 on CPU, and
+    (d) the max_tokens scalar field is preserved as Python int.
+    """
+    jsonl = _jsonl(tmp_path)
+    original = _make_output_reservoir()
+    save_output_reservoir(original, jsonl)
+
+    expected_path = sidecar_path(jsonl, "output_reservoir")
+    assert expected_path.exists()
+    # tmp file does not leak after the atomic os.replace.
+    assert not Path(str(expected_path) + ".tmp").exists()
+
+    loaded = load_output_reservoir(jsonl)
+    assert loaded is not None
+    assert loaded.schema_version == SCHEMA_VERSIONS["output_reservoir"]
+    assert loaded.n_experts == original.n_experts
+    assert loaded.n_layers == original.n_layers
+    assert loaded.max_tokens == original.max_tokens
+    # Reservoir is byte-identical to the bf16-cast original (the writer
+    # casts via .to(dtype=torch.bfloat16); compare against the same cast).
+    expected_reservoir = original.reservoir.cpu().to(torch.bfloat16)
+    assert torch.equal(loaded.reservoir, expected_reservoir)
+    assert loaded.reservoir.dtype == torch.bfloat16
+    assert loaded.reservoir.device.type == "cpu"
+    assert torch.equal(loaded.valid_count, original.valid_count.cpu())
+    assert torch.equal(loaded.total_seen, original.total_seen.cpu())
+    assert loaded.valid_count.dtype == torch.int64
+    assert loaded.total_seen.dtype == torch.int64
+    assert loaded.valid_count.device.type == "cpu"
+    assert loaded.total_seen.device.type == "cpu"
+    assert isinstance(loaded.max_tokens, int)
+
+    expected_path.unlink()
+    assert load_output_reservoir(jsonl) is None
 
 
 def test_covariance_roundtrip(tmp_path):

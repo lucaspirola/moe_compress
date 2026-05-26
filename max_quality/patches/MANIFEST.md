@@ -8,11 +8,11 @@ the patch (the HF Jobs build script, the README uploaded to
 
 | Field | Value |
 |---|---|
-| Immutable tag | `calib-v2-router-logits-stats-writer` |
+| Immutable tag | `calib-v2-output-reservoir-writer` |
 | Branch (active) | `feat/calibration-v2` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch line count | **7824** |
-| Patch MD5 | **`2f05332467dafd54e7083494e4aa7823`** |
+| Patch line count | **8774** |
+| Patch MD5 | **`423b8267b18fc8f0990cd7c9b9f24828`** |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -22,9 +22,9 @@ the patch (the HF Jobs build script, the README uploaded to
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: 2f05332467dafd54e7083494e4aa7823
+# expect: 423b8267b18fc8f0990cd7c9b9f24828
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 7824
+# expect: 8774
 
 # Re-apply against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -34,7 +34,83 @@ git apply --check /path/to/vllm_calibration_hooks.patch && echo OK
 
 ## Change log
 
-### `calib-v2-router-logits-stats-writer` (current)
+### `calib-v2-output-reservoir-writer` (current)
+Adds the per-(layer, expert) expert-output reservoir writer
+(Item 6 of the calibration-v2 writers campaign).
+- `vllm/calibration_output_reservoir.py`: new module subscribing the
+  existing ``expert_out_unweighted`` hook (chained alongside REAP-
+  scores and per-expert-max via the multi-callback registry) to
+  reservoir-sample per-(layer, expert) unweighted expert outputs into
+  CPU fp32 reservoirs (lazy-allocated per cell, lazily because typical
+  sparse routing only touches a fraction of (layer, expert) pairs per
+  dispatch). The two-phase fill+sample math replicates
+  :meth:`ExpertOutputAccumulator.update` byte-for-byte: Phase 1 fills
+  empty slots sequentially while ``seen < max_tokens``; Phase 2
+  accepts each further token with probability ``max_tokens / (seen +
+  n_fill + j)`` and on accept writes to a uniformly-random slot
+  (last-wins on collision). The persistent-buffer clone guard mirrors
+  per-expert-max. ``dump_output_reservoir`` stacks all per-(rank, e)
+  reservoirs into a dense ``[n_layers, n_experts, max_tokens, hidden]``
+  bf16 tensor (zero-padded for unfilled cells) and writes the
+  ``OutputReservoirPayload`` sidecar (schema v1, includes per-(layer,
+  expert) ``valid_count`` and ``total_seen`` int64 + the ``max_tokens``
+  scalar) via
+  ``moe_compress.utils.cached_calibration_signals.save_output_reservoir``.
+  ``dump_output_reservoir_checkpoint`` /
+  ``load_output_reservoir_checkpoint`` mirror the imatrix / REAP /
+  input-cov / per-expert-max / routing-stats / router-logits-stats
+  resumability cadence (atomic tmp+rename, schema-versioned,
+  CPU-resident reservoirs -> CUDA-graph-safe). Cap is sampled at
+  module import from ``VLLM_CALIB_OUTPUT_RESERVOIR_CAP`` (default 256)
+  so the writer's two-phase math is consistent across a resume; a
+  mismatch on load raises ``ValueError``. FlashInfer monolithic path
+  is disabled (no ``expert_out_unweighted`` available there).
+- `vllm/envs.py`: add ``VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR`` +
+  ``VLLM_CALIB_OUTPUT_RESERVOIR_CAP`` to the ``TYPE_CHECKING`` block
+  and the ``environment_variables`` dispatch dict for discoverability
+  through ``vllm.envs``.
+- `tests/test_calibration_output_reservoir_smoke.py`: +6 tests covering
+  the fill-only-regime byte-equality math (token rows preserved in
+  routing order), env-off short-circuit (setup + callback both no-op),
+  checkpoint round-trip (reservoirs + bookkeeping + cap survive a
+  reimport), two-segment additivity in the fill-only regime (exact
+  equality across a checkpoint+reload split), persistent-buffer clone
+  safety (post-callback ``unweighted.fill_(...)`` does NOT corrupt
+  stored reservoir rows), and the final-dump payload shape +
+  ``valid_count`` correctness (rank-1 untouched cells stay zero-filled
+  with valid_count=0; rank-0 populated cells preserve their slabs).
+
+Driver-side companion (`build_self_traces_calib_vllm.py`): new flags
+``--capture-output-reservoir`` + ``--output-reservoir-cap`` (default
+256) + ``--output-reservoir-checkpoint-every-chunks`` (default 1),
+parallel env-gating block (``VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR=1``,
+``VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1``,
+``VLLM_USE_FLASHINFER_MOE_FP16=0``, ``VLLM_CALIB_OUTPUT_RESERVOIR_CAP=<value>``),
+post-``_load_teacher_vllm`` setup + resume hydration, periodic in-loop
+checkpoint, and final dump that removes the now-stale ckpt.
+``or_ckpt_path`` is hoisted out of the per-feature ``if`` block (same
+N1 pattern as Item 1).
+
+Stage 1 reader-side companion: ``Stage1OutputReservoirCacheProvider``
+(``max_quality/src/moe_compress/stage1/plugins/output_reservoir_cache.py``)
+consulted by the Stage 1 orchestrator's STEP 4.8 immediately AFTER
+STEP 4.7 (Item 4's router_logits_stats attempt) with the same
+try/except guard pattern. On hit the provider hydrates a pre-
+finalized ``ExpertOutputAccumulator`` directly into ``ctx.output_acc``
+(slicing each cell to ``valid_count`` per the writer's bookkeeping;
+zero-valid-count cells are excluded to match the live absent-key
+convention) AND the orchestrator drops ``"output_reservoir"`` from
+``needed`` so the live Phase-B per-expert reservoir-sample HookSpec
+is NOT registered. STEP 5's ``ctx.set("output_acc", ...)`` and STEP
+7's ``built["output_reservoir"].finalize()`` are both guarded against
+the cache-hit case (``if not _or_cache_hit`` and
+``if "output_reservoir" in built`` respectively). Topology consistency
+check raises ``ValueError`` if the sidecar's ``n_layers`` disagrees
+with the live model.
+
+Schema bump: ``SCHEMA_VERSIONS["output_reservoir"] = 1`` (new entry).
+
+### `calib-v2-router-logits-stats-writer` (previous)
 Adds the per-(layer, expert) sink-vs-normal router-score aggregate
 writer (Item 4 of the calibration-v2 writers campaign).
 - `vllm/calibration_router_logits_stats.py`: new module subscribing the

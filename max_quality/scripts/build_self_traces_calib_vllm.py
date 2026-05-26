@@ -562,6 +562,47 @@ def main() -> int:
                         "--resume, the checkpoint at "
                         "<jsonl>.router_logits_stats.ckpt is hydrated "
                         "automatically if it exists.")
+    p.add_argument("--capture-output-reservoir", action="store_true",
+                   default=False,
+                   help="Capture per-(layer, expert) unweighted expert-"
+                        "output reservoirs during calibration and write a "
+                        "moe_compress-side sidecar at "
+                        "<jsonl>/sidecars/output_reservoir.pt at run end "
+                        "(schema v1, dense [n_layers, n_experts, "
+                        "max_tokens, hidden] bf16 tensor + per-(layer, "
+                        "expert) valid_count / total_seen int64 + "
+                        "max_tokens scalar). Item 6 of the calibration-v2 "
+                        "writers campaign. Hydrates Stage 1's "
+                        "ExpertOutputAccumulator from the sidecar, "
+                        "allowing the CKADistancePlugin to skip its live "
+                        "Phase-B reservoir-build forward pass entirely. "
+                        "Auto-enables VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR=1 + "
+                        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
+                        "VLLM_USE_FLASHINFER_MOE_FP16=0 + "
+                        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP=<value> BEFORE "
+                        "any vllm import. Failures during dump are "
+                        "logged but do NOT re-raise.")
+    p.add_argument("--output-reservoir-cap", type=int, default=256,
+                   help="Per-(layer, expert) reservoir capacity (max "
+                        "tokens stored per cell). Mirrors "
+                        "ExpertOutputAccumulator.max_tokens_per_expert "
+                        "(default 256). Increasing this linearly scales "
+                        "both peak memory during the run and the on-disk "
+                        "sidecar size. Only consulted when "
+                        "--capture-output-reservoir is set; baked into "
+                        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP before vllm "
+                        "import.")
+    p.add_argument("--output-reservoir-checkpoint-every-chunks", type=int,
+                   default=1,
+                   help="When --capture-output-reservoir is set, dump a "
+                        "checkpoint (.output_reservoir.ckpt) of the live "
+                        "reservoir state every N chunked LLM.generate "
+                        "calls. Default 1 = checkpoint at every JSONL "
+                        "flush boundary. Set 0 to disable periodic "
+                        "checkpointing (final-dump-only). On --resume, "
+                        "the checkpoint at "
+                        "<jsonl>.output_reservoir.ckpt is hydrated "
+                        "automatically if it exists.")
     args = p.parse_args()
 
     # Pre-import env gates for the imatrix path. These MUST be set before any
@@ -658,6 +699,30 @@ def main() -> int:
                  "VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS=1 + "
                  "VLLM_CALIB_CAPTURE_ROUTER=1 "
                  "(must precede vllm import)")
+
+    # Pre-import env gates for the output-reservoir path. Same strict-
+    # string rule: vllm.calibration_hooks samples these once at module
+    # import. VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED is REQUIRED so the
+    # expert_out_unweighted callback dispatches; output-reservoir shares
+    # the hook with REAP-scores + per-expert-max via the chained-callback
+    # registry. FlashInfer monolithic path is disabled because
+    # expert_out_unweighted is not available on that backend.
+    # VLLM_CALIB_OUTPUT_RESERVOIR_CAP is sampled at writer-module import
+    # alongside the gate so it must also be set BEFORE the first vllm
+    # import.
+    if args.capture_output_reservoir:
+        os.environ["VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED"] = "1"
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
+        os.environ["VLLM_CALIB_OUTPUT_RESERVOIR_CAP"] = str(
+            args.output_reservoir_cap
+        )
+        log.info("--capture-output-reservoir: enabled "
+                 "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR=1 + "
+                 "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
+                 "VLLM_USE_FLASHINFER_MOE_FP16=0 + "
+                 "VLLM_CALIB_OUTPUT_RESERVOIR_CAP=%d "
+                 "(must precede vllm import)", args.output_reservoir_cap)
 
     # --- cache_key + paths ----------------------------------------------
     # prev_num_prompts is folded into the prompts_source field so an extended
@@ -785,6 +850,7 @@ def main() -> int:
     pem_ckpt_path = None
     rts_ckpt_path = None
     router_logits_ckpt_path = None
+    or_ckpt_path = None
 
     # --- imatrix accumulator setup (pre-CUDA-graph) ---------------------
     # The imatrix module must pre-allocate accumulator tensors for every
@@ -1036,6 +1102,47 @@ def main() -> int:
                 )
                 router_logits_ckpt_path.unlink()
 
+    # --- output-reservoir accumulator setup (pre-CUDA-graph) -----------
+    # Mirrors the per-expert-max / reap-scores blocks: setup() registers
+    # the expert_out_unweighted callback (chained alongside REAP-scores
+    # and per-expert-max via the multi-callback registry) and builds the
+    # layer->rank map. Resume: hydrate the checkpoint that sits next to
+    # the JSONL at <jsonl>.output_reservoir.ckpt.
+    if args.capture_output_reservoir:
+        import vllm.calibration_output_reservoir as _or  # type: ignore
+        _or.setup(llm)
+        log.info("output-reservoir: setup complete -- "
+                 "expert_out_unweighted callback registered (cap=%d)",
+                 args.output_reservoir_cap)
+
+        or_ckpt_path = out_path.with_suffix(".output_reservoir.ckpt")
+        if args.resume and or_ckpt_path.exists():
+            try:
+                loaded_prompts = _or.load_output_reservoir_checkpoint(
+                    str(or_ckpt_path),
+                )
+                if loaded_prompts != already_done:
+                    log.warning(
+                        "output-reservoir: checkpoint has %d prompts "
+                        "but JSONL has %d rows -- proceeding with the "
+                        "cumulative counter from the checkpoint.",
+                        loaded_prompts, already_done,
+                    )
+                else:
+                    log.info(
+                        "output-reservoir: hydrated %d-prompt "
+                        "checkpoint from %s",
+                        loaded_prompts, or_ckpt_path,
+                    )
+            except ValueError as exc:
+                log.error(
+                    "output-reservoir: checkpoint schema mismatch "
+                    "(%s); deleting stale checkpoint and starting "
+                    "reservoirs from zero.",
+                    exc,
+                )
+                or_ckpt_path.unlink()
+
     # --- sampling params ------------------------------------------------
     from vllm import SamplingParams  # type: ignore
     # vLLM's reasoning_budget is exposed via `extra_args` (PR #20859 path).
@@ -1236,6 +1343,28 @@ def main() -> int:
                             exc, exc_info=True,
                         )
 
+            # Periodic output-reservoir checkpoint -- same cadence pattern.
+            if (args.capture_output_reservoir
+                    and args.output_reservoir_checkpoint_every_chunks > 0):
+                chunk_idx = chunk_start // args.chunk_size
+                every = args.output_reservoir_checkpoint_every_chunks
+                if (chunk_idx + 1) % every == 0:
+                    try:
+                        import vllm.calibration_output_reservoir as _or  # type: ignore
+                        _or.set_n_prompts_accumulated(already_done + n_new)
+                        _or.dump_output_reservoir_checkpoint(
+                            str(or_ckpt_path),
+                        )
+                        log.info(
+                            "output-reservoir: checkpointed %d prompts -> %s",
+                            already_done + n_new, or_ckpt_path,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "output-reservoir checkpoint failed: %s",
+                            exc, exc_info=True,
+                        )
+
     # --- imatrix dump ---------------------------------------------------
     # Run BEFORE the JSONL finalize so a failure here can't corrupt the
     # rename, but in a try/except so a failure doesn't lose the JSONL.
@@ -1349,6 +1478,25 @@ def main() -> int:
         except Exception as exc:
             log.error(
                 "router-logits-stats dump failed: %s", exc, exc_info=True,
+            )
+
+    # --- output-reservoir dump -----------------------------------------
+    # Same try/except policy: the JSONL is the primary deliverable.
+    if args.capture_output_reservoir:
+        try:
+            import vllm.calibration_output_reservoir as _or  # type: ignore
+            _or.set_n_prompts_accumulated(already_done + n_new)
+            _or.dump_output_reservoir(out_path)
+            log.info(
+                "output-reservoir: dumped sidecar from %d prompts "
+                "(next to %s)",
+                _or.get_n_prompts_accumulated(), out_path,
+            )
+            if or_ckpt_path is not None and or_ckpt_path.exists():
+                or_ckpt_path.unlink()
+        except Exception as exc:
+            log.error(
+                "output-reservoir dump failed: %s", exc, exc_info=True,
             )
 
     # --- finalize -------------------------------------------------------
