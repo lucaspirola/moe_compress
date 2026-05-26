@@ -17,7 +17,7 @@
 - [x] **P3+P4** (combined): REAP-exact YAML preset + skip-intermediate orchestration. Commits `48cfc01` + `bdbc2d9`. Loop closed at iter 2. YAML-only entry point (no new CLI flag), `pipeline.skip_intermediate_stages: true` + `pipeline.evaluator: stage6alt`. 6 new tests + docs. 81 regression tests still green.
 
 ## Phase 4 — Remaining 8 writers
-- [ ] **Item 1**: Teacher per-expert `Σ_in[layer][expert]` writer + Stage 3/4 cache readers.
+- [x] **Item 1**: Teacher per-expert `Σ_in[layer][expert]` writer + Stage 3/4 cache readers. Commits `08562c7` + `389a923` (iter-1 fixes for 8 findings). Loop closed at iter 2. Patch now 5350 lines, MD5 `c35dc497cd3e9268c7448410bdddf80c`. New tag `calib-v2-input-cov-writer-chained-callbacks`. **CRITICAL: vllm/calibration_hooks.py registry was restructured to support chained callbacks** (was single-slot, now list-valued with identity-dedup) — required to fix the latent expert_in collision between imatrix + input-cov writers.
 - [ ] **Item 2**: Per-expert `down_proj` output magnitudes writer + Stage 1 readers.
 - [ ] **Item 3**: Routing freq + mean weight writer + Stage 1/2 readers.
 - [ ] **Item 4**: Per-layer pre-softmax router logits writer + Stage 1 SinkToken reader.
