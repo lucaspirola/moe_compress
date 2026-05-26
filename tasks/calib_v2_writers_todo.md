@@ -14,8 +14,7 @@
 - [x] **V1+V2**: REAP-exact via vLLM hooks — writer in patch (router + expert_out_unweighted scatter-reduce); stage-2 cache-reader plugin (`dispatch_first` slot pattern). Commits `1fd9cc4` + `36f08af` (review-fix iter 1). Loop closed at iter 2. Patch now 4409 lines, MD5 `e3fba22dc2bb0f5db3822c75a8182ad5`. New tag `calib-v2-reap-scores-writer`. 6 vLLM smoke tests + 7 reader tests, all green. Existing stage 2 tests untouched.
 
 ## Phase 3 — REAP-exact preset
-- [ ] **P3**: `configs/qwen36_35b_a3b_reap_exact.yaml` — keep qwen3-pretrain-mix, skip 2.5/3/4/5.
-- [ ] **P4**: `run_pipeline.py` `--reap-exact` flag + stage-6/6alt input remap from `stage2_pruned/`.
+- [x] **P3+P4** (combined): REAP-exact YAML preset + skip-intermediate orchestration. Commits `48cfc01` + `bdbc2d9`. Loop closed at iter 2. YAML-only entry point (no new CLI flag), `pipeline.skip_intermediate_stages: true` + `pipeline.evaluator: stage6alt`. 6 new tests + docs. 81 regression tests still green.
 
 ## Phase 4 — Remaining 8 writers
 - [ ] **Item 1**: Teacher per-expert `Σ_in[layer][expert]` writer + Stage 3/4 cache readers.
