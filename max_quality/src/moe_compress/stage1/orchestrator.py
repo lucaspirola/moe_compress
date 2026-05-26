@@ -62,6 +62,33 @@ _CKA_RESERVOIR_CAP = 256             # ExpertOutputAccumulator(max_tokens_per_ex
 
 
 # ---------------------------------------------------------------------------
+# Calibration JSONL path resolver — shared by STEP 4.5 / 4.6 / 4.7 (and any
+# future cache-first attempts at Step 5+). Reads ``config["calibration"]
+# ["jsonl_path"]`` (falling back to ``_DEFAULT_SELF_TRACES_PATH``) and
+# anchors relative paths against ``Path.cwd()``. Kept at module level so
+# each STEP block becomes a single-line lookup instead of re-duplicating
+# the same 6-line resolve block.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_calib_jsonl_path(config: dict) -> Path:
+    """Return the absolute Path to the calibration JSONL for this run.
+
+    Source: ``config["calibration"]["jsonl_path"]`` if present, else the
+    package default ``_DEFAULT_SELF_TRACES_PATH``. Relative paths are
+    anchored against ``Path.cwd()`` (matching the legacy STEP 4.5 / 4.6
+    / 4.7 inline behavior verbatim).
+    """
+    from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
+    cal_cfg = config["calibration"]
+    calib_source = cal_cfg.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
+    calib_jsonl_path = Path(calib_source)
+    if not calib_jsonl_path.is_absolute():
+        calib_jsonl_path = Path.cwd() / calib_jsonl_path
+    return calib_jsonl_path
+
+
+# ---------------------------------------------------------------------------
 # Phase-B calibration progress callback — moved verbatim from the legacy
 # Stage 1 module (sub-task 10: the orchestrator now owns it).
 # ---------------------------------------------------------------------------
@@ -304,12 +331,7 @@ def run(
     # miss we leave ``needed`` unchanged and the live path runs at Phase B.
     _pem_cache_hit = False
     try:
-        from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
-        cal_cfg = config["calibration"]
-        _calib_source = cal_cfg.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
-        _calib_jsonl_path = Path(_calib_source)
-        if not _calib_jsonl_path.is_absolute():
-            _calib_jsonl_path = Path.cwd() / _calib_jsonl_path
+        _calib_jsonl_path = _resolve_calib_jsonl_path(config)
         _pem_provider = Stage1PerExpertMaxCacheProvider()
         _pem_payload = _pem_provider.on_load(ctx, _calib_jsonl_path)
         if _pem_payload is not None:
@@ -345,12 +367,7 @@ def run(
     # variants, ...) will be added by later items. Unlike STEP 4.5 we
     # do NOT modify ``needed`` (no live accumulator to skip).
     try:
-        from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
-        cal_cfg = config["calibration"]
-        _calib_source = cal_cfg.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
-        _calib_jsonl_path = Path(_calib_source)
-        if not _calib_jsonl_path.is_absolute():
-            _calib_jsonl_path = Path.cwd() / _calib_jsonl_path
+        _calib_jsonl_path = _resolve_calib_jsonl_path(config)
         _rts_provider = Stage1RoutingStatsCacheProvider()
         _rts_payload = _rts_provider.on_load(ctx, _calib_jsonl_path)
         if _rts_payload is not None:
@@ -399,12 +416,7 @@ def run(
     # router-logits + softmax + top-k pass runs at Phase B.
     _rlsx_cache_hit = False
     try:
-        from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
-        cal_cfg = config["calibration"]
-        _calib_source = cal_cfg.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
-        _calib_jsonl_path = Path(_calib_source)
-        if not _calib_jsonl_path.is_absolute():
-            _calib_jsonl_path = Path.cwd() / _calib_jsonl_path
+        _calib_jsonl_path = _resolve_calib_jsonl_path(config)
         _rlsx_provider = Stage1RouterLogitsStatsCacheProvider()
         _rlsx_payload = _rlsx_provider.on_load(ctx, _calib_jsonl_path)
         if _rlsx_payload is not None:
