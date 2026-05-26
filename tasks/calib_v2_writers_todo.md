@@ -32,11 +32,11 @@
 - [x] **L1**: ~~REAP+REAM (default) refactor — N vLLM passes with `update_weights` between rounds.~~ **SCOPE CUT (halt-trigger invoked)**. Planner identified 3 architectural blockers: (1) `update_weights` CUDA-graph semantics unverified (worst case: 32 min of graph re-captures × 64 layers), (2) vLLM's `expert_in` hook fires at MoE block input but Stage 2 needs per-expert gate_proj inputs (after dispatch/gather) — semantic mismatch requires solving signal-mapping problem, (3) HF↔vLLM expert weight stacking representations differ; arch-specific adapter needed. All 3 require live GPU validation which the autonomous campaign doesn't have. Per the user's pre-authorized halt-triggers ("architectural incompatibility ... `update_weights` doesn't survive cudagraph capture for L1"), L1 is deferred. **Better alternative path documented**: a `Stage2ProfileCacheProvider` (capture REAP/REAM/cov via the one-shot vLLM calibration pass, read in Stage 2 to bypass the profile forward entirely) is the architecturally-cleaner next step IF Stage 2 profile time becomes a bottleneck. The signal-mapping problem must be solved either way; doing it ONCE in the writer (not N times with weight updates) is the simpler path. Reversible: revisit when GPU-equipped engineering session is available.
 
 ## Phase 6 — Deploy
-- [ ] Regenerate patch + bump MANIFEST + new tag.
-- [ ] Push to GitHub.
-- [ ] Kick off HF Jobs build, `/loop` every 15 min.
-- [ ] On BUILD COMPLETE: verify wheel + kill any lingering CPU.
-- [ ] Surface final to user.
+- [x] Regenerate patch + bump MANIFEST + new tag — patch at 10101 lines, MD5 `a8da5e321ac7fb30f1648fba3476bea6`, tag `calib-v2-max-layer-early-exit` (the final tag covering all campaign changes through L2).
+- [x] Push to GitHub — all commits + 8 new immutable tags pushed (`calib-v2-imatrix-resumable`, `calib-v2-reap-scores-writer`, `calib-v2-input-cov-writer-chained-callbacks`, `calib-v2-per-expert-max-writer`, `calib-v2-routing-stats-writer`, `calib-v2-router-logits-stats-writer`, `calib-v2-output-reservoir-writer`, `calib-v2-block-outputs-writer`, `calib-v2-max-layer-early-exit`).
+- [x] Kick off HF Jobs build, `/loop` every 15 min — Job `6a156caff17429a271eee142` started 2026-05-26 09:49 UTC, /loop wakeup at 14:06.
+- [ ] On BUILD COMPLETE: verify wheel at `pirola/vllm-patched-calib` + confirm no lingering CPU instances.
+- [ ] Surface final summary to user.
 
 ## Invariants (apply to every item)
 
