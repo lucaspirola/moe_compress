@@ -54,7 +54,7 @@ curl -sL \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected MD5: 4886a2f826acfc6d5557694603dd190c (9630 lines)
+# Expected MD5: 1375b965b02b4ce7ac0a35fd7f7b23cf (9828 lines)
 # Adds the per-MoE-block hidden-states writer on a fixed N-prompt
 # subset (Item 7 of the calibration-v2 writers campaign), on top of
 # the previous output-reservoir + router-logits-stats + routing-stats
@@ -202,7 +202,7 @@ tags:
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
 - Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-block-outputs-writer`)
-- Patch artifact (9630 lines, MD5 `4886a2f826acfc6d5557694603dd190c`): also uploaded to this repo as `vllm_calibration_hooks.patch`
+- Patch artifact (9828 lines, MD5 `1375b965b02b4ce7ac0a35fd7f7b23cf`): also uploaded to this repo as `vllm_calibration_hooks.patch`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130

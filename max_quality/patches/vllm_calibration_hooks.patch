@@ -1,9 +1,9 @@
 diff --git a/tests/test_calibration_block_outputs_smoke.py b/tests/test_calibration_block_outputs_smoke.py
 new file mode 100644
-index 0000000..a73dd0b
+index 0000000..8cff9eb
 --- /dev/null
 +++ b/tests/test_calibration_block_outputs_smoke.py
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,527 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_block_outputs``.
@@ -32,6 +32,15 @@ index 0000000..a73dd0b
 +6. ``test_dump_produces_per_layer_sidecars`` -- ``dump_block_outputs``
 +   calls ``save_block_hidden`` once per populated rank with the
 +   correct ``layer_idx`` keyed by ``_RANK_TO_LAYER_ID``.
++7. ``test_dump_truncates_on_over_collection_uniform`` -- when the
++   driver over-collects past ``_SUBSET_SIZE`` and the per-prompt token
++   count is uniform, the dumped tensor is truncated to exactly
++   ``_SUBSET_SIZE * tokens_per_prompt`` rows and
++   ``n_prompts_in_subset == _SUBSET_SIZE``.
++8. ``test_dump_no_truncate_on_variable_length`` -- when the driver
++   over-collects but the per-prompt token count is variable (total
++   tokens does not divide evenly by accumulated prompts), the tensor
++   is shipped as-is and the operator is warned.
 +"""
 +from __future__ import annotations
 +
@@ -385,6 +394,143 @@ index 0000000..a73dd0b
 +    assert p30.hidden_states.shape == (5, 3)
 +    # All entries are 4.0 (bf16-round-tripped).
 +    assert torch.all(p30.hidden_states == 4.0)
++
++
++# ---------------------------------------------------------------------------
++# Test 7 -- truncate on over-collection (uniform per-prompt token count)
++# ---------------------------------------------------------------------------
++
++
++def test_dump_truncates_on_over_collection_uniform(tmp_path, monkeypatch):
++    """When the driver over-collects past ``_SUBSET_SIZE`` AND the
++    per-prompt token count is uniform, ``dump_block_outputs`` truncates
++    the concatenated tensor to exactly
++    ``_SUBSET_SIZE * tokens_per_prompt`` rows and reports
++    ``n_prompts_in_subset == _SUBSET_SIZE`` exactly.
++
++    This is the I1/I2 reachability fix: without truncation the
++    over-collected rows would make the Stage 3 reader's strict
++    ``n_tokens == n_prompts * seq_len`` guard reject every sidecar.
++    """
++    # Subset size = 4, but the driver "over-collects" 6 prompts at
++    # chunk-boundary close. Per-prompt token count is uniform (5).
++    bo = _reload_bo({
++        "VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS": "1",
++        "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE": "4",
++        "VLLM_CALIB_CAPTURE_BLOCK": "1",
++    })
++    assert bo._SUBSET_SIZE == 4
++    _seed_layer(bo, layer_idx=5, rank=0)
++
++    # 6 prompts of 5 tokens each -> 30 tokens total dispatched as two
++    # batches (mimicking two chunk-internal forward passes producing
++    # 15 tokens each = 3 prompts each).
++    batch1 = torch.arange(15 * 8, dtype=torch.float32).reshape(15, 8)
++    batch2 = torch.arange(15 * 8, 30 * 8, dtype=torch.float32).reshape(15, 8)
++    bo._on_block_out(layer_idx=5, output=batch1)
++    bo._on_block_out(layer_idx=5, output=batch2)
++    assert sum(t.shape[0] for t in bo._ACCUM[0]) == 30
++
++    # Cumulative prompt counter at dump time: 6 (driver-owned).
++    bo.set_n_prompts_accumulated(6)
++
++    captured: dict[int, Any] = {}
++
++    def _fake_save(payload, path):
++        captured[payload.layer_idx] = (payload, path)
++
++    import moe_compress.utils.cached_calibration_signals as ccs
++    monkeypatch.setattr(ccs, "save_block_hidden", _fake_save)
++
++    jsonl = tmp_path / "trace.jsonl"
++    bo.dump_block_outputs(jsonl)
++
++    assert set(captured.keys()) == {5}
++    payload, _ = captured[5]
++    # The I1+I2 reachability contract: n_prompts_in_subset reports
++    # _SUBSET_SIZE exactly when over-collection occurred.
++    assert payload.n_prompts_in_subset == bo._SUBSET_SIZE == 4
++    # Tensor truncated to subset_size * tokens_per_prompt = 4 * 5 = 20.
++    assert payload.hidden_states.shape == (20, 8)
++    # The truncation preserves the FIRST 20 rows in dispatch order
++    # (batch1's 15 rows + batch2's first 5 rows).
++    expected_first15 = batch1.to(torch.bfloat16)
++    expected_next5 = batch2[:5].to(torch.bfloat16)
++    assert torch.equal(payload.hidden_states[:15], expected_first15)
++    assert torch.equal(payload.hidden_states[15:], expected_next5)
++    # The reader's downstream invariant: tokens / n_prompts_in_subset
++    # divides cleanly back to the per-prompt token count.
++    assert payload.hidden_states.shape[0] % payload.n_prompts_in_subset == 0
++
++
++# ---------------------------------------------------------------------------
++# Test 8 -- no-truncate fallback on variable-length per-prompt regime
++# ---------------------------------------------------------------------------
++
++
++def test_dump_no_truncate_on_variable_length(tmp_path, monkeypatch):
++    """When the driver over-collects but the total token count does
++    NOT divide evenly by ``_n_prompts_accumulated`` (variable per-prompt
++    length, the default vLLM continuous-batching regime), the tensor
++    ships as-is and a warning is emitted telling the operator to
++    pick chunk-size as a divisor of subset-size.
++
++    Note: vLLM configures ``propagate=False`` on its loggers and binds
++    its handler stream at config-load time, so neither pytest's
++    ``caplog`` nor ``capsys`` see the warnings. We attach a per-test
++    in-memory handler directly to the module logger to capture them.
++    """
++    import io
++    import logging
++
++    bo = _reload_bo({
++        "VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS": "1",
++        "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE": "4",
++        "VLLM_CALIB_CAPTURE_BLOCK": "1",
++    })
++
++    # Attach an in-memory StreamHandler to the module logger so we can
++    # observe the warning without relying on stdout capture.
++    log_stream = io.StringIO()
++    test_handler = logging.StreamHandler(log_stream)
++    test_handler.setLevel(logging.WARNING)
++    module_logger = logging.getLogger("vllm.calibration_block_outputs")
++    module_logger.addHandler(test_handler)
++    module_logger.setLevel(logging.WARNING)
++
++    _seed_layer(bo, layer_idx=5, rank=0)
++
++    # 6 prompts but 31 total tokens (variable-length: 31 does not divide
++    # evenly by 6). Two batches of 13 + 18 rows.
++    batch1 = torch.randn(13, 4, dtype=torch.float32)
++    batch2 = torch.randn(18, 4, dtype=torch.float32)
++    bo._on_block_out(layer_idx=5, output=batch1)
++    bo._on_block_out(layer_idx=5, output=batch2)
++    bo.set_n_prompts_accumulated(6)
++
++    captured: dict[int, Any] = {}
++
++    def _fake_save(payload, path):
++        captured[payload.layer_idx] = (payload, path)
++
++    import moe_compress.utils.cached_calibration_signals as ccs
++    monkeypatch.setattr(ccs, "save_block_hidden", _fake_save)
++
++    jsonl = tmp_path / "trace.jsonl"
++    try:
++        bo.dump_block_outputs(jsonl)
++    finally:
++        module_logger.removeHandler(test_handler)
++    log_text = log_stream.getvalue()
++
++    payload, _ = captured[5]
++    # n_prompts_in_subset still reports the floor at _SUBSET_SIZE.
++    assert payload.n_prompts_in_subset == 4
++    # Tensor is shipped as-is -- no truncation (31 rows, not 4*k).
++    assert payload.hidden_states.shape == (31, 4)
++    # Operator-facing warning surfaced.
++    assert "does NOT divide evenly" in log_text
++    assert "--chunk-size as a divisor" in log_text
 diff --git a/tests/test_calibration_hooks_smoke.py b/tests/test_calibration_hooks_smoke.py
 new file mode 100644
 index 0000000..c93ec35
@@ -4764,10 +4910,10 @@ index 0000000..0593101
 +    assert rts._WEIGHT_SUM_ACCUM == {}
 diff --git a/vllm/calibration_block_outputs.py b/vllm/calibration_block_outputs.py
 new file mode 100644
-index 0000000..0ea6b21
+index 0000000..7944163
 --- /dev/null
 +++ b/vllm/calibration_block_outputs.py
-@@ -0,0 +1,438 @@
+@@ -0,0 +1,490 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-MoE-block hidden-states writer for calibration-v2 (Item 7).
@@ -5051,23 +5197,31 @@ index 0000000..0ea6b21
 +    one sidecar per layer at
 +    ``<jsonl_parent>/sidecars/block_hidden/layer_{layer_idx:04d}.pt``.
 +
++    Over-collection truncation
++    --------------------------
++    Because the driver closes the subset at the JSONL flush boundary
++    (chunk boundary), if ``chunk_size`` is not a divisor of
++    ``_SUBSET_SIZE`` the writer will have already absorbed up to
++    ``chunk_size - 1`` extra prompts past the cap when ``close_subset()``
++    fires. The downstream Stage 3 reader's strict-equality token-count
++    guard (``n_tokens == n_prompts × seq_len``) would then reject every
++    sidecar as a cache miss. To make the cache hit reachable for
++    properly-configured runs (uniform per-prompt token count, i.e.
++    chat-templated prompts padded by the tokenizer to the same length),
++    we truncate the concatenated tensor to exactly
++    ``_SUBSET_SIZE * tokens_per_prompt`` rows when over-collection
++    occurred AND the total token count divides cleanly by the cumulative
++    prompt count. If the token count does NOT divide cleanly (variable
++    per-prompt token count -- typical for vLLM continuous batching with
++    decode-step block_out dispatches), we cannot identify a per-prompt
++    boundary and skip the truncate: the sidecar still ships with the
++    over-collected tensor and the reader will fall through to the live
++    forward with its existing warning. The operator-facing fix in that
++    case is to set ``--chunk-size`` as a divisor of
++    ``--block-outputs-subset-size``.
++
 +    Failures during the concatenation/save of a single layer are logged
 +    but do not block the other layers.
-+
-+    ``n_prompts_in_subset`` invariant (I1)
-+    --------------------------------------
-+    The dataclass field carries the ACTUAL number of prompts whose
-+    block outputs were captured, NOT ``min(actual, _SUBSET_SIZE)``.
-+    The driver's ``close_subset()`` fires at chunk-boundary granularity
-+    (once ``total_done >= _SUBSET_SIZE``); the very last
-+    pre-close chunk may push ``_n_prompts_accumulated`` PAST the cap by
-+    a chunk-remainder. The reader's prompt-count divergence check (see
-+    ``Stage3BlockHiddenCacheProvider.on_load``) compares this field
-+    against ``ctx.calib.shape[0]`` exactly, so reporting the actual
-+    captured count lets the reader correctly fall through on a
-+    divergence rather than silently accepting a sidecar whose tensor
-+    holds a different number of prompts than what the field would
-+    suggest.
 +    """
 +    if not _CAPTURE_BLOCK_OUTPUTS:
 +        return
@@ -5086,14 +5240,26 @@ index 0000000..0ea6b21
 +        return
 +
 +    jsonl_path_obj = Path(jsonl_path)
-+    # I1: report the actual captured count, NOT min(actual, cap). The
-+    # close_subset() driver gate fires on a chunk boundary so the
-+    # accumulated counter may legitimately exceed the configured
-+    # _SUBSET_SIZE by a chunk-remainder; downstream the reader checks
-+    # this field exactly against ctx.calib.shape[0] for the
-+    # prompt-count divergence guard (I2).
-+    n_prompts_in_subset = _n_prompts_accumulated
++
++    # Over-collection guard: when the driver closes the subset at the
++    # chunk boundary, _n_prompts_accumulated can exceed _SUBSET_SIZE by
++    # up to chunk_size-1 prompts (the I1 hazard). The reader's I2 guard
++    # checks strict equality on n_prompts_in_subset; absent a truncate
++    # the cache hit would be unreachable for any operator who did not
++    # coincidentally pick chunk_size as a divisor of subset_size.
++    #
++    # We truncate to _SUBSET_SIZE * tokens_per_prompt rows when the
++    # uniform-per-prompt-tokens regime holds (total tokens divides
++    # cleanly by _n_prompts_accumulated). Otherwise -- variable-length
++    # per-prompt dispatches, which is the default for vLLM continuous
++    # batching with decode-step block_out dispatches -- we cannot
++    # identify a per-prompt boundary so we leave the tensor untouched
++    # and emit a warning. See module docstring's I1+I2 note.
++    over_collected = _n_prompts_accumulated > _SUBSET_SIZE
++    n_prompts_in_subset = min(_n_prompts_accumulated, _SUBSET_SIZE)
++
 +    n_written = 0
++    truncated_any = False
 +    for rank in sorted(_ACCUM.keys()):
 +        batches = _ACCUM[rank]
 +        if not batches:
@@ -5109,6 +5275,37 @@ index 0000000..0ea6b21
 +            continue
 +        try:
 +            hidden = torch.cat(batches, dim=0)
++            n_tokens_total = int(hidden.shape[0])
++
++            # Truncate if (a) the driver over-collected and (b) the
++            # total token count divides cleanly by the cumulative
++            # prompt count (uniform-per-prompt-tokens regime).
++            if over_collected and _n_prompts_accumulated > 0:
++                if n_tokens_total % _n_prompts_accumulated == 0:
++                    tokens_per_prompt = (
++                        n_tokens_total // _n_prompts_accumulated
++                    )
++                    target_tokens = n_prompts_in_subset * tokens_per_prompt
++                    if target_tokens < n_tokens_total:
++                        hidden = hidden[:target_tokens].contiguous()
++                        truncated_any = True
++                else:
++                    log.warning(
++                        "calibration_block_outputs: layer_idx=%d -- "
++                        "over-collected by %d prompts (accumulated=%d, "
++                        "subset_size=%d) but n_tokens=%d does NOT divide "
++                        "evenly by accumulated prompt count, so per-prompt "
++                        "token boundaries are unknown (variable-length "
++                        "regime). Shipping the over-collected tensor "
++                        "as-is; the Stage 3 reader's strict equality "
++                        "guard will reject it as a cache miss. To make "
++                        "the cache hit reachable, set --chunk-size as a "
++                        "divisor of --block-outputs-subset-size.",
++                        layer_idx,
++                        _n_prompts_accumulated - _SUBSET_SIZE,
++                        _n_prompts_accumulated, _SUBSET_SIZE, n_tokens_total,
++                    )
++
 +            payload = BlockHiddenPayload(
 +                schema_version=SCHEMA_VERSIONS["block_hidden"],
 +                layer_idx=int(layer_idx),
@@ -5126,8 +5323,9 @@ index 0000000..0ea6b21
 +
 +    log.info(
 +        "calibration_block_outputs: wrote %d per-layer sidecars "
-+        "(n_prompts_in_subset=%d) next to %s",
-+        n_written, n_prompts_in_subset, jsonl_path,
++        "(n_prompts_in_subset=%d, over_collected=%s, truncated=%s) next to %s",
++        n_written, n_prompts_in_subset, over_collected, truncated_any,
++        jsonl_path,
 +    )
 +
 +

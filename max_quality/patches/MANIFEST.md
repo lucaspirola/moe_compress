@@ -11,8 +11,8 @@ the patch (the HF Jobs build script, the README uploaded to
 | Immutable tag | `calib-v2-block-outputs-writer` |
 | Branch (active) | `feat/calibration-v2` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch line count | **9630** |
-| Patch MD5 | **`4886a2f826acfc6d5557694603dd190c`** |
+| Patch line count | **9828** |
+| Patch MD5 | **`1375b965b02b4ce7ac0a35fd7f7b23cf`** |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -22,9 +22,9 @@ the patch (the HF Jobs build script, the README uploaded to
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: 4886a2f826acfc6d5557694603dd190c
+# expect: 1375b965b02b4ce7ac0a35fd7f7b23cf
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 9630
+# expect: 9828
 
 # Re-apply against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
