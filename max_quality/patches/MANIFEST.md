@@ -71,6 +71,21 @@ on `feat/calibration-v2`:
   - JSONL resume validates each line as JSON and truncates at the first
     parse failure (drops trailing partial lines from preempted writes).
 
+## Schema bumps
+
+Sidecar schema versions for the cached-calibration-signals provider-pair
+infrastructure. Bump these when changing the dataclass layout in
+`max_quality/src/moe_compress/utils/cached_calibration_signals.py`.
+
+| Signal | schema_version | Notes |
+|---|---|---|
+| `phase_b` | 1 | initial |
+| `stage2_profile` | 1 | initial |
+| `covariance` | 1 | initial |
+| `router_kd_logits` | 1 | initial — matches the existing .npz writer format in `build_self_traces_calib_vllm.py` |
+| `block_hidden` | 1 | initial |
+| `teacher_eval` | 1 | initial |
+
 ## When to bump the immutable tag
 
 Whenever the patch's functional contents change (line count or MD5 differ),
