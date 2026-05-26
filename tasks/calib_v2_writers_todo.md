@@ -19,7 +19,7 @@
 ## Phase 4 — Remaining 8 writers
 - [x] **Item 1**: Teacher per-expert `Σ_in[layer][expert]` writer + Stage 3/4 cache readers. Commits `08562c7` + `389a923` (iter-1 fixes for 8 findings). Loop closed at iter 2. Patch now 5350 lines, MD5 `c35dc497cd3e9268c7448410bdddf80c`. New tag `calib-v2-input-cov-writer-chained-callbacks`. **CRITICAL: vllm/calibration_hooks.py registry was restructured to support chained callbacks** (was single-slot, now list-valued with identity-dedup) — required to fix the latent expert_in collision between imatrix + input-cov writers.
 - [x] **Item 2**: Per-expert `down_proj` output magnitudes writer + Stage 1 readers. Commits `1a6d2cf` + `a375c98`. Loop closed at iter 2 (4 nitpicks fixed). Patch now 6097 lines, MD5 `15163e64ad096eb8e1e24f961b7f3543`. New tag `calib-v2-per-expert-max-writer`. Reuses `expert_out_unweighted` hook chained with REAP via Item 1's multi-callback fix.
-- [ ] **Item 3**: Routing freq + mean weight writer + Stage 1/2 readers.
+- [x] **Item 3**: Routing freq + mean weight writer + Stage 1/2 readers. Commit `628fe3f`. Loop closed at iter 1 (no fixer needed; 3 cosmetic suggestions noted but non-blocking). Patch now 6841 lines, MD5 `1c5602d20f5a2b268e6edb0f969e4cfe`. New tag `calib-v2-routing-stats-writer`. Router-hook-only (no FLASHINFER dep). Infrastructure for future downstream consumers — current sidecar deposits to `ctx.routing_stats_payload` for any plugin that wants it.
 - [ ] **Item 4**: Per-layer pre-softmax router logits writer + Stage 1 SinkToken reader.
 - [ ] **Item 5**: Per-layer expert top-K + post-softmax weights writer + Stage 2 readers.
 - [ ] **Item 6**: Per-expert output reservoir writer + Stage 1 CKA reader.
