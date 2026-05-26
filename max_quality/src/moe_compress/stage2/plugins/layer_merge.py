@@ -327,8 +327,9 @@ class LayerMergePlugin:
 
     name = "layer_merge"
     paper = (
-        "REAM Eq. 6 merge (frequency- or saliency-weighted) + §3-4 sequential profiling — "
-        "arXiv:2604.04356 (Liu et al.). Official code: SamsungSAILMontreal/ream "
+        "REAM Eq. 6 merge (frequency- or saliency-weighted) + §3-4 "
+        "sequential profiling — arXiv:2604.04356 (Liu et al.). "
+        "Official code: SamsungSAILMontreal/ream "
         "@ 84a3030716a0059589e9d10e2ea049e32b76cfa6. "
         "Deviations: D5a (max_merge_group_size=8 vs paper C=16/32), "
         "D5b (C = C_wt + C_act for Hungarian neuron-alignment; "

@@ -1232,10 +1232,14 @@ def test_config_rejects_asymmetric_without_freq_weighted_merge(tmp_path, monkeyp
 # ---------------------------------------------------------------------------
 
 
-def test_merge_saliency_weighted_2_experts(monkeypatch):
-    """Saliency-weighted merge with scores=[3.0, 1.0] must produce
-    weights [0.75, 0.25] — centroid is experts[0], member is experts[1].
-    Verify the merged centroid weight ends up closer to W_0 than to W_1.
+def test_merge_saliency_weighted_matches_equivalent_freq(monkeypatch):
+    """Saliency mode with scores=[3,1] must produce byte-identical merged
+    weights to freq mode with freq={0:3, 1:1} — both compute the same
+    [0.75, 0.25] convex blend with the same permutation alignment.
+
+    This pins the saliency arithmetic without needing to recompute the
+    permutation manually: any wrong weighting (e.g. [0.5, 0.5] or
+    [0.25, 0.75]) would diverge from the freq-mode reference.
     """
     import numpy as np
     import torch
@@ -1243,26 +1247,40 @@ def test_merge_saliency_weighted_2_experts(monkeypatch):
     from moe_compress.stage2 import merging as _merging
     from moe_compress.stage2.merging import _merge_experts_inplace
 
-    layer_ref, _ream_acc, raw_weights = _make_post_alignment_test_setup(monkeypatch)
-    scores = np.array([3.0, 1.0])
+    # --- Run 1: freq-weighted merge, freq={0:3, 1:1} ---
+    # The fixture sets torch.manual_seed(0) internally, so two calls yield
+    # identical initial weights in the bank — the ideal baseline for an
+    # arithmetic equality check across the two merge modes.
+    layer_ref, _, _ = _make_post_alignment_test_setup(monkeypatch)
     grouped = {0: [0, 1]}
-    freq = {0: 99, 1: 99}   # freq irrelevant in saliency mode
-
-    W0_before = raw_weights[0]["gate_proj"].clone().to(torch.float32)
-    W1_before = raw_weights[1]["gate_proj"].clone().to(torch.float32)
-
     _merge_experts_inplace(
-        layer_ref, grouped, freq,
-        freq_weighted=False,
-        scores=scores,
+        layer_ref, grouped,
+        freq={0: 3, 1: 1},
+        freq_weighted=True,
+    )
+    merged_freq = (
+        _merging.build_banks(layer_ref)["gate_proj"].get(0).clone().to(torch.float32)
     )
 
-    merged = _merging.build_banks(layer_ref)["gate_proj"].get(0).to(torch.float32)
-    d_merged_W0 = torch.linalg.matrix_norm(merged - W0_before, ord="fro").item()
-    d_W1_W0 = torch.linalg.matrix_norm(W1_before - W0_before, ord="fro").item()
-    assert d_merged_W0 < d_W1_W0, (
-        f"merged should be closer to W_0 than W_1 is (weight 0.75 on W_0). "
-        f"Got d(merged,W0)={d_merged_W0:.4f} vs d(W1,W0)={d_W1_W0:.4f}"
+    # --- Run 2: saliency-weighted merge, scores=[3.0, 1.0] ---
+    # Fresh fixture so the layer is back at its initial weights.
+    layer_ref2, _, _ = _make_post_alignment_test_setup(monkeypatch)
+    _merge_experts_inplace(
+        layer_ref2, grouped,
+        freq={0: 99, 1: 99},   # freq irrelevant in saliency mode
+        freq_weighted=False,
+        scores=np.array([3.0, 1.0], dtype=np.float64),
+    )
+    merged_sal = (
+        _merging.build_banks(layer_ref2)["gate_proj"].get(0).clone().to(torch.float32)
+    )
+
+    # Both modes must produce the same blend (same weights × same alignment).
+    assert torch.allclose(merged_freq, merged_sal, atol=1e-5), (
+        f"saliency mode with scores=[3,1] should equal freq mode with "
+        f"freq={{0:3, 1:1}} — both compute weights [0.75, 0.25] with the "
+        f"same permutation alignment. Max abs diff: "
+        f"{(merged_freq - merged_sal).abs().max().item():.2e}"
     )
 
 
@@ -1278,7 +1296,7 @@ def test_merge_saliency_zero_sum_fallback(monkeypatch, caplog):
     logging.getLogger("moe_compress.stage2.merging").propagate = True
 
     layer_ref, _, _ = _make_post_alignment_test_setup(monkeypatch)
-    scores = np.array([0.0, 0.0])
+    scores = np.array([0.0, 0.0], dtype=np.float64)
     grouped = {0: [0, 1]}
     freq = {0: 5, 1: 5}
 
@@ -1304,7 +1322,7 @@ def test_merge_saliency_negative_clamped(monkeypatch):
     from moe_compress.stage2.merging import _merge_experts_inplace
 
     layer_ref, _, raw_weights = _make_post_alignment_test_setup(monkeypatch)
-    scores = np.array([2.0, -5.0])   # member clamped to 0
+    scores = np.array([2.0, -5.0], dtype=np.float64)   # member clamped to 0
     grouped = {0: [0, 1]}
     freq = {0: 5, 1: 5}
 

@@ -36,7 +36,7 @@ def _merge_experts_inplace(
     freq: dict[int, int],
     *,
     freq_weighted: bool,
-    scores: "np.ndarray | None" = None,
+    scores: np.ndarray | None = None,
     ream_acc: ReamCostAccumulator | None = None,
     perm_cache: "_PermAlignCache | None" = None,
 ) -> None:
