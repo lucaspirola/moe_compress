@@ -67,9 +67,13 @@ ls -lh /tmp/wheels/
 pip install "/tmp/wheels/${VLLM_WHEEL_FILE}"
 python -c "import vllm; print('vllm:', vllm.__version__)"
 
-echo "[$(date)] === Phase 4: install transformers ==="
-pip install --quiet "transformers>=4.51.0"
+echo "[$(date)] === Phase 4: install transformers + accelerate ==="
+# `accelerate` is required as soon as `device_map=` is used in
+# from_pretrained, which the harness does for the side-by-side
+# HF reference model.
+pip install --quiet "transformers>=4.51.0" "accelerate>=0.30.0"
 python -c "import transformers; print('transformers:', transformers.__version__)"
+python -c "import accelerate; print('accelerate:', accelerate.__version__)"
 
 echo "[$(date)] === Phase 5: fetch + run the harness ==="
 HARNESS_URL="https://raw.githubusercontent.com/lucaspirola/moe_compress/${L1_HARNESS_COMMIT}/max_quality/scripts/l1_validation_harness.py"
