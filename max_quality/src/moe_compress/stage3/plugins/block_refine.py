@@ -177,7 +177,7 @@ def _phase_c5_block_refine(
     artifacts_dir: Path,
     no_resume: bool,
     device,
-    teacher_targets_cache: "dict[int, list[torch.Tensor]] | None" = None,
+    teacher_targets_cache: "dict[int, torch.Tensor] | None" = None,
 ) -> None:
     """Phase C.5 — block-level joint refinement (paper 2604.02119, Algorithm 2 §3.3).
 
@@ -449,9 +449,13 @@ def _phase_c5_block_refine(
         # Pre-compute teacher targets once per batch (no grad). The V2
         # block-hidden cache (calibration-v2 Item 7) can substitute these
         # tensors directly, skipping the live teacher block forward
-        # entirely on a cache hit. The cache holds per-batch
-        # ``[batch_size, seq_len, hidden]`` bf16 CPU tensors with the
-        # SAME shape contract as the live path's
+        # entirely on a cache hit. The cache holds ONE un-chunked
+        # ``[n_prompts, seq_len, hidden]`` bf16 CPU tensor per layer
+        # (decoupled from the consumer's batch_size to dodge the C1
+        # hazard where the writer would have to know Stage 3's
+        # block_refine.batch_size). The consumer slices
+        # ``cached[bi*bs:(bi+1)*bs]`` per batch index here; each slice
+        # carries the SAME shape contract as the live path's
         # ``out.detach().to(dtype=torch.bfloat16, device="cpu")``.
         # Shape-mismatch on a cached entry falls through to the live
         # path with a warning (a malformed cache must not corrupt the
@@ -459,28 +463,34 @@ def _phase_c5_block_refine(
         teacher_targets: list[torch.Tensor] | None = None
         if teacher_targets_cache is not None:
             cached = teacher_targets_cache.get(int(layer_idx))
-            if cached is not None and len(cached) == len(batches):
-                expected_shape = (batch_size, calib_tensor.shape[1])
-                shape_ok = all(
-                    t.dim() == 3 and t.shape[0] == expected_shape[0]
-                    and t.shape[1] == expected_shape[1]
-                    for t in cached
+            n_seq_cal, seq_len_cal = int(calib_tensor.shape[0]), int(calib_tensor.shape[1])
+            if (
+                cached is not None
+                and cached.dim() == 3
+                and cached.shape[0] >= n_batches * batch_size
+                and cached.shape[1] == seq_len_cal
+            ):
+                teacher_targets = [
+                    cached[bi * batch_size:(bi + 1) * batch_size].contiguous()
+                    for bi in range(n_batches)
+                ]
+                log.info(
+                    "Stage 3 Phase C.5 layer %d: using cached teacher "
+                    "targets (%d batches sliced from un-chunked "
+                    "[%d, %d, %d]; skipping live teacher block forward)",
+                    layer_idx, n_batches,
+                    int(cached.shape[0]), int(cached.shape[1]),
+                    int(cached.shape[2]),
                 )
-                if shape_ok:
-                    teacher_targets = cached
-                    log.info(
-                        "Stage 3 Phase C.5 layer %d: using cached teacher "
-                        "targets (%d batches; skipping live teacher block "
-                        "forward)", layer_idx, len(cached),
-                    )
-                else:
-                    log.warning(
-                        "Stage 3 Phase C.5 layer %d: cached teacher "
-                        "targets shape mismatch (expected per-batch "
-                        "[%d, %d, hidden]) -- falling through to live "
-                        "teacher forward.",
-                        layer_idx, expected_shape[0], expected_shape[1],
-                    )
+            elif cached is not None:
+                log.warning(
+                    "Stage 3 Phase C.5 layer %d: cached teacher targets "
+                    "shape mismatch (got %s, expected un-chunked "
+                    "[>=%d, %d, hidden]) -- falling through to live "
+                    "teacher forward.",
+                    layer_idx, tuple(cached.shape),
+                    n_batches * batch_size, seq_len_cal,
+                )
 
         if teacher_targets is None:
             teacher_targets = []
@@ -656,6 +666,14 @@ class BlockRefinePlugin:
     reads: tuple[str, ...] = (
         "model", "teacher_model", "moe_layers", "teacher_moe_layers",
         "calib", "config", "artifacts_dir", "no_resume", "device",
+        # Optional V2 block-hidden cache populated by
+        # Stage3BlockHiddenCacheProvider via dispatch_first("on_load",
+        # ...) in the orchestrator. Declared in ``reads`` so the
+        # plugin-registry contract reflects the actual dataflow; the
+        # ``refine_blocks`` hook reads it with a ``ctx.has`` guard so
+        # absence is a benign cache miss (live teacher forward), not a
+        # contract violation. (I3.)
+        "teacher_targets_cache",
     )
     # Phase C.5 refines the installed FactoredExperts U/V slots (and the
     # block-local RMSNorm scales) IN PLACE; it produces no new ctx slot.

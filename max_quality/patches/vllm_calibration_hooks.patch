@@ -4767,7 +4767,7 @@ new file mode 100644
 index 0000000..0ea6b21
 --- /dev/null
 +++ b/vllm/calibration_block_outputs.py
-@@ -0,0 +1,417 @@
+@@ -0,0 +1,438 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-MoE-block hidden-states writer for calibration-v2 (Item 7).
@@ -5053,6 +5053,21 @@ index 0000000..0ea6b21
 +
 +    Failures during the concatenation/save of a single layer are logged
 +    but do not block the other layers.
++
++    ``n_prompts_in_subset`` invariant (I1)
++    --------------------------------------
++    The dataclass field carries the ACTUAL number of prompts whose
++    block outputs were captured, NOT ``min(actual, _SUBSET_SIZE)``.
++    The driver's ``close_subset()`` fires at chunk-boundary granularity
++    (once ``total_done >= _SUBSET_SIZE``); the very last
++    pre-close chunk may push ``_n_prompts_accumulated`` PAST the cap by
++    a chunk-remainder. The reader's prompt-count divergence check (see
++    ``Stage3BlockHiddenCacheProvider.on_load``) compares this field
++    against ``ctx.calib.shape[0]`` exactly, so reporting the actual
++    captured count lets the reader correctly fall through on a
++    divergence rather than silently accepting a sidecar whose tensor
++    holds a different number of prompts than what the field would
++    suggest.
 +    """
 +    if not _CAPTURE_BLOCK_OUTPUTS:
 +        return
@@ -5071,7 +5086,13 @@ index 0000000..0ea6b21
 +        return
 +
 +    jsonl_path_obj = Path(jsonl_path)
-+    n_prompts_in_subset = min(_n_prompts_accumulated, _SUBSET_SIZE)
++    # I1: report the actual captured count, NOT min(actual, cap). The
++    # close_subset() driver gate fires on a chunk boundary so the
++    # accumulated counter may legitimately exceed the configured
++    # _SUBSET_SIZE by a chunk-remainder; downstream the reader checks
++    # this field exactly against ctx.calib.shape[0] for the
++    # prompt-count divergence guard (I2).
++    n_prompts_in_subset = _n_prompts_accumulated
 +    n_written = 0
 +    for rank in sorted(_ACCUM.keys()):
 +        batches = _ACCUM[rank]
