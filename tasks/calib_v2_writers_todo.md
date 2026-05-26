@@ -7,7 +7,7 @@
 
 ## Phase 1 — Cheap wins, no patch change
 - [x] **P1**: Fix stale docstring in `stage2/plugins/reap_scoring.py` — point at `config["calibration"]` instead of hardcoded "Nemotron-Cascade". Commits `0a95560` + `e374c00` (review-fix iter 1). Loop closed at iter 2.
-- [ ] **P2**: Wire saliency-weighted merge branch in `stage2/merging.py` (replace `raise ValueError`), thread `scores` from `layer_merge.py`.
+- [x] **P2**: Wire saliency-weighted merge branch in `stage2/merging.py` (replace `raise ValueError`), thread `scores` from `layer_merge.py`. Commits `4239304` + `3aae40c` (review-fix iter 1). Loop closed at iter 2. 5 new tests, byte-identical equivalence to freq mode with matching weights confirmed.
 
 ## Phase 2 — Infrastructure + first writer (proves the pattern)
 - [ ] **Item 0**: `utils/cached_calibration_signals.py` provider-pair module + schema/loader.
