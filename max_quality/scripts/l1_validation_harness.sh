@@ -39,11 +39,14 @@ python3 -m venv /tmp/venv
 # shellcheck disable=SC1091
 . /tmp/venv/bin/activate
 pip install --quiet --upgrade pip wheel "setuptools>=77"
+# NumPy first so torch can initialize its NumPy bridge cleanly.
+pip install --quiet "numpy<2.0"
 pip install --quiet torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.version.cuda)"
 
 echo "[$(date)] === Phase 3: install patched vLLM wheel from ${VLLM_WHEEL_REPO} ==="
-pip install --quiet huggingface_hub
+# [cli] extra pulls click + the typer-based hf CLI deps.
+pip install --quiet "huggingface_hub[cli]"
 hf download "${VLLM_WHEEL_REPO}" --include "${VLLM_WHEEL_FILE}" \
     --local-dir /tmp/wheels --quiet
 ls -lh /tmp/wheels/
