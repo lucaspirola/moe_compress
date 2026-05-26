@@ -633,8 +633,12 @@ def run(
     if bool(s2.get("cost_asymmetric", False)) and not s2["ream"]["frequency_weighted_merge"]:
         raise ValueError(
             "stage2_reap_ream.cost_asymmetric=True requires "
-            "ream.frequency_weighted_merge=True (spec § 5 step 4T(c)(iii) "
-            "/ D-asymmetric-freq)."
+            "ream.frequency_weighted_merge=True. Asymmetric-cost with "
+            "saliency-weighted merge (frequency_weighted_merge=False) is not "
+            "implemented in P2 — the analogous factor sal_m/(sal_c+sal_m) would "
+            "require threading scores into ream_cost_post.py. Set "
+            "cost_asymmetric=false or frequency_weighted_merge=true "
+            "(spec § 5 step 4T(c)(iii) / D-asymmetric-freq)."
         )
 
     # Blackwell sm_100 workaround: transformers' default MoE forward uses
@@ -766,9 +770,15 @@ def run(
 
         for record in resumed_records:
             ref = record.layer_ref
+            # scores=None on the resume path: saliency scores are not
+            # persisted on disk. A saliency-mode run that resumes here will
+            # hit the new ValueError inside _merge_experts_inplace for the
+            # first multi-member merge group — that is the correct surfacing
+            # of the gap (rather than silently applying wrong weights).
             _merge_experts_inplace(
                 ref, record.grouped, record.freq,
                 freq_weighted=s2["ream"]["frequency_weighted_merge"],
+                scores=None,
                 ream_acc=record.resume_ream_acc,
             )
             # build_banks again: _merge_experts_inplace already called it

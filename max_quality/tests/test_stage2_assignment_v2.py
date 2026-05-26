@@ -645,9 +645,11 @@ def _make_post_alignment_test_setup(monkeypatch):
     # monolith-resident code path a test in this file might exercise.
     import moe_compress.stage2.plugins.em_refine as _em_refine
     import moe_compress.stage2.plugins.ream_cost_post as _ream_cost_post
+    import moe_compress.stage2.merging as _merging
     monkeypatch.setattr(stage2_reap_ream, "build_banks", lambda layer_ref: banks)
     monkeypatch.setattr(_ream_cost_post, "build_banks", lambda layer_ref: banks)
     monkeypatch.setattr(_em_refine, "build_banks", lambda layer_ref: banks)
+    monkeypatch.setattr(_merging, "build_banks", lambda layer_ref: banks)
 
     class _FakeReamAcc:
         """Minimal accumulator that returns deterministic stub values so the
@@ -1221,6 +1223,209 @@ def test_config_rejects_asymmetric_without_freq_weighted_merge(tmp_path, monkeyp
     with pytest.raises(ValueError, match="cost_asymmetric=True"):
         stage2_reap_ream.run(
             _DummyModel(), tokenizer=None, config=bad_config,
+            artifacts_dir=tmp_path, no_resume=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Saliency-weighted merge (P2): the ``freq_weighted=False`` branch
+# ---------------------------------------------------------------------------
+
+
+def test_merge_saliency_weighted_2_experts(monkeypatch):
+    """Saliency-weighted merge with scores=[3.0, 1.0] must produce
+    weights [0.75, 0.25] — centroid is experts[0], member is experts[1].
+    Verify the merged centroid weight ends up closer to W_0 than to W_1.
+    """
+    import numpy as np
+    import torch
+
+    from moe_compress.stage2 import merging as _merging
+    from moe_compress.stage2.merging import _merge_experts_inplace
+
+    layer_ref, _ream_acc, raw_weights = _make_post_alignment_test_setup(monkeypatch)
+    scores = np.array([3.0, 1.0])
+    grouped = {0: [0, 1]}
+    freq = {0: 99, 1: 99}   # freq irrelevant in saliency mode
+
+    W0_before = raw_weights[0]["gate_proj"].clone().to(torch.float32)
+    W1_before = raw_weights[1]["gate_proj"].clone().to(torch.float32)
+
+    _merge_experts_inplace(
+        layer_ref, grouped, freq,
+        freq_weighted=False,
+        scores=scores,
+    )
+
+    merged = _merging.build_banks(layer_ref)["gate_proj"].get(0).to(torch.float32)
+    d_merged_W0 = torch.linalg.matrix_norm(merged - W0_before, ord="fro").item()
+    d_W1_W0 = torch.linalg.matrix_norm(W1_before - W0_before, ord="fro").item()
+    assert d_merged_W0 < d_W1_W0, (
+        f"merged should be closer to W_0 than W_1 is (weight 0.75 on W_0). "
+        f"Got d(merged,W0)={d_merged_W0:.4f} vs d(W1,W0)={d_W1_W0:.4f}"
+    )
+
+
+def test_merge_saliency_zero_sum_fallback(monkeypatch, caplog):
+    """All-zero saliency scores must fall back to equal weights and emit a WARNING."""
+    import logging
+    import numpy as np
+
+    from moe_compress.stage2.merging import _merge_experts_inplace
+
+    # Some pytest plugins in this env default new loggers to propagate=False;
+    # mirror the working pattern in test_stage2_grouping.py.
+    logging.getLogger("moe_compress.stage2.merging").propagate = True
+
+    layer_ref, _, _ = _make_post_alignment_test_setup(monkeypatch)
+    scores = np.array([0.0, 0.0])
+    grouped = {0: [0, 1]}
+    freq = {0: 5, 1: 5}
+
+    with caplog.at_level(logging.WARNING):
+        _merge_experts_inplace(
+            layer_ref, grouped, freq,
+            freq_weighted=False,
+            scores=scores,
+        )
+    assert any("zero saliency" in r.message for r in caplog.records), (
+        "Expected a WARNING about zero saliency score fallback"
+    )
+
+
+def test_merge_saliency_negative_clamped(monkeypatch):
+    """Pathological negative saliency must be clamped to 0; with only one
+    positive-scored expert the merged centroid must equal the centroid's
+    original weight exactly (no blending)."""
+    import numpy as np
+    import torch
+
+    from moe_compress.stage2 import merging as _merging
+    from moe_compress.stage2.merging import _merge_experts_inplace
+
+    layer_ref, _, raw_weights = _make_post_alignment_test_setup(monkeypatch)
+    scores = np.array([2.0, -5.0])   # member clamped to 0
+    grouped = {0: [0, 1]}
+    freq = {0: 5, 1: 5}
+
+    W0_before = raw_weights[0]["gate_proj"].clone().to(torch.float32)
+
+    _merge_experts_inplace(
+        layer_ref, grouped, freq,
+        freq_weighted=False,
+        scores=scores,
+    )
+
+    merged = _merging.build_banks(layer_ref)["gate_proj"].get(0).to(torch.float32)
+    assert torch.allclose(merged, W0_before, atol=1e-5), (
+        "With member score clamped to 0, merged weight must equal centroid weight"
+    )
+
+
+def test_config_accepts_freq_weighted_false_when_not_asymmetric(tmp_path, monkeypatch):
+    """YAML with frequency_weighted_merge=False ∧ cost_asymmetric=False must NOT
+    raise at the orchestrator guard (only asymmetric+saliency is rejected)."""
+    import torch
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
+
+    cfg = {
+        "stage2_reap_ream": {
+            "batch_size": 1,
+            "num_calibration_samples": 1,
+            "covariance_storage_dtype": "float16",
+            "max_merge_group_size": 8,
+            "ream_cost_sigma_threshold": 1.5,
+            "ream_cost_bump_ratio": 0.10,
+            "ream": {"frequency_weighted_merge": False},
+            "assignment_solver": "greedy",
+            "cost_alignment": "post",
+            "cost_whitening": "none",
+            "cost_asymmetric": False,
+            "cost_topk_filter": 4,
+            "capacity_util_threshold": 0.25,
+        },
+        "calibration": {"source": "c4-math-code", "seed": 0},
+    }
+
+    monkeypatch.setattr(
+        stage2_reap_ream, "load_json_artifact",
+        lambda p: {"per_layer_target_experts": {}, "blacklist": {}},
+    )
+    monkeypatch.setattr(
+        stage2_reap_ream, "build_calibration_tensor",
+        lambda *a, **kw: torch.zeros(1, 1, dtype=torch.long),
+    )
+    monkeypatch.setattr(stage2_reap_ream, "iter_batches", lambda *a, **kw: [])
+    monkeypatch.setattr(stage2_reap_ream, "iter_moe_layers", lambda model: iter([]))
+    # Past the orchestrator guard, run() calls `_set_experts_implementation`
+    # (Blackwell sm_100 workaround) which needs `model.config`. Stub it out so
+    # the empty-moe-layers path can run to completion on a `_DummyModel`.
+    import moe_compress.stage5_router_kd as _stage5_router_kd
+    monkeypatch.setattr(
+        _stage5_router_kd, "_set_experts_implementation", lambda model, impl: None,
+    )
+    # ``spec_from_config`` enforces required calibration keys; we don't care
+    # about the spec value because ``build_calibration_tensor`` is also stubbed.
+    monkeypatch.setattr(stage2_reap_ream, "spec_from_config", lambda *a, **kw: None)
+    # After the empty layer loop the orchestrator still writes a checkpoint;
+    # the helpers walk the model again, so neutralize them on _DummyModel.
+    monkeypatch.setattr(stage2_reap_ream, "save_compressed_checkpoint", lambda *a, **kw: None)
+    monkeypatch.setattr(stage2_reap_ream, "save_json_artifact", lambda *a, **kw: None)
+    monkeypatch.setattr(stage2_reap_ream, "_save_covariance", lambda *a, **kw: None)
+
+    class _DummyModel:
+        pass
+
+    # Must complete without raising — empty moe_layers list means the merge
+    # loop never executes; the orchestrator guard must NOT fire for this combo.
+    stage2_reap_ream.run(
+        _DummyModel(), tokenizer=None, config=cfg,
+        artifacts_dir=tmp_path, no_resume=True,
+    )
+
+
+def test_config_still_rejects_asymmetric_with_saliency(tmp_path, monkeypatch):
+    """YAML with frequency_weighted_merge=False ∧ cost_asymmetric=True must STILL
+    raise at the orchestrator guard — asymmetric-saliency is out of scope for P2."""
+    import torch
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
+
+    cfg = {
+        "stage2_reap_ream": {
+            "batch_size": 1,
+            "num_calibration_samples": 1,
+            "covariance_storage_dtype": "float16",
+            "max_merge_group_size": 8,
+            "ream_cost_sigma_threshold": 1.5,
+            "ream_cost_bump_ratio": 0.10,
+            "ream": {"frequency_weighted_merge": False},
+            "assignment_solver": "greedy",
+            "cost_alignment": "post",
+            "cost_whitening": "none",
+            "cost_asymmetric": True,
+            "cost_topk_filter": 4,
+            "capacity_util_threshold": 0.25,
+        },
+        "calibration": {"source": "c4-math-code", "seed": 0},
+    }
+
+    monkeypatch.setattr(
+        stage2_reap_ream, "load_json_artifact",
+        lambda p: {"per_layer_target_experts": {}, "blacklist": {}},
+    )
+    monkeypatch.setattr(
+        stage2_reap_ream, "build_calibration_tensor",
+        lambda *a, **kw: torch.zeros(1, 1, dtype=torch.long),
+    )
+    monkeypatch.setattr(stage2_reap_ream, "iter_batches", lambda *a, **kw: [])
+    monkeypatch.setattr(stage2_reap_ream, "iter_moe_layers", lambda model: iter([]))
+
+    class _DummyModel:
+        pass
+
+    with pytest.raises(ValueError, match="cost_asymmetric=True"):
+        stage2_reap_ream.run(
+            _DummyModel(), tokenizer=None, config=cfg,
             artifacts_dir=tmp_path, no_resume=True,
         )
 

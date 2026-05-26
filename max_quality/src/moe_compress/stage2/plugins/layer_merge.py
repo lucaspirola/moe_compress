@@ -2,7 +2,7 @@
 
 This plugin owns the always-on per-layer merge orchestration: the
 accumulator construction, the early-exit forward profile, the REAM
-Eq. 6 frequency-weighted merge with Hungarian intermediate-neuron
+Eq. 6 merge (frequency- or saliency-weighted) with Hungarian intermediate-neuron
 alignment, the budget-bump feasibility/quality loop, the router
 resize, the covariance snapshot, and the artifact write. Specific
 cost/solver/refine/distill/heal plugins live as siblings in this
@@ -327,7 +327,7 @@ class LayerMergePlugin:
 
     name = "layer_merge"
     paper = (
-        "REAM Eq. 6 frequency-weighted merge + §3-4 sequential profiling — "
+        "REAM Eq. 6 merge (frequency- or saliency-weighted) + §3-4 sequential profiling — "
         "arXiv:2604.04356 (Liu et al.). Official code: SamsungSAILMontreal/ream "
         "@ 84a3030716a0059589e9d10e2ea049e32b76cfa6. "
         "Deviations: D5a (max_merge_group_size=8 vs paper C=16/32), "
@@ -342,7 +342,7 @@ class LayerMergePlugin:
     # the ctx slots the SIX live hooks touch (S2-12a). ``provides`` is empty.
     reads: tuple[str, ...] = (
         "layer_ref", "reap_acc", "ream_acc", "layer_input_acc", "perm_cache",
-        "target", "freq", "grouped", "protected",
+        "target", "freq", "scores", "grouped", "protected",
         "ream_centroid_ids", "final_kept_ids",
         "heal_state", "distill_state", "n_experts", "n_protected",
         "assigned_cost", "n_assigned", "c_fail", "em_rounds_done",
@@ -513,12 +513,14 @@ class LayerMergePlugin:
         layer_ref = ctx.get("layer_ref")
         grouped = ctx.get("grouped")
         freq = ctx.get("freq")
+        scores = ctx.get("scores")
         ream_acc = ctx.get("ream_acc")
         perm_cache = ctx.get("perm_cache")
 
         _merge_experts_inplace(
             layer_ref, grouped, freq,
             freq_weighted=self.s2["ream"]["frequency_weighted_merge"],
+            scores=scores,
             ream_acc=ream_acc,
             perm_cache=perm_cache,
         )

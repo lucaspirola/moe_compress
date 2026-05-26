@@ -4,9 +4,10 @@ Extracted from ``stage2_reap_ream.py`` in Task 4 of the plugin-architecture
 refactor. The two operations live together because both mutate the layer in
 place at the end of grouping:
 
-  * ``_merge_experts_inplace`` -- frequency-weighted REAM Eq. 6 merge with
-    per-pair Hungarian alignment (reusing perms from ``_PermAlignCache`` when
-    the cost matrix already computed them).
+  * ``_merge_experts_inplace`` -- REAM Eq. 6 merge with per-pair Hungarian alignment.
+    Supports two weight modes: frequency-weighted (``freq_weighted=True``, default;
+    REAM paper Eq. 6) and saliency-weighted (``freq_weighted=False``; Cerebras REAP
+    default, ``merger.py:563``). See function docstring for the algebraic equivalence.
   * ``_resize_router_for_kept_experts`` -- slice the router's weight rows
     (and bias, if present) down to the centroid set; update ``num_experts``
     and clamp ``top_k``.
@@ -35,9 +36,36 @@ def _merge_experts_inplace(
     freq: dict[int, int],
     *,
     freq_weighted: bool,
+    scores: "np.ndarray | None" = None,
     ream_acc: ReamCostAccumulator | None = None,
     perm_cache: "_PermAlignCache | None" = None,
 ) -> None:
+    """Merge non-centroid experts into their centroid in place.
+
+    Parameters
+    ----------
+    freq_weighted:
+        ``True`` (default, REAM Eq. 6): merge weights are
+        ``freq_m / Σ_j freq_j`` — raw calibration token counts, renormalized
+        over the merge group. Equivalent to
+        ``S^freq_m / Σ_j S^freq_j`` where ``S^freq = freq/|X|``, because
+        ``|X|`` (token count) cancels in the ratio.
+
+        ``False`` (Cerebras REAP default, ``merger.py:563`` @
+        ``CerebrasResearch/reap@1970473c``): merge weights are
+        ``S_m / Σ_j S_j`` where ``S_j`` is the REAP Eq. 9 per-expert average
+        saliency ``(1/|X_j|)·Σ g_j·‖f_j‖₂``. ``scores`` must be provided.
+
+        Algebraic equivalence: both modes compute ``weight_m / Σ weight_j``
+        where the weighting quantity is already a per-expert average (freq/|X|
+        for freq mode; S_j for saliency mode). No additional normalization
+        by token count is needed in either case.
+
+    scores:
+        1-D ``np.ndarray`` indexed by expert id. Required when
+        ``freq_weighted=False``; ignored (may be ``None``) when
+        ``freq_weighted=True``.
+    """
     banks = build_banks(layer_ref)
     li = layer_ref.layer_idx
     with torch.no_grad():
@@ -58,18 +86,34 @@ def _merge_experts_inplace(
                     weights[:] = 1.0
                 weights /= weights.sum()
             else:
-                # B-C-M-2: spec §5 Step 4 mandates frequency-weighted merge per
-                # REAM Eq. 6. The equal-weights branch was an ablation-only
-                # fallback the spec never authorized; refuse to proceed with
-                # spec-non-compliant merges instead of silently warning.
-                raise ValueError(
-                    f"Stage 2: ream.frequency_weighted_merge=False produces "
-                    f"spec-non-compliant merges (REAM Eq. 6 mandates "
-                    f"frequency-weighted averaging). Set ream.frequency_weighted_merge: true "
-                    f"in the config — the equal-weights branch was an ablation "
-                    f"option that has no §12 D-row and must not be used in "
-                    f"production. (layer={li} centroid={centroid} members={len(members)})"
+                # Saliency-weighted merge — Cerebras REAP default (merger.py:563,
+                # CerebrasResearch/reap @ 1970473c51ca3caeb98c10392f15b3a08a672974).
+                # weights = S_m / Σ S_j, where S_j is the REAP Eq. 9 per-expert
+                # average saliency (already a per-expert AVERAGE over dispatched
+                # tokens, so no |X| normalization is needed here — the Σ
+                # denominator handles it).
+                if scores is None:
+                    raise ValueError(
+                        f"Stage 2: ream.frequency_weighted_merge=False requires "
+                        f"a saliency scores array (scores=None at layer={li} "
+                        f"centroid={centroid}). Ensure ReapScoringPlugin ran "
+                        f"before LayerMergePlugin and that ctx.get('scores') is "
+                        f"non-None. NB: scores are not persisted on disk, so a "
+                        f"saliency-mode run cannot be resumed from a partial "
+                        f"stage-2 checkpoint."
+                    )
+                weights = np.array(
+                    [max(float(scores[m]), 0.0) for m in members],
+                    dtype=np.float64,
                 )
+                if weights.sum() <= 0.0:
+                    log.warning(
+                        "layer %d centroid %d: all %d merge members have zero "
+                        "saliency score — falling back to equal weights",
+                        li, centroid, len(members),
+                    )
+                    weights[:] = 1.0
+                weights /= weights.sum()
 
             # The centroid serves a dual role: it is the permutation-alignment reference
             # (via ref_gate/ref_up) AND a member of the weighted average (members[0]).

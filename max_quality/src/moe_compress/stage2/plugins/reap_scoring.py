@@ -99,6 +99,9 @@ Output context contract
 - ``writes``: ``reap_acc`` (the per-layer ``ReapAccumulator``),
   ``scores`` (per-expert saliency ``np.ndarray``), ``freq`` (per-expert
   token count ``dict[int, int]``).
+- ``scores`` consumers: ``Stage 2 LayerMergePlugin.merge`` (when
+  ``ream.frequency_weighted_merge=False``; saliency-weighted merge mode)
+  AND ``select_centroids_by_reap`` (centroid selection ranking — always).
 - ``provides``: ``("reap_acc",)`` — declarative metadata for the
   orchestrator's calibration-pass wiring.
 
