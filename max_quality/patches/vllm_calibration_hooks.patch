@@ -2719,6 +2719,152 @@ index 0000000..c135f9f
 +    )
 +    assert torch.allclose(e0, expected_e0, atol=1e-5), f"e0={e0}"
 +    assert torch.allclose(e1, expected_e1, atol=1e-5), f"e1={e1}"
+diff --git a/tests/test_calibration_max_layer.py b/tests/test_calibration_max_layer.py
+new file mode 100644
+index 0000000..ff6a6d0
+--- /dev/null
++++ b/tests/test_calibration_max_layer.py
+@@ -0,0 +1,140 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Smoke tests for the L2 ``_CALIB_MAX_LAYER`` early-exit gate.
++
++These tests cover the calibration-side surface of L2:
++
++1. Module default: ``_CALIB_MAX_LAYER is None`` when the env var is unset
++   (the loop bound on the model side stays ``self.end_layer`` => byte-
++   identical to the unpatched forward).
++2. ``VLLM_CALIB_MAX_LAYER`` is sampled at import: setting it to ``"5"``
++   before importing the module yields ``_CALIB_MAX_LAYER == 5``.
++3. The literal env value ``"-1"`` and the empty string both map to
++   ``None`` (the "disabled" sentinel) so a launcher can clear the gate
++   by passing ``-1`` without unsetting the variable.
++4. Malformed env values (``"foo"``, ``"1.5"``) fall back to ``None``
++   rather than raising — a misconfigured env should not crash a run.
++5. Runtime ``set_calibration_max_layer(N)`` round-trips through
++   ``get_calibration_max_layer()``.
++6. ``set_calibration_max_layer(None)`` and ``set_calibration_max_layer(-1)``
++   both clear the gate.
++7. ``set_calibration_max_layer`` rejects non-int / non-None inputs with
++   ``TypeError`` (a string "5" is a bug, not a coerce).
++8. The early-exit math used by ``Qwen3MoeModel.forward`` matches the
++   spec: for a model with ``start_layer=0, end_layer=24``, setting
++   ``_CALIB_MAX_LAYER=0`` yields ``effective_end=1`` (one layer), and
++   ``_CALIB_MAX_LAYER=23`` yields ``effective_end=24`` (full forward).
++   Out-of-range values clamp to the model boundary.
++"""
++from __future__ import annotations
++
++import importlib
++import os
++import sys
++
++import pytest
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _reload_hooks(env_value: str | None):
++    """Reload ``vllm.calibration_hooks`` with a chosen ``VLLM_CALIB_MAX_LAYER``.
++
++    Passing ``None`` clears the env var so the import sees the unset state.
++    """
++    sys.modules.pop("vllm.calibration_hooks", None)
++    if env_value is None:
++        os.environ.pop("VLLM_CALIB_MAX_LAYER", None)
++    else:
++        os.environ["VLLM_CALIB_MAX_LAYER"] = env_value
++    return importlib.import_module("vllm.calibration_hooks")
++
++
++def _effective_end(
++    start_layer: int, end_layer: int, max_layer: int | None
++) -> int:
++    """Mirror the exact arithmetic used by ``Qwen3MoeModel.forward``."""
++    if max_layer is None:
++        return end_layer
++    return min(end_layer, max(start_layer, max_layer + 1))
++
++
++# ---------------------------------------------------------------------------
++# Tests
++# ---------------------------------------------------------------------------
++
++
++def test_default_max_layer_is_none():
++    ch = _reload_hooks(None)
++    assert ch._CALIB_MAX_LAYER is None
++    assert ch.get_calibration_max_layer() is None
++
++
++@pytest.mark.parametrize("env_value, expected", [("0", 0), ("5", 5), ("23", 23)])
++def test_env_value_is_sampled_at_import(env_value, expected):
++    ch = _reload_hooks(env_value)
++    assert ch._CALIB_MAX_LAYER == expected
++    assert ch.get_calibration_max_layer() == expected
++
++
++@pytest.mark.parametrize("env_value", ["", "-1", "-7"])
++def test_disabled_sentinels_map_to_none(env_value):
++    ch = _reload_hooks(env_value)
++    assert ch._CALIB_MAX_LAYER is None
++
++
++@pytest.mark.parametrize("env_value", ["foo", "1.5", "0x5", " "])
++def test_malformed_env_falls_back_to_none(env_value):
++    ch = _reload_hooks(env_value)
++    assert ch._CALIB_MAX_LAYER is None
++
++
++def test_runtime_setter_round_trip():
++    ch = _reload_hooks(None)
++    ch.set_calibration_max_layer(11)
++    assert ch._CALIB_MAX_LAYER == 11
++    assert ch.get_calibration_max_layer() == 11
++    ch.set_calibration_max_layer(0)
++    assert ch.get_calibration_max_layer() == 0
++
++
++def test_runtime_setter_clears_with_none_or_negative():
++    ch = _reload_hooks("5")
++    assert ch._CALIB_MAX_LAYER == 5
++    ch.set_calibration_max_layer(None)
++    assert ch._CALIB_MAX_LAYER is None
++    ch.set_calibration_max_layer(7)
++    assert ch._CALIB_MAX_LAYER == 7
++    ch.set_calibration_max_layer(-1)
++    assert ch._CALIB_MAX_LAYER is None
++    ch.set_calibration_max_layer(3)
++    ch.set_calibration_max_layer(-99)
++    assert ch._CALIB_MAX_LAYER is None
++
++
++@pytest.mark.parametrize("bad", ["5", 5.0, [5], (5,), object()])
++def test_runtime_setter_rejects_non_int(bad):
++    ch = _reload_hooks(None)
++    with pytest.raises(TypeError):
++        ch.set_calibration_max_layer(bad)
++    # And the gate stays at its previous value (None).
++    assert ch._CALIB_MAX_LAYER is None
++
++
++def test_effective_end_math_matches_forward_spec():
++    # Single-rank model: start_layer=0, end_layer=num_hidden_layers.
++    assert _effective_end(0, 24, None) == 24  # default -> full forward
++    assert _effective_end(0, 24, 0) == 1  # only layer 0 runs
++    assert _effective_end(0, 24, 5) == 6  # layers 0..5 (six layers)
++    assert _effective_end(0, 24, 23) == 24  # last legal layer == full
++    # Out-of-range clamps to model boundary (no IndexError, no underflow).
++    assert _effective_end(0, 24, 99) == 24
++    # Pipeline-parallel shard: start_layer=12, end_layer=24.
++    assert _effective_end(12, 24, None) == 24
++    assert _effective_end(12, 24, 15) == 16  # layers 12..15 on this shard
++    # A max_layer BELOW this shard's start collapses to running zero
++    # layers on the shard (still bounded by start_layer, never < it).
++    assert _effective_end(12, 24, 5) == 12  # islice(layers, 12, 12) => empty
 diff --git a/tests/test_calibration_output_reservoir_smoke.py b/tests/test_calibration_output_reservoir_smoke.py
 new file mode 100644
 index 0000000..72a1792
@@ -5406,10 +5552,10 @@ index 0000000..7944163
 +    return _n_prompts_accumulated
 diff --git a/vllm/calibration_hooks.py b/vllm/calibration_hooks.py
 new file mode 100644
-index 0000000..d4c8f8c
+index 0000000..fc2f9e1
 --- /dev/null
 +++ b/vllm/calibration_hooks.py
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,390 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Calibration capture hooks for the MoE forward path.
@@ -5554,6 +5700,22 @@ index 0000000..d4c8f8c
 +duplication: registering the SAME callable twice is a no-op (the list
 +contains each callable at most once). Clearing: passing ``fn=None`` empties
 +the list for that hook.
++
++L2 max-layer early-exit (orthogonal to the per-hook gates)
++----------------------------------------------------------
++The module-level ``_CALIB_MAX_LAYER`` (env: ``VLLM_CALIB_MAX_LAYER``,
++default unset / ``None``) lets a calibration driver tell ``Qwen3MoeModel``
++to stop the decoder-layer loop after a specific layer. When set to a non-
++negative int ``N``, the model forward processes layers ``0..N`` (inclusive)
++and skips ``N+1..num_hidden_layers-1``. The final RMSNorm is still applied
++to keep the return shape consistent with the un-truncated path. The L2 path
++is the foundation for L1 (sequential REAP+REAM per-layer profiling) but
++also useful standalone: any writer whose payload comes from layer ``L``
++or earlier (every per-block / per-expert hook listed above) saves the
++``L+1..end`` compute. Set via :func:`set_calibration_max_layer` (runtime;
++triggers torch.compile re-specialisation on first forward) or via
++``VLLM_CALIB_MAX_LAYER=<N>`` before importing ``vllm`` (preferred --
++specialises ONCE).
 +"""
 +from __future__ import annotations
 +
@@ -5564,6 +5726,8 @@ index 0000000..d4c8f8c
 +    "register_callback",
 +    "dispatch",
 +    "VALID_HOOK_NAMES",
++    "set_calibration_max_layer",
++    "get_calibration_max_layer",
 +]
 +
 +
@@ -5618,6 +5782,73 @@ index 0000000..d4c8f8c
 +# writes this attribute; callbacks SHOULD prefer the explicit ``layer_idx``
 +# kwarg in the payload.
 +_current_layer_idx: int = -1
++
++
++# ---------------------------------------------------------------------------
++# L2 max-layer early-exit gate. When set to a non-negative int N, the model
++# forward truncates the decoder-layer loop after layer N (inclusive) and
++# returns the post-layer-N hidden states normalized by the final RMSNorm.
++# Subsequent decoder layers (N+1 .. num_hidden_layers-1) are SKIPPED.
++#
++# Sampling discipline mirrors the per-hook capture gates: read from env once
++# at import (so the loop-bound modification specializes under
++# ``support_torch_compile``), with a runtime override via
++# ``set_calibration_max_layer(N)`` for drivers that need to flip it after
++# import (forces a torch.compile recompile on next forward, by design).
++#
++# Read by ``Qwen3MoeModel.forward`` as ``_ch._CALIB_MAX_LAYER``. Default
++# ``None`` => unchanged (no truncation, full forward).
++# ---------------------------------------------------------------------------
++def _parse_max_layer_env() -> int | None:
++    raw = os.getenv("VLLM_CALIB_MAX_LAYER", "")
++    if raw == "" or raw == "-1":
++        return None
++    try:
++        v = int(raw)
++    except ValueError:
++        return None
++    return v if v >= 0 else None
++
++
++_CALIB_MAX_LAYER: int | None = _parse_max_layer_env()
++
++
++def set_calibration_max_layer(layer: int | None) -> None:
++    """Set the L2 max-layer early-exit boundary at runtime.
++
++    Args:
++        layer: ``None`` (or a negative int) disables early-exit (full
++            forward). A non-negative int ``N`` causes the model forward
++            to truncate after decoder layer ``N`` (inclusive) and return
++            the post-norm hidden state at that point. Layers ``N+1 ..``
++            are SKIPPED.
++
++    Notes:
++        * ``Qwen3MoeModel`` is wrapped with ``@support_torch_compile``;
++          changing this value invalidates any specialised compile and
++          will trigger a recompile on the next forward. Set ONCE before
++          the first ``generate()`` call for the cleanest perf profile.
++        * Setting this DOES NOT alter any calibration capture hook; the
++          ``block_out`` / ``expert_in`` / etc. callbacks still fire on
++          layers ``0..N`` as normal (which is the entire L2 win: skip
++          the wasted compute on layers ``> N`` when the calibration
++          writer for that pass only needs layer-N data).
++    """
++    global _CALIB_MAX_LAYER
++    if layer is None or (isinstance(layer, int) and layer < 0):
++        _CALIB_MAX_LAYER = None
++        return
++    if not isinstance(layer, int):
++        raise TypeError(
++            f"set_calibration_max_layer expects int|None, got "
++            f"{type(layer).__name__}"
++        )
++    _CALIB_MAX_LAYER = layer
++
++
++def get_calibration_max_layer() -> int | None:
++    """Return the current L2 max-layer early-exit boundary (or ``None``)."""
++    return _CALIB_MAX_LAYER
 +
 +
 +def register_callback(name: str, fn: Callable[..., None] | None) -> None:
@@ -9021,10 +9252,10 @@ index 0000000..516237c
 +        _WEIGHT_SUM_ACCUM[int(r)] = t.to(torch.float32).clone()
 +    return _n_prompts_accumulated
 diff --git a/vllm/envs.py b/vllm/envs.py
-index ded474d..c1d8eeb 100755
+index ded474d..2ff296f 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -268,6 +268,23 @@ if TYPE_CHECKING:
+@@ -268,6 +268,24 @@ if TYPE_CHECKING:
      VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
      VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
      VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -9045,10 +9276,11 @@ index ded474d..c1d8eeb 100755
 +    VLLM_CALIB_OUTPUT_RESERVOIR_CAP: int = 256
 +    VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS: bool = False
 +    VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE: int = 128
++    VLLM_CALIB_MAX_LAYER: int = -1
  
  
  def get_default_cache_root():
-@@ -1788,6 +1805,177 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1788,6 +1806,193 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
          int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
      ),
@@ -9222,6 +9454,22 @@ index ded474d..c1d8eeb 100755
 +    # Only consulted when ``VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS=1``.
 +    "VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE": lambda: int(
 +        os.getenv("VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE", "128")
++    ),
++    # L2 max-layer early-exit boundary for ``Qwen3MoeModel.forward``. When
++    # set to a non-negative int ``N``, the model forward truncates the
++    # decoder-layer loop after layer ``N`` (inclusive) and returns the
++    # post-norm hidden state. Layers ``N+1..num_hidden_layers-1`` are
++    # SKIPPED. Default ``-1`` => disabled / full forward (the
++    # ``vllm.calibration_hooks._parse_max_layer_env`` parser maps both
++    # the unset case and the literal ``"-1"`` to ``None``). Read once at
++    # ``vllm.calibration_hooks`` import; runtime overrides go through
++    # ``vllm.calibration_hooks.set_calibration_max_layer``. Useful as the
++    # foundation for L1 (sequential REAP+REAM per-layer profiling) and as
++    # a standalone optimisation for any calibration writer whose payload
++    # comes from layer ``L`` or earlier (every per-block / per-expert
++    # hook). Setting this DOES NOT alter calibration capture hooks.
++    "VLLM_CALIB_MAX_LAYER": lambda: int(
++        os.getenv("VLLM_CALIB_MAX_LAYER", "-1")
 +    ),
  }
  
@@ -9787,7 +10035,7 @@ index 3541b97..10380b0 100644
          logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
  
 diff --git a/vllm/model_executor/models/qwen3_moe.py b/vllm/model_executor/models/qwen3_moe.py
-index 4ec1be3..3fa2040 100644
+index 4ec1be3..454c657 100644
 --- a/vllm/model_executor/models/qwen3_moe.py
 +++ b/vllm/model_executor/models/qwen3_moe.py
 @@ -32,6 +32,7 @@ import torch
@@ -9826,3 +10074,28 @@ index 4ec1be3..3fa2040 100644
  
          if self.is_sequence_parallel:
              final_hidden_states = tensor_model_parallel_all_gather(
+@@ -496,8 +511,23 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
+         aux_hidden_states = self._maybe_add_hidden_state(
+             [], self.start_layer, hidden_states, residual
+         )
++        # L2 max-layer early-exit: sample the gate once at forward entry so
++        # the loop bound is a plain int (specialises cleanly under
++        # ``@support_torch_compile`` -- a value change forces a recompile,
++        # by design). The boundary is INCLUSIVE: ``_CALIB_MAX_LAYER=N``
++        # runs layers ``start_layer..N`` and skips ``N+1..end_layer-1``.
++        # ``None`` (default) leaves ``effective_end`` == ``self.end_layer``
++        # so the production hot path stays byte-identical.
++        _max_layer = _ch._CALIB_MAX_LAYER
++        if _max_layer is None:
++            effective_end = self.end_layer
++        else:
++            # Clamp to the actual layer range so callers cannot blow past
++            # the model boundary (and so a negative value is a no-op via
++            # ``set_calibration_max_layer`` normalisation upstream).
++            effective_end = min(self.end_layer, max(self.start_layer, _max_layer + 1))
+         for layer_idx, layer in enumerate(
+-            islice(self.layers, self.start_layer, self.end_layer),
++            islice(self.layers, self.start_layer, effective_end),
+             start=self.start_layer,
+         ):
+             hidden_states, residual = layer(positions, hidden_states, residual)

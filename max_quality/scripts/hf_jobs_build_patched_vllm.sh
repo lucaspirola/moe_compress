@@ -50,28 +50,29 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply calibration hooks patch ==="
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-block-outputs-writer/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-max-layer-early-exit/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected MD5: 1375b965b02b4ce7ac0a35fd7f7b23cf (9828 lines)
-# Adds the per-MoE-block hidden-states writer on a fixed N-prompt
-# subset (Item 7 of the calibration-v2 writers campaign), on top of
-# the previous output-reservoir + router-logits-stats + routing-stats
-# + per-expert-max + input-cov + REAP-scores + imatrix writers.
-# Subscribes to the existing ``block_out`` hook (dispatched from
-# Qwen3MoeSparseMoeBlock.forward under VLLM_CALIB_CAPTURE_BLOCK=1);
-# clones the post-MoE-block hidden states (pre-residual-add) to CPU
-# bf16 per-rank lists. The driver owns the cumulative prompt counter
-# and calls close_subset() once the count reaches
-# VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE (default 128); subsequent
-# block_out dispatches early-return. Writes one sidecar per layer at
-# <jsonl>/sidecars/block_hidden/layer_{idx:04d}.pt (schema v1
-# BlockHiddenPayload from Item 0, [n_tokens, hidden] bf16) at run
-# end. Consumed by Stage 3's Stage3BlockHiddenCacheProvider: on hit
-# populates ctx.teacher_targets_cache so Phase C.5 block_refine
-# skips the live teacher block forward. No FlashInfer restriction:
-# block_out fires on any MoE backend.
+# Expected MD5: a8da5e321ac7fb30f1648fba3476bea6 (10101 lines)
+# Adds the L2 max-layer early-exit gate to Qwen3MoeModel.forward
+# (Item L2 of the calibration-v2 writers campaign -- foundation for
+# L1's sequential REAP+REAM per-layer profiling and a standalone
+# optimisation for any writer whose payload comes from layer L or
+# earlier), on top of the previous block-outputs + output-reservoir
+# + router-logits-stats + routing-stats + per-expert-max + input-cov
+# + REAP-scores + imatrix writers. New module-level
+# _CALIB_MAX_LAYER (sampled from VLLM_CALIB_MAX_LAYER at
+# vllm.calibration_hooks import; "" and "-1" map to None;
+# malformed values map to None) + set_calibration_max_layer() /
+# get_calibration_max_layer() runtime accessors. Qwen3MoeModel.
+# forward reads the gate ONCE at forward entry and derives
+# effective_end = min(self.end_layer, max(self.start_layer,
+# _max_layer + 1)) for the islice over decoder layers (boundary is
+# INCLUSIVE; out-of-range clamps; below-shard-start collapses to
+# zero layers on that shard). When None (default), effective_end ==
+# self.end_layer => byte-identical to the un-patched path so the
+# production hot path pays nothing.
 # See max_quality/patches/MANIFEST.md.
 git apply --check /tmp/calib.patch
 git apply /tmp/calib.patch
@@ -201,8 +202,8 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-block-outputs-writer`)
-- Patch artifact (9828 lines, MD5 `1375b965b02b4ce7ac0a35fd7f7b23cf`): also uploaded to this repo as `vllm_calibration_hooks.patch`
+- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-max-layer-early-exit`)
+- Patch artifact (10101 lines, MD5 `a8da5e321ac7fb30f1648fba3476bea6`): also uploaded to this repo as `vllm_calibration_hooks.patch`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130
@@ -226,6 +227,7 @@ The patched vLLM accepts new env vars to enable calibration data capture:
 - `VLLM_CALIB_CAPTURE_BLOCK=1`      — MoE block pre-residual output
 - `VLLM_CALIB_CAPTURE_IMATRIX=1`    — per-input-channel sum-of-squares for every linear layer (writes llama.cpp-compatible `.imatrix.dat`)
 - `VLLM_CALIB_CAPTURE_INPUT_COV=1`  — per-(layer, expert, "gate_proj") teacher input covariance Σ_in (requires `VLLM_CALIB_CAPTURE_EXPERT=1`; writes dict-shaped `sidecars/covariance.pt`, schema v2)
+- `VLLM_CALIB_MAX_LAYER=<N>`        — L2 early-exit gate: truncate `Qwen3MoeModel.forward` after decoder layer `N` (inclusive); skips `N+1..end`. Default `-1` / unset = disabled. Orthogonal to the capture gates above. Useful as the foundation for L1 (sequential REAP+REAM per-layer profiling) and as a standalone optimisation for any writer whose payload comes from layer `L` or earlier.
 
 ## Spot-preemption resumability
 

@@ -8,11 +8,11 @@ the patch (the HF Jobs build script, the README uploaded to
 
 | Field | Value |
 |---|---|
-| Immutable tag | `calib-v2-block-outputs-writer` |
+| Immutable tag | `calib-v2-max-layer-early-exit` |
 | Branch (active) | `feat/calibration-v2` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch line count | **9828** |
-| Patch MD5 | **`1375b965b02b4ce7ac0a35fd7f7b23cf`** |
+| Patch line count | **10101** |
+| Patch MD5 | **`a8da5e321ac7fb30f1648fba3476bea6`** |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -22,9 +22,9 @@ the patch (the HF Jobs build script, the README uploaded to
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: 1375b965b02b4ce7ac0a35fd7f7b23cf
+# expect: a8da5e321ac7fb30f1648fba3476bea6
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 9828
+# expect: 10101
 
 # Re-apply against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -34,7 +34,69 @@ git apply --check /path/to/vllm_calibration_hooks.patch && echo OK
 
 ## Change log
 
-### `calib-v2-block-outputs-writer` (current)
+### `calib-v2-max-layer-early-exit` (current)
+Adds the L2 ``max_layer`` early-exit gate to ``Qwen3MoeModel.forward``
+(Item L2 of the calibration-v2 writers campaign — foundation for L1's
+sequential REAP+REAM per-layer profiling and a standalone optimisation
+for any writer whose payload comes from layer ``L`` or earlier).
+- `vllm/calibration_hooks.py`: new module-level ``_CALIB_MAX_LAYER:
+  int | None`` (sampled at import from ``VLLM_CALIB_MAX_LAYER`` via
+  ``_parse_max_layer_env``; ``""`` and ``"-1"`` map to ``None``;
+  malformed values map to ``None`` rather than raising), new public
+  ``set_calibration_max_layer(layer: int | None)`` /
+  ``get_calibration_max_layer()`` runtime accessors (the setter
+  normalises ``None`` and negative ints to the disabled sentinel and
+  rejects non-int with ``TypeError``), and a new docstring section
+  describing how L2 composes with the per-hook capture gates. Both
+  new functions are exported in ``__all__``.
+- `vllm/model_executor/models/qwen3_moe.py`: ``Qwen3MoeModel.forward``
+  reads ``_ch._CALIB_MAX_LAYER`` ONCE at forward entry and uses the
+  value to derive ``effective_end = min(self.end_layer, max(self.
+  start_layer, _max_layer + 1))`` for the ``islice`` over decoder
+  layers (so the boundary is INCLUSIVE: ``_CALIB_MAX_LAYER=N`` runs
+  layers ``start_layer..N`` and skips ``N+1..end_layer-1``; out-of-
+  range values clamp to the model boundary; values below the shard's
+  ``start_layer`` collapse to zero layers on that shard, which is the
+  correct pipeline-parallel semantics). When ``_CALIB_MAX_LAYER is
+  None`` (default), ``effective_end`` == ``self.end_layer`` => the
+  loop is byte-identical to the un-patched code path so the
+  production hot path pays nothing. The single attribute load at
+  forward entry keeps ``@support_torch_compile`` specialisation
+  clean: a value change forces a recompile, by design.
+- `vllm/envs.py`: ``VLLM_CALIB_MAX_LAYER: int = -1`` added to the
+  ``TYPE_CHECKING`` block and the ``environment_variables`` dispatch
+  dict (``lambda: int(os.getenv("VLLM_CALIB_MAX_LAYER", "-1"))``).
+  Default ``-1`` matches the ``_parse_max_layer_env`` "disabled"
+  sentinel.
+- `tests/test_calibration_max_layer.py`: +8 tests covering the
+  default-None contract, env-var sampling at import for ``0/5/23``,
+  the disabled-sentinel mapping for ``""/-1/-7``, malformed-env
+  fallback (``"foo"/"1.5"/"0x5"/" "`` -> ``None``), runtime setter
+  round-trip via the public accessors, setter-clears with ``None`` /
+  negative-int, setter-rejects with ``TypeError`` for
+  ``str/float/list/tuple/object``, and the ``effective_end`` math
+  spec (single-rank ``start=0, end=24`` + pipeline-parallel shard
+  ``start=12, end=24``, including the below-shard-start collapse).
+
+NO new driver-side flag in this patch: the calibration driver
+(``build_self_traces_calib_vllm.py``) can opt in by either exporting
+``VLLM_CALIB_MAX_LAYER=<N>`` BEFORE the ``from vllm import LLM``
+import or by calling ``vllm.calibration_hooks.set_calibration_max_
+layer(N)`` AFTER the import but BEFORE ``LLM.generate`` -- L1 will
+wire this in the per-layer loop.
+
+NO new Stage 3 / Stage 2.5 reader companion: L2 is an OPTIMISATION
+of the existing forward; the writers that benefit (block-outputs,
+imatrix, input-cov, REAP-scores, per-expert-max, output-reservoir,
+routing-stats, router-logits-stats) already write the same on-disk
+sidecars regardless of how many layers were actually run. Operators
+must understand that setting ``VLLM_CALIB_MAX_LAYER=N`` together with
+a layer-spanning writer (e.g. block-outputs over all layers) will
+produce sidecars containing data ONLY for layers ``0..N`` -- the
+downstream consumers handle "missing layer" the same way they handle
+any other absent sidecar entry.
+
+### `calib-v2-block-outputs-writer`
 Adds the per-MoE-block hidden-states writer on a fixed N-prompt subset
 (Item 7 of the calibration-v2 writers campaign).
 - `vllm/calibration_block_outputs.py`: new module subscribing the
