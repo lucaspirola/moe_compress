@@ -61,6 +61,7 @@ from ..utils.model_io import MATRIX_NAMES, FactoredExperts, save_json_artifact
 
 from .plugins.eora_compensation import EoraCompensationPlugin
 from .plugins.eora_inputs import EoraInputsPlugin
+from .plugins.input_cov_cache import Stage4InputCovCacheProvider
 
 log = logging.getLogger(__name__)
 
@@ -95,12 +96,47 @@ def run(
     run_ctx.set("rank_map", {})
     run_ctx.set("compensated_params", 0)
 
-    registry = PluginRegistry([EoraInputsPlugin(), EoraCompensationPlugin()])
+    # Cache provider registered FIRST so the V2 input-covariance cache
+    # has a shot at populating ``A_cov`` (+ ``a_storage_dtype``) on the
+    # ctx before the live ``EoraInputsPlugin.load_eora_inputs`` runs.
+    # The live plugin then short-circuits its on-disk
+    # ``_stage2_input_covariance.pt`` load via a ``ctx.has("A_cov")``
+    # guard. Cache miss: the live plugin loads from disk as before.
+    registry = PluginRegistry([
+        Stage4InputCovCacheProvider(),
+        EoraInputsPlugin(),
+        EoraCompensationPlugin(),
+    ])
     plugins = registry.enabled(config)
+
+    # ---- on_load (V2 input-cov cache only) -------------------------------
+    # Dispatch the cache provider's ``on_load`` BEFORE the
+    # ``load_eora_inputs`` walk so the live plugin's ``ctx.has("A_cov")``
+    # guard sees the cached binding. Resolve the calibration JSONL the
+    # same way Stage 2 does (default path -> _DEFAULT_SELF_TRACES_PATH).
+    try:
+        from pathlib import Path as _Path
+        from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
+        _cal_cfg = config.get("calibration", {})
+        _calib_source = _cal_cfg.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
+        _calib_jsonl_path = _Path(_calib_source)
+        if not _calib_jsonl_path.is_absolute():
+            _calib_jsonl_path = _Path.cwd() / _calib_jsonl_path
+        PluginRegistry.dispatch_first(
+            plugins, "on_load", run_ctx, _calib_jsonl_path,
+        )
+    except Exception as _exc:                       # noqa: BLE001
+        # Cache attempt MUST NOT block the legacy fallback inside
+        # ``EoraInputsPlugin.load_eora_inputs``. Log + ignore so the
+        # walk_phases call below still runs the live load.
+        log.warning("Stage 4: V2 input-cov cache dispatch failed (%s) -- "
+                    "falling back to the live load", _exc)
 
     # ---- load_eora_inputs ------------------------------------------------
     # EoraInputsPlugin.load_eora_inputs writes A_cov / a_storage_dtype /
-    # originals / layers / partial_dir / stage3_ranks onto run_ctx.
+    # originals / layers / partial_dir / stage3_ranks onto run_ctx. On a
+    # cache hit, A_cov + a_storage_dtype are already set; the live
+    # plugin's ctx.has("A_cov") guard skips the on-disk load.
     walk_phases(("load_eora_inputs",), plugins, run_ctx)
     layers = run_ctx.get("layers")
     partial_dir = run_ctx.get("partial_dir")

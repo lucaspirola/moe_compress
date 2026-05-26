@@ -134,17 +134,38 @@ class EoraInputsPlugin:
         # A-cov was persisted by Stage 2 in this storage dtype; the eigh
         # threshold in `_compute_eora_factors` must be tuned to that dtype's
         # quantization noise floor or it will keep noise-inflated directions.
-        s2 = config.get("stage2_reap_ream", {})
-        a_storage_dtype = getattr(
-            torch, s2.get("covariance_storage_dtype", "float16")
-        )
-        A_cov_path = artifacts_dir / "_stage2_input_covariance.pt"
-        A_cov: dict = {}
-        if A_cov_path.exists():
-            A_cov = torch.load(A_cov_path, map_location="cpu").get("covariance", {})
+        #
+        # V2 cache short-circuit: when the calibration-v2 cache provider
+        # (:class:`stage4.plugins.input_cov_cache.Stage4InputCovCacheProvider`)
+        # already populated ``ctx.A_cov`` + ``ctx.a_storage_dtype``, skip
+        # the on-disk ``_stage2_input_covariance.pt`` load entirely. The
+        # cached dict has the same ``(layer_idx, expert_idx, matrix_name)``
+        # → ``Tensor[d_in, d_in]`` shape so downstream ``_cov_lookup`` /
+        # ``_compute_eora_factors`` work unchanged.
+        if ctx.has("A_cov"):
+            log.info("Stage 4: V2 input-cov cache HIT (%d keys) — skipping "
+                     "_stage2_input_covariance.pt load",
+                     len(ctx.get("A_cov")))
+            # Compute a_storage_dtype only if the cache provider did not.
+            if not ctx.has("a_storage_dtype"):
+                s2 = config.get("stage2_reap_ream", {})
+                ctx.set("a_storage_dtype", getattr(
+                    torch, s2.get("covariance_storage_dtype", "float16"),
+                ))
+            A_cov = ctx.get("A_cov")
+            a_storage_dtype = ctx.get("a_storage_dtype")
         else:
-            log.warning("Stage 4: no Stage 2 covariance at %s — plain-SVD fallback",
-                        A_cov_path)
+            s2 = config.get("stage2_reap_ream", {})
+            a_storage_dtype = getattr(
+                torch, s2.get("covariance_storage_dtype", "float16")
+            )
+            A_cov_path = artifacts_dir / "_stage2_input_covariance.pt"
+            A_cov = {}
+            if A_cov_path.exists():
+                A_cov = torch.load(A_cov_path, map_location="cpu").get("covariance", {})
+            else:
+                log.warning("Stage 4: no Stage 2 covariance at %s — plain-SVD fallback",
+                            A_cov_path)
 
         originals_path = artifacts_dir / "_stage3_original_weights.pt"
         if not originals_path.exists():
@@ -205,8 +226,15 @@ class EoraInputsPlugin:
                     name: fe.ranks[name] for name in MATRIX_NAMES
                 }
 
-        ctx.set("A_cov", A_cov)
-        ctx.set("a_storage_dtype", a_storage_dtype)
+        # ``overwrite=("A_cov" in ctx)`` -- when the V2 cache provider
+        # already populated A_cov + a_storage_dtype on the ctx, our
+        # set() must use overwrite=True (or skip the set; we'd write the
+        # same object back, so overwrite is the simpler form). When the
+        # cache missed, A_cov / a_storage_dtype are absent on the ctx and
+        # the set is a fresh bind.
+        _cache_hit = "A_cov" in ctx
+        ctx.set("A_cov", A_cov, overwrite=_cache_hit)
+        ctx.set("a_storage_dtype", a_storage_dtype, overwrite=_cache_hit)
         ctx.set("originals", originals)
         ctx.set("layers", layers)
         ctx.set("partial_dir", partial_dir)

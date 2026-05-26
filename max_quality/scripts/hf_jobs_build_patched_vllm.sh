@@ -50,16 +50,20 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply calibration hooks patch ==="
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-reap-scores-writer/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-input-cov-writer/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected MD5: e3fba22dc2bb0f5db3822c75a8182ad5 (4409 lines)
-# Adds the REAP-scores writer: per-(layer, expert) saliency-score capture
-# via the router + expert_out_unweighted hooks, with periodic
-# .reap_scores.ckpt resumability mirroring the imatrix path. Final dump
-# writes the Stage2ReapPayload sidecar consumed by
-# Stage2ReapScoresCacheProvider. See max_quality/patches/MANIFEST.md.
+# Expected MD5: 304a223fe6f655d95a97cab282d17d5e (5196 lines)
+# Adds the per-(layer, expert, "gate_proj") teacher input-covariance Σ_in
+# writer (Item 1 of the calibration-v2 writers campaign), on top of the
+# previous REAP-scores writer. Hooks ``expert_in`` to scatter-reduce
+# per-(layer, expert) x^T x into a CPU fp32 accumulator dict keyed by
+# (layer_idx, expert_idx, "gate_proj") -- byte-shape-compatible with the
+# Stage 2 writer's _stage2_input_covariance.pt. Final dump writes the
+# CovariancePayload (schema v2) sidecar consumed by
+# Stage3InputCovCacheProvider + Stage4InputCovCacheProvider.
+# See max_quality/patches/MANIFEST.md.
 git apply --check /tmp/calib.patch
 git apply /tmp/calib.patch
 echo "Applied. Status:"
@@ -188,8 +192,8 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-reap-scores-writer`)
-- Patch artifact (4409 lines, MD5 `e3fba22dc2bb0f5db3822c75a8182ad5`): also uploaded to this repo as `vllm_calibration_hooks.patch`
+- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-input-cov-writer`)
+- Patch artifact (5196 lines, MD5 `304a223fe6f655d95a97cab282d17d5e`): also uploaded to this repo as `vllm_calibration_hooks.patch`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130
@@ -212,6 +216,7 @@ The patched vLLM accepts new env vars to enable calibration data capture:
 - `VLLM_CALIB_CAPTURE_EXPERT_MID=1` — silu(gate)·up intermediate (input to down_proj; Triton backend)
 - `VLLM_CALIB_CAPTURE_BLOCK=1`      — MoE block pre-residual output
 - `VLLM_CALIB_CAPTURE_IMATRIX=1`    — per-input-channel sum-of-squares for every linear layer (writes llama.cpp-compatible `.imatrix.dat`)
+- `VLLM_CALIB_CAPTURE_INPUT_COV=1`  — per-(layer, expert, "gate_proj") teacher input covariance Σ_in (requires `VLLM_CALIB_CAPTURE_EXPERT=1`; writes dict-shaped `sidecars/covariance.pt`, schema v2)
 
 ## Spot-preemption resumability
 

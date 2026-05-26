@@ -63,6 +63,7 @@ from .plugins.covariance_collection import (
     _load_stage2_covariance,
 )
 from .plugins.d_rank_allocate import DRankAllocatePlugin, _GroupStats, _group_stat
+from .plugins.input_cov_cache import Stage3InputCovCacheProvider
 from .plugins.swift_svd_alpha import (
     SwiftSvdAlphaPlugin,
     _redistribute_ranks_swift_svd_plus,
@@ -97,7 +98,39 @@ def run(
     # A covariance from Stage 2 (pre-prune inputs per surviving expert).
     # Used by EoRA (Stage 4) and L-BFGS refine (Phase D). Also used for
     # activation-weighted eps* in Swift-SVD+ (D8 fix).
-    A_cov = _load_stage2_covariance(artifacts_dir / "_stage2_input_covariance.pt")
+    #
+    # V2 cache-first: try the calibration-v2 sidecar at
+    # ``<jsonl_dir>/sidecars/covariance.pt`` BEFORE the legacy
+    # _stage2_input_covariance.pt load. On hit, the dict-shaped payload
+    # is byte-compatible with the legacy file's "covariance" field and
+    # plugs into ``A_cov`` directly; on miss, fall through to the
+    # legacy artifact. The provider is path-scoped (it reads from the
+    # calibration JSONL's sibling sidecars/ dir, not from artifacts_dir),
+    # so we resolve the calibration JSONL the same way Stage 2 does.
+    A_cov = None
+    try:
+        from pathlib import Path as _Path
+        from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
+        _calib_source = cal.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
+        _calib_jsonl_path = _Path(_calib_source)
+        if not _calib_jsonl_path.is_absolute():
+            _calib_jsonl_path = _Path.cwd() / _calib_jsonl_path
+        _input_cov_cache = Stage3InputCovCacheProvider()
+        _cached_payload = _input_cov_cache.on_load(
+            PipelineContext(), _calib_jsonl_path,
+        )
+        if _cached_payload is not None:
+            A_cov = _cached_payload.sigma_in
+            log.info(
+                "Stage 3: V2 input-cov cache HIT (%d keys) -- skipping "
+                "_stage2_input_covariance.pt load", len(A_cov),
+            )
+    except Exception as _exc:                       # noqa: BLE001
+        # Cache attempt MUST NOT block the legacy fallback. Log + ignore.
+        log.warning("Stage 3: V2 input-cov cache lookup failed (%s) -- "
+                    "falling back to _stage2_input_covariance.pt", _exc)
+    if A_cov is None:
+        A_cov = _load_stage2_covariance(artifacts_dir / "_stage2_input_covariance.pt")
 
     # B covariance + cross-covariance: fresh calibration through both models.
     # Use cal["num_sequences"] directly -- do NOT reuse validation_samples here,
@@ -170,7 +203,14 @@ def run(
     run_ctx.set("ccov_spill_dir", ccov_spill_dir)
     run_ctx.set("rank_map", {})
 
+    # Cache provider registered FIRST so a future ``dispatch_first(plugins,
+    # "on_load", ...)`` call (or a downstream phase that wants to consult
+    # the cache through the registry) sees it before the live plugins.
+    # The actual cache lookup for the run-scope A_cov happens above (run
+    # glue), but registering the provider here keeps the plugin sequence
+    # introspectable + parity with the Stage 2 / Stage 4 wiring.
     registry = PluginRegistry([
+        Stage3InputCovCacheProvider(),
         CovarianceCollectionPlugin(),
         DRankAllocatePlugin(),
         SwiftSvdAlphaPlugin(),

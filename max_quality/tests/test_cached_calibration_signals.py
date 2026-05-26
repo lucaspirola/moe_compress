@@ -105,14 +105,27 @@ def _make_stage2_profile(n_layers: int = 2, n_experts: int = 3) -> Stage2Profile
 
 
 def _make_covariance(n_layers: int = 2, n_experts: int = 3, hidden: int = 8) -> CovariancePayload:
+    """Dict-valued covariance payload mirroring the on-disk
+    ``_stage2_input_covariance.pt`` shape (schema v2).
+
+    Keys: ``(layer_idx, expert_idx, matrix_name)`` -> ``Tensor[d_in, d_in]``.
+    Matrix names match the Stage 2 writer convention: ``gate_proj`` (which
+    covers both gate and up via the up_proj alias) and ``down_proj``.
+    """
+    sigma_in: dict = {}
+    token_counts: dict = {}
+    for li in range(n_layers):
+        for e in range(n_experts):
+            for name in ("gate_proj", "down_proj"):
+                # fp16 to mirror the Stage 2 writer's storage dtype.
+                sigma_in[(li, e, name)] = torch.eye(hidden, dtype=torch.float16)
+                token_counts[(li, e, name)] = 7
     return CovariancePayload(
         schema_version=SCHEMA_VERSIONS["covariance"],
         n_experts=n_experts,
         n_layers=n_layers,
-        sigma_in=torch.eye(hidden, dtype=torch.float32).unsqueeze(0).repeat(
-            n_layers, 1, 1
-        ),
-        token_counts=torch.ones((n_layers, n_experts), dtype=torch.int64) * 7,
+        sigma_in=sigma_in,
+        token_counts=token_counts,
     )
 
 
@@ -268,6 +281,11 @@ def test_reap_scores_roundtrip(tmp_path):
 
 
 def test_covariance_roundtrip(tmp_path):
+    """Dict-valued covariance (schema v2) round-trips through save/load.
+
+    Validates every (layer, expert, matrix) key survives, every tensor
+    lands on CPU as fp16, and the token_counts dict is preserved as-is.
+    """
     jsonl = _jsonl(tmp_path)
     original = _make_covariance()
     save_covariance(original, jsonl)
@@ -276,9 +294,15 @@ def test_covariance_roundtrip(tmp_path):
     loaded = load_covariance(jsonl)
     assert loaded is not None
     assert loaded.schema_version == SCHEMA_VERSIONS["covariance"]
-    assert torch.equal(loaded.sigma_in, original.sigma_in.cpu())
-    assert torch.equal(loaded.token_counts, original.token_counts.cpu())
-    assert loaded.sigma_in.device.type == "cpu"
+    # Same keys.
+    assert set(loaded.sigma_in.keys()) == set(original.sigma_in.keys())
+    assert loaded.token_counts == original.token_counts
+    # Each tensor matches (after a CPU/fp16 cast on the original side) and
+    # lives on CPU as fp16 after the load.
+    for key, t in loaded.sigma_in.items():
+        assert t.device.type == "cpu"
+        assert t.dtype == torch.float16
+        assert torch.equal(t, original.sigma_in[key].cpu().to(torch.float16))
 
 
 def test_router_kd_logits_roundtrip(tmp_path):

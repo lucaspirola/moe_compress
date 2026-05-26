@@ -98,7 +98,7 @@ from moe_compress.pipeline.plugin import BasePlugin
 SCHEMA_VERSIONS: dict[str, int] = {
     "phase_b":          1,
     "stage2_profile":   1,
-    "covariance":       1,
+    "covariance":       2,
     "router_kd_logits": 1,
     "block_hidden":     1,
     "teacher_eval":     1,
@@ -181,11 +181,29 @@ class Stage2ReapPayload:
 
 @dataclass
 class CovariancePayload:
+    """Per-(layer, expert, matrix) teacher input covariance Σ_in.
+
+    Dict-valued storage because the actual on-disk format used by Stage
+    3/4 today (``_stage2_input_covariance.pt``) is a dict keyed by
+    ``(layer_idx, expert_idx, matrix_name)`` → fp16 ``Tensor[d_in, d_in]``.
+    See ``max_quality/src/moe_compress/stage3/plugins/covariance_collection.py``
+    for the loader contract (``_load_stage2_covariance`` returns the
+    ``"covariance"`` field of the raw payload as a dict of this shape).
+
+    Schema bumped from v1 (which had a single 4-D tensor field) to v2
+    (dict of tensors) because the actual consumers (Stage 3 AA-SVD, Stage
+    4 EoRA) need per-(layer, expert, matrix) keying that a single 4-D
+    tensor cannot represent without a separate index mapping. v1 was
+    never written to disk by any production writer; this is a forward-
+    only bump.
+    """
     schema_version: int
     n_experts: int
     n_layers: int
-    sigma_in: torch.Tensor                # teacher-side sigma_in (shape TBD by live producer)
-    token_counts: torch.Tensor            # [n_layers, n_experts] int64
+    # {(layer_idx, expert_idx, matrix_name): Tensor[d_in, d_in] fp16}
+    sigma_in: dict
+    # {(layer_idx, expert_idx, matrix_name): int}
+    token_counts: dict
 
 
 @dataclass
@@ -339,10 +357,24 @@ def load_reap_scores(jsonl_path: Path) -> Stage2ReapPayload | None:
 # Signal 3: covariance (teacher-side sigma_in).
 # ---------------------------------------------------------------------------
 def save_covariance(payload: CovariancePayload, jsonl_path: Path) -> None:
-    cpu_payload = replace(
-        payload,
-        sigma_in=payload.sigma_in.detach().cpu(),
-        token_counts=payload.token_counts.detach().cpu(),
+    """Atomically write the per-(layer, expert, matrix) covariance sidecar.
+
+    Every tensor inside ``payload.sigma_in`` is detached + CPU-moved + cast
+    to fp16 (the persistent dtype shared with Stage 2's writer, per
+    deviation D-cov-storage-fp16 in
+    ``stage3/plugins/covariance_collection.py``). ``token_counts`` is a
+    plain ``dict[key, int]`` and is copied as-is.
+    """
+    cpu_sigma = {
+        k: v.detach().to("cpu", dtype=torch.float16, copy=True)
+        for k, v in payload.sigma_in.items()
+    }
+    cpu_payload = CovariancePayload(
+        schema_version=payload.schema_version,
+        n_experts=payload.n_experts,
+        n_layers=payload.n_layers,
+        sigma_in=cpu_sigma,
+        token_counts=dict(payload.token_counts),
     )
     _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "covariance"))
 

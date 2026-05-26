@@ -451,6 +451,30 @@ def main() -> int:
                         "disable periodic checkpointing (final-dump-only). On "
                         "--resume, the checkpoint at <jsonl>.reap_scores.ckpt "
                         "is hydrated automatically if it exists.")
+    p.add_argument("--capture-input-covariance", action="store_true",
+                   default=False,
+                   help="Capture per-(layer, expert, 'gate_proj') teacher "
+                        "input covariance Σ_in = Σ_t x_t^T x_t during "
+                        "calibration and write a moe_compress-side sidecar at "
+                        "<jsonl>/sidecars/covariance.pt at run end "
+                        "(schema v2, dict-shaped, byte-compatible with the "
+                        "Stage 2 writer's _stage2_input_covariance.pt). "
+                        "Requires the vLLM calibration-hooks patch "
+                        "(vllm.calibration_input_cov). Auto-enables "
+                        "VLLM_CALIB_CAPTURE_INPUT_COV=1 and "
+                        "VLLM_CALIB_CAPTURE_EXPERT=1 (so the expert_in hook "
+                        "fires) BEFORE any vllm import. Failures during dump "
+                        "are logged but do NOT re-raise -- the JSONL is more "
+                        "valuable than the covariance sidecar.")
+    p.add_argument("--input-cov-checkpoint-every-chunks", type=int, default=1,
+                   help="When --capture-input-covariance is set, dump a "
+                        "checkpoint (.input_cov.ckpt) of the live covariance "
+                        "accumulator state every N chunked LLM.generate "
+                        "calls. Default 1 = checkpoint at every JSONL flush "
+                        "boundary. Set 0 to disable periodic checkpointing "
+                        "(final-dump-only). On --resume, the checkpoint at "
+                        "<jsonl>.input_cov.ckpt is hydrated automatically "
+                        "if it exists.")
     args = p.parse_args()
 
     # Pre-import env gates for the imatrix path. These MUST be set before any
@@ -489,6 +513,20 @@ def main() -> int:
                  "VLLM_CALIB_CAPTURE_ROUTER=1 + "
                  "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
                  "VLLM_USE_FLASHINFER_MOE_FP16=0 "
+                 "(must precede vllm import)")
+
+    # Pre-import env gates for the input-covariance path. Same strict-
+    # string rule: vllm.calibration_hooks samples these once at module
+    # import. VLLM_CALIB_CAPTURE_EXPERT is REQUIRED so the expert_in
+    # callback dispatches; vllm.calibration_input_cov registers a
+    # handler against it to scatter-reduce per-expert hidden-state
+    # covariance into the dict-shaped accumulator.
+    if args.capture_input_covariance:
+        os.environ["VLLM_CALIB_CAPTURE_INPUT_COV"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_EXPERT"] = "1"
+        log.info("--capture-input-covariance: enabled "
+                 "VLLM_CALIB_CAPTURE_INPUT_COV=1 + "
+                 "VLLM_CALIB_CAPTURE_EXPERT=1 "
                  "(must precede vllm import)")
 
     # --- cache_key + paths ----------------------------------------------
@@ -693,6 +731,41 @@ def main() -> int:
                 )
                 reap_ckpt_path.unlink()
 
+    # --- input-covariance accumulator setup (pre-CUDA-graph) ------------
+    # Mirrors the reap-scores block: setup() registers the expert_in
+    # callback and builds the layer→rank map. Resume: hydrate the
+    # checkpoint that sits next to the JSONL at <jsonl>.input_cov.ckpt.
+    if args.capture_input_covariance:
+        import vllm.calibration_input_cov as _icov  # type: ignore
+        _icov.setup(llm)
+        log.info("input-cov: setup complete -- expert_in callback registered")
+
+        input_cov_ckpt_path = out_path.with_suffix(".input_cov.ckpt")
+        if args.resume and input_cov_ckpt_path.exists():
+            try:
+                loaded_prompts = _icov.load_input_cov_checkpoint(
+                    str(input_cov_ckpt_path),
+                )
+                if loaded_prompts != already_done:
+                    log.warning(
+                        "input-cov: checkpoint has %d prompts but JSONL "
+                        "has %d rows -- proceeding with the cumulative "
+                        "counter from the checkpoint.",
+                        loaded_prompts, already_done,
+                    )
+                else:
+                    log.info(
+                        "input-cov: hydrated %d-prompt checkpoint from %s",
+                        loaded_prompts, input_cov_ckpt_path,
+                    )
+            except ValueError as exc:
+                log.error(
+                    "input-cov: checkpoint schema mismatch (%s); deleting "
+                    "stale checkpoint and starting accumulators from zero.",
+                    exc,
+                )
+                input_cov_ckpt_path.unlink()
+
     # --- sampling params ------------------------------------------------
     from vllm import SamplingParams  # type: ignore
     # vLLM's reasoning_budget is exposed via `extra_args` (PR #20859 path).
@@ -803,6 +876,29 @@ def main() -> int:
                             exc, exc_info=True,
                         )
 
+            # Periodic input-covariance checkpoint -- mirrors imatrix /
+            # reap-scores cadence.
+            if (args.capture_input_covariance
+                    and args.input_cov_checkpoint_every_chunks > 0):
+                chunk_idx = chunk_start // args.chunk_size
+                every = args.input_cov_checkpoint_every_chunks
+                if (chunk_idx + 1) % every == 0:
+                    try:
+                        import vllm.calibration_input_cov as _icov  # type: ignore
+                        _icov.set_n_prompts_accumulated(already_done + n_new)
+                        _icov.dump_input_cov_checkpoint(
+                            str(input_cov_ckpt_path),
+                        )
+                        log.info(
+                            "input-cov: checkpointed %d prompts -> %s",
+                            already_done + n_new, input_cov_ckpt_path,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "input-cov checkpoint failed: %s",
+                            exc, exc_info=True,
+                        )
+
     # --- imatrix dump ---------------------------------------------------
     # Run BEFORE the JSONL finalize so a failure here can't corrupt the
     # rename, but in a try/except so a failure doesn't lose the JSONL.
@@ -847,6 +943,23 @@ def main() -> int:
                 reap_ckpt_path.unlink()
         except Exception as exc:
             log.error("reap-scores dump failed: %s", exc, exc_info=True)
+
+    # --- input-covariance dump -----------------------------------------
+    # Same try/except policy as imatrix / reap-scores: the JSONL is the
+    # primary deliverable.
+    if args.capture_input_covariance:
+        try:
+            import vllm.calibration_input_cov as _icov  # type: ignore
+            _icov.set_n_prompts_accumulated(already_done + n_new)
+            _icov.dump_input_cov(out_path)
+            log.info(
+                "input-cov: dumped sidecar from %d prompts (next to %s)",
+                _icov.get_n_prompts_accumulated(), out_path,
+            )
+            if input_cov_ckpt_path.exists():
+                input_cov_ckpt_path.unlink()
+        except Exception as exc:
+            log.error("input-cov dump failed: %s", exc, exc_info=True)
 
     # --- finalize -------------------------------------------------------
     os.replace(tmp_path, out_path)

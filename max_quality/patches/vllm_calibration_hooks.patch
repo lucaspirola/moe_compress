@@ -1720,6 +1720,378 @@ index 0000000..4a7cd9d
 +
 +if __name__ == "__main__":
 +    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_calibration_input_cov_smoke.py b/tests/test_calibration_input_cov_smoke.py
+new file mode 100644
+index 0000000..c135f9f
+--- /dev/null
++++ b/tests/test_calibration_input_cov_smoke.py
+@@ -0,0 +1,366 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Smoke tests for ``vllm.calibration_input_cov``.
++
++These exercise the per-(layer, expert, matrix) accumulator, the env-gate
++contract, checkpoint round-trip + two-segment additivity, the dump
++normalization, and the lazy-allocation path.
++
++Tests:
++
++1. ``test_accumulator_math`` -- a synthetic expert_in dispatch populates
++   the per-(layer, expert, "gate_proj") accumulators with the expected
++   ``x^T @ x`` contributions.
++2. ``test_no_accumulation_when_env_off`` -- env unset → manually
++   dispatching ``_on_expert_in`` leaves accumulators at zero.
++3. ``test_checkpoint_roundtrip`` -- dump → reload module →
++   load_checkpoint restores byte-identical accumulator state plus the
++   prompt counter.
++4. ``test_two_segment_additivity`` -- 10 tokens + checkpoint + reload +
++   another 10 tokens equals a 20-token single run.
++5. ``test_dump_normalization`` -- single dispatch → the saved payload
++   carries the expected ``sigma_in`` dict and token counts (the writer
++   stores unnormalised sums; this only validates the dict was emitted
++   verbatim).
++6. ``test_lazy_alloc_unknown_layer`` -- an expert_in dispatch for a
++   layer NOT pre-discovered by ``setup()`` still accumulates and bumps
++   ``_LAYER_ID_TO_RANK`` / ``_N_LAYERS``.
++"""
++from __future__ import annotations
++
++import importlib
++import os
++import sys
++from typing import Any
++
++import torch
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _reload_input_cov(env: dict[str, str]) -> Any:
++    """Reload ``vllm.calibration_input_cov`` with a fresh env.
++
++    Module-level ``_CAPTURE_INPUT_COV`` is sampled at import; per-test
++    isolation requires a fresh import.
++    """
++    sys.modules.pop("vllm.calibration_input_cov", None)
++    sys.modules.pop("vllm.calibration_hooks", None)
++    for key in (
++        "VLLM_CALIB_CAPTURE_INPUT_COV",
++        "VLLM_CALIB_CAPTURE_EXPERT",
++        "VLLM_CALIB_CAPTURE_ROUTER",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED",
++        "VLLM_CALIB_CAPTURE_IMATRIX",
++        "VLLM_CALIB_CAPTURE_BLOCK",
++        "VLLM_CALIB_CAPTURE_EXPERT_MID",
++        "VLLM_CALIB_CAPTURE_REAP_SCORES",
++    ):
++        os.environ.pop(key, None)
++    for k, v in env.items():
++        os.environ[k] = v
++    importlib.import_module("vllm.calibration_hooks")
++    return importlib.import_module("vllm.calibration_input_cov")
++
++
++def _seed_layer(ic: Any, layer_idx: int, rank: int, n_experts: int) -> None:
++    """Manually wire up the layer→rank map the way setup() would."""
++    ic._LAYER_ID_TO_RANK[layer_idx] = rank
++    if rank + 1 > ic._N_LAYERS:
++        ic._N_LAYERS = rank + 1
++    if n_experts > ic._N_EXPERTS:
++        ic._N_EXPERTS = n_experts
++
++
++# ---------------------------------------------------------------------------
++# Test 1 -- accumulator math
++# ---------------------------------------------------------------------------
++
++
++def test_accumulator_math():
++    """Synthetic expert_in populates per-(layer, expert, "gate_proj")
++    Σ x^T x as expected.
++
++    Two tokens, top_k=2. Token 0 routes to (expert 0, expert 1); token 1
++    routes to (expert 1, expert 2). Expert 0 sees row 0 only; expert 1
++    sees rows {0, 1}; expert 2 sees row 1 only.
++    """
++    ic = _reload_input_cov({
++        "VLLM_CALIB_CAPTURE_INPUT_COV": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT": "1",
++    })
++    _seed_layer(ic, layer_idx=0, rank=0, n_experts=3)
++
++    hidden = torch.tensor([
++        [1.0, 0.0, 0.0],
++        [0.0, 2.0, 1.0],
++    ], dtype=torch.float32)
++    topk_ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int64)
++
++    ic._on_expert_in(layer_idx=0, hidden_states=hidden, topk_ids=topk_ids)
++
++    # Expected:
++    #   expert 0: row0^T row0 -> diag(1,0,0)
++    #   expert 1: (row0 + row1) x^T x = row0^T row0 + row1^T row1
++    #              = diag(1,0,0) + [[0,0,0],[0,4,2],[0,2,1]]
++    #              = [[1,0,0],[0,4,2],[0,2,1]]
++    #   expert 2: row1^T row1 = [[0,0,0],[0,4,2],[0,2,1]]
++    e0 = ic._COV_ACCUM[(0, 0, "gate_proj")]
++    e1 = ic._COV_ACCUM[(0, 1, "gate_proj")]
++    e2 = ic._COV_ACCUM[(0, 2, "gate_proj")]
++    expected_e0 = torch.tensor(
++        [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
++        dtype=torch.float32,
++    )
++    expected_e1 = torch.tensor(
++        [[1.0, 0.0, 0.0], [0.0, 4.0, 2.0], [0.0, 2.0, 1.0]],
++        dtype=torch.float32,
++    )
++    expected_e2 = torch.tensor(
++        [[0.0, 0.0, 0.0], [0.0, 4.0, 2.0], [0.0, 2.0, 1.0]],
++        dtype=torch.float32,
++    )
++    assert torch.allclose(e0, expected_e0, atol=1e-5), f"e0={e0}"
++    assert torch.allclose(e1, expected_e1, atol=1e-5), f"e1={e1}"
++    assert torch.allclose(e2, expected_e2, atol=1e-5), f"e2={e2}"
++    # Token counts.
++    assert ic._COV_TOKEN_COUNTS[(0, 0, "gate_proj")] == 1
++    assert ic._COV_TOKEN_COUNTS[(0, 1, "gate_proj")] == 2
++    assert ic._COV_TOKEN_COUNTS[(0, 2, "gate_proj")] == 1
++
++
++# ---------------------------------------------------------------------------
++# Test 2 -- env-off short-circuits
++# ---------------------------------------------------------------------------
++
++
++def test_no_accumulation_when_env_off():
++    """Env unset → ``_on_expert_in`` returns immediately, accumulator dict
++    stays empty."""
++    ic = _reload_input_cov({})  # env cleared
++    assert ic._CAPTURE_INPUT_COV is False
++
++    _seed_layer(ic, layer_idx=0, rank=0, n_experts=3)
++    hidden = torch.eye(3, dtype=torch.float32)
++    topk_ids = torch.tensor([[0, 1], [1, 2], [0, 2]], dtype=torch.int64)
++    ic._on_expert_in(layer_idx=0, hidden_states=hidden, topk_ids=topk_ids)
++
++    assert ic._COV_ACCUM == {}
++    assert ic._COV_TOKEN_COUNTS == {}
++
++
++# ---------------------------------------------------------------------------
++# Test 3 -- checkpoint round-trip
++# ---------------------------------------------------------------------------
++
++
++def test_checkpoint_roundtrip(tmp_path):
++    """Dump → reload module → load_checkpoint restores byte-identical state."""
++    ic = _reload_input_cov({
++        "VLLM_CALIB_CAPTURE_INPUT_COV": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT": "1",
++    })
++    _seed_layer(ic, layer_idx=0, rank=0, n_experts=2)
++    _seed_layer(ic, layer_idx=1, rank=1, n_experts=2)
++
++    ic._COV_ACCUM[(0, 0, "gate_proj")] = torch.tensor(
++        [[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
++    ic._COV_ACCUM[(0, 1, "gate_proj")] = torch.tensor(
++        [[5.0, 0.0], [0.0, 5.0]], dtype=torch.float32)
++    ic._COV_ACCUM[(1, 0, "gate_proj")] = torch.tensor(
++        [[0.5, 0.0], [0.0, 0.5]], dtype=torch.float32)
++    ic._COV_TOKEN_COUNTS[(0, 0, "gate_proj")] = 11
++    ic._COV_TOKEN_COUNTS[(0, 1, "gate_proj")] = 7
++    ic._COV_TOKEN_COUNTS[(1, 0, "gate_proj")] = 3
++    ic._D_IN = 2
++    ic.set_n_prompts_accumulated(42)
++
++    ckpt = str(tmp_path / "test.input_cov.ckpt")
++    ic.dump_input_cov_checkpoint(ckpt)
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + ".tmp")
++
++    # Fresh module load -- accumulators must hydrate from disk.
++    ic2 = _reload_input_cov({
++        "VLLM_CALIB_CAPTURE_INPUT_COV": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT": "1",
++    })
++    assert ic2._COV_ACCUM == {}
++    loaded = ic2.load_input_cov_checkpoint(ckpt)
++    assert loaded == 42
++    assert ic2.get_n_prompts_accumulated() == 42
++    assert ic2._N_LAYERS == 2
++    assert ic2._N_EXPERTS == 2
++    assert ic2._D_IN == 2
++    for key, expected in {
++        (0, 0, "gate_proj"): torch.tensor([[1.0, 2.0], [3.0, 4.0]],
++                                          dtype=torch.float32),
++        (0, 1, "gate_proj"): torch.tensor([[5.0, 0.0], [0.0, 5.0]],
++                                          dtype=torch.float32),
++        (1, 0, "gate_proj"): torch.tensor([[0.5, 0.0], [0.0, 0.5]],
++                                          dtype=torch.float32),
++    }.items():
++        got = ic2._COV_ACCUM[key]
++        assert torch.equal(got, expected), f"{key}: got {got}"
++    assert ic2._COV_TOKEN_COUNTS == {
++        (0, 0, "gate_proj"): 11,
++        (0, 1, "gate_proj"): 7,
++        (1, 0, "gate_proj"): 3,
++    }
++    assert ic2._LAYER_ID_TO_RANK == {0: 0, 1: 1}
++
++
++# ---------------------------------------------------------------------------
++# Test 4 -- two-segment additivity
++# ---------------------------------------------------------------------------
++
++
++def test_two_segment_additivity(tmp_path):
++    """10 tokens + checkpoint + reload + 10 tokens == 20-token single run.
++
++    Critical for spot-preemption: a run split across two instance
++    lifetimes must produce the same accumulator state as a single run.
++    """
++    n_experts = 3
++    n_tokens_per = 10
++    top_k = 2
++    d_in = 4
++
++    torch.manual_seed(11)
++    hs_all = torch.randn(2 * n_tokens_per, d_in, dtype=torch.float32)
++    ids_all = torch.randint(0, n_experts, (2 * n_tokens_per, top_k),
++                            dtype=torch.int64)
++
++    # --- single 20-token reference run ---------------------------------
++    ref = _reload_input_cov({
++        "VLLM_CALIB_CAPTURE_INPUT_COV": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT": "1",
++    })
++    _seed_layer(ref, layer_idx=0, rank=0, n_experts=n_experts)
++    ref._on_expert_in(layer_idx=0, hidden_states=hs_all, topk_ids=ids_all)
++    expected = {k: v.clone() for k, v in ref._COV_ACCUM.items()}
++    expected_counts = dict(ref._COV_TOKEN_COUNTS)
++
++    # --- split across two segments with a checkpoint + reload ----------
++    seg = _reload_input_cov({
++        "VLLM_CALIB_CAPTURE_INPUT_COV": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT": "1",
++    })
++    _seed_layer(seg, layer_idx=0, rank=0, n_experts=n_experts)
++    seg._on_expert_in(layer_idx=0,
++                      hidden_states=hs_all[:n_tokens_per],
++                      topk_ids=ids_all[:n_tokens_per])
++    seg.set_n_prompts_accumulated(1)
++    ckpt = str(tmp_path / "twoseg.input_cov.ckpt")
++    seg.dump_input_cov_checkpoint(ckpt)
++
++    seg2 = _reload_input_cov({
++        "VLLM_CALIB_CAPTURE_INPUT_COV": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT": "1",
++    })
++    seg2.load_input_cov_checkpoint(ckpt)
++    seg2._on_expert_in(layer_idx=0,
++                       hidden_states=hs_all[n_tokens_per:],
++                       topk_ids=ids_all[n_tokens_per:])
++
++    # Same key set + every tensor matches the reference run.
++    assert set(seg2._COV_ACCUM.keys()) == set(expected.keys())
++    for key, ref_t in expected.items():
++        got = seg2._COV_ACCUM[key]
++        assert torch.allclose(got, ref_t, atol=1e-5), (
++            f"two-segment vs single-run mismatch at {key}: "
++            f"got {got}, expected {ref_t}"
++        )
++    assert seg2._COV_TOKEN_COUNTS == expected_counts
++
++
++# ---------------------------------------------------------------------------
++# Test 5 -- dump normalization
++# ---------------------------------------------------------------------------
++
++
++def test_dump_normalization(tmp_path, monkeypatch):
++    """A single accumulated entry produces a CovariancePayload whose
++    ``sigma_in`` carries that key verbatim. The writer stores raw sums
++    (no division here); this test only validates the dict round-trips
++    into the payload."""
++    ic = _reload_input_cov({
++        "VLLM_CALIB_CAPTURE_INPUT_COV": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT": "1",
++    })
++    _seed_layer(ic, layer_idx=0, rank=0, n_experts=2)
++    ic._COV_ACCUM[(0, 0, "gate_proj")] = torch.tensor(
++        [[4.2, 0.0], [0.0, 4.2]], dtype=torch.float32)
++    ic._COV_TOKEN_COUNTS[(0, 0, "gate_proj")] = 1
++
++    # Spy on save_covariance to capture the payload (dump_input_cov
++    # imports it lazily inside the function body).
++    captured: dict[str, Any] = {}
++
++    def _fake_save(payload, path):
++        captured["payload"] = payload
++        captured["path"] = path
++
++    import moe_compress.utils.cached_calibration_signals as ccs
++    monkeypatch.setattr(ccs, "save_covariance", _fake_save)
++
++    jsonl = tmp_path / "trace.jsonl"
++    ic.dump_input_cov(jsonl)
++
++    payload = captured["payload"]
++    assert payload is not None
++    assert payload.schema_version == 2
++    assert payload.n_layers == 1
++    assert payload.n_experts == 2
++    assert (0, 0, "gate_proj") in payload.sigma_in
++    assert torch.allclose(
++        payload.sigma_in[(0, 0, "gate_proj")],
++        torch.tensor([[4.2, 0.0], [0.0, 4.2]], dtype=torch.float32),
++        atol=1e-5,
++    )
++    assert payload.token_counts[(0, 0, "gate_proj")] == 1
++
++
++# ---------------------------------------------------------------------------
++# Test 6 -- lazy alloc / unknown layer
++# ---------------------------------------------------------------------------
++
++
++def test_lazy_alloc_unknown_layer():
++    """An expert_in dispatch for a layer NOT pre-seeded still accumulates
++    and bumps the layer-id map. Mirrors reap_scores's stricter behaviour
++    relaxed for the cold-start case where setup() couldn't walk the
++    model.
++    """
++    ic = _reload_input_cov({
++        "VLLM_CALIB_CAPTURE_INPUT_COV": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT": "1",
++    })
++    # Do NOT seed layer_idx=7 -- it must be discovered lazily.
++    assert 7 not in ic._LAYER_ID_TO_RANK
++
++    hidden = torch.tensor(
++        [[1.0, 1.0], [2.0, 0.0]], dtype=torch.float32,
++    )
++    topk_ids = torch.tensor([[0, 1], [0, 0]], dtype=torch.int64)
++    ic._on_expert_in(layer_idx=7, hidden_states=hidden, topk_ids=topk_ids)
++
++    # Layer 7 now mapped.
++    assert 7 in ic._LAYER_ID_TO_RANK
++    assert ic._N_LAYERS >= 1
++    # Expert 0 sees both rows; expert 1 sees only row 0.
++    assert (7, 0, "gate_proj") in ic._COV_ACCUM
++    assert (7, 1, "gate_proj") in ic._COV_ACCUM
++    e0 = ic._COV_ACCUM[(7, 0, "gate_proj")]
++    e1 = ic._COV_ACCUM[(7, 1, "gate_proj")]
++    expected_e0 = torch.tensor(
++        [[5.0, 1.0], [1.0, 1.0]], dtype=torch.float32,
++    )  # row0^T row0 + row1^T row1 = [[1,1],[1,1]] + [[4,0],[0,0]]
++    expected_e1 = torch.tensor(
++        [[1.0, 1.0], [1.0, 1.0]], dtype=torch.float32,
++    )
++    assert torch.allclose(e0, expected_e0, atol=1e-5), f"e0={e0}"
++    assert torch.allclose(e1, expected_e1, atol=1e-5), f"e1={e1}"
 diff --git a/tests/test_calibration_reap_scores_smoke.py b/tests/test_calibration_reap_scores_smoke.py
 new file mode 100644
 index 0000000..b038437
@@ -3380,6 +3752,407 @@ index 0000000..8505da3
 +        len(payload.get("moe_down_accumulators", {})),
 +    )
 +    return loaded_n
+diff --git a/vllm/calibration_input_cov.py b/vllm/calibration_input_cov.py
+new file mode 100644
+index 0000000..ded2969
+--- /dev/null
++++ b/vllm/calibration_input_cov.py
+@@ -0,0 +1,395 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-(layer, expert, matrix) teacher input covariance capture for
++calibration-v2 (Item 1 of the writers campaign).
++
++Computes ``Σ_in[(layer, expert, matrix)] = Σ_t x_t^T x_t`` over the token
++positions that the router dispatches to each expert. Mirrors the on-disk
++dict-of-tensor shape used by Stage 2's
++``_stage2_input_covariance.pt`` writer (see
++``moe_compress/stage2/shared_io.py::_save_covariance``) so the same
++loaders in ``stage3/plugins/covariance_collection.py`` and
++``stage4/plugins/eora_inputs.py`` consume both interchangeably.
++
++Hook surface
++------------
++* ``expert_in`` (vllm/model_executor/layers/fused_moe/moe_runner.py)
++  dispatches ``(layer_idx, hidden_states, topk_ids)`` per MoE layer
++  forward, BEFORE the per-expert dispatch_combine. ``hidden_states`` is
++  the pre-routing hidden state -- the input that ``gate_proj`` (and
++  ``up_proj`` via the aliased entry, per Stage 2's
++  ``InputCovarianceAccumulator._alias_gate_up``) would see for any token
++  the router sends to each expert.
++
++Per the existing Stage 2 / 3 / 4 convention, this writer only emits
++``matrix_name="gate_proj"`` entries -- ``up_proj`` is served by the
++gate->up fallback in ``aa_svd_factor._cov_lookup``. ``down_proj`` would
++require an additional ``expert_mid`` hook against per-expert
++intermediates (post SwiGLU), which is out of scope for the input-cov
++writer (Stage 3 falls back to Corollary 3.3 / B-only for down_proj when
++no cross-cov is available -- see deviation D6 in
++``stage3/plugins/covariance_collection.py``).
++
++Env-var gating
++--------------
++``VLLM_CALIB_CAPTURE_INPUT_COV=1`` activates the module. Requires:
++
++* ``VLLM_CALIB_CAPTURE_EXPERT=1`` (so the ``expert_in`` hook fires from
++  the MoE forward path; the calibration_hooks dispatcher gates on this).
++
++The driver (``build_self_traces_calib_vllm.py``) sets both env vars
++BEFORE the first vllm import when ``--capture-input-covariance`` is
++passed.
++
++CUDA-graph compatibility
++------------------------
++Accumulators live on CPU (fp32). The callback is dispatched from Python
++synchronously after the kernel returns and clones the input before
++returning; no in-kernel allocation. Safe for CUDA-graph capture.
++
++Storage shape
++-------------
++For Qwen3.6-35B-A3B at hidden=2048, n_layers≈48, n_experts=256, the
++on-disk size is ~50-70 GB (matches the documented
++``_stage2_input_covariance.pt`` artifact; see
++``max_quality/docs/pipeline_status_2026-04-27.md``). Storage dtype on
++disk is fp16 (per deviation D-cov-storage-fp16); the live accumulator
++runs in fp32 to limit round-off across the millions of accumulation
++calls, casting only at ``dump_input_cov`` time inside
++``save_covariance``.
++
++Resumability
++------------
++Mirrors ``vllm.calibration_reap_scores``: periodic
++``dump_input_cov_checkpoint`` during the run,
++``load_input_cov_checkpoint`` on ``--resume``. The final
++``dump_input_cov`` writes the normalised payload via
++``moe_compress.utils.cached_calibration_signals.save_covariance`` (Item
++0 helper, schema v2).
++"""
++from __future__ import annotations
++
++import logging
++import os
++from pathlib import Path
++from typing import Any
++
++import torch
++
++import vllm.calibration_hooks as _ch
++
++log = logging.getLogger(__name__)
++
++__all__ = [
++    "setup",
++    "dump_input_cov",
++    "dump_input_cov_checkpoint",
++    "load_input_cov_checkpoint",
++    "get_n_prompts_accumulated",
++    "set_n_prompts_accumulated",
++]
++
++# Sampled at import time -- matches calibration_reap_scores / imatrix.
++_CAPTURE_INPUT_COV: bool = (
++    os.getenv("VLLM_CALIB_CAPTURE_INPUT_COV", "0") == "1"
++)
++
++# Per-(layer_idx, expert_idx, matrix_name) CPU accumulators (fp32).
++# Mirrors the on-disk shape of ``_stage2_input_covariance.pt``: the same
++# keys (with matrix_name == "gate_proj") and value Tensor[d_in, d_in].
++_COV_ACCUM: dict[tuple[int, int, str], torch.Tensor] = {}
++_COV_TOKEN_COUNTS: dict[tuple[int, int, str], int] = {}
++
++# Layer-ID -> rank map (kept for parity with reap_scores; consumed by
++# checkpoint payload serialization and downstream sanity assertions).
++_LAYER_ID_TO_RANK: dict[int, int] = {}
++_N_LAYERS: int = 0
++_N_EXPERTS: int = 0
++
++# Cumulative prompt counter mirroring reap_scores / imatrix.
++_n_prompts_accumulated: int = 0
++_CHECKPOINT_SCHEMA_VERSION: int = 1
++
++# Internal: keep d_in once seen so we can lazy-allocate per-expert
++# entries on the first dispatch. Used only by _on_expert_in.
++_D_IN: int | None = None
++
++
++def get_n_prompts_accumulated() -> int:
++    return _n_prompts_accumulated
++
++
++def set_n_prompts_accumulated(n: int) -> None:
++    global _n_prompts_accumulated
++    if n < 0:
++        raise ValueError(f"n must be >= 0; got {n}")
++    _n_prompts_accumulated = int(n)
++
++
++def _resolve_model(llm: Any) -> Any | None:
++    """Walk well-known attribute paths to find the live nn.Module."""
++    candidates = [
++        ("llm_engine", "model_executor", "driver_worker", "model_runner",
++         "model"),
++        ("llm_engine", "model_executor", "model_runner", "model"),
++        ("model_executor", "driver_worker", "model_runner", "model"),
++        ("model_runner", "model"),
++    ]
++    for path in candidates:
++        obj: Any = llm
++        ok = True
++        for attr in path:
++            obj = getattr(obj, attr, None)
++            if obj is None:
++                ok = False
++                break
++        if ok:
++            return obj
++    return None
++
++
++def setup(llm: Any) -> None:
++    """Discover MoE layers, build the layer_id_to_rank map, register
++    the ``expert_in`` callback. Idempotent: calling twice does not
++    double-register.
++
++    Per-expert accumulators are LAZILY allocated on the first dispatch
++    (we don't know ``d_in`` until the first hidden_states comes in -- the
++    model config exposes ``hidden_size`` but reading it requires the
++    same model-walk we already do here; the lazy path is simpler and
++    cheaper on the cold path).
++    """
++    global _N_LAYERS, _N_EXPERTS
++
++    if not _CAPTURE_INPUT_COV:
++        log.info("calibration_input_cov: env gate off; no-op setup.")
++        return
++
++    model = _resolve_model(llm)
++    if model is None:
++        log.warning(
++            "calibration_input_cov: could not resolve model from LLM; "
++            "callback will be registered but the layer_id_to_rank map "
++            "will be populated lazily from the first expert_in dispatch."
++        )
++
++    # Discover MoE layers by attribute presence (mirrors reap_scores).
++    n_layers = 0
++    n_experts_seen: int | None = None
++    if model is not None:
++        for name, module in model.named_modules():
++            moe_layer_id = getattr(module, "moe_layer_id", None)
++            num_experts = getattr(module, "num_experts", None)
++            if not (isinstance(moe_layer_id, int)
++                    and isinstance(num_experts, int) and num_experts > 0):
++                continue
++            _LAYER_ID_TO_RANK[moe_layer_id] = n_layers
++            if n_experts_seen is None:
++                n_experts_seen = num_experts
++            elif n_experts_seen != num_experts:
++                log.warning(
++                    "calibration_input_cov: mixed expert counts "
++                    "(%d vs first-seen %d at %s); using first.",
++                    num_experts, n_experts_seen, name,
++                )
++            n_layers += 1
++
++    _N_LAYERS = n_layers
++    _N_EXPERTS = int(n_experts_seen) if n_experts_seen is not None else 0
++
++    _ch.register_callback("expert_in", _on_expert_in)
++
++    log.info(
++        "calibration_input_cov: setup complete -- %d MoE layers, "
++        "%d experts/layer; callback registered for expert_in.",
++        _N_LAYERS, _N_EXPERTS,
++    )
++
++
++def _on_expert_in(layer_idx: int, hidden_states: torch.Tensor,
++                  topk_ids: torch.Tensor, **_: Any) -> None:
++    """Accumulate ``x^T @ x`` per (layer, expert, "gate_proj").
++
++    For each expert ``e``, gather the rows of ``hidden_states`` whose
++    ``topk_ids`` contain ``e`` and accumulate the matmul into the CPU
++    fp32 buffer. Matches Stage 2's ``InputCovarianceAccumulator.update``
++    semantics (the consumer side of the same dict shape).
++
++    ``hidden_states`` is ephemeral per the calibration_hooks contract,
++    but we read it into a CPU fp32 copy immediately so the workspace
++    overwrite on the next forward cannot corrupt our reads. The matmul
++    happens on CPU -- the row counts per expert are small (~top_k tokens
++    per expert per forward), and keeping everything on CPU avoids
++    multi-stream synchronization concerns.
++    """
++    if not _CAPTURE_INPUT_COV:
++        return
++
++    if layer_idx not in _LAYER_ID_TO_RANK:
++        # Lazy-discovered layer (setup() couldn't walk the model).
++        # Append a fresh rank so the checkpoint payload covers it.
++        rank = len(_LAYER_ID_TO_RANK)
++        _LAYER_ID_TO_RANK[layer_idx] = rank
++
++    global _D_IN, _N_LAYERS, _N_EXPERTS
++    hs = hidden_states.detach().to("cpu", dtype=torch.float32, copy=True)
++    if hs.numel() == 0:
++        return
++    if hs.dim() == 3:
++        # [batch, seq, hidden] -> [n_tok, hidden]
++        hs = hs.reshape(-1, hs.shape[-1])
++    if _D_IN is None:
++        _D_IN = int(hs.shape[-1])
++
++    ids = topk_ids.detach().to("cpu", dtype=torch.int64)
++    n_tok = hs.shape[0]
++    # ``ids`` may be [n_tok, top_k] or already [n_tok]; normalise.
++    if ids.dim() == 1:
++        ids = ids.unsqueeze(-1)
++    if ids.shape[0] != n_tok:
++        log.warning(
++            "calibration_input_cov: layer %d -- topk_ids first dim %d "
++            "does not match hidden_states n_tok %d; skipping.",
++            layer_idx, ids.shape[0], n_tok,
++        )
++        return
++
++    # Update the seen-expert ceiling so the checkpoint metadata reflects
++    # reality even when setup() couldn't read num_experts off the model.
++    seen_max = int(ids.max().item()) + 1 if ids.numel() > 0 else 0
++    if seen_max > _N_EXPERTS:
++        _N_EXPERTS = seen_max
++
++    # Per-expert accumulation. The router topk_ids selects which tokens
++    # contribute to which expert; a token may appear in top_k experts so
++    # its row contributes to top_k entries (matching the live Stage 2
++    # accumulator's behaviour where each expert's covariance is built
++    # from the rows the router dispatches to that expert).
++    for e in range(seen_max):
++        # Mask of (token, slot) pairs routed to expert e.
++        mask_2d = (ids == e)
++        if not mask_2d.any():
++            continue
++        # Token rows that route at least once to e. ``unique`` keeps each
++        # token at most once even if both top_k slots point at e (rare,
++        # but matches the Stage 2 update semantics where a single
++        # input_cb call appends the row once -- the per-call x.T @ x).
++        token_rows = mask_2d.any(dim=-1).nonzero(as_tuple=False).reshape(-1)
++        if token_rows.numel() == 0:
++            continue
++        sub = hs.index_select(0, token_rows)        # [n_e, d_in] fp32
++        contrib = sub.transpose(0, 1) @ sub          # [d_in, d_in]
++
++        key = (layer_idx, int(e), "gate_proj")
++        cur = _COV_ACCUM.get(key)
++        if cur is None:
++            _COV_ACCUM[key] = contrib
++        else:
++            cur.add_(contrib)
++        _COV_TOKEN_COUNTS[key] = (
++            _COV_TOKEN_COUNTS.get(key, 0) + int(token_rows.numel())
++        )
++
++    # _N_LAYERS may grow lazily if setup() couldn't pre-discover layers.
++    if len(_LAYER_ID_TO_RANK) > _N_LAYERS:
++        _N_LAYERS = len(_LAYER_ID_TO_RANK)
++
++
++def dump_input_cov(jsonl_path: str | Path) -> None:
++    """Write the final per-(layer, expert, matrix) Σ_in sidecar.
++
++    The accumulator already holds ``Σ_t x_t^T x_t`` (unnormalised sum --
++    matches Stage 2's ``_stage2_input_covariance.pt`` convention; the
++    downstream consumers in ``aa_svd_factor`` and EoRA do their own
++    normalisation by token count when needed). No per-key division
++    happens here; ``token_counts`` is persisted alongside for callers
++    that need ``E[x^T x]``.
++    """
++    if not _CAPTURE_INPUT_COV:
++        return
++
++    # Import here (not at module top) so the dependency is lazy.
++    from moe_compress.utils.cached_calibration_signals import (
++        CovariancePayload, save_covariance, SCHEMA_VERSIONS,
++    )
++
++    if not _COV_ACCUM:
++        log.warning(
++            "calibration_input_cov: no entries accumulated; skipping dump."
++        )
++        return
++
++    payload = CovariancePayload(
++        schema_version=SCHEMA_VERSIONS["covariance"],
++        n_experts=_N_EXPERTS,
++        n_layers=_N_LAYERS,
++        sigma_in=dict(_COV_ACCUM),
++        token_counts=dict(_COV_TOKEN_COUNTS),
++    )
++    save_covariance(payload, Path(jsonl_path))
++    log.info(
++        "calibration_input_cov: wrote %d-key sidecar (%d layers × %d "
++        "experts, gate_proj only) next to %s",
++        len(_COV_ACCUM), _N_LAYERS, _N_EXPERTS, jsonl_path,
++    )
++
++
++def dump_input_cov_checkpoint(ckpt_path: str) -> None:
++    """Atomic checkpoint of raw accumulator state for resume."""
++    if not _CAPTURE_INPUT_COV:
++        return
++    payload = {
++        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
++        "n_prompts_accumulated": _n_prompts_accumulated,
++        "n_layers": _N_LAYERS,
++        "n_experts": _N_EXPERTS,
++        "d_in": _D_IN,
++        "layer_id_to_rank": dict(_LAYER_ID_TO_RANK),
++        # Clone every tensor so a concurrent _on_expert_in cannot mutate
++        # our snapshot mid-save (mirror of reap_scores's pattern).
++        "cov_accum": {k: v.clone() for k, v in _COV_ACCUM.items()},
++        "token_counts": dict(_COV_TOKEN_COUNTS),
++    }
++    tmp = ckpt_path + ".tmp"
++    torch.save(payload, tmp)
++    os.replace(tmp, ckpt_path)
++
++
++def load_input_cov_checkpoint(ckpt_path: str) -> int:
++    """Hydrate accumulators from a previous run's checkpoint.
++
++    Returns ``n_prompts_accumulated``; 0 if file missing. Raises
++    ``ValueError`` on schema mismatch (caller deletes + restarts).
++    """
++    global _N_LAYERS, _N_EXPERTS, _D_IN, _n_prompts_accumulated
++    if not os.path.exists(ckpt_path):
++        return 0
++    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
++    schema = int(payload.get("schema_version", 0))
++    if schema != _CHECKPOINT_SCHEMA_VERSION:
++        raise ValueError(
++            f"calibration_input_cov: checkpoint at {ckpt_path} has "
++            f"schema_version={schema}, expected {_CHECKPOINT_SCHEMA_VERSION}. "
++            f"Delete the checkpoint to restart from scratch."
++        )
++    _n_prompts_accumulated = int(payload["n_prompts_accumulated"])
++    _N_LAYERS = int(payload["n_layers"])
++    _N_EXPERTS = int(payload["n_experts"])
++    _D_IN = payload.get("d_in")
++    if _D_IN is not None:
++        _D_IN = int(_D_IN)
++    _LAYER_ID_TO_RANK.clear()
++    _LAYER_ID_TO_RANK.update({int(k): int(v) for k, v in payload.get(
++        "layer_id_to_rank", {}).items()})
++    _COV_ACCUM.clear()
++    _COV_TOKEN_COUNTS.clear()
++    for k, t in payload.get("cov_accum", {}).items():
++        # Normalise key element types (tuple of (int, int, str)).
++        li, e, name = k
++        nk = (int(li), int(e), str(name))
++        _COV_ACCUM[nk] = t.to(torch.float32).clone()
++    for k, n in payload.get("token_counts", {}).items():
++        li, e, name = k
++        nk = (int(li), int(e), str(name))
++        _COV_TOKEN_COUNTS[nk] = int(n)
++    return _n_prompts_accumulated
 diff --git a/vllm/calibration_reap_scores.py b/vllm/calibration_reap_scores.py
 new file mode 100644
 index 0000000..1b3ca1f
@@ -3718,10 +4491,10 @@ index 0000000..1b3ca1f
 +        _REAP_TOKEN_COUNTS[int(r)] = t.to(torch.int64).clone()
 +    return _n_prompts_accumulated
 diff --git a/vllm/envs.py b/vllm/envs.py
-index ded474d..9f54b96 100755
+index ded474d..61eaf98 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -268,6 +268,15 @@ if TYPE_CHECKING:
+@@ -268,6 +268,16 @@ if TYPE_CHECKING:
      VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
      VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
      VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -3734,10 +4507,11 @@ index ded474d..9f54b96 100755
 +    VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED: bool = False
 +    VLLM_CALIB_CAPTURE_IMATRIX: bool = False
 +    VLLM_CALIB_CAPTURE_EXPERT_MID: bool = False
++    VLLM_CALIB_CAPTURE_INPUT_COV: bool = False
  
  
  def get_default_cache_root():
-@@ -1788,6 +1797,69 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1788,6 +1798,82 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
          int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
      ),
@@ -3803,6 +4577,19 @@ index ded474d..9f54b96 100755
 +    # lookup + branch and the production kernel path is unaffected.
 +    "VLLM_CALIB_CAPTURE_EXPERT_MID": lambda: bool(
 +        int(os.getenv("VLLM_CALIB_CAPTURE_EXPERT_MID", "0"))
++    ),
++    # Calibration capture: per-(layer, expert, "gate_proj") teacher input
++    # covariance Σ_in. Activates the writer in
++    # ``vllm.calibration_input_cov`` (Item 1 of the calibration-v2 writers
++    # campaign). REQUIRES VLLM_CALIB_CAPTURE_EXPERT=1 so the ``expert_in``
++    # hook fires from the MoE forward path; the calibration-v2 driver
++    # (``build_self_traces_calib_vllm.py --capture-input-covariance``)
++    # sets both. Output is the dict-shaped sidecar at
++    # ``<jsonl>/sidecars/covariance.pt`` (schema v2), shape-compatible
++    # with the Stage 2 writer's ``_stage2_input_covariance.pt``.
++    # Default off.
++    "VLLM_CALIB_CAPTURE_INPUT_COV": lambda: bool(
++        int(os.getenv("VLLM_CALIB_CAPTURE_INPUT_COV", "0"))
 +    ),
  }
  
