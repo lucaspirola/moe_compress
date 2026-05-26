@@ -50,20 +50,23 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply calibration hooks patch ==="
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-per-expert-max-writer/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-routing-stats-writer/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected MD5: 15163e64ad096eb8e1e24f961b7f3543 (6097 lines)
-# Adds the per-(layer, expert) down_proj output max-L_inf writer (Item 2
-# of the calibration-v2 writers campaign), on top of the previous
-# input-cov + REAP-scores writers. Subscribes to ``expert_out_unweighted``
-# alongside REAP-scores via the chained-callback registry to compute
-# ``max_j(|f_j(x)|_inf)`` per (layer, expert) and writes a dense
-# Stage1PerExpertMaxPayload sidecar (schema v1, shape
-# [n_layers, n_experts] float32 + matching int64 token counts) at run
-# end. Consumed by Stage1PerExpertMaxCacheProvider to short-circuit the
-# Stage 1 Phase B downproj_max accumulator construction.
+# Expected MD5: 1c5602d20f5a2b268e6edb0f969e4cfe (6841 lines)
+# Adds the per-(layer, expert) routing-frequency + mean-routing-weight
+# writer (Item 3 of the calibration-v2 writers campaign), on top of
+# the previous input-cov + REAP-scores + per-expert-max writers.
+# Subscribes to the existing ``router`` hook (no FlashInfer or
+# EXPERT_UNWEIGHTED requirement -- the router hook fires on every MoE
+# backend) via the chained-callback registry to scatter-add per-(layer,
+# expert) freq + weight-sum into CPU accumulators. Writes a dense
+# RoutingStatsPayload sidecar (schema v1, shape [n_layers, n_experts]
+# int64 freq + float32 mean_weight, zero-filled for zero-traffic cells,
+# no NaN) at run end. NO immediate downstream consumer -- the payload
+# is deposited on ctx.routing_stats_payload by the Stage 1 / Stage 2
+# cache readers for future plugins to pick up.
 # See max_quality/patches/MANIFEST.md.
 git apply --check /tmp/calib.patch
 git apply /tmp/calib.patch
@@ -193,8 +196,8 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-per-expert-max-writer`)
-- Patch artifact (6097 lines, MD5 `15163e64ad096eb8e1e24f961b7f3543`): also uploaded to this repo as `vllm_calibration_hooks.patch`
+- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-routing-stats-writer`)
+- Patch artifact (6841 lines, MD5 `1c5602d20f5a2b268e6edb0f969e4cfe`): also uploaded to this repo as `vllm_calibration_hooks.patch`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130

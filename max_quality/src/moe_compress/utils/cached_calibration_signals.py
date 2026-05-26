@@ -104,6 +104,7 @@ SCHEMA_VERSIONS: dict[str, int] = {
     "teacher_eval":     1,
     "reap_scores":      1,
     "per_expert_max":   1,
+    "routing_stats":    1,
 }
 
 
@@ -198,6 +199,44 @@ class Stage1PerExpertMaxPayload:
     n_layers: int
     per_expert_max: torch.Tensor   # [n_layers, n_experts] float32
     token_counts: torch.Tensor     # [n_layers, n_experts] int64
+
+
+@dataclass
+class RoutingStatsPayload:
+    """Per-(layer, expert) routing-frequency + mean-routing-weight statistics.
+
+    Computed over the entire calibration run from the live router's
+    ``topk_ids`` + ``topk_weights``:
+
+    * ``freq[layer_rank, expert_id]`` -- the int64 count of tokens that
+      selected expert ``expert_id`` at layer rank ``layer_rank`` (each
+      top-k selection counted once; a token with ``top_k=2`` that picks
+      experts 3 and 7 contributes +1 to both).
+    * ``mean_weight[layer_rank, expert_id]`` -- the float32 mean of the
+      router weights ``g_j(x)`` over the same population (i.e.
+      ``Σ topk_weight / freq`` with the per-expert weight sum tracked
+      internally by the writer; zero where ``freq == 0``).
+
+    Indexing convention: ``layer_rank`` is the 0-based ordinal into the
+    MoE layer list (NOT the model's absolute ``layer_idx`` -- the cache
+    reader maps rank -> layer_idx via the live ``MoELayerRef`` list
+    when needed). The writer uses the same ``named_modules() ->
+    moe_layer_id`` ordering as ``vllm.calibration_reap_scores`` and
+    ``vllm.calibration_per_expert_max`` so all three are mutually
+    consistent.
+
+    Consumer: NONE in the live path at the moment. This payload is laid
+    down as infrastructure for future plugins (e.g. routing-aware
+    ablation gating, mean-weight-weighted REAP variants). The Stage 1 /
+    Stage 2 cache readers shipped alongside this payload only deposit it
+    onto ``ctx`` so future read-side plugins can pick it up without
+    requiring a fresh schema rev.
+    """
+    schema_version: int
+    n_experts: int
+    n_layers: int
+    freq: torch.Tensor          # [n_layers, n_experts] int64
+    mean_weight: torch.Tensor   # [n_layers, n_experts] float32
 
 
 @dataclass
@@ -408,6 +447,39 @@ def load_per_expert_max(jsonl_path: Path) -> Stage1PerExpertMaxPayload | None:
 
 
 # ---------------------------------------------------------------------------
+# Signal 2d: routing_stats (per-(layer, expert) routing freq + mean weight).
+# ---------------------------------------------------------------------------
+def save_routing_stats(payload: RoutingStatsPayload, jsonl_path: Path) -> None:
+    """Atomically write the routing-stats sidecar.
+
+    Tensors are moved to CPU before serialization so the sidecar is
+    device-agnostic (H200 -> RTX 6000 Pro round-trip is supported).
+    """
+    cpu_payload = RoutingStatsPayload(
+        schema_version=payload.schema_version,
+        n_experts=payload.n_experts,
+        n_layers=payload.n_layers,
+        freq=payload.freq.detach().to("cpu", dtype=torch.int64),
+        mean_weight=payload.mean_weight.detach().to("cpu", dtype=torch.float32),
+    )
+    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "routing_stats"))
+
+
+def load_routing_stats(jsonl_path: Path) -> RoutingStatsPayload | None:
+    """Load the routing-stats sidecar.
+
+    Returns None if the sidecar does not exist (cache miss). Raises
+    ValueError on schema_version mismatch with an actionable message.
+    """
+    path = sidecar_path(jsonl_path, "routing_stats")
+    if not path.exists():
+        return None
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    _check_schema("routing_stats", payload.schema_version, path)
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Signal 3: covariance (teacher-side sigma_in).
 # ---------------------------------------------------------------------------
 def save_covariance(payload: CovariancePayload, jsonl_path: Path) -> None:
@@ -574,6 +646,7 @@ __all__ = [
     "Stage2ProfilePayload",
     "Stage2ReapPayload",
     "Stage1PerExpertMaxPayload",
+    "RoutingStatsPayload",
     "CovariancePayload",
     "RouterKDLogitsPayload",
     "BlockHiddenPayload",
@@ -586,6 +659,8 @@ __all__ = [
     "load_reap_scores",
     "save_per_expert_max",
     "load_per_expert_max",
+    "save_routing_stats",
+    "load_routing_stats",
     "save_covariance",
     "load_covariance",
     "save_router_kd_logits",

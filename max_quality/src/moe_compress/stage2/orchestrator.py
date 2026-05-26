@@ -957,6 +957,7 @@ def run(
     from .plugins.ream_cost_post import ReamCostPostPlugin
     from .plugins.reap_scoring import ReapScoringPlugin
     from .plugins.reap_scores_cache import Stage2ReapScoresCacheProvider
+    from .plugins.routing_stats_cache import Stage2RoutingStatsCacheProvider
     from .plugins.skip_merge_floor import SkipMergeFloorPlugin
     from .plugins.solver_auto import AutoSolverPlugin
     from .plugins.solver_greedy import GreedySolverPlugin
@@ -1057,6 +1058,14 @@ def run(
         # its ``ctx.has("scores")`` guard. On miss, this provider is a no-op
         # and the live REAP path runs unchanged.
         Stage2ReapScoresCacheProvider(),
+        # V2 (routing_stats infrastructure): cache provider registered
+        # immediately AFTER Stage2ReapScoresCacheProvider so it joins the
+        # same run-scope ``dispatch_first("on_load", ...)`` chain. On hit
+        # it deposits the payload on ``ctx.routing_stats_payload`` for
+        # future read-side plugins; on miss it returns None gracefully.
+        # No per-layer ``on_score`` hook -- there is no immediate per-
+        # layer consumer (Item 3 lays infrastructure only).
+        Stage2RoutingStatsCacheProvider(),
         ReapScoringPlugin(),
         # S2-10: the capacity-utilization gate. Registered AFTER ReapScoringPlugin
         # and BEFORE the three cost plugins so its ``select_alignment`` slot runs
@@ -1162,6 +1171,19 @@ def run(
     PluginRegistry.dispatch_first(
         plugins, "on_load", run_ctx, _calib_jsonl_path,
     )
+
+    # Item 3 routing-stats cache load. ``dispatch_first`` above stops at
+    # the FIRST non-None result (its semantics are "first winner takes
+    # all"), so if Stage2ReapScoresCacheProvider hits, the
+    # Stage2RoutingStatsCacheProvider's on_load is NEVER invoked through
+    # that chain. We therefore call its on_load EXPLICITLY here so the
+    # routing-stats payload always gets a chance to populate ctx,
+    # regardless of REAP-cache outcome. This mirrors Stage 1's STEP 4.6
+    # divergence (Item 3 is infrastructure-only, no live counterpart).
+    for _plug in plugins:
+        if isinstance(_plug, Stage2RoutingStatsCacheProvider):
+            _plug.on_load(run_ctx, _calib_jsonl_path)
+            break
 
     for k, layer_ref in enumerate(moe_layers):
         if layer_ref.layer_idx in completed_layers:

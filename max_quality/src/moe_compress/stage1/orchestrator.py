@@ -48,6 +48,7 @@ from ..utils.trackio_log import trackio_log as _trackio_log
 from .artifacts import REQUIRED_BLACKLIST_TOP_LEVEL_KEYS
 from .plugins import STAGE1_PLUGIN_MANIFEST
 from .plugins.per_expert_max_cache import Stage1PerExpertMaxCacheProvider
+from .plugins.routing_stats_cache import Stage1RoutingStatsCacheProvider
 
 log = logging.getLogger(__name__)
 
@@ -322,6 +323,46 @@ def run(
         # regenerate") and silently falling back would mask it.
         log.warning("Stage 1: V2 per_expert_max cache lookup failed (%s) "
                     "-- falling back to live downproj_max accumulator", _exc)
+
+    # ---- STEP 4.6: V2 cache-first attempt for routing_stats ---------------
+    # Try the calibration-v2 sidecar at
+    # ``<jsonl_dir>/sidecars/routing_stats.pt`` -- a routing-frequency +
+    # mean-routing-weight payload produced by the
+    # ``--capture-routing-stats`` flag (Item 3 of the writers campaign).
+    # On hit, the cache provider deposits the payload on
+    # ``ctx.routing_stats_payload`` so future read-side plugins can pick
+    # it up.
+    #
+    # Divergence from the canonical provider-pair pattern (see
+    # cached_calibration_signals.py module docstring): Item 3 has NO
+    # live counterpart in Stage 1 AND NO immediate downstream consumer.
+    # The cache provider is laid down now to keep the on-disk schema
+    # stable and the ctx-slot contract testable from day 1; consumer
+    # plugins (routing-aware ablation gating, mean-weight-weighted REAP
+    # variants, ...) will be added by later items. Unlike STEP 4.5 we
+    # do NOT modify ``needed`` (no live accumulator to skip).
+    try:
+        from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
+        cal_cfg = config["calibration"]
+        _calib_source = cal_cfg.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
+        _calib_jsonl_path = Path(_calib_source)
+        if not _calib_jsonl_path.is_absolute():
+            _calib_jsonl_path = Path.cwd() / _calib_jsonl_path
+        _rts_provider = Stage1RoutingStatsCacheProvider()
+        _rts_payload = _rts_provider.on_load(ctx, _calib_jsonl_path)
+        if _rts_payload is not None:
+            log.info(
+                "Stage 1: V2 routing_stats cache HIT (%d layers x %d "
+                "experts) -- ctx.routing_stats_payload populated",
+                _rts_payload.n_layers, _rts_payload.n_experts,
+            )
+    except (FileNotFoundError, OSError) as _exc:
+        # Routine filesystem misses should not block the live path.
+        # ValueError from _check_schema is NOT caught here -- a schema
+        # mismatch is an actionable user error ("Delete the sidecar to
+        # regenerate") and silently falling back would mask it.
+        log.warning("Stage 1: V2 routing_stats cache lookup failed (%s) "
+                    "-- ctx.routing_stats_payload not populated", _exc)
 
     # ---- STEP 5: build the ordered accumulator registrations --------------
     # ``registry.provides(config)`` returns the byte-identity-critical

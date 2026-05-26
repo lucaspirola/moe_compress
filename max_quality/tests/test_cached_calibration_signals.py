@@ -43,6 +43,7 @@ from moe_compress.utils.cached_calibration_signals import (
     CovariancePayload,
     PhaseBPayload,
     RouterKDLogitsPayload,
+    RoutingStatsPayload,
     Stage1PerExpertMaxPayload,
     Stage2ProfilePayload,
     Stage2ReapPayload,
@@ -52,6 +53,7 @@ from moe_compress.utils.cached_calibration_signals import (
     load_per_expert_max,
     load_phase_b,
     load_reap_scores,
+    load_routing_stats,
     load_router_kd_logits,
     load_stage2_profile,
     load_teacher_eval,
@@ -61,6 +63,7 @@ from moe_compress.utils.cached_calibration_signals import (
     save_per_expert_max,
     save_phase_b,
     save_reap_scores,
+    save_routing_stats,
     save_router_kd_logits,
     save_stage2_profile,
     save_teacher_eval,
@@ -320,6 +323,45 @@ def test_per_expert_max_roundtrip(tmp_path):
 
     expected_path.unlink()
     assert load_per_expert_max(jsonl) is None
+
+
+def _make_routing_stats(n_layers: int = 2, n_experts: int = 3) -> RoutingStatsPayload:
+    return RoutingStatsPayload(
+        schema_version=SCHEMA_VERSIONS["routing_stats"],
+        n_experts=n_experts,
+        n_layers=n_layers,
+        freq=torch.arange(
+            n_layers * n_experts, dtype=torch.int64
+        ).reshape(n_layers, n_experts),
+        mean_weight=torch.linspace(
+            0.1, 0.9, n_layers * n_experts, dtype=torch.float32,
+        ).reshape(n_layers, n_experts),
+    )
+
+
+def test_routing_stats_roundtrip(tmp_path):
+    jsonl = _jsonl(tmp_path)
+    original = _make_routing_stats()
+    save_routing_stats(original, jsonl)
+
+    expected_path = sidecar_path(jsonl, "routing_stats")
+    assert expected_path.exists()
+    assert not Path(str(expected_path) + ".tmp").exists()
+
+    loaded = load_routing_stats(jsonl)
+    assert loaded is not None
+    assert loaded.schema_version == SCHEMA_VERSIONS["routing_stats"]
+    assert loaded.n_experts == original.n_experts
+    assert loaded.n_layers == original.n_layers
+    assert torch.equal(loaded.freq, original.freq.cpu())
+    assert torch.equal(loaded.mean_weight, original.mean_weight.cpu())
+    assert loaded.freq.dtype == torch.int64
+    assert loaded.mean_weight.dtype == torch.float32
+    assert loaded.freq.device.type == "cpu"
+    assert loaded.mean_weight.device.type == "cpu"
+
+    expected_path.unlink()
+    assert load_routing_stats(jsonl) is None
 
 
 def test_covariance_roundtrip(tmp_path):

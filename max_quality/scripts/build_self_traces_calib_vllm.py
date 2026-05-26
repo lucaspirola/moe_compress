@@ -500,6 +500,36 @@ def main() -> int:
                         "(final-dump-only). On --resume, the checkpoint at "
                         "<jsonl>.per_expert_max.ckpt is hydrated "
                         "automatically if it exists.")
+    p.add_argument("--capture-routing-stats", action="store_true",
+                   default=False,
+                   help="Capture per-(layer, expert) routing frequency + "
+                        "mean routing weight during calibration and write a "
+                        "moe_compress-side sidecar at "
+                        "<jsonl>/sidecars/routing_stats.pt at run end "
+                        "(schema v1, shape [n_layers, n_experts] int64 freq + "
+                        "float32 mean_weight). Item 3 of the calibration-v2 "
+                        "writers campaign. No immediate downstream consumer: "
+                        "the payload is laid down as infrastructure for "
+                        "future plugins (routing-aware ablation gating, "
+                        "mean-weight-weighted REAP variants). Requires the "
+                        "vLLM calibration-hooks patch "
+                        "(vllm.calibration_routing_stats). Auto-enables "
+                        "VLLM_CALIB_CAPTURE_ROUTING_STATS=1 + "
+                        "VLLM_CALIB_CAPTURE_ROUTER=1 BEFORE any vllm import. "
+                        "Works on EVERY MoE backend (no FlashInfer or "
+                        "EXPERT_UNWEIGHTED requirement -- the router hook "
+                        "fires regardless). Failures during dump are logged "
+                        "but do NOT re-raise.")
+    p.add_argument("--routing-stats-checkpoint-every-chunks", type=int,
+                   default=1,
+                   help="When --capture-routing-stats is set, dump a "
+                        "checkpoint (.routing_stats.ckpt) of the live "
+                        "accumulator state every N chunked LLM.generate "
+                        "calls. Default 1 = checkpoint at every JSONL flush "
+                        "boundary. Set 0 to disable periodic checkpointing "
+                        "(final-dump-only). On --resume, the checkpoint at "
+                        "<jsonl>.routing_stats.ckpt is hydrated "
+                        "automatically if it exists.")
     args = p.parse_args()
 
     # Pre-import env gates for the imatrix path. These MUST be set before any
@@ -569,6 +599,20 @@ def main() -> int:
                  "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX=1 + "
                  "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
                  "VLLM_USE_FLASHINFER_MOE_FP16=0 "
+                 "(must precede vllm import)")
+
+    # Pre-import env gates for the routing-stats path. Same strict-string
+    # rule: vllm.calibration_hooks samples these once at module import.
+    # VLLM_CALIB_CAPTURE_ROUTER is REQUIRED so the router callback
+    # dispatches. NO FlashInfer / EXPERT_UNWEIGHTED requirement: the
+    # router hook fires on every MoE backend, so this writer works
+    # alongside any other writer combination (or alone).
+    if args.capture_routing_stats:
+        os.environ["VLLM_CALIB_CAPTURE_ROUTING_STATS"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_ROUTER"] = "1"
+        log.info("--capture-routing-stats: enabled "
+                 "VLLM_CALIB_CAPTURE_ROUTING_STATS=1 + "
+                 "VLLM_CALIB_CAPTURE_ROUTER=1 "
                  "(must precede vllm import)")
 
     # --- cache_key + paths ----------------------------------------------
@@ -695,6 +739,7 @@ def main() -> int:
     reap_ckpt_path = None
     input_cov_ckpt_path = None
     pem_ckpt_path = None
+    rts_ckpt_path = None
 
     # --- imatrix accumulator setup (pre-CUDA-graph) ---------------------
     # The imatrix module must pre-allocate accumulator tensors for every
@@ -858,6 +903,44 @@ def main() -> int:
                 )
                 pem_ckpt_path.unlink()
 
+    # --- routing-stats accumulator setup (pre-CUDA-graph) ---------------
+    # Mirrors the per-expert-max block but subscribes the ``router`` hook
+    # (which fires on every MoE backend). Resume: hydrate the checkpoint
+    # that sits next to the JSONL at <jsonl>.routing_stats.ckpt.
+    if args.capture_routing_stats:
+        import vllm.calibration_routing_stats as _rts  # type: ignore
+        _rts.setup(llm)
+        log.info("routing-stats: setup complete -- "
+                 "router callback registered")
+
+        rts_ckpt_path = out_path.with_suffix(".routing_stats.ckpt")
+        if args.resume and rts_ckpt_path.exists():
+            try:
+                loaded_prompts = _rts.load_routing_stats_checkpoint(
+                    str(rts_ckpt_path),
+                )
+                if loaded_prompts != already_done:
+                    log.warning(
+                        "routing-stats: checkpoint has %d prompts but JSONL "
+                        "has %d rows -- proceeding with the cumulative "
+                        "counter from the checkpoint.",
+                        loaded_prompts, already_done,
+                    )
+                else:
+                    log.info(
+                        "routing-stats: hydrated %d-prompt checkpoint "
+                        "from %s",
+                        loaded_prompts, rts_ckpt_path,
+                    )
+            except ValueError as exc:
+                log.error(
+                    "routing-stats: checkpoint schema mismatch (%s); "
+                    "deleting stale checkpoint and starting accumulators "
+                    "from zero.",
+                    exc,
+                )
+                rts_ckpt_path.unlink()
+
     # --- sampling params ------------------------------------------------
     from vllm import SamplingParams  # type: ignore
     # vLLM's reasoning_budget is exposed via `extra_args` (PR #20859 path).
@@ -1013,6 +1096,28 @@ def main() -> int:
                             exc, exc_info=True,
                         )
 
+            # Periodic routing-stats checkpoint -- same cadence pattern.
+            if (args.capture_routing_stats
+                    and args.routing_stats_checkpoint_every_chunks > 0):
+                chunk_idx = chunk_start // args.chunk_size
+                every = args.routing_stats_checkpoint_every_chunks
+                if (chunk_idx + 1) % every == 0:
+                    try:
+                        import vllm.calibration_routing_stats as _rts  # type: ignore
+                        _rts.set_n_prompts_accumulated(already_done + n_new)
+                        _rts.dump_routing_stats_checkpoint(
+                            str(rts_ckpt_path),
+                        )
+                        log.info(
+                            "routing-stats: checkpointed %d prompts -> %s",
+                            already_done + n_new, rts_ckpt_path,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "routing-stats checkpoint failed: %s",
+                            exc, exc_info=True,
+                        )
+
     # --- imatrix dump ---------------------------------------------------
     # Run BEFORE the JSONL finalize so a failure here can't corrupt the
     # rename, but in a try/except so a failure doesn't lose the JSONL.
@@ -1091,6 +1196,22 @@ def main() -> int:
                 pem_ckpt_path.unlink()
         except Exception as exc:
             log.error("per-expert-max dump failed: %s", exc, exc_info=True)
+
+    # --- routing-stats dump --------------------------------------------
+    # Same try/except policy: the JSONL is the primary deliverable.
+    if args.capture_routing_stats:
+        try:
+            import vllm.calibration_routing_stats as _rts  # type: ignore
+            _rts.set_n_prompts_accumulated(already_done + n_new)
+            _rts.dump_routing_stats(out_path)
+            log.info(
+                "routing-stats: dumped sidecar from %d prompts (next to %s)",
+                _rts.get_n_prompts_accumulated(), out_path,
+            )
+            if rts_ckpt_path is not None and rts_ckpt_path.exists():
+                rts_ckpt_path.unlink()
+        except Exception as exc:
+            log.error("routing-stats dump failed: %s", exc, exc_info=True)
 
     # --- finalize -------------------------------------------------------
     os.replace(tmp_path, out_path)

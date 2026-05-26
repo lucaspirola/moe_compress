@@ -2989,6 +2989,402 @@ index 0000000..b038437
 +        payload.token_counts[0],
 +        torch.tensor([1, 0, 0], dtype=torch.int64),
 +    )
+diff --git a/tests/test_calibration_routing_stats_smoke.py b/tests/test_calibration_routing_stats_smoke.py
+new file mode 100644
+index 0000000..0593101
+--- /dev/null
++++ b/tests/test_calibration_routing_stats_smoke.py
+@@ -0,0 +1,390 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Smoke tests for ``vllm.calibration_routing_stats``.
++
++These exercise the per-(layer, expert) freq + mean-weight accumulator,
++the env-gate contract, checkpoint round-trip + two-segment additivity,
++and the dump-normalization math.
++
++Tests:
++
++1. ``test_env_gate_off_no_op`` -- env unset -> ``setup()`` and the
++   callback are no-ops (accumulators untouched).
++2. ``test_freq_accumulation_correctness`` -- synthetic ``topk_ids``
++   populates ``_FREQ_ACCUM`` with the expected per-expert counts.
++3. ``test_mean_weight_normalization`` -- weights (0.3 + 0.5) routed to
++   expert 0 + (0.7) to expert 1 produce ``mean_weight[0]=0.4`` and
++   ``mean_weight[1]=0.7`` in the dumped payload.
++4. ``test_checkpoint_round_trip`` -- dump -> reload module ->
++   load_checkpoint restores byte-identical accumulator state.
++5. ``test_two_segment_additivity`` -- 10 selections + checkpoint +
++   reload + 10 more selections produces the same freq + weight_sum as a
++   single 20-selection run.
++6. ``test_gate_off_setup_is_no_op`` -- env unset -> ``setup(llm=None)``
++   leaves the registry empty AND does not register a callback.
++"""
++from __future__ import annotations
++
++import importlib
++import os
++import sys
++from typing import Any
++
++import torch
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _reload_rts(env: dict[str, str]) -> Any:
++    """Reload ``vllm.calibration_routing_stats`` (and hooks) with a fresh env.
++
++    Module-level ``_CAPTURE_ROUTING_STATS`` is sampled at import; per-test
++    isolation requires a fresh import.
++    """
++    sys.modules.pop("vllm.calibration_routing_stats", None)
++    sys.modules.pop("vllm.calibration_hooks", None)
++    for key in (
++        "VLLM_CALIB_CAPTURE_ROUTING_STATS",
++        "VLLM_CALIB_CAPTURE_ROUTER",
++        "VLLM_CALIB_CAPTURE_REAP_SCORES",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED",
++        "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX",
++        "VLLM_CALIB_CAPTURE_IMATRIX",
++        "VLLM_CALIB_CAPTURE_EXPERT",
++        "VLLM_CALIB_CAPTURE_BLOCK",
++        "VLLM_CALIB_CAPTURE_EXPERT_MID",
++        "VLLM_CALIB_CAPTURE_INPUT_COV",
++    ):
++        os.environ.pop(key, None)
++    for k, v in env.items():
++        os.environ[k] = v
++    importlib.import_module("vllm.calibration_hooks")
++    return importlib.import_module("vllm.calibration_routing_stats")
++
++
++def _seed_layer(rts: Any, layer_idx: int, rank: int, n_experts: int) -> None:
++    """Manually wire up the per-layer accumulators the way setup() would."""
++    rts._LAYER_ID_TO_RANK[layer_idx] = rank
++    if rank + 1 > rts._N_LAYERS:
++        rts._N_LAYERS = rank + 1
++    if n_experts > rts._N_EXPERTS:
++        rts._N_EXPERTS = n_experts
++    rts._FREQ_ACCUM[rank] = torch.zeros(n_experts, dtype=torch.int64)
++    rts._WEIGHT_SUM_ACCUM[rank] = torch.zeros(n_experts, dtype=torch.float32)
++
++
++# ---------------------------------------------------------------------------
++# Test 1 -- env-off short-circuit
++# ---------------------------------------------------------------------------
++
++
++def test_env_gate_off_no_op():
++    """Env unset -> setup() is a no-op, and the callback short-circuits
++    before touching any accumulator."""
++    rts = _reload_rts({})  # env cleared
++    assert rts._CAPTURE_ROUTING_STATS is False
++
++    # setup() with a stub LLM -> should not register callbacks nor
++    # allocate accumulators.
++    rts.setup(llm=None)
++    assert rts._FREQ_ACCUM == {}
++    assert rts._WEIGHT_SUM_ACCUM == {}
++
++    # Manually seed accumulators, then call the callback. The internal
++    # env guard must short-circuit before scatter_add_.
++    n_experts = 3
++    _seed_layer(rts, layer_idx=0, rank=0, n_experts=n_experts)
++
++    topk_weights = torch.tensor([[0.6, 0.4]], dtype=torch.float32)
++    topk_ids = torch.tensor([[0, 1]], dtype=torch.int64)
++    rts._on_router(
++        layer_idx=0, router_logits=torch.zeros(1, 3),
++        topk_weights=topk_weights, topk_ids=topk_ids,
++    )
++    # Accumulator unchanged because env guard short-circuits.
++    assert torch.equal(
++        rts._FREQ_ACCUM[0], torch.zeros(n_experts, dtype=torch.int64),
++    )
++    assert torch.equal(
++        rts._WEIGHT_SUM_ACCUM[0],
++        torch.zeros(n_experts, dtype=torch.float32),
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 2 -- freq accumulation correctness
++# ---------------------------------------------------------------------------
++
++
++def test_freq_accumulation_correctness():
++    """Synthetic ``topk_ids`` populates ``_FREQ_ACCUM`` with the expected
++    per-expert counts.
++
++    3 tokens, top_k=2:
++      t0 picks experts 0,2
++      t1 picks experts 1,2
++      t2 picks experts 0,3
++    Expected freq: e0=2, e1=1, e2=2, e3=1, e4=0.
++    """
++    rts = _reload_rts({
++        "VLLM_CALIB_CAPTURE_ROUTING_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    n_experts = 5
++    _seed_layer(rts, layer_idx=0, rank=0, n_experts=n_experts)
++
++    topk_ids = torch.tensor(
++        [[0, 2], [1, 2], [0, 3]], dtype=torch.int64,
++    )
++    topk_weights = torch.tensor(
++        [[0.5, 0.5], [0.6, 0.4], [0.7, 0.3]], dtype=torch.float32,
++    )
++    rts._on_router(
++        layer_idx=0, router_logits=torch.zeros(3, n_experts),
++        topk_weights=topk_weights, topk_ids=topk_ids,
++    )
++
++    expected_freq = torch.tensor([2, 1, 2, 1, 0], dtype=torch.int64)
++    assert torch.equal(rts._FREQ_ACCUM[0], expected_freq)
++
++    # Weight sums: e0 = 0.5 + 0.7 = 1.2; e1 = 0.6; e2 = 0.5 + 0.4 = 0.9;
++    # e3 = 0.3; e4 = 0.0.
++    expected_weight_sum = torch.tensor(
++        [1.2, 0.6, 0.9, 0.3, 0.0], dtype=torch.float32,
++    )
++    assert torch.allclose(rts._WEIGHT_SUM_ACCUM[0], expected_weight_sum,
++                          atol=1e-6)
++
++
++# ---------------------------------------------------------------------------
++# Test 3 -- mean_weight normalization correctness via dump
++# ---------------------------------------------------------------------------
++
++
++def test_mean_weight_normalization(tmp_path, monkeypatch):
++    """Weights (0.3 + 0.5) routed to expert 0 + (0.7) to expert 1
++    produce mean_weight[0]=0.4 and mean_weight[1]=0.7 in the dumped
++    payload. Zero-traffic cells stay at 0.0 (not NaN)."""
++    rts = _reload_rts({
++        "VLLM_CALIB_CAPTURE_ROUTING_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    n_experts = 3
++    _seed_layer(rts, layer_idx=0, rank=0, n_experts=n_experts)
++    _seed_layer(rts, layer_idx=1, rank=1, n_experts=n_experts)
++
++    # Two tokens, top_k=1. token 0 -> expert 0 weight 0.3; token 1 ->
++    # expert 0 weight 0.5. So e0 freq=2, weight_sum=0.8, mean=0.4.
++    rts._on_router(
++        layer_idx=0,
++        router_logits=torch.zeros(2, n_experts),
++        topk_weights=torch.tensor([[0.3], [0.5]], dtype=torch.float32),
++        topk_ids=torch.tensor([[0], [0]], dtype=torch.int64),
++    )
++    # One token -> expert 1 weight 0.7. So e1 freq=1, weight_sum=0.7,
++    # mean=0.7.
++    rts._on_router(
++        layer_idx=0,
++        router_logits=torch.zeros(1, n_experts),
++        topk_weights=torch.tensor([[0.7]], dtype=torch.float32),
++        topk_ids=torch.tensor([[1]], dtype=torch.int64),
++    )
++    # Layer rank 1: no traffic -- mean_weight row should stay all zeros
++    # (zero-traffic-must-not-NaN guarantee).
++
++    captured = {}
++
++    def _fake_save(payload, path):
++        captured["payload"] = payload
++        captured["path"] = path
++
++    import moe_compress.utils.cached_calibration_signals as ccs
++    monkeypatch.setattr(ccs, "save_routing_stats", _fake_save)
++
++    jsonl = tmp_path / "trace.jsonl"
++    rts.dump_routing_stats(jsonl)
++
++    payload = captured["payload"]
++    assert payload is not None
++    assert payload.schema_version == 1
++    assert payload.n_layers == 2
++    assert payload.n_experts == n_experts
++    assert payload.freq.shape == (2, n_experts)
++    assert payload.mean_weight.shape == (2, n_experts)
++    # Rank 0 freq.
++    assert torch.equal(
++        payload.freq[0], torch.tensor([2, 1, 0], dtype=torch.int64),
++    )
++    # Rank 0 mean weights: e0=0.4, e1=0.7, e2=0.0 (zero-traffic).
++    assert torch.allclose(
++        payload.mean_weight[0],
++        torch.tensor([0.4, 0.7, 0.0], dtype=torch.float32),
++        atol=1e-6,
++    )
++    # Rank 1: never seen any traffic.
++    assert torch.equal(
++        payload.freq[1], torch.zeros(n_experts, dtype=torch.int64),
++    )
++    assert torch.equal(
++        payload.mean_weight[1], torch.zeros(n_experts, dtype=torch.float32),
++    )
++    # No NaN anywhere.
++    assert not torch.isnan(payload.mean_weight).any()
++
++
++# ---------------------------------------------------------------------------
++# Test 4 -- checkpoint round-trip
++# ---------------------------------------------------------------------------
++
++
++def test_checkpoint_round_trip(tmp_path):
++    """Dump -> reload module -> load_checkpoint restores byte-identical
++    accumulator state."""
++    rts = _reload_rts({
++        "VLLM_CALIB_CAPTURE_ROUTING_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    n_experts = 3
++    _seed_layer(rts, layer_idx=0, rank=0, n_experts=n_experts)
++    _seed_layer(rts, layer_idx=1, rank=1, n_experts=n_experts)
++
++    rts._FREQ_ACCUM[0] = torch.tensor([3, 5, 0], dtype=torch.int64)
++    rts._WEIGHT_SUM_ACCUM[0] = torch.tensor(
++        [1.5, 2.5, 0.0], dtype=torch.float32,
++    )
++    rts._FREQ_ACCUM[1] = torch.tensor([1, 0, 7], dtype=torch.int64)
++    rts._WEIGHT_SUM_ACCUM[1] = torch.tensor(
++        [0.5, 0.0, 4.0], dtype=torch.float32,
++    )
++    rts.set_n_prompts_accumulated(42)
++
++    ckpt = str(tmp_path / "test.rts.ckpt")
++    rts.dump_routing_stats_checkpoint(ckpt)
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + ".tmp")
++
++    # Fresh module load -- accumulators must hydrate from disk.
++    rts2 = _reload_rts({
++        "VLLM_CALIB_CAPTURE_ROUTING_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    assert rts2._FREQ_ACCUM == {}  # fresh state
++    loaded = rts2.load_routing_stats_checkpoint(ckpt)
++    assert loaded == 42
++    assert rts2.get_n_prompts_accumulated() == 42
++    assert rts2._N_LAYERS == 2
++    assert rts2._N_EXPERTS == n_experts
++    assert torch.equal(
++        rts2._FREQ_ACCUM[0],
++        torch.tensor([3, 5, 0], dtype=torch.int64),
++    )
++    assert torch.equal(
++        rts2._WEIGHT_SUM_ACCUM[0],
++        torch.tensor([1.5, 2.5, 0.0], dtype=torch.float32),
++    )
++    assert torch.equal(
++        rts2._FREQ_ACCUM[1],
++        torch.tensor([1, 0, 7], dtype=torch.int64),
++    )
++    assert torch.equal(
++        rts2._WEIGHT_SUM_ACCUM[1],
++        torch.tensor([0.5, 0.0, 4.0], dtype=torch.float32),
++    )
++    assert rts2._LAYER_ID_TO_RANK == {0: 0, 1: 1}
++
++
++# ---------------------------------------------------------------------------
++# Test 5 -- two-segment additivity (freq + weight_sum are additive)
++# ---------------------------------------------------------------------------
++
++
++def test_two_segment_additivity(tmp_path):
++    """10 selections + ckpt + reload + 10 more selections == 20-selection
++    single run.
++
++    Critical for spot-preemption: an additive writer split across two
++    instance lifetimes must produce the same accumulator state as a
++    single run.
++    """
++    n_experts = 4
++    n_tokens_per = 10
++    top_k = 2
++
++    # Deterministic data.
++    torch.manual_seed(13)
++    ids_all = torch.randint(0, n_experts, (2 * n_tokens_per, top_k),
++                            dtype=torch.int64)
++    w_all = torch.rand(2 * n_tokens_per, top_k, dtype=torch.float32)
++
++    # --- single 20-selection reference run ---------------------------------
++    ref = _reload_rts({
++        "VLLM_CALIB_CAPTURE_ROUTING_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    _seed_layer(ref, layer_idx=0, rank=0, n_experts=n_experts)
++    ref._on_router(
++        layer_idx=0, router_logits=torch.zeros(2 * n_tokens_per, n_experts),
++        topk_weights=w_all, topk_ids=ids_all,
++    )
++    expected_freq = ref._FREQ_ACCUM[0].clone()
++    expected_weight_sum = ref._WEIGHT_SUM_ACCUM[0].clone()
++
++    # --- split across two segments with a checkpoint + reload --------------
++    seg = _reload_rts({
++        "VLLM_CALIB_CAPTURE_ROUTING_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    _seed_layer(seg, layer_idx=0, rank=0, n_experts=n_experts)
++    seg._on_router(
++        layer_idx=0,
++        router_logits=torch.zeros(n_tokens_per, n_experts),
++        topk_weights=w_all[:n_tokens_per],
++        topk_ids=ids_all[:n_tokens_per],
++    )
++    seg.set_n_prompts_accumulated(1)
++    ckpt = str(tmp_path / "twoseg.rts.ckpt")
++    seg.dump_routing_stats_checkpoint(ckpt)
++
++    # Reload module + checkpoint -- simulates a process restart.
++    seg2 = _reload_rts({
++        "VLLM_CALIB_CAPTURE_ROUTING_STATS": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++    })
++    seg2.load_routing_stats_checkpoint(ckpt)
++    seg2._on_router(
++        layer_idx=0,
++        router_logits=torch.zeros(n_tokens_per, n_experts),
++        topk_weights=w_all[n_tokens_per:],
++        topk_ids=ids_all[n_tokens_per:],
++    )
++
++    assert torch.equal(seg2._FREQ_ACCUM[0], expected_freq)
++    assert torch.allclose(
++        seg2._WEIGHT_SUM_ACCUM[0], expected_weight_sum, atol=1e-6,
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 6 -- env unset -> setup() is a no-op (no callback registered)
++# ---------------------------------------------------------------------------
++
++
++def test_gate_off_setup_is_no_op():
++    """With the env unset, ``setup(llm=None)`` must NOT register any
++    callback against the ``router`` hook -- the chained registry should
++    remain empty so production forwards pay nothing extra."""
++    rts = _reload_rts({})
++    assert rts._CAPTURE_ROUTING_STATS is False
++
++    import vllm.calibration_hooks as _ch
++    # Sanity-check: registry empty before setup.
++    assert _ch._callbacks["router"] == []
++
++    rts.setup(llm=None)
++    # Still empty -- gate is off, no registration happened.
++    assert _ch._callbacks["router"] == []
++    assert rts._FREQ_ACCUM == {}
++    assert rts._WEIGHT_SUM_ACCUM == {}
 diff --git a/vllm/calibration_hooks.py b/vllm/calibration_hooks.py
 new file mode 100644
 index 0000000..d4c8f8c
@@ -5375,11 +5771,343 @@ index 0000000..1b3ca1f
 +    for r, t in payload.get("token_counts", {}).items():
 +        _REAP_TOKEN_COUNTS[int(r)] = t.to(torch.int64).clone()
 +    return _n_prompts_accumulated
+diff --git a/vllm/calibration_routing_stats.py b/vllm/calibration_routing_stats.py
+new file mode 100644
+index 0000000..516237c
+--- /dev/null
++++ b/vllm/calibration_routing_stats.py
+@@ -0,0 +1,326 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-(layer, expert) routing-frequency + mean-routing-weight capture for
++calibration-v2 (Item 3 of the writers campaign).
++
++Computes two per-(layer, expert) quantities across the entire
++calibration run from the live router's ``topk_ids`` + ``topk_weights``:
++
++* ``freq[layer_rank, expert_id]``     -- int64 count of tokens that
++  selected expert ``expert_id`` at layer rank ``layer_rank``.
++* ``mean_weight[layer_rank, expert_id]`` -- float32 ``mean(g_j(x))``
++  over the same population (zero where ``freq == 0``).
++
++Both are derived from the ``router`` hook, which dispatches
++``(layer_idx, router_logits, topk_weights, topk_ids)`` after the routing
++gate selects the top-k experts. The hook fires on every MoE backend
++(Triton / FlashInfer / etc.) so there is NO ``EXPERT_UNWEIGHTED`` or
++``FLASHINFER`` dependency -- unlike Item 2's per-expert-max writer.
++
++Env-var gating
++--------------
++``VLLM_CALIB_CAPTURE_ROUTING_STATS=1`` activates the module. Requires:
++
++* ``VLLM_CALIB_CAPTURE_ROUTER=1`` (router hook fires).
++
++The driver (``build_self_traces_calib_vllm.py``) sets both BEFORE the
++first vllm import when ``--capture-routing-stats`` is passed.
++
++No-downstream-consumer note
++---------------------------
++There is NO immediate Stage-1 / Stage-2 / Stage-3 consumer for the
++sidecar produced here. Item 3 lays infrastructure for future plugins
++(routing-aware ablation gating, mean-weight-weighted REAP variants).
++The Stage 1 / Stage 2 cache readers shipped alongside this writer only
++deposit the payload onto ``ctx`` so future read-side plugins can pick
++it up without requiring a fresh schema rev.
++
++CUDA-graph compatibility
++------------------------
++Accumulators live on CPU. The callback is dispatched from Python
++synchronously after the router runs; ``topk_ids`` + ``topk_weights``
++are cloned (via ``.detach().cpu()``) at callback entry.
++
++Resumability
++------------
++Mirrors ``vllm.calibration_per_expert_max``: periodic
++``dump_routing_stats_checkpoint`` during the run,
++``load_routing_stats_checkpoint`` on ``--resume``. The final
++``dump_routing_stats`` writes the payload via
++``moe_compress.utils.cached_calibration_signals.save_routing_stats``
++(Item 0).
++"""
++from __future__ import annotations
++
++import logging
++import os
++from pathlib import Path
++from typing import Any
++
++import torch
++
++import vllm.calibration_hooks as _ch
++
++log = logging.getLogger(__name__)
++
++__all__ = [
++    "setup",
++    "dump_routing_stats",
++    "dump_routing_stats_checkpoint",
++    "load_routing_stats_checkpoint",
++    "get_n_prompts_accumulated",
++    "set_n_prompts_accumulated",
++]
++
++# Sampled at import time -- matches calibration_imatrix / per_expert_max pattern.
++_CAPTURE_ROUTING_STATS: bool = (
++    os.getenv("VLLM_CALIB_CAPTURE_ROUTING_STATS", "0") == "1"
++)
++
++# Per-layer-rank CPU accumulators.
++# ``_FREQ_ACCUM[rank][expert_id]``        : int64 token count for the
++#                                           expert at layer rank ``rank``.
++# ``_WEIGHT_SUM_ACCUM[rank][expert_id]``  : float32 sum of router weights
++#                                           for the same population.
++# The mean weight is derived at dump time as
++#   ``weight_sum / freq.clamp(min=1).float()`` (clamp avoids 0/0).
++_FREQ_ACCUM: dict[int, torch.Tensor] = {}          # rank -> [n_experts] int64
++_WEIGHT_SUM_ACCUM: dict[int, torch.Tensor] = {}    # rank -> [n_experts] float32
++
++_LAYER_ID_TO_RANK: dict[int, int] = {}
++_N_LAYERS: int = 0
++_N_EXPERTS: int = 0
++
++# Cumulative prompt counter mirroring imatrix / reap_scores / per_expert_max.
++_n_prompts_accumulated: int = 0
++_CHECKPOINT_SCHEMA_VERSION: int = 1
++
++
++def get_n_prompts_accumulated() -> int:
++    return _n_prompts_accumulated
++
++
++def set_n_prompts_accumulated(n: int) -> None:
++    global _n_prompts_accumulated
++    if n < 0:
++        raise ValueError(f"n must be >= 0; got {n}")
++    _n_prompts_accumulated = int(n)
++
++
++def _resolve_model(llm: Any) -> Any | None:
++    """Walk well-known attribute paths to find the live nn.Module."""
++    candidates = [
++        ("llm_engine", "model_executor", "driver_worker", "model_runner",
++         "model"),
++        ("llm_engine", "model_executor", "model_runner", "model"),
++        ("model_executor", "driver_worker", "model_runner", "model"),
++        ("model_runner", "model"),
++    ]
++    for path in candidates:
++        obj: Any = llm
++        ok = True
++        for attr in path:
++            obj = getattr(obj, attr, None)
++            if obj is None:
++                ok = False
++                break
++        if ok:
++            return obj
++    return None
++
++
++def setup(llm: Any) -> None:
++    """Discover MoE layers, pre-allocate accumulators, register callback.
++
++    Idempotent: calling twice does not double-allocate.
++    """
++    global _N_LAYERS, _N_EXPERTS
++
++    if not _CAPTURE_ROUTING_STATS:
++        log.info("calibration_routing_stats: env gate off; no-op setup.")
++        return
++
++    model = _resolve_model(llm)
++    if model is None:
++        log.warning(
++            "calibration_routing_stats: could not resolve model from LLM; "
++            "callback will be registered but accumulators will not have "
++            "their layer->rank mapping populated until first dispatch."
++        )
++
++    # Discover MoE layers by attribute presence -- same pattern as
++    # calibration_reap_scores / calibration_per_expert_max so the rank
++    # ordering matches across all three writers' sidecars.
++    n_layers = 0
++    n_experts_seen: int | None = None
++    if model is not None:
++        for name, module in model.named_modules():
++            moe_layer_id = getattr(module, "moe_layer_id", None)
++            num_experts = getattr(module, "num_experts", None)
++            if not (isinstance(moe_layer_id, int)
++                    and isinstance(num_experts, int) and num_experts > 0):
++                continue
++            _LAYER_ID_TO_RANK[moe_layer_id] = n_layers
++            if n_experts_seen is None:
++                n_experts_seen = num_experts
++            elif n_experts_seen != num_experts:
++                log.warning(
++                    "calibration_routing_stats: mixed expert counts "
++                    "(%d vs first-seen %d at %s); using first.",
++                    num_experts, n_experts_seen, name,
++                )
++            n_layers += 1
++
++    _N_LAYERS = n_layers
++    _N_EXPERTS = int(n_experts_seen) if n_experts_seen is not None else 0
++
++    # Pre-allocate CPU accumulators with zeros -- max-style sentinels are
++    # NOT needed here (additive accumulators).
++    for rank in range(_N_LAYERS):
++        if rank not in _FREQ_ACCUM:
++            _FREQ_ACCUM[rank] = torch.zeros(
++                _N_EXPERTS, dtype=torch.int64,
++            )
++            _WEIGHT_SUM_ACCUM[rank] = torch.zeros(
++                _N_EXPERTS, dtype=torch.float32,
++            )
++
++    _ch.register_callback("router", _on_router)
++
++    log.info(
++        "calibration_routing_stats: setup complete -- %d MoE layers, "
++        "%d experts/layer; callback registered for router.",
++        _N_LAYERS, _N_EXPERTS,
++    )
++
++
++def _on_router(layer_idx: int, router_logits: torch.Tensor,
++               topk_weights: torch.Tensor, topk_ids: torch.Tensor,
++               **_: Any) -> None:
++    """Scatter-add per-expert token counts + weight sums into the accumulator.
++
++    ``topk_ids`` is ``[n_tok, top_k]`` int; ``topk_weights`` is
++    ``[n_tok, top_k]`` (typically bf16/fp16). Per (token, k) selection we
++    add 1 to ``freq[expert]`` and ``topk_weight`` to ``weight_sum[expert]``.
++    """
++    if not _CAPTURE_ROUTING_STATS:
++        return
++
++    rank = _LAYER_ID_TO_RANK.get(layer_idx)
++    if rank is None:
++        raise RuntimeError(
++            f"calibration_routing_stats: layer_idx={layer_idx} was not "
++            f"discovered by setup() -- the MoE layer must be visible via "
++            f"named_modules() with the moe_layer_id attribute set. "
++            f"Late-discovered layers would force the accumulators to grow, "
++            f"corrupting already-allocated buffers for other layers. Fix "
++            f"the setup() pass to find ALL MoE layers (or this layer's "
++            f"FusedMoE module is missing the moe_layer_id attribute)."
++        )
++
++    ids = topk_ids.detach().cpu().to(torch.int64).reshape(-1)
++    ones = torch.ones_like(ids, dtype=torch.int64)
++    _FREQ_ACCUM[rank].scatter_add_(0, ids, ones)
++
++    tw = topk_weights.detach().cpu().to(torch.float32).reshape(-1)
++    _WEIGHT_SUM_ACCUM[rank].scatter_add_(0, ids, tw)
++
++
++def dump_routing_stats(jsonl_path: str | Path) -> None:
++    """Write the final routing-stats sidecar via the Item-0 helper.
++
++    Derives ``mean_weight = weight_sum / freq.clamp(min=1).float()`` so
++    zero-traffic experts surface as 0.0 (no NaN).
++    """
++    if not _CAPTURE_ROUTING_STATS:
++        return
++
++    # Import here (not at module top) so the dependency is lazy.
++    from moe_compress.utils.cached_calibration_signals import (
++        RoutingStatsPayload, save_routing_stats, SCHEMA_VERSIONS,
++    )
++
++    if _N_LAYERS == 0 or _N_EXPERTS == 0:
++        log.warning(
++            "calibration_routing_stats: no MoE layers seen; skipping dump."
++        )
++        return
++
++    freq_rows = []
++    weight_rows = []
++    for rank in range(_N_LAYERS):
++        freq = _FREQ_ACCUM.get(rank)
++        weight_sum = _WEIGHT_SUM_ACCUM.get(rank)
++        if freq is None or weight_sum is None:
++            freq_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.int64))
++            weight_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.float32))
++            continue
++        mean = weight_sum / freq.clamp(min=1).to(torch.float32)
++        # Zero-traffic cells: mean must be 0.0 (the clamp put 1 in the
++        # denominator there, but weight_sum is 0 so the division is 0/1 = 0).
++        freq_rows.append(freq.clone())
++        weight_rows.append(mean.clone())
++    freq_tensor = torch.stack(freq_rows)
++    mean_weight_tensor = torch.stack(weight_rows)
++
++    payload = RoutingStatsPayload(
++        schema_version=SCHEMA_VERSIONS["routing_stats"],
++        n_experts=_N_EXPERTS,
++        n_layers=_N_LAYERS,
++        freq=freq_tensor,
++        mean_weight=mean_weight_tensor,
++    )
++    save_routing_stats(payload, Path(jsonl_path))
++    log.info(
++        "calibration_routing_stats: wrote %d-layer x %d-expert sidecar "
++        "next to %s", _N_LAYERS, _N_EXPERTS, jsonl_path,
++    )
++
++
++def dump_routing_stats_checkpoint(ckpt_path: str) -> None:
++    """Atomic checkpoint of raw accumulator state for resume."""
++    if not _CAPTURE_ROUTING_STATS:
++        return
++    payload = {
++        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
++        "n_prompts_accumulated": _n_prompts_accumulated,
++        "n_layers": _N_LAYERS,
++        "n_experts": _N_EXPERTS,
++        "layer_id_to_rank": dict(_LAYER_ID_TO_RANK),
++        "freq_accum": {r: v.clone() for r, v in _FREQ_ACCUM.items()},
++        "weight_sum_accum": {
++            r: v.clone() for r, v in _WEIGHT_SUM_ACCUM.items()
++        },
++    }
++    tmp = ckpt_path + ".tmp"
++    torch.save(payload, tmp)
++    os.replace(tmp, ckpt_path)
++
++
++def load_routing_stats_checkpoint(ckpt_path: str) -> int:
++    """Hydrate accumulators from a previous run's checkpoint. Returns
++    n_prompts_accumulated; 0 if file missing."""
++    global _N_LAYERS, _N_EXPERTS, _n_prompts_accumulated
++    if not os.path.exists(ckpt_path):
++        return 0
++    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
++    schema = int(payload.get("schema_version", 0))
++    if schema != _CHECKPOINT_SCHEMA_VERSION:
++        raise ValueError(
++            f"calibration_routing_stats: checkpoint at {ckpt_path} has "
++            f"schema_version={schema}, expected {_CHECKPOINT_SCHEMA_VERSION}. "
++            f"Delete the checkpoint to restart from scratch."
++        )
++    _n_prompts_accumulated = int(payload["n_prompts_accumulated"])
++    _N_LAYERS = int(payload["n_layers"])
++    _N_EXPERTS = int(payload["n_experts"])
++    _LAYER_ID_TO_RANK.clear()
++    _LAYER_ID_TO_RANK.update({int(k): int(v) for k, v in payload.get(
++        "layer_id_to_rank", {}).items()})
++    _FREQ_ACCUM.clear()
++    _WEIGHT_SUM_ACCUM.clear()
++    for r, t in payload.get("freq_accum", {}).items():
++        _FREQ_ACCUM[int(r)] = t.to(torch.int64).clone()
++    for r, t in payload.get("weight_sum_accum", {}).items():
++        _WEIGHT_SUM_ACCUM[int(r)] = t.to(torch.float32).clone()
++    return _n_prompts_accumulated
 diff --git a/vllm/envs.py b/vllm/envs.py
-index ded474d..63e79c1 100755
+index ded474d..db15bb1 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -268,6 +268,17 @@ if TYPE_CHECKING:
+@@ -268,6 +268,18 @@ if TYPE_CHECKING:
      VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
      VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
      VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -5394,10 +6122,11 @@ index ded474d..63e79c1 100755
 +    VLLM_CALIB_CAPTURE_EXPERT_MID: bool = False
 +    VLLM_CALIB_CAPTURE_INPUT_COV: bool = False
 +    VLLM_CALIB_CAPTURE_PER_EXPERT_MAX: bool = False
++    VLLM_CALIB_CAPTURE_ROUTING_STATS: bool = False
  
  
  def get_default_cache_root():
-@@ -1788,6 +1799,97 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1788,6 +1800,112 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
          int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
      ),
@@ -5491,6 +6220,21 @@ index ded474d..63e79c1 100755
 +    # token counts. Default off.
 +    "VLLM_CALIB_CAPTURE_PER_EXPERT_MAX": lambda: bool(
 +        int(os.getenv("VLLM_CALIB_CAPTURE_PER_EXPERT_MAX", "0"))
++    ),
++    # Calibration capture gate for per-(layer, expert) routing-frequency
++    # + mean-routing-weight (Item 3 of the calibration-v2 writers campaign,
++    # ``vllm.calibration_routing_stats``). REQUIRES
++    # VLLM_CALIB_CAPTURE_ROUTER=1 so the ``router`` hook dispatches from
++    # the MoE forward path. NO FlashInfer / EXPERT_UNWEIGHTED dependency:
++    # the router hook fires on every MoE backend (Triton, FlashInfer,
++    # etc.). The calibration-v2 driver
++    # (``build_self_traces_calib_vllm.py --capture-routing-stats``) sets
++    # both. Output is the dense sidecar at
++    # ``<jsonl>/sidecars/routing_stats.pt`` (schema v1), shape
++    # ``[n_layers, n_experts]`` int64 freq + float32 mean_weight.
++    # Default off.
++    "VLLM_CALIB_CAPTURE_ROUTING_STATS": lambda: bool(
++        int(os.getenv("VLLM_CALIB_CAPTURE_ROUTING_STATS", "0"))
 +    ),
  }
  
