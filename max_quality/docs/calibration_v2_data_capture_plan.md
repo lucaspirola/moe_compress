@@ -111,8 +111,8 @@ across all stages and asking *what would it actually consume?*
 | # | Capture | Consuming plugin(s) | How |
 |---|---|---|---|
 | 0 | `utils/cached_calibration_signals.py` + 6 provider pairs | All cached signals | New module + ~12 provider plugins (Section 0) |
-| 8 | Per-row JSONL metadata `{n_prompt_tokens, n_gen_tokens, has_think, refusal_flag, subset, seed_idx}` | Any plugin using `build_calibration_tensor`; `swift_svd_alpha`, `merge_repair`, Stage 6alt `thermo_corpus` | JSONL schema bump; computed at write time in `build_self_traces_calib_vllm.py` |
-| 9 | Per-prompt deterministic `seed_idx` (the row's position in the shuffled `CalibrationSpec` source) | Reproducibility audit; any plugin selecting exact subsets | Added at JSONL write |
+| 8 | Per-row JSONL metadata `{n_prompt_tokens, n_gen_tokens, has_think, refusal_flag, subset, seed_idx}` | Any plugin using `build_calibration_tensor`; `swift_svd_alpha`, `merge_repair`, Stage 6alt `thermo_corpus` | **IMPLEMENTED** (combined with Item 9) at JSONL `schema_version=8` — fields added at write time in `build_self_traces_calib_vllm.py::_process_outputs`; cache_key folds `schema_version=8` so v7 runs do not cache-hit v8 runs. No vLLM patch change. Loader (`build_calibration_tensor`) is tolerant of additional JSONL keys. |
+| 9 | Per-prompt deterministic `seed_idx` (the row's position in the shuffled `CalibrationSpec` source) | Reproducibility audit; any plugin selecting exact subsets | **IMPLEMENTED** as part of the Item-8 metadata bundle at JSONL `schema_version=8` — duplicate key of the existing `_attempt_idx` (kept for back-compat); same int value, plan-doc name. |
 
 ### P1 (highest wall-clock + VRAM unlock per row of code)
 

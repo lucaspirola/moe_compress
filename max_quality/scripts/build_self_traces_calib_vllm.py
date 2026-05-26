@@ -77,6 +77,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -123,9 +124,14 @@ def _trace_cache_key_vllm(
       * ``dtype`` — bf16 / fp8 / awq runs produce different teacher logits.
       * ``logits_top_k`` — always folded (this script always saves logits;
         the HF script made it optional).
-      * ``schema_version=7`` — distinct from the HF schema_version=6 so
+      * ``schema_version=8`` — distinct from the HF schema_version=6 so
         a downstream loader can pick the right format if we ever change
-        the .npz layout.
+        the .npz layout. Bumped 7→8 when items 8+9 added the per-row
+        metadata bundle (``n_prompt_tokens``, ``n_gen_tokens``,
+        ``has_think``, ``refusal_flag``, ``subset``, ``seed_idx``) to the
+        JSONL row schema. Existing v7 runs are NOT cache-hit by v8 runs
+        (the bump intentionally segregates outputs so older JSONLs aren't
+        silently mixed with the v8 metadata-bearing ones).
     """
     payload = json.dumps({
         "teacher_repo": teacher_repo,
@@ -139,7 +145,7 @@ def _trace_cache_key_vllm(
         "logits_top_k": int(logits_top_k),
         "decode": "greedy",
         "inference_engine": "vllm",
-        "schema_version": 7,
+        "schema_version": 8,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -257,12 +263,91 @@ def _extract_topk_from_vllm_logprobs(
     return top_ids, top_lp
 
 
+# JSONL row schema v8 (Items 8+9): per-row metadata bundle.
+#
+# ``_REFUSAL_PATTERN`` — heuristic match against the assistant answer
+# (post-strip, AFTER any ``<think>...</think>`` block — see
+# ``_strip_think_block``). Matches at the start of the answer body, since
+# refusals open with the apology/disclaimer phrase. Pattern intentionally
+# narrow (5 canonical openers) to avoid false positives on legitimate
+# answers that happen to contain "sorry" or "can't" mid-sentence.
+#
+# Detected openers:
+#   * "I cannot"
+#   * "I can't"
+#   * "I'm sorry"
+#   * "I am sorry"
+#   * "Sorry, I" / "Sorry I"
+# Case-insensitive; matches optional leading whitespace.
+_REFUSAL_PATTERN = re.compile(
+    r"^\s*(i\s+cannot\b|i\s+can['’]t\b|i['’]m\s+sorry\b|"
+    r"i\s+am\s+sorry\b|sorry,?\s+i\b)",
+    re.IGNORECASE,
+)
+
+# Regex stripping the leading ``<think>...</think>`` block (if present)
+# so the refusal-heuristic sees the answer body, not the reasoning trace
+# (the model often types "I'm sorry, I need to think about this..." INSIDE
+# the think block, which is reasoning prose, not a refusal of the user's
+# task). DOTALL because ``<think>`` content can span newlines.
+_THINK_BLOCK_PATTERN = re.compile(
+    r"^\s*<think>.*?</think>\s*", re.DOTALL,
+)
+
+
+def _has_think_block(answer: str) -> bool:
+    """True iff the assistant answer contains a ``<think>...</think>``
+    block. Used as an Item-8 ``has_think`` metadata flag. Closed tag is
+    required: an unterminated ``<think>`` (which can occur on a
+    ``finish_reason='length'`` truncation tail) is NOT counted, matching
+    the existing ``is_complete`` predicate that also requires
+    ``"</think>" in ans``."""
+    return "<think>" in answer and "</think>" in answer
+
+
+def _detect_refusal(answer: str) -> bool:
+    """Heuristic refusal detector — see ``_REFUSAL_PATTERN`` docstring for
+    the matched phrases. Strips any leading ``<think>...</think>`` block
+    first so the heuristic fires on the assistant's final answer, not on
+    in-think reasoning prose that happens to mention "sorry"."""
+    body = _THINK_BLOCK_PATTERN.sub("", answer, count=1)
+    return bool(_REFUSAL_PATTERN.search(body))
+
+
 def _process_outputs(
     outputs, prompts_chunk, attempt_idx_chunk, eos_ids, logits_top_k,
     logits_dir, domain_stats, max_new_tokens,
 ):
     """Per chunk: convert vLLM ``RequestOutput`` results into our JSONL row
-    shape + the .npz logit-cache sidecars. Yields one dict per output."""
+    shape + the .npz logit-cache sidecars. Yields one dict per output.
+
+    JSONL row schema v8 (items 8+9 of the calibration-v2 writers campaign)
+    -------------------------------------------------------------------
+    Each yielded dict carries the original ``messages`` / ``domain`` /
+    ``_complete`` / ``_attempt_idx`` fields plus a metadata bundle:
+
+      * ``n_prompt_tokens`` (int) — vLLM-tokenized prompt length, from
+        ``out.prompt_token_ids`` (the rendered chat-templated prompt that
+        was fed to ``LLM.generate``). Excludes generated tokens.
+      * ``n_gen_tokens`` (int) — emitted token count, ``len(gen.token_ids)``
+        BEFORE EOS-trim. Includes ``<think>`` content if present and any
+        EOS sentinel vLLM appended; we keep the un-trimmed count because
+        downstream cost/length analyses want the raw decode work, not the
+        post-trim signal length.
+      * ``has_think`` (bool) — whether the answer contains a closed
+        ``<think>...</think>`` block (see ``_has_think_block``).
+      * ``refusal_flag`` (bool) — heuristic refusal detector (see
+        ``_detect_refusal``).
+      * ``subset`` (str) — the prompt's domain/subset, duplicated from
+        the existing ``domain`` field for consumer convenience (matches
+        the plan-doc field name).
+      * ``seed_idx`` (int) — duplicate of ``_attempt_idx`` under the
+        Item-9 name. The attempt index is the prompt's position in the
+        shuffled ``CalibrationSpec`` source ordering, which is what the
+        plan refers to as the deterministic per-prompt seed index. We
+        keep both keys for backward compatibility — existing consumers
+        reading ``_attempt_idx`` continue to work unchanged.
+    """
     import numpy as np
 
     for prompt_text, attempt_idx, out in zip(prompts_chunk, attempt_idx_chunk, outputs):
@@ -323,6 +408,17 @@ def _process_outputs(
                 )
                 os.replace(tmp_fp, fp)
 
+        # Item 8+9: per-row metadata bundle. ``prompt_token_ids`` on
+        # RequestOutput is the rendered+tokenized prompt vLLM actually
+        # consumed (not the raw user text), so it matches the model's
+        # forward-pass view 1:1. ``n_gen_tokens`` is the un-trimmed
+        # emit count — see _process_outputs docstring rationale.
+        prompt_token_ids = getattr(out, "prompt_token_ids", None) or []
+        n_prompt_tokens = len(prompt_token_ids)
+        n_gen_tokens = n_emit
+        has_think = _has_think_block(ans)
+        refusal_flag = _detect_refusal(ans)
+
         yield {
             "messages": [
                 {"role": "user", "content": prompt_str},
@@ -331,6 +427,13 @@ def _process_outputs(
             "domain": domain,
             "_complete": is_complete,
             "_attempt_idx": int(attempt_idx),
+            # --- Item 8+9 metadata bundle (JSONL schema v8) ---------------
+            "n_prompt_tokens": int(n_prompt_tokens),
+            "n_gen_tokens": int(n_gen_tokens),
+            "has_think": bool(has_think),
+            "refusal_flag": bool(refusal_flag),
+            "subset": str(domain),
+            "seed_idx": int(attempt_idx),
         }
 
 
