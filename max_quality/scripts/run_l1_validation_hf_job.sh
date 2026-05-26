@@ -35,4 +35,4 @@ hf jobs run \
     --secrets HF_TOKEN \
     --env "L1_HARNESS_COMMIT=${L1_HARNESS_COMMIT}" \
     "${IMAGE}" \
-    bash -c "curl -sL ${INSTALLER_URL} | L1_HARNESS_COMMIT=${L1_HARNESS_COMMIT} bash"
+    bash -c "export DEBIAN_FRONTEND=noninteractive && apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates && curl -sL ${INSTALLER_URL} | L1_HARNESS_COMMIT=${L1_HARNESS_COMMIT} bash"
