@@ -1466,21 +1466,348 @@ def _parse_yaml_qwen3_pretrain_mix_v2(
     )
 
 
-def _stream_texts_qwen3_pretrain_mix_v2(spec: CalibrationSpec, tokenizer) -> list[str]:
-    """Stream rendered chat-format texts for the v2 mix.
-
-    Placeholder implementation that intentionally raises until Step 3 of
-    the calibration-v2 plan lands the per-subset dispatch and the three
-    new helpers (_stream_messages_with_config, _stream_swe_smith_xml,
-    _stream_glaive_function_calling). The corpus is REGISTERED now so the
-    CalibrationSpec round-trip and cache_key tests pass at Step 1; the
-    actual text-streaming faucet is filled in at Step 3.
+def _stream_messages_with_config(
+    dataset_name: str, config: str | None, split: str,
+    count: int, tokenizer, seed: int,
+) -> list[str]:
+    """Like ``_stream_messages_native`` but routes through ``_shuffled_stream``'s
+    ``config``/``split`` kwargs so the MoT-math/code/science subsets can pull
+    from their non-default configs. Renders ``row["messages"]`` (a native
+    list-of-dicts on these subsets) via ``apply_chat_template`` with
+    ``enable_thinking=True`` so the canonical ``<think>...</think>`` block in
+    the assistant turn lands in the rendered text intact.
     """
-    raise NotImplementedError(
-        "_stream_texts_qwen3_pretrain_mix_v2 is a Step-1 placeholder; "
-        "Step 3 of tasks/CALIBRATION_MIX_V2_PLAN.md fills in the body. "
-        "Until then, calibration consumption from this corpus is unavailable."
+    ds, circuit_limit = _shuffled_stream(
+        dataset_name, count, seed, config=config, split=split,
     )
+    out: list[str] = []
+    rows_seen = 0
+    for row in ds:
+        rows_seen += 1
+        text = _render_messages(
+            row.get("messages"), tokenizer, enable_thinking=True,
+        )
+        if text:
+            out.append(text)
+            if len(out) >= count:
+                break
+        if rows_seen >= circuit_limit:
+            log.warning(
+                "_stream_messages_with_config: circuit-breaker fired at %d "
+                "rows on %s (config=%r, split=%r)",
+                rows_seen, dataset_name, config, split,
+            )
+            break
+    if len(out) < count:
+        log.warning(
+            "%s (config=%r, split=%r) yielded %d/%d rows",
+            dataset_name, config, split, len(out), count,
+        )
+    return out
+
+
+def _stream_swe_smith_xml(
+    dataset_name: str, split: str, count: int, tokenizer, seed: int,
+) -> list[str]:
+    """SWE-smith trajectories — multi-turn flatten to (first_user, first_assistant).
+
+    SWE-smith stores ``messages`` as a JSON-encoded string (NOT a native
+    list), so we ``json.loads`` first. The schema is system + user +
+    assistant + (tool / user / assistant)*; we keep only the first
+    (user, assistant) pair and drop the system header (Qwen3's
+    apply_chat_template re-injects its own system preamble at
+    calibration consumption time — including SWE-smith's would double
+    the agent-bash-tool boilerplate). The first assistant turn carries
+    the literal ``<function=...>`` tool-call block as plain string
+    content; the chat template renders it as-is (it lives in the
+    assistant ``content`` field, not in a separate ``tool_calls`` slot,
+    so the template will NOT re-wrap it). Per the design doc §5.4 this
+    gives us routing-pattern supervision for tool-use traces, at the
+    cost of zero ``<think>`` supervision on this subset (Claude 3.7's
+    SWE-smith trajectories were generated outside extended-thinking
+    mode).
+    """
+    ds, circuit_limit = _shuffled_stream(
+        dataset_name, count, seed, config=None, split=split,
+    )
+    out: list[str] = []
+    rows_seen = 0
+    for row in ds:
+        rows_seen += 1
+        raw = row.get("messages")
+        if not isinstance(raw, str):
+            # Schema drift — abort row but keep going (matches v1 per-row
+            # tolerance).
+            continue
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(parsed, list):
+            continue
+        # Find first user message and first assistant AFTER it. The xml
+        # split's typical layout is [system, user, assistant, ...]; we
+        # tolerate any leading system messages and skip them.
+        user_msg = None
+        assistant_msg = None
+        seen_user = False
+        for msg in parsed:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+            if role == "user" and user_msg is None:
+                user_msg = content
+                seen_user = True
+            elif role == "assistant" and seen_user and assistant_msg is None:
+                assistant_msg = content
+                break
+        if not user_msg or not assistant_msg:
+            continue
+        flat = [
+            {"role": "user", "content": user_msg},
+            {"role": "assistant", "content": assistant_msg},
+        ]
+        rendered = _render_messages(flat, tokenizer, enable_thinking=True)
+        if rendered:
+            out.append(rendered)
+            if len(out) >= count:
+                break
+        if rows_seen >= circuit_limit:
+            log.warning(
+                "_stream_swe_smith_xml: circuit-breaker fired at %d rows "
+                "on %s (split=%r)", rows_seen, dataset_name, split,
+            )
+            break
+    if len(out) < count:
+        log.warning("%s (split=%r) yielded %d/%d rows",
+                    dataset_name, split, len(out), count)
+    return out
+
+
+def _stream_glaive_function_calling(
+    dataset_name: str, count: int, tokenizer, seed: int,
+) -> list[str]:
+    """Glaive function-calling v2 — extract first USER turn + system schema.
+
+    Glaive stores both ``system`` and ``chat`` as flat strings; ``chat``
+    uses literal ``USER:`` / ``ASSISTANT:`` / ``FUNCTION RESPONSE:``
+    markers with ``<|endoftext|>`` separators. We pull the FIRST user
+    turn and prepend the system content as a single combined user
+    message (Option (i) from plan §B.6 — keeps the iterator tuple shape
+    stable; the teacher then generates its own Qwen3-native
+    ``<tool_call>...</tool_call>`` response).
+
+    For the calibration corpus path (this helper), we have neither the
+    canonical Glaive ASSISTANT turn (GENERATE policy discards it) nor a
+    teacher-generated thinking-mode response, so we render the user
+    turn alone and let ``_tokenize_to_fixed_length`` keep it as a
+    prompt-only calibration row. This matches v1's prompt-only handling
+    of subsets where the canonical assistant content is wrong-format
+    (e.g., aya / writingprompts at calibration consumption time).
+    """
+    ds, circuit_limit = _shuffled_stream(
+        dataset_name, count, seed, config=None, split="train",
+    )
+    out: list[str] = []
+    rows_seen = 0
+    for row in ds:
+        rows_seen += 1
+        system_raw = row.get("system") or ""
+        chat_raw = row.get("chat") or ""
+        if not isinstance(system_raw, str) or not isinstance(chat_raw, str):
+            continue
+        system_text = system_raw.strip()
+        if system_text.startswith("SYSTEM:"):
+            system_text = system_text[len("SYSTEM:"):].strip()
+        # First USER turn in the flat chat string.
+        user_text = _extract_glaive_first_user(chat_raw)
+        if not user_text:
+            continue
+        # Option (i): concat system schema + first user turn into one user
+        # message (see plan §B.6). The teacher generates its own
+        # Qwen3-native <tool_call> response; for calibration purposes we
+        # need only the prompt-shaped tokens.
+        user_content = (
+            f"{system_text}\n\n{user_text}" if system_text else user_text
+        )
+        messages = [{"role": "user", "content": user_content}]
+        rendered = _render_messages(
+            messages, tokenizer, add_generation_prompt=True,
+        )
+        if rendered:
+            out.append(rendered)
+            if len(out) >= count:
+                break
+        if rows_seen >= circuit_limit:
+            log.warning(
+                "_stream_glaive_function_calling: circuit-breaker fired at "
+                "%d rows on %s", rows_seen, dataset_name,
+            )
+            break
+    if len(out) < count:
+        log.warning("%s yielded %d/%d rows", dataset_name, len(out), count)
+    return out
+
+
+# Markers in Glaive's flat ``chat`` string that separate the first USER turn
+# from whatever follows (ASSISTANT response, FUNCTION RESPONSE, next USER).
+# Kept as module-level constants so the prompt-iterator in
+# build_self_traces_calib.py can import the same set instead of re-inlining
+# them. Order doesn't matter — we take min(found index) across them all.
+_GLAIVE_TURN_MARKERS = ("ASSISTANT:", "FUNCTION RESPONSE:", "USER:")
+
+
+def _extract_glaive_first_user(chat: str) -> str | None:
+    """Return the first USER turn's content (stripped) from a Glaive flat
+    chat string, or None if no USER turn is found.
+
+    Algorithm:
+      1. Find the first ``USER:`` occurrence and slice from just after it.
+      2. Find the next occurrence of any of ASSISTANT:, FUNCTION RESPONSE:,
+         or a SUBSEQUENT USER:, and slice up to the earliest such
+         boundary. If none is found, take everything to end-of-string.
+      3. Strip whitespace and ``<|endoftext|>`` sentinels.
+    """
+    if not isinstance(chat, str):
+        return None
+    start = chat.find("USER:")
+    if start < 0:
+        return None
+    body_start = start + len("USER:")
+    # Find earliest subsequent boundary in (ASSISTANT:, FUNCTION RESPONSE:,
+    # USER:).
+    boundaries = []
+    for marker in _GLAIVE_TURN_MARKERS:
+        idx = chat.find(marker, body_start)
+        if idx >= 0:
+            boundaries.append(idx)
+    body_end = min(boundaries) if boundaries else len(chat)
+    body = chat[body_start:body_end].strip()
+    # Strip any stray <|endoftext|> separator at end of turn.
+    body = body.replace("<|endoftext|>", "").strip()
+    return body or None
+
+
+def _stream_texts_qwen3_pretrain_mix_v2(spec: CalibrationSpec, tokenizer) -> list[str]:
+    """Multi-source Qwen3-thinking-mode reasoning mix (v2).
+
+    12 subsets dispatched by key from ``_QWEN3_MIX_V2_WEIGHTS``. Per-subset
+    behavior (weight, avg-tokens, dataset, config, split, policy) flows
+    from the six ``_QWEN3_MIX_V2_*`` sole-truth dicts. The calibration
+    consumer is policy-agnostic — both GENERATE and TEACHER_FORCED
+    subsets land as rendered chat-formatted texts here; the policy
+    field is consumed only by the build_self_traces_calib{,_vllm}.py
+    scripts when they decide whether to call model.generate() or to
+    short-circuit and emit the canonical completion directly.
+
+    See tasks/CALIBRATION_MIX_V2_PLAN.md §B for the per-subset row-
+    extraction recipe.
+    """
+    target_total_tokens = spec.num_sequences * spec.sequence_length
+    texts: list[str] = []
+    global _broad_instruct_mix_v2_intro_logged
+    if not _broad_instruct_mix_v2_intro_logged:
+        log.info(
+            "qwen3-pretrain-mix-v2: building 12-subset reasoning mix "
+            "(7 carryover GENERATE + 4 TEACHER_FORCED + Glaive GENERATE) "
+            "for %d sequences x %d tokens (target_total=%d).",
+            spec.num_sequences, spec.sequence_length, target_total_tokens,
+        )
+        _broad_instruct_mix_v2_intro_logged = True
+
+    for subset, weight in _QWEN3_MIX_V2_WEIGHTS.items():
+        target_subset_tokens = int(target_total_tokens * weight)
+        avg_tok = _QWEN3_MIX_V2_AVG_TOKENS[subset]
+        # 2x oversample — mirrors v1; `_tokenize_to_fixed_length` truncates
+        # so leftover rows are harmless.
+        n_rows = max(1, int((target_subset_tokens / avg_tok) * 2.0))
+        seed = _make_subset_seed(spec.seed, subset)
+        ds_name = _QWEN3_MIX_V2_DATASET[subset]
+        config = _QWEN3_MIX_V2_DATASET_CONFIG[subset]
+        split = _QWEN3_MIX_V2_DATASET_SPLIT[subset]
+        policy = _QWEN3_MIX_V2_POLICY[subset]
+        log.info(
+            "qwen3-pretrain-mix-v2: %s — streaming %d rows from %s "
+            "(weight=%.2f, target_tokens=%d, avg_tok=%d, seed=%d, "
+            "config=%r, split=%r, policy=%s)",
+            subset, n_rows, ds_name, weight, target_subset_tokens, avg_tok,
+            seed, config, split, policy,
+        )
+        try:
+            if subset == "tulu3":
+                subset_texts = _stream_messages_native(
+                    ds_name, n_rows, tokenizer, seed,
+                )
+            elif subset == "fineweb":
+                subset_texts = _stream_raw_wrapped(
+                    ds_name, "text", n_rows, tokenizer, seed,
+                    user_prompt="Read this passage carefully and reproduce it faithfully.",
+                )
+            elif subset == "math":
+                subset_texts = _stream_problem_solution(
+                    ds_name, n_rows, tokenizer, seed,
+                    problem_field="problem", solution_field="generated_solution",
+                )
+            elif subset == "qa":
+                # databricks-dolly-15k: instruction/context/response.
+                subset_texts = _stream_instruction_output(
+                    ds_name, n_rows, tokenizer, seed,
+                    input_field="context", output_field="response",
+                )
+            elif subset == "creative":
+                # euclaise/writingprompts: prompt/story.
+                subset_texts = _stream_problem_solution(
+                    ds_name, n_rows, tokenizer, seed,
+                    problem_field="prompt", solution_field="story",
+                )
+            elif subset == "multilingual":
+                # CohereForAI/aya_dataset: inputs/targets across 65+ languages.
+                subset_texts = _stream_problem_solution(
+                    ds_name, n_rows, tokenizer, seed,
+                    problem_field="inputs", solution_field="targets",
+                )
+            elif subset == "papers":
+                # gfissore/arxiv-abstracts-2021: title/abstract.
+                subset_texts = _stream_problem_solution(
+                    ds_name, n_rows, tokenizer, seed,
+                    problem_field="title", solution_field="abstract",
+                )
+            elif subset in ("mot_math", "mot_code", "mot_science"):
+                # open-r1/Mixture-of-Thoughts — R1 canonical <think>...</think>
+                # traces in messages=[user, assistant] shape.
+                subset_texts = _stream_messages_with_config(
+                    ds_name, config, split, n_rows, tokenizer, seed,
+                )
+            elif subset == "swe_smith":
+                # SWE-bench/SWE-smith-trajectories xml split — multi-turn
+                # tool-call traces (Claude 3.7), flatten to first
+                # (user, assistant) pair.
+                subset_texts = _stream_swe_smith_xml(
+                    ds_name, split, n_rows, tokenizer, seed,
+                )
+            elif subset == "function_calling":
+                subset_texts = _stream_glaive_function_calling(
+                    ds_name, n_rows, tokenizer, seed,
+                )
+            else:
+                raise ValueError(
+                    f"unknown qwen3-pretrain-mix-v2 subset {subset!r}"
+                )
+        except Exception as err:                       # noqa: BLE001
+            log.error(
+                "qwen3-pretrain-mix-v2: subset %s (%s) failed: %s — continuing",
+                subset, ds_name, err,
+            )
+            continue
+        log.info("qwen3-pretrain-mix-v2: %s — yielded %d rows",
+                 subset, len(subset_texts))
+        texts.extend(subset_texts)
+    log.info("qwen3-pretrain-mix-v2: total %d rendered rows across all subsets",
+             len(texts))
+    return texts
 
 
 register_corpus(CorpusAdapter(

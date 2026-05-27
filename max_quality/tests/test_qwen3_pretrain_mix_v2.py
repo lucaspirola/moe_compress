@@ -14,8 +14,11 @@ and registry behavior only.
 """
 from __future__ import annotations
 
+import json as _json
+
 import pytest
 
+from moe_compress.utils import calibration as _calib
 from moe_compress.utils.calibration import (
     CalibrationSpec,
     _QWEN3_MIX_V2_AVG_TOKENS,
@@ -24,9 +27,26 @@ from moe_compress.utils.calibration import (
     _QWEN3_MIX_V2_DATASET_SPLIT,
     _QWEN3_MIX_V2_POLICY,
     _QWEN3_MIX_V2_WEIGHTS,
+    _extract_glaive_first_user,
     _shuffled_stream,
+    _stream_glaive_function_calling,
+    _stream_messages_with_config,
+    _stream_swe_smith_xml,
     get_corpus_adapter,
 )
+
+
+class _StubTokenizer:
+    """Minimal tokenizer stub for the _stream_* helpers — they call
+    ``_render_messages`` which falls back to a role/content concat string
+    when ``apply_chat_template`` is missing.  We DON'T provide one, so the
+    fallback path renders deterministically without pulling transformers
+    into the test."""
+
+    name_or_path = "stub-tokenizer"
+
+    # Intentionally NO apply_chat_template — the fallback path in
+    # _render_messages serializes role + content + "\n\n" between turns.
 
 
 # The 12 subsets the plan locks in.
@@ -161,6 +181,179 @@ def test_shuffled_stream_forwards_config_and_split_kwargs(monkeypatch):
     )
     assert captured[-1][0] == ("SWE-bench/SWE-smith-trajectories",)
     assert captured[-1][1] == {"split": "xml", "streaming": True}
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — helper-level row extraction (CPU-only, hand-built fixtures)
+# ---------------------------------------------------------------------------
+
+
+def _patch_shuffled_stream(monkeypatch, rows: list[dict]):
+    """Monkeypatch ``_shuffled_stream`` to yield the given canned rows.
+
+    Returns the rows list so callers can mutate it between assertions if
+    needed. Replaces the function via monkeypatch on the calibration
+    module — safe per pytest's fixture scoping (auto-reverted after the
+    test).
+    """
+    def _fake(name, count, seed, *, config=None, split="train"):
+        # circuit_limit just needs to be larger than `count`; the iter
+        # below short-circuits on `len(out) >= count`.
+        return iter(rows), 10_000
+
+    monkeypatch.setattr(_calib, "_shuffled_stream", _fake)
+    return rows
+
+
+def test_stream_messages_with_config_renders_mot_row(monkeypatch):
+    """The MoT-style helper feeds {messages, num_tokens, source} rows
+    through ``_render_messages`` with enable_thinking=True. The fallback
+    role/content concat path (no apply_chat_template on the stub) produces
+    a non-empty string containing both turns."""
+    _patch_shuffled_stream(monkeypatch, [
+        {
+            "messages": [
+                {"role": "user", "content": "What is 2 + 2?"},
+                {"role": "assistant",
+                 "content": "<think>two plus two</think>4"},
+            ],
+            "num_tokens": 12,
+            "source": "test",
+        },
+    ])
+    out = _stream_messages_with_config(
+        "open-r1/Mixture-of-Thoughts", "math", "train",
+        count=1, tokenizer=_StubTokenizer(), seed=0,
+    )
+    assert len(out) == 1
+    rendered = out[0]
+    assert "What is 2 + 2?" in rendered
+    assert "<think>two plus two</think>4" in rendered
+
+
+def test_stream_swe_smith_xml_flattens_to_first_pair(monkeypatch):
+    """swe_smith stores ``messages`` as a JSON string. The helper must
+    parse it, drop the system message, keep only the first
+    (user, assistant) pair, and discard subsequent turns. The first
+    assistant turn carries literal ``<function=...>`` blocks as plain
+    string content."""
+    raw_messages = [
+        {"role": "system", "content": "You are an agent. Use bash."},
+        {"role": "user", "content": "<uploaded>repo/</uploaded>Fix bug X."},
+        {"role": "assistant",
+         "content": "<function=bash><parameter=command>ls</parameter></function>"},
+        {"role": "tool", "content": "main.py\n"},
+        {"role": "assistant",
+         "content": "Now I'll patch main.py with the fix."},
+    ]
+    _patch_shuffled_stream(monkeypatch, [
+        {
+            "messages": _json.dumps(raw_messages),
+            "instance_id": "x",
+            "resolved": True,
+            "model": "claude",
+            "traj_id": "y",
+            "patch": "",
+        },
+    ])
+    out = _stream_swe_smith_xml(
+        "SWE-bench/SWE-smith-trajectories", "xml",
+        count=1, tokenizer=_StubTokenizer(), seed=0,
+    )
+    assert len(out) == 1
+    rendered = out[0]
+    # First user turn present.
+    assert "Fix bug X." in rendered
+    # First assistant turn (tool-call block) preserved literal.
+    assert "<function=bash>" in rendered
+    assert "<parameter=command>ls</parameter>" in rendered
+    # System content from SWE-smith dropped (Qwen3 reinjects its own).
+    assert "You are an agent. Use bash." not in rendered
+    # Subsequent assistant turn dropped.
+    assert "Now I'll patch main.py" not in rendered
+
+
+def test_stream_swe_smith_xml_skips_malformed_rows(monkeypatch):
+    """Defensive: rows whose ``messages`` is not a JSON-encoded list of
+    dicts must be skipped without raising."""
+    _patch_shuffled_stream(monkeypatch, [
+        {"messages": "not-valid-json{[]"},
+        {"messages": None},
+        {"messages": "{\"role\": \"user\"}"},   # parses but not a list
+        {
+            "messages": _json.dumps([
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world"},
+            ]),
+        },
+    ])
+    out = _stream_swe_smith_xml(
+        "SWE-bench/SWE-smith-trajectories", "xml",
+        count=4, tokenizer=_StubTokenizer(), seed=0,
+    )
+    # Only the well-formed row should yield text.
+    assert len(out) == 1
+    assert "hello" in out[0]
+    assert "world" in out[0]
+
+
+def test_extract_glaive_first_user_basic():
+    """Pulls the first ``USER:`` segment, stops at the next ``ASSISTANT:``
+    or ``FUNCTION RESPONSE:`` boundary, strips whitespace and
+    ``<|endoftext|>`` sentinels."""
+    chat = (
+        "USER: pick a function to call <|endoftext|>"
+        " ASSISTANT: <functioncall>{...}</functioncall> <|endoftext|>"
+        " FUNCTION RESPONSE: ok <|endoftext|>"
+        " ASSISTANT: done <|endoftext|>"
+        " USER: ignored"
+    )
+    out = _extract_glaive_first_user(chat)
+    assert out is not None
+    assert out.startswith("pick a function")
+    assert "ignored" not in out
+    assert "<functioncall>" not in out
+    assert "<|endoftext|>" not in out
+
+
+def test_extract_glaive_first_user_returns_none_when_no_user():
+    """No ``USER:`` marker → None (helper must not crash)."""
+    assert _extract_glaive_first_user("ASSISTANT: hi") is None
+    assert _extract_glaive_first_user("") is None
+
+
+def test_stream_glaive_function_calling_combines_system_and_user(monkeypatch):
+    """Glaive helper renders the (stripped) system schema + first USER
+    turn as one combined user message — Option (i) from plan §B.6.
+
+    The stub tokenizer's fallback path appends ``USER: <combined>`` so
+    we should see BOTH the schema and the first user turn in the
+    rendered string.
+    """
+    _patch_shuffled_stream(monkeypatch, [
+        {
+            "system": (
+                "SYSTEM: You are a helpful assistant with access to the "
+                "following functions. {\"name\": \"get_weather\"}"
+            ),
+            "chat": (
+                "USER: What's the weather in Paris?  "
+                "ASSISTANT: <functioncall>... <|endoftext|> "
+                "USER: dropped"
+            ),
+        },
+    ])
+    out = _stream_glaive_function_calling(
+        "glaiveai/glaive-function-calling-v2",
+        count=1, tokenizer=_StubTokenizer(), seed=0,
+    )
+    assert len(out) == 1
+    rendered = out[0]
+    # System schema (sans SYSTEM: prefix) and first user turn both present.
+    assert "{\"name\": \"get_weather\"}" in rendered
+    assert "What's the weather in Paris?" in rendered
+    # Second USER turn dropped.
+    assert "dropped" not in rendered
 
 
 def test_cache_key_distinct_for_v1_v2():
