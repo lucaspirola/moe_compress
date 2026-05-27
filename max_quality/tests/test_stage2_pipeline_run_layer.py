@@ -150,6 +150,9 @@ class _CountingPlugin:
     def post_merge(self, ctx):
         self.calls.append("post_merge")
 
+    def on_post_merge(self, ctx):
+        self.calls.append("on_post_merge")
+
     def write_artifacts(self, ctx):
         self.calls.append("write_artifacts")
         return {}
@@ -205,6 +208,7 @@ def test_phases_tuple_matches_t6_canonical_order():
         "pre_merge_snapshot",
         "merge",
         "post_merge",
+        "on_post_merge",
         "write_artifacts",
         "on_layer_teardown",
     )
@@ -222,6 +226,7 @@ def test_phases_tuple_matches_t6_canonical_order():
         "pre_merge_snapshot",
         "merge",
         "post_merge",
+        "on_post_merge",
         "write_artifacts",
         "on_layer_teardown",
     )
@@ -681,3 +686,62 @@ def test_stage2_pipeline_path_handles_resume(tiny_model, patched_stage2,
     assert resume_map == clean_map, (
         f"resume merge_map mismatch:\n  resume={resume_map}\n  clean={clean_map}"
     )
+
+
+class _PostMergeProbePlugin:
+    """Records phase calls; implements on_post_merge to verify it fires."""
+
+    name = "post_merge_probe"
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def pre_merge_snapshot(self, ctx):
+        self.calls.append("pre_merge_snapshot")
+
+    def merge(self, ctx):
+        self.calls.append("merge")
+
+    def post_merge(self, ctx):
+        self.calls.append("post_merge")
+
+    def on_post_merge(self, ctx):
+        self.calls.append("on_post_merge")
+
+    def write_artifacts(self, ctx):
+        self.calls.append("write_artifacts")
+        return {}
+
+    def on_layer_teardown(self, ctx):
+        self.calls.append("on_layer_teardown")
+
+
+def test_on_post_merge_fires_after_post_merge_before_write_artifacts(tmp_path):
+    """on_post_merge fires in the correct position within _STAGE2_POST_ASSIGN_PHASES.
+
+    Asserts strict ordering:
+      merge → post_merge → on_post_merge → write_artifacts → on_layer_teardown.
+    Per SC_STAGE12 §582.
+    """
+    plugin = _PostMergeProbePlugin()
+    run_ctx = _make_run_ctx(
+        model=object(), tokenizer=object(), config={},
+        artifacts_dir=tmp_path, partial_dir=tmp_path, device="cpu",
+    )
+    layer_ctx = _make_layer_ctx(run_ctx, layer_idx=0, layer_ref=object(),
+                                n_experts=4, target=2)
+    walk_phases(_STAGE2_POST_ASSIGN_PHASES, [plugin], layer_ctx)
+
+    assert plugin.calls == [
+        "pre_merge_snapshot",
+        "merge",
+        "post_merge",
+        "on_post_merge",
+        "write_artifacts",
+        "on_layer_teardown",
+    ]
+    assert "on_post_merge" in _STAGE2_POST_ASSIGN_PHASES
+    post_idx = _STAGE2_POST_ASSIGN_PHASES.index("post_merge")
+    opm_idx = _STAGE2_POST_ASSIGN_PHASES.index("on_post_merge")
+    wa_idx = _STAGE2_POST_ASSIGN_PHASES.index("write_artifacts")
+    assert post_idx < opm_idx < wa_idx

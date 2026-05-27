@@ -73,7 +73,7 @@ def _make_layer_ctx() -> PipelineContext:
 def test_pipeline_phases_are_declared_in_canonical_order():
     """_STAGE2_LAYER_PHASES documents the per-layer execution order.
 
-    The tuple is 9 entries. The four fine-grained sub-hooks
+    The tuple is 10 entries. The four fine-grained sub-hooks
     (``compute_cost``, ``apply_cost_mask``, ``solve_assignment``,
     ``refine_assignment``) are an open vocabulary discovered reflectively by
     the tolerant phase walk and are NOT iterated by ``walk_phases`` over this
@@ -89,6 +89,7 @@ def test_pipeline_phases_are_declared_in_canonical_order():
         "pre_merge_snapshot",
         "merge",
         "post_merge",
+        "on_post_merge",
         "write_artifacts",
         "on_layer_teardown",
     )

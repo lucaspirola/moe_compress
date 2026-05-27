@@ -181,7 +181,15 @@ log = logging.getLogger(__name__)
 # per-layer loop calls between the pre-assign and post-assign phase walks. The
 # schedule is split into the two halves below; ``_STAGE2_LAYER_PHASES`` stays as
 # a derived back-compat constant so external callers / tests that expect the
-# full 9-tuple keep working.
+# full 10-tuple keep working.
+#
+# ``post_merge`` vs ``on_post_merge``:
+#   post_merge    — in-layer reaction to the merge (MergeHealPlugin,
+#                   ExpertDistillPlugin observe/repair the merged weight tensor).
+#   on_post_merge — inter-layer cache invalidation (S2_SEQ / REAM sequential:
+#                   clears cov_acc, ream_acc, layer_input_acc so the next layer's
+#                   on_layer_setup → on_profile sees fresh state).
+#                   Per SC_STAGE12 §582.
 _STAGE2_PRE_ASSIGN_PHASES: tuple[str, ...] = (
     "on_layer_setup",
     "on_profile",
@@ -191,10 +199,11 @@ _STAGE2_POST_ASSIGN_PHASES: tuple[str, ...] = (
     "pre_merge_snapshot",
     "merge",
     "post_merge",
+    "on_post_merge",   # SC_STAGE12 §582 — inter-layer cache invalidation
     "write_artifacts",
     "on_layer_teardown",
 )
-# Derived back-compat constant: the full 9-phase schedule with the compound
+# Derived back-compat constant: the full 10-phase schedule with the compound
 # ``compute_assignment`` slot wedged between the two halves. Not walked directly
 # anymore (``_run_assignment`` owns that slot) — kept so the canonical-order
 # contract test and any external importer still see the historical tuple.
