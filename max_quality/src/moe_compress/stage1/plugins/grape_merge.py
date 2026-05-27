@@ -215,6 +215,7 @@ import torch
 from ...utils.trackio_log import trackio_flush as _trackio_flush
 from ...utils.trackio_log import trackio_log as _trackio_log
 from ...pipeline.context import PipelineContext
+from ._floor import per_layer_floor
 
 log = logging.getLogger(__name__)
 
@@ -577,7 +578,11 @@ def _grape_greedy_merge(
     # the historical hardcoded floor. `floor_divisor` is only ever non-2 when
     # a caller explicitly opts in (Direction-A second pass).
     floors: dict[int, int] = {
-        li: max(per_layer_counts[li] // floor_divisor - len(blacklist.get(li, [])), 0)
+        li: per_layer_floor(
+            per_layer_counts[li],
+            len(blacklist.get(li, [])),
+            floor_divisor,
+        ).non_bl_floor
         for li in sorted_layers
     }
 
@@ -702,10 +707,23 @@ def _grape_greedy_merge(
             # second pass) the score is `R[li] * merge_cost_prior[li]`, biasing
             # selection toward layers that are both activation-redundant AND
             # cheap to merge per measured Stage-2 damage.
+            #
+            # M1 guard: a layer with prior == +inf (planned at-floor by S1_DP)
+            # combined with R[li] == 0.0 (post-clamp FP drift or fully-merged
+            # row/col residue) would yield `0.0 * inf = nan`. NaN < best_R is
+            # always False so the layer simply never wins, but the comparison
+            # is silent — convert any non-finite score to +inf so the intent
+            # ("never pick this layer") is explicit and inspectable.
             if merge_cost_prior is None:
                 score = R[li]
             else:
-                score = R[li] * merge_cost_prior[li]
+                prior_li = merge_cost_prior[li]
+                if math.isinf(prior_li):
+                    # +inf prior means "at the DP floor — do not merge".
+                    # Skip outright; avoids 0*inf=NaN entirely.
+                    score = math.inf
+                else:
+                    score = R[li] * prior_li
             if score < best_R:
                 best_R = score
                 best_layer = li

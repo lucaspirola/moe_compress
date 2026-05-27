@@ -587,11 +587,18 @@ def run(
     log.info("Stage 1 Phase D: ablating %d candidates", len(candidates))
     by_name["ablation_filter"].run(ctx)       # mandatory plugin
 
-    # ---- STEP 10: cka_distance + grape_merge ------------------------------
+    # ---- STEP 10: cka_distance + damage_curve_dp + grape_merge ------------
     by_name["cka_distance"].run(ctx)          # writes D_matrices
     # Free the big expert-output reservoir — matches the legacy
     # ``del output_acc``.
     ctx.drop("output_acc")
+    # S1_DP — damage-curve + DP knapsack. No-op when
+    # `stage1_grape.damage_curve_dp.enabled` is false (the default), so
+    # output stays byte-identical to the GRAPE-only path. When enabled,
+    # this plugin mutates `config["stage1_grape"]["merge_cost_prior"]` so
+    # GrapeMergePlugin's existing inert hook activates with the
+    # DP-derived per-layer marginal damage as a bias.
+    by_name["damage_curve_dp"].run(ctx)
     by_name["grape_merge"].run(ctx)           # writes the 5 budget slots
 
     # ---- STEP 11: assemble + write artifacts ------------------------------
