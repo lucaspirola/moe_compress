@@ -601,6 +601,16 @@ def run(
     by_name["damage_curve_dp"].run(ctx)
     by_name["grape_merge"].run(ctx)           # writes the 5 budget slots
 
+    # ---- STEP 10b: RCO budget refinement (opt-in) -------------------------
+    # Default OFF — gated on ``stage1.rco_budget.enabled``. When disabled
+    # this is a strict no-op: GRAPE's per_layer_target_experts remains the
+    # only Stage-1 budget output. When enabled, RCO consumes GRAPE's slot
+    # and writes a refined budget to ``per_layer_target_experts_rco``.
+    # See ``stage1/plugins/rco_budget.py`` for the algorithm + deviations.
+    rco_plugin = by_name["rco_budget"]
+    if rco_plugin.is_enabled(config):
+        rco_plugin.run(ctx)
+
     # ---- STEP 11: assemble + write artifacts ------------------------------
     blacklist_path, budgets_path = _write_artifacts(ctx, by_name)
     _emit_telemetry(ctx, by_name)
@@ -713,6 +723,23 @@ def _write_artifacts(ctx: PipelineContext, by_name: dict) -> tuple[Path, Path]:
         min(target_vals), max(target_vals),
         statistics.fmean(target_vals), budgets_path,
     )
+
+    # stage1_rco_budgets.json — whole-file contributor, opt-in. Written
+    # ONLY when ``stage1.rco_budget.enabled`` is true; on the default path
+    # the plugin's run() was never invoked and contribute_artifact returns
+    # ``{}`` defensively. The is_enabled check here is the single source
+    # of truth for "is this artifact present on disk?".
+    if by_name["rco_budget"].is_enabled(config):
+        rco_payload = by_name["rco_budget"].contribute_artifact(ctx)
+        if rco_payload:
+            rco_budgets_path = artifacts_dir / "stage1_rco_budgets.json"
+            save_json_artifact(rco_payload, rco_budgets_path)
+            rco_vals = [int(v) for v in rco_payload["rco_budgets"].values()]
+            log.info(
+                "Stage 1 RCO refinement — budgets range=[%d..%d] mean=%.1f → %s",
+                min(rco_vals), max(rco_vals),
+                statistics.fmean(rco_vals), rco_budgets_path,
+            )
 
     return blacklist_path, budgets_path
 

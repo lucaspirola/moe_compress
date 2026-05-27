@@ -17,13 +17,17 @@ from .damage_curve_dp import DamageCurveDpPlugin
 from .grape_merge import GrapeMergePlugin
 from .ma_detection import MADetectionPlugin
 from .magnitude_topk import MagnitudeTopkPlugin
+from .rco_budget import RCOBudgetPlugin
 from .sink_token import SinkTokenDetectorPlugin
 from .three_way_and import ThreeWayAndPlugin
 
-# Ordered execution sequence — Phase A → Phase C (4 detectors) → D → E → F.
-# DamageCurveDpPlugin (S1_DP) sits between Phase E (CKA) and Phase F
-# (GRAPE) — it consumes D_matrices and populates merge_cost_prior into
-# the in-ctx config so GRAPE's existing inert hook activates.
+# Ordered execution sequence — Phase A → Phase C (4 detectors) → D → E → E.5 → F → G.
+# Phase E.5: DamageCurveDpPlugin (S1_DP) sits between Phase E (CKA) and Phase F
+# (GRAPE) — it consumes D_matrices and populates merge_cost_prior into the in-ctx
+# config so GRAPE's existing inert hook activates. Default OFF.
+# Phase G: RCOBudgetPlugin is opt-in via ``stage1.rco_budget.enabled`` — when disabled
+# (the default) the plugin's ``run`` is never invoked and the manifest entry is inert.
+# See ``stage1/orchestrator.py`` STEPs 10 + 11 for the gated call sites.
 STAGE1_PLUGIN_MANIFEST = (
     MADetectionPlugin(),       # Phase A   — MA-formation detection
     ThreeWayAndPlugin(),       # Phase C₁  — three-way AND (mandatory)
@@ -34,6 +38,7 @@ STAGE1_PLUGIN_MANIFEST = (
     CKADistancePlugin(),       # Phase E   — CKA distance matrices
     DamageCurveDpPlugin(),     # Phase E.5 — S1_DP damage-curve + DP knapsack (optional, default OFF)
     GrapeMergePlugin(),        # Phase F   — GRAPE greedy merge
+    RCOBudgetPlugin(),         # Phase G   — RCO budget refinement (opt-in)
 )
 
 __all__ = [
@@ -42,4 +47,5 @@ __all__ = [
     "SinkTokenDetectorPlugin", "MagnitudeTopkPlugin",
     "AblationFilterPlugin", "CKADistancePlugin",
     "DamageCurveDpPlugin", "GrapeMergePlugin",
+    "RCOBudgetPlugin",
 ]

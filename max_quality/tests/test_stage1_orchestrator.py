@@ -122,10 +122,12 @@ def test_plugin_manifest_order():
     # (which produces D_matrices) and grape_merge (which optionally
     # consumes merge_cost_prior). It is default-off so the GRAPE-only
     # path is byte-identical to the historical behaviour.
+    # Plugin #11 (S1_RCO — rco_budget) sits after grape_merge as Phase G,
+    # opt-in via stage1.rco_budget.enabled (default off).
     assert names == (
         "ma_detection", "three_way_and", "aimer", "sink_token",
         "magnitude_topk", "ablation_filter", "cka_distance",
-        "damage_curve_dp", "grape_merge",
+        "damage_curve_dp", "grape_merge", "rco_budget",
     )
 
 
