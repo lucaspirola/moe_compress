@@ -16,7 +16,7 @@
 set -euo pipefail
 
 V2_VAL_COMMIT="${V2_VAL_COMMIT:-a3a946a}"
-FLAVOR="${FLAVOR:-rtx-pro-6000}"
+FLAVOR="${FLAVOR:-h200}"
 TIMEOUT="${TIMEOUT:-4h}"
 IMAGE="${IMAGE:-nvidia/cuda:13.0.0-devel-ubuntu24.04}"
 

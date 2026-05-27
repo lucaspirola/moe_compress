@@ -6,13 +6,17 @@
 #
 # Container: nvidia/cuda:13.0.0-devel-ubuntu24.04 (matches the wheel
 #            build env that produced pirola/vllm-patched-calib).
-# Flavor   : rtx-pro-6000 (1x RTX PRO 6000, 96 GB VRAM, $2.75/hr) —
-#            fits BF16 Qwen3.6-35B-A3B (~70 GB weights) with ~26 GB
-#            free for KV cache and activations. L40S/48 GB rejected
-#            because the Phase B build script has no --quantization
-#            flag (BF16 only), and 48 GB cannot hold a BF16 35B model.
-#            H200/141 GB is overkill; A100/80 GB is too tight on
-#            KV-cache headroom.
+# Flavor   : h200 (1x H200, 141 GB VRAM, $5.00/hr) — fits BF16
+#            Qwen3.6-35B-A3B (~70 GB weights) with ~71 GB free for
+#            KV cache + activations. L40S/48 GB rejected because the
+#            Phase B build script has no --quantization flag (BF16
+#            only) and 48 GB cannot hold a BF16 35B model.
+#            A100-large/80 GB was the cheapest fitting flavor but its
+#            ~10 GB headroom over the 70 GB weights is too tight for
+#            max_new_tokens=16384 KV cache. rtx-pro-6000 at $2.75/hr
+#            would have been ideal (96 GB, $2.25 cheaper/hr) but is
+#            not present in the hf-CLI's flavor enum (CLI is stale
+#            against the live hf jobs hardware list).
 # Inputs   : env HF_TOKEN passed via `hf jobs run --secrets HF_TOKEN`,
 #            env V2_VAL_COMMIT (git SHA hosting the harness .py + .sh,
 #            pinned to a3a946a by default).
