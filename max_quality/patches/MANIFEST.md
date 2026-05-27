@@ -624,6 +624,19 @@ infrastructure. Bump these when changing the dataclass layout in
 | `block_hidden` | 1 | initial |
 | `teacher_eval` | 1 | initial |
 
+**JSONL self-traces row schema bumps** (CALIBRATION_MIX_V2_PLAN.md Step 5/6):
+
+  * `build_self_traces_calib.py` `_trace_cache_key` schema_version: 6 → 7.
+  * `build_self_traces_calib_vllm.py` `_trace_cache_key_vllm` schema_version: 8 → 9.
+
+Both bumps add the per-row `completion_source` field
+(`"teacher_generated"` for rows produced by model.generate;
+`"canonical"` for v2 TEACHER_FORCED rows synthesized from the source
+dataset's canonical assistant turn). Existing v6/v8 JSONLs on disk are
+NOT cache-hit by v7/v9 runs — the bumps intentionally segregate so a
+v1-era cache doesn't silently mix into a v2 calibration tensor. See
+`max_quality/docs/calibration_mix_v2.md` for the full v2 mix definition.
+
 ## When to bump the immutable tag
 
 Whenever the patch's functional contents change (line count or MD5 differ),
