@@ -129,6 +129,19 @@ stage1_grape:
   min_experts_per_layer: 128
   entropy_tolerance: 0.1
 
+  # Phase E.5 — S1_DP damage-curve + DP knapsack (Plugin #8). When
+  # enabled, computes a per-layer cumulative CKA-distance damage curve
+  # D_ℓ(k) and solves a 1D knapsack to allocate the global merge target
+  # across layers; the marginal damage at the DP optimum is then
+  # published into `merge_cost_prior` so GRAPE's selection becomes
+  # `argmin R[li] · prior[li]` instead of `argmin R[li]`. Anchored to
+  # R4 (Additivity arxiv:2308.10438) and R8 (HC-SMoE arxiv:2410.08589
+  # Appendix B.1). Default OFF: with `enabled: false` Stage 1 is
+  # byte-identical to the historical GRAPE-only path. See
+  # tasks/SC_STAGE12_COMPREHENSIVE_PLAN.md §7 A1 (row S1_DP).
+  damage_curve_dp:
+    enabled: false
+
 stage2_reap_ream:
   experts_implementation: grouped_mm   # Hopper (H100/H200): grouped_mm is the
                                        # fastest kernel AND the only one that

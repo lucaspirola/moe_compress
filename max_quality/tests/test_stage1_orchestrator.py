@@ -118,9 +118,14 @@ def test_blacklist_seven_top_level_keys(tiny_model, tiny_config, tmp_path):
 
 def test_plugin_manifest_order():
     names = tuple(p.name for p in STAGE1_PLUGIN_MANIFEST)
+    # Plugin #8 (S1_DP — damage_curve_dp) sits between cka_distance
+    # (which produces D_matrices) and grape_merge (which optionally
+    # consumes merge_cost_prior). It is default-off so the GRAPE-only
+    # path is byte-identical to the historical behaviour.
     assert names == (
         "ma_detection", "three_way_and", "aimer", "sink_token",
-        "magnitude_topk", "ablation_filter", "cka_distance", "grape_merge",
+        "magnitude_topk", "ablation_filter", "cka_distance",
+        "damage_curve_dp", "grape_merge",
     )
 
 
