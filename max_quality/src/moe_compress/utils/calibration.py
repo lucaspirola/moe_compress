@@ -1056,14 +1056,32 @@ def _make_subset_seed(base_seed: int, subset: str) -> int:
     return (base_seed + subset_offset) % (2**32)
 
 
-def _shuffled_stream(dataset_name: str, count: int, seed: int):
+def _shuffled_stream(
+    dataset_name: str, count: int, seed: int,
+    *, config: str | None = None, split: str = "train",
+):
     """Open a streaming HF dataset and return a shuffled iterator + circuit
-    limit. Caller iterates and breaks when `count` non-empty rows yielded."""
+    limit. Caller iterates and breaks when `count` non-empty rows yielded.
+
+    ``config`` and ``split`` are optional kwargs added for the
+    qwen3-pretrain-mix-v2 corpus, whose MoT-math/code/science subsets
+    require a non-default config and whose swe_smith subset requires
+    ``split="xml"``. Defaults preserve the v1 behavior (config=None →
+    ``load_dataset(name, split="train", streaming=True)``) so all
+    existing callsites are unaffected.
+    """
     from datasets import load_dataset
     try:
-        ds = load_dataset(dataset_name, split="train", streaming=True)
+        # load_dataset's positional signature is (path, name=None, ...). Passing
+        # ``name=None`` is equivalent to omitting it; keep both branches explicit
+        # for log-line clarity.
+        if config is None:
+            ds = load_dataset(dataset_name, split=split, streaming=True)
+        else:
+            ds = load_dataset(dataset_name, config, split=split, streaming=True)
     except Exception as err:                          # noqa: BLE001
-        log.error("load_dataset(%s) failed: %s", dataset_name, err)
+        log.error("load_dataset(%s, config=%r, split=%r) failed: %s",
+                  dataset_name, config, split, err)
         raise
     circuit_limit = _CIRCUIT_BREAKER_MULTIPLIER * count
     ds = ds.shuffle(

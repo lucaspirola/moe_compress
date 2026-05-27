@@ -24,6 +24,7 @@ from moe_compress.utils.calibration import (
     _QWEN3_MIX_V2_DATASET_SPLIT,
     _QWEN3_MIX_V2_POLICY,
     _QWEN3_MIX_V2_WEIGHTS,
+    _shuffled_stream,
     get_corpus_adapter,
 )
 
@@ -112,6 +113,54 @@ def test_v1_corpus_still_registered():
 # ---------------------------------------------------------------------------
 # F.5.4 — v1 vs v2 cache-key uniqueness
 # ---------------------------------------------------------------------------
+
+
+def test_shuffled_stream_forwards_config_and_split_kwargs(monkeypatch):
+    """The Step-2 widening of ``_shuffled_stream`` must pass ``config`` and
+    ``split`` through to ``load_dataset`` exactly, while preserving v1
+    behavior when both kwargs are omitted.
+
+    v1 callsite (no kwargs) → ``load_dataset(name, split="train", streaming=True)``.
+    v2 mot_* callsite (config="math", split="train") → ``load_dataset(name, "math", split="train", streaming=True)``.
+    v2 swe_smith callsite (config=None, split="xml") → ``load_dataset(name, split="xml", streaming=True)``.
+    """
+    captured: list[tuple[tuple, dict]] = []
+
+    class _StubDS:
+        def shuffle(self, *_args, **_kwargs):
+            return self
+
+    def _fake_load_dataset(*args, **kwargs):
+        captured.append((args, dict(kwargs)))
+        return _StubDS()
+
+    # Monkeypatch the symbol where _shuffled_stream looks it up — the lazy
+    # ``from datasets import load_dataset`` happens inside the function, so
+    # we patch the `datasets` module attribute.
+    import datasets as _datasets
+
+    monkeypatch.setattr(_datasets, "load_dataset", _fake_load_dataset)
+
+    # Case 1: v1-style (no kwargs).
+    _shuffled_stream("some/dataset", count=5, seed=0)
+    assert captured[-1][0] == ("some/dataset",)
+    assert captured[-1][1] == {"split": "train", "streaming": True}
+
+    # Case 2: v2 MoT-style (config + split=train).
+    _shuffled_stream(
+        "open-r1/Mixture-of-Thoughts", count=5, seed=0,
+        config="math", split="train",
+    )
+    assert captured[-1][0] == ("open-r1/Mixture-of-Thoughts", "math")
+    assert captured[-1][1] == {"split": "train", "streaming": True}
+
+    # Case 3: v2 SWE-smith-style (config=None, split="xml").
+    _shuffled_stream(
+        "SWE-bench/SWE-smith-trajectories", count=5, seed=0,
+        config=None, split="xml",
+    )
+    assert captured[-1][0] == ("SWE-bench/SWE-smith-trajectories",)
+    assert captured[-1][1] == {"split": "xml", "streaming": True}
 
 
 def test_cache_key_distinct_for_v1_v2():
