@@ -303,6 +303,19 @@ stage4_eora:
   eigenspace_rank_cap: 128        # hard cap per matrix (spec §7 Budget)
 
 stage5_router_kd:
+  rkd_recipe: "current"           # "current" = production Stage 2.5 / Stage 5
+                                  #             recipe (all existing plugins,
+                                  #             unchanged). Default.
+                                  # "paper"   = arxiv 2603.02217 Row P recipe:
+                                  #             τ=4, wd=0, epochs=2,
+                                  #             early_stop_patience=0,
+                                  #             calib=wikitext-103-raw.
+                                  #             Applied by
+                                  #             RkdPaperRecipePlugin
+                                  #             .apply_config_overrides()
+                                  #             before orchestrator.run()
+                                  #             captures config locals. See
+                                  #             router_kd/plugins/rkd_paper_recipe.py.
   optimizer: adamw
   learning_rate: 5.0e-5           # paper Table 1 (§F.3)
   experts_implementation: grouped_mm   # Hopper (H100/H200) — fastest kernel.

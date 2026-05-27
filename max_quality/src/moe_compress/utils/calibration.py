@@ -2306,3 +2306,104 @@ register_corpus(CorpusAdapter(
     parse_yaml=_parse_yaml_self_traces,
     stream_texts=_stream_texts_self_traces,
 ))
+
+
+# ---------------------------------------------------------------------------
+# wikitext-103-raw — Wikipedia paragraphs, raw (no chat template applied)
+# ---------------------------------------------------------------------------
+# Owner: Plugin #7 (router_kd/plugins/rkd_paper_recipe.py) — the paper-recipe
+# calibration source for the Row P A/B against current production (Row C).
+#
+# Source: ``Salesforce/wikitext`` HF dataset, config ``wikitext-103-raw-v1``.
+# Rationale: arXiv:2603.02217 §F.3 Table 1 (the source paper) trains Router-KD
+# on raw WikiText/c4-style text. We mirror that exactly for Row P so the
+# A/B isolates production-vs-paper recipe deltas (τ=4, wd=0, epochs=2,
+# early_stop_patience=0, raw-text calib) — see PLAN_PLUGIN_07_rkd_paper_recipe.md §3.
+#
+# Distinction from instruct sources (nvidia-cascade / tulu3 / qwen3-pretrain-mix):
+# wikitext rows are plain encyclopedic paragraphs, NOT OpenAI-style messages.
+# There is NO ``apply_chat_template`` / ``_render_messages`` call — rows are
+# consumed raw, then re-tokenized into fixed-length packed sequences by the
+# downstream ``build_calibration_tensor`` → ``_tokenize_to_fixed_length``
+# pipeline. This matches the fully-packed-invariant assumption of
+# ``vocab_kd._chunked_vocab_kl`` (no padding tokens; mask collapses to no-op).
+
+
+def _parse_yaml_wikitext_103_raw(
+    cal_cfg: dict, num_sequences: int, sequence_length: int, seed: int,
+) -> CalibrationSpec:
+    """Yaml → CalibrationSpec for the ``wikitext-103-raw`` source.
+
+    Only ``dataset`` is honoured (defaults to ``Salesforce/wikitext``, config
+    ``wikitext-103-raw-v1``). The dataset is a single config; no sub-weights.
+    """
+    dataset = str(cal_cfg.get("dataset", "Salesforce/wikitext")).strip()
+    return CalibrationSpec(
+        num_sequences=num_sequences,
+        sequence_length=sequence_length,
+        seed=seed,
+        source="wikitext-103-raw",
+        dataset=dataset,
+    )
+
+
+def _stream_texts_wikitext_103_raw(spec: CalibrationSpec, tokenizer) -> list[str]:
+    """Stream wikitext-103-raw rows; return raw text strings.
+
+    The ``tokenizer`` argument is accepted for signature uniformity with the
+    other adapters but is NOT used here — wikitext rows are raw text, never
+    rendered through a chat template (instruct-template wrapping would inject
+    spurious role-header tokens that wikitext data does not contain).
+
+    Empty rows are skipped — wikitext-103 uses blank lines as paragraph
+    separators and ``ds["text"]`` returns them as empty strings.
+    """
+    from datasets import load_dataset
+
+    log.info(
+        "Streaming %d wikitext-103-raw samples from %s (config=wikitext-103-raw-v1, seed=%d)",
+        spec.num_sequences, spec.dataset, spec.seed,
+    )
+    try:
+        ds = load_dataset(
+            spec.dataset, "wikitext-103-raw-v1", split="train", streaming=True,
+        )
+    except Exception as err:                          # noqa: BLE001
+        log.error("load_dataset(%s, wikitext-103-raw-v1) failed: %s",
+                  spec.dataset, err)
+        raise
+
+    circuit_limit = _CIRCUIT_BREAKER_MULTIPLIER * spec.num_sequences
+    ds = ds.shuffle(
+        seed=spec.seed,
+        buffer_size=min(max(10_000, circuit_limit), 200_000),
+    )
+
+    out: list[str] = []
+    rows_seen = 0
+    for row in ds:
+        rows_seen += 1
+        text = row.get("text", "")
+        if text and text.strip():
+            out.append(text)
+            if len(out) >= spec.num_sequences:
+                break
+        if rows_seen >= circuit_limit:
+            log.warning(
+                "_stream_texts_wikitext_103_raw: circuit-breaker fired after %d rows "
+                "examined for content (circuit_limit=%d); dataset may be smaller "
+                "than expected",
+                rows_seen, circuit_limit,
+            )
+            break
+    if len(out) < spec.num_sequences:
+        log.warning("wikitext-103-raw only produced %d/%d non-empty rows",
+                    len(out), spec.num_sequences)
+    return out
+
+
+register_corpus(CorpusAdapter(
+    name="wikitext-103-raw",
+    parse_yaml=_parse_yaml_wikitext_103_raw,
+    stream_texts=_stream_texts_wikitext_103_raw,
+))

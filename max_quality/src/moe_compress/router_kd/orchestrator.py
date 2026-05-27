@@ -111,6 +111,7 @@ from .plugins.vocab_kd import (
 from .plugins.teacher import TeacherCachePlugin, TeacherLivePlugin
 from .plugins.merge_repair import MergeRepairPlugin, _LayerOutputCapture
 from .plugins.early_stop import EarlyStopPlugin
+from .plugins.rkd_paper_recipe import RkdPaperRecipePlugin
 
 log = logging.getLogger(__name__)
 
@@ -169,6 +170,13 @@ def run(
     (``stage_key="stage5"``).  The config section read is always
     ``stage5_router_kd`` regardless of ``stage_key``.
     """
+    # Plugin #7 — RKD paper-recipe (Row P) config overrides. MUST run before
+    # any ``config[...]`` capture below (s5 / cal binds the live dicts). The
+    # method is a no-op when ``stage5_router_kd.rkd_recipe`` is anything other
+    # than ``"paper"``, so Row C runs are byte-identical to pre-plugin behavior.
+    # See router_kd/plugins/rkd_paper_recipe.py for the 4 deltas + contract.
+    RkdPaperRecipePlugin().apply_config_overrides(config)
+
     s5 = config["stage5_router_kd"]
     cal = config["calibration"]
 
