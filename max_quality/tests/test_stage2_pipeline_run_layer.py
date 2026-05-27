@@ -208,8 +208,8 @@ def test_phases_tuple_matches_t6_canonical_order():
         "pre_merge_snapshot",
         "merge",
         "post_merge",
-        "on_post_merge",
         "write_artifacts",
+        "on_post_merge",
         "on_layer_teardown",
     )
     # The derived back-compat 9-tuple = pre-assign + compute_assignment + post.
@@ -226,8 +226,8 @@ def test_phases_tuple_matches_t6_canonical_order():
         "pre_merge_snapshot",
         "merge",
         "post_merge",
-        "on_post_merge",
         "write_artifacts",
+        "on_post_merge",
         "on_layer_teardown",
     )
 
@@ -716,12 +716,15 @@ class _PostMergeProbePlugin:
         self.calls.append("on_layer_teardown")
 
 
-def test_on_post_merge_fires_after_post_merge_before_write_artifacts(tmp_path):
-    """on_post_merge fires in the correct position within _STAGE2_POST_ASSIGN_PHASES.
+def test_on_post_merge_fires_after_write_artifacts_before_teardown(tmp_path):
+    """on_post_merge fires at Position B within _STAGE2_POST_ASSIGN_PHASES.
 
     Asserts strict ordering:
-      merge → post_merge → on_post_merge → write_artifacts → on_layer_teardown.
-    Per SC_STAGE12 §582.
+      merge → post_merge → write_artifacts → on_post_merge → on_layer_teardown.
+
+    Position B (rather than original Position A) chosen because write_artifacts
+    reads ream_acc._lock — invalidating ream_acc BEFORE write_artifacts caused
+    AttributeError. Per Plugin #10 review.
     """
     plugin = _PostMergeProbePlugin()
     run_ctx = _make_run_ctx(
@@ -736,12 +739,12 @@ def test_on_post_merge_fires_after_post_merge_before_write_artifacts(tmp_path):
         "pre_merge_snapshot",
         "merge",
         "post_merge",
-        "on_post_merge",
         "write_artifacts",
+        "on_post_merge",
         "on_layer_teardown",
     ]
     assert "on_post_merge" in _STAGE2_POST_ASSIGN_PHASES
-    post_idx = _STAGE2_POST_ASSIGN_PHASES.index("post_merge")
-    opm_idx = _STAGE2_POST_ASSIGN_PHASES.index("on_post_merge")
     wa_idx = _STAGE2_POST_ASSIGN_PHASES.index("write_artifacts")
-    assert post_idx < opm_idx < wa_idx
+    opm_idx = _STAGE2_POST_ASSIGN_PHASES.index("on_post_merge")
+    teardown_idx = _STAGE2_POST_ASSIGN_PHASES.index("on_layer_teardown")
+    assert wa_idx < opm_idx < teardown_idx

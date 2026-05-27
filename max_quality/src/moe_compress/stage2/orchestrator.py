@@ -190,6 +190,11 @@ log = logging.getLogger(__name__)
 #                   clears cov_acc, ream_acc, layer_input_acc so the next layer's
 #                   on_layer_setup → on_profile sees fresh state).
 #                   Per SC_STAGE12 §582.
+#
+# Position B (after write_artifacts, before on_layer_teardown): chosen because
+# write_artifacts reads ream_acc._lock (via _snapshot_neuron_means_layer).
+# An earlier "Position A" choice (between post_merge and write_artifacts)
+# caused AttributeError when sequential_reprofile=True. Per Plugin #10 review.
 _STAGE2_PRE_ASSIGN_PHASES: tuple[str, ...] = (
     "on_layer_setup",
     "on_profile",
@@ -199,8 +204,11 @@ _STAGE2_POST_ASSIGN_PHASES: tuple[str, ...] = (
     "pre_merge_snapshot",
     "merge",
     "post_merge",
-    "on_post_merge",   # SC_STAGE12 §582 — inter-layer cache invalidation
     "write_artifacts",
+    "on_post_merge",   # SC_STAGE12 §582 — inter-layer cache invalidation.
+                       # Position B (after write_artifacts): write_artifacts
+                       # reads ream_acc._lock, so invalidation MUST run after.
+                       # See Plugin #10 review (cov_acc clarification).
     "on_layer_teardown",
 )
 # Derived back-compat constant: the full 10-phase schedule with the compound

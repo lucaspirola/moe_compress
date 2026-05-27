@@ -89,8 +89,8 @@ def test_pipeline_phases_are_declared_in_canonical_order():
         "pre_merge_snapshot",
         "merge",
         "post_merge",
-        "on_post_merge",
         "write_artifacts",
+        "on_post_merge",
         "on_layer_teardown",
     )
 
