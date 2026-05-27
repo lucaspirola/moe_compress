@@ -282,6 +282,240 @@ def _iter_prompts_from_qwen3_pretrain_mix(
             break
 
 
+def _iter_prompts_from_qwen3_pretrain_mix_v2(
+    num_prompts: int, seed: int,
+    prev_num_prompts: int | None = None,
+) -> Iterator[tuple[str, str, str | None, str]]:
+    """Yield 4-tuples ``(prompt, domain, canonical_completion, policy)``
+    drawn from the qwen3-pretrain-mix-v2 12-subset hybrid mix.
+
+    Tuple shape contract (each yielded entry):
+      * ``prompt`` (str) — the user turn to feed the teacher.
+      * ``domain`` (str) — subset key (one of the 12 v2 subsets).
+      * ``canonical_completion`` (str | None) — for TEACHER_FORCED rows
+        this is the assistant content the build script will write
+        directly to the JSONL without invoking ``model.generate``. For
+        GENERATE rows it is ``None`` (the teacher generates fresh
+        thinking-mode output).
+      * ``policy`` (str) — ``"GENERATE"`` or ``"TEACHER_FORCED"``;
+        sourced verbatim from ``_QWEN3_MIX_V2_POLICY``.
+
+    Mirrors the v1 iterator's structure but emits a wider tuple. v1
+    callsites continue to use ``_iter_prompts_from_qwen3_pretrain_mix``
+    (2-tuples) unchanged.
+
+    ``prev_num_prompts`` semantics match v1: each per-subset stream
+    skips the first ``int(prev_num_prompts * weight)`` rows so the
+    yielded prompts are exactly the NEW slice an
+    iter(num_prompts) larger-pull would produce after an earlier
+    iter(prev_num_prompts) call.
+    """
+    # Import via the canonical package path; the script is also run
+    # as a flat module by build_self_traces_calib_vllm (which sys.path-
+    # inserts the scripts dir), so we tolerate both import styles.
+    from moe_compress.utils.calibration import (  # type: ignore
+        _QWEN3_MIX_V2_DATASET,
+        _QWEN3_MIX_V2_DATASET_CONFIG,
+        _QWEN3_MIX_V2_DATASET_SPLIT,
+        _QWEN3_MIX_V2_POLICY,
+        _QWEN3_MIX_V2_WEIGHTS,
+        _extract_glaive_first_user,
+        _make_subset_seed,
+        _shuffled_stream,
+    )
+
+    per_subset = {
+        subset: max(1, int(num_prompts * weight))
+        for subset, weight in _QWEN3_MIX_V2_WEIGHTS.items()
+    }
+    prev_per_subset: dict[str, int] = {}
+    if prev_num_prompts is not None and prev_num_prompts > 0:
+        prev_per_subset = {
+            subset: max(1, int(prev_num_prompts * weight))
+            for subset, weight in _QWEN3_MIX_V2_WEIGHTS.items()
+        }
+        no_growth = [
+            s for s in per_subset
+            if prev_per_subset.get(s, 0) >= per_subset[s]
+        ]
+        if no_growth:
+            log.warning(
+                "prev_num_prompts=%d gives per-subset counts >= num_prompts=%d "
+                "counts for subsets %s — those subsets will yield zero new "
+                "prompts. Did you mean a larger --num-prompts?",
+                prev_num_prompts, num_prompts, no_growth,
+            )
+    # Diversity-floor warning — mirrors v1 semantics: compare TOTAL
+    # ``num_prompts`` against (2 * num_subsets / min_weight) and warn
+    # when below. This is NOT a per-subset count check; that semantic
+    # change is out of scope for v2 (see plan §F.5.8/F.5.9).
+    try:
+        min_w = min(_QWEN3_MIX_V2_WEIGHTS.values())
+        threshold = int(2 * len(_QWEN3_MIX_V2_WEIGHTS) / min_w) if min_w > 0 else 0
+        if num_prompts < threshold:
+            log.warning(
+                "num_prompts=%d is below the diversity threshold (~%d) for "
+                "qwen3-pretrain-mix-v2's %d subsets (min weight=%.2f). "
+                "Smallest domains may be under-represented or dropped by "
+                "iteration-order short-circuit. Raise --num-prompts for "
+                "production runs.",
+                num_prompts, threshold, len(_QWEN3_MIX_V2_WEIGHTS), min_w,
+            )
+    except Exception:  # noqa: BLE001 — diagnostic only
+        pass
+
+    total_yielded = 0
+    for subset, count in per_subset.items():
+        ds_name = _QWEN3_MIX_V2_DATASET[subset]
+        config = _QWEN3_MIX_V2_DATASET_CONFIG[subset]
+        split = _QWEN3_MIX_V2_DATASET_SPLIT[subset]
+        policy = _QWEN3_MIX_V2_POLICY[subset]
+        s = _make_subset_seed(seed, subset)
+        prev_count = prev_per_subset.get(subset, 0)
+        if prev_count >= count:
+            log.info(
+                "prompts-v2: %s — prev_count=%d >= count=%d; SKIPPING entire subset",
+                subset, prev_count, count,
+            )
+            continue
+        log.info(
+            "prompts-v2: %s — pulling %d from %s (config=%r, split=%r, "
+            "policy=%s, seed=%d)%s",
+            subset, count, ds_name, config, split, policy, s,
+            f" [skipping first {prev_count}, yielding {count - prev_count} new]"
+            if prev_count else "",
+        )
+        try:
+            ds, _ = _shuffled_stream(
+                ds_name, count, s, config=config, split=split,
+            )
+        except Exception as err:  # noqa: BLE001
+            log.error("prompts-v2: %s failed (%s) — skipping", subset, err)
+            continue
+        n = 0
+        emitted = 0
+        for row in ds:
+            _payload: tuple[str, str, str | None, str] | None = None
+            try:
+                if subset == "tulu3":
+                    msgs = row.get("messages") or []
+                    user = next(
+                        (m.get("content") for m in msgs if m.get("role") == "user"),
+                        None,
+                    )
+                    if isinstance(user, str) and user.strip():
+                        _payload = (user.strip(), subset, None, policy)
+                elif subset == "fineweb":
+                    text = (row.get("text") or "").strip()
+                    if text:
+                        _payload = (
+                            f"Read the following passage and explain its key ideas:\n\n{text[:2000]}",
+                            subset, None, policy,
+                        )
+                elif subset == "math":
+                    problem = (row.get("problem") or "").strip()
+                    if problem:
+                        _payload = (problem, subset, None, policy)
+                elif subset == "qa":
+                    instr = (row.get("instruction") or "").strip()
+                    ctx = (row.get("context") or "").strip()
+                    if instr:
+                        _payload = (
+                            instr + (("\n\n" + ctx) if ctx else ""),
+                            subset, None, policy,
+                        )
+                elif subset == "creative":
+                    prompt = (row.get("prompt") or "").strip()
+                    if prompt:
+                        _payload = (prompt, subset, None, policy)
+                elif subset == "multilingual":
+                    inputs = (row.get("inputs") or "").strip()
+                    if inputs:
+                        _payload = (inputs, subset, None, policy)
+                elif subset == "papers":
+                    title = (row.get("title") or "").strip()
+                    if title:
+                        _payload = (
+                            f"Write the abstract for an academic paper titled:\n\n{title}",
+                            subset, None, policy,
+                        )
+                elif subset in ("mot_math", "mot_code", "mot_science"):
+                    # open-r1/Mixture-of-Thoughts — native list-of-dicts in
+                    # messages with R1 <think>...</think> traces.
+                    msgs = row.get("messages") or []
+                    if (
+                        len(msgs) >= 2
+                        and msgs[0].get("role") == "user"
+                        and msgs[1].get("role") == "assistant"
+                    ):
+                        user_text = (msgs[0].get("content") or "").strip()
+                        canonical = (msgs[1].get("content") or "").strip()
+                        if user_text and canonical:
+                            _payload = (user_text, subset, canonical, policy)
+                elif subset == "swe_smith":
+                    raw = row.get("messages")
+                    if isinstance(raw, str):
+                        try:
+                            parsed = json.loads(raw)
+                        except (json.JSONDecodeError, TypeError):
+                            parsed = None
+                        if isinstance(parsed, list):
+                            user_text = None
+                            canonical = None
+                            seen_user = False
+                            for msg in parsed:
+                                if not isinstance(msg, dict):
+                                    continue
+                                role = msg.get("role")
+                                content = msg.get("content")
+                                if not isinstance(content, str):
+                                    continue
+                                if role == "user" and user_text is None:
+                                    user_text = content
+                                    seen_user = True
+                                elif (role == "assistant" and seen_user
+                                        and canonical is None):
+                                    canonical = content
+                                    break
+                            if user_text and canonical:
+                                _payload = (
+                                    user_text, subset, canonical, policy,
+                                )
+                elif subset == "function_calling":
+                    system_raw = row.get("system") or ""
+                    chat_raw = row.get("chat") or ""
+                    if (isinstance(system_raw, str)
+                            and isinstance(chat_raw, str)):
+                        system_text = system_raw.strip()
+                        if system_text.startswith("SYSTEM:"):
+                            system_text = system_text[len("SYSTEM:"):].strip()
+                        user_text = _extract_glaive_first_user(chat_raw)
+                        if user_text:
+                            combined = (
+                                f"{system_text}\n\n{user_text}"
+                                if system_text else user_text
+                            )
+                            _payload = (combined, subset, None, policy)
+            except Exception:  # noqa: BLE001 — per-row tolerance; one bad row shouldn't tank the subset.
+                _payload = None
+
+            if _payload is not None:
+                if n >= prev_count:
+                    yield _payload
+                    emitted += 1
+                n += 1
+
+            if n >= count:
+                break
+        log.info(
+            "prompts-v2: %s — emitted %d (saw %d valid rows, skipped %d)",
+            subset, emitted, n, prev_count,
+        )
+        total_yielded += emitted
+        if total_yielded >= max(1, num_prompts - sum(prev_per_subset.values())):
+            break
+
+
 def _iter_prompts_from_jsonl(path: Path) -> Iterator[tuple[str, str]]:
     """Yield ``(prompt, domain)`` pairs from a JSONL file. Each row must
     carry ``{"prompt": "...", "domain": "..."}`` (or aliases ``user`` /

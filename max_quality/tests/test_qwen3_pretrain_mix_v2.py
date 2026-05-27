@@ -356,6 +356,329 @@ def test_stream_glaive_function_calling_combines_system_and_user(monkeypatch):
     assert "dropped" not in rendered
 
 
+# ---------------------------------------------------------------------------
+# Step 4 — HF build-script iterator F.5.5/6/7/8/9
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def _build_self_traces_calib():
+    """Import the build script as a flat module (its __main__ block does the
+    same trick from the vLLM sibling). Module-scoped to amortize the cost
+    across the parametric F.5.5 test."""
+    import importlib
+    import sys
+    from pathlib import Path as _Path
+
+    scripts_dir = _Path(__file__).resolve().parents[1] / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    return importlib.import_module("build_self_traces_calib")
+
+
+# Per-subset fixture rows matching the verified Section B schemas. One row
+# per subset is enough — the iterator's per-subset target count is at least
+# 1, so a single hit suffices to verify the 4-tuple shape + payload.
+_SUBSET_FIXTURE_ROWS: dict[str, dict] = {
+    "tulu3": {
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hi back"},
+        ],
+    },
+    "math": {
+        "problem": "What is 2 + 2?",
+        "generated_solution": "4",
+    },
+    "qa": {
+        "instruction": "Name the largest planet.",
+        "context": "",
+        "response": "Jupiter.",
+    },
+    "creative": {
+        "prompt": "Write a story about a fox.",
+        "story": "Once upon a time...",
+    },
+    "multilingual": {
+        "inputs": "Hola, ¿cómo estás?",
+        "targets": "Estoy bien, gracias.",
+    },
+    "fineweb": {
+        "text": "Photosynthesis converts sunlight into chemical energy.",
+    },
+    "papers": {
+        "title": "On the convergence of stochastic gradient descent",
+        "abstract": "We show that SGD converges in expectation...",
+    },
+    "mot_math": {
+        "messages": [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "<think>two plus two</think>4"},
+        ],
+        "num_tokens": 100,
+        "source": "test",
+    },
+    "mot_code": {
+        "messages": [
+            {"role": "user", "content": "Write FizzBuzz."},
+            {"role": "assistant",
+             "content": "<think>standard pattern</think>def fizzbuzz(n): ..."},
+        ],
+        "num_tokens": 100,
+        "source": "test",
+    },
+    "mot_science": {
+        "messages": [
+            {"role": "user", "content": "Explain photosynthesis."},
+            {"role": "assistant",
+             "content": "<think>light + CO2 + H2O</think>It is the process..."},
+        ],
+        "num_tokens": 100,
+        "source": "test",
+    },
+    "swe_smith": {
+        "messages": _json.dumps([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "<uploaded>fake</uploaded>Fix X"},
+            {"role": "assistant",
+             "content": "<function=bash><parameter=command>ls</parameter></function>"},
+        ]),
+        "instance_id": "x",
+        "resolved": True,
+        "model": "claude",
+        "traj_id": "y",
+        "patch": "",
+    },
+    "function_calling": {
+        "system": (
+            "SYSTEM: You are helpful. Use {\"name\": \"get_weather\"}."
+        ),
+        "chat": (
+            "USER: What's the weather in Paris? <|endoftext|> "
+            "ASSISTANT: <functioncall>{...} <|endoftext|>"
+        ),
+    },
+}
+
+
+@pytest.mark.parametrize("subset", sorted(_EXPECTED_SUBSETS))
+def test_iter_prompts_v2_returns_4tuples(
+    subset, monkeypatch, _build_self_traces_calib,
+):
+    """F.5.5 — for each of the 12 subsets, the iterator yields a 4-tuple
+    with the expected shape: prompt is non-empty str, domain matches the
+    subset key, canonical_completion is None iff policy=GENERATE, policy
+    matches the sole-truth dict.
+
+    Single-row fixture per subset (matches Section B schemas).
+    Monkeypatches ``_shuffled_stream`` on the calibration module — the
+    build-script iterator imports that symbol at call time, so the patch
+    on the calibration module takes effect when the iterator dispatches.
+    """
+    fixture_row = _SUBSET_FIXTURE_ROWS[subset]
+
+    def _fake_shuffled_stream(name, count, seed, *, config=None, split="train"):
+        # Only the asked-for subset's fixture must yield; every other
+        # subset gets an empty iter so the iterator emits ONLY this
+        # subset's row.
+        if _QWEN3_MIX_V2_DATASET[subset] == name:
+            return iter([fixture_row]), 10_000
+        return iter([]), 10_000
+
+    monkeypatch.setattr(_calib, "_shuffled_stream", _fake_shuffled_stream)
+
+    iterator = _build_self_traces_calib._iter_prompts_from_qwen3_pretrain_mix_v2(
+        num_prompts=8000, seed=1337,
+    )
+    yielded = list(iterator)
+    # Find the tuple(s) for this subset (others are empty by design).
+    matching = [t for t in yielded if t[1] == subset]
+    assert matching, (
+        f"subset {subset!r}: iterator yielded no tuples for fixture row "
+        f"(yielded {len(yielded)} other-subset tuples)"
+    )
+    tup = matching[0]
+    assert len(tup) == 4, f"subset {subset!r}: tuple shape {tup!r}"
+    prompt, domain, canonical, policy = tup
+    assert isinstance(prompt, str) and prompt.strip(), (
+        f"subset {subset!r}: prompt is empty"
+    )
+    assert domain == subset
+    assert policy == _QWEN3_MIX_V2_POLICY[subset]
+    if policy == "GENERATE":
+        assert canonical is None, (
+            f"subset {subset!r}: GENERATE row carried canonical {canonical!r}"
+        )
+    else:
+        assert isinstance(canonical, str) and canonical.strip(), (
+            f"subset {subset!r}: TEACHER_FORCED row missing canonical"
+        )
+
+
+def test_iter_prompts_v2_swe_smith_drops_subsequent_turns(
+    monkeypatch, _build_self_traces_calib,
+):
+    """F.5.6 — multi-turn SWE-smith row: keep only first (user, asst1);
+    drop system, tool, asst2."""
+    raw_messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "first user turn"},
+        {"role": "assistant", "content": "first assistant turn with <function=...>"},
+        {"role": "tool", "content": "tool out"},
+        {"role": "user", "content": "should-be-dropped second user"},
+        {"role": "assistant", "content": "should-be-dropped second assistant"},
+    ]
+    row = {
+        "messages": _json.dumps(raw_messages),
+        "instance_id": "x",
+        "resolved": True,
+        "model": "claude",
+        "traj_id": "y",
+        "patch": "",
+    }
+
+    def _fake(name, count, seed, *, config=None, split="train"):
+        if name == _QWEN3_MIX_V2_DATASET["swe_smith"]:
+            return iter([row]), 10_000
+        return iter([]), 10_000
+
+    monkeypatch.setattr(_calib, "_shuffled_stream", _fake)
+
+    tuples = list(
+        _build_self_traces_calib._iter_prompts_from_qwen3_pretrain_mix_v2(
+            num_prompts=8000, seed=1337,
+        )
+    )
+    swe = [t for t in tuples if t[1] == "swe_smith"]
+    assert len(swe) >= 1
+    prompt, _domain, canonical, policy = swe[0]
+    assert prompt == "first user turn"
+    assert canonical == "first assistant turn with <function=...>"
+    assert policy == "TEACHER_FORCED"
+    # No second-turn leakage in either field.
+    assert "should-be-dropped" not in prompt
+    assert "should-be-dropped" not in (canonical or "")
+
+
+def test_iter_prompts_v2_glaive_extracts_first_user(
+    monkeypatch, _build_self_traces_calib,
+):
+    """F.5.7 — Glaive: extracted prompt contains the system schema +
+    first USER turn; second USER turn is dropped."""
+    row = {
+        "system": "SYSTEM: You are helpful. {\"name\": \"f\"}",
+        "chat": (
+            "USER: pick a function  "
+            "ASSISTANT: <functioncall> {...} <|endoftext|>  "
+            "FUNCTION RESPONSE: ok  "
+            "ASSISTANT: done <|endoftext|>  "
+            "USER: ignored-second-user"
+        ),
+    }
+
+    def _fake(name, count, seed, *, config=None, split="train"):
+        if name == _QWEN3_MIX_V2_DATASET["function_calling"]:
+            return iter([row]), 10_000
+        return iter([]), 10_000
+
+    monkeypatch.setattr(_calib, "_shuffled_stream", _fake)
+
+    tuples = list(
+        _build_self_traces_calib._iter_prompts_from_qwen3_pretrain_mix_v2(
+            num_prompts=8000, seed=1337,
+        )
+    )
+    fc = [t for t in tuples if t[1] == "function_calling"]
+    assert len(fc) >= 1
+    prompt, _domain, canonical, policy = fc[0]
+    assert "pick a function" in prompt
+    assert "{\"name\": \"f\"}" in prompt   # system schema preserved
+    assert "ignored-second-user" not in prompt
+    assert canonical is None
+    assert policy == "GENERATE"
+
+
+def _diversity_warnings(records):
+    """Collector for diversity-threshold warnings — kept as a helper so the
+    F.5.8 / F.5.9 tests share the substring contract verbatim."""
+    return [
+        rec for rec in records
+        if "diversity threshold" in rec.getMessage()
+    ]
+
+
+@pytest.fixture
+def _attach_caplog_to_build_script_logger(caplog, _build_self_traces_calib):
+    """Attach the caplog handler directly to the build script's logger.
+
+    The ROS-on-system ``launch-testing-ros`` plugin overrides
+    ``logging.getLogger`` with a ``LaunchLogger`` that pins
+    ``propagate=False`` — so records emitted via that logger never reach
+    the root logger where caplog's handler is mounted. We attach caplog's
+    handler to the build-script's logger directly for the duration of
+    the test, then restore on teardown.
+    """
+    bs_logger = _build_self_traces_calib.log
+    bs_logger.setLevel("WARNING")
+    bs_logger.addHandler(caplog.handler)
+    yield caplog
+    bs_logger.removeHandler(caplog.handler)
+
+
+def test_iter_prompts_v2_diversity_floor_no_warning_at_8000(
+    monkeypatch, _build_self_traces_calib,
+    _attach_caplog_to_build_script_logger,
+):
+    """F.5.8 — at num_prompts=8000 (far above 2*12/0.05 = 480), the
+    diversity-threshold warning must NOT fire."""
+    caplog = _attach_caplog_to_build_script_logger
+
+    def _fake(name, count, seed, *, config=None, split="train"):
+        return iter([]), 10_000
+
+    monkeypatch.setattr(_calib, "_shuffled_stream", _fake)
+
+    # Exhaust the iterator so subset-skip logging fires (the diversity
+    # check happens BEFORE the iteration loop regardless).
+    list(
+        _build_self_traces_calib._iter_prompts_from_qwen3_pretrain_mix_v2(
+            num_prompts=8000, seed=1337,
+        )
+    )
+
+    matched = _diversity_warnings(caplog.records)
+    assert not matched, (
+        f"unexpected diversity-threshold warning at num_prompts=8000: "
+        f"{[r.getMessage() for r in matched]}"
+    )
+
+
+def test_iter_prompts_v2_diversity_floor_warns_at_low_num_prompts(
+    monkeypatch, _build_self_traces_calib,
+    _attach_caplog_to_build_script_logger,
+):
+    """F.5.9 — at num_prompts=300 (< threshold 480), the warning fires
+    exactly once."""
+    caplog = _attach_caplog_to_build_script_logger
+
+    def _fake(name, count, seed, *, config=None, split="train"):
+        return iter([]), 10_000
+
+    monkeypatch.setattr(_calib, "_shuffled_stream", _fake)
+
+    list(
+        _build_self_traces_calib._iter_prompts_from_qwen3_pretrain_mix_v2(
+            num_prompts=300, seed=1337,
+        )
+    )
+
+    matched = _diversity_warnings(caplog.records)
+    assert len(matched) == 1, (
+        f"expected exactly one diversity-threshold warning, got "
+        f"{len(matched)}: {[r.getMessage() for r in matched]}"
+    )
+
+
 def test_cache_key_distinct_for_v1_v2():
     """CalibrationSpec.cache_key folds ``source`` into the payload; v1 and
     v2 specs that differ only in ``source`` must produce different keys.
