@@ -70,6 +70,7 @@ JSONL where each row is::
       "domain": "<source-subset tag>",
       "_complete": true | false,
       "_attempt_idx": <int>,
+      "completion_source": "teacher_generated" | "canonical",
     }
 
 ``_complete`` is true iff the decoded assistant message contains ``</think>``
@@ -79,6 +80,16 @@ filters out ``_complete=false`` rows by default — they're kept on disk for
 debugging but never participate in calibration. ``_attempt_idx`` is the
 deterministic 0-based position in the gathered prompt list and exists for
 crash-recovery / audit; it has no semantic role in calibration.
+
+``completion_source`` (schema v7+) records whether the assistant content
+came from ``model.generate`` (``"teacher_generated"`` — the normal v1 and
+v2-GENERATE path) or directly from the source dataset's canonical
+assistant turn (``"canonical"`` — the v2 TEACHER_FORCED path used by
+mot_math / mot_code / mot_science / swe_smith). The downstream
+calibration loader is policy-agnostic — it renders+forwards whatever
+assistant string the row carries — but ``completion_source`` is useful
+at analysis time to separate teacher-generated from canonical
+supervision.
 
 The downstream loader renders kept rows through
 ``_render_messages(..., enable_thinking=True)`` so the Qwen3-thinking
@@ -587,11 +598,15 @@ def _trace_cache_key(
         # in the attention kernel). Two runs with the same prompts but
         # different attn impls are NOT interchangeable for cache purposes.
         "attn_impl": str(attn_impl),
-        # schema_version=6: attn_impl folded into the cache_key. schema=5
-        # runs were eager-only by construction (the script hardcoded
-        # eager); bumping forces the new SDPA/FA2 path to a clean output
-        # filename that won't collide with any partial eager .tmp on disk.
-        "schema_version": 6,
+        # schema_version=7: every JSONL row carries the new
+        # ``completion_source`` field (``"teacher_generated"`` for rows
+        # produced by model.generate, ``"canonical"`` for TEACHER_FORCED
+        # rows synthesized from the v2 mix's canonical assistant turns).
+        # Bumped 6→7 in Step 5 of CALIBRATION_MIX_V2_PLAN.md so v6 caches
+        # don't silently collide with the v7-schema output filename.
+        # schema_version=6 was the SDPA/FA2 cache_key fold; schema=5 was
+        # eager-only by construction.
+        "schema_version": 7,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -681,26 +696,68 @@ def _trim_at_first_eos(row_ids: Iterable[int], eos_ids: set[int]) -> list[int]:
 
 
 def _generate_traces(
-    model, tokenizer, prompts: list[tuple[str, str]], *,
+    model, tokenizer, prompts, *,
     batch_size: int, max_new_tokens: int,
     already_done: int = 0,
     save_logits: bool = False,
     logits_top_k: int = 50,
     logits_dir: Path | None = None,
 ) -> Iterator[dict]:
-    """Greedy-generate teacher traces; yield
-    ``{"messages": [...], "domain": "...", "_complete": bool, "_attempt_idx": int}`` rows. The ``domain`` field
-    propagates the source-subset tag from the prompt iterator so the
-    downstream self-traces loader can preserve the empirical domain mix
-    at every draw.
+    """Greedy-generate teacher traces and yield JSONL row dicts.
 
-    ``already_done`` is the number of rows the caller has already persisted
-    (e.g. from a prior --resume scan). It is added to the progress LOG ONLY
-    so the operator sees absolute progress across the full requested set,
-    not just this session's slice. It does NOT shift the loop indexing —
-    ``prompts`` is the post-resume slice the caller passes in.
+    Each yielded row has the shape::
+
+        {
+          "messages": [{"role": "user", "content": ...},
+                       {"role": "assistant", "content": ...}],
+          "domain": "<subset key>",
+          "_complete": bool,
+          "_attempt_idx": int,
+          "completion_source": "teacher_generated" | "canonical",
+        }
+
+    ``prompts`` is a list of tuples. Two shapes are supported:
+
+      * 2-tuples ``(prompt, domain)`` (v1 iterator output). Treated as
+        ``policy="GENERATE"`` with ``canonical=None``. Backward-compat
+        path; the legacy v1 build pipeline continues to call this way.
+      * 4-tuples ``(prompt, domain, canonical_or_None, policy)`` (v2
+        iterator output). For ``policy="TEACHER_FORCED"`` rows the
+        teacher's ``model.generate`` is SKIPPED — the row is emitted
+        directly from the canonical assistant content with
+        ``completion_source="canonical"`` and ``_complete=True``. The
+        teacher still gets a calibration FORWARD pass over the rendered
+        (prompt + canonical) tokens at downstream calibration consumption
+        time (Stage 2/2.5/3); only the autoregressive generation step is
+        skipped here.
+
+    GENERATE rows carry ``completion_source="teacher_generated"``.
+
+    ``already_done`` is the number of rows the caller has already
+    persisted (e.g. from a prior --resume scan). It is added to the
+    progress LOG ONLY so the operator sees absolute progress across the
+    full requested set, not just this session's slice. It does NOT
+    shift the loop indexing — ``prompts`` is the post-resume slice the
+    caller passes in.
     """
     import torch
+
+    def _unpack(entry):
+        """Normalize a prompt-list entry to (prompt, domain, canonical, policy).
+
+        2-tuple (v1) → (prompt, domain, None, "GENERATE").
+        4-tuple (v2) → entry unchanged.
+        Any other shape raises — we'd rather surface than guess.
+        """
+        if len(entry) == 4:
+            return entry
+        if len(entry) == 2:
+            prompt, domain = entry
+            return (prompt, domain, None, "GENERATE")
+        raise ValueError(
+            f"_generate_traces: unsupported prompt-tuple shape "
+            f"(len={len(entry)}, expected 2 or 4): {entry!r}"
+        )
 
     # Only fall back to eos as pad when the tokenizer truly lacks a pad
     # token (Qwen3 ships with a distinct <|endoftext|> pad; preserving it
@@ -744,14 +801,75 @@ def _generate_traces(
     domain_stats: dict[str, list[int]] = {}  # domain -> [complete, total]
     for i in range(0, total, batch_size):
         batch = prompts[i:i + batch_size]
-        batch_prompts = [p for p, _ in batch]
-        batch_domains = [d for _, d in batch]
+        # Normalize to 4-tuples (prompt, domain, canonical, policy) so the
+        # rest of the loop is shape-agnostic.
+        batch_unpacked = [_unpack(entry) for entry in batch]
         # 0-based attempt index for every prompt in this batch, computed
         # against the gathered prompt list. We add `already_done` so the
         # index is stable across --resume (prompts here are the post-resume
         # slice, but the JSONL row's _attempt_idx must reference the FULL
         # gather to make crash-recovery audit possible without re-tokenizing).
         batch_attempt_idx = [already_done + i + k for k in range(len(batch))]
+
+        # Partition by policy: GENERATE rows go through model.generate;
+        # TEACHER_FORCED rows skip the engine entirely and emit a JSONL
+        # row using the canonical assistant content directly.
+        gen_indices = [
+            k for k, (_, _, _, pol) in enumerate(batch_unpacked)
+            if pol != "TEACHER_FORCED"
+        ]
+        tf_indices = [
+            k for k, (_, _, _, pol) in enumerate(batch_unpacked)
+            if pol == "TEACHER_FORCED"
+        ]
+
+        # Emit TEACHER_FORCED rows first — they need no generation. We do
+        # this BEFORE the generate() call so a SIGINT during teacher
+        # generation doesn't lose the cheap TF rows for this batch.
+        for k in tf_indices:
+            prompt, domain, canonical, _policy = batch_unpacked[k]
+            attempt_idx = batch_attempt_idx[k]
+            if not canonical:
+                # Defensive: shouldn't happen (the v2 iterator validates
+                # canonical is non-empty for TF rows) but skip rather than
+                # emit an empty assistant turn.
+                continue
+            stats = domain_stats.setdefault(domain, [0, 0])
+            stats[0] += 1   # canonical rows are by construction complete
+            stats[1] += 1
+            yielded += 1
+            yield {
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": canonical},
+                ],
+                "domain": domain,
+                "_complete": True,
+                "_attempt_idx": int(attempt_idx),
+                "completion_source": "canonical",
+            }
+
+        if not gen_indices:
+            # No GENERATE rows in this batch — skip the teacher forward
+            # entirely. Progress log still fires below.
+            elapsed = time.monotonic() - t0
+            done = i + len(batch)
+            log_done = already_done + done
+            log_total = already_done + total
+            log_yielded = already_done + yielded
+            s_per_trace = elapsed / yielded if yielded > 0 else float("inf")
+            log.info(
+                "[%d/%d prompts processed, %d traces yielded] — "
+                "%.1fs session elapsed (%.1f s/trace session-avg, "
+                "%.1f s/prompt session-avg) [TF-only batch]",
+                log_done, log_total, log_yielded,
+                elapsed, s_per_trace, elapsed / max(done, 1),
+            )
+            continue
+
+        batch_prompts = [batch_unpacked[k][0] for k in gen_indices]
+        batch_domains = [batch_unpacked[k][1] for k in gen_indices]
+        batch_gen_attempt_idx = [batch_attempt_idx[k] for k in gen_indices]
         # Render each prompt with add_generation_prompt=True so the template
         # lands at the assistant cursor — the model's generation extends from
         # there with the <think> opener.
@@ -848,7 +966,7 @@ def _generate_traces(
         ]
         for b_idx, (prompt, domain, ans, saw_eos, attempt_idx) in enumerate(zip(
             batch_prompts, batch_domains, decoded, eos_emitted,
-            batch_attempt_idx,
+            batch_gen_attempt_idx,
         )):
             if not ans:
                 continue
@@ -909,10 +1027,11 @@ def _generate_traces(
                 "domain": domain,
                 "_complete": is_complete,
                 "_attempt_idx": int(attempt_idx),
+                "completion_source": "teacher_generated",
             }
 
         elapsed = time.monotonic() - t0
-        done = i + len(batch_prompts)
+        done = i + len(batch)
         # Report both throughput metrics — prompts/s for batch-pacing,
         # s/trace based on what actually landed in the JSONL. The bracketed
         # counters are absolute (lifetime) progress across resumed runs, but
@@ -1004,8 +1123,18 @@ def main() -> int:
                         "for lower VRAM. NOTE: changes teacher logits vs BF16 "
                         "and so produces a DIFFERENT output cache key.")
     p.add_argument("--prompts", default="qwen3-pretrain-mix",
-                   help="Prompt source: 'qwen3-pretrain-mix' or path to a "
+                   help="Prompt source: 'qwen3-pretrain-mix' (v1, 8 subsets, "
+                        "all GENERATE), 'qwen3-pretrain-mix-v2' (12 subsets, "
+                        "hybrid GENERATE + TEACHER_FORCED — see "
+                        "tasks/CALIBRATION_MIX_V2_PLAN.md), or path to a "
                         "JSONL with {'prompt': '...'} rows.")
+    p.add_argument("--prev-num-prompts", type=int, default=0,
+                   help="Per-subset extension mode (qwen3-pretrain-mix{,-v2} "
+                        "only): yield ONLY the prompts that an earlier "
+                        "--num-prompts=N run would NOT have yielded. Useful "
+                        "for incrementally growing a prior calibration set "
+                        "without re-running the existing slice. Set to 0 "
+                        "(default) for a fresh full pull.")
     p.add_argument("--num-prompts", type=int, default=5000)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--batch-size", type=int, default=8)
@@ -1110,13 +1239,30 @@ def main() -> int:
         )
         prompts_iter = _iter_prompts_from_qwen3_pretrain_mix(
             args.num_prompts, args.seed,
+            prev_num_prompts=(args.prev_num_prompts or None),
+        )
+    elif args.prompts == "qwen3-pretrain-mix-v2":
+        # Identical bootstrap to v1; the iterator yields wider 4-tuples
+        # but the tokenizer-load contract is unchanged.
+        from transformers import AutoTokenizer
+        bootstrap_tok = AutoTokenizer.from_pretrained(
+            args.teacher, revision=args.teacher_revision,
+        )
+        prompts_iter = _iter_prompts_from_qwen3_pretrain_mix_v2(
+            args.num_prompts, args.seed,
+            prev_num_prompts=(args.prev_num_prompts or None),
         )
     else:
+        if args.prev_num_prompts:
+            log.error("--prev-num-prompts only supported with --prompts=qwen3-pretrain-mix{,-v2}")
+            return 1
         prompts_iter = _iter_prompts_from_jsonl(Path(args.prompts))
 
-    prompts: list[tuple[str, str]] = []
+    # 2-tuple (v1 / JSONL) or 4-tuple (v2). _generate_traces unpacks
+    # either shape via the local _unpack helper.
+    prompts: list[tuple] = []
     for entry in prompts_iter:
-        prompts.append(entry)
+        prompts.append(tuple(entry))
         if len(prompts) >= args.num_prompts:
             break
     if not prompts:
@@ -1142,7 +1288,9 @@ def main() -> int:
     # Log empirical per-domain breakdown so the operator can verify the mix
     # before paying the teacher-forward bill.
     from collections import Counter
-    domain_counts = Counter(d for _, d in prompts)
+    # Domain is always the 2nd tuple element for both shapes (2-tuple and
+    # 4-tuple); explicit index keeps the breakdown shape-agnostic.
+    domain_counts = Counter(entry[1] for entry in prompts)
     total_p = len(prompts)
     log.info("gathered %d prompts; per-domain mix: %s", total_p, {
         d: f"{c} ({c / total_p:.1%})" for d, c in sorted(domain_counts.items())
