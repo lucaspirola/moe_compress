@@ -658,6 +658,20 @@ def run(
             "(spec § 5 step 4T(c)(iii) / D-asymmetric-freq)."
         )
 
+    # Plugin #9 / S2_MM (MergeMoE arXiv:2510.14436): merge_step switches the
+    # merge math between legacy freq-weighted (default; byte-identical) and
+    # the closed-form T₁=Q·P† least-squares solution. Validated at the top
+    # of run() — same fail-fast posture as ``cost_asymmetric`` above — so
+    # misconfigured pipelines surface the error before spending compute on
+    # calibration loading. The canonical resolved value is re-read further
+    # below where it is plumbed into ``LayerMergePlugin``.
+    _merge_step_check = str(s2.get("merge_step", "freq_weighted")).lower()
+    if _merge_step_check not in ("freq_weighted", "mergemoe"):
+        raise ValueError(
+            f"stage2_reap_ream.merge_step={_merge_step_check!r}; "
+            "expected 'freq_weighted' or 'mergemoe'."
+        )
+
     # Blackwell sm_100 workaround: transformers' default MoE forward uses
     # `torch.nn.functional.grouped_mm`, which deadlocks on B200 partway
     # through Stage 2 (reproduced as a 2-min main-thread hang then SIGSEGV
@@ -785,6 +799,33 @@ def run(
             partial_dir, moe_layers, heal_enabled=heal_cfg.enabled,
         )
 
+        # Plugin #9 / S2_MM (D-mergemoe-resume-fallback): when the configured
+        # ``merge_step`` is ``"mergemoe"`` but the run is being resumed from
+        # ``partial_dir``, the per-layer ``_LayerInputAccumulator`` calibration
+        # buffer is not on disk — so the lstsq T₁=Q·P† solve cannot run for the
+        # replayed layers. We force ``merge_step="freq_weighted"`` for the
+        # resume loop below (see kwarg on the ``_merge_experts_inplace`` call).
+        # The in-function fallback log.warning in ``merging.py`` never fires for
+        # these layers because the forced ``"freq_weighted"`` short-circuits the
+        # ``layer_inputs is None`` check. Emit the deviation warning HERE so the
+        # operator sees one log line per resumed run that surfaces the silent
+        # downgrade — and note that ``stage2/config/merge_step`` Trackio key
+        # still records the configured (not effective per-layer) value.
+        if (
+            str(s2.get("merge_step", "freq_weighted")).lower() == "mergemoe"
+            and resumed_records
+        ):
+            log.warning(
+                "Stage 2 resume: forcing merge_step=freq_weighted for %d "
+                "replayed layers (D-mergemoe-resume-fallback). The "
+                "_LayerInputAccumulator buffer is not persisted across resume, "
+                "so MergeMoE's lstsq solve cannot run on the replayed layers. "
+                "New layers (post-resume-point) will use the configured "
+                "merge_step. Trackio key stage2/config/merge_step still records "
+                "the configured value, not the effective per-layer choice.",
+                len(resumed_records),
+            )
+
         for record in resumed_records:
             ref = record.layer_ref
             # scores=None on the resume path: saliency scores are not
@@ -792,11 +833,26 @@ def run(
             # hit the new ValueError inside _merge_experts_inplace for the
             # first multi-member merge group — that is the correct surfacing
             # of the gap (rather than silently applying wrong weights).
+            #
+            # Plugin #9 / S2_MM (D-mergemoe-resume-fallback): the
+            # ``_LayerInputAccumulator`` calibration buffer is NOT persisted
+            # across runs, so a resumed MergeMoE run would silently fall back
+            # to freq-weighted per cluster (via the in-function warning) for
+            # every replayed layer. Force ``merge_step="freq_weighted"``
+            # explicitly here so the resume is deterministic and matches
+            # what the freq-weighted fallback path would have produced anyway
+            # — same posture as the saliency ``scores=None`` deviation above.
+            # MergeMoE-mode crashes therefore require ``--no-resume`` to be
+            # re-run with the original calibration buffer. The single
+            # log.warning above (gated on configured merge_step == "mergemoe"
+            # and non-empty resumed_records) surfaces this deviation once per
+            # resumed run rather than once per layer.
             _merge_experts_inplace(
                 ref, record.grouped, record.freq,
                 freq_weighted=s2["ream"]["frequency_weighted_merge"],
                 scores=None,
                 ream_acc=record.resume_ream_acc,
+                merge_step="freq_weighted",
             )
             # build_banks again: _merge_experts_inplace already called it
             # internally, but bank.select() was never called on any of those
@@ -878,6 +934,13 @@ def run(
             f"stage2_reap_ream.cost_alignment={cost_alignment_cfg!r}; "
             "expected 'pre', 'post', or 'output'."
         )
+    # Plugin #9 / S2_MM (MergeMoE arXiv:2510.14436): merge_step was already
+    # validated at the top of run() (alongside the cost_asymmetric / freq
+    # invariant). Re-read here as the canonical resolved value passed into
+    # LayerMergePlugin and emitted to Trackio below — no second raise to
+    # avoid duplicate error paths. See tasks/PLAN_PLUGIN_09_s2_mm.md and
+    # :mod:`stage2.mergemoe`.
+    merge_step: str = str(s2.get("merge_step", "freq_weighted")).lower()
     # Direction C — output-space cost calibration-token cap. Only consumed when
     # cost_alignment == "output"; bounds the per-pair SwiGLU residual compute.
     cost_output_token_cap: int = int(s2.get("cost_output_token_cap", 1024))
@@ -955,6 +1018,7 @@ def run(
         "stage2/config/expert_distill_token_cap": expert_distill_token_cap,
         "stage2/config/expert_distill_lr": expert_distill_lr,
         "stage2/config/sinkhorn_iters": sinkhorn_iters,
+        "stage2/config/merge_step": merge_step,
         "stage2/config/format_version": 2,
     })
 
@@ -1023,6 +1087,8 @@ def run(
         expert_distill_steps=expert_distill_steps,
         expert_distill_token_cap=expert_distill_token_cap,
         blacklist=blacklist, device=device,
+        # Plugin #9 / S2_MM — see PLAN_PLUGIN_09_s2_mm.md.
+        merge_step=merge_step,
     )
     # Registration order matters: ReapScoringPlugin.on_layer_setup must run
     # BEFORE LayerMergePlugin.on_profile (which reads ctx.reap_acc into

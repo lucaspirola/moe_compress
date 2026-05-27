@@ -386,6 +386,7 @@ class LayerMergePlugin:
         expert_distill_token_cap: int,
         blacklist: dict[int, list[int]],
         device,
+        merge_step: str = "freq_weighted",
     ) -> None:
         # Store every knob the SIX live hooks read off ``self`` PLUS the eight
         # attributes ``orchestrator._run_assignment`` reads off this plugin
@@ -418,6 +419,10 @@ class LayerMergePlugin:
         self.expert_distill_token_cap = expert_distill_token_cap
         self.blacklist = blacklist
         self.device = device
+        # Plugin #9 / S2_MM — config knob switching the merge math between
+        # legacy freq-weighted (default; byte-identical) and the MergeMoE
+        # closed-form T₁=Q·P† merge step. See PLAN_PLUGIN_09_s2_mm.md.
+        self.merge_step = merge_step
 
     # ------------------------------------------------------------------
     # Phase 1: on_layer_setup
@@ -445,11 +450,21 @@ class LayerMergePlugin:
         # be large enough for the larger consumer. The accumulator stays None
         # (no capture, no host-RAM cost) for every "pre"/"post" run — keeping
         # those paths byte-identical to main.
-        _need_layer_inputs = self.expert_distill_steps > 0 or self.cost_alignment_cfg == "output"
+        # Plugin #9 / S2_MM: merge_step="mergemoe" also requires the
+        # layer-input calibration buffer (for the T₁=Q·P† lstsq solve). The
+        # default merge_step="freq_weighted" keeps the boolean ``False``
+        # under runs with no distill and no output-space cost, so the legacy
+        # paths stay byte-identical.
+        _need_layer_inputs = (
+            self.expert_distill_steps > 0
+            or self.cost_alignment_cfg == "output"
+            or self.merge_step == "mergemoe"
+        )
         _layer_input_cap = (
             max(
                 self.expert_distill_token_cap if self.expert_distill_steps > 0 else 0,
                 self.cost_output_token_cap if self.cost_alignment_cfg == "output" else 0,
+                self.cost_output_token_cap if self.merge_step == "mergemoe" else 0,
             )
             if _need_layer_inputs
             else 0
@@ -517,6 +532,17 @@ class LayerMergePlugin:
         scores = ctx.get("scores")
         ream_acc = ctx.get("ream_acc")
         perm_cache = ctx.get("perm_cache")
+        # Plugin #9 / S2_MM: MergeMoE merge_step needs the layer-input
+        # calibration buffer. _LayerInputAccumulator is None on freq-weighted
+        # runs (the default), in which case .buffer is also None — the merge
+        # function falls back to freq-weighted on that signal with a WARNING.
+        # See merging.py:_merge_experts_inplace for the contract.
+        layer_input_acc = ctx.get("layer_input_acc")
+        layer_inputs = (
+            layer_input_acc.buffer
+            if layer_input_acc is not None
+            else None
+        )
 
         _merge_experts_inplace(
             layer_ref, grouped, freq,
@@ -524,6 +550,9 @@ class LayerMergePlugin:
             scores=scores,
             ream_acc=ream_acc,
             perm_cache=perm_cache,
+            merge_step=self.merge_step,
+            layer_inputs=layer_inputs,
+            token_cap=self.cost_output_token_cap,
         )
 
         ctx.set("distill_state", None)

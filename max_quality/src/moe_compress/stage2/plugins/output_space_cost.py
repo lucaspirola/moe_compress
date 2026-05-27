@@ -217,6 +217,10 @@ def _tentative_merged_weights(
     ream_acc: "ReamCostAccumulator | None",
     perm_cache: "_PermAlignCache | None",
     banks: dict[str, ExpertMatrixBank],
+    *,
+    merge_step: str = "freq_weighted",
+    layer_inputs: torch.Tensor | None = None,
+    token_cap: int = 1024,
 ) -> dict[str, torch.Tensor]:
     """Freq-weighted, permutation-aligned merge of ``child_id`` into
     ``centroid_id`` — the two-member case of ``_em_compute_tentative_weights``.
@@ -255,6 +259,22 @@ def _tentative_merged_weights(
     are Python float scalars and ``W_c``/``W_m`` are bf16 tensors stays bf16
     (PyTorch scalar-type rule: result dtype follows the tensor's dtype,
     Python float scalars do NOT promote bf16 → fp32).
+
+    MergeMoE branch (``merge_step="mergemoe"``)
+    -------------------------------------------
+    When ``merge_step="mergemoe"`` and ``layer_inputs`` is non-empty, the
+    merged ``down_proj`` is replaced by the MergeMoE closed-form least-squares
+    solution ``T₁ = Q · P†`` (paper arXiv:2510.14436 Eqs. 3–6 — see
+    :mod:`stage2.mergemoe`). Gate and up projections remain the freq-weighted
+    average (algebraically identical to MergeMoE T₂/T₃ per paper Eq. 4).
+
+    The default (``merge_step="freq_weighted"``) is byte-identical to legacy
+    behaviour. The only caller from this module (``_output_space_cost``) does
+    NOT opt into MergeMoE — the cost matrix continues to use the freq-weighted
+    tentative-merge proxy. The MergeMoE branch is exposed here so the
+    function signature is symmetric with ``_merge_experts_inplace`` (both
+    accept the same merge_step config knob); external callers that want to
+    evaluate MergeMoE-style merge damage as a cost proxy can opt in.
     """
     li = layer_ref.layer_idx
 
@@ -302,6 +322,33 @@ def _tentative_merged_weights(
             else:
                 W_m = W_m[perm_t, :]
             merged[name] = w_c * W_c + w_m * W_m
+
+        # MergeMoE override (opt-in; default-off branch). Replace ``down_proj``
+        # with the closed-form T₁=Q·P† solution; gate/up unchanged (paper
+        # T₂/T₃ collapse to the freq-weighted average per Eq. 4, so the
+        # already-computed freq-weighted gate/up tensors are correct as-is).
+        # ``layer_inputs`` empty → silent stay-on-freq-weighted (this is a
+        # cost-matrix tentative proxy, not the final merge; the actual merge
+        # at ``_merge_experts_inplace`` enforces the contract loudly).
+        if merge_step == "mergemoe" and layer_inputs is not None and layer_inputs.numel() > 0:
+            from ..mergemoe import _mergemoe_compute_merged_down
+            # Cast aligned member tensors to fp32 for the solve (matches the
+            # numerical posture of ``_merge_experts_inplace``).
+            gate_c_fp32 = banks["gate_proj"].get(centroid_id).to(torch.float32)
+            up_c_fp32   = banks["up_proj"].get(centroid_id).to(torch.float32)
+            down_c_fp32 = banks["down_proj"].get(centroid_id).to(torch.float32)
+            gate_m_fp32 = banks["gate_proj"].get(child_id).to(torch.float32)[perm_t, :]
+            up_m_fp32   = banks["up_proj"].get(child_id).to(torch.float32)[perm_t, :]
+            down_m_fp32 = banks["down_proj"].get(child_id).to(torch.float32)[:, perm_t]
+            merged["down_proj"] = _mergemoe_compute_merged_down(
+                member_gates=[gate_c_fp32, gate_m_fp32],
+                member_ups=[up_c_fp32, up_m_fp32],
+                member_downs=[down_c_fp32, down_m_fp32],
+                weights=[w_c, w_m],
+                layer_inputs=layer_inputs,
+                token_cap=token_cap,
+                seed=li,
+            )
     return merged
 
 
