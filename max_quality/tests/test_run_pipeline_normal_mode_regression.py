@@ -48,7 +48,7 @@ def normal_yaml(tmp_path):
             "expert_svd_ratio": 2.0,
         },
         "calibration": {
-            "source": "qwen3-pretrain-mix",
+            "source": "qwen3-pretrain-mix-v2",
             "seed": 1337,
             "num_sequences": 8,
             "sequence_length": 16,

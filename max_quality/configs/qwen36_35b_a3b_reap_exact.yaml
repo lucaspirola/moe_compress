@@ -41,30 +41,33 @@ target:
   expert_svd_ratio: 2.0
 
 calibration:
-  # Source: Qwen3 pretrain-distribution proxy mix. Four sources blended,
-  # ALL rendered through the model's chat template (Gemma 3 QAT rule):
-  #   tulu3 (25%):    allenai/tulu-3-sft-mixture           SFT / chat
-  #   fineweb (45%):  HuggingFaceFW/fineweb-edu            high-quality web
-  #   math (15%):     nvidia/OpenMathInstruct-2            math problems
-  #   code (15%):     nickrosh/Evol-Instruct-Code-80k-v1   code instructions
-  # (peS2o papers dropped: ships a .py script loader, not supported by
-  #  datasets>=4.5; 5% weight rolled into fineweb's edu-filtered content.)
+  # Source: qwen3-pretrain-mix-v2 — 12-subset reasoning-mode hybrid mix
+  # designed for Qwen3.6-thinking calibration. All rows rendered through
+  # the model's chat template (Gemma 3 QAT rule).
   #
-  # Why: empirically (2026-05-21) Tülu-3 (chat-format SFT only) gave us
-  # ~7% mean cross-domain MSE drop per heal layer — better than nvidia-
-  # cascade (~2%) but still far from closing the bpt_gap. Qwen3.6 was
-  # pretrained on web + code + STEM + papers + multilingual; calibrating
-  # on SFT-only never activates the pretrain-experts that hold web/code/
-  # math content, so heal targets miss those activation patterns. This
-  # mix injects pretrain-style content via chat-format wrappers so the
-  # pretrain-experts get exercised during calibration.
+  # GENERATE-policy (52%, teacher generates fresh thinking-mode response):
+  #   tulu3            11%  allenai/tulu-3-sft-mixture          general SFT
+  #   math              9%  nvidia/OpenMathInstruct-2           math problems
+  #   qa                5%  databricks/databricks-dolly-15k     instruct QA
+  #   creative          5%  euclaise/writingprompts             creative writing
+  #   multilingual      8%  CohereForAI/aya_dataset             65+ languages
+  #   fineweb           5%  HuggingFaceFW/fineweb-edu           high-quality web
+  #   papers            5%  gfissore/arxiv-abstracts-2021       academic
+  #   function_calling  8%  glaiveai/glaive-function-calling-v2 tool-use prompts
+  #
+  # TEACHER_FORCED policy (48%, canonical assistant turn used as-is):
+  #   mot_math    12%  open-r1/Mixture-of-Thoughts cfg=math    R1 <think> traces
+  #   mot_code    12%  open-r1/Mixture-of-Thoughts cfg=code    R1 <think> traces
+  #   mot_science  8%  open-r1/Mixture-of-Thoughts cfg=science R1 <think> traces
+  #   swe_smith   12%  SWE-bench/SWE-smith-trajectories split=xml  Claude tool-call
   #
   # Mix is hard-coded in calibration.py; dataset/subset_weights here are
-  # ignored. To experiment with a different mix, register a new adapter.
-  source: qwen3-pretrain-mix
+  # ignored. See tasks/CALIBRATION_MIX_V2_PLAN.md for the full design.
+  # To experiment with a different mix, register a new adapter.
+  source: qwen3-pretrain-mix-v2
   seed: 1337
   num_sequences: 4000
-  sequence_length: 2048
+  sequence_length: 4096
 
 # Stage 0 is removed — SE detection is now Phase B of Stage 1.
 

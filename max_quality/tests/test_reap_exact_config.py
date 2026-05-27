@@ -35,4 +35,8 @@ def test_reap_exact_preset_loads():
     assert cfg["stage2_reap_ream"]["cost_asymmetric"] is False
 
     # Calibration source preserved (project's, not paper's)
-    assert cfg["calibration"]["source"] == "qwen3-pretrain-mix"
+    assert cfg["calibration"]["source"] == "qwen3-pretrain-mix-v2"
+    # Sequence length bumped to 4096 in CALIBRATION_MIX_V2_PLAN.md
+    # Step 7 (the v2 mix's long reasoning + multi-turn rows benefit
+    # from the 2× window).
+    assert cfg["calibration"]["sequence_length"] == 4096
