@@ -1,8 +1,7 @@
-"""Tests for the calibration-v2 JSONL row schema v8 (Items 8+9).
+"""Tests for the calibration-v2 JSONL row schema (Items 8+9 → v9).
 
-Items 8+9 of the calibration-v2 writers campaign (see
-``max_quality/docs/calibration_v2_data_capture_plan.md``) bump the JSONL
-schema from v7 to v8 by adding a per-row metadata bundle:
+Schema v8 (Items 8+9 of the calibration-v2 writers campaign) added the
+per-row metadata bundle:
 
   * ``n_prompt_tokens`` — vLLM-tokenized prompt length.
   * ``n_gen_tokens`` — generated token count (pre-EOS-trim).
@@ -11,8 +10,15 @@ schema from v7 to v8 by adding a per-row metadata bundle:
   * ``subset`` — duplicate of ``domain`` under the plan-doc name.
   * ``seed_idx`` — duplicate of ``_attempt_idx`` under the plan-doc name.
 
+Schema v9 (CALIBRATION_MIX_V2_PLAN.md Step 6) adds a single field:
+
+  * ``completion_source`` — ``"teacher_generated"`` for rows produced by
+    vLLM generation; ``"canonical"`` for v2 TEACHER_FORCED rows synthesized
+    by ``_synth_teacher_forced_rows`` from a canonical assistant turn.
+
 These tests synthesize fake vLLM ``RequestOutput`` objects and call
-``_process_outputs`` directly (no live vLLM engine required).
+``_process_outputs`` / ``_synth_teacher_forced_rows`` directly (no live
+vLLM engine required).
 """
 from __future__ import annotations
 
@@ -305,13 +311,12 @@ def test_n_prompt_tokens_robust_to_missing_attribute():
 # ---------------------------------------------------------------------------
 
 
-def test_cache_key_carries_schema_version_8():
-    """Calling ``_trace_cache_key_vllm`` with the v7-shape arguments must
-    fold ``schema_version=8`` so v7 runs do NOT cache-hit v8 runs."""
+def test_cache_key_carries_schema_version_9():
+    """Calling ``_trace_cache_key_vllm`` must fold ``schema_version=9`` so
+    v8 runs do NOT cache-hit v9 runs. v9 is the schema bump that adds the
+    ``completion_source`` field to every JSONL row."""
     import json as _json
 
-    # Re-derive the cache key with a known input and compare against a
-    # locally-computed payload that asserts schema_version=8.
     key = _vllm_mod._trace_cache_key_vllm(
         teacher_repo="Qwen/Qwen3.6-35B-A3B",
         teacher_revision="main",
@@ -324,9 +329,10 @@ def test_cache_key_carries_schema_version_8():
         logits_top_k=50,
     )
 
-    # Independent re-derivation — if someone bumps to v9 without updating
-    # this test, both sides shift together; the assertion below is the
-    # canary that the writer's schema_version is exactly 8 right now.
+    # Independent re-derivation — if someone bumps to v10 without
+    # updating this test, both sides shift together; the assertion
+    # below is the canary that the writer's schema_version is exactly 9
+    # right now.
     import hashlib as _hashlib
     expected_payload = _json.dumps({
         "teacher_repo": "Qwen/Qwen3.6-35B-A3B",
@@ -340,11 +346,129 @@ def test_cache_key_carries_schema_version_8():
         "logits_top_k": 50,
         "decode": "greedy",
         "inference_engine": "vllm",
-        "schema_version": 8,
+        "schema_version": 9,
     }, sort_keys=True)
     expected_key = _hashlib.sha256(expected_payload.encode()).hexdigest()[:16]
     assert key == expected_key, (
-        "cache_key changed: either schema_version is no longer 8, or one "
-        "of the folded fields was renamed. If you bumped to v9 on purpose, "
+        "cache_key changed: either schema_version is no longer 9, or one "
+        "of the folded fields was renamed. If you bumped to v10 on purpose, "
         "update this test's expected payload accordingly."
     )
+
+
+# ---------------------------------------------------------------------------
+# v9 schema: completion_source field on every row
+# ---------------------------------------------------------------------------
+
+
+def test_generate_row_completion_source_is_teacher_generated():
+    """GENERATE rows produced by ``_process_outputs`` must carry
+    ``completion_source="teacher_generated"`` (v9 schema)."""
+    row = _drive_single(
+        prompt_str="What is 2 + 2?",
+        domain="math",
+        attempt_idx=0,
+        prompt_token_ids=[1, 2, 3],
+        gen_text="<think>compute</think>4",
+        gen_token_ids=[10, 11, 12],
+        finish_reason="stop",
+    )
+    assert "completion_source" in row, "v9 schema missing completion_source"
+    assert row["completion_source"] == "teacher_generated"
+    assert isinstance(row["completion_source"], str)
+
+
+def test_teacher_forced_row_completion_source_canonical():
+    """TEACHER_FORCED rows synthesized via ``_synth_teacher_forced_rows``
+    must carry ``completion_source="canonical"``, ``_complete=True``,
+    ``n_gen_tokens=0``, the canonical assistant content unchanged, and
+    ``has_think=True`` when the canonical contains a closed think block."""
+    canonical = "<think>two plus two</think>4"
+
+    class _StubTokenizer:
+        def apply_chat_template(self, messages, tokenize=False,
+                                 add_generation_prompt=False,
+                                 enable_thinking=False):
+            return " ".join(m["content"] for m in messages)
+
+        def __call__(self, text, add_special_tokens=False):
+            # Pretend each whitespace-separated word is one token.
+            return {"input_ids": text.split()}
+
+    rows = list(_vllm_mod._synth_teacher_forced_rows(
+        tf_prompts=[("What is 2+2?", "mot_math", canonical, "TEACHER_FORCED")],
+        tf_attempt_idx=[42],
+        tokenizer=_StubTokenizer(),
+        domain_stats={},
+    ))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["completion_source"] == "canonical"
+    assert row["_complete"] is True
+    assert row["n_gen_tokens"] == 0
+    assert row["has_think"] is True
+    assert row["refusal_flag"] is False
+    assert row["domain"] == "mot_math"
+    assert row["_attempt_idx"] == 42
+    # Assistant turn carries the canonical content verbatim.
+    assert row["messages"][1]["content"] == canonical
+    assert row["messages"][1]["role"] == "assistant"
+    # User turn matches the prompt.
+    assert row["messages"][0]["content"] == "What is 2+2?"
+
+
+def test_teacher_forced_row_n_prompt_tokens_uses_tokenizer():
+    """``n_prompt_tokens`` on a TF row reflects the tokenizer-rendered
+    (prompt + canonical) length — not the raw user prompt alone — because
+    the downstream calibration consumer will forward both turns."""
+    canonical = "step one step two step three"
+
+    class _StubTokenizer:
+        def apply_chat_template(self, messages, tokenize=False,
+                                 add_generation_prompt=False,
+                                 enable_thinking=False):
+            return " ".join(m["content"] for m in messages)
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": text.split()}
+
+    rows = list(_vllm_mod._synth_teacher_forced_rows(
+        tf_prompts=[("alpha beta", "mot_code", canonical, "TEACHER_FORCED")],
+        tf_attempt_idx=[0],
+        tokenizer=_StubTokenizer(),
+        domain_stats={},
+    ))
+    # "alpha beta" (2 words) + canonical "step one step two step three"
+    # (6 words) = 8 whitespace tokens after the stub joins them.
+    assert rows[0]["n_prompt_tokens"] == 8
+
+
+def test_synth_teacher_forced_rejects_2tuple_entries():
+    """The v2 plan ties TF rows to 4-tuples; calling the helper with a
+    2-tuple would silently coerce policy to GENERATE if it accepted them.
+    The helper must raise instead — surfaces upstream bugs early."""
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="expected 4-tuple"):
+        list(_vllm_mod._synth_teacher_forced_rows(
+            tf_prompts=[("hi", "math")],   # 2-tuple → reject
+            tf_attempt_idx=[0],
+            tokenizer=None,
+            domain_stats={},
+        ))
+
+
+def test_synth_teacher_forced_rejects_non_tf_policy():
+    """Defensive: the chunk-loop partition only feeds policy=TEACHER_FORCED
+    entries here. If the partition logic drifts, the helper must reject
+    rather than silently emit a teacher_generated-shaped row with
+    completion_source=canonical."""
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="TEACHER_FORCED"):
+        list(_vllm_mod._synth_teacher_forced_rows(
+            tf_prompts=[("hi", "math", "asst", "GENERATE")],
+            tf_attempt_idx=[0],
+            tokenizer=None,
+            domain_stats={},
+        ))

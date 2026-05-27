@@ -29,9 +29,13 @@ This script replaces HF generate with vLLM. vLLM provides:
     endless-loop tail without dropping --max-new-tokens.
 
 Output schema is byte-identical to the HF script: same JSONL row shape with
-``_complete`` / ``_attempt_idx``, same ``.npz`` logit-cache sidecar layout.
-The cache_key folds ``inference_engine="vllm"`` so vLLM and HF outputs never
-collide on disk.
+``_complete`` / ``_attempt_idx`` / ``completion_source``, same ``.npz``
+logit-cache sidecar layout. ``completion_source`` (added in schema v9, the
+companion bump to the HF script's schema v7) records whether the assistant
+content came from vLLM generation (``"teacher_generated"``) or directly
+from the source dataset's canonical assistant turn (``"canonical"`` — only
+the v2 mix's TEACHER_FORCED subsets). The cache_key folds
+``inference_engine="vllm"`` so vLLM and HF outputs never collide on disk.
 
 Usage
 -----
@@ -88,6 +92,7 @@ from typing import Iterable, Iterator
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_self_traces_calib import (  # type: ignore
     _iter_prompts_from_qwen3_pretrain_mix,
+    _iter_prompts_from_qwen3_pretrain_mix_v2,
     _iter_prompts_from_jsonl,
     _coerce_eos_ids,
     _trim_at_first_eos,
@@ -124,14 +129,15 @@ def _trace_cache_key_vllm(
       * ``dtype`` — bf16 / fp8 / awq runs produce different teacher logits.
       * ``logits_top_k`` — always folded (this script always saves logits;
         the HF script made it optional).
-      * ``schema_version=8`` — distinct from the HF schema_version=6 so
-        a downstream loader can pick the right format if we ever change
-        the .npz layout. Bumped 7→8 when items 8+9 added the per-row
-        metadata bundle (``n_prompt_tokens``, ``n_gen_tokens``,
-        ``has_think``, ``refusal_flag``, ``subset``, ``seed_idx``) to the
-        JSONL row schema. Existing v7 runs are NOT cache-hit by v8 runs
-        (the bump intentionally segregates outputs so older JSONLs aren't
-        silently mixed with the v8 metadata-bearing ones).
+      * ``schema_version=9`` — bumped 8→9 in Step 6 of
+        tasks/CALIBRATION_MIX_V2_PLAN.md. v9 is the version that carries
+        the new ``completion_source`` field on every row
+        (``"teacher_generated"`` for rows produced by vLLM generation;
+        ``"canonical"`` for v2 TEACHER_FORCED rows synthesized directly
+        from the source dataset's canonical assistant turn). v8 was the
+        Items 8+9 metadata bundle (``n_prompt_tokens``, ``n_gen_tokens``,
+        ``has_think``, ``refusal_flag``, ``subset``, ``seed_idx``).
+        Existing v8 runs are NOT cache-hit by v9 runs.
     """
     payload = json.dumps({
         "teacher_repo": teacher_repo,
@@ -145,7 +151,7 @@ def _trace_cache_key_vllm(
         "logits_top_k": int(logits_top_k),
         "decode": "greedy",
         "inference_engine": "vllm",
-        "schema_version": 8,
+        "schema_version": 9,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -321,10 +327,21 @@ def _process_outputs(
     """Per chunk: convert vLLM ``RequestOutput`` results into our JSONL row
     shape + the .npz logit-cache sidecars. Yields one dict per output.
 
-    JSONL row schema v8 (items 8+9 of the calibration-v2 writers campaign)
+    ``prompts_chunk`` may be a list of 2-tuples ``(prompt, domain)`` (v1
+    / JSONL iterators) or 4-tuples ``(prompt, domain, canonical, policy)``
+    (v2 iterator). _process_outputs reads only the first two positions;
+    the policy field is consulted by the caller (chunk loop) which is
+    responsible for partitioning GENERATE rows (forwarded here) from
+    TEACHER_FORCED rows (handled by ``_synth_teacher_forced_rows``).
+
+    JSONL row schema v9 (Step 6 of CALIBRATION_MIX_V2_PLAN.md)
     -------------------------------------------------------------------
+    Every row produced by this function carries
+    ``completion_source="teacher_generated"`` (TEACHER_FORCED rows go
+    through ``_synth_teacher_forced_rows`` and get ``"canonical"``).
+
     Each yielded dict carries the original ``messages`` / ``domain`` /
-    ``_complete`` / ``_attempt_idx`` fields plus a metadata bundle:
+    ``_complete`` / ``_attempt_idx`` fields plus the v8 metadata bundle:
 
       * ``n_prompt_tokens`` (int) — vLLM-tokenized prompt length, from
         ``out.prompt_token_ids`` (the rendered chat-templated prompt that
@@ -434,6 +451,112 @@ def _process_outputs(
             "refusal_flag": bool(refusal_flag),
             "subset": str(domain),
             "seed_idx": int(attempt_idx),
+            # --- v9 (CALIBRATION_MIX_V2_PLAN.md Step 6) -------------------
+            # GENERATE path always writes teacher_generated; the
+            # TEACHER_FORCED path is handled by _synth_teacher_forced_rows
+            # which emits "canonical" instead.
+            "completion_source": "teacher_generated",
+        }
+
+
+def _synth_teacher_forced_rows(
+    tf_prompts, tf_attempt_idx, tokenizer, domain_stats,
+):
+    """Emit JSONL rows for TEACHER_FORCED chunk entries — no vLLM
+    generation involved.
+
+    Each ``tf_prompts`` entry is a 4-tuple ``(prompt, domain, canonical,
+    policy)`` produced by the v2 iterator. For each entry we:
+
+      1. Render ``messages=[{user: prompt}, {assistant: canonical}]``
+         via ``apply_chat_template`` to compute the prompt-tokens count
+         (which the v8 metadata bundle exposes as ``n_prompt_tokens``).
+         We do NOT render add_generation_prompt because there is no
+         generation step.
+      2. Tokenize the rendered string with the tokenizer (no padding /
+         truncation — we just want the length count). Cheap enough at
+         8-K-token TF rows that we skip a length cache.
+      3. Compute the same per-row metadata flags as the GENERATE path:
+         ``has_think`` from ``_has_think_block`` on the canonical
+         completion, ``refusal_flag=False`` (canonical R1 / SWE-smith
+         traces are not refusals).
+      4. Yield a row dict with ``completion_source="canonical"``,
+         ``_complete=True``, ``n_gen_tokens=0`` (no generation
+         occurred), and the v8 metadata bundle.
+
+    Logit-sidecar emission is skipped intentionally — there's no
+    per-step logprobs distribution to capture from a canonical trace
+    (the row arrives pre-decided; no model.generate call ever happens).
+
+    ``domain_stats`` is mutated in place to reflect the canonical rows
+    as "complete" so the end-of-run completeness summary stays correct.
+    """
+    for entry, attempt_idx in zip(tf_prompts, tf_attempt_idx):
+        # Plan ties TF rows to 4-tuples by construction; reject 2-tuples
+        # loudly rather than silently treating them as GENERATE.
+        if len(entry) != 4:
+            raise ValueError(
+                f"_synth_teacher_forced_rows: expected 4-tuple "
+                f"(prompt, domain, canonical, policy), got len={len(entry)}: "
+                f"{entry!r}"
+            )
+        prompt, domain, canonical, policy = entry
+        if policy != "TEACHER_FORCED":
+            raise ValueError(
+                f"_synth_teacher_forced_rows: expected policy="
+                f"TEACHER_FORCED, got {policy!r} for domain={domain!r}"
+            )
+        if not canonical:
+            # Defensive: iterator should have skipped this row already.
+            continue
+
+        # Render+tokenize to get n_prompt_tokens. Mirrors what the
+        # downstream calibration consumer will see (its first forward
+        # pass renders+tokenizes the same messages list).
+        messages = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": canonical},
+        ]
+        try:
+            rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False,
+                enable_thinking=True,
+            )
+        except TypeError:
+            rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False,
+            )
+        try:
+            token_ids = tokenizer(rendered, add_special_tokens=False)["input_ids"]
+            n_prompt_tokens = len(token_ids)
+        except Exception:  # noqa: BLE001 — tokenizer drift shouldn't tank row.
+            n_prompt_tokens = 0
+
+        has_think = _has_think_block(canonical)
+        refusal_flag = _detect_refusal(canonical)
+
+        stats = domain_stats.setdefault(domain, [0, 0])
+        stats[0] += 1   # canonical rows are by construction complete
+        stats[1] += 1
+
+        yield {
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": canonical},
+            ],
+            "domain": domain,
+            "_complete": True,
+            "_attempt_idx": int(attempt_idx),
+            # v8 metadata bundle (same fields as the GENERATE path).
+            "n_prompt_tokens": int(n_prompt_tokens),
+            "n_gen_tokens": 0,
+            "has_think": bool(has_think),
+            "refusal_flag": bool(refusal_flag),
+            "subset": str(domain),
+            "seed_idx": int(attempt_idx),
+            # v9 (CALIBRATION_MIX_V2_PLAN.md Step 6): canonical-source
+            # rows.
+            "completion_source": "canonical",
         }
 
 
@@ -449,8 +572,11 @@ def main() -> int:
     p.add_argument("--teacher", default="Qwen/Qwen3.6-35B-A3B")
     p.add_argument("--teacher-revision", default="main")
     p.add_argument("--prompts", default="qwen3-pretrain-mix",
-                   help="'qwen3-pretrain-mix' or path to JSONL with "
-                        "{'prompt': '...', 'domain': '...'} rows.")
+                   help="'qwen3-pretrain-mix' (v1, 8 subsets, all GENERATE), "
+                        "'qwen3-pretrain-mix-v2' (12 subsets, hybrid GENERATE + "
+                        "TEACHER_FORCED — see tasks/CALIBRATION_MIX_V2_PLAN.md), "
+                        "or path to JSONL with {'prompt': '...', "
+                        "'domain': '...'} rows.")
     p.add_argument("--num-prompts", type=int, default=6500)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--max-new-tokens", type=int, default=16384,
@@ -931,15 +1057,22 @@ def main() -> int:
             args.num_prompts, args.seed,
             prev_num_prompts=(args.prev_num_prompts or None),
         )
+    elif args.prompts == "qwen3-pretrain-mix-v2":
+        prompts_iter = _iter_prompts_from_qwen3_pretrain_mix_v2(
+            args.num_prompts, args.seed,
+            prev_num_prompts=(args.prev_num_prompts or None),
+        )
     else:
         if args.prev_num_prompts:
-            log.error("--prev-num-prompts only supported with --prompts=qwen3-pretrain-mix")
+            log.error("--prev-num-prompts only supported with --prompts=qwen3-pretrain-mix{,-v2}")
             return 1
         prompts_iter = _iter_prompts_from_jsonl(Path(args.prompts))
 
-    prompts: list[tuple[str, str]] = []
+    # 2-tuple (v1 / JSONL) or 4-tuple (v2). The chunk loop below
+    # partitions by entry[3] when present.
+    prompts: list[tuple] = []
     for entry in prompts_iter:
-        prompts.append(entry)
+        prompts.append(tuple(entry))
         if len(prompts) >= args.num_prompts:
             break
     if not prompts:
@@ -1392,24 +1525,69 @@ def main() -> int:
             chunk_attempt_idx = [
                 already_done + chunk_start + k for k in range(len(chunk))
             ]
-            chunk_prompts_text = [p for p, _ in chunk]
-            rendered = _render_prompts(tokenizer, chunk_prompts_text)
-            log.info("chunk %d-%d: submitting %d prompts to vLLM",
-                     chunk_start, chunk_start + len(chunk), len(chunk))
-            chunk_t0 = time.monotonic()
-            outputs = llm.generate(rendered, sp)
-            chunk_elapsed = time.monotonic() - chunk_t0
-            log.info("chunk done in %.1fs (%.2f s/prompt avg)",
-                     chunk_elapsed, chunk_elapsed / max(len(chunk), 1))
+            # Partition by policy. v1 / JSONL paths emit 2-tuples which
+            # we treat as GENERATE (entry[3] only exists on the v2
+            # 4-tuple shape — fall back to "GENERATE" for shorter tuples).
+            def _policy_of(entry):
+                return entry[3] if len(entry) >= 4 else "GENERATE"
 
-            for row in _process_outputs(
-                outputs, chunk, chunk_attempt_idx, eos_ids,
-                args.logits_top_k, logits_dir, domain_stats,
-                args.max_new_tokens,
-            ):
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                f.flush()
-                n_new += 1
+            gen_chunk = []
+            gen_attempt = []
+            tf_chunk = []
+            tf_attempt = []
+            for k, entry in enumerate(chunk):
+                if _policy_of(entry) == "TEACHER_FORCED":
+                    tf_chunk.append(entry)
+                    tf_attempt.append(chunk_attempt_idx[k])
+                else:
+                    gen_chunk.append(entry)
+                    gen_attempt.append(chunk_attempt_idx[k])
+
+            # Emit TF rows FIRST so a SIGINT during the (slower)
+            # generate() call doesn't lose the cheap canonical rows.
+            if tf_chunk:
+                log.info(
+                    "chunk %d-%d: synthesizing %d TEACHER_FORCED rows "
+                    "(skipping vLLM generate)",
+                    chunk_start, chunk_start + len(chunk), len(tf_chunk),
+                )
+                for row in _synth_teacher_forced_rows(
+                    tf_chunk, tf_attempt, tokenizer, domain_stats,
+                ):
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    f.flush()
+                    n_new += 1
+
+            if gen_chunk:
+                chunk_prompts_text = [entry[0] for entry in gen_chunk]
+                rendered = _render_prompts(tokenizer, chunk_prompts_text)
+                log.info("chunk %d-%d: submitting %d prompts to vLLM",
+                         chunk_start, chunk_start + len(chunk), len(gen_chunk))
+                chunk_t0 = time.monotonic()
+                outputs = llm.generate(rendered, sp)
+                chunk_elapsed = time.monotonic() - chunk_t0
+                log.info("chunk done in %.1fs (%.2f s/prompt avg)",
+                         chunk_elapsed, chunk_elapsed / max(len(gen_chunk), 1))
+
+                for row in _process_outputs(
+                    outputs, gen_chunk, gen_attempt, eos_ids,
+                    args.logits_top_k, logits_dir, domain_stats,
+                    args.max_new_tokens,
+                ):
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    f.flush()
+                    n_new += 1
+            elif tf_chunk:
+                # All-TF chunk — no generate() call; the accumulator-
+                # checkpoint blocks below run unchanged and observe the
+                # current accumulator state (no new GENERATE forward
+                # pass means no new sidecar samples from this chunk; the
+                # checkpoint just persists whatever was captured before).
+                log.info(
+                    "chunk %d-%d: all-TF chunk; no vLLM generate call "
+                    "this iteration",
+                    chunk_start, chunk_start + len(chunk),
+                )
 
             total_done = already_done + n_new
             total_target = already_done + len(prompts)
