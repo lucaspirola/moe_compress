@@ -43,10 +43,40 @@ class _LayerInputAccumulator:
     host RAM cost is bounded even on long calibration runs. With
     ``hidden_size=2048`` and bf16, a full buffer is ~32 MB.
 
+    Caller contract on first add: when the very first ``add()`` call carries
+    ``n > max_samples`` tokens, the buffer is initialised with the deterministic
+    prefix ``flat[:max_samples]`` and the remaining ``n - max_samples`` tokens
+    are silently discarded (i.e. they are not subject to reservoir replacement).
+    This matches the scalar-loop baseline behavior — the original implementation
+    extended the buffer one token at a time until reaching ``max_samples``, then
+    returned without ever revisiting the prefix. Callers feeding the accumulator
+    in a single oversized first batch will get a non-uniform sample biased to
+    the prefix; feed in multiple ``add()`` calls (or pre-shuffle) for a truly
+    uniform sample.
+
     A seeded ``torch.Generator`` (default seed = 0) is used for the reservoir
     coin flips so the captured calibration set is bit-reproducible across
     runs; callers can override ``seed`` with the layer index for per-layer
     independence (the Stage 2 driver does this).
+
+    Algorithm: vectorized batch implementation of Vitter (1985) Algorithm R.
+    See ``tasks/SC_FAST_PLAN_V3.md`` §4 / Optimization C (lines 277-296) for
+    the measured 45x speedup (1.89 ms/batch vs 85.9 ms/batch baseline) and
+    Vitter, J.S. (1985). "Random sampling with a reservoir." *ACM Transactions
+    on Mathematical Software*, 11(1):37-57 for the underlying algorithm.
+
+    Deviation D1 from textbook scalar Algorithm R: this implementation
+    processes one batch of N tokens in a single vectorized step (one rand(N)
+    call for coin flips, one randint(0, max_samples, (n_kept,)) call for
+    target slots). The RNG stream produced by ``self._generator`` for any
+    given seed will therefore differ from the scalar-loop implementation,
+    yielding different *sample identities* in the final buffer. The marginal
+    probability that any token survives the reservoir after N total tokens
+    is unchanged at min(max_samples/N, 1.0), so the distribution is identical
+    Algorithm R. When two kept tokens in the same batch select the same
+    target slot, CPU ``index_copy_`` resolves in batch order (last write
+    wins), matching the scalar loop's per-token sequential semantics
+    exactly -- there is no statistical bias introduced by the vectorization.
     """
 
     def __init__(self, max_samples: int = 8192, *, seed: int = 0) -> None:
@@ -56,28 +86,81 @@ class _LayerInputAccumulator:
         self._generator = torch.Generator(device="cpu").manual_seed(int(seed))
 
     def add(self, hidden: torch.Tensor) -> None:
-        # hidden: (batch, seq, hidden) or (batch*seq, hidden)
-        flat = hidden.reshape(-1, hidden.shape[-1]).detach().to("cpu")
+        # Step 0: flatten and move to CPU — preserves existing contract.
+        flat = hidden.reshape(-1, hidden.shape[-1]).detach().to("cpu")  # (n, H) — may be a view; clone/cat below ensures contiguity where needed
         n = flat.shape[0]
+        if n == 0:
+            return
+
+        # ---------------------------------------------------------------
+        # Phase A — First-ever call: deterministic prefix take.
+        # Identical to current implementation; does NOT consume generator.
+        # ---------------------------------------------------------------
         if self.buffer is None:
             take = min(n, self.max_samples)
             self.buffer = flat[:take].contiguous().clone()
             self.seen = n
             return
-        # Reservoir-style: replace random rows in the buffer with new samples
-        # so the captured set remains a uniform sample across batches.
-        for i in range(n):
-            self.seen += 1
-            if self.buffer.shape[0] < self.max_samples:
-                self.buffer = torch.cat([self.buffer, flat[i:i + 1]], dim=0)
-            else:
-                # Replace a random index with probability max_samples / seen.
-                # Seeded generator → bit-reproducible across runs (F2 fix).
-                j = int(torch.randint(
-                    0, self.seen, (1,), generator=self._generator,
-                ).item())
-                if j < self.max_samples:
-                    self.buffer[j] = flat[i]
+
+        # ---------------------------------------------------------------
+        # Phase B — Buffer not yet full: fill remaining capacity first.
+        # Also does NOT consume generator (every arriving token below cap
+        # is kept unconditionally, probability = 1.0).
+        # ---------------------------------------------------------------
+        current_size = self.buffer.shape[0]
+        if current_size < self.max_samples:
+            remaining = self.max_samples - current_size
+            fill_count = min(n, remaining)
+            self.buffer = torch.cat(
+                [self.buffer, flat[:fill_count]], dim=0
+            ).contiguous()          # stays contiguous after cat
+            self.seen += fill_count
+            # If all n tokens fit below the cap, done.
+            if fill_count == n:
+                return
+            # Otherwise trim flat to the unprocessed tail and fall through.
+            flat = flat[fill_count:].contiguous()
+            n = n - fill_count
+
+        # ---------------------------------------------------------------
+        # Phase C — Buffer is full (shape[0] == max_samples).
+        # Vectorized Algorithm R for the remaining n tokens.
+        # ---------------------------------------------------------------
+        # pos[i] = 1-indexed global position of flat[i] in the entire stream
+        # seen before this call  → (self.seen + 1) .. (self.seen + n)
+        pos = torch.arange(
+            self.seen + 1, self.seen + n + 1, dtype=torch.float64
+        )                                              # (n,) float64 for precision
+
+        # keep_prob[i] = min(max_samples / pos[i], 1.0)
+        # clamp to 1.0 is theoretically inert in Phase C (pos >= max_samples+1 always,
+        # so max_samples/pos < 1.0), but kept as defense-in-depth against any future
+        # refactor that re-routes a partial-fill batch through Phase C.
+        keep_probs = torch.clamp_max(
+            self.max_samples / pos, 1.0
+        ).to(torch.float32)                            # (n,) float32 for rand comparison
+
+        # One uniform draw per token using the seeded generator.
+        coin = torch.rand(n, generator=self._generator)   # (n,)  — CPU generator
+
+        # Boolean mask of tokens that win their coin flip.
+        keep_mask = coin < keep_probs                  # (n,) bool
+
+        n_kept = int(keep_mask.sum())
+        if n_kept > 0:
+            # Indices into flat[] of kept tokens.
+            kept_local = keep_mask.nonzero(as_tuple=False).squeeze(1)  # (n_kept,)
+
+            # Uniform random target slot in [0, max_samples) per kept token.
+            target_slots = torch.randint(
+                0, self.max_samples, (n_kept,),
+                generator=self._generator,
+            )                                          # (n_kept,) int64
+
+            # Vectorised in-place scatter: buffer[target_slots[k]] = flat[kept_local[k]]
+            self.buffer.index_copy_(0, target_slots, flat[kept_local])
+
+        self.seen += n
 
     def get(self) -> torch.Tensor | None:
         return self.buffer
