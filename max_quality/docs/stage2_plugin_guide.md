@@ -95,8 +95,8 @@ The three schedule constants live in `stage2/orchestrator.py`:
 ```python
 _STAGE2_PRE_ASSIGN_PHASES  = ("on_layer_setup", "on_profile", "on_score")
 _STAGE2_POST_ASSIGN_PHASES = ("pre_merge_snapshot", "merge",
-                              "post_merge", "on_post_merge",
-                              "write_artifacts", "on_layer_teardown")
+                              "post_merge", "write_artifacts",
+                              "on_post_merge", "on_layer_teardown")
 # Derived back-compat constant — the full 10-tuple with the compound
 # "compute_assignment" slot wedged in. NOT walked directly; kept so the
 # canonical-order contract test and external importers still see the
@@ -130,8 +130,8 @@ appears in a `walk_phases` call.
 | `pre_merge_snapshot(ctx)` | layer | Before merge | Snapshot pre-merge expert weights (needed by expert-distill / merge-heal). |
 | `merge(ctx)` | layer | Apply the merge | Fuse experts in place, resize the router, run expert distillation. |
 | `post_merge(ctx)` | layer | After merge | Per-layer merge-heal, telemetry. |
-| `on_post_merge(ctx)` | layer | After `post_merge` | Inter-layer cache invalidation — clear `cov_acc`, `ream_acc`, `layer_input_acc` so the next layer's `on_layer_setup` → `on_profile` sees fresh state. Per SC_STAGE12 §582. |
-| `write_artifacts(ctx)` | layer | After post-merge | Write the per-layer partial checkpoint to `partial_dir` (read off `ctx`). |
+| `write_artifacts(ctx)` | layer | After post-merge | Write the per-layer partial checkpoint to `partial_dir` (read off `ctx`). Reads `ream_acc._lock` via `_snapshot_neuron_means_layer` — must run BEFORE `on_post_merge` invalidation. |
+| `on_post_merge(ctx)` | layer | After `write_artifacts` | Inter-layer cache invalidation — clear `cov_acc`, `ream_acc`, `layer_input_acc` so the next layer's `on_layer_setup` → `on_profile` sees fresh state. Position B (after `write_artifacts`) chosen because `write_artifacts` reads `ream_acc._lock`; earlier Position A choice broke when `sequential_reprofile=True`. Per SC_STAGE12 §582. |
 | `on_layer_teardown(ctx)` | layer | End of each layer | Drop per-layer accumulators, free memory. |
 | `on_run_teardown(ctx)` | run | Once, after all layers | Release run-scope resources. |
 
