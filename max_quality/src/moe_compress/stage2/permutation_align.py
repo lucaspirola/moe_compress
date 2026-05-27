@@ -139,8 +139,14 @@ def _permutation_align_to_centroid(
     # All inputs must share the same device (callers stage tensors via
     # build_banks(layer_ref), which keys off the live model device); cdist
     # would error on mixed-device inputs.
-    C_gate = torch.cdist(ref_gate, child_gate)
-    C_up   = torch.cdist(ref_up,   child_up)
+    # torch.cdist does not support bfloat16 on CPU (CUDA-only). Upcast here
+    # to fp32 for portability — cdist is on small (d_int × d_int) matrices
+    # so the upcast cost is negligible (cdist is not the B2-targeted hot
+    # path; the per-pair gain comes from the merge math and the perm-apply
+    # on the larger (hidden × intermediate) matrices, both of which remain
+    # in native dtype).
+    C_gate = torch.cdist(ref_gate.float(), child_gate.float())
+    C_up   = torch.cdist(ref_up.float(),   child_up.float())
     if ref_act_mean is not None and child_act_mean is not None:
         # L2-normalize both activation-mean vectors along the neuron dimension
         # before computing L2 distance (spec §5, F2-PERM-ALIGN-NORM).
@@ -173,5 +179,11 @@ def _permutation_align_to_centroid(
         # B-C-M-1: same single-component treatment for the no-activation path.
         C = _safe_norm(C_gate + C_up)
     # Hungarian solver requires CPU numpy — single sync at the end.
-    _, col_ind = linear_sum_assignment(C.detach().cpu().numpy())
+    # C.float(): scipy.optimize.linear_sum_assignment does not accept
+    # bfloat16, AND torch.cdist on CPU does not implement bfloat16
+    # (CUDA-only). Both .float() casts (here and at the cdist inputs
+    # above) preserve portability for CPU bf16 inputs while letting
+    # the merge math in _tentative_merged_weights stay in native dtype.
+    # No-op for existing fp32 callers. Added for SC_FAST_PLAN_V3 §4-B2.
+    _, col_ind = linear_sum_assignment(C.float().detach().cpu().numpy())
     return col_ind

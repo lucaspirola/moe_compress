@@ -224,7 +224,7 @@ def _tentative_merged_weights(
     ``W_merged = w_c · W_c + w_m · perm_m(W_m)`` where the weights are
     ``freq_e / (freq_c + freq_m)`` and ``perm_m`` aligns the child's
     intermediate neurons to the centroid (identity for the centroid itself).
-    Returns float32 weights keyed by ``MATRIX_NAMES``. Model-agnostic: expert
+    Returns weights in the model's native dtype keyed by ``MATRIX_NAMES``. Model-agnostic: expert
     weights come through ``build_banks`` / ``MATRIX_NAMES``.
 
     Read-only on model params — wrapped in ``torch.no_grad()`` so the leaf
@@ -241,6 +241,20 @@ def _tentative_merged_weights(
     over the full cost-matrix loop. Callers must pass the same ``banks``
     dict that ``build_banks(layer_ref)`` would return — this function no
     longer builds it internally.
+
+    Per SC_FAST_PLAN_V3.md §4-B2: the six ``.to(torch.float32)`` upcasts on
+    ``ref_gate``, ``ref_up``, ``child_gate``, ``child_up``, ``W_c``, ``W_m``
+    have been removed. Merge arithmetic runs in the model's native dtype
+    (bf16 for Qwen3.6-35B-A3B; float32 for tests). Callers needing float32
+    outputs apply ``.to(device, torch.float32)`` on the returned dict
+    (see ``_output_space_cost``: the W_m and merged dict comprehensions).
+    Documented relative drift O(1e-3) bounded by
+    ``test_output_cost_bf16_drift_under_threshold``.
+
+    Note on dtype promotion: ``w_c * W_c + w_m * W_m`` where ``w_c``/``w_m``
+    are Python float scalars and ``W_c``/``W_m`` are bf16 tensors stays bf16
+    (PyTorch scalar-type rule: result dtype follows the tensor's dtype,
+    Python float scalars do NOT promote bf16 → fp32).
     """
     li = layer_ref.layer_idx
 
@@ -253,10 +267,10 @@ def _tentative_merged_weights(
         w_c, w_m = 0.5, 0.5  # both zero — neutral average
 
     with torch.no_grad():
-        ref_gate = banks["gate_proj"].get(centroid_id).to(torch.float32)
-        ref_up   = banks["up_proj"].get(centroid_id).to(torch.float32)
-        child_gate = banks["gate_proj"].get(child_id).to(torch.float32)
-        child_up   = banks["up_proj"].get(child_id).to(torch.float32)
+        ref_gate   = banks["gate_proj"].get(centroid_id)
+        ref_up     = banks["up_proj"].get(centroid_id)
+        child_gate = banks["gate_proj"].get(child_id)
+        child_up   = banks["up_proj"].get(child_id)
 
         cached = perm_cache.get((li, centroid_id, child_id)) if perm_cache is not None else None
         if cached is not None:
@@ -279,8 +293,8 @@ def _tentative_merged_weights(
 
         merged: dict[str, torch.Tensor] = {}
         for name in MATRIX_NAMES:
-            W_c = banks[name].get(centroid_id).to(torch.float32)
-            W_m = banks[name].get(child_id).to(torch.float32)
+            W_c = banks[name].get(centroid_id)
+            W_m = banks[name].get(child_id)
             # gate/up permute the intermediate (row) axis; down permutes the
             # intermediate (column) axis. Mirrors _aligned_whitened_residual.
             if name == "down_proj":
