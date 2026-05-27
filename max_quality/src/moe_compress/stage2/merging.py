@@ -39,6 +39,9 @@ def _merge_experts_inplace(
     scores: np.ndarray | None = None,
     ream_acc: ReamCostAccumulator | None = None,
     perm_cache: "_PermAlignCache | None" = None,
+    merge_step: str = "freq_weighted",
+    layer_inputs: torch.Tensor | None = None,
+    token_cap: int = 1024,
 ) -> None:
     """Merge non-centroid experts into their centroid in place.
 
@@ -65,7 +68,56 @@ def _merge_experts_inplace(
         1-D ``np.ndarray`` indexed by expert id. Required when
         ``freq_weighted=False``; ignored (may be ``None``) when
         ``freq_weighted=True``.
+
+    merge_step:
+        ``"freq_weighted"`` (default, byte-identical to legacy behaviour) —
+        merged ``gate_proj`` / ``up_proj`` / ``down_proj`` are all
+        ``Σ_j b_j · perm_j(W_j)`` (REAM Eq. 6 with the cluster's freq or
+        saliency weights ``b_j``).
+
+        ``"mergemoe"`` — paper-original MergeMoE closed-form merge
+        (arXiv:2510.14436 Eqs. 3–6 / Theorem 1). Gate and up remain
+        ``Σ_j b_j · perm_j(W_j)`` (algebraically identical to the
+        freq-weighted path because T₂=T₃ are the freq-weighting block
+        matrices; paper Eq. 4). The down-projection is replaced by the
+        closed-form least-squares solution
+        ``W_D^merged = Σ_j b_j · perm_j(W_D^j) · T₁_block_j`` with
+        ``T₁ = Q·P†`` solved per-cluster from the layer-input calibration
+        tokens. See :mod:`stage2.mergemoe` for the math and deviations.
+        Requires ``layer_inputs`` to be non-None and non-empty; on
+        ``layer_inputs is None`` falls back to ``"freq_weighted"`` with a
+        WARNING log line (defensive — the caller should populate this
+        when configuring ``merge_step="mergemoe"``).
+
+    layer_inputs:
+        ``(T_full, d_hidden)`` calibration tokens captured by
+        :class:`stage2.profiling._LayerInputAccumulator`. Required for
+        ``merge_step="mergemoe"``; ignored for ``"freq_weighted"``.
+
+    token_cap:
+        Cap on the per-layer calibration-token subsample used by the
+        MergeMoE solve. Ignored for ``"freq_weighted"``. Default 1024
+        matches the SC output-cost token budget (see ``cost_output_token_cap``).
     """
+    if merge_step not in ("freq_weighted", "mergemoe"):
+        raise ValueError(
+            f"_merge_experts_inplace: merge_step={merge_step!r}; "
+            "expected 'freq_weighted' or 'mergemoe'."
+        )
+    # MergeMoE requires the layer-input calibration buffer. If the caller
+    # forgot to enable it, fall back loudly to the freq-weighted path so the
+    # merge still completes — but log a WARNING so the misconfiguration is
+    # visible. Per-cluster fallback also fires inside
+    # ``_mergemoe_compute_merged_down`` on cond(P) > 1e8.
+    effective_merge_step = merge_step
+    if merge_step == "mergemoe" and (layer_inputs is None or layer_inputs.numel() == 0):
+        log.warning(
+            "layer %d: merge_step='mergemoe' but layer_inputs is empty/None — "
+            "falling back to freq-weighted merge for this layer.",
+            layer_ref.layer_idx,
+        )
+        effective_merge_step = "freq_weighted"
+
     banks = build_banks(layer_ref)
     li = layer_ref.layer_idx
     with torch.no_grad():
@@ -126,6 +178,14 @@ def _merge_experts_inplace(
             ref_act  = ream_acc.get_neuron_mean(li, centroid) if ream_acc else None
 
             accs: dict[str, torch.Tensor | None] = {name: None for name in banks}
+            # MergeMoE bookkeeping (only populated when
+            # ``effective_merge_step == "mergemoe"``): permutation-aligned
+            # per-member weight tensors. Re-used after the loop to call
+            # ``_mergemoe_compute_merged_down``. Stays empty for the default
+            # freq-weighted path so the legacy code is byte-identical.
+            mm_gates: list[torch.Tensor] = []
+            mm_ups:   list[torch.Tensor] = []
+            mm_downs: list[torch.Tensor] = []
             for w, m in zip(weights, members):
                 gate_m = banks["gate_proj"].get(m).to(torch.float32)
                 up_m   = banks["up_proj"].get(m).to(torch.float32)
@@ -158,6 +218,33 @@ def _merge_experts_inplace(
                     if perm is not None:
                         Wm = Wm[perm, :] if name in ("gate_proj", "up_proj") else Wm[:, perm]
                     accs[name] = Wm * w if accs[name] is None else accs[name] + Wm * w
+                    # MergeMoE: stash the aligned per-member tensors for the
+                    # per-cluster lstsq solve below. We branch only on the
+                    # short-circuit boolean — the freq-weighted accumulation
+                    # above is unaffected.
+                    if effective_merge_step == "mergemoe":
+                        if name == "gate_proj":
+                            mm_gates.append(Wm)
+                        elif name == "up_proj":
+                            mm_ups.append(Wm)
+                        else:
+                            mm_downs.append(Wm)
+
+            if effective_merge_step == "mergemoe":
+                # Replace the freq-weighted ``down_proj`` accumulator with
+                # the MergeMoE closed-form result. Gate/up keep the
+                # freq-weighted result — algebraically identical to MergeMoE
+                # because T₂ = T₃ = freq-weights (paper Eq. 4).
+                from .mergemoe import _mergemoe_compute_merged_down
+                accs["down_proj"] = _mergemoe_compute_merged_down(
+                    member_gates=mm_gates,
+                    member_ups=mm_ups,
+                    member_downs=mm_downs,
+                    weights=list(weights),
+                    layer_inputs=layer_inputs,
+                    token_cap=token_cap,
+                    seed=li,
+                )
 
             for name, bank in banks.items():
                 bank.set(centroid, accs[name])
