@@ -19,20 +19,20 @@ is a single YAML edit (`source: qwen3-pretrain-mix → qwen3-pretrain-mix-v2`,
 
 ## Mix table
 
-| # | Subset key | Weight | HF dataset | Config | Split | Policy | Multi-turn |
-|---:|---|---:|---|---|---|---|---|
-| 1 | `tulu3`            | 11% | `allenai/tulu-3-sft-mixture`             | —       | train | GENERATE        | no  |
-| 2 | `math`             |  9% | `nvidia/OpenMathInstruct-2`              | —       | train | GENERATE        | no  |
-| 3 | `qa`               |  5% | `databricks/databricks-dolly-15k`        | —       | train | GENERATE        | no  |
-| 4 | `creative`         |  5% | `euclaise/writingprompts`                | —       | train | GENERATE        | no  |
-| 5 | `multilingual`     |  8% | `CohereForAI/aya_dataset`                | —       | train | GENERATE        | no  |
-| 6 | `fineweb`          |  5% | `HuggingFaceFW/fineweb-edu`              | —       | train | GENERATE        | no  |
-| 7 | `papers`           |  5% | `gfissore/arxiv-abstracts-2021`          | —       | train | GENERATE        | no  |
-| 8 | `mot_math`         | 12% | `open-r1/Mixture-of-Thoughts`            | math    | train | TEACHER_FORCED  | no  |
-| 9 | `mot_code`         | 12% | `open-r1/Mixture-of-Thoughts`            | code    | train | TEACHER_FORCED  | no  |
-| 10 | `mot_science`     |  8% | `open-r1/Mixture-of-Thoughts`            | science | train | TEACHER_FORCED  | no  |
-| 11 | `swe_smith`       | 12% | `SWE-bench/SWE-smith-trajectories`       | —       | xml   | TEACHER_FORCED  | YES (flattened) |
-| 12 | `function_calling` |  8% | `glaiveai/glaive-function-calling-v2`    | —       | train | GENERATE        | no  |
+| # | Subset key | Weight | HF dataset | Config | Split | Policy | Multi-turn | Notes |
+|---:|---|---:|---|---|---|---|---|---|
+| 1 | `tulu3`            | 11% | `allenai/tulu-3-sft-mixture`             | —       | train | GENERATE        | no              | general SFT, broadest coverage |
+| 2 | `math`             |  9% | `nvidia/OpenMathInstruct-2`              | —       | train | GENERATE        | no              | OMI-2 instruct (not CoT) |
+| 3 | `qa`               |  5% | `databricks/databricks-dolly-15k`        | —       | train | GENERATE        | no              | Dolly QA |
+| 4 | `creative`         |  5% | `euclaise/writingprompts`                | —       | train | GENERATE        | no              | writing prompts |
+| 5 | `multilingual`     |  8% | `CohereForAI/aya_dataset`                | —       | train | GENERATE        | no              | 65+ languages |
+| 6 | `fineweb`          |  5% | `HuggingFaceFW/fineweb-edu`              | —       | train | GENERATE        | no              | anti-forgetting replay |
+| 7 | `papers`           |  5% | `gfissore/arxiv-abstracts-2021`          | —       | train | GENERATE        | no              | arxiv abstracts |
+| 8 | `mot_math`         | 12% | `open-r1/Mixture-of-Thoughts`            | math    | train | TEACHER_FORCED  | no              | R1 thinking traces |
+| 9 | `mot_code`         | 12% | `open-r1/Mixture-of-Thoughts`            | code    | train | TEACHER_FORCED  | no              | R1 thinking traces, longest |
+| 10 | `mot_science`     |  8% | `open-r1/Mixture-of-Thoughts`            | science | train | TEACHER_FORCED  | no              | R1 + Llama-Nemotron, weakest alignment |
+| 11 | `swe_smith`       | 12% | `SWE-bench/SWE-smith-trajectories`       | —       | xml   | TEACHER_FORCED  | YES (flattened) | Claude 3.7 xml tool-calls, no `<think>` |
+| 12 | `function_calling` |  8% | `glaiveai/glaive-function-calling-v2`    | —       | train | GENERATE        | no              | Glaive GPT-3.5, GENERATE for Qwen3 tool-call format |
 
 **Sum**: 100%. GENERATE policy: 56% (8 subsets). TEACHER_FORCED policy: 44% (4 subsets).
 
