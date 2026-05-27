@@ -706,6 +706,43 @@ def main() -> int:
                         "(final-dump-only). On --resume, the checkpoint at "
                         "<jsonl>.input_cov.ckpt is hydrated automatically "
                         "if it exists.")
+    # Plugin #12 REDO -- Optimization A profile-pass sidecar.
+    p.add_argument("--capture-stage2-profile", action="store_true",
+                   default=False,
+                   help="Capture Stage 2 REAM profile (gate logits + gated "
+                        "outputs + covariance + layer-input reservoir) and "
+                        "write a sidecar at <jsonl>/sidecars/stage2_profile.pt "
+                        "(schema v3). Requires the vLLM patch "
+                        "vllm.calibration_stage2_profile (canonical source: "
+                        "moe_compress.calibration.stage2_profile_writer). "
+                        "Auto-enables VLLM_CALIB_CAPTURE_STAGE2_PROFILE=1 + "
+                        "VLLM_CALIB_CAPTURE_ROUTER=1 + "
+                        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
+                        "VLLM_USE_FLASHINFER_MOE_FP16=0 BEFORE any vllm "
+                        "import. NOTE: layer-input reservoir is reserved "
+                        "for future use; current production sidecars omit "
+                        "it pending a `layer_in` callback hook in the vLLM "
+                        "patch. Until then, SC cost_alignment='output' will "
+                        "fall back to the live forward pass on full-hit "
+                        "layers (the reader skips reservoir hydration when "
+                        "the payload entry is empty). Failures during dump "
+                        "are logged but do NOT re-raise.")
+    p.add_argument("--stage2-profile-checkpoint-every-chunks", type=int,
+                   default=1,
+                   help="When --capture-stage2-profile is set, dump a "
+                        "checkpoint (.stage2_profile.ckpt) every N chunks. "
+                        "Default 1. Set 0 to disable. On --resume, the "
+                        "checkpoint is hydrated automatically.")
+    p.add_argument("--stage2-profile-cov-storage-dtype", type=str,
+                   default="float16",
+                   choices=["float16", "bfloat16", "float32"],
+                   help="When --capture-stage2-profile is set, configure "
+                        "the InputCovarianceAccumulator.storage_dtype used "
+                        "by the writer. MUST MATCH the Stage 2 config's "
+                        "covariance_storage_dtype (default 'float16' per "
+                        "stage2 orchestrator). On mismatch the reader "
+                        "fails loud at load time with 'Delete the sidecar "
+                        "to regenerate'.")
     p.add_argument("--capture-per-expert-max", action="store_true",
                    default=False,
                    help="Capture per-(layer, expert) down_proj output max "
@@ -963,6 +1000,22 @@ def main() -> int:
         log.info("--capture-routing-stats: enabled "
                  "VLLM_CALIB_CAPTURE_ROUTING_STATS=1 + "
                  "VLLM_CALIB_CAPTURE_ROUTER=1 "
+                 "(must precede vllm import)")
+
+    # Plugin #12 REDO -- Optimization A. Pre-import env gates: the writer
+    # needs the router callback (gate logits) AND the
+    # expert_out_unweighted callback (gated outputs) to fire. FlashInfer
+    # is disabled because expert_out_unweighted is unavailable there.
+    if args.capture_stage2_profile:
+        os.environ["VLLM_CALIB_CAPTURE_STAGE2_PROFILE"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_ROUTER"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED"] = "1"
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
+        log.info("--capture-stage2-profile: enabled "
+                 "VLLM_CALIB_CAPTURE_STAGE2_PROFILE=1 + "
+                 "VLLM_CALIB_CAPTURE_ROUTER=1 + "
+                 "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
+                 "VLLM_USE_FLASHINFER_MOE_FP16=0 "
                  "(must precede vllm import)")
 
     # Pre-import env gates for the router-logits-stats path. Same strict-
@@ -1279,6 +1332,44 @@ def main() -> int:
                     exc,
                 )
                 input_cov_ckpt_path.unlink()
+
+    # --- Stage 2 profile-pass writer setup (Plugin #12 REDO) -----------
+    # Mirrors the input-cov block: setup() pins cov_storage_dtype IMMEDIATELY
+    # (overriding the default fp32 at activation_hooks.py:961) and
+    # registers the router + expert_out_unweighted callbacks. Resume:
+    # hydrate the checkpoint at <jsonl>.stage2_profile.ckpt.
+    s2p_ckpt_path = None
+    if args.capture_stage2_profile:
+        import vllm.calibration_stage2_profile as _s2p  # type: ignore
+        _s2p.setup(llm, cov_storage_dtype=args.stage2_profile_cov_storage_dtype)
+        log.info(
+            "stage2-profile: setup complete -- router + "
+            "expert_out_unweighted callbacks registered; "
+            "cov_storage_dtype=%s",
+            args.stage2_profile_cov_storage_dtype,
+        )
+        s2p_ckpt_path = out_path.with_suffix(".stage2_profile.ckpt")
+        if args.resume and s2p_ckpt_path.exists():
+            try:
+                loaded_prompts = _s2p.load_stage2_profile_checkpoint(
+                    str(s2p_ckpt_path),
+                )
+                if loaded_prompts != already_done:
+                    log.warning(
+                        "stage2-profile: checkpoint has %d prompts but JSONL "
+                        "has %d rows", loaded_prompts, already_done,
+                    )
+                else:
+                    log.info(
+                        "stage2-profile: hydrated %d-prompt checkpoint from %s",
+                        loaded_prompts, s2p_ckpt_path,
+                    )
+            except ValueError as exc:
+                log.error(
+                    "stage2-profile: checkpoint schema mismatch (%s); "
+                    "deleting", exc,
+                )
+                s2p_ckpt_path.unlink()
 
     # --- per-expert-max accumulator setup (pre-CUDA-graph) --------------
     # Mirrors the reap-scores / input-cov blocks: setup() registers the
@@ -1692,6 +1783,26 @@ def main() -> int:
                             exc, exc_info=True,
                         )
 
+            # Plugin #12 REDO -- periodic stage2-profile checkpoint.
+            if (args.capture_stage2_profile
+                    and args.stage2_profile_checkpoint_every_chunks > 0):
+                chunk_idx = chunk_start // args.chunk_size
+                every = args.stage2_profile_checkpoint_every_chunks
+                if (chunk_idx + 1) % every == 0:
+                    try:
+                        import vllm.calibration_stage2_profile as _s2p  # type: ignore
+                        _s2p.set_n_prompts_accumulated(already_done + n_new)
+                        _s2p.dump_stage2_profile_checkpoint(str(s2p_ckpt_path))
+                        log.info(
+                            "stage2-profile: checkpointed %d prompts -> %s",
+                            already_done + n_new, s2p_ckpt_path,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "stage2-profile checkpoint failed: %s",
+                            exc, exc_info=True,
+                        )
+
             # Periodic per-expert-max checkpoint -- same cadence pattern.
             if (args.capture_per_expert_max
                     and args.per_expert_max_checkpoint_every_chunks > 0):
@@ -1867,6 +1978,23 @@ def main() -> int:
                 input_cov_ckpt_path.unlink()
         except Exception as exc:
             log.error("input-cov dump failed: %s", exc, exc_info=True)
+
+    # --- Plugin #12 REDO -- stage2-profile dump ------------------------
+    # Same try/except policy as the other writers: the JSONL is the
+    # primary deliverable; dump failures are logged but never re-raised.
+    if args.capture_stage2_profile:
+        try:
+            import vllm.calibration_stage2_profile as _s2p  # type: ignore
+            _s2p.set_n_prompts_accumulated(already_done + n_new)
+            _s2p.dump_stage2_profile(out_path)
+            log.info(
+                "stage2-profile: dumped sidecar from %d prompts (next to %s)",
+                _s2p.get_n_prompts_accumulated(), out_path,
+            )
+            if s2p_ckpt_path is not None and s2p_ckpt_path.exists():
+                s2p_ckpt_path.unlink()
+        except Exception as exc:
+            log.error("stage2-profile dump failed: %s", exc, exc_info=True)
 
     # --- per-expert-max dump -------------------------------------------
     # Same try/except policy as imatrix / reap-scores / input-cov: the

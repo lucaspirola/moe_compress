@@ -489,7 +489,24 @@ class LayerMergePlugin:
         """Forward-pass profile: reap + cov + ream accumulators populated.
 
         Verbatim slice of lines 728–737 of stage2_reap_ream.run() (pre-T6).
+
+        Plugin #12 REDO (Optimization A): on a full-hit from
+        :class:`Stage2ProfileCacheProvider`, the per-layer ream_acc /
+        cov_acc / layer_input_acc have already been hydrated from the
+        sidecar in ``on_layer_setup``. We early-return BEFORE the live
+        forward pass and BEFORE ``cov_acc.finalize_layer`` — both are in
+        this method body and both must be skipped. ``cov_acc`` is already
+        finalized inside the payload (writer-side serialization order in
+        plan §10).
         """
+        # Pattern A — cache-aware skip. Must be at the top so the live
+        # forward AND finalize_layer are both elided on full hit. The slot
+        # is only set (to True) on a full hit by
+        # :meth:`Stage2ProfileCacheProvider.on_layer_setup`; ``ctx.has``
+        # guards against the cache-disabled case (no provider, slot never
+        # written) and the partial-hit case (slot set to True only on full).
+        if ctx.has("stage2_profile_full_hit") and ctx.get("stage2_profile_full_hit"):
+            return
         # Look up ``_profile_layer`` via the stage2.orchestrator namespace so
         # existing tests (e.g. test_smoke_stage2_resume.py) that
         # ``monkeypatch.setattr(stage2.orchestrator, "_profile_layer", ...)``
@@ -749,6 +766,12 @@ class LayerMergePlugin:
         ctx.set("layer_input_acc", None, overwrite=True)
         ctx.set("pre_merge_weights", None, overwrite=True)
         ctx.set("distill_state", None, overwrite=True)
+        # Plugin #12 REDO: null per-layer cache slots so a future layer
+        # cannot see stale full/partial-hit state from the previous layer.
+        # The reader writes True on hit; this teardown wipes them between
+        # layers regardless of whether the cache was enabled.
+        ctx.set("stage2_profile_full_hit", None, overwrite=True)
+        ctx.set("stage2_profile_partial_hit", None, overwrite=True)
         # Drop large transient writers / accumulators as well so gc.collect()
         # can reclaim their underlying buffers immediately.
         ctx.set("nemo_writer", None, overwrite=True)

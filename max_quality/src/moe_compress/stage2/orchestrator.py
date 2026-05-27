@@ -1040,6 +1040,7 @@ def run(
     from .plugins.reap_scoring import ReapScoringPlugin
     from .plugins.reap_scores_cache import Stage2ReapScoresCacheProvider
     from .plugins.routing_stats_cache import Stage2RoutingStatsCacheProvider
+    from .plugins.stage2_profile_cache import Stage2ProfileCacheProvider
     from .plugins.skip_merge_floor import SkipMergeFloorPlugin
     from .plugins.solver_auto import AutoSolverPlugin
     from .plugins.solver_greedy import GreedySolverPlugin
@@ -1202,6 +1203,31 @@ def run(
         # to be, so the phase-major walk lands its hooks unchanged. S2-12b
         # deleted the ``LegacyAdapter`` class entirely.
         layer_merge,
+        # Profile-sidecar cache reader (Optimization A REDO — Plugin #12).
+        # Single config knob: stage2_reap_ream.profile_sidecar.enabled.
+        # Same flag governs gate-logit hydration, cov_acc hydration, AND
+        # layer_input_acc hydration — all from ONE sidecar written by
+        # --capture-stage2-profile (Bug #8 fix is structural: this is the
+        # only reader for the profile sidecar).
+        # Registration AFTER layer_merge is REQUIRED so
+        # Stage2ProfileCacheProvider.on_layer_setup runs SECOND (OQ-1
+        # Option A — in-place hydration of the fresh ream_acc /
+        # layer_input_acc that LayerMergePlugin.on_layer_setup
+        # constructs). Registering before layer_merge would let the
+        # fresh empty accumulators overwrite the hydrated ones.
+        # On full hit: hydrates ream_acc + cov_acc + layer_input_acc so
+        # LayerMergePlugin.on_profile early-returns (Pattern A skip).
+        # On partial/miss: no-op; live forward path runs unchanged.
+        *(
+            [Stage2ProfileCacheProvider(
+                cov_acc=cov_acc,
+                expected_cov_storage_dtype=s2.get(
+                    "covariance_storage_dtype", "float16",
+                ),
+            )]
+            if s2.get("profile_sidecar", {}).get("enabled", False)
+            else []
+        ),
         # S2-11: the per-merge-group expert distillation + per-layer merge-heal
         # plugins are registered AFTER the merge spine — the LAST elements,
         # reversed vs. the S2-6..S2-10 ordering. ``pre_merge_snapshot`` /
@@ -1280,6 +1306,17 @@ def run(
     # divergence (Item 3 is infrastructure-only, no live counterpart).
     for _plug in plugins:
         if isinstance(_plug, Stage2RoutingStatsCacheProvider):
+            _plug.on_load(run_ctx, _calib_jsonl_path)
+            break
+
+    # Plugin #12 REDO: stage2-profile cache provider on_load. Same
+    # dispatch_first-stops-at-first-non-None hazard as routing-stats above,
+    # so call its on_load EXPLICITLY here. The provider is only present
+    # when ``profile_sidecar.enabled`` was True at registration time
+    # (registry.enabled drops it otherwise), so the explicit loop is
+    # naturally a no-op on disabled runs.
+    for _plug in plugins:
+        if isinstance(_plug, Stage2ProfileCacheProvider):
             _plug.on_load(run_ctx, _calib_jsonl_path)
             break
 
