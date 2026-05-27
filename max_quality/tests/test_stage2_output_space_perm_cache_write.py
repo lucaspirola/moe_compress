@@ -86,6 +86,7 @@ def test_cache_miss_path_writes_perm_to_cache():
     leave the freshly-computed permutation under ``(li, centroid_id, child_id)``.
     """
     layer_ref = _make_layer_ref()
+    banks = build_banks(layer_ref)
     cache = _PermAlignCache()
     li = layer_ref.layer_idx
     centroid_id, child_id = 0, 1
@@ -100,6 +101,7 @@ def test_cache_miss_path_writes_perm_to_cache():
         freq={0: 2, 1: 2},
         ream_acc=None,
         perm_cache=cache,
+        banks=banks,
     )
 
     # The write must have happened.
@@ -123,11 +125,11 @@ def test_cache_miss_path_writes_perm_to_cache():
     # directly assert that the stored perm equals the perm that
     # ``_permutation_align_to_centroid`` produces for these inputs.
     from moe_compress.stage2.permutation_align import _permutation_align_to_centroid
-    banks = build_banks(layer_ref)
-    ref_gate_fp32   = banks["gate_proj"].get(centroid_id).to(torch.float32)
-    ref_up_fp32     = banks["up_proj"].get(centroid_id).to(torch.float32)
-    child_gate_fp32 = banks["gate_proj"].get(child_id).to(torch.float32)
-    child_up_fp32   = banks["up_proj"].get(child_id).to(torch.float32)
+    banks_ref = build_banks(layer_ref)
+    ref_gate_fp32   = banks_ref["gate_proj"].get(centroid_id).to(torch.float32)
+    ref_up_fp32     = banks_ref["up_proj"].get(centroid_id).to(torch.float32)
+    child_gate_fp32 = banks_ref["gate_proj"].get(child_id).to(torch.float32)
+    child_up_fp32   = banks_ref["up_proj"].get(child_id).to(torch.float32)
     expected_perm = _permutation_align_to_centroid(
         ref_gate_fp32, ref_up_fp32, child_gate_fp32, child_up_fp32,
         ref_act_mean=None, child_act_mean=None,
@@ -147,6 +149,7 @@ def test_cached_perm_yields_identical_merge_on_second_call():
     built when the perm was first computed (cache-miss). Proves the stored
     perm is exactly the one the cost matrix used."""
     layer_ref = _make_layer_ref()
+    banks = build_banks(layer_ref)
     cache = _PermAlignCache()
     li = layer_ref.layer_idx
     centroid_id, child_id = 0, 1
@@ -160,6 +163,7 @@ def test_cached_perm_yields_identical_merge_on_second_call():
         freq=freq,
         ream_acc=None,
         perm_cache=cache,
+        banks=banks,
     )
 
     # Confirm the write happened so the second call genuinely takes the
@@ -174,6 +178,7 @@ def test_cached_perm_yields_identical_merge_on_second_call():
         freq=freq,
         ream_acc=None,
         perm_cache=cache,
+        banks=banks,
     )
 
     for name in MATRIX_NAMES:
@@ -193,6 +198,7 @@ def test_cache_hit_path_does_not_overwrite_existing_entry():
     a sentinel residual onto the existing entry and asserting it survives a
     follow-up call."""
     layer_ref = _make_layer_ref()
+    banks = build_banks(layer_ref)
     cache = _PermAlignCache()
     li = layer_ref.layer_idx
     centroid_id, child_id = 0, 1
@@ -206,6 +212,7 @@ def test_cache_hit_path_does_not_overwrite_existing_entry():
         freq=freq,
         ream_acc=None,
         perm_cache=cache,
+        banks=banks,
     )
     perm_stored, _ = cache.get((li, centroid_id, child_id))
 
@@ -221,6 +228,7 @@ def test_cache_hit_path_does_not_overwrite_existing_entry():
         freq=freq,
         ream_acc=None,
         perm_cache=cache,
+        banks=banks,
     )
 
     perm_after, residual_after = cache.get((li, centroid_id, child_id))
@@ -242,6 +250,7 @@ def test_none_perm_cache_path_unchanged():
     and, crucially, must be byte-identical to a ``perm_cache``-enabled call
     on the same inputs (no semantic drift between the two code paths)."""
     layer_ref = _make_layer_ref()
+    banks = build_banks(layer_ref)
     centroid_id, child_id = 0, 1
     freq = {0: 2, 1: 2}
 
@@ -252,9 +261,9 @@ def test_none_perm_cache_path_unchanged():
         freq=freq,
         ream_acc=None,
         perm_cache=None,
+        banks=banks,
     )
 
-    banks = build_banks(layer_ref)
     for name in MATRIX_NAMES:
         # Shape must match the per-expert weight shape.
         expected_shape = banks[name].get(centroid_id).shape
@@ -276,6 +285,7 @@ def test_none_perm_cache_path_unchanged():
         freq=freq,
         ream_acc=None,
         perm_cache=cache,
+        banks=banks,
     )
     merged_no_cache = _tentative_merged_weights(
         layer_ref,
@@ -284,6 +294,7 @@ def test_none_perm_cache_path_unchanged():
         freq=freq,
         ream_acc=None,
         perm_cache=None,
+        banks=banks,
     )
     for name in MATRIX_NAMES:
         assert torch.equal(merged_no_cache[name], merged_with_cache[name]), (

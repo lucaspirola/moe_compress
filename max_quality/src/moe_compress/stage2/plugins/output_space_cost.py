@@ -137,7 +137,7 @@ import torch
 import torch.nn.functional as F
 
 from ...utils.activation_hooks import ReamCostAccumulator  # noqa: F401 — string type hint
-from ...utils.model_io import MATRIX_NAMES, MoELayerRef, build_banks
+from ...utils.model_io import MATRIX_NAMES, ExpertMatrixBank, MoELayerRef, build_banks
 from ...pipeline.context import PipelineContext
 from ..permutation_align import (
     _PermAlignCache,  # noqa: F401 — resolves the string type hint
@@ -216,6 +216,7 @@ def _tentative_merged_weights(
     freq: dict[int, int],
     ream_acc: "ReamCostAccumulator | None",
     perm_cache: "_PermAlignCache | None",
+    banks: dict[str, ExpertMatrixBank],
 ) -> dict[str, torch.Tensor]:
     """Freq-weighted, permutation-aligned merge of ``child_id`` into
     ``centroid_id`` — the two-member case of ``_em_compute_tentative_weights``.
@@ -234,9 +235,14 @@ def _tentative_merged_weights(
     under ``(li, centroid_id, child_id)`` for reuse by the eventual merge
     step (``_merge_experts_inplace``). Side-effect only; cost matrix is
     byte-identical.
+
+    Per SC_FAST_PLAN_V3.md §4-B4: ``banks`` is now passed by the caller,
+    hoisted out of the per-pair call to amortize the ``build_banks`` cost
+    over the full cost-matrix loop. Callers must pass the same ``banks``
+    dict that ``build_banks(layer_ref)`` would return — this function no
+    longer builds it internally.
     """
     li = layer_ref.layer_idx
-    banks = build_banks(layer_ref)
 
     f_c = max(int(freq.get(centroid_id, 0)), 0)
     f_m = max(int(freq.get(child_id, 0)), 0)
@@ -442,7 +448,7 @@ def _output_space_cost(
             for cj in top_cj:
                 c_id = centroid_ids[cj]
                 merged = _tentative_merged_weights(
-                    layer_ref, c_id, m_id, freq, ream_acc, perm_cache,
+                    layer_ref, c_id, m_id, freq, ream_acc, perm_cache, banks,
                 )
                 merged = {name: merged[name].to(device, torch.float32)
                           for name in MATRIX_NAMES}

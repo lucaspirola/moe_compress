@@ -64,7 +64,15 @@ def _independent_output_cost(
     # weights → _permutation_align_to_centroid may still permute, so we reuse
     # the production tentative-merge helper for the weights only; the cost
     # arithmetic below is fully independent of it).
-    merged = _tentative_merged_weights(layer_ref, c_id, m_id, freq, None, None)
+    merged = _tentative_merged_weights(
+        layer_ref,
+        centroid_id=c_id,
+        child_id=m_id,
+        freq=freq,
+        ream_acc=None,
+        perm_cache=None,
+        banks=banks,
+    )
 
     E_m = _swiglu_forward(W_m["gate_proj"], W_m["up_proj"], W_m["down_proj"], x)
     E_merged = _swiglu_forward(
@@ -116,7 +124,7 @@ def test_tentative_merge_of_identical_experts_is_that_expert(tiny_model):
 
     merged = _tentative_merged_weights(
         layer_ref, centroid_id=0, child_id=1, freq={0: 3, 1: 7},
-        ream_acc=None, perm_cache=None,
+        ream_acc=None, perm_cache=None, banks=banks,
     )
     for n in MATRIX_NAMES:
         assert torch.allclose(
@@ -140,7 +148,7 @@ def test_tentative_merge_freq_weighting(tiny_model):
     f_c, f_m = 1, 3
     merged = _tentative_merged_weights(
         layer_ref, centroid_id=0, child_id=1, freq={0: f_c, 1: f_m},
-        ream_acc=None, perm_cache=None,
+        ream_acc=None, perm_cache=None, banks=banks,
     )
     w_c, w_m = f_c / (f_c + f_m), f_m / (f_c + f_m)
     expected_down = (
@@ -332,7 +340,15 @@ def test_output_cost_hand_checked_scalar():
 
     # --- closed-form expected value ---
     W0 = {n: banks[n].get(0).to(torch.float32) for n in MATRIX_NAMES}
-    merged = _tentative_merged_weights(layer_ref, 1, 0, freq, None, None)
+    merged = _tentative_merged_weights(
+        layer_ref,
+        centroid_id=1,
+        child_id=0,
+        freq=freq,
+        ream_acc=None,
+        perm_cache=None,
+        banks=banks,
+    )
     E0 = _swiglu_forward(W0["gate_proj"], W0["up_proj"], W0["down_proj"], x)
     Em = _swiglu_forward(
         merged["gate_proj"], merged["up_proj"], merged["down_proj"], x,
@@ -475,3 +491,52 @@ def test_output_cost_topk_hoisting_byte_identical():
         assert set(vectorized[ci].tolist()) == set(sorted_indices.tolist()), (
             f"row {ci}: selected indices are not the K smallest"
         )
+
+
+def test_tentative_merged_weights_uses_passed_banks(tiny_model):
+    """Per SC_FAST_PLAN_V3.md §4-B4: the function must use the ``banks``
+    argument for weight lookups, NOT call build_banks(layer_ref) internally.
+
+    Uses a non-mutating mock that returns a ×2-scaled COPY (not an in-place
+    mutation) so the real and sentinel banks point to genuinely different
+    tensor values at call time. If the function were to ignore the passed
+    banks and call build_banks internally, both calls would return the
+    same merged weights — the assertion catches that.
+    """
+    layer_ref = list(iter_moe_layers(tiny_model))[0]
+    banks = build_banks(layer_ref)
+
+    # Non-mutating wrapper: returns a 2× COPY of the underlying tensor.
+    # Does NOT call .set() — never touches the model's storage.
+    class _ScaledBankView:
+        def __init__(self, real_bank, scale):
+            self._real_bank = real_bank
+            self._scale = scale
+
+        def get(self, eid):
+            return self._real_bank.get(eid) * self._scale  # returns new tensor
+
+    sentinel_banks = {name: _ScaledBankView(banks[name], 2.0) for name in MATRIX_NAMES}
+
+    freq = {0: 1, 1: 1}
+
+    merged_real = _tentative_merged_weights(
+        layer_ref, centroid_id=0, child_id=1,
+        freq=freq, ream_acc=None, perm_cache=None, banks=banks,
+    )
+    merged_sentinel = _tentative_merged_weights(
+        layer_ref, centroid_id=0, child_id=1,
+        freq=freq, ream_acc=None, perm_cache=None, banks=sentinel_banks,
+    )
+
+    # down_proj is a linear function of the bank weights; the 2× scaling
+    # of sentinel_banks must propagate into merged_sentinel["down_proj"].
+    # If the function ignored the passed banks and called build_banks
+    # internally, both merges would use the real (unmutated) weights and
+    # return identical down_proj — that's the regression this test catches.
+    assert not torch.allclose(
+        merged_real["down_proj"], merged_sentinel["down_proj"], atol=1e-6,
+    ), (
+        "merged_real and merged_sentinel match — "
+        "_tentative_merged_weights appears to ignore the passed banks argument"
+    )
