@@ -135,8 +135,12 @@ def _assign_children_to_centroids(
     if n_children == 0 or n_centroids == 0:
         return [-1] * n_children
 
-    # `solver` is typed as the SolverName Literal (strictly lowercase); we
-    # rely on that contract instead of normalising at runtime.
+    # `solver` is typed as the SolverName Literal (strictly lowercase), but
+    # the type system is static-only — at runtime a YAML-supplied value can
+    # arrive in any case. Normalise once here so human-friendly config values
+    # (e.g. ``GREEDY``, ``Hungarian``) dispatch correctly.
+    solver = solver.lower()
+
     if solver == "sinkhorn":
         # Sinkhorn needs the three sinkhorn_* kwargs; special-case it so the
         # other solver signatures stay byte-identical (no dead **kwargs).
