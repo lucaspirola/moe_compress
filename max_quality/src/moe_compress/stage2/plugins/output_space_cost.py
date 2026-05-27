@@ -229,6 +229,11 @@ def _tentative_merged_weights(
     Read-only on model params — wrapped in ``torch.no_grad()`` so the leaf
     ``nn.Parameter``s' ``requires_grad=True`` does not build an autograd graph
     (mirrors ``_post_alignment_cost``).
+
+    Per SC_FAST_PLAN_V3.md §4-B1: caches the freshly-computed permutation
+    under ``(li, centroid_id, child_id)`` for reuse by the eventual merge
+    step (``_merge_experts_inplace``). Side-effect only; cost matrix is
+    byte-identical.
     """
     li = layer_ref.layer_idx
     banks = build_banks(layer_ref)
@@ -257,6 +262,13 @@ def _tentative_merged_weights(
                 ref_gate, ref_up, child_gate, child_up,
                 ref_act_mean=ref_act, child_act_mean=child_act,
             )
+            # Persist the freshly-computed permutation so the eventual merge
+            # step reuses it instead of re-running LAP for the same pair.
+            # Mirrors ream_cost_post.py:285. residual=None because the output
+            # path does not compute a whitened Frobenius residual.
+            # See SC_FAST_PLAN_V3.md §4-B1.
+            if perm_cache is not None:
+                perm_cache.put((li, centroid_id, child_id), perm, residual=None)
         perm_t = torch.as_tensor(perm, dtype=torch.long, device=ref_gate.device)
 
         merged: dict[str, torch.Tensor] = {}
