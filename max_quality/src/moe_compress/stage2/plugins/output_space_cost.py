@@ -366,11 +366,16 @@ def _output_space_cost(
     #    bump loop only calls this cost path when at least one side is non-
     #    empty), but we return the empty matrix to make the contract explicit.
     #  * If either side is empty there is no (m, c) pair to score: return early.
-    #  * With ``n_c == 0``, ``argpartition(cheap_cost[ci], k_cand-1)`` below
-    #    raises a k-out-of-bounds error on an empty shape — the early-return
-    #    guard here is correct.
+    # Empty matrix → no work; return the all-+∞ out array as-is. The
+    # argpartition below would raise on shape[1]==0 otherwise.
     if n_nc == 0 or n_c == 0:
         return out
+
+    # Hoist per-row argpartition out of the ci loop: cheap_cost is read-only
+    # and k_cand is loop-invariant, so this is equivalent to per-row form.
+    # See SC_FAST_PLAN_V3.md §4-B3.
+    k_cand = min(topk, n_c)
+    topk_per_ci = np.argpartition(cheap_cost, k_cand - 1, axis=1)[:, :k_cand]  # (n_nc, k_cand)
 
     banks = build_banks(layer_ref)
     # Resolve the compute device from the model's own expert weights so the
@@ -423,9 +428,8 @@ def _output_space_cost(
                 # feasible arcs for this row — fill those top-K entries
                 # with the cheap symmetric REAM cost (finite fallback),
                 # leaving the remaining entries at the row's initial +∞.
-                k_cand = min(topk, n_c)
-                for cj in np.argpartition(cheap_cost[ci], k_cand - 1)[:k_cand]:
-                    out[ci, int(cj)] = float(cheap_cost[ci, int(cj)])
+                for cj in topk_per_ci[ci].tolist():
+                    out[ci, cj] = float(cheap_cost[ci, cj])
                 continue
 
             W_m = {name: banks[name].get(m_id).to(device, torch.float32)
@@ -434,10 +438,8 @@ def _output_space_cost(
                 W_m["gate_proj"], W_m["up_proj"], W_m["down_proj"], x_all,
             )  # (T, hidden)
 
-            k_cand = min(topk, n_c)
-            top_cj = np.argpartition(cheap_cost[ci], k_cand - 1)[:k_cand]
+            top_cj = topk_per_ci[ci].tolist()  # 1-D K-element Python int list — eliminates per-iteration int() cast
             for cj in top_cj:
-                cj = int(cj)
                 c_id = centroid_ids[cj]
                 merged = _tentative_merged_weights(
                     layer_ref, c_id, m_id, freq, ream_acc, perm_cache,

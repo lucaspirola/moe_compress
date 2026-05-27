@@ -230,6 +230,40 @@ def test_output_cost_matches_independent_recomputation(tiny_model):
     # Sanity: a genuine merge of *different* random experts costs > 0.
     assert (cost[0] > 0).all(), "non-identical merges must have positive cost"
 
+    # M2: also exercise the pruning path (topk < n_c). With topk < n_c, only
+    # the K cheapest centroid columns (per the cheap_cost row) are scored;
+    # the remaining entries must stay at +∞ (so the assignment solver treats
+    # them as forbidden), and the K finite entries must land exactly at the
+    # K-smallest cheap_cost columns.
+    n_c = len(centroid_ids)
+    assert n_c >= 3, "fixture must expose at least 3 centroids for the pruning test"
+    topk_small = 2
+    cost_pruned = _output_space_cost(
+        layer_ref,
+        noncentroid_ids=noncentroid_ids,
+        centroid_ids=centroid_ids,
+        cheap_cost=cheap,
+        ream_acc=None,
+        perm_cache=None,
+        topk=topk_small,
+        freq=freq,
+        layer_inputs=x,
+        token_cap=1024,
+    )
+    assert cost_pruned.shape == (1, n_c), (
+        f"pruned cost shape {cost_pruned.shape} != expected (1, {n_c})"
+    )
+    finite_per_row = np.isfinite(cost_pruned).sum(axis=1)
+    assert (finite_per_row == topk_small).all(), (
+        f"each row should have exactly {topk_small} finite entries; got {finite_per_row}"
+    )
+    # The finite columns must be exactly the K-smallest cheap_cost columns.
+    finite_cols = set(np.where(np.isfinite(cost_pruned[0]))[0].tolist())
+    expected_cols = set(np.argsort(cheap[0])[:topk_small].tolist())
+    assert finite_cols == expected_cols, (
+        f"finite columns {finite_cols} != K-smallest cheap_cost columns {expected_cols}"
+    )
+
 
 def test_output_cost_hand_checked_scalar():
     """Fully hand-checked scalar case on a 2-expert, top-1 synthetic layer.
@@ -405,3 +439,39 @@ def test_router_routing_weights_applies_bias_terms():
     # that accepts the attributes but never adds them.
     no_bias = F.softmax(F.linear(x, router.weight).float(), dim=-1)
     assert not torch.allclose(sigma, no_bias)
+
+
+def test_output_cost_topk_hoisting_byte_identical():
+    """B3: hoisting np.argpartition out of the per-row loop must produce
+    byte-identical output cost matrices. Constructs a synthetic 4-NC × 6-C
+    cheap_cost with no ties, asserts that for each row, the set of K
+    smallest indices selected matches np.argpartition per-row.
+
+    Per SC_FAST_PLAN_V3.md §4-B3.
+    """
+    rng = np.random.default_rng(seed=42)
+    n_nc, n_c = 4, 6
+    k_cand = 3
+    cheap_cost = rng.random((n_nc, n_c)).astype(np.float64)
+    assert len(np.unique(cheap_cost)) == n_nc * n_c, "synthetic cheap_cost should have no ties"
+
+    # Vectorized form (B3):
+    vectorized = np.argpartition(cheap_cost, k_cand - 1, axis=1)[:, :k_cand]
+    assert vectorized.shape == (n_nc, k_cand)
+
+    # Per-row form (pre-B3 baseline):
+    per_row = np.array([
+        np.argpartition(cheap_cost[ci], k_cand - 1)[:k_cand]
+        for ci in range(n_nc)
+    ])
+
+    # SET equality per row (order may differ for ties; none here, but be defensive):
+    for ci in range(n_nc):
+        assert set(vectorized[ci].tolist()) == set(per_row[ci].tolist()), (
+            f"row {ci}: vectorized {vectorized[ci]} != per-row {per_row[ci]}"
+        )
+        # Additionally: every selected index is actually one of the K smallest.
+        sorted_indices = np.argsort(cheap_cost[ci])[:k_cand]
+        assert set(vectorized[ci].tolist()) == set(sorted_indices.tolist()), (
+            f"row {ci}: selected indices are not the K smallest"
+        )
