@@ -478,8 +478,10 @@ def _synth_teacher_forced_rows(
          8-K-token TF rows that we skip a length cache.
       3. Compute the same per-row metadata flags as the GENERATE path:
          ``has_think`` from ``_has_think_block`` on the canonical
-         completion, ``refusal_flag=False`` (canonical R1 / SWE-smith
-         traces are not refusals).
+         completion, ``refusal_flag`` via ``_detect_refusal(canonical)``
+         — same heuristic as the GENERATE path; canonical R1 / SWE-smith
+         traces evaluate to False in practice, but we run the detector
+         for consistency.
       4. Yield a row dict with ``completion_source="canonical"``,
          ``_complete=True``, ``n_gen_tokens=0`` (no generation
          occurred), and the v8 metadata bundle.

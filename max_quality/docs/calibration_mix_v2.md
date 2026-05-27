@@ -34,7 +34,7 @@ is a single YAML edit (`source: qwen3-pretrain-mix → qwen3-pretrain-mix-v2`,
 | 11 | `swe_smith`       | 12% | `SWE-bench/SWE-smith-trajectories`       | —       | xml   | TEACHER_FORCED  | YES (flattened) |
 | 12 | `function_calling` |  8% | `glaiveai/glaive-function-calling-v2`    | —       | train | GENERATE        | no  |
 
-**Sum**: 100%. GENERATE policy: 52% (8 subsets). TEACHER_FORCED policy: 48% (4 subsets).
+**Sum**: 100%. GENERATE policy: 56% (8 subsets). TEACHER_FORCED policy: 44% (4 subsets).
 
 ---
 

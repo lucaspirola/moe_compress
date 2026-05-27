@@ -1337,8 +1337,8 @@ register_corpus(CorpusAdapter(
 #  * tasks/CALIBRATION_MIX_V2_DESIGN.md
 #  * tasks/CALIBRATION_MIX_V2_PLAN.md
 
-# 12-subset mix; weights sum to exactly 1.0 (5 GENERATE + 1 function_calling
-# GENERATE = 52%, 4 TEACHER_FORCED = 48%).
+# 12-subset mix; weights sum to exactly 1.0 (8 GENERATE subsets = 56%,
+# 4 TEACHER_FORCED = 44%).
 _QWEN3_MIX_V2_WEIGHTS = {
     "tulu3":            0.11,
     "math":             0.09,
