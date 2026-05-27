@@ -1534,43 +1534,49 @@ def _stream_swe_smith_xml(
     rows_seen = 0
     for row in ds:
         rows_seen += 1
+        rendered: str | None = None
         raw = row.get("messages")
-        if not isinstance(raw, str):
-            # Schema drift — abort row but keep going (matches v1 per-row
-            # tolerance).
-            continue
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(parsed, list):
-            continue
-        # Find first user message and first assistant AFTER it. The xml
-        # split's typical layout is [system, user, assistant, ...]; we
-        # tolerate any leading system messages and skip them.
-        user_msg = None
-        assistant_msg = None
-        seen_user = False
-        for msg in parsed:
-            if not isinstance(msg, dict):
-                continue
-            role = msg.get("role")
-            content = msg.get("content")
-            if not isinstance(content, str):
-                continue
-            if role == "user" and user_msg is None:
-                user_msg = content
-                seen_user = True
-            elif role == "assistant" and seen_user and assistant_msg is None:
-                assistant_msg = content
-                break
-        if not user_msg or not assistant_msg:
-            continue
-        flat = [
-            {"role": "user", "content": user_msg},
-            {"role": "assistant", "content": assistant_msg},
-        ]
-        rendered = _render_messages(flat, tokenizer, enable_thinking=True)
+        # Schema drift — abort row but keep going (matches v1 per-row
+        # tolerance). Flow falls through to the circuit-limit check below
+        # so all-invalid streams still stop after `circuit_limit` rows.
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            if isinstance(parsed, list):
+                # Find first user message and first assistant AFTER it. The
+                # xml split's typical layout is [system, user, assistant,
+                # ...]; we tolerate any leading system messages and skip
+                # them.
+                user_msg = None
+                assistant_msg = None
+                seen_user = False
+                for msg in parsed:
+                    if not isinstance(msg, dict):
+                        continue
+                    role = msg.get("role")
+                    content = msg.get("content")
+                    if not isinstance(content, str):
+                        continue
+                    if role == "user" and user_msg is None:
+                        user_msg = content
+                        seen_user = True
+                    elif (
+                        role == "assistant"
+                        and seen_user
+                        and assistant_msg is None
+                    ):
+                        assistant_msg = content
+                        break
+                if user_msg and assistant_msg:
+                    flat = [
+                        {"role": "user", "content": user_msg},
+                        {"role": "assistant", "content": assistant_msg},
+                    ]
+                    rendered = _render_messages(
+                        flat, tokenizer, enable_thinking=True,
+                    )
         if rendered:
             out.append(rendered)
             if len(out) >= count:
@@ -1615,28 +1621,30 @@ def _stream_glaive_function_calling(
     rows_seen = 0
     for row in ds:
         rows_seen += 1
+        rendered: str | None = None
         system_raw = row.get("system") or ""
         chat_raw = row.get("chat") or ""
-        if not isinstance(system_raw, str) or not isinstance(chat_raw, str):
-            continue
-        system_text = system_raw.strip()
-        if system_text.startswith("SYSTEM:"):
-            system_text = system_text[len("SYSTEM:"):].strip()
-        # First USER turn in the flat chat string.
-        user_text = _extract_glaive_first_user(chat_raw)
-        if not user_text:
-            continue
-        # Option (i): concat system schema + first user turn into one user
-        # message (see plan §B.6). The teacher generates its own
-        # Qwen3-native <tool_call> response; for calibration purposes we
-        # need only the prompt-shaped tokens.
-        user_content = (
-            f"{system_text}\n\n{user_text}" if system_text else user_text
-        )
-        messages = [{"role": "user", "content": user_content}]
-        rendered = _render_messages(
-            messages, tokenizer, add_generation_prompt=True,
-        )
+        # Flow always falls through to the circuit-limit check below so
+        # schema-drifted streams still stop after `circuit_limit` rows.
+        if isinstance(system_raw, str) and isinstance(chat_raw, str):
+            system_text = system_raw.strip()
+            if system_text.startswith("SYSTEM:"):
+                system_text = system_text[len("SYSTEM:"):].strip()
+            # First USER turn in the flat chat string.
+            user_text = _extract_glaive_first_user(chat_raw)
+            if user_text:
+                # Option (i): concat system schema + first user turn into
+                # one user message (see plan §B.6). The teacher generates
+                # its own Qwen3-native <tool_call> response; for calibration
+                # purposes we need only the prompt-shaped tokens.
+                user_content = (
+                    f"{system_text}\n\n{user_text}"
+                    if system_text else user_text
+                )
+                messages = [{"role": "user", "content": user_content}]
+                rendered = _render_messages(
+                    messages, tokenizer, add_generation_prompt=True,
+                )
         if rendered:
             out.append(rendered)
             if len(out) >= count:

@@ -297,6 +297,113 @@ def test_stream_swe_smith_xml_skips_malformed_rows(monkeypatch):
     assert "world" in out[0]
 
 
+class _CountingIter:
+    """Iterator wrapper that counts advances so the M-1 circuit-breaker
+    smoke tests can assert the helper consumed at most ``circuit_limit``
+    rows, not the full malformed stream."""
+
+    def __init__(self, rows):
+        self._rows = list(rows)
+        self.advances = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.advances >= len(self._rows):
+            raise StopIteration
+        row = self._rows[self.advances]
+        self.advances += 1
+        return row
+
+
+def test_stream_swe_smith_xml_circuit_breaker_stops_on_all_invalid(
+    monkeypatch, caplog,
+):
+    """M-1 — under schema drift (every row's ``messages`` is None), the
+    helper must stop after the circuit_limit and NOT walk the entire
+    stream. Confirms the restructure that removed the ``continue``
+    statements that previously bypassed the circuit check.
+    """
+    circuit_limit = 50
+    rows = [{"messages": None} for _ in range(circuit_limit + 100)]
+    counter = _CountingIter(rows)
+
+    def _fake(name, count, seed, *, config=None, split="train"):
+        return counter, circuit_limit
+
+    monkeypatch.setattr(_calib, "_shuffled_stream", _fake)
+
+    # Attach to the calibration module's own logger (the WARNING is
+    # emitted via ``log.warning`` on the module-level ``log``).
+    cal_logger = _calib.log
+    cal_logger.addHandler(caplog.handler)
+    try:
+        cal_logger.setLevel("WARNING")
+        out = _stream_swe_smith_xml(
+            "SWE-bench/SWE-smith-trajectories", "xml",
+            count=10, tokenizer=_StubTokenizer(), seed=0,
+        )
+    finally:
+        cal_logger.removeHandler(caplog.handler)
+
+    # Helper produced no rows (everything was schema-drifted).
+    assert out == []
+    # Stopped after the circuit limit, NOT the full malformed stream.
+    # Allow a small slack (the helper increments rows_seen at the top of
+    # the loop then checks at the bottom, so the boundary is exactly
+    # circuit_limit).
+    assert counter.advances <= circuit_limit, (
+        f"expected ≤{circuit_limit} advances, got {counter.advances} — "
+        "circuit-breaker bypassed by `continue` in malformed-row branch"
+    )
+    # And the WARNING fired.
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(
+        "_stream_swe_smith_xml: circuit-breaker fired" in m for m in msgs
+    ), f"circuit-breaker WARNING not logged; got: {msgs}"
+
+
+def test_stream_glaive_function_calling_circuit_breaker_stops_on_all_invalid(
+    monkeypatch, caplog,
+):
+    """M-1 — twin of the swe_smith test for the glaive helper. Every row
+    has empty ``chat`` (no USER: marker → ``_extract_glaive_first_user``
+    returns None); the helper must stop after circuit_limit, not consume
+    the full stream.
+    """
+    circuit_limit = 50
+    rows = [{"system": "", "chat": ""} for _ in range(circuit_limit + 100)]
+    counter = _CountingIter(rows)
+
+    def _fake(name, count, seed, *, config=None, split="train"):
+        return counter, circuit_limit
+
+    monkeypatch.setattr(_calib, "_shuffled_stream", _fake)
+
+    cal_logger = _calib.log
+    cal_logger.addHandler(caplog.handler)
+    try:
+        cal_logger.setLevel("WARNING")
+        out = _stream_glaive_function_calling(
+            "glaiveai/glaive-function-calling-v2",
+            count=10, tokenizer=_StubTokenizer(), seed=0,
+        )
+    finally:
+        cal_logger.removeHandler(caplog.handler)
+
+    assert out == []
+    assert counter.advances <= circuit_limit, (
+        f"expected ≤{circuit_limit} advances, got {counter.advances} — "
+        "circuit-breaker bypassed by `continue` in malformed-row branch"
+    )
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(
+        "_stream_glaive_function_calling: circuit-breaker fired" in m
+        for m in msgs
+    ), f"circuit-breaker WARNING not logged; got: {msgs}"
+
+
 def test_extract_glaive_first_user_basic():
     """Pulls the first ``USER:`` segment, stops at the next ``ASSISTANT:``
     or ``FUNCTION RESPONSE:`` boundary, strips whitespace and
