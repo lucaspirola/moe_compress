@@ -472,3 +472,251 @@ def test_orchestrator_default_merge_step_is_freq_weighted():
     from moe_compress.stage2 import orchestrator as orch
     src = inspect.getsource(orch.run)
     assert 's2.get("merge_step", "freq_weighted")' in src
+
+
+# ---------------------------------------------------------------------------
+# Section 6 — D-mergemoe-resume-fallback (Plugin #9 reviewer fix)
+# ---------------------------------------------------------------------------
+
+
+def _patch_stage2_io(monkeypatch):
+    """Common helper: stub calibration loader + checkpoint save for the
+    resume-path tests below so they never hit HF datasets or real disk
+    writes for the compressed checkpoint. Returns nothing — applies the
+    monkey-patches on the supplied fixture.
+    """
+    from moe_compress.stage2 import orchestrator as orch
+    from moe_compress.utils import calibration as cal_mod
+    from moe_compress.utils import model_io as mio
+
+    def _fake_build(tokenizer, spec, cache_dir=None):
+        torch.manual_seed(spec.seed)
+        return torch.randint(0, 32, (spec.num_sequences, spec.sequence_length),
+                             dtype=torch.long)
+
+    def _fake_slice(tokenizer, spec, num_samples, cache_dir=None):
+        torch.manual_seed(spec.seed + 1)
+        return torch.randint(0, 32, (num_samples, spec.sequence_length),
+                             dtype=torch.long)
+
+    def _noop_save(model, tokenizer, path, **kwargs):
+        from pathlib import Path as _P
+        _P(path).mkdir(parents=True, exist_ok=True)
+        return _P(path)
+
+    monkeypatch.setattr(cal_mod, "build_calibration_tensor", _fake_build)
+    monkeypatch.setattr(cal_mod, "build_super_expert_slice", _fake_slice)
+    monkeypatch.setattr(orch, "build_calibration_tensor", _fake_build)
+    monkeypatch.setattr(mio, "save_compressed_checkpoint", _noop_save)
+    monkeypatch.setattr(orch, "save_compressed_checkpoint", _noop_save)
+
+
+class _TinyTok:
+    name_or_path = "tiny-tokenizer"
+    eos_token_id = 0
+    def __call__(self, text, *_, **__):
+        return {"input_ids": [min(ord(c) % 32, 31) for c in (text or " ")]}
+    def save_pretrained(self, *_a, **_k):
+        return None
+
+
+def _run_tiny_stage1(model, tokenizer, config, tmp_path):
+    from moe_compress import stage1
+    from moe_compress.budget.solver import BudgetDecomposition
+    decomp = BudgetDecomposition(
+        total_reduction_ratio=0.2, expert_prune_ratio=0.5,
+        svd_rank_ratio=0.14, global_expert_budget=4,
+        min_experts_per_layer=2, blacklisted_experts={},
+    )
+    stage1.run(model, tokenizer, config, tmp_path, decomp)
+
+
+def test_resume_path_forces_freq_weighted_and_warns_for_mergemoe(
+    tiny_model, tiny_config, tmp_path, monkeypatch, caplog,
+):
+    """Resume with ``merge_step="mergemoe"`` forces freq_weighted + warns.
+
+    Pins D-mergemoe-resume-fallback (Plugin #9):
+      * Resume does NOT crash even though the per-layer
+        ``_LayerInputAccumulator`` calibration buffer is not on disk.
+      * A single ``log.warning`` fires (gated on configured ``"mergemoe"``
+        and non-empty ``resumed_records``) — surfaces the silent downgrade.
+      * Every replayed layer is forced through the ``freq_weighted`` branch
+        (asserted by spying on ``_merge_experts_inplace`` and checking the
+        ``merge_step`` kwarg the orchestrator passes).
+
+    The orchestrator's resume gate fires when the partial-dir is populated
+    AND ``no_resume=False`` — manufactured here by crashing Stage 2 mid-run
+    via a monkey-patched ``_profile_layer`` (mirrors the pattern already
+    used by ``test_stage2_pipeline_run_layer.py::
+    test_stage2_pipeline_resume_skips_completed_layers``). The crashed
+    layer's checkpoint persists in ``_stage2_partial/`` and is picked up
+    by the second invocation.
+    """
+    import copy
+    from moe_compress.stage2 import orchestrator as orch
+    from moe_compress.utils.model_io import iter_moe_layers
+
+    _patch_stage2_io(monkeypatch)
+
+    # --- Stage 1 setup.
+    pre_s2 = copy.deepcopy(tiny_model)
+    _run_tiny_stage1(tiny_model, _TinyTok(), tiny_config, tmp_path)
+
+    moe_layers = list(iter_moe_layers(tiny_model))
+    assert len(moe_layers) >= 2, "need ≥2 MoE layers to manufacture a crash-resume"
+
+    # --- First run: crash after layer 0 completes. The completed-layer
+    # checkpoints (merge_0.json, layer_0.pt, optional _neuron_means_layer0.pt)
+    # are flushed to ``_stage2_partial/`` before the crash propagates.
+    original_profile = orch._profile_layer
+    call_count = [0]
+
+    def _crashing_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs):
+        call_count[0] += 1
+        if call_count[0] > 1:
+            raise RuntimeError("simulated crash after layer 0")
+        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs)
+
+    monkeypatch.setattr(orch, "_profile_layer", _crashing_profile)
+    tiny_config["stage2_reap_ream"]["merge_step"] = "freq_weighted"
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        orch.run(tiny_model, _TinyTok(), tiny_config, tmp_path, device=None)
+
+    # Restore profile for the resume run.
+    monkeypatch.setattr(orch, "_profile_layer", original_profile)
+
+    # Sanity: partial-dir has at least one completed layer.
+    partial_dir = tmp_path / "_stage2_partial"
+    assert partial_dir.exists(), "_stage2_partial/ should survive the crash"
+    merge_jsons = sorted(partial_dir.glob("merge_*.json"))
+    assert len(merge_jsons) >= 1, (
+        "expected at least one completed-layer record after the crash"
+    )
+
+    # --- Second run: flip merge_step to "mergemoe". Spy on
+    # ``_merge_experts_inplace`` so we can prove every resume-loop call
+    # forwards ``merge_step="freq_weighted"`` regardless of the config.
+    spy_calls: list[dict] = []
+    real_merge = orch._merge_experts_inplace
+
+    def _spy_merge(*args, **kwargs):
+        spy_calls.append({"args_len": len(args), "kwargs": dict(kwargs)})
+        return real_merge(*args, **kwargs)
+
+    monkeypatch.setattr(orch, "_merge_experts_inplace", _spy_merge)
+
+    tiny_config["stage2_reap_ream"]["merge_step"] = "mergemoe"
+    resume_model = copy.deepcopy(pre_s2)
+
+    # The resume loop runs BEFORE the orchestrator processes any
+    # post-resume-point layer, so the D-mergemoe-resume-fallback warning
+    # and the forced-freq_weighted ``_merge_experts_inplace`` calls fire
+    # before the live MergeMoE solve on layer 1. Layer-1 MergeMoE may
+    # still raise on environments that lack a LAPACK-enabled PyTorch
+    # (CPU lstsq needs LAPACK) — catch *any* exception thereafter and
+    # rely on the assertions below to pin the resume-loop behaviour.
+    #
+    # Pytest's caplog plugin sets ``propagate=False`` on the captured
+    # logger; force it back on so caplog actually sees the warning.
+    orch_log = logging.getLogger("moe_compress.stage2.orchestrator")
+    _saved_propagate = orch_log.propagate
+    orch_log.propagate = True
+    try:
+        caplog.set_level(logging.WARNING, logger="moe_compress.stage2.orchestrator")
+        try:
+            orch.run(resume_model, _TinyTok(), tiny_config, tmp_path,
+                     device=None, no_resume=False)
+        except RuntimeError as exc:
+            # Acceptable: post-resume MergeMoE solve hit LAPACK-not-found
+            # on the local CI box. The resume-loop assertions below still
+            # cover this fixer-pin. Re-raise anything else.
+            if "LAPACK" not in str(exc):
+                raise
+    finally:
+        orch_log.propagate = _saved_propagate
+
+    # --- Assertion 1: D-mergemoe-resume-fallback fired exactly once.
+    matches = [
+        r for r in caplog.records
+        if "D-mergemoe-resume-fallback" in r.message
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one D-mergemoe-resume-fallback warning "
+        f"(found {len(matches)}): {[r.message for r in caplog.records]}"
+    )
+    assert matches[0].levelname == "WARNING"
+    assert "forcing merge_step=freq_weighted" in matches[0].message
+
+    # --- Assertion 2: at least one ``_merge_experts_inplace`` call on
+    # the resume path forwarded ``merge_step="freq_weighted"`` (i.e. the
+    # orchestrator did NOT honor the config's "mergemoe" for replayed
+    # layers — see resume loop in stage2/orchestrator.py).
+    resume_loop_calls = [
+        c for c in spy_calls
+        if c["kwargs"].get("merge_step") == "freq_weighted"
+        and c["kwargs"].get("scores", "<missing>") is None
+    ]
+    assert len(resume_loop_calls) >= 1, (
+        "expected at least one resume-loop _merge_experts_inplace call "
+        "with merge_step='freq_weighted' (scores=None marks the resume "
+        f"path); got: {spy_calls}"
+    )
+
+
+def test_resume_warning_does_not_fire_for_freq_weighted_config(
+    tiny_model, tiny_config, tmp_path, monkeypatch, caplog,
+):
+    """Resume with ``merge_step="freq_weighted"`` (the default) does NOT
+    emit the D-mergemoe-resume-fallback warning — it would be noise.
+
+    The gate in ``stage2/orchestrator.py`` reads:
+      ``if … merge_step == "mergemoe" and resumed_records:``
+    so a freq_weighted config must short-circuit it.
+    """
+    import copy
+    from moe_compress.stage2 import orchestrator as orch
+    from moe_compress.utils.model_io import iter_moe_layers
+
+    _patch_stage2_io(monkeypatch)
+    pre_s2 = copy.deepcopy(tiny_model)
+    _run_tiny_stage1(tiny_model, _TinyTok(), tiny_config, tmp_path)
+
+    moe_layers = list(iter_moe_layers(tiny_model))
+    assert len(moe_layers) >= 2
+
+    original_profile = orch._profile_layer
+    call_count = [0]
+
+    def _crashing_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs):
+        call_count[0] += 1
+        if call_count[0] > 1:
+            raise RuntimeError("simulated crash after layer 0")
+        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs)
+
+    monkeypatch.setattr(orch, "_profile_layer", _crashing_profile)
+    tiny_config["stage2_reap_ream"]["merge_step"] = "freq_weighted"
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        orch.run(tiny_model, _TinyTok(), tiny_config, tmp_path, device=None)
+    monkeypatch.setattr(orch, "_profile_layer", original_profile)
+
+    assert (tmp_path / "_stage2_partial").exists()
+    resume_model = copy.deepcopy(pre_s2)
+    orch_log = logging.getLogger("moe_compress.stage2.orchestrator")
+    _saved_propagate = orch_log.propagate
+    orch_log.propagate = True
+    try:
+        caplog.set_level(logging.WARNING, logger="moe_compress.stage2.orchestrator")
+        orch.run(resume_model, _TinyTok(), tiny_config, tmp_path,
+                 device=None, no_resume=False)
+    finally:
+        orch_log.propagate = _saved_propagate
+
+    matches = [
+        r for r in caplog.records
+        if "D-mergemoe-resume-fallback" in r.message
+    ]
+    assert matches == [], (
+        f"D-mergemoe-resume-fallback warning fired for a freq_weighted "
+        f"config — would be noise: {[r.message for r in matches]}"
+    )

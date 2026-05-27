@@ -79,7 +79,35 @@ this holds with 2× margin.
 **D-mergemoe-fp32-solve**: the lstsq solve runs in float32 even if the
 model weights are bf16; result is cast back to the model's native dtype
 before return. Mirrors the existing fp32 numerical posture of
-``_merge_experts_inplace`` (``merging.py`` L124-125).
+``_merge_experts_inplace`` — see the ``ref_gate``/``ref_up``
+upcasts in ``merging.py`` (the ``.to(torch.float32)`` calls inside
+``_merge_experts_inplace``) and the matching per-member upcasts in the
+``for w, m in zip(weights, members):`` loop.
+
+**D-mergemoe-resume-fallback**: when Stage 2 is being resumed from
+``_stage2_partial/``, the per-layer ``_LayerInputAccumulator`` calibration
+buffer is not on disk. The orchestrator therefore forces
+``merge_step="freq_weighted"`` for every replayed layer before calling
+``_merge_experts_inplace`` — see the resume loop in
+``stage2/orchestrator.py`` around the ``for record in resumed_records:``
+loop. A single ``log.warning`` is emitted once per resumed run (gated on
+the configured ``merge_step == "mergemoe"`` and a non-empty
+``resumed_records``) rather than once per layer. New layers processed
+after the resume cursor use the configured ``merge_step``; the
+``stage2/config/merge_step`` Trackio key records the configured value,
+not the effective per-layer choice. MergeMoE-mode crashes therefore
+require ``--no-resume`` to re-run with the original calibration buffer.
+
+**D-mergemoe-saliency-interaction**: ``merge_step="mergemoe"`` with the
+project's saliency-mode merge (``ream.frequency_weighted_merge=False`` —
+weights derived from saliency scores rather than calibration frequency)
+is a project extension beyond paper Theorem 1. The paper's Eq. 4
+collapse ``T₂·W'_G = Σ_j b_j·W_G^j`` relies on the ``b_j`` interpretation
+as a normalized merge weight, which holds for both frequency and
+saliency weights (any positive weights summing to 1). The resulting
+``W_D^merged`` is still the closed-form least-squares solution that makes
+the merged expert reproduce the cluster's weighted output on the
+calibration tokens; only the source of the ``b_j`` changes.
 """
 from __future__ import annotations
 
@@ -244,9 +272,11 @@ def _mergemoe_compute_merged_down(
     # it (cond falls back to the largest/smallest singular ratio).
     try:
         cond_P = float(torch.linalg.cond(P).item())
-    except Exception as exc:  # pragma: no cover — defensive; cond() on a
-        # finite real matrix should not raise, but if a future torch version
-        # tightens the contract we fail safe to the freq-weighted result.
+    except torch.linalg.LinAlgError as exc:  # pragma: no cover — defensive; cond() on
+        # a finite real matrix should not raise, but rank-deficient inputs can
+        # trigger a LinAlgError inside the SVD. Fail safe to freq-weighted.
+        # Narrowed from bare ``Exception`` per reviewer feedback so unrelated
+        # bugs (CUDA OOM, device errors) propagate instead of being swallowed.
         log.warning(
             "_mergemoe_compute_merged_down: torch.linalg.cond(P) raised "
             "(%s) — falling back to freq-weighted merged down.",

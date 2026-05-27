@@ -791,6 +791,33 @@ def run(
             partial_dir, moe_layers, heal_enabled=heal_cfg.enabled,
         )
 
+        # Plugin #9 / S2_MM (D-mergemoe-resume-fallback): when the configured
+        # ``merge_step`` is ``"mergemoe"`` but the run is being resumed from
+        # ``partial_dir``, the per-layer ``_LayerInputAccumulator`` calibration
+        # buffer is not on disk — so the lstsq T₁=Q·P† solve cannot run for the
+        # replayed layers. We force ``merge_step="freq_weighted"`` for the
+        # resume loop below (see kwarg on the ``_merge_experts_inplace`` call).
+        # The in-function fallback log.warning in ``merging.py`` never fires for
+        # these layers because the forced ``"freq_weighted"`` short-circuits the
+        # ``layer_inputs is None`` check. Emit the deviation warning HERE so the
+        # operator sees one log line per resumed run that surfaces the silent
+        # downgrade — and note that ``stage2/config/merge_step`` Trackio key
+        # still records the configured (not effective per-layer) value.
+        if (
+            str(s2.get("merge_step", "freq_weighted")).lower() == "mergemoe"
+            and resumed_records
+        ):
+            log.warning(
+                "Stage 2 resume: forcing merge_step=freq_weighted for %d "
+                "replayed layers (D-mergemoe-resume-fallback). The "
+                "_LayerInputAccumulator buffer is not persisted across resume, "
+                "so MergeMoE's lstsq solve cannot run on the replayed layers. "
+                "New layers (post-resume-point) will use the configured "
+                "merge_step. Trackio key stage2/config/merge_step still records "
+                "the configured value, not the effective per-layer choice.",
+                len(resumed_records),
+            )
+
         for record in resumed_records:
             ref = record.layer_ref
             # scores=None on the resume path: saliency scores are not
@@ -808,7 +835,10 @@ def run(
             # what the freq-weighted fallback path would have produced anyway
             # — same posture as the saliency ``scores=None`` deviation above.
             # MergeMoE-mode crashes therefore require ``--no-resume`` to be
-            # re-run with the original calibration calibration buffer.
+            # re-run with the original calibration buffer. The single
+            # log.warning above (gated on configured merge_step == "mergemoe"
+            # and non-empty resumed_records) surfaces this deviation once per
+            # resumed run rather than once per layer.
             _merge_experts_inplace(
                 ref, record.grouped, record.freq,
                 freq_weighted=s2["ream"]["frequency_weighted_merge"],
