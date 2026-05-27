@@ -16,10 +16,14 @@ from .cka_distance import CKADistancePlugin
 from .grape_merge import GrapeMergePlugin
 from .ma_detection import MADetectionPlugin
 from .magnitude_topk import MagnitudeTopkPlugin
+from .rco_budget import RCOBudgetPlugin
 from .sink_token import SinkTokenDetectorPlugin
 from .three_way_and import ThreeWayAndPlugin
 
-# Ordered execution sequence — Phase A → Phase C (4 detectors) → D → E → F.
+# Ordered execution sequence — Phase A → Phase C (4 detectors) → D → E → F → G.
+# Phase G (RCO) is opt-in via ``stage1.rco_budget.enabled`` — when disabled
+# (the default) the plugin's ``run`` is never invoked and the manifest entry
+# is inert. See ``stage1/orchestrator.py`` STEP 10 for the gated call site.
 STAGE1_PLUGIN_MANIFEST = (
     MADetectionPlugin(),       # Phase A   — MA-formation detection
     ThreeWayAndPlugin(),       # Phase C₁  — three-way AND (mandatory)
@@ -29,6 +33,7 @@ STAGE1_PLUGIN_MANIFEST = (
     AblationFilterPlugin(),    # Phase D   — causal ΔNLL filter
     CKADistancePlugin(),       # Phase E   — CKA distance matrices
     GrapeMergePlugin(),        # Phase F   — GRAPE greedy merge
+    RCOBudgetPlugin(),         # Phase G   — RCO budget refinement (opt-in)
 )
 
 __all__ = [
@@ -36,4 +41,5 @@ __all__ = [
     "MADetectionPlugin", "ThreeWayAndPlugin", "AimerDetectorPlugin",
     "SinkTokenDetectorPlugin", "MagnitudeTopkPlugin",
     "AblationFilterPlugin", "CKADistancePlugin", "GrapeMergePlugin",
+    "RCOBudgetPlugin",
 ]
