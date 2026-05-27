@@ -1289,6 +1289,190 @@ register_corpus(CorpusAdapter(
 
 
 # ---------------------------------------------------------------------------
+# qwen3-pretrain-mix-v2 — reasoning-mode 12-subset hybrid mix (Generate + TF)
+# ---------------------------------------------------------------------------
+#
+# Sibling to ``qwen3-pretrain-mix`` (v1, 8 subsets, all generate-mode). The
+# v2 mix narrows-and-expands the source distribution to better cover the
+# Qwen3-thinking deploy surface: keeps the 7 instruct/SFT subsets that v1
+# already used (tulu3, math, qa, creative, multilingual, fineweb, papers),
+# adds 4 reasoning-format-native sources via TEACHER_FORCED policy
+# (MoT-math/code/science from open-r1, plus SWE-smith trajectories), and
+# adds Glaive function-calling as a GENERATE subset for tool-use coverage.
+#
+# Policy plumbing: every subset has a fixed policy ("GENERATE" or
+# "TEACHER_FORCED"). The build_self_traces_calib{,_vllm}.py scripts read
+# this policy to decide whether to run the teacher's generate() loop or
+# whether to emit the canonical assistant turn directly into the JSONL.
+# The downstream calibration loader (_stream_texts_self_traces) is policy-
+# agnostic — it renders+forwards whatever assistant message string ends up
+# in the JSONL row. Stage 2/2.5/3 capture cov/router/imatrix stats from
+# the rendered tokens regardless of source.
+#
+# Sole-truth dicts: all per-subset behavior (weight, avg_tokens, dataset,
+# config, split, policy) flows from the six ``_QWEN3_MIX_V2_*`` dicts
+# below. The iterator dispatches on subset key and looks up policy /
+# dataset / config / split / avg_tokens from these dicts; do NOT hardcode
+# per-subset choices in iterator/streamer bodies.
+#
+# Design + plan refs:
+#  * tasks/CALIBRATION_MIX_V2_DESIGN.md
+#  * tasks/CALIBRATION_MIX_V2_PLAN.md
+
+# 12-subset mix; weights sum to exactly 1.0 (5 GENERATE + 1 function_calling
+# GENERATE = 52%, 4 TEACHER_FORCED = 48%).
+_QWEN3_MIX_V2_WEIGHTS = {
+    "tulu3":            0.11,
+    "math":             0.09,
+    "qa":               0.05,
+    "creative":         0.05,
+    "multilingual":     0.08,
+    "fineweb":          0.05,
+    "papers":           0.05,
+    "mot_math":         0.12,
+    "mot_code":         0.12,
+    "mot_science":      0.08,
+    "swe_smith":        0.12,
+    "function_calling": 0.08,
+}
+
+# Avg tokens per row used for row-count budgeting. Underestimating risks
+# running out; overshoot is harmless (truncated by ``_tokenize_to_fixed_length``).
+_QWEN3_MIX_V2_AVG_TOKENS = {
+    "tulu3":              600,
+    "math":               800,
+    "qa":                 400,
+    "creative":           600,
+    "multilingual":       400,
+    "fineweb":           1500,
+    "papers":             300,
+    "mot_math":          3500,
+    "mot_code":         15000,
+    "mot_science":       2500,
+    "swe_smith":         8000,
+    "function_calling":   500,
+}
+
+_QWEN3_MIX_V2_DATASET = {
+    "tulu3":            "allenai/tulu-3-sft-mixture",
+    "math":             "nvidia/OpenMathInstruct-2",
+    "qa":               "databricks/databricks-dolly-15k",
+    "creative":         "euclaise/writingprompts",
+    "multilingual":     "CohereForAI/aya_dataset",
+    "fineweb":          "HuggingFaceFW/fineweb-edu",
+    "papers":           "gfissore/arxiv-abstracts-2021",
+    "mot_math":         "open-r1/Mixture-of-Thoughts",
+    "mot_code":         "open-r1/Mixture-of-Thoughts",
+    "mot_science":      "open-r1/Mixture-of-Thoughts",
+    "swe_smith":        "SWE-bench/SWE-smith-trajectories",
+    "function_calling": "glaiveai/glaive-function-calling-v2",
+}
+
+# Per-subset HF dataset config name (``load_dataset(name, config, ...)``).
+# Only the three MoT subsets need a config; all others use the default config
+# (``None`` → load_dataset's ``name=None`` positional default).
+_QWEN3_MIX_V2_DATASET_CONFIG: dict[str, str | None] = {
+    "tulu3":            None,
+    "math":             None,
+    "qa":               None,
+    "creative":         None,
+    "multilingual":     None,
+    "fineweb":          None,
+    "papers":           None,
+    "mot_math":         "math",
+    "mot_code":         "code",
+    "mot_science":      "science",
+    "swe_smith":        None,
+    "function_calling": None,
+}
+
+# Per-subset HF dataset split. Plain ``"train"`` for everything except
+# swe_smith which has named splits (we want ``"xml"`` — the Anthropic-XML
+# tool-call format that matches Qwen3's <tool_call> template).
+_QWEN3_MIX_V2_DATASET_SPLIT = {
+    "tulu3":            "train",
+    "math":             "train",
+    "qa":               "train",
+    "creative":         "train",
+    "multilingual":     "train",
+    "fineweb":          "train",
+    "papers":           "train",
+    "mot_math":         "train",
+    "mot_code":         "train",
+    "mot_science":      "train",
+    "swe_smith":        "xml",
+    "function_calling": "train",
+}
+
+# Per-subset policy. "GENERATE" = teacher generates fresh thinking-mode
+# response from prompt-only. "TEACHER_FORCED" = use the canonical assistant
+# turn from the source dataset (skip generation, emit JSONL row directly).
+# Consumed by build_self_traces_calib{,_vllm}.py at row-write time.
+_QWEN3_MIX_V2_POLICY = {
+    "tulu3":            "GENERATE",
+    "math":             "GENERATE",
+    "qa":               "GENERATE",
+    "creative":         "GENERATE",
+    "multilingual":     "GENERATE",
+    "fineweb":          "GENERATE",
+    "papers":           "GENERATE",
+    "mot_math":         "TEACHER_FORCED",
+    "mot_code":         "TEACHER_FORCED",
+    "mot_science":      "TEACHER_FORCED",
+    "swe_smith":        "TEACHER_FORCED",
+    "function_calling": "GENERATE",
+}
+
+# One-shot guard for the v2 intro banner (mirrors the v1 guard at the
+# top of this file; do NOT reuse the v1 flag so v1 and v2 each get to log
+# their own orientation banner once per process).
+_broad_instruct_mix_v2_intro_logged: bool = False
+
+
+def _parse_yaml_qwen3_pretrain_mix_v2(
+    cal_cfg: dict, num_sequences: int, sequence_length: int, seed: int,
+) -> CalibrationSpec:
+    """Yaml → CalibrationSpec for ``qwen3-pretrain-mix-v2``.
+
+    Twin of ``_parse_yaml_qwen3_pretrain_mix`` but stamps
+    ``source="qwen3-pretrain-mix-v2"`` so the CalibrationSpec cache_key
+    correctly invalidates between v1 and v2 runs. Same contract: the
+    YAML's ``dataset`` / ``subset_weights`` are ignored — the mix is
+    hard-coded in the ``_QWEN3_MIX_V2_*`` dicts above.
+    """
+    return CalibrationSpec(
+        num_sequences=num_sequences,
+        sequence_length=sequence_length,
+        seed=seed,
+        source="qwen3-pretrain-mix-v2",
+    )
+
+
+def _stream_texts_qwen3_pretrain_mix_v2(spec: CalibrationSpec, tokenizer) -> list[str]:
+    """Stream rendered chat-format texts for the v2 mix.
+
+    Placeholder implementation that intentionally raises until Step 3 of
+    the calibration-v2 plan lands the per-subset dispatch and the three
+    new helpers (_stream_messages_with_config, _stream_swe_smith_xml,
+    _stream_glaive_function_calling). The corpus is REGISTERED now so the
+    CalibrationSpec round-trip and cache_key tests pass at Step 1; the
+    actual text-streaming faucet is filled in at Step 3.
+    """
+    raise NotImplementedError(
+        "_stream_texts_qwen3_pretrain_mix_v2 is a Step-1 placeholder; "
+        "Step 3 of tasks/CALIBRATION_MIX_V2_PLAN.md fills in the body. "
+        "Until then, calibration consumption from this corpus is unavailable."
+    )
+
+
+register_corpus(CorpusAdapter(
+    name="qwen3-pretrain-mix-v2",
+    parse_yaml=_parse_yaml_qwen3_pretrain_mix_v2,
+    stream_texts=_stream_texts_qwen3_pretrain_mix_v2,
+))
+
+
+# ---------------------------------------------------------------------------
 # self-traces — model-self-distillation calibration (FIRST STEP FOR ANY NEW MODEL)
 # ---------------------------------------------------------------------------
 #
