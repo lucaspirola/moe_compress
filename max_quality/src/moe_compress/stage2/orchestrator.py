@@ -972,6 +972,7 @@ def run(
     from .plugins.output_space_cost import OutputSpaceCostPlugin
     from .plugins.ream_cost import ReamCostPrePlugin
     from .plugins.ream_cost_post import ReamCostPostPlugin
+    from .plugins.ream_sequential import Stage2ReamSequentialPlugin
     from .plugins.reap_scoring import ReapScoringPlugin
     from .plugins.reap_scores_cache import Stage2ReapScoresCacheProvider
     from .plugins.routing_stats_cache import Stage2RoutingStatsCacheProvider
@@ -1165,6 +1166,20 @@ def run(
             artifacts_dir=artifacts_dir,
             device=device,
         ),
+        # Plugin #10 (row S2_SEQ) — REAM sequential merging cache invalidator.
+        # Registered LAST in the PluginRegistry list so its ``on_post_merge``
+        # hook fires after any other plugin's ``on_post_merge`` (none of the
+        # other 18 Stage 2 plugins implement that hook today, but ordering
+        # last is the safe default for any future plugin that wants to
+        # READ the caches in ``on_post_merge`` before they get cleared).
+        # ``LayerMergePlugin`` does NOT implement ``on_post_merge`` at all
+        # (its merge-spine work happens in ``merge`` / ``post_merge``), so
+        # the "must run AFTER LayerMergePlugin in on_post_merge phase"
+        # contract is satisfied trivially. Default-OFF gate
+        # (``stage2_reap_ream.sequential_reprofile``): ``registry.enabled``
+        # drops this plugin at the default, preserving byte-identical
+        # existing behavior. See arXiv:2604.04356 §4 / SC_STAGE12 §523-532.
+        Stage2ReamSequentialPlugin(),
     ])
     plugins = registry.enabled(config)
     walk_phases(("on_run_setup",), plugins, run_ctx)
