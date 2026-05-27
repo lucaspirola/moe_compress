@@ -34,6 +34,69 @@ git apply --check /path/to/vllm_calibration_hooks.patch && echo OK
 
 ## Change log
 
+### `calib-v2-stage2-profile-writer` (in-flight)
+
+Adds the Plugin #12 REDO -- Optimization A profile-pass sidecar writer
+(SC_FAST_PLAN_V3 section 4). Lives in its own patch file
+``vllm_calibration_stage2_profile.patch`` (separate from the main
+``vllm_calibration_hooks.patch`` until the wheel rebuild folds it in).
+
+- `vllm/calibration_stage2_profile.py`: new module that wraps the
+  canonical writer logic from
+  ``moe_compress.calibration.stage2_profile_writer``. Subscribes the
+  ``router`` and ``expert_out_unweighted`` calibration_hooks callbacks
+  to populate a live :class:`ReamCostAccumulator` (so the Eq. 8
+  numerator is computed via the SAME ``finalize_batch`` code path the
+  live profiling uses -- Bug #1 fix: per-token jointly-active pair
+  cosines, NOT cos(mean_i, mean_j)) and an
+  :class:`InputCovarianceAccumulator` with ``storage_dtype`` pinned
+  IMMEDIATELY by ``setup(llm, cov_storage_dtype=...)`` (Bug avoidance:
+  no reliance on the default fp32 at ``activation_hooks.py:961``).
+  ``dump_stage2_profile`` finalizes pending cov entries layer-by-layer,
+  asserts the live ``storage_dtype`` still matches the configured
+  value, translates layer_idx-keyed dicts to layer_rank-keyed payload
+  dicts, and writes the v3 sidecar via
+  ``moe_compress.utils.cached_calibration_signals.save_stage2_profile_v3``.
+  ``dump_stage2_profile_checkpoint`` / ``load_stage2_profile_checkpoint``
+  mirror the imatrix / REAP / input-cov resumability cadence (atomic
+  tmp+rename, schema-versioned, CPU-resident).
+- Env-var gating: ``VLLM_CALIB_CAPTURE_STAGE2_PROFILE=1`` is sampled
+  at import. Requires ``VLLM_CALIB_CAPTURE_ROUTER=1`` +
+  ``VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1`` +
+  ``VLLM_USE_FLASHINFER_MOE_FP16=0`` (FlashInfer monolithic path lacks
+  ``expert_out_unweighted``).
+
+Driver-side companion (`build_self_traces_calib_vllm.py`): new flags
+``--capture-stage2-profile``, ``--stage2-profile-cov-storage-dtype``
+(choices: float16 / bfloat16 / float32, default float16),
+``--stage2-profile-checkpoint-every-chunks`` (default 1). Five
+insertion points: argparse (before --capture-per-expert-max), env-gate
+block (after routing-stats env block), setup block (after input-cov
+setup), periodic checkpoint (in the chunk loop after input-cov
+checkpoint), final dump (after input-cov dump).
+
+Stage 2 reader-side companion: ``Stage2ProfileCacheProvider``
+(``max_quality/src/moe_compress/stage2/plugins/stage2_profile_cache.py``)
+registered in the Stage 2 ``PluginRegistry`` AFTER ``LayerMergePlugin``
+(OQ-1 Option A -- in-place hydration of the fresh ream_acc /
+layer_input_acc that ``LayerMergePlugin.on_layer_setup`` constructs).
+Gated on ``stage2_reap_ream.profile_sidecar.enabled`` (default false).
+On full hit: hydrates ream_acc + cov_acc + layer_input_acc so
+``LayerMergePlugin.on_profile`` early-returns (Pattern A skip). On
+partial / miss: no-op; live forward runs unchanged.
+
+Cross-validation at load time: schema_version, cov_storage_dtype
+(against the run's ``s2.covariance_storage_dtype``), n_layers,
+n_experts, top_k, model_hash -- any mismatch raises ``ValueError``
+with the standard "Delete the sidecar to regenerate" message.
+
+Schema bump: ``SCHEMA_VERSIONS["stage2_profile"]`` bumped from 1 to 3
+(skips 2 to signal a clean break from the deleted prior Plugin #12
+v1 writer). The v1 dataclass was never persisted by a production
+writer; the v1 -> v3 bump is intentionally NOT forward-compatible.
+Pattern K applies forward (v3 -> v4 SHOULD preserve readers when
+adding optional fields).
+
 ### `calib-v2-max-layer-early-exit` (current)
 Adds the L2 ``max_layer`` early-exit gate to ``Qwen3MoeModel.forward``
 (Item L2 of the calibration-v2 writers campaign — foundation for L1's
@@ -614,7 +677,7 @@ infrastructure. Bump these when changing the dataclass layout in
 | Signal | schema_version | Notes |
 |---|---|---|
 | `phase_b` | 1 | initial |
-| `stage2_profile` | 1 | initial |
+| `stage2_profile` | 3 | v3 -- Plugin #12 REDO (Optimization A). Replaces deleted v1 (delta_gate / delta_expert / a_gate_up / a_down / token_counts). Now: `format_version: 3`, `model_hash`, `top_k`, `cov_storage_dtype` (cross-validated), `total_tokens_per_layer [n_layers] int64`, `gate_logit_profiles dict[int -> list[(int, Tensor[T_b, E] fp32)]]`, `sim_tensor [n_layers, E, E] fp64`, `neuron_act_sum/_count dict[(layer_rank, expert)]`, `cov_acc/_token_count dict[(layer_rank, expert, matrix_name)]` (finalized covariance, FP/BF/F16), `layer_input_reservoir list[Tensor[N, hidden] bf16]` (len == n_layers, always populated when --capture-stage2-profile is on). All dict keys use `layer_rank` (portable across models). |
 | `reap_scores` | 1 | initial — V1+V2 writers campaign, REAP Eq. 9 (arXiv:2510.13999); `[n_layers, n_experts] float32` + matching `int64` counts |
 | `per_expert_max` | 1 | initial — Item 2 writers campaign, Stage 1 cheap-pruning candidate-ranking signal; `[n_layers, n_experts] float32` (max of `\|f_j(x)\|_inf` over tokens routed to expert j in layer rank l, zero-filled for zero-traffic cells) + matching `int64` token counts |
 | `routing_stats` | 1 | initial — Item 3 writers campaign, per-(layer, expert) routing frequency + mean routing weight; `[n_layers, n_experts]` int64 freq + float32 mean_weight (zero where freq==0, no NaN). NO immediate downstream consumer; payload deposited on `ctx.routing_stats_payload` for future plugins (routing-aware ablation gating, mean-weight-weighted REAP variants). |

@@ -97,7 +97,13 @@ from moe_compress.pipeline.plugin import BasePlugin
 # ---------------------------------------------------------------------------
 SCHEMA_VERSIONS: dict[str, int] = {
     "phase_b":             1,
-    "stage2_profile":      1,
+    # stage2_profile bumped 1 → 3 (skip 2 to signal clean break from the
+    # deleted prior Plugin #12 v1 writer; see Stage2ProfilePayloadV3
+    # docstring). Pattern K applies forward (v3 → v4 should preserve
+    # readers when only optional fields are added), but the v1 → v3 bump
+    # is intentionally NOT forward-compatible — the v1 dataclass was
+    # never written by a production writer, so no callers exist.
+    "stage2_profile":      3,
     "covariance":          2,
     "router_kd_logits":    1,
     "block_hidden":        1,
@@ -150,15 +156,63 @@ class PhaseBPayload:
 
 
 @dataclass
-class Stage2ProfilePayload:
-    schema_version: int
-    n_experts: int
+class Stage2ProfilePayloadV3:
+    """Stage 2 profile-pass sidecar payload (schema v3) — Optimization A REDO.
+
+    Replaces the deleted prior :class:`Stage2ProfilePayload` (v1) with the
+    REDO schema described in PLAN_PLUGIN_12_opt_a_redo.md §3. Every field
+    is keyed by ``layer_rank`` (0-based ordinal into the MoE layer list),
+    NOT absolute ``layer_idx``; the reader translates rank → layer_idx on
+    hydration. This makes the sidecar portable across models with
+    different dense-prefix layer counts.
+
+    Fields:
+        format_version: constant ``3`` — distinguishes from old v1.
+        schema_version: ``3`` — checked by ``load_stage2_profile_v3``.
+        model_hash: SHA-256 of model name + config (cross-validation).
+        n_layers: number of MoE layers.
+        n_experts: routed experts per layer.
+        top_k: top-k routing (cross-validated).
+        cov_storage_dtype: one of {"float16","bfloat16","float32"} —
+            cross-validated against the run's
+            ``s2.covariance_storage_dtype`` setting at load time.
+        total_tokens_per_layer: [n_layers] int64 — Σ_b T_b per layer
+            (independent of routing activity; Bug #3 fix).
+        gate_logit_profiles: ``dict[layer_rank → list[(offset, Tensor)]]``
+            — raw per-batch gate logits, preserved verbatim from the
+            live ``ReamCostAccumulator.gate_logit_profiles`` storage
+            (Bug #2 fix).
+        sim_tensor: [n_layers, E, E] fp64 — Σ_t cos(g_i[t], g_j[t]) over
+            jointly-active tokens (Bug #1 fix: per-token pair cosines,
+            NOT cos(mean_i, mean_j)).
+        neuron_act_sum / neuron_act_count: per-(layer_rank, expert) mean
+            intermediate activations for C_act neuron alignment.
+        cov_acc: dict[(layer_rank, expert_idx, matrix_name) →
+            Tensor[d_in, d_in] in ``cov_storage_dtype``] — FINALIZED
+            input covariance (post ``finalize_layer``). ``matrix_name`` ∈
+            {"gate_proj", "down_proj"}; up_proj is aliased to gate_proj.
+        cov_token_count: dict[(layer_rank, expert_idx, matrix_name) →
+            int] — token count per cov entry.
+        layer_input_reservoir: ``list[Tensor[N, hidden] bf16]`` of length
+            ``n_layers`` — per-rank layer-input samples for SC strategy's
+            ``_output_space_cost``. Always captured when the sidecar is
+            written (no sub-flag; see plan §6 / OQ-2 resolution).
+    """
+    format_version: int                     # = 3
+    schema_version: int                     # = 3
+    model_hash: str
     n_layers: int
-    delta_gate: torch.Tensor              # [n_layers, n_experts, n_experts] float32
-    delta_expert: torch.Tensor            # [n_layers, n_experts, n_experts] float64
-    a_gate_up: torch.Tensor               # [n_layers, n_experts, intermediate_dim] float32
-    a_down: torch.Tensor                  # [n_layers, n_experts, hidden_dim] float32
-    token_counts: torch.Tensor            # [n_layers, n_experts] int64
+    n_experts: int
+    top_k: int
+    cov_storage_dtype: str                  # one of {"float16","bfloat16","float32"}
+    total_tokens_per_layer: torch.Tensor    # [n_layers] int64
+    gate_logit_profiles: dict               # dict[int → list[tuple[int, Tensor[T_b, E] fp32]]]
+    sim_tensor: torch.Tensor                # [n_layers, E, E] fp64
+    neuron_act_sum: dict                    # {(layer_rank, expert_idx): Tensor[d_int] fp32}
+    neuron_act_count: dict                  # {(layer_rank, expert_idx): int}
+    cov_acc: dict                           # {(layer_rank, expert_idx, matrix_name): Tensor[d, d] in cov_storage_dtype}
+    cov_token_count: dict                   # {(layer_rank, expert_idx, matrix_name): int}
+    layer_input_reservoir: list             # list[Tensor[N, hidden] bf16] (len == n_layers)
 
 
 @dataclass
@@ -464,26 +518,179 @@ def load_phase_b(jsonl_path: Path) -> PhaseBPayload | None:
 
 
 # ---------------------------------------------------------------------------
-# Signal 2: stage2_profile (Stage 2 Delta/A accumulators).
+# Signal 2: stage2_profile (Stage 2 REDO — Optimization A profile-pass sidecar).
+#
+# Schema v3 (see Stage2ProfilePayloadV3 docstring above). The v1 dataclass
+# was deleted; no alias is retained per plan §3 / Low-8 (prior v1 had no
+# production writer, so no callers exist).
 # ---------------------------------------------------------------------------
-def save_stage2_profile(payload: Stage2ProfilePayload, jsonl_path: Path) -> None:
-    cpu_payload = replace(
-        payload,
-        delta_gate=payload.delta_gate.detach().cpu(),
-        delta_expert=payload.delta_expert.detach().cpu(),
-        a_gate_up=payload.a_gate_up.detach().cpu(),
-        a_down=payload.a_down.detach().cpu(),
-        token_counts=payload.token_counts.detach().cpu(),
+_COV_STORAGE_DTYPE_ALLOWED = ("float16", "bfloat16", "float32")
+
+
+def save_stage2_profile_v3(
+    payload: Stage2ProfilePayloadV3, jsonl_path: Path,
+) -> None:
+    """Atomically write the Stage 2 profile sidecar (schema v3).
+
+    Moves all tensors to CPU before serialization so the sidecar is
+    device-agnostic (H200 → RTX 6000 Pro / CPU round-trip is supported).
+    The ``gate_logit_profiles`` dict's nested ``list[tuple[int, Tensor]]``
+    structure is preserved byte-for-byte: each per-batch tensor is moved
+    to CPU but the ``(int, tensor)`` tuple shape and list ordering are
+    not altered.
+    """
+    if payload.cov_storage_dtype not in _COV_STORAGE_DTYPE_ALLOWED:
+        raise ValueError(
+            f"save_stage2_profile_v3: cov_storage_dtype="
+            f"{payload.cov_storage_dtype!r} not in "
+            f"{_COV_STORAGE_DTYPE_ALLOWED!r}"
+        )
+    cov_dtype = getattr(torch, payload.cov_storage_dtype)
+
+    # Move gate_logit_profiles list-of-tuples to CPU, preserving shape.
+    cpu_glp: dict[int, list[tuple[int, torch.Tensor]]] = {}
+    for layer_rank, batches in payload.gate_logit_profiles.items():
+        cpu_glp[int(layer_rank)] = [
+            (int(offset), t.detach().to("cpu", dtype=torch.float32).contiguous())
+            for offset, t in batches
+        ]
+
+    # neuron_act_sum / neuron_act_count are small per-(layer, expert) tensors
+    # / ints; CPU-cast tensors, deep-copy counts.
+    cpu_nas = {
+        (int(lr), int(e)): v.detach().to("cpu", dtype=torch.float32).contiguous()
+        for (lr, e), v in payload.neuron_act_sum.items()
+    }
+    cpu_nac = {(int(lr), int(e)): int(c)
+               for (lr, e), c in payload.neuron_act_count.items()}
+
+    # cov_acc dict entries are CPU-cast to the declared storage dtype.
+    cpu_cov = {
+        (int(lr), int(e), str(m)): v.detach().to(
+            "cpu", dtype=cov_dtype, copy=True,
+        ).contiguous()
+        for (lr, e, m), v in payload.cov_acc.items()
+    }
+    cpu_ctc = {(int(lr), int(e), str(m)): int(n)
+               for (lr, e, m), n in payload.cov_token_count.items()}
+
+    # layer_input_reservoir: list[Tensor[N, hidden] bf16]; CPU + bf16.
+    cpu_lir: list = []
+    for i, t in enumerate(payload.layer_input_reservoir):
+        if t is None:
+            # Per plan: the field is always populated when capture is on,
+            # but we tolerate Optional entries (e.g. partial captures)
+            # rather than crash here. Writer-side §10 guarantees a tensor
+            # per rank; this is defense-in-depth.
+            cpu_lir.append(None)
+        else:
+            cpu_lir.append(
+                t.detach().to("cpu", dtype=torch.bfloat16).contiguous()
+            )
+
+    cpu_payload = Stage2ProfilePayloadV3(
+        format_version=int(payload.format_version),
+        schema_version=int(payload.schema_version),
+        model_hash=str(payload.model_hash),
+        n_layers=int(payload.n_layers),
+        n_experts=int(payload.n_experts),
+        top_k=int(payload.top_k),
+        cov_storage_dtype=str(payload.cov_storage_dtype),
+        total_tokens_per_layer=payload.total_tokens_per_layer.detach().to(
+            "cpu", dtype=torch.int64,
+        ).contiguous(),
+        gate_logit_profiles=cpu_glp,
+        sim_tensor=payload.sim_tensor.detach().to(
+            "cpu", dtype=torch.float64,
+        ).contiguous(),
+        neuron_act_sum=cpu_nas,
+        neuron_act_count=cpu_nac,
+        cov_acc=cpu_cov,
+        cov_token_count=cpu_ctc,
+        layer_input_reservoir=cpu_lir,
     )
     _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "stage2_profile"))
 
 
-def load_stage2_profile(jsonl_path: Path) -> Stage2ProfilePayload | None:
+def load_stage2_profile_v3(
+    jsonl_path: Path,
+    *,
+    expected_cov_storage_dtype: str | None = None,
+    expected_n_layers: int | None = None,
+    expected_n_experts: int | None = None,
+    expected_top_k: int | None = None,
+    expected_model_hash: str | None = None,
+) -> Stage2ProfilePayloadV3 | None:
+    """Load the Stage 2 profile sidecar (schema v3).
+
+    Returns ``None`` if the sidecar does not exist (cache miss). Raises
+    ``ValueError`` with the "Delete the sidecar to regenerate" message on
+    schema_version mismatch or on any cross-validation failure.
+
+    Cross-validation (each is optional; only checked when caller passes
+    the corresponding expected_* kwarg):
+        * schema_version (always)
+        * cov_storage_dtype (driver flag must match Stage 2 YAML)
+        * n_layers, n_experts, top_k, model_hash
+    """
     path = sidecar_path(jsonl_path, "stage2_profile")
     if not path.exists():
         return None
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("stage2_profile", loaded.schema_version, path)
+    if not isinstance(loaded, Stage2ProfilePayloadV3):
+        raise ValueError(
+            f"stage2_profile sidecar at {path} is not Stage2ProfilePayloadV3 "
+            f"(got {type(loaded).__name__}). "
+            f"Delete the sidecar to regenerate."
+        )
+    # cov_storage_dtype must be one of the allowed strings even when no
+    # expected_* is given — catches a future writer that ships a garbage
+    # value.
+    if loaded.cov_storage_dtype not in _COV_STORAGE_DTYPE_ALLOWED:
+        raise ValueError(
+            f"stage2_profile sidecar at {path} has cov_storage_dtype="
+            f"{loaded.cov_storage_dtype!r} not in "
+            f"{_COV_STORAGE_DTYPE_ALLOWED!r}. "
+            f"Delete the sidecar to regenerate."
+        )
+    if (expected_cov_storage_dtype is not None
+            and loaded.cov_storage_dtype != expected_cov_storage_dtype):
+        raise ValueError(
+            f"stage2_profile sidecar at {path} has cov_storage_dtype="
+            f"{loaded.cov_storage_dtype!r} but the run is configured with "
+            f"covariance_storage_dtype={expected_cov_storage_dtype!r}. "
+            f"Delete the sidecar to regenerate."
+        )
+    if (expected_n_layers is not None
+            and int(loaded.n_layers) != int(expected_n_layers)):
+        raise ValueError(
+            f"stage2_profile sidecar at {path} has n_layers="
+            f"{loaded.n_layers} but the run has {expected_n_layers}. "
+            f"Delete the sidecar to regenerate."
+        )
+    if (expected_n_experts is not None
+            and int(loaded.n_experts) != int(expected_n_experts)):
+        raise ValueError(
+            f"stage2_profile sidecar at {path} has n_experts="
+            f"{loaded.n_experts} but the run has {expected_n_experts}. "
+            f"Delete the sidecar to regenerate."
+        )
+    if (expected_top_k is not None
+            and int(loaded.top_k) != int(expected_top_k)):
+        raise ValueError(
+            f"stage2_profile sidecar at {path} has top_k="
+            f"{loaded.top_k} but the run has {expected_top_k}. "
+            f"Delete the sidecar to regenerate."
+        )
+    if (expected_model_hash is not None
+            and loaded.model_hash != expected_model_hash):
+        raise ValueError(
+            f"stage2_profile sidecar at {path} has model_hash="
+            f"{loaded.model_hash!r} but the run has "
+            f"{expected_model_hash!r}. "
+            f"Delete the sidecar to regenerate."
+        )
     return loaded
 
 
@@ -838,7 +1045,7 @@ __all__ = [
     "sidecar_path",
     "router_kd_logits_dir",
     "PhaseBPayload",
-    "Stage2ProfilePayload",
+    "Stage2ProfilePayloadV3",
     "Stage2ReapPayload",
     "Stage1PerExpertMaxPayload",
     "RoutingStatsPayload",
@@ -850,8 +1057,8 @@ __all__ = [
     "TeacherEvalPayload",
     "save_phase_b",
     "load_phase_b",
-    "save_stage2_profile",
-    "load_stage2_profile",
+    "save_stage2_profile_v3",
+    "load_stage2_profile_v3",
     "save_reap_scores",
     "load_reap_scores",
     "save_per_expert_max",

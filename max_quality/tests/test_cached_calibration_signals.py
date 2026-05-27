@@ -47,7 +47,7 @@ from moe_compress.utils.cached_calibration_signals import (
     RouterLogitsStatsPayload,
     RoutingStatsPayload,
     Stage1PerExpertMaxPayload,
-    Stage2ProfilePayload,
+    Stage2ProfilePayloadV3,
     Stage2ReapPayload,
     TeacherEvalPayload,
     load_block_hidden,
@@ -59,7 +59,7 @@ from moe_compress.utils.cached_calibration_signals import (
     load_router_logits_stats,
     load_routing_stats,
     load_router_kd_logits,
-    load_stage2_profile,
+    load_stage2_profile_v3,
     load_teacher_eval,
     router_kd_logits_dir,
     save_block_hidden,
@@ -71,7 +71,7 @@ from moe_compress.utils.cached_calibration_signals import (
     save_router_logits_stats,
     save_routing_stats,
     save_router_kd_logits,
-    save_stage2_profile,
+    save_stage2_profile_v3,
     save_teacher_eval,
     sidecar_path,
 )
@@ -99,20 +99,48 @@ def _make_phase_b(n_layers: int = 2, n_experts: int = 3) -> PhaseBPayload:
     )
 
 
-def _make_stage2_profile(n_layers: int = 2, n_experts: int = 3) -> Stage2ProfilePayload:
-    return Stage2ProfilePayload(
+def _make_stage2_profile(
+    n_layers: int = 2, n_experts: int = 3, *, hidden: int = 8, d_int: int = 4,
+) -> Stage2ProfilePayloadV3:
+    """Build a deterministic Stage 2 profile-pass payload (schema v3).
+
+    Tiny shapes — the focus is on schema/IO round-trip, not numerics.
+    """
+    gate_logit_profiles: dict[int, list[tuple[int, torch.Tensor]]] = {}
+    neuron_act_sum: dict = {}
+    neuron_act_count: dict = {}
+    cov_acc: dict = {}
+    cov_token_count: dict = {}
+    layer_input_reservoir: list = []
+    T_b = 5
+    for lr in range(n_layers):
+        gate_logit_profiles[lr] = [
+            (T_b * b, torch.full((T_b, n_experts), 0.1 * (b + 1), dtype=torch.float32))
+            for b in range(2)
+        ]
+        for e in range(n_experts):
+            neuron_act_sum[(lr, e)] = torch.full((d_int,), 0.3, dtype=torch.float32)
+            neuron_act_count[(lr, e)] = 11
+            for m in ("gate_proj", "down_proj"):
+                cov_acc[(lr, e, m)] = torch.eye(hidden, dtype=torch.float16)
+                cov_token_count[(lr, e, m)] = 7
+        layer_input_reservoir.append(torch.zeros((8, hidden), dtype=torch.bfloat16))
+    return Stage2ProfilePayloadV3(
+        format_version=3,
         schema_version=SCHEMA_VERSIONS["stage2_profile"],
-        n_experts=n_experts,
+        model_hash="deadbeef",
         n_layers=n_layers,
-        delta_gate=torch.full(
-            (n_layers, n_experts, n_experts), 1.0, dtype=torch.float32
-        ),
-        delta_expert=torch.full(
-            (n_layers, n_experts, n_experts), 2.0, dtype=torch.float64
-        ),
-        a_gate_up=torch.full((n_layers, n_experts, 5), 0.1, dtype=torch.float32),
-        a_down=torch.full((n_layers, n_experts, 7), 0.2, dtype=torch.float32),
-        token_counts=torch.ones((n_layers, n_experts), dtype=torch.int64) * 13,
+        n_experts=n_experts,
+        top_k=2,
+        cov_storage_dtype="float16",
+        total_tokens_per_layer=torch.full((n_layers,), 2 * T_b, dtype=torch.int64),
+        gate_logit_profiles=gate_logit_profiles,
+        sim_tensor=torch.zeros((n_layers, n_experts, n_experts), dtype=torch.float64),
+        neuron_act_sum=neuron_act_sum,
+        neuron_act_count=neuron_act_count,
+        cov_acc=cov_acc,
+        cov_token_count=cov_token_count,
+        layer_input_reservoir=layer_input_reservoir,
     )
 
 
@@ -235,22 +263,31 @@ def test_phase_b_roundtrip(tmp_path):
 def test_stage2_profile_roundtrip(tmp_path):
     jsonl = _jsonl(tmp_path)
     original = _make_stage2_profile()
-    save_stage2_profile(original, jsonl)
+    save_stage2_profile_v3(original, jsonl)
 
     expected_path = sidecar_path(jsonl, "stage2_profile")
     assert expected_path.exists()
 
-    loaded = load_stage2_profile(jsonl)
+    loaded = load_stage2_profile_v3(jsonl)
     assert loaded is not None
     assert loaded.schema_version == SCHEMA_VERSIONS["stage2_profile"]
-    assert torch.equal(loaded.delta_gate, original.delta_gate.cpu())
-    assert torch.equal(loaded.delta_expert, original.delta_expert.cpu())
-    assert torch.equal(loaded.a_gate_up, original.a_gate_up.cpu())
-    assert torch.equal(loaded.a_down, original.a_down.cpu())
-    assert torch.equal(loaded.token_counts, original.token_counts.cpu())
+    assert loaded.format_version == 3
+    assert loaded.cov_storage_dtype == "float16"
+    assert torch.equal(
+        loaded.total_tokens_per_layer, original.total_tokens_per_layer.cpu()
+    )
+    assert torch.equal(loaded.sim_tensor, original.sim_tensor.cpu())
+    # gate_logit_profiles preserves the list-of-tuples shape verbatim.
+    assert set(loaded.gate_logit_profiles) == set(original.gate_logit_profiles)
+    for lr, batches in original.gate_logit_profiles.items():
+        loaded_batches = loaded.gate_logit_profiles[lr]
+        assert len(loaded_batches) == len(batches)
+        for (lof, lt), (oof, ot) in zip(loaded_batches, batches):
+            assert int(lof) == int(oof)
+            assert torch.equal(lt, ot.cpu())
     # Dtype preserved across the round-trip (float64 stays float64).
-    assert loaded.delta_expert.dtype == torch.float64
-    assert loaded.token_counts.dtype == torch.int64
+    assert loaded.sim_tensor.dtype == torch.float64
+    assert loaded.total_tokens_per_layer.dtype == torch.int64
 
 
 def _make_reap_scores(n_layers: int = 2, n_experts: int = 3) -> Stage2ReapPayload:

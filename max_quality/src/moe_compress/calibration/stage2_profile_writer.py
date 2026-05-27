@@ -1,0 +1,628 @@
+"""Stage 2 profile-pass sidecar WRITER (Plugin #12 REDO — Optimization A).
+
+This module is the writer half of the cache-or-live provider pair. It is
+imported by ``build_self_traces_calib_vllm.py`` under the alias
+``vllm.calibration_stage2_profile`` (the actual import target after the
+vLLM patch is applied lives at ``vllm/calibration_stage2_profile.py``;
+the file here is the canonical source — the patch ships a verbatim copy
+into the vLLM tree).
+
+Design — single writer, one sidecar, four data streams:
+  * Router hook → gate logit profiles (Bug #2 fix: raw per-batch list,
+    NOT pre-collapsed).
+  * Expert-out-unweighted hook → per-batch ``(token_indices, gated)``
+    per expert, fed into a real :class:`ReamCostAccumulator` so the
+    Eq. 8 numerator is computed via the SAME finalize_batch code path
+    the live profiling uses (Bug #1 fix: per-token jointly-active pair
+    cosines, NOT cos(mean_i, mean_j)).
+  * Layer-input hook → :class:`_LayerInputAccumulator` per layer rank
+    (Crit-3 fix: always captured when --capture-stage2-profile is on).
+  * Per-batch token-count → fed into the same ReamCostAccumulator's
+    ``record_batch_token_count`` for the Eq. 8 denominator (Bug #3 fix:
+    EXACT |X|, NOT Sum_e token_counts_e).
+
+Cov accumulation reuses :class:`InputCovarianceAccumulator` directly so
+the writer-side cov entries are byte-identical with what a live Stage 2
+run would produce. ``setup`` calls ``set_storage_dtype`` IMMEDIATELY so
+the writer never relies on the default fp32 dtype at
+``activation_hooks.py:961``.
+
+Public API used by the driver:
+    * :func:`setup`
+    * :func:`dump_stage2_profile`
+    * :func:`dump_stage2_profile_checkpoint`
+    * :func:`load_stage2_profile_checkpoint`
+    * :func:`set_n_prompts_accumulated`
+    * :func:`get_n_prompts_accumulated`
+    * :func:`record_batch_token_count`
+
+Internal callbacks exposed for unit testing (plan section 8.1):
+    * :func:`_on_router_callback`
+    * :func:`_on_expert_out_unweighted_callback`
+    * :func:`_finalize_batch_for_layer`
+"""
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from ..utils.activation_hooks import (
+    InputCovarianceAccumulator,
+    ReamCostAccumulator,
+)
+from ..utils.cached_calibration_signals import (
+    SCHEMA_VERSIONS,
+    Stage2ProfilePayloadV3,
+    save_stage2_profile_v3,
+)
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class _WriterState:
+    """Single shared accumulator state for the run.
+
+    Held module-level (the writer is a singleton per process; the
+    pre-import env-var gate VLLM_CALIB_CAPTURE_STAGE2_PROFILE keeps a
+    stale state from a previous process from leaking through). Reset by
+    :func:`setup`.
+    """
+    ream_acc: ReamCostAccumulator = field(default_factory=ReamCostAccumulator)
+    cov_acc: InputCovarianceAccumulator = field(default_factory=InputCovarianceAccumulator)
+    # Per-layer-idx reservoirs; translated to layer_rank list at dump time.
+    layer_input_reservoir: dict[int, torch.Tensor] = field(default_factory=dict)
+    layer_idx_to_rank: dict[int, int] = field(default_factory=dict)
+    rank_to_layer_idx: dict[int, int] = field(default_factory=dict)
+    n_layers: int = 0
+    n_experts: int = 0
+    top_k: int = 0
+    model_hash: str = ""
+    configured_cov_storage_dtype: str = "float16"
+    n_prompts_accumulated: int = 0
+
+
+_state: _WriterState = _WriterState()
+
+
+# ---------------------------------------------------------------------------
+# Public API.
+# ---------------------------------------------------------------------------
+def setup(
+    llm: Any | None = None,
+    *,
+    cov_storage_dtype: str = "float16",
+    n_layers: int | None = None,
+    n_experts: int | None = None,
+    top_k: int | None = None,
+    model_hash: str | None = None,
+    layer_idx_to_rank: dict[int, int] | None = None,
+) -> None:
+    """Initialize the writer state.
+
+    Called once from ``build_self_traces_calib_vllm.py`` after the vLLM
+    LLM object exists but BEFORE any prompt is sampled (so the
+    callbacks register before the first router hook fires).
+
+    The env gate VLLM_CALIB_CAPTURE_STAGE2_PROFILE is checked by the
+    upstream callback dispatcher; ``setup`` itself is unconditional --
+    callers that did not set the env should not invoke us.
+
+    Args:
+        llm: the vLLM LLM object. When ``None``, the function operates
+            in test / standalone mode (no model introspection).
+        cov_storage_dtype: one of {"float16","bfloat16","float32"}.
+            Pinned IMMEDIATELY on the writer's cov_acc so the default
+            fp32 at ``activation_hooks.py:961`` is overridden before
+            any ``update`` call can land.
+        n_layers / n_experts / top_k / model_hash: optional cross-
+            validation metadata.
+        layer_idx_to_rank: optional explicit layer_idx -> layer_rank
+            mapping.
+    """
+    global _state
+    _state = _WriterState()
+    if cov_storage_dtype not in ("float16", "bfloat16", "float32"):
+        raise ValueError(
+            f"setup: cov_storage_dtype={cov_storage_dtype!r} not in "
+            f"{{'float16','bfloat16','float32'}}"
+        )
+    cov_dtype = getattr(torch, cov_storage_dtype)
+    _state.cov_acc.set_storage_dtype(cov_dtype)
+    _state.configured_cov_storage_dtype = cov_storage_dtype
+
+    if n_layers is not None:
+        _state.n_layers = int(n_layers)
+    if n_experts is not None:
+        _state.n_experts = int(n_experts)
+        _state.ream_acc.num_experts = int(n_experts)
+    if top_k is not None:
+        _state.top_k = int(top_k)
+    if model_hash is not None:
+        _state.model_hash = str(model_hash)
+
+    if layer_idx_to_rank is not None:
+        _state.layer_idx_to_rank = dict(layer_idx_to_rank)
+        _state.rank_to_layer_idx = {r: li for li, r in _state.layer_idx_to_rank.items()}
+        if _state.n_layers == 0:
+            _state.n_layers = len(_state.layer_idx_to_rank)
+    elif llm is not None:
+        try:
+            _populate_layer_map_from_llm(llm)
+        except Exception as exc:
+            log.warning(
+                "stage2-profile-writer: setup couldn't discover layers "
+                "from llm (%s)", exc,
+            )
+
+    log.info(
+        "stage2-profile-writer: setup ok (cov_storage_dtype=%s, "
+        "n_layers=%d, n_experts=%d, top_k=%d)",
+        cov_storage_dtype, _state.n_layers, _state.n_experts, _state.top_k,
+    )
+
+
+def _populate_layer_map_from_llm(llm: Any) -> None:
+    """Best-effort layer-rank discovery on the vLLM LLM object."""
+    model = None
+    for attr_path in (
+        ("llm_engine", "model_executor", "driver_worker", "model_runner", "model"),
+        ("llm_engine", "model_executor", "model"),
+    ):
+        node = llm
+        for a in attr_path:
+            node = getattr(node, a, None)
+            if node is None:
+                break
+        if node is not None:
+            model = node
+            break
+    if model is None:
+        return
+    ranks: dict[int, int] = {}
+    next_rank = 0
+    for name, _mod in getattr(model, "named_modules", lambda: [])():
+        if "layers" not in name:
+            continue
+        if "moe" not in name.lower() and "experts" not in name.lower():
+            continue
+        for tok in name.split("."):
+            if tok.isdigit():
+                li = int(tok)
+                if li not in ranks:
+                    ranks[li] = next_rank
+                    next_rank += 1
+                break
+    if ranks:
+        _state.layer_idx_to_rank = ranks
+        _state.rank_to_layer_idx = {r: li for li, r in ranks.items()}
+        if _state.n_layers == 0:
+            _state.n_layers = len(ranks)
+
+
+def set_n_prompts_accumulated(n: int) -> None:
+    _state.n_prompts_accumulated = int(n)
+
+
+def get_n_prompts_accumulated() -> int:
+    return int(_state.n_prompts_accumulated)
+
+
+def record_batch_token_count(layer_idx: int, n_tokens: int) -> None:
+    """Forward to ReamCostAccumulator.record_batch_token_count."""
+    _state.ream_acc.record_batch_token_count(int(layer_idx), int(n_tokens))
+
+
+# ---------------------------------------------------------------------------
+# Internal callbacks.
+# ---------------------------------------------------------------------------
+def _on_router_callback(
+    layer_idx: int, logits: torch.Tensor, batch_offset: int,
+) -> None:
+    """Router hook handler -- appends per-batch logits to gate_logit_profiles."""
+    _state.ream_acc.record_router_logits(
+        int(layer_idx), logits, int(batch_offset),
+    )
+
+
+def _on_expert_out_unweighted_callback(
+    layer_idx: int,
+    expert_idx: int,
+    gated: torch.Tensor,
+    token_indices: torch.Tensor,
+    batch_offset: int,
+    *,
+    gate_weights: torch.Tensor | None = None,
+) -> None:
+    """Expert-output-unweighted hook handler.
+
+    ``gated`` should be the WEIGHTED expert output sigma(x)_e * E_e(x). If
+    callers pass the unweighted output separately as ``gate_weights``,
+    the multiply is done here.
+    """
+    if gate_weights is not None:
+        _state.ream_acc.record_gated_output(
+            int(layer_idx), int(expert_idx),
+            gate_weights=gate_weights,
+            expert_output=gated,
+            token_indices=token_indices,
+            batch_offset=int(batch_offset),
+        )
+    else:
+        T = int(token_indices.numel())
+        ones = torch.ones((T,), dtype=gated.dtype, device=gated.device)
+        _state.ream_acc.record_gated_output(
+            int(layer_idx), int(expert_idx),
+            gate_weights=ones,
+            expert_output=gated,
+            token_indices=token_indices,
+            batch_offset=int(batch_offset),
+        )
+
+
+def _finalize_batch_for_layer(layer_idx: int, n_experts: int) -> None:
+    """Drain _batch_gated_indexed and accumulate the Eq. 8 numerator.
+
+    Direct passthrough to :meth:`ReamCostAccumulator.finalize_batch`,
+    which mirrors lines 260-448 of ``activation_hooks.py`` exactly
+    (Bug #1 fix: per-token jointly-active pair cosines, NOT
+    cos(mean_i, mean_j)).
+    """
+    _state.ream_acc.finalize_batch(int(layer_idx), int(n_experts))
+
+
+def _record_neuron_act(
+    layer_idx: int, expert_idx: int, neuron_act_sum: torch.Tensor,
+    n_tokens: int,
+) -> None:
+    """Test helper -- stash neuron mean state directly."""
+    key = (int(layer_idx), int(expert_idx))
+    _state.ream_acc._neuron_act_sum[key] = neuron_act_sum.detach().to(torch.float32).cpu()
+    _state.ream_acc._neuron_act_count[key] = int(n_tokens)
+
+
+def _record_layer_input_reservoir(
+    layer_idx: int, reservoir: torch.Tensor,
+) -> None:
+    """Stash the per-layer-input reservoir snapshot for ``layer_idx``."""
+    _state.layer_input_reservoir[int(layer_idx)] = (
+        reservoir.detach().to("cpu", dtype=torch.bfloat16).contiguous()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dump.
+# ---------------------------------------------------------------------------
+def dump_stage2_profile(jsonl_path: Path | str) -> None:
+    """Serialize the writer state into a schema-v3 sidecar.
+
+    Per plan section 10 writer-side serialization order:
+      1. Finalize all pending GPU covariances for each layer.
+      2. Cross-validate cov_acc.storage_dtype against the configured value.
+      3. Build Stage2ProfilePayloadV3 with layer_rank-keyed dicts.
+      4. Atomic torch.save via save_stage2_profile_v3.
+    """
+    jsonl_path = Path(jsonl_path)
+
+    # Step 1.
+    if _state.rank_to_layer_idx:
+        for rank in sorted(_state.rank_to_layer_idx):
+            layer_idx = _state.rank_to_layer_idx[rank]
+            _state.cov_acc.finalize_layer(layer_idx)
+    else:
+        _state.cov_acc.finalize_all()
+
+    # Step 2 -- assert configured cov_storage_dtype matches the live value.
+    live_dtype_str = str(_state.cov_acc.storage_dtype).split(".")[-1]
+    if live_dtype_str != _state.configured_cov_storage_dtype:
+        raise AssertionError(
+            f"dump_stage2_profile: cov_acc.storage_dtype="
+            f"{live_dtype_str!r} != configured "
+            f"{_state.configured_cov_storage_dtype!r}. A code path "
+            f"mutated storage_dtype after setup."
+        )
+
+    # Step 3 -- translate layer_idx-keyed accumulator data to layer_rank-
+    # keyed payload dicts.
+    if _state.rank_to_layer_idx:
+        layer_ranks = sorted(_state.rank_to_layer_idx)
+        n_layers = len(layer_ranks)
+        l2r = _state.layer_idx_to_rank
+    else:
+        observed = (
+            set(_state.ream_acc.gate_logit_profiles)
+            | {k[0] for k in _state.cov_acc.covariance}
+            | set(_state.layer_input_reservoir)
+        )
+        layer_ranks = sorted(observed)
+        n_layers = len(layer_ranks)
+        l2r = {li: i for i, li in enumerate(layer_ranks)}
+        for li, r in l2r.items():
+            _state.rank_to_layer_idx[r] = li
+            _state.layer_idx_to_rank[li] = r
+
+    n_experts = _state.n_experts
+    if n_experts == 0:
+        candidates: set[int] = set()
+        for (_, e, _) in _state.cov_acc.covariance:
+            candidates.add(int(e))
+        for (_, e) in _state.ream_acc._neuron_act_sum:
+            candidates.add(int(e))
+        n_experts = (max(candidates) + 1) if candidates else 0
+
+    if n_experts > 0:
+        sim_tensor = torch.zeros(
+            (n_layers, n_experts, n_experts), dtype=torch.float64,
+        )
+        for rank in range(n_layers):
+            layer_idx = _state.rank_to_layer_idx[rank]
+            row = _state.ream_acc._sim_tensor.get(layer_idx)
+            if row is not None:
+                sim_tensor[rank] = row.detach().to(torch.float64).cpu()
+    else:
+        sim_tensor = torch.zeros((n_layers, 0, 0), dtype=torch.float64)
+
+    total_tokens = torch.zeros((n_layers,), dtype=torch.int64)
+    for rank in range(n_layers):
+        layer_idx = _state.rank_to_layer_idx[rank]
+        total_tokens[rank] = int(
+            _state.ream_acc._total_tokens_by_layer.get(layer_idx, 0)
+        )
+
+    gate_logit_profiles: dict[int, list[tuple[int, torch.Tensor]]] = {}
+    for layer_idx, batches in _state.ream_acc.gate_logit_profiles.items():
+        rank = l2r.get(layer_idx)
+        if rank is None:
+            continue
+        gate_logit_profiles[rank] = [
+            (int(off), t.detach().to("cpu", dtype=torch.float32).contiguous())
+            for off, t in batches
+        ]
+
+    neuron_act_sum: dict = {}
+    neuron_act_count: dict = {}
+    for (layer_idx, e), v in _state.ream_acc._neuron_act_sum.items():
+        rank = l2r.get(layer_idx)
+        if rank is None:
+            continue
+        neuron_act_sum[(rank, int(e))] = v.detach().to(
+            "cpu", dtype=torch.float32,
+        ).contiguous()
+    for (layer_idx, e), c in _state.ream_acc._neuron_act_count.items():
+        rank = l2r.get(layer_idx)
+        if rank is None:
+            continue
+        neuron_act_count[(rank, int(e))] = int(c)
+
+    cov_dtype = getattr(torch, _state.configured_cov_storage_dtype)
+    cov_payload: dict = {}
+    cov_tc: dict = {}
+    for (layer_idx, e, m), v in _state.cov_acc.covariance.items():
+        rank = l2r.get(layer_idx)
+        if rank is None:
+            continue
+        cov_payload[(rank, int(e), str(m))] = v.detach().to(
+            "cpu", dtype=cov_dtype, copy=True,
+        ).contiguous()
+    for (layer_idx, e, m), n in _state.cov_acc.token_count.items():
+        rank = l2r.get(layer_idx)
+        if rank is None:
+            continue
+        cov_tc[(rank, int(e), str(m))] = int(n)
+
+    layer_input_reservoir: list = []
+    for rank in range(n_layers):
+        layer_idx = _state.rank_to_layer_idx[rank]
+        t = _state.layer_input_reservoir.get(layer_idx)
+        if t is None:
+            layer_input_reservoir.append(
+                torch.zeros((0, 0), dtype=torch.bfloat16)
+            )
+        else:
+            layer_input_reservoir.append(t)
+
+    payload = Stage2ProfilePayloadV3(
+        format_version=3,
+        schema_version=SCHEMA_VERSIONS["stage2_profile"],
+        model_hash=_state.model_hash,
+        n_layers=n_layers,
+        n_experts=int(n_experts),
+        top_k=int(_state.top_k),
+        cov_storage_dtype=_state.configured_cov_storage_dtype,
+        total_tokens_per_layer=total_tokens,
+        gate_logit_profiles=gate_logit_profiles,
+        sim_tensor=sim_tensor,
+        neuron_act_sum=neuron_act_sum,
+        neuron_act_count=neuron_act_count,
+        cov_acc=cov_payload,
+        cov_token_count=cov_tc,
+        layer_input_reservoir=layer_input_reservoir,
+    )
+    save_stage2_profile_v3(payload, jsonl_path)
+    # H-1: surface the missing layer-input reservoir to operators. The
+    # vLLM patch currently does NOT register a `layer_in` callback, so
+    # production sidecars carry empty (0, 0) placeholders for every
+    # layer. Until a follow-up adds the hook, SC cost_alignment="output"
+    # will fall back to the live forward pass on full-hit layers.
+    if layer_input_reservoir and all(
+        t.numel() == 0 for t in layer_input_reservoir
+    ):
+        log.warning(
+            "stage2-profile-writer: layer_input_reservoir is empty for "
+            "all %d layers — the vLLM patch has no `layer_in` callback "
+            "hook yet; SC cost_alignment='output' will fall back to the "
+            "live forward pass for hydrated layers. See H-1 follow-up.",
+            n_layers,
+        )
+    log.info(
+        "stage2-profile-writer: wrote %d-layer x %d-expert sidecar "
+        "(cov_storage_dtype=%s, n_prompts=%d) next to %s",
+        n_layers, n_experts, _state.configured_cov_storage_dtype,
+        _state.n_prompts_accumulated, jsonl_path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint -- crash-resume serialization.
+# ---------------------------------------------------------------------------
+_CKPT_SCHEMA = 1
+
+
+def dump_stage2_profile_checkpoint(path: str | Path) -> None:
+    """Atomic write the live writer state to ``path``.
+
+    Uses torch.save (the same pickle-backed primitive every other
+    sidecar in this repo uses); the file is consumed only by the
+    matching ``load_stage2_profile_checkpoint`` in the same trusted
+    process tree.
+    """
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    state_payload = {
+        "format_version": _CKPT_SCHEMA,
+        "schema_version": _CKPT_SCHEMA,
+        "n_prompts_accumulated": _state.n_prompts_accumulated,
+        "configured_cov_storage_dtype": _state.configured_cov_storage_dtype,
+        "n_layers": _state.n_layers,
+        "n_experts": _state.n_experts,
+        "top_k": _state.top_k,
+        "model_hash": _state.model_hash,
+        "layer_idx_to_rank": dict(_state.layer_idx_to_rank),
+        "ream_acc_sim_tensor": dict(_state.ream_acc._sim_tensor),
+        "ream_acc_total_tokens": dict(_state.ream_acc._total_tokens_by_layer),
+        "ream_acc_gate_logit_profiles": dict(_state.ream_acc.gate_logit_profiles),
+        "ream_acc_neuron_act_sum": dict(_state.ream_acc._neuron_act_sum),
+        "ream_acc_neuron_act_count": dict(_state.ream_acc._neuron_act_count),
+        "cov_acc_covariance": dict(_state.cov_acc.covariance),
+        "cov_acc_token_count": dict(_state.cov_acc.token_count),
+        "cov_acc_storage_dtype": str(_state.cov_acc.storage_dtype).split(".")[-1],
+        "layer_input_reservoir": dict(_state.layer_input_reservoir),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(state_payload, tmp)
+    os.replace(tmp, path)
+
+
+def load_stage2_profile_checkpoint(path: str | Path) -> int:
+    """Hydrate the writer state from a checkpoint. Returns prompts seen.
+
+    Raises ``ValueError`` on schema mismatch -- the caller deletes the
+    stale file and restarts from zero (mirrors imatrix / reap-scores).
+    """
+    path = Path(path)
+    if not path.exists():
+        return 0
+    loaded = torch.load(path, map_location="cpu", weights_only=False)
+    if int(loaded.get("schema_version", -1)) != _CKPT_SCHEMA:
+        raise ValueError(
+            f"stage2-profile checkpoint at {path} has schema_version="
+            f"{loaded.get('schema_version')!r}, expected {_CKPT_SCHEMA}. "
+            f"Delete the checkpoint to regenerate."
+        )
+    _state.n_prompts_accumulated = int(loaded.get("n_prompts_accumulated", 0))
+    # L-2 (round 2): cross-validate the LIVE operator-configured cov
+    # storage dtype (set by ``setup``) against the value the writer was
+    # running when the checkpoint was dumped. Capture the live value
+    # BEFORE overwriting `_state.configured_cov_storage_dtype` so the
+    # check catches divergence between operator intent and the resumed
+    # checkpoint (round-1 fix compared the checkpoint against itself).
+    live_configured_cov_storage_dtype = _state.configured_cov_storage_dtype
+    checkpoint_configured_cov_storage_dtype = str(
+        loaded.get(
+            "configured_cov_storage_dtype",
+            live_configured_cov_storage_dtype,
+        ),
+    )
+    if (
+        checkpoint_configured_cov_storage_dtype
+        != live_configured_cov_storage_dtype
+    ):
+        raise ValueError(
+            f"Checkpoint configured_cov_storage_dtype mismatch: live="
+            f"{live_configured_cov_storage_dtype!r}, checkpoint="
+            f"{checkpoint_configured_cov_storage_dtype!r}. Delete the "
+            f"checkpoint to regenerate."
+        )
+    _state.configured_cov_storage_dtype = (
+        checkpoint_configured_cov_storage_dtype
+    )
+    # Secondary check: the cov_acc's own storage_dtype tag in the
+    # checkpoint must agree with the configured value (same fail-loud
+    # pattern as the dump-time assert in dump_stage2_profile).
+    cov_acc_storage_dtype_from_payload = str(
+        loaded.get(
+            "cov_acc_storage_dtype",
+            _state.configured_cov_storage_dtype,
+        ),
+    )
+    if (
+        cov_acc_storage_dtype_from_payload
+        != _state.configured_cov_storage_dtype
+    ):
+        raise ValueError(
+            f"Checkpoint cov_acc dtype mismatch: configured="
+            f"{_state.configured_cov_storage_dtype!r}, accumulator="
+            f"{cov_acc_storage_dtype_from_payload!r}. Delete the "
+            f"checkpoint to regenerate."
+        )
+    cov_dtype = getattr(torch, _state.configured_cov_storage_dtype)
+    _state.cov_acc.set_storage_dtype(cov_dtype)
+    _state.n_layers = int(loaded.get("n_layers", _state.n_layers))
+    # Preserve any prior ``setup``-pinned n_experts when the checkpoint
+    # is missing the field — silently overwriting to 0 here would
+    # break finalize_batch's sim-row shape (sweep finding round 2).
+    _state.n_experts = int(loaded.get("n_experts", _state.n_experts))
+    # H-2: ReamCostAccumulator.num_experts is needed by finalize_batch's
+    # similarity-matrix sizing; if a checkpoint resumes BEFORE setup()
+    # ever pinned it (or after a fresh process where the default is 0),
+    # finalize_batch would build a malformed sim row. Mirror n_experts
+    # onto the accumulator at load time so resume sees the right shape.
+    _state.ream_acc.num_experts = _state.n_experts
+    _state.top_k = int(loaded.get("top_k", _state.top_k))
+    _state.model_hash = str(loaded.get("model_hash", _state.model_hash))
+    _state.layer_idx_to_rank = dict(loaded.get("layer_idx_to_rank", {}))
+    _state.rank_to_layer_idx = {
+        r: li for li, r in _state.layer_idx_to_rank.items()
+    }
+    # Uniform full-replace pattern: checkpoint load happens after
+    # ``setup`` zeroes the state, so every accumulator dict is the
+    # checkpoint snapshot verbatim (sweep finding round 2 -- prior
+    # mix of ``= dict(...)`` vs ``.update(...)`` was inconsistent).
+    _state.ream_acc._sim_tensor = dict(loaded.get("ream_acc_sim_tensor", {}))
+    _state.ream_acc._total_tokens_by_layer = dict(
+        loaded.get("ream_acc_total_tokens", {})
+    )
+    _state.ream_acc.gate_logit_profiles = dict(
+        loaded.get("ream_acc_gate_logit_profiles", {})
+    )
+    _state.ream_acc._neuron_act_sum = dict(
+        loaded.get("ream_acc_neuron_act_sum", {})
+    )
+    _state.ream_acc._neuron_act_count = dict(
+        loaded.get("ream_acc_neuron_act_count", {})
+    )
+    _state.cov_acc.covariance = dict(loaded.get("cov_acc_covariance", {}))
+    _state.cov_acc.token_count = dict(loaded.get("cov_acc_token_count", {}))
+    _state.layer_input_reservoir = dict(
+        loaded.get("layer_input_reservoir", {})
+    )
+    return _state.n_prompts_accumulated
+
+
+# ---------------------------------------------------------------------------
+# Test/debug helpers.
+# ---------------------------------------------------------------------------
+def _get_state() -> _WriterState:
+    """Test-only accessor for the module singleton."""
+    return _state
+
+
+def _reset_state_for_tests() -> None:
+    """Test helper: reset the singleton between cases."""
+    global _state
+    _state = _WriterState()
