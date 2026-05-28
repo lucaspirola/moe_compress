@@ -481,6 +481,81 @@ def test_orchestrator_default_merge_step_is_freq_weighted():
     assert 's2.get("merge_step", "freq_weighted")' in src
 
 
+def test_orchestrator_rejects_sequential_reprofile_with_profile_sidecar(
+    tiny_config, tiny_model, tmp_path,
+):
+    """Plugin #14 audit HIGH-2: hard mutual-exclusion between Plugin #10's
+    ``sequential_reprofile`` and Plugin #12's ``profile_sidecar.enabled``.
+
+    REAM §4 stale-stats hazard — the sidecar serves pre-merge state, the
+    sequential invalidator clears post-merge state; combining them is a
+    silent corruption path. The orchestrator must fail-fast at run() entry.
+    """
+    from moe_compress.stage2 import orchestrator as orch
+
+    tiny_config["stage2_reap_ream"] = {
+        "sequential_reprofile": True,
+        "profile_sidecar": {"enabled": True},
+        "ream": {"frequency_weighted_merge": True},
+        "num_calibration_samples": 1,
+        "batch_size": 1,
+    }
+    (tmp_path / "stage1_budgets.json").write_text('{"per_layer_target_experts": {}}')
+    (tmp_path / "stage1_blacklist.json").write_text('{"blacklist": {}}')
+
+    with pytest.raises(ValueError, match=r"sequential_reprofile.*profile_sidecar"):
+        orch.run(tiny_model, tokenizer=None, config=tiny_config,
+                 artifacts_dir=tmp_path)
+
+
+def test_orchestrator_allows_sequential_reprofile_alone(tiny_config, tiny_model, tmp_path):
+    """Sanity: enabling sequential_reprofile without profile_sidecar is OK
+    (does NOT trigger the mutual-exclusion guard). Tests the boundary so a
+    future refactor cannot accidentally tighten the guard.
+    """
+    from moe_compress.stage2 import orchestrator as orch
+
+    tiny_config["stage2_reap_ream"] = {
+        "sequential_reprofile": True,
+        "profile_sidecar": {"enabled": False},  # explicit False — not raised
+        "ream": {"frequency_weighted_merge": True},
+        "num_calibration_samples": 1,
+        "batch_size": 1,
+    }
+    (tmp_path / "stage1_budgets.json").write_text('{"per_layer_target_experts": {}}')
+    (tmp_path / "stage1_blacklist.json").write_text('{"blacklist": {}}')
+
+    # The mutual-exclusion guard must NOT raise. The run will fail later
+    # on a different validation (tiny_config minimal stage1 artifact) — but
+    # the failure must NOT mention sequential_reprofile/profile_sidecar.
+    with pytest.raises(Exception) as exc_info:
+        orch.run(tiny_model, tokenizer=None, config=tiny_config,
+                 artifacts_dir=tmp_path)
+    assert "sequential_reprofile" not in str(exc_info.value)
+    assert "profile_sidecar" not in str(exc_info.value)
+
+
+def test_orchestrator_allows_profile_sidecar_alone(tiny_config, tiny_model, tmp_path):
+    """Sanity: enabling profile_sidecar without sequential_reprofile is OK."""
+    from moe_compress.stage2 import orchestrator as orch
+
+    tiny_config["stage2_reap_ream"] = {
+        "sequential_reprofile": False,
+        "profile_sidecar": {"enabled": True},
+        "ream": {"frequency_weighted_merge": True},
+        "num_calibration_samples": 1,
+        "batch_size": 1,
+    }
+    (tmp_path / "stage1_budgets.json").write_text('{"per_layer_target_experts": {}}')
+    (tmp_path / "stage1_blacklist.json").write_text('{"blacklist": {}}')
+
+    with pytest.raises(Exception) as exc_info:
+        orch.run(tiny_model, tokenizer=None, config=tiny_config,
+                 artifacts_dir=tmp_path)
+    assert "sequential_reprofile" not in str(exc_info.value)
+    assert "profile_sidecar" not in str(exc_info.value)
+
+
 # ---------------------------------------------------------------------------
 # Section 6 — D-mergemoe-resume-fallback (Plugin #9 reviewer fix)
 # ---------------------------------------------------------------------------

@@ -672,6 +672,30 @@ def run(
             "expected 'freq_weighted' or 'mergemoe'."
         )
 
+    # Plugin #14 audit (HIGH-2): hard mutual-exclusion between Plugin #10's
+    # ``sequential_reprofile`` and Plugin #12's ``profile_sidecar.enabled``.
+    # REAM §4 warns that pre-collected statistics go stale after a merge,
+    # which is exactly what the profile sidecar serves on a full hit.
+    # Combining them would silently feed Plugin #10's invalidator a hydrated
+    # ream_acc/cov_acc/layer_input_acc on layer N (from the sidecar), then
+    # clear them at on_post_merge — so layer N+1's profile pass would re-run
+    # against the merged upstream (correct) but lose the sidecar-cache win
+    # AND mask the corruption hazard the sidecar's stale snapshot introduces.
+    # Fail fast at top of run() rather than let either path silently win.
+    _seq_reprofile = bool(s2.get("sequential_reprofile", False))
+    _profile_sidecar_enabled = bool(
+        s2.get("profile_sidecar", {}).get("enabled", False)
+    )
+    if _seq_reprofile and _profile_sidecar_enabled:
+        raise ValueError(
+            "stage2_reap_ream.sequential_reprofile=True AND "
+            "stage2_reap_ream.profile_sidecar.enabled=True is invalid: "
+            "REAM sequential reprofile invalidates per-layer state after every "
+            "merge, but the profile sidecar serves pre-merge state on full hit. "
+            "The two are mutually exclusive — set at most one. See Plugin #14 "
+            "sidecar audit HIGH-2 + tasks/PLAN_PLUGIN_14_sidecar_audit.md."
+        )
+
     # Blackwell sm_100 workaround: transformers' default MoE forward uses
     # `torch.nn.functional.grouped_mm`, which deadlocks on B200 partway
     # through Stage 2 (reproduced as a 2-min main-thread hang then SIGSEGV
