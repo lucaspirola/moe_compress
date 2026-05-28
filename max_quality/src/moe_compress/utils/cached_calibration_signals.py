@@ -558,6 +558,36 @@ class BlockHiddenPayload:
 
 @dataclass
 class TeacherEvalPayload:
+    """Canonical in-memory shape for a teacher-harness cache entry.
+
+    OPEN-QUESTION (Sequence 2, MEDIUM-2): Stage 6 currently bypasses
+    this dataclass and rolls its own JSON-keyed cache in
+    ``stage6/plugins/teacher_provider.py`` (``_save_teacher_cache`` /
+    ``_load_teacher_cache``). Migrating Stage 6 to use this canonical
+    shape is genuinely ambiguous:
+
+    * Storage location: Stage 6's cache lives at an operator-
+      configurable path (``s6.teacher_eval_cache.cache_path``, default
+      ``<artifacts_dir>/teacher_eval_cache.json``). This payload's
+      writer/reader use ``sidecar_path(jsonl_path, "teacher_eval")``,
+      which is a different layout (sidecars next to a JSONL trace).
+      Stage 6 has no JSONL.
+    * Format: Stage 6 writes a human-readable JSON file with strong
+      fsync. ``_atomic_torch_save`` produces an opaque torch.save
+      stream. Switching format is a regression on operator
+      inspectability.
+    * Field naming: the only field-level difference is
+      ``format_version`` (JSON) vs ``schema_version`` (this dataclass).
+
+    Resolution deferred. Either: (a) leave Stage 6's mechanism alone
+    and treat this dataclass as canonical only for the (currently
+    unused) sidecar-layout cache; or (b) introduce a JSON-on-disk
+    writer here keyed by an operator-supplied path (not a JSONL stem)
+    so Stage 6 can switch to a canonical name. The dataclass + load
+    function are retained so a future fix can re-target Stage 6 without
+    re-introducing the deleted writer (see NIT-5 commit).
+    """
+
     schema_version: int
     cache_key: str                        # SHA-256 from _teacher_cache_key
     teacher_results: dict
