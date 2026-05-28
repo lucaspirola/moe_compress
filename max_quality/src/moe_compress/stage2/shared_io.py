@@ -8,6 +8,15 @@ keep working without modification.
 The partial-JSON schema written by ``_write_merge_json`` is FROZEN at
 ``format_version=2`` — round-tripped by ``test_pipeline_shared_io.py`` so any
 accidental drift fails CI.
+
+S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.2): ``_write_merge_json`` accepts an
+optional ``stage2_run_id: str | None`` kwarg (additive — ``format_version``
+stays at 2). When non-None, the value is embedded under the ``stage2_run_id``
+key of the per-layer payload so the audit-time cross-check
+(``audit/spec_compliance/svc_audit.py::load_merge_map``) can detect a
+partial dir that contains files from two different Stage 2 runs. Legacy
+payloads written without the field continue to load and are treated as
+"pre-S-2 writer; cross-check disabled" by readers.
 """
 from __future__ import annotations
 
@@ -131,6 +140,7 @@ def _write_merge_json(
     em_rounds_completed: int = 0,
     distill_state: dict | None = None,
     heal_state: dict | None = None,
+    stage2_run_id: str | None = None,
 ) -> None:
     """Write the per-layer merge record to a durable JSON file.
 
@@ -148,6 +158,12 @@ def _write_merge_json(
         mean_cost_per_pair: Mean REAM assignment cost, for the budget-bump history.
         heal_state:       Per-layer merge-heal outcome dict (None when the
                           opt-in merge-heal feature is disabled).
+        stage2_run_id:    Optional per-run identity tag (S-2,
+                          PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.2). Additive —
+                          ``format_version`` stays at 2. When None (legacy
+                          callers / pre-S-2 writers), the key is omitted
+                          from the payload so existing on-disk schemas stay
+                          byte-identical.
     """
     payload = {
         "format_version": 2,
@@ -172,6 +188,11 @@ def _write_merge_json(
         # _heal_weights_layer_{N}.pt.
         "heal_state": heal_state,
     }
+    # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.2): additive optional field —
+    # ``format_version`` stays at 2; the key is OMITTED when None so legacy
+    # round-trip tests + on-disk schemas remain byte-identical.
+    if stage2_run_id is not None:
+        payload["stage2_run_id"] = stage2_run_id
     tmp = partial_dir / f"merge_{layer_idx}.json.tmp"
     final = partial_dir / f"merge_{layer_idx}.json"
     tmp.write_text(json.dumps(payload), encoding="utf-8")

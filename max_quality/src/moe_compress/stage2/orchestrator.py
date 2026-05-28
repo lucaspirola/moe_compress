@@ -35,6 +35,7 @@ import logging
 import math
 import os
 import shutil
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -638,6 +639,18 @@ def run(
     s2 = config["stage2_reap_ream"]
     cal = config["calibration"]
 
+    # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.1): mint a per-run identity
+    # UUID at run entry — the partial-dir writes happen DURING the per-layer
+    # loop (well before finalize), so the UUID must exist before any of
+    # them. Threaded into ``run_ctx`` immediately below so
+    # ``LayerMergePlugin._write_artifacts`` can stamp every
+    # ``_stage2_partial/merge_*.json`` payload. Also embedded in the
+    # finalize-time aggregate ``merge_map.json`` envelope and in the
+    # merged checkpoint's ``compressed_metadata.json -> extra`` so the
+    # SVC audit can cross-check ``--stage2-artifacts`` vs
+    # ``--merged-checkpoint`` come from the same run.
+    stage2_run_id = uuid.uuid4().hex
+
     # Stage 2 v2 (spec § 6 / D-asymmetric-freq): cost_asymmetric is valid
     # only under freq-weighted merge — the asymmetric factor freq_m/(freq_c+freq_m)
     # is the per-pair version of the merge weight. Reject the combination
@@ -1228,6 +1241,12 @@ def run(
     # ``write_artifacts`` branches on ``if partial_dir is not None:`` and must
     # see ``None`` (not a fallback path) when resume is disabled.
     run_ctx.set("partial_dir", partial_dir)
+    # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.2a): per-run identity threaded
+    # to ``LayerMergePlugin._write_artifacts`` (which calls
+    # ``_write_merge_json(..., stage2_run_id=ctx.get("stage2_run_id"))``).
+    # Mirrors the ``partial_dir`` setter precedent immediately above for a
+    # single-run-scoped scalar.
+    run_ctx.set("stage2_run_id", stage2_run_id)
     # The "device" ctx slot holds the *stringified* device ("cpu" / "cuda:0"),
     # not a torch.device — the original device object is passed separately to
     # the stage-2 plugins (the `device=device` kwarg below). Readers of
@@ -1541,9 +1560,28 @@ def run(
     save_compressed_checkpoint(
         model, tokenizer, out_dir,
         pipeline_stage="stage2_pruned",
-        extra_metadata={"merge_map_file": "merge_map.json"},
+        # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.4): embed the per-run id
+        # under ``extra`` so ``svc_audit._load_merged_checkpoint_run_id``
+        # can cross-check it against the ``--stage2-artifacts`` run id.
+        extra_metadata={
+            "merge_map_file": "merge_map.json",
+            "stage2_run_id": stage2_run_id,
+        },
     )
-    save_json_artifact(merge_map, out_dir / "merge_map.json")
+    # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.3): wrap the bare-dict merge_map
+    # into a typed envelope carrying the per-run id. The two readers
+    # (``svc_audit.load_merge_map`` and
+    # ``router_kd.plugins.merge_repair._load_merge_map``) detect this
+    # wrapper and recurse into the inner ``merge_map``; legacy bare-dict
+    # payloads on disk stay supported.
+    save_json_artifact(
+        {
+            "format_version": 1,
+            "stage2_run_id": stage2_run_id,
+            "merge_map": merge_map,
+        },
+        out_dir / "merge_map.json",
+    )
     if partial_dir is not None:
         if os.environ.get("MOE_KEEP_STAGE2_PARTIAL") == "1":
             # Direction A — budget retune reads per-layer measured damage from

@@ -704,6 +704,14 @@ class LayerMergePlugin:
                     else None
                 ),
                 heal_state=heal_state,
+                # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.2a): per-run id is
+                # set on the run-scope ``run_ctx`` by ``orchestrator.run``;
+                # the layer-scope ``ctx`` is a ``child()`` of that scope
+                # and inherits the slot. ``ctx.get(...)`` returns None for
+                # legacy callers / fixtures that bypass the orchestrator —
+                # the writer's None default then omits the field from the
+                # payload, so existing on-disk schemas stay byte-identical.
+                stage2_run_id=ctx.get("stage2_run_id"),
             )
 
         max_group = max((len(g) for g in grouped.values()), default=0)

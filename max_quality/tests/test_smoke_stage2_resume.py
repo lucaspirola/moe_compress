@@ -207,9 +207,27 @@ def test_stage2_resume_produces_same_merge_map(tiny_model, patched_stage2, tmp_p
 
     resume_merge_map = json.loads((tmp_path / "stage2_pruned" / "merge_map.json").read_text())
 
-    # The merge maps should be identical (same deterministic computation).
-    assert clean_merge_map == resume_merge_map, (
-        "Merge map from resumed run differs from clean run — resume broke determinism"
+    # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.3): the aggregate ``merge_map.json``
+    # is wrapped into ``{"format_version": 1, "stage2_run_id": "...",
+    # "merge_map": {...}}``. Each ``run()`` invocation mints a fresh UUID, so
+    # the wrapper-level dicts WILL differ on ``stage2_run_id`` — that's by
+    # design, not a regression. Compare the inner merge maps for the
+    # determinism check (and confirm the wrapper shape exists on both).
+    for label, payload in (("clean", clean_merge_map), ("resume", resume_merge_map)):
+        assert isinstance(payload, dict), f"{label} merge_map.json is not a dict"
+        assert "merge_map" in payload and isinstance(payload["merge_map"], dict), (
+            f"{label} merge_map.json missing wrapper-shape 'merge_map' field"
+        )
+    assert clean_merge_map["merge_map"] == resume_merge_map["merge_map"], (
+        "Merge map (inner dict) from resumed run differs from clean run — "
+        "resume broke determinism"
+    )
+    # The two runs MUST have different stage2_run_id values (each run mints
+    # a fresh UUID at run() entry). If they accidentally collided, the
+    # S-2 cross-check defence would be a no-op.
+    assert clean_merge_map["stage2_run_id"] != resume_merge_map["stage2_run_id"], (
+        "Two independent run() invocations produced identical stage2_run_id — "
+        "UUID minting is broken"
     )
 
 
