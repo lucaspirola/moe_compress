@@ -455,6 +455,11 @@ class LayerMergePlugin:
         # default merge_step="freq_weighted" keeps the boolean ``False``
         # under runs with no distill and no output-space cost, so the legacy
         # paths stay byte-identical.
+        #
+        # RegMean note: merge_step="regmean" does NOT need the layer-input
+        # buffer — it consumes the per-expert input Gram via ``self.cov_acc``,
+        # which Stage 2's profile pass populates as a side-effect. Hence
+        # merge_step="regmean" is intentionally absent from this boolean.
         _need_layer_inputs = (
             self.expert_distill_steps > 0
             or self.cost_alignment_cfg == "output"
@@ -570,6 +575,11 @@ class LayerMergePlugin:
             merge_step=self.merge_step,
             layer_inputs=layer_inputs,
             token_cap=self.cost_output_token_cap,
+            # RegMean (merge_step="regmean") reads per-(layer, expert, matrix)
+            # input Gram from cov_acc; the freq-weighted and mergemoe
+            # branches ignore this argument. cov_acc is always non-None in
+            # normal orchestrator flow — see LayerMergePlugin.__init__.
+            cov_acc=self.cov_acc,
         )
 
         ctx.set("distill_state", None)

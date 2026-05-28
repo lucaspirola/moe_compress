@@ -658,18 +658,21 @@ def run(
             "(spec § 5 step 4T(c)(iii) / D-asymmetric-freq)."
         )
 
-    # Plugin #9 / S2_MM (MergeMoE arXiv:2510.14436): merge_step switches the
-    # merge math between legacy freq-weighted (default; byte-identical) and
-    # the closed-form T₁=Q·P† least-squares solution. Validated at the top
-    # of run() — same fail-fast posture as ``cost_asymmetric`` above — so
+    # Plugin #9 / S2_MM (MergeMoE arXiv:2510.14436) +
+    # Plugin RegMean (Jin et al., ICLR 2023, arXiv:2212.09849): merge_step
+    # switches the merge math between legacy freq-weighted (default;
+    # byte-identical), the MergeMoE closed-form T₁=Q·P† least-squares
+    # solution, and the RegMean closed-form per-Linear least-squares
+    # solution W_M = (Σ G_i)⁻¹ Σ G_i W_i. Validated at the top of run() —
+    # same fail-fast posture as ``cost_asymmetric`` above — so
     # misconfigured pipelines surface the error before spending compute on
     # calibration loading. The canonical resolved value is re-read further
     # below where it is plumbed into ``LayerMergePlugin``.
     _merge_step_check = str(s2.get("merge_step", "freq_weighted")).lower()
-    if _merge_step_check not in ("freq_weighted", "mergemoe"):
+    if _merge_step_check not in ("freq_weighted", "mergemoe", "regmean"):
         raise ValueError(
             f"stage2_reap_ream.merge_step={_merge_step_check!r}; "
-            "expected 'freq_weighted' or 'mergemoe'."
+            "expected 'freq_weighted', 'mergemoe', or 'regmean'."
         )
 
     # Plugin #14 audit (HIGH-2): hard mutual-exclusion between Plugin #10's
@@ -861,6 +864,32 @@ def run(
                 "New layers (post-resume-point) will use the configured "
                 "merge_step. Trackio key stage2/config/merge_step still records "
                 "the configured value, not the effective per-layer choice.",
+                len(resumed_records),
+            )
+
+        # RegMean resume fallback — same posture as the MergeMoE block above.
+        # The per-layer cov_acc IS persisted to ``_stage2_partial/`` (via
+        # ``_snapshot_cov_layer``) and is reloaded later in this loop via
+        # ``cov_acc.load_layer_from_disk``, BUT that load happens AFTER the
+        # ``_merge_experts_inplace`` call below. We force the replayed
+        # layers to ``freq_weighted`` for determinism (matching what the
+        # in-function fallback path would have produced anyway) rather than
+        # re-ordering the resume loop. Operators who need RegMean on a
+        # mid-run crash can re-run with ``--no-resume``.
+        if (
+            str(s2.get("merge_step", "freq_weighted")).lower() == "regmean"
+            and resumed_records
+        ):
+            log.warning(
+                "Stage 2 resume: forcing merge_step=freq_weighted for %d "
+                "replayed layers (D-regmean-resume-fallback). The replay "
+                "loop applies _merge_experts_inplace BEFORE cov_acc is "
+                "reloaded from disk, so the RegMean solve cannot see the "
+                "per-member Gram for the replayed layers. New layers "
+                "(post-resume-point) will use the configured merge_step. "
+                "Trackio key stage2/config/merge_step still records the "
+                "configured value, not the effective per-layer choice. "
+                "Re-run with --no-resume if RegMean fidelity is required.",
                 len(resumed_records),
             )
 
@@ -1104,6 +1133,7 @@ def run(
     from .plugins.ream_cost_post import ReamCostPostPlugin
     from .plugins.ream_sequential import Stage2ReamSequentialPlugin
     from .plugins.reap_scoring import ReapScoringPlugin
+    from .plugins.regmean_merge import RegMeanMergeStepPlugin
     from .plugins.reap_scores_cache import Stage2ReapScoresCacheProvider
     from .plugins.routing_stats_cache import Stage2RoutingStatsCacheProvider
     from .plugins.stage2_profile_cache import Stage2ProfileCacheProvider
@@ -1269,6 +1299,17 @@ def run(
         # to be, so the phase-major walk lands its hooks unchanged. S2-12b
         # deleted the ``LegacyAdapter`` class entirely.
         layer_merge,
+        # RegMean (Jin et al., ICLR 2023, arXiv:2212.09849) — metadata /
+        # config-validation shim for ``merge_step="regmean"``. Carries NO
+        # phase hooks; the actual closed-form solve is invoked inline by
+        # ``LayerMergePlugin.merge`` -> ``_merge_experts_inplace`` ->
+        # ``_regmean_solve_one_linear``. The shim's ``is_enabled`` gate is
+        # True only when ``stage2_reap_ream.merge_step == "regmean"``, so
+        # the plugin self-deselects on every non-regmean run.
+        # Position: AFTER ``layer_merge`` mirroring MergeMoE's pattern
+        # (MergeMoE has no separate plugin class — its math lives on
+        # LayerMergePlugin's merge_step knob, which RegMean extends).
+        RegMeanMergeStepPlugin(),
         # Profile-sidecar cache reader (Optimization A REDO — Plugin #12).
         # Single config knob: stage2_reap_ream.profile_sidecar.enabled.
         # Same flag governs gate-logit hydration, cov_acc hydration, AND
