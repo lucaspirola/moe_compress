@@ -3,8 +3,11 @@
 See ``tasks/SC_FAST_PLAN_V3.md`` §4 / Optimization C (lines 277-296) and
 ``tasks/PLAN_OPT_C_vectorized_reservoir.md`` §6b for the full specification.
 These tests guard the marginal-uniformity, same-seed-determinism, and
-no-``.item()``-on-GPU contracts of the batch-vectorized Algorithm R
-(Vitter 1985) implementation.
+no-GPU-sync-points contracts of the batch-vectorized Algorithm R
+(Vitter 1985) implementation. (The implementation does call
+``int(keep_mask.sum())`` on a 0-d CPU tensor, which uses ``.item()``
+internally; the contract is that no ``.item()`` runs on a GPU tensor
+during the hot path — Plugin #14 follow-up item 5.)
 """
 from __future__ import annotations
 
@@ -78,7 +81,12 @@ def test_determinism_same_seed():
 
 
 def test_no_item_call_on_gpu_tensor():
-    """Guard against future regression that re-introduces .item() calls."""
+    """Guard against future regression that re-introduces GPU sync points
+    (i.e., ``.item()`` calls on GPU tensors) in the hot path. The
+    ``int(keep_mask.sum())`` call on a 0-d CPU tensor is acceptable
+    (one sync per batch, not per token); only GPU-side ``.item()``
+    would cost meaningful throughput. Plugin #14 follow-up item 5.
+    """
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     acc = _LayerInputAccumulator(max_samples=16, seed=0)

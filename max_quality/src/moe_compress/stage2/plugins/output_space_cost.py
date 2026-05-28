@@ -447,9 +447,17 @@ def _output_space_cost(
     banks = build_banks(layer_ref)
     # Resolve the compute device from the model's own expert weights so the
     # cost computation runs wherever the model lives (CPU or GPU), with no
-    # hardcoded device. (Dtype is hardcoded to fp32 at the SwiGLU call sites
-    # below.) Safe to index ``centroid_ids[0]`` — the empty case is handled
-    # by the early-return above.
+    # hardcoded device.
+    #
+    # Note on dtype (post-Opt B2): ``_tentative_merged_weights`` now returns
+    # weights in the model's NATIVE dtype (bf16 for production Qwen3.6-35B-A3B;
+    # float32 for fp32 tests). The fp32 boundary is the ``W_m`` and ``merged``
+    # dict comprehensions below at the SwiGLU call sites, which explicitly
+    # ``.to(device, torch.float32)`` before passing into ``_swiglu_forward``.
+    # The merge math itself stays in native dtype per SC_FAST_PLAN_V3 §4-B2.
+    #
+    # Safe to index ``centroid_ids[0]`` — the empty case is handled by the
+    # early-return above.
     _probe = banks["gate_proj"].get(centroid_ids[0])
     device = _probe.device
 
