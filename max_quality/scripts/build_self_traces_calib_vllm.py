@@ -833,6 +833,28 @@ def main() -> int:
                         "stage2 orchestrator). On mismatch the reader "
                         "fails loud at load time with 'Delete the sidecar "
                         "to regenerate'.")
+    # CRITICAL-1: vLLM `layer_in` hook landing -- writer subscription
+    # populates the previously-empty layer_input_reservoir field of the
+    # stage2_profile sidecar. Default OFF until the hook is validated on
+    # a smoke run; flip ON in a follow-up commit (per plan §3.c).
+    p.add_argument("--capture-layer-input-reservoir",
+                   action="store_true", default=False,
+                   help="When --capture-stage2-profile is set, ALSO "
+                        "populate the layer_input_reservoir field of "
+                        "the stage2_profile sidecar. Requires the vLLM "
+                        "patch's layer_in hook (vllm.calibration_hooks "
+                        "VALID_HOOK_NAMES). Auto-enables "
+                        "VLLM_CALIB_CAPTURE_LAYER_IN=1 BEFORE any vllm "
+                        "import. Default OFF (matches current "
+                        "production behavior -- empty (0, 0) "
+                        "placeholders). Flip ON once the layer_in hook "
+                        "is validated on a smoke run; the next "
+                        "production calibration run with this flag "
+                        "emits a fully-populated stage2_profile sidecar "
+                        "that unblocks SC cost_alignment='output' "
+                        "full-hit path (Plugin #12 + Plugin #1 combined "
+                        "~37-57 min/SC row saved per PLAN_PLUGIN_14 §5 "
+                        "row 1).")
     p.add_argument("--capture-per-expert-max", action="store_true",
                    default=False,
                    help="Capture per-(layer, expert) down_proj output max "
@@ -1123,6 +1145,23 @@ def main() -> int:
                  "VLLM_CALIB_CAPTURE_ROUTER=1 + "
                  "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
                  "VLLM_USE_FLASHINFER_MOE_FP16=0 "
+                 "(must precede vllm import)")
+
+    # CRITICAL-1: opt-in for the new vLLM `layer_in` hook + writer
+    # subscription. Requires --capture-stage2-profile (the
+    # layer_input_reservoir field lives inside the stage2_profile
+    # sidecar). Strict-string env: vllm.calibration_hooks samples this
+    # once at module import with ``os.getenv(...) == "1"``.
+    if args.capture_layer_input_reservoir:
+        if not args.capture_stage2_profile:
+            raise SystemExit(
+                "--capture-layer-input-reservoir requires "
+                "--capture-stage2-profile (the layer_input_reservoir "
+                "field lives inside the stage2_profile sidecar)."
+            )
+        os.environ["VLLM_CALIB_CAPTURE_LAYER_IN"] = "1"
+        log.info("--capture-layer-input-reservoir: enabled "
+                 "VLLM_CALIB_CAPTURE_LAYER_IN=1 "
                  "(must precede vllm import)")
 
     # Pre-import env gates for the router-logits-stats path. Same strict-

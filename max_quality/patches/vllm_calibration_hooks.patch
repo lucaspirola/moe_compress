@@ -5555,7 +5555,7 @@ new file mode 100644
 index 0000000..fc2f9e1
 --- /dev/null
 +++ b/vllm/calibration_hooks.py
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,392 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Calibration capture hooks for the MoE forward path.
@@ -5746,6 +5746,7 @@ index 0000000..fc2f9e1
 +_CAPTURE_EXPERT_MID: bool = (
 +    os.getenv("VLLM_CALIB_CAPTURE_EXPERT_MID", "0") == "1"
 +)
++_CAPTURE_LAYER_IN: bool = os.getenv("VLLM_CALIB_CAPTURE_LAYER_IN", "0") == "1"
 +
 +
 +VALID_HOOK_NAMES: frozenset[str] = frozenset(
@@ -5756,6 +5757,7 @@ index 0000000..fc2f9e1
 +        "expert_out_unweighted",
 +        "expert_mid",
 +        "block_out",
++        "layer_in",
 +        "linear_in",
 +        "lm_head_in",
 +    }
@@ -9255,7 +9257,7 @@ diff --git a/vllm/envs.py b/vllm/envs.py
 index ded474d..2ff296f 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -268,6 +268,24 @@ if TYPE_CHECKING:
+@@ -268,6 +268,25 @@ if TYPE_CHECKING:
      VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
      VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
      VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -9268,6 +9270,7 @@ index ded474d..2ff296f 100755
 +    VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED: bool = False
 +    VLLM_CALIB_CAPTURE_IMATRIX: bool = False
 +    VLLM_CALIB_CAPTURE_EXPERT_MID: bool = False
++    VLLM_CALIB_CAPTURE_LAYER_IN: bool = False
 +    VLLM_CALIB_CAPTURE_INPUT_COV: bool = False
 +    VLLM_CALIB_CAPTURE_PER_EXPERT_MAX: bool = False
 +    VLLM_CALIB_CAPTURE_ROUTING_STATS: bool = False
@@ -9280,7 +9283,7 @@ index ded474d..2ff296f 100755
  
  
  def get_default_cache_root():
-@@ -1788,6 +1806,193 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1788,6 +1807,203 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
          int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
      ),
@@ -9310,6 +9313,16 @@ index ded474d..2ff296f 100755
 +    # output) from the model's MoE block forward. Default off.
 +    "VLLM_CALIB_CAPTURE_BLOCK": lambda: bool(
 +        int(os.getenv("VLLM_CALIB_CAPTURE_BLOCK", "0"))
++    ),
++    # Calibration capture: dispatch the H_LAYER_IN hook (per-MoE-layer
++    # input hidden states, pre-experts) from inside
++    # Qwen3MoeSparseMoeBlock.forward. Feeds the layer_input_reservoir
++    # field of the stage2_profile sidecar (consumed by Stage 2 SC
++    # cost_alignment="output" via _LayerInputAccumulator, by Plugin #9
++    # MergeMoE T1 solve, and by expert_distill v2 per-token routing
++    # target). Default off.
++    "VLLM_CALIB_CAPTURE_LAYER_IN": lambda: bool(
++        int(os.getenv("VLLM_CALIB_CAPTURE_LAYER_IN", "0"))
 +    ),
 +    # Calibration capture: dispatch the H_EXPERT_OUT_UNWEIGHTED hook by
 +    # side-storing the per-(token, top-k) bf16 expert output BEFORE the
@@ -10046,7 +10059,27 @@ index 4ec1be3..454c657 100644
  from vllm.compilation.decorators import support_torch_compile
  from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
  from vllm.distributed import (
-@@ -239,6 +240,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+@@ -234,11 +235,33 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+         if self.is_sequence_parallel:
+             hidden_states = sequence_parallel_chunk(hidden_states)
+ 
++        # H_LAYER_IN calibration capture. Fires AFTER sequence-parallel
++        # chunking (the post-chunk hidden_states is the exact tensor
++        # self.experts receives), BEFORE the is_internal_router branch
++        # (both branches share the same input -- a single dispatch covers
++        # both). Feeds Stage 2 SC cost_alignment="output" via
++        # _LayerInputAccumulator (see
++        # moe_compress.stage2.profiling._LayerInputAccumulator,
++        # max_samples=8192, Vitter Algorithm R reservoir sampling).
++        if _ch._CAPTURE_LAYER_IN:
++            _ch.dispatch(
++                "layer_in",
++                layer_idx=self.experts.moe_layer_id,
++                hidden=hidden_states.detach(),
++            )
++
+         if self.experts.is_internal_router:
+             # In this case, the gate/router runs inside the FusedMoE class
              final_hidden_states = self.experts(
                  hidden_states=hidden_states, router_logits=hidden_states
              )
@@ -10060,7 +10093,7 @@ index 4ec1be3..454c657 100644
          else:
              # Actually this will be dead code, since we always pass gate into
              # FusedMoE in the current implementation. But we keep this code
-@@ -247,6 +255,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+@@ -247,6 +270,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
              final_hidden_states = self.experts(
                  hidden_states=hidden_states, router_logits=router_logits
              )
@@ -10074,7 +10107,7 @@ index 4ec1be3..454c657 100644
  
          if self.is_sequence_parallel:
              final_hidden_states = tensor_model_parallel_all_gather(
-@@ -496,8 +511,23 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
+@@ -496,8 +526,23 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
          aux_hidden_states = self._maybe_add_hidden_state(
              [], self.start_layer, hidden_states, residual
          )

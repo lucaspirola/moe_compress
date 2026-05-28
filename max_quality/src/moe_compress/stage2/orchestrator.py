@@ -1399,6 +1399,7 @@ def run(
                 expected_cov_storage_dtype=s2.get(
                     "covariance_storage_dtype", "float16",
                 ),
+                cost_alignment=cost_alignment_cfg,
             )]
             if (s2.get("profile_sidecar") or {}).get("enabled", False)
             else []

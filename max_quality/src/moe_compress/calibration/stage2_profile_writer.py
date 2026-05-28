@@ -39,6 +39,7 @@ Public API used by the driver:
 Internal callbacks exposed for unit testing (plan section 8.1):
     * :func:`_on_router_callback`
     * :func:`_on_expert_out_unweighted_callback`
+    * :func:`_on_layer_in_callback`
     * :func:`_finalize_batch_for_layer`
 """
 from __future__ import annotations
@@ -51,6 +52,7 @@ from typing import Any
 
 import torch
 
+from ..stage2.profiling import _LayerInputAccumulator
 from ..utils.activation_hooks import (
     InputCovarianceAccumulator,
     ReamCostAccumulator,
@@ -62,6 +64,18 @@ from ..utils.cached_calibration_signals import (
 )
 
 log = logging.getLogger(__name__)
+
+# Reservoir cap for the per-layer input-tokens streaming sample (Plugin #1
+# Opt-C / Vitter Algorithm R). Matches the default at
+# ``moe_compress.stage2.profiling._LayerInputAccumulator.__init__`` so the
+# captured calibration set is identical whether the data arrives from the
+# vLLM `layer_in` hook (this writer) or from the live profile pass
+# (``moe_compress.stage2.profiling._profile_layer``). Env-overridable so SC
+# experiments can raise it (per PLAN_PLUGIN_14:284 -- bounded by the host
+# RAM budget). Sampled at import; new processes pick up overrides.
+_LAYER_INPUT_MAX_SAMPLES: int = int(
+    os.getenv("VLLM_CALIB_LAYER_INPUT_MAX_SAMPLES", "8192")
+)
 
 
 @dataclass
@@ -75,8 +89,12 @@ class _WriterState:
     """
     ream_acc: ReamCostAccumulator = field(default_factory=ReamCostAccumulator)
     cov_acc: InputCovarianceAccumulator = field(default_factory=InputCovarianceAccumulator)
-    # Per-layer-idx reservoirs; translated to layer_rank list at dump time.
-    layer_input_reservoir: dict[int, torch.Tensor] = field(default_factory=dict)
+    # Per-layer-idx streaming reservoirs. Populated by the `layer_in`
+    # callback via :class:`_LayerInputAccumulator` (Vitter Algorithm R,
+    # per-layer seeded by ``layer_idx``). Finalised to a bf16 ``[N, hidden]``
+    # tensor list at dump time. Empty dict on runs without the
+    # ``VLLM_CALIB_CAPTURE_LAYER_IN=1`` env gate.
+    layer_input_reservoir: dict[int, _LayerInputAccumulator] = field(default_factory=dict)
     layer_idx_to_rank: dict[int, int] = field(default_factory=dict)
     rank_to_layer_idx: dict[int, int] = field(default_factory=dict)
     n_layers: int = 0
@@ -286,13 +304,49 @@ def _record_neuron_act(
     _state.ream_acc._neuron_act_count[key] = int(n_tokens)
 
 
+def _on_layer_in_callback(
+    layer_idx: int, hidden: torch.Tensor,
+) -> None:
+    """``layer_in`` hook handler -- stream per-batch layer input into the reservoir.
+
+    Constructs a per-layer :class:`_LayerInputAccumulator` lazily on first
+    sighting (seed = layer_idx for per-layer determinism, matching the live
+    profile pass's contract at ``moe_compress.stage2.profiling._profile_layer``).
+    Subsequent calls feed the Vitter Algorithm R reservoir via the
+    accumulator's vectorised ``add`` method (Plugin #1 Opt-C).
+    """
+    li = int(layer_idx)
+    acc = _state.layer_input_reservoir.get(li)
+    if acc is None:
+        # Per-layer seed = layer_idx (cross-run determinism + per-layer
+        # independence; matches profiling.py:86).
+        acc = _LayerInputAccumulator(
+            max_samples=_LAYER_INPUT_MAX_SAMPLES, seed=li,
+        )
+        _state.layer_input_reservoir[li] = acc
+    acc.add(hidden)
+
+
 def _record_layer_input_reservoir(
     layer_idx: int, reservoir: torch.Tensor,
 ) -> None:
-    """Stash the per-layer-input reservoir snapshot for ``layer_idx``."""
-    _state.layer_input_reservoir[int(layer_idx)] = (
-        reservoir.detach().to("cpu", dtype=torch.bfloat16).contiguous()
+    """Test helper -- stash a pre-finalised reservoir snapshot directly.
+
+    Preserves the original ``dict[int, Tensor]`` test-API contract (tests
+    call this to inject a known reservoir without driving the streaming
+    callback). Builds a fresh accumulator with the layer-seeded RNG, sets
+    ``.buffer`` and ``.seen`` from the snapshot, and stores it on the
+    state. Downstream consumers (``dump_stage2_profile``) read the
+    ``.buffer`` field uniformly.
+    """
+    li = int(layer_idx)
+    acc = _LayerInputAccumulator(
+        max_samples=_LAYER_INPUT_MAX_SAMPLES, seed=li,
     )
+    buf = reservoir.detach().to("cpu", dtype=torch.bfloat16).contiguous()
+    acc.buffer = buf
+    acc.seen = int(buf.size(0))
+    _state.layer_input_reservoir[li] = acc
 
 
 # ---------------------------------------------------------------------------
@@ -415,16 +469,22 @@ def dump_stage2_profile(jsonl_path: Path | str) -> None:
             continue
         cov_tc[(rank, int(e), str(m))] = int(n)
 
+    # Finalise each per-layer accumulator to a bf16 ``[N, hidden]`` tensor.
+    # Empty/missing layers fall back to the legacy ``(0, 0)`` placeholder
+    # so the schema-v3 reader's empty-shape guard keeps working as a
+    # defensive fallback (per plan §5.a).
     layer_input_reservoir: list = []
     for rank in range(n_layers):
         layer_idx = _state.rank_to_layer_idx[rank]
-        t = _state.layer_input_reservoir.get(layer_idx)
-        if t is None:
+        acc = _state.layer_input_reservoir.get(layer_idx)
+        if acc is None or acc.buffer is None or acc.buffer.numel() == 0:
             layer_input_reservoir.append(
                 torch.zeros((0, 0), dtype=torch.bfloat16)
             )
         else:
-            layer_input_reservoir.append(t)
+            layer_input_reservoir.append(
+                acc.buffer.detach().to("cpu", dtype=torch.bfloat16).contiguous()
+            )
 
     payload = Stage2ProfilePayloadV3(
         format_version=3,
@@ -444,20 +504,26 @@ def dump_stage2_profile(jsonl_path: Path | str) -> None:
         layer_input_reservoir=layer_input_reservoir,
     )
     save_stage2_profile_v3(payload, jsonl_path)
-    # H-1: surface the missing layer-input reservoir to operators. The
-    # vLLM patch currently does NOT register a `layer_in` callback, so
-    # production sidecars carry empty (0, 0) placeholders for every
-    # layer. Until a follow-up adds the hook, SC cost_alignment="output"
-    # will fall back to the live forward pass on full-hit layers.
-    if layer_input_reservoir and all(
-        t.numel() == 0 for t in layer_input_reservoir
-    ):
+    # Per plan §2.e: replace the prior H-1 "no hook yet" warning with an
+    # info-log reporting how many of the ``n_layers`` reservoirs got
+    # populated. All-empty after CRITICAL-1 landing typically means the
+    # operator forgot to set ``VLLM_CALIB_CAPTURE_LAYER_IN=1`` (the new
+    # capture env gate) -- escalate to a warning in that case so it
+    # surfaces in the driver logs.
+    populated = sum(1 for t in layer_input_reservoir if t.numel() > 0)
+    if layer_input_reservoir and populated == 0:
         log.warning(
             "stage2-profile-writer: layer_input_reservoir is empty for "
-            "all %d layers — the vLLM patch has no `layer_in` callback "
-            "hook yet; SC cost_alignment='output' will fall back to the "
-            "live forward pass for hydrated layers. See H-1 follow-up.",
+            "all %d layers -- VLLM_CALIB_CAPTURE_LAYER_IN was not set "
+            "to '1' (or no layer_in callback fired). SC "
+            "cost_alignment='output' will fall back to the live forward "
+            "pass for full-hit layers.",
             n_layers,
+        )
+    else:
+        log.info(
+            "stage2-profile-writer: layer_input_reservoir populated for "
+            "%d/%d layers", populated, n_layers,
         )
     log.info(
         "stage2-profile-writer: wrote %d-layer x %d-expert sidecar "
@@ -501,7 +567,20 @@ def dump_stage2_profile_checkpoint(path: str | Path) -> None:
         "cov_acc_covariance": dict(_state.cov_acc.covariance),
         "cov_acc_token_count": dict(_state.cov_acc.token_count),
         "cov_acc_storage_dtype": str(_state.cov_acc.storage_dtype).split(".")[-1],
-        "layer_input_reservoir": dict(_state.layer_input_reservoir),
+        # Serialise each accumulator as ``(buffer, seen, seed)``. The seed
+        # is recovered from the layer_idx contract (the accumulator was
+        # constructed with seed=layer_idx); reconstructed on load via
+        # ``_LayerInputAccumulator(max_samples=..., seed=layer_idx)`` so
+        # the RNG stream resumes byte-identically across processes
+        # (profiling.py:57-79 determinism contract).
+        "layer_input_reservoir": {
+            int(li): (
+                None if acc.buffer is None else acc.buffer.detach().cpu().clone(),
+                int(acc.seen),
+                int(acc.max_samples),
+            )
+            for li, acc in _state.layer_input_reservoir.items()
+        },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(state_payload, tmp)
@@ -608,9 +687,38 @@ def load_stage2_profile_checkpoint(path: str | Path) -> int:
     )
     _state.cov_acc.covariance = dict(loaded.get("cov_acc_covariance", {}))
     _state.cov_acc.token_count = dict(loaded.get("cov_acc_token_count", {}))
-    _state.layer_input_reservoir = dict(
-        loaded.get("layer_input_reservoir", {})
-    )
+    # Reconstruct the per-layer accumulators with the same per-layer seed
+    # (= layer_idx) so the resumed RNG stream is byte-identical to the
+    # non-resumed path (profiling.py:57-79 determinism contract).
+    # Backward compat: an older checkpoint with the bf16-tensor shape is
+    # promoted to an accumulator with buffer set + seen = buffer.size(0).
+    raw_reservoir = loaded.get("layer_input_reservoir", {}) or {}
+    new_reservoir: dict[int, _LayerInputAccumulator] = {}
+    for li, payload_entry in raw_reservoir.items():
+        li_int = int(li)
+        if isinstance(payload_entry, tuple):
+            buf, seen, max_samples = payload_entry
+            acc = _LayerInputAccumulator(
+                max_samples=int(max_samples), seed=li_int,
+            )
+            acc.buffer = (
+                None if buf is None
+                else buf.detach().cpu().to(torch.bfloat16).contiguous()
+            )
+            acc.seen = int(seen)
+        else:
+            # Legacy: payload was a bare tensor snapshot.
+            acc = _LayerInputAccumulator(
+                max_samples=_LAYER_INPUT_MAX_SAMPLES, seed=li_int,
+            )
+            if payload_entry is not None and payload_entry.numel() > 0:
+                acc.buffer = (
+                    payload_entry.detach().cpu()
+                    .to(torch.bfloat16).contiguous()
+                )
+                acc.seen = int(payload_entry.size(0))
+        new_reservoir[li_int] = acc
+    _state.layer_input_reservoir = new_reservoir
     return _state.n_prompts_accumulated
 
 

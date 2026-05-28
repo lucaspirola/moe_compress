@@ -106,6 +106,7 @@ class Stage2ProfileCacheProvider:
         cov_acc,
         expected_cov_storage_dtype: str | None = None,
         partial_hit_fraction: float = 0.5,
+        cost_alignment: str = "pre",
     ) -> None:
         """Construct the provider.
 
@@ -122,12 +123,32 @@ class Stage2ProfileCacheProvider:
                 skipped and only the allowed-values guard fires.
             partial_hit_fraction: threshold below which a layer is
                 classified as a partial hit (plan §5; defaults to 0.5).
+            cost_alignment: the active ``stage2_reap_ream.cost_alignment``
+                value (one of ``"pre"`` / ``"post"`` / ``"output"``). Used
+                by the hidden-bug demote guard (plan §5.b): when
+                ``"output"`` is active AND the sidecar's per-layer
+                reservoir is empty, the reader demotes ``full_hit`` to
+                ``partial_hit`` so ``_output_space_cost`` does not crash
+                on a missing layer-input buffer. Defaults to ``"pre"``
+                (no demotion) so the new arg is optional for callers that
+                don't enable output-space alignment.
         """
         self.cov_acc = cov_acc
         self.expected_cov_storage_dtype = expected_cov_storage_dtype
         self.partial_hit_fraction = float(partial_hit_fraction)
+        self.cost_alignment = str(cost_alignment).lower()
         # Filled by on_load; consumed by on_layer_setup.
         self.payload: Stage2ProfilePayloadV3 | None = None
+
+    def _cost_alignment_requires_reservoir(self) -> bool:
+        """True iff ``cost_alignment="output"`` is active.
+
+        Mirrors :meth:`OutputSpaceCostPlugin.is_enabled` (output_space_cost.py
+        :585-593): the layer-input reservoir is mandatory only on
+        ``cost_alignment="output"`` runs. On ``"pre"`` / ``"post"`` the
+        reservoir is unused so an empty payload entry is harmless.
+        """
+        return self.cost_alignment == "output"
 
     def is_enabled(self, config: dict) -> bool:
         s2 = config.get("stage2_reap_ream", {}) or {}
@@ -281,16 +302,34 @@ class Stage2ProfileCacheProvider:
         # (acceptable opt-in cost — see plan §10 N-3 / round-3 guard).
         if layer_input_acc is not None:
             reservoir_t = payload.layer_input_reservoir[layer_rank]
-            # Empty placeholder ``(0, 0)`` tensor signals the writer's
-            # layer_input reservoir capture is not yet wired in the vLLM
-            # patch (H-1 follow-up — pending a `layer_in` callback hook).
-            # Skip hydration so the live path's fresh empty accumulator
-            # remains, and SC cost_alignment="output" falls back to the
-            # live forward pass for this layer instead of consuming a
-            # silently-empty buffer.
+            # Empty placeholder ``(0, 0)`` tensor signals the writer ran
+            # without the ``VLLM_CALIB_CAPTURE_LAYER_IN=1`` env gate (or
+            # against a pre-CRITICAL-1 vLLM patch that lacks the
+            # ``layer_in`` dispatch site). Skip hydration so the live
+            # path's fresh empty accumulator remains.
             if reservoir_t is not None and reservoir_t.numel() > 0:
                 layer_input_acc.buffer = reservoir_t.clone()
                 layer_input_acc.seen = int(reservoir_t.size(0))
+            elif self._cost_alignment_requires_reservoir():
+                # Hidden-bug fix (plan §5.b): on
+                # ``cost_alignment="output"`` runs an empty reservoir
+                # WILL crash ``_output_space_cost`` downstream. Demote to
+                # partial hit so :meth:`LayerMergePlugin.on_profile`
+                # re-runs ``_profile_layer`` and the live forward
+                # populates ``layer_input_acc.buffer``. Without this the
+                # first run against a stale pre-hook sidecar that hits a
+                # ``cost_alignment="output"`` strategy raises::
+                #
+                #     RuntimeError: _output_space_cost: no layer-input
+                #     calibration tokens were captured ...
+                ctx.set("stage2_profile_partial_hit", True)
+                log.info(
+                    "stage2-profile-cache: layer %d (rank=%d) demoted "
+                    "to partial hit (empty layer_input_reservoir + "
+                    "cost_alignment='output') — live forward will run",
+                    layer_idx, layer_rank,
+                )
+                return
 
         ctx.set("stage2_profile_full_hit", True)
         log.info(
