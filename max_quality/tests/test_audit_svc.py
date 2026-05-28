@@ -517,3 +517,59 @@ def test_load_merge_map_aggregate_layout(tmp_path: Path):
 def test_load_merge_map_raises_on_missing(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         svc_audit.load_merge_map(tmp_path / "nope")
+
+
+# --------------------------------------------------------------------------- #
+# HF state-dict normaliser — fused layout (M2)                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_normalise_hf_state_dict_fused_layout_splits_correctly():
+    """Fused Qwen3-MoE layout splits cleanly into per-expert gate/up/down.
+
+    The fused state-dict layout is the production Qwen3 MoE shape:
+      * ``...experts.gate_up_proj`` : ``[E, 2*d_int, d_hid]`` — stacked
+        gate (first d_int rows) + up (remaining d_int rows) per expert.
+      * ``...experts.down_proj`` : ``[E, d_out, d_in]`` — one slab per
+        expert.
+
+    The normaliser must:
+      * unstack E experts;
+      * split ``gate_up_proj`` into ``gate_proj`` [d_int, d_hid] and
+        ``up_proj`` [d_int, d_hid];
+      * emit per-expert ``down_proj`` slabs unchanged.
+
+    Each per-expert tensor must keep the nn.Linear ``[d_out, d_in]``
+    convention so downstream audit consumers see the same shape contract
+    as the non-fused layout.
+    """
+    E, d_int, d_hid, d_out = 4, 8, 6, 6
+    g = torch.Generator().manual_seed(123)
+    gate_up = torch.randn(E, 2 * d_int, d_hid, generator=g)
+    down = torch.randn(E, d_out, d_int, generator=g)
+    sd = {
+        "model.layers.0.mlp.experts.gate_up_proj": gate_up,
+        "model.layers.0.mlp.experts.down_proj": down,
+    }
+    out = svc_audit._normalise_hf_state_dict(sd)
+
+    # Every expert should have all three matrix slots present.
+    for e in range(E):
+        for matrix in ("gate_proj", "up_proj", "down_proj"):
+            assert (0, e, matrix) in out, f"missing ({0}, {e}, {matrix!r})"
+
+    # Shape contract: nn.Linear convention [d_out, d_in].
+    for e in range(E):
+        assert out[(0, e, "gate_proj")].shape == (d_int, d_hid)
+        assert out[(0, e, "up_proj")].shape == (d_int, d_hid)
+        assert out[(0, e, "down_proj")].shape == (d_out, d_int)
+
+    # Value contract: gate slab is the FIRST d_int rows, up slab is the
+    # LAST d_int rows, and down_proj is unchanged per expert.
+    for e in range(E):
+        assert torch.equal(out[(0, e, "gate_proj")], gate_up[e, :d_int, :])
+        assert torch.equal(out[(0, e, "up_proj")], gate_up[e, d_int:, :])
+        assert torch.equal(out[(0, e, "down_proj")], down[e])
+
+    # Exactly E*3 entries — no spurious keys.
+    assert len(out) == E * 3

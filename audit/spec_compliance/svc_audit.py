@@ -480,7 +480,67 @@ def _parse_aggregate_merge_map(raw: Any) -> dict[int, dict[int, list[int]]]:
 def load_originals_snapshot(
     path: Path,
 ) -> dict[tuple[int, int, str], torch.Tensor]:
-    """Load Stage 3's ``_stage3_original_weights.pt`` snapshot."""
+    """Load Stage 3's ``_stage3_original_weights.pt`` snapshot.
+
+    Pattern O (atomic-write manifest validation) — mirrors the canonical
+    Stage 4 reader at
+    ``max_quality/src/moe_compress/stage4/plugins/eora_inputs.py:199-243``.
+    Stage 3 writes the manifest LAST, after the ``.pt``'s fsync, so a
+    torn ``.pt`` (mid-write SIGKILL on the ~50 GB payload) leaves NO
+    sibling manifest. We validate manifest-first to fail loudly on a
+    torn write instead of silently consuming a partial file.
+
+    Backward-compat fallback: a ``.pt`` produced by a pre-manifest Stage 3
+    writer has no manifest sibling — we accept it with a single WARNING
+    (skipping validation), matching the eora_inputs.py legacy shim. Once
+    all in-flight runs upgrade to a manifest-emitting writer, the
+    fallback branch becomes loud-fail territory.
+    """
+    # LOW-5: manifest naming consistency with F-RK-1 — the canonical
+    # writer appends ``.MANIFEST.json`` AFTER the payload suffix
+    # (``..._weights.pt.MANIFEST.json``). The legacy
+    # ``..._weights.MANIFEST.json`` (suffix-replaced) is also consulted
+    # for back-compat with pre-LOW-5 Stage 3 runs. See
+    # eora_inputs.py:171-184.
+    manifest_path = path.with_suffix(path.suffix + ".MANIFEST.json")
+    legacy_manifest_path = path.with_suffix(".MANIFEST.json")
+    if not manifest_path.exists() and legacy_manifest_path.exists():
+        manifest_path = legacy_manifest_path
+    if manifest_path.exists():
+        from moe_compress.utils.atomic_io import (
+            ManifestMismatchError,
+            read_and_validate_manifest,
+        )
+        try:
+            read_and_validate_manifest(
+                path,
+                manifest_path,
+                expected_schema_version=1,
+            )
+        except ManifestMismatchError as exc:
+            log.error(
+                "load_originals_snapshot: Stage 3 originals manifest "
+                "validation FAILED for %s — %s. This is the classic "
+                "torn-write signature on a ~50 GB artifact. Delete "
+                "both %s and %s and re-run Stage 3.",
+                path,
+                exc,
+                path.name,
+                manifest_path.name,
+            )
+            raise
+    else:
+        # Legacy back-compat shim — pre-manifest Stage 3 writers produced
+        # .pt files without sibling manifests. Same WARN-and-continue
+        # contract as the canonical reader at eora_inputs.py:237-243.
+        log.warning(
+            "load_originals_snapshot: %s has no MANIFEST.json sibling "
+            "(pre-manifest Stage 3 writer?). Proceeding without manifest "
+            "validation; if torch.load errors below, the .pt may be torn — "
+            "delete it and re-run Stage 3.",
+            path,
+        )
+
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError(
