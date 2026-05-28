@@ -184,7 +184,6 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any
 
 import numpy as np
 import torch
@@ -452,7 +451,6 @@ class RCOBudgetPlugin:
 
         # Initial fitness + budget vector for the metadata + R3 log lever.
         init_fitness, init_budget_vec = self._evaluate_discrete(
-            alpha=alpha,
             cost_grid=cost_grid,
             mask=mask,
             damage_grid=damage_grid,
@@ -525,7 +523,6 @@ class RCOBudgetPlugin:
 
         # Final discrete read: pure-damage DP project to budget-exact.
         final_fitness, final_budget_vec = self._evaluate_discrete(
-            alpha=alpha,
             cost_grid=cost_grid,
             mask=mask,
             damage_grid=damage_grid,
@@ -984,7 +981,6 @@ class RCOBudgetPlugin:
     def _evaluate_discrete(
         self,
         *,
-        alpha: torch.Tensor,  # noqa: ARG002 — kept for signature stability
         cost_grid: torch.Tensor,
         mask: torch.Tensor,
         damage_grid: torch.Tensor,
@@ -1053,9 +1049,10 @@ class RCOBudgetPlugin:
             # The primary DP table only tracks budgets in [0, B]; nearest
             # feasibility needs to also consider budgets > B, which means
             # re-solving over the full achievable range
-            # ``B_max = Σ_l max(opts_l)``. Capacity is small at our scale
-            # (L · K_max · B_max ≈ 6.4M for production); the cost is paid
-            # only on the rare infeasibility path.
+            # ``B_max = Σ_l max(opts_l)``. Capacity is small at our scale:
+            # Cost: L · K_max · B_max ≈ 48 · 65 · 6144 ≈ 19M float64 ops for
+            # production scale (still cheap — paid only on the rare
+            # infeasibility fallback path).
             B_max = int(sum(max(opts) for opts in k_options.values()))
             best_ext = np.full((L + 1, B_max + 1), INF, dtype=np.float64)
             choice_ext = np.full((L + 1, B_max + 1), -1, dtype=np.int64)

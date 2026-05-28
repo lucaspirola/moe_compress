@@ -628,13 +628,12 @@ def test_dp_knapsack_optimality():
     )
     damage_grid = torch.rand(L, K, dtype=torch.float64) * 10.0
     mask = torch.ones(L, K, dtype=torch.float64)
-    alpha = torch.zeros(L, K, dtype=torch.float64)
     k_options = {li: [1, 2, 3, 4] for li in range(L)}
     sorted_layers = [0, 1, 2]
     B = 7
 
     fitness_dp, budget_dp = plugin._evaluate_discrete(
-        alpha=alpha, cost_grid=cost_grid, mask=mask, damage_grid=damage_grid,
+        cost_grid=cost_grid, mask=mask, damage_grid=damage_grid,
         k_options=k_options, sorted_layers=sorted_layers, global_budget=B,
     )
 
@@ -663,7 +662,7 @@ def test_dp_knapsack_optimality():
 # --- F8: infeasible budget falls back to nearest feasible ------------------
 
 
-def test_dp_handles_infeasible_budget(monkeypatch):
+def test_dp_handles_infeasible_budget(caplog):
     """F8: when B is out of range, DP falls back to NEAREST feasible (not max).
 
     Plan §6.1 F8 / Delta 6 fix: selector is
@@ -675,49 +674,57 @@ def test_dp_handles_infeasible_budget(monkeypatch):
     only → feasible budgets = {4, 6, 8}. Ask B=5; nearest is 4 or 6,
     larger wins → 6. Ask B=7; 6 or 8 are equidistant; larger wins → 8.
 
-    Captures the WARNING via a monkeypatched ``log.warning`` rather than
-    pytest's ``caplog`` because the latter has propagation quirks
-    depending on the test harness's log-config side effects.
+    Uses Pattern N (caplog + propagate-restore) per
+    [[architectural-patterns]]; see
+    ``tests/test_stage2_assignment_v2.py:342-348`` for the canonical
+    precedent. Pytest's caplog plugin flips ``propagate=False`` on
+    captured loggers by default; we opt back in around the call and
+    restore in ``finally``.
     """
+    import logging
+
     plugin = RCOBudgetPlugin()
     L, K = 2, 2
     cost_grid = torch.tensor([[2, 4], [2, 4]], dtype=torch.float64)
     damage_grid = torch.tensor([[1.0, 1.0], [1.0, 1.0]], dtype=torch.float64)
     mask = torch.ones(L, K, dtype=torch.float64)
-    alpha = torch.zeros(L, K, dtype=torch.float64)
     k_options = {0: [2, 4], 1: [2, 4]}
     sorted_layers = [0, 1]
 
-    # Spy on log.warning to confirm the warning fires (no silent corruption).
-    from moe_compress.stage1.plugins import rco_budget as rco_mod
-    warnings_seen: list[str] = []
+    rco_log = logging.getLogger("moe_compress.stage1.plugins.rco_budget")
+    _saved_propagate = rco_log.propagate
+    rco_log.propagate = True
+    try:
+        with caplog.at_level(
+            logging.WARNING, logger="moe_compress.stage1.plugins.rco_budget"
+        ):
+            # B = 5: equidistant from 4 and 6 → larger-budget tiebreak picks 6.
+            _, budget = plugin._evaluate_discrete(
+                cost_grid=cost_grid, mask=mask, damage_grid=damage_grid,
+                k_options=k_options, sorted_layers=sorted_layers, global_budget=5,
+            )
+            assert sum(budget.values()) == 6, (
+                f"B=5 infeasible; expected nearest-larger=6, got {sum(budget.values())}"
+            )
+            # WARNING was emitted (no silent corruption).
+            out_of_range_msg = any(
+                "infeasible" in r.message.lower() for r in caplog.records
+            )
+            assert out_of_range_msg, (
+                "expected infeasible-budget warning; got "
+                f"{[r.message for r in caplog.records]}"
+            )
 
-    def _spy(msg, *args, **kwargs):
-        warnings_seen.append(msg % args if args else msg)
-
-    monkeypatch.setattr(rco_mod.log, "warning", _spy)
-
-    # B = 5: equidistant from 4 and 6 → larger-budget tiebreak picks 6.
-    _, budget = plugin._evaluate_discrete(
-        alpha=alpha, cost_grid=cost_grid, mask=mask, damage_grid=damage_grid,
-        k_options=k_options, sorted_layers=sorted_layers, global_budget=5,
-    )
-    assert sum(budget.values()) == 6, (
-        f"B=5 infeasible; expected nearest-larger=6, got {sum(budget.values())}"
-    )
-    # WARNING was emitted (no silent corruption).
-    assert any("infeasible" in w for w in warnings_seen), (
-        f"expected 'infeasible' WARNING; saw: {warnings_seen}"
-    )
-
-    # B = 7: equidistant from 6 and 8 → larger-budget tiebreak picks 8.
-    _, budget = plugin._evaluate_discrete(
-        alpha=alpha, cost_grid=cost_grid, mask=mask, damage_grid=damage_grid,
-        k_options=k_options, sorted_layers=sorted_layers, global_budget=7,
-    )
-    assert sum(budget.values()) == 8, (
-        f"B=7 infeasible; expected nearest-larger=8, got {sum(budget.values())}"
-    )
+            # B = 7: equidistant from 6 and 8 → larger-budget tiebreak picks 8.
+            _, budget = plugin._evaluate_discrete(
+                cost_grid=cost_grid, mask=mask, damage_grid=damage_grid,
+                k_options=k_options, sorted_layers=sorted_layers, global_budget=7,
+            )
+            assert sum(budget.values()) == 8, (
+                f"B=7 infeasible; expected nearest-larger=8, got {sum(budget.values())}"
+            )
+    finally:
+        rco_log.propagate = _saved_propagate
 
 
 # --- F9: convergence on a synthetic quadratic ------------------------------
@@ -836,8 +843,9 @@ def test_cosine_anneal_endpoints():
         f"τ at t=0 should be τ_init={tau_init}, got {tau_0}"
     )
     # cos(π·(T-1)/T) = cos(π·(1 - 1/T)) ≈ -1 + π²/(2T²) for large T; with
-    # T=500 the offset is small but nonzero so use a generous tol.
-    assert tau_end == pytest.approx(tau_final, abs=2e-2), (
+    # T=500 the analytic offset is ~4.43e-5, so abs=1e-4 leaves 2-3 orders
+    # of magnitude of headroom over the schedule's exact deviation.
+    assert tau_end == pytest.approx(tau_final, abs=1e-4), (
         f"τ at t=T-1 should be ≈τ_final={tau_final}, got {tau_end}"
     )
     # Sanity: τ_init > τ_end ⇒ schedule is decreasing (explore → exploit).
@@ -988,12 +996,11 @@ def test_dp_pure_damage_not_logit_tiebreak():
     cost_grid = torch.tensor([[1.0, 2.0], [1.0, 2.0]], dtype=torch.float64)
     damage_grid = torch.tensor([[1.0, 1.0], [1.0, 1.001]], dtype=torch.float64)
     mask = torch.ones(L, K, dtype=torch.float64)
-    alpha = torch.tensor([[10.0, 0.0], [0.0, 10.0]], dtype=torch.float64)
     k_options = {0: [1, 2], 1: [1, 2]}
     sorted_layers = [0, 1]
 
     _, budget_vec = plugin._evaluate_discrete(
-        alpha=alpha, cost_grid=cost_grid, mask=mask, damage_grid=damage_grid,
+        cost_grid=cost_grid, mask=mask, damage_grid=damage_grid,
         k_options=k_options, sorted_layers=sorted_layers, global_budget=3,
     )
 
