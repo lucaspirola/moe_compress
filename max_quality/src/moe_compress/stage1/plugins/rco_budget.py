@@ -1,184 +1,184 @@
-"""RCO — Riemannian-manifold budget allocator (Stage 1 refinement).
+"""RCO — Riemannian-manifold budget allocator (Stage 1 refinement, clean-room re-impl).
 
 Paper
 -----
 IST-DASLab, *Model Compression with Exact Budget Constraints via
 Riemannian Manifolds* — arxiv:2605.00649 (May 2026). §3 Algorithm 1.
 
+This module is a **clean-room re-implementation** from the paper's prose +
+``tasks/PLAN_RCO_NATIVE_REIMPL.md`` (v7 — 7 rounds of plan-reviewer
+ping-pong). Upstream repo at https://github.com/IST-DASLab/RCO ships
+**without a LICENSE file**, re-verified 2026-05-28 via the GitHub API on
+``https://api.github.com/repos/IST-DASLab/RCO`` returning the raw response
+``{"license": null, "default_branch": "main", "updated_at": "2026-05-16T..."}``.
+NO upstream source files are referenced. (Pattern H clean-room rule.)
+
+History — this file fully replaces the prior implementation at commit
+``269e64d`` (898 LoC, 12 tests). That implementation had **four** known
+algorithmic deviations that this re-impl fixes in-place:
+
+1. **Gumbel-softmax form**: was ``softmax(α + τ · g)``; now standard
+   ``softmax((α + g) / τ)``. Plan §1.3 step 1.
+2. **Cosine anneal direction**: was exploit→explore (start cold, end hot);
+   now explore→exploit (start hot, end cold) per the canonical form
+   ``τ_t = τ_final + 0.5·(τ_init − τ_final)·(1 + cos(π · t/T))``. Plan
+   §1.3 step 2.
+3. **DP score**: was ``damage − 1e-3 · log p``; now pure damage. The
+   β·log p tiebreak is REMOVED. Plan §1.3 step 3.
+4. **Infeasible-budget fallback**: was ``max(feasible, ...)``; now
+   nearest-feasible with larger-budget tiebreak via
+   ``min(feasible, key=lambda b: (abs(b − B), −b))``. Plan §6.1 F8.
+
 Slot in this codebase
 ---------------------
-**Stage 1 budget refinement.** This plugin runs AFTER
-:class:`stage1.plugins.grape_merge.GrapeMergePlugin` and produces a
-*refined* per-layer budget vector `{layer_idx -> surviving expert count}`
-on a NEW context slot ``per_layer_target_experts_rco``. GRAPE's original
-slot ``per_layer_target_experts`` is left untouched — downstream stages
-choose which budget to consume via the standard config knob (the row
-recipe sets the slot name; default is GRAPE).
+**Stage 1 budget refinement.** Runs AFTER ``grape_merge`` (Phase G,
+manifest index 9). Produces ``per_layer_target_experts_rco`` on a NEW
+context slot — distinct from GRAPE's ``per_layer_target_experts`` so the
+row recipe explicitly opts in. Default OFF behind
+``stage1.rco_budget.enabled``.
 
-Algorithm summary (paper §3, Algorithm 1)
------------------------------------------
-RCO recasts the discrete budget-allocation problem as a smooth
-optimization over a **Riemannian manifold** defined by an *exact* budget
-constraint. State is a per-layer matrix of logits ``α ∈ ℝ^{L × K}`` where
-``L`` is the MoE layer count and ``K`` is the number of candidate
-per-layer budgets. ``p_lk = softmax(α_l)_k`` is the soft allocation and
-the constraint is ``Σ_l Σ_k p_lk · c_lk = B`` with ``c_lk`` = surviving
-expert count of option ``k`` for layer ``l`` and ``B`` = global expert
-budget.
+Algorithm reference (paper §3 Algorithm 1, plan §1)
+----------------------------------------------------
 
-Three manifold primitives drive the search (paper §3.1):
+Given ``L`` MoE-bearing groups, each with a finite per-group option grid
+of size ``K_l`` with positive integer costs ``c_lk`` (here: surviving
+expert counts for the layer), and a global integer budget ``B``, find a
+discrete assignment minimising the decomposable damage
+``Σ_l D_l(k_l)`` subject to ``Σ_l c_{l, k_l} = B``.
 
-1. **Tangent projection** of a Euclidean gradient ``g``:
-   ``g_tangent = g − (⟨g, n⟩ / ⟨n, n⟩) · n``
-   where ``n_lk = p_lk · (c_lk − E_p[c_l])`` is the gradient of the
-   constraint w.r.t. ``α`` (i.e. the constraint normal).
+Introduce per-group logits ``α_l ∈ ℝ^{K_l}`` and soft probabilities
+``p_lk = softmax(α_l)_k``. The Budget Manifold (paper §2 Eq. 1) is
 
-2. **Retraction** onto the manifold via 1-D bisection along the cost
-   direction: find ``t`` such that ``Σ_l Σ_k softmax(α_l + t·c_l)_k
-   · c_lk = B``. Bracket-doubling until the budget straddles zero, then
-   bisection to tolerance.
+    M = { α ∈ ℝ^{Σ K_l} : C(α) = B }    with    C(α) = Σ_l ⟨p_l, c_l⟩.
 
-3. **Vector transport** of Adam's first-moment buffer to the new tangent
-   plane after a step + retraction (re-project ``m`` using the same
-   formula as the tangent projection on the new ``α``).
+Four manifold primitives drive the search (paper §2 Props. 1/2 + §3.1):
 
-Forward pass (fitness evaluation): Gumbel-STE samples a per-layer
-argmax, then a **multiple-choice knapsack 1-D DP** projects the argmax
-assignment to the closest budget-exact discrete vector under the per-
-layer cost grid. Backward flows through Gumbel-softmax probabilities.
+1. **Constraint normal** ``n_lk = p_lk · (c_lk − ⟨p_l, c_l⟩)`` —
+   gradient of C w.r.t. α. Always evaluated at the **un-perturbed**
+   ``p = softmax(α)`` (paper §2; see Q8 in the plan).
+2. **Tangent projection**: ``g_tan = g − (⟨g, n⟩/⟨n, n⟩)·n``.
+3. **Retraction** along the cost direction ``α(t) = α − t·c_grid``:
+   1-D bracket-doubling + bisection, signed by ``f(0) = C(α) − B``.
+4. **Vector transport — first moment only**: after each retraction,
+   re-project Adam's first moment ``m`` onto the new tangent plane;
+   the second moment ``v`` is left untransported (``D-adam-no-v-transport``).
 
-Fitness signal (`SC_STAGE12_COMPREHENSIVE_PLAN.md` §5.3 last bullet):
-**output-space MSE** — the same Stage 2 cost the SC row already
-optimizes. If a per-layer damage curve
-``D_l(k) = output-space MSE damage at k surviving experts`` is supplied
-on ``ctx["per_layer_damage_curve"]`` (the future S1_DP plugin would
-populate this), RCO reads it directly. When the slot is absent the
-plugin falls back to a *synthetic linear-redundancy curve*
-``D_l(k) = R̃^l · (per_layer_count_l − k)`` using GRAPE's R̃^l output,
-which preserves GRAPE's qualitative ranking — worst case RCO ≈ GRAPE.
+Forward pass (§1.3): standard-form Gumbel-softmax
+``p̃ = softmax((α + g) / τ)`` with ``g ~ Gumbel(0, 1)``. Limits: τ→∞ →
+uniform (explore); τ→0 → argmax(α + g) (exploit, Gumbel-max trick).
+Cosine-anneal τ from ``τ_init`` to ``τ_final`` so the search starts
+exploratory and ends decisive.
 
-Upstream code & licensing
--------------------------
-Reference implementation: https://github.com/IST-DASLab/RCO. **The
-upstream repo ships without a LICENSE file** (verified 2026-05-27 via
-the GitHub API: ``"license": null``). This implementation is therefore
-a clean-room re-implementation from the paper's algorithm prose and
-from the manifold-primitive descriptions in
-``tasks/SC_STAGE12_COMPREHENSIVE_PLAN.md`` §5.3 — no source files are
-copied. The repo is cited as an attribution / cross-check target only.
-See deviation D-clean-room.
+Discrete readout (§1.3 step 3): multiple-choice knapsack DP minimising
+**pure damage** ``Σ_l D_l(k_l)`` s.t. ``Σ_l c_{l, k_l} = B``. Strict
+``<`` tiebreak so on tied scores the first vector encountered along the
+layer sweep (lex-min on option indices) wins (plan v4-N4). On
+infeasibility (B outside ``[Σ floor_l, Σ N_l]``), fall back to the
+**nearest feasible budget** with WARNING log (larger-budget tiebreak).
 
 Deviations
 ==========
 
-D-clean-room — re-implementation, not vendor
---------------------------------------------
-The plugin is a clean-room re-implementation of the paper's Algorithm 1
-from the prose description; no code is copied from the upstream repo
-(which has no LICENSE file). Each algorithmic choice the paper leaves
-under-specified is flagged with its own deviation tag below.
+Nine `D-*` tags total (8 carried from the prior impl + 1 new).
 
-D-init-grape — GRAPE initialization (vs paper's REAP saliency)
---------------------------------------------------------------
-Paper §3.3 initializes ``α`` from REAP saliency scores. This plugin
-initializes from **GRAPE budgets** (`SC_STAGE12_COMPREHENSIVE_PLAN.md`
-§7 A5 mandate). Concretely: for each layer ``l`` with GRAPE budget
-``g_l ∈ {floor_l, ..., per_layer_count_l}``, the option-index
-corresponding to ``g_l`` gets logit ``init_peak_logit`` (default 2.0)
-and every other option gets logit 0. ``softmax`` of that gives a sharp
-peak on ``g_l`` with small mass on neighbors — RCO can refine.
+D-clean-room
+    Re-implementation from paper prose; no upstream code is copied.
+    Re-verified 2026-05-28: GitHub API returns ``{"license": null, ...}``.
 
-D-fitness-mse — output-space MSE fitness (vs paper's end-to-end loss)
----------------------------------------------------------------------
-Paper §4.2 uses end-to-end task loss as the fitness signal (cheap with
-their L1/vLLM rollout substrate). This plugin uses output-space MSE
-(`SC_STAGE12_COMPREHENSIVE_PLAN.md` §5.3 last bullet); the actual-loss
-upgrade is gated on `L1_FOR_SC_PLAN.md`. The risk mitigation
-(`SC_STAGE12_COMPREHENSIVE_PLAN.md` §9 R3, fitness-vs-bpt_gap mismatch)
-is operator-driven: the plugin logs implied + projected discrete
-budget vectors so the operator can spot-check rankings through Stage 2.
+D-init-grape
+    α initialised from GRAPE budgets, not REAP saliency. REAP would
+    require a per-(layer, option) saliency pass which our pipeline
+    does not run. Concretely: the option-index matching GRAPE's
+    budget gets logit ``init_peak_logit`` (default 2.0); other
+    options get 0. (Plan §1.6, Q2.)
 
-D-synthetic-curve — synthetic linear-redundancy fallback
---------------------------------------------------------
-When no per-layer damage curve is on the ctx (typical Stage-1-only
-run; S1_DP is a separate work item), RCO uses
-``D_l(k) = R̃^l · (per_layer_count_l − k)`` with R̃^l = GRAPE's
-``per_layer_redundancy`` slot. This is a convex decreasing curve in
-``k`` that preserves GRAPE's ranking. Worst case: RCO output ≈ GRAPE
-(no regression); best case: RCO redistributes 1-2 experts at the
-margin where logit gradients agree across iterations. The plugin
-emits a WARNING when the fallback fires so operators are not surprised
-by quiet behaviour.
+D-fitness-mse
+    Output-space MSE as fitness (vs paper §4.2's end-to-end task
+    loss). The upgrade is gated on L1/vLLM (`L1_FOR_SC_PLAN.md`)
+    and out of scope here. (Plan §1.6, Q3.)
 
-D-floor-projection — floor baked into option grid
--------------------------------------------------
-``min_experts_per_layer`` is a project invariant (see
-``MOE_COMPRESS_REPORT.md`` §5.1; not reopened by this plan). Each
-layer's per-layer option grid is restricted to
-``{floor_l, floor_l+1, ..., per_layer_count_l}`` so the floor is part
-of the manifold's intrinsic geometry — RCO cannot escape it. The
-alternative (post-hoc clipping) would break the budget-exact retraction.
+D-synthetic-curve
+    When ``per_layer_damage_curve`` slot is absent and
+    ``fitness_signal="auto"``, fall back to a synthetic linear curve
+    ``D_l(k) = (R̃^l + 1) · (per_layer_count_l − k)`` using GRAPE's
+    redundancy. Convex decreasing; preserves GRAPE's ranking. (Plan §1.6.)
 
-D-ragged-K — per-layer K varies; ragged tensors with a mask
------------------------------------------------------------
-Because the floor + per_layer_count combination can differ across
-layers (e.g. one MoE layer at 256 experts and one at 128), K_l varies.
-The implementation pads the per-layer option grid up to ``K_max =
-max_l (per_layer_count_l - floor_l + 1)`` and uses a 0/1 mask to zero
-out the padding columns wherever the algorithm computes a sum or
-gradient. The retraction bisection is done independently per layer
-(no cross-layer coupling beyond the global budget constraint).
+D-floor-projection
+    The per-layer floor ``floor_l = per_layer_count_l // floor_divisor``
+    is baked into the option grid ``{floor_l, ..., per_layer_count_l}``
+    — part of the manifold's intrinsic geometry. (Plan §1.6.)
 
-D-bisection-budget — joint vs per-layer retraction
---------------------------------------------------
-Paper Algorithm 1 line 8 (retraction) is global: one scalar ``t`` such
-that the *total* budget equals ``B``. This is the form implemented
-here. The upstream repo's ``manifold.py`` exposes a per-layer variant
-(``*_per_layer``) for independent per-layer constraints, which is not
-applicable here — our constraint is global.
+D-ragged-K
+    Per-layer K_l varies; the option grids are padded to
+    ``K_max = max_l(per_layer_count_l − floor_l + 1)`` with a 0/1 mask
+    and very-negative pad logits. The masked softmax zeroes pads. (Plan §1.6.)
 
-D-disabled-default — opt-in via ``stage1.rco_budget.enabled``
--------------------------------------------------------------
-Default ``enabled: false``. The plugin is only consumed by the
-``S1_RCO`` row of the S-series ablation; default-off keeps every other
-row (S0_GRAPE, SC, SCD, ...) byte-identical to pre-RCO behaviour.
-When the flag is false the plugin's ``run`` is never called and
-``contribute_artifact`` returns ``{}``.
+D-bisection-budget
+    Primitive 3 is the global retraction (one scalar ``t`` for the
+    global budget constraint), implemented via bracket-doubling +
+    bisection. Paper says only "1-D root-find"; the bracket scheme
+    is a concrete choice. (Plan §1.6, §1.2 Primitive 3.)
+
+D-disabled-default
+    Gated default OFF behind ``stage1.rco_budget.enabled``. Every
+    non-S1_RCO row stays byte-identical to pre-plugin-11 main. (Plan §1.6.)
+
+D-adam-no-v-transport  [NEW in this re-impl]
+    Adam's first moment ``m`` is vector-transported (re-projected onto
+    the new tangent plane after retraction); the second moment ``v``
+    is left untouched. The paper is silent on ``v``; we pick the
+    lighter convention because ``v`` is element-wise squared and used
+    only as an adaptive learning-rate scaler ``1 / (√v̂ + ε)`` — its
+    tangent-vs-normal decomposition has no operational meaning.
+    Documented in plan §1.2 Primitive 4; pinned by F13. (Plan §1.6.)
 
 Output context contract
 -----------------------
 - ``reads``:
     - ``per_layer_target_experts`` — GRAPE budgets (dict[str, int]).
-    - ``per_layer_redundancy`` — GRAPE R̃^l (dict[str, float]),
-      consumed by the synthetic-curve fallback.
-    - ``per_layer_targets`` — pre-Stage-1 per-layer expert counts
-      (dict[int, int]).
-    - ``decomposition`` — :class:`BudgetDecomposition` (the global
-      budget B is on ``.global_expert_budget``).
-    - ``config`` — the run config; this plugin reads
-      ``config["stage1"]["rco_budget"]``.
-
+    - ``per_layer_redundancy`` — GRAPE R̃^l (dict[str, float]).
+    - ``per_layer_targets`` — pre-Stage-1 per-layer expert counts (dict[int, int]).
+    - ``decomposition`` — :class:`BudgetDecomposition`; B = ``.global_expert_budget``.
+    - ``config`` — the run config; reads ``config["stage1"]["rco_budget"]``.
 - ``writes``:
-    - ``per_layer_target_experts_rco`` — refined budgets
-      (dict[str, int]). Distinct slot from GRAPE's so downstream
-      consumers explicitly opt in.
-    - ``rco_metadata`` — solver-state summary
-      (dict with init/final budget vectors, fitness, iter count).
-
+    - ``per_layer_target_experts_rco`` — refined budgets (dict[str, int]).
+    - ``rco_metadata`` — solver-state summary (dict).
 - Optional read (no KeyError if absent):
-    - ``per_layer_damage_curve`` — dict[int, dict[int, float]] of
-      ``D_l(k)`` per-layer cost curves. When present, RCO uses these
-      directly; when absent, the synthetic fallback fires.
+    - ``per_layer_damage_curve`` — dict[int, dict[int, float]].
 
-- ``contribute_artifact`` returns
-  ``{"rco_budgets": <budget dict>, "rco_metadata": <summary>}`` (an
-  empty dict when the plugin is disabled). The orchestrator writes
-  this to ``stage1_rco_budgets.json`` when enabled.
+Artifact (Pattern B + K)
+------------------------
+``stage1_rco_budgets.json`` payload:
+
+    {"format_version": 1,
+     "rco_budgets": {...},
+     "rco_metadata": {...}}
+
+The ``format_version`` field sits at the **top level**, NOT nested inside
+``rco_metadata``. Forward-only schema bumps (Pattern K): readers tolerate
+unknown keys; new fields appended to either dict do not bump the version.
+
+Config validation (Pattern C)
+-----------------------------
+``_validate_config`` runs as the FIRST statement of ``run()`` and
+rejects unknown keys + range-checks the values. Hidden mis-keys
+(e.g. ``learning_rates`` vs ``learning_rate``) raise ``ValueError`` with
+the unknown key surfaced, rather than silently falling through to
+defaults.
+
+Fitness signal knob (Pattern E)
+-------------------------------
+The ``fitness_signal`` config key gates the damage_curve interaction:
+
+- ``"auto"`` (default) — use ``per_layer_damage_curve`` if present, else
+  fall back to the synthetic curve. Byte-identical to historical behaviour.
+- ``"synthetic"`` — hard-skip damage_curve even if present.
+- ``"damage_curve"`` — hard-require damage_curve; raise ``ValueError`` if absent.
 
 Naming
 ------
-"S1_RCO" is the ablation-row name in `SC_STAGE12_COMPREHENSIVE_PLAN.md`
-§6.1; "rco_budget" is the plugin id.
+"S1_RCO" is the ablation row name in ``SC_STAGE12_COMPREHENSIVE_PLAN.md``
+§6.1; "rco_budget" is the plugin id (manifest index 9).
 """
 from __future__ import annotations
 
@@ -197,13 +197,44 @@ log = logging.getLogger(__name__)
 # Numerical tolerances for the budget retraction bisection. Tight enough
 # to round to the correct integer after the final DP projection (which
 # only needs ~0.5-of-an-expert resolution to disambiguate), loose enough
-# to converge in <60 bisection steps for L ≤ 64, K ≤ 256.
+# to converge in <60 bisection steps. At production scale B ≈ 8600,
+# relative tolerance is 1e-4/8600 ≈ 1.16e-8 — far below float64 epsilon.
 _BISECT_TOL = 1e-4
 _BISECT_MAX_ITERS = 60
 # Cap on the bracket-doubling phase before bisection. 32 doublings span
-# 2^31 in either direction — more than enough for any realistic
-# (cost, logit) scale.
+# 2^31 ≈ 2.15e9 in either direction — comfortably above any plausible B.
 _BRACKET_MAX_DOUBLINGS = 32
+
+# Artifact schema version (Pattern B). Bump only on incompatible shape
+# changes; additive top-level keys are tolerated by readers (Pattern K).
+_ARTIFACT_FORMAT_VERSION = 1
+
+# Allowed values for the Pattern E fitness_signal knob.
+_FITNESS_SIGNAL_AUTO = "auto"
+_FITNESS_SIGNAL_SYNTHETIC = "synthetic"
+_FITNESS_SIGNAL_DAMAGE_CURVE = "damage_curve"
+_FITNESS_SIGNAL_ALLOWED = frozenset(
+    (_FITNESS_SIGNAL_AUTO, _FITNESS_SIGNAL_SYNTHETIC, _FITNESS_SIGNAL_DAMAGE_CURVE)
+)
+
+# Recognised config keys (Pattern C). Any other key under
+# ``stage1.rco_budget`` raises ValueError in ``_validate_config``.
+_ALLOWED_CFG_KEYS = frozenset(
+    (
+        "enabled",
+        "n_iterations",
+        "learning_rate",
+        "gumbel_tau_init",
+        "gumbel_tau_final",
+        "init_peak_logit",
+        "floor_divisor",
+        "seed",
+        "adam_beta1",
+        "adam_beta2",
+        "adam_eps",
+        "fitness_signal",
+    )
+)
 
 
 class RCOBudgetPlugin:
@@ -211,23 +242,25 @@ class RCOBudgetPlugin:
 
     See module docstring for the paper citation (arxiv:2605.00649
     Algorithm 1), the clean-room re-implementation note (upstream
-    unlicensed), and the seven deviations:
+    unlicensed, re-verified 2026-05-28), and the nine deviations:
 
-    - **D-clean-room** (no verbatim vendoring)
-    - **D-init-grape** (initialize from GRAPE, not REAP saliency)
-    - **D-fitness-mse** (output-space MSE, not end-to-end loss)
-    - **D-synthetic-curve** (linear-redundancy fallback when no damage curve)
-    - **D-floor-projection** (floor baked into the option grid)
-    - **D-ragged-K** (per-layer K varies, padded with mask)
-    - **D-bisection-budget** (global retraction, not per-layer)
-    - **D-disabled-default** (opt-in via ``stage1.rco_budget.enabled``)
+    - **D-clean-room** — no verbatim vendoring
+    - **D-init-grape** — initialise from GRAPE, not REAP saliency
+    - **D-fitness-mse** — output-space MSE fitness, not end-to-end loss
+    - **D-synthetic-curve** — linear-redundancy fallback when no damage curve
+    - **D-floor-projection** — floor baked into the option grid
+    - **D-ragged-K** — per-layer K varies, padded with mask
+    - **D-bisection-budget** — global retraction, not per-layer
+    - **D-disabled-default** — opt-in via ``stage1.rco_budget.enabled``
+    - **D-adam-no-v-transport** — first moment transported only
     """
 
     name: str = "rco_budget"
     paper: str = (
         "RCO: IST-DASLab arxiv:2605.00649 §3 Algorithm 1. "
-        "Upstream code at github.com/IST-DASLab/RCO ships without a LICENSE "
-        "file; this is a clean-room re-implementation from the paper's prose. "
+        "Upstream code at github.com/IST-DASLab/RCO ships without a LICENSE file "
+        "(re-verified 2026-05-28 via GitHub API: license=null); this is a "
+        "clean-room re-implementation from the paper's prose. "
         "Deviations: D-clean-room (no verbatim vendoring), "
         "D-init-grape (initialize from GRAPE budgets, not REAP saliency), "
         "D-fitness-mse (output-space MSE fitness, not end-to-end loss), "
@@ -235,7 +268,12 @@ class RCOBudgetPlugin:
         "D-floor-projection (floor baked into per-layer option grid), "
         "D-ragged-K (per-layer K varies, padded with a mask), "
         "D-bisection-budget (global retraction, not per-layer), "
-        "D-disabled-default (opt-in via stage1.rco_budget.enabled). "
+        "D-disabled-default (opt-in via stage1.rco_budget.enabled), "
+        "D-adam-no-v-transport (Adam first moment transported only). "
+        "Algorithm details follow paper §3 with: standard Gumbel-softmax "
+        "softmax((α+g)/τ) (NOT α+τ·g); cosine τ-anneal τ_init→τ_final "
+        "(explore→exploit); pure-damage DP knapsack (no β·log p tiebreak); "
+        "Adam first-moment-only vector transport. "
         "See module docstring for full per-deviation derivations."
     )
     config_key: str = "stage1.rco_budget"
@@ -271,10 +309,12 @@ class RCOBudgetPlugin:
         this; absent in typical runs), and the per-layer expert counts;
         writes ``per_layer_target_experts_rco`` + ``rco_metadata``.
 
-        Raises KeyError with the slot name if any required slot is
-        missing (no silent degradation — `SC_STAGE12_COMPREHENSIVE_PLAN.md`
-        §1 mandate: "errors clearly").
+        Raises ``KeyError`` with the slot name if any required slot is
+        missing (no silent degradation). Raises ``ValueError`` if the
+        config contains unknown keys, out-of-range values, or
+        ``fitness_signal="damage_curve"`` without a damage-curve slot.
         """
+        # Required-slot reads (KeyError surfaces slot name).
         grape_budgets_str: dict[str, int] = ctx.get("per_layer_target_experts")
         grape_redundancy_str: dict[str, float] = ctx.get("per_layer_redundancy")
         per_layer_counts: dict[int, int] = ctx.get("per_layer_targets")
@@ -282,28 +322,56 @@ class RCOBudgetPlugin:
         config: dict = ctx.get("config")
 
         rco_cfg: dict = config.get("stage1", {}).get("rco_budget", {})
-        n_iterations: int = int(rco_cfg.get("n_iterations", 500))
-        learning_rate: float = float(rco_cfg.get("learning_rate", 0.1))
-        gumbel_tau_init: float = float(rco_cfg.get("gumbel_tau_init", 5.0))
-        gumbel_tau_final: float = float(rco_cfg.get("gumbel_tau_final", 0.5))
-        init_peak_logit: float = float(rco_cfg.get("init_peak_logit", 2.0))
-        floor_divisor: int = int(rco_cfg.get("floor_divisor", 2))
-        seed: int = int(rco_cfg.get("seed", 0))
-        adam_beta1: float = float(rco_cfg.get("adam_beta1", 0.9))
-        adam_beta2: float = float(rco_cfg.get("adam_beta2", 0.999))
-        adam_eps: float = float(rco_cfg.get("adam_eps", 1e-8))
+
+        # Pattern C: validate config FIRST, before any RCO work begins.
+        cfg = self._validate_config(rco_cfg)
+
+        # Pattern E: resolve fitness signal mode + raise on damage_curve-strict
+        # when the slot is absent.
+        fitness_signal = cfg["fitness_signal"]
+        has_curve = ctx.has("per_layer_damage_curve")
+        if fitness_signal == _FITNESS_SIGNAL_DAMAGE_CURVE and not has_curve:
+            raise ValueError(
+                "rco_budget: fitness_signal=damage_curve but "
+                "per_layer_damage_curve slot is absent. Set "
+                "fitness_signal=auto or enable damage_curve_dp."
+            )
+        if fitness_signal == _FITNESS_SIGNAL_SYNTHETIC:
+            use_damage_curve = False
+        elif fitness_signal == _FITNESS_SIGNAL_DAMAGE_CURVE:
+            use_damage_curve = True
+        else:  # auto
+            use_damage_curve = has_curve
+        fitness_signal_resolved = (
+            _FITNESS_SIGNAL_DAMAGE_CURVE if use_damage_curve else _FITNESS_SIGNAL_SYNTHETIC
+        )
+
+        n_iterations = cfg["n_iterations"]
+        learning_rate = cfg["learning_rate"]
+        gumbel_tau_init = cfg["gumbel_tau_init"]
+        gumbel_tau_final = cfg["gumbel_tau_final"]
+        init_peak_logit = cfg["init_peak_logit"]
+        floor_divisor = cfg["floor_divisor"]
+        seed = cfg["seed"]
+        adam_beta1 = cfg["adam_beta1"]
+        adam_beta2 = cfg["adam_beta2"]
+        adam_eps = cfg["adam_eps"]
 
         global_budget: int = int(decomposition.global_expert_budget)
 
         # Coerce GRAPE outputs (str keys → int).
-        grape_budgets: dict[int, int] = {int(k): int(v) for k, v in grape_budgets_str.items()}
+        grape_budgets: dict[int, int] = {
+            int(k): int(v) for k, v in grape_budgets_str.items()
+        }
         grape_redundancy: dict[int, float] = {
             int(k): float(v) for k, v in grape_redundancy_str.items()
         }
 
         sorted_layers = sorted(per_layer_counts.keys())
         if not sorted_layers:
-            raise ValueError("RCO: per_layer_targets is empty — no MoE layers to allocate.")
+            raise ValueError(
+                "RCO: per_layer_targets is empty — no MoE layers to allocate."
+            )
 
         # Build per-layer option grids: k_options[li] = {floor_l, ..., N_l}.
         # D-floor-projection: floor is part of the manifold's intrinsic geometry.
@@ -311,19 +379,18 @@ class RCOBudgetPlugin:
         for li in sorted_layers:
             N_l = int(per_layer_counts[li])
             floor_l = max(N_l // floor_divisor, 1)
-            k_options[li] = list(range(floor_l, N_l + 1))
-            if not k_options[li]:
+            opts = list(range(floor_l, N_l + 1))
+            if not opts:
                 raise ValueError(
                     f"RCO: layer {li}: option grid empty (N={N_l}, floor={floor_l})."
                 )
+            k_options[li] = opts
 
         # D-ragged-K: pad to K_max with a 0/1 mask.
         K_max = max(len(opts) for opts in k_options.values())
         L = len(sorted_layers)
         layer_to_row = {li: idx for idx, li in enumerate(sorted_layers)}
 
-        # cost_grid[row, k_idx] = surviving expert count for that option,
-        # or 0 in padding columns.
         cost_grid = torch.zeros((L, K_max), dtype=torch.float64)
         mask = torch.zeros((L, K_max), dtype=torch.float64)
         for li in sorted_layers:
@@ -335,7 +402,7 @@ class RCOBudgetPlugin:
 
         # Build the damage-cost matrix D[row, k_idx]: fitness contribution
         # of choosing option k for layer li. Damage curve from ctx if
-        # present, synthetic linear fallback otherwise.
+        # selected by the fitness_signal knob; synthetic linear fallback otherwise.
         damage_grid = self._build_damage_grid(
             ctx=ctx,
             sorted_layers=sorted_layers,
@@ -343,6 +410,7 @@ class RCOBudgetPlugin:
             K_max=K_max,
             grape_redundancy=grape_redundancy,
             per_layer_counts=per_layer_counts,
+            use_damage_curve=use_damage_curve,
         )
 
         # D-init-grape: initial logits peak at the GRAPE option-index.
@@ -352,14 +420,23 @@ class RCOBudgetPlugin:
             opts = k_options[li]
             g_l = int(grape_budgets[li])
             # Clamp GRAPE budget into the option grid (defensive — GRAPE
-            # SHOULD respect the same floor, but bugs happen). Add a
-            # warning if clamping fires.
+            # SHOULD respect the same floor, but the floor_divisor may
+            # legitimately differ from GRAPE's; see plan Q6).
             g_l_clamped = max(opts[0], min(opts[-1], g_l))
             if g_l_clamped != g_l:
+                # GRAPE's own floor_divisor sits under a different config
+                # namespace (``stage1_grape.grape_floor_divisor``); include
+                # both values in the warning so the operator immediately
+                # sees the divergent-config root cause (plan Q6 / D5-3).
+                grape_floor_divisor_cfg = config.get("stage1_grape", {}).get(
+                    "grape_floor_divisor", "<unset>"
+                )
                 log.warning(
                     "RCO: layer %d: GRAPE budget %d clamped to option grid "
-                    "[%d, %d] (floor mismatch with floor_divisor=%d)",
-                    li, g_l, opts[0], opts[-1], floor_divisor,
+                    "[%d, %d] (stage1_grape.grape_floor_divisor=%s, "
+                    "stage1.rco_budget.floor_divisor=%d)",
+                    li, g_l, opts[0], opts[-1],
+                    grape_floor_divisor_cfg, floor_divisor,
                 )
             k_idx = opts.index(g_l_clamped)
             alpha[row, k_idx] = init_peak_logit
@@ -382,15 +459,14 @@ class RCOBudgetPlugin:
             k_options=k_options,
             sorted_layers=sorted_layers,
             global_budget=global_budget,
-            tau=gumbel_tau_final,
-            seed=seed,
-            stochastic=False,
         )
         log.info(
             "RCO init: global_budget=%d, fitness=%.6g, budget_sum=%d, "
-            "init_iterations=%d, lr=%.3g",
+            "n_iterations=%d, lr=%.3g, tau_init=%.3g, tau_final=%.3g, "
+            "fitness_signal_resolved=%s",
             global_budget, init_fitness, sum(init_budget_vec.values()),
             n_iterations, learning_rate,
+            gumbel_tau_init, gumbel_tau_final, fitness_signal_resolved,
         )
 
         # Adam state.
@@ -400,16 +476,20 @@ class RCOBudgetPlugin:
 
         # Main RCO loop.
         for it in range(n_iterations):
-            # Cosine anneal Gumbel τ: high → low (explore → exploit).
-            progress = it / max(n_iterations - 1, 1)
-            tau = gumbel_tau_final + 0.5 * (gumbel_tau_init - gumbel_tau_final) * (
-                1.0 + math.cos(math.pi * (1.0 - progress))
+            # Cosine anneal τ explore → exploit. Cleaned formula (plan §1.3
+            # step 2): τ_t = τ_final + 0.5·(τ_init − τ_final)·(1 + cos(π·t/T)).
+            # At t=0: cos(0)=1 → τ = τ_init (hot, uniform). At t=T-1: cos≈π →
+            # τ ≈ τ_final (cold, argmax-like).
+            tau = self._cosine_tau(
+                step=it,
+                total_steps=max(n_iterations, 1),
+                tau_init=gumbel_tau_init,
+                tau_final=gumbel_tau_final,
             )
 
-            # Forward: Gumbel-STE → soft probabilities → fitness estimate.
+            # Forward: standard-form Gumbel-softmax (plan §1.3 step 1).
             grad = self._gradient_estimate(
                 alpha=alpha,
-                cost_grid=cost_grid,
                 mask=mask,
                 damage_grid=damage_grid,
                 tau=tau,
@@ -417,30 +497,33 @@ class RCOBudgetPlugin:
             )
 
             # Tangent projection: remove the constraint-normal component.
+            # Constraint normal evaluated at UN-PERTURBED p = softmax(α)
+            # (paper §2 Eq. 1 + Prop. 2; plan Q8).
             normal = self._constraint_normal(alpha, cost_grid, mask)
             grad_tangent = self._project_off_normal(grad, normal, mask)
 
             # Adam (in tangent space).
             m_buf = adam_beta1 * m_buf + (1.0 - adam_beta1) * grad_tangent
-            v_buf = adam_beta2 * v_buf + (1.0 - adam_beta2) * (grad_tangent * grad_tangent)
+            v_buf = adam_beta2 * v_buf + (1.0 - adam_beta2) * (
+                grad_tangent * grad_tangent
+            )
             m_hat = m_buf / (1.0 - adam_beta1 ** (it + 1))
             v_hat = v_buf / (1.0 - adam_beta2 ** (it + 1))
             step = -learning_rate * m_hat / (torch.sqrt(v_hat) + adam_eps)
-            # Padding columns are forced impossible by the very-negative
-            # init logit; zero out updates to them so they stay impossible.
+            # Zero updates to padding columns so they stay impossible.
             step = step * mask
             alpha = alpha + step
 
             # Retract onto the manifold (1-D bisection along cost direction).
             alpha = self._retract(alpha, cost_grid, mask, global_budget)
 
-            # Vector transport: re-project Adam's first moment onto the
-            # new tangent plane.
+            # Vector transport — m only (D-adam-no-v-transport, plan §1.2
+            # Primitive 4). Re-project Adam's first moment onto the new
+            # tangent plane; second moment ``v_buf`` is left untouched.
             normal_new = self._constraint_normal(alpha, cost_grid, mask)
             m_buf = self._project_off_normal(m_buf, normal_new, mask)
 
-        # Final discrete read: τ → 0 (deterministic argmax) and DP project
-        # to budget-exact.
+        # Final discrete read: pure-damage DP project to budget-exact.
         final_fitness, final_budget_vec = self._evaluate_discrete(
             alpha=alpha,
             cost_grid=cost_grid,
@@ -449,20 +532,15 @@ class RCOBudgetPlugin:
             k_options=k_options,
             sorted_layers=sorted_layers,
             global_budget=global_budget,
-            tau=gumbel_tau_final,
-            seed=seed,
-            stochastic=False,
         )
         log.info(
-            "RCO final: fitness=%.6g (init=%.6g, Δ=%.3g), budget_sum=%d (target=%d), "
-            "iterations=%d",
+            "RCO final: fitness=%.6g (init=%.6g, Δ=%.3g), "
+            "budget_sum=%d (target=%d), iterations=%d",
             final_fitness, init_fitness, init_fitness - final_fitness,
             sum(final_budget_vec.values()), global_budget, n_iterations,
         )
 
-        # `SC_STAGE12_COMPREHENSIVE_PLAN.md` §9 R3 inspection lever: log
-        # init + final budget-vector hashes so the operator can run the
-        # 3 spot-check budget vectors through end-to-end Stage 2.
+        # Log compact init+final budget vectors for the SC §9 R3 inspection lever.
         init_vec_str = ",".join(str(init_budget_vec[li]) for li in sorted_layers)
         final_vec_str = ",".join(str(final_budget_vec[li]) for li in sorted_layers)
         log.info("RCO init budget vector: %s", init_vec_str)
@@ -477,21 +555,27 @@ class RCOBudgetPlugin:
             {
                 "init_fitness": float(init_fitness),
                 "final_fitness": float(final_fitness),
-                "init_budget_vector": {str(li): int(v) for li, v in init_budget_vec.items()},
-                "final_budget_vector": {str(li): int(v) for li, v in final_budget_vec.items()},
+                "init_budget_vector": {
+                    str(li): int(v) for li, v in init_budget_vec.items()
+                },
+                "final_budget_vector": {
+                    str(li): int(v) for li, v in final_budget_vec.items()
+                },
                 "n_iterations": int(n_iterations),
                 "achieved_budget": int(sum(final_budget_vec.values())),
                 "requested_budget": int(global_budget),
-                "fitness_source": (
-                    "damage_curve" if ctx.has("per_layer_damage_curve") else "synthetic"
-                ),
+                "fitness_source": fitness_signal_resolved,
+                "tau_init_used": float(gumbel_tau_init),
+                "tau_final_used": float(gumbel_tau_final),
+                "fitness_signal_resolved": fitness_signal_resolved,
             },
         )
 
     def contribute_artifact(self, ctx: PipelineContext) -> dict:
         """Return the ``stage1_rco_budgets.json`` payload (empty if disabled).
 
-        The orchestrator writes this dict to
+        Pattern B: ``format_version`` at the TOP LEVEL (not inside
+        ``rco_metadata``). The orchestrator writes this dict to
         ``artifacts_dir / "stage1_rco_budgets.json"`` ONLY when the
         plugin is enabled; the empty-dict return on disabled paths is
         a defensive belt-and-suspenders so a stray write would produce
@@ -500,9 +584,95 @@ class RCOBudgetPlugin:
         if not ctx.has("per_layer_target_experts_rco"):
             return {}
         return {
+            "format_version": _ARTIFACT_FORMAT_VERSION,
             "rco_budgets": ctx.get("per_layer_target_experts_rco"),
             "rco_metadata": ctx.get("rco_metadata"),
         }
+
+    # ------------------------------------------------------------------
+    # Config validation (Pattern C)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_config(rco_cfg: dict) -> dict:
+        """Reject unknown keys + range-check the values. Pattern C.
+
+        Returns a typed dict of the validated config with defaults
+        applied. Unknown keys raise ``ValueError`` listing the typo so
+        operators see ``learning_rates`` mis-keys instead of having them
+        silently fall through to defaults.
+        """
+        unknown = set(rco_cfg.keys()) - _ALLOWED_CFG_KEYS
+        if unknown:
+            raise ValueError(
+                f"rco_budget: unknown config keys {sorted(unknown)!r} under "
+                f"stage1.rco_budget. Allowed keys: {sorted(_ALLOWED_CFG_KEYS)!r}."
+            )
+
+        cfg = {
+            "enabled": bool(rco_cfg.get("enabled", False)),
+            "n_iterations": int(rco_cfg.get("n_iterations", 500)),
+            "learning_rate": float(rco_cfg.get("learning_rate", 0.1)),
+            "gumbel_tau_init": float(rco_cfg.get("gumbel_tau_init", 5.0)),
+            "gumbel_tau_final": float(rco_cfg.get("gumbel_tau_final", 0.5)),
+            "init_peak_logit": float(rco_cfg.get("init_peak_logit", 2.0)),
+            "floor_divisor": int(rco_cfg.get("floor_divisor", 2)),
+            "seed": int(rco_cfg.get("seed", 0)),
+            "adam_beta1": float(rco_cfg.get("adam_beta1", 0.9)),
+            "adam_beta2": float(rco_cfg.get("adam_beta2", 0.999)),
+            "adam_eps": float(rco_cfg.get("adam_eps", 1e-8)),
+            "fitness_signal": str(rco_cfg.get("fitness_signal", _FITNESS_SIGNAL_AUTO)),
+        }
+
+        if cfg["n_iterations"] <= 0:
+            raise ValueError(
+                f"rco_budget: n_iterations must be > 0, got {cfg['n_iterations']}."
+            )
+        if not (0.0 < cfg["learning_rate"] < 10.0):
+            raise ValueError(
+                f"rco_budget: learning_rate must be in (0, 10), got "
+                f"{cfg['learning_rate']}."
+            )
+        if cfg["gumbel_tau_init"] <= 0.0:
+            raise ValueError(
+                f"rco_budget: gumbel_tau_init must be > 0, got "
+                f"{cfg['gumbel_tau_init']}."
+            )
+        if cfg["gumbel_tau_final"] <= 0.0:
+            raise ValueError(
+                f"rco_budget: gumbel_tau_final must be > 0, got "
+                f"{cfg['gumbel_tau_final']}."
+            )
+        if cfg["gumbel_tau_final"] >= cfg["gumbel_tau_init"]:
+            raise ValueError(
+                f"rco_budget: gumbel_tau_final ({cfg['gumbel_tau_final']}) must "
+                f"be strictly < gumbel_tau_init ({cfg['gumbel_tau_init']}) so "
+                "the cosine anneal goes explore → exploit."
+            )
+        if cfg["floor_divisor"] < 1:
+            raise ValueError(
+                f"rco_budget: floor_divisor must be ≥ 1, got {cfg['floor_divisor']}."
+            )
+        if not (0.0 <= cfg["adam_beta1"] < 1.0):
+            raise ValueError(
+                f"rco_budget: adam_beta1 must be in [0, 1), got {cfg['adam_beta1']}."
+            )
+        if not (0.0 <= cfg["adam_beta2"] < 1.0):
+            raise ValueError(
+                f"rco_budget: adam_beta2 must be in [0, 1), got {cfg['adam_beta2']}."
+            )
+        if cfg["adam_eps"] <= 0.0:
+            raise ValueError(
+                f"rco_budget: adam_eps must be > 0, got {cfg['adam_eps']}."
+            )
+        if cfg["fitness_signal"] not in _FITNESS_SIGNAL_ALLOWED:
+            raise ValueError(
+                f"rco_budget: fitness_signal must be one of "
+                f"{sorted(_FITNESS_SIGNAL_ALLOWED)!r}, got "
+                f"{cfg['fitness_signal']!r}."
+            )
+
+        return cfg
 
     # ------------------------------------------------------------------
     # Damage-curve construction (real curve from ctx OR synthetic fallback)
@@ -517,25 +687,20 @@ class RCOBudgetPlugin:
         K_max: int,
         grape_redundancy: dict[int, float],
         per_layer_counts: dict[int, int],
+        use_damage_curve: bool,
     ) -> torch.Tensor:
         """Build the ``[L, K_max]`` damage grid.
 
-        Primary path: read ``ctx["per_layer_damage_curve"]`` if present
-        (a future S1_DP plugin would populate this with output-space MSE
-        costs from a Stage-2 profile pass).
-
-        Fallback path (D-synthetic-curve): build a synthetic linear
-        curve ``D_l(k) = R̃^l · (per_layer_count_l − k)``. R̃^l is
-        GRAPE's per-layer redundancy slot in ``[0, 1]``; the curve is
-        zero at ``k = per_layer_count_l`` (no compression, no damage)
-        and grows linearly as ``k`` shrinks. The +1 offset on R̃^l
-        below ensures even layers with R̃ = 0 get a nonzero
-        compression cost so RCO does not see a flat objective.
+        ``use_damage_curve`` is resolved upstream from the
+        ``fitness_signal`` knob (Pattern E):
+        - True → read ``ctx["per_layer_damage_curve"]`` (must be present).
+        - False → use the synthetic linear curve
+          ``D_l(k) = (R̃^l + 1) · (per_layer_count_l − k)`` (D-synthetic-curve).
         """
         L = len(sorted_layers)
         damage_grid = torch.zeros((L, K_max), dtype=torch.float64)
 
-        if ctx.has("per_layer_damage_curve"):
+        if use_damage_curve:
             curve: dict[int, dict[int, float]] = ctx.get("per_layer_damage_curve")
             missing_layers = [li for li in sorted_layers if li not in curve]
             if missing_layers:
@@ -558,11 +723,10 @@ class RCOBudgetPlugin:
                     damage_grid[row, k_idx] = float(layer_curve[k_val])
         else:
             log.warning(
-                "RCO: per_layer_damage_curve slot not present on ctx — falling "
-                "back to synthetic linear-redundancy curve "
-                "D_l(k) = (R̃^l + 1) · (per_layer_count_l - k). This is a "
-                "qualitative-rank-preserving fallback; the real damage curve "
-                "(Plugin S1_DP) is recommended for production use."
+                "RCO: per_layer_damage_curve not used (synthetic fallback). "
+                "D_l(k) = (R̃^l + 1) · (per_layer_count_l − k); a "
+                "qualitative-rank-preserving fallback. The real damage curve "
+                "(Plugin S1_DP) is recommended for production."
             )
             for row, li in enumerate(sorted_layers):
                 # +1 offset so layers with R̃=0 still get a nonzero
@@ -577,17 +741,17 @@ class RCOBudgetPlugin:
         return damage_grid
 
     # ------------------------------------------------------------------
-    # Manifold primitives (paper §3.1)
+    # Manifold primitives (paper §2 + §3.1; plan §1.2)
     # ------------------------------------------------------------------
 
-    def _masked_softmax(self, alpha: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _masked_softmax(alpha: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Row-wise softmax with padding columns masked to 0 probability.
 
-        Padding columns already carry very-negative logits (set at init),
-        so the unmasked softmax has near-zero mass on them; the explicit
-        mask multiplication + renormalisation guarantees exactly zero.
+        Numerical-stability shift: subtract per-row max before ``exp``,
+        then multiply by mask + renormalise so pads carry exactly zero
+        mass even if the very-negative pad logits underflowed.
         """
-        # Numerical-stability shift: subtract per-row max before exp.
         alpha_shift = alpha - alpha.max(dim=1, keepdim=True).values
         exp = torch.exp(alpha_shift) * mask
         norm = exp.sum(dim=1, keepdim=True).clamp_min(1e-30)
@@ -599,33 +763,36 @@ class RCOBudgetPlugin:
         cost_grid: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Gradient of the constraint Σ_l Σ_k p_lk · c_lk w.r.t. α.
+        """Gradient of the constraint C(α) = Σ_l ⟨p_l, c_l⟩ w.r.t. α.
 
         ``n_lk = p_lk · (c_lk − E_p[c_l])`` where ``E_p[c_l] = Σ_k p_lk · c_lk``.
 
-        Derivation: d/d α_lk of ``softmax(α_l)_j · c_lj`` summed over j:
-        ``Σ_j (∂p_lj / ∂α_lk) · c_lj``. With the standard softmax
-        Jacobian ``∂p_lj/∂α_lk = p_lj (δ_jk − p_lk)``, this collapses to
-        ``p_lk · (c_lk − Σ_j p_lj c_lj)`` = ``p_lk · (c_lk − E_p[c_l])``.
+        Derivation (paper §2 Prop. 2): applying the softmax Jacobian
+        ``∂p_lj/∂α_lk = p_lj·(δ_jk − p_lk)`` to ``Σ_j p_lj·c_lj`` collapses to
+        the formula above.
+
+        Evaluated at the **un-perturbed** ``p = softmax(α)`` (paper §2;
+        plan Q8) — the constraint surface is defined in α-space without
+        temperature or Gumbel noise. The Gumbel-perturbed ``p̃`` is a
+        SEPARATE object used only as the STE backward surrogate (paper
+        §3.1) and is not the constraint normal.
         """
         p = self._masked_softmax(alpha, mask)
         e_c = (p * cost_grid).sum(dim=1, keepdim=True)
         return p * (cost_grid - e_c) * mask
 
+    @staticmethod
     def _project_off_normal(
-        self,
         g: torch.Tensor,
         normal: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
         """Remove the component of ``g`` along ``normal``.
 
-        Standard Gram-Schmidt: ``g_tangent = g − (⟨g, n⟩ / ⟨n, n⟩) · n``.
+        Standard Gram-Schmidt: ``g_tan = g − (⟨g, n⟩ / ⟨n, n⟩) · n``.
         Treats the full ``[L, K_max]`` tensor as one vector — the budget
-        constraint is global so the projection is global.
+        constraint is global, so the projection is global.
         """
-        # Zero out padding columns BEFORE the inner product so they
-        # do not contribute to either numerator or denominator.
         g_masked = g * mask
         normal_masked = normal * mask
         num = (g_masked * normal_masked).sum()
@@ -641,9 +808,11 @@ class RCOBudgetPlugin:
     ) -> float:
         """Compute ``(Σ_l Σ_k softmax(α_l)_k · c_lk) − B``.
 
-        Sign matters for the bisection: positive residual means the
-        soft-budget exceeds the target so ``α`` should shift *away from*
-        high-cost options (subtract t·c), and vice versa.
+        Sign matters for the bisection:
+        - ``f > 0``: soft-budget over-allocates → need larger ``t``
+          (shifts probability mass toward cheaper options).
+        - ``f < 0``: soft-budget under-allocates → need smaller (more
+          negative) ``t``.
         """
         p = self._masked_softmax(alpha, mask)
         soft_budget = float((p * cost_grid).sum().item())
@@ -658,23 +827,21 @@ class RCOBudgetPlugin:
     ) -> torch.Tensor:
         """Bisect along the cost direction to restore Σ p · c = B.
 
-        Parametrise: ``α(t) = α − t · c_grid``. The residual
-        ``f(t) = (Σ softmax(α(t)) · c) − B`` is monotonically decreasing
-        in ``t`` (higher t penalizes high-cost options more, shrinking
-        the soft budget), so a 1-D bisection converges.
-
-        Bracket-doubling phase finds an interval where ``f`` straddles
-        zero, then bisection halves it to tolerance.
+        Parametrise ``α(t) = α − t · c_grid``. Then ``d/dt C(α(t)) =
+        −Σ_l Var_{p_l}(c_l) ≤ 0`` so the residual ``f(t) = C(α(t)) − B``
+        is monotonically non-increasing in ``t``. Bracket-doubling with
+        an EXPLICIT SIGN BRANCH (plan §1.2 Primitive 3) handles both
+        over- and under-budget cases.
         """
         res_zero = self._budget_residual(alpha, cost_grid, mask, global_budget)
         if abs(res_zero) <= _BISECT_TOL:
             return alpha
 
-        # If residual > 0, soft budget too high → need t > 0 to shrink it.
-        # If residual < 0, soft budget too low → need t < 0 to grow it.
         if res_zero > 0:
+            # Over-budget: f(0) > 0; need t > 0 to shrink C(α).
             t_lo, t_hi = 0.0, 1.0
-            f_lo, f_hi = res_zero, self._budget_residual(
+            f_lo = res_zero
+            f_hi = self._budget_residual(
                 alpha - t_hi * cost_grid, cost_grid, mask, global_budget
             )
             doublings = 0
@@ -688,13 +855,15 @@ class RCOBudgetPlugin:
             if f_hi > 0:
                 log.warning(
                     "RCO retract: bracket-doubling exhausted at t_hi=%.3g "
-                    "with f_hi=%.3g still positive; returning best alpha "
+                    "with f_hi=%.3g still positive; returning best α "
                     "(soft-budget overshoot)", t_hi, f_hi,
                 )
                 return alpha - t_hi * cost_grid
         else:
+            # Under-budget: f(0) < 0; need t < 0 to grow C(α).
             t_hi, t_lo = 0.0, -1.0
-            f_hi, f_lo = res_zero, self._budget_residual(
+            f_hi = res_zero
+            f_lo = self._budget_residual(
                 alpha - t_lo * cost_grid, cost_grid, mask, global_budget
             )
             doublings = 0
@@ -708,7 +877,7 @@ class RCOBudgetPlugin:
             if f_lo < 0:
                 log.warning(
                     "RCO retract: bracket-doubling exhausted at t_lo=%.3g "
-                    "with f_lo=%.3g still negative; returning best alpha "
+                    "with f_lo=%.3g still negative; returning best α "
                     "(soft-budget undershoot)", t_lo, f_lo,
                 )
                 return alpha - t_lo * cost_grid
@@ -717,10 +886,12 @@ class RCOBudgetPlugin:
         for _ in range(_BISECT_MAX_ITERS):
             t_mid = 0.5 * (t_lo + t_hi)
             alpha_mid = alpha - t_mid * cost_grid
-            f_mid = self._budget_residual(alpha_mid, cost_grid, mask, global_budget)
+            f_mid = self._budget_residual(
+                alpha_mid, cost_grid, mask, global_budget
+            )
             if abs(f_mid) <= _BISECT_TOL:
                 return alpha_mid
-            # f is decreasing in t: f > 0 means t too small.
+            # f is non-increasing in t: f > 0 means t too small (advance lo).
             if f_mid > 0:
                 t_lo = t_mid
             else:
@@ -728,103 +899,122 @@ class RCOBudgetPlugin:
         return alpha - 0.5 * (t_lo + t_hi) * cost_grid
 
     # ------------------------------------------------------------------
-    # Gradient estimator (Gumbel-STE forward + analytic backward)
+    # Cosine τ-anneal (plan §1.3 step 2, cleaned form)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cosine_tau(
+        *, step: int, total_steps: int, tau_init: float, tau_final: float
+    ) -> float:
+        """Cosine schedule, explore → exploit (τ_init → τ_final).
+
+        ``τ_t = τ_final + 0.5·(τ_init − τ_final)·(1 + cos(π·t/T))``
+        with ``t ∈ {0, ..., T-1}``.
+
+        - At ``t = 0``: ``cos(0) = 1`` ⇒ ``τ = τ_init`` (hot, uniform p̃).
+        - At ``t = T-1``: ``cos(π·(T-1)/T) ≈ cos(π) = -1`` ⇒
+          ``τ ≈ τ_final`` (cold, argmax-like p̃).
+
+        This is the canonical explore → exploit direction (plan §1.3
+        step 2 / D1-2 fix); the prior impl used cos(π·(1−t/T)) which
+        ran the schedule exploit → explore (reversed).
+        """
+        T = max(total_steps, 1)
+        progress = step / T
+        return tau_final + 0.5 * (tau_init - tau_final) * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    # ------------------------------------------------------------------
+    # Gradient estimator (Gumbel-softmax forward + analytic backward)
     # ------------------------------------------------------------------
 
     def _gradient_estimate(
         self,
         *,
         alpha: torch.Tensor,
-        cost_grid: torch.Tensor,
         mask: torch.Tensor,
         damage_grid: torch.Tensor,
         tau: float,
         rng: torch.Generator,
     ) -> torch.Tensor:
-        """Stochastic gradient of ``E_p[Σ_l D_l(k_l)]`` w.r.t. ``α``.
+        """Stochastic gradient of ``E_p̃[Σ_l D_l(k_l)]`` w.r.t. ``α``.
 
-        Uses the soft Gumbel-softmax to approximate the discrete
-        distribution at temperature ``tau``, then computes the analytic
-        gradient of ``Σ_l Σ_k p̃_lk · D_lk`` where ``p̃`` is the
-        Gumbel-softmax output.
+        Standard-form Gumbel-softmax (plan §1.3 step 1 / D1-1 fix):
 
-        The straight-through estimator typically uses ``argmax`` in the
-        forward + ``softmax`` in the backward. Here we use the soft
-        ``p̃`` for both (a Gumbel-softmax relaxation, not strict STE),
-        since the fitness signal is a sum over options and the soft
-        path gives a lower-variance gradient. This matches the paper's
-        practical recipe at moderate τ; the discrete projection happens
-        only at the final read-out.
+            p̃ = softmax((α + g) / τ),   g ~ Gumbel(0, 1).
+
+        Limits (paper §3.1):
+        - ``τ → ∞``: ``p̃ → uniform`` (high-entropy exploration).
+        - ``τ → 0``: ``p̃ → argmax(α + g)`` (low-entropy exploitation; this
+          IS the categorical sample by the Gumbel-max trick).
+
+        The prior impl used ``softmax(α + τ·g)`` which has the opposite
+        limits — REMOVED, not preserved.
+
+        Analytic backward (paper §3.1, eq. on lines 478-482): the softmax
+        Jacobian collapse yields ``∂(Σ_j p̃_lj D_lj)/∂α_lk = (1/τ) ·
+        p̃_lk · (D_lk − E_p̃[D_l])``. The ``1/τ`` factor is absorbed
+        into the Adam learning rate.
         """
-        # Sample Gumbel noise: g_lk = -log(-log(u_lk)) with u ~ Uniform.
-        # The shape matches alpha; padding columns get noise too but the
-        # mask zeroes them out before softmax.
+        # Sample Gumbel noise: g_lk = -log(-log(u_lk)) with u ~ Uniform(0,1).
+        # clamp_min(1e-20) avoids log(0) at the floor.
         u = torch.rand(alpha.shape, generator=rng, dtype=alpha.dtype).clamp_min(1e-20)
         gumbel = -torch.log(-torch.log(u))
-        # Padding columns must stay impossible after gumbel noise. We
-        # add gumbel to the *masked* logits then re-impose the very-
-        # negative pad value, so the soft probabilities on pads are ~0.
-        alpha_perturbed = alpha + tau * gumbel
-        # Re-impose the pad: where mask == 0, set to a very-negative
-        # value so the masked softmax gives ~0 mass.
+
+        # Standard Gumbel-softmax form: (α + g) / τ.
+        alpha_perturbed = (alpha + gumbel) / tau
+        # Re-impose pad: where mask == 0, set to a very-negative value so
+        # the masked softmax gives ~0 mass even after the gumbel noise
+        # could have boosted a pad index.
         very_neg = torch.full_like(alpha_perturbed, -1e9)
         alpha_perturbed = torch.where(mask > 0, alpha_perturbed, very_neg)
 
         p_tilde = self._masked_softmax(alpha_perturbed, mask)
 
-        # Analytic ∇_α (Σ p̃ · D) under the standard softmax Jacobian:
-        # ∂(Σ_j p̃_lj D_lj)/∂α_lk = p̃_lk · (D_lk − E_p̃[D_l]).
-        # The 1/tau factor would normally appear because α' = α/tau before
-        # softmax, but we treat that as a constant scale absorbed into the
-        # Adam learning rate.
+        # Analytic backward (1/τ absorbed by Adam lr).
         e_d = (p_tilde * damage_grid).sum(dim=1, keepdim=True)
         grad = p_tilde * (damage_grid - e_d) * mask
         return grad
 
     # ------------------------------------------------------------------
-    # Discrete readout (multiple-choice knapsack DP)
+    # Discrete readout (multiple-choice knapsack DP, pure damage)
     # ------------------------------------------------------------------
 
     def _evaluate_discrete(
         self,
         *,
-        alpha: torch.Tensor,
+        alpha: torch.Tensor,  # noqa: ARG002 — kept for signature stability
         cost_grid: torch.Tensor,
         mask: torch.Tensor,
         damage_grid: torch.Tensor,
         k_options: dict[int, list[int]],
         sorted_layers: list[int],
         global_budget: int,
-        tau: float,
-        seed: int,
-        stochastic: bool,
     ) -> tuple[float, dict[int, int]]:
-        """Project the soft logits to a budget-exact discrete vector via DP.
+        """Project to a budget-exact discrete vector via pure-damage DP.
 
-        Multiple-choice knapsack with ``L`` items (layers), each having
-        ``K_l`` mutually-exclusive options. The DP minimises a *combined*
-        score that mixes ``damage_grid`` (the fitness signal we want to
-        minimise) with a small negative-log-probability bias toward the
-        soft logits (so the discrete projection respects the optimizer's
-        belief at small τ).
+        Multiple-choice knapsack: select one option per layer minimising
 
-        Concretely: select one option per layer minimising
-        ``Σ_l (D_lk - β · log p_lk)`` subject to ``Σ_l c_lk = B``, with
-        β small (default 1e-3). β → 0 recovers a pure damage-DP solve;
-        β → ∞ recovers a pure argmax projection. The small default
-        means damage dominates, but the soft logits break ties.
+            Σ_l D_l(k_l)   subject to   Σ_l c_{l, k_l} = B.
 
-        Returns (fitness, budget_vector). budget_vector keyed by layer_idx.
+        The DP score is **pure damage** (plan §1.3 step 3 / D1-3 fix);
+        the prior impl's ``β · log p`` tiebreak is REMOVED.
+
+        Tiebreak policy (plan v4-N4): strict ``<`` on score comparisons,
+        so on tied scores the first vector encountered in the layer
+        sweep (lex-min on option indices) wins.
+
+        Infeasibility fallback (plan §6.1 F8 / Delta 6 fix): if ``B`` is
+        outside the achievable range, pick the nearest feasible budget
+        with larger-budget tiebreak via
+        ``min(feasible, key=lambda b: (abs(b−B), −b))``. Prior impl
+        picked the maximum; REMOVED.
+
+        Returns (fitness, budget_vector). ``budget_vector`` keyed by
+        ``layer_idx`` → surviving expert count.
         """
-        del stochastic, seed, tau  # kept in signature for future stochastic readout
-
-        # Per-option score: damage + small soft-logit nudge.
-        p = self._masked_softmax(alpha, mask)
-        log_p = torch.log(p.clamp_min(1e-30))
-        beta = 1e-3
-        score_grid = damage_grid - beta * log_p
-        # Padding columns get +inf score so DP never picks them.
-        score_grid_np = score_grid.detach().cpu().numpy().copy()
+        score_grid_np = damage_grid.detach().cpu().numpy().copy()
         mask_np = mask.detach().cpu().numpy()
         score_grid_np[mask_np == 0] = float("inf")
         cost_grid_np = cost_grid.detach().cpu().numpy()
@@ -832,9 +1022,6 @@ class RCOBudgetPlugin:
         L = len(sorted_layers)
         B = int(global_budget)
 
-        # DP table: best_score[i][b] = min sum of scores for first i
-        # layers using exactly budget b. choice[i][b] = option index
-        # taken at layer i to achieve it.
         INF = float("inf")
         best = np.full((L + 1, B + 1), INF, dtype=np.float64)
         choice = np.full((L + 1, B + 1), -1, dtype=np.int64)
@@ -845,30 +1032,64 @@ class RCOBudgetPlugin:
             for b in range(B + 1):
                 if not math.isfinite(best[i, b]):
                     continue
+                base = best[i, b]
                 for k_idx in range(K_l):
                     c = int(cost_grid_np[i, k_idx])
                     s = float(score_grid_np[i, k_idx])
                     nb = b + c
                     if nb > B:
                         continue
-                    cand = best[i, b] + s
+                    cand = base + s
+                    # Strict < tiebreak (plan v4-N4): first vector
+                    # encountered in the layer sweep wins on ties.
                     if cand < best[i + 1, nb]:
                         best[i + 1, nb] = cand
                         choice[i + 1, nb] = k_idx
 
         if not math.isfinite(best[L, B]):
-            # Infeasibility: no combination of per-layer options hits
-            # exactly B. Fall back to the closest feasible budget.
-            feasible = [b for b in range(B + 1) if math.isfinite(best[L, b])]
+            # Infeasibility (plan §6.1 F8): pick the NEAREST feasible
+            # budget with larger-budget tiebreak. WARN on the way.
+            #
+            # The primary DP table only tracks budgets in [0, B]; nearest
+            # feasibility needs to also consider budgets > B, which means
+            # re-solving over the full achievable range
+            # ``B_max = Σ_l max(opts_l)``. Capacity is small at our scale
+            # (L · K_max · B_max ≈ 6.4M for production); the cost is paid
+            # only on the rare infeasibility path.
+            B_max = int(sum(max(opts) for opts in k_options.values()))
+            best_ext = np.full((L + 1, B_max + 1), INF, dtype=np.float64)
+            choice_ext = np.full((L + 1, B_max + 1), -1, dtype=np.int64)
+            best_ext[0, 0] = 0.0
+            for i, li in enumerate(sorted_layers):
+                opts = k_options[li]
+                K_l = len(opts)
+                for b in range(B_max + 1):
+                    if not math.isfinite(best_ext[i, b]):
+                        continue
+                    base = best_ext[i, b]
+                    for k_idx in range(K_l):
+                        c = int(cost_grid_np[i, k_idx])
+                        s = float(score_grid_np[i, k_idx])
+                        nb = b + c
+                        if nb > B_max:
+                            continue
+                        cand = base + s
+                        if cand < best_ext[i + 1, nb]:
+                            best_ext[i + 1, nb] = cand
+                            choice_ext[i + 1, nb] = k_idx
+            feasible = [b for b in range(B_max + 1) if math.isfinite(best_ext[L, b])]
             if not feasible:
                 raise ValueError(
                     f"RCO DP: no feasible budget assignment for global_budget={B}."
                 )
-            chosen_B = max(feasible, key=lambda b: (b, -abs(b - B)))
+            chosen_B = min(feasible, key=lambda b: (abs(b - B), -b))
             log.warning(
-                "RCO DP: budget %d infeasible; falling back to nearest feasible "
-                "budget %d.", B, chosen_B,
+                "RCO DP: global_budget %d infeasible; falling back to nearest "
+                "feasible budget %d (larger-budget tiebreak).", B, chosen_B,
             )
+            # Use the extended DP table for backtracking.
+            best = best_ext
+            choice = choice_ext
         else:
             chosen_B = B
 
@@ -886,8 +1107,6 @@ class RCOBudgetPlugin:
             budget_vec[li] = chosen_k
             b -= chosen_k
 
-        # Final fitness uses the *damage* alone (not the score), so it is
-        # comparable across calls regardless of β.
         fitness = 0.0
         for i, li in enumerate(sorted_layers):
             k_idx = k_options[li].index(budget_vec[li])
