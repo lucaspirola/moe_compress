@@ -409,21 +409,25 @@ def _process_outputs(
                     gen.logprobs[:n_keep], logits_top_k,
                 )
                 fp = logits_dir / f"{int(attempt_idx):07d}.npz"
-                # Atomic write: tmp + os.replace so a kill mid-write
-                # leaves any previous .npz at `fp` intact (or no file
-                # at all). The paired JSONL row is written only AFTER
-                # this returns, so resume's re-run of the prompt will
-                # cleanly overwrite either way.
-                tmp_fp = fp.with_suffix(fp.suffix + ".tmp")
-                np.savez_compressed(
-                    tmp_fp,
+                # F-C-1 fix: durable .npz write via atomic_io.
+                # The previous tmp_fp = fp.with_suffix(fp.suffix + ".tmp")
+                # was broken: np.savez_compressed(str_path, …)
+                # auto-appends ".npz" to any path that doesn't end in
+                # ".npz", so the call wrote "000.npz.tmp.npz" and the
+                # subsequent os.replace(tmp_fp, fp) raised
+                # FileNotFoundError. atomic_npz_save passes an open
+                # binary file HANDLE which numpy does NOT auto-extend,
+                # and adds fsync(fd) + fsync(parent_dir) for true
+                # durability under eviction-class SIGKILL.
+                from moe_compress.utils.atomic_io import atomic_npz_save
+                atomic_npz_save(
+                    fp,
                     token_ids=np.asarray(trimmed_ids, dtype=np.int32),
                     top_ids=top_ids,
                     top_logprobs=top_lp,
                     attempt_idx=np.int64(attempt_idx),
                     top_k=np.int32(logits_top_k),
                 )
-                os.replace(tmp_fp, fp)
 
         # Item 8+9: per-row metadata bundle. ``prompt_token_ids`` on
         # RequestOutput is the rendered+tokenized prompt vLLM actually
