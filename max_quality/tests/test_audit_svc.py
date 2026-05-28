@@ -500,8 +500,11 @@ def test_load_merge_map_partial_layout(tmp_path: Path):
     (partial / "merge_1.json").write_text(json.dumps({
         "grouped": {"3": [3, 4]},
     }), encoding="utf-8")
-    merge_map = svc_audit.load_merge_map(art_dir)
+    # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.5): loader now returns a
+    # ``(map, stage2_run_id)`` tuple; pre-S-2 payloads return run_id=None.
+    merge_map, run_id = svc_audit.load_merge_map(art_dir)
     assert merge_map == {0: {0: [0, 1, 2], 5: [5]}, 1: {3: [3, 4]}}
+    assert run_id is None
 
 
 def test_load_merge_map_aggregate_layout(tmp_path: Path):
@@ -510,13 +513,253 @@ def test_load_merge_map_aggregate_layout(tmp_path: Path):
     art_dir.mkdir()
     raw = {"0": {"0": [0, 1], "5": [5]}, "1": {"3": [3, 4]}}
     (art_dir / "merge_map.json").write_text(json.dumps(raw), encoding="utf-8")
-    merge_map = svc_audit.load_merge_map(art_dir)
+    merge_map, run_id = svc_audit.load_merge_map(art_dir)
     assert merge_map == {0: {0: [0, 1], 5: [5]}, 1: {3: [3, 4]}}
+    assert run_id is None
 
 
 def test_load_merge_map_raises_on_missing(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         svc_audit.load_merge_map(tmp_path / "nope")
+
+
+# --------------------------------------------------------------------------- #
+# S-2: stage2_run_id cross-check (PLAN_S2_SVC_LOAD_MERGE_MAP.md §4)           #
+# --------------------------------------------------------------------------- #
+
+
+def _write_wrapper_merge_map(art_dir: Path, run_id: str | None,
+                             inner: dict) -> Path:
+    """Helper: write the S-2 wrapper-shape merge_map.json.
+
+    When ``run_id`` is None the stage2_run_id key is omitted (legacy
+    pre-S-2 writer shape would just be the bare inner dict — exercised by
+    the existing test_load_merge_map_aggregate_layout above).
+    """
+    art_dir.mkdir(parents=True, exist_ok=True)
+    payload: dict = {"format_version": 1, "merge_map": inner}
+    if run_id is not None:
+        payload["stage2_run_id"] = run_id
+    (art_dir / "merge_map.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    return art_dir / "merge_map.json"
+
+
+def _write_merged_checkpoint_meta(ckpt_dir: Path, run_id: str | None) -> None:
+    """Helper: write a stub ``compressed_metadata.json`` under ``ckpt_dir``.
+
+    Mirrors the ``extra`` envelope shape produced by
+    ``save_compressed_checkpoint`` so ``_load_merged_checkpoint_run_id``
+    finds the field where it expects to.
+    """
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    extra: dict = {"merge_map_file": "merge_map.json"}
+    if run_id is not None:
+        extra["stage2_run_id"] = run_id
+    (ckpt_dir / "compressed_metadata.json").write_text(
+        json.dumps({"pipeline_stage": "stage2_pruned", "extra": extra}),
+        encoding="utf-8",
+    )
+
+
+def test_load_merge_map_wrapper_shape_returns_run_id(tmp_path: Path):
+    """Wrapper-shape aggregate parses and returns the embedded run_id."""
+    art_dir = tmp_path / "artifacts"
+    _write_wrapper_merge_map(
+        art_dir, "abc123def456",
+        {"0": {"0": [0, 1], "5": [5]}, "1": {"3": [3, 4]}},
+    )
+    merge_map, run_id = svc_audit.load_merge_map(art_dir)
+    assert merge_map == {0: {0: [0, 1], 5: [5]}, 1: {3: [3, 4]}}
+    assert run_id == "abc123def456"
+
+
+def _attach_capture_handler(monkeypatch_logger: str):
+    """Helper: attach a list-collecting handler directly to the svc_audit
+    logger and return the records-collecting list + a cleanup function.
+
+    The svc_audit logger is configured with ``logging.basicConfig`` only
+    inside ``main()`` (not the helpers we test directly); pytest's
+    ``caplog`` fixture sometimes misses records from this logger because
+    of import-order interactions (the logger was created during the
+    importlib-based module load, before caplog's root handler was
+    installed). Attaching our own handler at the named logger sidesteps
+    that — the test sees exactly what the production code emitted.
+    """
+    import logging as _logging
+
+    records: list[_logging.LogRecord] = []
+
+    class _ListHandler(_logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _ListHandler(level=_logging.DEBUG)
+    lg = _logging.getLogger(monkeypatch_logger)
+    prev_level = lg.level
+    lg.addHandler(handler)
+    lg.setLevel(_logging.DEBUG)
+
+    def _cleanup():
+        lg.removeHandler(handler)
+        lg.setLevel(prev_level)
+
+    return records, _cleanup
+
+
+def test_load_merge_map_run_id_match_passes(tmp_path: Path):
+    """End-to-end: matching merge_map + merged checkpoint run_ids pass."""
+    art_dir = tmp_path / "artifacts"
+    _write_wrapper_merge_map(art_dir, "abc123", {"0": {"0": [0]}})
+    ckpt = tmp_path / "merged"
+    _write_merged_checkpoint_meta(ckpt, "abc123")
+
+    records, cleanup = _attach_capture_handler("svc_audit")
+    try:
+        _, mm_run_id = svc_audit.load_merge_map(art_dir)
+        merged_run_id = svc_audit._load_merged_checkpoint_run_id(ckpt)
+        rc = svc_audit._cross_check_run_ids(mm_run_id, merged_run_id)
+    finally:
+        cleanup()
+    assert rc == 0
+    joined = " ".join(rec.getMessage() for rec in records)
+    assert "cross-check OK" in joined
+    assert "abc123" in joined
+
+
+def test_load_merge_map_run_id_mismatch_raises_actionable_error(
+    tmp_path: Path,
+):
+    """Mismatched run_ids return exit code 2 and name BOTH ids in the log."""
+    art_dir = tmp_path / "artifacts"
+    _write_wrapper_merge_map(art_dir, "AAA", {"0": {"0": [0]}})
+    ckpt = tmp_path / "merged"
+    _write_merged_checkpoint_meta(ckpt, "BBB")
+
+    records, cleanup = _attach_capture_handler("svc_audit")
+    try:
+        _, mm_run_id = svc_audit.load_merge_map(art_dir)
+        merged_run_id = svc_audit._load_merged_checkpoint_run_id(ckpt)
+        rc = svc_audit._cross_check_run_ids(mm_run_id, merged_run_id)
+    finally:
+        cleanup()
+    assert rc == 2
+    # Naming the conflicting IDs is non-negotiable — that's what makes
+    # the message ACTIONABLE: the operator can grep their run logs for
+    # both IDs and identify which run each artifact came from.
+    joined = " ".join(rec.getMessage() for rec in records)
+    assert "RUN IDENTITY MISMATCH" in joined
+    assert "AAA" in joined
+    assert "BBB" in joined
+
+
+def test_load_merge_map_legacy_no_run_id_warns_not_raises(tmp_path: Path):
+    """Both sides pre-S-2 → cross-check returns 0 + WARN, no failure."""
+    art_dir = tmp_path / "artifacts"
+    # Legacy bare-dict shape (no wrapper, no run_id).
+    art_dir.mkdir()
+    (art_dir / "merge_map.json").write_text(
+        json.dumps({"0": {"0": [0, 1]}}), encoding="utf-8"
+    )
+    ckpt = tmp_path / "merged"
+    _write_merged_checkpoint_meta(ckpt, None)
+
+    records, cleanup = _attach_capture_handler("svc_audit")
+    try:
+        _, mm_run_id = svc_audit.load_merge_map(art_dir)
+        merged_run_id = svc_audit._load_merged_checkpoint_run_id(ckpt)
+        rc = svc_audit._cross_check_run_ids(mm_run_id, merged_run_id)
+    finally:
+        cleanup()
+    assert rc == 0
+    assert mm_run_id is None
+    assert merged_run_id is None
+    assert any(
+        "cross-check skipped" in rec.getMessage() for rec in records
+    )
+
+
+def test_load_merge_map_partial_dir_run_id_drift_raises(tmp_path: Path):
+    """_stage2_partial/ with conflicting run_ids raises RunIdMismatchError."""
+    art_dir = tmp_path / "artifacts"
+    partial = art_dir / "_stage2_partial"
+    partial.mkdir(parents=True)
+    (partial / "merge_0.json").write_text(json.dumps({
+        "grouped": {"0": [0, 1]},
+        "stage2_run_id": "X",
+    }), encoding="utf-8")
+    (partial / "merge_1.json").write_text(json.dumps({
+        "grouped": {"1": [1, 2]},
+        "stage2_run_id": "Y",
+    }), encoding="utf-8")
+    with pytest.raises(svc_audit.RunIdMismatchError) as excinfo:
+        svc_audit.load_merge_map(art_dir)
+    msg = str(excinfo.value)
+    # Both layer files AND both IDs must appear in the error message
+    # (operator needs every reference to diagnose which runs collided).
+    assert "merge_0.json" in msg
+    assert "merge_1.json" in msg
+    assert "'X'" in msg
+    assert "'Y'" in msg
+
+
+def test_load_merge_map_partial_dir_mixed_legacy_and_post_s2_raises(
+    tmp_path: Path,
+):
+    """_stage2_partial/ with mixed pre-S-2 + post-S-2 files hard-fails."""
+    art_dir = tmp_path / "artifacts"
+    partial = art_dir / "_stage2_partial"
+    partial.mkdir(parents=True)
+    (partial / "merge_0.json").write_text(json.dumps({
+        "grouped": {"0": [0, 1]},
+        # NO stage2_run_id — pre-S-2 shape.
+    }), encoding="utf-8")
+    (partial / "merge_1.json").write_text(json.dumps({
+        "grouped": {"1": [1, 2]},
+        "stage2_run_id": "Z",
+    }), encoding="utf-8")
+    with pytest.raises(svc_audit.RunIdMismatchError):
+        svc_audit.load_merge_map(art_dir)
+
+
+def test_load_merge_map_partial_dir_uniform_run_id_returns_it(
+    tmp_path: Path,
+):
+    """_stage2_partial/ where every file has the SAME run_id returns it."""
+    art_dir = tmp_path / "artifacts"
+    partial = art_dir / "_stage2_partial"
+    partial.mkdir(parents=True)
+    (partial / "merge_0.json").write_text(json.dumps({
+        "grouped": {"0": [0, 1]},
+        "stage2_run_id": "uniform-id",
+    }), encoding="utf-8")
+    (partial / "merge_1.json").write_text(json.dumps({
+        "grouped": {"1": [1, 2]},
+        "stage2_run_id": "uniform-id",
+    }), encoding="utf-8")
+    merge_map, run_id = svc_audit.load_merge_map(art_dir)
+    assert merge_map == {0: {0: [0, 1]}, 1: {1: [1, 2]}}
+    assert run_id == "uniform-id"
+
+
+def test_load_merged_checkpoint_run_id_pt_short_circuits_to_none(
+    tmp_path: Path,
+):
+    """``.pt`` checkpoint path returns None (no sidecar to read)."""
+    # Path doesn't exist as a dir → loader returns None without crashing.
+    pt_path = tmp_path / "merged.pt"
+    pt_path.write_bytes(b"")
+    assert svc_audit._load_merged_checkpoint_run_id(pt_path) is None
+
+
+def test_load_merged_checkpoint_run_id_missing_meta_returns_none(
+    tmp_path: Path,
+):
+    """Directory without compressed_metadata.json returns None."""
+    ckpt = tmp_path / "merged"
+    ckpt.mkdir()
+    assert svc_audit._load_merged_checkpoint_run_id(ckpt) is None
 
 
 # --------------------------------------------------------------------------- #

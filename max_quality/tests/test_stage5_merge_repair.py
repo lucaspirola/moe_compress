@@ -78,6 +78,28 @@ def test_load_merge_map_normalizes_string_keys(tmp_path):
     assert all(isinstance(k, int) for k in loaded[0])
 
 
+def test_load_merge_map_tolerates_wrapper_shape(tmp_path):
+    """S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.5a / §4.4): Stage 5 reader
+    handles the new ``{format_version, stage2_run_id, merge_map}`` envelope
+    written by ``stage2/orchestrator.py`` at finalize.
+    """
+    d = tmp_path / "stage2_pruned"
+    d.mkdir(parents=True)
+    payload = {
+        "format_version": 1,
+        "stage2_run_id": "abc123def456",
+        "merge_map": {"0": {"0": [0, 1], "1": [2]}, "3": {"0": [0]}},
+    }
+    (d / "merge_map.json").write_text(json.dumps(payload), encoding="utf-8")
+    loaded = s5m._load_merge_map(tmp_path, None)
+    # Returns inner map only; the run_id is intentionally NOT consumed here
+    # (Stage 5 trusts the intra-run path convention — cross-check is the
+    # audit tool's job).
+    assert loaded == {0: {0: [0, 1], 1: [2]}, 3: {0: [0]}}
+    assert all(isinstance(k, int) for k in loaded)
+    assert all(isinstance(k, int) for k in loaded[0])
+
+
 def test_load_merge_map_missing_fails_loud(tmp_path):
     with pytest.raises(RuntimeError, match="merge map not found"):
         s5m._load_merge_map(tmp_path, None)

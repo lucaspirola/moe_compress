@@ -424,22 +424,78 @@ def svc_scores_for_group(
 # --------------------------------------------------------------------------- #
 
 
-def load_merge_map(stage2_artifacts_dir: Path) -> dict[int, dict[int, list[int]]]:
-    """Return ``{layer_idx: {centroid_expert_id: [donor_id, ...]}}``.
+class RunIdMismatchError(RuntimeError):
+    """S-2: raised when ``_stage2_partial/merge_*.json`` files disagree on
+    ``stage2_run_id`` (the partial dir contains files from two different
+    Stage 2 runs, or the codebase was upgraded mid-run mixing pre-S-2 and
+    post-S-2 files in the same dir).
+
+    Operator action: delete ``_stage2_partial/`` and let Stage 2 re-write a
+    uniform set (cross-check is impossible on a contaminated dir).
+    """
+
+
+def load_merge_map(
+    stage2_artifacts_dir: Path,
+) -> tuple[dict[int, dict[int, list[int]]], str | None]:
+    """Return ``({layer_idx: {centroid_expert_id: [donor_id, ...]}}, stage2_run_id)``.
 
     Tries the top-level ``merge_map.json`` (the orchestrator's final
     aggregate) first, then falls back to the per-layer
     ``_stage2_partial/merge_{layer}.json`` files (a partial run snapshot,
     same shape).
+
+    S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.5): returns a second element —
+    the ``stage2_run_id`` recovered from the on-disk artifact (or ``None``
+    for pre-S-2 writers). ``svc_audit.main`` cross-checks this against the
+    merged checkpoint's ``stage2_run_id`` so operator-mixed
+    ``--stage2-artifacts`` and ``--merged-checkpoint`` from two different
+    runs cannot silently produce garbage SVC projection coefficients.
+
+    Aggregate path:
+      * Wrapper shape (post-S-2):
+        ``{"format_version": 1, "stage2_run_id": "<hex>", "merge_map": {...}}``
+        → returns ``(_parse_aggregate_merge_map(inner), raw["stage2_run_id"])``.
+      * Bare-dict legacy shape (pre-S-2): returns
+        ``(_parse_aggregate_merge_map(raw), None)`` plus a WARN.
+
+    Partial-dir path:
+      * Aggregates per-layer merge JSONs AND collects the optional
+        ``stage2_run_id`` field from each.
+      * All files agree on ``stage2_run_id`` → returns ``(parsed, id)``.
+      * All files are pre-S-2 (no field) → returns ``(parsed, None)`` + WARN.
+      * Any two files disagree (incl. mixed pre-S-2 + post-S-2) →
+        raises :class:`RunIdMismatchError`.
     """
     aggregate = stage2_artifacts_dir / "merge_map.json"
     if aggregate.exists():
         raw = json.loads(aggregate.read_text(encoding="utf-8"))
-        return _parse_aggregate_merge_map(raw)
+        # Wrapper-shape detection (post-S-2 writer).
+        if (isinstance(raw, dict)
+                and "merge_map" in raw
+                and isinstance(raw["merge_map"], dict)):
+            inner = raw["merge_map"]
+            run_id = raw.get("stage2_run_id")
+            if not isinstance(run_id, str):
+                # Wrapper present but no run-id — treat as missing.
+                run_id = None
+            return (_parse_aggregate_merge_map(inner), run_id)
+        # Legacy bare-dict shape (pre-S-2 writer).
+        log.warning(
+            "load_merge_map: %s is a pre-S-2 bare-dict payload "
+            "(no stage2_run_id); cross-check vs --merged-checkpoint is "
+            "DISABLED for this artifact set.",
+            aggregate,
+        )
+        return (_parse_aggregate_merge_map(raw), None)
 
     partial_dir = stage2_artifacts_dir / "_stage2_partial"
     if partial_dir.is_dir():
         out: dict[int, dict[int, list[int]]] = {}
+        # Track per-layer run-id alongside the merge groups so we can
+        # detect cross-run contamination (or mixed pre-S-2 + post-S-2)
+        # before returning.
+        seen_run_ids: list[tuple[str, str | None]] = []
         for path in sorted(partial_dir.glob("merge_*.json")):
             layer_idx = int(path.stem.split("_")[-1])
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -448,13 +504,126 @@ def load_merge_map(stage2_artifacts_dir: Path) -> dict[int, dict[int, list[int]]
                 int(centroid): [int(d) for d in donors]
                 for centroid, donors in grouped.items()
             }
+            rid_raw = payload.get("stage2_run_id")
+            rid = rid_raw if isinstance(rid_raw, str) else None
+            seen_run_ids.append((path.name, rid))
         if out:
-            return out
+            # Validate run-id consistency. ANY drift (incl. mixed
+            # pre-S-2 + post-S-2 within the same partial dir) is a HARD
+            # FAIL — that combination almost certainly means two runs
+            # writing to the same dir, and we cannot prove which Stage 2
+            # state produced the merged checkpoint we are auditing.
+            distinct = {rid for _, rid in seen_run_ids}
+            if len(distinct) > 1:
+                pairs = ", ".join(
+                    f"{name}={rid!r}" for name, rid in seen_run_ids
+                )
+                raise RunIdMismatchError(
+                    f"_stage2_partial/ under {stage2_artifacts_dir} contains "
+                    f"merge_*.json files with conflicting stage2_run_id "
+                    f"values: {pairs}. The partial dir is contaminated with "
+                    f"files from different Stage 2 runs (or mixes pre-S-2 + "
+                    f"current writers — operator NOTE: if you upgraded the "
+                    f"codebase mid-run, delete _stage2_partial/ before "
+                    f"resuming). Cross-check is impossible on this artifact "
+                    f"set."
+                )
+            # Single-value set: either {actual_id} or {None}.
+            unified = next(iter(distinct))
+            if unified is None:
+                log.warning(
+                    "load_merge_map: _stage2_partial/ under %s is a pre-S-2 "
+                    "payload set (no stage2_run_id on any file); cross-check "
+                    "vs --merged-checkpoint is DISABLED for this artifact "
+                    "set.",
+                    stage2_artifacts_dir,
+                )
+            return (out, unified)
 
     raise FileNotFoundError(
         f"load_merge_map: no merge_map.json under {stage2_artifacts_dir} and "
         f"no _stage2_partial/merge_*.json fallbacks either"
     )
+
+
+def _load_merged_checkpoint_run_id(checkpoint_path: Path) -> str | None:
+    """Return ``stage2_run_id`` from the merged checkpoint, or None for
+    legacy / non-directory layouts.
+
+    S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.6): reads
+    ``<checkpoint_path>/compressed_metadata.json -> extra.stage2_run_id``.
+
+    NOTE: ``.pt`` (state-dict) checkpoints SHORT-CIRCUIT to ``None`` here
+    because they don't carry a sidecar ``compressed_metadata.json``. The
+    cross-check then degrades to the legacy-WARN path (no hard fail).
+    This is an ACCEPTED limitation under the current threat model: the
+    ``--merged-checkpoint <foo.pt>`` operator path is rare (HF-dir is the
+    canonical layout), and a determined operator who concatenates two
+    runs' .pt files past the audit is outside scope. If a future audit
+    upgrade needs to close this hole, embed the run-id in the .pt payload
+    alongside the state_dict and add a branch here.
+    """
+    if not checkpoint_path.is_dir():
+        return None
+    meta_path = checkpoint_path / "compressed_metadata.json"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    extra = meta.get("extra", {})
+    if isinstance(extra, dict):
+        rid = extra.get("stage2_run_id")
+        if isinstance(rid, str):
+            return rid
+    return None
+
+
+def _cross_check_run_ids(
+    merge_map_run_id: str | None,
+    merged_run_id: str | None,
+) -> int:
+    """Compare run identities from --stage2-artifacts and --merged-checkpoint.
+
+    Returns:
+        0 on cross-check OK (or skipped due to legacy artifacts).
+        2 on MISMATCH (operator pointed at two different runs).
+
+    Side-effect: logs at INFO on OK, ERROR on mismatch, WARN on skip.
+    Tests target this helper directly without spinning up the full audit
+    pipeline.
+    """
+    if merge_map_run_id is not None and merged_run_id is not None:
+        if merge_map_run_id != merged_run_id:
+            log.error(
+                "RUN IDENTITY MISMATCH: --stage2-artifacts run_id=%s but "
+                "--merged-checkpoint run_id=%s. The merge map and merged "
+                "weights come from DIFFERENT Stage 2 runs. SVC projection "
+                "coefficients would be meaningless. Re-run with consistent "
+                "paths, or delete the stale artifact set.",
+                merge_map_run_id, merged_run_id,
+            )
+            return 2
+        log.info(
+            "Run identity cross-check OK: stage2_run_id=%s",
+            merged_run_id,
+        )
+        return 0
+    # Exactly one side has the field, or neither. Either case:
+    #   - operator pointed at a pre-S-2 merge map + a current merged
+    #     checkpoint (or vice versa), which strongly suggests they ARE
+    #     from different runs but we can't prove it. WARN, don't fail.
+    #   - both sides are pre-S-2 (legacy) — no cross-check possible. WARN.
+    log.warning(
+        "Run-identity cross-check skipped: merge_map run_id=%r, "
+        "merged-checkpoint run_id=%r. One or both sides predate the "
+        "S-2 run-id field (pre-S-2 Stage 2 writer, or .pt checkpoint "
+        "without sidecar). Cross-run contamination is undetectable on "
+        "this artifact set.",
+        merge_map_run_id, merged_run_id,
+    )
+    return 0
 
 
 def _parse_aggregate_merge_map(raw: Any) -> dict[int, dict[int, list[int]]]:
@@ -1060,7 +1229,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # ``--stage2-artifacts`` directory must produce a clear error +
     # exit code 2, not an uncaught FileNotFoundError stack trace.
     try:
-        merge_map = load_merge_map(args.stage2_artifacts)
+        merge_map, merge_map_run_id = load_merge_map(args.stage2_artifacts)
     except FileNotFoundError as exc:
         log.error(
             "Stage 2 merge map not found under %s — pass "
@@ -1069,6 +1238,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.stage2_artifacts,
             exc,
         )
+        return 2
+    except RunIdMismatchError as exc:
+        # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.5): hard-fail when
+        # _stage2_partial/ contains files from two different Stage 2 runs.
+        log.error("%s", exc)
         return 2
     log.info("Loaded merge_map for %d layers", len(merge_map))
 
@@ -1101,6 +1275,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     merged = load_merged_expert_weights(args.merged_checkpoint)
     log.info("Loaded %d merged expert weights from %s", len(merged), args.merged_checkpoint)
+
+    # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.6): cross-check that
+    # ``--stage2-artifacts`` and ``--merged-checkpoint`` come from the
+    # SAME Stage 2 run. The threat model is "operator pointed at the wrong
+    # dir by accident"; UUID-equality (constant-time, no large-file
+    # hashing) is the right tool. Exit code 2 on MISMATCH matches the
+    # other "can't proceed" branches above.
+    merged_run_id = _load_merged_checkpoint_run_id(args.merged_checkpoint)
+    rc = _cross_check_run_ids(merge_map_run_id, merged_run_id)
+    if rc != 0:
+        return rc
 
     results = run_audit(
         originals=originals,
