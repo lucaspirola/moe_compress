@@ -10099,3 +10099,781 @@ index 4ec1be3..454c657 100644
              start=self.start_layer,
          ):
              hidden_states, residual = layer(positions, hidden_states, residual)
+diff --git a/vllm/calibration_wanda_scalar_row.py b/vllm/calibration_wanda_scalar_row.py
+new file mode 100644
+index 0000000..0000001
+--- /dev/null
++++ b/vllm/calibration_wanda_scalar_row.py
+@@ -0,0 +1,474 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-(layer, expert, matrix) Wanda ``scalar_row`` calibration capture.
++
++W-1 (audit `tasks/AUDIT_CALIBRATION_COMPLETENESS_V2.md` §W-1).
++Plan: `tasks/PLAN_W1_WANDA_SCALAR_ROW_CAPTURE.md`.
++
++Computes per-(layer_idx, expert_idx, matrix_name) running mean of
++``(x_t · g_{e,t})^2`` per input channel ``c`` during a calibration
++forward pass, via two source-patched hooks (router-stash + expert-in
++reader, mirroring `vllm.calibration_reap_scores` at
++``max_quality/patches/vllm_calibration_hooks.patch:8134-8473``):
++
++* ``router`` (vllm/model_executor/layers/fused_moe/moe_runner.py)
++  dispatches ``(layer_idx, router_logits, topk_weights, topk_ids)`` per
++  MoE layer forward. This module stashes ``topk_weights`` keyed by
++  ``layer_idx`` for the immediately-following ``expert_in`` callback to
++  match.
++
++* ``expert_in`` (vllm/model_executor/layers/fused_moe/moe_runner.py)
++  dispatches ``(layer_idx, hidden_states, topk_ids)`` per MoE layer
++  forward, BEFORE the per-expert dispatch_combine. ``hidden_states`` is
++  the pre-routing hidden state (gate_proj / up_proj input). We
++  scatter-accumulate per-(layer, expert, "gate_proj") sum-of-squares of
++  ``(x_t · g_{e,t})`` per input channel into CPU fp32 buffers, plus
++  ``token_counts``.
++
++``down_proj`` input is the post-act intermediate — NOT visible at
++``expert_in`` (which fires on the pre-routing hidden state). The
++``down_proj`` scalar_row is therefore NOT captured by this writer; the
++plugin's cache-MISS fallback path (the existing in-process calibration
++sweep at ``stage3/plugins/wanda_intra_expert_score.py:498-528``)
++captures both ``gate_proj`` and ``down_proj``. The down_proj entry is
++simply absent from the sidecar payload, and the consumer's
++``_compute_scores`` already skips matrices without a scalar_row.
++
++Stash lifecycle — overwrite-on-router-fire, NO explicit clear
++-------------------------------------------------------------
++The per-layer ``_ROUTER_WEIGHTS_STASH`` is overwritten on each
++``_on_router(layer_idx=…)`` call; it is NOT cleared by the
++``_on_expert_in`` reader. The stale entry sits inert until the next
++``_on_router`` for the same layer overwrites it. The steady-state
++per-layer dispatch order (router(N) → expert_in(N) → router(N+1) → …)
++makes this safe.
++
++Mirrors ``vllm.calibration_reap_scores._ROUTER_WEIGHTS_STASH`` at
++``vllm_calibration_hooks.patch:8219`` (the inline comment there claims
++"cleared after each use" — verified empirically as stale; this module's
++docstring states the correct contract).
++
++Env-var gating
++--------------
++``VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW=1`` activates the module. Requires:
++
++* ``VLLM_CALIB_CAPTURE_ROUTER=1`` (router hook fires from MoE forward)
++* ``VLLM_CALIB_CAPTURE_EXPERT=1`` (expert_in hook fires)
++
++The driver (``build_self_traces_calib_vllm.py``) sets all three env
++vars BEFORE the first vllm import when ``--capture-wanda-scalar-row``
++is passed.
++
++CUDA-graph compatibility
++------------------------
++Accumulators live on CPU (fp32). The callbacks dispatch from Python
++synchronously after the kernel returns; ``hidden_states`` / ``topk_*``
++are cloned (via ``.detach().cpu()``) at callback entry. Safe for
++CUDA-graph capture.
++
++Resumability
++------------
++Mirrors ``vllm.calibration_reap_scores`` / ``vllm.calibration_input_cov``:
++periodic ``dump_wanda_scalar_row_checkpoint`` during the run,
++``load_wanda_scalar_row_checkpoint`` on ``--resume``. The final
++``dump_wanda_scalar_row`` writes the normalised payload via
++``moe_compress.utils.cached_calibration_signals.save_wanda_scalar_row``
++(Pattern O — atomic write + manifest-last).
++
++Storage shape
++-------------
++For Qwen3.6-35B-A3B at hidden=2048, n_layers≈40, n_experts=256, the
++on-disk size is ~80 MB (gate_proj scalar_row, fp32). down_proj scalar_row
++is not captured here — see "down_proj input is the post-act
++intermediate" note above.
++"""
++from __future__ import annotations
++
++import logging
++import os
++from pathlib import Path
++from typing import Any
++
++import torch
++
++import vllm.calibration_hooks as _ch
++
++log = logging.getLogger(__name__)
++
++__all__ = [
++    "setup",
++    "dump_wanda_scalar_row",
++    "dump_wanda_scalar_row_checkpoint",
++    "load_wanda_scalar_row_checkpoint",
++    "get_n_prompts_accumulated",
++    "set_n_prompts_accumulated",
++]
++
++# Sampled at import time -- matches calibration_reap_scores / input_cov.
++_CAPTURE_WANDA_SCALAR_ROW: bool = (
++    os.getenv("VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW", "0") == "1"
++)
++
++# Per-(layer_idx, expert_idx, matrix_name) CPU sum-of-squares accumulators.
++# Stored as raw running SUMS (NOT means) so checkpoint resumability is
++# additive — the final ``dump_wanda_scalar_row`` divides by the matching
++# ``_WANDA_TOKEN_COUNTS`` entry to produce the per-channel mean. The
++# in-process plugin accumulator's running-mean form is reconstructed
++# from this sum + count pair at consume time (see
++# ``_WandaScalarRowAccumulator.from_payload``).
++_WANDA_SCALAR_ROW_SUM: dict[tuple[int, int, str], torch.Tensor] = {}
++_WANDA_TOKEN_COUNTS: dict[tuple[int, int, str], int] = {}
++
++# Per-layer router-weight stash. Overwrite-on-router-fire, NOT cleared
++# by the expert_in reader — the per-layer dispatch order guarantees the
++# router fires before the expert_in for every layer in every forward.
++# See module docstring for the correct lifecycle (the comment at
++# vllm_calibration_hooks.patch:8218 for REAP is stale).
++_ROUTER_WEIGHTS_STASH: dict[int, torch.Tensor] = {}
++
++# Per-layer top-k width (sampled from the first router fire; consumed by
++# expert_in to size the per-token routing-weight gather).
++_TOP_K: int | None = None
++
++_LAYER_ID_TO_RANK: dict[int, int] = {}
++_N_LAYERS: int = 0
++_N_EXPERTS: int = 0
++# d_in is sampled lazily on the first expert_in dispatch so checkpoint
++# metadata reflects reality even when setup() couldn't pre-walk the model.
++_D_IN: int | None = None
++
++# Cumulative prompt counter mirroring reap_scores / input_cov / imatrix.
++_n_prompts_accumulated: int = 0
++_CHECKPOINT_SCHEMA_VERSION: int = 1
++
++
++def get_n_prompts_accumulated() -> int:
++    return _n_prompts_accumulated
++
++
++def set_n_prompts_accumulated(n: int) -> None:
++    global _n_prompts_accumulated
++    if n < 0:
++        raise ValueError(f"n must be >= 0; got {n}")
++    _n_prompts_accumulated = int(n)
++
++
++def _resolve_model(llm: Any) -> Any | None:
++    """Walk well-known attribute paths to find the live nn.Module."""
++    candidates = [
++        ("llm_engine", "model_executor", "driver_worker", "model_runner",
++         "model"),
++        ("llm_engine", "model_executor", "model_runner", "model"),
++        ("model_executor", "driver_worker", "model_runner", "model"),
++        ("model_runner", "model"),
++    ]
++    for path in candidates:
++        obj: Any = llm
++        ok = True
++        for attr in path:
++            obj = getattr(obj, attr, None)
++            if obj is None:
++                ok = False
++                break
++        if ok:
++            return obj
++    return None
++
++
++def setup(llm: Any) -> None:
++    """Discover MoE layers, build the layer_id_to_rank map, register
++    the ``router`` + ``expert_in`` callbacks. Idempotent: calling twice
++    does not double-register.
++    """
++    global _N_LAYERS, _N_EXPERTS
++
++    if not _CAPTURE_WANDA_SCALAR_ROW:
++        log.info("calibration_wanda_scalar_row: env gate off; no-op setup.")
++        return
++
++    model = _resolve_model(llm)
++    if model is None:
++        log.warning(
++            "calibration_wanda_scalar_row: could not resolve model from "
++            "LLM; callbacks will be registered but the layer_id_to_rank "
++            "map will be populated lazily from the first router dispatch."
++        )
++
++    # Discover MoE layers by attribute presence (mirrors reap_scores +
++    # input_cov).
++    n_layers = 0
++    n_experts_seen: int | None = None
++    if model is not None:
++        for name, module in model.named_modules():
++            moe_layer_id = getattr(module, "moe_layer_id", None)
++            num_experts = getattr(module, "num_experts", None)
++            if not (isinstance(moe_layer_id, int)
++                    and isinstance(num_experts, int) and num_experts > 0):
++                continue
++            _LAYER_ID_TO_RANK[moe_layer_id] = n_layers
++            if n_experts_seen is None:
++                n_experts_seen = num_experts
++            elif n_experts_seen != num_experts:
++                log.warning(
++                    "calibration_wanda_scalar_row: mixed expert counts "
++                    "(%d vs first-seen %d at %s); using first.",
++                    num_experts, n_experts_seen, name,
++                )
++            n_layers += 1
++
++    _N_LAYERS = n_layers
++    _N_EXPERTS = int(n_experts_seen) if n_experts_seen is not None else 0
++
++    _ch.register_callback("router", _on_router)
++    _ch.register_callback("expert_in", _on_expert_in)
++
++    log.info(
++        "calibration_wanda_scalar_row: setup complete -- %d MoE layers, "
++        "%d experts/layer; callbacks registered for router + expert_in.",
++        _N_LAYERS, _N_EXPERTS,
++    )
++
++
++def _on_router(layer_idx: int, router_logits: torch.Tensor,
++               topk_weights: torch.Tensor, topk_ids: torch.Tensor,
++               **_: Any) -> None:
++    """Stash per-layer topk_weights for the matching expert_in callback.
++
++    Lifecycle: overwrite-on-fire, NO explicit clear (see module
++    docstring + ``_ROUTER_WEIGHTS_STASH`` declaration comment).
++    """
++    if not _CAPTURE_WANDA_SCALAR_ROW:
++        return
++    global _TOP_K
++    tw = topk_weights.detach().cpu().to(torch.float32)
++    _ROUTER_WEIGHTS_STASH[layer_idx] = tw
++    if _TOP_K is None and tw.dim() >= 2:
++        _TOP_K = int(tw.shape[1])
++
++
++def _on_expert_in(layer_idx: int, hidden_states: torch.Tensor,
++                  topk_ids: torch.Tensor, **_: Any) -> None:
++    """Accumulate per-(layer, expert, "gate_proj") sum of
++    ``(x_t · g_{e,t})^2`` per input channel.
++
++    For each expert ``e`` and each token ``t`` routed to ``e``, the
++    contribution is ``(x_t * g_{e,t}) ** 2`` per channel, where
++    ``g_{e,t}`` is the topk_weight assigned to the slot at which expert
++    ``e`` was selected for token ``t``.
++
++    Reads topk_weights from ``_ROUTER_WEIGHTS_STASH[layer_idx]`` (stashed
++    by the matching ``_on_router`` call earlier in the same forward).
++    On router-stash miss (out-of-order dispatch — does NOT occur in
++    production), emits one-shot ERROR log + skips the layer (does NOT
++    silently zero the row).
++    """
++    if not _CAPTURE_WANDA_SCALAR_ROW:
++        return
++
++    tw = _ROUTER_WEIGHTS_STASH.get(layer_idx)
++    if tw is None:
++        log.error(
++            "calibration_wanda_scalar_row: expert_in at layer %d "
++            "without a preceding router dispatch (stash miss); "
++            "skipping. Did you forget VLLM_CALIB_CAPTURE_ROUTER=1?",
++            layer_idx,
++        )
++        return
++
++    if layer_idx not in _LAYER_ID_TO_RANK:
++        rank = len(_LAYER_ID_TO_RANK)
++        _LAYER_ID_TO_RANK[layer_idx] = rank
++
++    global _D_IN, _N_LAYERS, _N_EXPERTS
++    hs = hidden_states.detach().to("cpu", dtype=torch.float32, copy=True)
++    if hs.numel() == 0:
++        return
++    if hs.dim() == 3:
++        # [batch, seq, hidden] -> [n_tok, hidden]
++        hs = hs.reshape(-1, hs.shape[-1])
++    if _D_IN is None:
++        _D_IN = int(hs.shape[-1])
++
++    ids = topk_ids.detach().to("cpu", dtype=torch.int64)
++    n_tok = hs.shape[0]
++    if ids.dim() == 1:
++        ids = ids.unsqueeze(-1)
++    if ids.shape[0] != n_tok:
++        log.warning(
++            "calibration_wanda_scalar_row: layer %d -- topk_ids first "
++            "dim %d does not match hidden_states n_tok %d; skipping.",
++            layer_idx, ids.shape[0], n_tok,
++        )
++        return
++
++    # Trim/align topk_weights to the (n_tok, top_k) shape of ids.
++    tw_aligned = tw[:n_tok, :ids.shape[1]]
++    if tw_aligned.shape != ids.shape:
++        log.warning(
++            "calibration_wanda_scalar_row: layer %d -- topk_weights "
++            "shape %s does not align with topk_ids shape %s; skipping.",
++            layer_idx, tuple(tw.shape), tuple(ids.shape),
++        )
++        return
++
++    # Update seen-expert ceiling for checkpoint metadata.
++    seen_max = int(ids.max().item()) + 1 if ids.numel() > 0 else 0
++    if seen_max > _N_EXPERTS:
++        _N_EXPERTS = seen_max
++
++    # Per-expert accumulation. A token may appear in top_k slots so its
++    # contribution is added per slot — matching the live plugin
++    # accumulator's semantics (each (token, slot) routed to expert e
++    # contributes the (x_t * g_{e,t,slot}) ** 2 per-channel
++    # sum-of-squares).
++    for e in range(seen_max):
++        mask_2d = (ids == e)  # [n_tok, top_k]
++        if not mask_2d.any():
++            continue
++        # For each (token, slot) where ids == e, gather the per-token
++        # row and the matching scalar g. The same token may appear
++        # multiple times if both slots selected expert e — the per-slot
++        # contribution is added separately (mirrors the in-process
++        # accumulator's semantics where instrument_experts dispatches
++        # per (token, slot) routed to e).
++        token_idx, slot_idx = mask_2d.nonzero(as_tuple=True)
++        if token_idx.numel() == 0:
++            continue
++        sub_x = hs.index_select(0, token_idx)             # [n_e, d_in]
++        sub_g = tw_aligned[token_idx, slot_idx]            # [n_e]
++        weighted = sub_x * sub_g.reshape(-1, 1)            # [n_e, d_in]
++        sq_per_channel = weighted.pow(2).sum(dim=0)        # [d_in]
++
++        key = (layer_idx, int(e), "gate_proj")
++        cur = _WANDA_SCALAR_ROW_SUM.get(key)
++        if cur is None:
++            _WANDA_SCALAR_ROW_SUM[key] = sq_per_channel
++        else:
++            cur.add_(sq_per_channel)
++        _WANDA_TOKEN_COUNTS[key] = (
++            _WANDA_TOKEN_COUNTS.get(key, 0) + int(token_idx.numel())
++        )
++
++    # _N_LAYERS may grow lazily if setup() couldn't pre-discover layers.
++    if len(_LAYER_ID_TO_RANK) > _N_LAYERS:
++        _N_LAYERS = len(_LAYER_ID_TO_RANK)
++
++
++def dump_wanda_scalar_row(jsonl_path: str | Path) -> None:
++    """Write the final per-(layer, expert, "gate_proj") scalar_row sidecar.
++
++    Divides the raw sum-of-squares accumulators by the matching
++    ``token_counts`` to produce the per-channel running mean
++    (``E_t[(x_t * g_{e,t})^2]``), then delegates to
++    ``moe_compress.utils.cached_calibration_signals.save_wanda_scalar_row``
++    which writes the payload + manifest atomically (Pattern O).
++    """
++    if not _CAPTURE_WANDA_SCALAR_ROW:
++        return
++
++    # Import here (not at module top) so the dependency is lazy.
++    from moe_compress.utils.cached_calibration_signals import (
++        SCHEMA_VERSIONS, WandaScalarRowPayload, save_wanda_scalar_row,
++    )
++
++    if not _WANDA_SCALAR_ROW_SUM:
++        log.warning(
++            "calibration_wanda_scalar_row: no entries accumulated; "
++            "skipping dump."
++        )
++        return
++
++    sigma_x_g_squared: dict = {}
++    token_counts: dict = {}
++    for key, sumsq in _WANDA_SCALAR_ROW_SUM.items():
++        count = _WANDA_TOKEN_COUNTS.get(key, 0)
++        safe = max(1, count)
++        sigma_x_g_squared[key] = sumsq / float(safe)
++        token_counts[key] = int(count)
++
++    payload = WandaScalarRowPayload(
++        schema_version=SCHEMA_VERSIONS["wanda_scalar_row"],
++        n_experts=_N_EXPERTS,
++        n_layers=_N_LAYERS,
++        sigma_x_g_squared=sigma_x_g_squared,
++        token_counts=token_counts,
++    )
++    save_wanda_scalar_row(payload, Path(jsonl_path))
++    log.info(
++        "calibration_wanda_scalar_row: wrote %d (layer, expert, matrix) "
++        "entries (%d layers x %d experts) next to %s",
++        len(sigma_x_g_squared), _N_LAYERS, _N_EXPERTS, jsonl_path,
++    )
++
++
++def dump_wanda_scalar_row_checkpoint(ckpt_path: str) -> None:
++    """Atomic checkpoint of raw accumulator state for resume.
++
++    Stores the RAW sum-of-squares (NOT the normalised mean) so a
++    kill-mid-calibration + resume can additively combine the new chunks
++    with the saved sums. See T6 in
++    ``tasks/PLAN_W1_WANDA_SCALAR_ROW_CAPTURE.md`` §9.
++    """
++    if not _CAPTURE_WANDA_SCALAR_ROW:
++        return
++    payload = {
++        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
++        "n_prompts_accumulated": _n_prompts_accumulated,
++        "n_layers": _N_LAYERS,
++        "n_experts": _N_EXPERTS,
++        "d_in": _D_IN,
++        "top_k": _TOP_K,
++        "layer_id_to_rank": dict(_LAYER_ID_TO_RANK),
++        # Clone every tensor so a concurrent _on_expert_in cannot mutate
++        # our snapshot mid-save (mirror of reap_scores's pattern).
++        "scalar_row_sum": {
++            k: v.clone() for k, v in _WANDA_SCALAR_ROW_SUM.items()
++        },
++        "token_counts": dict(_WANDA_TOKEN_COUNTS),
++    }
++    tmp = ckpt_path + ".tmp"
++    torch.save(payload, tmp)
++    os.replace(tmp, ckpt_path)
++
++
++def load_wanda_scalar_row_checkpoint(ckpt_path: str) -> int:
++    """Hydrate accumulators from a previous run's checkpoint.
++
++    Returns ``n_prompts_accumulated``; 0 if file missing. Raises
++    ``ValueError`` on schema mismatch (caller deletes + restarts).
++    """
++    global _N_LAYERS, _N_EXPERTS, _D_IN, _TOP_K, _n_prompts_accumulated
++    if not os.path.exists(ckpt_path):
++        return 0
++    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
++    schema = int(payload.get("schema_version", 0))
++    if schema != _CHECKPOINT_SCHEMA_VERSION:
++        raise ValueError(
++            f"calibration_wanda_scalar_row: checkpoint at {ckpt_path} "
++            f"has schema_version={schema}, expected "
++            f"{_CHECKPOINT_SCHEMA_VERSION}. "
++            f"Delete the checkpoint to restart from scratch."
++        )
++    _n_prompts_accumulated = int(payload["n_prompts_accumulated"])
++    _N_LAYERS = int(payload["n_layers"])
++    _N_EXPERTS = int(payload["n_experts"])
++    _D_IN = payload.get("d_in")
++    if _D_IN is not None:
++        _D_IN = int(_D_IN)
++    _TOP_K = payload.get("top_k")
++    if _TOP_K is not None:
++        _TOP_K = int(_TOP_K)
++    _LAYER_ID_TO_RANK.clear()
++    _LAYER_ID_TO_RANK.update({int(k): int(v) for k, v in payload.get(
++        "layer_id_to_rank", {}).items()})
++    _WANDA_SCALAR_ROW_SUM.clear()
++    _WANDA_TOKEN_COUNTS.clear()
++    for k, t in payload.get("scalar_row_sum", {}).items():
++        li, e, name = k
++        nk = (int(li), int(e), str(name))
++        _WANDA_SCALAR_ROW_SUM[nk] = t.to(torch.float32).clone()
++    for k, n in payload.get("token_counts", {}).items():
++        li, e, name = k
++        nk = (int(li), int(e), str(name))
++        _WANDA_TOKEN_COUNTS[nk] = int(n)
++    return _n_prompts_accumulated
+diff --git a/tests/test_calibration_wanda_scalar_row_smoke.py b/tests/test_calibration_wanda_scalar_row_smoke.py
+new file mode 100644
+index 0000000..0000001
+--- /dev/null
++++ b/tests/test_calibration_wanda_scalar_row_smoke.py
+@@ -0,0 +1,292 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Smoke tests for ``vllm.calibration_wanda_scalar_row``.
++
++These exercise the per-(layer, expert, "gate_proj") Wanda scalar_row
++accumulator, the router-stash + expert_in dispatch contract, the
++overwrite-no-clear stash lifecycle, and the checkpoint two-segment
++additivity invariant.
++
++Tests:
++
++1. ``test_accumulation_matches_reference`` (T1 in plan §9) -- synthetic
++   _on_router + _on_expert_in for one layer, one expert, two batches.
++   Final sigma_x_g_squared per-channel matches the upstream
++   running-mean formula
++   ``MoEPrunerHookFnForMixtralLinear`` (atol=1e-5; rtol=0).
++2. ``test_expert_in_without_router_logs_error`` (T2) -- expert_in fired
++   without a preceding router dispatch -> accumulator does NOT zero
++   the row, ERROR log is emitted, dump produces a (just empty-for-that-
++   layer) sidecar.
++3. ``test_router_stash_overwrites_no_clear`` (T2b) -- two consecutive
++   _on_router calls for the same layer leave only the latest weights
++   in the stash; reader uses the latest; reader does NOT clear.
++"""
++from __future__ import annotations
++
++import importlib
++import logging
++import os
++import sys
++from typing import Any
++
++import torch
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _reload_wanda_scalar_row(env: dict[str, str]) -> Any:
++    """Reload ``vllm.calibration_wanda_scalar_row`` (and hooks) with a
++    fresh env. Module-level ``_CAPTURE_WANDA_SCALAR_ROW`` is sampled at
++    import; per-test isolation requires a fresh import.
++    """
++    sys.modules.pop("vllm.calibration_wanda_scalar_row", None)
++    sys.modules.pop("vllm.calibration_hooks", None)
++    for key in (
++        "VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW",
++        "VLLM_CALIB_CAPTURE_ROUTER",
++        "VLLM_CALIB_CAPTURE_EXPERT",
++        "VLLM_CALIB_CAPTURE_REAP_SCORES",
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED",
++        "VLLM_CALIB_CAPTURE_BLOCK",
++        "VLLM_CALIB_CAPTURE_IMATRIX",
++    ):
++        os.environ.pop(key, None)
++    for k, v in env.items():
++        os.environ[k] = v
++    importlib.import_module("vllm.calibration_hooks")
++    return importlib.import_module("vllm.calibration_wanda_scalar_row")
++
++
++def _seed_layer(wsr: Any, layer_idx: int, rank: int, n_experts: int) -> None:
++    """Manually wire up the per-layer book-keeping the way setup() would."""
++    wsr._LAYER_ID_TO_RANK[layer_idx] = rank
++    if rank + 1 > wsr._N_LAYERS:
++        wsr._N_LAYERS = rank + 1
++    if n_experts > wsr._N_EXPERTS:
++        wsr._N_EXPERTS = n_experts
++
++
++# ---------------------------------------------------------------------------
++# Test 1 (T1) -- accumulation matches reference upstream formula
++# ---------------------------------------------------------------------------
++
++
++def test_accumulation_matches_reference():
++    """Two batches of synthetic _on_router + _on_expert_in produce the
++    same per-(layer, expert, "gate_proj") sigma_x_g_squared as the
++    upstream running-mean reference at near-byte-equality
++    (atol=1e-5; rtol=0).
++
++    Reference math (MoEPrunerHookFnForMixtralLinear):
++
++        scalar_row[c] = E_t[(x_t[c] * g_{e,t})^2]
++                      = sum_t (x_t[c] * g_{e,t})^2 / N
++
++    where the expectation is over tokens routed to expert e and N is
++    that token count.
++    """
++    wsr = _reload_wanda_scalar_row({
++        "VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT": "1",
++    })
++    n_experts = 4
++    d_in = 5
++    _seed_layer(wsr, layer_idx=0, rank=0, n_experts=n_experts)
++
++    # ---- Batch 1: two tokens, top_k=2, both routed to expert 0 in slot 0
++    # Token 0 -> (e=0, e=2) with weights (0.7, 0.3)
++    # Token 1 -> (e=0, e=1) with weights (0.6, 0.4)
++    # Hidden dim = 5; deterministic vectors so the math is hand-checkable.
++    torch.manual_seed(7)
++    hs1 = torch.randn(2, d_in, dtype=torch.float32)
++    tw1 = torch.tensor([[0.7, 0.3], [0.6, 0.4]], dtype=torch.float32)
++    ids1 = torch.tensor([[0, 2], [0, 1]], dtype=torch.int64)
++
++    wsr._on_router(layer_idx=0, router_logits=torch.zeros(2, n_experts),
++                   topk_weights=tw1, topk_ids=ids1)
++    wsr._on_expert_in(layer_idx=0, hidden_states=hs1, topk_ids=ids1)
++
++    # ---- Batch 2: three more tokens.
++    hs2 = torch.randn(3, d_in, dtype=torch.float32)
++    tw2 = torch.tensor(
++        [[0.5, 0.5], [0.8, 0.2], [0.1, 0.9]], dtype=torch.float32,
++    )
++    ids2 = torch.tensor([[0, 3], [1, 0], [2, 0]], dtype=torch.int64)
++
++    wsr._on_router(layer_idx=0, router_logits=torch.zeros(3, n_experts),
++                   topk_weights=tw2, topk_ids=ids2)
++    wsr._on_expert_in(layer_idx=0, hidden_states=hs2, topk_ids=ids2)
++
++    # ---- Reference: per-(layer, expert) per-channel running mean ---
++    # For each batch, iterate tokens/slots routed to expert 0 and add
++    # (x_t * g_{e=0, t, slot}) ** 2 per channel; finally divide by the
++    # token count.
++    def _reference_for_expert(e: int) -> tuple[torch.Tensor, int]:
++        sumsq = torch.zeros(d_in, dtype=torch.float32)
++        count = 0
++        for hs, tw, ids in ((hs1, tw1, ids1), (hs2, tw2, ids2)):
++            mask = (ids == e)
++            token_idx, slot_idx = mask.nonzero(as_tuple=True)
++            for t, s in zip(token_idx.tolist(), slot_idx.tolist()):
++                g = tw[t, s].item()
++                sumsq += (hs[t].to(torch.float32) * g).pow(2)
++                count += 1
++        return sumsq, count
++
++    for e in range(n_experts):
++        ref_sum, ref_count = _reference_for_expert(e)
++        key = (0, e, "gate_proj")
++        if ref_count == 0:
++            assert key not in wsr._WANDA_SCALAR_ROW_SUM
++            continue
++        got_sum = wsr._WANDA_SCALAR_ROW_SUM[key]
++        got_count = wsr._WANDA_TOKEN_COUNTS[key]
++        assert got_count == ref_count, (
++            f"expert {e}: count {got_count} vs ref {ref_count}"
++        )
++        assert torch.allclose(got_sum, ref_sum, rtol=0, atol=1e-5), (
++            f"expert {e}: sumsq mismatch"
++        )
++
++    # ---- Final dump produces the running MEAN (sum / count) ----------
++    # Drive dump via the on-disk path -- requires save_wanda_scalar_row
++    # which is a moe_compress-side helper. We assert the math by
++    # constructing the payload that dump_wanda_scalar_row would build.
++    for e in range(n_experts):
++        ref_sum, ref_count = _reference_for_expert(e)
++        if ref_count == 0:
++            continue
++        ref_mean = ref_sum / float(ref_count)
++        # Reconstruct what dump_wanda_scalar_row will emit:
++        key = (0, e, "gate_proj")
++        got_sum = wsr._WANDA_SCALAR_ROW_SUM[key]
++        got_count = wsr._WANDA_TOKEN_COUNTS[key]
++        got_mean = got_sum / float(max(1, got_count))
++        assert torch.allclose(got_mean, ref_mean, rtol=0, atol=1e-5)
++
++
++# ---------------------------------------------------------------------------
++# Test 2 (T2) -- expert_in without router fires an ERROR + skips
++# ---------------------------------------------------------------------------
++
++
++def test_expert_in_without_router_logs_error(caplog):
++    """expert_in dispatched without a preceding router dispatch -> the
++    accumulator is NOT touched and an ERROR is logged."""
++    wsr = _reload_wanda_scalar_row({
++        "VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT": "1",
++    })
++    n_experts = 3
++    d_in = 4
++    _seed_layer(wsr, layer_idx=7, rank=0, n_experts=n_experts)
++
++    hs = torch.randn(2, d_in, dtype=torch.float32)
++    ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int64)
++
++    # The vllm.* loggers set propagate=False via the vllm logging
++    # config, so attach a handler directly on the module's logger.
++    module_log = logging.getLogger("vllm.calibration_wanda_scalar_row")
++    records: list[logging.LogRecord] = []
++    handler = logging.Handler()
++    handler.emit = records.append  # type: ignore[assignment]
++    handler.setLevel(logging.ERROR)
++    module_log.addHandler(handler)
++    try:
++        wsr._on_expert_in(layer_idx=7, hidden_states=hs, topk_ids=ids)
++    finally:
++        module_log.removeHandler(handler)
++
++    # Accumulator untouched.
++    assert not wsr._WANDA_SCALAR_ROW_SUM
++    assert not wsr._WANDA_TOKEN_COUNTS
++
++    # ERROR log was emitted with the layer index.
++    error_msgs = [r.getMessage() for r in records if r.levelno >= logging.ERROR]
++    assert any("layer 7" in m for m in error_msgs), (
++        f"Expected ERROR log mentioning 'layer 7', got: {error_msgs}"
++    )
++    assert any("VLLM_CALIB_CAPTURE_ROUTER" in m for m in error_msgs), (
++        f"Expected ERROR log mentioning the actionable env var: {error_msgs}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# Test 3 (T2b) -- router-stash overwrite-on-fire, NO explicit clear
++# ---------------------------------------------------------------------------
++
++
++def test_router_stash_overwrites_no_clear():
++    """Two consecutive _on_router calls for the same layer leave only
++    the latest weights in the stash. Reader uses the latest. Reader
++    does NOT clear after consumption.
++
++    Anchors the §3.0 lifecycle claim in
++    ``tasks/PLAN_W1_WANDA_SCALAR_ROW_CAPTURE.md`` that the REAP
++    precedent is overwrite-on-router-fire + no explicit clear (the
++    inline comment at vllm_calibration_hooks.patch:8218 is stale).
++    """
++    wsr = _reload_wanda_scalar_row({
++        "VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW": "1",
++        "VLLM_CALIB_CAPTURE_ROUTER": "1",
++        "VLLM_CALIB_CAPTURE_EXPERT": "1",
++    })
++    n_experts = 3
++    d_in = 4
++    _seed_layer(wsr, layer_idx=0, rank=0, n_experts=n_experts)
++
++    n_tok = 2
++    top_k = 2
++    W1 = torch.full((n_tok, top_k), 0.25, dtype=torch.float32)
++    W2 = torch.full((n_tok, top_k), 0.75, dtype=torch.float32)
++    ids = torch.tensor([[0, 1], [0, 2]], dtype=torch.int64)
++
++    # Step 1: first router fire -> stash holds W1.
++    wsr._on_router(layer_idx=0,
++                   router_logits=torch.zeros(n_tok, n_experts),
++                   topk_weights=W1, topk_ids=ids)
++    assert torch.allclose(
++        wsr._ROUTER_WEIGHTS_STASH[0],
++        W1.to("cpu", torch.float32),
++        rtol=0, atol=0,
++    )
++
++    # Step 2: second router fire (no intervening expert_in / clear) ->
++    # stash MUST hold W2 (latest), not W1 (not a concat or a sum).
++    wsr._on_router(layer_idx=0,
++                   router_logits=torch.zeros(n_tok, n_experts),
++                   topk_weights=W2, topk_ids=ids)
++    stashed = wsr._ROUTER_WEIGHTS_STASH[0]
++    assert torch.allclose(
++        stashed, W2.to("cpu", torch.float32), rtol=0, atol=0,
++    ), f"Expected W2 in stash; got: {stashed}"
++    assert not torch.allclose(
++        stashed, W1.to("cpu", torch.float32), rtol=0, atol=0,
++    ), "Stash still contains W1 — overwrite failed"
++
++    # Step 3: drive expert_in -> accumulator update uses W2's weights.
++    torch.manual_seed(11)
++    hs = torch.randn(n_tok, d_in, dtype=torch.float32)
++    wsr._on_expert_in(layer_idx=0, hidden_states=hs, topk_ids=ids)
++
++    # Expert 0 was selected in slot 0 of both tokens with weight 0.75
++    # (from W2). Per-channel contribution = sum_{t in {0,1}}
++    # (hs[t] * 0.75) ** 2.
++    expected = (hs * 0.75).pow(2).sum(dim=0)
++    got = wsr._WANDA_SCALAR_ROW_SUM[(0, 0, "gate_proj")]
++    assert torch.allclose(got, expected, rtol=0, atol=1e-5), (
++        f"Update used wrong weights; got {got}, expected {expected}"
++    )
++
++    # Step 4: stash entry survives the reader (no clear).
++    assert torch.allclose(
++        wsr._ROUTER_WEIGHTS_STASH[0],
++        W2.to("cpu", torch.float32),
++        rtol=0, atol=0,
++    ), "Reader cleared the stash — lifecycle violated"

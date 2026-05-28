@@ -8,11 +8,11 @@ the patch (the HF Jobs build script, the README uploaded to
 
 | Field | Value |
 |---|---|
-| Immutable tag | `calib-v2-max-layer-early-exit` |
+| Immutable tag | `calib-v2-wanda-scalar-row` |
 | Branch (active) | `feat/calibration-v2` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch line count | **10101** |
-| Patch MD5 | **`a8da5e321ac7fb30f1648fba3476bea6`** |
+| Patch line count | **10879** |
+| Patch MD5 | **`b5260160edfcf59609339f872fd7abdb`** |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -22,9 +22,9 @@ the patch (the HF Jobs build script, the README uploaded to
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: a8da5e321ac7fb30f1648fba3476bea6
+# expect: b5260160edfcf59609339f872fd7abdb
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 10101
+# expect: 10879
 
 # Re-apply against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -33,6 +33,77 @@ git apply --check /path/to/vllm_calibration_hooks.patch && echo OK
 ```
 
 ## Change log
+
+### `calib-v2-wanda-scalar-row` (current)
+
+W-1 (audit `tasks/AUDIT_CALIBRATION_COMPLETENESS_V2.md` §W-1, plan
+`tasks/PLAN_W1_WANDA_SCALAR_ROW_CAPTURE.md`). Promotes the routing-
+weighted Wanda intra-expert ``scalar_row`` signal to a cross-run
+calibration sidecar so the A0..A11 ablation grid skips the per-row
+~2× Stage-3 calibration sweep that the in-process plugin previously
+required. Expected saving: ~60 min per 12-row sweep, per
+(teacher × calibration mix) combo.
+
+- `vllm/calibration_wanda_scalar_row.py`: new module that subscribes
+  the ``router`` and ``expert_in`` calibration_hooks callbacks; stashes
+  per-layer ``topk_weights`` on the router fire (overwrite-on-fire,
+  NO explicit clear — mirrors `vllm.calibration_reap_scores` at
+  patch:8134-8473) and scatter-accumulates per-(layer, expert,
+  "gate_proj") sum-of-squares of ``(x_t * g_{e,t})`` per input
+  channel from the ``expert_in`` hook. ``dump_wanda_scalar_row``
+  divides by token counts to produce the running mean
+  ``E_t[(x_t * g_{e,t})^2]`` and writes the sidecar payload via
+  `moe_compress.utils.cached_calibration_signals.save_wanda_scalar_row`
+  (schema v1, Pattern B + Pattern O — atomic write + manifest-last).
+  ``dump_wanda_scalar_row_checkpoint`` / ``load_wanda_scalar_row_checkpoint``
+  store the RAW sum-of-squares (NOT the normalised mean) so a
+  kill-mid-calibration + resume can additively combine new chunks
+  with the saved sums (additivity invariant tested in T6 of the
+  plan).
+- ``down_proj`` is NOT captured by this writer (the ``expert_in``
+  hook fires on the pre-routing hidden state; ``down_proj`` input is
+  the post-act intermediate). The plugin's cache-MISS fallback
+  retains the in-process calibration sweep that captures both
+  matrices; cache HIT for ``gate_proj`` alone is sufficient for
+  ``gate_proj`` + ``up_proj`` scoring (D-gate-up-share). On cache
+  HIT, ``down_proj`` scoring is skipped (matches the consumer's
+  existing "no scalar_row → skip" path at
+  ``stage3/plugins/wanda_intra_expert_score.py:_compute_scores``).
+- Env-var gating: ``VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW=1`` is sampled
+  at import. Requires ``VLLM_CALIB_CAPTURE_ROUTER=1`` +
+  ``VLLM_CALIB_CAPTURE_EXPERT=1`` (so the ``expert_in`` callback
+  dispatches; NO FlashInfer requirement -- ``expert_in`` fires on
+  every MoE backend).
+
+Driver-side companion (``build_self_traces_calib_vllm.py``): new
+``--capture-wanda-scalar-row`` + ``--wanda-scalar-row-checkpoint-every-chunks``
+flags + 3 insertion points (argparse, env-gate block, setup +
+checkpoint + final-dump block).
+
+Consumer-side companion: ``Stage3WandaScalarRowCacheProvider``
+(``max_quality/src/moe_compress/stage3/plugins/wanda_scalar_row_cache.py``)
+registered in the Stage 3 ``PluginRegistry`` alongside
+``Stage3InputCovCacheProvider``. On cache HIT, populates
+``ctx["stage3.wanda_scalar_row"]`` so
+``WandaIntraExpertScorePlugin.collect_wanda_scores`` short-circuits
+its per-layer calibration sweep entirely via
+``_WandaScalarRowAccumulator.from_payload``. On cache MISS or when
+the operator opts out, the existing in-process calibration sweep
+runs unchanged (cache MISS = unchanged behaviour).
+
+Schema bump: ``SCHEMA_VERSIONS["wanda_scalar_row"]`` introduced at 1
+(new green-field signal). Manifest-LAST is REQUIRED at load time —
+missing manifest raises ``ManifestMismatchError`` (no legacy
+artifacts exist on disk, so the bare-``torch.load`` fallback would
+be dead code; L-1 plan-reviewer-v1 fold).
+
+TODO (separate branch, NOT W-1 scope): the inline comment at
+`vllm_calibration_hooks.patch:8218` in
+``vllm/calibration_reap_scores.py`` claims
+``_ROUTER_WEIGHTS_STASH: Cleared after each expert_out_unweighted
+use``, but the code does NOT clear; it just overwrites. Replace
+with ``Overwritten on next router fire; not explicitly cleared
+(per-layer dispatch order guarantees correctness)``.
 
 ### `calib-v2-stage2-profile-writer` (in-flight)
 
