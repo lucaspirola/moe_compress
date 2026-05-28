@@ -70,7 +70,6 @@ from moe_compress.utils.cached_calibration_signals import (
     save_router_logits_stats,
     save_routing_stats,
     save_stage2_profile_v3,
-    save_teacher_eval,
     sidecar_path,
 )
 
@@ -650,18 +649,14 @@ def test_block_hidden_roundtrip(tmp_path):
     assert torch.equal(loaded.hidden_states, original.hidden_states.cpu())
 
 
-def test_teacher_eval_roundtrip(tmp_path):
-    jsonl = _jsonl(tmp_path)
-    original = _make_teacher_eval()
-    save_teacher_eval(original, jsonl)
-
-    assert sidecar_path(jsonl, "teacher_eval").exists()
-    loaded = load_teacher_eval(jsonl)
-    assert loaded is not None
-    assert loaded.schema_version == SCHEMA_VERSIONS["teacher_eval"]
-    assert loaded.cache_key == original.cache_key
-    assert loaded.teacher_results == original.teacher_results
-    assert loaded.teacher_param_counts == original.teacher_param_counts
+# NIT-5 (audit/calibration-completeness): ``test_teacher_eval_roundtrip``
+# was deleted alongside the public ``save_teacher_eval`` writer. No
+# substrate tests use teacher_eval as their regression target, so unlike
+# NIT-3 / NIT-4 there is no private ``_test_save_teacher_eval`` helper to
+# introduce. The ``TeacherEvalPayload`` dataclass + ``load_teacher_eval``
+# loader are retained (and still imported above) so a future Sequence-2
+# follow-up can re-target Stage 6 through this canonical name; see the
+# OPEN-QUESTION docstring on Signal 6 in cached_calibration_signals.py.
 
 
 # ---------------------------------------------------------------------------

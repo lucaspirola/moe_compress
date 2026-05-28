@@ -1125,13 +1125,23 @@ def load_block_hidden(jsonl_path: Path, layer_idx: int) -> BlockHiddenPayload | 
 
 
 # ---------------------------------------------------------------------------
-# Signal 6: teacher_eval (eval-harness results keyed by SHA-256 cache_key).
+# Signal 6: teacher_eval (harness results keyed by SHA-256 cache_key).
+#
+# NIT-5 (audit/calibration-completeness): the ``save_teacher_eval``
+# writer was removed -- it had no production caller. Stage 6 has its
+# own teacher-eval cache mechanism at ``stage6/plugins/teacher_provider.py``
+# (``_save_teacher_cache`` writes a strong-fsync JSON file at an
+# operator-configurable path, distinct from this sidecar layout).
+#
+# OPEN-QUESTION (Sequence 2, MEDIUM-2): whether to migrate Stage 6's
+# JSON-keyed cache into ``TeacherEvalPayload`` is genuinely ambiguous --
+# the storage location semantics (operator-facing path vs sidecar-next-
+# to-jsonl) and format (human-readable JSON vs torch pickle) differ.
+# Migration was deferred; ``TeacherEvalPayload`` + ``load_teacher_eval``
+# are retained for backward-compat with any sidecars an operator may
+# have written and so a future Sequence-2 follow-up can re-target
+# Stage 6 through this canonical name.
 # ---------------------------------------------------------------------------
-def save_teacher_eval(payload: TeacherEvalPayload, jsonl_path: Path) -> None:
-    # No tensor fields; payload is purely Python-typed.
-    _atomic_torch_save(payload, sidecar_path(jsonl_path, "teacher_eval"))
-
-
 def load_teacher_eval(jsonl_path: Path) -> TeacherEvalPayload | None:
     path = _resolve_sidecar_for_load(jsonl_path, "teacher_eval")
     if path is None:
@@ -1220,7 +1230,6 @@ __all__ = [
     "load_router_kd_logits",
     "save_block_hidden",
     "load_block_hidden",
-    "save_teacher_eval",
     "load_teacher_eval",
     "BaseCacheProvider",
     "BaseLiveProvider",
