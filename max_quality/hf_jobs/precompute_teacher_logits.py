@@ -1,16 +1,36 @@
-"""Precompute Stage 5 teacher router logits — Path B for KD.
+"""Precompute Stage 5 teacher vocabulary logits — Path B for KD.
 
 Standalone HF Jobs UV script. Loads the original (uncompressed) model
 alone (no student → fits cleanly on a single A100 in BF16), runs the
-Stage 5 calibration set forward, captures pre-softmax router logits per
-layer, and writes a sidecar that Stage 5 can read instead of running the
-teacher live.
+Stage 5 calibration set forward, captures the final-layer
+**vocabulary** logits ``out.logits`` and writes a flat
+``[N_total_tokens, |V|]`` BF16 sidecar that Stage 5 can read instead of
+running the teacher live.
 
 Why this exists: Stage 5 normally holds teacher (~70 GB) + student
 (~50 GB) = ~120 GB on cuda → triggers CPU offload (5–10× slowdown).
 Path A (4-bit teacher, ~17 GB) avoids offload but at small KD-signal
 precision cost. Path B (this script) gives bit-exact teacher logits
 at the cost of a single ~45-min precompute run.
+
+CRITICAL-2 fix (Path B rewrite — 2026-05-28): the previous writer
+captured per-layer **pre-softmax router scores** (``dict[int,
+Tensor[B*T, num_experts]]``). That signal is the WRONG thing for
+Router-KD: Router-KD §5 Eq. 3 (arXiv:2603.02217) distills the
+teacher's vocabulary logits ``z_T ∈ ℝ^|V|``, not gate-level scores.
+The Stage 5 reader (``router_kd.plugins.teacher.TeacherCachePlugin``)
+correctly expects a single flat tensor ``[N*L, |V|]`` and validates
+``shape[-1] == student.config.vocab_size`` — a contract the previous
+writer violated on both shape AND signal content. Latent because every
+shipped YAML kept ``teacher_logits_cache`` commented out; first
+uncomment would AttributeError on the dict-vs-tensor mismatch.
+
+The new writer makes the on-disk contract literal:
+
+* one call ``out = teacher(input_ids=batch)`` per batch (mirrors the
+  live ``TeacherLivePlugin.provide_teacher_logits`` exactly),
+* cast ``out.logits`` to BF16 + flatten to ``[B*L, |V|]`` + CPU,
+* concatenate across batches → final tensor ``[N*L, |V|]``.
 
 Output sidecar: ``_stage5_teacher_logits.pt`` (BF16). Saved in the
 mounted bucket's ``artifacts/`` dir by default; pass ``--output`` to
@@ -20,10 +40,10 @@ can pull it.
 
 Run it:
 
-    hf jobs uv run hf_jobs/precompute_teacher_logits.py \
-        --flavor a100-large \
-        --volume hf://buckets/pirola/moe-cache:/mnt/cache \
-        --secrets HF_TOKEN \
+    hf jobs uv run hf_jobs/precompute_teacher_logits.py \\
+        --flavor a100-large \\
+        --volume hf://buckets/pirola/moe-cache:/mnt/cache \\
+        --secrets HF_TOKEN \\
         --timeout 2h
 """
 
@@ -70,9 +90,8 @@ def _main() -> int:
     code_root = Path(args.code_root).expanduser().resolve()
     sys.path.insert(0, str(code_root / "src"))
 
-    from moe_compress.utils.activation_hooks import capture_router_outputs, run_calibration
     from moe_compress.utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
-    from moe_compress.utils.model_io import iter_moe_layers, load_model
+    from moe_compress.utils.model_io import load_model
 
     # Load config (the same one Stage 5 uses).
     config_path = Path(args.config).expanduser()
@@ -153,13 +172,27 @@ def _main() -> int:
         p.requires_grad_(False)
     LOG.info("Teacher loaded in %.1fs", time.monotonic() - t_start)
 
-    teacher_refs = list(iter_moe_layers(teacher))
-    LOG.info("Teacher: %d MoE layers", len(teacher_refs))
-
-    # Per-layer accumulator. Each batch contributes a [B*T, num_experts]
-    # tensor; we concatenate across batches into one [N_total_tokens,
-    # num_experts] tensor per layer in BF16 on CPU.
-    per_layer_buffers: dict[int, list[torch.Tensor]] = {ref.layer_idx: [] for ref in teacher_refs}
+    # CRITICAL-2 fix: capture VOCABULARY logits (``out.logits``), NOT per-layer
+    # router scores. The Stage 5 reader (``TeacherCachePlugin.load_teacher_cache``,
+    # teacher.py L374-393) treats ``cache_payload["logits"]`` as a single flat
+    # tensor ``[num_samples * sequence_length, vocab_size]`` and validates
+    # ``shape[-1] == student.config.vocab_size``. We pre-allocate the destination
+    # tensor and fill it batch-by-batch — this avoids a second pass through
+    # ``torch.cat`` over a long Python list of per-batch tensors.
+    vocab_size = int(teacher.config.vocab_size)
+    seq_len = int(spec.sequence_length)
+    num_samples = int(spec.num_sequences)
+    total_tokens = num_samples * seq_len
+    LOG.info(
+        "Allocating logits buffer: [%d x %d, %d] BF16 ~= %.2f GB",
+        num_samples, seq_len, vocab_size,
+        total_tokens * vocab_size * 2 / 1e9,
+    )
+    # CPU-resident BF16 buffer — the precompute host has hundreds of GB of
+    # CPU RAM; we never need the full vocab-logit cube in VRAM simultaneously.
+    logits_buf = torch.empty(
+        (total_tokens, vocab_size), dtype=torch.bfloat16
+    )
 
     # ``device_map="auto"`` already placed teacher tensors. Calling
     # ``model.to(cuda)`` afterwards is redundant and can raise on
@@ -172,42 +205,59 @@ def _main() -> int:
     n_batches = len(batches)
     log_every = max(1, n_batches // 50)
     t0 = time.monotonic()
+    cursor = 0
     with torch.no_grad():
         for i, batch in enumerate(batches):
             batch_dev = batch.to(device)
-            with capture_router_outputs(teacher_refs) as t_out:
-                teacher(input_ids=batch_dev)
-            for li, logits_list in t_out.items():
-                if not logits_list:
-                    continue
-                # Each forward fires the hook once → list has 1 entry of
-                # shape [B*T, num_experts]. Move to CPU bf16 for storage.
-                per_layer_buffers[li].append(logits_list[-1].to(torch.bfloat16).cpu())
+            # Mirrors ``TeacherLivePlugin.provide_teacher_logits`` (teacher.py
+            # L723-726) byte-for-byte: no ``attention_mask`` (packed batches
+            # invariant — uniform length, no padding), no ``output_router_logits``
+            # request — we only want the final-layer vocabulary logits.
+            out = teacher(input_ids=batch_dev)
+            # ``out.logits`` is ``[B, L, |V|]``. Flatten the token axis and
+            # write into the pre-allocated buffer in token order. The per-token
+            # slot index at READ time is ``(epoch * num_batches + batch_index)
+            # * (B * L) + token_within_batch`` — at WRITE time epoch=0 and
+            # batches arrive in batch_index order, so a simple monotonic cursor
+            # is correct and matches the reader's token_start arithmetic
+            # (TeacherCachePlugin.provide_teacher_logits L460).
+            flat = out.logits.detach().to(torch.bfloat16).reshape(-1, vocab_size).cpu()
+            n_rows = flat.shape[0]
+            logits_buf[cursor : cursor + n_rows].copy_(flat)
+            cursor += n_rows
             if (i + 1) % log_every == 0:
                 elapsed = time.monotonic() - t0
                 eta = elapsed * (n_batches - i - 1) / (i + 1)
                 LOG.info("batch %d/%d | %.1fs elapsed, ~%.0fs ETA",
                          i + 1, n_batches, elapsed, eta)
 
-    # Concatenate per-layer buffers and serialize.
-    LOG.info("Concatenating per-layer buffers")
-    per_layer: dict[int, torch.Tensor] = {}
-    total_bytes = 0
-    for li, parts in per_layer_buffers.items():
-        if not parts:
-            continue
-        t = torch.cat(parts, dim=0).contiguous()
-        per_layer[li] = t
-        total_bytes += t.numel() * t.element_size()
-    LOG.info("Total cache size: %.2f GB across %d layers", total_bytes / 1e9, len(per_layer))
+    # Defense in depth: the reader's token-count guard (teacher.py L386-393)
+    # demands ``logits.shape[0] == num_samples * sequence_length``. Assert
+    # here so a wrong-shape sidecar is never written.
+    if cursor != total_tokens:
+        raise RuntimeError(
+            f"precompute_teacher_logits: wrote {cursor} token rows but "
+            f"expected num_samples x sequence_length = "
+            f"{num_samples} x {seq_len} = {total_tokens}. iter_batches "
+            "must produce uniform full batches; check spec_from_config + "
+            "batch_size divisibility."
+        )
+    total_bytes = logits_buf.numel() * logits_buf.element_size()
+    LOG.info(
+        "Total cache size: %.2f GB, shape=%s",
+        total_bytes / 1e9, tuple(logits_buf.shape),
+    )
 
     out_path = Path(args.output).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "logits": per_layer,
-        "num_samples": int(spec.num_sequences),
-        "sequence_length": int(spec.sequence_length),
+        # Single flat tensor [N*L, |V|] in BF16 — matches the reader contract
+        # at TeacherCachePlugin.load_teacher_cache (teacher.py L374-393).
+        "logits": logits_buf,
+        "num_samples": num_samples,
+        "sequence_length": seq_len,
         "batch_size": batch_size,
+        "vocab_size": vocab_size,
         "model": args.model,
         "calibration_seed_offset": 5,
         "format_version": 1,
@@ -238,9 +288,16 @@ def _main() -> int:
         extra_meta={
             "artifact": "stage5_teacher_logits",
             "model": args.model,
-            "num_samples": int(spec.num_sequences),
-            "sequence_length": int(spec.sequence_length),
+            "num_samples": num_samples,
+            "sequence_length": seq_len,
             "batch_size": batch_size,
+            # CRITICAL-2: surface the vocab + token-count contract in the
+            # manifest forensics block so an operator can spot a wrong-cache
+            # mismatch (e.g. cache built for a different tokenizer) without
+            # mmap-loading the .pt. Read-side validation still uses the
+            # in-payload values; this is duplicated for human inspection.
+            "vocab_size": vocab_size,
+            "total_tokens": total_tokens,
             "calibration_seed_offset": 5,
         },
         # SHA-256 of a 30 GB file is ~3-5 min on NVMe; we compute once at
