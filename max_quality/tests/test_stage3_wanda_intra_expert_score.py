@@ -63,7 +63,8 @@ def test_plugin_metadata():
     assert isinstance(plugin.provides, tuple)
     # Public output slot is in writes.
     assert "stage3.wanda_intra_expert_score" in plugin.writes
-    assert "wanda_scalar_row" in plugin.provides
+    # provides is empty — accumulator state is in-memory only, not a ctx slot.
+    assert plugin.provides == ()
 
 
 def test_plugin_has_collect_wanda_scores_hook():
@@ -300,9 +301,10 @@ def test_collect_wanda_scores_publishes_score_map(tiny_model, tmp_path):
     )
     assert n_entries > 0
 
-    # Metadata sidecar is present with format_version (Pattern B).
+    # Metadata sidecar is present; format_version lives at the sidecar
+    # payload top level (Pattern B canonical carrier), not inside metadata.
     md = ctx.get("stage3.wanda_intra_expert_metadata")
-    assert md["format_version"] == _ARTIFACT_FORMAT_VERSION
+    assert "format_version" not in md
     assert md["n_score_tensors"] == n_entries
 
 

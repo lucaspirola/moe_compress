@@ -72,9 +72,17 @@ forward cost" because the routing weights are already collected during
 the covariance pass. The current implementation runs its own calibration
 pass (mirrors ``_collect_covariances`` structure) for correctness +
 isolation; composing this accumulator with the covariance pass's
-callbacks is a future optimization. The cost is one extra forward sweep
-when the plugin is enabled (which is the same shape as covariance
-collection and therefore well-understood).
+callbacks is a future optimization.
+
+Honest cost: ~2× Stage 3 calibration wall-clock when enabled, due to a
+separate per-layer calibration sweep instead of composing with
+``_collect_covariances``. Operators opting into
+``stage3.wanda_intra_expert.enabled=True`` (e.g., for the A0..A11
+ablation grid) pay this cost on top of the existing covariance
+collection. Composition with ``_collect_covariances`` (extend it to
+accept ``extra_callbacks``) would eliminate this extra pass; deferred
+to a future PR — see
+``tasks/todo_wanda_compose_with_collect_covariances.md``.
 
 **D-fused-experts-architecture**. Upstream targets MixtralForCausalLM
 (per-expert ``nn.Linear`` triples) and DeepseekV2ForCausalLM. Our base
@@ -109,8 +117,8 @@ listing the typo + the allowed key set, so an operator's typo (e.g.
 ``enabld`` for ``enabled``) fails loud instead of silently falling
 through to default-OFF.
 
-Pattern A (registry append + opt-in)
-------------------------------------
+Opt-in gating
+-------------
 ``is_enabled`` gates on ``stage3.wanda_intra_expert.enabled`` (default
 ``False``) so the plugin is a strict no-op for every row that does not
 explicitly request it. When disabled, the registry's
@@ -389,7 +397,7 @@ class WandaIntraExpertScorePlugin:
         "stage3.wanda_intra_expert_score",
         "stage3.wanda_intra_expert_metadata",
     )
-    provides: tuple[str, ...] = ("wanda_scalar_row",)
+    provides: tuple[str, ...] = ()
 
     def is_enabled(self, config: dict) -> bool:
         """Gate on ``config["stage3"]["wanda_intra_expert"]["enabled"]``.
@@ -529,7 +537,6 @@ class WandaIntraExpertScorePlugin:
         )
 
         metadata = {
-            "format_version": _ARTIFACT_FORMAT_VERSION,
             "n_layers": len(score_map),
             "n_score_tensors": sum(
                 len(per_expert)
@@ -565,7 +572,7 @@ class WandaIntraExpertScorePlugin:
                 schema_version=_ARTIFACT_FORMAT_VERSION,
                 extra_meta={
                     "artifact": "wanda_intra_expert_score",
-                    **{k: v for k, v in metadata.items() if k != "format_version"},
+                    **metadata,
                 },
                 compute_sha256=False,
             )
