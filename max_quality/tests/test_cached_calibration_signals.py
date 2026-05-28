@@ -49,7 +49,6 @@ from moe_compress.utils.cached_calibration_signals import (
     Stage1PerExpertMaxPayload,
     Stage2ProfilePayloadV3,
     Stage2ReapPayload,
-    TeacherEvalPayload,
     load_block_hidden,
     load_covariance,
     load_output_reservoir,
@@ -60,7 +59,6 @@ from moe_compress.utils.cached_calibration_signals import (
     load_routing_stats,
     load_router_kd_logits,
     load_stage2_profile_v3,
-    load_teacher_eval,
     router_kd_logits_dir,
     save_block_hidden,
     save_covariance,
@@ -245,13 +243,11 @@ def _make_block_hidden(layer_idx: int = 7, n_tokens: int = 5, hidden: int = 8) -
     )
 
 
-def _make_teacher_eval() -> TeacherEvalPayload:
-    return TeacherEvalPayload(
-        schema_version=SCHEMA_VERSIONS["teacher_eval"],
-        cache_key="0" * 64,  # SHA-256 hex placeholder
-        teacher_results={"piqa": {"acc": 0.81}},
-        teacher_param_counts={"total": 30_000_000_000},
-    )
+# NIT-5 (audit/calibration-completeness): ``_make_teacher_eval`` was
+# deleted alongside ``test_teacher_eval_roundtrip``. Re-introduce when a
+# future Sequence-2 follow-up re-targets Stage 6 through the canonical
+# ``TeacherEvalPayload`` shape (see the dataclass docstring in
+# cached_calibration_signals.py for the OPEN-QUESTION resolution paths).
 
 
 def _jsonl(tmp_path: Path) -> Path:
@@ -654,9 +650,10 @@ def test_block_hidden_roundtrip(tmp_path):
 # substrate tests use teacher_eval as their regression target, so unlike
 # NIT-3 / NIT-4 there is no private ``_test_save_teacher_eval`` helper to
 # introduce. The ``TeacherEvalPayload`` dataclass + ``load_teacher_eval``
-# loader are retained (and still imported above) so a future Sequence-2
-# follow-up can re-target Stage 6 through this canonical name; see the
-# OPEN-QUESTION docstring on Signal 6 in cached_calibration_signals.py.
+# loader remain defined in cached_calibration_signals.py (and are still
+# exported in its ``__all__``) so a future Sequence-2 follow-up can
+# re-target Stage 6 through this canonical name; see the OPEN-QUESTION
+# docstring on Signal 6 there.
 
 
 # ---------------------------------------------------------------------------
