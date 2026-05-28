@@ -738,15 +738,17 @@ class RCOBudgetPlugin:
         global_budget: float,
         L: int,
         K_max: int,
+        weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """β-bisection init.
 
         Mirrors ``src/search/quant.py::InterpolatedModel.init_alpha_to_bits``
         (upstream lines 302-327): bisect ``β ∈ [-10, 10]`` such that
-        ``E[budget] = Σ_l Σ_k softmax(-β·c_l)_k · c_lk`` equals the
-        target. With identical cost rows the upstream code sets the same
-        per-row logits for every group; we generalise to per-row costs
-        (our cost_grid may differ per layer when option grids differ).
+        ``E[budget] = Σ_l w_l · Σ_k softmax(-β·c_l)_k · c_lk`` equals
+        the target. With identical cost rows the upstream code sets the
+        same per-row logits for every group; we generalise to per-row
+        costs (our cost_grid may differ per layer when option grids
+        differ).
 
         100 bisection iterations matches upstream (`for _ in range(100)`).
         """
@@ -754,12 +756,15 @@ class RCOBudgetPlugin:
         hi = 10.0
 
         def expected_budget(beta_val: float) -> float:
-            # softmax(-β·c) per row, then Σ_l Σ_k p_lk · c_lk.
+            # softmax(-β·c) per row, then Σ_l w_l · Σ_k p_lk · c_lk.
             logits = -beta_val * cost_grid
             very_neg = torch.full_like(logits, -1e9)
             logits = torch.where(mask > 0, logits, very_neg)
             p = self._masked_softmax(logits, mask)
-            return float((p * cost_grid).sum().item())
+            row_sums = (p * cost_grid).sum(dim=1)
+            if weights is not None:
+                return float((row_sums * weights).sum().item())
+            return float(row_sums.sum().item())
 
         for _ in range(100):
             mid = 0.5 * (lo + hi)
@@ -794,10 +799,14 @@ class RCOBudgetPlugin:
         alpha: torch.Tensor,
         cost_grid: torch.Tensor,
         mask: torch.Tensor,
+        weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Gradient of the constraint C(α) = Σ_l ⟨p_l, c_l⟩ w.r.t. α.
+        """Gradient of the constraint C(α) = Σ_l w_l · ⟨p_l, c_l⟩ w.r.t. α.
 
-        ``n_lk = p_lk · (c_lk − E_p[c_l])`` where ``E_p[c_l] = Σ_k p_lk · c_lk``.
+        ``n_lk = w_l · p_lk · (c_lk − E_p[c_l])`` where
+        ``E_p[c_l] = Σ_k p_lk · c_lk``. Mirrors upstream
+        ``src/manifold.py::budget_normal`` (lines 32-45) including the
+        optional ``weights`` parameter.
 
         Derivation (paper §2 Prop. 2): applying the softmax Jacobian
         ``∂p_lj/∂α_lk = p_lj·(δ_jk − p_lk)`` to ``Σ_j p_lj·c_lj`` collapses to
@@ -811,7 +820,10 @@ class RCOBudgetPlugin:
         """
         p = self._masked_softmax(alpha, mask)
         e_c = (p * cost_grid).sum(dim=1, keepdim=True)
-        return p * (cost_grid - e_c) * mask
+        n = p * (cost_grid - e_c) * mask
+        if weights is not None:
+            n = n * weights.unsqueeze(-1)
+        return n
 
     @staticmethod
     def _project_off_normal(
@@ -838,15 +850,18 @@ class RCOBudgetPlugin:
         alpha: torch.Tensor,
         cost_grid: torch.Tensor,
         mask: torch.Tensor,
+        weights: torch.Tensor | None = None,
     ) -> float:
-        """Return ``C(α) = Σ_l Σ_k softmax(α_l)_k · c_lk``.
+        """Return ``C(α) = Σ_l w_l · Σ_k softmax(α_l)_k · c_lk``.
 
         Mirrors upstream ``src/manifold.py::retraction`` inner ``C(shift)``
-        (line 83-88). When per-group weights are wired (Item 1) the
-        sum becomes weighted; for now ``w_i = 1``.
+        (lines 83-88) including the optional per-group ``weights``.
         """
         p = self._masked_softmax(alpha, mask)
-        return float((p * cost_grid).sum().item())
+        row = (p * cost_grid).sum(dim=1)
+        if weights is not None:
+            return float((row * weights).sum().item())
+        return float(row.sum().item())
 
     def _budget_residual(
         self,
@@ -854,9 +869,13 @@ class RCOBudgetPlugin:
         cost_grid: torch.Tensor,
         mask: torch.Tensor,
         global_budget: float,
+        weights: torch.Tensor | None = None,
     ) -> float:
         """Compute ``C(α) − B``; thin wrapper for legacy test names."""
-        return self._soft_budget(alpha, cost_grid, mask) - float(global_budget)
+        return (
+            self._soft_budget(alpha, cost_grid, mask, weights)
+            - float(global_budget)
+        )
 
     def _retract(
         self,
@@ -864,11 +883,13 @@ class RCOBudgetPlugin:
         cost_grid: torch.Tensor,
         mask: torch.Tensor,
         global_budget: float,
+        weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Bisect a scalar shift ``c`` so that ``C(α + c·costs) = B``.
 
         Verbatim port of upstream ``src/manifold.py::retraction`` (lines
-        68-118): positive-shift convention ``α ← α + c · costs``.
+        68-118): positive-shift convention ``α ← α + c · costs``, with
+        the optional per-group ``weights`` parameter passed through.
         Since ``softmax(α + c·costs)`` weights options by ``exp(c·c_lk)``,
         increasing ``c`` shifts probability mass toward HIGH-cost options
         ⇒ ``C(α + c·costs)`` is monotonically NON-DECREASING in ``c``.
@@ -880,7 +901,9 @@ class RCOBudgetPlugin:
         3. Apply the final ``c = 0.5·(lo + hi)`` shift in place.
         """
         def C(shift: float) -> float:
-            return self._soft_budget(alpha + shift * cost_grid, cost_grid, mask)
+            return self._soft_budget(
+                alpha + shift * cost_grid, cost_grid, mask, weights
+            )
 
         cur = C(0.0)
         if abs(cur - float(global_budget)) < _BISECT_TOL:

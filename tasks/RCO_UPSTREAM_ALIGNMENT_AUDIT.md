@@ -16,11 +16,11 @@ Definitions:
 
 **Upstream**: `src/manifold.py:32-45` (`budget_normal`), 48-65 (`project_gradient`), 68-118 (`retraction`), 121-145 (`vector_transport`). Each accepts `weights: Optional[torch.Tensor]`; the budget formula is `C(α) = Σ_i w_i · Σ_k p_ik · c_k`. In `src/search/quant.py:329-332` the weights are `group_param_fracs` (per-group parameter-count fraction).
 
-**Ours**: No `weights` parameter in `_constraint_normal`, `_project_off_normal`, `_retract`, `_budget_residual`. Implicit `w_i = 1`.
+Critically: **upstream's prune.py (MoE expert pruning, our case) calls every manifold primitive WITHOUT weights** (lines 724, 734, 739): `project_gradient(alpha, costs)`, `retraction(alpha, costs, target_budget)`, `vector_transport(optimizer, alpha, costs)`. Only the quant case in `quant.py` passes `group_param_fracs`.
 
-**Verdict**: **ALIGN**. Add optional `weights` parameter to all manifold primitives. For our MoE expert-pruning use, derive `w_i` as the per-layer **MoE parameter count** (sum of expert weights = `num_experts × hidden_size × moe_intermediate_size × 3` for gate+up+down). The orchestrator exposes the `model` slot in ctx; we add a `_layer_param_counts` helper and pass `weights` shaped `[L]` into the primitives.
+**Ours**: No `weights` parameter in `_constraint_normal`, `_project_off_normal`, `_retract`, `_budget_residual`. Implicit `w_i = 1` — matches `prune.py` behavior exactly.
 
-If `model` is absent (unit-test path), pass `weights=None` and treat as ones (back-compat).
+**Verdict**: **ALIGN (partial)**. Add optional `weights` parameter to all manifold primitives so the API surface matches upstream (allows future quant-style use). For the MoE-pruning case, leave `weights=None` (uniform) — this matches `prune.py` verbatim. No new ctx slot is required.
 
 ---
 
