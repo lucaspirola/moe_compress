@@ -69,7 +69,6 @@ from moe_compress.utils.cached_calibration_signals import (
     save_reap_scores,
     save_router_logits_stats,
     save_routing_stats,
-    save_router_kd_logits,
     save_stage2_profile_v3,
     save_teacher_eval,
     sidecar_path,
@@ -203,6 +202,37 @@ def _make_router_kd(attempt_idx: int = 42, n_tokens: int = 4, top_k: int = 3) ->
         attempt_idx=attempt_idx,
         top_k=top_k,
     )
+
+
+def _test_save_router_kd_logits(
+    payload: RouterKDLogitsPayload, jsonl_path: Path,
+) -> None:
+    """Test-local stand-in for the deleted public ``save_router_kd_logits``
+    writer.
+
+    NIT-4 (audit/calibration-completeness): the production writer
+    ``save_router_kd_logits`` was removed -- production .npz shards are
+    written directly by ``build_self_traces_calib_vllm.py`` in a
+    streaming-writer pattern (see audit row C.3), and nothing in the
+    repo called the public helper. ``RouterKDLogitsPayload`` +
+    ``load_router_kd_logits`` are retained for legacy read support and
+    are exercised below via this private helper. Mirrors the deleted
+    writer byte-for-byte (same arrays dict, same path derivation, same
+    atomic-npz contract).
+    """
+    from moe_compress.utils.cached_calibration_signals import (
+        _atomic_npz_save as _ccs_atomic_npz_save,
+    )
+    arrays = {
+        "schema_version": np.int32(payload.schema_version),
+        "token_ids": payload.token_ids,
+        "top_ids": payload.top_ids,
+        "top_logprobs": payload.top_logprobs,
+        "attempt_idx": np.int64(payload.attempt_idx),
+        "top_k": np.int32(payload.top_k),
+    }
+    path = router_kd_logits_dir(jsonl_path) / f"{payload.attempt_idx:07d}.npz"
+    _ccs_atomic_npz_save(arrays, path)
 
 
 def _make_block_hidden(layer_idx: int = 7, n_tokens: int = 5, hidden: int = 8) -> BlockHiddenPayload:
@@ -592,29 +622,11 @@ def test_covariance_roundtrip(tmp_path):
         assert torch.equal(t, original.sigma_in[key].cpu().to(torch.float16))
 
 
-def test_router_kd_logits_roundtrip(tmp_path):
-    jsonl = _jsonl(tmp_path)
-    original = _make_router_kd(attempt_idx=42)
-    save_router_kd_logits(original, jsonl)
-
-    # Sharded .npz lives at sidecars/router_kd_logits/0000042.npz.
-    expected_path = router_kd_logits_dir(jsonl) / "0000042.npz"
-    assert expected_path.exists()
-    # No double-extension (.npz.tmp.npz) or orphaned tmp.
-    assert not Path(str(expected_path) + ".tmp").exists()
-    assert not expected_path.with_suffix(".npz.npz").exists()
-
-    loaded = load_router_kd_logits(jsonl, attempt_idx=42)
-    assert loaded is not None
-    assert loaded.schema_version == SCHEMA_VERSIONS["router_kd_logits"]
-    assert loaded.attempt_idx == 42
-    assert loaded.top_k == original.top_k
-    np.testing.assert_array_equal(loaded.token_ids, original.token_ids)
-    np.testing.assert_array_equal(loaded.top_ids, original.top_ids)
-    np.testing.assert_array_equal(loaded.top_logprobs, original.top_logprobs)
-
-    # Different attempt_idx: clean miss.
-    assert load_router_kd_logits(jsonl, attempt_idx=99) is None
+# NIT-4 (audit/calibration-completeness): ``test_router_kd_logits_roundtrip``
+# was deleted alongside the public ``save_router_kd_logits`` writer.
+# ``load_router_kd_logits`` remains under test via the F-H-7 backward-compat
+# router_kd suite below and the schema-mismatch substrate test (which now
+# writes via the private ``_test_save_router_kd_logits`` helper).
 
 
 def test_block_hidden_roundtrip(tmp_path):
@@ -677,7 +689,7 @@ def test_schema_version_mismatch_raises(tmp_path, monkeypatch):
     assert "Delete the sidecar to regenerate" in msg
 
     # The npz path also enforces schema versioning.
-    save_router_kd_logits(_make_router_kd(attempt_idx=3), jsonl)
+    _test_save_router_kd_logits(_make_router_kd(attempt_idx=3), jsonl)
     bumped["router_kd_logits"] = 2
     monkeypatch.setattr(
         "moe_compress.utils.cached_calibration_signals.SCHEMA_VERSIONS",
@@ -1055,7 +1067,6 @@ def test_fh7_router_kd_legacy_single_stem_one_shot_warn(tmp_path, caplog):
         RouterKDLogitsPayload,
         SCHEMA_VERSIONS,
         _legacy_router_kd_logits_dir,
-        save_router_kd_logits,
     )
 
     ccs._already_warned_legacy_paths.clear()
@@ -1071,9 +1082,9 @@ def test_fh7_router_kd_legacy_single_stem_one_shot_warn(tmp_path, caplog):
         attempt_idx=7,
         top_k=3,
     )
-    # Use the public writer to create a *new-namespaced* shard, then
+    # Use the test-local writer to create a *new-namespaced* shard, then
     # move it to the legacy location.
-    save_router_kd_logits(payload, jsonl)
+    _test_save_router_kd_logits(payload, jsonl)
     new_shard = router_kd_logits_dir(jsonl) / "0000007.npz"
     assert new_shard.exists()
     legacy_dir = _legacy_router_kd_logits_dir(jsonl)

@@ -1041,20 +1041,15 @@ def load_covariance(jsonl_path: Path) -> CovariancePayload | None:
 
 # ---------------------------------------------------------------------------
 # Signal 4: router_kd_logits (per-attempt-idx .npz shards).
+#
+# NIT-4 (audit/calibration-completeness): the ``save_router_kd_logits``
+# writer was removed -- it had no production caller (production .npz
+# shards are written directly by ``build_self_traces_calib_vllm.py`` in
+# a streaming-writer pattern; see audit row C.3). ``RouterKDLogitsPayload``
+# + ``load_router_kd_logits`` are RETAINED for backward-compat reads of
+# the shards an operator may have on disk (also exercised by the F-H-7
+# router_kd backward-compat test in ``test_cached_calibration_signals.py``).
 # ---------------------------------------------------------------------------
-def save_router_kd_logits(payload: RouterKDLogitsPayload, jsonl_path: Path) -> None:
-    arrays = {
-        "schema_version": np.int32(payload.schema_version),
-        "token_ids": payload.token_ids,
-        "top_ids": payload.top_ids,
-        "top_logprobs": payload.top_logprobs,
-        "attempt_idx": np.int64(payload.attempt_idx),
-        "top_k": np.int32(payload.top_k),
-    }
-    path = router_kd_logits_dir(jsonl_path) / f"{payload.attempt_idx:07d}.npz"
-    _atomic_npz_save(arrays, path)
-
-
 def load_router_kd_logits(jsonl_path: Path, attempt_idx: int) -> RouterKDLogitsPayload | None:
     path = router_kd_logits_dir(jsonl_path) / f"{attempt_idx:07d}.npz"
     if not path.exists():
@@ -1222,7 +1217,6 @@ __all__ = [
     "load_output_reservoir",
     "save_covariance",
     "load_covariance",
-    "save_router_kd_logits",
     "load_router_kd_logits",
     "save_block_hidden",
     "load_block_hidden",
