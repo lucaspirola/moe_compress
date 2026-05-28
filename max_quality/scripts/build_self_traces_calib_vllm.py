@@ -835,26 +835,27 @@ def main() -> int:
                         "to regenerate'.")
     # CRITICAL-1: vLLM `layer_in` hook landing -- writer subscription
     # populates the previously-empty layer_input_reservoir field of the
-    # stage2_profile sidecar. Default OFF until the hook is validated on
-    # a smoke run; flip ON in a follow-up commit (per plan §3.c).
+    # stage2_profile sidecar. Production default flipped to ON after
+    # the hook landed in the preceding commit (per plan §3.c / user
+    # OQ Q3 = same-branch follow-up commit).
     p.add_argument("--capture-layer-input-reservoir",
-                   action="store_true", default=False,
+                   action=argparse.BooleanOptionalAction, default=True,
                    help="When --capture-stage2-profile is set, ALSO "
                         "populate the layer_input_reservoir field of "
                         "the stage2_profile sidecar. Requires the vLLM "
                         "patch's layer_in hook (vllm.calibration_hooks "
                         "VALID_HOOK_NAMES). Auto-enables "
                         "VLLM_CALIB_CAPTURE_LAYER_IN=1 BEFORE any vllm "
-                        "import. Default OFF (matches current "
-                        "production behavior -- empty (0, 0) "
-                        "placeholders). Flip ON once the layer_in hook "
-                        "is validated on a smoke run; the next "
-                        "production calibration run with this flag "
-                        "emits a fully-populated stage2_profile sidecar "
-                        "that unblocks SC cost_alignment='output' "
-                        "full-hit path (Plugin #12 + Plugin #1 combined "
-                        "~37-57 min/SC row saved per PLAN_PLUGIN_14 §5 "
-                        "row 1).")
+                        "import. Default ON (post-CRITICAL-1 production "
+                        "flip): the layer_in hook is now part of the "
+                        "patch and the writer subscribes via "
+                        "_layer_in_handler. Use "
+                        "--no-capture-layer-input-reservoir to opt out "
+                        "(e.g. to reproduce the legacy empty-placeholder "
+                        "sidecar shape for back-compat experiments). "
+                        "Unblocks SC cost_alignment='output' full-hit "
+                        "path (Plugin #12 + Plugin #1 combined ~37-57 "
+                        "min/SC row saved per PLAN_PLUGIN_14 §5 row 1).")
     p.add_argument("--capture-per-expert-max", action="store_true",
                    default=False,
                    help="Capture per-(layer, expert) down_proj output max "
@@ -1154,15 +1155,23 @@ def main() -> int:
     # once at module import with ``os.getenv(...) == "1"``.
     if args.capture_layer_input_reservoir:
         if not args.capture_stage2_profile:
-            raise SystemExit(
-                "--capture-layer-input-reservoir requires "
-                "--capture-stage2-profile (the layer_input_reservoir "
-                "field lives inside the stage2_profile sidecar)."
+            # Post-CRITICAL-1 production flip: the flag defaults ON.
+            # Runs that don't capture stage2_profile have nothing to
+            # populate, so silently no-op instead of raising
+            # SystemExit (which would break every legacy invocation
+            # that didn't pass --capture-stage2-profile).
+            log.debug(
+                "--capture-layer-input-reservoir is on (default) but "
+                "--capture-stage2-profile is off; no-op "
+                "(layer_input_reservoir lives inside the stage2_profile "
+                "sidecar). Pass --no-capture-layer-input-reservoir to "
+                "suppress this message."
             )
-        os.environ["VLLM_CALIB_CAPTURE_LAYER_IN"] = "1"
-        log.info("--capture-layer-input-reservoir: enabled "
-                 "VLLM_CALIB_CAPTURE_LAYER_IN=1 "
-                 "(must precede vllm import)")
+        else:
+            os.environ["VLLM_CALIB_CAPTURE_LAYER_IN"] = "1"
+            log.info("--capture-layer-input-reservoir: enabled "
+                     "VLLM_CALIB_CAPTURE_LAYER_IN=1 "
+                     "(must precede vllm import)")
 
     # Pre-import env gates for the router-logits-stats path. Same strict-
     # string rule: vllm.calibration_hooks samples these once at module
