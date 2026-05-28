@@ -1097,10 +1097,14 @@ class RCOBudgetPlugin:
                 raise ValueError(
                     f"RCO DP: no feasible budget assignment for global_budget={B}."
                 )
-            chosen_B = min(feasible, key=lambda b: (abs(b - B), -b))
+            # Lower-budget tiebreak matches upstream
+            # src/search/quant.py:411-419 (`for delta: [budget - delta,
+            # budget + delta]` checks the LOWER side first, so ties
+            # resolve to the smaller budget).
+            chosen_B = min(feasible, key=lambda b: (abs(b - B), b))
             log.warning(
                 "RCO DP: global_budget %d infeasible; falling back to nearest "
-                "feasible budget %d (larger-budget tiebreak).", B, chosen_B,
+                "feasible budget %d (lower-budget tiebreak).", B, chosen_B,
             )
             # Use the extended DP table for backtracking.
             best = best_ext
