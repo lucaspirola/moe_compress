@@ -128,6 +128,17 @@ D-dp-damage-not-logp
     The two formulations differ only in input form; the polarity is
     consistent given our damage-curve signal.
 
+D-dp-search-supra-budget
+    When the requested ``global_budget`` falls outside the feasibility
+    range, our infeasibility-fallback DP extends the table to
+    ``B_max = Σ_l max(opts_l)`` and picks
+    ``min(feasible, key=(|b-B|, b))`` over the full range. Upstream
+    (``src/search/quant.py:412-420``) caps the DP at ``budget`` and
+    only searches ``[budget - delta, budget + delta]`` within
+    ``[0, budget]`` — i.e. lower-side only. The generalisation matters
+    when the feasible set has no entry below ``B`` but does have one
+    above; rare in practice but visible on degenerate inputs.
+
 D-disabled-default
     Gated default OFF behind ``stage1.rco_budget.enabled``. Every
     non-S1_RCO row stays byte-identical to pre-plugin-11 main.
@@ -259,6 +270,8 @@ class RCOBudgetPlugin:
     - **D-floor-projection** — floor baked into the option grid
     - **D-ragged-K** — per-layer K varies, padded with mask
     - **D-dp-damage-not-logp** — DP score is damage (input form, not polarity)
+    - **D-dp-search-supra-budget** — infeasibility-fallback DP searches
+      ``[0, B_max]`` (vs upstream's ``[0, budget]`` lower-side-only)
     - **D-disabled-default** — opt-in via ``stage1.rco_budget.enabled``
     - **D-no-router-prior** — β-bisection init (upstream's default branch)
 
@@ -282,6 +295,8 @@ class RCOBudgetPlugin:
         "D-ragged-K (per-layer K varies, padded with a mask), "
         "D-dp-damage-not-logp (DP minimises damage, upstream maximises log-prob; "
         "input form differs, polarity consistent), "
+        "D-dp-search-supra-budget (infeasibility-fallback DP searches [0, B_max]; "
+        "upstream caps at [0, budget] lower-side-only — quant.py:412-420), "
         "D-disabled-default (opt-in via stage1.rco_budget.enabled), "
         "D-no-router-prior (β-bisection init; upstream's router-prior variant "
         "is out of scope). "
@@ -518,9 +533,11 @@ class RCOBudgetPlugin:
             # Retract onto the manifold (1-D bisection along cost direction).
             alpha = self._retract(alpha, cost_grid, mask, global_budget)
 
-            # Vector transport — m only (D-adam-no-v-transport, plan §1.2
-            # Primitive 4). Re-project Adam's first moment onto the new
-            # tangent plane; second moment ``v_buf`` is left untouched.
+            # Vector transport — first moment only (upstream parity:
+            # src/manifold.py:121-145 also leaves the second moment ``v``
+            # untouched, since ``v`` is a variance estimate without a
+            # direction to transport). Re-project Adam's first moment onto
+            # the new tangent plane after retraction.
             normal_new = self._constraint_normal(alpha, cost_grid, mask)
             m_buf = self._project_off_normal(m_buf, normal_new, mask)
 

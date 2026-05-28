@@ -871,16 +871,19 @@ def test_anneal_endpoints():
 
 
 def test_adam_v_buf_transport_policy():
-    """F13: D-adam-no-v-transport.
+    """F13: vector transport — first moment only (upstream parity).
 
-    After one outer step + retract, the first moment ``m`` (transported)
-    has ``⟨m, n_new⟩ ≈ 0``; the second moment ``v`` (NOT transported)
-    in general does NOT satisfy this.
+    Pin the upstream-conformant transport policy from ``src/manifold.py:121-145``:
+    after one outer step + retract, the first moment ``m`` (transported via
+    ``_project_off_normal``) satisfies ``⟨m, n_new⟩ ≈ 0`` on the new tangent
+    plane; the second moment ``v`` (deliberately NOT transported, since it's
+    a directionless variance estimate) in general does NOT satisfy this.
 
     Strategy: run a single Adam step with synthetic m, v populated, then
     check (m_after, v_after) against the new normal n_new directly. The
     plugin's main loop transports m via ``_project_off_normal`` and
-    leaves v as-is; we replicate that here.
+    leaves v as-is — matching upstream's manifold update; we replicate
+    that here.
 
     Setup uses a mild α + cost_grid that lets retraction find a clean
     bisection bracket (so n_new is well-conditioned).
