@@ -646,6 +646,175 @@ def test_block_hidden_roundtrip(tmp_path):
     assert torch.equal(loaded.hidden_states, original.hidden_states.cpu())
 
 
+# ---------------------------------------------------------------------------
+# S-1 Pattern O writer-side tests — each save_* must emit a sibling
+# MANIFEST.json carrying schema_version, payload_name, size_bytes, and
+# extra.artifact. Pattern mirrored from test_stage3_originals_manifest.py
+# (Stage 3) and test_stage5_teacher_logits_manifest.py (Stage 5).
+# ---------------------------------------------------------------------------
+def _read_manifest(payload_path: Path) -> dict:
+    """Read the sibling MANIFEST.json next to a payload.
+
+    Helper for the Pattern O writer-side tests — same naming convention
+    as ``_manifest_path_for`` in cached_calibration_signals.py.
+    """
+    import json as _json
+    manifest_path = Path(str(payload_path) + ".MANIFEST.json")
+    assert manifest_path.exists(), f"manifest missing at {manifest_path}"
+    return _json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def _assert_manifest_well_formed(
+    payload_path: Path, signal_name: str,
+) -> dict:
+    """Assert the manifest at <payload>.MANIFEST.json is well-formed.
+
+    Shared assertion bundle for every per-pair writer test:
+    * file exists alongside the payload
+    * schema_version == SCHEMA_VERSIONS[signal_name]
+    * payload_name == basename of the payload on disk
+    * size_bytes == payload's actual size
+    * extra.artifact == signal_name
+    * sha256 == None (compute_sha256=False contract — plan §3.4)
+    Returns the parsed manifest dict so individual tests can do more
+    targeted checks on top.
+    """
+    manifest = _read_manifest(payload_path)
+    assert manifest["schema_version"] == SCHEMA_VERSIONS[signal_name]
+    assert manifest["payload_name"] == payload_path.name
+    assert manifest["size_bytes"] == payload_path.stat().st_size
+    assert manifest["sha256"] is None, (
+        "Pattern O calibration sidecars MUST use compute_sha256=False "
+        "(see plan §3.4 SHA-256 policy)"
+    )
+    assert manifest.get("extra", {}).get("artifact") == signal_name
+    return manifest
+
+
+def test_stage2_profile_manifest_roundtrip(tmp_path):
+    """save_stage2_profile_v3 emits a sibling manifest carrying the v3
+    schema_version, the payload's name + size, and extra.artifact —
+    AND read_and_validate_manifest accepts the pair (manifest-last
+    invariant)."""
+    from moe_compress.utils.atomic_io import read_and_validate_manifest
+
+    jsonl = _jsonl(tmp_path)
+    save_stage2_profile_v3(_make_stage2_profile(), jsonl)
+    payload_path = sidecar_path(jsonl, "stage2_profile")
+    assert payload_path.exists()
+    manifest = _assert_manifest_well_formed(payload_path, "stage2_profile")
+    # The .MANIFEST.json validates against the payload via the canonical
+    # read+validate helper (Pattern O contract).
+    read_and_validate_manifest(
+        payload_path,
+        Path(str(payload_path) + ".MANIFEST.json"),
+        expected_schema_version=manifest["schema_version"],
+    )
+
+
+def test_reap_scores_manifest_roundtrip(tmp_path):
+    from moe_compress.utils.atomic_io import read_and_validate_manifest
+
+    jsonl = _jsonl(tmp_path)
+    save_reap_scores(_make_reap_scores(), jsonl)
+    payload_path = sidecar_path(jsonl, "reap_scores")
+    manifest = _assert_manifest_well_formed(payload_path, "reap_scores")
+    read_and_validate_manifest(
+        payload_path,
+        Path(str(payload_path) + ".MANIFEST.json"),
+        expected_schema_version=manifest["schema_version"],
+    )
+
+
+def test_per_expert_max_manifest_roundtrip(tmp_path):
+    from moe_compress.utils.atomic_io import read_and_validate_manifest
+
+    jsonl = _jsonl(tmp_path)
+    save_per_expert_max(_make_per_expert_max(), jsonl)
+    payload_path = sidecar_path(jsonl, "per_expert_max")
+    manifest = _assert_manifest_well_formed(payload_path, "per_expert_max")
+    read_and_validate_manifest(
+        payload_path,
+        Path(str(payload_path) + ".MANIFEST.json"),
+        expected_schema_version=manifest["schema_version"],
+    )
+
+
+def test_routing_stats_manifest_roundtrip(tmp_path):
+    from moe_compress.utils.atomic_io import read_and_validate_manifest
+
+    jsonl = _jsonl(tmp_path)
+    save_routing_stats(_make_routing_stats(), jsonl)
+    payload_path = sidecar_path(jsonl, "routing_stats")
+    manifest = _assert_manifest_well_formed(payload_path, "routing_stats")
+    read_and_validate_manifest(
+        payload_path,
+        Path(str(payload_path) + ".MANIFEST.json"),
+        expected_schema_version=manifest["schema_version"],
+    )
+
+
+def test_router_logits_stats_manifest_roundtrip(tmp_path):
+    from moe_compress.utils.atomic_io import read_and_validate_manifest
+
+    jsonl = _jsonl(tmp_path)
+    save_router_logits_stats(_make_router_logits_stats(), jsonl)
+    payload_path = sidecar_path(jsonl, "router_logits_stats")
+    manifest = _assert_manifest_well_formed(payload_path, "router_logits_stats")
+    read_and_validate_manifest(
+        payload_path,
+        Path(str(payload_path) + ".MANIFEST.json"),
+        expected_schema_version=manifest["schema_version"],
+    )
+
+
+def test_output_reservoir_manifest_roundtrip(tmp_path):
+    from moe_compress.utils.atomic_io import read_and_validate_manifest
+
+    jsonl = _jsonl(tmp_path)
+    save_output_reservoir(_make_output_reservoir(), jsonl)
+    payload_path = sidecar_path(jsonl, "output_reservoir")
+    manifest = _assert_manifest_well_formed(payload_path, "output_reservoir")
+    read_and_validate_manifest(
+        payload_path,
+        Path(str(payload_path) + ".MANIFEST.json"),
+        expected_schema_version=manifest["schema_version"],
+    )
+
+
+def test_covariance_manifest_roundtrip(tmp_path):
+    from moe_compress.utils.atomic_io import read_and_validate_manifest
+
+    jsonl = _jsonl(tmp_path)
+    save_covariance(_make_covariance(), jsonl)
+    payload_path = sidecar_path(jsonl, "covariance")
+    manifest = _assert_manifest_well_formed(payload_path, "covariance")
+    read_and_validate_manifest(
+        payload_path,
+        Path(str(payload_path) + ".MANIFEST.json"),
+        expected_schema_version=manifest["schema_version"],
+    )
+
+
+def test_block_hidden_manifest_roundtrip(tmp_path):
+    """save_block_hidden emits a PER-LAYER manifest at
+    ``block_hidden/layer_NNNN.pt.MANIFEST.json``."""
+    from moe_compress.utils.atomic_io import read_and_validate_manifest
+
+    jsonl = _jsonl(tmp_path)
+    payload = _make_block_hidden(layer_idx=7)
+    save_block_hidden(payload, jsonl)
+    payload_path = (
+        tmp_path / "sidecars" / jsonl.stem / "block_hidden" / "layer_0007.pt"
+    )
+    manifest = _assert_manifest_well_formed(payload_path, "block_hidden")
+    read_and_validate_manifest(
+        payload_path,
+        Path(str(payload_path) + ".MANIFEST.json"),
+        expected_schema_version=manifest["schema_version"],
+    )
+
+
 # NIT-5 (audit/calibration-completeness): ``test_teacher_eval_roundtrip``
 # was deleted alongside the public ``save_teacher_eval`` writer. No
 # substrate tests use teacher_eval as their regression target, so unlike

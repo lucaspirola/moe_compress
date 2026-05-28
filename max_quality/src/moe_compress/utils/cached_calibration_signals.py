@@ -97,8 +97,11 @@ import numpy as np
 import torch
 
 from .atomic_io import (
+    ManifestMismatchError,
     atomic_npz_save as _shared_atomic_npz_save,
     atomic_torch_save as _shared_atomic_torch_save,
+    read_and_validate_manifest,
+    write_manifest_last,
 )
 from moe_compress.pipeline.context import PipelineContext
 from moe_compress.pipeline.plugin import BasePlugin
@@ -189,6 +192,138 @@ def _legacy_router_kd_logits_dir(jsonl_path: Path) -> Path:
 # not a concern. Tests that need a fresh process state can call
 # ``_already_warned_legacy_paths.clear()`` between cases.
 _already_warned_legacy_paths: set[tuple[Path, str]] = set()
+
+
+# S-1 Pattern O rollout: dedupe set for the "missing MANIFEST.json"
+# back-compat WARNING. Keyed on (payload_path, signal_name) so a
+# 40-shard block_hidden artifact emits one WARN per shard (not one
+# global). Mirrors ``_already_warned_legacy_paths`` semantics — module-
+# level, no LRU eviction. The set is process-local; restarted
+# calibration jobs re-emit the WARN once on the first read after
+# restart. Tests can call ``.clear()`` for fresh state.
+_already_warned_missing_manifest: set[tuple[Path, str]] = set()
+
+
+def _manifest_path_for(payload_path: Path) -> Path:
+    """Sibling manifest path for a calibration sidecar.
+
+    Convention: append ``.MANIFEST.json`` AFTER the payload's full suffix so
+    the manifest sorts alphabetically right after the payload. This matches
+    the Stage 3 originals (``orchestrator.py:472``), Stage 5 teacher logits
+    (``precompute_teacher_logits.py``), and ``wanda_intra_expert_score.py:564``
+    sidecar conventions.
+
+    NOTE: these 10 sidecars are local-only caches under the artifacts dir;
+    they are NOT in ``utils/hub_upload.py::_STAGE_LAYOUT`` (which only lists
+    ``_stage2_input_covariance.pt`` for Stage 2 and the Stage 3 originals .pt
+    + its manifest for Stage 3) nor in ``hf_jobs/entrypoint.py::aux_files``
+    (which carries only the Stage 2 covariance, Stage 3 originals + manifest,
+    and calibration_imatrix.* tooling). The naming convention is followed for
+    cross-module consistency with the staged-upload sidecars, NOT because any
+    current code path Hub-uploads these calibration sidecars.
+    """
+    return Path(str(payload_path) + ".MANIFEST.json")
+
+
+def _validate_manifest_or_warn(
+    payload_path: Path,
+    *,
+    expected_schema_version: int,
+    signal_name: str,
+) -> None:
+    """Pattern O validation with one-shot back-compat WARN fallback.
+
+    Behavior:
+    * Manifest exists → ``read_and_validate_manifest``. On failure, raise
+      RuntimeError with the canonical "delete + re-run calibration"
+      message and chain the ManifestMismatchError as cause.
+    * Manifest absent → log a one-shot WARNING (deduped via
+      ``_already_warned_missing_manifest`` keyed on
+      ``(payload_path, signal_name)``) and return; the caller's existing
+      in-payload schema check is the only torn-write guard for these
+      legacy sidecars.
+
+    The fallback exists so this fix does NOT invalidate calibration
+    artifacts already on disk (~tens of GB per artifacts dir). Operators
+    re-running calibration will get a manifest automatically on the next
+    save_*; on the run after that, the warning will stop firing.
+
+    NOTE: ``_already_warned_missing_manifest`` is process-local; a
+    restarted calibration job (rented GPU killed and respawned) re-emits
+    the WARN once per (payload, signal) on the first read after restart.
+    Matches ``_already_warned_legacy_paths`` semantics — operators
+    should NOT file repeated WARN-on-restart as a regression.
+
+    MEDIUM-8 TODO(post-2026-Q3): drop the fallback once all in-flight
+    sidecars under ``/opt/output/*`` have been regenerated. The horizon
+    is intentionally identical to the Stage 4 / Stage 5 fallbacks
+    (eora_inputs.py:230, teacher.py:301).
+    """
+    manifest_path = _manifest_path_for(payload_path)
+    if manifest_path.exists():
+        try:
+            read_and_validate_manifest(
+                payload_path,
+                manifest_path,
+                expected_schema_version=expected_schema_version,
+            )
+        except ManifestMismatchError as exc:
+            raise RuntimeError(
+                f"Calibration sidecar manifest validation FAILED for "
+                f"signal={signal_name!r}: {exc}. Delete both "
+                f"{payload_path.name} and {manifest_path.name} from "
+                f"{payload_path.parent} and re-run calibration."
+            ) from exc
+        return
+    _key = (payload_path, signal_name)
+    if _key not in _already_warned_missing_manifest:
+        log.warning(
+            "Pattern O back-compat: sidecar %s has no MANIFEST.json "
+            "(pre-S1 calibration run?). Proceeding with in-payload schema "
+            "check only; next save_* call will emit a manifest. "
+            "MEDIUM-8 TODO(post-2026-Q3): remove this fallback once all "
+            "in-flight calibration sidecars have been regenerated.",
+            payload_path,
+        )
+        _already_warned_missing_manifest.add(_key)
+
+
+def _write_payload_and_manifest(
+    payload: Any,
+    path: Path,
+    *,
+    signal_name: str,
+) -> None:
+    """Atomic payload write + manifest-last for a calibration sidecar.
+
+    Pattern O write protocol:
+    1. Unlink any stale ``<path>.MANIFEST.json`` so a torn re-write
+       leaves NO manifest at all (mirrors ``stage3/orchestrator.py:475``
+       and ``wanda_intra_expert_score.py:564`` precedents). Wrapped in
+       ``try/except OSError`` per those precedents.
+    2. Atomic torch.save the payload (tmp + fsync + os.replace +
+       fsync(parent)).
+    3. Write the manifest LAST, after the payload's data blocks are
+       durable on disk.
+
+    ``compute_sha256=False`` is intentional: the size + schema_version
+    cross-check inside ``read_and_validate_manifest`` is the validation
+    budget for these multi-GB sidecars; SHA-256 over them would add
+    minutes per calibration run. See plan §3.4 SHA-256 policy.
+    """
+    manifest_path = _manifest_path_for(path)
+    try:
+        manifest_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _atomic_torch_save(payload, path)
+    write_manifest_last(
+        path,
+        manifest_path,
+        schema_version=SCHEMA_VERSIONS[signal_name],
+        extra_meta={"artifact": signal_name},
+        compute_sha256=False,
+    )
 
 
 def _resolve_sidecar_for_load(
@@ -889,7 +1024,11 @@ def save_stage2_profile_v3(
         cov_token_count=cpu_ctc,
         layer_input_reservoir=cpu_lir,
     )
-    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "stage2_profile"))
+    _write_payload_and_manifest(
+        cpu_payload,
+        sidecar_path(jsonl_path, "stage2_profile"),
+        signal_name="stage2_profile",
+    )
 
 
 def load_stage2_profile_v3(
@@ -990,7 +1129,11 @@ def save_reap_scores(payload: Stage2ReapPayload, jsonl_path: Path) -> None:
         reap_scores=payload.reap_scores.detach().to("cpu", dtype=torch.float32),
         token_counts=payload.token_counts.detach().to("cpu", dtype=torch.int64),
     )
-    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "reap_scores"))
+    _write_payload_and_manifest(
+        cpu_payload,
+        sidecar_path(jsonl_path, "reap_scores"),
+        signal_name="reap_scores",
+    )
 
 
 def load_reap_scores(jsonl_path: Path) -> Stage2ReapPayload | None:
@@ -1023,7 +1166,11 @@ def save_per_expert_max(payload: Stage1PerExpertMaxPayload, jsonl_path: Path) ->
         per_expert_max=payload.per_expert_max.detach().to("cpu", dtype=torch.float32),
         token_counts=payload.token_counts.detach().to("cpu", dtype=torch.int64),
     )
-    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "per_expert_max"))
+    _write_payload_and_manifest(
+        cpu_payload,
+        sidecar_path(jsonl_path, "per_expert_max"),
+        signal_name="per_expert_max",
+    )
 
 
 def load_per_expert_max(jsonl_path: Path) -> Stage1PerExpertMaxPayload | None:
@@ -1056,7 +1203,11 @@ def save_routing_stats(payload: RoutingStatsPayload, jsonl_path: Path) -> None:
         freq=payload.freq.detach().to("cpu", dtype=torch.int64),
         mean_weight=payload.mean_weight.detach().to("cpu", dtype=torch.float32),
     )
-    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "routing_stats"))
+    _write_payload_and_manifest(
+        cpu_payload,
+        sidecar_path(jsonl_path, "routing_stats"),
+        signal_name="routing_stats",
+    )
 
 
 def load_routing_stats(jsonl_path: Path) -> RoutingStatsPayload | None:
@@ -1106,7 +1257,11 @@ def save_router_logits_stats(payload: RouterLogitsStatsPayload, jsonl_path: Path
             if payload.bos_token_id is not None else None
         ),
     )
-    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "router_logits_stats"))
+    _write_payload_and_manifest(
+        cpu_payload,
+        sidecar_path(jsonl_path, "router_logits_stats"),
+        signal_name="router_logits_stats",
+    )
 
 
 def load_router_logits_stats(jsonl_path: Path) -> RouterLogitsStatsPayload | None:
@@ -1144,7 +1299,11 @@ def save_output_reservoir(payload: OutputReservoirPayload, jsonl_path: Path) -> 
         total_seen=payload.total_seen.detach().to("cpu", dtype=torch.int64),
         max_tokens=int(payload.max_tokens),
     )
-    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "output_reservoir"))
+    _write_payload_and_manifest(
+        cpu_payload,
+        sidecar_path(jsonl_path, "output_reservoir"),
+        signal_name="output_reservoir",
+    )
 
 
 def load_output_reservoir(jsonl_path: Path) -> OutputReservoirPayload | None:
@@ -1184,7 +1343,11 @@ def save_covariance(payload: CovariancePayload, jsonl_path: Path) -> None:
         sigma_in=cpu_sigma,
         token_counts=dict(payload.token_counts),
     )
-    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "covariance"))
+    _write_payload_and_manifest(
+        cpu_payload,
+        sidecar_path(jsonl_path, "covariance"),
+        signal_name="covariance",
+    )
 
 
 def load_covariance(jsonl_path: Path) -> CovariancePayload | None:
@@ -1269,7 +1432,14 @@ def save_block_hidden(payload: BlockHiddenPayload, jsonl_path: Path) -> None:
     path = sidecar_path(
         jsonl_path, f"block_hidden/layer_{payload.layer_idx:04d}"
     )
-    _atomic_torch_save(cpu_payload, path)
+    # Per-layer Pattern O: each layer shard has its OWN sibling manifest
+    # (``block_hidden/layer_NNNN.pt.MANIFEST.json``), so torn-write damage
+    # on layer L does NOT invalidate layers L-1 or L+1. The
+    # ``_validate_manifest_or_warn`` dedupe key uses the full per-shard
+    # ``payload_path``, so legacy 40-layer artifacts emit one WARN per
+    # missing-manifest layer (not one global WARN that obscures which
+    # layer is legacy).
+    _write_payload_and_manifest(cpu_payload, path, signal_name="block_hidden")
 
 
 def load_block_hidden(jsonl_path: Path, layer_idx: int) -> BlockHiddenPayload | None:
