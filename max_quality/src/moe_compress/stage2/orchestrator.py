@@ -1035,6 +1035,18 @@ def run(
     # pin a numeric default; parity weighting is the safe ON-path starting point).
     expert_distill_use_ce_term: bool = bool(s2.get("expert_distill_use_ce_term", True))
     expert_distill_ce_lambda: float = float(s2.get("expert_distill_ce_lambda", 1.0))
+    # Lift 2 — D-expert-distill-paper-lift: target version. "v2" is the
+    # paper-faithful TopK-gated + per-token routing-weighted target (Eqs. 1-3,
+    # paper lines 133-152) and is the default post-lift. "v1" preserves the
+    # legacy freq-weighted-only target for A0..A11 ablation parity.
+    expert_distill_target_version: str = str(
+        s2.get("expert_distill_target_version", "v2")
+    )
+    if expert_distill_target_version not in ("v1", "v2"):
+        raise ValueError(
+            "stage2_reap_ream.expert_distill_target_version="
+            f"{expert_distill_target_version!r}; must be 'v1' or 'v2'."
+        )
     if expert_distill_steps < 0:
         raise ValueError(
             f"stage2_reap_ream.expert_distill_steps={expert_distill_steps}; "
@@ -1068,6 +1080,7 @@ def run(
         "stage2/config/expert_distill_lr": expert_distill_lr,
         "stage2/config/expert_distill_use_ce_term": expert_distill_use_ce_term,
         "stage2/config/expert_distill_ce_lambda": expert_distill_ce_lambda,
+        "stage2/config/expert_distill_target_version": expert_distill_target_version,
         "stage2/config/sinkhorn_iters": sinkhorn_iters,
         "stage2/config/merge_step": merge_step,
         "stage2/config/format_version": 2,
@@ -1301,6 +1314,7 @@ def run(
             expert_distill_plateau_eps=expert_distill_plateau_eps,
             expert_distill_use_ce_term=expert_distill_use_ce_term,
             expert_distill_ce_lambda=expert_distill_ce_lambda,
+            expert_distill_target_version=expert_distill_target_version,
         ),
         MergeHealPlugin(
             heal_cfg=heal_cfg,

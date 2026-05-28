@@ -115,6 +115,52 @@ Config knobs (Pattern C — consumed verbatim, no implicit coupling):
   weighting between CE and MSE; tune via config since the paper does
   not pin a numeric default.
 
+Deviation: D-expert-distill-paper-lift (Lift 2, paper Eqs. 1-3)
+---------------------------------------------------------------
+v2 target — adds the **TopK gate + per-token routing weight** that
+v1 (D-expert-distill-mse-v1) drops. The paper's Eq. 1 (line 133) is
+
+    y = Σ_i Gate(x)_i · E_i(x)
+
+with ``Gate(x) = Softmax(TopK(x · W_g))`` (Eq. 2, line 142), i.e. the
+post-top-k *renormalized* softmax over routed experts (TopK sets
+non-top-k logits to ``−∞`` per line 144-145, so they vanish after
+softmax). Eq. 3 (line 152) specializes this to top-2 for Mixtral.
+
+Applied to the per-merge-group additive target, v2 becomes
+
+    target_per_token = Σ_{e ∈ members ∩ TopK(σ_orig(x))}
+                            g_e^orig(x) · E_e^orig(x)
+
+where:
+- ``σ_orig`` is the **pre-merge** router (recomputed from
+  ``layer_ref.router.weight``; the pre-merge router row is the row
+  the post-resize router carries verbatim for the centroid, so
+  ``σ_orig`` evaluated on the unpruned router gives the original
+  routing distribution — exactly what the paper's ``Gate(x)`` would
+  produce);
+- ``TopK`` is the layer's dispatch-time top-k (``layer_ref.top_k``);
+- ``g_e^orig(x)`` is the renormalized post-top-k softmax weight per
+  Eq. 2.
+
+Tokens for which the group's members contribute ZERO routing mass
+(no member is in the per-token top-k) carry a zero target — those
+tokens still appear in the MSE / CE mean but with target = 0, which
+is the paper-correct semantic: the merge cannot degrade what the
+pre-merge router would not route through this group anyway.
+
+Config knob (Pattern C — consumed verbatim):
+- ``expert_distill_target_version``: ``"v1"`` | ``"v2"``, default
+  ``"v2"`` post-lift. ``"v1"`` preserves the legacy freq-weighted
+  target (D-expert-distill-mse-v1) for back-compat and A0..A11
+  ablation parity; ``"v2"`` enables this paper-faithful target.
+
+The v2 target is reconstructed from ``layer_ref.router`` (Wg, bias,
+e_score_correction_bias) and the pre-merge expert weights in
+``pre_merge_weights`` — no additional plumbing beyond the existing
+v1 inputs is needed. The v1-waste of snapshotting all experts
+(documented in ``_snapshot_pre_merge_layer_experts``) is unchanged.
+
 Deviation: D-expert-distill-mse-v1
 ----------------------------------
 The contract above is the *target*. The v1 implementation in
@@ -184,7 +230,7 @@ import torch.nn.functional as F
 
 from ...utils.model_io import MATRIX_NAMES, MoELayerRef, build_banks
 from ...pipeline.context import PipelineContext
-from .output_space_cost import _swiglu_forward
+from .output_space_cost import _router_routing_weights, _swiglu_forward
 
 log = logging.getLogger(__name__)
 
@@ -269,19 +315,35 @@ def _distill_merged_group(
     device: torch.device,
     use_ce_term: bool = False,
     ce_lambda: float = 1.0,
+    target_version: str = "v1",
 ) -> dict:
     """500-step MSE (+ optional CE) distillation of the merged centroid
-    against the freq-weighted pre-merge group-member forward
+    against the routing-gated pre-merge group-member forward
     (spec § 5 step 7b / M8).
 
-    **v1 simplification — see D-expert-distill-mse-v1 in spec § 10**: this
-    implementation differs from the pinned spec target in two ways:
-    (i) freq-weighted-only target ``Σ (freq_e / Σ freq) · E_e^orig(x)``
-        (no per-token routing weight ``g_e^orig(x)``);
-    (ii) input tokens are the reservoir-sampled layer-input ``layer_inputs``
-         for every group, not the routing-restricted ``X_g`` set.
-    Phase 3 v2 will lift both. The v1 form provides a correctly-signed
-    merge-error gradient on a uniform-token sample.
+    Target version (D-expert-distill-paper-lift):
+    - ``target_version="v1"`` (helper default for back-compat): legacy
+      freq-weighted-only target ``Σ (freq_e / Σ freq) · E_e^orig(x)``;
+      drops the TopK gate AND the per-token routing weight
+      ``g_e^orig(x)`` (see ``D-expert-distill-mse-v1`` below).
+    - ``target_version="v2"`` (plugin __init__ default post-lift): the
+      paper-faithful target from Eqs. 1-3 (paper lines 133-152),
+      ``target = Σ_{e ∈ members ∩ TopK(σ_orig(x))} g_e^orig(x) · E_e^orig(x)``,
+      where ``σ_orig`` is recomputed from ``layer_ref.router`` (the
+      pre-merge router; the post-resize router carries the centroid's
+      row verbatim so ``σ_orig`` on the original router gives the same
+      ``Gate(x)`` distribution per Eq. 2). ``TopK`` is
+      ``layer_ref.top_k``; the post-top-k softmax is renormalized per
+      paper Eq. 2 ("TopK(X)_i = −∞ otherwise", paper line 145, which
+      makes the softmax denominator the top-k sum). Tokens whose
+      group has no top-k members contribute zero target.
+
+    v2 still uses the reservoir-sampled layer-input ``layer_inputs``
+    for the token pool (not the routing-restricted ``X_g`` set, which
+    is impractical to reconstruct cheaply) — but the TopK mask makes
+    that pool implicit per token: tokens not routed to any group
+    member contribute zero target, which is the paper-correct
+    semantic.
 
     Lift 1 — CE term (D-expert-distill-ce-term, paper Eq. 10)
     --------------------------------------------------------
@@ -312,6 +374,18 @@ def _distill_merged_group(
     reason. The optimizer state is NOT persisted — resume re-runs the
     distillation from scratch for any layer whose partial JSON is missing.
     """
+    # Pattern C config-validation: reject unknown target_version
+    # versions at the helper boundary BEFORE any state setup so a
+    # typo in config fails fast (also guards direct helper callers
+    # in addition to the plugin-level validation). Runs before the
+    # trivial-skip gate so that bogus values surface even when the
+    # helper would have early-exited.
+    if target_version not in ("v1", "v2"):
+        raise ValueError(
+            f"_distill_merged_group: target_version={target_version!r}; "
+            "must be 'v1' or 'v2'."
+        )
+
     if steps <= 0 or len(members) <= 1:
         return {"steps": 0, "skip": "trivial"}
 
@@ -355,19 +429,93 @@ def _distill_merged_group(
         x_all = layer_inputs
     x_all = x_all.to(device, dtype=torch.float32)
 
-    # Build the freq-weighted target once (it doesn't change during training).
-    weights = np.array([max(freq.get(m, 0), 0) for m in members], dtype=np.float64)
-    if weights.sum() <= 0.0:
-        weights[:] = 1.0
-    weights = weights / weights.sum()
+    # Build the per-token distillation target once (it doesn't change
+    # during training because the pre-merge expert weights and the
+    # pre-merge router are both frozen w.r.t. the optimizer).
+    if target_version == "v1":
+        # D-expert-distill-mse-v1: freq-weighted average of pre-merge
+        # member outputs on the same token pool — drops TopK gate and
+        # per-token routing weight. Preserved for ablation parity.
+        weights = np.array(
+            [max(freq.get(m, 0), 0) for m in members], dtype=np.float64,
+        )
+        if weights.sum() <= 0.0:
+            weights[:] = 1.0
+        weights = weights / weights.sum()
 
-    with torch.no_grad():
-        target = torch.zeros_like(x_all)
-        for w, m in zip(weights, members):
-            W_g = pre_merge_weights[m]["gate_proj"].to(device, dtype=torch.float32)
-            W_u = pre_merge_weights[m]["up_proj"  ].to(device, dtype=torch.float32)
-            W_d = pre_merge_weights[m]["down_proj"].to(device, dtype=torch.float32)
-            target = target + float(w) * _swiglu_forward(W_g, W_u, W_d, x_all)
+        with torch.no_grad():
+            target = torch.zeros_like(x_all)
+            for w, m in zip(weights, members):
+                W_g = pre_merge_weights[m]["gate_proj"].to(device, dtype=torch.float32)
+                W_u = pre_merge_weights[m]["up_proj"  ].to(device, dtype=torch.float32)
+                W_d = pre_merge_weights[m]["down_proj"].to(device, dtype=torch.float32)
+                target = target + float(w) * _swiglu_forward(W_g, W_u, W_d, x_all)
+    else:
+        # target_version == "v2": D-expert-distill-paper-lift. Paper
+        # Eqs. 1-3 (lines 133-152): ``y = Σ_i Gate(x)_i · E_i(x)`` with
+        # ``Gate(x) = Softmax(TopK(x · W_g))``. Applied to the
+        # per-merge-group additive target, we sum only over group
+        # members that fall inside the per-token TopK and weight each
+        # by the renormalized post-top-k softmax mass.
+        with torch.no_grad():
+            # Full-softmax routing weights ``σ_orig(x)`` from the
+            # pre-merge router. Returned as (T, n_experts) float32.
+            # Note: ``_router_routing_weights`` returns the UNMASKED
+            # softmax (matching the cost-builder convention); we apply
+            # the TopK mask + renormalization below to match paper
+            # Eq. 2's "Softmax(TopK(...))" verbatim. The output-space
+            # cost builder intentionally uses the un-renormalized form
+            # (see ``D-output-space-routing-weight``); the paper's
+            # distillation loss explicitly states Eq. 2's renormalized
+            # form, so v2 follows the paper here.
+            n_experts = layer_ref.num_routed_experts
+            router_top_k = min(layer_ref.top_k, n_experts)
+            sigma = _router_routing_weights(layer_ref, x_all)  # (T, n_experts)
+            # Paper Eq. 2 (line 144-145): "TopK(X)_i = l_i if i is in the
+            # top-K coordinates of logits l and TopK(X)_i = −∞
+            # otherwise." → mask logits with -∞ outside top-k, then
+            # softmax. Equivalent (and numerically friendlier) form:
+            # zero-out non-top-k softmax probs and renormalize to sum
+            # to 1 across top-k.
+            topk_idx = torch.topk(sigma, k=router_top_k, dim=-1).indices  # (T, k)
+            topk_mask = torch.zeros_like(sigma, dtype=torch.bool)
+            topk_mask.scatter_(1, topk_idx, True)
+            gate = sigma * topk_mask.to(sigma.dtype)  # (T, n_experts)
+            gate_sum = gate.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            gate = gate / gate_sum  # renormalized over top-k per token
+
+            target = torch.zeros_like(x_all)
+            for m in members:
+                # Per-member gate column g_m^orig(x) — already zero on
+                # tokens where m is not in the top-k (mask applied
+                # above). Tokens routed through m contribute the
+                # renormalized softmax weight × E_m's SwiGLU output.
+                g_m = gate[:, m].unsqueeze(-1)  # (T, 1)
+                W_g = pre_merge_weights[m]["gate_proj"].to(device, dtype=torch.float32)
+                W_u = pre_merge_weights[m]["up_proj"  ].to(device, dtype=torch.float32)
+                W_d = pre_merge_weights[m]["down_proj"].to(device, dtype=torch.float32)
+                E_m = _swiglu_forward(W_g, W_u, W_d, x_all)  # (T, hidden)
+                target = target + g_m * E_m
+
+    # v2 student-gate: the spec target form is
+    # ``student = g_g^merged(x) · E_g^merged(x)`` (D-expert-distill-mse,
+    # module docstring) — symmetric to the v2 target. Under v2 we
+    # multiply the student SwiGLU output by the centroid's per-token
+    # gate weight from the SAME pre-merge router (the post-resize
+    # router carries the centroid's pre-merge row verbatim, so this
+    # IS the post-resize centroid's gate up to the denominator
+    # change Stage 2.5 retrains). Under v1 the student stays un-gated
+    # to preserve byte-identity with the legacy path.
+    if target_version == "v2":
+        student_gate = gate[:, centroid_id].unsqueeze(-1)  # (T, 1) — no_grad above
+    else:
+        student_gate = None
+
+    def _student_forward() -> torch.Tensor:
+        out = _swiglu_forward(p_gate, p_up, p_down, x_all)
+        if student_gate is not None:
+            out = student_gate * out
+        return out
 
     # LOW-1 fix: snapshot the *pre-step-0* loss as the relative-loss
     # baseline. Previously this was set inside the loop after step 0's
@@ -382,7 +530,7 @@ def _distill_merged_group(
     # composite quantity the optimizer is actually minimizing. Plateau
     # threshold semantics are unchanged.
     with torch.no_grad():
-        student0 = _swiglu_forward(p_gate, p_up, p_down, x_all)
+        student0 = _student_forward()
         mse0 = F.mse_loss(student0, target)
         if use_ce_term:
             ce0 = _feature_kl_ce(student0, target)
@@ -398,7 +546,7 @@ def _distill_merged_group(
 
     for step in range(steps):
         optim.zero_grad(set_to_none=True)
-        student = _swiglu_forward(p_gate, p_up, p_down, x_all)
+        student = _student_forward()
         mse_loss = F.mse_loss(student, target)
         if use_ce_term:
             # Paper Eq. 10: ``L_KD = L_CE + λ · L_expert`` (line 394).
@@ -491,7 +639,10 @@ class ExpertDistillPlugin:
         "D-expert-distill-ce-term (Lift 1: paper Eq. 10's L_CE term "
         "adapted to per-layer per-group as a feature-level KL between "
         "pre-merge teacher softmax and merged-student log-softmax — "
-        "default ON). See module docstring."
+        "default ON), D-expert-distill-paper-lift (Lift 2: v2 target "
+        "with TopK gate + per-token routing weight per Eqs. 1-3 — "
+        "default 'v2'; v1 retained for ablation parity). See module "
+        "docstring."
     )
     config_key = "stage2_reap_ream.expert_distill_steps"
     # S2-11 LIVE: pre_merge_snapshot reads layer_ref and writes
@@ -515,6 +666,7 @@ class ExpertDistillPlugin:
         expert_distill_plateau_eps: float,
         expert_distill_use_ce_term: bool = True,
         expert_distill_ce_lambda: float = 1.0,
+        expert_distill_target_version: str = "v2",
     ) -> None:
         """Store every distill knob the live hooks read.
 
@@ -535,7 +687,23 @@ class ExpertDistillPlugin:
           expert-wise knowledge distillation loss" — no numeric default
           pinned, so we use 1.0 (parity weighting) as the safe ON-path
           starting point.
+
+        Lift 2 addition (D-expert-distill-paper-lift):
+        - ``expert_distill_target_version``: ``"v1"`` (legacy
+          freq-weighted target) or ``"v2"`` (default; paper-faithful
+          TopK-gated + per-token routing-weighted target per Eqs.
+          1-3, paper lines 133-152). v1 is retained for A0..A11
+          ablation parity and back-compat. Pattern C: validated at
+          this boundary so a typo cannot silently fall through.
         """
+        if expert_distill_target_version not in ("v1", "v2"):
+            raise ValueError(
+                "expert_distill_target_version="
+                f"{expert_distill_target_version!r}; must be "
+                "'v1' (legacy freq-weighted target) or 'v2' "
+                "(paper-faithful TopK-gated target — D-expert-distill"
+                "-paper-lift)."
+            )
         self.expert_distill_steps = expert_distill_steps
         self.expert_distill_lr = expert_distill_lr
         self.expert_distill_betas = expert_distill_betas
@@ -545,6 +713,7 @@ class ExpertDistillPlugin:
         self.expert_distill_plateau_eps = expert_distill_plateau_eps
         self.expert_distill_use_ce_term = expert_distill_use_ce_term
         self.expert_distill_ce_lambda = expert_distill_ce_lambda
+        self.expert_distill_target_version = expert_distill_target_version
 
     def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.expert_distill_steps`` > 0.
@@ -637,6 +806,7 @@ class ExpertDistillPlugin:
                         device=target_device,
                         use_ce_term=self.expert_distill_use_ce_term,
                         ce_lambda=self.expert_distill_ce_lambda,
+                        target_version=self.expert_distill_target_version,
                     )
                     distill_state[centroid] = state
                 log.info(
