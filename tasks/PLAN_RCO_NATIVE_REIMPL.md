@@ -125,7 +125,7 @@ Pinned by test F13 (`test_adam_v_buf_transport_policy`).
 
 ### 1.3 Discrete fitness signal (Gumbel-softmax + DP knapsack)
 
-The paper §3.2 evaluates fitness on a *discrete* sample because the objective `J` is typically not differentiable in `α`. The flow is:
+The paper §3.1 evaluates fitness on a *discrete* sample because the objective `J` is typically not differentiable in `α`. The flow is:
 
 1. **Gumbel perturbation — standard form** (D1-1 / Delta 1 fix). Sample i.i.d. Gumbel noise `g_lk = −log(−log(u_lk))` with `u ~ Uniform(0, 1)`. Form perturbed logits `α' = (α + g) / τ`. **Not** `α + τ · g` (which is what the existing impl uses — see §7 migration). The standard Gumbel-softmax form is:
 
@@ -156,7 +156,7 @@ The paper §3.2 evaluates fitness on a *discrete* sample because the objective `
    ```
 
    The existing impl at `rco_budget.py:822-825` mixes `score_grid = damage_grid − β · log p` with `β = 1e-3` as a soft tiebreak. **The re-impl removes this term**: the DP is over pure damage. Rationale:
-   - The paper §3.2 describes the discrete projection as a budget-exact damage minimisation; the `β · log p` term is not in the paper.
+   - The paper §3.1 describes the discrete projection as a budget-exact damage minimisation; the `β · log p` term is not in the paper.
    - At small `τ_final = 0.5`, `log p` of the argmax option is already ~0 and of the others is large negative, so β=1e-3 affects only deep-tie cases. The tiebreaking value is marginal and obscures the spec.
    - Removing it makes RCO degenerate cleanly to Plugin #8 (`damage_curve_dp`) when fitness comes from the damage_curve slot — a desirable property for the S1_DP-vs-S1_RCO ablation.
 
@@ -169,7 +169,7 @@ The paper §3.2 evaluates fitness on a *discrete* sample because the objective `
 ### 1.4 Outer loop (Algorithm 1)
 
 ```
-init α from REAP saliency (paper §3.3) OR GRAPE budgets (our D-init-grape)
+init α from REAP saliency (paper §4 Setup, paper.txt lines 600-605) OR GRAPE budgets (our D-init-grape)
 init Adam buffers m = 0, v = 0
 for t = 0..T−1:
     # Explore → exploit anneal (D1-2 fix):
@@ -204,7 +204,7 @@ for t = 0..T−1:
 return discrete_argmax_then_DP(α, c_grid, B, damage_grid_only)   # pure-damage DP (D1-3 fix); strict `<` tiebreak (v4-N4)
 ```
 
-**Hyperparameters exposed by the paper**: `n_iterations` (default 500-2000 depending on problem size), `learning_rate` (default 0.01-0.1), `gumbel_tau_init` (default 5.0), `gumbel_tau_final` (default 0.5), Adam (β1=0.9, β2=0.999, ε=1e-8), `seed`. The paper notes (abstract): *"avoids constraint-specific hyperparameters"* — the constraint primitives are parameter-free.
+**Hyperparameters exposed by the paper**: `n_iterations` (default 500-2000 depending on problem size), `learning_rate` (default 0.01-0.1), `gumbel_tau_init` (default 5.0), `gumbel_tau_final` (default 0.5), Adam (β1=0.9, β2=0.999, ε=1e-8), `seed`. The paper notes (abstract, paper.txt line 29): *"no constraint-related hyperparameters"* — the constraint primitives are parameter-free.
 
 ### 1.5 Cost & complexity at production scale
 
@@ -549,14 +549,14 @@ The paper (§3.1) introduces RCO for *non-decomposable* objectives `J(k_1, ..., 
 
 ### Q2 — Initialisation: REAP saliency vs GRAPE budgets
 
-Paper §3.3 initialises α from REAP saliency scores; our implementation initialises from GRAPE per-layer budgets via `D-init-grape`.
+Paper §4 Setup (paper.txt lines 600-605) initialises α from REAP saliency scores; our implementation initialises from GRAPE per-layer budgets via `D-init-grape`.
 
 **Concrete reason for the deviation**: REAP saliency is per-*expert*, not per-budget-*option*. To use REAP, we'd need a per-(layer, surviving_k) saliency, which the upstream paper *constructs* from a forward pass over candidate budgets. Our pipeline does not run that pass — GRAPE's output is the cheapest reasonable initialisation.
 
 **Status (v3 correction)**: the v2 wording claimed the GRAPE-vs-uniform-init basin question was "folded into F11/F12". That was misleading: F11 pins the Gumbel-softmax τ limits and F12 pins the cosine anneal endpoints — neither addresses the basin-of-attraction question for the initialisation choice. The ablation is **deferred**, not folded:
 
 - Q2 is a basin-of-attraction ablation, not a paper-fidelity property. Adding an F-test for it would mis-categorise the test (F-tests pin paper-spec behaviour; basin questions are empirical / post-hoc).
-- The existing `D-init-grape` deviation already documents the divergence from paper §3.3.
+- The existing `D-init-grape` deviation already documents the divergence from paper §4 Setup (paper.txt lines 600-605).
 - The ablation can be run post-hoc against the new impl if the user requests it (config-only change: swap `init_peak_logit` for a uniform-init code path; no algorithm changes needed).
 - **No new F-test is added.** The "drop `D-init-grape` from the deviation list" decision is gated on running that ablation, which is out of scope for this plan.
 
@@ -624,7 +624,7 @@ In §1.4 the pseudocode computes `n = constraint_normal(α)` at the deterministi
 
 > M = {α ∈ R^{NK} : C(α) = B}  with  C(α) = Σᵢ wᵢ ⟨pᵢ, c⟩  and  pᵢ = softmax(αᵢ)
 
-(Eq. 1, paper.txt lines 264-291). Proposition 2 then gives the closed-form normal `∇C(α)_{ik} = wᵢ pᵢₖ (cₖ − E_{pᵢ}[c])` (paper.txt line 303, `grep -F` hit on `"the gradient of C with respect to α"` and on `Proposition 2 (Normal vector)`). The whole §2 derivation is in `α`-space with `p(α) = softmax(α)` — no temperature, no Gumbel noise, no `α̂`. Verbatim `grep -F`-verified quote from paper.txt line 256 (Section 2 opener):
+(Eq. 1, paper.txt lines 264-291). Proposition 2 then gives the closed-form normal `∇C(α)_{ik} = wᵢ pᵢₖ (cₖ − E_{pᵢ}[c])` (paper.txt line 303, `grep -F` hit on `"the gradient of C with respect to α"` and on `Proposition 2 (Normal vector)`). The whole §2 derivation is in `α`-space with `p(α) = softmax(α)` — no temperature, no Gumbel noise, no `α̂`. Verbatim `grep -F`-verified quote from paper.txt line 258 (Section 2 opener):
 
 > *"Optimizing on a manifold requires three operations: tangent projection"*
 
@@ -800,7 +800,7 @@ tr '\n' ' ' < paper.txt | grep -oF "<joined string>"   # must return a hit
 ```
 
 `grep -F` hits confirmed for both quotes used in v4 Q8:
-- §2 quote (paper.txt line 256): `"Optimizing on a manifold requires three operations: tangent projection"`
+- §2 quote (paper.txt line 258): `"Optimizing on a manifold requires three operations: tangent projection"`
 - §3.1 quote (paper.txt lines 478-482, joined): `"gradients flow through p̂ᵢₖ = softmax(α̂ᵢ)ₖ, the softmax of the same perturbed logits that produced z*. This ensures the surrogate concentrates on the sampled mode, so the STE bias vanishes as τ → 0 and independent Gumbel samples yield independent Jacobians; the unperturbed softmax(αᵢ) would decouple the surrogate from the sampled assignment and suppress both effects."`
 
 **No deltas were RECONSIDERED or DEFERRED. All 6 folded.** Loop should close on round-4 review.
