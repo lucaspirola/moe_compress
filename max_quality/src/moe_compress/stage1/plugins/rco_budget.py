@@ -193,16 +193,19 @@ from ...pipeline.context import PipelineContext
 log = logging.getLogger(__name__)
 
 
-# Numerical tolerances for the budget retraction bisection. Tight enough
-# to round to the correct integer after the final DP projection (which
-# only needs ~0.5-of-an-expert resolution to disambiguate), loose enough
-# to converge in <60 bisection steps. At production scale B ≈ 8600,
-# relative tolerance is 1e-4/8600 ≈ 1.16e-8 — far below float64 epsilon.
-_BISECT_TOL = 1e-4
+# Numerical tolerances for the budget retraction bisection. Match upstream
+# src/manifold.py:73 verbatim — ``tol=0.05`` for the global-budget case.
+# (Upstream ``retraction_per_layer`` uses tol=1e-3; we don't currently
+# wire per-layer retraction.) The DP projection only needs ~0.5-of-an-
+# expert resolution to disambiguate, so 0.05 is more than tight enough.
+_BISECT_TOL = 0.05
 _BISECT_MAX_ITERS = 60
-# Cap on the bracket-doubling phase before bisection. 32 doublings span
-# 2^31 ≈ 2.15e9 in either direction — comfortably above any plausible B.
-_BRACKET_MAX_DOUBLINGS = 32
+# Cap on the bracket-doubling phase before bisection. Matches upstream
+# src/manifold.py:96 (`for _ in range(40)`).
+_BRACKET_MAX_DOUBLINGS = 40
+# Numerical floor for the tangent-projection denominator. Matches upstream
+# src/manifold.py:62 / :138 (``+ 1e-12``).
+_PROJECTION_DEN_EPS = 1e-12
 
 # Artifact schema version (Pattern B). Bump only on incompatible shape
 # changes; additive top-level keys are tolerated by readers (Pattern K).
@@ -820,13 +823,30 @@ class RCOBudgetPlugin:
 
         Standard Gram-Schmidt: ``g_tan = g − (⟨g, n⟩ / ⟨n, n⟩) · n``.
         Treats the full ``[L, K_max]`` tensor as one vector — the budget
-        constraint is global, so the projection is global.
+        constraint is global, so the projection is global. Denominator
+        guard ``+ _PROJECTION_DEN_EPS`` matches upstream
+        ``src/manifold.py:62`` (``nf @ nf + 1e-12``).
         """
         g_masked = g * mask
         normal_masked = normal * mask
         num = (g_masked * normal_masked).sum()
-        den = (normal_masked * normal_masked).sum().clamp_min(1e-30)
+        den = (normal_masked * normal_masked).sum() + _PROJECTION_DEN_EPS
         return (g_masked - (num / den) * normal_masked) * mask
+
+    def _soft_budget(
+        self,
+        alpha: torch.Tensor,
+        cost_grid: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> float:
+        """Return ``C(α) = Σ_l Σ_k softmax(α_l)_k · c_lk``.
+
+        Mirrors upstream ``src/manifold.py::retraction`` inner ``C(shift)``
+        (line 83-88). When per-group weights are wired (Item 1) the
+        sum becomes weighted; for now ``w_i = 1``.
+        """
+        p = self._masked_softmax(alpha, mask)
+        return float((p * cost_grid).sum().item())
 
     def _budget_residual(
         self,
@@ -835,17 +855,8 @@ class RCOBudgetPlugin:
         mask: torch.Tensor,
         global_budget: float,
     ) -> float:
-        """Compute ``(Σ_l Σ_k softmax(α_l)_k · c_lk) − B``.
-
-        Sign matters for the bisection:
-        - ``f > 0``: soft-budget over-allocates → need larger ``t``
-          (shifts probability mass toward cheaper options).
-        - ``f < 0``: soft-budget under-allocates → need smaller (more
-          negative) ``t``.
-        """
-        p = self._masked_softmax(alpha, mask)
-        soft_budget = float((p * cost_grid).sum().item())
-        return soft_budget - float(global_budget)
+        """Compute ``C(α) − B``; thin wrapper for legacy test names."""
+        return self._soft_budget(alpha, cost_grid, mask) - float(global_budget)
 
     def _retract(
         self,
@@ -854,78 +865,54 @@ class RCOBudgetPlugin:
         mask: torch.Tensor,
         global_budget: float,
     ) -> torch.Tensor:
-        """Bisect along the cost direction to restore Σ p · c = B.
+        """Bisect a scalar shift ``c`` so that ``C(α + c·costs) = B``.
 
-        Parametrise ``α(t) = α − t · c_grid``. Then ``d/dt C(α(t)) =
-        −Σ_l Var_{p_l}(c_l) ≤ 0`` so the residual ``f(t) = C(α(t)) − B``
-        is monotonically non-increasing in ``t``. Bracket-doubling with
-        an EXPLICIT SIGN BRANCH (plan §1.2 Primitive 3) handles both
-        over- and under-budget cases.
+        Verbatim port of upstream ``src/manifold.py::retraction`` (lines
+        68-118): positive-shift convention ``α ← α + c · costs``.
+        Since ``softmax(α + c·costs)`` weights options by ``exp(c·c_lk)``,
+        increasing ``c`` shifts probability mass toward HIGH-cost options
+        ⇒ ``C(α + c·costs)`` is monotonically NON-DECREASING in ``c``.
+
+        Algorithm:
+        1. Adaptive bracket: start ``lo, hi = -1.0, 1.0``; double whichever
+           endpoint has not yet crossed ``target``, up to 40 iters.
+        2. Bisection up to 60 iters; halt as soon as ``|C(mid) − B| < tol``.
+        3. Apply the final ``c = 0.5·(lo + hi)`` shift in place.
         """
-        res_zero = self._budget_residual(alpha, cost_grid, mask, global_budget)
-        if abs(res_zero) <= _BISECT_TOL:
+        def C(shift: float) -> float:
+            return self._soft_budget(alpha + shift * cost_grid, cost_grid, mask)
+
+        cur = C(0.0)
+        if abs(cur - float(global_budget)) < _BISECT_TOL:
             return alpha
 
-        if res_zero > 0:
-            # Over-budget: f(0) > 0; need t > 0 to shrink C(α).
-            t_lo, t_hi = 0.0, 1.0
-            f_lo = res_zero
-            f_hi = self._budget_residual(
-                alpha - t_hi * cost_grid, cost_grid, mask, global_budget
-            )
-            doublings = 0
-            while f_hi > 0 and doublings < _BRACKET_MAX_DOUBLINGS:
-                t_lo, f_lo = t_hi, f_hi
-                t_hi *= 2.0
-                f_hi = self._budget_residual(
-                    alpha - t_hi * cost_grid, cost_grid, mask, global_budget
-                )
-                doublings += 1
-            if f_hi > 0:
-                log.warning(
-                    "RCO retract: bracket-doubling exhausted at t_hi=%.3g "
-                    "with f_hi=%.3g still positive; returning best α "
-                    "(soft-budget overshoot)", t_hi, f_hi,
-                )
-                return alpha - t_hi * cost_grid
-        else:
-            # Under-budget: f(0) < 0; need t < 0 to grow C(α).
-            t_hi, t_lo = 0.0, -1.0
-            f_hi = res_zero
-            f_lo = self._budget_residual(
-                alpha - t_lo * cost_grid, cost_grid, mask, global_budget
-            )
-            doublings = 0
-            while f_lo < 0 and doublings < _BRACKET_MAX_DOUBLINGS:
-                t_hi, f_hi = t_lo, f_lo
-                t_lo *= 2.0
-                f_lo = self._budget_residual(
-                    alpha - t_lo * cost_grid, cost_grid, mask, global_budget
-                )
-                doublings += 1
-            if f_lo < 0:
-                log.warning(
-                    "RCO retract: bracket-doubling exhausted at t_lo=%.3g "
-                    "with f_lo=%.3g still negative; returning best α "
-                    "(soft-budget undershoot)", t_lo, f_lo,
-                )
-                return alpha - t_lo * cost_grid
+        # Adaptive bracket: expand by 2x on the side that hasn't crossed yet.
+        lo, hi = -1.0, 1.0
+        for _ in range(_BRACKET_MAX_DOUBLINGS):
+            c_lo = C(lo)
+            c_hi = C(hi)
+            if c_lo <= float(global_budget) <= c_hi:
+                break
+            if c_hi < float(global_budget):
+                hi *= 2.0
+            if c_lo > float(global_budget):
+                lo *= 2.0
 
-        # Bisection.
+        # Bisection. C is non-decreasing in shift; E > target ⇒ shift too
+        # large ⇒ contract upper bound.
         for _ in range(_BISECT_MAX_ITERS):
-            t_mid = 0.5 * (t_lo + t_hi)
-            alpha_mid = alpha - t_mid * cost_grid
-            f_mid = self._budget_residual(
-                alpha_mid, cost_grid, mask, global_budget
-            )
-            if abs(f_mid) <= _BISECT_TOL:
-                return alpha_mid
-            # f is non-increasing in t: f > 0 means t too small (advance lo).
-            if f_mid > 0:
-                t_lo = t_mid
+            mid = 0.5 * (lo + hi)
+            E = C(mid)
+            if abs(E - float(global_budget)) < _BISECT_TOL:
+                lo = hi = mid
+                break
+            if E > float(global_budget):
+                hi = mid
             else:
-                t_hi = t_mid
-        return alpha - 0.5 * (t_lo + t_hi) * cost_grid
+                lo = mid
+
+        c = 0.5 * (lo + hi)
+        return alpha + c * cost_grid
 
     # ------------------------------------------------------------------
     # τ-anneal (exponential, upstream parity)
