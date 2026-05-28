@@ -339,6 +339,169 @@ def test_plugin_consumes_cache_sidecar(tiny_model, tmp_path):
 
 
 # ==========================================================================
+# H-1 -- orchestrator wiring: the V2 cache dispatch must promote
+# ctx['stage3.wanda_scalar_row'] onto the live run_ctx that
+# walk_phases(('collect_wanda_scores',), ...) consumes.
+#
+# This test EXISTS because of the original reviewer's C-1 finding:
+# the first version of the orchestrator wired the wanda cache
+# provider against a throwaway ``_cache_ctx`` that was discarded
+# before run_ctx construction, so ``run_ctx.has('stage3.wanda_scalar_row')``
+# always returned False and the consumer plugin always fell through
+# to its per-layer calibration sweep. The fix added a second
+# ``dispatch_first`` call on ``run_ctx`` mirroring
+# ``Stage3BlockHiddenCacheProvider``'s pattern. This test asserts
+# the wiring end-to-end and would have caught C-1 had it been in
+# place before C-1 shipped green.
+# ==========================================================================
+
+
+class _IntegrationTokenizer:
+    name_or_path = "tiny-tokenizer"
+    eos_token_id = 0
+
+    def __call__(self, text, *_, **__):
+        return {"input_ids": [min(ord(c) % 32, 31) for c in (text or " ")]}
+
+    def save_pretrained(self, *_args, **_kwargs):
+        return None
+
+
+def _noop_save_integration(model, tokenizer, path, **kwargs):
+    Path(path).mkdir(parents=True, exist_ok=True)
+    return Path(path)
+
+
+def test_orchestrator_promotes_wanda_cache_to_run_ctx(
+    tiny_model, tiny_config, tmp_path, monkeypatch,
+):
+    """H-1 integration test (audit/PLAN_W1).
+
+    Drive the real stage3 orchestrator's dispatch logic with a tiny
+    model + pre-written W-1 sidecar; assert that on cache HIT the
+    slot lands on ``run_ctx`` BEFORE ``walk_phases(('collect_wanda_scores',))``
+    fires. The previous bug (C-1) would manifest as
+    ``run_ctx.has('stage3.wanda_scalar_row') is False`` at the
+    capture point and is therefore caught directly by this test.
+
+    Implementation notes:
+
+    * The orchestrator computes the calibration JSONL path as
+      ``Path.cwd() / cal.get('jsonl_path', _DEFAULT_SELF_TRACES_PATH)``;
+      we set ``calibration.jsonl_path`` to an absolute path under
+      ``tmp_path`` so the orchestrator and the test write/read the
+      same sidecar location.
+    * We monkeypatch ``walk_phases`` to capture the live ``ctx`` at
+      every walk -- the relevant one is the
+      ``('collect_wanda_scores',)`` walk -- and short-circuit it
+      to avoid running the full SVD pipeline. The orchestrator
+      executes its preamble (incl. the V2 cache dispatch we are
+      testing) and is interrupted by an exception we raise from a
+      later phase so the orchestrator's finalize block never runs.
+    """
+    # Avoid the stage1+2 prerequisites: drive the orchestrator's
+    # dispatch logic directly via the same module that ``run`` uses.
+    from moe_compress.stage3 import orchestrator as stage3_orchestrator
+    from moe_compress.utils import calibration as cal_mod
+    from moe_compress.utils import model_io as mio
+    from moe_compress.budget.solver import BudgetDecomposition
+    from moe_compress.tools import phase_walker as _phase_walker_mod
+
+    # Calibration JSONL path = tmp_path / "traces.jsonl"; write the
+    # W-1 sidecar to ``tmp_path/sidecars/wanda_scalar_row.pt``.
+    jsonl = tmp_path / "traces.jsonl"
+    payload = _make_payload(n_layers=1, n_experts=2, d_in=4)
+    save_wanda_scalar_row(payload, jsonl)
+    # Sanity: sidecar + manifest both written.
+    sidecar = sidecar_path(jsonl, "wanda_scalar_row")
+    manifest = sidecar.with_suffix(sidecar.suffix + ".MANIFEST.json")
+    assert sidecar.exists()
+    assert manifest.exists()
+
+    # Point the orchestrator at the absolute sidecar path so the
+    # ``Path.cwd() / jsonl_path`` join in the orchestrator yields
+    # the same absolute path.
+    config = copy_config_with_wanda_jsonl(tiny_config, jsonl)
+
+    # Stub the heavy loaders so the orchestrator doesn't try real I/O.
+    def _fake_build(tokenizer, spec, cache_dir=None):
+        torch.manual_seed(spec.seed)
+        return torch.randint(0, 32, (spec.num_sequences, spec.sequence_length),
+                             dtype=torch.long)
+
+    monkeypatch.setattr(cal_mod, "build_calibration_tensor", _fake_build)
+    monkeypatch.setattr(mio, "save_compressed_checkpoint", _noop_save_integration)
+
+    # Capture the ctx at the collect_wanda_scores walk and short-circuit
+    # the orchestrator before it does real SVD work.
+    captured: dict = {"saw_wanda_walk": False, "ctx_has_slot": None}
+
+    real_walk_phases = _phase_walker_mod.walk_phases
+
+    class _StopHere(Exception):
+        pass
+
+    def _spy_walk_phases(phases, plugins, ctx, *args, **kwargs):
+        if phases == ("collect_wanda_scores",):
+            captured["saw_wanda_walk"] = True
+            captured["ctx_has_slot"] = ctx.has("stage3.wanda_scalar_row")
+            # Stop the orchestrator here -- everything after is out of
+            # scope for this wiring test.
+            raise _StopHere
+        return real_walk_phases(phases, plugins, ctx, *args, **kwargs)
+
+    monkeypatch.setattr(stage3_orchestrator, "walk_phases", _spy_walk_phases)
+
+    decomp = BudgetDecomposition(
+        total_reduction_ratio=0.2,
+        expert_prune_ratio=0.5,
+        svd_rank_ratio=0.14,
+        global_expert_budget=4,
+        min_experts_per_layer=2,
+        blacklisted_experts={},
+    )
+
+    # The orchestrator's covariance phase needs a Stage 2 cov artifact;
+    # write a minimal one so the no-cache path doesn't fail before our
+    # spy fires. We don't actually use the values -- the test only
+    # cares about the ctx state at the wanda walk.
+    art = tmp_path
+    stage2_cov_path = art / "_stage2_input_covariance.pt"
+    torch.save({"covariance": {}}, stage2_cov_path)
+
+    with pytest.raises(_StopHere):
+        stage3_orchestrator.run(
+            tiny_model, _IntegrationTokenizer(), config, art, decomp,
+            device=None, no_resume=True,
+        )
+
+    assert captured["saw_wanda_walk"], (
+        "orchestrator never reached the collect_wanda_scores walk "
+        "(spy not triggered) -- preamble likely raised before the "
+        "wanda dispatch could fire"
+    )
+    assert captured["ctx_has_slot"] is True, (
+        "C-1 REGRESSION: run_ctx.has('stage3.wanda_scalar_row') was "
+        f"{captured['ctx_has_slot']} at the collect_wanda_scores walk. "
+        "The orchestrator's V2 wanda cache dispatch is NOT promoting "
+        "the slot onto run_ctx; the consumer plugin will always fall "
+        "through to its per-layer calibration sweep."
+    )
+
+
+def copy_config_with_wanda_jsonl(tiny_config: dict, jsonl: Path) -> dict:
+    """Return a deep-copy of tiny_config with calibration.jsonl_path
+    set to the absolute ``jsonl`` and wanda_intra_expert enabled."""
+    import copy as _copy
+    cfg = _copy.deepcopy(tiny_config)
+    cfg.setdefault("calibration", {})["jsonl_path"] = str(jsonl)
+    cfg.setdefault("stage3", {}).setdefault("wanda_intra_expert", {})[
+        "enabled"
+    ] = True
+    return cfg
+
+
+# ==========================================================================
 # T6 -- checkpoint kill + resume byte-equality
 # ==========================================================================
 

@@ -375,6 +375,46 @@ def run(
     run_ctx.set("teacher_moe_layers", teacher_moe_layers, overwrite=True)
     run_ctx.set("C_acc", C_acc, overwrite=True)
 
+    # V2 cache-first (W-1): try the wanda scalar_row sidecar against
+    # ``run_ctx`` so the slot the provider sets
+    # (``stage3.wanda_scalar_row``) is visible to the
+    # ``collect_wanda_scores`` walk below. Mirrors the
+    # ``Stage3BlockHiddenCacheProvider`` pattern further down
+    # (search for ``block-hidden cache HIT``): a second
+    # ``dispatch_first`` call on the live ``run_ctx`` AFTER the
+    # throwaway ``_cache_ctx`` dispatch above, because the earlier
+    # call promotes only ``A_cov`` and the wanda slot would otherwise
+    # be discarded with ``_cache_ctx``.
+    #
+    # Always-enabled and a no-op on miss, so this is safe to run
+    # even for stage3 runs that do NOT opt into the wanda
+    # intra-expert plugin (the consumer plugin is gated separately).
+    try:
+        from pathlib import Path as _Path
+        from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
+        _wsr_cal_source = cal.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
+        _wsr_cal_jsonl_path = _Path(_wsr_cal_source)
+        if not _wsr_cal_jsonl_path.is_absolute():
+            _wsr_cal_jsonl_path = _Path.cwd() / _wsr_cal_jsonl_path
+        _wsr_providers = [Stage3WandaScalarRowCacheProvider()]
+        PluginRegistry.dispatch_first(
+            _wsr_providers, "on_load", run_ctx, _wsr_cal_jsonl_path,
+        )
+        if run_ctx.has("stage3.wanda_scalar_row"):
+            _payload = run_ctx.get("stage3.wanda_scalar_row")
+            log.info(
+                "Stage 3: V2 wanda scalar_row cache HIT "
+                "(%d entries) -- WandaIntraExpertScorePlugin will "
+                "skip its per-layer calibration sweep",
+                len(_payload.sigma_x_g_squared),
+            )
+    except (FileNotFoundError, OSError) as _exc:
+        log.warning(
+            "Stage 3: V2 wanda scalar_row cache lookup failed (%s) "
+            "-- WandaIntraExpertScorePlugin (if enabled) will fall "
+            "through to its per-layer calibration sweep.", _exc,
+        )
+
     # ---- collect_wanda_scores -------------------------------------------
     # Routing-weighted Wanda intra-expert score (MoE-Pruner arXiv:2410.12013).
     # Default OFF -- WandaIntraExpertScorePlugin.is_enabled gates on
