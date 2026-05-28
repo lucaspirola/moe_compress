@@ -277,12 +277,18 @@ router-routing-weight recompute, paid once per group on the first
 distillation pass through a layer. Warm runs amortize via Python's
 import cache + torch's kernel cache and show no measurable regression.
 
-If this becomes a CI flake (i.e. cold-cache runs intermittently exceed
-the 60s wall), the cheapest fix is to **cache the routing weights at
-first compute and reuse them across the per-group loop** — ``σ_orig``
-is shared across all groups within a layer (the router is the same
-tensor), so the current per-group recompute is O(num_groups) wasteful.
-This is a follow-up optimization, not a blocker.
+Post-fix (E-2): the per-group recompute has been lifted to a per-layer
+cache in ``ExpertDistillPlugin.merge`` — see ``_build_v2_router_cache``
+(this module). ``ExpertDistillPlugin.merge`` builds the
+``(x_all, σ_orig, gate)`` triple ONCE at layer entry and threads it
+into every ``_distill_merged_group`` call via the ``v2_router_cache``
+kwarg, dropping the per-group cost from O(num_groups) to 1. The
+pre-fix cold-cache wall-clock numbers above (~120s with intermittent
+``--timeout=60`` failures) stand as the historical anchor; the cached
+path collapses that overhead to one softmax+topk+linear per layer.
+Direct helper callers (tests, ad-hoc usage) that omit
+``v2_router_cache`` continue to hit the legacy in-helper recompute for
+byte-identity with the pre-fix call signature.
 
 Deviation: D-expert-distill-mse-v1
 ----------------------------------
@@ -396,6 +402,90 @@ def _feature_kl_ce(
     return F.kl_div(log_p_student, p_teacher, reduction="batchmean")
 
 
+def _build_v2_router_cache(
+    *,
+    layer_ref: MoELayerRef,
+    layer_inputs: torch.Tensor,
+    token_cap: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Per-layer cache of ``(x_all, σ_orig(x), gate)`` for v2 distillation.
+
+    Closes E-2: the v2 ``_distill_merged_group`` path used to recompute
+    ``σ_orig(x)`` + TopK-mask + renormalize ONCE PER CENTROID GROUP, even
+    though every tensor in the triple is centroid-independent (the
+    pre-merge router and the layer's reservoir-sub-sampled tokens are
+    both frozen for the whole ``merge`` invocation). This helper hoists
+    the computation to layer entry — ``ExpertDistillPlugin.merge`` builds
+    the cache once and threads it into every per-group ``_distill_merged_group``
+    call via the ``v2_router_cache`` kwarg, dropping the per-group
+    re-execution from ``O(num_groups)`` to ``1``.
+
+    Determinism contract: the cached ``x_all`` is byte-identical to the
+    tensor ``_distill_merged_group`` would have built internally — same
+    ``randperm(layer_idx)`` seed, same ``token_cap`` truncation, same
+    ``.to(device, dtype=fp32)`` cast. The cached ``sigma`` is the full
+    softmax over the pre-merge router (``_router_routing_weights``);
+    ``gate`` is the renormalized TopK softmax per paper Eq. 2. All three
+    tensors are detached / no-grad — autograd never touches them.
+
+    Cache payload (all fp32, on ``device``):
+
+    - ``x_all``: ``(T, hidden)`` — the deterministically sub-sampled
+      tokens shared across every centroid in this layer.
+    - ``sigma``: ``(T, n_experts)`` — full pre-merge router softmax.
+    - ``gate``:  ``(T, n_experts)`` — renormalized TopK softmax mask.
+
+    Memory footprint at default ``token_cap=8192`` / ``hidden=2048`` /
+    ``n_experts=256``: ``x_all``≈64 MB, ``sigma``≈8 MB, ``gate``≈8 MB —
+    ~80 MB live during the layer's distillation pass, freed at next
+    layer's ``merge`` call (stack-local; no ``ctx`` persistence, no
+    interaction with the resume state machine).
+
+    Singleton-skip note: the cache is built unconditionally at layer
+    entry. If every group in a layer is a singleton (``len(members) <= 1``
+    when ``expert_distill_skip_singletons=True``), the cache build is
+    wasted work — but the cost is a single softmax + topk + linear over
+    ≤80 MB of fp32, while the simpler control flow is worth more than
+    the all-singletons micro-saving (singletons are rare at production
+    ``num_groups``).
+    """
+    # Step 1: deterministic sub-sample of ``layer_inputs`` — lifted
+    # verbatim from ``_distill_merged_group`` (M-2 caveat: seed is
+    # ``layer_idx`` ONLY, no global seed mix-in, so every centroid in
+    # the same layer sees the SAME ``token_cap`` rows — that bias is
+    # intentional for resume-determinism). This block is the
+    # bit-identical twin of the legacy ``v2_router_cache is None`` branch
+    # in ``_distill_merged_group``.
+    rng = torch.Generator(device="cpu").manual_seed(layer_ref.layer_idx)
+    n_tokens = layer_inputs.shape[0]
+    if n_tokens > token_cap:
+        idx = torch.randperm(n_tokens, generator=rng)[:token_cap]
+        x_all = layer_inputs[idx]
+    else:
+        x_all = layer_inputs
+    x_all = x_all.to(device, dtype=torch.float32)
+
+    # Step 2: full pre-merge router softmax + TopK-masked renormalization
+    # (paper Eq. 2). The math here is the bit-identical twin of the v2
+    # branch's per-group recompute at the now-deleted ``sigma =
+    # _router_routing_weights(...)`` site — same call site, same
+    # downstream mask + renormalize math, just hoisted up one frame so it
+    # runs once per layer instead of once per centroid.
+    with torch.no_grad():
+        n_experts = layer_ref.num_routed_experts
+        router_top_k = min(layer_ref.top_k, n_experts)
+        sigma = _router_routing_weights(layer_ref, x_all)  # (T, n_experts)
+        topk_idx = torch.topk(sigma, k=router_top_k, dim=-1).indices  # (T, k)
+        topk_mask = torch.zeros_like(sigma, dtype=torch.bool)
+        topk_mask.scatter_(1, topk_idx, True)
+        gate = sigma * topk_mask.to(sigma.dtype)  # (T, n_experts)
+        gate_sum = gate.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        gate = gate / gate_sum  # renormalized over top-k per token
+
+    return {"x_all": x_all, "sigma": sigma, "gate": gate}
+
+
 def _snapshot_pre_merge_layer_experts(
     layer_ref: MoELayerRef,
 ) -> dict[int, dict[str, torch.Tensor]]:
@@ -443,6 +533,7 @@ def _distill_merged_group(
     use_ce_term: bool = False,
     ce_lambda: float = 1.0,
     target_version: str = "v1",
+    v2_router_cache: dict | None = None,
 ) -> dict:
     """500-step MSE (+ optional CE) distillation of the merged centroid
     against the routing-gated pre-merge group-member forward
@@ -547,14 +638,24 @@ def _distill_merged_group(
     # randomized-sub-sampling pass (e.g., seed mixed with centroid id +
     # step) would decouple this from the reservoir's draw without
     # breaking resume.
-    rng = torch.Generator(device="cpu").manual_seed(layer_ref.layer_idx)
-    n_tokens = layer_inputs.shape[0]
-    if n_tokens > token_cap:
-        idx = torch.randperm(n_tokens, generator=rng)[:token_cap]
-        x_all = layer_inputs[idx]
+    #
+    # E-2 fix: when ``v2_router_cache`` is provided (plugin path), reuse
+    # the cached ``x_all`` directly — it is bit-identical to what this
+    # legacy branch would produce (same ``layer_idx`` seed, same cap, same
+    # cast). Direct helper callers (tests, ad-hoc usage) pass
+    # ``v2_router_cache=None`` and keep the legacy in-helper sub-sample
+    # path verbatim for byte-identity.
+    if v2_router_cache is not None:
+        x_all = v2_router_cache["x_all"]
     else:
-        x_all = layer_inputs
-    x_all = x_all.to(device, dtype=torch.float32)
+        rng = torch.Generator(device="cpu").manual_seed(layer_ref.layer_idx)
+        n_tokens = layer_inputs.shape[0]
+        if n_tokens > token_cap:
+            idx = torch.randperm(n_tokens, generator=rng)[:token_cap]
+            x_all = layer_inputs[idx]
+        else:
+            x_all = layer_inputs
+        x_all = x_all.to(device, dtype=torch.float32)
 
     # Build the per-token distillation target once (it doesn't change
     # during training because the pre-merge expert weights and the
@@ -595,26 +696,37 @@ def _distill_merged_group(
             # (see ``D-output-space-routing-weight``); the paper's
             # distillation loss explicitly states Eq. 2's renormalized
             # form, so v2 follows the paper here.
-            n_experts = layer_ref.num_routed_experts
-            router_top_k = min(layer_ref.top_k, n_experts)
-            sigma = _router_routing_weights(layer_ref, x_all)  # (T, n_experts)
-            # Paper Eq. 2 (line 144-145): "TopK(X)_i = l_i if i is in the
-            # top-K coordinates of logits l and TopK(X)_i = −∞
-            # otherwise." → mask logits with -∞ outside top-k, then
-            # softmax. Equivalent (and numerically friendlier) form:
-            # zero-out non-top-k softmax probs and renormalize to sum
-            # to 1 across top-k.
-            # math: softmax(logit; mask=−∞) ≡ softmax_full × topk_mask / sum
-            # (the −∞ entries vanish under exp(); the surviving top-k
-            # entries normalize to the same renormalized softmax we get
-            # by masking-then-dividing the full softmax — tying this
-            # implementation directly to paper Eq. 2's mask form.)
-            topk_idx = torch.topk(sigma, k=router_top_k, dim=-1).indices  # (T, k)
-            topk_mask = torch.zeros_like(sigma, dtype=torch.bool)
-            topk_mask.scatter_(1, topk_idx, True)
-            gate = sigma * topk_mask.to(sigma.dtype)  # (T, n_experts)
-            gate_sum = gate.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            gate = gate / gate_sum  # renormalized over top-k per token
+            #
+            # E-2 fix: when ``v2_router_cache`` is provided (plugin
+            # path), reuse the pre-computed ``sigma`` + ``gate``
+            # directly — both are centroid-independent and the cache
+            # hoists the computation to layer entry (one call per
+            # layer instead of ``len(grouped)``). Direct helper callers
+            # without the cache hit the in-helper recompute below.
+            if v2_router_cache is not None:
+                sigma = v2_router_cache["sigma"]
+                gate = v2_router_cache["gate"]
+            else:
+                n_experts = layer_ref.num_routed_experts
+                router_top_k = min(layer_ref.top_k, n_experts)
+                sigma = _router_routing_weights(layer_ref, x_all)  # (T, n_experts)
+                # Paper Eq. 2 (line 144-145): "TopK(X)_i = l_i if i is in the
+                # top-K coordinates of logits l and TopK(X)_i = −∞
+                # otherwise." → mask logits with -∞ outside top-k, then
+                # softmax. Equivalent (and numerically friendlier) form:
+                # zero-out non-top-k softmax probs and renormalize to sum
+                # to 1 across top-k.
+                # math: softmax(logit; mask=−∞) ≡ softmax_full × topk_mask / sum
+                # (the −∞ entries vanish under exp(); the surviving top-k
+                # entries normalize to the same renormalized softmax we get
+                # by masking-then-dividing the full softmax — tying this
+                # implementation directly to paper Eq. 2's mask form.)
+                topk_idx = torch.topk(sigma, k=router_top_k, dim=-1).indices  # (T, k)
+                topk_mask = torch.zeros_like(sigma, dtype=torch.bool)
+                topk_mask.scatter_(1, topk_idx, True)
+                gate = sigma * topk_mask.to(sigma.dtype)  # (T, n_experts)
+                gate_sum = gate.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                gate = gate / gate_sum  # renormalized over top-k per token
 
             target = torch.zeros_like(x_all)
             for m in members:
@@ -927,6 +1039,27 @@ class ExpertDistillPlugin:
             else:
                 distill_state = {}
                 target_device = layer_ref.layer_module.parameters().__next__().device
+                # E-2: build the per-layer router cache ONCE for v2 — all
+                # centroid groups in this layer share the same
+                # ``(x_all, sigma, gate)`` triple (the pre-merge router
+                # and the layer's reservoir-sub-sampled tokens are both
+                # frozen for the whole ``merge`` invocation). For v1
+                # the cache is not used (v1 never calls
+                # ``_router_routing_weights``); we still pass
+                # ``v2_router_cache=None`` for that path, so the helper
+                # falls back to its legacy in-helper sub-sample. Plan
+                # OQ #1: build unconditionally even when every group is
+                # a singleton — the build is one softmax+topk+linear
+                # (≤80 MB fp32) and the simpler control flow beats the
+                # all-singletons micro-saving.
+                v2_router_cache: dict | None = None
+                if self.expert_distill_target_version == "v2":
+                    v2_router_cache = _build_v2_router_cache(
+                        layer_ref=layer_ref,
+                        layer_inputs=layer_inputs_buf,
+                        token_cap=self.expert_distill_token_cap,
+                        device=target_device,
+                    )
                 for centroid, members in grouped.items():
                     if self.expert_distill_skip_singletons and len(members) <= 1:
                         continue
@@ -947,6 +1080,7 @@ class ExpertDistillPlugin:
                         use_ce_term=self.expert_distill_use_ce_term,
                         ce_lambda=self.expert_distill_ce_lambda,
                         target_version=self.expert_distill_target_version,
+                        v2_router_cache=v2_router_cache,
                     )
                     distill_state[centroid] = state
                 log.info(

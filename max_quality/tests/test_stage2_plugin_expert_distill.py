@@ -661,6 +661,225 @@ def test_distill_v2_plugin_path_drives_v2(tiny_model):
         )
 
 
+# --- E-2: v2 per-layer router cache (D-expert-distill-paper-lift) ---------
+def test_e2_v2_router_cache_byte_identical_to_per_group_recompute(tiny_model):
+    """E-2 correctness gate: ``ExpertDistillPlugin.merge`` with the
+    per-layer ``_build_v2_router_cache`` MUST produce bit-identical bank
+    weights to the un-cached path (per-group in-helper recompute).
+
+    Plan §5 Test 1 — byte-equivalence of cached vs un-cached. The cached
+    ``x_all``/``sigma``/``gate`` triple is constructed via the SAME
+    deterministic math the helper would use internally (same
+    ``randperm(layer_idx)`` seed, same TopK-mask + renormalize math), so
+    the two paths must agree exactly on the final centroid weights and
+    on the per-step loss trajectory.
+
+    Force the un-cached path by monkeypatching ``_build_v2_router_cache``
+    in the plugin module to return ``None`` — the helper then falls back
+    to its legacy in-helper recompute. This pins the equivalence
+    contract: the cache is a faithful refactor, not a numerical
+    redefinition.
+    """
+    from moe_compress.utils.model_io import iter_moe_layers, build_banks
+    from moe_compress.stage2.merging import _merge_experts_inplace
+    from moe_compress.stage2.plugins import expert_distill as ed_mod
+
+    distill_kwargs = dict(
+        expert_distill_steps=4,
+        expert_distill_lr=5e-3,
+        expert_distill_betas=(0.9, 0.95),
+        expert_distill_token_cap=16,
+        expert_distill_skip_singletons=True,
+        expert_distill_plateau_steps=100,
+        expert_distill_plateau_eps=0.0,
+        expert_distill_use_ce_term=False,
+        expert_distill_ce_lambda=1.0,
+        expert_distill_target_version="v2",
+    )
+
+    hidden = list(iter_moe_layers(tiny_model))[0].experts_module.hidden_dim
+    torch.manual_seed(1234)
+    layer_inputs = torch.randn(16, hidden) * 0.1
+    # Build a layer with N>=2 non-singleton groups so the cache covers
+    # more than one centroid (proves the cache is actually re-used).
+    grouped = {0: [0, 1], 2: [2, 3]}
+    freq = {0: 3, 1: 1, 2: 5, 3: 2}
+
+    class _StubAcc:
+        def __init__(self, buf):
+            self._buf = buf
+
+        def get(self):
+            return self._buf
+
+    # --- Run A: default (cache ON) ---------------------------------------
+    m_a = copy.deepcopy(tiny_model)
+    l_a = list(iter_moe_layers(m_a))[0]
+    plugin_a = _make_plugin(**distill_kwargs)
+    ctx_a = PipelineContext()
+    ctx_a.set("layer_ref", l_a)
+    ctx_a.set("grouped", grouped)
+    ctx_a.set("freq", freq)
+    ctx_a.set("layer_input_acc", _StubAcc(layer_inputs.clone()))
+    ctx_a.set("distill_state", None)
+    plugin_a.pre_merge_snapshot(ctx_a)
+    _merge_experts_inplace(l_a, grouped, freq, freq_weighted=True)
+    plugin_a.merge(ctx_a)
+    state_a = ctx_a.get("distill_state")
+    banks_a = build_banks(l_a)
+    weights_a = {
+        c: {n: banks_a[n].get(c).clone() for n in ("gate_proj", "up_proj", "down_proj")}
+        for c in state_a.keys()
+    }
+
+    # --- Run B: cache forced OFF (monkeypatch returns None on the path) --
+    # We monkeypatch the helper's local symbol resolution so
+    # ``ExpertDistillPlugin.merge`` invokes the stub that returns None;
+    # ``_distill_merged_group`` then takes its un-cached branch.
+    m_b = copy.deepcopy(tiny_model)
+    l_b = list(iter_moe_layers(m_b))[0]
+    plugin_b = _make_plugin(**distill_kwargs)
+    ctx_b = PipelineContext()
+    ctx_b.set("layer_ref", l_b)
+    ctx_b.set("grouped", grouped)
+    ctx_b.set("freq", freq)
+    ctx_b.set("layer_input_acc", _StubAcc(layer_inputs.clone()))
+    ctx_b.set("distill_state", None)
+    plugin_b.pre_merge_snapshot(ctx_b)
+    _merge_experts_inplace(l_b, grouped, freq, freq_weighted=True)
+
+    orig_build = ed_mod._build_v2_router_cache
+    try:
+        ed_mod._build_v2_router_cache = lambda **kw: None  # type: ignore[assignment]
+        plugin_b.merge(ctx_b)
+    finally:
+        ed_mod._build_v2_router_cache = orig_build  # restore
+
+    state_b = ctx_b.get("distill_state")
+    banks_b = build_banks(l_b)
+
+    # Byte-identity on every distilled centroid's weights AND the
+    # per-step loss trajectory.
+    assert set(state_a.keys()) == set(state_b.keys())
+    for c in state_a.keys():
+        assert state_a[c]["steps"] == state_b[c]["steps"]
+        assert state_a[c]["final_loss"] == state_b[c]["final_loss"], (
+            f"cached vs uncached final_loss diverged for centroid {c}: "
+            f"{state_a[c]['final_loss']} vs {state_b[c]['final_loss']}"
+        )
+        assert state_a[c]["initial_loss"] == state_b[c]["initial_loss"]
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            assert torch.equal(
+                weights_a[c][name], banks_b[name].get(c)
+            ), (
+                f"cached vs uncached bank {name} diverged for centroid {c} — "
+                "E-2 cache must be a bit-identical refactor"
+            )
+
+
+def test_e2_v2_router_routing_weights_called_once_per_layer(
+    tiny_model, monkeypatch
+):
+    """E-2 perf gate: ``_router_routing_weights`` MUST be called exactly
+    ONCE per layer on the v2 plugin path (in ``_build_v2_router_cache``),
+    not once per centroid group. A future refactor that reintroduces
+    per-group recompute fails this immediately rather than re-emerging
+    as a cold-cache CI flake.
+
+    Plan §5 Test 2 — perf-regression assertion.
+
+    Negative control: on the v1 path the router function is never called
+    at all (v1's freq-weighted target does not touch the router).
+    """
+    from moe_compress.utils.model_io import iter_moe_layers
+    from moe_compress.stage2.merging import _merge_experts_inplace
+    from moe_compress.stage2.plugins import expert_distill as ed_mod
+
+    distill_kwargs = dict(
+        expert_distill_steps=2,
+        expert_distill_lr=5e-3,
+        expert_distill_betas=(0.9, 0.95),
+        expert_distill_token_cap=16,
+        expert_distill_skip_singletons=True,
+        expert_distill_plateau_steps=100,
+        expert_distill_plateau_eps=0.0,
+        expert_distill_use_ce_term=False,
+        expert_distill_ce_lambda=1.0,
+    )
+
+    # N >= 2 non-singleton groups so any accidental per-group recompute
+    # would surface as >=2 calls; with the cache the counter must read 1
+    # regardless of N. (Plan §5 suggested N>=3 for "visible" multiplier;
+    # 2 is sufficient for the equality assertion and matches tiny_model's
+    # 4-expert default — see conftest._TinyModel.)
+    layer_for_check = list(iter_moe_layers(tiny_model))[0]
+    assert layer_for_check.num_routed_experts >= 4, (
+        "tiny_model fixture must expose >=4 experts for this test"
+    )
+    grouped = {0: [0, 1], 2: [2, 3]}
+    freq = {0: 3, 1: 1, 2: 5, 3: 2}
+
+    hidden = layer_for_check.experts_module.hidden_dim
+    torch.manual_seed(1234)
+    layer_inputs = torch.randn(16, hidden) * 0.1
+
+    class _StubAcc:
+        def __init__(self, buf):
+            self._buf = buf
+
+        def get(self):
+            return self._buf
+
+    def _driver(plugin):
+        m = copy.deepcopy(tiny_model)
+        layer = list(iter_moe_layers(m))[0]
+        ctx = PipelineContext()
+        ctx.set("layer_ref", layer)
+        ctx.set("grouped", grouped)
+        ctx.set("freq", freq)
+        ctx.set("layer_input_acc", _StubAcc(layer_inputs.clone()))
+        ctx.set("distill_state", None)
+        plugin.pre_merge_snapshot(ctx)
+        _merge_experts_inplace(layer, grouped, freq, freq_weighted=True)
+        plugin.merge(ctx)
+
+    # --- v2: counter MUST read 1 -----------------------------------------
+    orig_rrw = ed_mod._router_routing_weights
+    calls_v2 = {"n": 0}
+
+    def _counter_v2(layer_ref, x):
+        calls_v2["n"] += 1
+        return orig_rrw(layer_ref, x)
+
+    monkeypatch.setattr(ed_mod, "_router_routing_weights", _counter_v2)
+    plugin_v2 = _make_plugin(
+        **distill_kwargs, expert_distill_target_version="v2"
+    )
+    _driver(plugin_v2)
+    assert calls_v2["n"] == 1, (
+        f"v2 path: _router_routing_weights called {calls_v2['n']} times for "
+        f"a single layer with {len(grouped)} groups — E-2 cache should "
+        "collapse this to 1 (was previously len(grouped))"
+    )
+
+    # --- v1: counter MUST read 0 (negative control) ----------------------
+    calls_v1 = {"n": 0}
+
+    def _counter_v1(layer_ref, x):
+        calls_v1["n"] += 1
+        return orig_rrw(layer_ref, x)
+
+    monkeypatch.setattr(ed_mod, "_router_routing_weights", _counter_v1)
+    plugin_v1 = _make_plugin(
+        **distill_kwargs, expert_distill_target_version="v1"
+    )
+    _driver(plugin_v1)
+    assert calls_v1["n"] == 0, (
+        f"v1 path: _router_routing_weights called {calls_v1['n']} times — "
+        "v1 should NEVER touch the router (freq-weighted target only)"
+    )
+
+
 # --- monkeypatch-drift guard (T9-T15 lesson) -----------------------------
 def test_no_stale_monkeypatch_of_distill_symbols():
     """`_distill_merged_group` / `_snapshot_pre_merge_layer_experts` moved to
