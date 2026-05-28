@@ -454,7 +454,7 @@ def run(
         _orig_manifest_path.unlink(missing_ok=True)
     except OSError:
         pass
-    atomic_torch_save(originals, _orig_path)
+    atomic_torch_save(_orig_path, originals)
     # Manifest is written LAST, after the .pt is fsync'd. Stage 4 reads
     # the manifest first; a missing/mismatched manifest means the .pt
     # is torn and must be re-captured.

@@ -39,7 +39,7 @@ from moe_compress.utils.atomic_io import (
 def test_atomic_torch_save_roundtrip(tmp_path):
     p = tmp_path / "sub" / "out.pt"
     payload = {"k": torch.arange(4, dtype=torch.float32)}
-    atomic_torch_save(payload, p)
+    atomic_torch_save(p, payload)
     assert p.exists()
     assert not list(tmp_path.rglob("*.tmp"))
     reloaded = torch.load(p, weights_only=False)
@@ -48,14 +48,14 @@ def test_atomic_torch_save_roundtrip(tmp_path):
 
 def test_atomic_torch_save_preserves_previous_on_failure(tmp_path):
     p = tmp_path / "out.pt"
-    atomic_torch_save({"v": 1}, p)
+    atomic_torch_save(p, {"v": 1})
 
     # Simulate a crash *during* torch.save (before tmp closed).
     def boom(*a, **kw):
         raise RuntimeError("simulated SIGKILL")
     with mock.patch("moe_compress.utils.atomic_io.torch.save", boom):
         with pytest.raises(RuntimeError, match="simulated"):
-            atomic_torch_save({"v": 2}, p)
+            atomic_torch_save(p, {"v": 2})
     # Previous file still readable.
     reloaded = torch.load(p, weights_only=False)
     assert reloaded == {"v": 1}
@@ -67,14 +67,14 @@ def test_atomic_torch_save_kill_between_save_and_rename(tmp_path):
     """A kill AFTER torch.save (tmp file exists) but BEFORE os.replace
     must leave the previous final-path file intact."""
     p = tmp_path / "out.pt"
-    atomic_torch_save({"v": 1}, p)
+    atomic_torch_save(p, {"v": 1})
 
     # Inject a failure inside os.replace (post-write, pre-rename).
     def boom(src, dst):
         raise RuntimeError("simulated kill before rename")
     with mock.patch("moe_compress.utils.atomic_io.os.replace", boom):
         with pytest.raises(RuntimeError):
-            atomic_torch_save({"v": 2}, p)
+            atomic_torch_save(p, {"v": 2})
     reloaded = torch.load(p, weights_only=False)
     assert reloaded == {"v": 1}
     # tmp file is cleaned up by the except branch.
@@ -157,8 +157,8 @@ def test_atomic_safetensors_save_roundtrip(tmp_path):
 
     p = tmp_path / "shard.safetensors"
     atomic_safetensors_save(
-        {"a": torch.arange(4, dtype=torch.float32), "b": torch.zeros(2, 3)},
         p,
+        {"a": torch.arange(4, dtype=torch.float32), "b": torch.zeros(2, 3)},
     )
     assert p.exists()
     with safe_open(str(p), framework="pt", device="cpu") as f:
@@ -179,12 +179,52 @@ def test_durable_rename_basic(tmp_path):
     assert final.read_bytes() == b"hello"
 
 
+def test_durable_rename_call_order_is_fsync_replace_fsync(tmp_path):
+    """MEDIUM-3: durable_rename's correctness contract is the CALL
+    ORDER of (fsync_file, os.replace, fsync_dir), not just the
+    end-state. A reorder (e.g. fsync AFTER replace) would still leave
+    the right file on disk under happy-path tests but would lose the
+    durability guarantee on power-loss. Verify the sequence directly.
+    """
+    tmp = tmp_path / "foo.pt.tmp"
+    final = tmp_path / "foo.pt"
+    tmp.write_bytes(b"hello")
+
+    calls: list[str] = []
+    import moe_compress.utils.atomic_io as aio
+
+    real_fsync_file = aio._fsync_file
+    real_fsync_dir = aio._fsync_dir
+    real_replace = aio.os.replace
+
+    def rec_fsync_file(p):
+        calls.append("fsync_file")
+        return real_fsync_file(p)
+
+    def rec_replace(src, dst):
+        calls.append("replace")
+        return real_replace(src, dst)
+
+    def rec_fsync_dir(d):
+        calls.append("fsync_dir")
+        return real_fsync_dir(d)
+
+    with mock.patch.object(aio, "_fsync_file", side_effect=rec_fsync_file), \
+         mock.patch.object(aio.os, "replace", side_effect=rec_replace), \
+         mock.patch.object(aio, "_fsync_dir", side_effect=rec_fsync_dir):
+        durable_rename(tmp, final)
+
+    assert calls == ["fsync_file", "replace", "fsync_dir"], (
+        f"expected sequence [fsync_file, replace, fsync_dir], got {calls}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # write_manifest_last + read_and_validate_manifest
 # ---------------------------------------------------------------------------
 def test_manifest_last_roundtrip(tmp_path):
     payload = tmp_path / "payload.pt"
-    atomic_torch_save({"data": torch.arange(16)}, payload)
+    atomic_torch_save(payload, {"data": torch.arange(16)})
     manifest = payload.with_suffix(".MANIFEST.json")
     write_manifest_last(payload, manifest, schema_version=1)
     out = read_and_validate_manifest(payload, manifest, expected_schema_version=1)
@@ -208,7 +248,7 @@ def test_manifest_last_torn_payload_detected_by_size(tmp_path):
     with the full size; after a truncating reset of the payload the
     manifest's size_bytes no longer matches → reader fails loudly."""
     payload = tmp_path / "big.pt"
-    atomic_torch_save({"data": torch.arange(1024)}, payload)
+    atomic_torch_save(payload, {"data": torch.arange(1024)})
     manifest = payload.with_suffix(".MANIFEST.json")
     write_manifest_last(payload, manifest, schema_version=1)
 
@@ -223,7 +263,7 @@ def test_manifest_last_torn_payload_detected_by_size(tmp_path):
 
 def test_manifest_last_schema_mismatch_raises(tmp_path):
     payload = tmp_path / "p.pt"
-    atomic_torch_save({"data": 1}, payload)
+    atomic_torch_save(payload, {"data": 1})
     manifest = payload.with_suffix(".MANIFEST.json")
     write_manifest_last(payload, manifest, schema_version=1)
     with pytest.raises(ManifestMismatchError, match="schema_version"):
@@ -232,7 +272,7 @@ def test_manifest_last_schema_mismatch_raises(tmp_path):
 
 def test_manifest_last_sha256_validation(tmp_path):
     payload = tmp_path / "p.pt"
-    atomic_torch_save({"data": torch.arange(8)}, payload)
+    atomic_torch_save(payload, {"data": torch.arange(8)})
     manifest = payload.with_suffix(".MANIFEST.json")
     write_manifest_last(payload, manifest, schema_version=1, compute_sha256=True)
 
@@ -250,7 +290,7 @@ def test_manifest_last_sha256_validation(tmp_path):
 
 def test_manifest_last_extra_meta_preserved(tmp_path):
     payload = tmp_path / "p.pt"
-    atomic_torch_save({"data": 1}, payload)
+    atomic_torch_save(payload, {"data": 1})
     manifest = payload.with_suffix(".MANIFEST.json")
     write_manifest_last(
         payload, manifest, schema_version=1,
@@ -258,6 +298,24 @@ def test_manifest_last_extra_meta_preserved(tmp_path):
     )
     out = read_and_validate_manifest(payload, manifest, expected_schema_version=1)
     assert out["extra"] == {"layers": 32, "model": "fake"}
+
+
+def test_manifest_last_includes_write_timestamp(tmp_path):
+    """MEDIUM-2: every manifest now carries a UTC ISO-8601 timestamp
+    for cross-host forensics. The field is informational only — never
+    validated — but must be present on every newly-written manifest."""
+    import re
+    payload = tmp_path / "p.pt"
+    atomic_torch_save(payload, {"x": 1})
+    manifest = payload.with_suffix(".MANIFEST.json")
+    write_manifest_last(payload, manifest, schema_version=1)
+    out = read_and_validate_manifest(payload, manifest, expected_schema_version=1)
+    assert "write_timestamp_iso" in out
+    ts = out["write_timestamp_iso"]
+    # ISO-8601 with timezone offset: 2026-05-28T...+00:00 or ...Z.
+    assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", ts), (
+        f"unexpected timestamp format: {ts!r}"
+    )
 
 
 def test_manifest_last_requires_payload_exists(tmp_path):
@@ -278,7 +336,7 @@ def test_atomic_torch_save_kill_after_fsync_before_rename(tmp_path):
     final-path file MUST be the PREVIOUS good version (or absent if no
     prior write). The tmp file MAY survive (resume sweeps it)."""
     p = tmp_path / "out.pt"
-    atomic_torch_save({"v": "first"}, p)
+    atomic_torch_save(p, {"v": "first"})
     # Patch durable_rename to fail (between fsync and replace internally,
     # but at this granularity we simulate "rename never happened").
     with mock.patch(
@@ -286,7 +344,7 @@ def test_atomic_torch_save_kill_after_fsync_before_rename(tmp_path):
         side_effect=RuntimeError("kill after fsync, before rename"),
     ):
         with pytest.raises(RuntimeError):
-            atomic_torch_save({"v": "second"}, p)
+            atomic_torch_save(p, {"v": "second"})
     # Final-path file is the PREVIOUS good version.
     reloaded = torch.load(p, weights_only=False)
     assert reloaded == {"v": "first"}

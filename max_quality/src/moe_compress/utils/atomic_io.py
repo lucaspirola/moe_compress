@@ -44,6 +44,7 @@ import hashlib
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -135,7 +136,7 @@ def durable_rename(tmp: Path, final: Path) -> None:
 # ---------------------------------------------------------------------------
 # Atomic writers (Pattern O — single source of truth).
 # ---------------------------------------------------------------------------
-def atomic_torch_save(payload: Any, path: str | Path) -> Path:
+def atomic_torch_save(path: str | Path, payload: Any) -> Path:
     """Atomically write ``payload`` to ``path`` via torch.save.
 
     Sequence: mkdir parents → torch.save(payload, tmp) → fsync(tmp) →
@@ -144,6 +145,12 @@ def atomic_torch_save(payload: Any, path: str | Path) -> Path:
 
     On any exception the partial .tmp file is unlinked. The previous
     contents of ``path`` (if any) are untouched.
+
+    MEDIUM-1: signature is ``(path, payload)`` — flipped from the
+    legacy ``(payload, path)`` order to match every other writer in
+    this module (``atomic_json_save``, ``atomic_write_text``,
+    ``atomic_npz_save`` which is forced by ``**arrays``). The legacy
+    order was inherited from ``torch.save``'s C-side prototype.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,8 +225,8 @@ def atomic_json_save(
 
 
 def atomic_safetensors_save(
-    tensors: dict[str, torch.Tensor],
     path: str | Path,
+    tensors: dict[str, torch.Tensor],
     *,
     metadata: dict[str, str] | None = None,
 ) -> Path:
@@ -227,6 +234,11 @@ def atomic_safetensors_save(
 
     safetensors.save_file writes in place by default (no atomic helper in
     the upstream library). We pass it a tmp path, then fsync + rename.
+
+    MEDIUM-1: signature is ``(path, tensors, *, metadata)`` to match
+    every other writer in this module. The legacy
+    ``(tensors, path, *, metadata)`` order was inherited from
+    safetensors's own ``save_file``.
     """
     from safetensors.torch import save_file
 
@@ -302,6 +314,10 @@ def write_manifest_last(
       compute_sha256=False; large artifacts may set this False to skip
       the I/O cost and rely on size + schema_version cross-checks
       instead)
+    * ``write_timestamp_iso`` (str — UTC ISO-8601 timestamp at the
+      moment the manifest was emitted; forensics-only, never validated).
+      MEDIUM-2: surfaces "which run wrote this artifact" across
+      multi-host resumes where bucket attribution is otherwise opaque.
     * ``extra`` (dict | absent — caller-supplied bag for forensics)
 
     The manifest is the LAST thing written by the producer. A reader
@@ -329,6 +345,10 @@ def write_manifest_last(
         "payload_name": payload_path.name,
         "size_bytes": int(size_bytes),
         "sha256": sha256,
+        # MEDIUM-2: forensics-only — not validated by reader. Useful for
+        # disambiguating which host wrote the artifact when multiple pods
+        # share a bucket (vast.ai / DataCrunch eviction-recovery flows).
+        "write_timestamp_iso": datetime.now(timezone.utc).isoformat(),
     }
     if extra_meta:
         # Caller meta is kept under a sub-key so future top-level fields
@@ -358,7 +378,10 @@ def read_and_validate_manifest(
       default for multi-GB payloads; reserve for security-sensitive
       reads)
 
-    Returns the parsed manifest dict on success.
+    Returns the parsed manifest dict on success. MEDIUM-2: the parsed
+    dict includes the ``write_timestamp_iso`` field if present (added
+    in MEDIUM-2 — older manifests lack it; never validated, only
+    surfaced at DEBUG for forensics).
 
     The caller decides what to do with the failure: deleting the
     payload + manifest and re-running is the standard recovery path on
@@ -420,5 +443,14 @@ def read_and_validate_manifest(
                 f"with manifest sha256={expected_sha}. Payload corrupted — "
                 "delete both and re-run."
             )
+
+    # MEDIUM-2: surface the write timestamp at DEBUG so cross-host
+    # resume sweeps can attribute "which run wrote this artifact"
+    # without re-parsing the manifest. Never validated.
+    ts = manifest.get("write_timestamp_iso")
+    if ts is not None:
+        log.debug(
+            "atomic_io: validated manifest %s (written %s)", manifest_path, ts,
+        )
 
     return manifest

@@ -261,7 +261,7 @@ class ShardWriter:
         # fsync(parent) so a torn write leaves the previous (good or
         # absent) final-path file untouched and a stale .tmp orphan.
         from .atomic_io import atomic_safetensors_save
-        atomic_safetensors_save({_INPUT_KEY: x_in, _OUTPUT_KEY: x_out}, path)
+        atomic_safetensors_save(path, {_INPUT_KEY: x_in, _OUTPUT_KEY: x_out})
         self._shards.append(ShardEntry(path=name, rows=int(x_in.size(0))))
 
     def close_pending(self) -> None:
@@ -315,7 +315,7 @@ class ShardWriter:
             # F-H-1 (companion): same atomic-write protection as the
             # input shard above. See _write_input_shard rationale.
             from .atomic_io import atomic_safetensors_save
-            atomic_safetensors_save({_SHARED_KEY: x_shared}, shared_path)
+            atomic_safetensors_save(shared_path, {_SHARED_KEY: x_shared})
 
     def finalize(self, *, split_ratio: float = 0.9, seed: int = 0) -> ShardManifest:
         """Whole-shard train/holdout split, write ``manifest.json``, return it.

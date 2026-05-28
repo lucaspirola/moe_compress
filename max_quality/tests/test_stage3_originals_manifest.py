@@ -5,7 +5,7 @@ opening the .pt.
 We don't run the full Stage 3 orchestrator (too heavy); instead we
 exercise the same write+read protocol the orchestrator uses end-to-end:
 
-  1. atomic_torch_save(originals, _orig_path)
+  1. atomic_torch_save(_orig_path, originals)
   2. write_manifest_last(_orig_path, _orig_manifest_path, schema_version=1)
 
 then simulate a Stage-4-style read with truncation injected between
@@ -38,7 +38,7 @@ def test_stage3_originals_manifest_roundtrip(tmp_path):
     manifest_path = tmp_path / "_stage3_original_weights.pt.MANIFEST.json"
 
     originals = _fake_originals()
-    atomic_torch_save(originals, orig_path)
+    atomic_torch_save(orig_path, originals)
     write_manifest_last(
         orig_path, manifest_path, schema_version=1,
         extra_meta={"n_matrices": len(originals)},
@@ -61,7 +61,7 @@ def test_stage3_originals_torn_payload_fails_loudly(tmp_path):
     BEFORE Stage 4 ever touches the corrupt file."""
     orig_path = tmp_path / "_stage3_original_weights.pt"
     manifest_path = tmp_path / "_stage3_original_weights.pt.MANIFEST.json"
-    atomic_torch_save(_fake_originals(), orig_path)
+    atomic_torch_save(orig_path, _fake_originals())
     write_manifest_last(orig_path, manifest_path, schema_version=1)
 
     # Truncate the payload to simulate SIGKILL mid-write recovered by
@@ -80,7 +80,7 @@ def test_stage3_originals_missing_manifest_fails_loudly(tmp_path):
     the .pt without its manifest. Reader treats this as torn."""
     orig_path = tmp_path / "_stage3_original_weights.pt"
     manifest_path = tmp_path / "_stage3_original_weights.pt.MANIFEST.json"
-    atomic_torch_save(_fake_originals(), orig_path)
+    atomic_torch_save(orig_path, _fake_originals())
     # NO write_manifest_last call — simulating kill in between.
 
     with pytest.raises(ManifestMismatchError, match="missing"):
@@ -91,7 +91,7 @@ def test_stage3_originals_schema_bump_invalidates(tmp_path):
     """A schema_version bump in Stage 3 must invalidate stale manifests."""
     orig_path = tmp_path / "_stage3_original_weights.pt"
     manifest_path = tmp_path / "_stage3_original_weights.pt.MANIFEST.json"
-    atomic_torch_save(_fake_originals(), orig_path)
+    atomic_torch_save(orig_path, _fake_originals())
     write_manifest_last(orig_path, manifest_path, schema_version=1)
 
     # Stage 4 from a future revision expects schema_version=2.
@@ -103,7 +103,7 @@ def test_stage3_originals_no_dotnpz_tmp_leftovers(tmp_path):
     """Belt-and-braces: writer leaves no .tmp orphans on success."""
     orig_path = tmp_path / "_stage3_original_weights.pt"
     manifest_path = tmp_path / "_stage3_original_weights.pt.MANIFEST.json"
-    atomic_torch_save(_fake_originals(), orig_path)
+    atomic_torch_save(orig_path, _fake_originals())
     write_manifest_last(orig_path, manifest_path, schema_version=1)
     assert not list(tmp_path.glob("*.tmp"))
 

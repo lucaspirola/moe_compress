@@ -892,3 +892,205 @@ def test_provider_pair_dispatch_first(tmp_path):
         "C_cross_cov is student-dependent and must NOT be supplied by the "
         "cache provider"
     )
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-7 — F-H-7 backward-compat: legacy non-namespaced sidecar fallback.
+# ---------------------------------------------------------------------------
+def _write_legacy_phase_b(jsonl_path: Path, payload: PhaseBPayload) -> Path:
+    """Write a PhaseBPayload at the LEGACY (pre-F-H-7) non-namespaced
+    path: <jsonl.parent>/sidecars/phase_b.pt. Used by the backward-compat
+    tests below to seed disk state that simulates a pre-F-H-7 run."""
+    from moe_compress.utils.cached_calibration_signals import _legacy_sidecar_path
+    legacy = _legacy_sidecar_path(jsonl_path, "phase_b")
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    # Move tensor fields to CPU as save_phase_b would; we bypass the
+    # public writer because save_phase_b writes to the NEW namespaced
+    # path, but the test needs the legacy layout on disk.
+    from dataclasses import replace as _replace
+    cpu_payload = _replace(
+        payload,
+        per_expert_max=payload.per_expert_max.detach().cpu(),
+        routing_freq=payload.routing_freq.detach().cpu(),
+        mean_routing_weight=payload.mean_routing_weight.detach().cpu(),
+        output_reservoir=payload.output_reservoir.detach().cpu(),
+    )
+    torch.save(cpu_payload, legacy)
+    return legacy
+
+
+def _with_ccs_logger_propagate(fn):
+    """Pattern N (caplog-propagate-restore) wrapper for cached_calibration_signals.
+
+    The module uses ``log = logging.getLogger(__name__)`` — a non-root logger
+    — so pytest's caplog needs the logger to propagate=True for records to
+    bubble up to the root LogCaptureHandler. See [[caplog-propagate-restore]].
+    """
+    import logging as _lg
+    _logger = _lg.getLogger("moe_compress.utils.cached_calibration_signals")
+    prev = _logger.propagate
+    _logger.propagate = True
+    try:
+        return fn()
+    finally:
+        _logger.propagate = prev
+
+
+def test_fh7_legacy_single_stem_fallback_warns_once(tmp_path, caplog):
+    """MEDIUM-7 + HIGH-4: a single-stem legacy sidecar is consumed with a
+    ONE-SHOT WARNING. Multiple successive loads emit the warning AT MOST
+    ONCE per (legacy_path, signal_name) — HIGH-4's dedupe contract.
+    """
+    import logging
+    import moe_compress.utils.cached_calibration_signals as ccs
+
+    # Reset the dedupe set so this test is independent of prior tests.
+    ccs._already_warned_legacy_paths.clear()
+
+    jsonl = tmp_path / "trace_solo.jsonl"
+    jsonl.touch()  # ensure the parent dir counts exactly one .jsonl stem
+    legacy = _write_legacy_phase_b(jsonl, _make_phase_b())
+    assert legacy.exists()
+    # Sanity: new-style path does NOT exist.
+    assert not sidecar_path(jsonl, "phase_b").exists()
+
+    caplog.set_level(logging.WARNING, logger="moe_compress.utils.cached_calibration_signals")
+
+    def _do_loads():
+        p1 = load_phase_b(jsonl)
+        p2 = load_phase_b(jsonl)
+        p3 = load_phase_b(jsonl)
+        assert p1 is not None and p2 is not None and p3 is not None
+
+    _with_ccs_logger_propagate(_do_loads)
+    # Exactly ONE warning recorded across three reads (HIGH-4 dedupe).
+    warns = [r for r in caplog.records
+             if r.levelno >= logging.WARNING and "F-H-7" in r.getMessage()]
+    assert len(warns) == 1, (
+        f"expected exactly 1 WARNING (one-shot dedupe), got {len(warns)}: "
+        f"{[r.getMessage() for r in warns]}"
+    )
+
+
+def test_fh7_legacy_multi_stem_refuses_with_error(tmp_path, caplog):
+    """MEDIUM-7: with >1 JSONL stem in the parent dir, the legacy
+    fallback is REFUSED — log.error + None return. The error message
+    is operator-actionable (mentions the .jsonl.tmp participation; see
+    MEDIUM-6).
+    """
+    import logging
+    import moe_compress.utils.cached_calibration_signals as ccs
+
+    ccs._already_warned_legacy_paths.clear()
+
+    jsonl_a = tmp_path / "trace_alpha.jsonl"
+    jsonl_b = tmp_path / "trace_beta.jsonl"
+    jsonl_a.touch()
+    jsonl_b.touch()
+    # Two stems → ambiguous → refuse.
+    _write_legacy_phase_b(jsonl_a, _make_phase_b())
+
+    caplog.set_level(logging.ERROR, logger="moe_compress.utils.cached_calibration_signals")
+    result_box: dict = {}
+
+    def _do_load():
+        result_box["r"] = load_phase_b(jsonl_a)
+
+    _with_ccs_logger_propagate(_do_load)
+    assert result_box["r"] is None, "multi-stem legacy fallback must return None"
+    errs = [r for r in caplog.records
+            if r.levelno >= logging.ERROR and "F-H-7" in r.getMessage()]
+    assert len(errs) >= 1, "expected ERROR log on multi-stem refusal"
+    # MEDIUM-6: error mentions .jsonl.tmp participation.
+    assert any(".jsonl.tmp" in r.getMessage() for r in errs), (
+        "ERROR must mention .jsonl.tmp participation per MEDIUM-6"
+    )
+
+
+def test_fh7_new_path_exists_ignores_legacy(tmp_path, caplog):
+    """MEDIUM-7: when the new-style namespaced path exists, the legacy
+    file is ignored entirely — no WARNING, no ERROR, no log emission
+    relating to F-H-7 backward compat.
+    """
+    import logging
+    import moe_compress.utils.cached_calibration_signals as ccs
+
+    ccs._already_warned_legacy_paths.clear()
+
+    jsonl = tmp_path / "trace_x.jsonl"
+    payload = _make_phase_b()
+    # Seed BOTH the new-style path (via the public writer) and the
+    # legacy path (via the helper).
+    save_phase_b(payload, jsonl)
+    _write_legacy_phase_b(jsonl, payload)
+    assert sidecar_path(jsonl, "phase_b").exists()
+
+    caplog.set_level(logging.DEBUG, logger="moe_compress.utils.cached_calibration_signals")
+    loaded_box: dict = {}
+
+    def _do_load():
+        loaded_box["v"] = load_phase_b(jsonl)
+
+    _with_ccs_logger_propagate(_do_load)
+    assert loaded_box["v"] is not None
+    # No F-H-7 log records at all.
+    fh7 = [r for r in caplog.records if "F-H-7" in r.getMessage()]
+    assert fh7 == [], (
+        f"new-path hit must NOT touch F-H-7 backward-compat code path; "
+        f"got {[r.getMessage() for r in fh7]}"
+    )
+
+
+def test_fh7_router_kd_legacy_single_stem_one_shot_warn(tmp_path, caplog):
+    """MEDIUM-7 (router_kd variant): the legacy router_kd_logits dir
+    fallback (load_router_kd_logits) also dedupes WARN emissions per
+    HIGH-4. Multiple loads → at most one warning.
+    """
+    import logging
+    import moe_compress.utils.cached_calibration_signals as ccs
+    from moe_compress.utils.cached_calibration_signals import (
+        RouterKDLogitsPayload,
+        SCHEMA_VERSIONS,
+        _legacy_router_kd_logits_dir,
+        save_router_kd_logits,
+    )
+
+    ccs._already_warned_legacy_paths.clear()
+
+    jsonl = tmp_path / "trace_router.jsonl"
+    jsonl.touch()
+    # Seed a legacy shard.
+    payload = RouterKDLogitsPayload(
+        schema_version=SCHEMA_VERSIONS["router_kd_logits"],
+        token_ids=np.arange(4, dtype=np.int32),
+        top_ids=np.zeros((4, 3), dtype=np.int32),
+        top_logprobs=np.zeros((4, 3), dtype=np.float32),
+        attempt_idx=7,
+        top_k=3,
+    )
+    # Use the public writer to create a *new-namespaced* shard, then
+    # move it to the legacy location.
+    save_router_kd_logits(payload, jsonl)
+    new_shard = router_kd_logits_dir(jsonl) / "0000007.npz"
+    assert new_shard.exists()
+    legacy_dir = _legacy_router_kd_logits_dir(jsonl)
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    shutil.move(str(new_shard), str(legacy_dir / "0000007.npz"))
+    # Remove the now-empty new-style dir to simulate a pre-F-H-7 layout.
+    new_shard.parent.rmdir()
+
+    caplog.set_level(logging.WARNING, logger="moe_compress.utils.cached_calibration_signals")
+
+    def _do_loads():
+        r1 = load_router_kd_logits(jsonl, attempt_idx=7)
+        r2 = load_router_kd_logits(jsonl, attempt_idx=7)
+        r3 = load_router_kd_logits(jsonl, attempt_idx=7)
+        assert r1 is not None and r2 is not None and r3 is not None
+
+    _with_ccs_logger_propagate(_do_loads)
+    warns = [r for r in caplog.records
+             if r.levelno >= logging.WARNING and "F-H-7" in r.getMessage()]
+    assert len(warns) == 1, (
+        f"router_kd_logits legacy WARN must be one-shot; got {len(warns)}"
+    )

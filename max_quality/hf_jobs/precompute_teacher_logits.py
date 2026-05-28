@@ -198,7 +198,7 @@ def _main() -> int:
         manifest_path.unlink(missing_ok=True)
     except OSError:
         pass
-    atomic_torch_save(payload, out_path)
+    atomic_torch_save(out_path, payload)
     write_manifest_last(
         out_path,
         manifest_path,

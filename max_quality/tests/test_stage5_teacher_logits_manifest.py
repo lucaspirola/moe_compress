@@ -34,7 +34,7 @@ def _fake_cache_payload(num_samples=4, seq_len=8, vocab=32):
 def test_stage5_teacher_logits_manifest_roundtrip(tmp_path):
     cache_path = tmp_path / "_stage5_teacher_logits.pt"
     manifest_path = cache_path.with_suffix(cache_path.suffix + ".MANIFEST.json")
-    atomic_torch_save(_fake_cache_payload(), cache_path)
+    atomic_torch_save(cache_path, _fake_cache_payload())
     write_manifest_last(
         cache_path, manifest_path, schema_version=1,
         extra_meta={"artifact": "stage5_teacher_logits"},
@@ -57,7 +57,7 @@ def test_stage5_teacher_logits_torn_payload_caught(tmp_path):
     mmap."""
     cache_path = tmp_path / "_stage5_teacher_logits.pt"
     manifest_path = cache_path.with_suffix(cache_path.suffix + ".MANIFEST.json")
-    atomic_torch_save(_fake_cache_payload(), cache_path)
+    atomic_torch_save(cache_path, _fake_cache_payload())
     write_manifest_last(cache_path, manifest_path, schema_version=1)
 
     real_size = cache_path.stat().st_size
@@ -72,7 +72,7 @@ def test_stage5_teacher_logits_missing_manifest_fails(tmp_path):
     """Kill between atomic_torch_save and write_manifest_last."""
     cache_path = tmp_path / "_stage5_teacher_logits.pt"
     manifest_path = cache_path.with_suffix(cache_path.suffix + ".MANIFEST.json")
-    atomic_torch_save(_fake_cache_payload(), cache_path)
+    atomic_torch_save(cache_path, _fake_cache_payload())
 
     with pytest.raises(ManifestMismatchError, match="missing"):
         read_and_validate_manifest(cache_path, manifest_path, expected_schema_version=1)
@@ -89,9 +89,9 @@ def test_stage5_teacher_logits_size_mismatch_after_replacement(tmp_path):
     """
     cache_path = tmp_path / "_stage5_teacher_logits.pt"
     manifest_path = cache_path.with_suffix(cache_path.suffix + ".MANIFEST.json")
-    atomic_torch_save(_fake_cache_payload(num_samples=4), cache_path)
+    atomic_torch_save(cache_path, _fake_cache_payload(num_samples=4))
     write_manifest_last(cache_path, manifest_path, schema_version=1)
     # Replace payload with a larger one but keep the old manifest.
-    atomic_torch_save(_fake_cache_payload(num_samples=16), cache_path)
+    atomic_torch_save(cache_path, _fake_cache_payload(num_samples=16))
     with pytest.raises(ManifestMismatchError, match="size"):
         read_and_validate_manifest(cache_path, manifest_path, expected_schema_version=1)

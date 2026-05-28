@@ -18,12 +18,17 @@ came from cache or from a live forward pass.
 
 Atomic-write contract
 ---------------------
-Every ``save_*`` writes to ``str(final_path) + ".tmp"`` then calls
-``os.replace(tmp, final_path)``. A process kill mid-``torch.save`` leaves
-the previous version of ``final_path`` intact (only ``.tmp`` is partial).
-A kill between ``torch.save`` completing and ``os.replace`` leaves a
-stale ``.tmp`` file (orphan); callers may delete orphans on startup but
-are not required to.
+Every ``save_*`` delegates to :mod:`moe_compress.utils.atomic_io`
+(Pattern O — atomic-write + manifest-last). The dance is
+``tmp + fsync(fd) + os.replace + fsync(parent_dir)`` — not a bare
+``tmp + os.replace``. A SIGKILL between the last write() and the next
+pdflush cycle on ext4 would otherwise leave the renamed file with
+stale/garbage blocks; the explicit fsync covers that gap (MEDIUM-4
+docstring refresh; the F-H-3 fix landed in :func:`_atomic_torch_save`
+and :func:`_atomic_npz_save` is now thin shims around the shared
+helpers in :mod:`utils.atomic_io`). A kill BETWEEN ``torch.save``
+completing and ``os.replace`` leaves a stale ``.tmp`` file (orphan);
+callers may delete orphans on startup but are not required to.
 
 Schema versioning
 -----------------
@@ -50,24 +55,26 @@ Sharded signals (``router_kd_logits`` per attempt_idx; ``block_hidden``
 per layer_idx) are naturally collision-free if each shard is written by
 exactly one process.
 
-Sidecar isolation across calibration runs
------------------------------------------
-Sidecars are collocated with the JSONL by DIRECTORY, not by JSONL stem.
-Two distinct calibration runs that write to JSONLs in the same parent
-directory will OVERWRITE each other's sidecars. To preserve sidecars
-across runs that produce distinct JSONLs (e.g., different cache_keys),
-either:
+Sidecar isolation across calibration runs (post-F-H-7)
+------------------------------------------------------
+Sidecars are namespaced by JSONL **stem** under
+``<jsonl_path.parent>/sidecars/<jsonl.stem>/`` (see :func:`sidecar_path`).
+Two distinct calibration runs that produce different JSONL stems in the
+same parent directory (e.g. ablation sweeps under ``artifacts/_shared/``)
+NO LONGER overwrite each other's sidecars; each stem owns its own
+sidecar subdirectory. MEDIUM-5 docstring refresh: the prior overwrite
+behaviour was fixed by F-H-7 (commit 47dbe0d).
 
-* Use distinct output directories per run, OR
-* Rely on the JSONL cache_key suffix being identical across runs that
-  should share sidecars (the typical case — same teacher + same prompt
-  source + same num_prompts produces the same cache_key, so the
-  sidecar from a prior run is the cache hit for the current run).
-
-This is the consequence of the directory-collocation choice (see
-``sidecar_path`` docstring); it is intentional and trades isolation
-for resilience-to-JSONL-rename. Operators running ablation sweeps
-across different cache_keys MUST use distinct output dirs.
+Backward compat: legacy non-namespaced sidecars
+(``<jsonl.parent>/sidecars/<signal>.pt``) from pre-F-H-7 runs are
+consulted as a fallback by :func:`_resolve_sidecar_for_load` AND ONLY
+WHEN the parent directory contains exactly one JSONL stem (in-flight
+``.jsonl.tmp`` files also count toward the stem disambiguation). A
+single-stem legacy hit logs a one-shot WARNING (deduped via
+``_already_warned_legacy_paths``); a multi-stem legacy fallback logs
+an ERROR and refuses to consume (operator must manually migrate or
+delete the legacy file). New writes ALWAYS land at the new namespaced
+path; legacy paths are read-only.
 
 Out of scope here
 -----------------
@@ -570,9 +577,13 @@ def _atomic_torch_save(payload: Any, path: Path) -> None:
     Now delegates to the shared :func:`utils.atomic_io.atomic_torch_save`
     which does the full §11 durable-write dance — fixing all ~15 sidecar
     write sites in this module at once (Pattern O).
+
+    Local arg order is ``(payload, path)`` for backward compat with the
+    pre-MEDIUM-1 in-module callers; the shared helper is invoked with
+    the new ``(path, payload)`` order it now requires.
     """
     from .atomic_io import atomic_torch_save as _shared_atomic_torch_save
-    _shared_atomic_torch_save(payload, path)
+    _shared_atomic_torch_save(path, payload)
 
 
 def _atomic_npz_save(arrays: dict[str, np.ndarray], path: Path) -> None:

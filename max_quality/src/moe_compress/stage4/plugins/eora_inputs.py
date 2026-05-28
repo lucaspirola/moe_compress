@@ -227,6 +227,13 @@ class EoraInputsPlugin:
                     "and re-run Stage 3."
                 ) from exc
         else:
+            # MEDIUM-8 TODO(post-2026-Q3): remove this backward-compat
+            # shim once all sidecars under /opt/output/* are regenerated
+            # with manifests. The fallback exists because pre-F-S3-1
+            # runs produced .pt files without sibling manifests; once
+            # those in-flight runs complete, ALL Stage 3 writers emit a
+            # manifest and the missing-manifest branch becomes
+            # dead-code-loud-fail territory.
             log.warning(
                 "Stage 4: %s has no MANIFEST.json sibling (pre-F-S3-1 "
                 "calibration run?). Proceeding without manifest validation; "
