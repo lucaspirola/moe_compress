@@ -130,6 +130,11 @@ SCHEMA_VERSIONS: dict[str, int] = {
     "routing_stats":       1,
     "router_logits_stats": 1,
     "output_reservoir":    1,
+    # W-1: Wanda intra-expert ``scalar_row`` calibration sidecar — see
+    # ``tasks/PLAN_W1_WANDA_SCALAR_ROW_CAPTURE.md`` + the
+    # ``vllm.calibration_wanda_scalar_row`` writer module. Lands compliant
+    # with Pattern O (atomic write + manifest-last) from day one (audit S-1).
+    "wanda_scalar_row":    1,
 }
 
 
@@ -670,6 +675,44 @@ class CovariancePayload:
     n_layers: int
     # {(layer_idx, expert_idx, matrix_name): Tensor[d_in, d_in] fp16}
     sigma_in: dict
+    # {(layer_idx, expert_idx, matrix_name): int}
+    token_counts: dict
+
+
+@dataclass
+class WandaScalarRowPayload:
+    """Per-(layer, expert, matrix) Wanda ``scalar_row`` running mean.
+
+    On-disk shape mirrors the in-memory state of
+    :class:`moe_compress.stage3.plugins.wanda_intra_expert_score._WandaScalarRowAccumulator`:
+
+    * ``sigma_x_g_squared``:
+      ``dict[(layer_idx, expert_idx, matrix_name) -> Tensor[d_in] fp32]`` —
+      the running mean ``E_t[(x_t · g_{e,t})^2]`` per input channel ``c``.
+    * ``token_counts``:
+      ``dict[(layer_idx, expert_idx, matrix_name) -> int]`` — the number of
+      token rows that contributed to each running mean (needed by the
+      consumer to round-trip the accumulator state via ``from_payload``).
+
+    Two ``matrix_name`` values are written: ``"gate_proj"`` and
+    ``"down_proj"``. ``up_proj`` aliases ``gate_proj`` at compute time (per
+    the D-gate-up-share deviation in
+    ``stage3/plugins/wanda_intra_expert_score.py``), so it is NOT stored.
+
+    Pattern B: the ``schema_version`` field IS the on-disk
+    ``format_version`` (kept under that name for compatibility with the
+    central ``_check_schema`` helper that all other sidecars use).
+
+    Schema v1 — see ``tasks/PLAN_W1_WANDA_SCALAR_ROW_CAPTURE.md`` §5.1 for
+    the contract; the writer lives in ``vllm/calibration_wanda_scalar_row.py``
+    (vLLM patch, mirrors ``vllm/calibration_reap_scores.py`` at
+    ``max_quality/patches/vllm_calibration_hooks.patch:8134-8473``).
+    """
+    schema_version: int
+    n_experts: int
+    n_layers: int
+    # {(layer_idx, expert_idx, matrix_name): Tensor[d_in] fp32}
+    sigma_x_g_squared: dict
     # {(layer_idx, expert_idx, matrix_name): int}
     token_counts: dict
 
@@ -1400,6 +1443,103 @@ def load_covariance(jsonl_path: Path) -> CovariancePayload | None:
 
 
 # ---------------------------------------------------------------------------
+# Signal 3b: wanda_scalar_row (W-1 — Wanda intra-expert ``scalar_row``
+# calibration sidecar). Lands compliant with Pattern O (atomic write +
+# manifest-last) AND Pattern B (format_version validated against
+# SCHEMA_VERSIONS) from day one — see ``tasks/PLAN_W1_WANDA_SCALAR_ROW_CAPTURE.md``
+# §5. The writer is ``vllm.calibration_wanda_scalar_row.dump_wanda_scalar_row``,
+# mirroring the REAP-scores precedent at
+# ``max_quality/patches/vllm_calibration_hooks.patch:8134-8473``.
+# ---------------------------------------------------------------------------
+def save_wanda_scalar_row(
+    payload: WandaScalarRowPayload, jsonl_path: Path,
+) -> None:
+    """Atomically write the per-(layer, expert, matrix) Wanda scalar_row sidecar.
+
+    Pattern O (atomic write + manifest-last):
+
+      1. Tensors are detached + CPU-moved + cast to fp32 (storage dtype —
+         see §10 Risk 2 of the plan).
+      2. ``_atomic_torch_save`` writes the payload via
+         ``tmp + fsync(fd) + os.replace + fsync(parent)``.
+      3. ``write_manifest_last`` emits the sidecar manifest LAST, after
+         the payload's data blocks are durable. A reader that finds the
+         payload without the manifest treats it as torn (Pattern O).
+
+    ``token_counts`` is a plain ``dict[key, int]`` and is copied as-is.
+    """
+    cpu_sigma = {
+        k: v.detach().to("cpu", dtype=torch.float32, copy=True)
+        for k, v in payload.sigma_x_g_squared.items()
+    }
+    cpu_payload = WandaScalarRowPayload(
+        schema_version=payload.schema_version,
+        n_experts=payload.n_experts,
+        n_layers=payload.n_layers,
+        sigma_x_g_squared=cpu_sigma,
+        token_counts=dict(payload.token_counts),
+    )
+    sidecar = sidecar_path(jsonl_path, "wanda_scalar_row")
+    _atomic_torch_save(cpu_payload, sidecar)
+    # Manifest LAST — Pattern O. Skip sha256 because the payload can be
+    # ~110 MB (Qwen3.6-35B-A3B) and the size + schema_version cross-check
+    # is sufficient for torn-write detection.
+    manifest_path = sidecar.with_suffix(sidecar.suffix + ".MANIFEST.json")
+    write_manifest_last(
+        sidecar,
+        manifest_path,
+        schema_version=cpu_payload.schema_version,
+        extra_meta={
+            "signal": "wanda_scalar_row",
+            "n_layers": cpu_payload.n_layers,
+            "n_experts": cpu_payload.n_experts,
+            "n_keys": len(cpu_payload.sigma_x_g_squared),
+        },
+        compute_sha256=False,
+    )
+
+
+def load_wanda_scalar_row(
+    jsonl_path: Path,
+) -> WandaScalarRowPayload | None:
+    """Load the Wanda scalar_row sidecar.
+
+    Returns ``None`` if the sidecar does not exist (cache miss). On the
+    namespaced (post-F-H-7) path, the manifest is REQUIRED — a missing
+    manifest raises :class:`ManifestMismatchError` with the actionable
+    "torn write" message. Rationale: W-1 is a green-field sidecar — no
+    legacy artifacts exist on disk, so the bare-``torch.load`` fallback
+    would be dead code on day one. Tightening the contract here makes
+    the new sidecar strictly cleaner than the 10 pre-existing sidecars
+    (audit §S-1).
+
+    Raises ``ValueError`` on payload-side schema mismatch (via
+    ``_check_schema``); the message is actionable ("Delete the sidecar
+    to regenerate").
+
+    Raises :class:`ManifestMismatchError` on manifest-vs-payload
+    disagreement (missing manifest, schema disagreement, payload size
+    mismatch).
+    """
+    path = _resolve_sidecar_for_load(jsonl_path, "wanda_scalar_row")
+    if path is None:
+        return None
+    # Pattern O: validate the manifest BEFORE reading the payload — if the
+    # producer was killed between the payload write and the manifest
+    # write, this raises ManifestMismatchError with a torn-write message
+    # (no silent stale-read).
+    manifest_path = path.with_suffix(path.suffix + ".MANIFEST.json")
+    read_and_validate_manifest(
+        path,
+        manifest_path,
+        expected_schema_version=SCHEMA_VERSIONS["wanda_scalar_row"],
+    )
+    loaded = torch.load(path, map_location="cpu", weights_only=False)
+    _check_schema("wanda_scalar_row", loaded.schema_version, path)
+    return loaded
+
+
+# ---------------------------------------------------------------------------
 # Signal 4: router_kd_logits (per-attempt-idx .npz shards).
 #
 # NIT-4 (audit/calibration-completeness): the ``save_router_kd_logits``
@@ -1585,6 +1725,7 @@ __all__ = [
     "RouterLogitsStatsPayload",
     "OutputReservoirPayload",
     "CovariancePayload",
+    "WandaScalarRowPayload",
     "RouterKDLogitsPayload",
     "BlockHiddenPayload",
     "TeacherEvalPayload",
@@ -1603,6 +1744,8 @@ __all__ = [
     "load_output_reservoir",
     "save_covariance",
     "load_covariance",
+    "save_wanda_scalar_row",
+    "load_wanda_scalar_row",
     "load_router_kd_logits",
     "save_block_hidden",
     "load_block_hidden",
