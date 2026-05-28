@@ -1,6 +1,6 @@
-# Plan — RCO Native Re-Implementation (clean-room, third path) — **v2**
+# Plan — RCO Native Re-Implementation (clean-room, third path) — **v3**
 
-**Status**: Planning. Pre-implementation. v2 folds the 14 deltas surfaced by plan-reviewer round 1. Awaiting plan-reviewer round 2 per [[paper-fidelity-review-loop]].
+**Status**: Planning. Pre-implementation. v3 folds the 5 new deltas surfaced by plan-reviewer round 2 (v2 had correctly folded all 14 round-1 deltas but introduced internal inconsistencies). Awaiting plan-reviewer round 3 per [[paper-fidelity-review-loop]].
 **Branch**: `feat/plugin_11_rco_native_reimpl` (cut from `main@d7bfa22`).
 **Parent plans**: `tasks/SC_STAGE12_COMPREHENSIVE_PLAN.md` §5.3 (R3 — RCO); `tasks/PLAN_PLUGIN_11_s1_rco.md` (the earlier clean-room plan, already implemented and merged at `269e64d`).
 **Paper anchor**: arxiv 2605.00649 — *Model Compression with Exact Budget Constraints via Riemannian Manifolds* (IST-DASLab, May 2026). §3 Algorithm 1.
@@ -22,7 +22,7 @@ The repo *already contains* a clean-room implementation at `max_quality/src/moe_
 
 > *NOTE: clean-room has 2 algorithmic bugs (reversed cosine annealing, non-standard Gumbel-softmax) that will be fixed by the upcoming re-vendor from upstream RCO. The DP readout hides them on easy cases; plugin interface is re-vendor-ready […].*
 
-Since the re-vendor path (option 2) is now abandoned, this re-impl plan **owns** fixing both bugs. They are folded into §1 (paper-fidelity algorithm reference) and §6.1 (new paper-fidelity tests F11 and F12).
+Since the re-vendor path (option 2) is now abandoned, this re-impl plan **owns** fixing both bugs. They are folded into §1 (paper-fidelity algorithm reference) and §6.1 (new paper-fidelity tests F11-F14, plus F15 added in v3 to pin the pure-damage-DP-vs-logit-tiebreak fidelity).
 
 This plan's job is therefore:
 
@@ -160,7 +160,7 @@ The paper §3.2 evaluates fitness on a *discrete* sample because the objective `
    - At small `τ_final = 0.5`, `log p` of the argmax option is already ~0 and of the others is large negative, so β=1e-3 affects only deep-tie cases. The tiebreaking value is marginal and obscures the spec.
    - Removing it makes RCO degenerate cleanly to Plugin #8 (`damage_curve_dp`) when fitness comes from the damage_curve slot — a desirable property for the S1_DP-vs-S1_RCO ablation.
 
-   Documented as a fix-up in §7 (behaviour change on the ON path); pinned by F-test on a hand-graded instance where β tiebreak would otherwise pick a different vector.
+   Documented as a fix-up in §7 (behaviour change on the ON path); pinned by F15 on a hand-graded tied-damage instance where the β tiebreak would otherwise pick a different vector.
 
 4. **Soft objective for backward.** Compute `J_soft = Σ_l ⟨p̃_l, D_l⟩` and differentiate analytically: the softmax Jacobian collapse yields `∂J_soft / ∂α_lk = (1/τ) · p̃_lk · (D_lk − ⟨p̃_l, D_l⟩)`. The `1/τ` factor is absorbed into the Adam learning rate (so the implementation drops the explicit `1/τ` from the analytic gradient and lets Adam adapt).
 
@@ -181,7 +181,7 @@ for t = 0..T−1:
     grad = p̃ · (D − ⟨p̃, D⟩)              # per-group Jacobian collapse
 
     # Tangent projection (Primitive 2):
-    n   = constraint_normal(α)             # p · (c − ⟨p, c⟩) at the un-perturbed p, see Q-grad-α-vs-α'
+    n   = constraint_normal(α)             # p · (c − ⟨p, c⟩) at the un-perturbed p = softmax(α); see Q8
     grad_tangent = grad − (⟨grad, n⟩ / ⟨n, n⟩) · n
 
     # Adam update (in tangent space):
@@ -439,6 +439,7 @@ These tests are content-level: they prove the implementation does what arxiv 260
 | F12 | `test_cosine_anneal_endpoints` | **NEW (Delta 2 / D1-2).** Construct the cosine schedule with `(τ_init=5.0, τ_final=0.5, T=500)`. Assert `τ_t[0] == pytest.approx(τ_init, abs=1e-12)` and `τ_t[T−1] == pytest.approx(τ_final, abs=2e-2)` (the `T−1` endpoint is `cos(π · (T−1)/T) ≈ cos(π)` with a small offset; use a generous tol). Pins the explore→exploit direction. |
 | F13 | `test_adam_v_buf_transport_policy` | **NEW (Delta 4 / D1-4).** After one outer step + retract, the first moment `m` has `⟨m, n_new⟩ ≈ 0` (transported); the second moment `v` does NOT (untransported). Pins `D-adam-no-v-transport`. |
 | F14 | `test_alpha_stability_under_large_logits` | **NEW (Delta 12 / D6-5).** Feed α with magnitude ~1e6 into the masked softmax → no NaN/Inf in `p̃`, in `_constraint_normal`, in retraction. Standard plugin-audit stability sanity. |
+| F15 | `test_dp_pure_damage_not_logit_tiebreak` | **NEW (v3-Δ3 / Delta 3 fidelity pin).** Construct a 2-layer × 2-option instance with **tied damage values** (e.g. `D = [[1.0, 1.0], [2.0, 2.0]]`) and α chosen so `log p` differs between options (e.g. `α = [[10.0, 0.0], [0.0, 10.0]]` → option 0 in layer 0 and option 1 in layer 1 have higher `log p`). With the existing impl's β=1e-3 soft-logit DP, the lower-entropy vector `[0, 1]` wins via the `−β · log p` tiebreak. With the v3 pure-damage DP (β=0), the lex-min vector (whatever the configured deterministic tiebreak rule is — currently first-encountered-in-DP-sweep, which is `[0, 0]` for the construction above with `c = [[1, 2], [1, 2]]`, `B = 2`) wins. Assert the re-impl picks the lex-min/configured vector, NOT the soft-logit-biased one. Pins §1.3 step 3 against future re-introduction of the β tiebreak. |
 
 ### 6.2 Code-quality tests (config validation, edge cases)
 
@@ -463,13 +464,13 @@ Real existing test inventory in `max_quality/tests/test_stage1_plugin_rco_budget
 | C15 | `test_plugin_registered_in_manifest` | **EXISTS — KEEP** | Manifest order (this is in the rco test file; the cross-plugin manifest order is in `test_stage1_orchestrator.py:119-131`). |
 | C16 | `test_run_sums_to_global_budget` | **EXISTS — KEEP** (single test, NOT parametrised in current file) | Verifies RCO returns budget-exact assignments. |
 
-**Re-tallied test count**:
-- Existing (kept verbatim or with expected-value re-verification): **12** — C1-C5, C8-C10, C13-C16
-- New: **6** — C6, C7, C11, C12; F11-F14 are paper-fidelity (counted in §6.1)
-- Paper-fidelity (NEW): **F1-F14** = 14 (was 10 in v1; F11/F12/F13/F14 added)
-- Regression (R1-R3): 3 (described in §6.3)
+**Re-tallied test count** (v3 arithmetic, with F15 added per v3-Δ3):
+- Existing code-quality (kept verbatim or with expected-value re-verification): **12** — C1-C5, C8-C10, C13-C16
+- New code-quality: **4** — C6, C7, C11, C12 (Patterns B/C/E)
+- Paper-fidelity (all NEW; none of F1-F15 exist in the current test file — verified by `grep -n "^def test_"` on 2026-05-28): **15** — F1-F15 (was 14 in v2; F15 added in v3-Δ3 to pin the pure-damage DP vs β·log-p tiebreak fidelity)
+- Regression: **3** — R1-R3 (R1 is the Stage-1 byte-equality golden snapshot; R2 and R3 are repurposed existing C-tests with re-derived expected values, listed separately in §6.3 because they fill the regression role even though the rows reference C-test names)
 
-**Total: 12 existing + 6 new code-quality + 14 paper-fidelity + 3 regression = 35 tests** (12 of which already exist; 23 are new or upgraded; +5 vs v1's count of 28).
+**Contiguous F + C + R tally: 15 + 16 + 3 = 34** (was 33 in v2 pre-F15). This is the authoritative total.
 
 ### 6.3 Regression / byte-identity tests
 
@@ -479,7 +480,7 @@ Real existing test inventory in `max_quality/tests/test_stage1_plugin_rco_budget
 | R2 | `test_run_synthetic_2layer_handcheck` + `test_run_consumes_damage_curve_when_present` | Must pass — but with expected values RE-DERIVED under the corrected algorithm (Gumbel form, anneal direction, β removal). These are NOT byte-identity guards on the ON path. |
 | R3 | `test_run_sums_to_global_budget` | Existing single test; budget-exactness is invariant under algorithm changes, so this passes as-is. |
 
-**Pass criteria**: F1-F14 + C1-C16 + R1-R3 green. Total: 14 + 16 + 3 = **33 tests** (Delta 12 budget for v2; the 35 count above counts C6/C7/C11/C12 separately, which makes the matrix-style table read as 35; the contiguous "F + C + R" tally is 33).
+**Pass criteria**: F1-F15 + C1-C16 + R1-R3 green. Total: 15 + 16 + 3 = **34 tests**.
 
 ---
 
@@ -513,7 +514,7 @@ Combined effect: the final `per_layer_target_experts_rco` vector returned for an
 **Migration steps**:
 
 1. Re-write `max_quality/src/moe_compress/stage1/plugins/rco_budget.py` on this branch (`feat/plugin_11_rco_native_reimpl`). The file is REPLACED, not appended. Existing API (`name`, `reads`, `writes`, `is_enabled`, `run`, `contribute_artifact`) is preserved bit-for-bit on the OFF path.
-2. Extend `max_quality/tests/test_stage1_plugin_rco_budget.py` with F1-F14 + C6, C7, C11, C12; re-derive expected values in C8 + C9 under the corrected algorithm; keep all other existing tests as-is.
+2. Extend `max_quality/tests/test_stage1_plugin_rco_budget.py` with F1-F15 + C6, C7, C11, C12; re-derive expected values in C8 + C9 under the corrected algorithm; keep all other existing tests as-is.
 3. No changes to `max_quality/src/moe_compress/stage1/orchestrator.py` (the gated call sites at STEP 10b and `_write_artifacts` already exist).
 4. No changes to `max_quality/src/moe_compress/stage1/plugins/__init__.py` (manifest entry already present; verified by `test_plugin_manifest_order` at `test_stage1_orchestrator.py:119-131`).
 5. Update the module docstring of `rco_budget.py` to:
@@ -550,7 +551,12 @@ Paper §3.3 initialises α from REAP saliency scores; our implementation initial
 
 **Concrete reason for the deviation**: REAP saliency is per-*expert*, not per-budget-*option*. To use REAP, we'd need a per-(layer, surviving_k) saliency, which the upstream paper *constructs* from a forward pass over candidate budgets. Our pipeline does not run that pass — GRAPE's output is the cheapest reasonable initialisation.
 
-**Recommendation**: add a Q2 ablation test as an F11-tier item (now folded into F11/F12; specifically the GRAPE-vs-uniform basin test was reframed in v2 because the broken anneal direction made the test meaningless on existing impl). Re-evaluate AFTER the corrected anneal direction lands: if the corrected impl with GRAPE-init still converges to the same basin as uniform-init at τ_init=5.0, drop `D-init-grape` from the deviation list.
+**Status (v3 correction)**: the v2 wording claimed the GRAPE-vs-uniform-init basin question was "folded into F11/F12". That was misleading: F11 pins the Gumbel-softmax τ limits and F12 pins the cosine anneal endpoints — neither addresses the basin-of-attraction question for the initialisation choice. The ablation is **deferred**, not folded:
+
+- Q2 is a basin-of-attraction ablation, not a paper-fidelity property. Adding an F-test for it would mis-categorise the test (F-tests pin paper-spec behaviour; basin questions are empirical / post-hoc).
+- The existing `D-init-grape` deviation already documents the divergence from paper §3.3.
+- The ablation can be run post-hoc against the new impl if the user requests it (config-only change: swap `init_peak_logit` for a uniform-init code path; no algorithm changes needed).
+- **No new F-test is added.** The "drop `D-init-grape` from the deviation list" decision is gated on running that ablation, which is out of scope for this plan.
 
 ### Q3 — Fitness signal: output-space MSE vs end-to-end task loss
 
@@ -600,9 +606,23 @@ if g_l_clamped != g_l:
 
 This is no longer a "quality-of-life" question — it is a **correctness fix**. The re-impl is required (Posture A).
 
-- **Posture A (full re-impl, REQUIRED)**: rewrite `rco_budget.py` end-to-end on this branch, apply all Pattern-B/C/E upgrades, add F1-F14 paper-fidelity tests, fix all four algorithm bugs. Estimated effort: 1 implementation session + 1 paper-fidelity review + 1 code-quality review = ~5-7 hours of agent time.
+- **Posture A (full re-impl, REQUIRED)**: rewrite `rco_budget.py` end-to-end on this branch, apply all Pattern-B/C/E upgrades, add F1-F15 paper-fidelity tests, fix all four algorithm bugs. Estimated effort: 1 implementation session + 1 paper-fidelity review + 1 code-quality review = ~5-7 hours of agent time.
 - ~~Posture B (incremental)~~: insufficient; cannot patch the four bugs without rewriting most of the iteration loop and DP body.
 - ~~Posture C (no change)~~: ruled out — the existing impl is known-buggy per the merge commit body.
+
+### Q8 — Constraint normal at un-perturbed `p` vs Gumbel-perturbed `p̃`
+
+In §1.4 the pseudocode computes `n = constraint_normal(α)` at the deterministic, un-perturbed softmax `p = softmax(α)` — NOT at the Gumbel-perturbed `p̃ = softmax((α + g) / τ)`. This was dangling-referenced in v2 as "Q-grad-α-vs-α'" but never resolved.
+
+**Question**: should the constraint normal be computed at `p` (deterministic) or `p̃` (perturbed)?
+
+**Existing impl**: un-perturbed `p` at `rco_budget.py:420` (the call site reads `p = torch.softmax(alpha, dim=-1)` immediately before `constraint_normal(p, c)`, with no τ scaling or Gumbel noise).
+
+**Paper §3.1**: the manifold is defined deterministically as `M = {α ∈ ℝⁿ : Σᵢ pᵢ(α) · cᵢ = B}` with `p(α) = softmax(α)` — no temperature, no Gumbel noise. Verified by WebFetch against `arxiv.org/pdf/2605.00649` on 2026-05-28: *"the geometric constraint defining the manifold itself operates on the clean softmax probability distribution, ensuring the constraint surface has a well-defined mathematical structure independent of stochastic perturbations."* The constraint normal is by definition `∂C/∂α` evaluated on `M`, so it inherits the deterministic-`p` formulation.
+
+**Recommendation**: keep un-perturbed `p`. This matches the paper, matches the existing impl, and is the mathematically clean choice (the manifold geometry is independent of the sampling temperature). Pinned by F1 (`test_constraint_normal_closed_form` — F1's symbolic reference `p · (c − E_p[c])` already encodes this: F1 constructs a deterministic `p = softmax(α)` and checks `_constraint_normal` against autograd of `Σ p · c`, so any drift toward `p̃` in the impl would surface as an F1 failure).
+
+**No new test required**: F1 already covers this; Q8 documents the choice so a future reader doesn't re-litigate it.
 
 ---
 
@@ -613,18 +633,18 @@ This is no longer a "quality-of-life" question — it is a **correctness fix**. 
 | File | Action | Approx LoC |
 |---|---|---|
 | `max_quality/src/moe_compress/stage1/plugins/rco_budget.py` | REPLACE (in-place rewrite) | ~950 (was 898) |
-| `max_quality/tests/test_stage1_plugin_rco_budget.py` | EXTEND (add F1-F14, C6, C7, C11, C12; re-derive C8/C9 expected values) | ~800 (was 325) |
+| `max_quality/tests/test_stage1_plugin_rco_budget.py` | EXTEND (add F1-F15, C6, C7, C11, C12; re-derive C8/C9 expected values) | ~820 (was 325) |
 | `max_quality/src/moe_compress/stage1/orchestrator.py` | NO CHANGE | — |
 | `max_quality/src/moe_compress/stage1/plugins/__init__.py` | NO CHANGE | — |
-| `tasks/PLAN_RCO_NATIVE_REIMPL.md` | THIS FILE (v2 commit) | ~750 |
+| `tasks/PLAN_RCO_NATIVE_REIMPL.md` | THIS FILE (v3 commit) | ~770 |
 
-### 9.2 Test list (33 total)
+### 9.2 Test list (34 total)
 
-- Paper-fidelity (F1-F14): 14 NEW
+- Paper-fidelity (F1-F15): 15 NEW (F15 added in v3-Δ3 to pin pure-damage DP vs β·log-p tiebreak)
 - Code-quality: C1-C5 (5 existing), C6/C7 (2 NEW Pattern C), C8/C9 (2 existing, expected-values re-derived), C10 (1 existing), C11 (1 NEW Pattern E), C12 (1 NEW Pattern B), C13/C14 (2 existing; C14 extended for format_version), C15/C16 (2 existing) → **16**
 - Regression: R1 (Stage-1 byte-equality), R2 (2 existing behavioural tests, re-derived), R3 (1 existing budget-sum test) → **3**
 
-**Total: 33** (was 28 in v1; +5 from the paper-fidelity additions and the explicit C14 re-tally).
+**Total: 34** (was 33 in v2; +1 from F15 in v3-Δ3).
 
 ### 9.3 Performance — production scale (L=48, K_max=129, B≈8600)
 
@@ -711,3 +731,19 @@ The 14 deltas surfaced by plan-reviewer round 1, each mapped to the v2 section t
 | D14 (D2-4, D3-2, D7-2 through D7-6) | Low | v1 polish items | §1.2 (sign branch + v_hat lag); §1.4 (cleaned cos formula); §6.3 R1 (Stage-1 only); §5 H (license: null timestamp); §7 (revendor audit); §2 (manifest test cite) | FOLDED |
 
 **No deltas were RECONSIDERED or DEFERRED. All 14 folded.**
+
+---
+
+## Appendix D — v2→v3 delta change-log
+
+Plan-reviewer round 2 surfaced 5 new findings — all of them inconsistencies that v2 itself introduced when folding round 1's 14 deltas. v3 resolves them:
+
+| v3 Delta | Severity | v2 issue | v3 fold location | Status |
+|---|---|---|---|---|
+| v3-Δ1 | Medium | §6.2 said "New: 6" (should be 4 — C6, C7, C11, C12); §9.2 line 627 said "33"; §6.3 line 482 had a 35-vs-33 reconciliation paragraph that became unnecessary once the arithmetic was fixed. | §6.2 re-tally rewritten with explicit 12 + 4 + 15 + 3 = 34 arithmetic; §9.2 updated to 34; §6.3 line 482 reconciliation prose dropped per v3-Δ5. | FOLDED — recommendation (a) (recompute total) |
+| v3-Δ2 | Medium | §1.4 line 184 cited a non-existent "Q-grad-α-vs-α'" question. The substantive choice (un-perturbed `p` vs Gumbel-perturbed `p̃` for the constraint normal) was un-anchored. | §1.4 line 184 inline citation rewritten to "see Q8"; new Q8 added to §8 with paper §3.1 verification (WebFetch against arxiv 2605.00649 on 2026-05-28 confirms deterministic-`p` formulation: *"the geometric constraint defining the manifold itself operates on the clean softmax probability distribution"*). Recommendation: keep un-perturbed `p`. F1 already pins this; no new F-test needed. | FOLDED — paper §3.1 claim verified |
+| v3-Δ3 | Medium | §1.3 step 3 line 163 promised "pinned by F-test on a hand-graded instance where β tiebreak would otherwise pick a different vector" but no such F-test existed in F1-F14. | F15 (`test_dp_pure_damage_not_logit_tiebreak`) added to §6.1 covering tied-damage instance with β=1e-3 vs β=0 disagreement. §1.3 step 3 line 163 amended to cite F15. §6.1, §6.3, §9.2 test counts updated 14 → 15 (F), 33 → 34 (total). | FOLDED — recommendation (a) (add F15) |
+| v3-Δ4 | Low | §8 Q2 line 553 said the GRAPE-init basin ablation was "folded into F11/F12" but F11 (Gumbel τ limits) and F12 (cosine endpoints) don't cover the basin question. Misleading "folded" claim. | Q2 rewritten: ablation explicitly **deferred** (not folded). Rationale: it's a basin-of-attraction empirical question, not a paper-fidelity property. No new F-test added; ablation runnable post-hoc by user request. | FOLDED — recommendation (defer) |
+| v3-Δ5 | Nitpick | §0 line 25 mentioned only "F11 and F12" when v2 actually added F11-F14. §6.3 line 482 had reconciliation prose that v3-Δ1 makes unnecessary. | §0 line 25 expanded to "F11-F14, plus F15 in v3-Δ3". §6.3 line 482 reconciliation prose dropped. | FOLDED |
+
+**No deltas were RECONSIDERED or DEFERRED. All 5 folded.** Round-3 reviewer should re-spawn against this v3 plan.
