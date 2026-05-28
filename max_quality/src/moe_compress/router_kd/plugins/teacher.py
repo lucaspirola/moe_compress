@@ -395,6 +395,44 @@ class TeacherCachePlugin:
                 # (orchestrator.py L585-594) — a per-epoch coverage check here
                 # would be unreachable. The single equality `cache_n == cfg_n`
                 # above is the only valid combination.
+
+                # PB-2: soft cross-check on the teacher repo. The cache payload
+                # carries `model` (the HF repo it was generated against, e.g.
+                # "Qwen/Qwen3.6-35B-A3B") + `calibration_seed_offset`. Both are
+                # forensics fields per the writer (precompute_teacher_logits.py:
+                # 261-262 / 290-301) but a silent wrong-teacher-repo run would
+                # manifest as a degraded-loss signature rather than a clean error.
+                # Warn (not fail) — a deliberate override path exists via
+                # stage5_router_kd.teacher_model_repo (see teacher.py:48-51 and
+                # the canonical resolution at teacher.py:553-562).
+                cache_model = str(cache_payload.get("model", ""))
+                # Mirror the canonical resolution at teacher.py:553-562 — override
+                # wins, else fall back to config["model"]["name_or_path"].
+                expected_model = str(
+                    s5.get("teacher_model_repo") or config["model"]["name_or_path"]
+                )
+                if cache_model and expected_model and cache_model != expected_model:
+                    log.warning(
+                        "Stage 5: teacher-logits cache 'model'=%r disagrees with "
+                        "configured teacher repo %r. Tolerated (operator may have "
+                        "deliberately swapped teachers via stage5_router_kd."
+                        "teacher_model_repo); if KD signal looks wrong, regenerate "
+                        "the cache against the correct teacher.",
+                        cache_model, expected_model,
+                    )
+                cache_seed = int(cache_payload.get("calibration_seed_offset", -1))
+                if cache_seed != -1 and cache_seed != 5:
+                    # The precompute writer hard-codes seed_offset=5 (must match
+                    # stage5_router_kd.run, precompute_teacher_logits.py:144).
+                    # A cache with a different offset was built against a different
+                    # calibration tensor → silently-wrong KD signal.
+                    log.warning(
+                        "Stage 5: teacher-logits cache calibration_seed_offset=%d "
+                        "but Stage 5 uses 5. Cache was built against a different "
+                        "calibration tensor — regenerate to align.",
+                        cache_seed,
+                    )
+
                 log.info("Stage 5: cache covers %d samples, %d sequence_length",
                          cache_payload.get("num_samples"), cache_payload.get("sequence_length"))
             else:

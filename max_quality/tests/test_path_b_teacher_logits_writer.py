@@ -234,6 +234,9 @@ def test_writer_to_reader_roundtrip(tmp_path):
 
     student = _StudentStub(vocab_size=vocab)
     cfg = {
+        # PB-2: teacher cross-check resolves via config["model"]["name_or_path"]
+        # — must match the writer-style payload's "model" field (fake-model).
+        "model": {"name_or_path": "fake-model"},
         "stage5_router_kd": {
             "teacher_logits_cache": str(cache_path),
             "batch_size": batch_size,
@@ -443,6 +446,8 @@ def test_fake_teacher_writer_loop_payload_round_trips_to_reader(tmp_path):
 
     ctx = PipelineContext()
     ctx.set("config", {
+        # PB-2: match payload's "model" field so the cross-check stays quiet.
+        "model": {"name_or_path": "fake"},
         "stage5_router_kd": {
             "teacher_logits_cache": str(cache_path),
             "batch_size": batch_size,
@@ -494,3 +499,141 @@ def test_writer_manifest_extra_meta_includes_vocab_size(tmp_path):
     assert manifest["extra"]["vocab_size"] == 128
     assert manifest["extra"]["total_tokens"] == 32
     assert manifest["extra"]["artifact"] == "stage5_teacher_logits"
+
+
+# ---------------------------------------------------------------------------
+# 5. PB-2 soft cross-check — teacher model + seed_offset WARN-only
+# ---------------------------------------------------------------------------
+def _build_loaded_ctx(tmp_path, *, payload):
+    """Helper: write a payload + manifest pair, build a ctx for the reader.
+
+    Returns (ctx, plugin) ready for ``plugin.load_teacher_cache(ctx)`` and a
+    happy-path-shaped reader configuration (no override unless caller sets it).
+    """
+    from moe_compress.pipeline.context import PipelineContext
+    from moe_compress.router_kd.plugins.teacher import TeacherCachePlugin
+
+    cache_path = tmp_path / "_stage5_teacher_logits.pt"
+    manifest_path = cache_path.with_suffix(cache_path.suffix + ".MANIFEST.json")
+    atomic_torch_save(cache_path, payload)
+    write_manifest_last(cache_path, manifest_path, schema_version=1)
+
+    student = _StudentStub(vocab_size=int(payload["vocab_size"]))
+    ctx = PipelineContext()
+    ctx.set("config", {
+        "model": {"name_or_path": "Qwen/Qwen3.6-35B-A3B"},
+        "stage5_router_kd": {
+            "teacher_logits_cache": str(cache_path),
+            "batch_size": int(payload["batch_size"]),
+            "max_sequence_length": int(payload["sequence_length"]),
+            "max_calibration_samples": int(payload["num_samples"]),
+        },
+    })
+    ctx.set("student", student)
+    ctx.set("artifacts_dir", tmp_path)
+    return ctx, TeacherCachePlugin()
+
+
+def _run_with_caplog_pattern_n(caplog, fn):
+    """Pattern N (caplog-propagate-restore) — see test_calib_ckpt_counter.py:64.
+
+    The teacher.py logger is non-root; under this repo's pytest setup, caplog
+    only captures named loggers when (a) root level is set via
+    ``caplog.set_level`` and (b) the named logger's ``propagate`` is forced
+    True for the duration of the call. Encapsulated here so the three PB-2
+    tests don't re-implement the dance.
+    """
+    import logging
+    caplog.set_level(logging.WARNING)
+    logger = logging.getLogger("moe_compress.router_kd.plugins.teacher")
+    prev = logger.propagate
+    logger.propagate = True
+    try:
+        return fn()
+    finally:
+        logger.propagate = prev
+
+
+def test_pb2_cache_model_mismatch_warns(tmp_path, caplog):
+    """PB-2 — cache 'model' that disagrees with the resolved teacher repo emits
+    a WARN (not a raise). The override path is legitimate; this is forensics.
+
+    Mirrors the WARN-only pattern at router_kd/plugins/teacher.py:343 (the
+    batch_size soft warn): caplog at WARN level, substring assertion, no raise.
+    """
+    payload = _writer_style_payload(
+        num_samples=4, seq_len=8, vocab=32, batch_size=2,
+        model="some/other-model",  # disagrees with config["model"]["name_or_path"]
+    )
+    ctx, plugin = _build_loaded_ctx(tmp_path, payload=payload)
+
+    _run_with_caplog_pattern_n(caplog, lambda: plugin.load_teacher_cache(ctx))
+
+    assert any(
+        "teacher-logits cache 'model'" in rec.getMessage()
+        and "disagrees with configured teacher repo" in rec.getMessage()
+        for rec in caplog.records
+    ), [rec.getMessage() for rec in caplog.records]
+    # Reader still publishes the cache despite the warning.
+    assert ctx.get("teacher_logits_cache") is not None
+
+
+def test_pb2_cache_model_override_respected(tmp_path, caplog):
+    """If the operator set ``stage5_router_kd.teacher_model_repo``, the
+    cache's `model` is compared against the override — match means no warning.
+    """
+    payload = _writer_style_payload(
+        num_samples=4, seq_len=8, vocab=32, batch_size=2,
+        model="Qwen/Qwen3.6-35B-A3B-FP8",  # equals the override below
+    )
+    ctx, plugin = _build_loaded_ctx(tmp_path, payload=payload)
+    # Inject the override.
+    cfg = ctx.get("config")
+    cfg["stage5_router_kd"]["teacher_model_repo"] = "Qwen/Qwen3.6-35B-A3B-FP8"
+
+    _run_with_caplog_pattern_n(caplog, lambda: plugin.load_teacher_cache(ctx))
+
+    assert not any(
+        "teacher-logits cache 'model'" in rec.getMessage()
+        for rec in caplog.records
+    ), [rec.getMessage() for rec in caplog.records]
+
+
+def test_pb2_cache_seed_offset_mismatch_warns(tmp_path, caplog):
+    """PB-2 — cache built with a different ``calibration_seed_offset`` (not 5)
+    emits a WARN. The fixture's `_writer_style_payload` defaults to 5; override
+    here to simulate a stale cache.
+    """
+    payload = _writer_style_payload(
+        num_samples=4, seq_len=8, vocab=32, batch_size=2,
+    )
+    payload["calibration_seed_offset"] = 7  # ≠ 5
+    ctx, plugin = _build_loaded_ctx(tmp_path, payload=payload)
+
+    _run_with_caplog_pattern_n(caplog, lambda: plugin.load_teacher_cache(ctx))
+
+    assert any(
+        "calibration_seed_offset=7" in rec.getMessage()
+        and "Stage 5 uses 5" in rec.getMessage()
+        for rec in caplog.records
+    ), [rec.getMessage() for rec in caplog.records]
+
+
+def test_pb2_happy_path_no_warns(tmp_path, caplog):
+    """PB-2 — when the cache's `model` matches config and seed_offset == 5,
+    no PB-2 WARN is emitted (false-positive guard).
+    """
+    payload = _writer_style_payload(
+        num_samples=4, seq_len=8, vocab=32, batch_size=2,
+        model="Qwen/Qwen3.6-35B-A3B",
+    )
+    ctx, plugin = _build_loaded_ctx(tmp_path, payload=payload)
+
+    _run_with_caplog_pattern_n(caplog, lambda: plugin.load_teacher_cache(ctx))
+
+    pb2_messages = [
+        rec.getMessage() for rec in caplog.records
+        if "teacher-logits cache 'model'" in rec.getMessage()
+        or "calibration_seed_offset=" in rec.getMessage()
+    ]
+    assert pb2_messages == [], pb2_messages
