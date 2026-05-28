@@ -247,7 +247,7 @@ def test_merge_experts_inplace_mergemoe_routes_through_new_path(tiny_model):
 
 
 def test_merge_experts_inplace_mergemoe_fallback_on_empty_layer_inputs(
-    tiny_model, capsys,
+    tiny_model, caplog,
 ):
     """``merge_step="mergemoe"`` with ``layer_inputs=None`` falls back to
     freq-weighted with a WARNING.
@@ -261,20 +261,30 @@ def test_merge_experts_inplace_mergemoe_fallback_on_empty_layer_inputs(
 
     _merge_experts_inplace(layer_freq, grouped, freq, freq_weighted=True)
 
-    # Mirror of 9330988: the moe_compress.stage2.merging logger's handler chain
-    # bypasses pytest's `caplog` under full-suite imports, but the warning
-    # reaches stderr via the default StreamHandler. Assert on captured stderr.
-    _merge_experts_inplace(
-        layer_mm, grouped, freq, freq_weighted=True,
-        merge_step="mergemoe", layer_inputs=None,
-    )
+    # Pytest's caplog plugin sets ``propagate=False`` on the captured logger;
+    # force it back on so caplog actually sees the warning. The empirically
+    # broken alternative (capsys, per 37156b4) silently failed because no
+    # StreamHandler is attached to ``moe_compress.stage2.merging`` — the
+    # warning IS captured by pytest's LogCaptureHandler but never reaches
+    # stderr. See ``test_resume_path_forces_freq_weighted_and_warns_for_mergemoe``
+    # (this file) for the canonical pattern.
+    merging_log = logging.getLogger("moe_compress.stage2.merging")
+    _saved_propagate = merging_log.propagate
+    merging_log.propagate = True
+    try:
+        with caplog.at_level(logging.WARNING, logger="moe_compress.stage2.merging"):
+            _merge_experts_inplace(
+                layer_mm, grouped, freq, freq_weighted=True,
+                merge_step="mergemoe", layer_inputs=None,
+            )
+    finally:
+        merging_log.propagate = _saved_propagate
 
-    captured = capsys.readouterr()
-    assert (
-        "falling back to freq-weighted merge" in captured.err
-    ), (
-        f"expected a WARNING about the freq-weighted fallback in captured "
-        f"stderr, got: {captured.err!r}"
+    fallback_records = [r for r in caplog.records
+                        if "fall" in r.message.lower() and "freq" in r.message.lower()]
+    assert len(fallback_records) >= 1, (
+        f"expected a WARNING about the freq-weighted fallback; got: "
+        f"{[r.message for r in caplog.records]}"
     )
 
     # Merged weights should match the freq-weighted result.
@@ -299,7 +309,7 @@ def test_merge_experts_inplace_invalid_merge_step_raises(tiny_model):
 # ---------------------------------------------------------------------------
 
 
-def test_mergemoe_cond_threshold_fallback_warns_and_falls_back(capsys):
+def test_mergemoe_cond_threshold_fallback_warns_and_falls_back(caplog):
     """When cond(P) > 1e8 the helper falls back to freq-weighted down + WARNs."""
     torch.manual_seed(4)
     d_hidden, d_int = 4, 3
@@ -312,20 +322,31 @@ def test_mergemoe_cond_threshold_fallback_warns_and_falls_back(capsys):
     x1 = torch.randn(1, d_hidden)
     X_hat = x1.repeat(8, 1)
 
-    # Ensure the moe_compress.stage2.mergemoe logger reaches stderr.
-    # Some full-suite imports configure loggers to bypass `caplog`; assert
-    # against the captured stderr instead (where log.warning ends up via the
-    # default StreamHandler chain).
-    out = _mergemoe_compute_merged_down(
-        member_gates=W_G, member_ups=W_U, member_downs=W_D,
-        weights=b, layer_inputs=X_hat, token_cap=8, seed=0,
-    )
+    # Pytest's caplog plugin sets ``propagate=False`` on the captured logger;
+    # force it back on so caplog actually sees the warning. The empirically
+    # broken alternative (capsys, per 9330988) silently failed because no
+    # StreamHandler is attached to ``moe_compress.stage2.mergemoe`` — the
+    # warning IS captured by pytest's LogCaptureHandler but never reaches
+    # stderr.
+    mergemoe_log = logging.getLogger("moe_compress.stage2.mergemoe")
+    _saved_propagate = mergemoe_log.propagate
+    mergemoe_log.propagate = True
+    try:
+        with caplog.at_level(logging.WARNING, logger="moe_compress.stage2.mergemoe"):
+            out = _mergemoe_compute_merged_down(
+                member_gates=W_G, member_ups=W_U, member_downs=W_D,
+                weights=b, layer_inputs=X_hat, token_cap=8, seed=0,
+            )
+    finally:
+        mergemoe_log.propagate = _saved_propagate
 
-    captured = capsys.readouterr()
-    assert (
-        "cond(P)=" in captured.err and "D-mergemoe-cond-fallback" in captured.err
-    ), (
-        f"expected cond-fallback WARNING in captured stderr, got: {captured.err!r}"
+    fallback_records = [
+        r for r in caplog.records
+        if "D-mergemoe-cond-fallback" in r.message and "cond(P)=" in r.message
+    ]
+    assert len(fallback_records) >= 1, (
+        f"expected cond-fallback WARNING (D-mergemoe-cond-fallback); got: "
+        f"{[r.message for r in caplog.records]}"
     )
 
     # Falls back to freq-weighted down.
