@@ -1,10 +1,26 @@
 # PLAN — W-1: Wanda `scalar_row` calibration sidecar
 
-**Status**: planner-only. No code changed. Recommendation below.
+**Status**: planner-v2. No code changed. Recommendation below.
+**Revision**: v2 — folds plan-reviewer-v1's 8 findings against the
+v1 plan at `plan/w1-wanda-scalar-row-capture@5abec26`
+(1 HIGH + 2 MEDIUM + 2 LOW + 3 NIT). See change-log below.
 **Repo**: `/home/lucas/moe_compress` (main @ `1fe4ba5`).
 **Date**: 2026-05-29.
 **Auditor finding tracked**: `tasks/AUDIT_CALIBRATION_COMPLETENESS_V2.md` §W-1.
 **Predecessor TODO** (run-scope variant): `tasks/todo_wanda_compose_with_collect_covariances.md`.
+
+### v1 → v2 change-log
+
+| Reviewer finding | Where folded | Summary |
+|---|---|---|
+| **H-1** Resumability test gap | §9 T6 added | Kill+resume byte-equality test; mirrors REAP `test_two_segment_additivity` at `vllm_calibration_hooks.patch:3974-4039`. |
+| **M-1** REAP precedent not cited | §3.0 added; §3 recommend-B.2 paragraph; §9 T2b added | Cites `vllm.calibration_reap_scores` at `vllm_calibration_hooks.patch:8134-8473`; `_ROUTER_WEIGHTS_STASH` at `:8219`; `_on_router` at `:8327`. Verifies stash lifecycle = **overwrite-on-next-router-fire, NO explicit clear** (the inline `:8218` comment is stale; surfaced as OPEN-QUESTION per CLAUDE.md §0). T2b asserts overwrite-no-clear on consecutive `_on_router` calls. |
+| **M-2** T4 file ambiguity | §4 Create table; §9 T4 | Resolved with option (a) — T4 lives in NEW `test_stage3_wanda_scalar_row_cache.py`; pre-existing `test_stage3_wanda_intra_expert_score.py` NOT modified (its 24 tests stay byte-identical). |
+| **L-1** Reader fallback dead | §5.2 reader | Bare-`torch.load` fallback DROPPED; missing manifest → `ManifestMismatchError` (hard fail). Rationale: green-field sidecar with no legacy artifacts. |
+| **L-2** Cache hydration via private API | §7.1; §9 T4 extension; §4 Modify row | New `_WandaScalarRowAccumulator.from_payload` classmethod + `_frozen` guard; plugin no longer pokes `_cpu`/`_nsamples` from outside the class. |
+| **N-1** argparse help too long | §6.1 | Trimmed from ~13 lines to ~5; full contract in vllm module docstring. |
+| **N-2** §13 Q1 redundant | §13 Q1 | Rephrased as "confirm fp32 default" (already settled in §10 Risk 2). |
+| **N-3** LoC estimate underplays new module | §4 Create table; Total | vLLM module ~280 → ~300-350 (REAP precedent is ~340); cache-test file ~150 → ~220 to host T4+T6; Total ~950 → ~1060. |
 
 ---
 
@@ -156,6 +172,55 @@ synthetic payload shape and `:7147` for `calibration_input_cov`'s
 The `router` dispatch DOES carry `topk_weights` + `topk_ids`
 (`vllm_calibration_hooks.patch:633-639`).
 
+### 3.0 In-tree precedent — `vllm.calibration_reap_scores`
+
+The router-stash pattern is NOT novel; it is in production in
+`vllm.calibration_reap_scores` (inside the same patch at
+`vllm_calibration_hooks.patch:8134-8473`). W-1's B.2 stash MUST
+mirror this module byte-for-byte in shape, lifecycle, and
+miss-warning behaviour.
+
+* Module: `vllm/calibration_reap_scores.py`,
+  patch lines `8134-8473`.
+* Stash declaration: `_ROUTER_WEIGHTS_STASH: dict[int, torch.Tensor]`
+  at `vllm_calibration_hooks.patch:8219`.
+* Writer: `_on_router` at `:8327` — assigns
+  `_ROUTER_WEIGHTS_STASH[layer_idx] = topk_weights.detach().cpu().to(torch.float32)`.
+* Reader: `_on_expert_out_unweighted` at `:8347` — reads via
+  `_ROUTER_WEIGHTS_STASH.get(layer_idx)` then on miss emits a
+  one-shot WARNING at `:8349-8354` + skips (no silent zeroing).
+
+**Stash lifecycle — verified empirically by reading the patch**:
+**overwrite-on-next-router-fire, NO explicit clear**. There is NO
+`del _ROUTER_WEIGHTS_STASH[layer_idx]` or `.pop()` anywhere in the
+module (grep confirms only 3 references: declaration, write in
+`_on_router`, read in `_on_expert_out_unweighted`). The reader does
+NOT clear the slot post-read; the stale entry sits inert until the
+next `_on_router(layer_idx=…)` overwrites it. The steady-state
+dispatch order (router(N) → expert(N) → router(N+1) → expert(N+1)
+…) makes this safe.
+
+> **Note for the implementer / OPEN-QUESTION for plan-reviewer-v2**:
+> the inline comment at `vllm_calibration_hooks.patch:8218` says
+> *"Cleared after each expert_out_unweighted use"*. This is a
+> **stale/incorrect comment** — the code does NOT clear; it just
+> overwrites. W-1 SHOULD NOT propagate the stale comment to the
+> Wanda module's stash declaration. A 1-line comment fix in the
+> REAP module is OUT OF SCOPE for W-1 but logged here as an audit
+> follow-up.
+
+**Implications for W-1**:
+
+* Wanda's `_ROUTER_WEIGHTS_STASH` analogue MUST adopt the same
+  overwrite-no-clear lifecycle. The module docstring + declaration
+  comment must state the actual contract:
+  *"Overwrite-on-router-fire; no explicit clear — safe because the
+  per-layer dispatch order guarantees the router fires before the
+  expert in every forward."*
+* See T2b in §9 for the test asserting the overwrite-no-clear
+  behaviour (two consecutive `_on_router` calls for the same
+  layer leave only the latest weights in the stash).
+
 **Two options inside Strategy B**:
 
 * **B.1 — extend `expert_in` to carry `topk_weights`** (~10 LOC patch
@@ -170,11 +235,12 @@ The `router` dispatch DOES carry `topk_weights` + `topk_ids`
   stashing is correct as long as the dispatch order is router →
   expert_in within one layer (it is, by the kernel structure).
 
-**Recommend B.2** — local to the new module, no patch fan-out.
-Document the layer-keyed stash + dispatch-order assumption in the
-new module's docstring + a one-test smoke that simulates
-out-of-order dispatch and asserts the error path is loud
-(`assert router_observed_for_this_layer`).
+**Recommend B.2** — local to the new module, no patch fan-out;
+**byte-for-byte mirror of `calibration_reap_scores`** (see §3.0
+above for the precedent). Document the layer-keyed stash +
+dispatch-order assumption in the new module's docstring + a
+one-test smoke that simulates out-of-order dispatch and asserts
+the error path is loud (`assert router_observed_for_this_layer`).
 
 ---
 
@@ -184,10 +250,10 @@ out-of-order dispatch and asserts the error path is loud
 
 | Path | Purpose | Approx LOC |
 |---|---|---|
-| `max_quality/patches/vllm_calibration_hooks.patch` (extend) — adds new module **`vllm/calibration_wanda_scalar_row.py`** | per-(layer, expert, "gate_proj"/"down_proj") scalar_row accumulator + `_on_router` stash + `_on_expert_in` reader + dump | ~280 |
+| `max_quality/patches/vllm_calibration_hooks.patch` (extend) — adds new module **`vllm/calibration_wanda_scalar_row.py`** | per-(layer, expert, "gate_proj"/"down_proj") scalar_row accumulator + `_on_router` stash + `_on_expert_in` reader + dump + `dump_wanda_scalar_row_checkpoint` / `load_wanda_scalar_row_checkpoint` | ~300-350 (REAP precedent `vllm/calibration_reap_scores.py` is ~340 LOC; bumped from initial ~280 estimate after factoring in checkpoint dump/load pair + matrix-tag bookkeeping) |
 | `max_quality/src/moe_compress/stage3/plugins/wanda_scalar_row_cache.py` | `Stage3WandaScalarRowCacheProvider` (mirror of `Stage3InputCovCacheProvider`) — on hit populates `ctx["stage3.wanda_scalar_row"]` and returns the payload | ~95 |
-| `max_quality/tests/test_calibration_wanda_scalar_row_smoke.py` (inside patch) | smoke tests for the new vLLM module (env-gate, accumulation, dump, checkpoint, router-first ordering) | ~250 |
-| `max_quality/tests/test_stage3_wanda_scalar_row_cache.py` | cache-provider tests: hit, miss, schema mismatch, dtype round-trip | ~150 |
+| `max_quality/tests/test_calibration_wanda_scalar_row_smoke.py` (inside patch) | smoke tests for the new vLLM module: T1 (accumulation correctness), T2 (router-before-expert_in ordering), T2b (overwrite-no-clear lifecycle — folded from plan-reviewer-v1 M-1) | ~280 |
+| `max_quality/tests/test_stage3_wanda_scalar_row_cache.py` | cache-provider tests (T3, T5) + end-to-end short-circuit (T4) + checkpoint resumability (T6): hit, miss, schema mismatch, dtype round-trip, manifest-last ordering, plugin consumes sidecar, kill+resume byte-equality | ~220 |
 
 ### Modify
 
@@ -195,13 +261,18 @@ out-of-order dispatch and asserts the error path is loud
 |---|---|---|
 | `max_quality/src/moe_compress/utils/cached_calibration_signals.py` | + `WandaScalarRowPayload` dataclass; + `SCHEMA_VERSIONS["wanda_scalar_row"] = 1`; + `save_wanda_scalar_row` / `load_wanda_scalar_row`; both call **`write_manifest_last`** + **`read_and_validate_manifest`** so this sidecar lands compliant with the audit's S-1 push from day one. | +80 |
 | `max_quality/scripts/build_self_traces_calib_vllm.py` | + `--capture-wanda-scalar-row` arg group (mirrors `--capture-input-covariance` block at lines 760-783); + env-var `VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW=1` auto-enable in the pre-vllm-import section (line ~1041); + `dump_wanda_scalar_row` call at run-end (line ~2059 pattern); + `dump_wanda_scalar_row_checkpoint` in the periodic-checkpoint loop (line ~1856 pattern) | +60 |
-| `max_quality/src/moe_compress/stage3/plugins/wanda_intra_expert_score.py` | (1) Add `reads += ("stage3.wanda_scalar_row",)`. (2) At top of `collect_wanda_scores`, check `ctx.has("stage3.wanda_scalar_row")` — on hit, hydrate `_WandaScalarRowAccumulator._cpu` from the payload and SKIP the per-layer calibration sweep entirely. (3) Update module docstring's `D-zero-extra-forward` block (lines 70-86) to point at the new cache provider — see §6. | +30 / -0 |
+| `max_quality/src/moe_compress/stage3/plugins/wanda_intra_expert_score.py` | (1) Add `reads += ("stage3.wanda_scalar_row",)`. (2) At top of `collect_wanda_scores`, check `ctx.has("stage3.wanda_scalar_row")` — on hit, build the accumulator via `_WandaScalarRowAccumulator.from_payload(payload, scalar_row_dtype=…)` (new classmethod — see §7.1) and SKIP the per-layer calibration sweep entirely. (3) Add the `from_payload` classmethod + `_frozen` guard to `_WandaScalarRowAccumulator`. (4) Update module docstring's `D-zero-extra-forward` block (lines 70-86) to point at the new cache provider — see §6. | +45 / -0 |
 | `max_quality/src/moe_compress/stage3/orchestrator.py` | Register `Stage3WandaScalarRowCacheProvider()` in the same `_cache_only_plugins` list that holds `Stage3InputCovCacheProvider` (line ~133) | +1 |
 | `max_quality/src/moe_compress/stage3/plugins/__init__.py` | Re-export `Stage3WandaScalarRowCacheProvider` for symmetry with the input-cov cache | +2 |
 | `max_quality/patches/MANIFEST.md` | Bump entries: new module declared; SCHEMA_VERSIONS row added | +5 |
 
-**Total**: ~950 LOC across 4 new files + 5 modifications, dominated
-by the vLLM patch's accumulator + tests.
+**Total**: ~1095 LOC across 4 new files + 5 modifications, dominated
+by the vLLM patch's accumulator + tests (bumped from the v1 plan's
+~950 LOC after folding plan-reviewer-v1 N-3 + H-1 + M-1: vLLM module
+~280 → ~300-350 to match the REAP precedent's ~340 LoC + checkpoint
+dump/load pair; smoke-test file ~250 → ~280 to host new T2b
+overwrite-no-clear lifecycle test; cache-test file ~150 → ~220 to
+host T4 + T6 resumability).
 
 ---
 
@@ -249,9 +320,16 @@ to fire).
      opts in unilaterally so the new sidecar lands compliant.
 * Reader (`load_wanda_scalar_row`):
   1. `read_and_validate_manifest(path, manifest_path,
-      schema_version=1)` — on missing manifest, emit a one-shot
-     WARNING and fall back to bare `torch.load` (mirrors F-S3-1
-     backward-compat shim).
+      schema_version=1)` — **on missing manifest, raise
+     `ManifestMismatchError` (hard fail).** Rationale: this is a
+     brand-new sidecar with NO legacy artifacts on disk anywhere
+     (it has never been written), so the bare-`torch.load` fallback
+     would be dead code on day one. Tightening to hard-fail here
+     makes the new sidecar's contract strictly cleaner than the 10
+     pre-existing sidecars (audit §S-1) — the S-1 uplift work item
+     can later relax this only IF a back-compat need surfaces, but
+     for a green-field sidecar we lock in the strict contract from
+     the start.
   2. `_check_schema("wanda_scalar_row", loaded.schema_version, path)`.
   3. Return the typed payload.
 
@@ -278,27 +356,23 @@ group at line 783)
 ```python
 p.add_argument("--capture-wanda-scalar-row", action="store_true",
                default=False,
-               help="Capture per-(layer, expert, matrix) Wanda "
-                    "scalar_row = E[(x · g_e)^2] per input channel "
-                    "during calibration and write a moe_compress-side "
-                    "sidecar at <jsonl>/sidecars/<stem>/"
-                    "wanda_scalar_row.pt at run end (schema v1). "
-                    "Consumed by Stage 3's WandaIntraExpertScorePlugin "
-                    "via Stage3WandaScalarRowCacheProvider, which "
-                    "short-circuits the plugin's own per-layer "
-                    "calibration sweep (saving ~2x Stage 3 cal "
-                    "wall-clock per A0..A11 ablation row). Requires "
-                    "the vLLM calibration-hooks patch "
-                    "(vllm.calibration_wanda_scalar_row). Auto-enables "
-                    "VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW=1 + "
-                    "VLLM_CALIB_CAPTURE_ROUTER=1 + "
-                    "VLLM_CALIB_CAPTURE_EXPERT=1 BEFORE any vllm "
-                    "import. Failures during dump are logged but do "
-                    "NOT re-raise -- the JSONL is more valuable than "
-                    "the wanda sidecar.")
+               help="Capture Wanda scalar_row = E[(x*g_e)^2] per "
+                    "(layer, expert, gate_proj/down_proj) during "
+                    "calibration; write sidecar wanda_scalar_row.pt "
+                    "(schema v1). Auto-enables "
+                    "VLLM_CALIB_CAPTURE_{WANDA_SCALAR_ROW,ROUTER,EXPERT}=1. "
+                    "Full contract: vllm.calibration_wanda_scalar_row "
+                    "module docstring.")
 p.add_argument("--wanda-scalar-row-checkpoint-every-chunks", type=int,
-               default=1, help="...")
+               default=1, help="Checkpoint cadence in chunks; mirrors "
+                               "--input-cov-checkpoint-every-chunks.")
 ```
+
+(Trimmed from v1's ~13-line block per plan-reviewer-v1 N-1; full
+contract — including cache-HIT short-circuit semantics, ablation
+saving math, and dump-failure non-fatality — lives in the
+`vllm.calibration_wanda_scalar_row` module docstring, single
+source of truth.)
 
 ### 6.2 Env-var auto-enable (line ~1041 — same block as input_cov)
 
@@ -337,19 +411,54 @@ if ctx.has("stage3.wanda_scalar_row"):
         "calibration sweep",
         len(payload.sigma_x_g_squared),
     )
-    acc = _WandaScalarRowAccumulator(scalar_row_dtype=scalar_row_dtype)
-    for key, sigma in payload.sigma_x_g_squared.items():
-        acc._cpu[key] = sigma.to(scalar_row_dtype)
-        acc._nsamples[key] = int(payload.token_counts[key])
+    acc = _WandaScalarRowAccumulator.from_payload(
+        payload, scalar_row_dtype=scalar_row_dtype,
+    )
     # Skip directly to _compute_scores below.
 else:
     # ... existing per-layer sweep at lines 498-528 ...
 ```
 
-The `_cpu` private-dict write is intentional — the cache provider
-short-circuits the accumulator's update path entirely; finalize
-semantics are vacuous (the payload is already finalized at
-calibration time).
+This requires a new classmethod on `_WandaScalarRowAccumulator`:
+
+```python
+@classmethod
+def from_payload(
+    cls,
+    payload: "WandaScalarRowPayload",
+    *,
+    scalar_row_dtype: torch.dtype,
+) -> "_WandaScalarRowAccumulator":
+    """Hydrate a frozen accumulator from a calibration sidecar.
+
+    The returned accumulator is finalize-ready: its update path is
+    NOT meant to be called again (the payload represents finalized
+    running means from the calibration phase). Calling ``.update()``
+    after ``.from_payload()`` would double-count and is guarded
+    against by setting ``self._frozen = True``.
+    """
+    self = cls(scalar_row_dtype=scalar_row_dtype)
+    for key, sigma in payload.sigma_x_g_squared.items():
+        self._cpu[key] = sigma.to(scalar_row_dtype)
+        self._nsamples[key] = int(payload.token_counts[key])
+    self._frozen = True
+    return self
+```
+
+Rationale: the v1 plan's pseudo-code wrote directly to
+`_WandaScalarRowAccumulator._cpu` (a private dict) + `_nsamples`
+from outside the class. That violates encapsulation and couples
+the plugin to the accumulator's internal layout. The classmethod:
+
+* Keeps the private dicts behind a class boundary.
+* Adds a `_frozen` flag that lets `.update()` raise if the cache
+  path is later accidentally fed live data (defensive but cheap).
+* Mirrors the standard "alternate constructor" pattern used by
+  `torch.Tensor.from_numpy`, `dict.fromkeys`, etc.
+
+Finalize semantics remain vacuous (the payload is already
+finalized at calibration time) — `from_payload` produces a
+ready-to-read accumulator.
 
 ### 7.2 D-tag updates (D-zero-extra-forward)
 
@@ -458,7 +567,7 @@ score compute — no calibration sweep at all.
 
 ---
 
-## 9. Test plan (4+ tests)
+## 9. Test plan (7 tests: T1, T2, T2b, T3, T4, T5, T6)
 
 ### T1. Calibration-side accumulation correctness (vLLM patch smoke test)
 
@@ -483,6 +592,33 @@ the layer index, (c) the dump still produces a valid (just
 empty-for-that-layer) sidecar. This guards the B.2 router-stash
 ordering assumption from §3.
 
+### T2b. Router-stash overwrite-on-fire, no-clear lifecycle (vLLM patch)
+
+`test_calibration_wanda_scalar_row_smoke.py::test_router_stash_overwrites_no_clear`
+
+Anchors the §3.0 lifecycle contract: two consecutive `_on_router`
+calls for the SAME `layer_idx` (back-to-back, with different
+`topk_weights`) MUST leave only the latest weights in the stash
+(no append, no clear in between). Steps:
+
+1. `_on_router(layer_idx=0, topk_weights=W1, …)`.
+2. Assert `_ROUTER_WEIGHTS_STASH[0]` allclose `W1.to(cpu, fp32)`.
+3. `_on_router(layer_idx=0, topk_weights=W2, …)` where `W2 != W1`.
+4. Assert `_ROUTER_WEIGHTS_STASH[0]` allclose `W2.to(cpu, fp32)`
+   (NOT `W1`, NOT a concat/sum of the two).
+5. `_on_expert_in(layer_idx=0, …)`; assert the accumulator update
+   uses `W2`, not `W1`.
+6. After `_on_expert_in` returns, assert `_ROUTER_WEIGHTS_STASH[0]`
+   STILL contains `W2` (the entry is NOT cleared by the reader —
+   it sits inert until the next `_on_router(layer_idx=0)`
+   overwrites it).
+
+This test is the explicit anchor for the M-1 finding's
+"overwrite-on-next-router-fire, NO explicit clear" claim about
+the REAP precedent. Mirrors REAP's
+`test_router_stash_miss_skips_silently` partner test in
+`tests/test_calibration_reap_scores_smoke.py:4047+`.
+
 ### T3. Cache provider hit / miss / schema mismatch
 
 `test_stage3_wanda_scalar_row_cache.py::test_cache_hit_populates_ctx`
@@ -506,7 +642,18 @@ ordering assumption from §3.
 
 ### T4. End-to-end short-circuit in `WandaIntraExpertScorePlugin`
 
-`test_stage3_wanda_intra_expert_score.py::test_plugin_consumes_cache_sidecar`
+`test_stage3_wanda_scalar_row_cache.py::test_plugin_consumes_cache_sidecar`
+
+(T4 lives in the NEW `test_stage3_wanda_scalar_row_cache.py`, NOT in
+the pre-existing `test_stage3_wanda_intra_expert_score.py`. Keeps
+the new test file cohesive around the new sidecar+plugin contract;
+the pre-existing file stays focused on the in-process Wanda score
+math + ablation paths. The §4 "Modified" table is NOT updated to
+include `test_stage3_wanda_intra_expert_score.py` because T4 does
+not land there — only the existing 24 tests in that file remain,
+and they MUST stay byte-identical (covered by "Existing tests that
+MUST stay green" below). Folded from plan-reviewer-v1 M-2 option
+(a).)
 
 * Build a tiny model + populate
   `ctx["stage3.wanda_scalar_row"]` directly with a known
@@ -518,6 +665,10 @@ ordering assumption from §3.
   byte-equals the score map produced by the existing
   `test_score_map_matches_W_times_sqrt_scalar_row` path when the
   same `scalar_row` is computed live.
+* Assert the accumulator constructed via
+  `_WandaScalarRowAccumulator.from_payload` returns the same
+  scalar_row map as the live accumulator (anchors L-2's
+  classmethod from §7.1).
 
 ### T5. Manifest-last + atomic write (Pattern O)
 
@@ -530,6 +681,69 @@ ordering assumption from §3.
 * Assert `_resolve_sidecar_for_load` preferring the namespaced
   layout over the legacy layout still works when both exist
   (F-H-7 backward-compat sanity).
+
+### T6. Checkpoint kill + resume byte-equality (vLLM patch + sidecar)
+
+`test_stage3_wanda_scalar_row_cache.py::test_checkpoint_resume_byte_equal`
+
+Anchors the resumability contract for the periodic-checkpoint loop
+in §4 (`dump_wanda_scalar_row_checkpoint`) +
+`load_wanda_scalar_row_checkpoint`. The §6.3 plan wires the
+checkpoint into `build_self_traces_calib_vllm.py`'s
+periodic-checkpoint loop (line ~1856 pattern), so a process
+interruption mid-calibration MUST resume into byte-identical
+accumulator state.
+
+Mirrors REAP's two-segment additivity test pattern at
+`max_quality/patches/vllm_calibration_hooks.patch:3974-4039`
+(`test_two_segment_additivity` —
+`tests/test_calibration_reap_scores_smoke.py::test_two_segment_additivity`).
+
+Steps:
+
+1. **Reference run (uninterrupted)**: fresh module load (
+   `VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW=1` +
+   `VLLM_CALIB_CAPTURE_ROUTER=1` +
+   `VLLM_CALIB_CAPTURE_EXPERT=1`), drive `_on_router` +
+   `_on_expert_in` for `2 * n_chunks` synthetic chunks across
+   `n_layers=2`, `n_experts=4`, `top_k=2`. Capture the final
+   `_REAP_SCORE_ACCUM`-equivalent state
+   (`_WANDA_SCALAR_ROW_ACCUM` for our module) into
+   `expected_sigma_x_g_squared` + `expected_token_counts`.
+2. **Killed-and-resumed run**: fresh module load, drive `n_chunks`
+   chunks (first half of the same deterministic data). Call
+   `dump_wanda_scalar_row_checkpoint(ckpt)`. Simulate
+   process death by reloading the vllm module from scratch
+   (`importlib.reload`-style helper mirroring REAP's
+   `_reload_reap_scores`). Call
+   `load_wanda_scalar_row_checkpoint(ckpt)`; assert the loaded
+   `_n_prompts_accumulated` matches the pre-kill counter. Drive
+   the remaining `n_chunks` chunks (second half).
+3. **Assertion**: post-resume final state byte-equals
+   `expected_sigma_x_g_squared` + `expected_token_counts`.
+   `torch.equal` (not allclose) for `token_counts` (int64);
+   `torch.allclose(rtol=0, atol=1e-5)` for
+   `sigma_x_g_squared` (fp32 — the additivity is exact
+   in fp32 for the sum-of-squares reduce; the rtol=0 atol=1e-5
+   bound mirrors REAP's `torch.allclose(seg2._REAP_SCORE_ACCUM[0],
+   expected_scores, atol=1e-5)` at patch line 4038).
+4. **Final dump check**: call `dump_wanda_scalar_row(jsonl_path)`
+   on the resumed module; load via `load_wanda_scalar_row`;
+   assert payload byte-equals the reference run's final payload
+   (Pattern O atomic write + manifest still emitted correctly
+   after a resume — guards against a regression where checkpoint
+   load + dump produce a manifest-inconsistent sidecar).
+
+Why this matters: spot-preempted calibration runs are the
+default failure mode on the project's vast.ai + DataCrunch
+fleets (per `feedback_vastai_proxy_can_fail.md` +
+`feedback_disk_pressure_lever_is_uploads.md`); a checkpoint that
+doesn't byte-resume into the same accumulator state means the
+operator quietly gets a corrupted scalar_row sidecar with no
+mismatch indication — exactly the silent-failure class the
+Pattern-O manifest is supposed to prevent.
+
+(Folded from plan-reviewer-v1 H-1.)
 
 ### Existing tests that MUST stay green
 
@@ -608,10 +822,16 @@ pushing toward.
 
 ## 13. Open questions for the user
 
-1. **Storage dtype default**: fp32 (110 MB) vs bf16 (55 MB) vs fp16
-   (55 MB, underflow risk). Recommendation: fp32; matches upstream
-   fusion_bench's accumulator dtype + the plugin's existing
-   in-memory choice.
+1. **Confirm fp32 storage default for `--wanda-scalar-row-storage-dtype`.**
+   §10 Risk 2 already settles the dtype question (fp32 default,
+   operator-configurable to fp16/bf16 via the new flag, with a
+   docstring caveat on underflow on long-calibration runs); this
+   open question reduces to a single yes/no on the default. The
+   alternative options (bf16 / fp16, both ~55 MB) save ~55 MB
+   on disk but introduce underflow risk on the sum-of-squares
+   reduce. Recommendation: **confirm fp32 default** — it matches
+   upstream fusion_bench's accumulator dtype + the plugin's
+   existing in-memory choice; the 110 MB cost is trivial.
 2. **Whether to ALSO ship Strategy A** as a follow-up. Recommendation:
    defer until measured demand — Strategy B alone hits the
    ablation-grid use case, and Strategy A's run-scope saving is
