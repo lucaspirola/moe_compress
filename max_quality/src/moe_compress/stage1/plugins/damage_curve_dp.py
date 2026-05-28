@@ -18,13 +18,29 @@ This plugin combines two anchors:
 
    solvable exactly by O(L · K · G) DP.
 
-2. **R8 — HC-SMoE (arxiv:2410.08589, ICML 2024).**
-   *Retraining-Free Merging of Sparse MoE via Hierarchical Clustering*,
-   Appendix B.1: the earliest cited precedent for "vary the per-layer
-   budget instead of holding it uniform". HC-SMoE's implementation is
-   crude (global frequency threshold determines per-layer counts as a
-   side-effect); the DP-knapsack-on-damage-curve here is a principled
-   refinement of the same idea.
+2. **R8 — HC-SMoE (arxiv:2410.08589, ICML 2025).**
+   *Retraining-Free Merging of Sparse MoE via Hierarchical Clustering*.
+   Cited here as the **idea-precedent** (not code-precedent) for
+   "vary the per-layer budget instead of holding it uniform".
+   HC-SMoE's published code (github.com/wazenmai/HC-SMoE) implements
+   this via a **global-frequency-rank cut** in
+   ``_assign_num_groups_per_layer`` —
+   ``grouping_mixtral.py:142-173`` and ``grouping_qwen.py:130-176``
+   (verified upstream cite as of audit 2026-05-28). The mechanism in
+   plain English: concatenate every layer's per-expert token-routing
+   frequency into one global vector, sort descending, take the
+   ``total_num_groups``-th entry as a global threshold, then for each
+   layer count how many experts route above that threshold; that
+   count is the layer's surviving-expert budget. There is no DP, no
+   cost-minimisation objective, no damage signal, no per-layer floor,
+   no blacklist handling. The DP-knapsack-on-damage-curve implemented
+   in this plugin is a fundamentally different algorithm — a
+   principled R4-additivity-grounded cost minimisation — that adopts
+   only the high-level "non-uniform per-layer budget" idea HC-SMoE
+   introduced. See ``D-no-hcsmoe-knapsack-upstream`` below for the
+   per-surface departures and
+   ``tasks/HCSMOE_UPSTREAM_ALIGNMENT_AUDIT.md`` for the bit-by-bit
+   alignment audit.
 
 Spec
 ----
@@ -82,6 +98,41 @@ in play. ``prior_ℓ = 0`` is clamped to a small positive epsilon
 Deviations
 ==========
 
+D-no-hcsmoe-knapsack-upstream
+-----------------------------
+HC-SMoE upstream (github.com/wazenmai/HC-SMoE,
+``grouping_mixtral.py:142-173`` / ``grouping_qwen.py:130-176``)
+implements per-layer budget variation as a **global-frequency-rank
+cut** — usage-frequency-threshold survivor selection, no DP, no
+knapsack, no damage curve, no per-layer floor, no blacklist handling.
+The entire algorithmic surface of this plugin (cumulative damage
+curve, 1D layer-knapsack DP, marginal-damage prior, traceback, +inf
+at-floor convention, ``_PRIOR_EPS`` clamp) has **no upstream
+counterpart in HC-SMoE**. The departures from upstream are:
+
+* **Cost signal**: usage frequency (upstream) → CKA off-diagonal pair
+  distance (ours, ``cka_distance.py``). Rationale below
+  (``D-cka-substitute-for-output-mse``).
+* **Objective**: implicit global rank cut on usage (upstream) →
+  explicit cost minimisation
+  ``min Σ_ℓ D_ℓ(k_ℓ) s.t. Σ_ℓ k_ℓ = G`` (ours, R4 §3 sketch).
+* **Output format**: per-layer survivor count (upstream) →
+  multiplicative prior into GRAPE
+  (ours, ``D-dp-prior-as-marginal`` below).
+* **Floor / blacklist**: no upstream analog
+  (``D-floor-vs-hcsmoe-no-floor`` and
+  ``D-blacklist-vs-hcsmoe-no-blacklist`` below).
+
+The plugin's algorithmic basis is therefore R4 (arXiv:2308.10438
+Theorem 1, no public code), not HC-SMoE. HC-SMoE remains cited only
+as the idea-precedent for non-uniform per-layer budgets.
+
+Verified by exhaustive grep on the upstream repo:
+``grep -rn -i "knapsack|damage|dynamic.*program" upstream/`` returns
+zero matches; ``_assign_num_groups_per_layer`` is the sole upstream
+surface mappable onto this plugin's purpose. See
+``tasks/HCSMOE_UPSTREAM_ALIGNMENT_AUDIT.md`` for the bit-by-bit table.
+
 D-cka-substitute-for-output-mse
 -------------------------------
 R4 / Rec 2 of the SC plan prescribe the **output-space** MSE
@@ -100,6 +151,16 @@ the substitution is paper-consistent with GRAPE's own choice of CKA as
 its merge primitive. A future ``S1_DP_OUTPUT`` variant could swap in
 the Stage 2 cost via the same plugin scaffold.
 
+The HC-SMoE alternative — adopt upstream's **usage-frequency** cost
+signal (``grouping_mixtral.py:152-157``: concatenated per-expert
+routing histogram) — was deliberately rejected. Usage frequency is a
+*traffic* proxy, not a *damage* proxy: a high-traffic expert may be
+cheap to merge into a near-clone, and a low-traffic expert may be
+expensive to merge if no near-clone exists. Using usage frequency
+would break R4's additivity theorem's δᵢ interpretation (R4 §3
+assumes δᵢ is an output-space distortion). CKA preserves R4's
+damage semantics; usage frequency does not.
+
 D-dp-prior-as-marginal
 ----------------------
 The DP optimum ``k*_ℓ`` itself is a complete per-layer count vector and
@@ -111,6 +172,63 @@ refine the DP starting point. Rationale: GRAPE's entropy gate (γ)
 already encodes a regulariser the DP does not see; using the DP as a
 *biaser* keeps that gate active and preserves the proven SC=0.1293
 baseline behaviour when DP is disabled.
+
+The HC-SMoE alternative — adopt upstream's **direct per-layer count**
+output convention (``grouping_mixtral.py:169-171``: the count is the
+definitive layer survivor budget, consumed at line 359 by the
+clustering pass with no further refinement) — was deliberately
+rejected. Upstream has no analog to GRAPE's entropy gate γ; its
+per-layer count is a hard side-effect of the global threshold cut.
+Replacing GRAPE's selection with the DP optimum outright would
+require ripping out the γ regulariser entirely, which is a separate
+larger redesign and would shred the SC=0.1293 GRAPE-only baseline.
+
+D-floor-vs-hcsmoe-no-floor
+--------------------------
+HC-SMoE upstream's ``_assign_num_groups_per_layer``
+(``grouping_mixtral.py:142-173``) imposes **no per-layer floor**: a
+layer whose experts all fall below the global frequency threshold
+gets ``num_groups_per_layer[ffn_name] = 0`` (line 169-171), and
+upstream provides no clamp to a minimum surviving-expert count. The
+qwen variant (``grouping_qwen.py:146-147``) only protects layers
+explicitly excluded from ``merging_layers`` by stamping their
+frequencies to ``ones_like`` — layers *in* the merging set still have
+no floor guard. The ``group_limit`` knob (``grouping_qwen.py:62``) is
+a maximum group size, not a per-layer floor.
+
+This plugin enforces a per-layer floor via
+:func:`~moe_compress.stage1.plugins._floor.per_layer_floor` (which
+clamps ``total_floor = max(N_ℓ // d, n_blacklisted_ℓ)``). The
+DP's ``k_max[ℓ] = N_ℓ − total_floor_ℓ`` plans merges against the
+**same** floor GRAPE will enforce downstream (``grape_merge.py`` D5),
+so the DP optimum is feasible against GRAPE's constraints by
+construction. Adopting HC-SMoE's no-floor convention would either
+(a) cause the DP to over-merge layers GRAPE will subsequently reject
+(creating the infeasibility the ``global_merges > Σ k_max`` guard
+already handles defensively, but normalised to "always"), or
+(b) require eliminating GRAPE's floor — shredding the SC=0.1293
+baseline's robustness.
+
+D-blacklist-vs-hcsmoe-no-blacklist
+----------------------------------
+HC-SMoE upstream has **no blacklist** — verified by exhaustive grep:
+``grep -rn -i "blacklist|immovable|protected|super.expert"
+upstream/hcsmoe/`` returns zero matches. Every expert is mergeable in
+HC-SMoE's task scope.
+
+This plugin honours the project's super-expert blacklist
+(``damage_curve_dp.py:275`` reads ``blacklist: dict[int, list[int]]``
+from ctx; ``_build_damage_curves`` excludes any pair touching a
+blacklisted expert at the ``triu_indices`` extraction step). The
+blacklist is populated by Stage 1's super-expert detector chain
+(``ma_detection.py`` + ``sink_token.py`` + ``three_way_and.py``
+voters aggregated by ``ablation_filter.py``) and flags experts whose
+ablation triggers catastrophic damage. Honouring it in the DP keeps
+the DP optimum aligned with the protection layer GRAPE enforces
+downstream. This is a project-specific feature absent from HC-SMoE
+because HC-SMoE's published task scope (zero-shot LM eval on Mixtral
++ Qwen, no MoE pruning-with-protections setting) does not model
+super-experts.
 
 D-prior-floor-eps
 -----------------
@@ -132,6 +250,13 @@ of the damage curve when many near-duplicate experts collide there.
 Kept as a module constant rather than a YAML knob because changing it
 without also auditing the empirical marginal-distribution histogram
 would silently shift GRAPE's bias.
+
+HC-SMoE upstream has no ε analog because its selection rule isn't
+multiplicative (it's a global rank cut on a usage-frequency vector,
+``grouping_mixtral.py:169-171``). The ``_PRIOR_EPS`` clamp is
+mathematically specific to this plugin's
+``argmin R[li] · prior[li]`` GRAPE-integration mode (cf.
+``D-dp-prior-as-marginal``) and has no upstream-cite cross-reference.
 
 D-independent-pairs-assumption
 ------------------------------
@@ -201,28 +326,47 @@ class DamageCurveDpPlugin:
     :class:`GrapeMergePlugin` to consume.
 
     Disabled by default. See module docstring for the R4 / R8 paper
-    citations and the four deviations:
+    citations and the seven deviations:
+    ``D-no-hcsmoe-knapsack-upstream``,
     ``D-cka-substitute-for-output-mse``, ``D-dp-prior-as-marginal``,
-    ``D-prior-floor-eps``, and ``D-independent-pairs-assumption``.
+    ``D-floor-vs-hcsmoe-no-floor``,
+    ``D-blacklist-vs-hcsmoe-no-blacklist``, ``D-prior-floor-eps``, and
+    ``D-independent-pairs-assumption``.
     """
 
     name: str = "damage_curve_dp"
     paper: str = (
-        "R4 Additivity theorem arXiv:2308.10438 Theorem 1 (DP formal basis); "
-        "R8 HC-SMoE arXiv:2410.08589 Appendix B.1 (non-uniform-budget precedent). "
-        "No official code published. "
-        "Deviations: D-cka-substitute-for-output-mse (damage uses CKA off-diagonal "
-        "distance cumsum vs paper Rec 2's output-space MSE — _output_space_cost "
-        "machinery lives in Stage 2 and isn't available at Stage 1); "
-        "D-dp-prior-as-marginal (prior published into merge_cost_prior is the "
-        "marginal damage D_ℓ(k*+1)−D_ℓ(k*) at the DP optimum, not the cumulative "
-        "value — preserves GRAPE's entropy gate); D-prior-floor-eps (prior=0 "
-        "clamped to 1e-12 so R·prior stays discriminative); "
-        "D-independent-pairs-assumption (sorted-pair cumsum treats merged pairs "
-        "as independent → strict upper bound on R4's per-layer δᵢ; biases DP "
-        "toward layers with sparser low-distance pair structure; acceptable "
-        "per §5.4 cheap-baseline positioning). See module docstring for full "
-        "algorithm + per-deviation derivations."
+        "R4 Additivity theorem arXiv:2308.10438 Theorem 1 (DP formal basis, "
+        "no public code); R8 HC-SMoE arXiv:2410.08589 ICML 2025 "
+        "(idea-precedent only, upstream github.com/wazenmai/HC-SMoE "
+        "implements per-layer count via global-frequency-rank cut at "
+        "grouping_mixtral.py:142-173 — no DP / no knapsack / no damage "
+        "curve / no floor / no blacklist; see "
+        "tasks/HCSMOE_UPSTREAM_ALIGNMENT_AUDIT.md). "
+        "Deviations: D-no-hcsmoe-knapsack-upstream (entire algorithmic "
+        "surface — DP, damage curve, marginal prior — has no upstream "
+        "counterpart; HC-SMoE is idea-precedent not code-precedent); "
+        "D-cka-substitute-for-output-mse (damage uses CKA off-diagonal "
+        "distance cumsum vs paper Rec 2's output-space MSE — "
+        "_output_space_cost machinery lives in Stage 2 and isn't "
+        "available at Stage 1; usage-frequency cost from HC-SMoE upstream "
+        "deliberately rejected — breaks R4 δᵢ semantics); "
+        "D-dp-prior-as-marginal (prior published into merge_cost_prior is "
+        "the marginal damage D_ℓ(k*+1)−D_ℓ(k*) at the DP optimum, not the "
+        "cumulative value — preserves GRAPE's entropy gate; HC-SMoE's "
+        "direct-per-layer-count output deliberately rejected — would "
+        "bypass γ); D-floor-vs-hcsmoe-no-floor (per-layer floor enforced "
+        "via _floor.per_layer_floor; HC-SMoE has no floor — layers can "
+        "collapse to 0 survivors); D-blacklist-vs-hcsmoe-no-blacklist "
+        "(super-expert blacklist honoured in damage-curve construction; "
+        "HC-SMoE has no blacklist analog); D-prior-floor-eps (prior=0 "
+        "clamped to 1e-12 so R·prior stays discriminative; no HC-SMoE "
+        "analog since upstream's selection isn't multiplicative); "
+        "D-independent-pairs-assumption (sorted-pair cumsum treats merged "
+        "pairs as independent → strict upper bound on R4's per-layer δᵢ; "
+        "biases DP toward layers with sparser low-distance pair structure; "
+        "acceptable per §5.4 cheap-baseline positioning). See module "
+        "docstring for full algorithm + per-deviation derivations."
     )
     config_key: str = "stage1_grape.damage_curve_dp.enabled"
     reads: tuple[str, ...] = (

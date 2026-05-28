@@ -85,9 +85,18 @@ def test_plugin_protocol_attributes():
     assert plugin.name == "damage_curve_dp"
     assert "arXiv:2308.10438" in plugin.paper          # R4 anchor
     assert "arXiv:2410.08589" in plugin.paper          # R8 anchor
+    # HC-SMoE upstream alignment: must cite the verified upstream
+    # surface and the three deviation tags introduced by the
+    # HCSMOE_UPSTREAM_ALIGNMENT_AUDIT (see tasks/ for the audit doc).
+    assert "github.com/wazenmai/HC-SMoE" in plugin.paper
+    assert "grouping_mixtral.py:142-173" in plugin.paper
+    assert "D-no-hcsmoe-knapsack-upstream" in plugin.paper
     assert "D-cka-substitute-for-output-mse" in plugin.paper
     assert "D-dp-prior-as-marginal" in plugin.paper
+    assert "D-floor-vs-hcsmoe-no-floor" in plugin.paper
+    assert "D-blacklist-vs-hcsmoe-no-blacklist" in plugin.paper
     assert "D-prior-floor-eps" in plugin.paper
+    assert "D-independent-pairs-assumption" in plugin.paper
     assert plugin.config_key == "stage1_grape.damage_curve_dp.enabled"
     assert plugin.reads == (
         "D_matrices", "blacklist", "per_layer_targets",
