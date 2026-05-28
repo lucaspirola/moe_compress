@@ -179,13 +179,16 @@ import torch
 from ...pipeline.context import PipelineContext
 from ...utils.activation_hooks import instrument_experts
 from ...utils.atomic_io import atomic_torch_save, write_manifest_last
+from ...utils.cached_calibration_signals import SCHEMA_VERSIONS
 from ...utils.model_io import MATRIX_NAMES, build_banks
 
 log = logging.getLogger(__name__)
 
 
 # Sidecar payload schema version (Pattern B). Bump on incompatible changes.
-_ARTIFACT_FORMAT_VERSION: int = 1
+# F-N-2 / NIT-1: schema version sourced from the central registry
+# so any future v1 -> v2 bump invalidates writer + reader atomically.
+_ARTIFACT_FORMAT_VERSION: int = SCHEMA_VERSIONS["wanda_intra_expert_score"]
 
 # Recognised config keys (Pattern C). Any other key under
 # ``stage3.wanda_intra_expert`` raises ``ValueError``.

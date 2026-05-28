@@ -135,6 +135,12 @@ SCHEMA_VERSIONS: dict[str, int] = {
     # ``vllm.calibration_wanda_scalar_row`` writer module. Lands compliant
     # with Pattern O (atomic write + manifest-last) from day one (audit S-1).
     "wanda_scalar_row":    1,
+    # Wanda intra-expert score (Stage 3) — private writer at
+    # stage3/plugins/wanda_intra_expert_score.py; registry entry lets a
+    # future reader/cache provider invalidate atomically. Placed adjacent
+    # to ``wanda_scalar_row`` per plan-v3 fold (both are Wanda-family
+    # sidecars; group them in append order).
+    "wanda_intra_expert_score": 1,
 }
 
 
