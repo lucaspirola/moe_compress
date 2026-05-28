@@ -79,6 +79,7 @@ land in items V1+V2 + items 1-10 of the calibration-v2 campaign.
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
@@ -90,6 +91,8 @@ import torch
 
 from moe_compress.pipeline.context import PipelineContext
 from moe_compress.pipeline.plugin import BasePlugin
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -122,23 +125,99 @@ SCHEMA_VERSIONS: dict[str, int] = {
 def sidecar_path(jsonl_path: Path, signal_name: str, *, suffix: str = ".pt") -> Path:
     """Derive the sidecar path for a given signal.
 
+    F-H-7 fix: sidecars are now namespaced by the JSONL filename STEM,
+    not just the parent directory, so two distinct calibration runs
+    that produce different JSONLs in the same parent directory
+    (e.g. ablation sweeps under ``artifacts/_shared/``) do NOT overwrite
+    each other's sidecars.
+
     For atomic single-file signals (e.g., signal_name="phase_b"):
-        <jsonl_path.parent>/sidecars/phase_b.pt
+        <jsonl_path.parent>/sidecars/<jsonl.stem>/phase_b.pt
 
     For per-shard signals (signal_name contains a slash):
-        <jsonl_path.parent>/sidecars/block_hidden/layer_0007.pt
+        <jsonl_path.parent>/sidecars/<jsonl.stem>/block_hidden/layer_0007.pt
 
-    Sidecars are collocated by directory with the JSONL, NOT by filename
-    stem. Renaming the JSONL does not orphan its sidecars. Moving the
-    JSONL to a new directory requires moving the sidecars/ subdir.
+    Backward compat: the legacy non-namespaced path
+    (``<jsonl.parent>/sidecars/<signal>.pt``) is consulted as a
+    fallback by :func:`_legacy_sidecar_path` so existing sidecars from
+    pre-F-H-7 runs continue to load — see ``load_*`` functions which
+    check the new path first, then warn-and-fall-back to the legacy
+    path. New writes ALWAYS land at the new path.
+    """
+    return jsonl_path.parent / "sidecars" / jsonl_path.stem / (signal_name + suffix)
+
+
+def _legacy_sidecar_path(
+    jsonl_path: Path, signal_name: str, *, suffix: str = ".pt",
+) -> Path:
+    """Pre-F-H-7 sidecar path (no JSONL-stem namespace).
+
+    Consulted by load_* functions as a backward-compat fallback when the
+    new namespaced path is missing. New writes are NEVER directed here.
     """
     return jsonl_path.parent / "sidecars" / (signal_name + suffix)
 
 
 def router_kd_logits_dir(jsonl_path: Path) -> Path:
-    """Returns <jsonl_path.parent>/sidecars/router_kd_logits/ -- the directory
-    holding per-attempt-idx .npz shards."""
+    """Returns <jsonl_path.parent>/sidecars/<jsonl.stem>/router_kd_logits/
+    — the directory holding per-attempt-idx .npz shards (F-H-7 namespaced).
+    """
+    return jsonl_path.parent / "sidecars" / jsonl_path.stem / "router_kd_logits"
+
+
+def _legacy_router_kd_logits_dir(jsonl_path: Path) -> Path:
+    """Pre-F-H-7 router_kd_logits dir (no JSONL-stem namespace)."""
     return jsonl_path.parent / "sidecars" / "router_kd_logits"
+
+
+def _resolve_sidecar_for_load(
+    jsonl_path: Path, signal_name: str, *, suffix: str = ".pt",
+) -> Path | None:
+    """Resolve a sidecar path for READING with F-H-7 backward compat.
+
+    Returns the new-style namespaced path if it exists. If not, checks
+    the legacy non-namespaced path and returns it (with a one-shot
+    WARNING) when present — but ONLY if there is exactly one JSONL
+    living in the parent directory (otherwise the legacy file is
+    ambiguous between multiple runs and we refuse to consume it).
+    Returns None if neither path exists.
+    """
+    new_path = sidecar_path(jsonl_path, signal_name, suffix=suffix)
+    if new_path.exists():
+        return new_path
+    legacy = _legacy_sidecar_path(jsonl_path, signal_name, suffix=suffix)
+    if not legacy.exists():
+        return None
+    # Disambiguate: if the JSONL's parent dir contains exactly one .jsonl
+    # file, the legacy sidecar unambiguously belongs to that run. If
+    # multiple JSONLs are present, refuse to consume — operator must
+    # migrate sidecars manually (mv to the new namespaced layout) or
+    # re-run the calibration.
+    parent = jsonl_path.parent
+    jsonls = [p for p in parent.glob("*.jsonl") if p.is_file()]
+    # The .tmp variant during an in-flight resume also counts as the
+    # owning JSONL.
+    jsonls_tmp = [p for p in parent.glob("*.jsonl.tmp") if p.is_file()]
+    n_distinct_runs = len({p.stem for p in jsonls + jsonls_tmp})
+    if n_distinct_runs > 1:
+        log.error(
+            "F-H-7: legacy sidecar %s exists but %s contains %d distinct "
+            "JSONL stems (%s) — legacy layout is ambiguous across runs. "
+            "Move the legacy sidecar to %s manually if it belongs to this "
+            "run, or delete it to force live recomputation.",
+            legacy, parent, n_distinct_runs,
+            sorted({p.stem for p in jsonls + jsonls_tmp}),
+            new_path,
+        )
+        return None
+    log.warning(
+        "F-H-7 backward-compat: loading sidecar from legacy path %s "
+        "(pre-F-H-7 layout). Next save_* call will write to the new "
+        "namespaced path %s — consider deleting the legacy file once "
+        "the run completes.",
+        legacy, new_path,
+    )
+    return legacy
 
 
 # ---------------------------------------------------------------------------
@@ -457,11 +536,21 @@ class TeacherEvalPayload:
 # Atomic-write helpers.
 # ---------------------------------------------------------------------------
 def _atomic_torch_save(payload: Any, path: Path) -> None:
-    """Atomic torch.save: write to tmp + os.replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(path) + ".tmp")
-    torch.save(payload, tmp)
-    os.replace(tmp, path)
+    """Atomic torch.save: tmp + fsync(fd) + os.replace + fsync(parent_dir).
+
+    F-H-3 fix: previously this helper did only tmp + os.replace — no
+    fsync. POSIX atomic-rename guarantees "either old or new", but only
+    IF the file's data blocks are flushed before the rename. Without
+    fsync(tmp), a kernel-panic / VM eviction between torch.save's last
+    write() and the next pdflush cycle (typically 5-30 s on ext4) could
+    leave the renamed file with stale/garbage blocks.
+
+    Now delegates to the shared :func:`utils.atomic_io.atomic_torch_save`
+    which does the full §11 durable-write dance — fixing all ~15 sidecar
+    write sites in this module at once (Pattern N).
+    """
+    from .atomic_io import atomic_torch_save as _shared_atomic_torch_save
+    _shared_atomic_torch_save(payload, path)
 
 
 def _atomic_npz_save(arrays: dict[str, np.ndarray], path: Path) -> None:
@@ -473,12 +562,14 @@ def _atomic_npz_save(arrays: dict[str, np.ndarray], path: Path) -> None:
     we open the tmp file as a binary handle, pass the HANDLE to
     np.savez_compressed (which does NOT auto-append), then rename the
     finalized file to the final .npz path.
+
+    F-H-3 fix: now delegates to
+    :func:`utils.atomic_io.atomic_npz_save` which additionally fsyncs
+    the file handle + parent dir for durability under power-loss /
+    kernel-panic-class events.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(path) + ".tmp")
-    with open(tmp, "wb") as fh:
-        np.savez_compressed(fh, **arrays)
-    os.replace(tmp, path)
+    from .atomic_io import atomic_npz_save as _shared_atomic_npz_save
+    _shared_atomic_npz_save(path, **arrays)
 
 
 # ---------------------------------------------------------------------------
@@ -509,8 +600,8 @@ def save_phase_b(payload: PhaseBPayload, jsonl_path: Path) -> None:
 
 
 def load_phase_b(jsonl_path: Path) -> PhaseBPayload | None:
-    path = sidecar_path(jsonl_path, "phase_b")
-    if not path.exists():
+    path = _resolve_sidecar_for_load(jsonl_path, "phase_b")
+    if path is None:
         return None
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("phase_b", loaded.schema_version, path)
@@ -633,8 +724,8 @@ def load_stage2_profile_v3(
         * cov_storage_dtype (driver flag must match Stage 2 YAML)
         * n_layers, n_experts, top_k, model_hash
     """
-    path = sidecar_path(jsonl_path, "stage2_profile")
-    if not path.exists():
+    path = _resolve_sidecar_for_load(jsonl_path, "stage2_profile")
+    if path is None:
         return None
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("stage2_profile", loaded.schema_version, path)
@@ -719,8 +810,8 @@ def load_reap_scores(jsonl_path: Path) -> Stage2ReapPayload | None:
     Returns None if the sidecar does not exist (cache miss). Raises
     ValueError on schema_version mismatch with an actionable message.
     """
-    path = sidecar_path(jsonl_path, "reap_scores")
-    if not path.exists():
+    path = _resolve_sidecar_for_load(jsonl_path, "reap_scores")
+    if path is None:
         return None
     payload = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("reap_scores", payload.schema_version, path)
@@ -752,8 +843,8 @@ def load_per_expert_max(jsonl_path: Path) -> Stage1PerExpertMaxPayload | None:
     Returns None if the sidecar does not exist (cache miss). Raises
     ValueError on schema_version mismatch with an actionable message.
     """
-    path = sidecar_path(jsonl_path, "per_expert_max")
-    if not path.exists():
+    path = _resolve_sidecar_for_load(jsonl_path, "per_expert_max")
+    if path is None:
         return None
     payload = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("per_expert_max", payload.schema_version, path)
@@ -785,8 +876,8 @@ def load_routing_stats(jsonl_path: Path) -> RoutingStatsPayload | None:
     Returns None if the sidecar does not exist (cache miss). Raises
     ValueError on schema_version mismatch with an actionable message.
     """
-    path = sidecar_path(jsonl_path, "routing_stats")
-    if not path.exists():
+    path = _resolve_sidecar_for_load(jsonl_path, "routing_stats")
+    if path is None:
         return None
     payload = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("routing_stats", payload.schema_version, path)
@@ -835,8 +926,8 @@ def load_router_logits_stats(jsonl_path: Path) -> RouterLogitsStatsPayload | Non
     Returns None if the sidecar does not exist (cache miss). Raises
     ValueError on schema_version mismatch with an actionable message.
     """
-    path = sidecar_path(jsonl_path, "router_logits_stats")
-    if not path.exists():
+    path = _resolve_sidecar_for_load(jsonl_path, "router_logits_stats")
+    if path is None:
         return None
     payload = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("router_logits_stats", payload.schema_version, path)
@@ -873,8 +964,8 @@ def load_output_reservoir(jsonl_path: Path) -> OutputReservoirPayload | None:
     Returns None if the sidecar does not exist (cache miss). Raises
     ValueError on schema_version mismatch with an actionable message.
     """
-    path = sidecar_path(jsonl_path, "output_reservoir")
-    if not path.exists():
+    path = _resolve_sidecar_for_load(jsonl_path, "output_reservoir")
+    if path is None:
         return None
     payload = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("output_reservoir", payload.schema_version, path)
@@ -908,8 +999,8 @@ def save_covariance(payload: CovariancePayload, jsonl_path: Path) -> None:
 
 
 def load_covariance(jsonl_path: Path) -> CovariancePayload | None:
-    path = sidecar_path(jsonl_path, "covariance")
-    if not path.exists():
+    path = _resolve_sidecar_for_load(jsonl_path, "covariance")
+    if path is None:
         return None
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("covariance", loaded.schema_version, path)
@@ -935,7 +1026,30 @@ def save_router_kd_logits(payload: RouterKDLogitsPayload, jsonl_path: Path) -> N
 def load_router_kd_logits(jsonl_path: Path, attempt_idx: int) -> RouterKDLogitsPayload | None:
     path = router_kd_logits_dir(jsonl_path) / f"{attempt_idx:07d}.npz"
     if not path.exists():
-        return None
+        # F-H-7 backward-compat: fall back to the legacy
+        # non-namespaced router_kd_logits/ dir if the new namespaced
+        # path is empty. Only safe if exactly one JSONL stem lives in
+        # the parent dir (same disambiguation rule as
+        # _resolve_sidecar_for_load).
+        legacy_path = _legacy_router_kd_logits_dir(jsonl_path) / f"{attempt_idx:07d}.npz"
+        if not legacy_path.exists():
+            return None
+        parent = jsonl_path.parent
+        jsonls = list(parent.glob("*.jsonl")) + list(parent.glob("*.jsonl.tmp"))
+        if len({p.stem for p in jsonls}) > 1:
+            log.error(
+                "F-H-7: legacy router_kd_logits shard %s exists but %s "
+                "contains multiple JSONL stems — refusing to consume "
+                "ambiguous legacy shard.",
+                legacy_path, parent,
+            )
+            return None
+        log.warning(
+            "F-H-7 backward-compat: loading router_kd_logits shard "
+            "from legacy path %s; new writes will land at %s.",
+            legacy_path, path,
+        )
+        path = legacy_path
     with np.load(path) as f:
         schema = int(f["schema_version"])
         if schema != SCHEMA_VERSIONS["router_kd_logits"]:
@@ -969,8 +1083,8 @@ def save_block_hidden(payload: BlockHiddenPayload, jsonl_path: Path) -> None:
 
 
 def load_block_hidden(jsonl_path: Path, layer_idx: int) -> BlockHiddenPayload | None:
-    path = sidecar_path(jsonl_path, f"block_hidden/layer_{layer_idx:04d}")
-    if not path.exists():
+    path = _resolve_sidecar_for_load(jsonl_path, f"block_hidden/layer_{layer_idx:04d}")
+    if path is None:
         return None
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("block_hidden", loaded.schema_version, path)
@@ -986,8 +1100,8 @@ def save_teacher_eval(payload: TeacherEvalPayload, jsonl_path: Path) -> None:
 
 
 def load_teacher_eval(jsonl_path: Path) -> TeacherEvalPayload | None:
-    path = sidecar_path(jsonl_path, "teacher_eval")
-    if not path.exists():
+    path = _resolve_sidecar_for_load(jsonl_path, "teacher_eval")
+    if path is None:
         return None
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("teacher_eval", loaded.schema_version, path)

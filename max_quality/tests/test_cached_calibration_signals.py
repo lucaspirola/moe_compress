@@ -212,21 +212,22 @@ def _jsonl(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 def test_sidecar_path_atomic_and_sharded(tmp_path):
     jsonl = _jsonl(tmp_path)
+    stem = jsonl.stem  # "trace_000123"
 
-    # Atomic single-file signal.
+    # Atomic single-file signal — F-H-7: namespaced by JSONL stem.
     atomic = sidecar_path(jsonl, "phase_b")
-    assert atomic == tmp_path / "sidecars" / "phase_b.pt"
+    assert atomic == tmp_path / "sidecars" / stem / "phase_b.pt"
 
     # Custom suffix passthrough.
     npz = sidecar_path(jsonl, "router_kd_logits/0000007", suffix=".npz")
-    assert npz == tmp_path / "sidecars" / "router_kd_logits" / "0000007.npz"
+    assert npz == tmp_path / "sidecars" / stem / "router_kd_logits" / "0000007.npz"
 
     # Per-shard block_hidden subpath.
     sharded = sidecar_path(jsonl, "block_hidden/layer_0007")
-    assert sharded == tmp_path / "sidecars" / "block_hidden" / "layer_0007.pt"
+    assert sharded == tmp_path / "sidecars" / stem / "block_hidden" / "layer_0007.pt"
 
     # router_kd_logits_dir convenience helper.
-    assert router_kd_logits_dir(jsonl) == tmp_path / "sidecars" / "router_kd_logits"
+    assert router_kd_logits_dir(jsonl) == tmp_path / "sidecars" / stem / "router_kd_logits"
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +620,7 @@ def test_block_hidden_roundtrip(tmp_path):
     save_block_hidden(original, jsonl)
 
     expected_path = (
-        tmp_path / "sidecars" / "block_hidden" / "layer_0007.pt"
+        tmp_path / "sidecars" / jsonl.stem / "block_hidden" / "layer_0007.pt"
     )
     assert expected_path.exists()
     # Different layer_idx: clean miss (sharded layout).
