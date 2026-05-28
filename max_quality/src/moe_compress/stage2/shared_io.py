@@ -36,29 +36,22 @@ def _durable_rename(tmp: Path, final: Path) -> None:
 
     Spec §11: durable write — fsync file bytes, then fsync parent dir entry,
     then atomic rename so a crash never leaves a truncated final file.
-    O_WRONLY|O_APPEND is used for the .tmp file so fsync flushes write data
-    (O_RDONLY on a regular file does not guarantee flushing write buffers on POSIX).
-    The parent dir must use O_RDONLY (directories cannot be opened for write).
 
-    Note: the tmp file must already be closed (all Python I/O buffers flushed to
-    the kernel) before calling _durable_rename; the fsync it performs flushes
-    kernel buffers, not Python-level buffers.
+    Backward-compat shim (audit/calibration-durability): delegates to the
+    shared :func:`utils.atomic_io.durable_rename`. Existing call sites
+    that ``from .shared_io import _durable_rename`` (or the in-module
+    callers below) continue to work unchanged. The shared helper uses
+    ``O_RDONLY`` for the file fsync rather than ``O_WRONLY|O_APPEND``;
+    POSIX requires fsync() to flush all buffered modifications on the
+    fd regardless of open mode, and O_RDONLY survives on FUSE mounts
+    (HF Jobs bucket) that reject opening a regular file O_WRONLY.
+
+    Note: ``tmp`` must already be closed at the Python level (all
+    userspace I/O buffers flushed to the kernel) before this call; the
+    fsync here flushes kernel page-cache, not Python buffers.
     """
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_APPEND)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, final)
-    # tmp and final share the same parent directory (both are created in the same
-    # directory by all callers), so final.parent == tmp.parent and the fsync below
-    # correctly flushes the directory entry for the rename regardless of which path
-    # is used.
-    parent_fd = os.open(str(final.parent), os.O_RDONLY)
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
+    from ..utils.atomic_io import durable_rename as _shared_durable_rename
+    _shared_durable_rename(tmp, final)
 
 
 def _snapshot_cov_layer(
