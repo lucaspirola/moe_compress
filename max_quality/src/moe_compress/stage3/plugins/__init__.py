@@ -23,6 +23,11 @@ Cache providers (registered alongside the algorithmic plugins, hit via
 
   * :class:`input_cov_cache.Stage3InputCovCacheProvider` — V2 input-cov
     sidecar.
+  * :class:`wanda_scalar_row_cache.Stage3WandaScalarRowCacheProvider` —
+    W-1 Wanda scalar_row sidecar. On hit, populates
+    ``ctx["stage3.wanda_scalar_row"]`` so
+    :class:`WandaIntraExpertScorePlugin` short-circuits its per-layer
+    calibration sweep (D-zero-extra-forward resolved).
   * :class:`block_hidden_cache.Stage3BlockHiddenCacheProvider` —
     block-hidden teacher targets cache for Phase C.5.
 

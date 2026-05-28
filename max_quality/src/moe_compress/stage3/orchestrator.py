@@ -71,6 +71,7 @@ from .plugins.swift_svd_alpha import (
     _snapshot_originals,
 )
 from .plugins.wanda_intra_expert_score import WandaIntraExpertScorePlugin
+from .plugins.wanda_scalar_row_cache import Stage3WandaScalarRowCacheProvider
 
 log = logging.getLogger(__name__)
 
@@ -130,7 +131,10 @@ def run(
         # The cache provider is one of the plugins in the registry built
         # below; reuse the same registry here so an introspection tool
         # observes one wiring, not two.
-        _cache_only_plugins = [Stage3InputCovCacheProvider()]
+        _cache_only_plugins = [
+            Stage3InputCovCacheProvider(),
+            Stage3WandaScalarRowCacheProvider(),
+        ]
         PluginRegistry.dispatch_first(
             _cache_only_plugins, "on_load", _cache_ctx, _calib_jsonl_path,
         )
@@ -230,6 +234,7 @@ def run(
     # introspectable + parity with the Stage 2 / Stage 4 wiring.
     registry = PluginRegistry([
         Stage3InputCovCacheProvider(),
+        Stage3WandaScalarRowCacheProvider(),
         Stage3BlockHiddenCacheProvider(),
         CovarianceCollectionPlugin(),
         # Routing-weighted Wanda intra-expert importance score (MoE-Pruner
