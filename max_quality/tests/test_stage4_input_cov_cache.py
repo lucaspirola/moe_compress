@@ -257,3 +257,70 @@ def test_cache_miss_falls_back_to_disk(tmp_path):
         A_cov[(0, 0, "gate_proj")],
         torch.eye(3, dtype=torch.float16) * 2,
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 6 (S-2) -- Reader 2: torn on-disk payload fails loudly via manifest
+# ---------------------------------------------------------------------------
+
+
+def test_stage4_cache_miss_torn_disk_payload_fails_loudly(tmp_path):
+    """S-2: end-to-end through Reader 2's cache-miss branch.
+
+    Plant a Stage 2 cov via the real writer (which emits a manifest),
+    then truncate the .pt to simulate a SIGKILL mid-write. The manifest
+    still vouches for the original size, so reading via
+    ``EoraInputsPlugin.load_eora_inputs`` MUST raise loudly with the
+    'delete + re-run Stage 2' actionable signature instead of silently
+    consuming a partial multi-GB payload.
+    """
+    import threading
+
+    from moe_compress.stage2.shared_io import _save_covariance
+
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+
+    # Minimal fake of InputCovarianceAccumulator that _save_covariance
+    # consumes: _lock + .covariance + .token_count.
+    class _Fake:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.covariance = {
+                (0, 0, "gate_proj"): torch.eye(3, dtype=torch.float16),
+                (0, 1, "gate_proj"): torch.eye(3, dtype=torch.float16) * 2,
+            }
+            self.token_count = {k: 5 for k in self.covariance}
+
+    cov_path = artifacts_dir / "_stage2_input_covariance.pt"
+    _save_covariance(_Fake(), cov_path)
+
+    # Plant a stage3 originals placeholder (load_eora_inputs needs it past
+    # the cov branch we're testing).
+    torch.save({}, artifacts_dir / "_stage3_original_weights.pt")
+
+    # Truncate the cov payload — manifest still says the old size, so
+    # read_and_validate_manifest must raise ManifestMismatchError.
+    real_size = cov_path.stat().st_size
+    with open(cov_path, "r+b") as f:
+        f.truncate(real_size // 2)
+
+    ctx = PipelineContext()
+    ctx.set("artifacts_dir", artifacts_dir)
+    ctx.set("config", {"stage2_reap_ream": {"covariance_storage_dtype": "float16"}})
+
+    # Minimal model stub (same pattern as the other tests in this file).
+    import torch.nn as nn
+
+    class _StubLayer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mlp = None  # rejected by _is_moe_layer
+
+    stub_model = nn.Module()
+    stub_model.layers = nn.ModuleList([_StubLayer()])
+    ctx.set("model", stub_model)
+
+    live = EoraInputsPlugin()
+    with pytest.raises(RuntimeError, match="re-run Stage 2"):
+        live.load_eora_inputs(ctx)

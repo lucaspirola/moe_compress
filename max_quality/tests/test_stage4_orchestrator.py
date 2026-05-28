@@ -234,13 +234,26 @@ def test_orchestrator_run_deletes_stage3_stage2_sidecars(
 ):
     """The SIDECAR-DELETION contract: after the stage1->2->3 setup the
     sidecars ``_stage3_original_weights.pt`` and ``_stage2_input_covariance.pt``
-    exist on disk; the orchestrator's finalize block deletes BOTH on a
-    successful Stage 4 run. Also pins the ``run`` return contract."""
+    (plus their ``.MANIFEST.json`` siblings) exist on disk; the
+    orchestrator's finalize block deletes BOTH the payloads AND their
+    sibling manifests on a successful Stage 4 run.
+
+    S-2 M1 (F-S3-1 back-fill): the manifest assertions guard against
+    finalize leaving an ORPHAN manifest pointing at a vanished payload,
+    which any future reader would interpret as a torn-write signature
+    and raise loudly on a perfectly-healthy run.
+
+    Also pins the ``run`` return contract."""
     _run_stages_0123(tiny_model, patched_stage4, tmp_path)
 
     # Pre-condition: both sidecars are present after Stages 1->2->3.
+    # Note: the manifest siblings are present iff the writers emit them.
+    # Stage 3 emits its originals manifest (F-S3-1); Stage 2 emits its
+    # cov manifest (S-2). Both are checked in the post-condition.
     s3_originals = tmp_path / "_stage3_original_weights.pt"
+    s3_originals_manifest = tmp_path / "_stage3_original_weights.pt.MANIFEST.json"
     s2_covariance = tmp_path / "_stage2_input_covariance.pt"
+    s2_covariance_manifest = tmp_path / "_stage2_input_covariance.pt.MANIFEST.json"
     assert s3_originals.is_file()
     assert s2_covariance.is_file()
 
@@ -248,9 +261,13 @@ def test_orchestrator_run_deletes_stage3_stage2_sidecars(
         tiny_model, _TinyTokenizer(), patched_stage4, tmp_path, no_resume=True,
     )
 
-    # Finalize deletes BOTH sidecars (durable on the per-stage Hub repos).
+    # Finalize deletes BOTH sidecars AND their manifest siblings
+    # (durable on the per-stage Hub repos; the orphan-manifest cleanup
+    # is the M1 fix / F-S3-1 back-fill).
     assert not s3_originals.exists()
+    assert not s3_originals_manifest.exists()
     assert not s2_covariance.exists()
+    assert not s2_covariance_manifest.exists()
 
     # Return contract: the stage4_eora output directory + its JSON artifact.
     assert out_dir == tmp_path / "stage4_eora"
