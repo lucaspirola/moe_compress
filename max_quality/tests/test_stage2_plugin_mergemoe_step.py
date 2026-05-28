@@ -280,12 +280,10 @@ def test_merge_experts_inplace_mergemoe_fallback_on_empty_layer_inputs(
     finally:
         merging_log.propagate = _saved_propagate
 
-    fallback_records = [r for r in caplog.records
-                        if "fall" in r.message.lower() and "freq" in r.message.lower()]
-    assert len(fallback_records) >= 1, (
-        f"expected a WARNING about the freq-weighted fallback; got: "
-        f"{[r.message for r in caplog.records]}"
-    )
+    # Match the literal emitter text at ``stage2/merging.py:114`` — tighter
+    # contract, and the assertion itself documents the warning intent.
+    assert any("falling back to freq-weighted merge" in r.message for r in caplog.records), \
+        f"expected the empty-layer-inputs fallback warning, got: {[r.message for r in caplog.records]}"
 
     # Merged weights should match the freq-weighted result.
     snap_freq = _snapshot_banks(layer_freq)
