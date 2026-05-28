@@ -168,6 +168,9 @@ class EoraInputsPlugin:
                             A_cov_path)
 
         originals_path = artifacts_dir / "_stage3_original_weights.pt"
+        originals_manifest_path = (
+            artifacts_dir / "_stage3_original_weights.MANIFEST.json"
+        )
         if not originals_path.exists():
             # If Stage 4 already completed, the originals are intentionally
             # deleted. Re-entering Stage 4 on an already-widened model is a
@@ -181,6 +184,44 @@ class EoraInputsPlugin:
             raise FileNotFoundError(
                 f"Stage 4 requires Stage 3 original weights at {originals_path}. "
                 "Re-run Stage 3 first."
+            )
+        # F-S3-1: validate the MANIFEST.json sidecar before loading the
+        # ~50 GB .pt. Stage 3 writes the manifest LAST, after the .pt's
+        # fsync, so a torn .pt (mid-write SIGKILL) leaves NO manifest.
+        # Missing or mismatched manifest = fail loudly + delete-and-re-run,
+        # NEVER silently consume a partial file.
+        #
+        # Backward-compat: a .pt produced by a pre-F-S3-1 Stage 3 has no
+        # manifest sibling — we accept it with a single WARNING (skipping
+        # validation) so the fix doesn't invalidate completed runs already
+        # in flight. Once the next full pipeline rev lands, this fallback
+        # can be removed.
+        if originals_manifest_path.exists():
+            from moe_compress.utils.atomic_io import (
+                ManifestMismatchError,
+                read_and_validate_manifest,
+            )
+            try:
+                read_and_validate_manifest(
+                    originals_path,
+                    originals_manifest_path,
+                    expected_schema_version=1,
+                )
+            except ManifestMismatchError as exc:
+                raise RuntimeError(
+                    f"Stage 4: Stage 3 originals manifest validation FAILED — {exc}. "
+                    "This is the classic torn-write signature on a "
+                    f"~50 GB artifact. Delete both {originals_path.name} and "
+                    f"{originals_manifest_path.name} from {artifacts_dir} "
+                    "and re-run Stage 3."
+                ) from exc
+        else:
+            log.warning(
+                "Stage 4: %s has no MANIFEST.json sibling (pre-F-S3-1 "
+                "calibration run?). Proceeding without manifest validation; "
+                "if Stage 4 errors during originals lookup, the .pt may be "
+                "torn — delete it and re-run Stage 3.",
+                originals_path,
             )
         originals: dict = torch.load(originals_path, map_location="cpu")
 

@@ -429,10 +429,47 @@ def run(
     # Persist originals before Phase D. Stage 4 reads this file, so it must
     # exist even if Stage 3 crashes mid-factoring. Written once here so
     # Stage 4 can always resume cleanly from the correct original weights.
+    #
+    # F-S3-1 fix: previously a bare in-place torch.save with no tmp+rename,
+    # no fsync, no manifest. A SIGKILL mid-write (~50 GB on
+    # Qwen3.6-35B-A3B) left a TRUNCATED .pt at the final path that Stage 4
+    # would either error on (loud) OR partially load (silent corruption if
+    # a future Stage 4 ever adds a `.get(..., 0)` fallback).
+    #
+    # Now: atomic_torch_save (tmp + fsync + os.replace + fsync(parent)) +
+    # write_manifest_last so Stage 4 keys on the manifest's existence,
+    # NOT the .pt's. A torn write produces a .pt without its
+    # MANIFEST.json sibling — Stage 4 fails loudly with an actionable
+    # message instead of consuming the partial file.
+    from ..utils.atomic_io import atomic_torch_save, write_manifest_last
     _orig_path = artifacts_dir / "_stage3_original_weights.pt"
-    torch.save(originals, _orig_path)
-    log.info("Saved Stage 3 original weights snapshot (%d matrices) -> %s",
-             len(originals), _orig_path)
+    _orig_manifest_path = artifacts_dir / "_stage3_original_weights.MANIFEST.json"
+    # If a previous run left a stale manifest, remove it first so an
+    # interrupted re-write here doesn't briefly look "good" to Stage 4.
+    try:
+        _orig_manifest_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    atomic_torch_save(originals, _orig_path)
+    # Manifest is written LAST, after the .pt is fsync'd. Stage 4 reads
+    # the manifest first; a missing/mismatched manifest means the .pt
+    # is torn and must be re-captured.
+    write_manifest_last(
+        _orig_path,
+        _orig_manifest_path,
+        schema_version=1,
+        extra_meta={
+            "n_matrices": len(originals),
+            "artifact": "stage3_original_weights",
+        },
+        # 50 GB SHA-256 on resume would add minutes — size + schema is
+        # the validation budget; sha256 here is computed once at write
+        # time and stored for opt-in deep validation by operators.
+        compute_sha256=True,
+    )
+    log.info("Saved Stage 3 original weights snapshot (%d matrices) -> %s "
+             "(manifest -> %s)",
+             len(originals), _orig_path, _orig_manifest_path)
 
     # Pre-flight RAM check: paper-compliance contract (spec section 6 Phase B.2)
     # requires the end-to-end PPL alpha-search per Swift-SVD section 3.2.2. If
