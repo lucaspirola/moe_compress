@@ -468,6 +468,47 @@ def _load_stage2_covariance(path: Path):
     if not path.exists():
         log.warning("Stage 2 covariance not found at %s — AA-SVD fallback", path)
         return {}
+    # S-2: validate the MANIFEST.json sidecar before loading the multi-GB
+    # .pt. Stage 2 writes the manifest LAST, after the .pt's fsync, so a
+    # torn .pt (mid-write SIGKILL) leaves NO manifest. Missing or
+    # mismatched manifest = fail loudly + delete-and-re-run, NEVER
+    # silently consume a partial file. Mirrors F-S3-1's
+    # eora_inputs.py:199-243 contract.
+    manifest_path = path.with_suffix(path.suffix + ".MANIFEST.json")
+    if manifest_path.exists():
+        from moe_compress.utils.atomic_io import (
+            ManifestMismatchError,
+            read_and_validate_manifest,
+        )
+        try:
+            read_and_validate_manifest(
+                path,
+                manifest_path,
+                expected_schema_version=1,
+            )
+        except ManifestMismatchError as exc:
+            raise RuntimeError(
+                f"Stage 3: Stage 2 covariance manifest validation FAILED — {exc}. "
+                "This is the classic torn-write signature on a multi-GB "
+                f"artifact. Delete both {path.name} and "
+                f"{manifest_path.name} from {path.parent} and re-run Stage 2."
+            ) from exc
+    else:
+        # MEDIUM-S2 TODO(post-2026-Q3): remove this backward-compat shim
+        # once all in-flight runs that produced pre-S-2 .pt files are
+        # regenerated under the new writer. Mirrors MEDIUM-8 in
+        # eora_inputs.py:230-236. The fallback exists because pre-S-2
+        # Stage 2 writers produced .pt files without sibling manifests;
+        # once those in-flight runs complete, ALL Stage 2 writers emit a
+        # manifest and the missing-manifest branch becomes
+        # dead-code-loud-fail territory.
+        log.warning(
+            "Stage 3: %s has no MANIFEST.json sibling (pre-S-2 Stage 2 "
+            "writer?). Proceeding without manifest validation; if "
+            "torch.load errors below, the .pt may be torn — delete it "
+            "and re-run Stage 2.",
+            path,
+        )
     payload = torch.load(path, map_location="cpu")
     return payload.get("covariance", {})
 

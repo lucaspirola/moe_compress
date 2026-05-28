@@ -575,7 +575,60 @@ def load_originals_snapshot(
 def load_input_covariance(
     path: Path,
 ) -> dict[tuple[int, int, str], torch.Tensor]:
-    """Load ``_stage2_input_covariance.pt`` and return its sigma_in dict."""
+    """Load ``_stage2_input_covariance.pt`` and return its sigma_in dict.
+
+    S-2: validate the MANIFEST.json sidecar before loading the multi-GB
+    .pt. Stage 2 writes the manifest LAST, after the .pt's fsync, so a
+    torn .pt (mid-write SIGKILL) leaves NO sibling manifest. We validate
+    manifest-first to fail loudly on a torn write instead of silently
+    consuming a partial file. Mirrors load_originals_snapshot above.
+
+    Backward-compat fallback: a ``.pt`` produced by a pre-S-2 Stage 2
+    writer has no manifest sibling — we accept it with a single WARNING
+    (skipping validation). Once all in-flight runs upgrade to a
+    manifest-emitting writer, the fallback branch becomes loud-fail
+    territory.
+    """
+    # S-2: Stage 2 cov has no pre-rename legacy artifacts, so unlike
+    # load_originals_snapshot we do NOT consult a legacy-suffix
+    # manifest path. There is exactly one manifest path:
+    # ``...covariance.pt.MANIFEST.json``.
+    manifest_path = path.with_suffix(path.suffix + ".MANIFEST.json")
+    if manifest_path.exists():
+        from moe_compress.utils.atomic_io import (
+            ManifestMismatchError,
+            read_and_validate_manifest,
+        )
+        try:
+            read_and_validate_manifest(
+                path,
+                manifest_path,
+                expected_schema_version=1,
+            )
+        except ManifestMismatchError as exc:
+            log.error(
+                "load_input_covariance: Stage 2 covariance manifest "
+                "validation FAILED for %s — %s. This is the classic "
+                "torn-write signature on a multi-GB artifact. Delete "
+                "both %s and %s and re-run Stage 2.",
+                path,
+                exc,
+                path.name,
+                manifest_path.name,
+            )
+            raise
+    else:
+        # MEDIUM-S2 TODO(post-2026-Q3): remove this back-compat shim
+        # once all sidecars under /opt/output/* are regenerated with
+        # manifests. Same WARN-and-continue contract as
+        # load_originals_snapshot above.
+        log.warning(
+            "load_input_covariance: %s has no MANIFEST.json sibling "
+            "(pre-S-2 Stage 2 writer?). Proceeding without manifest "
+            "validation; if torch.load errors below, the .pt may be "
+            "torn — delete it and re-run Stage 2.",
+            path,
+        )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError(

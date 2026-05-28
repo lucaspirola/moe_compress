@@ -162,6 +162,58 @@ class EoraInputsPlugin:
             A_cov_path = artifacts_dir / "_stage2_input_covariance.pt"
             A_cov = {}
             if A_cov_path.exists():
+                # S-2: validate the MANIFEST.json sidecar before loading
+                # the multi-GB .pt. Stage 2 writes the manifest LAST,
+                # after the .pt's fsync, so a torn .pt (mid-write
+                # SIGKILL) leaves NO manifest sibling. Same contract as
+                # the Stage 3 originals block below (lines 199-243).
+                #
+                # Stage 2 cov has no pre-rename legacy artifacts, so the
+                # legacy-suffix back-compat block (analogous to lines
+                # 179-184 for Stage 3 originals) is intentionally absent
+                # here — Reader 2's new block has ONE manifest path.
+                A_cov_manifest_path = A_cov_path.with_suffix(
+                    A_cov_path.suffix + ".MANIFEST.json"
+                )
+                if A_cov_manifest_path.exists():
+                    from moe_compress.utils.atomic_io import (
+                        ManifestMismatchError,
+                        read_and_validate_manifest,
+                    )
+                    try:
+                        read_and_validate_manifest(
+                            A_cov_path,
+                            A_cov_manifest_path,
+                            expected_schema_version=1,
+                        )
+                    except ManifestMismatchError as exc:
+                        raise RuntimeError(
+                            f"Stage 4: Stage 2 covariance manifest validation "
+                            f"FAILED — {exc}. This is the classic torn-write "
+                            f"signature on a multi-GB artifact. Delete both "
+                            f"{A_cov_path.name} and "
+                            f"{A_cov_manifest_path.name} from {artifacts_dir} "
+                            "and re-run Stage 2."
+                        ) from exc
+                else:
+                    # MEDIUM-S2 TODO(post-2026-Q3): remove this
+                    # backward-compat shim once all in-flight runs that
+                    # produced pre-S-2 .pt files are regenerated under
+                    # the new writer. Mirrors MEDIUM-8 in lines 230-236
+                    # below. The fallback exists because pre-S-2 Stage 2
+                    # writers produced .pt files without sibling
+                    # manifests; once those in-flight runs complete, ALL
+                    # Stage 2 writers emit a manifest and the
+                    # missing-manifest branch becomes
+                    # dead-code-loud-fail territory.
+                    log.warning(
+                        "Stage 4: %s has no MANIFEST.json sibling "
+                        "(pre-S-2 Stage 2 writer?). Proceeding without "
+                        "manifest validation; if torch.load errors "
+                        "below, the .pt may be torn — delete it and "
+                        "re-run Stage 2.",
+                        A_cov_path,
+                    )
                 A_cov = torch.load(A_cov_path, map_location="cpu").get("covariance", {})
             else:
                 log.warning("Stage 4: no Stage 2 covariance at %s — plain-SVD fallback",
