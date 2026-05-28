@@ -771,6 +771,39 @@ NOT cache-hit by v7/v9 runs — the bumps intentionally segregate so a
 v1-era cache doesn't silently mix into a v2 calibration tensor. See
 `max_quality/docs/calibration_mix_v2.md` for the full v2 mix definition.
 
+## Performance disclosures
+
+Driver-side / plugin-side perf characteristics worth surfacing at the
+manifest level so CI flake reviews don't re-derive them from scratch.
+
+### `expert_distill` v2 cold-cache CI cost
+
+`expert_distill.py` v2 target (D-expert-distill-paper-lift, Lift 2,
+paper Eqs. 1-3) adds a per-group `_router_routing_weights` recompute
+(full-softmax `σ_orig(x)` over the unpruned router, then a TopK mask
+and renormalization) inside `_distill_merged_group`. Empirical wall-
+clock on the `tests/test_stage2_assignment_v2.py` suite:
+
+- Main branch baseline: 52 passed, 6 skipped in ~3.7s
+- This branch, cold cache: ~120s total with occasional `--timeout=60`
+  failures
+- This branch, warm cache: 1.5-13s (no regression)
+
+The cold slowdown is the cost of the per-group router-routing-weight
+recompute, paid once per group on the first distillation pass through
+a layer. Warm runs amortize via Python's import cache + torch's kernel
+cache.
+
+If this becomes a CI flake (cold-cache runs intermittently exceed the
+60s wall), the cheapest fix is to **cache the routing weights at first
+compute and reuse them across the per-group loop** — `σ_orig` is
+shared across all groups within a layer (the router is the same
+tensor), so the current per-group recompute is O(num_groups) wasteful.
+This is a follow-up optimization tracked as audit finding E-2 (MEDIUM)
+in `tasks/AUDIT_CALIBRATION_COMPLETENESS_V2.md`.
+
+Authoritative source: `expert_distill.py:262-285`.
+
 ## When to bump the immutable tag
 
 Whenever the patch's functional contents change (line count or MD5 differ),
