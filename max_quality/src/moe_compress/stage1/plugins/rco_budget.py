@@ -459,11 +459,9 @@ class RCOBudgetPlugin:
 
         # Main RCO loop.
         for it in range(n_iterations):
-            # Cosine anneal τ explore → exploit. Cleaned formula (plan §1.3
-            # step 2): τ_t = τ_final + 0.5·(τ_init − τ_final)·(1 + cos(π·t/T)).
-            # At t=0: cos(0)=1 → τ = τ_init (hot, uniform). At t=T-1: cos≈π →
-            # τ ≈ τ_final (cold, argmax-like).
-            tau = self._cosine_tau(
+            # Exponential anneal τ explore → exploit. Upstream parity:
+            # src/search/prune.py:663 / src/search/quant.py:655.
+            tau = self._anneal_tau(
                 step=it,
                 total_steps=max(n_iterations, 1),
                 tau_init=gumbel_tau_init,
@@ -930,30 +928,29 @@ class RCOBudgetPlugin:
         return alpha - 0.5 * (t_lo + t_hi) * cost_grid
 
     # ------------------------------------------------------------------
-    # Cosine τ-anneal (plan §1.3 step 2, cleaned form)
+    # τ-anneal (exponential, upstream parity)
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _cosine_tau(
+    def _anneal_tau(
         *, step: int, total_steps: int, tau_init: float, tau_final: float
     ) -> float:
-        """Cosine schedule, explore → exploit (τ_init → τ_final).
+        """Exponential τ schedule, explore → exploit (τ_init → τ_final).
 
-        ``τ_t = τ_final + 0.5·(τ_init − τ_final)·(1 + cos(π·t/T))``
-        with ``t ∈ {0, ..., T-1}``.
+        Mirrors upstream ``src/search/prune.py:663`` and
+        ``src/search/quant.py:655`` verbatim::
 
-        - At ``t = 0``: ``cos(0) = 1`` ⇒ ``τ = τ_init`` (hot, uniform p̃).
-        - At ``t = T-1``: ``cos(π·(T-1)/T) ≈ cos(π) = -1`` ⇒
-          ``τ ≈ τ_final`` (cold, argmax-like p̃).
+            progress = step / max(n_steps - 1, 1)
+            tau = max(tau_min, tau_init * (tau_min / tau_init) ** progress)
 
-        This is the canonical explore → exploit direction (plan §1.3
-        step 2 / D1-2 fix); the prior impl used cos(π·(1−t/T)) which
-        ran the schedule exploit → explore (reversed).
+        Endpoints:
+        - At ``t = 0``: ``progress = 0`` ⇒ ``τ = τ_init`` (hot).
+        - At ``t = T-1``: ``progress = 1`` ⇒ ``τ = τ_final`` (cold).
         """
-        T = max(total_steps, 1)
-        progress = step / T
-        return tau_final + 0.5 * (tau_init - tau_final) * (
-            1.0 + math.cos(math.pi * progress)
+        progress = step / max(total_steps - 1, 1)
+        return max(
+            tau_final,
+            tau_init * (tau_final / tau_init) ** progress,
         )
 
     # ------------------------------------------------------------------
