@@ -255,7 +255,13 @@ class ShardWriter:
         idx = len(self._shards)
         name = f"{_INPUT_PREFIX}layer{self.layer_idx}_shard{idx:05d}.safetensors"
         path = self.out_dir / name
-        save_file({_INPUT_KEY: x_in, _OUTPUT_KEY: x_out}, str(path))
+        # F-H-1: previously save_file(…, str(path)) wrote in place. A
+        # SIGKILL mid-write left a truncated .safetensors at the final
+        # name. atomic_safetensors_save does tmp+fsync+os.replace+
+        # fsync(parent) so a torn write leaves the previous (good or
+        # absent) final-path file untouched and a stale .tmp orphan.
+        from .atomic_io import atomic_safetensors_save
+        atomic_safetensors_save({_INPUT_KEY: x_in, _OUTPUT_KEY: x_out}, path)
         self._shards.append(ShardEntry(path=name, rows=int(x_in.size(0))))
 
     def close_pending(self) -> None:
@@ -306,7 +312,10 @@ class ShardWriter:
                 )
             shared_name = _shared_name_for(entry.path)
             shared_path = self.out_dir / shared_name
-            save_file({_SHARED_KEY: x_shared}, str(shared_path))
+            # F-H-1 (companion): same atomic-write protection as the
+            # input shard above. See _write_input_shard rationale.
+            from .atomic_io import atomic_safetensors_save
+            atomic_safetensors_save({_SHARED_KEY: x_shared}, shared_path)
 
     def finalize(self, *, split_ratio: float = 0.9, seed: int = 0) -> ShardManifest:
         """Whole-shard train/holdout split, write ``manifest.json``, return it.
@@ -362,7 +371,24 @@ class ShardWriter:
             shard_rows=self.shard_rows,
         )
         path = self.out_dir / _MANIFEST_FILENAME
-        path.write_text(json.dumps(manifest.to_json(), indent=2, sort_keys=True))
+        # F-H-2: previously path.write_text(json.dumps(...)) opened-
+        # truncated-wrote in place. A SIGKILL mid-flush could leave a
+        # JSON file truncated at a "happens-to-be-valid" structural
+        # boundary — silently accepted by json.loads but with a
+        # truncated shard list → heal trained on a fraction of the
+        # captured data without noticing.
+        #
+        # atomic_json_save does tmp + fsync(fd) + os.replace +
+        # fsync(parent_dir) so the manifest is the LAST thing written
+        # by finalize(); a torn manifest = no manifest at all,
+        # detectable by readers (they require manifest.json to exist).
+        # Combined with F-H-1's per-shard atomic writes, the
+        # manifest-last invariant for the heal-shards directory is
+        # now durable end-to-end (Pattern N).
+        from .atomic_io import atomic_json_save
+        atomic_json_save(
+            path, manifest.to_json(), indent=2, sort_keys=True,
+        )
         log.info(
             "Wrote manifest %s: layer=%d n_train=%d n_holdout=%d shards=%d+%d",
             path, manifest.layer_idx, manifest.n_train, manifest.n_holdout,
