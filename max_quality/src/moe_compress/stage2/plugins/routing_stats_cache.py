@@ -8,6 +8,14 @@ calibration-v2 writers campaign). On cache hit, populates
 it. There is NO immediate per-layer consumer at present -- this
 provider lays infrastructure only.
 
+TODO(routing_stats-consumer): Same finding as the Stage 1 sibling at
+``stage1/plugins/routing_stats_cache.py`` -- no production consumer
+reads ``ctx.routing_stats_payload`` as of 2026-05. Audit raised this
+as HIGH-1 "infrastructure-only capture". Either wire a consumer
+(routing-aware ablation gating / mean-weight-weighted REAP variants
+are the planned use cases) or delete the writer + both cache
+providers. Tracking: ``tasks/calib_v2_writers_todo.md`` Item 3.
+
 Architecture: provider-pair pattern per
 ``max_quality/docs/calibration_v2_data_capture_plan.md`` Section 0.
 The Stage 2 routing-stats provider mirrors the plain (no

@@ -8,6 +8,17 @@ calibration-v2 writers campaign, in
 onto ``ctx["routing_stats_payload"]`` for future read-side plugins;
 on miss, returns None and leaves the ctx untouched.
 
+TODO(routing_stats-consumer): This cache provider has NO production
+consumer reading ``ctx.routing_stats_payload`` as of 2026-05.
+The writer + readers are infrastructure-only, laid down to keep the
+on-disk schema stable while the downstream consumers (routing-aware
+ablation gating, mean-weight-weighted REAP variants, mentioned below)
+are still on the calibration-v2 roadmap. Audit raised this as a
+HIGH-1 "infrastructure-only capture" finding. If after another sweep
+no consumer materializes, consider deleting the writer + both
+(Stage1/Stage2) cache providers to reclaim calibration disk + the
+sidecar-load time. Tracking: ``tasks/calib_v2_writers_todo.md`` Item 3.
+
 Architecture: provider-pair pattern per
 ``max_quality/docs/calibration_v2_data_capture_plan.md`` Section 0.
 The cached payload is indexed by ``(layer_rank, expert_id)`` on disk;
