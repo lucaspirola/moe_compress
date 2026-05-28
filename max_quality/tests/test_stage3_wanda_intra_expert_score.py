@@ -124,11 +124,17 @@ def test_config_validation_rejects_invalid_scalar_row_dtype():
         )
 
 
-def test_config_validation_rejects_empty_sidecar_filename():
-    """An empty sidecar filename raises ValueError."""
+def test_config_validation_rejects_sidecar_filename_post_w2():
+    """W-2 (2026-05-29): the ``sidecar_filename`` key was removed when the
+    sidecar moved to the F-H-7 namespaced layout. Pre-W-2 configs carrying
+    the key now fail loud via the Pattern C unknown-key validator instead
+    of silently writing to a stale path.
+    """
     plugin = WandaIntraExpertScorePlugin()
-    with pytest.raises(ValueError, match="sidecar_filename"):
-        plugin._validate_config({"enabled": True, "sidecar_filename": ""})
+    with pytest.raises(ValueError, match="unknown config keys"):
+        plugin._validate_config(
+            {"enabled": True, "sidecar_filename": "_wanda.pt"},
+        )
 
 
 def test_config_validation_defaults_applied():
@@ -137,9 +143,10 @@ def test_config_validation_defaults_applied():
     cfg = plugin._validate_config({})
     assert cfg["enabled"] is False
     assert cfg["write_sidecar"] is True
-    assert cfg["sidecar_filename"].endswith(".pt")
     assert cfg["score_dtype"] == "float32"
     assert cfg["scalar_row_dtype"] == "float32"
+    # W-2: sidecar_filename was removed; defaults dict must not carry it.
+    assert "sidecar_filename" not in cfg
 
 
 # ==========================================================================
@@ -258,8 +265,18 @@ def test_scalar_row_accumulator_empty_batch_is_noop():
 # ==========================================================================
 
 
-def _make_score_ctx(model, batches, tmp_path: Path) -> PipelineContext:
-    """Build a minimal ctx for the collect_wanda_scores hook."""
+def _make_score_ctx(
+    model, batches, tmp_path: Path, *, jsonl_stem: str = "trace",
+) -> PipelineContext:
+    """Build a minimal ctx for the collect_wanda_scores hook.
+
+    W-2 (2026-05-29): the plugin now reads ``calibration_jsonl_path``
+    (set by the orchestrator at the same site as ``artifacts_dir``) to
+    derive its F-H-7 namespaced sidecar location. Tests synthesize a
+    JSONL file path under ``tmp_path`` (no real file required — the
+    plugin only consults its ``.parent`` + ``.stem`` via
+    :func:`sidecar_path`).
+    """
     config = {
         "stage3": {
             "wanda_intra_expert": {
@@ -276,7 +293,7 @@ def _make_score_ctx(model, batches, tmp_path: Path) -> PipelineContext:
     ctx.set("batches", batches)
     ctx.set("device", None)
     ctx.set("config", config)
-    ctx.set("artifacts_dir", tmp_path)
+    ctx.set("calibration_jsonl_path", tmp_path / f"{jsonl_stem}.jsonl")
     return ctx
 
 
@@ -376,25 +393,67 @@ def test_score_map_matches_W_times_sqrt_scalar_row(tiny_model, tmp_path):
 
 
 def test_collect_wanda_scores_writes_sidecar(tiny_model, tmp_path):
-    """When ``write_sidecar=True`` an atomic .pt + .MANIFEST.json appear."""
+    """T5 (W-2 update): when ``write_sidecar=True`` an atomic .pt +
+    .MANIFEST.json appear at the F-H-7 namespaced layout
+    ``<jsonl.parent>/sidecars/<jsonl.stem>/wanda_intra_expert_score.pt``
+    — NOT at the pre-W-2 ``artifacts_dir/_stage3_wanda_intra_expert_score.pt``.
+    Also drops the now-removed ``sidecar_filename`` config override.
+    """
     batches = [torch.randint(0, 32, (1, 4), dtype=torch.long)]
-    ctx = _make_score_ctx(tiny_model, batches, tmp_path)
+    ctx = _make_score_ctx(
+        tiny_model, batches, tmp_path, jsonl_stem="trace_t5",
+    )
     cfg = ctx.get("config")
     cfg["stage3"]["wanda_intra_expert"]["write_sidecar"] = True
-    cfg["stage3"]["wanda_intra_expert"]["sidecar_filename"] = "_wanda_test.pt"
 
     plugin = WandaIntraExpertScorePlugin()
     plugin.collect_wanda_scores(ctx)
 
-    sidecar = tmp_path / "_wanda_test.pt"
-    manifest = tmp_path / "_wanda_test.pt.MANIFEST.json"
-    assert sidecar.exists()
-    assert manifest.exists()
+    # F-H-7 namespaced path — must match sidecar_path() with the
+    # "wanda_intra_expert_score" signal name (asserted byte-equal in T2).
+    sidecar = tmp_path / "sidecars" / "trace_t5" / "wanda_intra_expert_score.pt"
+    manifest = sidecar.with_suffix(".pt.MANIFEST.json")
+    assert sidecar.exists(), f"sidecar missing at {sidecar}"
+    assert manifest.exists(), f"manifest missing at {manifest}"
+    # The legacy path MUST NOT have been written (writer never falls back).
+    legacy = tmp_path / "_stage3_wanda_intra_expert_score.pt"
+    assert not legacy.exists(), (
+        "legacy sidecar at artifacts_dir was unexpectedly created"
+    )
     payload = torch.load(sidecar, map_location="cpu", weights_only=False)
     # Pattern B: format_version at the top level.
     assert payload["format_version"] == _ARTIFACT_FORMAT_VERSION
     assert "wanda_intra_expert_score" in payload
     assert "metadata" in payload
+
+
+def test_collect_wanda_scores_writes_sidecar_at_namespaced_path(
+    tiny_model, tmp_path,
+):
+    """T1 (W-2): explicit smoke that the writer lands at the F-H-7
+    namespaced layout when ``calibration_jsonl_path`` is set on ctx.
+    Complement to T5 — T5 covers the realistic config path with
+    ``write_sidecar=True`` flipped on; T1 cross-checks the resulting
+    path against the byte-equal value derived from the helper
+    contract (T2 is the byte-equality lock).
+    """
+    batches = [torch.randint(0, 32, (1, 4), dtype=torch.long)]
+    ctx = _make_score_ctx(
+        tiny_model, batches, tmp_path, jsonl_stem="trace_t1",
+    )
+    cfg = ctx.get("config")
+    cfg["stage3"]["wanda_intra_expert"]["write_sidecar"] = True
+
+    plugin = WandaIntraExpertScorePlugin()
+    plugin.collect_wanda_scores(ctx)
+
+    sidecar = (
+        tmp_path / "sidecars" / "trace_t1" / "wanda_intra_expert_score.pt"
+    )
+    assert sidecar.exists()
+    assert sidecar.with_suffix(".pt.MANIFEST.json").exists()
+    payload = torch.load(sidecar, map_location="cpu", weights_only=False)
+    assert payload["format_version"] == _ARTIFACT_FORMAT_VERSION
 
 
 def test_collect_wanda_scores_rejects_invalid_config(tiny_model, tmp_path):
