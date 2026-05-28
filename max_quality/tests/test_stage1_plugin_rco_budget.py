@@ -1,19 +1,18 @@
-"""Unit tests for ``moe_compress.stage1.plugins.rco_budget`` (clean-room re-impl).
+"""Unit tests for ``moe_compress.stage1.plugins.rco_budget``.
 
-Total: 34 tests covering plan ``tasks/PLAN_RCO_NATIVE_REIMPL.md`` §6:
+Aligned bit-by-bit with upstream IST-DASLab/RCO. Tests pin upstream's
+specific algorithmic choices:
 
-- **C1-C16 (16)**: code-quality / contract / Pattern B/C/E adoption tests
-- **F1-F15 (15)**: paper-fidelity tests pinning algorithm correctness
-- **R1-R3 (3)**: regression / byte-identity tests
+- Exponential τ-anneal (matches src/search/prune.py:663).
+- Retraction with α ← α + c·costs, tol=0.05, 40 bracket-doublings
+  (matches src/manifold.py:73,96,117).
+- β-bisection init (matches src/search/quant.py::init_alpha_to_bits).
+- Lower-budget tiebreak on infeasibility (matches src/search/quant.py:411-419).
+- Per-group weights API parameter (matches src/manifold.py weights= kwarg).
+- Gumbel sampling with u clamped to (1e-20, 1-1e-20), inner-log +1e-20
+  (matches src/search/quant.py:672-673).
 
-Naming follows the plan's test IDs verbatim. The "carried over" 12 tests
-(C1-C5, C8-C10, C13-C16) keep their existing function names; their
-expected values were re-derived where the algorithm changed (Gumbel form,
-cosine anneal direction, β·log p removal, infeasibility fallback).
-
-The 4 ON-path behavior changes from plan §7 are pinned by F11 (Gumbel
-form), F12 (cosine direction), F15 (pure-damage DP), F8 (nearest
-feasible budget).
+Audit: tasks/RCO_UPSTREAM_ALIGNMENT_AUDIT.md.
 """
 from __future__ import annotations
 
@@ -64,7 +63,6 @@ def _build_inputs(*, global_budget: int = 6, enabled: bool = True) -> dict:
                     "learning_rate": 0.1,
                     "gumbel_tau_init": 5.0,
                     "gumbel_tau_final": 0.5,
-                    "init_peak_logit": 2.0,
                     "floor_divisor": 2,
                     "seed": 0,
                 }
@@ -92,24 +90,23 @@ def _populate_context(inputs: dict) -> PipelineContext:
 
 
 def test_plugin_protocol_attributes():
-    """C1: class-level attributes match the plan exactly + nine deviations cited."""
+    """C1: class-level attributes match the upstream-aligned deviations list."""
     plugin = RCOBudgetPlugin()
     assert plugin.name == "rco_budget"
     assert "arxiv:2605.00649" in plugin.paper
     assert "clean-room" in plugin.paper
     assert "IST-DASLab" in plugin.paper
-    # All NINE D-* deviations must be cited in the paper string (8 carried +
-    # 1 new D-adam-no-v-transport).
+    # Post-alignment deviations (forced by our pipeline's API surface):
     for deviation_token in (
         "D-clean-room",
-        "D-init-grape",
         "D-fitness-mse",
+        "D-analytic-grad",
         "D-synthetic-curve",
         "D-floor-projection",
         "D-ragged-K",
-        "D-bisection-budget",
+        "D-dp-damage-not-logp",
         "D-disabled-default",
-        "D-adam-no-v-transport",
+        "D-no-router-prior",
     ):
         assert deviation_token in plugin.paper
     assert plugin.config_key == "stage1.rco_budget"
@@ -509,7 +506,12 @@ def test_tangent_projection_orthogonality():
 
 
 def test_retraction_budget_exactness():
-    """F3: after ``_retract``, Σ p · c equals B within _BISECT_TOL (50 trials)."""
+    """F3: after ``_retract``, Σ p · c equals B within upstream tol=0.05 (50 trials).
+
+    Matches upstream src/manifold.py:73 (`tol=0.05`).
+    """
+    from moe_compress.stage1.plugins.rco_budget import _BISECT_TOL
+
     plugin = RCOBudgetPlugin()
     torch.manual_seed(42)
     L, K_max = 5, 8
@@ -524,8 +526,8 @@ def test_retraction_budget_exactness():
         alpha_r = plugin._retract(alpha, cost_grid, mask, B)
         p = plugin._masked_softmax(alpha_r, mask)
         soft_b = float((p * cost_grid).sum().item())
-        assert abs(soft_b - B) <= 1e-3, (
-            f"trial {trial}: |Σ p·c − B| = {abs(soft_b - B)}"
+        assert abs(soft_b - B) <= _BISECT_TOL, (
+            f"trial {trial}: |Σ p·c − B| = {abs(soft_b - B)} > {_BISECT_TOL}"
         )
 
 
@@ -533,7 +535,13 @@ def test_retraction_budget_exactness():
 
 
 def test_retraction_monotonicity():
-    """F4: f(t) = C(α − t·c) − B is monotonically non-increasing in t."""
+    """F4: f(c) = C(α + c·costs) − B is monotonically non-decreasing in c.
+
+    Upstream parity: matches the retraction's positive-shift convention
+    in ``src/manifold.py:115-117`` (``alpha.add_(c * costs)``). Increasing
+    ``c`` shifts probability mass toward high-cost options ⇒ C is
+    monotonically non-decreasing in c.
+    """
     plugin = RCOBudgetPlugin()
     torch.manual_seed(3)
     L, K_max = 4, 5
@@ -541,15 +549,15 @@ def test_retraction_monotonicity():
     cost_grid = torch.randint(1, 10, (L, K_max)).double()
     mask = torch.ones(L, K_max, dtype=torch.float64)
     B = 4.0
-    ts = np.linspace(-3.0, 3.0, 81)
+    cs = np.linspace(-3.0, 3.0, 81)
     residuals = [
-        plugin._budget_residual(alpha - t * cost_grid, cost_grid, mask, B)
-        for t in ts
+        plugin._budget_residual(alpha + c * cost_grid, cost_grid, mask, B)
+        for c in cs
     ]
     diffs = np.diff(residuals)
-    # Non-increasing: every diff ≤ 0 (allow tiny float noise).
-    assert (diffs <= 1e-10).all(), (
-        f"retraction residual not monotone: max diff = {diffs.max()}"
+    # Non-decreasing: every diff ≥ 0 (allow tiny float noise).
+    assert (diffs >= -1e-10).all(), (
+        f"retraction residual not monotone: min diff = {diffs.min()}"
     )
 
 
@@ -603,9 +611,12 @@ def test_gradient_estimate_jacobian_collapse():
         alpha=alpha, mask=mask, damage_grid=damage_grid, tau=tau, rng=rng_impl,
     )
 
-    # Reference: replay the same Gumbel sample + analytic Jacobian collapse.
-    u = torch.rand(alpha.shape, generator=rng_ref, dtype=alpha.dtype).clamp_min(1e-20)
-    g_noise = -torch.log(-torch.log(u))
+    # Reference: replay the same Gumbel sample (upstream-aligned form:
+    # u clamp (1e-20, 1-1e-20); inner log + 1e-20) + analytic Jacobian.
+    u = torch.rand(alpha.shape, generator=rng_ref, dtype=alpha.dtype).clamp(
+        min=1e-20, max=1.0 - 1e-20,
+    )
+    g_noise = -torch.log(-torch.log(u) + 1e-20)
     alpha_perturbed = (alpha + g_noise) / tau
     p_tilde = plugin._masked_softmax(alpha_perturbed, mask)
     e_d = (p_tilde * damage_grid).sum(dim=1, keepdim=True)
@@ -663,23 +674,21 @@ def test_dp_knapsack_optimality():
 
 
 def test_dp_handles_infeasible_budget(caplog):
-    """F8: when B is out of range, DP falls back to NEAREST feasible (not max).
+    """F8: when B is out of range, DP falls back to NEAREST feasible.
 
-    Plan §6.1 F8 / Delta 6 fix: selector is
-    ``min(feasible, key=lambda b: (abs(b−B), −b))``, i.e. nearest with
-    larger-budget tiebreak. Prior impl picked ``max(feasible, ...)``;
-    REMOVED.
+    Upstream parity: ``src/search/quant.py:411-419`` checks
+    ``[budget - delta, budget + delta]`` in order, so the lower side
+    is preferred on tied distance. Our selector is
+    ``min(feasible, key=lambda b: (abs(b−B), b))``.
 
     Setup uses cost_grid with a gap. Layers each have options {2, 4}
-    only → feasible budgets = {4, 6, 8}. Ask B=5; nearest is 4 or 6,
-    larger wins → 6. Ask B=7; 6 or 8 are equidistant; larger wins → 8.
+    only → feasible budgets = {4, 6, 8}. Ask B=5; equidistant from 4
+    and 6, lower wins → 4. Ask B=7; equidistant from 6 and 8, lower
+    wins → 6.
 
     Uses Pattern N (caplog + propagate-restore) per
-    [[architectural-patterns]]; see
-    ``tests/test_stage2_assignment_v2.py:342-348`` for the canonical
-    precedent. Pytest's caplog plugin flips ``propagate=False`` on
-    captured loggers by default; we opt back in around the call and
-    restore in ``finally``.
+    [[architectural-patterns]]; pytest's caplog flips
+    ``propagate=False`` on captured loggers by default.
     """
     import logging
 
@@ -698,13 +707,13 @@ def test_dp_handles_infeasible_budget(caplog):
         with caplog.at_level(
             logging.WARNING, logger="moe_compress.stage1.plugins.rco_budget"
         ):
-            # B = 5: equidistant from 4 and 6 → larger-budget tiebreak picks 6.
+            # B = 5: equidistant from 4 and 6 → lower-budget tiebreak picks 4.
             _, budget = plugin._evaluate_discrete(
                 cost_grid=cost_grid, mask=mask, damage_grid=damage_grid,
                 k_options=k_options, sorted_layers=sorted_layers, global_budget=5,
             )
-            assert sum(budget.values()) == 6, (
-                f"B=5 infeasible; expected nearest-larger=6, got {sum(budget.values())}"
+            assert sum(budget.values()) == 4, (
+                f"B=5 infeasible; expected nearest-lower=4, got {sum(budget.values())}"
             )
             # WARNING was emitted (no silent corruption).
             out_of_range_msg = any(
@@ -715,13 +724,13 @@ def test_dp_handles_infeasible_budget(caplog):
                 f"{[r.message for r in caplog.records]}"
             )
 
-            # B = 7: equidistant from 6 and 8 → larger-budget tiebreak picks 8.
+            # B = 7: equidistant from 6 and 8 → lower-budget tiebreak picks 6.
             _, budget = plugin._evaluate_discrete(
                 cost_grid=cost_grid, mask=mask, damage_grid=damage_grid,
                 k_options=k_options, sorted_layers=sorted_layers, global_budget=7,
             )
-            assert sum(budget.values()) == 8, (
-                f"B=7 infeasible; expected nearest-larger=8, got {sum(budget.values())}"
+            assert sum(budget.values()) == 6, (
+                f"B=7 infeasible; expected nearest-lower=6, got {sum(budget.values())}"
             )
     finally:
         rco_log.propagate = _saved_propagate
@@ -795,10 +804,13 @@ def test_gumbel_softmax_tau_limits():
     alpha = torch.randn(L, K, dtype=torch.float64)
     mask = torch.ones(L, K, dtype=torch.float64)
 
-    # Pre-sample the same Gumbel noise for both temperatures.
+    # Pre-sample the same Gumbel noise for both temperatures (upstream-
+    # aligned form: u clamp (1e-20, 1-1e-20); inner log + 1e-20).
     rng_setup = torch.Generator().manual_seed(99)
-    u = torch.rand(alpha.shape, generator=rng_setup, dtype=alpha.dtype).clamp_min(1e-20)
-    g_noise = -torch.log(-torch.log(u))
+    u = torch.rand(alpha.shape, generator=rng_setup, dtype=alpha.dtype).clamp(
+        min=1e-20, max=1.0 - 1e-20,
+    )
+    g_noise = -torch.log(-torch.log(u) + 1e-20)
 
     # τ → ∞: p̃ ≈ uniform.
     tau_big = 1e6
@@ -820,33 +832,36 @@ def test_gumbel_softmax_tau_limits():
         )
 
 
-# --- F12: cosine anneal endpoints ------------------------------------------
+# --- F12: exponential anneal endpoints (upstream parity) -------------------
 
 
-def test_cosine_anneal_endpoints():
-    """F12: cosine schedule with (τ_init=5.0, τ_final=0.5, T=500).
+def test_anneal_endpoints():
+    """F12: exponential schedule with (τ_init=5.0, τ_final=0.5, T=500).
 
-    Pins explore→exploit direction (plan §1.3 step 2 / D1-2 fix).
-    - At t=0: τ_t ≈ τ_init (cos(0)=1).
-    - At t=T-1: τ_t ≈ τ_final (cos(π·(T-1)/T) ≈ cos(π) = -1).
+    Upstream parity: matches ``src/search/prune.py:663`` /
+    ``src/search/quant.py:655``::
+
+        progress = step / max(n_steps - 1, 1)
+        tau = max(tau_min, tau_init * (tau_min / tau_init) ** progress)
+
+    - At t=0:    progress=0 ⇒ τ = τ_init (exact).
+    - At t=T-1:  progress=1 ⇒ τ = τ_final (exact).
     """
     T = 500
     tau_init = 5.0
     tau_final = 0.5
-    tau_0 = RCOBudgetPlugin._cosine_tau(
+    tau_0 = RCOBudgetPlugin._anneal_tau(
         step=0, total_steps=T, tau_init=tau_init, tau_final=tau_final
     )
-    tau_end = RCOBudgetPlugin._cosine_tau(
+    tau_end = RCOBudgetPlugin._anneal_tau(
         step=T - 1, total_steps=T, tau_init=tau_init, tau_final=tau_final
     )
     assert tau_0 == pytest.approx(tau_init, abs=1e-12), (
         f"τ at t=0 should be τ_init={tau_init}, got {tau_0}"
     )
-    # cos(π·(T-1)/T) = cos(π·(1 - 1/T)) ≈ -1 + π²/(2T²) for large T; with
-    # T=500 the analytic offset is ~4.43e-5, so abs=1e-4 leaves 2-3 orders
-    # of magnitude of headroom over the schedule's exact deviation.
-    assert tau_end == pytest.approx(tau_final, abs=1e-4), (
-        f"τ at t=T-1 should be ≈τ_final={tau_final}, got {tau_end}"
+    # Exponential endpoint is exact: tau_init * (tau_final/tau_init)^1 = tau_final.
+    assert tau_end == pytest.approx(tau_final, abs=1e-12), (
+        f"τ at t=T-1 should be τ_final={tau_final}, got {tau_end}"
     )
     # Sanity: τ_init > τ_end ⇒ schedule is decreasing (explore → exploit).
     assert tau_0 > tau_end
