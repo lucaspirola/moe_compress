@@ -200,6 +200,20 @@ def _post_alignment_cost(
 
     out = np.full((n_nc, n_c), np.inf, dtype=np.float64)
 
+    # Empty matrix → no work; return the all-+∞ out array as-is. The
+    # argpartition below would raise on shape[1]==0 otherwise.
+    if n_nc == 0 or n_c == 0:
+        return out
+
+    # Pattern H hoist: compute the K-smallest centroid columns per non-centroid
+    # row ONCE before the loop. Loop-invariant: ``k`` depends only on (topk, n_c);
+    # cheap_cost is read-only after construction. Mirrors the same hoist applied
+    # to ``_output_space_cost`` in Plugin #3 (SC_FAST_PLAN_V3.md §4-B3). Saving
+    # ~1 min/row on the SC + post-cost paths.
+    # See Plugin #14 audit follow-up item 4 / Plugin #3 audit finding L-B3-3.
+    k = min(topk, n_c)
+    topk_per_ci = np.argpartition(cheap_cost, k - 1, axis=1)[:, :k]  # (n_nc, k)
+
     # Per-non-centroid: pick the top-K cheapest centroids and compute the
     # expensive cost only for those. All cost-matrix tensor work is
     # read-only on model params; wrap in torch.no_grad() so the leaf
@@ -209,11 +223,11 @@ def _post_alignment_cost(
         for ci in range(n_nc):
             m_id = noncentroid_ids[ci]
             # Top-K centroid indices by cheap cost (smallest first).
-            # If n_c <= K, we score all centroids.
-            k = min(topk, n_c)
-            top_cj = np.argpartition(cheap_cost[ci], k - 1)[:k]
+            # If n_c <= K, we score all centroids. ``.tolist()`` materializes
+            # Python ints once per row, eliminating the per-iteration
+            # ``int(cj)`` cast that the prior in-loop form needed.
+            top_cj = topk_per_ci[ci].tolist()
             for cj in top_cj:
-                cj = int(cj)
                 c_id = centroid_ids[cj]
                 cache_key = (li, c_id, m_id)
                 cached = perm_cache.get(cache_key) if perm_cache is not None else None
