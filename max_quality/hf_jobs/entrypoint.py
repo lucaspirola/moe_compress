@@ -518,6 +518,7 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
         "budget_decomposition.json",
         "stage6_eval.json",
         "_stage2_input_covariance.pt",   # needed for Stage 3 AA-SVD on resume
+        "_stage2_input_covariance.pt.MANIFEST.json",  # S-2 manifest-last (Pattern O)
         "_stage3_original_weights.pt",   # needed for Stage 4 EoRA residuals on resume
         "_stage3_original_weights.pt.MANIFEST.json",  # F-S3-1 manifest-last (Pattern O)
         "calibration_imatrix.txt",       # multi-domain imatrix calibration text (Stage 6)

@@ -56,7 +56,11 @@ log = logging.getLogger(__name__)
 # Stage 4's reader treats as a torn write (fails loudly) rather than
 # silently consuming a half-uploaded payload.
 _STAGE_LAYOUT: dict[int | str, tuple[str, list[str]]] = {
-    2:     ("stage2_pruned",  ["_stage2_input_covariance.pt", "stage2_layer_mse.json"]),
+    2:     ("stage2_pruned",  [
+        "_stage2_input_covariance.pt",
+        "_stage2_input_covariance.pt.MANIFEST.json",  # S-2 manifest-LAST (Pattern O)
+        "stage2_layer_mse.json",
+    ]),
     "2p5": ("stage2p5_final", []),
     3:     ("stage3_svd",     [
         "_stage3_original_weights.pt",

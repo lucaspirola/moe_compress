@@ -183,17 +183,84 @@ def _save_covariance(cov: InputCovarianceAccumulator, path: Path) -> None:
 
     Caller must ensure no active profiling threads are writing to `cov` during
     this call, or hold `cov._lock` externally.
+
+    S-2 / Pattern O (manifest-LAST): the writer used to do a manual
+    ``torch.save(payload, tmp) + _durable_rename(tmp, final)`` pair. That
+    survived a single-process kill (the .pt was either fully there or not
+    there at all) but it gave readers no way to distinguish a clean
+    write from a torn one once the .pt existed on disk. Mirror F-S3-1's
+    template (``stage3/orchestrator.py:466-498``):
+
+      1. snapshot under ``cov._lock`` (unchanged)
+      2. unlink stale manifest sibling BEFORE the payload write so an
+         interrupted re-write cannot transiently leave a manifest that
+         vouches for an old payload
+      3. ``atomic_torch_save`` (tmp + fsync + os.replace + fsync(parent))
+      4. ``write_manifest_last`` (manifest is the absolute LAST on-disk
+         action; readers key on its existence to decide "torn or clean")
+
+    If steps 1-3 succeed but step 4 fails (SIGKILL between
+    ``atomic_torch_save`` and ``write_manifest_last``), readers see a
+    ``.pt`` without its ``.MANIFEST.json`` and treat the payload as
+    torn — same contract as F-S3-1's ``test_stage3_originals_missing_
+    manifest_fails_loudly``.
     """
+    from ..utils.atomic_io import atomic_torch_save, write_manifest_last
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # LOW-5: manifest naming consistency — append ``.MANIFEST.json`` AFTER
+    # the payload suffix so the manifest sorts alphabetically right after
+    # the .pt (Pattern O: manifest-LAST upload ordering relies on this).
+    manifest_path = path.with_suffix(path.suffix + ".MANIFEST.json")
     with cov._lock:
         # Clone tensors inside the lock so the snapshot is a deep copy, not a
         # shallow dict of shared tensor references that could be mutated concurrently.
         cov_snapshot = {k: v.clone() for k, v in cov.covariance.items()}
         tok_snapshot = dict(cov.token_count)
-    torch.save({"format_version": 1, "covariance": cov_snapshot, "tokens": tok_snapshot}, tmp)
-    _durable_rename(tmp, path)
-    log.info("Saved Stage 2 input covariance to %s", path)
+    payload = {
+        "format_version": 1,
+        "covariance": cov_snapshot,
+        "tokens": tok_snapshot,
+    }
+    # If a previous run left a stale manifest, remove it first so an
+    # interrupted re-write here doesn't briefly look "good" to Stage 3/4.
+    # Precedent: stage3/orchestrator.py:475-478.
+    try:
+        manifest_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    atomic_torch_save(path, payload)
+    # Forensics-only metadata: surface the cov storage dtype + key count so
+    # an operator can spot a wrong-shaped cov without mmap-loading the
+    # multi-GB .pt. Sourced via tensor introspection on a sample tensor;
+    # falls back to "unknown" if cov_snapshot is empty (shouldn't happen
+    # post-Stage 2 but guard it).
+    if cov_snapshot:
+        _sample = next(iter(cov_snapshot.values()))
+        cov_storage_dtype = str(_sample.dtype).removeprefix("torch.")
+    else:
+        cov_storage_dtype = "unknown"
+    # Manifest is written LAST, after the .pt is fsync'd. Stage 3/4/audit
+    # read the manifest first; a missing/mismatched manifest means the .pt
+    # is torn and must be re-captured.
+    #
+    # compute_sha256=False: this artifact is multi-GB (tens of GB on
+    # production runs); SHA-256 on every write would add minutes per
+    # Stage 2 finalize. Size + schema_version is the validation budget,
+    # matching the rationale at stage3/orchestrator.py:491-494.
+    write_manifest_last(
+        path,
+        manifest_path,
+        schema_version=1,
+        extra_meta={
+            "artifact": "_stage2_input_covariance.pt",
+            "n_keys": int(len(cov_snapshot)),
+            "covariance_storage_dtype": cov_storage_dtype,
+        },
+        compute_sha256=False,
+    )
+    log.info("Saved Stage 2 input covariance to %s (manifest -> %s)",
+             path, manifest_path)
 
 
 def _remap_covariance_for_layer(
