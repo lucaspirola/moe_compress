@@ -31,7 +31,15 @@ within an expert that survives REAP. The Stage 3 ablation grid (A0..A11)
 consumes the per-(layer, expert, matrix) score tensor map to compare
 intra-expert pruning strategies; the score itself is published to
 ``ctx["stage3.wanda_intra_expert_score"]`` and optionally to a JSON-keyed
-.pt sidecar at ``artifacts_dir/_stage3_wanda_intra_expert_score.pt``.
+.pt sidecar at the F-H-7 namespaced calibration-sidecar path
+``<jsonl.parent>/sidecars/<jsonl.stem>/wanda_intra_expert_score.pt``
+(resolved via :func:`moe_compress.utils.cached_calibration_signals.sidecar_path`
+with signal name ``"wanda_intra_expert_score"``). The previous layout
+``artifacts_dir/_stage3_wanda_intra_expert_score.pt`` was out-of-band of
+the calibration-sidecar pipeline and collided across multi-run sweeps
+that share an ``artifacts_dir`` (audit W-2, 2026-05-29); the namespaced
+layout coexists with W-1's ``wanda_scalar_row.pt`` under the same
+``<jsonl>/sidecars/<stem>/`` directory under distinct signal names.
 
 Upstream reference (clean-room)
 -------------------------------
@@ -192,11 +200,19 @@ _ARTIFACT_FORMAT_VERSION: int = SCHEMA_VERSIONS["wanda_intra_expert_score"]
 
 # Recognised config keys (Pattern C). Any other key under
 # ``stage3.wanda_intra_expert`` raises ``ValueError``.
+#
+# W-2 (2026-05-29): ``sidecar_filename`` is REMOVED — the sidecar path
+# is now derived from the calibration JSONL stem via
+# :func:`sidecar_path(..., "wanda_intra_expert_score")` so it lives
+# under the namespaced ``<jsonl>/sidecars/<stem>/`` layout. Any
+# pre-W-2 config carrying ``sidecar_filename`` will now raise via the
+# Pattern C unknown-key validator (caller gets the typo list + the
+# allowed-key set), failing loud instead of silently writing to the
+# wrong place.
 _ALLOWED_CFG_KEYS: frozenset[str] = frozenset(
     (
         "enabled",
         "write_sidecar",
-        "sidecar_filename",
         "score_dtype",
         "scalar_row_dtype",
     )
@@ -513,10 +529,18 @@ class WandaIntraExpertScorePlugin:
         "batches",
         "device",
         "config",
-        "artifacts_dir",
+        # W-2 (2026-05-29): the sidecar is now namespaced under the
+        # calibration JSONL stem (replaces the prior ``artifacts_dir``
+        # dependency). The orchestrator sets ``calibration_jsonl_path``
+        # (absolute ``Path``) on ``run_ctx`` at the same site as
+        # ``artifacts_dir`` (orchestrator line 210). When absent the
+        # plugin still computes the in-memory score map but skips the
+        # sidecar write with a WARNING (operators see the actionable
+        # cause rather than a silent NO-OP).
+        "calibration_jsonl_path",
         # Optional cache slot populated by
-        # ``Stage3WandaScalarRowCacheProvider``. On HIT, the plugin
-        # short-circuits its per-layer calibration sweep — see
+        # ``Stage3WandaScalarRowCacheProvider`` (W-1). On HIT, the
+        # plugin short-circuits its per-layer calibration sweep — see
         # tasks/PLAN_W1_WANDA_SCALAR_ROW_CAPTURE.md §7.1.
         "stage3.wanda_scalar_row",
     )
@@ -601,8 +625,14 @@ class WandaIntraExpertScorePlugin:
         moe_layers = ctx.get("moe_layers")
         batches = ctx.get("batches")
         device = ctx.get("device") if ctx.has("device") else None
-        artifacts_dir: Path | None = (
-            Path(ctx.get("artifacts_dir")) if ctx.has("artifacts_dir") else None
+        # W-2: sidecar path derives from the calibration JSONL stem via
+        # the F-H-7 ``sidecar_path`` helper. The orchestrator sets this
+        # slot at line 210; if absent, the in-memory score map is still
+        # published but the sidecar write is skipped with a WARNING.
+        calib_jsonl_path: Path | None = (
+            Path(ctx.get("calibration_jsonl_path"))
+            if ctx.has("calibration_jsonl_path")
+            else None
         )
 
         score_dtype = _dtype_from_name(cfg["score_dtype"])
@@ -720,35 +750,58 @@ class WandaIntraExpertScorePlugin:
         ctx.set("stage3.wanda_intra_expert_metadata", metadata)
 
         # --- Optional sidecar (Pattern B + atomic + manifest-LAST) --------
-        if cfg["write_sidecar"] and artifacts_dir is not None:
-            sidecar_path = artifacts_dir / cfg["sidecar_filename"]
-            manifest_path = artifacts_dir / (
-                cfg["sidecar_filename"] + ".MANIFEST.json"
-            )
-            payload = {
-                "format_version": _ARTIFACT_FORMAT_VERSION,
-                "wanda_intra_expert_score": score_map,
-                "metadata": metadata,
-            }
-            try:
-                manifest_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            atomic_torch_save(sidecar_path, payload)
-            write_manifest_last(
-                sidecar_path,
-                manifest_path,
-                schema_version=_ARTIFACT_FORMAT_VERSION,
-                extra_meta={
-                    "artifact": "wanda_intra_expert_score",
-                    **metadata,
-                },
-                compute_sha256=False,
-            )
-            log.info(
-                "wanda_intra_expert_score: wrote sidecar %s (manifest %s)",
-                sidecar_path, manifest_path,
-            )
+        # W-2: write to the F-H-7 namespaced layout
+        # ``<jsonl.parent>/sidecars/<jsonl.stem>/wanda_intra_expert_score.pt``
+        # via the shared :func:`sidecar_path` helper, so two Stage 3 runs
+        # that share an ``artifacts_dir`` (e.g. A0..A11 ablation sweep rows
+        # with different ``score_dtype``) no longer collide on the sidecar.
+        if cfg["write_sidecar"]:
+            if calib_jsonl_path is None:
+                log.warning(
+                    "wanda_intra_expert_score: write_sidecar=True but "
+                    "ctx['calibration_jsonl_path'] is not set — skipping "
+                    "sidecar write. The orchestrator promotes this slot at "
+                    "stage3/orchestrator.py line 210; an unset value usually "
+                    "means the plugin was invoked outside the Stage 3 "
+                    "orchestrator (e.g. a unit test) or that wiring is "
+                    "missing. The in-memory score map at "
+                    "ctx['stage3.wanda_intra_expert_score'] is unaffected.",
+                )
+            else:
+                from ...utils.cached_calibration_signals import (
+                    sidecar_path as _sidecar_path,
+                )
+                # Local name ``sidecar_pt`` avoids shadowing the imported
+                # helper inside this function body.
+                sidecar_pt = _sidecar_path(
+                    calib_jsonl_path, "wanda_intra_expert_score",
+                )
+                manifest_path = sidecar_pt.with_suffix(".pt.MANIFEST.json")
+                sidecar_pt.parent.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "format_version": _ARTIFACT_FORMAT_VERSION,
+                    "wanda_intra_expert_score": score_map,
+                    "metadata": metadata,
+                }
+                try:
+                    manifest_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                atomic_torch_save(sidecar_pt, payload)
+                write_manifest_last(
+                    sidecar_pt,
+                    manifest_path,
+                    schema_version=_ARTIFACT_FORMAT_VERSION,
+                    extra_meta={
+                        "artifact": "wanda_intra_expert_score",
+                        **metadata,
+                    },
+                    compute_sha256=False,
+                )
+                log.info(
+                    "wanda_intra_expert_score: wrote sidecar %s (manifest %s)",
+                    sidecar_pt, manifest_path,
+                )
 
     # ------------------------------------------------------------------
     # Config validation (Pattern C)
@@ -773,12 +826,6 @@ class WandaIntraExpertScorePlugin:
         cfg = {
             "enabled": bool(wanda_cfg.get("enabled", False)),
             "write_sidecar": bool(wanda_cfg.get("write_sidecar", True)),
-            "sidecar_filename": str(
-                wanda_cfg.get(
-                    "sidecar_filename",
-                    "_stage3_wanda_intra_expert_score.pt",
-                )
-            ),
             "score_dtype": str(wanda_cfg.get("score_dtype", "float32")),
             "scalar_row_dtype": str(
                 wanda_cfg.get("scalar_row_dtype", "float32")
@@ -793,10 +840,6 @@ class WandaIntraExpertScorePlugin:
             raise ValueError(
                 f"wanda_intra_expert: scalar_row_dtype must be one of "
                 f"{sorted(_ALLOWED_DTYPES)!r}, got {cfg['scalar_row_dtype']!r}."
-            )
-        if not cfg["sidecar_filename"]:
-            raise ValueError(
-                "wanda_intra_expert: sidecar_filename must be non-empty."
             )
         return cfg
 
