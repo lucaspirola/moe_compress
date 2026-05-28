@@ -310,10 +310,13 @@ Verdict: **ALIGN** (citation update only — no algorithmic change).
      H100; also requires full pruned student model resident on the GPU
      (~30 GB BF16) plus activation checkpointing plumbing that does
      not exist in Stage 2 today.
-   - Direct-implementer branch
-     `fix/expert-distill-paper-ce-via-pathb` (commit `d75549a`) —
-     halted on the same architectural blocker rather than push a
-     multi-day-Stage-2 patch.
+   - A subsequent direct-implementer pass independently reached the
+     same architectural blocker on first contact with
+     `_distill_merged_group` and halted with a writeup rather than
+     push a multi-day-Stage-2 regression (local-only branch, not
+     preserved); the canonical record of the cost analysis and
+     5-option decision space remains
+     `plan/moe-pruner-ce-term@f15ff1d`.
 
    **User decision (2026-05-28): option (2)** — paper-faithful `L_CE`
    moves to a SEPARATE downstream fine-tune phase that has the LM head

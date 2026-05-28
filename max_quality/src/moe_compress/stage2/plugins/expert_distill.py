@@ -150,10 +150,12 @@ blocker:
     wall-clock budget. Also requires the full pruned student model
     resident on the same GPU (~30 GB BF16) and activation
     checkpointing plumbing that does not exist in Stage 2 today.
-  - Direct-implementer branch ``fix/expert-distill-paper-ce-via-pathb``
-    (commit ``d75549a``) raised the same architectural blocker on
-    first contact with ``_distill_merged_group`` and halted with a
-    doc rather than push a multi-day-Stage-2 patch.
+  - A subsequent direct-implementer pass independently reached the
+    same blocker on first contact with ``_distill_merged_group`` and
+    halted with a writeup rather than push a multi-day-Stage-2
+    regression (local-only branch, not preserved); the canonical
+    record of the cost analysis and 5-option decision space lives at
+    ``plan/moe-pruner-ce-term`` (commit ``f15ff1d``).
 
 Per CLAUDE.md "RAISE, don't substitute"
 (``feedback_raise_dont_substitute.md``), the user was given the
