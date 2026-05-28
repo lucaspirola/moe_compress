@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import math
 import sys
 from pathlib import Path
@@ -575,61 +576,33 @@ def test_load_merge_map_wrapper_shape_returns_run_id(tmp_path: Path):
     assert run_id == "abc123def456"
 
 
-def _attach_capture_handler(monkeypatch_logger: str):
-    """Helper: attach a list-collecting handler directly to the svc_audit
-    logger and return the records-collecting list + a cleanup function.
-
-    The svc_audit logger is configured with ``logging.basicConfig`` only
-    inside ``main()`` (not the helpers we test directly); pytest's
-    ``caplog`` fixture sometimes misses records from this logger because
-    of import-order interactions (the logger was created during the
-    importlib-based module load, before caplog's root handler was
-    installed). Attaching our own handler at the named logger sidesteps
-    that — the test sees exactly what the production code emitted.
-    """
-    import logging as _logging
-
-    records: list[_logging.LogRecord] = []
-
-    class _ListHandler(_logging.Handler):
-        def emit(self, record):
-            records.append(record)
-
-    handler = _ListHandler(level=_logging.DEBUG)
-    lg = _logging.getLogger(monkeypatch_logger)
-    prev_level = lg.level
-    lg.addHandler(handler)
-    lg.setLevel(_logging.DEBUG)
-
-    def _cleanup():
-        lg.removeHandler(handler)
-        lg.setLevel(prev_level)
-
-    return records, _cleanup
-
-
-def test_load_merge_map_run_id_match_passes(tmp_path: Path):
+def test_load_merge_map_run_id_match_passes(
+    tmp_path: Path, caplog, monkeypatch
+):
     """End-to-end: matching merge_map + merged checkpoint run_ids pass."""
     art_dir = tmp_path / "artifacts"
     _write_wrapper_merge_map(art_dir, "abc123", {"0": {"0": [0]}})
     ckpt = tmp_path / "merged"
     _write_merged_checkpoint_meta(ckpt, "abc123")
 
-    records, cleanup = _attach_capture_handler("svc_audit")
-    try:
+    # The ``svc_audit`` named logger has ``propagate=False`` by default
+    # (see audit/spec_compliance/svc_audit.py:124), which means caplog's
+    # root handler never sees its records. Temporarily flip propagate so
+    # the stdlib Pattern N (``caplog.at_level(..., logger="svc_audit")``)
+    # routes records through caplog. ``monkeypatch`` restores it on test
+    # teardown so we don't pollute sibling tests.
+    monkeypatch.setattr(logging.getLogger("svc_audit"), "propagate", True)
+    with caplog.at_level(logging.DEBUG, logger="svc_audit"):
         _, mm_run_id = svc_audit.load_merge_map(art_dir)
         merged_run_id = svc_audit._load_merged_checkpoint_run_id(ckpt)
         rc = svc_audit._cross_check_run_ids(mm_run_id, merged_run_id)
-    finally:
-        cleanup()
     assert rc == 0
-    joined = " ".join(rec.getMessage() for rec in records)
-    assert "cross-check OK" in joined
-    assert "abc123" in joined
+    assert "cross-check OK" in caplog.text
+    assert "abc123" in caplog.text
 
 
 def test_load_merge_map_run_id_mismatch_raises_actionable_error(
-    tmp_path: Path,
+    tmp_path: Path, caplog, monkeypatch
 ):
     """Mismatched run_ids return exit code 2 and name BOTH ids in the log."""
     art_dir = tmp_path / "artifacts"
@@ -637,24 +610,23 @@ def test_load_merge_map_run_id_mismatch_raises_actionable_error(
     ckpt = tmp_path / "merged"
     _write_merged_checkpoint_meta(ckpt, "BBB")
 
-    records, cleanup = _attach_capture_handler("svc_audit")
-    try:
+    monkeypatch.setattr(logging.getLogger("svc_audit"), "propagate", True)
+    with caplog.at_level(logging.DEBUG, logger="svc_audit"):
         _, mm_run_id = svc_audit.load_merge_map(art_dir)
         merged_run_id = svc_audit._load_merged_checkpoint_run_id(ckpt)
         rc = svc_audit._cross_check_run_ids(mm_run_id, merged_run_id)
-    finally:
-        cleanup()
     assert rc == 2
     # Naming the conflicting IDs is non-negotiable — that's what makes
     # the message ACTIONABLE: the operator can grep their run logs for
     # both IDs and identify which run each artifact came from.
-    joined = " ".join(rec.getMessage() for rec in records)
-    assert "RUN IDENTITY MISMATCH" in joined
-    assert "AAA" in joined
-    assert "BBB" in joined
+    assert "RUN IDENTITY MISMATCH" in caplog.text
+    assert "AAA" in caplog.text
+    assert "BBB" in caplog.text
 
 
-def test_load_merge_map_legacy_no_run_id_warns_not_raises(tmp_path: Path):
+def test_load_merge_map_legacy_no_run_id_warns_not_raises(
+    tmp_path: Path, caplog, monkeypatch
+):
     """Both sides pre-S-2 → cross-check returns 0 + WARN, no failure."""
     art_dir = tmp_path / "artifacts"
     # Legacy bare-dict shape (no wrapper, no run_id).
@@ -665,19 +637,15 @@ def test_load_merge_map_legacy_no_run_id_warns_not_raises(tmp_path: Path):
     ckpt = tmp_path / "merged"
     _write_merged_checkpoint_meta(ckpt, None)
 
-    records, cleanup = _attach_capture_handler("svc_audit")
-    try:
+    monkeypatch.setattr(logging.getLogger("svc_audit"), "propagate", True)
+    with caplog.at_level(logging.DEBUG, logger="svc_audit"):
         _, mm_run_id = svc_audit.load_merge_map(art_dir)
         merged_run_id = svc_audit._load_merged_checkpoint_run_id(ckpt)
         rc = svc_audit._cross_check_run_ids(mm_run_id, merged_run_id)
-    finally:
-        cleanup()
     assert rc == 0
     assert mm_run_id is None
     assert merged_run_id is None
-    assert any(
-        "cross-check skipped" in rec.getMessage() for rec in records
-    )
+    assert "cross-check skipped" in caplog.text
 
 
 def test_load_merge_map_partial_dir_run_id_drift_raises(tmp_path: Path):
