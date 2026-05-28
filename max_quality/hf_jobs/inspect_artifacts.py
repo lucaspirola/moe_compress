@@ -90,10 +90,24 @@ def inspect_stage2() -> int:
     mm_uri = f"{BUCKET_URI}/{ARTIFACTS_DIR_IN_BUCKET}/stage2_pruned/merge_map.json"
     try:
         with fs.open(mm_uri, "r") as fh:
-            mm = json.load(fh)
+            raw = json.load(fh)
     except FileNotFoundError:
         print("ERROR: merge_map.json not found — Stage 2 did not write it.")
         return 1
+
+    # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.5b): tolerate the wrapper
+    # envelope written by ``stage2/orchestrator.py`` at finalize —
+    # ``{"format_version": 1, "stage2_run_id": "<hex>", "merge_map": {...}}``.
+    # Without this branch, on the new envelope shape ``len(mm)`` reports 3
+    # (the wrapper keys) and the per-layer budget loop below blows up at
+    # ``budgets["format_version"]`` with KeyError. Legacy bare-dict payloads
+    # stay supported.
+    if (isinstance(raw, dict)
+            and "merge_map" in raw
+            and isinstance(raw["merge_map"], dict)):
+        mm = raw["merge_map"]
+    else:
+        mm = raw
 
     budgets = _read_json_from_bucket("stage1_budgets.json")["per_layer_target_experts"]
     print(f"Stage 2 artifacts:")

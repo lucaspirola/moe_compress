@@ -166,8 +166,22 @@ def _load_merge_map(artifacts_dir: Path, override_path: "str | None") -> dict:
             "stage5_router_kd.merge_repair.merge_map_path."
         )
     raw = json.loads(path.read_text(encoding="utf-8"))
+    # S-2 (PLAN_S2_SVC_LOAD_MERGE_MAP.md §2.5a): tolerate the wrapper
+    # envelope written by ``stage2/orchestrator.py`` at finalize —
+    # ``{"format_version": 1, "stage2_run_id": "<hex>", "merge_map": {...}}``.
+    # The bare-dict legacy shape stays supported for any pre-S-2 artifact on
+    # disk and for the ``override_path`` branch that may point at a
+    # hand-built merge map. No run-id check needed here: Stage 5 trusts
+    # the intra-run path convention (the cross-check belongs in the audit
+    # tool, ``audit/spec_compliance/svc_audit.py::main``).
+    if (isinstance(raw, dict)
+            and "merge_map" in raw
+            and isinstance(raw["merge_map"], dict)):
+        inner = raw["merge_map"]
+    else:
+        inner = raw
     out: dict[int, dict[int, list[int]]] = {}
-    for layer_k, groups in raw.items():
+    for layer_k, groups in inner.items():
         out[int(layer_k)] = {
             int(new_idx): [int(x) for x in members]
             for new_idx, members in groups.items()
