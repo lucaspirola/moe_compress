@@ -815,6 +815,281 @@ def test_block_hidden_manifest_roundtrip(tmp_path):
     )
 
 
+# ---------------------------------------------------------------------------
+# S-1 Pattern O reader-side tests — each load_* MUST detect a torn .pt
+# via manifest size mismatch, AND must fall back with a one-shot WARN
+# when the manifest is absent (legacy pre-S1 sidecars). Pattern mirrors
+# test_stage3_originals_torn_payload_fails_loudly + the eora_inputs.py
+# back-compat WARN pattern.
+# ---------------------------------------------------------------------------
+def _truncate_to_half(path: Path) -> None:
+    """Truncate ``path`` to half its current size in-place.
+
+    Simulates the SIGKILL-mid-write torn-payload signature that Pattern
+    O's manifest size_bytes cross-check catches. Mirrors the truncation
+    helper in ``test_stage3_originals_manifest.py``.
+    """
+    real_size = path.stat().st_size
+    with open(path, "r+b") as f:
+        f.truncate(real_size // 2)
+
+
+def _delete_manifest_only(payload_path: Path) -> Path:
+    """Delete just the sibling manifest, leaving the payload alone.
+
+    Simulates a legacy pre-S1 sidecar that landed on disk before the
+    Pattern O writers existed: payload is present, sibling
+    ``<payload>.MANIFEST.json`` is absent.
+    """
+    manifest_path = Path(str(payload_path) + ".MANIFEST.json")
+    if manifest_path.exists():
+        manifest_path.unlink()
+    return manifest_path
+
+
+def _clear_warn_dedupe() -> None:
+    """Reset both module-level dedupe sets so a test starts fresh.
+
+    Clears ``_already_warned_missing_manifest`` (S-1 dedupe) AND
+    ``_already_warned_legacy_paths`` (F-H-7 dedupe) — independent
+    pre-S1 / pre-F-H-7 fallback flows must be assertable in isolation.
+    """
+    import moe_compress.utils.cached_calibration_signals as ccs
+    ccs._already_warned_missing_manifest.clear()
+    ccs._already_warned_legacy_paths.clear()
+
+
+def _expect_torn_payload_runtime_error(
+    load_fn, jsonl, signal_name: str, payload_basename: str,
+):
+    """Shared assertion: a torn payload triggers RuntimeError with the
+    canonical "delete + re-run calibration" message, naming the signal
+    and the on-disk filenames.
+
+    Mirrors test_stage3_originals_torn_payload_fails_loudly. The
+    RuntimeError must wrap a ManifestMismatchError (chained via
+    ``raise ... from exc`` in ``_validate_manifest_or_warn``).
+    """
+    from moe_compress.utils.atomic_io import ManifestMismatchError
+
+    with pytest.raises(RuntimeError) as exc:
+        load_fn(jsonl)
+    msg = str(exc.value)
+    assert "manifest validation FAILED" in msg
+    assert signal_name in msg
+    assert "Delete both" in msg
+    assert payload_basename in msg
+    assert "re-run calibration" in msg
+    # The original ManifestMismatchError must be chained (raise ... from exc).
+    assert isinstance(exc.value.__cause__, ManifestMismatchError)
+
+
+def test_stage2_profile_torn_payload_detected_by_size(tmp_path):
+    """A truncated stage2_profile.pt raises RuntimeError naming the
+    manifest+payload, NOT a misleading expected_* cross-validation
+    error (plan §11.1 — manifest validation runs FIRST)."""
+    _clear_warn_dedupe()
+    jsonl = _jsonl(tmp_path)
+    save_stage2_profile_v3(_make_stage2_profile(), jsonl)
+    payload_path = sidecar_path(jsonl, "stage2_profile")
+    _truncate_to_half(payload_path)
+    _expect_torn_payload_runtime_error(
+        load_stage2_profile_v3, jsonl, "stage2_profile", payload_path.name,
+    )
+
+
+def test_reap_scores_torn_payload_detected_by_size(tmp_path):
+    _clear_warn_dedupe()
+    jsonl = _jsonl(tmp_path)
+    save_reap_scores(_make_reap_scores(), jsonl)
+    payload_path = sidecar_path(jsonl, "reap_scores")
+    _truncate_to_half(payload_path)
+    _expect_torn_payload_runtime_error(
+        load_reap_scores, jsonl, "reap_scores", payload_path.name,
+    )
+
+
+def test_per_expert_max_torn_payload_detected_by_size(tmp_path):
+    _clear_warn_dedupe()
+    jsonl = _jsonl(tmp_path)
+    save_per_expert_max(_make_per_expert_max(), jsonl)
+    payload_path = sidecar_path(jsonl, "per_expert_max")
+    _truncate_to_half(payload_path)
+    _expect_torn_payload_runtime_error(
+        load_per_expert_max, jsonl, "per_expert_max", payload_path.name,
+    )
+
+
+def test_routing_stats_torn_payload_detected_by_size(tmp_path):
+    _clear_warn_dedupe()
+    jsonl = _jsonl(tmp_path)
+    save_routing_stats(_make_routing_stats(), jsonl)
+    payload_path = sidecar_path(jsonl, "routing_stats")
+    _truncate_to_half(payload_path)
+    _expect_torn_payload_runtime_error(
+        load_routing_stats, jsonl, "routing_stats", payload_path.name,
+    )
+
+
+def test_router_logits_stats_torn_payload_detected_by_size(tmp_path):
+    _clear_warn_dedupe()
+    jsonl = _jsonl(tmp_path)
+    save_router_logits_stats(_make_router_logits_stats(), jsonl)
+    payload_path = sidecar_path(jsonl, "router_logits_stats")
+    _truncate_to_half(payload_path)
+    _expect_torn_payload_runtime_error(
+        load_router_logits_stats, jsonl, "router_logits_stats",
+        payload_path.name,
+    )
+
+
+def test_output_reservoir_torn_payload_detected_by_size(tmp_path):
+    _clear_warn_dedupe()
+    jsonl = _jsonl(tmp_path)
+    save_output_reservoir(_make_output_reservoir(), jsonl)
+    payload_path = sidecar_path(jsonl, "output_reservoir")
+    _truncate_to_half(payload_path)
+    _expect_torn_payload_runtime_error(
+        load_output_reservoir, jsonl, "output_reservoir", payload_path.name,
+    )
+
+
+def test_covariance_torn_payload_detected_by_size(tmp_path):
+    _clear_warn_dedupe()
+    jsonl = _jsonl(tmp_path)
+    save_covariance(_make_covariance(), jsonl)
+    payload_path = sidecar_path(jsonl, "covariance")
+    _truncate_to_half(payload_path)
+    _expect_torn_payload_runtime_error(
+        load_covariance, jsonl, "covariance", payload_path.name,
+    )
+
+
+def test_block_hidden_torn_payload_detected_by_size(tmp_path):
+    """Per-layer shard: a torn layer_0007.pt fails layer 7 loudly. The
+    layer_NNNN subpath is mirrored verbatim into the RuntimeError so the
+    operator can identify the exact shard to delete."""
+    _clear_warn_dedupe()
+    jsonl = _jsonl(tmp_path)
+    save_block_hidden(_make_block_hidden(layer_idx=7), jsonl)
+    payload_path = (
+        tmp_path / "sidecars" / jsonl.stem / "block_hidden" / "layer_0007.pt"
+    )
+    _truncate_to_half(payload_path)
+    # load_block_hidden takes (jsonl, layer_idx); wrap so the shared
+    # assertion helper can call it with just jsonl.
+    _expect_torn_payload_runtime_error(
+        lambda j: load_block_hidden(j, layer_idx=7),
+        jsonl, "block_hidden", payload_path.name,
+    )
+
+
+def _missing_manifest_warn_fallback_loads(
+    load_fn, save_fn, make_payload, jsonl, signal_name: str, caplog,
+):
+    """Shared assertion: after the manifest is deleted (legacy sidecar
+    simulation), the load_* returns the payload AND emits exactly one
+    "Pattern O back-compat" WARNING for that (payload, signal) tuple.
+
+    Uses ``_with_ccs_logger_propagate`` so caplog captures the
+    non-root logger's records (Pattern N).
+    """
+    import logging
+    _clear_warn_dedupe()
+    save_fn(make_payload(), jsonl)
+    # Determine the payload path (varies by writer) and delete just the manifest.
+    if signal_name == "block_hidden":
+        payload_path = (
+            jsonl.parent / "sidecars" / jsonl.stem / "block_hidden" / "layer_0007.pt"
+        )
+    else:
+        payload_path = sidecar_path(jsonl, signal_name)
+    _delete_manifest_only(payload_path)
+    assert payload_path.exists()
+    assert not Path(str(payload_path) + ".MANIFEST.json").exists()
+    caplog.set_level(
+        logging.WARNING,
+        logger="moe_compress.utils.cached_calibration_signals",
+    )
+    result_box: dict = {}
+
+    def _do_load():
+        result_box["r"] = load_fn(jsonl)
+
+    _with_ccs_logger_propagate(_do_load)
+    assert result_box["r"] is not None
+    warns = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and "Pattern O back-compat" in r.getMessage()
+    ]
+    assert len(warns) == 1, (
+        f"expected exactly 1 Pattern O back-compat WARN for {signal_name}, "
+        f"got {len(warns)}: {[r.getMessage() for r in warns]}"
+    )
+
+
+def test_stage2_profile_missing_manifest_warn_fallback_loads(tmp_path, caplog):
+    _missing_manifest_warn_fallback_loads(
+        load_stage2_profile_v3, save_stage2_profile_v3, _make_stage2_profile,
+        _jsonl(tmp_path), "stage2_profile", caplog,
+    )
+
+
+def test_reap_scores_missing_manifest_warn_fallback_loads(tmp_path, caplog):
+    _missing_manifest_warn_fallback_loads(
+        load_reap_scores, save_reap_scores, _make_reap_scores,
+        _jsonl(tmp_path), "reap_scores", caplog,
+    )
+
+
+def test_per_expert_max_missing_manifest_warn_fallback_loads(tmp_path, caplog):
+    _missing_manifest_warn_fallback_loads(
+        load_per_expert_max, save_per_expert_max, _make_per_expert_max,
+        _jsonl(tmp_path), "per_expert_max", caplog,
+    )
+
+
+def test_routing_stats_missing_manifest_warn_fallback_loads(tmp_path, caplog):
+    _missing_manifest_warn_fallback_loads(
+        load_routing_stats, save_routing_stats, _make_routing_stats,
+        _jsonl(tmp_path), "routing_stats", caplog,
+    )
+
+
+def test_router_logits_stats_missing_manifest_warn_fallback_loads(tmp_path, caplog):
+    _missing_manifest_warn_fallback_loads(
+        load_router_logits_stats, save_router_logits_stats,
+        _make_router_logits_stats,
+        _jsonl(tmp_path), "router_logits_stats", caplog,
+    )
+
+
+def test_output_reservoir_missing_manifest_warn_fallback_loads(tmp_path, caplog):
+    _missing_manifest_warn_fallback_loads(
+        load_output_reservoir, save_output_reservoir, _make_output_reservoir,
+        _jsonl(tmp_path), "output_reservoir", caplog,
+    )
+
+
+def test_covariance_missing_manifest_warn_fallback_loads(tmp_path, caplog):
+    _missing_manifest_warn_fallback_loads(
+        load_covariance, save_covariance, _make_covariance,
+        _jsonl(tmp_path), "covariance", caplog,
+    )
+
+
+def test_block_hidden_missing_manifest_warn_fallback_loads(tmp_path, caplog):
+    """Per-layer fallback: WARN fires exactly once for the specific
+    layer_0007 shard whose manifest is missing."""
+    _missing_manifest_warn_fallback_loads(
+        lambda j: load_block_hidden(j, layer_idx=7),
+        save_block_hidden,
+        lambda: _make_block_hidden(layer_idx=7),
+        _jsonl(tmp_path), "block_hidden", caplog,
+    )
+
+
 # NIT-5 (audit/calibration-completeness): ``test_teacher_eval_roundtrip``
 # was deleted alongside the public ``save_teacher_eval`` writer. No
 # substrate tests use teacher_eval as their regression target, so unlike

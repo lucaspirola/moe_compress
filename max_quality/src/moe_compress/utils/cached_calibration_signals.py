@@ -1055,6 +1055,16 @@ def load_stage2_profile_v3(
     path = _resolve_sidecar_for_load(jsonl_path, "stage2_profile")
     if path is None:
         return None
+    # Pattern O torn-write guard MUST run BEFORE torch.load (and BEFORE
+    # the expected_* cross-validation below) — see plan §11.1: this row
+    # has the most cross-validation kwargs and a torn .pt must surface
+    # the manifest-specific "delete + re-run calibration" message, not a
+    # misleading expected_* cross-validation error.
+    _validate_manifest_or_warn(
+        path,
+        expected_schema_version=SCHEMA_VERSIONS["stage2_profile"],
+        signal_name="stage2_profile",
+    )
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("stage2_profile", loaded.schema_version, path)
     if not isinstance(loaded, Stage2ProfilePayloadV3):
@@ -1145,6 +1155,11 @@ def load_reap_scores(jsonl_path: Path) -> Stage2ReapPayload | None:
     path = _resolve_sidecar_for_load(jsonl_path, "reap_scores")
     if path is None:
         return None
+    _validate_manifest_or_warn(
+        path,
+        expected_schema_version=SCHEMA_VERSIONS["reap_scores"],
+        signal_name="reap_scores",
+    )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("reap_scores", payload.schema_version, path)
     return payload
@@ -1182,6 +1197,11 @@ def load_per_expert_max(jsonl_path: Path) -> Stage1PerExpertMaxPayload | None:
     path = _resolve_sidecar_for_load(jsonl_path, "per_expert_max")
     if path is None:
         return None
+    _validate_manifest_or_warn(
+        path,
+        expected_schema_version=SCHEMA_VERSIONS["per_expert_max"],
+        signal_name="per_expert_max",
+    )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("per_expert_max", payload.schema_version, path)
     return payload
@@ -1219,6 +1239,11 @@ def load_routing_stats(jsonl_path: Path) -> RoutingStatsPayload | None:
     path = _resolve_sidecar_for_load(jsonl_path, "routing_stats")
     if path is None:
         return None
+    _validate_manifest_or_warn(
+        path,
+        expected_schema_version=SCHEMA_VERSIONS["routing_stats"],
+        signal_name="routing_stats",
+    )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("routing_stats", payload.schema_version, path)
     return payload
@@ -1273,6 +1298,11 @@ def load_router_logits_stats(jsonl_path: Path) -> RouterLogitsStatsPayload | Non
     path = _resolve_sidecar_for_load(jsonl_path, "router_logits_stats")
     if path is None:
         return None
+    _validate_manifest_or_warn(
+        path,
+        expected_schema_version=SCHEMA_VERSIONS["router_logits_stats"],
+        signal_name="router_logits_stats",
+    )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("router_logits_stats", payload.schema_version, path)
     return payload
@@ -1315,6 +1345,11 @@ def load_output_reservoir(jsonl_path: Path) -> OutputReservoirPayload | None:
     path = _resolve_sidecar_for_load(jsonl_path, "output_reservoir")
     if path is None:
         return None
+    _validate_manifest_or_warn(
+        path,
+        expected_schema_version=SCHEMA_VERSIONS["output_reservoir"],
+        signal_name="output_reservoir",
+    )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("output_reservoir", payload.schema_version, path)
     return payload
@@ -1354,6 +1389,11 @@ def load_covariance(jsonl_path: Path) -> CovariancePayload | None:
     path = _resolve_sidecar_for_load(jsonl_path, "covariance")
     if path is None:
         return None
+    _validate_manifest_or_warn(
+        path,
+        expected_schema_version=SCHEMA_VERSIONS["covariance"],
+        signal_name="covariance",
+    )
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("covariance", loaded.schema_version, path)
     return loaded
@@ -1446,6 +1486,14 @@ def load_block_hidden(jsonl_path: Path, layer_idx: int) -> BlockHiddenPayload | 
     path = _resolve_sidecar_for_load(jsonl_path, f"block_hidden/layer_{layer_idx:04d}")
     if path is None:
         return None
+    # Per-layer Pattern O: each shard's manifest is validated
+    # independently, so torn damage on layer L's shard fails LOAD(L)
+    # only — layers L-1, L+1 still load.
+    _validate_manifest_or_warn(
+        path,
+        expected_schema_version=SCHEMA_VERSIONS["block_hidden"],
+        signal_name="block_hidden",
+    )
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("block_hidden", loaded.schema_version, path)
     return loaded
