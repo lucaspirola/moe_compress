@@ -221,14 +221,22 @@ def run(
     # bucket only causes the entrypoint's job-exit aux upload to push ~140 GB
     # of already-uploaded data to the aggregate result repo. Delete on Stage 4
     # success only; on failure they stay so a re-run can pick up cleanly.
+    #
+    # S-2 / M1 (back-fills F-S3-1's same omission): also unlink the
+    # ``.MANIFEST.json`` sibling for each payload. Without this, finalize
+    # leaves an ORPHAN manifest pointing at a vanished payload — which
+    # any future reader would interpret as a torn-write signature and
+    # raise loudly on a perfectly-healthy run.
     for sidecar in ("_stage3_original_weights.pt", "_stage2_input_covariance.pt"):
         p = artifacts_dir / sidecar
-        if p.exists():
-            try:
-                p.unlink()
-                log.info("Deleted %s (no longer needed past Stage 4; durable on Hub)", p)
-            except OSError as exc:
-                log.warning("Could not delete %s: %s", p, exc)
+        manifest_p = p.with_suffix(p.suffix + ".MANIFEST.json")
+        for target in (p, manifest_p):
+            if target.exists():
+                try:
+                    target.unlink()
+                    log.info("Deleted %s (no longer needed past Stage 4; durable on Hub)", target)
+                except OSError as exc:
+                    log.warning("Could not delete %s: %s", target, exc)
     log.info("Stage 4 complete — EoRA added %d params → %s", compensated_params, out_dir)
     return out_dir
 
