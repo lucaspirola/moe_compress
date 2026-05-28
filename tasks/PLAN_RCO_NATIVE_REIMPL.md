@@ -1,6 +1,6 @@
-# Plan — RCO Native Re-Implementation (clean-room, third path) — **v3**
+# Plan — RCO Native Re-Implementation (clean-room, third path) — **v4**
 
-**Status**: Planning. Pre-implementation. v3 folds the 5 new deltas surfaced by plan-reviewer round 2 (v2 had correctly folded all 14 round-1 deltas but introduced internal inconsistencies). Awaiting plan-reviewer round 3 per [[paper-fidelity-review-loop]].
+**Status**: Planning. Pre-implementation. v4 folds the 6 round-3 deltas — two serious (v4-N1 fabricated Q8 quote, v4-N2 mathematically infeasible F15 construction) plus 4 smaller. Every paper quote in v4 verified via `grep -F` against `pdftotext`-extracted `paper.txt` (3768 lines from arxiv.org/pdf/2605.00649). Awaiting plan-reviewer round 4 per [[paper-fidelity-review-loop]].
 **Branch**: `feat/plugin_11_rco_native_reimpl` (cut from `main@d7bfa22`).
 **Parent plans**: `tasks/SC_STAGE12_COMPREHENSIVE_PLAN.md` §5.3 (R3 — RCO); `tasks/PLAN_PLUGIN_11_s1_rco.md` (the earlier clean-room plan, already implemented and merged at `269e64d`).
 **Paper anchor**: arxiv 2605.00649 — *Model Compression with Exact Budget Constraints via Riemannian Manifolds* (IST-DASLab, May 2026). §3 Algorithm 1.
@@ -22,7 +22,7 @@ The repo *already contains* a clean-room implementation at `max_quality/src/moe_
 
 > *NOTE: clean-room has 2 algorithmic bugs (reversed cosine annealing, non-standard Gumbel-softmax) that will be fixed by the upcoming re-vendor from upstream RCO. The DP readout hides them on easy cases; plugin interface is re-vendor-ready […].*
 
-Since the re-vendor path (option 2) is now abandoned, this re-impl plan **owns** fixing both bugs. They are folded into §1 (paper-fidelity algorithm reference) and §6.1 (new paper-fidelity tests F11-F14, plus F15 added in v3 to pin the pure-damage-DP-vs-logit-tiebreak fidelity).
+Since the re-vendor path (option 2) is now abandoned, this re-impl plan **owns** fixing both bugs. They are folded into §1 (paper-fidelity algorithm reference) and §6.1 (new paper-fidelity tests F11-F14, plus F15 added in v3 and arithmetic-corrected in v4 to pin the pure-damage-DP-vs-logit-tiebreak fidelity).
 
 This plan's job is therefore:
 
@@ -162,6 +162,8 @@ The paper §3.2 evaluates fitness on a *discrete* sample because the objective `
 
    Documented as a fix-up in §7 (behaviour change on the ON path); pinned by F15 on a hand-graded tied-damage instance where the β tiebreak would otherwise pick a different vector.
 
+   **DP tiebreak policy (v4-N4 pin)**: the DP uses **strict `<` on score comparisons**, so on ties the first vector encountered along the layer sweep (lexicographic by layer 0 option, then layer 1 option, …) wins. Equivalently: the table entry is replaced only when a strictly-smaller damage is found. This becomes load-bearing the moment two feasible vectors have equal pure-damage sum; absent any other rule the layer-sweep order picks lex-min on the option indices. F15's construction has no ties (damage gap = 0.001), so the rule does not affect F15's reference value — but it MUST be specified, both for reviewer auditability and so a future DP re-write doesn't silently swap to `≤` and produce a different answer on tied cases.
+
 4. **Soft objective for backward.** Compute `J_soft = Σ_l ⟨p̃_l, D_l⟩` and differentiate analytically: the softmax Jacobian collapse yields `∂J_soft / ∂α_lk = (1/τ) · p̃_lk · (D_lk − ⟨p̃_l, D_l⟩)`. The `1/τ` factor is absorbed into the Adam learning rate (so the implementation drops the explicit `1/τ` from the analytic gradient and lets Adam adapt).
 
 ### 1.4 Outer loop (Algorithm 1)
@@ -199,7 +201,7 @@ for t = 0..T−1:
     n_new = constraint_normal(α)
     m     = m − (⟨m, n_new⟩ / ⟨n_new, n_new⟩) · n_new
     # v left untransported (D-adam-no-v-transport)
-return discrete_argmax_then_DP(α, c_grid, B, damage_grid_only)   # pure-damage DP (D1-3 fix)
+return discrete_argmax_then_DP(α, c_grid, B, damage_grid_only)   # pure-damage DP (D1-3 fix); strict `<` tiebreak (v4-N4)
 ```
 
 **Hyperparameters exposed by the paper**: `n_iterations` (default 500-2000 depending on problem size), `learning_rate` (default 0.01-0.1), `gumbel_tau_init` (default 5.0), `gumbel_tau_final` (default 0.5), Adam (β1=0.9, β2=0.999, ε=1e-8), `seed`. The paper notes (abstract): *"avoids constraint-specific hyperparameters"* — the constraint primitives are parameter-free.
@@ -439,7 +441,7 @@ These tests are content-level: they prove the implementation does what arxiv 260
 | F12 | `test_cosine_anneal_endpoints` | **NEW (Delta 2 / D1-2).** Construct the cosine schedule with `(τ_init=5.0, τ_final=0.5, T=500)`. Assert `τ_t[0] == pytest.approx(τ_init, abs=1e-12)` and `τ_t[T−1] == pytest.approx(τ_final, abs=2e-2)` (the `T−1` endpoint is `cos(π · (T−1)/T) ≈ cos(π)` with a small offset; use a generous tol). Pins the explore→exploit direction. |
 | F13 | `test_adam_v_buf_transport_policy` | **NEW (Delta 4 / D1-4).** After one outer step + retract, the first moment `m` has `⟨m, n_new⟩ ≈ 0` (transported); the second moment `v` does NOT (untransported). Pins `D-adam-no-v-transport`. |
 | F14 | `test_alpha_stability_under_large_logits` | **NEW (Delta 12 / D6-5).** Feed α with magnitude ~1e6 into the masked softmax → no NaN/Inf in `p̃`, in `_constraint_normal`, in retraction. Standard plugin-audit stability sanity. |
-| F15 | `test_dp_pure_damage_not_logit_tiebreak` | **NEW (v3-Δ3 / Delta 3 fidelity pin).** Construct a 2-layer × 2-option instance with **tied damage values** (e.g. `D = [[1.0, 1.0], [2.0, 2.0]]`) and α chosen so `log p` differs between options (e.g. `α = [[10.0, 0.0], [0.0, 10.0]]` → option 0 in layer 0 and option 1 in layer 1 have higher `log p`). With the existing impl's β=1e-3 soft-logit DP, the lower-entropy vector `[0, 1]` wins via the `−β · log p` tiebreak. With the v3 pure-damage DP (β=0), the lex-min vector (whatever the configured deterministic tiebreak rule is — currently first-encountered-in-DP-sweep, which is `[0, 0]` for the construction above with `c = [[1, 2], [1, 2]]`, `B = 2`) wins. Assert the re-impl picks the lex-min/configured vector, NOT the soft-logit-biased one. Pins §1.3 step 3 against future re-introduction of the β tiebreak. |
+| F15 | `test_dp_pure_damage_not_logit_tiebreak` | **NEW (v3-Δ3 / Delta 3 fidelity pin; v4-N2 construction).** Construct a 2-layer × 2-option instance that genuinely contrasts β=0 vs β=1e-3. **Setup**: L=2, K=2; `c = [[1, 2], [1, 2]]`; `B = 3`; `D = [[1.0, 1.0], [1.0, 1.001]]`; `α = [[10.0, 0.0], [0.0, 10.0]]`. **Hand-derived arithmetic** (worked into the test docstring): (a) **Feasibility at B = 3**: per-layer choice (k₀, k₁) sums `c[0][k₀] + c[1][k₁]`. (0,0): 1+1=2 — infeasible. (0,1): 1+2=3 — FEASIBLE. (1,0): 2+1=3 — FEASIBLE. (1,1): 2+2=4 — infeasible. Two feasible vectors. (b) **β=0 pure-damage DP**: damage_sum(0,1) = D[0][0] + D[1][1] = 1.0 + 1.001 = 2.001; damage_sum(1,0) = D[0][1] + D[1][0] = 1.0 + 1.0 = 2.0. Minimum is 2.0 → pure-damage DP picks **(1, 0)**. (c) **β=1e-3 reference**: `log softmax([10, 0]) ≈ [−4.54e-5, −10.0000454]`; `log softmax([0, 10]) ≈ [−10.0000454, −4.54e-5]`. Score = damage − β · log p. score(0,1) = 2.001 − 1e-3 · (−4.54e-5 + −4.54e-5) = 2.001 + 9.08e-8 ≈ 2.001000091. score(1,0) = 2.0 − 1e-3 · (−10.0000454 + −10.0000454) = 2.0 + 0.0200000908 ≈ 2.0200000908. Minimum is ≈2.001 → β=1e-3 picks **(0, 1)**. **Crucially β=0 and β=1e-3 disagree** because the damage gap (0.001) is comparable to β · |Δ log p| (1e-3 · 20 = 0.02). **Test assertions**: (i) Re-impl (which has no β knob — removed in v2-Δ3) returns the β=0 reference `(1, 0)`. (ii) Re-impl's output is NOT `(0, 1)` (the β=1e-3 hand-computed answer; computed off-line because the re-impl has no β knob to re-create the broken regime). Both reference vectors spelled out verbatim in the test docstring. **No DP-tiebreak ambiguity**: the construction has no tied scores, so v4-N4's tiebreak policy doesn't kick in here. Pins §1.3 step 3 against future re-introduction of the β tiebreak. |
 
 ### 6.2 Code-quality tests (config validation, edge cases)
 
@@ -616,13 +618,36 @@ In §1.4 the pseudocode computes `n = constraint_normal(α)` at the deterministi
 
 **Question**: should the constraint normal be computed at `p` (deterministic) or `p̃` (perturbed)?
 
-**Existing impl**: un-perturbed `p` at `rco_budget.py:420` (the call site reads `p = torch.softmax(alpha, dim=-1)` immediately before `constraint_normal(p, c)`, with no τ scaling or Gumbel noise).
+**Existing impl**: un-perturbed `p`. At `rco_budget.py:420`, `self._constraint_normal(alpha, cost_grid, mask)` is called with the un-perturbed `alpha` (NOT a pre-computed `p`); the softmax is computed *internally* at line 611 as `p = self._masked_softmax(alpha, mask)` — no τ scaling, no Gumbel noise. (v4-N6 corrects v3's line-citation paraphrase.)
 
-**Paper §3.1**: the manifold is defined deterministically as `M = {α ∈ ℝⁿ : Σᵢ pᵢ(α) · cᵢ = B}` with `p(α) = softmax(α)` — no temperature, no Gumbel noise. Verified by WebFetch against `arxiv.org/pdf/2605.00649` on 2026-05-28: *"the geometric constraint defining the manifold itself operates on the clean softmax probability distribution, ensuring the constraint surface has a well-defined mathematical structure independent of stochastic perturbations."* The constraint normal is by definition `∂C/∂α` evaluated on `M`, so it inherits the deterministic-`p` formulation.
+**Paper §2 (The Budget Manifold)**, Eq. (1) + Propositions 1 and 2 (paper.txt lines 251-308). The paper defines `pi = softmax(αi)` (paper.txt line 265, `grep -F`-verified) and constructs the manifold as
 
-**Recommendation**: keep un-perturbed `p`. This matches the paper, matches the existing impl, and is the mathematically clean choice (the manifold geometry is independent of the sampling temperature). Pinned by F1 (`test_constraint_normal_closed_form` — F1's symbolic reference `p · (c − E_p[c])` already encodes this: F1 constructs a deterministic `p = softmax(α)` and checks `_constraint_normal` against autograd of `Σ p · c`, so any drift toward `p̃` in the impl would surface as an F1 failure).
+> M = {α ∈ R^{NK} : C(α) = B}  with  C(α) = Σᵢ wᵢ ⟨pᵢ, c⟩  and  pᵢ = softmax(αᵢ)
 
-**No new test required**: F1 already covers this; Q8 documents the choice so a future reader doesn't re-litigate it.
+(Eq. 1, paper.txt lines 264-291). Proposition 2 then gives the closed-form normal `∇C(α)_{ik} = wᵢ pᵢₖ (cₖ − E_{pᵢ}[c])` (paper.txt line 303, `grep -F` hit on `"the gradient of C with respect to α"` and on `Proposition 2 (Normal vector)`). The whole §2 derivation is in `α`-space with `p(α) = softmax(α)` — no temperature, no Gumbel noise, no `α̂`. Verbatim `grep -F`-verified quote from paper.txt line 256 (Section 2 opener):
+
+> *"Optimizing on a manifold requires three operations: tangent projection"*
+
+— and §2 explicitly defines those three operations (tangent projection, retraction, vector transport) against the un-perturbed `p`.
+
+**§3.1 contrast (NOT in tension)**. Paper §3.1 introduces a *separate* object: the perturbed logits `α̂ᵢₖ = (αᵢₖ + Gᵢₖ)/τ` for the forward-pass DP sampler, with `p̂ᵢ = softmax(α̂ᵢ)` as the **STE backward-gradient surrogate** for the soft objective `J_soft`. The paper makes the choice of `p̂` (perturbed) over un-perturbed `softmax(α)` explicit at paper.txt lines 478-482 (`grep -F`-verified):
+
+> *"gradients flow through p̂ᵢₖ = softmax(α̂ᵢ)ₖ, the softmax of the same perturbed logits that produced z\*. This ensures the surrogate concentrates on the sampled mode, so the STE bias vanishes as τ → 0 and independent Gumbel samples yield independent Jacobians; the unperturbed softmax(αᵢ) would decouple the surrogate from the sampled assignment and suppress both effects."*
+
+This `p̂` is used for the **backward pass of the STE on the loss gradient `∇L(α)`** — it is the surrogate that lets ∂L/∂α flow through the discrete arg-max. It is NOT the constraint normal.
+
+**The two objects are distinct and the paper uses them in different places**:
+
+| Object | Where | Computed at |
+|---|---|---|
+| Constraint normal `n = ∇C(α)` (forward manifold projection) | §2, Prop. 2 | Un-perturbed `p = softmax(α)` |
+| STE backward gradient surrogate `p̂` (backward through DP arg-max) | §3.1, lines 478-482 | Perturbed `p̂ = softmax(α̂)`, `α̂ = (α + G)/τ` |
+
+The re-impl mirrors this: `_constraint_normal` uses un-perturbed `α` (paper §2); the analytic backward gradient on `J_soft` in §1.3 step 4 uses `p̃` (paper §3.1, lines 478-482). There is no paper-fidelity tension between the two — they answer different questions about different terms.
+
+**Recommendation**: keep un-perturbed `p` for the constraint normal. Pinned by F1 (`test_constraint_normal_closed_form` — F1's symbolic reference `p · (c − E_p[c])` already encodes this: F1 constructs a deterministic `p = softmax(α)` and checks `_constraint_normal` against autograd of `Σ p · c`, so any drift toward `p̃` in the impl would surface as an F1 failure). F6 (`test_gradient_estimate_jacobian_collapse`) covers the §3.1 contrast (`p̃`-based backward).
+
+**No new test required**: F1 + F6 already cover both objects. Q8 documents that the §2-vs-§3.1 distinction is intentional and not a paper-fidelity bug.
 
 ---
 
@@ -636,7 +661,7 @@ In §1.4 the pseudocode computes `n = constraint_normal(α)` at the deterministi
 | `max_quality/tests/test_stage1_plugin_rco_budget.py` | EXTEND (add F1-F15, C6, C7, C11, C12; re-derive C8/C9 expected values) | ~820 (was 325) |
 | `max_quality/src/moe_compress/stage1/orchestrator.py` | NO CHANGE | — |
 | `max_quality/src/moe_compress/stage1/plugins/__init__.py` | NO CHANGE | — |
-| `tasks/PLAN_RCO_NATIVE_REIMPL.md` | THIS FILE (v3 commit) | ~770 |
+| `tasks/PLAN_RCO_NATIVE_REIMPL.md` | THIS FILE (v4 commit) | ~830 |
 
 ### 9.2 Test list (34 total)
 
@@ -741,9 +766,41 @@ Plan-reviewer round 2 surfaced 5 new findings — all of them inconsistencies th
 | v3 Delta | Severity | v2 issue | v3 fold location | Status |
 |---|---|---|---|---|
 | v3-Δ1 | Medium | §6.2 said "New: 6" (should be 4 — C6, C7, C11, C12); §9.2 line 627 said "33"; §6.3 line 482 had a 35-vs-33 reconciliation paragraph that became unnecessary once the arithmetic was fixed. | §6.2 re-tally rewritten with explicit 12 + 4 + 15 + 3 = 34 arithmetic; §9.2 updated to 34; §6.3 line 482 reconciliation prose dropped per v3-Δ5. | FOLDED — recommendation (a) (recompute total) |
-| v3-Δ2 | Medium | §1.4 line 184 cited a non-existent "Q-grad-α-vs-α'" question. The substantive choice (un-perturbed `p` vs Gumbel-perturbed `p̃` for the constraint normal) was un-anchored. | §1.4 line 184 inline citation rewritten to "see Q8"; new Q8 added to §8 with paper §3.1 verification (WebFetch against arxiv 2605.00649 on 2026-05-28 confirms deterministic-`p` formulation: *"the geometric constraint defining the manifold itself operates on the clean softmax probability distribution"*). Recommendation: keep un-perturbed `p`. F1 already pins this; no new F-test needed. | FOLDED — paper §3.1 claim verified |
+| v3-Δ2 | Medium | §1.4 line 184 cited a non-existent "Q-grad-α-vs-α'" question. The substantive choice (un-perturbed `p` vs Gumbel-perturbed `p̃` for the constraint normal) was un-anchored. | §1.4 line 184 inline citation rewritten to "see Q8"; new Q8 added to §8 anchored at **Paper §2 (The Budget Manifold), Eq. (1) + Prop. 1/2** (not §3.1 — §3.1 is the algorithm section, which uses perturbed `p̂` for a different purpose, the STE backward; v4-N1/N3/N5 corrects v3's section citation). Recommendation: keep un-perturbed `p`. F1 + F6 already pin both objects; no new F-test needed. See Q8 for the full §2-vs-§3.1 distinction. | FOLDED — paper §2 anchor (corrected from §3.1 in v4-N3) |
 | v3-Δ3 | Medium | §1.3 step 3 line 163 promised "pinned by F-test on a hand-graded instance where β tiebreak would otherwise pick a different vector" but no such F-test existed in F1-F14. | F15 (`test_dp_pure_damage_not_logit_tiebreak`) added to §6.1 covering tied-damage instance with β=1e-3 vs β=0 disagreement. §1.3 step 3 line 163 amended to cite F15. §6.1, §6.3, §9.2 test counts updated 14 → 15 (F), 33 → 34 (total). | FOLDED — recommendation (a) (add F15) |
 | v3-Δ4 | Low | §8 Q2 line 553 said the GRAPE-init basin ablation was "folded into F11/F12" but F11 (Gumbel τ limits) and F12 (cosine endpoints) don't cover the basin question. Misleading "folded" claim. | Q2 rewritten: ablation explicitly **deferred** (not folded). Rationale: it's a basin-of-attraction empirical question, not a paper-fidelity property. No new F-test added; ablation runnable post-hoc by user request. | FOLDED — recommendation (defer) |
 | v3-Δ5 | Nitpick | §0 line 25 mentioned only "F11 and F12" when v2 actually added F11-F14. §6.3 line 482 had reconciliation prose that v3-Δ1 makes unnecessary. | §0 line 25 expanded to "F11-F14, plus F15 in v3-Δ3". §6.3 line 482 reconciliation prose dropped. | FOLDED |
 
 **No deltas were RECONSIDERED or DEFERRED. All 5 folded.** Round-3 reviewer should re-spawn against this v3 plan.
+
+---
+
+## Appendix E — v3→v4 delta change-log
+
+Plan-reviewer round 3 surfaced 6 findings, including two serious bugs (one fabricated paper quote in Q8, one mathematically infeasible F15 construction). v4 folds them. Every paper quote in this v4 was verified via `grep -F` against `pdftotext`-extracted `paper.txt` from `arxiv.org/pdf/2605.00649` (3768 lines, downloaded fresh 2026-05-28).
+
+| v4 Delta | Severity | v3 issue | v4 fold location | Status |
+|---|---|---|---|---|
+| v4-N1 | HIGH | Q8 contained a verbatim quote (*"the geometric constraint defining the manifold itself operates on the clean softmax probability distribution, ensuring the constraint surface has a well-defined mathematical structure independent of stochastic perturbations."*) that the round-3 reviewer empirically demonstrated does NOT appear in the paper (downloaded PDF + `pdftotext` + `grep -F`: no hit). This was a hallucination from a WebFetch "verification" that wasn't a verification. | Q8 rewritten end-to-end. Fabricated quote struck. Replaced with `grep -F`-verified paraphrase + citation of Paper §2 Eq. (1) + Props. 1/2 (paper.txt lines 251-308). Added a clarifying paragraph distinguishing the **constraint normal** (§2, un-perturbed `p` — what `_constraint_normal` uses) from the **STE backward gradient surrogate** (§3.1, perturbed `p̂` — what the loss-gradient backward pass uses), with the `grep -F`-verified §3.1 quote (paper.txt lines 478-482): *"gradients flow through p̂ᵢₖ = softmax(α̂ᵢ)ₖ, the softmax of the same perturbed logits that produced z\*. This ensures the surrogate concentrates on the sampled mode, so the STE bias vanishes as τ → 0 and independent Gumbel samples yield independent Jacobians; the unperturbed softmax(αᵢ) would decouple the surrogate from the sampled assignment and suppress both effects."* The two objects are NOT in tension — they answer different questions about different terms. | FOLDED — both quotes `grep -F`-verified |
+| v4-N2 | CRITICAL | F15's v3 construction was mathematically infeasible: with `c = [[1, 2], [1, 2]]` and `B = 2`, only `(0, 0)` is feasible (1+1=2); `(0,1)`, `(1,0)`, `(1,1)` all violate the budget (sum 3, 3, 4). The v3 claim that β=1e-3 picks `[0, 1]` vs β=0 picks `[0, 0]` is impossible — the DP has only one feasible vector. | F15 entirely rewritten with hand-derived arithmetic. New setup: `c = [[1, 2], [1, 2]]`, `B = 3`, `D = [[1.0, 1.0], [1.0, 1.001]]`, `α = [[10, 0], [0, 10]]`. Feasibility worked out: (0,1) and (1,0) are the two feasible vectors at B=3. β=0 hand-derivation: damage_sum(0,1)=2.001, damage_sum(1,0)=2.0 → β=0 picks (1,0). β=1e-3 hand-derivation (computed off-line because the re-impl has no β knob — removed in v2-Δ3): score(0,1)≈2.001, score(1,0)≈2.020 → β=1e-3 picks (0,1). β=0 and β=1e-3 genuinely disagree because the damage gap (0.001) is comparable to β·|Δ log p| (1e-3 · 20 = 0.02). Both reference vectors verbatim in F15's docstring. Test asserts re-impl returns (1, 0) and is NOT (0, 1). | FOLDED — arithmetic hand-derived |
+| v4-N3 | MEDIUM | Q8 cited "Paper §3.1" for the manifold definition. The actual paper has §2 = "The Budget Manifold" (paper.txt line 251; manifold definition lines 263-304); §3.1 = "Algorithm" (paper.txt line 447). | Q8 corrected to cite **Paper §2 (The Budget Manifold), Eq. (1) + Prop. 1/2**. Appendix D v3-Δ2 row also corrected (was §3.1, now §2). Section structure verified by `grep -nE "^[0-9]+\..|^[A-Z][a-z].* Manifold$|^Algorithm$"` on paper.txt. | FOLDED |
+| v4-N4 | LOW | §1.3 step 3 and §1.4 pseudocode did not specify the DP tiebreak policy. F15 explicitly states it has no ties, but the rule must still be pinned for general auditability and to prevent a future DP rewrite from silently swapping `<` for `≤` on tied cases. | §1.3 step 3 amended with a tiebreak-policy paragraph: strict `<` on score comparisons, so the first vector encountered along the layer sweep wins on ties (equivalently: lex-min on option indices). §1.4 pseudocode comment line `discrete_argmax_then_DP(...)` extended to "strict `<` tiebreak (v4-N4)". F15 docstring notes its construction has no ties so the rule is informational for that test. | FOLDED |
+| v4-N5 | MEDIUM | Appendix D v3-Δ2 row repeated the v4-N1 fabricated quote verbatim. | Fabricated quote struck from Appendix D v3-Δ2 row. Row replaced with a reference to the corrected Q8 (Paper §2 anchor) and the v4-N1/N3 lineage. | FOLDED |
+| v4-N6 | NITPICK | Q8 in v3 said "the call site reads `p = torch.softmax(alpha, dim=-1)` immediately before `constraint_normal(p, c)`". This does not match the code: `rco_budget.py:420` calls `self._constraint_normal(alpha, cost_grid, mask)` with `alpha`, NOT a pre-computed `p`; the softmax happens *inside* at line 611 via `_masked_softmax(alpha, mask)`. | Q8's "existing impl" line rewritten to match the code: "At `rco_budget.py:420`, `self._constraint_normal(alpha, cost_grid, mask)` is called with the un-perturbed `alpha`; the softmax is computed internally at line 611 as `p = self._masked_softmax(alpha, mask)` — no τ scaling, no Gumbel noise." Both line numbers verified against the file in this branch. | FOLDED |
+
+**Paper-quote verification protocol used for v4** (per round-3 reviewer's discipline):
+```
+mkdir -p /tmp/rco_paper && cd /tmp/rco_paper
+curl -L https://arxiv.org/pdf/2605.00649 -o paper.pdf  # 2.08 MB
+pdftotext paper.pdf paper.txt                          # 3768 lines
+# For every quote used:
+grep -Fn "<exact string>" paper.txt                    # must return a hit
+# For multi-line quotes (wrapped by pdftotext):
+tr '\n' ' ' < paper.txt | grep -oF "<joined string>"   # must return a hit
+```
+
+`grep -F` hits confirmed for both quotes used in v4 Q8:
+- §2 quote (paper.txt line 256): `"Optimizing on a manifold requires three operations: tangent projection"`
+- §3.1 quote (paper.txt lines 478-482, joined): `"gradients flow through p̂ᵢₖ = softmax(α̂ᵢ)ₖ, the softmax of the same perturbed logits that produced z*. This ensures the surrogate concentrates on the sampled mode, so the STE bias vanishes as τ → 0 and independent Gumbel samples yield independent Jacobians; the unperturbed softmax(αᵢ) would decouple the surrogate from the sampled assignment and suppress both effects."`
+
+**No deltas were RECONSIDERED or DEFERRED. All 6 folded.** Loop should close on round-4 review.
