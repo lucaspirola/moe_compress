@@ -67,21 +67,35 @@ clean-room version is structurally cleaner and avoids the side channel.
 
 Deviations from upstream
 ------------------------
-**D-zero-extra-forward (deferred)**. The brief promised "zero extra
-forward cost" because the routing weights are already collected during
-the covariance pass. The current implementation runs its own calibration
-pass (mirrors ``_collect_covariances`` structure) for correctness +
-isolation; composing this accumulator with the covariance pass's
-callbacks is a future optimization.
+**D-zero-extra-forward (RESOLVED via calibration sidecar — W-1)**.
+The brief promised "zero extra forward cost" because the routing
+weights are already collected during the covariance pass.
+Resolution: ``scalar_row`` is captured as a calibration sidecar by
+``vllm.calibration_wanda_scalar_row`` (gated on
+``--capture-wanda-scalar-row``). On cache HIT, this plugin skips its
+per-layer calibration sweep entirely and hydrates the accumulator
+state directly from the sidecar via
+``_WandaScalarRowAccumulator.from_payload`` — true zero extra
+forward.
 
-Honest cost: ~2× Stage 3 calibration wall-clock when enabled, due to a
-separate per-layer calibration sweep instead of composing with
-``_collect_covariances``. Operators opting into
-``stage3.wanda_intra_expert.enabled=True`` (e.g., for the A0..A11
-ablation grid) pay this cost on top of the existing covariance
-collection. Composition with ``_collect_covariances`` (extend it to
-accept ``extra_callbacks``) would eliminate this extra pass; deferred
-to a future PR — see
+On cache MISS (e.g. a sidecar was not captured), the plugin falls
+back to the per-layer calibration sweep at lines ~498-528 (mirrors
+``_collect_covariances`` structure) — the original ~2× Stage 3 cal
+cost is retained as the fallback path so production runs that omit
+the capture flag still succeed.
+
+See:
+* ``tasks/PLAN_W1_WANDA_SCALAR_ROW_CAPTURE.md`` for the plan
+* ``stage3/plugins/wanda_scalar_row_cache.py`` for the cache provider
+* ``vllm/calibration_wanda_scalar_row.py`` for the writer
+
+**Honest cost** (cache MISS only): ~2× Stage 3 calibration
+wall-clock when ``--capture-wanda-scalar-row`` was NOT set during
+calibration. Cache HIT: zero extra forward.
+
+A future patch may compose the fallback path with
+``_collect_covariances`` (audit W-2) for the no-sidecar path; this is
+independent of W-1 and tracked at
 ``tasks/todo_wanda_compose_with_collect_covariances.md``.
 
 **D-fused-experts-architecture**. Upstream targets MixtralForCausalLM
@@ -213,6 +227,9 @@ class _WandaScalarRowAccumulator:
         # Finalized CPU tensors, cast to scalar_row_dtype
         self._cpu: dict[tuple[int, int, str], torch.Tensor] = {}
         self._dtype = scalar_row_dtype
+        # When True, the accumulator was hydrated from a calibration
+        # sidecar (see ``from_payload``); update() is forbidden.
+        self._frozen: bool = False
 
     def update(
         self,
@@ -231,6 +248,15 @@ class _WandaScalarRowAccumulator:
         (per channel) of the weighted rows is added into the running
         mean.
         """
+        if self._frozen:
+            raise RuntimeError(
+                "_WandaScalarRowAccumulator.update: accumulator was "
+                "hydrated from a calibration sidecar (via "
+                "from_payload) and is frozen — calling .update() now "
+                "would double-count the calibration data. "
+                "Construct a fresh accumulator if you need to "
+                "accumulate live token rows."
+            )
         if x_rows.numel() == 0:
             return
         if x_rows.dim() != 2:
@@ -292,6 +318,73 @@ class _WandaScalarRowAccumulator:
     @property
     def cpu_entries(self) -> dict[tuple[int, int, str], torch.Tensor]:
         return self._cpu
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload,
+        *,
+        scalar_row_dtype: torch.dtype,
+        expected_d_in_by_matrix: dict[str, int] | None = None,
+    ) -> "_WandaScalarRowAccumulator":
+        """Hydrate a frozen accumulator from a calibration sidecar.
+
+        The returned accumulator is finalize-ready: its update path is
+        NOT meant to be called again (the payload represents finalized
+        running means from the calibration phase). Calling ``.update()``
+        after ``.from_payload()`` raises ``RuntimeError`` (the
+        ``_frozen`` guard set here defends against silent
+        double-counting).
+
+        ``payload`` is a
+        :class:`moe_compress.utils.cached_calibration_signals.WandaScalarRowPayload`
+        (the dict shape + dataclass shape both supported; the dataclass
+        is canonical).
+
+        Optional ``expected_d_in_by_matrix`` (e.g.
+        ``{"gate_proj": 2048, "down_proj": 768}``) — when provided, each
+        cached ``sigma_x_g_squared`` tensor is asserted to match
+        ``Tensor[d_in]`` for its matrix's expected ``d_in``. Catches
+        geometric drift across runs (polish item #2 from the planner
+        review).
+
+        Pattern mirrors ``dict.fromkeys`` / ``torch.Tensor.from_numpy``
+        (alternate constructor that internalises the encapsulation —
+        replaces the v1 plan's direct ``_cpu`` / ``_nsamples`` pokes
+        from outside the class; L-2 plan-reviewer-v1 fold).
+        """
+        sigma_dict = payload.sigma_x_g_squared
+        token_counts = payload.token_counts
+        self = cls(scalar_row_dtype=scalar_row_dtype)
+        for key, sigma in sigma_dict.items():
+            li, e, name = key
+            if not isinstance(sigma, torch.Tensor):
+                raise ValueError(
+                    f"_WandaScalarRowAccumulator.from_payload: "
+                    f"sigma_x_g_squared[{key}] is "
+                    f"{type(sigma).__name__}, expected torch.Tensor."
+                )
+            if sigma.dim() != 1:
+                raise ValueError(
+                    f"_WandaScalarRowAccumulator.from_payload: "
+                    f"sigma_x_g_squared[{key}] has dim {sigma.dim()}, "
+                    f"expected 1D Tensor[d_in]."
+                )
+            if expected_d_in_by_matrix is not None:
+                exp_d_in = expected_d_in_by_matrix.get(name)
+                if exp_d_in is not None and int(sigma.shape[0]) != int(exp_d_in):
+                    raise ValueError(
+                        f"_WandaScalarRowAccumulator.from_payload: "
+                        f"sigma_x_g_squared[{key}] has d_in="
+                        f"{int(sigma.shape[0])}, expected {int(exp_d_in)} "
+                        f"for matrix '{name}'. Geometric drift across "
+                        f"runs — delete the sidecar to regenerate."
+                    )
+            self._cpu[(int(li), int(e), str(name))] = sigma.to(scalar_row_dtype)
+            count = token_counts.get(key, 0)
+            self._nsamples[(int(li), int(e), str(name))] = int(count)
+        self._frozen = True
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +485,11 @@ class WandaIntraExpertScorePlugin:
         "device",
         "config",
         "artifacts_dir",
+        # Optional cache slot populated by
+        # ``Stage3WandaScalarRowCacheProvider``. On HIT, the plugin
+        # short-circuits its per-layer calibration sweep — see
+        # tasks/PLAN_W1_WANDA_SCALAR_ROW_CAPTURE.md §7.1.
+        "stage3.wanda_scalar_row",
     )
     writes: tuple[str, ...] = (
         "stage3.wanda_intra_expert_score",
@@ -488,44 +586,86 @@ class WandaIntraExpertScorePlugin:
             cfg["write_sidecar"],
         )
 
-        acc = _WandaScalarRowAccumulator(scalar_row_dtype=scalar_row_dtype)
-
-        # --- Per-layer calibration pass -----------------------------------
-        # Mirror of _collect_covariances structure: one calibration sweep
-        # PER MoE layer (sequential), to bound peak hook state. The brief
-        # promised "zero extra forward" but composing callbacks with
-        # _collect_covariances is deferred (see D-zero-extra-forward).
-        for k, ref in enumerate(moe_layers):
+        # --- CACHE HIT: short-circuit per W-1 -----------------------------
+        # Mirrors Stage3InputCovCacheProvider's contract — the cache
+        # provider has already validated schema + manifest by the time it
+        # populates ``ctx["stage3.wanda_scalar_row"]``. On HIT, hydrate
+        # the accumulator via ``from_payload`` and skip the per-layer
+        # sweep entirely (the writer in
+        # ``vllm/calibration_wanda_scalar_row.py`` captured the same
+        # running mean during the calibration forward — see D-zero-
+        # extra-forward in this module's docstring).
+        if ctx.has("stage3.wanda_scalar_row"):
+            payload = ctx.get("stage3.wanda_scalar_row")
             log.info(
-                "  wanda layer %d/%d (idx=%d) — calibration pass",
-                k + 1, len(moe_layers), ref.layer_idx,
+                "wanda_intra_expert_score: cache HIT (%d entries) — "
+                "skipping per-layer calibration sweep",
+                len(payload.sigma_x_g_squared),
             )
+            # Build the expected d_in map from the model banks so the
+            # classmethod can range-check the cached tensor shapes
+            # against the live config (polish item #2 — catches
+            # geometric drift across runs).
+            expected_d_in: dict[str, int] = {}
+            if moe_layers:
+                _banks = build_banks(moe_layers[0])
+                for _name in ("gate_proj", "down_proj"):
+                    if _name in _banks:
+                        try:
+                            _W = _banks[_name].get(0)
+                            expected_d_in[_name] = int(_W.shape[1])
+                        except (KeyError, AttributeError, IndexError):
+                            # If the bank can't materialise expert 0,
+                            # skip the shape assertion — the consumer's
+                            # own _compute_scores will surface a real
+                            # error later if the cache is incompatible.
+                            pass
+            acc = _WandaScalarRowAccumulator.from_payload(
+                payload,
+                scalar_row_dtype=scalar_row_dtype,
+                expected_d_in_by_matrix=expected_d_in or None,
+            )
+        else:
+            acc = _WandaScalarRowAccumulator(scalar_row_dtype=scalar_row_dtype)
 
-            def _input_cb(li, e, tensor, cb_ctx, _acc=acc):
-                # gate_proj input — pre-routing hidden state (also serves
-                # up_proj by D-gate-up-share).
-                _acc.update(
-                    li, e, "gate_proj",
-                    tensor, cb_ctx["top_k_weights"],
+            # --- Per-layer calibration pass -------------------------------
+            # Mirror of _collect_covariances structure: one calibration
+            # sweep PER MoE layer (sequential), to bound peak hook state.
+            # The cache-HIT short-circuit above resolves D-zero-extra-
+            # forward; this fallback is the cache-MISS path retained for
+            # operators who did not pass ``--capture-wanda-scalar-row``.
+            for k, ref in enumerate(moe_layers):
+                log.info(
+                    "  wanda layer %d/%d (idx=%d) — calibration pass",
+                    k + 1, len(moe_layers), ref.layer_idx,
                 )
 
-            def _intermediate_cb(li, e, tensor, cb_ctx, _acc=acc):
-                # down_proj input — post-act intermediate.
-                _acc.update(
-                    li, e, "down_proj",
-                    tensor, cb_ctx["top_k_weights"],
-                )
+                def _input_cb(li, e, tensor, cb_ctx, _acc=acc):
+                    # gate_proj input — pre-routing hidden state (also
+                    # serves up_proj by D-gate-up-share).
+                    _acc.update(
+                        li, e, "gate_proj",
+                        tensor, cb_ctx["top_k_weights"],
+                    )
 
-            with instrument_experts(
-                ref, {"input": _input_cb, "intermediate": _intermediate_cb},
-            ):
-                for batch in batches:
-                    if device is not None:
-                        batch = batch.to(device)
-                    with torch.no_grad():
-                        model(input_ids=batch)
+                def _intermediate_cb(li, e, tensor, cb_ctx, _acc=acc):
+                    # down_proj input — post-act intermediate.
+                    _acc.update(
+                        li, e, "down_proj",
+                        tensor, cb_ctx["top_k_weights"],
+                    )
 
-            acc.finalize_layer(ref.layer_idx)
+                with instrument_experts(
+                    ref,
+                    {"input": _input_cb, "intermediate": _intermediate_cb},
+                ):
+                    for batch in batches:
+                        if device is not None:
+                            batch = batch.to(device)
+                        with torch.no_grad():
+                            model(input_ids=batch)
+
+                acc.finalize_layer(ref.layer_idx)
 
         # --- Compute |W| · sqrt(scalar_row) -------------------------------
         log.info(
