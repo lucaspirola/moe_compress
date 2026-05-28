@@ -66,7 +66,6 @@ from moe_compress.utils.cached_calibration_signals import (
     save_covariance,
     save_output_reservoir,
     save_per_expert_max,
-    save_phase_b,
     save_reap_scores,
     save_router_logits_stats,
     save_routing_stats,
@@ -97,6 +96,31 @@ def _make_phase_b(n_layers: int = 2, n_experts: int = 3) -> PhaseBPayload:
             (n_layers, n_experts, 4, 8), dtype=torch.float32
         ),
     )
+
+
+def _test_save_phase_b(payload: PhaseBPayload, jsonl_path: Path) -> None:
+    """Test-local stand-in for the deleted public ``save_phase_b`` writer.
+
+    NIT-3 (audit/calibration-completeness): the production writer
+    ``save_phase_b`` was removed -- the combined Phase-B payload was
+    superseded by per-signal sidecars. ``PhaseBPayload`` + ``load_phase_b``
+    are still retained for legacy read support and are exercised below
+    via this private test helper. Mirrors the deleted writer byte-for-byte
+    so the substrate tests (schema-mismatch / atomic-write-crash-safety /
+    F-H-7 new-path-shadowing) keep using phase_b as their regression target.
+    """
+    from dataclasses import replace as _dc_replace
+    from moe_compress.utils.cached_calibration_signals import (
+        _atomic_torch_save as _ccs_atomic_torch_save,
+    )
+    cpu_payload = _dc_replace(
+        payload,
+        per_expert_max=payload.per_expert_max.detach().cpu(),
+        routing_freq=payload.routing_freq.detach().cpu(),
+        mean_routing_weight=payload.mean_routing_weight.detach().cpu(),
+        output_reservoir=payload.output_reservoir.detach().cpu(),
+    )
+    _ccs_atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "phase_b"))
 
 
 def _make_stage2_profile(
@@ -233,32 +257,11 @@ def test_sidecar_path_atomic_and_sharded(tmp_path):
 # ---------------------------------------------------------------------------
 # Test 2-7 -- round-trip for each of the 6 signals.
 # ---------------------------------------------------------------------------
-def test_phase_b_roundtrip(tmp_path):
-    jsonl = _jsonl(tmp_path)
-    original = _make_phase_b()
-    save_phase_b(original, jsonl)
-
-    expected_path = sidecar_path(jsonl, "phase_b")
-    assert expected_path.exists(), "phase_b.pt must land at sidecars/phase_b.pt"
-    # No orphan tmp left behind.
-    assert not Path(str(expected_path) + ".tmp").exists()
-
-    loaded = load_phase_b(jsonl)
-    assert loaded is not None
-    assert loaded.schema_version == SCHEMA_VERSIONS["phase_b"]
-    assert loaded.n_experts == original.n_experts
-    assert loaded.n_layers == original.n_layers
-    assert torch.equal(loaded.per_expert_max, original.per_expert_max.cpu())
-    assert torch.equal(loaded.routing_freq, original.routing_freq.cpu())
-    assert torch.equal(loaded.mean_routing_weight, original.mean_routing_weight.cpu())
-    assert torch.equal(loaded.output_reservoir, original.output_reservoir.cpu())
-    # All loaded tensors are on CPU.
-    assert loaded.per_expert_max.device.type == "cpu"
-    assert loaded.output_reservoir.device.type == "cpu"
-
-    # Miss-on-absent: deleting the file gives a clean None.
-    expected_path.unlink()
-    assert load_phase_b(jsonl) is None
+# NIT-3 (audit/calibration-completeness): ``test_phase_b_roundtrip`` was
+# deleted alongside the public ``save_phase_b`` writer. ``load_phase_b``
+# remains under test via the FH7 backward-compat suite below and the
+# atomic-write / schema-mismatch substrate tests (which now write via
+# the private ``_test_save_phase_b`` helper).
 
 
 def test_stage2_profile_roundtrip(tmp_path):
@@ -656,7 +659,7 @@ def test_schema_version_mismatch_raises(tmp_path, monkeypatch):
     jsonl = _jsonl(tmp_path)
 
     # Persist a phase_b sidecar at version 1.
-    save_phase_b(_make_phase_b(), jsonl)
+    _test_save_phase_b(_make_phase_b(), jsonl)
 
     # Bump the central version *after* the write -- mimics a code update.
     bumped = dict(SCHEMA_VERSIONS)
@@ -695,7 +698,7 @@ def test_atomic_write_crash_safety(tmp_path, monkeypatch):
 
     # Write a known-good first version.
     first = _make_phase_b()
-    save_phase_b(first, jsonl)
+    _test_save_phase_b(first, jsonl)
     expected_path = sidecar_path(jsonl, "phase_b")
     assert expected_path.exists()
     good_bytes = expected_path.read_bytes()
@@ -709,7 +712,7 @@ def test_atomic_write_crash_safety(tmp_path, monkeypatch):
 
     second = _make_phase_b(n_layers=4, n_experts=5)
     with pytest.raises(RuntimeError, match="simulated SIGTERM"):
-        save_phase_b(second, jsonl)
+        _test_save_phase_b(second, jsonl)
 
     # The final path is untouched -- bytes match the first write.
     assert expected_path.exists()
@@ -770,7 +773,7 @@ class _SyntheticLiveProvider(BaseLiveProvider):
     def on_load(self, ctx: PipelineContext, jsonl_path: Path):
         self.calls += 1
         payload = _make_phase_b()
-        save_phase_b(payload, jsonl_path)
+        _test_save_phase_b(payload, jsonl_path)
         ctx.set("phase_b_cached", payload)
         return payload
 
@@ -1019,9 +1022,9 @@ def test_fh7_new_path_exists_ignores_legacy(tmp_path, caplog):
 
     jsonl = tmp_path / "trace_x.jsonl"
     payload = _make_phase_b()
-    # Seed BOTH the new-style path (via the public writer) and the
+    # Seed BOTH the new-style path (via the test-local writer) and the
     # legacy path (via the helper).
-    save_phase_b(payload, jsonl)
+    _test_save_phase_b(payload, jsonl)
     _write_legacy_phase_b(jsonl, payload)
     assert sidecar_path(jsonl, "phase_b").exists()
 

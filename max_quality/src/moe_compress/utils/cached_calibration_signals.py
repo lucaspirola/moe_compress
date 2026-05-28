@@ -621,18 +621,16 @@ def _check_schema(signal: str, loaded_version: int, path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # Signal 1: phase_b (Stage 1 Phase-B accumulators).
+#
+# NIT-3 (audit/calibration-completeness): the ``save_phase_b`` writer
+# was removed -- the combined Phase-B payload was superseded by the
+# per-signal sidecars (``per_expert_max`` + ``routing_stats`` +
+# ``output_reservoir``) and had no production caller. ``PhaseBPayload``
+# + ``load_phase_b`` are RETAINED for backward-compat reads of any
+# legacy phase_b.pt files an operator may still have on disk (also
+# exercised by the F-H-7 backward-compat tests in
+# ``test_cached_calibration_signals.py``).
 # ---------------------------------------------------------------------------
-def save_phase_b(payload: PhaseBPayload, jsonl_path: Path) -> None:
-    cpu_payload = replace(
-        payload,
-        per_expert_max=payload.per_expert_max.detach().cpu(),
-        routing_freq=payload.routing_freq.detach().cpu(),
-        mean_routing_weight=payload.mean_routing_weight.detach().cpu(),
-        output_reservoir=payload.output_reservoir.detach().cpu(),
-    )
-    _atomic_torch_save(cpu_payload, sidecar_path(jsonl_path, "phase_b"))
-
-
 def load_phase_b(jsonl_path: Path) -> PhaseBPayload | None:
     path = _resolve_sidecar_for_load(jsonl_path, "phase_b")
     if path is None:
@@ -1209,7 +1207,6 @@ __all__ = [
     "RouterKDLogitsPayload",
     "BlockHiddenPayload",
     "TeacherEvalPayload",
-    "save_phase_b",
     "load_phase_b",
     "save_stage2_profile_v3",
     "load_stage2_profile_v3",
