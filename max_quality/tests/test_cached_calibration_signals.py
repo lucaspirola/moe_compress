@@ -1090,6 +1090,199 @@ def test_block_hidden_missing_manifest_warn_fallback_loads(tmp_path, caplog):
     )
 
 
+# ---------------------------------------------------------------------------
+# S-1 Pattern O cross-cutting tests — warn-dedupe (8 cases),
+# block_hidden per-layer manifest isolation, and stage2_profile
+# cross-validation order. Per plan §8 commit #3 chunking.
+# ---------------------------------------------------------------------------
+def _missing_manifest_warn_deduped(
+    load_fn, save_fn, make_payload, jsonl, signal_name: str, caplog,
+):
+    """Shared assertion: WARN fires AT MOST ONCE per (payload, signal)
+    across multiple successive load_* calls. Mirrors the HIGH-4 dedupe
+    contract for F-H-7 legacy paths (test_fh7_legacy_single_stem_fallback_warns_once).
+    """
+    import logging
+    _clear_warn_dedupe()
+    save_fn(make_payload(), jsonl)
+    if signal_name == "block_hidden":
+        payload_path = (
+            jsonl.parent / "sidecars" / jsonl.stem / "block_hidden" / "layer_0007.pt"
+        )
+    else:
+        payload_path = sidecar_path(jsonl, signal_name)
+    _delete_manifest_only(payload_path)
+    caplog.set_level(
+        logging.WARNING,
+        logger="moe_compress.utils.cached_calibration_signals",
+    )
+
+    def _do_loads():
+        # Three successive loads — only the first should emit a WARN.
+        for _ in range(3):
+            assert load_fn(jsonl) is not None
+
+    _with_ccs_logger_propagate(_do_loads)
+    warns = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and "Pattern O back-compat" in r.getMessage()
+    ]
+    assert len(warns) == 1, (
+        f"Pattern O back-compat WARN must dedupe across reads for "
+        f"{signal_name}; got {len(warns)} warnings"
+    )
+
+
+def test_stage2_profile_missing_manifest_warn_deduped(tmp_path, caplog):
+    _missing_manifest_warn_deduped(
+        load_stage2_profile_v3, save_stage2_profile_v3, _make_stage2_profile,
+        _jsonl(tmp_path), "stage2_profile", caplog,
+    )
+
+
+def test_reap_scores_missing_manifest_warn_deduped(tmp_path, caplog):
+    _missing_manifest_warn_deduped(
+        load_reap_scores, save_reap_scores, _make_reap_scores,
+        _jsonl(tmp_path), "reap_scores", caplog,
+    )
+
+
+def test_per_expert_max_missing_manifest_warn_deduped(tmp_path, caplog):
+    _missing_manifest_warn_deduped(
+        load_per_expert_max, save_per_expert_max, _make_per_expert_max,
+        _jsonl(tmp_path), "per_expert_max", caplog,
+    )
+
+
+def test_routing_stats_missing_manifest_warn_deduped(tmp_path, caplog):
+    _missing_manifest_warn_deduped(
+        load_routing_stats, save_routing_stats, _make_routing_stats,
+        _jsonl(tmp_path), "routing_stats", caplog,
+    )
+
+
+def test_router_logits_stats_missing_manifest_warn_deduped(tmp_path, caplog):
+    _missing_manifest_warn_deduped(
+        load_router_logits_stats, save_router_logits_stats,
+        _make_router_logits_stats,
+        _jsonl(tmp_path), "router_logits_stats", caplog,
+    )
+
+
+def test_output_reservoir_missing_manifest_warn_deduped(tmp_path, caplog):
+    _missing_manifest_warn_deduped(
+        load_output_reservoir, save_output_reservoir, _make_output_reservoir,
+        _jsonl(tmp_path), "output_reservoir", caplog,
+    )
+
+
+def test_covariance_missing_manifest_warn_deduped(tmp_path, caplog):
+    _missing_manifest_warn_deduped(
+        load_covariance, save_covariance, _make_covariance,
+        _jsonl(tmp_path), "covariance", caplog,
+    )
+
+
+def test_block_hidden_missing_manifest_warn_deduped(tmp_path, caplog):
+    """Per-layer dedupe: the dedupe key uses the full per-shard
+    ``payload_path`` so a legacy 40-layer artifact would emit one WARN
+    per layer (not one global). Here we exercise the single-shard case
+    (layer 7) to prove the dedupe holds for that key."""
+    _missing_manifest_warn_deduped(
+        lambda j: load_block_hidden(j, layer_idx=7),
+        save_block_hidden,
+        lambda: _make_block_hidden(layer_idx=7),
+        _jsonl(tmp_path), "block_hidden", caplog,
+    )
+
+
+def test_block_hidden_per_layer_manifests_independent(tmp_path):
+    """Per-layer torn-write isolation: write three layer shards, truncate
+    layer 1's payload, confirm:
+      * layer 0 and layer 2 still load (their manifests are intact)
+      * layer 1's load raises RuntimeError with the torn-write message
+    """
+    _clear_warn_dedupe()
+    jsonl = _jsonl(tmp_path)
+    # Write three shards with distinct content so torch.load can
+    # distinguish them on the load side.
+    save_block_hidden(_make_block_hidden(layer_idx=0, n_tokens=3), jsonl)
+    save_block_hidden(_make_block_hidden(layer_idx=1, n_tokens=4), jsonl)
+    save_block_hidden(_make_block_hidden(layer_idx=2, n_tokens=5), jsonl)
+    layer_paths = [
+        tmp_path / "sidecars" / jsonl.stem / "block_hidden" / f"layer_{i:04d}.pt"
+        for i in range(3)
+    ]
+    for p in layer_paths:
+        assert p.exists()
+        assert Path(str(p) + ".MANIFEST.json").exists()
+
+    # Truncate layer 1's payload — simulates SIGKILL mid-write of
+    # that single shard.
+    _truncate_to_half(layer_paths[1])
+
+    # Layer 0 still loads.
+    loaded_0 = load_block_hidden(jsonl, layer_idx=0)
+    assert loaded_0 is not None
+    assert loaded_0.layer_idx == 0
+
+    # Layer 2 still loads — sibling damage on layer 1 did not affect it.
+    loaded_2 = load_block_hidden(jsonl, layer_idx=2)
+    assert loaded_2 is not None
+    assert loaded_2.layer_idx == 2
+
+    # Layer 1 fails loudly with the canonical message naming layer_0001.pt.
+    _expect_torn_payload_runtime_error(
+        lambda j: load_block_hidden(j, layer_idx=1),
+        jsonl, "block_hidden", layer_paths[1].name,
+    )
+
+
+def test_stage2_profile_manifest_with_cross_validation(tmp_path):
+    """Plan §11.1 / §9 test #6: Pattern O manifest validation MUST run
+    BEFORE the existing ``expected_*`` cross-validation. A torn .pt
+    must surface the manifest-specific "delete + re-run calibration"
+    RuntimeError, NOT a misleading ``expected_n_layers`` ValueError.
+
+    Posture: write a healthy stage2_profile, truncate it, then call
+    load_stage2_profile_v3 with intentionally mismatched expected_*
+    kwargs. Without ordering control, the loader could surface a
+    cross-validation error (or torch.load could fail mid-deserialize
+    with an opaque message). With the fix, the manifest check fires
+    first and the RuntimeError dominates.
+    """
+    _clear_warn_dedupe()
+    jsonl = _jsonl(tmp_path)
+    payload = _make_stage2_profile(n_layers=2, n_experts=3)
+    save_stage2_profile_v3(payload, jsonl)
+    payload_path = sidecar_path(jsonl, "stage2_profile")
+    _truncate_to_half(payload_path)
+
+    # Pass cross-validation kwargs that WOULD mismatch the original
+    # payload's metadata (n_layers=999) — but the manifest error must
+    # surface first.
+    with pytest.raises(RuntimeError) as exc:
+        load_stage2_profile_v3(
+            jsonl,
+            expected_n_layers=999,
+            expected_n_experts=999,
+            expected_top_k=999,
+            expected_cov_storage_dtype="bfloat16",
+            expected_model_hash="cafef00d",
+        )
+    msg = str(exc.value)
+    # The dominating error is the manifest one.
+    assert "manifest validation FAILED" in msg
+    assert "stage2_profile" in msg
+    assert "re-run calibration" in msg
+    # Cross-cutting: no expected_* phrasing leaks through (would
+    # indicate the cross-validation block ran AHEAD of the manifest).
+    assert "n_layers=" not in msg or "n_layers=999" not in msg, (
+        "manifest validation must dominate — no expected_n_layers leakage"
+    )
+
+
 # NIT-5 (audit/calibration-completeness): ``test_teacher_eval_roundtrip``
 # was deleted alongside the public ``save_teacher_eval`` writer. No
 # substrate tests use teacher_eval as their regression target, so unlike
