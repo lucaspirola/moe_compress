@@ -683,11 +683,13 @@ def _normalise_hf_state_dict(
                 # weight tensor for nn.Linear has shape [out, in] already.
                 out[(layer_idx, expert_idx, matrix_name)] = tensor.detach()
         else:
-            # Fused.
-            fused_name = nxt.split("_weight")[0] if nxt.endswith("_weight") else nxt
-            if fused_name.endswith(".weight"):
-                fused_name = fused_name[: -len(".weight")]
-            # Strip trailing ".weight" segment if it came as its own part.
+            # Fused. ``nxt`` came from ``key.split(".")``, so it cannot
+            # itself end in ``.weight`` (a trailing ``.weight`` would be
+            # a separate part). The earlier ``_weight`` / ``.weight``
+            # suffix-strip branches were dead code (L3) and have been
+            # removed. The trailing ``.weight`` part, when present, is
+            # already filtered by the ``endswith("_proj")`` test below.
+            fused_name = nxt
             if fused_name == "gate_up_proj":
                 num_experts = tensor.shape[0]
                 d_int_x2 = tensor.shape[1]
@@ -801,13 +803,44 @@ def run_audit(
 
 def write_results_json(results: Sequence[SVCGroupResult], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # L1: filter non-finite ``s_r`` values BEFORE serialisation. Standard
+    # JSON has no NaN/Infinity literals; ``json.dumps`` defaults to
+    # emitting the JavaScript-only ``NaN`` / ``Infinity`` tokens that
+    # downstream strict parsers (e.g. browsers, jq --strict, many BI
+    # tools) will refuse. Replacing with ``None`` keeps the document
+    # spec-valid and makes the missing-sample visible to consumers
+    # without bloating the schema with a per-sample status flag.
+    sanitised: list[dict[str, Any]] = []
+    dropped = 0
+    for r in results:
+        rec = r.to_jsonable()
+        clean_scores: list[dict[str, Any]] = []
+        for s in rec["scores"]:
+            s_val = s["s_r"]
+            if isinstance(s_val, float) and not math.isfinite(s_val):
+                dropped += 1
+                s = {**s, "s_r": None}
+            clean_scores.append(s)
+        rec["scores"] = clean_scores
+        sanitised.append(rec)
+    if dropped:
+        log.warning(
+            "write_results_json: %d non-finite s_r samples replaced with "
+            "null (likely degenerate-spectrum SVD or empty-donor edge case)",
+            dropped,
+        )
     payload = {
         "format_version": 1,
         "audit": "svc_audit",
         "paper_reference": "arXiv:2602.05536 Eq. 8 (clean-room re-impl)",
-        "results": [r.to_jsonable() for r in results],
+        "results": sanitised,
     }
-    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # allow_nan=False: belt-and-suspenders — if a non-float NaN sneaks
+    # past the filter above, the encoder raises rather than silently
+    # emitting non-spec JSON.
+    out_path.write_text(
+        json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8"
+    )
 
 
 def write_summary_markdown(
@@ -941,7 +974,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=args.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s"
     )
 
-    merge_map = load_merge_map(args.stage2_artifacts)
+    # L2: mirror the actionable-error pattern used for missing
+    # --originals-pt / --input-cov-pt below — a missing
+    # ``--stage2-artifacts`` directory must produce a clear error +
+    # exit code 2, not an uncaught FileNotFoundError stack trace.
+    try:
+        merge_map = load_merge_map(args.stage2_artifacts)
+    except FileNotFoundError as exc:
+        log.error(
+            "Stage 2 merge map not found under %s — pass "
+            "--stage2-artifacts pointing at a directory that contains "
+            "merge_map.json (or _stage2_partial/merge_*.json). %s",
+            args.stage2_artifacts,
+            exc,
+        )
+        return 2
     log.info("Loaded merge_map for %d layers", len(merge_map))
 
     originals_path = args.originals_pt or (
