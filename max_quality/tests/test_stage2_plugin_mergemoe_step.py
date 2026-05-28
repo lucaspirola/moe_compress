@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 
 import numpy as np
 import pytest
@@ -527,12 +528,17 @@ def test_orchestrator_allows_sequential_reprofile_alone(tiny_config, tiny_model,
 
     # The mutual-exclusion guard must NOT raise. The run will fail later
     # on a different validation (tiny_config minimal stage1 artifact) — but
-    # the failure must NOT mention sequential_reprofile/profile_sidecar.
+    # the failure must NOT be the specific ValueError this guard raises.
+    # Negative match is anchored to (ValueError, regex) — substring-only
+    # matching would be fragile against any downstream message that happens
+    # to mention either knob name for unrelated reasons.
     with pytest.raises(Exception) as exc_info:
         orch.run(tiny_model, tokenizer=None, config=tiny_config,
                  artifacts_dir=tmp_path)
-    assert "sequential_reprofile" not in str(exc_info.value)
-    assert "profile_sidecar" not in str(exc_info.value)
+    assert not (
+        isinstance(exc_info.value, ValueError)
+        and re.search(r"sequential_reprofile.*profile_sidecar", str(exc_info.value))
+    )
 
 
 def test_orchestrator_allows_profile_sidecar_alone(tiny_config, tiny_model, tmp_path):
@@ -552,8 +558,35 @@ def test_orchestrator_allows_profile_sidecar_alone(tiny_config, tiny_model, tmp_
     with pytest.raises(Exception) as exc_info:
         orch.run(tiny_model, tokenizer=None, config=tiny_config,
                  artifacts_dir=tmp_path)
-    assert "sequential_reprofile" not in str(exc_info.value)
-    assert "profile_sidecar" not in str(exc_info.value)
+    assert not (
+        isinstance(exc_info.value, ValueError)
+        and re.search(r"sequential_reprofile.*profile_sidecar", str(exc_info.value))
+    )
+
+
+def test_orchestrator_default_config_does_not_trigger_mutex(
+    tiny_config, tiny_model, tmp_path,
+):
+    """Pin: the default ``tiny_config`` (no overrides) must NOT trigger the
+    sequential_reprofile ↔ profile_sidecar mutual-exclusion guard.
+
+    Symmetrical to ``test_orchestrator_default_merge_step_is_freq_weighted``:
+    guards against an inadvertent default flip that would make every Stage-2
+    run hit the guard. The run will still fail downstream on tiny_config's
+    minimal stage1 artifact, but the failure must not be the mutex guard.
+    """
+    from moe_compress.stage2 import orchestrator as orch
+
+    (tmp_path / "stage1_budgets.json").write_text('{"per_layer_target_experts": {}}')
+    (tmp_path / "stage1_blacklist.json").write_text('{"blacklist": {}}')
+
+    with pytest.raises(Exception) as exc_info:
+        orch.run(tiny_model, tokenizer=None, config=tiny_config,
+                 artifacts_dir=tmp_path)
+    assert not (
+        isinstance(exc_info.value, ValueError)
+        and re.search(r"sequential_reprofile.*profile_sidecar", str(exc_info.value))
+    )
 
 
 # ---------------------------------------------------------------------------

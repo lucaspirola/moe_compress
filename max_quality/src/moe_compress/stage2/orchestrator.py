@@ -674,22 +674,36 @@ def run(
 
     # Plugin #14 audit (HIGH-2): hard mutual-exclusion between Plugin #10's
     # ``sequential_reprofile`` and Plugin #12's ``profile_sidecar.enabled``.
-    # REAM §4 warns that pre-collected statistics go stale after a merge,
-    # which is exactly what the profile sidecar serves on a full hit.
-    # Combining them would silently feed Plugin #10's invalidator a hydrated
-    # ream_acc/cov_acc/layer_input_acc on layer N (from the sidecar), then
-    # clear them at on_post_merge — so layer N+1's profile pass would re-run
-    # against the merged upstream (correct) but lose the sidecar-cache win
-    # AND mask the corruption hazard the sidecar's stale snapshot introduces.
-    # Fail fast at top of run() rather than let either path silently win.
-    _seq_reprofile = bool(s2.get("sequential_reprofile", False))
+    # REAM §4 warns that pre-collected statistics go stale after a merge.
+    # The sidecar serves *pre-merge* state on full hit; the sequential
+    # invalidator clears state at on_post_merge. Combining them is NOT a
+    # mild race — the invalidator becomes a complete no-op:
+    #
+    #   1. on_layer_setup: LayerMergePlugin constructs empty accs, then
+    #      Stage2ProfileCacheProvider re-hydrates them with **pre-merge stats**
+    #      (stale for every layer ℓ ≥ 1, because upstream layers were merged).
+    #   2. on_profile: LayerMergePlugin.on_profile early-returns on
+    #      ``stage2_profile_full_hit`` — the live forward pass is **skipped**.
+    #   3. merge: uses the stale-hydrated cost.
+    #   4. on_post_merge: Stage2ReamSequentialPlugin sets accs to None
+    #      (invalidator fires).
+    #   5. Next layer: the cycle repeats — sidecar re-hydrates with stale
+    #      stats AGAIN, defeating the invalidator entirely.
+    #
+    # Net effect: EVERY layer ℓ ≥ 1 sees stale (pre-upstream-merge) cost,
+    # not just "layer N's cost is wrong while N+1 reprofiles correctly".
+    # The invalidator's clear-at-on_post_merge is structurally unable to
+    # win against the sidecar's re-hydration at the next layer's
+    # on_layer_setup. Fail fast at top of run() rather than let the silent
+    # corruption land in stage2_merge_map.json.
+    _sequential_reprofile_enabled = bool(s2.get("sequential_reprofile", False))
     _profile_sidecar_enabled = bool(
-        s2.get("profile_sidecar", {}).get("enabled", False)
+        (s2.get("profile_sidecar") or {}).get("enabled", False)
     )
-    if _seq_reprofile and _profile_sidecar_enabled:
+    if _sequential_reprofile_enabled and _profile_sidecar_enabled:
         raise ValueError(
             "stage2_reap_ream.sequential_reprofile=True AND "
-            "stage2_reap_ream.profile_sidecar.enabled=True is invalid: "
+            "stage2_reap_ream.profile_sidecar.enabled=True is invalid; "
             "REAM sequential reprofile invalidates per-layer state after every "
             "merge, but the profile sidecar serves pre-merge state on full hit. "
             "The two are mutually exclusive — set at most one. See Plugin #14 "
@@ -1249,7 +1263,7 @@ def run(
                     "covariance_storage_dtype", "float16",
                 ),
             )]
-            if s2.get("profile_sidecar", {}).get("enabled", False)
+            if (s2.get("profile_sidecar") or {}).get("enabled", False)
             else []
         ),
         # S2-11: the per-merge-group expert distillation + per-layer merge-heal
