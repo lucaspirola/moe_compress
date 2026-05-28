@@ -567,17 +567,23 @@ def dump_stage2_profile_checkpoint(path: str | Path) -> None:
         "cov_acc_covariance": dict(_state.cov_acc.covariance),
         "cov_acc_token_count": dict(_state.cov_acc.token_count),
         "cov_acc_storage_dtype": str(_state.cov_acc.storage_dtype).split(".")[-1],
-        # Serialise each accumulator as ``(buffer, seen, seed)``. The seed
-        # is recovered from the layer_idx contract (the accumulator was
-        # constructed with seed=layer_idx); reconstructed on load via
-        # ``_LayerInputAccumulator(max_samples=..., seed=layer_idx)`` so
-        # the RNG stream resumes byte-identically across processes
-        # (profiling.py:57-79 determinism contract).
+        # Serialise each accumulator as ``(buffer, seen, max_samples,
+        # generator_state)``. The seed is recovered from the layer_idx
+        # contract (the accumulator was constructed with seed=layer_idx),
+        # but seed alone is NOT enough once Phase C has consumed RNG draws
+        # -- a fresh ``manual_seed(layer_idx)`` would re-emit the already-
+        # consumed prefix of the stream. We therefore serialise the live
+        # ``torch.Generator.get_state()`` tensor (uint8[5056] on CPU) and
+        # restore it via ``set_state`` on load so the resumed RNG stream
+        # is byte-identical to the non-resumed path even after Phase C
+        # entry (profiling.py:57-79 determinism contract; reservoir Phase C
+        # at profiling.py:128 is where the generator first gets consumed).
         "layer_input_reservoir": {
             int(li): (
                 None if acc.buffer is None else acc.buffer.detach().cpu().clone(),
                 int(acc.seen),
                 int(acc.max_samples),
+                acc._generator.get_state().clone(),
             )
             for li, acc in _state.layer_input_reservoir.items()
         },
@@ -687,25 +693,62 @@ def load_stage2_profile_checkpoint(path: str | Path) -> int:
     )
     _state.cov_acc.covariance = dict(loaded.get("cov_acc_covariance", {}))
     _state.cov_acc.token_count = dict(loaded.get("cov_acc_token_count", {}))
-    # Reconstruct the per-layer accumulators with the same per-layer seed
-    # (= layer_idx) so the resumed RNG stream is byte-identical to the
-    # non-resumed path (profiling.py:57-79 determinism contract).
-    # Backward compat: an older checkpoint with the bf16-tensor shape is
-    # promoted to an accumulator with buffer set + seen = buffer.size(0).
+    # Reconstruct the per-layer accumulators. The post-MEDIUM-fix payload
+    # is a 4-tuple ``(buffer, seen, max_samples, generator_state)`` where
+    # ``generator_state`` is the uint8 tensor returned by
+    # ``torch.Generator.get_state()``. We restore it via ``set_state`` so
+    # the resumed RNG stream is byte-identical to the non-resumed path
+    # EVEN AFTER Phase C entry (profiling.py:57-79 determinism contract;
+    # the live Phase C ``torch.rand``/``torch.randint`` calls at
+    # profiling.py:144,155 share the per-layer generator).
+    #
+    # Backward compat: a pre-MEDIUM-fix 3-tuple checkpoint
+    # ``(buffer, seen, max_samples)`` lacks the generator state. We log a
+    # WARN and fall back to seed-re-init (seed = layer_idx) -- byte-
+    # identical resume is preserved as long as the pre-checkpoint
+    # accumulator never entered Phase C (i.e. the buffer never reached
+    # ``max_samples``). Operators who must guarantee byte-identical
+    # resume after Phase C entry must re-dump a fresh checkpoint with
+    # the new schema.
+    #
+    # Legacy bare-tensor payload (pre-CRITICAL-1) is also tolerated -- it
+    # gets promoted to an accumulator with buffer set + seen =
+    # buffer.size(0); generator is seed-re-initialised (same caveat).
     raw_reservoir = loaded.get("layer_input_reservoir", {}) or {}
     new_reservoir: dict[int, _LayerInputAccumulator] = {}
+    legacy_3tuple_count = 0
     for li, payload_entry in raw_reservoir.items():
         li_int = int(li)
         if isinstance(payload_entry, tuple):
-            buf, seen, max_samples = payload_entry
-            acc = _LayerInputAccumulator(
-                max_samples=int(max_samples), seed=li_int,
-            )
-            acc.buffer = (
-                None if buf is None
-                else buf.detach().cpu().to(torch.bfloat16).contiguous()
-            )
-            acc.seen = int(seen)
+            if len(payload_entry) == 4:
+                buf, seen, max_samples, generator_state = payload_entry
+                acc = _LayerInputAccumulator(
+                    max_samples=int(max_samples), seed=li_int,
+                )
+                acc.buffer = (
+                    None if buf is None
+                    else buf.detach().cpu().to(torch.bfloat16).contiguous()
+                )
+                acc.seen = int(seen)
+                # Restore the RNG state byte-for-byte.
+                acc._generator.set_state(generator_state.clone())
+            elif len(payload_entry) == 3:
+                buf, seen, max_samples = payload_entry
+                acc = _LayerInputAccumulator(
+                    max_samples=int(max_samples), seed=li_int,
+                )
+                acc.buffer = (
+                    None if buf is None
+                    else buf.detach().cpu().to(torch.bfloat16).contiguous()
+                )
+                acc.seen = int(seen)
+                legacy_3tuple_count += 1
+            else:
+                raise ValueError(
+                    f"layer_input_reservoir[{li_int}] tuple has unsupported "
+                    f"arity {len(payload_entry)} (expected 3 or 4). Delete "
+                    f"the checkpoint to regenerate."
+                )
         else:
             # Legacy: payload was a bare tensor snapshot.
             acc = _LayerInputAccumulator(
@@ -718,6 +761,17 @@ def load_stage2_profile_checkpoint(path: str | Path) -> int:
                 )
                 acc.seen = int(payload_entry.size(0))
         new_reservoir[li_int] = acc
+    if legacy_3tuple_count > 0:
+        log.warning(
+            "stage2_profile_writer.load_checkpoint: %d layer reservoir(s) "
+            "loaded from a pre-MEDIUM-fix 3-tuple payload without "
+            "generator state; falling back to seed-re-init "
+            "(seed=layer_idx). Byte-identical RNG resume is preserved only "
+            "if the accumulator never entered Phase C pre-checkpoint "
+            "(buffer.size(0) < max_samples). Re-dump a fresh checkpoint "
+            "with the new schema to eliminate this warning.",
+            legacy_3tuple_count,
+        )
     _state.layer_input_reservoir = new_reservoir
     return _state.n_prompts_accumulated
 

@@ -270,6 +270,155 @@ def test_checkpoint_resume_preserves_accumulator_state(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# §7.e (MEDIUM-fix follow-up) — checkpoint resume is byte-identical EVEN
+# after the per-layer reservoir entered Phase C (RNG-consuming branch).
+# Pre-fix: `dump_stage2_profile_checkpoint` serialised only
+# `(buffer, seen, max_samples)` and the loader re-initialised
+# `_LayerInputAccumulator(seed=layer_idx)`. After Phase C consumed N draws,
+# the resumed generator would re-emit the same draws (NOT continue from
+# the consumed state). This test forces Phase C entry pre-checkpoint and
+# asserts byte-equality against a no-resume reference.
+# ---------------------------------------------------------------------------
+def test_checkpoint_resume_byte_identical_after_phase_c(tmp_path):
+    """Phase-C-active checkpoint resume MUST be byte-identical to no-resume.
+
+    Setup:
+      * Force Phase C with a tiny cap (max_samples=64).
+      * The accumulator is constructed inside the writer via
+        ``_on_layer_in_callback`` with the per-layer-idx seed.
+      * We monkey-patch ``_LAYER_INPUT_MAX_SAMPLES`` to 64 so the writer's
+        lazy constructor uses the small cap.
+
+    Critical setup detail: ``_LayerInputAccumulator.add`` Phase A drops the
+    over-cap tail of the FIRST call (profiling.py:46-55 docstring -- the
+    deterministic-prefix contract that matches the scalar-loop baseline).
+    To force Phase C entry the test must feed multiple small chunks so the
+    accumulator runs Phase A on chunk 1, Phase B on chunk 2, and then Phase
+    C from chunk 3 onward. We use 50-token chunks for clarity.
+
+    Procedure:
+      A. Reference path: feed 8 chunks of 50 tokens (= 400 total) straight;
+         record final buffer + generator state.
+      B. Resume path: feed 4 chunks (= 200), dump checkpoint, reset+load,
+         feed remaining 4 chunks (= 200); record final buffer.
+      C. Assert buffer A == buffer B byte-for-byte AND that the post-load
+         generator state matches the reference's mid-stream state. With the
+         pre-fix 3-tuple payload these diverge once Phase C consumes the
+         per-layer RNG -- the loader re-emits seed=layer_idx so the resume
+         half walks the same RNG prefix the reference's first half already
+         consumed.
+    """
+    layer_idx = 0
+    cap = 64
+    n_chunks = 8
+    chunk_size = 50  # > cap/2 so Phase C definitely runs once buffer fills.
+    cut = n_chunks // 2
+
+    torch.manual_seed(123)
+    chunks = [
+        torch.randn(chunk_size, 8, dtype=torch.bfloat16)
+        for _ in range(n_chunks)
+    ]
+
+    saved_cap = s2pw._LAYER_INPUT_MAX_SAMPLES
+    try:
+        s2pw._LAYER_INPUT_MAX_SAMPLES = cap
+
+        # --- Reference path: no resume, single process feeds all chunks ---
+        s2pw._reset_state_for_tests()
+        s2pw.setup(
+            cov_storage_dtype="float16",
+            layer_idx_to_rank={layer_idx: 0},
+        )
+        for chunk in chunks:
+            s2pw._on_layer_in_callback(layer_idx=layer_idx, hidden=chunk)
+        acc_ref = s2pw._get_state().layer_input_reservoir[layer_idx]
+        assert acc_ref.buffer is not None
+        assert acc_ref.seen == n_chunks * chunk_size
+        assert acc_ref.buffer.shape[0] == cap
+        reference_buffer = acc_ref.buffer.clone()
+        reference_gen_state_final = acc_ref._generator.get_state().clone()
+
+        # Also record what the gen state looks like at the cut point (the
+        # state we expect ``load_checkpoint`` to restore -- this is the
+        # invariant the bug breaks).
+        s2pw._reset_state_for_tests()
+        s2pw.setup(
+            cov_storage_dtype="float16",
+            layer_idx_to_rank={layer_idx: 0},
+        )
+        for chunk in chunks[:cut]:
+            s2pw._on_layer_in_callback(layer_idx=layer_idx, hidden=chunk)
+        gen_state_at_cut_ref = (
+            s2pw._get_state().layer_input_reservoir[layer_idx]
+            ._generator.get_state().clone()
+        )
+        # Sanity: by cut=4 chunks (200 tokens > cap=64), the generator
+        # MUST have been advanced past its seed-only state.
+        seed_only_state = (
+            torch.Generator(device="cpu").manual_seed(layer_idx).get_state()
+        )
+        assert not torch.equal(gen_state_at_cut_ref, seed_only_state), (
+            "Phase C did not consume the RNG by cut=4 chunks -- test "
+            "setup is wrong, chunk sizing must force Phase C entry."
+        )
+
+        # --- Resume path: feed first half, dump, reset+load, feed rest ---
+        s2pw._reset_state_for_tests()
+        s2pw.setup(
+            cov_storage_dtype="float16",
+            layer_idx_to_rank={layer_idx: 0},
+        )
+        for chunk in chunks[:cut]:
+            s2pw._on_layer_in_callback(layer_idx=layer_idx, hidden=chunk)
+        acc_pre = s2pw._get_state().layer_input_reservoir[layer_idx]
+        assert acc_pre.seen == cut * chunk_size
+        assert acc_pre.buffer.shape[0] == cap
+
+        ckpt_path = tmp_path / "writer_phase_c.ckpt"
+        s2pw.dump_stage2_profile_checkpoint(ckpt_path)
+
+        s2pw._reset_state_for_tests()
+        s2pw.setup(
+            cov_storage_dtype="float16",
+            layer_idx_to_rank={layer_idx: 0},
+        )
+        s2pw.load_stage2_profile_checkpoint(ckpt_path)
+        acc_loaded = s2pw._get_state().layer_input_reservoir[layer_idx]
+        # The loaded generator state MUST match the reference's mid-stream
+        # state. With the pre-fix 3-tuple loader this is a seed-only re-init
+        # (NOT equal to the reference) so the assertion fails loudly here.
+        assert torch.equal(
+            acc_loaded._generator.get_state(), gen_state_at_cut_ref,
+        ), (
+            "Post-load generator state does not match the reference's "
+            "mid-stream state. The 3-tuple payload re-seeded the generator "
+            "instead of restoring its consumed-stream position."
+        )
+
+        # Continue feeding the second half.
+        for chunk in chunks[cut:]:
+            s2pw._on_layer_in_callback(layer_idx=layer_idx, hidden=chunk)
+        acc_resume = s2pw._get_state().layer_input_reservoir[layer_idx]
+
+        assert acc_resume.seen == n_chunks * chunk_size
+        assert acc_resume.buffer.shape == reference_buffer.shape
+        assert torch.equal(acc_resume.buffer, reference_buffer), (
+            "Resumed Phase-C buffer diverges from reference -- generator "
+            "state was not restored byte-identically across the dump/load "
+            "cycle."
+        )
+        assert torch.equal(
+            acc_resume._generator.get_state(), reference_gen_state_final,
+        ), (
+            "Resumed Phase-C generator state diverges from reference -- "
+            "future draws will not match."
+        )
+    finally:
+        s2pw._LAYER_INPUT_MAX_SAMPLES = saved_cap
+
+
+# ---------------------------------------------------------------------------
 # §7.g — hidden bug: full-hit + empty-reservoir + cost_alignment=output
 #         → reader demotes to partial hit.
 # ---------------------------------------------------------------------------

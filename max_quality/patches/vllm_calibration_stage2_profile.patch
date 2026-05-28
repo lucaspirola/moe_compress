@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..c0de100
 --- /dev/null
 +++ b/vllm/calibration_stage2_profile.py
-@@ -0,0 +1,753 @@
+@@ -0,0 +1,796 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Stage 2 profile-pass sidecar capture (Plugin #12 REDO -- Optimization A).
@@ -598,16 +598,20 @@ index 0000000..c0de100
 +        "cov_acc_covariance": dict(_state.cov_acc.covariance),
 +        "cov_acc_token_count": dict(_state.cov_acc.token_count),
 +        "cov_acc_storage_dtype": str(_state.cov_acc.storage_dtype).split(".")[-1],
-+        # Serialise each accumulator as (buffer, seen, max_samples). Seed
-+        # is the layer_idx itself; reconstructed on load via
-+        # _LayerInputAccumulator(seed=layer_idx) so the RNG stream
-+        # resumes byte-identically across processes.
++        # Serialise each accumulator as (buffer, seen, max_samples,
++        # generator_state). Seed alone (= layer_idx) is NOT enough once
++        # Phase C has consumed RNG draws -- a fresh manual_seed(layer_idx)
++        # would re-emit the already-consumed prefix of the stream. We
++        # serialise the live torch.Generator.get_state() tensor (uint8
++        # [5056] on CPU) and restore via set_state on load so the resumed
++        # RNG stream is byte-identical even after Phase C entry.
 +        "layer_input_reservoir": {
 +            int(li): (
 +                None if getattr(acc, "buffer", None) is None
 +                else acc.buffer.detach().cpu().clone(),
 +                int(getattr(acc, "seen", 0)),
 +                int(getattr(acc, "max_samples", _LAYER_INPUT_MAX_SAMPLES)),
++                acc._generator.get_state().clone(),
 +            )
 +            for li, acc in _state.layer_input_reservoir.items()
 +        },
@@ -727,23 +731,51 @@ index 0000000..c0de100
 +    )
 +    _state.cov_acc.covariance = dict(loaded.get("cov_acc_covariance", {}))
 +    _state.cov_acc.token_count = dict(loaded.get("cov_acc_token_count", {}))
-+    # Reconstruct the per-layer accumulators with the same per-layer seed
-+    # (= layer_idx). Backward compat: legacy tensor snapshots get
-+    # promoted to an accumulator with buffer set + seen = buffer.size(0).
++    # Reconstruct the per-layer accumulators. The post-MEDIUM-fix payload
++    # is a 4-tuple (buffer, seen, max_samples, generator_state) where
++    # generator_state is the uint8 tensor from torch.Generator.get_state().
++    # We restore it via set_state so the resumed RNG is byte-identical
++    # even after Phase C entry.
++    #
++    # Backward compat: a pre-MEDIUM-fix 3-tuple lacks the generator
++    # state. We WARN and fall back to seed-re-init -- byte-identical
++    # resume holds only if Phase C was never entered pre-checkpoint
++    # (buffer.size(0) < max_samples). Legacy bare-tensor payload (pre-
++    # CRITICAL-1) is also tolerated with the same seed-re-init caveat.
 +    raw_reservoir = loaded.get("layer_input_reservoir", {}) or {}
 +    new_reservoir: dict = {}
++    legacy_3tuple_count = 0
 +    for li, payload_entry in raw_reservoir.items():
 +        li_int = int(li)
 +        if isinstance(payload_entry, tuple):
-+            buf, seen, max_samples = payload_entry
-+            acc = _LayerInputAccumulator(
-+                max_samples=int(max_samples), seed=li_int,
-+            )
-+            acc.buffer = (
-+                None if buf is None
-+                else buf.detach().cpu().to(torch.bfloat16).contiguous()
-+            )
-+            acc.seen = int(seen)
++            if len(payload_entry) == 4:
++                buf, seen, max_samples, generator_state = payload_entry
++                acc = _LayerInputAccumulator(
++                    max_samples=int(max_samples), seed=li_int,
++                )
++                acc.buffer = (
++                    None if buf is None
++                    else buf.detach().cpu().to(torch.bfloat16).contiguous()
++                )
++                acc.seen = int(seen)
++                acc._generator.set_state(generator_state.clone())
++            elif len(payload_entry) == 3:
++                buf, seen, max_samples = payload_entry
++                acc = _LayerInputAccumulator(
++                    max_samples=int(max_samples), seed=li_int,
++                )
++                acc.buffer = (
++                    None if buf is None
++                    else buf.detach().cpu().to(torch.bfloat16).contiguous()
++                )
++                acc.seen = int(seen)
++                legacy_3tuple_count += 1
++            else:
++                raise ValueError(
++                    f"layer_input_reservoir[{li_int}] tuple has "
++                    f"unsupported arity {len(payload_entry)} (expected "
++                    f"3 or 4). Delete the checkpoint to regenerate."
++                )
 +        else:
 +            acc = _LayerInputAccumulator(
 +                max_samples=_LAYER_INPUT_MAX_SAMPLES, seed=li_int,
@@ -755,5 +787,16 @@ index 0000000..c0de100
 +                )
 +                acc.seen = int(payload_entry.size(0))
 +        new_reservoir[li_int] = acc
++    if legacy_3tuple_count > 0:
++        log.warning(
++            "calibration_stage2_profile.load_checkpoint: %d layer "
++            "reservoir(s) loaded from a pre-MEDIUM-fix 3-tuple payload "
++            "without generator state; falling back to seed-re-init "
++            "(seed=layer_idx). Byte-identical RNG resume is preserved "
++            "only if the accumulator never entered Phase C pre-"
++            "checkpoint (buffer.size(0) < max_samples). Re-dump a fresh "
++            "checkpoint with the new schema to eliminate this warning.",
++            legacy_3tuple_count,
++        )
 +    _state.layer_input_reservoir = new_reservoir
 +    return _state.n_prompts_accumulated
