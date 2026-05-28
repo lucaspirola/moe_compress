@@ -694,10 +694,18 @@ class WandaScalarRowPayload:
       token rows that contributed to each running mean (needed by the
       consumer to round-trip the accumulator state via ``from_payload``).
 
-    Two ``matrix_name`` values are written: ``"gate_proj"`` and
-    ``"down_proj"``. ``up_proj`` aliases ``gate_proj`` at compute time (per
-    the D-gate-up-share deviation in
-    ``stage3/plugins/wanda_intra_expert_score.py``), so it is NOT stored.
+    One ``matrix_name`` value is written by the W-1 calibration writer:
+    ``"gate_proj"`` (the post-act intermediate seen by ``down_proj`` is
+    not visible at the ``expert_in`` hook). ``"down_proj"`` keys MAY
+    appear in payloads constructed by the cache-MISS plugin path
+    (the per-layer calibration sweep in
+    ``stage3/plugins/wanda_intra_expert_score.py``) or by test
+    fixtures, but the production sidecar emitted by
+    ``vllm/calibration_wanda_scalar_row.py`` contains only
+    ``"gate_proj"``. ``up_proj`` aliases ``gate_proj`` at compute time
+    (per the D-gate-up-share deviation in
+    ``stage3/plugins/wanda_intra_expert_score.py``), so it is NOT
+    stored either.
 
     Pattern B: the ``schema_version`` field IS the on-disk
     ``format_version`` (kept under that name for compatibility with the

@@ -93,6 +93,30 @@ See:
 wall-clock when ``--capture-wanda-scalar-row`` was NOT set during
 calibration. Cache HIT: zero extra forward.
 
+**Honest cost (cache HIT)**: the score map produced on the HIT
+path is a STRICT SUBSET of the MISS path. The vLLM writer
+(``vllm/calibration_wanda_scalar_row.py``) emits only
+``"gate_proj"`` scalar_row entries -- the post-activation
+intermediate seen by ``down_proj`` is not visible at the
+``expert_in`` hook, so no ``"down_proj"`` keys are written. On
+HIT, ``_compute_scores`` consequently emits ``{"gate_proj":
+Tensor}`` per (layer, expert) and no ``"down_proj"`` entry; on
+MISS, the per-layer calibration sweep emits both. The
+``D-gate-up-share`` deviation aliases ``up_proj`` onto
+``gate_proj`` at compute time on both paths, so the
+``up_proj`` consumer is unaffected.
+
+Downstream consumers (the D-Rank allocator, the future
+rank-redistribution allocator) MUST handle a score map without
+``"down_proj"`` keys gracefully on the HIT path -- either by
+falling back to a covariance-only score for ``down_proj`` or by
+skipping the wanda-weighting for that matrix slot. Today no
+allocator consumes the wanda score map directly (it is
+published for future use, see the plugin's "Placed between
+collect_covariances and allocate_ranks" comment in the
+orchestrator), so the HIT-vs-MISS asymmetry is latent; it
+becomes load-bearing the moment an allocator wires it in.
+
 A future patch may compose the fallback path with
 ``_collect_covariances`` (audit W-2) for the no-sidecar path; this is
 independent of W-1 and tracked at
@@ -470,8 +494,10 @@ class WandaIntraExpertScorePlugin:
         "fusion_bench/method/moe_pruner/hooks/mixtral.py:53 "
         "(MoEPrunerHookFnForMixtralGate); upstream license MIT, "
         "© 2024 Anke Tang. Verified live at upstream HEAD 2026-05-28. "
-        "Deviations: D-zero-extra-forward (own calibration pass; composing "
-        "with covariance pass deferred), D-fused-experts-architecture "
+        "Deviations: D-zero-extra-forward (RESOLVED via W-1 calibration "
+        "sidecar -- on cache HIT the per-layer calibration sweep is "
+        "skipped entirely; cache MISS retains the own-calibration-pass "
+        "fallback), D-fused-experts-architecture "
         "(weight lookup via ExpertMatrixBank.get instead of nn.Linear.weight "
         "for Qwen3_5MoeExperts), D-gate-up-share (gate/up share scalar_row "
         "per covariance_collection D6). Pattern H (clean-room), B "
