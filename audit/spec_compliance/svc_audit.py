@@ -913,8 +913,12 @@ def write_results_json(results: Sequence[SVCGroupResult], out_path: Path) -> Non
     # allow_nan=False: belt-and-suspenders — if a non-float NaN sneaks
     # past the filter above, the encoder raises rather than silently
     # emitting non-spec JSON.
-    out_path.write_text(
-        json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8"
+    from moe_compress.utils.atomic_io import atomic_write_text
+
+    atomic_write_text(
+        out_path,
+        json.dumps(payload, indent=2, allow_nan=False),
+        encoding="utf-8",
     )
 
 
@@ -971,7 +975,9 @@ def write_summary_markdown(
     if not buckets:
         lines.append("| — | — | 0 | 0 | n/a | 0 | 0 |")
     lines.append("")
-    out_path.write_text("\n".join(lines), encoding="utf-8")
+    from moe_compress.utils.atomic_io import atomic_write_text
+
+    atomic_write_text(out_path, "\n".join(lines), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
