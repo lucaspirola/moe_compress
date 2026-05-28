@@ -20,20 +20,29 @@ Baseline REAM (arXiv:2604.04356) does NOT have a post-merge distill
 step; the merge formula is a one-shot weighted average and no further
 refinement.
 
-Official code
--------------
-MoE-Pruner has no official code (the paper-cited URL
-github.com/yanyue-xie/moe-pruner returns 404 as of 2026-05-28). A
-third-party MIT-licensed re-implementation by Anke Tang exists at
-github.com/tanganke/fusion_bench (file:
-fusion_bench/method/moe_pruner/moe_pruner.py); not paper-authoritative
-but usable as a code-level cross-reference.
+Official / third-party code
+---------------------------
+The MoE-Pruner paper cites ``github.com/yanyue-xie/moe-pruner`` as the
+official repo; that URL returns HTTP 404 (verified 2026-05-28) and no
+authors' code has been located. The closest **third-party**
+re-implementation is ``github.com/tanganke/fusion_bench``
+(MIT-licensed, by Anke Tang, no formal affiliation with the paper's
+authors) under
+``fusion_bench/method/moe_pruner/`` — but it implements only the
+Wanda-style pruning pass; a repo-wide ``grep -r distill
+fusion_bench/method/moe_pruner/`` returns ZERO matches, so the paper's
+Eq. 10 expert-wise distillation has no public reference implementation
+to align against. Treat the paper text as authoritative; treat
+``tanganke/fusion_bench`` as a *paper-grounded cross-check*, not a
+paper-authoritative source.
 
-Neither source has a project-aligned per-merge-group implementation:
-their expert-wise loss pairs teacher expert ``i`` with student expert
-``i`` across the unpruned/pruned bank, whereas this plugin pairs the
-merged centroid with the *additive contribution of its pre-merge
-group members*. The ``_distill_merged_group`` loop is project-original.
+Even ignoring that gap, no project-aligned per-merge-group
+implementation exists upstream: MoE-Pruner's expert-wise loss pairs
+teacher expert ``i`` with student expert ``i`` across the
+unpruned/pruned bank (one-to-one same-index pairing), whereas this
+plugin pairs the merged centroid with the *additive contribution of
+its pre-merge group members*. The ``_distill_merged_group`` loop is
+project-original.
 
 Deviation: D-expert-distill-mse
 -------------------------------
@@ -359,16 +368,18 @@ class ExpertDistillPlugin:
     paper = (
         "Per-merge-group MSE distillation against routing-gated original "
         "outputs. Inspired by MoE-Pruner arXiv:2410.12013 (expert-wise MSE, "
-        "Eq. 10; no official code — third-party MIT impl at "
-        "github.com/tanganke/fusion_bench/blob/main/fusion_bench/method/"
-        "moe_pruner/moe_pruner.py, verified 2026-05-28) and "
-        "SlimMoE arXiv:2506.18349 (top-8 logits KL on full model output, "
-        "Eq. 3) — no project-aligned per-merge-group code in either. REAM "
-        "baseline arXiv:2604.04356 has no post-merge distill. Deviations: "
-        "D-expert-distill-mse (per-group additive target against pre-merge "
-        "members; expert/router training separated), D-expert-distill-mse-v1 "
-        "(freq-weighted target + reservoir tokens — drops TopK gate AND "
-        "per-token routing weight). See module docstring."
+        "Eq. 10; paper-cited repo github.com/yanyue-xie/moe-pruner is 404 — "
+        "closest third-party re-implementation is github.com/tanganke/"
+        "fusion_bench under fusion_bench/method/moe_pruner/, but it ships "
+        "only the pruning pass and NO distillation code, so Eq. 10 has no "
+        "public reference implementation) and SlimMoE arXiv:2506.18349 "
+        "(top-8 logits KL on full model output, Eq. 3) — no project-aligned "
+        "per-merge-group code in either. REAM baseline arXiv:2604.04356 has "
+        "no post-merge distill. Deviations: D-expert-distill-mse (per-group "
+        "additive target against pre-merge members; expert/router training "
+        "separated), D-expert-distill-mse-v1 (freq-weighted target + "
+        "reservoir tokens — drops TopK gate AND per-token routing weight). "
+        "See module docstring."
     )
     config_key = "stage2_reap_ream.expert_distill_steps"
     # S2-11 LIVE: pre_merge_snapshot reads layer_ref and writes
