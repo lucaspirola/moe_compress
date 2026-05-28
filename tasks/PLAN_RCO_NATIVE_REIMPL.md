@@ -620,11 +620,11 @@ In §1.4 the pseudocode computes `n = constraint_normal(α)` at the deterministi
 
 **Existing impl**: un-perturbed `p`. At `rco_budget.py:420`, `self._constraint_normal(alpha, cost_grid, mask)` is called with the un-perturbed `alpha` (NOT a pre-computed `p`); the softmax is computed *internally* at line 611 as `p = self._masked_softmax(alpha, mask)` — no τ scaling, no Gumbel noise. (v4-N6 corrects v3's line-citation paraphrase.)
 
-**Paper §2 (The Budget Manifold)**, Eq. (1) + Propositions 1 and 2 (paper.txt lines 251-308). The paper defines `pi = softmax(αi)` (paper.txt line 265, `grep -F`-verified) and constructs the manifold as
+**Paper §2 (The Budget Manifold)**, Eq. (1) + Propositions 1 and 2 (paper.txt lines 251-308). The paper defines `pi = softmax(αi )` (paper.txt line 265, `grep -F`-verified) and constructs the manifold as
 
 > M = {α ∈ R^{NK} : C(α) = B}  with  C(α) = Σᵢ wᵢ ⟨pᵢ, c⟩  and  pᵢ = softmax(αᵢ)
 
-(Eq. 1, paper.txt lines 264-291). Proposition 2 then gives the closed-form normal `∇C(α)_{ik} = wᵢ pᵢₖ (cₖ − E_{pᵢ}[c])` (paper.txt lines 300-303, `grep -F` hits on `"Proposition 2 (Normal vector)"` and on `"the gradient of C with respect to α"` at line 300; equation labelled `(2)` at line 303). The whole §2 derivation is in `α`-space with `p(α) = softmax(α)` — no temperature, no Gumbel noise, no `α̂`. Verbatim `grep -F`-verified quote from paper.txt line 258 (Section 2 opener):
+(Eq. 1, paper.txt lines 264-291). Proposition 2 then gives the closed-form normal `∇C(α)_{ik} = wᵢ pᵢₖ (cₖ − E_{pᵢ}[c])` (paper.txt lines 300-304, `grep -F` hits on `"Proposition 2 (Normal vector)"` and on `"The gradient of C with respect to α"` at line 300; equation body at line 303 with label `(2)` on line 304). The whole §2 derivation is in `α`-space with `p(α) = softmax(α)` — no temperature, no Gumbel noise, no `α̂`. Verbatim `grep -F`-verified quote from paper.txt line 258 (Section 2 opener):
 
 > *"Optimizing on a manifold requires three operations: tangent projection"*
 
