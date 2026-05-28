@@ -212,6 +212,14 @@ def run(
     run_ctx.set("tokenizer", tokenizer)
     run_ctx.set("config", config)
     run_ctx.set("artifacts_dir", artifacts_dir)
+    # W-2 (2026-05-29): promote the resolved calibration-JSONL absolute
+    # path onto run_ctx so the Wanda intra-expert score plugin can
+    # derive its sidecar location via the F-H-7 ``sidecar_path`` helper
+    # (audit W-2; see plugin write site for the consumer contract).
+    # The local ``_calib_jsonl_path`` is the value computed at the
+    # input-cov cache lookup above (line 127); the block-hidden cache
+    # provider below reads back from ctx instead of re-resolving.
+    run_ctx.set("calibration_jsonl_path", _calib_jsonl_path)
     run_ctx.set("decomposition", decomposition)
     run_ctx.set("device", device)
     run_ctx.set("no_resume", no_resume)
@@ -662,12 +670,12 @@ def run(
     # ``dispatch_first`` returns the first non-None payload winner.
     if bool(s3.get("block_refine", {}).get("enabled", False)):
         try:
-            from pathlib import Path as _Path
-            from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
-            _cal_source = cal.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
-            _cal_jsonl_path = _Path(_cal_source)
-            if not _cal_jsonl_path.is_absolute():
-                _cal_jsonl_path = _Path.cwd() / _cal_jsonl_path
+            # W-2: read the already-resolved calibration JSONL path from
+            # run_ctx (set above next to artifacts_dir) instead of
+            # re-deriving it from ``cal["jsonl_path"]``. This removes the
+            # duplicated resolution block and keeps a single source of
+            # truth — drift between the two sites is now impossible.
+            _cal_jsonl_path = run_ctx.get("calibration_jsonl_path")
             _bh_providers = [Stage3BlockHiddenCacheProvider()]
             PluginRegistry.dispatch_first(
                 _bh_providers, "on_load", run_ctx, _cal_jsonl_path,
