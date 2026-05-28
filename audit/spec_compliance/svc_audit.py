@@ -207,11 +207,16 @@ def _top_left_singular_vectors(
     # full_matrices=False keeps the thin SVD; float64 promotion stabilises
     # the eigenvalue ordering on near-degenerate spectra (the diagnostic's
     # most interesting regime).
-    U, _S, _Vh = torch.linalg.svd(
-        activation_matrix.to(torch.float64), full_matrices=False
-    )
-    # Columns of U are left singular vectors; return rows for caller ergonomics.
-    return U[:, :rank].transpose(0, 1).contiguous()
+    # N4: explicit ``no_grad`` documents intent — this primitive is
+    # diagnostic-only and never participates in autograd. All input
+    # tensors arrive detached (loaded via ``torch.load`` from disk), so
+    # this is belt-and-suspenders rather than a behavioural fix.
+    with torch.no_grad():
+        U, _S, _Vh = torch.linalg.svd(
+            activation_matrix.to(torch.float64), full_matrices=False
+        )
+        # Columns of U are left singular vectors; return rows for caller ergonomics.
+        return U[:, :rank].transpose(0, 1).contiguous()
 
 
 def _activation_matrix_from_cov(
@@ -259,10 +264,15 @@ def _activation_matrix_from_cov(
     d_in = sigma_f64.shape[0]
     # Jitter ladder identical in spirit to ``stage3.cov_sqrt`` — try a few
     # increasing damping levels rather than failing on first non-PD attempt.
+    # N2: ``.item()`` here forces a CPU↔GPU sync per call. This is
+    # diagnostic-only code (one call per merge group, off the training
+    # critical path), so the sync cost is negligible; future refactors
+    # that lift this primitive into a hot path MUST keep the jitter on
+    # the device side (e.g. compute the floor without ``.item()``).
     jitter_floor = max(
         float(sigma_f64.diagonal().abs().mean().item()) * 1e-8, 1e-10
     )
-    last_exc: Exception | None = None
+    last_exc: torch.linalg.LinAlgError | None = None
     L: torch.Tensor | None = None
     for j_mul in (1.0, 10.0, 100.0, 1_000.0, 10_000.0):
         try:
@@ -271,7 +281,11 @@ def _activation_matrix_from_cov(
                 sigma_f64 + jitter * torch.eye(d_in, dtype=torch.float64)
             )
             break
-        except Exception as exc:  # noqa: BLE001 — torch raises a torch._C error
+        except torch.linalg.LinAlgError as exc:
+            # N3: ``torch.linalg.cholesky`` raises this specific type
+            # on non-PD inputs. Narrowing the except keeps real bugs
+            # (shape mismatch, OOM, etc.) loud rather than silently
+            # retrying at a higher jitter level.
             last_exc = exc
     if L is None:
         raise RuntimeError(
@@ -458,6 +472,14 @@ def _parse_aggregate_merge_map(raw: Any) -> dict[int, dict[int, list[int]]]:
         try:
             layer_idx = int(layer_key)
         except (TypeError, ValueError):
+            # N5: surface skipped non-int keys at DEBUG so future
+            # forensics can confirm whether a header / metadata key
+            # (e.g. ``"schema_version"``) was silently swallowed vs a
+            # real layer key dropped due to a typo.
+            log.debug(
+                "_parse_aggregate_merge_map: skipping non-int layer key %r",
+                layer_key,
+            )
             continue  # skip header / metadata keys
         if isinstance(layer_val, dict) and "grouped" in layer_val:
             grouped = layer_val["grouped"]
