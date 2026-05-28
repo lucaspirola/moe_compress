@@ -1,7 +1,7 @@
 """Durable atomic-write helpers for calibration-phase artifacts.
 
 This module is the single source of truth for "kill-safe" file writes across
-all calibration / training stages. It implements **Pattern N**
+all calibration / training stages. It implements **Pattern O**
 (architectural-patterns) — *atomic-write + manifest-last for durable
 calibration artifacts*.
 
@@ -71,7 +71,7 @@ class ManifestMismatchError(RuntimeError):
 
     Distinct from a generic RuntimeError so callers can re-capture rather
     than crash the whole pipeline if they so choose. Default behavior is
-    to propagate — silent fall-back is forbidden by Pattern N.
+    to propagate — silent fall-back is forbidden by Pattern O.
     """
 
 
@@ -133,7 +133,7 @@ def durable_rename(tmp: Path, final: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Atomic writers (Pattern N — single source of truth).
+# Atomic writers (Pattern O — single source of truth).
 # ---------------------------------------------------------------------------
 def atomic_torch_save(payload: Any, path: str | Path) -> Path:
     """Atomically write ``payload`` to ``path`` via torch.save.
@@ -264,7 +264,7 @@ def atomic_write_text(path: str | Path, text: str, *, encoding: str = "utf-8") -
 
 
 # ---------------------------------------------------------------------------
-# Manifest-last protocol (Pattern N — for large artifacts).
+# Manifest-last protocol (Pattern O — for large artifacts).
 # ---------------------------------------------------------------------------
 _DEFAULT_CHUNK = 1 << 20  # 1 MiB
 

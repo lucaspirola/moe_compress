@@ -226,13 +226,25 @@ def _main() -> int:
         api = HfApi()
         api.create_repo(args.upload_repo, repo_type="model", private=True, exist_ok=True)
         LOG.info("Uploading → https://huggingface.co/%s", args.upload_repo)
+        # Pattern O: manifest-LAST. Upload the payload .pt FIRST and wait
+        # for the commit to return, then upload the MANIFEST.json. A
+        # partial upload that fails between the two leaves the .pt on Hub
+        # without a manifest → Stage 5's F-RK-1 reader fails loudly
+        # (manifest missing) rather than mmap-loading a half-uploaded
+        # payload and silently degrading KD.
         api.upload_file(
             path_or_fileobj=str(out_path),
             path_in_repo=out_path.name,
             repo_id=args.upload_repo,
             repo_type="model",
         )
-        LOG.info("Upload complete")
+        api.upload_file(
+            path_or_fileobj=str(manifest_path),
+            path_in_repo=manifest_path.name,
+            repo_id=args.upload_repo,
+            repo_type="model",
+        )
+        LOG.info("Upload complete (payload + manifest)")
 
     return 0
 

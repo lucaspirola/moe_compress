@@ -1,4 +1,4 @@
-"""Tests for moe_compress.utils.atomic_io (Pattern N).
+"""Tests for moe_compress.utils.atomic_io (Pattern O).
 
 The audit (F-C-1, F-S3-1, F-RK-1, F-H-1..7) motivates one shared
 durable-write module. These tests cover:

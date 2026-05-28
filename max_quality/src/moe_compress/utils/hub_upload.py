@@ -49,10 +49,19 @@ log = logging.getLogger(__name__)
 # ``stage5_router_kd.run(stage_key="stage2p5")`` — verified at
 # stage5_router_kd.py:434 (``out_dir = artifacts_dir / f"{stage_key}_final"``).
 # No new sidecars are produced beyond what Stage 2 already uploaded.
+#
+# Stage 3 includes the ``.pt.MANIFEST.json`` sidecar, listed AFTER the
+# ``.pt`` so the upload loop honours Pattern O's manifest-LAST invariant:
+# any partial-upload failure leaves the .pt without a manifest, which
+# Stage 4's reader treats as a torn write (fails loudly) rather than
+# silently consuming a half-uploaded payload.
 _STAGE_LAYOUT: dict[int | str, tuple[str, list[str]]] = {
     2:     ("stage2_pruned",  ["_stage2_input_covariance.pt", "stage2_layer_mse.json"]),
     "2p5": ("stage2p5_final", []),
-    3:     ("stage3_svd",     ["_stage3_original_weights.pt"]),
+    3:     ("stage3_svd",     [
+        "_stage3_original_weights.pt",
+        "_stage3_original_weights.pt.MANIFEST.json",  # F-S3-1 manifest-LAST (Pattern O)
+    ]),
     4:     ("stage4_eora",    []),
     5:     ("stage5_final",   []),
 }

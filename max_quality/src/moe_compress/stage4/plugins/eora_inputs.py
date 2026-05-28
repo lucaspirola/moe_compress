@@ -168,9 +168,20 @@ class EoraInputsPlugin:
                             A_cov_path)
 
         originals_path = artifacts_dir / "_stage3_original_weights.pt"
+        # LOW-5: manifest naming consistency with F-RK-1
+        # (``.pt.MANIFEST.json`` — appended after the payload suffix). The
+        # legacy ``_stage3_original_weights.MANIFEST.json`` is also
+        # consulted for backward compat (in-flight runs that wrote the
+        # manifest before this rename landed).
         originals_manifest_path = (
+            artifacts_dir / "_stage3_original_weights.pt.MANIFEST.json"
+        )
+        legacy_originals_manifest_path = (
             artifacts_dir / "_stage3_original_weights.MANIFEST.json"
         )
+        if not originals_manifest_path.exists() and legacy_originals_manifest_path.exists():
+            # Honour the legacy manifest from a pre-LOW-5 Stage 3 run.
+            originals_manifest_path = legacy_originals_manifest_path
         if not originals_path.exists():
             # If Stage 4 already completed, the originals are intentionally
             # deleted. Re-entering Stage 4 on an already-widened model is a

@@ -170,6 +170,16 @@ def _legacy_router_kd_logits_dir(jsonl_path: Path) -> Path:
     return jsonl_path.parent / "sidecars" / "router_kd_logits"
 
 
+# HIGH-4 fix: dedupe set so the one-shot WARNING docstring contract holds.
+# Each (legacy_path, signal_name) pair logs at WARNING level exactly once
+# per process. The set is module-level (no LRU eviction); legacy-path
+# count is bounded by the number of distinct sidecar signals × distinct
+# JSONL parents — well under 100 in production, so unbounded growth is
+# not a concern. Tests that need a fresh process state can call
+# ``_already_warned_legacy_paths.clear()`` between cases.
+_already_warned_legacy_paths: set[tuple[Path, str]] = set()
+
+
 def _resolve_sidecar_for_load(
     jsonl_path: Path, signal_name: str, *, suffix: str = ".pt",
 ) -> Path | None:
@@ -177,9 +187,11 @@ def _resolve_sidecar_for_load(
 
     Returns the new-style namespaced path if it exists. If not, checks
     the legacy non-namespaced path and returns it (with a one-shot
-    WARNING) when present — but ONLY if there is exactly one JSONL
-    living in the parent directory (otherwise the legacy file is
-    ambiguous between multiple runs and we refuse to consume it).
+    WARNING — see :data:`_already_warned_legacy_paths` for dedupe state)
+    when present — but ONLY if there is exactly one JSONL stem living
+    in the parent directory (otherwise the legacy file is ambiguous
+    between multiple runs and we refuse to consume it; in-flight
+    ``.jsonl.tmp`` files also participate in the multi-stem count).
     Returns None if neither path exists.
     """
     new_path = sidecar_path(jsonl_path, signal_name, suffix=suffix)
@@ -203,20 +215,30 @@ def _resolve_sidecar_for_load(
         log.error(
             "F-H-7: legacy sidecar %s exists but %s contains %d distinct "
             "JSONL stems (%s) — legacy layout is ambiguous across runs. "
-            "Move the legacy sidecar to %s manually if it belongs to this "
-            "run, or delete it to force live recomputation.",
+            "Move the legacy sidecar to %s manually. Note: in-flight "
+            "``.jsonl.tmp`` files also count toward the multi-stem "
+            "disambiguation; either complete or delete them first. "
+            "Alternatively delete the legacy sidecar to force live "
+            "recomputation.",
             legacy, parent, n_distinct_runs,
             sorted({p.stem for p in jsonls + jsonls_tmp}),
             new_path,
         )
         return None
-    log.warning(
-        "F-H-7 backward-compat: loading sidecar from legacy path %s "
-        "(pre-F-H-7 layout). Next save_* call will write to the new "
-        "namespaced path %s — consider deleting the legacy file once "
-        "the run completes.",
-        legacy, new_path,
-    )
+    # HIGH-4: one-shot dedupe on (legacy_path, signal_name) so the
+    # docstring's "one-shot WARNING" contract holds — without this the
+    # WARNING was emitted on EVERY load_* call, spamming the log on
+    # provider-pair caches that read sidecars per layer.
+    _key = (legacy, signal_name)
+    if _key not in _already_warned_legacy_paths:
+        log.warning(
+            "F-H-7 backward-compat: loading sidecar from legacy path %s "
+            "(pre-F-H-7 layout). Next save_* call will write to the new "
+            "namespaced path %s — consider deleting the legacy file once "
+            "the run completes.",
+            legacy, new_path,
+        )
+        _already_warned_legacy_paths.add(_key)
     return legacy
 
 
@@ -547,7 +569,7 @@ def _atomic_torch_save(payload: Any, path: Path) -> None:
 
     Now delegates to the shared :func:`utils.atomic_io.atomic_torch_save`
     which does the full §11 durable-write dance — fixing all ~15 sidecar
-    write sites in this module at once (Pattern N).
+    write sites in this module at once (Pattern O).
     """
     from .atomic_io import atomic_torch_save as _shared_atomic_torch_save
     _shared_atomic_torch_save(payload, path)
@@ -1040,15 +1062,21 @@ def load_router_kd_logits(jsonl_path: Path, attempt_idx: int) -> RouterKDLogitsP
             log.error(
                 "F-H-7: legacy router_kd_logits shard %s exists but %s "
                 "contains multiple JSONL stems — refusing to consume "
-                "ambiguous legacy shard.",
+                "ambiguous legacy shard. Note: in-flight ``.jsonl.tmp`` "
+                "files also count; complete or delete them first.",
                 legacy_path, parent,
             )
             return None
-        log.warning(
-            "F-H-7 backward-compat: loading router_kd_logits shard "
-            "from legacy path %s; new writes will land at %s.",
-            legacy_path, path,
-        )
+        # HIGH-4: one-shot dedupe — warn at most once per (legacy_dir,
+        # router_kd_logits) tuple across the process lifetime.
+        _key = (legacy_path.parent, "router_kd_logits")
+        if _key not in _already_warned_legacy_paths:
+            log.warning(
+                "F-H-7 backward-compat: loading router_kd_logits shard "
+                "from legacy path %s; new writes will land at %s.",
+                legacy_path, path,
+            )
+            _already_warned_legacy_paths.add(_key)
         path = legacy_path
     with np.load(path) as f:
         schema = int(f["schema_version"])

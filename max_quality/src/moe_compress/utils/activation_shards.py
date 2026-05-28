@@ -384,7 +384,7 @@ class ShardWriter:
         # detectable by readers (they require manifest.json to exist).
         # Combined with F-H-1's per-shard atomic writes, the
         # manifest-last invariant for the heal-shards directory is
-        # now durable end-to-end (Pattern N).
+        # now durable end-to-end (Pattern O).
         from .atomic_io import atomic_json_save
         atomic_json_save(
             path, manifest.to_json(), indent=2, sort_keys=True,

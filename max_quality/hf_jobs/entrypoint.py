@@ -502,6 +502,15 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
     # We stage them into a single folder mirroring the Hub layout, then use
     # ``upload_large_folder`` for resumable, chunked, retried uploads — the
     # large sidecars (5–20 GB) make per-file ``upload_file`` calls fragile.
+    # Order matters: Pattern O (atomic-write + manifest-last) requires the
+    # MANIFEST sidecar to be uploaded AFTER its payload .pt so a partial
+    # upload never leaves a manifest-without-payload (which Stage 4's
+    # validator would happily approve). The entrypoint uses
+    # ``upload_large_folder`` which uploads alphabetically — and
+    # ``_stage3_original_weights.pt`` sorts before
+    # ``_stage3_original_weights.pt.MANIFEST.json`` because the dot+suffix
+    # extends the basename — so naming alone gives us manifest-LAST. The
+    # list order below mirrors this for human inspection.
     aux_files = [
         "stage1_blacklist.json",
         "stage1_budgets.json",
@@ -510,6 +519,7 @@ def _upload_results(artifacts_dir: Path, repo_id: str, *, ok: bool) -> None:
         "stage6_eval.json",
         "_stage2_input_covariance.pt",   # needed for Stage 3 AA-SVD on resume
         "_stage3_original_weights.pt",   # needed for Stage 4 EoRA residuals on resume
+        "_stage3_original_weights.pt.MANIFEST.json",  # F-S3-1 manifest-last (Pattern O)
         "calibration_imatrix.txt",       # multi-domain imatrix calibration text (Stage 6)
         "imatrix.gguf",                  # importance matrix for GGUF quantization (Stage 6)
     ]

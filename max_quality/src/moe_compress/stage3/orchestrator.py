@@ -441,9 +441,13 @@ def run(
     # NOT the .pt's. A torn write produces a .pt without its
     # MANIFEST.json sibling — Stage 4 fails loudly with an actionable
     # message instead of consuming the partial file.
-    from ..utils.atomic_io import atomic_torch_save, write_manifest_last
+    from moe_compress.utils.atomic_io import atomic_torch_save, write_manifest_last
     _orig_path = artifacts_dir / "_stage3_original_weights.pt"
-    _orig_manifest_path = artifacts_dir / "_stage3_original_weights.MANIFEST.json"
+    # LOW-5: manifest naming consistency — append ``.MANIFEST.json`` AFTER
+    # the payload suffix so the manifest sorts alphabetically right after
+    # the .pt (Pattern O: manifest-LAST upload ordering relies on this).
+    # F-RK-1 already uses this convention.
+    _orig_manifest_path = artifacts_dir / "_stage3_original_weights.pt.MANIFEST.json"
     # If a previous run left a stale manifest, remove it first so an
     # interrupted re-write here doesn't briefly look "good" to Stage 4.
     try:
