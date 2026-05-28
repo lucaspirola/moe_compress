@@ -823,6 +823,27 @@ def run(
     # below replays each record against the live model.
     # -----------------------------------------------------------------------
     completed_layers: set[int] = set()
+    # R-1 v2 / Mutation 3(a): hoist the configured merge_step parse here
+    # (from the post-resume config block) so the eager init below has the
+    # configured value in scope. Plugin #9 / S2_MM (MergeMoE arXiv:2510.14436):
+    # merge_step was already validated at the top of run() (alongside the
+    # cost_asymmetric / freq invariant). This is a re-read of the canonical
+    # resolved value passed into LayerMergePlugin and emitted to Trackio
+    # below — no second raise to avoid duplicate error paths. See
+    # tasks/PLAN_PLUGIN_09_s2_mm.md and :mod:`stage2.mergemoe`.
+    merge_step: str = str(s2.get("merge_step", "freq_weighted")).lower()
+    # R-1 v2 / Mutation 1: per-layer effective merge_step pin for Trackio
+    # (§2.1, §2.2 of tasks/PLAN_R1_REGMEAN_RESUME_TRACKIO.md). Pre-populated
+    # with the configured value for every MoE layer so the one-shot emit at
+    # the run-scope Trackio block has full coverage regardless of resume
+    # state. The resume loop below only OVERWRITES resumed entries to
+    # "freq_weighted" — non-resumed layers keep the configured default,
+    # clean (non-resume) runs see all configured values. Hoisted out of
+    # the ``else:`` branch so ``--no-resume`` (the if-branch below) also
+    # sees the binding.
+    _effective_merge_step_per_layer: dict[int, str] = {
+        ref.layer_idx: merge_step for ref in moe_layers
+    }
     _layer_mean_costs: list[float] = []  # running history for cost-threshold gate (Strategy C)
 
     if no_resume:
@@ -951,6 +972,13 @@ def run(
 
             merge_map[ref.layer_idx] = record.merge_map_layer
             completed_layers.add(ref.layer_idx)
+            # R-1 v2 / Mutation 2: surface the forced freq_weighted downgrade
+            # for this replayed layer (overwrites the eager-init default
+            # written at line ~825). The forced ``merge_step="freq_weighted"``
+            # kwarg on ``_merge_experts_inplace`` above IS the truth we're
+            # recording; copying the string keeps drift impossible. See
+            # tasks/PLAN_R1_REGMEAN_RESUME_TRACKIO.md § 3.1 Mutation 2.
+            _effective_merge_step_per_layer[ref.layer_idx] = "freq_weighted"
             log.info(
                 "Stage 2: layer %d resumed from partial (skipping profile + merge)",
                 ref.layer_idx,
@@ -1003,11 +1031,12 @@ def run(
         )
     # Plugin #9 / S2_MM (MergeMoE arXiv:2510.14436): merge_step was already
     # validated at the top of run() (alongside the cost_asymmetric / freq
-    # invariant). Re-read here as the canonical resolved value passed into
-    # LayerMergePlugin and emitted to Trackio below — no second raise to
-    # avoid duplicate error paths. See tasks/PLAN_PLUGIN_09_s2_mm.md and
-    # :mod:`stage2.mergemoe`.
-    merge_step: str = str(s2.get("merge_step", "freq_weighted")).lower()
+    # invariant). The canonical resolved value (passed into LayerMergePlugin
+    # and emitted to Trackio below) is parsed at the top of the resume block
+    # (line 825 region) so the R-1 v2 eager-init of
+    # ``_effective_merge_step_per_layer`` has it in scope before the resume
+    # loop runs. See tasks/PLAN_PLUGIN_09_s2_mm.md, :mod:`stage2.mergemoe`,
+    # and tasks/PLAN_R1_REGMEAN_RESUME_TRACKIO.md § 3.1 Mutation 3(a).
     # Direction C — output-space cost calibration-token cap. Only consumed when
     # cost_alignment == "output"; bounds the per-pair SwiGLU residual compute.
     cost_output_token_cap: int = int(s2.get("cost_output_token_cap", 1024))
@@ -1114,6 +1143,45 @@ def run(
         "stage2/config/expert_distill_target_version": expert_distill_target_version,
         "stage2/config/sinkhorn_iters": sinkhorn_iters,
         "stage2/config/merge_step": merge_step,
+        # R-1 v2 / Mutation 3(b): per-layer effective merge_step + downgrade
+        # forensics. The eager-init contract (§2.2 of
+        # tasks/PLAN_R1_REGMEAN_RESUME_TRACKIO.md) guarantees one entry per
+        # MoE layer in ``_effective_merge_step_per_layer`` by the time this
+        # emit fires — replayed-under-resume entries carry "freq_weighted",
+        # all others carry the configured ``merge_step``. Operators alert on
+        # the scalar downgrade counter; the per-layer JSON dict is for the
+        # post-mortem notebook; the reason string distinguishes the two
+        # D-* deviations (RegMean-resume vs MergeMoE-resume) without log
+        # grepping.
+        "stage2/effective/merge_step_per_layer": json.dumps(
+            {str(k): v for k, v in sorted(_effective_merge_step_per_layer.items())},
+            sort_keys=True,
+        ),
+        "stage2/effective/merge_step_downgrades_total": (
+            _downgrades_total := sum(
+                1 for v in _effective_merge_step_per_layer.values() if v != merge_step
+            )
+        ),
+        # R-1 v2 LOW-finding fold: emit a non-empty reason string ONLY when
+        # the downgrade counter is nonzero. The original v1 formulation
+        # keyed the reason on ``merge_step`` (configured) inside an
+        # unconditional ternary, so a future change that allowed
+        # ``freq_weighted`` to also produce per-layer downgrades would
+        # silently mislabel them as the MergeMoE reason. Gating on
+        # ``_downgrades_total > 0`` makes the keying explicit: no
+        # downgrades → empty string; downgrades exist → reason follows
+        # configured ``merge_step``. (Today both branches are reachable
+        # only via RegMean-resume or MergeMoE-resume, so the inner ternary
+        # is unchanged.)
+        "stage2/effective/merge_step_downgrade_reason": (
+            ""
+            if _downgrades_total == 0
+            else (
+                "regmean_resume_no_cov_load_before_merge"
+                if merge_step == "regmean"
+                else "mergemoe_resume_no_calibration_buffer"
+            )
+        ),
         "stage2/config/format_version": 2,
     })
 

@@ -671,3 +671,279 @@ def test_mergemoe_path_unchanged_by_regmean_addition(tiny_model):
     )
     banks = build_banks(layer)
     assert torch.isfinite(banks["down_proj"]._stacked()).all()
+
+
+# ---------------------------------------------------------------------------
+# Section 10 — R-1 (RegMean resume Trackio forensics) — orchestrator-level
+# ---------------------------------------------------------------------------
+#
+# Pins the eager-init contract from
+# ``tasks/PLAN_R1_REGMEAN_RESUME_TRACKIO.md`` § 2.2: by the time the one-shot
+# Trackio config emit at ``orchestrator.run()`` fires,
+# ``_effective_merge_step_per_layer`` MUST contain one entry per MoE layer.
+# Resume forces ``"freq_weighted"`` for replayed layers (overriding the
+# configured ``merge_step``); clean runs leave every entry at the configured
+# value.
+#
+# Test 1 covers RegMean resume → downgrade counter / reason / dict shape.
+# Test 2 covers RegMean clean run → zero downgrades, full per-layer coverage.
+# Both tests reuse the resume fixture pattern from
+# ``test_smoke_stage2_resume.py`` (see plan § 4 for the rationale of not
+# parametrising).
+
+
+def _r1_make_tiny_tokenizer():
+    """Tokenizer shim mirroring ``test_smoke_stage2_resume._TinyTokenizer``.
+
+    Inlined here so this module does not import the smoke test (which would
+    couple two unrelated test files together).
+    """
+    class _TinyTokenizer:
+        name_or_path = "tiny-tokenizer"
+        eos_token_id = 0
+
+        def __call__(self, text, *_, **__):
+            return {"input_ids": [min(ord(c) % 32, 31) for c in (text or " ")]}
+
+        def save_pretrained(self, *_args, **_kwargs):
+            return None
+
+    return _TinyTokenizer()
+
+
+def _r1_noop_save(model, tokenizer, path, **kwargs):
+    from pathlib import Path as _Path
+
+    _Path(path).mkdir(parents=True, exist_ok=True)
+    return _Path(path)
+
+
+@pytest.fixture
+def _r1_patched_stage2(monkeypatch, tiny_config):
+    """Resume-fixture clone (CPU-only) configured for RegMean.
+
+    Mirrors ``test_smoke_stage2_resume.patched_stage2`` but flips
+    ``merge_step`` to ``"regmean"`` so the eager-init contract is exercised
+    on the RegMean code paths. Returns the mutated config dict.
+    """
+    import copy as _copy
+
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
+    from moe_compress.utils import calibration as cal_mod
+    from moe_compress.utils import model_io as mio
+
+    def _fake_build(tokenizer, spec, cache_dir=None):
+        torch.manual_seed(spec.seed)
+        return torch.randint(0, 32, (spec.num_sequences, spec.sequence_length),
+                             dtype=torch.long)
+
+    def _fake_slice(tokenizer, spec, num_samples, cache_dir=None):
+        torch.manual_seed(spec.seed + 1)
+        return torch.randint(0, 32, (num_samples, spec.sequence_length),
+                             dtype=torch.long)
+
+    monkeypatch.setattr(cal_mod, "build_calibration_tensor", _fake_build)
+    monkeypatch.setattr(cal_mod, "build_super_expert_slice", _fake_slice)
+    monkeypatch.setattr(stage2_reap_ream, "build_calibration_tensor", _fake_build)
+
+    monkeypatch.setattr(mio, "save_compressed_checkpoint", _r1_noop_save)
+    monkeypatch.setattr(stage2_reap_ream, "save_compressed_checkpoint", _r1_noop_save)
+
+    cfg = _copy.deepcopy(tiny_config)
+    cfg["stage2_reap_ream"]["merge_step"] = "regmean"
+    return cfg
+
+
+def _r1_run_stages_01(model, config, tmp_path):
+    """Stage-0/1 prep clone of ``test_smoke_stage2_resume._run_stages_01``."""
+    from moe_compress import stage1
+    from moe_compress.budget.solver import BudgetDecomposition
+
+    tokenizer = _r1_make_tiny_tokenizer()
+    decomp = BudgetDecomposition(
+        total_reduction_ratio=0.2,
+        expert_prune_ratio=0.5,
+        svd_rank_ratio=0.14,
+        global_expert_budget=4,
+        min_experts_per_layer=2,
+        blacklisted_experts={},
+    )
+    stage1.run(model, tokenizer, config, tmp_path, decomp)
+    return decomp
+
+
+def _r1_find_config_emit(captured_emits):
+    """Locate the one-shot config emit in the captured Trackio call list.
+
+    The emit is the dict containing ``stage2/config/merge_step``. We assert a
+    single match to pin the eager-init contract on the ONE canonical emit
+    (post-resume, pre-walker) — if the orchestrator ever splits this into
+    two emits, this helper fails loudly.
+    """
+    matches = [p for p in captured_emits if "stage2/config/merge_step" in p]
+    assert len(matches) == 1, (
+        f"Expected exactly one config emit, found {len(matches)}; "
+        "the R-1 contract pins the eager-init dict on the canonical emit "
+        "at orchestrator.run() (post-resume, pre-walker)."
+    )
+    return matches[0]
+
+
+def test_regmean_resume_emits_downgrade_counter(
+    tiny_model, _r1_patched_stage2, tmp_path, monkeypatch
+):
+    """R-1: resume of a RegMean run reports the forced freq_weighted
+    downgrade via the new ``stage2/effective/*`` Trackio keys.
+
+    End-to-end proof:
+      * ``stage2/effective/merge_step_downgrades_total`` equals the number of
+        replayed layers (1 in this fixture: crash after layer 0).
+      * ``stage2/effective/merge_step_downgrade_reason`` reads
+        ``"regmean_resume_no_cov_load_before_merge"`` (RegMean branch).
+      * ``stage2/effective/merge_step_per_layer`` is a JSON dict with FULL
+        MoE coverage (one entry per layer in ``moe_layers``) — pins the
+        eager-init contract from plan § 2.2. The replayed layer maps to
+        ``"freq_weighted"``; every other MoE layer maps to ``"regmean"``.
+    """
+    import copy as _copy
+    import json as _json
+
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
+
+    _r1_run_stages_01(tiny_model, _r1_patched_stage2, tmp_path)
+    model_before_s2 = _copy.deepcopy(tiny_model)
+
+    moe_layers = list(iter_moe_layers(tiny_model))
+    assert len(moe_layers) >= 2, "Need at least 2 MoE layers for this test"
+    layer0_idx = moe_layers[0].layer_idx
+
+    # --- First run: crash after layer 0 is fully processed (writes partial) ---
+    original_profile = stage2_reap_ream._profile_layer
+    call_count = [0]
+
+    def _crashing_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs):
+        call_count[0] += 1
+        if call_count[0] > 1:
+            raise RuntimeError("simulated crash after layer 0")
+        return original_profile(model, layer_ref, batches, reap_acc, cov_acc, ream_acc, **kwargs)
+
+    monkeypatch.setattr(stage2_reap_ream, "_profile_layer", _crashing_profile)
+    with pytest.raises(RuntimeError, match="simulated crash after layer 0"):
+        stage2_reap_ream.run(
+            tiny_model, _r1_make_tiny_tokenizer(), _r1_patched_stage2,
+            tmp_path, device=None,
+        )
+
+    # Confirm partial files are present so the resume path is exercised.
+    partial_dir = tmp_path / "_stage2_partial"
+    assert (partial_dir / f"merge_{layer0_idx}.json").exists()
+    assert (partial_dir / f"layer_{layer0_idx}.pt").exists()
+
+    # --- Restore model + capture Trackio emits on the resume run ---
+    model_for_resume = _copy.deepcopy(model_before_s2)
+    monkeypatch.setattr(stage2_reap_ream, "_profile_layer", original_profile)
+
+    captured: list[dict] = []
+
+    def _capture_trackio(payload, *args, **kwargs):
+        captured.append(dict(payload))
+
+    monkeypatch.setattr(stage2_reap_ream, "_trackio_log", _capture_trackio)
+
+    stage2_reap_ream.run(
+        model_for_resume, _r1_make_tiny_tokenizer(), _r1_patched_stage2,
+        tmp_path, device=None,
+    )
+
+    payload = _r1_find_config_emit(captured)
+
+    # Configured value is unchanged.
+    assert payload["stage2/config/merge_step"] == "regmean"
+
+    # One replayed layer → one downgrade.
+    assert payload["stage2/effective/merge_step_downgrades_total"] == 1
+
+    # Reason string maps to the RegMean branch.
+    assert payload["stage2/effective/merge_step_downgrade_reason"] == (
+        "regmean_resume_no_cov_load_before_merge"
+    )
+
+    # Per-layer dict shape: JSON-encoded, FULL MoE coverage (eager-init
+    # contract from plan § 2.2). Without eager init the non-resumed layers
+    # would be missing from the dict at emit time — this assertion catches
+    # a regression of the eager-init fix.
+    per_layer = _json.loads(payload["stage2/effective/merge_step_per_layer"])
+    expected_keys = {str(layer.layer_idx) for layer in moe_layers}
+    assert set(per_layer.keys()) == expected_keys, (
+        "Eager-init contract broken: per-layer dict missing entries for "
+        f"non-resumed MoE layers. Expected {expected_keys}, "
+        f"got {set(per_layer.keys())}."
+    )
+
+    # Replayed layer → "freq_weighted"; every other → "regmean".
+    assert per_layer[str(layer0_idx)] == "freq_weighted"
+    for layer in moe_layers:
+        if layer.layer_idx == layer0_idx:
+            continue
+        assert per_layer[str(layer.layer_idx)] == "regmean", (
+            f"Non-resumed layer {layer.layer_idx} carries "
+            f"{per_layer[str(layer.layer_idx)]!r}; expected the configured "
+            "'regmean' (eager-init default)."
+        )
+
+
+def test_regmean_clean_run_emits_zero_downgrades(
+    tiny_model, _r1_patched_stage2, tmp_path, monkeypatch
+):
+    """R-1: a clean (no-resume) RegMean run pins zero downgrades AND full
+    per-layer coverage of the configured ``"regmean"`` value.
+
+    Guards against:
+      * accidentally counting absence of resume as a "downgrade" (off-by-one);
+      * the v1 ``NameError`` on the no-resume path (eager init hoisted
+        OUTSIDE the ``else:`` branch makes the binding exist on both code
+        paths — see plan § 2.2 CRITICAL-2).
+    """
+    import json as _json
+
+    from moe_compress.stage2 import orchestrator as stage2_reap_ream
+
+    _r1_run_stages_01(tiny_model, _r1_patched_stage2, tmp_path)
+    moe_layers = list(iter_moe_layers(tiny_model))
+
+    captured: list[dict] = []
+
+    def _capture_trackio(payload, *args, **kwargs):
+        captured.append(dict(payload))
+
+    monkeypatch.setattr(stage2_reap_ream, "_trackio_log", _capture_trackio)
+
+    stage2_reap_ream.run(
+        tiny_model, _r1_make_tiny_tokenizer(), _r1_patched_stage2,
+        tmp_path, device=None,
+    )
+
+    payload = _r1_find_config_emit(captured)
+
+    # Zero downgrades + empty reason on the clean path.
+    assert payload["stage2/effective/merge_step_downgrades_total"] == 0
+    assert payload["stage2/effective/merge_step_downgrade_reason"] == ""
+
+    # Per-layer dict: FULL MoE coverage (eager-init contract). Without eager
+    # init the clean-run dict would be empty — no resume-loop writes occur,
+    # so this assertion is the load-bearing pin for plan § 2.2.
+    per_layer = _json.loads(payload["stage2/effective/merge_step_per_layer"])
+    expected_keys = {str(layer.layer_idx) for layer in moe_layers}
+    assert set(per_layer.keys()) == expected_keys, (
+        "Eager-init contract broken on clean run: per-layer dict is "
+        f"missing entries. Expected {expected_keys}, "
+        f"got {set(per_layer.keys())}."
+    )
+
+    # Every layer carries the configured value.
+    for layer in moe_layers:
+        assert per_layer[str(layer.layer_idx)] == "regmean", (
+            f"Clean-run layer {layer.layer_idx} carries "
+            f"{per_layer[str(layer.layer_idx)]!r}; expected configured "
+            "'regmean'."
+        )
