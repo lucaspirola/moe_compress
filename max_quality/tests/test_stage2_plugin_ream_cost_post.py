@@ -10,7 +10,10 @@ import numpy as np
 import pytest
 
 from moe_compress.pipeline.context import PipelineContext
-from moe_compress.stage2.plugins.ream_cost_post import ReamCostPostPlugin
+from moe_compress.stage2.plugins.ream_cost_post import (
+    ReamCostPostPlugin,
+    _post_alignment_cost,
+)
 from moe_compress.utils.activation_hooks import (
     InputCovarianceAccumulator,
     ReamCostAccumulator,
@@ -104,3 +107,136 @@ def test_compute_cost_is_live_slot(tiny_model):
     assert isinstance(delta, np.ndarray)
     assert delta.shape == (len(noncentroid_ids), len(centroid_ids))
     assert np.isfinite(delta).all()
+
+
+# --- Plugin #14 audit follow-up item 4 / Pattern H hoist polish -------------
+
+def test_post_cost_topk_hoisting_byte_identical():
+    """N2 (nitpick): hoisting np.argpartition out of the per-row loop in
+    ``_post_alignment_cost`` must select the same K-smallest centroids as
+    the pre-hoist per-row form. Mirrors Plugin #3's
+    ``test_output_cost_topk_hoisting_byte_identical`` shape (see
+    ``test_stage2_output_cost.py``).
+
+    Two cases:
+      * No-tie matrix — the vectorized argpartition and the per-row form
+        return set-identical K-smallest indices (and the same set as
+        ``argsort[:K]``).
+      * With-tie matrix — argpartition's order among tied elements is
+        implementation-defined; the *set* of K-smallest indices must
+        still match per-row, and the K-smallest *values* must equal.
+
+    Pins the hoist contract documented at ``ream_cost_post.py:208`` and
+    Plugin #14 audit follow-up item 4.
+    """
+    # Case 1 — no ties: vectorized vs per-row, set-identical selection.
+    rng = np.random.default_rng(seed=42)
+    n_nc, n_c = 4, 6
+    k_cand = 3
+    cheap_cost = rng.random((n_nc, n_c)).astype(np.float64)
+    assert len(np.unique(cheap_cost)) == n_nc * n_c, (
+        "synthetic cheap_cost should have no ties"
+    )
+
+    vectorized = np.argpartition(cheap_cost, k_cand - 1, axis=1)[:, :k_cand]
+    assert vectorized.shape == (n_nc, k_cand)
+
+    per_row = np.array([
+        np.argpartition(cheap_cost[ci], k_cand - 1)[:k_cand]
+        for ci in range(n_nc)
+    ])
+
+    for ci in range(n_nc):
+        assert set(vectorized[ci].tolist()) == set(per_row[ci].tolist()), (
+            f"row {ci}: vectorized {vectorized[ci]} != per-row {per_row[ci]}"
+        )
+        # Every selected index is one of the K smallest.
+        sorted_indices = np.argsort(cheap_cost[ci])[:k_cand]
+        assert set(vectorized[ci].tolist()) == set(sorted_indices.tolist()), (
+            f"row {ci}: selected indices are not the K smallest"
+        )
+
+    # Case 2 — with ties: argpartition order is implementation-defined among
+    # tied elements; the set of K-smallest indices must still match per-row,
+    # and the selected *values* must equal the K-smallest values.
+    tied = np.array([
+        [0.1, 0.1, 0.2, 0.3, 0.4, 0.5],  # 0.1 / 0.1 tied
+        [0.9, 0.8, 0.8, 0.7, 0.6, 0.6],  # 0.6 / 0.6 tied
+        [1.0, 2.0, 3.0, 3.0, 4.0, 5.0],  # 3.0 / 3.0 tied outside top-K
+        [5.0, 5.0, 5.0, 5.0, 5.0, 5.0],  # all equal
+    ], dtype=np.float64)
+    k_cand = 3
+
+    vectorized_tied = np.argpartition(tied, k_cand - 1, axis=1)[:, :k_cand]
+    per_row_tied = np.array([
+        np.argpartition(tied[ci], k_cand - 1)[:k_cand]
+        for ci in range(tied.shape[0])
+    ])
+
+    for ci in range(tied.shape[0]):
+        assert set(vectorized_tied[ci].tolist()) == set(per_row_tied[ci].tolist()), (
+            f"tie-row {ci}: vectorized {vectorized_tied[ci]} != "
+            f"per-row {per_row_tied[ci]}"
+        )
+        # Selected values must equal the K-smallest values, even when index
+        # sets differ across tie-breaking strategies.
+        selected_vals = sorted(tied[ci, vectorized_tied[ci]].tolist())
+        smallest_vals = sorted(np.sort(tied[ci])[:k_cand].tolist())
+        assert selected_vals == smallest_vals, (
+            f"tie-row {ci}: selected values {selected_vals} != "
+            f"K-smallest values {smallest_vals}"
+        )
+
+
+def test_post_cost_empty_matrix_early_return(tiny_model):
+    """N3 (nitpick): exercise the ``n_nc == 0 or n_c == 0`` early-return at
+    ``ream_cost_post.py:205``. The commit message itself (24c24df) flags
+    this branch as untested. Two cases:
+
+      * ``noncentroid_ids=[]`` -> ``(0, n_c)`` all-+inf matrix.
+      * ``centroid_ids=[]``    -> ``(n_nc, 0)`` all-+inf matrix.
+
+    The all-+inf init is the assignment-solver "forbidden arc" sentinel;
+    the early-return preserves that contract without entering the
+    argpartition path (which would IndexError on shape[1]==0).
+    """
+    layer_ref = list(iter_moe_layers(tiny_model))[0]
+    n_exp = layer_ref.num_routed_experts
+
+    # Case 1: empty non-centroid set -> (0, n_c) result.
+    centroid_ids = list(range(n_exp))
+    out_empty_nc = _post_alignment_cost(
+        layer_ref,
+        noncentroid_ids=[],
+        centroid_ids=centroid_ids,
+        cheap_cost=np.empty((0, len(centroid_ids)), dtype=np.float64),
+        ream_acc=ReamCostAccumulator(),
+        cov_acc=None,
+        perm_cache=None,
+        whitening_mode="none",
+        asymmetric=False,
+        topk=2,
+        freq=None,
+    )
+    assert isinstance(out_empty_nc, np.ndarray)
+    assert out_empty_nc.shape == (0, len(centroid_ids))
+    assert out_empty_nc.dtype == np.float64
+
+    # Case 2: empty centroid set -> (n_nc, 0) result.
+    noncentroid_ids = list(range(n_exp))
+    out_empty_c = _post_alignment_cost(
+        layer_ref,
+        noncentroid_ids=noncentroid_ids,
+        centroid_ids=[],
+        cheap_cost=np.empty((len(noncentroid_ids), 0), dtype=np.float64),
+        ream_acc=ReamCostAccumulator(),
+        cov_acc=None,
+        perm_cache=None,
+        whitening_mode="none",
+        asymmetric=False,
+        topk=2,
+        freq=None,
+    )
+    assert isinstance(out_empty_c, np.ndarray)
+    assert out_empty_c.shape == (len(noncentroid_ids), 0)
+    assert out_empty_c.dtype == np.float64

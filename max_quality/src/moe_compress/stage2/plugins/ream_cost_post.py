@@ -206,13 +206,13 @@ def _post_alignment_cost(
         return out
 
     # Pattern H hoist: compute the K-smallest centroid columns per non-centroid
-    # row ONCE before the loop. Loop-invariant: ``k`` depends only on (topk, n_c);
-    # cheap_cost is read-only after construction. Mirrors the same hoist applied
-    # to ``_output_space_cost`` in Plugin #3 (SC_FAST_PLAN_V3.md §4-B3). Saving
-    # ~1 min/row on the SC + post-cost paths.
+    # row ONCE before the loop. Loop-invariant: ``k_cand`` depends only on
+    # (topk, n_c); cheap_cost is read-only after construction. Mirrors the same
+    # hoist applied to ``_output_space_cost`` in Plugin #3
+    # (SC_FAST_PLAN_V3.md §4-B3). Saving ~1 min/row on the SC + post-cost paths.
     # See Plugin #14 audit follow-up item 4 / Plugin #3 audit finding L-B3-3.
-    k = min(topk, n_c)
-    topk_per_ci = np.argpartition(cheap_cost, k - 1, axis=1)[:, :k]  # (n_nc, k)
+    k_cand = min(topk, n_c)
+    topk_per_ci = np.argpartition(cheap_cost, k_cand - 1, axis=1)[:, :k_cand]  # (n_nc, k_cand)
 
     # Per-non-centroid: pick the top-K cheapest centroids and compute the
     # expensive cost only for those. All cost-matrix tensor work is
