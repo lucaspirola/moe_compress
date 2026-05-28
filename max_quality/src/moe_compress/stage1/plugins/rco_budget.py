@@ -225,7 +225,6 @@ _ALLOWED_CFG_KEYS = frozenset(
         "learning_rate",
         "gumbel_tau_init",
         "gumbel_tau_final",
-        "init_peak_logit",
         "floor_divisor",
         "seed",
         "adam_beta1",
@@ -349,7 +348,6 @@ class RCOBudgetPlugin:
         learning_rate = cfg["learning_rate"]
         gumbel_tau_init = cfg["gumbel_tau_init"]
         gumbel_tau_final = cfg["gumbel_tau_final"]
-        init_peak_logit = cfg["init_peak_logit"]
         floor_divisor = cfg["floor_divisor"]
         seed = cfg["seed"]
         adam_beta1 = cfg["adam_beta1"]
@@ -412,37 +410,24 @@ class RCOBudgetPlugin:
             use_damage_curve=use_damage_curve,
         )
 
-        # D-init-grape: initial logits peak at the GRAPE option-index.
-        alpha = torch.zeros((L, K_max), dtype=torch.float64)
-        for li in sorted_layers:
-            row = layer_to_row[li]
-            opts = k_options[li]
-            g_l = int(grape_budgets[li])
-            # Clamp GRAPE budget into the option grid (defensive — GRAPE
-            # SHOULD respect the same floor, but the floor_divisor may
-            # legitimately differ from GRAPE's; see plan Q6).
-            g_l_clamped = max(opts[0], min(opts[-1], g_l))
-            if g_l_clamped != g_l:
-                # GRAPE's own floor_divisor sits under a different config
-                # namespace (``stage1_grape.grape_floor_divisor``); include
-                # both values in the warning so the operator immediately
-                # sees the divergent-config root cause (plan Q6 / D5-3).
-                grape_floor_divisor_cfg = config.get("stage1_grape", {}).get(
-                    "grape_floor_divisor", "<unset>"
-                )
-                log.warning(
-                    "RCO: layer %d: GRAPE budget %d clamped to option grid "
-                    "[%d, %d] (stage1_grape.grape_floor_divisor=%s, "
-                    "stage1.rco_budget.floor_divisor=%d)",
-                    li, g_l, opts[0], opts[-1],
-                    grape_floor_divisor_cfg, floor_divisor,
-                )
-            k_idx = opts.index(g_l_clamped)
-            alpha[row, k_idx] = init_peak_logit
-            # Make padding columns hard-impossible: large negative logit
-            # so softmax probability is ~0 even before mask multiplies it.
-            for pad_k in range(len(opts), K_max):
-                alpha[row, pad_k] = -1e9
+        # Initialise α via β-bisection so the expected budget already
+        # equals the target at iteration 0 (upstream parity:
+        # ``src/search/quant.py::InterpolatedModel.init_alpha_to_bits``
+        # lines 302-327). Bisect a single scalar β such that
+        # ``E[budget] = Σ_l w_l · Σ_k softmax(-β·c_l)_k · c_lk = B``;
+        # then set ``α_lk = -β · c_lk``. Per-row identical when costs
+        # are identical (uniform pattern); otherwise per-row.
+        alpha = self._init_alpha_beta_bisection(
+            cost_grid=cost_grid,
+            mask=mask,
+            global_budget=global_budget,
+            L=L,
+            K_max=K_max,
+        )
+        # Make padding columns hard-impossible: large negative logit so
+        # softmax probability is ~0 even before mask multiplies it.
+        very_neg = torch.full_like(alpha, -1e9)
+        alpha = torch.where(mask > 0, alpha, very_neg)
 
         # Retract initial logits onto the constraint surface — GRAPE's
         # budget is integer-feasible but the soft-budget at τ→0+ may
@@ -608,11 +593,14 @@ class RCOBudgetPlugin:
 
         cfg = {
             "enabled": bool(rco_cfg.get("enabled", False)),
-            "n_iterations": int(rco_cfg.get("n_iterations", 500)),
+            # Upstream default: ``n_steps=200`` in ``src/search/prune.py::optimize``.
+            "n_iterations": int(rco_cfg.get("n_iterations", 200)),
+            # Upstream default: ``lr=0.1`` in ``src/search/prune.py::optimize``.
             "learning_rate": float(rco_cfg.get("learning_rate", 0.1)),
-            "gumbel_tau_init": float(rco_cfg.get("gumbel_tau_init", 5.0)),
-            "gumbel_tau_final": float(rco_cfg.get("gumbel_tau_final", 0.5)),
-            "init_peak_logit": float(rco_cfg.get("init_peak_logit", 2.0)),
+            # Upstream default: ``tau_init=1.0`` in ``src/search/prune.py::optimize``.
+            "gumbel_tau_init": float(rco_cfg.get("gumbel_tau_init", 1.0)),
+            # Upstream default: ``tau_min=0.05`` in ``src/search/prune.py::optimize``.
+            "gumbel_tau_final": float(rco_cfg.get("gumbel_tau_final", 0.05)),
             "floor_divisor": int(rco_cfg.get("floor_divisor", 2)),
             "seed": int(rco_cfg.get("seed", 0)),
             "adam_beta1": float(rco_cfg.get("adam_beta1", 0.9)),
@@ -736,6 +724,52 @@ class RCOBudgetPlugin:
                     damage_grid[row, k_idx] = alpha_redundancy * float(N_l - k_val)
 
         return damage_grid
+
+    # ------------------------------------------------------------------
+    # Initialisation (β-bisection, upstream parity)
+    # ------------------------------------------------------------------
+
+    def _init_alpha_beta_bisection(
+        self,
+        *,
+        cost_grid: torch.Tensor,
+        mask: torch.Tensor,
+        global_budget: float,
+        L: int,
+        K_max: int,
+    ) -> torch.Tensor:
+        """β-bisection init.
+
+        Mirrors ``src/search/quant.py::InterpolatedModel.init_alpha_to_bits``
+        (upstream lines 302-327): bisect ``β ∈ [-10, 10]`` such that
+        ``E[budget] = Σ_l Σ_k softmax(-β·c_l)_k · c_lk`` equals the
+        target. With identical cost rows the upstream code sets the same
+        per-row logits for every group; we generalise to per-row costs
+        (our cost_grid may differ per layer when option grids differ).
+
+        100 bisection iterations matches upstream (`for _ in range(100)`).
+        """
+        lo = -10.0
+        hi = 10.0
+
+        def expected_budget(beta_val: float) -> float:
+            # softmax(-β·c) per row, then Σ_l Σ_k p_lk · c_lk.
+            logits = -beta_val * cost_grid
+            very_neg = torch.full_like(logits, -1e9)
+            logits = torch.where(mask > 0, logits, very_neg)
+            p = self._masked_softmax(logits, mask)
+            return float((p * cost_grid).sum().item())
+
+        for _ in range(100):
+            mid = 0.5 * (lo + hi)
+            if expected_budget(mid) > float(global_budget):
+                lo = mid
+            else:
+                hi = mid
+        beta = 0.5 * (lo + hi)
+
+        alpha = -beta * cost_grid
+        return alpha
 
     # ------------------------------------------------------------------
     # Manifold primitives (paper §2 + §3.1; plan §1.2)
