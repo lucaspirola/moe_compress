@@ -37,6 +37,20 @@ Backward-compat shim
 --------------------
 ``stage2.shared_io._durable_rename`` is preserved as a thin shim that calls
 :func:`durable_rename` here. Existing call sites do not need to change.
+
+Single-writer assumption (NIT-5)
+--------------------------------
+Every writer here uses ``tmp = path + ".tmp"`` — a SINGLE tmp filename
+shared across processes that target the same final path. The
+calibration pipeline is single-writer by contract (one orchestrator
+per ``artifacts_dir``; concurrent stages write to disjoint subdirs).
+Two processes that race for the same final path would BOTH write to
+the same ``.tmp`` and one would observe a partial/garbled rename
+target. If you ever wire this for multi-writer use, switch the tmp
+suffix to ``tmp.{pid}.{uuid}`` and document the new uniqueness
+contract; the current design is intentional and matches the
+provider-pair "one calibration writer per JSONL" contract documented
+in :mod:`cached_calibration_signals`.
 """
 from __future__ import annotations
 
@@ -96,7 +110,13 @@ def _fsync_file(path: Path) -> None:
     except OSError as exc:
         # Some virtual filesystems (tmpfs, FUSE) don't support fsync on
         # regular files. The rename below is still atomic at the FS layer.
-        log.debug("atomic_io: fsync(%s) raised %s — non-POSIX FS?", path, exc)
+        # NIT-6: include errno so DEBUG dumps disambiguate expected
+        # EINVAL/ENOTSUP from real I/O errors.
+        log.debug(
+            "atomic_io: fsync(%s) raised OSError (errno=%s, %s) — "
+            "non-POSIX FS?",
+            path, exc.errno, exc.strerror,
+        )
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -107,9 +127,15 @@ def _fsync_dir(directory: Path) -> None:
             os.fsync(fd)
         finally:
             os.close(fd)
-    except OSError:
-        # tmpfs / FUSE mounts (HF Jobs) raise EINVAL — swallow.
-        log.debug("atomic_io: fsync(dir=%s) raised OSError — non-POSIX FS?", directory)
+    except OSError as exc:
+        # NIT-6: log the concrete errno so DEBUG dumps can distinguish
+        # the expected EINVAL/ENOTSUP (tmpfs / FUSE mounts on HF Jobs)
+        # from real EIO/EBADF surfaces.
+        log.debug(
+            "atomic_io: fsync(dir=%s) raised OSError (errno=%s, %s) — "
+            "non-POSIX FS?",
+            directory, exc.errno, exc.strerror,
+        )
 
 
 def durable_rename(tmp: Path, final: Path) -> None:
@@ -129,6 +155,45 @@ def durable_rename(tmp: Path, final: Path) -> None:
     tmp = Path(tmp)
     final = Path(final)
     _fsync_file(tmp)
+    os.replace(tmp, final)
+    _fsync_dir(final.parent)
+
+
+def _durable_close_and_replace(fh, tmp: Path, final: Path) -> None:
+    """LOW-1 internal helper: flush + fsync(fileno) the open file handle,
+    then atomically replace and fsync the parent dir.
+
+    Used by writers that own their own file handle inline
+    (``atomic_npz_save``, ``atomic_json_save``, ``atomic_write_text``).
+    Reduces drift risk: any future tweak to the durable-write dance
+    lands in ONE place, not three.
+
+    The caller is responsible for closing ``fh`` after this returns (or
+    using a ``with`` block); this helper only flushes + fsyncs the
+    fileno before the kernel-level rename.
+    """
+    fh.flush()
+    os.fsync(fh.fileno())
+    # The caller's `with open(tmp) as fh:` block will close fh on
+    # exit; on POSIX, fsync()-then-close()-then-rename is durable in
+    # the same sense as fsync()-then-rename via O_RDONLY: the data
+    # blocks are on disk by the time replace runs.
+    # We delay the actual replace + parent-dir fsync until after the
+    # caller's context manager closes the handle, so callers must
+    # invoke this helper INSIDE the `with` block and the
+    # ``os.replace + _fsync_dir`` BELOW the `with`. (See
+    # ``_finalize_atomic_write`` for the post-close half.)
+
+
+def _finalize_atomic_write(tmp: Path, final: Path) -> None:
+    """LOW-1 internal helper: the post-close half of the durable-write
+    dance — ``os.replace(tmp, final)`` + ``_fsync_dir(final.parent)``.
+
+    Pair with :func:`_durable_close_and_replace` for writers that own
+    their own file handle. The two helpers together replace the
+    inline ``fh.flush() + os.fsync + os.replace + _fsync_dir`` triad
+    in ``atomic_npz_save`` / ``atomic_json_save`` / ``atomic_write_text``.
+    """
     os.replace(tmp, final)
     _fsync_dir(final.parent)
 
@@ -185,10 +250,8 @@ def atomic_npz_save(path: str | Path, **arrays: np.ndarray) -> Path:
     try:
         with open(tmp, "wb") as fh:
             np.savez_compressed(fh, **arrays)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        _fsync_dir(path.parent)
+            _durable_close_and_replace(fh, tmp, path)
+        _finalize_atomic_write(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -214,10 +277,8 @@ def atomic_json_save(
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(obj, fh, indent=indent, sort_keys=sort_keys)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        _fsync_dir(path.parent)
+            _durable_close_and_replace(fh, tmp, path)
+        _finalize_atomic_write(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -265,10 +326,8 @@ def atomic_write_text(path: str | Path, text: str, *, encoding: str = "utf-8") -
     try:
         with open(tmp, "w", encoding=encoding) as fh:
             fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        _fsync_dir(path.parent)
+            _durable_close_and_replace(fh, tmp, path)
+        _finalize_atomic_write(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise

@@ -41,7 +41,9 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 import torch
-from safetensors.torch import safe_open, save_file
+from safetensors.torch import safe_open
+
+from .atomic_io import atomic_json_save, atomic_safetensors_save
 
 log = logging.getLogger(__name__)
 
@@ -260,7 +262,6 @@ class ShardWriter:
         # name. atomic_safetensors_save does tmp+fsync+os.replace+
         # fsync(parent) so a torn write leaves the previous (good or
         # absent) final-path file untouched and a stale .tmp orphan.
-        from .atomic_io import atomic_safetensors_save
         atomic_safetensors_save(path, {_INPUT_KEY: x_in, _OUTPUT_KEY: x_out})
         self._shards.append(ShardEntry(path=name, rows=int(x_in.size(0))))
 
@@ -314,7 +315,6 @@ class ShardWriter:
             shared_path = self.out_dir / shared_name
             # F-H-1 (companion): same atomic-write protection as the
             # input shard above. See _write_input_shard rationale.
-            from .atomic_io import atomic_safetensors_save
             atomic_safetensors_save(shared_path, {_SHARED_KEY: x_shared})
 
     def finalize(self, *, split_ratio: float = 0.9, seed: int = 0) -> ShardManifest:
@@ -385,7 +385,6 @@ class ShardWriter:
         # Combined with F-H-1's per-shard atomic writes, the
         # manifest-last invariant for the heal-shards directory is
         # now durable end-to-end (Pattern O).
-        from .atomic_io import atomic_json_save
         atomic_json_save(
             path, manifest.to_json(), indent=2, sort_keys=True,
         )

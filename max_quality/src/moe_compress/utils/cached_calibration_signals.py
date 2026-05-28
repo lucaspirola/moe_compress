@@ -87,7 +87,6 @@ land in items V1+V2 + items 1-10 of the calibration-v2 campaign.
 from __future__ import annotations
 
 import logging
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -96,6 +95,10 @@ from typing import Any
 import numpy as np
 import torch
 
+from .atomic_io import (
+    atomic_npz_save as _shared_atomic_npz_save,
+    atomic_torch_save as _shared_atomic_torch_save,
+)
 from moe_compress.pipeline.context import PipelineContext
 from moe_compress.pipeline.plugin import BasePlugin
 
@@ -582,7 +585,6 @@ def _atomic_torch_save(payload: Any, path: Path) -> None:
     pre-MEDIUM-1 in-module callers; the shared helper is invoked with
     the new ``(path, payload)`` order it now requires.
     """
-    from .atomic_io import atomic_torch_save as _shared_atomic_torch_save
     _shared_atomic_torch_save(path, payload)
 
 
@@ -601,7 +603,6 @@ def _atomic_npz_save(arrays: dict[str, np.ndarray], path: Path) -> None:
     the file handle + parent dir for durability under power-loss /
     kernel-panic-class events.
     """
-    from .atomic_io import atomic_npz_save as _shared_atomic_npz_save
     _shared_atomic_npz_save(path, **arrays)
 
 

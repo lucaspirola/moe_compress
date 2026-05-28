@@ -243,10 +243,16 @@ def test_manifest_last_missing_manifest_raises(tmp_path):
 
 
 def test_manifest_last_torn_payload_detected_by_size(tmp_path):
-    """Simulate F-S3-1 / F-RK-1: a kill mid-write leaves a TRUNCATED .pt at
-    the final path. The manifest was written under a previous (whole) run
-    with the full size; after a truncating reset of the payload the
-    manifest's size_bytes no longer matches → reader fails loudly."""
+    """LOW-2: this test catches POST-write disk corruption / external
+    truncation of the payload (not a kill mid-write — atomic_torch_save's
+    tmp+rename + the manifest-last ordering already make a true mid-write
+    SIGKILL impossible to confuse with a complete write). The injected
+    truncation here simulates a payload that survives the writer's
+    fsync but is later truncated by an unrelated FS event (disk full,
+    quota hit, external tool); the manifest's recorded size_bytes still
+    pins the original whole-file size, so the reader's size check trips
+    and raises ManifestMismatchError instead of silently consuming a
+    half-truncated artifact."""
     payload = tmp_path / "big.pt"
     atomic_torch_save(payload, {"data": torch.arange(1024)})
     manifest = payload.with_suffix(".MANIFEST.json")
@@ -326,6 +332,64 @@ def test_manifest_last_requires_payload_exists(tmp_path):
     manifest = tmp_path / "missing.MANIFEST.json"
     with pytest.raises(FileNotFoundError):
         write_manifest_last(payload, manifest, schema_version=1)
+
+
+# ---------------------------------------------------------------------------
+# NIT-7 / NIT-8 / NIT-9: extra manifest edge-case coverage.
+# ---------------------------------------------------------------------------
+def test_manifest_last_compute_sha256_false_branch(tmp_path):
+    """NIT-7: ``compute_sha256=False`` writes a manifest with sha256=None
+    (skipping the multi-GB SHA-256 I/O). Reader's default validation
+    still passes — size + schema_version are enough — but
+    ``require_sha256=True`` then raises with an actionable message."""
+    payload = tmp_path / "p.pt"
+    atomic_torch_save(payload, {"data": 1})
+    manifest = payload.with_suffix(".MANIFEST.json")
+    write_manifest_last(payload, manifest, schema_version=1, compute_sha256=False)
+
+    raw = json.loads(manifest.read_text())
+    assert raw["sha256"] is None, "compute_sha256=False must record None"
+
+    # Default validation (require_sha256=False) succeeds.
+    out = read_and_validate_manifest(payload, manifest, expected_schema_version=1)
+    assert out["sha256"] is None
+
+    # Strict validation surfaces the no-sha256 manifest as a problem.
+    with pytest.raises(ManifestMismatchError, match="no sha256"):
+        read_and_validate_manifest(
+            payload, manifest, expected_schema_version=1, require_sha256=True,
+        )
+
+
+def test_manifest_last_require_sha256_with_null_sha_raises(tmp_path):
+    """NIT-8: a manifest emitted with compute_sha256=False has sha256=None.
+    Strict-validation callers (require_sha256=True) must get a loud
+    ManifestMismatchError; we MUST NOT compare ``None == actual_sha``
+    and silently pass."""
+    payload = tmp_path / "p.pt"
+    atomic_torch_save(payload, {"data": 1})
+    manifest = payload.with_suffix(".MANIFEST.json")
+    write_manifest_last(payload, manifest, schema_version=1, compute_sha256=False)
+
+    with pytest.raises(ManifestMismatchError, match="no sha256.*require_sha256=True"):
+        read_and_validate_manifest(
+            payload, manifest, expected_schema_version=1, require_sha256=True,
+        )
+
+
+def test_manifest_last_malformed_json_fails_loudly(tmp_path):
+    """NIT-9: a manifest file that exists but is unparseable JSON is
+    treated like a torn payload — ManifestMismatchError with the
+    "unreadable" message. Includes the json.JSONDecodeError as cause."""
+    payload = tmp_path / "p.pt"
+    atomic_torch_save(payload, {"data": 1})
+    manifest = payload.with_suffix(".MANIFEST.json")
+    # Write valid manifest first, then truncate to invalid JSON.
+    write_manifest_last(payload, manifest, schema_version=1)
+    manifest.write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(ManifestMismatchError, match="unreadable"):
+        read_and_validate_manifest(payload, manifest, expected_schema_version=1)
 
 
 # ---------------------------------------------------------------------------

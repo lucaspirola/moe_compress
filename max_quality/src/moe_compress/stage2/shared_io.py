@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 
 import torch
@@ -34,17 +33,22 @@ _HEAL_WEIGHTS_FORMAT_VERSION = 2
 def _durable_rename(tmp: Path, final: Path) -> None:
     """Fsync *tmp*, atomically rename it to *final*, then fsync the parent dir.
 
+    .. deprecated:: 2026-Q2
+       Use :func:`moe_compress.utils.atomic_io.durable_rename` directly.
+       This module-local symbol is preserved as a thin backward-compat
+       shim for the in-module callers below + any external import that
+       did ``from .shared_io import _durable_rename`` before the
+       audit/calibration-durability refactor. New call sites MUST
+       import the shared helper.
+
     Spec §11: durable write — fsync file bytes, then fsync parent dir entry,
     then atomic rename so a crash never leaves a truncated final file.
 
-    Backward-compat shim (audit/calibration-durability): delegates to the
-    shared :func:`utils.atomic_io.durable_rename`. Existing call sites
-    that ``from .shared_io import _durable_rename`` (or the in-module
-    callers below) continue to work unchanged. The shared helper uses
-    ``O_RDONLY`` for the file fsync rather than ``O_WRONLY|O_APPEND``;
-    POSIX requires fsync() to flush all buffered modifications on the
-    fd regardless of open mode, and O_RDONLY survives on FUSE mounts
-    (HF Jobs bucket) that reject opening a regular file O_WRONLY.
+    The shared helper uses ``O_RDONLY`` for the file fsync rather than
+    ``O_WRONLY|O_APPEND``; POSIX requires fsync() to flush all buffered
+    modifications on the fd regardless of open mode, and O_RDONLY
+    survives on FUSE mounts (HF Jobs bucket) that reject opening a
+    regular file O_WRONLY.
 
     Note: ``tmp`` must already be closed at the Python level (all
     userspace I/O buffers flushed to the kernel) before this call; the

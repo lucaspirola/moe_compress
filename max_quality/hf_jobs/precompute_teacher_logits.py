@@ -86,6 +86,38 @@ def _main() -> int:
     artifacts_dir = Path(args.artifacts_dir).expanduser()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+    # NIT-10: resume idempotency — if the .pt + MANIFEST.json already
+    # exist AND the manifest validates against the .pt, skip the
+    # ~45-min teacher forward entirely. Saves a full GPU-hour on
+    # spot-restart races. A torn .pt (no manifest, or manifest
+    # disagrees) falls through to a fresh compute as before.
+    out_path_pre = Path(args.output).expanduser()
+    manifest_path_pre = out_path_pre.with_suffix(
+        out_path_pre.suffix + ".MANIFEST.json"
+    )
+    if out_path_pre.exists() and manifest_path_pre.exists():
+        try:
+            from moe_compress.utils.atomic_io import (
+                ManifestMismatchError,
+                read_and_validate_manifest,
+            )
+            read_and_validate_manifest(
+                out_path_pre, manifest_path_pre, expected_schema_version=1,
+            )
+        except ManifestMismatchError as exc:
+            LOG.warning(
+                "precompute resume: existing cache failed manifest "
+                "validation (%s) — re-running full teacher forward.",
+                exc,
+            )
+        else:
+            LOG.info(
+                "precompute resume: cache + manifest already valid at %s — "
+                "skipping teacher forward (NIT-10 idempotency).",
+                out_path_pre,
+            )
+            return 0
+
     spec = spec_from_config(
         cal,
         num_sequences_override=s5["max_calibration_samples"],

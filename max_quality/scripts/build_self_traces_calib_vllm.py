@@ -77,6 +77,7 @@ downstream pipeline integration (Stage 2.5 router-KD consumes the JSONL
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import logging
@@ -564,6 +565,59 @@ def _synth_teacher_forced_rows(
             # rows.
             "completion_source": "canonical",
         }
+
+
+# ---------------------------------------------------------------------------
+# Free helpers — exposed at module scope so unit tests can exercise them
+# without spinning up the full vLLM pipeline. (NIT-4 / LOW-4 fold.)
+# ---------------------------------------------------------------------------
+def _ckpt_counter_check(
+    signal_name: str,
+    loaded_prompts: int,
+    already_done: int,
+    ckpt_path: "Path",
+    *,
+    allow_counter_divergence: bool,
+    log_: logging.Logger | None = None,
+) -> None:
+    """F-H-6 enforcement, extracted to module scope (NIT-4 / LOW-4).
+
+    Hard-fail (default) or WARN-only (with ``allow_counter_divergence=True``)
+    when an accumulator checkpoint and the JSONL row count disagree. The
+    function is pure — it takes counts + flags as args and raises
+    ``ValueError`` on a hard fail. The in-``main`` closure
+    ``_check_ckpt_counter`` (kept for backward-compat with the existing
+    call sites that already capture ``args`` and ``already_done`` from
+    the enclosing scope) now forwards to this free function.
+
+    Raises:
+        ValueError: when loaded_prompts != already_done and
+            allow_counter_divergence is False. Message includes the
+            checkpoint path so operators know what to delete.
+    """
+    if loaded_prompts == already_done:
+        return
+    msg = (
+        f"{signal_name}: checkpoint has {loaded_prompts} prompts "
+        f"but JSONL has {already_done} rows. A SIGKILL between "
+        f"JSONL flush and the next ckpt dump silently undercounts "
+        f"the accumulator (the JSONL claims more prompts than the "
+        f"accumulator saw)."
+    )
+    if allow_counter_divergence:
+        (log_ or log).warning(
+            "%s Proceeding with the smaller counter "
+            "(--allow-counter-divergence is set). Sidecar will be "
+            "computed over a SUBSET of the calibration data.",
+            msg,
+        )
+        return
+    raise ValueError(
+        f"{msg} Delete the checkpoint file ({ckpt_path}) so the "
+        "accumulator restarts from zero and re-walks the prompts "
+        "from this run's resume base, OR re-run with "
+        "--allow-counter-divergence to tolerate the under-count."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1239,43 +1293,18 @@ def main() -> int:
     ) -> None:
         """F-H-6 enforcement: hard-fail on JSONL/ckpt counter divergence.
 
-        On resume, every accumulator-checkpoint loader reports the number
-        of prompts whose forward-pass data made it into the .ckpt. The
-        JSONL row count (``already_done``) is the number of prompts
-        whose row was flushed. A SIGKILL between JSONL flush and the
-        next .ckpt dump leaves loaded_prompts < already_done — and
-        ``prompts = prompts[already_done:]`` then SKIPS the chunks whose
-        data the accumulator needs, silently UNDERCOUNTING the sidecar.
-
-        Default behavior (audit/calibration-durability fix): raise
-        ``ValueError`` with an actionable instruction to delete the
-        affected .ckpt and re-run; the accumulator restarts from zero
-        and re-walks all prompts since the resume base, restoring
-        coverage. Pass ``--allow-counter-divergence`` to downgrade to
-        the legacy WARNING-only flow.
+        Thin wrapper over the module-level :func:`_ckpt_counter_check`
+        (NIT-4 / LOW-4 extraction); preserves the closure semantics so
+        existing call sites that already capture ``already_done`` +
+        ``args.allow_counter_divergence`` from the enclosing scope keep
+        working without modification.
         """
-        if loaded_prompts == already_done:
-            return
-        msg = (
-            f"{signal_name}: checkpoint has {loaded_prompts} prompts "
-            f"but JSONL has {already_done} rows. A SIGKILL between "
-            f"JSONL flush and the next ckpt dump silently undercounts "
-            f"the accumulator (the JSONL claims more prompts than the "
-            f"accumulator saw)."
-        )
-        if args.allow_counter_divergence:
-            log.warning(
-                "%s Proceeding with the smaller counter "
-                "(--allow-counter-divergence is set). Sidecar will be "
-                "computed over a SUBSET of the calibration data.",
-                msg,
-            )
-            return
-        raise ValueError(
-            f"{msg} Delete the checkpoint file ({ckpt_path}) so the "
-            "accumulator restarts from zero and re-walks the prompts "
-            "from this run's resume base, OR re-run with "
-            "--allow-counter-divergence to tolerate the under-count."
+        _ckpt_counter_check(
+            signal_name,
+            loaded_prompts,
+            already_done,
+            ckpt_path,
+            allow_counter_divergence=args.allow_counter_divergence,
         )
 
     # --- imatrix accumulator setup (pre-CUDA-graph) ---------------------
@@ -1723,14 +1752,22 @@ def main() -> int:
             try:
                 f.flush()
                 os.fsync(f.fileno())
-            except OSError:
-                # FUSE / tmpfs may reject fsync on regular files; flush
-                # alone is the best we can do there. Logging at DEBUG so
-                # production runs on real ext4/xfs don't see noise.
+            except OSError as exc:
+                # LOW-3: narrow the swallow to errno {EINVAL, ENOTSUP}.
+                # FUSE / tmpfs reject fsync on regular files with these
+                # errnos; any OTHER OSError (EIO, ENOSPC, EBADF) is a
+                # real problem the JSONL caller must see immediately
+                # rather than waiting for the next pdflush cycle to
+                # surface the loss.
+                if exc.errno not in (errno.EINVAL, errno.ENOTSUP):
+                    raise
+                # Logging at DEBUG so production runs on real ext4/xfs
+                # don't see noise.
                 log.debug(
-                    "F-H-5: fsync(jsonl_fd) raised OSError — non-POSIX "
-                    "filesystem (HF Jobs FUSE mount?); relying on rename "
-                    "atomicity instead."
+                    "F-H-5: fsync(jsonl_fd) raised OSError (errno=%s) — "
+                    "non-POSIX filesystem (HF Jobs FUSE mount?); relying "
+                    "on rename atomicity instead.",
+                    exc.errno,
                 )
 
             total_done = already_done + n_new
