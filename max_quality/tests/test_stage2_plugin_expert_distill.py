@@ -28,6 +28,12 @@ from moe_compress.stage2.plugins.expert_distill import (
 
 # Default knob set for a constructed (live) plugin. Mirrors the
 # ``expert_distill_*`` block of ``stage2_reap_ream.run()``.
+#
+# Lift 1 (D-expert-distill-ce-term): the production default for
+# ``expert_distill_use_ce_term`` is True, but these defaults pin it to
+# False so the existing byte-equivalence test (which references
+# ``_distill_merged_group`` directly without CE) stays identical.
+# Dedicated tests for the CE path are below.
 _DISTILL_KNOBS = dict(
     expert_distill_steps=0,
     expert_distill_lr=1e-4,
@@ -36,6 +42,8 @@ _DISTILL_KNOBS = dict(
     expert_distill_skip_singletons=True,
     expert_distill_plateau_steps=2,
     expert_distill_plateau_eps=1e-4,
+    expert_distill_use_ce_term=False,
+    expert_distill_ce_lambda=1.0,
 )
 
 
@@ -245,6 +253,141 @@ def test_distill_on_path_matches_reference(tiny_model):
         assert torch.equal(plug_banks[name].get(0), ref_weights[name]), (
             f"plugin-path bank weight {name} diverged from the "
             f"_distill_merged_group reference"
+        )
+
+
+# --- Lift 1: CE term (D-expert-distill-ce-term, paper Eq. 10) ------------
+def test_plugin_defaults_ce_term_on():
+    """Production default per Lift 1 spec: ``expert_distill_use_ce_term``
+    defaults to True on the plugin (callers may override to False for
+    v1-back-compat / A0..A11 ablation parity)."""
+    knobs = dict(_DISTILL_KNOBS)
+    knobs.pop("expert_distill_use_ce_term", None)
+    knobs.pop("expert_distill_ce_lambda", None)
+    plugin = ExpertDistillPlugin(**knobs)
+    assert plugin.expert_distill_use_ce_term is True
+    assert plugin.expert_distill_ce_lambda == 1.0
+
+
+def test_distill_ce_term_changes_loss_value(tiny_model):
+    """Enabling the CE term should produce a strictly different total
+    loss vs. pure MSE on identical inputs (same init, same tokens, same
+    optimizer) — guards against an accidental no-op CE."""
+    from moe_compress.utils.model_io import iter_moe_layers, build_banks
+
+    layer_inputs = torch.randn(
+        16, list(iter_moe_layers(tiny_model))[0].experts_module.hidden_dim
+    ) * 0.1
+    freq = {0: 3, 1: 1}
+
+    # --- run 1: pure MSE -------------------------------------------------
+    m1 = copy.deepcopy(tiny_model)
+    l1 = list(iter_moe_layers(m1))[0]
+    pre1 = _snapshot_pre_merge_layer_experts(l1)
+    state_mse = _distill_merged_group(
+        layer_ref=l1, centroid_id=0, members=[0, 1], freq=freq,
+        pre_merge_weights=pre1, layer_inputs=layer_inputs.clone(),
+        steps=4, lr=5e-3, betas=(0.9, 0.95),
+        plateau_steps=100, plateau_eps=0.0,
+        token_cap=16, device=torch.device("cpu"),
+        use_ce_term=False,
+    )
+
+    # --- run 2: CE + MSE -------------------------------------------------
+    m2 = copy.deepcopy(tiny_model)
+    l2 = list(iter_moe_layers(m2))[0]
+    pre2 = _snapshot_pre_merge_layer_experts(l2)
+    state_ce = _distill_merged_group(
+        layer_ref=l2, centroid_id=0, members=[0, 1], freq=freq,
+        pre_merge_weights=pre2, layer_inputs=layer_inputs.clone(),
+        steps=4, lr=5e-3, betas=(0.9, 0.95),
+        plateau_steps=100, plateau_eps=0.0,
+        token_cap=16, device=torch.device("cpu"),
+        use_ce_term=True, ce_lambda=1.0,
+    )
+
+    # CE term is additive on top of MSE, so the composite loss must differ
+    # from the pure-MSE loss. (Either direction is acceptable — the test
+    # only guards against the CE branch being a silent no-op.)
+    assert state_ce["final_loss"] != state_mse["final_loss"]
+    # Both runs trained the same number of steps (no early plateau-break).
+    assert state_ce["steps"] == state_mse["steps"] == 4
+
+    # Bank weights diverge — CE pushes the centroid in a different
+    # direction than MSE alone.
+    b1 = build_banks(l1)
+    b2 = build_banks(l2)
+    assert not torch.equal(b1["gate_proj"].get(0), b2["gate_proj"].get(0))
+
+
+def test_distill_ce_lambda_zero_silences_mse(tiny_model):
+    """``ce_lambda=0`` with ``use_ce_term=True`` runs CE-only (MSE term
+    silenced) — provides a clean ablation point for the λ knob."""
+    from moe_compress.utils.model_io import iter_moe_layers
+
+    m = copy.deepcopy(tiny_model)
+    layer_ref = list(iter_moe_layers(m))[0]
+    pre = _snapshot_pre_merge_layer_experts(layer_ref)
+    layer_inputs = torch.randn(8, layer_ref.experts_module.hidden_dim) * 0.1
+
+    state = _distill_merged_group(
+        layer_ref=layer_ref, centroid_id=0, members=[0, 1], freq={0: 1, 1: 1},
+        pre_merge_weights=pre, layer_inputs=layer_inputs,
+        steps=5, lr=5e-3, betas=(0.9, 0.95),
+        plateau_steps=100, plateau_eps=0.0,
+        token_cap=8, device=torch.device("cpu"),
+        use_ce_term=True, ce_lambda=0.0,
+    )
+    # CE-only must still produce a finite loss (KL on near-identical
+    # softmaxed features can produce tiny negative values from fp32
+    # numerical noise — guard finiteness, not strict positivity).
+    import math
+    assert state["steps"] == 5
+    assert state["final_loss"] is not None
+    assert math.isfinite(state["final_loss"])
+
+
+def test_distill_ce_off_path_byte_identical_to_pre_lift(tiny_model):
+    """Back-compat guard: ``use_ce_term=False`` (Lift 1 default OFF in
+    the helper signature) MUST yield bit-identical bank weights to a run
+    that does not pass the CE kwargs at all. Ensures Lift 1 did not
+    introduce a hidden behavior change on the OFF path."""
+    from moe_compress.utils.model_io import iter_moe_layers, build_banks
+
+    layer_inputs = torch.randn(
+        16, list(iter_moe_layers(tiny_model))[0].experts_module.hidden_dim
+    ) * 0.1
+    freq = {0: 3, 1: 1}
+
+    m1 = copy.deepcopy(tiny_model)
+    l1 = list(iter_moe_layers(m1))[0]
+    pre1 = _snapshot_pre_merge_layer_experts(l1)
+    _distill_merged_group(
+        layer_ref=l1, centroid_id=0, members=[0, 1], freq=freq,
+        pre_merge_weights=pre1, layer_inputs=layer_inputs.clone(),
+        steps=4, lr=5e-3, betas=(0.9, 0.95),
+        plateau_steps=100, plateau_eps=0.0,
+        token_cap=16, device=torch.device("cpu"),
+    )  # NO CE kwargs
+
+    m2 = copy.deepcopy(tiny_model)
+    l2 = list(iter_moe_layers(m2))[0]
+    pre2 = _snapshot_pre_merge_layer_experts(l2)
+    _distill_merged_group(
+        layer_ref=l2, centroid_id=0, members=[0, 1], freq=freq,
+        pre_merge_weights=pre2, layer_inputs=layer_inputs.clone(),
+        steps=4, lr=5e-3, betas=(0.9, 0.95),
+        plateau_steps=100, plateau_eps=0.0,
+        token_cap=16, device=torch.device("cpu"),
+        use_ce_term=False, ce_lambda=1.0,  # explicit OFF
+    )
+
+    b1 = build_banks(l1)
+    b2 = build_banks(l2)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        assert torch.equal(b1[name].get(0), b2[name].get(0)), (
+            f"OFF-path with explicit use_ce_term=False diverged from the "
+            f"unspecified-kwargs path on bank weight {name}"
         )
 
 

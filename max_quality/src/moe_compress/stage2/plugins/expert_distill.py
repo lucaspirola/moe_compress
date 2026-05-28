@@ -87,6 +87,34 @@ sees a model whose merged centroids are already distilled — its job
 becomes purely router calibration on top of pre-distilled experts,
 not expert recovery (see § 5.5 of the Stage 2.5 plugin's docstring).**
 
+Deviation: D-expert-distill-ce-term (Lift 1, paper Eq. 10)
+----------------------------------------------------------
+MoE-Pruner Eq. 10 (paper line 394) is
+
+    L_KD = L_CE + λ · L_expert = L_CE + λ · Σ_{j,i} MSE(E_i^{j,t}, E_i^{j,s})
+
+with ``L_CE`` the standard cross-entropy loss (paper line 410:
+"LCE is the cross entropy loss") and ``λ`` "a weighting coefficient and
+initialized based on the strength of cross entropy loss and expert-wise
+knowledge distillation loss" (paper line 414). The paper's ``L_CE`` is
+the LM next-token cross-entropy from the end-to-end fine-tune; this
+plugin runs PER-LAYER PER-GROUP with no LM-head / labels in scope, so
+the faithful adaptation is a **feature-level KL** between the
+``softmax``-normalized teacher signal (the pre-merge group-member
+additive forward — the SAME tensor the MSE term targets, already in
+scope via ``pre_merge_weights``) and the ``log_softmax``-normalized
+student (the merged centroid forward). Reduction is ``batchmean`` over
+tokens.
+
+Config knobs (Pattern C — consumed verbatim, no implicit coupling):
+- ``expert_distill_use_ce_term`` (default True post-lift, False on
+  v1-back-compat / A0..A11 ablation): when False the per-step loss is
+  pure MSE, byte-identical to pre-lift behavior at the optimizer
+  level.
+- ``expert_distill_ce_lambda`` (default 1.0): paper's λ. Parity
+  weighting between CE and MSE; tune via config since the paper does
+  not pin a numeric default.
+
 Deviation: D-expert-distill-mse-v1
 ----------------------------------
 The contract above is the *target*. The v1 implementation in
@@ -166,6 +194,35 @@ log = logging.getLogger(__name__)
 # ===========================================================================
 
 
+def _feature_kl_ce(
+    student: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    """Per-token soft-KL between ``softmax(target)`` and
+    ``log_softmax(student)`` over the hidden dim.
+
+    Per-layer per-group adaptation of paper Eq. 10's ``L_CE`` term:
+    the paper computes ``L_CE`` as the LM next-token cross-entropy on
+    the end-to-end fine-tune (paper line 410: "LCE is the cross
+    entropy loss"); per-layer per-group has no LM head / labels in
+    scope, so the natural adaptation is a feature-level KL between
+    the teacher (pre-merge group-member forward) and the student
+    (merged centroid forward) on the same per-token tensors.
+
+    Reduction: ``batchmean`` over tokens, matching torch's
+    ``F.kl_div`` convention. Returns a 0-D tensor.
+
+    Both tensors are ``(T, hidden)`` float32. The function is
+    invariant to constant shifts of either argument's last dim (KL on
+    softmaxed distributions). Numerical stability comes from
+    ``log_softmax`` on the student side; the teacher softmax is
+    ``no_grad`` because the target is a constant w.r.t. the optimizer.
+    """
+    with torch.no_grad():
+        p_teacher = F.softmax(target, dim=-1)
+    log_p_student = F.log_softmax(student, dim=-1)
+    return F.kl_div(log_p_student, p_teacher, reduction="batchmean")
+
+
 def _snapshot_pre_merge_layer_experts(
     layer_ref: MoELayerRef,
 ) -> dict[int, dict[str, torch.Tensor]]:
@@ -210,9 +267,12 @@ def _distill_merged_group(
     plateau_eps: float,
     token_cap: int,
     device: torch.device,
+    use_ce_term: bool = False,
+    ce_lambda: float = 1.0,
 ) -> dict:
-    """500-step MSE distillation of the merged centroid against the
-    freq-weighted pre-merge group-member forward (spec § 5 step 7b / M8).
+    """500-step MSE (+ optional CE) distillation of the merged centroid
+    against the freq-weighted pre-merge group-member forward
+    (spec § 5 step 7b / M8).
 
     **v1 simplification — see D-expert-distill-mse-v1 in spec § 10**: this
     implementation differs from the pinned spec target in two ways:
@@ -222,6 +282,31 @@ def _distill_merged_group(
          for every group, not the routing-restricted ``X_g`` set.
     Phase 3 v2 will lift both. The v1 form provides a correctly-signed
     merge-error gradient on a uniform-token sample.
+
+    Lift 1 — CE term (D-expert-distill-ce-term, paper Eq. 10)
+    --------------------------------------------------------
+    When ``use_ce_term=True`` (default OFF at this helper for back-compat;
+    production default ON via the plugin __init__), the per-step loss is
+        ``loss = L_CE + ce_lambda · MSE(student, target)``
+    where ``L_CE`` is a per-token soft-KL between
+    ``softmax(target)`` and ``log_softmax(student)`` over the hidden
+    dim — the per-layer adaptation of MoE-Pruner's Eq. 10
+    ``L_KD = L_CE + λ · L_expert`` (paper line 394; "LCE is the cross
+    entropy loss" line 410). The paper's ``L_CE`` is the LM next-token
+    cross-entropy from the end-to-end fine-tune; this distillation runs
+    PER-LAYER PER-GROUP with no LM-head / labels in scope, so a
+    feature-level KL on the same MSE-scope tokens is the closest faithful
+    adaptation: the teacher signal is the pre-merge group-member forward
+    (the same ``target`` the MSE term uses, already exposed via
+    ``pre_merge_weights`` in ctx). Documented as a deviation rather than
+    a hidden simplification — see ``D-expert-distill-ce-term`` in the
+    module docstring.
+
+    ``ce_lambda`` defaults to 1.0; the paper says "λ is a weighting
+    coefficient and initialized based on the strength of cross entropy
+    loss and expert-wise knowledge distillation loss" (line 414) without
+    pinning a numeric default. The 1.0 default preserves the MSE
+    magnitude verbatim and weights CE at parity — tune via config.
 
     Returns a small state dict with the final loss, step count, and break
     reason. The optimizer state is NOT persisted — resume re-runs the
@@ -291,9 +376,20 @@ def _distill_merged_group(
     # update — optimistically biased. The fp32 no-grad forward below is
     # the true distillation starting point (post-merge centroid vs.
     # freq-weighted target on the same token batch).
+    #
+    # Lift 1: when ``use_ce_term=True`` the baseline includes the CE
+    # term too so ``relative_loss = final / initial`` measures the same
+    # composite quantity the optimizer is actually minimizing. Plateau
+    # threshold semantics are unchanged.
     with torch.no_grad():
         student0 = _swiglu_forward(p_gate, p_up, p_down, x_all)
-        initial_loss = max(float(F.mse_loss(student0, target).item()), 1e-12)
+        mse0 = F.mse_loss(student0, target)
+        if use_ce_term:
+            ce0 = _feature_kl_ce(student0, target)
+            loss0 = ce0 + ce_lambda * mse0
+        else:
+            loss0 = mse0
+        initial_loss = max(float(loss0.item()), 1e-12)
 
     plateau_counter = 0
     last_step = 0
@@ -303,7 +399,19 @@ def _distill_merged_group(
     for step in range(steps):
         optim.zero_grad(set_to_none=True)
         student = _swiglu_forward(p_gate, p_up, p_down, x_all)
-        loss = F.mse_loss(student, target)
+        mse_loss = F.mse_loss(student, target)
+        if use_ce_term:
+            # Paper Eq. 10: ``L_KD = L_CE + λ · L_expert`` (line 394).
+            # ``L_expert`` is the per-expert MSE (the ``mse_loss`` above
+            # against the freq-weighted / TopK-gated target per the
+            # active v1/v2 path); ``L_CE`` is the paper's cross-entropy
+            # term, adapted to the per-layer per-group scope as a
+            # feature-level KL (see ``D-expert-distill-ce-term``). The
+            # arithmetic combination follows the paper's formula verbatim.
+            ce_loss = _feature_kl_ce(student, target)
+            loss = ce_loss + ce_lambda * mse_loss
+        else:
+            loss = mse_loss
         loss.backward()
         optim.step()
         last_step = step + 1
@@ -366,20 +474,24 @@ class ExpertDistillPlugin:
 
     name = "expert_distill"
     paper = (
-        "Per-merge-group MSE distillation against routing-gated original "
-        "outputs. Inspired by MoE-Pruner arXiv:2410.12013 (expert-wise MSE, "
-        "Eq. 10; paper-cited repo github.com/yanyue-xie/moe-pruner is 404 — "
-        "closest third-party re-implementation is github.com/tanganke/"
-        "fusion_bench under fusion_bench/method/moe_pruner/, but it ships "
-        "only the pruning pass and NO distillation code, so Eq. 10 has no "
-        "public reference implementation) and SlimMoE arXiv:2506.18349 "
-        "(top-8 logits KL on full model output, Eq. 3) — no project-aligned "
-        "per-merge-group code in either. REAM baseline arXiv:2604.04356 has "
-        "no post-merge distill. Deviations: D-expert-distill-mse (per-group "
-        "additive target against pre-merge members; expert/router training "
+        "Per-merge-group MSE (+ optional CE) distillation against "
+        "routing-gated original outputs. Inspired by MoE-Pruner "
+        "arXiv:2410.12013 (expert-wise MSE, Eq. 10; paper-cited repo "
+        "github.com/yanyue-xie/moe-pruner is 404 — closest third-party "
+        "re-implementation is github.com/tanganke/fusion_bench under "
+        "fusion_bench/method/moe_pruner/, but it ships only the pruning "
+        "pass and NO distillation code, so Eq. 10 has no public reference "
+        "implementation) and SlimMoE arXiv:2506.18349 (top-8 logits KL "
+        "on full model output, Eq. 3) — no project-aligned per-merge-group "
+        "code in either. REAM baseline arXiv:2604.04356 has no post-merge "
+        "distill. Deviations: D-expert-distill-mse (per-group additive "
+        "target against pre-merge members; expert/router training "
         "separated), D-expert-distill-mse-v1 (freq-weighted target + "
-        "reservoir tokens — drops TopK gate AND per-token routing weight). "
-        "See module docstring."
+        "reservoir tokens — drops TopK gate AND per-token routing weight), "
+        "D-expert-distill-ce-term (Lift 1: paper Eq. 10's L_CE term "
+        "adapted to per-layer per-group as a feature-level KL between "
+        "pre-merge teacher softmax and merged-student log-softmax — "
+        "default ON). See module docstring."
     )
     config_key = "stage2_reap_ream.expert_distill_steps"
     # S2-11 LIVE: pre_merge_snapshot reads layer_ref and writes
@@ -401,6 +513,8 @@ class ExpertDistillPlugin:
         expert_distill_skip_singletons: bool,
         expert_distill_plateau_steps: int,
         expert_distill_plateau_eps: float,
+        expert_distill_use_ce_term: bool = True,
+        expert_distill_ce_lambda: float = 1.0,
     ) -> None:
         """Store every distill knob the live hooks read.
 
@@ -408,6 +522,19 @@ class ExpertDistillPlugin:
         ``LegacyAdapter.__init__`` exactly — no logic in ``__init__``, just a
         faithful re-host of the local variables the distill code read off
         ``self`` in the pre-S2-11 adapter.
+
+        Lift 1 additions (D-expert-distill-ce-term):
+        - ``expert_distill_use_ce_term`` (default True): when True,
+          per-step loss is ``L_CE + ce_lambda · MSE`` per paper Eq. 10
+          (paper line 394); when False, runs pure MSE (v1 back-compat
+          / A0..A11 ablation parity). Pattern C config-validation: the
+          knob is consumed verbatim, no implicit coupling.
+        - ``expert_distill_ce_lambda`` (default 1.0): the λ from paper
+          Eq. 10. Paper line 414 says "λ is a weighting coefficient and
+          initialized based on the strength of cross entropy loss and
+          expert-wise knowledge distillation loss" — no numeric default
+          pinned, so we use 1.0 (parity weighting) as the safe ON-path
+          starting point.
         """
         self.expert_distill_steps = expert_distill_steps
         self.expert_distill_lr = expert_distill_lr
@@ -416,6 +543,8 @@ class ExpertDistillPlugin:
         self.expert_distill_skip_singletons = expert_distill_skip_singletons
         self.expert_distill_plateau_steps = expert_distill_plateau_steps
         self.expert_distill_plateau_eps = expert_distill_plateau_eps
+        self.expert_distill_use_ce_term = expert_distill_use_ce_term
+        self.expert_distill_ce_lambda = expert_distill_ce_lambda
 
     def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.expert_distill_steps`` > 0.
@@ -506,6 +635,8 @@ class ExpertDistillPlugin:
                         plateau_eps=self.expert_distill_plateau_eps,
                         token_cap=self.expert_distill_token_cap,
                         device=target_device,
+                        use_ce_term=self.expert_distill_use_ce_term,
+                        ce_lambda=self.expert_distill_ce_lambda,
                     )
                     distill_state[centroid] = state
                 log.info(

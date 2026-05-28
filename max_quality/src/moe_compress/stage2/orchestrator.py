@@ -1030,10 +1030,21 @@ def run(
     expert_distill_skip_singletons: bool = bool(s2.get("expert_distill_skip_singletons", True))
     expert_distill_plateau_steps: int = int(s2.get("expert_distill_loss_plateau_steps", 50))
     expert_distill_plateau_eps: float = float(s2.get("expert_distill_loss_plateau_eps", 1e-4))
+    # Lift 1 — D-expert-distill-ce-term: paper Eq. 10's L_KD = L_CE + λ · MSE.
+    # Defaults: CE ON (default True post-lift), λ = 1.0 (paper line 414 does not
+    # pin a numeric default; parity weighting is the safe ON-path starting point).
+    expert_distill_use_ce_term: bool = bool(s2.get("expert_distill_use_ce_term", True))
+    expert_distill_ce_lambda: float = float(s2.get("expert_distill_ce_lambda", 1.0))
     if expert_distill_steps < 0:
         raise ValueError(
             f"stage2_reap_ream.expert_distill_steps={expert_distill_steps}; "
             "must be >= 0 (set 0 to disable)."
+        )
+    if expert_distill_ce_lambda < 0.0:
+        raise ValueError(
+            f"stage2_reap_ream.expert_distill_ce_lambda="
+            f"{expert_distill_ce_lambda}; must be >= 0 (set 0 to silence "
+            "the MSE term while still running CE)."
         )
     # cost_asymmetric × freq_weighted_merge invariant is checked at the very
     # top of run() (fail-fast); we rely on that here.
@@ -1055,6 +1066,8 @@ def run(
         "stage2/config/expert_distill_steps": expert_distill_steps,
         "stage2/config/expert_distill_token_cap": expert_distill_token_cap,
         "stage2/config/expert_distill_lr": expert_distill_lr,
+        "stage2/config/expert_distill_use_ce_term": expert_distill_use_ce_term,
+        "stage2/config/expert_distill_ce_lambda": expert_distill_ce_lambda,
         "stage2/config/sinkhorn_iters": sinkhorn_iters,
         "stage2/config/merge_step": merge_step,
         "stage2/config/format_version": 2,
@@ -1286,6 +1299,8 @@ def run(
             expert_distill_skip_singletons=expert_distill_skip_singletons,
             expert_distill_plateau_steps=expert_distill_plateau_steps,
             expert_distill_plateau_eps=expert_distill_plateau_eps,
+            expert_distill_use_ce_term=expert_distill_use_ce_term,
+            expert_distill_ce_lambda=expert_distill_ce_lambda,
         ),
         MergeHealPlugin(
             heal_cfg=heal_cfg,
