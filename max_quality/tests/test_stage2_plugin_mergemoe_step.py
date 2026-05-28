@@ -295,7 +295,7 @@ def test_merge_experts_inplace_invalid_merge_step_raises(tiny_model):
 # ---------------------------------------------------------------------------
 
 
-def test_mergemoe_cond_threshold_fallback_warns_and_falls_back(caplog):
+def test_mergemoe_cond_threshold_fallback_warns_and_falls_back(capsys):
     """When cond(P) > 1e8 the helper falls back to freq-weighted down + WARNs."""
     torch.manual_seed(4)
     d_hidden, d_int = 4, 3
@@ -308,14 +308,21 @@ def test_mergemoe_cond_threshold_fallback_warns_and_falls_back(caplog):
     x1 = torch.randn(1, d_hidden)
     X_hat = x1.repeat(8, 1)
 
-    with caplog.at_level(logging.WARNING, logger="moe_compress.stage2.mergemoe"):
-        out = _mergemoe_compute_merged_down(
-            member_gates=W_G, member_ups=W_U, member_downs=W_D,
-            weights=b, layer_inputs=X_hat, token_cap=8, seed=0,
-        )
+    # Ensure the moe_compress.stage2.mergemoe logger reaches stderr.
+    # Some full-suite imports configure loggers to bypass `caplog`; assert
+    # against the captured stderr instead (where log.warning ends up via the
+    # default StreamHandler chain).
+    out = _mergemoe_compute_merged_down(
+        member_gates=W_G, member_ups=W_U, member_downs=W_D,
+        weights=b, layer_inputs=X_hat, token_cap=8, seed=0,
+    )
 
-    cond_records = [r for r in caplog.records if "cond" in r.message.lower()]
-    assert cond_records, f"expected cond-fallback WARNING, got: {caplog.records}"
+    captured = capsys.readouterr()
+    assert (
+        "cond(P)=" in captured.err and "D-mergemoe-cond-fallback" in captured.err
+    ), (
+        f"expected cond-fallback WARNING in captured stderr, got: {captured.err!r}"
+    )
 
     # Falls back to freq-weighted down.
     expected_freq = b[0] * W_D[0] + b[1] * W_D[1]
