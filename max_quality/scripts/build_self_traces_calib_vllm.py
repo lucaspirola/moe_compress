@@ -628,6 +628,23 @@ def main() -> int:
     p.add_argument("--no-cache-suffix", action="store_true")
     p.add_argument("--resume", action="store_true",
                    help="Skip prompts that already have rows in the .tmp file.")
+    p.add_argument(
+        "--allow-counter-divergence",
+        action="store_true", default=False,
+        help=(
+            "F-H-6 escape hatch: by default, when an accumulator "
+            "checkpoint's prompt counter disagrees with the JSONL row "
+            "count on resume (indicating SIGKILL between JSONL flush "
+            "and ckpt dump → silently-undercounted accumulator), the "
+            "script hard-fails with a ValueError instructing the "
+            "operator to delete the affected .ckpt file and re-run. "
+            "Passing this flag downgrades that to a WARNING and "
+            "proceeds with the smaller counter — the legacy behavior. "
+            "Recommended ONLY for ablation sweeps where minor "
+            "under-counting is tolerable; production runs should "
+            "keep the default hard-fail."
+        ),
+    )
     p.add_argument("--prev-num-prompts", type=int, default=0,
                    help="Per-subset extension mode: yield ONLY the prompts that "
                         "an earlier --num-prompts=N run would NOT have yielded. "
@@ -1215,6 +1232,52 @@ def main() -> int:
     or_ckpt_path = None
     bo_ckpt_path = None
 
+    def _check_ckpt_counter(
+        signal_name: str,
+        loaded_prompts: int,
+        ckpt_path: "Path",
+    ) -> None:
+        """F-H-6 enforcement: hard-fail on JSONL/ckpt counter divergence.
+
+        On resume, every accumulator-checkpoint loader reports the number
+        of prompts whose forward-pass data made it into the .ckpt. The
+        JSONL row count (``already_done``) is the number of prompts
+        whose row was flushed. A SIGKILL between JSONL flush and the
+        next .ckpt dump leaves loaded_prompts < already_done — and
+        ``prompts = prompts[already_done:]`` then SKIPS the chunks whose
+        data the accumulator needs, silently UNDERCOUNTING the sidecar.
+
+        Default behavior (audit/calibration-durability fix): raise
+        ``ValueError`` with an actionable instruction to delete the
+        affected .ckpt and re-run; the accumulator restarts from zero
+        and re-walks all prompts since the resume base, restoring
+        coverage. Pass ``--allow-counter-divergence`` to downgrade to
+        the legacy WARNING-only flow.
+        """
+        if loaded_prompts == already_done:
+            return
+        msg = (
+            f"{signal_name}: checkpoint has {loaded_prompts} prompts "
+            f"but JSONL has {already_done} rows. A SIGKILL between "
+            f"JSONL flush and the next ckpt dump silently undercounts "
+            f"the accumulator (the JSONL claims more prompts than the "
+            f"accumulator saw)."
+        )
+        if args.allow_counter_divergence:
+            log.warning(
+                "%s Proceeding with the smaller counter "
+                "(--allow-counter-divergence is set). Sidecar will be "
+                "computed over a SUBSET of the calibration data.",
+                msg,
+            )
+            return
+        raise ValueError(
+            f"{msg} Delete the checkpoint file ({ckpt_path}) so the "
+            "accumulator restarts from zero and re-walks the prompts "
+            "from this run's resume base, OR re-run with "
+            "--allow-counter-divergence to tolerate the under-count."
+        )
+
     # --- imatrix accumulator setup (pre-CUDA-graph) ---------------------
     # The imatrix module must pre-allocate accumulator tensors for every
     # LinearBase / ParallelLMHead instance BEFORE the first captured
@@ -1234,29 +1297,17 @@ def main() -> int:
                 loaded_prompts = _im.load_imatrix_checkpoint(
                     str(imatrix_ckpt_path),
                 )
-                if loaded_prompts != already_done:
-                    # JSONL/checkpoint divergence. Two cases:
-                    #   loaded > already_done : checkpoint is newer than
-                    #     JSONL -- impossible given we checkpoint AFTER
-                    #     flush, unless the user manually edited the JSONL.
-                    #     Trust the checkpoint; warn loudly.
-                    #   loaded < already_done : JSONL was flushed but the
-                    #     subsequent checkpoint dump didn't complete before
-                    #     preemption. The imatrix will have fewer prompts'
-                    #     worth of data than the JSONL claims, but that's
-                    #     honestly recorded in m_last_chunk.
-                    log.warning(
-                        "imatrix: checkpoint has %d prompts but JSONL has "
-                        "%d rows -- proceeding with the cumulative counter "
-                        "from the checkpoint; m_last_chunk in the final "
-                        ".imatrix.dat will reflect actual accumulated count.",
-                        loaded_prompts, already_done,
-                    )
-                else:
-                    log.info(
-                        "imatrix: hydrated %d-prompt checkpoint from %s",
-                        loaded_prompts, imatrix_ckpt_path,
-                    )
+                # F-H-6: hard-fail on counter divergence (or WARN if
+                # --allow-counter-divergence is set). Replaces the
+                # legacy WARN-only flow whose silent under-counting
+                # would slip past standing-auth pipelines.
+                _check_ckpt_counter(
+                    "imatrix", loaded_prompts, imatrix_ckpt_path,
+                )
+                log.info(
+                    "imatrix: hydrated %d-prompt checkpoint from %s",
+                    loaded_prompts, imatrix_ckpt_path,
+                )
             except ValueError as exc:
                 # Schema mismatch -- delete and restart cleanly.
                 log.error(
@@ -1282,18 +1333,14 @@ def main() -> int:
                 loaded_prompts = _reap.load_reap_scores_checkpoint(
                     str(reap_ckpt_path),
                 )
-                if loaded_prompts != already_done:
-                    log.warning(
-                        "reap-scores: checkpoint has %d prompts but JSONL "
-                        "has %d rows -- proceeding with the cumulative "
-                        "counter from the checkpoint.",
-                        loaded_prompts, already_done,
-                    )
-                else:
-                    log.info(
-                        "reap-scores: hydrated %d-prompt checkpoint from %s",
-                        loaded_prompts, reap_ckpt_path,
-                    )
+                # F-H-6: hard-fail on counter divergence.
+                _check_ckpt_counter(
+                    "reap-scores", loaded_prompts, reap_ckpt_path,
+                )
+                log.info(
+                    "reap-scores: hydrated %d-prompt checkpoint from %s",
+                    loaded_prompts, reap_ckpt_path,
+                )
             except ValueError as exc:
                 log.error(
                     "reap-scores: checkpoint schema mismatch (%s); deleting "
@@ -1317,18 +1364,14 @@ def main() -> int:
                 loaded_prompts = _icov.load_input_cov_checkpoint(
                     str(input_cov_ckpt_path),
                 )
-                if loaded_prompts != already_done:
-                    log.warning(
-                        "input-cov: checkpoint has %d prompts but JSONL "
-                        "has %d rows -- proceeding with the cumulative "
-                        "counter from the checkpoint.",
-                        loaded_prompts, already_done,
-                    )
-                else:
-                    log.info(
-                        "input-cov: hydrated %d-prompt checkpoint from %s",
-                        loaded_prompts, input_cov_ckpt_path,
-                    )
+                # F-H-6: hard-fail on counter divergence.
+                _check_ckpt_counter(
+                    "input-cov", loaded_prompts, input_cov_ckpt_path,
+                )
+                log.info(
+                    "input-cov: hydrated %d-prompt checkpoint from %s",
+                    loaded_prompts, input_cov_ckpt_path,
+                )
             except ValueError as exc:
                 log.error(
                     "input-cov: checkpoint schema mismatch (%s); deleting "
@@ -1358,16 +1401,14 @@ def main() -> int:
                 loaded_prompts = _s2p.load_stage2_profile_checkpoint(
                     str(s2p_ckpt_path),
                 )
-                if loaded_prompts != already_done:
-                    log.warning(
-                        "stage2-profile: checkpoint has %d prompts but JSONL "
-                        "has %d rows", loaded_prompts, already_done,
-                    )
-                else:
-                    log.info(
-                        "stage2-profile: hydrated %d-prompt checkpoint from %s",
-                        loaded_prompts, s2p_ckpt_path,
-                    )
+                # F-H-6: hard-fail on counter divergence.
+                _check_ckpt_counter(
+                    "stage2-profile", loaded_prompts, s2p_ckpt_path,
+                )
+                log.info(
+                    "stage2-profile: hydrated %d-prompt checkpoint from %s",
+                    loaded_prompts, s2p_ckpt_path,
+                )
             except ValueError as exc:
                 log.error(
                     "stage2-profile: checkpoint schema mismatch (%s); "
@@ -1393,19 +1434,15 @@ def main() -> int:
                 loaded_prompts = _pem.load_per_expert_max_checkpoint(
                     str(pem_ckpt_path),
                 )
-                if loaded_prompts != already_done:
-                    log.warning(
-                        "per-expert-max: checkpoint has %d prompts but JSONL "
-                        "has %d rows -- proceeding with the cumulative "
-                        "counter from the checkpoint.",
-                        loaded_prompts, already_done,
-                    )
-                else:
-                    log.info(
-                        "per-expert-max: hydrated %d-prompt checkpoint "
-                        "from %s",
-                        loaded_prompts, pem_ckpt_path,
-                    )
+                # F-H-6: hard-fail on counter divergence.
+                _check_ckpt_counter(
+                    "per-expert-max", loaded_prompts, pem_ckpt_path,
+                )
+                log.info(
+                    "per-expert-max: hydrated %d-prompt checkpoint "
+                    "from %s",
+                    loaded_prompts, pem_ckpt_path,
+                )
             except ValueError as exc:
                 log.error(
                     "per-expert-max: checkpoint schema mismatch (%s); "
@@ -1431,19 +1468,15 @@ def main() -> int:
                 loaded_prompts = _rts.load_routing_stats_checkpoint(
                     str(rts_ckpt_path),
                 )
-                if loaded_prompts != already_done:
-                    log.warning(
-                        "routing-stats: checkpoint has %d prompts but JSONL "
-                        "has %d rows -- proceeding with the cumulative "
-                        "counter from the checkpoint.",
-                        loaded_prompts, already_done,
-                    )
-                else:
-                    log.info(
-                        "routing-stats: hydrated %d-prompt checkpoint "
-                        "from %s",
-                        loaded_prompts, rts_ckpt_path,
-                    )
+                # F-H-6: hard-fail on counter divergence.
+                _check_ckpt_counter(
+                    "routing-stats", loaded_prompts, rts_ckpt_path,
+                )
+                log.info(
+                    "routing-stats: hydrated %d-prompt checkpoint "
+                    "from %s",
+                    loaded_prompts, rts_ckpt_path,
+                )
             except ValueError as exc:
                 log.error(
                     "routing-stats: checkpoint schema mismatch (%s); "
@@ -1481,19 +1514,17 @@ def main() -> int:
                 loaded_prompts = _rlsx.load_router_logits_stats_checkpoint(
                     str(router_logits_ckpt_path),
                 )
-                if loaded_prompts != already_done:
-                    log.warning(
-                        "router-logits-stats: checkpoint has %d prompts "
-                        "but JSONL has %d rows -- proceeding with the "
-                        "cumulative counter from the checkpoint.",
-                        loaded_prompts, already_done,
-                    )
-                else:
-                    log.info(
-                        "router-logits-stats: hydrated %d-prompt "
-                        "checkpoint from %s",
-                        loaded_prompts, router_logits_ckpt_path,
-                    )
+                # F-H-6: hard-fail on counter divergence.
+                _check_ckpt_counter(
+                    "router-logits-stats",
+                    loaded_prompts,
+                    router_logits_ckpt_path,
+                )
+                log.info(
+                    "router-logits-stats: hydrated %d-prompt "
+                    "checkpoint from %s",
+                    loaded_prompts, router_logits_ckpt_path,
+                )
             except ValueError as exc:
                 log.error(
                     "router-logits-stats: checkpoint schema mismatch "
@@ -1522,19 +1553,15 @@ def main() -> int:
                 loaded_prompts = _or.load_output_reservoir_checkpoint(
                     str(or_ckpt_path),
                 )
-                if loaded_prompts != already_done:
-                    log.warning(
-                        "output-reservoir: checkpoint has %d prompts "
-                        "but JSONL has %d rows -- proceeding with the "
-                        "cumulative counter from the checkpoint.",
-                        loaded_prompts, already_done,
-                    )
-                else:
-                    log.info(
-                        "output-reservoir: hydrated %d-prompt "
-                        "checkpoint from %s",
-                        loaded_prompts, or_ckpt_path,
-                    )
+                # F-H-6: hard-fail on counter divergence.
+                _check_ckpt_counter(
+                    "output-reservoir", loaded_prompts, or_ckpt_path,
+                )
+                log.info(
+                    "output-reservoir: hydrated %d-prompt "
+                    "checkpoint from %s",
+                    loaded_prompts, or_ckpt_path,
+                )
             except ValueError as exc:
                 log.error(
                     "output-reservoir: checkpoint schema mismatch "
@@ -1565,19 +1592,15 @@ def main() -> int:
                 loaded_prompts = _bo.load_block_outputs_checkpoint(
                     str(bo_ckpt_path),
                 )
-                if loaded_prompts != already_done:
-                    log.warning(
-                        "block-outputs: checkpoint has %d prompts but "
-                        "JSONL has %d rows -- proceeding with the "
-                        "cumulative counter from the checkpoint.",
-                        loaded_prompts, already_done,
-                    )
-                else:
-                    log.info(
-                        "block-outputs: hydrated %d-prompt checkpoint "
-                        "from %s (subset_closed=%s)",
-                        loaded_prompts, bo_ckpt_path, _bo._SUBSET_CLOSED,
-                    )
+                # F-H-6: hard-fail on counter divergence.
+                _check_ckpt_counter(
+                    "block-outputs", loaded_prompts, bo_ckpt_path,
+                )
+                log.info(
+                    "block-outputs: hydrated %d-prompt checkpoint "
+                    "from %s (subset_closed=%s)",
+                    loaded_prompts, bo_ckpt_path, _bo._SUBSET_CLOSED,
+                )
             except ValueError as exc:
                 log.error(
                     "block-outputs: checkpoint schema mismatch (%s); "
@@ -1684,6 +1707,30 @@ def main() -> int:
                     "chunk %d-%d: all-TF chunk; no vLLM generate call "
                     "this iteration",
                     chunk_start, chunk_start + len(chunk),
+                )
+
+            # F-H-5: per-row f.flush() pushed Python's userspace buffer to
+            # the kernel page-cache but did NOT durably flush to disk. A
+            # kernel-panic / power-loss between flush and the next
+            # pdflush cycle (5-30 s on ext4) would lose all rows from
+            # this chunk — but the per-chunk accumulator checkpoints
+            # below would also be lost, so the JSONL/ckpt counter pair
+            # remains internally consistent (the F-H-6 hard-fail covers
+            # the remaining edge case). The fsync here promotes the
+            # entire chunk's rows to durable storage BEFORE the
+            # accumulator checkpoints are written, establishing the
+            # ordering invariant "JSONL is durable >= ckpt counter".
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except OSError:
+                # FUSE / tmpfs may reject fsync on regular files; flush
+                # alone is the best we can do there. Logging at DEBUG so
+                # production runs on real ext4/xfs don't see noise.
+                log.debug(
+                    "F-H-5: fsync(jsonl_fd) raised OSError — non-POSIX "
+                    "filesystem (HF Jobs FUSE mount?); relying on rename "
+                    "atomicity instead."
                 )
 
             total_done = already_done + n_new
