@@ -246,8 +246,13 @@ must be set per the paper's Eq. 10 fine-tune appendix (CE coefficient λ,
 distillation epochs, optimizer); the paper's Algorithm 1 / Appendix B
 should be consulted for v2 knob values when CE+TopK are added.
 
-Verdict: **OUT-OF-SCOPE** for byte-alignment; **OPEN-QUESTION** for paper
-fidelity (see § OPEN-QUESTIONS below).
+Verdict: **OUT-OF-SCOPE** for byte-alignment; previously **OPEN-QUESTION**
+for paper fidelity — **now RESOLVED (2026-05-28)** via option (2):
+paper-faithful `L_CE` (and the appendix-B fine-tune hyperparameters it
+implies) moves to a separate downstream fine-tune phase that consumes
+the Path-B teacher cache directly; the in-plugin knobs documented above
+stay scoped to the local feature-KL + MSE distill. See § OPEN-QUESTIONS
+item 1 below.
 
 ### 10. Other differences — IN-SCOPE: citation hygiene
 
@@ -277,25 +282,62 @@ Verdict: **ALIGN** (citation update only — no algorithmic change).
 | 6 | One-shot vs iterative | OUT-OF-SCOPE | None |
 | 7 | Expert-wise KD (Eq. 10) | DEVIATION (documented) | None — D-expert-distill-mse + D-expert-distill-mse-v1 already disclose; upstream has no counterpart |
 | 8 | Forward-pass plumbing | OUT-OF-SCOPE | None |
-| 9 | Hyperparameters | OUT-OF-SCOPE / OPEN-Q | None for now |
+| 9 | Hyperparameters | OUT-OF-SCOPE / RESOLVED | None — paper Eq. 10 λ + appendix-B fine-tune knobs belong to the deferred downstream phase (see § OPEN-QUESTIONS item 1) |
 | 10 | Citation URLs | **ALIGN** | Update `expert_distill.py:25` + `:356` to cite `tanganke/fusion_bench` with third-party caveat |
 
 ---
 
 ## OPEN-QUESTIONS
 
-1. **Paper Eq. 10 includes a CE term** (`L_CE + λ · Σ MSE`). Our plugin
-   uses **MSE only** — no LM cross-entropy. The CE term in the paper is
-   computed on the full model output; including it would require a forward
-   pass through the entire pruned model on labeled tokens, which is a
-   different infrastructure (it's effectively a fine-tune harness, not a
-   per-merge-group local distill). **Question**: do we want a separate
-   fine-tune phase that adds the CE term post-stage-2, or is the MSE-only
-   per-group distill a deliberately-scoped local refinement?
-   Current plugin docstring frames the CE drop as part of
-   D-expert-distill-mse but does not give a recommendation. The paper's
-   99% recovery result depends on the *combined* L_KD; MSE-only here
-   should not be reported as "matching MoE-Pruner".
+1. **Paper Eq. 10 CE term — RESOLVED (2026-05-28): option (2) deferred
+   to downstream fine-tune phase, NOT this plugin.**
+
+   Paper Eq. 10 (`L_KD = L_CE + λ · Σ MSE`) computes `L_CE` as the LM
+   next-token cross-entropy on the end-to-end fine-tune. The plugin
+   currently ships a `feature_KL + ce_lambda · MSE` composite where
+   `feature_KL` is a per-layer per-group feature-level KL over the
+   hidden axis (`_feature_kl_ce`, Lift 1) — a documented engineering
+   adaptation, **not** paper-faithful `L_CE`.
+
+   The intuitive paper-literal path — bubble teacher LM-head logits
+   into Stage 2's ctx and project the student's per-merge-group
+   `(T, hidden)` output through the remaining ~`94 - N` MoE decoder
+   layers + RMSNorm + LM head per gradient step to reach vocab space
+   — was independently rejected by two agents:
+   - Plan branch `plan/moe-pruner-ce-term` (commit `f15ff1d`) — §2
+     cost analysis: ~3.5 s/step vs current ~7 ms/step (~500× per-step
+     regression); Stage-2-total wall projection ~3h → ~60d on a single
+     H100; also requires full pruned student model resident on the GPU
+     (~30 GB BF16) plus activation checkpointing plumbing that does
+     not exist in Stage 2 today.
+   - Direct-implementer branch
+     `fix/expert-distill-paper-ce-via-pathb` (commit `d75549a`) —
+     halted on the same architectural blocker rather than push a
+     multi-day-Stage-2 patch.
+
+   **User decision (2026-05-28): option (2)** — paper-faithful `L_CE`
+   moves to a SEPARATE downstream fine-tune phase that has the LM head
+   + labels already in scope and that can consume the existing Path-B
+   teacher cache (`_stage5_teacher_logits.pt`) directly. That phase is
+   **deferred**, not in scope for any Stage 2 plugin.
+
+   Status of the in-plugin term: the feature-level KL stays as a
+   local per-merge-group recovery signal (Lift 1). It is NOT
+   paper-faithful — known semantic gaps (hidden-axis softmax has no
+   real event space; KL is shift-invariant along the hidden axis) are
+   accepted as the cost of the local-only design and are called out
+   in the plugin docstring's RESOLVED block.
+
+   Status of option (b) (LN-aware / shift-broken KL on hidden tensors)
+   from the original OPEN-QUESTION: still optionally available as a
+   future LOCAL improvement to the in-plugin term — distinct from the
+   deferred fine-tune phase. Not blocking.
+
+   Reporting guidance: this plugin should NOT be reported as
+   "matching MoE-Pruner Eq. 10" — its CE term is a feature-level
+   adaptation. The paper's 99% recovery result depends on the
+   combined `L_KD` with vocab-level `L_CE`, which lives in the
+   deferred downstream phase.
 
 2. **TopK gate + per-token routing weight (v1 simplifications)** are
    slated for v2 per D-expert-distill-mse-v1 (lines 75-103). Status?

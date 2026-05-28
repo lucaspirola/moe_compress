@@ -108,64 +108,108 @@ tokens.
 
 Config knobs (Pattern C — consumed verbatim, no implicit coupling):
 - ``expert_distill_use_ce_term`` (default True post-lift, False on
-  v1-back-compat / A0..A11 ablation): when False the per-step loss is
-  pure MSE, byte-identical to pre-lift behavior at the optimizer
-  level.
-- ``expert_distill_ce_lambda`` (default 1.0): paper's λ. Parity
-  weighting between CE and MSE; tune via config since the paper does
-  not pin a numeric default.
+  v1-back-compat / A0..A11 ablation): when True the per-step loss is
+  ``feature_KL + ce_lambda · MSE`` where ``feature_KL`` is the
+  in-plugin feature-level KL (NOT paper-faithful Eq. 10 ``L_CE`` — see
+  RESOLVED block below). When False the per-step loss is pure MSE,
+  byte-identical to pre-lift behavior at the optimizer level.
+- ``expert_distill_ce_lambda`` (default 1.0): parity weight between
+  the in-plugin feature-KL term and the MSE term. Not paper Eq. 10's
+  λ (which weights the deferred vocab-level ``L_CE`` against the same
+  MSE — different magnitude regime). Tune via config; 1.0 is the safe
+  parity default for the current adaptation.
 
-OPEN-QUESTION: feature-level KL is NOT mathematically equivalent to
-paper Eq. 10's L_CE
--------------------------------------------------------------------
-The feature-level KL implemented here is a per-layer engineering
-adaptation, not a faithful realization of the paper's L_CE. Two
-concrete semantic gaps:
+RESOLVED: feature-level KL stays as a per-merge-group local term;
+paper-faithful L_CE is DEFERRED to a separate downstream fine-tune phase
+---------------------------------------------------------------------
+**Decision (2026-05-28): option (2) — paper-faithful ``L_CE`` will
+live in a SEPARATE downstream model-level fine-tune phase, NOT in this
+plugin.** The in-plugin term implemented above (``_feature_kl_ce``,
+Lift 1) stays as a local per-merge-group recovery signal — it is an
+engineering adaptation, not a paper-faithful ``L_CE``, and it is
+explicitly documented as such here.
+
+Why the obvious paper-literal path was rejected
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The intuitive "bubble teacher LM-head logits into ctx + project
+student through the downstream stack" path (call it option (a)) is
+mathematically clean but **catastrophically expensive** at this
+plugin's per-step granularity. Two independent agents confirmed the
+blocker:
+
+  - Plan branch ``plan/moe-pruner-ce-term`` (commit ``f15ff1d``,
+    "plan(moe-pruner): paper Eq. 10 CE term — option (a) BLOCKED
+    writeup") — structured §2 cost analysis: each gradient step would
+    need to forward the trained merged centroid's ``(T, hidden)``
+    output through ~``94 - N`` remaining MoE decoder layers (worst
+    case ~47 at the mid-stack), RMSNorm, and the LM head to reach
+    vocab space. At ~75 ms/layer for 8192 tokens BF16 on a single
+    H100, that is ~3.5 s/step vs. the current ~7 ms/step — a ~500×
+    per-step regression. Stage-2-total wall projection moves from
+    ~3h to ~60d on a single H100, fully outside the project's
+    wall-clock budget. Also requires the full pruned student model
+    resident on the same GPU (~30 GB BF16) and activation
+    checkpointing plumbing that does not exist in Stage 2 today.
+  - Direct-implementer branch ``fix/expert-distill-paper-ce-via-pathb``
+    (commit ``d75549a``) raised the same architectural blocker on
+    first contact with ``_distill_merged_group`` and halted with a
+    doc rather than push a multi-day-Stage-2 patch.
+
+Per CLAUDE.md "RAISE, don't substitute"
+(``feedback_raise_dont_substitute.md``), the user was given the
+decision boundary and picked option (2): defer ``L_CE`` to a downstream
+fine-tune phase that has the LM head + labels already in scope.
+
+Status of the in-plugin term
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The ``_feature_kl_ce`` helper (Lift 1) is a **feature-level KL** on the
+per-layer per-group ``(T, hidden)`` tensors, NOT paper-faithful
+``L_CE``. Two concrete semantic gaps remain and are accepted as the
+cost of the local-only design:
 
   1. The hidden-dim softmax has no meaningful event space at the
-     feature level. The paper's L_CE is a categorical cross-entropy
-     over a real probability space (vocabulary tokens, one event per
-     vocab slot). A softmax over a hidden-state's feature axis
-     manufactures a distribution where the "events" are arbitrary
-     coordinate indices — there is no semantic interpretation under
-     which p(feature_i) means anything analogous to p(token_i).
+     feature level. The paper's ``L_CE`` is a categorical cross-entropy
+     over vocabulary tokens (one event per vocab slot); a softmax over
+     a hidden-state's feature axis manufactures a distribution where
+     the "events" are arbitrary coordinate indices.
   2. The hidden-axis softmax is **invariant to constant shifts along
      that axis**: any two hidden vectors ``h`` and ``h + c·1`` produce
      identical softmaxes, so the KL is blind to constant-shift errors
      in the merged centroid's output even though those shifts DO
-     change downstream LM logits and the paper's true L_CE would
-     penalize them. (The MSE term still penalizes the shift, which is
-     why the composite is non-degenerate in practice — but the CE
-     contribution itself is shift-blind.)
+     change downstream LM logits. (The MSE term still penalizes the
+     shift, so the composite is non-degenerate in practice — but the
+     CE contribution itself is shift-blind.)
 
-Two alternative adaptations the user should consider before locking in
-λ or moving to production tuning:
+The current implementation is still useful: it produces a
+correctly-signed gradient component that pushes the merged centroid
+toward the pre-merge group-member forward in distribution-shape (not
+just magnitude). The ``ce_lambda=1.0`` default was chosen for
+MSE-magnitude parity under this feature-level adaptation; it is a
+parity weighting for the **in-plugin** term, NOT for paper Eq. 10's
+``L_CE``.
 
-  (a) **Bubble teacher LM-head logits into ctx.** Run the teacher
-      forward through the LM head on the per-layer token batch, pipe
-      the resulting (T, vocab) logits into ``pre_merge_weights`` /
-      a sibling ctx slot, and use a true vocab-level KL or
-      cross-entropy as L_CE — matching paper Eq. 10 verbatim. This
-      is a larger architectural change (touches the snapshot path
-      and the ctx contract) but gives the paper-correct semantics.
-  (b) **Alternative normalization on the existing hidden tensors.**
-      E.g. feature-wise MSE on softmaxed logits (no log on student
-      side, no KL — just L2 between two softmax-normalized
-      distributions, which at least avoids the log-domain blow-up on
-      near-zero student probs), or a row-LayerNorm-aware KL that
-      first centers and scales hidden vectors so the constant-shift
-      invariance is broken in a structured way before the softmax.
-      Smaller change than (a); still not paper-faithful but closes
-      the constant-shift gap.
+Future fine-tune phase (deferred, NOT this plugin)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When/if the downstream paper-faithful ``L_CE`` fine-tune phase lands,
+it should consume the existing Path-B teacher cache
+(``_stage5_teacher_logits.pt``, produced by
+``max_quality/hf_jobs/precompute_teacher_logits.py``, schema_version=1,
+manifest-last) directly — that artifact already covers the vocab-axis
+teacher half of Eq. 10. No NEW calibration capture is required beyond
+what Path-B already provides; the new infrastructure that DOES need to
+be built is the end-to-end fine-tune harness itself (LM head + labels +
+optimizer over the full pruned model), which is out of scope for the
+Stage 2 per-merge-group plugin family.
 
-The current implementation is **not blocked** by this open question —
-it produces a correctly-signed gradient component that pushes the
-merged centroid toward the pre-merge group-member forward in
-distribution-shape (not just magnitude). But the ``ce_lambda=1.0``
-default was chosen for MSE-magnitude parity under the current
-adaptation; if (a) or (b) lands, expect to re-tune λ from scratch
-since the new L_CE will have different magnitude characteristics.
-Track this as an outstanding paper-fidelity TODO.
+Option (b) (LN-aware / shift-broken KL on the existing hidden tensors —
+e.g. row-LayerNorm-aware KL that centers + scales hidden vectors so
+the constant-shift invariance is broken in a structured way before the
+softmax) stays available as a future **LOCAL** improvement to this
+plugin's in-plugin term. It is distinct from the deferred paper-faithful
+fine-tune phase: option (b) refines the local KL inside this plugin;
+the deferred phase replaces the local KL with a true vocab CE in a
+different stage. They are not alternatives — both can land
+independently.
 
 Deviation: D-expert-distill-paper-lift (Lift 2, paper Eqs. 1-3)
 ---------------------------------------------------------------
@@ -323,13 +367,17 @@ def _feature_kl_ce(
     """Per-token soft-KL between ``softmax(target)`` and
     ``log_softmax(student)`` over the hidden dim.
 
-    Per-layer per-group adaptation of paper Eq. 10's ``L_CE`` term:
-    the paper computes ``L_CE`` as the LM next-token cross-entropy on
-    the end-to-end fine-tune (paper line 410: "LCE is the cross
-    entropy loss"); per-layer per-group has no LM head / labels in
-    scope, so the natural adaptation is a feature-level KL between
-    the teacher (pre-merge group-member forward) and the student
-    (merged centroid forward) on the same per-token tensors.
+    Per-layer per-group LOCAL adaptation, NOT paper-faithful ``L_CE``
+    (see module docstring "RESOLVED" block). The paper computes
+    ``L_CE`` as the LM next-token cross-entropy on the end-to-end
+    fine-tune (paper line 410: "LCE is the cross entropy loss"); the
+    per-layer per-group surface has no LM head / labels in scope, so
+    we use a feature-level KL between the teacher (pre-merge
+    group-member forward) and the student (merged centroid forward)
+    on the same per-token ``(T, hidden)`` tensors instead. This is a
+    documented engineering adaptation; paper-faithful ``L_CE`` is
+    deferred to a separate downstream fine-tune phase that consumes
+    the Path-B teacher cache directly (see module docstring).
 
     Reduction: ``batchmean`` over tokens, matching torch's
     ``F.kl_div`` convention. Returns a 0-D tensor.
@@ -759,16 +807,24 @@ class ExpertDistillPlugin:
 
         Lift 1 additions (D-expert-distill-ce-term):
         - ``expert_distill_use_ce_term`` (default True): when True,
-          per-step loss is ``L_CE + ce_lambda · MSE`` per paper Eq. 10
-          (paper line 394); when False, runs pure MSE (v1 back-compat
-          / A0..A11 ablation parity). Pattern C config-validation: the
+          per-step loss is ``feature_KL + ce_lambda · MSE``. NOTE: the
+          ``feature_KL`` term is the in-plugin engineering adaptation
+          (``_feature_kl_ce``), NOT paper-faithful Eq. 10 ``L_CE`` —
+          see the module docstring's "RESOLVED" block for the rationale
+          (paper-literal vocab CE was rejected as a ~500×/step
+          regression; the paper-faithful term is deferred to a downstream
+          fine-tune phase). When False, runs pure MSE (v1 back-compat /
+          A0..A11 ablation parity). Pattern C config-validation: the
           knob is consumed verbatim, no implicit coupling.
-        - ``expert_distill_ce_lambda`` (default 1.0): the λ from paper
-          Eq. 10. Paper line 414 says "λ is a weighting coefficient and
-          initialized based on the strength of cross entropy loss and
-          expert-wise knowledge distillation loss" — no numeric default
-          pinned, so we use 1.0 (parity weighting) as the safe ON-path
-          starting point.
+        - ``expert_distill_ce_lambda`` (default 1.0): λ-parity weight
+          between the feature-KL term and the MSE term — NOT paper
+          Eq. 10's λ (which weights the deferred vocab-level ``L_CE``,
+          a different scale entirely). 1.0 is the safe parity default
+          for the in-plugin feature-KL adaptation; setting it to 0
+          falls back to MSE-only behavior. If/when the downstream
+          paper-faithful ``L_CE`` fine-tune phase lands, expect that
+          phase to pin its own λ-equivalent against vocab CE
+          magnitudes, independent of this knob.
 
         Lift 2 addition (D-expert-distill-paper-lift):
         - ``expert_distill_target_version``: ``"v1"`` (legacy
