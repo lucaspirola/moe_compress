@@ -188,7 +188,7 @@ discoverable from the plugin itself.
 ## Item 2 — Cost signal: usage-frequency vs CKA-distance
 
 **Upstream**: usage frequency from token routing. Computed by
-`compute_all_usages` (called from `merging-mixtral.py:165` and
+`compute_all_usages` (called from `merging-mixtral.py:220` and
 `merging-qwen.py:210, 213, 229`). Stored in
 `grouping_mixtral.py:_usage_frequency_state_dict` /
 `grouping_qwen.py:_usage_frequency_state_dict`. Has no theoretical
@@ -234,8 +234,10 @@ R4's δᵢ semantics.
 ## Item 3 — Output: per-layer expert counts vs multiplicative prior into GRAPE
 
 **Upstream**: `num_groups_per_layer: Dict[str, int]` mapped to FFN
-module names (`grouping_mixtral.py:159, 167-171`). Consumed directly
-at `grouping_mixtral.py:359` (and similar): `num_groups_in_layer =
+module names (`grouping_mixtral.py:159, 167-171`). The
+`_assign_num_groups_per_layer` call site is `grouping_mixtral.py:359`;
+the per-layer count is consumed directly at `grouping_mixtral.py:366`
+(and similar): `num_groups_in_layer =
 num_groups_per_layer[ffn_name] if self.dynamic_group else num_groups`.
 The per-layer count is the **definitive** survivor budget — clustering
 runs at that count for each layer.
@@ -368,7 +370,7 @@ are deterministic). No action.
 
 ## Item 7 — Hyperparameters / defaults / ε values
 
-**Upstream**: `group_limit` default 4 (`grouping_mixtral.py:39`,
+**Upstream**: `group_limit` default 4 (`grouping_mixtral.py:46`,
 `grouping_qwen.py:40`); `data_limit` 50000 (mixtral) / 1000000 (qwen);
 `start_layer` 0; `dynamic_group` False (NB: the per-layer-count
 derivation only fires when `dynamic_group=True`); various `cluster` /

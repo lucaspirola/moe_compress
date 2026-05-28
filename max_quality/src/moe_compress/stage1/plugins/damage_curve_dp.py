@@ -175,8 +175,9 @@ baseline behaviour when DP is disabled.
 
 The HC-SMoE alternative — adopt upstream's **direct per-layer count**
 output convention (``grouping_mixtral.py:169-171``: the count is the
-definitive layer survivor budget, consumed at line 359 by the
-clustering pass with no further refinement) — was deliberately
+definitive layer survivor budget, consumed at line 366 by the
+clustering pass — preceded by the ``_assign_num_groups_per_layer``
+call at line 359 — with no further refinement) — was deliberately
 rejected. Upstream has no analog to GRAPE's entropy gate γ; its
 per-layer count is a hard side-effect of the global threshold cut.
 Replacing GRAPE's selection with the DP optimum outright would
@@ -217,9 +218,10 @@ upstream/hcsmoe/`` returns zero matches. Every expert is mergeable in
 HC-SMoE's task scope.
 
 This plugin honours the project's super-expert blacklist
-(``damage_curve_dp.py:275`` reads ``blacklist: dict[int, list[int]]``
-from ctx; ``_build_damage_curves`` excludes any pair touching a
-blacklisted expert at the ``triu_indices`` extraction step). The
+(the ``run()`` method's ``blacklist = ctx.get("blacklist")`` line
+reads ``blacklist: dict[int, list[int]]`` from ctx;
+``_build_damage_curves`` excludes any pair touching a blacklisted
+expert at the ``triu_indices`` extraction step). The
 blacklist is populated by Stage 1's super-expert detector chain
 (``ma_detection.py`` + ``sink_token.py`` + ``three_way_and.py``
 voters aggregated by ``ablation_filter.py``) and flags experts whose
