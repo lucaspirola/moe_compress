@@ -91,7 +91,7 @@ def test_stage2_cov_manifest_roundtrip(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T3 — torn payload via Reader 1
+# T2 — torn payload via Reader 1
 # ---------------------------------------------------------------------------
 
 
@@ -116,7 +116,7 @@ def test_stage2_cov_torn_payload_fails_loudly(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T2 — missing manifest, NEW writer (kill between atomic_torch_save +
+# T3 — missing manifest, NEW writer (kill between atomic_torch_save +
 # write_manifest_last)
 # ---------------------------------------------------------------------------
 
@@ -177,7 +177,7 @@ def test_stage2_cov_manifest_written_last(tmp_path):
 
     def _spy_replace(src, dst, *args, **kwargs):
         # Record only the final-target basenames we care about. The
-        # atomic helpers rename `<dst>.<random>.tmp` → `<dst>`, so the
+        # atomic helpers rename `<dst>.tmp` → `<dst>`, so the
         # destination basename is the file we want to track.
         from pathlib import Path as _P
         dst_name = _P(dst).name
