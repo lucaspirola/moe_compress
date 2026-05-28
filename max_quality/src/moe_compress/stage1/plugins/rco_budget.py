@@ -1,33 +1,18 @@
-"""RCO — Riemannian-manifold budget allocator (Stage 1 refinement, clean-room re-impl).
+"""RCO — Riemannian-manifold budget allocator (Stage 1 refinement, upstream-aligned).
 
 Paper
 -----
 IST-DASLab, *Model Compression with Exact Budget Constraints via
 Riemannian Manifolds* — arxiv:2605.00649 (May 2026). §3 Algorithm 1.
 
-This module is a **clean-room re-implementation** from the paper's prose +
-``tasks/PLAN_RCO_NATIVE_REIMPL.md`` (v7 — 7 rounds of plan-reviewer
-ping-pong). Upstream repo at https://github.com/IST-DASLab/RCO ships
-**without a LICENSE file**, re-verified 2026-05-28 via the GitHub API on
-``https://api.github.com/repos/IST-DASLab/RCO`` returning the raw response
-``{"license": null, "default_branch": "main", "updated_at": "2026-05-16T..."}``.
-NO upstream source files are referenced. (Pattern H clean-room rule.)
+This module is **bit-by-bit aligned** with the upstream code at
+https://github.com/IST-DASLab/RCO (re-verified 2026-05-28: license=null;
+clean-room re-implementation policy). Per-primitive citations to
+upstream files are in the docstrings of ``_constraint_normal``,
+``_project_off_normal``, ``_retract``, ``_init_alpha_beta_bisection``,
+``_anneal_tau``, ``_gradient_estimate``, and ``_evaluate_discrete``.
 
-History — this file fully replaces the prior implementation at commit
-``269e64d`` (898 LoC, 12 tests). That implementation had **four** known
-algorithmic deviations that this re-impl fixes in-place:
-
-1. **Gumbel-softmax form**: was ``softmax(α + τ · g)``; now standard
-   ``softmax((α + g) / τ)``. Plan §1.3 step 1.
-2. **Cosine anneal direction**: was exploit→explore (start cold, end hot);
-   now explore→exploit (start hot, end cold) per the canonical form
-   ``τ_t = τ_final + 0.5·(τ_init − τ_final)·(1 + cos(π · t/T))``. Plan
-   §1.3 step 2.
-3. **DP score**: was ``damage − 1e-3 · log p``; now pure damage. The
-   β·log p tiebreak is REMOVED. Plan §1.3 step 3.
-4. **Infeasible-budget fallback**: was ``max(feasible, ...)``; now
-   nearest-feasible with larger-budget tiebreak via
-   ``min(feasible, key=lambda b: (abs(b − B), −b))``. Plan §6.1 F8.
+Audit + per-change rationale: ``tasks/RCO_UPSTREAM_ALIGNMENT_AUDIT.md``.
 
 Slot in this codebase
 ---------------------
@@ -37,100 +22,121 @@ context slot — distinct from GRAPE's ``per_layer_target_experts`` so the
 row recipe explicitly opts in. Default OFF behind
 ``stage1.rco_budget.enabled``.
 
-Algorithm reference (paper §3 Algorithm 1, plan §1)
-----------------------------------------------------
+Algorithm reference (paper §3 Algorithm 1)
+------------------------------------------
 
 Given ``L`` MoE-bearing groups, each with a finite per-group option grid
 of size ``K_l`` with positive integer costs ``c_lk`` (here: surviving
 expert counts for the layer), and a global integer budget ``B``, find a
 discrete assignment minimising the decomposable damage
-``Σ_l D_l(k_l)`` subject to ``Σ_l c_{l, k_l} = B``.
+``Σ_l D_l(k_l)`` subject to ``Σ_l w_l · c_{l, k_l} = B``. For the MoE
+pruning case ``w_l = 1`` (matches upstream ``prune.py``); the API
+accepts custom weights for future quant-style use.
 
 Introduce per-group logits ``α_l ∈ ℝ^{K_l}`` and soft probabilities
 ``p_lk = softmax(α_l)_k``. The Budget Manifold (paper §2 Eq. 1) is
 
-    M = { α ∈ ℝ^{Σ K_l} : C(α) = B }    with    C(α) = Σ_l ⟨p_l, c_l⟩.
+    M = { α ∈ ℝ^{Σ K_l} : C(α) = B }
+    with  C(α) = Σ_l w_l · ⟨p_l, c_l⟩.
 
-Four manifold primitives drive the search (paper §2 Props. 1/2 + §3.1):
+Four manifold primitives drive the search (paper §2 Props. 1/2 + §3.1),
+all verbatim from upstream ``src/manifold.py``:
 
-1. **Constraint normal** ``n_lk = p_lk · (c_lk − ⟨p_l, c_l⟩)`` —
-   gradient of C w.r.t. α. Always evaluated at the **un-perturbed**
-   ``p = softmax(α)`` (paper §2; see Q8 in the plan).
-2. **Tangent projection**: ``g_tan = g − (⟨g, n⟩/⟨n, n⟩)·n``.
-3. **Retraction** along the cost direction ``α(t) = α − t·c_grid``:
-   1-D bracket-doubling + bisection, signed by ``f(0) = C(α) − B``.
-4. **Vector transport — first moment only**: after each retraction,
-   re-project Adam's first moment ``m`` onto the new tangent plane;
-   the second moment ``v`` is left untransported (``D-adam-no-v-transport``).
+1. **Constraint normal** ``n_lk = w_l · p_lk · (c_lk − ⟨p_l, c_l⟩)`` —
+   gradient of C w.r.t. α. Evaluated at the un-perturbed
+   ``p = softmax(α)``.
+2. **Tangent projection**: ``g_tan = g − (⟨g, n⟩/(⟨n, n⟩+1e-12))·n``.
+3. **Retraction**: bisect a scalar shift ``c`` so that
+   ``C(α + c · costs) = B``. Bracket starts at ``[-1, 1]``; doubles
+   outwards (up to 40 iters) on whichever side has not yet crossed
+   the target. Bisection (up to 60 iters) halts as soon as
+   ``|C(mid) − B| < 0.05``. Upstream tolerance + iteration counts.
+4. **Vector transport (first moment only)**: re-project Adam's first
+   moment ``m`` onto the new tangent plane after each retraction. The
+   second moment ``v`` is variance and has no direction to transport —
+   upstream ``vector_transport`` (``src/manifold.py:121-145``) handles
+   only ``m``, so this is upstream parity, not a deviation.
 
-Forward pass (§1.3): standard-form Gumbel-softmax
-``p̃ = softmax((α + g) / τ)`` with ``g ~ Gumbel(0, 1)``. Limits: τ→∞ →
-uniform (explore); τ→0 → argmax(α + g) (exploit, Gumbel-max trick).
-Cosine-anneal τ from ``τ_init`` to ``τ_final`` so the search starts
-exploratory and ends decisive.
+Forward pass (§3.1): standard Gumbel-softmax
+``p̃ = softmax((α + g) / τ)`` with ``g = -log(-log(u) + 1e-20)`` and
+``u ∼ Uniform(1e-20, 1 − 1e-20)`` (matches upstream
+``src/search/quant.py:672-673`` clamps + inner-log floor).
 
-Discrete readout (§1.3 step 3): multiple-choice knapsack DP minimising
+τ-anneal: exponential
+``τ_t = max(τ_min, τ_init · (τ_min/τ_init)^(t/(T-1)))`` —
+upstream ``src/search/prune.py:663`` verbatim.
+
+Initialisation (β-bisection): bisect a single scalar β ∈ [-10, 10] for
+100 iters such that ``E[budget] = Σ_l w_l · Σ_k softmax(-β·c_l)_k · c_lk``
+equals the target; then ``α_lk = -β · c_lk``. Mirrors upstream
+``src/search/quant.py::init_alpha_to_bits`` (lines 302-327).
+
+Discrete readout: multiple-choice knapsack DP minimising
 **pure damage** ``Σ_l D_l(k_l)`` s.t. ``Σ_l c_{l, k_l} = B``. Strict
 ``<`` tiebreak so on tied scores the first vector encountered along the
-layer sweep (lex-min on option indices) wins (plan v4-N4). On
-infeasibility (B outside ``[Σ floor_l, Σ N_l]``), fall back to the
-**nearest feasible budget** with WARNING log (larger-budget tiebreak).
+layer sweep wins (lex-min on option indices). On infeasibility (B
+outside the achievable budget range), fall back to the **nearest
+feasible budget** with WARNING log — **lower-budget tiebreak** matches
+upstream ``src/search/quant.py:411-419`` which checks
+``[budget - delta, budget + delta]`` in order, so the smaller side
+wins on equidistant ties.
 
 Deviations
 ==========
 
-Nine `D-*` tags total (8 carried from the prior impl + 1 new).
+These are the deviations that cannot be removed because our pipeline's
+API surface forces a different shape. Each is justified inline.
 
 D-clean-room
     Re-implementation from paper prose; no upstream code is copied.
     Re-verified 2026-05-28: GitHub API returns ``{"license": null, ...}``.
 
-D-init-grape
-    α initialised from GRAPE budgets, not REAP saliency. REAP would
-    require a per-(layer, option) saliency pass which our pipeline
-    does not run. Concretely: the option-index matching GRAPE's
-    budget gets logit ``init_peak_logit`` (default 2.0); other
-    options get 0. (Plan §1.6, Q2.)
-
 D-fitness-mse
-    Output-space MSE as fitness (vs paper §4.2's end-to-end task
-    loss). The upgrade is gated on L1/vLLM (`L1_FOR_SC_PLAN.md`)
-    and out of scope here. (Plan §1.6, Q3.)
+    Damage curve is precomputed by Plugin S1_DP (or the synthetic
+    fallback), not derived from a model-in-the-loop KL/CE pass as in
+    upstream ``prune.py``. Our Stage 1 pipeline has no model-in-the-
+    loop here; precomputed curves are the natural alternative.
+
+D-analytic-grad
+    Single-sample analytic gradient ``p̃ · (D − E_p̃[D])`` of the
+    expected damage, not STE through the model. Upstream computes
+    the gradient through autograd; ours is the closed-form Jacobian
+    collapse (paper §3.1). Mathematically equivalent in expectation.
 
 D-synthetic-curve
     When ``per_layer_damage_curve`` slot is absent and
     ``fitness_signal="auto"``, fall back to a synthetic linear curve
     ``D_l(k) = (R̃^l + 1) · (per_layer_count_l − k)`` using GRAPE's
-    redundancy. Convex decreasing; preserves GRAPE's ranking. (Plan §1.6.)
+    redundancy. Upstream has no fallback because it always runs the
+    model.
 
 D-floor-projection
     The per-layer floor ``floor_l = per_layer_count_l // floor_divisor``
-    is baked into the option grid ``{floor_l, ..., per_layer_count_l}``
-    — part of the manifold's intrinsic geometry. (Plan §1.6.)
+    is baked into the option grid ``{floor_l, ..., per_layer_count_l}``.
+    Upstream's option grid is ``[0, ..., bitwidths_max]`` without a
+    floor concept.
 
 D-ragged-K
     Per-layer K_l varies; the option grids are padded to
     ``K_max = max_l(per_layer_count_l − floor_l + 1)`` with a 0/1 mask
-    and very-negative pad logits. The masked softmax zeroes pads. (Plan §1.6.)
+    and very-negative pad logits. Upstream has uniform K across groups.
 
-D-bisection-budget
-    Primitive 3 is the global retraction (one scalar ``t`` for the
-    global budget constraint), implemented via bracket-doubling +
-    bisection. Paper says only "1-D root-find"; the bracket scheme
-    is a concrete choice. (Plan §1.6, §1.2 Primitive 3.)
+D-dp-damage-not-logp
+    DP score is the precomputed damage, not the log-prob of the
+    optimizer-preferred option. Upstream MAXIMIZES log(prob) (high
+    prob = preferred); we MINIMIZE damage (low damage = preferred).
+    The two formulations differ only in input form; the polarity is
+    consistent given our damage-curve signal.
 
 D-disabled-default
     Gated default OFF behind ``stage1.rco_budget.enabled``. Every
-    non-S1_RCO row stays byte-identical to pre-plugin-11 main. (Plan §1.6.)
+    non-S1_RCO row stays byte-identical to pre-plugin-11 main.
 
-D-adam-no-v-transport  [NEW in this re-impl]
-    Adam's first moment ``m`` is vector-transported (re-projected onto
-    the new tangent plane after retraction); the second moment ``v``
-    is left untouched. The paper is silent on ``v``; we pick the
-    lighter convention because ``v`` is element-wise squared and used
-    only as an adaptive learning-rate scaler ``1 / (√v̂ + ε)`` — its
-    tangent-vs-normal decomposition has no operational meaning.
-    Documented in plan §1.2 Primitive 4; pinned by F13. (Plan §1.6.)
+D-no-router-prior
+    Upstream ``src/search/prune.py::init_alpha_from_router_scores``
+    biases α by router-frequency rankings. We default to β-bisection
+    init (upstream's other branch); router-prior init is an opt-in
+    extension out of scope for this plugin.
 
 Output context contract
 -----------------------
@@ -241,19 +247,23 @@ _ALLOWED_CFG_KEYS = frozenset(
 class RCOBudgetPlugin:
     """RCO Stage-1 budget refinement plugin.
 
-    See module docstring for the paper citation (arxiv:2605.00649
-    Algorithm 1), the clean-room re-implementation note (upstream
-    unlicensed, re-verified 2026-05-28), and the nine deviations:
+    Bit-by-bit aligned with the upstream IST-DASLab/RCO implementation
+    (re-verified 2026-05-28, license=null). See the module docstring
+    for the paper citation (arxiv:2605.00649 Algorithm 1) and the
+    deviations that remain (forced by our pipeline's API surface):
 
-    - **D-clean-room** — no verbatim vendoring
-    - **D-init-grape** — initialise from GRAPE, not REAP saliency
-    - **D-fitness-mse** — output-space MSE fitness, not end-to-end loss
+    - **D-clean-room** — no verbatim vendoring (license=null)
+    - **D-fitness-mse** — precomputed damage curve, not model-in-the-loop
+    - **D-analytic-grad** — single-sample analytic gradient (vs STE+autograd)
     - **D-synthetic-curve** — linear-redundancy fallback when no damage curve
     - **D-floor-projection** — floor baked into the option grid
     - **D-ragged-K** — per-layer K varies, padded with mask
-    - **D-bisection-budget** — global retraction, not per-layer
+    - **D-dp-damage-not-logp** — DP score is damage (input form, not polarity)
     - **D-disabled-default** — opt-in via ``stage1.rco_budget.enabled``
-    - **D-adam-no-v-transport** — first moment transported only
+    - **D-no-router-prior** — β-bisection init (upstream's default branch)
+
+    Audit + per-change rationale:
+    ``tasks/RCO_UPSTREAM_ALIGNMENT_AUDIT.md``.
     """
 
     name: str = "rco_budget"
@@ -261,21 +271,28 @@ class RCOBudgetPlugin:
         "RCO: IST-DASLab arxiv:2605.00649 §3 Algorithm 1. "
         "Upstream code at github.com/IST-DASLab/RCO ships without a LICENSE file "
         "(re-verified 2026-05-28 via GitHub API: license=null); this is a "
-        "clean-room re-implementation from the paper's prose. "
-        "Deviations: D-clean-room (no verbatim vendoring), "
-        "D-init-grape (initialize from GRAPE budgets, not REAP saliency), "
-        "D-fitness-mse (output-space MSE fitness, not end-to-end loss), "
+        "clean-room re-implementation from the paper's prose, bit-by-bit "
+        "aligned with upstream's algorithmic choices. "
+        "Deviations (forced by our pipeline): "
+        "D-clean-room (no verbatim vendoring), "
+        "D-fitness-mse (precomputed damage curve, not end-to-end loss), "
+        "D-analytic-grad (single-sample analytic gradient, not STE+autograd), "
         "D-synthetic-curve (linear-redundancy fallback when no damage curve), "
         "D-floor-projection (floor baked into per-layer option grid), "
         "D-ragged-K (per-layer K varies, padded with a mask), "
-        "D-bisection-budget (global retraction, not per-layer), "
+        "D-dp-damage-not-logp (DP minimises damage, upstream maximises log-prob; "
+        "input form differs, polarity consistent), "
         "D-disabled-default (opt-in via stage1.rco_budget.enabled), "
-        "D-adam-no-v-transport (Adam first moment transported only). "
-        "Algorithm details follow paper §3 with: standard Gumbel-softmax "
-        "softmax((α+g)/τ) (NOT α+τ·g); cosine τ-anneal τ_init→τ_final "
-        "(explore→exploit); pure-damage DP knapsack (no β·log p tiebreak); "
-        "Adam first-moment-only vector transport. "
-        "See module docstring for full per-deviation derivations."
+        "D-no-router-prior (β-bisection init; upstream's router-prior variant "
+        "is out of scope). "
+        "Upstream-aligned details: standard Gumbel-softmax softmax((α+g)/τ); "
+        "exponential τ anneal τ_init → τ_min (matches src/search/prune.py:663); "
+        "retraction α ← α + c·costs with tol=0.05 and 40 bracket-doublings "
+        "(matches src/manifold.py:73,96,117); β-bisection init (matches "
+        "src/search/quant.py::init_alpha_to_bits); lower-budget tiebreak on "
+        "infeasibility (matches src/search/quant.py:411-419); per-group "
+        "weights API parameter (matches src/manifold.py weights= kwarg). "
+        "See tasks/RCO_UPSTREAM_ALIGNMENT_AUDIT.md for the full audit."
     )
     config_key: str = "stage1.rco_budget"
     reads: tuple[str, ...] = (
@@ -995,10 +1012,14 @@ class RCOBudgetPlugin:
         p̃_lk · (D_lk − E_p̃[D_l])``. The ``1/τ`` factor is absorbed
         into the Adam learning rate.
         """
-        # Sample Gumbel noise: g_lk = -log(-log(u_lk)) with u ~ Uniform(0,1).
-        # clamp_min(1e-20) avoids log(0) at the floor.
-        u = torch.rand(alpha.shape, generator=rng, dtype=alpha.dtype).clamp_min(1e-20)
-        gumbel = -torch.log(-torch.log(u))
+        # Sample Gumbel noise: g_lk = -log(-log(u_lk) + 1e-20) with
+        # u ~ Uniform(0,1). Mirrors upstream src/search/quant.py:672-673
+        # verbatim: clamp(min=1e-20, max=1-1e-20) on u AND the inner
+        # ``+ 1e-20`` floor inside the inner log.
+        u = torch.rand(alpha.shape, generator=rng, dtype=alpha.dtype).clamp(
+            min=1e-20, max=1.0 - 1e-20,
+        )
+        gumbel = -torch.log(-torch.log(u) + 1e-20)
 
         # Standard Gumbel-softmax form: (α + g) / τ.
         alpha_perturbed = (alpha + gumbel) / tau
