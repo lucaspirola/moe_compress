@@ -247,7 +247,7 @@ def test_merge_experts_inplace_mergemoe_routes_through_new_path(tiny_model):
 
 
 def test_merge_experts_inplace_mergemoe_fallback_on_empty_layer_inputs(
-    tiny_model, caplog,
+    tiny_model, capsys,
 ):
     """``merge_step="mergemoe"`` with ``layer_inputs=None`` falls back to
     freq-weighted with a WARNING.
@@ -261,17 +261,20 @@ def test_merge_experts_inplace_mergemoe_fallback_on_empty_layer_inputs(
 
     _merge_experts_inplace(layer_freq, grouped, freq, freq_weighted=True)
 
-    with caplog.at_level(logging.WARNING, logger="moe_compress.stage2.merging"):
-        _merge_experts_inplace(
-            layer_mm, grouped, freq, freq_weighted=True,
-            merge_step="mergemoe", layer_inputs=None,
-        )
+    # Mirror of 9330988: the moe_compress.stage2.merging logger's handler chain
+    # bypasses pytest's `caplog` under full-suite imports, but the warning
+    # reaches stderr via the default StreamHandler. Assert on captured stderr.
+    _merge_experts_inplace(
+        layer_mm, grouped, freq, freq_weighted=True,
+        merge_step="mergemoe", layer_inputs=None,
+    )
 
-    fallback_records = [r for r in caplog.records
-                        if "fall" in r.message.lower() and "freq" in r.message.lower()]
-    assert len(fallback_records) >= 1, (
-        f"expected a WARNING about the freq-weighted fallback; got: "
-        f"{[r.message for r in caplog.records]}"
+    captured = capsys.readouterr()
+    assert (
+        "falling back to freq-weighted merge" in captured.err
+    ), (
+        f"expected a WARNING about the freq-weighted fallback in captured "
+        f"stderr, got: {captured.err!r}"
     )
 
     # Merged weights should match the freq-weighted result.
