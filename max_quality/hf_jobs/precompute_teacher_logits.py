@@ -181,8 +181,43 @@ def _main() -> int:
         "format_version": 1,
     }
     LOG.info("Saving → %s", out_path)
-    torch.save(payload, out_path)
-    LOG.info("Saved (%.2f GB on disk)", out_path.stat().st_size / 1e9)
+    # F-RK-1 fix: previously bare torch.save(payload, out_path) — no
+    # tmp+rename, no fsync, no manifest. On HF Jobs pod eviction mid-write
+    # (~30 GB), the .pt was truncated at the final path. Stage 5's
+    # mmap=True read silently returned zeros/garbage past EOF → degenerate
+    # KD signal → hours of Stage 5 training produced a silently-worse
+    # student. Now: atomic_torch_save + manifest-last so the Stage 5
+    # reader keys on the manifest's existence + size match.
+    from moe_compress.utils.atomic_io import atomic_torch_save, write_manifest_last
+    manifest_path = out_path.with_suffix(out_path.suffix + ".MANIFEST.json")
+    # Drop any stale manifest from a prior interrupted run before the new
+    # write so resumers never see an old manifest "approve" the new
+    # partial .pt during the window between atomic_torch_save and
+    # write_manifest_last.
+    try:
+        manifest_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    atomic_torch_save(payload, out_path)
+    write_manifest_last(
+        out_path,
+        manifest_path,
+        schema_version=1,
+        extra_meta={
+            "artifact": "stage5_teacher_logits",
+            "model": args.model,
+            "num_samples": int(spec.num_sequences),
+            "sequence_length": int(spec.sequence_length),
+            "batch_size": batch_size,
+            "calibration_seed_offset": 5,
+        },
+        # SHA-256 of a 30 GB file is ~3-5 min on NVMe; we compute once at
+        # write time and store, so opt-in deep validation by operators is
+        # cheap; default read path uses size + schema only.
+        compute_sha256=True,
+    )
+    LOG.info("Saved (%.2f GB on disk) — manifest %s",
+             out_path.stat().st_size / 1e9, manifest_path)
 
     # Optional Hub upload so a separate Stage 5 job (different bucket
     # mount) can fetch the cache directly.

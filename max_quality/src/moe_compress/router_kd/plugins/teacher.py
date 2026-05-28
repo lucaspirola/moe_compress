@@ -261,6 +261,51 @@ class TeacherCachePlugin:
                         cache_path,
                     )
                 log.info("Stage 5: loading precomputed teacher logits from %s", cache_path)
+                # F-RK-1: validate the MANIFEST.json sidecar BEFORE the
+                # mmap-load. The precompute writer writes the manifest LAST
+                # (after the .pt is fsync'd); a torn payload (mid-write
+                # SIGKILL on an HF Jobs pod eviction) leaves NO manifest.
+                # Without this guard, mmap loads metadata cleanly and per-
+                # batch slices past EOF silently return SIGBUS / zero pages
+                # → degenerate KD signal → silently-worse Stage 5 student.
+                #
+                # Backward-compat: a cache written by a pre-F-RK-1
+                # precompute has no manifest. We accept it with a WARNING
+                # and fall through to the existing in-payload schema
+                # check (format_version=1) which is the only torn-write
+                # protection that flow ever had. Remove this fallback
+                # once all in-flight caches are regenerated.
+                manifest_path = cache_path.with_suffix(
+                    cache_path.suffix + ".MANIFEST.json",
+                )
+                if manifest_path.exists():
+                    from moe_compress.utils.atomic_io import (
+                        ManifestMismatchError,
+                        read_and_validate_manifest,
+                    )
+                    try:
+                        read_and_validate_manifest(
+                            cache_path, manifest_path, expected_schema_version=1,
+                        )
+                    except ManifestMismatchError as exc:
+                        raise RuntimeError(
+                            f"Stage 5: teacher-logits cache manifest "
+                            f"validation FAILED — {exc}. The classic "
+                            "torn-write signature on a ~30 GB artifact. "
+                            f"Delete both {cache_path.name} and "
+                            f"{manifest_path.name} from "
+                            f"{cache_path.parent} and re-run "
+                            "precompute_teacher_logits."
+                        ) from exc
+                else:
+                    log.warning(
+                        "Stage 5: teacher-logits cache %s has no "
+                        "MANIFEST.json sibling (pre-F-RK-1 precompute "
+                        "run?). Proceeding without manifest validation; "
+                        "if KD signal looks degenerate, the cache may be "
+                        "torn — delete and re-run precompute.",
+                        cache_path,
+                    )
                 # mmap=True keeps the ~30 GB sidecar memory-mapped instead of
                 # materializing the whole thing in CPU RAM. Each per-batch
                 # slice pages in only what the loop touches.
