@@ -781,6 +781,21 @@ def main() -> int:
                         "(final-dump-only). On --resume, the checkpoint at "
                         "<jsonl>.input_cov.ckpt is hydrated automatically "
                         "if it exists.")
+    # W-1: Wanda scalar_row sidecar (audit/PLAN_W1).
+    p.add_argument("--capture-wanda-scalar-row", action="store_true",
+                   default=False,
+                   help="Capture Wanda scalar_row = E[(x*g_e)^2] per "
+                        "(layer, expert, gate_proj) during calibration; "
+                        "write sidecar wanda_scalar_row.pt (schema v1). "
+                        "Auto-enables "
+                        "VLLM_CALIB_CAPTURE_{WANDA_SCALAR_ROW,ROUTER,EXPERT}=1. "
+                        "Full contract: vllm.calibration_wanda_scalar_row "
+                        "module docstring.")
+    p.add_argument("--wanda-scalar-row-checkpoint-every-chunks", type=int,
+                   default=1, help="When --capture-wanda-scalar-row is set, "
+                                   "dump a .wanda_scalar_row.ckpt every N "
+                                   "chunks; mirrors "
+                                   "--input-cov-checkpoint-every-chunks.")
     # Plugin #12 REDO -- Optimization A profile-pass sidecar.
     p.add_argument("--capture-stage2-profile", action="store_true",
                    default=False,
@@ -1046,6 +1061,20 @@ def main() -> int:
         os.environ["VLLM_CALIB_CAPTURE_EXPERT"] = "1"
         log.info("--capture-input-covariance: enabled "
                  "VLLM_CALIB_CAPTURE_INPUT_COV=1 + "
+                 "VLLM_CALIB_CAPTURE_EXPERT=1 "
+                 "(must precede vllm import)")
+
+    # W-1: Pre-import env gates for the Wanda scalar_row path. Same strict-
+    # string rule. VLLM_CALIB_CAPTURE_ROUTER is REQUIRED so the router hook
+    # fires (for the topk_weights stash); VLLM_CALIB_CAPTURE_EXPERT is
+    # REQUIRED so the expert_in hook fires (for the hidden-state read).
+    if args.capture_wanda_scalar_row:
+        os.environ["VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_ROUTER"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_EXPERT"] = "1"
+        log.info("--capture-wanda-scalar-row: enabled "
+                 "VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW=1 + "
+                 "VLLM_CALIB_CAPTURE_ROUTER=1 + "
                  "VLLM_CALIB_CAPTURE_EXPERT=1 "
                  "(must precede vllm import)")
 
@@ -1411,6 +1440,41 @@ def main() -> int:
                     exc,
                 )
                 input_cov_ckpt_path.unlink()
+
+    # --- Wanda scalar_row accumulator setup (W-1) ----------------------
+    # Mirrors the input-cov block: setup() registers the router +
+    # expert_in callbacks. Resume: hydrate the checkpoint at
+    # <jsonl>.wanda_scalar_row.ckpt.
+    wsr_ckpt_path = None
+    if args.capture_wanda_scalar_row:
+        import vllm.calibration_wanda_scalar_row as _wsr  # type: ignore
+        _wsr.setup(llm)
+        log.info(
+            "wanda-scalar-row: setup complete -- router + expert_in "
+            "callbacks registered"
+        )
+
+        wsr_ckpt_path = out_path.with_suffix(".wanda_scalar_row.ckpt")
+        if args.resume and wsr_ckpt_path.exists():
+            try:
+                loaded_prompts = _wsr.load_wanda_scalar_row_checkpoint(
+                    str(wsr_ckpt_path),
+                )
+                _check_ckpt_counter(
+                    "wanda-scalar-row", loaded_prompts, wsr_ckpt_path,
+                )
+                log.info(
+                    "wanda-scalar-row: hydrated %d-prompt checkpoint from %s",
+                    loaded_prompts, wsr_ckpt_path,
+                )
+            except ValueError as exc:
+                log.error(
+                    "wanda-scalar-row: checkpoint schema mismatch (%s); "
+                    "deleting stale checkpoint and starting accumulators "
+                    "from zero.",
+                    exc,
+                )
+                wsr_ckpt_path.unlink()
 
     # --- Stage 2 profile-pass writer setup (Plugin #12 REDO) -----------
     # Mirrors the input-cov block: setup() pins cov_storage_dtype IMMEDIATELY
@@ -1874,6 +1938,29 @@ def main() -> int:
                             exc, exc_info=True,
                         )
 
+            # Periodic Wanda scalar_row checkpoint -- mirrors input-cov
+            # cadence. W-1 (audit/PLAN_W1) §6.3.
+            if (args.capture_wanda_scalar_row
+                    and args.wanda_scalar_row_checkpoint_every_chunks > 0):
+                chunk_idx = chunk_start // args.chunk_size
+                every = args.wanda_scalar_row_checkpoint_every_chunks
+                if (chunk_idx + 1) % every == 0:
+                    try:
+                        import vllm.calibration_wanda_scalar_row as _wsr  # type: ignore
+                        _wsr.set_n_prompts_accumulated(already_done + n_new)
+                        _wsr.dump_wanda_scalar_row_checkpoint(
+                            str(wsr_ckpt_path),
+                        )
+                        log.info(
+                            "wanda-scalar-row: checkpointed %d prompts -> %s",
+                            already_done + n_new, wsr_ckpt_path,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "wanda-scalar-row checkpoint failed: %s",
+                            exc, exc_info=True,
+                        )
+
             # Plugin #12 REDO -- periodic stage2-profile checkpoint.
             if (args.capture_stage2_profile
                     and args.stage2_profile_checkpoint_every_chunks > 0):
@@ -2069,6 +2156,23 @@ def main() -> int:
                 input_cov_ckpt_path.unlink()
         except Exception as exc:
             log.error("input-cov dump failed: %s", exc, exc_info=True)
+
+    # --- Wanda scalar_row dump (W-1) -----------------------------------
+    # Same try/except policy: the JSONL is the primary deliverable;
+    # dump failures are logged but never re-raised.
+    if args.capture_wanda_scalar_row:
+        try:
+            import vllm.calibration_wanda_scalar_row as _wsr  # type: ignore
+            _wsr.set_n_prompts_accumulated(already_done + n_new)
+            _wsr.dump_wanda_scalar_row(out_path)
+            log.info(
+                "wanda-scalar-row: dumped sidecar from %d prompts (next to %s)",
+                _wsr.get_n_prompts_accumulated(), out_path,
+            )
+            if wsr_ckpt_path is not None and wsr_ckpt_path.exists():
+                wsr_ckpt_path.unlink()
+        except Exception as exc:
+            log.error("wanda-scalar-row dump failed: %s", exc, exc_info=True)
 
     # --- Plugin #12 REDO -- stage2-profile dump ------------------------
     # Same try/except policy as the other writers: the JSONL is the
