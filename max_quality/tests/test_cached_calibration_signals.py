@@ -49,6 +49,7 @@ from moe_compress.utils.cached_calibration_signals import (
     Stage1PerExpertMaxPayload,
     Stage2ProfilePayloadV3,
     Stage2ReapPayload,
+    TeacherEvalPayload,
     load_block_hidden,
     load_covariance,
     load_output_reservoir,
@@ -651,9 +652,171 @@ def test_block_hidden_roundtrip(tmp_path):
 # NIT-3 / NIT-4 there is no private ``_test_save_teacher_eval`` helper to
 # introduce. The ``TeacherEvalPayload`` dataclass + ``load_teacher_eval``
 # loader remain defined in cached_calibration_signals.py (and are still
-# exported in its ``__all__``) so a future Sequence-2 follow-up can
-# re-target Stage 6 through this canonical name; see the OPEN-QUESTION
-# docstring on Signal 6 there.
+# exported in its ``__all__``) -- and as of MEDIUM-2 (2026-05-29) the
+# dataclass also exposes the ``from_legacy_json`` classmethod that
+# adapts Stage 6's JSON cache into the typed shape; the 4 tests below
+# exercise that adapter.
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-2: TeacherEvalPayload.from_legacy_json adapter (Stage 6 JSON read).
+# ---------------------------------------------------------------------------
+def _write_stage6_teacher_json(
+    path: Path,
+    *,
+    cache_key: str = "a" * 64,
+    teacher_results: dict | None = None,
+    teacher_param_counts: dict | None = None,
+    format_version: int | None = 1,
+) -> None:
+    """Mirror of Stage 6's ``_save_teacher_cache`` on-disk layout.
+
+    Keep the field shape identical to the Stage 6 writer
+    (``stage6/plugins/teacher_provider.py:_save_teacher_cache``). The
+    adapter under test is the read-path counterpart of that writer.
+    """
+    import json as _json
+    data: dict = {
+        "cache_key": cache_key,
+        "teacher_results": teacher_results if teacher_results is not None else {
+            "wikitext2": {"ppl": 12.34},
+            "zero_shot": {"arc_easy": {"acc": 0.5}},
+        },
+    }
+    if teacher_param_counts is not None:
+        data["teacher_param_counts"] = teacher_param_counts
+    if format_version is not None:
+        data["format_version"] = format_version
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+
+
+def test_teacher_eval_payload_from_legacy_json_roundtrip(tmp_path):
+    """Write a synthetic Stage 6 JSON, adapt it via the classmethod, and
+    verify every typed field is populated correctly (including the
+    optional ``teacher_param_counts``).
+    """
+    cache_path = tmp_path / "teacher_eval_cache.json"
+    cache_key = "deadbeef" * 8  # 64 chars to match SHA-256 hex length
+    teacher_results = {
+        "wikitext2": {"ppl": 11.5},
+        "zero_shot": {"arc_easy": {"acc": 0.72, "acc_norm": 0.75}},
+        "generative": {"humaneval": {"pass@1": 0.42}},
+    }
+    teacher_param_counts = {"total": 1_234_567, "experts": 999_999}
+    _write_stage6_teacher_json(
+        cache_path,
+        cache_key=cache_key,
+        teacher_results=teacher_results,
+        teacher_param_counts=teacher_param_counts,
+        format_version=SCHEMA_VERSIONS["teacher_eval"],
+    )
+
+    payload = TeacherEvalPayload.from_legacy_json(cache_path)
+
+    assert isinstance(payload, TeacherEvalPayload)
+    assert payload.schema_version == SCHEMA_VERSIONS["teacher_eval"]
+    assert payload.cache_key == cache_key
+    assert payload.teacher_results == teacher_results
+    assert payload.teacher_param_counts == teacher_param_counts
+
+    # Legacy-cache variant: teacher_param_counts may be absent. The
+    # adapter must surface that as None (not raise) -- matches the
+    # Stage 6 reader's behaviour at teacher_provider.py:198-205.
+    legacy_path = tmp_path / "legacy_teacher_eval_cache.json"
+    _write_stage6_teacher_json(
+        legacy_path,
+        cache_key=cache_key,
+        teacher_results=teacher_results,
+        teacher_param_counts=None,
+        format_version=SCHEMA_VERSIONS["teacher_eval"],
+    )
+    legacy_payload = TeacherEvalPayload.from_legacy_json(legacy_path)
+    assert legacy_payload.teacher_param_counts is None
+    assert legacy_payload.teacher_results == teacher_results
+
+
+def test_teacher_eval_payload_from_legacy_json_rejects_unknown_schema_version(tmp_path):
+    """Pattern C: an on-disk ``format_version`` that does not match
+    ``SCHEMA_VERSIONS["teacher_eval"]`` raises ``ValueError`` with the
+    canonical "Delete the sidecar to regenerate" message.
+    """
+    cache_path = tmp_path / "teacher_eval_cache.json"
+    bogus_version = SCHEMA_VERSIONS["teacher_eval"] + 42
+    _write_stage6_teacher_json(cache_path, format_version=bogus_version)
+
+    with pytest.raises(ValueError) as exc:
+        TeacherEvalPayload.from_legacy_json(cache_path)
+    msg = str(exc.value)
+    assert f"format_version={bogus_version}" in msg
+    assert f"expected {SCHEMA_VERSIONS['teacher_eval']}" in msg
+    assert "Delete the sidecar to regenerate" in msg
+
+    # Missing format_version key entirely is also rejected (fail-loud).
+    no_version_path = tmp_path / "no_version.json"
+    _write_stage6_teacher_json(no_version_path, format_version=None)
+    with pytest.raises(ValueError) as exc:
+        TeacherEvalPayload.from_legacy_json(no_version_path)
+    assert "no 'format_version' field" in str(exc.value)
+    assert "Delete the sidecar to regenerate" in str(exc.value)
+
+
+def test_teacher_eval_payload_from_legacy_json_missing_file(tmp_path):
+    """Fail-loud: pointing at a non-existent path raises ``FileNotFoundError``
+    with an actionable message (not silently returning None — that is the
+    ``load_teacher_eval`` sidecar reader's contract, not this adapter's).
+    """
+    missing = tmp_path / "does_not_exist.json"
+    assert not missing.exists()
+
+    with pytest.raises(FileNotFoundError) as exc:
+        TeacherEvalPayload.from_legacy_json(missing)
+    msg = str(exc.value)
+    assert "no teacher cache" in msg
+    assert str(missing) in msg
+
+
+def test_teacher_eval_payload_from_legacy_json_malformed_json(tmp_path):
+    """Fail-loud: corrupt JSON raises ``ValueError`` (wrapping
+    ``json.JSONDecodeError``) with the actionable
+    "Delete the sidecar to regenerate" message. Also exercises the
+    not-a-dict and missing-required-key fail-loud branches.
+    """
+    # 1. Truncated JSON.
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not even close to valid JSON", encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        TeacherEvalPayload.from_legacy_json(bad)
+    assert "not valid JSON" in str(exc.value)
+    assert "Delete the sidecar to regenerate" in str(exc.value)
+
+    # 2. Valid JSON but a top-level list (not an object).
+    list_path = tmp_path / "list.json"
+    list_path.write_text("[1, 2, 3]", encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        TeacherEvalPayload.from_legacy_json(list_path)
+    assert "did not decode to a JSON object" in str(exc.value)
+
+    # 3. Valid object but missing 'cache_key'.
+    missing_key_path = tmp_path / "missing_key.json"
+    import json as _json
+    missing_key_path.write_text(_json.dumps({
+        "teacher_results": {"wikitext2": {"ppl": 1.0}},
+        "format_version": SCHEMA_VERSIONS["teacher_eval"],
+    }), encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        TeacherEvalPayload.from_legacy_json(missing_key_path)
+    assert "missing or non-string 'cache_key'" in str(exc.value)
+
+    # 4. Valid object but missing 'teacher_results'.
+    missing_results_path = tmp_path / "missing_results.json"
+    missing_results_path.write_text(_json.dumps({
+        "cache_key": "x" * 64,
+        "format_version": SCHEMA_VERSIONS["teacher_eval"],
+    }), encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        TeacherEvalPayload.from_legacy_json(missing_results_path)
+    assert "missing or non-dict 'teacher_results'" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

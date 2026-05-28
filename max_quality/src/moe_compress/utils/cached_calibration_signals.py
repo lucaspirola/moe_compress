@@ -86,6 +86,7 @@ land in items V1+V2 + items 1-10 of the calibration-v2 campaign.
 
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
@@ -560,38 +561,164 @@ class BlockHiddenPayload:
 class TeacherEvalPayload:
     """Canonical in-memory shape for a teacher-harness cache entry.
 
-    OPEN-QUESTION (Sequence 2, MEDIUM-2): Stage 6 currently bypasses
-    this dataclass and rolls its own JSON-keyed cache in
+    OPEN-QUESTION resolution (Sequence 2, MEDIUM-2; resolved 2026-05-29
+    via option (b) variant -- *adapter*, not *writer*): Stage 6's
+    on-disk JSON format is unchanged. The Stage 6 writer at
     ``stage6/plugins/teacher_provider.py`` (``_save_teacher_cache`` /
-    ``_load_teacher_cache``). Migrating Stage 6 to use this canonical
-    shape is genuinely ambiguous:
+    ``_load_teacher_cache``) remains the source of truth for that
+    cache file's layout:
 
-    * Storage location: Stage 6's cache lives at an operator-
-      configurable path (``s6.teacher_eval_cache.cache_path``, default
-      ``<artifacts_dir>/teacher_eval_cache.json``). This payload's
-      writer/reader use ``sidecar_path(jsonl_path, "teacher_eval")``,
-      which is a different layout (sidecars next to a JSONL trace).
-      Stage 6 has no JSONL.
-    * Format: Stage 6 writes a human-readable JSON file with strong
-      fsync. ``_atomic_torch_save`` produces an opaque torch.save
-      stream. Switching format is a regression on operator
-      inspectability.
-    * Field naming: the only field-level difference is
-      ``format_version`` (JSON) vs ``schema_version`` (this dataclass).
+    * Storage location: still ``s6.teacher_eval_cache.cache_path``
+      (operator-configurable, default
+      ``<artifacts_dir>/teacher_eval_cache.json``).
+    * Format: still a human-readable JSON file with strong fsync --
+      operator inspectability is preserved.
+    * Field naming: the JSON's ``format_version`` is adapted onto
+      this dataclass's ``schema_version`` at read time.
 
-    Resolution deferred. Either: (a) leave Stage 6's mechanism alone
-    and treat this dataclass as canonical only for the (currently
-    unused) sidecar-layout cache; or (b) introduce a JSON-on-disk
-    writer here keyed by an operator-supplied path (not a JSONL stem)
-    so Stage 6 can switch to a canonical name. The dataclass + load
-    function are retained so a future fix can re-target Stage 6 without
-    re-introducing the deleted writer (see NIT-5 commit).
+    What landed: a READ-PATH adapter, :meth:`from_legacy_json`, that
+    parses Stage 6's JSON cache into a properly-typed
+    ``TeacherEvalPayload`` instance. New consumers that need the
+    typed shape (e.g. cross-stage code that wants to read Stage 6's
+    teacher numbers without depending on stage6/plugins internals)
+    should use ``TeacherEvalPayload.from_legacy_json(path)`` instead
+    of parsing the JSON directly. The classmethod validates
+    ``format_version`` against the central ``SCHEMA_VERSIONS`` table
+    and raises ``ValueError`` with the actionable "Delete the
+    sidecar to regenerate" message on mismatch (Pattern C).
+
+    Note that this dataclass remains *canonical only for reads*:
+    Stage 6 owns its on-disk JSON format and its writer. No new
+    writer from this module lands; the legacy
+    :func:`load_teacher_eval` (torch-pt sidecar reader) is
+    retained for backward compat with any sidecars an operator may
+    have written before the resolution (see NIT-5).
     """
 
     schema_version: int
     cache_key: str                        # SHA-256 from _teacher_cache_key
     teacher_results: dict
     teacher_param_counts: dict | None
+
+    @classmethod
+    def from_legacy_json(cls, path: Path) -> "TeacherEvalPayload":
+        """Adapt a Stage 6 ``teacher_eval_cache.json`` into a typed payload.
+
+        Stamp: 2026-05-29 (Pattern H clean-room -- MEDIUM-2 resolution).
+
+        Reads the JSON format written by
+        :func:`moe_compress.stage6.plugins.teacher_provider._save_teacher_cache`
+        (see ``stage6/plugins/teacher_provider.py`` around L217-L266 for
+        the writer). The on-disk schema, copied verbatim from that
+        writer, is::
+
+            {
+                "cache_key": "<sha256>",
+                "teacher_results": { ... },
+                "teacher_param_counts": { ... }  # optional (legacy: absent)
+                "format_version": 1
+            }
+
+        Field mapping JSON -> dataclass:
+            ``format_version``     -> ``schema_version``  (validated)
+            ``cache_key``          -> ``cache_key``
+            ``teacher_results``    -> ``teacher_results``
+            ``teacher_param_counts`` (optional) -> ``teacher_param_counts``
+                (``None`` when absent -- matches the Stage 6 reader's
+                legacy-cache fallback at teacher_provider.py:198-205)
+
+        Pattern C validation:
+            * Missing file -> ``FileNotFoundError`` (actionable: "no
+              teacher cache at {path}").
+            * Malformed JSON -> ``ValueError`` (wraps json.JSONDecodeError).
+            * Missing ``cache_key`` or ``teacher_results`` -> ``ValueError``.
+            * ``format_version`` mismatch with
+              ``SCHEMA_VERSIONS["teacher_eval"]`` -> ``ValueError`` with
+              the canonical "Delete the sidecar to regenerate" message.
+
+        Returns a properly-typed :class:`TeacherEvalPayload` instance.
+
+        Cross-ref: keep this aligned with the writer in
+        :func:`moe_compress.stage6.plugins.teacher_provider._save_teacher_cache`
+        (commit: see ``TEACHER_CACHE_FORMAT_VERSION`` constant there).
+        If Stage 6 bumps ``TEACHER_CACHE_FORMAT_VERSION``, also bump
+        ``SCHEMA_VERSIONS["teacher_eval"]`` in this module.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"TeacherEvalPayload.from_legacy_json: no teacher cache "
+                f"at {path}. Run Stage 6 first to populate "
+                f"teacher_eval_cache.json, or pass the correct path."
+            )
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"TeacherEvalPayload.from_legacy_json: cache file at "
+                f"{path} is not valid JSON ({exc}). "
+                f"Delete the sidecar to regenerate."
+            ) from exc
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"TeacherEvalPayload.from_legacy_json: cache file at "
+                f"{path} did not decode to a JSON object (got "
+                f"{type(data).__name__}). "
+                f"Delete the sidecar to regenerate."
+            )
+
+        on_disk_version = data.get("format_version")
+        expected = SCHEMA_VERSIONS["teacher_eval"]
+        if on_disk_version is None:
+            raise ValueError(
+                f"TeacherEvalPayload.from_legacy_json: cache file at "
+                f"{path} has no 'format_version' field "
+                f"(expected {expected}). "
+                f"Delete the sidecar to regenerate."
+            )
+        if int(on_disk_version) != int(expected):
+            raise ValueError(
+                f"TeacherEvalPayload.from_legacy_json: cache file at "
+                f"{path} has format_version={on_disk_version}, "
+                f"expected {expected}. "
+                f"Delete the sidecar to regenerate."
+            )
+
+        cache_key = data.get("cache_key")
+        if not isinstance(cache_key, str) or not cache_key:
+            raise ValueError(
+                f"TeacherEvalPayload.from_legacy_json: cache file at "
+                f"{path} has missing or non-string 'cache_key'. "
+                f"Delete the sidecar to regenerate."
+            )
+
+        teacher_results = data.get("teacher_results")
+        if not isinstance(teacher_results, dict):
+            raise ValueError(
+                f"TeacherEvalPayload.from_legacy_json: cache file at "
+                f"{path} has missing or non-dict 'teacher_results'. "
+                f"Delete the sidecar to regenerate."
+            )
+
+        # teacher_param_counts is optional (legacy caches written before
+        # the field was added omit it; the Stage 6 reader treats absence
+        # as a soft warning, not an error -- see teacher_provider.py:198-205).
+        teacher_param_counts = data.get("teacher_param_counts")
+        if (teacher_param_counts is not None
+                and not isinstance(teacher_param_counts, dict)):
+            raise ValueError(
+                f"TeacherEvalPayload.from_legacy_json: cache file at "
+                f"{path} has non-dict 'teacher_param_counts' (got "
+                f"{type(teacher_param_counts).__name__}). "
+                f"Delete the sidecar to regenerate."
+            )
+
+        return cls(
+            schema_version=int(on_disk_version),
+            cache_key=cache_key,
+            teacher_results=teacher_results,
+            teacher_param_counts=teacher_param_counts,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1163,14 +1290,15 @@ def load_block_hidden(jsonl_path: Path, layer_idx: int) -> BlockHiddenPayload | 
 # (``_save_teacher_cache`` writes a strong-fsync JSON file at an
 # operator-configurable path, distinct from this sidecar layout).
 #
-# OPEN-QUESTION (Sequence 2, MEDIUM-2): whether to migrate Stage 6's
-# JSON-keyed cache into ``TeacherEvalPayload`` is genuinely ambiguous --
-# the storage location semantics (operator-facing path vs sidecar-next-
-# to-jsonl) and format (human-readable JSON vs torch pickle) differ.
-# Migration was deferred; ``TeacherEvalPayload`` + ``load_teacher_eval``
-# are retained for backward-compat with any sidecars an operator may
-# have written and so a future Sequence-2 follow-up can re-target
-# Stage 6 through this canonical name.
+# MEDIUM-2 resolution (2026-05-29, user picked option (b)-as-adapter):
+# Stage 6 keeps its on-disk JSON format unchanged; the READ path now
+# also goes through the canonical typed ``TeacherEvalPayload`` via the
+# ``from_legacy_json(path)`` classmethod (see the dataclass docstring
+# above for the full resolution). New consumers should use that
+# classmethod rather than parsing Stage 6's JSON directly. The legacy
+# ``load_teacher_eval`` sidecar reader below is RETAINED for
+# backward-compat with any torch-pt sidecars an operator may have
+# written before the resolution.
 # ---------------------------------------------------------------------------
 def load_teacher_eval(jsonl_path: Path) -> TeacherEvalPayload | None:
     path = _resolve_sidecar_for_load(jsonl_path, "teacher_eval")
