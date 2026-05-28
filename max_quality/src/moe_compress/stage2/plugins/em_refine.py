@@ -41,9 +41,22 @@ The merge formula is non-linear in inputs but linear in weights:
 ``forward(linear_combo(W_e)) ≠ linear_combo(forward(W_e))``. After one
 merge, the centroid's weights are no longer the original — a new
 assignment under the new centroid weights may produce a lower-cost
-matching. Sub-MoE demonstrates this iterative refinement on K-means-
-style merging; the Stage 2 v2 EM round adapts it to the freq-weighted
-merge formula used by capacitated assignment.
+matching.
+
+Inspiration vs adaptation: Sub-MoE (arXiv:2506.23266) runs classical
+K-means **over expert output vectors** with k-means++ seeding (paper
+line 245), cosine-similarity assignment (Eq. 2), and a **uniform**
+arithmetic mean of outputs at the centroid-update step (paper line 250,
+objective in Eq. 3); a **single-shot** SVD + frequency-weighted V-matrix
+merge (Eq. 7, paper line 326) is then applied **after** clustering
+converges — Sub-MoE does **not** iteratively re-cluster around tentative
+merged weights. Our plugin is *adapted from* (not a re-implementation
+of) Sub-MoE: we borrow only the E→M→converge shape and apply it in
+**weight space** under capacitated assignment — re-solving the
+assignment against tentative **freq-weighted merged centroid weights**
+(per-round). The freq weighting itself is paper-attested, but only at
+Sub-MoE's V-matrix merge step (Eq. 7), not at its K-means centroid
+update (Eq. 3, which is uniform).
 
 Cache invariant: the cached perm becomes stale under tentative
 weights, so the inner cost recomputes the perm; the cache is **not**
@@ -85,7 +98,40 @@ Early-exit uses strict assignment equality (``new_assignment ==
 assignment``). With Sinkhorn solvers a single low-confidence flip can
 prevent termination; a Hamming-distance tolerance would be a natural
 future-work knob (see MEDIUM-2 in audit history). Kept strict today to
-preserve byte-identical determinism with the greedy solver.
+preserve byte-identical determinism with the greedy solver. Note that
+Sub-MoE's paper does not use "EM" / "E-step" / "M-step" terminology
+(its §3.2 names the four steps "Means Initialization / Clusters
+Assignment / Means Update / Convergence"); our "EM" / "M4" naming is an
+internal Stage 2 v2 convention, not a paper-traceable label.
+
+Initialization context (D-em-init-reap)
+---------------------------------------
+This plugin is a *refiner*, not an initializer: it operates on an
+assignment already seeded upstream. Sub-MoE explicitly uses k-means++
+on expert outputs for centroid seeding (paper line 245); the Stage 2 v2
+pipeline initializes from REAP-saliency-ranked centroids via
+``select_centroids_by_reap`` (see ``orchestrator.py:344``; REAP itself
+is arXiv:2510.13999). The k-means++ → REAP-saliency swap is therefore
+an upstream deviation visible to em_refine only as the starting
+assignment it inherits.
+
+Pattern H: paper-only re-implementation
+---------------------------------------
+No upstream code exists for the Sub-MoE-inspired EM loop. Paper
+re-verification stamp: 2026-05-28.
+
+Upstream URL audit (2026-05-28):
+
+* ``github.com/lliai/MoERazor`` — paper-cited reference repo →
+  HTTP 404 (verified via ``curl``); the repository does not exist.
+* ``github.com/siruihan2024/Sub-MoE`` — placeholder repo → HTTP 200,
+  but contains only ``README.md`` + ``LICENSE`` (MIT, repo size = 1 KB,
+  default_branch = main, last updated 2026-03-14T15:46:59Z, verified via
+  GitHub API). No source code is published.
+
+The arXiv:2506.23266 PDF is therefore the sole authoritative source for
+Sub-MoE; this plugin is paper-only re-implementation with no upstream
+to clean-room from.
 """
 from __future__ import annotations
 
