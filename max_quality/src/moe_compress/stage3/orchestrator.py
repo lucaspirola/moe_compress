@@ -70,6 +70,7 @@ from .plugins.swift_svd_alpha import (
     _redistribute_ranks_swift_svd_plus,
     _snapshot_originals,
 )
+from .plugins.wanda_intra_expert_score import WandaIntraExpertScorePlugin
 
 log = logging.getLogger(__name__)
 
@@ -231,6 +232,12 @@ def run(
         Stage3InputCovCacheProvider(),
         Stage3BlockHiddenCacheProvider(),
         CovarianceCollectionPlugin(),
+        # Routing-weighted Wanda intra-expert importance score (MoE-Pruner
+        # arXiv:2410.12013, clean-room from fusion_bench upstream). Default
+        # OFF — registry filter drops the plugin when
+        # ``stage3.wanda_intra_expert.enabled`` is false, making the
+        # ``collect_wanda_scores`` walk_phases call a no-op.
+        WandaIntraExpertScorePlugin(),
         DRankAllocatePlugin(),
         SwiftSvdAlphaPlugin(),
         AaSvdFactorPlugin(),
@@ -362,6 +369,21 @@ def run(
     run_ctx.set("teacher_model", teacher_model, overwrite=True)
     run_ctx.set("teacher_moe_layers", teacher_moe_layers, overwrite=True)
     run_ctx.set("C_acc", C_acc, overwrite=True)
+
+    # ---- collect_wanda_scores -------------------------------------------
+    # Routing-weighted Wanda intra-expert score (MoE-Pruner arXiv:2410.12013).
+    # Default OFF -- WandaIntraExpertScorePlugin.is_enabled gates on
+    # stage3.wanda_intra_expert.enabled, so the registry filter drops it
+    # and this walk_phases call is a byte-identical no-op for runs that
+    # do not opt in. When enabled, the plugin runs its own calibration
+    # pass through the student model and publishes
+    # ctx["stage3.wanda_intra_expert_score"] (a nested
+    # {layer: {expert: {matrix: Tensor}}} score map). See
+    # stage3.plugins.wanda_intra_expert_score for the math + upstream
+    # citation. Placed between collect_covariances and allocate_ranks so
+    # a future allocator that wants to consult the score can read it
+    # through the parent chain.
+    walk_phases(("collect_wanda_scores",), plugins, run_ctx)
 
     # ---- allocate_ranks --------------------------------------------------
     # The per-(layer, matrix) group_stats loop is RUN-GLUE (it needs
