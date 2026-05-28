@@ -1055,8 +1055,10 @@ def run(
     if expert_distill_ce_lambda < 0.0:
         raise ValueError(
             f"stage2_reap_ream.expert_distill_ce_lambda="
-            f"{expert_distill_ce_lambda}; must be >= 0 (set 0 to silence "
-            "the MSE term while still running CE)."
+            f"{expert_distill_ce_lambda}; must be >= 0 (set 0 (with "
+            "`use_ce_term=True`) to silence the MSE term while still "
+            "running CE; with `use_ce_term=False` the run is pure MSE "
+            "and lambda has no effect)."
         )
     # cost_asymmetric × freq_weighted_merge invariant is checked at the very
     # top of run() (fail-fast); we rely on that here.

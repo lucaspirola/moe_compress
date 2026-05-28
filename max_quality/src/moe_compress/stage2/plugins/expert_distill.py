@@ -115,6 +115,58 @@ Config knobs (Pattern C — consumed verbatim, no implicit coupling):
   weighting between CE and MSE; tune via config since the paper does
   not pin a numeric default.
 
+OPEN-QUESTION: feature-level KL is NOT mathematically equivalent to
+paper Eq. 10's L_CE
+-------------------------------------------------------------------
+The feature-level KL implemented here is a per-layer engineering
+adaptation, not a faithful realization of the paper's L_CE. Two
+concrete semantic gaps:
+
+  1. The hidden-dim softmax has no meaningful event space at the
+     feature level. The paper's L_CE is a categorical cross-entropy
+     over a real probability space (vocabulary tokens, one event per
+     vocab slot). A softmax over a hidden-state's feature axis
+     manufactures a distribution where the "events" are arbitrary
+     coordinate indices — there is no semantic interpretation under
+     which p(feature_i) means anything analogous to p(token_i).
+  2. The hidden-axis softmax is **invariant to constant shifts along
+     that axis**: any two hidden vectors ``h`` and ``h + c·1`` produce
+     identical softmaxes, so the KL is blind to constant-shift errors
+     in the merged centroid's output even though those shifts DO
+     change downstream LM logits and the paper's true L_CE would
+     penalize them. (The MSE term still penalizes the shift, which is
+     why the composite is non-degenerate in practice — but the CE
+     contribution itself is shift-blind.)
+
+Two alternative adaptations the user should consider before locking in
+λ or moving to production tuning:
+
+  (a) **Bubble teacher LM-head logits into ctx.** Run the teacher
+      forward through the LM head on the per-layer token batch, pipe
+      the resulting (T, vocab) logits into ``pre_merge_weights`` /
+      a sibling ctx slot, and use a true vocab-level KL or
+      cross-entropy as L_CE — matching paper Eq. 10 verbatim. This
+      is a larger architectural change (touches the snapshot path
+      and the ctx contract) but gives the paper-correct semantics.
+  (b) **Alternative normalization on the existing hidden tensors.**
+      E.g. feature-wise MSE on softmaxed logits (no log on student
+      side, no KL — just L2 between two softmax-normalized
+      distributions, which at least avoids the log-domain blow-up on
+      near-zero student probs), or a row-LayerNorm-aware KL that
+      first centers and scales hidden vectors so the constant-shift
+      invariance is broken in a structured way before the softmax.
+      Smaller change than (a); still not paper-faithful but closes
+      the constant-shift gap.
+
+The current implementation is **not blocked** by this open question —
+it produces a correctly-signed gradient component that pushes the
+merged centroid toward the pre-merge group-member forward in
+distribution-shape (not just magnitude). But the ``ce_lambda=1.0``
+default was chosen for MSE-magnitude parity under the current
+adaptation; if (a) or (b) lands, expect to re-tune λ from scratch
+since the new L_CE will have different magnitude characteristics.
+Track this as an outstanding paper-fidelity TODO.
+
 Deviation: D-expert-distill-paper-lift (Lift 2, paper Eqs. 1-3)
 ---------------------------------------------------------------
 v2 target — adds the **TopK gate + per-token routing weight** that
@@ -160,6 +212,31 @@ e_score_correction_bias) and the pre-merge expert weights in
 ``pre_merge_weights`` — no additional plumbing beyond the existing
 v1 inputs is needed. The v1-waste of snapshotting all experts
 (documented in ``_snapshot_pre_merge_layer_experts``) is unchanged.
+
+Performance disclosure (v2 cold-cache CI cost)
+----------------------------------------------
+v2 adds a per-group ``_router_routing_weights`` recompute (full-softmax
+``σ_orig(x)`` over the unpruned router, then a TopK mask and
+renormalization) inside ``_distill_merged_group``. Empirical wall-clock
+characteristics observed on the assignment_v2 test suite
+(``tests/test_stage2_assignment_v2.py``):
+
+- Main branch baseline: 52 passed, 6 skipped in ~3.7s
+- This branch, cold cache: ~120s total with occasional
+  ``--timeout=60`` failures
+- This branch, warm cache: 1.5-13s (no regression)
+
+The cold slowdown is NOT pre-existing — it is the cost of the per-group
+router-routing-weight recompute, paid once per group on the first
+distillation pass through a layer. Warm runs amortize via Python's
+import cache + torch's kernel cache and show no measurable regression.
+
+If this becomes a CI flake (i.e. cold-cache runs intermittently exceed
+the 60s wall), the cheapest fix is to **cache the routing weights at
+first compute and reuse them across the per-group loop** — ``σ_orig``
+is shared across all groups within a layer (the router is the same
+tensor), so the current per-group recompute is O(num_groups) wasteful.
+This is a follow-up optimization, not a blocker.
 
 Deviation: D-expert-distill-mse-v1
 ----------------------------------
@@ -477,6 +554,11 @@ def _distill_merged_group(
             # softmax. Equivalent (and numerically friendlier) form:
             # zero-out non-top-k softmax probs and renormalize to sum
             # to 1 across top-k.
+            # math: softmax(logit; mask=−∞) ≡ softmax_full × topk_mask / sum
+            # (the −∞ entries vanish under exp(); the surviving top-k
+            # entries normalize to the same renormalized softmax we get
+            # by masking-then-dividing the full softmax — tying this
+            # implementation directly to paper Eq. 2's mask form.)
             topk_idx = torch.topk(sigma, k=router_top_k, dim=-1).indices  # (T, k)
             topk_mask = torch.zeros_like(sigma, dtype=torch.bool)
             topk_mask.scatter_(1, topk_idx, True)
