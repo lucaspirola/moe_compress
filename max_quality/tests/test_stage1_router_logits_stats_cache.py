@@ -301,7 +301,7 @@ def test_schema_mismatch_raises(tmp_path, monkeypatch):
     ctx.set("moe_layers", moe_layers)
     ctx.set("config", _enabled_config())
     provider = Stage1RouterLogitsStatsCacheProvider()
-    with pytest.raises(ValueError, match="Delete the sidecar to regenerate"):
+    with pytest.raises(RuntimeError, match="manifest validation FAILED"):
         provider.on_load(ctx, jsonl)
 
 

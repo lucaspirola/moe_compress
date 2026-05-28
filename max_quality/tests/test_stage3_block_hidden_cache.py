@@ -206,12 +206,13 @@ def test_schema_mismatch_raises(tmp_path, monkeypatch):
     )
 
     provider = Stage3BlockHiddenCacheProvider()
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(RuntimeError) as exc:
         provider.on_load(ctx, jsonl)
     msg = str(exc.value)
+    assert "manifest validation FAILED" in msg
     assert "schema_version=1" in msg
     assert "expected 99" in msg
-    assert "Delete the sidecar to regenerate" in msg
+    assert "re-run calibration" in msg
 
 
 # ---------------------------------------------------------------------------

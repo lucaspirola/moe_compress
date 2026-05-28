@@ -176,7 +176,7 @@ def test_schema_mismatch_raises(tmp_path, monkeypatch):
     save_stage2_profile_v3(original, jsonl)
     # Bump the central version so the existing sidecar disagrees.
     monkeypatch.setitem(SCHEMA_VERSIONS, "stage2_profile", 99)
-    with pytest.raises(ValueError, match="Delete the sidecar to regenerate"):
+    with pytest.raises(RuntimeError, match="manifest validation FAILED"):
         load_stage2_profile_v3(jsonl)
 
 

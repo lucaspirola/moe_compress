@@ -98,8 +98,9 @@ def test_save_load_roundtrip(tmp_path):
 
 
 def test_schema_mismatch_raises(tmp_path, monkeypatch):
-    """Forced schema=99 → load_reap_scores raises ValueError pointing to
-    the actionable 'Delete the sidecar' message."""
+    """Forced schema=99 → load_reap_scores raises ``RuntimeError`` from
+    Pattern O manifest validation with the actionable 'Delete both ...
+    re-run calibration' message."""
     jsonl = _jsonl(tmp_path)
     save_reap_scores(_make_payload(), jsonl)
 
@@ -111,12 +112,13 @@ def test_schema_mismatch_raises(tmp_path, monkeypatch):
         bumped,
     )
 
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(RuntimeError) as exc:
         load_reap_scores(jsonl)
     msg = str(exc.value)
+    assert "manifest validation FAILED" in msg
     assert "schema_version=1" in msg
     assert "expected 99" in msg
-    assert "Delete the sidecar to regenerate" in msg
+    assert "re-run calibration" in msg
 
 
 # ---------------------------------------------------------------------------

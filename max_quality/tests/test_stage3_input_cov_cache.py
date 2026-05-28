@@ -117,23 +117,25 @@ def test_schema_mismatch_raises(tmp_path, monkeypatch):
     )
 
     provider = Stage3InputCovCacheProvider()
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(RuntimeError) as exc:
         provider.on_load(PipelineContext(), jsonl)
     msg = str(exc.value)
     # The on-disk file is v2; expected v99 after the monkeypatch.
+    assert "manifest validation FAILED" in msg
     assert "schema_version=2" in msg
     assert "expected 99" in msg
-    assert "Delete the sidecar to regenerate" in msg
+    assert "re-run calibration" in msg
 
 
 def test_schema_mismatch_propagates_through_dispatch_first(tmp_path, monkeypatch):
-    """Schema-mismatch ValueError must propagate out of dispatch_first.
+    """Schema-mismatch RuntimeError must propagate out of dispatch_first.
 
     The orchestrator's try/except around the cache lookup narrowed to
-    ``(FileNotFoundError, OSError)`` -- a ``ValueError`` from
-    ``_check_schema`` MUST escape so the user sees the actionable
-    "Delete the sidecar to regenerate" message instead of silently
-    falling back to a stale legacy ``_stage2_input_covariance.pt``.
+    ``(FileNotFoundError, OSError)`` -- a ``RuntimeError`` from Pattern
+    O ``_validate_manifest_or_warn`` MUST escape so the user sees the
+    actionable "Delete both ... re-run calibration" message instead of
+    silently falling back to a stale legacy
+    ``_stage2_input_covariance.pt``.
 
     Mirror of the orchestrator's wiring: dispatch_first against the
     cache-provider-only plugin list, with a forced schema bump.
@@ -151,14 +153,15 @@ def test_schema_mismatch_propagates_through_dispatch_first(tmp_path, monkeypatch
     )
 
     plugins = [Stage3InputCovCacheProvider()]
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(RuntimeError) as exc:
         PluginRegistry.dispatch_first(
             plugins, "on_load", PipelineContext(), jsonl,
         )
     msg = str(exc.value)
+    assert "manifest validation FAILED" in msg
     assert "schema_version=2" in msg
     assert "expected 99" in msg
-    assert "Delete the sidecar to regenerate" in msg
+    assert "re-run calibration" in msg
 
 
 # ---------------------------------------------------------------------------

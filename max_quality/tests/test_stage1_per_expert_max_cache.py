@@ -119,8 +119,9 @@ def test_save_load_roundtrip(tmp_path):
 
 def test_schema_version_mismatch_raises(tmp_path, monkeypatch):
     """Bumping ``SCHEMA_VERSIONS["per_expert_max"]`` after a sidecar is
-    written makes ``load_per_expert_max`` raise ``ValueError`` with the
-    actionable "Delete the sidecar to regenerate" message."""
+    written makes ``load_per_expert_max`` raise ``RuntimeError`` from
+    the Pattern O manifest validator (``_validate_manifest_or_warn``)
+    with the actionable "Delete both ... re-run calibration" message."""
     jsonl = _jsonl(tmp_path)
     payload = _make_payload(n_layers=2, n_experts=3)
     save_per_expert_max(payload, jsonl)
@@ -129,7 +130,7 @@ def test_schema_version_mismatch_raises(tmp_path, monkeypatch):
     # mismatch and raise.
     import moe_compress.utils.cached_calibration_signals as ccs
     monkeypatch.setitem(ccs.SCHEMA_VERSIONS, "per_expert_max", 99)
-    with pytest.raises(ValueError, match="Delete the sidecar to regenerate"):
+    with pytest.raises(RuntimeError, match="manifest validation FAILED"):
         load_per_expert_max(jsonl)
 
 
