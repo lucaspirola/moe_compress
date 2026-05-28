@@ -298,12 +298,12 @@ class TeacherCachePlugin:
                             "precompute_teacher_logits."
                         ) from exc
                 else:
-                    # MEDIUM-8 TODO(post-2026-Q3): remove this
-                    # backward-compat shim once all in-flight teacher
-                    # caches under /opt/output/* are regenerated with
-                    # manifests. The fallback exists for pre-F-RK-1
-                    # precompute runs that wrote a bare .pt with no
-                    # manifest sidecar.
+                    # MEDIUM-8 TODO(post-2026-Q3 — REMOVAL DEADLINE 2026-09-30):
+                    # remove this backward-compat shim once all in-flight
+                    # teacher caches under /opt/output/* are regenerated with
+                    # manifests. Tracking: tasks/PLAN_CALIB_V2_LOW_NIT_BATCH.md
+                    # (PB-1). The fallback exists for pre-F-RK-1 precompute
+                    # runs that wrote a bare .pt with no manifest sibling.
                     log.warning(
                         "Stage 5: teacher-logits cache %s has no "
                         "MANIFEST.json sibling (pre-F-RK-1 precompute "
