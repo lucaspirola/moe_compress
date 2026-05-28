@@ -307,3 +307,49 @@ def test_orchestrator_run_produces_expected_artifact_set(
 
     # The B-cov spill dir is removed on a clean finish.
     assert not (tmp_path / "_stage3_bcov_partial").exists()
+
+
+def test_stage3_orchestrator_sets_calibration_jsonl_path(
+    tiny_model, patched_stage3, tmp_path, monkeypatch,
+):
+    """T6 (W-2): the Stage 3 orchestrator promotes
+    ``calibration_jsonl_path`` (absolute ``Path``) onto ``run_ctx`` so
+    the Wanda intra-expert score plugin can derive its F-H-7
+    namespaced sidecar location. Without this wiring T1-T5 pass in
+    isolation but the real Stage 3 run silently skips the sidecar
+    write via T4's WARN path — defeating the whole purpose of W-2.
+
+    Spy on the first phase hook (``collect_covariances``) to snapshot
+    ``run_ctx`` while the run is in progress, then assert the slot is
+    present + is an absolute ``Path``.
+    """
+    decomp = _run_stages_1_2(tiny_model, patched_stage3, tmp_path)
+
+    captured: dict = {}
+    _original = CovarianceCollectionPlugin.collect_covariances
+
+    def _spy(self, ctx):
+        captured["has_slot"] = ctx.has("calibration_jsonl_path")
+        if captured["has_slot"]:
+            captured["value"] = ctx.get("calibration_jsonl_path")
+        return _original(self, ctx)
+
+    monkeypatch.setattr(
+        CovarianceCollectionPlugin, "collect_covariances", _spy,
+    )
+
+    stage3_orchestrator.run(
+        tiny_model, _TinyTokenizer(), patched_stage3, tmp_path, decomp,
+        device=None, no_resume=True,
+    )
+
+    assert captured.get("has_slot") is True, (
+        "Stage 3 orchestrator did not set run_ctx['calibration_jsonl_path']"
+    )
+    val = captured["value"]
+    assert isinstance(val, Path), (
+        f"expected Path; got {type(val).__name__}"
+    )
+    assert val.is_absolute(), (
+        f"expected absolute Path; got {val}"
+    )
