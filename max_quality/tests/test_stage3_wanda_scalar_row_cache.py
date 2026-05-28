@@ -197,6 +197,11 @@ def test_writer_emits_manifest_after_payload(tmp_path):
     manifest_str = str(manifest)
     # rename_order may contain parent-dir fsync targets that aren't
     # ``os.replace``; filter to just the actual file renames.
+    # (Pattern O's parent-dir sync mechanism is ``os.fsync(fd)`` on
+    # the parent directory handle -- NOT ``os.replace`` -- so the
+    # spy here genuinely only observes file renames; the filter is
+    # defensive in case the helper ever grows an intermediate
+    # ``os.replace`` for some other artifact in the same tmp dir.)
     file_renames = [r for r in rename_order
                     if r in (sidecar_str, manifest_str)]
     assert sidecar_str in file_renames, (

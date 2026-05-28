@@ -10584,7 +10584,7 @@ new file mode 100644
 index 0000000..0000001
 --- /dev/null
 +++ b/tests/test_calibration_wanda_scalar_row_smoke.py
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,300 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_wanda_scalar_row``.
@@ -10778,7 +10778,15 @@ index 0000000..0000001
 +    ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int64)
 +
 +    # The vllm.* loggers set propagate=False via the vllm logging
-+    # config, so attach a handler directly on the module's logger.
++    # config (see vllm/logger.py), so pytest's ``caplog`` fixture
++    # (which works by attaching to the root logger and relying on
++    # record propagation) silently captures NOTHING for these
++    # records. We attach a raw handler directly on the module's
++    # logger instead -- this is the canonical workaround for
++    # propagate=False loggers and is documented in pytest's caplog
++    # caveats. Switching to ``caplog`` would make the test green
++    # without actually verifying anything (the assertion list would
++    # be empty rather than containing the ERROR record).
 +    module_log = logging.getLogger("vllm.calibration_wanda_scalar_row")
 +    records: list[logging.LogRecord] = []
 +    handler = logging.Handler()
