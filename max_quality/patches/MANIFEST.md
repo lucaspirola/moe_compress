@@ -8,11 +8,11 @@ the patch (the HF Jobs build script, the README uploaded to
 
 | Field | Value |
 |---|---|
-| Immutable tag | `calib-v2-wanda-scalar-row` |
+| Immutable tag | `calib-v2-layer-input-reservoir` |
 | Branch (active) | `feat/calibration-v2` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch line count | **10887** |
-| Patch MD5 | **`118b866b58fdc3167ef97f812d60aa6d`** |
+| Patch line count | **10920** |
+| Patch MD5 | **`af1c38a2686c74012fc0f86b5449f23c`** |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -22,9 +22,9 @@ the patch (the HF Jobs build script, the README uploaded to
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: 118b866b58fdc3167ef97f812d60aa6d
+# expect: af1c38a2686c74012fc0f86b5449f23c
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 10887
+# expect: 10920
 
 # Re-apply against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -34,7 +34,7 @@ git apply --check /path/to/vllm_calibration_hooks.patch && echo OK
 
 ## Change log
 
-### `calib-v2-wanda-scalar-row` (current)
+### `calib-v2-wanda-scalar-row` (previous)
 
 W-1 (audit `tasks/AUDIT_CALIBRATION_COMPLETENESS_V2.md` §W-1, plan
 `tasks/PLAN_W1_WANDA_SCALAR_ROW_CAPTURE.md`). Promotes the routing-
@@ -168,7 +168,51 @@ writer; the v1 -> v3 bump is intentionally NOT forward-compatible.
 Pattern K applies forward (v3 -> v4 SHOULD preserve readers when
 adding optional fields).
 
-### `calib-v2-max-layer-early-exit` (current)
+### `calib-v2-layer-input-reservoir` (current)
+
+CRITICAL-1 follow-up to ``calib-v2-max-layer-early-exit``. Adds the
+``layer_in`` hook + per-layer reservoir capture wiring so the canonical
+``stage2_profile_writer`` can populate ``layer_input_reservoir`` during
+vLLM-backed calibration runs (previously only the in-process profile
+pass populated it; vLLM calibrations were silently writing empty
+reservoirs).
+
+- `vllm/calibration_hooks.py`: registers the new ``layer_in`` callback
+  name in the ``_CALLBACK_NAMES`` set and dispatches it from the
+  ``Qwen3MoeSparseMoeBlock.forward`` pre-MoE entrypoint. The hook
+  fires once per (layer_idx, hidden) pair, before routing.
+- `vllm/model_executor/models/qwen3_moe.py`: hooks the new dispatch
+  into the MoE block forward with the existing capture gate
+  (no new env-var; the hook is dormant unless a writer subscribes).
+- Driver wiring lives in
+  ``max_quality/src/moe_compress/calibration/stage2_profile_writer.py``
+  (canonical writer's ``_on_layer_in_callback``) + the patch copy in
+  ``max_quality/patches/vllm_calibration_stage2_profile.patch``. The
+  callback constructs a per-layer
+  ``moe_compress.stage2.profiling._LayerInputAccumulator`` lazily on
+  first sighting (seed = ``layer_idx`` for per-layer determinism, same
+  contract as the in-process profile pass at ``profiling.py:86``) and
+  feeds each batch into the vectorised Vitter Algorithm R reservoir.
+- Driver flag: ``--capture-layer-input-reservoir`` (default ON; turn
+  OFF only for the legacy empty-reservoir behaviour).
+- MEDIUM-fix follow-up (this tag): the layer-input-reservoir
+  checkpoint payload now serialises the per-layer
+  ``torch.Generator.get_state()`` tensor (uint8[5056] on CPU) so the
+  resumed RNG stream is byte-identical to the no-resume reference
+  EVEN AFTER Phase C entry. The pre-fix 3-tuple payload
+  ``(buffer, seen, max_samples)`` re-seeded the generator on load, so
+  Phase-C-active checkpoints diverged from the reference (the
+  reservoir's RNG draws on tokens 101..200 would be the same draws the
+  pre-checkpoint half had already consumed). The loader emits a WARN
+  + seed-re-init fallback for pre-MEDIUM-fix checkpoints (byte-
+  identical resume preserved only if Phase C was never entered pre-
+  checkpoint). New test
+  ``test_checkpoint_resume_byte_identical_after_phase_c`` forces Phase
+  C entry pre-checkpoint via cap=64 + multi-chunk feed and asserts
+  buffer + generator state byte-equality against the no-resume
+  reference.
+
+### `calib-v2-max-layer-early-exit` (previous)
 Adds the L2 ``max_layer`` early-exit gate to ``Qwen3MoeModel.forward``
 (Item L2 of the calibration-v2 writers campaign — foundation for L1's
 sequential REAP+REAM per-layer profiling and a standalone optimisation
