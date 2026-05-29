@@ -13,6 +13,7 @@ durable-write module. These tests cover:
 from __future__ import annotations
 
 import json
+import textwrap
 import unittest.mock as mock
 from pathlib import Path
 
@@ -179,44 +180,46 @@ def test_durable_rename_basic(tmp_path):
     assert final.read_bytes() == b"hello"
 
 
-def test_durable_rename_call_order_is_fsync_replace_fsync(tmp_path):
+def test_durable_rename_call_order_is_fsync_replace_fsync(tmp_path, strace_syscalls):
     """MEDIUM-3: durable_rename's correctness contract is the CALL
     ORDER of (fsync_file, os.replace, fsync_dir), not just the
     end-state. A reorder (e.g. fsync AFTER replace) would still leave
     the right file on disk under happy-path tests but would lose the
-    durability guarantee on power-loss. Verify the sequence directly.
+    durability guarantee on power-loss. Verify the sequence directly
+    by observing real syscalls under strace.
+
+    Migrated from mock.patch.object to the strace_syscalls fixture per
+    the project's [[no-monkey-patches]] rule and the H-1/H-2 plan
+    commit #8 (closes one of the two pre-existing patch.object
+    violators in this directory).
     """
     tmp = tmp_path / "foo.pt.tmp"
     final = tmp_path / "foo.pt"
-    tmp.write_bytes(b"hello")
-
-    calls: list[str] = []
-    import moe_compress.utils.atomic_io as aio
-
-    real_fsync_file = aio._fsync_file
-    real_fsync_dir = aio._fsync_dir
-    real_replace = aio.os.replace
-
-    def rec_fsync_file(p):
-        calls.append("fsync_file")
-        return real_fsync_file(p)
-
-    def rec_replace(src, dst):
-        calls.append("replace")
-        return real_replace(src, dst)
-
-    def rec_fsync_dir(d):
-        calls.append("fsync_dir")
-        return real_fsync_dir(d)
-
-    with mock.patch.object(aio, "_fsync_file", side_effect=rec_fsync_file), \
-         mock.patch.object(aio.os, "replace", side_effect=rec_replace), \
-         mock.patch.object(aio, "_fsync_dir", side_effect=rec_fsync_dir):
+    body = textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
+        from pathlib import Path
+        from moe_compress.utils.atomic_io import durable_rename
+        tmp = Path({str(tmp)!r})
+        final = Path({str(final)!r})
+        tmp.write_bytes(b"hello")
         durable_rename(tmp, final)
-
-    assert calls == ["fsync_file", "replace", "fsync_dir"], (
-        f"expected sequence [fsync_file, replace, fsync_dir], got {calls}"
+    """).strip()
+    with strace_syscalls(body) as recorder:
+        pass
+    # Pattern O syscall sequence: openat(tmp) -> fsync(tmp_fd) ->
+    # rename(tmp -> final) -> openat(parent_dir, O_DIRECTORY) ->
+    # fsync(parent_dir_fd). The O_DIRECTORY flag in the second openat
+    # is added by commit #2 (atomic_io._fsync_dir change).
+    recorder.assert_order(
+        ("openat", lambda a: ".tmp" in a),
+        ("fsync",  lambda a: True),
+        ("rename", lambda a: ".tmp" in a),
+        ("openat", lambda a: "O_DIRECTORY" in a),
+        ("fsync",  lambda a: True),
     )
+    assert final.read_bytes() == b"hello"
+    assert not tmp.exists()
 
 
 # ---------------------------------------------------------------------------
