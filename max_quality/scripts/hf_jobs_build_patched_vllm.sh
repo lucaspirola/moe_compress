@@ -13,7 +13,7 @@
 #   hf jobs run --flavor cpu-performance --detach --timeout 6h \
 #       --secrets HF_TOKEN \
 #       nvidia/cuda:13.0.0-devel-ubuntu24.04 \
-#       bash -c "curl -sL https://raw.githubusercontent.com/lucaspirola/moe_compress/feat/calibration-v2/max_quality/scripts/hf_jobs_build_patched_vllm.sh | bash"
+#       bash -c "curl -sL https://raw.githubusercontent.com/lucaspirola/moe_compress/main/max_quality/scripts/hf_jobs_build_patched_vllm.sh | bash"
 
 set -e
 set -o pipefail
@@ -48,35 +48,48 @@ git clone --depth 1 --branch v0.21.0 \
 cd vllm-patched
 echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
-echo "[$(date)] === Phase 5: fetch and apply calibration hooks patch ==="
+echo "[$(date)] === Phase 5: fetch and apply BOTH calibration patches ==="
+# Two patches in this wheel:
+#  1. vllm_calibration_hooks.patch (10920 lines, MD5 af1c38a2...) — the
+#     core hooks + 10 writer modules (block_outputs / hooks / imatrix /
+#     input_cov / output_reservoir / per_expert_max / reap_scores /
+#     router_logits_stats / routing_stats / wanda_scalar_row), the
+#     envs.py mirror, and the Qwen3MoeSparseMoeBlock dispatch sites.
+#     Includes CRITICAL-1's layer_in hook (env var
+#     VLLM_CALIB_CAPTURE_LAYER_IN + "layer_in" in VALID_HOOK_NAMES +
+#     dispatch site post-chunk pre-is_internal_router) and W-1's new
+#     calibration_wanda_scalar_row.py writer module.
+#  2. vllm_calibration_stage2_profile.patch (802 lines, MD5 2a201245...) —
+#     creates calibration_stage2_profile.py with the
+#     _layer_in_handler writer subscription (receiver for patch #1's
+#     dispatch), _LAYER_INPUT_MAX_SAMPLES constant, and the
+#     CRITICAL-1 MEDIUM 4-tuple checkpoint shape
+#     (buffer, seen, max_samples, generator_state) that preserves
+#     Phase-C RNG state for byte-identical resume.
+# Both patches are needed; #2 modifies a file #1 does not create
+# (they are sibling new-file patches, independent of each other,
+# but logically required together for layer_in capture to work).
+# See max_quality/patches/MANIFEST.md.
+
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-max-layer-early-exit/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-layer-input-reservoir/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected MD5: a8da5e321ac7fb30f1648fba3476bea6 (10101 lines)
-# Adds the L2 max-layer early-exit gate to Qwen3MoeModel.forward
-# (Item L2 of the calibration-v2 writers campaign -- foundation for
-# L1's sequential REAP+REAM per-layer profiling and a standalone
-# optimisation for any writer whose payload comes from layer L or
-# earlier), on top of the previous block-outputs + output-reservoir
-# + router-logits-stats + routing-stats + per-expert-max + input-cov
-# + REAP-scores + imatrix writers. New module-level
-# _CALIB_MAX_LAYER (sampled from VLLM_CALIB_MAX_LAYER at
-# vllm.calibration_hooks import; "" and "-1" map to None;
-# malformed values map to None) + set_calibration_max_layer() /
-# get_calibration_max_layer() runtime accessors. Qwen3MoeModel.
-# forward reads the gate ONCE at forward entry and derives
-# effective_end = min(self.end_layer, max(self.start_layer,
-# _max_layer + 1)) for the islice over decoder layers (boundary is
-# INCLUSIVE; out-of-range clamps; below-shard-start collapses to
-# zero layers on that shard). When None (default), effective_end ==
-# self.end_layer => byte-identical to the un-patched path so the
-# production hot path pays nothing.
-# See max_quality/patches/MANIFEST.md.
+# Expected: 10920 lines, MD5 af1c38a2686c74012fc0f86b5449f23c
+
+curl -sL \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-layer-input-reservoir/max_quality/patches/vllm_calibration_stage2_profile.patch \
+    -o /tmp/calib2.patch
+wc -l /tmp/calib2.patch
+md5sum /tmp/calib2.patch
+# Expected: 802 lines, MD5 2a2012457ef4a45ca36757b33a3c4e15
+
 git apply --check /tmp/calib.patch
 git apply /tmp/calib.patch
-echo "Applied. Status:"
+git apply --check /tmp/calib2.patch
+git apply /tmp/calib2.patch
+echo "Applied both. Status:"
 git status --short
 
 echo "[$(date)] === Phase 5b: strip license + license-files lines from pyproject.toml ==="
@@ -177,17 +190,20 @@ for w in wheels:
     )
     print(f"  -> https://huggingface.co/{repo_id}/blob/main/{name}")
 
-# Also upload the patch itself for traceability
-patch_path = "/tmp/calib.patch"
-if os.path.exists(patch_path):
-    print("Uploading patch artifact...")
-    upload_file(
-        path_or_fileobj=patch_path,
-        path_in_repo="vllm_calibration_hooks.patch",
-        repo_id=repo_id,
-        repo_type="model",
-        token=token,
-    )
+# Also upload both patches themselves for traceability
+for src_path, dest_name in [
+    ("/tmp/calib.patch", "vllm_calibration_hooks.patch"),
+    ("/tmp/calib2.patch", "vllm_calibration_stage2_profile.patch"),
+]:
+    if os.path.exists(src_path):
+        print(f"Uploading patch artifact {dest_name}...")
+        upload_file(
+            path_or_fileobj=src_path,
+            path_in_repo=dest_name,
+            repo_id=repo_id,
+            repo_type="model",
+            token=token,
+        )
 
 # Upload a small README with build metadata
 readme = f"""---
@@ -202,8 +218,10 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/calibration-v2`, immutable tag `calib-v2-max-layer-early-exit`)
-- Patch artifact (10101 lines, MD5 `a8da5e321ac7fb30f1648fba3476bea6`): also uploaded to this repo as `vllm_calibration_hooks.patch`
+- Source repo: https://github.com/lucaspirola/moe_compress (branch `main`, immutable tag `calib-v2-layer-input-reservoir`)
+- Patch artifacts (also uploaded to this repo for traceability):
+  - `vllm_calibration_hooks.patch` — 10920 lines, MD5 `af1c38a2686c74012fc0f86b5449f23c`
+  - `vllm_calibration_stage2_profile.patch` — 802 lines, MD5 `2a2012457ef4a45ca36757b33a3c4e15`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130

@@ -1,18 +1,27 @@
-# `vllm_calibration_hooks.patch` — manifest
+# `vllm_calibration_hooks.patch` + `vllm_calibration_stage2_profile.patch` — manifest
 
-Single source of truth for the patch's identity. Other places that reference
-the patch (the HF Jobs build script, the README uploaded to
+Single source of truth for the patches' identity. Other places that reference
+either patch (the HF Jobs build script, the README uploaded to
 `pirola/vllm-patched-calib`) should match this file.
+
+The wheel produced by the build script applies **both** patches in this
+table. They are sibling new-file patches (independent of each other on
+the apply graph; the hooks patch creates 10 modules, the stage2_profile
+patch creates 1), but the second patch's `_layer_in_handler` is the
+required receiver for the first patch's `layer_in` dispatch site — so
+either one alone produces a partially-wired wheel.
 
 ## Current
 
 | Field | Value |
 |---|---|
 | Immutable tag | `calib-v2-layer-input-reservoir` |
-| Branch (active) | `feat/calibration-v2` |
+| Branch (active) | `main` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch line count | **10920** |
-| Patch MD5 | **`af1c38a2686c74012fc0f86b5449f23c`** |
+| Patch 1 line count | **10920** |
+| Patch 1 MD5 | **`af1c38a2686c74012fc0f86b5449f23c`** (vllm_calibration_hooks.patch) |
+| Patch 2 line count | **802** |
+| Patch 2 MD5 | **`2a2012457ef4a45ca36757b33a3c4e15`** (vllm_calibration_stage2_profile.patch) |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -26,10 +35,17 @@ md5sum max_quality/patches/vllm_calibration_hooks.patch
 wc -l max_quality/patches/vllm_calibration_hooks.patch
 # expect: 10920
 
-# Re-apply against a fresh v0.21.0 checkout (idempotency check):
+md5sum max_quality/patches/vllm_calibration_stage2_profile.patch
+# expect: 2a2012457ef4a45ca36757b33a3c4e15
+wc -l max_quality/patches/vllm_calibration_stage2_profile.patch
+# expect: 802
+
+# Re-apply both against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
 cd /tmp/vllm-fresh
 git apply --check /path/to/vllm_calibration_hooks.patch && echo OK
+git apply /path/to/vllm_calibration_hooks.patch
+git apply --check /path/to/vllm_calibration_stage2_profile.patch && echo OK
 ```
 
 ## Change log
