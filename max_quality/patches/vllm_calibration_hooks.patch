@@ -7461,7 +7461,7 @@ new file mode 100644
 index 0000000..660a951
 --- /dev/null
 +++ b/vllm/calibration_output_reservoir.py
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,529 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) expert-output reservoir capture for calibration-v2
@@ -7579,6 +7579,16 @@ index 0000000..660a951
 +_SEEN: dict[tuple[int, int], int] = {}                # (rank, e) -> total tokens seen
 +_VALID_COUNT: dict[tuple[int, int], int] = {}         # (rank, e) -> min(seen, cap)
 +
++# H-2 fix: per-(rank, expert) torch.Generator so Phase-2 reservoir-
++# sampling draws are reproducible across periodic-checkpoint resumes.
++# Pre-H-2 the Phase-2 path used GLOBAL torch.rand / torch.randint, so a
++# kill + resume would diverge the random stream (the resumed segment
++# saw whatever the global RNG state happened to be at re-import time).
++# Mirrors the proven pattern in _LayerInputAccumulator at
++# moe_compress/stage2/profiling.py:82-86 + stage2_profile's checkpoint
++# (de)serialise of acc._generator.get_state().clone() at L614 / L761.
++_GENERATORS: dict[tuple[int, int], torch.Generator] = {}
++
 +_LAYER_ID_TO_RANK: dict[int, int] = {}
 +_N_LAYERS: int = 0
 +_N_EXPERTS: int = 0
@@ -7597,6 +7607,26 @@ index 0000000..660a951
 +    if n < 0:
 +        raise ValueError(f"n must be >= 0; got {n}")
 +    _n_prompts_accumulated = int(n)
++
++
++def _get_generator(key: tuple[int, int]) -> torch.Generator:
++    """Lazily create a per-(rank, expert) ``torch.Generator`` on CPU.
++
++    H-2: the Phase-2 reservoir-sampling draws (``torch.rand`` /
++    ``torch.randint``) MUST go through this per-key generator so that
++    a periodic-checkpoint resume can byte-identically continue the
++    random stream. The seed mix below is deterministic on the key:
++    ``rank * 1_000_003 + e`` (1_000_003 is the smallest prime above
++    1e6, large enough to avoid neighbor-key collisions for any
++    realistic ``e`` < 1e6) masked to int63.
++    """
++    g = _GENERATORS.get(key)
++    if g is None:
++        rank, e = key
++        seed = (rank * 1_000_003 + e) & 0x7FFFFFFFFFFFFFFF
++        g = torch.Generator(device="cpu").manual_seed(seed)
++        _GENERATORS[key] = g
++    return g
 +
 +
 +def _resolve_model(llm: Any) -> Any | None:
@@ -7754,9 +7784,11 @@ index 0000000..660a951
 +                + torch.arange(1, n_remaining + 1, dtype=torch.float32)
 +            )
 +            probs = float(cap) / positions                       # [n_remaining]
-+            u = torch.rand(n_remaining)
++            # H-2: per-(rank, expert) generator so resume is reproducible.
++            g = _get_generator(key)
++            u = torch.rand(n_remaining, generator=g)
 +            accept_mask = u < probs                              # [n_remaining]
-+            slots = torch.randint(0, cap, (n_remaining,))
++            slots = torch.randint(0, cap, (n_remaining,), generator=g)
 +            accepted = accept_mask.nonzero(as_tuple=True)[0]
 +            if accepted.numel() > 0:
 +                src_rows = rows[n_to_fill + accepted]
@@ -7885,6 +7917,12 @@ index 0000000..660a951
 +        "reservoir": {k: v.clone() for k, v in _RESERVOIR.items()},
 +        "seen": dict(_SEEN),
 +        "valid_count": dict(_VALID_COUNT),
++        # H-2: per-(rank, expert) generator state so Phase-2 resume is
++        # byte-identical to a single-run counterfactual. Each value is
++        # a uint8 CPU tensor (the format returned by Generator.get_state).
++        "generator_states": {
++            k: _GENERATORS[k].get_state().clone() for k in _GENERATORS
++        },
 +    }
 +    _atomic_torch_save(payload, ckpt_path)
 +
@@ -7922,6 +7960,7 @@ index 0000000..660a951
 +    _RESERVOIR.clear()
 +    _SEEN.clear()
 +    _VALID_COUNT.clear()
++    _GENERATORS.clear()
 +    for k, t in payload.get("reservoir", {}).items():
 +        rk = (int(k[0]), int(k[1]))
 +        _RESERVOIR[rk] = t.to(torch.float32).clone()
@@ -7929,6 +7968,28 @@ index 0000000..660a951
 +        _SEEN[(int(k[0]), int(k[1]))] = int(v)
 +    for k, v in payload.get("valid_count", {}).items():
 +        _VALID_COUNT[(int(k[0]), int(k[1]))] = int(v)
++    # H-2: restore per-(rank, expert) generator state for byte-identical
++    # Phase-2 resume. Back-compat: a pre-H-2 checkpoint won't have the
++    # 'generator_states' field; emit a WARN and leave _GENERATORS empty
++    # (lazy-init from _get_generator's deterministic seed on next use —
++    # FUTURE draws are still reproducible across re-resumes, but the
++    # resumed segment's Phase-2 contents will NOT be byte-identical to a
++    # single-run counterfactual).
++    gs_payload = payload.get("generator_states", None)
++    if gs_payload is None:
++        log.warning(
++            "calibration_output_reservoir: checkpoint at %s predates the "
++            "H-2 RNG-state fix (no 'generator_states' field). Resume "
++            "will continue but the resumed Phase-2 reservoir contents "
++            "will NOT be byte-identical to a single-run counterfactual.",
++            ckpt_path,
++        )
++    else:
++        for k_raw, state in gs_payload.items():
++            k = (int(k_raw[0]), int(k_raw[1]))
++            g = torch.Generator(device="cpu")
++            g.set_state(state.clone())
++            _GENERATORS[k] = g
 +    return _n_prompts_accumulated
 diff --git a/vllm/calibration_per_expert_max.py b/vllm/calibration_per_expert_max.py
 new file mode 100644
