@@ -1047,12 +1047,18 @@ None pending. The user's choice of path (b) over (a) for H-v3-1 was
 explicit; L-v3-1 and N-v3-1 are mechanical folds with no engineering
 ambiguity. **One nit to flag, not a raise**: per the user's protocol
 "between commit #1 and commit #2 — or appended at the end if cleaner",
-this v4 picked the **between #1 and #2** position because (a) the
-strace tests in commit #6 reference `O_DIRECTORY` in their predicates,
-so the production fix must land before the tests for the loop-close
-verification step (`pytest tests/test_calibration_*_smoke.py` after
-every commit) to succeed; (b) the new commit is production code, not
-patch code, so grouping it before the wheel-patch sweep keeps the
-commits' subsystems contiguous. The alternative "appended at the end"
-position would have made the test-as-evidence step fail at commit #6
-until the very last commit landed, breaking per-commit validation.
+this v4 picked the **between #1 and #2** position because (a) commit
+#8's migration of `test_utils_atomic_io.py:212-214` uses the
+`'O_DIRECTORY' in a` predicate against `utils/atomic_io._fsync_dir`,
+AND the existing repo-side
+`test_durable_rename_call_order_is_fsync_replace_fsync`
+(test_utils_atomic_io.py:182-219) runs after commit #2 in every
+per-commit validation, so the production fix must land before those
+tests for the loop-close verification step
+(`pytest tests/test_calibration_*_smoke.py` after every commit) to
+succeed; (b) the new commit is production code, not patch code, so
+grouping it before the wheel-patch sweep keeps the commits' subsystems
+contiguous. The alternative "appended at the end" position would have
+made the test-as-evidence step fail at the migrated/existing
+`_fsync_dir` tests until the very last commit landed, breaking
+per-commit validation.
