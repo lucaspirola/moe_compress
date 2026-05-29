@@ -120,9 +120,25 @@ def _fsync_file(path: Path) -> None:
 
 
 def _fsync_dir(directory: Path) -> None:
-    """fsync the parent directory so that the rename entry survives power loss."""
+    """fsync the parent directory so that the rename entry survives power loss.
+
+    Uses ``os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)`` for the open:
+
+    * On Linux/BSD/macOS, ``O_DIRECTORY`` raises ``ENOTDIR`` if ``directory``
+      is not a directory — fail-fast for a class of caller bugs that
+      previously fsync-ed silently against the wrong fd.
+    * On platforms where ``O_DIRECTORY`` is absent from ``os`` (rare), the
+      OR-with-0 yields the original ``O_RDONLY`` behavior — zero behavior
+      change.
+
+    Mirrors the portability idiom at
+    ``moe_compress.router_kd.plugins.early_stop:168``. Also makes the
+    parent-dir openat decode as ``O_RDONLY|O_DIRECTORY|O_CLOEXEC`` in
+    strace output, which the H-1 fsync-order tests rely on to
+    disambiguate file-fsync from parent-dir-fsync without FD bookkeeping.
+    """
     try:
-        fd = os.open(str(directory), os.O_RDONLY)
+        fd = os.open(str(directory), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(fd)
         finally:
