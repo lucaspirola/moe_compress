@@ -321,6 +321,78 @@ writer.dump_X_checkpoint(r"{ckpt}")
     assert "n_prompts_accumulated" in loaded
 ```
 
+#### Predicate authoring guide (fd disambiguation)
+
+The per-writer test shape above uses lambdas like
+`lambda a: ".tmp" in a` against the `args` string of a recorded syscall.
+This works for `rename` and `openat` because they take path arguments
+directly. **`fsync(N)` is different** — strace records it as a numeric
+file descriptor with no path. The same trace prefix
+`openat(path, O_RDONLY) + fsync(fd) + close(fd)` is emitted by BOTH the
+file-fsync helper AND the parent-dir-fsync helper in
+`utils/atomic_io.py`. At the syscall level the trace for a normal
+durable-rename therefore looks like:
+
+```
+openat(AT_FDCWD, "/.../target.tmp",  O_RDONLY|O_CLOEXEC) = 7
+fsync(7)                                                  = 0
+close(7)                                                  = 0
+rename("/.../target.tmp", "/.../target")                  = 0
+openat(AT_FDCWD, "/.../parent_dir", O_RDONLY|O_DIRECTORY) = 7
+fsync(7)                                                  = 0
+close(7)                                                  = 0
+```
+
+Predicates that need to distinguish the *file* fsync from the *parent
+dir* fsync MUST correlate each `fsync(fd)` with the most-recent
+`openat(path, ...)` that returned that `fd`. Two options for the
+implementer:
+
+1. **(preferred)** Extend `_StraceRecorder` with an
+   `fd_path(fd) -> str` helper. The recorder walks the recorded
+   syscalls forward, maintaining a `dict[int, str]` of live fds keyed
+   by the path captured from the matching `openat`'s args, removing
+   entries on `close(fd)`. The fixture would then accept predicates
+   shaped as `lambda ev: ev.path == str(target_dir)` where `ev`
+   carries the resolved path. This requires changing `_SYSCALL_RE` to
+   also capture `close`, and extending `assert_order` to pass the
+   live-fd dict into each predicate.
+
+2. **(simpler, may be enough)** Keep the recorder as-is and write
+   per-test predicates that walk the trace themselves. For
+   `test_durable_rename_call_order`:
+   ```python
+   recorder.assert_order(
+       ("openat",  lambda a: a.endswith('.tmp", O_RDONLY|O_CLOEXEC')),
+       ("fsync",   lambda a: True),                            # file fd
+       ("rename",  lambda a: ".tmp" in a),
+       ("openat",  lambda a: 'O_DIRECTORY' in a),
+       ("fsync",   lambda a: True),                            # parent dir fd
+   )
+   ```
+   This works because `assert_order` matches predicates in sequence
+   with gaps allowed, and the `openat(..., O_DIRECTORY)` flag
+   reliably disambiguates the parent-dir open from the file open.
+
+The implementer should start with option (2) — it stays within the
+existing `_StraceRecorder` API and the `O_DIRECTORY` flag is a stable
+disambiguator written by `os.open(path, os.O_RDONLY | os.O_DIRECTORY)`
+in `utils/atomic_io._fsync_dir`. Promote to option (1) only if a test
+arises where `O_DIRECTORY` is not present (which would be a
+pre-existing helper bug worth surfacing on its own).
+
+**RAISE-not-fallback**: per `feedback_raise_dont_substitute.md`, if
+predicate authoring proves harder than either pattern above — e.g.,
+the strace trace shows the `openat` happening in a forked child whose
+pid `strace -f` does not interleave with the parent's syscalls in the
+log, or `O_DIRECTORY` is absent on the test box's `_fsync_dir`
+codepath, or the `_StraceRecorder` API needs a refactor wider than a
+single-method addition — the implementer SHOULD RAISE back to the user
+rather than fall back to a weaker test idiom (e.g., monkey-patching
+`_fsync_file`, asserting only call-count rather than order, etc.).
+Option (2)'s assertion shape is the LOAD-BEARING contract for H-1; any
+deviation goes through the user.
+
 Estimated LoC:
 - Fixture (one-time): ~110 LoC in `tests/conftest_strace.py` + ~2 LoC
   import in `tests/conftest.py`.
@@ -660,10 +732,25 @@ early.
    — converts `max_quality/tests/test_stage3_wanda_scalar_row_cache.py:189`'s
    `with patch.object(_aio.os, "replace", side_effect=_spy_replace):` block
    to the `strace_syscalls` fixture. Closes the second violator. ~+10 / -5 LoC.
-   (Note: the `monkeypatch.setattr` calls at L437/L438/L458 in the same file
-   stub `build_calibration_tensor` / `save_compressed_checkpoint` /
-   `walk_phases` — these are NOT fsync-order spies and are OUT OF SCOPE for
-   this plan; they're a separate test-design question.)
+   (Note: the `monkeypatch.setattr` / `patch.object` calls at L299, L437,
+   L438, L458 in the same file stub `instrument_experts` /
+   `build_calibration_tensor` / `save_compressed_checkpoint` / `walk_phases`
+   — these are NOT fsync-order spies and are OUT OF SCOPE for this plan;
+   they're a separate test-design question.)
+
+   **Implementer note (payload reconstruction)**: the existing
+   `test_writer_emits_manifest_after_payload` (around L170-218 of
+   `test_stage3_wanda_scalar_row_cache.py`) builds a tensor `payload`
+   via `_make_payload(...)`. To migrate, the subprocess body MUST
+   reconstruct the payload via the deterministic `_make_payload(seed=...)`
+   call (mirrors the existing pattern at L170-218 — `_make_payload` is
+   deterministic via `torch.manual_seed`). Do NOT serialise the payload
+   to a `tmp_path` file in the parent test and re-load it inside the
+   subprocess body — that defeats the point of the strace approach
+   (the extra `openat`/`read` syscalls from the parent's dump and the
+   subprocess's reload pollute the trace, plus it couples the test to a
+   serialisation side-channel). The ~20 LoC delta in the estimate above
+   assumes the in-body `_make_payload(seed=...)` reconstruction approach.
 
 9. **`patch(manifest): bump line count + MD5 for both patches`** — final
    commit, runs `wc -l max_quality/patches/vllm_calibration_*.patch` and
@@ -693,11 +780,14 @@ re-upload to `pirola/vllm-patched-calib`.
   — non-functional, defer.
 - **N-1 / N-2 / N-3** (nitpicks: closure inlining, log message paths, help text)
   — non-functional.
-- **Other `monkeypatch.setattr` sites in the migrated files** that do NOT
-  spy fsync/replace order (e.g., `test_stage3_wanda_scalar_row_cache.py`
-  L437 / L438 / L458 stub `build_calibration_tensor`,
-  `save_compressed_checkpoint`, `walk_phases`). These are a separate
-  test-design refactor question and stay out of scope.
+- **Other `monkeypatch.setattr` / `patch.object` sites in the migrated
+  files** that do NOT spy fsync/replace order (e.g.,
+  `test_stage3_wanda_scalar_row_cache.py` L299, L437, L438, L458 —
+  production function stubbing for `instrument_experts` /
+  `build_calibration_tensor` / `save_compressed_checkpoint` /
+  `walk_phases`). These are a separate test-design refactor question
+  and stay out of scope; commit #8 only migrates the fsync/replace spy
+  at L189.
 
 (Moved IN-SCOPE in v2: the two `mock.patch.object` violators at
 `test_utils_atomic_io.py:212-214` and `test_stage3_wanda_scalar_row_cache.py:189`
