@@ -1049,16 +1049,18 @@ ambiguity. **One nit to flag, not a raise**: per the user's protocol
 "between commit #1 and commit #2 — or appended at the end if cleaner",
 this v4 picked the **between #1 and #2** position because (a) commit
 #8's migration of `test_utils_atomic_io.py:212-214` uses the
-`'O_DIRECTORY' in a` predicate against `utils/atomic_io._fsync_dir`,
-AND the existing repo-side
-`test_durable_rename_call_order_is_fsync_replace_fsync`
-(test_utils_atomic_io.py:182-219) runs after commit #2 in every
-per-commit validation, so the production fix must land before those
-tests for the loop-close verification step
+`'O_DIRECTORY' in a` predicate against `utils/atomic_io._fsync_dir`
+and is the sole load-bearing dependency. (The existing repo-side
+`test_durable_rename_call_order_is_fsync_replace_fsync` at
+`test_utils_atomic_io.py:182-219` uses `mock.patch.object` intercepts
+at the Python-call level via spies — it would pass before commit #2
+lands, so it is NOT a load-bearing reason for the between-#1-and-#2
+position; only commit #8 is.) The production fix must land before
+commit #8 for the loop-close verification step
 (`pytest tests/test_calibration_*_smoke.py` after every commit) to
 succeed; (b) the new commit is production code, not patch code, so
 grouping it before the wheel-patch sweep keeps the commits' subsystems
 contiguous. The alternative "appended at the end" position would have
-made the test-as-evidence step fail at the migrated/existing
-`_fsync_dir` tests until the very last commit landed, breaking
-per-commit validation.
+made the test-as-evidence step fail at the migrated `_fsync_dir` test
+in commit #8 until the very last commit landed, breaking per-commit
+validation.
