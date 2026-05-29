@@ -15,13 +15,13 @@ either one alone produces a partially-wired wheel.
 
 | Field | Value |
 |---|---|
-| Immutable tag | `calib-v2-layer-input-reservoir` |
+| Immutable tag | `calib-v2-fsync-rng-safe` |
 | Branch (active) | `main` |
 | vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch 1 line count | **10920** |
-| Patch 1 MD5 | **`af1c38a2686c74012fc0f86b5449f23c`** (vllm_calibration_hooks.patch) |
-| Patch 2 line count | **802** |
-| Patch 2 MD5 | **`2a2012457ef4a45ca36757b33a3c4e15`** (vllm_calibration_stage2_profile.patch) |
+| Patch 1 line count | **11778** |
+| Patch 1 MD5 | **`007977e108015d74c73ef9b2896ac645`** (vllm_calibration_hooks.patch) |
+| Patch 2 line count | **883** |
+| Patch 2 MD5 | **`c3ef265d51d44f5e794af04f156d9067`** (vllm_calibration_stage2_profile.patch) |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -31,14 +31,14 @@ either one alone produces a partially-wired wheel.
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: af1c38a2686c74012fc0f86b5449f23c
+# expect: 007977e108015d74c73ef9b2896ac645
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 10920
+# expect: 11778
 
 md5sum max_quality/patches/vllm_calibration_stage2_profile.patch
-# expect: 2a2012457ef4a45ca36757b33a3c4e15
+# expect: c3ef265d51d44f5e794af04f156d9067
 wc -l max_quality/patches/vllm_calibration_stage2_profile.patch
-# expect: 802
+# expect: 883
 
 # Re-apply both against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -49,6 +49,58 @@ git apply --check /path/to/vllm_calibration_stage2_profile.patch && echo OK
 ```
 
 ## Change log
+
+### `calib-v2-fsync-rng-safe` (current)
+
+H-1 + H-2 fixes from the spot-eviction resume audit
+(`tasks/AUDIT_CALIB_RESUME_SPOT_EVICTION.md` @ `5e485f6`, YELLOW ->
+GREEN gate). Plan: `tasks/PLAN_CALIB_H1_H2_FSYNC_RNG.md` on
+`plan/calib-h1-h2-fsync-rng` @ `d49da3ef`.
+
+**H-1 (fsync periodic checkpoints)**: every periodic-checkpoint write
+in the calibration writers now goes through `_atomic_torch_save`
+(inlined per writer at the top of each module's checkpoint primitives
+section). The helper mirrors `moe_compress.utils.atomic_io.atomic_torch_save`:
+`tmp + torch.save + fsync(fd) + os.replace + fsync(parent_dir)`. Pre-
+H-1 a SIGKILL between the `os.replace` and a hypothetical fsync would
+lose the rename's directory-entry durability on power-loss; pre-H-1
+the writers didn't fsync at all (only `os.replace` for atomicity).
+
+The imatrix `.dat` custom binary writer gets a second helper
+`_durable_close_replace_dat` because it owns its open file handle via
+`with open(tmp, "wb") as f:` — caller `f.flush() + os.fsync(f.fileno())`
+INSIDE the with-block, helper handles `os.replace + fsync(parent_dir)`
+AFTER the with-block closes the fd.
+
+The repo-side `atomic_io._fsync_dir` also gains `O_DIRECTORY` for
+fail-fast on non-directory paths and to make the strace-based fsync-
+order tests' `'O_DIRECTORY' in args` predicate work reliably.
+
+11 sites changed: 9 writers' periodic ckpts + imatrix `.dat` +
+stage2_profile periodic ckpt.
+
+**H-2 (output_reservoir Phase-2 RNG state)**: the Phase-2 reservoir-
+sampling path no longer uses GLOBAL `torch.rand` / `torch.randint`.
+Each (rank, expert) has its own `torch.Generator` (seeded
+deterministically via `rank * 1_000_003 + e`) whose state is
+serialized into the checkpoint payload's new `generator_states` field
+and restored on load. Resumed Phase-2 reservoir contents are now
+byte-identical to a single-run counterfactual. Back-compat: pre-H-2
+checkpoints (no `generator_states` field) load with a WARN; Future
+Phase-2 draws use the freshly seeded generators.
+
+Test infrastructure: `strace_syscalls` fixture (Linux-only,
+pytest.skip-elsewhere) added in `max_quality/tests/conftest_strace.py`
+AND vendored inside the hooks patch at `tests/conftest_strace.py`
+(with a sibling `tests/conftest.py` modification importing the
+fixture). 12 new fsync-order tests cover all 11 H-1 sites + the H-2
+byte-identical regression. Two pre-existing `mock.patch.object` /
+`patch.object` fsync-spy violators in `max_quality/tests/` migrated to
+the strace fixture (closes the prohibited-pattern surface for
+fsync/replace-order spies in this directory).
+
+Patch metadata: 11778 (`hooks`) + 883 (`stage2_profile`) = 12661 total
+lines, MD5 `007977e108015d74c73ef9b2896ac645` + `c3ef265d51d44f5e794af04f156d9067`.
 
 ### `calib-v2-wanda-scalar-row` (previous)
 
