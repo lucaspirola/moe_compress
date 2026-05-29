@@ -40,7 +40,7 @@ pattern (memory: `feedback_no_monkey_patches.md`, 2026-05-29). The user picked:
 
 This is reflected in:
 - H-1 test section below (strace fixture spec + per-test usage).
-- New commits #7 + #8 in the commit sequence (violator migrations).
+- New commits #8 + #9 in the commit sequence (violator migrations).
 - LoC tables and risk section updated for the strace dependency.
 - "Out of scope" section: the two violator migrations are MOVED out of
   scope and INTO this plan.
@@ -184,6 +184,21 @@ without per-file boilerplate.
 # tests/conftest_strace.py
 """Strace-based syscall observer for Pattern O fsync ordering tests.
 
+NOTE on fsync predicates: strace records `fsync(N)` with a bare numeric
+file descriptor — there is NO path argument to match against. The
+canonical Pattern O trace is
+
+    openat(..., "/.../target.tmp",  O_RDONLY|O_CLOEXEC) = 7
+    fsync(7) = 0
+    rename("/.../target.tmp", "/.../target") = 0
+    openat(..., "/.../parent_dir",  O_RDONLY|O_DIRECTORY|...) = 7
+    fsync(7) = 0
+
+so the file vs. parent-dir fsync is disambiguated by the most-recent
+preceding `openat` (path-bearing) — NOT by anything in the fsync's own
+args. See "Predicate authoring guide (fd disambiguation)" below for
+the full FD-correlation pattern.
+
 Usage:
     def test_periodic_ckpt_pattern_o(strace_syscalls):
         with strace_syscalls() as recorder:
@@ -191,9 +206,11 @@ Usage:
         # recorder.syscalls is a list of (syscall_name, args_str) tuples
         # in observed order, filtered to fsync/rename*/openat events.
         recorder.assert_order(
-            ("fsync",  lambda args: "tmp" in args),          # payload fsync
-            ("rename", lambda args: ".tmp" in args[0]),      # tmp → final
-            ("fsync",  lambda args: "parent_dir_fd" in args),# parent dir fsync
+            ("openat", lambda a: ".tmp" in a),               # opens payload tmp
+            ("fsync",  lambda a: True),                      # payload fsync (fd from prev openat)
+            ("rename", lambda a: ".tmp" in a),               # tmp → final
+            ("openat", lambda a: "O_DIRECTORY" in a),        # opens parent dir
+            ("fsync",  lambda a: True),                      # parent-dir fsync (fd from prev openat)
         )
 """
 import contextlib
@@ -363,7 +380,7 @@ implementer:
    `test_durable_rename_call_order`:
    ```python
    recorder.assert_order(
-       ("openat",  lambda a: a.endswith('.tmp", O_RDONLY|O_CLOEXEC')),
+       ("openat",  lambda a: '.tmp' in a),                     # path-only, robust to future flag-set changes
        ("fsync",   lambda a: True),                            # file fd
        ("rename",  lambda a: ".tmp" in a),
        ("openat",  lambda a: 'O_DIRECTORY' in a),
@@ -373,13 +390,30 @@ implementer:
    This works because `assert_order` matches predicates in sequence
    with gaps allowed, and the `openat(..., O_DIRECTORY)` flag
    reliably disambiguates the parent-dir open from the file open.
+   The path-only `'.tmp' in a` predicate (instead of an
+   `a.endswith(..., O_RDONLY|O_CLOEXEC')` flag-set match) survives
+   future Python / libc default-flag changes — the previous strict
+   form was tightly coupled to CPython 3.4+'s `O_CLOEXEC`-by-default
+   on `os.open`. (L-v3-1 fold.)
 
 The implementer should start with option (2) — it stays within the
-existing `_StraceRecorder` API and the `O_DIRECTORY` flag is a stable
-disambiguator written by `os.open(path, os.O_RDONLY | os.O_DIRECTORY)`
-in `utils/atomic_io._fsync_dir`. Promote to option (1) only if a test
-arises where `O_DIRECTORY` is not present (which would be a
-pre-existing helper bug worth surfacing on its own).
+existing `_StraceRecorder` API and, **after commit #2 in the
+"Commit structure" section below lands** (the new
+`feat(atomic_io): _fsync_dir uses O_DIRECTORY` change), the
+`O_DIRECTORY` flag is a stable disambiguator written by
+`os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))` in
+`utils/atomic_io._fsync_dir`. Promote to option (1) only if a test
+arises where `O_DIRECTORY` is not present after that commit — which
+would be either a regression in `_fsync_dir` or a non-Linux platform
+where `getattr(os, "O_DIRECTORY", 0)` evaluates to `0` (the production
+fallback). Both cases warrant raising back to the user rather than
+silently switching test idioms.
+
+(Note: previously, prior to the v4 fold of H-v3-1, `_fsync_dir` opened
+the directory with bare `os.O_RDONLY` — strace decoded the parent-dir
+openat as `O_RDONLY|O_CLOEXEC`, making the `'O_DIRECTORY' in a`
+predicate FALSE in practice. The new `_fsync_dir` commit makes the
+predicate factually correct on Linux.)
 
 **RAISE-not-fallback**: per `feedback_raise_dont_substitute.md`, if
 predicate authoring proves harder than either pattern above — e.g.,
@@ -691,44 +725,84 @@ early.
    import the helper standalone for the next commit's tests. ~110 LoC
    (10 × ~11 LoC).
 
-2. **`patch(vllm): H-1 fsync periodic checkpoints — 11 sites use _atomic_torch_save`**
+2. **`feat(atomic_io): _fsync_dir uses O_DIRECTORY for portable, fail-fast directory fsync`**
+   — single-line production change at
+   `max_quality/src/moe_compress/utils/atomic_io.py:125`:
+   ```python
+   # before:
+   fd = os.open(str(directory), os.O_RDONLY)
+   # after:
+   fd = os.open(str(directory), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+   ```
+   Mirrors the existing portability pattern at
+   `max_quality/src/moe_compress/router_kd/plugins/early_stop.py:168`
+   (same `getattr(os, "O_DIRECTORY", 0)` idiom). Strict improvement:
+   - On Linux, `O_DIRECTORY` raises `ENOTDIR` if the path is not a
+     directory — fail-fast for a class of caller bugs that previously
+     fsync-ed silently against the wrong fd.
+   - On platforms where `O_DIRECTORY` is absent from `os` (rare; macOS
+     does have it, BSD does, the `getattr(..., 0)` fallback covers any
+     hypothetical platform where it isn't exposed), the OR-with-0
+     yields the original `O_RDONLY` behavior — zero behavior change.
+   - Decodes in strace as `O_RDONLY|O_DIRECTORY|O_CLOEXEC` (or similar
+     superset), making the `'O_DIRECTORY' in a` predicate in the
+     fixture authoring guide (above) factually correct. This is the
+     v3 reviewer's HIGH (H-v3-1) folded via user-chosen path (b).
+
+   **Test impact**: `max_quality/tests/test_utils_atomic_io.py` has
+   existing `_fsync_dir` exercises (the `real_fsync_dir`/`rec_fsync_dir`
+   spy at L197/L208/L210/L214, and the order assertion at L217). None
+   of these assert on the openat flag-set; they assert on call-order
+   and on the helper returning successfully against a real directory.
+   `getattr(os, "O_DIRECTORY", 0)` evaluates to a non-zero int on
+   Linux+macOS (where the existing tests run) and `O_DIRECTORY` already
+   implies `O_RDONLY`-compatible read semantics for the parent-dir
+   fsync, so the existing tests continue to pass unchanged. A new
+   one-line assertion that `_fsync_dir(<non-dir path>)` raises
+   `NotADirectoryError` / `OSError(ENOTDIR)` may be added in the same
+   commit to lock in the fail-fast contract (optional; out of the LoC
+   budget but cheap if the implementer wants to harden the change).
+
+   LoC: 1 production line changed + ~5 LoC optional new test = ~6 LoC.
+
+3. **`patch(vllm): H-1 fsync periodic checkpoints — 11 sites use _atomic_torch_save`**
    — replaces every `tmp + torch.save + os.replace` triple with a single
    `_atomic_torch_save(payload, path)` call. The imatrix `_write_dat` site uses
    the parallel `_durable_close_replace_dat` helper variant. ~33 LoC delta (11
    × 3-line block → 11 × 1-line call) + 11 LoC for the imatrix `.dat` helper.
 
-3. **`patch(vllm): H-2 output_reservoir per-(rank,expert) torch.Generator`**
+4. **`patch(vllm): H-2 output_reservoir per-(rank,expert) torch.Generator`**
    — adds `_GENERATORS` dict + `_get_generator(key)` helper, replaces the
    2 global `torch.rand` / `torch.randint` calls in Phase-2 with `generator=g`
    variants, adds `generator_states` to the dump payload, adds back-compat
    restore in load. ~38 LoC.
 
-4. **`test(infra): strace_syscalls fixture — foundation for fsync-order tests`**
+5. **`test(infra): strace_syscalls fixture — foundation for fsync-order tests`**
    — adds `tests/conftest_strace.py` inside the hooks patch's vendored
    test tree AND a sibling copy at `max_quality/tests/conftest_strace.py`.
    Wires both into their respective `conftest.py`. ~115 LoC each location
    (~230 LoC total in this commit). This commit lands BEFORE the fsync-order
-   tests in commits #5 / #7 / #8 so they all reference an existing fixture.
+   tests in commits #6 / #8 / #9 so they all reference an existing fixture.
 
-5. **`patch(vllm): tests — H-1 fsync ORDER per writer (11 strace tests)`**
+6. **`patch(vllm): tests — H-1 fsync ORDER per writer (11 strace tests)`**
    — adds `test_periodic_ckpt_uses_fsync_pattern_o` to each
    `tests/test_calibration_*_smoke.py` (10 writers) + the imatrix `.dat`
    smoke + the stage2_profile smoke. Each test uses the `strace_syscalls`
-   fixture from commit #4. ~330 LoC across 12 test files (110 fixture
-   already shipped in #4, so this commit adds 11 × ~20 LoC).
+   fixture from commit #5. ~330 LoC across 12 test files (110 fixture
+   already shipped in #5, so this commit adds 11 × ~20 LoC).
 
-6. **`patch(vllm): tests — H-2 Phase-2 byte-identical + back-compat WARN`**
+7. **`patch(vllm): tests — H-2 Phase-2 byte-identical + back-compat WARN`**
    — adds `test_two_segment_additivity_phase_2_byte_identical` and
    `test_load_pre_h2_checkpoint_warns_and_proceeds` to
    `tests/test_calibration_output_reservoir_smoke.py` inside the patch. ~60 LoC.
 
-7. **`test(refactor): migrate test_utils_atomic_io.py off mock.patch.object`**
+8. **`test(refactor): migrate test_utils_atomic_io.py off mock.patch.object`**
    — converts `max_quality/tests/test_utils_atomic_io.py:212-214`'s
    `with mock.patch.object(aio, "_fsync_file", ...) ...` block to the
-   `strace_syscalls` fixture from commit #4. Closes one of the two
+   `strace_syscalls` fixture from commit #5. Closes one of the two
    pre-existing `no-monkey-patches` violators. ~+10 / -8 LoC.
 
-8. **`test(refactor): migrate test_stage3_wanda_scalar_row_cache.py off patch.object`**
+9. **`test(refactor): migrate test_stage3_wanda_scalar_row_cache.py off patch.object`**
    — converts `max_quality/tests/test_stage3_wanda_scalar_row_cache.py:189`'s
    `with patch.object(_aio.os, "replace", side_effect=_spy_replace):` block
    to the `strace_syscalls` fixture. Closes the second violator. ~+10 / -5 LoC.
@@ -736,7 +810,8 @@ early.
    L438, L458 in the same file stub `instrument_experts` /
    `build_calibration_tensor` / `save_compressed_checkpoint` / `walk_phases`
    — these are NOT fsync-order spies and are OUT OF SCOPE for this plan;
-   they're a separate test-design question.)
+   they're a separate test-design question.) Uses the `strace_syscalls`
+   fixture from commit #5.
 
    **Implementer note (payload reconstruction)**: the existing
    `test_writer_emits_manifest_after_payload` (around L170-218 of
@@ -752,16 +827,16 @@ early.
    serialisation side-channel). The ~20 LoC delta in the estimate above
    assumes the in-body `_make_payload(seed=...)` reconstruction approach.
 
-9. **`patch(manifest): bump line count + MD5 for both patches`** — final
-   commit, runs `wc -l max_quality/patches/vllm_calibration_*.patch` and
-   `md5sum` and updates the MANIFEST.md table.
+10. **`patch(manifest): bump line count + MD5 for both patches`** — final
+    commit, runs `wc -l max_quality/patches/vllm_calibration_*.patch` and
+    `md5sum` and updates the MANIFEST.md table.
 
 Per commit: tests are validated by re-applying the patch against a fresh
 v0.21.0 vLLM checkout and running `pytest tests/test_calibration_*_smoke.py`
-inside the patched tree. After commits #7 / #8 the repo-level
+inside the patched tree. After commits #8 / #9 the repo-level
 `max_quality/tests/test_utils_atomic_io.py` and `test_stage3_wanda_scalar_row_cache.py`
 must also pass. The wheel-build script (out of scope for this
-implementation but unblocked once commits 1-9 land) will rebuild and
+implementation but unblocked once commits 1-10 land) will rebuild and
 re-upload to `pirola/vllm-patched-calib`.
 
 ---
@@ -786,12 +861,12 @@ re-upload to `pirola/vllm-patched-calib`.
   production function stubbing for `instrument_experts` /
   `build_calibration_tensor` / `save_compressed_checkpoint` /
   `walk_phases`). These are a separate test-design refactor question
-  and stay out of scope; commit #8 only migrates the fsync/replace spy
+  and stay out of scope; commit #9 only migrates the fsync/replace spy
   at L189.
 
 (Moved IN-SCOPE in v2: the two `mock.patch.object` violators at
 `test_utils_atomic_io.py:212-214` and `test_stage3_wanda_scalar_row_cache.py:189`
-— commits #7 and #8 above.)
+— commits #8 and #9 above.)
 
 ---
 
@@ -818,7 +893,9 @@ provenance).
   invocation), strace must be on PATH at test time (verified
   `/usr/bin/strace` v6.8 on dev host).
 - **Updated in v2**: §"H-1 design / Tests", §"Risk" #6 (strace
-  availability), §"Commit structure" #4 (fixture as foundation commit).
+  availability), §"Commit structure" #4 (fixture as foundation commit;
+  renumbered to #5 in v4 after the O_DIRECTORY production fix was
+  inserted at #2).
 
 ### Fold 2: Migrate the 2 pre-existing violators
 
@@ -835,9 +912,9 @@ provenance).
   the patch-vendored copy; risk #7 above covers the dual-copy
   maintenance).
 - **Updated in v2**: §"Out of scope" (entry removed + back-reference
-  added), §"Commit structure" #7 + #8, §"Affected patch files +
-  estimated LoC delta" (new "Migrations" table), §"Risk" #7 (dual
-  fixture copy).
+  added), §"Commit structure" #7 + #8 (renumbered to #8 + #9 in v4),
+  §"Affected patch files + estimated LoC delta" (new "Migrations"
+  table), §"Risk" #7 (dual fixture copy).
 
 ### What did NOT change from v1
 
@@ -858,3 +935,124 @@ unexpected blocker (e.g., `strace` parsing edge-case on a writer whose
 dump_X path takes a `pathlib.Path` instead of a `str`), they should raise
 back to the user rather than silently switch to a different test
 strategy.
+
+---
+
+## Plan-v3 ledger
+
+### Fold 1 (NIT, v2 → v3): out-of-scope L299 enumeration + implementer notes
+
+- **Source**: plan-reviewer-v2 NIT.
+- **Changes**: §"Out of scope" enumerated `L299, L437, L438, L458`
+  (added `L299` — `instrument_experts`) plus matching parenthetical
+  in commit #8's body (renumbered to #9 in v4). Two material
+  implementer notes added: (a) the `_make_payload(seed=...)`
+  reconstruction approach for commit #8's subprocess body
+  (renumbered to #9 in v4; ~20 LoC budget already accounted),
+  (b) the `feedback_raise_dont_substitute.md` block in the
+  predicate authoring guide.
+
+### Raises (per `feedback_raise_dont_substitute.md`)
+
+None.
+
+---
+
+## Plan-v4 ledger
+
+### Fold 1 (HIGH, H-v3-1): user picked path (b) — add O_DIRECTORY to `_fsync_dir`
+
+- **Source**: plan-reviewer-v3 HIGH (H-v3-1).
+- **Verbatim reviewer**:
+  > The plan asserts at L378-380 that the recommended disambiguator
+  > (`'O_DIRECTORY' in a`) is "stable" because `_fsync_dir` opens with
+  > `os.O_RDONLY | os.O_DIRECTORY`. Verification:
+  > `max_quality/src/moe_compress/utils/atomic_io.py:125` uses bare
+  > `os.open(str(directory), os.O_RDONLY)` — NO `O_DIRECTORY`.
+  > Empirical strace run confirms the parent-dir openat decodes as
+  > `O_RDONLY|O_CLOEXEC`, not `O_RDONLY|O_DIRECTORY`.
+- **Path picked** (user, 2026-05-29): **(b)** — add the production
+  flag rather than complicate the test predicate.
+- **Rationale**: cheapest fix; the codebase already uses the exact
+  `getattr(os, "O_DIRECTORY", 0)` idiom at
+  `max_quality/src/moe_compress/router_kd/plugins/early_stop.py:168`
+  (verified present 2026-05-29 via
+  `grep -n 'O_DIRECTORY' max_quality/src/`). Strict improvement:
+  fail-fast on non-directory paths via `ENOTDIR`. Makes the strace
+  disambiguation predicate (option (2) in the fd-disambiguation guide)
+  factually correct.
+- **Changes**:
+  1. New commit #2 in §"Commit structure":
+     `feat(atomic_io): _fsync_dir uses O_DIRECTORY for portable, fail-fast directory fsync`.
+     1-line production change at
+     `max_quality/src/moe_compress/utils/atomic_io.py:125`. Commit
+     count: 9 → 10.
+  2. All subsequent commits renumbered (#2→#3, #3→#4, ..., #9→#10).
+     Cross-references updated at lines 43, 785, 791-792, 802, 814,
+     836, 864, 869, and the v2-ledger §"Updated in v2" annotations.
+  3. §"Predicate authoring guide (fd disambiguation)" — the
+     "stable disambiguator" claim now references the new commit and
+     notes the prior-state correction (old behavior: bare `O_RDONLY`,
+     `'O_DIRECTORY' in a` was FALSE in practice).
+
+### Fold 2 (LOW, L-v3-1): option (2) example predicate tightened
+
+- **Source**: plan-reviewer-v3 LOW (L-v3-1).
+- **Verbatim reviewer**:
+  > Option (2)'s example predicate at L366
+  > `lambda a: a.endswith('.tmp", O_RDONLY|O_CLOEXEC')` is brittle to
+  > Python's default flag-set on `os.open`. Empirically it works on
+  > Python 3.8+ (O_CLOEXEC is the default since Python 3.4), but a
+  > more conservative predicate like `lambda a: '.tmp' in a` (matching
+  > the path only) would survive future Python or libc changes.
+- **Change**: example predicate switched from
+  `a.endswith('.tmp", O_RDONLY|O_CLOEXEC')` to `'.tmp' in a`
+  (path-only match) with an explanatory paragraph after the code
+  block citing the L-v3-1 origin.
+
+### Fold 3 (NIT, N-v3-1): fixture docstring fsync-predicate examples corrected
+
+- **Source**: plan-reviewer-v3 NITPICK (N-v3-1).
+- **Verbatim reviewer**:
+  > The pre-existing fixture docstring at L194-197 uses
+  > `("fsync", lambda args: "tmp" in args)` and
+  > `("fsync", lambda args: "parent_dir_fd" in args)`. The new
+  > authoring guide at L329-330 correctly observes that `fsync(N)`
+  > has no path arg — so the fixture's own docstring example is wrong
+  > in the same way the guide warns against.
+- **Change**: fixture docstring now leads with an explanatory NOTE
+  about `fsync(N)` having no path argument, and the Usage block
+  example now mirrors the canonical 5-step pattern from the predicate
+  authoring guide (openat-tmp → fsync → rename → openat-parent →
+  fsync), using `lambda a: True` for the FD-based fsync predicates
+  and path-only/flag-only matches for the surrounding openats.
+
+### What did NOT change from v3
+
+- The H-1 site inventory (11 sites).
+- The H-1 helper inlining strategy (per-writer `_atomic_torch_save`).
+- The H-2 design (per-(rank, expert) `torch.Generator`, payload
+  `generator_states`, soft back-compat WARN).
+- The MANIFEST.md re-bump as the final commit.
+- All "Risk" entries (#1–#7).
+- The LoC totals for H-1 / H-2 / fixture / migrations (the new
+  commit adds ~6 LoC outside the patch wheel; this is below the
+  table's rounding granularity but called out in the new commit's
+  body).
+- The two violator migrations (commits #8 + #9).
+
+### Raises (per `feedback_raise_dont_substitute.md`)
+
+None pending. The user's choice of path (b) over (a) for H-v3-1 was
+explicit; L-v3-1 and N-v3-1 are mechanical folds with no engineering
+ambiguity. **One nit to flag, not a raise**: per the user's protocol
+"between commit #1 and commit #2 — or appended at the end if cleaner",
+this v4 picked the **between #1 and #2** position because (a) the
+strace tests in commit #6 reference `O_DIRECTORY` in their predicates,
+so the production fix must land before the tests for the loop-close
+verification step (`pytest tests/test_calibration_*_smoke.py` after
+every commit) to succeed; (b) the new commit is production code, not
+patch code, so grouping it before the wheel-patch sweep keeps the
+commits' subsystems contiguous. The alternative "appended at the end"
+position would have made the test-as-evidence step fail at commit #6
+until the very last commit landed, breaking per-commit validation.
