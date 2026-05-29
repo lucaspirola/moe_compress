@@ -22,6 +22,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# Make sibling conftest_strace.py importable for the strace_syscalls
+# fixture re-export below.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# Re-export the strace_syscalls fixture for the Pattern-O fsync-order tests
+# (test_utils_atomic_io.py, test_stage3_wanda_scalar_row_cache.py). The
+# fixture body lives in conftest_strace.py — kept byte-identical to the
+# patch-vendored copy inside vllm_calibration_hooks.patch's tests/ tree.
+from conftest_strace import strace_syscalls  # noqa: E402,F401
 
 
 # ---------------------------------------------------------------------------
