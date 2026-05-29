@@ -22,43 +22,30 @@ mechanical sweep for H-1 plus a localized 3-site change (init/dump/load) for H-2
 - Test additions for both go into the patches' `tests/test_calibration_*_smoke.py`
   test files (also vendored into the vLLM tree by these same patches).
 
-### Key constraint surfaced during planning (REQUEST FOR DECISION)
+### Decision-fold (v2): test strategy is (c) strace fixture, both violator tests migrated
 
-Two pre-existing tests in this codebase use `unittest.mock.patch.object` /
-`monkeypatch.setattr` against production module attributes to verify call ORDER:
+The v1 planner raised a 3-way choice for verifying fsync call ORDER without
+re-introducing the prohibited `mock.patch.object` / `monkeypatch.setattr`
+pattern (memory: `feedback_no_monkey_patches.md`, 2026-05-29). The user picked:
 
-- `max_quality/tests/test_utils_atomic_io.py:212-214` — patches
-  `aio._fsync_file`, `aio.os.replace`, `aio._fsync_dir` to assert
-  `fsync_file → replace → fsync_dir` sequence.
-- `max_quality/tests/test_stage3_wanda_scalar_row_cache.py:189` —
-  patches `_aio.os.replace` to assert payload-rename-before-manifest-rename.
+- **Test strategy: (c) strace fixture** — observe real `fsync` / `rename` /
+  `renameat` / `renameat2` syscalls and assert order. Most rigorous;
+  Linux-only (already a project constraint per
+  `feedback_compare_against_actual_upstream.md`'s clone-and-read workflow).
+- **Migrate the 2 pre-existing violators**: `test_utils_atomic_io.py:212-214`
+  and `test_stage3_wanda_scalar_row_cache.py:189` get converted from
+  `mock.patch.object` to the same strace fixture. Closes the prohibited-pattern
+  surface in this directory entirely (rather than letting H-1's new tests be
+  the only fsync-order tests not using `mock.patch.object`).
 
-The standing project rule is **no-monkey-patches against production code**
-(memory: `feedback_no_monkey_patches.md`, 2026-05-29). The cleanest
-no-monkey-patch idiom for verifying that the fsync calls are PRESENT in the
-new writers is **AST/source inspection**: `inspect.getsource(writer.dump_X_checkpoint)`
-must contain `os.fsync`, and a functional round-trip test on a real (tmpfs is fine)
-filesystem confirms no exception is raised. This does NOT verify the call ORDER
-the way the existing `mock.patch.object` tests do.
+This is reflected in:
+- H-1 test section below (strace fixture spec + per-test usage).
+- New commits #7 + #8 in the commit sequence (violator migrations).
+- LoC tables and risk section updated for the strace dependency.
+- "Out of scope" section: the two violator migrations are MOVED out of
+  scope and INTO this plan.
 
-**RAISING per `feedback_raise_dont_substitute.md`**: do you want me to
-
-  **(a)** Match the existing pre-existing test style (`mock.patch.object` to spy
-        the fsync/replace sequence — consistent with the file but reinforces
-        the prohibited pattern), or
-
-  **(b)** Use AST + functional round-trip only (strictly no-monkey-patch but
-        weaker — proves the fsync calls EXIST in the source and the dump
-        produces a readable file, but does not prove call order against a
-        reordered re-write), or
-
-  **(c)** Use a `strace -e trace=fsync,renameat,renameat2 python -c …` fixture
-        (most rigorous — observes real syscalls — but new dependency on
-        strace at test-runtime and Linux-only)?
-
-The plan below ASSUMES option (b) until the user picks. Option (a) would be
-~10 LoC simpler per test; option (c) would add a `pytest.importorskip("strace")`
-or shell-out fixture.
+See "Plan-v2 ledger" at the bottom of this doc for the audit trail.
 
 ---
 
@@ -177,53 +164,184 @@ helper variant for the open-write path). Total: **10 writer modules + 1 stage2
 module get the `_atomic_torch_save` helper added; 1 module (imatrix) gets BOTH
 helpers because of the custom binary `.dat` writer.**
 
-### Tests (H-1)
+### Tests (H-1) — strace fixture (decision (c))
 
 Per-writer smoke test files already exist inside the hooks patch
 (`tests/test_calibration_*_smoke.py`). For each of the 10 writers + imatrix
-`.dat`, add ONE new test:
+`.dat`, add ONE new test that uses a shared `strace_syscalls` pytest fixture
+to assert the exact `fsync → replace → fsync(parent_dir)` ordering by reading
+real syscalls.
+
+#### Fixture location + spec
+
+The fixture lives in a NEW file vendored inside the patches' test tree:
+`tests/conftest_strace.py` (imported into the patch's `tests/conftest.py`
+via `from .conftest_strace import strace_syscalls`). It lives at the patch's
+test-tree root so all 11 `test_calibration_*_smoke.py` files can use it
+without per-file boilerplate.
 
 ```python
-def test_periodic_ckpt_uses_fsync_pattern_o(tmp_path):
-    """H-1: dump_<writer>_checkpoint must use the Pattern O fsync dance.
+# tests/conftest_strace.py
+"""Strace-based syscall observer for Pattern O fsync ordering tests.
 
-    Verifies (assuming option (b) from the plan's REQUEST FOR DECISION):
-    1. inspect.getsource(writer.dump_X_checkpoint) contains 'os.fsync'
-       AND 'os.replace' (proves the fsync is in the source path).
-    2. A functional round-trip (dump → file exists → torch.load → fields
-       match) succeeds and the .tmp file does NOT linger.
+Usage:
+    def test_periodic_ckpt_pattern_o(strace_syscalls):
+        with strace_syscalls() as recorder:
+            writer.dump_X_checkpoint(ckpt_path)
+        # recorder.syscalls is a list of (syscall_name, args_str) tuples
+        # in observed order, filtered to fsync/rename*/openat events.
+        recorder.assert_order(
+            ("fsync",  lambda args: "tmp" in args),          # payload fsync
+            ("rename", lambda args: ".tmp" in args[0]),      # tmp → final
+            ("fsync",  lambda args: "parent_dir_fd" in args),# parent dir fsync
+        )
+"""
+import contextlib
+import os
+import re
+import subprocess
+import sys
+
+import pytest
+
+
+# Each strace line we care about looks like:
+#   <pid> fsync(7)                                 = 0
+#   <pid> rename("/tmp/xxx.tmp", "/tmp/xxx")       = 0
+#   <pid> renameat2(AT_FDCWD, "/.../a.tmp", ...)   = 0
+#   <pid> openat(AT_FDCWD, "/some/dir", O_RDONLY...) = 7
+_SYSCALL_RE = re.compile(
+    r"^(?:\[pid\s+\d+\]\s+)?"
+    r"(?P<name>fsync|rename|renameat|renameat2|openat)"
+    r"\((?P<args>[^)]*)\)\s*=\s*(?P<ret>-?\d+|0x[0-9a-fA-F]+)"
+)
+
+
+class _StraceRecorder:
+    def __init__(self, syscalls):
+        # list of (name, args_str)
+        self.syscalls = syscalls
+
+    def assert_order(self, *predicates):
+        """Assert the recorded syscalls match the given ordered predicates.
+
+        Each predicate is a (syscall_name, args_predicate_callable) tuple.
+        The recorded syscalls are scanned in order; each predicate must
+        match SOME subsequent syscall (gaps OK — e.g. openat between
+        fsync and rename is fine).
+        """
+        i = 0
+        for syscall_name, args_pred in predicates:
+            while i < len(self.syscalls):
+                name, args = self.syscalls[i]
+                i += 1
+                if name == syscall_name and args_pred(args):
+                    break
+            else:
+                raise AssertionError(
+                    f"strace order check failed: did not find {syscall_name} "
+                    f"matching predicate after position {i}. "
+                    f"Recorded syscalls: {self.syscalls}"
+                )
+
+
+@pytest.fixture
+def strace_syscalls(tmp_path):
+    """Yield a context-manager factory that records fsync/rename/openat.
+
+    The factory runs the body inside a `strace -e trace=...` subprocess
+    that re-imports the writer and invokes the dump. Stdout/stderr of
+    the subprocess is captured + parsed.
+
+    Skipped if `strace` is not on PATH (e.g. macOS, BSD CI).
     """
-    import inspect
-    from vllm import calibration_X as writer
-    src = inspect.getsource(writer.dump_X_checkpoint)
-    assert "os.fsync" in src, (
-        "dump_X_checkpoint must inline Pattern O fsync; got source:\n" + src
-    )
-    assert "os.replace" in src
+    if subprocess.run(
+        ["which", "strace"], capture_output=True
+    ).returncode != 0:
+        pytest.skip("strace not available; H-1 fsync-order test requires Linux + strace")
 
-    # Functional round-trip on a real filesystem.
-    _seed_writer(writer, ...)  # writer-specific setup, mirrors existing tests
-    ckpt = str(tmp_path / "smoke.X.ckpt")
-    writer.dump_X_checkpoint(ckpt)
-    assert os.path.exists(ckpt)
-    assert not os.path.exists(ckpt + ".tmp")
-    loaded = writer.load_X_checkpoint(ckpt)
-    assert loaded == writer.get_n_prompts_accumulated()
+    @contextlib.contextmanager
+    def _runner(python_code: str):
+        # The test body emits python source that does the dump; we
+        # exec it under strace and parse the trace log.
+        trace_log = tmp_path / "strace.log"
+        cmd = [
+            "strace",
+            "-f",                                          # follow forks
+            "-e", "trace=fsync,rename,renameat,renameat2,openat",
+            "-o", str(trace_log),
+            sys.executable, "-c", python_code,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise AssertionError(
+                f"strace subprocess failed (rc={res.returncode}):\n"
+                f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+            )
+        syscalls = []
+        for line in trace_log.read_text().splitlines():
+            m = _SYSCALL_RE.search(line)
+            if m:
+                syscalls.append((m.group("name"), m.group("args")))
+        yield _StraceRecorder(syscalls)
+
+    yield _runner
 ```
 
-Estimated LoC per writer: ~25 lines. Total: 11 × 25 ≈ 275 lines of new tests
-across the 11 `test_calibration_*_smoke.py` files inside the patch.
+#### Per-writer test shape
 
-**If user picks option (a)** (existing project style): replace the
-`inspect.getsource` assertion with a `mock.patch.object(os, "fsync", ...)`
-spy that records the fsync targets. Net delta vs option (b): -2 LoC per
-test, but reintroduces the prohibited pattern.
+```python
+def test_periodic_ckpt_uses_fsync_pattern_o(tmp_path, strace_syscalls):
+    """H-1: dump_<writer>_checkpoint must issue fsync → rename → fsync(parent).
 
-**If user picks option (c)** (strace): wrap each writer's smoke test in
-`@pytest.mark.skipif(not has_strace, …)`, spawn a subprocess that imports the
-writer, runs `dump_X_checkpoint`, and exits; parent reads `/proc/<pid>/syscalls`
-or strace's CSV output to assert fsync was invoked. Net delta vs (b):
-+40 LoC fixture in conftest, +Linux-only, but most rigorous.
+    Uses the strace_syscalls fixture (option (c) from the v1 planner's
+    REQUEST FOR DECISION) to observe real syscalls in a subprocess.
+    """
+    ckpt = tmp_path / "smoke.X.ckpt"
+    body = f'''
+import torch
+from vllm import calibration_X as writer
+# writer-specific seed (mirrors existing smoke tests in this file)
+writer._RESERVOIR[(0, 0)] = torch.zeros(2, 3)
+writer.set_n_prompts_accumulated(1)
+writer.dump_X_checkpoint(r"{ckpt}")
+'''
+    with strace_syscalls(body) as recorder:
+        pass  # body ran inside the strace subprocess
+    # Assert: fsync(payload_tmp) → rename(tmp → final) → fsync(parent_dir)
+    recorder.assert_order(
+        ("fsync",  lambda a: True),                          # payload fd fsync
+        ("rename", lambda a: ".tmp" in a and str(ckpt) in a),# tmp → final
+        ("fsync",  lambda a: True),                          # parent dir fd fsync
+    )
+    assert ckpt.exists()
+    assert not (ckpt.with_suffix(ckpt.suffix + ".tmp")).exists()
+    # Functional round-trip check (still useful)
+    loaded = torch.load(ckpt, weights_only=False)
+    assert "n_prompts_accumulated" in loaded
+```
+
+Estimated LoC:
+- Fixture (one-time): ~110 LoC in `tests/conftest_strace.py` + ~2 LoC
+  import in `tests/conftest.py`.
+- Per-test usage: ~20 LoC (subprocess-body string + assertion block).
+- Total: ~110 fixture + 11 × ~20 = **~330 lines** of new test code across
+  the 11 `test_calibration_*_smoke.py` files + conftest.
+
+(The v1 plan's pre-decision estimate of ~275 LoC under option (b) is
+replaced by this updated ~330 LoC figure: the per-test cost dropped from
+~25 → ~20 LoC because the assertion is `recorder.assert_order(...)` instead
+of an AST grep + round-trip block, but the one-time fixture cost is ~110
+LoC — net +55 LoC vs option (b).)
+
+#### Strace dependency note
+
+`strace` is part of `procps`-adjacent tooling on every Linux distro the
+project's CI/dev boxes use (verified `/usr/bin/strace` present on the
+v6.8 dev host). For non-Linux developers (macOS) the fixture issues
+`pytest.skip(...)` so the rest of the smoke suite still runs. The wheel
+build pipelines all run on Linux containers; the strace requirement does
+NOT affect production runtime, only test execution. See risk note #6 below.
 
 ---
 
@@ -407,11 +525,23 @@ inside the hooks patch.
 
 | Patch file | H-1 LoC | H-2 LoC | Test LoC | Total Δ (lines) |
 |---|---|---|---|---|
-| `vllm_calibration_hooks.patch` | +110 (10 helpers × ~11 lines, minus 2 lines per replaced site) | +38 (H-2 init + dump + load) | +275 (H-1 per-writer tests) + 60 (H-2 byte-identical + back-compat) | **~+483 lines** (current 10920 → ~11403) |
-| `vllm_calibration_stage2_profile.patch` | +11 (1 helper inlined + 2-line site collapse) | n/a | 0 (stage2_profile's existing `test_checkpoint_resume_byte_identical_after_phase_c` already exercises the resume path; new H-1 fsync test is identical-shape to the per-writer ones above, ~25 LoC) | **~+36 lines** (current 802 → ~838) |
+| `vllm_calibration_hooks.patch` | +110 (10 helpers × ~11 lines, minus 2 lines per replaced site) | +38 (H-2 init + dump + load) | +330 H-1 (110 fixture + 11×20 per-writer) + 60 H-2 (byte-identical + back-compat) | **~+538 lines** (current 10920 → ~11458) |
+| `vllm_calibration_stage2_profile.patch` | +11 (1 helper inlined + 2-line site collapse) | n/a | +20 (1 strace-fixture-based fsync test in the stage2 smoke file; the fixture itself is imported from the hooks-patch conftest, not duplicated) | **~+31 lines** (current 802 → ~833) |
 
-Net wheel-payload code delta: ~+520 lines across both patches. The MANIFEST.md
-line-counts + MD5s update once at the end of implementation.
+Migrations of the 2 pre-existing violators (separate non-patch files, do
+NOT touch the wheel-vendored test tree):
+
+| File | Lines (current) | Δ | Notes |
+|---|---|---|---|
+| `max_quality/tests/test_utils_atomic_io.py` | L212-214 use `mock.patch.object` | ~+10 / -8 | Replace 3-line `with mock.patch.object(...) as ...` block with `with strace_syscalls(body) as recorder: ...; recorder.assert_order(...)`. The fixture is imported from `max_quality/tests/conftest.py` (NOT the patch-vendored conftest — needs a sibling copy). |
+| `max_quality/tests/test_stage3_wanda_scalar_row_cache.py` | L189 uses `patch.object` | ~+10 / -5 | Same migration pattern. |
+| `max_quality/tests/conftest.py` | new | +5 | `from .conftest_strace import strace_syscalls` (sibling copy of the same fixture used inside the patches' test tree) |
+| `max_quality/tests/conftest_strace.py` | new | +110 | Sibling copy of the fixture vendored at `<patch>/tests/conftest_strace.py`. Kept in sync by hand at commit time; future change to one must update both. |
+
+Net wheel-payload code delta: ~+569 lines across both patches.
+Net repo code delta (non-patch): ~+125 lines for the violator migrations
++ the second fixture copy.
+The MANIFEST.md line-counts + MD5s update once at the end of implementation.
 
 ---
 
@@ -437,10 +567,9 @@ line-counts + MD5s update once at the end of implementation.
    and the patched wheel will be re-built incorrectly. The plan's commit
    sequence ends with the MANIFEST.md bump explicitly.
 
-4. **Test strategy decision (option a/b/c above) gates the test-LoC
-   estimates.** The 275 + 60 LoC test estimates above assume option (b) (AST
-   inspection + functional round-trip). Option (a) shaves ~20 LoC total.
-   Option (c) adds ~40 LoC fixture and a strace dependency.
+4. **Test strategy decision is folded (option (c) chosen).** The
+   ~330 H-1 + ~60 H-2 + ~125 violator-migration LoC reflect the strace
+   fixture path. Original v1 estimates (option (b)) are superseded.
 
 5. **The `_atomic_torch_save` helper is duplicated 10 times** (one per
    writer module). This is deliberate (avoids cross-module imports inside
@@ -454,6 +583,27 @@ line-counts + MD5s update once at the end of implementation.
    sites must be edited together — same maintenance cost as the existing
    bare `tmp + torch.save + os.replace` 11-site sweep that this plan
    replaces.
+
+6. **Strace must be on PATH at test time.** Verified present
+   (`/usr/bin/strace`, v6.8) on the dev host and standard on every Linux
+   container the project uses (apt: `strace`, alpine: `strace`). The
+   fixture issues `pytest.skip` if absent — so non-Linux contributors
+   (macOS) still run the rest of the smoke suite cleanly, but they
+   cannot validate the fsync-order assertions locally. CI MUST run on
+   Linux + ensure `strace` is in the image. Document the requirement
+   in `tests/conftest_strace.py`'s module docstring and in the patches'
+   README hunk so future maintainers see it before debugging a "test
+   skipped" puzzle.
+
+7. **The `conftest_strace.py` fixture exists in two locations**: once
+   vendored inside each patch's test tree (`<patch>/tests/conftest_strace.py`),
+   once in the repo-level test tree (`max_quality/tests/conftest_strace.py`).
+   The two copies MUST stay byte-identical. Mitigation: a CI sanity check
+   `diff max_quality/tests/conftest_strace.py max_quality/patches/.../conftest_strace.py`
+   in pre-commit / pre-push. Alternative considered: symlink the second
+   copy — rejected because the patch-vendored copy must survive the
+   `git apply` of the patch into a fresh vLLM checkout, where symlinks
+   to outside-the-tree paths break.
 
 ---
 
@@ -481,25 +631,50 @@ early.
    variants, adds `generator_states` to the dump payload, adds back-compat
    restore in load. ~38 LoC.
 
-4. **`patch(vllm): tests — H-1 fsync round-trip per writer (11 tests)`**
-   — adds `test_periodic_ckpt_uses_fsync_pattern_o` to each
-   `tests/test_calibration_*_smoke.py` inside the patch. ~275 LoC. **Assumes
-   option (b) from the REQUEST FOR DECISION above; switch to (a) or (c) per
-   user's choice.**
+4. **`test(infra): strace_syscalls fixture — foundation for fsync-order tests`**
+   — adds `tests/conftest_strace.py` inside the hooks patch's vendored
+   test tree AND a sibling copy at `max_quality/tests/conftest_strace.py`.
+   Wires both into their respective `conftest.py`. ~115 LoC each location
+   (~230 LoC total in this commit). This commit lands BEFORE the fsync-order
+   tests in commits #5 / #7 / #8 so they all reference an existing fixture.
 
-5. **`patch(vllm): tests — H-2 Phase-2 byte-identical + back-compat WARN`**
+5. **`patch(vllm): tests — H-1 fsync ORDER per writer (11 strace tests)`**
+   — adds `test_periodic_ckpt_uses_fsync_pattern_o` to each
+   `tests/test_calibration_*_smoke.py` (10 writers) + the imatrix `.dat`
+   smoke + the stage2_profile smoke. Each test uses the `strace_syscalls`
+   fixture from commit #4. ~330 LoC across 12 test files (110 fixture
+   already shipped in #4, so this commit adds 11 × ~20 LoC).
+
+6. **`patch(vllm): tests — H-2 Phase-2 byte-identical + back-compat WARN`**
    — adds `test_two_segment_additivity_phase_2_byte_identical` and
    `test_load_pre_h2_checkpoint_warns_and_proceeds` to
    `tests/test_calibration_output_reservoir_smoke.py` inside the patch. ~60 LoC.
 
-6. **`patch(manifest): bump line count + MD5 for both patches`** — final
+7. **`test(refactor): migrate test_utils_atomic_io.py off mock.patch.object`**
+   — converts `max_quality/tests/test_utils_atomic_io.py:212-214`'s
+   `with mock.patch.object(aio, "_fsync_file", ...) ...` block to the
+   `strace_syscalls` fixture from commit #4. Closes one of the two
+   pre-existing `no-monkey-patches` violators. ~+10 / -8 LoC.
+
+8. **`test(refactor): migrate test_stage3_wanda_scalar_row_cache.py off patch.object`**
+   — converts `max_quality/tests/test_stage3_wanda_scalar_row_cache.py:189`'s
+   `with patch.object(_aio.os, "replace", side_effect=_spy_replace):` block
+   to the `strace_syscalls` fixture. Closes the second violator. ~+10 / -5 LoC.
+   (Note: the `monkeypatch.setattr` calls at L437/L438/L458 in the same file
+   stub `build_calibration_tensor` / `save_compressed_checkpoint` /
+   `walk_phases` — these are NOT fsync-order spies and are OUT OF SCOPE for
+   this plan; they're a separate test-design question.)
+
+9. **`patch(manifest): bump line count + MD5 for both patches`** — final
    commit, runs `wc -l max_quality/patches/vllm_calibration_*.patch` and
    `md5sum` and updates the MANIFEST.md table.
 
 Per commit: tests are validated by re-applying the patch against a fresh
 v0.21.0 vLLM checkout and running `pytest tests/test_calibration_*_smoke.py`
-inside the patched tree. The wheel-build script (out of scope for this
-implementation but unblocked once commits 1-6 land) will rebuild and
+inside the patched tree. After commits #7 / #8 the repo-level
+`max_quality/tests/test_utils_atomic_io.py` and `test_stage3_wanda_scalar_row_cache.py`
+must also pass. The wheel-build script (out of scope for this
+implementation but unblocked once commits 1-9 land) will rebuild and
 re-upload to `pirola/vllm-patched-calib`.
 
 ---
@@ -518,8 +693,78 @@ re-upload to `pirola/vllm-patched-calib`.
   — non-functional, defer.
 - **N-1 / N-2 / N-3** (nitpicks: closure inlining, log message paths, help text)
   — non-functional.
-- **Pre-existing monkey-patch tests** in `test_utils_atomic_io.py:212-214` and
-  `test_stage3_wanda_scalar_row_cache.py:189` — these violate the project's
-  `no-monkey-patches` standing rule but are out of scope for THIS plan
-  (separate refactor ticket; raised in the REQUEST FOR DECISION above so the
-  user is aware of the test-style asymmetry the H-1 tests will create).
+- **Other `monkeypatch.setattr` sites in the migrated files** that do NOT
+  spy fsync/replace order (e.g., `test_stage3_wanda_scalar_row_cache.py`
+  L437 / L438 / L458 stub `build_calibration_tensor`,
+  `save_compressed_checkpoint`, `walk_phases`). These are a separate
+  test-design refactor question and stay out of scope.
+
+(Moved IN-SCOPE in v2: the two `mock.patch.object` violators at
+`test_utils_atomic_io.py:212-214` and `test_stage3_wanda_scalar_row_cache.py:189`
+— commits #7 and #8 above.)
+
+---
+
+## Plan-v2 ledger
+
+This section documents the folds from v1 → v2 with reviewer attribution
++ design rationale, per `feedback_subagent_files_need_git_persistence.md`
+(audit trail) and `feedback_raise_dont_substitute.md` (user-decision
+provenance).
+
+### Fold 1: Test strategy (c) strace fixture
+
+- **Source**: v1 planner (commit `bfb40941d`) explicitly raised a 3-way
+  choice (a/b/c) in §"Key constraint surfaced during planning (REQUEST
+  FOR DECISION)" with default (b) AST + readback. Raised because the
+  pre-existing `mock.patch.object` style (option (a)) violates the
+  project's `no-monkey-patches` rule and option (b) cannot prove call
+  ORDER (only call presence).
+- **User decision** (folded here, 2026-05-29): chose **(c) strace fixture**
+  — observe real syscalls. Rationale: most rigorous; catches
+  helper-reorder bugs that AST or readback can't; the Linux constraint
+  is already baked into the project.
+- **Cost**: +110 LoC fixture (one-time), +5 LoC per test (per-test
+  invocation), strace must be on PATH at test time (verified
+  `/usr/bin/strace` v6.8 on dev host).
+- **Updated in v2**: §"H-1 design / Tests", §"Risk" #6 (strace
+  availability), §"Commit structure" #4 (fixture as foundation commit).
+
+### Fold 2: Migrate the 2 pre-existing violators
+
+- **Source**: v1 planner listed the 2 violators in §"Out of scope" with
+  a note that the H-1 tests would create a test-style asymmetry (new
+  tests use strict no-monkey-patch path; old tests still use
+  `mock.patch.object`).
+- **User decision** (folded here, 2026-05-29): chose **yes, migrate both**.
+  Rationale: close the prohibited-pattern surface entirely in
+  `max_quality/tests/` so reviewers can't accidentally cite the
+  pre-existing violators as precedent for new monkey-patches.
+- **Cost**: ~+20 LoC across 2 test files + a sibling fixture copy at
+  `max_quality/tests/conftest_strace.py` (~115 LoC, byte-identical to
+  the patch-vendored copy; risk #7 above covers the dual-copy
+  maintenance).
+- **Updated in v2**: §"Out of scope" (entry removed + back-reference
+  added), §"Commit structure" #7 + #8, §"Affected patch files +
+  estimated LoC delta" (new "Migrations" table), §"Risk" #7 (dual
+  fixture copy).
+
+### What did NOT change from v1
+
+- The H-1 site inventory (11 sites) is unchanged.
+- The H-1 helper inlining strategy (per-writer `_atomic_torch_save`,
+  imatrix's special `_durable_close_replace_dat`) is unchanged.
+- The H-2 design (per-(rank, expert) `torch.Generator`, payload
+  `generator_states` field, soft back-compat WARN at load) is
+  unchanged.
+- The MANIFEST.md re-bump is still the final commit.
+- All "Risk" entries #1, #2, #3, #5 from v1 are unchanged.
+
+### Raises (per `feedback_raise_dont_substitute.md`)
+
+None pending. v1's single open decision-point is resolved by user input;
+no new ambiguity surfaced during the fold. If the implementer hits an
+unexpected blocker (e.g., `strace` parsing edge-case on a writer whose
+dump_X path takes a `pathlib.Path` instead of a `str`), they should raise
+back to the user rather than silently switch to a different test
+strategy.
