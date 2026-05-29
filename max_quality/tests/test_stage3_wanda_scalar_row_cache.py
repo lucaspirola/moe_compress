@@ -167,55 +167,77 @@ def test_missing_manifest_raises(tmp_path):
 # ==========================================================================
 
 
-def test_writer_emits_manifest_after_payload(tmp_path):
-    """Mock os.replace to capture the rename order. The manifest's
-    rename MUST be observed AFTER the payload's rename (Pattern O).
+def test_writer_emits_manifest_after_payload(tmp_path, strace_syscalls):
+    """Pattern O write order: the manifest's rename MUST be observed
+    AFTER the payload's rename. Verified via real syscalls under strace.
+
+    Migrated from patch.object(os, 'replace') spy to the strace_syscalls
+    fixture per the project's [[no-monkey-patches]] rule and the H-1/H-2
+    plan commit #9 (closes the second of two pre-existing patch.object
+    fsync/replace-order spies in this directory).
+
+    Per the plan's payload-reconstruction note: the subprocess body
+    rebuilds the WandaScalarRowPayload via _make_payload(seed=7) (the
+    same deterministic builder used by the parent test). We do NOT
+    serialize the payload to disk in the parent and re-load it in the
+    subprocess — that would pollute the strace trace with extra
+    openat/read syscalls and couple the test to a serialisation
+    side-channel.
     """
+    import textwrap
     jsonl = tmp_path / "trace.jsonl"
-    payload = _make_payload(n_layers=1, n_experts=2, d_in=3)
-
-    rename_order: list[str] = []
-
-    # Capture the two ``os.replace`` calls that materialise the sidecar
-    # + manifest. The atomic_io helpers use ``os.replace`` for the
-    # tmp->final rename; we patch the symbol used inside the helpers.
-    import moe_compress.utils.atomic_io as _aio
-    real_replace = _aio.os.replace
-
-    def _spy_replace(src, dst):
-        rename_order.append(str(dst))
-        return real_replace(src, dst)
-
-    with patch.object(_aio.os, "replace", side_effect=_spy_replace):
-        save_wanda_scalar_row(payload, jsonl)
-
-    # Both renames observed; manifest rename must come AFTER the
-    # payload rename.
     sidecar = sidecar_path(jsonl, "wanda_scalar_row")
     manifest = sidecar.with_suffix(sidecar.suffix + ".MANIFEST.json")
     sidecar_str = str(sidecar)
     manifest_str = str(manifest)
-    # rename_order may contain parent-dir fsync targets that aren't
-    # ``os.replace``; filter to just the actual file renames.
-    # (Pattern O's parent-dir sync mechanism is ``os.fsync(fd)`` on
-    # the parent directory handle -- NOT ``os.replace`` -- so the
-    # spy here genuinely only observes file renames; the filter is
-    # defensive in case the helper ever grows an intermediate
-    # ``os.replace`` for some other artifact in the same tmp dir.)
-    file_renames = [r for r in rename_order
-                    if r in (sidecar_str, manifest_str)]
-    assert sidecar_str in file_renames, (
-        f"Sidecar rename not observed; renames: {file_renames}"
+
+    # Build the subprocess body. Reconstruct payload via the same
+    # deterministic _make_payload(seed=7) the parent uses (mirrors the
+    # in-tree builder so the strace test stays in sync with non-strace
+    # tests that share this helper).
+    body = textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
+        from pathlib import Path
+        import torch
+        from moe_compress.utils.cached_calibration_signals import (
+            SCHEMA_VERSIONS, WandaScalarRowPayload, save_wanda_scalar_row,
+        )
+        torch.manual_seed(7)
+        sigma = {{}}
+        counts = {{}}
+        for li in range(1):
+            for e in range(2):
+                for name in ("gate_proj",):
+                    key = (li, e, name)
+                    sigma[key] = torch.rand(3, dtype=torch.float32)
+                    counts[key] = (li + 1) * (e + 1)
+        payload = WandaScalarRowPayload(
+            schema_version=SCHEMA_VERSIONS["wanda_scalar_row"],
+            n_experts=2,
+            n_layers=1,
+            sigma_x_g_squared=sigma,
+            token_counts=counts,
+        )
+        save_wanda_scalar_row(payload, Path({str(jsonl)!r}))
+    """).strip()
+    with strace_syscalls(body) as recorder:
+        pass
+
+    # Pattern O: the sidecar's rename(tmp -> final) MUST be observed
+    # BEFORE the manifest's rename(tmp -> final). assert_order scans the
+    # syscalls in observed order; we look for the sidecar rename first,
+    # then the manifest rename after it. Either rename appearing without
+    # the other or out of order indicates the writer violates Pattern O.
+    recorder.assert_order(
+        ("rename", lambda a: sidecar_str in a),
+        ("rename", lambda a: manifest_str in a),
     )
-    assert manifest_str in file_renames, (
-        f"Manifest rename not observed; renames: {file_renames}"
-    )
-    sidecar_idx = file_renames.index(sidecar_str)
-    manifest_idx = file_renames.index(manifest_str)
-    assert manifest_idx > sidecar_idx, (
-        f"Manifest at idx {manifest_idx} not AFTER sidecar at idx "
-        f"{sidecar_idx}; order: {file_renames}"
-    )
+    # Functional checks: both artifacts exist; no .tmp leftovers.
+    assert sidecar.exists(), f"sidecar {sidecar} not written"
+    assert manifest.exists(), f"manifest {manifest} not written"
+    assert not Path(sidecar_str + ".tmp").exists()
+    assert not Path(manifest_str + ".tmp").exists()
 
 
 # ==========================================================================
