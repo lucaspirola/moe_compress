@@ -620,6 +620,60 @@ def _ckpt_counter_check(
     )
 
 
+def _ckpt_existence_check(
+    signal_name: str,
+    capture_enabled: bool,
+    already_done: int,
+    ckpt_path: "Path",
+    *,
+    allow_counter_divergence: bool,
+    log_: logging.Logger | None = None,
+) -> None:
+    """C-1 enforcement: hard-fail when a writer is fresh-on-resume.
+
+    Fires when ``args.resume`` is set, the operator enabled the writer
+    (``capture_enabled=True``), the JSONL has rows from a prior session
+    (``already_done > 0``), but the writer's checkpoint does not exist.
+    In that state, the writer would start from zero and silently
+    under-cover the calibration data, while the sidecar's eventual
+    ``n_prompts_accumulated = already_done + n_new`` would inflate the
+    coverage claim. Refuse to start unless ``--allow-counter-divergence``
+    is set (in which case warn).
+
+    Raises:
+        ValueError: when capture_enabled is True, already_done > 0,
+            the checkpoint does not exist, and
+            allow_counter_divergence is False. Message names the
+            writer, the row count, the checkpoint path, and the
+            escape-hatch flag so operators have an actionable
+            recovery path.
+    """
+    if not capture_enabled or already_done == 0 or ckpt_path.exists():
+        return
+    msg = (
+        f"{signal_name}: --capture-{signal_name} enabled on a resume "
+        f"with already_done={already_done} JSONL rows, but no "
+        f"checkpoint exists at {ckpt_path}. The writer would silently "
+        f"under-cover the prior {already_done} prompts; the sidecar's "
+        f"n_prompts_accumulated would claim full coverage."
+    )
+    if allow_counter_divergence:
+        (log_ or log).warning(
+            "%s Proceeding with the smaller actual coverage "
+            "(--allow-counter-divergence is set). Sidecar metadata will "
+            "OVER-state coverage; downstream consumers that rely on "
+            "n_prompts_accumulated for normalization will be biased.",
+            msg,
+        )
+        return
+    raise ValueError(
+        f"{msg} Either re-run without --resume to start fresh, OR "
+        f"delete the .jsonl.tmp file ({ckpt_path.parent}) so the "
+        f"writer starts from prompt 0, OR pass "
+        f"--allow-counter-divergence to tolerate the under-coverage."
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -696,7 +750,13 @@ def main() -> int:
             "proceeds with the smaller counter — the legacy behavior. "
             "Recommended ONLY for ablation sweeps where minor "
             "under-counting is tolerable; production runs should "
-            "keep the default hard-fail."
+            "keep the default hard-fail. "
+            "Also downgrades the C-1 (fresh-writer-on-resume) abort "
+            "to a WARN: when a writer's --capture-X flag is enabled "
+            "on a resume but no prior checkpoint exists, the writer "
+            "integrates over only the post-resume chunks (a SUBSET "
+            "of the calibration data); the sidecar's "
+            "n_prompts_accumulated metadata will OVER-state coverage."
         ),
     )
     p.add_argument("--prev-num-prompts", type=int, default=0,
@@ -1401,6 +1461,13 @@ def main() -> int:
         # pre-allocated the buffers CUDA-graph capture needs). The loader
         # does an in-place .copy_() so the pinned buffers survive.
         imatrix_ckpt_path = out_path.with_suffix(".imatrix.ckpt")
+        _ckpt_existence_check(
+            "imatrix",
+            args.capture_imatrix,
+            already_done,
+            imatrix_ckpt_path,
+            allow_counter_divergence=args.allow_counter_divergence,
+        )
         if args.resume and imatrix_ckpt_path.exists():
             try:
                 loaded_prompts = _im.load_imatrix_checkpoint(
@@ -1437,6 +1504,13 @@ def main() -> int:
         log.info("reap-scores: setup complete -- accumulators pre-allocated")
 
         reap_ckpt_path = out_path.with_suffix(".reap_scores.ckpt")
+        _ckpt_existence_check(
+            "reap_scores",
+            args.capture_reap_scores,
+            already_done,
+            reap_ckpt_path,
+            allow_counter_divergence=args.allow_counter_divergence,
+        )
         if args.resume and reap_ckpt_path.exists():
             try:
                 loaded_prompts = _reap.load_reap_scores_checkpoint(
@@ -1468,6 +1542,13 @@ def main() -> int:
         log.info("input-cov: setup complete -- expert_in callback registered")
 
         input_cov_ckpt_path = out_path.with_suffix(".input_cov.ckpt")
+        _ckpt_existence_check(
+            "input_covariance",
+            args.capture_input_covariance,
+            already_done,
+            input_cov_ckpt_path,
+            allow_counter_divergence=args.allow_counter_divergence,
+        )
         if args.resume and input_cov_ckpt_path.exists():
             try:
                 loaded_prompts = _icov.load_input_cov_checkpoint(
@@ -1503,6 +1584,13 @@ def main() -> int:
         )
 
         wsr_ckpt_path = out_path.with_suffix(".wanda_scalar_row.ckpt")
+        _ckpt_existence_check(
+            "wanda_scalar_row",
+            args.capture_wanda_scalar_row,
+            already_done,
+            wsr_ckpt_path,
+            allow_counter_divergence=args.allow_counter_divergence,
+        )
         if args.resume and wsr_ckpt_path.exists():
             try:
                 loaded_prompts = _wsr.load_wanda_scalar_row_checkpoint(
@@ -1540,6 +1628,13 @@ def main() -> int:
             args.stage2_profile_cov_storage_dtype,
         )
         s2p_ckpt_path = out_path.with_suffix(".stage2_profile.ckpt")
+        _ckpt_existence_check(
+            "stage2_profile",
+            args.capture_stage2_profile,
+            already_done,
+            s2p_ckpt_path,
+            allow_counter_divergence=args.allow_counter_divergence,
+        )
         if args.resume and s2p_ckpt_path.exists():
             try:
                 loaded_prompts = _s2p.load_stage2_profile_checkpoint(
@@ -1573,6 +1668,13 @@ def main() -> int:
                  "expert_out_unweighted callback registered")
 
         pem_ckpt_path = out_path.with_suffix(".per_expert_max.ckpt")
+        _ckpt_existence_check(
+            "per_expert_max",
+            args.capture_per_expert_max,
+            already_done,
+            pem_ckpt_path,
+            allow_counter_divergence=args.allow_counter_divergence,
+        )
         if args.resume and pem_ckpt_path.exists():
             try:
                 loaded_prompts = _pem.load_per_expert_max_checkpoint(
@@ -1607,6 +1709,13 @@ def main() -> int:
                  "router callback registered")
 
         rts_ckpt_path = out_path.with_suffix(".routing_stats.ckpt")
+        _ckpt_existence_check(
+            "routing_stats",
+            args.capture_routing_stats,
+            already_done,
+            rts_ckpt_path,
+            allow_counter_divergence=args.allow_counter_divergence,
+        )
         if args.resume and rts_ckpt_path.exists():
             try:
                 loaded_prompts = _rts.load_routing_stats_checkpoint(
@@ -1653,6 +1762,13 @@ def main() -> int:
         router_logits_ckpt_path = out_path.with_suffix(
             ".router_logits_stats.ckpt"
         )
+        _ckpt_existence_check(
+            "router_logits_stats",
+            args.capture_router_logits_stats,
+            already_done,
+            router_logits_ckpt_path,
+            allow_counter_divergence=args.allow_counter_divergence,
+        )
         if args.resume and router_logits_ckpt_path.exists():
             try:
                 loaded_prompts = _rlsx.load_router_logits_stats_checkpoint(
@@ -1692,6 +1808,13 @@ def main() -> int:
                  args.output_reservoir_cap)
 
         or_ckpt_path = out_path.with_suffix(".output_reservoir.ckpt")
+        _ckpt_existence_check(
+            "output_reservoir",
+            args.capture_output_reservoir,
+            already_done,
+            or_ckpt_path,
+            allow_counter_divergence=args.allow_counter_divergence,
+        )
         if args.resume and or_ckpt_path.exists():
             try:
                 loaded_prompts = _or.load_output_reservoir_checkpoint(
@@ -1731,6 +1854,13 @@ def main() -> int:
                  args.block_outputs_subset_size)
 
         bo_ckpt_path = out_path.with_suffix(".block_outputs.ckpt")
+        _ckpt_existence_check(
+            "block_outputs",
+            args.capture_block_outputs,
+            already_done,
+            bo_ckpt_path,
+            allow_counter_divergence=args.allow_counter_divergence,
+        )
         if args.resume and bo_ckpt_path.exists():
             try:
                 loaded_prompts = _bo.load_block_outputs_checkpoint(
