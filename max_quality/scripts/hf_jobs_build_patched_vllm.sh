@@ -13,7 +13,12 @@
 #   hf jobs run --flavor cpu-performance --detach --timeout 6h \
 #       --secrets HF_TOKEN \
 #       nvidia/cuda:13.0.0-devel-ubuntu24.04 \
-#       bash -c "curl -sL https://raw.githubusercontent.com/lucaspirola/moe_compress/main/max_quality/scripts/hf_jobs_build_patched_vllm.sh | bash"
+#       bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates && curl -sL https://raw.githubusercontent.com/lucaspirola/moe_compress/main/max_quality/scripts/hf_jobs_build_patched_vllm.sh | bash"
+#
+# NOTE: the base nvidia/cuda:*-ubuntu24.04 image does NOT ship with curl,
+# so the bootstrap MUST apt-install it BEFORE the curl|bash pipe — otherwise
+# the job fails at line 1 with "curl: command not found". The script's own
+# Phase 1 installs the rest of the build prereqs (curl included, idempotent).
 
 set -e
 set -o pipefail
