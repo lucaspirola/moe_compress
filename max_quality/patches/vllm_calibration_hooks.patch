@@ -169,7 +169,7 @@ new file mode 100644
 index 0000000..8cff9eb
 --- /dev/null
 +++ b/tests/test_calibration_block_outputs_smoke.py
-@@ -0,0 +1,527 @@
+@@ -0,0 +1,553 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_block_outputs``.
@@ -697,6 +697,32 @@ index 0000000..8cff9eb
 +    # Operator-facing warning surfaced.
 +    assert "does NOT divide evenly" in log_text
 +    assert "--chunk-size as a divisor" in log_text
++
++
++def test_h1_periodic_ckpt_pattern_o(tmp_path, strace_syscalls):
++    """H-1: dump_*_checkpoint must issue Pattern O syscall sequence
++    (openat(tmp) -> fsync -> rename -> openat(parent O_DIRECTORY) -> fsync).
++
++    Uses the strace_syscalls fixture (commit #5) to observe real
++    syscalls in a subprocess. Linux-only; skipped if strace is
++    absent on PATH. The body intentionally seeds minimal state —
++    the Pattern O dance is invariant to payload size, so an empty
++    or near-empty payload still exercises the full fsync sequence.
++    """
++    ckpt = str(tmp_path / 'h1.calibration_block_outputs.ckpt')
++    body_template = "import importlib, os\nfor k, v in {'VLLM_CALIB_CAPTURE_BLOCK_OUTPUTS': '1', 'VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE': '8', 'VLLM_CALIB_CAPTURE_BLOCK': '1'}.items():\n    os.environ[k] = v\nimportlib.import_module('vllm.calibration_hooks')\nm = importlib.import_module('vllm.calibration_block_outputs')\nif hasattr(m, 'set_n_prompts_accumulated'):\n    m.set_n_prompts_accumulated(1)\nm.dump_block_outputs_checkpoint({ckpt!r})\n"
++    body = body_template.format(ckpt=ckpt)
++    with strace_syscalls(body) as recorder:
++        pass
++    recorder.assert_order(
++        ('openat', lambda a: '.tmp' in a),
++        ('fsync',  lambda a: True),
++        ('rename', lambda a: '.tmp' in a),
++        ('openat', lambda a: 'O_DIRECTORY' in a),
++        ('fsync',  lambda a: True),
++    )
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + '.tmp')
 diff --git a/tests/test_calibration_hooks_smoke.py b/tests/test_calibration_hooks_smoke.py
 new file mode 100644
 index 0000000..c93ec35
@@ -1422,7 +1448,7 @@ new file mode 100644
 index 0000000..4a7cd9d
 --- /dev/null
 +++ b/tests/test_calibration_imatrix_smoke.py
-@@ -0,0 +1,1090 @@
+@@ -0,0 +1,1143 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_imatrix``.
@@ -2513,12 +2539,65 @@ index 0000000..4a7cd9d
 +
 +if __name__ == "__main__":
 +    sys.exit(pytest.main([__file__, "-v"]))
++
++
++def test_h1_periodic_ckpt_pattern_o(tmp_path, strace_syscalls):
++    """H-1: dump_*_checkpoint must issue Pattern O syscall sequence
++    (openat(tmp) -> fsync -> rename -> openat(parent O_DIRECTORY) -> fsync).
++
++    Uses the strace_syscalls fixture (commit #5) to observe real
++    syscalls in a subprocess. Linux-only; skipped if strace is
++    absent on PATH. The body intentionally seeds minimal state —
++    the Pattern O dance is invariant to payload size, so an empty
++    or near-empty payload still exercises the full fsync sequence.
++    """
++    ckpt = str(tmp_path / 'h1.calibration_imatrix.ckpt')
++    body_template = "import importlib, os\nfor k, v in {'VLLM_CALIB_CAPTURE_IMATRIX': '1'}.items():\n    os.environ[k] = v\nimportlib.import_module('vllm.calibration_hooks')\nm = importlib.import_module('vllm.calibration_imatrix')\nif hasattr(m, 'set_n_prompts_accumulated'):\n    m.set_n_prompts_accumulated(1)\nm.dump_imatrix_checkpoint({ckpt!r})\n"
++    body = body_template.format(ckpt=ckpt)
++    with strace_syscalls(body) as recorder:
++        pass
++    recorder.assert_order(
++        ('openat', lambda a: '.tmp' in a),
++        ('fsync',  lambda a: True),
++        ('rename', lambda a: '.tmp' in a),
++        ('openat', lambda a: 'O_DIRECTORY' in a),
++        ('fsync',  lambda a: True),
++    )
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + '.tmp')
++
++
++def test_h1_dump_imatrix_dat_pattern_o(tmp_path, strace_syscalls):
++    """H-1: dump_imatrix (.dat custom binary writer) must issue Pattern O.
++
++    The .dat writer uses `with open(tmp, 'wb') as f:` (NOT torch.save),
++    so the helper is _durable_close_replace_dat instead of
++    _atomic_torch_save. Same Pattern O syscall sequence expected.
++    """
++    path = str(tmp_path / 'h1.imatrix.dat')
++    body_template = "import importlib, os\nfor k, v in {'VLLM_CALIB_CAPTURE_IMATRIX': '1'}.items():\n    os.environ[k] = v\nimportlib.import_module('vllm.calibration_hooks')\nm = importlib.import_module('vllm.calibration_imatrix')\nm.dump_imatrix({path!r}, chunk_count=0)\n"
++    body = body_template.format(path=path)
++    with strace_syscalls(body) as recorder:
++        pass
++    # The .dat writer opens the tmp via `open(..., 'wb')` (also an openat
++    # at the syscall layer with O_WRONLY|O_CREAT|O_TRUNC), then fsyncs
++    # the fileno BEFORE the with-block closes, then os.replace, then
++    # parent-dir openat(O_DIRECTORY) + fsync.
++    recorder.assert_order(
++        ('openat', lambda a: '.tmp' in a),
++        ('fsync',  lambda a: True),
++        ('rename', lambda a: '.tmp' in a),
++        ('openat', lambda a: 'O_DIRECTORY' in a),
++        ('fsync',  lambda a: True),
++    )
++    assert os.path.exists(path)
++    assert not os.path.exists(path + '.tmp')
 diff --git a/tests/test_calibration_input_cov_smoke.py b/tests/test_calibration_input_cov_smoke.py
 new file mode 100644
 index 0000000..c135f9f
 --- /dev/null
 +++ b/tests/test_calibration_input_cov_smoke.py
-@@ -0,0 +1,366 @@
+@@ -0,0 +1,392 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_input_cov``.
@@ -2885,6 +2964,32 @@ index 0000000..c135f9f
 +    )
 +    assert torch.allclose(e0, expected_e0, atol=1e-5), f"e0={e0}"
 +    assert torch.allclose(e1, expected_e1, atol=1e-5), f"e1={e1}"
++
++
++def test_h1_periodic_ckpt_pattern_o(tmp_path, strace_syscalls):
++    """H-1: dump_*_checkpoint must issue Pattern O syscall sequence
++    (openat(tmp) -> fsync -> rename -> openat(parent O_DIRECTORY) -> fsync).
++
++    Uses the strace_syscalls fixture (commit #5) to observe real
++    syscalls in a subprocess. Linux-only; skipped if strace is
++    absent on PATH. The body intentionally seeds minimal state —
++    the Pattern O dance is invariant to payload size, so an empty
++    or near-empty payload still exercises the full fsync sequence.
++    """
++    ckpt = str(tmp_path / 'h1.calibration_input_cov.ckpt')
++    body_template = "import importlib, os\nfor k, v in {'VLLM_CALIB_CAPTURE_INPUT_COV': '1'}.items():\n    os.environ[k] = v\nimportlib.import_module('vllm.calibration_hooks')\nm = importlib.import_module('vllm.calibration_input_cov')\nif hasattr(m, 'set_n_prompts_accumulated'):\n    m.set_n_prompts_accumulated(1)\nm.dump_input_cov_checkpoint({ckpt!r})\n"
++    body = body_template.format(ckpt=ckpt)
++    with strace_syscalls(body) as recorder:
++        pass
++    recorder.assert_order(
++        ('openat', lambda a: '.tmp' in a),
++        ('fsync',  lambda a: True),
++        ('rename', lambda a: '.tmp' in a),
++        ('openat', lambda a: 'O_DIRECTORY' in a),
++        ('fsync',  lambda a: True),
++    )
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + '.tmp')
 diff --git a/tests/test_calibration_max_layer.py b/tests/test_calibration_max_layer.py
 new file mode 100644
 index 0000000..ff6a6d0
@@ -3036,7 +3141,7 @@ new file mode 100644
 index 0000000..72a1792
 --- /dev/null
 +++ b/tests/test_calibration_output_reservoir_smoke.py
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,494 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_output_reservoir``.
@@ -3505,12 +3610,38 @@ index 0000000..72a1792
 +    assert payload.total_seen[0, 0].item() == 2
 +    assert payload.total_seen[0, 2].item() == 6
 +    assert payload.total_seen[0, 1].item() == 0
++
++
++def test_h1_periodic_ckpt_pattern_o(tmp_path, strace_syscalls):
++    """H-1: dump_*_checkpoint must issue Pattern O syscall sequence
++    (openat(tmp) -> fsync -> rename -> openat(parent O_DIRECTORY) -> fsync).
++
++    Uses the strace_syscalls fixture (commit #5) to observe real
++    syscalls in a subprocess. Linux-only; skipped if strace is
++    absent on PATH. The body intentionally seeds minimal state —
++    the Pattern O dance is invariant to payload size, so an empty
++    or near-empty payload still exercises the full fsync sequence.
++    """
++    ckpt = str(tmp_path / 'h1.calibration_output_reservoir.ckpt')
++    body_template = "import importlib, os\nfor k, v in {'VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR': '1', 'VLLM_CALIB_OUTPUT_RESERVOIR_CAP': '8', 'VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED': '1'}.items():\n    os.environ[k] = v\nimportlib.import_module('vllm.calibration_hooks')\nm = importlib.import_module('vllm.calibration_output_reservoir')\nif hasattr(m, 'set_n_prompts_accumulated'):\n    m.set_n_prompts_accumulated(1)\nm.dump_output_reservoir_checkpoint({ckpt!r})\n"
++    body = body_template.format(ckpt=ckpt)
++    with strace_syscalls(body) as recorder:
++        pass
++    recorder.assert_order(
++        ('openat', lambda a: '.tmp' in a),
++        ('fsync',  lambda a: True),
++        ('rename', lambda a: '.tmp' in a),
++        ('openat', lambda a: 'O_DIRECTORY' in a),
++        ('fsync',  lambda a: True),
++    )
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + '.tmp')
 diff --git a/tests/test_calibration_per_expert_max_smoke.py b/tests/test_calibration_per_expert_max_smoke.py
 new file mode 100644
 index 0000000..f4f9d32
 --- /dev/null
 +++ b/tests/test_calibration_per_expert_max_smoke.py
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,417 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_per_expert_max``.
@@ -3902,12 +4033,38 @@ index 0000000..f4f9d32
 +        payload.token_counts[1],
 +        torch.zeros(n_experts, dtype=torch.int64),
 +    )
++
++
++def test_h1_periodic_ckpt_pattern_o(tmp_path, strace_syscalls):
++    """H-1: dump_*_checkpoint must issue Pattern O syscall sequence
++    (openat(tmp) -> fsync -> rename -> openat(parent O_DIRECTORY) -> fsync).
++
++    Uses the strace_syscalls fixture (commit #5) to observe real
++    syscalls in a subprocess. Linux-only; skipped if strace is
++    absent on PATH. The body intentionally seeds minimal state —
++    the Pattern O dance is invariant to payload size, so an empty
++    or near-empty payload still exercises the full fsync sequence.
++    """
++    ckpt = str(tmp_path / 'h1.calibration_per_expert_max.ckpt')
++    body_template = "import importlib, os\nfor k, v in {'VLLM_CALIB_CAPTURE_PER_EXPERT_MAX': '1', 'VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED': '1'}.items():\n    os.environ[k] = v\nimportlib.import_module('vllm.calibration_hooks')\nm = importlib.import_module('vllm.calibration_per_expert_max')\nif hasattr(m, 'set_n_prompts_accumulated'):\n    m.set_n_prompts_accumulated(1)\nm.dump_per_expert_max_checkpoint({ckpt!r})\n"
++    body = body_template.format(ckpt=ckpt)
++    with strace_syscalls(body) as recorder:
++        pass
++    recorder.assert_order(
++        ('openat', lambda a: '.tmp' in a),
++        ('fsync',  lambda a: True),
++        ('rename', lambda a: '.tmp' in a),
++        ('openat', lambda a: 'O_DIRECTORY' in a),
++        ('fsync',  lambda a: True),
++    )
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + '.tmp')
 diff --git a/tests/test_calibration_reap_scores_smoke.py b/tests/test_calibration_reap_scores_smoke.py
 new file mode 100644
 index 0000000..b038437
 --- /dev/null
 +++ b/tests/test_calibration_reap_scores_smoke.py
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,426 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_reap_scores``.
@@ -4308,12 +4465,38 @@ index 0000000..b038437
 +        payload.token_counts[0],
 +        torch.tensor([1, 0, 0], dtype=torch.int64),
 +    )
++
++
++def test_h1_periodic_ckpt_pattern_o(tmp_path, strace_syscalls):
++    """H-1: dump_*_checkpoint must issue Pattern O syscall sequence
++    (openat(tmp) -> fsync -> rename -> openat(parent O_DIRECTORY) -> fsync).
++
++    Uses the strace_syscalls fixture (commit #5) to observe real
++    syscalls in a subprocess. Linux-only; skipped if strace is
++    absent on PATH. The body intentionally seeds minimal state —
++    the Pattern O dance is invariant to payload size, so an empty
++    or near-empty payload still exercises the full fsync sequence.
++    """
++    ckpt = str(tmp_path / 'h1.calibration_reap_scores.ckpt')
++    body_template = "import importlib, os\nfor k, v in {'VLLM_CALIB_CAPTURE_REAP_SCORES': '1', 'VLLM_CALIB_CAPTURE_ROUTER': '1', 'VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED': '1'}.items():\n    os.environ[k] = v\nimportlib.import_module('vllm.calibration_hooks')\nm = importlib.import_module('vllm.calibration_reap_scores')\nif hasattr(m, 'set_n_prompts_accumulated'):\n    m.set_n_prompts_accumulated(1)\nm.dump_reap_scores_checkpoint({ckpt!r})\n"
++    body = body_template.format(ckpt=ckpt)
++    with strace_syscalls(body) as recorder:
++        pass
++    recorder.assert_order(
++        ('openat', lambda a: '.tmp' in a),
++        ('fsync',  lambda a: True),
++        ('rename', lambda a: '.tmp' in a),
++        ('openat', lambda a: 'O_DIRECTORY' in a),
++        ('fsync',  lambda a: True),
++    )
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + '.tmp')
 diff --git a/tests/test_calibration_router_logits_stats_smoke.py b/tests/test_calibration_router_logits_stats_smoke.py
 new file mode 100644
 index 0000000..b768afb
 --- /dev/null
 +++ b/tests/test_calibration_router_logits_stats_smoke.py
-@@ -0,0 +1,510 @@
+@@ -0,0 +1,536 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_router_logits_stats``.
@@ -4824,12 +5007,38 @@ index 0000000..b768afb
 +    assert torch.equal(
 +        payload.fire_on_sink[1], torch.tensor([0, 0, 1], dtype=torch.int64),
 +    )
++
++
++def test_h1_periodic_ckpt_pattern_o(tmp_path, strace_syscalls):
++    """H-1: dump_*_checkpoint must issue Pattern O syscall sequence
++    (openat(tmp) -> fsync -> rename -> openat(parent O_DIRECTORY) -> fsync).
++
++    Uses the strace_syscalls fixture (commit #5) to observe real
++    syscalls in a subprocess. Linux-only; skipped if strace is
++    absent on PATH. The body intentionally seeds minimal state —
++    the Pattern O dance is invariant to payload size, so an empty
++    or near-empty payload still exercises the full fsync sequence.
++    """
++    ckpt = str(tmp_path / 'h1.calibration_router_logits_stats.ckpt')
++    body_template = "import importlib, os\nfor k, v in {'VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS': '1', 'VLLM_CALIB_CAPTURE_ROUTER': '1'}.items():\n    os.environ[k] = v\nimportlib.import_module('vllm.calibration_hooks')\nm = importlib.import_module('vllm.calibration_router_logits_stats')\nif hasattr(m, 'set_n_prompts_accumulated'):\n    m.set_n_prompts_accumulated(1)\nm.dump_router_logits_stats_checkpoint({ckpt!r})\n"
++    body = body_template.format(ckpt=ckpt)
++    with strace_syscalls(body) as recorder:
++        pass
++    recorder.assert_order(
++        ('openat', lambda a: '.tmp' in a),
++        ('fsync',  lambda a: True),
++        ('rename', lambda a: '.tmp' in a),
++        ('openat', lambda a: 'O_DIRECTORY' in a),
++        ('fsync',  lambda a: True),
++    )
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + '.tmp')
 diff --git a/tests/test_calibration_routing_stats_smoke.py b/tests/test_calibration_routing_stats_smoke.py
 new file mode 100644
 index 0000000..0593101
 --- /dev/null
 +++ b/tests/test_calibration_routing_stats_smoke.py
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,416 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_routing_stats``.
@@ -5220,6 +5429,32 @@ index 0000000..0593101
 +    assert _ch._callbacks["router"] == []
 +    assert rts._FREQ_ACCUM == {}
 +    assert rts._WEIGHT_SUM_ACCUM == {}
++
++
++def test_h1_periodic_ckpt_pattern_o(tmp_path, strace_syscalls):
++    """H-1: dump_*_checkpoint must issue Pattern O syscall sequence
++    (openat(tmp) -> fsync -> rename -> openat(parent O_DIRECTORY) -> fsync).
++
++    Uses the strace_syscalls fixture (commit #5) to observe real
++    syscalls in a subprocess. Linux-only; skipped if strace is
++    absent on PATH. The body intentionally seeds minimal state —
++    the Pattern O dance is invariant to payload size, so an empty
++    or near-empty payload still exercises the full fsync sequence.
++    """
++    ckpt = str(tmp_path / 'h1.calibration_routing_stats.ckpt')
++    body_template = "import importlib, os\nfor k, v in {'VLLM_CALIB_CAPTURE_ROUTING_STATS': '1', 'VLLM_CALIB_CAPTURE_ROUTER': '1'}.items():\n    os.environ[k] = v\nimportlib.import_module('vllm.calibration_hooks')\nm = importlib.import_module('vllm.calibration_routing_stats')\nif hasattr(m, 'set_n_prompts_accumulated'):\n    m.set_n_prompts_accumulated(1)\nm.dump_routing_stats_checkpoint({ckpt!r})\n"
++    body = body_template.format(ckpt=ckpt)
++    with strace_syscalls(body) as recorder:
++        pass
++    recorder.assert_order(
++        ('openat', lambda a: '.tmp' in a),
++        ('fsync',  lambda a: True),
++        ('rename', lambda a: '.tmp' in a),
++        ('openat', lambda a: 'O_DIRECTORY' in a),
++        ('fsync',  lambda a: True),
++    )
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + '.tmp')
 diff --git a/vllm/calibration_block_outputs.py b/vllm/calibration_block_outputs.py
 new file mode 100644
 index 0000000..7944163
@@ -11110,7 +11345,7 @@ new file mode 100644
 index 0000000..0000001
 --- /dev/null
 +++ b/tests/test_calibration_wanda_scalar_row_smoke.py
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,326 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_wanda_scalar_row``.
@@ -11411,3 +11646,29 @@ index 0000000..0000001
 +        W2.to("cpu", torch.float32),
 +        rtol=0, atol=0,
 +    ), "Reader cleared the stash — lifecycle violated"
++
++
++def test_h1_periodic_ckpt_pattern_o(tmp_path, strace_syscalls):
++    """H-1: dump_*_checkpoint must issue Pattern O syscall sequence
++    (openat(tmp) -> fsync -> rename -> openat(parent O_DIRECTORY) -> fsync).
++
++    Uses the strace_syscalls fixture (commit #5) to observe real
++    syscalls in a subprocess. Linux-only; skipped if strace is
++    absent on PATH. The body intentionally seeds minimal state —
++    the Pattern O dance is invariant to payload size, so an empty
++    or near-empty payload still exercises the full fsync sequence.
++    """
++    ckpt = str(tmp_path / 'h1.calibration_wanda_scalar_row.ckpt')
++    body_template = "import importlib, os\nfor k, v in {'VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW': '1', 'VLLM_CALIB_CAPTURE_EXPERT': '1'}.items():\n    os.environ[k] = v\nimportlib.import_module('vllm.calibration_hooks')\nm = importlib.import_module('vllm.calibration_wanda_scalar_row')\nif hasattr(m, 'set_n_prompts_accumulated'):\n    m.set_n_prompts_accumulated(1)\nm.dump_wanda_scalar_row_checkpoint({ckpt!r})\n"
++    body = body_template.format(ckpt=ckpt)
++    with strace_syscalls(body) as recorder:
++        pass
++    recorder.assert_order(
++        ('openat', lambda a: '.tmp' in a),
++        ('fsync',  lambda a: True),
++        ('rename', lambda a: '.tmp' in a),
++        ('openat', lambda a: 'O_DIRECTORY' in a),
++        ('fsync',  lambda a: True),
++    )
++    assert os.path.exists(ckpt)
++    assert not os.path.exists(ckpt + '.tmp')
