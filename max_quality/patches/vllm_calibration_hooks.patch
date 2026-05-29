@@ -5059,7 +5059,7 @@ new file mode 100644
 index 0000000..7944163
 --- /dev/null
 +++ b/vllm/calibration_block_outputs.py
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,517 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-MoE-block hidden-states writer for calibration-v2 (Item 7).
@@ -5527,9 +5527,7 @@ index 0000000..7944163
 +        # independent of any subsequent in-place changes.
 +        "accum": {k: [t.clone() for t in v] for k, v in _ACCUM.items()},
 +    }
-+    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
-+    os.replace(tmp, ckpt_path)
++    _atomic_torch_save(payload, ckpt_path)
 +
 +
 +def load_block_outputs_checkpoint(ckpt_path: str) -> int:
@@ -6751,7 +6749,9 @@ index 0000000..8505da3
 +        dataset_b = dataset.encode("utf-8")
 +        f.write(struct.pack("<i", len(dataset_b)))
 +        f.write(dataset_b)
-+    os.replace(tmp, path)
++        f.flush()
++        os.fsync(f.fileno())
++    _durable_close_replace_dat(tmp, path)
 +
 +
 +# ---------------------------------------------------------------------------
@@ -6900,9 +6900,7 @@ index 0000000..8505da3
 +            for k, v in _moe_down_token_counts_per_expert.items()
 +        },
 +    }
-+    tmp = path + ".tmp"
-+    torch.save(payload, tmp)
-+    os.replace(tmp, path)
++    _atomic_torch_save(payload, path)
 +
 +
 +def load_imatrix_checkpoint(path: str) -> int:
@@ -7016,7 +7014,7 @@ new file mode 100644
 index 0000000..adff069
 --- /dev/null
 +++ b/vllm/calibration_input_cov.py
-@@ -0,0 +1,443 @@
+@@ -0,0 +1,441 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert, matrix) teacher input covariance capture for
@@ -7417,9 +7415,7 @@ index 0000000..adff069
 +        "cov_accum": {k: v.clone() for k, v in _COV_ACCUM.items()},
 +        "token_counts": dict(_COV_TOKEN_COUNTS),
 +    }
-+    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
-+    os.replace(tmp, ckpt_path)
++    _atomic_torch_save(payload, ckpt_path)
 +
 +
 +def load_input_cov_checkpoint(ckpt_path: str) -> int:
@@ -7465,7 +7461,7 @@ new file mode 100644
 index 0000000..660a951
 --- /dev/null
 +++ b/vllm/calibration_output_reservoir.py
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,468 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) expert-output reservoir capture for calibration-v2
@@ -7890,9 +7886,7 @@ index 0000000..660a951
 +        "seen": dict(_SEEN),
 +        "valid_count": dict(_VALID_COUNT),
 +    }
-+    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
-+    os.replace(tmp, ckpt_path)
++    _atomic_torch_save(payload, ckpt_path)
 +
 +
 +def load_output_reservoir_checkpoint(ckpt_path: str) -> int:
@@ -7941,7 +7935,7 @@ new file mode 100644
 index 0000000..8ce03ab
 --- /dev/null
 +++ b/vllm/calibration_per_expert_max.py
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,355 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) ``down_proj`` output max-L_inf capture for
@@ -8267,9 +8261,7 @@ index 0000000..8ce03ab
 +        "pem_accum": {r: v.clone() for r, v in _PEM_ACCUM.items()},
 +        "token_counts": {r: v.clone() for r, v in _PEM_TOKEN_COUNTS.items()},
 +    }
-+    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
-+    os.replace(tmp, ckpt_path)
++    _atomic_torch_save(payload, ckpt_path)
 +
 +
 +def load_per_expert_max_checkpoint(ckpt_path: str) -> int:
@@ -8304,7 +8296,7 @@ new file mode 100644
 index 0000000..1b3ca1f
 --- /dev/null
 +++ b/vllm/calibration_reap_scores.py
-@@ -0,0 +1,360 @@
+@@ -0,0 +1,358 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""REAP per-(layer, expert) saliency-score capture for calibration-v2.
@@ -8633,9 +8625,7 @@ index 0000000..1b3ca1f
 +        "score_accum": {r: v.clone() for r, v in _REAP_SCORE_ACCUM.items()},
 +        "token_counts": {r: v.clone() for r, v in _REAP_TOKEN_COUNTS.items()},
 +    }
-+    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
-+    os.replace(tmp, ckpt_path)
++    _atomic_torch_save(payload, ckpt_path)
 +
 +
 +def load_reap_scores_checkpoint(ckpt_path: str) -> int:
@@ -8670,7 +8660,7 @@ new file mode 100644
 index 0000000..1644034
 --- /dev/null
 +++ b/vllm/calibration_router_logits_stats.py
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,472 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) sink-vs-normal router-score aggregate writer for
@@ -9100,9 +9090,7 @@ index 0000000..1644034
 +            r: v.clone() for r, v in _N_NORMAL_TOKENS.items()
 +        },
 +    }
-+    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
-+    os.replace(tmp, ckpt_path)
++    _atomic_torch_save(payload, ckpt_path)
 +
 +
 +def load_router_logits_stats_checkpoint(ckpt_path: str) -> int:
@@ -9150,7 +9138,7 @@ new file mode 100644
 index 0000000..516237c
 --- /dev/null
 +++ b/vllm/calibration_routing_stats.py
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,353 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) routing-frequency + mean-routing-weight capture for
@@ -9474,9 +9462,7 @@ index 0000000..516237c
 +            r: v.clone() for r, v in _WEIGHT_SUM_ACCUM.items()
 +        },
 +    }
-+    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
-+    os.replace(tmp, ckpt_path)
++    _atomic_torch_save(payload, ckpt_path)
 +
 +
 +def load_routing_stats_checkpoint(ckpt_path: str) -> int:
@@ -10390,7 +10376,7 @@ new file mode 100644
 index 0000000..0000001
 --- /dev/null
 +++ b/vllm/calibration_wanda_scalar_row.py
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,501 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert, matrix) Wanda ``scalar_row`` calibration capture.
@@ -10848,9 +10834,7 @@ index 0000000..0000001
 +        },
 +        "token_counts": dict(_WANDA_TOKEN_COUNTS),
 +    }
-+    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
-+    os.replace(tmp, ckpt_path)
++    _atomic_torch_save(payload, ckpt_path)
 +
 +
 +def load_wanda_scalar_row_checkpoint(ckpt_path: str) -> int:

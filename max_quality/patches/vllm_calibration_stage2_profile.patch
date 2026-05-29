@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..c0de100
 --- /dev/null
 +++ b/vllm/calibration_stage2_profile.py
-@@ -0,0 +1,825 @@
+@@ -0,0 +1,823 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Stage 2 profile-pass sidecar capture (Plugin #12 REDO -- Optimization A).
@@ -608,7 +608,6 @@ index 0000000..c0de100
 +    if _state.ream_acc is None or _state.cov_acc is None:
 +        return
 +    path = Path(path)
-+    tmp = path.with_suffix(path.suffix + ".tmp")
 +    state_payload = {
 +        "format_version": _CKPT_SCHEMA,
 +        "schema_version": _CKPT_SCHEMA,
@@ -646,8 +645,7 @@ index 0000000..c0de100
 +        },
 +    }
 +    path.parent.mkdir(parents=True, exist_ok=True)
-+    torch.save(state_payload, tmp)
-+    os.replace(tmp, path)
++    _atomic_torch_save(state_payload, str(path))
 +
 +
 +def load_stage2_profile_checkpoint(path: str | Path) -> int:
