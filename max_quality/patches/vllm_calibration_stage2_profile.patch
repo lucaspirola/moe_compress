@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..c0de100
 --- /dev/null
 +++ b/vllm/calibration_stage2_profile.py
-@@ -0,0 +1,796 @@
+@@ -0,0 +1,825 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Stage 2 profile-pass sidecar capture (Plugin #12 REDO -- Optimization A).
@@ -573,6 +573,35 @@ index 0000000..c0de100
 +        n_layers, n_experts, _state.configured_cov_storage_dtype,
 +        _state.n_prompts_accumulated, jsonl_path,
 +    )
++
++
++def _atomic_torch_save(payload, path: str) -> None:
++    """Pattern O atomic + durable: tmp -> fsync(fd) -> os.replace -> fsync(parent_dir).
++
++    Mirrors ``moe_compress.utils.atomic_io.atomic_torch_save``. Inlined here
++    because vLLM's runtime modules cannot import from ``moe_compress`` at
++    module-load time (circular dep). Best-effort fsync semantics -- non-POSIX
++    filesystems may EINVAL the parent-dir fsync; swallowed silently.
++    """
++    tmp = path + ".tmp"
++    torch.save(payload, tmp)
++    fd = os.open(tmp, os.O_RDONLY)
++    try:
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++    os.replace(tmp, path)
++    parent = os.path.dirname(path) or "."
++    try:
++        parent_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
++        try:
++            os.fsync(parent_fd)
++        finally:
++            os.close(parent_fd)
++    except OSError:
++        # Non-POSIX FS (tmpfs in CI, FUSE on HF Jobs) may not support
++        # fsync on a directory fd; swallow per atomic_io._fsync_dir.
++        pass
 +
 +
 +def dump_stage2_profile_checkpoint(path: str | Path) -> None:
