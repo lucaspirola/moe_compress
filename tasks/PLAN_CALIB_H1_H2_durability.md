@@ -203,8 +203,9 @@ Each writer is a `new file mode 100644` diff, so its single hunk header is
 `@@ -0,0 +1,N @@`. Adding `k` lines to a module bumps that hunk to `@@ -0,0 +1,N+k @@`:
 - torch.save sites: the new block is **+12 lines net** over the old 3 (old: `tmp=`, `torch.save`, `os.replace` → kept `tmp=`+`os.replace`, added `with`/`torch.save(f)`/`flush`/`fsync` = 4, added 6-line dir-fsync, +`with` indent of torch.save). Recompute exactly when applying; the count below is the editing target, the `@@` arithmetic is mechanical.
 - For each affected module file, after editing, set `+1,N` to the new physical added-line count. Because these are whole-new-file diffs, `git apply --check` will reject a wrong count — that is the verification gate (see §4).
-- stage2 is a hunk against context (not a new file). Its `@@ -A,B +C,D @@` header's `D`
-  must grow by the number of added lines; recompute and verify with `git apply --check`.
+- stage2 is ALSO a whole-new-file diff — a single hunk `@@ -0,0 +1,673 @@` adding
+  `vllm/calibration_stage2_profile.py` (there is NO `-A,B +C,D` context header). Bump its
+  `+1,N` count by the number of added lines exactly as sites 1–9; verify with `git apply --check`.
 
 ---
 
@@ -246,7 +247,7 @@ if gen is None:
 `_cell_seed(rank, e)` is a pure function of the cell index plus a fixed run salt so two
 different cells never share a stream and the seed is reproducible:
 ```
-_RESERVOIR_RNG_BASE_SEED = int(os.getenv("VLLM_CALIB_OUTPUT_RESERVOIR_SEED", "0x5eed"))
+_RESERVOIR_RNG_BASE_SEED = int(os.getenv("VLLM_CALIB_OUTPUT_RESERVOIR_SEED", "0x5eed"), 0)  # base-0: auto-detects 0x prefix; int("0x5eed") without base would raise
 def _cell_seed(rank, e):
     # 64-bit mix; deterministic, cell-unique, independent of dispatch order.
     return (_RESERVOIR_RNG_BASE_SEED * 0x9E3779B97F4A7C15
@@ -263,7 +264,7 @@ Order within a dispatch is preserved EXACTLY (`rand` then `randint`) — this or
 load-bearing for byte-identity (see §3).
 
 **Serialize into the checkpoint** (`dump_output_reservoir_checkpoint`, payload dict @
-7743–7753). Add a key holding each live generator's state. `generator.get_state()` returns
+7743–7752). Add a key holding each live generator's state. `generator.get_state()` returns
 a CPU `uint8` ByteTensor (~5056 bytes for the MT19937 CPU engine). Clone it so a later
 draw cannot mutate the serialized snapshot:
 ```
@@ -458,7 +459,7 @@ after `os.replace`. Recompute imatrix hunk count.
 Verify: `git apply --check`; run imatrix smoke tests (the imatrix test block in the patch).
 
 **Commit 3 — H-1 fsync, stage2_profile (site 10, sibling patch).**
-Edit `dump_stage2_profile_checkpoint`; recompute the context hunk's `@@ ... +C,D @@`.
+Edit `dump_stage2_profile_checkpoint`; recompute the whole-new-file hunk `@@ -0,0 +1,673 @@` → `+1,N` by the added-line count (same as sites 1–9; NOT a context hunk).
 Verify: `git apply --check max_quality/patches/vllm_calibration_stage2_profile.patch`;
 run stage2_profile smoke/round-trip tests.
 
@@ -531,7 +532,7 @@ fails it immediately, catching the single most likely mechanical error.
 ## Appendix — exact patch line references (quick index)
 - Reservoir module: header 7353; `_RESERVOIR/_SEEN/_VALID_COUNT` 7472–7474; schema ver
   7482; `_on_expert_out_unweighted` 7575; lazy alloc 7622–7627; Phase-2 draws 7651
-  (`torch.rand`) + 7653 (`torch.randint`); `dump_..._checkpoint` 7735 (payload 7743–7753,
+  (`torch.rand`) + 7653 (`torch.randint`); `dump_..._checkpoint` 7735 (payload 7743–7752,
   torch.save 7755, os.replace 7756); `load_..._checkpoint` 7759 (schema check 7766,
   max_tokens check 7773, clear/hydrate 7789–7798).
 - imatrix: `_write_dat` 6688 (open 6710, last write 6722, os.replace 6723);
