@@ -1,0 +1,64 @@
+{
+  "T_budget": 27,
+  "alpha_by_type": {
+    "down_proj": 0.5,
+    "gate_proj": 1.0,
+    "up_proj": 0.5
+  },
+  "config": {
+    "aa_svd": {
+      "cross_covariance": false,
+      "use_post_prune_inputs": true
+    },
+    "bcov_storage_dtype": "bfloat16",
+    "block_refine": {
+      "batch_size": 1,
+      "enabled": false,
+      "epochs": 1,
+      "learning_rate": 0.0001,
+      "warmup_ratio": 0.1,
+      "weight_decay": 0.0
+    },
+    "d_rank": {
+      "parameter_cost_omega_mode": "auto"
+    },
+    "scope": "moe_experts_only",
+    "swift_svd_plus": {
+      "alpha_grid": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "alpha_search_min_host_ram_gb": 0.0,
+      "metric": "wikitext2_ppl",
+      "per_group_type": true,
+      "validation_samples": 0
+    }
+  },
+  "per_layer_ranks": {
+    "0": {
+      "down_proj": 4,
+      "gate_proj": 5,
+      "up_proj": 4
+    },
+    "1": {
+      "down_proj": 4,
+      "gate_proj": 5,
+      "up_proj": 5
+    }
+  },
+  "rank_map": {
+    "L0_E0_down_proj": 5,
+    "L0_E0_gate_proj": 5,
+    "L0_E0_up_proj": 5,
+    "L0_E1_down_proj": 3,
+    "L0_E1_gate_proj": 5,
+    "L0_E1_up_proj": 3,
+    "L1_E0_down_proj": 3,
+    "L1_E0_gate_proj": 4,
+    "L1_E0_up_proj": 4,
+    "L1_E1_down_proj": 5,
+    "L1_E1_gate_proj": 6,
+    "L1_E1_up_proj": 6
+  }
+}
