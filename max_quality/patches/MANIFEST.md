@@ -15,13 +15,13 @@ either one alone produces a partially-wired wheel.
 
 | Field | Value |
 |---|---|
-| Immutable tag | `calib-v2-layer-input-reservoir` |
+| Immutable tag | `calib-v2-fsync-rng-safe` |
 | Branch (active) | `main` |
-| vLLM upstream SHA | `ad7125a43e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch 1 line count | **10920** |
-| Patch 1 MD5 | **`af1c38a2686c74012fc0f86b5449f23c`** (vllm_calibration_hooks.patch) |
-| Patch 2 line count | **802** |
-| Patch 2 MD5 | **`2a2012457ef4a45ca36757b33a3c4e15`** (vllm_calibration_stage2_profile.patch) |
+| vLLM upstream SHA | `ad7125a431e176d4161099480a66f0169609a690` (v0.21.0) |
+| Patch 1 line count | **11262** |
+| Patch 1 MD5 | **`23a5040722024aeff00b1f9d5f278431`** (vllm_calibration_hooks.patch) |
+| Patch 2 line count | **812** |
+| Patch 2 MD5 | **`fefbcec8b4f230317bdb16be808eecc8`** (vllm_calibration_stage2_profile.patch) |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -31,14 +31,14 @@ either one alone produces a partially-wired wheel.
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: af1c38a2686c74012fc0f86b5449f23c
+# expect: 23a5040722024aeff00b1f9d5f278431
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 10920
+# expect: 11262
 
 md5sum max_quality/patches/vllm_calibration_stage2_profile.patch
-# expect: 2a2012457ef4a45ca36757b33a3c4e15
+# expect: fefbcec8b4f230317bdb16be808eecc8
 wc -l max_quality/patches/vllm_calibration_stage2_profile.patch
-# expect: 802
+# expect: 812
 
 # Re-apply both against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
