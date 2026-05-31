@@ -55,7 +55,7 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply BOTH calibration patches ==="
 # Two patches in this wheel:
-#  1. vllm_calibration_hooks.patch (10920 lines, MD5 af1c38a2...) — the
+#  1. vllm_calibration_hooks.patch (11272 lines, MD5 9aaf47ab...) — the
 #     core hooks + 10 writer modules (block_outputs / hooks / imatrix /
 #     input_cov / output_reservoir / per_expert_max / reap_scores /
 #     router_logits_stats / routing_stats / wanda_scalar_row), the
@@ -64,7 +64,7 @@ echo "[$(date)] === Phase 5: fetch and apply BOTH calibration patches ==="
 #     VLLM_CALIB_CAPTURE_LAYER_IN + "layer_in" in VALID_HOOK_NAMES +
 #     dispatch site post-chunk pre-is_internal_router) and W-1's new
 #     calibration_wanda_scalar_row.py writer module.
-#  2. vllm_calibration_stage2_profile.patch (802 lines, MD5 2a201245...) —
+#  2. vllm_calibration_stage2_profile.patch (812 lines, MD5 fefbcec8...) —
 #     creates calibration_stage2_profile.py with the
 #     _layer_in_handler writer subscription (receiver for patch #1's
 #     dispatch), _LAYER_INPUT_MAX_SAMPLES constant, and the
@@ -77,18 +77,18 @@ echo "[$(date)] === Phase 5: fetch and apply BOTH calibration patches ==="
 # See max_quality/patches/MANIFEST.md.
 
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-layer-input-reservoir/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-fsync-complete/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected: 10920 lines, MD5 af1c38a2686c74012fc0f86b5449f23c
+# Expected: 11272 lines, MD5 9aaf47abd4c44bf2b2a62edd7e28014f
 
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-layer-input-reservoir/max_quality/patches/vllm_calibration_stage2_profile.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-fsync-complete/max_quality/patches/vllm_calibration_stage2_profile.patch \
     -o /tmp/calib2.patch
 wc -l /tmp/calib2.patch
 md5sum /tmp/calib2.patch
-# Expected: 802 lines, MD5 2a2012457ef4a45ca36757b33a3c4e15
+# Expected: 812 lines, MD5 fefbcec8b4f230317bdb16be808eecc8
 
 git apply --check /tmp/calib.patch
 git apply /tmp/calib.patch
@@ -223,10 +223,10 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-- Source repo: https://github.com/lucaspirola/moe_compress (branch `main`, immutable tag `calib-v2-layer-input-reservoir`)
+- Source repo: https://github.com/lucaspirola/moe_compress (branch `main`, immutable tag `calib-v2-fsync-complete`)
 - Patch artifacts (also uploaded to this repo for traceability):
-  - `vllm_calibration_hooks.patch` — 10920 lines, MD5 `af1c38a2686c74012fc0f86b5449f23c`
-  - `vllm_calibration_stage2_profile.patch` — 802 lines, MD5 `2a2012457ef4a45ca36757b33a3c4e15`
+  - `vllm_calibration_hooks.patch` — 11272 lines, MD5 `9aaf47abd4c44bf2b2a62edd7e28014f`
+  - `vllm_calibration_stage2_profile.patch` — 812 lines, MD5 `fefbcec8b4f230317bdb16be808eecc8`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130
