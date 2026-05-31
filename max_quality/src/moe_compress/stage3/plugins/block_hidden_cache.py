@@ -88,14 +88,108 @@ from typing import Any
 import torch
 
 from ...pipeline.context import PipelineContext
+from ...utils import cached_calibration_signals as _ccs
 from ...utils.cached_calibration_signals import (
     BaseCacheProvider,
     BlockHiddenPayload,
+    _resolve_sidecar_for_load,
+    _validate_manifest_or_warn,
     load_block_hidden,
     sidecar_path,
 )
 
 log = logging.getLogger(__name__)
+
+
+class _LazyTeacherTargetsCache:
+    """Lazy ``dict[layer_idx -> Tensor]``-compatible mapping for the
+    block-hidden teacher targets (Lever 3 — design (b)).
+
+    Presence (which layers exist + manifest-validate) is established
+    EAGERLY and all-or-nothing in :meth:`Stage3BlockHiddenCacheProvider.on_load`
+    (stat + manifest read, NO payload load). This object holds only the
+    validated ``layer_idx`` set + the reshape dims; the per-layer
+    ``[n_prompts, seq_len, hidden]`` tensor is materialized on demand in
+    :meth:`get` and NOT retained, so at most one layer's tensor is
+    resident at a time (block_refine reads each layer exactly once).
+
+    Contract (matches the ``dict`` API block_refine / the orchestrator
+    rely on):
+
+    * ``len(mapping)`` → the validated layer count, with NO materialization
+      (orchestrator HIT-log at ``stage3/orchestrator.py:710``).
+    * ``mapping.get(layer_idx)`` → the lazily reshaped tensor for a present
+      key, or ``None`` for an absent key (``block_refine.py:465`` relies on
+      ``dict.get`` returning ``None`` on miss).
+
+    Byte-identity: ``get`` performs the SAME
+    ``hs.reshape(n_prompts, seq_len, -1).contiguous()`` the old eager path
+    did, so the consumed tensor is bit-identical — only allocation timing
+    changes. For a present-but-malformed sidecar whose flat token count
+    does not factor as ``n_prompts × seq_len``, ``get`` returns the raw
+    2-D ``[n_tokens, hidden]`` tensor; block_refine's per-layer guard
+    (``block_refine.py:466-492``, ``cached.dim() == 3`` etc.) then falls
+    through to the live teacher forward for that layer — the same
+    numerically-safe fall-through already in ``origin/main``.
+    """
+
+    def __init__(
+        self,
+        jsonl_path: Path,
+        layer_indices: set[int],
+        n_prompts: int,
+        seq_len: int,
+    ) -> None:
+        self._jsonl_path = jsonl_path
+        self._layers = frozenset(layer_indices)
+        self._n_prompts = n_prompts
+        self._seq_len = seq_len
+
+    def __len__(self) -> int:
+        # Validated layer count from the eager presence scan — no
+        # tensor materialization (orchestrator:710 HIT-log).
+        return len(self._layers)
+
+    def __contains__(self, layer_idx: object) -> bool:
+        return layer_idx in self._layers
+
+    def __iter__(self):
+        return iter(sorted(self._layers))
+
+    def keys(self):
+        # Validated layer ids, sorted — no materialization. Lets callers
+        # treat the lazy cache like the old eager dict for key inspection.
+        return sorted(self._layers)
+
+    def __getitem__(self, layer_idx: int) -> Any:
+        if layer_idx not in self._layers:
+            raise KeyError(layer_idx)
+        tensor = self.get(layer_idx)
+        if tensor is None:
+            raise KeyError(layer_idx)
+        return tensor
+
+    def get(self, layer_idx: int, default: Any = None) -> Any:
+        if layer_idx not in self._layers:
+            return default
+        payload = load_block_hidden(self._jsonl_path, int(layer_idx))
+        if payload is None:
+            # Presence was validated up-front; a None here means the
+            # sidecar vanished between scan and read. Mirror dict.get
+            # absent semantics so block_refine falls through to live.
+            return default
+        hs = payload.hidden_states  # [n_tokens, hidden]
+        n_tokens = int(hs.shape[0])
+        expected = self._n_prompts * self._seq_len
+        if n_tokens != expected:
+            # Malformed-but-present sidecar: token count does not factor
+            # as n_prompts × seq_len. Return the raw 2-D tensor so
+            # block_refine's per-layer shape guard (dim()==3 check) falls
+            # through to the live teacher forward for this layer. Drop
+            # the payload reference; only the returned tensor survives.
+            return hs
+        # Same reshape the old eager path produced (former line 278).
+        return hs.reshape(self._n_prompts, self._seq_len, -1).contiguous()
 
 
 class Stage3BlockHiddenCacheProvider(BaseCacheProvider):
@@ -141,14 +235,22 @@ class Stage3BlockHiddenCacheProvider(BaseCacheProvider):
     def contribute_artifact(self, ctx: PipelineContext) -> dict:
         return {}
 
-    def _load_layers(self, jsonl_path: Path) -> dict[int, BlockHiddenPayload]:
-        """Walk ``<jsonl_path>/sidecars/block_hidden/`` and load every
-        per-layer payload found.
+    def _presence_scan(self, jsonl_path: Path) -> set[int] | None:
+        """Walk ``<jsonl_path>/sidecars/block_hidden/`` and presence-validate
+        every per-layer sidecar WITHOUT loading any payload tensor (Lever 3).
 
-        Returns an empty dict if the directory doesn't exist; this is the
-        ordinary cache-miss path. Missing individual sidecars within an
-        existing directory is also a miss (the consumer needs every MoE
-        layer, not a partial set).
+        For each ``layer_NNNN.pt`` discovered, resolve its read path
+        (``_resolve_sidecar_for_load``) and run the manifest schema-version
+        check (``_validate_manifest_or_warn`` — reads only the sibling
+        ``.MANIFEST.json``, never the multi-GB payload). Returns the set of
+        validated ``layer_idx`` on success; returns ``None`` when the
+        directory is absent (the ordinary cache-miss path). The all-or-
+        nothing miss semantic for a *malformed manifest* is preserved by
+        ``_validate_manifest_or_warn`` raising — it is NOT swallowed here.
+
+        A torn sidecar whose manifest is absent (pre-S1 layout) passes the
+        one-shot-WARN fallback in ``_validate_manifest_or_warn`` exactly as
+        the old eager loader did.
         """
         # sidecar_path with a slashed signal name returns the per-layer
         # file path; the parent of that path is the sidecars/block_hidden/
@@ -156,8 +258,8 @@ class Stage3BlockHiddenCacheProvider(BaseCacheProvider):
         any_path = sidecar_path(jsonl_path, "block_hidden/layer_0000")
         bh_dir = any_path.parent
         if not bh_dir.exists():
-            return {}
-        loaded: dict[int, BlockHiddenPayload] = {}
+            return None
+        present: set[int] = set()
         for child in sorted(bh_dir.iterdir()):
             if not child.is_file() or not child.name.startswith("layer_"):
                 continue
@@ -168,52 +270,67 @@ class Stage3BlockHiddenCacheProvider(BaseCacheProvider):
                 layer_idx = int(idx_str)
             except ValueError:
                 continue
-            payload = load_block_hidden(jsonl_path, layer_idx)
-            if payload is None:
-                # Should not happen given iterdir() saw the file, but
-                # treat as a partial miss.
+            # Presence + manifest-schema validation only. No torch.load
+            # of the payload tensor (the ~52 GB up-front stall this lever
+            # removes). _resolve_sidecar_for_load returning None means the
+            # file vanished between iterdir() and resolve -- skip it.
+            resolved = _resolve_sidecar_for_load(
+                jsonl_path, f"block_hidden/layer_{layer_idx:04d}"
+            )
+            if resolved is None:
                 continue
-            loaded[layer_idx] = payload
-        return loaded
+            # Read SCHEMA_VERSIONS via the module attribute (not the import-
+            # time binding) so a test/code bump of the version is honored,
+            # matching load_block_hidden's behavior.
+            _validate_manifest_or_warn(
+                resolved,
+                expected_schema_version=_ccs.SCHEMA_VERSIONS["block_hidden"],
+                signal_name="block_hidden",
+            )
+            present.add(layer_idx)
+        return present
 
     def on_load(
         self, ctx: PipelineContext, jsonl_path: Path
-    ) -> BlockHiddenPayload | None:
-        """Try to load the per-layer block-hidden sidecars; on hit
-        populate ``ctx.teacher_targets_cache`` and return the first
-        payload (non-None marker); on miss return ``None``.
+    ) -> "_LazyTeacherTargetsCache | None":
+        """Presence-validate the per-layer block-hidden sidecars (Lever 3,
+        design (b)); on hit populate ``ctx.teacher_targets_cache`` with a
+        LAZY mapping and return it (non-None marker); on miss return ``None``.
 
-        Schema mismatch surfaces as ``ValueError`` from
-        ``load_block_hidden`` -- the caller MUST NOT mask that exception
-        (the message is actionable: "Delete the sidecar to regenerate").
+        Schema mismatch surfaces as ``RuntimeError`` from
+        ``_validate_manifest_or_warn`` -- the caller MUST NOT mask that
+        exception (the message is actionable: "re-run calibration").
 
-        Token-count alignment + seq_len inference
-        -----------------------------------------
-        ``ctx`` SHOULD have ``calib`` (an ``[n_prompts, seq_len]`` int64
-        token tensor) bound; the provider reads the shape to determine
-        ``n_prompts`` and ``seq_len``, then validates against the flat
-        ``[n_tokens]`` row count on each sidecar tensor. If the calib
-        slot is missing or the token-count math doesn't divide cleanly
-        the provider returns ``None`` (cache miss). The reader is
-        explicitly INDEPENDENT of ``ctx.batches`` / any consumer batch
-        size -- the cache stores an un-chunked
-        ``[n_prompts, seq_len, hidden]`` tensor per layer and the
-        block_refine consumer slices per-batch at consumption time.
+        All-or-nothing PRESENCE miss (preserved)
+        ----------------------------------------
+        Presence validation is EAGER and all-or-nothing, but via file +
+        manifest EXISTENCE (``_presence_scan``), NOT by deserializing any
+        payload tensor. If the sidecars dir is absent the provider returns
+        ``None`` (full miss). This preserves the contract that a partial
+        cache never silently mixes cached + live targets at the directory
+        level. Shape / ``n_tokens`` / ``n_prompts_in_subset`` content
+        validation is OUT OF SCOPE up-front -- ``load_block_hidden`` has no
+        shape-only path and the manifest carries no shape field -- so a
+        present-but-malformed sidecar is caught at consumption time by
+        ``block_refine``'s per-layer shape guard (``block_refine.py:466-492``)
+        which falls through to the live teacher forward for that layer.
+        Each layer's target is independent, so a per-layer fall-through is
+        numerically safe.
 
-        Prompt-count divergence check (I2)
-        ----------------------------------
-        The writer's ``payload.n_prompts_in_subset`` records the actual
-        number of prompts the writer captured (which may exceed the
-        ``--block-outputs-subset-size`` cap by a chunk-boundary
-        remainder -- see the writer's docstring). If this differs from
-        ``ctx.calib.shape[0]`` the two pipelines are likely fed from
-        different calibration sources and the tensor contents would
-        bear the WRONG targets even if the per-layer token counts
-        happen to match. The reader falls through to the live forward
-        (returns ``None``, logs a warning) in that case.
+        Lazy materialization
+        --------------------
+        The ``teacher_targets_cache`` slot is a :class:`_LazyTeacherTargetsCache`
+        that materializes (``load_block_hidden`` + reshape) one layer's
+        ``[n_prompts, seq_len, hidden]`` tensor on ``.get(layer_idx)`` and
+        retains no reference, so at most one layer is resident at a time
+        (block_refine reads each layer exactly once). ``ctx.calib`` supplies
+        ``(n_prompts, seq_len)`` for the reshape; if it is missing the
+        provider returns ``None`` (cache miss) so block_refine falls through.
+        The reader is INDEPENDENT of ``ctx.batches`` / any consumer batch
+        size; block_refine slices per-batch at consumption time.
         """
-        payloads = self._load_layers(jsonl_path)
-        if not payloads:
+        present = self._presence_scan(jsonl_path)
+        if not present:
             return None
 
         # Read alignment-relevant slots from ctx; bail to miss on any
@@ -229,63 +346,16 @@ class Stage3BlockHiddenCacheProvider(BaseCacheProvider):
             return None
         n_prompts, seq_len = int(calib.shape[0]), int(calib.shape[1])
 
-        # Per-layer reshape only -- no per-batch chunking. The
-        # block_refine consumer slices its own batches at consumption
-        # time using its own ``batch_size``, so the cache is decoupled
-        # from any specific batch-size configuration (C1 fix). Bail to
-        # miss on any token-count or prompt-count mismatch; the live
-        # forward is still correct.
-        teacher_targets_cache: dict[int, torch.Tensor] = {}
-        first_payload: BlockHiddenPayload | None = None
-        for layer_idx, payload in payloads.items():
-            # I2: prompt-count divergence guard. ``n_prompts_in_subset``
-            # is the actual number of prompts the writer captured; if
-            # it differs from the Stage 3 calibration tensor's
-            # ``n_prompts`` the two pipelines are reading different
-            # subsets and the per-prompt content would not align even
-            # when the per-layer token counts happen to coincide.
-            if int(payload.n_prompts_in_subset) != n_prompts:
-                log.warning(
-                    "stage3-block-hidden-cache: layer_idx=%d sidecar has "
-                    "n_prompts_in_subset=%d but ctx.calib.shape[0]=%d. "
-                    "Prompt-count divergence -- cache miss. (Operator: "
-                    "run --capture-block-outputs and Stage 3 from the "
-                    "SAME calibration source with matching "
-                    "calibration.num_sequences / "
-                    "--block-outputs-subset-size.)",
-                    layer_idx, int(payload.n_prompts_in_subset), n_prompts,
-                )
-                return None
-
-            hs = payload.hidden_states           # [n_tokens, hidden]
-            n_tokens = int(hs.shape[0])
-            expected = n_prompts * seq_len
-            if n_tokens != expected:
-                log.warning(
-                    "stage3-block-hidden-cache: layer_idx=%d sidecar has "
-                    "n_tokens=%d but ctx.calib implies n_prompts=%d × "
-                    "seq_len=%d = %d. Token count mismatch -- cache "
-                    "miss. (Operator: align calibration.num_sequences "
-                    "with --block-outputs-subset-size and "
-                    "calibration.sequence_length with the writer's "
-                    "actual per-prompt length.)",
-                    layer_idx, n_tokens, n_prompts, seq_len, expected,
-                )
-                return None
-            # Reshape to [n_prompts, seq_len, hidden] and store
-            # un-chunked. The block_refine consumer slices
-            # ``cached[bi*bs:(bi+1)*bs]`` per batch index.
-            reshaped = hs.reshape(n_prompts, seq_len, -1).contiguous()
-            teacher_targets_cache[int(layer_idx)] = reshaped
-            if first_payload is None:
-                first_payload = payload
-
-        ctx.set("teacher_targets_cache", teacher_targets_cache, overwrite=True)
+        lazy_cache = _LazyTeacherTargetsCache(
+            jsonl_path, present, n_prompts, seq_len
+        )
+        ctx.set("teacher_targets_cache", lazy_cache, overwrite=True)
         log.info(
-            "stage3-block-hidden-cache: hydrated %d-layer "
+            "stage3-block-hidden-cache: presence-validated %d-layer "
             "teacher_targets_cache (n_prompts=%d, seq_len=%d, "
-            "un-chunked [n_prompts, seq_len, hidden]) from %s",
-            len(teacher_targets_cache), n_prompts, seq_len,
+            "lazy un-chunked [n_prompts, seq_len, hidden] per layer) "
+            "from %s",
+            len(lazy_cache), n_prompts, seq_len,
             sidecar_path(jsonl_path, "block_hidden/layer_0000").parent,
         )
-        return first_payload
+        return lazy_cache

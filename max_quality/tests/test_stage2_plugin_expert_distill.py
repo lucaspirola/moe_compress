@@ -913,3 +913,94 @@ def test_no_stale_monkeypatch_of_distill_symbols():
         "monolith-only monkeypatch of a distill symbol — also patch it on "
         "pipeline.plugins.expert_distill:\n" + "\n".join(offenders)
     )
+
+
+# --- Lever 4: snapshot→members narrowing is byte-identical ---------------
+def test_lever4_narrowed_snapshot_distills_identically(tiny_model):
+    """Lever 4 byte-identity gate: driving ExpertDistillPlugin's
+    pre_merge_snapshot (which narrows the snapshot to
+    ``set().union(*grouped.values())`` when ``grouped`` is in ctx) + merge
+    produces distilled bank weights + distill_state BIT-IDENTICAL to a run
+    that forces a FULL snapshot (legacy ``members=None``).
+
+    This proves the narrowing is a pure dead-key removal:
+    ``_distill_merged_group`` reads only ``pre_merge_weights[m]`` for
+    ``m in members``, and every such ``m`` is in the union -- the dropped
+    non-member entries never influence any distilled output.
+    """
+    from moe_compress.utils.model_io import build_banks, iter_moe_layers
+
+    distill_kwargs = dict(
+        expert_distill_steps=8,
+        expert_distill_lr=5e-3,
+        expert_distill_betas=(0.9, 0.95),
+        expert_distill_token_cap=16,
+        expert_distill_skip_singletons=True,
+        expert_distill_plateau_steps=100,  # disable plateau-break
+        expert_distill_plateau_eps=0.0,
+    )
+    # grouped covers experts {0,1,2}; expert 3 is a NON-member that the
+    # full snapshot would clone but the narrowed snapshot drops.
+    grouped = {0: [0, 1], 2: [2]}
+    freq = {0: 3, 1: 1, 2: 5, 3: 2}
+    torch.manual_seed(1234)
+    layer_inputs = torch.randn(
+        16, list(iter_moe_layers(tiny_model))[0].experts_module.hidden_dim
+    ) * 0.1
+
+    class _StubAcc:
+        def __init__(self, buf):
+            self._buf = buf
+
+        def get(self):
+            return self._buf
+
+    def _run(force_full_snapshot: bool):
+        model = copy.deepcopy(tiny_model)
+        layer = list(iter_moe_layers(model))[0]
+        plugin = _make_plugin(**distill_kwargs)
+        ctx = PipelineContext()
+        ctx.set("layer_ref", layer)
+        # FULL-snapshot run: omit ``grouped`` from ctx so pre_merge_snapshot's
+        # ``ctx.has("grouped")`` is False -> members=None -> full snapshot.
+        # NARROWED run: provide ``grouped`` so the union-of-members narrowing
+        # fires (the production path).
+        if not force_full_snapshot:
+            ctx.set("grouped", grouped)
+        ctx.set("freq", freq)
+        ctx.set("layer_input_acc", _StubAcc(layer_inputs.clone()))
+        ctx.set("distill_state", None)
+
+        plugin.pre_merge_snapshot(ctx)
+        snap = ctx.get("pre_merge_weights")
+        # merge needs ``grouped`` regardless; set it now for the full-snapshot
+        # run (its absence above only affected the snapshot members).
+        if force_full_snapshot:
+            ctx.set("grouped", grouped)
+        _merge_experts_inplace(layer, grouped, freq, freq_weighted=True)
+        plugin.merge(ctx)
+        banks = build_banks(layer)
+        weights = {
+            name: banks[name].get(0).clone()
+            for name in ("gate_proj", "up_proj", "down_proj")
+        }
+        return snap, ctx.get("distill_state"), weights
+
+    full_snap, full_state, full_weights = _run(force_full_snapshot=True)
+    narrow_snap, narrow_state, narrow_weights = _run(force_full_snapshot=False)
+
+    # The snapshots themselves differ in KEY SET (the narrowing's whole point):
+    assert set(full_snap.keys()) == {0, 1, 2, 3}, "full snapshot keeps all experts"
+    assert set(narrow_snap.keys()) == {0, 1, 2}, (
+        "narrowed snapshot keeps exactly union(*grouped.values())"
+    )
+
+    # ...yet the distilled outputs are bit-identical -- dead-key removal only.
+    assert set(full_state.keys()) == set(narrow_state.keys()) == {0}
+    assert full_state[0]["steps"] == narrow_state[0]["steps"]
+    assert full_state[0]["final_loss"] == narrow_state[0]["final_loss"]
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        assert torch.equal(full_weights[name], narrow_weights[name]), (
+            f"narrowed-snapshot distilled bank weight {name} diverged from "
+            f"the full-snapshot reference -- the narrowing is NOT byte-identical"
+        )

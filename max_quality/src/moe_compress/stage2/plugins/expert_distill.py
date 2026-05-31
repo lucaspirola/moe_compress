@@ -488,26 +488,28 @@ def _build_v2_router_cache(
 
 def _snapshot_pre_merge_layer_experts(
     layer_ref: MoELayerRef,
+    members: "set[int] | None" = None,
 ) -> dict[int, dict[str, torch.Tensor]]:
-    """CPU snapshot of every expert's gate/up/down weights for a single
-    layer, taken BEFORE the merge step mutates the bank.
+    """CPU snapshot of expert gate/up/down weights for a single layer,
+    taken BEFORE the merge step mutates the bank.
 
     Used by step 7b (distillation) to compute the pre-merge group-member
     forward as the distillation target. Released by the per-layer driver
     once distillation finishes for the layer.
 
-    v1-waste note: this snapshots ALL ``num_routed_experts`` experts for
-    the layer, but ``_distill_merged_group`` only reads members of each
-    merge group (``pre_merge_weights[m]`` for ``m in members``). The
-    spec-form v2 target only needs the group's members, so the
-    non-member entries are dead weight in host RAM. v2 should narrow
-    the snapshot to ``set().union(*grouped.values())`` once ``grouped``
-    is available pre-merge.
+    When ``members`` is ``None`` (the default) ALL ``num_routed_experts``
+    experts are snapshotted — preserving the legacy full-snapshot behavior
+    relied on by direct callers/tests. When ``members`` is provided (the
+    plugin path, computed as ``set().union(*grouped.values())``) only those
+    expert ids are snapshotted: ``_distill_merged_group`` reads only group
+    members (``pre_merge_weights[m]`` for ``m in members``), so non-member
+    entries are dead weight in host RAM and narrowing them away is
+    byte-identical for every distilled output.
     """
     banks = build_banks(layer_ref)
     out: dict[int, dict[str, torch.Tensor]] = {}
-    n = layer_ref.num_routed_experts
-    for eid in range(n):
+    eids = range(layer_ref.num_routed_experts) if members is None else sorted(members)
+    for eid in eids:
         out[eid] = {
             name: banks[name].get(eid).detach().cpu().clone()
             for name in MATRIX_NAMES
@@ -1001,11 +1003,27 @@ class ExpertDistillPlugin:
         # mutates the bank. The snapshot is consumed only by the per-group
         # distillation step in ``merge``; released as soon as that finishes
         # for this layer (Python GC since no module-level reference is held).
-        pre_merge_weights: dict[int, dict[str, torch.Tensor]] | None = (
-            _snapshot_pre_merge_layer_experts(layer_ref)
-            if self.expert_distill_steps > 0
-            else None
-        )
+        #
+        # Lever 4: narrow the snapshot to only the experts any merge group can
+        # read (``set().union(*grouped.values())`` = every centroid + every
+        # absorbed/promoted member). ``_distill_merged_group`` reads only
+        # ``pre_merge_weights[m]`` for ``m in members``, so the narrowed dict is
+        # an exact superset of every key consumed — byte-identical distilled
+        # output, less host RAM. The ``if grouped`` guard degrades to a full
+        # snapshot if ``grouped`` is empty/None (defensive; not expected live).
+        # ``grouped`` is only needed when distillation is enabled; on the live
+        # path it is ``set`` (orchestrator:608, inside _run_assignment) strictly
+        # before this post-assign phase fires (orchestrator:1568). Read it via
+        # ``has`` so the disabled path (which sets only ``layer_ref``) never
+        # raises a KeyError.
+        if self.expert_distill_steps > 0:
+            grouped = ctx.get("grouped") if ctx.has("grouped") else None
+            needed = set().union(*grouped.values()) if grouped else None
+            pre_merge_weights: dict[int, dict[str, torch.Tensor]] | None = (
+                _snapshot_pre_merge_layer_experts(layer_ref, members=needed)
+            )
+        else:
+            pre_merge_weights = None
         ctx.set("pre_merge_weights", pre_merge_weights)
 
     def merge(self, ctx: PipelineContext) -> None:

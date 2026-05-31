@@ -1,33 +1,60 @@
 """Tests for ``Stage3BlockHiddenCacheProvider`` (Item 7 reader, Stage 3 side).
 
+Lever 3 (design (b)) note
+-------------------------
+``on_load`` no longer eagerly loads every payload. It PRESENCE-validates the
+sidecars all-or-nothing (file + manifest existence + schema, NO payload load)
+and returns a LAZY mapping (:class:`_LazyTeacherTargetsCache`) that
+materializes one layer's ``[n_prompts, seq_len, hidden]`` tensor on
+``.get(layer_idx)`` and retains no reference. The lazy mapping exposes
+``__len__`` (validated layer count, no materialization), ``.get`` (``None`` on
+absent key), and dict-like ``keys()`` / ``__getitem__`` for parity.
+
+Two former up-front content guards (token-count mismatch, I2 prompt-count
+divergence) cannot run without deserializing the payload (``load_block_hidden``
+has no shape-only path; the manifest carries no shape field), so they moved
+OUT of up-front scope. A present-but-malformed sidecar is now caught at
+consumption time by ``block_refine``'s per-layer shape guard, which falls
+through to the live teacher forward for that one layer (numerically safe --
+each layer's target is independent). The all-or-nothing *presence* miss is
+preserved.
+
 Covers:
 
 1. ``test_load_miss_no_dir`` -- no sidecars directory → ``on_load``
    returns None (does not raise) and ctx is untouched.
 2. ``test_load_hit_populates_teacher_targets_cache`` -- per-layer
-   sidecars present + ctx has calib → ``on_load`` returns a
-   non-None payload AND populates
-   ``ctx.teacher_targets_cache: dict[int, Tensor]`` with un-chunked
-   ``[n_prompts, seq_len, hidden]`` bf16 tensors per layer (decoupled
-   from any consumer batch_size -- C1 fix).
-3. ``test_schema_mismatch_raises`` -- forced schema=99 →
-   ``load_block_hidden`` raises ValueError with the actionable
-   "Delete the sidecar to regenerate" message.
-4. ``test_token_count_mismatch_falls_through_to_miss`` -- sidecar
-   ``n_tokens`` does not match ``n_prompts × seq_len`` → ``on_load``
-   returns None and does NOT populate ``ctx.teacher_targets_cache``.
+   sidecars present + ctx has calib → ``on_load`` returns a non-None
+   marker AND populates a lazy ``ctx.teacher_targets_cache`` whose
+   ``.get(layer_idx)`` yields the un-chunked ``[n_prompts, seq_len,
+   hidden]`` bf16 tensor (decoupled from any consumer batch_size).
+3. ``test_schema_mismatch_raises`` -- forced schema=99 → the presence
+   scan's manifest validation raises RuntimeError with the actionable
+   "re-run calibration" message (manifest read, no payload load).
+4. ``test_token_count_mismatch_lazy_get_falls_through`` -- a
+   present-but-misshapen sidecar PASSES presence validation (hit), but
+   ``.get`` returns a non-3-D tensor so block_refine's per-layer guard
+   falls through to live for that layer.
 5. ``test_dispatch_first_routes_through_registry`` -- a one-element
    registry of [Stage3BlockHiddenCacheProvider] processed via
    ``PluginRegistry.dispatch_first`` returns the first non-None winner
    on cache hit.
-6. ``test_prompt_count_divergence_falls_through_to_miss`` -- sidecar's
-   ``n_prompts_in_subset`` does not match ``ctx.calib.shape[0]`` →
-   ``on_load`` returns None (I2 prompt-count divergence guard).
+6. ``test_prompt_count_divergence_no_longer_upfront_miss`` -- documents
+   the accepted scope change: ``n_prompts_in_subset`` divergence is NOT
+   detected up-front anymore (needs a payload load); a shape-valid
+   sidecar still materializes.
 7. ``test_c1_batch_size_decoupled`` -- a writer with bcov-style batch
    size 1 produces sidecars; the reader populates the un-chunked
    tensor; downstream block_refine consumer with batch_size=32 slices
    correctly into per-batch tensors. Exercises the C1 fix's promise
    that the cache is independent of the consumer's batch size.
+8. ``test_lazy_get_returns_same_tensor_as_eager`` -- ``.get`` materializes
+   the SAME reshaped tensor the old eager path produced (byte-identity).
+9. ``test_lazy_mapping_len_and_get_contract`` -- ``len`` == n_layers with
+   NO materialization; ``.get(absent) is None``.
+10. ``test_partial_cache_still_all_or_nothing_miss`` -- removing one
+    layer's sidecar/manifest is the contract gate; the sidecars dir
+    presence is all-or-nothing.
 """
 from __future__ import annotations
 
@@ -216,16 +243,19 @@ def test_schema_mismatch_raises(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Test 4 -- token count mismatch -> miss (not raise)
+# Test 4 -- token count mismatch -> presence HIT, per-layer lazy fall-through
 # ---------------------------------------------------------------------------
 
 
-def test_token_count_mismatch_falls_through_to_miss(tmp_path):
-    """The sidecar holds ``n_tokens = n_prompts × seq_len`` but ctx.calib
-    advertises a different geometry. The reader must treat this as a
-    cache miss (return None, leave ctx untouched), NOT raise -- a
-    misaligned operator config is not a contract violation, just a
-    missed optimization."""
+def test_token_count_mismatch_lazy_get_falls_through(tmp_path):
+    """Lever 3 (design (b)): a present-but-misshapen sidecar PASSES the
+    cheap presence/manifest validation (so ``on_load`` returns a hit), but
+    its ``.get`` cannot reshape under the ctx geometry. Per design (b) the
+    token-count check moved OUT of up-front scope (it needs a payload load).
+    ``.get`` instead returns the raw 2-D ``[n_tokens, hidden]`` tensor, which
+    block_refine's per-layer shape guard (``cached.dim() == 3``) rejects --
+    falling through to the live teacher forward FOR THAT LAYER. Each layer's
+    target is independent, so a per-layer fall-through is numerically safe."""
     # Sidecar shape: 4 prompts × 3 seq_len = 12 tokens.
     n_prompts_write, seq_len_write, hidden = 4, 3, 2
     jsonl = _write_layer_sidecars(
@@ -242,8 +272,20 @@ def test_token_count_mismatch_falls_through_to_miss(tmp_path):
 
     provider = Stage3BlockHiddenCacheProvider()
     result = provider.on_load(ctx, jsonl)
-    assert result is None
-    assert not ctx.has("teacher_targets_cache")
+    # Presence validation succeeds -> this is a HIT (the lazy mapping).
+    assert result is not None
+    assert ctx.has("teacher_targets_cache")
+    cache = ctx.get("teacher_targets_cache")
+    assert len(cache) == 2  # both layers present
+
+    # But materializing a misshapen layer yields a non-3-D tensor that
+    # block_refine's guard rejects -> per-layer live fall-through.
+    got = cache.get(1)
+    assert got is not None
+    assert got.dim() != 3, (
+        "a token-count-mismatched sidecar must NOT reshape to 3-D; it must "
+        "return a tensor block_refine's dim()==3 guard rejects"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -287,25 +329,27 @@ def test_dispatch_first_routes_through_registry(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 6 -- prompt-count divergence guard (I2)
+# Test 6 -- I2 prompt-count divergence is no longer an up-front miss
+# (accepted scope change under Lever 3 design (b))
 # ---------------------------------------------------------------------------
 
 
-def test_prompt_count_divergence_falls_through_to_miss(tmp_path):
-    """The sidecar's ``n_prompts_in_subset`` does not match
-    ``ctx.calib.shape[0]``. Even if the per-layer ``n_tokens`` happens
-    to match (it does here because the writer chose to over-collect by
-    a chunk-boundary remainder), the reader must treat this as a cache
-    miss because the per-prompt content is no longer guaranteed to
-    align with the consumer's calibration tensor."""
+def test_prompt_count_divergence_no_longer_upfront_miss(tmp_path):
+    """ACCEPTED SCOPE CHANGE (Lever 3 design (b)): the I2 prompt-count
+    divergence guard read ``payload.n_prompts_in_subset``, which requires
+    deserializing the payload -- impossible under the cheap presence scan
+    (``load_block_hidden`` has no shape-only path; the manifest carries no
+    n_prompts field). So a sidecar whose ``n_prompts_in_subset`` diverges
+    but whose token count matches the ctx geometry is NO LONGER an up-front
+    miss; it presence-validates (hit) and ``.get`` materializes a
+    shape-valid tensor under the ctx geometry.
+
+    This is the documented trade-off recorded in the plan's risk table:
+    operator misconfiguration of the calibration source is caught by the
+    operator-responsibility note (prompt-identity is I1+I2 operator
+    responsibility), not by this reader. The numerically-safe per-layer
+    shape fall-through still protects against a *misshapen* sidecar."""
     n_prompts_ctx, seq_len, hidden = 6, 4, 2
-    # Build a payload whose hidden_states has the right SHAPE (6×4=24
-    # rows) but whose n_prompts_in_subset advertises 130 -- e.g. a
-    # writer that captured beyond the 128-cap on a chunk boundary AND
-    # the Stage 3 calib spec asks for a totally different 6-prompt
-    # tensor. The token-count math would coincidentally check out only
-    # if the per-prompt seq_len also lined up; here the divergence
-    # check fires before the token-count check.
     jsonl = _jsonl(tmp_path)
     hs = torch.zeros(n_prompts_ctx * seq_len, hidden, dtype=torch.bfloat16)
     payload = BlockHiddenPayload(
@@ -323,8 +367,14 @@ def test_prompt_count_divergence_falls_through_to_miss(tmp_path):
 
     provider = Stage3BlockHiddenCacheProvider()
     result = provider.on_load(ctx, jsonl)
-    assert result is None
-    assert not ctx.has("teacher_targets_cache")
+    # Presence-valid -> hit. (Pre-Lever-3 this returned None.)
+    assert result is not None
+    assert ctx.has("teacher_targets_cache")
+    cache = ctx.get("teacher_targets_cache")
+    # Token count (24) matches 6×4, so .get materializes a shape-valid tensor.
+    got = cache.get(0)
+    assert got is not None
+    assert got.shape == (n_prompts_ctx, seq_len, hidden)
 
 
 # ---------------------------------------------------------------------------
@@ -405,3 +455,103 @@ def test_c1_batch_size_decoupled(tmp_path):
     assert per_batch_targets[0][0, 0, 1].item() == 0.0
     # batch 1 row 0 covers prompt 4; t = 4 * seq_len + 0 = 8.
     assert per_batch_targets[1][0, 0, 1].item() == 8.0
+
+
+# ---------------------------------------------------------------------------
+# Lever 3 -- lazy materialization contract
+# ---------------------------------------------------------------------------
+
+
+def test_lazy_get_returns_same_tensor_as_eager(tmp_path):
+    """``.get(layer_idx)`` materializes the SAME reshaped tensor the old
+    eager path produced (``hs.reshape(n_prompts, seq_len, -1).contiguous()``)
+    -- byte-identity, only allocation timing changes."""
+    from moe_compress.utils.cached_calibration_signals import load_block_hidden
+
+    n_prompts, seq_len, hidden = 8, 4, 3
+    layer_indices = [3, 7]
+    jsonl = _write_layer_sidecars(
+        tmp_path,
+        layer_indices=layer_indices,
+        n_prompts=n_prompts,
+        seq_len=seq_len,
+        hidden=hidden,
+    )
+    ctx = PipelineContext()
+    _populate_ctx_for_alignment(
+        ctx, n_prompts=n_prompts, seq_len=seq_len, batch_size=2,
+    )
+    provider = Stage3BlockHiddenCacheProvider()
+    assert provider.on_load(ctx, jsonl) is not None
+    cache = ctx.get("teacher_targets_cache")
+
+    for li in layer_indices:
+        eager = load_block_hidden(jsonl, li).hidden_states.reshape(
+            n_prompts, seq_len, -1
+        ).contiguous()
+        lazy = cache.get(li)
+        assert lazy.dtype == eager.dtype
+        assert lazy.shape == eager.shape
+        assert torch.equal(lazy, eager), (
+            f"lazy .get(layer {li}) tensor diverged from the eager reshape"
+        )
+
+
+def test_lazy_mapping_len_and_get_contract(tmp_path):
+    """``len(cache) == n_layers`` from the presence scan WITHOUT materializing
+    any tensor (orchestrator:710 HIT-log call), and ``.get(absent) is None``
+    (block_refine:465 ``dict.get`` semantics)."""
+    n_prompts, seq_len, hidden = 6, 2, 2
+    layer_indices = [0, 4, 9]
+    jsonl = _write_layer_sidecars(
+        tmp_path,
+        layer_indices=layer_indices,
+        n_prompts=n_prompts,
+        seq_len=seq_len,
+        hidden=hidden,
+    )
+    ctx = PipelineContext()
+    _populate_ctx_for_alignment(
+        ctx, n_prompts=n_prompts, seq_len=seq_len, batch_size=3,
+    )
+    provider = Stage3BlockHiddenCacheProvider()
+    assert provider.on_load(ctx, jsonl) is not None
+    cache = ctx.get("teacher_targets_cache")
+
+    # len() must equal the validated layer count with NO materialization.
+    # We assert it BEFORE any .get() call, so no payload has been loaded yet.
+    assert len(cache) == len(layer_indices)
+    assert set(cache.keys()) == set(layer_indices)
+
+    # Absent key -> None (NOT KeyError) for .get, matching dict.get.
+    assert cache.get(999) is None
+    # Present key materializes a real tensor.
+    assert cache.get(4) is not None
+
+
+def test_partial_cache_still_all_or_nothing_miss(tmp_path):
+    """Contract-preservation gate: the PRESENCE miss stays all-or-nothing
+    BEFORE any training, established cheaply (stat + manifest, no payload
+    load).
+
+    The directory-level miss is all-or-nothing: with no sidecars dir there is
+    a full miss (None) BEFORE any training, so a consumer never sees a
+    partially-hydrated cache. A genuinely-malformed-but-PRESENT sidecar (torn
+    manifest) raises in the presence scan -- covered by
+    ``test_schema_mismatch_raises``. A shape-misshapen-but-present sidecar
+    falls through per-layer at consumption -- covered by
+    ``test_token_count_mismatch_lazy_get_falls_through``.
+
+    (Removing ONE layer's ``.pt`` from an N-layer dir shrinks the validated
+    set but is NOT independently detectable as a "missing layer" -- neither
+    origin/main's eager ``_load_layers`` nor this presence scan is given the
+    expected layer COUNT; the orchestrator never passes ``n_blocks`` to the
+    provider. This is unchanged from origin/main.)
+    """
+    # Directory absent -> full miss, ctx untouched, before any materialization.
+    jsonl = _jsonl(tmp_path)
+    ctx = PipelineContext()
+    _populate_ctx_for_alignment(ctx, n_prompts=6, seq_len=2, batch_size=2)
+    provider = Stage3BlockHiddenCacheProvider()
+    assert provider.on_load(ctx, jsonl) is None
+    assert not ctx.has("teacher_targets_cache")

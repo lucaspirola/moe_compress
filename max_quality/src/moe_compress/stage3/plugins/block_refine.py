@@ -291,7 +291,13 @@ def _phase_c5_block_refine(
 
         def _hook(_mod, args, kwargs):
             t = args[0] if args else kwargs.get("hidden_states")
-            captured[cur_idx[0]] = t.detach().to(dtype=torch.bfloat16, device="cpu")
+            # Levers 1+2: pin the bf16 CPU source so the per-step H2D in the
+            # AdamW loop (non_blocking=True) is async. .pin_memory() returns
+            # a byte-identical copy in non-pageable host memory; values are
+            # unchanged.
+            captured[cur_idx[0]] = (
+                t.detach().to(dtype=torch.bfloat16, device="cpu").pin_memory()
+            )
             raise _EarlyExit
 
         handle = layer_module.register_forward_pre_hook(_hook, with_kwargs=True)
@@ -470,8 +476,14 @@ def _phase_c5_block_refine(
                 and cached.shape[0] >= n_batches * batch_size
                 and cached.shape[1] == seq_len_cal
             ):
+                # Levers 1+2: pin the per-batch slice copy (NOT the whole
+                # cached tensor) so the per-step H2D below is async. The
+                # contiguous() slice is already a fresh bf16 CPU tensor;
+                # .pin_memory() makes it non-pageable with identical bytes.
                 teacher_targets = [
-                    cached[bi * batch_size:(bi + 1) * batch_size].contiguous()
+                    cached[bi * batch_size:(bi + 1) * batch_size]
+                    .contiguous()
+                    .pin_memory()
                     for bi in range(n_batches)
                 ]
                 log.info(
@@ -500,7 +512,11 @@ def _phase_c5_block_refine(
                     out = t_layer(x_t, **teacher_kwargs_all.get(layer_idx, {}))
                     if isinstance(out, tuple):
                         out = out[0]
-                    teacher_targets.append(out.detach().to(dtype=torch.bfloat16, device="cpu"))
+                    # Levers 1+2: pinned bf16 CPU source for the async
+                    # per-step H2D below. Byte-identical to the pageable copy.
+                    teacher_targets.append(
+                        out.detach().to(dtype=torch.bfloat16, device="cpu").pin_memory()
+                    )
 
         # AdamW loop.
         loss_first: float | None = None
@@ -508,8 +524,15 @@ def _phase_c5_block_refine(
         step = 0
         for epoch in range(epochs):
             for bi, _ in enumerate(batches):
-                x_s = X_student[bi].to(device=device, dtype=student_dtype)
-                target = teacher_targets[bi].to(device=device, dtype=student_dtype)
+                # Levers 1+2: the source tensors are pinned (produced at
+                # capture/teacher-target sites), so non_blocking=True makes
+                # this per-step H2D async + overlappable on the default
+                # stream. Same stream + no RNG => the consuming kernel sees
+                # bit-identical values; op order and AdamW step order are
+                # unchanged. (pin + non_blocking are inseparable: pageable
+                # + non_blocking is silently synchronous.)
+                x_s = X_student[bi].to(device=device, dtype=student_dtype, non_blocking=True)
+                target = teacher_targets[bi].to(device=device, dtype=student_dtype, non_blocking=True)
                 out = s_layer(x_s, **student_kwargs_all.get(layer_idx, {}))
                 if isinstance(out, tuple):
                     out = out[0]
@@ -621,12 +644,14 @@ def _advance_streams(s_layer, t_layer, X_student, X_teacher,
             out_s = s_layer(x_s, **s_kwargs)
             if isinstance(out_s, tuple):
                 out_s = out_s[0]
-            new_s.append(out_s.detach().to(dtype=torch.bfloat16, device="cpu"))
+            # Levers 1+2: pin the next-block bf16 CPU inputs so the next
+            # block's per-step H2D (non_blocking=True) is async. Byte-identical.
+            new_s.append(out_s.detach().to(dtype=torch.bfloat16, device="cpu").pin_memory())
             x_t = x_t_cpu.to(device=device, dtype=teacher_dtype)
             out_t = t_layer(x_t, **t_kwargs)
             if isinstance(out_t, tuple):
                 out_t = out_t[0]
-            new_t.append(out_t.detach().to(dtype=torch.bfloat16, device="cpu"))
+            new_t.append(out_t.detach().to(dtype=torch.bfloat16, device="cpu").pin_memory())
     return new_s, new_t
 
 
