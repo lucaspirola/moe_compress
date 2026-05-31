@@ -1,9 +1,9 @@
 diff --git a/vllm/calibration_stage2_profile.py b/vllm/calibration_stage2_profile.py
 new file mode 100644
-index 0000000..c0de100
+index 0000000..9e35029
 --- /dev/null
 +++ b/vllm/calibration_stage2_profile.py
-@@ -0,0 +1,806 @@
+@@ -0,0 +1,894 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Stage 2 profile-pass sidecar capture (Plugin #12 REDO -- Optimization A).
@@ -20,10 +20,12 @@ index 0000000..c0de100
 +vLLM-side wrapper that:
 +
 +  1. Samples the env gate VLLM_CALIB_CAPTURE_STAGE2_PROFILE at import.
-+  2. Registers the router + expert_out_unweighted callbacks with the
++  2. Registers the router + expert_out_unweighted + layer_in + expert_in
++     (gate_proj cov) + expert_mid (down_proj cov) callbacks with the
 +     calibration_hooks dispatcher.
 +  3. Forwards into the canonical writer's _on_router_callback /
-+     _on_expert_out_unweighted_callback / _finalize_batch_for_layer /
++     _on_expert_out_unweighted_callback / _expert_in_handler /
++     _expert_mid_handler / _finalize_batch_for_layer /
 +     record_batch_token_count / dump_stage2_profile entry points.
 +
 +Bug fixes (relative to the deleted prior Plugin #12 writer):
@@ -67,8 +69,8 @@ index 0000000..c0de100
 +dump_stage2_profile_checkpoint during the run,
 +load_stage2_profile_checkpoint on --resume. The final
 +dump_stage2_profile writes the normalised payload via
-+moe_compress.utils.cached_calibration_signals.save_stage2_profile_v3
-+(schema v3).
++moe_compress.utils.cached_calibration_signals.save_stage2_profile_v4
++(schema v4).
 +"""
 +from __future__ import annotations
 +
@@ -96,16 +98,16 @@ index 0000000..c0de100
 +    )
 +    from moe_compress.utils.cached_calibration_signals import (
 +        SCHEMA_VERSIONS,
-+        Stage2ProfilePayloadV3,
-+        save_stage2_profile_v3,
++        Stage2ProfilePayloadV4,
++        save_stage2_profile_v4,
 +    )
 +    _IMPORT_OK = True
 +except ImportError as exc:  # pragma: no cover -- defensive
 +    _LayerInputAccumulator = None  # type: ignore
 +    InputCovarianceAccumulator = None  # type: ignore
 +    ReamCostAccumulator = None  # type: ignore
-+    Stage2ProfilePayloadV3 = None  # type: ignore
-+    save_stage2_profile_v3 = None  # type: ignore
++    Stage2ProfilePayloadV4 = None  # type: ignore
++    save_stage2_profile_v4 = None  # type: ignore
 +    SCHEMA_VERSIONS = {}  # type: ignore
 +    _IMPORT_ERR = str(exc)
 +
@@ -160,7 +162,7 @@ index 0000000..c0de100
 +
 +# Sticky -- callbacks registered once; subsequent setup() calls reuse them.
 +_CALLBACKS_REGISTERED: bool = False
-+_CKPT_SCHEMA: int = 1
++_CKPT_SCHEMA: int = 2
 +
 +
 +def setup(
@@ -234,10 +236,13 @@ index 0000000..c0de100
 +        _ch.register_callback("router", _router_handler)
 +        _ch.register_callback("expert_out_unweighted", _expert_out_handler)
 +        _ch.register_callback("layer_in", _layer_in_handler)
++        _ch.register_callback("expert_in", _expert_in_handler)
++        _ch.register_callback("expert_mid", _expert_mid_handler)
 +        _CALLBACKS_REGISTERED = True
 +        log.info(
 +            "calibration_stage2_profile.setup: registered router + "
-+            "expert_out_unweighted + layer_in callbacks",
++            "expert_out_unweighted + layer_in + expert_in (gate_proj cov) + "
++            "expert_mid (down_proj cov) callbacks",
 +        )
 +
 +    log.info(
@@ -290,7 +295,7 @@ index 0000000..c0de100
 +# vLLM calibration_hooks callbacks.
 +# ---------------------------------------------------------------------------
 +def _router_handler(**kw: Any) -> None:
-+    """``router`` hook -- record per-batch gate logits."""
++    """``router`` hook -- fold per-batch gate logits into the online _gate_gram."""
 +    if not _CAPTURE or _state.ream_acc is None:
 +        return
 +    try:
@@ -360,6 +365,84 @@ index 0000000..c0de100
 +        )
 +
 +
++def _expert_in_handler(**kw: Any) -> None:
++    """``expert_in`` hook -- gate_proj input covariance per expert.
++
++    Mirrors the LIVE Stage-2 ``instrument_experts`` row set exactly: the
++    "input"/gate_proj cb receives ``hidden_states[token_idx]`` where
++    ``token_idx`` comes from ``torch.where(mask[e])`` (per-(token,slot)).
++    The vLLM ``expert_in`` dispatch hands us the full ``hidden_states
++    [n_tok, hidden]`` + ``topk_ids [n_tok, top_k]``; we reconstruct the
++    per-slot row set for each expert ``e`` and feed it through the shared
++    ``InputCovarianceAccumulator.update`` (the SAME accumulator the live
++    path uses; ``subᵀ@sub`` + token_count are accumulated internally).
++
++    Per-slot ``(topk_ids == e).nonzero()`` rows match the live contract and
++    are robust to a future sampler that repeats an expert within a row;
++    under ``torch.topk`` (distinct experts per token) this equals the
++    unique-token mask. CPU-resident ``sub`` (option A): the matmul runs on
++    CPU so it is safe under vLLM CUDA-graph capture.
++    """
++    if not _CAPTURE or _state.cov_acc is None:
++        return
++    try:
++        layer_idx = int(kw["layer_idx"])
++        hidden = kw["hidden_states"]
++        topk_ids = kw["topk_ids"]
++    except KeyError:
++        return
++    hs = hidden.detach().reshape(-1, hidden.shape[-1]).to("cpu")  # [n_tok, hidden]
++    ids = topk_ids.detach().to("cpu")
++    if ids.dim() == 1:
++        ids = ids.unsqueeze(-1)  # -> [n_tok, top_k]
++    n_experts = _state.n_experts or (
++        int(ids.max().item()) + 1 if ids.numel() else 0
++    )
++    for e in range(n_experts):
++        # Per-(token,slot) rows: (topk_ids == e).nonzero() -> (token, slot);
++        # column 0 is the per-slot token index (mirrors torch.where(mask[e])).
++        slot_tok = (ids == e).nonzero(as_tuple=False)  # [n_assign, 2]
++        if slot_tok.numel() == 0:
++            continue
++        token_idx = slot_tok[:, 0]
++        sub = hs.index_select(0, token_idx)  # [n_assign, hidden] (CPU)
++        _state.cov_acc.update(layer_idx, e, "gate_proj", sub)
++
++
++def _expert_mid_handler(**kw: Any) -> None:
++    """``expert_mid`` hook -- down_proj input covariance per expert.
++
++    The live ``intermediate``/down_proj cb uses the SAME per-(token,slot)
++    axis as gate (both flow from ``torch.where(mask[e])`` -> ``token_idx``
++    in ``instrument_experts``); there is NO gate/down axis difference in the
++    live cov path. The vLLM ``expert_mid`` dispatch hands us ``intermediate
++    [n_tok, top_k, interm]`` + ``topk_ids [n_tok, top_k]``; we flatten to
++    ``[n_tok*top_k, interm]`` (naturally per-slot — the kernel runs one
++    down_proj matmul per (token, slot) pair) and select the per-slot rows
++    for each expert. CPU matmul (option A) for CUDA-graph safety.
++    """
++    if not _CAPTURE or _state.cov_acc is None:
++        return
++    try:
++        layer_idx = int(kw["layer_idx"])
++        interm = kw["intermediate"]
++        topk_ids = kw["topk_ids"]
++    except KeyError:
++        return
++    interm_dim = interm.shape[-1]
++    flat = interm.detach().reshape(-1, interm_dim).to("cpu")  # [n_tok*top_k, interm]
++    flat_ids = topk_ids.detach().reshape(-1).to("cpu")  # [n_tok*top_k]
++    n_experts = _state.n_experts or (
++        int(flat_ids.max().item()) + 1 if flat_ids.numel() else 0
++    )
++    for e in range(n_experts):
++        rows = (flat_ids == e).nonzero(as_tuple=False).reshape(-1)
++        if rows.numel() == 0:
++            continue
++        sub = flat.index_select(0, rows)  # [n_e_slots, interm] (CPU)
++        _state.cov_acc.update(layer_idx, e, "down_proj", sub)
++
++
 +# ---------------------------------------------------------------------------
 +# Public helpers for the driver.
 +# ---------------------------------------------------------------------------
@@ -405,7 +488,7 @@ index 0000000..c0de100
 +# Dump.
 +# ---------------------------------------------------------------------------
 +def dump_stage2_profile(jsonl_path: Path | str) -> None:
-+    """Serialize the writer state into a schema-v3 sidecar."""
++    """Serialize the writer state into a schema-v4 sidecar."""
 +    if _state.cov_acc is None or _state.ream_acc is None:
 +        log.warning("calibration_stage2_profile.dump: writer state empty; skip")
 +        return
@@ -433,7 +516,7 @@ index 0000000..c0de100
 +        l2r = _state.layer_idx_to_rank
 +    else:
 +        observed = (
-+            set(_state.ream_acc.gate_logit_profiles)
++            set(_state.ream_acc._gate_gram)
 +            | {k[0] for k in _state.cov_acc.covariance}
 +            | set(_state.layer_input_reservoir)
 +        )
@@ -472,15 +555,20 @@ index 0000000..c0de100
 +            _state.ream_acc._total_tokens_by_layer.get(layer_idx, 0)
 +        )
 +
-+    gate_logit_profiles: dict[int, list[tuple[int, torch.Tensor]]] = {}
-+    for layer_idx, batches in _state.ream_acc.gate_logit_profiles.items():
-+        rank = l2r.get(layer_idx)
-+        if rank is None:
-+            continue
-+        gate_logit_profiles[rank] = [
-+            (int(off), t.detach().to("cpu", dtype=torch.float32).contiguous())
-+            for off, t in batches
-+        ]
++    # δ_gate router-logit Gram: a bounded [n_layers, E, E] fp64 tensor mirroring
++    # the sim_tensor build loop. _gate_gram[layer] is the full [E, E] Gram over
++    # all experts; rehydrated into ReamCostAccumulator._gate_gram by the reader.
++    if n_experts > 0:
++        gate_gram = torch.zeros(
++            (n_layers, n_experts, n_experts), dtype=torch.float64,
++        )
++        for rank in range(n_layers):
++            layer_idx = _state.rank_to_layer_idx[rank]
++            g = _state.ream_acc._gate_gram.get(layer_idx)
++            if g is not None:
++                gate_gram[rank] = g.detach().to(torch.float64).cpu()
++    else:
++        gate_gram = torch.zeros((n_layers, 0, 0), dtype=torch.float64)
 +
 +    neuron_act_sum: dict = {}
 +    neuron_act_count: dict = {}
@@ -515,7 +603,7 @@ index 0000000..c0de100
 +
 +    # Finalise each per-layer accumulator to a bf16 [N, hidden] tensor.
 +    # Empty/missing layers fall back to the (0, 0) placeholder so the
-+    # schema-v3 reader's empty-shape guard remains a defensive fallback
++    # schema-v4 reader's empty-shape guard remains a defensive fallback
 +    # (per plan §5.a) for back-compat with pre-hook sidecars.
 +    layer_input_reservoir: list = []
 +    for rank in range(n_layers):
@@ -530,8 +618,8 @@ index 0000000..c0de100
 +                acc.buffer.detach().to("cpu", dtype=torch.bfloat16).contiguous()
 +            )
 +
-+    payload = Stage2ProfilePayloadV3(
-+        format_version=3,
++    payload = Stage2ProfilePayloadV4(
++        format_version=4,
 +        schema_version=SCHEMA_VERSIONS["stage2_profile"],
 +        model_hash=_state.model_hash,
 +        n_layers=n_layers,
@@ -539,7 +627,7 @@ index 0000000..c0de100
 +        top_k=int(_state.top_k),
 +        cov_storage_dtype=_state.configured_cov_storage_dtype,
 +        total_tokens_per_layer=total_tokens,
-+        gate_logit_profiles=gate_logit_profiles,
++        gate_gram=gate_gram,
 +        sim_tensor=sim_tensor,
 +        neuron_act_sum=neuron_act_sum,
 +        neuron_act_count=neuron_act_count,
@@ -547,7 +635,7 @@ index 0000000..c0de100
 +        cov_token_count=cov_tc,
 +        layer_input_reservoir=layer_input_reservoir,
 +    )
-+    save_stage2_profile_v3(payload, jsonl_path)
++    save_stage2_profile_v4(payload, jsonl_path)
 +    # Per plan §2.e: emit an info-log reporting layer_input_reservoir
 +    # population. All-empty after the CRITICAL-1 hook landing typically
 +    # means VLLM_CALIB_CAPTURE_LAYER_IN was not set to '1' -- escalate
@@ -592,7 +680,7 @@ index 0000000..c0de100
 +        "layer_idx_to_rank": dict(_state.layer_idx_to_rank),
 +        "ream_acc_sim_tensor": dict(_state.ream_acc._sim_tensor),
 +        "ream_acc_total_tokens": dict(_state.ream_acc._total_tokens_by_layer),
-+        "ream_acc_gate_logit_profiles": dict(_state.ream_acc.gate_logit_profiles),
++        "ream_acc_gate_gram": dict(_state.ream_acc._gate_gram),
 +        "ream_acc_neuron_act_sum": dict(_state.ream_acc._neuron_act_sum),
 +        "ream_acc_neuron_act_count": dict(_state.ream_acc._neuron_act_count),
 +        "cov_acc_covariance": dict(_state.cov_acc.covariance),
@@ -730,8 +818,8 @@ index 0000000..c0de100
 +    _state.ream_acc._total_tokens_by_layer = dict(
 +        loaded.get("ream_acc_total_tokens", {})
 +    )
-+    _state.ream_acc.gate_logit_profiles = dict(
-+        loaded.get("ream_acc_gate_logit_profiles", {})
++    _state.ream_acc._gate_gram = dict(
++        loaded.get("ream_acc_gate_gram", {})
 +    )
 +    _state.ream_acc._neuron_act_sum = dict(
 +        loaded.get("ream_acc_neuron_act_sum", {})

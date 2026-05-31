@@ -20,8 +20,8 @@ either one alone produces a partially-wired wheel.
 | vLLM upstream SHA | `ad7125a431e176d4161099480a66f0169609a690` (v0.21.0) |
 | Patch 1 line count | **11272** |
 | Patch 1 MD5 | **`9aaf47abd4c44bf2b2a62edd7e28014f`** (vllm_calibration_hooks.patch) |
-| Patch 2 line count | **812** |
-| Patch 2 MD5 | **`fefbcec8b4f230317bdb16be808eecc8`** (vllm_calibration_stage2_profile.patch) |
+| Patch 2 line count | **900** |
+| Patch 2 MD5 | **`176e1bc4ee08d32d0b2a12dc73b4fec4`** (vllm_calibration_stage2_profile.patch) |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -36,9 +36,9 @@ wc -l max_quality/patches/vllm_calibration_hooks.patch
 # expect: 11272
 
 md5sum max_quality/patches/vllm_calibration_stage2_profile.patch
-# expect: fefbcec8b4f230317bdb16be808eecc8
+# expect: 176e1bc4ee08d32d0b2a12dc73b4fec4
 wc -l max_quality/patches/vllm_calibration_stage2_profile.patch
-# expect: 812
+# expect: 900
 
 # Re-apply both against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -177,12 +177,25 @@ Cross-validation at load time: schema_version, cov_storage_dtype
 n_experts, top_k, model_hash -- any mismatch raises ``ValueError``
 with the standard "Delete the sidecar to regenerate" message.
 
-Schema bump: ``SCHEMA_VERSIONS["stage2_profile"]`` bumped from 1 to 3
+Schema bump: ``SCHEMA_VERSIONS["stage2_profile"]`` bumped from 1 to 4
 (skips 2 to signal a clean break from the deleted prior Plugin #12
-v1 writer). The v1 dataclass was never persisted by a production
-writer; the v1 -> v3 bump is intentionally NOT forward-compatible.
-Pattern K applies forward (v3 -> v4 SHOULD preserve readers when
-adding optional fields).
+v1 writer; 3 -> 4 replaces the unbounded raw ``gate_logit_profiles``
+per-batch list with a bounded online ``gate_gram`` [n_layers, E, E]
+fp64 router-logit Gram — ~570-920 GB host RAM -> ~20 MB across 40
+layers). The v1 dataclass was never persisted by a production writer;
+the v1 -> v4 bump is intentionally NOT forward-compatible. The writer
+checkpoint ``_CKPT_SCHEMA`` is bumped 1 -> 2 to match (old checkpoints
+fail-loud and regenerate).
+
+Cov capture: ``--capture-stage2-profile`` now feeds gate_proj covariance
+via the ``expert_in`` hook and down_proj covariance via the ``expert_mid``
+hook (both mirror the live ``instrument_experts`` per-(token,slot) row set
+through the shared ``InputCovarianceAccumulator``; CPU matmul for CUDA-graph
+safety). Previously no callback fed ``cov_acc``, so a full-hit Stage-2 layer
+emitted an empty covariance. The driver auto-enables
+``VLLM_CALIB_CAPTURE_EXPERT=1`` + ``VLLM_CALIB_CAPTURE_EXPERT_MID=1``. DISK:
+this adds ~91 GB at ``cov_storage_dtype=float16`` for a 256-expert /
+40-layer / hidden=2048 / moe_intermediate=512 model.
 
 ### `calib-v2-layer-input-reservoir` (current)
 
