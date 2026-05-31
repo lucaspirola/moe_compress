@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from ..utils.activation_hooks import InputCovarianceAccumulator, ReamCostAccumulator
+from ..utils.lsa_pool import parallel_map
 from ..utils.model_io import MoELayerRef, build_banks
 from .permutation_align import _PermAlignCache, _permutation_align_to_centroid
 
@@ -43,6 +44,7 @@ def _merge_experts_inplace(
     layer_inputs: torch.Tensor | None = None,
     token_cap: int = 1024,
     cov_acc: "InputCovarianceAccumulator | None" = None,
+    lsa_max_workers: int | None = None,
 ) -> None:
     """Merge non-centroid experts into their centroid in place.
 
@@ -212,6 +214,35 @@ def _merge_experts_inplace(
             ref_up   = banks["up_proj"].get(centroid).to(torch.float32)
             ref_act  = ream_acc.get_neuron_mean(li, centroid) if ream_acc else None
 
+            # Phase A (threaded): pre-compute the per-(centroid, member) Hungarian
+            # solves for cache-miss non-centroid members. SPLIT-PHASE — only the
+            # pure `linear_sum_assignment` solves run in the pool; the float
+            # accumulation (Phase B) stays SERIAL in original member order below
+            # (fp addition is non-associative; reordering diverges ~1e-6). Perms
+            # are keyed by member id and reassembled by index ⇒ thread completion
+            # order is unobservable. Matches today's behaviour: merge-time perms
+            # are NOT written back to perm_cache (it is read-only here), so Phase A
+            # only reads the cache and hands fresh perms to Phase B.
+            _miss_members = [
+                m for m in members
+                if m != centroid
+                and (perm_cache is None or perm_cache.get((li, centroid, m)) is None)
+            ]
+
+            def _solve_perm(m: int, _ref_gate=ref_gate, _ref_up=ref_up, _ref_act=ref_act):
+                gate_m = banks["gate_proj"].get(m).to(torch.float32)
+                up_m   = banks["up_proj"].get(m).to(torch.float32)
+                child_act = ream_acc.get_neuron_mean(li, m) if ream_acc else None
+                return _permutation_align_to_centroid(
+                    _ref_gate, _ref_up, gate_m, up_m,
+                    ref_act_mean=_ref_act, child_act_mean=child_act,
+                )
+
+            _solved = parallel_map(
+                _solve_perm, _miss_members, max_workers=lsa_max_workers,
+            )
+            _miss_perms: dict[int, np.ndarray] = dict(zip(_miss_members, _solved))
+
             accs: dict[str, torch.Tensor | None] = {name: None for name in banks}
             # MergeMoE bookkeeping (only populated when
             # ``effective_merge_step == "mergemoe"``): permutation-aligned
@@ -253,10 +284,12 @@ def _merge_experts_inplace(
                     if cached is not None:
                         perm = cached[0]
                     else:
-                        perm = _permutation_align_to_centroid(
-                            ref_gate, ref_up, gate_m, up_m,
-                            ref_act_mean=ref_act, child_act_mean=child_act,
-                        )
+                        # Phase B (serial): read the perm computed in Phase A's
+                        # thread pool. Byte-identical to the prior inline solve
+                        # (same pure function, same inputs); the accumulation
+                        # below still runs in original `zip(weights, members)`
+                        # order so `accs` sums identically.
+                        perm = _miss_perms[m]
                 for name, bank in banks.items():
                     if name == "gate_proj":
                         Wm = gate_m
