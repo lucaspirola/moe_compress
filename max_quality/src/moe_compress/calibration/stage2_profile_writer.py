@@ -21,11 +21,15 @@ Design — single writer, one sidecar, four data streams:
     ``record_batch_token_count`` for the Eq. 8 denominator (Bug #3 fix:
     EXACT |X|, NOT Sum_e token_counts_e).
 
-Cov accumulation reuses :class:`InputCovarianceAccumulator` directly so
-the writer-side cov entries are byte-identical with what a live Stage 2
-run would produce. ``setup`` calls ``set_storage_dtype`` IMMEDIATELY so
-the writer never relies on the default fp32 dtype at
-``activation_hooks.py:961``.
+Cov accumulation is fed by the ``expert_in`` (gate_proj) + ``expert_mid``
+(down_proj) hooks (:func:`_expert_in_handler` / :func:`_expert_mid_handler`),
+which reconstruct the SAME per-(token,slot) row set the live Stage-2
+``instrument_experts`` path uses (``torch.where(mask[e])`` -> ``token_idx``)
+and feed it through the shared :class:`InputCovarianceAccumulator.update`.
+gate cov is ``[hidden_size, hidden_size]``; down cov is
+``[moe_intermediate_size, moe_intermediate_size]``. ``setup`` calls
+``set_storage_dtype`` IMMEDIATELY so the writer never relies on the default
+fp32 dtype at ``activation_hooks.py:961``.
 
 Public API used by the driver:
     * :func:`setup`
@@ -281,6 +285,84 @@ def _on_expert_out_unweighted_callback(
             token_indices=token_indices,
             batch_offset=int(batch_offset),
         )
+
+
+def _expert_in_handler(**kw: Any) -> None:
+    """``expert_in`` hook -- gate_proj input covariance per expert.
+
+    Mirrors the LIVE Stage-2 ``instrument_experts`` row set exactly: the
+    "input"/gate_proj cb receives ``hidden_states[token_idx]`` where
+    ``token_idx`` comes from ``torch.where(mask[e])`` (per-(token,slot)).
+    The vLLM ``expert_in`` dispatch hands us the full ``hidden_states
+    [n_tok, hidden]`` + ``topk_ids [n_tok, top_k]``; we reconstruct the
+    per-slot row set for each expert ``e`` and feed it through the shared
+    ``InputCovarianceAccumulator.update`` (the SAME accumulator the live
+    path uses; ``subᵀ@sub`` + token_count are accumulated internally).
+
+    Per-slot ``(topk_ids == e).nonzero()`` rows match the live contract and
+    are robust to a future sampler that repeats an expert within a row;
+    under ``torch.topk`` (distinct experts per token) this equals the
+    unique-token mask. CPU-resident ``sub`` (option A): the matmul runs on
+    CPU so it is safe under vLLM CUDA-graph capture.
+    """
+    if _state.cov_acc is None:
+        return
+    try:
+        layer_idx = int(kw["layer_idx"])
+        hidden = kw["hidden_states"]
+        topk_ids = kw["topk_ids"]
+    except KeyError:
+        return
+    hs = hidden.detach().reshape(-1, hidden.shape[-1]).to("cpu")  # [n_tok, hidden]
+    ids = topk_ids.detach().to("cpu")
+    if ids.dim() == 1:
+        ids = ids.unsqueeze(-1)  # -> [n_tok, top_k]
+    n_experts = _state.n_experts or (
+        int(ids.max().item()) + 1 if ids.numel() else 0
+    )
+    for e in range(n_experts):
+        # Per-(token,slot) rows: (topk_ids == e).nonzero() -> (token, slot);
+        # column 0 is the per-slot token index (mirrors torch.where(mask[e])).
+        slot_tok = (ids == e).nonzero(as_tuple=False)  # [n_assign, 2]
+        if slot_tok.numel() == 0:
+            continue
+        token_idx = slot_tok[:, 0]
+        sub = hs.index_select(0, token_idx)  # [n_assign, hidden] (CPU)
+        _state.cov_acc.update(layer_idx, e, "gate_proj", sub)
+
+
+def _expert_mid_handler(**kw: Any) -> None:
+    """``expert_mid`` hook -- down_proj input covariance per expert.
+
+    The live ``intermediate``/down_proj cb uses the SAME per-(token,slot)
+    axis as gate (both flow from ``torch.where(mask[e])`` -> ``token_idx``
+    in ``instrument_experts``); there is NO gate/down axis difference in the
+    live cov path. The vLLM ``expert_mid`` dispatch hands us ``intermediate
+    [n_tok, top_k, interm]`` + ``topk_ids [n_tok, top_k]``; we flatten to
+    ``[n_tok*top_k, interm]`` (naturally per-slot — the kernel runs one
+    down_proj matmul per (token, slot) pair) and select the per-slot rows
+    for each expert. CPU matmul (option A) for CUDA-graph safety.
+    """
+    if _state.cov_acc is None:
+        return
+    try:
+        layer_idx = int(kw["layer_idx"])
+        interm = kw["intermediate"]
+        topk_ids = kw["topk_ids"]
+    except KeyError:
+        return
+    interm_dim = interm.shape[-1]
+    flat = interm.detach().reshape(-1, interm_dim).to("cpu")  # [n_tok*top_k, interm]
+    flat_ids = topk_ids.detach().reshape(-1).to("cpu")  # [n_tok*top_k]
+    n_experts = _state.n_experts or (
+        int(flat_ids.max().item()) + 1 if flat_ids.numel() else 0
+    )
+    for e in range(n_experts):
+        rows = (flat_ids == e).nonzero(as_tuple=False).reshape(-1)
+        if rows.numel() == 0:
+            continue
+        sub = flat.index_select(0, rows)  # [n_e_slots, interm] (CPU)
+        _state.cov_acc.update(layer_idx, e, "down_proj", sub)
 
 
 def _finalize_batch_for_layer(layer_idx: int, n_experts: int) -> None:

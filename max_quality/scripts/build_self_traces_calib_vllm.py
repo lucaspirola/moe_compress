@@ -859,17 +859,26 @@ def main() -> int:
     # Plugin #12 REDO -- Optimization A profile-pass sidecar.
     p.add_argument("--capture-stage2-profile", action="store_true",
                    default=False,
-                   help="Capture Stage 2 REAM profile (gate logits + gated "
-                        "outputs + covariance + layer-input reservoir) and "
-                        "write a sidecar at <jsonl>/sidecars/stage2_profile.pt "
-                        "(schema v3). Requires the vLLM patch "
+                   help="Capture Stage 2 REAM profile (gate-logit Gram + gated "
+                        "outputs + gate_proj/down_proj covariance + layer-input "
+                        "reservoir) and write a sidecar at "
+                        "<jsonl>/sidecars/stage2_profile.pt "
+                        "(schema v4). Requires the vLLM patch "
                         "vllm.calibration_stage2_profile (canonical source: "
                         "moe_compress.calibration.stage2_profile_writer). "
                         "Auto-enables VLLM_CALIB_CAPTURE_STAGE2_PROFILE=1 + "
                         "VLLM_CALIB_CAPTURE_ROUTER=1 + "
                         "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
+                        "VLLM_CALIB_CAPTURE_EXPERT=1 (gate_proj cov) + "
+                        "VLLM_CALIB_CAPTURE_EXPERT_MID=1 (down_proj cov) + "
                         "VLLM_USE_FLASHINFER_MOE_FP16=0 BEFORE any vllm "
-                        "import. NOTE: layer-input reservoir is reserved "
+                        "import. DISK: the gate+down per-(layer,expert) cov "
+                        "adds ~91 GB at cov_storage_dtype=float16 for a "
+                        "256-expert / 40-layer / hidden=2048 / "
+                        "moe_intermediate=512 model (size it accordingly); "
+                        "this is the price of skipping the live Stage-2 cov "
+                        "forward on full-hit layers. NOTE: layer-input "
+                        "reservoir is reserved "
                         "for future use; current production sidecars omit "
                         "it pending a `layer_in` callback hook in the vLLM "
                         "patch. Until then, SC cost_alignment='output' will "
@@ -1200,11 +1209,19 @@ def main() -> int:
         os.environ["VLLM_CALIB_CAPTURE_STAGE2_PROFILE"] = "1"
         os.environ["VLLM_CALIB_CAPTURE_ROUTER"] = "1"
         os.environ["VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED"] = "1"
+        # Cov-capture gates: expert_in feeds gate_proj cov, expert_mid feeds
+        # down_proj cov (both mirror the live instrument_experts row set).
+        # expert_mid also needs _current_layer_idx, which is set whenever
+        # _CAPTURE_EXPERT_UNWEIGHTED or _CAPTURE_EXPERT_MID is on (satisfied).
+        os.environ["VLLM_CALIB_CAPTURE_EXPERT"] = "1"
+        os.environ["VLLM_CALIB_CAPTURE_EXPERT_MID"] = "1"
         os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
         log.info("--capture-stage2-profile: enabled "
                  "VLLM_CALIB_CAPTURE_STAGE2_PROFILE=1 + "
                  "VLLM_CALIB_CAPTURE_ROUTER=1 + "
                  "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED=1 + "
+                 "VLLM_CALIB_CAPTURE_EXPERT=1 + "
+                 "VLLM_CALIB_CAPTURE_EXPERT_MID=1 + "
                  "VLLM_USE_FLASHINFER_MOE_FP16=0 "
                  "(must precede vllm import)")
 

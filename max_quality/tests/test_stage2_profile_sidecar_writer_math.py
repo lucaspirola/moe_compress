@@ -410,3 +410,159 @@ def test_writer_sim_tensor_distinguishes_from_buggy_path(tmp_path):
             f"layer {lr}: writer sim_tensor coincidentally matches the "
             f"buggy mean-of-means path -- fixture lost discrimination power"
         )
+
+
+# ---------------------------------------------------------------------------
+# Cov-capture fidelity (PLAN_STAGE2_COV_CAPTURE §5). Drive the writer's
+# _expert_in_handler (gate_proj) + _expert_mid_handler (down_proj) directly
+# and compare against a reference built from the LIVE instrument_experts
+# per-(token,slot) row set (torch.where(mask[e]) -> token_idx).
+# ---------------------------------------------------------------------------
+def _live_row_token_idx(topk_ids: torch.Tensor, e: int) -> torch.Tensor:
+    """Reproduce the live instrument_experts row set for expert e.
+
+    mask[e] is [top_k, T] (one_hot then permute(2,1,0)); torch.where(mask[e])
+    yields (top_k_pos, token_idx) per assignment. Returns the per-slot
+    token_idx (the rows hidden_states[token_idx] / intermediate slots use).
+    """
+    n_experts = int(topk_ids.max().item()) + 1
+    mask = torch.nn.functional.one_hot(
+        topk_ids, num_classes=n_experts,
+    ).permute(2, 1, 0)  # [n_experts, top_k, T]
+    _top_k_pos, token_idx = torch.where(mask[e])
+    return token_idx
+
+
+def _realizable_topk(n_tok: int, top_k: int, n_experts: int, seed: int):
+    """A realizable topk_ids [n_tok, top_k] with DISTINCT experts per row."""
+    g = torch.Generator().manual_seed(seed)
+    logits = torch.randn((n_tok, n_experts), generator=g)
+    return torch.topk(logits, top_k, dim=-1).indices  # distinct per row
+
+
+def test_writer_cov_gate_and_down_match_instrument_experts(tmp_path):
+    """Writer gate_proj/down_proj cov + token_count == live instrument_experts.
+
+    Load-bearing fidelity guard (§5 item 3): for a realizable distinct-experts
+    topk_ids, the writer's _expert_in_handler / _expert_mid_handler per-expert
+    row multiset (and the resulting cov + token_count) must EQUAL the live
+    per-(token,slot) row set for BOTH gate_proj and down_proj.
+    """
+    n_tok, top_k, n_experts, hidden, interm = 64, 4, 6, 8, 5
+    topk_ids = _realizable_topk(n_tok, top_k, n_experts, seed=7)
+    torch.manual_seed(7)
+    hidden_states = torch.randn((n_tok, hidden), dtype=torch.float32)
+    # intermediate is [n_tok, top_k, interm] (one row per (token, slot)).
+    intermediate = torch.randn((n_tok, top_k, interm), dtype=torch.float32)
+
+    # Drive the writer handlers.
+    s2pw._reset_state_for_tests()
+    s2pw.setup(
+        llm=None, cov_storage_dtype="float32",
+        n_layers=1, n_experts=n_experts, top_k=top_k,
+        model_hash="cov-fidelity", layer_idx_to_rank={0: 0},
+    )
+    s2pw._expert_in_handler(layer_idx=0, hidden_states=hidden_states, topk_ids=topk_ids)
+    s2pw._expert_mid_handler(layer_idx=0, intermediate=intermediate, topk_ids=topk_ids)
+    s2pw._state.cov_acc.finalize_layer(0)
+    writer_cov = s2pw._state.cov_acc
+
+    # Reference: live per-(token,slot) row set for each expert.
+    ref = InputCovarianceAccumulator()
+    ref.set_storage_dtype(torch.float32)
+    flat_interm = intermediate.reshape(-1, interm)  # [n_tok*top_k, interm]
+    same_axis_rows: list[tuple[int, int]] = []
+    for e in range(n_experts):
+        token_idx = _live_row_token_idx(topk_ids, e)
+        if token_idx.numel() == 0:
+            continue
+        # gate_proj rows: hidden_states[token_idx].
+        ref.update(0, e, "gate_proj", hidden_states.index_select(0, token_idx))
+        # down_proj rows: the flattened (token, slot) intermediate rows for e.
+        flat_ids = topk_ids.reshape(-1)
+        rows = (flat_ids == e).nonzero(as_tuple=False).reshape(-1)
+        ref.update(0, e, "down_proj", flat_interm.index_select(0, rows))
+        # Same-axis guard: gate per-slot count == down per-slot count for e.
+        same_axis_rows.append((int(token_idx.numel()), int(rows.numel())))
+    ref.finalize_layer(0)
+
+    # Gate AND down cov + token_count match for every expert.
+    for e in range(n_experts):
+        for m, dim in (("gate_proj", hidden), ("down_proj", interm)):
+            wk = (0, e, m)
+            if wk not in ref.covariance:
+                assert wk not in writer_cov.covariance
+                continue
+            torch.testing.assert_close(
+                writer_cov.covariance[wk].to(torch.float32),
+                ref.covariance[wk].to(torch.float32),
+                rtol=0.0, atol=1e-4,
+            )
+            assert writer_cov.token_count[wk] == ref.token_count[wk]
+            assert writer_cov.covariance[wk].shape == (dim, dim)
+    # Same-axis: gate and down use the IDENTICAL per-slot row count per expert.
+    for gate_n, down_n in same_axis_rows:
+        assert gate_n == down_n
+
+
+def test_writer_cov_up_proj_aliased(tmp_path):
+    """An explicit up_proj update is ignored (aliasing inherited from cov_acc)."""
+    s2pw._reset_state_for_tests()
+    s2pw.setup(
+        llm=None, cov_storage_dtype="float32",
+        n_layers=1, n_experts=2, top_k=1,
+        model_hash="alias", layer_idx_to_rank={0: 0},
+    )
+    s2pw._state.cov_acc.update(0, 0, "up_proj", torch.randn((4, 8)))
+    s2pw._state.cov_acc.finalize_layer(0)
+    assert not any(k[2] == "up_proj" for k in s2pw._state.cov_acc.covariance)
+
+
+def test_writer_cov_reader_roundtrip_full_hit(tmp_path):
+    """dump -> load -> hydrate: full-hit cov for gate AND down survives."""
+    n_tok, top_k, n_experts, hidden, interm = 48, 2, 3, 6, 4
+    topk_ids = _realizable_topk(n_tok, top_k, n_experts, seed=9)
+    torch.manual_seed(9)
+    hidden_states = torch.randn((n_tok, hidden), dtype=torch.float32)
+    intermediate = torch.randn((n_tok, top_k, interm), dtype=torch.float32)
+
+    s2pw._reset_state_for_tests()
+    s2pw.setup(
+        llm=None, cov_storage_dtype="float16",
+        n_layers=1, n_experts=n_experts, top_k=top_k,
+        model_hash="cov-roundtrip", layer_idx_to_rank={0: 0},
+    )
+    # Router (so the layer is observed) + cov hooks + a token count.
+    s2pw._on_router_callback(0, torch.randn((n_tok, n_experts)), 0)
+    s2pw._expert_in_handler(layer_idx=0, hidden_states=hidden_states, topk_ids=topk_ids)
+    s2pw._expert_mid_handler(layer_idx=0, intermediate=intermediate, topk_ids=topk_ids)
+    s2pw.record_batch_token_count(0, n_tok)
+    s2pw._record_layer_input_reservoir(
+        0, torch.zeros((8, hidden), dtype=torch.float32),
+    )
+    jsonl = _jsonl(tmp_path)
+    s2pw.dump_stage2_profile(jsonl)
+
+    loaded = load_stage2_profile_v4(jsonl)
+    assert loaded is not None
+    # Both gate_proj and down_proj cov present in the payload.
+    assert any(k[2] == "gate_proj" for k in loaded.cov_acc)
+    assert any(k[2] == "down_proj" for k in loaded.cov_acc)
+
+    # Hydrate via the reader; full-hit must leave cov_acc populated.
+    cov_acc = InputCovarianceAccumulator()
+    cov_acc.set_storage_dtype(torch.float16)
+    provider = Stage2ProfileCacheProvider(
+        cov_acc=cov_acc, expected_cov_storage_dtype="float16",
+    )
+    run_ctx = PipelineContext()
+    provider.on_load(run_ctx, jsonl)
+    ctx = run_ctx.child()
+    ctx.set("_layer_rank", 0)
+    ctx.set("layer_ref", SimpleNamespace(layer_idx=0, num_routed_experts=n_experts))
+    ctx.set("ream_acc", ReamCostAccumulator())
+    ctx.set("layer_input_acc", None)
+    provider.on_layer_setup(ctx)
+    assert ctx.has("stage2_profile_full_hit")
+    assert any(k[0] == 0 and k[2] == "gate_proj" for k in cov_acc.covariance)
+    assert any(k[0] == 0 and k[2] == "down_proj" for k in cov_acc.covariance)
