@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from moe_compress.stage2.merging import _merge_experts_inplace
 from moe_compress.stage2.mergemoe import (
     _COND_THRESHOLD,
+    _COND_THRESHOLD_CUDA,
     _mergemoe_compute_merged_down,
     _swiglu_intermediate,
 )
@@ -353,13 +354,69 @@ def test_mergemoe_cond_threshold_fallback_warns_and_falls_back(caplog):
 
 
 def test_mergemoe_cond_threshold_constant_matches_plan():
-    """Pin: ``_COND_THRESHOLD`` matches the comprehensive-plan §581 spec.
+    """Pin: both cond(P) thresholds match their specs.
 
     The risk-mitigation table in SC_STAGE12_COMPREHENSIVE_PLAN.md §581
-    pins the per-cluster ``cond(P)`` threshold at ``1e8``. Hard-coding the
-    expected value here guards against a silent threshold change.
+    pins the per-cluster CPU (``gelsd``/SVD) ``cond(P)`` threshold at ``1e8``.
+    The CUDA (``gels``/QR) path uses the tighter ``1e6`` threshold pinned by
+    PLAN_STAGE2_MERGEMOE_GELS.md (D-mergemoe-cuda-driver) so ``gels`` never
+    sees the [1e6, 1e8) band where it diverges from ``gelsd``. Hard-coding
+    both values here guards against a silent threshold change.
     """
     assert _COND_THRESHOLD == 1e8
+    assert _COND_THRESHOLD_CUDA == 1e6
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA-driver parity test needs a GPU"
+)
+def test_mergemoe_cuda_gels_matches_cpu_gelsd_on_well_conditioned_P():
+    """D-mergemoe-cuda-driver: CUDA ``gels`` ≈ CPU ``gelsd`` merged-down.
+
+    On a well-conditioned ``P`` (the common, gated regime) the device-dependent
+    driver swap is numerically equivalent: CUDA uses ``gels`` (QR — the only
+    driver CUDA's lstsq supports) and CPU uses ``gelsd`` (SVD). Both solve the
+    same least-squares system (paper Eq. 6) and agree on full-rank ``P``. This
+    pins that the merged ``down_proj`` matches across the two paths within the
+    existing golden tolerance ``atol=1e-5, rtol=1e-4`` (measured ~2e-6 rel).
+
+    We construct ``P`` with ``cond(P) ≈ 6`` so the cluster passes the CUDA gate
+    (1e6) comfortably; the same inputs run on CPU pass the 1e8 gate. The two
+    merged-down tensors are compared on CPU.
+    """
+    torch.manual_seed(7)
+    d_hidden, d_int, T = 8, 4, 64
+    b = [0.6, 0.25, 0.15]
+    # Small-magnitude weights → realistic, well-conditioned SwiGLU intermediate.
+    W_G = [0.1 * torch.randn(d_int, d_hidden) for _ in range(3)]
+    W_U = [0.1 * torch.randn(d_int, d_hidden) for _ in range(3)]
+    W_D = [0.1 * torch.randn(d_hidden, d_int) for _ in range(3)]
+    X_hat = torch.randn(T, d_hidden)
+
+    # Sanity: P is comfortably well-conditioned (well below the 1e6 CUDA gate),
+    # so neither path takes the freq-weighted fallback.
+    W_G_merged = sum(b[j] * W_G[j] for j in range(3))
+    W_U_merged = sum(b[j] * W_U[j] for j in range(3))
+    P_cpu = F.silu(F.linear(X_hat, W_G_merged)) * F.linear(X_hat, W_U_merged)
+    cond_P = float(torch.linalg.cond(P_cpu).item())
+    assert cond_P < 100.0, f"test fixture not well-conditioned: cond(P)={cond_P:.3e}"
+
+    merged_cpu = _mergemoe_compute_merged_down(
+        member_gates=W_G, member_ups=W_U, member_downs=W_D,
+        weights=b, layer_inputs=X_hat, token_cap=T, seed=0,
+    )
+
+    dev = torch.device("cuda")
+    merged_cuda = _mergemoe_compute_merged_down(
+        member_gates=[w.to(dev) for w in W_G],
+        member_ups=[w.to(dev) for w in W_U],
+        member_downs=[w.to(dev) for w in W_D],
+        weights=b, layer_inputs=X_hat.to(dev), token_cap=T, seed=0,
+    )
+    assert merged_cuda.is_cuda
+    assert torch.allclose(
+        merged_cuda.cpu(), merged_cpu, atol=1e-5, rtol=1e-4
+    )
 
 
 def test_mergemoe_requires_at_least_two_members():

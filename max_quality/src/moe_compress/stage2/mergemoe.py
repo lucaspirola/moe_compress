@@ -60,7 +60,29 @@ Deviations from the paper
 ill-posed (rank-deficient calibration); we fall back to the
 freq-weighted merged down ``Σ_j b_j · W_D^j`` and log a warning. Not in
 the paper — added per ``tasks/SC_STAGE12_COMPREHENSIVE_PLAN.md`` §581
-risk-mitigation R1. Threshold ``1e8`` matches that spec.
+risk-mitigation R1. Threshold ``1e8`` matches that spec on the CPU
+(``gelsd``/SVD) path; see ``D-mergemoe-cuda-driver`` for the tighter
+CUDA-path threshold.
+
+**D-mergemoe-cuda-driver**: ``torch.linalg.lstsq`` on CUDA supports
+**only** ``driver="gels"`` (QR-based); ``driver="gelsd"`` (SVD-based)
+raises ``RuntimeError`` on GPU tensors. The driver is therefore selected
+by device: ``gels`` when ``P.is_cuda`` else ``gelsd``. The paper (Eq. 6)
+specifies ``T₁ = Q·P†`` — the least-squares / pseudoinverse solution —
+and does not mandate a LAPACK driver; ``gels`` and ``gelsd`` solve the
+same problem and agree on full-rank ``P``, differing only in the
+rank-deficient corner (SVD picks the minimum-norm solution, QR does not).
+To keep ``gels`` provably safe, the pre-solve conditioning gate uses a
+tighter threshold on the CUDA path: ``_COND_THRESHOLD_CUDA = 1e6`` (vs
+``_COND_THRESHOLD = 1e8`` on CPU), so any cluster with
+``cond(P) ∈ [1e6, 1e8)`` — the band where ``gels`` and ``gelsd`` can
+diverge — is routed to the ``_freq_weighted_down`` fallback **before**
+the solve. On well-conditioned ``P`` (the common, gated regime) CUDA
+``gels`` reproduces CPU ``gelsd`` merged-down to ~2e-6 relative. No
+post-solve residual/finiteness guard is added: the pre-solve gate is the
+guard. The CPU path keeps ``gelsd`` and the ``1e8`` gate **byte-identical**
+to legacy. Within paper fidelity per the sign-off on
+``tasks/PLAN_STAGE2_MERGEMOE_GELS.md`` §6.
 
 **D-mergemoe-perm-alignment**: the paper clusters by cosine-similarity
 on ``[W_U; W_G]`` and does not specify a per-cluster neuron alignment.
@@ -120,8 +142,16 @@ import torch.nn.functional as F
 log = logging.getLogger(__name__)
 
 
-# Conditioning threshold for the lstsq fallback — see D-mergemoe-cond-fallback.
+# Conditioning threshold for the lstsq fallback on the CPU (gelsd/SVD) path
+# — see D-mergemoe-cond-fallback.
 _COND_THRESHOLD = 1e8
+
+# Tighter conditioning threshold for the CUDA (gels/QR) path — see
+# D-mergemoe-cuda-driver. ``gels`` is only trustworthy on comfortably
+# full-rank ``P``; clusters with cond(P) ∈ [1e6, 1e8) are routed to the
+# freq-weighted fallback before the solve so gels never sees the band where
+# it diverges from gelsd.
+_COND_THRESHOLD_CUDA = 1e6
 
 
 def _swiglu_intermediate(
@@ -267,6 +297,13 @@ def _mergemoe_compute_merged_down(
     # P = σ(W_G_merged·X̂) ⊙ (W_U_merged·X̂)         shape (T, d_int)
     P = _swiglu_intermediate(W_G_merged, W_U_merged, X_hat)
 
+    # Device-dependent driver + conditioning threshold (D-mergemoe-cuda-driver):
+    # CUDA's lstsq supports only ``gels`` (QR), which is trustworthy only on
+    # comfortably full-rank P, so the CUDA gate is tighter (1e6); CPU keeps the
+    # SVD-robust ``gelsd`` driver and the legacy 1e8 gate (byte-identical).
+    lstsq_driver = "gels" if P.is_cuda else "gelsd"
+    cond_threshold = _COND_THRESHOLD_CUDA if P.is_cuda else _COND_THRESHOLD
+
     # Conditioning guard (D-mergemoe-cond-fallback). cond is well-defined on
     # the rectangular P (T ≥ d_int expected); for T < d_int we still compute
     # it (cond falls back to the largest/smallest singular ratio).
@@ -284,12 +321,12 @@ def _mergemoe_compute_merged_down(
         )
         return _freq_weighted_down(W_D, b).to(native_dtype)
 
-    if not (cond_P < _COND_THRESHOLD):  # NaN-safe: NaN fails the < test
+    if not (cond_P < cond_threshold):  # NaN-safe: NaN fails the < test
         log.warning(
             "_mergemoe_compute_merged_down: cond(P)=%.3e exceeds threshold "
             "%.0e (D-mergemoe-cond-fallback) — falling back to freq-weighted "
             "merged down for this cluster.",
-            cond_P, _COND_THRESHOLD,
+            cond_P, cond_threshold,
         )
         return _freq_weighted_down(W_D, b).to(native_dtype)
 
@@ -312,10 +349,14 @@ def _mergemoe_compute_merged_down(
     #              = Xᵀ,                shape (N·d_int, d_int).
     # So T1 = X.transpose(0, 1) is exactly paper Eq. 6's T₁.
     #
-    # driver="gelsd" — SVD-based, robust to rank-deficient P. We already
-    # short-circuit on cond > 1e8 above, but gelsd is the safer driver for
-    # the borderline-conditioned case below the threshold.
-    sol = torch.linalg.lstsq(P, Q_stack_T, driver="gelsd")
+    # Driver is device-dependent (D-mergemoe-cuda-driver): "gelsd" on CPU
+    # (SVD-based, robust to rank-deficient P, the safer driver for the
+    # borderline-conditioned case below the threshold), "gels" on CUDA
+    # (QR-based — the only driver CUDA's lstsq supports). The pre-solve
+    # conditioning gate above already short-circuits the ill-conditioned band
+    # (CUDA uses the tighter 1e6 threshold so gels only ever sees comfortably
+    # full-rank P); there is no post-solve guard — the gate is the guard.
+    sol = torch.linalg.lstsq(P, Q_stack_T, driver=lstsq_driver)
     X = sol.solution                       # (d_int, N·d_int)
     T1 = X.transpose(0, 1).contiguous()    # (N·d_int, d_int)
 
