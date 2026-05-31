@@ -508,6 +508,12 @@ class AaSvdFactorPlugin:
         A_cov = ctx.get("A_cov") if ctx.has("A_cov") else None
         C_acc = ctx.get("C_acc") if ctx.has("C_acc") else None
         ccov_spill_dir = ctx.get("ccov_spill_dir") if ctx.has("ccov_spill_dir") else None
+        # Tier-1 item 9: depth-1 B-cov prefetcher + ordered layer list, both
+        # published by the orchestrator on run_ctx. Optional — absent when the
+        # hook is driven outside the orchestrator (e.g. direct unit tests),
+        # in which case the load falls back to the serial path below.
+        bcov_prefetcher = ctx.get("bcov_prefetcher") if ctx.has("bcov_prefetcher") else None
+        all_moe_layers = ctx.get("moe_layers") if ctx.has("moe_layers") else None
 
         # ---- VERBATIM per-layer factoring loop body from the monolith run() --
         # When Swift-SVD+ gives per-expert ranks, allocate at the max rank
@@ -531,7 +537,23 @@ class AaSvdFactorPlugin:
         # point would mean _aa_svd silently falls back to plain SVD for
         # this whole layer's experts, ignoring the activation-aware
         # weighting; we'd ship a degraded model. Crash loud instead.
-        loaded = B_acc.load_layer_from_disk(ref.layer_idx, bcov_spill_dir)
+        #
+        # Tier-1 item 9: consume the prefetched read of THIS layer (if the
+        # prefetcher read it ahead while the previous layer factored), then
+        # kick off the background read of the NEXT layer's spill. The locked
+        # accumulate inside consume() is byte-identical to the serial loader.
+        if bcov_prefetcher is not None:
+            loaded = bcov_prefetcher.consume(ref.layer_idx)
+            if all_moe_layers is not None:
+                _idx = next(
+                    (j for j, r in enumerate(all_moe_layers)
+                     if r.layer_idx == ref.layer_idx),
+                    None,
+                )
+                if _idx is not None and _idx + 1 < len(all_moe_layers):
+                    bcov_prefetcher.prefetch(all_moe_layers[_idx + 1].layer_idx)
+        else:
+            loaded = B_acc.load_layer_from_disk(ref.layer_idx, bcov_spill_dir)
         if not loaded:
             raise RuntimeError(
                 f"Stage 3 factor: B-cov spill missing for layer {ref.layer_idx} "

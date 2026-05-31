@@ -1153,10 +1153,19 @@ class InputCovarianceAccumulator:
                         k,
                     )
 
-    def load_layer_from_disk(self, layer_idx: int, dir_path) -> bool:
+    def _read_layer_payload(self, layer_idx: int, dir_path):
+        """Pure read + validation of a per-layer spill file (NO shared-state
+        mutation, NO lock).
+
+        Returns the validated payload dict, or ``None`` if the spill file is
+        absent (resume case). Raises loudly on a corrupt/legacy file — the
+        same RuntimeError contract as the serial loader. Safe to call from a
+        background prefetch thread: it only reads an immutable on-disk file
+        (Pattern-O manifest-last spills are immutable once written).
+        """
         p = Path(dir_path) / f"layer_{layer_idx}.pt"
         if not p.exists():
-            return False
+            return None
         try:
             payload = torch.load(p, map_location="cpu", weights_only=True)
         except Exception as exc:
@@ -1178,13 +1187,21 @@ class InputCovarianceAccumulator:
                 f"Spill file {p} has format_version={fmt} (expected 1). "
                 "Regenerate by deleting the per-layer spill dir and re-running."
             )
-        # Validate all keys before acquiring the lock
+        # Validate all keys before any accumulate (no lock held here).
         for k in payload["covariance"]:
             if k[0] != layer_idx:
                 raise RuntimeError(
                     f"load_layer_from_disk: key {k!r} does not belong to layer {layer_idx}"
                 )
-        # Now safe to mutate under the lock
+        return payload
+
+    def _accumulate_payload(self, payload) -> None:
+        """Locked accumulate of a validated payload into ``covariance`` /
+        ``token_count``. Math is identical to the serial path and runs under
+        ``self._lock`` in caller (loop) order — Tier-1 item 9 hoists only the
+        ``torch.load`` (in :meth:`_read_layer_payload`) off the critical path,
+        never this accumulate.
+        """
         with self._lock:
             storage_dtype = self.storage_dtype  # capture under lock, consistent with finalize_layer discipline
             for k, disk_cov in payload["covariance"].items():
@@ -1197,6 +1214,43 @@ class InputCovarianceAccumulator:
                     ).to(storage_dtype)
             for k, n in payload.get("tokens", {}).items():
                 self.token_count[k] = self.token_count.get(k, 0) + n
+
+    def load_layer_from_disk(self, layer_idx: int, dir_path) -> bool:
+        """Serial load: read+validate then locked-accumulate one layer's spill.
+
+        Returns ``True`` on success, ``False`` if the spill file is absent
+        (resume case). Backward-compatible: existing callers keep this exact
+        contract. The prefetch fast-path (:meth:`prefetch_layer_from_disk` +
+        :meth:`load_layer_prefetched`) splits the same two steps so the read
+        can be hoisted to a background thread; the accumulate is byte-identical.
+        """
+        payload = self._read_layer_payload(layer_idx, dir_path)
+        if payload is None:
+            return False
+        self._accumulate_payload(payload)
+        return True
+
+    def prefetch_layer_from_disk(self, layer_idx: int, dir_path):
+        """Read+validate a layer's spill into a payload for later accumulate.
+
+        Pure read (no lock, no shared-state mutation) — intended to run on a
+        background thread to overlap the disk read of layer N+1 with the
+        factoring of layer N. Returns the validated payload, or ``None`` when
+        the spill file is absent. Raises loudly on corruption; the caller is
+        expected to surface that at consume time via :meth:`load_layer_prefetched`.
+        """
+        return self._read_layer_payload(layer_idx, dir_path)
+
+    def load_layer_prefetched(self, payload) -> bool:
+        """Accumulate a payload obtained from :meth:`prefetch_layer_from_disk`.
+
+        ``payload is None`` (absent spill) returns ``False`` — same semantics
+        as the serial loader's missing-file case. Otherwise runs the identical
+        locked-accumulate as :meth:`load_layer_from_disk`.
+        """
+        if payload is None:
+            return False
+        self._accumulate_payload(payload)
         return True
 
     def unload_layer(self, layer_idx: int) -> None:
@@ -1219,6 +1273,94 @@ class InputCovarianceAccumulator:
                 if t is not None:
                     return t.clone()
         return None
+
+
+class BcovLayerPrefetcher:
+    """1-deep background prefetcher for per-layer covariance spill files.
+
+    Tier-1 item 9: overlaps the ``torch.load`` of layer N+1's spill (a pure,
+    immutable on-disk read) with the factoring of layer N. The accumulate
+    itself stays serial and byte-identical — only the read is hoisted in
+    wall-clock time.
+
+    Usage (driven from the Stage-3 factor loop, depth bounded to 1):
+
+        pf = BcovLayerPrefetcher(B_acc, spill_dir)
+        try:
+            for i, ref in enumerate(moe_layers):
+                ok = pf.consume(ref.layer_idx)            # accumulate layer i
+                if i + 1 < len(moe_layers):
+                    pf.prefetch(moe_layers[i + 1].layer_idx)  # read i+1 in bg
+                ... factor layer i ...
+        finally:
+            pf.shutdown()
+
+    RAM: a depth-1 prefetch holds at most TWO layers' spill simultaneously
+    (the one being accumulated + the one read ahead). The executor and the
+    1-slot cache are released in :meth:`shutdown`, which MUST be called from a
+    ``finally`` so a factor-loop exception cannot leak the background thread.
+    A missing spill (resume case) prefetches as ``None`` and surfaces as a
+    ``False`` from :meth:`consume`; corruption raises loudly at consume time
+    (the read RuntimeError is surfaced from the future's ``.result()``).
+    """
+
+    def __init__(self, accumulator: "InputCovarianceAccumulator", dir_path):
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._acc = accumulator
+        self._dir_path = dir_path
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="bcov-prefetch",
+        )
+        # 1-slot cache: (layer_idx -> future yielding the payload | None).
+        self._pending_layer: int | None = None
+        self._pending_future = None
+
+    def prefetch(self, layer_idx: int) -> None:
+        """Submit a background read+validate of ``layer_idx`` (depth 1).
+
+        Idempotent for an already-pending layer; replaces any stale pending
+        future (its result would just be dropped — at depth 1 we only ever
+        prefetch the immediate next layer).
+        """
+        if self._pending_layer == layer_idx and self._pending_future is not None:
+            return
+        self._pending_layer = layer_idx
+        self._pending_future = self._executor.submit(
+            self._acc.prefetch_layer_from_disk, layer_idx, self._dir_path
+        )
+
+    def consume(self, layer_idx: int) -> bool:
+        """Accumulate ``layer_idx`` — from the prefetch cache if it matches,
+        else a synchronous read. Returns ``True`` on success, ``False`` if the
+        spill is absent (resume case). Re-raises any read error from the
+        prefetch future's ``.result()`` (loud-on-corrupt contract preserved).
+        """
+        if self._pending_layer == layer_idx and self._pending_future is not None:
+            fut = self._pending_future
+            self._pending_layer = None
+            self._pending_future = None
+            payload = fut.result()  # re-raises a corrupt-spill RuntimeError
+            return self._acc.load_layer_prefetched(payload)
+        # No matching prefetch (first layer, or out-of-order) — serial read.
+        return self._acc.load_layer_from_disk(layer_idx, self._dir_path)
+
+    def shutdown(self) -> None:
+        """Drain/cancel the pending prefetch and release the executor.
+
+        Best-effort: a pending future's exception is swallowed here (the loop
+        is already tearing down); the live consume path is the source of truth
+        for surfacing read errors.
+        """
+        fut = self._pending_future
+        self._pending_layer = None
+        self._pending_future = None
+        if fut is not None and not fut.cancel():
+            try:
+                fut.result()
+            except Exception:  # noqa: BLE001 - teardown, error already moot
+                pass
+        self._executor.shutdown(wait=True)
 
 
 # ---------------------------------------------------------------------------

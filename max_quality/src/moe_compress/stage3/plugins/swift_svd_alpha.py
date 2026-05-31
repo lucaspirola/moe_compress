@@ -690,7 +690,8 @@ def _swift_svd_plus_alpha_search(
     *,
     per_group_type: bool = True,
     A_cov: dict | None = None,
-) -> dict[str, float]:
+    return_svs: bool = False,
+):
     """Swift-SVD+ (2604.01609, Algorithm 2): select α per projection type.
 
     For each candidate α, compute the blending score for every expert within
@@ -709,6 +710,16 @@ def _swift_svd_plus_alpha_search(
     experts in the group wins.
 
     Returns {matrix_type: best_α} if per_group_type, else {"all": best_α}.
+
+    Tier-1 item 2 (opt-in, byte-safe): when ``return_svs=True`` the function
+    additionally returns the per-expert ``grouped_svs`` cache it built (the
+    activation-weighted ``svdvals(W @ L_A)`` keyed by ``[name][(layer, expert)]``)
+    as the second element of a ``(alpha_by_type, grouped_svs)`` tuple, so
+    ``_redistribute_ranks_swift_svd_plus`` can reuse it instead of recomputing
+    the identical per-expert eigh+svd. The DEFAULT (``return_svs=False``)
+    leaves the base return type UNCHANGED — still just ``alpha_by_type`` — so
+    the package re-export (``stage3_svd.py``), the name-pin test, and every
+    existing caller keep their current contract.
     """
     # S3-4 lazy import: _cov_lookup stays monolith-resident (S3-5 target);
     # a module-top import would deadlock the import cycle (see module docstring).
@@ -867,7 +878,7 @@ def _swift_svd_plus_alpha_search(
                     best_alpha = alpha
             best_alphas[name] = best_alpha
             log.info("  Swift-SVD+ %s: best α=%.1f (err=%.4e)", name, best_alpha, best_err)
-        return best_alphas
+        return (best_alphas, grouped_svs) if return_svs else best_alphas
     else:
         best_alpha = 0.5
         best_err = float("inf")
@@ -877,7 +888,8 @@ def _swift_svd_plus_alpha_search(
                 best_err = err
                 best_alpha = alpha
         log.info("  Swift-SVD+ global: best α=%.1f (err=%.4e)", best_alpha, best_err)
-        return {"all": best_alpha}
+        alpha_by_type = {"all": best_alpha}
+        return (alpha_by_type, grouped_svs) if return_svs else alpha_by_type
 
 
 def _redistribute_ranks_swift_svd_plus(
@@ -913,28 +925,43 @@ def _redistribute_ranks_swift_svd_plus(
         energies: list[float] = []
         epsilons: list[float] = []
         for e in range(gs.n_experts):
-            W = banks[name].get(e).detach().to(torch.float32)
-            # D8 fix: activation-weighted SVD when A_cov available.
-            A = _cov_lookup(A_cov, li, e, name) if A_cov else None
-            if A is not None:
-                A_f32 = A.to(torch.float32)
-                A_f32 = 0.5 * (A_f32 + A_f32.T)
-                eigvals_a, eigvecs_a = torch.linalg.eigh(A_f32)
-                keep_a = eigvals_a > eigvals_a.max() * 1e-6
-                if keep_a.any():
-                    L_A = eigvecs_a[:, keep_a] * eigvals_a[keep_a].clamp_min(1e-12).sqrt().unsqueeze(0)
-                    svs = torch.linalg.svdvals(W @ L_A)
+            # Tier-1 item 2: reuse the proxy's per-expert spectrum when the
+            # caller threaded the cache it built in _swift_svd_plus_alpha_search
+            # (select_alpha branches (i)/(iii) only — see select_alpha). The
+            # cached svs is byte-identical to the recompute below (same A,
+            # same eigh+threshold, same svdvals(W @ L_A)); a precondition test
+            # asserts torch.equal. When the cache is absent (branch (ii) +
+            # orchestrator α-resume) we recompute exactly as before.
+            cached_svs = (
+                grouped_svs_cache[name].get((li, e))
+                if grouped_svs_cache is not None and name in grouped_svs_cache
+                else None
+            )
+            if cached_svs is not None:
+                svs = cached_svs
+            else:
+                W = banks[name].get(e).detach().to(torch.float32)
+                # D8 fix: activation-weighted SVD when A_cov available.
+                A = _cov_lookup(A_cov, li, e, name) if A_cov else None
+                if A is not None:
+                    A_f32 = A.to(torch.float32)
+                    A_f32 = 0.5 * (A_f32 + A_f32.T)
+                    eigvals_a, eigvecs_a = torch.linalg.eigh(A_f32)
+                    keep_a = eigvals_a > eigvals_a.max() * 1e-6
+                    if keep_a.any():
+                        L_A = eigvecs_a[:, keep_a] * eigvals_a[keep_a].clamp_min(1e-12).sqrt().unsqueeze(0)
+                        svs = torch.linalg.svdvals(W @ L_A)
+                    else:
+                        _warn_raw_svd_fallback_once(
+                            "A_cov is rank-zero / empty after eigh thresholding "
+                            "(in _redistribute_ranks_swift_svd_plus)"
+                        )
+                        svs = torch.linalg.svdvals(W)
                 else:
                     _warn_raw_svd_fallback_once(
-                        "A_cov is rank-zero / empty after eigh thresholding "
-                        "(in _redistribute_ranks_swift_svd_plus)"
+                        "A_cov=None passed to _redistribute_ranks_swift_svd_plus"
                     )
                     svs = torch.linalg.svdvals(W)
-            else:
-                _warn_raw_svd_fallback_once(
-                    "A_cov=None passed to _redistribute_ranks_swift_svd_plus"
-                )
-                svs = torch.linalg.svdvals(W)
             s2 = svs * svs
             total_e = float(s2.sum().clamp_min(1e-30).item())
             energies.append(total_e)
@@ -1086,6 +1113,14 @@ class SwiftSvdAlphaPlugin:
         validation_samples = int(svd_plus_cfg.get("validation_samples", 0))
 
         if alpha_grid and len(alpha_grid) > 1:
+            # Tier-1 item 2: thread the proxy's grouped_svs into the
+            # redistribute ONLY on the branches where the proxy actually ran
+            # (i)/(iii). Branch (ii) does not run the proxy, so there is
+            # nothing to reuse and the cache stays None (redistribute correctly
+            # recomputes). `grouped_svs_cache if cache_was_built else None` —
+            # never an unconditional pass.
+            grouped_svs_cache = None
+            cache_was_built = False
             if validation_samples > 0:
                 # Paper-exact: global α via WikiText-2 PPL validation (§3.2.2).
                 best_global_alpha = _swift_svd_plus_alpha_search_validation(
@@ -1105,21 +1140,26 @@ class SwiftSvdAlphaPlugin:
                     device=ctx.get("device"),
                 )
                 if per_group_type:
-                    alpha_by_type = _swift_svd_plus_alpha_search(
+                    # Branch (i): proxy runs → grouped_svs is built and reused.
+                    alpha_by_type, grouped_svs_cache = _swift_svd_plus_alpha_search(
                         moe_layers, group_stats, ranks, alpha_grid,
-                        per_group_type=True, A_cov=A_cov,
+                        per_group_type=True, A_cov=A_cov, return_svs=True,
                     )
+                    cache_was_built = True
                 else:
+                    # Branch (ii): proxy NOT run → no grouped_svs to thread.
                     alpha_by_type = {"all": best_global_alpha}
             else:
-                # Fallback: spectral proxy only (no forward passes).
-                alpha_by_type = _swift_svd_plus_alpha_search(
+                # Branch (iii): spectral proxy only (no forward passes) → built.
+                alpha_by_type, grouped_svs_cache = _swift_svd_plus_alpha_search(
                     moe_layers, group_stats, ranks, alpha_grid,
-                    per_group_type=per_group_type, A_cov=A_cov,
+                    per_group_type=per_group_type, A_cov=A_cov, return_svs=True,
                 )
+                cache_was_built = True
             per_expert_ranks = _redistribute_ranks_swift_svd_plus(
                 moe_layers, group_stats, ranks, alpha_by_type,
-                grouped_svs_cache=None, A_cov=A_cov,
+                grouped_svs_cache=grouped_svs_cache if cache_was_built else None,
+                A_cov=A_cov,
             )
         else:
             # alpha_grid length ≤ 1 — uniform path: every expert keeps the

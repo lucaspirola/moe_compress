@@ -541,10 +541,15 @@ def run(
             "n_matrices": len(originals),
             "artifact": "stage3_original_weights",
         },
-        # 50 GB SHA-256 on resume would add minutes — size + schema is
-        # the validation budget; sha256 here is computed once at write
-        # time and stored for opt-in deep validation by operators.
-        compute_sha256=True,
+        # Tier-1 item 10: skip the ~50 GB SHA-256 on the originals payload.
+        # Streaming the full _stage3_original_weights.pt (~50 GB on a 30B
+        # base) through SHA-256 is a second full read on the critical path
+        # purely to populate a forensics field. The sole consumer (Stage 4
+        # eora_inputs.read_and_validate_manifest) passes no require_sha256,
+        # so it defaults to False and validates on size + schema_version
+        # only — a sha256=None manifest passes cleanly. In-repo precedent:
+        # wanda_intra_expert_score.py ships compute_sha256=False likewise.
+        compute_sha256=False,
     )
     log.info("Saved Stage 3 original weights snapshot (%d matrices) -> %s "
              "(manifest -> %s)",
@@ -650,7 +655,24 @@ def run(
     # B_acc / C_acc / B_cov_dtype / rank_map / device / originals through
     # the parent chain. rank_map is the single shared dict set on run_ctx --
     # every child mutates it in place (HAZARD H1).
-    loop_over(moe_layers, plugins, ("factor_layer",), run_ctx, item_key="layer_ref")
+    #
+    # Tier-1 item 9 (B-cov layer prefetch): a depth-1 BcovLayerPrefetcher is
+    # published on run_ctx so factor_layer can consume the read-ahead spill of
+    # the current layer and prefetch the next one's read on a background
+    # thread (overlapping the ~5 GB disk read of layer N+1 with the factoring
+    # of layer N). The accumulate stays serial/byte-identical (item 9 hoists
+    # only torch.load). The prefetcher is drained in a finally so a factor
+    # exception cannot leak the executor; the C-cov twin load stays serial
+    # (out of item-9 scope). The ordered moe_layers list is also published so
+    # factor_layer can resolve "the next layer" without re-deriving it.
+    from moe_compress.utils.activation_hooks import BcovLayerPrefetcher
+    _bcov_prefetcher = BcovLayerPrefetcher(B_acc, bcov_spill_dir)
+    run_ctx.set("bcov_prefetcher", _bcov_prefetcher)
+    try:
+        loop_over(moe_layers, plugins, ("factor_layer",), run_ctx, item_key="layer_ref")
+    finally:
+        _bcov_prefetcher.shutdown()
+        run_ctx.drop("bcov_prefetcher")
 
     # 4. Phase C.5 -- block-level joint refinement (paper 2604.02119
     # section 3.3). Replaces the legacy per-matrix L-BFGS refine; trains the

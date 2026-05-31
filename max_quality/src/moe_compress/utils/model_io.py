@@ -1212,22 +1212,49 @@ def _save_state_dict_sharded(
     # Second pass: write each shard. Use the HF-convention filename so the
     # existing streaming loader picks them up via its `model-*.safetensors`
     # glob without changes.
+    #
+    # Tier-1 item 8 (I/O overlap): the CPU-clone (GPU->CPU copy) of shard
+    # N+1 is produced on the main thread while the disk write of shard N is
+    # in flight on a single-worker pool — mirror of the
+    # covariance_collection.py "bcov-spill" executor pattern. Shard
+    # *contents* and the index JSON are byte-identical; only the timing of
+    # writes vs. the next clone overlaps. weight_map / total_bytes
+    # bookkeeping stays on the main thread in deterministic shard order, and
+    # the index is written only AFTER the pool is fully drained.
+    from concurrent.futures import ThreadPoolExecutor
     weight_map: dict[str, str] = {}
     total_bytes = 0
-    for i, shard in enumerate(shards):
-        shard_name = f"model-{i + 1:05d}-of-{n_shards:05d}.safetensors"
-        shard_path = out_path / shard_name
-        # safetensors requires contiguous tensors on CPU. Detach + clone to
-        # CPU avoids tying memory to the live GPU model during write.
-        cpu_shard = {k: v.detach().cpu().contiguous() for k, v in shard.items()}
-        save_file(cpu_shard, str(shard_path))
-        del cpu_shard
-        for k in shard:
-            weight_map[k] = shard_name
-        shard_bytes = sum(t.element_size() * t.numel() for t in shard.values())
-        total_bytes += shard_bytes
-        log.info("  wrote shard %d/%d (%s, %.2f GB)",
-                 i + 1, n_shards, shard_name, shard_bytes / (1024**3))
+    save_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="shard-save",
+    )
+    save_futures: list = []
+    try:
+        for i, shard in enumerate(shards):
+            shard_name = f"model-{i + 1:05d}-of-{n_shards:05d}.safetensors"
+            shard_path = out_path / shard_name
+            # safetensors requires contiguous tensors on CPU. Detach + clone
+            # to CPU avoids tying memory to the live GPU model during write.
+            cpu_shard = {k: v.detach().cpu().contiguous() for k, v in shard.items()}
+            # Bound in-flight writes to <=1 so peak CPU RAM stays <=2 shards
+            # (the in-flight one + the one just cloned). Surface any prior
+            # write failure before submitting more work.
+            for f in save_futures:
+                f.result()
+            save_futures.clear()
+            save_futures.append(
+                save_executor.submit(save_file, cpu_shard, str(shard_path))
+            )
+            for k in shard:
+                weight_map[k] = shard_name
+            shard_bytes = sum(t.element_size() * t.numel() for t in shard.values())
+            total_bytes += shard_bytes
+            log.info("  wrote shard %d/%d (%s, %.2f GB)",
+                     i + 1, n_shards, shard_name, shard_bytes / (1024**3))
+        # Drain remaining writes before the index — re-raises on any error.
+        for f in save_futures:
+            f.result()
+    finally:
+        save_executor.shutdown(wait=True)
 
     index = {
         "metadata": {"total_size": total_bytes},

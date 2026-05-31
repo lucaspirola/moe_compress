@@ -32,6 +32,7 @@ First-run seeding workflow
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 
@@ -183,5 +184,126 @@ def test_stage3_rank_map_byte_identical(tiny_model, patched_stage3, stage3_case,
         pytest.fail(
             "Stage 3 golden snapshot drift detected:\n"
             f"  rank_map.{stage3_case}.json: produced={produced}  golden={golden}\n"
+            "If intentional, re-run with MOE_REGEN_GOLDEN=1 and commit the new bytes."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Additive α-path golden variant (Tier-1 items 2/3 end-to-end coverage).
+#
+# The pinned golden above uses ``alpha_grid=[0.5]`` (length 1) → the uniform
+# path, which never enters ``_swift_svd_plus_alpha_search`` /
+# ``_redistribute_ranks_swift_svd_plus`` / the ``grouped_svs`` cache (item 2's
+# target). This ADDITIVE variant flips ``alpha_grid=[0.0, 0.5, 1.0]`` with
+# ``validation_samples=0`` so ``select_alpha`` takes the offline spectral-proxy
+# branch (iii): the proxy runs with ``return_svs=True`` and threads its
+# ``grouped_svs`` cache into the redistribute. No model forward / network — the
+# WikiText-2 PPL grid (validation_samples>0) is intentionally NOT exercised.
+#
+# It pins a SEPARATE golden file (``rank_map.alpha.{case}.json``); the existing
+# pinned goldens are left immutable.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(params=["fp32", "bf16"])
+def patched_stage3_alpha(request, monkeypatch, tiny_config, tiny_config_bf16):
+    """Same patching as ``patched_stage3`` but with an α-grid > 1 + offline
+    spectral-proxy (``validation_samples=0``) so the α redistribution + the
+    ``grouped_svs`` cache path actually run."""
+    base = tiny_config_bf16 if request.param == "bf16" else tiny_config
+    cfg = copy.deepcopy(base)
+    sp = cfg["stage3_svd"]["swift_svd_plus"]
+    sp["alpha_grid"] = [0.0, 0.5, 1.0]
+    sp["validation_samples"] = 0  # offline: spectral-proxy branch (iii)
+    sp["per_group_type"] = True
+
+    from moe_compress.utils import calibration as cal_mod
+
+    def _fake_build(tokenizer, spec, cache_dir=None):
+        torch.manual_seed(spec.seed)
+        return torch.randint(0, 32, (spec.num_sequences, spec.sequence_length),
+                             dtype=torch.long)
+
+    def _fake_slice(tokenizer, spec, num_samples, cache_dir=None):
+        torch.manual_seed(spec.seed + 1)
+        return torch.randint(0, 32, (num_samples, spec.sequence_length),
+                             dtype=torch.long)
+
+    monkeypatch.setattr(cal_mod, "build_calibration_tensor", _fake_build)
+    monkeypatch.setattr(cal_mod, "build_super_expert_slice", _fake_slice)
+    monkeypatch.setattr(stage2_reap_ream, "build_calibration_tensor", _fake_build)
+    monkeypatch.setattr(stage3_svd, "build_calibration_tensor", _fake_build)
+
+    from moe_compress.utils import model_io as mio
+    monkeypatch.setattr(mio, "save_compressed_checkpoint", _noop_save)
+    monkeypatch.setattr(stage2_reap_ream, "save_compressed_checkpoint", _noop_save)
+    monkeypatch.setattr(stage3_svd, "save_compressed_checkpoint", _noop_save)
+
+    return cfg
+
+
+@pytest.fixture
+def stage3_alpha_case(request):
+    """Case label (``"fp32"`` / ``"bf16"``) for ``patched_stage3_alpha``."""
+    return request.node.callspec.params["patched_stage3_alpha"]
+
+
+@pytest.mark.xfail(
+    reason=(
+        "PRE-EXISTING (origin/main) defect, NOT a Tier-1 regression: the "
+        "non-uniform per-expert factor path crashes in "
+        "FactoredExperts.set_factors with 'U.shape=(d_out, k_e) expected "
+        "(d_out, slot)'. aa_svd_factor.factor_layer allocates each matrix slot "
+        "at the per-LAYER MAX per-expert rank (ranks_layer = max_e "
+        "per_expert_ranks[...]), but then factors+set_factors each expert at "
+        "its OWN (smaller) rank k_e WITHOUT zero-padding U_k/V_k to the slot "
+        "width — contradicting the factor_layer comment 'Experts with lower "
+        "rank will be zero-padded'. Any alpha_grid length>1 produces "
+        "non-uniform ranks and trips this. Confirmed reproducible on clean "
+        "origin/main (git stash). Out of Tier-1 scope (item 9 is B-cov "
+        "prefetch only; this is the factor-shape path) — file a Tier-2 / "
+        "re-bless ticket to zero-pad in factor_layer, then this xfail flips to "
+        "a real bless via MOE_REGEN_GOLDEN=1. The item-2 grouped_svs cache "
+        "path it would exercise is independently proven byte-safe by "
+        "tests/test_stage3_tier1.py::test_grouped_svs_cache_equals_recompute."
+    ),
+    strict=False,
+    raises=ValueError,
+)
+def test_stage3_rank_map_alpha_variant_byte_identical(
+    tiny_model, patched_stage3_alpha, stage3_alpha_case, tmp_path
+):
+    decomp = _run_stages_012(tiny_model, patched_stage3_alpha, tmp_path)
+    stage3_svd.run(
+        tiny_model, _TinyTokenizer(), patched_stage3_alpha, tmp_path, decomp,
+        device=None,
+    )
+
+    produced = tmp_path / "stage3_svd" / "rank_map.json"
+    assert produced.exists(), f"Stage 3 did not produce rank_map.json at {produced}"
+
+    golden = (
+        Path(__file__).resolve().parent
+        / "golden" / "stage3" / f"rank_map.alpha.{stage3_alpha_case}.json"
+    )
+
+    if REGEN:
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_bytes(produced.read_bytes())
+        pytest.skip("Regenerated α-variant goldens — inspect `git diff` then commit.")
+
+    if not golden.exists():
+        pytest.fail(
+            f"α-variant golden snapshot missing: {golden}\n"
+            f"Seed once with:\n"
+            f"  MOE_REGEN_GOLDEN=1 pytest max_quality/tests/test_stage3_golden_snapshot.py\n"
+            f"then `git diff` and commit the resulting JSON files."
+        )
+
+    if produced.read_bytes() != golden.read_bytes():
+        pytest.fail(
+            "Stage 3 α-variant golden snapshot drift detected:\n"
+            f"  rank_map.alpha.{stage3_alpha_case}.json: produced={produced}  "
+            f"golden={golden}\n"
             "If intentional, re-run with MOE_REGEN_GOLDEN=1 and commit the new bytes."
         )
