@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..c0de100
 --- /dev/null
 +++ b/vllm/calibration_stage2_profile.py
-@@ -0,0 +1,796 @@
+@@ -0,0 +1,806 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Stage 2 profile-pass sidecar capture (Plugin #12 REDO -- Optimization A).
@@ -617,8 +617,18 @@ index 0000000..c0de100
 +        },
 +    }
 +    path.parent.mkdir(parents=True, exist_ok=True)
-+    torch.save(state_payload, tmp)
++    with open(tmp, "wb") as f:
++        torch.save(state_payload, f)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, path)
++    _dir_fd = os.open(os.path.dirname(str(path)) or ".", os.O_RDONLY)
++    try:
++        os.fsync(_dir_fd)
++    except OSError:
++        pass
++    finally:
++        os.close(_dir_fd)
 +
 +
 +def load_stage2_profile_checkpoint(path: str | Path) -> int:
