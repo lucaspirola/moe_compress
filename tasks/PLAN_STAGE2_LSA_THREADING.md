@@ -21,7 +21,7 @@ Measured (agent's experiments, recorded in the workstream brief):
 |------|------|--------------------|-----------|
 | 1 | merge-time Hungarian (`merging.py` → `permutation_align.py`) | ~12.5× @16 thr | ALL configs (incl. SC, 30pct) |
 | 2 | post-cost residual loop (`ream_cost_post.py`) | 6.4× @8 thr, ×(1+em_rounds) | `cost_alignment="post"` |
-| 3 | output-space cost Hungarian (`output_space_cost.py`) | (embedded LSA) | SC (`cost_alignment="output"`) |
+| 3 | output-space cost Hungarian (`output_space_cost.py`) | **UNMEASURED — gated on A/B, may be ≤1×** | SC (`cost_alignment="output"`) |
 | 4 | `eigh` in `compute_a_sqrt("full")` (`cov_sqrt.py`) | 9.3× @16 thr | `cost_whitening="full"` |
 
 **Therefore the scipy floor bump (item K) is a HARD PREREQUISITE.** Threading must be
@@ -48,15 +48,18 @@ floor `numpy>=1.26.0` (both files) is compatible; **no numpy change needed**. (s
 the minimal floor that releases the GIL in LSAP, so pin the floor at exactly 1.12.0.)
 
 ### "Verify the DEPLOYED IMAGE actually installs ≥1.12, not just the pin"
-The pin is necessary but **not sufficient**:
+The pin is necessary but **not sufficient**. This is enforced as a **HARD merge-gate
+(G4 in §4)** with recorded command output — NOT prose. Summary of why each path needs it:
 - **Docker path** (`docker/Dockerfile:55`): `pip install -r requirements.txt -c torch-constraint.txt`.
-  The `torch-constraint.txt` constrains torch only — it does not cap scipy. Verify post-build:
-  `docker run <image> python -c "import scipy; print(scipy.__version__)"` ⇒ must print ≥1.12.
-- **HF Jobs path**: UV resolves the PEP 723 block. Verify in the job log that the resolved
-  lockline shows `scipy==1.12.x` (or higher), not 1.11.
+  The `torch-constraint.txt` constrains torch only — it does not cap scipy. G4 runs a
+  `docker run … assert scipy.__version__>='1.12'` and records the printed version.
+- **HF Jobs path**: UV resolves the PEP 723 block. G4 records the resolved lockline showing
+  `scipy==1.12.x` (or higher), not 1.11, for `hf_jobs/entrypoint_ablations.py`.
 - **Runtime self-check (belt-and-suspenders, see §3):** the thread-pool helper reads
   `scipy.__version__` at import and **disables threading on <1.12**, logging a one-shot
-  WARNING. So even a stale image is correct (it just runs serial), never wrong.
+  WARNING. So even a stale image is correct (it just runs serial), never wrong. **But this
+  safety net silently no-ops the wall-clock goal if the image stays at 1.11.x** — which is
+  exactly why G4 is mandatory before claiming the speedup.
 
 ---
 
@@ -97,7 +100,13 @@ inputs* and scatter their outputs by precomputed index.
   today merging.py only *reads* the cache, it does not put. So Phase A does NOT put;
   it just hands perms to Phase B. **No cache write in item 1** ⇒ no cache-safety concern.)
 
-### Item 2 — post-cost residual loop (`stage2/plugins/ream_cost_post.py:222-314`)
+### Item 2 — post-cost residual loop (`stage2/plugins/ream_cost_post.py` ~:223-314)
+- **N1:** the `for ci in range(n_nc):` loop body lives **inside** the `with torch.no_grad():`
+  block opened at ~:222, spanning ~:223-314 (the `out[ci, cj] = float(residual)` write is the
+  loop tail). When threading the outer `ci` loop, the `torch.no_grad()` context must be
+  entered **on each worker thread** (it is thread-local in PyTorch) — or the whole threaded
+  region wrapped so every worker runs under no_grad — to preserve the `.numpy()`-on-leaf
+  behavior the serial path relies on.
 - **Loop:** `for ci in range(n_nc):` (outer, over non-centroid rows) × `for cj in top_cj`
   (inner, K candidate centroids). Body: cache lookup → `_permutation_align_to_centroid`
   (LSA) → `_aligned_whitened_residual` (which itself may trigger item-4 `eigh` via
@@ -129,14 +138,36 @@ inputs* and scatter their outputs by precomputed index.
   - distinct `m_id` per row, disjoint `out[ci, cj]` writes.
   - `perm_cache.put((li, centroid_id, child_id), perm, residual=None)` — disjoint keys
     by the same argument as item 2 (row owns child_id=m_id).
-- **Subtlety — GPU concurrency:** the worker bodies launch GPU SwiGLU forwards. CUDA is
-  thread-safe but kernels on the default stream serialize; the *parallelism win here is
-  the CPU-side LSA overlapping with GPU work*, not GPU parallelism. The LSA releases the
-  GIL (scipy≥1.12) so while one worker's GPU forward runs, another worker's CPU Hungarian
-  proceeds. This is byte-identical: each forward is independent, results scattered by
-  index. **Worker `torch.set_num_threads(1)` does NOT throttle CUDA** (it caps CPU intra-op
-  threads only) — the GPU forwards keep full device throughput.
-- **Thread the outer `ci` loop**, same as item 2.
+- **Subtlety — GPU concurrency (why item 3 is NOT assumed to win):** the worker bodies
+  launch GPU SwiGLU forwards. CUDA is thread-safe but kernels on the **default stream
+  serialize on the device**, so N worker threads do NOT get N× GPU throughput — they queue.
+  The *only* plausible win is the CPU-side LSA (GIL-released, scipy≥1.12) overlapping with
+  GPU work. But two effects can make threading **net-negative** here:
+  1. **Default-stream serialization:** the `_swiglu_forward` launches from N threads still
+     execute one-at-a-time on the device; the dominant cost is GPU, not the overlap-able CPU
+     LSA, so the overlap may recover little.
+  2. **H2D contention:** each worker does per-pair `.to(device)` host→device copies of the
+     gate/up/down weights; N concurrent H2D copies contend on the same PCIe/copy engine.
+  - **Unlike items 1/2/4, item 3 has NO measured speedup** (the §0 table multiplier is
+    blank). Threading it on a guess risks a regression on the SC config — the exact config
+    that triggers this path.
+- **DECISION (M1): item-3 threading is GATED on a measured A/B.** Before threading item 3,
+  the implementer **MUST** measure serial-vs-threaded `_output_space_cost` on the real
+  **SC config** (`cost_alignment="output"`), one real layer, recording wall-clock both
+  ways. Then:
+  - **If the A/B shows a real gain** (threaded < serial by a margin beyond noise): thread
+    the outer `ci` loop exactly as item 2 (collect-then-merge, §3). Byte-identical either
+    way (the parity test §4 still gates correctness).
+  - **If no gain (or a regression):** ship item 3 **SERIAL** — leave `_output_space_cost`'s
+    `ci` loop unthreaded. This is **byte-identical** to the threaded path (same scatter-by-
+    index math), so shipping serial costs nothing in correctness and avoids a guessed
+    regression. **Do NOT thread item 3 unmeasured.**
+  - Items 1, 2, 4 are **unaffected** by this gate — their multipliers are measured; thread
+    them as planned.
+- **If threaded (A/B-positive only):** thread the outer `ci` loop, same mechanics as item 2.
+  **Worker `torch.set_num_threads(1)` does NOT throttle CUDA** (it caps CPU intra-op threads
+  only) — the GPU forwards keep full device throughput; each forward is independent, results
+  scattered by index.
 
 ### Item 4 — `eigh` in `compute_a_sqrt("full")` (`utils/cov_sqrt.py:140-146`)
 - **Where the calls originate:** `ream_cost_post._get_a_sqrt` (`ream_cost_post.py:178`)
@@ -180,31 +211,45 @@ def lsa_threads_enabled() -> bool:
     """True iff scipy>=1.12 (LSA releases the GIL). Cached one-shot. Logs a
     one-time WARNING when disabled so a stale image is visibly serial, not wrong."""
 
-def parallel_map(fn, items, *, max_workers=None):
+def parallel_map(fn, items, *, max_workers=None, enabled=None):
     """ThreadPool map preserving input order in the returned list. Falls back
-    to a serial list-comprehension when lsa_threads_enabled() is False or
-    len(items) <= 1. Each worker sets torch.set_num_threads(_INNER) on entry."""
+    to a serial list-comprehension when threading is disabled or len(items) <= 1.
+
+    Threading is enabled iff ``enabled`` (when not None) else
+    ``lsa_threads_enabled()``. The explicit ``enabled`` override lets the parity
+    test (§4) run BOTH the serial and threaded branches on any host scipy WITHOUT
+    monkeypatching scipy (repo policy: no monkeypatch).
+
+    BLAS throttle is applied ONCE on the calling (main) thread: save
+    ``torch.get_num_threads()``, set ``torch.set_num_threads(_INNER)`` with
+    ``_INNER = 1``, run the pool, and restore the original count in a ``finally``.
+    Workers do NOT touch ``set_num_threads`` (it is process-global, not
+    thread-local)."""
 ```
 
-- **Worker count default:** `min(8, os.cpu_count())`. The brief's measurement: the
+- **Worker count default:** `min(8, os.cpu_count() or 1)` — **L1:** `os.cpu_count()` can
+  return `None` in cgroup/container contexts (no detectable CPU affinity), and `min(8, None)`
+  raises `TypeError`; the `or 1` floor makes the helper degrade to serial instead of crashing.
+  The brief's measurement: the
   16-thread plateau is **intra-op BLAS oversubscription**, not LSA saturation. 8 outer
   workers × throttled inner BLAS is the sweet spot for the BLAS-heavy bodies (items 2/3/4
   do cdist + Frobenius + eigh + SwiGLU). A config knob
   `stage2_reap_ream.lsa_threads` (default 8, 0/1 ⇒ serial) lets the SC sweep tune it
   without code change; **the knob must NOT appear in any golden-snapshot key** (it is a
   pure perf knob — confirm it is excluded from the manifest, see §4).
-- **`torch.set_num_threads(1)` inside workers:** each worker calls
-  `torch.set_num_threads(_INNER)` with `_INNER=1` (or 2) on entry. This prevents the 8
-  Python threads from each spawning 16 BLAS threads (8×16=128 ⇒ thrash). **Caveat to
-  verify:** `torch.set_num_threads` is **process-global**, not thread-local. Setting it
-  from worker threads mutates global state racily and bleeds into the main thread after
-  the pool exits. **Correct pattern:** set `torch.set_num_threads(_INNER)` ONCE on the
-  main thread before submitting, wrapped in a `try/finally` that **restores the original
-  count after the pool joins**. Do NOT set it per-worker. The reviewer must confirm this
-  — a per-worker `set_num_threads` is a latent global-state bug.
-  - Alternative if 1-2 global threads starve the serial Phase-B accumulation: use the
-    `threadpoolctl` library (already a transitive dep via scikit/scipy? — VERIFY; if not
-    present, do NOT add a dep, use the global save/restore pattern).
+- **Intra-op BLAS throttle — `_INNER = 1` (L2):** pin `_INNER = 1` (8 outer workers × 1
+  inner BLAS thread). This avoids the 8×16 = 128-thread oversubscription that the brief
+  measured as the 16-thread plateau. `_INNER` is **byte-irrelevant** — the number of intra-op
+  BLAS threads does not change the numerical result for a fixed BLAS build (deterministic
+  per build), only the timing — so fixing it at 1 has zero correctness cost. **Drop the
+  `threadpoolctl` alternative** (it would add an unneeded dependency; the global
+  save/restore pattern below is sufficient).
+- **`torch.set_num_threads` is process-global, not thread-local.** Setting it from worker
+  threads mutates global state racily and bleeds into the main thread after the pool exits.
+  **Correct pattern:** set `torch.set_num_threads(_INNER)` ONCE on the **main thread** before
+  submitting, wrapped in a `try/finally` that **restores the original count after the pool
+  joins**. Do NOT set it per-worker. The reviewer must confirm this — a per-worker
+  `set_num_threads` is a latent global-state bug.
 
 ### D2 — perm_cache thread-safety: LOCK vs collect-then-merge
 
@@ -253,6 +298,12 @@ mutation ⇒ no lock needed. Confirm the pre-warm set is a superset of what rows
 (it is: rows only ever ask for `c_id ∈ centroid_ids` via `_get_a_sqrt(c_id, ...)`).
 - The `compute_a_sqrt`/`eigh` result is a pure function of `A` ⇒ pre-warm vs in-loop
   compute yield bit-identical tensors; only timing differs.
+- **N3:** the eigh pre-warm is relevant **only when `whitening_mode == "full"`** — that is
+  the sole branch in `compute_a_sqrt` that runs `torch.linalg.eigh` (`cov_sqrt.py`). The
+  `"none"` branch returns an uncached `torch.tensor(1.0)` sentinel (no eigh, nothing to
+  pre-warm), and `"diag"` is a cheap `sqrt(diag(A))` (no eigh). So skip the pre-warm
+  entirely unless `whitening_mode == "full"`; for the other modes the row loop has no eigh
+  to overlap and the a_sqrt_cache concern (D3) is moot.
 - Edge: the `tentative_active` branch (EM rounds) recomputes against tentative weights but
   **still calls `_get_a_sqrt(c_id, ...)` with the ORIGINAL c_id** (per the comment at
   `ream_cost_post.py:276-282`) ⇒ pre-warm by `centroid_ids` still covers it.
@@ -273,7 +324,7 @@ mutation ⇒ no lock needed. Confirm the pre-warm set is a superset of what rows
 |------|-------------------------------|---------|
 | item 1 body | YES — `accs` accumulation | split: thread the LSA only, keep accumulation serial |
 | item 2 rows | NO (disjoint out cells + disjoint cache keys; a_sqrt_cache pre-warmed) | thread outer `ci` |
-| item 3 rows | NO (same as item 2; GPU forwards independent) | thread outer `ci` |
+| item 3 rows | NO (same as item 2; GPU forwards independent) | **GATED on A/B (M1): thread outer `ci` only if measured gain on SC config; else ship SERIAL (byte-identical)** |
 | item 4 eigh | NO (pure fn of A; cache pre-warm) | thread via item-2 pre-warm |
 
 ---
@@ -312,18 +363,42 @@ These must pass unchanged after threading (they encode the per-pair / per-matrix
    - the a_sqrt tensors (item 4),
    - and **`perm_cache._store` equality** including key insertion order
      (`list(serial._store.items()) == list(threaded._store.items())`).
-3. Force-exercise the version gate: monkeypatch is PROHIBITED (per repo policy) — instead
-   inject the version decision through the `lsa_threads` config knob / a public
-   `lsa_threads_enabled` override arg so both branches run without patching scipy.
+3. Force-exercise both branches WITHOUT monkeypatch (PROHIBITED per repo policy) — **N2:**
+   inject the enabled-decision via the explicit `enabled=` / `max_workers=` params on
+   `parallel_map` (e.g. `enabled=False, max_workers=1` for the serial branch and
+   `enabled=True, max_workers=8` for the threaded branch). This runs both branches on **any
+   host scipy** (no patching of `scipy.__version__`). The version-gate itself is covered by
+   the `enabled=None` default path resolving to `lsa_threads_enabled()`.
 4. Run this test on a CI box with `OMP_NUM_THREADS`/host scipy whatever — parity must hold
    even on scipy<1.12 (there the threaded path *is* the serial fallback ⇒ trivially equal).
 
-### Verification gate before merge (not part of this plan's code, but the plan mandates it)
-- `pytest max_quality/tests -k "stage2 or cov_sqrt or router_kd_golden"` green.
-- Golden snapshots byte-identical (no `--bless`).
-- A real-layer A/B on the deployed image: dump the merged `down_proj` / cost matrix for one
-  layer serial vs threaded, `cmp`/`torch.equal` ⇒ identical; record wall-clock to confirm
-  the speedup actually materialized (proves scipy≥1.12 landed in the image, per §1).
+### Verification gate before merge — HARD, RECORDED CHECKLIST (not optional prose)
+Every item below is a **merge-gate**: the command is run and its **actual output is
+recorded** (pasted into the merge/PR notes). The merge is blocked until all are checked.
+
+- [ ] **G1 — tests green:** `pytest max_quality/tests -k "stage2 or cov_sqrt or router_kd_golden"`
+      passes. Record the summary line.
+- [ ] **G2 — golden byte-identical:** golden snapshots unchanged (no `--bless`; `git diff
+      --stat max_quality/tests/golden` empty). Record the (empty) diff.
+- [ ] **G3 — item-3 A/B measured (M1):** serial-vs-threaded `_output_space_cost` on the SC
+      config (`cost_alignment="output"`, one real layer); record both wall-clocks and the
+      thread/serial decision. If no gain ⇒ item 3 shipped serial (record that).
+- [ ] **G4 — DEPLOYED-IMAGE scipy gate (M2, MANDATORY).** The runtime version-gate (§3) is
+      only a *safety net* (stale image ⇒ serial, never wrong); the wall-clock goal **silently
+      no-ops** if the image stays at 1.11.x. So this gate is mandatory before claiming any
+      speedup. Both sub-checks run and their **output is recorded**:
+      - [ ] **Docker image:** after build, run and paste the output of
+        ```
+        docker run --rm <image> python -c "import scipy,sys; assert scipy.__version__>='1.12', scipy.__version__; print('scipy', scipy.__version__)"
+        ```
+        (assertion must pass; record the printed version).
+      - [ ] **HF-Jobs UV lockline:** confirm the resolved `scipy` in the HF-Jobs run is
+        ≥1.12 for `hf_jobs/entrypoint_ablations.py` — paste the UV resolve/lock line showing
+        `scipy==1.12.x` (or higher), NOT 1.11.x.
+- [ ] **G5 — real-layer A/B byte-identical + speedup landed:** on the deployed image, dump the
+      merged `down_proj` / cost matrix for one layer serial vs threaded; `cmp`/`torch.equal`
+      ⇒ identical (record). Record the wall-clock delta to confirm the speedup materialized
+      (this only materializes if G4 passed — proves scipy≥1.12 is actually in the image).
 
 ---
 
@@ -346,7 +421,9 @@ These must pass unchanged after threading (they encode the per-pair / per-matrix
 5. `max_quality/src/moe_compress/stage2/plugins/ream_cost_post.py` — item 2 (rows) + item 4
    (a_sqrt pre-warm), collect-then-merge cache replay (D2/D3).
 6. `max_quality/src/moe_compress/stage2/plugins/output_space_cost.py` — item 3 (rows),
-   collect-then-merge cache replay (D2).
+   collect-then-merge cache replay (D2). **GATED on the M1 A/B measurement — touched ONLY
+   if the SC-config serial-vs-threaded A/B shows a real gain; otherwise this file is left
+   unchanged (item 3 ships serial, byte-identical).**
 7. `max_quality/src/moe_compress/stage2/orchestrator.py` — thread the `lsa_threads` config
    knob through to the cost/merge plugins (read at `s2.get(...)`, default 8).
 
@@ -362,13 +439,15 @@ threaded by the caller's pre-warm), or `em_refine.py` (it calls the now-threaded
 
 ## 7. Open questions for the plan-reviewer
 1. `torch.set_num_threads` is process-global — confirm the save/restore-around-pool pattern
-   (D1) over any per-worker setter, and decide `_INNER ∈ {1,2}`.
+   (D1) over any per-worker setter. **RESOLVED (L2):** `_INNER = 1` (byte-irrelevant; avoids
+   the 8×16 oversubscription); `threadpoolctl` alternative dropped (no new dep).
 2. Confirm no current consumer iterates `_PermAlignCache._store` (only `.get`/`.has`/`.put`
    today) — if true, insertion-order replay (D2) is belt-and-suspenders; if false, it is
    load-bearing.
 3. Confirm `cov_acc.covariance` tensors are CPU-resident so item-4 eigh stays on CPU LAPACK
    (the brief asserts this; verify in `InputCovarianceAccumulator`).
-4. Decide whether item 3's GPU SwiGLU forwards benefit enough from CPU-LSA overlap to be
-   worth threading at all on the SC config, or whether CUDA-stream serialization caps the
-   gain (the brief lists item 3 without a measured multiplier — flag for a quick measure).
+4. **RESOLVED (M1):** item 3 is no longer threaded on a guess. It is **gated on a mandatory
+   serial-vs-threaded A/B on the SC config** (`cost_alignment="output"`, one real layer):
+   thread only on a measured gain, else ship serial (byte-identical). See §2-item-3 DECISION
+   and the merge-gate checklist §4-G3.
 5. Confirm `lsa_threads` is excluded from the stage2 config-hash/manifest allowlist (§5).
