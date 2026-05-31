@@ -2870,7 +2870,7 @@ new file mode 100644
 index 0000000..72a1792
 --- /dev/null
 +++ b/tests/test_calibration_output_reservoir_smoke.py
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,669 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Smoke tests for ``vllm.calibration_output_reservoir``.
@@ -3101,6 +3101,13 @@ index 0000000..72a1792
 +    or_._SEEN[(1, 2)] = 7
 +    or_._VALID_COUNT[(1, 2)] = 4
 +    or_.set_n_prompts_accumulated(42)
++    # Seed a per-cell generator and capture its state so we can assert it
++    # round-trips through dump/load (H-2 RNG durability).
++    _g = torch.Generator(device="cpu")
++    _g.manual_seed(or_._cell_seed(0, 0))
++    _ = torch.rand(3, generator=_g)  # advance the stream off its fresh state
++    or_._GEN[(0, 0)] = _g
++    _expected_gen_state = _g.get_state().clone()
 +
 +    ckpt = str(tmp_path / "test.or.ckpt")
 +    or_.dump_output_reservoir_checkpoint(ckpt)
@@ -3138,6 +3145,10 @@ index 0000000..72a1792
 +            dtype=torch.float32,
 +        ),
 +    )
++    # _GEN round-trips: the seeded generator state for the populated cell is
++    # serialized and restored byte-for-byte.
++    assert (0, 0) in or2._GEN
++    assert torch.equal(or2._GEN[(0, 0)].get_state(), _expected_gen_state)
 +
 +
 +# ---------------------------------------------------------------------------
@@ -3339,6 +3350,196 @@ index 0000000..72a1792
 +    assert payload.total_seen[0, 0].item() == 2
 +    assert payload.total_seen[0, 2].item() == 6
 +    assert payload.total_seen[0, 1].item() == 0
++
++
++# ---------------------------------------------------------------------------
++# Test 7 (T-A) -- Phase-2 byte-identical resume under the same dispatch grouping
++# ---------------------------------------------------------------------------
++
++
++def test_two_segment_additivity_phase_2_byte_identical(tmp_path):
++    """A kill+resume run that crosses into Phase-2 sampling is byte-identical
++    to the uninterrupted run.
++
++    Byte-identity holds because (a) each (rank, expert) cell owns a CPU
++    ``torch.Generator`` whose state is serialized in the checkpoint and
++    restored via ``set_state`` on load, AND (b) the split is taken at a
++    dispatch boundary so the per-expert sequence of ``n_remaining`` values
++    (the dispatch grouping) is unchanged. The byte-identity guarantee does
++    NOT hold if the dispatch grouping changes across the split (see
++    ``test_phase_2_resume_diverges_under_regrouping``); the driver preserves
++    grouping by replaying the not-yet-processed tail of the fixed prompt
++    list in order, and never checkpoints mid-dispatch.
++    """
++    cap = 4
++    top_k = 1
++    hidden = 3
++    n_experts = 2
++    # Dispatch sequence [3, 4, 3] all routed to expert 0 (10 tokens > cap=4
++    # so dispatches 2 and 3 exercise Phase-2 sampling). Split after dispatch 2.
++    grouping = [3, 4, 3]
++    torch.manual_seed(123)
++    chunks = [
++        torch.randn(n, top_k, hidden, dtype=torch.float32) for n in grouping
++    ]
++    id_chunks = [torch.zeros(n, top_k, dtype=torch.int64) for n in grouping]
++
++    common = {
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": "1",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": str(cap),
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    }
++
++    # --- uninterrupted reference run: all three dispatches in one process ---
++    ref = _reload_or(common)
++    _seed_layer(ref, layer_idx=0, rank=0, n_experts=n_experts)
++    for c, ic in zip(chunks, id_chunks):
++        ref._on_expert_out_unweighted(layer_idx=0, unweighted=c, topk_ids=ic)
++    expected_reservoir = ref._RESERVOIR[(0, 0)].clone()
++    expected_seen = ref._SEEN[(0, 0)]
++    expected_valid = ref._VALID_COUNT[(0, 0)]
++    expected_gen_state = ref._GEN[(0, 0)].get_state().clone()
++
++    # --- split run: dispatches 1+2, checkpoint at the boundary, resume 3 ----
++    seg = _reload_or(common)
++    _seed_layer(seg, layer_idx=0, rank=0, n_experts=n_experts)
++    for c, ic in zip(chunks[:2], id_chunks[:2]):
++        seg._on_expert_out_unweighted(layer_idx=0, unweighted=c, topk_ids=ic)
++    seg.set_n_prompts_accumulated(2)
++    ckpt = str(tmp_path / "phase2.or.ckpt")
++    seg.dump_output_reservoir_checkpoint(ckpt)
++
++    seg2 = _reload_or(common)
++    seg2.load_output_reservoir_checkpoint(ckpt)
++    seg2._on_expert_out_unweighted(
++        layer_idx=0, unweighted=chunks[2], topk_ids=id_chunks[2],
++    )
++
++    # Byte-identity of the reservoir contents AND the generator stream.
++    assert torch.equal(seg2._RESERVOIR[(0, 0)], expected_reservoir)
++    assert seg2._SEEN[(0, 0)] == expected_seen
++    assert seg2._VALID_COUNT[(0, 0)] == expected_valid
++    assert torch.equal(seg2._GEN[(0, 0)].get_state(), expected_gen_state)
++
++
++# ---------------------------------------------------------------------------
++# Test 8 (T-B) -- the guarantee's boundary: regrouping the dispatches diverges
++# ---------------------------------------------------------------------------
++
++
++def test_phase_2_resume_diverges_under_regrouping(tmp_path):
++    """Negative/guard test pinning the boundary of the byte-identity
++    guarantee: if the dispatch grouping CHANGES across the split, the
++    Phase-2 sampled slots generally diverge from a single grouping -- even
++    though ``seen``/``valid_count`` remain additive/equal.
++
++    Single run draws one Phase-2 dispatch of 8 tail tokens (rand(8) then
++    randint(8)); the regrouped resume draws 3 then 5 (rand(3),randint(3),
++    rand(5),randint(5)). The interleaving order of ``rand`` vs ``randint``
++    differs, so the consumed RNG values differ. This documents WHY the
++    driver must preserve per-expert dispatch grouping; nobody should later
++    "fix" this by asserting byte-identity here.
++    """
++    cap = 4
++    top_k = 1
++    hidden = 2
++    n_experts = 1
++    common = {
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": "1",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": str(cap),
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    }
++    # First fill the reservoir (4 tokens) then 8 tail tokens in Phase-2.
++    torch.manual_seed(321)
++    fill = torch.randn(cap, top_k, hidden, dtype=torch.float32)
++    fill_ids = torch.zeros(cap, top_k, dtype=torch.int64)
++    tail = torch.randn(8, top_k, hidden, dtype=torch.float32)
++    tail_ids = torch.zeros(8, top_k, dtype=torch.int64)
++
++    # --- single run: fill, then one dispatch of all 8 tail tokens ----------
++    ref = _reload_or(common)
++    _seed_layer(ref, layer_idx=0, rank=0, n_experts=n_experts)
++    ref._on_expert_out_unweighted(layer_idx=0, unweighted=fill, topk_ids=fill_ids)
++    ref._on_expert_out_unweighted(layer_idx=0, unweighted=tail, topk_ids=tail_ids)
++    single_reservoir = ref._RESERVOIR[(0, 0)].clone()
++    single_seen = ref._SEEN[(0, 0)]
++    single_valid = ref._VALID_COUNT[(0, 0)]
++
++    # --- regrouped run: fill + checkpoint, then tail as 3 then 5 -----------
++    seg = _reload_or(common)
++    _seed_layer(seg, layer_idx=0, rank=0, n_experts=n_experts)
++    seg._on_expert_out_unweighted(layer_idx=0, unweighted=fill, topk_ids=fill_ids)
++    ckpt = str(tmp_path / "regroup.or.ckpt")
++    seg.dump_output_reservoir_checkpoint(ckpt)
++    seg2 = _reload_or(common)
++    seg2.load_output_reservoir_checkpoint(ckpt)
++    seg2._on_expert_out_unweighted(
++        layer_idx=0, unweighted=tail[:3], topk_ids=tail_ids[:3],
++    )
++    seg2._on_expert_out_unweighted(
++        layer_idx=0, unweighted=tail[3:], topk_ids=tail_ids[3:],
++    )
++
++    # Bookkeeping is still exact/additive regardless of grouping.
++    assert seg2._SEEN[(0, 0)] == single_seen
++    assert seg2._VALID_COUNT[(0, 0)] == single_valid
++    # The sampled slot CONTENTS generally differ because the RNG-consumption
++    # order changed. This is the documented boundary -- NOT a byte-identity
++    # claim. (Equality is not GUARANTEED; assert divergence to pin the
++    # behavior so a future change that accidentally restores grouping
++    # sensitivity is caught.)
++    assert not torch.equal(seg2._RESERVOIR[(0, 0)], single_reservoir)
++
++
++# ---------------------------------------------------------------------------
++# Test 9 (T-C) -- per-cell generator isolation across experts
++# ---------------------------------------------------------------------------
++
++
++def test_generator_isolation_across_experts():
++    """Expert-0's Phase-2 reservoir is unaffected by whether expert-1 receives
++    any dispatches in between, because each cell owns its own generator.
++
++    Drives expert-0 with the same dispatch sequence twice: once alone, once
++    interleaved with expert-1 traffic. The per-cell generator makes expert-0's
++    stream depend ONLY on expert-0's own dispatches, so its reservoir is
++    byte-identical between the two scenarios.
++    """
++    cap = 4
++    top_k = 1
++    hidden = 3
++    n_experts = 2
++    common = {
++        "VLLM_CALIB_CAPTURE_OUTPUT_RESERVOIR": "1",
++        "VLLM_CALIB_OUTPUT_RESERVOIR_CAP": str(cap),
++        "VLLM_CALIB_CAPTURE_EXPERT_UNWEIGHTED": "1",
++    }
++    torch.manual_seed(99)
++    # expert-0 dispatch sequence [4, 7] (crosses into Phase-2).
++    e0_a = torch.randn(4, top_k, hidden, dtype=torch.float32)
++    e0_b = torch.randn(7, top_k, hidden, dtype=torch.float32)
++    e0_a_ids = torch.zeros(4, top_k, dtype=torch.int64)
++    e0_b_ids = torch.zeros(7, top_k, dtype=torch.int64)
++    # expert-1 traffic interleaved (id == 1).
++    e1 = torch.randn(5, top_k, hidden, dtype=torch.float32)
++    e1_ids = torch.ones(5, top_k, dtype=torch.int64)
++
++    # --- expert-0 alone -----------------------------------------------------
++    alone = _reload_or(common)
++    _seed_layer(alone, layer_idx=0, rank=0, n_experts=n_experts)
++    alone._on_expert_out_unweighted(layer_idx=0, unweighted=e0_a, topk_ids=e0_a_ids)
++    alone._on_expert_out_unweighted(layer_idx=0, unweighted=e0_b, topk_ids=e0_b_ids)
++    e0_alone = alone._RESERVOIR[(0, 0)].clone()
++
++    # --- expert-0 with expert-1 traffic interleaved -------------------------
++    inter = _reload_or(common)
++    _seed_layer(inter, layer_idx=0, rank=0, n_experts=n_experts)
++    inter._on_expert_out_unweighted(layer_idx=0, unweighted=e0_a, topk_ids=e0_a_ids)
++    inter._on_expert_out_unweighted(layer_idx=0, unweighted=e1, topk_ids=e1_ids)
++    inter._on_expert_out_unweighted(layer_idx=0, unweighted=e0_b, topk_ids=e0_b_ids)
++    e0_inter = inter._RESERVOIR[(0, 0)].clone()
++
++    assert torch.equal(e0_alone, e0_inter)
 diff --git a/tests/test_calibration_per_expert_max_smoke.py b/tests/test_calibration_per_expert_max_smoke.py
 new file mode 100644
 index 0000000..f4f9d32
