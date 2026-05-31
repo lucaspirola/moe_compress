@@ -5963,7 +5963,7 @@ new file mode 100644
 index 0000000..8505da3
 --- /dev/null
 +++ b/vllm/calibration_imatrix.py
-@@ -0,0 +1,988 @@
+@@ -0,0 +1,997 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Imatrix capture for llama.cpp-compatible activation statistics.
@@ -6732,7 +6732,16 @@ index 0000000..8505da3
 +        dataset_b = dataset.encode("utf-8")
 +        f.write(struct.pack("<i", len(dataset_b)))
 +        f.write(dataset_b)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, path)
++    _dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
++    try:
++        os.fsync(_dir_fd)
++    except OSError:
++        pass
++    finally:
++        os.close(_dir_fd)
 +
 +
 +# ---------------------------------------------------------------------------
