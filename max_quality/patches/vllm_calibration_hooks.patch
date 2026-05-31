@@ -7396,7 +7396,7 @@ new file mode 100644
 index 0000000..660a951
 --- /dev/null
 +++ b/vllm/calibration_output_reservoir.py
-@@ -0,0 +1,451 @@
+@@ -0,0 +1,503 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) expert-output reservoir capture for calibration-v2
@@ -7513,6 +7513,13 @@ index 0000000..660a951
 +_RESERVOIR: dict[tuple[int, int], torch.Tensor] = {}  # (rank, e) -> [cap, hidden] fp32
 +_SEEN: dict[tuple[int, int], int] = {}                # (rank, e) -> total tokens seen
 +_VALID_COUNT: dict[tuple[int, int], int] = {}         # (rank, e) -> min(seen, cap)
++# Per-(rank, expert_id) CPU RNG generators for the Phase-2 reservoir-sample
++# draws. Seeded deterministically per cell at lazy allocation and
++# serialized/restored across checkpoints so a kill+resume run reproduces the
++# single-run sampling decisions byte-for-byte (CPU MT19937 is portable across
++# machines; NEVER use a CUDA generator -- cross-arch CUDA RNG is not
++# bit-identical and the checkpoint is device-agnostic).
++_GEN: dict[tuple[int, int], torch.Generator] = {}     # (rank, e) -> CPU generator
 +
 +_LAYER_ID_TO_RANK: dict[int, int] = {}
 +_N_LAYERS: int = 0
@@ -7520,7 +7527,28 @@ index 0000000..660a951
 +
 +# Cumulative prompt counter mirroring imatrix / per_expert_max.
 +_n_prompts_accumulated: int = 0
-+_CHECKPOINT_SCHEMA_VERSION: int = 1
++_CHECKPOINT_SCHEMA_VERSION: int = 2
++
++# Base seed for the per-cell Phase-2 RNG. base-0 ``int()`` auto-detects the
++# ``0x`` prefix (a bare ``int("0x5eed")`` would raise); override via
++# ``VLLM_CALIB_OUTPUT_RESERVOIR_SEED`` to re-key the whole run's sampling
++# stream. A checkpoint written under a different base seed is rejected on
++# load (the stream would diverge); see ``load_output_reservoir_checkpoint``.
++_RESERVOIR_RNG_BASE_SEED: int = int(
++    os.getenv("VLLM_CALIB_OUTPUT_RESERVOIR_SEED", "0x5eed"), 0
++)
++
++
++def _cell_seed(rank: int, e: int) -> int:
++    """Deterministic, cell-unique 63-bit seed for the (rank, expert) RNG.
++
++    Independent of dispatch order so two distinct cells never share a stream
++    and the seed is reproducible across a kill+resume. The Phase-2 draws
++    (``rand`` then ``randint``) use this generator; their op order is
++    load-bearing for byte-identity across resume (do not reorder/fuse).
++    """
++    return (_RESERVOIR_RNG_BASE_SEED * 0x9E3779B97F4A7C15
++            + (rank << 20) + e) & 0x7FFFFFFFFFFFFFFF
 +
 +
 +def get_n_prompts_accumulated() -> int:
@@ -7666,6 +7694,12 @@ index 0000000..660a951
 +                _MAX_TOKENS, hidden_dim, dtype=torch.float32,
 +            )
 +            _RESERVOIR[key] = reservoir
++        gen = _GEN.get(key)
++        if gen is None:
++            gen = torch.Generator(device="cpu")
++            gen.manual_seed(_cell_seed(rank, e))
++            _GEN[key] = gen
++
 +
 +        seen = _SEEN.get(key, 0)
 +        cap = _MAX_TOKENS
@@ -7689,9 +7723,9 @@ index 0000000..660a951
 +                + torch.arange(1, n_remaining + 1, dtype=torch.float32)
 +            )
 +            probs = float(cap) / positions                       # [n_remaining]
-+            u = torch.rand(n_remaining)
++            u = torch.rand(n_remaining, generator=gen)
 +            accept_mask = u < probs                              # [n_remaining]
-+            slots = torch.randint(0, cap, (n_remaining,))
++            slots = torch.randint(0, cap, (n_remaining,), generator=gen)
 +            accepted = accept_mask.nonzero(as_tuple=True)[0]
 +            if accepted.numel() > 0:
 +                src_rows = rows[n_to_fill + accepted]
@@ -7791,6 +7825,8 @@ index 0000000..660a951
 +        "reservoir": {k: v.clone() for k, v in _RESERVOIR.items()},
 +        "seen": dict(_SEEN),
 +        "valid_count": dict(_VALID_COUNT),
++        "generator_state": {k: g.get_state().clone() for k, g in _GEN.items()},
++        "rng_base_seed": _RESERVOIR_RNG_BASE_SEED,
 +    }
 +    tmp = ckpt_path + ".tmp"
 +    with open(tmp, "wb") as f:
@@ -7847,6 +7883,22 @@ index 0000000..660a951
 +        _SEEN[(int(k[0]), int(k[1]))] = int(v)
 +    for k, v in payload.get("valid_count", {}).items():
 +        _VALID_COUNT[(int(k[0]), int(k[1]))] = int(v)
++    _GEN.clear()
++    saved_base = int(payload.get("rng_base_seed", _RESERVOIR_RNG_BASE_SEED))
++    if saved_base != _RESERVOIR_RNG_BASE_SEED:
++        raise ValueError(
++            f"calibration_output_reservoir: checkpoint at {ckpt_path} has "
++            f"rng_base_seed={saved_base} but the current run is configured "
++            f"for {_RESERVOIR_RNG_BASE_SEED}. The Phase-2 reservoir-sample "
++            f"stream would diverge from the single-run counterfactual. "
++            f"Delete the checkpoint or restore the matching "
++            f"VLLM_CALIB_OUTPUT_RESERVOIR_SEED."
++        )
++    for k, state in payload.get("generator_state", {}).items():
++        rk = (int(k[0]), int(k[1]))
++        g = torch.Generator(device="cpu")
++        g.set_state(state.to(torch.uint8))
++        _GEN[rk] = g
 +    return _n_prompts_accumulated
 diff --git a/vllm/calibration_per_expert_max.py b/vllm/calibration_per_expert_max.py
 new file mode 100644
