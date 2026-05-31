@@ -28,7 +28,7 @@ datasets>=3.0.0
 
 # --- Numerics + solvers ---
 numpy>=1.26.0
-scipy>=1.11.0       # Hungarian assignment in REAM
+scipy>=1.12.0       # Hungarian assignment in REAM (>=1.12 releases the GIL in linear_sum_assignment — required for Stage-2 LSA threading)
 ortools>=9.10       # SimpleMinCostFlow for Stage 2 v2 capacitated assignment
 
 # --- Misc runtime ---

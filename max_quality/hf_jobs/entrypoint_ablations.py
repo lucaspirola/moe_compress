@@ -35,7 +35,7 @@ Environment:
 #     "huggingface_hub>=0.26.0",
 #     "einops>=0.8.0",
 #     "numpy>=1.26.0",
-#     "scipy>=1.11.0",
+#     "scipy>=1.12.0",
 #     "ortools>=9.10",
 #     "peft>=0.13.0",
 #     "pyyaml>=6.0",
