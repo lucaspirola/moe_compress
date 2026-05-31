@@ -9,8 +9,8 @@ The Stage 2 profile writer has TWO implementations that must be kept in sync:
      ``max_quality/patches/vllm_calibration_stage2_profile.patch``) — runs
      inside the rebuilt patched-wheel; reimplements the state machine but
      imports the shared types (``ReamCostAccumulator``,
-     ``InputCovarianceAccumulator``, ``Stage2ProfilePayloadV3``,
-     ``save_stage2_profile_v3``) from this package so the bug-fix path is
+     ``InputCovarianceAccumulator``, ``Stage2ProfilePayloadV4``,
+     ``save_stage2_profile_v4``) from this package so the bug-fix path is
      unified.
 
 The patch is a FULL REIMPLEMENTATION (not a thin wrapper around the canonical

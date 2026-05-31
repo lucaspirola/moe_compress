@@ -2,7 +2,7 @@
 
 Plan section 8.1 — Bug #1 reference test. Drives the writer's internal
 callbacks directly (no vLLM required) and compares the resulting
-sim_tensor / gate_logit_profiles / total_tokens_per_layer with a
+sim_tensor / gate_gram / total_tokens_per_layer with a
 parallel live :class:`ReamCostAccumulator` fed the SAME synthetic
 inputs.
 
@@ -38,7 +38,7 @@ from moe_compress.utils.activation_hooks import (
     ReamCostAccumulator,
 )
 from moe_compress.utils.cached_calibration_signals import (
-    load_stage2_profile_v3,
+    load_stage2_profile_v4,
     sidecar_path,
 )
 
@@ -193,25 +193,30 @@ def test_total_tokens_not_off_by_top_k(tmp_path):
         )
 
 
-def test_gate_logit_profiles_preserved_verbatim(tmp_path):
-    """gate_logit_profiles preserves list[(offset, Tensor)] shape (Bug #2)."""
+def test_gate_gram_matches_reference(tmp_path):
+    """_gate_gram is the bounded [E, E] fp64 Gram and matches the reference (Bug #2).
+
+    The writer's _on_router_callback folds each batch into the same online
+    ReamCostAccumulator._gate_gram as the live path, so equality is by
+    construction.
+    """
     cfg = _synth_inputs()
     batches = _build_batches(cfg, seed=13)
     _drive_writer(cfg, batches)
+    ref = _drive_reference(cfg, batches)
     state = s2pw._get_state()
     for lr in range(cfg["n_layers"]):
-        glp = state.ream_acc.gate_logit_profiles[lr]
-        assert isinstance(glp, list)
-        assert len(glp) == cfg["n_batches"]
-        for (off, t) in glp:
-            assert isinstance(off, int)
-            assert isinstance(t, torch.Tensor)
-            assert t.dtype == torch.float32
-            assert t.shape == (cfg["T"], cfg["n_experts"])
+        gram = state.ream_acc._gate_gram[lr]
+        assert isinstance(gram, torch.Tensor)
+        assert gram.dtype == torch.float64
+        assert gram.shape == (cfg["n_experts"], cfg["n_experts"])
+        torch.testing.assert_close(
+            gram, ref._gate_gram[lr], rtol=0.0, atol=1e-10,
+        )
 
 
 def test_dump_load_roundtrip_byte_identical(tmp_path):
-    """dump_stage2_profile -> load_stage2_profile_v3 preserves payload fields."""
+    """dump_stage2_profile -> load_stage2_profile_v4 preserves payload fields."""
     cfg = _synth_inputs()
     batches = _build_batches(cfg, seed=14)
     _drive_writer(cfg, batches)
@@ -233,9 +238,9 @@ def test_dump_load_roundtrip_byte_identical(tmp_path):
     jsonl = _jsonl(tmp_path)
     s2pw.dump_stage2_profile(jsonl)
 
-    loaded = load_stage2_profile_v3(jsonl)
+    loaded = load_stage2_profile_v4(jsonl)
     assert loaded is not None
-    assert loaded.schema_version == 3
+    assert loaded.schema_version == 4
     assert loaded.cov_storage_dtype == "float16"
     assert loaded.n_layers == cfg["n_layers"]
     assert loaded.n_experts == cfg["n_experts"]
@@ -243,10 +248,17 @@ def test_dump_load_roundtrip_byte_identical(tmp_path):
     # total_tokens preserved.
     expected_total = cfg["T"] * cfg["n_batches"]
     assert (loaded.total_tokens_per_layer == expected_total).all()
-    # gate_logit_profiles preserves shape.
+    # gate_gram: bounded [n_layers, E, E] fp64 Gram, matches the live acc.
+    assert loaded.gate_gram.shape == (
+        cfg["n_layers"], cfg["n_experts"], cfg["n_experts"],
+    )
+    assert loaded.gate_gram.dtype == torch.float64
+    state = s2pw._get_state()
     for lr in range(cfg["n_layers"]):
-        assert lr in loaded.gate_logit_profiles
-        assert len(loaded.gate_logit_profiles[lr]) == cfg["n_batches"]
+        torch.testing.assert_close(
+            loaded.gate_gram[lr], state.ream_acc._gate_gram[lr],
+            rtol=0.0, atol=1e-10,
+        )
 
 
 def test_hydrated_acc_matches_reference_via_reader(tmp_path):

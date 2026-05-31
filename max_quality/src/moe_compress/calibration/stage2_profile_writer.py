@@ -59,8 +59,8 @@ from ..utils.activation_hooks import (
 )
 from ..utils.cached_calibration_signals import (
     SCHEMA_VERSIONS,
-    Stage2ProfilePayloadV3,
-    save_stage2_profile_v3,
+    Stage2ProfilePayloadV4,
+    save_stage2_profile_v4,
 )
 
 log = logging.getLogger(__name__)
@@ -242,7 +242,7 @@ def record_batch_token_count(layer_idx: int, n_tokens: int) -> None:
 def _on_router_callback(
     layer_idx: int, logits: torch.Tensor, batch_offset: int,
 ) -> None:
-    """Router hook handler -- appends per-batch logits to gate_logit_profiles."""
+    """Router hook handler -- folds per-batch logits into the online _gate_gram."""
     _state.ream_acc.record_router_logits(
         int(layer_idx), logits, int(batch_offset),
     )
@@ -358,8 +358,8 @@ def dump_stage2_profile(jsonl_path: Path | str) -> None:
     Per plan section 10 writer-side serialization order:
       1. Finalize all pending GPU covariances for each layer.
       2. Cross-validate cov_acc.storage_dtype against the configured value.
-      3. Build Stage2ProfilePayloadV3 with layer_rank-keyed dicts.
-      4. Atomic torch.save via save_stage2_profile_v3.
+      3. Build Stage2ProfilePayloadV4 with layer_rank-keyed dicts.
+      4. Atomic torch.save via save_stage2_profile_v4.
     """
     jsonl_path = Path(jsonl_path)
 
@@ -389,7 +389,7 @@ def dump_stage2_profile(jsonl_path: Path | str) -> None:
         l2r = _state.layer_idx_to_rank
     else:
         observed = (
-            set(_state.ream_acc.gate_logit_profiles)
+            set(_state.ream_acc._gate_gram)
             | {k[0] for k in _state.cov_acc.covariance}
             | set(_state.layer_input_reservoir)
         )
@@ -428,15 +428,20 @@ def dump_stage2_profile(jsonl_path: Path | str) -> None:
             _state.ream_acc._total_tokens_by_layer.get(layer_idx, 0)
         )
 
-    gate_logit_profiles: dict[int, list[tuple[int, torch.Tensor]]] = {}
-    for layer_idx, batches in _state.ream_acc.gate_logit_profiles.items():
-        rank = l2r.get(layer_idx)
-        if rank is None:
-            continue
-        gate_logit_profiles[rank] = [
-            (int(off), t.detach().to("cpu", dtype=torch.float32).contiguous())
-            for off, t in batches
-        ]
+    # δ_gate router-logit Gram: a bounded [n_layers, E, E] fp64 tensor mirroring
+    # the sim_tensor build loop. _gate_gram[layer] is the full [E, E] Gram over
+    # all experts; rehydrated into ReamCostAccumulator._gate_gram by the reader.
+    if n_experts > 0:
+        gate_gram = torch.zeros(
+            (n_layers, n_experts, n_experts), dtype=torch.float64,
+        )
+        for rank in range(n_layers):
+            layer_idx = _state.rank_to_layer_idx[rank]
+            g = _state.ream_acc._gate_gram.get(layer_idx)
+            if g is not None:
+                gate_gram[rank] = g.detach().to(torch.float64).cpu()
+    else:
+        gate_gram = torch.zeros((n_layers, 0, 0), dtype=torch.float64)
 
     neuron_act_sum: dict = {}
     neuron_act_count: dict = {}
@@ -486,8 +491,8 @@ def dump_stage2_profile(jsonl_path: Path | str) -> None:
                 acc.buffer.detach().to("cpu", dtype=torch.bfloat16).contiguous()
             )
 
-    payload = Stage2ProfilePayloadV3(
-        format_version=3,
+    payload = Stage2ProfilePayloadV4(
+        format_version=4,
         schema_version=SCHEMA_VERSIONS["stage2_profile"],
         model_hash=_state.model_hash,
         n_layers=n_layers,
@@ -495,7 +500,7 @@ def dump_stage2_profile(jsonl_path: Path | str) -> None:
         top_k=int(_state.top_k),
         cov_storage_dtype=_state.configured_cov_storage_dtype,
         total_tokens_per_layer=total_tokens,
-        gate_logit_profiles=gate_logit_profiles,
+        gate_gram=gate_gram,
         sim_tensor=sim_tensor,
         neuron_act_sum=neuron_act_sum,
         neuron_act_count=neuron_act_count,
@@ -503,7 +508,7 @@ def dump_stage2_profile(jsonl_path: Path | str) -> None:
         cov_token_count=cov_tc,
         layer_input_reservoir=layer_input_reservoir,
     )
-    save_stage2_profile_v3(payload, jsonl_path)
+    save_stage2_profile_v4(payload, jsonl_path)
     # Per plan §2.e: replace the prior H-1 "no hook yet" warning with an
     # info-log reporting how many of the ``n_layers`` reservoirs got
     # populated. All-empty after CRITICAL-1 landing typically means the
@@ -536,7 +541,7 @@ def dump_stage2_profile(jsonl_path: Path | str) -> None:
 # ---------------------------------------------------------------------------
 # Checkpoint -- crash-resume serialization.
 # ---------------------------------------------------------------------------
-_CKPT_SCHEMA = 1
+_CKPT_SCHEMA = 2
 
 
 def dump_stage2_profile_checkpoint(path: str | Path) -> None:
@@ -561,7 +566,7 @@ def dump_stage2_profile_checkpoint(path: str | Path) -> None:
         "layer_idx_to_rank": dict(_state.layer_idx_to_rank),
         "ream_acc_sim_tensor": dict(_state.ream_acc._sim_tensor),
         "ream_acc_total_tokens": dict(_state.ream_acc._total_tokens_by_layer),
-        "ream_acc_gate_logit_profiles": dict(_state.ream_acc.gate_logit_profiles),
+        "ream_acc_gate_gram": dict(_state.ream_acc._gate_gram),
         "ream_acc_neuron_act_sum": dict(_state.ream_acc._neuron_act_sum),
         "ream_acc_neuron_act_count": dict(_state.ream_acc._neuron_act_count),
         "cov_acc_covariance": dict(_state.cov_acc.covariance),
@@ -682,8 +687,8 @@ def load_stage2_profile_checkpoint(path: str | Path) -> int:
     _state.ream_acc._total_tokens_by_layer = dict(
         loaded.get("ream_acc_total_tokens", {})
     )
-    _state.ream_acc.gate_logit_profiles = dict(
-        loaded.get("ream_acc_gate_logit_profiles", {})
+    _state.ream_acc._gate_gram = dict(
+        loaded.get("ream_acc_gate_gram", {})
     )
     _state.ream_acc._neuron_act_sum = dict(
         loaded.get("ream_acc_neuron_act_sum", {})

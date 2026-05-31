@@ -28,7 +28,7 @@ from moe_compress.utils.activation_hooks import (
 )
 from moe_compress.utils.cached_calibration_signals import (
     SCHEMA_VERSIONS,
-    Stage2ProfilePayloadV3,
+    Stage2ProfilePayloadV4,
 )
 
 
@@ -36,13 +36,15 @@ def _build_payload(
     *, n_layers: int = 2, n_experts: int = 3,
     per_layer_tokens: list[int] | None = None,
     cov_storage_dtype: str = "float16",
-) -> Stage2ProfilePayloadV3:
+) -> Stage2ProfilePayloadV4:
     if per_layer_tokens is None:
         per_layer_tokens = [1000] * n_layers
-    gate_logit_profiles: dict[int, list[tuple[int, torch.Tensor]]] = {
-        lr: [(0, torch.ones((per_layer_tokens[lr], n_experts), dtype=torch.float32))]
+    # Bounded [n_layers, E, E] fp64 router-logit Gram (replaces gate_logit_profiles).
+    # A distinct non-zero value per layer so hydration can be checked per rank.
+    gate_gram = torch.stack([
+        torch.full((n_experts, n_experts), float(lr + 1), dtype=torch.float64)
         for lr in range(n_layers)
-    }
+    ]) if n_layers > 0 else torch.zeros((0, n_experts, n_experts), dtype=torch.float64)
     cov_dtype = getattr(torch, cov_storage_dtype)
     cov_acc: dict = {
         (lr, e, m): torch.eye(4, dtype=cov_dtype)
@@ -59,8 +61,8 @@ def _build_payload(
     layer_input_reservoir: list = [
         torch.zeros((8, 4), dtype=torch.bfloat16) for _ in range(n_layers)
     ]
-    return Stage2ProfilePayloadV3(
-        format_version=3,
+    return Stage2ProfilePayloadV4(
+        format_version=4,
         schema_version=SCHEMA_VERSIONS["stage2_profile"],
         model_hash="testhash",
         n_layers=n_layers,
@@ -68,7 +70,7 @@ def _build_payload(
         top_k=2,
         cov_storage_dtype=cov_storage_dtype,
         total_tokens_per_layer=torch.tensor(per_layer_tokens, dtype=torch.int64),
-        gate_logit_profiles=gate_logit_profiles,
+        gate_gram=gate_gram,
         sim_tensor=torch.zeros(
             (n_layers, n_experts, n_experts), dtype=torch.float64,
         ),
@@ -117,7 +119,7 @@ def test_partial_hit_does_not_hydrate(tmp_path):
     # ream_acc untouched (fresh, empty).
     ream = ctx.get("ream_acc")
     assert ream._total_tokens_by_layer.get(7, 0) == 0
-    assert 7 not in ream.gate_logit_profiles
+    assert 7 not in ream._gate_gram
     assert 7 not in ream._sim_tensor
     # cov_acc untouched.
     assert not any(k[0] == 7 for k in cov_acc.covariance)
@@ -144,13 +146,13 @@ def test_full_hit_hydrates(tmp_path):
     ream = ctx.get("ream_acc")
     # Hydration happened under layer_idx=13.
     assert ream._total_tokens_by_layer[13] == 1000
-    assert 13 in ream.gate_logit_profiles
-    assert isinstance(ream.gate_logit_profiles[13], list)
-    assert len(ream.gate_logit_profiles[13]) == 1
-    off, t = ream.gate_logit_profiles[13][0]
-    assert isinstance(off, int)
-    assert isinstance(t, torch.Tensor)
-    assert t.dtype == torch.float32
+    assert 13 in ream._gate_gram
+    gram = ream._gate_gram[13]
+    assert isinstance(gram, torch.Tensor)
+    assert gram.dtype == torch.float64
+    assert gram.shape == (3, 3)
+    # rank 1 → gate_gram[1] == full(2.0); hydrated under layer_idx=13.
+    assert torch.equal(gram, torch.full((3, 3), 2.0, dtype=torch.float64))
     assert 13 in ream._sim_tensor
     # cov_acc hydrated for layer 13's experts.
     assert any(k[0] == 13 for k in cov_acc.covariance)

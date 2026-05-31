@@ -115,12 +115,13 @@ log = logging.getLogger(__name__)
 SCHEMA_VERSIONS: dict[str, int] = {
     "phase_b":             1,
     # stage2_profile bumped 1 → 3 (skip 2 to signal clean break from the
-    # deleted prior Plugin #12 v1 writer; see Stage2ProfilePayloadV3
-    # docstring). Pattern K applies forward (v3 → v4 should preserve
-    # readers when only optional fields are added), but the v1 → v3 bump
-    # is intentionally NOT forward-compatible — the v1 dataclass was
-    # never written by a production writer, so no callers exist.
-    "stage2_profile":      3,
+    # deleted prior Plugin #12 v1 writer), then 3 → 4: the unbounded raw
+    # per-batch ``gate_logit_profiles`` list is replaced by a bounded online
+    # ``gate_gram`` [n_layers, E, E] fp64 Gram (see Stage2ProfilePayloadV4
+    # docstring). The v3 → v4 break is NOT forward-compatible — the payload
+    # field changed shape/meaning, so an old v3 sidecar must fail-loud and
+    # regenerate via ``_check_schema``.
+    "stage2_profile":      4,
     "covariance":          2,
     "router_kd_logits":    1,
     "block_hidden":        1,
@@ -414,8 +415,8 @@ class PhaseBPayload:
 
 
 @dataclass
-class Stage2ProfilePayloadV3:
-    """Stage 2 profile-pass sidecar payload (schema v3) — Optimization A REDO.
+class Stage2ProfilePayloadV4:
+    """Stage 2 profile-pass sidecar payload (schema v4) — Optimization A REDO.
 
     Replaces the deleted prior :class:`Stage2ProfilePayload` (v1) with the
     REDO schema described in PLAN_PLUGIN_12_opt_a_redo.md §3. Every field
@@ -424,9 +425,16 @@ class Stage2ProfilePayloadV3:
     hydration. This makes the sidecar portable across models with
     different dense-prefix layer counts.
 
+    v3 → v4: the unbounded raw per-batch ``gate_logit_profiles`` list
+    (which grew to hundreds of GB on the vLLM single-pass path) is replaced
+    by a bounded online ``gate_gram`` [n_layers, E, E] fp64 Gram. The Gram
+    ``G[i,j] = Σ_t v_i[t]·v_j[t]`` is a complete sufficient statistic for the
+    δ_gate cosine geometry (paper Eq. 5), reconstructed exactly in fp64 by
+    ``ReamCostAccumulator.compute_gate_similarity_matrix``.
+
     Fields:
-        format_version: constant ``3`` — distinguishes from old v1.
-        schema_version: ``3`` — checked by ``load_stage2_profile_v3``.
+        format_version: constant ``4`` — distinguishes from old v1/v3.
+        schema_version: ``4`` — checked by ``load_stage2_profile_v4``.
         model_hash: SHA-256 of model name + config (cross-validation).
         n_layers: number of MoE layers.
         n_experts: routed experts per layer.
@@ -436,10 +444,12 @@ class Stage2ProfilePayloadV3:
             ``s2.covariance_storage_dtype`` setting at load time.
         total_tokens_per_layer: [n_layers] int64 — Σ_b T_b per layer
             (independent of routing activity; Bug #3 fix).
-        gate_logit_profiles: ``dict[layer_rank → list[(offset, Tensor)]]``
-            — raw per-batch gate logits, preserved verbatim from the
-            live ``ReamCostAccumulator.gate_logit_profiles`` storage
-            (Bug #2 fix).
+        gate_gram: [n_layers, E, E] fp64 — the bounded online router-logit
+            Gram ``G[i,j] = Σ_t v_i[t]·v_j[t]`` over the full expert
+            population per layer (diag = per-expert ‖v_e‖₂²). Rehydrated into
+            ``ReamCostAccumulator._gate_gram`` and consumed by
+            ``compute_gate_similarity_matrix`` to reconstruct δ_gate
+            (Bug #2 fix: bounded, constant in token count).
         sim_tensor: [n_layers, E, E] fp64 — Σ_t cos(g_i[t], g_j[t]) over
             jointly-active tokens (Bug #1 fix: per-token pair cosines,
             NOT cos(mean_i, mean_j)).
@@ -456,15 +466,15 @@ class Stage2ProfilePayloadV3:
             ``_output_space_cost``. Always captured when the sidecar is
             written (no sub-flag; see plan §6 / OQ-2 resolution).
     """
-    format_version: int                     # = 3
-    schema_version: int                     # = 3
+    format_version: int                     # = 4
+    schema_version: int                     # = 4
     model_hash: str
     n_layers: int
     n_experts: int
     top_k: int
     cov_storage_dtype: str                  # one of {"float16","bfloat16","float32"}
     total_tokens_per_layer: torch.Tensor    # [n_layers] int64
-    gate_logit_profiles: dict               # dict[int → list[tuple[int, Tensor[T_b, E] fp32]]]
+    gate_gram: torch.Tensor                 # [n_layers, E, E] fp64
     sim_tensor: torch.Tensor                # [n_layers, E, E] fp64
     neuron_act_sum: dict                    # {(layer_rank, expert_idx): Tensor[d_int] fp32}
     neuron_act_count: dict                  # {(layer_rank, expert_idx): int}
@@ -992,40 +1002,31 @@ def load_phase_b(jsonl_path: Path) -> PhaseBPayload | None:
 # ---------------------------------------------------------------------------
 # Signal 2: stage2_profile (Stage 2 REDO — Optimization A profile-pass sidecar).
 #
-# Schema v3 (see Stage2ProfilePayloadV3 docstring above). The v1 dataclass
+# Schema v4 (see Stage2ProfilePayloadV4 docstring above). The v1 dataclass
 # was deleted; no alias is retained per plan §3 / Low-8 (prior v1 had no
-# production writer, so no callers exist).
+# production writer, so no callers exist). v3 → v4 replaces the unbounded
+# raw gate_logit_profiles list with a bounded online gate_gram Gram tensor.
 # ---------------------------------------------------------------------------
 _COV_STORAGE_DTYPE_ALLOWED = ("float16", "bfloat16", "float32")
 
 
-def save_stage2_profile_v3(
-    payload: Stage2ProfilePayloadV3, jsonl_path: Path,
+def save_stage2_profile_v4(
+    payload: Stage2ProfilePayloadV4, jsonl_path: Path,
 ) -> None:
-    """Atomically write the Stage 2 profile sidecar (schema v3).
+    """Atomically write the Stage 2 profile sidecar (schema v4).
 
     Moves all tensors to CPU before serialization so the sidecar is
     device-agnostic (H200 → RTX 6000 Pro / CPU round-trip is supported).
-    The ``gate_logit_profiles`` dict's nested ``list[tuple[int, Tensor]]``
-    structure is preserved byte-for-byte: each per-batch tensor is moved
-    to CPU but the ``(int, tensor)`` tuple shape and list ordering are
-    not altered.
+    The ``gate_gram`` tensor (bounded [n_layers, E, E] fp64 router-logit
+    Gram) is CPU-cast to fp64, like ``sim_tensor``.
     """
     if payload.cov_storage_dtype not in _COV_STORAGE_DTYPE_ALLOWED:
         raise ValueError(
-            f"save_stage2_profile_v3: cov_storage_dtype="
+            f"save_stage2_profile_v4: cov_storage_dtype="
             f"{payload.cov_storage_dtype!r} not in "
             f"{_COV_STORAGE_DTYPE_ALLOWED!r}"
         )
     cov_dtype = getattr(torch, payload.cov_storage_dtype)
-
-    # Move gate_logit_profiles list-of-tuples to CPU, preserving shape.
-    cpu_glp: dict[int, list[tuple[int, torch.Tensor]]] = {}
-    for layer_rank, batches in payload.gate_logit_profiles.items():
-        cpu_glp[int(layer_rank)] = [
-            (int(offset), t.detach().to("cpu", dtype=torch.float32).contiguous())
-            for offset, t in batches
-        ]
 
     # neuron_act_sum / neuron_act_count are small per-(layer, expert) tensors
     # / ints; CPU-cast tensors, deep-copy counts.
@@ -1060,7 +1061,7 @@ def save_stage2_profile_v3(
                 t.detach().to("cpu", dtype=torch.bfloat16).contiguous()
             )
 
-    cpu_payload = Stage2ProfilePayloadV3(
+    cpu_payload = Stage2ProfilePayloadV4(
         format_version=int(payload.format_version),
         schema_version=int(payload.schema_version),
         model_hash=str(payload.model_hash),
@@ -1071,7 +1072,9 @@ def save_stage2_profile_v3(
         total_tokens_per_layer=payload.total_tokens_per_layer.detach().to(
             "cpu", dtype=torch.int64,
         ).contiguous(),
-        gate_logit_profiles=cpu_glp,
+        gate_gram=payload.gate_gram.detach().to(
+            "cpu", dtype=torch.float64,
+        ).contiguous(),
         sim_tensor=payload.sim_tensor.detach().to(
             "cpu", dtype=torch.float64,
         ).contiguous(),
@@ -1088,7 +1091,7 @@ def save_stage2_profile_v3(
     )
 
 
-def load_stage2_profile_v3(
+def load_stage2_profile_v4(
     jsonl_path: Path,
     *,
     expected_cov_storage_dtype: str | None = None,
@@ -1096,8 +1099,8 @@ def load_stage2_profile_v3(
     expected_n_experts: int | None = None,
     expected_top_k: int | None = None,
     expected_model_hash: str | None = None,
-) -> Stage2ProfilePayloadV3 | None:
-    """Load the Stage 2 profile sidecar (schema v3).
+) -> Stage2ProfilePayloadV4 | None:
+    """Load the Stage 2 profile sidecar (schema v4).
 
     Returns ``None`` if the sidecar does not exist (cache miss). Raises
     ``ValueError`` with the "Delete the sidecar to regenerate" message on
@@ -1124,9 +1127,9 @@ def load_stage2_profile_v3(
     )
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     _check_schema("stage2_profile", loaded.schema_version, path)
-    if not isinstance(loaded, Stage2ProfilePayloadV3):
+    if not isinstance(loaded, Stage2ProfilePayloadV4):
         raise ValueError(
-            f"stage2_profile sidecar at {path} is not Stage2ProfilePayloadV3 "
+            f"stage2_profile sidecar at {path} is not Stage2ProfilePayloadV4 "
             f"(got {type(loaded).__name__}). "
             f"Delete the sidecar to regenerate."
         )
@@ -1732,7 +1735,7 @@ __all__ = [
     "sidecar_path",
     "router_kd_logits_dir",
     "PhaseBPayload",
-    "Stage2ProfilePayloadV3",
+    "Stage2ProfilePayloadV4",
     "Stage2ReapPayload",
     "Stage1PerExpertMaxPayload",
     "RoutingStatsPayload",
@@ -1744,8 +1747,8 @@ __all__ = [
     "BlockHiddenPayload",
     "TeacherEvalPayload",
     "load_phase_b",
-    "save_stage2_profile_v3",
-    "load_stage2_profile_v3",
+    "save_stage2_profile_v4",
+    "load_stage2_profile_v4",
     "save_reap_scores",
     "load_reap_scores",
     "save_per_expert_max",

@@ -25,8 +25,8 @@ Architecture
   accumulators untouched and the live forward runs.
 
 Hydration contract (in-place; see plan §10):
-    * ``ream_acc.gate_logit_profiles[layer_idx]`` ← payload list-of-tuples
-      verbatim (list[(int_offset, Tensor[T_b, E] fp32)]).
+    * ``ream_acc._gate_gram[layer_idx]`` ← clone of payload gate_gram row
+      (the bounded [E, E] fp64 router-logit Gram for this layer).
     * ``ream_acc._sim_tensor[layer_idx]``           ← clone of payload sim row.
     * ``ream_acc._total_tokens_by_layer[layer_idx]`` ← payload total.
     * ``ream_acc._neuron_act_sum/_count[(layer_idx, e)]`` ← payload rows for
@@ -57,8 +57,8 @@ import torch
 
 from ...pipeline.context import PipelineContext
 from ...utils.cached_calibration_signals import (
-    Stage2ProfilePayloadV3,
-    load_stage2_profile_v3,
+    Stage2ProfilePayloadV4,
+    load_stage2_profile_v4,
     sidecar_path,
 )
 
@@ -138,7 +138,7 @@ class Stage2ProfileCacheProvider:
         self.partial_hit_fraction = float(partial_hit_fraction)
         self.cost_alignment = str(cost_alignment).lower()
         # Filled by on_load; consumed by on_layer_setup.
-        self.payload: Stage2ProfilePayloadV3 | None = None
+        self.payload: Stage2ProfilePayloadV4 | None = None
 
     def _cost_alignment_requires_reservoir(self) -> bool:
         """True iff ``cost_alignment="output"`` is active.
@@ -163,8 +163,8 @@ class Stage2ProfileCacheProvider:
     # ------------------------------------------------------------------
     def on_load(
         self, ctx: PipelineContext, jsonl_path: Path,
-    ) -> Stage2ProfilePayloadV3 | None:
-        """Try to load the schema-v3 stage2_profile sidecar.
+    ) -> Stage2ProfilePayloadV4 | None:
+        """Try to load the schema-v4 stage2_profile sidecar.
 
         Returns the loaded payload on hit; ``None`` on miss (graceful —
         the live path runs unchanged). Raises ``ValueError`` on schema
@@ -174,7 +174,7 @@ class Stage2ProfileCacheProvider:
         # "Delete the sidecar to regenerate" message — let them propagate
         # to the operator unchanged (no try/except wrapper; the previous
         # `except ValueError: raise` was a no-op).
-        payload = load_stage2_profile_v3(
+        payload = load_stage2_profile_v4(
             jsonl_path,
             expected_cov_storage_dtype=self.expected_cov_storage_dtype,
         )
@@ -246,16 +246,12 @@ class Stage2ProfileCacheProvider:
         ream_acc = ctx.get("ream_acc")
         layer_input_acc = ctx.get("layer_input_acc")
 
-        # gate_logit_profiles: preserve list-of-tuples shape verbatim. The
-        # downstream consumer compute_gate_similarity_matrix
-        # (activation_hooks.py:501) unpacks via `for _, t in batches` —
-        # only the tensors are read, but the offset MUST stay in the tuple
-        # so the live storage shape contract is preserved (round-2 Crit-1).
-        sidecar_batches = payload.gate_logit_profiles.get(layer_rank, ())
-        # Copy the list (shallow) so future writer-side mutations of the
-        # payload list cannot bleed into the live acc. Tensors themselves
-        # are not cloned (record_router_logits never mutates them post-append).
-        ream_acc.gate_logit_profiles[layer_idx] = list(sidecar_batches)
+        # _gate_gram: clone the bounded [E, E] fp64 router-logit Gram row so
+        # the downstream consumer compute_gate_similarity_matrix reconstructs
+        # δ_gate from it (mirrors the _sim_tensor hydration below). The clone
+        # guards against any in-place mutation bleeding into the payload.
+        gram_row = payload.gate_gram[layer_rank]
+        ream_acc._gate_gram[layer_idx] = gram_row.clone()
 
         # _sim_tensor: clone the [E, E] row so any in-place add later
         # (none expected on full hit, defense-in-depth) does not mutate

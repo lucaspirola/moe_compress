@@ -36,8 +36,8 @@ from moe_compress.utils.activation_hooks import (
 )
 from moe_compress.utils.cached_calibration_signals import (
     SCHEMA_VERSIONS,
-    Stage2ProfilePayloadV3,
-    load_stage2_profile_v3,
+    Stage2ProfilePayloadV4,
+    load_stage2_profile_v4,
 )
 
 
@@ -152,7 +152,7 @@ def test_roundtrip_layer_input_reservoir_populated(tmp_path):
     jsonl = _jsonl(tmp_path)
     s2pw.dump_stage2_profile(jsonl)
 
-    payload = load_stage2_profile_v3(jsonl)
+    payload = load_stage2_profile_v4(jsonl)
     assert payload is not None
     assert isinstance(payload.layer_input_reservoir, list)
     assert len(payload.layer_input_reservoir) == 2
@@ -211,7 +211,7 @@ def test_dump_emits_empty_placeholder_when_no_layer_in_fired(tmp_path):
     jsonl = _jsonl(tmp_path)
     s2pw.dump_stage2_profile(jsonl)
 
-    payload = load_stage2_profile_v3(jsonl)
+    payload = load_stage2_profile_v4(jsonl)
     for t in payload.layer_input_reservoir:
         assert t.dtype == torch.bfloat16
         assert t.numel() == 0
@@ -424,20 +424,16 @@ def test_checkpoint_resume_byte_identical_after_phase_c(tmp_path):
 # ---------------------------------------------------------------------------
 def _build_payload_with_empty_reservoir(
     n_layers: int = 2,
-) -> Stage2ProfilePayloadV3:
+) -> Stage2ProfilePayloadV4:
     """Build a sidecar that mimics a pre-CRITICAL-1 capture (empty reservoirs)."""
-    gate_logit_profiles = {
-        lr: [(0, torch.ones((1000, 2), dtype=torch.float32))]
-        for lr in range(n_layers)
-    }
     cov_acc = {
         (lr, e, m): torch.eye(4, dtype=torch.float16)
         for lr in range(n_layers)
         for e in range(2)
         for m in ("gate_proj", "down_proj")
     }
-    return Stage2ProfilePayloadV3(
-        format_version=3,
+    return Stage2ProfilePayloadV4(
+        format_version=4,
         schema_version=SCHEMA_VERSIONS["stage2_profile"],
         model_hash="h",
         n_layers=n_layers,
@@ -445,7 +441,7 @@ def _build_payload_with_empty_reservoir(
         top_k=1,
         cov_storage_dtype="float16",
         total_tokens_per_layer=torch.full((n_layers,), 1000, dtype=torch.int64),
-        gate_logit_profiles=gate_logit_profiles,
+        gate_gram=torch.zeros((n_layers, 2, 2), dtype=torch.float64),
         sim_tensor=torch.zeros((n_layers, 2, 2), dtype=torch.float64),
         neuron_act_sum={
             (lr, e): torch.zeros((4,), dtype=torch.float32)

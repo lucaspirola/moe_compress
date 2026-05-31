@@ -47,7 +47,7 @@ from moe_compress.utils.cached_calibration_signals import (
     RouterLogitsStatsPayload,
     RoutingStatsPayload,
     Stage1PerExpertMaxPayload,
-    Stage2ProfilePayloadV3,
+    Stage2ProfilePayloadV4,
     Stage2ReapPayload,
     TeacherEvalPayload,
     load_block_hidden,
@@ -59,7 +59,7 @@ from moe_compress.utils.cached_calibration_signals import (
     load_router_logits_stats,
     load_routing_stats,
     load_router_kd_logits,
-    load_stage2_profile_v3,
+    load_stage2_profile_v4,
     router_kd_logits_dir,
     save_block_hidden,
     save_covariance,
@@ -68,7 +68,7 @@ from moe_compress.utils.cached_calibration_signals import (
     save_reap_scores,
     save_router_logits_stats,
     save_routing_stats,
-    save_stage2_profile_v3,
+    save_stage2_profile_v4,
     sidecar_path,
 )
 
@@ -122,23 +122,27 @@ def _test_save_phase_b(payload: PhaseBPayload, jsonl_path: Path) -> None:
 
 def _make_stage2_profile(
     n_layers: int = 2, n_experts: int = 3, *, hidden: int = 8, d_int: int = 4,
-) -> Stage2ProfilePayloadV3:
-    """Build a deterministic Stage 2 profile-pass payload (schema v3).
+) -> Stage2ProfilePayloadV4:
+    """Build a deterministic Stage 2 profile-pass payload (schema v4).
 
     Tiny shapes — the focus is on schema/IO round-trip, not numerics.
     """
-    gate_logit_profiles: dict[int, list[tuple[int, torch.Tensor]]] = {}
     neuron_act_sum: dict = {}
     neuron_act_count: dict = {}
     cov_acc: dict = {}
     cov_token_count: dict = {}
     layer_input_reservoir: list = []
     T_b = 5
+    # Bounded [n_layers, E, E] fp64 router-logit Gram (replaces the former
+    # unbounded gate_logit_profiles list). A deterministic non-zero Gram.
+    if n_layers > 0:
+        gate_gram = torch.stack([
+            torch.full((n_experts, n_experts), 0.5 * (lr + 1), dtype=torch.float64)
+            for lr in range(n_layers)
+        ])
+    else:
+        gate_gram = torch.zeros((0, n_experts, n_experts), dtype=torch.float64)
     for lr in range(n_layers):
-        gate_logit_profiles[lr] = [
-            (T_b * b, torch.full((T_b, n_experts), 0.1 * (b + 1), dtype=torch.float32))
-            for b in range(2)
-        ]
         for e in range(n_experts):
             neuron_act_sum[(lr, e)] = torch.full((d_int,), 0.3, dtype=torch.float32)
             neuron_act_count[(lr, e)] = 11
@@ -146,8 +150,8 @@ def _make_stage2_profile(
                 cov_acc[(lr, e, m)] = torch.eye(hidden, dtype=torch.float16)
                 cov_token_count[(lr, e, m)] = 7
         layer_input_reservoir.append(torch.zeros((8, hidden), dtype=torch.bfloat16))
-    return Stage2ProfilePayloadV3(
-        format_version=3,
+    return Stage2ProfilePayloadV4(
+        format_version=4,
         schema_version=SCHEMA_VERSIONS["stage2_profile"],
         model_hash="deadbeef",
         n_layers=n_layers,
@@ -155,7 +159,7 @@ def _make_stage2_profile(
         top_k=2,
         cov_storage_dtype="float16",
         total_tokens_per_layer=torch.full((n_layers,), 2 * T_b, dtype=torch.int64),
-        gate_logit_profiles=gate_logit_profiles,
+        gate_gram=gate_gram,
         sim_tensor=torch.zeros((n_layers, n_experts, n_experts), dtype=torch.float64),
         neuron_act_sum=neuron_act_sum,
         neuron_act_count=neuron_act_count,
@@ -293,28 +297,23 @@ def test_sidecar_path_atomic_and_sharded(tmp_path):
 def test_stage2_profile_roundtrip(tmp_path):
     jsonl = _jsonl(tmp_path)
     original = _make_stage2_profile()
-    save_stage2_profile_v3(original, jsonl)
+    save_stage2_profile_v4(original, jsonl)
 
     expected_path = sidecar_path(jsonl, "stage2_profile")
     assert expected_path.exists()
 
-    loaded = load_stage2_profile_v3(jsonl)
+    loaded = load_stage2_profile_v4(jsonl)
     assert loaded is not None
     assert loaded.schema_version == SCHEMA_VERSIONS["stage2_profile"]
-    assert loaded.format_version == 3
+    assert loaded.format_version == 4
     assert loaded.cov_storage_dtype == "float16"
     assert torch.equal(
         loaded.total_tokens_per_layer, original.total_tokens_per_layer.cpu()
     )
     assert torch.equal(loaded.sim_tensor, original.sim_tensor.cpu())
-    # gate_logit_profiles preserves the list-of-tuples shape verbatim.
-    assert set(loaded.gate_logit_profiles) == set(original.gate_logit_profiles)
-    for lr, batches in original.gate_logit_profiles.items():
-        loaded_batches = loaded.gate_logit_profiles[lr]
-        assert len(loaded_batches) == len(batches)
-        for (lof, lt), (oof, ot) in zip(loaded_batches, batches):
-            assert int(lof) == int(oof)
-            assert torch.equal(lt, ot.cpu())
+    # gate_gram (bounded [n_layers, E, E] fp64 Gram) round-trips verbatim.
+    assert torch.equal(loaded.gate_gram, original.gate_gram.cpu())
+    assert loaded.gate_gram.dtype == torch.float64
     # Dtype preserved across the round-trip (float64 stays float64).
     assert loaded.sim_tensor.dtype == torch.float64
     assert loaded.total_tokens_per_layer.dtype == torch.int64
@@ -692,14 +691,14 @@ def _assert_manifest_well_formed(
 
 
 def test_stage2_profile_manifest_roundtrip(tmp_path):
-    """save_stage2_profile_v3 emits a sibling manifest carrying the v3
+    """save_stage2_profile_v4 emits a sibling manifest carrying the v3
     schema_version, the payload's name + size, and extra.artifact —
     AND read_and_validate_manifest accepts the pair (manifest-last
     invariant)."""
     from moe_compress.utils.atomic_io import read_and_validate_manifest
 
     jsonl = _jsonl(tmp_path)
-    save_stage2_profile_v3(_make_stage2_profile(), jsonl)
+    save_stage2_profile_v4(_make_stage2_profile(), jsonl)
     payload_path = sidecar_path(jsonl, "stage2_profile")
     assert payload_path.exists()
     manifest = _assert_manifest_well_formed(payload_path, "stage2_profile")
@@ -890,11 +889,11 @@ def test_stage2_profile_torn_payload_detected_by_size(tmp_path):
     error (plan §11.1 — manifest validation runs FIRST)."""
     _clear_warn_dedupe()
     jsonl = _jsonl(tmp_path)
-    save_stage2_profile_v3(_make_stage2_profile(), jsonl)
+    save_stage2_profile_v4(_make_stage2_profile(), jsonl)
     payload_path = sidecar_path(jsonl, "stage2_profile")
     _truncate_to_half(payload_path)
     _expect_torn_payload_runtime_error(
-        load_stage2_profile_v3, jsonl, "stage2_profile", payload_path.name,
+        load_stage2_profile_v4, jsonl, "stage2_profile", payload_path.name,
     )
 
 
@@ -1031,7 +1030,7 @@ def _missing_manifest_warn_fallback_loads(
 
 def test_stage2_profile_missing_manifest_warn_fallback_loads(tmp_path, caplog):
     _missing_manifest_warn_fallback_loads(
-        load_stage2_profile_v3, save_stage2_profile_v3, _make_stage2_profile,
+        load_stage2_profile_v4, save_stage2_profile_v4, _make_stage2_profile,
         _jsonl(tmp_path), "stage2_profile", caplog,
     )
 
@@ -1136,7 +1135,7 @@ def _missing_manifest_warn_deduped(
 
 def test_stage2_profile_missing_manifest_warn_deduped(tmp_path, caplog):
     _missing_manifest_warn_deduped(
-        load_stage2_profile_v3, save_stage2_profile_v3, _make_stage2_profile,
+        load_stage2_profile_v4, save_stage2_profile_v4, _make_stage2_profile,
         _jsonl(tmp_path), "stage2_profile", caplog,
     )
 
@@ -1246,7 +1245,7 @@ def test_stage2_profile_manifest_with_cross_validation(tmp_path):
     RuntimeError, NOT a misleading ``expected_n_layers`` ValueError.
 
     Posture: write a healthy stage2_profile, truncate it, then call
-    load_stage2_profile_v3 with intentionally mismatched expected_*
+    load_stage2_profile_v4 with intentionally mismatched expected_*
     kwargs. Without ordering control, the loader could surface a
     cross-validation error (or torch.load could fail mid-deserialize
     with an opaque message). With the fix, the manifest check fires
@@ -1255,7 +1254,7 @@ def test_stage2_profile_manifest_with_cross_validation(tmp_path):
     _clear_warn_dedupe()
     jsonl = _jsonl(tmp_path)
     payload = _make_stage2_profile(n_layers=2, n_experts=3)
-    save_stage2_profile_v3(payload, jsonl)
+    save_stage2_profile_v4(payload, jsonl)
     payload_path = sidecar_path(jsonl, "stage2_profile")
     _truncate_to_half(payload_path)
 
@@ -1263,7 +1262,7 @@ def test_stage2_profile_manifest_with_cross_validation(tmp_path):
     # payload's metadata (n_layers=999) — but the manifest error must
     # surface first.
     with pytest.raises(RuntimeError) as exc:
-        load_stage2_profile_v3(
+        load_stage2_profile_v4(
             jsonl,
             expected_n_layers=999,
             expected_n_experts=999,

@@ -83,20 +83,22 @@ class ReamCostAccumulator:
     (paper 2604.04356, Eq. 5 & 8).
 
     Storage per layer:
-      - gate_logit_profiles[layer_idx]: list of (batch_offset, logits) pairs,
-        where ``logits`` is a CPU float32 tensor of shape ``[T_batch, n_experts]``
-        — one entry appended per profiling batch. The pre-softmax routing
-        scores for batch ``b`` cover global token indices
-        ``[batch_offsets[b], batch_offsets[b] + T_batch)``. This append-only
-        list-of-batches storage replaces a former
-        ``dict[layer][expert] → dict[global_token → float]`` which produced
-        O(T×E) Python dict assignments per batch (3M+ assignments for
-        T=12288/E=256) and dominated wall-time at large num_sequences.
-        Aligned by global token position so δ_gate cosine similarity compares
-        the same tokens across experts (paper Eq. 5). Pre-softmax scores
-        can be negative and unbounded, giving the full [-1, 1] cosine
-        similarity range (post-softmax weights are non-negative,
-        compressing cosine to [0, 1]).
+      - _gate_gram[layer_idx]: a bounded ``[E, E]`` float64 CPU Gram matrix
+        ``G[i, j] = Σ_t v_i[t]·v_j[t]`` accumulated online from the
+        pre-softmax routing-logit vectors ``v_e`` (one column per expert of
+        the dense ``[T, E]`` router output, populated for EVERY token incl.
+        non-top-k). ``record_router_logits`` folds each batch in via
+        ``G += full_bᵀ @ full_b`` and discards the raw logits — bounded at
+        ``E²·8`` bytes ≈ 512 KB/layer at E=256, regardless of token count
+        (vs. the former unbounded list of per-batch ``[T_batch, E]`` tensors
+        that grew to hundreds of GB on the vLLM single-pass path). ``G`` is a
+        complete sufficient statistic for δ_gate: the diagonal is the per-
+        expert sum-of-squares ``‖v_e‖₂²`` and the off-diagonal is the inner
+        product ``v_i·v_j``, so the cosine geometry (hence the dist2sim of
+        paper Eq. 5) is reconstructed exactly in fp64 at finalize.
+        Pre-softmax scores can be negative and unbounded, giving the full
+        [-1, 1] cosine similarity range (post-softmax weights are non-
+        negative, compressing cosine to [0, 1]).
       - _sim_tensor[layer_idx]: incremental pairwise cosine similarity of
         gated expert outputs per batch (paper Eq. 8, approximated as
         cosine(mean_gated_i, mean_gated_j) per batch), stored as a dense
@@ -110,14 +112,14 @@ class ReamCostAccumulator:
     """
     # Total number of experts in the MoE layer; 0 means "not set, skip bounds check".
     num_experts: int = 0
-    # Per-layer: append-only list of (batch_offset, logits[T_batch, n_experts])
-    # pairs accumulated by record_router_logits. compute_gate_similarity_matrix
-    # concatenates this list once per call into a dense [T_total, n_experts]
-    # matrix. See class docstring for the rationale (eliminates O(T×E) Python
-    # dict population per batch).
-    gate_logit_profiles: dict[int, list[tuple[int, torch.Tensor]]] = field(
-        default_factory=lambda: defaultdict(list)
-    )
+    # Per-layer router-logit Gram accumulator G[i,j] = Σ_t v_i[t]·v_j[t],
+    # a bounded [E, E] float64 CPU tensor. record_router_logits folds each
+    # batch in via G += full_bᵀ @ full_b and discards the raw logits;
+    # compute_gate_similarity_matrix reconstructs δ_gate from G in fp64.
+    # diag(G) = Σ_t v_e[t]² = ‖v_e‖₂². Bounded: E²·8 bytes ≈ 512 KB/layer at
+    # E=256 (vs. the former unbounded raw-logit list it replaces). See class
+    # docstring for the sufficient-statistic rationale.
+    _gate_gram: dict[int, torch.Tensor] = field(default_factory=dict)
     # Incremental pairwise cosine similarity of gated expert outputs, stored
     # as a dense [E, E] float64 CPU tensor per layer (keyed by layer_idx).
     # Entry [i, j] accumulates Σ_{t in shared} cos_sim for the ordered pair
@@ -154,23 +156,35 @@ class ReamCostAccumulator:
         """Record pre-softmax routing scores for ALL experts from one batch.
 
         Called once per batch per layer (from the ``capture_router_outputs``
-        hook), NOT once per expert. Appends the entire ``[T_batch, n_experts]``
-        tensor to ``gate_logit_profiles[layer_idx]`` as one
-        ``(batch_offset, tensor)`` pair — O(1) Python work, no per-token loop.
+        hook), NOT once per expert. Folds the entire ``[T_batch, n_experts]``
+        tensor into the bounded online Gram ``G += full_bᵀ @ full_b`` and
+        discards the raw logits — O(E²) work + a single [E, E] CPU transfer
+        per batch, constant in token count.
 
         "Routing score" here means: linear projection + optional bias +
         e_score_correction_bias if present (pre-softmax routing score).
 
         Args:
             logits: [T, E] pre-softmax routing scores.
-            batch_offset: global token index of the first row in this batch
-                (== batch_idx * batch_size * seq_len under cumulative offsets).
+            batch_offset: kept in the signature for API compatibility; no
+                longer used — Gram accumulation is order-independent and needs
+                no global token index.
         """
-        # Single CPU sync moves the whole batch's logits at once; storage is
-        # float32 to match the prior dict[int, float] precision.
-        logits_cpu = logits.detach().to(torch.float32).cpu().contiguous()
+        # fp64 is MANDATORY (§2.4 of PLAN_GATE_LOGIT_ONLINE): an fp32 Gram
+        # would breach the δ_gate accuracy budget via catastrophic
+        # cancellation in the √(2−2cos) reconstruction for near-colinear
+        # experts. Compute gram_b on the logits' device, then a single [E, E]
+        # CPU transfer per batch.
+        x = logits.detach().to(torch.float64)  # [T_b, E]
+        gram_b = (x.transpose(0, 1) @ x).cpu().contiguous()  # [E, E] = Σ_{t∈b} v[t]v[t]ᵀ
+        del batch_offset  # unused; documented above
         with self._lock:
-            self.gate_logit_profiles[layer_idx].append((int(batch_offset), logits_cpu))
+            g = self._gate_gram.get(layer_idx)
+            if g is None:
+                self._gate_gram[layer_idx] = gram_b
+            else:
+                g.add_(gram_b)
+        # raw logits go out of scope → freed each batch (the whole point)
 
     def record_gated_output(self, layer_idx: int, expert_idx: int,
                             gate_weights: torch.Tensor, expert_output: torch.Tensor,
@@ -483,62 +497,60 @@ class ReamCostAccumulator:
         if n == 0:
             return torch.zeros(0, 0, dtype=torch.float32)
 
-        # Snapshot the batch list under the lock, then release before the
-        # concat. The list of (offset, tensor) pairs is shallow-copied; the
-        # individual tensors are not cloned because record_router_logits
-        # never mutates them after append (each call appends a fresh
-        # CPU-resident detach()'d tensor).
+        # Snapshot the online Gram under the lock. G[i,j] = Σ_t v_i[t]·v_j[t]
+        # is a complete sufficient statistic for the δ_gate cosine geometry;
+        # we reconstruct the (formerly cdist-on-normalized-rows) similarity
+        # from G entirely in fp64 (§2 of PLAN_GATE_LOGIT_ONLINE).
         with self._lock:
-            batches = list(self.gate_logit_profiles.get(layer_idx, ()))
+            g = self._gate_gram.get(layer_idx)
 
-        if not batches:
+        if g is None:
             return torch.zeros(n, n, dtype=torch.float32)
 
-        # Concatenate per-batch tensors → dense [T_total, n_experts]. Token
-        # indexing here is implicit: row i corresponds to the i'th token in
-        # batch-order, which matches the contiguous batch_offset accumulation
-        # in _profile_layer (`_next_offset += batch.numel()`).
-        full = torch.cat([t for _, t in batches], dim=0)  # [T_total, n_experts_layer]
-
-        # Select the requested experts' columns and transpose to [n, T_total].
-        # `expert_ids` are global expert indices; the storage tensor's second
-        # axis is indexed by the same expert ids, so this is a direct gather.
+        # Sub-select the requested experts' rows/cols → [n, n] in fp64.
+        # `expert_ids` are global expert indices indexing the full [E, E] Gram.
         col_idx = torch.tensor(expert_ids, dtype=torch.long)
         try:
-            mat = full.index_select(1, col_idx).t().contiguous()  # [n, T_total]
+            G_sub = (
+                g.index_select(0, col_idx).index_select(1, col_idx).to(torch.float64)
+            )  # [n, n]
         except IndexError as exc:
             raise IndexError(
                 f"compute_gate_similarity_matrix: expert_ids out of range for "
-                f"layer {layer_idx} logits with {full.shape[1]} columns: {exc}"
+                f"layer {layer_idx} gram with {g.shape[0]} rows: {exc}"
             ) from exc
 
-        # L2-row-normalize each expert's profile vector.
-        mat = F.normalize(mat, p=2, dim=1)  # (n, T)
-        # Guard against NaN from zero-norm rows (experts with an all-zero profile
-        # vector). F.normalize produces NaN for zero vectors; replace with zeros
-        # so they contribute minimum (0.0) similarity to every pair.
-        mat = torch.where(torch.isnan(mat), torch.zeros_like(mat), mat)
-
-        # Early exit for all-zero (or near-zero) profile matrix — cdist would
-        # yield all-zero distances, mapping to all-ones similarity, which is
-        # meaningless.  Using an absolute threshold (< 1e-9) rather than exact
-        # equality avoids the case where near-zero but non-exactly-zero entries
-        # pass the check and then cause d.max().clamp(min=1e-12) to produce
-        # large negative sim values outside [0, 1].
-        if mat.abs().max() < 1e-9:
+        # Per-expert L2 norms = sqrt(diag(G)); clamp_min(0) guards fp negatives.
+        norms = G_sub.diagonal().clamp_min(0.0).sqrt()  # [n]
+        nz = norms > 0
+        # All-zero early exit: equivalent to the former mat.abs().max() < 1e-9
+        # (a normalized non-zero row has unit-magnitude entries ≫ 1e-9, so the
+        # matrix is ~zero only when EVERY expert profile is zero-normed).
+        if not bool(nz.any()) or float(norms.max()) < 1e-9:
             return torch.zeros(n, n, dtype=torch.float32)
 
-        # Full pairwise Euclidean distances → (n, n).
-        d = torch.cdist(mat, mat, p=2)  # (n, n)
+        # Reconstruct d = √(2−2cos) in fp64. The explicit-norm form below
+        # reproduces the former F.normalize + where(isnan,0) zero-vector
+        # convention exactly (§2.3): unit_i + unit_j − 2cos_ij, where unit_e
+        # = 1 iff expert e has signal. fp64 throughout is load-bearing — an
+        # fp32 (2−2cos) subtraction triggers catastrophic cancellation for
+        # near-colinear experts and breaches the accuracy budget (§2.4).
+        unit = nz.to(torch.float64)  # [n]; 1 if expert has signal, else 0
+        denom = (norms[:, None] * norms[None, :]).clamp_min(1e-300)
+        cos = torch.where(
+            nz[:, None] & nz[None, :], G_sub / denom, torch.zeros_like(G_sub)
+        )
+        d = (unit[:, None] + unit[None, :] - 2.0 * cos).clamp_min(0.0).sqrt()  # (n, n)
 
         # dist2sim: 1 - d / d.max() (observed-max normalization, matching reference).
-        # Numerical robustness clamp for near-zero profiles (the all-zeros case is handled above).
-        sim = 1.0 - d / d.max().clamp(min=1e-12)
+        sim = 1.0 - d / d.max().clamp_min(1e-12)
         sim.fill_diagonal_(1.0)
-        # Safety clamp: floating-point rounding in cdist can push values
-        # infinitesimally outside [0, 1]; clamp to guarantee the contract.
+        # Safety clamp: floating-point rounding can push values infinitesimally
+        # outside [0, 1]; clamp to guarantee the contract.
         sim.clamp_(0.0, 1.0)
 
+        # Output downcast to fp32 matches the former return dtype; it is post-
+        # d.max() normalization, so it does not re-introduce cancellation.
         return sim.to(torch.float32)
 
     def compute_delta_expert(self, layer_idx: int, expert_i: int, expert_j: int) -> float:
@@ -609,7 +621,7 @@ class ReamCostAccumulator:
     def clear_layer(self, layer_idx: int) -> None:
         """Free memory for a processed layer."""
         with self._lock:
-            self.gate_logit_profiles.pop(layer_idx, None)
+            self._gate_gram.pop(layer_idx, None)
             self._sim_tensor.pop(layer_idx, None)
             self._total_tokens_by_layer.pop(layer_idx, None)
             batch_keys = [k for k in self._batch_gated_indexed if k[0] == layer_idx]

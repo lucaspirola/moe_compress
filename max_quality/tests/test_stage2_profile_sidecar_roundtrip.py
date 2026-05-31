@@ -13,9 +13,9 @@ import torch
 
 from moe_compress.utils.cached_calibration_signals import (
     SCHEMA_VERSIONS,
-    Stage2ProfilePayloadV3,
-    load_stage2_profile_v3,
-    save_stage2_profile_v3,
+    Stage2ProfilePayloadV4,
+    load_stage2_profile_v4,
+    save_stage2_profile_v4,
     sidecar_path,
 )
 
@@ -31,9 +31,8 @@ def _make_payload(
     hidden: int = 6,
     d_int: int = 4,
     cov_storage_dtype: str = "float16",
-) -> Stage2ProfilePayloadV3:
-    """Construct a deterministic Stage 2 profile payload (schema v3)."""
-    gate_logit_profiles: dict[int, list[tuple[int, torch.Tensor]]] = {}
+) -> Stage2ProfilePayloadV4:
+    """Construct a deterministic Stage 2 profile payload (schema v4)."""
     neuron_act_sum: dict = {}
     neuron_act_count: dict = {}
     cov_acc: dict = {}
@@ -42,12 +41,11 @@ def _make_payload(
     T_b = 4
     n_batches = 2
     cov_dtype = getattr(torch, cov_storage_dtype)
+    # Bounded [n_layers, E, E] fp64 router-logit Gram (replaces gate_logit_profiles).
+    gate_gram = torch.arange(
+        n_layers * n_experts * n_experts, dtype=torch.float64,
+    ).reshape(n_layers, n_experts, n_experts) + 1.0
     for lr in range(n_layers):
-        gate_logit_profiles[lr] = [
-            (T_b * b,
-             torch.full((T_b, n_experts), 0.1 * (lr + 1) + 0.01 * b, dtype=torch.float32))
-            for b in range(n_batches)
-        ]
         for e in range(n_experts):
             neuron_act_sum[(lr, e)] = torch.full((d_int,), 0.3 * (e + 1), dtype=torch.float32)
             neuron_act_count[(lr, e)] = 17 + e
@@ -58,8 +56,8 @@ def _make_payload(
             torch.arange(8 * hidden, dtype=torch.float32).reshape(8, hidden).to(torch.bfloat16)
         )
 
-    return Stage2ProfilePayloadV3(
-        format_version=3,
+    return Stage2ProfilePayloadV4(
+        format_version=4,
         schema_version=SCHEMA_VERSIONS["stage2_profile"],
         model_hash="abc123",
         n_layers=n_layers,
@@ -69,7 +67,7 @@ def _make_payload(
         total_tokens_per_layer=torch.full(
             (n_layers,), T_b * n_batches, dtype=torch.int64,
         ),
-        gate_logit_profiles=gate_logit_profiles,
+        gate_gram=gate_gram,
         sim_tensor=torch.arange(
             n_layers * n_experts * n_experts, dtype=torch.float64,
         ).reshape(n_layers, n_experts, n_experts),
@@ -85,17 +83,17 @@ def test_roundtrip_byte_identity(tmp_path):
     """All payload fields round-trip byte-identically (plan §8.4)."""
     jsonl = _jsonl(tmp_path)
     original = _make_payload()
-    save_stage2_profile_v3(original, jsonl)
+    save_stage2_profile_v4(original, jsonl)
 
     expected_path = sidecar_path(jsonl, "stage2_profile")
     assert expected_path.exists()
 
-    loaded = load_stage2_profile_v3(jsonl)
+    loaded = load_stage2_profile_v4(jsonl)
     assert loaded is not None
-    assert isinstance(loaded, Stage2ProfilePayloadV3)
+    assert isinstance(loaded, Stage2ProfilePayloadV4)
     # Schema + identity fields.
-    assert loaded.schema_version == 3
-    assert loaded.format_version == 3
+    assert loaded.schema_version == 4
+    assert loaded.format_version == 4
     assert loaded.model_hash == original.model_hash
     assert loaded.n_layers == original.n_layers
     assert loaded.n_experts == original.n_experts
@@ -108,33 +106,24 @@ def test_roundtrip_byte_identity(tmp_path):
     assert loaded.total_tokens_per_layer.dtype == torch.int64
 
 
-def test_roundtrip_gate_logit_profiles_shape_preserved(tmp_path):
-    """gate_logit_profiles preserves the (int, tensor) tuple structure verbatim."""
+def test_roundtrip_gate_gram_preserved(tmp_path):
+    """gate_gram (bounded [n_layers, E, E] fp64 Gram) round-trips byte-identically."""
     jsonl = _jsonl(tmp_path)
     original = _make_payload()
-    save_stage2_profile_v3(original, jsonl)
-    loaded = load_stage2_profile_v3(jsonl)
+    save_stage2_profile_v4(original, jsonl)
+    loaded = load_stage2_profile_v4(jsonl)
 
-    assert set(loaded.gate_logit_profiles) == set(original.gate_logit_profiles)
-    for lr, original_batches in original.gate_logit_profiles.items():
-        loaded_batches = loaded.gate_logit_profiles[lr]
-        assert isinstance(loaded_batches, list)
-        assert len(loaded_batches) == len(original_batches)
-        for (lof, lt), (oof, ot) in zip(loaded_batches, original_batches):
-            # Tuple shape: (int_offset, Tensor[T_b, E] fp32) preserved.
-            assert isinstance(lof, int)
-            assert isinstance(lt, torch.Tensor)
-            assert int(lof) == int(oof)
-            assert lt.dtype == torch.float32
-            assert torch.equal(lt, ot.cpu())
+    assert loaded.gate_gram.dtype == torch.float64
+    assert loaded.gate_gram.shape == original.gate_gram.shape
+    assert torch.equal(loaded.gate_gram, original.gate_gram.cpu())
 
 
 def test_roundtrip_cov_and_neuron_dicts(tmp_path):
     """cov_acc / cov_token_count / neuron_act_* dicts round-trip key+value."""
     jsonl = _jsonl(tmp_path)
     original = _make_payload()
-    save_stage2_profile_v3(original, jsonl)
-    loaded = load_stage2_profile_v3(jsonl)
+    save_stage2_profile_v4(original, jsonl)
+    loaded = load_stage2_profile_v4(jsonl)
 
     assert set(loaded.cov_acc) == set(original.cov_acc)
     for key, ot in original.cov_acc.items():
@@ -152,8 +141,8 @@ def test_roundtrip_layer_input_reservoir(tmp_path):
     """layer_input_reservoir is a list[Tensor[N, hidden] bf16], len==n_layers."""
     jsonl = _jsonl(tmp_path)
     original = _make_payload()
-    save_stage2_profile_v3(original, jsonl)
-    loaded = load_stage2_profile_v3(jsonl)
+    save_stage2_profile_v4(original, jsonl)
+    loaded = load_stage2_profile_v4(jsonl)
 
     assert isinstance(loaded.layer_input_reservoir, list)
     assert len(loaded.layer_input_reservoir) == original.n_layers
@@ -166,18 +155,18 @@ def test_roundtrip_layer_input_reservoir(tmp_path):
 def test_load_miss_returns_none(tmp_path):
     """Cache miss (sidecar absent) returns None gracefully."""
     jsonl = _jsonl(tmp_path)
-    assert load_stage2_profile_v3(jsonl) is None
+    assert load_stage2_profile_v4(jsonl) is None
 
 
 def test_schema_mismatch_raises(tmp_path, monkeypatch):
     """A sidecar with the wrong schema_version raises with the standard message."""
     jsonl = _jsonl(tmp_path)
     original = _make_payload()
-    save_stage2_profile_v3(original, jsonl)
+    save_stage2_profile_v4(original, jsonl)
     # Bump the central version so the existing sidecar disagrees.
     monkeypatch.setitem(SCHEMA_VERSIONS, "stage2_profile", 99)
     with pytest.raises(RuntimeError, match="manifest validation FAILED"):
-        load_stage2_profile_v3(jsonl)
+        load_stage2_profile_v4(jsonl)
 
 
 def test_save_rejects_unknown_cov_dtype(tmp_path):
@@ -187,4 +176,4 @@ def test_save_rejects_unknown_cov_dtype(tmp_path):
     # Hand-mutate to a bad value.
     payload.cov_storage_dtype = "bogus"
     with pytest.raises(ValueError):
-        save_stage2_profile_v3(payload, jsonl)
+        save_stage2_profile_v4(payload, jsonl)
