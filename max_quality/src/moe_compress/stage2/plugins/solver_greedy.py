@@ -121,10 +121,12 @@ def _assign_greedy(
 
     Complexity
     ----------
-    O(n_children · n_centroids · max_group_cap) for the capped path
-    (linear scan per fill slot, per centroid); vs upstream's O(n log n)
-    per centroid via a single ``np.argsort``. Pathological for very large
-    expert counts — see the inline note on pre-sorting.
+    The capped path issues at most ``n_centroids · max_group_cap`` masked
+    ``np.argmin`` calls (one per fill slot, per centroid); each ``argmin`` is
+    a C-level ``O(n_children)`` reduction over the centroid's cost column.
+    So the Python-level iteration is ``O(n_centroids · max_group_cap)`` (the
+    inner ``O(n_children)`` scan is vectorized into ``argmin``), vs upstream's
+    one ``np.argsort`` (``O(n_children log n_children)``) per centroid.
 
     Argument note
     -------------
@@ -176,22 +178,29 @@ def _assign_greedy(
     # The feasibility check (b_fail) in the bump loop uses the same semantics:
     #   n_ream_nc > n_ream_c * max_group_cap  (non-centroids exceed total centroid capacity).
     assignment = [-1] * n_children
-    assigned: set[int] = set()
+    # Global cross-centroid exclusion mask (replaces the ``assigned`` set). A
+    # ``True`` entry means the child is already assigned and must be excluded
+    # from every subsequent centroid's argmin.
+    assigned_mask = np.zeros(n_children, dtype=bool)
 
     for c_idx in range(n_centroids):
-        absorbed = 0
-        # O(n_children) scan per fill slot — pathological for large expert counts;
-        # consider pre-sorting by cost if this becomes a bottleneck.
-        while absorbed < max_group_cap:
-            best_child = -1
-            best_cost = float("inf")
-            for ch in range(n_children):
-                if ch in assigned:
-                    continue
-                if cost[ch, c_idx] < best_cost:
-                    best_cost = cost[ch, c_idx]
-                    best_child = ch
-            if best_child < 0:
+        # Masked argmin per fill slot — vectorizes the old per-slot
+        # ``O(n_children)`` Python scan into a single C-level reduction over
+        # this centroid's cost column. ``np.argmin`` returns the *first*
+        # (lowest) index on ties, matching the strict-``<`` ascending scan's
+        # lowest-index tie-break exactly.
+        col = cost[:, c_idx].astype(float).copy()
+        # NaN → +inf so argmin never picks a NaN slot (the old strict-``<``
+        # scan never selected NaN since ``NaN < best_cost`` is False). MUST
+        # use this explicit assignment, not ``np.nan_to_num(col, nan=np.inf)``:
+        # that form's default ``posinf=`` rewrites genuine ``+inf`` to a finite
+        # value (~1.8e308), defeating the all-inf orphan-promotion break below.
+        col[np.isnan(col)] = np.inf
+        # Exclude children already absorbed by earlier centroids.
+        col[assigned_mask] = np.inf
+        for _ in range(max_group_cap):
+            best_child = int(np.argmin(col))
+            if not np.isfinite(col[best_child]):
                 # No unassigned children with finite cost remain for this centroid.
                 # Break to next centroid; any remaining unassigned children (all-inf
                 # cost rows) will be reported and promoted as orphan centroids by the
@@ -199,8 +208,8 @@ def _assign_greedy(
                 # to guarantee all children are assigned.
                 break
             assignment[best_child] = c_idx
-            assigned.add(best_child)
-            absorbed += 1
+            col[best_child] = np.inf          # exclude within this centroid's fill
+            assigned_mask[best_child] = True   # and from all later centroids
 
     n_unassigned = sum(1 for a in assignment if a < 0)
     if n_unassigned > 0 and n_centroids > 0:

@@ -59,6 +59,113 @@ def test_dispatcher_default_solver_is_greedy_and_bit_identical():
     assert via_dispatch == via_helper
 
 
+# ---------------------------------------------------------------------------
+# Capped-greedy vectorization regression suite.
+#
+# The inner scan of ``_assign_greedy`` was vectorized from a per-fill-slot
+# Python ``O(n_children)`` strict-``<`` loop into a masked ``np.argmin`` per
+# pick. These cases pin the byte-identical contract on exactly the inputs the
+# default bit-identical test (``rng.random``: no ties / no inf / no NaN) does
+# NOT exercise: ties → lowest index, all-inf / partial-inf orphan-promotion
+# break, and NaN-skip. The oracle is an independent re-implementation of the
+# OLD strict-``<`` ascending scan (``_assign_greedy_old_scan``); each case
+# asserts ``_assign_greedy`` matches it, so no hand-written expectation can
+# itself encode the vectorize's known NaN-sanitize trap.
+# ---------------------------------------------------------------------------
+
+
+def _assign_greedy_old_scan(
+    cost: np.ndarray, n_children: int, n_centroids: int, max_group_cap: int,
+) -> list[int]:
+    """Reference oracle: the pre-vectorize strict-``<`` ascending capped scan.
+
+    Verbatim semantics of the old inner loop — lowest-index tie-break,
+    ``NaN < best_cost`` is False (NaN skipped), ``best_child < 0`` break on
+    all-inf. Capped path only (``max_group_cap > 0``)."""
+    assignment = [-1] * n_children
+    assigned: set[int] = set()
+    for c_idx in range(n_centroids):
+        absorbed = 0
+        while absorbed < max_group_cap:
+            best_child = -1
+            best_cost = float("inf")
+            for ch in range(n_children):
+                if ch in assigned:
+                    continue
+                if cost[ch, c_idx] < best_cost:
+                    best_cost = cost[ch, c_idx]
+                    best_child = ch
+            if best_child < 0:
+                break
+            assignment[best_child] = c_idx
+            assigned.add(best_child)
+            absorbed += 1
+    return assignment
+
+
+def test_capped_greedy_tie_breaks_to_lowest_child_index():
+    """(a) Two equal minima at indices i < j: child i wins (lowest index)."""
+    # Column 0: children 0 and 2 tie at cost 0.1 (the minimum); child 1 is higher.
+    cost = np.array([[0.1], [0.5], [0.1]])
+    result = _assign_greedy(cost, 3, 1, max_group_cap=1)
+    assert result == _assign_greedy_old_scan(cost, 3, 1, max_group_cap=1)
+    # Lowest-index tie-break: child 0 absorbed, child 2 left for orphan-promotion.
+    assert result == [0, -1, -1]
+
+
+def test_capped_greedy_all_inf_column_absorbs_nothing_then_finite_fills():
+    """(b) Fully-inf column then finite column — orphan-promotion break.
+
+    The all-inf centroid (c0) must absorb nothing; the finite centroid (c1)
+    fills normally. This is the case the bare ``np.nan_to_num(col, nan=np.inf)``
+    bug regresses (it rewrites real +inf to finite and wrongly assigns)."""
+    inf = float("inf")
+    cost = np.array([
+        [inf, 0.3],
+        [inf, 0.1],
+    ])
+    result = _assign_greedy(cost, 2, 2, max_group_cap=1)
+    assert result == _assign_greedy_old_scan(cost, 2, 2, max_group_cap=1)
+    # c0 (all-inf) absorbs nothing; c1 takes its lowest-cost child (index 1).
+    assert result == [-1, 1]
+
+
+def test_capped_greedy_partial_inf_column_breaks_before_inf_at_cap_ge_2():
+    """(c) Partial-inf column at cap >= 2: absorb finite children up to cap,
+    break before pulling an +inf slot."""
+    inf = float("inf")
+    # Column 0: children 0,1 finite; children 2,3 are +inf (infeasible).
+    cost = np.array([
+        [0.2],
+        [0.1],
+        [inf],
+        [inf],
+    ])
+    result = _assign_greedy(cost, 4, 1, max_group_cap=3)
+    assert result == _assign_greedy_old_scan(cost, 4, 1, max_group_cap=3)
+    # Both finite children absorbed (ascending cost order is by index here);
+    # the +inf children break the fill before reaching cap=3.
+    assert result == [0, 0, -1, -1]
+
+
+def test_capped_greedy_nan_skipped_finite_fills_at_cap_ge_2():
+    """(d) NaN + finite at cap >= 2: NaN children never selected (matching the
+    old ``<``-is-False-for-NaN behavior), finite children fill up to cap."""
+    nan = float("nan")
+    # Column 0: child 0 NaN, children 1,2 finite, child 3 NaN.
+    cost = np.array([
+        [nan],
+        [0.4],
+        [0.2],
+        [nan],
+    ])
+    result = _assign_greedy(cost, 4, 1, max_group_cap=2)
+    assert result == _assign_greedy_old_scan(cost, 4, 1, max_group_cap=2)
+    # NaN children skipped; the two finite children (indices 1,2) are absorbed
+    # by the single centroid (c_idx 0), filling cap=2.
+    assert result == [-1, 0, 0, -1]
+
+
 def test_dispatcher_unknown_solver_raises():
     cost = np.zeros((2, 2))
     with pytest.raises(ValueError, match="unknown solver"):
