@@ -111,7 +111,13 @@ bs=8 numeric behavior — metrics stay exactly what bs=8 produces.
    Optimization #1." ("numerically identical to batch_size=1" is on `:27`; the
    VALIDATED_STRATEGIES reference spans `:26-29`.) This claim is TRUE for the
    forward/PPL path -> keep it, scope it explicitly.
-4. Config narrative `max_quality/configs/qwen36_35b_a3b_30pct.yaml:568-569` —
+4. `stage6/plugins/math500.py:391` — the THIRD `gen_batch_size` parse site
+   (`gen_batch_size = int(s6.get("gen_batch_size", 8))`, `<= 0` raise at `:392-395`).
+   Functionally identical to the humaneval / teacher_provider sites; `math500_accuracy`
+   is a batch-geometry-dependent pinned generative metric, so it MUST get the same
+   advisory WARN (see M3). `math500.py` ALREADY imports from `...tools.eval_harness`
+   (`:85`), so it can import `PINNED_GEN_BATCH_SIZE` DIRECTLY (no local mirror).
+5. Config narrative `max_quality/configs/qwen36_35b_a3b_30pct.yaml:568-569` —
    "Greedy decode (do_sample=False) is deterministic regardless of batch." (`:568`)
    "Left-padding + attention_mask ensures no cross-contamination." (`:569`). Same
    overclaim in prose; correct it too. `gen_batch_size: 8` is at `:570`.
@@ -136,14 +142,15 @@ bs=8 numeric behavior — metrics stay exactly what bs=8 produces.
 
 ### Pin gen_batch_size so generative metrics are reproducible (M3 — WARN, not raise)
 Measurement found bs=8 IS run-to-run deterministic; pinning locks the geometry.
-**DECISION (M3): plain advisory WARN at both parse sites — NOT a hard raise, and
+**DECISION (M3): plain advisory WARN at all THREE parse sites — NOT a hard raise, and
 NOT the over-engineered conditional/`HUMANEVAL_LIMIT`-guarded raise.** The value is
-parsed + validated in two places (`humaneval.py:429`, `teacher_provider.py:548`)
-and a silent change there would silently re-bless generative metrics; a loud WARN
+parsed + validated in three places (`humaneval.py:429`, `teacher_provider.py:548`,
+`math500.py:391`) and a silent change at ANY of them would silently re-bless
+generative metrics (`humaneval_pass_at_1` AND `math500_accuracy`); a loud WARN
 delivers reproducibility-of-reporting without breaking `HUMANEVAL_LIMIT`/smoke runs
 (operators legitimately run other geometries).
 
-At the two existing parse sites (each already does
+At the three existing parse sites (each already does
 `gen_batch_size = int(s6.get("gen_batch_size", 8))` then a `<= 0` raise):
 ```python
 gen_batch_size = int(s6.get("gen_batch_size", 8))
@@ -168,6 +175,11 @@ if gen_batch_size != PINNED_GEN_BATCH_SIZE:
 - **`humaneval.py`** already imports private names from `...tools.eval_harness`
   (`:115-119`) — so add `PINNED_GEN_BATCH_SIZE` to that existing import block and
   use it at the `:429` parse site. This is contract-safe.
+- **`math500.py`** already imports from `...tools.eval_harness` (`:85`) — so add
+  `PINNED_GEN_BATCH_SIZE` to that existing import block and use it at the `:391`
+  parse site, emitting the same advisory WARN after the parse/validation (`:392`).
+  This is contract-safe — DIRECT import, NO local mirror needed (unlike
+  teacher_provider).
 - **`teacher_provider.py`** has a HARD circular-import contract (0.6 /
   `teacher_provider.py:37-43`) that forbids importing from `...tools.eval_harness`.
   Therefore define a **LOCAL MIRROR** there, next to its existing module-local
@@ -190,7 +202,8 @@ import contracts (0.6).
   contain "NOT bit-identical" (cheap doc-contract pin, mirrors existing constant-pin tests).
 - New unit `test_gen_batch_size_pin_warns_on_mismatch` — call the parse path (or a
   tiny extracted helper) with gen_batch_size=4 and assert a WARNING via caplog (no
-  raise).
+  raise). Cover all three sites (humaneval, teacher_provider, math500) — math500
+  uses the directly-imported `PINNED_GEN_BATCH_SIZE`, the others as wired in H2.
 - New unit `test_pinned_gen_batch_size_mirror_in_sync` — assert
   `eval_harness.PINNED_GEN_BATCH_SIZE == teacher_provider`'s local mirror value
   (mirror-drift guard, same spirit as any `_STAGE6_ATTN_IMPLEMENTATION` pin).
@@ -315,6 +328,10 @@ tally `terminated = #unfinished` for the post-loop warning (now "terminated" not
 ### Pins to preserve
 - `test_stage6_plugin_humaneval.py:183` + `:202` (the `_check_humaneval` 4-arg
   positional bool contract) — keep `_check_humaneval` as the public wrapper.
+- `test_stage6_plugin_humaneval.py:77` (`stage6_validate._check_humaneval is
+  he._check_humaneval` is-identity assertion) — keeping `_check_humaneval` as a
+  wrapper IN `humaneval.py` (already required for the `:183/:202` bool-contract pins
+  above) also satisfies this; do NOT relocate the symbol out of `humaneval.py`.
 - `stage6_eval.json` golden (0.1 — disabled, untouched).
 
 ### In-code-decision reversals to update (N2 — REQUIRED, both blocks)
@@ -326,7 +343,7 @@ documented in-code decisions that MUST be rewritten as part of this item:
   now implemented via the ProcessPool worker (and the signal.alarm caveat is moot
   once the model code runs in a child process, not a daemon thread).
 - The module docstring in-process rationale (`humaneval.py:23-26` and
-  `:37-40`): "(b) Exec-based scoring runs **in-process**, NOT in a subprocess
+  `:37-41`): "(b) Exec-based scoring runs **in-process**, NOT in a subprocess
   sandbox ..." and "In-process exec is documented because subprocess isolation
   would slow eval substantially with no signal-quality benefit ...". Rewrite both
   blocks to document the ProcessPool design.
@@ -340,7 +357,7 @@ documented in-code decisions that MUST be rewritten as part of this item:
   (`concurrent.futures`, `multiprocessing`, `time`; `os` is already imported).
 - Security posture UNCHANGED conceptually (still runs model code) but now in a
   child process (MORE isolated than the in-process daemon thread). H1 security
-  WARNING at `humaneval.py:221-227` stays; update wording from "daemon thread" to
+  WARNING at `humaneval.py:220-231` stays; update wording from "daemon thread" to
   "subprocess workers".
 
 ### Tests that prove it
@@ -440,7 +457,7 @@ Bounds the argmax-path logits peak to `(chunk_b, L-1, V)` instead of the full
 ### Risks / rollback
 - argmax tie-breaking: safe as long as we never split the vocab axis (only B/L).
   Plan: chunk B/L ONLY.
-- Eager-attn pin (`bpt_metric.py:97-105`) UNTOUCHED.
+- Eager-attn pin (`bpt_metric.py:97-106`) UNTOUCHED.
 - Blackwell grouped_mm shim UNTOUCHED (spec mandate; verified not in this file).
 - The `wikitext_ppl.py` loss path is UNTOUCHED (M1).
 - Rollback: revert the argmax branch to the single-shot
@@ -503,8 +520,10 @@ but the above order minimizes integration risk.
 - No monkeypatch in new tests (project rule) — use caplog, direct calls, real tiny_model
   fixture, subprocess imports.
 
-> L2 NOTE: `math500.py`'s module docstring contains NO false "numerically
+> L2 NOTE: `math500.py`'s module DOCSTRING contains NO false "numerically
 > identical / bs=1" claim (its `:48` mention of "identical copies of the monolith
 > definitions" is about Pattern-A symbol copies, not generate() invariance).
-> Mirroring the Item-1 scoping note into math500.py would be ADDITIVE, not a fix —
-> dropped from this round (optional only).
+> Mirroring the Item-1 docstring scoping note into math500.py would be ADDITIVE, not
+> a fix — dropped from this round (optional only). This is SEPARATE from the
+> `gen_batch_size` WARN pin at `math500.py:391`, which IS in scope (Item 1 Site 4 /
+> M3) because `math500_accuracy` is a batch-geometry-dependent generative metric.
