@@ -78,6 +78,8 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
+import threading
 from pathlib import Path
 
 import torch
@@ -637,6 +639,17 @@ def run(
         g.manual_seed(_shuffle_seed + epoch_idx)
         return torch.randperm(n, generator=g).tolist()
 
+    # Async periodic-checkpoint writer (Tier-1 Lever C). A single background
+    # thread serializes/fsyncs/replaces/prunes the step_*.pt files so the
+    # ~815 ms write does not stall the training thread. None when the
+    # kill-switch (STAGE5_ASYNC_CKPT=0) is set or there is no partial_dir, in
+    # which case _save_stage5_checkpoint falls back to a fully-synchronous
+    # write. best.pt (early_stop.py) stays synchronous regardless.
+    _ckpt_writer = (
+        _Stage5CheckpointWriter()
+        if (partial_dir is not None and _async_ckpt_enabled())
+        else None
+    )
     for epoch in range(s5["epochs"]):
         if epoch < resume_epoch:
             continue
@@ -730,7 +743,10 @@ def run(
             )
             if _student_capture is not None:
                 _student_capture.clear()
-            student_out = student(input_ids=batch)
+            # Tier-1 (Lever A): suppress the KV cache allocation on the student
+            # forward. Single full-sequence pass, no incremental decode, the
+            # cache is never read -> bit-identical to the HF default.
+            student_out = student(input_ids=batch, use_cache=False)
             student_vocab_logits = student_out.logits.to(torch.float32)  # [B, L, |V|]
             del student_out  # free model output object; student_vocab_logits retains grad_fn
 
@@ -822,15 +838,29 @@ def run(
             (loss / grad_accum).backward()
 
             if (i + 1) % grad_accum == 0:
-                # Pre-step: compute gradient norm over trainable params.
-                # Unwrap compiled wrapper so parameters() reflects the original module's leaf params.
-                _params_for_norm = getattr(student, "_orig_mod", student)
-                grad_norm = float(
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in _params_for_norm.parameters() if p.requires_grad and p.grad is not None],
-                        float('inf'),
+                # Pre-step: compute gradient norm over trainable params, but
+                # ONLY on log-window steps (Tier-1 Lever B). grad_norm is read
+                # solely inside `if step % log_every_n_steps == 0:` below, so on
+                # every other optimizer step the device->host sync + the full
+                # parameters() comprehension are wasted. The gate uses the
+                # PREDICTED post-increment step value `(step + 1)` (the modulo
+                # test below runs after `step += 1`), and the call stays HERE —
+                # before `optim.step()`/`optim.zero_grad()` — so it reads the
+                # SAME populated grads that produced this window's step. The
+                # reported value is therefore bit-identical to the unconditional
+                # version. `clip_grad_norm_(..., inf)` is a no-op on the grads
+                # (clip-coef inf >= 1, so PyTorch skips the in-place scale).
+                grad_norm = float("nan")
+                _log_every = config["logging"]["log_every_n_steps"]
+                if (step + 1) % _log_every == 0:
+                    # Unwrap compiled wrapper so parameters() reflects the original module's leaf params.
+                    _params_for_norm = getattr(student, "_orig_mod", student)
+                    grad_norm = float(
+                        torch.nn.utils.clip_grad_norm_(
+                            [p for p in _params_for_norm.parameters() if p.requires_grad and p.grad is not None],
+                            float('inf'),
+                        )
                     )
-                )
                 optim.step()
                 optim.zero_grad()
                 scheduler.step()
@@ -924,7 +954,14 @@ def run(
                             "halting to preserve diagnostics."
                         )
 
-                # Periodic checkpoint for crash-resume.
+                # Periodic checkpoint for crash-resume. The payload is built
+                # synchronously (incl. a deep CPU copy of the optimizer state)
+                # inside _save_stage5_checkpoint; only the torch.save / fsync /
+                # os.replace / prune run on the background writer thread (Tier-1
+                # Lever C). The prune (keep newest two step_*.pt) was relocated
+                # into the writer, AFTER os.replace, so it never races a
+                # not-yet-written checkpoint. When _ckpt_writer is None
+                # (kill-switch) the save is fully synchronous, prune included.
                 if partial_dir is not None and ckpt_every > 0 and step % ckpt_every == 0:
                     _save_stage5_checkpoint(
                         partial_dir, step, epoch, i, student, optim,
@@ -935,15 +972,8 @@ def run(
                         prev_ema=float(run_ctx.get("prev_ema")),
                         no_improve_windows=int(run_ctx.get("no_improve_windows")),
                         es_ref_ema=float(run_ctx.get("es_ref_ema")),
+                        writer=_ckpt_writer,
                     )
-                    # Keep only the two most recent checkpoints to bound disk use.
-                    # Sort by step number (ascending) and delete all but the newest two.
-                    all_ckpts = sorted(
-                        partial_dir.glob("step_*.pt"),
-                        key=lambda p: int(p.stem.split("_")[1]),
-                    )
-                    for old_ckpt in all_ckpts[:-2]:
-                        old_ckpt.unlink(missing_ok=True)
 
                 # --- Early-stopping break (2026-05-17 overfit fix) ---
                 # Triggered inside the optimizer-step block (where the counter
@@ -955,6 +985,13 @@ def run(
                 # False) - byte-identical to pre-2026-05-17 `main`.
                 if _early_stopped:
                     if partial_dir is not None:
+                        # Drain any in-flight async step_*.pt write first so the
+                        # final early-stop checkpoint is written AFTER it (no
+                        # overlap / prune race), then write the early-stop
+                        # checkpoint SYNCHRONOUSLY (writer=None) so it is durable
+                        # on disk before we break to finalize.
+                        if _ckpt_writer is not None:
+                            _ckpt_writer.join()
                         _save_stage5_checkpoint(
                             partial_dir, step, epoch, i, student, optim,
                             grad_accum=grad_accum,
@@ -964,6 +1001,7 @@ def run(
                             prev_ema=float(run_ctx.get("prev_ema")),
                             no_improve_windows=int(run_ctx.get("no_improve_windows")),
                             es_ref_ema=float(run_ctx.get("es_ref_ema")),
+                            writer=None,
                         )
                     break
         # Trailing-batch accounting is computed once before the epoch loop
@@ -976,6 +1014,15 @@ def run(
             and bool(run_ctx.get("early_stop_should_stop"))
         ):
             break
+
+    # ---- async checkpoint writer drain (Tier-1 Lever C) ------------------
+    # Drain + stop the background step_*.pt writer BEFORE the final export so
+    # (a) every periodic checkpoint is durably on disk if the process exits,
+    # (b) no pending write races save_compressed_checkpoint, and (c) any
+    # writer-thread error is re-raised on this (training) thread, halting the
+    # run rather than silently losing crash-resume state.
+    if _ckpt_writer is not None:
+        _ckpt_writer.close()
 
     # ---- teardown_merge_repair -------------------------------------------
     # MergeRepairPlugin.teardown_merge_repair removes the gradient-mask hooks
@@ -1001,55 +1048,47 @@ def run(
     return out_dir
 
 
-def _save_stage5_checkpoint(
-    partial_dir: Path,
-    step: int,
-    epoch: int,
-    batch_idx: int,
-    student: nn.Module,
-    optim: torch.optim.Optimizer,
-    grad_accum: int = 1,
-    scheduler: "torch.optim.lr_scheduler._LRScheduler | None" = None,
-    best_raw_kl_ema: float | None = None,
-    best_step: int | None = None,
-    prev_ema: float | None = None,
-    no_improve_windows: int | None = None,
-    es_ref_ema: float | None = None,
+def _async_ckpt_enabled() -> bool:
+    """Async-checkpoint kill-switch (Tier-1 Lever C).
+
+    ``STAGE5_ASYNC_CKPT=0`` forces the fully-synchronous path (payload build +
+    torch.save + fsync + os.replace + prune all on the training thread), i.e.
+    the pre-Lever-C behaviour. Any other value (or unset) enables the async
+    writer. This lets a production run disable async without a code revert.
+    """
+    return os.environ.get("STAGE5_ASYNC_CKPT", "1") != "0"
+
+
+def _deep_cpu_copy(obj):
+    """Recursively detach+CPU-clone every tensor inside a (possibly nested)
+    container so the result shares NO storage with live GPU tensors.
+
+    ``optim.state_dict()`` returns references to the LIVE optimizer moment
+    tensors (on the training device). Backgrounding ``torch.save`` on those
+    references would let the next ``optim.step()`` mutate them mid-serialize,
+    producing a torn checkpoint. Snapshotting them on the training thread BEFORE
+    handing the payload to the writer makes the background write independent of
+    any subsequent ``optim.step()``.
+    """
+    if torch.is_tensor(obj):
+        return obj.detach().cpu().clone()
+    if isinstance(obj, dict):
+        return {k: _deep_cpu_copy(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        typ = type(obj)
+        return typ(_deep_cpu_copy(v) for v in obj)
+    return obj
+
+
+def _write_checkpoint_payload(
+    payload: dict, partial_dir: Path, step: int, epoch: int, batch_idx: int
 ) -> None:
-    # F3 fix: when torch.compile is active, `student` is a compiled wrapper
-    # whose named_parameters() may enumerate names that differ from the
-    # underlying module's attribute tree (e.g. "_orig_mod.*" prefixes are
-    # stripped or mangled). Use the unwrapped module so that the names saved
-    # here match the attribute path walked during restore.
-    unwrapped = getattr(student, "_orig_mod", student)
-    router_state = {
-        name: p.data.cpu().clone()
-        for name, p in unwrapped.named_parameters()
-        if p.requires_grad
-    }
-    payload = {
-        "format_version": 2,
-        "step": step,
-        "epoch": epoch,
-        "batch_idx": batch_idx,
-        "router_state": router_state,
-        "optim_state": optim.state_dict(),
-        "gradient_accumulation": grad_accum,
-        # Trainable parameter name set; resume validates this matches the
-        # current trainable scope so a config change to trainable_name_patterns
-        # cannot pair stale moments with the wrong parameters.
-        "trainable_param_names": sorted(router_state.keys()),
-        # v2 additions (Move A): LR scheduler + best-tracker state. None for
-        # legacy code paths that don't pass them; resume tolerates None.
-        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
-        "best_raw_kl_ema": best_raw_kl_ema,
-        "best_step": best_step,
-        "prev_ema": prev_ema,
-        # 2026-05-17 early-stop additions. None for callers that don't pass
-        # them; resume tolerates None (patience restarts fresh).
-        "no_improve_windows": no_improve_windows,
-        "es_ref_ema": es_ref_ema,
-    }
+    """Durably write a fully-host-resident ``payload`` to ``step_{step}.pt``.
+
+    Atomic: write to ``*.pt.tmp`` -> fsync(file) -> os.replace -> fsync(parent).
+    Then prune (keep newest two ``step_*.pt``). This is the part that may run on
+    the background writer thread; ``payload`` MUST already be CPU/host-resident.
+    """
     tmp = partial_dir / f"step_{step}.pt.tmp"
     final = partial_dir / f"step_{step}.pt"
     torch.save(payload, tmp)
@@ -1064,7 +1103,151 @@ def _save_stage5_checkpoint(
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
+    # Prune AFTER os.replace so the just-written step_N.pt is visible to the
+    # glob (relocated from the orchestrator run() body so it never races a
+    # not-yet-written checkpoint). Keep only the two most recent step_*.pt.
+    all_ckpts = sorted(
+        partial_dir.glob("step_*.pt"),
+        key=lambda p: int(p.stem.split("_")[1]),
+    )
+    for old_ckpt in all_ckpts[:-2]:
+        old_ckpt.unlink(missing_ok=True)
     log.info("Stage 5: checkpoint saved at step %d (epoch %d, batch %d)", step, epoch, batch_idx)
+
+
+class _Stage5CheckpointWriter:
+    """Single background writer for the periodic ``step_*.pt`` checkpoints.
+
+    One persistent worker thread drains a ``Queue(maxsize=1)``; ``put`` blocks
+    until the previous job is taken, so two ``step_*.pt`` writes never overlap
+    (the single-writer invariant). Scoped to ``step_*.pt`` ONLY — ``best.pt`` is
+    written synchronously by ``early_stop.py`` and is left untouched (distinct
+    filename, no collision; the prune globs ``step_*.pt`` only).
+
+    A worker-thread exception is captured and RE-RAISED on the training thread
+    at the next ``submit`` and at ``join`` so a failed checkpoint halts the run
+    rather than silently losing crash-resume state.
+    """
+
+    def __init__(self) -> None:
+        self._queue: "queue.Queue" = queue.Queue(maxsize=1)
+        self._error: BaseException | None = None
+        self._error_lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._drain, name="stage5-ckpt-writer", daemon=True
+        )
+        self._thread.start()
+
+    def _drain(self) -> None:
+        while True:
+            job = self._queue.get()
+            try:
+                if job is None:  # shutdown sentinel
+                    return
+                payload, partial_dir, step, epoch, batch_idx = job
+                _write_checkpoint_payload(payload, partial_dir, step, epoch, batch_idx)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on training thread
+                with self._error_lock:
+                    if self._error is None:
+                        self._error = exc
+                log.error("Stage 5: async checkpoint writer failed: %r", exc)
+            finally:
+                self._queue.task_done()
+
+    def _raise_if_error(self) -> None:
+        with self._error_lock:
+            err = self._error
+            self._error = None
+        if err is not None:
+            raise err
+
+    def submit(
+        self, payload: dict, partial_dir: Path, step: int, epoch: int, batch_idx: int
+    ) -> None:
+        # Re-raise a prior worker failure before enqueuing the next job.
+        self._raise_if_error()
+        # maxsize=1 put() blocks until the previous job is drained -> the
+        # previous step_*.pt write is fully done before this one starts.
+        self._queue.put((payload, partial_dir, step, epoch, batch_idx))
+
+    def join(self) -> None:
+        """Block until all queued writes are durable; re-raise worker errors."""
+        self._queue.join()
+        self._raise_if_error()
+
+    def close(self) -> None:
+        """Drain, stop the worker, and re-raise any pending worker error."""
+        self._queue.put(None)
+        self._thread.join()
+        self._raise_if_error()
+
+
+def _save_stage5_checkpoint(
+    partial_dir: Path,
+    step: int,
+    epoch: int,
+    batch_idx: int,
+    student: nn.Module,
+    optim: torch.optim.Optimizer,
+    grad_accum: int = 1,
+    scheduler: "torch.optim.lr_scheduler._LRScheduler | None" = None,
+    best_raw_kl_ema: float | None = None,
+    best_step: int | None = None,
+    prev_ema: float | None = None,
+    no_improve_windows: int | None = None,
+    es_ref_ema: float | None = None,
+    writer: "_Stage5CheckpointWriter | None" = None,
+) -> None:
+    # F3 fix: when torch.compile is active, `student` is a compiled wrapper
+    # whose named_parameters() may enumerate names that differ from the
+    # underlying module's attribute tree (e.g. "_orig_mod.*" prefixes are
+    # stripped or mangled). Use the unwrapped module so that the names saved
+    # here match the attribute path walked during restore.
+    unwrapped = getattr(student, "_orig_mod", student)
+    router_state = {
+        name: p.data.cpu().clone()
+        for name, p in unwrapped.named_parameters()
+        if p.requires_grad
+    }
+    # SYNCHRONOUS snapshot (Tier-1 Lever C): build the ENTIRE payload from
+    # host-resident values on the training thread BEFORE any async write.
+    #   - router_state: already CPU-cloned above.
+    #   - optim.state_dict(): returns LIVE GPU moment-tensor references, so it
+    #     MUST be deep-CPU-copied; otherwise a backgrounded torch.save would
+    #     race the next optim.step() -> torn checkpoint.
+    #   - scheduler_state: plain Python scalars, deep-copied for safety.
+    payload = {
+        "format_version": 2,
+        "step": step,
+        "epoch": epoch,
+        "batch_idx": batch_idx,
+        "router_state": router_state,
+        "optim_state": _deep_cpu_copy(optim.state_dict()),
+        "gradient_accumulation": grad_accum,
+        # Trainable parameter name set; resume validates this matches the
+        # current trainable scope so a config change to trainable_name_patterns
+        # cannot pair stale moments with the wrong parameters.
+        "trainable_param_names": sorted(router_state.keys()),
+        # v2 additions (Move A): LR scheduler + best-tracker state. None for
+        # legacy code paths that don't pass them; resume tolerates None.
+        "scheduler_state": (
+            _deep_cpu_copy(scheduler.state_dict()) if scheduler is not None else None
+        ),
+        "best_raw_kl_ema": best_raw_kl_ema,
+        "best_step": best_step,
+        "prev_ema": prev_ema,
+        # 2026-05-17 early-stop additions. None for callers that don't pass
+        # them; resume tolerates None (patience restarts fresh).
+        "no_improve_windows": no_improve_windows,
+        "es_ref_ema": es_ref_ema,
+    }
+    # The payload is now fully host-resident and independent of subsequent GPU
+    # mutation. Either hand it to the background writer (async) or write it
+    # synchronously (no writer / kill-switch). Bytes written are identical.
+    if writer is not None:
+        writer.submit(payload, partial_dir, step, epoch, batch_idx)
+    else:
+        _write_checkpoint_payload(payload, partial_dir, step, epoch, batch_idx)
 
 
 __all__ = ["run"]

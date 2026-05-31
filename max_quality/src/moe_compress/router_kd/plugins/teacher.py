@@ -728,11 +728,14 @@ class TeacherLivePlugin:
     ) -> torch.Tensor:
         """Slot hook — run a no-grad teacher forward, return the vocab logits.
 
-        INERT at RK-5: no orchestrator walk or test invokes this hook in the
-        live pipeline. RK-8 dispatches it via :meth:`PluginRegistry.dispatch_first`
-        AFTER :meth:`TeacherCachePlugin.provide_teacher_logits`, so it only
-        runs on a cache miss. The body reproduces the monolith ``run()``
-        live-teacher branch (minus the OUT-of-scope merge-repair capture).
+        LIVE on the production path: RK-8 dispatches this via
+        :meth:`PluginRegistry.dispatch_first` AFTER
+        :meth:`TeacherCachePlugin.provide_teacher_logits`
+        (``orchestrator.py`` live-teacher dispatch), so it runs whenever no
+        ``teacher_logits_cache`` is configured (the production live-teacher
+        path) or on a cache miss. It is inert only when a cache is configured
+        and hitting. The body reproduces the monolith ``run()`` live-teacher
+        branch (minus the OUT-of-scope merge-repair capture).
 
         Lazily loads the teacher (:meth:`_load_teacher`), runs a no-grad
         forward, and returns ``out.logits.detach().to(torch.float32)`` — the
@@ -760,7 +763,11 @@ class TeacherLivePlugin:
         """
         with torch.no_grad():
             teacher = self._load_teacher(ctx)
-            out = teacher(input_ids=input_ids)
+            # Tier-1 (Lever A): suppress the KV cache allocation. This is a
+            # single full-sequence forward; the KV cache is never read (no
+            # incremental decode), so use_cache=False is bit-identical to the
+            # HF default while freeing the past_key_values buffer.
+            out = teacher(input_ids=input_ids, use_cache=False)
             return out.logits.detach().to(torch.float32)
 
 
