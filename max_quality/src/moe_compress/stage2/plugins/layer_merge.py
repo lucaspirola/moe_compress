@@ -387,6 +387,7 @@ class LayerMergePlugin:
         blacklist: dict[int, list[int]],
         device,
         merge_step: str = "freq_weighted",
+        lsa_threads: int = 8,
     ) -> None:
         # Store every knob the SIX live hooks read off ``self`` PLUS the eight
         # attributes ``orchestrator._run_assignment`` reads off this plugin
@@ -423,6 +424,10 @@ class LayerMergePlugin:
         # legacy freq-weighted (default; byte-identical) and the MergeMoE
         # closed-form T₁=Q·P† merge step. See PLAN_PLUGIN_09_s2_mm.md.
         self.merge_step = merge_step
+        # Stage-2 LSA threading perf knob (workstream A). Passed to
+        # _merge_experts_inplace; byte-irrelevant (threads only the per-member
+        # Hungarian solves; accumulation stays serial). 0/1 ⇒ serial.
+        self.lsa_threads = lsa_threads
 
     # ------------------------------------------------------------------
     # Phase 1: on_layer_setup
@@ -575,6 +580,7 @@ class LayerMergePlugin:
             merge_step=self.merge_step,
             layer_inputs=layer_inputs,
             token_cap=self.cost_output_token_cap,
+            lsa_max_workers=self.lsa_threads,
             # RegMean (merge_step="regmean") reads per-(layer, expert, matrix)
             # input Gram from cov_acc; the freq-weighted and mergemoe
             # branches ignore this argument. cov_acc is always non-None in

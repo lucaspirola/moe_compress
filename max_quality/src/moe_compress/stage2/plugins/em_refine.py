@@ -287,6 +287,7 @@ def _em_refine_assignment(
     sinkhorn_epsilon_final: float = 0.01,
     sinkhorn_iters: int = 200,
     skip_merge_percentile: float = 100.0,
+    lsa_max_workers: int | None = None,
 ) -> tuple[list[int], np.ndarray, int]:
     """EM refinement loop.
 
@@ -355,6 +356,7 @@ def _em_refine_assignment(
             cov_acc=cov_acc,
             perm_cache=perm_cache,
             tentative_centroid_weights=tentative,
+            lsa_max_workers=lsa_max_workers,
         )
         # Direction B — re-apply the skip-merge floor each EM round; the freshly
         # recomputed cost matrix would otherwise un-mask the high-cost pairs.
@@ -427,6 +429,7 @@ class EmRefinePlugin:
         sinkhorn_epsilon_init: float = 1.0,
         sinkhorn_epsilon_final: float = 0.01,
         sinkhorn_iters: int = 200,
+        lsa_threads: int = 8,
     ) -> None:
         self.em_refinement_rounds = em_refinement_rounds
         self.em_convergence_break = em_convergence_break
@@ -440,6 +443,9 @@ class EmRefinePlugin:
         self.sinkhorn_epsilon_init = sinkhorn_epsilon_init
         self.sinkhorn_epsilon_final = sinkhorn_epsilon_final
         self.sinkhorn_iters = sinkhorn_iters
+        # Stage-2 LSA threading perf knob (workstream A). EM re-invokes the
+        # post-cost path each round, so it inherits the same threading.
+        self.lsa_threads = lsa_threads
 
     def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.em_refinement_rounds`` > 0.
@@ -508,5 +514,6 @@ class EmRefinePlugin:
             sinkhorn_epsilon_init=self.sinkhorn_epsilon_init,
             sinkhorn_epsilon_final=self.sinkhorn_epsilon_final,
             sinkhorn_iters=self.sinkhorn_iters,
+            lsa_max_workers=self.lsa_threads,
         )
         return assignment, delta, {"em_rounds": em_rounds_done}

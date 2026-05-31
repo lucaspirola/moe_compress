@@ -131,6 +131,7 @@ def _post_alignment_cost(
     topk: int,
     freq: dict[int, int] | None,
     tentative_centroid_weights: dict[int, dict[str, torch.Tensor]] | None = None,
+    lsa_max_workers: int | None = None,
 ) -> np.ndarray:
     """Build the post-alignment whitened cost matrix per spec § 5 step 4T.
 
@@ -146,6 +147,7 @@ def _post_alignment_cost(
     them as forbidden arcs.
     """
     from ...utils.cov_sqrt import compute_a_sqrt, CovSqrtCache
+    from ...utils.lsa_pool import parallel_map
 
     li = layer_ref.layer_idx
     n_nc = len(noncentroid_ids)
@@ -214,19 +216,41 @@ def _post_alignment_cost(
     k_cand = min(topk, n_c)
     topk_per_ci = np.argpartition(cheap_cost, k_cand - 1, axis=1)[:, :k_cand]  # (n_nc, k_cand)
 
-    # Per-non-centroid: pick the top-K cheapest centroids and compute the
-    # expensive cost only for those. All cost-matrix tensor work is
-    # read-only on model params; wrap in torch.no_grad() so the leaf
-    # nn.Parameters' requires_grad=True does not poison the .numpy() calls
-    # in _permutation_align_to_centroid.
-    with torch.no_grad():
-        for ci in range(n_nc):
-            m_id = noncentroid_ids[ci]
-            # Top-K centroid indices by cheap cost (smallest first).
-            # If n_c <= K, we score all centroids. ``.tolist()`` materializes
-            # Python ints once per row, eliminating the per-iteration
-            # ``int(cj)`` cast that the prior in-loop form needed.
-            top_cj = topk_per_ci[ci].tolist()
+    # Item-4 eigh pre-warm (whitening_mode == "full" only). The per-centroid
+    # a_sqrt (V·diag(√λ)·Vᵀ via torch.linalg.eigh, CPU LAPACK) is a pure
+    # function of the centroid covariance ⇒ pre-computing every centroid's
+    # gate_proj/down_proj a_sqrt in ONE pool populates ``a_sqrt_cache`` so the
+    # threaded row loop below only ever READS it (no concurrent read-modify-
+    # write on the cache; D3). Pre-warm by ``centroid_ids`` is a superset of
+    # what rows request (rows call _get_a_sqrt(c_id, ...) with c_id ∈
+    # centroid_ids — incl. the tentative-EM branch, which still keys on the
+    # ORIGINAL c_id). Byte-identical: same eigh call, same inputs, just issued
+    # from a pool. Skipped for "none"/"diag" — neither runs eigh (D3 N3).
+    if whitening_mode == "full":
+        _warm_keys = [(c_id, name) for c_id in centroid_ids
+                      for name in ("gate_proj", "down_proj")]
+
+        def _warm(key):
+            c_id, name = key
+            with torch.no_grad():
+                _get_a_sqrt(c_id, name)  # populates a_sqrt_cache as a side effect
+
+        parallel_map(_warm, _warm_keys, max_workers=lsa_max_workers)
+
+    # Per-non-centroid ROW worker. Returns the row index, the list of
+    # (cj, residual_float) cost-cell writes, and the list of
+    # (cache_key, perm, residual) cache puts. Collect-then-merge (D2): workers
+    # touch only thread-local state; the main thread scatters ``out`` and
+    # replays ``perm_cache.put`` in ROW-MAJOR order after the pool joins, so the
+    # cache CONTENTS (disjoint keys) AND insertion ORDER are byte-identical to
+    # the serial path. Each worker enters torch.no_grad() itself (it is
+    # thread-local — otherwise .numpy() on requires-grad leaves raises).
+    def _solve_row(ci: int):
+        m_id = noncentroid_ids[ci]
+        top_cj = topk_per_ci[ci].tolist()
+        cells: list[tuple[int, float]] = []
+        puts: list[tuple[tuple[int, int, int], np.ndarray, float | None]] = []
+        with torch.no_grad():
             for cj in top_cj:
                 c_id = centroid_ids[cj]
                 cache_key = (li, c_id, m_id)
@@ -279,7 +303,8 @@ def _post_alignment_cost(
                     # which is approximated by A_c (the original centroid's input
                     # statistics). Using A_c here keeps the whitening consistent
                     # across EM rounds; otherwise we'd need to recompute A from
-                    # scratch each round.
+                    # scratch each round. For whitening_mode == "full" the a_sqrt
+                    # was pre-warmed above ⇒ this is a lock-free cache read.
                     a_sqrt_gate_up = _get_a_sqrt(c_id, "gate_proj")
                     a_sqrt_down    = _get_a_sqrt(c_id, "down_proj")
                     residual = _aligned_whitened_residual(
@@ -294,9 +319,11 @@ def _post_alignment_cost(
                     # Only persist to the cache when the residual reflects the
                     # *original* centroid weights (no tentative override). The
                     # tentative residual is per-EM-round and would be stale by
-                    # the time the merge step consumes it.
+                    # the time the merge step consumes it. Defer the actual
+                    # perm_cache.put to the main-thread replay (collect-then-
+                    # merge): record it here, apply it in row-major order below.
                     if perm_cache is not None and not tentative_active:
-                        perm_cache.put(cache_key, perm, residual)
+                        puts.append((cache_key, perm, residual))
 
                 if asymmetric:
                     # freq is guaranteed non-None here by the precondition check
@@ -311,7 +338,25 @@ def _post_alignment_cost(
                         factor = 0.5  # both zero — neutral
                     residual = residual * factor
 
-                out[ci, cj] = float(residual)
+                cells.append((cj, float(residual)))
+        return ci, cells, puts
+
+    # Thread the per-ci rows (item 2). Disjoint out cells + disjoint cache keys
+    # (each row owns a unique m_id) ⇒ order-independent CONTENTS; the row-major
+    # replay below makes insertion ORDER deterministic too.
+    row_results = parallel_map(
+        _solve_row, list(range(n_nc)), max_workers=lsa_max_workers,
+    )
+
+    # Main-thread merge: scatter out cells and replay perm_cache puts in
+    # ROW-MAJOR order (ci ascending, cj/candidate order within the row) —
+    # exactly the order the serial loop would have inserted them.
+    for ci, cells, puts in row_results:
+        for cj, value in cells:
+            out[ci, cj] = value
+        if perm_cache is not None:
+            for cache_key, perm, residual in puts:
+                perm_cache.put(cache_key, perm, residual)
 
     return out
 
@@ -353,6 +398,7 @@ class ReamCostPostPlugin:
         cost_whitening: str,
         cost_topk_filter: int,
         cost_output_token_cap: int,
+        lsa_threads: int = 8,
     ) -> None:
         # Store every knob the shared compute_cost body reads. NO logic — a
         # faithful mirror of the matching subset of LegacyAdapter.__init__.
@@ -363,6 +409,8 @@ class ReamCostPostPlugin:
         self.cost_whitening = cost_whitening
         self.cost_topk_filter = cost_topk_filter
         self.cost_output_token_cap = cost_output_token_cap
+        # Stage-2 LSA threading perf knob (read by _compute_cost_for_plugin).
+        self.lsa_threads = lsa_threads
 
     def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.cost_alignment`` resolves to ``"post"``.

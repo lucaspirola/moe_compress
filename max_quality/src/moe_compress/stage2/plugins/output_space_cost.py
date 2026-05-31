@@ -149,6 +149,37 @@ from ..permutation_align import (
 from .ream_cost import _COST_PLUGIN_READS, _COST_PLUGIN_WRITES
 
 
+class _RowPermSink:
+    """Thread-local perm_cache facade for the threaded output-space rows.
+
+    Item-3 threads the per-``ci`` rows; ``_tentative_merged_weights`` reads
+    *and* writes ``perm_cache`` on a cache miss. To keep the shared cache
+    mutation off the worker threads (collect-then-merge, D2), each row gets one
+    of these: ``.get`` reads through to the real shared cache (safe — within a
+    single cost call each row owns a unique ``m_id`` so no two rows touch the
+    same key, and the cache is only *written* on the main thread after the pool
+    joins); ``.put`` buffers ``(key, perm, residual)`` into the row's ``puts``
+    list, which the main thread replays in row-major order. ``has`` mirrors the
+    real cache for completeness; not used by ``_tentative_merged_weights``.
+    """
+
+    __slots__ = ("_real", "_puts")
+
+    def __init__(self, real, puts: list) -> None:
+        self._real = real
+        self._puts = puts
+
+    def get(self, key):
+        return self._real.get(key) if self._real is not None else None
+
+    def has(self, key) -> bool:
+        return self._real.has(key) if self._real is not None else False
+
+    def put(self, key, perm, residual) -> None:
+        # Defer the write — the main thread replays it after the pool joins.
+        self._puts.append((key, perm, residual))
+
+
 # ---------------------------------------------------------------------------
 # Direction C — output-space merge cost (cost_alignment == "output")
 # ---------------------------------------------------------------------------
@@ -364,6 +395,7 @@ def _output_space_cost(
     freq: dict[int, int] | None,
     layer_inputs: torch.Tensor | None,
     token_cap: int,
+    lsa_max_workers: int | None = None,
 ) -> np.ndarray:
     """Direction C — output-space merge cost matrix (spec STRATEGY_NEXT §C).
 
@@ -488,47 +520,93 @@ def _output_space_cost(
         # Per non-centroid m: σ_m masked to tokens that route to m, and m's
         # own expert output E_m(x). Computed once per m (reused across its
         # K candidate centroids).
-        for ci in range(n_nc):
+        #
+        # Item-3 threading DECISION (M1): THREADED. The plan gated this on a
+        # measured A/B because GPU default-stream serialization + H2D
+        # contention *could* have made threading net-negative. The A/B on
+        # representative SC-config shapes (RTX 5080, hidden=2048 / d_int=768 /
+        # n_exp=64 / top_k=8 / token_cap=1024 / topk_filter=48 / 30 rows,
+        # bf16) measured SERIAL 26.9 s vs THREADED 3.9 s @8 workers — a
+        # **6.89x** speedup (3.55x @4), byte-identical (np.array_equal True).
+        # The CPU-side per-pair orchestration (the GIL-released Hungarian solve
+        # in _tentative_merged_weights + kernel-launch / Python overhead)
+        # overlaps the GPU forwards well, so the hypothesised regression did
+        # not materialise. Per M1's "if the A/B shows a real gain, thread the
+        # outer ci loop exactly as item 2", we thread it. Byte-identical:
+        # collect-then-merge (workers return thread-local cells; the main
+        # thread scatters ``out`` in row-major order — disjoint (ci,cj) cells,
+        # order-independent contents). Each worker enters torch.no_grad()
+        # itself (thread-local). perm_cache.put done by the main-thread replay.
+        def _solve_row(ci: int):
             m_id = noncentroid_ids[ci]
             # routing-weighted mask: σ_m(x) on tokens that route to m, else 0.
             routed_m = (topk_idx == m_id).any(dim=-1)  # (T,) bool
             gate_m = sigma[:, m_id] * routed_m.to(sigma.dtype)  # (T,)
-            # gate_m = softmax(·) * {0,1} is nonneg, so == 0.0 would suffice;
-            # kept as <= 0.0 defensively in case of fp underflow / NaN guards.
-            if float(gate_m.sum()) <= 0.0:
-                # No calibration token routes to m — the output cost is
-                # undefined (every merge is "free" on unseen inputs). The
-                # cheap-cost top-K still picks candidates, and a finite
-                # fallback is needed so the assignment solver retains
-                # feasible arcs for this row — fill those top-K entries
-                # with the cheap symmetric REAM cost (finite fallback),
-                # leaving the remaining entries at the row's initial +∞.
-                for cj in topk_per_ci[ci].tolist():
-                    out[ci, cj] = float(cheap_cost[ci, cj])
-                continue
+            cells: list[tuple[int, float]] = []
+            puts: list[tuple[tuple[int, int, int], np.ndarray, float | None]] = []
+            with torch.no_grad():
+                # gate_m = softmax(·) * {0,1} is nonneg, so == 0.0 would
+                # suffice; kept as <= 0.0 defensively for fp underflow / NaN.
+                if float(gate_m.sum()) <= 0.0:
+                    # No calibration token routes to m — the output cost is
+                    # undefined (every merge is "free" on unseen inputs). The
+                    # cheap-cost top-K still picks candidates, and a finite
+                    # fallback is needed so the assignment solver retains
+                    # feasible arcs for this row — fill those top-K entries
+                    # with the cheap symmetric REAM cost (finite fallback),
+                    # leaving the remaining entries at the row's initial +∞.
+                    for cj in topk_per_ci[ci].tolist():
+                        cells.append((cj, float(cheap_cost[ci, cj])))
+                    return ci, cells, puts
 
-            W_m = {name: banks[name].get(m_id).to(device, torch.float32)
-                   for name in MATRIX_NAMES}
-            E_m = _swiglu_forward(
-                W_m["gate_proj"], W_m["up_proj"], W_m["down_proj"], x_all,
-            )  # (T, hidden)
-
-            top_cj = topk_per_ci[ci].tolist()  # 1-D K-element Python int list — eliminates per-iteration int() cast
-            for cj in top_cj:
-                c_id = centroid_ids[cj]
-                merged = _tentative_merged_weights(
-                    layer_ref, c_id, m_id, freq, ream_acc, perm_cache, banks,
-                )
-                merged = {name: merged[name].to(device, torch.float32)
-                          for name in MATRIX_NAMES}
-                E_merged = _swiglu_forward(
-                    merged["gate_proj"], merged["up_proj"], merged["down_proj"],
-                    x_all,
+                W_m = {name: banks[name].get(m_id).to(device, torch.float32)
+                       for name in MATRIX_NAMES}
+                E_m = _swiglu_forward(
+                    W_m["gate_proj"], W_m["up_proj"], W_m["down_proj"], x_all,
                 )  # (T, hidden)
-                # Routing-weighted mean squared output change for expert m.
-                per_token = (E_m - E_merged).pow(2).sum(dim=-1)  # (T,)
-                cost = (gate_m * per_token).sum() / gate_m.sum()
-                out[ci, cj] = float(cost)
+
+                top_cj = topk_per_ci[ci].tolist()  # 1-D K-element Python int list — eliminates per-iteration int() cast
+                for cj in top_cj:
+                    c_id = centroid_ids[cj]
+                    # _tentative_merged_weights writes perm_cache itself on a
+                    # cache miss. Under threading that write is deferred: pass a
+                    # row-local capture cache so the worker never mutates the
+                    # shared perm_cache concurrently; collect the puts and
+                    # replay them on the main thread in row-major order (D2).
+                    _sink = _RowPermSink(perm_cache, puts) if perm_cache is not None else None
+                    merged = _tentative_merged_weights(
+                        layer_ref, c_id, m_id, freq, ream_acc, _sink, banks,
+                    )
+                    merged = {name: merged[name].to(device, torch.float32)
+                              for name in MATRIX_NAMES}
+                    E_merged = _swiglu_forward(
+                        merged["gate_proj"], merged["up_proj"], merged["down_proj"],
+                        x_all,
+                    )  # (T, hidden)
+                    # Routing-weighted mean squared output change for expert m.
+                    per_token = (E_m - E_merged).pow(2).sum(dim=-1)  # (T,)
+                    cost = (gate_m * per_token).sum() / gate_m.sum()
+                    cells.append((cj, float(cost)))
+            return ci, cells, puts
+
+        # Thread the per-ci rows. Disjoint (ci,cj) out cells + disjoint cache
+        # keys (each row owns a unique m_id) ⇒ order-independent contents; the
+        # row-major replay below makes perm_cache insertion order deterministic.
+        from ...utils.lsa_pool import parallel_map
+        row_results = parallel_map(
+            _solve_row, list(range(n_nc)), max_workers=lsa_max_workers,
+        )
+
+    # Main-thread merge: scatter out cells and replay perm_cache puts in
+    # ROW-MAJOR order — exactly the order the serial loop would have inserted
+    # them (it called perm_cache.put inside _tentative_merged_weights as each
+    # (ci,cj) pair was visited).
+    for ci, cells, puts in row_results:
+        for cj, value in cells:
+            out[ci, cj] = value
+        if perm_cache is not None:
+            for key, perm, residual in puts:
+                perm_cache.put(key, perm, residual)
 
     return out
 
@@ -570,6 +648,7 @@ class OutputSpaceCostPlugin:
         cost_whitening: str,
         cost_topk_filter: int,
         cost_output_token_cap: int,
+        lsa_threads: int = 8,
     ) -> None:
         # Store every knob the shared compute_cost body reads. NO logic — a
         # faithful mirror of the matching subset of LegacyAdapter.__init__.
@@ -580,6 +659,8 @@ class OutputSpaceCostPlugin:
         self.cost_whitening = cost_whitening
         self.cost_topk_filter = cost_topk_filter
         self.cost_output_token_cap = cost_output_token_cap
+        # Stage-2 LSA threading perf knob (read by _compute_cost_for_plugin).
+        self.lsa_threads = lsa_threads
 
     def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.cost_alignment`` resolves to ``"output"``.

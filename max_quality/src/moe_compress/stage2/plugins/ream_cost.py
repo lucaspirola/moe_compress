@@ -245,6 +245,7 @@ def _ream_cost_matrix(
     tentative_centroid_weights: dict[int, dict[str, torch.Tensor]] | None = None,
     layer_inputs: torch.Tensor | None = None,
     output_token_cap: int = 1024,
+    lsa_max_workers: int | None = None,
 ) -> np.ndarray:
     """Compute the (n_nc × n_c) REAM cost matrix.
 
@@ -362,6 +363,7 @@ def _ream_cost_matrix(
             freq=freq,
             layer_inputs=layer_inputs,
             token_cap=output_token_cap,
+            lsa_max_workers=lsa_max_workers,
         )
 
     if cost_alignment != "post":
@@ -389,6 +391,7 @@ def _ream_cost_matrix(
         topk=cost_topk_filter,
         freq=freq,
         tentative_centroid_weights=tentative_centroid_weights,
+        lsa_max_workers=lsa_max_workers,
     )
 
 
@@ -450,6 +453,9 @@ def _compute_cost_for_plugin(plugin, ctx: PipelineContext) -> np.ndarray:
             else None
         ),
         output_token_cap=plugin.cost_output_token_cap,
+        # Stage-2 LSA threading perf knob (stage2_reap_ream.lsa_threads). Pure
+        # wall-clock knob; byte-irrelevant. None ⇒ version-gated default.
+        lsa_max_workers=getattr(plugin, "lsa_threads", None),
     )
     return delta
 
@@ -511,6 +517,7 @@ class ReamCostPrePlugin:
         cost_whitening: str,
         cost_topk_filter: int,
         cost_output_token_cap: int,
+        lsa_threads: int = 8,
     ) -> None:
         # Store every knob the shared compute_cost body reads. NO logic — a
         # faithful mirror of the matching subset of LegacyAdapter.__init__.
@@ -521,6 +528,8 @@ class ReamCostPrePlugin:
         self.cost_whitening = cost_whitening
         self.cost_topk_filter = cost_topk_filter
         self.cost_output_token_cap = cost_output_token_cap
+        # Stage-2 LSA threading perf knob (read by _compute_cost_for_plugin).
+        self.lsa_threads = lsa_threads
 
     def is_enabled(self, config: dict) -> bool:
         """True iff ``stage2_reap_ream.cost_alignment`` resolves to ``"pre"``.

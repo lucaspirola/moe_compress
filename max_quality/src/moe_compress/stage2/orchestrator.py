@@ -1066,6 +1066,17 @@ def run(
         )
     cost_asymmetric: bool = bool(s2.get("cost_asymmetric", False))
     cost_topk_filter: int = int(s2.get("cost_topk_filter", 48))
+    # Stage-2 LSA threading perf knob (workstream A). Pure wall-clock control:
+    # byte-irrelevant (threading only reorders independent pure solves; results
+    # are scattered by index). Default 8 outer workers; 0/1 ⇒ serial. The
+    # version-gate in utils.lsa_pool independently falls back to serial on
+    # scipy<1.12 regardless of this value. NOT a golden-snapshot key.
+    lsa_threads: int = int(s2.get("lsa_threads", 8))
+    if lsa_threads < 0:
+        raise ValueError(
+            f"stage2_reap_ream.lsa_threads={lsa_threads}; must be >= 0 "
+            "(0 or 1 = serial; default 8)."
+        )
     capacity_util_threshold: float = float(s2.get("capacity_util_threshold", 0.25))
     em_refinement_rounds: int = int(s2.get("em_refinement_rounds", 0))
     em_convergence_break: bool = bool(s2.get("em_convergence_break", True))
@@ -1274,6 +1285,8 @@ def run(
         blacklist=blacklist, device=device,
         # Plugin #9 / S2_MM — see PLAN_PLUGIN_09_s2_mm.md.
         merge_step=merge_step,
+        # Stage-2 LSA threading perf knob (workstream A).
+        lsa_threads=lsa_threads,
     )
     # Registration order matters: ReapScoringPlugin.on_layer_setup must run
     # BEFORE LayerMergePlugin.on_profile (which reads ctx.reap_acc into
@@ -1298,6 +1311,9 @@ def run(
         cost_whitening=cost_whitening,
         cost_topk_filter=cost_topk_filter,
         cost_output_token_cap=cost_output_token_cap,
+        # Stage-2 LSA threading perf knob — read back by
+        # ream_cost._compute_cost_for_plugin via getattr(plugin, "lsa_threads").
+        lsa_threads=lsa_threads,
     )
     # S2-7: the skip-merge floor plugin is registered AFTER the three cost
     # plugins so it wins the ``apply_cost_mask`` ``dispatch_first`` slot.
@@ -1379,6 +1395,7 @@ def run(
             sinkhorn_epsilon_init=sinkhorn_epsilon_init,
             sinkhorn_epsilon_final=sinkhorn_epsilon_final,
             sinkhorn_iters=sinkhorn_iters,
+            lsa_threads=lsa_threads,
         ),
         # S2-12: the per-layer merge spine. ``LayerMergePlugin`` carries the
         # SIX live phase hooks relocated out of the retired ``LegacyAdapter``
