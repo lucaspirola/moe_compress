@@ -28,7 +28,7 @@ the research line numbers had drifted, the **verified** numbers are recorded.
 |------|---------------|----------------------|
 | Teacher forward | `teacher.py:~763` | `teacher.py:763` — `out = teacher(input_ids=input_ids)` inside `with torch.no_grad():` (762), in `TeacherLivePlugin.provide_teacher_logits` (def @ 720). No `attention_mask`, no `use_cache`. |
 | Student forward | `orchestrator.py:~733` | `orchestrator.py:733` — `student_out = student(input_ids=batch)`. No `use_cache`. |
-| grad-norm metric | `orchestrator.py:~828-833` | `orchestrator.py:828-834` — `grad_norm = float(clip_grad_norm_([p for p in _params_for_norm.parameters() if p.requires_grad and p.grad is not None], float('inf')))`, inside the `if (i+1) % grad_accum == 0:` block (825). |
+| grad-norm metric | `orchestrator.py:~828-833` | `orchestrator.py:828-833` — `grad_norm = float(clip_grad_norm_([p for p in _params_for_norm.parameters() if p.requires_grad and p.grad is not None], float('inf')))` (the `float(...)` statement spans 828-833, with `optim.step()` immediately after at 834), inside the `if (i+1) % grad_accum == 0:` block (825). |
 | grad-norm consumption | `~:884/:898` | **Only** `884/886` (`log.info`) and `898` (trackio payload) — both **inside** the `if step % log_every_n_steps == 0:` block (840). `grep -n grad_norm orchestrator.py` → exactly lines 828, 884, 886, 898. **Nothing else reads it.** |
 | Checkpoint glue | `~:928-938` + `_save_stage5_checkpoint ~:1004-1067` | Periodic save call @ `928-939`; early-stop save call @ `957-968`; `_save_stage5_checkpoint` def @ `1004`, body `.cpu().clone()` @ `1026`, `torch.save` @ `1055`, two `os.fsync` @ `1058`/`1064`, `os.replace` @ `1062`. |
 | Final export (golden target) | n/a | `save_compressed_checkpoint(...)` @ `994` writes `{stage_key}_final/compressed_metadata.json` — the byte-pinned golden artifact. |
@@ -56,6 +56,23 @@ must be re-proven on the golden fixture, not just asserted.
 - `router_kd/plugins/teacher.py` — `TeacherLivePlugin.provide_teacher_logits`,
   line **763**.
 - `router_kd/orchestrator.py` — `run()` training loop, line **733**.
+
+**Scope (N1):** the teacher edit at `teacher.py:763` only bites the **LIVE
+teacher path**. `provide_teacher_logits` is dispatched via
+`PluginRegistry.dispatch_first("provide_teacher_logits", ...)` at
+`orchestrator.py:700-701`, which walks `TeacherCachePlugin` first, then
+`TeacherLivePlugin`. When a `teacher_logits_cache` is configured the cache wins
+on a hit and `teacher.py:763` **never runs** (no-op there). Production uses the
+live teacher (cache miss → live forward), so the edit is live on the production
+path; it is simply inert when a cache is configured and hitting.
+
+**Stale-comment warning (L2):** the docstring on `provide_teacher_logits`
+(`teacher.py:~720-735`) still reads "INERT at RK-5: no orchestrator walk or test
+invokes this hook in the live pipeline." That comment is **STALE** — the live
+dispatch at `orchestrator.py:700-701` routes to this hook on a cache miss (the
+production path). The implementer should NOT be deterred by that comment into
+thinking the function is dead. A one-line docstring refresh (drop/correct the
+"INERT at RK-5" claim) may ride along with this Lever-A edit.
 
 ### Before → after
 Teacher (`teacher.py:763`):
@@ -115,10 +132,12 @@ part of this change. This change only removes the wasted allocation.
 
 ### File / function
 `router_kd/orchestrator.py` — `run()` training loop, the optimizer-step block
-`if (i + 1) % grad_accum == 0:` (line 825); `grad_norm` computed @ **828-834**.
+`if (i + 1) % grad_accum == 0:` (line 825); `grad_norm` computed @ **828-833**
+(`optim.step()` is the next statement at 834).
 
 ### Before → after (sketch)
-Today (verified): `grad_norm` is computed **every** optimizer step (828-834),
+Today (verified): `grad_norm` is computed **every** optimizer step (828-833,
+with `optim.step()` at 834),
 then `optim.step()` / `zero_grad()` / `scheduler.step()` / `step += 1`, then it
 is read **only** inside `if step % log_every_n_steps == 0:` (840) at 886 + 898.
 
@@ -197,7 +216,9 @@ Plus the manual window-boundary `grad_norm` parity check described above.
 `router_kd/orchestrator.py` — `_save_stage5_checkpoint` (def @ **1004**, body
 1026-1064) and its two call sites: periodic @ **928-939**, early-stop @
 **957-968**; plus the post-save prune (`sorted(partial_dir.glob("step_*.pt"))` +
-`unlink`) @ **942-948**; and the post-loop teardown/final-export region
+`unlink`) @ **941-946** — note this prune lives **in the orchestrator** `run()`
+body, NOT inside `_save_stage5_checkpoint` (def @ 1004); and the post-loop
+teardown/final-export region
 (`teardown_merge_repair` @ ~986, `save_compressed_checkpoint` @ **994**).
 
 ### Before → after (design)
@@ -225,12 +246,33 @@ Plan — **split synchronous snapshot from asynchronous write**:
    race-safe (see below). Bytes written are identical to today's.
 
 ### Thread lifecycle / correctness (must-address)
-- **Single writer, no overlap.** Use one persistent worker (a `threading.Thread`
-  draining a `queue.Queue(maxsize=1)`) or a one-slot executor. Before enqueuing a
-  new save, **block-join the previous one** (or rely on `maxsize=1` `put()`
-  blocking). Two checkpoints must never write concurrently. At production cadence
+- **Single writer, no overlap — scoped to `step_*.pt` only.** Use one persistent
+  worker (a `threading.Thread` draining a `queue.Queue(maxsize=1)`) or a one-slot
+  executor for the `step_*.pt` writes. Before enqueuing a new `step_*.pt` save,
+  **block-join the previous one** (or rely on `maxsize=1` `put()` blocking). Two
+  `step_*.pt` checkpoints must never write concurrently. At production cadence
   (~3 saves/run, hundreds of steps apart) the previous save is long done, so the
-  join is effectively free — but it MUST be there for correctness.
+  join is effectively free — but it MUST be there for correctness. **This
+  single-writer invariant covers `step_*.pt` ONLY.**
+- **`best.pt` is a separate, pre-existing synchronous writer — leave it
+  untouched (M1).** The `update_best_tracker` hook
+  (`router_kd/plugins/early_stop.py`, dispatched from `orchestrator.py:~870` via
+  `walk_phases(("update_best_tracker", "check_early_stop"), …)`) calls
+  `_save_best_router_state` (`early_stop.py:126`), which writes `best.pt`
+  **synchronously on the training thread** every log window into the **same**
+  `partial_dir` as the async `step_*.pt` writer — with its own
+  `torch.save` → file fsync → `os.replace` → directory fsync dance
+  (`early_stop.py:153-172`). Keeping `best.pt` synchronous is confirmed SAFE
+  alongside the async `step_*.pt` writer: (a) **distinct filenames** —
+  `best.pt`/`best.pt.tmp` vs `step_N.pt`/`step_N.pt.tmp` — so no same-name
+  collision; (b) the prune globs `step_*.pt` only, so it never unlinks `best.pt`;
+  (c) `best.pt` snapshots router params with `.data.cpu().clone()`
+  (`early_stop.py:142`) before `torch.save`, so its payload cannot tear even if
+  the GPU mutates afterward; (d) two threads each issuing their own directory
+  `fsync` on `partial_dir` is OS-safe. **No shared mutable state and no
+  same-filename collision with the async writer.** Therefore: do NOT move
+  `best.pt` onto the writer thread; the implementer leaves the synchronous
+  `best.pt` path exactly as-is.
 - **Join on shutdown / finalize.** Before the post-loop work that depends on the
   partial dir being settled — specifically **before `save_compressed_checkpoint`
   @ 994** and before `run()` returns @ 1001 — drain/join the writer so (a) all
@@ -246,7 +288,8 @@ Plan — **split synchronous snapshot from asynchronous write**:
   training thread at the next enqueue **and** at the final join (so a failed
   checkpoint halts the run rather than silently losing crash-resume state). Log
   with the same `log.info`/`log.error` channel.
-- **Prune race.** The post-save prune (942-948) lists `step_*.pt` and unlinks all
+- **Prune race.** The post-save prune (941-946, in the orchestrator `run()` body)
+  lists `step_*.pt` and unlinks all
   but the newest two. If the just-queued save has not yet written its `step_N.pt`
   (only the async writer creates it), the prune sees an older set. Resolve by
   **doing the prune inside the writer thread, after `os.replace`** (so the new
@@ -266,11 +309,21 @@ preserves a consistent point-in-time state; only the disk write moves off-thread
   the deep-CPU-copy is missed — the single most important detail), overlapping
   writes, a swallowed write error losing crash-resume, or a pending write racing
   the final export.
-- **Rollback:** the change is contained to `_save_stage5_checkpoint` + a small
-  amount of orchestrator glue (writer creation + join). Rollback = revert to the
-  synchronous body. Provide a kill-switch env/config (e.g.
-  `STAGE5_ASYNC_CKPT=0`) that forces the synchronous path, so a production run
-  can disable async without a code revert.
+- **Touched surface (L1).** The change is NOT confined to
+  `_save_stage5_checkpoint`. It touches: (a) `_save_stage5_checkpoint` itself
+  (split sync snapshot / async write); (b) orchestrator glue — writer creation +
+  join points; and (c) **the prune.** Relocating the prune into the writer thread
+  closure (after `os.replace`, per the Prune-race bullet) **moves orchestrator
+  logic (currently `run()` lines 941-946) into the writer closure** — i.e. it
+  enlarges the touched surface beyond `_save_stage5_checkpoint`. Account for this
+  in any rollback: reverting the lever means restoring both the synchronous
+  checkpoint body AND the in-`run()` synchronous prune.
+- **Rollback:** revert `_save_stage5_checkpoint` to the synchronous body, restore
+  the synchronous in-orchestrator prune (941-946), and remove the writer
+  creation/join glue. Provide a kill-switch env/config (e.g.
+  `STAGE5_ASYNC_CKPT=0`) that forces the synchronous path (including the prune
+  staying in `run()`), so a production run can disable async without a code
+  revert.
 - **Resume correctness is the real acceptance gate**, not the golden (the golden
   never exercises mid-run checkpoints). See testing plan.
 
