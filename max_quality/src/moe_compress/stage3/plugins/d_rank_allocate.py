@@ -365,7 +365,7 @@ def _group_stat(n_experts: int, bank, A_g: torch.Tensor | None = None) -> _Group
             # therefore the Cholesky factor + whitened svdvals) stays CPU-fp64 —
             # co-located with the CPU-resident A_g, device-independent, and the
             # fp64 precision is carried through svdvals → eff_rank → round() (the
-            # prior `.to(torch.float32)` cast is dropped; see D-drank-fp64-mixed
+            # prior `.to(torch.float32)` cast is dropped; see D-drank-fp64-spectrum
             # deviation block above).
             A64 = A_g.to(device="cpu", dtype=torch.float64)
             A64 = 0.5 * (A64 + A64.T)
@@ -592,7 +592,7 @@ class DRankAllocatePlugin:
         "D-drank-eq19-denominator (avg_cost preconditioning vs paper-exact "
         "params-weighted denominator), "
         "D-drank-mean-spectra (per-expert SV mean vs concat-SVD), "
-        "D-drank-fp64-mixed (FP64 Cholesky + FP32 SVD), "
+        "D-drank-fp64-spectrum (FP64 Cholesky + FP64 SVD, CPU-resident, device-independent), "
         "D-drank-symmetrize-A (defensive A_g symmetrization), "
         "D-drank-cholesky-jitter (1e-6·mean(diag) PD regularizer), "
         "D-drank-premerge-A (Stage 2 A-cov reuse on post-merge weights). "

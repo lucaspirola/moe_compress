@@ -664,6 +664,14 @@ class AaSvdFactorPlugin:
                 slot = ranks_layer[name]
                 u_w = U_k.shape[1]   # actual returned column count of U_k
                 v_w = V_k.shape[0]   # actual returned row count of V_k (== u_w)
+                # Defensive: the _aa_svd* re-clamp chain guarantees the returned
+                # factor width never exceeds the per-LAYER MAX slot, so u_w/v_w > slot
+                # is impossible. Assert it loudly here to localize the diagnostic
+                # instead of falling through to set_factors' generic shape error.
+                assert u_w <= slot and v_w <= slot, (
+                    f"factor width exceeds slot (u_w={u_w}, v_w={v_w}, slot={slot}) "
+                    f"for L{ref.layer_idx}_E{e}_{name} — _aa_svd* clamp chain violated"
+                )
                 if u_w < slot:
                     U_pad = torch.zeros(
                         U_k.shape[0], slot, device=U_k.device, dtype=U_k.dtype)
