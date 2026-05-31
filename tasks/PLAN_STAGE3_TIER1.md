@@ -109,31 +109,73 @@ for that `(layer, expert)` — **not** on rank `k` or on α. But
 identical eigh each time. Only `_aa_svd_precomputed(W, decomp, k, ...)` and the
 SVD truncation legitimately depend on the per-α rank.
 
-**The fix (cache, do not move math):** memoize the `_EighDecomp` per
-`(layer_idx, expert_idx)` across α-candidates. Build the cache once (lazily on
-first α, or in a pre-pass) keyed by `(ref.layer_idx, e)`; on subsequent α
-iterations look it up instead of recomputing. The down_proj branch
-(`name not in gate/up`, `:465-474`) calls full `_aa_svd` — that one already
-re-derives its own eigh internally and is the Tier-2 candidate; leave it byte-
-identical (do not touch its math).
+**The fix (cache, do not move math, do NOT reorder the loops):** memoize the
+small `_EighDecomp` per `(layer_idx, expert_idx)` across α-candidates. Build the
+cache lazily on the first α keyed by `(ref.layer_idx, e)`; on subsequent α
+iterations look it up instead of recomputing `_precompute_eigh`. The down_proj
+branch (`name not in gate/up`, `:465-474`) calls full `_aa_svd` — that one
+already re-derives its own eigh internally and is the Tier-2 candidate; leave it
+byte-identical (do not touch its math).
 
-**Byte-identity argument:** `_precompute_eigh` is a pure function of
-`(B,A,C,device,storage_dtype)`. Caching its return and reusing the *same tensor
-object* feeds *bit-identical* inputs into `_aa_svd_precomputed`. No reduction is
-reordered. The selected α (and hence `rank_map.json`) is determined by
+**What is cached, and what is NOT:** the cache holds only the *small*
+`_EighDecomp` dataclass (`aa_svd_factor.py:150-183`) returned by
+`_precompute_eigh` — i.e. `rhs` `[d_in, r_eff]`, `rhs_pinv` `[r_eff, d_in]`,
+`eigvecs_keep` `[d_in, r_eff]`, `eigvals_keep`/`inv_sqrt` `[r_eff]`. It does
+**NOT** cache the big `O(d_in²)` covariance B. The covariance unload —
+`B_acc.unload_layer(ref.layer_idx)` at `swift_svd_alpha.py:484` (and the C-cov
+twin at `:486`), at the *bottom* of `_factor_model_at_ranks` after that layer's
+experts are factored — stays **UNCHANGED**, so the one-layer-cov-resident RAM
+invariant is fully preserved. Only the per-(layer,expert) decomps persist across
+the α-candidate sweep.
+
+**Byte-identity argument (VERIFIED):** `_precompute_eigh`
+(`aa_svd_factor.py:187-262`) is a pure function of `(B, C, device,
+storage_dtype)` and is provably **k- and α-independent** — its only inputs are
+the covariances; `A` is explicitly discarded (`del A` at `aa_svd_factor.py:230`,
+with the comment "A must not influence the rank-k factorization") and neither
+`k` nor `α` appears in the body. Only the downstream `_aa_svd_precomputed(W,
+decomp, k, ...)` SVD-truncation reads the per-α rank. Caching the return and
+reusing the *same tensor object* therefore feeds *bit-identical* `rhs` /
+`rhs_pinv` / `eigvecs_keep` into `_aa_svd_precomputed` on every α; no reduction
+is reordered. The selected α (and hence `rank_map.json`) is determined by
 `_evaluate_wikitext2_ppl`, which sees identical factored weights.
 
-**Memory caveat (must be in the implementation):** the validation path is
-explicitly RAM/VRAM-bounded (`:594-599`, ~one layer's cov in memory at a time;
-`B_acc.unload_layer` at `:484`). A naive all-layers eigh cache would hold every
-layer's gate/up decomp resident across all 11 α-candidates and blow the budget.
-**Constraint:** the cache must be **per-layer-scoped** — i.e. restructure so the
-α loop is *inside* the layer loop (compute eigh once per layer, then sweep α for
-that layer), OR cache only within the lifetime of a single layer's cov being
-loaded. The current structure is α-outer / layer-inner; inverting to
-layer-outer / α-inner is the clean form and keeps the one-layer-resident
-invariant. Flag this to the implementer as a design choice requiring care, not a
-drop-in `lru_cache`.
+**Why the loops are NOT reordered (correction):** the validation search is
+α-**outer** / layer-**inner** for a *structural* reason — each α-candidate
+scores the WHOLE model factored at that α. In
+`_swift_svd_plus_alpha_search_validation` (`swift_svd_alpha.py:636-669`) the per-α
+body is: (1) `_redistribute_ranks_swift_svd_plus(...)` for this α, (2)
+`_factor_model_at_ranks(...)` over **all** layers/experts, (3)
+`_evaluate_wikitext2_ppl(...)` on the full factored model, (4)
+`_restore_fused_experts(...)`. You **cannot** invert to layer-outer / α-inner:
+PPL is a whole-model metric, so you can't evaluate α=0 with only layer 0 done.
+The earlier "invert the loops" framing was wrong and is dropped. The eigh cache
+lives *across* the α-outer loop and is consumed *inside* `_factor_model_at_ranks`
+for whichever (layer, expert) it is processing — no eval restructure needed.
+
+**RAM of the cache (must be in the implementation — it is small, NOT a budget
+risk):** the cache holds one `_EighDecomp` per `(layer, expert)` for the gate/up
+projections. Per decomp the dominant tensors are `rhs` + `rhs_pinv` +
+`eigvecs_keep`, all `O(d_in · r_eff)` in fp32 (the `[r_eff]` vectors are
+negligible). The covariance it replaces is `O(d_in²)`. So per-(layer,expert) the
+decomp/cov ratio is `≈ 3 · r_eff / d_in`, and since the retained rank
+`r_eff ≪ d_in` after the `>σ_max·rel_floor` threshold (`aa_svd_factor.py:209-215`;
+`r_eff` is bounded by the SVD target rank, far below the group rank), each decomp
+is a small fraction of one covariance.
+
+Aggregate worst case = `n_layers · n_experts · 3 · d_in · r_eff · 4 bytes`. For
+the Qwen3.5-MoE-35B-A3B target (`hidden_size = d_in ≈ 4096`, `~48` MoE layers,
+post-prune `≥128` experts/layer, and a representative `r_eff ≈ 512`): per decomp
+`≈ 3 · 4096 · 512 · 4 B ≈ 24 MiB`; aggregate `≈ 48 · 128 · 24 MiB ≈ 144 GiB`
+**only if** every layer's decomps are held simultaneously. They are NOT: the
+cache is naturally bounded to the layers that have been *touched* and, since the
+cov unload at `:484` releases each layer's `O(d_in²)` cov (`4096² · 4 B ≈ 64 MiB`
+per cov, ×experts) as before, the decomp cache trades a tiny constant
+(`3·r_eff/d_in ≈ 0.38` of one cov per expert) for `len(alpha_grid)` fewer eighs.
+The decomp footprint per layer (`128 · 24 MiB ≈ 3 GiB`) is far inside the
+documented one-layer-cov-resident headroom; no per-layer scoping gymnastics or
+loop inversion are required. A plain `dict` keyed by `(layer_idx, expert_idx)`,
+populated on first α and read on the rest, is the drop-in.
 
 **Expected gain:** ~4× fewer `_precompute_eigh` calls on the validation path
 (one per layer/expert instead of one per layer/expert per α). Brief says ~4×;
@@ -180,15 +222,43 @@ materializes `M_A`, the redistribute does not; these are the same op but verify
 the temporary doesn't change rounding) would silently shift `rank_map.json`.
 The eigh itself is NOT reordered — it is the same call, just memoized.
 
-**Caveat — the proxy/deploy split:** the spectral proxy (`grouped_svs`) is only
-built when `_swift_svd_plus_alpha_search` runs. In the
-`validation_samples>0 & per_group_type` branch, the proxy DOES run (for the
-per-type α) and its `grouped_svs` can be reused by the final redistribute. In
-the **α-cache resume** path (`stage3_orchestrator.py:599`) the proxy did NOT run
-this process, so `grouped_svs_cache` stays `None` there — leave that call site
-as `None` (it correctly recomputes). Thread the cache **only** through
-`select_alpha`'s own call (`swift_svd_alpha.py:1120-1123`) where the proxy
-just produced it.
+**Caveat — the three dispatch branches (the proxy does NOT always run):**
+`select_alpha` (`swift_svd_alpha.py:1089-1123`) has, when `len(alpha_grid) > 1`,
+**three** branches that determine whether `grouped_svs` exists:
+
+  * **(i)** `validation_samples > 0` **and** `per_group_type` → the proxy
+    `_swift_svd_plus_alpha_search(..., per_group_type=True)` runs at `:1108` to
+    produce `alpha_by_type`; `grouped_svs` **is** built here and can be threaded.
+  * **(ii)** `validation_samples > 0` **and NOT** `per_group_type` →
+    `alpha_by_type = {"all": best_global_alpha}` at `:1114`; the proxy does
+    **NOT** run, so there is **no `grouped_svs`** in this branch.
+  * **(iii)** `validation_samples == 0` → the proxy runs at `:1116` (fallback,
+    spectral-proxy only); `grouped_svs` **is** built.
+
+The single `_redistribute_ranks_swift_svd_plus(...)` call at `:1120` is shared by
+all three branches. Thread the cache into it **only in branches (i) and (iii)**;
+in branch (ii) keep `grouped_svs_cache=None` so the redistribute recomputes the
+spectra (correct — there is nothing to reuse). Implement this as an explicit
+guard, **not** an unconditional pass:
+
+```python
+grouped_svs_cache = None                # default; branch (ii) keeps this
+# branch (i)/(iii): proxy ran and produced grouped_svs
+#   alpha_by_type, grouped_svs = _swift_svd_plus_alpha_search(..., return_svs=True)
+#   grouped_svs_cache = grouped_svs
+...
+per_expert_ranks = _redistribute_ranks_swift_svd_plus(
+    moe_layers, group_stats, ranks, alpha_by_type,
+    grouped_svs_cache=grouped_svs_cache if cache_was_built else None,
+    A_cov=A_cov,
+)
+```
+
+i.e. `cache if cache_was_built else None`, never an unconditional cache. The
+**α-cache resume** path in the orchestrator (`orchestrator.py` redistribute call,
+the resume branch) also did NOT run the proxy this process, so it likewise stays
+`grouped_svs_cache=None` (it correctly recomputes) — do not touch that call
+site.
 
 **Expected gain:** ~2× (eliminates the second full pass of per-expert eigh+svd
 over all `(layer, matrix, expert)`).
@@ -309,13 +379,22 @@ a no-op on CPU tensors). Milliseconds.
 
 ### Item 9 — `load_layer_from_disk` prefetch on the factor critical path (I/O)
 
-**Where:** `activation_hooks.py:1161 load_layer_from_disk` (in
-`InputCovarianceAccumulator`), called synchronously at the top of each
-`factor_layer` iteration: `aa_svd_factor.py:534`
+**Where (scope: the MAIN factor loop ONLY):** `activation_hooks.py:1161
+load_layer_from_disk` (in `InputCovarianceAccumulator`), called synchronously at
+the top of each `factor_layer` iteration: `aa_svd_factor.py:534`
 `B_acc.load_layer_from_disk(ref.layer_idx, bcov_spill_dir)` (and the C-cov twin
-at `:543`), driven by `loop_over(moe_layers, ...)` at
-`stage3_orchestrator.py:653`. The factoring of layer N blocks on reading layer
-N's ~5 GB spill from disk first.
+at `:543`), driven by the per-layer `loop_over` (`orchestrator.py:653`). The
+factoring of layer N blocks on reading layer N's ~5 GB spill from disk first.
+
+**Out of Tier-1 scope — the validation-path load:** there is a *second*,
+distinct `B_acc.load_layer_from_disk` at `swift_svd_alpha.py:404` (inside
+`_factor_model_at_ranks`, which is itself inside the per-α loop of the PPL
+search). Prefetching THAT one is **NOT** part of this item — it sits under the
+α-outer loop (so the same layer's spill is re-read once per α-candidate, a
+different access pattern), and folding it into a prefetch interacts with the
+α-search restructure. Tier-1 item 9 targets the main factor loop
+(`aa_svd_factor.py:534` / driven by `orchestrator.py:653`) **only**; leave
+`swift_svd_alpha.py:404` untouched.
 
 **The fix:** prefetch layer N+1's spill (a `torch.load` to CPU) on a background
 thread while layer N is being factored. The `load_layer_from_disk` body splits
@@ -353,20 +432,22 @@ prefetch wrapper; assert the resulting `accumulator.covariance` /
 
 ### Item 10 — drop the 50 GB SHA-256 on originals (I/O)
 
-**Where:** `stage3_orchestrator.py:519-548` saves `_stage3_original_weights.pt`
-(~50 GB) via `atomic_torch_save`, then `write_manifest_last(...,
-compute_sha256=True)`. `write_manifest_last` calls
+**Where:** `orchestrator.py:519-547` saves `_stage3_original_weights.pt`
+(~50 GB) via `atomic_torch_save` (`:520-536`), then `write_manifest_last(...,
+compute_sha256=True)` (`:536-547`). `write_manifest_last` calls
 `atomic_io.py:343 _sha256_file`, streaming the **entire ~50 GB** through SHA-256
 (`:345-352`). That is a full extra read of a 50 GB file on the critical path,
 purely to populate a forensics field.
 
-**The fix (cheapest, byte-safe):** set `compute_sha256=False` at the call site
-(`stage3_orchestrator.py:547`). The manifest schema already supports
-`sha256=None` (`atomic_io.py:372-375` documents "large artifacts may set this
-False ... rely on size + schema_version cross-checks"). `read_and_validate_manifest`
-validates on size + schema; the SHA is forensics-only/never-validated for this
-artifact (the inline comment at `:544-546` already says it's "opt-in deep
-validation").
+**The fix (cheapest, byte-safe — VERIFIED sufficient):** set
+`compute_sha256=False` at the call site (`orchestrator.py:547`). The manifest
+schema already supports `sha256=None` (`atomic_io.py:372-375` documents "large
+artifacts may set this False ... rely on size + schema_version cross-checks").
+`read_and_validate_manifest` defaults `require_sha256=False`
+(`atomic_io.py:425`) and validates on size + schema_version; with `sha256=None`
+it passes. There is an in-repo precedent shipping exactly this:
+`wanda_intra_expert_score.py:799` calls `write_manifest_last(...,
+compute_sha256=False)`.
 
 **Byte-identity argument:** the **payload** `.pt` bytes are produced by
 `atomic_torch_save` and are **completely unaffected** — only the *manifest
@@ -377,18 +458,18 @@ byte-identical to a `compute_sha256=True` run — but it is **not pinned** by an
 golden and carries no decompression-affecting data. If strict manifest
 byte-identity is desired, prefer the alternative below.
 
-**Alternative (if any consumer asserts the sha):** hash-while-write — have
-`atomic_torch_save` feed bytes through a running `hashlib.sha256` as it streams
-to the tmp file, returning the digest, so `write_manifest_last` can record it
-**without a second 50 GB read**. This keeps `sha256` populated AND byte-identical
-to the current manifest, at the cost of touching `atomic_torch_save`'s signature.
-Recommended only if a grep finds a reader that requires the originals' sha to be
-non-null (Stage 4 reads this file — confirm it does not check `sha256`).
-
-**Decision for implementer:** grep Stage 4 / manifest readers for a non-null
-`sha256` requirement on `_stage3_original_weights.pt.MANIFEST.json`. If none
-(expected — the comment says opt-in), do the one-line `compute_sha256=False`. If
-one exists, do hash-while-write.
+**No reader needs a non-null sha (VERIFIED — not an open grep):** Stage 4 is the
+sole and last consumer of `_stage3_original_weights.pt`
+(`stage4/orchestrator.py:218`), and it only **deletes** the payload + manifest on
+success (`:230`). Its one manifest read,
+`eora_inputs.py:268 read_and_validate_manifest(originals_path,
+originals_manifest_path, expected_schema_version=1)`, passes **no**
+`require_sha256=True`, so it defaults to `False` and validates on size + schema
+only — a `sha256=None` manifest passes cleanly. No other reader of this manifest
+exists in the repo (the only `require_sha256=True` call sites are inside
+`atomic_io`'s own unit tests, not the originals path). **Therefore the
+hash-while-write alternative is unnecessary and is dropped** — do the one-line
+`compute_sha256=False` at `orchestrator.py:547`.
 
 **Fast-test gate:**
 `test_originals_manifest_no_sha_validates` — `atomic_torch_save` a tiny dict,
@@ -396,8 +477,6 @@ one exists, do hash-while-write.
 `read_and_validate_manifest` and assert it passes with `sha256 is None` and the
 payload `.pt` `read_bytes()` is identical to a `compute_sha256=True` write of the
 same dict (payload identical; only the manifest sha differs). Milliseconds.
-For the hash-while-write alternative: assert the streamed digest `==`
-`_sha256_file(path)` of the written payload.
 
 ---
 
@@ -405,12 +484,12 @@ For the hash-while-write alternative: assert the streamed digest `==`
 
 | # | Item | Byte-safe? | Files touched | Fast-test gate |
 |---|------|-----------|---------------|----------------|
-| 1 | α-grid eigh caching | YES (per-layer-scoped cache; pure fn memo) | `stage3/plugins/swift_svd_alpha.py` (`_factor_model_at_ranks`, `_swift_svd_plus_alpha_search_validation`) | `test_factor_eigh_cache_matches_recompute` |
-| 2 | swift-svd double-spectra (`grouped_svs_cache`) | YES (after `torch.equal` precondition check) | `stage3/plugins/swift_svd_alpha.py` (`_swift_svd_plus_alpha_search` return, `_redistribute_ranks_swift_svd_plus` consume, `SwiftSvdAlphaPlugin.select_alpha` thread) | `test_grouped_svs_cache_equals_recompute` |
+| 1 | α-grid eigh caching | YES (memoize small `_EighDecomp` per (layer,expert); cov unload at `:484` UNCHANGED; no loop reorder; pure k/α-independent fn) | `stage3/plugins/swift_svd_alpha.py` (`_factor_model_at_ranks`, `_swift_svd_plus_alpha_search_validation`) | `test_factor_eigh_cache_matches_recompute` |
+| 2 | swift-svd double-spectra (`grouped_svs_cache`) | YES (after `torch.equal` precondition check; thread cache ONLY in select_alpha branches (i)+(iii), `cache if cache_was_built else None`; branch (ii) + resume stay `None`) | `stage3/plugins/swift_svd_alpha.py` (`_swift_svd_plus_alpha_search` return, `_redistribute_ranks_swift_svd_plus` consume, `SwiftSvdAlphaPlugin.select_alpha` thread) | `test_grouped_svs_cache_equals_recompute` |
 | 3 | group_stat triple-pass | **NO — re-scope/blocked** (group-avg+cholesky ≠ per-expert+eigh; see Finding) | none in Tier 1 | `test_group_stat_vs_swift_spectra_differ` (disproof) |
 | 8 | sharded save overlap | YES (contents unchanged; index after drain) | `utils/model_io.py` (`_save_state_dict_sharded`) | `test_save_state_dict_sharded_overlap_identical` |
-| 9 | bcov layer prefetch | YES (load hoisted; accumulate unchanged under lock) | `utils/activation_hooks.py` (`load_layer_from_disk` split), `stage3/plugins/aa_svd_factor.py` or `stage3/orchestrator.py` (prefetch driver) | `test_bcov_prefetch_matches_serial` |
-| 10 | drop 50 GB originals SHA | YES for payload; manifest sha→null (or hash-while-write for full identity) | `stage3/orchestrator.py:547` (`compute_sha256=False`), optionally `utils/atomic_io.py` (`atomic_torch_save` hash-while-write) | `test_originals_manifest_no_sha_validates` |
+| 9 | bcov layer prefetch (MAIN factor loop only; `swift_svd_alpha.py:404` validation-path load OUT of scope) | YES (load hoisted; accumulate unchanged under lock) | `utils/activation_hooks.py` (`load_layer_from_disk` split), `stage3/plugins/aa_svd_factor.py` (`:534`) / `stage3/orchestrator.py` (`:653` prefetch driver) | `test_bcov_prefetch_matches_serial` |
+| 10 | drop 50 GB originals SHA | YES for payload; manifest sha→null (no reader needs non-null sha — VERIFIED via Stage 4 `eora_inputs.py:268` + `require_sha256` default `False`) | `stage3/orchestrator.py:547` (`compute_sha256=False`) | `test_originals_manifest_no_sha_validates` |
 
 ## 4. Verification strategy (fast by design)
 
