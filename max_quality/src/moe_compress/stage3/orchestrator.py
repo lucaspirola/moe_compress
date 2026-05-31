@@ -544,8 +544,8 @@ def run(
         # Tier-1 item 10: skip the ~50 GB SHA-256 on the originals payload.
         # Streaming the full _stage3_original_weights.pt (~50 GB on a 30B
         # base) through SHA-256 is a second full read on the critical path
-        # purely to populate a forensics field. The sole consumer (Stage 4
-        # eora_inputs.read_and_validate_manifest) passes no require_sha256,
+        # purely to populate a forensics field. The sole consumer
+        # (stage4/plugins/eora_inputs.py:268) passes no require_sha256,
         # so it defaults to False and validates on size + schema_version
         # only — a sha256=None manifest passes cleanly. In-repo precedent:
         # wanda_intra_expert_score.py ships compute_sha256=False likewise.
