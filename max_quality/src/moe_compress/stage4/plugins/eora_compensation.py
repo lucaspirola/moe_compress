@@ -179,6 +179,59 @@ def _spill_layer(
     os.replace(tmp, final)
 
 
+def _eigh_spectrum(
+    A: torch.Tensor,
+    d_in: int,
+    device,
+    storage_dtype: torch.dtype | None = None,
+):
+    """Compute the EoRA whitening spectrum of covariance ``A`` (Lever A helper).
+
+    Performs the EXACT prologue ``_compute_eora_factors`` runs at the original
+    lines :239-:240 BEFORE ``eigh`` (cast to fp32 + symmetrize), then the
+    noise-floor truncation. The returned spectrum is keyed on the
+    *post-cast, post-symmetrize* matrix — memoizing it and reusing it on the
+    up_proj pass (which shares gate_proj's identical ``A`` object) is
+    bit-identical to recomputing ``eigh`` on the same input.
+
+    Returns
+    -------
+    ``None``
+        when the caller must fall back to plain (unweighted) SVD — i.e. the
+        covariance shape mismatches ``(d_in, d_in)`` or no eigenvalue clears
+        the noise floor. Mirrors the original :241-:244 / :255-:256 fallbacks.
+    ``(eigvecs_keep, eigvals_keep, sqrt_lambda, inv_sqrt_lambda)``
+        on success. ``eigvecs_keep`` is ``[d_in, n_keep]``; the three vectors
+        are ``[n_keep]``. All on ``device`` in fp32.
+    """
+    A = A.to(device=device, dtype=torch.float32)
+    A = 0.5 * (A + A.T)
+    if A.shape != (d_in, d_in):
+        log.warning("EoRA: covariance shape %s != (%d,%d), falling back to plain SVD",
+                    A.shape, d_in, d_in)
+        return None
+
+    # Step 2: Eigendecompose activation covariance A = X̃^T X̃ = QΛQ^T  (A shape [d_in × d_in])
+    eigvals, eigvecs = torch.linalg.eigh(A)  # ascending order
+
+    lambda_max = float(eigvals[-1].clamp_min(0).item())
+    # Dtype-aware noise floor — see _NOISE_FLOOR_BY_DTYPE in tools.dtype_noise_floor.
+    rel_floor = _NOISE_FLOOR_BY_DTYPE.get(storage_dtype or torch.float32, 1e-6)
+    thresh = max(lambda_max * rel_floor, 1e-12)
+
+    keep_mask = eigvals > thresh
+    if not keep_mask.any():
+        return None
+
+    # Keep only directions above the noise floor for the projection.
+    eigvals_keep = eigvals[keep_mask].clamp_min(0)
+    eigvecs_keep = eigvecs[:, keep_mask]         # [d_in, n_keep]
+
+    sqrt_lambda = eigvals_keep.sqrt()                        # [n_keep]
+    inv_sqrt_lambda = eigvals_keep.clamp_min(1e-30).rsqrt()  # [n_keep]
+    return eigvecs_keep, eigvals_keep, sqrt_lambda, inv_sqrt_lambda
+
+
 def _compute_eora_factors(
     delta: torch.Tensor,
     A: torch.Tensor | None,
@@ -186,6 +239,7 @@ def _compute_eora_factors(
     device,
     *,
     storage_dtype: torch.dtype | None = None,
+    spectrum: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Paper-correct EoRA (2410.21271) Algorithm 1.
 
@@ -214,6 +268,18 @@ def _compute_eora_factors(
     warning as a hard error and investigate the input pipeline.
     TODO: consider upgrading the warning to ``raise ValueError`` once the
     eora_inputs contract is locked down further.
+
+    Lever A — ``spectrum``
+    ----------------------
+    Optional precomputed whitening spectrum
+    ``(eigvecs_keep, eigvals_keep, sqrt_lambda, inv_sqrt_lambda)`` from
+    :func:`_eigh_spectrum`. When supplied, the kernel SKIPS its own
+    ``eigh(A)`` and reuses these tensors. The gate_proj / up_proj passes of
+    the same ``(layer, expert)`` share the IDENTICAL ``A`` object, so passing
+    gate's spectrum to up is bit-identical to recomputing — by construction,
+    since the memoized spectrum is the spectrum of the *post-cast,
+    post-symmetrize* matrix that ``eigh`` would consume. When ``spectrum`` is
+    ``None`` the kernel computes it itself (unchanged behaviour).
     """
     if r <= 0:
         return (torch.zeros(delta.shape[0], 0, device=device),
@@ -233,57 +299,68 @@ def _compute_eora_factors(
         V_out[:rk, :] = Vh[:rk, :]
         return U_out, V_out, rk
 
-    if A is None:
+    if A is None and spectrum is None:
         return _plain_svd_padded()
 
-    A = A.to(device=device, dtype=torch.float32)
-    A = 0.5 * (A + A.T)
-    if A.shape != (d_in, d_in):
-        log.warning("EoRA: covariance shape %s != (%d,%d), falling back to plain SVD",
-                    A.shape, d_in, d_in)
+    # Lever A: reuse a precomputed spectrum when supplied; else compute it now.
+    # ``_eigh_spectrum`` returns None on the same shape-mismatch / empty-keep
+    # conditions that previously fell back inline (:241-:244, :255-:256).
+    if spectrum is None:
+        spectrum = _eigh_spectrum(A, d_in, device, storage_dtype)
+    if spectrum is None:
         return _plain_svd_padded()
-
-    # Step 2: Eigendecompose activation covariance A = X̃^T X̃ = QΛQ^T  (A shape [d_in × d_in])
-    eigvals, eigvecs = torch.linalg.eigh(A)  # ascending order
-
-    lambda_max = float(eigvals[-1].clamp_min(0).item())
-    # Dtype-aware noise floor — see _NOISE_FLOOR_BY_DTYPE in tools.dtype_noise_floor.
-    rel_floor = _NOISE_FLOOR_BY_DTYPE.get(storage_dtype or torch.float32, 1e-6)
-    thresh = max(lambda_max * rel_floor, 1e-12)
-
-    keep_mask = eigvals > thresh
-    if not keep_mask.any():
-        return _plain_svd_padded()
-
-    # Keep only directions above the noise floor for the projection.
-    eigvals_keep = eigvals[keep_mask].clamp_min(0)
-    eigvecs_keep = eigvecs[:, keep_mask]         # [d_in, n_keep]
-    n_keep = int(eigvals_keep.numel())
+    eigvecs_keep, eigvals_keep, sqrt_lambda, inv_sqrt_lambda = spectrum
 
     # Step 3: Q' = Q · √Λ  (paper Algorithm 1 step 3).
     # FULL projection matrix — NOT truncated to r. The SVD in step 5
     # will optimally select the best r directions from the FULL d_in-
     # dimensional projected error. Pre-truncating to r would eliminate
     # the joint optimisation that distinguishes EoRA from Act-S.
-    sqrt_lambda = eigvals_keep.sqrt()                         # [n_keep]
     Q_prime = eigvecs_keep * sqrt_lambda.unsqueeze(0)         # [d_in, n_keep]
 
     # Step 4: ΔW' = ΔW · Q'  (FULL projection, [d_out × n_keep])
     delta_prime = delta @ Q_prime                             # [d_out, n_keep]
 
-    # Step 5: rank-r SVD of the full projected error
-    U_p, S_p, Vh_p = torch.linalg.svd(delta_prime, full_matrices=False)
-    take_eff = min(r, int(U_p.shape[1]))
+    # Step 5: rank-r SVD of the full projected error — Lever C (Gram-side).
+    # Instead of torch.linalg.svd(delta_prime) (which materialises ALL
+    # min(d_out, n_keep) singular triplets), eigh the SMALLER Gram and extract
+    # the top-take_eff triplets. ``take_eff`` MIRRORS production EXACTLY:
+    #   production was  take_eff = min(r, U_p.shape[1]) with U_p from
+    #   svd(delta_prime, full_matrices=False) ⇒ U_p.shape[1] == min(d_out, n_keep)
+    # so take_eff = min(r, min(d_out, n_keep)). We do NOT add an (evals>0)
+    # positivity filter — that would shrink take_eff below production whenever a
+    # kept direction is zero/near-zero/Gram-negative, a deterministic rank
+    # reduction the full SVD never does → would break the golden by construction.
+    # We clamp the singular VALUES (not the count) and guard the left/right
+    # divide with an eps tensor on ``device``.
+    d_out_, n_keep_ = delta_prime.shape
+    take_eff = min(r, min(d_out_, n_keep_))
+    eps = torch.tensor(1e-30, device=device, dtype=torch.float32)
+    if n_keep_ <= d_out_:
+        # Right Gram is the smaller [n_keep, n_keep] matrix.
+        G = delta_prime.T @ delta_prime                       # [n_keep, n_keep]
+        evals, evecs = torch.linalg.eigh(G)                   # ascending
+        idx = torch.arange(n_keep_ - 1, n_keep_ - 1 - take_eff, -1, device=device)
+        s = evals[idx].clamp_min(0).sqrt()                    # σ = √λ, [take_eff]
+        Vh_p = evecs[:, idx].T                                # [take_eff, n_keep]
+        U_p = (delta_prime @ evecs[:, idx]) / s.clamp_min(eps)  # [d_out, take_eff]
+    else:
+        # Left Gram is the smaller [d_out, d_out] matrix.
+        G = delta_prime @ delta_prime.T                       # [d_out, d_out]
+        evals, evecs = torch.linalg.eigh(G)                   # ascending
+        idx = torch.arange(d_out_ - 1, d_out_ - 1 - take_eff, -1, device=device)
+        s = evals[idx].clamp_min(0).sqrt()                    # σ = √λ, [take_eff]
+        U_p = evecs[:, idx]                                   # [d_out, take_eff]
+        Vh_p = ((delta_prime.T @ evecs[:, idx]) / s.clamp_min(eps)).T  # [take_eff, n_keep]
 
     # Step 6a: B' = U' Σ'
-    U_corr = U_p[:, :take_eff] * S_p[:take_eff]              # [d_out, take_eff]
+    U_corr = U_p * s                                         # [d_out, take_eff]
 
     # Step 6b: Back-project V_corr = V'^T · Q'^{+}
     # Q'^{+} = diag(1/√Λ) · Q^T  (pseudo-inverse — eigvecs_keep is [d_in × n_keep],
     # non-square after the noise-floor mask, so this is Moore-Penrose, not true inverse)
     # So: V_corr = V'^T · diag(1/√Λ) · Q^T = (Vh_p[:take_eff] · diag(1/√Λ)) @ Q^T
-    inv_sqrt_lambda = eigvals_keep.clamp_min(1e-30).rsqrt()   # [n_keep]
-    V_corr = (Vh_p[:take_eff, :] * inv_sqrt_lambda.unsqueeze(0)) @ eigvecs_keep.T
+    V_corr = (Vh_p * inv_sqrt_lambda.unsqueeze(0)) @ eigvecs_keep.T
     # V_corr shape: [take_eff, d_in]
 
     # Zero-pad to fixed r so caller's pre-allocated tensors stay shape-stable.
@@ -405,6 +482,16 @@ class EoraCompensationPlugin:
 
         layer_compensated_params = 0
         rank_map_layer: dict[str, int] = {}
+        # Lever A: memoize the gate_proj whitening spectrum per expert so the
+        # up_proj pass — which shares the IDENTICAL covariance object (cov_key
+        # rewrite below) — reuses it instead of recomputing eigh(A). Reusing
+        # the same spectrum on the same input is bit-identical to recomputing.
+        # Variant A1 (matrix-outer loops preserved): keyed by expert index,
+        # built during the gate_proj pass and read during up_proj. The dict
+        # holds the N gate spectra across the gate→up window (kept eigvecs are
+        # [d_in, n_keep] fp32) and is cleared right after the up_proj pass so it
+        # never outlives its use or reaches down_proj.
+        gate_spectra: dict[int, Any] = {}
 
         for name in MATRIX_NAMES:
             # Per-matrix-type, per-layer: pool per-expert residuals independently.
@@ -426,9 +513,11 @@ class EoraCompensationPlugin:
             # 0 for experts without an `originals` entry (no correction
             # applied → no parameters added in effective terms).
             eff_per_expert: list[int] = [0] * N
-            # Track residual norm before/after to verify EoRA actually helps.
-            res_before_sum = 0.0
-            res_after_sum = 0.0
+            # Lever B: accumulate squared residual norms ON-DEVICE and sync once
+            # per matrix (below), instead of a per-expert .item() host sync.
+            # These feed ONLY log.info / trackio — never the golden.
+            res_before_acc = torch.zeros((), device=dev, dtype=torch.float32)
+            res_after_acc = torch.zeros((), device=dev, dtype=torch.float32)
             n_eligible = 0
             for e in range(N):
                 key = (ref.layer_idx, e, name)
@@ -443,19 +532,29 @@ class EoraCompensationPlugin:
                        fe.up_proj_V.data[e]   if name == "up_proj"   else \
                        fe.down_proj_V.data[e]
                 delta = W_orig_f - (U_e.to(torch.float32) @ V_e.to(torch.float32))
-                res_before_sum += float(delta.norm().item() ** 2)
+                res_before_acc += delta.norm() ** 2
                 # up_proj shares the gate_proj input covariance (same fused tensor).
                 cov_key = (ref.layer_idx, e, "gate_proj") if name == "up_proj" else key
                 A = A_cov.get(cov_key)
+                # Lever A: gate_proj computes+memoizes the spectrum; up_proj
+                # reuses gate's (identical A object) → skips the redundant eigh.
+                if name == "up_proj":
+                    spectrum = gate_spectra.get(e)
+                elif name == "gate_proj":
+                    spectrum = _eigh_spectrum(A, d_in, dev, a_storage_dtype) if A is not None else None
+                    gate_spectra[e] = spectrum
+                else:
+                    spectrum = None
                 Uc, Vc, take_eff = _compute_eora_factors(
                     delta, A, r_per_expert, dev, storage_dtype=a_storage_dtype,
+                    spectrum=spectrum,
                 )
                 U_corr[e] = Uc.to(dtype)
                 V_corr[e] = Vc.to(dtype)
                 eff_per_expert[e] = int(take_eff)
                 # Residual after applying the planned correction (Uc @ Vc).
                 res_after = delta - (Uc.to(torch.float32) @ Vc.to(torch.float32))
-                res_after_sum += float(res_after.norm().item() ** 2)
+                res_after_acc += res_after.norm() ** 2
                 n_eligible += 1
                 if (e + 1) % 32 == 0:
                     log.info("  L%d/%s expert %d/%d", ref.layer_idx, name, e + 1, N)
@@ -472,6 +571,9 @@ class EoraCompensationPlugin:
             fe.widen_rank(name, U_corr, V_corr, added_effective_per_expert=eff_per_expert)
             rank_map_layer[f"L{ref.layer_idx}_{name}"] = fe.ranks[name]
             layer_compensated_params += int(U_corr.numel() + V_corr.numel())
+            # Lever B: single device→host sync per matrix (was per-expert).
+            res_before_sum = float(res_before_acc.item())
+            res_after_sum = float(res_after_acc.item())
             res_before = (res_before_sum / max(n_eligible, 1)) ** 0.5
             res_after = (res_after_sum / max(n_eligible, 1)) ** 0.5
             rel_drop = (res_before - res_after) / max(res_before, 1e-12)
@@ -503,6 +605,11 @@ class EoraCompensationPlugin:
                 # which is already in `stage4/compensated_params`).
                 f"stage4/{name}_matrix_compensated_params": int(U_corr.numel() + V_corr.numel()),
             })
+
+            # Lever A: the memoized gate spectra are consumed by the up_proj
+            # pass; drop them before down_proj so they don't outlive their use.
+            if name == "up_proj":
+                gate_spectra.clear()
 
         rank_map.update(rank_map_layer)
         compensated_params += layer_compensated_params
