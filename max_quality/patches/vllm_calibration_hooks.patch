@@ -5059,7 +5059,7 @@ new file mode 100644
 index 0000000..7944163
 --- /dev/null
 +++ b/vllm/calibration_block_outputs.py
-@@ -0,0 +1,490 @@
+@@ -0,0 +1,500 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-MoE-block hidden-states writer for calibration-v2 (Item 7).
@@ -5499,8 +5499,18 @@ index 0000000..7944163
 +        "accum": {k: [t.clone() for t in v] for k, v in _ACCUM.items()},
 +    }
 +    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
++    with open(tmp, "wb") as f:
++        torch.save(payload, f)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, ckpt_path)
++    _dir_fd = os.open(os.path.dirname(ckpt_path) or ".", os.O_RDONLY)
++    try:
++        os.fsync(_dir_fd)
++    except OSError:
++        pass
++    finally:
++        os.close(_dir_fd)
 +
 +
 +def load_block_outputs_checkpoint(ckpt_path: str) -> int:
@@ -5953,7 +5963,7 @@ new file mode 100644
 index 0000000..8505da3
 --- /dev/null
 +++ b/vllm/calibration_imatrix.py
-@@ -0,0 +1,978 @@
+@@ -0,0 +1,988 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Imatrix capture for llama.cpp-compatible activation statistics.
@@ -6822,8 +6832,18 @@ index 0000000..8505da3
 +        },
 +    }
 +    tmp = path + ".tmp"
-+    torch.save(payload, tmp)
++    with open(tmp, "wb") as f:
++        torch.save(payload, f)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, path)
++    _dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
++    try:
++        os.fsync(_dir_fd)
++    except OSError:
++        pass
++    finally:
++        os.close(_dir_fd)
 +
 +
 +def load_imatrix_checkpoint(path: str) -> int:
@@ -6937,7 +6957,7 @@ new file mode 100644
 index 0000000..adff069
 --- /dev/null
 +++ b/vllm/calibration_input_cov.py
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,424 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert, matrix) teacher input covariance capture for
@@ -7310,8 +7330,18 @@ index 0000000..adff069
 +        "token_counts": dict(_COV_TOKEN_COUNTS),
 +    }
 +    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
++    with open(tmp, "wb") as f:
++        torch.save(payload, f)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, ckpt_path)
++    _dir_fd = os.open(os.path.dirname(ckpt_path) or ".", os.O_RDONLY)
++    try:
++        os.fsync(_dir_fd)
++    except OSError:
++        pass
++    finally:
++        os.close(_dir_fd)
 +
 +
 +def load_input_cov_checkpoint(ckpt_path: str) -> int:
@@ -7357,7 +7387,7 @@ new file mode 100644
 index 0000000..660a951
 --- /dev/null
 +++ b/vllm/calibration_output_reservoir.py
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,451 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) expert-output reservoir capture for calibration-v2
@@ -7754,8 +7784,18 @@ index 0000000..660a951
 +        "valid_count": dict(_VALID_COUNT),
 +    }
 +    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
++    with open(tmp, "wb") as f:
++        torch.save(payload, f)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, ckpt_path)
++    _dir_fd = os.open(os.path.dirname(ckpt_path) or ".", os.O_RDONLY)
++    try:
++        os.fsync(_dir_fd)
++    except OSError:
++        pass
++    finally:
++        os.close(_dir_fd)
 +
 +
 +def load_output_reservoir_checkpoint(ckpt_path: str) -> int:
@@ -7804,7 +7844,7 @@ new file mode 100644
 index 0000000..8ce03ab
 --- /dev/null
 +++ b/vllm/calibration_per_expert_max.py
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,338 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) ``down_proj`` output max-L_inf capture for
@@ -8102,8 +8142,18 @@ index 0000000..8ce03ab
 +        "token_counts": {r: v.clone() for r, v in _PEM_TOKEN_COUNTS.items()},
 +    }
 +    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
++    with open(tmp, "wb") as f:
++        torch.save(payload, f)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, ckpt_path)
++    _dir_fd = os.open(os.path.dirname(ckpt_path) or ".", os.O_RDONLY)
++    try:
++        os.fsync(_dir_fd)
++    except OSError:
++        pass
++    finally:
++        os.close(_dir_fd)
 +
 +
 +def load_per_expert_max_checkpoint(ckpt_path: str) -> int:
@@ -8138,7 +8188,7 @@ new file mode 100644
 index 0000000..1b3ca1f
 --- /dev/null
 +++ b/vllm/calibration_reap_scores.py
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,341 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""REAP per-(layer, expert) saliency-score capture for calibration-v2.
@@ -8439,8 +8489,18 @@ index 0000000..1b3ca1f
 +        "token_counts": {r: v.clone() for r, v in _REAP_TOKEN_COUNTS.items()},
 +    }
 +    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
++    with open(tmp, "wb") as f:
++        torch.save(payload, f)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, ckpt_path)
++    _dir_fd = os.open(os.path.dirname(ckpt_path) or ".", os.O_RDONLY)
++    try:
++        os.fsync(_dir_fd)
++    except OSError:
++        pass
++    finally:
++        os.close(_dir_fd)
 +
 +
 +def load_reap_scores_checkpoint(ckpt_path: str) -> int:
@@ -8475,7 +8535,7 @@ new file mode 100644
 index 0000000..1644034
 --- /dev/null
 +++ b/vllm/calibration_router_logits_stats.py
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,455 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) sink-vs-normal router-score aggregate writer for
@@ -8877,8 +8937,18 @@ index 0000000..1644034
 +        },
 +    }
 +    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
++    with open(tmp, "wb") as f:
++        torch.save(payload, f)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, ckpt_path)
++    _dir_fd = os.open(os.path.dirname(ckpt_path) or ".", os.O_RDONLY)
++    try:
++        os.fsync(_dir_fd)
++    except OSError:
++        pass
++    finally:
++        os.close(_dir_fd)
 +
 +
 +def load_router_logits_stats_checkpoint(ckpt_path: str) -> int:
@@ -8926,7 +8996,7 @@ new file mode 100644
 index 0000000..516237c
 --- /dev/null
 +++ b/vllm/calibration_routing_stats.py
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,336 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) routing-frequency + mean-routing-weight capture for
@@ -9222,8 +9292,18 @@ index 0000000..516237c
 +        },
 +    }
 +    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
++    with open(tmp, "wb") as f:
++        torch.save(payload, f)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, ckpt_path)
++    _dir_fd = os.open(os.path.dirname(ckpt_path) or ".", os.O_RDONLY)
++    try:
++        os.fsync(_dir_fd)
++    except OSError:
++        pass
++    finally:
++        os.close(_dir_fd)
 +
 +
 +def load_routing_stats_checkpoint(ckpt_path: str) -> int:
