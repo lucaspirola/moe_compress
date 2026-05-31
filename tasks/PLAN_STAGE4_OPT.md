@@ -72,6 +72,14 @@ Split `_compute_eora_factors` so the eigh step is separable, and have the hook c
 ```
 # pseudo — eigh extracted to a reusable spectrum object
 def _eigh_spectrum(A, d_in, storage_dtype, device):
+    # MUST perform the SAME prologue the kernel does at :239-:240 BEFORE eigh:
+    #   A = A.to(device=device, dtype=torch.float32)   # :239
+    #   A = 0.5 * (A + A.T)                              # :240
+    # then torch.linalg.eigh(A) (:247) on that exact post-cast, post-symmetrize
+    # input. The memoized spectrum must be computed strictly AFTER this
+    # .to()+symmetrize, or the up_proj reuse will not be bit-identical to the
+    # gate_proj eigh input. (eigh is keyed on the symmetrized fp32 matrix, not
+    # the raw stored `A`.)
     # returns None  → caller falls back to _plain_svd_padded()
     # returns (eigvecs_keep, sqrt_lambda, inv_sqrt_lambda)  on success
     ...  # exactly the :239-:286 prologue, no behavioral change
@@ -80,6 +88,13 @@ def _compute_eora_factors(delta, A, r, device, *, storage_dtype=None, spectrum=N
     # if spectrum is None and A is not None: spectrum = _eigh_spectrum(...)
     # then reuse spectrum for Q_prime / delta_prime / back-projection
 ```
+**A1 memo key caveat (byte-identity):** the cached spectrum that the up_proj pass
+reuses MUST be the spectrum of the *post-cast, post-symmetrize* matrix — i.e. the
+gate_proj pass memoizes AFTER running `A = A.to(device, fp32); A = 0.5*(A + A.T)`
+(`:239-:240`) and only then `eigh` (`:247`). Memoizing the raw stored `A` (or its
+spectrum computed before the symmetrize) would let FP rounding in the `.to()`/`+A.T`
+diverge from the gate pass and break the byte-identical golden. Memoize strictly
+after the `:239-:240` step.
 
 In the hook, restructure the gate/up handling so per expert `e` we compute the spectrum once from
 `A_cov.get((layer_idx, e, "gate_proj"))` and pass it to **both** the gate_proj and up_proj
@@ -130,16 +145,18 @@ res_after_sum  += float(res_after.norm().item() ** 2)
 res_before_acc = torch.zeros((), device=dev, dtype=torch.float32)   # init before expert loop
 res_after_acc  = torch.zeros((), device=dev, dtype=torch.float32)
 ...
-res_before_acc += (delta.float() ** 2).sum()      # == delta.norm()**2, stays on dev
-res_after_acc  += (res_after.float() ** 2).sum()
+res_before_acc += delta.norm() ** 2               # stays on dev (delta already fp32 at :445/:221)
+res_after_acc  += res_after.norm() ** 2
 ...
 # after the expert loop (once):
 res_before_sum = float(res_before_acc.item())
 res_after_sum  = float(res_after_acc.item())
 ```
 Note: `norm()**2` == `(x**2).sum()` in fp32; either form is fine as long as it stays on `dev` until one sync.
-Keeping `.norm()**2` but deferring the `.item()` (accumulate the 0-d tensor, sync once) is the most literal,
-lowest-drift variant and is preferred.
+**Preferred: keep `.norm()**2` and defer only the `.item()`** (accumulate the 0-d tensor, sync once) — the most
+literal, lowest-drift variant. The earlier `(delta.float() ** 2).sum()` sketch has a **no-op `.float()`** —
+`delta` is already fp32 (cast at `:221`, in scope at `:445`), so the `.float()` does nothing and is dropped
+above; the deferred-`.item()` `.norm()**2` form is what stands.
 
 ### Golden / thread-safety confirmation
 - **Golden:** unchanged (residual is log/trackio only; not in `eora_ranks.json`).
@@ -168,27 +185,47 @@ singular triplets. Measured: **1.84×** gate/up, **3.24×** down end-to-end; SVD
 ```
 # before (:275-:286)
 U_p, S_p, Vh_p = torch.linalg.svd(delta_prime, full_matrices=False)
-take_eff = min(r, int(U_p.shape[1]))
+take_eff = min(r, int(U_p.shape[1]))       # U_p.shape[1] == min(d_out, n_keep); SVD keeps ALL σ incl. ~0
 U_corr = U_p[:, :take_eff] * S_p[:take_eff]
 inv_sqrt_lambda = eigvals_keep.clamp_min(1e-30).rsqrt()
 V_corr = (Vh_p[:take_eff, :] * inv_sqrt_lambda.unsqueeze(0)) @ eigvecs_keep.T
 
 # after — Gram-side, top-r triplets (fp32 throughout; see conditioning note)
+# CRITICAL: take_eff MUST mirror production EXACTLY. Production (:276) is
+#   take_eff = min(r, U_p.shape[1])  with U_p from torch.linalg.svd(..., full_matrices=False)
+# so U_p.shape[1] == min(d_out, n_keep) and the SVD returns ALL singular values,
+# including exact/near-zero/Gram-negative ones (SVD does NOT drop zeros). Do NOT
+# add an `(evals > 0).sum()` rank filter here — that would make Gram take_eff
+# STRICTLY SMALLER than production whenever a kept direction has a zero/near-zero/
+# Gram-negative eigenvalue, a DETERMINISTIC rank reduction the production SVD never
+# does → flips rank_map / compensated_params → breaks the byte-identical golden BY
+# CONSTRUCTION (not merely at a numerical tie). Instead, keep take_eff identical to
+# production and clamp the singular VALUES; the negligible directions then sit in the
+# structurally-zero low-rank tail and contribute ~nothing.
 d_out_, n_keep_ = delta_prime.shape
+take_eff = min(r, min(d_out_, n_keep_))    # == production min(r, U_p.shape[1]); NO (evals>0) filter
 if n_keep_ <= d_out_:                      # right-Gram smaller
     G = delta_prime.T @ delta_prime        # [n_keep, n_keep], fp32
     evals, evecs = torch.linalg.eigh(G)    # ascending
-    take_eff = min(r, int((evals > 0).sum().item()), n_keep_, d_out_)  # match SVD rank semantics
-    idx = torch.arange(n_keep_-1, n_keep_-1-take_eff, -1, device=dev)  # top-r descending
-    s = evals[idx].clamp_min(0).sqrt()     # singular values
+    idx = torch.arange(n_keep_-1, n_keep_-1-take_eff, -1, device=dev)  # top-take_eff descending
+    s = evals[idx].clamp_min(0).sqrt()     # singular values (clamp the VALUES, not the count)
     Vh = evecs[:, idx].T                   # right singular vecs (== Vh_p[:take_eff])
+    # guard zero-σ columns: those left vectors are in the structurally-negligible
+    # tail and contribute ~nothing; eps/clamp tensor lives on `dev` (no device mismatch).
     U  = (delta_prime @ evecs[:, idx]) / s.clamp_min(eps)  # left singular vecs
 else:                                      # left-Gram smaller
     G = delta_prime @ delta_prime.T        # [d_out, d_out]
-    ...                                    # symmetric construction, V = (Δ'^T U)/s
+    ...                                    # symmetric construction, V = (Δ'^T U)/s,
+                                           # same take_eff = min(r, min(d_out_, n_keep_)),
+                                           # same s = evals.clamp_min(0).sqrt(), same
+                                           # s.clamp_min(eps) guard on the divide
 U_corr = U * s                             # == U_p[:,:take_eff] * S_p[:take_eff]
 V_corr = (Vh * inv_sqrt_lambda.unsqueeze(0)) @ eigvecs_keep.T
 ```
+**`eps` device note:** the `s.clamp_min(eps)` guard and any Gram-side `eps`/clamp
+must use a scalar/tensor already on `dev` (a Python float literal is fine; a tensor
+must be created with `device=dev`). No new device-mismatch surface — the kernel's
+device contract (`§0`) is preserved.
 Keep zero-padding logic (`:289-296`) **unchanged** — `test_eora_zero_pad_path_used_when_take_lt_r` asserts
 `torch.equal(U[:, take:], zeros)` / `torch.equal(V[take:, :], zeros)`, so the pad region must stay exactly zero.
 
@@ -198,10 +235,16 @@ Keep zero-padding logic (`:289-296`) **unchanged** — `test_eora_zero_pad_path_
   does not transfer to EoRA; fp64 spectra are 9× slower and rejected).
 - **`take_eff` rank-boundary tie:** Gram eigh reorders FP vs direct SVD; reconstruction rel-Frobenius ≈ **4e-4**.
   At a near-degenerate singular-value tie this could flip `take_eff` by ±1 at a boundary → a **rank flip** that
-  *would* change `eora_ranks.json`. This is the one path that can touch the golden.
-- Define `take_eff` to match the production SVD's effective-rank semantics exactly: `min(r, number of strictly
-  positive singular values, min(d_out, n_keep))`. Mirror `:276` `min(r, U_p.shape[1])` where
-  `U_p.shape[1] = min(d_out, n_keep)`.
+  *would* change `eora_ranks.json`. This near-tie reorder (~4e-4) is the ONLY golden-touch surface, and the plan
+  already human-gates it (see "Golden gate" below).
+- **Define `take_eff` to match production EXACTLY — `take_eff = min(r, min(d_out, n_keep))`.** Production (`:276`)
+  is `min(r, U_p.shape[1])` where `U_p` comes from `torch.linalg.svd(delta_prime, full_matrices=False)` (`:275`),
+  so `U_p.shape[1] == min(d_out, n_keep)` and the SVD returns **all** singular values including exact/near-zero
+  ones (SVD does NOT drop zeros). Do **NOT** add a `(number of strictly positive singular values)` /
+  `(evals > 0).sum()` term — that filter would make Gram `take_eff` strictly smaller than production on any kept
+  direction with a zero/near-zero/Gram-negative eigenvalue, a deterministic rank reduction that breaks the
+  byte-identical golden BY CONSTRUCTION. Clamp the singular **values** (`s = evals.clamp_min(0).sqrt()`) and
+  guard the left-vector divide (`/ s.clamp_min(eps)`) instead of reducing the count.
 
 ### Golden gate — HUMAN-GATED rank-diff (NO blind regen)
 1. Implement Lever C behind the change.
@@ -223,9 +266,14 @@ golden-pinned. **Before merging Lever C, the implementer MUST confirm no downstr
 checkpoint float tensors via tolerance compare.**
 
 Verified during planning (so the implementer can re-confirm fast):
-- `grep` of stage-4 tests for `allclose`/`torch.equal`/`effective_ranks` found **one** float compare:
+- `grep` of stage-4 tests for `allclose`/`torch.equal`/`effective_ranks` found **one** float compare
+  **ON THE POST-STAGE-4 U/V OUTPUT PATH**:
   `test_smoke_stage4_resume.py:233-235` — `torch.allclose(U_actual, U_expected, atol=1e-5)`.
-  **This is SAFE for Lever C.** Reading `test_smoke_stage4_resume.py:189-241`: `saved` is captured from a clean
+  A second `torch.equal` exists but is verified-irrelevant: `test_stage4_input_cov_cache.py:257`
+  `torch.equal(A_cov[(0,0,"gate_proj")], torch.eye(3, dtype=fp16) * 2)`. That assertion is on the **INPUT
+  covariance** `A_cov` (a cache-load roundtrip), which is **UPSTREAM of `_compute_eora_factors`** — no lever
+  (A, B, or C) touches it, so it cannot drift. It is omitted from the "output path" count deliberately.
+  **`test_smoke_stage4_resume.py:233-235` is SAFE for Lever C.** Reading `test_smoke_stage4_resume.py:189-241`: `saved` is captured from a clean
   run, written *into* the spill file, and the resumed run **loads layer 0 from spill** (not recomputed). The
   assertion compares spill-write bytes vs spill-read bytes on the same compute path — it does NOT compare a
   recompute against a frozen expectation. Lever C changes the compute path uniformly, so both sides move
