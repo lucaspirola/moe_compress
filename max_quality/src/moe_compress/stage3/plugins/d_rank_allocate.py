@@ -190,24 +190,33 @@ mismatched principal-axis orientations (e.g. post-merge populations
 with surviving experts from divergent specializations); a one-time
 concat-SVD audit per layer would suffice to bound the heuristic error.
 
-Deviation: D-drank-fp64-mixed — FP64 Cholesky, FP32 SVD
---------------------------------------------------------
+Deviation: D-drank-fp64-spectrum — FP64 Cholesky + FP64 SVD, CPU-resident, device-independent
+---------------------------------------------------------------------------------------------
 Paper §3.2 (L575) specifies ``S S^T = cholesky(X^T X)``; precision is
-not explicitly nailed down in the paper. This plugin uses FP64
-arithmetic for the Cholesky factorization (``A64 = A_g.to(float64)``,
-followed by the ``torch.linalg.cholesky(A64 + jitter)`` call in
-``_group_stat``), then immediately casts ``L_A`` back to FP32
-(``.to(torch.float32)``) before forming ``L_A @ W.T`` and calling
-``torch.linalg.svdvals``.
+not explicitly nailed down in the paper. This plugin computes the entire
+**rank-deciding** whitened spectrum in FP64 on CPU: ``A64 =
+A_g.to(device="cpu", dtype=float64)``, ``L_A = cholesky(A64 + jitter)``
+(NO cast back to FP32), and the per-expert ``W`` is also brought to
+CPU-FP64 so ``svdvals(L_A @ W.T)`` runs FP64 end-to-end. ``eff_rank``
+(Eq. 1/2) and the downstream ``round()`` in ``_d_rank_allocate`` therefore
+derive from an FP64 spectrum.
 
-Rationale: ``A_g = X^T X`` is the dominant numerical risk — it
-squares the activation dynamic range and can produce near-singular
-Hessians that an FP32 Cholesky would silently corrupt. The downstream
-SVD on the whitened operator is well-conditioned (rectangular tall-
-or-wide matrix, no squaring), so FP32 there is adequate and ~3× faster
-in wall-clock. This is sometimes labelled as "fp64 Cholesky" in logs;
-the honest label is "FP64 Cholesky + FP32 SVD" (mixed-precision).
-Documented for spec-compliance; no refactor planned.
+Rationale (Tier-2 §3.1): ``A_g = X^T X`` squares the activation dynamic
+range and can produce near-singular Hessians — FP64 Cholesky guards that.
+The previous design then **cast ``L_A`` back to FP32** before ``svdvals``
+("FP64 Cholesky + FP32 SVD", mixed-precision), arguing the whitened
+operator is well-conditioned. That cast is now **removed**. The reason is
+**device-independence**, not conditioning: Stage 3 runs GPU-resident, and a
+3-seed measurement on real shapes showed an FP32-GPU spectrum flips 2–3/216
+ranks vs the FP32-CPU golden (boundary flips → a fragile per-device
+re-bless), whereas FP64 agrees across CPU and GPU to ~1e-14 (0 rank flips).
+Keeping the spectrum FP64 **and CPU-resident** gives one device-independent
+rank decision and also co-locates the operands (the Stage-2 covariances are
+loaded ``map_location="cpu"``), removing the cross-device crash a GPU model
+would otherwise hit. The bulk low-rank factor matrices (``U_k``/``V_k`` in
+``aa_svd_factor.factor_layer``) remain FP32-GPU — only the rank-deciding
+*spectrum* is FP64-CPU. The honest label is now "FP64 Cholesky + FP64 SVD,
+CPU-resident". Documented for spec-compliance; this is the Tier-2 policy.
 
 Deviation: D-drank-symmetrize-A — explicit symmetrization of A_g
 -----------------------------------------------------------------
@@ -352,11 +361,17 @@ def _group_stat(n_experts: int, bank, A_g: torch.Tensor | None = None) -> _Group
     L_A = None
     if A_g is not None:
         try:
-            A64 = A_g.to(torch.float64)
+            # Tier-2 §2.4/§3.4: rank-deciding spectrum on CPU in fp64. A64 (and
+            # therefore the Cholesky factor + whitened svdvals) stays CPU-fp64 —
+            # co-located with the CPU-resident A_g, device-independent, and the
+            # fp64 precision is carried through svdvals → eff_rank → round() (the
+            # prior `.to(torch.float32)` cast is dropped; see D-drank-fp64-mixed
+            # deviation block above).
+            A64 = A_g.to(device="cpu", dtype=torch.float64)
             A64 = 0.5 * (A64 + A64.T)
             jitter = 1e-6 * A64.diag().mean().clamp_min(1e-12) * torch.eye(
-                A64.shape[0], dtype=torch.float64, device=A64.device)
-            L_A = torch.linalg.cholesky(A64 + jitter).to(torch.float32)
+                A64.shape[0], dtype=torch.float64, device="cpu")
+            L_A = torch.linalg.cholesky(A64 + jitter)
         except Exception as exc:
             log.warning("D-Rank whitening: Cholesky on A_g failed (%s); "
                         "falling back to raw SVD for this group.", exc)
@@ -364,7 +379,10 @@ def _group_stat(n_experts: int, bank, A_g: torch.Tensor | None = None) -> _Group
 
     svs: list[torch.Tensor] = []
     for e in range(n_experts):
-        W = bank.get(e).detach().to(torch.float32)  # [d_out, d_in]
+        # Tier-2 §2.4/§3.4: CPU-fp64 to co-locate with the fp64 Cholesky factor
+        # (raw-SVD fallback path also runs CPU-fp64 for one device-independent
+        # spectrum path).
+        W = bank.get(e).detach().to(device="cpu", dtype=torch.float64)  # [d_out, d_in]
         if L_A is not None:
             # Spec §6 Step B.2: σ_i = sv(S_g · W_g^T). PyTorch stores W as
             # [d_out × d_in]; transpose to [d_in × d_out] then S @ that

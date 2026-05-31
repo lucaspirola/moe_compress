@@ -248,28 +248,13 @@ def stage3_alpha_case(request):
     return request.node.callspec.params["patched_stage3_alpha"]
 
 
-@pytest.mark.xfail(
-    reason=(
-        "PRE-EXISTING (origin/main) defect, NOT a Tier-1 regression: the "
-        "non-uniform per-expert factor path crashes in "
-        "FactoredExperts.set_factors with 'U.shape=(d_out, k_e) expected "
-        "(d_out, slot)'. aa_svd_factor.factor_layer allocates each matrix slot "
-        "at the per-LAYER MAX per-expert rank (ranks_layer = max_e "
-        "per_expert_ranks[...]), but then factors+set_factors each expert at "
-        "its OWN (smaller) rank k_e WITHOUT zero-padding U_k/V_k to the slot "
-        "width — contradicting the factor_layer comment 'Experts with lower "
-        "rank will be zero-padded'. Any alpha_grid length>1 produces "
-        "non-uniform ranks and trips this. Confirmed reproducible on clean "
-        "origin/main (git stash). Out of Tier-1 scope (item 9 is B-cov "
-        "prefetch only; this is the factor-shape path) — file a Tier-2 / "
-        "re-bless ticket to zero-pad in factor_layer, then this xfail flips to "
-        "a real bless via MOE_REGEN_GOLDEN=1. The item-2 grouped_svs cache "
-        "path it would exercise is independently proven byte-safe by "
-        "tests/test_stage3_tier1.py::test_grouped_svs_cache_equals_recompute."
-    ),
-    strict=False,
-    raises=ValueError,
-)
+# Tier-2 §5c: the zero-pad fix in aa_svd_factor.factor_layer (pad each expert's
+# U_k/V_k up to the per-layer slot width before set_factors) removes the
+# pre-existing ValueError crash on the non-uniform per-expert path, so this test
+# no longer xfails. The α-grid goldens (rank_map.alpha.{fp32,bf16}.json) are a
+# human-gated bless: mint them via MOE_REGEN_GOLDEN=1 after reviewing the
+# Tier-2 rank diff. Until they are committed, this test fails with
+# "golden missing" (expected on the impl branch; green once the goldens land).
 def test_stage3_rank_map_alpha_variant_byte_identical(
     tiny_model, patched_stage3_alpha, stage3_alpha_case, tmp_path
 ):

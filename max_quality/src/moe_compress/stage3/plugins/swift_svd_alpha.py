@@ -746,13 +746,19 @@ def _swift_svd_plus_alpha_search(
     for (li, name), gs in group_stats.items():
         banks = build_banks(moe_layers_by_idx[li])
         for e in range(gs.n_experts):
-            W = banks[name].get(e).detach().to(torch.float32)
+            # Tier-2 §2.2/§3: the rank-deciding spectrum is computed on CPU in
+            # fp64. This (a) co-locates W with the CPU-resident A_cov so the
+            # whitened decomp never crosses devices on a GPU-resident model, and
+            # (b) makes the rank decision device-independent (CPU-fp64 ==
+            # GPU-fp64 to ~1e-14, 0 rank flips). The bulk fp32-GPU factor build
+            # in aa_svd_factor.factor_layer is unchanged.
+            W = banks[name].get(e).detach().to(device="cpu", dtype=torch.float64)
             # D8 fix: activation-weighted singular values when A_cov available.
             A = _cov_lookup(A_cov, li, e, name) if A_cov else None
             if A is not None:
-                A_f32 = A.to(torch.float32)
-                A_f32 = 0.5 * (A_f32 + A_f32.T)
-                eigvals_a, eigvecs_a = torch.linalg.eigh(A_f32)
+                A64 = A.to(device="cpu", dtype=torch.float64)
+                A64 = 0.5 * (A64 + A64.T)
+                eigvals_a, eigvecs_a = torch.linalg.eigh(A64)
                 keep_a = eigvals_a > eigvals_a.max() * 1e-6
                 if keep_a.any():
                     L_A = eigvecs_a[:, keep_a] * eigvals_a[keep_a].clamp_min(1e-12).sqrt().unsqueeze(0)
@@ -940,13 +946,17 @@ def _redistribute_ranks_swift_svd_plus(
             if cached_svs is not None:
                 svs = cached_svs
             else:
-                W = banks[name].get(e).detach().to(torch.float32)
+                # Tier-2 §2.3: mirror the producer in _swift_svd_plus_alpha_search
+                # exactly — CPU-fp64 spectrum. The cached branch above reuses the
+                # producer's fp64-CPU tensor, so cache producer and this recompute
+                # stay identical dtype/device (the tier-1 torch.equal precondition).
+                W = banks[name].get(e).detach().to(device="cpu", dtype=torch.float64)
                 # D8 fix: activation-weighted SVD when A_cov available.
                 A = _cov_lookup(A_cov, li, e, name) if A_cov else None
                 if A is not None:
-                    A_f32 = A.to(torch.float32)
-                    A_f32 = 0.5 * (A_f32 + A_f32.T)
-                    eigvals_a, eigvecs_a = torch.linalg.eigh(A_f32)
+                    A64 = A.to(device="cpu", dtype=torch.float64)
+                    A64 = 0.5 * (A64 + A64.T)
+                    eigvals_a, eigvecs_a = torch.linalg.eigh(A64)
                     keep_a = eigvals_a > eigvals_a.max() * 1e-6
                     if keep_a.any():
                         L_A = eigvecs_a[:, keep_a] * eigvals_a[keep_a].clamp_min(1e-12).sqrt().unsqueeze(0)

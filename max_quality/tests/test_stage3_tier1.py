@@ -129,14 +129,16 @@ def test_grouped_svs_cache_precondition_torch_equal():
     )
 
     # Inline recompute exactly as _redistribute_ranks_swift_svd_plus does
-    # (svdvals(W @ L_A), no M_A temporary).
+    # (svdvals(W @ L_A), no M_A temporary). Tier-2 §2.2/C1: the producer now
+    # emits CPU-fp64 spectra, so this inline recompute is CPU-fp64 in lockstep
+    # for the torch.equal precondition to hold bit-exact.
     from moe_compress.utils.model_io import build_banks
 
     banks = build_banks(ref)
     for name in ("gate_proj", "up_proj", "down_proj"):
         for e in range(n):
-            W = banks[name].get(e).detach().to(torch.float32)
-            A = A_cov[(layer_idx, e, name)].to(torch.float32)
+            W = banks[name].get(e).detach().to(device="cpu", dtype=torch.float64)
+            A = A_cov[(layer_idx, e, name)].to(device="cpu", dtype=torch.float64)
             A = 0.5 * (A + A.T)
             ev, evec = torch.linalg.eigh(A)
             keep = ev > ev.max() * 1e-6
@@ -229,15 +231,23 @@ def test_group_stat_vs_swift_spectra_differ():
     A_g = torch.stack(A_es).mean(0)
 
     # _group_stat path: group-averaged Cholesky factor, svdvals(L_A @ W.T).
-    L_chol = torch.linalg.cholesky(A_g.double() + 1e-6 * torch.eye(d_in).double()).float()
-    s_group = torch.linalg.svdvals(L_chol @ W.T)
+    # Tier-2 §2.4/M2: _group_stat now keeps the spectrum CPU-fp64 end-to-end
+    # (the prior `.float()` cast on L_A is removed); mirror that here so this
+    # disproof test stays an honest shadow of the production path. The
+    # `not torch.allclose` inequality compares two structurally different
+    # operators (group-avg Cholesky vs per-expert eigh) and is independent of
+    # fp32 vs fp64, so it still holds.
+    L_chol = torch.linalg.cholesky(A_g.double() + 1e-6 * torch.eye(d_in).double())
+    s_group = torch.linalg.svdvals(L_chol @ W.double().T)
 
-    # Swift-SVD path: per-expert eigh factor, svdvals(W @ L_eigh).
-    A0 = 0.5 * (A_es[0] + A_es[0].T)
+    # Swift-SVD path: per-expert eigh factor, svdvals(W @ L_eigh). Also CPU-fp64
+    # to mirror the changed Swift producer (§2.2) and to share dtype with
+    # ``s_group`` for the allclose comparison below.
+    A0 = 0.5 * (A_es[0].double() + A_es[0].double().T)
     ev, evec = torch.linalg.eigh(A0)
     keep = ev > ev.max() * 1e-6
     L_eigh = evec[:, keep] * ev[keep].clamp_min(1e-12).sqrt().unsqueeze(0)
-    s_swift = torch.linalg.svdvals(W @ L_eigh)
+    s_swift = torch.linalg.svdvals(W.double() @ L_eigh)
 
     assert not torch.allclose(s_group, s_swift), (
         "group-avg Cholesky spectrum unexpectedly matches per-expert eigh "

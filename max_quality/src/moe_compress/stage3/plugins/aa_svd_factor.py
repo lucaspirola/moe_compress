@@ -650,6 +650,28 @@ class AaSvdFactorPlugin:
                     )
                 if k_eff < k:
                     k_eff_clip_count[name] += 1
+                # Tier-2 §4: zero-pad the per-expert factors up to the layer
+                # slot width before set_factors. FactoredExperts allocates each
+                # matrix slot at the per-LAYER MAX per-expert rank
+                # (ranks_layer[name]); experts with a smaller k must be padded or
+                # set_factors raises on the shape check. Index by the ACTUAL
+                # returned factor width, NOT the requested k: _aa_svd* internally
+                # re-clamp k (`k = max(1, min(k, min(d_out, d_in)))` and
+                # `k_eff = max(1, min(k, r_eff))`) and zero-pad to that clamped k,
+                # so the returned U_k width can be < the requested k. The trailing
+                # zero col(U)/row(V) are inert in the forward (bmm: V row=0 → 0 →
+                # U col=0), same property EoRA widen_rank already relies on.
+                slot = ranks_layer[name]
+                u_w = U_k.shape[1]   # actual returned column count of U_k
+                v_w = V_k.shape[0]   # actual returned row count of V_k (== u_w)
+                if u_w < slot:
+                    U_pad = torch.zeros(
+                        U_k.shape[0], slot, device=U_k.device, dtype=U_k.dtype)
+                    V_pad = torch.zeros(
+                        slot, V_k.shape[1], device=V_k.device, dtype=V_k.dtype)
+                    U_pad[:, :u_w] = U_k
+                    V_pad[:v_w, :] = V_k
+                    U_k, V_k = U_pad, V_pad
                 new_factored.set_factors(e, name, U_k, V_k, effective_rank=k_eff)
                 rank_map[f"L{ref.layer_idx}_E{e}_{name}"] = k
                 err_sum[name] += rel_err
