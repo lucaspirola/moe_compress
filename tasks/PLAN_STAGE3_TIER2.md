@@ -60,7 +60,7 @@ Tier-2 delivers four changes:
 | `L_A = eigvecs_a[:, keep_a] * ...sqrt()...` | **952** | — | — |
 | `svs = torch.linalg.svdvals(W @ L_A)` | **953** | **953** | exact |
 | `tail = ...` | **972** | — | — |
-| `cached_svs` reuse branch (item-2 cache, byte-identical to recompute) | **936-945** | — | — |
+| `cached_svs` reuse branch (item-2 cache; byte-identical to recompute *once both producer and recompute are CPU-fp64* — see §2.3 / C1) | **936-945** | — | — |
 
 Note: the redistribute path has a `grouped_svs_cache` fast path (**936**) that
 reuses the proxy's spectrum when threaded; the recompute branch (**943-961**)
@@ -167,7 +167,7 @@ Tier-2 policy folds in consistently (§3).
 
 ### 2.1 Decision: where each operand lives
 The model device is `dev` (already computed in `factor_layer` at
-`aa_svd_factor.py:583` as `ex.gate_up_proj.device`). For the **swift** and
+`aa_svd_factor.py:578` as `ex.gate_up_proj.device`). For the **swift** and
 **d_rank** spectra paths the equivalent device is the bank/weight device. The
 covariance dict from `_load_stage2_covariance` is **CPU**.
 
@@ -224,10 +224,27 @@ grouped_svs[name][(li, e)] = svs           # store fp64 spectrum
 ### 2.3 swift redistribute twin — `_redistribute_ranks_swift_svd_plus` (~943-961)
 Mirror 2.2 exactly in the **recompute** branch (**949-953**). The **cached**
 branch (**936-941**) reuses `grouped_svs_cache[name][(li,e)]`, which is now an
-fp64-CPU tensor built in 2.2 — so the `torch.equal` precondition (tier1 test)
-still holds because both producer and consumer are CPU-fp64. **Verify** the
-cache producer and this consumer use identical dtype/device, else `torch.equal`
-fails on a dtype mismatch.
+fp64-CPU tensor built in 2.2 — so the cache producer and this consumer remain
+identical dtype/device (both CPU-fp64). **Verify** that identity holds, else any
+downstream `torch.equal` comparison fails on a dtype mismatch.
+
+> **Test-fixture coupling (CRITICAL — see C1):** the producer↔consumer identity
+> is not the only `torch.equal` consumer. The tier-1 precondition test
+> `test_stage3_tier1.py::test_grouped_svs_cache_precondition_torch_equal`
+> (**test_stage3_tier1.py:107-147**) asserts the producer's spectrum is
+> `torch.equal` to an **inline recompute that hardcodes fp32**
+> (`W…to(torch.float32)` at **:138**, `A…to(torch.float32)` at **:139**,
+> `svdvals(W @ L_A)` at **:144**, the `torch.equal(...)` assert at **:145**).
+> Once §2.2 makes the producer emit **fp64-CPU** spectra, that test FAILS on
+> dtype+value (producer fp64 vs inline fp32). It **must** be patched in lockstep
+> with §2.2: edit the inline recompute at **tier1:138-144** to CPU-fp64
+> (`W…to(device="cpu", dtype=torch.float64)`, `A…` likewise, keep the
+> `eigh`/`keep_a`/`L_A`/`svdvals` structure) so producer and inline are both
+> CPU-fp64 and the assert holds bit-exact again. This is a **test-fixture edit**,
+> not a production producer/consumer concern (see §9 risk row, §10 files-touched).
+> Note: the *other* tier-1 test `test_grouped_svs_cache_equals_recompute`
+> (**:150**) only compares integer rank dicts via `==` and survives the dtype
+> change unchanged — do not confuse the two.
 
 ### 2.4 d_rank — `_group_stat` (~355-374)
 **Before:**
@@ -258,6 +275,31 @@ s = torch.linalg.svdvals(M)                        # fp64, CPU — feeds eff_ran
 
 **Why:** removes `CPU @ GPU` crash; makes `eff_rank` → `round()` deterministic.
 
+### 2.4.1 item-3 disproof test — re-confirm it still holds (M2)
+`test_stage3_tier1.py::test_group_stat_vs_swift_spectra_differ`
+(**test_stage3_tier1.py:216-245**) shadows the exact two operators §2/§3 change.
+It hardcodes precision —
+`cholesky(A_g.double()+1e-6·eye.double()).float()` (**:232**),
+`svdvals(L_chol @ W.T)` (**:233**) for the d_rank `_group_stat` side, and
+`svdvals(W @ L_eigh)` (**:240**) for the swift side — then asserts
+`not torch.allclose(s_group, s_swift)` (**:242**): the group-averaged
+Cholesky-whitened spectrum is NOT close to the per-expert eigh-whitened spectrum.
+- **Does the disproof still hold after §2/§3?** Yes — it compares two
+  *structurally different operators* (group-avg Cholesky `L_chol @ W.T` vs
+  per-expert eigh `W @ L_eigh`), and that inequality is independent of fp32 vs
+  fp64 or CPU vs GPU. The precision/device change does not make them coincide;
+  the test stays green and its load-bearing finding is unaffected. The plan
+  states this explicitly so the change isn't assumed to silently break it.
+- **But the hardcoded precision is now a latent desync (action required):** this
+  test inlines `.float()` on the Cholesky factor (**:232**) and fp32 `svdvals`,
+  i.e. it still models the **old** `_group_stat` fp32 path that §2.4/§3.4
+  *removes*. It is a disproof test (asserts inequality), so the fp32-vs-fp64
+  delta cannot flip its result — but to keep the test an honest mirror of the
+  shadowed production path, **update its `_group_stat`-side recompute to CPU-fp64
+  in lockstep** (drop the `.float()` at :232; keep `.double()`), matching §2.4.
+  Re-run after the change and confirm `not torch.allclose` still holds. Tracked
+  in §10.
+
 ### 2.5 covariance load — leave on CPU
 `_load_stage2_covariance` at **512** keeps `map_location="cpu"`. **No change** —
 the covariances stay CPU-resident (that is correct for the one-layer-resident
@@ -287,7 +329,7 @@ GPU copy of every layer's cov (§6 memory risk).
 
 The factor matrices are built in `aa_svd_factor.factor_layer` (the `_aa_svd*`
 calls at **637-650**), which already runs on `dev` in fp32
-(`W = originals[...].to(device=dev, dtype=torch.float32)` at **666**). **That
+(`W = originals[...].to(device=dev, dtype=torch.float32)` at **629**). **That
 path is unchanged by §3** — it already does fp32-GPU. The only thing the rank
 decision feeds into `factor_layer` is the integer `k` (via `per_expert_ranks` /
 `ranks`), which is now fp64-derived upstream.
@@ -321,6 +363,22 @@ before `svdvals`. §2.4 **removes that cast** so the spectrum stays fp64 through
 item: the cholesky was always fp64; we now stop throwing the precision away one
 line later.
 
+**MANDATORY paper-fidelity follow-up — rewrite the deviation docstring (M1).**
+The module-level deviation block **"Deviation: D-drank-fp64-mixed — FP64
+Cholesky, FP32 SVD"** (`d_rank_allocate.py:193-210`, with the inline narrative
+at **:199-201** that the cast happens "immediately… before forming `L_A @ W.T`")
+codifies the fp32 cast as a *deliberate* choice — "FP32 there is adequate and
+~3× faster… Documented for spec-compliance; no refactor planned" (**:207-210**).
+Once §2.4 drops the cast, that block becomes a **lie**. Per paper-fidelity
+discipline, the cast must NOT be silently deleted: the deviation entry at
+**:193-210** (and the inline comment at **:199-201**) MUST be **rewritten** in
+the same commit, restating the new rationale — the spectrum now stays fp64
+through `svdvals` to make `eff_rank`/`round()` **device-independent** (CPU-fp64
+== GPU-fp64 to ~1e-14, 0 rank flips; the prior fp32-GPU path flipped 2–3/216),
+which is the whole point of Tier-2 §3.1. Relabel accordingly (no longer "mixed
+precision"; now "FP64 Cholesky + FP64 SVD, CPU-resident, device-independent").
+This docstring rewrite is in scope for §4/§10.
+
 ---
 
 ## 4. Change 3 — zero-pad fix in `factor_layer`
@@ -332,7 +390,10 @@ expert's factors are built at its **own** `k` (≤ slot), so `U_k=(d_out,k)`,
 `V_k=(k,d_in)`. `set_factors` hard-checks `U.shape == (d_out, slot)` and
 `raise ValueError` (**737-744**). When per-expert ranks are non-uniform (any
 `alpha_grid` length>1), `k < slot` for some expert → **crash**. The
-`_aa_svd*` functions pad `k_eff→k` but never `k→slot`.
+`_aa_svd*` functions pad `k_eff→k` internally (`_aa_svd_precomputed` try-branch
+**310-316** and fallback **326-332**; `_aa_svd` non-precomputed **394-400**) but
+never `k→slot`. (Note the §4.2 caveat: the internal pad targets the *clamped* k,
+so the returned width can itself be `< k` — see L1 handling below.)
 
 ### 4.2 Fix — pad in `factor_layer` (chosen over padding in `set_factors`)
 **Decision: pad in `factor_layer`, NOT inside `set_factors`.** Reasons:
@@ -356,13 +417,21 @@ new_factored.set_factors(e, name, U_k, V_k, effective_rank=k_eff)      # CRASH i
 U_k, V_k, rel_err, k_eff = _aa_svd(W, A, B, k, C=C, device=dev, ...)
 if k_eff < k: k_eff_clip_count[name] += 1
 slot = ranks_layer[name]
-if k < slot:
+# Index by the ACTUAL returned factor width, not the requested k. `_aa_svd*`
+# internally re-clamps the requested k — `k = max(1, min(k, min(d_out,d_in)))`
+# (aa_svd_factor.py:285) and `k_eff = max(1, min(k, decomp.r_eff))` (:290) — so
+# the returned `U_k` width can be < the requested k when the internal clamp
+# fires. Using `k` in the assignment would raise on a shape mismatch in that
+# edge case.
+u_w = U_k.shape[1]   # actual returned column count of U_k
+v_w = V_k.shape[0]   # actual returned row count of V_k (== u_w in practice)
+if u_w < slot:
     # zero-pad the per-expert factors up to the layer slot width.
     # trailing zero col(U)/row(V) are inert in the forward (bmm: V row=0 → 0 → U col=0).
     U_pad = torch.zeros(U_k.shape[0], slot, device=U_k.device, dtype=U_k.dtype)
     V_pad = torch.zeros(slot, V_k.shape[1], device=V_k.device, dtype=V_k.dtype)
-    U_pad[:, :k] = U_k
-    V_pad[:k, :] = V_k
+    U_pad[:, :u_w] = U_k
+    V_pad[:v_w, :] = V_k
     U_k, V_k = U_pad, V_pad
 new_factored.set_factors(e, name, U_k, V_k, effective_rank=k_eff)
 ```
@@ -445,7 +514,7 @@ Add a test asserting **fp64-CPU and fp64-GPU produce identical integer ranks**
   transient**: `M_A=[d_out, r_A]`, `M=[d_in, d_out]`, `W=[d_out, d_in]` — never
   model-sized. With spectra on CPU (§2 decision), the GPU sees only the fp32
   factor build that already exists on origin/main (`factor_layer` offloads the
-  dense expert to CPU before allocating `FactoredExperts`, **581-582**, to avoid
+  dense expert to CPU before allocating `FactoredExperts`, **579-580**, to avoid
   double-occupancy). **Net new GPU VRAM from Tier-2: ~0** (spectra moved to CPU,
   factors unchanged).
 - **CPU RAM impact.** fp64 spectra double the transient spectrum tensor vs fp32,
@@ -486,7 +555,9 @@ are the fast path**; byte-identity/rank-diff goldens run on CPU (~90s).
 |---|---|---|---|
 | `test_stage3_golden_snapshot.py::test_stage3_rank_map_byte_identical` (fp32,bf16) | fp64-spectra byte-identical golden | CPU | ~90s |
 | `test_stage3_golden_snapshot.py::test_stage3_rank_map_alpha_variant_byte_identical` (xfail→pass) | zero-pad fix + α-grid swift-path golden | CPU | ~90s |
-| `test_stage3_tier1.py::test_grouped_svs_cache_equals_recompute` | cache vs recompute still `torch.equal` after dtype/device change | CPU | fast |
+| `test_stage3_tier1.py::test_grouped_svs_cache_precondition_torch_equal` (inline recompute patched to CPU-fp64, §2.2/C1) | producer fp64-CPU spectrum `torch.equal` to fp64-CPU inline recompute | CPU | fast |
+| `test_stage3_tier1.py::test_grouped_svs_cache_equals_recompute` | cache vs recompute rank dicts still `==` after dtype/device change (no edit needed — integer-dict compare) | CPU | fast |
+| `test_stage3_tier1.py::test_group_stat_vs_swift_spectra_differ` (recompute patched to CPU-fp64, M2) | item-3 disproof `not allclose` still holds; test mirrors the changed `_group_stat` path | CPU | fast |
 | NEW device-independence test (§5d) | fp64-CPU rank_map == fp64-GPU rank_map | CPU + 5080 (skipif no cuda) | CPU fast; GPU slow-but-bounded |
 | NEW non-uniform zero-pad unit test | `factor_layer` with non-uniform per-expert ranks no longer raises; forward inert | `test_stage3_plugin_aa_svd.py` | fast |
 | GPU-resident smoke (model on cuda) | §2 crash-fix: no device-mismatch RuntimeError | 5080 | minutes |
@@ -503,7 +574,8 @@ device-independence test touch cuda; keep those minimal (1 layer, few experts).
 | Risk | Mitigation | Rollback |
 |---|---|---|
 | fp64 ranks flip more than expected vs golden | §5a human-reviewed diff BEFORE bless; flip count surfaced | revert the spectra dtype change (back to fp32) — goldens unchanged |
-| `torch.equal` cache precondition breaks (dtype/device mismatch between producer/consumer) | §2.3 explicit verify both are CPU-fp64 | the cache reuse is an optimization; recompute branch is byte-identical fallback |
+| tier-1 `torch.equal` precondition **test** breaks: `test_grouped_svs_cache_precondition_torch_equal` (tier1:107-147) hardcodes an fp32 inline recompute (:138-144) and `torch.equal`-asserts (:145) against the producer, which §2.2 now emits as fp64-CPU → dtype+value mismatch | C1 mandates editing the test's inline recompute to CPU-fp64 (tier1:138-144) **in the same commit as §2.2**; this is a test-fixture edit, not just a production producer/consumer concern | revert the spectra dtype change restores fp32 producer ↔ fp32 inline; test fixture and producer move in lockstep either way |
+| production cache producer↔consumer dtype/device drift apart (within `swift_svd_alpha.py`) | §2.3 explicit verify both build/read CPU-fp64 | the cache reuse is an optimization; recompute branch is the fallback (identical once both are CPU-fp64) |
 | zero-pad perturbs forward | §4.3 proves inertness (same as shipped EoRA widen_rank); add forward-equivalence unit test | pad fix is local to `factor_layer`; revert restores xfail |
 | someone broadcasts cov to GPU "to fix the crash" | §6 forbids it; spectra-on-CPU is the sanctioned fix | n/a |
 | fp64-GPU svdvals accidentally introduced on 5080 (slow) | §2.1 mandates CPU-fp64 spectra; device-independence test guards | revert the offending `.to(dev)` |
@@ -520,10 +592,11 @@ production behavior outside Stage-3 factorization is touched.
 | File | Change |
 |---|---|
 | `stage3/plugins/swift_svd_alpha.py` | §2.2/§2.3 device+fp64 in `_swift_..._search` (749-760) & `_redistribute_..._swift_svd_plus` (949-953) |
-| `stage3/plugins/d_rank_allocate.py` | §2.4/§3.4 device+fp64 in `_group_stat` (355-374), drop fp32 cast at 359 |
-| `stage3/plugins/aa_svd_factor.py` | §4 zero-pad `k→slot` before `set_factors` (after 650, before 653) |
+| `stage3/plugins/d_rank_allocate.py` | §2.4/§3.4 device+fp64 in `_group_stat` (355-374), drop fp32 cast at 359, **AND rewrite the D-drank-fp64-mixed deviation docstring (193-210, inline comment 199-201) — M1** |
+| `stage3/plugins/aa_svd_factor.py` | §4 zero-pad `k→slot` before `set_factors` (after 650, before 653); index by actual returned width `U_k.shape[1]`/`V_k.shape[0]` — L1 |
 | `stage3/plugins/covariance_collection.py` | **no change** (cov stays CPU — §2.5/§6) |
 | `utils/model_io.py` | **no change** to `set_factors`/forward (pad in caller — §4.2) |
+| `tests/test_stage3_tier1.py` | **C1** edit `test_grouped_svs_cache_precondition_torch_equal` inline recompute (138-144) to CPU-fp64 in lockstep with §2.2 (so `torch.equal` at :145 holds); **M2** update `test_group_stat_vs_swift_spectra_differ` `_group_stat`-side recompute (drop `.float()` at :232 → CPU-fp64) to mirror §2.4 (disproof at :242 still holds) |
 | `tests/test_stage3_golden_snapshot.py` | §5c remove xfail on α-variant; (re-bless via env var, not code) |
 | `tests/golden/stage3/rank_map.{fp32,bf16}.json` | §5b re-blessed bytes |
 | `tests/golden/stage3/rank_map.alpha.{fp32,bf16}.json` | §5c new α goldens |
