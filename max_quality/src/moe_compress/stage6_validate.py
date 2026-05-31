@@ -19,23 +19,25 @@ Artifact: ``stage6_eval.json`` with absolute metrics + deltas + threshold
 pass/fail summary.
 
 **Security note — HumanEval code execution (H1, F-C-L-3):**
-``_check_humaneval`` executes model-generated Python code via ``exec()`` inside
-a daemon thread with a wall-clock timeout.  This provides *best-effort*
-sandboxing only — there is **no process isolation** (no subprocess, no
-seccomp, no container boundary).  Malicious or runaway generated code can
-access the filesystem, network, and interpreter state.  Use only in trusted
-environments or behind an external sandbox.
+HumanEval scoring runs model-generated Python in ``spawn`` ProcessPool CHILD
+PROCESSES (Item-2), with a shared wall-clock deadline and hard termination of
+stuck workers.  This provides subprocess isolation — strictly stronger than the
+legacy in-process daemon thread — but is still *best-effort*: there is **no
+seccomp / landlock / container boundary**.  Malicious or runaway generated code
+can still access the filesystem, network, and its own interpreter state.  Use
+only in trusted environments or behind an external sandbox.
 
-Known limitations of the in-process sandbox:
-  * Daemon threads that exceed the timeout are NOT killed — they leak silently
-    until interpreter exit (counted via ``_leaked_counter`` and surfaced as a
-    warning at the end of the eval).
-  * Wall-clock timeouts via ``Thread.join(timeout=...)`` do not interrupt
-    long-running C extensions or syscalls inside the exec body. (POSIX ``signal``
-    -based timeouts would interrupt syscalls but are not used here because they
-    only work on the main thread; signal-based timeouts are POSIX-only anyway.)
+Known limitations of the subprocess sandbox (Item-2 supersedes the old
+in-process daemon-thread design):
+  * The former daemon-thread LEAK (timed-out threads that ran until interpreter
+    exit) is FIXED: a worker that exceeds the shared deadline is hard-terminated
+    via ``ProcessPoolExecutor.shutdown(wait=False, cancel_futures=True)`` and
+    reaped by the OS.
+  * A worker stuck in a C extension may briefly ignore ``SIGTERM`` before the
+    OS reaps it on pool shutdown; this is strictly better than the old
+    never-dies daemon thread.
   * No syscall filter (no seccomp/landlock); generated code can open sockets,
-    write to ``/tmp``, exec binaries, etc., subject only to OS-level permissions.
+    write to ``/tmp``, run binaries, etc., subject only to OS-level permissions.
 
 **Compute-time optimizations (2026-04-30):**
 All optimizations are purely computational scheduling — larger batches, cached

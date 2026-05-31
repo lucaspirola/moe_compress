@@ -565,8 +565,14 @@ stage6_validate:
   lm_eval_batch_size: "auto:8"
   #
   # Optimizations #3, #4: Batched model.generate() for HumanEval/MATH-500.
-  # Greedy decode (do_sample=False) is deterministic regardless of batch.
-  # Left-padding + attention_mask ensures no cross-contamination.
+  # Greedy decode (do_sample=False) is deterministic run-to-run for a FIXED
+  # batch geometry, but NOT bit-identical across batch sizes (bf16 reduction
+  # order + left-pad placement flip near-tied argmax; ~11/16 completions differ
+  # at bs=8 vs bs=1). The generative metrics (humaneval_pass_at_1,
+  # math500_accuracy) are therefore batch-geometry-dependent.
+  # PINNED generative geometry — do not change without re-blessing generative
+  # metrics (the parse sites emit an advisory WARN when this differs from
+  # tools.eval_harness.PINNED_GEN_BATCH_SIZE).
   gen_batch_size: 8
   #
   # Optimization #5: torch.compile for prefill-dominant forward paths.

@@ -547,3 +547,44 @@ def test_compute_zero_shot_subset_hook(monkeypatch):
     assert ctx.get("student_arc_easy_acc_norm") == pytest.approx(0.42)
     assert ctx.get("student_hellaswag_acc_norm") == pytest.approx(0.77)
     assert ctx.get("student_acc_norm_sum") == pytest.approx(1.19)
+
+
+# ---------------------------------------------------------------------------
+# Item-3b — BPT argmax B/L chunking is BIT-IDENTICAL to the unchunked argmax
+# ---------------------------------------------------------------------------
+
+
+def test_bpt_argmax_chunked_equals_unchunked(tiny_model):
+    """The chunked-over-B argmax must be torch.equal to the single-shot argmax.
+
+    Item-3b chunks only the B/L dims (vocab axis kept WHOLE), so the result is
+    bit-identical regardless of chunk size: argmax has no float accumulation
+    and first-index tie-break is preserved. We score the SAME corpus with
+    batch_size=1 (so the whole corpus passes through a single forward per seq)
+    at several argmax_chunk_b values and assert identical argmax tensors, and
+    that the BPT float is unchanged."""
+    import torch as _torch
+
+    from moe_compress.stage6alt.plugins.bpt_metric import _bpt_from_nll
+
+    tiny_model.config._attn_implementation = "eager"
+    # 4 sequences x len 6 over the tiny vocab (32); distinct ids so the per-
+    # position argmax is non-trivial and order-sensitive.
+    calib = _torch.arange(4 * 6, dtype=_torch.long).reshape(4, 6) % 32
+
+    # Reference: chunk_b large enough to be a single (B, L-1, V) argmax.
+    bpt_full, argmax_full = _bpt_from_nll(
+        tiny_model, calib, device=None, batch_size=4,
+        collect_argmax=True, argmax_chunk_b=64,
+    )
+    for cb in (1, 2, 3):
+        bpt_c, argmax_c = _bpt_from_nll(
+            tiny_model, calib, device=None, batch_size=4,
+            collect_argmax=True, argmax_chunk_b=cb,
+        )
+        assert _torch.equal(argmax_c, argmax_full), (
+            f"argmax differs at argmax_chunk_b={cb}"
+        )
+        assert bpt_c == bpt_full
+        assert argmax_c.shape == (4, 5)
+        assert argmax_c.dtype == _torch.long

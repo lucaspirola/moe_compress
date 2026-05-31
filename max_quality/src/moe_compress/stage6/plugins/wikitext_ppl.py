@@ -24,9 +24,13 @@ Declared deviations from Merity et al. 2017 Table 4
    the reported number non-trivially.
 
 Stage 6 implementation note: configurable ``batch_size``;
-**numerically identical to ``batch_size=1``** (no per-batch noise).
-This is the project's ``VALIDATED_STRATEGIES`` §Stage 6 Optimization
-#1.
+**numerically identical to ``batch_size=1``** (no per-batch noise) —
+forward/PPL path ONLY. This metric reads ``out.loss``, a batch-invariant
+reduction, so it IS bit-identical across batch sizes. (The
+generate()-based generative metrics — ``humaneval_pass_at_1`` /
+``math500_accuracy`` — are NOT batch-invariant; see
+``tools.eval_harness._generate_batched``.) This is the project's
+``VALIDATED_STRATEGIES`` §Stage 6 Optimization #1.
 
 Home of the Stage 6 WikiText-2 perplexity concern, extracted from the legacy
 ``stage6_validate.py`` monolith. WikiText-2 PPL is the first sub-metric of the

@@ -39,6 +39,19 @@ log = logging.getLogger(__name__)
 _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 
 
+# Item-1: PINNED generative batch geometry. generate()-based metrics
+# (humaneval_pass_at_1, math500_accuracy) are NOT batch-invariant — bf16 matmul
+# reduction order + left-pad placement shift near-tied argmax across batch sizes
+# (~11/16 completions differ at bs=8 vs bs=1). Pinning the geometry makes the
+# reported generative numbers reproducible run-to-run. The gen_batch_size parse
+# sites emit an advisory WARN (not a raise) when the configured value differs,
+# so smoke runs (HUMANEVAL_LIMIT) may still use other geometries. The
+# forward/PPL/loglikelihood path IS batch-invariant and is unaffected by this.
+# teacher_provider keeps its own module-local MIRROR of this value (its
+# circular-import contract forbids importing from this module).
+PINNED_GEN_BATCH_SIZE: int = 8
+
+
 # ---------------------------------------------------------------------------
 # Batched generation (Optimizations #3, #4)
 # ---------------------------------------------------------------------------
@@ -49,8 +62,13 @@ def _generate_batched(model, tokenizer, prompts: list[str], *, max_new: int,
     """Batched model.generate() for greedy decoding (do_sample=False).
 
     Left-pads prompts to the longest in each batch group. Greedy decoding
-    produces deterministic outputs regardless of batching.
-    Numerically identical to serial generation.
+    (do_sample=False) is deterministic run-to-run for a FIXED batch geometry.
+    It is NOT bit-identical across batch sizes: bf16 matmul reduction order +
+    left-pad placement shift near-tied argmax (~11/16 completions differ at
+    bs=8 vs bs=1). Callers that report generative metrics MUST pin batch_size
+    (see ``PINNED_GEN_BATCH_SIZE``) for run-to-run reproducibility. The
+    forward/PPL/loglikelihood path IS batch-invariant; only generate() is
+    batch-geometry-dependent.
     """
     # H2: Mutates shared tokenizer state (padding_side, pad_token_id) and then
     # restores it in a finally block.  Not safe for concurrent callers — must
@@ -273,6 +291,7 @@ def _extract_code_from_chat_response(text: str, entry_point: str) -> str:
 
 
 __all__ = [
+    "PINNED_GEN_BATCH_SIZE",
     "_generate_batched",
     "_stage6_enable_thinking",
     "_chat_format_prompts",

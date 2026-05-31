@@ -77,7 +77,7 @@ _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 
 
 def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int,
-                  collect_argmax: bool = False):
+                  collect_argmax: bool = False, argmax_chunk_b: int = 1):
     """Mean next-token NLL in bits over a pre-tokenized calibration tensor.
 
     Adapted from `stage6_validate._wikitext2_ppl`'s NLL loop, but returns
@@ -93,6 +93,13 @@ def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int,
     predicted next-token id at each position — used by the top1_agreement
     metric. On the skip/inf path `argmax` is `None`. When `collect_argmax`
     is False (default) the bare `float` is returned, as before.
+
+    `argmax_chunk_b` (Item-3b) chunks the argmax computation over the B axis
+    (default 1) to bound the materialized-logits memory peak. The argmax is
+    taken over the WHOLE vocab axis per chunk, so the result is bit-identical
+    to the unchunked `out.logits[:, :-1, :].argmax(dim=-1)` regardless of the
+    chunk size (argmax has no float accumulation; first-index tie-break is
+    preserved as long as the vocab axis is never split).
     """
     # Batch-size-invariant numerics require eager attention (same requirement
     # as Stage 6's PPL / lm-eval paths). The student is loaded eager by
@@ -147,9 +154,21 @@ def _bpt_from_nll(model, calib_ids: torch.Tensor, *, device, batch_size: int,
                     # logits[:, t] predicts token t+1 → predicted-next id at
                     # positions 0..L-2. Move to CPU so 32 batches' worth of
                     # predictions don't accumulate on the GPU.
-                    argmax_chunks.append(
-                        out.logits[:, :-1, :].argmax(dim=-1).to("cpu")
-                    )
+                    #
+                    # Item-3b: argmax over the vocab axis is EXACTLY decomposable
+                    # over the B/L dims — argmax(full)[k] == argmax(chunk_k)
+                    # bit-for-bit (no float accumulation; first-index tie-break
+                    # preserved) AS LONG AS the vocab axis is kept WHOLE and only
+                    # B/L are chunked. We chunk the B axis to bound the
+                    # materialized-logits peak to (chunk_b, L-1, V) instead of
+                    # the full (B, L-1, V). The downstream torch.cat(..., dim=0)
+                    # is unchanged.
+                    shift = out.logits[:, :-1, :]            # (B, L-1, V)
+                    for _b0 in range(0, shift.shape[0], argmax_chunk_b):
+                        _sl = shift[_b0:_b0 + argmax_chunk_b]  # vocab axis WHOLE
+                        argmax_chunks.append(
+                            _sl.argmax(dim=-1).to("cpu")
+                        )
             except Exception as exc:           # noqa: BLE001
                 log.warning("stage6alt _bpt_from_nll: batch error (%s); skipping", exc)
                 skipped += 1

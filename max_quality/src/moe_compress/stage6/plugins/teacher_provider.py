@@ -82,6 +82,15 @@ log = logging.getLogger(__name__)
 _STAGE6_ATTN_IMPLEMENTATION: str = "eager"
 
 
+# Item-1: LOCAL MIRROR of ``tools.eval_harness.PINNED_GEN_BATCH_SIZE``. This
+# module's circular-import contract (module docstring) forbids importing from
+# ``...tools.eval_harness``, so the pinned generative geometry is duplicated
+# here exactly the way ``_STAGE6_ATTN_IMPLEMENTATION`` is — keep in sync with
+# eval_harness.PINNED_GEN_BATCH_SIZE. Used by the gen_batch_size parse site
+# below to emit the advisory WARN when the teacher-side geometry is off-pin.
+PINNED_GEN_BATCH_SIZE: int = 8
+
+
 # F-iter4-LOW-5: bump this whenever the cache file schema changes. _load_teacher_cache
 # rejects (and triggers re-evaluation) when the on-disk version does not match.
 TEACHER_CACHE_FORMAT_VERSION: int = 1
@@ -549,6 +558,18 @@ class TeacherProviderPlugin:
         if gen_batch_size <= 0:
             raise ValueError(
                 f"stage6_validate.gen_batch_size must be a positive int; got {gen_batch_size!r}."
+            )
+        # Item-1: generative metrics (humaneval_pass_at_1, math500_accuracy) are
+        # batch-geometry-dependent (bf16 + left-pad reduction drift). Pin the
+        # geometry so reported numbers are reproducible run-to-run. Advisory
+        # only — smoke runs legitimately use other geometries, so do NOT raise
+        # here. Uses the module-local PINNED_GEN_BATCH_SIZE mirror (no
+        # cross-import per the circular-import contract).
+        if gen_batch_size != PINNED_GEN_BATCH_SIZE:
+            log.warning(
+                "gen_batch_size=%d differs from the pinned generative geometry "
+                "%d; humaneval/math500 numbers are NOT comparable to pinned runs.",
+                gen_batch_size, PINNED_GEN_BATCH_SIZE,
             )
 
         # Step 5: conditional teacher-side eval calls (gated by the same

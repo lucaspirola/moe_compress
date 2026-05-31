@@ -20,25 +20,40 @@ This plugin's protocol:
 
   (a) **Greedy decoding** pass@1: ``do_sample=False, n=1``, no
       temperature, no top_p, single sample per problem.
-  (b) Exec-based scoring runs **in-process**, NOT in a subprocess
-      sandbox: tests can leak ``sys.modules`` / signal handlers /
-      ``os.environ`` mutations across problems. Both teacher and
-      student see the same in-process leakage so the
-      relative-to-teacher gate is not biased.
+  (b) Scoring runs in a **subprocess sandbox** (a
+      ``ProcessPoolExecutor`` forced onto the ``spawn`` start-method):
+      each problem's reference test runs in a CHILD PROCESS, so
+      ``sys.modules`` / signal-handler / ``os.environ`` mutations
+      cannot leak across problems, and a hung/runaway test is
+      hard-terminated at a shared deadline (no interpreter-lifetime
+      daemon-thread leak). Both teacher and student score with the
+      same isolated worker so the relative-to-teacher gate is not
+      biased.
 
 Rationale: greedy is lower-variance and reproducible across runs
 without seed plumbing, sufficient for **relative-to-teacher gating**
 (the gate is a 3pp absolute drop vs the same-protocol teacher score,
 not against published baselines). **Absolute pass@1 numbers will not
 match published Chen et al. 2021 baselines** and must not be compared
-to them. The gate's batched-vs-bs=1 numerical-identity claim (#3, #4
-in ``VALIDATED_STRATEGIES``) holds under greedy decoding only.
+to them. The ``VALIDATED_STRATEGIES`` #3/#4 references cover the
+batched-generate PLUMBING (left-padding, EOS-truncation, eager-attn
+pin), NOT numerical identity of the metric: the generative metrics
+``humaneval_pass_at_1`` / ``math500_accuracy`` are batch-geometry-
+dependent (bf16 + left-pad reduction drift flips near-tied argmax
+across batch sizes) and are pinned via ``gen_batch_size`` /
+``tools.eval_harness.PINNED_GEN_BATCH_SIZE`` for reproducibility. Only
+the forward/PPL/loglikelihood path is batch-invariant.
 
-In-process exec is documented because subprocess isolation would slow
-eval substantially with no signal-quality benefit for the relative
-gate; see ``stage6_validate.py`` module docstring "Known limitations"
-subsection for the operational caveats (daemon-thread leakage, no
-syscall interruption, no seccomp / landlock).
+Subprocess isolation (Item-2) replaces the legacy in-process
+daemon-thread scoring: the model code now runs in a ``spawn``
+ProcessPool child, so the documented daemon-thread LEAK (a timed-out
+thread that ran until interpreter exit) is gone — a stuck worker is
+terminated at the shared deadline. The remaining caveats are weaker:
+the child is still not a full sandbox (no seccomp / landlock /
+container), so this is best-effort isolation for trusted inputs. See
+``stage6_validate.py`` module docstring "Known limitations" subsection;
+that note's daemon-thread-leakage / no-syscall-interruption wording is
+superseded here by the subprocess-worker design.
 
 **D-humaneval-maxnew** — Paper / Chen 2021 §2.2 uses comparatively
 small decode budgets (the original eval scores standalone completions
@@ -89,16 +104,21 @@ S6-4's HumanEval slice covers a MIXED pattern (mirror of S6-3):
   deleted and this hook is wired live.
 
 Circular-import contract (mirror of ``stage6/plugins/wikitext_ppl.py``): this
-module imports only from ``..context`` / ``...tools.eval_harness`` / stdlib --
+module imports only from ``..context`` / ``...tools.eval_harness`` / sibling
+plugin modules (``eval_environment``, ``_humaneval_worker`` — both torch-free
+or context-only) / stdlib --
 NEVER from ``stage6_validate``, ``stage6.orchestrator`` or ``orchestrator`` at
 any scope (module-top OR function-local). The monolith re-imports *this* module
 at load time, so a ``from ..stage6_validate import ...`` here would deadlock
 the import; nothing in this module does that.
 
-**Security note -- HumanEval code execution (H1):** ``_check_humaneval`` runs
-model-generated Python inside a daemon thread with a wall-clock timeout. This
-is best-effort sandboxing only -- no process isolation. See the monolith
-docstring for the full caveat list. Use only in trusted environments.
+**Security note -- HumanEval code execution (H1):** scoring runs
+model-generated Python in a ``spawn`` ProcessPool CHILD PROCESS (Item-2), with
+a shared wall-clock deadline and hard termination of stuck workers. This is
+subprocess isolation -- strictly stronger than the legacy in-process daemon
+thread -- but still best-effort: no seccomp / landlock / container boundary.
+See the monolith docstring for the full caveat list. Use only in trusted
+environments.
 
 ``HumanEvalPlugin`` is registered-but-INERT at S6-4 -- no orchestrator walk or
 test invokes its ``eval_task`` hook. S6-8 plugs the hook into the live Stage 6
@@ -106,15 +126,17 @@ plugin sequencer and deletes the monolith ``run()``.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import multiprocessing
 import os
-import threading
+import time
 from typing import Any
 
 from ..context import PipelineContext
 from ...tools.eval_harness import (
+    PINNED_GEN_BATCH_SIZE,
     _chat_format_prompts,
-    _extract_code_from_chat_response,
     _generate_batched,
     _stage6_enable_thinking,
 )
@@ -125,6 +147,10 @@ from ...tools.eval_harness import (
 # this is safe wrt the circular-import contract documented in the module
 # docstring.
 from .eval_environment import _set_experts_implementation_s6
+# Item-2: torch-free leaf worker submitted to the spawn ProcessPool (see the
+# scoring loop in _humaneval). Importing it here is contract-safe: the worker
+# imports only stdlib + re (no torch, no stage modules).
+from ._humaneval_worker import _score_humaneval_one
 
 log = logging.getLogger(__name__)
 
@@ -218,15 +244,17 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None,
              "enable_thinking=%s, chat_template=on",
              len(prompts), batch_size, max_new, _enable_thinking)
     # H-1 — Security note (emitted once for the full eval, not per problem):
-    # _check_humaneval executes model-generated Python via exec() in a daemon thread
-    # with a wall-clock timeout.  This is best-effort sandboxing only — no process
-    # isolation (no subprocess, no seccomp, no container boundary).  Runaway or
-    # malicious generated code can access the filesystem, network, and interpreter
-    # state.  Use only in trusted environments or behind an external sandbox.
+    # scoring runs model-generated Python in spawn ProcessPool CHILD PROCESSES
+    # (Item-2) with a shared wall-clock deadline and hard termination of stuck
+    # workers.  This is subprocess isolation (stronger than the legacy in-process
+    # daemon thread) but still best-effort — no seccomp / landlock / container
+    # boundary.  Runaway or malicious generated code can still access the
+    # filesystem, network, and its own interpreter state.  Use only in trusted
+    # environments or behind an external sandbox.
     log.warning(
-        "HumanEval: executing model-generated code via exec() for %d problems "
-        "— best-effort sandboxed via daemon threads with %.0fs timeout each; "
-        "no process isolation.",
+        "HumanEval: running model-generated code for %d problems in spawn "
+        "ProcessPool workers with a %.0fs shared scoring deadline; subprocess "
+        "isolation only (no seccomp / landlock / container).",
         len(prompts), exec_timeout_secs,
     )
     completions = _generate_batched(
@@ -234,31 +262,126 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None,
         device=device, batch_size=batch_size,
     )
 
-    passes = 0
     total = len(prompts)
-    leaked_counter = [0]  # mutable box so _check_humaneval can increment it
-    # Pair RAW stub (for exec fallback) with the model's chat-formatted reply.
-    # `_check_humaneval` will prefer code extracted from the reply when the
-    # reply contains `def <entry_point>(...)`; else falls back to stub + reply.
-    for i, (raw_stub, completion, test, ep) in enumerate(
-        zip(raw_prompts, completions, tests, entry_points)
-    ):
-        if _check_humaneval(
-            raw_stub, completion, test, ep,
-            exec_timeout_secs=exec_timeout_secs,
-            _leaked_counter=leaked_counter,
-            _problem_index=i,
-        ):
-            passes += 1
-        if (i + 1) % 16 == 0:
-            log.info("  HumanEval eval %d/%d (pass=%d)", i + 1, total, passes)
-    if leaked_counter[0]:
-        log.warning(
-            "HumanEval: %d exec threads leaked (daemon threads; will be killed at interpreter exit)",
-            leaked_counter[0],
-        )
+    # Pair RAW stub (for the fallback src construction) with the model's
+    # chat-formatted reply. `_score_humaneval_one` prefers code extracted from
+    # the reply when it contains `def <entry_point>(...)`; else falls back to
+    # stub + reply (identical to the legacy `_check_humaneval` path).
+    passes = _score_all_humaneval(
+        raw_prompts, completions, tests, entry_points,
+        exec_timeout_secs=exec_timeout_secs,
+    )
     log.info("  HumanEval final: %d/%d = %.3f", passes, total, passes / max(total, 1))
     return passes / max(total, 1)
+
+
+def _score_all_humaneval(
+    raw_prompts: list[str], completions: list[str],
+    tests: list[str], entry_points: list[str],
+    *, exec_timeout_secs: int,
+) -> int:
+    """Score every HumanEval problem in a spawn ProcessPool; return pass count.
+
+    Item-2: replaces the legacy serial daemon-thread loop. Each problem is
+    scored by ``_humaneval_worker._score_humaneval_one`` in a CHILD PROCESS
+    (the process is the isolation + kill boundary), so a hanging/runaway
+    completion no longer leaks a daemon thread that lives until interpreter
+    exit. All problems are submitted up front and waited against a SINGLE
+    SHARED deadline (``exec_timeout_secs`` total, NOT per-future) so total
+    scoring wall-time is capped at ~one timeout instead of N x timeout in the
+    timeout-heavy regime. Unfinished futures at the deadline score False
+    (matches the legacy timeout->False contract) and their workers are
+    hard-terminated via ``shutdown(wait=False, cancel_futures=True)``.
+
+    The pass tally is an order-independent ``sum`` over finished futures, so
+    completion order does not affect the result (greedy decode makes each
+    score a pure function of its inputs).
+    """
+    total = len(raw_prompts)
+    if total == 0:
+        return 0
+    # FORCE spawn (host default may be fork -- fork-after-CUDA-init can deadlock
+    # the child). The worker leaf module is torch-free, so spawn import cost is
+    # small + one-time.
+    ctx = multiprocessing.get_context("spawn")
+    max_workers = max(1, min(os.cpu_count() or 1, total))
+    executor = concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_workers, mp_context=ctx,
+    )
+    fut_to_idx: dict[concurrent.futures.Future, int] = {}
+    try:
+        for i, (raw_stub, completion, test, ep) in enumerate(
+            zip(raw_prompts, completions, tests, entry_points)
+        ):
+            fut = executor.submit(
+                _score_humaneval_one, raw_stub, completion, test, ep,
+            )
+            fut_to_idx[fut] = i
+
+        # Shared deadline across the whole batch (NOT per-future) so the timeout
+        # does not re-serialize to N x exec_timeout_secs.
+        deadline = time.monotonic() + exec_timeout_secs
+        pending = set(fut_to_idx)
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _done, pending = concurrent.futures.wait(
+                pending, timeout=remaining,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+
+        # Order-independent tally over FINISHED futures; unfinished -> False.
+        passes = 0
+        terminated = 0
+        for fut, i in fut_to_idx.items():
+            if fut.done() and not fut.cancelled():
+                try:
+                    if fut.result() is True:
+                        passes += 1
+                except Exception as exc:           # noqa: BLE001
+                    # A worker that crashed (segfault->BrokenProcessPool, etc.)
+                    # scores False, matching the legacy exception->False path.
+                    log.warning(
+                        "HumanEval problem %d: worker raised (%s); scoring False.",
+                        i, exc,
+                    )
+            else:
+                terminated += 1
+        if terminated:
+            log.warning(
+                "HumanEval: %d problems exceeded the %ds shared scoring deadline "
+                "and were terminated (subprocess workers; scored as failures).",
+                terminated, exec_timeout_secs,
+            )
+        return passes
+    finally:
+        # Hard-terminate any still-running workers. cancel_futures drops
+        # queued-but-unstarted work; but a worker already RUNNING a runaway
+        # snippet (e.g. `while True: pass`) is NOT stopped by
+        # shutdown(wait=False) alone -- the pool's atexit join would then HANG
+        # the whole interpreter (the very failure mode this design exists to
+        # kill). The public API has no "terminate running children" call, so we
+        # reach into the documented-but-private `_processes` mapping to send
+        # SIGTERM (then SIGKILL) to each live worker. This is a CPython
+        # ProcessPoolExecutor implementation detail (stable across 3.9-3.13:
+        # `_processes` is a {pid: Process} dict); if a future CPython renames
+        # it the getattr-guarded fallback degrades to shutdown-only (still
+        # correct for non-runaway workers, only re-introducing the hang risk
+        # for a truly stuck child). A terminated process reclaims runaway work
+        # immediately -- unlike the legacy daemon thread that ran until
+        # interpreter exit.
+        procs = getattr(executor, "_processes", None)
+        if procs:
+            for _proc in list(procs.values()):
+                if _proc.is_alive():
+                    _proc.terminate()      # SIGTERM
+            for _proc in list(procs.values()):
+                _proc.join(timeout=1.0)
+                if _proc.is_alive():
+                    _proc.kill()           # SIGKILL — stuck in C ext / ignoring TERM
+                    _proc.join(timeout=1.0)
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _check_humaneval(
@@ -267,57 +390,28 @@ def _check_humaneval(
     _leaked_counter: list | None = None,
     _problem_index: int = 0,
 ) -> bool:
-    # H1 — Security note (debug-level; outer _humaneval emits one WARNING for
-    # the full eval before the loop starts).  exec() is used here inside a
-    # daemon thread; the outer function owns the one-time security log.
-    log.debug(
-        "HumanEval problem %d: running in daemon thread, timeout=%.0fs",
-        _problem_index, exec_timeout_secs,
-    )
-    # Chat-formatted completions wrap reasoning + code in markdown / think
-    # tags. _extract_code_from_chat_response strips <think>...</think> and
-    # prefers ```python fences. If the extracted code already contains a full
-    # `def <entry_point>(`, run it standalone; otherwise fall back to the
-    # legacy `stub + body` concatenation (preserves the raw-completion path
-    # used by non-chat models in earlier runs).
-    code = _extract_code_from_chat_response(completion, entry_point)
-    if code and f"def {entry_point}(" in code:
-        src = code + "\n" + test_src + f"\ncheck({entry_point})\n"
-    else:
-        src = prompt + completion + "\n" + test_src + f"\ncheck({entry_point})\n"
-    ns: dict = {}
-    _exc_holder: list = []
+    """Score a single HumanEval problem; True iff its reference test passes.
 
-    def _exec_target() -> None:
-        # N3: this body runs inside a non-main daemon thread, which means
-        # signal.alarm / signal.SIGALRM based interruption is NOT available
-        # here — Python only delivers signals to the main thread. The H1
-        # caveat (best-effort wall-clock timeout via Thread.join leaving the
-        # offending thread alive as a daemon) is therefore structural, not a
-        # TODO. Do NOT try to "fix" it by adding signal.alarm: it would
-        # raise ValueError: signal only works in main thread and break every
-        # problem. Subprocess isolation is the only real fix and is
-        # intentionally out of scope (D-humaneval-greedy rationale).
-        try:
-            exec(src, ns, ns)           # noqa: S102 — controlled benchmark use
-        except Exception as _e:         # noqa: BLE001
-            _exc_holder.append(_e)
+    Item-2: this is now a CONTRACT-PRESERVING WRAPPER that delegates to the
+    torch-free leaf worker ``_humaneval_worker._score_humaneval_one``. The
+    batch scoring path (``_humaneval`` -> ``_score_all_humaneval``) runs that
+    same worker in a spawn ProcessPool with a shared deadline and hard
+    termination of stuck workers — the subprocess IS the timeout + isolation
+    boundary, replacing the legacy in-process daemon thread (which leaked a
+    runaway thread that lived until interpreter exit).
 
-    _t = threading.Thread(target=_exec_target, daemon=True)
-    _t.start()
-    _t.join(timeout=exec_timeout_secs)
-    if _t.is_alive():
-        # Thread leaked (daemon — will die with process); count as failure.
-        if _leaked_counter is not None:
-            _leaked_counter[0] += 1
-            log.warning(
-                "HumanEval exec timed out for problem %d (%d leaked threads total)",
-                _problem_index, _leaked_counter[0],
-            )
-        return False
-    if _exc_holder:
-        return False
-    return True
+    The signature is unchanged so the existing in-process unit tests keep
+    pinning it positionally (``_check_humaneval(prompt, completion, test_src,
+    entry_point) is True/False``) and ``stage6_validate`` keeps re-importing
+    this symbol from here (the is-identity pin). ``exec_timeout_secs`` /
+    ``_leaked_counter`` / ``_problem_index`` are accepted for backwards
+    compatibility but the wall-clock timeout + leak accounting now live in the
+    batch ProcessPool path, NOT in this single-problem call (a direct call runs
+    the worker in-process and returns its bool exactly).
+    """
+    log.debug("HumanEval problem %d: scoring (delegated to worker).",
+              _problem_index)
+    return _score_humaneval_one(prompt, completion, test_src, entry_point)
 
 
 class HumanEvalPlugin:
@@ -430,6 +524,17 @@ class HumanEvalPlugin:
         if gen_batch_size <= 0:
             raise ValueError(
                 f"stage6_validate.gen_batch_size must be a positive int; got {gen_batch_size!r}."
+            )
+        # Item-1: generative metrics (humaneval_pass_at_1, math500_accuracy) are
+        # batch-geometry-dependent (bf16 + left-pad reduction drift). Pin the
+        # geometry so reported numbers are reproducible run-to-run. Advisory
+        # only — smoke runs (HUMANEVAL_LIMIT) legitimately use other geometries,
+        # so do NOT raise here.
+        if gen_batch_size != PINNED_GEN_BATCH_SIZE:
+            log.warning(
+                "gen_batch_size=%d differs from the pinned generative geometry "
+                "%d; humaneval/math500 numbers are NOT comparable to pinned runs.",
+                gen_batch_size, PINNED_GEN_BATCH_SIZE,
             )
 
         # F-CR2-L-1: schema preservation -- accept `num_samples_per_task` for

@@ -83,6 +83,7 @@ from typing import Any
 
 from ..context import PipelineContext
 from ...tools.eval_harness import (
+    PINNED_GEN_BATCH_SIZE,
     _chat_format_prompts,
     _generate_batched,
     _stage6_enable_thinking,
@@ -392,6 +393,16 @@ class Math500Plugin:
         if gen_batch_size <= 0:
             raise ValueError(
                 f"stage6_validate.gen_batch_size must be a positive int; got {gen_batch_size!r}."
+            )
+        # Item-1: math500_accuracy is a batch-geometry-dependent generative
+        # metric (bf16 + left-pad reduction drift). Pin the geometry so reported
+        # numbers are reproducible run-to-run. Advisory only — smoke runs
+        # legitimately use other geometries, so do NOT raise here.
+        if gen_batch_size != PINNED_GEN_BATCH_SIZE:
+            log.warning(
+                "gen_batch_size=%d differs from the pinned generative geometry "
+                "%d; humaneval/math500 numbers are NOT comparable to pinned runs.",
+                gen_batch_size, PINNED_GEN_BATCH_SIZE,
             )
 
         # The run-scoped `device` / `eval_text_concat` are optional context
