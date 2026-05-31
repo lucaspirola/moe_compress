@@ -25,14 +25,32 @@ introduced (project rule): the old-vs-new comparison goes purely through the
 captured golden. Same determinism caveat as the Stage 3 golden snapshot:
 capture + verify MUST run on the same torch wheel / host.
 
-Capture workflow::
+The golden is DEVICE-KEYED (``trained_<tag>_<cpu|cuda>.pt``): fp32 reductions
+are not bit-identical across the CPU and CUDA backends, so each device asserts
+byte-identity against a golden captured on that same device. The C1 fix (the
+CPU-safe ``_pin`` guard in ``block_refine.py``) is what lets the CPU path run
+at all — origin/main's unconditional ``.pin_memory()`` raised
+``RuntimeError: No CUDA GPUs are available`` under ``CUDA_VISIBLE_DEVICES=""``.
+
+Capture workflow (run once per device the harness will be verified on)::
 
     MOE_REGEN_BLOCK_REFINE_GOLDEN=1 \
-      pytest tests/test_stage3_block_refine_optimized_equiv.py -q
+      pytest tests/test_stage3_block_refine_optimized_equiv.py -q          # CUDA golden
+    CUDA_VISIBLE_DEVICES="" MOE_REGEN_BLOCK_REFINE_GOLDEN=1 \
+      pytest tests/test_stage3_block_refine_optimized_equiv.py -q          # CPU golden
 
-  (with ``block_refine.py`` checked out at origin/main) -> writes the golden,
-  test skips. Restore the optimized ``block_refine.py``, then run without the
-  env var -> must pass via ``torch.equal``.
+  (with ``block_refine.py`` checked out at origin/main) -> writes the
+  device-keyed golden, test skips. Restore the optimized ``block_refine.py``,
+  then run without the env var -> must pass via ``torch.equal``.
+
+  Provenance caveat for the CPU golden: origin/main CANNOT be run under
+  ``CUDA_VISIBLE_DEVICES=""`` (its unconditional ``.pin_memory()`` raises),
+  so ``trained_*_cpu.pt`` is captured against the OPTIMIZED code. This is a
+  faithful origin/main reference because the only CPU-path change is the
+  ``_pin`` guard, which on CPU is the IDENTITY (returns the tensor unchanged):
+  same values, same op order, same RNG as origin/main would have produced had
+  it not crashed. The CPU golden therefore still gates that no OTHER CPU-path
+  behavior drifted.
 
 Self-verification of the pinned path
 ------------------------------------
@@ -389,13 +407,19 @@ def _capture_teacher_cache(teacher, teacher_moe_layers, calib, device, dtype):
 # ---------------------------------------------------------------------------
 # Golden capture / verify.
 # ---------------------------------------------------------------------------
-def _golden_path(tag: str) -> Path:
-    return _GOLDEN_DIR / f"trained_{tag}.pt"
+def _golden_path(tag: str, device) -> Path:
+    # The golden is device-keyed: fp32 reductions are NOT bit-identical
+    # across the CPU and CUDA backends (different kernels / accumulation
+    # order), so each device verifies against a golden captured ON THAT
+    # device against origin/main. The C1 fix (CPU-safe ``_pin`` guard) lets
+    # the CPU path RUN at all; byte-identity is then asserted within-device.
+    dtype_tag = getattr(device, "type", str(device))
+    return _GOLDEN_DIR / f"trained_{tag}_{dtype_tag}.pt"
 
 
 def _capture_or_verify(tag: str, device, *, use_cache: bool, tmp_path: Path):
     state = _run_block_refine(device, use_cache=use_cache, tmp_path=tmp_path)
-    gpath = _golden_path(tag)
+    gpath = _golden_path(tag, device)
     if os.environ.get(_REGEN_ENV):
         _GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
         torch.save(state, gpath)

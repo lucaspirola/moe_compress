@@ -125,12 +125,14 @@ class _LazyTeacherTargetsCache:
     Byte-identity: ``get`` performs the SAME
     ``hs.reshape(n_prompts, seq_len, -1).contiguous()`` the old eager path
     did, so the consumed tensor is bit-identical — only allocation timing
-    changes. For a present-but-malformed sidecar whose flat token count
-    does not factor as ``n_prompts × seq_len``, ``get`` returns the raw
-    2-D ``[n_tokens, hidden]`` tensor; block_refine's per-layer guard
-    (``block_refine.py:466-492``, ``cached.dim() == 3`` etc.) then falls
-    through to the live teacher forward for that layer — the same
-    numerically-safe fall-through already in ``origin/main``.
+    changes. ``get`` re-applies origin/main's I2 prompt-count divergence
+    guard (``payload.n_prompts_in_subset != n_prompts``) using the payload
+    it has already deserialized — at zero extra I/O — and for a divergent
+    OR present-but-malformed sidecar (flat token count not factoring as
+    ``n_prompts × seq_len``) returns the raw 2-D ``[n_tokens, hidden]``
+    tensor; block_refine's per-layer guard (``cached.dim() == 3`` etc.)
+    then falls through to the live teacher forward for that layer — the
+    same numerically-safe fall-through origin/main forced via a full miss.
     """
 
     def __init__(
@@ -179,6 +181,21 @@ class _LazyTeacherTargetsCache:
             # absent semantics so block_refine falls through to live.
             return default
         hs = payload.hidden_states  # [n_tokens, hidden]
+        # I2 (Lever 3): prompt-count divergence guard. origin/main's
+        # eager ``on_load`` checked ``n_prompts_in_subset != n_prompts``
+        # up front and forced a full cache miss. The lazy presence scan
+        # cannot do this without a payload load, BUT we have already
+        # deserialized ``payload`` here, so ``n_prompts_in_subset`` is in
+        # hand at ZERO extra I/O. The dangerous case is a writer payload
+        # whose flat token count coincidentally equals n_prompts×seq_len
+        # but whose prompt/seq geometry diverges: a bare reshape would
+        # produce wrong-content [n_prompts, seq_len, hidden] targets that
+        # block_refine's shape-only guard (dim()==3, shape[1]==seq_len)
+        # would ACCEPT. Returning the raw 2-D tensor forces block_refine's
+        # numerically-safe per-layer fall-through (dim()==3 rejection),
+        # exactly as origin/main forced a miss.
+        if int(payload.n_prompts_in_subset) != self._n_prompts:
+            return hs
         n_tokens = int(hs.shape[0])
         expected = self._n_prompts * self._seq_len
         if n_tokens != expected:

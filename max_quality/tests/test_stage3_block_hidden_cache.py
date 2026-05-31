@@ -39,10 +39,11 @@ Covers:
    registry of [Stage3BlockHiddenCacheProvider] processed via
    ``PluginRegistry.dispatch_first`` returns the first non-None winner
    on cache hit.
-6. ``test_prompt_count_divergence_no_longer_upfront_miss`` -- documents
-   the accepted scope change: ``n_prompts_in_subset`` divergence is NOT
-   detected up-front anymore (needs a payload load); a shape-valid
-   sidecar still materializes.
+6. ``test_prompt_count_divergence_caught_at_get`` -- H1 fix: the I2
+   ``n_prompts_in_subset`` divergence guard is re-applied INSIDE ``.get``
+   (which already loaded the payload), so a divergent-but-token-count-
+   matching sidecar returns the raw 2-D tensor -> block_refine per-layer
+   fall-through, exactly as origin/main forced a full miss.
 7. ``test_c1_batch_size_decoupled`` -- a writer with bcov-style batch
    size 1 produces sidecars; the reader populates the un-chunked
    tensor; downstream block_refine consumer with batch_size=32 slices
@@ -52,9 +53,10 @@ Covers:
    the SAME reshaped tensor the old eager path produced (byte-identity).
 9. ``test_lazy_mapping_len_and_get_contract`` -- ``len`` == n_layers with
    NO materialization; ``.get(absent) is None``.
-10. ``test_partial_cache_still_all_or_nothing_miss`` -- removing one
-    layer's sidecar/manifest is the contract gate; the sidecars dir
-    presence is all-or-nothing.
+10. ``test_absent_dir_is_full_miss`` -- an absent sidecars dir is a full
+    miss (None, ctx untouched) before any training. (Honest limitation: a
+    single missing layer is undetectable -- the provider is never given the
+    expected layer count -- so this gates only the dir-absent path.)
 """
 from __future__ import annotations
 
@@ -334,23 +336,30 @@ def test_dispatch_first_routes_through_registry(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_prompt_count_divergence_no_longer_upfront_miss(tmp_path):
-    """ACCEPTED SCOPE CHANGE (Lever 3 design (b)): the I2 prompt-count
-    divergence guard read ``payload.n_prompts_in_subset``, which requires
-    deserializing the payload -- impossible under the cheap presence scan
-    (``load_block_hidden`` has no shape-only path; the manifest carries no
-    n_prompts field). So a sidecar whose ``n_prompts_in_subset`` diverges
-    but whose token count matches the ctx geometry is NO LONGER an up-front
-    miss; it presence-validates (hit) and ``.get`` materializes a
-    shape-valid tensor under the ctx geometry.
+def test_prompt_count_divergence_caught_at_get(tmp_path):
+    """H1 fix (Lever 3): the I2 prompt-count divergence guard is RE-APPLIED
+    inside ``_LazyTeacherTargetsCache.get``. The cheap presence scan still
+    can't do it up-front (it does NO payload load), but ``.get`` ALREADY
+    deserializes the payload to materialize the tensor, so
+    ``payload.n_prompts_in_subset`` is in hand at ZERO extra I/O.
 
-    This is the documented trade-off recorded in the plan's risk table:
-    operator misconfiguration of the calibration source is caught by the
-    operator-responsibility note (prompt-identity is I1+I2 operator
-    responsibility), not by this reader. The numerically-safe per-layer
-    shape fall-through still protects against a *misshapen* sidecar."""
+    The dangerous case this guards: a writer payload whose flat token count
+    coincidentally equals ``n_prompts × seq_len`` (so the shape-only guard
+    would accept it) but whose prompt/seq geometry diverges -> a bare reshape
+    would hand block_refine WRONG-CONTENT 3-D targets that its shape-only
+    guard (``dim()==3``, ``shape[1]==seq_len``) silently accepts. On
+    ``n_prompts_in_subset != n_prompts`` the divergence is caught and ``.get``
+    returns the raw 2-D ``[n_tokens, hidden]`` tensor, forcing block_refine's
+    numerically-safe per-layer ``dim()==3`` fall-through to the live teacher
+    forward -- exactly as origin/main's eager ``on_load`` forced a full miss.
+
+    Presence validation is unchanged (still a HIT), because the guard is a
+    per-layer ``.get`` concern, not a presence concern."""
     n_prompts_ctx, seq_len, hidden = 6, 4, 2
     jsonl = _jsonl(tmp_path)
+    # Token count = 6×4 = 24 deliberately MATCHES the ctx geometry, so the
+    # shape-only guard alone would NOT catch this. Only the n_prompts_in_subset
+    # divergence (130 != 6) distinguishes the wrong-content payload.
     hs = torch.zeros(n_prompts_ctx * seq_len, hidden, dtype=torch.bfloat16)
     payload = BlockHiddenPayload(
         schema_version=SCHEMA_VERSIONS["block_hidden"],
@@ -367,14 +376,21 @@ def test_prompt_count_divergence_no_longer_upfront_miss(tmp_path):
 
     provider = Stage3BlockHiddenCacheProvider()
     result = provider.on_load(ctx, jsonl)
-    # Presence-valid -> hit. (Pre-Lever-3 this returned None.)
+    # Presence-valid -> hit (the lazy mapping); the guard fires at .get.
     assert result is not None
     assert ctx.has("teacher_targets_cache")
     cache = ctx.get("teacher_targets_cache")
-    # Token count (24) matches 6×4, so .get materializes a shape-valid tensor.
     got = cache.get(0)
+    # Divergence caught: .get returns the RAW 2-D tensor (NOT reshaped to the
+    # ctx 3-D geometry), so block_refine's dim()==3 guard falls through to the
+    # live teacher forward for this layer -- no wrong-content target accepted.
     assert got is not None
-    assert got.shape == (n_prompts_ctx, seq_len, hidden)
+    assert got.dim() == 2, (
+        "prompt-count divergence must NOT reshape to 3-D even when the token "
+        "count coincidentally matches; .get must return the raw 2-D tensor so "
+        "block_refine's dim()==3 guard forces the live fall-through"
+    )
+    assert got.shape == (n_prompts_ctx * seq_len, hidden)
 
 
 # ---------------------------------------------------------------------------
@@ -529,24 +545,25 @@ def test_lazy_mapping_len_and_get_contract(tmp_path):
     assert cache.get(4) is not None
 
 
-def test_partial_cache_still_all_or_nothing_miss(tmp_path):
-    """Contract-preservation gate: the PRESENCE miss stays all-or-nothing
-    BEFORE any training, established cheaply (stat + manifest, no payload
-    load).
+def test_absent_dir_is_full_miss(tmp_path):
+    """Contract-preservation gate: an ABSENT sidecars dir is a full miss
+    (``None``, ctx untouched) BEFORE any training, established cheaply
+    (stat + manifest, no payload load), so a consumer never sees a
+    partially-hydrated cache.
 
-    The directory-level miss is all-or-nothing: with no sidecars dir there is
-    a full miss (None) BEFORE any training, so a consumer never sees a
-    partially-hydrated cache. A genuinely-malformed-but-PRESENT sidecar (torn
-    manifest) raises in the presence scan -- covered by
-    ``test_schema_mismatch_raises``. A shape-misshapen-but-present sidecar
-    falls through per-layer at consumption -- covered by
-    ``test_token_count_mismatch_lazy_get_falls_through``.
+    Related present-but-bad cases are covered elsewhere: a torn-manifest
+    sidecar raises in the presence scan (``test_schema_mismatch_raises``);
+    a shape-misshapen-but-present sidecar falls through per-layer at
+    consumption (``test_token_count_mismatch_lazy_get_falls_through``).
 
-    (Removing ONE layer's ``.pt`` from an N-layer dir shrinks the validated
-    set but is NOT independently detectable as a "missing layer" -- neither
-    origin/main's eager ``_load_layers`` nor this presence scan is given the
-    expected layer COUNT; the orchestrator never passes ``n_blocks`` to the
-    provider. This is unchanged from origin/main.)
+    HONEST LIMITATION (why this is named for the dir-absent case, not
+    "partial cache"): removing ONE layer's ``.pt`` from an N-layer dir
+    shrinks the validated set but is NOT independently detectable as a
+    "missing layer" -- neither origin/main's eager ``_load_layers`` nor
+    this presence scan is given the expected layer COUNT; the orchestrator
+    never passes ``n_blocks`` to the provider. So a single missing layer is
+    undetectable here, and this test deliberately exercises only the
+    dir-absent -> full-miss path. This is unchanged from origin/main.
     """
     # Directory absent -> full miss, ctx untouched, before any materialization.
     jsonl = _jsonl(tmp_path)

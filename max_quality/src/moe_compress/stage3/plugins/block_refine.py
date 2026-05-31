@@ -209,6 +209,20 @@ def _phase_c5_block_refine(
     log.info("Stage 3 Phase C.5: %d decoder layers (%d MoE refined) × %d epochs (lr=%.1e, batch=%d)",
              n_blocks, n_moe_blocks, epochs, learning_rate, batch_size)
 
+    # Levers 1+2 are a CUDA-only optimization: ``.pin_memory()`` allocates
+    # non-pageable host memory via the CUDA driver, so it raises
+    # ``RuntimeError: No CUDA GPUs are available`` on a CPU-only host (or
+    # ``CUDA_VISIBLE_DEVICES=""``). Pinning is also pointless when the
+    # consuming ``.to(device, non_blocking=True)`` targets CPU (a CPU->CPU
+    # copy is never an async H2D). Gate the pin on the resolved device type:
+    # on CUDA we pin (byte-identical, async H2D); on CPU it is the identity,
+    # which loses nothing.
+    _pin = (
+        (lambda t: t.pin_memory())
+        if (getattr(device, "type", device) == "cuda")
+        else (lambda t: t)
+    )
+
     partial_dir = None if no_resume else artifacts_dir / "_stage3_phase_c5_partial"
     if partial_dir is not None:
         partial_dir.mkdir(parents=True, exist_ok=True)
@@ -295,8 +309,8 @@ def _phase_c5_block_refine(
             # AdamW loop (non_blocking=True) is async. .pin_memory() returns
             # a byte-identical copy in non-pageable host memory; values are
             # unchanged.
-            captured[cur_idx[0]] = (
-                t.detach().to(dtype=torch.bfloat16, device="cpu").pin_memory()
+            captured[cur_idx[0]] = _pin(
+                t.detach().to(dtype=torch.bfloat16, device="cpu")
             )
             raise _EarlyExit
 
@@ -481,9 +495,10 @@ def _phase_c5_block_refine(
                 # contiguous() slice is already a fresh bf16 CPU tensor;
                 # .pin_memory() makes it non-pageable with identical bytes.
                 teacher_targets = [
-                    cached[bi * batch_size:(bi + 1) * batch_size]
-                    .contiguous()
-                    .pin_memory()
+                    _pin(
+                        cached[bi * batch_size:(bi + 1) * batch_size]
+                        .contiguous()
+                    )
                     for bi in range(n_batches)
                 ]
                 log.info(
@@ -515,7 +530,7 @@ def _phase_c5_block_refine(
                     # Levers 1+2: pinned bf16 CPU source for the async
                     # per-step H2D below. Byte-identical to the pageable copy.
                     teacher_targets.append(
-                        out.detach().to(dtype=torch.bfloat16, device="cpu").pin_memory()
+                        _pin(out.detach().to(dtype=torch.bfloat16, device="cpu"))
                     )
 
         # AdamW loop.
@@ -638,6 +653,14 @@ def _advance_streams(s_layer, t_layer, X_student, X_teacher,
     new_t: list[torch.Tensor] = []
     student_dtype = next(s_layer.parameters()).dtype
     teacher_dtype = next(t_layer.parameters()).dtype
+    # Levers 1+2 are CUDA-only (``.pin_memory()`` needs the CUDA driver and is
+    # pointless for a CPU->CPU copy); gate the pin on the resolved device type
+    # so the CPU device path does not raise ``No CUDA GPUs are available``.
+    _pin = (
+        (lambda t: t.pin_memory())
+        if (getattr(device, "type", device) == "cuda")
+        else (lambda t: t)
+    )
     with torch.no_grad():
         for x_s_cpu, x_t_cpu in zip(X_student, X_teacher):
             x_s = x_s_cpu.to(device=device, dtype=student_dtype)
@@ -646,12 +669,12 @@ def _advance_streams(s_layer, t_layer, X_student, X_teacher,
                 out_s = out_s[0]
             # Levers 1+2: pin the next-block bf16 CPU inputs so the next
             # block's per-step H2D (non_blocking=True) is async. Byte-identical.
-            new_s.append(out_s.detach().to(dtype=torch.bfloat16, device="cpu").pin_memory())
+            new_s.append(_pin(out_s.detach().to(dtype=torch.bfloat16, device="cpu")))
             x_t = x_t_cpu.to(device=device, dtype=teacher_dtype)
             out_t = t_layer(x_t, **t_kwargs)
             if isinstance(out_t, tuple):
                 out_t = out_t[0]
-            new_t.append(out_t.detach().to(dtype=torch.bfloat16, device="cpu").pin_memory())
+            new_t.append(_pin(out_t.detach().to(dtype=torch.bfloat16, device="cpu")))
     return new_s, new_t
 
 
