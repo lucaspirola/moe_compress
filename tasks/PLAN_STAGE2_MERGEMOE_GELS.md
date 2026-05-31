@@ -78,7 +78,17 @@ Measured `gels`(CUDA) vs `gelsd`(CPU) on `(1024, 512)` × `N=4`:
 |---|---|---|---|
 | realistic well-conditioned | ~6 | — | **2.1e-06** |
 | synthetic well-cond | ~1e2 | 1.2e-05 | — |
-| synthetic ill-cond (sub-gate) | ~1e6–3e7 | **~0.8–1.3** (diverges) | — (not tested for merged-down) |
+| synthetic ill-cond (sub-gate) | ~1e6–3e7 | **~1e2–3e3** (diverges) | — (not tested for merged-down) |
+
+> The ill-conditioned-band solution rel diff is **construction-dependent**: a
+> fresh reproduction on real `(1024, 512)` shapes (torch 2.11+cu130) gives
+> `1e2–3e3` for `cond(P) ∈ [1e6, 3e7)` — orders of magnitude larger than the
+> earlier `~0.8–1.3` estimate. The conclusion is unchanged and in fact
+> strengthened: in this band `gels` and `gelsd` disagree massively on the
+> solution. Critically (see §4), in this band the `gels` output is **finite**
+> and its **residual is no worse than (often lower than) `gelsd`'s** — the only
+> signal that flags the divergence is the **solution norm** (`‖x_qr‖ ~1e8–1e9`
+> vs `~1e6`).
 
 **Key findings:**
 
@@ -114,11 +124,11 @@ Three candidates were considered:
   consistent with the golden snapshots and the paper's SVD posture. But the
   CPU `gelsd` solve is the ~426× slower path the report flags; per-layer cost
   on the real model is unacceptable for a GPU run.
-- **(C) `gels` on-device, with a tightened cond-fallback so the residual
-  ill-conditioned band is sent to CPU `gelsd` (or to the freq-weighted
-  fallback).** Correct AND GPU-fast.
+- **(C) `gels` on-device, with a tightened **pre-solve** cond-gate so the
+  ill-conditioned `[1e6, 1e8)` band is routed to the existing freq-weighted
+  fallback BEFORE the solve.** Correct AND GPU-fast.
 
-### Recommendation: **Option C — `gels` on-device + tighten the gate to make `gels` provably safe.**
+### Recommendation: **Option C — `gels` on-device + a tightened CUDA-path cond-gate (`1e6`) so `gels` only runs on provably full-rank `P`.**
 
 Concretely (to be implemented in the follow-up, `mergemoe.py` only):
 
@@ -127,41 +137,72 @@ Concretely (to be implemented in the follow-up, `mergemoe.py` only):
    golden snapshots **byte-identical** — see §5). This is a 2-line
    `driver = "gels" if P.is_cuda else "gelsd"` selection at L318.
 
-2. **Make the gate guarantee gels-safety.** The current `1e8` gate is an
+2. **Make the gate guarantee gels-safety — lower the CUDA-path cond-gate
+   *before* the solve (Option C2, PRIMARY).** The current `1e8` gate is an
    SVD-era threshold. For `gels` (QR) to be numerically trustworthy we need
-   `P` comfortably full-rank. Two sub-options, decide at implementation review:
-   - **C1 (preferred, simplest, still elegant):** keep the single `1e8` gate
-     but add a **post-solve residual / finiteness check** on the CUDA path: if
-     `T1` contains non-finite values or the relative residual `‖P·T1ᵀ−Q‖/‖Q‖`
-     exceeds a small tolerance, fall back to freq-weighted (same fallback the
-     cond-gate already uses). This catches QR breakdown without re-tuning the
-     conditioning threshold and without a CPU round-trip.
-   - **C2 (if C1's residual check proves flaky):** lower the CUDA-path gate to
-     a `gels`-safe threshold (e.g. `1e6`, matching the regime where §3 shows
-     gels≈gelsd), keeping `1e8` for the CPU `gelsd` path. Costs a second
-     constant + updates `test_mergemoe_cond_threshold_constant_matches_plan`.
+   `P` comfortably full-rank.
 
-   Recommend implementing **C1** first; it adds robustness without changing the
-   paper-pinned `1e8` constant. Escalate to C2 only if the residual guard is
-   noisy in practice.
+   **C2 (PRIMARY recommendation):** on the CUDA path, lower the cond-gate to
+   `_COND_THRESHOLD_CUDA = 1e6` (a new constant), keeping `_COND_THRESHOLD =
+   1e8` on the CPU `gelsd` path. Any cluster with `cond(P) ∈ [1e6, 1e8)` then
+   routes to the existing `_freq_weighted_down` fallback **before** the solve;
+   `gels` only ever runs on provably full-rank `P` where §3 verified
+   `gels ≈ gelsd` to ~`2e-6`. This catches the divergence band at the one
+   place a cheap test can see it — the conditioning number, computed
+   pre-solve. Costs the second constant + updates
+   `test_mergemoe_cond_threshold_constant_matches_plan` (which must now pin
+   both constants).
+
+   **Why NOT a post-solve residual/finiteness guard (the earlier "C1"):** a
+   fresh reproduction on real `(1024, 512)` shapes (torch 2.11+cu130) shows
+   that in the `cond(P) ∈ [1e6, 1e8)` band the `gels` (QR) output is
+   **finite**, and its **relative residual `‖P·T1ᵀ−Q‖/‖Q‖` is *lower* than
+   `gelsd`'s** (QR minimizes residual on the data it sees; SVD trades residual
+   for minimum norm). So a finiteness+residual guard **never fires** in the
+   exact band it was meant to catch, while it is blind to the actual failure
+   mode — **solution-norm blow-up** (`‖x_qr‖ ~1e8–1e9` vs the well-conditioned
+   `~1e6`). A residual guard is therefore **inert** and is rejected.
+
+   **If any post-solve guard is kept at all (optional belt-and-suspenders),**
+   it must key on **solution-norm blow-up relative to the freq-weighted scale**
+   — e.g. fall back when `‖T1‖` exceeds the freq-weighted-down norm by some
+   large factor — **NOT** on residual or finiteness. This is secondary to the
+   pre-solve cond-gate (C2), which already excludes the divergence band; it
+   exists only to defend against a `cond(P)` estimate that under-reports.
+
+   **CPU goldens unchanged:** the CPU path keeps `_COND_THRESHOLD = 1e8` and
+   `driver="gelsd"`, so every existing CPU golden snapshot stays byte-identical
+   (see §5).
 
 **Why not B:** the 426× CPU penalty defeats the purpose; the user's perf posture
 (`feedback_speedup_questions_target_real_run`) makes a slow-but-correct path the
 wrong default for a GPU run.
 
 **Why not plain A:** leaves the `[1e6, 1e8)` divergence band silently mis-solved.
-C is A plus a cheap guard, so it is correct AND GPU-fast.
+C is A plus a cheap **pre-solve** cond-gate (the `1e6` CUDA threshold), so it is
+correct AND GPU-fast. Note a post-solve residual/finiteness guard would *not*
+fix A — see §4.2: in that band `gels` is finite with a residual no worse than
+`gelsd`, so the divergence must be excluded *before* the solve, not detected
+after it.
 
 ---
 
 ## 5. Golden-snapshot impact
 
 - **CPU snapshots: ZERO change.** The existing tests run on CPU (`device=None`)
-  and the test reference solve at `test_*_mergemoe_step.py:72,108` uses
-  `driver="gelsd"`. By selecting the driver on `P.is_cuda`, the **CPU path keeps
-  `gelsd`**, so every existing CPU golden snapshot
-  (`atol=1e-5, rtol=1e-4` at L110/L128; byte-identical at L155, `_snapshot_banks`)
-  stays valid **unchanged**.
+  and the test reference solve at `test_*_mergemoe_step.py:L72 (call) + L108
+  (comment)` uses `driver="gelsd"`. By selecting the driver on `P.is_cuda`, the
+  **CPU path keeps `gelsd`** (and `_COND_THRESHOLD = 1e8`), so every existing CPU
+  golden snapshot (`atol=1e-5, rtol=1e-4` at L110/L128; byte-identical at L155,
+  `_snapshot_banks`) stays valid **unchanged**. The CUDA-only `1e6` gate (C2)
+  never touches the CPU branch.
+- **`_freq_weighted_down` reuse — verified sound.** The C2 fallback target is
+  the same `_freq_weighted_down(W_D, b)` already used by the cond-gate at
+  `mergemoe.py:285,294` (def at L332). It takes the fp32 member-`down` list plus
+  scalar freq weights `b` and reduces to the legacy freq-weighted merge — the
+  exact byte-identical-to-legacy path the default `merge_step="freq_weighted"`
+  produces. Routing the `[1e6, 1e8)` CUDA band into it is therefore a no-new-code
+  reuse of an already-pinned merge.
 - **CUDA path: no existing snapshot.** There is currently no CUDA golden
   snapshot for `mergemoe` (the path crashes, so none could exist). The fix
   *creates* the first working CUDA path. Per §3, on well-conditioned `P` the
@@ -184,10 +225,11 @@ new, tolerance-bounded CUDA path. No existing golden needs re-baselining.
   mandate a LAPACK driver. `gelsd` and `gels` both target the same
   least-squares problem; they differ only in the rank-deficient corner.
 - Therefore the driver swap is **within paper fidelity** *as long as* the
-  rank-deficient corner is handled — which is exactly what the cond-gate +
-  Option-C guard does. The paper's `P†` is the minimum-norm (SVD) solution;
-  on full-rank `P` (the gated regime) `gels` and `gelsd` give the same answer,
-  so fidelity holds.
+  rank-deficient corner is handled — which is exactly what the tightened
+  CUDA-path cond-gate (C2, `cond < 1e6`) does: it routes any near-rank-deficient
+  `P` to the freq-weighted fallback **before** `gels` runs. The paper's `P†` is
+  the minimum-norm (SVD) solution; on full-rank `P` (the gated regime) `gels`
+  and `gelsd` give the same answer, so fidelity holds.
 - **Sign-off ask:** confirm that "device-dependent LAPACK driver, with a
   full-rank guard ensuring gels≈the paper's `P†`" is an acceptable
   implementation deviation. This should be recorded as a new deviation tag in
@@ -204,27 +246,43 @@ selection and the rationale.
 
 1. `mergemoe.py` L318: `driver = "gels" if P.is_cuda else "gelsd"`; pass to
    `lstsq`.
-2. `mergemoe.py`: add Option-C1 post-solve finiteness/residual guard on the
-   CUDA path → freq-weighted fallback on failure (reuse `_freq_weighted_down`).
+2. `mergemoe.py`: add a new CUDA-path cond constant `_COND_THRESHOLD_CUDA = 1e6`
+   (keep `_COND_THRESHOLD = 1e8` for CPU). At the gate (L287), select the
+   threshold on `P.is_cuda` so the `[1e6, 1e8)` band routes to
+   `_freq_weighted_down` **before** the solve (Option C2). Do **NOT** add a
+   post-solve residual/finiteness guard — it is inert in this band (§4.2). An
+   optional solution-norm-blow-up guard (relative to the freq-weighted-down
+   scale) may be added as belt-and-suspenders, but never a residual one.
 3. `mergemoe.py` L315–316 + module docstring: replace the `gelsd`-only comment;
    add deviation tag `D-mergemoe-cuda-driver`.
-4. `test_stage2_plugin_mergemoe_step.py`: add a CUDA-guarded
-   (`@pytest.mark.skipif(not torch.cuda.is_available())`) parity test asserting
-   CUDA-`gels` merged-down ≈ CPU-`gelsd` within `atol=1e-5, rtol=1e-4`. Leave
-   all existing CPU tests untouched (they keep `gelsd`).
+4. `test_stage2_plugin_mergemoe_step.py`: (a) update
+   `test_mergemoe_cond_threshold_constant_matches_plan` to pin **both**
+   `_COND_THRESHOLD = 1e8` (CPU) and `_COND_THRESHOLD_CUDA = 1e6`; (b) add a
+   CUDA-guarded (`@pytest.mark.skipif(not torch.cuda.is_available())`) parity
+   test asserting CUDA-`gels` merged-down ≈ CPU-`gelsd` within
+   `atol=1e-5, rtol=1e-4`. Leave all existing CPU tests untouched (they keep
+   `gelsd` and the `1e8` gate).
 5. Run the full `test_stage2_plugin_mergemoe_step.py` on a CUDA box to confirm
    the crash is gone and the new parity test passes.
 
 **Out of scope:** the caller in `merging.py` (no change needed — it already
-passes correct device tensors), the `1e8` constant for the CPU path, and any
-non-`mergemoe` merge step.
+passes correct device tensors), the `1e8` constant on the **CPU** path (kept),
+and any non-`mergemoe` merge step.
 
 ---
 
 ## 8. Open questions for sign-off
 
-1. C1 (residual guard, keep `1e8`) vs C2 (per-device gate constants)? Plan
-   recommends C1.
+1. **RESOLVED — C2 (per-device gate constants), not C1.** The earlier "C1 vs C2,
+   decide at review" question is closed: a fresh reproduction (torch 2.11+cu130,
+   real `(1024, 512)` shapes) shows the C1 post-solve residual/finiteness guard
+   is **inert** — in the `[1e6, 1e8)` divergence band `gels` is finite and its
+   residual is *lower* than `gelsd`'s, so the guard never fires. The only
+   discriminating pre-solve signal is the conditioning number. The plan therefore
+   adopts **C2**: a CUDA-path `_COND_THRESHOLD_CUDA = 1e6` gate (CPU keeps `1e8`),
+   routing `[1e6, 1e8)` to `_freq_weighted_down` before the solve. (No "escalate
+   to C2 only if the residual guard is noisy" path — that escalation would never
+   trigger, since the residual guard is silent by construction.)
 2. Acceptable to record `D-mergemoe-cuda-driver` as a deviation, or does the
    user want the CPU-`gelsd` posture preserved on GPU at the 426× cost
    (Option B)? Plan recommends the deviation.
