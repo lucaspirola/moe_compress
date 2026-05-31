@@ -41,7 +41,7 @@ set -o pipefail
 V2_VAL_COMMIT="${V2_VAL_COMMIT:-a3a946a}"
 V2_VAL_RESULTS_REPO="${V2_VAL_RESULTS_REPO:-pirola/calibration-v2-validation}"
 VLLM_WHEEL_REPO="${VLLM_WHEEL_REPO:-pirola/vllm-patched-calib}"
-VLLM_WHEEL_FILE="${VLLM_WHEEL_FILE:-vllm-0.21.1.dev0+gad7125a43.d20260526-cp312-cp312-linux_x86_64.whl}"
+VLLM_WHEEL_FILE="${VLLM_WHEEL_FILE:-vllm-0.21.1.dev0+gad7125a43.d20260531-cp312-cp312-linux_x86_64.whl}"
 REPO_ROOT="${V2_VAL_REPO_ROOT:-/tmp/moe_compress}"
 
 echo "[$(date)] === Phase 1: apt-install ==="

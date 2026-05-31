@@ -25,7 +25,7 @@ set -o pipefail
 L1_HARNESS_COMMIT="${L1_HARNESS_COMMIT:-feat/calibration-v2}"
 L1_RESULTS_REPO="${L1_RESULTS_REPO:-pirola/l1-validation-results}"
 VLLM_WHEEL_REPO="${VLLM_WHEEL_REPO:-pirola/vllm-patched-calib}"
-VLLM_WHEEL_FILE="${VLLM_WHEEL_FILE:-vllm-0.21.1.dev0+gad7125a43.d20260526-cp312-cp312-linux_x86_64.whl}"
+VLLM_WHEEL_FILE="${VLLM_WHEEL_FILE:-vllm-0.21.1.dev0+gad7125a43.d20260531-cp312-cp312-linux_x86_64.whl}"
 
 echo "[$(date)] === Phase 1: apt-install ==="
 export DEBIAN_FRONTEND=noninteractive
