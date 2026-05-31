@@ -19,6 +19,19 @@ decomposition operands to GPU, or threading the per-expert eigh/svd that feeds
 `rank_map.json`. Those reorder FP reductions (±1 rank flips) and break
 byte-identity; they need a re-bless decision.
 
+> **Item 1 was DROPPED.** A prior draft contained an "Item 1 — α-grid eigh
+> caching" optimization (memoize the per-`(layer,expert)` `_EighDecomp` across
+> α-candidates). It has been **removed** as memory-infeasible: to reuse a
+> decomp across the α-candidate sweep the cache must survive the whole α-outer
+> loop keyed `(layer, expert)`, i.e. hold a decomp for **every** expert at once.
+> For the Qwen3.5-MoE target (`d_in ≈ 4096`, `r_eff ≈ 512`, `48` layers, `128`
+> experts) that is `48 · 128 · 3 · 4096 · 512 · 4 B ≈ 144 GiB` resident — it
+> OOMs the H200 and blows the ~128 GiB CPU headroom. Its only payoff (avoiding
+> the eigh recompute per α) largely evaporates once Tier-2 moves eigh to GPU
+> (~100× faster), so the cache buys little even where it fits. The item, its RAM
+> analysis, and its unit test are gone; remaining items keep their original
+> numbering (2, 3, 8, 9, 10) for stable cross-references.
+
 ### Architecture note (important — line refs in the brief were pre-S3-7)
 
 Stage 3 is now plugin-driven. `moe_compress.stage3_svd.run` is a **thin shim**
@@ -75,122 +88,25 @@ Because `alpha_grid=[0.5]` (length 1), the golden takes the **uniform path**
 `stage3_orchestrator` α-cache branch is also gated on `len>1`). Therefore the
 golden exercises **none** of:
 
-* `_factor_model_at_ranks` (item 1's caching target),
 * `_swift_svd_plus_alpha_search` / `_redistribute_ranks_swift_svd_plus` /
   `grouped_svs` (item 2's target),
 * the α-search redistribution that would consume item 3's published spectra.
 
-**Consequence:** items 1, 2, 3 are *invisible* to the golden. Their correctness
+**Consequence:** items 2 and 3 are *invisible* to the golden. Their correctness
 gate is the **focused unit test on small synthetic tensors** specified per item
 below. The golden remains the regression backstop proving we did not perturb
 the uniform path (and the factor path, which it does cover).
 
-Optional belt-and-suspenders for items 1–3: a second tiny config with
+Optional belt-and-suspenders for items 2–3: a second tiny config with
 `alpha_grid=[0.0,0.5,1.0]` + `validation_samples=2` would make the golden
 actually traverse the α paths. Recommended as a **new golden variant**
 (`rank_map.alpha.fp32.json`) rather than mutating the pinned one — additive,
-keeps the existing pin immutable. This is optional; the per-item unit tests are
-the primary gate.
+keeps the existing pin immutable (use the additive `[0.0, 0.5, 1.0]` grid). This
+is optional; the per-item unit tests are the primary gate.
 
 ---
 
 ## 2. Items
-
-### Item 1 — α-grid eigh caching (validation path)
-
-**Where:** `swift_svd_alpha.py:373 _factor_model_at_ranks`, called once per
-α-candidate from `_swift_svd_plus_alpha_search_validation:650`.
-
-**The redundancy:** inside the per-expert loop (`:436-451`),
-`_precompute_eigh(B_shared, A_shared, C_shared, ...)` is computed for the
-shared gate/up decomposition. `_precompute_eigh` depends only on `(B, A, C)`
-for that `(layer, expert)` — **not** on rank `k` or on α. But
-`_factor_model_at_ranks` is re-invoked for *every* α-candidate, recomputing the
-identical eigh each time. Only `_aa_svd_precomputed(W, decomp, k, ...)` and the
-SVD truncation legitimately depend on the per-α rank.
-
-**The fix (cache, do not move math, do NOT reorder the loops):** memoize the
-small `_EighDecomp` per `(layer_idx, expert_idx)` across α-candidates. Build the
-cache lazily on the first α keyed by `(ref.layer_idx, e)`; on subsequent α
-iterations look it up instead of recomputing `_precompute_eigh`. The down_proj
-branch (`name not in gate/up`, `:465-474`) calls full `_aa_svd` — that one
-already re-derives its own eigh internally and is the Tier-2 candidate; leave it
-byte-identical (do not touch its math).
-
-**What is cached, and what is NOT:** the cache holds only the *small*
-`_EighDecomp` dataclass (`aa_svd_factor.py:150-183`) returned by
-`_precompute_eigh` — i.e. `rhs` `[d_in, r_eff]`, `rhs_pinv` `[r_eff, d_in]`,
-`eigvecs_keep` `[d_in, r_eff]`, `eigvals_keep`/`inv_sqrt` `[r_eff]`. It does
-**NOT** cache the big `O(d_in²)` covariance B. The covariance unload —
-`B_acc.unload_layer(ref.layer_idx)` at `swift_svd_alpha.py:484` (and the C-cov
-twin at `:486`), at the *bottom* of `_factor_model_at_ranks` after that layer's
-experts are factored — stays **UNCHANGED**, so the one-layer-cov-resident RAM
-invariant is fully preserved. Only the per-(layer,expert) decomps persist across
-the α-candidate sweep.
-
-**Byte-identity argument (VERIFIED):** `_precompute_eigh`
-(`aa_svd_factor.py:187-262`) is a pure function of `(B, C, device,
-storage_dtype)` and is provably **k- and α-independent** — its only inputs are
-the covariances; `A` is explicitly discarded (`del A` at `aa_svd_factor.py:230`,
-with the comment "A must not influence the rank-k factorization") and neither
-`k` nor `α` appears in the body. Only the downstream `_aa_svd_precomputed(W,
-decomp, k, ...)` SVD-truncation reads the per-α rank. Caching the return and
-reusing the *same tensor object* therefore feeds *bit-identical* `rhs` /
-`rhs_pinv` / `eigvecs_keep` into `_aa_svd_precomputed` on every α; no reduction
-is reordered. The selected α (and hence `rank_map.json`) is determined by
-`_evaluate_wikitext2_ppl`, which sees identical factored weights.
-
-**Why the loops are NOT reordered (correction):** the validation search is
-α-**outer** / layer-**inner** for a *structural* reason — each α-candidate
-scores the WHOLE model factored at that α. In
-`_swift_svd_plus_alpha_search_validation` (`swift_svd_alpha.py:636-669`) the per-α
-body is: (1) `_redistribute_ranks_swift_svd_plus(...)` for this α, (2)
-`_factor_model_at_ranks(...)` over **all** layers/experts, (3)
-`_evaluate_wikitext2_ppl(...)` on the full factored model, (4)
-`_restore_fused_experts(...)`. You **cannot** invert to layer-outer / α-inner:
-PPL is a whole-model metric, so you can't evaluate α=0 with only layer 0 done.
-The earlier "invert the loops" framing was wrong and is dropped. The eigh cache
-lives *across* the α-outer loop and is consumed *inside* `_factor_model_at_ranks`
-for whichever (layer, expert) it is processing — no eval restructure needed.
-
-**RAM of the cache (must be in the implementation — it is small, NOT a budget
-risk):** the cache holds one `_EighDecomp` per `(layer, expert)` for the gate/up
-projections. Per decomp the dominant tensors are `rhs` + `rhs_pinv` +
-`eigvecs_keep`, all `O(d_in · r_eff)` in fp32 (the `[r_eff]` vectors are
-negligible). The covariance it replaces is `O(d_in²)`. So per-(layer,expert) the
-decomp/cov ratio is `≈ 3 · r_eff / d_in`, and since the retained rank
-`r_eff ≪ d_in` after the `>σ_max·rel_floor` threshold (`aa_svd_factor.py:209-215`;
-`r_eff` is bounded by the SVD target rank, far below the group rank), each decomp
-is a small fraction of one covariance.
-
-Aggregate worst case = `n_layers · n_experts · 3 · d_in · r_eff · 4 bytes`. For
-the Qwen3.5-MoE-35B-A3B target (`hidden_size = d_in ≈ 4096`, `~48` MoE layers,
-post-prune `≥128` experts/layer, and a representative `r_eff ≈ 512`): per decomp
-`≈ 3 · 4096 · 512 · 4 B ≈ 24 MiB`; aggregate `≈ 48 · 128 · 24 MiB ≈ 144 GiB`
-**only if** every layer's decomps are held simultaneously. They are NOT: the
-cache is naturally bounded to the layers that have been *touched* and, since the
-cov unload at `:484` releases each layer's `O(d_in²)` cov (`4096² · 4 B ≈ 64 MiB`
-per cov, ×experts) as before, the decomp cache trades a tiny constant
-(`3·r_eff/d_in ≈ 0.38` of one cov per expert) for `len(alpha_grid)` fewer eighs.
-The decomp footprint per layer (`128 · 24 MiB ≈ 3 GiB`) is far inside the
-documented one-layer-cov-resident headroom; no per-layer scoping gymnastics or
-loop inversion are required. A plain `dict` keyed by `(layer_idx, expert_idx)`,
-populated on first α and read on the rest, is the drop-in.
-
-**Expected gain:** ~4× fewer `_precompute_eigh` calls on the validation path
-(one per layer/expert instead of one per layer/expert per α). Brief says ~4×;
-realistic factor = `len(alpha_grid)` for the gate/up eighs (11 in production).
-
-**Fast-test gate (no model):**
-`test_factor_eigh_cache_matches_recompute` — synthesize a handful of small
-`(B, A, C, W)` tensors and small per-expert ranks; assert that the cached path
-(`_precompute_eigh` once → `_aa_svd_precomputed` per α) yields `U_k, V_k, k_eff`
-**bit-identical** (`torch.equal`) to calling `_precompute_eigh` fresh for each
-α. Near-instant; LAPACK-enabled build required (eigh/svd). Add a second assert
-that two different α/rank values reusing one cached decomp match their
-independent recompute.
-
----
 
 ### Item 2 — Swift-SVD double-spectra (`grouped_svs_cache` plumbing)
 
@@ -201,15 +117,34 @@ the **identical** per-expert spectra (same `build_banks`, same
 `_cov_lookup(A_cov,...)`, same eigh+threshold+`svdvals(W @ L_A)`).
 
 **The dead parameter:** `_redistribute_ranks_swift_svd_plus(... ,
-grouped_svs_cache=None, ...)` (`:889`) is plumbed but never populated. Both call
-sites pass `grouped_svs_cache=None` (`stage3_orchestrator.py:601` resume path,
-`:1122` in `select_alpha`).
+grouped_svs_cache=None, ...)` (param on `swift_svd_alpha.py:889`; `def` at
+`:883`) is plumbed but never populated. Both call sites pass
+`grouped_svs_cache=None` (`orchestrator.py:601` resume path, `swift_svd_alpha.py:1122`
+in `select_alpha`).
 
-**The fix:** have `_swift_svd_plus_alpha_search` **return** its `grouped_svs`
-(or accept an out-param) so `select_alpha` can thread it into
+**The fix:** have `_swift_svd_plus_alpha_search` **optionally return** its
+`grouped_svs` so `select_alpha` can thread it into
 `_redistribute_ranks_swift_svd_plus(grouped_svs_cache=grouped_svs)`. In
 `_redistribute_*`, when `grouped_svs_cache` is provided, look up
 `svs = grouped_svs_cache[name][(li, e)]` instead of recomputing the eigh+svd.
+
+**Contracts to preserve (do NOT break the public surface — LOW finding):**
+`_swift_svd_plus_alpha_search` is **re-exported** from the package shim at
+`stage3_svd.py:77` (verified: it is one of the 8 names in the
+`from .stage3.plugins.swift_svd_alpha import (...)` block) and is **name-pinned**
+by `test_stage3_plugin_swift_svd.py:39` (the `_EXPECTED_NAMES`/imports tuple in
+`test_swift_svd_module_imports`). Both must keep working unchanged. The pin-test
+also calls `_redistribute_ranks_swift_svd_plus(...)` with its **current arity**
+at `test_stage3_plugin_swift_svd.py:188` — the new `grouped_svs_cache`/return
+plumbing must remain backward-compatible with that call.
+
+**Backward-compatible signature (MANDATORY):** add an **opt-in** keyword
+`return_svs: bool = False` to `_swift_svd_plus_alpha_search` (`def` at
+`swift_svd_alpha.py:685`). When `return_svs=False` (the default) the function's
+**base return type is unchanged** — it still returns just `alpha_by_type` — so
+the re-export, the `:39` name-pin, and every existing caller keep their current
+contract. Only when `return_svs=True` does it return the `(alpha_by_type,
+grouped_svs)` tuple. Do **not** change the default return shape.
 
 **Byte-identity argument & PRECONDITION (must verify before relying on it):**
 the two code blocks must produce *bit-identical* `svs`. They look identical by
@@ -235,15 +170,27 @@ The eigh itself is NOT reordered — it is the same call, just memoized.
   * **(iii)** `validation_samples == 0` → the proxy runs at `:1116` (fallback,
     spectral-proxy only); `grouped_svs` **is** built.
 
-The single `_redistribute_ranks_swift_svd_plus(...)` call at `:1120` is shared by
-all three branches. Thread the cache into it **only in branches (i) and (iii)**;
-in branch (ii) keep `grouped_svs_cache=None` so the redistribute recomputes the
+**Update BOTH in-tree call-sites of the proxy in lockstep** (verified against
+`origin/main` blobs):
+
+  * branch (i) proxy call at `swift_svd_alpha.py:1108` →
+    `alpha_by_type, grouped_svs = _swift_svd_plus_alpha_search(..., per_group_type=True, A_cov=A_cov, return_svs=True)`.
+  * branch (iii) proxy call at `swift_svd_alpha.py:1116` →
+    `alpha_by_type, grouped_svs = _swift_svd_plus_alpha_search(..., per_group_type=per_group_type, A_cov=A_cov, return_svs=True)`.
+  * branch (ii) at `swift_svd_alpha.py:1113`
+    (`alpha_by_type = {"all": best_global_alpha}`) is **left unchanged** — the
+    proxy is not called there, so there is no `grouped_svs` to thread.
+
+The single `_redistribute_ranks_swift_svd_plus(...)` call shared by all three
+branches is at `swift_svd_alpha.py:1120` (its `grouped_svs_cache=None` argument is
+on `:1122`). Thread the cache into it **only in branches (i) and (iii)**; in
+branch (ii) keep `grouped_svs_cache=None` so the redistribute recomputes the
 spectra (correct — there is nothing to reuse). Implement this as an explicit
 guard, **not** an unconditional pass:
 
 ```python
 grouped_svs_cache = None                # default; branch (ii) keeps this
-# branch (i)/(iii): proxy ran and produced grouped_svs
+# branch (i)/(iii): proxy ran with return_svs=True and produced grouped_svs
 #   alpha_by_type, grouped_svs = _swift_svd_plus_alpha_search(..., return_svs=True)
 #   grouped_svs_cache = grouped_svs
 ...
@@ -255,10 +202,10 @@ per_expert_ranks = _redistribute_ranks_swift_svd_plus(
 ```
 
 i.e. `cache if cache_was_built else None`, never an unconditional cache. The
-**α-cache resume** path in the orchestrator (`orchestrator.py` redistribute call,
-the resume branch) also did NOT run the proxy this process, so it likewise stays
-`grouped_svs_cache=None` (it correctly recomputes) — do not touch that call
-site.
+**α-cache resume** path in the orchestrator — `_redistribute_ranks_swift_svd_plus`
+call at `orchestrator.py:599` (its `grouped_svs_cache=None` on `:601`) — also did
+NOT run the proxy this process, so it likewise stays `grouped_svs_cache=None` (it
+correctly recomputes) — **do not touch that call site**.
 
 **Expected gain:** ~2× (eliminates the second full pass of per-expert eigh+svd
 over all `(layer, matrix, expert)`).
@@ -484,8 +431,8 @@ same dict (payload identical; only the manifest sha differs). Milliseconds.
 
 | # | Item | Byte-safe? | Files touched | Fast-test gate |
 |---|------|-----------|---------------|----------------|
-| 1 | α-grid eigh caching | YES (memoize small `_EighDecomp` per (layer,expert); cov unload at `:484` UNCHANGED; no loop reorder; pure k/α-independent fn) | `stage3/plugins/swift_svd_alpha.py` (`_factor_model_at_ranks`, `_swift_svd_plus_alpha_search_validation`) | `test_factor_eigh_cache_matches_recompute` |
-| 2 | swift-svd double-spectra (`grouped_svs_cache`) | YES (after `torch.equal` precondition check; thread cache ONLY in select_alpha branches (i)+(iii), `cache if cache_was_built else None`; branch (ii) + resume stay `None`) | `stage3/plugins/swift_svd_alpha.py` (`_swift_svd_plus_alpha_search` return, `_redistribute_ranks_swift_svd_plus` consume, `SwiftSvdAlphaPlugin.select_alpha` thread) | `test_grouped_svs_cache_equals_recompute` |
+| 1 | ~~α-grid eigh caching~~ | **DROPPED** — memory-infeasible (≈144 GiB resident to keep all `(layer,expert)` decomps across the α-outer loop; OOMs H200 + blows ~128 GiB CPU headroom); payoff evaporates once Tier-2 moves eigh to GPU. See §0 note. | none | none |
+| 2 | swift-svd double-spectra (`grouped_svs_cache`) | YES (after `torch.equal` precondition check; opt-in `return_svs=False` default keeps base return type + re-export `stage3_svd.py:77` + pin-test `:39`/`:188` intact; thread cache ONLY in select_alpha branches (i)`:1108`+(iii)`:1116`, `cache if cache_was_built else None`; branch (ii)`:1113` + resume `orchestrator.py:599` stay `None`) | `stage3/plugins/swift_svd_alpha.py` (`_swift_svd_plus_alpha_search` opt-in return, `_redistribute_ranks_swift_svd_plus` consume, `SwiftSvdAlphaPlugin.select_alpha` thread both call-sites) | `test_grouped_svs_cache_equals_recompute` |
 | 3 | group_stat triple-pass | **NO — re-scope/blocked** (group-avg+cholesky ≠ per-expert+eigh; see Finding) | none in Tier 1 | `test_group_stat_vs_swift_spectra_differ` (disproof) |
 | 8 | sharded save overlap | YES (contents unchanged; index after drain) | `utils/model_io.py` (`_save_state_dict_sharded`) | `test_save_state_dict_sharded_overlap_identical` |
 | 9 | bcov layer prefetch (MAIN factor loop only; `swift_svd_alpha.py:404` validation-path load OUT of scope) | YES (load hoisted; accumulate unchanged under lock) | `utils/activation_hooks.py` (`load_layer_from_disk` split), `stage3/plugins/aa_svd_factor.py` (`:534`) / `stage3/orchestrator.py` (`:653` prefetch driver) | `test_bcov_prefetch_matches_serial` |
@@ -493,24 +440,25 @@ same dict (payload identical; only the manifest sha differs). Milliseconds.
 
 ## 4. Verification strategy (fast by design)
 
-1. **Per-item unit tests (primary gate for 1,2,8,9,10; disproof for 3):**
+1. **Per-item unit tests (primary gate for 2,8,9,10; disproof for 3):**
    small synthetic tensors, no model load, `torch.equal` / byte-equal asserts of
    cached/overlapped path vs recompute/serial path. Each runs in
-   ms–seconds. These are the *only* coverage of items 1 & 2 because the golden's
+   ms–seconds. The unit test is the *only* coverage of item 2 because the golden's
    `alpha_grid=[0.5]` skips the α paths.
 2. **End-to-end golden:**
    `pytest max_quality/tests/test_stage3_golden_snapshot.py` — ~38–42 s for both
    params, already small/fast, **no new fixture required**. Run on a
    LAPACK-enabled build. Proves the uniform + factor paths stay byte-identical.
-3. **Optional additive α-golden variant** (`alpha_grid=[0.0,0.5,1.0]`) to give
-   the golden suite real coverage of items 1–3 end-to-end. Additive new golden
+3. **Optional additive α-golden variant** (`alpha_grid=[0.0, 0.5, 1.0]`) to give
+   the golden suite real coverage of items 2–3 end-to-end. Additive new golden
    file; do **not** mutate the pinned `rank_map.{fp32,bf16}.json`.
 
 ## 5. Ordering / risk
 
 * Lowest-risk first: **10** (1-line), **8** (self-contained), **9**
   (self-contained, RAM-bounded).
-* **1** and **2** touch the α-search hot path — land with their unit tests
-  green, then the α-golden variant, then the pinned golden.
+* **2** touches the α-search hot path — land with its unit test green, then the
+  α-golden variant, then the pinned golden.
+* **1** is **DROPPED** (memory-infeasible — see §0); no work.
 * **3** is **not implemented in Tier 1** — file a Tier-2 / re-bless ticket;
   the disproof test documents why.
