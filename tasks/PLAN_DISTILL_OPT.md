@@ -2,7 +2,8 @@
 
 **Branch:** `plan/distill-opt` (base `origin/main` @ `0ae66896942cd8ecbca1cf62c81aaec60f889590`)
 **Scope:** PLAN ONLY. No production edits in this branch. All file:line citations verified against `origin/main` blobs on 2026-05-31.
-**Host for testing:** RTX 5080, 16 GB VRAM (`nvidia-smi`: `16303 MiB`). This is the binding VRAM constraint for Lever 1.
+**Recovery host:** H200 (~70 GB resident model; ample system RAM). This is where the levers run in production.
+**Equivalence-test host:** RTX 5080, 16 GB VRAM (`nvidia-smi`: `16303 MiB`). Used ONLY to run the tiny (KB-scale) equivalence fixtures and CPU tests — it is NOT the recovery host and is NOT sized for the real working set. No lever's production budget is bound by the 5080.
 
 ## Tier-1 contract (applies to all four levers)
 
@@ -18,9 +19,18 @@ Threading / `lsa_pool` does NOT apply: neither path calls `linear_sum_assignment
 
 ---
 
-## Lever 1 — block_refine: hoist per-step re-upload (BIGGEST)
+## Levers 1+2 (merged) — block_refine: pinned-memory + `non_blocking=True` per-step H2D
 
 **File / function:** `max_quality/src/moe_compress/stage3/plugins/block_refine.py` → `_phase_c5_block_refine`.
+
+> **Why merged / why NO resident-hoist.** An earlier draft proposed hoisting the per-step H2D into device-resident lists (`x_s_dev`/`target_dev`) once per block. **That is infeasible at recovery scale and is dropped.** From the REAL config (`qwen36_35b_a3b_30pct.yaml`: `calibration.num_sequences=4000`, `calibration.sequence_length=4096`, `block_refine.batch_size=32`) and the model (`hidden_size=2048`, Qwen3.6-35B-A3B — verified `stage2_assignment_revision.md:293`, `stage2/profiling.py:44`), each hoisted list spans ALL `ceil(4000/32)=125` batches:
+>
+> ```
+> X_student (or teacher_targets) resident = 4000 × 4096 × 2048 × 2 bytes
+>   = 67.1 GB (62.5 GiB) per list  →  ~134 GB (125 GiB) for BOTH lists
+> ```
+>
+> On the H200 recovery host the model already occupies ~70 GB resident; adding ~134 GB of resident activations is a **guaranteed OOM**. The earlier "~4.3 GB resident" figure was ~30× too small and was internally inconsistent with the same draft's "~103 GB redundant H2D/block." The loop also CANNOT be reordered batch-outer to shrink the resident set: that would change the AdamW update order (a Tier-2 change), which is forbidden. So the per-step re-upload stays; we only make each upload faster.
 
 ### Current behavior (verified)
 The per-block training loop (lines **509–512**) re-uploads the SAME CPU tensors on every one of the `epochs * len(batches)` steps:
@@ -35,65 +45,38 @@ The per-block training loop (lines **509–512**) re-uploads the SAME CPU tensor
 - `X_student[bi]` is a constant bf16 CPU tensor for the whole block (built once at line **314** via `_capture_block_input`, mutated only at block advance, line **598**).
 - `teacher_targets[bi]` is built ONCE per block (lines **495–503** live path, or sliced from the cache at **473–476**) and is constant across all `epochs` (default 25) of that block.
 
-So across 25 epochs × `n_batches` steps, the identical H2D copy is issued ~25× per batch per block. The measurement pass reported ~103 GB redundant H2D per block and ~20% of each step's wall time.
-
-### After (restructure)
-Hoist the H2D **once per block**, before the epoch loop, into device-resident lists; index those inside the loop with no `.to()`:
-
-```
-# --- before the epoch loop, after teacher_targets is finalized (~line 504) ---
-x_s_dev      = [X_student[bi].to(device=device, dtype=student_dtype) for bi in range(len(batches))]
-target_dev   = [teacher_targets[bi].to(device=device, dtype=student_dtype) for bi in range(len(batches))]
-
-# --- inside the loop (replaces 511-512) ---
-for epoch in range(epochs):
-    for bi, _ in enumerate(batches):
-        x_s    = x_s_dev[bi]
-        target = target_dev[bi]
-        out = s_layer(x_s, **student_kwargs_all.get(layer_idx, {}))
-        ...
-
-# --- after the AdamW loop, BEFORE _advance_streams (~line 597) ---
-del x_s_dev, target_dev
-# (optional) torch.cuda.empty_cache() only if a VRAM-tight fallback is selected — see Risks.
-```
-
-**Byte-identity argument:** `Tensor.to(device, dtype)` is a pure copy/cast. Doing it once and reusing the result is bit-identical to doing it every step — the source CPU bytes never change between steps (no in-place mutation of `X_student[bi]` / `teacher_targets[bi]` inside the loop; the only mutation is at block advance, line 598, which runs AFTER `del`). The forward `s_layer(x_s, ...)`, the loss, the optimizer step, the LR schedule, and `step` increment are untouched. Identical op order, identical RNG (none in this loop), identical values.
-
-### GPU-memory cost (the binding risk on the 16 GB host)
-Resident working set per block = `x_s_dev` + `target_dev`. Each is `n_batches` tensors of shape `(batch_size, seq_len, hidden)` bf16.
-- The measurement pass cited **~2.15 GB per list, ~4.3 GB total resident per block** (2× ~2.15 GB). VERIFY at implementation time by computing `n_batches * batch_size * seq_len * hidden * 2 bytes` from the live config — the recovery config's `block_refine.batch_size`, `calibration.num_sequences`, `calibration.sequence_length`, and the model `hidden_size` set the true number. (Note: `X_student`/`teacher_targets` lists already span ALL batches in CPU RAM today; Lever 1 only changes *where* the per-block copy lives, GPU vs CPU.)
-- On the 16 GB 5080 the resident 30B-A3B student layer + teacher target forward already lives on-device; adding ~4.3 GB of resident activations must be checked against headroom. If the resident set does not fit, use the **pinned-once fallback** below.
-
-### Pinned-once fallback (VRAM-tight)
-If the full per-block resident set blows the budget: keep the lists on CPU but make them **pinned** (see Lever 2) and upload per-step with `non_blocking=True`. This recovers most of the H2D-throughput win (pinned + async) without the resident-VRAM cost. The H2D is still issued per step, but at 3.25× throughput and overlapped with compute. This is strictly a fallback — Lever 1's hoist is preferred when VRAM allows.
-
-### Free point
-`del x_s_dev, target_dev` immediately before `_advance_streams` (line 598). `_advance_streams` does its own per-batch `.to(device)` of the CPU `X_student`/`X_teacher` lists, so freeing the hoisted copies first maximizes headroom for the advance forward. Do NOT add an unconditional `torch.cuda.empty_cache()` (it serializes the stream and is a perf regression); only consider it inside the VRAM-tight fallback path.
-
----
-
-## Lever 2 — block_refine: pinned + `non_blocking` H2D
-
-**File / function:** same file; producers of the CPU bf16 lists.
-
-### Current behavior (verified)
-The CPU bf16 tensors are pageable (`.to(device="cpu")` with no `.pin_memory()`):
+These CPU bf16 tensors are **pageable** (`.to(device="cpu")` with no `.pin_memory()`):
 - `_capture_block_input._hook` (line **294**): `captured[...] = t.detach().to(dtype=torch.bfloat16, device="cpu")`.
 - live teacher target (line **503**): `teacher_targets.append(out.detach().to(dtype=torch.bfloat16, device="cpu"))`.
 - `_advance_streams` (lines **624**, **629**): `new_s/new_t.append(out_*.detach().to(dtype=torch.bfloat16, device="cpu"))`.
 
-Pageable→device copies are synchronous and ~3.25× slower than pinned async copies (measurement pass).
+Pageable→device copies are synchronous and ~3.25× slower than pinned async copies (measurement pass). Across 25 epochs × `n_batches`, the same pageable H2D is re-issued per step.
 
-### After
-1. Allocate the CPU-side tensors as **pinned** at the producer sites. Append `.pin_memory()` to the four producer `.to(..., device="cpu")` calls (294, 503, 624, 629). The cache-slice path (lines 473–476) produces views into a single large cached tensor; pin the per-batch slice copy at the consumption site instead (see below) rather than the whole cache.
-2. At the H2D site, add `non_blocking=True`. With Lever 1 applied, the H2D is the **once-per-block** hoist (`x_s_dev`/`target_dev` build) — pin those source tensors so the single bulk upload is async. Without Lever 1 (fallback path), pin + `non_blocking` on the per-step `.to()` at 511–512.
+### The deliverable: pinned source + `non_blocking=True` per-step upload
+This is a **single** change — pin and non_blocking land together (with pageable memory, `non_blocking=True` is silently synchronous, so neither helps alone):
 
-**Bound on pinned RAM:** pin only the *resident working set*, i.e. the `X_student` + `teacher_targets` + `X_teacher` lists that are live for the current block, NOT every historical block. These lists are already replaced wholesale at each block advance (line 598 reassigns `X_student, X_teacher`), so pinned RAM is bounded by `2–3 × n_batches × batch_size × seq_len × hidden × 2 bytes` — same order as the Lever 1 resident set. Pinned host RAM is non-pageable; on a many-GB working set verify the host has the headroom (the recovery host has ample system RAM; this is not the 16 GB GPU budget). If pinned-RAM pressure is observed, fall back to pinning only `x_s_dev`/`target_dev` sources for the hoisted upload and leave `X_teacher` pageable.
+1. Allocate the producer CPU tensors as **pinned**. Append `.pin_memory()` to the producer `.to(..., device="cpu")` calls (294, 503, 624, 629). The cache-slice path (lines 473–476) produces slices of one large cached tensor; pin the per-batch slice copy at the consumption site, not the whole cache.
+2. At the per-step H2D site (511–512), add `non_blocking=True`:
+   ```
+   x_s    = X_student[bi].to(device=device, dtype=student_dtype, non_blocking=True)
+   target = teacher_targets[bi].to(device=device, dtype=student_dtype, non_blocking=True)
+   ```
+The loop structure, op order, AdamW step order, LR schedule, and `step` increment are all UNCHANGED. The H2D is still issued per step (this is unavoidable without a resident hold we cannot afford); it is just ~3.25× faster per transfer and can overlap with compute on the same stream.
 
-**Byte-identity argument:** `.pin_memory()` returns a copy in pinned host memory with identical bytes; `non_blocking=True` only relaxes the host-side synchronization of the copy — PyTorch still orders the copy before the consuming kernel on the same stream, so the consumed values are identical. No numeric change.
+### Honest gain (recompute / scope at real dims)
+This is a per-transfer speedup, NOT an elimination of bytes moved. At the reduced-dim measurement the H2D was ~20% of each step; the pinned+async path takes that ~20% to ~6% (≈3.25×). **At the real recovery dims (`batch_size=32 × seq_len=4096 × hidden=2048` bf16 per per-step tensor) the H2D share SHRINKS as a fraction of the step**, because the fwd+bwd through the full MoE block (with `epochs=25`, top-k routing) grows faster than the fixed-size transfer. So the realistic end-to-end gain is **smaller than the ~20%-of-step figure suggests** — recompute the actual H2D fraction at real dims during implementation (`nvidia-smi`/profiler on the tiny→scaled fixture) and report the measured share. Do NOT claim "~103 GB eliminated" — nothing is eliminated; each per-step transfer is just faster.
 
-**Stacking:** Lever 2 stacks under Lever 1 — pin the once-uploaded copy's *source* so the single bulk H2D is both async and pinned-throughput.
+### Budget table (recomputed from REAL config dims)
+| Quantity | Formula | Value |
+|---|---|---|
+| `n_batches` | `ceil(4000 / 32)` | **125** |
+| per-step H2D tensor (`x_s` or `target`) | `32 × 4096 × 2048 × 2 B` | **0.5 GiB** |
+| full-list resident (if hoisted — INFEASIBLE) | `4000 × 4096 × 2048 × 2 B` | **62.5 GiB / 67.1 GB per list; ~134 GB both** |
+| pinned host RAM held (working set) | current block's `X_student`+`teacher_targets`+`X_teacher`, replaced at block advance (line 598) | bounded by `~3 × 62.5 GiB ≈ 188 GiB` worst-case if the full lists are pinned |
+
+**Pinned-RAM caveat (recovery host, not GPU):** pinned host memory is non-pageable. Pinning the entire `X_student`/`teacher_targets`/`X_teacher` lists is ~188 GiB worst-case — verify the H200 host's system RAM headroom before pinning the full lists. If pinned-RAM pressure appears, pin only the per-step source slices that are about to upload (a rolling pin of the current batch), or pin `X_student`/`teacher_targets` and leave `X_teacher` pageable. This is a host-RAM budget concern only; it does NOT touch the 16 GB GPU budget (the 5080 is the equivalence-test host, never the recovery host).
+
+**Byte-identity argument:** `.pin_memory()` returns a copy in pinned host memory with identical bytes; `non_blocking=True` only relaxes host-side synchronization of the copy. There are no custom CUDA streams and no RNG in this loop, so PyTorch orders the async copy before the consuming kernel on the same (default) stream — the consumed values are bit-identical. No numeric change; same op order; same `torch.equal` result.
 
 ---
 
@@ -111,20 +94,30 @@ Today the cache is **all-or-nothing at start**: `on_load` validates EVERY layer'
 
 A lazy / per-layer load moves the miss point from "before Stage 3 starts" to "during layer `i`'s consumption" — and a malformed layer `i` discovered mid-pass would be discovered AFTER layers `0..i-1` already trained against cached targets, which is FINE numerically (each layer's target is independent), but the all-or-nothing miss-detection semantic must be preserved so a partial cache never silently mixes cached + live targets in a way the operator can't see.
 
-### After — recommended design (eager-validate, lazy-materialize)
-Split the two costs that are conflated today:
-1. **Validation stays eager and all-or-nothing** (cheap, metadata-only): in `on_load`, walk the sidecars dir and validate `n_prompts_in_subset` + `n_tokens == n_prompts*seq_len` for EVERY layer using ONLY the sidecar header / shape metadata — WITHOUT materializing the reshaped `[n_prompts, seq_len, hidden]` tensor or holding the raw `hidden_states` in RAM. This requires `load_block_hidden` (or a new metadata-only helper in `cached_calibration_signals`) to expose `n_prompts_in_subset` and `hs.shape[0]` without retaining the full payload. CHECK the `BlockHiddenPayload` / `load_block_hidden` API: if it always loads the full tensor (likely, since it's a `torch.load`), add a lightweight `peek_block_hidden(jsonl_path, layer_idx) -> (n_prompts_in_subset, n_tokens, hidden)` that reads only metadata (e.g. via `torch.load(..., mmap=True)` shape inspection, or a stored header field). If a cheap metadata read is not feasible, fall back to design (b) below.
-2. **Materialization becomes lazy**: instead of populating `teacher_targets_cache` with eager tensors, populate it with a **lazy mapping** — a small object that, on `cache.get(layer_idx)`, `torch.load`s + reshapes that one layer's sidecar on demand and returns the `[n_prompts, seq_len, hidden]` tensor. Because `block_refine` reads each layer exactly once and never re-reads, a plain lazy dict (load-on-get, no caching of prior layers) holds only ~1 layer's tensor in RAM at a time (~52 GB / n_layers). The consumer's `cached.get(int(layer_idx))` call site (block_refine line 465) is unchanged.
+### Why a "metadata-only peek" (design (a)) is infeasible as Tier-1
+An earlier draft proposed validating each layer's `n_prompts_in_subset` + `n_tokens` from sidecar metadata WITHOUT materializing the tensor (a cheap "peek"). **That is not achievable in Tier-1 scope:**
+- `load_block_hidden` (`cached_calibration_signals.py:1642`) does `torch.load(path, map_location="cpu", weights_only=False)` (line **1654**) — it deserializes the WHOLE `BlockHiddenPayload`, including the full `hidden_states: [n_tokens, hidden_dim]` tensor. There is no shape-only path.
+- The manifest (written by `_write_payload_and_manifest`, ~line 303; `extra_meta={"artifact": signal_name}`, line 336) stores only `schema_version` + `size` + the artifact name — **NO `n_tokens`/`shape`/`n_prompts` field**. So a cheap n_tokens peek would require a WRITER-side manifest change (adding a shape header), which is out of Tier-1 scope.
 
-This preserves the contract: validation is still complete and up-front (operator sees a clean hit/miss decision before any training), while the 52 GB / 21 s materialization is amortized lazily over the pass.
+So design (a) is dropped. We commit to design (b) below.
 
-### Optional prefetch (only if the lazy stall per layer is material)
-Layer `i`'s `torch.load` (~52 GB / n_layers ≈ ~1–2 GB) can be prefetched on a background thread during layer `i-1`'s 25-epoch train (the train is GPU-bound; a CPU-side `torch.load` overlaps cleanly). Implement as a one-deep prefetch in the lazy mapping: when `get(i)` is called, kick a daemon thread to `torch.load(i+1)`. KEEP this OFF the byte-identity-critical path: prefetch only changes load timing, never values. Recommend deferring prefetch to a follow-up unless the per-layer lazy stall is measured to matter — the lazy-materialize step alone removes the 52 GB held-RAM and the 21 s up-front stall.
+### After — design (b): presence-validate up-front, lazy-materialize per layer
+1. **Presence validation stays eager and all-or-nothing**, but via file/manifest EXISTENCE, not tensor load: in `on_load`, for every expected `layer_idx`, resolve the sidecar path (`_resolve_sidecar_for_load`) and confirm the file + its manifest exist (and pass the existing `_validate_manifest_or_warn` schema-version check, which reads only the manifest, not the payload). If ANY layer's sidecar/manifest is absent, return `None` (full miss → live teacher forward) BEFORE any training — preserving the all-or-nothing semantic so a partial cache never silently mixes cached + live targets.
+   - **Out of scope (accepted):** shape / `n_tokens` cannot be validated up-front without the writer-side manifest change above. The existing per-layer token-count and prompt-count guards (`block_refine` lines 466–492: a cached entry whose shape/token-count mismatches **falls through to the live teacher forward for that layer with a warning**) remain the safety net for a malformed-but-present sidecar. That per-layer fall-through is already in `origin/main` and is numerically safe (each layer's target is independent).
+2. **Materialization becomes lazy**: populate `teacher_targets_cache` with a **lazy mapping** object (not an eager `dict`). On `get(layer_idx)` it `load_block_hidden`s + reshapes that one layer's sidecar on demand (`hs.reshape(n_prompts, seq_len, -1).contiguous()`, current line 278) and returns the `[n_prompts, seq_len, hidden]` tensor, then drops its own reference so the payload is freed after the consumer is done. Because `block_refine` reads each layer exactly once and never re-reads, only ~1 layer's tensor is resident at a time (~52 GB / n_layers). The consumer's `cached.get(int(layer_idx))` call site (block_refine line 465) is unchanged.
 
-### Alternative design (b) — if metadata-only peek is infeasible
-If `load_block_hidden` cannot be made to peek cheaply, keep `_load_layers` eager for VALIDATION (it must read each sidecar to validate), but DON'T retain the reshaped tensors: validate each, then `del` the payload, and store in `teacher_targets_cache` a lazy loader keyed by `(jsonl_path, layer_idx)` that re-loads on `get`. This still removes the 52 GB held-RAM (only one layer materialized at a time) but does NOT remove the ~21 s up-front validation stall (each sidecar is read once for validation). The held-RAM win is the larger one; accept the stall if the peek is infeasible.
+**What this wins:** removes the ~52 GB held-RAM (only one layer materialized at a time — the LARGER win), and because presence validation is cheap (stat + manifest read, no payload load) the ~21 s eager-load up-front stall is also largely eliminated.
 
-**Byte-identity argument:** the cached tensor returned by `get(layer_idx)` is the SAME reshaped `[n_prompts, seq_len, hidden]` bf16 tensor (same `hs.reshape(n_prompts, seq_len, -1).contiguous()`, line 278) whether materialized eagerly or lazily. `block_refine` slices it identically (lines 473–476). No value change; only allocation timing.
+### Lazy-mapping contract (MUST implement `__len__` and `.get`)
+The orchestrator (`stage3/orchestrator.py:710`) logs `len(run_ctx.get("teacher_targets_cache"))` on a HIT, and `block_refine` (line 465) reads via `.get(int(layer_idx))` (NOT `[]`). The lazy mapping MUST therefore expose:
+- `__len__()` → the validated layer count, computed from the presence scan WITHOUT materializing any tensor.
+- `.get(layer_idx)` → the lazily-loaded `[n_prompts, seq_len, hidden]` tensor for a present key, and **`None` for an absent key** (matching `dict.get` semantics block_refine relies on).
+Add both to the lazy-mapping unit assertions (see Verification gates): assert `len(mapping) == n_layers` before any `.get`, and `mapping.get(absent_idx) is None`.
+
+### Optional prefetch (deferred)
+Layer `i`'s `load_block_hidden` (~52 GB / n_layers ≈ ~1–2 GB) could be prefetched on a daemon thread during layer `i-1`'s 25-epoch train (train is GPU-bound; a CPU-side load overlaps cleanly). One-deep only (≤2 layers resident). KEEP off the byte-identity-critical path — prefetch changes load timing, never values. Defer to a follow-up unless the per-layer lazy stall is measured to matter; the lazy-materialize step alone removes the held-RAM and the up-front stall.
+
+**Byte-identity argument:** the tensor returned by `get(layer_idx)` is the SAME reshaped `[n_prompts, seq_len, hidden]` bf16 tensor (same `hs.reshape(n_prompts, seq_len, -1).contiguous()`, line 278) whether materialized eagerly or lazily. `block_refine` slices it identically (lines 473–476). No value change; only allocation timing.
 
 ---
 
@@ -142,8 +135,10 @@ The v1-waste note in the docstring (lines 499–505) already flags this and pres
 - `pre_merge_snapshot` runs in `_STAGE2_POST_ASSIGN_PHASES` (`orchestrator.py` line **205**, first phase), walked at line **1568** — AFTER `_run_assignment`. So `grouped` IS in ctx when the snapshot hook fires. ✓
 - `grouped` shape (verified `stage2/grouping.py:63` `_build_grouped_from_assignment`): `{centroid_id: [centroid_id, *absorbed_member_ids]}`. Orphan non-centroids are promoted to singleton groups (`_promote_orphans`, grouping.py). So `set().union(*grouped.values())` = every centroid + every assigned/promoted child = EXACTLY the experts that any `_distill_merged_group` call can read via `members`.
 
-### `reads` declaration (correction to the task brief)
-The brief says "the plan must add `grouped` to the snapshot hook's `reads`". **`grouped` is ALREADY in the plugin-level `reads` tuple** (`expert_distill.py` line **896**: `"layer_ref", "pre_merge_weights", "grouped", "freq", "layer_input_acc"`). So no `reads` change is needed — the registry contract already declares it. What IS needed is for the `pre_merge_snapshot` hook BODY (currently reads only `layer_ref`, line 999) to also `ctx.get("grouped")` and pass it down. Confirm `grouped` is set-once-before-read in the registry's ordering check (it is: set at orch 1567/608, read at orch 1568) so the read does not trip a "read-before-write" registry assertion.
+### `reads` declaration (advisory only — do NOT add a redundant entry)
+The `reads`/`writes` tuples are **ADVISORY**: `pipeline/plugin.py:29–30` describes them as enabling "a future static check that every plugin reads keys some prior [plugin writes]" — there is NO static gate today. What actually enforces correctness at runtime is `ctx.get` raising a `KeyError` if a key was never `set`. So whether `grouped` appears in `reads` is **irrelevant to safety**; what matters is the runtime ordering: `grouped` is `set` (orch:608, inside `_run_assignment` called at orch:1567) strictly BEFORE it is read (the post-assign phase walk at orch:1568). That ordering IS safe.
+
+`grouped` already happens to be in the plugin-level `reads` tuple (`expert_distill.py:895–897`: `"layer_ref", "pre_merge_weights", "grouped", "freq", "layer_input_acc"`), but do NOT treat that as load-bearing and do NOT add any further `reads` entry "for the gate" — there is no gate. The ONLY required change is the `pre_merge_snapshot` hook BODY (currently reads only `layer_ref`, line 999) calling `ctx.get("grouped")` and passing it down.
 
 ### After
 1. Add an optional `members` param to the helper (keeps the existing 1-arg test call `_snapshot_pre_merge_layer_experts(layer_ref)` working — see test gate):
@@ -179,11 +174,10 @@ pre_merge_weights = (
 ## Ordering
 
 1. **Lever 4** first — fully self-contained, covered by behavioral tests, lowest risk, smallest diff. Lands and verifies independently.
-2. **Lever 3** second — independent file, contract-sensitive but no interaction with Levers 1/2.
-3. **Lever 1** third — the big win; needs the new bit-identity gate test (below) in place first.
-4. **Lever 2** last — stacks under Lever 1 (pin the hoisted source). Implementing after Lever 1 means the pin sites are the once-per-block upload, not the per-step path.
+2. **Lever 3** second — independent file, contract-sensitive but no interaction with Levers 1+2.
+3. **Levers 1+2** last (single deliverable) — pinned-memory + `non_blocking=True` per-step H2D land together (pin+non_blocking are inseparable; pageable+non_blocking is silently sync). Needs the new block_refine bit-identity harness (build-from-scratch — the largest implementation cost) in place first.
 
-Rationale: ascending risk / ascending need-for-new-gate. Lever 4 and Lever 3 are gated by existing/extendable behavioral tests; Levers 1+2 need the new block_refine bit-identity harness, so build that once and land 1+2 against it.
+Rationale: ascending risk / ascending need-for-new-gate. Lever 4 and Lever 3 are gated by existing/extendable behavioral tests; Levers 1+2 need the new from-scratch block_refine bit-identity harness, so build that once and land 1+2 against it.
 
 ---
 
@@ -191,30 +185,36 @@ Rationale: ascending risk / ascending need-for-new-gate. Lever 4 and Lever 3 are
 
 ### Lever 4 (byte-identical; existing behavioral tests + one new equality test)
 - Existing: `max_quality/tests/test_stage2_expert_distill.py`, `test_stage2_plugin_expert_distill.py`.
-- **CAUTION:** `test_snapshot_pre_merge_layer_experts_makes_independent_cpu_clones` (test file lines 106–129) asserts `set(snap.keys()) == set(range(n))` — i.e. it asserts the FULL snapshot. The optional-`members`-defaults-to-None signature keeps this test green (it calls `_snapshot_pre_merge_layer_experts(layer_ref)` with no `members`). Do NOT change that test's call; the narrowing only happens on the plugin path where `grouped` is passed.
+- **CAUTION:** the FULL-snapshot guard `set(snap.keys()) == set(range(n))` is in **`test_stage2_expert_distill.py`** (test `test_snapshot_pre_merge_layer_experts_makes_independent_cpu_clones`, def at line **106**, the `set(...)==set(range(n))` assert at line **115**) — NOT in `test_stage2_plugin_expert_distill.py`. The optional-`members`-defaults-to-None signature keeps it green (it calls `_snapshot_pre_merge_layer_experts(layer_ref)` with no `members`). Do NOT change that test's call; the narrowing only happens on the plugin path where `grouped` is passed.
+- **MANY other bare callers:** `_snapshot_pre_merge_layer_experts(layer_ref)` is called with no `members` in numerous other tests across BOTH files — `test_stage2_expert_distill.py:185,224,267` and `test_stage2_plugin_expert_distill.py:196,292,305,336,370,381,456,469,509,556,567,614`. All rely on the default-None full-snapshot behavior; the optional-`members=None` default preserves every one of them unchanged.
 - **NEW test** (`test_stage2_plugin_expert_distill.py`): drive `ExpertDistillPlugin.pre_merge_snapshot` + `merge` on the `tiny_model` fixture with a known `grouped` in ctx, once with the narrowed snapshot (production path) and once forcing a FULL snapshot (`members=None`), and assert the resulting distilled bank weights (`distill_state` + the written-back `gate/up/down` for each centroid) are **bit-identical** (`torch.equal`). This proves the narrowing is a pure dead-key removal. Seed RNG identically for both runs.
 
 ### Lever 3 (byte-identical; extend existing cache tests)
 - Existing: `max_quality/tests/test_stage3_block_hidden_cache.py` (covers `test_load_miss_no_dir`, `test_load_hit_populates_teacher_targets_cache`, `test_token_count_mismatch_falls_through_to_miss`, `test_prompt_count_divergence_falls_through_to_miss`, `test_c1_batch_size_decoupled`).
 - **NEW tests:**
   - `test_lazy_get_returns_same_tensor_as_eager`: build sidecars, call `on_load`, then `cache.get(layer_idx)` for each layer; assert each returned tensor `torch.equal` to the eager `hs.reshape(n_prompts, seq_len, -1).contiguous()`.
-  - `test_partial_cache_still_all_or_nothing_miss`: corrupt ONE layer's token-count; assert `on_load` returns `None` (full miss) BEFORE any training — i.e. the validation stays eager/all-or-nothing. This is the contract-preservation gate.
+  - `test_lazy_mapping_len_and_get_contract`: after `on_load`, assert `len(cache) == n_layers` WITHOUT having materialized any tensor (the `len` must come from the presence scan, matching the orchestrator:710 HIT-log call), and assert `cache.get(absent_idx) is None` for a key not present (matching block_refine:465 `.get` semantics).
+  - `test_partial_cache_still_all_or_nothing_miss`: remove ONE layer's sidecar/manifest; assert `on_load` returns `None` (full miss) BEFORE any training — i.e. presence validation stays eager/all-or-nothing. This is the contract-preservation gate.
   - (if prefetch is implemented) `test_prefetch_does_not_change_values`: same as the first test with prefetch enabled.
 - These run on CPU; no GPU needed.
 
-### Levers 1 + 2 (NO existing byte-identical golden — build the gate)
-The Stage 3 golden snapshot (`test_stage3_golden_snapshot.py`) runs with `block_refine` **OFF** (docstring lines 18–22: "captured with `block_refine` OFF"). So it CANNOT gate Levers 1–3 of block_refine. The mechanism-only argument (above) is necessary but NOT sufficient — build the real gate:
+### Levers 1 + 2 (NO existing byte-identical golden AND no existing driver — build BOTH from scratch — LARGEST implementation cost)
+The Stage 3 golden snapshot (`test_stage3_golden_snapshot.py`) runs with `block_refine` **OFF** (docstring lines 18–22: "captured with `block_refine` OFF"), so it CANNOT gate the block_refine changes. The mechanism-only argument (above) is necessary but NOT sufficient.
+
+**There is NO existing harness to reuse.** `test_stage3_plugin_block_refine.py` is import/re-export/metadata/protocol/gate assertions ONLY (`test_block_refine_module_imports`, `test_monolith_reexports_block_refine_symbols`, `test_plugin_satisfies_protocol`, `test_plugin_metadata`, `test_plugin_is_enabled_gates`, `test_plugin_has_refine_blocks_hook`) — **NONE of them invoke `_phase_c5_block_refine` or build a runnable model**, there is no `tiny_model` fixture there, and no `model(input_ids=...)` forward. So "reuse the tiny_model fixture" is wrong. The harness must be **built from scratch** — acknowledge this as the single largest implementation cost of the whole plan.
 
 - **NEW test** `max_quality/tests/test_stage3_block_refine_optimized_equiv.py`:
-  1. Tiny fixture: a small synthetic decoder stack with a `FactoredExperts` MoE layer (reuse the `tiny_model` Stage 3 fixture / the same construction `test_stage3_plugin_block_refine.py` uses for plumbing), a small `calib_tensor`, `epochs` small (e.g. 2) but `> 1` so the hoist's "reuse across epochs" path is exercised, `batch_size` such that `n_batches >= 2`.
+  1. **Build a synthetic student+teacher decoder stack** with `FactoredExperts` MoE layers that:
+     - runs `model(input_ids=...)` forwards (required by `_capture_block_input` / `_capture_first_pass`, which register forward hooks and run the model),
+     - supports `iter_decoder_layers` (the driver walks decoder layers),
+     - satisfies the **14-arg `_phase_c5_block_refine` keyword contract** (`block_refine.py:165–181`: positional `student, teacher, moe_layers, teacher_moe_layers, calib_tensor` + keyword-only `batch_size, learning_rate, epochs, warmup_ratio, weight_decay, artifacts_dir, no_resume, device, teacher_targets_cache=None`).
+     Use a small `calib_tensor`, `epochs > 1` (e.g. 2) so the per-step re-upload is exercised across epochs, and `batch_size` such that `n_batches >= 2`.
   2. Run `_phase_c5_block_refine` to completion under a deterministic seed and snapshot the trained `FactoredExperts` U/V slots + the four RMSNorm scales (`input_layernorm`, `post_attention_layernorm`, `self_attn.q_norm`, `self_attn.k_norm`).
-  3. **Compare old vs new code path.** Two viable mechanizations:
-     - (preferred) Parametrize a single test over a module-level flag / monkeypatch-free toggle that selects the hoisted-upload path vs the legacy per-step path. **No monkeypatching production code** (project rule). Implement the toggle as an explicit kwarg or a tiny internal branch added WITH the optimization, defaulting to the optimized path, with the legacy path retained behind the kwarg ONLY for the test — OR
-     - (cleaner, recommended) Capture a GOLDEN of the trained factors from `origin/main`'s pre-optimization code FIRST (run the new test against `origin/main` once, save the state_dict tensors as a golden artifact under `max_quality/tests/golden/stage3_block_refine/`), then assert the post-optimization run reproduces it bit-identically via `torch.equal`. Same determinism caveat as the existing golden (same wheel / same host for seed + verify; document it in the test docstring).
+  3. **Compare old vs new code path via captured golden (no production toggle/monkeypatch — project rule).** Capture a GOLDEN of the trained factors from `origin/main`'s pre-optimization code FIRST (run the harness against `origin/main` once, save the state_dict tensors under `max_quality/tests/golden/stage3_block_refine/`), then assert the post-optimization run reproduces it bit-identically via `torch.equal`. Do NOT add a production toggle/branch just for the test, and do NOT `monkeypatch.setattr` production code. Document the same determinism caveat as the existing golden (same wheel / same host for capture + verify).
   4. Assert `torch.equal` on every trained tensor (U/V for each MATRIX_NAME, all 4 norms). bf16 trained factors are restored to original dtype at lines 538–542; compare in that final dtype.
-  5. Run BOTH the live-teacher-target path AND the cache-hit path (`teacher_targets_cache` populated) so the hoist is verified for both target sources.
-- **Determinism note:** PyTorch CPU/GPU op order is unchanged by Levers 1+2, so `torch.equal` (not `allclose`) is the correct assertion. If a GPU non-determinism surfaces (it should not, since op order is identical), that is a RED FLAG that the change is not actually mechanism-only — investigate, do not relax to `allclose`.
-- The golden-capture variant is preferred because it pins against the ACTUAL pre-change bytes, not a re-derivation. Capture it from `origin/main` (this base) before touching block_refine.
+  5. **SELF-VERIFY the pinned path is actually exercised:** the harness MUST assert `epochs > 1` AND `n_batches >= 2` (so the per-step pinned+async H2D fires repeatedly), and MUST cover **BOTH the live-teacher-target path AND the cache-hit path** (`teacher_targets_cache` populated) so the pinned upload is verified for both target sources.
+- **Determinism note:** PyTorch CPU/GPU op order is unchanged by Levers 1+2, so `torch.equal` (not `allclose`) is the correct assertion. If GPU non-determinism surfaces (it should not — op order is identical), that is a RED FLAG that the change is not actually mechanism-only; investigate, do not relax to `allclose`.
+- Capture the golden from `origin/main` (this base) before touching block_refine.
 
 ### Full-suite regression
 After all four levers: run the Stage 2 + Stage 3 test suites (`pytest max_quality/tests/test_stage2_expert_distill.py max_quality/tests/test_stage2_plugin_expert_distill.py max_quality/tests/test_stage3_block_hidden_cache.py max_quality/tests/test_stage3_plugin_block_refine.py max_quality/tests/test_stage3_golden_snapshot.py max_quality/tests/test_stage3_block_refine_optimized_equiv.py -v`) plus the existing Stage 3 golden (must remain byte-identical since block_refine is OFF there — proves no accidental change to the OFF path).
@@ -225,12 +225,13 @@ After all four levers: run the Stage 2 + Stage 3 test suites (`pytest max_qualit
 
 | Lever | Risk | Mitigation / rollback |
 |---|---|---|
-| 1 | **GPU OOM on 16 GB 5080** from ~4.3 GB resident per-block working set on top of the resident student+teacher layers. | Compute the exact resident bytes from the live config before enabling on-host. If it doesn't fit, use the pinned-once fallback (Lever 2 path, per-step async H2D — keeps the throughput win, drops the resident cost). Rollback: revert the hoist, keep per-step `.to()`. |
-| 1 | `del` placement wrong → tensors freed before last use, or held into `_advance_streams` reducing advance headroom. | `del x_s_dev, target_dev` strictly AFTER the epoch loop and BEFORE `_advance_streams` (line 598). Covered by the equivalence test (a premature free would crash or change values). |
-| 1 | Resume-from-checkpoint path (lines 339–371) does NOT hit the hoist (it `continue`s before the train loop). | No change needed there; the hoist is only in the train branch. Verify the resume test still passes. |
-| 2 | **Pinned host RAM pressure** — pinned memory is non-pageable. | Bound to the current block's working set (lists are replaced at block advance). If pressure observed, pin only the Lever-1 hoist source (`x_s_dev`/`target_dev`), leave `X_teacher` pageable. Rollback: drop `.pin_memory()`, keep `non_blocking=False`. |
+| 1+2 | **Pinned host RAM pressure** on the H200 recovery host — pinned memory is non-pageable; pinning the full `X_student`/`teacher_targets`/`X_teacher` lists is ~188 GiB worst-case. | Verify the host's system-RAM headroom before pinning the full lists. If pressure appears, pin only the per-step source slice about to upload (rolling pin), or pin `X_student`/`teacher_targets` and leave `X_teacher` pageable. This is a HOST-RAM concern; it never touches the 16 GB GPU budget (the 5080 is the equivalence-test host only). Rollback: drop `.pin_memory()` + `non_blocking=True`, revert to the pageable per-step `.to()`. |
+| 1+2 | `non_blocking=True` on pageable (un-pinned) memory is **silently synchronous** — pin + non_blocking must land TOGETHER or there is no gain. | They are a single commit; the equivalence harness's `epochs>1`+`n_batches>=2` self-check exercises the repeated per-step upload. |
+| 1+2 | Resume-from-checkpoint path (lines 339–371) `continue`s before the train loop. | No change needed there; the pinned/async upload is only in the per-step train branch. Verify the resume test still passes. |
+| 1+2 | Real end-to-end gain is **smaller than "~20% of step"** and shrinks at real dims (fixed H2D vs growing fwd+bwd). | Recompute the measured H2D fraction at real recovery dims during implementation; report the measured share, do NOT claim "~103 GB eliminated" (nothing is eliminated — each per-step transfer is just faster). |
 | 3 | **Miss-detection contract regression** — a partial/lazy cache silently mixing cached + live targets. | Validation stays eager & all-or-nothing (design step 1). NEW test `test_partial_cache_still_all_or_nothing_miss` is the explicit gate. Rollback: revert to eager materialize (current code). |
-| 3 | `load_block_hidden` may not support cheap metadata peek → can't avoid the 21 s stall. | Fall to alternative design (b): eager validate (accept stall), lazy materialize (kill the 52 GB held-RAM, the bigger win). |
+| 3 | `load_block_hidden` cannot peek shape/`n_tokens` cheaply (it deserializes the whole payload; manifest has no shape field). | Design committed to (b): presence-validate up-front (stat + manifest, no payload load), lazy-materialize per layer (kills the 52 GB held-RAM AND largely kills the 21 s stall). Shape validation stays out of scope — the existing per-layer fall-through guard (block_refine 466–492) covers a malformed-but-present sidecar. |
+| 3 | Lazy mapping missing `__len__`/`.get` → orchestrator:710 `len(...)` HIT-log crashes, or block_refine:465 `.get` mis-behaves. | Lazy-mapping contract mandates `__len__` (validated layer count, no materialize) + `.get(idx)` returning `None` for absent keys; unit-asserted. |
 | 3 | Background prefetch thread races / holds an extra layer in RAM. | Prefetch is OPTIONAL and deferred; one-deep only (≤2 layers resident). Recommend shipping lazy-materialize without prefetch first. |
 | 4 | `grouped` empty/None at snapshot time → narrowing drops everything. | `if grouped` guard falls back to full snapshot. Verified `grouped` is set (orch 608) before the phase (orch 1568); the guard is defensive only. |
 | 4 | Existing `set(snap.keys()) == set(range(n))` test breaks. | Optional `members=None` default preserves the full-snapshot signature; the existing test passes unchanged. |
@@ -239,24 +240,25 @@ After all four levers: run the Stage 2 + Stage 3 test suites (`pytest max_qualit
 
 ---
 
-## Testing plan on the host RTX 5080 (16 GB)
+## Testing plan on the equivalence-test host RTX 5080 (16 GB)
+
+> The 5080 is the EQUIVALENCE-TEST host (tiny KB-scale fixtures only). The recovery run is on the H200. No lever's production budget is bound by the 5080.
 
 1. **CPU-only tests** (Levers 3 + 4 + the equivalence harness's CPU mode): `pytest` the listed files. No VRAM concern.
-2. **Lever 1 VRAM budget check (BEFORE enabling on a real run):** compute resident bytes from the live recovery config (`n_batches * batch_size * seq_len * hidden_size * 2 * 2` for both lists) and compare to `nvidia-smi` free VRAM with the student+teacher layer resident. If the equivalence test fixture is tiny it won't reveal OOM — so this is a manual arithmetic gate, documented in the implementation PR, not a unit test.
-3. **Equivalence test on GPU** (if the host can run the tiny fixture on CUDA): run `test_stage3_block_refine_optimized_equiv.py` with `device=cuda` to exercise the real H2D path; `torch.equal` must hold. The tiny fixture's working set is KB-scale, so no OOM risk there.
+2. **Levers 1+2 host-RAM sanity (BEFORE enabling on the real run):** the pinned working set is a HOST-RAM concern on the H200, not a GPU budget. Verify the recovery host's system-RAM headroom against the pinned lists (worst-case ~188 GiB if all of `X_student`/`teacher_targets`/`X_teacher` are pinned; the per-step GPU tensor is only ~0.5 GiB). There is NO resident-hoist, so there is no per-block GPU OOM gate to compute. This is a documented manual host-RAM check, not a unit test.
+3. **Equivalence test on GPU** (if the host can run the tiny fixture on CUDA): run `test_stage3_block_refine_optimized_equiv.py` with `device=cuda` to exercise the real pinned+async H2D path; `torch.equal` must hold. The tiny fixture's working set is KB-scale, so no OOM risk there.
 4. **Golden non-regression:** `test_stage3_golden_snapshot.py` (block_refine OFF) must stay byte-identical — proves the OFF path is untouched.
-5. Capture the Lever-1/2 golden artifact from `origin/main` (this base) on THIS host before any block_refine edit, so seed and verify share wheel + platform (existing golden determinism caveat).
+5. Capture the Levers-1+2 golden artifact from `origin/main` (this base) on THIS host before any block_refine edit, so capture and verify share wheel + platform (existing golden determinism caveat).
 
 ---
 
 ## Section-by-section outline (for the report)
 
 1. Tier-1 contract
-2. Lever 1 — block_refine per-step re-upload hoist (current 509–512, after-sketch, ~4.3 GB resident budget on 16 GB host, pinned-once fallback, free at 598)
-3. Lever 2 — block_refine pinned + non_blocking H2D (producers 294/503/624/629, bounds pinned RAM to the block working set, stacks under Lever 1)
-4. Lever 3 — block_hidden_cache lazy/prefetch (eager-validate / lazy-materialize, preserves all-or-nothing miss contract, optional one-deep prefetch deferred)
-5. Lever 4 — expert_distill snapshot→members (helper 489–515 + hook 999–1008; `grouped` ALREADY in reads line 896; narrow via `set().union(*grouped.values())`)
-6. Ordering (4 → 3 → 1 → 2)
-7. Verification gates (Lever 4 equality test; Lever 3 lazy+all-or-nothing tests; Levers 1+2 NEW bit-identity golden harness — the real gate; no-monkeypatch toggle/golden capture from origin/main)
-8. Risks & rollback (Lever-1 GPU budget; Lever-3 miss contract; per-lever independent revert)
-9. Host RTX 5080 testing plan
+2. Levers 1+2 (merged) — block_refine pinned-memory + `non_blocking=True` per-step H2D (current 509–512, producers 294/503/624/629; NO resident-hoist — ~134 GB both-lists is a guaranteed H200 OOM; honest per-transfer ~3.25× gain that shrinks at real dims; budget table from real config)
+3. Lever 3 — block_hidden_cache lazy-materialize (design (b): presence-validate up-front + lazy per-layer materialize; metadata peek infeasible — `torch.load weights_only=False` + no shape in manifest; lazy-mapping `__len__`/`.get` contract; preserves all-or-nothing presence miss; optional one-deep prefetch deferred)
+4. Lever 4 — expert_distill snapshot→members (helper 489–515 + hook 999–1008; `reads` is ADVISORY only — runtime ordering orch:608<orch:1568 is what's safe; narrow via `set().union(*grouped.values())`)
+5. Ordering (4 → 3 → 1+2)
+6. Verification gates (Lever 4 equality test; Lever 3 lazy + `__len__`/`.get` + all-or-nothing presence tests; Levers 1+2 build-from-scratch bit-identity golden harness — the real gate AND the largest implementation cost; no toggle/monkeypatch, golden captured from origin/main)
+7. Risks & rollback (Levers 1+2 host-RAM pinned pressure; Lever-3 presence miss + lazy-mapping contract; per-lever independent revert)
+8. Equivalence-test host RTX 5080 testing plan
