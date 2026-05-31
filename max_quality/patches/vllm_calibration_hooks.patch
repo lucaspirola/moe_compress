@@ -10479,7 +10479,7 @@ new file mode 100644
 index 0000000..0000001
 --- /dev/null
 +++ b/vllm/calibration_wanda_scalar_row.py
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,484 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert, matrix) Wanda ``scalar_row`` calibration capture.
@@ -10909,8 +10909,18 @@ index 0000000..0000001
 +        "token_counts": dict(_WANDA_TOKEN_COUNTS),
 +    }
 +    tmp = ckpt_path + ".tmp"
-+    torch.save(payload, tmp)
++    with open(tmp, "wb") as f:
++        torch.save(payload, f)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, ckpt_path)
++    _dir_fd = os.open(os.path.dirname(ckpt_path) or ".", os.O_RDONLY)
++    try:
++        os.fsync(_dir_fd)
++    except OSError:
++        pass
++    finally:
++        os.close(_dir_fd)
 +
 +
 +def load_wanda_scalar_row_checkpoint(ckpt_path: str) -> int:
