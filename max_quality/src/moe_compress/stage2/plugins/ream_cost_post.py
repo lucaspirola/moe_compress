@@ -177,11 +177,18 @@ def _post_alignment_cost(
     # Per-layer eigen-sqrt cache. Bounded by N centroids × 1 matrix per axis.
     a_sqrt_cache = CovSqrtCache(max_entries=2 * n_c + 8)
 
-    def _get_a_sqrt(eid: int, name: str) -> torch.Tensor:
+    def _get_a_sqrt(eid: int, name: str, *, relink: bool = True) -> torch.Tensor:
         if whitening_mode == "none":
             return torch.tensor(1.0)
         key = (li, eid, name, whitening_mode)
-        cached = a_sqrt_cache.get(key)
+        # ``relink=False`` reads the backing dict directly (no LRU ``move_to_end``
+        # mutation). The threaded row loop passes it so concurrent workers issue
+        # a plain, lock-free read instead of a read-modify-write on the cache's
+        # OrderedDict — see the prewarm note above (D3). Byte-identical: the same
+        # tensor is returned; only the LRU bookkeeping is skipped, and no eviction
+        # can occur because the prewarm set (2*n_c keys) is below max_entries
+        # (2*n_c+8). The serial/prewarm callers keep the relinking ``.get()``.
+        cached = a_sqrt_cache._store.get(key) if not relink else a_sqrt_cache.get(key)
         if cached is not None:
             return cached
         # InputCovarianceAccumulator stores covariance under the (layer, expert,
@@ -232,6 +239,8 @@ def _post_alignment_cost(
 
         def _warm(key):
             c_id, name = key
+            # torch.no_grad() is thread-local, so each pool worker must enter it
+            # itself (same rationale as _solve_row below).
             with torch.no_grad():
                 _get_a_sqrt(c_id, name)  # populates a_sqrt_cache as a side effect
 
@@ -305,8 +314,8 @@ def _post_alignment_cost(
                     # across EM rounds; otherwise we'd need to recompute A from
                     # scratch each round. For whitening_mode == "full" the a_sqrt
                     # was pre-warmed above ⇒ this is a lock-free cache read.
-                    a_sqrt_gate_up = _get_a_sqrt(c_id, "gate_proj")
-                    a_sqrt_down    = _get_a_sqrt(c_id, "down_proj")
+                    a_sqrt_gate_up = _get_a_sqrt(c_id, "gate_proj", relink=False)
+                    a_sqrt_down    = _get_a_sqrt(c_id, "down_proj", relink=False)
                     residual = _aligned_whitened_residual(
                         ref_gate=ref_gate, ref_up=ref_up, ref_down=ref_down,
                         child_gate=child_gate, child_up=child_up, child_down=child_down,
