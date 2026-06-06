@@ -162,6 +162,57 @@ def _trace_cache_key_vllm(
 # ---------------------------------------------------------------------------
 
 
+def _harden_runtime_env(output_path: str, dtype: str) -> None:
+    """Apply operational fixes learned running this driver on fresh cloud GPU
+    boxes (see ``docs/calibration_vllm_runbook.md``).
+
+    All of these are SAFE: they touch only the build/cache environment, never
+    the sampling path, so generated tokens and the trace cache_key are
+    unchanged.
+
+    1. Cap JIT-compiler fan-out. The first forward pass JIT-compiles the
+       FlashInfer GDN (gated-delta-net) prefill kernel, spawning one ``cicc``
+       (CUDA compiler) per translation unit — uncapped that is ~one per vCPU,
+       each ~6 GB RSS, which host-RAM-OOM-kills the run on a 180 GB box.
+       ``MAX_JOBS`` caps the fan-out; ``NVCC_THREADS=1`` keeps per-job RSS low.
+    2. Persist the vLLM / torch.compile cache next to the output (durable
+       storage) so a restart after a spot preemption skips recompilation.
+    3. Warn about the two host prerequisites that fail loudly and late:
+       missing ``python3-dev`` (no ``Python.h`` -> the kernel JIT cc fails) and
+       a present-but-incompatible ``kernels`` package (needed only for an FP8
+       teacher; with a non-FP8 teacher it can break ``from vllm import LLM``).
+
+    Idempotent and override-friendly: every env var uses ``setdefault`` so an
+    operator can still pin their own values.
+    """
+    import importlib.util
+    import sysconfig
+
+    cpu = os.cpu_count() or 8
+    os.environ.setdefault("MAX_JOBS", str(max(1, min(16, cpu // 2))))
+    os.environ.setdefault("NVCC_THREADS", "1")
+    if "VLLM_CACHE_ROOT" not in os.environ:
+        cache_dir = Path(output_path).resolve().parent / ".vllm_compile_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["VLLM_CACHE_ROOT"] = str(cache_dir)
+    log.info("runtime env: MAX_JOBS=%s NVCC_THREADS=%s VLLM_CACHE_ROOT=%s",
+             os.environ["MAX_JOBS"], os.environ["NVCC_THREADS"],
+             os.environ["VLLM_CACHE_ROOT"])
+
+    py_h = Path(sysconfig.get_path("include")) / "Python.h"
+    if not py_h.exists():
+        log.warning("Python.h not found at %s — the FlashInfer GDN kernel JIT "
+                    "will fail to compile. Install the python dev headers "
+                    "(e.g. `apt-get install python3-dev`).", py_h)
+
+    if dtype != "fp8" and importlib.util.find_spec("kernels") is not None:
+        log.warning("`kernels` is installed but teacher dtype is %s (not fp8). "
+                    "With some transformers versions this makes "
+                    "`from vllm import LLM` raise during the hub-kernels "
+                    "import. If vLLM import fails, `pip uninstall -y kernels`.",
+                    dtype)
+
+
 def _load_teacher_vllm(
     repo: str, revision: str, dtype: str,
     gpu_memory_utilization: float, max_model_len: int,
@@ -1103,6 +1154,10 @@ def main() -> int:
                         "automatically if it exists (including the "
                         "subset-closed flag).")
     args = p.parse_args()
+
+    # Apply operational env hardening (compile-OOM cap, durable compile cache,
+    # host-prereq warnings) before any vllm.* import. Safe: build/cache only.
+    _harden_runtime_env(args.output, args.dtype)
 
     # Pre-import env gates for the imatrix path. These MUST be set before any
     # vllm.* import because vllm.calibration_hooks samples them at module

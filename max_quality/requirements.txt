@@ -20,6 +20,12 @@ einops>=0.8.0
 # quant) when loading Qwen3.6-35B-A3B-FP8 as the Stage 2.5 KD teacher.
 # Without this, the first forward pass through an FP8 linear layer raises
 # ImportError("finegrained-fp8 kernel requires the `kernels` package").
+# CAVEAT (vLLM calibration path): `kernels` is needed ONLY for an FP8 teacher.
+# With a non-FP8 (bf16) teacher, some `kernels`/`transformers` combinations make
+# `from vllm import LLM` raise during transformers' hub-kernels import
+# ("Either a revision or a version must be specified"). For the bf16 vLLM
+# self-traces run, uninstall it (scripts/run_calib_vllm.sh does this) — see
+# docs/calibration_vllm_runbook.md.
 kernels>=0.14.0
 
 # --- Hugging Face plumbing ---
