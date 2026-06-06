@@ -446,15 +446,23 @@ fallback command in the run README/log.
 ---
 ## RESOLUTIONS (user decisions 2026-06-06) — scope LOCKED, no open questions
 
-6 models, ALL on qwen3-pretrain-mix-v2, 35% fewer experts (keep round(0.65*256)=166/layer):
+6 models, ALL on qwen3-pretrain-mix-v2, 35% fewer experts. **Single survivor count
+K for BOTH groups: drop = round(0.35 × 256) = 90 → KEEP 166/layer** (see
+PLAN-REVIEW §R1 for the REAP fix this requires).
 - Group REAP (by-the-book): prune_mode=faithful_prune, prune_fraction=0.35
-- Group REAM (by-the-book): direct merge_size=166 knob (OD-1 — mirrors upstream `--merge_size`, an ABSOLUTE per-layer kept count; bypass GRAPE, parallel to REAP's prune_fraction). Confirmed from SamsungSAILMontreal/ream merge.py `--merge_size` + ream/ream.py pseudo_group(k=...).
+- Group REAM (by-the-book): direct merge_size=166 knob (OD-1 — mirrors upstream
+  `--merge_size`, an ABSOLUTE per-layer kept count; bypass GRAPE, parallel to
+  REAP's prune_fraction). Confirmed from SamsungSAILMontreal/ream
+  `merge.py --merge_size` (default 96, `merger.py:32`) + `ream/ream.py`
+  `pseudo_group(k=...)`. **This knob is already implemented on the branch** —
+  see PLAN-REVIEW §R2.
 - Each group: base (no heal) + stage-2.5-heal + RKD-heal = 3 per group → 6 total.
   - "stage-2.5 healing" = CURRENT production router-KD (default dials, our calib; rkd_recipe absent).
   - "RKD healing" = rkd_paper_recipe paper_dials_only (paper dials, our calib; NO wikitext).
   - merge_repair is NOT involved (was my confusion; closed).
 - OD-2 naming: HF dataset/model repos pirola/calib-v2-probe-{reap,ream}-{base,heal25,rkd}; stage6alt eval on wikitext each.
-- OD-4: add a real per-stage enable toggle (heal/Stage-5 ON while SVD/Stage-3/4 OFF) — replaces the all-or-nothing skip_intermediate_stages for the probe.
+- OD-4: heal/no-heal is controlled by the EXISTING `pipeline.stages` per-stage
+  enable map — no new toggle (see PLAN-REVIEW §R3/§R4).
 - B0: fix vLLM capture-hook to bind Qwen3.6 fused/GDN MoE + add calib-driver fail-fast (assert nonzero captured entries after chunk 1). Re-capture via forward-only replay of the 8000 saved prompts.
 
 ## PAPER-CORE = NO REFINEMENTS (user-confirmed 2026-06-06) — HARD REQUIREMENT
@@ -466,3 +474,281 @@ Goal: establish the by-the-book REAP/REAM baseline (what popular compressors giv
   capacity_gate: off (confirm exact key)
   skip_merge_floor: off  (REAM paper-core uses plain greedy assignment; no percentile masking)
 REAP group: faithful_prune bypasses the merge machinery so these are structurally inert — set them anyway for clarity. REAM group: these ARE merge-path plugins → explicit-off is load-bearing for faithfulness. The orchestration (run_probe.py + 6 configs) build step must assert these in every config + ideally a test that greps the generated configs for the disabled set.
+
+---
+
+# PLAN-REVIEW RESOLUTIONS (2026-06-06) — supersedes OD-1..OD-4 above
+
+> Scope is LOCKED (RESOLUTIONS block). The reviewer's Critical/High/Medium/Low
+> findings are resolved below. **Tiebreak = faithfulness to upstream
+> SamsungSAILMontreal/ream** (intent: "by-the-book REAP/REAM on our calib, 35%
+> fewer experts, no refinements"). Every claim is re-verified against the
+> *current branch* code (`feat/probe-machinery` @ 7fbeed1) and the re-read
+> upstream clone at `/tmp/ream_upstream`. **Line numbers in §0–§8 above were
+> written against an older `main` state and have drifted; the file:line cites in
+> THIS section are authoritative.**
+
+## R1 — CRITICAL: single survivor count K=166 for BOTH groups
+
+**Decision: drop = `round(0.35 × 256) = 90` → KEEP exactly 166/layer for BOTH
+REAP and REAM.** REAM keeps 166 via `merge_size: 166` (R2). REAP currently
+keeps the wrong count.
+
+**Verified bug.** `reap_prune.py:309`:
+```python
+self._n_prune = int(n_experts * self.prune_fraction)
+```
+`int(256 × 0.35) = int(89.6) = 89` dropped → **167 kept**, off-by-one vs REAM's
+166. (The plugin comment at `reap_prune.py:306-307` cites upstream
+`prune.py:258-261`, which also uses `int()`, but upstream REAP prunes to a
+*fraction*, not to match a merge survivor count — for an apples-to-apples probe
+the two groups MUST land on the identical K.)
+
+**Plan change (production code, R-phase — NOT written in this planning pass):**
+change the REAP drop-count derivation so REAP and REAM both land at 166. Two
+acceptable forms; pick ONE at implement time:
+- **(a) round():** `self._n_prune = round(n_experts * self.prune_fraction)` →
+  `round(89.6) = 90` → keeps 166. Minimal diff at `reap_prune.py:309`.
+- **(b) explicit keep-count:** add a `stage2_reap_ream.keep_experts` (absolute,
+  parallel to REAM's `merge_size`) that, when set, makes
+  `n_prune = n_experts - keep_experts` and pins REAP to keep=166 directly. More
+  symmetric with REAM's knob but more code.
+
+**Recommendation: (a) round().** One-line change, faithful to the "35% fewer
+experts" intent (round-to-nearest), and the probe sets `prune_fraction: 0.35`
+so it lands on 166 automatically. The 6 configs set `prune_fraction: 0.35`; a
+config-grep/derivation test asserts the derived drop == 90 / keep == 166.
+
+> Note: changing `int()`→`round()` at `reap_prune.py:309` is behaviour-changing
+> ONLY when `n_experts × prune_fraction` is non-integer (e.g. 256×0.35=89.6 →
+> 89 vs 90). VERIFIED: no existing test exercises such a case —
+> `test_reap_prune_golden.py` uses `prune_fraction` 0.5/0.0 (8×0.5=4 exact),
+> `test_reap_prune_integration.py:72,134` uses 0.5 (8→4 exact),
+> `test_reap_prune_upstream_formula.py` passes `n_prune` directly (bypasses the
+> derivation), and `test_run_pipeline_reap_exact.py` uses tiny synthetic
+> dims/budgets (not the 256→K production count). So `int()`→`round()` breaks NO
+> current test. The R-phase MUST nonetheless add a derived-count test asserting
+> 256×0.35 → drop 90 / keep 166, and confirm (by regen) that the production
+> faithful-prune goldens — if any are keyed on the 256-expert count — move
+> 167→166. Flag for the implementer: behavioural for the real config, inert for
+> the current test suite.
+
+## R2 — CRITICAL: merge_size is a THIN budget-pin, ALREADY IMPLEMENTED
+
+**Decision: `stage2_reap_ream.merge_size` is a config key whose ONLY effect is
+to pin `target` (the per-layer survivor count) UNIFORMLY = merge_size, on the
+existing GRAPE-budget consumption path. No new merge machinery, no grouping /
+_promote_orphans / resume changes.** This is the reviewer-approved "Option A"
+budget-pin, exposed as the direct knob the user asked for.
+
+**Verified: this is already on the branch — the plan only needs to DOCUMENT it,
+not invent it.**
+- Validation block: `stage2/orchestrator.py:731-756` — rejects `merge_size`
+  under `prune_mode=faithful_prune` (it is a merge-path knob), and asserts a
+  positive int.
+- The pin itself: `stage2/orchestrator.py:1674-1686`:
+  ```python
+  target = per_layer_target[layer_ref.layer_idx]   # GRAPE budget (1674)
+  if _merge_size is not None:
+      ...                                            # ceiling check vs n_exp
+      target = int(_merge_size)                      # uniform pin (1686)
+  ```
+  `target` is then written to ctx at `orchestrator.py:1695` and consumed by the
+  merge loop exactly as the GRAPE value would be. When `merge_size` is absent the
+  GRAPE `per_layer_target` (`orchestrator.py:814-816`) is used unchanged —
+  byte-identical default.
+
+**Plan change:** the §3.3 / §4 prose that described OD-1 Option A as a "custom
+`stage1_budgets.json` JSON-writer helper" is OBSOLETE — there is NO budget-JSON
+helper and NO `_pin_uniform_budget()` step. The REAM rows simply set
+`stage2_reap_ream.merge_size: 166`. Delete the JSON-writer from the §5 driver
+spec (it was Difference #4 there). The pin is written by the orchestrator at the
+single site `orchestrator.py:1686`; the driver only injects the config key.
+
+## R3 — HIGH: heal mechanism = EXISTING `pipeline.stages` map (no new toggle)
+
+**Decision: DROP the proposed new per-stage toggle. The branch already has a
+clean native per-stage enable map; the heal rows use it.** This is even cleaner
+than the reviewer's "reuse run_ablations stage-windowing" because it runs
+entirely inside `run_pipeline.run()` in ONE invocation.
+
+**Verified.** `run_pipeline.py:434-493` `_resolve_stage_enables(pipe_cfg,
+skip_intermediate)`:
+- With `pipeline.stages` ABSENT → all intermediate (2.5/3/4/5) derive from
+  `skip_intermediate_stages` (byte-identical legacy behaviour, `:439-442,456-457`).
+- With `pipeline.stages` PRESENT → a dict `{stage2p5|stage3|stage4|stage5: bool}`
+  overrides per-stage (`:443-447,472-482`); contradiction guard at `:488-493`.
+- The resolved map gates each stage: `run_pipeline.py:269` (2.5), `:289` (3),
+  `:301` (4), `:312` (5).
+
+**Mapping the two heal variants to the existing stage runners (both call
+`stage5_router_kd.run`):**
+- **stage-2.5 heal** (CURRENT production router-KD, default dials): enable
+  Stage 2.5 only. `run_pipeline.py:280` runs
+  `stage5_router_kd.run(..., stage_key="stage2p5")` — independent of Stage 3/4.
+  Config: `pipeline.stages: {stage2p5: true, stage3: false, stage4: false,
+  stage5: false}`, `rkd_recipe` absent.
+- **RKD heal** (paper_dials_only): enable Stage 5 only.
+  `run_pipeline.py:312-318` runs `stage5_router_kd.run(...)` (default
+  `stage_key`). Config: `pipeline.stages: {stage2p5: false, stage3: false,
+  stage4: false, stage5: true}`, `stage5_router_kd.rkd_recipe:
+  "paper_dials_only"`.
+
+No new production toggle. (The reviewer's run_ablations.py:633 cite refers to a
+state of that file that no longer matches; the native `pipeline.stages` map is
+the superior in-pipeline equivalent and is what the probe uses.)
+
+## R4 — HIGH: base (no-heal) rows still produce stage6alt_eval.json — natively
+
+**Decision: base rows disable ALL intermediate stages via `pipeline.stages` and
+flow straight to Stage 6 in the SAME invocation. No `--skip-stage2p5`, no second
+`--resume-from-stage 6` process.** This sidesteps the reviewer's concern
+entirely (the `--skip-stage2p5` early-return is never on the probe's path).
+
+**Verified.** When every intermediate stage is off, `_all_intermediate_off=True`
+(`run_pipeline.py:104`). The mid-pipeline "stop after stage N" early-returns at
+`run_pipeline.py:296-299, 307-310, 319-322` are guarded by
+`... and not _all_intermediate_off`, so with all-off they are SKIPPED and control
+reaches Stage 6 at `run_pipeline.py:324`. With `stage6_validate.mode` resolving
+to `thermometer` (forced by `pipeline.evaluator: stage6alt` at
+`run_pipeline.py:111-117`), Stage 6 runs `stage6alt_thermometer.run`
+(`run_pipeline.py:329-331`), which writes `stage6alt_eval.json`.
+
+So base rows = `pipeline.stages: {stage2p5: false, stage3: false, stage4: false,
+stage5: false}` (or equivalently `skip_intermediate_stages: true` with no
+`stages` block), `pipeline.evaluator: stage6alt`, run once with default
+`--stop-after-stage 6`. They reach stage6alt without the split-machine
+`--skip-stage2p5` chain.
+
+> `--skip-stage2p5` (the reviewer's bail path, `run_pipeline.py:272-276`) is a
+> SEPARATE split-machine feature and is NOT used by `run_probe.py`. The driver
+> must NOT pass it. (If a future split-GPU flow needs base rows across two boxes,
+> the Stage-2-only run + a `--resume-from-stage 6` second process is the
+> documented fallback — Stage 6 loads `stage2_pruned/` via the resume shortcut at
+> `run_pipeline.py:156-166` — but the single-box probe does not need it.)
+
+## R5 — MEDIUM: REAM by-the-book — match upstream params + document deviations
+
+The REAM rows MUST set the upstream-default REAM params, NOT silently inherit our
+production defaults. Verified upstream defaults (`/tmp/ream_upstream`):
+
+| upstream param | upstream default | source | our knob | probe value |
+|---|---|---|---|---|
+| `group_size` (C) | **16** | `merger.py:40`, `merge.py:72`, `ream.py:25` | `stage2_reap_ream.max_merge_group_size` | **15** (see ⚠ below) |
+| `sequential` | **True** | `merger.py:41`, `merge.py:83` | `stage2_reap_ream.sequential_reprofile` | **true** |
+| `merging` | `logits+weights` | `merger.py:34` | (cost path, baked) | n/a — δ_REAM `cost_alignment: "pre"` |
+| `saliency` | `reap` | `merger.py:35` | always-on REAP scoring | n/a |
+| `grouping` | `ream` | `merger.py:33` | `assignment_solver: "greedy"` + pseudo-group | greedy |
+| `use_gate_output` | **True** | `merger.py:42` | (no knob — see ⚠ below) | baked-on |
+| `gated_sim` | **True** | `merger.py:43` | (no knob — baked) | baked-on |
+| freq-weighted merge | (REAM merge op) | — | `frequency_weighted_merge` | **true** |
+
+**⚠ DEVIATION #1 (group_size semantics — CORRECTS the task's "set C=16").**
+Our `max_merge_group_size` counts **non-centroids only**; upstream `group_size`
+counts the **total group including the centroid**
+(`layer_merge.py:55-79`, citing `ream/ream.py:75-82`). Equivalence:
+`max_merge_group_size = N` ⇔ upstream `group_size = N+1`. Therefore matching
+upstream `group_size=16` requires `max_merge_group_size: 15`, **not 16** (16
+would be upstream group_size=17). Our config default is 8
+(`layer_merge.py:77`), explicitly ~half the paper's 25%-reduction recipe.
+**By-the-book ⇒ set `max_merge_group_size: 15`.**
+
+**⚠ DEVIATION #2 (no `use_gate_output`/`gated_sim` knob).** Our pipeline has NO
+gate-output toggle. The gated-softmax expert view is baked into the δ_REAM cost
+under `cost_alignment="pre"` (`ream_cost.py:40-46`, mirroring upstream
+`ream/moe_utils.py:146-147,170-171`). So upstream's `use_gate_output=True` /
+`gated_sim=True` are matched implicitly by `cost_alignment: "pre"`; there is
+nothing to set and nothing to turn off. **Accepted deviation (parity preserved
+by construction).**
+
+**⚠ DEVIATION #3 (sequential propagation cost — FLAG FOR USER).**
+`sequential_reprofile: true` re-forwards each layer after every merge
+(`ream_sequential.py`, mirroring `merger.py:303,468` `if self.sequential`). This
+is **slower and heavier on GPU** than the one-shot pre-collected-stats path.
+This is the price of by-the-book REAM (upstream default is sequential=True).
+**Flagged prominently for the user before launch.**
+
+**Mutual-exclusion consequence:** `sequential_reprofile=true` is rejected
+together with `profile_sidecar.enabled=true`
+(`orchestrator.py:782-794`). The REAM configs MUST set
+`profile_sidecar.enabled: false`.
+
+**Remaining accepted deviations from upstream `pseudo_group`
+(`ream/ream.py:21-34`):**
+- Calibration data: upstream `c4+math+code @ 0/0.3/0.7` (`merge.py:59-67`); ours
+  is `qwen3-pretrain-mix-v2`. **Accepted — the whole point of the probe is "on
+  OUR calib".**
+- Solver: upstream `pseudo_group` greedy nearest-centroid (`ream.py:74-94`); ours
+  is `assignment_solver: "greedy"`. Parity intended; any algorithmic gap is a
+  documented-not-fixed item for the R-phase reviewer.
+- saliency tie-break / argsort order: upstream `np.argsort(saliency)[::-1][:k]`
+  (`ream.py:64`); confirm our scoring picks the same top-K centroids — note as
+  a verify-at-implement item.
+
+## R6 — MEDIUM: post-run assertion that survivors == 166/layer (BOTH groups)
+
+**Verified gap.** No survivor-count assertion exists in `orchestrator.py`
+(grep for `num_experts ==` / `len(...kept)` / `survivor` returns only the
+unrelated cost asserts at `:386,389,397`). Upstream HARD-asserts
+`moe_layer.num_experts == self.merge_size` (`/tmp/ream_upstream/ream/merger.py:463`).
+
+**Verified risk.** The bump loop raises the kept count above the configured
+target when the cost gate fails: `orchestrator.py:480-491` logs
+`"bumping target %d→%d"` and sets `effective_target = new_effective`, and the
+post-loop fallback (`orchestrator.py:493+`) commits an above-target assignment as
+last resort. So a `merge_size: 166` run can silently keep >166.
+
+**Plan change (R-phase production code):** add a post-merge assertion — after the
+per-layer merge commits, assert the realised survivor count == target (166) for
+EVERY MoE layer, raising on mismatch (mirroring upstream `merger.py:463`). This
+guards both the REAM bump-loop overshoot and the REAP K (R1). The driver/config
+test additionally asserts the *intended* counts (REAP keep==166 via
+prune_fraction derivation, REAM `merge_size==166`); the orchestrator assertion
+guards the *realised* counts at run time.
+
+> Caveat to document: with a hard 166 assertion AND the bump loop active, a
+> cost-gate bump would now ABORT the run rather than silently overshoot. That is
+> the desired by-the-book behaviour (upstream aborts on count mismatch). If the
+> probe's cost gate is expected to bump, the bump loop must be configured inert
+> for the REAM rows — note as an implement-time check.
+
+## R7 — LOW / NITPICK
+
+- **Piece 1 (RKD `paper_dials_only`) is DONE.** Already on
+  `feat/probe-machinery` @ 7fbeed1, reviewed. Mark §1 complete; no R-phase work.
+- **HF naming is CUSTOM, not the stage-idx default.** Required repos:
+  `pirola/calib-v2-probe-{reap,ream}-{base,heal25,rkd}` (6 repos). This is NOT
+  the `upload_stage_to_hub` default `f"{repo_base}-stage{stage_idx}"`
+  (`utils/hub_upload.py:147`). The driver must compute the custom repo id per
+  row and pass it explicitly (or set `PIPELINE_HUB_RESULT_REPO_BASE` per row);
+  do NOT rely on the stage-idx suffix.
+- **`capacity_gate` has no off-key — inert via `cost_alignment="pre"`.**
+  `capacity_gate.py:23-25`: under `cost_alignment="pre"` the gate forces the pre
+  path "regardless of the configured value". So setting `cost_alignment: "pre"`
+  (already required for δ_REAM) makes capacity_gate inert; there is no separate
+  toggle to set. Document, don't invent a key.
+- **REAM rows set `skip_merge_percentile: 100.0` (OFF sentinel).**
+  `skip_merge_floor.py:101-102` (100.0 = OFF). The faithful config ships
+  `skip_merge_percentile: 0.0` (REAP-prune-exact); the REAM rows OVERRIDE to
+  100.0 so merges are allowed. `two_opt_refine` is OFF when the key is
+  falsy/absent (`two_opt_refine.py:215,239-240`,
+  `config_key="stage2_reap_ream.two_opt_refine"`).
+- **Config-grep test asserts ALL disable sentinels on the GENERATED configs**
+  (not just source defaults): per the PAPER-CORE block —
+  `em_refinement_rounds: 0`, `expert_distill_steps: 0`,
+  `merge_heal_enabled: false`, `two_opt_refine` falsy, `skip_merge_percentile:
+  100.0` (REAM) / inert (REAP), plus the R1 derived-keep==166 and R5 REAM params
+  (`max_merge_group_size: 15`, `sequential_reprofile: true`,
+  `cost_alignment: "pre"`, `frequency_weighted_merge: true`,
+  `profile_sidecar.enabled: false`). Mirror `tests/test_reap_faithful_config.py`.
+
+## R-phase work order (gated on this revised plan)
+
+1. (R1) REAP keep==166: `reap_prune.py:309` `int()`→`round()`; regenerate
+   faithful-prune goldens + fix `tests/test_run_pipeline_reap_exact.py` (167→166).
+2. (R6) post-merge survivor==target assertion in `orchestrator.py`.
+3. `run_probe.py` 6-row driver: REAP rows (`prune_fraction: 0.35`), REAM rows
+   (`merge_size: 166` + R5 params), per-row `pipeline.stages` (R3/R4), custom HF
+   repo ids (R7), PAPER-CORE OFF set.
+4. Config-grep + driver-config + derived-count tests (R7).
+5. CPU dry-run of the config-builder; hold for sidecar re-capture (B0); launch.
