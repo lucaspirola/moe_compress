@@ -442,3 +442,17 @@ fallback command in the run README/log.
 - Stage-2 plugin config keys: see §4 table (each verified by grep)
 - Mutual-exclusion guard: `stage2/orchestrator.py:759-767`
 - Hub upload API: `utils/hub_upload.py:112,147,186,197`
+
+---
+## RESOLUTIONS (user decisions 2026-06-06) — scope LOCKED, no open questions
+
+6 models, ALL on qwen3-pretrain-mix-v2, 35% fewer experts (keep round(0.65*256)=166/layer):
+- Group REAP (by-the-book): prune_mode=faithful_prune, prune_fraction=0.35
+- Group REAM (by-the-book): direct merge_size=166 knob (OD-1 — mirrors upstream `--merge_size`, an ABSOLUTE per-layer kept count; bypass GRAPE, parallel to REAP's prune_fraction). Confirmed from SamsungSAILMontreal/ream merge.py `--merge_size` + ream/ream.py pseudo_group(k=...).
+- Each group: base (no heal) + stage-2.5-heal + RKD-heal = 3 per group → 6 total.
+  - "stage-2.5 healing" = CURRENT production router-KD (default dials, our calib; rkd_recipe absent).
+  - "RKD healing" = rkd_paper_recipe paper_dials_only (paper dials, our calib; NO wikitext).
+  - merge_repair is NOT involved (was my confusion; closed).
+- OD-2 naming: HF dataset/model repos pirola/calib-v2-probe-{reap,ream}-{base,heal25,rkd}; stage6alt eval on wikitext each.
+- OD-4: add a real per-stage enable toggle (heal/Stage-5 ON while SVD/Stage-3/4 OFF) — replaces the all-or-nothing skip_intermediate_stages for the probe.
+- B0: fix vLLM capture-hook to bind Qwen3.6 fused/GDN MoE + add calib-driver fail-fast (assert nonzero captured entries after chunk 1). Re-capture via forward-only replay of the 8000 saved prompts.
