@@ -53,14 +53,24 @@ Chosen approach: the plugin exposes ``apply_config_overrides(config) -> None``
 that mutates ``config`` in-place. The orchestrator calls this method as the
 very first statement of ``run()``, BEFORE the ``s5`` / ``cal`` captures.
 
+Dials-only mode (``"paper_dials_only"``)
+----------------------------------------
+A third ``rkd_recipe`` value, ``"paper_dials_only"``, applies the SAME 4
+numeric dials + the SAME multi-epoch cache-clear, but does NOT swap the
+calibration source. It keeps whatever the config carries (the project's
+``qwen3-pretrain-mix-v2``), honouring the "our dataset everywhere" rule
+while still isolating the paper's optimisation dials for an A/B. The full
+``"paper"`` mode is unchanged.
+
 Contract
 --------
 1. ``apply_config_overrides`` reads
    ``config["stage5_router_kd"].get("rkd_recipe", "current")``.
-2. If the value is ``"current"`` (or any non-``"paper"`` value, or the key
-   is missing, or the ``stage5_router_kd`` block is missing entirely), the
-   method returns immediately without touching ``config``. Row C runs are
-   byte-identical to pre-plugin behavior.
+2. If the value is ``"current"`` (or any value outside
+   ``{"paper", "paper_dials_only"}``, or the key is missing, or the
+   ``stage5_router_kd`` block is missing entirely), the method returns
+   immediately without touching ``config``. Row C runs are byte-identical to
+   pre-plugin behavior.
 3. If the value is ``"paper"``, the method mutates ``config`` in-place:
      * ``s5["kd_temperature"] = 4.0``
      * ``s5["weight_decay"] = 0.0``
@@ -68,6 +78,9 @@ Contract
      * ``s5["early_stop_patience"] = 0``
      * ``s5["teacher_logits_cache"] = None``  (multi-epoch guard)
      * ``config["calibration"]["source"] = "wikitext-103-raw"``
+3b. If the value is ``"paper_dials_only"``, the method applies the same 4
+   dials + the ``teacher_logits_cache = None`` clearance, but SKIPS the
+   ``config["calibration"]["source"]`` swap entirely.
 4. The existing Stage 2.5 / Stage 5 plugins
    (:mod:`~moe_compress.router_kd.plugins.vocab_kd`,
    :mod:`~moe_compress.router_kd.plugins.kd_optimizer`,
@@ -104,8 +117,11 @@ class RkdPaperRecipePlugin:
     When ``stage5_router_kd.rkd_recipe == "paper"`` is set in the YAML,
     ``apply_config_overrides(config)`` mutates ``config`` in place to apply
     the 4 paper-recipe deltas + the wikitext-103-raw calibration source.
-    The default value ``"current"`` makes the method a no-op, so existing
-    runs that do not opt in are byte-identical to pre-plugin behavior.
+    When it is ``"paper_dials_only"``, the same 4 dials + cache-clear are
+    applied but the calibration source is left untouched (project source
+    preserved). The default value ``"current"`` makes the method a no-op, so
+    existing runs that do not opt in are byte-identical to pre-plugin
+    behavior.
     """
 
     name = "rkd_paper_recipe"
@@ -121,17 +137,21 @@ class RkdPaperRecipePlugin:
     provides: tuple[str, ...] = ()
 
     def is_enabled(self, config: dict) -> bool:
-        """True iff the operator opted in to the paper recipe.
+        """True iff the operator opted in to a paper recipe.
 
         Reads ``config["stage5_router_kd"].get("rkd_recipe", "current")``.
-        Default ``"current"`` → False (the no-op path). Missing or non-dict
-        ``stage5_router_kd`` block → False (graceful: never raise during a
-        registry-style audit walk).
+        Returns True for both ``"paper"`` (full recipe incl. the
+        wikitext-103-raw calibration swap) and ``"paper_dials_only"`` (the
+        4 numeric dials + cache-clear, but NO calibration-source swap —
+        keeps the project's own calibration source). Default ``"current"``
+        → False (the no-op path). Missing or non-dict ``stage5_router_kd``
+        block → False (graceful: never raise during a registry-style audit
+        walk).
         """
         s5 = config.get("stage5_router_kd")
         if not isinstance(s5, dict):
             return False
-        return s5.get("rkd_recipe", "current") == "paper"
+        return s5.get("rkd_recipe", "current") in ("paper", "paper_dials_only")
 
     def contribute_artifact(self, ctx: Any) -> dict:
         # Fresh empty dict literal each call — never a shared module-level
@@ -148,12 +168,19 @@ class RkdPaperRecipePlugin:
         Behaviour
         ---------
         * No-op when ``stage5_router_kd.rkd_recipe`` is ``"current"``, any
-          other non-``"paper"`` value, or absent — and also when the
-          ``stage5_router_kd`` block itself is missing (defensive; the real
-          orchestrator will raise later on the missing block, but this
-          method must never raise on a non-paper path).
-        * When the value is ``"paper"``, applies the 4 deltas + the
-          calibration-source swap + the teacher_logits_cache clearance.
+          other value outside ``{"paper", "paper_dials_only"}``, or absent —
+          and also when the ``stage5_router_kd`` block itself is missing
+          (defensive; the real orchestrator will raise later on the missing
+          block, but this method must never raise on a non-paper path).
+        * When the value is ``"paper"``, applies the 4 numeric deltas + the
+          teacher_logits_cache clearance + the wikitext-103-raw
+          calibration-source swap.
+        * When the value is ``"paper_dials_only"``, applies the SAME 4
+          numeric deltas + the SAME teacher_logits_cache clearance, but
+          does NOT touch ``config["calibration"]["source"]`` — the project's
+          own calibration source (e.g. ``qwen3-pretrain-mix-v2``) is
+          preserved. This honours the "our dataset everywhere" rule while
+          still isolating the paper's optimisation dials for an A/B.
 
         Idempotent: applying the override twice yields the same final
         config (each assignment is unconditional). The orchestrator only
@@ -162,43 +189,54 @@ class RkdPaperRecipePlugin:
         s5 = config.get("stage5_router_kd")
         if not isinstance(s5, dict):
             return
-        if s5.get("rkd_recipe", "current") != "paper":
+        recipe = s5.get("rkd_recipe", "current")
+        if recipe not in ("paper", "paper_dials_only"):
             return
 
-        # The 4 numeric/scalar deltas from the paper recipe.
+        # The 4 numeric/scalar deltas from the paper recipe. Applied for
+        # BOTH "paper" and "paper_dials_only".
         s5["kd_temperature"] = 4.0
         s5["weight_decay"] = 0.0
         s5["epochs"] = 2
         s5["early_stop_patience"] = 0
 
         # Multi-epoch + cache guard (orchestrator.py:585 raises if
-        # epochs>1 and teacher_logits_cache is not None). Row P sets
+        # epochs>1 and teacher_logits_cache is not None). Both recipes set
         # epochs=2, so clear the cache slot defensively.
         s5["teacher_logits_cache"] = None
 
-        # Calibration source swap (paper §F.3 Table 1 uses raw text; we
-        # mirror with the wikitext-103-raw adapter registered in
-        # ``utils/calibration.py``). The ``calibration:`` block must exist
-        # for any Router-KD run; the orchestrator validates it downstream,
-        # so we assume it is present here and create / mutate the source key.
-        cal = config.get("calibration")
-        if not isinstance(cal, dict):
-            log.warning(
-                "RkdPaperRecipePlugin: config has no 'calibration' block; "
-                "creating minimal stub with source='wikitext-103-raw'. "
-                "Downstream calibration setup may KeyError on missing keys "
-                "(num_sequences, sequence_length, seed). Add a complete "
-                "calibration block to the config to silence this warning."
-            )
-            cal = {}
-            config["calibration"] = cal
-        cal["source"] = "wikitext-103-raw"
+        # Calibration source swap — ONLY for the full "paper" recipe (paper
+        # §F.3 Table 1 uses raw text; we mirror with the wikitext-103-raw
+        # adapter registered in ``utils/calibration.py``). The
+        # "paper_dials_only" recipe SKIPS this block so the project's own
+        # calibration source is preserved.
+        swapped_source = False
+        if recipe == "paper":
+            cal = config.get("calibration")
+            if not isinstance(cal, dict):
+                log.warning(
+                    "RkdPaperRecipePlugin: config has no 'calibration' block; "
+                    "creating minimal stub with source='wikitext-103-raw'. "
+                    "Downstream calibration setup may KeyError on missing keys "
+                    "(num_sequences, sequence_length, seed). Add a complete "
+                    "calibration block to the config to silence this warning."
+                )
+                cal = {}
+                config["calibration"] = cal
+            cal["source"] = "wikitext-103-raw"
+            swapped_source = True
 
         log.info(
-            "RkdPaperRecipePlugin: applied Row P overrides — "
+            "RkdPaperRecipePlugin: applied %s overrides — "
             "kd_temperature=4.0, weight_decay=0.0, epochs=2, "
-            "early_stop_patience=0, teacher_logits_cache=None, "
-            "calibration.source='wikitext-103-raw'."
+            "early_stop_patience=0, teacher_logits_cache=None; "
+            "calibration.source %s.",
+            recipe,
+            (
+                "swapped to 'wikitext-103-raw'"
+                if swapped_source
+                else "left unchanged (project source preserved)"
+            ),
         )
 
 

@@ -442,6 +442,106 @@ def test_apply_config_overrides_paper_idempotent():
 
 
 # ---------------------------------------------------------------------------
+# Group D-bis — ``paper_dials_only`` mode (dials + cache-clear, NO calib swap)
+# ---------------------------------------------------------------------------
+
+
+def _row_dials_only_config() -> dict:
+    """Row C config but with ``rkd_recipe='paper_dials_only'``."""
+    config = _row_c_config()
+    config["stage5_router_kd"]["rkd_recipe"] = "paper_dials_only"
+    return config
+
+
+def test_dials_only_is_enabled():
+    """``rkd_recipe='paper_dials_only'`` → enabled (same gate as 'paper')."""
+    from moe_compress.router_kd.plugins.rkd_paper_recipe import (
+        RkdPaperRecipePlugin,
+    )
+
+    plugin = RkdPaperRecipePlugin()
+    assert plugin.is_enabled(
+        {"stage5_router_kd": {"rkd_recipe": "paper_dials_only"}}
+    ) is True
+
+
+def test_dials_only_sets_4_dials():
+    """All 4 numeric dials applied under paper_dials_only (same as 'paper')."""
+    from moe_compress.router_kd.plugins.rkd_paper_recipe import (
+        RkdPaperRecipePlugin,
+    )
+
+    config = _row_dials_only_config()
+    RkdPaperRecipePlugin().apply_config_overrides(config)
+
+    s5 = config["stage5_router_kd"]
+    assert s5["kd_temperature"] == 4.0
+    assert s5["weight_decay"] == 0.0
+    assert s5["epochs"] == 2
+    assert s5["early_stop_patience"] == 0
+
+
+def test_dials_only_clears_teacher_cache():
+    """``teacher_logits_cache`` cleared under paper_dials_only (epochs>1 guard)."""
+    from moe_compress.router_kd.plugins.rkd_paper_recipe import (
+        RkdPaperRecipePlugin,
+    )
+
+    config = _row_dials_only_config()
+    assert config["stage5_router_kd"]["teacher_logits_cache"] == "/some/path/teacher_cache.pt"
+    RkdPaperRecipePlugin().apply_config_overrides(config)
+    assert config["stage5_router_kd"]["teacher_logits_cache"] is None
+
+
+def test_dials_only_KEEPS_calibration_source():
+    """THE KEY INVARIANT: paper_dials_only does NOT swap calibration.source.
+
+    The whole point of the mode — the project's own source
+    (``qwen3-pretrain-mix-v2``) is preserved, NOT replaced by
+    ``wikitext-103-raw`` (which the full 'paper' recipe would do).
+    """
+    from moe_compress.router_kd.plugins.rkd_paper_recipe import (
+        RkdPaperRecipePlugin,
+    )
+
+    config = _row_dials_only_config()
+    RkdPaperRecipePlugin().apply_config_overrides(config)
+    assert config["calibration"]["source"] == "qwen3-pretrain-mix-v2"
+    # And specifically NOT the paper's wikitext swap.
+    assert config["calibration"]["source"] != "wikitext-103-raw"
+
+
+def test_dials_only_leaves_calibration_block_untouched():
+    """paper_dials_only mutates only stage5; the whole calibration block is intact."""
+    from moe_compress.router_kd.plugins.rkd_paper_recipe import (
+        RkdPaperRecipePlugin,
+    )
+
+    config = _row_dials_only_config()
+    cal_before = dict(config["calibration"])
+    RkdPaperRecipePlugin().apply_config_overrides(config)
+    assert config["calibration"] == cal_before
+
+
+def test_dials_only_idempotent():
+    """Calling ``apply_config_overrides`` twice yields the same final config."""
+    from moe_compress.router_kd.plugins.rkd_paper_recipe import (
+        RkdPaperRecipePlugin,
+    )
+
+    config = _row_dials_only_config()
+    plugin = RkdPaperRecipePlugin()
+    plugin.apply_config_overrides(config)
+    snapshot = {
+        "s5": dict(config["stage5_router_kd"]),
+        "cal": dict(config["calibration"]),
+    }
+    plugin.apply_config_overrides(config)
+    assert dict(config["stage5_router_kd"]) == snapshot["s5"]
+    assert dict(config["calibration"]) == snapshot["cal"]
+
+
+# ---------------------------------------------------------------------------
 # Group E — downstream plugins read OVERRIDDEN values post-mutation
 # ---------------------------------------------------------------------------
 
