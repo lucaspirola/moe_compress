@@ -43,15 +43,18 @@ layer's expert count and reused at every layer (the Qwen3.x stack is
 homogeneous so absolute-count and fixed-fraction coincide).
 
 **D-keep-rounded (drop-count derivation).** We derive the drop so the KEPT
-count is ``round((1 - prune_fraction) * n_experts0)`` (i.e. ``n_prune =
-n_experts0 - round((1 - prune_fraction) * n_experts0)``). Upstream computes
+count is ``round_half_up((1 - prune_fraction) * n_experts0)`` —
+``math.floor(n_experts0 * (1 - prune_fraction) + 0.5)`` — i.e. ``n_prune =
+n_experts0 - that``. A deterministic HALF-UP rule is used (not the builtin
+``round``, which is banker's / half-to-even) so the keep-count convention is
+explicit + tie-deterministic for any ``prune_fraction``. Upstream computes
 ``int(total_experts * compression_ratio)`` (``prune.py:258-261``), a
 TRUNCATION. The two agree whenever ``n_experts0 * prune_fraction`` is
 integral; they differ only on a non-integral product. We deliberately use
 keep-rounded — the exact statement of the "keep the top-(1 -
 compression_ratio) experts" intent — so the production case (256 experts,
-0.35) keeps ``round(166.4) = 166`` (drops 90), matching the REAM survivor
-count K=166, rather than upstream's ``int(89.6) = 89`` (keep 167, an
+0.35) keeps ``floor(166.4 + 0.5) = 166`` (drops 90), matching the REAM
+survivor count K=166, rather than upstream's ``int(89.6) = 89`` (keep 167, an
 off-by-one vs REAM). With an empty protected set the SELECTION (which
 experts survive given ``n_prune``) is still byte-identical to upstream's
 ``torch.topk`` formula; only the scalar ``n_prune`` rounding differs.
@@ -123,6 +126,7 @@ singletons because it skips groups of ``len(members) <= 1``
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -317,18 +321,23 @@ class ReapPrunePlugin:
 
         # Global n_prune, computed ONCE from layer 0 (upstream prune.py:258-261)
         # and reused per layer (Qwen3.x is homogeneous). Derive the drop count so
-        # the KEPT count is ``round((1 - prune_fraction) * n_experts)`` — the
-        # upstream "keep the top-(1 - compression_ratio) experts" intent stated
-        # exactly. For n_experts=256, prune_fraction=0.35 this keeps
-        # round(166.4)=166 (drops 90), vs the old ``int(256*0.35)=89`` which
-        # kept 167 (off-by-one vs the REAM 166 survivor count). The keep-rounded
-        # form is inert whenever ``n_experts * fraction`` is integral (the cases
-        # the existing test suite exercises) and only changes the non-integral
-        # production case.
+        # the KEPT count is ``round_half_up((1 - prune_fraction) * n_experts)`` —
+        # the upstream "keep the top-(1 - compression_ratio) experts" intent
+        # stated exactly. For n_experts=256, prune_fraction=0.35 this keeps
+        # floor(166.4 + 0.5)=166 (drops 90), vs the old ``int(256*0.35)=89``
+        # which kept 167 (off-by-one vs the REAM 166 survivor count). The
+        # keep-rounded form is inert whenever ``n_experts * fraction`` is
+        # integral (the cases the existing test suite exercises) and only
+        # changes the non-integral production case.
+        #
+        # ``math.floor(x + 0.5)`` is a deterministic HALF-UP rule, chosen over
+        # the builtin ``round`` (which is banker's / half-to-even): for the
+        # locked probe config (166.4, no .5 tie) both agree, but half-up makes
+        # the keep-count convention explicit + tie-deterministic for any other
+        # prune_fraction.
         if self._n_prune is None:
-            self._n_prune = n_experts - round(
-                n_experts * (1.0 - self.prune_fraction)
-            )
+            n_keep = math.floor(n_experts * (1.0 - self.prune_fraction) + 0.5)
+            self._n_prune = n_experts - n_keep
         n_prune = self._n_prune
 
         final_kept_ids, pruned_expert_ids = compute_final_kept_ids(
