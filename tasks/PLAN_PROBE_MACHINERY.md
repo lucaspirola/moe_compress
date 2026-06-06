@@ -456,3 +456,13 @@ fallback command in the run README/log.
 - OD-2 naming: HF dataset/model repos pirola/calib-v2-probe-{reap,ream}-{base,heal25,rkd}; stage6alt eval on wikitext each.
 - OD-4: add a real per-stage enable toggle (heal/Stage-5 ON while SVD/Stage-3/4 OFF) — replaces the all-or-nothing skip_intermediate_stages for the probe.
 - B0: fix vLLM capture-hook to bind Qwen3.6 fused/GDN MoE + add calib-driver fail-fast (assert nonzero captured entries after chunk 1). Re-capture via forward-only replay of the 8000 saved prompts.
+
+## PAPER-CORE = NO REFINEMENTS (user-confirmed 2026-06-06) — HARD REQUIREMENT
+Goal: establish the by-the-book REAP/REAM baseline (what popular compressors give) BEFORE adding our refinements. ALL 6 probe configs MUST explicitly disable (not rely on defaults):
+  em_refinement_rounds: 0
+  expert_distill_steps: 0
+  merge_heal_enabled: false
+  two_opt_refine: off (confirm exact key in registry)
+  capacity_gate: off (confirm exact key)
+  skip_merge_floor: off  (REAM paper-core uses plain greedy assignment; no percentile masking)
+REAP group: faithful_prune bypasses the merge machinery so these are structurally inert — set them anyway for clarity. REAM group: these ARE merge-path plugins → explicit-off is load-bearing for faithfulness. The orchestration (run_probe.py + 6 configs) build step must assert these in every config + ideally a test that greps the generated configs for the disabled set.
