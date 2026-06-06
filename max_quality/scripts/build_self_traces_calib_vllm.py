@@ -88,6 +88,8 @@ import time
 from pathlib import Path
 from typing import Iterable, Iterator
 
+log = logging.getLogger("build_self_traces_calib_vllm")
+
 # B0/C1 — run the vLLM V1 EngineCore IN-PROCESS (no engine subprocess).
 #
 # vLLM V1 defaults VLLM_ENABLE_V1_MULTIPROCESSING=1, which runs EngineCore (and
@@ -103,10 +105,16 @@ from typing import Iterable, Iterator
 # share one process. Calibration is single-GPU (tp=1 -> UniProcExecutor), so
 # in-process is correct here and also more deterministic for capture.
 #
-# Must be set BEFORE vllm is first imported anywhere (the import is lazy, inside
-# _load_teacher_vllm), so it lives at module level here. setdefault lets an
-# operator still pin their own value if they truly need MP on.
-os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+# This is a DRIVER INVARIANT, not a default: this script CANNOT capture with
+# MP=1. We therefore HARD-SET it (not setdefault) so a stale shell
+# `export VLLM_ENABLE_V1_MULTIPROCESSING=1` cannot survive and silently
+# re-break captures -- that would only be caught by the fail-fast after a
+# wasted chunk + full GPU spin-up. Must be set BEFORE vllm is first imported
+# anywhere (the import is lazy, inside _load_teacher_vllm), so it lives at
+# module level here.
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+log.info("calibration driver: forcing VLLM_ENABLE_V1_MULTIPROCESSING=0 "
+         "(in-process EngineCore required for capture hooks to fire)")
 
 # Reuse prompt loaders + per-domain stats helpers from the HF script — they
 # don't depend on transformers / vLLM, only on utils/calibration.
@@ -118,8 +126,6 @@ from build_self_traces_calib import (  # type: ignore
     _coerce_eos_ids,
     _trim_at_first_eos,
 )
-
-log = logging.getLogger("build_self_traces_calib_vllm")
 
 
 # ---------------------------------------------------------------------------

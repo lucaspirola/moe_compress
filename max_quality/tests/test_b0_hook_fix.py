@@ -265,12 +265,40 @@ def test_c2_predicate_rejects_zero_experts():
 
 def test_c1_env_set_at_module_level():
     """Importing the driver must have already set
-    VLLM_ENABLE_V1_MULTIPROCESSING (module-level setdefault), so it is in
+    VLLM_ENABLE_V1_MULTIPROCESSING (module-level hard set), so it is in
     os.environ by the time any vllm import would run."""
     import os
 
     # The import at the top of this file already ran the driver module body.
     assert os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0"
+
+
+def test_c1_env_hard_set_overrides_stale_export():
+    """DRIVER INVARIANT: this script cannot capture with MP=1, so the
+    module-level set is HARD (not setdefault). A stale shell
+    `export VLLM_ENABLE_V1_MULTIPROCESSING=1` must NOT survive -- reloading
+    the driver module body with the env pre-set to "1" must still leave it
+    "0" afterwards. Locks in the hard-set against a setdefault regression."""
+    import importlib
+    import os
+
+    import build_self_traces_calib_vllm as _drv
+
+    saved = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
+    try:
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"  # stale export
+        importlib.reload(_drv)  # re-runs the module-level hard set
+        assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0", (
+            "hard set must override a stale MP=1 export; a setdefault "
+            "regression would leave it at '1' and re-break captures"
+        )
+    finally:
+        # Restore env + reload once more so other tests see a clean module.
+        if saved is None:
+            os.environ.pop("VLLM_ENABLE_V1_MULTIPROCESSING", None)
+        else:
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = saved
+        importlib.reload(_drv)
 
 
 def test_patches_apply_check_command_documented():
