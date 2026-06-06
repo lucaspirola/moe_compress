@@ -164,10 +164,13 @@ stage2_reap_ream:
                                    # cost/solver/merge/heal knobs below are INERT
                                    # (the orchestrator drops those plugins).
   prune_fraction: 0.35             # per-layer expert drop fraction (upstream
-                                   # ``compression_ratio`` semantics). n_prune =
-                                   # int(n_experts(layer0) * prune_fraction),
-                                   # computed once and reused per layer. BYPASSES
-                                   # the Stage-1 GRAPE per-layer budget.
+                                   # ``compression_ratio`` semantics). KEEP =
+                                   # round((1 - prune_fraction) * n_experts(layer0))
+                                   # → n_prune = n_experts - KEEP, computed once
+                                   # and reused per layer. For 256 experts at 0.35
+                                   # this keeps 166 (drops 90), matching the REAM
+                                   # survivor count. BYPASSES the Stage-1 GRAPE
+                                   # per-layer budget.
   experts_implementation: grouped_mm   # Hopper (H100/H200): grouped_mm is the
                                        # fastest kernel AND the only one that
                                        # fits Stage 2's profiling shape (bs=6 ×

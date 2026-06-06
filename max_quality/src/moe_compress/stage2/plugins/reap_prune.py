@@ -39,11 +39,22 @@ protected set, it is byte-identical to upstream's
     retained         = [i for i in range(n) if i not in experts_to_prune]
 
 ``n_prune`` is a single GLOBAL scalar computed ONCE from the first MoE
-layer's expert count (``int(n_experts0 * prune_fraction)``), mirroring
-upstream's ``int(total_experts * compression_ratio)`` (``prune.py:261``,
-computed from layer 0 only at ``prune.py:258``) and reused at every layer
-(the Qwen3.x stack is homogeneous so absolute-count and fixed-fraction
-coincide).
+layer's expert count and reused at every layer (the Qwen3.x stack is
+homogeneous so absolute-count and fixed-fraction coincide).
+
+**D-keep-rounded (drop-count derivation).** We derive the drop so the KEPT
+count is ``round((1 - prune_fraction) * n_experts0)`` (i.e. ``n_prune =
+n_experts0 - round((1 - prune_fraction) * n_experts0)``). Upstream computes
+``int(total_experts * compression_ratio)`` (``prune.py:258-261``), a
+TRUNCATION. The two agree whenever ``n_experts0 * prune_fraction`` is
+integral; they differ only on a non-integral product. We deliberately use
+keep-rounded — the exact statement of the "keep the top-(1 -
+compression_ratio) experts" intent — so the production case (256 experts,
+0.35) keeps ``round(166.4) = 166`` (drops 90), matching the REAM survivor
+count K=166, rather than upstream's ``int(89.6) = 89`` (keep 167, an
+off-by-one vs REAM). With an empty protected set the SELECTION (which
+experts survive given ``n_prune``) is still byte-identical to upstream's
+``torch.topk`` formula; only the scalar ``n_prune`` rounding differs.
 
 Deviations (vs upstream default)
 --------------------------------
@@ -254,8 +265,9 @@ class ReapPrunePlugin:
         """Compute ``final_kept_ids`` = top-(n−n_prune) by REAP score ∪ protected.
 
         BYPASSES ``ctx.get("target")`` (the Stage-1 GRAPE budget); the drop
-        count is ``int(n_experts0 * prune_fraction)`` computed once from the
-        first MoE layer and reused (homogeneous stack). Publishes the slots
+        count is ``n_experts0 - round(n_experts0 * (1 - prune_fraction))``
+        (keep ``round((1 - prune_fraction) * n_experts0)``) computed once from
+        the first MoE layer and reused (homogeneous stack). Publishes the slots
         the standard post-assign schedule + ``write_artifacts`` consume.
         """
         layer_ref = ctx.get("layer_ref")
@@ -304,9 +316,19 @@ class ReapPrunePlugin:
         ctx.set("protected", tuple(protected), overwrite=True)
 
         # Global n_prune, computed ONCE from layer 0 (upstream prune.py:258-261)
-        # and reused per layer (Qwen3.x is homogeneous).
+        # and reused per layer (Qwen3.x is homogeneous). Derive the drop count so
+        # the KEPT count is ``round((1 - prune_fraction) * n_experts)`` — the
+        # upstream "keep the top-(1 - compression_ratio) experts" intent stated
+        # exactly. For n_experts=256, prune_fraction=0.35 this keeps
+        # round(166.4)=166 (drops 90), vs the old ``int(256*0.35)=89`` which
+        # kept 167 (off-by-one vs the REAM 166 survivor count). The keep-rounded
+        # form is inert whenever ``n_experts * fraction`` is integral (the cases
+        # the existing test suite exercises) and only changes the non-integral
+        # production case.
         if self._n_prune is None:
-            self._n_prune = int(n_experts * self.prune_fraction)
+            self._n_prune = n_experts - round(
+                n_experts * (1.0 - self.prune_fraction)
+            )
         n_prune = self._n_prune
 
         final_kept_ids, pruned_expert_ids = compute_final_kept_ids(

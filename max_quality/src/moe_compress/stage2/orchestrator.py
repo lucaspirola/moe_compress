@@ -626,6 +626,35 @@ def _run_assignment(plugins, ctx) -> None:
     ctx.set("effective_target", effective_target)
 
 
+def _assert_survivor_count(
+    n_survivors: int, target: int, *, layer_idx: int, faithful: bool,
+) -> None:
+    """Hard-assert a layer's realised survivor count == its ``target`` budget.
+
+    Mirrors upstream REAM ``merger.py:463`` (``assert moe_layer.num_experts ==
+    self.merge_size``). OPT-IN at the call site (gated on
+    ``stage2_reap_ream.assert_survivors_match_target``, default False) so
+    default runs stay byte-identical: the REAM bump loop
+    (orchestrator.py:465-487) may legitimately RAISE the realised count above
+    ``target`` on a feasibility/cost-gate bump, which a hard equality assert
+    would (correctly) abort. The probe enables the flag with the bump gates
+    inert + a uniform-K budget pin, so ``target`` is honoured exactly and any
+    silent overshoot ABORTS. On the faithful-prune path the count is
+    deterministic (``n_experts - n_prune``); pinning ``target`` to that value
+    lets the same guard cover both REAP and REAM groups.
+    """
+    if n_survivors != target:
+        raise RuntimeError(
+            f"Stage 2 layer {layer_idx}: survivor count {n_survivors} != "
+            f"target {target} (prune_mode="
+            f"{'faithful_prune' if faithful else 'merge'}). A REAM "
+            "feasibility/cost-gate bump overshot the budget, or the "
+            "faithful-prune keep-count diverged from the pinned target. The "
+            "probe requires exact survivor==target; configure the bump gates "
+            "inert or fix the budget pin."
+        )
+
+
 def run(
     model,
     tokenizer,
@@ -702,6 +731,10 @@ def run(
             "expected 'merge' or 'faithful_prune'."
         )
     _faithful_prune = _faithful_enabled(config)
+    # Opt-in post-merge survivor-count guard (see the per-layer loop). Default
+    # False so default merge runs (whose bump loop may legitimately overshoot
+    # the budget) are byte-identical; the probe sets it to enforce exactly-K.
+    _assert_survivors = bool(s2.get("assert_survivors_match_target", False))
     if _faithful_prune:
         _prune_fraction = s2.get("prune_fraction")
         if _prune_fraction is None or not (0.0 < float(_prune_fraction) < 1.0):
@@ -1677,6 +1710,14 @@ def run(
             walk_phases(_STAGE2_PRE_ASSIGN_PHASES, plugins, ctx)
             _run_assignment(plugins, ctx)
             walk_phases(_STAGE2_POST_ASSIGN_PHASES, plugins, ctx)
+
+        # Post-merge survivor-count guard (OPT-IN — see
+        # ``_assert_survivor_count`` and the flag read above).
+        if _assert_survivors:
+            _assert_survivor_count(
+                len(ctx.get("final_kept_ids")), target,
+                layer_idx=layer_ref.layer_idx, faithful=_faithful_prune,
+            )
     walk_phases(("on_run_teardown",), plugins, run_ctx)
 
     out_dir = artifacts_dir / "stage2_pruned"
