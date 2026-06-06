@@ -688,6 +688,46 @@ def run(
             "expected 'freq_weighted', 'mergemoe', or 'regmean'."
         )
 
+    # Faithful-prune mode (PLAN_REAP_FAITHFUL_PRUNER.md). Default "merge" keeps
+    # the byte-identical merge path; "faithful_prune" routes Stage 2 through
+    # ``ReapPrunePlugin`` (pure structural drop, no merge/cost/solver/heal).
+    # Validate the mode + ``prune_fraction`` at the top of run() — same
+    # fail-fast posture as the checks above — so misconfigured pipelines
+    # surface the error before spending compute on calibration loading.
+    from .plugins.reap_prune import faithful_prune_enabled as _faithful_enabled
+    _prune_mode = str(s2.get("prune_mode", "merge"))
+    if _prune_mode not in ("merge", "faithful_prune"):
+        raise ValueError(
+            f"stage2_reap_ream.prune_mode={_prune_mode!r}; "
+            "expected 'merge' or 'faithful_prune'."
+        )
+    _faithful_prune = _faithful_enabled(config)
+    if _faithful_prune:
+        _prune_fraction = s2.get("prune_fraction")
+        if _prune_fraction is None or not (0.0 < float(_prune_fraction) < 1.0):
+            raise ValueError(
+                "stage2_reap_ream.prune_mode='faithful_prune' requires "
+                "stage2_reap_ream.prune_fraction in (0, 1) (the per-layer "
+                f"expert drop fraction); got {_prune_fraction!r}."
+            )
+        # Faithful mode is a pure prune: the merge/cost/solver/heal machinery
+        # is BYPASSED. Refuse the contradictory combo (non-inert merge knobs)
+        # so a misconfig fails loud, not silently. expert_distill_steps and
+        # merge_heal_enabled both default to inert; flipping them on under
+        # faithful_prune would have no effect (the plugins are dropped), so
+        # reject it rather than silently ignore.
+        if int(s2.get("expert_distill_steps", 0)) != 0:
+            raise ValueError(
+                "stage2_reap_ream.prune_mode='faithful_prune' is incompatible "
+                "with expert_distill_steps>0 (no merge groups exist to distill)."
+            )
+        if bool(s2.get("merge_heal_enabled", False)):
+            raise ValueError(
+                "stage2_reap_ream.prune_mode='faithful_prune' is incompatible "
+                "with merge_heal_enabled=true (experts are dropped, not merged; "
+                "there is no merged centroid to heal)."
+            )
+
     # Plugin #14 audit (HIGH-2): hard mutual-exclusion between Plugin #10's
     # ``sequential_reprofile`` and Plugin #12's ``profile_sidecar.enabled``.
     # REAM §4 warns that pre-collected statistics go stale after a merge.
@@ -1225,6 +1265,7 @@ def run(
     from .plugins.ream_cost_post import ReamCostPostPlugin
     from .plugins.ream_sequential import Stage2ReamSequentialPlugin
     from .plugins.reap_scoring import ReapScoringPlugin
+    from .plugins.reap_prune import ReapPrunePlugin
     from .plugins.regmean_merge import RegMeanMergeStepPlugin
     from .plugins.reap_scores_cache import Stage2ReapScoresCacheProvider
     from .plugins.routing_stats_cache import Stage2RoutingStatsCacheProvider
@@ -1287,6 +1328,17 @@ def run(
         merge_step=merge_step,
         # Stage-2 LSA threading perf knob (workstream A).
         lsa_threads=lsa_threads,
+    )
+    # Faithful-prune mode (PLAN_REAP_FAITHFUL_PRUNER.md): the pure-drop pruner.
+    # INERT by default (is_enabled gated on prune_mode == "faithful_prune"), so
+    # registry.enabled drops it on every merge-path run and the merge path stays
+    # byte-identical. Shares the run-scope ``merge_map`` + ``partial_dir`` with
+    # LayerMergePlugin (only one of the two is ever enabled at a time).
+    reap_prune = ReapPrunePlugin(
+        prune_fraction=float(s2.get("prune_fraction", 0.0) or 0.0),
+        blacklist=blacklist,
+        merge_map=merge_map,
+        partial_dir=partial_dir,
     )
     # Registration order matters: ReapScoringPlugin.on_layer_setup must run
     # BEFORE LayerMergePlugin.on_profile (which reads ctx.reap_acc into
@@ -1351,6 +1403,16 @@ def run(
         # layer consumer (Item 3 lays infrastructure only).
         Stage2RoutingStatsCacheProvider(),
         ReapScoringPlugin(),
+        # Faithful-prune pruner (PLAN_REAP_FAITHFUL_PRUNER.md). Registered
+        # AFTER ReapScoringPlugin (so ``scores``/``freq`` are published) and
+        # BEFORE the merge machinery. INERT by default: ``is_enabled`` returns
+        # True only when ``prune_mode == "faithful_prune"`` — registry.enabled
+        # drops it on every merge-path run, keeping that path byte-identical.
+        # In faithful mode the orchestrator drops LayerMergePlugin + the
+        # cost/solver/refine/distill/heal plugins (see the post-enabled filter
+        # below) and routes layers through ``_STAGE2_LAYER_PHASES`` so this
+        # plugin's ``compute_assignment`` (not the bump loop) runs.
+        reap_prune,
         # S2-10: the capacity-utilization gate. Registered AFTER ReapScoringPlugin
         # and BEFORE the three cost plugins so its ``select_alignment`` slot runs
         # earlier in the bump iteration and publishes the gate decision
@@ -1489,6 +1551,46 @@ def run(
         Stage2ReamSequentialPlugin(),
     ])
     plugins = registry.enabled(config)
+    # Faithful-prune mode: drop the entire merge spine + machinery so only the
+    # cache providers, ReapScoringPlugin, and ReapPrunePlugin remain. The merge
+    # plugins' ``is_enabled`` gates do NOT all self-deselect (LayerMergePlugin
+    # is always-on), and LayerMergePlugin.write_artifacts would ``ctx.get()``
+    # ~12 bump-loop slots the faithful ``compute_assignment`` never sets
+    # (KeyError on a missing slot). Filtering them here is the surgical drop.
+    if _faithful_prune:
+        from .plugins.capacity_gate import CapacityGatePlugin as _CapacityGatePlugin
+        from .plugins.expert_distill import ExpertDistillPlugin as _ExpertDistillPlugin
+        from .plugins.layer_merge import LayerMergePlugin as _LayerMergePlugin
+        from .plugins.merge_heal import MergeHealPlugin as _MergeHealPlugin
+        from .plugins.output_space_cost import OutputSpaceCostPlugin as _OutputSpaceCostPlugin
+        from .plugins.ream_cost import ReamCostPrePlugin as _ReamCostPrePlugin
+        from .plugins.ream_cost_post import ReamCostPostPlugin as _ReamCostPostPlugin
+        from .plugins.ream_sequential import Stage2ReamSequentialPlugin as _Stage2ReamSequentialPlugin
+        from .plugins.regmean_merge import RegMeanMergeStepPlugin as _RegMeanMergeStepPlugin
+        from .plugins.skip_merge_floor import SkipMergeFloorPlugin as _SkipMergeFloorPlugin
+        from .plugins.solver_auto import AutoSolverPlugin as _AutoSolverPlugin
+        from .plugins.solver_greedy import GreedySolverPlugin as _GreedySolverPlugin
+        from .plugins.solver_hungarian import HungarianSolverPlugin as _HungarianSolverPlugin
+        from .plugins.solver_mcf import McfSolverPlugin as _McfSolverPlugin
+        from .plugins.solver_sinkhorn import SinkhornSolverPlugin as _SinkhornSolverPlugin
+        from .plugins.two_opt_refine import TwoOptRefinePlugin as _TwoOptRefinePlugin
+        from .plugins.em_refine import EmRefinePlugin as _EmRefinePlugin
+        _MERGE_MACHINERY = (
+            _CapacityGatePlugin, _ReamCostPrePlugin, _ReamCostPostPlugin,
+            _OutputSpaceCostPlugin, _SkipMergeFloorPlugin, _GreedySolverPlugin,
+            _HungarianSolverPlugin, _McfSolverPlugin, _SinkhornSolverPlugin,
+            _AutoSolverPlugin, _TwoOptRefinePlugin, _EmRefinePlugin,
+            _LayerMergePlugin, _RegMeanMergeStepPlugin, _ExpertDistillPlugin,
+            _MergeHealPlugin, _Stage2ReamSequentialPlugin,
+        )
+        plugins = tuple(
+            p for p in plugins if not isinstance(p, _MERGE_MACHINERY)
+        )
+        log.info(
+            "Stage 2 faithful_prune mode: dropped the merge spine + machinery; "
+            "running pure REAP prune (prune_fraction=%.4f)",
+            float(s2.get("prune_fraction")),
+        )
     walk_phases(("on_run_setup",), plugins, run_ctx)
 
     # Run-scope sidecar load. Stage2ReapScoresCacheProvider.on_load tries
@@ -1563,9 +1665,18 @@ def run(
         # loop over the four fine-grained assignment slots, then the
         # post-assign phases run. ``_STAGE2_LAYER_PHASES`` (the derived 9-tuple)
         # is the back-compat view of this same canonical order.
-        walk_phases(_STAGE2_PRE_ASSIGN_PHASES, plugins, ctx)
-        _run_assignment(plugins, ctx)
-        walk_phases(_STAGE2_POST_ASSIGN_PHASES, plugins, ctx)
+        if _faithful_prune:
+            # Faithful prune: route the layer through the plain 10-phase
+            # schedule so the ``compute_assignment`` slot dispatches to
+            # ``ReapPrunePlugin.compute_assignment`` (top-K selection). This
+            # SKIPS ``_run_assignment`` (the bump loop / cost / solver /
+            # _promote_orphans) entirely — exactly the upstream "no merge"
+            # posture.
+            walk_phases(_STAGE2_LAYER_PHASES, plugins, ctx)
+        else:
+            walk_phases(_STAGE2_PRE_ASSIGN_PHASES, plugins, ctx)
+            _run_assignment(plugins, ctx)
+            walk_phases(_STAGE2_POST_ASSIGN_PHASES, plugins, ctx)
     walk_phases(("on_run_teardown",), plugins, run_ctx)
 
     out_dir = artifacts_dir / "stage2_pruned"

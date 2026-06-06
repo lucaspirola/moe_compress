@@ -141,6 +141,7 @@ def _write_merge_json(
     distill_state: dict | None = None,
     heal_state: dict | None = None,
     stage2_run_id: str | None = None,
+    pruned_expert_ids: list[int] | None = None,
 ) -> None:
     """Write the per-layer merge record to a durable JSON file.
 
@@ -164,6 +165,11 @@ def _write_merge_json(
                           callers / pre-S-2 writers), the key is omitted
                           from the payload so existing on-disk schemas stay
                           byte-identical.
+        pruned_expert_ids: Optional list of dropped expert IDs (the complement
+                          of ``final_kept_ids``), written by the faithful REAP
+                          pruner (PLAN_REAP_FAITHFUL_PRUNER.md §3.7). Additive —
+                          ``format_version`` stays at 2; omitted-when-None so
+                          the merge path JSON stays byte-identical.
     """
     payload = {
         "format_version": 2,
@@ -193,6 +199,14 @@ def _write_merge_json(
     # round-trip tests + on-disk schemas remain byte-identical.
     if stage2_run_id is not None:
         payload["stage2_run_id"] = stage2_run_id
+    # Faithful-prune (PLAN_REAP_FAITHFUL_PRUNER.md §3.7): additive optional
+    # field — the complement of ``final_kept_ids`` (the dropped experts), for
+    # downstream parity with upstream's ``experts_to_prune``. Same omit-when-None
+    # contract as ``stage2_run_id`` above: ``format_version`` stays at 2 and the
+    # merge path (which passes None) keeps the JSON byte-identical. ``resume.py``
+    # ignores unknown keys, so reading stays safe.
+    if pruned_expert_ids is not None:
+        payload["pruned_expert_ids"] = list(pruned_expert_ids)
     tmp = partial_dir / f"merge_{layer_idx}.json.tmp"
     final = partial_dir / f"merge_{layer_idx}.json"
     tmp.write_text(json.dumps(payload), encoding="utf-8")
