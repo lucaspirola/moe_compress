@@ -114,14 +114,15 @@ class RkdPaperRecipePlugin:
     functional entry point, called by the orchestrator before its config
     captures).
 
-    When ``stage5_router_kd.rkd_recipe == "paper"`` is set in the YAML,
-    ``apply_config_overrides(config)`` mutates ``config`` in place to apply
-    the 4 paper-recipe deltas + the wikitext-103-raw calibration source.
-    When it is ``"paper_dials_only"``, the same 4 dials + cache-clear are
-    applied but the calibration source is left untouched (project source
-    preserved). The default value ``"current"`` makes the method a no-op, so
-    existing runs that do not opt in are byte-identical to pre-plugin
-    behavior.
+    ``stage5_router_kd.rkd_recipe`` selects one of two opt-in modes (the
+    YAML default ``"current"`` makes ``apply_config_overrides(config)`` a
+    no-op, so existing runs that do not opt in are byte-identical to
+    pre-plugin behavior):
+
+    * ``"paper"`` — apply the 4 paper-recipe deltas + the cache-clear AND
+      swap the calibration source to wikitext-103-raw.
+    * ``"paper_dials_only"`` — apply the same 4 dials + cache-clear but
+      leave the calibration source untouched (project source preserved).
     """
 
     name = "rkd_paper_recipe"
@@ -210,7 +211,6 @@ class RkdPaperRecipePlugin:
         # adapter registered in ``utils/calibration.py``). The
         # "paper_dials_only" recipe SKIPS this block so the project's own
         # calibration source is preserved.
-        swapped_source = False
         if recipe == "paper":
             cal = config.get("calibration")
             if not isinstance(cal, dict):
@@ -224,7 +224,6 @@ class RkdPaperRecipePlugin:
                 cal = {}
                 config["calibration"] = cal
             cal["source"] = "wikitext-103-raw"
-            swapped_source = True
 
         log.info(
             "RkdPaperRecipePlugin: applied %s overrides — "
@@ -234,7 +233,7 @@ class RkdPaperRecipePlugin:
             recipe,
             (
                 "swapped to 'wikitext-103-raw'"
-                if swapped_source
+                if recipe == "paper"
                 else "left unchanged (project source preserved)"
             ),
         )
