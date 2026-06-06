@@ -16,10 +16,14 @@ folded in. See §10 for the point-by-point resolution. Headline corrections:
   `KeyError` on a missing slot (`context.py:91`). So we adopt wiring (a):
   `ReapPrunePlugin` owns `merge`/`post_merge`/`write_artifacts` and emits ONLY the
   fields `resume.py` reads — see §3.7.
-- `ctx.get("target")` (`orchestrator.py:249`) is the SVD-split **param** budget
-  (`per_layer_target_experts` ← `budget/solver.py:solve`, driven by
-  `total_reduction_ratio × expert_svd_ratio`), NOT a 35% expert fraction. Faithful
-  mode BYPASSES it and computes `n_prune` from an explicit `prune_fraction` — §3.3.
+- `ctx.get("target")` (`orchestrator.py:249`) is the Stage-1 **GRAPE-allocated**
+  per-layer expert budget (`per_layer_target_experts`), NOT a 35% expert fraction.
+  Provenance corrected (nit C): `budget/solver.py:113-119` explicitly states
+  `per_layer_target_experts` is **NOT a solver output** — the solver yields only the
+  global `global_expert_budget`; GRAPE in Stage 1 distributes it non-uniformly
+  across layers (activation-aware CKA, `min_experts_per_layer` floor). It is driven
+  by the overall reduction config, not a clean 35% expert drop. Faithful mode
+  BYPASSES it and computes `n_prune` from an explicit `prune_fraction` — §3.3.
 - Protected-experts exclusion is a **genuine divergence** from upstream's
   default-OFF super-expert preservation (`args.py:515,523` both `default=False`) —
   re-documented in §7 with a `protected=∅` upstream-formula byte-match test.
@@ -154,7 +158,7 @@ ModuleList. **Our** Qwen3.5/3.6 stores experts in the **fused**
 | router row slice (no rescale) | `prune.py:126,142` | `_resize_router_for_kept_experts` (`merging.py:421-437`) — slices rows, updates `num_experts`/`top_k`, **no rescale** (matches upstream) | **reuse as-is** |
 | wire select+resize into spine | `prune.py` loop | `LayerMergePlugin.post_merge` (`layer_merge.py:610-629`) calls both off `final_kept_ids` | **NEW: alternative `final_kept_ids` producer** |
 | merge/solve/cost/heal | n/a (no merge) | full machinery | **MUST be bypassed** in faithful mode |
-| target → n_prune | `prune.py:261` | budget logic computes per-layer `target` (kept count) in `orchestrator.py` | **reuse the target arithmetic, drop the bump loop** |
+| target → n_prune | `prune.py:261` (`int(total_experts*compression_ratio)`) | `ctx.get("target")` is the **Stage-1 GRAPE-allocated** `per_layer_target_experts` (NOT a solver output — `budget/solver.py:113-119`), driven by the SVD-aware reduction config, not a 35% expert drop | **BYPASS `target`; compute `n_prune` from explicit `prune_fraction` (§3.3)** |
 
 **Net delta = ONE new plugin + ONE config mode flag** that:
 1. computes `final_kept_ids = top-(n_experts - n_prune) experts by REAP score`
@@ -250,12 +254,17 @@ The orchestrator's per-layer walk has the bump loop + grouping inline in
   **CRITICAL (finding #3) — do NOT use `ctx.get("target")`.** That slot
   (`orchestrator.py:249`, set at `:1554` from `per_layer_target[layer_idx]`,
   `:1545`) traces to `stage1_budgets.json["per_layer_target_experts"]`
-  (`orchestrator.py:747-748`) ← `budget/solver.py:solve(...)` driven by
-  `total_reduction_ratio` (0.30) × `expert_svd_ratio` (2.0)
-  (`budget/solver.py:15,70,121,351`). That is the **SVD-split param budget**, not a
-  35% expert fraction, and `solver.py:114` explicitly notes
-  `per_layer_target_experts` is the param-budget N'_l. Using it would prune
-  "whatever the SVD split left over", silently ignoring §4's `prune_fraction`.
+  (`orchestrator.py:747-748`). Provenance (nit C, CONFIRMED `budget/solver.py:113-119`):
+  `per_layer_target_experts` is **NOT a `solve()` output** — the docstring says so
+  verbatim ("``per_layer_target_experts`` (N'_l in the spec) is **not** a solver
+  output"). The solver yields only the global `global_expert_budget`
+  (`solver.py:124`); **GRAPE in Stage 1** distributes it non-uniformly across layers
+  (activation-aware CKA similarity, subject to `min_experts_per_layer`,
+  `solver.py:116-119`). So the per-layer value is a GRAPE allocation of the overall
+  reduction target (`total_reduction_ratio` 0.30 / `expert_prune_ratio` /
+  `svd_rank_ratio`, `solver.py:121-123`), NOT a clean 35%-of-experts drop. Using it
+  would prune "whatever GRAPE allocated for the SVD-aware param budget", silently
+  ignoring §4's `prune_fraction`.
 
   Faithful mode instead computes `n_prune` from the explicit `prune_fraction`
   (§4), mirroring upstream's direct `int(total_experts * compression_ratio)`
@@ -321,10 +330,13 @@ covariance/imatrix; those can be skipped in faithful mode for speed — note in
 **Q1 is resolved (finding #3): faithful mode BYPASSES `ctx.get("target")`.** The
 brief's "35%" is a per-layer **expert** drop fraction (upstream `compression_ratio`
 semantics, `prune.py:261`). The orchestrator's `target` slot is a different number
-— the SVD-split **param** budget (`per_layer_target_experts`, ←
-`budget/solver.py:solve` driven by `total_reduction_ratio: 0.30 × expert_svd_ratio:
-2.0`; `solver.py:114` marks it as the param-budget N'_l). They are not the same
-quantity and must not be conflated.
+— the **Stage-1 GRAPE-allocated** per-layer expert budget
+(`per_layer_target_experts`). Provenance (nit C): `budget/solver.py:113-119`
+explicitly states this is NOT a `solve()` output; the solver emits only the global
+`global_expert_budget` (`solver.py:124`) and **GRAPE** distributes it per-layer
+(CKA-weighted, `min_experts_per_layer` floor). It is a function of the overall
+reduction config, NOT a clean 35%-of-experts drop. They are not the same quantity
+and must not be conflated.
 
 So the ONE source of truth for the drop count is the explicit `prune_fraction`
 under `stage2_reap_ream` (§4):
@@ -376,10 +388,28 @@ Notes that make this correct:
 - **No bump-loop fields are written** (`n_protected`, `c_fail`, `effective_target`,
   etc.) — `resume.py` never reads them; they existed only for forensic logging on
   the merge path.
-- `write_artifacts` must STILL call `_write_merge_json(...)` (`shared_io.py:129`)
-  with the neutral defaults above, AND write the sentinel `.pt` (§5, finding #1).
-  It must NOT call `_remap_covariance_for_layer` / `_snapshot_cov_layer` /
+- `write_artifacts` calls `_write_merge_json(...)` (`shared_io.py:129`) with the
+  neutral defaults above, AND write the sentinel `.pt` (§5, finding #1). It must
+  NOT call `_remap_covariance_for_layer` / `_snapshot_cov_layer` /
   `_snapshot_neuron_means_layer` (no covariance exists in faithful mode).
+- **`pruned_expert_ids` requires a `_write_merge_json` EDIT (blocker B).**
+  `_write_merge_json` (`shared_io.py:129-199`) currently has NO `pruned_expert_ids`
+  parameter and never serializes it, so the §3.7 payload table CANNOT be satisfied
+  by reusing it unchanged. The fix is an **additive optional kwarg**, mirroring the
+  existing `stage2_run_id` omitted-when-None pattern (CONFIRMED `shared_io.py:194-195`:
+  `if stage2_run_id is not None: payload["stage2_run_id"] = stage2_run_id`):
+  ```
+  def _write_merge_json(..., stage2_run_id=None, pruned_expert_ids=None):  # signature :129-144
+      payload = { ... }                       # format_version stays 2
+      if stage2_run_id is not None:           # existing, :194-195
+          payload["stage2_run_id"] = stage2_run_id
+      if pruned_expert_ids is not None:       # NEW — same omit-when-None contract
+          payload["pruned_expert_ids"] = list(pruned_expert_ids)
+  ```
+  Because the key is OMITTED when None, the merge path (which passes None) keeps the
+  merge JSON **byte-identical** — every existing stage2 golden / resume round-trip
+  test stays green. `resume.py` ignores unknown keys, so reading is safe. This
+  makes `_write_merge_json` an **EDIT**, not a reuse-unchanged (corrected in §8).
 
 ---
 
@@ -400,6 +430,13 @@ pipeline:
 Code must **assert/refuse** the contradictory combo (faithful_prune +
 non-default merge knobs, or + `skip_intermediate_stages: false` with stage3 SVD
 expecting merged centroids) so a misconfig fails loud, not silently.
+
+**Env (nit D):** set `MOE_SKIP_STAGE2_COV_SAVE=1` for the faithful run (in the
+runner / launch env, or document it alongside this config). In faithful mode
+`cov_acc` is empty, so the end-of-run `_save_covariance`
+(`orchestrator.py:1572-1576`) would otherwise write a useless empty
+`_stage2_input_covariance.pt`. Stage 3 (its only consumer) is skipped anyway, so
+the guard just avoids the wasted write — harmless if omitted, see §5.
 
 `prune_mode` default is `"merge"` everywhere → **every existing config and golden
 snapshot is byte-identical** (the new plugin's `is_enabled` returns False).
@@ -445,6 +482,19 @@ calls `bank.select` + `_resize_router_for_kept_experts` — exactly the right
 behavior for a pure prune. **Confirm in review** that `_accumulate_payload` tolerates
 empty `covariance`/`tokens` dicts (it iterates the maps; empty ⇒ no-op).
 
+**Replay also calls `_merge_experts_inplace` — no-op for faithful, but ONLY by
+construction (nit A).** BEFORE the `bank.select` above, the replay path
+unconditionally runs `_merge_experts_inplace(ref, record.grouped, record.freq, …)`
+(`orchestrator.py:951-956`). For a faithful layer `record.grouped` is all
+singletons, and `_merge_experts_inplace` skips any group with `len(members) <= 1`
+(CONFIRMED `merging.py:161-163`: `for centroid, members in grouped.items(): if
+len(members) <= 1: continue`). So it touches zero weights — the per-expert tensors
+reach `bank.select` byte-identical to a fresh run. This is the load-bearing
+invariant behind the §6 test-6 (faithful resume round-trip) byte-equality
+assertion: if a future change ever made `_merge_experts_inplace` mutate singleton
+groups, the resumed weights would diverge silently. Test-6 must assert byte-equal
+weights (not just equal `final_kept_ids`) so it locks `merging.py:162` in place.
+
 **Why (a) over (b):** option (b) (teach `resume.py` to treat present
 `merge_*.json` + no-`.pt` as a completed faithful layer) requires `resume.py` to
 KNOW the run is in faithful mode, which it does not have in scope at `:135`
@@ -461,6 +511,14 @@ changes to the shared resume reader. Lower blast radius, no cross-mode coupling.
 **Covariance remap is NOT called in faithful mode:** `write_artifacts` skips
 `_remap_covariance_for_layer` (`layer_merge.py:680`) and the two snapshot helpers
 (no covariance collected) — see §3.7. This removes the §9-Q3 open item.
+
+**End-of-run covariance save (nit D — harmless, but set the guard):** at run end
+`orchestrator.py:1576` `_save_covariance(cov_acc, "_stage2_input_covariance.pt")`
+runs unless `MOE_SKIP_STAGE2_COV_SAVE == "1"` (`:1572-1574`). In faithful mode
+`cov_acc` is empty, so this writes an empty/degenerate `_stage2_input_covariance.pt`.
+It is harmless — Stage 3 (its only consumer) is skipped in faithful mode
+(`skip_intermediate_stages: true`, §4) — but wasteful. The faithful config/runner
+should set `MOE_SKIP_STAGE2_COV_SAVE=1` (§4) so the empty file is never written.
 
 This is exercised by the §6 faithful-mode resume round-trip test.
 
@@ -510,8 +568,13 @@ hidden=16, num_experts=3-8, num_experts_per_tok=1). **No GPU.**
      re-applied / `resume.py` returns a record for layer 0);
    - `cov_acc.load_layer_from_disk(0, partial_dir)` returns `True` and accumulates
      no covariance (empty sentinel);
-   - the resumed model's per-layer expert count == fresh-run count (byte-equal
-     `final_kept_ids`).
+   - the resumed model's per-layer expert count == fresh-run count, with **byte-equal
+     surviving expert tensors AND `final_kept_ids`** (not just equal counts). The
+     byte-equality of weights is the assertion that locks `merging.py:162` (nit A):
+     replay runs `_merge_experts_inplace(record.grouped,…)` (`orchestrator.py:951`)
+     before `bank.select`, and it is a no-op for faithful singletons ONLY because
+     `merging.py:161-163` skips `len(members) <= 1` groups. If that skip ever
+     regressed, this assertion fails.
    This is the regression lock for the "resume silently re-runs every layer" bug.
 7. **NEW — protected=∅ upstream-formula byte-match** (`test_reap_prune_upstream_formula.py`)
    (finding #6 / #7b): with `protected = ∅` (upstream default, both
@@ -580,6 +643,10 @@ fidelity (`prune.py:142`, no post-drop renorm).
   layers through `walk_phases(_STAGE2_LAYER_PHASES, plugins, ctx)` instead of the
   `_run_assignment` split at `:1566-1568` (so the plain `compute_assignment` phase
   dispatches to `ReapPrunePlugin`, never the bump loop). Pin to `:1538-1568`.
+- **EDIT `max_quality/src/moe_compress/stage2/shared_io.py`** — add the additive
+  optional `pruned_expert_ids=None` kwarg to `_write_merge_json` (`:129-199`),
+  omitted-when-None so the merge path JSON stays byte-identical (blocker B; mirrors
+  the `stage2_run_id` pattern at `:194-195`).
 - NEW `max_quality/configs/qwen36_35b_a3b_reap_faithful.yaml`
 - NEW tests (§6, **7 files** — incl. the new resume round-trip and the
   protected=∅ upstream-formula byte-match).
@@ -589,8 +656,9 @@ fidelity (`prune.py:142`, no post-drop renorm).
   `_remap_covariance_for_layer` are simply NOT CALLED in faithful mode.
 - Reused unchanged: `plugins/reap_scoring.py`, `utils/model_io.py`
   (`ExpertMatrixBank.select`), `stage2/merging.py`
-  (`_resize_router_for_kept_experts`), `stage2/shared_io.py:_write_merge_json` +
-  the atomic-write helpers (for the sentinel `.pt`).
+  (`_resize_router_for_kept_experts`), and the `shared_io.py` atomic-write helpers
+  (for the sentinel `.pt`). NOTE: `_write_merge_json` is an EDIT (see above), not a
+  reuse-unchanged — the `pruned_expert_ids` field requires the new kwarg.
 
 ---
 
@@ -598,9 +666,10 @@ fidelity (`prune.py:142`, no post-drop renorm).
 
 1. **(RESOLVED — §3.3/§3.6)** The 35% is a per-layer *expert* fraction (upstream
    `compression_ratio` semantics). Faithful mode uses an explicit `prune_fraction`
-   and **BYPASSES `ctx.get("target")`** (which is the SVD-split param budget, not a
-   35% expert drop — confirmed `orchestrator.py:249,747-748` ←
-   `budget/solver.py:114,121,351`).
+   and **BYPASSES `ctx.get("target")`** — which is the Stage-1 GRAPE-allocated
+   per-layer budget, not a 35% expert drop (confirmed `orchestrator.py:249,747-748`;
+   provenance corrected per nit C: `budget/solver.py:113-119` says
+   `per_layer_target_experts` is NOT a solver output — GRAPE allocates it in Stage 1).
 2. **(RESOLVED — §3.2/§3.5/§3.7)** Wiring **(a) ADOPTED**: `ReapPrunePlugin` owns
    `merge`/`post_merge`/`write_artifacts`; `LayerMergePlugin` is dropped in
    faithful mode. Required, not just preferred — `LayerMergePlugin.write_artifacts`
