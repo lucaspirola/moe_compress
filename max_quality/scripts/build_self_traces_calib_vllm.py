@@ -88,6 +88,26 @@ import time
 from pathlib import Path
 from typing import Iterable, Iterator
 
+# B0/C1 — run the vLLM V1 EngineCore IN-PROCESS (no engine subprocess).
+#
+# vLLM V1 defaults VLLM_ENABLE_V1_MULTIPROCESSING=1, which runs EngineCore (and
+# therefore the model forward + every capture *dispatch* site: MoERunner.apply,
+# TritonExperts.apply, LinearBase, LogitsProcessor) in a separate WORKER
+# subprocess. Our calibration writers call register_callback() in the DRIVER
+# process, so under MP=1 the worker's callback registry is empty and every
+# dispatch is a no-op; the driver's _resolve_model() also finds no
+# model_executor (set only `if not multiprocess_mode`), so _N_LAYERS=0 and
+# every sidecar is written empty ("no MoE layers seen").
+#
+# Forcing MP=0 makes EngineCore run in-process so setup + dispatch + dump all
+# share one process. Calibration is single-GPU (tp=1 -> UniProcExecutor), so
+# in-process is correct here and also more deterministic for capture.
+#
+# Must be set BEFORE vllm is first imported anywhere (the import is lazy, inside
+# _load_teacher_vllm), so it lives at module level here. setdefault lets an
+# operator still pin their own value if they truly need MP on.
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
 # Reuse prompt loaders + per-domain stats helpers from the HF script — they
 # don't depend on transformers / vLLM, only on utils/calibration.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -155,6 +175,128 @@ def _trace_cache_key_vllm(
         "schema_version": 9,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# B0 fail-fast: enabled captures must produce nonzero entries.
+# ---------------------------------------------------------------------------
+
+# Maps each --capture-* arg name to the vllm writer module that holds its
+# accumulator. ``layer_input_reservoir`` rides stage2_profile (no separate
+# module), so it is intentionally absent here -- its non-emptiness is covered
+# by the stage2_profile writer's count.
+_CAPTURE_WRITER_MODULES: dict[str, str] = {
+    "capture_imatrix": "vllm.calibration_imatrix",
+    "capture_reap_scores": "vllm.calibration_reap_scores",
+    "capture_input_covariance": "vllm.calibration_input_cov",
+    "capture_wanda_scalar_row": "vllm.calibration_wanda_scalar_row",
+    "capture_stage2_profile": "vllm.calibration_stage2_profile",
+    "capture_per_expert_max": "vllm.calibration_per_expert_max",
+    "capture_routing_stats": "vllm.calibration_routing_stats",
+    "capture_router_logits_stats": "vllm.calibration_router_logits_stats",
+    "capture_output_reservoir": "vllm.calibration_output_reservoir",
+    "capture_block_outputs": "vllm.calibration_block_outputs",
+}
+
+
+def _default_writer_resolver(module_name: str):
+    """Import a vllm calibration writer module by dotted name.
+
+    Separated out so tests can inject a fake resolver returning stub writer
+    objects (no monkeypatch of production code, no real vllm wheel required).
+    """
+    import importlib
+
+    return importlib.import_module(module_name)
+
+
+def assert_enabled_captures_nonempty(
+    enabled_captures,
+    *,
+    model_class: str = "<unknown>",
+    allow_empty: bool = False,
+    writer_resolver=_default_writer_resolver,
+) -> dict[str, int]:
+    """B0 fail-fast: verify every ENABLED capture has nonzero entries.
+
+    Called once, right after the first chunk that actually invoked
+    ``llm.generate()``. For each enabled ``--capture-*`` it resolves the
+    writer module and reads its PUBLIC ``captured_entry_count() -> int``
+    (no private ``_state`` reach-in, no monkeypatch).
+
+    Behaviour per writer:
+      * writer exposes ``captured_entry_count`` and returns 0  -> EMPTY
+        (a hook/model mismatch -- the B0 bug class).
+      * writer exposes it and returns > 0                      -> OK.
+      * writer (installed wheel) predates the method            -> SKIP with a
+        WARNING (cannot prove emptiness; do not crash on an old wheel).
+
+    If any enabled capture is EMPTY: log ERROR naming every empty capture +
+    the resolved model class, then ``SystemExit(2)`` BEFORE any checkpoint --
+    unless ``allow_empty`` (``--allow-empty-captures``) downgrades it to a
+    warning.
+
+    Returns ``{capture_arg_name: count}`` for the captures that exposed the
+    count method (diagnostic; SKIPs are omitted).
+    """
+    counts: dict[str, int] = {}
+    empty: list[str] = []
+    skipped: list[str] = []
+    for cap in enabled_captures:
+        module_name = _CAPTURE_WRITER_MODULES.get(cap)
+        if module_name is None:
+            # Not a count-checkable capture (e.g. layer_input_reservoir which
+            # rides stage2_profile). Skip silently.
+            continue
+        try:
+            writer = writer_resolver(module_name)
+        except Exception as exc:  # pragma: no cover - import-time failure
+            log.warning(
+                "B0 fail-fast: could not import writer %s for --%s (%s); "
+                "skipping its non-empty check.",
+                module_name, cap.replace("_", "-"), exc,
+            )
+            skipped.append(cap)
+            continue
+        counter = getattr(writer, "captured_entry_count", None)
+        if not callable(counter):
+            log.warning(
+                "B0 fail-fast: installed %s has no captured_entry_count() "
+                "(pre-B0 wheel); skipping its non-empty check. Rebuild the "
+                "patched wheel to enable this gate for --%s.",
+                module_name, cap.replace("_", "-"),
+            )
+            skipped.append(cap)
+            continue
+        n = int(counter())
+        counts[cap] = n
+        if n <= 0:
+            empty.append(cap)
+
+    if empty:
+        names = ", ".join("--" + c.replace("_", "-") for c in sorted(empty))
+        msg = (
+            "B0 fail-fast: %d enabled capture(s) produced ZERO entries after "
+            "the first generate chunk: %s. Resolved model class=%s. The "
+            "capture hooks did not bind to this model's MoE path -- see "
+            "tasks/PLAN_B0_HOOK_FIX.md (check VLLM_ENABLE_V1_MULTIPROCESSING=0 "
+            "and that the wheel carries the C2 predicate + M3 block hook)."
+        )
+        if allow_empty:
+            log.warning(msg + " (continuing: --allow-empty-captures set)",
+                        len(empty), names, model_class)
+        else:
+            log.error(msg, len(empty), names, model_class)
+            raise SystemExit(2)
+    else:
+        log.info(
+            "B0 fail-fast: all %d checkable enabled capture(s) nonempty "
+            "(%s)%s.",
+            len(counts),
+            ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none",
+            f"; {len(skipped)} skipped (pre-B0 wheel)" if skipped else "",
+        )
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1295,16 @@ def main() -> int:
                         "<jsonl>.block_outputs.ckpt is hydrated "
                         "automatically if it exists (including the "
                         "subset-closed flag).")
+    p.add_argument("--allow-empty-captures", action="store_true",
+                   default=False,
+                   help="B0 fail-fast bypass. By default, after the first "
+                        "chunk that actually ran vLLM generate(), the driver "
+                        "asserts every ENABLED --capture-* writer has a "
+                        "nonzero captured_entry_count() and SystemExit(2)s "
+                        "if any enabled capture is still empty (a hook/model "
+                        "mismatch -- see tasks/PLAN_B0_HOOK_FIX.md). Set this "
+                        "flag to downgrade that abort to a warning (debug "
+                        "only).")
     args = p.parse_args()
 
     # Apply operational env hardening (compile-OOM cap, durable compile cache,
@@ -1985,6 +2137,14 @@ def main() -> int:
     n_new = 0
     mode = "a" if already_done > 0 else "w"
     t0 = time.monotonic()
+    # B0 fail-fast state: run the non-empty assertion exactly once, after the
+    # first chunk that actually called llm.generate() (an all-TF first chunk
+    # legitimately captures nothing, so defer until a real generate chunk).
+    first_gen_chunk_checked = False
+    _enabled_captures = [
+        cap for cap in _CAPTURE_WRITER_MODULES
+        if getattr(args, cap, False)
+    ]
     with tmp_path.open(mode, encoding="utf-8") as f:
         for chunk_start in range(0, len(prompts), args.chunk_size):
             chunk = prompts[chunk_start:chunk_start + args.chunk_size]
@@ -2096,6 +2256,28 @@ def main() -> int:
                 total_done, total_target,
                 session_elapsed, session_elapsed / max(n_new, 1),
             )
+
+            # B0 fail-fast: after the FIRST chunk that actually ran
+            # llm.generate(), assert every enabled capture has nonzero
+            # entries. Runs once (first_gen_chunk_checked guard) and only on a
+            # real generate chunk (an all-TF first chunk captures nothing
+            # legitimately). Placed BEFORE close_subset so we abort with
+            # partial JSONL intact and no checkpoint written.
+            if gen_chunk and not first_gen_chunk_checked:
+                first_gen_chunk_checked = True
+                if _enabled_captures:
+                    try:
+                        _model_cls = type(
+                            llm.llm_engine.model_executor.driver_worker
+                            .model_runner.model
+                        ).__name__
+                    except Exception:
+                        _model_cls = "<unresolved>"
+                    assert_enabled_captures_nonempty(
+                        _enabled_captures,
+                        model_class=_model_cls,
+                        allow_empty=args.allow_empty_captures,
+                    )
 
             # Block-outputs subset gate. Close as soon as the cumulative
             # prompt counter reaches the configured subset size so any

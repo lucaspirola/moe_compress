@@ -59,12 +59,16 @@ echo "[$(date)] === Phase 5: fetch and apply BOTH calibration patches ==="
 #     core hooks + 10 writer modules (block_outputs / hooks / imatrix /
 #     input_cov / output_reservoir / per_expert_max / reap_scores /
 #     router_logits_stats / routing_stats / wanda_scalar_row), the
-#     envs.py mirror, and the Qwen3MoeSparseMoeBlock dispatch sites.
-#     Includes CRITICAL-1's layer_in hook (env var
+#     envs.py mirror, and the Qwen3MoeSparseMoeBlock + (B0/M3)
+#     Qwen3NextSparseMoeBlock (qwen3_next.py, reused by qwen3_5 for
+#     Qwen3.6) dispatch sites. Includes CRITICAL-1's layer_in hook (env var
 #     VLLM_CALIB_CAPTURE_LAYER_IN + "layer_in" in VALID_HOOK_NAMES +
 #     dispatch site post-chunk pre-is_internal_router) and W-1's new
-#     calibration_wanda_scalar_row.py writer module.
-#  2. vllm_calibration_stage2_profile.patch (900 lines, MD5 176e1bc4...) —
+#     calibration_wanda_scalar_row.py writer module. B0: discovery predicate
+#     now keys off global_num_experts (FusedMoE never sets num_experts), and
+#     every writer exposes a public captured_entry_count() for the driver
+#     fail-fast.
+#  2. vllm_calibration_stage2_profile.patch (923 lines, MD5 7e04ccb6...) —
 #     creates calibration_stage2_profile.py with the
 #     _layer_in_handler writer subscription (receiver for patch #1's
 #     dispatch), _LAYER_INPUT_MAX_SAMPLES constant, and the
@@ -77,18 +81,21 @@ echo "[$(date)] === Phase 5: fetch and apply BOTH calibration patches ==="
 # See max_quality/patches/MANIFEST.md.
 
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-stage2-profile-complete/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/feat/b0-hook-fix/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected: 11272 lines, MD5 9aaf47abd4c44bf2b2a62edd7e28014f
+# Expected: 11450 lines, MD5 517377fe2ad7a169c08b5dd15c864c42
+# (B0 fix: C2 discovery predicate global_num_experts, M3 qwen3_next.py block
+#  hook, + captured_entry_count() public helper per writer.)
 
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/calib-v2-stage2-profile-complete/max_quality/patches/vllm_calibration_stage2_profile.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/feat/b0-hook-fix/max_quality/patches/vllm_calibration_stage2_profile.patch \
     -o /tmp/calib2.patch
 wc -l /tmp/calib2.patch
 md5sum /tmp/calib2.patch
-# Expected: 900 lines, MD5 176e1bc4ee08d32d0b2a12dc73b4fec4
+# Expected: 923 lines, MD5 7e04ccb6afcaeae8f800346ef319ad51
+# (B0 fix: + captured_entry_count() public helper.)
 
 git apply --check /tmp/calib.patch
 git apply /tmp/calib.patch
@@ -96,6 +103,15 @@ git apply --check /tmp/calib2.patch
 git apply /tmp/calib2.patch
 echo "Applied both. Status:"
 git status --short
+
+# Build-hygiene gate (B0/M3): confirm the new qwen3_next.py block hook landed
+# (the dispatch surface must exist in the v0.21.0 base or the M3 hunk is dead).
+echo "[$(date)] === Phase 5 gate: verify M3 qwen3_next.py block hook applied ==="
+grep -q 'def captured_entry_count' vllm/calibration_block_outputs.py \
+    || { echo "FATAL: captured_entry_count() missing from calibration_block_outputs.py"; exit 1; }
+grep -q '_ch.dispatch' vllm/model_executor/models/qwen3_next.py \
+    || { echo "FATAL: M3 block hook missing from qwen3_next.py"; exit 1; }
+echo "M3 + captured_entry_count() gate OK."
 
 echo "[$(date)] === Phase 5b: strip license + license-files lines from pyproject.toml ==="
 # vLLM 0.21.0 has BOTH `license = "Apache-2.0"` (SPDX-string, deprecated)
@@ -223,10 +239,18 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-- Source repo: https://github.com/lucaspirola/moe_compress (branch `main`, immutable tag `calib-v2-stage2-profile-complete`)
+B0 fix (this build): C2 discovery predicate now keys off `global_num_experts`
+(FusedMoE never sets `num_experts`, so the old predicate was always False ->
+empty sidecars); M3 ports the layer_in/block_out hook to
+`Qwen3NextSparseMoeBlock` (qwen3_next.py, reused by qwen3_5 for Qwen3.6); each
+writer exposes a public `captured_entry_count()` for the driver fail-fast.
+NOTE: the driver must also export `VLLM_ENABLE_V1_MULTIPROCESSING=0` (C1, env
+only, no rebuild) or captures stay empty regardless of this wheel.
+
+- Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/b0-hook-fix`)
 - Patch artifacts (also uploaded to this repo for traceability):
-  - `vllm_calibration_hooks.patch` — 11272 lines, MD5 `9aaf47abd4c44bf2b2a62edd7e28014f`
-  - `vllm_calibration_stage2_profile.patch` — 900 lines, MD5 `176e1bc4ee08d32d0b2a12dc73b4fec4`
+  - `vllm_calibration_hooks.patch` — 11450 lines, MD5 `517377fe2ad7a169c08b5dd15c864c42`
+  - `vllm_calibration_stage2_profile.patch` — 923 lines, MD5 `7e04ccb6afcaeae8f800346ef319ad51`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130

@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..9e35029
 --- /dev/null
 +++ b/vllm/calibration_stage2_profile.py
-@@ -0,0 +1,894 @@
+@@ -0,0 +1,917 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Stage 2 profile-pass sidecar capture (Plugin #12 REDO -- Optimization A).
@@ -130,6 +130,7 @@ index 0000000..9e35029
 +    "get_n_prompts_accumulated",
 +    "set_n_prompts_accumulated",
 +    "record_batch_token_count",
++    "captured_entry_count",
 +]
 +
 +# Sampled at import time -- matches calibration_reap_scores / imatrix.
@@ -898,3 +899,25 @@ index 0000000..9e35029
 +        )
 +    _state.layer_input_reservoir = new_reservoir
 +    return _state.n_prompts_accumulated
++
++
++def captured_entry_count() -> int:
++    """B0 fail-fast hook: number of MoE layers this writer has captured.
++
++    Public, read-only. The driver
++    (build_self_traces_calib_vllm.py::assert_enabled_captures_nonempty)
++    calls this after the first generate chunk and aborts if --capture-
++    stage2-profile is enabled yet still reports 0 (the B0 empty-sidecar
++    bug class). Counts layers with recorded ream-cost tokens, falling
++    back to the layer-input reservoir count; returns 0 before any MoE
++    forward has populated the accumulator.
++    """
++    n = 0
++    ream = getattr(_state, "ream_acc", None)
++    if ream is not None:
++        tbl = getattr(ream, "_total_tokens_by_layer", None)
++        if tbl:
++            n = len(tbl)
++    if n == 0:
++        n = len(_state.layer_input_reservoir)
++    return n

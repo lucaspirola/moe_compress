@@ -16,12 +16,12 @@ either one alone produces a partially-wired wheel.
 | Field | Value |
 |---|---|
 | Immutable tag | `calib-v2-fsync-complete` |
-| Branch (active) | `main` |
+| Branch (active) | `feat/b0-hook-fix` |
 | vLLM upstream SHA | `ad7125a431e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch 1 line count | **11272** |
-| Patch 1 MD5 | **`9aaf47abd4c44bf2b2a62edd7e28014f`** (vllm_calibration_hooks.patch) |
-| Patch 2 line count | **900** |
-| Patch 2 MD5 | **`176e1bc4ee08d32d0b2a12dc73b4fec4`** (vllm_calibration_stage2_profile.patch) |
+| Patch 1 line count | **11450** |
+| Patch 1 MD5 | **`517377fe2ad7a169c08b5dd15c864c42`** (vllm_calibration_hooks.patch) |
+| Patch 2 line count | **923** |
+| Patch 2 MD5 | **`7e04ccb6afcaeae8f800346ef319ad51`** (vllm_calibration_stage2_profile.patch) |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -31,14 +31,14 @@ either one alone produces a partially-wired wheel.
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: 9aaf47abd4c44bf2b2a62edd7e28014f
+# expect: 517377fe2ad7a169c08b5dd15c864c42
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 11272
+# expect: 11450
 
 md5sum max_quality/patches/vllm_calibration_stage2_profile.patch
-# expect: 176e1bc4ee08d32d0b2a12dc73b4fec4
+# expect: 7e04ccb6afcaeae8f800346ef319ad51
 wc -l max_quality/patches/vllm_calibration_stage2_profile.patch
-# expect: 900
+# expect: 923
 
 # Re-apply both against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh

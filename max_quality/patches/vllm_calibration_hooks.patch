@@ -5260,7 +5260,7 @@ new file mode 100644
 index 0000000..7944163
 --- /dev/null
 +++ b/vllm/calibration_block_outputs.py
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,513 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-MoE-block hidden-states writer for calibration-v2 (Item 7).
@@ -5340,6 +5340,7 @@ index 0000000..7944163
 +    "load_block_outputs_checkpoint",
 +    "get_n_prompts_accumulated",
 +    "set_n_prompts_accumulated",
++    "captured_entry_count",
 +]
 +
 +# Sampled at import time -- matches the other writer modules.
@@ -5448,7 +5449,7 @@ index 0000000..7944163
 +    if model is not None:
 +        for name, module in model.named_modules():
 +            moe_layer_id = getattr(module, "moe_layer_id", None)
-+            num_experts = getattr(module, "num_experts", None)
++            num_experts = getattr(module, "global_num_experts", None)
 +            if not (isinstance(moe_layer_id, int)
 +                    and isinstance(num_experts, int) and num_experts > 0):
 +                continue
@@ -5761,6 +5762,18 @@ index 0000000..7944163
 +    for k, batches in payload.get("accum", {}).items():
 +        _ACCUM[int(k)] = [t.clone() for t in batches]
 +    return _n_prompts_accumulated
++
++def captured_entry_count() -> int:
++    """B0 fail-fast hook: number of populated accumulator entries.
++
++    Public, read-only. The driver
++    (build_self_traces_calib_vllm.py::assert_enabled_captures_nonempty)
++    calls this after the first generate chunk and aborts if an ENABLED
++    capture still reports 0 (the B0 empty-sidecar bug class). Returns 0
++    when no MoE forward has populated this writer yet.
++    """
++    # Number of captured block-output tensors across all layer ranks.
++    return sum(len(v) for v in _ACCUM.values())
 diff --git a/vllm/calibration_hooks.py b/vllm/calibration_hooks.py
 new file mode 100644
 index 0000000..fc2f9e1
@@ -6164,7 +6177,7 @@ new file mode 100644
 index 0000000..8505da3
 --- /dev/null
 +++ b/vllm/calibration_imatrix.py
-@@ -0,0 +1,997 @@
+@@ -0,0 +1,1010 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Imatrix capture for llama.cpp-compatible activation statistics.
@@ -6303,6 +6316,7 @@ index 0000000..8505da3
 +    "load_imatrix_checkpoint",
 +    "get_n_prompts_accumulated",
 +    "set_n_prompts_accumulated",
++    "captured_entry_count",
 +]
 +
 +
@@ -6698,7 +6712,7 @@ index 0000000..8505da3
 +    n_moe_layers = 0
 +    moe_re = re.compile(r".*?layers\.(\d+)\.mlp\.experts$")
 +    for name, module in model.named_modules():
-+        n_exp = getattr(module, "num_experts", None)
++        n_exp = getattr(module, "global_num_experts", None)
 +        if not (isinstance(n_exp, int) and n_exp > 0):
 +            continue
 +        m = moe_re.match(name)
@@ -7162,12 +7176,24 @@ index 0000000..8505da3
 +        len(payload.get("moe_down_accumulators", {})),
 +    )
 +    return loaded_n
++
++def captured_entry_count() -> int:
++    """B0 fail-fast hook: number of populated accumulator entries.
++
++    Public, read-only. The driver
++    (build_self_traces_calib_vllm.py::assert_enabled_captures_nonempty)
++    calls this after the first generate chunk and aborts if an ENABLED
++    capture still reports 0 (the B0 empty-sidecar bug class). Returns 0
++    when no MoE forward has populated this writer yet.
++    """
++    # Number of populated per-surface imatrix accumulators.
++    return len(_accumulators)
 diff --git a/vllm/calibration_input_cov.py b/vllm/calibration_input_cov.py
 new file mode 100644
 index 0000000..adff069
 --- /dev/null
 +++ b/vllm/calibration_input_cov.py
-@@ -0,0 +1,424 @@
+@@ -0,0 +1,437 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert, matrix) teacher input covariance capture for
@@ -7257,6 +7283,7 @@ index 0000000..adff069
 +    "load_input_cov_checkpoint",
 +    "get_n_prompts_accumulated",
 +    "set_n_prompts_accumulated",
++    "captured_entry_count",
 +]
 +
 +# Sampled at import time -- matches calibration_reap_scores / imatrix.
@@ -7349,7 +7376,7 @@ index 0000000..adff069
 +    if model is not None:
 +        for name, module in model.named_modules():
 +            moe_layer_id = getattr(module, "moe_layer_id", None)
-+            num_experts = getattr(module, "num_experts", None)
++            num_experts = getattr(module, "global_num_experts", None)
 +            if not (isinstance(moe_layer_id, int)
 +                    and isinstance(num_experts, int) and num_experts > 0):
 +                continue
@@ -7592,12 +7619,24 @@ index 0000000..adff069
 +        nk = (int(li), int(e), str(name))
 +        _COV_TOKEN_COUNTS[nk] = int(n)
 +    return _n_prompts_accumulated
++
++def captured_entry_count() -> int:
++    """B0 fail-fast hook: number of populated accumulator entries.
++
++    Public, read-only. The driver
++    (build_self_traces_calib_vllm.py::assert_enabled_captures_nonempty)
++    calls this after the first generate chunk and aborts if an ENABLED
++    capture still reports 0 (the B0 empty-sidecar bug class). Returns 0
++    when no MoE forward has populated this writer yet.
++    """
++    # Number of populated (layer, expert, matrix) covariance accumulators.
++    return len(_COV_ACCUM)
 diff --git a/vllm/calibration_output_reservoir.py b/vllm/calibration_output_reservoir.py
 new file mode 100644
 index 0000000..660a951
 --- /dev/null
 +++ b/vllm/calibration_output_reservoir.py
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,516 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) expert-output reservoir capture for calibration-v2
@@ -7695,6 +7734,7 @@ index 0000000..660a951
 +    "load_output_reservoir_checkpoint",
 +    "get_n_prompts_accumulated",
 +    "set_n_prompts_accumulated",
++    "captured_entry_count",
 +]
 +
 +# Sampled at import time -- matches calibration_imatrix / per_expert_max pattern.
@@ -7814,7 +7854,7 @@ index 0000000..660a951
 +    if model is not None:
 +        for name, module in model.named_modules():
 +            moe_layer_id = getattr(module, "moe_layer_id", None)
-+            num_experts = getattr(module, "num_experts", None)
++            num_experts = getattr(module, "global_num_experts", None)
 +            if not (isinstance(moe_layer_id, int)
 +                    and isinstance(num_experts, int) and num_experts > 0):
 +                continue
@@ -8101,12 +8141,24 @@ index 0000000..660a951
 +        g.set_state(state.to(torch.uint8))
 +        _GEN[rk] = g
 +    return _n_prompts_accumulated
++
++def captured_entry_count() -> int:
++    """B0 fail-fast hook: number of populated accumulator entries.
++
++    Public, read-only. The driver
++    (build_self_traces_calib_vllm.py::assert_enabled_captures_nonempty)
++    calls this after the first generate chunk and aborts if an ENABLED
++    capture still reports 0 (the B0 empty-sidecar bug class). Returns 0
++    when no MoE forward has populated this writer yet.
++    """
++    # Number of populated (rank, expert) reservoirs.
++    return len(_RESERVOIR)
 diff --git a/vllm/calibration_per_expert_max.py b/vllm/calibration_per_expert_max.py
 new file mode 100644
 index 0000000..8ce03ab
 --- /dev/null
 +++ b/vllm/calibration_per_expert_max.py
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,351 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) ``down_proj`` output max-L_inf capture for
@@ -8174,6 +8226,7 @@ index 0000000..8ce03ab
 +    "load_per_expert_max_checkpoint",
 +    "get_n_prompts_accumulated",
 +    "set_n_prompts_accumulated",
++    "captured_entry_count",
 +]
 +
 +# Sampled at import time -- matches calibration_imatrix / reap_scores pattern.
@@ -8256,7 +8309,7 @@ index 0000000..8ce03ab
 +    if model is not None:
 +        for name, module in model.named_modules():
 +            moe_layer_id = getattr(module, "moe_layer_id", None)
-+            num_experts = getattr(module, "num_experts", None)
++            num_experts = getattr(module, "global_num_experts", None)
 +            if not (isinstance(moe_layer_id, int)
 +                    and isinstance(num_experts, int) and num_experts > 0):
 +                continue
@@ -8445,12 +8498,24 @@ index 0000000..8ce03ab
 +    for r, t in payload.get("token_counts", {}).items():
 +        _PEM_TOKEN_COUNTS[int(r)] = t.to(torch.int64).clone()
 +    return _n_prompts_accumulated
++
++def captured_entry_count() -> int:
++    """B0 fail-fast hook: number of populated accumulator entries.
++
++    Public, read-only. The driver
++    (build_self_traces_calib_vllm.py::assert_enabled_captures_nonempty)
++    calls this after the first generate chunk and aborts if an ENABLED
++    capture still reports 0 (the B0 empty-sidecar bug class). Returns 0
++    when no MoE forward has populated this writer yet.
++    """
++    # Number of layer ranks with a populated per-expert-max accumulator.
++    return len(_PEM_ACCUM)
 diff --git a/vllm/calibration_reap_scores.py b/vllm/calibration_reap_scores.py
 new file mode 100644
 index 0000000..1b3ca1f
 --- /dev/null
 +++ b/vllm/calibration_reap_scores.py
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,354 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""REAP per-(layer, expert) saliency-score capture for calibration-v2.
@@ -8518,6 +8583,7 @@ index 0000000..1b3ca1f
 +    "load_reap_scores_checkpoint",
 +    "get_n_prompts_accumulated",
 +    "set_n_prompts_accumulated",
++    "captured_entry_count",
 +]
 +
 +# Sampled at import time -- matches calibration_imatrix pattern.
@@ -8599,7 +8665,7 @@ index 0000000..1b3ca1f
 +    if model is not None:
 +        for name, module in model.named_modules():
 +            moe_layer_id = getattr(module, "moe_layer_id", None)
-+            num_experts = getattr(module, "num_experts", None)
++            num_experts = getattr(module, "global_num_experts", None)
 +            if not (isinstance(moe_layer_id, int)
 +                    and isinstance(num_experts, int) and num_experts > 0):
 +                continue
@@ -8792,12 +8858,24 @@ index 0000000..1b3ca1f
 +    for r, t in payload.get("token_counts", {}).items():
 +        _REAP_TOKEN_COUNTS[int(r)] = t.to(torch.int64).clone()
 +    return _n_prompts_accumulated
++
++def captured_entry_count() -> int:
++    """B0 fail-fast hook: number of populated accumulator entries.
++
++    Public, read-only. The driver
++    (build_self_traces_calib_vllm.py::assert_enabled_captures_nonempty)
++    calls this after the first generate chunk and aborts if an ENABLED
++    capture still reports 0 (the B0 empty-sidecar bug class). Returns 0
++    when no MoE forward has populated this writer yet.
++    """
++    # Number of layer ranks with a populated REAP-score accumulator.
++    return len(_REAP_SCORE_ACCUM)
 diff --git a/vllm/calibration_router_logits_stats.py b/vllm/calibration_router_logits_stats.py
 new file mode 100644
 index 0000000..1644034
 --- /dev/null
 +++ b/vllm/calibration_router_logits_stats.py
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,468 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) sink-vs-normal router-score aggregate writer for
@@ -8882,6 +8960,7 @@ index 0000000..1644034
 +    "load_router_logits_stats_checkpoint",
 +    "get_n_prompts_accumulated",
 +    "set_n_prompts_accumulated",
++    "captured_entry_count",
 +]
 +
 +# Sampled at import time -- matches calibration_imatrix / per_expert_max /
@@ -8984,7 +9063,7 @@ index 0000000..1644034
 +    if model is not None:
 +        for name, module in model.named_modules():
 +            moe_layer_id = getattr(module, "moe_layer_id", None)
-+            num_experts = getattr(module, "num_experts", None)
++            num_experts = getattr(module, "global_num_experts", None)
 +            if not (isinstance(moe_layer_id, int)
 +                    and isinstance(num_experts, int) and num_experts > 0):
 +                continue
@@ -9253,12 +9332,24 @@ index 0000000..1644034
 +    for r, t in payload.get("n_normal_tokens", {}).items():
 +        _N_NORMAL_TOKENS[int(r)] = t.to(torch.int64).clone()
 +    return _n_prompts_accumulated
++
++def captured_entry_count() -> int:
++    """B0 fail-fast hook: number of populated accumulator entries.
++
++    Public, read-only. The driver
++    (build_self_traces_calib_vllm.py::assert_enabled_captures_nonempty)
++    calls this after the first generate chunk and aborts if an ENABLED
++    capture still reports 0 (the B0 empty-sidecar bug class). Returns 0
++    when no MoE forward has populated this writer yet.
++    """
++    # Number of layer ranks with populated router-logit-stat sums.
++    return len(_SCORE_SINK_SUM)
 diff --git a/vllm/calibration_routing_stats.py b/vllm/calibration_routing_stats.py
 new file mode 100644
 index 0000000..516237c
 --- /dev/null
 +++ b/vllm/calibration_routing_stats.py
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,349 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) routing-frequency + mean-routing-weight capture for
@@ -9331,6 +9422,7 @@ index 0000000..516237c
 +    "load_routing_stats_checkpoint",
 +    "get_n_prompts_accumulated",
 +    "set_n_prompts_accumulated",
++    "captured_entry_count",
 +]
 +
 +# Sampled at import time -- matches calibration_imatrix / per_expert_max pattern.
@@ -9417,7 +9509,7 @@ index 0000000..516237c
 +    if model is not None:
 +        for name, module in model.named_modules():
 +            moe_layer_id = getattr(module, "moe_layer_id", None)
-+            num_experts = getattr(module, "num_experts", None)
++            num_experts = getattr(module, "global_num_experts", None)
 +            if not (isinstance(moe_layer_id, int)
 +                    and isinstance(num_experts, int) and num_experts > 0):
 +                continue
@@ -9595,6 +9687,18 @@ index 0000000..516237c
 +    for r, t in payload.get("weight_sum_accum", {}).items():
 +        _WEIGHT_SUM_ACCUM[int(r)] = t.to(torch.float32).clone()
 +    return _n_prompts_accumulated
++
++def captured_entry_count() -> int:
++    """B0 fail-fast hook: number of populated accumulator entries.
++
++    Public, read-only. The driver
++    (build_self_traces_calib_vllm.py::assert_enabled_captures_nonempty)
++    calls this after the first generate chunk and aborts if an ENABLED
++    capture still reports 0 (the B0 empty-sidecar bug class). Returns 0
++    when no MoE forward has populated this writer yet.
++    """
++    # Number of layer ranks with a populated routing-frequency accumulator.
++    return len(_FREQ_ACCUM)
 diff --git a/vllm/envs.py b/vllm/envs.py
 index ded474d..2ff296f 100755
 --- a/vllm/envs.py
@@ -10474,12 +10578,73 @@ index 4ec1be3..454c657 100644
              start=self.start_layer,
          ):
              hidden_states, residual = layer(positions, hidden_states, residual)
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index 0000002..0000003 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -6,6 +6,7 @@ from itertools import islice
+ 
+ import torch
+ from torch import nn
++import vllm.calibration_hooks as _ch
+ 
+ from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.compilation.decorators import support_torch_compile
+@@ -178,20 +179,48 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+         num_tokens, hidden_dim = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_dim)
+ 
+         if self.is_sequence_parallel:
+             hidden_states = sequence_parallel_chunk(hidden_states)
+ 
++        # H_LAYER_IN calibration capture (Qwen3.6 / Qwen3-Next path -- this
++        # block is reused by qwen3_5.py). Mirrors Qwen3MoeSparseMoeBlock:
++        # fires AFTER sequence-parallel chunking (post-chunk hidden_states is
++        # exactly what self.experts receives), BEFORE the is_internal_router
++        # branch (both branches share the same input). layer_idx comes from
++        # self.experts.moe_layer_id -- this block has no moe_layer_id of its
++        # own; the FusedMoE auto-increment counter is the layer key.
++        if _ch._CAPTURE_LAYER_IN:
++            _ch.dispatch(
++                "layer_in",
++                layer_idx=self.experts.moe_layer_id,
++                hidden=hidden_states.detach(),
++            )
++
+         if self.experts.is_internal_router:
+             # In this case, the gate/router runs inside the FusedMoE class
+             final_hidden_states = self.experts(
+                 hidden_states=hidden_states, router_logits=hidden_states
+             )
++            # H_BLOCK_OUT calibration capture (internal-router branch).
++            if _ch._CAPTURE_BLOCK:
++                _ch.dispatch(
++                    "block_out",
++                    layer_idx=self.experts.moe_layer_id,
++                    output=final_hidden_states.detach(),
++                )
+         else:
+             # router_logits: (num_tokens, n_experts)
+             router_logits, _ = self.gate(hidden_states)
+             final_hidden_states = self.experts(
+                 hidden_states=hidden_states, router_logits=router_logits
+             )
++            # H_BLOCK_OUT calibration capture (external-gate branch).
++            if _ch._CAPTURE_BLOCK:
++                _ch.dispatch(
++                    "block_out",
++                    layer_idx=self.experts.moe_layer_id,
++                    output=final_hidden_states.detach(),
++                )
+ 
+         if self.is_sequence_parallel:
+             final_hidden_states = tensor_model_parallel_all_gather(
 diff --git a/vllm/calibration_wanda_scalar_row.py b/vllm/calibration_wanda_scalar_row.py
 new file mode 100644
 index 0000000..0000001
 --- /dev/null
 +++ b/vllm/calibration_wanda_scalar_row.py
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,497 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert, matrix) Wanda ``scalar_row`` calibration capture.
@@ -10584,6 +10749,7 @@ index 0000000..0000001
 +    "load_wanda_scalar_row_checkpoint",
 +    "get_n_prompts_accumulated",
 +    "set_n_prompts_accumulated",
++    "captured_entry_count",
 +]
 +
 +# Sampled at import time -- matches calibration_reap_scores / input_cov.
@@ -10683,7 +10849,7 @@ index 0000000..0000001
 +    if model is not None:
 +        for name, module in model.named_modules():
 +            moe_layer_id = getattr(module, "moe_layer_id", None)
-+            num_experts = getattr(module, "num_experts", None)
++            num_experts = getattr(module, "global_num_experts", None)
 +            if not (isinstance(moe_layer_id, int)
 +                    and isinstance(num_experts, int) and num_experts > 0):
 +                continue
@@ -10964,6 +11130,18 @@ index 0000000..0000001
 +        nk = (int(li), int(e), str(name))
 +        _WANDA_TOKEN_COUNTS[nk] = int(n)
 +    return _n_prompts_accumulated
++
++def captured_entry_count() -> int:
++    """B0 fail-fast hook: number of populated accumulator entries.
++
++    Public, read-only. The driver
++    (build_self_traces_calib_vllm.py::assert_enabled_captures_nonempty)
++    calls this after the first generate chunk and aborts if an ENABLED
++    capture still reports 0 (the B0 empty-sidecar bug class). Returns 0
++    when no MoE forward has populated this writer yet.
++    """
++    # Number of populated (layer, expert, matrix) Wanda accumulators.
++    return len(_WANDA_SCALAR_ROW_SUM)
 diff --git a/tests/test_calibration_wanda_scalar_row_smoke.py b/tests/test_calibration_wanda_scalar_row_smoke.py
 new file mode 100644
 index 0000000..0000001

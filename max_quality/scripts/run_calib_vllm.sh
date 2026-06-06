@@ -47,6 +47,14 @@ export MAX_JOBS="${MAX_JOBS:-16}"          # cap parallel cicc; ~6 GB each
 export NVCC_THREADS="${NVCC_THREADS:-1}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$DATA_ROOT/vllm_cache}"
 export FLASHINFER_WORKSPACE_DIR="${FLASHINFER_WORKSPACE_DIR:-$DATA_ROOT/flashinfer_cache}"
+# --- B0/C1: run EngineCore IN-PROCESS so capture callbacks fire ------------
+# vLLM V1 defaults this to 1, which runs the model forward + every capture
+# dispatch site in a worker SUBPROCESS while our writers register callbacks in
+# the driver process -> empty callback registry -> all sidecars empty,
+# _N_LAYERS=0. tp=1 single-GPU calibration runs UniProcExecutor, so in-process
+# is correct. The driver also setdefault()s this; export here documents the
+# requirement at the launch surface and covers alternate entrypoints.
+export VLLM_ENABLE_V1_MULTIPROCESSING="${VLLM_ENABLE_V1_MULTIPROCESSING:-0}"
 mkdir -p "$VLLM_CACHE_ROOT" "$FLASHINFER_WORKSPACE_DIR"
 # FlashInfer ignores the env var above and hardcodes ~/.cache/flashinfer, so
 # symlink it onto durable storage to persist the GDN compile across restarts.
