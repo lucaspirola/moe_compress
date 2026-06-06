@@ -66,8 +66,10 @@ def test_target_below_protected_raises():
 
 
 def test_tie_break_prefers_lower_index():
-    # experts 0 and 1 tie at the boundary; keep the lower index (matches
-    # torch.topk(largest=False) dropping the higher index on a tie).
+    # experts 0 and 1 tie at the boundary; our deterministic tie-break keeps the
+    # lower index (drops the higher). This is NOT a torch.topk(largest=False)
+    # parity claim — torch's tie order is implementation-defined and differs
+    # CPU/CUDA; here we only assert our own stable keep-lowest-index behaviour.
     scores = np.array([0.5, 0.5, 0.9])
     kept, pruned = compute_final_kept_ids(
         scores, n_experts=3, n_prune=1, protected=[],

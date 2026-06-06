@@ -51,6 +51,10 @@ def test_drop_slices_experts_and_router_no_rescale():
     ctx.set("layer_ref", layer_ref)
     ctx.set("scores", scores)
     ctx.set("n_experts", n_experts)
+    # Sentinel: a real sidecar payload was loaded (the fail-loud guard gates on
+    # this slot, not on ``scores``). Direct unit test of the selection/drop
+    # math, so any non-None payload satisfies the guard.
+    ctx.set("reap_scores_payload", object())
 
     plugin.compute_assignment(ctx)
     final_kept_ids = list(ctx.get("final_kept_ids"))
@@ -100,3 +104,45 @@ def test_compute_assignment_fails_loud_without_scores():
     # NOTE: 'scores' is deliberately NOT set.
     with pytest.raises(RuntimeError, match="capture-reap-scores"):
         plugin.compute_assignment(ctx)
+
+
+def test_fails_loud_on_full_schedule_with_no_sidecar():
+    """Regression for the bypassable-guard HIGH (review of 53e0062).
+
+    Reproduces the REAL cache-miss path: run the per-layer pre-assign schedule
+    (ReapScoringPlugin.on_layer_setup → on_score) with NO sidecar payload, then
+    compute_assignment. ReapScoringPlugin publishes an ALL-ZERO ``scores`` vector
+    (its live ReapAccumulator is empty — faithful mode drops the on_profile
+    feeder), so ``ctx.has("scores")`` is True. The guard MUST still fire because
+    it now gates on ``reap_scores_payload`` (only set on a real sidecar hit),
+    NOT on ``scores``. Without the fix the pruner would silently argsort(-zeros)
+    and drop the highest-indexed experts.
+    """
+    from moe_compress.stage2.plugins.reap_scoring import ReapScoringPlugin
+    from .conftest import _TinyModel
+
+    torch.manual_seed(0)
+    model = _TinyModel(hidden=16, intermediate=8, num_layers=1,
+                       num_experts=8, top_k=1)
+    layer_ref = next(iter_moe_layers(model))
+
+    reap_scoring = ReapScoringPlugin()
+    pruner = _make_plugin(prune_fraction=0.25)
+
+    ctx = PipelineContext()
+    ctx.set("layer_ref", layer_ref)
+    ctx.set("n_experts", layer_ref.num_routed_experts)
+
+    # Pre-assign schedule WITHOUT a sidecar: on_layer_setup builds an empty
+    # ReapAccumulator, on_score finalizes it and publishes all-zero scores.
+    reap_scoring.on_layer_setup(ctx)
+    reap_scoring.on_score(ctx)
+    assert ctx.has("scores"), "ReapScoringPlugin should have published scores"
+    assert float(np.abs(ctx.get("scores")).sum()) == 0.0, (
+        "empty accumulator must yield an all-zero scores vector (the bug input)"
+    )
+    assert not ctx.has("reap_scores_payload"), "no sidecar → no payload"
+
+    # The guard must fire despite the published (all-zero) scores.
+    with pytest.raises(RuntimeError, match="capture-reap-scores"):
+        pruner.compute_assignment(ctx)

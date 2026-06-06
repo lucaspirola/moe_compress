@@ -156,11 +156,14 @@ def compute_final_kept_ids(
     experts are NEVER dropped (D-protected-experts); with an empty
     protected set this reduces to the pure upstream formula.
 
-    Tie-break: ``np.argsort`` is stable, so equal scores keep ascending
-    expert-index order; the descending pass (``-scores``) then keeps the
-    LOWEST index of a tie — matching ``torch.topk(largest=False)``'s
-    "drop the higher index on a tie" convention so the byte-match test is
-    deterministic.
+    Tie-break: deterministic keep-LOWEST-index. ``np.argsort`` is stable, so
+    equal scores keep ascending expert-index order; the descending pass
+    (``-scores``) then keeps the lowest index of a tie and drops the higher.
+    This does NOT claim parity with ``torch.topk(largest=False)`` on ties —
+    torch's tie order is implementation-defined and differs CPU vs CUDA (e.g.
+    ``scores=[0.5, 0.5, 0.9], n_prune=1`` → torch drops index 0, we drop index
+    2). Parity is unattainable and irrelevant for continuous REAP saliencies
+    (which are never exactly tied); what matters is our own determinism.
     """
     protected_set = set(protected)
     faithful_target = n_experts - n_prune  # kept count (including protected)
@@ -172,8 +175,9 @@ def compute_final_kept_ids(
             "layer's protected/blacklisted experts"
         )
     # Descending saliency. np.argsort(-scores) is stable → ties resolve to
-    # ascending index, so the kept set prefers the lowest-index expert on a
-    # tie (== torch.topk(largest=False) dropping the higher index).
+    # ascending index, so the kept set prefers the lowest-index expert on a tie
+    # (deterministic keep-lowest-index; NOT a torch.topk tie-order match — see
+    # the docstring).
     order = [int(e) for e in np.argsort(-scores)]
     n_kept_nonprotected = faithful_target - len(protected_set)
     kept_nonprotected = [
@@ -207,7 +211,8 @@ class ReapPrunePlugin:
     )
     config_key = "stage2_reap_ream"
     reads: tuple[str, ...] = (
-        "layer_ref", "scores", "freq", "protected", "n_experts", "partial_dir",
+        "layer_ref", "reap_scores_payload", "scores", "freq", "protected",
+        "n_experts", "partial_dir",
     )
     writes: tuple[str, ...] = (
         "final_kept_ids", "grouped", "ream_centroid_ids", "pruned_expert_ids",
@@ -255,32 +260,47 @@ class ReapPrunePlugin:
         """
         layer_ref = ctx.get("layer_ref")
         n_experts = ctx.get("n_experts")
-        # FAIL LOUD if no saliency is available. Faithful mode does NOT run its
-        # own HF forward-pass rescoring — the project requires vLLM-sourced REAP
-        # scores (the ``--capture-reap-scores`` sidecar hydrated by
-        # Stage2ReapScoresCacheProvider) for faithfulness/consistency. A silent
-        # HF rescore would diverge from the calibration distribution. Because
-        # faithful mode drops LayerMergePlugin (the only ``on_profile`` that
-        # populates a live ReapAccumulator), the ONLY score source here is the
-        # sidecar cache hit; if it is missing, refuse rather than prune on
-        # uninformed (all-zero) scores.
-        if not ctx.has("scores"):
+        # FAIL LOUD if the vLLM REAP-scores sidecar is absent. Faithful mode does
+        # NOT run its own HF forward-pass rescoring — the project requires
+        # vLLM-sourced REAP scores (the ``--capture-reap-scores`` sidecar) for
+        # faithfulness/consistency; an HF rescore would diverge from the
+        # calibration distribution.
+        #
+        # CRITICAL — gate on ``reap_scores_payload``, NOT ``scores``: the
+        # ``scores`` slot is an UNRELIABLE proxy for "a sidecar was loaded". On a
+        # real cache miss ``Stage2ReapScoresCacheProvider.on_score`` returns
+        # without setting ``scores`` (it only sets the payload + scores on a hit,
+        # reap_scores_cache.py:64,74-84), and then ``ReapScoringPlugin.on_score``
+        # (reap_scoring.py:200-219) runs and publishes an ALL-ZERO ``scores``
+        # vector (its live ReapAccumulator is EMPTY because faithful mode drops
+        # LayerMergePlugin, the only ``on_profile`` feeder). That would make
+        # ``ctx.has("scores")`` True and silently prune on argsort(-zeros) — the
+        # exact silent failure this guard exists to prevent.
+        # ``reap_scores_payload`` is set ONLY when ``load_reap_scores`` succeeds
+        # (reap_scores_cache.py:64), so it is the true "real sidecar present"
+        # signal.
+        if not ctx.has("reap_scores_payload"):
             raise RuntimeError(
                 f"Layer {layer_ref.layer_idx}: faithful_prune mode requires REAP "
-                "saliency from the vLLM --capture-reap-scores sidecar, but no "
-                "'scores' were published (cache miss / sidecar absent). Run the "
+                "saliency from the vLLM --capture-reap-scores sidecar, but its "
+                "payload was not loaded (cache miss / sidecar absent). Run the "
                 "vLLM calibration with --capture-reap-scores FIRST "
                 "(build_self_traces_calib_vllm.py), then re-run Stage 2. "
                 "Faithful prune does NOT fall back to a fresh HF forward-pass "
-                "rescore (it would diverge from the calibration distribution)."
+                "rescore (it would diverge from the calibration distribution), "
+                "and it refuses the all-zero ReapAccumulator scores the live "
+                "ReapScoringPlugin would otherwise publish on a sidecar miss."
             )
         scores = ctx.get("scores")
 
         # Protected experts (super / shared, from stage1_blacklist.json) — never
         # dropped. Publish ``protected`` early (the post-assign schedule + the
-        # merge JSON read it); _run_assignment normally sets this slot, but it
-        # never runs in faithful mode.
+        # merge JSON read it). ``overwrite=True`` is intentional: ``protected``
+        # is the slot ``_run_assignment`` normally owns (orchestrator.py:271),
+        # but ``_run_assignment`` never runs in faithful mode — this plugin is
+        # its faithful-mode replacement, so it (re)writes the slot itself.
         protected = sorted(set(self.blacklist.get(layer_ref.layer_idx, [])))
+        protected_set = set(protected)
         ctx.set("protected", tuple(protected), overwrite=True)
 
         # Global n_prune, computed ONCE from layer 0 (upstream prune.py:258-261)
@@ -301,7 +321,7 @@ class ReapPrunePlugin:
         # Singleton groups → no merge math. ream_centroid_ids are the kept,
         # non-protected experts (used only for the merge_map / forensic logging).
         grouped = {e: [e] for e in final_kept_ids}
-        ream_centroid_ids = [e for e in final_kept_ids if e not in set(protected)]
+        ream_centroid_ids = [e for e in final_kept_ids if e not in protected_set]
 
         ctx.set("final_kept_ids", tuple(final_kept_ids))
         ctx.set("grouped", grouped)

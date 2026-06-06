@@ -42,6 +42,8 @@ def _run_prune(model, prune_fraction, scores_per_layer):
         ctx.set("layer_ref", ref)
         ctx.set("scores", np.asarray(scores_per_layer[ref.layer_idx]))
         ctx.set("n_experts", ref.num_routed_experts)
+        # Sentinel payload (fail-loud guard gates on this, not on ``scores``).
+        ctx.set("reap_scores_payload", object())
         plugin.compute_assignment(ctx)
         plugin.merge(ctx)
         plugin.post_merge(ctx)
