@@ -139,15 +139,17 @@ stage1_grape:
     enabled: true
     holdout_samples: 100               # held-out slice from calibration; deterministic seed_offset=999
     blacklist_threshold: 0.001         # ΔNLL threshold; ~0.1% PPL impact
-    batch_size: 8                      # H200 first-run telemetry (job 6a00caf0, 2026-05-10): the
-                                       # model+Phase B accumulators+Phase E (CKA) reservoir occupy
-                                       # ~99 GB before Phase D, leaving ~40 GB free. The
-                                       # ForCausalLMLoss bf16→fp32 logits upcast at bs=32 OOM'd
-                                       # (tried to allocate 60.6 GB; logits tensor itself is
-                                       # 32×2048×151936×4 bytes = 38 GB upcast). bs=8 keeps the
-                                       # upcast at ~9.5 GB + intermediates ≈ 16 GB total —
-                                       # comfortably within budget and matches the v4-proven
-                                       # post_hoc_ablation config. ~13 batches per candidate.
+    batch_size: 6                      # CORRECTED 2026-06-07 (was 8). The old "bs=8 fits" note
+                                       # below was computed for a 151936-vocab model; Qwen3.6 has
+                                       # vocab=248320, so the ForCausalLMLoss bf16→fp32 logits
+                                       # upcast is ~3.8 GB per holdout sample (seq≈3814):
+                                       # bs=8 → ~30 GB upcast on top of ~113 GB already resident
+                                       # = OOM on a 143 GB H200 (observed: "Tried to allocate
+                                       # 30.31 GiB"). Measured-safe points on H200-143GB:
+                                       #   bs=4 → ~128 GB total (PROVEN, ~15 GB headroom)
+                                       #   bs=6 → ~136 GB total (ceiling, ~8 GB headroom)
+                                       # If a future run OOMs in Phase D, drop to 4. SMALLER GPUs
+                                       # (e.g. 96 GB) need bs≈2. ~17 batches/candidate at bs=6.
 
   # Phase E/F (unchanged)
   similarity_metric: cka

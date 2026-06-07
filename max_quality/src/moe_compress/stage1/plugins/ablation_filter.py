@@ -579,7 +579,8 @@ def run_ablation_filter(
     )
 
     deltas: dict[tuple[int, int], float] = {}
-    for (li, e), _provenance in candidates.items():
+    n_cand = len(candidates)
+    for idx, ((li, e), _provenance) in enumerate(candidates.items(), start=1):
         ref = moe_layers.get(int(li))
         if ref is None:
             log.warning(
@@ -589,6 +590,11 @@ def run_ablation_filter(
         with _ablate_expert_context(ref, int(e)):
             nll = _measure_corpus_nll(model, eval_batches, device)
         deltas[(int(li), int(e))] = nll - baseline_nll
+        # Per-candidate progress (Phase D ablation has no other progress signal;
+        # one corpus-NLL pass per candidate, so it is the slow part). Log every
+        # 10 (+ first/last) so the log stays a countable X/N, not 190 lines.
+        if idx == 1 or idx % 10 == 0 or idx == n_cand:
+            log.info("Stage 1 Phase D: ablated %d/%d candidates", idx, n_cand)
 
     blacklist = _apply_threshold_filter(deltas, threshold)
     log.info(
