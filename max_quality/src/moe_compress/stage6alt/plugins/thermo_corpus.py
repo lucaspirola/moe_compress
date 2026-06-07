@@ -158,6 +158,11 @@ def _thermo_wikitext_tensor(tokenizer, *, num_sequences: int,
     # report plugin reads ``calib_ids``. Swallowing the load error here would
     # produce a misleading "no full-length sequence" exception two frames
     # deeper, hiding the real (network / SHA / dataset-name) root cause.
+    # Legacy bare dataset ids (e.g. "wikitext") are rejected by newer
+    # huggingface_hub (HfUriError: repo id must be namespace/name). Map to the
+    # namespaced canonical, matching stage6/wikitext_ppl (Salesforce/wikitext).
+    if dataset == "wikitext":
+        dataset = "Salesforce/wikitext"
     ds = load_dataset(dataset, subset, split=split, revision=revision)
     concatenated = "\n\n".join(row.get("text", "") for row in ds)
     all_ids = tokenizer(

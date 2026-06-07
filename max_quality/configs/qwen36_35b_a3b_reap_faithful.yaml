@@ -553,7 +553,10 @@ stage6_validate:
     # comparable to the prior greedy/all-off baseline bpt_gap 0.2507.
     corpus: wikitext
     wikitext:                        # only consulted when corpus == wikitext
-      dataset: wikitext
+      dataset: Salesforce/wikitext   # namespaced id (bare "wikitext" is rejected
+                                     # by newer huggingface_hub: HfUriError "repo
+                                     # id must be namespace/name"). Matches the
+                                     # Stage-6 PPL plugin (stage6_validate.wikitext2).
       subset: wikitext-2-raw-v1
       split: test
     # Held-out Nemotron draw: a fixed slice drawn with a seed offset
