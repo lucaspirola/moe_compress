@@ -637,14 +637,18 @@ class OutputReservoirPayload:
     ``layer_idx``); the Stage 1 cache reader maps rank → layer_idx via
     the live ``MoELayerRef`` list when hydrating the accumulator.
 
-    Reservoir-sampling math: identical to
-    :meth:`ExpertOutputAccumulator.update` — Phase 1 fills empty slots
-    sequentially while ``seen < max_tokens``; Phase 2 accepts each
-    further token with probability ``max_tokens / (seen + j)`` for the
-    j-th post-fill token and on accept writes to a uniformly-random
-    slot (last-wins on collision). The accepted-token distribution is
-    uniform across slots; statistically equivalent to sequential
-    reservoir sampling.
+    Sampling math (in-graph capture): the calibration writer
+    (``vllm.calibration_output_reservoir``) uses a CUDA-graph-safe
+    **deterministic fixed-stride** ring buffer instead of RNG reservoir
+    sampling (RNG / per-cell generators cannot execute inside a graph
+    replay). For expert ``e`` the write slot for the ``s``-th token routed
+    to ``e`` within a dispatch is ``(ctr_e + s) % max_tokens``; after the
+    dispatch ``ctr_e += N_e``. ``valid_count = min(ctr_e, max_tokens)`` and
+    ``total_seen = ctr_e``. Once ``ctr_e`` exceeds ``max_tokens`` the buffer
+    behaves as a wrap-around ring (last-stride-wins), keeping a strided
+    sample of the token stream rather than a uniform random one. The cache
+    reader contract (slice each cell to its ``valid_count`` head before
+    hydrating ``ExpertOutputAccumulator._finalized``) is unchanged.
 
     Storage budget: ``max_tokens=256`` × ``hidden_dim≈2048`` × 2 bytes
     (bf16) × ``n_layers≈40`` × ``n_experts≈256`` ≈ 10 GB on disk; the

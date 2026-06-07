@@ -55,7 +55,7 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply BOTH calibration patches ==="
 # Two patches in this wheel:
-#  1. vllm_calibration_hooks.patch (10469 lines, MD5 e5128e62...) — the
+#  1. vllm_calibration_hooks.patch (10388 lines, MD5 63f38b7f...) — the
 #     CUDA-graph-safe in-graph capture rearchitecture: calibration_hooks.py
 #     (GPU accumulator dicts, custom-op import, NO Python callback registry),
 #     calibration_custom_ops.py (the 3 named-arg mutates_args custom ops:
@@ -81,7 +81,7 @@ curl -sL \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected: 10469 lines, MD5 e5128e629e5642547d9175c03f0d384a
+# Expected: 10388 lines, MD5 63f38b7f1dcfd0ef35713363fdf28fae
 # (In-graph cudagraph-safe capture: calibration_custom_ops.py + GPU-accumulator
 #  rewrite of all 10 writers + named-arg mutates_args custom ops; removes the
 #  graph-unsafe Python _ch.dispatch/register_callback path.)
@@ -255,7 +255,7 @@ Runs cudagraph-fast (NOT enforce_eager).
 
 - Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/b0-hook-fix`)
 - Patch artifacts (also uploaded to this repo for traceability):
-  - `vllm_calibration_hooks.patch` — 10469 lines, MD5 `e5128e629e5642547d9175c03f0d384a`
+  - `vllm_calibration_hooks.patch` — 10388 lines, MD5 `63f38b7f1dcfd0ef35713363fdf28fae`
   - `vllm_calibration_stage2_profile.patch` — 941 lines, MD5 `fca4c01cc5cef188b30c323bb919cd72`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)

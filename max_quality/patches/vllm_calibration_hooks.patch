@@ -5563,10 +5563,10 @@ index 0000000..f593bd7
 +    ), "Reader cleared the stash — lifecycle violated"
 diff --git a/vllm/calibration_block_outputs.py b/vllm/calibration_block_outputs.py
 new file mode 100644
-index 0000000..fa775eb
+index 0000000..c719fe1
 --- /dev/null
 +++ b/vllm/calibration_block_outputs.py
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,322 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-MoE-block hidden-states writer for calibration-v2 (Item 7).
@@ -5872,12 +5872,13 @@ index 0000000..fa775eb
 +        _ch._BLOCK_OUT_GPU[int(li)] = t.to(torch.bfloat16).to(device)
 +    for li, t in payload.get("block_ptr", {}).items():
 +        _ch._BLOCK_OUT_PTR_GPU[int(li)] = t.to(torch.int64).to(device)
-+    # Re-create the arange scratch for any restored layer.
++    # Re-create the arange scratch for any restored layer. Must match setup()'s
++    # arange(_CAP + 1) (the buffer has _CAP+1 rows incl. the OOB sentinel).
 +    if _CAP > 0:
 +        for li in _LAYER_IDS:
 +            if li in _ch._BLOCK_OUT_GPU and li not in _ch._BLOCK_ARANGE_GPU:
 +                _ch._BLOCK_ARANGE_GPU[li] = torch.arange(
-+                    _CAP, dtype=torch.int64, device=device)
++                    _CAP + 1, dtype=torch.int64, device=device)
 +    return _n_prompts_accumulated
 +
 +
@@ -5890,16 +5891,16 @@ index 0000000..fa775eb
 +    return n
 diff --git a/vllm/calibration_custom_ops.py b/vllm/calibration_custom_ops.py
 new file mode 100644
-index 0000000..35fe81f
+index 0000000..f3b0d0e
 --- /dev/null
 +++ b/vllm/calibration_custom_ops.py
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,109 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""CUDA-graph-safe in-graph accumulation custom ops for calibration capture.
 +
-+The traced-region calibration signals (``imatrix`` dense path, ``block_out``,
-+``layer_in``) fire from inside ``@support_torch_compile`` model code. A plain
++The traced-region calibration signals (``imatrix`` dense path, ``block_out``)
++fire from inside ``@support_torch_compile`` model code. A plain
 +Python callback cannot execute inside a CUDA-graph replay, and a None-returning
 +op that only touches module-level globals is dead-code-eliminated (DCE'd) by
 +Inductor because Dynamo sees no tensor aliasing, no output, and no mutation of
@@ -6003,46 +6004,9 @@ index 0000000..35fe81f
 +    fake_impl=_calib_block_out_accum_fake,
 +    tags=(torch.Tag.needs_fixed_stride_order,),
 +)
-+
-+
-+# ---------------------------------------------------------------------------
-+# layer_in: same monotonic-pointer write pattern as block_out, separate buffer.
-+# ---------------------------------------------------------------------------
-+def _calib_layer_in_accum(
-+    accum: torch.Tensor,
-+    ptr: torch.Tensor,
-+    arange: torch.Tensor,
-+    hidden: torch.Tensor,
-+) -> None:
-+    """Same write-pointer semantics as :func:`_calib_block_out_accum`."""
-+    T = hidden.shape[0]
-+    cap = accum.shape[0]
-+    offs = ptr + arange[:T]
-+    write_idx = offs.clamp(max=cap - 1)
-+    valid = (offs < cap)
-+    src = hidden * valid.unsqueeze(1).to(hidden.dtype)
-+    accum.scatter_(
-+        0,
-+        write_idx.unsqueeze(1).expand(-1, accum.shape[1]),
-+        src.to(accum.dtype),
-+    )
-+    ptr.copy_((ptr + T).clamp(max=cap))
-+
-+
-+def _calib_layer_in_accum_fake(accum, ptr, arange, hidden) -> None:
-+    return
-+
-+
-+direct_register_custom_op(
-+    op_name="calib_layer_in_accum",
-+    op_func=_calib_layer_in_accum,
-+    mutates_args=["accum", "ptr"],
-+    fake_impl=_calib_layer_in_accum_fake,
-+    tags=(torch.Tag.needs_fixed_stride_order,),
-+)
 diff --git a/vllm/calibration_hooks.py b/vllm/calibration_hooks.py
 new file mode 100644
-index 0000000..6e98a6b
+index 0000000..9de3848
 --- /dev/null
 +++ b/vllm/calibration_hooks.py
 @@ -0,0 +1,370 @@
@@ -6324,11 +6288,11 @@ index 0000000..6e98a6b
 +# block_outputs (monotonic-pointer write buffer)
 +_BLOCK_OUT_GPU: dict[int, "torch.Tensor"] = {}          # [cap, H] bf16
 +_BLOCK_OUT_PTR_GPU: dict[int, "torch.Tensor"] = {}      # [] int64
-+_BLOCK_ARANGE_GPU: dict[int, "torch.Tensor"] = {}       # [cap] int64
-+# layer_in (monotonic-pointer write buffer)
-+_LAYER_IN_GPU: dict[int, "torch.Tensor"] = {}           # [cap, H] bf16
-+_LAYER_IN_PTR_GPU: dict[int, "torch.Tensor"] = {}       # [] int64
-+_LAYER_IN_ARANGE_GPU: dict[int, "torch.Tensor"] = {}    # [cap] int64
++_BLOCK_ARANGE_GPU: dict[int, "torch.Tensor"] = {}       # [cap+1] int64
++# NOTE: layer_in in-graph buffers were removed (LOW-1): the layer_in signal
++# fed only the replay-only stage2_profile writer, so no in-graph writer
++# allocates or reads them. The calib_layer_in_accum custom op + its qwen
++# callers were deleted with them.
 +# input_cov (resident mode): per-expert Gram [E, H, H] + per-expert token
 +# counts [E] + per-forward scratch [E, buf_rows, H].
 +_INPUT_COV_GPU: dict[int, "torch.Tensor"] = {}          # [E, H, H] fp32
@@ -8382,10 +8346,10 @@ index 0000000..86daced
 +    return n
 diff --git a/vllm/calibration_router_logits_stats.py b/vllm/calibration_router_logits_stats.py
 new file mode 100644
-index 0000000..729339d
+index 0000000..78ca0b1
 --- /dev/null
 +++ b/vllm/calibration_router_logits_stats.py
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,272 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert) router-logit statistics capture for calibration-v2
@@ -8406,19 +8370,22 @@ index 0000000..729339d
 +accumulated in ``MoERunner._apply_quant_method`` with no
 +``.cpu()``/``.item()``/RNG on the capture path.
 +
-+Sidecar-schema compatibility (sink split → all-normal)
-+------------------------------------------------------
-+``RouterLogitsStatsPayload`` retains its exact field set. Because sink
-+classification is not graph-safe, every token is treated as a NORMAL token:
-+``score_normal_sum`` carries Σ logit, ``n_normal_tokens`` carries the count,
-+and ``score_sink_sum`` / ``fire_on_sink`` / ``n_sink_tokens`` are zero. The
-+``schema_version`` / shapes are unchanged so downstream loaders are
-+byte-compatible. (Σ logit² is checkpointed for variance derivation but is not
-+a payload field in the unchanged schema.)
++NO sidecar is emitted (HIGH-1 fix)
++----------------------------------
++The downstream consumer ``stage1/plugins/router_logits_stats_cache.py`` is
++ALWAYS enabled and, on a sidecar hit with ``sink_token_enabled=True`` (the
++default), OVERWRITES ``ctx.sink_acc`` with an accumulator hydrated from the
++sidecar's sink fields. But the in-graph capture CANNOT produce the sink-vs-
++normal split (it is not graph-safe), so a sidecar would carry all-zero sink
++fields and silently neuter ``SinkTokenDetectorPlugin`` (zero candidates where
++a live pass would have found some).
 +
-+BOS-path note (LOW): position-0 sink-heavy logits are accumulated without
-+filtering; consumers that previously read ``score_sink_sum`` will now see all
-+mass under ``score_normal_sum``.
++Therefore ``dump_router_logits_stats`` is a deliberate NO-OP: it does not
++write ``sidecars/router_logits_stats.pt``. The cache provider then always
++MISSES and Stage 1 computes ``sink_acc`` LIVE (Stage 1 runs live forwards
++anyway), which is correct. The GPU Σ-logit / Σ-logit² / count accumulators are
++still maintained + checkpointed (for resume / future replay-driver use), but
++they are not surfaced as a consumer sidecar.
 +
 +Env-var gating
 +--------------
@@ -8559,52 +8526,26 @@ index 0000000..729339d
 +
 +
 +def dump_router_logits_stats(jsonl_path: str | Path) -> None:
++    """Deliberate NO-OP: do NOT emit a router_logits_stats sidecar.
++
++    HIGH-1: the always-enabled ``stage1/plugins/router_logits_stats_cache.py``
++    would, on a sidecar hit (sink_token_enabled=True, the default), OVERWRITE
++    ``ctx.sink_acc`` with an accumulator hydrated from the sidecar's sink
++    fields. The in-graph capture cannot produce the sink-vs-normal split
++    (not graph-safe), so a sidecar would carry all-zero sink fields and
++    silently neuter SinkTokenDetectorPlugin (zero candidates). By emitting NO
++    sidecar, the cache provider always misses and Stage 1 computes ``sink_acc``
++    LIVE -- the correct behavior. The GPU Σ-logit / Σ-logit² / count
++    accumulators remain available via the checkpoint for resume / a future
++    replay driver, but are not surfaced as a consumer sidecar.
++    """
 +    if not _CAPTURE_ROUTER_LOGITS_STATS:
 +        return
-+
-+    from moe_compress.utils.cached_calibration_signals import (
-+        RouterLogitsStatsPayload, save_router_logits_stats, SCHEMA_VERSIONS,
-+    )
-+
-+    if _N_LAYERS == 0 or _N_EXPERTS == 0:
-+        log.warning("calibration_router_logits_stats: no MoE layers; skip.")
-+        return
-+
-+    normal_rows = []
-+    sink_rows = []
-+    fire_rows = []
-+    n_sink_rows = []
-+    n_normal_rows = []
-+    for li in _LAYER_IDS:
-+        lsum = _ch._RLOGITS_SUM_GPU.get(li)
-+        lcnt = _ch._RLOGITS_COUNT_GPU.get(li)
-+        if lsum is None or lcnt is None:
-+            normal_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.float32))
-+        else:
-+            normal_rows.append(lsum.cpu())
-+        # Sink classification is not graph-safe: all mass treated as normal.
-+        sink_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.float32))
-+        fire_rows.append(torch.zeros(_N_EXPERTS, dtype=torch.int64))
-+        n_sink_rows.append(torch.zeros(1, dtype=torch.int64))
-+        cnt_val = int(lcnt.item()) if lcnt is not None else 0
-+        n_normal_rows.append(torch.tensor([cnt_val], dtype=torch.int64))
-+
-+    payload = RouterLogitsStatsPayload(
-+        schema_version=SCHEMA_VERSIONS["router_logits_stats"],
-+        n_experts=_N_EXPERTS,
-+        n_layers=_N_LAYERS,
-+        score_sink_sum=torch.stack(sink_rows),
-+        score_normal_sum=torch.stack(normal_rows),
-+        fire_on_sink=torch.stack(fire_rows),
-+        n_sink_tokens=torch.cat(n_sink_rows),
-+        n_normal_tokens=torch.cat(n_normal_rows),
-+        bos_token_id=_BOS_TOKEN_ID,
-+    )
-+    save_router_logits_stats(payload, Path(jsonl_path))
 +    log.info(
-+        "calibration_router_logits_stats: wrote %d-layer x %d-expert sidecar "
-+        "next to %s (bos_token_id=%s, all-normal split)",
-+        _N_LAYERS, _N_EXPERTS, jsonl_path, _BOS_TOKEN_ID,
++        "calibration_router_logits_stats: dump is a no-op under in-graph "
++        "capture -- NO sidecar emitted (sink/normal split is not graph-safe; "
++        "Stage 1 computes sink_acc live). GPU accumulators remain in the "
++        "checkpoint for resume."
 +    )
 +
 +
@@ -10307,7 +10248,7 @@ index 3541b97..2addb47 100644
          logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
  
 diff --git a/vllm/model_executor/models/qwen3_moe.py b/vllm/model_executor/models/qwen3_moe.py
-index 4ec1be3..5476a56 100644
+index 4ec1be3..0231e71 100644
 --- a/vllm/model_executor/models/qwen3_moe.py
 +++ b/vllm/model_executor/models/qwen3_moe.py
 @@ -32,6 +32,7 @@ import torch
@@ -10318,27 +10259,16 @@ index 4ec1be3..5476a56 100644
  from vllm.compilation.decorators import support_torch_compile
  from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
  from vllm.distributed import (
-@@ -234,11 +235,39 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+@@ -234,11 +235,28 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
          if self.is_sequence_parallel:
              hidden_states = sequence_parallel_chunk(hidden_states)
  
-+        # H_LAYER_IN calibration capture. Fires AFTER sequence-parallel
-+        # chunking (the post-chunk hidden_states is the exact tensor
-+        # self.experts receives), BEFORE the is_internal_router branch
-+        # (both branches share the same input -- a single dispatch covers
-+        # both). Feeds Stage 2 SC cost_alignment="output" via
-+        # _LayerInputAccumulator (see
-+        # moe_compress.stage2.profiling._LayerInputAccumulator,
-+        # max_samples=8192, Vitter Algorithm R reservoir sampling).
-+        if _ch._CAPTURE_LAYER_IN:
-+            _layer_id = self.experts.moe_layer_id
-+            _accum = _ch._LAYER_IN_GPU.get(_layer_id)
-+            _ptr = _ch._LAYER_IN_PTR_GPU.get(_layer_id)
-+            _arng = _ch._LAYER_IN_ARANGE_GPU.get(_layer_id)
-+            if _accum is not None:
-+                torch.ops.vllm.calib_layer_in_accum(
-+                    _accum, _ptr, _arng, hidden_states
-+                )
++        # NOTE: the legacy H_LAYER_IN calibration capture is removed under the
++        # in-graph rearchitecture. The layer_in signal fed only the replay-only
++        # stage2_profile writer (VLLM_CALIB_STAGE2_PROFILE_MODE=replay), which
++        # reconstructs it post-capture from the GPU-tensor checkpoints; no
++        # in-graph writer consumes it. (The _ch._CAPTURE_LAYER_IN flag is
++        # retained as a no-op for env/config compatibility.)
 +
          if self.experts.is_internal_router:
              # In this case, the gate/router runs inside the FusedMoE class
@@ -10358,7 +10288,7 @@ index 4ec1be3..5476a56 100644
          else:
              # Actually this will be dead code, since we always pass gate into
              # FusedMoE in the current implementation. But we keep this code
-@@ -247,6 +276,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+@@ -247,6 +265,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
              final_hidden_states = self.experts(
                  hidden_states=hidden_states, router_logits=router_logits
              )
@@ -10375,7 +10305,7 @@ index 4ec1be3..5476a56 100644
  
          if self.is_sequence_parallel:
              final_hidden_states = tensor_model_parallel_all_gather(
-@@ -496,8 +535,23 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
+@@ -496,8 +524,23 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
          aux_hidden_states = self._maybe_add_hidden_state(
              [], self.start_layer, hidden_states, residual
          )
@@ -10401,7 +10331,7 @@ index 4ec1be3..5476a56 100644
          ):
              hidden_states, residual = layer(positions, hidden_states, residual)
 diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
-index f4c7167..3e2fbf8 100644
+index f4c7167..94ebc17 100644
 --- a/vllm/model_executor/models/qwen3_next.py
 +++ b/vllm/model_executor/models/qwen3_next.py
 @@ -7,6 +7,7 @@ from itertools import islice
@@ -10412,26 +10342,15 @@ index f4c7167..3e2fbf8 100644
  
  from vllm._aiter_ops import rocm_aiter_ops
  from vllm.compilation.decorators import support_torch_compile
-@@ -181,17 +182,54 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -181,17 +182,43 @@ class Qwen3NextSparseMoeBlock(nn.Module):
          if self.is_sequence_parallel:
              hidden_states = sequence_parallel_chunk(hidden_states)
  
-+        # H_LAYER_IN calibration capture (Qwen3.6 / Qwen3-Next path -- this
-+        # block is reused by qwen3_5.py). Mirrors Qwen3MoeSparseMoeBlock:
-+        # fires AFTER sequence-parallel chunking (post-chunk hidden_states is
-+        # exactly what self.experts receives), BEFORE the is_internal_router
-+        # branch (both branches share the same input). layer_idx comes from
-+        # self.experts.moe_layer_id -- this block has no moe_layer_id of its
-+        # own; the FusedMoE auto-increment counter is the layer key.
-+        if _ch._CAPTURE_LAYER_IN:
-+            _layer_id = self.experts.moe_layer_id
-+            _accum = _ch._LAYER_IN_GPU.get(_layer_id)
-+            _ptr = _ch._LAYER_IN_PTR_GPU.get(_layer_id)
-+            _arng = _ch._LAYER_IN_ARANGE_GPU.get(_layer_id)
-+            if _accum is not None:
-+                torch.ops.vllm.calib_layer_in_accum(
-+                    _accum, _ptr, _arng, hidden_states
-+                )
++        # NOTE: the legacy H_LAYER_IN calibration capture is removed under the
++        # in-graph rearchitecture (see qwen3_moe.py for the rationale). The
++        # layer_in signal fed only the replay-only stage2_profile writer; no
++        # in-graph writer consumes it. The _ch._CAPTURE_LAYER_IN flag is
++        # retained as a no-op for env/config compatibility.
 +
          if self.experts.is_internal_router:
              # In this case, the gate/router runs inside the FusedMoE class
