@@ -368,6 +368,7 @@ def _load_teacher_vllm(
     max_num_seqs: int | None = None,
     max_num_batched_tokens: int | None = None,
     max_logprobs: int = 50,
+    moe_backend: str | None = None,
 ):
     """Instantiate vLLM's offline LLM for the teacher.
 
@@ -381,6 +382,20 @@ def _load_teacher_vllm(
     decode. That's where the throughput wins live. We document it for the
     operator since the determinism contract depends on it being stable
     across runs (i.e., same vLLM version + same teacher revision).
+
+    ``moe_backend`` (when not ``None``) is threaded into the LLM's
+    ``kernel_config={"moe_backend": <val>}``. This is REQUIRED for the
+    in-graph calibration capture path: the kernel-interior signals
+    (reap_scores, per_expert_max, output_reservoir, plus the per-layer
+    block_outputs hook) only dispatch inside ``TritonExperts.apply`` /
+    ``MoERunner.apply``. With the default ``"auto"`` backend, vLLM picks
+    FlashInfer's fused-MoE kernel on Hopper/Blackwell, which never reaches
+    the patched Triton dispatch sites — every capture sidecar would come
+    out empty (the B0 failure class). The calibration orchestration always
+    passes ``moe_backend="triton"`` (the driver's ``--moe-backend`` default)
+    so the replay-capture path runs ``TritonExperts``. When ``None`` the
+    kwarg is omitted entirely so vLLM's auto-selection is unchanged (kept
+    for non-capture / pure-generate experimentation).
 
     ``max_num_seqs`` and ``max_num_batched_tokens`` are vLLM's continuous-
     batching knobs:
@@ -418,7 +433,47 @@ def _load_teacher_vllm(
         kwargs["max_num_seqs"] = int(max_num_seqs)
     if max_num_batched_tokens is not None:
         kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+    if moe_backend is not None:
+        # Force the fused-MoE backend. "triton" is required for the
+        # in-graph capture hooks to fire (see docstring). Passed via
+        # kernel_config, which vLLM forwards to the MoE method selection.
+        kwargs["kernel_config"] = {"moe_backend": str(moe_backend)}
+        log.info("vLLM kernel_config: forcing moe_backend=%s "
+                 "(required for in-graph calibration capture)", moe_backend)
     return LLM(**kwargs)
+
+
+def _resolve_moe_backend(args) -> "str | None":
+    """Resolve the fused-MoE backend to force on the LLM.
+
+    Returns ``args.moe_backend`` (default ``"triton"``) so the value
+    threads uniformly into both the generate and replay ``_load_teacher_vllm``
+    call sites. The replay (``--replay-from``) path REQUIRES a non-auto
+    backend (triton) for the kernel-interior captures to fire; if an
+    operator explicitly downgrades to ``--moe-backend auto`` while ANY
+    ``--capture-*`` flag is set, this is a misconfiguration that would
+    silently produce empty sidecars, so we hard-force ``"triton"`` and log
+    a warning rather than honour the auto downgrade. An explicit non-auto
+    override (e.g. another patched backend) is honoured as-is.
+
+    Passing the literal string ``"none"`` (case-insensitive) maps to
+    ``None`` -> omit kernel_config entirely (escape hatch for benchmarking
+    vLLM's own selection on a pure-generate run).
+    """
+    backend = getattr(args, "moe_backend", "triton")
+    if backend is not None and str(backend).lower() == "none":
+        return None
+    enabled_captures = any(
+        getattr(args, cap, False) for cap in _CAPTURE_WRITER_MODULES
+    )
+    if enabled_captures and (backend is None or str(backend).lower() == "auto"):
+        log.warning(
+            "moe_backend=%r requested but --capture-* flags are enabled; "
+            "auto/None would route to FlashInfer and yield EMPTY capture "
+            "sidecars. Hard-forcing moe_backend='triton'.", backend,
+        )
+        return "triton"
+    return backend
 
 
 def _render_prompts(tokenizer, prompts: Iterable[str]) -> list[str]:
@@ -1359,6 +1414,18 @@ def main() -> int:
                         "improve prefill GPU utilization on H200/B300 but "
                         "trade off latency. Like --max-num-seqs, doesn't "
                         "alter output bytes.")
+    p.add_argument("--moe-backend", type=str, default="triton",
+                   help="Force vLLM's fused-MoE backend via "
+                        "kernel_config={'moe_backend': <val>}. Default "
+                        "'triton' is REQUIRED for the in-graph calibration "
+                        "capture path: the kernel-interior signals "
+                        "(reap_scores / per_expert_max / output_reservoir / "
+                        "block_outputs) only dispatch inside TritonExperts; "
+                        "the 'auto' default would pick FlashInfer on "
+                        "Hopper/Blackwell and every capture sidecar would be "
+                        "empty (B0 failure class). Pass 'auto' to restore "
+                        "vLLM's own backend selection (only safe for "
+                        "pure-generate runs with no --capture-* flags).")
     p.add_argument("--chunk-size", type=int, default=200,
                    help="How many prompts to submit per LLM.generate call. "
                         "Affects crash-recovery granularity, not throughput "
@@ -2092,6 +2159,7 @@ def main() -> int:
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_logprobs=args.logits_top_k,
+        moe_backend=_resolve_moe_backend(args),
     )
     tokenizer = llm.get_tokenizer()
     eos_ids = _coerce_eos_ids(getattr(tokenizer, "eos_token_id", None))
@@ -2928,6 +2996,7 @@ def _run_replay(args) -> int:
         max_num_seqs=_REPLAY_MAX_NUM_SEQS,
         max_num_batched_tokens=_REPLAY_MAX_BATCHED_TOKENS,
         max_logprobs=1,
+        moe_backend=_resolve_moe_backend(args),
     )
     tokenizer = llm.get_tokenizer()
 
