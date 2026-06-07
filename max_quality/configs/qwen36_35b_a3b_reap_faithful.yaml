@@ -451,8 +451,12 @@ stage5_router_kd:
   # bs=8 with grad_accum=1 eliminates gradient accumulation overhead entirely:
   # 750 forward passes (= 750 optimizer steps at 6000 samples / 8 batch / 1 epoch).
   # Same effective batch as paper (8×1 = 2×4 = 8).
-  batch_size: 8
-  gradient_accumulation: 1
+  batch_size: 2                   # CORRECTED 2026-06-07 (was 8). On H200 the
+  gradient_accumulation: 4         # BF16 teacher (~70GB) + BF16 student (~50GB)
+                                   # are both resident (~120GB), so bs=8 vocab-KL
+                                   # logits OOM'd by a hair (Qwen3.6 |V|=248320).
+                                   # bs=2 x grad_accum=4 = SAME effective batch 8
+                                   # (identical KD math), ~4x less peak logit mem.
   # Teacher loads in BF16 on H200 — no quantization needed.
   teacher_load_in_4bit: false
   # Optional alternate teacher for KD (Stage 2.5 / Stage 5). null = use the
