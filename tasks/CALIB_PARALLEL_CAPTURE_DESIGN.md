@@ -36,12 +36,16 @@ capture). Add a `--moe-backend` flag (default "triton" for calibration).
 Input: N per-shard sidecar dirs. Output: one merged sidecar dir at the canonical
 8000-jsonl `sidecars/<stem>/` path (so a probe config with
 `calibration.jsonl_path = <8000 jsonl>` resolves it). Per-signal reductions
-(must be EXACTLY equal to a single full run):
+reproduce a single full run **exact up to the fp32 storage of the per-shard
+mean** — the writer stores each shard's mean in fp32 and the merge re-expands
++ accumulates in fp64, so the merge arithmetic itself adds no error. (The
+writer stays fp32; that precision is fine for expert-ranking — H3.)
 
-- **reap_scores (probe-critical):** payload has `reap_scores` (= per-shard mean
-  `score_sum/count`) + `token_counts`. Merge:
+- **reap_scores (probe-critical):** payload has `reap_scores` (= per-shard fp32
+  mean `score_sum/count`) + `token_counts`. Merge (fp64 accumulation):
   `combined[l,e] = Σ_k(reap_k[l,e] * count_k[l,e]) / max(Σ_k count_k[l,e], 1)`,
-  `counts = Σ_k count_k`. Exactly reproduces the single-run mean. Unit-tested.
+  `counts = Σ_k count_k`. Reproduces the single-run mean exact up to the fp32
+  storage of each `reap_k`. Unit-tested.
 - **per_expert_max:** element-wise `max` across shards. token_counts summed.
 - **routing_stats:** `freq = Σ freq_k`; `mean_weight = Σ(mean_weight_k*freq_k)/max(Σfreq_k,1)`.
 - **imatrix:** dense `.dat` not pipeline-consumed (Stage 6 uses llama.cpp's own) —

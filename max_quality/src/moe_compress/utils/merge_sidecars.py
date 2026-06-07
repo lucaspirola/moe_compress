@@ -4,20 +4,30 @@ Part of the data-parallel calibration-capture machinery (see
 ``tasks/CALIB_PARALLEL_CAPTURE_DESIGN.md``). Each of N independent single-GPU
 replay processes captures over a DISJOINT shard of the corpus and writes its
 own sidecar dir. Because every in-graph capture signal is an **associative
-reduction**, the N partial sidecars combine EXACTLY into the single-full-run
-result. This module performs those reductions.
+reduction**, the N partial sidecars combine into the single-full-run result
+(exact up to the fp32 storage of each shard's per-shard mean; the merge
+arithmetic itself accumulates in fp64). This module performs those reductions.
 
-Per-signal reductions (each EXACTLY reproduces a single full run)
------------------------------------------------------------------
+Per-signal reductions
+---------------------
+The reductions reproduce a single full run **exact up to the fp32 storage
+of the per-shard mean** — the writer stores each shard's mean in fp32, and
+the merge re-expands + accumulates in fp64, so no additional error is
+introduced by the merge itself. The only deviation from an idealized
+single full run is the fp32 quantization of each shard's stored mean, which
+is well within tolerance for expert-ranking. The writer is intentionally
+left at fp32 (see design §H3).
+
 * **reap_scores** (probe-critical): the payload stores the per-shard MEAN
-  ``reap[l,e] = score_sum[l,e] / count[l,e]`` plus ``token_counts[l,e]``.
-  The combined mean is the count-weighted mean::
+  ``reap[l,e] = score_sum[l,e] / count[l,e]`` (fp32) plus ``token_counts[l,e]``.
+  The combined mean is the count-weighted mean, accumulated in fp64::
 
       combined[l,e] = Σ_k (reap_k[l,e] * count_k[l,e]) / max(Σ_k count_k[l,e], 1)
       counts[l,e]   = Σ_k count_k[l,e]
 
-  This reconstructs ``Σ_k score_sum_k / Σ_k count_k`` exactly (the single-run
-  formula), because ``reap_k * count_k == score_sum_k``.
+  This reconstructs ``Σ_k score_sum_k / Σ_k count_k`` exactly up to the fp32
+  storage of each ``reap_k`` (because ``reap_k * count_k == score_sum_k``),
+  with the merge arithmetic itself done in fp64.
 * **per_expert_max**: element-wise ``max`` across shards; ``token_counts``
   summed.
 * **routing_stats**: ``freq = Σ freq_k``; ``mean_weight`` is the
@@ -40,11 +50,13 @@ Validation
 ----------
 All shards must agree on ``(n_layers, n_experts)`` and ``schema_version``
 for each signal; a mismatch aborts. Signals absent from the shards are
-skipped. ``reap_scores`` is the critical path and is reduced exactly.
+skipped. ``reap_scores`` is the critical path and is reduced exactly up to
+fp32 mean storage (fp64 merge arithmetic).
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -100,6 +112,105 @@ def _jsonl_for_sidecar_dir(sidecar_dir: Path) -> Path:
     return parent / (stem + ".jsonl")
 
 
+def _row_stable_key(row: dict, line_idx: int) -> "tuple[str, object]":
+    """Stable per-row key for the concat disjointness check.
+
+    Mirrors ``shard_split._row_key`` exactly so concat-mode coverage is
+    checked with the same rigor as the replay-mode split: ``_attempt_idx``
+    -> ``seed_idx`` -> 0-based line index, tagged with its kind.
+    """
+    if "_attempt_idx" in row and row["_attempt_idx"] is not None:
+        return ("_attempt_idx", int(row["_attempt_idx"]))
+    if "seed_idx" in row and row["seed_idx"] is not None:
+        return ("seed_idx", int(row["seed_idx"]))
+    return ("line_idx", int(line_idx))
+
+
+def concat_jsonls(
+    shard_jsonls: "list[Path]",
+    out_jsonl: Path,
+) -> int:
+    """Concatenate N per-shard output JSONLs (generate mode) in shard order.
+
+    Used by the orchestration's ``generate`` mode: each process GENERATES a
+    disjoint prompt slice into its own ``shard_k/self_traces.jsonl``; the final
+    corpus is their shard-ordered concatenation.
+
+    HARD verification (same rigor as ``shard_split``):
+      (a) total output rows == Σ shard rows.
+      (b) the per-row stable key (``_attempt_idx``/``seed_idx``/line-index)
+          forms DISJOINT sets across shards whose UNION is the full set
+          (no row in two shards, none dropped, and globally key-unique).
+    Aborts (RuntimeError) on any violation BEFORE writing the output, so a
+    silently-overlapping generate run never produces a corpus.
+
+    Returns the total number of rows written.
+    """
+    shard_jsonls = [Path(p) for p in shard_jsonls]
+    per_shard_rows: list[list[str]] = []
+    per_shard_keys: list[set] = []
+    global_line = 0
+    for sj in shard_jsonls:
+        if not sj.is_file():
+            raise RuntimeError(f"concat_jsonls: shard jsonl missing: {sj}")
+        rows: list[str] = []
+        keys: set = set()
+        with sj.open(encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                parsed = json.loads(stripped)
+                keys.add(_row_stable_key(parsed, global_line))
+                rows.append(stripped)
+                global_line += 1
+        per_shard_rows.append(rows)
+        per_shard_keys.append(keys)
+
+    total = sum(len(r) for r in per_shard_rows)
+    if total == 0:
+        raise RuntimeError("concat_jsonls: all shard JSONLs are empty")
+
+    # (b) disjoint + unique across shards.
+    keys_with_multiplicity = sum(len(s) for s in per_shard_keys)
+    union: set = set()
+    for s in per_shard_keys:
+        union |= s
+    if keys_with_multiplicity != len(union):
+        seen: set = set()
+        dupes: set = set()
+        for s in per_shard_keys:
+            for key in s:
+                if key in seen:
+                    dupes.add(key)
+                seen.add(key)
+        raise RuntimeError(
+            f"concat_jsonls DISJOINTNESS FAILURE: {len(dupes)} key(s) appear "
+            f"in more than one shard, e.g. {sorted(dupes)[:5]}. Generate "
+            f"slices overlap — check the --num-prompts/--prev-num-prompts "
+            f"ladder + that every process used the SAME --seed."
+        )
+    # (a) count == union (also catches in-shard dupes -> count > union).
+    if total != len(union):
+        raise RuntimeError(
+            f"concat_jsonls KEY-UNIQUENESS FAILURE: {total} rows but "
+            f"{len(union)} distinct stable keys. Duplicate keys make the "
+            f"corpus ambiguous; check for repeated generation."
+        )
+
+    out_jsonl = Path(out_jsonl)
+    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_jsonl.with_suffix(out_jsonl.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as out:
+        for rows in per_shard_rows:
+            for r in rows:
+                out.write(r + "\n")
+    tmp.replace(out_jsonl)
+    log.info("concat_jsonls: wrote %d rows from %d shards -> %s",
+             total, len(shard_jsonls), out_jsonl)
+    return total
+
+
 def _validate_dims(
     signal: str,
     payloads: list,
@@ -146,7 +257,8 @@ def _validate_dims(
 def merge_reap_scores(
     shard_payloads: list,
 ) -> "Stage2ReapPayload | None":
-    """Count-weighted mean reduction (EXACT). See module docstring."""
+    """Count-weighted mean reduction (fp64 accumulation; exact up to fp32
+    storage of each shard's mean). See module docstring."""
     payloads = [p for p in shard_payloads if p is not None]
     if not payloads:
         return None
@@ -326,8 +438,6 @@ def merge_output_reservoir(
 def merge_block_outputs(
     shard_jsonls: list,
     out_jsonl: Path,
-    *,
-    n_layers_hint: "int | None" = None,
 ) -> int:
     """block_outputs: per-layer concat of hidden_states across shards.
 
@@ -337,22 +447,26 @@ def merge_block_outputs(
     -> ``[Σn, H]``, sum ``n_prompts_in_subset``, and write the merged
     per-layer sidecar under ``out_jsonl``'s namespace.
 
+    Layer discovery (H1 fix): the set of layer indices is the UNION across
+    ALL shard sidecar dirs, not just shard 0. A layer present only on a
+    subset of shards (e.g. a shard whose disjoint rows never routed through
+    some block) is still merged, using only the shards that actually have
+    it. Scanning shard 0 alone would silently drop such layers.
+
     Returns the number of layers merged (0 if block_outputs absent).
     """
-    # Discover which layers exist by scanning shard 0's block_hidden dir.
-    first_dir = sidecar_path(
-        shard_jsonls[0], "block_hidden/layer_0000",
-    ).parent
-    if not first_dir.is_dir():
+    # Discover which layers exist by UNIONing every shard's block_hidden dir.
+    layer_set: set[int] = set()
+    for sj in shard_jsonls:
+        bh_dir = sidecar_path(sj, "block_hidden/layer_0000").parent
+        if not bh_dir.is_dir():
+            continue
+        for p in bh_dir.glob("layer_*.pt"):
+            if p.suffix == ".pt":
+                layer_set.add(int(p.stem.split("_")[-1]))
+    if not layer_set:
         return 0
-
-    layer_indices = sorted(
-        int(p.stem.split("_")[-1])
-        for p in first_dir.glob("layer_*.pt")
-        if p.suffix == ".pt"
-    )
-    if not layer_indices:
-        return 0
+    layer_indices = sorted(layer_set)
 
     merged = 0
     for layer_idx in layer_indices:
@@ -452,8 +566,28 @@ def merge_all(
 
     Returns a dict ``{signal: status}`` where status is "merged" / "absent"
     / "skipped".
+
+    H2 self-merge guard: the OUTPUT jsonl's resolved sidecar dir must NOT be
+    one of the input shard sidecar dirs. Otherwise the merge would read its
+    own (in-progress or prior) output as an input — double-counting and a
+    silently-wrong corpus. Aborts with a clear message if violated.
     """
     out_jsonl = Path(out_jsonl)
+
+    # H2: resolve the output sidecar dir and reject any input shard dir that
+    # is the same path (after full resolution to defeat ./ / symlink aliasing).
+    out_sidecar_dir = (out_jsonl.parent / "sidecars" / out_jsonl.stem).resolve()
+    resolved_inputs = [Path(d).resolve() for d in shard_sidecar_dirs]
+    for raw, resolved in zip(shard_sidecar_dirs, resolved_inputs):
+        if resolved == out_sidecar_dir:
+            raise ValueError(
+                f"merge_sidecars: self-merge detected — input shard sidecar "
+                f"dir {raw} resolves to the OUTPUT sidecar dir "
+                f"{out_sidecar_dir}. Merging the output as an input would "
+                f"double-count. Use an --out-jsonl whose sidecar namespace is "
+                f"distinct from every shard's."
+            )
+
     shard_jsonls = [_jsonl_for_sidecar_dir(Path(d)) for d in shard_sidecar_dirs]
 
     status: dict[str, str] = {}

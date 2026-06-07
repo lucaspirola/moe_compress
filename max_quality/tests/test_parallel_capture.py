@@ -27,12 +27,15 @@ sys.path.insert(0, str(_SCRIPTS))
 from moe_compress.utils import merge_sidecars as ms  # noqa: E402
 from moe_compress.utils.cached_calibration_signals import (  # noqa: E402
     SCHEMA_VERSIONS,
+    BlockHiddenPayload,
     RoutingStatsPayload,
     Stage1PerExpertMaxPayload,
     Stage2ReapPayload,
+    load_block_hidden,
     load_per_expert_max,
     load_reap_scores,
     load_routing_stats,
+    save_block_hidden,
     save_per_expert_max,
     save_reap_scores,
     save_routing_stats,
@@ -363,3 +366,164 @@ def test_merge_absent_signal_skipped(tmp_path):
     assert status["reap_scores"] == "merged"
     assert status["per_expert_max"] == "absent"
     assert status["routing_stats"] == "absent"
+
+
+# ===========================================================================
+# N3: merge_block_outputs — per-layer concat across shards + layer UNION (H1).
+# ===========================================================================
+def test_merge_block_outputs_union_and_concat(tmp_path):
+    """Per-layer block_hidden round-trip across 2 shards.
+
+    Shard A has layers {0, 1}; shard B has layers {1, 2}. The merge must:
+      * cover the UNION {0, 1, 2} (H1 — layer present only on one shard is
+        NOT dropped),
+      * concatenate hidden_states in shard order for layers seen in both,
+      * sum n_prompts_in_subset per layer.
+    """
+    H = 4
+
+    def _bh(layer, rows, n_prompts, fill):
+        return BlockHiddenPayload(
+            schema_version=SCHEMA_VERSIONS["block_hidden"],
+            layer_idx=layer,
+            n_prompts_in_subset=n_prompts,
+            hidden_states=torch.full((rows, H), float(fill), dtype=torch.bfloat16),
+        )
+
+    sj_a = tmp_path / "bo_a.jsonl"; sj_a.write_text("")
+    sj_b = tmp_path / "bo_b.jsonl"; sj_b.write_text("")
+
+    # Shard A: layer 0 (2 rows, fill 1), layer 1 (3 rows, fill 2).
+    save_block_hidden(_bh(0, 2, 5, 1), sj_a)
+    save_block_hidden(_bh(1, 3, 5, 2), sj_a)
+    # Shard B: layer 1 (1 row, fill 3), layer 2 (4 rows, fill 4).
+    save_block_hidden(_bh(1, 1, 7, 3), sj_b)
+    save_block_hidden(_bh(2, 4, 7, 4), sj_b)
+
+    out = tmp_path / "bo_merged.jsonl"; out.write_text("")
+    n_merged = ms.merge_block_outputs([sj_a, sj_b], out)
+    assert n_merged == 3, f"expected union of 3 layers, got {n_merged}"
+
+    # Layer 0: only shard A -> 2 rows, n_prompts 5.
+    l0 = load_block_hidden(out, 0)
+    assert l0 is not None and l0.hidden_states.shape == (2, H)
+    assert l0.n_prompts_in_subset == 5
+
+    # Layer 1: both shards, concat in shard order (A then B) -> 3+1=4 rows.
+    l1 = load_block_hidden(out, 1)
+    assert l1 is not None and l1.hidden_states.shape == (4, H)
+    assert l1.n_prompts_in_subset == 12  # 5 + 7
+    # First 3 rows == fill 2 (shard A), last row == fill 3 (shard B).
+    hs = l1.hidden_states.to(torch.float32)
+    assert torch.all(hs[:3] == 2.0)
+    assert torch.all(hs[3:] == 3.0)
+
+    # Layer 2: only shard B (NOT dropped — H1) -> 4 rows, n_prompts 7.
+    l2 = load_block_hidden(out, 2)
+    assert l2 is not None and l2.hidden_states.shape == (4, H)
+    assert l2.n_prompts_in_subset == 7
+
+
+# ===========================================================================
+# H2: self-merge guard.
+# ===========================================================================
+def test_merge_self_merge_guard(tmp_path):
+    """Output sidecar dir == an input shard dir must abort."""
+    sj = tmp_path / "self.jsonl"; sj.write_text("")
+    save_reap_scores(
+        Stage2ReapPayload(
+            schema_version=SCHEMA_VERSIONS["reap_scores"],
+            n_experts=N_EXPERTS, n_layers=N_LAYERS,
+            reap_scores=torch.zeros(N_LAYERS, N_EXPERTS),
+            token_counts=torch.ones(N_LAYERS, N_EXPERTS, dtype=torch.int64),
+        ),
+        sj,
+    )
+    # out_jsonl == the same jsonl -> its sidecar dir == the input shard dir.
+    with pytest.raises(ValueError, match="self-merge"):
+        ms.merge_all([_sidecar_dir_for(sj)], sj)
+
+
+# ===========================================================================
+# concat_jsonls (generate-mode merge) disjointness.
+# ===========================================================================
+def test_concat_jsonls_disjoint_complete(tmp_path):
+    a = tmp_path / "shard_a.jsonl"
+    b = tmp_path / "shard_b.jsonl"
+    _write_jsonl(a, 0)  # create empty then overwrite with explicit keys
+    with a.open("w") as f:
+        for i in [0, 1, 2]:
+            f.write(json.dumps({"_attempt_idx": i, "messages": []}) + "\n")
+    with b.open("w") as f:
+        for i in [3, 4]:
+            f.write(json.dumps({"_attempt_idx": i, "messages": []}) + "\n")
+
+    out = tmp_path / "corpus.jsonl"
+    n = ms.concat_jsonls([a, b], out)
+    assert n == 5
+    keys = [json.loads(l)["_attempt_idx"] for l in out.read_text().splitlines()]
+    # shard order preserved (a then b), disjoint+complete.
+    assert keys == [0, 1, 2, 3, 4]
+
+
+def test_concat_jsonls_overlap_aborts(tmp_path):
+    a = tmp_path / "a.jsonl"
+    b = tmp_path / "b.jsonl"
+    with a.open("w") as f:
+        for i in [0, 1, 2]:
+            f.write(json.dumps({"_attempt_idx": i, "messages": []}) + "\n")
+    with b.open("w") as f:
+        for i in [2, 3]:  # key 2 overlaps shard a
+            f.write(json.dumps({"_attempt_idx": i, "messages": []}) + "\n")
+    out = tmp_path / "corpus.jsonl"
+    with pytest.raises(RuntimeError, match="DISJOINTNESS"):
+        ms.concat_jsonls([a, b], out)
+    assert not out.exists(), "corpus must NOT be written on overlap"
+
+
+# ===========================================================================
+# generate-mode offset slices: disjoint + complete (no GPU, stubbed source).
+#
+# Mirrors the driver's offset semantics: a per-key deterministic stream where
+# iter(num_prompts=N) yields the first int(N*weight) of each subset, and
+# iter(M, prev=N) yields [int(N*weight), int(M*weight)). With a single subset
+# (weight=1) the count ladder C_0<..<C_N gives slices [C_k, C_{k+1}) that are
+# disjoint and cover [0, C_N). This is the property run_parallel_capture.sh's
+# generate mode relies on.
+# ===========================================================================
+def _stub_offset_slice(total_stream, lo, hi):
+    """A deterministic stream sliced to [lo, hi) — models one subset's
+    [prev_count, count) yield with the same shuffle for all N."""
+    return list(total_stream[lo:hi])
+
+
+def test_generate_offset_slices_disjoint_complete():
+    # Deterministic "shuffle" of 8000 prompt ids; same for every process.
+    total_stream = list(range(8000))
+    n = 4
+    ladder = [8000 * k // n for k in range(n + 1)]
+    assert ladder == [0, 2000, 4000, 6000, 8000]
+
+    slices = [
+        _stub_offset_slice(total_stream, ladder[k], ladder[k + 1])
+        for k in range(n)
+    ]
+    # Disjoint.
+    seen = set()
+    for s in slices:
+        sset = set(s)
+        assert seen.isdisjoint(sset), "generate slices overlap"
+        seen |= sset
+    # Complete: union == full stream, no dupes.
+    assert sorted(seen) == total_stream
+    assert sum(len(s) for s in slices) == len(total_stream)
+
+
+def test_generate_ladder_uneven_split():
+    # 10 prompts over 3 shards -> ladder [0,3,6,10]; last slice absorbs remainder.
+    n, total = 3, 10
+    ladder = [total * k // n for k in range(n + 1)]
+    assert ladder == [0, 3, 6, 10]
+    sizes = [ladder[k + 1] - ladder[k] for k in range(n)]
+    assert sizes == [3, 3, 4]
+    assert sum(sizes) == total
