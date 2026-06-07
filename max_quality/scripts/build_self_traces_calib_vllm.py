@@ -2993,15 +2993,16 @@ def _run_replay(args) -> int:
     # ------------------------------------------------------------------
     # 5. Load teacher
     #
-    # max_num_seqs=256 set explicitly so:
-    #   max_cudagraph_capture_size = min(256*2, 512) = 512 (predictable).
-    # max_num_batched_tokens=256 caps each prefill chunk so every MoE
-    # forward has num_tokens <= 256 <= buf_rows, making
-    # expert_out_unweighted fire on all prefill tokens (not just the
-    # single decode token).
+    # THROUGHPUT: the patched wheel sizes the in-graph capture side-store to
+    # _calib_buf_rows = max(max_cudagraph_capture_size, max_num_batched_tokens,
+    # 512), so a LARGE max_num_batched_tokens scales the buffer WITH the batch
+    # (no OOB capture skip) and keeps the GPU busy. The old hard 256 cap (only
+    # needed before the buf_rows fix) is removed; default high and let
+    # --max-num-batched-tokens / --max-num-seqs override. The C2 assert
+    # (buf_rows >= max_num_batched_tokens) below is the correctness safety net.
     # ------------------------------------------------------------------
-    _REPLAY_MAX_BATCHED_TOKENS = 256
-    _REPLAY_MAX_NUM_SEQS = 256
+    _REPLAY_MAX_BATCHED_TOKENS = args.max_num_batched_tokens or 8192
+    _REPLAY_MAX_NUM_SEQS = args.max_num_seqs or 256
 
     llm = _load_teacher_vllm(
         args.teacher,
