@@ -1,304 +1,368 @@
-# PLAN — In-graph cudagraph-safe calibration capture (CORRECTED, all signals)
+# PLAN — In-graph cudagraph-safe calibration capture (ROUND 3, all signals)
 
 Implements tasks/CALIB_CUDAGRAPH_FAST_CAPTURE_DESIGN.md. Branch feat/calib-cudagraph-capture.
-Revised to fix plan-review round-1 findings (C1 custom-op routing, C2/C3, H1-3, M1-4).
+Fixes round-2: C1-RESIDUAL (named-arg mutates_args custom-op retention), H-NEW-1 (input_cov clamp), M-NEW-1/2/3.
 
 ---
 
-# CALIB CUDAGRAPH FAST CAPTURE — CORRECTED IMPLEMENTATION PLAN
+# CALIB CUDAGRAPH FAST CAPTURE — CORRECTED FULL IMPLEMENTATION PLAN (Round 3)
 
-## 0. Boundary Classification (C1 resolution)
+## 0. Ground Truth from Patch + Source (M-NEW-3 / Version Skew)
 
-**Custom-op-interior (inline GPU accumulation is graph-safe):** All code called from `_moe_forward` → `_forward_impl` → `_apply_quant_method` → `_quant_method.apply` → `TritonExperts.apply`. This includes:
+All insertion-point citations below are relative to the **patched file symbols**, not upstream line numbers, because the patch modifies `MoERunner._apply_quant_method` / `.forward` significantly. The relevant placement facts confirmed from the patch:
 
-- `router` / `topk_weights` / `topk_ids` (in `_apply_quant_method`, moe_runner.py:526–544)
-- `expert_in` (in `_apply_quant_method`, before `.apply()`)
-- `expert_out_weighted` (in `_apply_quant_method`, after `.apply()`)
-- `expert_out_unweighted` (inside `TritonExperts.apply`, triton_moe.py)
-- `expert_mid` (inside `TritonExperts.apply`)
+- **`_current_layer_idx` assignment** lives in `MoERunner.forward` (the non-monolithic path), guarded by `if _ch._CAPTURE_EXPERT_UNWEIGHTED or _ch._CAPTURE_EXPERT_MID` (patch line 10375). It is NOT in `_apply_quant_method`.
+- **`router` dispatch** fires in `MoERunner.forward`, in the non-monolithic branch, after `topk_weights, topk_ids = self.router.select_experts(...)`. Patch line 10377–10390.
+- **`expert_in` dispatch** fires immediately after the router dispatch in the same non-monolithic branch. Patch line 10391–10397.
+- **`expert_out_weighted` dispatch** fires after `fused_out = self._quant_method.apply(...)` returns, still in `MoERunner.forward` non-monolithic branch. Patch line 10407–10414.
+- **`expert_out_unweighted` and `expert_mid` dispatches** fire inside `TritonExperts.apply`, reading `_ch._current_layer_idx` which was set by the runner earlier in the same call chain.
+- **`layer_in` and `block_out` dispatches** fire in `Qwen3MoeSparseMoeBlock.forward` and `Qwen3NextSparseMoeBlock.forward`, using `self.experts.moe_layer_id` (NOT `self.moe_layer_id` — the SparseMoeBlock has no such attribute of its own).
+- **`linear_in` dispatch** fires in `ReplicatedLinear.forward`, `ColumnParallelLinear.forward`, and `RowParallelLinear.forward`, all using `self.prefix`.
+- **`lm_head_in` dispatch** fires in `LogitsProcessor._get_logits`, passing `hidden_states` (before the matmul).
 
-All of these are inside the `vllm.moe_forward` custom op (moe_runner.py:167–173), which is opaque to Dynamo.
-
-**Traced-region (must use `direct_register_custom_op` wrappers):** Dispatched from code that `@support_torch_compile` traces:
-
-- `linear_in` / `lm_head_in`: dispatched from `ColumnParallelLinear.forward` (linear.py:582) and `LogitsProcessor._get_logits` (logits_processor.py:96). Both are called from `Qwen3MoeModel`/`Qwen3NextModel` which is decorated `@support_torch_compile` (qwen3_moe.py:439, qwen3_next.py:461).
-- `block_out`: dispatched from `Qwen3NextSparseMoeBlock.forward` (qwen3_next.py:175) / `Qwen3MoeSparseMoeBlock.forward` (qwen3_moe.py:226). These are methods on sub-modules of `@support_torch_compile` models.
-- `layer_in`: dispatched from decoder layer `forward` (qwen3_next.py:401 / qwen3_moe.py:416), also inside the compiled region.
-
-**Writers affected by traced-region signals:**
-- `imatrix` (dense path: `linear_in` and `lm_head_in`)
-- `block_outputs` (`block_out`)
-- `stage2_profile` (`layer_in`, `expert_out_unweighted`, etc.)
-- `input_cov` (dense path: `linear_in`)
-
-**Writers that are pure custom-op-interior:**
-- `reap_scores`, `per_expert_max`, `routing_stats`, `router_logits_stats`, `wanda_scalar_row`, `output_reservoir` — all consume only `router`, `expert_in`, `expert_out_unweighted`, `expert_mid`, `expert_out_weighted`.
+**Implication for the plan:** All GPU accumulation for `router`, `expert_in`, `expert_out_weighted` must be inserted in `MoERunner.forward` (non-monolithic branch), not `_apply_quant_method`. This is still inside the `vllm.moe_forward` custom op body (confirmed: `_forward_impl` calls `_apply_quant_method` which calls `forward` through the runner chain — the entire stack is opaque to Dynamo). The `layer_in`, `block_out`, and `linear_in`/`lm_head_in` dispatch sites remain in traced-region code.
 
 ---
 
-## 1. Shared Infrastructure Changes
+## 1. Boundary Classification (C1 — final)
 
-### 1.1 `vllm/calibration_hooks.py`
+**Custom-op-interior (inline GPU accumulation is graph-safe):**
+All code reachable from `MoERunner.forward` in the non-monolithic path: `router`, `expert_in`, `expert_out_weighted` dispatch sites in `MoERunner.forward`; `expert_out_unweighted` and `expert_mid` sites in `TritonExperts.apply`. All are inside `vllm.moe_forward` (confirmed: `direct_register_custom_op`, moe_runner.py:167–173).
 
-Replace `_callbacks` dict + `dispatch()` Python calls with persistent GPU accumulator infrastructure:
+**Traced-region — requires `direct_register_custom_op` wrapper (C1-RESIDUAL fix):**
+- `linear_in` → `ColumnParallelLinear.forward`, `ReplicatedLinear.forward`, `RowParallelLinear.forward` — called from `@support_torch_compile` model forward
+- `lm_head_in` → `LogitsProcessor._get_logits` — called from compiled model
+- `block_out` → `Qwen3MoeSparseMoeBlock.forward`, `Qwen3NextSparseMoeBlock.forward` — inside `@support_torch_compile` model
+- `layer_in` → same SparseMoeBlock forward methods — same compiled region
 
-```
-# Module-level GPU accumulator registries (keyed by layer_idx int)
-_REAP_SCORE_ACCUM_GPU:     dict[int, Tensor]   # [E] fp32
-_REAP_TOKEN_COUNTS_GPU:    dict[int, Tensor]   # [E] int64
-_PEM_ACCUM_GPU:            dict[int, Tensor]   # [E, K] fp32
-_ROUTING_FREQ_GPU:         dict[int, Tensor]   # [E] int64
-_ROUTING_WSUM_GPU:         dict[int, Tensor]   # [E] int64
-_ROUTER_LOGITS_SUM_GPU:    dict[int, Tensor]   # [E] fp32
-_ROUTER_LOGITS_SQ_GPU:     dict[int, Tensor]   # [E] fp32
-_ROUTER_COUNT_GPU:         dict[int, Tensor]   # [E] int64
-_IMATRIX_MoE_GPU:          dict[int, Tensor]   # [E, H] fp32 (expert_in sq-sum)
-_IMATRIX_DENSE_GPU:        dict[str, Tensor]   # keyed by layer name, fp32
-_WANDA_GPU:                dict[int, Tensor]   # [E, K] fp32
-_RESERVOIR_GPU:            dict[int, Tensor]   # [E, cap, H] fp32
-_RESERVOIR_CTR_GPU:        dict[int, Tensor]   # [E] int64 (monotonic per-expert)
-_BLOCK_OUT_GPU:            dict[int, Tensor]   # [buf_rows, H] bf16 (monotonic)
-_BLOCK_OUT_PTR_GPU:        dict[int, Tensor]   # [] int64 scalar write pointer
-_TOPK_WEIGHTS_STASH_GPU:   dict[int, Tensor]   # [buf_rows, top_k] fp32
-_TOPK_IDS_STASH_GPU:       dict[int, Tensor]   # [buf_rows, top_k] int64
-```
+**Affected writers by boundary:**
+- Custom-op-interior only: `reap_scores`, `per_expert_max`, `routing_stats`, `router_logits_stats`, `wanda_scalar_row`, `output_reservoir`
+- Traced-region only: `block_outputs` (block_out signal)
+- Mixed (MoE path interior, dense path traced): `imatrix` (MoE via `expert_in`/`expert_mid`, dense via `linear_in`/`lm_head_in`)
+- Traced-region: `stage2_profile` (layer_in, plus TritonExperts-interior signals — routed to replay, see Section 2.10)
+- Traced-region + interior mixed: `input_cov` (dense `linear_in` traced; MoE `expert_in` interior)
 
-Keep `_current_layer_idx: int = -1` and the flag globals (`_CAPTURE_ROUTER`, etc.) as before.
+---
 
-Remove `_callbacks` dict, `dispatch()`, and `register_callback()` entirely. Instead, export the GPU tensor dicts directly so each writer module can hold references allocated during `setup()`.
+## 2. C1-RESIDUAL Fix: Correct `direct_register_custom_op` Pattern
 
-Add `_CUSTOM_OP_LIB` module-level `torch.library.Library("vllm_calib", "FRAGMENT")` for traced-region op registration.
+**The bug in the prior plan:** `mutates_args=[]` with a None-returning op that only touches module-level globals is DCE'd by Inductor. Dynamo sees no tensor aliasing, no output, no mutation of named args — the op is dead.
 
-### 1.2 `_calib_buf_rows` fix (H2)
+**The fix:** Pass the actual GPU accumulator tensor as a named function argument and declare it in `mutates_args`. Dynamo then sees a tensor mutation and cannot eliminate the call. This matches the proven vLLM pattern: `lora_shrink` uses `mutates_args=["output_tensor"]`, `unified_attention_with_output` uses `mutates_args=["output", "output_block_scale"]`, `fused_moe_lora` uses `mutates_args=["output"]`.
 
-In `TritonExperts.__init__` (triton_moe.py), replace:
+**Complication:** The accumulator is keyed by (layer_idx, layer_name, etc.) — it is a different tensor for every call site. But `layer_idx` is a compile-time constant (Python int frozen at trace time), so the specific accumulator tensor resolved by `_ch._IMATRIX_DENSE_GPU[layer_idx]` at trace time is also a fixed tensor address. The caller fetches the accumulator by key and passes it as an argument.
+
+**Pattern for all three traced-region ops:**
 
 ```python
-self._calib_buf_rows = vllm_config.compilation_config.max_cudagraph_capture_size
+# In vllm/calibration_custom_ops.py
+
+def _calib_imatrix_dense_accum(accum: torch.Tensor, x: torch.Tensor) -> None:
+    """accum: [H] fp32, in-place add of x.float()^2.sum(dim=0). mutates accum."""
+    accum.add_(x.float().pow(2).sum(dim=0))
+
+def _calib_imatrix_dense_accum_fake(accum: torch.Tensor, x: torch.Tensor) -> None:
+    return  # no output; accum mutation declared via mutates_args
+
+direct_register_custom_op(
+    op_name="calib_imatrix_dense_accum",
+    op_func=_calib_imatrix_dense_accum,
+    mutates_args=["accum"],
+    fake_impl=_calib_imatrix_dense_accum_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def _calib_block_out_accum(accum: torch.Tensor, ptr: torch.Tensor,
+                            arange: torch.Tensor, hidden: torch.Tensor) -> None:
+    """accum: [cap, H] bf16 (write buffer), ptr: [] int64 (write pointer).
+    Writes hidden[:T] into accum at monotonic positions, advances ptr by T."""
+    T = hidden.shape[0]
+    cap = accum.shape[0]
+    write_idx = (ptr + arange[:T]).clamp(max=cap - 1)  # [T]
+    valid = (ptr + arange[:T]) < cap                    # [T] bool
+    src = hidden * valid.unsqueeze(1).to(hidden.dtype)   # zero out OOB
+    accum.scatter_(0, write_idx.unsqueeze(1).expand(-1, accum.shape[1]),
+                   src.to(accum.dtype))
+    ptr.copy_((ptr + T).clamp(max=cap))
+
+def _calib_block_out_accum_fake(accum, ptr, arange, hidden):
+    return
+
+direct_register_custom_op(
+    op_name="calib_block_out_accum",
+    op_func=_calib_block_out_accum,
+    mutates_args=["accum", "ptr"],
+    fake_impl=_calib_block_out_accum_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def _calib_layer_in_accum(accum: torch.Tensor, ptr: torch.Tensor,
+                           arange: torch.Tensor, hidden: torch.Tensor) -> None:
+    """Same write-pointer pattern as block_out but for layer_in."""
+    T = hidden.shape[0]
+    cap = accum.shape[0]
+    write_idx = (ptr + arange[:T]).clamp(max=cap - 1)
+    valid = (ptr + arange[:T]) < cap
+    src = hidden * valid.unsqueeze(1).to(hidden.dtype)
+    accum.scatter_(0, write_idx.unsqueeze(1).expand(-1, accum.shape[1]),
+                   src.to(accum.dtype))
+    ptr.copy_((ptr + T).clamp(max=cap))
+
+def _calib_layer_in_accum_fake(accum, ptr, arange, hidden):
+    return
+
+direct_register_custom_op(
+    op_name="calib_layer_in_accum",
+    op_func=_calib_layer_in_accum,
+    mutates_args=["accum", "ptr"],
+    fake_impl=_calib_layer_in_accum_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+```
+
+**Caller pattern in traced-region code (e.g., `ColumnParallelLinear.forward`):**
+
+```python
+# At trace time: _ch._CAPTURE_IMATRIX is a Python bool constant.
+# When True, Dynamo sees the constant-True branch and records the custom op call.
+# When False, Dynamo folds the branch and the call is DCE'd (correctly -- no accumulator).
+if _ch._CAPTURE_IMATRIX and self.prefix:
+    _accum = _ch._IMATRIX_DENSE_GPU.get(self.prefix)  # tensor, resolved at trace time
+    if _accum is not None:
+        torch.ops.vllm.calib_imatrix_dense_accum(_accum, input_)
+```
+
+`_ch._IMATRIX_DENSE_GPU.get(self.prefix)` is evaluated at trace time: `self.prefix` is a compile-time attribute (string constant per layer instance), and the dict is pre-populated by `setup()` before any forward. The resolved tensor `_accum` is a specific GPU tensor with a stable address — Dynamo records it as a constant in the graph. The `mutates_args=["accum"]` declaration tells Dynamo this call mutates that specific tensor, preventing DCE.
+
+**Verify gate (added per C1-RESIDUAL):** After compiling with `TORCH_COMPILE_DEBUG=1` or using `depyf` to dump the compiled graph, check that `torch.ops.vllm.calib_block_out_accum` (or `calib_imatrix_dense_accum`) appears as a node in the graph IR for the traced-region callers. The verify gate for `block_out` is: `VLLM_CALIB_CAPTURE_BLOCK=1 VLLM_COMPILE=1`, dump graph, grep for `calib_block_out_accum`. Token count non-zero is necessary but not sufficient — must confirm the op node survives in the compiled graph.
+
+---
+
+## 3. Shared Infrastructure Changes
+
+### 3.1 `vllm/calibration_hooks.py`
+
+Remove `_callbacks`, `dispatch()`, `register_callback()`. Add module-level GPU accumulator dicts:
+
+```python
+# Per-layer GPU accumulators (allocated by each writer's setup(), pre-capture)
+_REAP_SCORE_ACCUM_GPU:     dict[int, Tensor] = {}   # [E] fp32
+_REAP_TOKEN_COUNTS_GPU:    dict[int, Tensor] = {}   # [E] int64
+_PEM_ACCUM_GPU:            dict[int, Tensor] = {}   # [E, K] fp32  (-inf init)
+_ROUTING_FREQ_GPU:         dict[int, Tensor] = {}   # [E] int64
+_ROUTING_WSUM_GPU:         dict[int, Tensor] = {}   # [E] fp32
+_RLOGITS_SUM_GPU:          dict[int, Tensor] = {}   # [E] fp32
+_RLOGITS_SQ_GPU:           dict[int, Tensor] = {}   # [E] fp32
+_RLOGITS_COUNT_GPU:        dict[int, Tensor] = {}   # [E] int64
+_IMATRIX_MoE_GPU:          dict[int, Tensor] = {}   # [E, H] fp32
+_IMATRIX_DENSE_GPU:        dict[str, Tensor] = {}   # prefix -> [H] fp32
+_WANDA_GPU:                dict[int, Tensor] = {}   # [E, H] fp32
+_RESERVOIR_GPU:            dict[int, Tensor] = {}   # [E, cap, H] fp32
+_RESERVOIR_CTR_GPU:        dict[int, Tensor] = {}   # [E] int64
+_BLOCK_OUT_GPU:            dict[int, Tensor] = {}   # [cap, H] bf16
+_BLOCK_OUT_PTR_GPU:        dict[int, Tensor] = {}   # [] int64
+_LAYER_IN_GPU:             dict[int, Tensor] = {}   # [cap, H] bf16
+_LAYER_IN_PTR_GPU:         dict[int, Tensor] = {}   # [] int64
+_INPUT_COV_GPU:            dict[int, Tensor] = {}   # [E, H, H] fp32 (resident mode)
+_TOPK_WEIGHTS_STASH_GPU:   dict[int, Tensor] = {}   # [buf_rows, top_k] fp32
+_TOPK_IDS_STASH_GPU:       dict[int, Tensor] = {}   # [buf_rows, top_k] int64
+# Shared prealloc scratch buffers (allocated by setup(), pre-capture):
+_ARANGE_BUF_GPU:           dict[int, Tensor] = {}   # [buf_rows] int64 arange 0..buf_rows-1
+_ONES_I64_BUF_GPU:         dict[int, Tensor] = {}   # [buf_rows*top_k] int64 ones
+```
+
+Keep `_current_layer_idx: int = -1`, all `_CAPTURE_*` flag globals, `_CALIB_MAX_LAYER`.
+
+Note on in-graph allocation: vLLM's CUDA graph implementation uses a managed memory pool, so intermediate tensor allocations inside custom op bodies (e.g., `torch.zeros`, `cumsum` output) do NOT break graph replay — they are replayed against the same pool. Pre-allocating `_ARANGE_BUF_GPU` is an optional perf optimization (avoids repeated small allocations), not a correctness requirement. The plan pre-allocates them anyway for predictability.
+
+### 3.2 `_calib_buf_rows` fix (H2)
+
+In `TritonExperts.__init__`:
+
+```python
+from vllm import envs as _envs
+_ccs = (vllm_config.compilation_config.max_cudagraph_capture_size or 0)
+_mbt = getattr(getattr(vllm_config, "scheduler_config", None),
+               "max_num_batched_tokens", 0) or 0
+_floor = getattr(_envs, "VLLM_CALIB_BUF_ROWS_FLOOR", 512)
+self._calib_buf_rows = max(_ccs, _mbt, _floor)
+```
+
+At the OOB skip in `TritonExperts.apply`, before the calibration accumulation block:
+
+```python
+if num_tokens > self._calib_buf_rows:
+    if self._moe_layer_id not in _WARNED_OOB:
+        _WARNED_OOB.add(self._moe_layer_id)
+        logger.warning(
+            "calib: buf_rows=%d < num_tokens=%d for layer %d; "
+            "prefill tokens SKIPPED for expert_out_unweighted/mid capture. "
+            "Increase VLLM_CALIB_BUF_ROWS_FLOOR or max_num_batched_tokens.",
+            self._calib_buf_rows, num_tokens, self._moe_layer_id,
+        )
+    # skip the entire calibration accumulation block
+```
+
+`_WARNED_OOB: set[int] = set()` is a module-level set in `triton_moe.py`.
+
+### 3.3 `_current_layer_idx` guard broadening (M4)
+
+In `MoERunner.forward` (non-monolithic path), replace:
+
+```python
+if _ch._CAPTURE_EXPERT_UNWEIGHTED or _ch._CAPTURE_EXPERT_MID:
+    _ch._current_layer_idx = layer.moe_layer_id
 ```
 
 With:
 
 ```python
-from vllm import envs
-_ccs = vllm_config.compilation_config.max_cudagraph_capture_size or 0
-_mbt = getattr(vllm_config.scheduler_config, "max_num_batched_tokens", 0)
-self._calib_buf_rows = max(_ccs, _mbt, 512)
-```
-
-Also add at the OOB skip site (inside `TritonExperts.apply`):
-
-```python
-if num_tokens > self._calib_buf_rows:
-    _warn_once(f"calib: buf_rows={self._calib_buf_rows} < num_tokens={num_tokens}; "
-               "prefill skipped for expert_out_unweighted/mid")
-    # skip the dispatch block
-```
-
-Use a module-level `_WARNED_OOB: set[int]` keyed by layer id to make this warn-once.
-
-### 1.3 `_current_layer_idx` guard broadening (M4)
-
-In `moe_runner.py`, the guard currently reads:
-
-```python
-if _CAPTURE_EXPERT_UNWEIGHTED or _CAPTURE_EXPERT_MID:
+if (_ch._CAPTURE_EXPERT_UNWEIGHTED or _ch._CAPTURE_EXPERT_MID or
+        _ch._CAPTURE_IMATRIX or _ch._CAPTURE_OUTPUT_RESERVOIR or
+        _ch._CAPTURE_PER_EXPERT_MAX or _ch._CAPTURE_WANDA_SCALAR_ROW or
+        _ch._CAPTURE_REAP_SCORES or _ch._CAPTURE_INPUT_COV):
     _ch._current_layer_idx = layer.moe_layer_id
 ```
 
-Expand to:
+This ensures every TritonExperts-interior accumulation sees a valid layer index regardless of which subset of flags is enabled.
+
+### 3.4 New env vars (M3) — `vllm/envs.py`
+
+Add to the existing calib block:
 
 ```python
-if any([_ch._CAPTURE_EXPERT_UNWEIGHTED, _ch._CAPTURE_EXPERT_MID,
-        _ch._CAPTURE_IMATRIX, _ch._CAPTURE_OUTPUT_RESERVOIR,
-        _ch._CAPTURE_PER_EXPERT_MAX, _ch._CAPTURE_WANDA]):
-    _ch._current_layer_idx = layer.moe_layer_id
+"VLLM_CALIB_INPUT_COV_MODE": lambda: os.getenv("VLLM_CALIB_INPUT_COV_MODE", "off"),
+# "off" | "resident" | "offload"
+"VLLM_CALIB_BUF_ROWS_FLOOR": lambda: int(os.getenv("VLLM_CALIB_BUF_ROWS_FLOOR", "512")),
+"VLLM_CALIB_STAGE2_PROFILE_MODE": lambda: os.getenv("VLLM_CALIB_STAGE2_PROFILE_MODE", "replay"),
+# "replay" = post-capture via feat/calib-v3-replay driver; "live" = not supported under compile
 ```
-
-This ensures `_current_layer_idx` is set before any TritonExperts-interior writer can read it.
-
-### 1.4 New env vars (M3)
-
-Add to `vllm/envs.py` (in the existing calib block):
-
-```python
-VLLM_CALIB_INPUT_COV_MODE: str = "off"       # "off" | "resident" | "offload"
-VLLM_CALIB_BUF_ROWS_FLOOR: int = 512          # minimum _calib_buf_rows
-VLLM_CALIB_STAGE2_PROFILE_MODE: str = "replay" # "replay" | "live" (see H3)
-```
-
-The existing vars remain. `VLLM_CALIB_CAPTURE_INPUT_COV` is repurposed: non-empty value = mode string ("resident"/"offload"); empty = off.
-
-### 1.5 Custom-op registration module
-
-Create `vllm/calibration_custom_ops.py`. This module registers all traced-region accumulation ops using `direct_register_custom_op` from `vllm.utils.torch_utils`. It must be imported at module level from each traced-region signal's caller (or from `calibration_hooks.py` which is imported by all callers).
-
-Registration pattern (identical to moe_runner.py:167–173):
-
-```python
-from vllm.utils.torch_utils import direct_register_custom_op, vllm_lib
-
-def _calib_dense_imatrix_accum(x: torch.Tensor, layer_name: str) -> None:
-    # x: [T, H] — input to a dense linear layer
-    # mutates global _IMATRIX_DENSE_GPU[layer_name]
-    if layer_name not in _ch._IMATRIX_DENSE_GPU:
-        return
-    acc = _ch._IMATRIX_DENSE_GPU[layer_name]
-    x_sq = (x.float() ** 2).sum(dim=0)   # [H]
-    acc.add_(x_sq)
-
-def _calib_dense_imatrix_accum_fake(x: torch.Tensor, layer_name: str) -> None:
-    return
-
-direct_register_custom_op(
-    op_name="calib_dense_imatrix_accum",
-    op_func=_calib_dense_imatrix_accum,
-    mutates_args=["x"],   # x not mutated but Dynamo must not DCE the call
-    fake_impl=_calib_dense_imatrix_accum_fake,
-)
-```
-
-`mutates_args=["x"]` is a convention trick to prevent Dynamo from eliminating the call as dead. Actually `mutates_args` should be the name of the first persistent accumulator argument. Since accumulators are module-level dicts (not function args), use `mutates_args=[]` but tag with `torch.Tag.needs_fixed_stride_order` so Dynamo cannot reorder or eliminate it. The custom op is opaque — its body runs in the dispatch path, which is not traced.
-
-Similarly register:
-
-```python
-_calib_block_out_accum(hidden: Tensor, layer_idx: int) -> None
-_calib_layer_in_accum(hidden: Tensor, layer_idx: int) -> None
-```
-
-All three ops: `mutates_args=[]`, `tags=(torch.Tag.needs_fixed_stride_order,)`.
-
-**Insertion points for traced-region callers:**
-
-- `_calib_dense_imatrix_accum`: call from `ColumnParallelLinear.forward` (linear.py:392) after `output = self.quant_method.apply(...)` — pass `x` (the input tensor before the linear) and `self.layer_name`. Also call from `LogitsProcessor._get_logits` (logits_processor.py:96) after `lm_head.quant_method.apply(...)` — pass `hidden_states` and `"lm_head"`.
-- `_calib_block_out_accum`: call from `Qwen3NextSparseMoeBlock.forward` (qwen3_next.py:202) and `Qwen3MoeSparseMoeBlock.forward` (qwen3_moe.py:258), after `return final_hidden_states.view(orig_shape)` — insert before the return, passing `final_hidden_states` and `self.moe_layer_id`.
-- `_calib_layer_in_accum`: call from decoder layer `forward` in both models (qwen3_next.py:401 / qwen3_moe.py:416), at the top of the layer forward before the attention call, passing `hidden_states` and `self.layer_idx`.
-
-**Gate pattern for all three custom ops:** Guard the call with `if _ch._CAPTURE_IMATRIX:` / `if _ch._CAPTURE_BLOCK:` / `if _ch._CAPTURE_LAYER_IN:`. These are Python bool checks read at trace time — when False, Dynamo folds the call away entirely (the guard is a constant). When True, the custom op call is recorded into the graph and re-executes on every replay.
 
 ---
 
-## 2. Per-Writer Implementation
+## 4. Per-Writer Implementation
 
-### 2.1 `calibration_reap_scores.py` — custom-op-interior
+### 4.1 `calibration_reap_scores.py` — custom-op-interior
 
-**GPU accumulators** (allocated in `setup()`, before CUDA graph capture):
+**GPU accumulators** (allocated by `setup()` before first forward):
 
 ```python
-_REAP_SCORE_ACCUM_GPU: dict[int, Tensor]   # layer_idx -> [n_experts] fp32, zero-init
-_REAP_TOKEN_COUNTS_GPU: dict[int, Tensor]  # layer_idx -> [n_experts] int64, zero-init
-_TOPK_WEIGHTS_STASH_GPU: dict[int, Tensor] # layer_idx -> [buf_rows, top_k] fp32
+_REAP_SCORE_ACCUM_GPU:   dict[int, Tensor]   # [E] fp32, zero-init
+_REAP_TOKEN_COUNTS_GPU:  dict[int, Tensor]   # [E] int64, zero-init
+_TOPK_WEIGHTS_STASH_GPU: dict[int, Tensor]   # [buf_rows, top_k] fp32
+_ONES_I64_BUF_GPU:       dict[int, Tensor]   # [buf_rows*top_k] int64 ones
 ```
 
-**In-graph accumulation** (replacing `_on_router` + `_on_expert_out_unweighted` CPU callbacks):
+**In-graph accumulation — `MoERunner.forward` non-monolithic branch:**
 
-In `moe_runner.py _apply_quant_method`, after `topk_weights, topk_ids = self.router.select_experts(...)` (line 530), add inline GPU ops:
+After `topk_weights, topk_ids = self.router.select_experts(...)`:
 
 ```python
-if _ch._CAPTURE_ROUTER:
-    layer_idx = _ch._current_layer_idx  # Python int, constant at capture time
-    stash = _ch._TOPK_WEIGHTS_STASH_GPU[layer_idx]
-    stash[:topk_weights.shape[0]].copy_(topk_weights)  # graph-recorded copy_
+if _ch._CAPTURE_REAP_SCORES:
+    _li = _ch._current_layer_idx          # int constant at capture time
+    _ch._TOPK_WEIGHTS_STASH_GPU[_li][:topk_weights.shape[0]].copy_(topk_weights)
 ```
 
-In `TritonExperts.apply`, after `invoke_fused_moe_triton_kernel` returns, the `_unweighted_slice` is `self._calib_unweighted_buf[:num_tokens, :, :]`. Add:
+`topk_weights.shape[0]` is the captured batch size — constant at graph capture.
+
+**In-graph accumulation — `TritonExperts.apply`** (after OOB check, with valid `_unweighted_slice`):
 
 ```python
-if _ch._CAPTURE_EXPERT and _ch._CAPTURE_ROUTER:
-    layer_idx = _ch._current_layer_idx
-    scores = _ch._REAP_SCORE_ACCUM_GPU[layer_idx]    # [E]
-    counts = _ch._REAP_TOKEN_COUNTS_GPU[layer_idx]    # [E]
-    # topk_ids shape: [num_tokens, top_k]; unweighted_slice: [num_tokens, top_k, K]
-    # norm per (token, expert): [num_tokens, top_k]
-    norms = _unweighted_slice.float().norm(dim=-1)     # [T, K_top]
-    stash = _ch._TOPK_WEIGHTS_STASH_GPU[layer_idx][:num_tokens]  # [T, K_top]
-    weighted_norms = norms * stash                      # [T, K_top] graph-safe multiply
-    flat_ids  = topk_ids.reshape(-1).long()             # [T*K_top]
-    flat_vals = weighted_norms.reshape(-1)              # [T*K_top]
+if _ch._CAPTURE_REAP_SCORES:
+    _li = _ch._current_layer_idx
+    scores  = _ch._REAP_SCORE_ACCUM_GPU[_li]     # [E]
+    counts  = _ch._REAP_TOKEN_COUNTS_GPU[_li]    # [E]
+    stash   = _ch._TOPK_WEIGHTS_STASH_GPU[_li][:num_tokens]  # [T, top_k]
+    # _unweighted_slice: [T, top_k, K] bf16
+    norms   = _unweighted_slice.float().norm(dim=-1)          # [T, top_k]
+    weighted = norms * stash                                  # [T, top_k]
+    flat_ids  = topk_ids.reshape(-1)                          # [T*top_k]
+    flat_vals = weighted.reshape(-1)                          # [T*top_k]
     scores.scatter_add_(0, flat_ids, flat_vals)
-    ones_buf = _ch._ONES_BUF_GPU[layer_idx][:flat_ids.shape[0]]  # [T*K_top] ones, prealloc
-    counts.scatter_add_(0, flat_ids, ones_buf)
+    ones = _ch._ONES_I64_BUF_GPU[_li][:flat_ids.shape[0]]    # [T*top_k]
+    counts.scatter_add_(0, flat_ids, ones)
 ```
 
-`_ONES_BUF_GPU[layer_idx]` is a `[buf_rows * top_k]` int64 tensor of ones allocated once in `setup()`. Slice `[:flat_ids.shape[0]]` — `flat_ids.shape[0]` is a constant at graph capture time (captured batch size × top_k).
-
-**`captured_entry_count()`** (H1):
+**`captured_entry_count()`:**
 
 ```python
 def captured_entry_count() -> bool:
-    if not _REAP_TOKEN_COUNTS_GPU:
-        return False
-    return int(next(iter(_REAP_TOKEN_COUNTS_GPU.values())).sum().item()) > 0
+    return any(v.sum().item() > 0 for v in _ch._REAP_TOKEN_COUNTS_GPU.values())
 ```
 
-One `.item()` outside graph, at dump time only.
-
-**`dump()`**: copy GPU tensors to CPU at dump time (outside graph):
+**`dump()`** (called outside graph, at end of capture run):
 
 ```python
-for layer_idx, scores_gpu in _REAP_SCORE_ACCUM_GPU.items():
-    counts_cpu = _REAP_TOKEN_COUNTS_GPU[layer_idx].cpu().float()
+for layer_idx, scores_gpu in _ch._REAP_SCORE_ACCUM_GPU.items():
+    counts_cpu = _ch._REAP_TOKEN_COUNTS_GPU[layer_idx].cpu().float().clamp(min=1.0)
     scores_cpu = scores_gpu.cpu()
-    safe_counts = counts_cpu.clamp(min=1.0)
-    normalized = scores_cpu / safe_counts
-    # serialize to sidecar as before
+    normalized = scores_cpu / counts_cpu
+    # serialize to sidecar payload (unchanged schema)
 ```
 
-Remove all `_ROUTER_WEIGHTS_STASH` CPU stash, `_on_router`, `_on_expert_out_unweighted` callbacks, `register_callback` calls.
+Remove all CPU stash, `_on_router`, `_on_expert_out_unweighted`, `register_callback` calls.
 
-### 2.2 `calibration_per_expert_max.py` — custom-op-interior
+### 4.2 `calibration_per_expert_max.py` — custom-op-interior
 
 **GPU accumulators:**
 
 ```python
-_PEM_ACCUM_GPU: dict[int, Tensor]  # [n_experts, K] fp32, -inf init
+_PEM_ACCUM_GPU: dict[int, Tensor]  # [E, K] fp32, -inf init
 ```
 
-**In-graph accumulation** (in `TritonExperts.apply`):
+**In-graph accumulation — `TritonExperts.apply`:**
 
 ```python
 if _ch._CAPTURE_PER_EXPERT_MAX:
-    layer_idx = _ch._current_layer_idx
-    acc = _ch._PEM_ACCUM_GPU[layer_idx]     # [E, K]
-    # _unweighted_slice: [T, top_k, K] — abs-max per (expert, channel)
-    abs_vals = _unweighted_slice.float().abs()  # [T, top_k, K]
-    flat_ids  = topk_ids.reshape(-1).long()     # [T*top_k]
-    flat_vals = abs_vals.reshape(-1, abs_vals.shape[-1])  # [T*top_k, K]
-    acc.scatter_reduce_(0, flat_ids.unsqueeze(1).expand_as(flat_vals),
-                        flat_vals, reduce="amax", include_self=True)
+    _li = _ch._current_layer_idx
+    acc = _ch._PEM_ACCUM_GPU[_li]     # [E, K]
+    abs_vals = _unweighted_slice.float().abs()        # [T, top_k, K]
+    flat_ids  = topk_ids.reshape(-1)                  # [T*top_k]
+    flat_vals = abs_vals.reshape(-1, acc.shape[1])    # [T*top_k, K]
+    idx_exp   = flat_ids.unsqueeze(1).expand_as(flat_vals)
+    acc.scatter_reduce_(0, idx_exp, flat_vals, reduce="amax", include_self=True)
 ```
 
-**`captured_entry_count()`**: `int((_PEM_ACCUM_GPU[0] > -1e37).any().item()) > 0` — checks if any cell moved off -inf.
+**`captured_entry_count()`:**
 
-**`dump()`**: `acc.cpu()` per layer at dump time.
+```python
+return any((v > -1e37).any().item() for v in _ch._PEM_ACCUM_GPU.values())
+```
 
-### 2.3 `calibration_routing_stats.py` — custom-op-interior
+**`dump()`**: `acc.cpu()` per layer.
+
+### 4.3 `calibration_routing_stats.py` — custom-op-interior
 
 **GPU accumulators:**
 
 ```python
-_ROUTING_FREQ_GPU:  dict[int, Tensor]  # [E] int64, zero-init
-_ROUTING_WSUM_GPU:  dict[int, Tensor]  # [E] fp32, zero-init
+_ROUTING_FREQ_GPU: dict[int, Tensor]  # [E] int64, zero-init
+_ROUTING_WSUM_GPU: dict[int, Tensor]  # [E] fp32, zero-init
 ```
 
-**In-graph accumulation** (in `moe_runner.py _apply_quant_method`, same location as reap topk stash):
+**In-graph accumulation — `MoERunner.forward`** (same location as reap topk stash, after `topk_weights, topk_ids`):
 
 ```python
 if _ch._CAPTURE_ROUTING_STATS:
-    layer_idx = _ch._current_layer_idx
-    freq  = _ch._ROUTING_FREQ_GPU[layer_idx]   # [E]
-    wsum  = _ch._ROUTING_WSUM_GPU[layer_idx]   # [E]
-    flat_ids = topk_ids.reshape(-1).long()
+    _li = _ch._current_layer_idx
+    freq = _ch._ROUTING_FREQ_GPU[_li]
+    wsum = _ch._ROUTING_WSUM_GPU[_li]
+    flat_ids = topk_ids.reshape(-1)
     flat_w   = topk_weights.reshape(-1)
-    ones_i64 = _ch._ONES_I64_BUF_GPU[layer_idx][:flat_ids.shape[0]]
-    freq.scatter_add_(0, flat_ids, ones_i64)
+    ones = _ch._ONES_I64_BUF_GPU[_li][:flat_ids.shape[0]]
+    freq.scatter_add_(0, flat_ids, ones)
     wsum.scatter_add_(0, flat_ids, flat_w)
 ```
 
-**`dump()`**: both tensors `.cpu()` at dump time.
+**`captured_entry_count()`:**
 
-### 2.4 `calibration_router_logits_stats.py` — custom-op-interior
+```python
+return any(v.sum().item() > 0 for v in _ch._ROUTING_FREQ_GPU.values())
+```
+
+### 4.4 `calibration_router_logits_stats.py` — custom-op-interior
 
 **GPU accumulators:**
 
@@ -308,483 +372,425 @@ _RLOGITS_SQ_GPU:    dict[int, Tensor]  # [E] fp32, zero-init
 _RLOGITS_COUNT_GPU: dict[int, Tensor]  # [E] int64, zero-init
 ```
 
-**In-graph accumulation**: Computed from `router_logits` in `moe_runner.py _apply_quant_method` before `select_experts` call (router_logits is available as a tensor argument):
+**In-graph accumulation — `MoERunner.forward`** (before `select_experts`, where `router_logits` is available; note: already sliced to remove shared-expert column if `_fse_fuse_gate`):
 
 ```python
 if _ch._CAPTURE_ROUTER_LOGITS_STATS:
-    layer_idx = _ch._current_layer_idx
-    # router_logits: [T, E]
-    # BOS-path narrowing: when T==1 this is a single-token decode step
-    # (documented LOW item: BOS at position 0 has sink logit behavior;
-    # no special-case needed — uniform accumulation is correct for stats)
-    lsum  = _ch._RLOGITS_SUM_GPU[layer_idx]    # [E]
-    lsq   = _ch._RLOGITS_SQ_GPU[layer_idx]     # [E]
-    lcnt  = _ch._RLOGITS_COUNT_GPU[layer_idx]  # [E]
-    rl    = router_logits.float()               # [T, E]
-    lsum.add_(rl.sum(dim=0))                    # graph-safe: reduce over T
-    lsq.add_((rl ** 2).sum(dim=0))
-    t_count = _ch._SCALAR_ONES_GPU[layer_idx]  # [] int64 = 1, prealloc
-    lcnt.add_(t_count * rl.shape[0])            # constant * runtime int
+    _li = _ch._current_layer_idx
+    rl   = router_logits.float()                    # [T, E] (already sliced by runner)
+    lsum = _ch._RLOGITS_SUM_GPU[_li]
+    lsq  = _ch._RLOGITS_SQ_GPU[_li]
+    lcnt = _ch._RLOGITS_COUNT_GPU[_li]
+    lsum.add_(rl.sum(dim=0))                        # [E]
+    lsq.add_((rl * rl).sum(dim=0))                 # [E]
+    lcnt.add_(torch.tensor(rl.shape[0], dtype=torch.int64, device=rl.device))
 ```
 
-Note: `rl.shape[0]` is a constant at capture time (the batch size slot). The multiply `t_count * rl.shape[0]` is graph-safe.
+Note: `torch.tensor(rl.shape[0], ...)` is a constant at capture time (batch size is fixed per captured graph) — it becomes a scalar literal in the graph. No dynamic allocation.
 
-**`captured_entry_count()`**: `_RLOGITS_COUNT_GPU[0].sum().item() > 0`.
+**BOS-path note (LOW):** BOS token (single-token prefill at position 0) produces a sink-heavy logit distribution. This is accumulated without filtering. Callers of `dump()` statistics should be aware position-0 tokens skew the mean/variance of the top-expert column.
 
-### 2.5 `calibration_imatrix.py` — split: MoE path (interior) + dense path (traced-region)
+**`captured_entry_count()`:**
 
-**MoE path (custom-op-interior):** `expert_in` signal comes from `moe_runner.py _apply_quant_method` before `_quant_method.apply(...)` — already inside the custom op. Replace the Python loop with:
+```python
+return any(v.sum().item() > 0 for v in _ch._RLOGITS_COUNT_GPU.values())
+```
+
+### 4.5 `calibration_imatrix.py` — split: MoE interior + dense traced-region
+
+**MoE path (custom-op-interior, using `expert_in` and `expert_mid` signals in `MoERunner.forward` / `TritonExperts.apply`):**
+
+GPU accumulator:
+
+```python
+_IMATRIX_MoE_GPU: dict[int, Tensor]  # [E, H] fp32, zero-init
+```
+
+In-graph in `MoERunner.forward` (after `topk_ids` available, before `_quant_method.apply`):
 
 ```python
 if _ch._CAPTURE_IMATRIX:
-    layer_idx = _ch._current_layer_idx
-    acc = _ch._IMATRIX_MoE_GPU[layer_idx]   # [E, H]
-    # hidden_states: [T, H], topk_ids: [T, top_k]
-    x_sq = hidden_states.float() ** 2        # [T, H]
-    flat_ids = topk_ids[:, 0].long()         # [T] — use first expert for routing (top-1 surrogate)
-    # For correct per-expert accumulation: scatter x_sq for each (token, expert_slot)
-    # Expand for all top_k slots:
-    for k in range(topk_ids.shape[1]):       # loop over top_k (small constant, unrolled by Dynamo)
-        ids_k = topk_ids[:, k].long()        # [T]
+    _li = _ch._current_layer_idx
+    acc = _ch._IMATRIX_MoE_GPU[_li]    # [E, H]
+    x_sq = hidden_states.float() ** 2   # [T, H]
+    for k in range(topk_ids.shape[1]):  # top_k is small constant, Dynamo unrolls
+        ids_k = topk_ids[:, k]          # [T]
         acc.scatter_add_(0, ids_k.unsqueeze(1).expand(-1, acc.shape[1]), x_sq)
 ```
 
-`topk_ids.shape[1]` is top_k = small constant (2 or 4) — Dynamo unrolls this loop at compile time, so it becomes a sequence of static `scatter_add_` calls in the graph.
+`topk_ids.shape[1]` is top_k = compile-time constant (2 or 4). Dynamo unrolls the `for k` loop into a static sequence of `scatter_add_` nodes.
 
-**Dense path (traced-region):** The `_calib_dense_imatrix_accum` custom op (Section 1.5) handles `linear_in` and `lm_head_in`. In `calibration_imatrix.py`:
+Remove the earlier `topk_ids[:,0]` top-1-surrogate line that appeared in the prior plan draft — the top_k loop is the correct path.
+
+**Dense path (traced-region, via `calib_imatrix_dense_accum` custom op):**
+
+GPU accumulator:
 
 ```python
-_IMATRIX_DENSE_GPU: dict[str, Tensor]  # layer_name -> [H] fp32
+_IMATRIX_DENSE_GPU: dict[str, Tensor]  # prefix -> [H] fp32, zero-init
 ```
 
-The custom op body reads `_ch._IMATRIX_DENSE_GPU[layer_name]` directly. `setup()` pre-populates the dict with zero-tensors for all layer names that will be captured.
+`setup()` pre-populates this dict for all layer prefixes that will be captured (by iterating model named modules).
 
-**`captured_entry_count()`**: 
+Callers (all three linear forward methods + `LogitsProcessor._get_logits`):
+
 ```python
-# MoE path
-moe_ok = any(v.sum().item() > 0 for v in _ch._IMATRIX_MoE_GPU.values())
-# dense path  
+# In ColumnParallelLinear.forward (and Replicated, RowParallel analogously):
+if _ch._CAPTURE_IMATRIX and self.prefix:
+    _accum = _ch._IMATRIX_DENSE_GPU.get(self.prefix)
+    if _accum is not None:
+        torch.ops.vllm.calib_imatrix_dense_accum(_accum, input_)
+
+# In LogitsProcessor._get_logits:
+if _ch._CAPTURE_IMATRIX:
+    _accum = _ch._IMATRIX_DENSE_GPU.get("lm_head")
+    if _accum is not None:
+        torch.ops.vllm.calib_imatrix_dense_accum(_accum, hidden_states)
+```
+
+`_accum` is `None` when the dict has not been pre-populated for this prefix (e.g., when max_layer gate excludes it). The `if _accum is not None` guard folds to a compile-time constant per layer instance because `self.prefix` is a fixed string and the dict is populated at `setup()` before tracing.
+
+**`captured_entry_count()`:**
+
+```python
+moe_ok   = any(v.sum().item() > 0 for v in _ch._IMATRIX_MoE_GPU.values())
 dense_ok = any(v.sum().item() > 0 for v in _ch._IMATRIX_DENSE_GPU.values())
 return moe_ok or dense_ok
 ```
 
-### 2.6 `calibration_wanda_scalar_row.py` — custom-op-interior
+### 4.6 `calibration_wanda_scalar_row.py` — custom-op-interior
 
-**GPU accumulators:**
+**GPU accumulator:**
 
 ```python
 _WANDA_GPU: dict[int, Tensor]  # [E, H] fp32, zero-init
 ```
 
-**In-graph accumulation** (in `moe_runner.py _apply_quant_method`):
+**In-graph — `MoERunner.forward`** (after `topk_ids` / `topk_weights`):
 
 ```python
-if _ch._CAPTURE_WANDA:
-    layer_idx = _ch._current_layer_idx
-    acc = _ch._WANDA_GPU[layer_idx]     # [E, H]
-    # x: hidden_states [T, H]; g: gate output [T, top_k] (topk_weights)
-    # wanda metric: (x_sq * g_sq) per channel, accumulated per expert
-    x_sq = (hidden_states.float() ** 2)     # [T, H]
+if _ch._CAPTURE_WANDA_SCALAR_ROW:
+    _li = _ch._current_layer_idx
+    acc = _ch._WANDA_GPU[_li]     # [E, H]
+    x_sq = hidden_states.float() ** 2    # [T, H]
     for k in range(topk_ids.shape[1]):
-        ids_k = topk_ids[:, k].long()       # [T]
+        ids_k = topk_ids[:, k]           # [T]
         w_k   = topk_weights[:, k].float().unsqueeze(1) ** 2  # [T, 1]
-        contrib = x_sq * w_k                # [T, H]
+        contrib = x_sq * w_k             # [T, H]
         acc.scatter_add_(0, ids_k.unsqueeze(1).expand(-1, acc.shape[1]), contrib)
 ```
 
-### 2.7 `calibration_output_reservoir.py` — custom-op-interior (C3 fix)
+**`captured_entry_count()`:**
 
-**Design: Deterministic fixed-stride per-expert reservoir (no RNG).**
+```python
+return any(v.sum().item() > 0 for v in _ch._WANDA_GPU.values())
+```
 
-Replace Vitter-R entirely. The algorithm: for expert `e`, token slot `s` (0-indexed within this dispatch, routing to expert `e`), write to reservoir slot `(ctr_e + s) % cap` where `ctr_e` is the per-expert monotonic token counter. After writing, advance `ctr_e += N_e` where `N_e` = number of tokens routed to expert `e` this dispatch. This gives a deterministic sliding window with stride 1 per token, which is uniform coverage with no intra-dispatch collision (each token writes to a distinct slot `mod cap` because `s` is the within-dispatch local index).
+### 4.7 `calibration_output_reservoir.py` — custom-op-interior (C3 fix)
+
+**Design: Deterministic fixed-stride per-expert reservoir, no RNG.**
+
+Algorithm: for expert `e`, the write slot for the `s`-th token routed to `e` within this dispatch is `(ctr_e + s) % cap`. After the dispatch, `ctr_e += N_e` (count of tokens routed to `e` this dispatch). Each token gets a distinct slot within the dispatch because `s` is the unique within-expert local index. Adjacent dispatches tile without overlap because `ctr_e` advances by `N_e` (not 1).
 
 **GPU accumulators:**
 
 ```python
 _RESERVOIR_GPU:     dict[int, Tensor]  # [E, cap, H] fp32
-_RESERVOIR_CTR_GPU: dict[int, Tensor]  # [E] int64 monotonic counter, zero-init
+_RESERVOIR_CTR_GPU: dict[int, Tensor]  # [E] int64, zero-init
 ```
 
-`cap` = `VLLM_CALIB_OUTPUT_RESERVOIR_CAP` (default 256).
+`cap = VLLM_CALIB_OUTPUT_RESERVOIR_CAP` (default 256).
 
-**In-graph accumulation** (in `TritonExperts.apply`):
+**In-graph accumulation — `TritonExperts.apply`:**
 
 ```python
 if _ch._CAPTURE_OUTPUT_RESERVOIR:
-    layer_idx = _ch._current_layer_idx
-    res   = _ch._RESERVOIR_GPU[layer_idx]    # [E, cap, H]
-    ctrs  = _ch._RESERVOIR_CTR_GPU[layer_idx]  # [E]
-    cap   = res.shape[1]
-    H     = res.shape[2]
-    # _unweighted_slice: [T, top_k, H] (expert outputs for each slot)
-    # topk_ids: [T, top_k]
-    # For each expert slot k:
-    for k in range(topk_ids.shape[1]):  # unrolled by Dynamo
-        ids_k = topk_ids[:, k].long()    # [T]
+    _li  = _ch._current_layer_idx
+    res  = _ch._RESERVOIR_GPU[_li]      # [E, cap, H]
+    ctrs = _ch._RESERVOIR_CTR_GPU[_li]  # [E]
+    cap  = res.shape[1]
+    H    = res.shape[2]
+    T    = _unweighted_slice.shape[0]
+    E    = ctrs.shape[0]
+
+    for k in range(topk_ids.shape[1]):  # Dynamo unrolls
+        ids_k  = topk_ids[:, k].long()          # [T]
         vals_k = _unweighted_slice[:, k, :].float()  # [T, H]
-        # Assign write slots: within-dispatch local rank for each token per expert
-        # Build a [T] tensor of within-expert local indices via scatter
-        # local_rank[t] = (number of tokens before t that route to same expert as t in slot k)
-        # This requires a rank-within-group — not graph-safe with Python loops.
-        # CHOSEN APPROACH: compute slot = (ctr_e + within_expert_rank) % cap
-        # Compute within_expert_rank via cumsum on indicator per expert:
-        E = ctrs.shape[0]
+
+        # One-hot [T, E] and cumsum to get within-dispatch local rank per expert
         indicator = torch.zeros(T, E, dtype=torch.int64, device=ids_k.device)
-        indicator.scatter_(1, ids_k.unsqueeze(1), 1)   # [T, E] one-hot
-        # cumsum along T gives within-dispatch rank (0-based prefix):
-        local_rank = indicator.cumsum(dim=0).gather(1, ids_k.unsqueeze(1)).squeeze(1) - 1  # [T]
-        base_ctr = ctrs.gather(0, ids_k)  # [T] — each token's expert's current ctr
-        write_slot = (base_ctr + local_rank) % cap    # [T]
-        # Write: res[ids_k[t], write_slot[t], :] = vals_k[t, :]
-        # Flatten to scatter_: linear index = ids_k * cap * H + write_slot * H + ch
+        indicator.scatter_(1, ids_k.unsqueeze(1), 1)  # [T, E]
+        # cumsum along T gives prefix count; subtract 1 for 0-based local rank
+        local_rank = (indicator.cumsum(dim=0)
+                       .gather(1, ids_k.unsqueeze(1))
+                       .squeeze(1) - 1)            # [T] int64, range [0, N_e)
+
+        base_ctr   = ctrs.gather(0, ids_k)         # [T]: each token's expert ctr
+        write_slot = (base_ctr + local_rank) % cap # [T]
+
+        # Flatten to [E*cap, H] for scatter_
         lin_idx = (ids_k * cap + write_slot).unsqueeze(1).expand(-1, H)  # [T, H]
-        # res reshaped to [E*cap, H]:
-        res_flat = res.view(-1, H)
-        res_flat.scatter_(0, lin_idx, vals_k)
-        # Advance counters: add N_e to ctr for each expert
-        delta = indicator.sum(dim=0)  # [E] number of tokens routed to each expert
+        res.view(-1, H).scatter_(0, lin_idx, vals_k)
+
+        # Advance ctrs: add N_e for each expert
+        delta = indicator.sum(dim=0)               # [E]
         ctrs.add_(delta)
 ```
 
-This is fully graph-safe: `cumsum`, `gather`, `scatter_`, `add_` are all CUDA ops. `topk_ids.shape[1]` (top_k) is constant at capture time so the `for k` loop is unrolled by Dynamo into a static sequence.
+All ops (`zeros`, `scatter_`, `cumsum`, `gather`, `add_`) are CUDA-graph-safe. The intermediary `indicator` and `local_rank` tensors are allocated from the CUDA graph memory pool during replay — no stability issue.
 
-**`captured_entry_count()`**: `_RESERVOIR_CTR_GPU[0].sum().item() > 0`.
-
-**`dump()`**: `_RESERVOIR_GPU[layer_idx][:, :min(ctr, cap), :]` for each layer, `.cpu()`.
-
-**Old CPU fields to remove**: `_RESERVOIR`, per-cell `torch.Generator`, phase-1/2 fill/sample logic.
-
-### 2.8 `calibration_block_outputs.py` — traced-region (C2 fix)
-
-**Design: Pre-sized monotonic write-pointer buffer.**
+**`captured_entry_count()`:**
 
 ```python
-_BLOCK_OUT_GPU:     dict[int, Tensor]  # [subset * max_seq_len, H] bf16
-_BLOCK_OUT_PTR_GPU: dict[int, Tensor]  # [] int64 scalar (write pointer per layer)
+return any(v.sum().item() > 0 for v in _ch._RESERVOIR_CTR_GPU.values())
 ```
 
-`subset = VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE` (default 128). `max_seq_len` = model config max sequence length. Allocated in `setup()` per MoE layer index.
-
-**In-graph accumulation** (via `_calib_block_out_accum` custom op, Section 1.5):
+**`dump()`:**
 
 ```python
-def _calib_block_out_accum(hidden: torch.Tensor, layer_idx: int) -> None:
-    if not _ch._CAPTURE_BLOCK:
-        return
-    if layer_idx not in _ch._BLOCK_OUT_GPU:
-        return
-    buf = _ch._BLOCK_OUT_GPU[layer_idx]   # [cap, H]
-    ptr = _ch._BLOCK_OUT_PTR_GPU[layer_idx]  # [] int64
-    T = hidden.shape[0]
-    cap = buf.shape[0]
-    # Only write if space remains (monotonic, no wrap)
-    # This check is a runtime branch — graph-safe because ptr is a GPU tensor
-    # and the condition is computed on GPU:
-    space = (cap - ptr).clamp(min=0)
-    write_T = space.clamp(max=T).item()  # .item() here is ONE read at graph boundary
-    # ALTERNATIVE: use torch.where to avoid .item():
-    write_T_gpu = torch.minimum(space, torch.tensor(T, device=space.device))
-    buf_slice = buf[ptr:ptr+write_T_gpu]  # dynamic slice — NOT graph-safe with tensor index
+for layer_idx, res in _ch._RESERVOIR_GPU.items():
+    ctr = _ch._RESERVOIR_CTR_GPU[layer_idx].cpu()
+    # Each expert may have less than cap tokens if total < cap
+    # Dump as-is: shape [E, cap, H], valid tokens are [0:min(ctr_e, cap)]
+    # The consumer already handles variable per-expert fill.
+    data = res.cpu()
+    save_reservoir_sidecar(layer_idx, data, ctr)
 ```
 
-`ptr:ptr+write_T_gpu` with a tensor index is NOT graph-safe (dynamic shape). Use `torch.ops.aten.slice_scatter` or a static upper bound.
+Remove all `_RESERVOIR` CPU dicts, `torch.Generator`, Vitter-R phase-1/2 logic.
 
-**Revised approach:** Since buf size is `subset * max_seq_len` and we only write once per prompt (at inference time), the write pointer advances by exactly `T` tokens per dispatch. Cap is never exceeded during a correctly sized calibration run. If it is exceeded, the OOB tokens are silently dropped. This can be implemented with a static-shape conditional:
+### 4.8 `calibration_block_outputs.py` — traced-region (C2 fix + M-NEW-1 + M-NEW-2)
+
+**GPU accumulators:**
 
 ```python
-def _calib_block_out_accum(hidden: torch.Tensor, layer_idx: int) -> None:
-    buf = _ch._BLOCK_OUT_GPU[layer_idx]     # [cap, H] bf16
-    ptr_tensor = _ch._BLOCK_OUT_PTR_GPU[layer_idx]  # [] int64
-    T = hidden.shape[0]    # constant at capture time
-    cap = buf.shape[0]     # constant at capture time
-    ptr = int(ptr_tensor.item())  # read pointer value — ONE .item() per forward pass
-    end = min(ptr + T, cap)
-    write_n = end - ptr
-    if write_n > 0:
-        buf[ptr:end].copy_(hidden[:write_n].to(buf.dtype))
-    ptr_tensor.fill_(end)
+_BLOCK_OUT_GPU:     dict[int, Tensor]  # layer_idx -> [cap, H] bf16
+_BLOCK_OUT_PTR_GPU: dict[int, Tensor]  # layer_idx -> [] int64
+_BLOCK_ARANGE_GPU:  dict[int, Tensor]  # layer_idx -> [cap] int64 arange
 ```
 
-The `.item()` call makes this NOT fully in-graph. However, `_calib_block_out_accum` is a `direct_register_custom_op` — its body runs eagerly (not traced by Dynamo). The CUDA graph does NOT capture inside custom op bodies; it records the custom op call as an opaque dispatch. Therefore `.item()` inside the custom op body is fine: it runs outside the graph's recorded CUDA stream.
+`cap = VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE * max_seq_len`, allocated by `setup()`.
 
-Wait — this is the critical subtlety. A `direct_register_custom_op` op IS recorded into the CUDA graph only if its implementation issues CUDA kernels. Python-level `.item()` inside a custom op body would cause a `cudaStreamSynchronize` during capture, which is illegal.
+**Attribute fix (M-NEW-1):** Both `Qwen3MoeSparseMoeBlock` and `Qwen3NextSparseMoeBlock` use `self.experts.moe_layer_id` — confirmed directly from the patch (lines 10523, 10536, 10610, 10623). The `layer_idx` passed to the custom op is `self.experts.moe_layer_id`.
 
-**Correct approach:** Use a pure GPU conditional with `torch.clamp` and `scatter_`:
+**Callers in traced-region code (both qwen3_moe.py and qwen3_next.py):**
+
+Replace the existing `_ch.dispatch("block_out", ...)` calls with:
 
 ```python
-def _calib_block_out_accum(hidden: torch.Tensor, layer_idx: int) -> None:
-    buf = _ch._BLOCK_OUT_GPU[layer_idx]     # [cap, H] bf16
-    ptr_tensor = _ch._BLOCK_OUT_PTR_GPU[layer_idx]  # [] int64
-    T = hidden.shape[0]    # constant at capture time (captured batch size)
-    # Write range: [ptr, ptr+T) clamped to [0, cap)
-    # Compute write indices for each of T rows: ptr + arange(T), clamped to cap
-    arange = _ch._ARANGE_BUF_GPU[layer_idx][:T]  # prealloc [buf_rows] arange, slice to T
-    write_idx = (ptr_tensor + arange).clamp(max=buf.shape[0] - 1)  # [T]
-    # Mask out tokens that fall outside cap (write_idx == cap-1 may collide — use valid_mask)
-    valid_mask = (ptr_tensor + arange) < buf.shape[0]  # [T] bool
-    # Only scatter valid tokens:
-    valid_hidden = hidden * valid_mask.unsqueeze(1).to(hidden.dtype)  # zero out invalid
-    buf.scatter_(0, write_idx.unsqueeze(1).expand(-1, buf.shape[1]),
-                 valid_hidden.to(buf.dtype))
-    # Advance pointer by T (clamped to cap):
-    new_ptr = (ptr_tensor + T).clamp(max=buf.shape[0])
-    ptr_tensor.copy_(new_ptr)
+if _ch._CAPTURE_BLOCK:
+    _layer_id = self.experts.moe_layer_id  # compile-time int for this instance
+    _accum = _ch._BLOCK_OUT_GPU.get(_layer_id)
+    _ptr   = _ch._BLOCK_OUT_PTR_GPU.get(_layer_id)
+    _arng  = _ch._BLOCK_ARANGE_GPU.get(_layer_id)
+    if _accum is not None:
+        torch.ops.vllm.calib_block_out_accum(_accum, _ptr, _arng,
+                                             final_hidden_states)
 ```
 
-All ops are pure CUDA: `clamp`, `scatter_`, `copy_`. Graph-safe. The overflow case writes `hidden * 0` (zero) into the last slot — a minor corruption of the last slot when over-full, acceptable since `setup()` is sized to never overflow under normal use.
+This appears in all four dispatch sites (internal-router + external-gate branch in both qwen3_moe and qwen3_next).
 
-**`captured_entry_count()`**: `_BLOCK_OUT_PTR_GPU[0].item() > 0` at dump time.
+**`dump()` — `BlockHiddenPayload` fields fix (M-NEW-2):**
 
-**`dump()`**:
+The actual `BlockHiddenPayload` schema has fields `(schema_version, layer_idx, n_prompts_in_subset, hidden_states)`.
 
 ```python
-for layer_idx, buf in _BLOCK_OUT_GPU.items():
-    valid = int(_BLOCK_OUT_PTR_GPU[layer_idx].item())
-    data = buf[:valid].cpu()
-    # serialize using existing BlockHiddenPayload schema
-    payload = BlockHiddenPayload(hidden=data, n_tokens=valid)
-    save_sidecar(layer_idx, payload)
+for layer_idx, buf in _ch._BLOCK_OUT_GPU.items():
+    valid_tokens = int(_ch._BLOCK_OUT_PTR_GPU[layer_idx].item())
+    if valid_tokens == 0:
+        continue
+    hidden_data = buf[:valid_tokens].cpu()   # [valid_tokens, H] bf16
+    payload = BlockHiddenPayload(
+        schema_version=CHECKPOINT_SCHEMA_VERSION,
+        layer_idx=layer_idx,
+        n_prompts_in_subset=_n_prompts_captured,  # tracked separately by driver
+        hidden_states=hidden_data,
+    )
+    save_block_hidden(layer_idx, payload)
 ```
 
-`BlockHiddenPayload` schema unchanged: `hidden: [n_tokens, H]`, `n_tokens: int`.
-
-### 2.9 `calibration_input_cov.py` — flag-gated dual-mode (C1 + M2)
-
-Mode controlled by `VLLM_CALIB_INPUT_COV_MODE` (M3 env var):
-
-**Mode "off"**: no-op, no allocation.
-
-**Mode "resident"**: GPU accumulators hold the full `[E, H, H]` covariance matrix.
-
-**Mode "offload"**: GPU holds only a `[buf_rows, H]` input buffer per expert per layer; after each forward, a CPU thread does `bmm` on CPU.
-
-**Resident-mode peak memory analysis (M2):**
-
-For Qwen3-30B (n_experts=128, H=2048, top_k=8, n_moe_layers=48):
-- Accumulator: 128 × 2048 × 2048 × 4 bytes × 48 layers = 128 × 16M × 48 = 98,304 MB ≈ 96 GB per TP rank
-- With TP=4 sharding H → H/4=512 per rank: 128 × 512 × 512 × 4 × 48 = 128 × 1M × 48 ≈ 6 GB per rank — feasible
-- Per-forward `[E, N, H/4]` temp (E=128, N=buf_rows=512, H/4=512): 128 × 512 × 512 × 2 = 67 MB (bf16)
-- `bmm [E, H/4, H/4]`: materially same as accumulator slice, no second allocation (using `baddbmm_` in-place into accumulator)
-- **Confirmed:** `bmm` with `out=accumulator` does NOT materialize a second `[E, H, H]` — PyTorch `baddbmm_` mutates in place.
-- **Full-H unsharded** (if TP=1): 96 GB just for covs on top of 60 GB model weights — not viable on a single 80 GB H100 without off-loading. TP=8 required, or use offload mode.
-
-**GPU accumulators (resident mode):**
+**`captured_entry_count()`:**
 
 ```python
-_INPUT_COV_GPU: dict[(int,int), Tensor]  # (layer_idx, expert_idx) -> [H_local, H_local] fp32
+return any(v.item() > 0 for v in _ch._BLOCK_OUT_PTR_GPU.values())
 ```
 
-**In-graph accumulation** (in `moe_runner.py`, inside custom op boundary):
+### 4.9 `calibration_input_cov.py` — flag-gated dual-mode + H-NEW-1 fix
+
+**Mode "off":** `setup()` is a no-op. No allocation.
+
+**Mode "resident":** GPU accumulators hold full `[E, H_local, H_local]` covariance per MoE layer.
+
+GPU accumulators:
+
+```python
+_INPUT_COV_GPU:      dict[int, Tensor]  # [E, H_local, H_local] fp32
+_INPUT_COV_TEMP_GPU: dict[int, Tensor]  # [E, buf_rows, H_local] fp32 (reused per fwd)
+```
+
+`H_local = H / tp_size`. `buf_rows = _calib_buf_rows`.
+
+**H-NEW-1 OOB fix:** `local_rank` for a hot expert can exceed `buf_rows` when many tokens in one batch route to the same expert. Fix by clamping/masking before scatter:
+
+**In-graph accumulation — `MoERunner.forward`** (inside custom-op boundary):
 
 ```python
 if _ch._CAPTURE_INPUT_COV and _ch._INPUT_COV_MODE == "resident":
-    layer_idx = _ch._current_layer_idx
-    x = hidden_states.float()       # [T, H]
+    _li = _ch._current_layer_idx
+    cov = _ch._INPUT_COV_GPU[_li]       # [E, H_local, H_local]
+    tmp = _ch._INPUT_COV_TEMP_GPU[_li]  # [E, buf_rows, H_local]
+    tmp.zero_()
+    x = hidden_states.float()           # [T, H_local]
+    E = cov.shape[0]
+    buf = tmp.shape[1]
+
     for k in range(topk_ids.shape[1]):
-        ids_k = topk_ids[:, k]      # [T]
-        for e in range(n_experts):  # NOT graph-safe: Python loop over E
-```
-
-This Python loop over experts is not acceptable for large E. Use batched gather + `baddbmm_`:
-
-```python
-if _ch._CAPTURE_INPUT_COV and _ch._INPUT_COV_MODE == "resident":
-    layer_idx = _ch._current_layer_idx
-    cov_stack = _ch._INPUT_COV_STACK_GPU[layer_idx]  # [E, H, H] fp32
-    x = hidden_states.float()   # [T, H]
-    # For each top_k slot:
-    for k in range(topk_ids.shape[1]):  # Dynamo unrolls (k is small constant)
         ids_k = topk_ids[:, k].long()   # [T]
-        # Gather x per expert: x_gathered[e] = rows of x where ids_k==e
-        # Use scatter to build [E, buf_rows, H] batched input tensor:
-        x_batched = _ch._INPUT_COV_TEMP_GPU[layer_idx]  # [E, buf_rows, H] fp32, zero each fwd
-        x_batched.zero_()
-        # local_rank per expert (same construction as reservoir):
-        E = cov_stack.shape[0]
-        indicator = torch.zeros(x.shape[0], E, dtype=torch.float32, device=x.device)
-        indicator.scatter_(1, ids_k.unsqueeze(1), 1.0)
-        local_rank = indicator.cumsum(dim=0).gather(1, ids_k.unsqueeze(1)).squeeze(1).long() - 1
-        dest_e  = ids_k               # [T] which expert
-        dest_r  = local_rank          # [T] which row within expert
-        lin_idx = (dest_e * x_batched.shape[1] + dest_r)  # [T]
-        x_batched.view(-1, x.shape[1]).scatter_(0, lin_idx.unsqueeze(1).expand(-1, x.shape[1]), x)
-        # baddbmm_ in place: cov_stack += x_batched.T @ x_batched per expert
-        cov_stack.baddbmm_(x_batched.transpose(1, 2), x_batched)  # [E, H, H] += [E, H, buf] @ [E, buf, H]
+        indicator = torch.zeros(T, E, dtype=torch.int64, device=ids_k.device)
+        indicator.scatter_(1, ids_k.unsqueeze(1), 1)
+        local_rank = (indicator.cumsum(dim=0)
+                       .gather(1, ids_k.unsqueeze(1))
+                       .squeeze(1) - 1)     # [T] range [0, N_e)
+
+        # H-NEW-1: clamp overflow tokens — if local_rank >= buf_rows, drop
+        valid_mask = local_rank < buf        # [T] bool
+        safe_rank  = local_rank.clamp(max=buf - 1)  # [T], clamped
+
+        dest_e  = ids_k                              # [T]
+        dest_r  = safe_rank                          # [T]
+        lin_idx = (dest_e * buf + dest_r)            # [T]
+
+        # Zero out overflow tokens (they write to clamped-to-last slot but masked)
+        x_masked = x * valid_mask.unsqueeze(1).to(x.dtype)  # [T, H_local]
+        tmp.view(-1, x.shape[1]).scatter_(
+            0,
+            lin_idx.unsqueeze(1).expand(-1, x.shape[1]),
+            x_masked,
+        )
+
+    # baddbmm_ in-place: cov += tmp.T @ tmp per expert
+    # tmp: [E, buf_rows, H]; cov: [E, H, H]
+    # baddbmm_ expects [E, H, H] += [E, H, buf] @ [E, buf, H]
+    cov.baddbmm_(tmp.transpose(1, 2), tmp)
+    # Does NOT materialize a second [E, H, H] tensor — baddbmm_ is in-place. (M2 confirmed)
 ```
 
-**Offload mode**: instead of `baddbmm_` GPU, after filling `x_batched`, enqueue a CPU task: `pool.submit(cpu_cov_update, x_batched.cpu(), layer_idx)`. This offload happens inside the custom op body (not in graph), so the async submit is fine. The GPU graph only records the `x_batched.zero_()` + scatter fill.
+The clamped "last-slot" writes for overflow tokens are zeroed by `x_masked` (the `valid_mask` zeros the input for those tokens), so overflow tokens contribute zero to the accumulation — correct drop semantics.
 
-**H3 / stage2_profile:** See Section 3 below.
-
-### 2.10 `calibration_stage2_profile.py` — routed to forward-only replay (H3)
-
-**Locating the post-step hook (H3):** `execute_model` in `vllm/v1/worker/gpu/model_runner.py` returns at line 1183 with `return None` (last PP rank returns None; `sample_tokens` is a separate call at line 1185). There is no `post_model_hook` or step-level callback surface in the current vLLM v1 worker path. The model runner stores `execute_model_state` (line 1169) but that is only for bridging to `sample_tokens`, not for user hooks.
-
-**Decision:** Stage2_profile and input_cov-offload mode's aggregation step are routed via the `feat/calib-v3-replay` forward-only replay driver. The live vLLM capture path records only the raw tensor data (GPU accumulators). Post-run, the replay driver loads the checkpoint and re-executes `ReamCostAccumulator` + `InputCovarianceAccumulator` from `moe_compress.stage2.profiling` against the captured outputs.
-
-`calibration_stage2_profile.py` in live mode: only registers setup()/dump() stubs; the 5 callbacks (`router`, `expert_out_unweighted`, `layer_in`, `expert_in`, `expert_mid`) are NOT registered during live vLLM capture (they remain CPU-callback-based and are unused under cudagraph).
-
-The replay driver will call them after loading the dumped GPU tensor checkpoints. This is explicitly marked in the `VLLM_CALIB_STAGE2_PROFILE_MODE` env var ("replay" = default).
-
----
-
-## 3. `moe_runner.py` Patch Insertion Points
-
-All inline GPU accumulation for custom-op-interior writers is inserted in `_apply_quant_method` (moe_runner.py:496) and in `TritonExperts.apply` (triton_moe.py).
-
-**`_apply_quant_method` additions** (after line 530, after `topk_weights, topk_ids = ...`):
+**Offload mode:** Replace the `baddbmm_` call with an async CPU submit:
 
 ```python
-# === CALIB: in-graph GPU accumulation (graph-safe: inside vllm.moe_forward custom op) ===
-if any([_ch._CAPTURE_ROUTER, _ch._CAPTURE_ROUTING_STATS,
-        _ch._CAPTURE_ROUTER_LOGITS_STATS, _ch._CAPTURE_WANDA,
-        _ch._CAPTURE_INPUT_COV, _ch._CAPTURE_OUTPUT_RESERVOIR,
-        _ch._CAPTURE_IMATRIX, _ch._CAPTURE_PER_EXPERT_MAX]):
-    _layer_idx = _ch._current_layer_idx  # int constant at capture time
-    if _ch._CAPTURE_ROUTER:
-        _ch._TOPK_WEIGHTS_STASH_GPU[_layer_idx][:topk_weights.shape[0]].copy_(topk_weights)
-    if _ch._CAPTURE_ROUTING_STATS:
-        # routing freq + wsum (Section 2.3)
-        ...
-    if _ch._CAPTURE_ROUTER_LOGITS_STATS:
-        # router_logits mean/var (Section 2.4)
-        ...
-    if _ch._CAPTURE_WANDA:
-        # wanda metric (Section 2.6)
-        ...
-    if _ch._CAPTURE_IMATRIX:
-        # MoE imatrix (Section 2.5 MoE path)
-        ...
-    if _ch._CAPTURE_INPUT_COV:
-        # input_cov resident/offload (Section 2.9)
-        ...
-# === END CALIB ===
+x_cpu_future = tmp.cpu()  # D2H copy, async in CUDA stream
+_INPUT_COV_OFFLOAD_POOL.submit(_cpu_cov_update, x_cpu_future, _li)
 ```
 
-The outer `if any([...])` guard is folded to a constant by Dynamo (all `_CAPTURE_*` flags are module-level booleans read at trace time). When all flags are False, the entire block is DCE'd.
+`_cpu_cov_update` takes the numpy view and does `cov_cpu += x.T @ x` on CPU. The GPU graph records only the `tmp.zero_()` + scatter fills.
 
-**`TritonExperts.apply` additions** (after `invoke_fused_moe_triton_kernel`, before return):
+**Peak memory (M2 revisited):**
+- TP=4, H_local=512, E=128, 48 layers: `128 × 512 × 512 × 4 × 48 ≈ 6.4 GB` accumulator — feasible.
+- TP=1, H=2048, E=128, 48 layers: `128 × 2048 × 2048 × 4 × 48 ≈ 102 GB` — requires offload mode or TP≥4.
+- Per-forward temp `[E, buf_rows, H_local]` at TP=4: `128 × 512 × 512 × 4 = 134 MB` — acceptable.
+- `baddbmm_` does not allocate a second `[E, H, H]` tensor when called as in-place. Confirmed: PyTorch `baddbmm_` writes into `self` (the accumulator) without temp output allocation.
+
+**`captured_entry_count()`:**
 
 ```python
-if self._calib_buf_rows > 0 and num_tokens <= self._calib_buf_rows:
-    _unweighted_slice = self._calib_unweighted_buf[:num_tokens]  # [T, top_k, K]
-    if _ch._CAPTURE_EXPERT and _ch._CAPTURE_ROUTER:
-        # reap_scores (Section 2.1)
-        ...
-    if _ch._CAPTURE_PER_EXPERT_MAX:
-        # per_expert_max (Section 2.2)
-        ...
-    if _ch._CAPTURE_OUTPUT_RESERVOIR:
-        # output_reservoir (Section 2.7)
-        ...
-else:
-    _warn_once(self.moe_layer_id, num_tokens, self._calib_buf_rows)
+if _ch._INPUT_COV_MODE == "resident":
+    return any(v.abs().sum().item() > 0 for v in _ch._INPUT_COV_GPU.values())
+return False
 ```
 
----
+### 4.10 `calibration_stage2_profile.py` — replay-only (H3)
 
-## 4. `vllm/envs.py` Hunk (M3)
+**H3 resolution:** The `execute_model` method in `vllm/v1/worker/gpu/model_runner.py` returns `None` at line 1183 (last PP rank) and has no post-model-call hook surface. The `sample_tokens` method at line 1185 is a separate scheduler-driven call, not a model-step callback. There is no viable `post_step_hook` surface in the current v1 worker path.
 
-Add to the existing calib env var block (after `VLLM_CALIB_BLOCK_OUTPUTS_SUBSET_SIZE`):
+**Decision:** `calibration_stage2_profile.py` operates in replay-only mode under `VLLM_CALIB_STAGE2_PROFILE_MODE=replay` (the default). During live vLLM capture, the module's `setup()` registers no callbacks. Post-capture, the `feat/calib-v3-replay` forward-only replay driver loads the dumped GPU tensor checkpoints and calls `ReamCostAccumulator` and `InputCovarianceAccumulator` from `moe_compress.stage2.profiling` against the replayed outputs.
 
-```python
-VLLM_CALIB_INPUT_COV_MODE: str = os.getenv("VLLM_CALIB_INPUT_COV_MODE", "off")
-# "off" | "resident" | "offload"
-VLLM_CALIB_BUF_ROWS_FLOOR: int = int(os.getenv("VLLM_CALIB_BUF_ROWS_FLOOR", "512"))
-VLLM_CALIB_STAGE2_PROFILE_MODE: str = os.getenv("VLLM_CALIB_STAGE2_PROFILE_MODE", "replay")
-# "replay" = use forward-only replay driver post-capture
-# "live"   = register callbacks during capture (only works eager/non-compiled)
-```
+For `VLLM_CALIB_STAGE2_PROFILE_MODE=live` (non-default), the module registers its five CPU callbacks as before — this only works without `VLLM_COMPILE` (eager mode). Document this clearly in the module docstring.
 
 ---
 
 ## 5. Implementation File Map
 
 **Files to create:**
-- `/vllm/calibration_custom_ops.py` — `direct_register_custom_op` registrations for `calib_dense_imatrix_accum`, `calib_block_out_accum`, `calib_layer_in_accum`; exposes `torch.ops.vllm.calib_*` for use by traced-region callers
+- `/vllm/calibration_custom_ops.py` — `direct_register_custom_op` registrations for `calib_imatrix_dense_accum` (`mutates_args=["accum"]`), `calib_block_out_accum` (`mutates_args=["accum", "ptr"]`), `calib_layer_in_accum` (`mutates_args=["accum", "ptr"]`). Module imported by `calibration_hooks.py` at module level to register ops before any forward.
 
 **Files to modify:**
-- `/vllm/calibration_hooks.py` — remove `_callbacks`/`dispatch`/`register_callback`; add GPU accumulator dicts; add `_ARANGE_BUF_GPU`, `_ONES_BUF_GPU`, `_ONES_I64_BUF_GPU`, `_SCALAR_ONES_GPU`; add `_current_layer_idx` guard broadening
-- `/vllm/calibration_reap_scores.py` — full rewrite to in-graph GPU (Section 2.1)
-- `/vllm/calibration_per_expert_max.py` — full rewrite to in-graph GPU (Section 2.2)
-- `/vllm/calibration_routing_stats.py` — full rewrite (Section 2.3)
-- `/vllm/calibration_router_logits_stats.py` — full rewrite (Section 2.4)
-- `/vllm/calibration_imatrix.py` — MoE path rewrite + dense path via custom op (Section 2.5)
-- `/vllm/calibration_wanda_scalar_row.py` — full rewrite (Section 2.6)
-- `/vllm/calibration_output_reservoir.py` — full rewrite, deterministic fixed-stride (Section 2.7)
-- `/vllm/calibration_block_outputs.py` — monotonic write-pointer + custom op receiver (Section 2.8)
-- `/vllm/calibration_input_cov.py` — flag-gated dual-mode (Section 2.9)
-- `/vllm/calibration_stage2_profile.py` — stub setup/dump; disable live callbacks; add replay-mode note (Section 2.10)
-- `/vllm/model_executor/layers/fused_moe/runner/moe_runner.py` — inline GPU accum in `_apply_quant_method`; broadened `_current_layer_idx` guard (M4); import `calibration_custom_ops`
-- `/vllm/model_executor/layers/fused_moe/experts/triton_moe.py` — `_calib_buf_rows` fix (H2); OOB warn-once; inline GPU accum in `apply()`
-- `/vllm/model_executor/layers/linear.py` — insert `torch.ops.vllm.calib_dense_imatrix_accum(input_, self._calib_layer_name)` in `ColumnParallelLinear.forward` (line 582), guarded by `if _ch._CAPTURE_IMATRIX`
-- `/vllm/model_executor/layers/logits_processor.py` — insert `torch.ops.vllm.calib_dense_imatrix_accum(hidden_states, "lm_head")` in `_get_logits` (line 96), guarded by `if _ch._CAPTURE_IMATRIX`
-- `/vllm/model_executor/models/qwen3_moe.py` — insert `torch.ops.vllm.calib_block_out_accum(final_hidden_states, self.moe_layer_id)` in `Qwen3MoeSparseMoeBlock.forward` (line 258); insert `torch.ops.vllm.calib_layer_in_accum(hidden_states, self.layer_idx)` in decoder layer forward (line 416), guarded by respective flags
-- `/vllm/model_executor/models/qwen3_next.py` — same as qwen3_moe.py equivalents (SparseMoeBlock.forward line 202; decoder layer forward line 401)
-- `/vllm/envs.py` — add three new env vars (M3, Section 4)
+
+| File | Changes |
+|------|---------|
+| `vllm/calibration_hooks.py` | Remove `_callbacks`/`dispatch`/`register_callback`; add all GPU accumulator dict declarations; add `_ARANGE_BUF_GPU`, `_ONES_I64_BUF_GPU`; import `calibration_custom_ops` |
+| `vllm/calibration_reap_scores.py` | Full rewrite to GPU accumulators + in-graph scatter (Section 4.1) |
+| `vllm/calibration_per_expert_max.py` | Full rewrite (Section 4.2) |
+| `vllm/calibration_routing_stats.py` | Full rewrite (Section 4.3) |
+| `vllm/calibration_router_logits_stats.py` | Full rewrite (Section 4.4) |
+| `vllm/calibration_imatrix.py` | MoE path in-graph + dense path via custom op; remove top-1-surrogate line (Section 4.5) |
+| `vllm/calibration_wanda_scalar_row.py` | Full rewrite (Section 4.6) |
+| `vllm/calibration_output_reservoir.py` | Full rewrite, deterministic fixed-stride (Section 4.7) |
+| `vllm/calibration_block_outputs.py` | GPU monotonic-pointer write + custom op receiver; fix payload fields (Section 4.8) |
+| `vllm/calibration_input_cov.py` | Dual-mode resident/offload + H-NEW-1 clamp fix (Section 4.9) |
+| `vllm/calibration_stage2_profile.py` | Stub live path; document replay mode (Section 4.10) |
+| `vllm/model_executor/layers/fused_moe/runner/moe_runner.py` | Inline GPU accum in `MoERunner.forward` non-monolithic branch; broadened `_current_layer_idx` guard (M4) |
+| `vllm/model_executor/layers/fused_moe/experts/triton_moe.py` | `_calib_buf_rows` fix (H2); OOB warn-once; inline GPU accum in `TritonExperts.apply` |
+| `vllm/model_executor/layers/linear.py` | Replace `_ch.dispatch("linear_in", ...)` with `torch.ops.vllm.calib_imatrix_dense_accum(accum, input_)` in all three linear forward methods; `accum` fetched from `_ch._IMATRIX_DENSE_GPU.get(self.prefix)` |
+| `vllm/model_executor/layers/logits_processor.py` | Replace `_ch.dispatch("lm_head_in", ...)` with `torch.ops.vllm.calib_imatrix_dense_accum(accum, hidden_states)` |
+| `vllm/model_executor/models/qwen3_moe.py` | Replace `_ch.dispatch("block_out", ...)` with `torch.ops.vllm.calib_block_out_accum(accum, ptr, arng, final_hidden_states)` (both branches); replace `_ch.dispatch("layer_in", ...)` with `torch.ops.vllm.calib_layer_in_accum(accum, ptr, arng, hidden_states)` |
+| `vllm/model_executor/models/qwen3_next.py` | Same as qwen3_moe.py equivalents |
+| `vllm/envs.py` | Add three new env vars (Section 3.4) |
 
 ---
 
 ## 6. Build Sequence
 
 **Phase 1 — Infrastructure (no behavior change):**
-- [ ] Create `calibration_custom_ops.py` with the three `direct_register_custom_op` registrations and empty (pass) bodies
-- [ ] Add GPU accumulator dict declarations to `calibration_hooks.py`; remove `_callbacks`/`dispatch`/`register_callback`; add prealloc buffer dicts
+- [ ] Create `calibration_custom_ops.py` with stub bodies (pass) and correct `mutates_args` declarations; verify `torch.ops.vllm.calib_imatrix_dense_accum` callable in Python
+- [ ] Update `calibration_hooks.py`: GPU dict declarations, remove callback infrastructure, import custom_ops
 - [ ] Add new env vars to `envs.py`
 - [ ] Fix `_calib_buf_rows` in `triton_moe.py` (H2)
 - [ ] Broaden `_current_layer_idx` guard in `moe_runner.py` (M4)
 
-**Phase 2 — Custom-op-interior writers (reap, pem, routing_stats, router_logits_stats, wanda):**
-- [ ] Rewrite each writer's `setup()` to allocate GPU tensors (pre-capture)
-- [ ] Replace CPU callbacks in each with in-graph GPU ops in `moe_runner.py` and `triton_moe.py`
-- [ ] Fix `captured_entry_count()` for each (H1)
-- [ ] Update `dump()` for each (GPU→CPU copy at dump time)
-- [ ] Verify: smoke test with `enforce_eager=False`, `VLLM_COMPILE=1`, token counts non-zero post-decode
+**Phase 2 — Custom-op-interior writers:**
+- [ ] Rewrite `reap_scores`, `per_expert_max`, `routing_stats`, `router_logits_stats`, `wanda_scalar_row` with GPU accumulators and in-graph ops
+- [ ] Add GPU accumulation code to `MoERunner.forward` and `TritonExperts.apply`
+- [ ] Fix `captured_entry_count()` for all five writers (use `.values()` not `[0]`)
+- [ ] Verify gate: `VLLM_CALIB_CAPTURE_EXPERT=1 VLLM_COMPILE=1` — single decode batch — `_REAP_TOKEN_COUNTS_GPU` sum > 0
 
 **Phase 3 — Reservoir rewrite (C3):**
-- [ ] Rewrite `calibration_output_reservoir.py` to deterministic fixed-stride per-expert (Section 2.7)
-- [ ] Verify: distribution check — per-expert write counts should be uniform across cap slots
+- [ ] Rewrite `calibration_output_reservoir.py` (Section 4.7)
+- [ ] Verify: uniform slot distribution check across 1000 dispatches
 
-**Phase 4 — Traced-region signals (C1):**
-- [ ] Implement `_calib_dense_imatrix_accum`, `_calib_block_out_accum`, `_calib_layer_in_accum` custom op bodies
-- [ ] Insert calls in `linear.py`, `logits_processor.py`, `qwen3_moe.py`, `qwen3_next.py`
-- [ ] Rewrite `calibration_imatrix.py` MoE path (in-graph) + dense path (via custom op)
-- [ ] Rewrite `calibration_block_outputs.py` with monotonic write pointer (C2)
-- [ ] Verify: `block_out` accumulator non-empty after compile=ON forward
+**Phase 4 — Traced-region signals (C1-RESIDUAL):**
+- [ ] Implement full bodies of `calib_imatrix_dense_accum`, `calib_block_out_accum`, `calib_layer_in_accum`
+- [ ] Replace `_ch.dispatch(...)` calls in `linear.py`, `logits_processor.py`, `qwen3_moe.py`, `qwen3_next.py` with `torch.ops.vllm.*` calls; pass named accumulator tensor
+- [ ] Rewrite `calibration_imatrix.py` (MoE + dense paths); remove top-1-surrogate line
+- [ ] Rewrite `calibration_block_outputs.py` (Section 4.8); fix `BlockHiddenPayload` fields (M-NEW-2)
+- [ ] Verify gate: `VLLM_CALIB_CAPTURE_BLOCK=1 VLLM_COMPILE=1` — `_BLOCK_OUT_PTR_GPU` > 0 AND `calib_block_out_accum` node present in `TORCH_COMPILE_DEBUG` graph dump (C1-RESIDUAL confirm)
+- [ ] Verify gate: `VLLM_CALIB_CAPTURE_IMATRIX=1 VLLM_COMPILE=1` — dense accumulator for `model.layers.0.self_attn.q_proj` > 0
 
-**Phase 5 — input_cov + stage2_profile (H3):**
-- [ ] Implement `calibration_input_cov.py` resident mode (full GPU `baddbmm_` path)
-- [ ] Implement offload mode (enqueue CPU task from custom op body)
-- [ ] Stub out `calibration_stage2_profile.py` for replay-mode
-- [ ] Verify: resident mode accumulator shape + memory footprint at TP=4
+**Phase 5 — input_cov + stage2_profile:**
+- [ ] Implement `input_cov` resident mode with H-NEW-1 clamp (Section 4.9)
+- [ ] Implement offload mode
+- [ ] Stub `stage2_profile` live path; document replay-only default (Section 4.10)
+- [ ] Verify: TP=4 resident-mode accumulator shape `[128, 512, 512]` per layer; `baddbmm_` peak stays under 8 GB extra VRAM
 
-**Phase 6 — Verify gates:**
-- [ ] Gate 1: `VLLM_CALIB_CAPTURE_EXPERT=1 VLLM_COMPILE=1` — decode-only batch, verify `_REAP_TOKEN_COUNTS_GPU[0].sum().item() > 0`
-- [ ] Gate 2: `VLLM_CALIB_CAPTURE_BLOCK=1 VLLM_COMPILE=1` — verify `_BLOCK_OUT_PTR_GPU[0].item() > 0` after prefill (traced-region signal test)
-- [ ] Gate 3: `VLLM_CALIB_CAPTURE_IMATRIX=1 VLLM_COMPILE=1` — verify `_IMATRIX_DENSE_GPU["model.layers.0.self_attn.q_proj"].sum().item() > 0` (dense path, traced-region)
-- [ ] Gate 4: full 8000-trace calib run → all sidecars non-empty → downstream REAP finalize completes without shape errors
-- [ ] Gate 5: resume from in-flight v1 CPU-checkpoint errors on schema version mismatch (checkpoint version bump hard-errors cleanly)
+**Phase 6 — Integration verify:**
+- [ ] Full 8000-trace calib run with all writers active → all sidecars non-empty → REAP finalize completes without shape errors
+- [ ] Resume from v1 CPU checkpoint → schema version mismatch hard-error (verify clean message)
+- [ ] `TORCH_COMPILE_DEBUG` graph dump for a compiled forward: confirm `calib_block_out_accum` and `calib_imatrix_dense_accum` nodes present, not DCE'd
 
 ---
 
-## 7. Checkpoint Schema Version Bump
+## 7. Schema Version Bump (LOW)
 
-The existing CPU-checkpoint schema for all writers changes (GPU tensors replace CPU lists/dicts). Any in-flight v1 checkpoint is incompatible. Add to each writer's `load_checkpoint()`:
+Every writer's `load_checkpoint()` adds:
 
 ```python
 if data.get("schema_version", 0) < 2:
-    raise ValueError(
-        "Calibration checkpoint schema v1 is incompatible with v2 (GPU accumulator format). "
-        "Delete the checkpoint directory and restart capture."
+    raise RuntimeError(
+        "Calibration checkpoint schema v1 is incompatible with v2 "
+        "(GPU accumulator format). Delete the checkpoint directory "
+        "and restart capture from scratch."
     )
 ```
 
-This hard-errors on resume (LOW/NIT item) rather than silently corrupting state.
-
----
-
-## 8. LOW/NIT Items
-
-- **Router logits BOS-path:** BOS token (position 0, single-token prefill) produces a sink logit distribution. Document in `calibration_router_logits_stats.py` module docstring that BOS tokens are accumulated without filtering — callers should be aware that position-0 statistics may be biased toward the sink expert.
-- **Redundant `.long()`**: The original `_on_router` callbacks had `.long()` on already-int64 tensors. The new in-graph path uses `topk_ids` directly from `select_experts` which returns `int64`; drop all `.long()` casts.
-- **Prealloc `ones`/`arange` buffers**: `_ch._ONES_BUF_GPU[layer_idx]` (`[buf_rows * top_k]` int64 filled with 1), `_ch._ARANGE_BUF_GPU[layer_idx]` (`[buf_rows]` int64 arange) are allocated once in `setup()` and sliced per dispatch. This avoids `torch.ones`/`torch.arange` allocation inside the graph (allocation in-graph creates dynamic memory which disrupts graph replay).
+In-flight v1 CPU-checkpoint resumes will hard-error on the first `load_checkpoint` call — this is the desired behavior (silent corruption would be worse).
