@@ -1756,7 +1756,12 @@ def main() -> int:
 
     # Apply operational env hardening (compile-OOM cap, durable compile cache,
     # host-prereq warnings) before any vllm.* import. Safe: build/cache only.
-    _harden_runtime_env(args.output, args.dtype)
+    # Skip in replay mode: _harden_runtime_env uses setdefault, so calling it
+    # here with args.output would pin VLLM_CACHE_ROOT next to the *output*
+    # path and the later call in _run_replay (with the replay JSONL path)
+    # would be a no-op. _run_replay owns hardening with the correct path.
+    if args.replay_from is None:
+        _harden_runtime_env(args.output, args.dtype)
 
     # Pre-import env gates for the imatrix path. These MUST be set before any
     # vllm.* import because vllm.calibration_hooks samples them at module
