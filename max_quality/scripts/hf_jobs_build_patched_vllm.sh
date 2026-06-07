@@ -55,29 +55,25 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply BOTH calibration patches ==="
 # Two patches in this wheel:
-#  1. vllm_calibration_hooks.patch (11272 lines, MD5 9aaf47ab...) — the
-#     core hooks + 10 writer modules (block_outputs / hooks / imatrix /
-#     input_cov / output_reservoir / per_expert_max / reap_scores /
-#     router_logits_stats / routing_stats / wanda_scalar_row), the
-#     envs.py mirror, and the Qwen3MoeSparseMoeBlock + (B0/M3)
-#     Qwen3NextSparseMoeBlock (qwen3_next.py, reused by qwen3_5 for
-#     Qwen3.6) dispatch sites. Includes CRITICAL-1's layer_in hook (env var
-#     VLLM_CALIB_CAPTURE_LAYER_IN + "layer_in" in VALID_HOOK_NAMES +
-#     dispatch site post-chunk pre-is_internal_router) and W-1's new
-#     calibration_wanda_scalar_row.py writer module. B0: discovery predicate
-#     now keys off global_num_experts (FusedMoE never sets num_experts), and
-#     every writer exposes a public captured_entry_count() for the driver
-#     fail-fast.
-#  2. vllm_calibration_stage2_profile.patch (923 lines, MD5 7e04ccb6...) —
-#     creates calibration_stage2_profile.py with the
-#     _layer_in_handler writer subscription (receiver for patch #1's
-#     dispatch), _LAYER_INPUT_MAX_SAMPLES constant, and the
-#     CRITICAL-1 MEDIUM 4-tuple checkpoint shape
-#     (buffer, seen, max_samples, generator_state) that preserves
-#     Phase-C RNG state for byte-identical resume.
-# Both patches are needed; #2 modifies a file #1 does not create
-# (they are sibling new-file patches, independent of each other,
-# but logically required together for layer_in capture to work).
+#  1. vllm_calibration_hooks.patch (10469 lines, MD5 e5128e62...) — the
+#     CUDA-graph-safe in-graph capture rearchitecture: calibration_hooks.py
+#     (GPU accumulator dicts, custom-op import, NO Python callback registry),
+#     calibration_custom_ops.py (the 3 named-arg mutates_args custom ops:
+#     calib_imatrix_dense_accum / calib_block_out_accum / calib_layer_in_accum),
+#     the 10 writer modules rewritten to GPU accumulators + in-graph ops
+#     (block_outputs / imatrix / input_cov / output_reservoir / per_expert_max /
+#     reap_scores / router_logits_stats / routing_stats / wanda_scalar_row),
+#     the envs.py mirror (+ new VLLM_CALIB_INPUT_COV_MODE / BUF_ROWS_FLOOR /
+#     STAGE2_PROFILE_MODE / WANDA gate), the MoERunner + TritonExperts interior
+#     accumulation, and the qwen3_moe/qwen3_next/linear/logits_processor
+#     custom-op call sites. Every writer keeps a public captured_entry_count().
+#  2. vllm_calibration_stage2_profile.patch (941 lines, MD5 fca4c01c...) —
+#     creates calibration_stage2_profile.py, now REPLAY-ONLY by default
+#     (VLLM_CALIB_STAGE2_PROFILE_MODE=replay): no live callbacks are registered
+#     (the graph-unsafe callback registry was removed); the legacy "live" mode
+#     raises NotImplementedError. The profile is reconstructed post-capture by
+#     the feat/calib-v3-replay forward-only driver.
+# Both patches are needed; #2 creates a file #1 does not.
 # See max_quality/patches/MANIFEST.md.
 
 curl -sL \
@@ -85,17 +81,20 @@ curl -sL \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected: 11450 lines, MD5 517377fe2ad7a169c08b5dd15c864c42
-# (B0 fix: C2 discovery predicate global_num_experts, M3 qwen3_next.py block
-#  hook, + captured_entry_count() public helper per writer.)
+# Expected: 10469 lines, MD5 e5128e629e5642547d9175c03f0d384a
+# (In-graph cudagraph-safe capture: calibration_custom_ops.py + GPU-accumulator
+#  rewrite of all 10 writers + named-arg mutates_args custom ops; removes the
+#  graph-unsafe Python _ch.dispatch/register_callback path.)
 
 curl -sL \
     https://raw.githubusercontent.com/lucaspirola/moe_compress/feat/b0-hook-fix/max_quality/patches/vllm_calibration_stage2_profile.patch \
     -o /tmp/calib2.patch
 wc -l /tmp/calib2.patch
 md5sum /tmp/calib2.patch
-# Expected: 923 lines, MD5 7e04ccb6afcaeae8f800346ef319ad51
-# (B0 fix: + captured_entry_count() public helper.)
+# Expected: 941 lines, MD5 fca4c01cc5cef188b30c323bb919cd72
+# (In-graph rearchitecture: stage2_profile is now replay-only by default;
+#  the legacy live CPU-callback path raises NotImplementedError under
+#  VLLM_CALIB_STAGE2_PROFILE_MODE=live.)
 
 git apply --check /tmp/calib.patch
 git apply /tmp/calib.patch
@@ -104,14 +103,19 @@ git apply /tmp/calib2.patch
 echo "Applied both. Status:"
 git status --short
 
-# Build-hygiene gate (B0/M3): confirm the new qwen3_next.py block hook landed
-# (the dispatch surface must exist in the v0.21.0 base or the M3 hunk is dead).
-echo "[$(date)] === Phase 5 gate: verify M3 qwen3_next.py block hook applied ==="
+# Build-hygiene gate: confirm the in-graph capture rearchitecture landed.
+# Under the cudagraph-safe rearchitecture the Python ``_ch.dispatch`` callback
+# path is REMOVED; the qwen3_next.py block hook now calls the
+# ``torch.ops.vllm.calib_block_out_accum`` custom op instead. The custom-op
+# registration module + the block hook custom-op call must both be present.
+echo "[$(date)] === Phase 5 gate: verify in-graph capture hooks applied ==="
 grep -q 'def captured_entry_count' vllm/calibration_block_outputs.py \
     || { echo "FATAL: captured_entry_count() missing from calibration_block_outputs.py"; exit 1; }
-grep -q '_ch.dispatch' vllm/model_executor/models/qwen3_next.py \
-    || { echo "FATAL: M3 block hook missing from qwen3_next.py"; exit 1; }
-echo "M3 + captured_entry_count() gate OK."
+test -f vllm/calibration_custom_ops.py \
+    || { echo "FATAL: calibration_custom_ops.py missing (in-graph custom ops)"; exit 1; }
+grep -q 'calib_block_out_accum' vllm/model_executor/models/qwen3_next.py \
+    || { echo "FATAL: in-graph block hook (calib_block_out_accum) missing from qwen3_next.py"; exit 1; }
+echo "In-graph capture gate OK (custom_ops + block hook present)."
 
 echo "[$(date)] === Phase 5b: strip license + license-files lines from pyproject.toml ==="
 # vLLM 0.21.0 has BOTH `license = "Apache-2.0"` (SPDX-string, deprecated)
@@ -239,18 +243,20 @@ tags:
 
 vLLM 0.21.0 (commit `ad7125a`) with calibration-v2 hooks patch applied.
 
-B0 fix (this build): C2 discovery predicate now keys off `global_num_experts`
-(FusedMoE never sets `num_experts`, so the old predicate was always False ->
-empty sidecars); M3 ports the layer_in/block_out hook to
-`Qwen3NextSparseMoeBlock` (qwen3_next.py, reused by qwen3_5 for Qwen3.6); each
-writer exposes a public `captured_entry_count()` for the driver fail-fast.
-NOTE: the driver must also export `VLLM_ENABLE_V1_MULTIPROCESSING=0` (C1, env
-only, no rebuild) or captures stay empty regardless of this wheel.
+In-graph cudagraph-safe capture (this build): every capture signal now
+accumulates via pure GPU tensor ops recorded INTO the captured graph (the prior
+Python `_ch.dispatch` callback path yielded zero under cudagraphs, the
+production default). Traced-region signals (imatrix dense / block_out /
+layer_in) use named-arg `mutates_args` custom ops in `calibration_custom_ops.py`
+so Inductor cannot DCE them; custom-op-interior signals accumulate inline in
+MoERunner / TritonExperts. All 10 writers keep public `captured_entry_count()`
+for the driver fail-fast and dump from GPU accumulators (checkpoint schema v2).
+Runs cudagraph-fast (NOT enforce_eager).
 
 - Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/b0-hook-fix`)
 - Patch artifacts (also uploaded to this repo for traceability):
-  - `vllm_calibration_hooks.patch` — 11450 lines, MD5 `517377fe2ad7a169c08b5dd15c864c42`
-  - `vllm_calibration_stage2_profile.patch` — 923 lines, MD5 `7e04ccb6afcaeae8f800346ef319ad51`
+  - `vllm_calibration_hooks.patch` — 10469 lines, MD5 `e5128e629e5642547d9175c03f0d384a`
+  - `vllm_calibration_stage2_profile.patch` — 941 lines, MD5 `fca4c01cc5cef188b30c323bb919cd72`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)
 - torch: 2.11.0+cu130

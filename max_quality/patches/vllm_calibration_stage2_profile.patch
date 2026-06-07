@@ -1,9 +1,9 @@
 diff --git a/vllm/calibration_stage2_profile.py b/vllm/calibration_stage2_profile.py
 new file mode 100644
-index 0000000..9e35029
+index 0000000..13f8e39
 --- /dev/null
 +++ b/vllm/calibration_stage2_profile.py
-@@ -0,0 +1,917 @@
+@@ -0,0 +1,935 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Stage 2 profile-pass sidecar capture (Plugin #12 REDO -- Optimization A).
@@ -120,6 +120,16 @@ index 0000000..9e35029
 +    os.getenv("VLLM_CALIB_LAYER_INPUT_MAX_SAMPLES", "8192")
 +)
 +
++# Run-mode (plan §4.10). "replay" (default) registers NO live callbacks --
++# the stage2 profile is reconstructed post-capture by the feat/calib-v3-replay
++# forward-only driver from the dumped GPU-tensor checkpoints. "live" is the
++# legacy in-process CPU-callback path and is INCOMPATIBLE with torch.compile /
++# cudagraphs (the calibration_hooks Python callback registry was removed under
++# the in-graph rearchitecture); it is no longer supported.
++_STAGE2_PROFILE_MODE: str = os.getenv(
++    "VLLM_CALIB_STAGE2_PROFILE_MODE", "replay"
++)
++
 +log = logging.getLogger(__name__)
 +
 +__all__ = [
@@ -233,18 +243,26 @@ index 0000000..9e35029
 +                "failed (%s)", exc,
 +            )
 +
-+    if not _CALLBACKS_REGISTERED:
-+        _ch.register_callback("router", _router_handler)
-+        _ch.register_callback("expert_out_unweighted", _expert_out_handler)
-+        _ch.register_callback("layer_in", _layer_in_handler)
-+        _ch.register_callback("expert_in", _expert_in_handler)
-+        _ch.register_callback("expert_mid", _expert_mid_handler)
-+        _CALLBACKS_REGISTERED = True
-+        log.info(
-+            "calibration_stage2_profile.setup: registered router + "
-+            "expert_out_unweighted + layer_in + expert_in (gate_proj cov) + "
-+            "expert_mid (down_proj cov) callbacks",
++    # Plan §4.10: in "replay" (default) mode register NO live callbacks --
++    # the profile is reconstructed post-capture by the forward-only replay
++    # driver from the dumped GPU-tensor checkpoints. The legacy "live" path
++    # used the calibration_hooks Python callback registry, which was removed
++    # under the in-graph (cudagraph-safe) rearchitecture, so it is no longer
++    # supported.
++    if _STAGE2_PROFILE_MODE == "live":
++        raise NotImplementedError(
++            "calibration_stage2_profile: VLLM_CALIB_STAGE2_PROFILE_MODE=live "
++            "is no longer supported. The in-graph capture rearchitecture "
++            "removed the Python callback registry that the live path relied "
++            "on (it cannot run under torch.compile / cudagraphs). Use the "
++            "default 'replay' mode + the feat/calib-v3-replay forward-only "
++            "driver."
 +        )
++    log.info(
++        "calibration_stage2_profile.setup: replay mode -- no live callbacks "
++        "registered; profile reconstructed post-capture from GPU-tensor "
++        "checkpoints by the forward-only replay driver.",
++    )
 +
 +    log.info(
 +        "calibration_stage2_profile.setup: ok (cov_storage_dtype=%s, "
