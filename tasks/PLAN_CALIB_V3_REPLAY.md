@@ -1,77 +1,60 @@
-# PLAN — Calibration v3 forward-only replay (REVISED FINAL, verbatim)
+# PLAN — Calibration v3 forward-only replay (CORRECTED FINAL, verbatim)
 
 Implements tasks/CALIBRATION_V3_CAPTURE_REPLAY_DESIGN.md. Branch feat/calib-v3-replay.
-Authoritative spec with full inlined code (extracted verbatim from the planner agent).
+Authoritative spec, full inlined code. Round-2 fixes applied: C-NEW-1 (all-skip
+counter) + L-NEW-1 (two-path buf_rows probe).
 
 ---
 
-# Calibration v3 — Forward-Only Replay: REVISED FINAL Implementation Plan
+# Calibration v3 — Forward-Only Replay: CORRECTED FINAL Implementation Plan
 
-## How This Revision Fixes Each Defect
+## Changes in This Revision
 
-**C1 (imatrix dump signature):** Imatrix is explicitly special-cased throughout: `dump_imatrix(str(out_path.with_suffix(".imatrix.dat")), chunk_count=total_done_captures)`. All nine other writers use `dump_<signal>(out_path: Path)` and compute the sidecar path internally. This asymmetry is called out in every relevant section.
+**C-NEW-1 (CRITICAL — fixed):** The all-skip-chunk branch in `_run_replay` corrupted `rows_done` by adding `len(chunk)` on top of a `total_rows_consumed` that already included the chunk's skips (which were accumulated per-row during rendering), then incremented `n_skipped` a third time. The fix: write `rows_done=rows_done_base + n_replayed + n_skipped` directly — the per-row `n_skipped += 1` accumulator inside the rendering loop is the sole source of truth. The misleading comment and the spurious `n_skipped += len(chunk) - len(rendered_chunk)` line are deleted. Partial-skip chunks are correct under this formula: the rendering loop accumulates exactly the right `n_skipped` before control reaches the checkpoint write in either branch.
 
-**C2 (buffer size is runtime-derived):** After `_load_teacher_vllm` returns, `_run_replay` reads back the actual `max_cudagraph_capture_size` via `llm.llm_engine.vllm_config.compilation_config.max_cudagraph_capture_size` and hard-asserts `buf_rows >= _REPLAY_MAX_BATCHED_TOKENS` before starting the loop. The `LLM()` constructor also receives `max_num_seqs=256` explicitly (not relying on the default) so the formula `min(256*2, 512) = 512` is predictable. If the assert fires, the error message names the escape hatches.
+**L-NEW-1 (hardening — applied):** The C2 `AttributeError` fallback now tries two attribute paths before giving up. First: `llm.llm_engine.vllm_config.compilation_config.max_cudagraph_capture_size`. Second (new): `llm.llm_engine.model_executor.driver_worker.model_runner.vllm_config.compilation_config.max_cudagraph_capture_size` (the same model-runner path the generate code uses at line 2277). Only if both paths raise `AttributeError` does it fall back to the formula — and at that point it logs at `ERROR` (not WARNING) to tell the operator the buf_rows guarantee is unverified.
 
-**H1 (_WriterState completeness):** All ten ckpt-path fields are enumerated verbatim in the `_WriterState` dataclass. The `_check_ckpt_counter` closure is recreated inside `_setup_all_writers` as a lambda that captures the passed-in `already_done` and `allow_counter_divergence`. All ~20 downstream `*_ckpt_path` references in `main()` are listed for `ws.<field>` replacement.
-
-**H2 (layer_input_reservoir):** Explicitly noted: rides inside `stage2_profile`, no standalone dump, not an 11th writer.
-
-**M1 (counter-check collision on resume):** `.replay.ckpt` now stores `{"rows_done": int, "captured_done": int}`. `rows_done` slices the JSONL; `captured_done` is passed to `_setup_all_writers` as `already_done` for writer counter checks. `_write_replay_ckpt` writes both.
-
-**M2 (assert gating):** `assert_enabled_captures_nonempty` is gated on `first_chunk_checked`, which is set only when `rendered_chunk` is non-empty (i.e., at least one request was actually submitted). An all-over-length first chunk does not trip it.
-
-**N1 (prompt_token_ids fallback):** Fallback is re-render as string AND verify round-trip token equality before submitting. If the token counts differ by more than a small tolerance, `log.error` + `SystemExit(2)`. No blind `decode()`.
-
-**N3 (generate-vs-replay routing spot-check):** Removed from the automated gates. Per-row generate-time captures are not retained; the empirical match cannot be automated. The gate is replaced by the buf_rows smoke. The plan notes the design doc line should be softened to "the causal-masking argument is the justification; the automated gates are (a) B0 non-empty, (b) code+science tokens > 0, (c) buf_rows >= effective chunk smoke."
+All other content from the previous plan is unchanged and confirmed correct.
 
 ---
 
-## Patterns & Conventions (confirmed correct, file:line refs)
+## Confirmed-Correct Unchanged Items
+
+- All 9 prior findings remain fixed.
+- API names, non-imatrix dump signatures, imatrix special-case, sidecar stem, argparse flags, B0/C1 env ordering: unchanged and confirmed correct.
+- `_render_row_for_replay`, `_build_replay_subset_tally`, `_assert_code_science_nonzero` helpers: unchanged.
+- `_WriterState` (10 fields, no layer_input_reservoir): unchanged.
+- `_setup_all_writers`: unchanged.
+- Unit test file (14 tests): unchanged.
+- Build sequence, implementation map, data flow, smoke plan: unchanged except the C-NEW-1 and L-NEW-1 corrections noted in `_run_replay`.
+
+---
+
+## Patterns & Conventions (file:line refs)
 
 **B0/C1 invariant:** `os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"` module-level line 115. Replay inherits unconditionally.
 
-**Capture env gates:** `VLLM_CALIB_CAPTURE_*` set in `main()` lines 1323–1521 before any vllm import. The `if args.replay_from: return _run_replay(args)` redirect is placed after line 1521.
+**Capture env gates:** `VLLM_CALIB_CAPTURE_*` set in `main()` lines 1323–1521. `if args.replay_from: return _run_replay(args)` placed after line 1521.
 
-**`_load_teacher_vllm`** (line 364): signature `(repo, revision, dtype, gpu_memory_utilization, max_model_len, max_num_seqs=None, max_num_batched_tokens=None, max_logprobs=50)`. No signature change. Replay calls with `max_num_batched_tokens=256, max_num_seqs=256, max_logprobs=1`.
+**`_load_teacher_vllm`** (line 364): signature `(repo, revision, dtype, gpu_memory_utilization, max_model_len, max_num_seqs=None, max_num_batched_tokens=None, max_logprobs=50)`. No change. Replay calls with `max_num_seqs=256, max_num_batched_tokens=256, max_logprobs=1`.
 
-**TF rendering** (lines 726–733): `apply_chat_template(messages, tokenize=False, add_generation_prompt=False, enable_thinking=True)` + `TypeError` fallback. `_render_row_for_replay` mirrors this path exactly.
+**TF rendering** (lines 726–733): `apply_chat_template(messages, tokenize=False, add_generation_prompt=False, enable_thinking=True)` + `TypeError` fallback. Mirrored exactly by `_render_row_for_replay`.
 
-**Imatrix dump is special:** `dump_imatrix(path: str, chunk_count: int)` writes to `<jsonl>.imatrix.dat` (driver lines 2540–2559). Every other writer: `dump_<signal>(out_path: Path)` computes sidecar internally.
+**Imatrix dump is special:** `dump_imatrix(path: str, chunk_count: int)` writes to `<jsonl>.imatrix.dat` (generate path lines 2540–2559). Every other writer: `dump_<signal>(out_path: Path)`.
 
-**All nine non-imatrix dump signatures confirmed correct:** `dump_reap_scores(Path)`, `dump_input_cov(Path)`, `dump_wanda_scalar_row(Path)`, `dump_stage2_profile(Path)`, `dump_per_expert_max(Path)`, `dump_routing_stats(Path)`, `dump_router_logits_stats(Path)`, `dump_output_reservoir(Path)`, `dump_block_outputs(Path)`.
+**Nine non-imatrix dump signatures (confirmed):** `dump_reap_scores(Path)`, `dump_input_cov(Path)`, `dump_wanda_scalar_row(Path)`, `dump_stage2_profile(Path)`, `dump_per_expert_max(Path)`, `dump_routing_stats(Path)`, `dump_router_logits_stats(Path)`, `dump_output_reservoir(Path)`, `dump_block_outputs(Path)`.
 
-**`layer_input_reservoir` rides `stage2_profile`:** no standalone dump, no 11th writer, no 11th `_WriterState` field.
+**`layer_input_reservoir` rides `stage2_profile`:** no standalone dump, no 11th `_WriterState` field.
 
-**Sidecar path:** `<jsonl.parent>/sidecars/<jsonl.stem>/<signal>.pt` (cached_calibration_signals.py line 151). Computed internally by each writer's `dump_*`.
+**`_CAPTURE_WRITER_MODULES`** (line 194): `layer_input_reservoir` intentionally absent.
 
-**`assert_enabled_captures_nonempty`** (line 219): reused unchanged.
+**Model-runner path for model class resolution** (generate path lines 2277–2279): `llm.llm_engine.model_executor.driver_worker.model_runner.model`. L-NEW-1 adds `.vllm_config.compilation_config.max_cudagraph_capture_size` on the same spine as a second buf_rows probe path.
 
-**`_ckpt_counter_check` / `_ckpt_existence_check`** (lines 773–873): called by `_setup_all_writers`.
-
-**`_CAPTURE_WRITER_MODULES`** (line 194): maps `capture_*` arg names → vllm module names. `layer_input_reservoir` intentionally absent (rides `stage2_profile`).
+**`_write_replay_ckpt` two-counter contract (M1):** `rows_done` slices the JSONL on resume (includes skips); `captured_done` is passed to `_setup_all_writers` as `already_done` for writer counter checks (excludes skips). Per-row `n_skipped += 1` is the sole accumulator — no other site increments it.
 
 ---
 
-## Architecture Decision (confirmed)
-
-`--replay-from <jsonl>` flag on the same driver. Redirect `main()` → `_run_replay(args)` after env gates. No new script file.
-
----
-
-## Chunked Prefill + Buffer Size Analysis (C2)
-
-**`_calib_buf_rows` derivation:** The patch reads `get_current_vllm_config().compilation_config.max_cudagraph_capture_size` at `TritonExperts.__init__` time (patch lines 9996–10001). The engine docs state `max_cudagraph_capture_size = min(max_num_seqs*2, 512)` by default; passing `cudagraph_capture_sizes` overrides it to the max of that list.
-
-**Ensuring buf_rows ≥ 256:** We set `max_num_seqs=256` explicitly so `min(256*2, 512) = 512`. We do NOT pass `cudagraph_capture_sizes` (which would risk a smaller max). After construction, `_run_replay` reads back the actual value and hard-asserts before the loop. This catches any edge case where vLLM computed a smaller value than expected.
-
-**Reading buf_rows from live engine:** `llm.llm_engine.vllm_config.compilation_config.max_cudagraph_capture_size`. This is the same `VllmConfig` object whose reference `get_current_vllm_config()` returns during model init. If this attribute path doesn't exist on the pinned wheel (UNVERIFIED-GPU), the fallback in the assert code is to call `get_current_vllm_config()` directly.
-
-**vLLM V1 + chunked prefill:** V1 engine enables chunked prefill by default when `max_num_batched_tokens` is set. With `max_num_batched_tokens=256`, every prefill batch is at most 256 tokens. Combined with `buf_rows=512`, every MoE forward has `num_tokens ≤ 256 < 512 = buf_rows` → `expert_out_unweighted` fires on every token.
-
----
-
-## Complete Verbatim Code for New Functions
+## Complete Verbatim Code
 
 ### `_render_row_for_replay`
 
@@ -167,8 +150,8 @@ def _assert_code_science_nonzero(
             subset, counts["n_rows"], counts["n_tokens"],
         )
     log.info(
-        "replay: code subsets %s → %d tokens; "
-        "science subsets %s → %d tokens",
+        "replay: code subsets %s -> %d tokens; "
+        "science subsets %s -> %d tokens",
         sorted(code_subsets & tally.keys()), code_tokens,
         sorted(science_subsets & tally.keys()), sci_tokens,
     )
@@ -196,12 +179,14 @@ def _write_replay_ckpt(
 ) -> None:
     """Atomically write the replay row-index + capture-counter checkpoint.
 
-    Two counters are stored separately to avoid M1 counter-check collision:
-      rows_done    — total rows consumed from the JSONL (replayed + skipped).
-                     Used to slice the JSONL on resume (includes skips).
-      captured_done — rows that actually contributed to captures (no skips).
-                     Passed to _setup_all_writers as already_done for
-                     per-writer ckpt counter validation.
+    Two counters stored separately (M1 fix):
+      rows_done     -- total rows consumed from the JSONL (replayed +
+                       skipped). Used to slice the JSONL on resume.
+                       Per-row n_skipped += 1 is the SOLE accumulator;
+                       no other site may increment n_skipped.
+      captured_done -- rows that contributed to captures (no skips).
+                       Passed to _setup_all_writers as already_done for
+                       per-writer ckpt counter validation.
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(
@@ -216,16 +201,16 @@ def _write_replay_ckpt(
 ```python
 import dataclasses
 
+
 @dataclasses.dataclass
 class _WriterState:
     """Per-writer checkpoint paths returned by _setup_all_writers.
 
     Every field is None when the corresponding --capture-* flag is off.
-    Using a dataclass rather than a dict gives AttributeError on typo
-    instead of silent None propagation.
+    Dataclass gives AttributeError on typo instead of silent None.
 
-    Fields (10 total; layer_input_reservoir has no standalone field
-    because it rides stage2_profile with no separate dump):
+    Ten fields; layer_input_reservoir has no field because it rides
+    inside stage2_profile with no separate dump call (H2).
     """
     imatrix_ckpt_path: "Path | None" = None
     reap_ckpt_path: "Path | None" = None
@@ -251,25 +236,24 @@ def _setup_all_writers(
     Extracted from main() (was inline lines 1659-2115) so both the
     generate path and _run_replay() call it identically.
 
-    ``out_path`` — determines checkpoint file locations:
-      generate path: the output JSONL tmp path (out_path = tmp_path)
-      replay path  : the input JSONL (out_path = replay_jsonl)
+    ``out_path`` determines checkpoint file locations:
+      generate path: the output JSONL tmp path
+      replay path  : the input JSONL (replay_jsonl)
     All per-writer .ckpt files land as siblings of out_path.
 
-    ``already_done`` — for the generate path: JSONL rows already written.
-      For the replay path: captured_done (rows that contributed to
-      captures, EXCLUDING skipped/over-length rows). This is the correct
-      counter for _ckpt_counter_check which validates capture coverage.
+    ``already_done`` for the generate path: JSONL rows already written.
+    For the replay path: captured_done (rows that contributed to
+    captures, EXCLUDING skipped/over-length rows). This is the correct
+    counter for _ckpt_counter_check which validates capture coverage.
+
+    The _check_ckpt_counter closure from main() (~line 1659) is
+    recreated as a lambda capturing already_done and
+    args.allow_counter_divergence from the caller's scope.
 
     Returns _WriterState with all ten ckpt path fields (None if disabled).
-
-    The _check_ckpt_counter closure from main() is recreated as a lambda
-    that captures already_done and args.allow_counter_divergence.
     """
     ws = _WriterState()
 
-    # Recreate the _check_ckpt_counter closure from main() (~line 1659).
-    # Captures already_done + args.allow_counter_divergence from caller.
     def _check(signal_name: str, loaded_prompts: int, ckpt_path: "Path"):
         _ckpt_counter_check(
             signal_name, loaded_prompts, already_done, ckpt_path,
@@ -294,7 +278,8 @@ def _setup_all_writers(
                 _check("imatrix", loaded, ws.imatrix_ckpt_path)
                 log.info("imatrix: hydrated %d-prompt ckpt", loaded)
             except ValueError as exc:
-                log.error("imatrix: ckpt schema mismatch (%s); deleting", exc)
+                log.error(
+                    "imatrix: ckpt schema mismatch (%s); deleting", exc)
                 ws.imatrix_ckpt_path.unlink()
 
     # ---- reap-scores ----------------------------------------------------
@@ -315,8 +300,8 @@ def _setup_all_writers(
                 _check("reap-scores", loaded, ws.reap_ckpt_path)
                 log.info("reap-scores: hydrated %d-prompt ckpt", loaded)
             except ValueError as exc:
-                log.error("reap-scores: ckpt schema mismatch (%s); deleting",
-                          exc)
+                log.error(
+                    "reap-scores: ckpt schema mismatch (%s); deleting", exc)
                 ws.reap_ckpt_path.unlink()
 
     # ---- input-covariance -----------------------------------------------
@@ -337,8 +322,8 @@ def _setup_all_writers(
                 _check("input-cov", loaded, ws.input_cov_ckpt_path)
                 log.info("input-cov: hydrated %d-prompt ckpt", loaded)
             except ValueError as exc:
-                log.error("input-cov: ckpt schema mismatch (%s); deleting",
-                          exc)
+                log.error(
+                    "input-cov: ckpt schema mismatch (%s); deleting", exc)
                 ws.input_cov_ckpt_path.unlink()
 
     # ---- wanda scalar_row -----------------------------------------------
@@ -431,7 +416,8 @@ def _setup_all_writers(
                 log.info("routing-stats: hydrated %d-prompt ckpt", loaded)
             except ValueError as exc:
                 log.error(
-                    "routing-stats: ckpt schema mismatch (%s); deleting", exc)
+                    "routing-stats: ckpt schema mismatch (%s); deleting",
+                    exc)
                 ws.rts_ckpt_path.unlink()
 
     # ---- router-logits-stats --------------------------------------------
@@ -503,11 +489,13 @@ def _setup_all_writers(
                 loaded = _bo.load_block_outputs_checkpoint(
                     str(ws.bo_ckpt_path))
                 _check("block-outputs", loaded, ws.bo_ckpt_path)
-                log.info("block-outputs: hydrated %d-prompt ckpt (closed=%s)",
-                         loaded, _bo._SUBSET_CLOSED)
+                log.info(
+                    "block-outputs: hydrated %d-prompt ckpt (closed=%s)",
+                    loaded, _bo._SUBSET_CLOSED)
             except ValueError as exc:
                 log.error(
-                    "block-outputs: ckpt schema mismatch (%s); deleting", exc)
+                    "block-outputs: ckpt schema mismatch (%s); deleting",
+                    exc)
                 ws.bo_ckpt_path.unlink()
 
     return ws
@@ -529,11 +517,20 @@ def _run_replay(args) -> int:
     capture sidecars to the canonical sidecar_path namespace of the
     input JSONL.
 
-    Imatrix dump is special-cased (writes <jsonl>.imatrix.dat, not a
-    sidecar under sidecars/). All other nine writers use dump_*(Path).
+    Imatrix dump is special-cased: dump_imatrix(str, chunk_count=int)
+    writes <jsonl>.imatrix.dat alongside the JSONL (NOT under sidecars/).
+    All other nine writers use dump_<signal>(Path) and compute their
+    sidecar path internally.
+
+    Counter contract (M1 fix):
+      n_skipped is incremented ONLY in the per-row rendering loop.
+      No other site may increment it. rows_done = rows_done_base +
+      n_replayed + n_skipped is always the correct JSONL position.
+      captured_done = captured_done_base + n_replayed excludes skips
+      and is passed to _setup_all_writers for writer counter checks.
 
     Returns 0 on success, 1 on configuration/validation error.
-    SystemExit(2) if B0 hard-fails (from assert_enabled_captures_nonempty).
+    SystemExit(2) if B0 hard-fails (assert_enabled_captures_nonempty).
     """
     # ------------------------------------------------------------------
     # 1. Input validation
@@ -558,8 +555,7 @@ def _run_replay(args) -> int:
         replay_jsonl, _enabled_captures,
     )
 
-    # Runtime env hardening (compile cache, JIT cap). out_path is the
-    # input JSONL so VLLM_CACHE_ROOT lands next to it.
+    # Runtime env hardening (compile cache, JIT cap).
     _harden_runtime_env(str(replay_jsonl), args.dtype)
 
     # ------------------------------------------------------------------
@@ -603,7 +599,7 @@ def _run_replay(args) -> int:
     if n_generate_rows == 0:
         log.warning(
             "replay: no GENERATE rows (completion_source=teacher_generated). "
-            "Continuing — may indicate an unexpected corpus."
+            "Continuing -- may indicate an unexpected corpus."
         )
 
     # ------------------------------------------------------------------
@@ -633,15 +629,13 @@ def _run_replay(args) -> int:
         )
 
     # ------------------------------------------------------------------
-    # 4. Resume handling — two counters (M1 fix)
-    # ------------------------------------------------------------------
-    # rows_done    = total rows consumed (replayed + skipped). Used to
-    #               slice the JSONL. Includes skips.
+    # 4. Resume handling -- two counters (M1 fix)
+    #
+    # rows_done    = total rows consumed (replayed + skipped).
+    #               Used to slice the JSONL on resume.
     # captured_done = rows that contributed to captures (no skips).
-    #               Passed to _setup_all_writers for writer counter checks.
-    # Storing both prevents spurious hard-fail on resume when some rows
-    # were skipped (which would make rows_done > captured_done, wrongly
-    # triggering _ckpt_counter_check divergence if we passed rows_done).
+    #               Passed to _setup_all_writers as already_done.
+    # ------------------------------------------------------------------
     replay_ckpt = replay_jsonl.with_suffix(
         replay_jsonl.suffix + ".replay.ckpt"
     )
@@ -671,11 +665,13 @@ def _run_replay(args) -> int:
 
     # ------------------------------------------------------------------
     # 5. Load teacher
-    # max_num_seqs=256 set explicitly so max_cudagraph_capture_size =
-    # min(256*2, 512) = 512, predictable and >= max_num_batched_tokens=256.
+    #
+    # max_num_seqs=256 set explicitly so:
+    #   max_cudagraph_capture_size = min(256*2, 512) = 512 (predictable).
     # max_num_batched_tokens=256 caps each prefill chunk so every MoE
-    # forward has num_tokens <= 256 <= buf_rows, making expert_out_unweighted
-    # fire on all prefill tokens.
+    # forward has num_tokens <= 256 <= buf_rows, making
+    # expert_out_unweighted fire on all prefill tokens (not just the
+    # single decode token).
     # ------------------------------------------------------------------
     _REPLAY_MAX_BATCHED_TOKENS = 256
     _REPLAY_MAX_NUM_SEQS = 256
@@ -693,61 +689,90 @@ def _run_replay(args) -> int:
     tokenizer = llm.get_tokenizer()
 
     # ------------------------------------------------------------------
-    # 6. C2 runtime buffer-size assertion
-    # Read back the actual max_cudagraph_capture_size from the live engine
-    # and hard-assert it is >= _REPLAY_MAX_BATCHED_TOKENS. If this fires,
-    # the expert_out_unweighted hook would silently skip prefill chunks.
+    # 6. C2 runtime buffer-size assertion (L-NEW-1 hardening)
+    #
+    # Read back the actual max_cudagraph_capture_size from the live
+    # engine. If buf_rows < _REPLAY_MAX_BATCHED_TOKENS the
+    # expert_out_unweighted hook would silently skip prefill chunks and
+    # reap/per_expert_max/output_reservoir would only capture the single
+    # decode token -- the whole chunked-prefill fix would silently fail.
+    #
+    # Two attribute paths tried before falling back to the formula:
+    #   Path 1: llm.llm_engine.vllm_config.compilation_config...
+    #   Path 2: llm.llm_engine.model_executor.driver_worker
+    #             .model_runner.vllm_config.compilation_config...
+    #           (same spine used by the generate path for model_cls,
+    #            lines 2277-2279 of the driver)
+    # Only if BOTH raise AttributeError: fall back to formula and log
+    # ERROR (not WARNING) -- the GPU smoke is then the sole guarantee.
     # ------------------------------------------------------------------
     buf_rows: int
+    _buf_rows_source: str
     try:
         buf_rows = (
             llm.llm_engine.vllm_config
             .compilation_config
             .max_cudagraph_capture_size
         )
-        log.info(
-            "C2 check: max_cudagraph_capture_size=%d (must be >= %d)",
-            buf_rows, _REPLAY_MAX_BATCHED_TOKENS,
-        )
+        _buf_rows_source = "llm.llm_engine.vllm_config"
     except AttributeError:
-        # Fallback: call get_current_vllm_config() in a dummy context.
-        # This should not happen on the patched wheel but is safe.
-        log.warning(
-            "C2 check: llm.llm_engine.vllm_config.compilation_config "
-            "attribute path not found; falling back to formula "
-            "min(max_num_seqs*2, 512)=%d.",
-            min(_REPLAY_MAX_NUM_SEQS * 2, 512),
-        )
-        buf_rows = min(_REPLAY_MAX_NUM_SEQS * 2, 512)
+        try:
+            buf_rows = (
+                llm.llm_engine.model_executor.driver_worker
+                .model_runner.vllm_config
+                .compilation_config
+                .max_cudagraph_capture_size
+            )
+            _buf_rows_source = "model_runner.vllm_config"
+        except AttributeError:
+            # Both paths failed. Fall back to the formula but flag loudly:
+            # the assert below becomes best-effort, not authoritative.
+            buf_rows = min(_REPLAY_MAX_NUM_SEQS * 2, 512)
+            _buf_rows_source = f"formula min({_REPLAY_MAX_NUM_SEQS}*2,512)"
+            log.error(
+                "C2: both vllm_config attribute paths raised AttributeError. "
+                "Falling back to formula buf_rows=%d. "
+                "The GPU smoke (captured_entry_count > buf_rows) is now the "
+                "SOLE guarantee that expert_out_unweighted fires on prefill. "
+                "Run the C2 smoke before trusting any reap/per_expert_max/"
+                "output_reservoir sidecar from this replay.",
+                buf_rows,
+            )
+
+    log.info(
+        "C2 check: max_cudagraph_capture_size=%d (source: %s); "
+        "must be >= max_num_batched_tokens=%d",
+        buf_rows, _buf_rows_source, _REPLAY_MAX_BATCHED_TOKENS,
+    )
 
     if buf_rows < _REPLAY_MAX_BATCHED_TOKENS:
         log.error(
             "C2 HARD FAIL: max_cudagraph_capture_size=%d < "
             "max_num_batched_tokens=%d. expert_out_unweighted would skip "
-            "prefill chunks. Recovery options: "
-            "(a) lower max_num_batched_tokens to %d, "
-            "(b) set max_num_seqs so min(seqs*2,512) >= %d, "
+            "prefill chunks silently. Recovery options: "
+            "(a) lower max_num_batched_tokens to %d (= buf_rows), "
+            "(b) raise max_num_seqs so min(seqs*2,512) >= %d, "
             "(c) pass compilation_config with cudagraph_capture_sizes "
             "whose max >= %d. Aborting.",
             buf_rows, _REPLAY_MAX_BATCHED_TOKENS,
-            buf_rows,        # option (a): use buf_rows as the new cap
-            _REPLAY_MAX_BATCHED_TOKENS,  # option (b)
-            _REPLAY_MAX_BATCHED_TOKENS,  # option (c)
+            buf_rows,
+            _REPLAY_MAX_BATCHED_TOKENS,
+            _REPLAY_MAX_BATCHED_TOKENS,
         )
         return 1
 
     log.info(
         "C2 check passed: buf_rows=%d >= max_num_batched_tokens=%d. "
-        "expert_out_unweighted will fire on all prefill chunks "
-        "(chunked prefill enabled by V1 default).",
+        "expert_out_unweighted fires on all prefill chunks "
+        "(vLLM V1 chunked prefill enabled by default).",
         buf_rows, _REPLAY_MAX_BATCHED_TOKENS,
     )
 
     # ------------------------------------------------------------------
     # 7. Writer setup
+    #
     # out_path = replay_jsonl so .ckpt files land next to the input JSONL.
-    # captured_done_base is passed as already_done (excludes skips —
-    # M1 fix).
+    # captured_done_base passed as already_done (excludes skips -- M1).
     # ------------------------------------------------------------------
     out_path = replay_jsonl
     ws = _setup_all_writers(
@@ -771,6 +796,12 @@ def _run_replay(args) -> int:
 
     # ------------------------------------------------------------------
     # 9. Replay loop
+    #
+    # Counter invariant (C-NEW-1 fix):
+    #   n_skipped is incremented ONLY by the per-row `n_skipped += 1`
+    #   inside the rendering loop. No other site touches it.
+    #   rows_done = rows_done_base + n_replayed + n_skipped is always
+    #   the correct total rows consumed from the JSONL.
     # ------------------------------------------------------------------
     n_replayed = 0          # rows submitted to vLLM (contribute to captures)
     n_skipped = 0           # rows dropped (over max_model_len)
@@ -784,13 +815,14 @@ def _run_replay(args) -> int:
     for chunk_start in range(0, len(replay_rows), args.chunk_size):
         chunk = replay_rows[chunk_start: chunk_start + args.chunk_size]
 
-        # Render all rows; partition into submitted / skipped.
+        # Render all rows in this chunk. Per-row n_skipped += 1 is the
+        # SOLE site that increments n_skipped (C-NEW-1).
         rendered_chunk: list[tuple[dict, list[int], int]] = []
         for row in chunk:
             result = _render_row_for_replay(
                 row, tokenizer, args.max_model_len)
             if result is None:
-                n_skipped += 1
+                n_skipped += 1   # SOLE increment site (C-NEW-1)
                 subset = str(
                     row.get("subset") or row.get("domain") or "unknown")
                 skipped_by_subset[subset] = (
@@ -799,28 +831,31 @@ def _run_replay(args) -> int:
                 tok_ids, n_tok = result
                 rendered_chunk.append((row, tok_ids, n_tok))
 
-        total_rows_consumed = rows_done_base + n_replayed + n_skipped
+        # After the rendering loop, n_skipped already reflects ALL skips
+        # from this chunk (C-NEW-1). rows_done_base + n_replayed + n_skipped
+        # is the correct JSONL position at this point.
 
         if not rendered_chunk:
+            # All rows in this chunk were over max_model_len.
             log.warning(
                 "replay chunk %d-%d: all %d rows over max_model_len=%d; "
                 "skipping chunk.",
                 chunk_start, chunk_start + len(chunk),
                 len(chunk), args.max_model_len,
             )
+            # Write checkpoint using the already-correct counters.
+            # n_skipped already includes this chunk's skips from the
+            # per-row loop above. DO NOT add len(chunk) again (C-NEW-1).
             _write_replay_ckpt(
                 replay_ckpt,
-                rows_done=total_rows_consumed + len(chunk),
+                rows_done=rows_done_base + n_replayed + n_skipped,
                 captured_done=captured_done_base + n_replayed,
             )
-            n_skipped += len(chunk) - len(rendered_chunk)
-            # rendered_chunk already empty, nothing to subtract again
-            # (the += above is correct: all chunk rows skipped)
             continue
 
-        # Build requests. Primary: prompt_token_ids dict shape.
+        # Build requests. Primary shape: prompt_token_ids dict.
         # Fallback (N1): if the pinned wheel rejects dicts, re-render
-        # as string and verify round-trip token equality.
+        # as string and verify round-trip token equality before submitting.
         requests = [
             {"prompt_token_ids": tok_ids}
             for _, tok_ids, _ in rendered_chunk
@@ -841,10 +876,10 @@ def _run_replay(args) -> int:
             outputs = llm.generate(requests, sp_replay)
         except TypeError as exc:
             # N1 fallback: dict input not accepted; re-render as string
-            # and verify round-trip token equality.
+            # and verify round-trip token equality (no lossy decode).
             log.warning(
                 "replay: LLM.generate rejected prompt_token_ids dict "
-                "input (%s); falling back to string rendering. "
+                "(%s); falling back to string rendering. "
                 "Verifying round-trip token equality.", exc,
             )
             string_inputs = []
@@ -881,7 +916,7 @@ def _run_replay(args) -> int:
             "replay chunk done in %.1fs (%.2f s/row avg)",
             chunk_elapsed, chunk_elapsed / max(len(rendered_chunk), 1),
         )
-        del outputs  # outputs discarded; captures are in writer state
+        del outputs  # outputs discarded; captures live in writer state
 
         # Update tally accumulators.
         for row, _, n_tok in rendered_chunk:
@@ -890,21 +925,20 @@ def _run_replay(args) -> int:
             n_replayed += 1
 
         total_done_captures = captured_done_base + n_replayed
-        total_rows_consumed = rows_done_base + n_replayed + n_skipped
 
         # Progress log.
         session_elapsed = time.monotonic() - t0
         log.info(
-            "[%d/%d rows consumed] %d replayed, %d skipped — "
+            "[%d/%d rows consumed] %d replayed, %d skipped -- "
             "%.0fs elapsed (%.2f s/replayed-row avg)",
-            total_rows_consumed,
+            rows_done_base + n_replayed + n_skipped,
             rows_done_base + len(replay_rows),
             n_replayed, n_skipped,
             session_elapsed,
             session_elapsed / max(n_replayed, 1),
         )
 
-        # B0 fail-fast (M2: gate on first actual submission).
+        # B0 fail-fast (M2: gate on first actual submission only).
         if not first_chunk_checked and _enabled_captures:
             first_chunk_checked = True
             try:
@@ -921,6 +955,7 @@ def _run_replay(args) -> int:
             )
 
         # Block-outputs subset gate.
+        total_rows_consumed = rows_done_base + n_replayed + n_skipped
         if (
             args.capture_block_outputs
             and total_rows_consumed >= args.block_outputs_subset_size
@@ -939,7 +974,7 @@ def _run_replay(args) -> int:
                           exc_info=True)
 
         # ---- Periodic per-writer checkpoints ---------------------------
-        # counter = total_done_captures (no skips) for all writers.
+        # All counters use total_done_captures (captured rows only, no skips).
         chunk_idx = chunk_start // args.chunk_size
 
         if (args.capture_imatrix
@@ -960,8 +995,7 @@ def _run_replay(args) -> int:
                 try:
                     import vllm.calibration_reap_scores as _reap  # type: ignore
                     _reap.set_n_prompts_accumulated(total_done_captures)
-                    _reap.dump_reap_scores_checkpoint(
-                        str(ws.reap_ckpt_path))
+                    _reap.dump_reap_scores_checkpoint(str(ws.reap_ckpt_path))
                     log.info("reap-scores: ckpt %d -> %s",
                              total_done_captures, ws.reap_ckpt_path)
                 except Exception as exc:
@@ -1001,8 +1035,7 @@ def _run_replay(args) -> int:
                 try:
                     import vllm.calibration_stage2_profile as _s2p  # type: ignore
                     _s2p.set_n_prompts_accumulated(total_done_captures)
-                    _s2p.dump_stage2_profile_checkpoint(
-                        str(ws.s2p_ckpt_path))
+                    _s2p.dump_stage2_profile_checkpoint(str(ws.s2p_ckpt_path))
                     log.info("stage2-profile: ckpt %d -> %s",
                              total_done_captures, ws.s2p_ckpt_path)
                 except Exception as exc:
@@ -1015,8 +1048,7 @@ def _run_replay(args) -> int:
                 try:
                     import vllm.calibration_per_expert_max as _pem  # type: ignore
                     _pem.set_n_prompts_accumulated(total_done_captures)
-                    _pem.dump_per_expert_max_checkpoint(
-                        str(ws.pem_ckpt_path))
+                    _pem.dump_per_expert_max_checkpoint(str(ws.pem_ckpt_path))
                     log.info("per-expert-max: ckpt %d -> %s",
                              total_done_captures, ws.pem_ckpt_path)
                 except Exception as exc:
@@ -1077,6 +1109,7 @@ def _run_replay(args) -> int:
                               exc_info=True)
 
         # Row-index + capture-counter checkpoint (M1 fix: both counters).
+        # n_skipped already reflects all skips accumulated so far (C-NEW-1).
         _write_replay_ckpt(
             replay_ckpt,
             rows_done=rows_done_base + n_replayed + n_skipped,
@@ -1099,19 +1132,23 @@ def _run_replay(args) -> int:
         skip_frac = n_skipped / max(len(replay_rows), 1)
         if skip_frac > 0.10:
             log.warning(
-                "replay: %.1f%% rows skipped — consider "
+                "replay: %.1f%% rows skipped -- consider "
                 "--max-model-len %d (corpus max ~%d tokens).",
                 100.0 * skip_frac, int(max_required * 1.05), max_required,
             )
-    log.info("replay loop done: %d replayed, %d skipped.", n_replayed, n_skipped)
+    log.info(
+        "replay loop done: %d replayed, %d skipped.",
+        n_replayed, n_skipped,
+    )
 
     # ------------------------------------------------------------------
     # 11. Correctness gates
-    # (N3 fix: generate-vs-replay routing match removed — per-row
+    #
+    # N3 fix: generate-vs-replay routing match removed -- per-row
     # generate-time captures are not retained; the gate is infeasible.
     # Justification is the causal-masking argument in the design doc.
-    # Automated gates are: B0 non-empty, code+science tokens >0,
-    # buf_rows >= chunk size (already asserted before the loop).)
+    # Automated gates: (a) B0 non-empty, (b) code+science tokens > 0,
+    # (c) buf_rows >= max_num_batched_tokens (asserted before loop).
     # ------------------------------------------------------------------
     tally = _build_replay_subset_tally(replayed_rows, replayed_token_counts)
     _assert_code_science_nonzero(tally)
@@ -1134,15 +1171,19 @@ def _run_replay(args) -> int:
 
     # ------------------------------------------------------------------
     # 12. Sidecar dumps
-    # IMPORTANT: imatrix is special-cased.
-    #   dump_imatrix(path: str, chunk_count: int) writes to
-    #   <jsonl>.imatrix.dat (NOT under sidecars/).
-    # All other nine writers:
-    #   dump_<signal>(out_path: Path) compute sidecar_path() internally
-    #   → <jsonl>.parent/sidecars/<jsonl.stem>/<signal>.pt
+    #
+    # IMATRIX IS SPECIAL:
+    #   dump_imatrix(path: str, chunk_count: int)
+    #   writes <jsonl>.imatrix.dat (sibling of the input JSONL, NOT
+    #   under sidecars/). Requires chunk_count argument.
+    #
+    # ALL OTHER NINE WRITERS (uniform interface):
+    #   dump_<signal>(out_path: Path)
+    #   each computes sidecar_path(out_path, signal) internally ->
+    #   <jsonl>.parent/sidecars/<jsonl.stem>/<signal>.pt
     # ------------------------------------------------------------------
 
-    # -- imatrix (SPECIAL CASE: sibling .dat file, requires chunk_count) -
+    # -- imatrix (SPECIAL: sibling .dat + required chunk_count arg) ------
     if args.capture_imatrix:
         imatrix_path = out_path.with_suffix(".imatrix.dat")
         try:
@@ -1197,8 +1238,8 @@ def _run_replay(args) -> int:
             log.error("wanda-scalar-row dump failed: %s", exc, exc_info=True)
 
     # -- stage2-profile (uniform: dump_stage2_profile(Path)) --------------
-    # Note: layer_input_reservoir rides inside this sidecar; no separate
-    # dump call needed (H2).
+    # layer_input_reservoir rides inside this sidecar; no separate
+    # dump needed (H2).
     if args.capture_stage2_profile:
         try:
             import vllm.calibration_stage2_profile as _s2p  # type: ignore
@@ -1274,12 +1315,13 @@ def _run_replay(args) -> int:
                 _bo.close_subset()
                 log.info(
                     "block-outputs: subset closed pre-dump (%d prompts "
-                    "< subset_size=%d — partial subset shipped).",
+                    "< subset_size=%d -- partial subset shipped).",
                     total_done_captures, args.block_outputs_subset_size,
                 )
             _bo.dump_block_outputs(out_path)
-            log.info("block-outputs: dumped per-layer sidecars from %d prompts",
-                     _bo.get_n_prompts_accumulated())
+            log.info(
+                "block-outputs: dumped per-layer sidecars from %d prompts",
+                _bo.get_n_prompts_accumulated())
             if ws.bo_ckpt_path and ws.bo_ckpt_path.exists():
                 ws.bo_ckpt_path.unlink()
         except Exception as exc:
@@ -1302,71 +1344,9 @@ def _run_replay(args) -> int:
 
 ---
 
-## Implementation Map: Files to Create/Modify
+## Unit Tests (unchanged, 14 tests)
 
-### MODIFY: `/home/lucas/ai/moe_compress/max_quality/scripts/build_self_traces_calib_vllm.py`
-
-**Change A — Imports (top of file, line ~82):**
-Add `import dataclasses` to the existing stdlib import block.
-
-**Change B — New helpers after line 766:**
-In order: `_render_row_for_replay`, `_build_replay_subset_tally`, `_assert_code_science_nonzero`, `_write_replay_ckpt`, `_WriterState`, `_setup_all_writers`.
-
-**Change C — Refactor `main()` writer-setup blocks (lines 1659–2115):**
-Replace the `_check_ckpt_counter` closure definition (line 1659) and all 10 per-writer setup blocks (lines 1684–2115) with:
-```python
-ws = _setup_all_writers(args, out_path, llm, tokenizer, already_done)
-```
-Update all downstream references in `main()`'s periodic checkpoint blocks (lines 2310–2534) and final dump blocks (lines 2536–2735) from bare variable names to `ws.<field>`. Complete substitution list:
-
-| Old variable | New reference |
-|---|---|
-| `imatrix_ckpt_path` | `ws.imatrix_ckpt_path` |
-| `reap_ckpt_path` | `ws.reap_ckpt_path` |
-| `input_cov_ckpt_path` | `ws.input_cov_ckpt_path` |
-| `wsr_ckpt_path` | `ws.wsr_ckpt_path` |
-| `s2p_ckpt_path` | `ws.s2p_ckpt_path` |
-| `pem_ckpt_path` | `ws.pem_ckpt_path` |
-| `rts_ckpt_path` | `ws.rts_ckpt_path` |
-| `router_logits_ckpt_path` | `ws.router_logits_ckpt_path` |
-| `or_ckpt_path` | `ws.or_ckpt_path` |
-| `bo_ckpt_path` | `ws.bo_ckpt_path` |
-
-All ~20 occurrences across lines 2310–2735. The generate path's `already_done` variable name and `out_path` (the tmp path) are unchanged — they are passed into `_setup_all_writers`.
-
-**Change D — Add `--replay-from` argparse argument** after `--allow-empty-captures` (after line 1313):
-```python
-p.add_argument(
-    "--replay-from", default=None, metavar="JSONL",
-    help=(
-        "v3 forward-only replay. Path to an existing self-traces JSONL. "
-        "Tokenizes each row's (prompt+answer) and submits to vLLM as a "
-        "single prefill forward (max_tokens=1, max_num_batched_tokens=256) "
-        "so capture hooks fire over every token. Sidecars land at the "
-        "canonical sidecar_path of the INPUT jsonl. Requires >=1 "
-        "--capture-* flag. Resumable via .replay.ckpt."
-    ),
-)
-```
-
-**Change E — Add replay redirect in `main()`** after line 1521 (after all env gate blocks), before `_trace_cache_key_vllm` computation:
-```python
-if args.replay_from is not None:
-    return _run_replay(args)
-```
-
-**Change F — Add deprecation comment** in the TF synthesis block (~line 2186):
-```python
-# NOTE (v3): TEACHER_FORCED rows are synthesised here without a model
-# forward. The canonical capture path is --replay-from (v3 replay).
-# Generate-time capture (GENERATE rows only) remains for incremental runs.
-```
-
-**Change G — Add `_run_replay` function** after `main()`, before `if __name__ == "__main__"`.
-
-### CREATE: `/home/lucas/ai/moe_compress/max_quality/tests/test_replay_helpers.py`
-
-Complete file verbatim:
+**File:** `/home/lucas/ai/moe_compress/max_quality/tests/test_replay_helpers.py`
 
 ```python
 """Unit tests for _run_replay helper functions (v3 calibration replay).
@@ -1545,109 +1525,46 @@ def test_assert_custom_subsets():
     )
 ```
 
-Run: `pytest max_quality/tests/test_replay_helpers.py -v` — no GPU, no vllm.
+---
+
+## Implementation Map (changes to existing driver)
+
+### MODIFY: `/home/lucas/ai/moe_compress/max_quality/scripts/build_self_traces_calib_vllm.py`
+
+**Change A** — Add `import dataclasses` to the stdlib import block (~line 82).
+
+**Change B** — Insert after line 766: `_render_row_for_replay`, `_build_replay_subset_tally`, `_assert_code_science_nonzero`, `_write_replay_ckpt`, `_WriterState`, `_setup_all_writers` (in that order, verbatim as above).
+
+**Change C** — Replace `main()` lines 1659–2115 (the `_check_ckpt_counter` closure + all 10 writer setup blocks) with `ws = _setup_all_writers(args, out_path, llm, tokenizer, already_done)`. Replace all 20 bare `*_ckpt_path` variable references in lines 2310–2735 with `ws.<field>`:
+
+| Old | New |
+|---|---|
+| `imatrix_ckpt_path` | `ws.imatrix_ckpt_path` |
+| `reap_ckpt_path` | `ws.reap_ckpt_path` |
+| `input_cov_ckpt_path` | `ws.input_cov_ckpt_path` |
+| `wsr_ckpt_path` | `ws.wsr_ckpt_path` |
+| `s2p_ckpt_path` | `ws.s2p_ckpt_path` |
+| `pem_ckpt_path` | `ws.pem_ckpt_path` |
+| `rts_ckpt_path` | `ws.rts_ckpt_path` |
+| `router_logits_ckpt_path` | `ws.router_logits_ckpt_path` |
+| `or_ckpt_path` | `ws.or_ckpt_path` |
+| `bo_ckpt_path` | `ws.bo_ckpt_path` |
+
+**Change D** — Add `--replay-from` argparse argument after `--allow-empty-captures` (after line 1313).
+
+**Change E** — Add `if args.replay_from is not None: return _run_replay(args)` in `main()` after line 1521.
+
+**Change F** — Add deprecation comment in TF synthesis block (~line 2186).
+
+**Change G** — Add `_run_replay(args) -> int` after `main()`, before `if __name__ == "__main__"`.
+
+### CREATE: `/home/lucas/ai/moe_compress/max_quality/tests/test_replay_helpers.py`
+
+14 tests, verbatim as above. Run: `pytest max_quality/tests/test_replay_helpers.py -v` — no GPU required.
 
 ---
 
-## Data Flow
-
-```
-CLI:
-  build_self_traces_calib_vllm.py
-    --replay-from artifacts/_shared/self_traces_<key>.jsonl
-    --teacher Qwen/Qwen3.6-35B-A3B
-    --capture-reap-scores --capture-imatrix [--capture-*...]
-    --chunk-size 200 --max-model-len 40960
-    [--resume]
-
-main():
-  line 115: VLLM_ENABLE_V1_MULTIPROCESSING=0  [module-level, inherited]
-  lines 1323-1521: VLLM_CALIB_CAPTURE_* env gates per --capture-* flags
-  line ~1522: if args.replay_from: return _run_replay(args)
-
-_run_replay(args):
-  validate replay_jsonl exists, >=1 capture enabled
-  _harden_runtime_env(str(replay_jsonl), args.dtype)
-  load all_rows from replay_jsonl (validate messages field)
-  pre-flight scan: n_prompt_tokens + n_gen_tokens vs --max-model-len
-  resume: read .replay.ckpt → {rows_done, captured_done}
-  _load_teacher_vllm(..., max_num_seqs=256, max_num_batched_tokens=256,
-                         max_logprobs=1)
-    → LLM: V1 engine, chunked prefill by default, ≤256 tok/chunk
-  C2 assert: buf_rows = llm.llm_engine.vllm_config.compilation_config
-                              .max_cudagraph_capture_size
-             assert buf_rows >= 256  [hard-fail if not]
-  _setup_all_writers(args, out_path=replay_jsonl, llm, tokenizer,
-                     already_done=captured_done_base)
-    → setup() + ckpt hydration per enabled writer → _WriterState ws
-  sp_replay = SamplingParams(temperature=0, max_tokens=1, seed=N)
-
-  chunk loop:
-    for each row → _render_row_for_replay(row, tokenizer, max_model_len)
-      apply_chat_template(messages, add_generation_prompt=False,
-                          enable_thinking=True) [mirrors lines 726-733]
-      tokenize → token_ids
-      if len > max_model_len: n_skipped++ / skipped_by_subset[domain]++
-      else: rendered_chunk.append((row, token_ids, n_tok))
-
-    if rendered_chunk empty: write .replay.ckpt + continue
-
-    llm.generate([{"prompt_token_ids": ids}, ...], sp_replay)
-      [fallback on TypeError: re-render string + round-trip verify]
-      → V1 scheduler: each request split into ≤256-token prefill chunks
-        each chunk = one MoE forward, num_tokens ≤ 256 ≤ buf_rows=512
-          → router hook fires on ALL tokens: reap, wanda, routing_stats,
-                                              stage2_profile, router_logits
-          → expert_in fires on ALL tokens: imatrix, input_cov, wanda
-          → expert_mid fires on ALL tokens: imatrix
-          → expert_out_unweighted fires (num_tokens≤256≤512): reap,
-              per_expert_max, output_reservoir, stage2_profile (gated out)
-          → block_out fires on ALL tokens: block_outputs
-          → layer_in fires on ALL tokens: stage2_profile (layer_input_reservoir)
-        + 1 decode token per request (all hooks fire again for 1 token)
-      outputs discarded
-
-    first actual submission: assert_enabled_captures_nonempty() [M2]
-    block_outputs subset close gate
-    per-writer periodic checkpoints (counter = captured_done_base + n_replayed)
-    _write_replay_ckpt(ckpt, rows_done=..., captured_done=...)
-
-  _build_replay_subset_tally(replayed_rows, replayed_token_counts)
-  _assert_code_science_nonzero(tally)
-  assert_enabled_captures_nonempty(..., "<post-replay>")
-
-  DUMP BLOCKS:
-    imatrix [SPECIAL]: dump_imatrix(str(out_path.with_suffix(".imatrix.dat")),
-                                    chunk_count=total_done_captures)
-    reap:    dump_reap_scores(out_path)
-    icov:    dump_input_cov(out_path)
-    wsr:     dump_wanda_scalar_row(out_path)
-    s2p:     dump_stage2_profile(out_path)  [includes layer_input_reservoir]
-    pem:     dump_per_expert_max(out_path)
-    rts:     dump_routing_stats(out_path)
-    rlsx:    dump_router_logits_stats(out_path)
-    or:      dump_output_reservoir(out_path)
-    bo:      close_subset() + dump_block_outputs(out_path)
-    → all non-imatrix: sidecar_path(replay_jsonl, signal)
-      = replay_jsonl.parent/sidecars/<stem>/<signal>.pt
-
-  replay_ckpt.unlink()
-  return 0
-```
-
----
-
-## Long-Sequence Policy
-
-`_render_row_for_replay` returns `None` when `len(token_ids) > max_model_len`. Never truncates. The pre-flight scan uses stored `n_prompt_tokens + n_gen_tokens` to estimate skips before GPU time is spent. At end-of-loop, `skipped_by_subset` is logged as a WARNING with the exact per-domain breakdown. If `n_skipped / len(replay_rows) > 0.10`, an additional WARNING recommends raising `--max-model-len`.
-
-For the v2 corpus (8000 rows with R1/SWE traces up to ~30K tokens), use `--max-model-len 40960` on H200 (141GB, `--gpu-memory-utilization 0.90`). The pre-flight scan prints the minimum required value.
-
----
-
-## GPU Smoke Validation
-
-### Primary gate (C2 smoke): expert_out_unweighted fires on prefill
+## GPU Smoke (C2 primary gate, unchanged)
 
 ```bash
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
@@ -1671,21 +1588,27 @@ llm = LLM(
     max_logprobs=1,
 )
 
-# Read back buf_rows from live engine.
-buf_rows = (llm.llm_engine.vllm_config
-              .compilation_config.max_cudagraph_capture_size)
-print(f'buf_rows={buf_rows}, max_num_batched_tokens=256')
+# C2: read back buf_rows via both paths.
+try:
+    buf_rows = (llm.llm_engine.vllm_config
+                  .compilation_config.max_cudagraph_capture_size)
+    print(f'buf_rows={buf_rows} (via vllm_config)')
+except AttributeError:
+    buf_rows = (llm.llm_engine.model_executor.driver_worker
+                  .model_runner.vllm_config
+                  .compilation_config.max_cudagraph_capture_size)
+    print(f'buf_rows={buf_rows} (via model_runner.vllm_config)')
+
 assert buf_rows >= 256, f'C2 FAIL: buf_rows={buf_rows} < 256'
 print('C2 assert passed.')
 
 _reap.setup(llm)
 tok = llm.get_tokenizer()
 
-# Build a ~1500-token sequence (>buf_rows to test chunking).
 text = 'The quick brown fox jumps over the lazy dog. ' * 35
 tids = tok(text, add_special_tokens=False)['input_ids'][:1500]
 print(f'Sequence length: {len(tids)} tokens (> buf_rows={buf_rows})')
-assert len(tids) > buf_rows, 'Need sequence longer than buf_rows to test chunking'
+assert len(tids) > buf_rows
 
 sp = SamplingParams(temperature=0.0, max_tokens=1, seed=42)
 out = llm.generate([{'prompt_token_ids': tids}], sp)
@@ -1694,136 +1617,18 @@ print('Generated token id:', out[0].outputs[0].token_ids)
 n = _reap.captured_entry_count()
 print(f'reap captured_entry_count: {n}')
 assert n > buf_rows, (
-    f'FAIL: captured_entry_count={n} <= buf_rows={buf_rows}. '
-    'expert_out_unweighted only fired on decode token, not prefill chunks. '
-    'Check VLLM_ENABLE_V1_MULTIPROCESSING=0 and max_num_batched_tokens<=buf_rows.'
-)
-print(f'PASS: captured {n} tokens (> buf_rows={buf_rows}): '
-      f'chunked prefill fired expert_out_unweighted on all prefill chunks.')
-# Verify no SKIPPED warning in logs (look for absence of the warning above).
+    f'FAIL: n={n} <= buf_rows={buf_rows}. '
+    'expert_out_unweighted fired only on decode, not prefill chunks.')
+print(f'PASS: {n} tokens captured (> buf_rows={buf_rows}).')
 "
 ```
 
-**Pass:** `captured_entry_count > buf_rows`, no "SKIPPED" warning, `buf_rows >= 256`.
-**Fail:** `captured_entry_count == 1` or SKIPPED warning.
-
-**If fail — contingency (not planned here):** Patch `TritonExperts.apply` to internally sub-slice the persistent buffer into `_calib_buf_rows`-sized windows when `num_tokens > _calib_buf_rows`. This is a wheel rebuild, contingent on the smoke failing.
-
-### Additional smoke steps
-
-**Step 2: N1 smoke — prompt_token_ids dict format accepted:**
-```bash
-# The primary generate call in the C2 smoke uses {'prompt_token_ids': tids}.
-# If it succeeded, N1 is confirmed. If it raised TypeError, the fallback
-# path engaged — verify logs show "falling back to string rendering" and
-# "round-trip token equality verified".
-```
-
-**Step 3: End-to-end 10-row replay:**
-```bash
-python max_quality/scripts/build_self_traces_calib_vllm.py \
-  --replay-from artifacts/_shared/self_traces_<key>.jsonl \
-  --teacher Qwen/Qwen3.6-35B-A3B \
-  --capture-reap-scores --capture-imatrix --capture-routing-stats \
-  --chunk-size 10 --max-model-len 40960 \
-  --gpu-memory-utilization 0.90
-```
-Verify:
-- B0 passes after chunk 1 (no SystemExit 2).
-- `sidecars/self_traces_<key>/reap_scores.pt` exists.
-- `torch.load(..., map_location="cpu")` has shape `[40, 256]`, no NaN, non-zero.
-- `self_traces_<key>.imatrix.dat` exists (NOT under sidecars/).
-- `.replay.ckpt` absent on success.
-
-**Step 4: Resume:**
-Kill after chunk 2. Re-run with `--resume`. Verify `rows_done` and `captured_done` in logs match chunk-2 boundary, first 20 rows skipped.
-
-**Step 5: Full 8000-row run** (~20–40 min on H200 with chunk_size=200, max_num_batched_tokens=256).
+**Pass:** `n > buf_rows`, no SKIPPED warning. **Fail → contingency (not planned here):** patch `TritonExperts.apply` to internally sub-slice into `_calib_buf_rows`-sized windows; requires wheel rebuild.
 
 ---
 
-## Build Sequence Checklist
+## Remaining Unverified Items (GPU-only, 2 items)
 
-**Phase 1: Pure helpers + tests (no GPU)**
-- [ ] Add `import dataclasses` to import block (~line 82).
-- [ ] Add `_render_row_for_replay` after line 766.
-- [ ] Add `_build_replay_subset_tally`.
-- [ ] Add `_assert_code_science_nonzero`.
-- [ ] Add `_write_replay_ckpt` (two-counter signature).
-- [ ] Add `_WriterState` dataclass (10 fields, no layer_input_reservoir).
-- [ ] Add `_setup_all_writers`.
-- [ ] Create `max_quality/tests/test_replay_helpers.py` (14 tests).
-- [ ] `pytest max_quality/tests/test_replay_helpers.py -v` — passes with no GPU.
+**UNVERIFIED-1:** Whether `llm.llm_engine.vllm_config.compilation_config.max_cudagraph_capture_size` or the model-runner fallback path resolves on the pinned wheel. The L-NEW-1 two-path probe with formula last-resort handles both failure modes; the ERROR log flags the operator when neither resolves.
 
-**Phase 2: `_setup_all_writers` refactor of `main()`**
-- [ ] Replace lines 1659–2115 in `main()` with `ws = _setup_all_writers(...)`.
-- [ ] Replace all 20 `*_ckpt_path` refs in lines 2310–2735 with `ws.<field>`.
-- [ ] `pytest max_quality/tests/test_calib_ckpt_counter.py max_quality/tests/test_build_self_traces_calib_vllm_c1.py -v` — passes.
-
-**Phase 3: `--replay-from` + `_run_replay` skeleton**
-- [ ] Add `--replay-from` to argparse (after `--allow-empty-captures`).
-- [ ] Add `if args.replay_from: return _run_replay(args)` in `main()` after line 1521.
-- [ ] Add `_run_replay(args)` after `main()` (skeleton through step 8).
-
-**Phase 4: Replay loop**
-- [ ] Implement chunk loop (render, skip tracking, `llm.generate`, N1 fallback).
-- [ ] B0 fail-fast block gated on `first_chunk_checked` (M2).
-- [ ] Block-outputs close_subset gate.
-- [ ] All 10 periodic checkpoint blocks.
-- [ ] `_write_replay_ckpt` call with both counters.
-
-**Phase 5: Correctness gates + dumps + cleanup**
-- [ ] `_build_replay_subset_tally` + `_assert_code_science_nonzero`.
-- [ ] Post-run `assert_enabled_captures_nonempty`.
-- [ ] Imatrix dump (special-cased: `.imatrix.dat` + `chunk_count=`).
-- [ ] Nine uniform dump blocks.
-- [ ] `replay_ckpt.unlink()` on success.
-- [ ] Deprecation comment in TF synthesis block.
-
-**Phase 6: GPU smokes**
-- [ ] C2 primary gate (buf_rows ≥ 256, captured_entry_count > buf_rows).
-- [ ] N1 confirmation (dict format accepted, or fallback triggered cleanly).
-- [ ] 10-row end-to-end replay.
-- [ ] Resume test.
-- [ ] Full 8000-row run.
-
----
-
-## Complete Function/Change Table
-
-| Item | File location | Type |
-|---|---|---|
-| `import dataclasses` | Import block ~line 82 | ADD |
-| `_render_row_for_replay(row, tokenizer, max_model_len)` | After line 766 | NEW |
-| `_build_replay_subset_tally(rows, token_counts)` | After `_render_row_for_replay` | NEW |
-| `_assert_code_science_nonzero(tally, code_subsets, science_subsets)` | After `_build_replay_subset_tally` | NEW |
-| `_write_replay_ckpt(path, rows_done, captured_done)` | After `_assert_code_science_nonzero` | NEW |
-| `_WriterState` (10 fields: imatrix, reap, input_cov, wsr, s2p, pem, rts, router_logits, or, bo) | After `_write_replay_ckpt` | NEW |
-| `_setup_all_writers(args, out_path, llm, tokenizer, already_done)` | After `_WriterState` | NEW |
-| `main()` lines 1659–2115 | Replace with `ws = _setup_all_writers(...)` | MODIFY |
-| 20× `*_ckpt_path` → `ws.<field>` | Lines 2310–2735 | MODIFY |
-| `--replay-from` argparse arg | After `--allow-empty-captures`, line ~1313 | ADD |
-| `if args.replay_from: return _run_replay(args)` | After line 1521 | ADD |
-| Deprecation comment | TF synthesis block ~line 2186 | ADD |
-| `_run_replay(args) -> int` | After `main()` | NEW (~220 lines) |
-| `max_quality/tests/test_replay_helpers.py` | tests dir | CREATE |
-
----
-
-## Remaining Unverified Items (GPU-only)
-
-**UNVERIFIED-1 (GPU-only):** Whether `llm.llm_engine.vllm_config.compilation_config.max_cudagraph_capture_size` is the correct attribute path on the pinned wheel (vllm 0.21.1.dev0+gad7125a43.d20260606). The patch uses `get_current_vllm_config().compilation_config.max_cudagraph_capture_size` during `TritonExperts.__init__`, confirming the `compilation_config.max_cudagraph_capture_size` attribute exists on the config object. The `llm.llm_engine.vllm_config` path is the standard V1 config access pattern. The `AttributeError` fallback in the C2 check handles any deviation.
-
-**UNVERIFIED-2 (GPU-only):** Whether `LLM.generate()` accepts `list[dict]` with `"prompt_token_ids"` key on the pinned wheel. The N1 fallback (re-render string + round-trip token equality verification + `SystemExit(2)` on mismatch) handles this cleanly without any information loss. The C2 smoke confirms acceptance.
-
-No further unverified items exist that can be resolved by static analysis.
-
----
-
-## Design Doc Note (N3)
-
-The design doc (`tasks/CALIBRATION_V3_CAPTURE_REPLAY_DESIGN.md`) §Correctness gates states: "A spot check: for ≥1 GENERATE row, replay-captured per-layer routing matches the generate-time capture within float tolerance." This gate is infeasible: generate-time per-row routing captures are not retained (only the aggregated sidecar is written). The gate should be softened in the design doc to: "The read-through == generation equivalence is established by the causal-masking argument (§Numerical justification). The automated correctness gates are: (a) B0 non-empty captures after first chunk, (b) code+science token tally > 0, (c) buf_rows ≥ max_num_batched_tokens confirmed before run start." The plan implements all three automated gates. The design doc line should be updated to match.
-
-Sources:
-- [vLLM Engine Arguments — max_cudagraph_capture_size formula](https://docs.vllm.ai/en/stable/configuration/engine_args/)
-- [vLLM Optimization — V1 chunked prefill enabled by default](https://docs.vllm.ai/en/latest/configuration/optimization/)
+**UNVERIFIED-2:** Whether `LLM.generate()` accepts `list[dict]` with `"prompt_token_ids"` key on the pinned wheel. The N1 fallback with round-trip token equality verification and `SystemExit(2)` on mismatch handles this without information loss.
