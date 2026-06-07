@@ -168,9 +168,15 @@ the cap.
   assert code+science > 0 with a sane fraction (~the mix weight).
 - `assert_enabled_captures_nonempty` (existing fail-fast) passes for every
   enabled signal.
-- A spot check: for ≥1 GENERATE row, replay-captured per-layer routing matches
-  the generate-time capture within float tolerance (validates read-through ==
-  generation empirically, not just by argument).
+- **buf_rows ≥ chunk:** before the loop, assert the live
+  `max_cudagraph_capture_size ≥ max_num_batched_tokens` so
+  `expert_out_unweighted` fires on every prefill chunk (the reap go/no-go).
+
+Read-through == generation is established by the causal-masking argument above
+(NOT by an automated per-row match check — generate-time per-row captures are
+not retained, only the aggregated sidecar, so a runtime match gate is
+infeasible). The three automated gates are: (a) non-empty captures, (b)
+code+science token tally > 0, (c) buf_rows ≥ chunk.
 
 ## Scope decisions (locked unless the plan/review surfaces a reason)
 
