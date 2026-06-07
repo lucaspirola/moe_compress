@@ -107,6 +107,50 @@ the plan). Behavior:
 7. **Resumable + checkpointed:** reuse the existing per-chunk `.ckpt`
    accumulator checkpointing so a preemption mid-replay resumes.
 
+### CRITICAL: the `expert_out_unweighted` buffer constraint (and the fix)
+
+Verified against `max_quality/patches/vllm_calibration_hooks.patch` (lines
+1060–1100): the `expert_out_unweighted` hook writes per-token expert outputs
+into a **persistent buffer sized to `_calib_buf_rows` (= max CUDA-graph capture
+size, ~512)** and **SKIPS any forward batch with `num_tokens > _calib_buf_rows`**
+to avoid an out-of-bounds Triton write (one-time WARNING; "decode-batch
+coverage continues normally"). **`reap_scores`, `per_expert_max`,
+`output_reservoir`, and the gated-output half of `stage2_profile` all depend on
+this hook.**
+
+Consequence: a naive single-big-prefill replay (`max_tokens=1` over a 2–20K
+token sequence in one forward) would have `num_tokens` ≫ buffer → the hook
+skips → reap captures only the **1 dummy decode token per row**. That would
+gut the entire fix for REAP. (Corollary, confirmed: in v2 *generation* the
+prompt-prefill was always skipped too — reap saliency has only ever covered the
+generated *answer* (decode) tokens.)
+
+The hooks WITHOUT this limit (fire on any batch size): `router`, `expert_in`,
+`expert_mid`, `block_out`, `layer_in` → imatrix, input_cov, wanda,
+routing_stats, router_logits_stats, block_outputs, layer_input_reservoir are
+fine regardless.
+
+**Resolution (primary): chunked prefill.** Run the replay's `LLM()` with
+`enable_chunked_prefill=True` and `max_num_batched_tokens ≤ _calib_buf_rows`
+(use 256, headroom under the 512 buffer). vLLM then splits every long prefill
+into ≤256-token windows, each a separate forward with the KV-cache of prior
+windows — so **every MoE forward batch is ≤256 tokens ≤ buffer → the hook fires
+on all tokens**, causal context preserved (KV cache), captures aggregate across
+windows. No wheel change; pure replay-side config. The per-token activations
+are identical (chunked prefill is a scheduling change, not a semantic one).
+
+**Resolution (fallback, only if the smoke disproves the primary):** patch the
+hook to **sub-slice** the batch into ≤`_calib_buf_rows` windows and run the
+capture kernel per window instead of skipping — guarantees full capture at any
+batch size and also fixes generate-time prompt capture. Cost: a wheel rebuild +
+patch review. Do NOT take this path unless the chunked-prefill smoke shows the
+MoE `num_tokens` is not bounded by `max_num_batched_tokens`.
+
+**Decision gate:** the GPU smoke MUST confirm, for `--capture-reap-scores` on a
+≥1000-token sequence under chunked prefill (max_num_batched_tokens=256), that
+`expert_out_unweighted` fires (no SKIP warning) and reap captures ≫1 token.
+Until that passes, the replay is NOT trusted for reap.
+
 ### Long-sequence handling
 
 Some canonical R1/SWE traces exceed `--max-model-len`. Plan must choose +
