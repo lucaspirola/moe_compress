@@ -129,6 +129,8 @@ def _row_stable_key(row: dict, line_idx: int) -> "tuple[str, object]":
 def concat_jsonls(
     shard_jsonls: "list[Path]",
     out_jsonl: Path,
+    *,
+    expected_total: "int | None" = None,
 ) -> int:
     """Concatenate N per-shard output JSONLs (generate mode) in shard order.
 
@@ -141,8 +143,25 @@ def concat_jsonls(
       (b) the per-row stable key (``_attempt_idx``/``seed_idx``/line-index)
           forms DISJOINT sets across shards whose UNION is the full set
           (no row in two shards, none dropped, and globally key-unique).
+      (c) GAP guard: when ``expected_total`` is given (the GLOBAL count the
+          ladder was supposed to cover, e.g. C_N), the merged row count MUST
+          equal it. Overlap is caught by (b); a pure GAP (a shuffle-buffer
+          divergence that silently dropped prompts) leaves each shard's slice
+          internally disjoint so (b) still passes — only an absolute count
+          check against the externally-known expected total catches a gap.
+          This is the completeness half of the HIGH shuffle-buffer fix.
+
     Aborts (RuntimeError) on any violation BEFORE writing the output, so a
-    silently-overlapping generate run never produces a corpus.
+    silently-overlapping OR gapped generate run never produces a corpus.
+
+    NOTE: ``expected_total`` is the PROMPT count C_N. Generated corpora can
+    legitimately have fewer ROWS than prompts (e.g. a prompt the teacher
+    failed to complete is dropped). The orchestration therefore passes the
+    SUM OF ACTUALLY-EMITTED ladder slices as the expected total only when it
+    can be derived exactly; when generation may drop rows the caller passes
+    ``None`` and relies on (a)+(b). The gap guard is for the
+    deterministic-completion case (and is exercised by the misalignment
+    regression test).
 
     Returns the total number of rows written.
     """
@@ -196,6 +215,17 @@ def concat_jsonls(
             f"concat_jsonls KEY-UNIQUENESS FAILURE: {total} rows but "
             f"{len(union)} distinct stable keys. Duplicate keys make the "
             f"corpus ambiguous; check for repeated generation."
+        )
+
+    # (c) GAP guard against an externally-known expected global count.
+    if expected_total is not None and total != int(expected_total):
+        raise RuntimeError(
+            f"concat_jsonls COMPLETENESS FAILURE (gap): merged {total} rows "
+            f"but expected {int(expected_total)} (the global ladder total). "
+            f"The shards are internally disjoint, so this is a GAP — prompts "
+            f"were silently dropped. Most likely the N generate processes did "
+            f"NOT share an identical shuffle order: verify every process got "
+            f"the SAME --seed AND --shuffle-buffer."
         )
 
     out_jsonl = Path(out_jsonl)

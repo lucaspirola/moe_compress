@@ -199,6 +199,17 @@ else
         LADDER+=("$(( NUM_PROMPTS * k / N ))")
     done
     echo "  ladder = ${LADDER[*]}"
+
+    # HIGH fix: derive ONE shuffle-buffer from the GLOBAL total and pass the
+    # SAME value to every process so all N share an identical shuffle order
+    # (otherwise the per-process count-derived buffer diverges once a subset
+    # count exceeds ~1000 -> offset slices overlap or gap). Mirror the
+    # driver's clamp [10000, 200000] with the global total as the basis.
+    #   buffer = min(max(10000, 10*NUM_PROMPTS), 200000)
+    GLOBAL_SHUFFLE_BUFFER=$(( 10 * NUM_PROMPTS ))
+    [[ "${GLOBAL_SHUFFLE_BUFFER}" -lt 10000 ]] && GLOBAL_SHUFFLE_BUFFER=10000
+    [[ "${GLOBAL_SHUFFLE_BUFFER}" -gt 200000 ]] && GLOBAL_SHUFFLE_BUFFER=200000
+    echo "  shared shuffle-buffer = ${GLOBAL_SHUFFLE_BUFFER} (same for all ${N} shards)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -246,6 +257,7 @@ for ((k = 0; k < N; k++)); do
                 --num-prompts "${C_HI}" \
                 "${PREV_ARG[@]}" \
                 --seed "${SEED}" \
+                --shuffle-buffer "${GLOBAL_SHUFFLE_BUFFER}" \
                 --teacher "${TEACHER}" \
                 --moe-backend "${MOE_BACKEND}" \
                 --max-model-len "${MAX_MODEL_LEN}" \
@@ -343,13 +355,26 @@ else
     for ((k = 0; k < N; k++)); do
         SHARD_JSONLS+=("${OUT_DIR}/shard_${k}/self_traces.jsonl")
     done
-    "${PY}" - "${JSONL}" "${SHARD_JSONLS[@]}" <<'PYEOF'
+    # GAP guard (completeness): when every prompt is expected to yield exactly
+    # one row (deterministic completion, no teacher drops), set
+    # PARALLEL_CAPTURE_ENFORCE_COMPLETE=1 so concat asserts the merged row
+    # count == NUM_PROMPTS — this catches a pure shuffle-buffer GAP that the
+    # disjointness check alone cannot see. Off by default because generation
+    # can legitimately drop incomplete rows (then only (a)+(b) apply).
+    EXPECTED_TOTAL_ARG="-1"
+    if [[ "${PARALLEL_CAPTURE_ENFORCE_COMPLETE:-0}" == "1" ]]; then
+        EXPECTED_TOTAL_ARG="${NUM_PROMPTS}"
+        echo "  completeness gate ON: expecting ${NUM_PROMPTS} rows"
+    fi
+    "${PY}" - "${JSONL}" "${EXPECTED_TOTAL_ARG}" "${SHARD_JSONLS[@]}" <<'PYEOF'
 import sys
 from pathlib import Path
 from moe_compress.utils.merge_sidecars import concat_jsonls
 out = Path(sys.argv[1])
-shards = [Path(p) for p in sys.argv[2:]]
-n = concat_jsonls(shards, out)
+expected = int(sys.argv[2])
+shards = [Path(p) for p in sys.argv[3:]]
+n = concat_jsonls(shards, out,
+                  expected_total=(expected if expected >= 0 else None))
 print(f"concat_jsonls: {n} rows -> {out}")
 PYEOF
     if [[ -n "${CAPTURES}" ]]; then

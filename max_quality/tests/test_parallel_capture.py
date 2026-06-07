@@ -482,41 +482,126 @@ def test_concat_jsonls_overlap_aborts(tmp_path):
 
 
 # ===========================================================================
-# generate-mode offset slices: disjoint + complete (no GPU, stubbed source).
+# generate-mode offset slices driven through the REAL buffer-dependent shuffle.
 #
-# Mirrors the driver's offset semantics: a per-key deterministic stream where
-# iter(num_prompts=N) yields the first int(N*weight) of each subset, and
-# iter(M, prev=N) yields [int(N*weight), int(M*weight)). With a single subset
-# (weight=1) the count ladder C_0<..<C_N gives slices [C_k, C_{k+1}) that are
-# disjoint and cover [0, C_N). This is the property run_parallel_capture.sh's
-# generate mode relies on.
+# This replaces the earlier tautological list-slice test. It drives a FAITHFUL
+# fake of HF streaming ``shuffle(buffer_size=B)`` whose emit ORDER DEPENDS on B
+# (a reservoir-style buffer shuffle), exactly the dependency that caused the
+# HIGH bug: the driver's buffer = min(max(10000, 10*count), 200000) is
+# count-DEPENDENT, so two processes with different --num-prompts get different
+# orders. The test asserts:
+#   * with a SHARED buffer (the --shuffle-buffer fix), the per-process
+#     [prev_count, count) offset slices are disjoint + complete;
+#   * with the OLD per-process count-derived buffer, the slices MISALIGN
+#     (overlap and/or gap) — i.e. the test FAILS the disjoint+complete
+#     property, proving it would catch a regression of the HIGH fix.
 # ===========================================================================
-def _stub_offset_slice(total_stream, lo, hi):
-    """A deterministic stream sliced to [lo, hi) — models one subset's
-    [prev_count, count) yield with the same shuffle for all N."""
-    return list(total_stream[lo:hi])
+import random as _random
 
 
-def test_generate_offset_slices_disjoint_complete():
-    # Deterministic "shuffle" of 8000 prompt ids; same for every process.
-    total_stream = list(range(8000))
-    n = 4
-    ladder = [8000 * k // n for k in range(n + 1)]
-    assert ladder == [0, 2000, 4000, 6000, 8000]
+def _fake_shuffled_stream(source, buffer_size, seed):
+    """Faithful-ish model of HF ``IterableDataset.shuffle(buffer_size=B)``.
 
+    Reservoir-buffer shuffle: fill a buffer of B items from the source, then
+    repeatedly emit a RANDOM item from the buffer (seeded) and refill from the
+    source. The emit ORDER is a deterministic function of (source, B, seed):
+    same B -> same order; different B -> different order. This is the exact
+    property the real ``ds.shuffle(buffer_size=...)`` has and which the HIGH
+    bug hinges on.
+    """
+    rng = _random.Random(seed)
+    src = iter(source)
+    buf = []
+    try:
+        for _ in range(buffer_size):
+            buf.append(next(src))
+    except StopIteration:
+        pass
+    out = []
+    while buf:
+        j = rng.randrange(len(buf))
+        out.append(buf[j])
+        try:
+            buf[j] = next(src)
+        except StopIteration:
+            buf.pop(j)
+    return out
+
+
+def _driver_offset_slice(source, seed, count, prev_count, *, shuffle_buffer):
+    """Model ONE process: pull a buffer-B shuffle, take the first ``count``
+    emitted, then yield positions [prev_count, count) — exactly the driver's
+    per-subset offset semantics. ``shuffle_buffer`` None => count-derived
+    (the OLD divergent behavior); set => shared (the fix)."""
+    b = (shuffle_buffer if shuffle_buffer is not None
+         else min(max(10_000, 10 * count), 200_000))
+    order = _fake_shuffled_stream(source, b, seed)
+    return order[prev_count:count]
+
+
+def test_generate_offset_slices_disjoint_complete_shared_buffer():
+    # Source MUST exceed the largest per-process buffer so reservoir size
+    # actually affects emit order (a buffer >= source length degenerates to a
+    # full in-memory shuffle, masking buffer differences). Largest old buffer
+    # is 10*total = 45000, so source = 50000 keeps every buffer < source.
+    source = list(range(50_000))
+    seed = 1337
+    n = 3
+    total = 4500  # C_N
+    ladder = [total * k // n for k in range(n + 1)]  # [0,1500,3000,4500]
+
+    # SHARED buffer (the fix): one value for all processes.
+    shared_buf = min(max(10_000, 10 * total), 200_000)
     slices = [
-        _stub_offset_slice(total_stream, ladder[k], ladder[k + 1])
+        _driver_offset_slice(
+            source, seed, ladder[k + 1], ladder[k],
+            shuffle_buffer=shared_buf,
+        )
         for k in range(n)
     ]
-    # Disjoint.
     seen = set()
     for s in slices:
         sset = set(s)
-        assert seen.isdisjoint(sset), "generate slices overlap"
+        assert seen.isdisjoint(sset), "shared-buffer slices overlap"
         seen |= sset
-    # Complete: union == full stream, no dupes.
-    assert sorted(seen) == total_stream
-    assert sum(len(s) for s in slices) == len(total_stream)
+    # Complete: union == the first C_N of the SHARED order, exactly.
+    expected_order = _fake_shuffled_stream(source, shared_buf, seed)[:total]
+    assert seen == set(expected_order)
+    assert sum(len(s) for s in slices) == total
+
+
+def test_generate_offset_slices_misalign_when_buffer_differs():
+    # Same ladder, but each process uses the OLD count-derived buffer
+    # (shuffle_buffer=None) -> per-process buffers differ -> orders diverge
+    # -> slices MUST misalign (overlap OR gap). This is the regression guard:
+    # if someone removes the --shuffle-buffer fix, this asserts the breakage.
+    source = list(range(50_000))
+    seed = 1337
+    n = 3
+    total = 4500
+    ladder = [total * k // n for k in range(n + 1)]
+
+    slices = [
+        _driver_offset_slice(
+            source, seed, ladder[k + 1], ladder[k],
+            shuffle_buffer=None,  # OLD divergent behavior
+        )
+        for k in range(n)
+    ]
+    # Detect misalignment: either an overlap (a key in two slices) OR a gap
+    # (union != the first C_N of ANY single consistent order, AND count<total
+    # of distinct). With divergent orders the slices are NOT a clean partition.
+    multiset_len = sum(len(s) for s in slices)
+    union = set().union(*[set(s) for s in slices])
+    overlap = multiset_len != len(union)
+    # A clean partition of C_N distinct items would have len(union)==total with
+    # no overlap; divergent buffers break at least one of these.
+    clean_partition = (not overlap) and (len(union) == total)
+    assert not clean_partition, (
+        "count-derived (divergent) buffers unexpectedly produced a clean "
+        "partition — the buffer-dependence the HIGH fix guards against did "
+        "not manifest; the test can no longer detect a regression."
+    )
 
 
 def test_generate_ladder_uneven_split():
@@ -527,3 +612,27 @@ def test_generate_ladder_uneven_split():
     sizes = [ladder[k + 1] - ladder[k] for k in range(n)]
     assert sizes == [3, 3, 4]
     assert sum(sizes) == total
+
+
+def test_concat_jsonls_gap_aborts():
+    # A pure GAP: two internally-disjoint shards that together miss a prompt.
+    # Disjointness (b) passes; only the expected_total guard catches it.
+    a = tmp = None
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    a = d / "a.jsonl"; b = d / "b.jsonl"
+    with a.open("w") as f:
+        for i in [0, 1]:
+            f.write(json.dumps({"_attempt_idx": i, "messages": []}) + "\n")
+    with b.open("w") as f:
+        for i in [2, 3]:  # key 4 is the dropped/gapped prompt
+            f.write(json.dumps({"_attempt_idx": i, "messages": []}) + "\n")
+    out = d / "corpus.jsonl"
+    # Without expected_total: passes (disjoint + complete-by-union).
+    n = ms.concat_jsonls([a, b], out)
+    assert n == 4
+    # With expected_total=5 (the ladder expected 5): GAP caught.
+    out.unlink()
+    with pytest.raises(RuntimeError, match="COMPLETENESS FAILURE .gap."):
+        ms.concat_jsonls([a, b], out, expected_total=5)
+    assert not out.exists()

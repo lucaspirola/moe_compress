@@ -1056,9 +1056,35 @@ def _make_subset_seed(base_seed: int, subset: str) -> int:
     return (base_seed + subset_offset) % (2**32)
 
 
+def _resolve_shuffle_buffer(count: int, shuffle_buffer: int | None) -> int:
+    """Resolve the HF ``shuffle(buffer_size=...)`` value.
+
+    Default (``shuffle_buffer is None``): the historical count-derived
+    formula ``min(max(10_000, 10*count), 200_000)``. This is correct for a
+    SINGLE process but is **count-dependent**: two processes pulling
+    different ``count`` (e.g. data-parallel generate shards with different
+    ``--num-prompts``) get different buffer sizes and therefore different
+    shuffle orders — which breaks the offset-slice disjointness the
+    generate-mode orchestration relies on.
+
+    Override (``shuffle_buffer`` set): use it verbatim (still clamped to the
+    [10_000, 200_000] sane range). The generate orchestration computes ONE
+    buffer value from the GLOBAL total and passes the SAME value to all N
+    processes so every process produces an IDENTICAL shuffle order; the
+    per-process ``[prev_count, count)`` offset slices then align exactly.
+
+    INVARIANT (generate-mode data-parallel): all shards MUST share both
+    ``seed`` AND ``shuffle_buffer`` for the slices to be disjoint+complete.
+    """
+    if shuffle_buffer is not None:
+        return min(max(10_000, int(shuffle_buffer)), 200_000)
+    return min(max(10_000, _CIRCUIT_BREAKER_MULTIPLIER * count), 200_000)
+
+
 def _shuffled_stream(
     dataset_name: str, count: int, seed: int,
     *, config: str | None = None, split: str = "train",
+    shuffle_buffer: int | None = None,
 ):
     """Open a streaming HF dataset and return a shuffled iterator + circuit
     limit. Caller iterates and breaks when `count` non-empty rows yielded.
@@ -1069,6 +1095,14 @@ def _shuffled_stream(
     ``split="xml"``. Defaults preserve the v1 behavior (config=None →
     ``load_dataset(name, split="train", streaming=True)``) so all
     existing callsites are unaffected.
+
+    ``shuffle_buffer`` (default ``None``): when set, fixes the HF shuffle
+    buffer_size INDEPENDENTLY of ``count`` so multiple processes pulling
+    different counts share an identical shuffle order — required for the
+    data-parallel generate-mode offset slices to align (see
+    :func:`_resolve_shuffle_buffer`). Unset preserves the historical
+    count-derived behavior, so replay/normal single-process paths are
+    byte-for-byte unchanged.
     """
     from datasets import load_dataset
     try:
@@ -1086,7 +1120,7 @@ def _shuffled_stream(
     circuit_limit = _CIRCUIT_BREAKER_MULTIPLIER * count
     ds = ds.shuffle(
         seed=seed,
-        buffer_size=min(max(10_000, circuit_limit), 200_000),
+        buffer_size=_resolve_shuffle_buffer(count, shuffle_buffer),
     )
     return ds, circuit_limit
 

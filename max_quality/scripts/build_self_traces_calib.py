@@ -132,6 +132,7 @@ log = logging.getLogger("build_self_traces_calib")
 def _iter_prompts_from_qwen3_pretrain_mix(
     num_prompts: int, seed: int,
     prev_num_prompts: int | None = None,
+    shuffle_buffer: int | None = None,
 ) -> Iterator[tuple[str, str]]:
     """Yield ``(prompt, domain)`` pairs drawn from the qwen3-pretrain-mix
     datasets, with per-subset counts that preserve the corpus's intended mix.
@@ -212,7 +213,9 @@ def _iter_prompts_from_qwen3_pretrain_mix(
                  f" [skipping first {prev_count}, yielding {count - prev_count} new]"
                  if prev_count else "")
         try:
-            ds, _ = _shuffled_stream(ds_name, count, s)
+            ds, _ = _shuffled_stream(
+                ds_name, count, s, shuffle_buffer=shuffle_buffer,
+            )
         except Exception as err:  # noqa: BLE001
             log.error("prompts: %s failed (%s) — skipping", subset, err)
             continue
@@ -296,6 +299,7 @@ def _iter_prompts_from_qwen3_pretrain_mix(
 def _iter_prompts_from_qwen3_pretrain_mix_v2(
     num_prompts: int, seed: int,
     prev_num_prompts: int | None = None,
+    shuffle_buffer: int | None = None,
 ) -> Iterator[tuple[str, str, str | None, str]]:
     """Yield 4-tuples ``(prompt, domain, canonical_completion, policy)``
     drawn from the qwen3-pretrain-mix-v2 12-subset hybrid mix.
@@ -399,6 +403,7 @@ def _iter_prompts_from_qwen3_pretrain_mix_v2(
         try:
             ds, _ = _shuffled_stream(
                 ds_name, count, s, config=config, split=split,
+                shuffle_buffer=shuffle_buffer,
             )
         except Exception as err:  # noqa: BLE001
             log.error("prompts-v2: %s failed (%s) — skipping", subset, err)

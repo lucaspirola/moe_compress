@@ -1468,6 +1468,20 @@ def main() -> int:
                         "construction non-overlapping with the earlier run. "
                         "Cache_key incorporates this so the output file is "
                         "distinct from the prev=0 run with the same --num-prompts.")
+    p.add_argument("--shuffle-buffer", type=int, default=0,
+                   help="Fix the HF streaming shuffle buffer_size INDEPENDENTLY "
+                        "of --num-prompts (clamped to [10000, 200000]). Default "
+                        "0 = unset = the historical count-derived formula "
+                        "min(max(10000, 10*per_subset_count), 200000), which is "
+                        "count-DEPENDENT. REQUIRED for data-parallel generate "
+                        "mode: the per-subset shuffle order must be IDENTICAL "
+                        "across all N processes for the --prev-num-prompts "
+                        "offset slices to align. The generate orchestration "
+                        "computes ONE buffer from the GLOBAL total and passes "
+                        "the SAME --shuffle-buffer (and --seed) to every shard. "
+                        "Generate-mode INVARIANT: shards MUST share seed AND "
+                        "shuffle-buffer. Only affects the mix iterators; "
+                        "replay/JSONL paths ignore it.")
     p.add_argument("--capture-imatrix", action="store_true", default=False,
                    help="Capture per-input-channel squared-activation statistics "
                         "for every linear layer reached during calibration and "
@@ -2077,11 +2091,13 @@ def main() -> int:
         prompts_iter = _iter_prompts_from_qwen3_pretrain_mix(
             args.num_prompts, args.seed,
             prev_num_prompts=(args.prev_num_prompts or None),
+            shuffle_buffer=(args.shuffle_buffer or None),
         )
     elif args.prompts == "qwen3-pretrain-mix-v2":
         prompts_iter = _iter_prompts_from_qwen3_pretrain_mix_v2(
             args.num_prompts, args.seed,
             prev_num_prompts=(args.prev_num_prompts or None),
+            shuffle_buffer=(args.shuffle_buffer or None),
         )
     else:
         if args.prev_num_prompts:
