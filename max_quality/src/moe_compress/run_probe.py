@@ -303,8 +303,9 @@ def is_complete(row_dir: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def _pipeline_argv(cfg_path: Path, model_repo: str, row_dir: Path,
-                   resume: int, stop: int) -> list[str]:
-    return [
+                   resume: int, stop: int,
+                   extra: "list[str] | None" = None) -> list[str]:
+    argv = [
         sys.executable, "-m", "moe_compress.run_pipeline",
         "--config", str(cfg_path),
         "--model", model_repo,
@@ -313,18 +314,90 @@ def _pipeline_argv(cfg_path: Path, model_repo: str, row_dir: Path,
         "--resume-from-stage", str(resume),
         "--stop-after-stage", str(stop),
     ]
+    if extra:
+        argv.extend(extra)
+    return argv
+
+
+def _pruned_checkpoint_complete(pruned: Path) -> bool:
+    """A stage2_pruned/ dir is usable only if it has a config + weight shard.
+
+    Guards against a killed prior prune leaving a half-written dir that the
+    resume shortcut would otherwise load as a complete checkpoint (corrupting
+    every arm that branches off it).
+    """
+    return (
+        pruned.is_dir()
+        and (pruned / "config.json").exists()
+        and any(pruned.glob("*.safetensors"))
+    )
+
+
+def run_shared_prune(
+    *, group: str, base_config: dict, shared_dir: Path, probe_root: Path,
+    model_repo: str, num_sequences: int,
+) -> Path:
+    """Run the deterministic Stage-2 prune/merge for a GROUP exactly ONCE.
+
+    The faithful prune (reap) and frequency-weighted merge (ream) are identical
+    across that group's three arms (base/heal25/rkd differ only in Stage-2.5).
+    Running them per-row re-did the same expensive Stage-2 work 3×. Instead we
+    produce one ``_shared_prune/<group>/stage2_pruned/`` via the pipeline's
+    designed split-machine flow (``--skip-stage2p5``: run Stage 2, write
+    ``stage2_pruned/``, return), which each arm then symlinks + resumes from.
+
+    Returns the path to the shared ``stage2_pruned/`` dir. Idempotent.
+    """
+    prune_dir = probe_root / "_shared_prune" / group
+    pruned = prune_dir / "stage2_pruned"
+    if pruned.exists():
+        if _pruned_checkpoint_complete(pruned):
+            log.info("[%s] shared prune already present → %s", group, pruned)
+            return pruned
+        # Partial/corrupt dir from a killed prior run: dir-existence alone is
+        # not enough (resume shortcut would load it as complete → corrupt model
+        # for all 3 arms). Discard and re-prune.
+        log.warning("[%s] shared prune dir is incomplete (no config.json/.safetensors) "
+                    "— discarding %s and re-pruning", group, pruned)
+        shutil.rmtree(pruned)
+
+    prune_dir.mkdir(parents=True, exist_ok=True)
+    # Arm is irrelevant to the Stage-2 prune (arms differ only in Stage-2.5);
+    # use "base" purely to materialise the group's prune_mode + survivor pin.
+    cfg = build_probe_config(base_config, group=group, arm="base",
+                             num_sequences=num_sequences)
+    cfg_path = _write_config(cfg, prune_dir)
+    seed_stage1_artifacts(prune_dir, shared_dir, group=group)
+
+    log.info("[%s] shared prune: Stage-2 once (--skip-stage2p5) → %s", group, prune_dir)
+    rc = subprocess.run(
+        _pipeline_argv(cfg_path, model_repo, prune_dir, resume=2, stop=2,
+                       extra=["--skip-stage2p5"]),
+        check=False,
+    ).returncode
+    if rc != 0:
+        raise RuntimeError(f"[{group}] shared prune returned exit code {rc}")
+    if not _pruned_checkpoint_complete(pruned):
+        raise RuntimeError(
+            f"[{group}] shared prune reported success but {pruned} is missing or "
+            "incomplete (no config.json / .safetensors)"
+        )
+    return pruned
 
 
 def run_one_row(
     *, row_id: str, group: str, arm: str, base_config: dict, shared_dir: Path,
     probe_root: Path, model_repo: str, num_sequences: int,
-    hf_token: str | None = None,
+    pruned_src: Path, hf_token: str | None = None,
 ) -> dict[str, Any]:
     """Drive one probe row to its Stage-6alt artifact + per-row HF upload.
 
-    base arm: ONE subprocess (skip_intermediate, --stop-after-stage 6).
-    heal arms: TWO subprocesses (--stop-after-stage 2, then --resume-from-stage 6).
-    Idempotent: a present stage6alt_eval.json short-circuits.
+    Branches off the GROUP's shared ``stage2_pruned/`` (``pruned_src``): the
+    pruned model is symlinked into the row dir, so the pipeline's resume
+    shortcut skips the (already-done) Stage-2 prune and loads it from disk.
+    base arm: ONE subprocess (resume@2 → skip prune → Stage 6alt).
+    heal arms: TWO subprocesses (resume@2 → skip prune, run Stage 2.5; then
+    resume@6 → Stage 6alt). Idempotent: a present stage6alt_eval.json short-circuits.
     """
     row_dir = probe_root / row_id
     row_dir.mkdir(parents=True, exist_ok=True)
@@ -340,7 +413,15 @@ def run_one_row(
     cfg_path = _write_config(cfg, row_dir)
     seed_stage1_artifacts(row_dir, shared_dir, group=group)
 
-    log.info("[%s] starting (group=%s arm=%s)", row_id, group, arm)
+    # Branch off the shared prune: symlink stage2_pruned/ so the resume shortcut
+    # (run_pipeline.py:145-151) skips the deterministic Stage-2 work. It is
+    # read-only on resume (Stage 2.5 writes a separate stage2p5_final/), so a
+    # symlink is safe and avoids copying the ~46 GB pruned model per row.
+    row_pruned = row_dir / "stage2_pruned"
+    if not row_pruned.exists():
+        os.symlink(Path(pruned_src).resolve(), row_pruned, target_is_directory=True)
+
+    log.info("[%s] starting (group=%s arm=%s) — branched off shared prune", row_id, group, arm)
     if not is_heal_arm(arm):
         # base: single invocation, skip_intermediate → straight to Stage 6alt.
         rc = subprocess.run(
@@ -357,6 +438,15 @@ def run_one_row(
         ).returncode
         if rc1 != 0:
             raise RuntimeError(f"[{row_id}] Stage 2/2.5 returned exit code {rc1}")
+        # Stage 2.5 must have produced stage2p5_final/. If it didn't (e.g. a
+        # defensive exit-0 with no write), the resume@6 below would silently
+        # fall back to stage2_pruned/ (the symlinked UN-healed model) and emit a
+        # base-like BPT mislabeled as a heal arm — corrupting the comparison.
+        if not (row_dir / "stage2p5_final").exists():
+            raise RuntimeError(
+                f"[{row_id}] Stage 2.5 exited 0 but stage2p5_final/ is absent — "
+                "refusing to resume Stage 6 on the un-healed stage2_pruned/."
+            )
         rc2 = subprocess.run(
             _pipeline_argv(cfg_path, model_repo, row_dir, resume=6, stop=6),
             check=False,
@@ -383,8 +473,10 @@ def run_one_row(
 
 def _row_model_dir(row_dir: Path, arm: str) -> Path:
     """The model checkpoint dir to publish: stage2p5_final/ for heal arms,
-    stage2_pruned/ for base."""
-    return row_dir / ("stage2p5_final" if is_heal_arm(arm) else "stage2_pruned")
+    stage2_pruned/ for base. For base, stage2_pruned/ is a symlink to the
+    group's shared prune — resolve() so the upload targets the real dir."""
+    sub = "stage2p5_final" if is_heal_arm(arm) else "stage2_pruned"
+    return (row_dir / sub).resolve()
 
 
 def _upload_row_model(row_id: str, row_dir: Path, arm: str, hf_token: str) -> None:
@@ -502,15 +594,34 @@ def main(argv: list[str] | None = None) -> int:
             "Stage-1 step (run_pipeline --stop-after-stage 1) into _shared/ first."
         )
 
+    # Prune/merge ONCE per group, then branch its arms off the shared
+    # stage2_pruned/. A failed shared prune fails every arm in that group
+    # (recorded per-row), but does not abort the other group.
+    pruned_by_group: dict[str, Path] = {}
+    prune_errors: dict[str, str] = {}
+    for grp in list(dict.fromkeys(g for _, g, _ in rows)):  # ordered dedup of groups
+        try:
+            pruned_by_group[grp] = run_shared_prune(
+                group=grp, base_config=base_config, shared_dir=shared_dir,
+                probe_root=probe_root, model_repo=args.model,
+                num_sequences=args.num_sequences,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("[%s] shared prune failed", grp)
+            prune_errors[grp] = str(exc)
+
     results: dict[str, dict] = {}
     failures: list[tuple[str, str]] = []
     for row_id, group, arm in rows:
+        if group in prune_errors:
+            failures.append((row_id, f"shared prune failed: {prune_errors[group]}"))
+            continue
         try:
             results[row_id] = run_one_row(
                 row_id=row_id, group=group, arm=arm, base_config=base_config,
                 shared_dir=shared_dir, probe_root=probe_root,
                 model_repo=args.model, num_sequences=args.num_sequences,
-                hf_token=hf_token,
+                pruned_src=pruned_by_group[group], hf_token=hf_token,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("[%s] failed", row_id)
