@@ -3035,65 +3035,66 @@ def _run_replay(args) -> int:
     # Only if BOTH raise AttributeError: fall back to formula and log
     # ERROR (not WARNING) -- the GPU smoke is then the sole guarantee.
     # ------------------------------------------------------------------
-    buf_rows: int
-    _buf_rows_source: str
+    # The ACTUAL side-store row capacity is TritonExperts._calib_buf_rows =
+    # max(max_cudagraph_capture_size, max_num_batched_tokens, 512) in the
+    # patched wheel (H2 fix). Introspect a live TritonExperts instance and
+    # assert that real value >= max_num_batched_tokens, so a forward batch can
+    # never exceed the buffer (the OOB-skip condition). At mbt > cudagraph
+    # capture size the large prefill simply runs eager (Python scatter executes)
+    # -> capture still fires; the only thing that matters is buf_rows >= batch.
+    buf_rows = -1
+    _buf_rows_source = "unresolved"
     try:
-        buf_rows = (
-            llm.llm_engine.vllm_config
-            .compilation_config
-            .max_cudagraph_capture_size
-        )
-        _buf_rows_source = "llm.llm_engine.vllm_config"
-    except AttributeError:
+        _model = (llm.llm_engine.model_executor.driver_worker
+                  .model_runner.model)
+        for _name, _mod in _model.named_modules():
+            if getattr(_mod, "global_num_experts", None) is not None and \
+                    hasattr(_mod, "quant_method"):
+                _te = getattr(getattr(_mod.quant_method, "moe_kernel", None),
+                              "fused_experts", None)
+                _br = getattr(_te, "_calib_buf_rows", None)
+                if isinstance(_br, int) and _br > 0:
+                    buf_rows = _br
+                    _buf_rows_source = "TritonExperts._calib_buf_rows (actual)"
+                break
+    except Exception as _exc:  # noqa: BLE001
+        log.warning("C2: could not introspect _calib_buf_rows (%s)", _exc)
+    if buf_rows < 0:
+        # Fall back to the wheel's formula so the check is not falsely strict.
         try:
-            buf_rows = (
-                llm.llm_engine.model_executor.driver_worker
-                .model_runner.vllm_config
-                .compilation_config
-                .max_cudagraph_capture_size
-            )
-            _buf_rows_source = "model_runner.vllm_config"
+            _ccs = (llm.llm_engine.vllm_config
+                    .compilation_config.max_cudagraph_capture_size) or 0
         except AttributeError:
-            # Both paths failed. Fall back to the formula but flag loudly:
-            # the assert below becomes best-effort, not authoritative.
-            buf_rows = min(_REPLAY_MAX_NUM_SEQS * 2, 512)
-            _buf_rows_source = f"formula min({_REPLAY_MAX_NUM_SEQS}*2,512)"
-            log.error(
-                "C2: both vllm_config attribute paths raised AttributeError. "
-                "Falling back to formula buf_rows=%d. "
-                "The GPU smoke (captured_entry_count > buf_rows) is now the "
-                "SOLE guarantee that expert_out_unweighted fires on prefill. "
-                "Run the C2 smoke before trusting any reap/per_expert_max/"
-                "output_reservoir sidecar from this replay.",
-                buf_rows,
-            )
+            _ccs = 0
+        buf_rows = max(_ccs, _REPLAY_MAX_BATCHED_TOKENS, 512)
+        _buf_rows_source = "formula max(cg,mbt,512)"
+        log.warning(
+            "C2: using formula buf_rows=%d (could not read the live "
+            "TritonExperts._calib_buf_rows). If the installed wheel lacks the "
+            "H2 buf_rows fix this may overstate the real buffer; the smoke's "
+            "captured-token check is the backstop.", buf_rows,
+        )
 
     log.info(
-        "C2 check: max_cudagraph_capture_size=%d (source: %s); "
+        "C2 check: _calib_buf_rows=%d (source: %s); "
         "must be >= max_num_batched_tokens=%d",
         buf_rows, _buf_rows_source, _REPLAY_MAX_BATCHED_TOKENS,
     )
 
     if buf_rows < _REPLAY_MAX_BATCHED_TOKENS:
         log.error(
-            "C2 HARD FAIL: max_cudagraph_capture_size=%d < "
-            "max_num_batched_tokens=%d. expert_out_unweighted would skip "
-            "prefill chunks silently. Recovery options: "
-            "(a) lower max_num_batched_tokens to %d (= buf_rows), "
-            "(b) raise max_num_seqs so min(seqs*2,512) >= %d, "
-            "(c) pass compilation_config with cudagraph_capture_sizes "
-            "whose max >= %d. Aborting.",
-            buf_rows, _REPLAY_MAX_BATCHED_TOKENS,
-            buf_rows,
-            _REPLAY_MAX_BATCHED_TOKENS,
-            _REPLAY_MAX_BATCHED_TOKENS,
+            "C2 HARD FAIL: _calib_buf_rows=%d < max_num_batched_tokens=%d. "
+            "expert_out_unweighted would skip forward batches > buf_rows. "
+            "The wheel's H2 fix should make buf_rows=max(cg,mbt,512) >= mbt; "
+            "if not, rebuild the wheel or lower --max-num-batched-tokens to %d. "
+            "Aborting.",
+            buf_rows, _REPLAY_MAX_BATCHED_TOKENS, buf_rows,
         )
         return 1
 
     log.info(
-        "C2 check passed: buf_rows=%d >= max_num_batched_tokens=%d. "
-        "expert_out_unweighted fires on all prefill chunks "
-        "(vLLM V1 chunked prefill enabled by default).",
+        "C2 check passed: _calib_buf_rows=%d >= max_num_batched_tokens=%d. "
+        "expert_out_unweighted fires on all forward tokens.",
         buf_rows, _REPLAY_MAX_BATCHED_TOKENS,
     )
 
