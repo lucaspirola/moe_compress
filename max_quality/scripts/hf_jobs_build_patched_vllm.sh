@@ -77,7 +77,7 @@ echo "[$(date)] === Phase 5: fetch and apply BOTH calibration patches ==="
 # See max_quality/patches/MANIFEST.md.
 
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/feat/b0-hook-fix/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/feat/calib-cudagraph-capture/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
@@ -87,7 +87,7 @@ md5sum /tmp/calib.patch
 #  graph-unsafe Python _ch.dispatch/register_callback path.)
 
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/feat/b0-hook-fix/max_quality/patches/vllm_calibration_stage2_profile.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/feat/calib-cudagraph-capture/max_quality/patches/vllm_calibration_stage2_profile.patch \
     -o /tmp/calib2.patch
 wc -l /tmp/calib2.patch
 md5sum /tmp/calib2.patch
