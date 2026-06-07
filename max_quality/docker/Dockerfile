@@ -54,12 +54,51 @@ RUN pip install --index-url https://download.pytorch.org/whl/cu130 \
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt -c /tmp/torch-constraint.txt
 
-# Compiled fast-path kernels need --no-build-isolation so they can see the
-# already-installed torch + cuda toolkit during their setup.py.
-# Re-pinned here in case a base image already had stale versions.
+# GDN fast-path kernels. transformers gates the Qwen3.6 GDN fast path
+# ALL-OR-NOTHING on BOTH of these importing (modeling_qwen3_5_moe.py:
+# `is_fast_path_available = all((causal_conv1d_*, *_gated_delta_rule))`);
+# missing either => slow native chunked fallback (GPU util ~0-46%). See
+# memory/project_grouped_mm_blackwell.md.
+#
+#  - causal-conv1d: CUDA C++ extension; --no-build-isolation so it links the
+#    already-installed torch + nvcc. Needs python3-dev (Python.h) + ninja
+#    (both installed above) and nvcc CUDA major == torch CUDA major (the
+#    cuda:13.0.3 base + cu130 torch satisfy this).
+#  - flash-linear-attention: MUST come from git. PyPI's newest is 0.5.0, which
+#    crashes on torch>=2.11 ("module 'torch.cpu' has no attribute 'device'");
+#    the fix is git-only (>=0.5.1). Do NOT use a PyPI version pin here.
+#    --no-deps: fla's runtime deps (einops, triton, transformers, ...) are
+#    already pinned/installed by requirements.txt above; --no-deps stops the
+#    git install from pulling unpinned/duplicate variants over them.
 RUN pip install --no-build-isolation -c /tmp/torch-constraint.txt \
         "causal-conv1d>=1.4.0" \
-        "flash-linear-attention>=0.1.2"
+    && pip install --no-deps \
+        "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention"
+
+# Fail the build LOUDLY if the fast path is not actually live — catch a broken
+# kernel/torch combo here (seconds) instead of mid-run on a paid GPU (hours).
+# Build-time = no GPU, so we can't enter custom_device_ctx(0); instead we (a)
+# import both kernels, (b) reject the known-bad fla 0.5.0 by version (the
+# torch.cpu.device crash is call-time, not import-time, so an import alone
+# would NOT catch a regression to it), and (c) assert transformers sees both.
+# The full call-exercise (with custom_device_ctx(0)) runs in setup_gpu_env.sh
+# on the live GPU box.
+RUN python3 - <<'PYEOF'
+import importlib
+import fla, causal_conv1d  # noqa: F401
+from packaging.version import Version
+assert Version(fla.__version__) >= Version("0.5.1"), (
+    f"flash-linear-attention {fla.__version__} has the torch>=2.11 "
+    "custom_device_ctx crash; install >=0.5.1 from git"
+)
+from fla.utils import custom_device_ctx  # noqa: F401  symbol that broke on 0.5.0
+from transformers.utils.import_utils import (
+    is_flash_linear_attention_available as _fla,
+    is_causal_conv1d_available as _cc,
+)
+assert _fla() and _cc(), f"fast path not importable: fla={_fla()} causal={_cc()}"
+print(f"[docker] fast-path verified: fla {fla.__version__} + causal-conv1d, transformers sees both")
+PYEOF
 
 # Pre-bake the FP8 KD-teacher kernels (deep-gemm + finegrained-fp8) into the
 # image. A fresh container otherwise fetches ~1200 small deep-gemm files from

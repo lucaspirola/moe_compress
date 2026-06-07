@@ -4,9 +4,11 @@
 #   - hf_jobs/entrypoint_ablations.py PEP 723 inline metadata (HF Jobs path)
 #   - docker/Dockerfile (vast.ai / external GPU path)
 #
-# Note: torch is installed separately (Dockerfile uses the cu128 wheel index;
-# the HF Jobs UV resolver picks an appropriate wheel automatically). We pin
-# the version range here for reference; the install command differs per path.
+# Note: torch is installed separately (Dockerfile uses the cu130 wheel index,
+# matching its CUDA-13 base; the HF Jobs UV resolver picks an appropriate wheel
+# automatically). We pin the version below for reference; the install command
+# differs per path. torch MUST be >=2.11 (MoE torch._grouped_mm needs it on
+# Blackwell sm_120).
 
 # --- Deep learning core ---
 torch==2.11.0
@@ -54,15 +56,23 @@ bitsandbytes>=0.49.2
 tilelang>=0.1.7
 
 # --- Fast-path attention kernels: handled per environment, NOT here ---
-# flash-linear-attention and causal-conv1d build CUDA kernels and need to
-# link against the host's torch + nvcc. They are installed by:
-#   - max_quality/docker/Dockerfile  (with --no-build-isolation against the
-#     cu128-pinned torch)
-#   - max_quality/hf_jobs/entrypoint_ablations.py  (PEP 723 metadata with
-#     a prebuilt-wheel URL, since the HF Jobs UV env has no nvcc)
+# flash-linear-attention and causal-conv1d build/JIT against the host's torch +
+# nvcc and gate the Qwen3.6 GDN fast path ALL-OR-NOTHING (need BOTH; missing
+# either => slow native fallback, GPU util ~0-46%). Install via the canonical,
+# fail-loud recipe — NOT a plain `pip install` here:
+#   - max_quality/scripts/setup_gpu_env.sh   (bare box / existing venv path)
+#   - max_quality/docker/Dockerfile          (baked into the image)
+#   - max_quality/hf_jobs/entrypoint_ablations.py  (PEP 723 prebuilt-wheel URL;
+#     the HF Jobs UV env has no nvcc)
+# THREE TRAPS those paths encode (full detail in setup_gpu_env.sh header):
+#   * causal-conv1d needs python3-dev (Python.h) + ninja, --no-build-isolation,
+#     and nvcc CUDA major == torch CUDA major (else its setup.py hard-errors).
+#   * flash-linear-attention MUST come from git (>=0.5.1). PyPI's 0.5.0 crashes
+#     on torch>=2.11 ("module 'torch.cpu' has no attribute 'device'").
+#   * torch MUST be >=2.11 or MoE `torch._grouped_mm` fails on Blackwell sm_120.
 # Listing them here would force pip to source-build under PEP 517 isolation,
 # which spawns a venv that ignores constraint files and pulls a fresh torch
-# from the default PyPI index — mismatching the cu128 base.
+# from the default PyPI index — mismatching the pinned cuXXX base.
 
 # --- Test only ---
 pytest>=8.0
