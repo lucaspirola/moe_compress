@@ -62,18 +62,28 @@ count_accum[rank].scatter_add_(0, ids, ones_like(contrib))         # persistent 
 - **No host sync on the capture path** — accumulators stay on GPU; read once at
   dump.
 
-## Scope (DECISION PENDING — see below)
+## Scope (FINAL — user decision 2026-06-07: EVERYTHING in-graph)
 
-- **Tier A (probe-critical):** `reap_scores`. Minimum to unblock the 6-model probe.
-- **Tier B (cheap, same hooks, full pipeline-useful):** `per_expert_max`,
-  `routing_stats`, `router_logits_stats`, `imatrix` (dense EASY; MoE MEDIUM),
-  `wanda` (MEDIUM).
-- **Tier C (HARD — RNG/covariance/variable-shape; NOT graph-expressible cheaply):**
-  `input_cov` (~TB if naive — needs a different formulation), `output_reservoir`,
-  `block_outputs`, `stage2_profile`. Options for these: (i) defer; (ii) capture in
-  a separate **eager prefill-only** pass when their consumers (Stages 3/4) are
-  actually run; (iii) redesign later (e.g. input_cov via per-expert running
-  Gram with fixed rank, reservoirs via fixed-stride deterministic sampling).
+ALL ten signals get the in-graph GPU-accumulation treatment now:
+- **Scatter/reduce signals:** `reap_scores`, `per_expert_max`, `routing_stats`,
+  `router_logits_stats`, `imatrix` (dense + MoE), `wanda` — persistent
+  per-(layer,expert) accumulators via `scatter_add_`/`scatter_reduce_`.
+- **Reservoir/block signals** (`output_reservoir`, `block_outputs`,
+  stage2_profile reservoir component): replace RNG reservoir sampling with
+  **deterministic fixed-stride** selection into a persistent capped buffer
+  (graph-safe, no RNG, no data-dependent shapes; keep every ⌈N/cap⌉-th token).
+- **`input_cov` (+ stage2_profile covariance component): in-graph GPU
+  accumulation, but FLAG-GATED OFF by default** (its ~172 GB all-resident
+  footprint OOMs a single H200). Two run modes when enabled:
+  - **(a) all-resident** — full cudagraph-fast, requires ≥172 GB total VRAM
+    (e.g. 2×H200, TP/offload split). Default for multi-GPU.
+  - **(b) per-layer CPU-offload (1×H200)** — accumulate one layer's per-expert
+    Gram on GPU, copy to pinned CPU after each layer, reuse the GPU slice for the
+    next layer. Runs the per-layer accumulation as GPU ops; orchestration is
+    per-layer (not one whole-model graph) so the resident footprint is one
+    layer (~4.3 GB) not all 40. Slower but fits 1×H200.
+  The default (flag off) means normal probe/calibration runs never allocate the
+  172 GB and never OOM; input_cov is opt-in for when Stage 3/4 actually need it.
 
 ## Verify gates (HF GPU, before trusting)
 
