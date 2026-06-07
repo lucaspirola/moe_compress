@@ -151,7 +151,7 @@ grep -nE "^license" pyproject.toml || echo "(none — clean)"
 echo "[$(date)] === Phase 6: build multi-arch wheel ==="
 export CUDA_HOME=/usr/local/cuda
 export PATH=/usr/local/cuda/bin:${PATH}
-export TORCH_CUDA_ARCH_LIST="8.0;9.0a;10.0;12.0"
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0;9.0a;10.0;12.0}"
 export MAX_JOBS=16
 export NVCC_THREADS=2
 nvcc --version | tail -3
