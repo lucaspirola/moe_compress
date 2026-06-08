@@ -440,6 +440,19 @@ def _load_teacher_vllm(
         kwargs["kernel_config"] = {"moe_backend": str(moe_backend)}
         log.info("vLLM kernel_config: forcing moe_backend=%s "
                  "(required for in-graph calibration capture)", moe_backend)
+    # CALIB_ENFORCE_EAGER=1 disables CUDA-graph capture. The full multi-signal
+    # capture allocates large per-(layer,expert) accumulators (output_reservoir
+    # ~21 GB, block_outputs ~10 GB, expert side-stores) OUTSIDE vLLM's
+    # gpu_memory_utilization budget; CUDA graphs reserve extra device memory on
+    # top, and on a single 141 GB H200 the model + all accumulators + graphs do
+    # not fit. Eager frees the graph reservation (capture runs the Python
+    # scatter path either way) and also avoids the per-window recompile in the
+    # input_cov offload (set_calibration_max_layer changes a compile-specialised
+    # constant). Default off so the production/throughput path is unchanged.
+    if os.getenv("CALIB_ENFORCE_EAGER", "0") == "1":
+        kwargs["enforce_eager"] = True
+        log.info("vLLM: enforce_eager=True (CALIB_ENFORCE_EAGER=1) -- no CUDA "
+                 "graphs; frees graph memory for capture accumulators")
     return LLM(**kwargs)
 
 
