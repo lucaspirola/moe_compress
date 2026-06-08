@@ -6294,7 +6294,7 @@ index 0000000..9de3848
 +# allocates or reads them. The calib_layer_in_accum custom op + its qwen
 +# callers were deleted with them.
 +# input_cov (resident mode): per-expert Gram [E, H, H] + per-expert token
-+# counts [E] + per-forward scratch [E, buf_rows, H].
++# counts [E] + per-forward scratch [E, buf_rows+1, H].
 +_INPUT_COV_GPU: dict[int, "torch.Tensor"] = {}          # [E, H, H] fp32
 +_INPUT_COV_COUNT_GPU: dict[int, "torch.Tensor"] = {}    # [E] int64
 +_INPUT_COV_TEMP_GPU: dict[int, "torch.Tensor"] = {}     # [E, buf_rows+1, H] fp32 (+1 = OOB sentinel, H-NEW-1)
