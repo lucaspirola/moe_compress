@@ -6297,7 +6297,7 @@ index 0000000..9de3848
 +# counts [E] + per-forward scratch [E, buf_rows, H].
 +_INPUT_COV_GPU: dict[int, "torch.Tensor"] = {}          # [E, H, H] fp32
 +_INPUT_COV_COUNT_GPU: dict[int, "torch.Tensor"] = {}    # [E] int64
-+_INPUT_COV_TEMP_GPU: dict[int, "torch.Tensor"] = {}     # [E, buf_rows, H] fp32
++_INPUT_COV_TEMP_GPU: dict[int, "torch.Tensor"] = {}     # [E, buf_rows+1, H] fp32 (+1 = OOB sentinel, H-NEW-1)
 +# reap topk-weights stash (set in MoERunner, read in TritonExperts.apply)
 +_TOPK_WEIGHTS_STASH_GPU: dict[int, "torch.Tensor"] = {}  # [buf_rows, top_k] fp32
 +_TOPK_IDS_STASH_GPU: dict[int, "torch.Tensor"] = {}      # [buf_rows, top_k] i64

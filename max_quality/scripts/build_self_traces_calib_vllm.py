@@ -3732,37 +3732,6 @@ def _run_replay(args) -> int:
     return 0
 
 
-def _introspect_calib_buf_rows(llm, fallback_mbt: int) -> int:
-    """Read the live TritonExperts._calib_buf_rows (side-store row capacity).
-
-    Mirrors the C2 introspection in _run_replay: the per-forward Gram temp is
-    sized [E, buf_rows+1, H], so buf_rows must match the wheel's actual buffer
-    or the scatter overflows / underflows. Falls back to the wheel formula
-    max(cudagraph, max_num_batched_tokens, 512) if introspection fails.
-    """
-    try:
-        _model = (llm.llm_engine.model_executor.driver_worker
-                  .model_runner.model)
-        for _name, _mod in _model.named_modules():
-            if getattr(_mod, "global_num_experts", None) is not None and \
-                    hasattr(_mod, "quant_method"):
-                _te = getattr(getattr(_mod.quant_method, "moe_kernel", None),
-                              "fused_experts", None)
-                _br = getattr(_te, "_calib_buf_rows", None)
-                if isinstance(_br, int) and _br > 0:
-                    return _br
-                break
-    except Exception as _exc:  # noqa: BLE001
-        log.warning("input-cov-offload: could not introspect "
-                    "_calib_buf_rows (%s)", _exc)
-    try:
-        _ccs = (llm.llm_engine.vllm_config
-                .compilation_config.max_cudagraph_capture_size) or 0
-    except AttributeError:
-        _ccs = 0
-    return max(_ccs, fallback_mbt, 512)
-
-
 def _run_input_cov_offload(args) -> int:
     """input_covariance capture via the per-layer CPU-offload (windowed) path.
 
@@ -3871,14 +3840,13 @@ def _run_input_cov_offload(args) -> int:
     if device is None:
         device = torch.device("cuda")
     n_layers = len(layer_ids)
-    buf_rows = _introspect_calib_buf_rows(llm, _MBT)
-    if buf_rows < _MBT:
-        log.error(
-            "input-cov-offload: _calib_buf_rows=%d < max_num_batched_tokens="
-            "%d; forward batches > buf_rows would be skipped. Lower "
-            "--max-num-batched-tokens to %d. Aborting.",
-            buf_rows, _MBT, buf_rows)
-        return 1
+    # This path allocates its OWN shared temp, so buf_rows is NOT a compiled
+    # wheel constant: the moe_runner accumulation reads per-expert row capacity
+    # dynamically from `_tmp.shape[1] - 1`. A single forward batches at most
+    # max_num_batched_tokens tokens (chunked-prefill cap), and a single expert
+    # can receive at most all of them, so buf_rows = _MBT is exactly sufficient
+    # (the +1 sentinel column absorbs the worst-case overflow -> nothing lost).
+    buf_rows = _MBT
 
     gram_bytes = n_experts * d_in * d_in * 4          # per-layer Gram [E,H,H]
     temp_bytes = n_experts * (buf_rows + 1) * d_in * 4  # shared temp
@@ -3958,7 +3926,8 @@ def _run_input_cov_offload(args) -> int:
                              weights_only=False)
             if (int(_ck.get("n_experts", -1)) == n_experts
                     and int(_ck.get("d_in", -1)) == d_in
-                    and int(_ck.get("window_size", -1)) == window_size):
+                    and int(_ck.get("window_size", -1)) == window_size
+                    and list(_ck.get("layer_ids", [])) == list(layer_ids)):
                 cpu_sigma = _ck["cpu_sigma"]
                 cpu_counts = _ck["cpu_counts"]
                 windows_done = int(_ck["windows_done"])
@@ -3989,12 +3958,27 @@ def _run_input_cov_offload(args) -> int:
         _ch._INPUT_COV_GPU.clear()
         _ch._INPUT_COV_COUNT_GPU.clear()
         _ch._INPUT_COV_TEMP_GPU.clear()
-        for li in window:
-            _ch._INPUT_COV_GPU[li] = torch.zeros(
-                n_experts, d_in, d_in, dtype=torch.float32, device=device)
-            _ch._INPUT_COV_COUNT_GPU[li] = torch.zeros(
-                n_experts, dtype=torch.int64, device=device)
-            _ch._INPUT_COV_TEMP_GPU[li] = shared_temp
+        try:
+            for li in window:
+                _ch._INPUT_COV_GPU[li] = torch.zeros(
+                    n_experts, d_in, d_in, dtype=torch.float32, device=device)
+                _ch._INPUT_COV_COUNT_GPU[li] = torch.zeros(
+                    n_experts, dtype=torch.int64, device=device)
+                _ch._INPUT_COV_TEMP_GPU[li] = shared_temp
+        except torch.cuda.OutOfMemoryError:
+            _ch._INPUT_COV_GPU.clear()
+            _ch._INPUT_COV_COUNT_GPU.clear()
+            _ch._INPUT_COV_TEMP_GPU.clear()
+            torch.cuda.empty_cache()
+            log.error(
+                "input-cov-offload: OOM allocating window %d/%d Gram (%d "
+                "layers x %.1f GB). Lower --input-cov-window-size (current "
+                "auto/explicit=%d) or --gpu-memory-utilization (vLLM reserves "
+                "most VRAM for KV). %d/%d windows are checkpointed and will "
+                "resume on rerun with --resume.",
+                w_idx + 1, len(windows), len(window), gram_bytes / 2**30,
+                window_size, windows_done, len(windows))
+            return 1
         _ch.set_calibration_max_layer(hi)
         log.info(
             "input-cov-offload: window %d/%d layers [%d..%d] -- "
@@ -4019,6 +4003,23 @@ def _run_input_cov_offload(args) -> int:
         log.info("input-cov-offload: window %d/%d forward done in %.0fs.",
                  w_idx + 1, len(windows), time.monotonic() - w_t0)
 
+        # H2: fail fast if this window captured ZERO routed tokens. An all-zero
+        # Gram means the hook never fired (wrong MoE path / mode / env) -- catch
+        # it on the FIRST window instead of after a multi-hour, all-window run
+        # that silently writes a zero sidecar.
+        _win_tokens = sum(
+            int(_ch._INPUT_COV_COUNT_GPU[li].sum().item()) for li in window)
+        if _win_tokens == 0:
+            log.error(
+                "input-cov-offload: window %d/%d (layers [%d..%d]) captured "
+                "ZERO routed tokens -- the input_cov accumulation is not "
+                "firing. Verify VLLM_CALIB_INPUT_COV_MODE=resident, "
+                "VLLM_CALIB_CAPTURE_INPUT_COV=1, VLLM_CALIB_CAPTURE_EXPERT=1, "
+                "and a non-monolithic (Triton) MoE backend. Aborting before "
+                "wasting further GPU-hours.",
+                w_idx + 1, len(windows), window[0], hi)
+            return 1
+
         # Snapshot this window's layers to CPU, then free GPU slices.
         for li in window:
             cov_cpu = _ch._INPUT_COV_GPU[li].cpu()       # [E, H, H]
@@ -4042,6 +4043,7 @@ def _run_input_cov_offload(args) -> int:
             "n_experts": n_experts,
             "d_in": d_in,
             "n_layers": n_layers,
+            "layer_ids": list(layer_ids),
             "window_size": window_size,
             "windows_done": windows_done,
             "cpu_sigma": cpu_sigma,
