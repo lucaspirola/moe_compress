@@ -1568,6 +1568,18 @@ def main() -> int:
                         "(the per-window early-exit is incompatible with the "
                         "other full-forward signals). Forces "
                         "VLLM_CALIB_INPUT_COV_MODE=resident.")
+    p.add_argument("--input-cov-max-rows", type=int, default=0,
+                   help="Cap the number of corpus rows used for the input_cov "
+                        "offload pass. 0 (default) = all renderable rows. When "
+                        "set below the corpus size, a DETERMINISTIC RANDOM "
+                        "sample (seeded by --seed) of this many rows is used "
+                        "instead of the first N -- input_covariance is a "
+                        "2nd-moment Gram statistic that converges well before "
+                        "the full corpus, so a representative ~2-3k subset cuts "
+                        "the per-window cost ~3-4x with negligible SVD/EoRA "
+                        "loss. A random sample (not head slice) avoids subset/"
+                        "domain bias if the JSONL is ordered. Only used with "
+                        "--input-cov-offload.")
     p.add_argument("--input-cov-window-size", type=int, default=0,
                    help="Number of MoE layers allocated resident per offload "
                         "window. 0 (default) = auto-size from free GPU memory "
@@ -3909,6 +3921,19 @@ def _run_input_cov_offload(args) -> int:
              "--max-model-len=%d).", len(rendered), n_skipped,
              args.max_model_len)
 
+    # Optional representative subset: input_covariance is a 2nd-moment Gram
+    # statistic that converges well before the full corpus. Take a seeded
+    # RANDOM sample (not a head slice -> avoids subset/domain bias if the
+    # JSONL is ordered) so each window pass costs proportionally less.
+    if 0 < args.input_cov_max_rows < len(rendered):
+        import random as _random  # noqa: PLC0415
+        _total = len(rendered)
+        _rng = _random.Random(args.seed)
+        rendered = _rng.sample(rendered, args.input_cov_max_rows)
+        log.info("input-cov-offload: sampled %d/%d renderable rows for the "
+                 "Gram pass (seeded random subset, seed=%d).",
+                 len(rendered), _total, args.seed)
+
     from vllm import SamplingParams  # type: ignore
     sp = SamplingParams(temperature=0.0, max_tokens=1, seed=args.seed)
 
@@ -3927,6 +3952,7 @@ def _run_input_cov_offload(args) -> int:
             if (int(_ck.get("n_experts", -1)) == n_experts
                     and int(_ck.get("d_in", -1)) == d_in
                     and int(_ck.get("window_size", -1)) == window_size
+                    and int(_ck.get("max_rows", -1)) == int(args.input_cov_max_rows)
                     and list(_ck.get("layer_ids", [])) == list(layer_ids)):
                 cpu_sigma = _ck["cpu_sigma"]
                 cpu_counts = _ck["cpu_counts"]
@@ -4045,6 +4071,7 @@ def _run_input_cov_offload(args) -> int:
             "n_layers": n_layers,
             "layer_ids": list(layer_ids),
             "window_size": window_size,
+            "max_rows": int(args.input_cov_max_rows),
             "windows_done": windows_done,
             "cpu_sigma": cpu_sigma,
             "cpu_counts": cpu_counts,
