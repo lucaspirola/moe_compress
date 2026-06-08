@@ -18,10 +18,11 @@ either one alone produces a partially-wired wheel.
 | Immutable tag | `calib-v2-fsync-complete` |
 | Branch (active) | `feat/b0-hook-fix` |
 | vLLM upstream SHA | `ad7125a431e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch 1 line count | **11450** |
-| Patch 1 MD5 | **`517377fe2ad7a169c08b5dd15c864c42`** (vllm_calibration_hooks.patch) |
-| Patch 2 line count | **923** |
-| Patch 2 MD5 | **`7e04ccb6afcaeae8f800346ef319ad51`** (vllm_calibration_stage2_profile.patch) |
+| Patch 1 line count | **10604** |
+| Patch 1 MD5 | **`e10ad588120d6ba7713435fae8f28d52`** (vllm_calibration_hooks.patch) |
+| Patch 2 line count | **941** |
+| Patch 2 MD5 | **`fca4c01cc5cef188b30c323bb919cd72`** (vllm_calibration_stage2_profile.patch) |
+| Native code (patch 1) | **`csrc/calibration/gram_grouped_accum.cu`** + a `CMakeLists.txt` edit — patch 1 is now CMakeLists-modifying, not pure new-file |
 | HF model repo | `pirola/vllm-patched-calib` |
 | Wheel filename pattern | `vllm-0.21.1.dev0+gad7125a43.d<YYYYMMDD>-cp312-cp312-linux_x86_64.whl` |
 | Torch / CUDA pinned in build | `torch==2.11.0+cu130` |
@@ -31,14 +32,14 @@ either one alone produces a partially-wired wheel.
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: 517377fe2ad7a169c08b5dd15c864c42
+# expect: e10ad588120d6ba7713435fae8f28d52
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 11450
+# expect: 10604
 
 md5sum max_quality/patches/vllm_calibration_stage2_profile.patch
-# expect: 7e04ccb6afcaeae8f800346ef319ad51
+# expect: fca4c01cc5cef188b30c323bb919cd72
 wc -l max_quality/patches/vllm_calibration_stage2_profile.patch
-# expect: 923
+# expect: 941
 
 # Re-apply both against a fresh v0.21.0 checkout (idempotency check):
 git clone --depth 1 --branch v0.21.0 https://github.com/vllm-project/vllm /tmp/vllm-fresh
@@ -49,6 +50,35 @@ git apply --check /path/to/vllm_calibration_stage2_profile.patch && echo OK
 ```
 
 ## Change log
+
+### `input-cov-grouped-syrk` (current)
+
+Replaces the input_covariance accumulation (padded per-top-k-slot scatter +
+`baddbmm_` over an `[E, buf_rows+1, H]` temp) with a fused, graph-safe grouped
+symmetric-rank-k CUDA kernel:
+
+- **`csrc/calibration/gram_grouped_accum.cu`** (new): `torch.ops.calib_gram.gram_grouped_accum`
+  — runtime-parameterized (E, d_in, R as launch args), shared-memory-tiled
+  `X_e^T X_e` with symmetry, fp32 accumulate, mutating-tensor schema + Meta
+  impl. Registered into `_C` via a `CMakeLists.txt` `VLLM_EXT_SRC` append
+  (CUDA-only block).
+- **`vllm/model_executor/.../moe_runner.py`**: the resident-mode block now runs
+  a graph-safe compact counting-sort prologue (scatter_add + cumsum offsets,
+  argsort order, index_select) then the fused op. No padded temp, no host sync
+  → enforce_eager no longer required. Also fixes a latent top_k>1 overwrite bug
+  (the old per-slot scatter restarted local_rank at 0, clobbering prior slots'
+  rows for the same expert).
+- **`vllm/calibration_input_cov.py`**: discovers `top_k`; `alloc_layer()` /
+  `free_layer()` helpers allocate the compact `[buf_rows*top_k, d_in]` scratch
+  (+ offsets/counts) in place of the `[E, buf_rows+1, d_in]` temp (~`E`× smaller
+  per layer); shared with the offload driver.
+- **`vllm/calibration_hooks.py`**: `_INPUT_COV_XSORTED_GPU` / `_INPUT_COV_OFFSETS_GPU`
+  / `_INPUT_COV_COUNTS_SCRATCH_GPU` dicts; legacy `_INPUT_COV_TEMP_GPU` retained
+  (unused).
+
+Standalone kernel verified on RTX5080 (sm_120): numerical parity across dim
+configs + CUDA-graph capture/replay. (Line counts/MD5s above also corrected for
+prior MANIFEST drift; patch2 unchanged.)
 
 ### `calib-v2-wanda-scalar-row` (previous)
 
