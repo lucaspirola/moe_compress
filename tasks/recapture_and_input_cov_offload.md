@@ -69,5 +69,40 @@ only `--capture-input-covariance` set). Algorithm:
 4. [run] D2 windowed offload, verify, push HF.
 5. teardown GPU (keep volume), verify GONE.
 
+## Run commands (after review passes; on 1xH200 with volume 0a2fda41 attached)
+Let JSONL = the 8000-row calibration corpus on the volume (locate on box:
+`find /mnt/data -name '*.jsonl' | xargs wc -l` -> the ~8000-line one).
+
+### D1 — 9 signals, one forward-only pass
+```
+python max_quality/scripts/build_self_traces_calib_vllm.py \
+  --replay-from $JSONL --teacher <base> --dtype bfloat16 \
+  --gpu-memory-utilization 0.85 --max-num-batched-tokens 8192 --chunk-size 200 \
+  --resume \
+  --capture-imatrix --capture-reap-scores --capture-wanda-scalar-row \
+  --capture-stage2-profile --capture-per-expert-max --capture-routing-stats \
+  --capture-router-logits-stats --capture-output-reservoir --capture-block-outputs
+```
+Verify each sidecar by CONTENT, then push to HF.
+
+### D2 — input_cov windowed offload (SOLE capture flag)
+NOTE: low --gpu-memory-utilization so the windowed Gram has room (vLLM
+reserves the rest for KV). Modest --max-num-batched-tokens keeps the shared
+temp small (temp = E*(mbt+1)*H*4 ~ 256*2049*2048*4 ~ 4.3GB at mbt=2048).
+```
+python max_quality/scripts/build_self_traces_calib_vllm.py \
+  --replay-from $JSONL --teacher <base> --dtype bfloat16 \
+  --gpu-memory-utilization 0.45 --max-num-batched-tokens 2048 --chunk-size 200 \
+  --resume --capture-input-covariance --input-cov-offload --input-cov-window-size 0
+```
+Window auto-sizes from free VRAM. Verify sidecar CONTENT (40*256 entries,
+[2048,2048] each, counts>0), then push to HF. Teardown GPU, keep volume.
+
 ## Review section
-(filled after implementation)
+- Round 1 (reviewer a8da3a82): Critical none. High H1 (introspect fallback
+  false-negative), H2 (no early zero-capture fail). Med M1 (KV-lazy OOM mid
+  window). Low L1 (resume layer_ids), L2 (introspect path). Nit N1 (comment).
+- Round 1 fixes (c5d1b0d): H1+L2 removed introspection (buf_rows=_MBT, kernel
+  reads capacity from temp shape); H2 per-window zero-token fast-fail; M1
+  OOM-guarded alloc; L1 layer_ids in ckpt; N1 comment.
+- Round 2: re-review in progress.
