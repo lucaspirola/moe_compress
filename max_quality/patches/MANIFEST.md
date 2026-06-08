@@ -18,8 +18,8 @@ either one alone produces a partially-wired wheel.
 | Immutable tag | `calib-v2-fsync-complete` |
 | Branch (active) | `feat/b0-hook-fix` |
 | vLLM upstream SHA | `ad7125a431e176d4161099480a66f0169609a690` (v0.21.0) |
-| Patch 1 line count | **10604** |
-| Patch 1 MD5 | **`e10ad588120d6ba7713435fae8f28d52`** (vllm_calibration_hooks.patch) |
+| Patch 1 line count | **10627** |
+| Patch 1 MD5 | **`f0d2afa2c0be77c9c54b62e05706b750`** (vllm_calibration_hooks.patch) |
 | Patch 2 line count | **941** |
 | Patch 2 MD5 | **`fca4c01cc5cef188b30c323bb919cd72`** (vllm_calibration_stage2_profile.patch) |
 | Native code (patch 1) | **`csrc/calibration/gram_grouped_accum.cu`** + a `CMakeLists.txt` edit — patch 1 is now CMakeLists-modifying, not pure new-file |
@@ -32,9 +32,9 @@ either one alone produces a partially-wired wheel.
 
 ```bash
 md5sum max_quality/patches/vllm_calibration_hooks.patch
-# expect: e10ad588120d6ba7713435fae8f28d52
+# expect: f0d2afa2c0be77c9c54b62e05706b750
 wc -l max_quality/patches/vllm_calibration_hooks.patch
-# expect: 10604
+# expect: 10627
 
 md5sum max_quality/patches/vllm_calibration_stage2_profile.patch
 # expect: fca4c01cc5cef188b30c323bb919cd72

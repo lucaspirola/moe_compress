@@ -3791,18 +3791,20 @@ def _run_input_cov_offload(args) -> int:
           point _ch._INPUT_COV_TEMP_GPU[li] at a single shared temp buffer.
         - set_calibration_max_layer(hi)  -> forward early-exits after hi.
         - run the full corpus (forward-only, prefill) once.
-        - snapshot each window layer's Gram + counts to a CPU dict; free the
-          GPU slice; advance.
+        - stream each window layer's Gram to a durable fp16 shard on disk, then
+          free the GPU slice; advance.
 
     Each MoE layer is in exactly one window, so every layer integrates over the
     full corpus exactly once (no double counting). The in-graph accumulation in
-    moe_runner.py is the SAME resident kernel; it fires for a layer iff that
-    layer is present in _ch._INPUT_COV_GPU (per-layer guard), so absent layers
-    (prior/future windows) are silently skipped.
+    moe_runner.py is the SAME resident kernel (fused grouped-SYRK); it fires for
+    a layer iff that layer is present in _ch._INPUT_COV_GPU (per-layer guard),
+    so absent layers (prior/future windows) are silently skipped.
 
-    Resume is at WINDOW granularity via <jsonl>.input_cov_offload.ckpt.
-    On success writes the canonical input_cov sidecar (same on-disk shape as
-    dump_input_cov) and returns 0.
+    Resume is at LAYER granularity via per-layer atomic shards under the staging
+    dir (sidecars/<stem>/_covariance_staging/), guarded by a topology+seed
+    fingerprint (_meta.pt) -- a present shard is complete, so its window is
+    skipped. On success stream-assembles the per-layer shards into the canonical
+    input_cov sidecar (same on-disk shape as dump_input_cov) and returns 0.
     """
     # ------------------------------------------------------------------
     # 1. Input validation + corpus load (mirrors _run_replay steps 1-2)
@@ -3860,6 +3862,9 @@ def _run_input_cov_offload(args) -> int:
     import vllm.calibration_hooks as _ch  # type: ignore
     import vllm.calibration_input_cov as _icov  # type: ignore
     from moe_compress.utils import input_cov_offload as _ico  # type: ignore
+    from moe_compress.utils.atomic_io import (  # type: ignore
+        atomic_torch_save as _atomic_save,
+    )
 
     if _ch._INPUT_COV_MODE != "resident":
         log.error(
@@ -3985,6 +3990,9 @@ def _run_input_cov_offload(args) -> int:
     fingerprint = {
         "n_experts": int(n_experts), "d_in": int(d_in), "top_k": int(top_k),
         "max_rows": int(args.input_cov_max_rows), "layer_ids": list(layer_ids),
+        # seed selects the random row subset when max_rows>0; a seed change must
+        # invalidate stale shards (else the assembled Gram mixes two samples).
+        "seed": int(args.seed),
     }
     meta_path = staging / "_meta.pt"
     done_layers: set[int] = set()
@@ -4005,7 +4013,8 @@ def _run_input_cov_offload(args) -> int:
     elif staging.exists():
         shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True, exist_ok=True)
-    torch.save(fingerprint, meta_path)
+    _atomic_save(meta_path, fingerprint)  # atomic: a torn _meta.pt mid-crash
+    #                                       would otherwise wipe all shards
 
     # ------------------------------------------------------------------
     # 7. Shared COMPACT scratch (allocated ONCE; aliased across every window
@@ -4025,6 +4034,10 @@ def _run_input_cov_offload(args) -> int:
         _ch._INPUT_COV_XSORTED_GPU.clear()
         _ch._INPUT_COV_OFFSETS_GPU.clear()
         _ch._INPUT_COV_COUNTS_SCRATCH_GPU.clear()
+        # input_cov is the SOLE capture in offload mode, so _ONES is ours to
+        # clear (all entries alias one shared_ones tensor -> no leak, but drop
+        # stale per-layer keys).
+        _ch._ONES_I64_BUF_GPU.clear()
 
     shared_xsorted = torch.zeros(
         r_max, d_in, dtype=torch.float32, device=device)
@@ -4121,8 +4134,10 @@ def _run_input_cov_offload(args) -> int:
     torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
-    # 8. Stream-assemble the canonical covariance.pt from the per-layer shards
-    #    (bounded memory: one shard resident at a time, already fp16).
+    # 8. Assemble the canonical covariance.pt from the per-layer shards. NOTE:
+    #    the single-file consumer contract forces the full fp16 dict into host
+    #    RAM here (~n_layers*E*d_in^2*2 B); capture was memory-bounded, assembly
+    #    is not -- run on a box with enough RAM. See assemble_covariance().
     # ------------------------------------------------------------------
     if not _ico.scan_done_layers(staging):
         log.error("input-cov-offload: no Gram shards under %s; refusing to "

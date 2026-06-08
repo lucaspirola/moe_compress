@@ -23,6 +23,8 @@
 // throughput if the op is ever shown to dominate the forward; deferred until
 // measured (current form is correct, graph-safe, and temp-buffer-free).
 
+#include <climits>
+
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -55,7 +57,7 @@ __global__ void gram_grouped_accum_kernel(
 
   const int64_t lo = offsets[e];
   const int64_t hi = offsets[e + 1];
-  const int n_e = static_cast<int>(hi - lo);
+  const int64_t n_e = hi - lo;  // int64: no truncation for huge token counts
 
   const int ty = threadIdx.y;  // i_local
   const int tx = threadIdx.x;  // j_local
@@ -67,16 +69,14 @@ __global__ void gram_grouped_accum_kernel(
   const int j = bj * TILE + tx;
 
   float acc = 0.0f;
-  for (int k0 = 0; k0 < n_e; k0 += TILE) {
-    const int ii = bi * TILE + ty;
-    const int ka = k0 + tx;
-    As[ty][tx] = (ii < d && ka < n_e)
-                     ? x_sorted[(lo + ka) * (int64_t)d + ii]
+  for (int64_t k0 = 0; k0 < n_e; k0 += TILE) {
+    const int64_t ka = k0 + tx;
+    As[ty][tx] = (i < d && ka < n_e)
+                     ? x_sorted[(lo + ka) * (int64_t)d + i]
                      : 0.0f;
-    const int jj = bj * TILE + tx;
-    const int kb = k0 + ty;
-    Bs[ty][tx] = (jj < d && kb < n_e)
-                     ? x_sorted[(lo + kb) * (int64_t)d + jj]
+    const int64_t kb = k0 + ty;
+    Bs[ty][tx] = (j < d && kb < n_e)
+                     ? x_sorted[(lo + kb) * (int64_t)d + j]
                      : 0.0f;
     __syncthreads();
 #pragma unroll
@@ -116,6 +116,12 @@ void gram_grouped_accum(
   TORCH_CHECK(cov.is_contiguous() && x_sorted.is_contiguous() &&
                   offsets.is_contiguous() && counts.is_contiguous(),
               "gram_grouped_accum: tensors must be contiguous");
+  TORCH_CHECK(counts.device() == cov.device() &&
+                  x_sorted.device() == cov.device() &&
+                  offsets.device() == cov.device(),
+              "gram_grouped_accum: all tensors must share one device");
+  TORCH_CHECK(cov.size(0) <= INT_MAX && cov.size(1) <= INT_MAX,
+              "gram_grouped_accum: E and d must fit in int32");
 
   const int E = static_cast<int>(cov.size(0));
   const int d = static_cast<int>(cov.size(1));
@@ -124,6 +130,9 @@ void gram_grouped_accum(
   TORCH_CHECK(offsets.numel() == E + 1, "offsets must have E+1 elements");
   TORCH_CHECK(counts.numel() == E, "counts must have E elements");
   if (E == 0 || d == 0) return;
+  // Caller contract, NOT re-validated here (reading offsets values
+  // device->host would break CUDA-graph capture): offsets is the non-decreasing
+  // per-expert prefix-sum with offsets[0]==0 and offsets[E]==R==x_sorted.size(0).
   (void)R;
 
   constexpr int TILE = 16;
@@ -142,6 +151,8 @@ void gram_grouped_accum(
 // nothing, so under fake-tensor tracing (torch.compile / export) there is no
 // shape to infer -- the Meta kernel just must exist so tracing never launches
 // the real CUDA kernel.
+// NOTE: signature must match the CUDA impl exactly (by-value at::Tensor) -- the
+// dispatcher rejects differing C++ signatures across kernels of one op.
 void gram_grouped_accum_meta(at::Tensor /*cov*/, at::Tensor /*counts*/,
                              at::Tensor /*x_sorted*/, at::Tensor /*offsets*/) {}
 

@@ -4,11 +4,13 @@ Fixes the RAM bomb in the old offload driver, which accumulated every window's
 Gram into an unbounded host dict (``cpu_sigma``) AND re-serialized the whole
 growing dict every window (~160 GB host RAM on a big model). Here each layer's
 Gram is cast to fp16 and written straight to a per-layer shard on disk the
-moment it is captured, then freed -- so host RAM is bounded by ONE layer's Gram
-regardless of layer count. The final ``covariance.pt`` is stream-assembled from
-the shards (one shard resident at a time), emitting the exact existing contract
-(``CovariancePayload`` -> ``sidecars/<stem>/covariance.pt``, fp16 ``sigma_in``,
-raw ``token_counts``, manifest-last).
+moment it is captured, then freed -- so DURING CAPTURE host RAM is bounded by
+ONE layer's Gram regardless of layer count (the RAM-bomb fix). The final
+``covariance.pt`` is assembled from the shards, emitting the exact existing
+contract (``CovariancePayload`` -> ``sidecars/<stem>/covariance.pt``, fp16
+``sigma_in``, raw ``token_counts``, manifest-last). NOTE: assembly itself is
+NOT memory-bounded -- the single-file consumer contract forces the full fp16
+dict into RAM before the write; see ``assemble_covariance``.
 
 Crash-safety: each shard is written atomically (tmp + fsync + replace +
 fsync-parent), so a kill loses at most the in-flight layer; ``scan_done_layers``
@@ -42,10 +44,12 @@ def staging_dir(replay_jsonl: Path, staging_override: str | None = None) -> Path
 
     Defaults to a sibling of the final ``covariance.pt`` (same filesystem, so
     the run's data volume -- not the OS root -- holds the shards). Pass
-    ``staging_override`` to place shards on an explicit large volume.
+    ``staging_override`` to place shards on an explicit large volume; a fixed
+    ``_covariance_staging`` subdirectory is always appended so a fresh-run wipe
+    (``rmtree``) never deletes the override path itself (e.g. a shared mount).
     """
     if staging_override:
-        return Path(staging_override)
+        return Path(staging_override) / "_covariance_staging"
     return sidecar_path(replay_jsonl, "covariance").parent / "_covariance_staging"
 
 
@@ -78,7 +82,9 @@ def write_layer_shard(
         c = int(cnt_cpu[e].item())
         if c <= 0:
             continue
-        sigma[e] = cov_cpu[e].to(torch.float16).clone()
+        # copy=True: one fp16 copy that never aliases cov_cpu (so the slice
+        # doesn't keep the whole layer tensor alive after we free it).
+        sigma[e] = cov_cpu[e].to(torch.float16, copy=True)
         counts[e] = c
     payload = {
         "schema": _SHARD_SCHEMA,
@@ -112,10 +118,20 @@ def assemble_covariance(
     n_experts: int,
     n_layers: int,
 ) -> int:
-    """Stream-merge per-layer fp16 shards into the single canonical
-    ``covariance.pt`` (byte-compatible with ``save_covariance``), bounded
-    memory: one shard resident at a time, tensors already fp16 (no re-clone, so
-    no transient fp32 doubling). Returns the (layer, expert) entry count.
+    """Merge per-layer fp16 shards into the single canonical ``covariance.pt``
+    (byte-compatible with ``save_covariance``). Returns the (layer, expert)
+    entry count.
+
+    MEMORY: this is NOT bounded -- the consumer contract is a single
+    ``torch.load`` of one ``covariance.pt``, so the full assembled ``sigma_in``
+    dict (~``n_layers * n_experts * d_in**2 * 2`` bytes, e.g. ~80 GB on a large
+    model) is resident in host RAM before the final write. Shards are read one
+    at a time and are already fp16 (no fp32 re-clone, halving peak vs reusing
+    ``save_covariance``), but the assembled dict is not freed until written.
+    Run on a box with enough RAM, or as a separate fresh process after the
+    capturing vLLM has exited (see the ``--input-cov-staging-dir`` /
+    assemble-only path). True bounded assembly would require a sharded final
+    layout that Stage 3/4's ``load_covariance`` does not yet support.
     """
     shard_files = sorted(staging.glob("layer_*.pt"))
     if not shard_files:

@@ -14,10 +14,10 @@ index 38af648..7d1b597 100644
  
 diff --git a/csrc/calibration/gram_grouped_accum.cu b/csrc/calibration/gram_grouped_accum.cu
 new file mode 100644
-index 0000000..ddd8dff
+index 0000000..440ef0c
 --- /dev/null
 +++ b/csrc/calibration/gram_grouped_accum.cu
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,175 @@
 +// Grouped symmetric Gram accumulation for MoE input-covariance calibration.
 +//
 +// Computes, per expert e, the in-place accumulation
@@ -42,6 +42,8 @@ index 0000000..ddd8dff
 +// (per-thread register micro-tiling / vectorized loads) could raise fp32
 +// throughput if the op is ever shown to dominate the forward; deferred until
 +// measured (current form is correct, graph-safe, and temp-buffer-free).
++
++#include <climits>
 +
 +#include <torch/all.h>
 +#include <ATen/cuda/CUDAContext.h>
@@ -75,7 +77,7 @@ index 0000000..ddd8dff
 +
 +  const int64_t lo = offsets[e];
 +  const int64_t hi = offsets[e + 1];
-+  const int n_e = static_cast<int>(hi - lo);
++  const int64_t n_e = hi - lo;  // int64: no truncation for huge token counts
 +
 +  const int ty = threadIdx.y;  // i_local
 +  const int tx = threadIdx.x;  // j_local
@@ -87,16 +89,14 @@ index 0000000..ddd8dff
 +  const int j = bj * TILE + tx;
 +
 +  float acc = 0.0f;
-+  for (int k0 = 0; k0 < n_e; k0 += TILE) {
-+    const int ii = bi * TILE + ty;
-+    const int ka = k0 + tx;
-+    As[ty][tx] = (ii < d && ka < n_e)
-+                     ? x_sorted[(lo + ka) * (int64_t)d + ii]
++  for (int64_t k0 = 0; k0 < n_e; k0 += TILE) {
++    const int64_t ka = k0 + tx;
++    As[ty][tx] = (i < d && ka < n_e)
++                     ? x_sorted[(lo + ka) * (int64_t)d + i]
 +                     : 0.0f;
-+    const int jj = bj * TILE + tx;
-+    const int kb = k0 + ty;
-+    Bs[ty][tx] = (jj < d && kb < n_e)
-+                     ? x_sorted[(lo + kb) * (int64_t)d + jj]
++    const int64_t kb = k0 + ty;
++    Bs[ty][tx] = (j < d && kb < n_e)
++                     ? x_sorted[(lo + kb) * (int64_t)d + j]
 +                     : 0.0f;
 +    __syncthreads();
 +#pragma unroll
@@ -136,6 +136,12 @@ index 0000000..ddd8dff
 +  TORCH_CHECK(cov.is_contiguous() && x_sorted.is_contiguous() &&
 +                  offsets.is_contiguous() && counts.is_contiguous(),
 +              "gram_grouped_accum: tensors must be contiguous");
++  TORCH_CHECK(counts.device() == cov.device() &&
++                  x_sorted.device() == cov.device() &&
++                  offsets.device() == cov.device(),
++              "gram_grouped_accum: all tensors must share one device");
++  TORCH_CHECK(cov.size(0) <= INT_MAX && cov.size(1) <= INT_MAX,
++              "gram_grouped_accum: E and d must fit in int32");
 +
 +  const int E = static_cast<int>(cov.size(0));
 +  const int d = static_cast<int>(cov.size(1));
@@ -144,6 +150,9 @@ index 0000000..ddd8dff
 +  TORCH_CHECK(offsets.numel() == E + 1, "offsets must have E+1 elements");
 +  TORCH_CHECK(counts.numel() == E, "counts must have E elements");
 +  if (E == 0 || d == 0) return;
++  // Caller contract, NOT re-validated here (reading offsets values
++  // device->host would break CUDA-graph capture): offsets is the non-decreasing
++  // per-expert prefix-sum with offsets[0]==0 and offsets[E]==R==x_sorted.size(0).
 +  (void)R;
 +
 +  constexpr int TILE = 16;
@@ -162,6 +171,8 @@ index 0000000..ddd8dff
 +// nothing, so under fake-tensor tracing (torch.compile / export) there is no
 +// shape to infer -- the Meta kernel just must exist so tracing never launches
 +// the real CUDA kernel.
++// NOTE: signature must match the CUDA impl exactly (by-value at::Tensor) -- the
++// dispatcher rejects differing C++ signatures across kernels of one op.
 +void gram_grouped_accum_meta(at::Tensor /*cov*/, at::Tensor /*counts*/,
 +                             at::Tensor /*x_sorted*/, at::Tensor /*offsets*/) {}
 +
@@ -6190,10 +6201,10 @@ index 0000000..f3b0d0e
 +)
 diff --git a/vllm/calibration_hooks.py b/vllm/calibration_hooks.py
 new file mode 100644
-index 0000000..95f644d
+index 0000000..7e53fb5
 --- /dev/null
 +++ b/vllm/calibration_hooks.py
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,375 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Calibration capture hooks for the MoE forward path.
@@ -6478,13 +6489,12 @@ index 0000000..95f644d
 +# allocates or reads them. The calib_layer_in_accum custom op + its qwen
 +# callers were deleted with them.
 +# input_cov (resident mode): per-expert Gram [E, H, H] + per-expert token
-+# counts [E] + per-forward scratch [E, buf_rows+1, H].
++# counts [E] + the compact grouped-SYRK scratch below.
 +_INPUT_COV_GPU: dict[int, "torch.Tensor"] = {}          # [E, H, H] fp32
 +_INPUT_COV_COUNT_GPU: dict[int, "torch.Tensor"] = {}    # [E] int64
-+_INPUT_COV_TEMP_GPU: dict[int, "torch.Tensor"] = {}     # legacy padded temp [E, buf_rows+1, H] (unused by the fused grouped-SYRK path)
 +# Fused grouped-SYRK path scratch (graph-safe compact counting-sort). Replaces
-+# the padded _INPUT_COV_TEMP_GPU: per-layer footprint drops from
-+# [E, buf_rows+1, H] to a single [buf_rows*top_k, H] compact buffer.
++# the old padded per-forward temp ([E, buf_rows+1, H]): per-layer footprint
++# drops to a single [buf_rows*top_k, H] compact buffer (~E x smaller).
 +_INPUT_COV_XSORTED_GPU: dict[int, "torch.Tensor"] = {}  # [buf_rows*top_k, H] fp32 expert-contiguous tokens
 +_INPUT_COV_OFFSETS_GPU: dict[int, "torch.Tensor"] = {}  # [E+1] int64 per-expert prefix-sum
 +_INPUT_COV_COUNTS_SCRATCH_GPU: dict[int, "torch.Tensor"] = {}  # [E] int64 per-forward offset scratch
@@ -7285,10 +7295,10 @@ index 0000000..818433f
 +    return n
 diff --git a/vllm/calibration_input_cov.py b/vllm/calibration_input_cov.py
 new file mode 100644
-index 0000000..f270f36
+index 0000000..2d09960
 --- /dev/null
 +++ b/vllm/calibration_input_cov.py
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,361 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert, "gate_proj") teacher input covariance capture for
@@ -7472,7 +7482,11 @@ index 0000000..f270f36
 +
 +
 +def free_layer(li: int) -> None:
-+    """Drop a layer's resident Gram + scratch (offload driver, per-window)."""
++    """Drop a layer's resident Gram + compact scratch (offload driver,
++    per-window). ``_ONES_I64_BUF_GPU`` is intentionally NOT dropped here: it is
++    a shared ones buffer that other calibration signals (imatrix/wanda/...) may
++    also key by ``li``, so freeing it could break a co-running signal. (The
++    offload driver, which is sole-capture, clears it itself.)"""
 +    for _d in (_ch._INPUT_COV_GPU, _ch._INPUT_COV_COUNT_GPU,
 +               _ch._INPUT_COV_XSORTED_GPU, _ch._INPUT_COV_OFFSETS_GPU,
 +               _ch._INPUT_COV_COUNTS_SCRATCH_GPU):
@@ -10182,7 +10196,7 @@ index 8d974ea..3a5f115 100644
  
  
 diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
-index 37b15ed..13f2986 100644
+index 37b15ed..4ce4a47 100644
 --- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
 +++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
 @@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
@@ -10230,7 +10244,7 @@ index 37b15ed..13f2986 100644
          if self._quant_method.is_monolithic:
              fused_out = self._quant_method.apply_monolithic(
                  layer=layer,
-@@ -533,6 +557,135 @@ class MoERunner(MoERunnerInterface):
+@@ -533,6 +557,144 @@ class MoERunner(MoERunnerInterface):
              if routing_replay_out is not None:
                  routing_replay_out[: topk_ids.shape[0]].copy_(topk_ids.to(torch.int16))
  
@@ -10341,32 +10355,41 @@ index 37b15ed..13f2986 100644
 +                _x = hidden_states.float()               # [T, H]
 +                _topk = topk_ids.shape[1]
 +                _R = _x.shape[0] * _topk
-+                _flat = topk_ids.reshape(-1).to(torch.int64)   # [R]
-+                # per-expert prefix-sum offsets (scatter_add + cumsum; no
-+                # bincount host-size sync).
-+                _counts = _ch._INPUT_COV_COUNTS_SCRATCH_GPU[_li]
-+                _counts.zero_()
-+                _counts.scatter_add_(
-+                    0, _flat, _ch._ONES_I64_BUF_GPU[_li][:_R])
-+                _offsets = _ch._INPUT_COV_OFFSETS_GPU[_li]
-+                _offsets.zero_()
-+                torch.cumsum(_counts, 0, out=_offsets[1:])
-+                # compact expert-contiguous token rows: x_sorted[pos] = x[token]
-+                _order = torch.argsort(_flat, stable=True)     # [R]
-+                _tok = torch.div(_order, _topk, rounding_mode="floor")
-+                _xs = _ch._INPUT_COV_XSORTED_GPU[_li]
-+                torch.index_select(_x, 0, _tok, out=_xs[:_R])
-+                # cov[e] += X_e^T X_e ; counts[e] += n_e  (in-place, fused).
-+                torch.ops.calib_gram.gram_grouped_accum(
-+                    _ch._INPUT_COV_GPU[_li],
-+                    _ch._INPUT_COV_COUNT_GPU[_li],
-+                    _xs[:_R], _offsets,
-+                )
++                _xs = _ch._INPUT_COV_XSORTED_GPU[_li]     # [r_max, H]
++                # Capacity guard: _R = T*top_k must fit r_max = buf_rows*top_k.
++                # It always does when buf_rows >= the scheduler's
++                # max_num_batched_tokens (the per-forward token cap), which is
++                # the intended sizing. _R is constant per captured cudagraph
++                # size, so this branch resolves at trace time (graph-safe). If a
++                # misconfigured buf_rows is too small we SKIP this forward's
++                # contribution rather than index x_sorted / ones out of bounds
++                # (which would read garbage GPU memory via the kernel offsets).
++                if _R <= _xs.shape[0]:
++                    _flat = topk_ids.reshape(-1).to(torch.int64)   # [R]
++                    # per-expert prefix-sum offsets (scatter_add + cumsum; no
++                    # bincount host-size sync).
++                    _counts = _ch._INPUT_COV_COUNTS_SCRATCH_GPU[_li]
++                    _counts.zero_()
++                    _counts.scatter_add_(
++                        0, _flat, _ch._ONES_I64_BUF_GPU[_li][:_R])
++                    _offsets = _ch._INPUT_COV_OFFSETS_GPU[_li]
++                    _offsets.zero_()
++                    torch.cumsum(_counts, 0, out=_offsets[1:])
++                    # compact expert-contiguous rows: x_sorted[pos] = x[token]
++                    _order = torch.argsort(_flat, stable=True)     # [R]
++                    _tok = torch.div(_order, _topk, rounding_mode="floor")
++                    torch.index_select(_x, 0, _tok, out=_xs[:_R])
++                    # cov[e] += X_e^T X_e ; counts[e] += n_e (in-place, fused).
++                    torch.ops.calib_gram.gram_grouped_accum(
++                        _ch._INPUT_COV_GPU[_li],
++                        _ch._INPUT_COV_COUNT_GPU[_li],
++                        _xs[:_R], _offsets,
++                    )
 +
              # Passing shared_experts_input in case SharedExpertsOrder is
              # MK_INTERNAL_OVERLAPPED.
              fused_out = self._quant_method.apply(
-@@ -543,6 +696,11 @@ class MoERunner(MoERunnerInterface):
+@@ -543,6 +705,11 @@ class MoERunner(MoERunnerInterface):
                  shared_experts_input=shared_experts_input,
              )
  

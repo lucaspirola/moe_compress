@@ -109,10 +109,24 @@ def test_atomic_shard_is_complete_or_absent(tmp_path: Path):
     print("  PASS  atomic shard complete + zero-token experts elided")
 
 
+def test_staging_dir_override_appends_subdir(tmp_path: Path):
+    """An explicit --input-cov-staging-dir must get a fixed _covariance_staging
+    subdir appended, so a fresh-run rmtree never deletes the user's path."""
+    jsonl = _make_jsonl(tmp_path)
+    override = tmp_path / "shared_mount"
+    s = ico.staging_dir(jsonl, str(override))
+    assert s == override / "_covariance_staging"
+    assert s != override  # never the bare user path (rmtree-safety)
+    default = ico.staging_dir(jsonl)
+    assert default.name == "_covariance_staging"
+    print("  PASS  staging-dir override appends _covariance_staging (rmtree-safe)")
+
+
 if __name__ == "__main__":
     import tempfile
     for fn in (test_roundtrip_and_contract, test_resume_scan_partial,
-               test_atomic_shard_is_complete_or_absent):
+               test_atomic_shard_is_complete_or_absent,
+               test_staging_dir_override_appends_subdir):
         with tempfile.TemporaryDirectory() as d:
             fn(Path(d))
     print("ALL PASS")
