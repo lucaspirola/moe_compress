@@ -1553,6 +1553,28 @@ def main() -> int:
                         "(final-dump-only). On --resume, the checkpoint at "
                         "<jsonl>.input_cov.ckpt is hydrated automatically "
                         "if it exists.")
+    p.add_argument("--input-cov-offload", action="store_true", default=False,
+                   help="Capture input_covariance via the per-layer CPU-offload "
+                        "(windowed-resident) path instead of the all-resident "
+                        "setup. REQUIRED for the full Gram on a big model: the "
+                        "all-resident Gram is ~172 GB (40 layers x 256 experts x "
+                        "2048^2 x 4B) and OOMs. The offload allocates only a "
+                        "WINDOW of MoE layers at a time, early-exits the forward "
+                        "after the window's top layer (set_calibration_max_layer), "
+                        "snapshots each window's Gram to CPU, frees the GPU "
+                        "slice, and advances -- re-running the corpus once per "
+                        "window. Only valid in --replay-from mode with "
+                        "--capture-input-covariance as the SOLE capture flag "
+                        "(the per-window early-exit is incompatible with the "
+                        "other full-forward signals). Forces "
+                        "VLLM_CALIB_INPUT_COV_MODE=resident.")
+    p.add_argument("--input-cov-window-size", type=int, default=0,
+                   help="Number of MoE layers allocated resident per offload "
+                        "window. 0 (default) = auto-size from free GPU memory "
+                        "after model load (free // per-layer-Gram-bytes, with "
+                        "headroom). Smaller windows = lower peak VRAM but more "
+                        "corpus passes (cost ~ sum(window_top_layer)/n_layers x "
+                        "full forward). Only used with --input-cov-offload.")
     # W-1: Wanda scalar_row sidecar (audit/PLAN_W1).
     p.add_argument("--capture-wanda-scalar-row", action="store_true",
                    default=False,
@@ -1891,9 +1913,25 @@ def main() -> int:
     if args.capture_input_covariance:
         os.environ["VLLM_CALIB_CAPTURE_INPUT_COV"] = "1"
         os.environ["VLLM_CALIB_CAPTURE_EXPERT"] = "1"
+        # The in-graph Gram accumulation in moe_runner.py is guarded by
+        # ``_INPUT_COV_MODE == "resident"``. Without this the accumulation
+        # never fires and the sidecar is silently empty (one of the two
+        # original empty-capture root causes). The offload path uses the
+        # SAME resident accumulation kernel -- it just restricts which layers
+        # are allocated -- so it also runs in "resident" mode.
+        os.environ["VLLM_CALIB_INPUT_COV_MODE"] = "resident"
+        # CAPTURE_EXPERT requires the non-monolithic (Triton) MoE path;
+        # MoERunner.__init__ hard-asserts against monolithic backends when
+        # CAPTURE_EXPERT is set. _resolve_moe_backend already forces triton,
+        # but disable FlashInfer's monolithic fp16 path defensively (mirrors
+        # the reap-scores gate) so a stray backend selection can't trip the
+        # assert / silently miss the Gram.
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
         log.info("--capture-input-covariance: enabled "
                  "VLLM_CALIB_CAPTURE_INPUT_COV=1 + "
-                 "VLLM_CALIB_CAPTURE_EXPERT=1 "
+                 "VLLM_CALIB_CAPTURE_EXPERT=1 + "
+                 "VLLM_CALIB_INPUT_COV_MODE=resident + "
+                 "VLLM_USE_FLASHINFER_MOE_FP16=0 "
                  "(must precede vllm import)")
 
     # W-1: Pre-import env gates for the Wanda scalar_row path. Same strict-
@@ -2053,6 +2091,28 @@ def main() -> int:
     # B0/C1 env invariants, but before the generate-path cache_key block
     # (which _run_replay does not use). _run_replay owns the rest of main().
     if args.replay_from is not None:
+        if args.input_cov_offload:
+            # The per-window early-exit (set_calibration_max_layer) is
+            # incompatible with the other full-forward signals: it would
+            # truncate their accumulation at the window's top layer. Enforce
+            # input_covariance as the SOLE capture flag for the offload path.
+            _other = [
+                cap for cap in _CAPTURE_WRITER_MODULES
+                if cap != "capture_input_covariance"
+                and getattr(args, cap, False)
+            ]
+            if not args.capture_input_covariance:
+                log.error(
+                    "--input-cov-offload requires --capture-input-covariance.")
+                return 1
+            if _other:
+                log.error(
+                    "--input-cov-offload must be the SOLE capture flag "
+                    "(per-window early-exit truncates full-forward signals). "
+                    "Also enabled: %s. Run those in a separate replay pass.",
+                    _other)
+                return 1
+            return _run_input_cov_offload(args)
         return _run_replay(args)
 
     # --- cache_key + paths ----------------------------------------------
@@ -3669,6 +3729,356 @@ def _run_replay(args) -> int:
         "Sidecars at %s/",
         n_replayed, n_skipped, sidecar_dir,
     )
+    return 0
+
+
+def _introspect_calib_buf_rows(llm, fallback_mbt: int) -> int:
+    """Read the live TritonExperts._calib_buf_rows (side-store row capacity).
+
+    Mirrors the C2 introspection in _run_replay: the per-forward Gram temp is
+    sized [E, buf_rows+1, H], so buf_rows must match the wheel's actual buffer
+    or the scatter overflows / underflows. Falls back to the wheel formula
+    max(cudagraph, max_num_batched_tokens, 512) if introspection fails.
+    """
+    try:
+        _model = (llm.llm_engine.model_executor.driver_worker
+                  .model_runner.model)
+        for _name, _mod in _model.named_modules():
+            if getattr(_mod, "global_num_experts", None) is not None and \
+                    hasattr(_mod, "quant_method"):
+                _te = getattr(getattr(_mod.quant_method, "moe_kernel", None),
+                              "fused_experts", None)
+                _br = getattr(_te, "_calib_buf_rows", None)
+                if isinstance(_br, int) and _br > 0:
+                    return _br
+                break
+    except Exception as _exc:  # noqa: BLE001
+        log.warning("input-cov-offload: could not introspect "
+                    "_calib_buf_rows (%s)", _exc)
+    try:
+        _ccs = (llm.llm_engine.vllm_config
+                .compilation_config.max_cudagraph_capture_size) or 0
+    except AttributeError:
+        _ccs = 0
+    return max(_ccs, fallback_mbt, 512)
+
+
+def _run_input_cov_offload(args) -> int:
+    """input_covariance capture via the per-layer CPU-offload (windowed) path.
+
+    The all-resident Gram ([n_layers, E, H, H] fp32) is ~172 GB on the target
+    model and OOMs. This path allocates only a WINDOW of MoE layers at a time:
+
+      for each window [lo..hi] of MoE layer ids:
+        - allocate _ch._INPUT_COV_GPU[li]/_COUNT_GPU[li] for li in window;
+          point _ch._INPUT_COV_TEMP_GPU[li] at a single shared temp buffer.
+        - set_calibration_max_layer(hi)  -> forward early-exits after hi.
+        - run the full corpus (forward-only, prefill) once.
+        - snapshot each window layer's Gram + counts to a CPU dict; free the
+          GPU slice; advance.
+
+    Each MoE layer is in exactly one window, so every layer integrates over the
+    full corpus exactly once (no double counting). The in-graph accumulation in
+    moe_runner.py is the SAME resident kernel; it fires for a layer iff that
+    layer is present in _ch._INPUT_COV_GPU (per-layer guard), so absent layers
+    (prior/future windows) are silently skipped.
+
+    Resume is at WINDOW granularity via <jsonl>.input_cov_offload.ckpt.
+    On success writes the canonical input_cov sidecar (same on-disk shape as
+    dump_input_cov) and returns 0.
+    """
+    # ------------------------------------------------------------------
+    # 1. Input validation + corpus load (mirrors _run_replay steps 1-2)
+    # ------------------------------------------------------------------
+    replay_jsonl = Path(args.replay_from).resolve()
+    if not replay_jsonl.is_file():
+        log.error("--replay-from: file not found: %s", replay_jsonl)
+        return 1
+
+    _harden_runtime_env(str(replay_jsonl), args.dtype)
+
+    all_rows: list[dict] = []
+    with replay_jsonl.open(encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                log.error("input-cov-offload: invalid JSON at line %d: %s",
+                          lineno, exc)
+                return 1
+            if len(row.get("messages", [])) < 2:
+                log.error("input-cov-offload: line %d: messages missing/<2.",
+                          lineno)
+                return 1
+            all_rows.append(row)
+    if not all_rows:
+        log.error("input-cov-offload: no rows in %s", replay_jsonl)
+        return 1
+    log.info("input-cov-offload: loaded %d rows from %s",
+             len(all_rows), replay_jsonl)
+
+    # ------------------------------------------------------------------
+    # 2. Load teacher (forward-only; keep gpu-memory-utilization LOW so the
+    #    windowed Gram has room -- vLLM otherwise reserves most VRAM for KV).
+    # ------------------------------------------------------------------
+    _MBT = args.max_num_batched_tokens or 2048
+    _NUM_SEQS = args.max_num_seqs or 256
+    llm = _load_teacher_vllm(
+        args.teacher,
+        args.teacher_revision,
+        args.dtype,
+        args.gpu_memory_utilization,
+        args.max_model_len,
+        max_num_seqs=_NUM_SEQS,
+        max_num_batched_tokens=_MBT,
+        max_logprobs=1,
+        moe_backend=_resolve_moe_backend(args),
+    )
+    tokenizer = llm.get_tokenizer()
+
+    import torch  # noqa: PLC0415  (after vLLM import to keep CUDA init order)
+    import vllm.calibration_hooks as _ch  # type: ignore
+    import vllm.calibration_input_cov as _icov  # type: ignore
+    from moe_compress.utils.cached_calibration_signals import (  # type: ignore
+        CovariancePayload, save_covariance, SCHEMA_VERSIONS,
+    )
+
+    if _ch._INPUT_COV_MODE != "resident":
+        log.error(
+            "input-cov-offload: VLLM_CALIB_INPUT_COV_MODE=%r (expected "
+            "'resident'). The accumulation kernel is gated on 'resident'; the "
+            "env gate in main() should have set it. Aborting.",
+            _ch._INPUT_COV_MODE)
+        return 1
+
+    # ------------------------------------------------------------------
+    # 3. Discover MoE topology + buffer size
+    # ------------------------------------------------------------------
+    model = _icov._resolve_model(llm)
+    if model is None:
+        log.error("input-cov-offload: could not resolve model.")
+        return 1
+    layer_ids, n_experts, d_in, device = _icov._discover_moe_layers(model)
+    if not layer_ids or n_experts == 0 or d_in == 0:
+        log.error(
+            "input-cov-offload: incomplete MoE discovery "
+            "(layers=%d, experts=%d, d_in=%d).",
+            len(layer_ids), n_experts, d_in)
+        return 1
+    if device is None:
+        device = torch.device("cuda")
+    n_layers = len(layer_ids)
+    buf_rows = _introspect_calib_buf_rows(llm, _MBT)
+    if buf_rows < _MBT:
+        log.error(
+            "input-cov-offload: _calib_buf_rows=%d < max_num_batched_tokens="
+            "%d; forward batches > buf_rows would be skipped. Lower "
+            "--max-num-batched-tokens to %d. Aborting.",
+            buf_rows, _MBT, buf_rows)
+        return 1
+
+    gram_bytes = n_experts * d_in * d_in * 4          # per-layer Gram [E,H,H]
+    temp_bytes = n_experts * (buf_rows + 1) * d_in * 4  # shared temp
+    log.info(
+        "input-cov-offload: topology n_layers=%d, n_experts=%d, d_in=%d, "
+        "buf_rows=%d; per-layer Gram=%.2f GB, shared temp=%.2f GB.",
+        n_layers, n_experts, d_in, buf_rows,
+        gram_bytes / 2**30, temp_bytes / 2**30)
+
+    # ------------------------------------------------------------------
+    # 4. Window sizing (auto from free VRAM after model+KV are allocated)
+    # ------------------------------------------------------------------
+    if args.input_cov_window_size > 0:
+        window_size = min(args.input_cov_window_size, n_layers)
+        log.info("input-cov-offload: window_size=%d (from "
+                 "--input-cov-window-size).", window_size)
+    else:
+        free_b, total_b = torch.cuda.mem_get_info()
+        headroom = max(8 * 2**30, int(0.10 * total_b))
+        usable = free_b - temp_bytes - headroom
+        window_size = max(0, int(usable // gram_bytes))
+        window_size = min(window_size, n_layers)
+        log.info(
+            "input-cov-offload: auto window_size=%d (free=%.1f GB, total=%.1f "
+            "GB, temp=%.2f GB, headroom=%.1f GB, gram/layer=%.2f GB).",
+            window_size, free_b / 2**30, total_b / 2**30,
+            temp_bytes / 2**30, headroom / 2**30, gram_bytes / 2**30)
+        if window_size < 1:
+            log.error(
+                "input-cov-offload: not enough free VRAM for even ONE layer's "
+                "Gram (%.2f GB) + temp (%.2f GB). Lower "
+                "--gpu-memory-utilization (vLLM reserves most VRAM for KV "
+                "cache) or --max-num-batched-tokens. Aborting.",
+                gram_bytes / 2**30, temp_bytes / 2**30)
+            return 1
+
+    windows = [layer_ids[i:i + window_size]
+               for i in range(0, n_layers, window_size)]
+    log.info("input-cov-offload: %d window(s) over %d layers: %s",
+             len(windows), n_layers,
+             [(w[0], w[-1]) for w in windows])
+
+    # ------------------------------------------------------------------
+    # 5. Pre-render the corpus once (reused across every window pass)
+    # ------------------------------------------------------------------
+    rendered: list[list[int]] = []
+    n_skipped = 0
+    for row in all_rows:
+        result = _render_row_for_replay(row, tokenizer, args.max_model_len)
+        if result is None:
+            n_skipped += 1
+        else:
+            tok_ids, _ = result
+            rendered.append(tok_ids)
+    if not rendered:
+        log.error("input-cov-offload: all %d rows over --max-model-len=%d.",
+                  len(all_rows), args.max_model_len)
+        return 1
+    log.info("input-cov-offload: %d rows renderable, %d skipped (over "
+             "--max-model-len=%d).", len(rendered), n_skipped,
+             args.max_model_len)
+
+    from vllm import SamplingParams  # type: ignore
+    sp = SamplingParams(temperature=0.0, max_tokens=1, seed=args.seed)
+
+    # ------------------------------------------------------------------
+    # 6. Resume (window granularity)
+    # ------------------------------------------------------------------
+    offload_ckpt = replay_jsonl.with_suffix(
+        replay_jsonl.suffix + ".input_cov_offload.ckpt")
+    cpu_sigma: dict = {}        # (layer, expert, "gate_proj") -> Tensor[H,H]
+    cpu_counts: dict = {}       # (layer, expert, "gate_proj") -> int
+    windows_done = 0
+    if args.resume and offload_ckpt.exists():
+        try:
+            _ck = torch.load(offload_ckpt, map_location="cpu",
+                             weights_only=False)
+            if (int(_ck.get("n_experts", -1)) == n_experts
+                    and int(_ck.get("d_in", -1)) == d_in
+                    and int(_ck.get("window_size", -1)) == window_size):
+                cpu_sigma = _ck["cpu_sigma"]
+                cpu_counts = _ck["cpu_counts"]
+                windows_done = int(_ck["windows_done"])
+                log.info("input-cov-offload: resume -- %d/%d windows done, "
+                         "%d entries hydrated.", windows_done, len(windows),
+                         len(cpu_sigma))
+            else:
+                log.warning("input-cov-offload: ckpt topology mismatch; "
+                            "ignoring and restarting from window 0.")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("input-cov-offload: could not read ckpt (%s); "
+                        "restarting from window 0.", exc)
+
+    # ------------------------------------------------------------------
+    # 7. Shared per-forward temp (allocated ONCE; reused every window/layer).
+    #    Sequential layer execution within a forward zeroes+folds it per
+    #    layer before the next, so a single buffer is correct.
+    # ------------------------------------------------------------------
+    shared_temp = torch.zeros(
+        n_experts, buf_rows + 1, d_in, dtype=torch.float32, device=device)
+
+    t0 = time.monotonic()
+    for w_idx, window in enumerate(windows):
+        if w_idx < windows_done:
+            continue
+        hi = window[-1]
+        # Allocate this window's Gram slices; point temp at the shared buffer.
+        _ch._INPUT_COV_GPU.clear()
+        _ch._INPUT_COV_COUNT_GPU.clear()
+        _ch._INPUT_COV_TEMP_GPU.clear()
+        for li in window:
+            _ch._INPUT_COV_GPU[li] = torch.zeros(
+                n_experts, d_in, d_in, dtype=torch.float32, device=device)
+            _ch._INPUT_COV_COUNT_GPU[li] = torch.zeros(
+                n_experts, dtype=torch.int64, device=device)
+            _ch._INPUT_COV_TEMP_GPU[li] = shared_temp
+        _ch.set_calibration_max_layer(hi)
+        log.info(
+            "input-cov-offload: window %d/%d layers [%d..%d] -- "
+            "max_layer=%d, %d Gram slices allocated (%.1f GB).",
+            w_idx + 1, len(windows), window[0], hi, hi, len(window),
+            len(window) * gram_bytes / 2**30)
+
+        # Forward the full corpus (prefill-only) in chunks.
+        w_t0 = time.monotonic()
+        for cstart in range(0, len(rendered), args.chunk_size):
+            chunk = rendered[cstart: cstart + args.chunk_size]
+            requests = [{"prompt_token_ids": ids} for ids in chunk]
+            outputs = llm.generate(requests, sp)
+            del outputs
+            if (cstart // args.chunk_size) % 10 == 0:
+                log.info(
+                    "input-cov-offload: window %d/%d, %d/%d rows, "
+                    "%.0fs elapsed.",
+                    w_idx + 1, len(windows),
+                    min(cstart + args.chunk_size, len(rendered)),
+                    len(rendered), time.monotonic() - t0)
+        log.info("input-cov-offload: window %d/%d forward done in %.0fs.",
+                 w_idx + 1, len(windows), time.monotonic() - w_t0)
+
+        # Snapshot this window's layers to CPU, then free GPU slices.
+        for li in window:
+            cov_cpu = _ch._INPUT_COV_GPU[li].cpu()       # [E, H, H]
+            cnt_cpu = _ch._INPUT_COV_COUNT_GPU[li].cpu()  # [E]
+            for e in range(n_experts):
+                c = int(cnt_cpu[e].item())
+                if c <= 0:
+                    continue
+                key = (int(li), int(e), "gate_proj")
+                cpu_sigma[key] = cov_cpu[e].clone()
+                cpu_counts[key] = c
+        _ch._INPUT_COV_GPU.clear()
+        _ch._INPUT_COV_COUNT_GPU.clear()
+        _ch._INPUT_COV_TEMP_GPU.clear()
+        torch.cuda.empty_cache()
+
+        windows_done = w_idx + 1
+        tmp = str(offload_ckpt) + ".tmp"
+        torch.save({
+            "schema": 1,
+            "n_experts": n_experts,
+            "d_in": d_in,
+            "n_layers": n_layers,
+            "window_size": window_size,
+            "windows_done": windows_done,
+            "cpu_sigma": cpu_sigma,
+            "cpu_counts": cpu_counts,
+        }, tmp)
+        os.replace(tmp, offload_ckpt)
+        log.info("input-cov-offload: window %d/%d checkpointed "
+                 "(%d entries so far).", windows_done, len(windows),
+                 len(cpu_sigma))
+
+    _ch.set_calibration_max_layer(None)
+    del shared_temp
+    torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # 8. Assemble + write the canonical sidecar (same shape as dump_input_cov)
+    # ------------------------------------------------------------------
+    if not cpu_sigma:
+        log.error("input-cov-offload: no entries captured; refusing to write "
+                  "an empty sidecar.")
+        return 1
+    payload = CovariancePayload(
+        schema_version=SCHEMA_VERSIONS["covariance"],
+        n_experts=n_experts,
+        n_layers=n_layers,
+        sigma_in=cpu_sigma,
+        token_counts=cpu_counts,
+    )
+    save_covariance(payload, replay_jsonl)
+    log.info(
+        "input-cov-offload: wrote %d (layer, expert) entries (%d layers x %d "
+        "experts) for %s in %.0fs.",
+        len(cpu_sigma), n_layers, n_experts, replay_jsonl,
+        time.monotonic() - t0)
+
+    if offload_ckpt.exists():
+        offload_ckpt.unlink()
     return 0
 
 
