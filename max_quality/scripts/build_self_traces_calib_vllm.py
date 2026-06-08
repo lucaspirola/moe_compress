@@ -3371,6 +3371,7 @@ def _run_replay(args) -> int:
 
         # Block-outputs subset gate.
         total_rows_consumed = rows_done_base + n_replayed + n_skipped
+        _block_outputs_early_exit = False
         if (
             args.capture_block_outputs
             and total_rows_consumed >= args.block_outputs_subset_size
@@ -3384,9 +3385,23 @@ def _run_replay(args) -> int:
                         "(>= subset_size=%d).",
                         total_rows_consumed, args.block_outputs_subset_size,
                     )
+                # Early-exit: when block_outputs is the SOLE enabled capture
+                # and its subset is full, the remaining corpus contributes
+                # nothing (the block hook is now a no-op). Stop replaying and
+                # proceed straight to the dump -- saves a full forward over the
+                # rest of the corpus (e.g. ~50 min on an 8000-row pass). The
+                # dump reads in-memory accumulators, so breaking here is safe.
+                if _enabled_captures == ["capture_block_outputs"]:
+                    log.info(
+                        "block-outputs: sole capture and subset closed; "
+                        "ending replay early at %d rows consumed -> dump.",
+                        total_rows_consumed)
+                    _block_outputs_early_exit = True
             except Exception as exc:
                 log.error("block-outputs close_subset failed: %s", exc,
                           exc_info=True)
+        if _block_outputs_early_exit:
+            break
 
         # ---- Periodic per-writer checkpoints ---------------------------
         # All counters use total_done_captures (captured rows only, no skips).
