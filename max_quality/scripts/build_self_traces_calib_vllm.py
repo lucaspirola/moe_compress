@@ -3788,7 +3788,8 @@ def _run_input_cov_offload(args) -> int:
 
       for each window [lo..hi] of MoE layer ids:
         - allocate _ch._INPUT_COV_GPU[li]/_COUNT_GPU[li] for li in window;
-          point _ch._INPUT_COV_TEMP_GPU[li] at a single shared temp buffer.
+          alias the shared compact scratch (_INPUT_COV_XSORTED_GPU[li] /
+          _OFFSETS_GPU[li] / _COUNTS_SCRATCH_GPU[li] / _ONES_I64_BUF_GPU[li]).
         - set_calibration_max_layer(hi)  -> forward early-exits after hi.
         - run the full corpus (forward-only, prefill) once.
         - stream each window layer's Gram to a durable fp16 shard on disk, then
