@@ -15,11 +15,13 @@
 // fp32 CUDA-core FMA accumulation (NOT tf32 tensor cores) to keep Sigma_in
 // numerically exact for the downstream eigendecomposition/EoRA contract.
 //
-// v1 is correctness-first: one thread per (e, i, j) output element, looping
-// the expert's token segment with naive global loads. Each output element is
-// written by exactly one thread, so the in-place `+=` needs no atomics. A
-// shared-memory-tiled + symmetric (upper-triangle + mirror) variant is a
-// later optimization that must preserve this numerical contract.
+// Implementation: shared-memory-tiled X_e^T @ X_e with symmetry (strictly-lower
+// output tiles early-return; upper tiles write both [i,j] and the mirror [j,i];
+// diagonal tiles write [i,j] only). Each output element is written by exactly
+// one thread, so the in-place `+=` needs no atomics. A further optimization
+// (per-thread register micro-tiling / vectorized loads) could raise fp32
+// throughput if the op is ever shown to dominate the forward; deferred until
+// measured (current form is correct, graph-safe, and temp-buffer-free).
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -27,29 +29,71 @@
 
 namespace calib {
 
+// Shared-memory-tiled  cov[e] += X_e^T @ X_e  with symmetry.
+//
+// Output is tiled TILE x TILE. The grid is the full (nTiles, nTiles, E) square
+// but strictly-lower output tiles (bj < bi) early-return, halving the compute;
+// an upper tile (bj > bi) writes both C[i,j] and its mirror C[j,i] (the mirror
+// element's own tile is a skipped lower tile, so there is no double-write and
+// no atomics). Diagonal tiles (bj == bi) write only C[i,j], covering the whole
+// block including its sub-diagonal.
+//
+// As[i_local][k_local] stages the X^T tile, Bs[k_local][j_local] the X tile;
+// acc += sum_k As[i][k] * Bs[k][j] accumulates in fp32. Each output element is
+// written by exactly one thread.
+template <int TILE>
 __global__ void gram_grouped_accum_kernel(
     float* __restrict__ cov,            // [E, d, d]
     int64_t* __restrict__ counts,       // [E]
     const float* __restrict__ x_sorted, // [R, d]
     const int64_t* __restrict__ offsets,// [E+1]
-    int E, int d, int64_t R) {
+    int d) {
   const int e = blockIdx.z;
-  const int i = blockIdx.y * blockDim.y + threadIdx.y;  // output row
-  const int j = blockIdx.x * blockDim.x + threadIdx.x;  // output col
-  if (e >= E || i >= d || j >= d) return;
+  const int bi = blockIdx.y;  // output row tile
+  const int bj = blockIdx.x;  // output col tile
+  if (bj < bi) return;        // symmetry: skip strictly-lower tiles
 
   const int64_t lo = offsets[e];
   const int64_t hi = offsets[e + 1];
+  const int n_e = static_cast<int>(hi - lo);
+
+  const int ty = threadIdx.y;  // i_local
+  const int tx = threadIdx.x;  // j_local
+
+  __shared__ float As[TILE][TILE];  // [i_local][k_local]
+  __shared__ float Bs[TILE][TILE];  // [k_local][j_local]
+
+  const int i = bi * TILE + ty;
+  const int j = bj * TILE + tx;
 
   float acc = 0.0f;
-  for (int64_t k = lo; k < hi; ++k) {
-    const float* row = x_sorted + k * (int64_t)d;
-    acc += row[i] * row[j];
+  for (int k0 = 0; k0 < n_e; k0 += TILE) {
+    const int ii = bi * TILE + ty;
+    const int ka = k0 + tx;
+    As[ty][tx] = (ii < d && ka < n_e)
+                     ? x_sorted[(lo + ka) * (int64_t)d + ii]
+                     : 0.0f;
+    const int jj = bj * TILE + tx;
+    const int kb = k0 + ty;
+    Bs[ty][tx] = (jj < d && kb < n_e)
+                     ? x_sorted[(lo + kb) * (int64_t)d + jj]
+                     : 0.0f;
+    __syncthreads();
+#pragma unroll
+    for (int kl = 0; kl < TILE; ++kl) {
+      acc += As[ty][kl] * Bs[kl][tx];
+    }
+    __syncthreads();
   }
-  cov[((int64_t)e * d + i) * d + j] += acc;
 
-  // One thread per expert advances the token count.
-  if (i == 0 && j == 0) {
+  if (i < d && j < d) {
+    cov[((int64_t)e * d + i) * d + j] += acc;
+    if (bj > bi) {
+      cov[((int64_t)e * d + j) * d + i] += acc;  // mirror (Gram is symmetric)
+    }
+  }
+
+  if (bi == 0 && bj == 0 && ty == 0 && tx == 0) {
     counts[e] += (hi - lo);
   }
 }
@@ -80,15 +124,18 @@ void gram_grouped_accum(
   TORCH_CHECK(offsets.numel() == E + 1, "offsets must have E+1 elements");
   TORCH_CHECK(counts.numel() == E, "counts must have E elements");
   if (E == 0 || d == 0) return;
+  (void)R;
 
+  constexpr int TILE = 16;
+  const int n_tiles = (d + TILE - 1) / TILE;
   const at::cuda::CUDAGuard guard(cov.device());
-  dim3 block(16, 16);
-  dim3 grid((d + block.x - 1) / block.x, (d + block.y - 1) / block.y,
+  dim3 block(TILE, TILE);
+  dim3 grid(static_cast<unsigned>(n_tiles), static_cast<unsigned>(n_tiles),
             static_cast<unsigned>(E));
   auto stream = at::cuda::getCurrentCUDAStream();
-  gram_grouped_accum_kernel<<<grid, block, 0, stream>>>(
+  gram_grouped_accum_kernel<TILE><<<grid, block, 0, stream>>>(
       cov.data_ptr<float>(), counts.data_ptr<int64_t>(),
-      x_sorted.data_ptr<float>(), offsets.data_ptr<int64_t>(), E, d, R);
+      x_sorted.data_ptr<float>(), offsets.data_ptr<int64_t>(), d);
 }
 
 // Meta (fake-tensor) impl: a no-op. The op mutates in place and returns
