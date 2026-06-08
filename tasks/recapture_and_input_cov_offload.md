@@ -93,8 +93,10 @@ temp small (temp = E*(mbt+1)*H*4 ~ 256*2049*2048*4 ~ 4.3GB at mbt=2048).
 python max_quality/scripts/build_self_traces_calib_vllm.py \
   --replay-from $JSONL --teacher <base> --dtype bfloat16 \
   --gpu-memory-utilization 0.45 --max-num-batched-tokens 2048 --chunk-size 200 \
-  --resume --capture-input-covariance --input-cov-offload --input-cov-window-size 0
+  --resume --capture-input-covariance --input-cov-offload \
+  --input-cov-window-size 0 --input-cov-max-rows 3000
 ```
+(User chose a ~3000 representative subset for D2; D1 stays at full 8000.)
 Window auto-sizes from free VRAM. Verify sidecar CONTENT (40*256 entries,
 [2048,2048] each, counts>0), then push to HF. Teardown GPU, keep volume.
 
