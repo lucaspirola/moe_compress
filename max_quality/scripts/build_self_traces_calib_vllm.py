@@ -1600,6 +1600,14 @@ def main() -> int:
                         "headroom). Smaller windows = lower peak VRAM but more "
                         "corpus passes (cost ~ sum(window_top_layer)/n_layers x "
                         "full forward). Only used with --input-cov-offload.")
+    p.add_argument("--input-cov-staging-dir", type=str, default=None,
+                   help="Directory for the per-layer fp16 Gram shards written "
+                        "during --input-cov-offload (streaming offload, the "
+                        "RAM-bomb fix). Default: <jsonl>/sidecars/<stem>/"
+                        "_covariance_staging (sibling of the final "
+                        "covariance.pt, on the run's data volume). Point at a "
+                        "large volume if the JSONL lives on a small OS disk. "
+                        "Shards resume the run (--resume) at LAYER granularity.")
     # W-1: Wanda scalar_row sidecar (audit/PLAN_W1).
     p.add_argument("--capture-wanda-scalar-row", action="store_true",
                    default=False,
@@ -3851,9 +3859,7 @@ def _run_input_cov_offload(args) -> int:
     import torch  # noqa: PLC0415  (after vLLM import to keep CUDA init order)
     import vllm.calibration_hooks as _ch  # type: ignore
     import vllm.calibration_input_cov as _icov  # type: ignore
-    from moe_compress.utils.cached_calibration_signals import (  # type: ignore
-        CovariancePayload, save_covariance, SCHEMA_VERSIONS,
-    )
+    from moe_compress.utils import input_cov_offload as _ico  # type: ignore
 
     if _ch._INPUT_COV_MODE != "resident":
         log.error(
@@ -3870,7 +3876,7 @@ def _run_input_cov_offload(args) -> int:
     if model is None:
         log.error("input-cov-offload: could not resolve model.")
         return 1
-    layer_ids, n_experts, d_in, device = _icov._discover_moe_layers(model)
+    layer_ids, n_experts, top_k, d_in, device = _icov._discover_moe_layers(model)
     if not layer_ids or n_experts == 0 or d_in == 0:
         log.error(
             "input-cov-offload: incomplete MoE discovery "
@@ -3880,21 +3886,24 @@ def _run_input_cov_offload(args) -> int:
     if device is None:
         device = torch.device("cuda")
     n_layers = len(layer_ids)
-    # This path allocates its OWN shared temp, so buf_rows is NOT a compiled
-    # wheel constant: the moe_runner accumulation reads per-expert row capacity
-    # dynamically from `_tmp.shape[1] - 1`. A single forward batches at most
-    # max_num_batched_tokens tokens (chunked-prefill cap), and a single expert
-    # can receive at most all of them, so buf_rows = _MBT is exactly sufficient
-    # (the +1 sentinel column absorbs the worst-case overflow -> nothing lost).
+    top_k = top_k if top_k > 0 else 8
+    # buf_rows = the chunked-prefill token cap (max tokens in one forward). The
+    # fused grouped-SYRK path builds a COMPACT [buf_rows*top_k, d_in] x_sorted
+    # buffer (R = T*top_k routed rows) instead of the old padded
+    # [E, buf_rows+1, d_in] temp -- ~E x smaller per layer.
     buf_rows = _MBT
+    r_max = buf_rows * top_k
 
-    gram_bytes = n_experts * d_in * d_in * 4          # per-layer Gram [E,H,H]
-    temp_bytes = n_experts * (buf_rows + 1) * d_in * 4  # shared temp
+    gram_bytes = n_experts * d_in * d_in * 4            # per-layer Gram [E,H,H]
+    # Compact shared scratch (one x_sorted [r_max, d_in] + offsets/counts/ones),
+    # reused across the window's layers (sequential per-forward execution).
+    scratch_bytes = (r_max * d_in * 4 + r_max * 8
+                     + (n_experts + 1) * 8 + n_experts * 8)
     log.info(
-        "input-cov-offload: topology n_layers=%d, n_experts=%d, d_in=%d, "
-        "buf_rows=%d; per-layer Gram=%.2f GB, shared temp=%.2f GB.",
-        n_layers, n_experts, d_in, buf_rows,
-        gram_bytes / 2**30, temp_bytes / 2**30)
+        "input-cov-offload: topology n_layers=%d, n_experts=%d, top_k=%d, "
+        "d_in=%d, buf_rows=%d; per-layer Gram=%.2f GB, shared scratch=%.3f GB.",
+        n_layers, n_experts, top_k, d_in, buf_rows,
+        gram_bytes / 2**30, scratch_bytes / 2**30)
 
     # ------------------------------------------------------------------
     # 4. Window sizing (auto from free VRAM after model+KV are allocated)
@@ -3906,21 +3915,21 @@ def _run_input_cov_offload(args) -> int:
     else:
         free_b, total_b = torch.cuda.mem_get_info()
         headroom = max(8 * 2**30, int(0.10 * total_b))
-        usable = free_b - temp_bytes - headroom
+        usable = free_b - scratch_bytes - headroom
         window_size = max(0, int(usable // gram_bytes))
         window_size = min(window_size, n_layers)
         log.info(
             "input-cov-offload: auto window_size=%d (free=%.1f GB, total=%.1f "
-            "GB, temp=%.2f GB, headroom=%.1f GB, gram/layer=%.2f GB).",
+            "GB, scratch=%.3f GB, headroom=%.1f GB, gram/layer=%.2f GB).",
             window_size, free_b / 2**30, total_b / 2**30,
-            temp_bytes / 2**30, headroom / 2**30, gram_bytes / 2**30)
+            scratch_bytes / 2**30, headroom / 2**30, gram_bytes / 2**30)
         if window_size < 1:
             log.error(
                 "input-cov-offload: not enough free VRAM for even ONE layer's "
-                "Gram (%.2f GB) + temp (%.2f GB). Lower "
+                "Gram (%.2f GB) + scratch (%.3f GB). Lower "
                 "--gpu-memory-utilization (vLLM reserves most VRAM for KV "
                 "cache) or --max-num-batched-tokens. Aborting.",
-                gram_bytes / 2**30, temp_bytes / 2**30)
+                gram_bytes / 2**30, scratch_bytes / 2**30)
             return 1
 
     windows = [layer_ids[i:i + window_size]
@@ -3966,72 +3975,92 @@ def _run_input_cov_offload(args) -> int:
     sp = SamplingParams(temperature=0.0, max_tokens=1, seed=args.seed)
 
     # ------------------------------------------------------------------
-    # 6. Resume (window granularity)
+    # 6. Resume / staging: per-layer fp16 Gram shards on disk. Each shard is
+    #    written atomically, so a present shard is complete -> resume skips its
+    #    window. A topology fingerprint invalidates stale shards.
     # ------------------------------------------------------------------
-    offload_ckpt = replay_jsonl.with_suffix(
-        replay_jsonl.suffix + ".input_cov_offload.ckpt")
-    cpu_sigma: dict = {}        # (layer, expert, "gate_proj") -> Tensor[H,H]
-    cpu_counts: dict = {}       # (layer, expert, "gate_proj") -> int
-    windows_done = 0
-    if args.resume and offload_ckpt.exists():
+    import shutil  # noqa: PLC0415
+    staging = _ico.staging_dir(
+        replay_jsonl, getattr(args, "input_cov_staging_dir", None))
+    fingerprint = {
+        "n_experts": int(n_experts), "d_in": int(d_in), "top_k": int(top_k),
+        "max_rows": int(args.input_cov_max_rows), "layer_ids": list(layer_ids),
+    }
+    meta_path = staging / "_meta.pt"
+    done_layers: set[int] = set()
+    if args.resume and meta_path.exists():
         try:
-            _ck = torch.load(offload_ckpt, map_location="cpu",
-                             weights_only=False)
-            if (int(_ck.get("n_experts", -1)) == n_experts
-                    and int(_ck.get("d_in", -1)) == d_in
-                    and int(_ck.get("window_size", -1)) == window_size
-                    and int(_ck.get("max_rows", -1)) == int(args.input_cov_max_rows)
-                    and list(_ck.get("layer_ids", [])) == list(layer_ids)):
-                cpu_sigma = _ck["cpu_sigma"]
-                cpu_counts = _ck["cpu_counts"]
-                windows_done = int(_ck["windows_done"])
-                log.info("input-cov-offload: resume -- %d/%d windows done, "
-                         "%d entries hydrated.", windows_done, len(windows),
-                         len(cpu_sigma))
-            else:
-                log.warning("input-cov-offload: ckpt topology mismatch; "
-                            "ignoring and restarting from window 0.")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("input-cov-offload: could not read ckpt (%s); "
-                        "restarting from window 0.", exc)
+            _prev = torch.load(meta_path, map_location="cpu",
+                               weights_only=False)
+        except Exception:  # noqa: BLE001
+            _prev = None
+        if _prev == fingerprint:
+            done_layers = _ico.scan_done_layers(staging)
+            log.info("input-cov-offload: resume -- %d/%d layers already "
+                     "sharded at %s.", len(done_layers), n_layers, staging)
+        else:
+            log.warning("input-cov-offload: staging topology mismatch; wiping "
+                        "%s and restarting.", staging)
+            shutil.rmtree(staging, ignore_errors=True)
+    elif staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    torch.save(fingerprint, meta_path)
 
     # ------------------------------------------------------------------
-    # 7. Shared per-forward temp (allocated ONCE; reused every window/layer).
-    #    Sequential layer execution within a forward zeroes+folds it per
-    #    layer before the next, so a single buffer is correct.
+    # 7. Shared COMPACT scratch (allocated ONCE; aliased across every window
+    #    layer). Sequential per-forward layer execution on one CUDA stream
+    #    serializes the prologue+op, so a single x_sorted/offsets/counts/ones
+    #    set is correct. Replaces the old [E, buf_rows+1, d_in] padded temp.
     # ------------------------------------------------------------------
-    shared_temp = torch.zeros(
-        n_experts, buf_rows + 1, d_in, dtype=torch.float32, device=device)
+    def _alias_scratch(li):
+        _ch._INPUT_COV_XSORTED_GPU[li] = shared_xsorted
+        _ch._INPUT_COV_OFFSETS_GPU[li] = shared_offsets
+        _ch._INPUT_COV_COUNTS_SCRATCH_GPU[li] = shared_counts
+        _ch._ONES_I64_BUF_GPU[li] = shared_ones
+
+    def _clear_window_dicts():
+        _ch._INPUT_COV_GPU.clear()
+        _ch._INPUT_COV_COUNT_GPU.clear()
+        _ch._INPUT_COV_XSORTED_GPU.clear()
+        _ch._INPUT_COV_OFFSETS_GPU.clear()
+        _ch._INPUT_COV_COUNTS_SCRATCH_GPU.clear()
+
+    shared_xsorted = torch.zeros(
+        r_max, d_in, dtype=torch.float32, device=device)
+    shared_offsets = torch.zeros(
+        n_experts + 1, dtype=torch.int64, device=device)
+    shared_counts = torch.zeros(n_experts, dtype=torch.int64, device=device)
+    shared_ones = torch.ones(r_max, dtype=torch.int64, device=device)
 
     t0 = time.monotonic()
     for w_idx, window in enumerate(windows):
-        if w_idx < windows_done:
+        if all(li in done_layers for li in window):
+            log.info("input-cov-offload: window %d/%d layers [%d..%d] already "
+                     "sharded; skipping.", w_idx + 1, len(windows),
+                     window[0], window[-1])
             continue
         hi = window[-1]
-        # Allocate this window's Gram slices; point temp at the shared buffer.
-        _ch._INPUT_COV_GPU.clear()
-        _ch._INPUT_COV_COUNT_GPU.clear()
-        _ch._INPUT_COV_TEMP_GPU.clear()
+        # Allocate this window's Gram slices; alias the shared compact scratch.
+        _clear_window_dicts()
         try:
             for li in window:
                 _ch._INPUT_COV_GPU[li] = torch.zeros(
                     n_experts, d_in, d_in, dtype=torch.float32, device=device)
                 _ch._INPUT_COV_COUNT_GPU[li] = torch.zeros(
                     n_experts, dtype=torch.int64, device=device)
-                _ch._INPUT_COV_TEMP_GPU[li] = shared_temp
+                _alias_scratch(li)
         except torch.cuda.OutOfMemoryError:
-            _ch._INPUT_COV_GPU.clear()
-            _ch._INPUT_COV_COUNT_GPU.clear()
-            _ch._INPUT_COV_TEMP_GPU.clear()
+            _clear_window_dicts()
             torch.cuda.empty_cache()
             log.error(
                 "input-cov-offload: OOM allocating window %d/%d Gram (%d "
                 "layers x %.1f GB). Lower --input-cov-window-size (current "
                 "auto/explicit=%d) or --gpu-memory-utilization (vLLM reserves "
-                "most VRAM for KV). %d/%d windows are checkpointed and will "
-                "resume on rerun with --resume.",
+                "most VRAM for KV). Completed layers are sharded and resume on "
+                "rerun with --resume.",
                 w_idx + 1, len(windows), len(window), gram_bytes / 2**30,
-                window_size, windows_done, len(windows))
+                window_size)
             return 1
         _ch.set_calibration_max_layer(hi)
         log.info(
@@ -4074,68 +4103,37 @@ def _run_input_cov_offload(args) -> int:
                 w_idx + 1, len(windows), window[0], hi)
             return 1
 
-        # Snapshot this window's layers to CPU, then free GPU slices.
+        # Stream each layer's Gram straight to a durable fp16 shard, then free
+        # it -- never accumulate in host RAM (the old RAM bomb). Per-layer
+        # atomic write => a crash loses at most the in-flight layer.
         for li in window:
-            cov_cpu = _ch._INPUT_COV_GPU[li].cpu()       # [E, H, H]
-            cnt_cpu = _ch._INPUT_COV_COUNT_GPU[li].cpu()  # [E]
-            for e in range(n_experts):
-                c = int(cnt_cpu[e].item())
-                if c <= 0:
-                    continue
-                key = (int(li), int(e), "gate_proj")
-                cpu_sigma[key] = cov_cpu[e].clone()
-                cpu_counts[key] = c
-        _ch._INPUT_COV_GPU.clear()
-        _ch._INPUT_COV_COUNT_GPU.clear()
-        _ch._INPUT_COV_TEMP_GPU.clear()
+            n_w = _ico.write_layer_shard(
+                staging, li,
+                _ch._INPUT_COV_GPU[li], _ch._INPUT_COV_COUNT_GPU[li])
+            log.info(
+                "input-cov-offload: layer %d sharded (%d experts) -> %s",
+                li, n_w, _ico.shard_path(staging, li).name)
+        _clear_window_dicts()
         torch.cuda.empty_cache()
 
-        windows_done = w_idx + 1
-        tmp = str(offload_ckpt) + ".tmp"
-        torch.save({
-            "schema": 1,
-            "n_experts": n_experts,
-            "d_in": d_in,
-            "n_layers": n_layers,
-            "layer_ids": list(layer_ids),
-            "window_size": window_size,
-            "max_rows": int(args.input_cov_max_rows),
-            "windows_done": windows_done,
-            "cpu_sigma": cpu_sigma,
-            "cpu_counts": cpu_counts,
-        }, tmp)
-        os.replace(tmp, offload_ckpt)
-        log.info("input-cov-offload: window %d/%d checkpointed "
-                 "(%d entries so far).", windows_done, len(windows),
-                 len(cpu_sigma))
-
     _ch.set_calibration_max_layer(None)
-    del shared_temp
+    del shared_xsorted, shared_offsets, shared_counts, shared_ones
     torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
-    # 8. Assemble + write the canonical sidecar (same shape as dump_input_cov)
+    # 8. Stream-assemble the canonical covariance.pt from the per-layer shards
+    #    (bounded memory: one shard resident at a time, already fp16).
     # ------------------------------------------------------------------
-    if not cpu_sigma:
-        log.error("input-cov-offload: no entries captured; refusing to write "
-                  "an empty sidecar.")
+    if not _ico.scan_done_layers(staging):
+        log.error("input-cov-offload: no Gram shards under %s; refusing to "
+                  "write an empty sidecar.", staging)
         return 1
-    payload = CovariancePayload(
-        schema_version=SCHEMA_VERSIONS["covariance"],
-        n_experts=n_experts,
-        n_layers=n_layers,
-        sigma_in=cpu_sigma,
-        token_counts=cpu_counts,
-    )
-    save_covariance(payload, replay_jsonl)
+    _n_entries = _ico.assemble_covariance(
+        staging, replay_jsonl, n_experts, n_layers)
     log.info(
-        "input-cov-offload: wrote %d (layer, expert) entries (%d layers x %d "
-        "experts) for %s in %.0fs.",
-        len(cpu_sigma), n_layers, n_experts, replay_jsonl,
-        time.monotonic() - t0)
-
-    if offload_ckpt.exists():
-        offload_ckpt.unlink()
+        "input-cov-offload: assembled %d (layer, expert) entries from shards "
+        "in %s -> %s (%.0fs total). Staging kept for re-assembly/debug.",
+        _n_entries, staging, replay_jsonl, time.monotonic() - t0)
     return 0
 
 
