@@ -77,17 +77,18 @@ echo "[$(date)] === Phase 5: fetch and apply BOTH calibration patches ==="
 # See max_quality/patches/MANIFEST.md.
 
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/feat/calib-cudagraph-capture/max_quality/patches/vllm_calibration_hooks.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/main/max_quality/patches/vllm_calibration_hooks.patch \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected: 10388 lines, MD5 63f38b7f1dcfd0ef35713363fdf28fae
-# (In-graph cudagraph-safe capture: calibration_custom_ops.py + GPU-accumulator
-#  rewrite of all 10 writers + named-arg mutates_args custom ops; removes the
-#  graph-unsafe Python _ch.dispatch/register_callback path.)
+# Expected: 10627 lines, MD5 f0d2afa2c0be77c9c54b62e05706b750
+# (In-graph cudagraph-safe capture + the fused grouped-SYRK input_cov kernel:
+#  calibration_custom_ops.py, GPU-accumulator rewrite of all 10 writers,
+#  named-arg mutates_args custom ops, AND csrc/calibration/gram_grouped_accum.cu
+#  + a CMakeLists VLLM_EXT_SRC append. See MANIFEST.md.)
 
 curl -sL \
-    https://raw.githubusercontent.com/lucaspirola/moe_compress/feat/calib-cudagraph-capture/max_quality/patches/vllm_calibration_stage2_profile.patch \
+    https://raw.githubusercontent.com/lucaspirola/moe_compress/main/max_quality/patches/vllm_calibration_stage2_profile.patch \
     -o /tmp/calib2.patch
 wc -l /tmp/calib2.patch
 md5sum /tmp/calib2.patch
@@ -116,6 +117,19 @@ test -f vllm/calibration_custom_ops.py \
 grep -q 'calib_block_out_accum' vllm/model_executor/models/qwen3_next.py \
     || { echo "FATAL: in-graph block hook (calib_block_out_accum) missing from qwen3_next.py"; exit 1; }
 echo "In-graph capture gate OK (custom_ops + block hook present)."
+
+# Fused grouped-SYRK input_cov kernel gate: the .cu and its CMakeLists
+# registration must both have landed from patch 1, else the wheel builds
+# without torch.ops.calib_gram.gram_grouped_accum and input_cov capture aborts
+# at the first forward.
+echo "[$(date)] === Phase 5 gate: verify grouped-SYRK kernel applied ==="
+test -f csrc/calibration/gram_grouped_accum.cu \
+    || { echo "FATAL: csrc/calibration/gram_grouped_accum.cu missing (input_cov kernel)"; exit 1; }
+grep -q 'csrc/calibration/gram_grouped_accum.cu' CMakeLists.txt \
+    || { echo "FATAL: gram_grouped_accum.cu not registered in CMakeLists.txt VLLM_EXT_SRC"; exit 1; }
+grep -q 'TORCH_LIBRARY(calib_gram' csrc/calibration/gram_grouped_accum.cu \
+    || { echo "FATAL: calib_gram op registration missing from the kernel"; exit 1; }
+echo "grouped-SYRK kernel gate OK (.cu + CMakeLists + op registration present)."
 
 echo "[$(date)] === Phase 5b: strip license + license-files lines from pyproject.toml ==="
 # vLLM 0.21.0 has BOTH `license = "Apache-2.0"` (SPDX-string, deprecated)
