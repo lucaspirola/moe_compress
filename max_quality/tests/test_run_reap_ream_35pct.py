@@ -84,6 +84,21 @@ def test_paper_recipe_safety_passes_with_save_best():
     rr.assert_paper_recipe_safety(cfg)  # no raise
 
 
+def test_paper_recipe_safety_passes_with_default_save_best():
+    # save_best omitted → defaults to True (early_stop.py default), so the guard
+    # must NOT trip on a mere omission under the (now-default) paper recipe.
+    cfg = {"stage5_router_kd": {"rkd_recipe": "paper_dials_only"}}
+    rr.assert_paper_recipe_safety(cfg)  # no raise
+
+
+def test_paper_recipe_safety_default_recipe_requires_save_best():
+    # rkd_recipe omitted → defaults to "paper_dials_only" (2026-06-09 flip), so
+    # the guard now covers the DEFAULT path: an explicit save_best=False raises.
+    cfg = {"stage5_router_kd": {"save_best": False}}
+    with pytest.raises(RuntimeError, match="save_best"):
+        rr.assert_paper_recipe_safety(cfg)
+
+
 def test_paper_recipe_safety_noop_for_non_paper_recipe():
     cfg = {"stage5_router_kd": {"rkd_recipe": "current", "save_best": False}}
     rr.assert_paper_recipe_safety(cfg)  # current dials don't require save_best

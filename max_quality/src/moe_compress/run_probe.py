@@ -203,11 +203,16 @@ def build_probe_config(
         cfg["pipeline"]["skip_intermediate_stages"] = False
         cfg["stage6_validate"]["mode"] = "thermometer"
         if arm == "rkd":
-            # Paper dials, OUR calib.
+            # Paper dials, OUR calib. NOTE: this is ALSO the global default
+            # since the 2026-06-09 consolidation; set explicitly so the probe
+            # is robust to default changes.
             cfg.setdefault("stage5_router_kd", {})["rkd_recipe"] = "paper_dials_only"
-        # heal25: rkd_recipe ABSENT → default "current" production dials.
         else:
-            cfg.setdefault("stage5_router_kd", {}).pop("rkd_recipe", None)
+            # heal25 = the DEPRECATED current/production dials, kept as a
+            # rollback/repro baseline. Pin "current" EXPLICITLY: since the
+            # 2026-06-09 default flip (absent → "paper_dials_only"), popping the
+            # key would silently turn heal25 into a SECOND paper arm.
+            cfg.setdefault("stage5_router_kd", {})["rkd_recipe"] = "current"
 
     if num_sequences is not None:
         cfg.setdefault("calibration", {})["num_sequences"] = int(num_sequences)

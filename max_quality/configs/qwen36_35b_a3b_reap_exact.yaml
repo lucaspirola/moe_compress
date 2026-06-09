@@ -356,6 +356,11 @@ stage5_router_kd:
                                   # the optimum. The paper does not specify this,
                                   # but our empirical loss curve was textbook
                                   # overfit; 0.01 is the AdamW default.
+  # RUNTIME NOTE (2026-06-09): the default recipe (rkd_recipe:
+  # "paper_dials_only") OVERRIDES epochs → 2 at run start, paired with
+  # save_best: true (exports the EMA-best, drops the late-step overfit) and
+  # early_stop_patience → 0. This YAML "1" is the deprecated "current"-rollback
+  # value, applied only if you set rkd_recipe: "current".
   epochs: 1                       # 2026-05-17: reverted 3 → 1. The S0 live run
                                   # showed Move B's epochs=3 did NOT cure the
                                   # overfit — it amplified it: the pure

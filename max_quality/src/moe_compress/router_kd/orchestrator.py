@@ -172,11 +172,14 @@ def run(
     (``stage_key="stage5"``).  The config section read is always
     ``stage5_router_kd`` regardless of ``stage_key``.
     """
-    # Plugin #7 — RKD paper-recipe (Row P) config overrides. MUST run before
-    # any ``config[...]`` capture below (s5 / cal binds the live dicts). The
-    # method is a no-op when ``stage5_router_kd.rkd_recipe`` is anything other
-    # than ``"paper"``, so Row C runs are byte-identical to pre-plugin behavior.
-    # See router_kd/plugins/rkd_paper_recipe.py for the 4 deltas + contract.
+    # Plugin #7 — RKD paper-recipe config overrides. MUST run before any
+    # ``config[...]`` capture below (s5 / cal binds the live dicts). Since the
+    # 2026-06-09 consolidation the DEFAULT (absent ``stage5_router_kd
+    # .rkd_recipe``) is ``"paper_dials_only"`` — so this applies the 4 paper
+    # dials (τ=4, wd=0, epochs=2, early_stop_patience=0; project calib kept) to
+    # EVERY Stage 2.5/5 run by default. It is a no-op ONLY when the operator
+    # explicitly sets ``rkd_recipe: "current"`` (the deprecated rollback dials).
+    # See router_kd/plugins/rkd_paper_recipe.py for the deltas + contract.
     RkdPaperRecipePlugin().apply_config_overrides(config)
 
     s5 = config["stage5_router_kd"]

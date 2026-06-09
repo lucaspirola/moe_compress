@@ -112,3 +112,18 @@ lazily at the Stage 2→2.5 boundary, stalling the GPU idle for the ~5-8 min
 429 storm. Fix: the env-build script must eagerly fetch BOTH revs (or run
 a teacher-kernel prefetch in the background during Stage 2's long runtime).
 Never let a known-required, slow-to-fetch artifact land on the GPU's clock.
+
+## 2026-06-09 — Don't decode ablation ARM NAMES by inference; read the arm-definition code
+Recalling the 6-arm REAP/REAM probe, I labelled the `heal25` arm as "MergeHeal
+at 25%" purely from the name + the MergeHeal plugin we'd just discussed, and
+stated it as fact. The user challenged it. The authoritative source
+(`run_probe.py:9-15,205-210`) shows `heal25` is actually **Stage-2.5 Router-KD
+with current/production dials** (rkd = same Router-KD with `rkd_recipe:
+paper_dials_only`); and line 5 says merge-heal was OFF across the whole probe —
+so `heal25` categorically is NOT MergeHeal. Rule: an arm/run NAME is a label,
+not a spec. Before asserting what an ablation arm does, open the harness that
+DEFINES the arms (run_probe.py / run_ablations.py — the `ARMS` matrix + the
+per-arm config builder) and quote it. Never present a name-derived inference as
+a verified fact; if I haven't traced a token (e.g. the literal "25"), say so
+rather than invent a meaning. (Reinforces: report faithfully, verify don't
+assume.)

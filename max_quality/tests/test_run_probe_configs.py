@@ -122,10 +122,12 @@ def test_rkd_arm_paper_dials_only(group):
 
 
 @pytest.mark.parametrize("group", ["reap", "ream"])
-def test_heal25_arm_no_rkd_recipe(group):
+def test_heal25_arm_explicit_current(group):
     cfg = build_probe_config(_faithful_base(), group=group, arm="heal25")
-    # rkd_recipe ABSENT → default "current" production dials.
-    assert "rkd_recipe" not in (cfg.get("stage5_router_kd") or {})
+    # heal25 = the DEPRECATED current/production dials. Since the 2026-06-09
+    # default flip (absent rkd_recipe → "paper_dials_only"), heal25 must pin
+    # "current" EXPLICITLY, else it would silently become a second paper arm.
+    assert cfg["stage5_router_kd"]["rkd_recipe"] == "current"
 
 
 def test_is_heal_arm():

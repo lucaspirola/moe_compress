@@ -1,6 +1,6 @@
 # Plan: Stage-4-aware solver + full-pipeline REAP-vs-REAM @ net-35%
 
-Date: 2026-06-09. Status: **PLAN-REVIEW CLOSED (round 4 all-none) — READY TO IMPLEMENT.**
+Date: 2026-06-09. Status: **IMPLEMENTED + LANDED on main `a0a8a7d`.** plan-review (4 rounds all-none) → fidelity-review (clean) → code-quality-review (2 rounds) → tests (118 passed, 1 skipped) → committed FF-only. REMAINING = the actual GPU run on the box (shared Stage-1 net_of_eora + 2 arms).
 
 ## Established facts (verified)
 - **Solver gap** (2 independent agents): `budget/solver.py::solve()` originally hit the target on Stages 2+3 only; Stage-4 EoRA regrows ~`compensation_budget_pct`(0.03) × Stage-3 savings → final landed ~0.2–0.3pp UNDER target (≈34.7% for a 35% ask), one-directional. **NOW FIXED by WS1 (opt-in `net_of_eora`).**
@@ -55,7 +55,7 @@ Scientific question: at iso-35% compression, does **keeping more experts + compr
 
 ## Workstream 2 — RKD recipe = paper_dials_only at both positions
 - **There is NO shared base config** (plan-review H2): only `qwen36_35b_a3b_30pct.yaml` carries `rkd_recipe`; the two configs WS3 uses (`reap_exact.yaml`, `reap_faithful.yaml`) have NO `rkd_recipe` key → default `"current"` via the plugin hardcode. Flipping `30pct.yaml` alone does NOT reach them.
-- **Therefore:** the WS3 runner explicitly injects `cfg["stage5_router_kd"]["rkd_recipe"]="paper_dials_only"` for BOTH arms (mirroring how `run_probe.py` injects `PROBE_REAM_PARAMS`). Do NOT flip the plugin hardcode default (`rkd_paper_recipe.py:155,193`) — that would change every other run repo-wide.
+- **Therefore:** the WS3 runner explicitly injects `cfg["stage5_router_kd"]["rkd_recipe"]="paper_dials_only"` for BOTH arms (mirroring how `run_probe.py` injects `PROBE_REAM_PARAMS`). Do NOT flip the plugin hardcode default (`rkd_paper_recipe.py:155,193`) — that would change every other run repo-wide. **[SUPERSEDED 2026-06-09:** the user later chose to CONSOLIDATE the winner repo-wide — the plugin default WAS flipped `current → paper_dials_only`, so paper dials are now the global Stage 2.5/5 default. The runner's explicit inject is now redundant-but-harmless. See the Router-KD consolidation.]
 - Stage 5 (`stage_key="stage5"`) reads the same `stage5_router_kd` block → honors the injected recipe. Both positions get paper dials.
 - **H1 — epochs=2 cost + safety net (MUST document):** `paper_dials_only` sets `epochs=2`, which CONTRADICTS the documented 2026-05-17 revert (3→1 epochs; raw_kl rises 7× over training — late steps overfit). It is NOT a quality regression ONLY because `save_best: true` (present in all configs, untouched by the recipe) exports the EMA-best (~step250) and discards the late-step overfit. Cost: ~40 min/row of redundant 2nd-epoch teacher forwards. **Guard:** assert `save_best` is true whenever a paper recipe is active; never combine `paper_dials_only` with `save_best: false`.
 - Keep the `epochs>1 + teacher_logits_cache` guard (paper recipe clears the cache — orchestrator.py:585).

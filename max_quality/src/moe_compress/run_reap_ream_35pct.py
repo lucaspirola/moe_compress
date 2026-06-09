@@ -348,14 +348,21 @@ def build_arm_config(
 def assert_paper_recipe_safety(cfg: dict) -> None:
     """WS2 safety net: ``paper_dials_only`` sets epochs=2; ``save_best`` MUST be
     true (it exports the EMA-best ~step250 and discards the late-step overfit —
-    plan WS2 H1). Fail loudly if the recipe is active but save_best is false.
+    plan WS2 H1). Fail loudly only if the recipe is active AND save_best is
+    EXPLICITLY false. ``save_best`` already defaults to True in the operative
+    path (early_stop.py: ``s5.get("save_best", True)``), so this net matches
+    that default and never trips on a mere omission.
     """
     s5 = cfg.get("stage5_router_kd", {})
-    if s5.get("rkd_recipe") in ("paper", "paper_dials_only"):
-        if not bool(s5.get("save_best", False)):
+    # Defaults mirror the operative code (2026-06-09): absent rkd_recipe →
+    # "paper_dials_only" (the plugin default), absent save_best → True
+    # (early_stop.py default). So the guard covers the default path and only
+    # raises on an EXPLICIT save_best: false under a paper recipe.
+    if s5.get("rkd_recipe", "paper_dials_only") in ("paper", "paper_dials_only"):
+        if not bool(s5.get("save_best", True)):
             raise RuntimeError(
                 "stage5_router_kd.rkd_recipe is a paper recipe (epochs=2) but "
-                "save_best is not true — the late-step overfit would be "
+                "save_best is explicitly false — the late-step overfit would be "
                 "exported. Set stage5_router_kd.save_best: true (plan WS2 H1)."
             )
 

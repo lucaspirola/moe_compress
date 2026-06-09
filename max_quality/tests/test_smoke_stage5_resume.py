@@ -129,6 +129,12 @@ def _make_stage5_config(base_config: dict, ckpt_every: int = 0) -> dict:
     import copy as _copy
     cfg = _copy.deepcopy(base_config)
     s5 = cfg["stage5_router_kd"]
+    # Pin the rollback recipe so the 2026-06-09 default flip
+    # (absent rkd_recipe → "paper_dials_only") does NOT clobber the controlled
+    # dials below (epochs, early_stop_patience, teacher_logits_cache) when
+    # stage5_router_kd.run() applies the recipe overrides. These smoke/early-stop
+    # tests exercise the mechanism under fixed dials, not the production default.
+    s5["rkd_recipe"] = "current"
     s5["epochs"] = 1
     s5["batch_size"] = 1
     s5["gradient_accumulation"] = 1

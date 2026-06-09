@@ -53,24 +53,27 @@ Chosen approach: the plugin exposes ``apply_config_overrides(config) -> None``
 that mutates ``config`` in-place. The orchestrator calls this method as the
 very first statement of ``run()``, BEFORE the ``s5`` / ``cal`` captures.
 
-Dials-only mode (``"paper_dials_only"``)
-----------------------------------------
-A third ``rkd_recipe`` value, ``"paper_dials_only"``, applies the SAME 4
-numeric dials + the SAME multi-epoch cache-clear, but does NOT swap the
+Dials-only mode (``"paper_dials_only"``) — NOW THE DEFAULT
+----------------------------------------------------------
+``rkd_recipe: "paper_dials_only"`` applies the SAME 4 numeric dials + the SAME
+multi-epoch cache-clear as the full ``"paper"`` mode, but does NOT swap the
 calibration source. It keeps whatever the config carries (the project's
-``qwen3-pretrain-mix-v2``), honouring the "our dataset everywhere" rule
-while still isolating the paper's optimisation dials for an A/B. The full
-``"paper"`` mode is unchanged.
+``qwen3-pretrain-mix-v2`` corpus — now the v3 self-traces), honouring the "our
+dataset everywhere" rule. **2026-06-09: this is the CONSOLIDATED DEFAULT** —
+the 6-arm REAP/REAM probe found paper dials beat the old "current" production
+dials for both pruners (reap-rkd 3.1686 < reap-heal25 3.1862; ream likewise),
+so absent ``rkd_recipe`` now resolves to ``"paper_dials_only"``. The full
+``"paper"`` mode (with the wikitext-103-raw calibration swap) is unchanged.
 
 Contract
 --------
 1. ``apply_config_overrides`` reads
-   ``config["stage5_router_kd"].get("rkd_recipe", "current")``.
-2. If the value is ``"current"`` (or any value outside
-   ``{"paper", "paper_dials_only"}``, or the key is missing, or the
-   ``stage5_router_kd`` block is missing entirely), the method returns
-   immediately without touching ``config``. Row C runs are byte-identical to
-   pre-plugin behavior.
+   ``config["stage5_router_kd"].get("rkd_recipe", "paper_dials_only")`` — the
+   DEFAULT (key absent) is now ``"paper_dials_only"``.
+2. Only an EXPLICIT ``"current"`` (the deprecated pre-2026-06 production dials,
+   kept as a rollback) — or any value outside ``{"paper", "paper_dials_only"}``,
+   or a missing ``stage5_router_kd`` block — returns immediately without
+   touching ``config`` (the no-op / rollback path).
 3. If the value is ``"paper"``, the method mutates ``config`` in-place:
      * ``s5["kd_temperature"] = 4.0``
      * ``s5["weight_decay"] = 0.0``
@@ -114,15 +117,16 @@ class RkdPaperRecipePlugin:
     functional entry point, called by the orchestrator before its config
     captures).
 
-    ``stage5_router_kd.rkd_recipe`` selects one of two opt-in modes (the
-    YAML default ``"current"`` makes ``apply_config_overrides(config)`` a
-    no-op, so existing runs that do not opt in are byte-identical to
-    pre-plugin behavior):
+    ``stage5_router_kd.rkd_recipe`` selects the recipe. **The default (key
+    absent) is now ``"paper_dials_only"``** (2026-06-09 consolidation of the
+    ablation winner); set ``"current"`` explicitly to roll back to the
+    deprecated production dials (then ``apply_config_overrides`` is a no-op):
 
-    * ``"paper"`` — apply the 4 paper-recipe deltas + the cache-clear AND
-      swap the calibration source to wikitext-103-raw.
-    * ``"paper_dials_only"`` — apply the same 4 dials + cache-clear but
+    * ``"paper_dials_only"`` (DEFAULT) — apply the 4 paper dials + cache-clear,
       leave the calibration source untouched (project source preserved).
+    * ``"paper"`` — the same 4 dials + cache-clear AND swap the calibration
+      source to wikitext-103-raw.
+    * ``"current"`` — DEPRECATED rollback: no-op, uses the config's own dials.
     """
 
     name = "rkd_paper_recipe"
@@ -140,19 +144,23 @@ class RkdPaperRecipePlugin:
     def is_enabled(self, config: dict) -> bool:
         """True iff the operator opted in to a paper recipe.
 
-        Reads ``config["stage5_router_kd"].get("rkd_recipe", "current")``.
-        Returns True for both ``"paper"`` (full recipe incl. the
-        wikitext-103-raw calibration swap) and ``"paper_dials_only"`` (the
-        4 numeric dials + cache-clear, but NO calibration-source swap —
-        keeps the project's own calibration source). Default ``"current"``
-        → False (the no-op path). Missing or non-dict ``stage5_router_kd``
-        block → False (graceful: never raise during a registry-style audit
-        walk).
+        Reads ``config["stage5_router_kd"].get("rkd_recipe",
+        "paper_dials_only")``. Returns True for both ``"paper"`` (full recipe
+        incl. the wikitext-103-raw calibration swap) and ``"paper_dials_only"``
+        (the 4 numeric dials + cache-clear, but NO calibration-source swap —
+        keeps the project's own calibration source). **The default (key absent)
+        is now ``"paper_dials_only"`` → True** — paper dials are the
+        consolidated Stage 2.5/5 winner (2026-06-09 ablation: reap-rkd 3.1686 >
+        reap-heal25 3.1862). Only the EXPLICIT opt-out ``"current"`` (the
+        deprecated production dials, kept as a rollback) → False. Missing or
+        non-dict ``stage5_router_kd`` block → False (graceful: never raise
+        during a registry-style audit walk).
         """
         s5 = config.get("stage5_router_kd")
         if not isinstance(s5, dict):
             return False
-        return s5.get("rkd_recipe", "current") in ("paper", "paper_dials_only")
+        return (s5.get("rkd_recipe", "paper_dials_only")
+                in ("paper", "paper_dials_only"))
 
     def contribute_artifact(self, ctx: Any) -> dict:
         # Fresh empty dict literal each call — never a shared module-level
@@ -168,20 +176,24 @@ class RkdPaperRecipePlugin:
 
         Behaviour
         ---------
-        * No-op when ``stage5_router_kd.rkd_recipe`` is ``"current"``, any
-          other value outside ``{"paper", "paper_dials_only"}``, or absent —
-          and also when the ``stage5_router_kd`` block itself is missing
-          (defensive; the real orchestrator will raise later on the missing
-          block, but this method must never raise on a non-paper path).
+        * No-op ONLY when ``stage5_router_kd.rkd_recipe`` is the EXPLICIT
+          ``"current"`` rollback (or any other value outside
+          ``{"paper", "paper_dials_only"}``), and when the
+          ``stage5_router_kd`` block itself is missing (defensive; the real
+          orchestrator will raise later on the missing block, but this method
+          must never raise on a non-paper path). NOTE: an ABSENT ``rkd_recipe``
+          key is NOT a no-op since the 2026-06-09 flip — it defaults to
+          ``"paper_dials_only"`` and applies the deltas below.
         * When the value is ``"paper"``, applies the 4 numeric deltas + the
           teacher_logits_cache clearance + the wikitext-103-raw
           calibration-source swap.
-        * When the value is ``"paper_dials_only"``, applies the SAME 4
-          numeric deltas + the SAME teacher_logits_cache clearance, but
-          does NOT touch ``config["calibration"]["source"]`` — the project's
-          own calibration source (e.g. ``qwen3-pretrain-mix-v2``) is
-          preserved. This honours the "our dataset everywhere" rule while
-          still isolating the paper's optimisation dials for an A/B.
+        * When the value is ``"paper_dials_only"`` (incl. the default / absent
+          key), applies the SAME 4 numeric deltas + the SAME
+          teacher_logits_cache clearance, but does NOT touch
+          ``config["calibration"]["source"]`` — the project's own calibration
+          source (e.g. ``qwen3-pretrain-mix-v2``) is preserved. This honours
+          the "our dataset everywhere" rule while still isolating the paper's
+          optimisation dials for an A/B.
 
         Idempotent: applying the override twice yields the same final
         config (each assignment is unconditional). The orchestrator only
@@ -190,7 +202,11 @@ class RkdPaperRecipePlugin:
         s5 = config.get("stage5_router_kd")
         if not isinstance(s5, dict):
             return
-        recipe = s5.get("rkd_recipe", "current")
+        # DEFAULT FLIPPED 2026-06-09: absent rkd_recipe now resolves to
+        # "paper_dials_only" (the consolidated winner), NOT "current". The
+        # deprecated production dials are reached only by an EXPLICIT
+        # rkd_recipe: "current" (kept as a rollback).
+        recipe = s5.get("rkd_recipe", "paper_dials_only")
         if recipe not in ("paper", "paper_dials_only"):
             return
 

@@ -400,6 +400,12 @@ def test_merge_repair_with_logits_cache_fails_loud(tiny_model, tiny_config, tmp_
     _write_merge_map(tmp_path, _merge_map_with_centroids(tiny_model))
 
     cfg = json.loads(json.dumps(tiny_config))  # deep copy of the plain-dict cfg
+    # Pin the rollback recipe: the 2026-06-09 default flip (absent rkd_recipe →
+    # "paper_dials_only") sets teacher_logits_cache=None inside
+    # apply_config_overrides, which would CLEAR the cache before the
+    # merge_repair-vs-cache incompatibility check fires — defeating this
+    # fail-loud test. "current" makes the recipe a no-op so the cache survives.
+    cfg["stage5_router_kd"]["rkd_recipe"] = "current"
     cfg["stage5_router_kd"]["teacher_logits_cache"] = str(cache_path)
     cfg["stage5_router_kd"]["merge_repair"] = {"enabled": True, "mse_weight": 1.0}
 

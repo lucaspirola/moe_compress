@@ -6,10 +6,11 @@ Verifies the ``RkdPaperRecipePlugin`` scaffolding in
 * the plugin imports, satisfies the universal ``PipelinePlugin`` Protocol,
   and carries correct metadata (``name`` / ``paper`` / ``config_key`` /
   tuple-typed ``reads`` / ``writes`` / ``provides``);
-* the ``is_enabled`` gate keys off ``stage5_router_kd.rkd_recipe == "paper"``;
-* ``apply_config_overrides`` is a true no-op on the default
-  ``"current"`` / missing-key paths (Row C is byte-identical to pre-plugin
-  behavior);
+* the ``is_enabled`` gate is True for ``{"paper", "paper_dials_only"}`` and for
+  the DEFAULT (missing key) — since the 2026-06-09 consolidation the default is
+  ``"paper_dials_only"``;
+* ``apply_config_overrides`` is a true no-op ONLY on the explicit ``"current"``
+  rollback path; the default (missing-key) path now applies the paper dials;
 * ``apply_config_overrides`` correctly mutates all 5 keys (4 numeric deltas
   + ``teacher_logits_cache`` clearance + calibration-source swap) on the
   ``"paper"`` path;
@@ -177,13 +178,26 @@ def test_is_enabled_current():
 
 
 def test_is_enabled_default():
-    """Missing ``rkd_recipe`` key → defaults to ``"current"`` → disabled."""
+    """Missing ``rkd_recipe`` key → defaults to ``"paper_dials_only"`` (the
+    2026-06-09 consolidated winner) → ENABLED."""
     from moe_compress.router_kd.plugins.rkd_paper_recipe import (
         RkdPaperRecipePlugin,
     )
 
     plugin = RkdPaperRecipePlugin()
-    assert plugin.is_enabled({"stage5_router_kd": {}}) is False
+    assert plugin.is_enabled({"stage5_router_kd": {}}) is True
+
+
+def test_is_enabled_explicit_current_rollback():
+    """Explicit ``rkd_recipe: "current"`` is the deprecated rollback → disabled
+    (no-op), even though the default flipped to paper_dials_only."""
+    from moe_compress.router_kd.plugins.rkd_paper_recipe import (
+        RkdPaperRecipePlugin,
+    )
+
+    plugin = RkdPaperRecipePlugin()
+    assert plugin.is_enabled(
+        {"stage5_router_kd": {"rkd_recipe": "current"}}) is False
 
 
 def test_is_enabled_missing_block():
@@ -259,23 +273,29 @@ def test_apply_config_overrides_noop_on_current():
     assert config["calibration"] == cal_before
 
 
-def test_apply_config_overrides_noop_on_default():
-    """Missing ``rkd_recipe`` key (= default ``current``) → no mutation."""
+def test_apply_config_overrides_paper_dials_on_default():
+    """Missing ``rkd_recipe`` key now defaults to ``"paper_dials_only"`` (the
+    2026-06-09 consolidation): the 4 paper dials ARE applied + the teacher cache
+    is cleared, but the calibration source is left untouched (no wikitext swap).
+    """
     from moe_compress.router_kd.plugins.rkd_paper_recipe import (
         RkdPaperRecipePlugin,
     )
 
     config = _row_c_config()
     del config["stage5_router_kd"]["rkd_recipe"]
-    s5_before = dict(config["stage5_router_kd"])
     cal_before = dict(config["calibration"])
 
     RkdPaperRecipePlugin().apply_config_overrides(config)
 
-    assert config["stage5_router_kd"] == s5_before
+    s5 = config["stage5_router_kd"]
+    assert s5["kd_temperature"] == 4.0
+    assert s5["weight_decay"] == 0.0
+    assert s5["epochs"] == 2
+    assert s5["early_stop_patience"] == 0
+    assert s5["teacher_logits_cache"] is None
+    # paper_dials_only keeps the project calibration source (no wikitext swap).
     assert config["calibration"] == cal_before
-    # Defensive: the no-op path must NOT add ``rkd_recipe`` back in.
-    assert "rkd_recipe" not in config["stage5_router_kd"]
 
 
 def test_apply_config_overrides_noop_on_missing_block():

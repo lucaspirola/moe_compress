@@ -227,6 +227,13 @@ def test_router_kd_golden(tiny_model, patched_router_kd, stage_id, tmp_path, mon
     base_config, captured = patched_router_kd
 
     cfg = copy.deepcopy(base_config)
+    # Pin the rollback recipe: since the 2026-06-09 default flip (absent
+    # rkd_recipe → "paper_dials_only"), run() would otherwise override
+    # epochs→2 / kd_temperature→4 etc. inside apply_config_overrides, breaking
+    # this golden's controlled deterministic 1-epoch capture. The golden pins
+    # the module MECHANISM under fixed dials; the paper-default behavior is
+    # covered by test_router_kd_plugin_rkd_paper_recipe.py.
+    cfg["stage5_router_kd"]["rkd_recipe"] = "current"
     # Router-KD is a 1-epoch training stage; confirm the golden is captured at
     # epochs == 1 (the tiny_config default), and force a per-step loss emit so
     # the loss trace is guaranteed non-empty.

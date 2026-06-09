@@ -316,19 +316,15 @@ stage4_eora:
   eigenspace_rank_cap: 128        # hard cap per matrix (spec §7 Budget)
 
 stage5_router_kd:
-  rkd_recipe: "current"           # "current" = production Stage 2.5 / Stage 5
-                                  #             recipe (all existing plugins,
-                                  #             unchanged). Default.
-                                  # "paper"   = arxiv 2603.02217 Row P recipe:
-                                  #             τ=4, wd=0, epochs=2,
-                                  #             early_stop_patience=0,
-                                  #             calib=wikitext-103-raw.
-                                  #             Applied by
-                                  #             RkdPaperRecipePlugin
-                                  #             .apply_config_overrides()
-                                  #             before orchestrator.run()
-                                  #             captures config locals. See
-                                  #             router_kd/plugins/rkd_paper_recipe.py.
+  # rkd_recipe: DEFAULT (key omitted) = "paper_dials_only" — the consolidated
+  #   winner (2026-06-09 ablation: reap-rkd 3.1686 > reap-heal25 3.1862). It
+  #   overrides the dials below to τ=4, wd=0, epochs=2, early_stop_patience=0
+  #   at runtime via RkdPaperRecipePlugin.apply_config_overrides(), keeping the
+  #   project calibration source (NO wikitext swap). The dials below are the
+  #   DEPRECATED "current" rollback values — reached only if you uncomment:
+  #     rkd_recipe: "current"     # roll back to pre-2026-06 production dials
+  #   ("paper" = paper_dials_only + the wikitext-103-raw calibration swap.)
+  #   See router_kd/plugins/rkd_paper_recipe.py.
   optimizer: adamw
   learning_rate: 5.0e-5           # paper Table 1 (§F.3)
   experts_implementation: grouped_mm   # Hopper (H100/H200) — fastest kernel.
@@ -355,6 +351,11 @@ stage5_router_kd:
                                   # the optimum. The paper does not specify this,
                                   # but our empirical loss curve was textbook
                                   # overfit; 0.01 is the AdamW default.
+  # RUNTIME NOTE (2026-06-09): the default recipe (rkd_recipe:
+  # "paper_dials_only") OVERRIDES epochs → 2 at run start, paired with
+  # save_best: true (exports the EMA-best, drops the late-step overfit) and
+  # early_stop_patience → 0. This YAML "1" is the deprecated "current"-rollback
+  # value, applied only if you set rkd_recipe: "current".
   epochs: 1                       # 2026-05-17: reverted 3 → 1. The S0 live run
                                   # showed Move B's epochs=3 did NOT cure the
                                   # overfit — it amplified it: the pure

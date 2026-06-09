@@ -100,7 +100,7 @@ second process resumes directly at Stage 6.
 Both heal arms run through the SAME auto Stage-2.5 call
 (`run_pipeline.py:266`, `stage_key="stage2p5"`). They differ ONLY by the
 `stage5_router_kd.rkd_recipe` config key:
-- **heal25** = default production router-KD: `rkd_recipe` ABSENT (→ `"current"`).
+- **heal25** = deprecated production router-KD. **[2026-06-09:** the absent-key default flipped `current → "paper_dials_only"`, so `run_probe.py` now pins `rkd_recipe: "current"` EXPLICITLY for heal25 — absent would otherwise become a second paper arm.]
 - **rkd** = `stage5_router_kd.rkd_recipe: "paper_dials_only"` (paper dials, OUR
   calib — already implemented, 7fbeed1).
 
@@ -298,7 +298,8 @@ Per-row driver logic:
   `--stop-after-stage 6` (§1a). heal rows = `skip_intermediate_stages: false`,
   `stage6_validate.mode: thermometer` set directly, two processes
   (`--stop-after-stage 2`, then `--resume-from-stage 6`) per §1b. heal25:
-  `rkd_recipe` absent; rkd: `rkd_recipe: "paper_dials_only"`.
+  `rkd_recipe: "current"` (pinned explicitly since the 2026-06-09 default flip;
+  was absent); rkd: `rkd_recipe: "paper_dials_only"`.
 - **subprocess, not in-process** (memory; `run_ablations.py:634-639,677-679`).
 
 **Launch (after sidecar B0):**
