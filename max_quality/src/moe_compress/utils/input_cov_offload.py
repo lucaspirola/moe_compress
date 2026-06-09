@@ -64,7 +64,7 @@ def write_layer_shard(
     counts_layer: torch.Tensor,
     matrix_name: str = "gate_proj",
 ) -> int:
-    """Atomically write ONE layer's Gram as an fp16 shard.
+    """Atomically write ONE layer's Gram as a bf16 shard.
 
     ``cov_layer`` [E, d, d] (any device/dtype), ``counts_layer`` [E] int. Only
     experts with count > 0 are written (matching the old snapshot guard). The
@@ -82,16 +82,22 @@ def write_layer_shard(
         c = int(cnt_cpu[e].item())
         if c <= 0:
             continue
-        # copy=True: one fp16 copy that never aliases cov_cpu (so the slice
-        # doesn't keep the whole layer tensor alive after we free it).
-        sigma[e] = cov_cpu[e].to(torch.float16, copy=True)
+        # bf16 (NOT fp16): the Gram is a RAW un-normalized sum of x⊗x over
+        # ~10^5-10^6 tokens/expert; those sums exceed fp16's 65504 ceiling and
+        # saturate to +inf (this corrupted the 2026-06-09 capture -- ~38% of
+        # variance diagonals went inf). bf16 shares fp32's exponent range so it
+        # cannot overflow here; the consumer eigendecomposes in fp32 and is
+        # scale-invariant, so the extra mantissa rounding is harmless. copy=True:
+        # one bf16 copy that never aliases cov_cpu (so the slice doesn't keep the
+        # whole layer tensor alive after we free it).
+        sigma[e] = cov_cpu[e].to(torch.bfloat16, copy=True)
         counts[e] = c
     payload = {
         "schema": _SHARD_SCHEMA,
         "layer_idx": int(layer_idx),
         "matrix_name": str(matrix_name),
         "n_experts": n_e,
-        "sigma": sigma,     # {expert: Tensor[d, d] fp16}
+        "sigma": sigma,     # {expert: Tensor[d, d] bf16}
         "counts": counts,   # {expert: int}
     }
     atomic_torch_save(shard_path(staging, layer_idx), payload)
@@ -143,7 +149,7 @@ def assemble_covariance(
         li = int(shard["layer_idx"])
         mat = str(shard.get("matrix_name", "gate_proj"))
         for e, t in shard["sigma"].items():
-            sigma_in[(li, int(e), mat)] = t          # already fp16 CPU
+            sigma_in[(li, int(e), mat)] = t          # already bf16 CPU
         for e, c in shard["counts"].items():
             token_counts[(li, int(e), mat)] = int(c)
         del shard

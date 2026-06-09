@@ -41,7 +41,7 @@ def _capture_layers(staging: Path, n_layers: int, n_experts: int, d: int,
         ico.write_layer_shard(staging, li, cov, cnt)
         for e in range(n_experts):
             if int(cnt[e]) > 0:
-                ref[(li, e, "gate_proj")] = (cov[e].to(torch.float16), int(cnt[e]))
+                ref[(li, e, "gate_proj")] = (cov[e].to(torch.bfloat16), int(cnt[e]))
     return ref
 
 
@@ -62,11 +62,11 @@ def test_roundtrip_and_contract(tmp_path: Path):
     assert payload.n_experts == n_experts and payload.n_layers == n_layers
     assert set(payload.sigma_in.keys()) == set(ref.keys())
     assert (1, 2, "gate_proj") not in payload.sigma_in  # empty expert skipped
-    for k, (t_fp16, c) in ref.items():
+    for k, (t_bf16, c) in ref.items():
         got = payload.sigma_in[k]
-        assert got.dtype == torch.float16 and got.device.type == "cpu"
+        assert got.dtype == torch.bfloat16 and got.device.type == "cpu"
         assert tuple(got.shape) == (d, d)
-        torch.testing.assert_close(got, t_fp16)         # exact fp16 match
+        torch.testing.assert_close(got, t_bf16)         # exact bf16 match
         assert payload.token_counts[k] == c             # raw, unnormalized
     print("  PASS  streaming round-trip + contract (fp16, keys, counts, empty-skip)")
 

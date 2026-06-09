@@ -82,11 +82,17 @@ class Stage4InputCovCacheProvider(BaseCacheProvider):
         if payload is None:
             return None
         ctx.set("A_cov", payload.sigma_in)
-        # The cached tensors are persisted as fp16 (per the Stage 2
-        # writer's storage dtype convention, shared by the V2 writer).
-        # Setting ``a_storage_dtype`` so the EoRA eigh-threshold tuning
-        # in ``_compute_eora_factors`` picks the right noise floor.
-        ctx.set("a_storage_dtype", torch.float16)
+        # Infer the ACTUAL storage dtype from the loaded tensors rather than
+        # hard-coding: the windowed-offload writer stores bf16 (post 2026-06-09
+        # fp16-overflow fix -- raw Gram sums overflow fp16), while older Stage 2
+        # caches are fp16. Reading the real dtype keeps the EoRA eigh-threshold
+        # tuning in ``_compute_eora_factors`` matched to the right noise floor
+        # for either provenance (bf16 -> 1e-2, fp16 -> 1e-3).
+        _a_dtype = (
+            next(iter(payload.sigma_in.values())).dtype
+            if payload.sigma_in else torch.float16
+        )
+        ctx.set("a_storage_dtype", _a_dtype)
         log.info(
             "stage4-input-cov-cache: loaded %d-key sidecar (%d layers × "
             "%d experts) from %s -- populated ctx.A_cov + "
