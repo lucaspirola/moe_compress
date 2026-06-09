@@ -52,7 +52,8 @@ def test_roundtrip_and_contract(tmp_path: Path):
     # layer 1 expert 2 gets zero tokens -> must be skipped everywhere.
     ref = _capture_layers(staging, n_layers, n_experts, d, empty=[(1, 2)])
 
-    assert ico.scan_done_layers(staging) == {0, 1, 2}
+    assert ico.scan_done_layers(staging) == {
+        (0, "gate_proj"), (1, "gate_proj"), (2, "gate_proj")}
 
     n = ico.assemble_covariance(staging, jsonl, n_experts, n_layers)
     assert n == len(ref)
@@ -82,11 +83,12 @@ def test_resume_scan_partial(tmp_path: Path):
                               torch.randn(n_experts, d, d),
                               torch.full((n_experts,), 5, dtype=torch.int64))
     done = ico.scan_done_layers(staging)
-    assert done == {0, 2}, done
+    assert done == {(0, "gate_proj"), (2, "gate_proj")}, done
     # Resume completes layer 1; assembly then sees all three.
     ico.write_layer_shard(staging, 1, torch.randn(n_experts, d, d),
                           torch.full((n_experts,), 5, dtype=torch.int64))
-    assert ico.scan_done_layers(staging) == {0, 1, 2}
+    assert ico.scan_done_layers(staging) == {
+        (0, "gate_proj"), (1, "gate_proj"), (2, "gate_proj")}
     ico.assemble_covariance(staging, jsonl, n_experts, n_layers=3)
     payload = load_covariance(jsonl)
     assert payload is not None
@@ -122,11 +124,91 @@ def test_staging_dir_override_appends_subdir(tmp_path: Path):
     print("  PASS  staging-dir override appends _covariance_staging (rmtree-safe)")
 
 
+def test_ride_along_gate_and_down_shards_coexist(tmp_path: Path):
+    """Ride-along: gate_proj + down_proj shards for the SAME layer must coexist
+    (the matrix-aware shard_path fix) and assemble into ONE covariance.pt with
+    both key sets. Distinct d_in (gate=5, down=3) confirms the shapes are kept
+    separate per matrix."""
+    jsonl = _make_jsonl(tmp_path)
+    staging = ico.staging_dir(jsonl)
+    n_experts, d_gate, d_down = 4, 5, 3
+    torch.manual_seed(11)
+    for li in range(2):
+        gate = torch.randn(n_experts, d_gate, d_gate)
+        down = torch.randn(n_experts, d_down, d_down)
+        cnt = torch.full((n_experts,), 7, dtype=torch.int64)
+        ico.write_layer_shard(staging, li, gate, cnt, matrix_name="gate_proj")
+        ico.write_layer_shard(staging, li, down, cnt, matrix_name="down_proj")
+
+    # Both shards present per layer -> distinct filenames, no clobber.
+    assert ico.shard_path(staging, 0, "gate_proj").exists()
+    assert ico.shard_path(staging, 0, "down_proj").exists()
+    assert (ico.shard_path(staging, 0, "gate_proj")
+            != ico.shard_path(staging, 0, "down_proj"))
+    assert ico.scan_done_layers(staging) == {
+        (0, "gate_proj"), (0, "down_proj"),
+        (1, "gate_proj"), (1, "down_proj")}
+
+    n = ico.assemble_covariance(staging, jsonl, n_experts, n_layers=2)
+    assert n == 2 * 2 * n_experts          # 2 layers * 2 matrices * experts
+    payload = load_covariance(jsonl)
+    assert payload is not None
+    gate_keys = {k for k in payload.sigma_in if k[2] == "gate_proj"}
+    down_keys = {k for k in payload.sigma_in if k[2] == "down_proj"}
+    assert len(gate_keys) == 2 * n_experts and len(down_keys) == 2 * n_experts
+    # Per-matrix shapes preserved + bf16 storage.
+    assert tuple(payload.sigma_in[(0, 0, "gate_proj")].shape) == (d_gate, d_gate)
+    assert tuple(payload.sigma_in[(0, 0, "down_proj")].shape) == (d_down, d_down)
+    assert payload.sigma_in[(0, 0, "down_proj")].dtype == torch.bfloat16
+    print("  PASS  ride-along gate+down shards coexist + assemble both key sets")
+
+
+def test_down_gather_grouping_matches_reference():
+    """The down SYRK's NEW gather logic (triton_moe.py): because
+    intermediate_cache2 is already per-(token, slot) token-major [R, I], rows
+    are gathered DIRECTLY by argsort(_flat) (NOT _tok = order // top_k like the
+    per-token gate path). Replicate the counting-sort + gather in pure torch
+    (no .cu op) and assert each expert's contiguous block offsets[e]:offsets[e+1]
+    equals exactly the rows routed to e (stable order), and the per-expert Gram
+    X_e^T X_e matches the masked reference. This is the correctness linchpin."""
+    torch.manual_seed(3)
+    T, top_k, E, I = 6, 3, 4, 5
+    topk_ids = torch.randint(0, E, (T, top_k), dtype=torch.int64)
+    R = T * top_k
+    # xmid row r corresponds to (token r//top_k, slot r%top_k) -> expert flat[r].
+    xmid = torch.randn(R, I)
+    flat = topk_ids.reshape(-1)                              # [R] row -> expert
+
+    # --- replicate the in-graph prologue (counting-sort, no padding) ---
+    counts = torch.zeros(E, dtype=torch.int64)
+    counts.scatter_add_(0, flat, torch.ones(R, dtype=torch.int64))
+    offsets = torch.zeros(E + 1, dtype=torch.int64)
+    torch.cumsum(counts, 0, out=offsets[1:])
+    order = torch.argsort(flat, stable=True)
+    xs = torch.index_select(xmid, 0, order)                 # DIRECT gather
+
+    # offsets[E] must equal R (every routed row contributes exactly once).
+    assert int(offsets[-1]) == R
+    for e in range(E):
+        lo, hi = int(offsets[e]), int(offsets[e + 1])
+        block = xs[lo:hi]                                   # gathered rows for e
+        ref = xmid[flat == e]                               # rows routed to e
+        # stable argsort preserves token order within an expert -> exact match.
+        assert block.shape == ref.shape
+        torch.testing.assert_close(block, ref)
+        # the kernel accumulates cov[e] += X_e^T X_e over this block.
+        torch.testing.assert_close(block.T @ block, ref.T @ ref)
+    print("  PASS  down gather grouping matches reference (direct argsort, "
+          "per-expert Gram)")
+
+
 if __name__ == "__main__":
     import tempfile
     for fn in (test_roundtrip_and_contract, test_resume_scan_partial,
                test_atomic_shard_is_complete_or_absent,
-               test_staging_dir_override_appends_subdir):
+               test_staging_dir_override_appends_subdir,
+               test_ride_along_gate_and_down_shards_coexist):
         with tempfile.TemporaryDirectory() as d:
             fn(Path(d))
+    test_down_gather_grouping_matches_reference()
     print("ALL PASS")

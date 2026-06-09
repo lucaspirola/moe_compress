@@ -55,7 +55,7 @@ echo "vllm commit: $(git rev-parse HEAD)"   # should be ad7125a
 
 echo "[$(date)] === Phase 5: fetch and apply BOTH calibration patches ==="
 # Two patches in this wheel:
-#  1. vllm_calibration_hooks.patch (10388 lines, MD5 63f38b7f...) — the
+#  1. vllm_calibration_hooks.patch (10846 lines, MD5 c19ffcc5...) — the
 #     CUDA-graph-safe in-graph capture rearchitecture: calibration_hooks.py
 #     (GPU accumulator dicts, custom-op import, NO Python callback registry),
 #     calibration_custom_ops.py (the 3 named-arg mutates_args custom ops:
@@ -81,7 +81,7 @@ curl -sL \
     -o /tmp/calib.patch
 wc -l /tmp/calib.patch
 md5sum /tmp/calib.patch
-# Expected: 10627 lines, MD5 f0d2afa2c0be77c9c54b62e05706b750
+# Expected: 10846 lines, MD5 c19ffcc5d03fec7dc20caebfad80d7c1
 # (In-graph cudagraph-safe capture + the fused grouped-SYRK input_cov kernel:
 #  calibration_custom_ops.py, GPU-accumulator rewrite of all 10 writers,
 #  named-arg mutates_args custom ops, AND csrc/calibration/gram_grouped_accum.cu
@@ -130,6 +130,18 @@ grep -q 'csrc/calibration/gram_grouped_accum.cu' CMakeLists.txt \
 grep -q 'TORCH_LIBRARY(calib_gram' csrc/calibration/gram_grouped_accum.cu \
     || { echo "FATAL: calib_gram op registration missing from the kernel"; exit 1; }
 echo "grouped-SYRK kernel gate OK (.cu + CMakeLists + op registration present)."
+
+# down_proj input_cov gate: the SECOND grouped-SYRK call (post-SwiGLU
+# intermediate -> down_proj input cov) must have landed -- the down accumulator
+# globals in calibration_hooks.py AND the in-graph SYRK call inside
+# TritonExperts.apply. Without these the wheel captures gate_proj only.
+echo "[$(date)] === Phase 5 gate: verify down_proj input_cov SYRK applied ==="
+grep -q '_INPUT_COV_DOWN_GPU' vllm/calibration_hooks.py \
+    || { echo "FATAL: _INPUT_COV_DOWN_GPU missing from calibration_hooks.py"; exit 1; }
+grep -q '_CAPTURE_INPUT_COV_DOWN' \
+    vllm/model_executor/layers/fused_moe/experts/triton_moe.py \
+    || { echo "FATAL: down_proj SYRK (CAPTURE_INPUT_COV_DOWN) missing from triton_moe.py"; exit 1; }
+echo "down_proj input_cov gate OK (down accumulator + in-graph SYRK present)."
 
 echo "[$(date)] === Phase 5b: strip license + license-files lines from pyproject.toml ==="
 # vLLM 0.21.0 has BOTH `license = "Apache-2.0"` (SPDX-string, deprecated)
@@ -269,7 +281,7 @@ Runs cudagraph-fast (NOT enforce_eager).
 
 - Source repo: https://github.com/lucaspirola/moe_compress (branch `feat/b0-hook-fix`)
 - Patch artifacts (also uploaded to this repo for traceability):
-  - `vllm_calibration_hooks.patch` — 10388 lines, MD5 `63f38b7f1dcfd0ef35713363fdf28fae`
+  - `vllm_calibration_hooks.patch` — 10846 lines, MD5 `c19ffcc5d03fec7dc20caebfad80d7c1`
   - `vllm_calibration_stage2_profile.patch` — 941 lines, MD5 `fca4c01cc5cef188b30c323bb919cd72`
 - Architectures: sm_80 (A100), sm_90a (H100/H200), sm_100 (B200), sm_120 (RTX 6000 Pro Blackwell)
 - Build host: HF Jobs (cpu-performance)

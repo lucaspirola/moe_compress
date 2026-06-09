@@ -478,7 +478,7 @@ def _resolve_moe_backend(args) -> "str | None":
         return None
     enabled_captures = any(
         getattr(args, cap, False) for cap in _CAPTURE_WRITER_MODULES
-    )
+    ) or getattr(args, "capture_input_covariance_down", False)
     if enabled_captures and (backend is None or str(backend).lower() == "auto"):
         log.warning(
             "moe_backend=%r requested but --capture-* flags are enabled; "
@@ -1070,13 +1070,15 @@ def _setup_all_writers(
                 ws.reap_ckpt_path.unlink()
 
     # ---- input-covariance -----------------------------------------------
-    if args.capture_input_covariance:
+    if args.capture_input_covariance or args.capture_input_covariance_down:
         import vllm.calibration_input_cov as _icov  # type: ignore
         _icov.setup(llm)
         log.info("input-cov: setup complete")
         ws.input_cov_ckpt_path = out_path.with_suffix(".input_cov.ckpt")
         _ckpt_existence_check(
-            "input_covariance", args.capture_input_covariance, already_done,
+            "input_covariance",
+            args.capture_input_covariance or args.capture_input_covariance_down,
+            already_done,
             ws.input_cov_ckpt_path,
             allow_counter_divergence=args.allow_counter_divergence,
         )
@@ -1557,6 +1559,23 @@ def main() -> int:
                         "fires) BEFORE any vllm import. Failures during dump "
                         "are logged but do NOT re-raise -- the JSONL is more "
                         "valuable than the covariance sidecar.")
+    p.add_argument("--capture-input-covariance-down", action="store_true",
+                   default=False,
+                   help="Capture the SECOND input-covariance group: per-(layer, "
+                        "expert, 'down_proj') teacher input covariance Σ_in of "
+                        "the post-SwiGLU intermediate (the down_proj input), via "
+                        "a second in-graph CUDA grouped-SYRK call inside "
+                        "TritonExperts.apply. Independent on/off from "
+                        "--capture-input-covariance; enable BOTH to capture "
+                        "gate_proj + down_proj keys into one covariance.pt in a "
+                        "single windowed offload pass. Auto-enables "
+                        "VLLM_CALIB_CAPTURE_INPUT_COV_DOWN=1 (+ "
+                        "VLLM_CALIB_CAPTURE_EXPERT=1, "
+                        "VLLM_CALIB_INPUT_COV_MODE=resident) BEFORE any vllm "
+                        "import. Triton MoE backend only (FlashInfer's monolithic "
+                        "path does not expose the intermediate). Rides the "
+                        "--input-cov-offload windowed path (down-only without "
+                        "--input-cov-offload is unsupported).")
     p.add_argument("--input-cov-checkpoint-every-chunks", type=int, default=1,
                    help="When --capture-input-covariance is set, dump a "
                         "checkpoint (.input_cov.ckpt) of the live covariance "
@@ -1577,10 +1596,12 @@ def main() -> int:
                         "snapshots each window's Gram to CPU, frees the GPU "
                         "slice, and advances -- re-running the corpus once per "
                         "window. Only valid in --replay-from mode with "
-                        "--capture-input-covariance as the SOLE capture flag "
-                        "(the per-window early-exit is incompatible with the "
-                        "other full-forward signals). Forces "
-                        "VLLM_CALIB_INPUT_COV_MODE=resident.")
+                        "--capture-input-covariance and/or "
+                        "--capture-input-covariance-down as the SOLE capture "
+                        "flag(s) -- both input-cov groups are windowing-safe and "
+                        "ride one pass; the per-window early-exit is "
+                        "incompatible with the OTHER full-forward signals. "
+                        "Forces VLLM_CALIB_INPUT_COV_MODE=resident.")
     p.add_argument("--input-cov-max-rows", type=int, default=0,
                    help="Cap the number of corpus rows used for the input_cov "
                         "offload pass. 0 (default) = all renderable rows. When "
@@ -1943,29 +1964,37 @@ def main() -> int:
     # callback dispatches; vllm.calibration_input_cov registers a
     # handler against it to scatter-reduce per-expert hidden-state
     # covariance into the dict-shaped accumulator.
-    if args.capture_input_covariance:
-        os.environ["VLLM_CALIB_CAPTURE_INPUT_COV"] = "1"
+    if args.capture_input_covariance or args.capture_input_covariance_down:
+        # Per-group flags: gate/up fires in MoERunner, down in
+        # TritonExperts.apply. Either or both may be on (both -> one pass,
+        # gate_proj + down_proj keys).
+        if args.capture_input_covariance:
+            os.environ["VLLM_CALIB_CAPTURE_INPUT_COV"] = "1"
+        if args.capture_input_covariance_down:
+            os.environ["VLLM_CALIB_CAPTURE_INPUT_COV_DOWN"] = "1"
+        # Shared gates for BOTH groups below.
         os.environ["VLLM_CALIB_CAPTURE_EXPERT"] = "1"
-        # The in-graph Gram accumulation in moe_runner.py is guarded by
-        # ``_INPUT_COV_MODE == "resident"``. Without this the accumulation
-        # never fires and the sidecar is silently empty (one of the two
-        # original empty-capture root causes). The offload path uses the
+        # The in-graph Gram accumulation in moe_runner.py / TritonExperts.apply
+        # is guarded by ``_INPUT_COV_MODE == "resident"``. Without this the
+        # accumulation never fires and the sidecar is silently empty (one of the
+        # two original empty-capture root causes). The offload path uses the
         # SAME resident accumulation kernel -- it just restricts which layers
         # are allocated -- so it also runs in "resident" mode.
         os.environ["VLLM_CALIB_INPUT_COV_MODE"] = "resident"
         # CAPTURE_EXPERT requires the non-monolithic (Triton) MoE path;
         # MoERunner.__init__ hard-asserts against monolithic backends when
-        # CAPTURE_EXPERT is set. _resolve_moe_backend already forces triton,
-        # but disable FlashInfer's monolithic fp16 path defensively (mirrors
-        # the reap-scores gate) so a stray backend selection can't trip the
-        # assert / silently miss the Gram.
+        # CAPTURE_EXPERT is set. The down group is doubly Triton-only (the
+        # post-SwiGLU intermediate is exposed only inside TritonExperts.apply).
+        # _resolve_moe_backend already forces triton, but disable FlashInfer's
+        # monolithic fp16 path defensively (mirrors the reap-scores gate) so a
+        # stray backend selection can't trip the assert / silently miss the Gram.
         os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
-        log.info("--capture-input-covariance: enabled "
-                 "VLLM_CALIB_CAPTURE_INPUT_COV=1 + "
-                 "VLLM_CALIB_CAPTURE_EXPERT=1 + "
+        log.info("--capture-input-covariance[-down]: enabled INPUT_COV=%s "
+                 "INPUT_COV_DOWN=%s + VLLM_CALIB_CAPTURE_EXPERT=1 + "
                  "VLLM_CALIB_INPUT_COV_MODE=resident + "
-                 "VLLM_USE_FLASHINFER_MOE_FP16=0 "
-                 "(must precede vllm import)")
+                 "VLLM_USE_FLASHINFER_MOE_FP16=0 (must precede vllm import)",
+                 int(args.capture_input_covariance),
+                 int(args.capture_input_covariance_down))
 
     # W-1: Pre-import env gates for the Wanda scalar_row path. Same strict-
     # string rule. VLLM_CALIB_CAPTURE_ROUTER is REQUIRED so the router hook
@@ -2128,19 +2157,25 @@ def main() -> int:
             # The per-window early-exit (set_calibration_max_layer) is
             # incompatible with the other full-forward signals: it would
             # truncate their accumulation at the window's top layer. Enforce
-            # input_covariance as the SOLE capture flag for the offload path.
+            # the input-covariance group(s) -- gate/up and/or down, both
+            # windowing-safe -- as the SOLE capture flag(s) for the offload
+            # path. (capture_input_covariance_down is NOT in
+            # _CAPTURE_WRITER_MODULES: it is an input-cov-offload rider, not an
+            # independent full-forward writer, so it is exempt by construction.)
             _other = [
                 cap for cap in _CAPTURE_WRITER_MODULES
                 if cap != "capture_input_covariance"
                 and getattr(args, cap, False)
             ]
-            if not args.capture_input_covariance:
+            if not (args.capture_input_covariance
+                    or args.capture_input_covariance_down):
                 log.error(
-                    "--input-cov-offload requires --capture-input-covariance.")
+                    "--input-cov-offload requires --capture-input-covariance "
+                    "and/or --capture-input-covariance-down.")
                 return 1
             if _other:
                 log.error(
-                    "--input-cov-offload must be the SOLE capture flag "
+                    "--input-cov-offload must be the SOLE capture flag(s) "
                     "(per-window early-exit truncates full-forward signals). "
                     "Also enabled: %s. Run those in a separate replay pass.",
                     _other)
@@ -2528,7 +2563,8 @@ def main() -> int:
 
             # Periodic input-covariance checkpoint -- mirrors imatrix /
             # reap-scores cadence.
-            if (args.capture_input_covariance
+            if ((args.capture_input_covariance
+                    or args.capture_input_covariance_down)
                     and args.input_cov_checkpoint_every_chunks > 0):
                 chunk_idx = chunk_start // args.chunk_size
                 every = args.input_cov_checkpoint_every_chunks
@@ -2754,7 +2790,7 @@ def main() -> int:
     # --- input-covariance dump -----------------------------------------
     # Same try/except policy as imatrix / reap-scores: the JSONL is the
     # primary deliverable.
-    if args.capture_input_covariance:
+    if args.capture_input_covariance or args.capture_input_covariance_down:
         try:
             import vllm.calibration_input_cov as _icov  # type: ignore
             _icov.set_n_prompts_accumulated(already_done + n_new)
@@ -3440,7 +3476,8 @@ def _run_replay(args) -> int:
                     log.error("reap-scores ckpt failed: %s", exc,
                               exc_info=True)
 
-        if (args.capture_input_covariance
+        if ((args.capture_input_covariance
+                or args.capture_input_covariance_down)
                 and args.input_cov_checkpoint_every_chunks > 0):
             if (chunk_idx + 1) % args.input_cov_checkpoint_every_chunks == 0:
                 try:
@@ -3650,7 +3687,7 @@ def _run_replay(args) -> int:
             log.error("reap-scores dump failed: %s", exc, exc_info=True)
 
     # -- input-covariance (uniform: dump_input_cov(Path)) ----------------
-    if args.capture_input_covariance:
+    if args.capture_input_covariance or args.capture_input_covariance_down:
         try:
             import vllm.calibration_input_cov as _icov  # type: ignore
             _icov.set_n_prompts_accumulated(total_done_captures)
@@ -3882,12 +3919,38 @@ def _run_input_cov_offload(args) -> int:
     if model is None:
         log.error("input-cov-offload: could not resolve model.")
         return 1
-    layer_ids, n_experts, top_k, d_in, device = _icov._discover_moe_layers(model)
-    if not layer_ids or n_experts == 0 or d_in == 0:
+    (layer_ids, n_experts, top_k, d_in, d_in_down,
+     device) = _icov._discover_moe_layers(model)
+    # Active input-cov GROUPS for this pass (gate/up and/or down, each behind
+    # its own flag). Each group has a distinct d_in and its own Gram + scratch
+    # dict family in calibration_hooks; both can ride ONE windowed pass. The
+    # gate/up SYRK fires in MoERunner._apply_quant_method; the down SYRK in
+    # TritonExperts.apply -- each keyed by the per-layer presence of its Gram.
+    groups: list[dict] = []
+    if args.capture_input_covariance:
+        groups.append({
+            "name": "gate_proj", "d_in": d_in,
+            "gram": _ch._INPUT_COV_GPU, "count": _ch._INPUT_COV_COUNT_GPU,
+            "xsorted": _ch._INPUT_COV_XSORTED_GPU,
+            "offsets": _ch._INPUT_COV_OFFSETS_GPU,
+            "counts_scratch": _ch._INPUT_COV_COUNTS_SCRATCH_GPU,
+        })
+    if args.capture_input_covariance_down:
+        groups.append({
+            "name": "down_proj", "d_in": d_in_down,
+            "gram": _ch._INPUT_COV_DOWN_GPU,
+            "count": _ch._INPUT_COV_DOWN_COUNT_GPU,
+            "xsorted": _ch._INPUT_COV_DOWN_XSORTED_GPU,
+            "offsets": _ch._INPUT_COV_DOWN_OFFSETS_GPU,
+            "counts_scratch": _ch._INPUT_COV_DOWN_COUNTS_SCRATCH_GPU,
+        })
+    active_matrix_names = [g["name"] for g in groups]
+    if (not layer_ids or n_experts == 0 or not groups
+            or any(g["d_in"] == 0 for g in groups)):
         log.error(
-            "input-cov-offload: incomplete MoE discovery "
-            "(layers=%d, experts=%d, d_in=%d).",
-            len(layer_ids), n_experts, d_in)
+            "input-cov-offload: incomplete MoE discovery / no active group "
+            "(layers=%d, experts=%d, groups=%s, d_in=%d, d_in_down=%d).",
+            len(layer_ids), n_experts, active_matrix_names, d_in, d_in_down)
         return 1
     if device is None:
         device = torch.device("cuda")
@@ -3900,16 +3963,21 @@ def _run_input_cov_offload(args) -> int:
     buf_rows = _MBT
     r_max = buf_rows * top_k
 
-    gram_bytes = n_experts * d_in * d_in * 4            # per-layer Gram [E,H,H]
-    # Compact shared scratch (one x_sorted [r_max, d_in] + offsets/counts/ones),
-    # reused across the window's layers (sequential per-forward execution).
-    scratch_bytes = (r_max * d_in * 4 + r_max * 8
-                     + (n_experts + 1) * 8 + n_experts * 8)
+    # Per-layer footprint sums over active groups (a layer allocates one Gram
+    # per group). [E, d_in, d_in] fp32 each.
+    gram_bytes = sum(n_experts * g["d_in"] * g["d_in"] * 4 for g in groups)
+    # Compact shared scratch: per group an x_sorted [r_max, d_in] + offsets
+    # [E+1] + counts [E]; the ones buffer [r_max] is shared across groups.
+    scratch_bytes = (
+        sum(r_max * g["d_in"] * 4 + (n_experts + 1) * 8 + n_experts * 8
+            for g in groups)
+        + r_max * 8)
     log.info(
         "input-cov-offload: topology n_layers=%d, n_experts=%d, top_k=%d, "
-        "d_in=%d, buf_rows=%d; per-layer Gram=%.2f GB, shared scratch=%.3f GB.",
-        n_layers, n_experts, top_k, d_in, buf_rows,
-        gram_bytes / 2**30, scratch_bytes / 2**30)
+        "groups=%s (d_in gate=%d down=%d), buf_rows=%d; per-layer Gram=%.2f "
+        "GB, shared scratch=%.3f GB.",
+        n_layers, n_experts, top_k, active_matrix_names, d_in, d_in_down,
+        buf_rows, gram_bytes / 2**30, scratch_bytes / 2**30)
 
     # ------------------------------------------------------------------
     # 4. Window sizing (auto from free VRAM after model+KV are allocated)
@@ -3990,13 +4058,18 @@ def _run_input_cov_offload(args) -> int:
         replay_jsonl, getattr(args, "input_cov_staging_dir", None))
     fingerprint = {
         "n_experts": int(n_experts), "d_in": int(d_in), "top_k": int(top_k),
+        "d_in_down": int(d_in_down),
+        # The set of captured matrices is part of the fingerprint: adding
+        # down_proj to a gate-only staging dir (or vice versa) must invalidate
+        # the stale shards so the new group is actually captured on --resume.
+        "matrices": sorted(active_matrix_names),
         "max_rows": int(args.input_cov_max_rows), "layer_ids": list(layer_ids),
         # seed selects the random row subset when max_rows>0; a seed change must
         # invalidate stale shards (else the assembled Gram mixes two samples).
         "seed": int(args.seed),
     }
     meta_path = staging / "_meta.pt"
-    done_layers: set[int] = set()
+    done_layers: set[tuple[int, str]] = set()
     if args.resume and meta_path.exists():
         try:
             _prev = torch.load(meta_path, map_location="cpu",
@@ -4005,8 +4078,9 @@ def _run_input_cov_offload(args) -> int:
             _prev = None
         if _prev == fingerprint:
             done_layers = _ico.scan_done_layers(staging)
-            log.info("input-cov-offload: resume -- %d/%d layers already "
-                     "sharded at %s.", len(done_layers), n_layers, staging)
+            log.info("input-cov-offload: resume -- %d/%d (layer, matrix) "
+                     "shards present at %s.",
+                     len(done_layers), n_layers * len(groups), staging)
         else:
             log.warning("input-cov-offload: staging topology mismatch; wiping "
                         "%s and restarting.", staging)
@@ -4024,63 +4098,80 @@ def _run_input_cov_offload(args) -> int:
     #    set is correct. Replaces the old [E, buf_rows+1, d_in] padded temp.
     # ------------------------------------------------------------------
     def _alias_scratch(li):
-        _ch._INPUT_COV_XSORTED_GPU[li] = shared_xsorted
-        _ch._INPUT_COV_OFFSETS_GPU[li] = shared_offsets
-        _ch._INPUT_COV_COUNTS_SCRATCH_GPU[li] = shared_counts
+        # Each active group aliases its OWN shared scratch (x_sorted sized to
+        # that group's d_in + its own offsets/counts) into its module dict.
+        # Sequential per-forward layer execution on one CUDA stream serializes
+        # the prologue+op, so one scratch set per group is correct. The gate and
+        # down groups must NOT share offsets/counts (the down SYRK in
+        # TritonExperts.apply recomputes its own). The ones buffer [r_max] is
+        # shared across groups (same r_max).
+        for g in groups:
+            g["xsorted"][li] = g["_shared_xsorted"]
+            g["offsets"][li] = g["_shared_offsets"]
+            g["counts_scratch"][li] = g["_shared_counts"]
         _ch._ONES_I64_BUF_GPU[li] = shared_ones
 
     def _clear_window_dicts():
-        _ch._INPUT_COV_GPU.clear()
-        _ch._INPUT_COV_COUNT_GPU.clear()
-        _ch._INPUT_COV_XSORTED_GPU.clear()
-        _ch._INPUT_COV_OFFSETS_GPU.clear()
-        _ch._INPUT_COV_COUNTS_SCRATCH_GPU.clear()
+        for g in groups:
+            g["gram"].clear()
+            g["count"].clear()
+            g["xsorted"].clear()
+            g["offsets"].clear()
+            g["counts_scratch"].clear()
         # input_cov is the SOLE capture in offload mode, so _ONES is ours to
         # clear (all entries alias one shared_ones tensor -> no leak, but drop
         # stale per-layer keys).
         _ch._ONES_I64_BUF_GPU.clear()
 
-    shared_xsorted = torch.zeros(
-        r_max, d_in, dtype=torch.float32, device=device)
-    shared_offsets = torch.zeros(
-        n_experts + 1, dtype=torch.int64, device=device)
-    shared_counts = torch.zeros(n_experts, dtype=torch.int64, device=device)
+    for g in groups:
+        g["_shared_xsorted"] = torch.zeros(
+            r_max, g["d_in"], dtype=torch.float32, device=device)
+        g["_shared_offsets"] = torch.zeros(
+            n_experts + 1, dtype=torch.int64, device=device)
+        g["_shared_counts"] = torch.zeros(
+            n_experts, dtype=torch.int64, device=device)
     shared_ones = torch.ones(r_max, dtype=torch.int64, device=device)
 
     t0 = time.monotonic()
     for w_idx, window in enumerate(windows):
-        if all(li in done_layers for li in window):
+        if all((li, g["name"]) in done_layers
+               for li in window for g in groups):
             log.info("input-cov-offload: window %d/%d layers [%d..%d] already "
-                     "sharded; skipping.", w_idx + 1, len(windows),
-                     window[0], window[-1])
+                     "sharded (%s); skipping.", w_idx + 1, len(windows),
+                     window[0], window[-1], active_matrix_names)
             continue
         hi = window[-1]
-        # Allocate this window's Gram slices; alias the shared compact scratch.
+        # Allocate this window's Gram slices -- one per active group per layer;
+        # alias the shared compact scratch.
         _clear_window_dicts()
         try:
             for li in window:
-                _ch._INPUT_COV_GPU[li] = torch.zeros(
-                    n_experts, d_in, d_in, dtype=torch.float32, device=device)
-                _ch._INPUT_COV_COUNT_GPU[li] = torch.zeros(
-                    n_experts, dtype=torch.int64, device=device)
+                for g in groups:
+                    g["gram"][li] = torch.zeros(
+                        n_experts, g["d_in"], g["d_in"],
+                        dtype=torch.float32, device=device)
+                    g["count"][li] = torch.zeros(
+                        n_experts, dtype=torch.int64, device=device)
                 _alias_scratch(li)
         except torch.cuda.OutOfMemoryError:
             _clear_window_dicts()
             torch.cuda.empty_cache()
             log.error(
                 "input-cov-offload: OOM allocating window %d/%d Gram (%d "
-                "layers x %.1f GB). Lower --input-cov-window-size (current "
-                "auto/explicit=%d) or --gpu-memory-utilization (vLLM reserves "
-                "most VRAM for KV). Completed layers are sharded and resume on "
-                "rerun with --resume.",
-                w_idx + 1, len(windows), len(window), gram_bytes / 2**30,
-                window_size)
+                "layers x %d groups x %.1f GB/layer). Lower "
+                "--input-cov-window-size (current auto/explicit=%d) or "
+                "--gpu-memory-utilization (vLLM reserves most VRAM for KV). "
+                "Completed layers are sharded and resume on rerun with "
+                "--resume.",
+                w_idx + 1, len(windows), len(window), len(groups),
+                gram_bytes / 2**30, window_size)
             return 1
         _ch.set_calibration_max_layer(hi)
         log.info(
             "input-cov-offload: window %d/%d layers [%d..%d] -- "
-            "max_layer=%d, %d Gram slices allocated (%.1f GB).",
-            w_idx + 1, len(windows), window[0], hi, hi, len(window),
+            "max_layer=%d, %d Gram slices allocated (%s, %.1f GB).",
+            w_idx + 1, len(windows), window[0], hi, hi,
+            len(window) * len(groups), active_matrix_names,
             len(window) * gram_bytes / 2**30)
 
         # Forward the full corpus (prefill-only) in chunks.
@@ -4104,34 +4195,46 @@ def _run_input_cov_offload(args) -> int:
         # Gram means the hook never fired (wrong MoE path / mode / env) -- catch
         # it on the FIRST window instead of after a multi-hour, all-window run
         # that silently writes a zero sidecar.
-        _win_tokens = sum(
-            int(_ch._INPUT_COV_COUNT_GPU[li].sum().item()) for li in window)
-        if _win_tokens == 0:
-            log.error(
-                "input-cov-offload: window %d/%d (layers [%d..%d]) captured "
-                "ZERO routed tokens -- the input_cov accumulation is not "
-                "firing. Verify VLLM_CALIB_INPUT_COV_MODE=resident, "
-                "VLLM_CALIB_CAPTURE_INPUT_COV=1, VLLM_CALIB_CAPTURE_EXPERT=1, "
-                "and a non-monolithic (Triton) MoE backend. Aborting before "
-                "wasting further GPU-hours.",
-                w_idx + 1, len(windows), window[0], hi)
-            return 1
+        # Check EACH active group: a group with all-zero counts means its SYRK
+        # never fired (gate -> MoERunner, down -> TritonExperts.apply). Catch a
+        # silent down-only miss too, not just gate.
+        for g in groups:
+            _g_tokens = sum(
+                int(g["count"][li].sum().item()) for li in window)
+            if _g_tokens == 0:
+                log.error(
+                    "input-cov-offload: window %d/%d (layers [%d..%d]) "
+                    "captured ZERO routed tokens for matrix %r -- that group's "
+                    "accumulation is not firing. Verify "
+                    "VLLM_CALIB_INPUT_COV_MODE=resident, the matching capture "
+                    "flag (VLLM_CALIB_CAPTURE_INPUT_COV / "
+                    "VLLM_CALIB_CAPTURE_INPUT_COV_DOWN), "
+                    "VLLM_CALIB_CAPTURE_EXPERT=1, and a non-monolithic (Triton) "
+                    "MoE backend. Aborting before wasting further GPU-hours.",
+                    w_idx + 1, len(windows), window[0], hi, g["name"])
+                return 1
 
         # Stream each layer's Gram straight to a durable fp16 shard, then free
         # it -- never accumulate in host RAM (the old RAM bomb). Per-layer
         # atomic write => a crash loses at most the in-flight layer.
         for li in window:
-            n_w = _ico.write_layer_shard(
-                staging, li,
-                _ch._INPUT_COV_GPU[li], _ch._INPUT_COV_COUNT_GPU[li])
-            log.info(
-                "input-cov-offload: layer %d sharded (%d experts) -> %s",
-                li, n_w, _ico.shard_path(staging, li).name)
+            for g in groups:
+                n_w = _ico.write_layer_shard(
+                    staging, li, g["gram"][li], g["count"][li],
+                    matrix_name=g["name"])
+                log.info(
+                    "input-cov-offload: layer %d [%s] sharded (%d experts) "
+                    "-> %s", li, g["name"], n_w,
+                    _ico.shard_path(staging, li, g["name"]).name)
         _clear_window_dicts()
         torch.cuda.empty_cache()
 
     _ch.set_calibration_max_layer(None)
-    del shared_xsorted, shared_offsets, shared_counts, shared_ones
+    for g in groups:
+        g.pop("_shared_xsorted", None)
+        g.pop("_shared_offsets", None)
+        g.pop("_shared_counts", None)
+    del shared_ones
     torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
@@ -4147,9 +4250,11 @@ def _run_input_cov_offload(args) -> int:
     _n_entries = _ico.assemble_covariance(
         staging, replay_jsonl, n_experts, n_layers)
     log.info(
-        "input-cov-offload: assembled %d (layer, expert) entries from shards "
-        "in %s -> %s (%.0fs total). Staging kept for re-assembly/debug.",
-        _n_entries, staging, replay_jsonl, time.monotonic() - t0)
+        "input-cov-offload: assembled %d (layer, expert, matrix) entries "
+        "(matrices=%s) from shards in %s -> %s (%.0fs total). Staging kept "
+        "for re-assembly/debug.",
+        _n_entries, active_matrix_names, staging, replay_jsonl,
+        time.monotonic() - t0)
     return 0
 
 

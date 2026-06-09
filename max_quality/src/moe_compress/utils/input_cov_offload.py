@@ -53,8 +53,13 @@ def staging_dir(replay_jsonl: Path, staging_override: str | None = None) -> Path
     return sidecar_path(replay_jsonl, "covariance").parent / "_covariance_staging"
 
 
-def shard_path(staging: Path, layer_idx: int) -> Path:
-    return staging / f"layer_{int(layer_idx):05d}.pt"
+def shard_path(
+    staging: Path, layer_idx: int, matrix_name: str = "gate_proj"
+) -> Path:
+    """Per-(layer, matrix) shard path. The ``matrix_name`` suffix is what lets
+    gate_proj and down_proj Grams for the SAME layer coexist (without it the
+    second write would clobber the first -- the ride-along collision)."""
+    return staging / f"layer_{int(layer_idx):05d}_{matrix_name}.pt"
 
 
 def write_layer_shard(
@@ -100,21 +105,30 @@ def write_layer_shard(
         "sigma": sigma,     # {expert: Tensor[d, d] bf16}
         "counts": counts,   # {expert: int}
     }
-    atomic_torch_save(shard_path(staging, layer_idx), payload)
+    atomic_torch_save(shard_path(staging, layer_idx, matrix_name), payload)
     return len(sigma)
 
 
-def scan_done_layers(staging: Path) -> set[int]:
-    """Layer ids whose shard is durably present (drives resume). A shard is
-    written atomically, so presence == complete."""
+def scan_done_layers(staging: Path) -> set[tuple[int, str]]:
+    """``(layer_idx, matrix_name)`` pairs whose shard is durably present (drives
+    resume). A shard is written atomically, so presence == complete. The shard
+    filename is ``layer_<idx>_<matrix>.pt``; a legacy 2-field ``layer_<idx>.pt``
+    name (pre matrix-aware shards) is read as ``gate_proj`` for back-compat.
+
+    Returns ``(layer, matrix)`` pairs -- NOT bare layer ids -- so a ride-along
+    resume can tell "layer N has gate but not yet down" and re-run that window.
+    """
     if not staging.is_dir():
         return set()
-    done: set[int] = set()
+    done: set[tuple[int, str]] = set()
     for p in staging.glob("layer_*.pt"):
+        parts = p.stem.split("_")
         try:
-            done.add(int(p.stem.split("_")[1]))
+            idx = int(parts[1])
         except (IndexError, ValueError):
             continue
+        mat = "_".join(parts[2:]) or "gate_proj"
+        done.add((idx, mat))
     return done
 
 

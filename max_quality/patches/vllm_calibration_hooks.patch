@@ -6201,10 +6201,10 @@ index 0000000..f3b0d0e
 +)
 diff --git a/vllm/calibration_hooks.py b/vllm/calibration_hooks.py
 new file mode 100644
-index 0000000..7e53fb5
+index 0000000..d0ad8b9
 --- /dev/null
 +++ b/vllm/calibration_hooks.py
-@@ -0,0 +1,375 @@
+@@ -0,0 +1,389 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Calibration capture hooks for the MoE forward path.
@@ -6424,6 +6424,9 @@ index 0000000..7e53fb5
 +_CAPTURE_WANDA_SCALAR_ROW: bool = (
 +    os.getenv("VLLM_CALIB_CAPTURE_WANDA_SCALAR_ROW", "0") == "1"
 +)
++_CAPTURE_INPUT_COV_DOWN: bool = (
++    os.getenv("VLLM_CALIB_CAPTURE_INPUT_COV_DOWN", "0") == "1"
++)
 +_CAPTURE_INPUT_COV: bool = (
 +    os.getenv("VLLM_CALIB_CAPTURE_INPUT_COV", "0") == "1"
 +)
@@ -6498,6 +6501,17 @@ index 0000000..7e53fb5
 +_INPUT_COV_XSORTED_GPU: dict[int, "torch.Tensor"] = {}  # [buf_rows*top_k, H] fp32 expert-contiguous tokens
 +_INPUT_COV_OFFSETS_GPU: dict[int, "torch.Tensor"] = {}  # [E+1] int64 per-expert prefix-sum
 +_INPUT_COV_COUNTS_SCRATCH_GPU: dict[int, "torch.Tensor"] = {}  # [E] int64 per-forward offset scratch
++# down_proj input_cov (resident mode): the SECOND in-graph grouped-SYRK group.
++# Same shapes as the gate/up group but with d_in = the post-SwiGLU intermediate
++# width I (= w2_weight.shape[-1] = moe_intermediate_size per partition), so the
++# Gram is [E, I, I] (typically far smaller than the [E, H, H] gate Gram). The
++# SYRK fires inside TritonExperts.apply (on intermediate_cache2), NOT in
++# MoERunner -- so these are populated by a self-contained counting-sort there.
++_INPUT_COV_DOWN_GPU: dict[int, "torch.Tensor"] = {}          # [E, I, I] fp32
++_INPUT_COV_DOWN_COUNT_GPU: dict[int, "torch.Tensor"] = {}    # [E] int64
++_INPUT_COV_DOWN_XSORTED_GPU: dict[int, "torch.Tensor"] = {}  # [buf_rows*top_k, I] fp32 expert-contiguous rows
++_INPUT_COV_DOWN_OFFSETS_GPU: dict[int, "torch.Tensor"] = {}  # [E+1] int64 per-expert prefix-sum
++_INPUT_COV_DOWN_COUNTS_SCRATCH_GPU: dict[int, "torch.Tensor"] = {}  # [E] int64 per-forward offset scratch
 +# reap topk-weights stash (set in MoERunner, read in TritonExperts.apply)
 +_TOPK_WEIGHTS_STASH_GPU: dict[int, "torch.Tensor"] = {}  # [buf_rows, top_k] fp32
 +_TOPK_IDS_STASH_GPU: dict[int, "torch.Tensor"] = {}      # [buf_rows, top_k] i64
@@ -7295,10 +7309,10 @@ index 0000000..818433f
 +    return n
 diff --git a/vllm/calibration_input_cov.py b/vllm/calibration_input_cov.py
 new file mode 100644
-index 0000000..2d09960
+index 0000000..ece38fe
 --- /dev/null
 +++ b/vllm/calibration_input_cov.py
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,473 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Per-(layer, expert, "gate_proj") teacher input covariance capture for
@@ -7361,14 +7375,22 @@ index 0000000..2d09960
 +_CAPTURE_INPUT_COV: bool = (
 +    os.getenv("VLLM_CALIB_CAPTURE_INPUT_COV", "0") == "1"
 +)
++# Independent on/off for the down_proj input-cov group. Each calibration capture
++# has its OWN flag so it can be toggled in isolation; this one arms the second
++# in-graph grouped-SYRK call (the post-SwiGLU intermediate -> down_proj input).
++_CAPTURE_INPUT_COV_DOWN: bool = (
++    os.getenv("VLLM_CALIB_CAPTURE_INPUT_COV_DOWN", "0") == "1"
++)
 +_INPUT_COV_MODE: str = os.getenv("VLLM_CALIB_INPUT_COV_MODE", "off")
 +_MATRIX_NAME = "gate_proj"
++_MATRIX_NAME_DOWN = "down_proj"
 +
 +_LAYER_IDS: list[int] = []
 +_N_LAYERS: int = 0
 +_N_EXPERTS: int = 0
 +_TOP_K: int = 0
 +_D_IN: int | None = None
++_D_IN_DOWN: int | None = None
 +
 +_n_prompts_accumulated: int = 0
 +_CHECKPOINT_SCHEMA_VERSION: int = 2
@@ -7424,11 +7446,24 @@ index 0000000..2d09960
 +
 +def _discover_moe_layers(
 +    model: Any,
-+) -> tuple[list[int], int, int, int, Any]:
++) -> tuple[list[int], int, int, int, int, Any]:
++    """Discover MoE topology. Returns
++    ``(layer_ids, n_experts, top_k, d_in, d_in_down, device)``.
++
++    ``d_in`` is the gate/up input width (``hidden_size``); ``d_in_down`` is the
++    down_proj input width = the post-SwiGLU intermediate width per partition.
++    The latter is read activation-agnostically from the down expert weight
++    (``w2_weight.shape[-1]`` == ``intermediate_size_per_partition`` ==
++    ``intermediate_cache2.shape[-1]`` seen inside ``TritonExperts.apply``), so
++    it is correct for any MoE architecture (and any activation, unlike deriving
++    it as N//2 from the gate/up width). Assumes the unquantized calibration
++    weight layout ``[E, hidden, intermediate]``.
++    """
 +    layer_ids: list[int] = []
 +    n_experts: int | None = None
 +    top_k: int | None = None
 +    d_in: int | None = None
++    d_in_down: int | None = None
 +    device = None
 +    for _name, module in model.named_modules():
 +        moe_layer_id = getattr(module, "moe_layer_id", None)
@@ -7442,6 +7477,10 @@ index 0000000..2d09960
 +        hs = getattr(module, "hidden_size", None)
 +        if hs is not None and d_in is None:
 +            d_in = int(hs)
++        if d_in_down is None:
++            w2 = getattr(module, "w2_weight", None)
++            if w2 is not None and getattr(w2, "ndim", 0) >= 1:
++                d_in_down = int(w2.shape[-1])
 +        tk = getattr(module, "top_k", None)
 +        if tk is not None and top_k is None:
 +            top_k = int(tk)
@@ -7454,6 +7493,7 @@ index 0000000..2d09960
 +        int(n_experts) if n_experts is not None else 0,
 +        int(top_k) if top_k is not None else 0,
 +        int(d_in) if d_in is not None else 0,
++        int(d_in_down) if d_in_down is not None else 0,
 +        device,
 +    )
 +
@@ -7481,6 +7521,34 @@ index 0000000..2d09960
 +            r_max, dtype=torch.int64, device=device)
 +
 +
++def alloc_layer_down(
++    li: int, n_experts: int, d_in_down: int, buf_rows: int, top_k: int,
++    device: Any,
++) -> None:
++    """Allocate the down_proj Gram accumulator + its OWN compact scratch for one
++    MoE layer. Mirrors :func:`alloc_layer` but with ``d_in_down`` and the
++    ``_INPUT_COV_DOWN_*`` dict family. The down group keeps a SEPARATE
++    counting-sort scratch (offsets/counts) from the gate/up group: the down SYRK
++    runs inside ``TritonExperts.apply`` (a different scope than the gate SYRK in
++    ``MoERunner``), so it recomputes its own prologue and must not alias the
++    gate scratch. ``_ONES_I64_BUF_GPU`` is shared (same ``r_max = buf_rows *
++    top_k``)."""
++    r_max = buf_rows * max(1, top_k)
++    _ch._INPUT_COV_DOWN_GPU[li] = torch.zeros(
++        n_experts, d_in_down, d_in_down, dtype=torch.float32, device=device)
++    _ch._INPUT_COV_DOWN_COUNT_GPU[li] = torch.zeros(
++        n_experts, dtype=torch.int64, device=device)
++    _ch._INPUT_COV_DOWN_XSORTED_GPU[li] = torch.zeros(
++        r_max, d_in_down, dtype=torch.float32, device=device)
++    _ch._INPUT_COV_DOWN_OFFSETS_GPU[li] = torch.zeros(
++        n_experts + 1, dtype=torch.int64, device=device)
++    _ch._INPUT_COV_DOWN_COUNTS_SCRATCH_GPU[li] = torch.zeros(
++        n_experts, dtype=torch.int64, device=device)
++    if li not in _ch._ONES_I64_BUF_GPU:
++        _ch._ONES_I64_BUF_GPU[li] = torch.ones(
++            r_max, dtype=torch.int64, device=device)
++
++
 +def free_layer(li: int) -> None:
 +    """Drop a layer's resident Gram + compact scratch (offload driver,
 +    per-window). ``_ONES_I64_BUF_GPU`` is intentionally NOT dropped here: it is
@@ -7489,14 +7557,18 @@ index 0000000..2d09960
 +    offload driver, which is sole-capture, clears it itself.)"""
 +    for _d in (_ch._INPUT_COV_GPU, _ch._INPUT_COV_COUNT_GPU,
 +               _ch._INPUT_COV_XSORTED_GPU, _ch._INPUT_COV_OFFSETS_GPU,
-+               _ch._INPUT_COV_COUNTS_SCRATCH_GPU):
++               _ch._INPUT_COV_COUNTS_SCRATCH_GPU,
++               _ch._INPUT_COV_DOWN_GPU, _ch._INPUT_COV_DOWN_COUNT_GPU,
++               _ch._INPUT_COV_DOWN_XSORTED_GPU,
++               _ch._INPUT_COV_DOWN_OFFSETS_GPU,
++               _ch._INPUT_COV_DOWN_COUNTS_SCRATCH_GPU):
 +        _d.pop(li, None)
 +
 +
 +def setup(llm: Any) -> None:
-+    global _LAYER_IDS, _N_LAYERS, _N_EXPERTS, _TOP_K, _D_IN
++    global _LAYER_IDS, _N_LAYERS, _N_EXPERTS, _TOP_K, _D_IN, _D_IN_DOWN
 +
-+    if not _CAPTURE_INPUT_COV:
++    if not (_CAPTURE_INPUT_COV or _CAPTURE_INPUT_COV_DOWN):
 +        log.info("calibration_input_cov: env gate off; no-op setup.")
 +        return
 +    if _INPUT_COV_MODE == "off":
@@ -7516,12 +7588,19 @@ index 0000000..2d09960
 +        log.warning("calibration_input_cov: could not resolve model.")
 +        return
 +
-+    layer_ids, n_experts, top_k, d_in, device = _discover_moe_layers(model)
-+    if not layer_ids or n_experts == 0 or d_in == 0:
++    layer_ids, n_experts, top_k, d_in, d_in_down, device = _discover_moe_layers(
++        model)
++    # d_in is needed for the gate/up group; d_in_down for the down group. Only
++    # require the dim(s) the enabled flag(s) actually use.
++    _need_gate = _CAPTURE_INPUT_COV
++    _need_down = _CAPTURE_INPUT_COV_DOWN
++    if (not layer_ids or n_experts == 0
++            or (_need_gate and d_in == 0)
++            or (_need_down and d_in_down == 0)):
 +        log.warning(
 +            "calibration_input_cov: incomplete MoE discovery "
-+            "(layers=%d, experts=%d, d_in=%d).",
-+            len(layer_ids), n_experts, d_in)
++            "(layers=%d, experts=%d, d_in=%d, d_in_down=%d).",
++            len(layer_ids), n_experts, d_in, d_in_down)
 +        return
 +    if device is None:
 +        device = torch.device("cuda")
@@ -7531,49 +7610,75 @@ index 0000000..2d09960
 +    _N_EXPERTS = n_experts
 +    _TOP_K = top_k if top_k > 0 else 8
 +    _D_IN = d_in
++    _D_IN_DOWN = d_in_down
 +
 +    buf_rows = _calib_buf_rows()
 +    for li in layer_ids:
-+        if li not in _ch._INPUT_COV_GPU:
++        if _need_gate and li not in _ch._INPUT_COV_GPU:
 +            alloc_layer(li, n_experts, d_in, buf_rows, _TOP_K, device)
++        if _need_down and li not in _ch._INPUT_COV_DOWN_GPU:
++            alloc_layer_down(li, n_experts, d_in_down, buf_rows, _TOP_K, device)
 +
 +    log.info(
 +        "calibration_input_cov: setup complete -- mode=%s, %d MoE layers, "
-+        "%d experts/layer, top_k=%d, d_in=%d, buf_rows=%d; fused grouped-SYRK "
-+        "Gram accumulation armed (compact scratch [%d, %d]).",
-+        _INPUT_COV_MODE, _N_LAYERS, _N_EXPERTS, _TOP_K, _D_IN, buf_rows,
-+        buf_rows * _TOP_K, _D_IN,
++        "%d experts/layer, top_k=%d, gate(d_in=%s)=%s down(d_in=%s)=%s, "
++        "buf_rows=%d; fused grouped-SYRK Gram accumulation armed.",
++        _INPUT_COV_MODE, _N_LAYERS, _N_EXPERTS, _TOP_K,
++        _D_IN, "on" if _need_gate else "off",
++        _D_IN_DOWN, "on" if _need_down else "off", buf_rows,
 +    )
 +
 +
 +def dump_input_cov(jsonl_path: str | Path) -> None:
-+    if not _CAPTURE_INPUT_COV or _INPUT_COV_MODE == "off":
++    if (not (_CAPTURE_INPUT_COV or _CAPTURE_INPUT_COV_DOWN)
++            or _INPUT_COV_MODE == "off"):
 +        return
 +
 +    from moe_compress.utils.cached_calibration_signals import (
 +        CovariancePayload, save_covariance, SCHEMA_VERSIONS,
 +    )
 +
-+    if not _ch._INPUT_COV_GPU:
++    # (matrix_name, Gram dict, count dict) for each enabled group. Keys are
++    # disjoint across groups (matrix_name differs), so a single payload carries
++    # both gate_proj and down_proj.
++    groups = []
++    if _CAPTURE_INPUT_COV:
++        groups.append(
++            (_MATRIX_NAME, _ch._INPUT_COV_GPU, _ch._INPUT_COV_COUNT_GPU))
++    if _CAPTURE_INPUT_COV_DOWN:
++        groups.append(
++            (_MATRIX_NAME_DOWN, _ch._INPUT_COV_DOWN_GPU,
++             _ch._INPUT_COV_DOWN_COUNT_GPU))
++
++    if not any(gpu for _m, gpu, _c in groups):
 +        log.warning("calibration_input_cov: no entries; skip dump.")
 +        return
 +
++    # NOTE (storage dtype): this resident-mode dump goes through
++    # ``save_covariance``, which casts sigma_in to fp16 -- whereas the windowed
++    # OFFLOAD path (input_cov_offload.write_layer_shard / assemble_covariance)
++    # stores bf16. The raw un-normalized Gram is a sum over ~1e5-1e6
++    # tokens/expert and can exceed fp16's 65504 ceiling (->+inf). The resident
++    # path is therefore only safe for SMALL captures; use --input-cov-offload
++    # (bf16, overflow-proof) for the full-corpus / big-model capture. This
++    # applies to gate_proj and down_proj identically.
 +    sigma_in: dict = {}
 +    token_counts: dict = {}
-+    for li in _LAYER_IDS:
-+        cov = _ch._INPUT_COV_GPU.get(li)
-+        cnt = _ch._INPUT_COV_COUNT_GPU.get(li)
-+        if cov is None or cnt is None:
-+            continue
-+        cov_cpu = cov.cpu()       # [E, H, H]
-+        cnt_cpu = cnt.cpu()       # [E]
-+        for e in range(cov_cpu.shape[0]):
-+            c = int(cnt_cpu[e].item())
-+            if c <= 0:
++    for matrix_name, cov_gpu, count_gpu in groups:
++        for li in _LAYER_IDS:
++            cov = cov_gpu.get(li)
++            cnt = count_gpu.get(li)
++            if cov is None or cnt is None:
 +                continue
-+            key = (int(li), int(e), _MATRIX_NAME)
-+            sigma_in[key] = cov_cpu[e]
-+            token_counts[key] = c
++            cov_cpu = cov.cpu()       # [E, d, d]
++            cnt_cpu = cnt.cpu()       # [E]
++            for e in range(cov_cpu.shape[0]):
++                c = int(cnt_cpu[e].item())
++                if c <= 0:
++                    continue
++                key = (int(li), int(e), matrix_name)
++                sigma_in[key] = cov_cpu[e]
++                token_counts[key] = c
 +
 +    payload = CovariancePayload(
 +        schema_version=SCHEMA_VERSIONS["covariance"],
@@ -7584,14 +7689,15 @@ index 0000000..2d09960
 +    )
 +    save_covariance(payload, Path(jsonl_path))
 +    log.info(
-+        "calibration_input_cov: wrote %d (layer, expert) entries (%d "
-+        "layers × %d experts) next to %s",
-+        len(sigma_in), _N_LAYERS, _N_EXPERTS, jsonl_path,
++        "calibration_input_cov: wrote %d (layer, expert, matrix) entries (%d "
++        "layers × %d experts × %d matrices) next to %s",
++        len(sigma_in), _N_LAYERS, _N_EXPERTS, len(groups), jsonl_path,
 +    )
 +
 +
 +def dump_input_cov_checkpoint(ckpt_path: str) -> None:
-+    if not _CAPTURE_INPUT_COV or _INPUT_COV_MODE == "off":
++    if (not (_CAPTURE_INPUT_COV or _CAPTURE_INPUT_COV_DOWN)
++            or _INPUT_COV_MODE == "off"):
 +        return
 +    payload = {
 +        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
@@ -7599,12 +7705,19 @@ index 0000000..2d09960
 +        "n_layers": _N_LAYERS,
 +        "n_experts": _N_EXPERTS,
 +        "d_in": _D_IN,
++        "d_in_down": _D_IN_DOWN,
 +        "mode": _INPUT_COV_MODE,
 +        "layer_ids": list(_LAYER_IDS),
 +        "cov": {li: _ch._INPUT_COV_GPU[li].cpu()
 +                for li in _LAYER_IDS if li in _ch._INPUT_COV_GPU},
 +        "counts": {li: _ch._INPUT_COV_COUNT_GPU[li].cpu()
 +                   for li in _LAYER_IDS if li in _ch._INPUT_COV_COUNT_GPU},
++        # down_proj group (empty unless _CAPTURE_INPUT_COV_DOWN is on).
++        "cov_down": {li: _ch._INPUT_COV_DOWN_GPU[li].cpu()
++                     for li in _LAYER_IDS if li in _ch._INPUT_COV_DOWN_GPU},
++        "counts_down": {li: _ch._INPUT_COV_DOWN_COUNT_GPU[li].cpu()
++                        for li in _LAYER_IDS
++                        if li in _ch._INPUT_COV_DOWN_COUNT_GPU},
 +    }
 +    tmp = ckpt_path + ".tmp"
 +    with open(tmp, "wb") as f:
@@ -7622,7 +7735,8 @@ index 0000000..2d09960
 +
 +
 +def load_input_cov_checkpoint(ckpt_path: str) -> int:
-+    global _N_LAYERS, _N_EXPERTS, _D_IN, _n_prompts_accumulated, _LAYER_IDS
++    global _N_LAYERS, _N_EXPERTS, _D_IN, _D_IN_DOWN
++    global _n_prompts_accumulated, _LAYER_IDS
 +    if not os.path.exists(ckpt_path):
 +        return 0
 +    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -7642,23 +7756,35 @@ index 0000000..2d09960
 +    _N_LAYERS = int(payload["n_layers"])
 +    _N_EXPERTS = int(payload["n_experts"])
 +    _D_IN = payload.get("d_in", None)
++    _D_IN_DOWN = payload.get("d_in_down", None)
 +    _LAYER_IDS = [int(x) for x in payload.get("layer_ids", [])]
 +    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 +    for li, t in payload.get("cov", {}).items():
 +        _ch._INPUT_COV_GPU[int(li)] = t.to(torch.float32).to(device)
 +    for li, t in payload.get("counts", {}).items():
 +        _ch._INPUT_COV_COUNT_GPU[int(li)] = t.to(torch.int64).to(device)
++    # down_proj group (absent in pre-down checkpoints -> {} -> nothing restored).
++    for li, t in payload.get("cov_down", {}).items():
++        _ch._INPUT_COV_DOWN_GPU[int(li)] = t.to(torch.float32).to(device)
++    for li, t in payload.get("counts_down", {}).items():
++        _ch._INPUT_COV_DOWN_COUNT_GPU[int(li)] = t.to(torch.int64).to(device)
 +    return _n_prompts_accumulated
 +
 +
 +def captured_entry_count() -> int:
-+    """B0 fail-fast hook: number of layers with non-zero token counts."""
++    """B0 fail-fast hook: number of (layer, group) slots with non-zero token
++    counts. Counts BOTH the gate/up and down groups so a down-only run is not
++    falsely reported as empty (the down SYRK populates _INPUT_COV_DOWN_*)."""
 +    if _INPUT_COV_MODE == "off":
 +        return 0
 +    n = 0
 +    for v in _ch._INPUT_COV_COUNT_GPU.values():
 +        if int(v.sum().item()) > 0:
 +            n += 1
++    if _CAPTURE_INPUT_COV_DOWN:
++        for v in _ch._INPUT_COV_DOWN_COUNT_GPU.values():
++            if int(v.sum().item()) > 0:
++                n += 1
 +    return n
 diff --git a/vllm/calibration_output_reservoir.py b/vllm/calibration_output_reservoir.py
 new file mode 100644
@@ -9473,10 +9599,10 @@ index 0000000..3f5f800
 +            n += 1
 +    return n
 diff --git a/vllm/envs.py b/vllm/envs.py
-index ded474d..9b64790 100755
+index ded474d..7077685 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -268,6 +268,29 @@ if TYPE_CHECKING:
+@@ -268,6 +268,30 @@ if TYPE_CHECKING:
      VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
      VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
      VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -9491,6 +9617,7 @@ index ded474d..9b64790 100755
 +    VLLM_CALIB_CAPTURE_EXPERT_MID: bool = False
 +    VLLM_CALIB_CAPTURE_LAYER_IN: bool = False
 +    VLLM_CALIB_CAPTURE_INPUT_COV: bool = False
++    VLLM_CALIB_CAPTURE_INPUT_COV_DOWN: bool = False
 +    VLLM_CALIB_CAPTURE_PER_EXPERT_MAX: bool = False
 +    VLLM_CALIB_CAPTURE_ROUTING_STATS: bool = False
 +    VLLM_CALIB_CAPTURE_ROUTER_LOGITS_STATS: bool = False
@@ -9506,7 +9633,7 @@ index ded474d..9b64790 100755
  
  
  def get_default_cache_root():
-@@ -1788,6 +1811,235 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1788,6 +1812,246 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
          int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
      ),
@@ -9595,6 +9722,17 @@ index ded474d..9b64790 100755
 +    # Default off.
 +    "VLLM_CALIB_CAPTURE_INPUT_COV": lambda: bool(
 +        int(os.getenv("VLLM_CALIB_CAPTURE_INPUT_COV", "0"))
++    ),
++    # Calibration capture: per-(layer, expert, "down_proj") teacher input
++    # covariance Σ_in -- the SECOND in-graph grouped-SYRK group, fed the
++    # post-SwiGLU intermediate inside ``TritonExperts.apply`` (Triton backend
++    # only). Independent on/off from the gate/up group above so it can be
++    # toggled in isolation; the calibration-v2 driver
++    # (``build_self_traces_calib_vllm.py --capture-input-covariance-down``)
++    # sets it. Writes ``down_proj`` keys into the same dict-shaped
++    # ``covariance.pt`` (schema v2). Default off.
++    "VLLM_CALIB_CAPTURE_INPUT_COV_DOWN": lambda: bool(
++        int(os.getenv("VLLM_CALIB_CAPTURE_INPUT_COV_DOWN", "0"))
 +    ),
 +    # Capture per-(layer, expert) down_proj output max L_inf for Stage 1
 +    # cheap-pruning candidate ranking. Activates the writer in
@@ -9743,7 +9881,7 @@ index ded474d..9b64790 100755
  
  
 diff --git a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
-index e99f307..cc0cacf 100644
+index e99f307..fc1398e 100644
 --- a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
 +++ b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
 @@ -2,8 +2,11 @@
@@ -9758,7 +9896,7 @@ index e99f307..cc0cacf 100644
  import vllm.model_executor.layers.fused_moe.modular_kernel as mk
  from vllm import _custom_ops as ops
  from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-@@ -45,6 +48,19 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+@@ -45,6 +48,25 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
  from vllm.platforms import current_platform
  from vllm.triton_utils import tl
  
@@ -9772,13 +9910,19 @@ index e99f307..cc0cacf 100644
 +# side-store row capacity for a layer, the interior calibration accumulation
 +# for that batch is skipped and a single WARNING is emitted per layer.
 +_WARNED_OOB: set[int] = set()
++# One-time warn per layer when the down_proj SYRK skips a forward's
++# contribution -- either the discovered Gram width disagrees with the live
++# post-SwiGLU intermediate width (quantized/packed w2 mis-sized) or the routed
++# rows R exceed the x_sorted capacity (buf_rows too small). Mirrors the
++# _WARNED_OOB convention used by the other interior captures in this file.
++_WARNED_DOWN: set[int] = set()
 +
 +_calib_logger = logging.getLogger(__name__)
 +
  
  class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
      """Triton-based fused MoE expert implementation."""
-@@ -59,6 +75,68 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+@@ -59,6 +81,68 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
          self.quantization_emulation = False
          super().__init__(moe_config, quant_config)
  
@@ -9847,10 +9991,84 @@ index e99f307..cc0cacf 100644
      @staticmethod
      def activation_format() -> mk.FusedMoEActivationFormat:
          return mk.FusedMoEActivationFormat.Standard
-@@ -287,6 +365,20 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+@@ -287,6 +371,94 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
              activation, intermediate_cache2, intermediate_cache1.view(-1, N)
          )
  
++        # ---- in-graph down_proj input-covariance (grouped-SYRK) -------------
++        # The CUDA-resident, graph-safe replacement for the removed eager
++        # ``expert_mid`` dispatch. ``intermediate_cache2`` is the post-SwiGLU
++        # intermediate = the down_proj INPUT, in NATIVE dtype (this runs BEFORE
++        # the pre-down quantize below). Its layout is token-major
++        # ``[num_tokens * top_k_num, cache2_dim]`` (row r = token (r // top_k),
++        # slot (r % top_k)), so row r maps to expert ``topk_ids.reshape(-1)[r]``
++        # -- the SAME indexing the gate/up SYRK uses in MoERunner. This is the
++        # SECOND group of ``torch.ops.calib_gram.gram_grouped_accum``: per
++        # expert e, cov[e] += X_e^T X_e over the rows routed to e.
++        #
++        # Self-contained counting-sort (own scratch, NOT the gate scratch): the
++        # gate SYRK lives in MoERunner._apply_quant_method (a different scope),
++        # so its offsets are not in scope here and down-only runs must work too.
++        # Unlike the gate path -- which gathers per-TOKEN hidden rows via
++        # ``_tok = order // top_k`` because ``hidden_states`` is ``[T, H]`` --
++        # ``intermediate_cache2`` is ALREADY per-(token, slot), so we gather
++        # rows DIRECTLY by ``argsort(_flat)`` (no ``// top_k``). Only GPU tensor
++        # ops + the registered op: no .cpu()/.item()/callback (graph-safe).
++        if (_ch._CAPTURE_INPUT_COV_DOWN
++                and _ch._INPUT_COV_MODE == "resident"
++                and _ch._current_layer_idx in _ch._INPUT_COV_DOWN_GPU):
++            _li = _ch._current_layer_idx
++            _xmid = intermediate_cache2.float()           # [R, cache2_dim]
++            _R = _xmid.shape[0]                           # == num_tokens*top_k
++            _cov = _ch._INPUT_COV_DOWN_GPU[_li]           # [E, d, d]
++            _xs = _ch._INPUT_COV_DOWN_XSORTED_GPU[_li]    # [r_max, d]
++            if _xmid.shape[1] != _cov.shape[1]:
++                # Discovered down width disagrees with the live intermediate
++                # (e.g. a packed/quantized w2). Skip rather than crash the op.
++                if _li not in _WARNED_DOWN:
++                    _WARNED_DOWN.add(_li)
++                    _calib_logger.warning(
++                        "calib: down_proj cov width mismatch for layer %d "
++                        "(intermediate=%d, accumulator=%d); SKIPPING down "
++                        "capture for this layer. The discovered d_in_down "
++                        "(w2_weight.shape[-1]) must equal the post-SwiGLU "
++                        "intermediate width.",
++                        _li, _xmid.shape[1], _cov.shape[1])
++            elif _R <= _xs.shape[0]:
++                # Capacity guard mirrors the gate path: R = num_tokens*top_k
++                # must fit r_max = buf_rows*top_k. Constant per captured graph
++                # size -> resolves at trace time (graph-safe). A too-small
++                # buf_rows SKIPS this forward (the elif's else) rather than
++                # indexing OOB.
++                _flat = topk_ids.reshape(-1).to(torch.int64)   # [R] row->expert
++                _cnts = _ch._INPUT_COV_DOWN_COUNTS_SCRATCH_GPU[_li]
++                _cnts.zero_()
++                _cnts.scatter_add_(
++                    0, _flat, _ch._ONES_I64_BUF_GPU[_li][:_R])
++                _off = _ch._INPUT_COV_DOWN_OFFSETS_GPU[_li]
++                _off.zero_()
++                torch.cumsum(_cnts, 0, out=_off[1:])
++                _order = torch.argsort(_flat, stable=True)     # [R]
++                # DIRECT gather (intermediate is already per-(token, slot)).
++                torch.index_select(_xmid, 0, _order, out=_xs[:_R])
++                torch.ops.calib_gram.gram_grouped_accum(
++                    _ch._INPUT_COV_DOWN_GPU[_li],
++                    _ch._INPUT_COV_DOWN_COUNT_GPU[_li],
++                    _xs[:_R], _off,
++                )
++            elif _li not in _WARNED_DOWN:
++                # Capacity exceeded (buf_rows < num_tokens): skip this forward's
++                # down contribution and warn ONCE per layer. Mirrors the
++                # _WARNED_OOB convention of the sibling interior captures below;
++                # decode/cudagraph batches always fit, so this only trips on a
++                # misconfigured prefill cap.
++                _WARNED_DOWN.add(_li)
++                _calib_logger.warning(
++                    "calib: down_proj cov R=%d > x_sorted capacity=%d for "
++                    "layer %d; SKIPPING down capture for this forward. Increase "
++                    "VLLM_CALIB_BUF_ROWS_FLOOR or max_num_batched_tokens.",
++                    _R, _xs.shape[0], _li)
++
 +        # Calibration capture: side-store the per-(token, top_k)
 +        # mid-activation (silu(gate)·up) BEFORE the pre-down quantize so
 +        # the imatrix consumer sees the native-dtype tensor. The
@@ -9868,7 +10086,7 @@ index e99f307..cc0cacf 100644
          a2q_scale: torch.Tensor | None = None
  
          qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-@@ -298,6 +390,78 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+@@ -298,6 +470,78 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
              quantization_emulation=self.quantization_emulation,
          )
  
@@ -9947,7 +10165,7 @@ index e99f307..cc0cacf 100644
          invoke_fused_moe_triton_kernel(
              qintermediate_cache2,
              w2,
-@@ -319,8 +483,75 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+@@ -319,8 +563,75 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
              per_channel_quant=self.per_act_token_quant,
              block_shape=self.block_shape,
              B_bias=self.w2_bias,
@@ -10196,7 +10414,7 @@ index 8d974ea..3a5f115 100644
  
  
 diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
-index 37b15ed..4ce4a47 100644
+index 37b15ed..7d91f34 100644
 --- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
 +++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
 @@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
@@ -10244,7 +10462,7 @@ index 37b15ed..4ce4a47 100644
          if self._quant_method.is_monolithic:
              fused_out = self._quant_method.apply_monolithic(
                  layer=layer,
-@@ -533,6 +557,144 @@ class MoERunner(MoERunnerInterface):
+@@ -533,6 +557,145 @@ class MoERunner(MoERunnerInterface):
              if routing_replay_out is not None:
                  routing_replay_out[: topk_ids.shape[0]].copy_(topk_ids.to(torch.int16))
  
@@ -10267,7 +10485,8 @@ index 37b15ed..4ce4a47 100644
 +                    or _ch._CAPTURE_IMATRIX or _ch._CAPTURE_OUTPUT_RESERVOIR
 +                    or _ch._CAPTURE_PER_EXPERT_MAX
 +                    or _ch._CAPTURE_WANDA_SCALAR_ROW
-+                    or _ch._CAPTURE_REAP_SCORES or _ch._CAPTURE_INPUT_COV):
++                    or _ch._CAPTURE_REAP_SCORES or _ch._CAPTURE_INPUT_COV
++                    or _ch._CAPTURE_INPUT_COV_DOWN):
 +                _ch._current_layer_idx = layer.moe_layer_id
 +
 +            _li = layer.moe_layer_id
@@ -10389,7 +10608,7 @@ index 37b15ed..4ce4a47 100644
              # Passing shared_experts_input in case SharedExpertsOrder is
              # MK_INTERNAL_OVERLAPPED.
              fused_out = self._quant_method.apply(
-@@ -543,6 +705,11 @@ class MoERunner(MoERunnerInterface):
+@@ -543,6 +706,11 @@ class MoERunner(MoERunnerInterface):
                  shared_experts_input=shared_experts_input,
              )
  
