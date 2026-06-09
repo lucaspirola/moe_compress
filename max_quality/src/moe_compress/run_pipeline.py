@@ -171,6 +171,17 @@ def main(argv=None) -> int:
         log.info("=== Stage 1 — Super Expert Detection + GRAPE Budgets ===")
         t1 = time.monotonic()
 
+        # Stage-4-aware net target (opt-in via target.net_of_eora). When true the
+        # solver treats total_reduction_ratio as the NET compression after Stage 4
+        # EoRA regrows the model, over-compressing Stages 2/3 to absorb the
+        # ~compensation_budget_pct × (Stage-3 savings) add-back. Default false =
+        # legacy gross-only behaviour (existing configs unchanged).
+        _eora_overhead_pct = (
+            float(config.get("stage4_eora", {}).get("compensation_budget_pct", 0.0))
+            if config["target"].get("net_of_eora", False)
+            else 0.0
+        )
+
         # First pass: approximate budget (blacklist unknown yet)
         decomposition = budget_solver.solve(
             model,
@@ -178,6 +189,7 @@ def main(argv=None) -> int:
             ep_sp_knob_ratio=config["target"]["expert_svd_ratio"],
             min_experts_per_layer=config["stage1_grape"]["min_experts_per_layer"],
             blacklisted_experts={},
+            eora_overhead_pct=_eora_overhead_pct,
         )
 
         # Stage 1: SE detection + CKA + GRAPE
@@ -194,6 +206,7 @@ def main(argv=None) -> int:
             ep_sp_knob_ratio=config["target"]["expert_svd_ratio"],
             min_experts_per_layer=config["stage1_grape"]["min_experts_per_layer"],
             blacklisted_experts=blacklist,
+            eora_overhead_pct=_eora_overhead_pct,
         )
         save_json_artifact(decomposition.as_dict(), artifacts_dir / "budget_decomposition.json")
         _finish_stage(1, t1, None)

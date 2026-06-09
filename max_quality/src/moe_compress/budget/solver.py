@@ -105,6 +105,11 @@ _MAX_EP = 0.60  # maximum expert pruning ratio
 _MAX_SP = 0.40  # maximum SVD rank reduction ratio
 # These caps are intentionally hardcoded; they represent the design ceiling for each compression axis.
 
+# Outer fixed-point iterations for the Stage-4-aware (EoRA) target inflation in
+# :func:`solve`. EoRA regrowth is small (~0.3pp at the 0.03 default) so the
+# gross-target fixed point converges in 1-2 steps; 5 is a safe ceiling.
+_EORA_OUTER_ITERS = 5
+
 
 @dataclass
 class BudgetDecomposition:
@@ -130,7 +135,18 @@ class BudgetDecomposition:
     expert_params: int = 0
     projected_expert_params_after_prune: int = 0
     projected_expert_params_after_svd: int = 0
-    projected_total_reduction: float = 0.0
+    projected_total_reduction: float = 0.0       # GROSS reduction over Stages 2+3 (no Stage-4 EoRA regrowth)
+
+    # Stage-4-aware accounting (populated only when ``eora_overhead_pct`` > 0; see
+    # :func:`solve`). When EoRA is modelled, ``total_reduction_ratio`` /
+    # ``projected_total_reduction`` remain the GROSS Stages-2+3 figures (so all
+    # downstream gross-based math is unchanged), while these three carry the NET
+    # picture: ``target_net_reduction`` is the user's requested final compression,
+    # and ``projected_net_reduction`` = gross − EoRA regrowth is what the delivered
+    # model actually hits after Stage 4 adds its low-rank adapters back.
+    eora_overhead_pct: float = 0.0               # EoRA add-back as a fraction of Stage-3 SVD savings (0 = not modelled)
+    target_net_reduction: float = 0.0            # user's net target when EoRA is modelled (else 0.0)
+    projected_net_reduction: float = 0.0         # gross − EoRA regrowth; the final delivered compression (0.0 when not modelled)
 
     def as_dict(self) -> dict:
         """Serialize to a JSON-compatible dict; blacklisted_experts keys are converted to strings.
@@ -160,6 +176,7 @@ def solve(
     blacklisted_experts: dict[int, list[int]] | None = None,
     max_iterations: int = 20,
     tolerance: float = 0.005,
+    eora_overhead_pct: float = 0.0,
 ) -> BudgetDecomposition:
     """Iteratively tighten the two knobs until the projected reduction
     meets or exceeds the target within ``tolerance`` (an *absolute* difference
@@ -179,7 +196,90 @@ def solve(
     expert/total param fraction, giving convergence in ≤ 3 iterations for
     fine-grained MoE models where params_per_expert_avg/total_params ≪ tolerance
     (i.e. the quantisation granularity is well below the tolerance threshold).
+
+    ``eora_overhead_pct``: when > 0, makes ``target_total_reduction`` a NET target
+    (the compression of the *delivered* model after Stage 4 EoRA adds its low-rank
+    adapters back). Stage 4 regrows the model by ≈ ``eora_overhead_pct`` × (Stage-3
+    SVD savings); the solver then targets a slightly higher GROSS reduction so that
+    gross − regrowth lands on the requested net target. Implemented as an outer
+    fixed-point that recurses into the base (``eora_overhead_pct=0``) path, so the
+    core decomposition logic is unchanged and ``eora_overhead_pct=0`` reproduces the
+    legacy result exactly. The returned decomposition's ``projected_total_reduction``
+    stays GROSS (downstream Stage-2/3 budgets are gross), while ``target_net_reduction``
+    / ``projected_net_reduction`` carry the net picture.
     """
+    if not math.isfinite(eora_overhead_pct) or eora_overhead_pct < 0:
+        raise ValueError(
+            f"eora_overhead_pct must be a non-negative finite number, got {eora_overhead_pct!r}"
+        )
+    if eora_overhead_pct > 0:
+        # Stage-4-aware pre-compensation. The inner solver hits its target on
+        # Stages 2+3 only; Stage 4 then adds back ~eora_overhead_pct × (Stage-3
+        # SVD savings). Inflate the gross target via a fixed point so that
+        # net = gross − regrowth == the requested net target.
+        def _growth_frac(d: BudgetDecomposition) -> float:
+            svd_savings = d.projected_expert_params_after_prune - d.projected_expert_params_after_svd
+            return eora_overhead_pct * max(0, svd_savings) / d.total_params
+
+        t_gross = target_total_reduction
+        for _ in range(_EORA_OUTER_ITERS):
+            d = solve(
+                model,
+                target_total_reduction=t_gross,
+                ep_sp_knob_ratio=ep_sp_knob_ratio,
+                min_experts_per_layer=min_experts_per_layer,
+                blacklisted_experts=blacklisted_experts,
+                max_iterations=max_iterations,
+                tolerance=tolerance,
+                eora_overhead_pct=0.0,
+            )
+            # Continuous max-achievable ceiling from this solve's measured params,
+            # so inflation never pushes the gross target past what the caps allow.
+            max_ach = d.expert_params * (1.0 - (1.0 - _MAX_EP) * (1.0 - _MAX_SP)) / d.total_params
+            nt = min(target_total_reduction + _growth_frac(d), max_ach - 1e-9)
+            if abs(nt - t_gross) < 1e-4:
+                t_gross = nt
+                break
+            t_gross = nt
+        # Final solve at the converged gross target, then annotate the net picture.
+        d = solve(
+            model,
+            target_total_reduction=t_gross,
+            ep_sp_knob_ratio=ep_sp_knob_ratio,
+            min_experts_per_layer=min_experts_per_layer,
+            blacklisted_experts=blacklisted_experts,
+            max_iterations=max_iterations,
+            tolerance=tolerance,
+            eora_overhead_pct=0.0,
+        )
+        d.eora_overhead_pct = eora_overhead_pct
+        d.target_net_reduction = target_total_reduction
+        d.projected_net_reduction = d.projected_total_reduction - _growth_frac(d)
+        # Net-target convergence check: the inner solve only validates GROSS vs its
+        # (inflated) gross target — genuine non-convergence is already caught there
+        # (it raises on gross undershoot). This is the secondary, net-side check so
+        # a net miss is never SILENT. We WARN rather than raise: when the inner
+        # solve returns, gross is within ±tolerance of (target+growth), so net =
+        # gross − growth is within ±tolerance of target by construction (modulo the
+        # sub-param int-rounding in _growth_frac); a warning flags the residual
+        # without false-failing on coarse-lattice models or the max_ach clamp.
+        net_err = d.projected_net_reduction - target_total_reduction
+        if abs(net_err) > tolerance:
+            log.warning(
+                "solve(EoRA-aware): net reduction %.4f is %+.4f from target %.4f "
+                "(>tolerance %.4f). gross_target=%.4f; %s. Inner gross convergence "
+                "already validated; check coarse expert lattice / max-achievable clamp.",
+                d.projected_net_reduction, net_err, target_total_reduction, tolerance,
+                t_gross, "overshoot (more compressed; safe)" if net_err > 0
+                else "undershoot (less compressed than requested)",
+            )
+        log.info(
+            "solve(EoRA-aware): net_target=%.4f -> gross_target=%.4f; "
+            "projected gross=%.4f net=%.4f (eora_overhead_pct=%.3f)",
+            target_total_reduction, t_gross, d.projected_total_reduction,
+            d.projected_net_reduction, eora_overhead_pct,
+        )
+        return d
     if max_iterations < 1:
         raise ValueError(f"max_iterations must be >= 1, got {max_iterations!r}")
     if not math.isfinite(tolerance) or tolerance <= 0:

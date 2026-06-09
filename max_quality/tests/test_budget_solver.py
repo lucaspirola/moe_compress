@@ -148,3 +148,67 @@ def test_as_dict_stringifies_blacklisted_keys(tiny_model):
     )
 
 
+
+
+# ---------------------------------------------------------------------------
+# Stage-4-aware (EoRA) net-target compensation
+# ---------------------------------------------------------------------------
+
+def test_eora_zero_reproduces_legacy(tiny_model):
+    """eora_overhead_pct=0.0 must produce a byte-identical decomposition to the
+    legacy call (no EoRA modelling) — protects all existing golden behaviour."""
+    legacy = solver.solve(
+        tiny_model, target_total_reduction=0.15, ep_sp_knob_ratio=5.0,
+        min_experts_per_layer=2,
+    )
+    explicit_zero = solver.solve(
+        tiny_model, target_total_reduction=0.15, ep_sp_knob_ratio=5.0,
+        min_experts_per_layer=2, eora_overhead_pct=0.0,
+    )
+    assert explicit_zero.as_dict() == legacy.as_dict()
+    # Net fields stay at their inert defaults when EoRA is not modelled.
+    assert explicit_zero.eora_overhead_pct == 0.0
+    assert explicit_zero.target_net_reduction == 0.0
+    assert explicit_zero.projected_net_reduction == 0.0
+
+
+def test_eora_aware_populates_net_fields(tiny_model):
+    """With EoRA modelled, projected_net = gross − eora_overhead_pct × SVD-savings,
+    and the net annotation fields are populated."""
+    comp = 0.03
+    d = solver.solve(
+        tiny_model, target_total_reduction=0.15, ep_sp_knob_ratio=5.0,
+        min_experts_per_layer=2, eora_overhead_pct=comp,
+    )
+    assert d.eora_overhead_pct == comp
+    assert d.target_net_reduction == 0.15
+    # gross (projected_total_reduction) is the Stages-2+3 figure; net subtracts
+    # EoRA regrowth = comp × (after_prune − after_svd) / total_params.
+    svd_savings = d.projected_expert_params_after_prune - d.projected_expert_params_after_svd
+    growth = comp * max(0, svd_savings) / d.total_params
+    assert d.projected_net_reduction == pytest.approx(d.projected_total_reduction - growth)
+    # EoRA only ever ADDS params back, so net <= gross.
+    assert d.projected_net_reduction <= d.projected_total_reduction + 1e-12
+
+
+def test_eora_aware_inflates_gross_target(tiny_model):
+    """The EoRA-aware solve targets a higher GROSS reduction than a plain solve
+    at the same nominal target (so net lands on target after regrowth)."""
+    plain = solver.solve(
+        tiny_model, target_total_reduction=0.15, ep_sp_knob_ratio=5.0,
+        min_experts_per_layer=2,
+    )
+    aware = solver.solve(
+        tiny_model, target_total_reduction=0.15, ep_sp_knob_ratio=5.0,
+        min_experts_per_layer=2, eora_overhead_pct=0.03,
+    )
+    # Gross compression is >= the plain solve (inflation never compresses less).
+    assert aware.projected_total_reduction >= plain.projected_total_reduction - 1e-12
+
+
+def test_eora_negative_raises(tiny_model):
+    with pytest.raises(ValueError, match=r"eora_overhead_pct must be"):
+        solver.solve(
+            tiny_model, target_total_reduction=0.15, ep_sp_knob_ratio=5.0,
+            min_experts_per_layer=2, eora_overhead_pct=-0.01,
+        )
