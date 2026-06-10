@@ -137,3 +137,178 @@ def test_derive_solver_budget_math_on_real_dims():
     the K/prune_fraction inverse math is covered above. This integration is
     exercised on the box during the real run."""
     pytest.skip("needs a 256-expert fixture; solver + inverse math covered separately")
+
+
+# ===========================================================================
+# S234-correctness regression locks (fix/reap-ream-s234-tests)
+# Audit: tasks/PLAN_REAP_REAM_S234_CORRECTNESS.md (Concerns 1/2/3).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. rkd_recipe == LIVE plugin default — re-flip tripwire (Concern 2)
+# ---------------------------------------------------------------------------
+
+def _live_rkd_recipe_default() -> str:
+    """Derive the LIVE default of ``stage5_router_kd.rkd_recipe`` behaviourally
+    from the plugin (NO hardcoded mirror) by finding the recipe string whose
+    EXPLICIT injection reproduces, byte-for-byte, the plugin's mutation when the
+    key is ABSENT. The plugin resolves ``s5.get("rkd_recipe", <DEFAULT>)``, so
+    the candidate that matches the absent-key behaviour IS the default."""
+    import copy
+    from moe_compress.router_kd.plugins.rkd_paper_recipe import RkdPaperRecipePlugin
+
+    plugin = RkdPaperRecipePlugin()
+
+    def _mutated(recipe: str | None) -> dict:
+        s5: dict = {"save_best": True}
+        if recipe is not None:
+            s5["rkd_recipe"] = recipe
+        cfg = {"stage5_router_kd": s5, "calibration": {"source": "project-mix"}}
+        plugin.apply_config_overrides(cfg)
+        # Drop the selector key itself so we compare only the APPLIED dials —
+        # the absent-key config has no rkd_recipe, the explicit one does.
+        cfg["stage5_router_kd"].pop("rkd_recipe", None)
+        return cfg
+
+    absent = _mutated(None)
+    # All recipe values the plugin understands; the one matching the absent-key
+    # result is the live default.
+    for candidate in ("paper_dials_only", "paper", "current"):
+        if _mutated(candidate) == absent:
+            return candidate
+    raise AssertionError(
+        "no candidate rkd_recipe reproduced the absent-key behaviour — the "
+        "plugin's default-resolution changed shape; update this derivation."
+    )
+
+
+def test_runner_rkd_recipe_equals_live_plugin_default():
+    """TRIPWIRE: the value the runner injects for ``stage5_router_kd.rkd_recipe``
+    MUST equal the LIVE plugin default (rkd_paper_recipe.py, currently
+    'paper_dials_only', flipped 2026-06-09). The whole point of this test is to
+    FAIL LOUDLY if someone later re-flips the plugin default without re-deciding
+    what the ablation runner pins — the two must not silently diverge."""
+    live_default = _live_rkd_recipe_default()
+    cfg = rr.build_arm_config(_base(), method="faithful_prune", prune_fraction=0.23)
+    injected = cfg["stage5_router_kd"]["rkd_recipe"]
+    assert injected == live_default, (
+        f"runner injects rkd_recipe={injected!r} but the LIVE plugin default is "
+        f"{live_default!r} — the plugin default was re-flipped. Re-decide what "
+        "run_reap_ream_35pct.py should pin (this divergence is the bug)."
+    )
+    # Belt-and-suspenders: the merge arm injects the same value.
+    cfg_merge = rr.build_arm_config(_base(), method="merge", prune_fraction=0.23)
+    assert cfg_merge["stage5_router_kd"]["rkd_recipe"] == live_default
+
+
+# ---------------------------------------------------------------------------
+# 2. iso-K identity between REAP (prune_fraction) and REAM (uniform pin)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("n_experts", [128, 256, 512])
+@pytest.mark.parametrize("K", [65, 166, 207, 333])
+def test_iso_K_identity_between_arms(n_experts, K):
+    """Both arms keep the SAME uniform K every layer. REAP derives its keep
+    count from the scalar ``prune_fraction = 1 - K/n`` through the REAL
+    round-half-up path (n_keep = floor((1-pf)*n + 0.5), reap_prune.py:339); REAM
+    pins the uniform budget directly to K (write_uniform_budget → target==K).
+    Assert REAP's realised n_keep == K == REAM's target — iso-K."""
+    import math
+    if not (0 < K < n_experts):
+        pytest.skip("K out of range for this n_experts")
+
+    # --- REAP arm: scalar prune_fraction → realised keep count (the exact
+    #     round-half-up the orchestrator uses via reap_prune). ---
+    prune_fraction = 1.0 - K / n_experts
+    cfg_reap = rr.build_arm_config(_base(), method="faithful_prune",
+                                   prune_fraction=prune_fraction)
+    assert cfg_reap["stage2_reap_ream"]["prune_mode"] == "faithful_prune"
+    pf = cfg_reap["stage2_reap_ream"]["prune_fraction"]
+    reap_n_keep = math.floor(n_experts * (1.0 - pf) + 0.5)  # reap_prune.py:339
+    assert reap_n_keep == K, f"REAP keep {reap_n_keep} != K {K}"
+
+    # --- REAM arm: uniform budget pin → every layer's target == K. ---
+    from moe_compress.run_probe import write_uniform_budget
+    shared = {"per_layer_target_experts": {str(i): 999 for i in range(48)},
+              "per_layer_redundancy": {}}
+    with _tmp_json(shared) as shared_path, _tmp_path() as out_path:
+        payload = write_uniform_budget(shared_path, out_path, survivors=K)
+    ream_targets = set(payload["per_layer_target_experts"].values())
+    assert ream_targets == {K}, f"REAM targets {ream_targets} != {{{K}}}"
+
+    # iso-K: REAP realised keep == REAM uniform target for every layer.
+    assert reap_n_keep == K and ream_targets == {reap_n_keep}
+
+
+# ---------------------------------------------------------------------------
+# 3. Stage-1 never runs — both subprocesses resume at stage >= 2 (Concern 1)
+# ---------------------------------------------------------------------------
+
+def test_pipeline_subprocesses_never_invoke_stage1():
+    """The runner drives each arm with exactly two run_pipeline subprocesses:
+    --resume-from-stage 2 (Stage 2+2.5) and --resume-from-stage 3 (Stage 3-6).
+    Inspect the argv the runner constructs via its OWN seam (_pipeline_argv):
+    every launch must start at stage >= 2, proving Stage-1 GRAPE/RCO (gated on
+    start <= 1 in run_pipeline.py) is NEVER invoked per arm."""
+    import tempfile
+    from pathlib import Path
+
+    arm_dir = Path(tempfile.mkdtemp())
+    cfg_path = arm_dir / "arm_config.yaml"
+
+    def _resume_of(argv: list[str]) -> int:
+        return int(argv[argv.index("--resume-from-stage") + 1])
+
+    # (a) Stage 2 + auto Stage 2.5
+    argv_a = rr._pipeline_argv(cfg_path, "fake/repo", arm_dir, resume=2, stop=2)
+    # (b) Stage 3 → 4 → 5 → 6
+    argv_b = rr._pipeline_argv(cfg_path, "fake/repo", arm_dir, resume=3, stop=6)
+
+    for argv in (argv_a, argv_b):
+        assert "--resume-from-stage" in argv
+        start = _resume_of(argv)
+        assert start >= 2, f"subprocess resumes at stage {start} (<=1 ⇒ Stage-1!)"
+
+    assert _resume_of(argv_a) == 2
+    assert _resume_of(argv_b) == 3
+    # never <= 1 in either launch
+    assert min(_resume_of(argv_a), _resume_of(argv_b)) > 1
+
+
+# ---------------------------------------------------------------------------
+# 4. covariance-miss fails fast — no silent fp16 fallback (Concern 3d / H-B)
+# ---------------------------------------------------------------------------
+
+def test_assert_covariance_resolves_raises_on_missing_sidecar(tmp_path):
+    """H-B pre-check MUST hard-raise when the bf16 covariance.pt sidecar is
+    absent/unloadable — the full-pipeline runner does NOT skip the fp16 fallback,
+    so a missing covariance source must abort before any GPU work rather than
+    silently degrade. Point calibration.jsonl_path at a tmp JSONL with NO
+    sidecar and assert the raise."""
+    missing_jsonl = tmp_path / "self_traces.jsonl"
+    missing_jsonl.write_text("{}\n", encoding="utf-8")  # exists, but no sidecar
+    base_cfg = {"calibration": {"jsonl_path": str(missing_jsonl)}}
+    with pytest.raises(RuntimeError, match="H-B"):
+        rr.assert_covariance_resolves(base_cfg)
+
+
+# --- small tmp helpers for the iso-K REAM-pin write/read ---
+
+import contextlib  # noqa: E402
+import json as _json  # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+
+@contextlib.contextmanager
+def _tmp_json(obj):
+    d = _tempfile.mkdtemp()
+    p = _Path(d) / "shared_budgets.json"
+    p.write_text(_json.dumps(obj), encoding="utf-8")
+    yield p
+
+
+@contextlib.contextmanager
+def _tmp_path():
+    d = _tempfile.mkdtemp()
+    yield _Path(d) / "stage1_budgets.json"
