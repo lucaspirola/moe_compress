@@ -219,6 +219,31 @@ from transformers.utils.import_utils import (
 assert _fla(), "transformers does not see flash-linear-attention"
 assert _cc(), "transformers does not see causal-conv1d"
 print("[verify] transformers fast-path: fla=True causal=True")
+
+# Training-readiness is SEPARATE from the inference fast path above. The gated
+# DeltaNet BACKWARD (chunk_bwd_dqkwg) RAISES on Hopper + Triton>=3.4 without
+# tilelang (fla PR #827 / issue #640). This script does NOT install tilelang —
+# it is un-installable on CUDA-13 (apache-tvm-ffi double-registers the tvm-ffi
+# runtime -> SIGABRT). So warn LOUDLY: this env can do forward/inference, but
+# Router-KD TRAINING (Stage 2.5/5) will crash at loss.backward(). Train on a
+# CUDA-12 box + tilelang. (Non-fatal: inference-only setups are valid here.)
+import importlib.util as _ilu
+import triton as _tr
+from packaging.version import Version as _V
+_hopper = tuple(torch.cuda.get_device_capability(0)) == (9, 0)
+_tri_ge_34 = _V(_tr.__version__) >= _V("3.4.0")
+_tilelang = _ilu.find_spec("tilelang") is not None
+if _hopper and _tri_ge_34 and not _tilelang:
+    print("[verify] ##############################################################")
+    print("[verify] ## TRAINING WARNING: Hopper + Triton>=3.4 + NO tilelang.    ##")
+    print("[verify] ## Router-KD TRAINING (Stage 2.5/5) WILL CRASH at backward  ##")
+    print("[verify] ## (fla #827). tilelang cannot install on CUDA-13. Forward/ ##")
+    print("[verify] ## inference is fine; train on a CUDA-12 box + tilelang.    ##")
+    print("[verify] ##############################################################")
+    print("TRAINING_BACKWARD_UNSUPPORTED")
+else:
+    print("[verify] training backward: OK (tilelang present, or off-Hopper)")
+
 print("FAST_PATH_READY")
 PYEOF
 

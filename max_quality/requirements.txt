@@ -53,7 +53,17 @@ bitsandbytes>=0.49.2
 # fla itself raises a RuntimeError pointing at tilelang as the fix.
 # Reproduced 2026-05-14 on H200 SXM5 (Datacrunch FIN-03), torch 2.11.0+cu130
 # (which ships Triton 3.4.x). See fla GitHub issue #640.
-tilelang>=0.1.7
+#
+# ⚠️ CUDA-13 INCOMPATIBILITY (2026-06-10): tilelang CANNOT install on a CUDA-13
+# box — its apache-tvm-ffi double-registers the tvm-ffi runtime that torch's
+# torch_c_dlpack_ext already loaded (TypeAttr __ffi_repr__ for type index 130)
+# → uncatchable SIGABRT on `import tilelang`; older tilelang 0.1.7.post3 is
+# CUDA-12-only. fla PR #827 (closes #640) made the Triton GDN backward RAISE on
+# Hopper, so on a CUDA-13 Hopper box Router-KD TRAINING (Stage 2.5/5) crashes at
+# the first loss.backward() with NO usable backend. => Run the TRAINING stages
+# on a CUDA-12 H200/H100 (where tilelang installs). utils/env_guard.py +
+# run_pipeline + setup_gpu_env.sh now fail/warn loudly on the bad combo.
+tilelang>=0.1.7   # CUDA-12 ONLY (see the CUDA-13 incompatibility note above)
 
 # --- Fast-path attention kernels: handled per environment, NOT here ---
 # flash-linear-attention and causal-conv1d build/JIT against the host's torch +

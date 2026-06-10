@@ -172,6 +172,15 @@ def run(
     (``stage_key="stage5"``).  The config section read is always
     ``stage5_router_kd`` regardless of ``stage_key``.
     """
+    # Fail loudly NOW if this environment cannot run the GDN backward correctly
+    # (Hopper + Triton>=3.4 + no tilelang ⇒ fla raises at loss.backward()). This
+    # is the universal Router-KD training chokepoint, so the guard here covers
+    # both Stage 2.5 and Stage 5 before a single optimizer step. See
+    # utils/env_guard.py for the full rationale (CUDA-13 cannot train).
+    from ..utils.env_guard import assert_gdn_training_supported
+
+    assert_gdn_training_supported(context=f"Router-KD {stage_key}")
+
     # Plugin #7 — RKD paper-recipe config overrides. MUST run before any
     # ``config[...]`` capture below (s5 / cal binds the live dicts). Since the
     # 2026-06-09 consolidation the DEFAULT (absent ``stage5_router_kd

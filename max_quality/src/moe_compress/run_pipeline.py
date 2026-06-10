@@ -118,6 +118,20 @@ def main(argv=None) -> int:
     start = args.resume_from_stage
     stop = args.stop_after_stage
 
+    # Fail loudly BEFORE any stage work if this run will TRAIN Router-KD (Stage
+    # 2.5 heal, auto after Stage 2; and/or Stage 5) but the environment cannot
+    # run the gated-DeltaNet backward (Hopper + Triton>=3.4 + no tilelang — i.e.
+    # CUDA-13). Otherwise Stage 1+2 (~an hour) run, then the first Router-KD
+    # loss.backward() raises. Forward-only ranges (Stage 3/4/6) are unaffected.
+    # See utils/env_guard.py for the full rationale.
+    _will_train_router_kd = (start <= 5 <= stop) or (
+        start <= 2 <= stop and not args.skip_stage2p5
+    )
+    if _will_train_router_kd:
+        from .utils.env_guard import assert_gdn_training_supported
+
+        assert_gdn_training_supported(context="run_pipeline preflight")
+
     if _skip_intermediate and stop < 6:
         log.warning(
             "pipeline.skip_intermediate_stages=true combined with "
