@@ -178,6 +178,10 @@ ARMS: tuple[tuple[str, str], ...] = (
 # Net compression target (M-C) — these arms target NET-35% after Stage-4 EoRA.
 NET_TARGET = 0.35
 
+# Per-arm run_pipeline stage windows: (resume, stop) for (Stage2+2.5, Stage3-6).
+# resume>=2 ⇒ Stage-1 GRAPE/RCO never runs (run_pipeline.py gates start<=1).
+ARM_STAGE_WINDOWS = ((2, 2), (3, 6))
+
 # Final Stage-6alt artifact filename — completion gate (mirrors run_probe).
 STAGE6ALT_ARTIFACT = "stage6alt_eval.json"
 
@@ -486,7 +490,8 @@ def run_one_arm(
     log.info("[%s] Stage 2 + 2.5 (method=%s, K=%d) → stage2p5_final/",
              arm_id, method, budget["K"])
     rc1 = subprocess.run(
-        _pipeline_argv(cfg_path, model_repo, arm_dir, resume=2, stop=2),
+        _pipeline_argv(cfg_path, model_repo, arm_dir,
+                       resume=ARM_STAGE_WINDOWS[0][0], stop=ARM_STAGE_WINDOWS[0][1]),
         check=False,
     ).returncode
     if rc1 != 0:
@@ -500,7 +505,8 @@ def run_one_arm(
     # ---- (b) Stage 3 → 4 → 5 → 6 (loads stage2p5_final/ per STAGE_REGISTRY) ----
     log.info("[%s] Stage 3 → 4 → 5 → 6alt", arm_id)
     rc2 = subprocess.run(
-        _pipeline_argv(cfg_path, model_repo, arm_dir, resume=3, stop=6),
+        _pipeline_argv(cfg_path, model_repo, arm_dir,
+                       resume=ARM_STAGE_WINDOWS[1][0], stop=ARM_STAGE_WINDOWS[1][1]),
         check=False,
     ).returncode
     if rc2 != 0:

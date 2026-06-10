@@ -154,7 +154,6 @@ def _live_rkd_recipe_default() -> str:
     EXPLICIT injection reproduces, byte-for-byte, the plugin's mutation when the
     key is ABSENT. The plugin resolves ``s5.get("rkd_recipe", <DEFAULT>)``, so
     the candidate that matches the absent-key behaviour IS the default."""
-    import copy
     from moe_compress.router_kd.plugins.rkd_paper_recipe import RkdPaperRecipePlugin
 
     plugin = RkdPaperRecipePlugin()
@@ -213,18 +212,19 @@ def test_iso_K_identity_between_arms(n_experts, K):
     round-half-up path (n_keep = floor((1-pf)*n + 0.5), reap_prune.py:339); REAM
     pins the uniform budget directly to K (write_uniform_budget → target==K).
     Assert REAP's realised n_keep == K == REAM's target — iso-K."""
-    import math
+    from moe_compress.stage2.plugins.reap_prune import keep_count
     if not (0 < K < n_experts):
         pytest.skip("K out of range for this n_experts")
 
     # --- REAP arm: scalar prune_fraction → realised keep count (the exact
-    #     round-half-up the orchestrator uses via reap_prune). ---
+    #     round-half-up the orchestrator uses, sourced from the REAL production
+    #     helper reap_prune.keep_count — no local re-impl). ---
     prune_fraction = 1.0 - K / n_experts
     cfg_reap = rr.build_arm_config(_base(), method="faithful_prune",
                                    prune_fraction=prune_fraction)
     assert cfg_reap["stage2_reap_ream"]["prune_mode"] == "faithful_prune"
     pf = cfg_reap["stage2_reap_ream"]["prune_fraction"]
-    reap_n_keep = math.floor(n_experts * (1.0 - pf) + 0.5)  # reap_prune.py:339
+    reap_n_keep = keep_count(n_experts, pf)  # the production formula itself
     assert reap_n_keep == K, f"REAP keep {reap_n_keep} != K {K}"
 
     # --- REAM arm: uniform budget pin → every layer's target == K. ---
@@ -240,16 +240,34 @@ def test_iso_K_identity_between_arms(n_experts, K):
     assert reap_n_keep == K and ream_targets == {reap_n_keep}
 
 
+def test_keep_count_pins_documented_rounding():
+    """Pin the EXACT documented production example (reap_prune.py:324-331):
+    256 experts @ prune_fraction=0.35 keeps floor(166.4 + 0.5)=166. This fails
+    LOUDLY if anyone swaps the round-half-up rule for banker's round (which
+    would also give 166 here, but the half-up tie cases below would diverge)."""
+    from moe_compress.stage2.plugins.reap_prune import keep_count
+    assert keep_count(256, 0.35) == 166
+    # Half-up tie discriminators where banker's round-half-to-even diverges:
+    #   (1-pf)*n lands on a .5 tie above an EVEN integer ⇒ half-up rounds UP,
+    #   banker's (Python round) rounds DOWN to the even. These would BREAK if the
+    #   convention were swapped to round-half-to-even.
+    assert keep_count(1, 0.5) == 1   # 0.5 → half-up 1, banker's 0
+    assert keep_count(5, 0.5) == 3   # 2.5 → half-up 3, banker's 2
+    assert keep_count(9, 0.5) == 5   # 4.5 → half-up 5, banker's 4
+
+
 # ---------------------------------------------------------------------------
 # 3. Stage-1 never runs — both subprocesses resume at stage >= 2 (Concern 1)
 # ---------------------------------------------------------------------------
 
 def test_pipeline_subprocesses_never_invoke_stage1():
-    """The runner drives each arm with exactly two run_pipeline subprocesses:
-    --resume-from-stage 2 (Stage 2+2.5) and --resume-from-stage 3 (Stage 3-6).
-    Inspect the argv the runner constructs via its OWN seam (_pipeline_argv):
-    every launch must start at stage >= 2, proving Stage-1 GRAPE/RCO (gated on
-    start <= 1 in run_pipeline.py) is NEVER invoked per arm."""
+    """The runner's per-arm stage windows (the constant the two
+    ``subprocess.run`` launches actually read) must never resume Stage-1. Source
+    the (resume, stop) pairs from the REAL ``ARM_STAGE_WINDOWS`` constant — not
+    hardcoded literals — so a future ``run_one_arm`` edit that lowers a resume to
+    1 is caught here, and feed each through the real ``_pipeline_argv`` to lock
+    the rendered argv. Stage-1 GRAPE/RCO is gated on start<=1 in run_pipeline.py;
+    every window with resume>=2 proves it is NEVER invoked per arm."""
     import tempfile
     from pathlib import Path
 
@@ -259,20 +277,29 @@ def test_pipeline_subprocesses_never_invoke_stage1():
     def _resume_of(argv: list[str]) -> int:
         return int(argv[argv.index("--resume-from-stage") + 1])
 
-    # (a) Stage 2 + auto Stage 2.5
-    argv_a = rr._pipeline_argv(cfg_path, "fake/repo", arm_dir, resume=2, stop=2)
-    # (b) Stage 3 → 4 → 5 → 6
-    argv_b = rr._pipeline_argv(cfg_path, "fake/repo", arm_dir, resume=3, stop=6)
+    windows = rr.ARM_STAGE_WINDOWS
+    assert len(windows) >= 1
 
-    for argv in (argv_a, argv_b):
+    # (a) Every window's resume stage proves Stage-1 is never re-entered.
+    for resume, stop in windows:
+        assert resume >= 2, (
+            f"ARM_STAGE_WINDOWS has a window resuming at stage {resume} "
+            "(<=1 ⇒ Stage-1 GRAPE/RCO would run!)"
+        )
+
+    # (b) Feed each window through the real formatter and lock the argv: it must
+    #     carry --resume-from-stage <resume> with resume>=2, never 1 or 0.
+    for resume, stop in windows:
+        argv = rr._pipeline_argv(cfg_path, "fake/repo", arm_dir,
+                                 resume=resume, stop=stop)
         assert "--resume-from-stage" in argv
         start = _resume_of(argv)
-        assert start >= 2, f"subprocess resumes at stage {start} (<=1 ⇒ Stage-1!)"
+        assert start == resume and start >= 2
+        assert "--resume-from-stage 1" not in " ".join(argv)
+        assert "--resume-from-stage 0" not in " ".join(argv)
 
-    assert _resume_of(argv_a) == 2
-    assert _resume_of(argv_b) == 3
-    # never <= 1 in either launch
-    assert min(_resume_of(argv_a), _resume_of(argv_b)) > 1
+    # The two locked windows: (Stage2+2.5)=2/2 then (Stage3-6)=3/6.
+    assert windows[0][0] == 2 and windows[1][0] == 3
 
 
 # ---------------------------------------------------------------------------

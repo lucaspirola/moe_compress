@@ -155,6 +155,16 @@ def faithful_prune_enabled(config: dict) -> bool:
     return s2.get(PRUNE_MODE_KEY, MERGE_MODE) == FAITHFUL_PRUNE
 
 
+def keep_count(n_experts: int, prune_fraction: float) -> int:
+    """Round-half-up keep convention: ``floor((1 - prune_fraction)*n + 0.5)``.
+
+    Single source of truth for the survivor count (see the comment block at the
+    call site for why HALF-UP, not banker's round). E.g. ``keep_count(256, 0.35)
+    == 166``.
+    """
+    return math.floor(n_experts * (1.0 - prune_fraction) + 0.5)
+
+
 def compute_final_kept_ids(
     scores: np.ndarray,
     *,
@@ -336,7 +346,7 @@ class ReapPrunePlugin:
         # the keep-count convention explicit + tie-deterministic for any other
         # prune_fraction.
         if self._n_prune is None:
-            n_keep = math.floor(n_experts * (1.0 - self.prune_fraction) + 0.5)
+            n_keep = keep_count(n_experts, self.prune_fraction)
             self._n_prune = n_experts - n_keep
         n_prune = self._n_prune
 
