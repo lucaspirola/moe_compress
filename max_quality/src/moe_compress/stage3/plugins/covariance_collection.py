@@ -151,7 +151,11 @@ from typing import Any
 
 import torch
 
-from ...utils.activation_hooks import InputCovarianceAccumulator, instrument_experts
+from ...utils.activation_hooks import (
+    InputCovarianceAccumulator,
+    capture_experts,
+    instrument_experts,
+)
 from ...utils.futures import drain_done_futures as _drain_done_futures
 from ...utils.trackio_log import trackio_log as _trackio_log
 from ...pipeline.context import PipelineContext
@@ -272,6 +276,79 @@ def _reduce_spilled_cov_dirs(replica_dirs, out_dir, *, storage_dtype=None) -> li
 
 
 # ---------------------------------------------------------------------------
+# A1 — windowed single-pass covariance collection helpers
+# ---------------------------------------------------------------------------
+
+
+def _iter_windows(seq, window_size: int):
+    """Yield contiguous windows of ``window_size`` items from ``seq`` (the last
+    window absorbs the remainder). ``window_size <= 0`` is treated as 1.
+
+    A window of ``G`` MoE layers is hooked with A7 ``capture_experts`` and the
+    calibration set is forwarded ONCE per window — ``ceil(N/G)`` passes instead
+    of N. ``G=1`` reproduces the per-layer structure (but on the native
+    forward, NOT the old Python-loop golden — see PLAN §4.1).
+    """
+    g = max(1, int(window_size))
+    for start in range(0, len(seq), g):
+        yield seq[start:start + g]
+
+
+def _resolve_cov_window(config: dict, n_layers: int) -> int:
+    """Resolve the cov collection window size G ∈ [1, n_layers].
+
+    Reads ``multi_gpu.cov_window_size`` (same block as ``cov_replicas``):
+      * absent / ``"auto"`` → VRAM-probe via ``torch.cuda.mem_get_info()``;
+        on a CPU-only box (no CUDA) ``auto`` degrades to ``G=1``.
+      * explicit int → clamp to ``[1, n_layers]``.
+
+    Unlike ``orchestrator._resolve_cov_replicas`` (config-ONLY), ``auto`` here
+    adds a real per-device VRAM probe: each hooked layer holds a persistent
+    on-device fp32 Gram (≈ ``d_hid²·4`` gate + ``d_int²·4`` down bytes) until
+    its window's ``finalize_layer`` runs at window end, plus transient gathered
+    activations. We size ``G ≈ floor((free − headroom) / per_layer_bytes)``.
+    """
+    if n_layers <= 0:
+        return 1
+    mg = config.get("multi_gpu") or {}
+    req = mg.get("cov_window_size", "auto")
+    if req is None:
+        req = "auto"
+    if isinstance(req, str):
+        if req.strip().lower() != "auto":
+            try:
+                req = int(req)
+            except ValueError:
+                req = "auto"
+    if isinstance(req, int):
+        return max(1, min(int(req), n_layers))
+
+    # auto: VRAM probe. CPU-only / no CUDA ⇒ G=1 (clean degrade).
+    if not torch.cuda.is_available():
+        return 1
+    try:
+        free, _total = torch.cuda.mem_get_info()
+    except Exception:                                # noqa: BLE001
+        return 1
+    # Per-layer persistent Gram estimate. d_hid / d_int from the model config
+    # when available; fall back to a conservative 8K/8K. fp32 → 4 bytes.
+    cfg_m = config.get("model") or {}
+    d_hid = int(config.get("_d_hidden", cfg_m.get("hidden_size", 8192)) or 8192)
+    d_int = int(config.get("_d_intermediate", cfg_m.get("moe_intermediate_size", 8192)) or 8192)
+    per_layer_bytes = float(d_hid) ** 2 * 4 + float(d_int) ** 2 * 4
+    # Reserve headroom for transient activations + the native forward's own
+    # working set (conservative: keep 25% of free VRAM in reserve).
+    usable = free * 0.75
+    g = int(usable // per_layer_bytes) if per_layer_bytes > 0 else 1
+    g = max(1, min(g, n_layers))
+    log.info(
+        "Stage 3 cov window auto-size: free=%.1fGB per_layer~%.1fMB -> G=%d (N=%d)",
+        free / 1e9, per_layer_bytes / 1e6, g, n_layers,
+    )
+    return g
+
+
+# ---------------------------------------------------------------------------
 # Post-prune input covariance (for AA-SVD B matrix)
 # ---------------------------------------------------------------------------
 
@@ -283,6 +360,8 @@ def _collect_covariances(
     teacher_moe_layers=None,
     C_acc: InputCovarianceAccumulator | None = None,
     ccov_spill_dir=None,
+    cov_window_size: int = 1,
+    cov_capture_mode: str = "capture",
 ) -> None:
     """Collect post-prune input covariance S and (optionally) cross-covariance C.
 
@@ -309,12 +388,23 @@ def _collect_covariances(
     each student expert, we need the teacher's activation at the *same token
     positions* that the student routes to that expert.
 
-    **Implementation**: We hook ALL layers on BOTH models simultaneously.
-    For each batch:
-    1. Forward teacher → collect {(layer, token_idx) → X_pre} via hooks
-    2. Forward student → for each (layer, expert, token_idx), look up the
-       corresponding X_pre from the teacher's output and accumulate
-       C += X_pre^T @ X_post for the same token positions.
+    **Implementation (A7 + A1)**: covariance is captured from the model's REAL
+    native forward via A7 ``capture_experts`` (a side-effect-free
+    ``forward_pre_hook``), NOT the per-expert Python-loop ``instrument_experts``
+    forward swap. A1 windows the MoE layers into contiguous groups of
+    ``cov_window_size`` (G) layers and forwards the calibration set ONCE per
+    window — ``ceil(N/G)`` passes instead of N. For each window, for each batch:
+    1. Forward teacher → collect {(layer, token_idx) → X_pre} for all G window
+       layers via the teacher capture hooks.
+    2. Forward student → for each (layer, expert, token_idx) in the window, look
+       up the corresponding X_pre and accumulate C += X_pre^T @ X_post.
+
+    ``_teacher_hidden`` is keyed by layer and cleared per BATCH (not per layer),
+    so it holds all G window layers' teacher rows during the student forward.
+    The per-(layer,expert,matrix) accumulators are additive and order-stable
+    per key, so windowing adds zero error on top of the native baseline (PLAN
+    §1.2 / §2.1). ``cov_capture_mode="instrument"`` selects the legacy
+    forward-swap path as a fallback.
 
     Since experts in teacher and student see different token subsets (routing
     differs), the cross-covariance captures the teacher's representation of
@@ -324,7 +414,20 @@ def _collect_covariances(
 
     With ``spill_dir`` set, after each layer's finalize the layer's entries
     are written to disk and dropped from memory.
+
+    .. note::
+
+       A7+A1 is byte-identical to a NEW all-native golden, NOT the legacy
+       Python-loop golden (which baked in ``instrument_experts``'s fp reduction
+       order). ``cov_window_size=1`` (``G=1``) is the per-layer structure on the
+       native forward — still the new golden. See
+       ``tasks/PLAN_A7_A1_WINDOWED_COV.md`` and the D-A7 deviation entry.
     """
+    if cov_capture_mode not in ("capture", "instrument"):
+        raise ValueError(
+            f"cov_capture_mode must be 'capture' (A7) or 'instrument' "
+            f"(legacy fallback), got {cov_capture_mode!r}"
+        )
 
     # --- Storage for teacher's per-layer hidden states (for cross-cov) ---
     # Structure: layer_idx → {token_idx → row Tensor [d_in]}. The nested
@@ -435,107 +538,132 @@ def _collect_covariances(
             max_workers=1, thread_name_prefix="bcov-spill",
         )
 
-    # NOTE: This function runs one full calibration pass PER MoE layer
-    # (sequential, not simultaneous). The original spec described a single
-    # simultaneous pass over all MoE layers; the sequential design was
-    # chosen because holding all layers' hook state simultaneously is
-    # memory-intensive — per-layer spill to disk bounds peak RAM to ~one
-    # layer's covariance at a time (~5 GB). Wall-clock cost is ~N× the
-    # simultaneous design (for N MoE layers), but GPU memory stays within
-    # H200 budget. Documented as an allowed deviation in the project
-    # deviation log (legacy label: D9; "Phase A" naming-historical).
+    # A1: window the MoE layers into contiguous groups of G layers and forward
+    # the calibration set ONCE per window (ceil(N/G) passes instead of N). Each
+    # window hooks all its layers with A7 capture_experts (capture-only — the
+    # native forward runs untouched, so upstream layers stay native and the
+    # residual stream is the real inference stream; PLAN §2.1/§4.1). The
+    # per-(layer,expert,matrix) accumulators are additive + order-stable per key
+    # (PLAN §1.2), so windowing adds zero error on top of the native baseline.
+    # ``cov_window_size=1`` reproduces the per-layer structure on the native
+    # forward (the NEW golden, not the legacy Python-loop golden).
+    import contextlib
     n = len(moe_layers)
+    G = max(1, int(cov_window_size))
+    indexed = list(enumerate(moe_layers))  # [(k, ref), ...]
+    done_count = 0
     try:
-        for k, ref in enumerate(moe_layers):
-            if spill_dir is not None:
-                b_spilled = (spill_dir / f"layer_{ref.layer_idx}.pt").exists()
-                # When ccov_spill_dir is None (cross-cov disabled OR no
-                # spill destination configured), there is no C-cov file
-                # to wait on — treat it as satisfied so the B-only resume
-                # path skips early instead of redoing the calibration pass.
-                if ccov_spill_dir is None:
-                    c_spilled = True
-                else:
-                    c_spilled = (ccov_spill_dir / f"layer_{ref.layer_idx}.pt").exists()
-                if b_spilled and c_spilled:
-                    log.info("Stage 3 cov layer %d/%d (idx=%d) — already spilled, skipping",
-                             k + 1, n, ref.layer_idx)
-                    continue
-            log.info("Stage 3 cov layer %d/%d (idx=%d) — %s calibration pass",
-                     k + 1, n, ref.layer_idx,
-                     "dual-forward" if teacher_model is not None else "B-cov only")
+        for window in _iter_windows(indexed, G):
+            # Resume: drop window layers already fully spilled (both B + C, when
+            # cross-cov spill is configured). A layer NOT in ``to_collect`` is
+            # neither hooked nor finalized — identical resume semantics to the
+            # old per-layer skip, just at window granularity.
+            to_collect = []
+            for k, ref in window:
+                if spill_dir is not None:
+                    b_spilled = (spill_dir / f"layer_{ref.layer_idx}.pt").exists()
+                    if ccov_spill_dir is None:
+                        c_spilled = True
+                    else:
+                        c_spilled = (ccov_spill_dir / f"layer_{ref.layer_idx}.pt").exists()
+                    if b_spilled and c_spilled:
+                        log.info("Stage 3 cov layer %d/%d (idx=%d) — already spilled, skipping",
+                                 k + 1, n, ref.layer_idx)
+                        done_count += 1
+                        continue
+                to_collect.append((k, ref))
+            if not to_collect:
+                continue
 
-            # Clear teacher hidden state storage for this layer.
-            _teacher_hidden.clear()
+            idxs = [ref.layer_idx for _, ref in to_collect]
+            log.info("Stage 3 cov window [%s] (%d layer(s)) — %s calibration pass (G=%d)",
+                     ",".join(str(i) for i in idxs), len(to_collect),
+                     "dual-forward" if teacher_model is not None else "B-cov only", G)
 
-            # Build context managers for instrumentation.
-            import contextlib
+            # Hook every layer in the window on BOTH models (student + teacher).
             stack = contextlib.ExitStack()
-            # Always hook the student (pruned model).
-            stack.enter_context(
-                instrument_experts(ref, {"input": input_cb, "intermediate": intermediate_cb})
-            )
-            # Optionally hook the teacher for cross-covariance.
-            if teacher_model is not None and teacher_moe_layers is not None:
-                # Find the matching teacher layer by index.
-                teacher_ref = teacher_moe_layers[k]
-                assert teacher_ref.layer_idx == ref.layer_idx, \
-                    f"Teacher/student layer index mismatch: {teacher_ref.layer_idx} vs {ref.layer_idx}"
-                stack.enter_context(
-                    instrument_experts(teacher_ref, {"input": _teacher_input_cb})
-                )
+            for _k, ref in to_collect:
+                if cov_capture_mode == "instrument":
+                    stack.enter_context(
+                        instrument_experts(
+                            ref, {"input": input_cb, "intermediate": intermediate_cb}
+                        )
+                    )
+                else:
+                    stack.enter_context(
+                        capture_experts(
+                            ref, {"input": input_cb, "intermediate": intermediate_cb}
+                        )
+                    )
+                if teacher_model is not None and teacher_moe_layers is not None:
+                    teacher_ref = teacher_moe_layers[_k]
+                    assert teacher_ref.layer_idx == ref.layer_idx, \
+                        f"Teacher/student layer index mismatch: {teacher_ref.layer_idx} vs {ref.layer_idx}"
+                    if cov_capture_mode == "instrument":
+                        stack.enter_context(
+                            instrument_experts(teacher_ref, {"input": _teacher_input_cb})
+                        )
+                    else:
+                        stack.enter_context(
+                            capture_experts(
+                                teacher_ref, {"input": _teacher_input_cb},
+                                capture_intermediate=False,
+                            )
+                        )
 
             with stack:
                 for batch_idx, batch in enumerate(batches):
                     if device is not None:
                         batch = batch.to(device)
+                    # Clear per-BATCH (not per-layer): _teacher_hidden holds all
+                    # G window layers' teacher rows for this batch's student
+                    # forward, then is dropped before the next batch (PLAN §4.2).
                     _teacher_hidden.clear()
-                    # Forward teacher first (if present) to populate _teacher_hidden.
                     if teacher_model is not None:
                         with torch.no_grad():
                             teacher_model(input_ids=batch)
-                    # Forward student — hooks fire and accumulate B + C.
                     with torch.no_grad():
                         model(input_ids=batch)
 
-            B_acc.finalize_layer(ref.layer_idx)
-            if C_acc is not None:
-                C_acc.finalize_layer(ref.layer_idx)
+            # Finalize + spill every collected layer in the window.
+            for _k, ref in to_collect:
+                B_acc.finalize_layer(ref.layer_idx)
+                if C_acc is not None:
+                    C_acc.finalize_layer(ref.layer_idx)
 
-            # Background spill for B-cov.
-            if spill_executor is not None:
-                _drain_done_futures(spill_futures)
-                fut = spill_executor.submit(
-                    B_acc.spill_layer_to_disk, ref.layer_idx, spill_dir,
-                )
-                spill_futures.append(fut)
-            # Spill cross-cov too.
-            if C_acc is not None and ccov_spill_dir is not None:
                 if spill_executor is not None:
-                    fut_c = spill_executor.submit(
-                        C_acc.spill_layer_to_disk, ref.layer_idx, ccov_spill_dir,
+                    _drain_done_futures(spill_futures)
+                    fut = spill_executor.submit(
+                        B_acc.spill_layer_to_disk, ref.layer_idx, spill_dir,
                     )
-                    spill_futures.append(fut_c)
+                    spill_futures.append(fut)
+                if C_acc is not None and ccov_spill_dir is not None:
+                    if spill_executor is not None:
+                        fut_c = spill_executor.submit(
+                            C_acc.spill_layer_to_disk, ref.layer_idx, ccov_spill_dir,
+                        )
+                        spill_futures.append(fut_c)
 
-            proc_rss = _proc_rss_gb()
-            maxrss = _maxrss_gb()
-            host_ram = None
-            try:
-                import psutil
-                host_ram = psutil.virtual_memory().used / 1e9
-            except Exception:                            # noqa: BLE001
-                pass
-            log.info(
-                "  Stage 3 cov layer %d/%d done — proc_rss=%sGB maxrss=%sGB host_ram=%sGB",
-                k + 1, n, _fmt(proc_rss), _fmt(maxrss), _fmt(host_ram),
-            )
-            _trackio_log({
-                "stage3/bcov_layer": k + 1,
-                "stage3/bcov_layer_idx": ref.layer_idx,
-                "stage3/bcov_proc_rss_gb": proc_rss if proc_rss is not None else float("nan"),
-                "stage3/bcov_maxrss_gb": maxrss if maxrss is not None else float("nan"),
-                "stage3/bcov_ram_used_gb": host_ram if host_ram is not None else float("nan"),
-            })
+                done_count += 1
+                proc_rss = _proc_rss_gb()
+                maxrss = _maxrss_gb()
+                host_ram = None
+                try:
+                    import psutil
+                    host_ram = psutil.virtual_memory().used / 1e9
+                except Exception:                            # noqa: BLE001
+                    pass
+                log.info(
+                    "  Stage 3 cov layer %d/%d done — proc_rss=%sGB maxrss=%sGB host_ram=%sGB",
+                    done_count, n, _fmt(proc_rss), _fmt(maxrss), _fmt(host_ram),
+                )
+                _trackio_log({
+                    "stage3/bcov_layer": done_count,
+                    "stage3/bcov_layer_idx": ref.layer_idx,
+                    "stage3/bcov_proc_rss_gb": proc_rss if proc_rss is not None else float("nan"),
+                    "stage3/bcov_maxrss_gb": maxrss if maxrss is not None else float("nan"),
+                    "stage3/bcov_ram_used_gb": host_ram if host_ram is not None else float("nan"),
+                })
     finally:
         if spill_executor is not None:
             log.info("Waiting for %d background spill(s) to flush before factor phase",
@@ -635,6 +763,23 @@ def _cov_replica_worker(
 
     moe_layers = list(_iter_moe_layers(student))
 
+    # A1 VRAM auto-sizing runs PER REPLICA, AFTER the CUDA_VISIBLE_DEVICES pin
+    # above (each replica probes only its own GPU subset; PLAN §4.4). Seed
+    # d_hidden/d_intermediate from the student config so the per-layer Gram
+    # estimate is accurate.
+    _cfg_for_window = dict(config)
+    try:
+        _scfg = getattr(student, "config", None)
+        _tcfg = getattr(_scfg, "text_config", _scfg)
+        if _tcfg is not None:
+            _cfg_for_window["_d_hidden"] = int(getattr(_tcfg, "hidden_size", 0)) or None
+            _cfg_for_window["_d_intermediate"] = int(
+                getattr(_tcfg, "moe_intermediate_size", 0)
+            ) or None
+    except Exception:                                # noqa: BLE001
+        pass
+    cov_window_size = _resolve_cov_window(_cfg_for_window, len(moe_layers))
+
     teacher_model = None
     teacher_moe_layers = None
     C_acc = None
@@ -667,6 +812,7 @@ def _cov_replica_worker(
         teacher_moe_layers=teacher_moe_layers,
         C_acc=C_acc,
         ccov_spill_dir=_Path(ccov_replica_dir) if ccov_replica_dir is not None else None,
+        cov_window_size=cov_window_size,
     )
 
 
@@ -823,14 +969,18 @@ class CovarianceCollectionPlugin:
         "aa_svd_factor.py. "
         "Deviations: D6 (gate-only cross-cov, per-expert MoE resolution; "
         "down falls back to Corollary 3.3), D-cov-storage-fp16 (SHARED "
-        "with Stage 2 — fp16 persisted, fp64 in-memory eigh). "
+        "with Stage 2 — fp16 persisted, fp64 in-memory eigh), "
+        "D-A7 (cov captured from the REAL native forward via capture_experts, "
+        "was the instrument_experts Python loop; windowed G layers/pass — "
+        "byte-identical to a NEW all-native golden, more inference-faithful; "
+        "definitions unchanged. See tasks/PLAN_A7_A1_WINDOWED_COV.md). "
         "See module docstring."
     )
     config_key = "stage3_svd.aa_svd.cross_covariance"
     reads: tuple[str, ...] = (
         "model", "moe_layers", "batches", "B_acc", "device",
         "bcov_spill_dir", "teacher_model", "teacher_moe_layers",
-        "C_acc", "ccov_spill_dir",
+        "C_acc", "ccov_spill_dir", "cov_window_size",
     )
     writes: tuple[str, ...] = ("B_acc", "C_acc")
     provides: tuple[str, ...] = ()
@@ -882,5 +1032,8 @@ class CovarianceCollectionPlugin:
             C_acc=ctx.get("C_acc") if ctx.has("C_acc") else None,
             ccov_spill_dir=(
                 ctx.get("ccov_spill_dir") if ctx.has("ccov_spill_dir") else None
+            ),
+            cov_window_size=(
+                ctx.get("cov_window_size") if ctx.has("cov_window_size") else 1
             ),
         )

@@ -35,6 +35,10 @@ multi_gpu:
   cov_replicas: 1                 # Stage-3 lever 2: data-parallel replica groups for cov.
                                   #   1 = in-process (today). >1 = spawn DP over batch shards.
                                   #   effective = min(cov_replicas, n_gpu // shards_per_model)
+  cov_window_size: auto           # A1: Stage-3 cov layers hooked per single forward pass.
+                                  #   auto = per-replica VRAM-probe; int = clamp to [1,N].
+                                  #   ceil(N/G) passes instead of N; composes with cov_replicas.
+                                  #   G=1 ⇒ native per-layer (NEW golden, not legacy loop golden).
   eora_workers: 4                 # Stage-4 lever 1: task-parallel EoRA worker devices.
                                   #   1 = serial in-process (single-GPU, golden path).
                                   #   >1 = fan per-(layer,expert) eigh/SVD solves across devices.

@@ -27,6 +27,10 @@ multi_gpu:
   cov_replicas: 1                 # lever 2: data-parallel replica groups for Stage-3 cov.
                                   #   1 = in-process (today). >1 = spawn DP over batch shards.
                                   #   effective = min(cov_replicas, n_gpu // shards_per_model)
+  cov_window_size: auto           # A1: Stage-3 cov layers hooked per single forward pass.
+                                  #   auto = VRAM-probe (mem_get_info); int = clamp to [1,N].
+                                  #   G=1 ⇒ native per-layer (NEW all-native golden, NOT the
+                                  #   legacy Python-loop golden). G layers ⇒ ceil(N/G) passes.
 
 target:
   # Total parameter reduction (measured, not estimated) the pipeline must hit.

@@ -83,6 +83,10 @@ def _resolve_cov_replicas(config: dict) -> tuple[int, int]:
     ``multi_gpu`` block (all optional; absent ⇒ today's in-process path):
       * ``cov_replicas`` (default 1): requested DP replica groups.
       * ``shard_models`` (default True): whether each model spans >1 GPU.
+      * ``cov_window_size`` (A1; default ``auto``): the cov collection window G,
+        resolved separately by ``covariance_collection._resolve_cov_window`` —
+        it composes multiplicatively with the DP replicas here (each replica
+        windows its own pass).
 
     ``effective_replicas = min(cov_replicas, n_gpu // shards_per_model)`` with a
     floor of 1 (so n_gpu<=1 ⇒ in-process, byte-identical to today; §2.4 — no
@@ -266,6 +270,20 @@ def run(
     run_ctx.set("cross_cov_enabled", cross_cov_enabled)
     run_ctx.set("bcov_spill_dir", bcov_spill_dir)
     run_ctx.set("ccov_spill_dir", ccov_spill_dir)
+    # A1: cov collection window size G (multi_gpu.cov_window_size; auto ⇒
+    # VRAM-probe, absent ⇒ G=1 native per-layer). Seed d_hidden/d_intermediate
+    # from the model config so the per-layer Gram estimate in the auto-sizer is
+    # accurate for the in-process path.
+    from .plugins.covariance_collection import _resolve_cov_window as _rcw
+    _win_cfg = dict(config)
+    _mcfg = getattr(model, "config", None)
+    _mtcfg = getattr(_mcfg, "text_config", _mcfg)
+    if _mtcfg is not None:
+        _win_cfg["_d_hidden"] = int(getattr(_mtcfg, "hidden_size", 0)) or None
+        _win_cfg["_d_intermediate"] = int(getattr(_mtcfg, "moe_intermediate_size", 0)) or None
+    _cov_window = _rcw(_win_cfg, len(moe_layers))
+    log.info("Stage 3: cov collection window G=%d (N=%d MoE layers)", _cov_window, len(moe_layers))
+    run_ctx.set("cov_window_size", _cov_window)
     run_ctx.set("rank_map", {})
 
     # Cache provider registered FIRST so a future ``dispatch_first(plugins,
