@@ -1003,10 +1003,19 @@ class InputCovarianceAccumulator:
         flat = x.detach().reshape(-1, x.shape[-1])
         if flat.numel() == 0:
             return
-        # `.clone()` ensures this thread owns the storage: `.to(float32)` returns
-        # a view when the input is already float32, and `.clone()` breaks the alias
-        # so in-place ops on the caller's source tensor cannot affect our computation.
-        flat_f32 = flat.to(torch.float32).clone()
+        # `.to(float32)` returns a *view* (no copy) when ``flat`` is already
+        # float32, so ``flat_f32`` may alias the caller's source storage. The
+        # former defensive `.clone()` here was REMOVED as a measured no-op:
+        # every current caller passes a fresh tensor (advanced-index /
+        # ``index_select`` / fresh compute) or the A7 ``capture_experts``
+        # buffer slice that is never mutated after the callback, no caller uses
+        # a second CUDA stream writing the source, and ``finalize_layer`` runs
+        # strictly after the forward block — so the read-only matmul below
+        # cannot be perturbed (audit-verified byte-identical, torch.equal).
+        # WARNING: a future caller that (a) introduces a second CUDA stream
+        # writing the source tensor, or (b) runs ``finalize_layer`` concurrently
+        # with the forward block, MUST restore the `.clone()` to break the alias.
+        flat_f32 = flat.to(torch.float32)
         # Matmul on the input's device (typically GPU). The covariance tensor
         # stays on-device — see method docstring for the cross-stream contract.
         cov = flat_f32.transpose(0, 1) @ flat_f32
