@@ -22,12 +22,34 @@ both no-ops at 1 GPU:**
    `model_io.py:98-99` is ONLY the 4bit branch). So today's bottleneck is
    asymmetric: teacher can shard, student cannot. Fix = teach
    `load_compressed_model` to honor a real `accelerate` `device_map`
-   ("auto"/"balanced"/explicit `max_memory`) so the *student* shards too. With
-   both models sharded across N GPUs the dual-forward gains the VRAM headroom
-   to raise `stage3_svd.batch_size` far above 4 — directly cutting the
-   ~27 min/layer covariance pass. **This is the primary, lowest-risk win and is
-   numerically identical to today (sharding does not change the math; accelerate
-   moves activations across the device boundary transparently).**
+   ("auto"/"balanced"/explicit `max_memory`) so the *student* shards too.
+
+   **What sharding actually buys (H1 — weight-VRAM vs activation-VRAM,
+   precisely):** the MoE experts are **fused stacked `nn.Parameter`s** — one
+   `gate_up_proj : [num_experts, 2*moe_intermediate, hidden]` and one
+   `down_proj : [num_experts, hidden, moe_intermediate]` per layer
+   (`model_io.py:10-13`; axis convention `[num_experts, d_out, d_in]` at `:13`).
+   accelerate's `infer_auto_device_map` / `dispatch_model` place at **module
+   granularity** and **cannot split a single stacked parameter**. So sharding
+   distributes **whole decoder layers** across the N GPUs: **weight VRAM drops
+   ~N-fold** (real, per-layer, certain). But the **activation** memory of the
+   *currently-executing* layer still concentrates on **that layer's one device**
+   — accelerate streams the hidden state to wherever the next layer lives and runs
+   it there, one device hot at a time. Therefore:
+   - **Weight-VRAM relief is guaranteed** and is what frees room on each card.
+   - **The `batch_size` ceiling is set by peak per-layer activation memory on a
+     single device**, which sharding relieves only indirectly (the freed weight
+     VRAM on the hot layer's device is now available for activations). The
+     *magnitude* of the batch_size gain is therefore **NOT pre-validated by this
+     plan** — it depends on how much of the ~120 GB dual-model weight footprint
+     leaves each card. **We commit to MEASURING batch headroom on the first
+     sharded run before sizing lever-2 scope** (see §6 step 4); the plan claims
+     only the certain part (weight-VRAM N-fold drop ⇒ *some* batch headroom),
+     not a specific multiple.
+
+   **This is the primary, lowest-risk win and is numerically identical to today
+   (sharding relocates ops, it does not change the math; accelerate moves
+   activations across the device boundary transparently — see §4).**
 
 2. **Data-parallel-over-calibration lever (the throughput multiplier).**
    Replicate the (optionally sharded) teacher+student onto G *replica groups*,
@@ -137,6 +159,21 @@ accumulator device and all later adds coerce. → Lever 1 needs **no change here
 this is the load-bearing reason sharding is numerically transparent. Lever 2 adds
 a post-loop cross-replica reduce (§3.C).
 
+**M2 — why the Stage-3 student forward cannot intra-layer device-mismatch:**
+the genuine un-coerced chain in the codebase is `wrapped_factored`'s
+`F.linear(F.linear(sel, V), U)` (`activation_hooks.py:1474-1475, 1483-1484`) —
+NO `.to()` between the two linears, so a `V`/`U` split across devices would fault.
+But the Stage-3 student is loaded from `stage2p5_final`/`stage2_pruned`
+(`run_pipeline.py:515-533`) which is **pruned but NOT yet factored** — Stage 3 is
+what *produces* the factorization. `_resize_moe_stack_to_metadata` therefore does
+**not** install `FactoredExperts` for the Stage-3 student; its experts are the
+**fused stacked** params, whose forward (`wrapped_fused`, `:1491`) is a single
+`F.linear` per matrix with no cross-device chain. Combined with the fused-param
+constraint (H1) forcing `no_split_module_classes` to keep each layer whole, the
+Stage-3 student cov pass **cannot** hit the un-coerced factored chain. The §3.B
+out-of-scope guard refuses a multi-device map on an already-factored checkpoint to
+keep this invariant explicit for Stage-4+ resumes (not covered here).
+
 ### B6 — accumulator device contract — `utils/activation_hooks.py:983-1052, 1054-1084`
 `InputCovarianceAccumulator.update` (`:1012`) computes `XᵀX` on the input's
 device; `update_cross` (`:1051`) coerces to `cur.device`; `finalize_layer`
@@ -242,35 +279,71 @@ keeps working).
 
 ### 3.A `utils/model_io.py` — `load_model` (B1)
 Make the 4bit device pin device-aware (non-4bit already shards):
-- Replace the `{"": 0}` at `:99` with: if a single-device `device` hint is
-  available use `{"": <that device>}`, else `{"": 0}`. Mirror
-  `router_kd/plugins/teacher.py:624-639`. (bnb 4bit cannot shard — that's a bnb
-  limitation, documented; 4bit is not the Stage 3 cross-cov path anyway.)
+- `load_model`'s signature (`model_io.py:54-63`) has **NO `device` parameter** —
+  it only sees `device_map`. So the single-device hint **must be parsed from the
+  incoming `device_map`** (L2): if `device_map` is a single-device dict
+  (`{"": "cuda:1"}`) or a `"cuda:N"` string, reuse that device for the 4bit pin;
+  otherwise fall back to `{"": 0}`. Replace the unconditional `{"": 0}` at `:99`
+  with that parse. This mirrors `router_kd/plugins/teacher.py:624-639` (which
+  resolves `{"": str(device)}` from a single-device map). bnb 4bit cannot shard
+  (bnb limitation, documented; 4bit is not the Stage 3 cross-cov path).
 - No change to the non-4bit path — it already honors `"auto"`/`"balanced"`/dict.
 
-### 3.B `utils/model_io.py` — `load_compressed_model` (B2) — THE core change
-Accept real multi-GPU maps and stream shard-aware:
-1. Relax the guard at `:1406`: allow `"balanced"`, `dict`, and `max_memory`-style
-   inputs in addition to `"auto"/"cuda"/"cpu"`.
-2. When the resolved map is multi-device, do NOT resolve a single `target_device`.
-   Instead: build the skeleton on `meta` device, then use
-   `accelerate.infer_auto_device_map` (or honor the explicit dict) to compute a
-   per-module placement, and stream each tensor to **its module's target
-   device** (look up the device for `key`'s owning module from the device map).
-   The per-tensor swap loop at `:1540-1564` changes only in that
-   `safe_open(..., device=<per-key device>)` and `_assign_storage` target the
-   mapped device instead of one global `target_device`.
-3. After streaming, dispatch accelerate hooks so cross-shard forward works:
-   `accelerate.dispatch_model(model, device_map=resolved_map)` (this is what
-   `from_pretrained(device_map=...)` does internally). Non-persistent buffers
-   (RoPE `inv_freq`) handled by `dispatch_model` instead of the single
-   `model.to(canonical_target)` at `:1618` — keep the single-device `.to` ONLY on
-   the `n_gpu<=1`/single-device path so the existing path is byte-identical.
-4. Preserve the streaming memory discipline (one-tensor peak) per shard — it still
-   holds, now per target device.
-- **1-GPU/`"auto"`-on-1-GPU/`"cuda"`/`"cpu"` paths: UNCHANGED** (single
-  `target_device`, original loop, original `model.to`). The multi-device branch
-  is entered only when the resolved map spans ≥2 devices.
+### 3.B `utils/model_io.py` — `load_compressed_model` (B2) — THE core change (non-trivial)
+**Accurate description of today's loader (H2 correction):** the function does
+**NOT** build a meta skeleton. It (a) `from_config` under `no_init_weights()`
+on **CPU** (`model_io.py:1496-1497`), (b) `model.tie_weights()` (`:1498`),
+(c) **resizes the MoE stack ON `target_device`** via
+`_resize_moe_stack_to_metadata(model, meta, dtype=dtype, device=target_device)`
+(`:1500`), then (d) streams each shard tensor to the single `target_device`
+(`safe_open(..., device=str(target_device))` `:1543`, `_assign_storage` `:1556`),
+and (e) `model.to(canonical_target)` for non-persistent buffers (`:1618`).
+
+The multi-device change therefore has **two substeps of different risk**:
+
+1. **Low-risk — per-key device routing (keeps resize-on-device, option (a) of
+   H2).** Relax the guard at `:1406` to also accept `"balanced"`, a `dict`, and
+   `max_memory`. Compute the per-module device map from the **existing module
+   tree** (not a meta rebuild): call `accelerate.infer_auto_device_map(model,
+   max_memory=..., no_split_module_classes=[decoder-layer class])` on the
+   CPU-resident skeleton (or honor the explicit dict), yielding
+   `module_path -> device`. Then in the stream loop, resolve each `key`'s target
+   device by longest-prefix match against that map and pass it to
+   `safe_open(..., device=<per-key device>)` + `_assign_storage`. **The
+   one-tensor-peak streaming discipline is preserved per device.** Resize stays
+   as-is but must target each stack's mapped device instead of one global
+   `target_device` — `_resize_moe_stack_to_metadata` gains a per-layer device
+   lookup (small, contained change).
+   `no_split_module_classes` MUST include the Qwen3.5 decoder-layer class so
+   accelerate keeps each layer (and its fused stacked expert params) intact on one
+   device — this is mandatory given the fused-`nn.Parameter` constraint (H1).
+
+2. **Non-trivial — accelerate hook dispatch.** After streaming, run
+   `accelerate.dispatch_model(model, device_map=resolved_map)` so cross-layer
+   forward relocates activations automatically (this is what
+   `from_pretrained(device_map=...)` does internally). This replaces the single
+   `model.to(canonical_target)` at `:1618` on the multi-device path. **This is a
+   genuine new code path, not "the loop changes only in the device arg"** — it
+   owns: re-establishing the `embed_tokens↔lm_head` tie **before** dispatch
+   (the existing `tie_weights()` at `:1498` runs pre-resize; verify the tie
+   survives resize+dispatch, see R1), and the per-device meta-leftover check
+   (generalize `:1597-1610` to assert no `is_meta` param on ANY device). **It gets
+   its own unit test** (`test_load_compressed_multidevice_routing`, §7) and the
+   sharded-forward integration check. Budget it as a real substep, not a one-liner.
+
+- **1-GPU / `"auto"`-on-1-GPU / `"cuda"` / `"cpu"` paths: UNCHANGED** (single
+  `target_device`, original loop at `:1540-1564`, original `model.to` at `:1618`).
+  The multi-device branch is entered only when the resolved map spans ≥2 devices.
+- **Out-of-scope guard (M2):** if the checkpoint being loaded is **already
+  factored** (`compressed_metadata.json` lists non-empty `factored_layers`) AND a
+  multi-device map is requested, **log a loud warning and refuse / fall back to
+  single-device**. Reason: an already-factored checkpoint installs
+  `FactoredExperts` whose `wrapped_factored` forward chains
+  `F.linear(F.linear(sel, V), U)` with **no `.to()` between the two linears**
+  (`activation_hooks.py:1474-1475, 1483-1484`); if `V` and `U` landed on different
+  devices that chain would device-mismatch. The Stage-3 student is NOT factored at
+  load time (M2 below), so this guard never trips for the motivating run — but it
+  protects a Stage-4+ multi-device resume that this plan does NOT cover.
 
 ### 3.C `stage3/plugins/covariance_collection.py` (B5) — lever-2 reduce only
 - Lever 1: **no change** (cross-device already handled, B5).
@@ -279,7 +352,7 @@ Accept real multi-GPU maps and stream shard-aware:
   per-`(expert,matrix)` covariance tensors (fp32 accumulate → cast back to
   `storage_dtype`) and the `token_count`s, and writes the merged `layer_{idx}.pt`
   to `out_dir`. This mirrors `finalize_layer`'s merge math
-  (`activation_hooks.py:1077-1084`) exactly. Pure CPU, deterministic given a fixed
+  (`activation_hooks.py:1081-1084`) exactly. Pure CPU, deterministic given a fixed
   replica order.
 
 ### 3.D `stage3/orchestrator.py` (B3) — lever-2 spawn wrapper
@@ -298,10 +371,14 @@ Accept real multi-GPU maps and stream shard-aware:
   token budget per replica (last replica takes remainder).
 
 ### 3.E `stage3/plugins/block_refine.py` (B8)
-- One-liner: `out = out.to(device)` before `mse_loss` at `:554` (and the
-  symmetric teacher-target capture at `:526` already targets `device`). Numerically
-  a copy; enables sharded student block output to reduce against the
-  `device`-resident target. Guarded so it's a no-op when already on `device`.
+- One-liner: `out = out.to(device)` before `mse_loss` at `:554` (`out` is the
+  student block forward output produced at `:553`; under sharding it lands on the
+  last shard's device). The teacher side is already device-safe: the teacher
+  block input `x_t` is placed on `device` at `:526` and the teacher target is
+  spilled via `out.detach().to(dtype=torch.bfloat16, device="cpu")` at `:533`,
+  then re-loaded to `device` at `:550`. Numerically a copy; enables a sharded
+  student block output to reduce against the `device`-resident target. Guarded so
+  it is a no-op when `out` is already on `device`.
 
 ### 3.F `run_pipeline.py` / config plumbing (B9, §5)
 - Pass the (possibly multi-device) `device_map` through unchanged — it already
@@ -319,11 +396,16 @@ sequential pass over batches per layer, `covariance_collection.py:403`). The onl
 new op is a device-to-device *copy* of the teacher hidden row
 (`covariance_collection.py:313`) and of the cross term into the accumulator
 (`activation_hooks.py:1051`) — copies are bit-preserving. **Therefore lever 1
-covariances are bit-identical to single-GPU** within the same dtype, and the
-Stage-3 golden snapshot (`tests/test_stage3_golden_snapshot.py`) must remain
-unchanged when run on 1 GPU AND must match within `0` ULP on 2 GPUs for the same
-batch schedule. (Tolerance budget: exact; assert `atol=0` for the sharding
-equivalence test where the batch order is identical.)
+covariances are bit-identical to single-GPU on the SAME hardware backend** within
+the same dtype, and the Stage-3 golden snapshot
+(`tests/test_stage3_golden_snapshot.py`) must remain unchanged when run on 1 GPU.
+Tolerance budget, split by backend (consistent with §7/N1):
+- **Same-arch 2-GPU** (`cuda:0` vs `cuda:1`, identical kernels): a pure relocation
+  is bit-exact → **`atol=0`** for the same batch schedule. This is the strong
+  claim, validated only in the multi-GPU integration check.
+- **CPU-stand-in second device** (CI without a 2nd GPU): a CPU matmul and a CUDA
+  matmul are NOT bit-identical → assert **`rtol=1e-5, atol=1e-6`**, NOT `atol=0`
+  (that would falsely fail). This still proves device-relocation correctness.
 
 **Lever 2 (data-parallel) — within-tolerance claim.** The math identity
 `B = Σ_r Σ_{t∈shard_r} x_tᵀ x_t` is exact in ℝ; in fp the per-replica partial sums
@@ -381,10 +463,13 @@ multi_gpu:                 # NEW, entirely optional
    router_kd logic.
 3. **block_refine `out.to(device)`** (§3.E) — one-liner, unblocks sharded C.5.
 4. **Config surface** (§5) + thread-through in `run_pipeline.py` (§3.F). At this
-   point lever 1 is live: `device_map: balanced` shards both models, batch_size
-   can rise, NO new reduction code. Validate on the live H200×N box: same
-   covariances (bit-identical to 1-GPU on identical batch schedule), higher
-   batch_size, lower wall-time.
+   point lever 1 is live: `device_map: balanced` shards both models, NO new
+   reduction code. **First-sharded-run validation (H1):** on the live H200×N box,
+   (a) confirm weight VRAM drops ~N-fold per card, (b) **MEASURE the achievable
+   `stage3_svd.batch_size`** before committing lever-2 scope — the batch ceiling
+   is activation-bound on the hot layer's device, so the gain is measured, not
+   assumed — and (c) confirm covariances match 1-GPU (same-arch: `atol=0` on
+   identical batch schedule, per §4).
 5. **Lever 2 — `_reduce_spilled_cov_dirs`** (§3.C) + orchestrator spawn wrapper
    (§3.D). Land behind `cov_replicas > 1`. Prove DP-vs-1GPU equivalence test
    (§7) within the §4 tolerance.
@@ -399,36 +484,58 @@ follow after the first sharded run is validated.
 ## 7. Test plan
 
 **Unit (no real multi-GPU box needed):**
-- `test_load_compressed_multidevice_routing`: build a tiny config-only Qwen3.5-MoE
-  skeleton (2 layers, 4 experts — reuse the smoke fixture from
-  `tests/test_smoke_stage3.py`), force a 2-bucket `device_map` dict mapping half
-  the modules to `cuda:0` and half to `cpu` (CPU stands in for "second device" so
-  the test runs on 1 physical GPU or even 0). Assert each param landed on its
-  mapped device and a forward runs without device-mismatch. This exercises the
-  per-key routing of §3.B without needing 2 GPUs.
+- `test_load_compressed_multidevice_routing` — **scope-limited to placement, not
+  intra-layer forward (M1).** Build a tiny config-only Qwen3.5-MoE skeleton
+  (2 layers, 4 experts — reuse the smoke fixture from `tests/test_smoke_stage3.py`),
+  force a 2-bucket map putting **layer 0** on `cuda:0` and **layer 1** on `cpu`
+  (whole-layer buckets, honoring `no_split_module_classes` — NOT half-modules-of-a-
+  layer, which is impossible for the fused stacked params, H1). Assert: (i) each
+  param landed on its layer's mapped device, (ii) `dispatch_model` ran and a plain
+  `model(input_ids=...)` forward completes (accelerate relocates the hidden state
+  across the layer-0→layer-1 boundary). **This test passes trivially for the fused
+  experts and intentionally does NOT claim to exercise intra-layer cross-device
+  safety** — the fused experts keep each layer intact, so there is no
+  intra-layer split to test. The genuine cross-device guard is
+  `test_cov_sharding_equivalence` below (the cov-collection forward via
+  `instrument_experts`, where the un-coerced `F.linear` chain would live IF the
+  experts were factored — they are not, see M2).
 - `test_reduce_spilled_cov_dirs`: synth 3 replica spill dirs with known
   per-`(layer,expert,matrix)` cov shards; assert the merged file equals the
   single-pass sum within fp32 `rtol=1e-6` and token_counts sum exactly. Pure CPU.
-- `test_load_model_4bit_device_aware`: monkeypatch-free — call with a single-device
-  `device` hint and assert the constructed `device_map` is `{"": <device>}` not
-  `{"":0}` (inspect via a thin seam returning the resolved kwargs).
+- `test_load_model_4bit_device_aware`: call with `device_map={"": "cuda:1"}` (a
+  single-device dict) and assert the resolved 4bit `device_map` is `{"": "cuda:1"}`
+  not `{"":0}` (inspect via a thin seam returning the resolved kwargs; the hint is
+  parsed from `device_map`, §3.A/L2 — there is no `device` param to read).
 
 **Equivalence (the load-bearing ones):**
-- `test_cov_sharding_bit_identical` (lever 1): run `_collect_covariances` twice
-  over the SAME batch schedule on a tiny model — once all-on-`cuda:0`, once with
-  the student's experts split `cuda:0`/`cpu` via a forced device map — assert the
-  resulting `B_acc.covariance` / `C_acc.covariance` are **`atol=0` identical**
-  (sharding is a pure relocation). Runs on 1 GPU (CPU as the "other device").
+- `test_cov_sharding_equivalence` (lever 1) — **the real cross-device guard.** Run
+  `_collect_covariances` twice over the SAME batch schedule on a tiny model — once
+  all on one device, once with the model's two layers split across two devices via
+  a forced device map — and compare `B_acc.covariance` / `C_acc.covariance`. This
+  drives the cov-collection forward through `instrument_experts`
+  (`activation_hooks.py:1474-1485`), exercising the teacher-row device coercion
+  (`covariance_collection.py:310-313`) and the accumulator coercion
+  (`activation_hooks.py:1051`). **Tolerance is split by device backend (N1):**
+  - **CPU-stand-in variant (runs on 1 GPU or 0 GPU): `rtol=1e-5, atol=1e-6`** —
+    a CPU matmul vs a CUDA matmul is NOT bit-identical, so `atol=0` would
+    falsely FAIL. This variant proves *device-relocation correctness*, within fp
+    tolerance.
+  - **True same-arch 2-GPU variant (integration, requires 2 physical GPUs):
+    `atol=0` bit-identical** — `cuda:0` and `cuda:1` run the same kernels, so a
+    pure relocation IS bit-exact. This is the strong claim from §4; it runs only
+    in the multi-GPU integration check, not in CI.
 - `test_cov_dp_equivalence` (lever 2): run the in-process single-replica path over
   the full tiny calibration tensor, then run the DP path with G=2 (two batch
   shards reduced via `_reduce_spilled_cov_dirs`) and assert covariances match
-  within fp32 `rtol=1e-4, atol=1e-5` (§4). Use `gloo`/disk handoff so it runs
-  without 2 GPUs (spawn 2 CPU "replicas").
+  within fp32 `rtol=1e-4, atol=1e-5` (§4). Disk handoff so it runs without 2 GPUs
+  (spawn 2 CPU "replicas").
 
-**Without a real multi-GPU box:** all of the above use either (a)
-`CUDA_VISIBLE_DEVICES` to mask, (b) CPU as a stand-in second device in a forced
-device map, or (c) disk-based replica handoff with CPU replicas. The real 2×/4×/8×
-H200 run is the integration check (same covariances + measured wall-time drop).
+**Without a real multi-GPU box:** all CI tests use either (a) `CUDA_VISIBLE_DEVICES`
+to mask, (b) CPU as a stand-in second device in a forced device map (with the
+`rtol` tolerance of N1, never `atol=0`), or (c) disk-based replica handoff with CPU
+replicas. The real 2×/4×/8× H200 run is the integration check (same covariances —
+the `atol=0` same-arch variant — plus measured weight-VRAM relief and wall-time
+drop, and the batch-headroom measurement of H1/§6 step 4).
 
 **Regression guards (must stay green, unchanged):**
 - `tests/test_stage3_golden_snapshot.py`, `test_stage3_cross_cov.py`,
