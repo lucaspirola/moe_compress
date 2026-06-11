@@ -68,6 +68,13 @@ Sampling parameters (project-specified):
     <5 % Frobenius drift threshold reported in arXiv:2603.18492's
     calibration sensitivity figure.
 
+  Optional ``auto_batch`` block (default ``enabled: false``): a VRAM-aware
+  resolver (:mod:`moe_compress.utils.auto_batch`) that probes memory cost and
+  picks a larger forward batch when headroom allows. It currently auto-sizes
+  only phase-a (the ``BATCH_INVARIANT`` MA-formation pass); phase-b and the
+  ablation filter keep their fixed sizes. When off it is a complete no-op, so
+  the fixed batch sizes above are used and goldens stay byte-identical.
+
 Why L matters (referenced by three_way_and, aimer, magnitude_topk,
 sink_token): the paper documents that some experts produce extreme
 down_proj output magnitudes outside the MA-formation layers — these are

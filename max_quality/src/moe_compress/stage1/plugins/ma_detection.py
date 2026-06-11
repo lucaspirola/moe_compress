@@ -227,6 +227,7 @@ import torch.nn as nn
 
 from ...pipeline.safe_json import safe_float
 from ...utils.activation_hooks import run_calibration_early_exit
+from ...utils.auto_batch import resolve_batch, run_with_oom_backoff, AutoBatchConfig, FidelityClass
 from ...utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from ...utils.model_io import iter_decoder_layers, iter_moe_layers
 from ...utils.trackio_log import trackio_log as _trackio_log
@@ -363,20 +364,61 @@ class MADetectionPlugin:
             tokenizer, spec,
             cache_dir=artifacts_dir / "_calibration_cache",
         )
-        phase_a_batch_size = int(s1.get("phase_a_batch_size", _PHASE_A_BATCH_SIZE))
-        batches = iter_batches(calib, batch_size=phase_a_batch_size)
+        ab_cfg = AutoBatchConfig.from_dict(s1.get("auto_batch"))
+        fixed_bs = int(s1.get("phase_a_batch_size", _PHASE_A_BATCH_SIZE))
 
-        log.info(
-            "Stage 1 Phase A: detecting MA-formation layers over %d samples (%d MoE layers)",
-            len(batches), len(moe_layers),
-        )
+        if not ab_cfg.enabled:
+            # Default-OFF path: EXACTLY the original single run via the LIVE
+            # ``_detect_ma_layers`` entry point (weight-tied check → collect →
+            # ratios). No probe, no backoff wrapper → byte-identical golden.
+            log.info(
+                "Stage 1 Phase A: detecting MA-formation layers (%d MoE layers)",
+                len(moe_layers),
+            )
+            L, residual_growth, moe_output_growth, moe_output_max = _detect_ma_layers(
+                model, iter_batches(calib, batch_size=fixed_bs), moe_layers, device,
+                ma_ratio=ma_ratio,
+                ma_growth_ratio=ma_growth_ratio,
+                moe_output_growth_ratio=moe_output_growth_ratio,
+            )
+        else:
+            # Enabled: validate FIRST (weight-tied raise precedes any forward),
+            # cost-model size the batch (BATCH_INVARIANT → grouping-independent
+            # max/percentile), then run the REAL pass with OOM backoff toward the
+            # fixed floor (the real pass is the fit test). The validated decoder
+            # indices are threaded into _ratios_from_collect (validate once).
+            sorted_decoder_layer_indices = _validate_decoder_layers(model)
 
-        L, residual_growth, moe_output_growth, moe_output_max = _detect_ma_layers(
-            model, batches, moe_layers, device,
-            ma_ratio=ma_ratio,
-            ma_growth_ratio=ma_growth_ratio,
-            moe_output_growth_ratio=moe_output_growth_ratio,
-        )
+            def cost_probe_fn(micro_batch: int) -> int:
+                torch.cuda.reset_peak_memory_stats(device)
+                _run_phase_a_collect(
+                    model,
+                    iter_batches(calib[: max(2, micro_batch)], batch_size=micro_batch),
+                    device,
+                )
+                return int(torch.cuda.max_memory_allocated(device))
+
+            bs = resolve_batch(
+                cost_probe_fn,
+                fixed_batch=fixed_bs,
+                fidelity_class=FidelityClass.BATCH_INVARIANT,
+                cfg=ab_cfg,
+            )
+            log.info(
+                "Stage 1 Phase A: detecting MA-formation layers (%d MoE layers)",
+                len(moe_layers),
+            )
+            collected = run_with_oom_backoff(
+                lambda b: _run_phase_a_collect(model, iter_batches(calib, batch_size=b), device),
+                start_batch=bs,
+                floor=fixed_bs,
+            )
+            L, residual_growth, moe_output_growth, moe_output_max = _ratios_from_collect(
+                model, moe_layers, sorted_decoder_layer_indices, collected,
+                ma_ratio=ma_ratio,
+                ma_growth_ratio=ma_growth_ratio,
+                moe_output_growth_ratio=moe_output_growth_ratio,
+            )
         log.info("Stage 1 Phase A: MA-formation layers L = %s", sorted(L))
 
         ctx.set("L", L)
@@ -426,52 +468,47 @@ def _flag_layer_dual_signal(
     return (residual_ratio > residual_threshold) or (moe_ratio > moe_threshold)
 
 
-def _detect_ma_layers(
-    model: nn.Module,
-    batches,
-    moe_layers,
-    device,
-    *,
-    ma_ratio: float = _MA_RATIO,
-    ma_growth_ratio: float = _MA_GROWTH_RATIO,
-    moe_output_growth_ratio: float = _MOE_OUTPUT_GROWTH_RATIO,
-) -> tuple[set[int], dict[int, float], dict[int, float], dict[int, float]]:
-    """Forward pass 1: identify MA-formation layers via dual-signal OR rule.
+def _validate_decoder_layers(model: nn.Module) -> list[int]:
+    """Validate the decoder-layer set and return its sorted indices.
 
-    Returns (L, residual_growth, moe_output_growth, moe_output_max):
-      L                   — set of MA-formation layer indices (subset of MoE
-                            layer indices; see module-docstring deviation #1).
-      residual_growth     — per-MoE-layer max|H_l|/max|H_{l-1}| where l-1 is
-                            the *physically adjacent decoder layer* in
-                            ``sorted_decoder_layer_indices`` order — may be a
-                            dense / linear-attention layer in hybrid models
-                            (see module-docstring deviation #2). First MoE
-                            layer entry is float('nan') (no predecessor at
-                            all).
-      moe_output_growth   — per-MoE-layer max|MoE_l|/max|MoE_{prev_moe}| where
-                            prev_moe is the *logically adjacent MoE layer* in
-                            ``sorted_moe_layer_indices`` order (possibly
-                            several decoder positions earlier — see
-                            module-docstring deviation #2). Post-routing-
-                            weighted-sum, pre-residual-add. First MoE layer
-                            entry is 0.0 (no prior MoE output).
-      moe_output_max      — per-MoE-layer raw max|MoE_l| (for diagnostics).
-
-    See the module docstring (Paper / Deviation sections) for the OR rule
-    rationale and the full predecessor-choice asymmetry argument.
+    Raises on no decoder layers / weight-tied (duplicate-module) decoder layers.
+    Both the default-off (``_detect_ma_layers``) and the enabled auto-batch path
+    call this BEFORE the Phase-A forward, so a weight-tied model raises without
+    burning a forward pass (preserving the pre-rework ordering).
     """
-    sorted_moe_layer_indices = sorted(ref.layer_idx for ref in moe_layers)
-    if not sorted_moe_layer_indices:
-        return set(), {}, {}, {}
-    first_moe_layer_idx = sorted_moe_layer_indices[0]
-    moe_layer_by_idx = {ref.layer_idx: ref for ref in moe_layers}
-
     decoder_layers: list[tuple[int, nn.Module]] = list(iter_decoder_layers(model))
     if not decoder_layers:
         raise ValueError("_detect_ma_layers: no decoder layers found")
     decoder_layer_modules = {layer: idx for idx, layer in decoder_layers}
     if len(decoder_layer_modules) != len(decoder_layers):
         raise ValueError("_detect_ma_layers: weight-tied decoder layers detected")
+    return sorted(decoder_layer_modules.values())
+
+
+def _run_phase_a_collect(
+    model: nn.Module,
+    batches,
+    device,
+) -> tuple[dict[int, float], dict[int, float], float]:
+    """Run the Phase-A forward and finalize the running maxes + Q99.
+
+    Returns ``(layer_max, moe_block_max, first_layer_q99)`` — the per-decoder-
+    layer residual-stream ``abs().max()`` map, the per-MoE-block ``abs().max()``
+    map (both as python floats), and the first-MoE-layer 99th-percentile scalar.
+
+    This is the SINGLE forward+finalize code path: the default-off pass (via
+    ``_detect_ma_layers``), the enabled auto-batch cost probe, and the enabled
+    real pass (under ``run_with_oom_backoff``) all call it, so every path runs
+    the byte-for-byte identical reduction. The downstream ratio/threshold logic
+    lives in ``_ratios_from_collect`` (CPU-only; not part of the forward).
+    """
+    moe_layers = list(iter_moe_layers(model))
+    sorted_moe_layer_indices = sorted(ref.layer_idx for ref in moe_layers)
+    first_moe_layer_idx = sorted_moe_layer_indices[0]
+    moe_layer_by_idx = {ref.layer_idx: ref for ref in moe_layers}
+
+    decoder_layers: list[tuple[int, nn.Module]] = list(iter_decoder_layers(model))
+    decoder_layer_modules = {layer: idx for idx, layer in decoder_layers}
     sorted_decoder_layer_indices = sorted(decoder_layer_modules.values())
 
     # Residual-stream max: hooked on every decoder layer.
@@ -558,6 +595,93 @@ def _detect_ma_layers(
         )
     else:
         first_layer_q99 = 0.0
+
+    return layer_max, moe_block_max, first_layer_q99
+
+
+def _detect_ma_layers(
+    model: nn.Module,
+    batches,
+    moe_layers,
+    device,
+    *,
+    ma_ratio: float = _MA_RATIO,
+    ma_growth_ratio: float = _MA_GROWTH_RATIO,
+    moe_output_growth_ratio: float = _MOE_OUTPUT_GROWTH_RATIO,
+) -> tuple[set[int], dict[int, float], dict[int, float], dict[int, float]]:
+    """Forward pass 1: identify MA-formation layers via dual-signal OR rule.
+
+    Returns (L, residual_growth, moe_output_growth, moe_output_max):
+      L                   — set of MA-formation layer indices (subset of MoE
+                            layer indices; see module-docstring deviation #1).
+      residual_growth     — per-MoE-layer max|H_l|/max|H_{l-1}| where l-1 is
+                            the *physically adjacent decoder layer* in
+                            ``sorted_decoder_layer_indices`` order — may be a
+                            dense / linear-attention layer in hybrid models
+                            (see module-docstring deviation #2). First MoE
+                            layer entry is float('nan') (no predecessor at
+                            all).
+      moe_output_growth   — per-MoE-layer max|MoE_l|/max|MoE_{prev_moe}| where
+                            prev_moe is the *logically adjacent MoE layer* in
+                            ``sorted_moe_layer_indices`` order (possibly
+                            several decoder positions earlier — see
+                            module-docstring deviation #2). Post-routing-
+                            weighted-sum, pre-residual-add. First MoE layer
+                            entry is 0.0 (no prior MoE output).
+      moe_output_max      — per-MoE-layer raw max|MoE_l| (for diagnostics).
+
+    See the module docstring (Paper / Deviation sections) for the OR rule
+    rationale and the full predecessor-choice asymmetry argument.
+
+    This is the LIVE entry point on the default-off path: validate (weight-tied
+    decoder check) FIRST, then the forward collect, then the ratios — exactly the
+    pre-rework ordering, so a weight-tied model raises before burning a forward.
+    """
+    if not list(moe_layers):
+        return set(), {}, {}, {}
+    # Weight-tied / no-decoder validation BEFORE the forward (matches original);
+    # the validated indices are threaded into _ratios_from_collect so validation
+    # happens exactly ONCE per path.
+    sorted_decoder_layer_indices = _validate_decoder_layers(model)
+    # Identical forward+finalize path shared with the auto-batch paths.
+    collected = _run_phase_a_collect(model, batches, device)
+    return _ratios_from_collect(
+        model, moe_layers, sorted_decoder_layer_indices, collected,
+        ma_ratio=ma_ratio,
+        ma_growth_ratio=ma_growth_ratio,
+        moe_output_growth_ratio=moe_output_growth_ratio,
+    )
+
+
+def _ratios_from_collect(
+    model: nn.Module,
+    moe_layers,
+    sorted_decoder_layer_indices: list[int],
+    collected: tuple[dict[int, float], dict[int, float], float],
+    *,
+    ma_ratio: float = _MA_RATIO,
+    ma_growth_ratio: float = _MA_GROWTH_RATIO,
+    moe_output_growth_ratio: float = _MOE_OUTPUT_GROWTH_RATIO,
+) -> tuple[set[int], dict[int, float], dict[int, float], dict[int, float]]:
+    """Dual-signal OR-rule ratios over an already-collected Phase-A reduction.
+
+    Splits the (forward) collect from the (CPU-only) ratio logic so the enabled
+    auto-batch path can run the forward through ``run_with_oom_backoff`` and feed
+    the resulting ``(layer_max, moe_block_max, first_layer_q99)`` triple here. The
+    default-off path goes through ``_detect_ma_layers`` (collect + this) and is
+    byte-identical to the pre-rework single-pass implementation.
+
+    ``model`` is used only for the 0.75-depth fallback (reads ``num_hidden_layers``
+    off its config). ``sorted_decoder_layer_indices`` is the already-validated
+    decoder index list (from ``_validate_decoder_layers``, called once per path
+    BEFORE the forward); this function does NOT re-validate.
+    """
+    layer_max, moe_block_max, first_layer_q99 = collected
+
+    sorted_moe_layer_indices = sorted(ref.layer_idx for ref in moe_layers)
+    if not sorted_moe_layer_indices:
+        return set(), {}, {}, {}
+    first_moe_layer_idx = sorted_moe_layer_indices[0]
 
     L: set[int] = set()
     residual_growth: dict[int, float] = {}
