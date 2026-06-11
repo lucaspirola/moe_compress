@@ -1529,6 +1529,170 @@ def instrument_experts(
         experts.forward = original_forward
 
 
+@contextlib.contextmanager
+def capture_experts(
+    layer_ref: MoELayerRef,
+    callbacks: dict[str, CallbackFn],
+    *,
+    capture_intermediate: bool = True,
+):
+    """Capture-ONLY sibling of :func:`instrument_experts` (A7).
+
+    Unlike :func:`instrument_experts`, this does **not** replace the experts'
+    ``forward`` — the model runs its REAL native forward (``FactoredExperts``
+    padded ``bmm`` / fused grouped GEMM) untouched, so upstream layers and the
+    residual stream stay bit-identical to inference. A ``forward_pre_hook``
+    (``with_kwargs=True``) re-derives the per-expert routing the native forward
+    uses (the identical ``one_hot``/``where`` ops) and fires:
+
+      * ``input`` / ``gate_up_in`` with ``sel = hidden_states[token_idx]`` — a
+        PURE gather, bit-invariant to the layer's forward internals (it depends
+        only on the upstream residual stream + routing). This feeds the
+        gate_proj-key ``S`` and the cross ``C`` exactly as today.
+      * ``intermediate`` (when ``capture_intermediate``) with
+        ``act_fn(gate) * up`` — the down_proj-key input. The pre-hook cannot
+        observe the native ``inter`` (it is local to the forward), so A7
+        RECOMPUTES it **in the native reduction shape**: a padded batched
+        ``bmm`` for ``FactoredExperts`` (mirrors ``model_io.py`` forward
+        lines 982-985), and a per-expert fused ``F.linear`` for the fused
+        path (mirrors the fused native loop). The zero-pad rows of the padded
+        ``inter`` contribute ``silu(0)*0 = 0`` outer-products, so the padded
+        recompute and an un-padded per-expert recompute yield an IDENTICAL
+        down_proj Gram inside ``InputCovarianceAccumulator.update`` (which
+        reshapes to ``(-1, d_int)`` and forms ``flatᵀ@flat``).
+
+    The captured quantities (``S = X_postᵀX_post``, ``C = X_preᵀX_post``,
+    gate-only per D6) are the SAME definitions as :func:`instrument_experts`;
+    only the fp reduction order of the captured activations moves from the
+    Python ``F.linear`` loop to the native forward — making the calibration
+    strictly more inference-faithful (see ``tasks/PLAN_A7_A1_WINDOWED_COV.md``).
+
+    Accepted callback keys: ``input``, ``gate_up_in`` (both fire with ``sel``),
+    ``intermediate``. The ``down`` / ``gate_up_out`` keys of
+    :func:`instrument_experts` are NOT emitted (unused by the cov collector).
+
+    Mutually exclusive with :func:`instrument_experts` on the same module: a
+    forward already swapped by ``instrument_experts`` would feed this pre-hook
+    the Python-loop stream, defeating the capture-only contract. We assert the
+    module is not currently ``instrument_experts``-patched on entry.
+    """
+    experts = layer_ref.experts_module
+    is_factored = isinstance(experts, FactoredExperts)
+    layer_idx = layer_ref.layer_idx
+
+    # Guard: A7 and instrument_experts must not be co-active on a module. If the
+    # forward is currently a swapped instrument_experts wrapper, the pre-hook
+    # would observe the Python-loop forward's stream, not the native one.
+    _underlying = getattr(experts.forward, "__func__", experts.forward)
+    if getattr(_underlying, "_instrument_experts_patched", False):
+        raise RuntimeError(
+            f"capture_experts: layer {layer_idx} is already instrument_experts-"
+            f"patched — A7 capture-only and instrument_experts are mutually "
+            f"exclusive on the same module"
+        )
+
+    def _cb(name, e_int: int, tensor, ctx):
+        fn = callbacks.get(name)
+        if fn is None:
+            return
+        fn(layer_idx, e_int, tensor, ctx)
+
+    def _pre_hook(module, args, kwargs):
+        # Mirror the native forward signature: (hidden_states, top_k_index,
+        # top_k_weights). Tolerate either positional or kw passing.
+        if len(args) >= 3:
+            hidden_states, top_k_index, top_k_weights = args[0], args[1], args[2]
+        else:
+            hidden_states = args[0] if args else kwargs["hidden_states"]
+            top_k_index = kwargs["top_k_index"]
+            top_k_weights = kwargs["top_k_weights"]
+        if top_k_index.dim() != 2:
+            raise RuntimeError(
+                f"capture_experts: top_k_index must be 2D [T, top_k], got "
+                f"shape {top_k_index.shape}"
+            )
+        with torch.no_grad():
+            mask = F.one_hot(
+                top_k_index, num_classes=module.num_experts
+            ).permute(2, 1, 0)
+            expert_hit = (mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=False)
+
+            # Per-expert routing in native-forward order.
+            expert_data: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+            for row in expert_hit:
+                e = row[0]
+                top_k_pos, token_idx = torch.where(mask[e])
+                expert_data.append((int(e), token_idx, top_k_pos))
+
+            # ---- down_proj-key intermediate (capture_intermediate only) -----
+            # FactoredExperts: recompute act_fn(gate)*up in the NATIVE padded
+            # batched-bmm shape (mirrors model_io.py FactoredExperts.forward
+            # lines 961-985) so the captured `inter` matches the native
+            # forward's fp reduction order. The zero pad rows
+            # (silu(0)*0 = 0) cancel in the down_proj Gram, so feeding the
+            # padded `inter` (pad rows included) yields the identical down_proj
+            # covariance as an un-padded per-expert capture.
+            inter_padded = None  # [n_active, max_tokens, d_int] (factored only)
+            if (
+                capture_intermediate
+                and is_factored
+                and len(expert_data) > 0
+            ):
+                n_active = len(expert_data)
+                max_tokens = max(len(tok) for _, tok, _ in expert_data)
+                gathered = hidden_states.new_zeros(
+                    n_active, max_tokens, hidden_states.shape[-1]
+                )
+                for i, (_, token_idx, _) in enumerate(expert_data):
+                    gathered[i, : len(token_idx)] = hidden_states[token_idx]
+                hit_ids = expert_hit[:, 0]
+                V_g = module.gate_proj_V[hit_ids]
+                U_g = module.gate_proj_U[hit_ids]
+                V_u = module.up_proj_V[hit_ids]
+                U_u = module.up_proj_U[hit_ids]
+                gate = torch.bmm(
+                    torch.bmm(gathered, V_g.transpose(-1, -2)),
+                    U_g.transpose(-1, -2),
+                )
+                up = torch.bmm(
+                    torch.bmm(gathered, V_u.transpose(-1, -2)),
+                    U_u.transpose(-1, -2),
+                )
+                inter_padded = module.act_fn(gate) * up
+
+            for i, (e_int, token_idx, top_k_pos) in enumerate(expert_data):
+                sel = hidden_states[token_idx]
+                ctx = {
+                    "top_k_weights": top_k_weights[token_idx, top_k_pos],
+                    "top_k_pos": top_k_pos,
+                    "token_idx": token_idx,
+                }
+                # gate_proj-key input — pure gather, native-forward-invariant.
+                _cb("input", e_int, sel, ctx)
+                _cb("gate_up_in", e_int, sel, ctx)
+                if not capture_intermediate:
+                    continue
+                if is_factored:
+                    # Feed the padded inter for this expert (zero pad rows
+                    # included — they cancel in the Gram, §3.2 of the plan).
+                    intermediate = inter_padded[i]
+                else:
+                    # Fused path: per-expert grouped GEMM mirrors the native
+                    # fused forward's reduction order.
+                    gate_up = F.linear(sel, module.gate_up_proj[e_int])
+                    gate, up = gate_up.chunk(2, dim=-1)
+                    intermediate = module.act_fn(gate) * up
+                _cb("intermediate", e_int, intermediate, ctx)
+        # Pre-hook returns None → native forward proceeds with original args.
+        return None
+
+    handle = experts.register_forward_pre_hook(_pre_hook, with_kwargs=True)
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
 # ---------------------------------------------------------------------------
 # Generic calibration runner (no hooks by itself)
 # ---------------------------------------------------------------------------

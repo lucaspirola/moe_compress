@@ -456,6 +456,211 @@ def test_resolve_cov_replicas_floor_and_autodetect():
         assert eff >= 1
 
 
+# ===========================================================================
+# A7 (capture-only hook) + A1 (windowed single-pass) equivalence
+# ===========================================================================
+
+
+def _factored_from_fused(tiny_model):
+    """Return a deepcopy of ``tiny_model`` with every MoE layer's fused experts
+    replaced by a FULL-RANK ``FactoredExperts`` whose U@V reproduces the fused
+    weights. This puts the model on the genuine native padded-``bmm`` forward
+    (``FactoredExperts.forward``) so the A7-vs-instrument test exercises the
+    real native-vs-Python-loop reduction-order delta (not the fused tiny path,
+    where both are the same per-expert ``F.linear`` loop).
+    """
+    import copy
+    from moe_compress.utils.model_io import FactoredExperts, iter_moe_layers
+
+    model = copy.deepcopy(tiny_model).eval()
+    for ref in iter_moe_layers(model):
+        fused = ref.experts_module
+        ne = fused.num_experts
+        d_hid = fused.hidden_dim
+        d_int = fused.intermediate_dim
+        fe = FactoredExperts(
+            num_experts=ne, hidden_dim=d_hid, intermediate_dim=d_int,
+            ranks={"gate_proj": d_int, "up_proj": d_int,
+                   "down_proj": min(d_hid, d_int)},
+            dtype=torch.float32,
+        )
+        with torch.no_grad():
+            for e in range(ne):
+                gate = fused.gate_up_proj[e][:d_int]
+                up = fused.gate_up_proj[e][d_int:]
+                down = fused.down_proj[e]
+                fe.set_factors_from_weight(e, "gate_proj", gate)
+                fe.set_factors_from_weight(e, "up_proj", up)
+                fe.set_factors_from_weight(e, "down_proj", down)
+        ref.mlp.experts = fe
+    return model
+
+
+def test_a7_capture_matches_instrument_single_layer(tiny_model):
+    """A7 ``capture_experts`` (native forward) vs ``instrument_experts`` (Python
+    loop) on a SINGLE FactoredExperts MoE layer must agree per-key within
+    rtol=1e-4/atol=1e-5. Isolates the native-vs-loop fp delta (single layer ⇒
+    no upstream drift); bounds it, justifying the new all-native golden.
+
+    Both runs use the SAME post-prune FactoredExperts model, so the only
+    difference is the captured-layer forward reduction order: the native padded
+    ``bmm`` (A7 recompute) vs the per-expert ``F.linear`` loop (instrument).
+    """
+    import copy
+    from moe_compress.utils.model_io import iter_moe_layers
+
+    torch.manual_seed(3)
+    batches = [torch.randint(0, 32, (2, 8)) for _ in range(3)]
+
+    base = _factored_from_fused(tiny_model)
+    # Restrict to a single MoE layer so there is no upstream-layer drift.
+    moe_all = list(iter_moe_layers(base))
+    single_idx = moe_all[0].layer_idx
+
+    def _collect(mode):
+        m = copy.deepcopy(base).eval()
+        moe = [r for r in iter_moe_layers(m) if r.layer_idx == single_idx]
+        B = InputCovarianceAccumulator()
+        B.set_storage_dtype(torch.float32)
+        _collect_covariances(
+            m, moe, batches, B, device=torch.device("cpu"),
+            cov_window_size=1, cov_capture_mode=mode,
+        )
+        B.finalize_all()
+        return B
+
+    B_cap = _collect("capture")
+    B_ins = _collect("instrument")
+
+    assert set(B_cap.covariance) == set(B_ins.covariance)
+    # gate_proj key is a pure gather ⇒ byte-identical; down_proj moves with the
+    # native-vs-loop order ⇒ bounded by rtol=1e-4. Both checked under one tol.
+    for k in B_cap.covariance:
+        a = B_cap.covariance[k].to(torch.float32)
+        b = B_ins.covariance[k].to(torch.float32)
+        assert torch.allclose(a, b, rtol=1e-4, atol=1e-5), \
+            f"A7-vs-instrument cov delta exceeds native-vs-loop bound at {k}"
+    # gate_proj keys must be EXACT (pure input gather, identical ops).
+    for k in B_cap.covariance:
+        if k[2] == "gate_proj":
+            assert torch.equal(
+                B_cap.covariance[k].to(torch.float32),
+                B_ins.covariance[k].to(torch.float32),
+            ), f"gate_proj key {k} must be bit-identical (pure gather)"
+
+
+def _collect_windowed(model_factory, batches, *, G, cross):
+    """Run A7 cov collection at window size ``G`` and return (B, C) accumulators."""
+    import copy
+    from moe_compress.utils.model_io import iter_moe_layers
+
+    model = copy.deepcopy(model_factory).eval()
+    teacher = copy.deepcopy(model_factory).eval() if cross else None
+    moe = list(iter_moe_layers(model))
+    tmoe = list(iter_moe_layers(teacher)) if cross else None
+    B = InputCovarianceAccumulator()
+    B.set_storage_dtype(torch.float32)
+    C = None
+    if cross:
+        C = InputCovarianceAccumulator()
+        C.set_storage_dtype(torch.float32)
+    _collect_covariances(
+        model, moe, batches, B, device=torch.device("cpu"),
+        teacher_model=teacher, teacher_moe_layers=tmoe, C_acc=C,
+        cov_window_size=G, cov_capture_mode="capture",
+    )
+    B.finalize_all()
+    if C is not None:
+        C.finalize_all()
+    return B, C
+
+
+def test_a1_windowed_equals_perlayer(tiny_model):
+    """A7 windowed (G=N, single pass) vs A7 per-layer (G=1) must be
+    BYTE-IDENTICAL (atol=0) on CPU per key — windowing adds zero error on top of
+    the native baseline (PLAN §2.1). Exercised WITH cross-cov (dual-forward) so
+    the per-batch ``_teacher_hidden`` window lifetime is covered too.
+    """
+    torch.manual_seed(5)
+    batches = [torch.randint(0, 32, (2, 8)) for _ in range(3)]
+    n_layers = len(list(__import__(
+        "moe_compress.utils.model_io", fromlist=["iter_moe_layers"]
+    ).iter_moe_layers(tiny_model)))
+
+    B1, C1 = _collect_windowed(tiny_model, batches, G=1, cross=True)
+    Bn, Cn = _collect_windowed(tiny_model, batches, G=n_layers, cross=True)
+
+    assert set(B1.covariance) == set(Bn.covariance)
+    for k in B1.covariance:
+        assert torch.equal(
+            B1.covariance[k].to(torch.float32), Bn.covariance[k].to(torch.float32)
+        ), f"B windowed(G=N) != per-layer(G=1) at {k}"
+    assert set(C1.covariance) == set(Cn.covariance)
+    for k in C1.covariance:
+        assert torch.equal(
+            C1.covariance[k].to(torch.float32), Cn.covariance[k].to(torch.float32)
+        ), f"C windowed(G=N) != per-layer(G=1) at {k}"
+
+
+def test_a1_window_sizes_consistent(tiny_model):
+    """G ∈ {1, 2, N} all produce byte-identical per-key cov — window-boundary
+    independence (PLAN §7.1)."""
+    from moe_compress.utils.model_io import iter_moe_layers
+
+    torch.manual_seed(9)
+    batches = [torch.randint(0, 32, (2, 8)) for _ in range(2)]
+    n_layers = len(list(iter_moe_layers(tiny_model)))
+    sizes = sorted({1, 2, n_layers})
+
+    ref_B, _ = _collect_windowed(tiny_model, batches, G=sizes[0], cross=False)
+    for G in sizes[1:]:
+        B, _ = _collect_windowed(tiny_model, batches, G=G, cross=False)
+        assert set(B.covariance) == set(ref_B.covariance)
+        for k in B.covariance:
+            assert torch.equal(
+                B.covariance[k].to(torch.float32),
+                ref_B.covariance[k].to(torch.float32),
+            ), f"G={G} cov differs from G={sizes[0]} at {k}"
+
+
+def test_resolve_cov_window_config():
+    """``_resolve_cov_window``: explicit int clamps to [1,N]; auto on a CPU-only
+    box degrades to G=1; absent key defaults to auto (G=1 on CPU)."""
+    from moe_compress.stage3.plugins.covariance_collection import _resolve_cov_window
+
+    # Explicit int clamps into [1, N].
+    assert _resolve_cov_window({"multi_gpu": {"cov_window_size": 3}}, 10) == 3
+    assert _resolve_cov_window({"multi_gpu": {"cov_window_size": 99}}, 10) == 10
+    assert _resolve_cov_window({"multi_gpu": {"cov_window_size": 0}}, 10) == 1
+    # String int accepted.
+    assert _resolve_cov_window({"multi_gpu": {"cov_window_size": "4"}}, 10) == 4
+    # auto / absent: VRAM-probe; on a CPU-only box this MUST be 1 (clean degrade).
+    if not torch.cuda.is_available():
+        assert _resolve_cov_window({"multi_gpu": {"cov_window_size": "auto"}}, 10) == 1
+        assert _resolve_cov_window({}, 10) == 1
+    else:
+        # With CUDA the probe returns a value in [1, N].
+        g = _resolve_cov_window({"multi_gpu": {"cov_window_size": "auto"}}, 10)
+        assert 1 <= g <= 10
+    # n_layers<=0 → 1.
+    assert _resolve_cov_window({}, 0) == 1
+
+
+def test_capture_experts_rejects_double_instrument(tiny_model):
+    """A7 ``capture_experts`` refuses to attach to a module whose forward is
+    already swapped by ``instrument_experts`` (mutually exclusive, PLAN §3.3)."""
+    from moe_compress.utils.activation_hooks import (
+        capture_experts, instrument_experts,
+    )
+    from moe_compress.utils.model_io import iter_moe_layers
+
+    ref = list(iter_moe_layers(tiny_model))[0]
+    with instrument_experts(ref, {"input": lambda *a, **k: None}):
+        with pytest.raises(RuntimeError, match="mutually exclusive"):
+            with capture_experts(ref, {"input": lambda *a, **k: None}):
+                pass
+
+
 if __name__ == "__main__":
     import sys as _sys
     _sys.exit(pytest.main([__file__, "-v"]))
