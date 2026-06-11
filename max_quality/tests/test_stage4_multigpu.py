@@ -25,12 +25,15 @@ All run WITHOUT a real multi-GPU box: the second "device" is CPU via the
 """
 from __future__ import annotations
 
+import pytest
 import torch
 
 from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage4.orchestrator import _resolve_eora_workers
 from moe_compress.stage4.plugins.eora_compensation import (
     EoraCompensationPlugin,
+    _compute_eora_factors,
+    _eigh_spectrum,
     _solve_expert_tile,
 )
 from moe_compress.utils.model_io import MoELayerRef, FactoredExperts
@@ -222,3 +225,72 @@ def test_eora_gather_order_deterministic():
             a = getattr(fe1, f"{name}_{proj}").data
             b = getattr(fe2, f"{name}_{proj}").data
             assert torch.equal(a, b)
+
+
+# --------------------------------------------------------------------------- #
+# HIGH regression: gate-pass spectrum on a DIFFERENT device than up-pass delta
+# --------------------------------------------------------------------------- #
+def _drop_up_originals(originals, experts):
+    """Return a copy of ``originals`` with the up_proj entry removed for the
+    given experts — makes the gate_proj and up_proj eligibility SETS differ in
+    length, which (under W>1) bands a shared expert ``e`` to a DIFFERENT worker
+    device on the gate vs up pass. That is the trigger for the cross-device
+    gate-spectrum bug."""
+    return {k: v for k, v in originals.items()
+            if not (k[2] == "up_proj" and k[1] in experts)}
+
+
+def test_eora_differing_eligibility_bands_diverge():
+    """With gate-eligible != up-eligible, compensate_layer still completes and
+    matches serial (CPU). On real multi-GPU the per-matrix bands would assign
+    expert e to different devices across the gate/up passes — this is the case
+    whose gate-spectrum reuse must NOT cross a device boundary."""
+    make_fe, ref_factory, originals, A_cov, config = _build_case(n_experts=6)
+    # Drop up_proj originals for experts {1,4}: gate has 6 eligible, up has 4,
+    # so contiguous banding (W=3) maps e.g. expert 5 to band 2 in gate but a
+    # different band in up — divergent device_of per matrix.
+    originals_skew = _drop_up_originals(originals, {1, 4})
+
+    serial = _run_compensate(
+        make_fe, ref_factory, originals_skew, A_cov, config, eora_workers=1,
+    )
+    par = _run_compensate(
+        make_fe, ref_factory, originals_skew, A_cov, config,
+        eora_workers=3, worker_devices=["cpu", "cpu", "cpu"],
+    )
+    fe_s, rm_s, cp_s = serial
+    fe_p, rm_p, cp_p = par
+    assert fe_s.ranks == fe_p.ranks
+    assert rm_s == rm_p and cp_s == cp_p
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        for proj in ("U", "V"):
+            torch.testing.assert_close(
+                getattr(fe_s, f"{name}_{proj}").data,
+                getattr(fe_p, f"{name}_{proj}").data,
+                rtol=1e-5, atol=1e-6,
+            )
+
+
+def test_compute_eora_factors_relocates_cross_device_spectrum():
+    """_compute_eora_factors must relocate a SUPPLIED spectrum to delta's device
+    before the projection matmul. Reproduces the gate(device A)→up(device B)
+    reuse path on two real CUDA devices; would RuntimeError before the fix.
+
+    Skipped without >=2 CUDA devices (CI has 0). The CPU path is covered by
+    test_eora_differing_eligibility_bands_diverge above."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("needs >=2 CUDA devices")
+    d_out, d_in, r = 12, 8, 2
+    g = torch.Generator().manual_seed(11)
+    A = _make_cov(d_in, seed=5)
+    # Gate pass: spectrum computed on cuda:0.
+    spectrum = _eigh_spectrum(A, d_in, torch.device("cuda:0"), torch.float32)
+    assert spectrum is not None and spectrum[0].device.type == "cuda"
+    # Up pass: delta on cuda:1; supplying the cuda:0 spectrum must NOT crash.
+    delta = torch.randn(d_out, d_in, generator=g, dtype=torch.float32).to("cuda:1")
+    Uc, Vc, take_eff = _compute_eora_factors(
+        delta, A, r, torch.device("cuda:1"),
+        storage_dtype=torch.float32, spectrum=spectrum,
+    )
+    assert Uc.device == torch.device("cuda:1")
+    assert Vc.device == torch.device("cuda:1")

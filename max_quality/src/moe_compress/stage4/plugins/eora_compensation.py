@@ -310,6 +310,19 @@ def _compute_eora_factors(
     if spectrum is None:
         return _plain_svd_padded()
     eigvecs_keep, eigvals_keep, sqrt_lambda, inv_sqrt_lambda = spectrum
+    # A SUPPLIED spectrum (Lever A reuse) may have been computed on a DIFFERENT
+    # device than ``delta`` — on real multi-GPU the gate_proj pass can band
+    # expert ``e`` to a different worker device than the up_proj pass (the two
+    # passes resolve their bands independently from per-matrix eligibility sets,
+    # which differ under partial/resumed Stage-3 originals). Relocate the few
+    # small fp32 spectrum tensors to ``delta``'s device so step 4's
+    # ``delta @ Q_prime`` is never a cross-device matmul. Bit-identical when the
+    # spectrum already lives on ``device`` (``.to`` is a no-op).
+    if eigvecs_keep.device != delta.device:
+        eigvecs_keep = eigvecs_keep.to(device=device)
+        eigvals_keep = eigvals_keep.to(device=device)
+        sqrt_lambda = sqrt_lambda.to(device=device)
+        inv_sqrt_lambda = inv_sqrt_lambda.to(device=device)
 
     # Step 3: Q' = Q · √Λ  (paper Algorithm 1 step 3).
     # FULL projection matrix — NOT truncated to r. The SVD in step 5
@@ -398,12 +411,17 @@ def _solve_expert_tile(
     pure relocation (same kernels on the same arch ⇒ bit-identical).
 
     The gate→up whitening-spectrum memo (Lever A) is threaded as an explicit
-    in/out arg ``gate_spectrum`` so it stays PER-EXPERT and crosses no worker
-    boundary: a worker owning expert ``e`` computes the spectrum on the
-    gate_proj pass (returns it) and RETAINS it for the up_proj pass (the loop
-    is matrix-outer / expert-inner, so the memo must survive the whole gate→up
-    window for that worker — it is NOT intra-solve scratch). down_proj passes
-    ``gate_spectrum=None`` and gets ``None`` back.
+    in/out arg ``gate_spectrum``, keyed PER-EXPERT: a worker computes the
+    spectrum on the gate_proj pass (returns it) and the caller hands it back on
+    the up_proj pass (the loop is matrix-outer / expert-inner, so the memo
+    survives the whole gate→up window). The memo is NOT pinned to a single
+    device: gate_proj and up_proj resolve their worker bands INDEPENDENTLY from
+    per-matrix eligibility (which can differ under partial/resumed Stage-3
+    originals), so the spectrum may arrive on a different device than this
+    pass's ``delta``. ``_compute_eora_factors`` therefore relocates a supplied
+    spectrum to ``target_device`` before use (bit-identical no-op when they
+    already match), so step 4's projection is never a cross-device matmul.
+    down_proj passes ``gate_spectrum=None`` and gets ``None`` back.
 
     Returns
     -------
