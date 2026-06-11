@@ -117,12 +117,15 @@ Arbitrary `device_map` dicts are rejected at `:1406`. **This is the real
 student-side block** — the Stage 3 student is ALWAYS loaded via this function
 (`run_pipeline.py:527-532`, the `stage == 3` branch). → Change: §3.B2.
 
-### B3 — orchestrator threads ONE `device` — `stage3/orchestrator.py:170,224,316-347`
+### B3 — orchestrator threads ONE `device` — `run_pipeline.py:170,305` + `stage3/orchestrator.py:224,316-347`
 ```
 run_pipeline.py:170:    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-orchestrator.py:224:    run_ctx.set("device", device)
+run_pipeline.py:305:    stage3_svd.run(..., device=device, ...)   # the single device enters Stage 3 here
+orchestrator.py:224:    run_ctx.set("device", device)             # threaded onto run_ctx
 orchestrator.py:316-323 / 336-343:  teacher_model = load_model(..., device_map=config["model"]["device_map"], ...)
 ```
+(NB: `orchestrator.py:170` is unrelated — it's `B_acc = InputCovarianceAccumulator()`;
+the `device` definition lives in `run_pipeline.py:170` and is passed in at `:305`.)
 `device` is a non-indexed `cuda` (== `cuda:0` semantics for tensor placement).
 The teacher load already passes `config["model"]["device_map"]` (so it shards),
 but the single `device` is then used to place calibration batches
@@ -259,7 +262,10 @@ keeps working).
   parent sums them. **Reuses the existing spill-to-disk path** (`spill_dir`,
   `ccov_spill_dir`) — each replica spills to its own subdir, parent sums the
   per-layer `.pt` files. This is the elegant move: no live IPC of 5 GB tensors,
-  just disk handoff + a key-wise CPU sum that mirrors the existing resume merge.
+  just disk handoff + a key-wise CPU sum that mirrors `finalize_layer`'s fp32
+  key-wise merge math (`activation_hooks.py:1081-1084`). (The resume path is NOT a
+  precedent for summing — it loads exactly one complete layer file and never sums
+  partials; `_reduce_spilled_cov_dirs` is NEW code, see §3.C/§6.)
 
 ### 2.3 Model-placement split (teacher set A / student set B) — REJECTED as default
 - Caps at 2-way; wastes GPUs ≥3; forces the cross-cov gather onto the hot path
@@ -371,9 +377,11 @@ The multi-device change therefore has **two substeps of different risk**:
   token budget per replica (last replica takes remainder).
 
 ### 3.E `stage3/plugins/block_refine.py` (B8)
-- One-liner: `out = out.to(device)` before `mse_loss` at `:554` (`out` is the
-  student block forward output produced at `:553`; under sharding it lands on the
-  last shard's device). The teacher side is already device-safe: the teacher
+- One-liner: insert `out = out.to(device)` **after `:553`, before `mse_loss` at
+  `:554`**. (`out` is the student block forward output at `:551` —
+  `out = s_layer(...)` — then tuple-unwrapped at `:553` — `out = out[0]`; under
+  sharding it lands on the last shard's device.) The teacher side is already
+  device-safe: the teacher
   block input `x_t` is placed on `device` at `:526` and the teacher target is
   spilled via `out.detach().to(dtype=torch.bfloat16, device="cpu")` at `:533`,
   then re-loaded to `device` at `:550`. Numerically a copy; enables a sharded
