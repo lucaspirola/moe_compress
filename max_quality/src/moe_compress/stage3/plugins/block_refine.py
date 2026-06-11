@@ -551,6 +551,13 @@ def _phase_c5_block_refine(
                 out = s_layer(x_s, **student_kwargs_all.get(layer_idx, {}))
                 if isinstance(out, tuple):
                     out = out[0]
+                # Under accelerate sharding the student block's output lands on
+                # the last shard's device, which may differ from ``device`` (the
+                # device ``target`` lives on). Coerce so mse_loss is single-device.
+                # No-op when already co-located (the single-GPU case). Numerically
+                # a device copy, not a precision change.
+                if out.device != target.device:
+                    out = out.to(target.device)
                 loss = nn.functional.mse_loss(out.to(torch.float32),
                                                target.to(torch.float32))
                 opt.zero_grad(set_to_none=True)

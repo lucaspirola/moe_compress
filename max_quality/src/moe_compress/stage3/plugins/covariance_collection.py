@@ -186,6 +186,92 @@ def _fmt(x):
 
 
 # ---------------------------------------------------------------------------
+# Lever 2 (data-parallel) — cross-replica spill reduce
+# ---------------------------------------------------------------------------
+
+
+def _reduce_spilled_cov_dirs(replica_dirs, out_dir, *, storage_dtype=None) -> list[int]:
+    """Sum per-layer covariance spills from G data-parallel replicas into one
+    canonical spill dir.
+
+    Each replica processed a DISJOINT batch-shard and spilled per-layer files
+    ``layer_{idx}.pt`` in the same on-disk format as
+    :meth:`InputCovarianceAccumulator.spill_layer_to_disk`
+    (``{"format_version": 1, "covariance": {key: tensor}, "tokens": {key: int}}``,
+    key = ``(layer, expert, matrix)``). The Gram accumulator is a linear sum of
+    per-token outer products, so the cross-replica reduce is exactly
+    ``B = Σ_r B_r`` — summed key-wise in **fp32** then cast back to
+    ``storage_dtype``, mirroring ``finalize_layer`` / ``_accumulate_payload``
+    (activation_hooks.py:1081-1084, 1212-1216). Token counts sum exactly
+    (integers).
+
+    Determinism: replica dirs are processed in **sorted** order so a given
+    (replicas, seed) is reproducible run-to-run (§4 determinism knob). Pure CPU.
+
+    Returns the sorted list of layer indices written to ``out_dir``.
+    """
+    replica_dirs = [Path(d) for d in sorted(str(d) for d in replica_dirs)]
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Union of layer indices present across replicas (a replica may legitimately
+    # be missing a layer file only if ALL are — otherwise it's a partial spill
+    # bug we surface by KeyError-free union + per-file existence below).
+    layer_ids: set[int] = set()
+    for d in replica_dirs:
+        for p in d.glob("layer_*.pt"):
+            try:
+                layer_ids.add(int(p.stem.split("_")[1]))
+            except (IndexError, ValueError):
+                continue
+
+    written: list[int] = []
+    for li in sorted(layer_ids):
+        merged_cov: dict = {}
+        merged_tok: dict = {}
+        resolved_dtype = storage_dtype
+        for d in replica_dirs:
+            p = d / f"layer_{li}.pt"
+            if not p.exists():
+                # A replica that saw no tokens for this layer contributes zero;
+                # skip it (its absence is an additive identity).
+                continue
+            payload = torch.load(p, map_location="cpu", weights_only=True)
+            if not isinstance(payload, dict) or "covariance" not in payload:
+                raise RuntimeError(
+                    f"_reduce_spilled_cov_dirs: spill file {p} has unexpected "
+                    f"layout (keys={list(payload.keys()) if isinstance(payload, dict) else 'n/a'})."
+                )
+            for k, t in payload["covariance"].items():
+                if resolved_dtype is None:
+                    resolved_dtype = t.dtype
+                prev = merged_cov.get(k)
+                if prev is None:
+                    merged_cov[k] = t.to(torch.float32)
+                else:
+                    merged_cov[k] = prev + t.to(torch.float32)
+            for k, n in payload.get("tokens", {}).items():
+                merged_tok[k] = merged_tok.get(k, 0) + int(n)
+
+        if not merged_cov:
+            continue
+        if resolved_dtype is None:
+            resolved_dtype = torch.float32
+        out_payload = {
+            "format_version": 1,
+            "covariance": {k: v.to(resolved_dtype) for k, v in merged_cov.items()},
+            "tokens": merged_tok,
+        }
+        out_path = out_dir / f"layer_{li}.pt"
+        tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+        torch.save(out_payload, tmp)
+        import os as _os
+        _os.replace(tmp, out_path)
+        written.append(li)
+    return written
+
+
+# ---------------------------------------------------------------------------
 # Post-prune input covariance (for AA-SVD B matrix)
 # ---------------------------------------------------------------------------
 
@@ -462,6 +548,204 @@ def _collect_covariances(
 
 # Public alias for tests that import the B-only covariance collection path.
 _collect_pruned_input_covariance = _collect_covariances
+
+
+# ---------------------------------------------------------------------------
+# Lever 2 (data-parallel) — replica spawn driver
+# ---------------------------------------------------------------------------
+
+
+def _shard_calib(calib, replicas: int) -> list:
+    """Split the calibration tensor along dim 0 into ``replicas`` contiguous,
+    disjoint shards (last shard takes the remainder). Token-disjoint shards are
+    what make the cross-replica Gram sum exact (B7): each replica owns its own
+    ``token_idx`` space; we never share ``_teacher_hidden`` across replicas, only
+    sum the final per-(layer,expert) Gram matrices.
+    """
+    n = calib.size(0)
+    if replicas <= 1 or n == 0:
+        return [calib]
+    replicas = min(replicas, n)
+    base = n // replicas
+    shards = []
+    start = 0
+    for r in range(replicas):
+        # Last replica absorbs the remainder so every sequence is covered once.
+        end = n if r == replicas - 1 else start + base
+        shards.append(calib[start:end])
+        start = end
+    return shards
+
+
+def _cov_replica_worker(
+    replica_idx: int,
+    visible_devices: str,
+    config: dict,
+    artifacts_dir,
+    student_path: str,
+    shard_start: int,
+    shard_end: int,
+    bcov_replica_dir: str,
+    ccov_replica_dir,
+    cross_cov_enabled: bool,
+    bcov_storage_dtype: str,
+) -> None:
+    """Spawn target: one data-parallel replica. Pins itself to its GPU subset
+    via ``CUDA_VISIBLE_DEVICES``, reloads teacher+student, runs
+    :func:`_collect_covariances` over its contiguous calibration shard, and
+    spills per-layer covariance to its own replica subdir. The parent reduces
+    the replica subdirs key-wise via :func:`_reduce_spilled_cov_dirs`.
+
+    Module-level (picklable) so it is a valid ``torch.multiprocessing`` spawn
+    target. Re-imports inside so the child has a clean import graph.
+    """
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+
+    import torch as _torch
+    from pathlib import Path as _Path
+    from ...utils.calibration import (
+        build_calibration_tensor as _bct,
+        spec_from_config as _spec_from_config,
+        iter_batches as _iter_batches,
+    )
+    from ...utils.model_io import (
+        load_model as _load_model,
+        load_compressed_model as _load_compressed_model,
+        iter_moe_layers as _iter_moe_layers,
+    )
+
+    artifacts_dir = _Path(artifacts_dir)
+    device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+    B_dtype = getattr(_torch, bcov_storage_dtype)
+
+    # Rebuild the SAME calibration tensor, then slice this replica's shard.
+    cal = config["calibration"]
+    spec = _spec_from_config(cal, seed_offset=2)
+    student, tokenizer, _ = _load_compressed_model(
+        student_path,
+        device_map=config["model"]["device_map"],
+        torch_dtype=config["model"]["torch_dtype"],
+        attn_implementation=config["model"].get("attn_implementation", "sdpa"),
+    )
+    calib = _bct(tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache")
+    shard = calib[shard_start:shard_end]
+    batch_size = int(config["stage3_svd"].get("batch_size", 1))
+    batches = _iter_batches(shard, batch_size=batch_size)
+
+    moe_layers = list(_iter_moe_layers(student))
+
+    teacher_model = None
+    teacher_moe_layers = None
+    C_acc = None
+    B_acc = InputCovarianceAccumulator()
+    B_acc.set_storage_dtype(B_dtype)
+    if cross_cov_enabled:
+        teacher_model, _ = _load_model(
+            config["model"]["name_or_path"],
+            revision=config["model"]["revision"],
+            torch_dtype=config["model"]["torch_dtype"],
+            device_map=config["model"]["device_map"],
+            attn_implementation=config["model"]["attn_implementation"],
+            trust_remote_code=config["model"].get("trust_remote_code", False),
+        )
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad_(False)
+        teacher_moe_layers = list(_iter_moe_layers(teacher_model))
+        C_acc = InputCovarianceAccumulator()
+        C_acc.set_storage_dtype(B_dtype)
+
+    _Path(bcov_replica_dir).mkdir(parents=True, exist_ok=True)
+    if ccov_replica_dir is not None:
+        _Path(ccov_replica_dir).mkdir(parents=True, exist_ok=True)
+
+    _collect_covariances(
+        student, moe_layers, batches, B_acc, device=device,
+        spill_dir=_Path(bcov_replica_dir),
+        teacher_model=teacher_model,
+        teacher_moe_layers=teacher_moe_layers,
+        C_acc=C_acc,
+        ccov_spill_dir=_Path(ccov_replica_dir) if ccov_replica_dir is not None else None,
+    )
+
+
+def run_dp_covariance_collection(
+    *,
+    config: dict,
+    artifacts_dir,
+    student_path: str,
+    calib,
+    replicas: int,
+    shards_per_model: int,
+    cross_cov_enabled: bool,
+    bcov_spill_dir,
+    ccov_spill_dir,
+    bcov_storage_dtype: str = "bfloat16",
+) -> None:
+    """Data-parallel Stage-3 covariance collection (lever 2).
+
+    Fan out ``replicas`` child processes (torch.multiprocessing spawn), each
+    pinned to ``shards_per_model`` GPUs via ``CUDA_VISIBLE_DEVICES`` and
+    processing a disjoint contiguous calibration shard into its own per-replica
+    spill subdir; then key-wise sum the subdirs into the canonical
+    ``bcov_spill_dir`` / ``ccov_spill_dir`` so the factor phase reads them
+    exactly like a single-pass (or resume) run.
+    """
+    from pathlib import Path as _Path
+    import torch as _torch
+    import torch.multiprocessing as _mp
+
+    artifacts_dir = _Path(artifacts_dir)
+    shards = _shard_calib(calib, replicas)
+    replicas = len(shards)  # may be clamped by _shard_calib
+
+    bcov_spill_dir = _Path(bcov_spill_dir)
+    ccov_spill_dir = _Path(ccov_spill_dir) if ccov_spill_dir is not None else None
+    store_dtype = getattr(_torch, bcov_storage_dtype)
+
+    bcov_replica_dirs = []
+    ccov_replica_dirs = []
+    spawn_args = []
+    start = 0
+    for r in range(replicas):
+        end = start + shards[r].size(0)
+        # Each replica gets a contiguous, non-overlapping GPU subset.
+        dev_lo = r * shards_per_model
+        dev_hi = dev_lo + shards_per_model
+        visible = ",".join(str(d) for d in range(dev_lo, dev_hi))
+        b_dir = bcov_spill_dir / f"_replica_{r}"
+        c_dir = (ccov_spill_dir / f"_replica_{r}") if ccov_spill_dir is not None else None
+        bcov_replica_dirs.append(b_dir)
+        if c_dir is not None:
+            ccov_replica_dirs.append(c_dir)
+        spawn_args.append(
+            (r, visible, config, str(artifacts_dir), str(student_path),
+             start, end, str(b_dir), (str(c_dir) if c_dir is not None else None),
+             cross_cov_enabled, bcov_storage_dtype)
+        )
+        start = end
+
+    log.info("Stage 3 DP cov: spawning %d replica(s), %d GPU(s)/replica",
+             replicas, shards_per_model)
+    procs = []
+    ctx = _mp.get_context("spawn")
+    for args in spawn_args:
+        p = ctx.Process(target=_cov_replica_worker, args=args)
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(
+                f"Stage 3 DP cov: replica process exited with code {p.exitcode}"
+            )
+
+    log.info("Stage 3 DP cov: reducing %d replica spill dir(s) → canonical spill",
+             replicas)
+    _reduce_spilled_cov_dirs(bcov_replica_dirs, bcov_spill_dir, storage_dtype=store_dtype)
+    if ccov_spill_dir is not None and ccov_replica_dirs:
+        _reduce_spilled_cov_dirs(ccov_replica_dirs, ccov_spill_dir, storage_dtype=store_dtype)
 
 
 def _load_stage2_covariance(path: Path):
