@@ -63,10 +63,18 @@ no-ops at 1 GPU:**
 solve for expert `e`, matrix `name` reads ONLY
 `originals[(li, e, name)]`, `fe.{name}_U[e]`, `fe.{name}_V[e]`, and
 `A_cov[(li, e, gate_or_self)]` — **nothing from any other expert**
-(`eora_compensation.py:522-557`). The only intra-loop shared state is the
+(`eora_compensation.py:522-558`). The only intra-loop shared state is the
 gate→up spectrum memo `gate_spectra` (`eora_compensation.py:494,541-545`), which
 is **per-expert keyed** (`gate_spectra[e]`) and so shards cleanly with the
-expert. There is **no cross-expert reduction** — `U_corr`/`V_corr` are
+expert. **Window note (the loop is MATRIX-OUTER, expert-inner):** `gate_spectra[e]`
+is populated across all N experts during the **gate_proj** pass
+(`eora_compensation.py:543-545`) and consumed across all N experts during a
+**separate up_proj** pass (`:541-542`), surviving the whole gate→up window before
+`.clear()` (`:611-612`). So a worker owning expert `e` must **RETAIN
+`gate_spectra[e]` between the gate-pass wave and the up-pass wave** — the memo is
+NOT intra-solve scratch to drop after the gate solve; it persists across the two
+matrix passes for that expert/worker (§3.A.1's in/out-arg design carries it).
+There is **no cross-expert reduction** — `U_corr`/`V_corr` are
 pre-allocated `[N, ...]` tensors written at disjoint expert rows `U_corr[e]=Uc`
 (`:552-553`). Splitting the `for e in range(N)` loop across devices and gathering
 the rows is **numerically identical to the serial loop** (the rows are
@@ -76,7 +84,7 @@ independent; §4).
 
 ## 1. Verified single-GPU blocks (file:line)
 
-### B1 — Stage 4 holds ONE model on ONE device — `run_pipeline.py:314-317` + `_load_for_stage` fall-through `:581-600`
+### B1 — Stage 4 holds ONE model on ONE device — `run_pipeline.py:317` + `_load_for_stage` fall-through `:581-600`
 ```
 314:    if start <= 4 <= stop and not _skip_intermediate:
 315:        log.info("=== Stage 4 — EoRA ===")
@@ -96,7 +104,7 @@ Either way the Stage 4 model is **single-device**. The experts inherit that
 device: `dev = fe.gate_proj_U.device` (`stage4/orchestrator.py:156`,
 `eora_compensation.py:479`).
 
-### B2 — EoRA compute is serial per (layer, expert, matrix) — `stage4/orchestrator.py:152-198` + `eora_compensation.py:496-560`
+### B2 — EoRA compute is serial per (layer, expert, matrix) — `stage4/orchestrator.py:152-198` + `eora_compensation.py:496-558`
 The orchestrator loops layers with a **plain `for`** (`orchestrator.py:152`):
 ```
 152:    for k, ref in enumerate(layers):
@@ -152,7 +160,7 @@ only post-loop reductions are `res_before_acc`/`res_after_acc`
 (`:518` "These feed ONLY log.info / trackio — never the golden"). → The expert
 loop is data-parallel-trivial; gather is a row-place, not a sum (§4).
 
-### M2 — the factored-model multi-device guard (the CRUX) — `utils/model_io.py:1647-1666`
+### M2 — the factored-model multi-device guard (the CRUX) — `utils/model_io.py:1655` (guard block `:1647-1666`)
 ```
 1655:    if multi_device and meta.get("factored_layers"):
 1656:        log.warning("load_compressed_model: checkpoint ... is already factored ...
@@ -238,7 +246,7 @@ spin-up amortized over ~6000 solves.
   during the CUDA kernel, round-robining experts across devices overlaps the
   kernels. **No spawn, no pickling, no model reload** — the model is already
   in-memory (B1 full-pipeline path). Simplest; preserves the in-memory handoff.
-  Risk: the Python per-token/per-expert glue (`:522-560`) is GIL-bound; if launch
+  Risk: the Python per-token/per-expert glue (`:522-558`) is GIL-bound; if launch
   latency dominates the kernel time the overlap is poor → fall to (b).
 - **(b) `torch.multiprocessing` spawn workers (fallback, mirrors Stage 3).**
   Reuse the **exact pattern** from
@@ -288,14 +296,15 @@ loop verbatim (no device fan-out, no gather indirection). No 1x/2x special-case;
 ## 3. Per-file change list
 
 ### 3.A `stage4/plugins/eora_compensation.py` — the core change (lever 1)
-The per-expert loop (`:522-560`) is refactored into a **device-parallel map** over
+The per-expert loop (`:522-558`) is refactored into a **device-parallel map** over
 experts, behind a worker-count gate. Concretely:
 
 1. **Extract a pure per-expert solve helper** (new module-level function):
    `_solve_expert_tile(name, e, li, W_orig_cpu, U_e_cpu, V_e_cpu, A_cpu,
    r_per_expert, target_device, a_storage_dtype, gate_spectrum=None) ->
    (Uc, Vc, take_eff, gate_spectrum_out)`. Body is **verbatim** the current
-   `:527-557` inner block (delta, spectrum select, `_compute_eora_factors`), just
+   `:523-557` inner block (key/`W_orig` fetch, delta, spectrum select,
+   `_compute_eora_factors`, result row + residual), just
    parameterized by `target_device` instead of the closure `dev`. The gate→up
    memo becomes an explicit in/out arg so it stays per-expert and crosses no
    worker boundary. **This helper is the unit each worker device runs.**
@@ -336,7 +345,8 @@ experts, behind a worker-count gate. Concretely:
 ### 3.C `run_pipeline.py` — no functional change for lever 1
 Stage 4 already receives the in-memory model (full-pipeline) or single-device
 load (resume, via M2 fallback). The new `multi_gpu` block (§5) is read inside the
-Stage 4 orchestrator, not here. **No change to `:314-317` or `_load_for_stage`.**
+Stage 4 orchestrator, not here. **No change to `:317` (the `stage4_eora.run`
+call) or `_load_for_stage`.**
 (If a future epic wants the resume-at-4 model itself sharded, that is the M2
 follow-up — explicitly out of scope, §8.)
 
@@ -368,10 +378,13 @@ reductions are log-only norms (B4). Therefore:
   `test_stage4_golden_snapshot.py` header — so even fp-level drift in factor
   *values* would not move the golden; but on same-arch there is none).
 - **Gate→up spectrum memo invariance.** The memo is per-expert
-  (`gate_spectra[e]`) and travels with expert `e` to its worker device; up_proj
-  reuses gate's spectrum **on the same device** — bit-identical to recompute
-  (the existing Lever-A contract, `eora_compensation.py:280-282`). No worker
-  shares a memo with another worker.
+  (`gate_spectra[e]`) and travels with expert `e` to its worker device, where it
+  **persists across the gate-pass and up-pass waves** for that worker (the loop is
+  matrix-outer/expert-inner, so the memo is held across the whole gate→up window —
+  NOT dropped after the gate solve; §0 window note). up_proj reuses gate's
+  spectrum **on the same device** — bit-identical to recompute (the existing
+  Lever-A contract, `eora_compensation.py:280-282`). No worker shares a memo with
+  another worker.
 - **Cross-arch / CPU-stand-in tolerance.** When a worker "device" is CPU (CI
   stand-in) or a different GPU arch, `eigh`/SVD are NOT bit-identical to the home
   device. Per-expert factor values then differ by floating-point only. Bound:
