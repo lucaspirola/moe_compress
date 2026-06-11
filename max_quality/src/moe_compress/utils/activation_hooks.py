@@ -1460,19 +1460,21 @@ def instrument_experts(
             with torch.no_grad():
                 mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
                 hit = (mask.sum(dim=(-1, -2)) > 0).nonzero()
-            for expert_idx in hit:
-                # hit contains indices from nonzero() on a mask of shape
-                # [num_experts, ...], so e is always in [0, num_experts).
-                e = expert_idx[0]
-                e_int = int(e)  # hoist int() conversion once per expert (L-4)
-                top_k_pos, token_idx = torch.where(mask[e])
+            # hit is [n_hit, 1] in ascending row order; coalesce the per-expert
+            # D2H sync by materialising all expert ids in ONE .tolist() call
+            # rather than int()-ing a 1-element CUDA tensor each iteration (P3).
+            hit_ids = hit[:, 0].tolist()
+            for e_int in hit_ids:
+                # e_int is a Python int in [0, num_experts) (hit indices come
+                # from nonzero() on a mask of shape [num_experts, ...]).
+                top_k_pos, token_idx = torch.where(mask[e_int])
                 sel = hidden_states[token_idx]
                 ctx = {"top_k_weights": top_k_weights[token_idx, top_k_pos],
                        "top_k_pos": top_k_pos, "token_idx": token_idx}
                 _cb("input", e_int, sel, ctx)
                 _cb("gate_up_in", e_int, sel, ctx)
-                gate = F.linear(F.linear(sel, self.gate_proj_V[e]), self.gate_proj_U[e])
-                up   = F.linear(F.linear(sel, self.up_proj_V[e]),   self.up_proj_U[e])
+                gate = F.linear(F.linear(sel, self.gate_proj_V[e_int]), self.gate_proj_U[e_int])
+                up   = F.linear(F.linear(sel, self.up_proj_V[e_int]),   self.up_proj_U[e_int])
                 # Emit a synthetic gate_up_out consistent with the non-factored path.
                 # FactoredExperts computes gate and up via separate low-rank projections
                 # rather than a single fused gate_up_proj, so we concatenate them to
@@ -1480,8 +1482,8 @@ def instrument_experts(
                 _cb("gate_up_out", e_int, torch.cat([gate, up], dim=-1), ctx)
                 intermediate = self.act_fn(gate) * up
                 _cb("intermediate", e_int, intermediate, ctx)
-                down = F.linear(F.linear(intermediate, self.down_proj_V[e]),
-                                self.down_proj_U[e])
+                down = F.linear(F.linear(intermediate, self.down_proj_V[e_int]),
+                                self.down_proj_U[e_int])
                 _cb("down", e_int, down, ctx)
                 down = down * top_k_weights[token_idx, top_k_pos, None]
                 final.index_add_(0, token_idx, down.to(final.dtype))
@@ -1497,23 +1499,25 @@ def instrument_experts(
             with torch.no_grad():
                 mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
                 hit = (mask.sum(dim=(-1, -2)) > 0).nonzero()
-            for expert_idx in hit:
-                # hit contains indices from nonzero() on a mask of shape
-                # [num_experts, ...], so e is always in [0, num_experts).
-                e = expert_idx[0]
-                e_int = int(e)  # hoist int() conversion once per expert (L-4)
-                top_k_pos, token_idx = torch.where(mask[e])
+            # hit is [n_hit, 1] in ascending row order; coalesce the per-expert
+            # D2H sync by materialising all expert ids in ONE .tolist() call
+            # rather than int()-ing a 1-element CUDA tensor each iteration (P3).
+            hit_ids = hit[:, 0].tolist()
+            for e_int in hit_ids:
+                # e_int is a Python int in [0, num_experts) (hit indices come
+                # from nonzero() on a mask of shape [num_experts, ...]).
+                top_k_pos, token_idx = torch.where(mask[e_int])
                 sel = hidden_states[token_idx]
                 ctx = {"top_k_weights": top_k_weights[token_idx, top_k_pos],
                        "top_k_pos": top_k_pos, "token_idx": token_idx}
                 _cb("input", e_int, sel, ctx)
                 _cb("gate_up_in", e_int, sel, ctx)
-                gate_up = F.linear(sel, self.gate_up_proj[e])
+                gate_up = F.linear(sel, self.gate_up_proj[e_int])
                 _cb("gate_up_out", e_int, gate_up, ctx)
                 gate, up = gate_up.chunk(2, dim=-1)
                 intermediate = self.act_fn(gate) * up
                 _cb("intermediate", e_int, intermediate, ctx)
-                down = F.linear(intermediate, self.down_proj[e])
+                down = F.linear(intermediate, self.down_proj[e_int])
                 _cb("down", e_int, down, ctx)
                 down = down * top_k_weights[token_idx, top_k_pos, None]
                 final.index_add_(0, token_idx, down.to(final.dtype))
