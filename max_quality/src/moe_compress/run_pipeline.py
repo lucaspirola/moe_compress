@@ -494,6 +494,7 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path,
             model, tokenizer, _ = load_compressed_model(
                 load_from_override,
                 device_map=config["model"]["device_map"],
+                max_memory=config["model"].get("max_memory"),
                 torch_dtype=config["model"]["torch_dtype"],
                 attn_implementation=student_attn,
             )
@@ -527,6 +528,7 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path,
                 model, tokenizer, _ = load_compressed_model(
                     prev_path,
                     device_map=config["model"]["device_map"],
+                    max_memory=config["model"].get("max_memory"),
                     torch_dtype=config["model"]["torch_dtype"],
                     attn_implementation=student_attn,
                 )
@@ -566,6 +568,7 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path,
                 model, tokenizer, _ = load_compressed_model(
                     prev_path,
                     device_map=config["model"]["device_map"],
+                    max_memory=config["model"].get("max_memory"),
                     torch_dtype=config["model"]["torch_dtype"],
                     attn_implementation=student_attn,
                 )
@@ -590,6 +593,7 @@ def _load_for_stage(stage: int, config: dict, artifacts_dir: Path,
     model, tokenizer, _ = load_compressed_model(
         prev_path,
         device_map=config["model"]["device_map"],
+        max_memory=config["model"].get("max_memory"),
         torch_dtype=config["model"]["torch_dtype"],
         attn_implementation=student_attn,
     )

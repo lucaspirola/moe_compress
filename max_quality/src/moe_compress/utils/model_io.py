@@ -51,6 +51,32 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _resolve_4bit_device_map(device_map):
+    """Resolve a single-device map for a bitsandbytes 4bit load.
+
+    bnb 4bit cannot shard, so a multi-device ``device_map`` is not honorable.
+    Parse a single-device hint from ``device_map`` (the only device signal
+    ``load_model`` receives — it has no ``device`` parameter):
+
+      * single-device dict ``{"": "cuda:1"}`` (or ``{"": 0}``) → reused as-is
+      * ``"cuda:N"`` / ``"cuda"`` / ``"cpu"`` string → wrapped as ``{"": <str>}``
+      * anything else (``"auto"``, ``"balanced"``, multi-entry dict) → ``{"": 0}``
+
+    Returned as a thin seam so a test can assert the resolved map without a real
+    4bit load (§3.A / §7 ``test_load_model_4bit_device_aware``).
+    """
+    if isinstance(device_map, dict):
+        if len(device_map) == 1:
+            return device_map
+        return {"": 0}
+    if isinstance(device_map, str):
+        if device_map in ("auto", "balanced", "balanced_low_0", "sequential"):
+            return {"": 0}
+        # A concrete single-device string like "cuda:1"/"cuda"/"cpu".
+        return {"": device_map}
+    return {"": 0}
+
+
 def load_model(
     name_or_path: str,
     *,
@@ -95,8 +121,17 @@ def load_model(
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
         )
-        if kwargs["device_map"] == "auto":
-            kwargs["device_map"] = {"": 0}
+        # bitsandbytes 4bit cannot shard across devices — it requires a
+        # single-device map. Honor a single-device hint parsed from the
+        # incoming ``device_map`` (the only device signal this function sees;
+        # there is no ``device`` parameter) so a 4bit teacher co-locates with
+        # the caller's chosen device (e.g. ``{"": "cuda:1"}`` or ``"cuda:1"``)
+        # instead of unconditionally pinning to GPU 0. Mirrors
+        # router_kd/plugins/teacher.py's 4bit device resolution. A multi-device
+        # map ("auto"/"balanced"/multi-entry dict) cannot be honored by bnb, so
+        # it falls back to ``{"": 0}`` (documented limitation; the Stage 3
+        # cross-cov teacher is BF16, not 4bit, so this never blocks that run).
+        kwargs["device_map"] = _resolve_4bit_device_map(kwargs["device_map"])
 
     cfg = AutoConfig.from_pretrained(name_or_path, revision=revision, trust_remote_code=trust_remote_code)
     arches = list(getattr(cfg, "architectures", None) or [])
@@ -1372,10 +1407,88 @@ def _assign_storage(model: nn.Module, key: str, tensor: torch.Tensor) -> None:
         )
 
 
+def _no_split_module_classes(model: nn.Module) -> list[str]:
+    """Class names that accelerate must keep whole on one device.
+
+    The MoE experts are fused stacked ``nn.Parameter``s — accelerate cannot
+    split a single stacked parameter — so every decoder layer (and its fused
+    expert stack) must stay intact on one device (H1). Derive the decoder-layer
+    class names from the live tower rather than hard-coding an arch name.
+    """
+    names: set[str] = set()
+    try:
+        tower = _find_text_tower(model)
+        for layer in tower.layers:
+            names.add(type(layer).__name__)
+    except Exception:  # noqa: BLE001 — fall back to empty (accelerate still works)
+        pass
+    return sorted(names)
+
+
+def _build_multidevice_map(model: nn.Module, *, device_map, max_memory) -> dict:
+    """Return a ``module_path -> torch.device`` map for accelerate dispatch.
+
+    An explicit multi-entry ``device_map`` dict is honored verbatim (after
+    canonicalizing its values to ``torch.device``). Otherwise accelerate's
+    ``infer_auto_device_map`` is called on the (CPU-resident, resized) skeleton
+    with ``no_split_module_classes`` set so each fused-expert decoder layer stays
+    whole. ``"auto"``/``"balanced"``/``"sequential"`` choose accelerate's
+    balancing policy; ``max_memory`` overrides per-device budgets.
+    """
+    if isinstance(device_map, dict):
+        return {k: torch.device(str(v)) for k, v in device_map.items()}
+
+    from accelerate.utils import infer_auto_device_map, get_balanced_memory
+
+    no_split = _no_split_module_classes(model)
+    dtype = next((p.dtype for p in model.parameters()), torch.bfloat16)
+    if max_memory is None:
+        max_memory = get_balanced_memory(
+            model,
+            dtype=dtype,
+            low_zero=(device_map in ("auto", "balanced_low_0")),
+            no_split_module_classes=no_split,
+        )
+    inferred = infer_auto_device_map(
+        model,
+        max_memory=max_memory,
+        dtype=dtype,
+        no_split_module_classes=no_split,
+    )
+    # Normalize accelerate's int/str device ids to torch.device.
+    return {mod: torch.device(f"cuda:{d}") if isinstance(d, int) else torch.device(str(d))
+            for mod, d in inferred.items()}
+
+
+def _device_for_key(key: str, resolved_map: dict) -> torch.device:
+    """Resolve a state-dict ``key``'s target device by longest-prefix match
+    against the module-path → device ``resolved_map`` (accelerate's convention).
+
+    A param key like ``model.layers.3.mlp.experts.gate_up_proj`` matches the
+    longest module path in the map that is a dotted prefix of it (``""`` is the
+    catch-all root bucket).
+    """
+    best = None
+    best_len = -1
+    for mod, dev in resolved_map.items():
+        if mod == "":
+            if best_len < 0:
+                best, best_len = dev, 0
+            continue
+        if key == mod or key.startswith(mod + "."):
+            if len(mod) > best_len:
+                best, best_len = dev, len(mod)
+    if best is None:
+        # No match (e.g. an empty map) — fall back to GPU 0 / CPU.
+        return torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    return best
+
+
 def load_compressed_model(
     path: str | Path,
     *,
-    device_map: str = "auto",
+    device_map: str | dict = "auto",
+    max_memory: dict | None = None,
     torch_dtype: str | torch.dtype = "bfloat16",
     attn_implementation: str = "sdpa",
     allow_missing_keys: bool = False,
@@ -1403,10 +1516,37 @@ def load_compressed_model(
     from transformers import AutoConfig, AutoTokenizer
     from safetensors import safe_open
 
-    if device_map not in ("auto", "cuda", "cpu"):
+    # Single-device strings keep the original byte-identical streaming path.
+    # Multi-device requests ("balanced", an explicit multi-entry dict, or a
+    # non-null max_memory) enter the accelerate-sharded branch added below.
+    _SINGLE_DEVICE_STRS = ("auto", "cuda", "cpu")
+    _n_visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    _multi_requested = (
+        isinstance(device_map, dict)
+        or device_map in ("balanced", "balanced_low_0", "sequential")
+        or max_memory is not None
+    )
+    if not _multi_requested and device_map not in _SINGLE_DEVICE_STRS:
         raise ValueError(
             f"load_compressed_model() does not support device_map={device_map!r}; "
-            "use 'auto', 'cuda', or 'cpu'"
+            "use 'auto', 'cuda', 'cpu', 'balanced', an explicit device-map dict, "
+            "or pass max_memory= for accelerate sharding"
+        )
+    # A multi-device request collapses to the single-device path when there are
+    # not ≥2 usable devices (1-GPU / 0-GPU boxes) — boundary invariant §2.4: at
+    # n_gpu<=1 the behavior is byte-identical to today. A forced multi-entry
+    # device-map dict with a CPU bucket is the CI stand-in for a 2nd device and
+    # is honored even at n_gpu<=1 (it names its own devices explicitly).
+    _explicit_multi_dict = (
+        isinstance(device_map, dict)
+        and len({_canonical_device(torch.device(str(v))) for v in device_map.values()}) >= 2
+    )
+    multi_device = _explicit_multi_dict or (_multi_requested and _n_visible >= 2)
+    if _multi_requested and not multi_device:
+        log.info(
+            "load_compressed_model: multi-device device_map=%r requested but only "
+            "%d CUDA device(s) visible — falling back to single-device load.",
+            device_map, _n_visible,
         )
     if device_map == "auto":
         log.debug(
@@ -1451,12 +1591,16 @@ def load_compressed_model(
         dtype = torch_dtype
     # Resolve target device. device_map is used only to distinguish cuda vs cpu:
     # "auto" and "cuda" both stream to CUDA when available, "cpu" forces CPU.
-    # Arbitrary device_map dicts are not supported by the streaming load path.
+    # In the MULTI-device branch the skeleton is built + resized on CPU and the
+    # per-module device routing (computed below from accelerate's
+    # infer_auto_device_map) takes over the streaming + dispatch; ``target_device``
+    # is only the construction/leftover-buffer device there.
     target_device = (
-        torch.device("cuda") if torch.cuda.is_available() and device_map != "cpu"
+        torch.device("cuda")
+        if (not multi_device and torch.cuda.is_available() and device_map != "cpu")
         else torch.device("cpu")
     )
-    if device_map == "cuda" and not torch.cuda.is_available():
+    if not multi_device and device_map == "cuda" and not torch.cuda.is_available():
         log.warning(
             "device_map='cuda' requested but CUDA is not available; falling back to CPU"
         )
@@ -1495,9 +1639,44 @@ def load_compressed_model(
     from transformers.initialization import no_init_weights
     with no_init_weights():
         model = auto_cls.from_config(cfg, torch_dtype=dtype, attn_implementation=attn_implementation)
+    # R1: re-establish the embed_tokens↔lm_head tie BEFORE any device routing or
+    # dispatch. On the multi-device path, dispatch_model is called after streaming
+    # and must observe the already-tied weights so the tie survives placement.
     model.tie_weights()
 
-    _resize_moe_stack_to_metadata(model, meta, dtype=dtype, device=target_device)
+    # M2 out-of-scope guard: an already-factored checkpoint installs
+    # ``FactoredExperts`` whose ``wrapped_factored`` forward chains
+    # ``F.linear(F.linear(sel, V), U)`` with NO ``.to()`` between the two linears.
+    # If V and U landed on different devices under accelerate sharding that chain
+    # would device-mismatch. The Stage-3 student is NOT factored at load time, so
+    # this guard never trips for the motivating run — it protects a Stage-4+
+    # multi-device resume (not covered by this feature). Refuse → fall back to
+    # single-device rather than silently mis-place factored experts.
+    if multi_device and meta.get("factored_layers"):
+        log.warning(
+            "load_compressed_model: checkpoint at %s is already factored "
+            "(factored_layers=%s) — a multi-device map could split a factored "
+            "expert's V/U across devices and device-mismatch its un-coerced "
+            "F.linear chain. Falling back to single-device load.",
+            path, meta["factored_layers"],
+        )
+        multi_device = False
+        target_device = (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        )
+
+    if multi_device:
+        # Resize on CPU (the skeleton holds only zeros — cheap in RAM); the
+        # per-key streaming below routes each real weight to its mapped device
+        # and the per-key CPU zeros are freed as they are replaced, preserving
+        # the one-tensor-on-GPU peak per device.
+        _resize_moe_stack_to_metadata(model, meta, dtype=dtype, device=torch.device("cpu"))
+        resolved_map = _build_multidevice_map(
+            model, device_map=device_map, max_memory=max_memory,
+        )
+    else:
+        _resize_moe_stack_to_metadata(model, meta, dtype=dtype, device=target_device)
+        resolved_map = None
 
     # Stream each tensor one-at-a-time directly into ``target_device``,
     # swapping the existing param/buffer storage in place. Avoids both
@@ -1519,8 +1698,13 @@ def load_compressed_model(
                 "verify these are model shards"
             )
         shards = fallback
-    log.info("Streaming state_dict from %s (%d shards) → %s",
-             path, len(shards), target_device)
+    if multi_device:
+        log.info("Streaming state_dict from %s (%d shards) → %d-device map (%d buckets)",
+                 path, len(shards), len({str(d) for d in resolved_map.values()}),
+                 len(resolved_map))
+    else:
+        log.info("Streaming state_dict from %s (%d shards) → %s",
+                 path, len(shards), target_device)
     # IMPORTANT: harvest the key set without binding the dict. ``state_dict()``
     # internally calls ``param.detach()`` which is ``shallow_copy_and_detach``
     # — the returned dict's values share storage with the originals and bump
@@ -1537,12 +1721,19 @@ def load_compressed_model(
     # config change that introduces a multi-GB single tensor visible in logs.
     max_bytes = 0
     max_key = ""
+    # On the multi-device path we cannot ask safe_open to land every key on one
+    # device — each key has its own mapped device. Open on CPU and move each
+    # tensor to its mapped device individually (one-tensor-on-GPU peak per
+    # device is preserved: the CPU source + CPU skeleton zeros are freed per
+    # key). The single-device path is UNCHANGED (safe_open lands on target).
+    _open_device = "cpu" if multi_device else str(target_device)
+    _saw_cuda = False
     for shard_idx, s in enumerate(shards):
         n_loaded_in_shard = 0
         n_unexpected_in_shard = 0
-        with safe_open(str(s), framework="pt", device=str(target_device)) as f:
+        with safe_open(str(s), framework="pt", device=_open_device) as f:
             for key in f.keys():
-                t = f.get_tensor(key)            # already on target_device
+                t = f.get_tensor(key)            # on _open_device
                 if key not in expected_keys:
                     unexpected_all.append(key)
                     n_unexpected_in_shard += 1
@@ -1553,6 +1744,12 @@ def load_compressed_model(
                 if nbytes > max_bytes:
                     max_bytes = nbytes
                     max_key = key
+                if multi_device:
+                    key_dev = _device_for_key(key, resolved_map)
+                    if key_dev.type == "cuda":
+                        _saw_cuda = True
+                    if _canonical_device(key_dev) != torch.device("cpu"):
+                        t = t.to(key_dev)
                 _assign_storage(model, key, t)
                 loaded_keys.add(key)
                 n_loaded_in_shard += 1
@@ -1560,7 +1757,7 @@ def load_compressed_model(
         log.info("  shard %d/%d: %s (%d loaded, %d unexpected)",
                  shard_idx + 1, len(shards), s.name, n_loaded_in_shard, n_unexpected_in_shard)
         gc.collect()
-        if target_device.type == "cuda":
+        if target_device.type == "cuda" or _saw_cuda:
             torch.cuda.empty_cache()
     log.info("Largest single tensor: %s (%.2f GB)", max_key, max_bytes / 1e9)
 
@@ -1617,6 +1814,36 @@ def load_compressed_model(
         log.debug("Moving non-persistent buffers to %s", canonical_target)
         model.to(canonical_target)
         torch.cuda.empty_cache()
+
+    if multi_device:
+        # Per-device meta-leftover check: assert no param/buffer is still on
+        # meta on ANY device (generalizes the single-device check above). The
+        # streamed params already live on their mapped devices; what remains is
+        # non-persistent buffers (e.g. RoPE inv_freq) still on the CPU skeleton.
+        meta_leftovers = [
+            n for n, p in model.named_parameters() if p.is_meta
+        ] + [
+            n for n, b in model.named_buffers() if b.is_meta
+        ]
+        if meta_leftovers:
+            raise RuntimeError(
+                f"After multi-device streaming load, {len(meta_leftovers)} tensor(s) "
+                f"are still on meta (sample: {meta_leftovers[:5]}). Investigate the "
+                "missing keys reported above."
+            )
+        # R1: re-tie BEFORE dispatch so dispatch_model observes the tie, then
+        # dispatch_model installs the cross-device forward hooks that relocate
+        # activations across layer→layer device boundaries (exactly what
+        # from_pretrained(device_map=...) does internally). This replaces the
+        # single model.to(canonical_target) on the multi-device path.
+        model.tie_weights()
+        from accelerate import dispatch_model
+        dispatch_map = {mod: str(dev) for mod, dev in resolved_map.items()}
+        log.info("Dispatching model across %d device bucket(s) via accelerate",
+                 len({str(d) for d in resolved_map.values()}))
+        model = dispatch_model(model, device_map=dispatch_map)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=trust_remote_code)
     return model, tokenizer, meta

@@ -76,6 +76,30 @@ from .plugins.wanda_scalar_row_cache import Stage3WandaScalarRowCacheProvider
 log = logging.getLogger(__name__)
 
 
+def _resolve_cov_replicas(config: dict) -> tuple[int, int]:
+    """Resolve (effective_replicas, shards_per_model) for lever-2 data-parallel
+    Stage-3 covariance collection.
+
+    ``multi_gpu`` block (all optional; absent ⇒ today's in-process path):
+      * ``cov_replicas`` (default 1): requested DP replica groups.
+      * ``shard_models`` (default True): whether each model spans >1 GPU.
+
+    ``effective_replicas = min(cov_replicas, n_gpu // shards_per_model)`` with a
+    floor of 1 (so n_gpu<=1 ⇒ in-process, byte-identical to today; §2.4 — no
+    1x/2x special-casing). ``shards_per_model`` is currently 1 (a model is
+    replicated whole per replica group); >1 would require co-resolving the
+    sharded device_map and is left to the model-sharding lever.
+    """
+    mg = config.get("multi_gpu") or {}
+    requested = int(mg.get("cov_replicas", 1) or 1)
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    shards_per_model = 1
+    if requested <= 1 or n_gpu < 2:
+        return 1, shards_per_model
+    effective = min(requested, n_gpu // shards_per_model)
+    return max(1, effective), shards_per_model
+
+
 def run(
     model,
     tokenizer,
@@ -172,13 +196,23 @@ def run(
 
     # Cross-covariance C = X_pre^T @ X_post (AA-SVD Theorem 3.2, paper 2604.02119).
     # Requires both the original (teacher) model and the pruned (student) model
-    # to forward the same calibration batch simultaneously. On H200 (141 GB VRAM):
-    # original BF16 (~70 GB) + pruned BF16 (~50 GB) = ~120 GB, leaving ~21 GB
-    # for activations and covariance accumulation.
+    # to forward the same calibration batch simultaneously. On a SINGLE H200
+    # (141 GB VRAM): original BF16 (~70 GB) + pruned BF16 (~50 GB) = ~120 GB,
+    # leaving ~21 GB for activations + covariance accumulation — which caps
+    # batch_size at ~4. The multi-GPU lever (config ``model.device_map: balanced``
+    # / ``multi_gpu``) shards both models across N visible GPUs so weight VRAM
+    # drops ~N-fold per card, freeing activation headroom for a larger
+    # batch_size (the achievable ceiling is activation-bound on the hot layer's
+    # device and is MEASURED on the first sharded run, not assumed).
     cross_cov_enabled = s3.get("aa_svd", {}).get("cross_covariance", True)
     C_acc: InputCovarianceAccumulator | None = None
     teacher_model = None
     teacher_moe_layers = None
+
+    # Lever 2 (data-parallel) replica resolution. Auto-detects from
+    # torch.cuda.device_count(); _dp_replicas==1 ⇒ today's in-process path
+    # (byte-identical). Only engages on the no-resume collection branch below.
+    _dp_replicas, _dp_shards_per_model = _resolve_cov_replicas(config)
 
     # One-shot Trackio emit: AA-SVD path indicator. All values in scope.
     _trackio_log({
@@ -312,6 +346,64 @@ def run(
         # ~60 s / 70 GB load only when block_refine is off.
         if bool(s3.get("block_refine", {}).get("enabled", False)):
             log.info("Stage 3: resume + block_refine -- loading original model "
+                     "for Phase C.5 anchored objective")
+            teacher_model, _ = _stage3_svd.load_model(
+                config["model"]["name_or_path"],
+                revision=config["model"]["revision"],
+                torch_dtype=config["model"]["torch_dtype"],
+                device_map=config["model"]["device_map"],
+                attn_implementation=config["model"]["attn_implementation"],
+                trust_remote_code=config["model"].get("trust_remote_code", False),
+            )
+            teacher_model.eval()
+            for p in teacher_model.parameters():
+                p.requires_grad_(False)
+            teacher_moe_layers = list(iter_moe_layers(teacher_model))
+    elif _dp_replicas > 1:
+        # Lever 2 (data-parallel): fan out G replica processes over disjoint
+        # calibration shards, each spilling per-layer covariance to its own
+        # subdir; the parent key-wise sums them into the canonical spill dirs.
+        # The factor phase then lazy-loads from those spill dirs exactly like a
+        # single-pass / resume run, so NO in-process collection runs here.
+        from .plugins.covariance_collection import run_dp_covariance_collection
+        log.info("Stage 3: data-parallel covariance collection -- %d replica(s), "
+                 "%d GPU(s)/replica (cross_cov=%s)",
+                 _dp_replicas, _dp_shards_per_model, cross_cov_enabled)
+        # Resolve the student checkpoint path (same precedence as run_pipeline's
+        # Stage-3 input resolution) so each replica reloads it independently.
+        _student_path = None
+        for _cand in ("stage2p5_final", "stage2_pruned"):
+            _p = artifacts_dir / _cand
+            if _p.exists():
+                _student_path = _p
+                break
+        if _student_path is None:
+            raise FileNotFoundError(
+                "Stage 3 DP cov: cannot locate the student checkpoint "
+                "(neither stage2p5_final/ nor stage2_pruned/ under "
+                f"{artifacts_dir}) for replica reload."
+            )
+        run_dp_covariance_collection(
+            config=config,
+            artifacts_dir=artifacts_dir,
+            student_path=_student_path,
+            calib=calib,
+            replicas=_dp_replicas,
+            shards_per_model=_dp_shards_per_model,
+            cross_cov_enabled=cross_cov_enabled,
+            bcov_spill_dir=bcov_spill_dir,
+            ccov_spill_dir=ccov_spill_dir,
+            bcov_storage_dtype=s3.get("bcov_storage_dtype", "bfloat16"),
+        )
+        # Re-create C_acc so the factor phase can lazy-load the merged cross-cov
+        # spill (mirrors the resume branch above).
+        if cross_cov_enabled:
+            C_acc = InputCovarianceAccumulator()
+            C_acc.set_storage_dtype(B_cov_dtype)
+        # Load the parent teacher only if Phase C.5 (block_refine) needs it; the
+        # collection itself was done by the child replicas.
+        if bool(s3.get("block_refine", {}).get("enabled", False)):
+            log.info("Stage 3: DP + block_refine -- loading original model in parent "
                      "for Phase C.5 anchored objective")
             teacher_model, _ = _stage3_svd.load_model(
                 config["model"]["name_or_path"],

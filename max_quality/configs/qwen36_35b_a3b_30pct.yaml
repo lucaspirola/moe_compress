@@ -11,10 +11,22 @@ model:
   trust_remote_code: false        # transformers>=5.3 has native qwen3_5_moe
   # For the 16 GB local smoke runs: switch these on in a sibling config.
   load_in_4bit: false
-  device_map: auto                # uses accelerate; on H200 everything fits on 1 GPU
+  device_map: auto                # auto|balanced|cpu|cuda|{explicit dict}; uses accelerate.
+                                  # On 1 H200 everything fits on 1 GPU. For N>1 GPUs use
+                                  # `balanced` (even split, max Stage-3 batch headroom).
+  max_memory: null                # optional per-device budget for accelerate sharding,
+                                  # e.g. {0: "70GiB", 1: "70GiB"}; null = auto-balanced.
   attn_implementation: sdpa       # DeltaNet layers ignore this; full_attention uses it
                                   # NOTE: Stage 6 forces attn_implementation="eager" (spec F-S-M-1)
                                   # for both teacher + student during the gate run regardless of this.
+
+# Multi-GPU Stage-3 covariance collection (entirely optional; absent block OR
+# n_gpu<=1 ⇒ behavior byte-identical to today). See PLAN_MULTIGPU_STAGE3.md.
+multi_gpu:
+  shard_models: true              # lever 1: let device_map span all visible GPUs
+  cov_replicas: 1                 # lever 2: data-parallel replica groups for Stage-3 cov.
+                                  #   1 = in-process (today). >1 = spawn DP over batch shards.
+                                  #   effective = min(cov_replicas, n_gpu // shards_per_model)
 
 target:
   # Total parameter reduction (measured, not estimated) the pipeline must hit.
