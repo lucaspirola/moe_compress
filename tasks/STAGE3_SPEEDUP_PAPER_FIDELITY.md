@@ -12,13 +12,19 @@ numbers are from that `pdftotext` output (verified, not from memory/WebFetch).
 
 | arXiv | Name | What Stage-3 cites it for | Touched by |
 |-------|------|---------------------------|-----------|
-| **2604.02119** | AA-SVD: Activation-Aware SVD | Theorem 3.2 cross-cov `C = X_pre^T X_post`; Algorithm 1 (CompressLayer); Algorithm 2 §3.3 (block-wise + refinement) | A1, A4, A6 |
+| **2604.02119** | AA-SVD: Anchored and Adaptive SVD | Theorem 3.2 cross-cov `C = X_pre^T X_post`; Algorithm 1 (CompressLayer); Algorithm 2 §3.3 (block-wise + refinement) | A1, A4, A6 |
 | **2604.01609** | Swift-SVD / Swift-SVD+ | §3.2.2 + Algorithm 2 — dynamic-rank candidate **grid search**, select by validation PPL | A2 |
 
 Code cites verified with `grep -n`:
 `aa_svd_factor.py:1,6,12,166,222,244` (Thm 3.2 / arXiv:2604.02119);
 `covariance_collection.py:1,6,8,197,300-304,806` (`C = X_pre^T X_post`);
 `swift_svd_alpha.py:6,7,187,576,695,1053` (Swift-SVD §3.2.2 / Alg 2).
+
+> Pre-existing code-doc error to fix separately (NOT introduced here): the
+> `swift_svd_alpha.py:5-6` module docstring titles 2604.01609 "Singular-Value
+> Decomposition with Energy-Aware Layer-wise Pruning"; the real paper is
+> **Swift-SVD** (the §3.2.2 / Algorithm 2 grid-search content the code relies on
+> is correct — only the title string is wrong). Out of scope for this audit.
 
 ### Verified paper definitions relied on below
 
@@ -84,22 +90,24 @@ activations are the same numbers**.
 **Accumulator side — byte-identical (verified).** `update_cross` is
 `cur.add_(cross_f32)` keyed by `(layer,expert,matrix)`
 (`activation_hooks.py:1042-1052`); `update` (B-cov) is the analogous additive sum
-(`:1016-1018`). Teacher/student token matching uses a **batch-local**
-`_teacher_hidden` dict that is `.clear()`-ed every batch
+(`cur.add_(cov)` at `:1020`, region `:1015-1021`). Teacher/student token matching
+uses a **batch-local** `_teacher_hidden` dict that is `.clear()`-ed every batch
 (`covariance_collection.py:469,492`), so there is no cross-layer or cross-batch
 token-id collision when many layers are hooked at once. Per key, the additive
 order over (batch, token) is identical whether 1 or N layers are hooked, and
 `finalize_layer` casts to storage-dtype once per key in both schemes
-(`activation_hooks.py:1054-1070`). **At the accumulator level the doc's
+(`activation_hooks.py:1054-1084`). **At the accumulator level the doc's
 byte-identical claim holds.**
 
 **The real risk — instrumentation changes the forward numerics, and A1 changes
 WHICH layers are instrumented.** `instrument_experts` does not merely observe; it
-**replaces** the experts' `forward` with a per-expert Python loop
-(`activation_hooks.py:1491-1521`) that recomputes gate/up/down via `F.linear`
-and re-assembles the output with `index_add_` (`:1518-1519`). This is
-*mathematically* the same map as the native fused/grouped GEMM but with a
-**different fp reduction order**, so its output is equal only up to fp rounding.
+**replaces** the experts' `forward` (contextmanager `activation_hooks.py:1407-1529`;
+the `wrapped_factored`/`wrapped_fused` twins span `:1453-1525`, restore at `:1529`)
+with a per-expert Python loop that recomputes gate/up/down via `F.linear` and
+re-assembles the output with `index_add_` (fused branch `:1491-1521`, factored
+branch `:1453-1488`). This is *mathematically* the same map as the native
+fused/grouped GEMM but with a **different fp reduction order**, so its output is
+equal only up to fp rounding.
 
 - **Current N-pass design:** when collecting layer L, *only* layer L is
   instrumented (`covariance_collection.py:474-486`). Layers `0..L-1` — whose
@@ -116,9 +124,13 @@ This is *not* a paper-definition break — both schemes still compute
 contamination: the keying + per-batch teacher clear guarantee each captured row
 is matched to its own layer and token). It is a **numerical-reproducibility**
 risk: A1's covariances differ from the current pipeline's at the fp-rounding
-level, which can perturb the downstream `eigh`/rank decision (the project's own
-notes flag fp16-vs-bf16 cov storage as able to *flip ranks* — i.e. this pipeline
-is rank-sensitive to small cov perturbations).
+level, which *could* perturb the downstream `eigh`/rank decision. Note this
+sensitivity is a **plausibility belief, not a measured rank flip**: the only
+evidence is a spot-check note (`covariance_collection.py:106-109`) that fp16 cov
+storage gave "cleaner Stage 3 rank-deficiency outcomes than bf16 **in spot
+checks**" — and even there "**without measurable downstream PPL / zero-shot
+drift**." So the prudent stance is "rank map is the output to re-check," not "ranks
+are known to flip."
 
 **Per-layer pre/post pairing is preserved (the question asked).** Yes: hooking
 many layers simultaneously still captures, for each layer L, that layer's own
@@ -238,7 +250,7 @@ fp-tolerance equal, not bit-exact.**
 
 | ID | Verdict | One-line reason |
 |----|---------|-----------------|
-| **A1** | **FIDELITY-RISK / NEEDS CARE** | Pairing & accumulator are correct, but hooking upstream layers swaps their forward to the Python expert-loop, perturbing the residual stream → cov values differ from today's at fp level (rank-sensitive). Make safe by capturing-only (A7 first) OR re-validating ranks and not claiming bit-identical. |
+| **A1** | **FIDELITY-RISK / NEEDS CARE** | Pairing & accumulator are correct, but hooking upstream layers swaps their forward to the Python expert-loop, perturbing the residual stream → cov values differ from today's at fp level (rank impact plausible per a spot-check note, not a measured flip). Make safe by capturing-only (A7 first) OR re-validating ranks and not claiming bit-identical. |
 | **A2** | **PAPER-FAITHFUL** | `_precompute_eigh` is alpha/k-independent; caching it across the 11 candidates gives bit-identical factors and the same argmin-PPL configuration the paper defines. |
 | **A4** | **PAPER-FAITHFUL** (honor 2 invariants) | `index_select` reproduces the same matched `X_pre` rows → same `C`, **iff** the missing-token membership filter and matched-row `n_tokens` count are preserved. |
 | **A6** | **PAPER-FAITHFUL** | Covariance is a per-token sum (Thm 3.2: cost independent of token count); larger batch only regroups the sum. fp-order equal, not bit-exact — already accepted. |
@@ -250,8 +262,11 @@ layers keep the native forward, after which A1 also becomes byte-identical.
 
 **Single biggest fidelity risk:** A1's switch of upstream MoE layers from the
 native fused forward to the per-expert Python-loop forward
-(`activation_hooks.py:1491-1521`). It does not break Theorem 3.2's per-layer
+(`activation_hooks.py:1453-1525`). It does not break Theorem 3.2's per-layer
 pre/post pairing (that is preserved), but it perturbs the captured covariances at
-the fp level in a pipeline whose own rank decisions are documented to flip under
-small covariance perturbations — so A1 must not be shipped as "byte-identical"
-without either the capture-only hook or a rank re-validation on a real arm.
+the fp level. The downstream rank impact is **plausible but unmeasured** — the
+supporting evidence is a spot-check note (`covariance_collection.py:106-109`,
+fp16-vs-bf16 cov storage), not a demonstrated rank flip, and that same note saw
+no measurable PPL / zero-shot drift. The conclusion is conservative regardless:
+A1 must not be shipped as "byte-identical" without either the capture-only hook
+or a rank re-validation on a real arm.
