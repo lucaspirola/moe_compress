@@ -348,6 +348,59 @@ def _resolve_cov_window(config: dict, n_layers: int) -> int:
     return g
 
 
+def _resolve_cov_batch_size(s3: dict) -> int:
+    """Resolve the cov-collection batch size (A6).
+
+    Reads the cov-specific ``stage3_svd.cov_batch_size`` key, defaulting to the
+    inherited ``stage3_svd.batch_size`` (default 1) so the 1-GPU golden is
+    untouched (the golden was generated at ``batch_size``):
+
+      * absent              → inherits ``batch_size`` (no behavior change).
+      * explicit int / str  → passes through (operator opt-in on a sharded box).
+      * ``"auto"``          → on a real ≥2-GPU sharded box, probe free VRAM and
+        pick a conservative bs; on CPU / 1-GPU it DEGRADES to the inherited
+        ``batch_size`` (NO raise), keeping the 1-GPU golden byte-identical.
+
+    A6 is NOT byte-identical across batch sizes: re-partitioning tokens across
+    the ``flat.T @ flat`` GEMM vs ``add_`` partials changes the fp32-summation
+    GROUPING (fp-reassociation), the same class of noise as a GEMM-backend
+    change — far below signal but not bit-equal. Hence the DEFAULT preserving
+    the value is what keeps the golden safe, not byte-neutrality of the knob.
+
+    Compound-peak constraint (plan M2): the A1×A4×A6 dense-teacher peak is
+    ``G · cov_bs · seq · d_in · 4`` bytes per hot device (every G window layer
+    holds a full ``[T, d_in]`` fp32 teacher tensor, T = cov_bs·seq). The
+    ``"auto"`` raise MUST budget THIS, not just the forward activation, or it
+    can OOM the hot device precisely when it raises bs. The VRAM-measured raise
+    is DEFERRED to a real ≥2-GPU box; until then ``"auto"`` returns the
+    inherited value, so this resolver never raises bs off-box.
+    """
+    inherited = int(s3.get("batch_size", 1))
+    req = s3.get("cov_batch_size", inherited)
+    if req is None:
+        return inherited
+    if isinstance(req, str):
+        if req.strip().lower() == "auto":
+            # DEFERRED: VRAM-measured raise only on a real ≥2-GPU sharded box.
+            # The per-sample cost (GB/sample) and the compound dense-teacher
+            # peak (G·cov_bs·seq·d_in·4) must be measured live before raising;
+            # off-box (CPU / 1-GPU) degrade to the inherited value (no raise).
+            try:
+                if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+                    # Multi-GPU auto-raise is gated on a live per-sample
+                    # measurement (Deferred). Until that lands, return the
+                    # inherited value so we never OOM the hot device.
+                    return inherited
+            except Exception:                            # noqa: BLE001
+                return inherited
+            return inherited
+        try:
+            return int(req)
+        except ValueError:
+            return inherited
+    return int(req)
+
+
 # ---------------------------------------------------------------------------
 # Post-prune input covariance (for AA-SVD B matrix)
 # ---------------------------------------------------------------------------
@@ -813,7 +866,12 @@ def _cov_replica_worker(
     )
     calib = _bct(tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache")
     shard = calib[shard_start:shard_end]
-    batch_size = int(config["stage3_svd"].get("batch_size", 1))
+    # A6: DP replica reads the SAME cov-specific key as the in-process path so
+    # the two agree (cross-replica Gram sum is bs-independent — finalized
+    # per-key Grams are summed). ``config["stage3_svd"]`` is this site's own
+    # local dict (review L2); the resolver defaults to the inherited
+    # ``batch_size`` (golden untouched).
+    batch_size = _resolve_cov_batch_size(config["stage3_svd"])
     batches = _iter_batches(shard, batch_size=batch_size)
 
     moe_layers = list(_iter_moe_layers(student))

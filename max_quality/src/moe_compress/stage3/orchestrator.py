@@ -191,7 +191,12 @@ def run(
     calib = cal_mod.build_calibration_tensor(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache"
     )
-    bcov_batch_size = int(s3.get("batch_size", 1))
+    # A6: cov-specific batch size. Defaults to the inherited ``batch_size`` so
+    # the 1-GPU golden is untouched; an operator can raise ``cov_batch_size`` on
+    # a sharded box (or set ``"auto"``, which degrades to the inherited value
+    # off a real ≥2-GPU box). See ``_resolve_cov_batch_size``.
+    from .plugins.covariance_collection import _resolve_cov_batch_size
+    bcov_batch_size = _resolve_cov_batch_size(s3)
     batches = iter_batches(calib, batch_size=bcov_batch_size)
     B_cov_dtype = getattr(torch, s3.get("bcov_storage_dtype", "bfloat16"))
 
