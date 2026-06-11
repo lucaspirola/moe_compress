@@ -549,7 +549,7 @@ def test_a7_capture_matches_instrument_single_layer(tiny_model):
             ), f"gate_proj key {k} must be bit-identical (pure gather)"
 
 
-def _collect_windowed(model_factory, batches, *, G, cross):
+def _collect_windowed(model_factory, batches, *, G, cross, cross_impl="dense"):
     """Run A7 cov collection at window size ``G`` and return (B, C) accumulators."""
     import copy
     from moe_compress.utils.model_io import iter_moe_layers
@@ -568,11 +568,48 @@ def _collect_windowed(model_factory, batches, *, G, cross):
         model, moe, batches, B, device=torch.device("cpu"),
         teacher_model=teacher, teacher_moe_layers=tmoe, C_acc=C,
         cov_window_size=G, cov_capture_mode="capture",
+        cov_cross_impl=cross_impl,
     )
     B.finalize_all()
     if C is not None:
         C.finalize_all()
     return B, C
+
+
+def test_a4_cross_cov_dense_equals_dict(tiny_model):
+    """A4: the dense ``index_select`` cross-cov path is BYTE-IDENTICAL
+    (``torch.equal``, atol=0) to the legacy ``{token_idx → row}`` dict path on
+    CPU per C key. Exercised across G ∈ {1, 2, N} (window independence) — G ≥ 2
+    additionally hooks multiple MoE layers SIMULTANEOUSLY, covering the
+    per-layer ``teacher_dense[li]`` separation. B keys are also checked equal
+    (the B path is impl-independent but must not regress)."""
+    from moe_compress.utils.model_io import iter_moe_layers
+
+    torch.manual_seed(13)
+    batches = [torch.randint(0, 32, (2, 8)) for _ in range(3)]
+    n_layers = len(list(iter_moe_layers(tiny_model)))
+    sizes = sorted({1, 2, n_layers})
+
+    for G in sizes:
+        B_dict, C_dict = _collect_windowed(
+            tiny_model, batches, G=G, cross=True, cross_impl="dict"
+        )
+        B_dense, C_dense = _collect_windowed(
+            tiny_model, batches, G=G, cross=True, cross_impl="dense"
+        )
+        assert set(C_dict.covariance) == set(C_dense.covariance), \
+            f"G={G}: C key sets differ dict vs dense"
+        for k in C_dict.covariance:
+            assert torch.equal(
+                C_dict.covariance[k].to(torch.float32),
+                C_dense.covariance[k].to(torch.float32),
+            ), f"G={G}: C dense != dict at {k}"
+        assert set(B_dict.covariance) == set(B_dense.covariance)
+        for k in B_dict.covariance:
+            assert torch.equal(
+                B_dict.covariance[k].to(torch.float32),
+                B_dense.covariance[k].to(torch.float32),
+            ), f"G={G}: B dense != dict at {k}"
 
 
 def test_a1_windowed_equals_perlayer(tiny_model):
