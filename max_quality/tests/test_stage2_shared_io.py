@@ -18,7 +18,8 @@ from moe_compress.stage2.resume import (
     ResumedLayerRecord,
     discover_completed_layers,
 )
-from moe_compress.stage2.shared_io import _write_merge_json
+from moe_compress.stage2.shared_io import _snapshot_neuron_means_layer, _write_merge_json
+from moe_compress.utils.activation_hooks import ReamCostAccumulator
 
 
 # ---------------------------------------------------------------------------
@@ -231,3 +232,47 @@ def test_discover_flags_heal_weights_when_enabled_and_present(tmp_path: Path):
     assert discover_completed_layers(partial_dir, refs, heal_enabled=False)[0].has_heal_weights_file is False
     # heal_enabled=True + file present → True.
     assert discover_completed_layers(partial_dir, refs, heal_enabled=True)[0].has_heal_weights_file is True
+
+
+# ---------------------------------------------------------------------------
+# Dropped-clone byte-identity (commit C2): shared_io P6 + resume P7
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_neuron_means_dropped_clone_is_byte_identical(tmp_path: Path):
+    """C2/P6+P7: snapshot→restore round-trip is byte-identical with the clones dropped.
+
+    P6 (shared_io:119): ``(s / c).contiguous()`` (no ``s.clone()``) must equal the
+    freshly-cloned reference ``(s.clone() / c).contiguous()`` — ``s`` is read-only.
+    P7 (resume:226): storing the loaded ``mean_tensor`` directly (no ``.clone()``)
+    must equal ``mean_tensor.clone()`` and survive the ``get_neuron_mean`` round-trip.
+    """
+    partial_dir = tmp_path / "_stage2_partial"
+    partial_dir.mkdir()
+
+    layer_idx = 0
+    acc = ReamCostAccumulator()
+    sums = {0: torch.arange(4, dtype=torch.float32), 1: torch.tensor([2.0, 4.0, 6.0, 8.0])}
+    counts = {0: 2, 1: 4}
+    for eid in sums:
+        acc._neuron_act_sum[(layer_idx, eid)] = sums[eid]
+        acc._neuron_act_count[(layer_idx, eid)] = counts[eid]
+
+    _snapshot_neuron_means_layer(acc, layer_idx, partial_dir)
+
+    saved = torch.load(partial_dir / f"_neuron_means_layer{layer_idx}.pt", weights_only=False)
+    assert saved["format_version"] == 1
+    means = saved["neuron_means"]
+    for eid in sums:
+        # P6: dropped-clone quotient == freshly-cloned reference, bit for bit.
+        ref = (sums[eid].clone() / counts[eid]).contiguous()
+        assert torch.equal(means[eid], ref)
+
+    # P7: restore mean_tensor WITHOUT clone; get_neuron_mean reproduces the saved mean.
+    restore = ReamCostAccumulator()
+    for eid, mean_tensor in means.items():
+        restore._neuron_act_sum[(layer_idx, eid)] = mean_tensor  # no .clone()
+        restore._neuron_act_count[(layer_idx, eid)] = 1
+    for eid in sums:
+        got = restore.get_neuron_mean(layer_idx, eid)
+        assert torch.equal(got, means[eid].clone())

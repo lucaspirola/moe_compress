@@ -223,7 +223,7 @@ def discover_completed_layers(
                 # preserves equality and avoids serializing both tensors.
                 for eid_str, mean_tensor in nm_payload["neuron_means"].items():
                     eid = int(eid_str)
-                    resume_ream_acc._neuron_act_sum[(ref.layer_idx, eid)] = mean_tensor.clone()
+                    resume_ream_acc._neuron_act_sum[(ref.layer_idx, eid)] = mean_tensor
                     resume_ream_acc._neuron_act_count[(ref.layer_idx, eid)] = 1
             except Exception as _exc:
                 log.warning(

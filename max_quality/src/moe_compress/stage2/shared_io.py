@@ -116,7 +116,7 @@ def _snapshot_neuron_means_layer(
             c = ream_acc._neuron_act_count.get(k, 0)
             if c == 0:
                 continue
-            means[k[1]] = (s.clone() / c).contiguous()
+            means[k[1]] = (s / c).contiguous()
     if not means:
         return
     payload = {"format_version": 1, "neuron_means": means}
