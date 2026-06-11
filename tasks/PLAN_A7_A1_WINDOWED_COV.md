@@ -276,6 +276,17 @@ A7 registers, per hooked experts module, on the **native** forward:
    Either way the captured `intermediate` is byte-identical to the native bmm
    result (same op, same gather), satisfying §2.1's down_proj requirement.
 
+   **Zero-pad cancellation (why mirroring the padded bmm shape is safe).** The
+   native `inter` (`model_io.py:985`) is **padded** `[n_active, max_tokens, d_int]`
+   with zero pad rows (`silu(0)*0 = 0`), whereas the loop's `intermediate`
+   (`activation_hooks.py:1481`) is **un-padded** per expert. But `B_acc.update`
+   reshapes to `(-1, d_int)` (`activation_hooks.py:1003`) and forms `flatᵀ@flat`
+   (`:1012`) — the zero pad rows contribute **zero** outer-products, so the padded
+   (native bmm) recompute and the un-padded loop yield an **IDENTICAL** down_proj
+   Gram. This is *why* the A7 recompute may safely use the native bmm shape; the
+   §7.1 byte-match unit test should therefore feed the padded `inter` (zero rows
+   included) and still assert exact equality.
+
 3. **No output capture is needed for cov** (the loop's `down`/`gate_up_out`
    callbacks are unused by the collector). So A7 is genuinely "input + intermediate
    capture only"; the experts' real output (the residual contribution) flows
@@ -339,8 +350,12 @@ rows for the duration of one batch's student forward:
 ### 4.3 VRAM auto-sizing of G
 
 G is bounded by the activations that must be **simultaneously resident** for one
-windowed batch. Auto-size by the same pattern as `_resolve_cov_replicas`
-(`orchestrator.py:79-100`):
+windowed batch. Auto-size with a **new** `_resolve_cov_window(config, devices)`
+that follows the config-resolution *shape* of `_resolve_cov_replicas`
+(`orchestrator.py:79-100`) but **adds a VRAM probe** — `_resolve_cov_replicas` is
+config-ONLY (no probe). The probe uses `torch.cuda.mem_get_info()` (already used at
+`utils/runtime_monitor.py:78`), a NEW mechanism, not a mirror of the existing
+config-only resolver:
 
 - Probe free VRAM via `torch.cuda.mem_get_info()` per device.
 - Estimate per-layer hook residency: for the captured batch, the dominant terms
@@ -357,9 +372,12 @@ windowed batch. Auto-size by the same pattern as `_resolve_cov_replicas`
   only after the last batch. To bound the persistent cov term, spill is per-layer
   at window end (reuse the existing background spill executor `:430-436, :505-518`).
   The teacher-hidden RAM (host, not VRAM) from §4.2 is the other knob.
-- Config: add `multigpu.cov_window_size` (int, default `auto`); `auto` →
-  VRAM-probe; explicit int → clamp to `[1, N]`. Default behavior with the key
-  absent = `G=1` native (clean degrade, NOT current golden — documented).
+- Config: add `multi_gpu.cov_window_size` (int, default `auto`) — under the
+  **`multi_gpu`** block that `_resolve_cov_replicas` already reads
+  (`orchestrator.py:93` `config.get("multi_gpu")`, `cov_replicas` at `:94`), NOT a
+  separate `multigpu` block (which does not exist → would silently default G=1).
+  `auto` → VRAM-probe; explicit int → clamp to `[1, N]`. Default behavior with the
+  key absent = `G=1` native (clean degrade, NOT current golden — documented).
 
 ### 4.4 Compose with multi-GPU (DP + sharding, already landed)
 
@@ -373,8 +391,11 @@ windowed batch. Auto-size by the same pattern as `_resolve_cov_replicas`
   (windowing changes *which layers* are hooked per pass, not *which tokens* a
   replica owns). ✅
 - **Model sharding** (`device_map="auto"`): A7's per-row `.to(tgt_device)`
-  coercion (`covariance_collection.py:396-399`) and the accumulator's
-  `.to(device=cur.device)` (`activation_hooks.py:1051`) already handle teacher/
+  coercion (`covariance_collection.py:396-399` — NOTE: the implementer should trust
+  this cite, NOT the stale `test_multigpu_stage3.py:171` comment which still points
+  at `covariance_collection.py:310-313`; pre-existing repo line drift, the real
+  coercion is `:396-399`) and the accumulator's `.to(device=cur.device)`
+  (`activation_hooks.py:1051`) already handle teacher/
   student on different GPUs; A1 inherits this unchanged. Larger G raises per-card
   activation residency → feeds the §4.3 VRAM probe per device. A6 (bigger batch)
   competes with G for the same VRAM; the auto-sizer must budget both.
@@ -389,9 +410,9 @@ windowed batch. Auto-size by the same pattern as `_resolve_cov_replicas`
 | File | Change |
 |------|--------|
 | `utils/activation_hooks.py` | **New** `capture_experts(layer_ref, callbacks, *, capture_intermediate: bool)` contextmanager: registers `forward_pre_hook(with_kwargs=True)` that re-derives `(token_idx, top_k_pos)` via the same `one_hot/where`, fires `input`/`gate_up_in` with `sel`, and (if `capture_intermediate`) recomputes `intermediate` in the **native bmm/GEMM shape** to fire `intermediate`; `.remove()` on exit. Assert the module is not already `instrument_experts`-patched (`:1438`). Does NOT touch `instrument_experts` (kept as fallback). |
-| `stage3/plugins/covariance_collection.py` | (1) `_collect_covariances`: replace per-layer outer loop (`:449`) with a windowed loop over `_iter_windows(moe_layers, G)`; register A7 `capture_experts` on all layers in the window (student + teacher) instead of one `instrument_experts`; forward once per batch per window; `finalize_layer`+spill each window layer at window end. (2) `_teacher_hidden`: clear per-batch only; populate/consume all G window layers. (3) Add `cov_window_size`/`G` param threaded from config; add `_resolve_cov_window(config, devices)` VRAM auto-sizer (mirror `_resolve_cov_replicas`). (4) Thread G into `_cov_replica_worker` (compute after device-pin) and `_collect_covariances` signature. (5) Fix the STALE docstring `:312-317`. Keep `instrument_experts` path selectable for the fallback/golden-regen-A/B. |
-| `stage3/orchestrator.py` | Read `multigpu.cov_window_size`; pass G into both the in-process `_collect_covariances` dispatch (via the `CovarianceCollectionPlugin.collect_covariances` ctx slot, `covariance_collection.py:852-886`) and `run_dp_covariance_collection`. Add a `cov_window_size` ctx slot. |
-| `config` (recipe yaml/defaults) | Add `multigpu.cov_window_size: auto`; document `G=1 ⇒ native per-layer (new golden, not current)`. |
+| `stage3/plugins/covariance_collection.py` | (1) `_collect_covariances`: replace per-layer outer loop (`:449`) with a windowed loop over `_iter_windows(moe_layers, G)`; register A7 `capture_experts` on all layers in the window (student + teacher) instead of one `instrument_experts`; forward once per batch per window; `finalize_layer`+spill each window layer at window end. (2) `_teacher_hidden`: clear per-batch only; populate/consume all G window layers. (3) Add `cov_window_size`/`G` param threaded from config; add `_resolve_cov_window(config, devices)` VRAM auto-sizer — config-resolution shape of `_resolve_cov_replicas` PLUS a new `torch.cuda.mem_get_info()` probe (not a pure mirror; the existing resolver is config-only). (4) Thread G into `_cov_replica_worker` (compute after device-pin) and `_collect_covariances` signature. (5) Fix the STALE docstring `:312-317`. Keep `instrument_experts` path selectable for the fallback/golden-regen-A/B. |
+| `stage3/orchestrator.py` | Read `multi_gpu.cov_window_size` (same block as `cov_replicas`, `:93-94`); pass G into both the in-process `_collect_covariances` dispatch (via the `CovarianceCollectionPlugin.collect_covariances` ctx slot, `covariance_collection.py:852-886`) and `run_dp_covariance_collection`. Add a `cov_window_size` ctx slot. |
+| `config` (recipe yaml/defaults) | Add `multi_gpu.cov_window_size: auto` (under the existing `multi_gpu` block, alongside `cov_replicas`); document `G=1 ⇒ native per-layer (new golden, not current)`. |
 | `tests/golden/stage3/rank_map.*.json` | **Regenerate** under A7 (MOE_REGEN_GOLDEN=1) — the blessed new all-native baseline. Human-gated bless after the §7 rank/PPL gate. |
 | `tests/test_multigpu_stage3.py` | Add A1 windowed-vs-per-layer equivalence (atol=0 CPU) + A7-vs-instrument single-layer equivalence (rtol=1e-4). |
 | `tasks/` deviation log | Record D-A7: "cov captured from native forward (was Python-loop); golden rebaselined; more inference-faithful." |
