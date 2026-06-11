@@ -50,6 +50,7 @@ short-circuiting Stage 2's per-layer profile forward pass.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,23 @@ from ...utils.cached_calibration_signals import (
 )
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class _RankBucket:
+    """Per-``layer_rank`` slice of the four payload dicts (C10).
+
+    Each list holds ``(expert[, module], value)`` entries that share the same
+    ``layer_rank``, in the payload's original ``.items()`` insertion order.
+    The ``value`` objects are the SAME references stored in the payload (no
+    copy), so a consumer's ``.clone()`` / ``.to(...)`` sees byte-identical
+    inputs to the pre-bucketing per-layer scan.
+    """
+
+    neuron_act_sum: list = field(default_factory=list)  # (e, tensor)
+    neuron_act_count: list = field(default_factory=list)  # (e, count)
+    cov_acc: list = field(default_factory=list)  # (e, m, tensor)
+    cov_token_count: list = field(default_factory=list)  # (e, m, count)
 
 
 class Stage2ProfileCacheProvider:
@@ -139,6 +157,15 @@ class Stage2ProfileCacheProvider:
         self.cost_alignment = str(cost_alignment).lower()
         # Filled by on_load; consumed by on_layer_setup.
         self.payload: Stage2ProfilePayloadV4 | None = None
+        # C10 (de-quadratic): per-``layer_rank`` buckets of the four payload
+        # dicts (``neuron_act_sum`` / ``neuron_act_count`` / ``cov_acc`` /
+        # ``cov_token_count``), built lazily ONCE on the first
+        # ``on_layer_setup`` and cached on the instance. Each layer then reads
+        # its own bucket directly instead of re-scanning the entire payload
+        # dict (which was O(n_layers²·n_experts) across the run). Buckets hold
+        # the SAME tensor references as the payload, so the downstream
+        # ``.clone()`` / ``.to(live_dtype)`` operate on byte-identical inputs.
+        self._rank_buckets: dict[int, _RankBucket] | None = None
 
     def _cost_alignment_requires_reservoir(self) -> bool:
         """True iff ``cost_alignment="output"`` is active.
@@ -149,6 +176,38 @@ class Stage2ProfileCacheProvider:
         reservoir is unused so an empty payload entry is harmless.
         """
         return self.cost_alignment == "output"
+
+    def _rank_bucket_for(self, layer_rank: int) -> _RankBucket:
+        """Return the cached :class:`_RankBucket` for ``layer_rank`` (C10).
+
+        Builds the full per-rank index ONCE (single ``.items()`` pass over
+        each of the four payload dicts, preserving insertion order) on first
+        call and caches it on ``self._rank_buckets``; subsequent calls — and
+        every later layer — are O(1) dict lookups. References (not copies) are
+        stored, so the per-layer ``.clone()`` / ``.to(live_dtype)`` operate on
+        byte-identical inputs to the pre-bucketing 4-scan path.
+        """
+        if self._rank_buckets is None:
+            buckets: dict[int, _RankBucket] = {}
+
+            def _bucket(lr: int) -> _RankBucket:
+                b = buckets.get(lr)
+                if b is None:
+                    b = _RankBucket()
+                    buckets[lr] = b
+                return b
+
+            payload = self.payload
+            for (lr, e), v in payload.neuron_act_sum.items():
+                _bucket(int(lr)).neuron_act_sum.append((int(e), v))
+            for (lr, e), c in payload.neuron_act_count.items():
+                _bucket(int(lr)).neuron_act_count.append((int(e), c))
+            for (lr, e, m), cov_t in payload.cov_acc.items():
+                _bucket(int(lr)).cov_acc.append((int(e), str(m), cov_t))
+            for (lr, e, m), n in payload.cov_token_count.items():
+                _bucket(int(lr)).cov_token_count.append((int(e), str(m), n))
+            self._rank_buckets = buckets
+        return self._rank_buckets.get(int(layer_rank), _RankBucket())
 
     def is_enabled(self, config: dict) -> bool:
         s2 = config.get("stage2_reap_ream", {}) or {}
@@ -186,6 +245,11 @@ class Stage2ProfileCacheProvider:
             )
             return None
         self.payload = payload
+        # C10: invalidate any prior per-rank bucket index so it is rebuilt
+        # from the freshly loaded payload (defensive — on_load assigns
+        # self.payload exactly once per run today, but this keeps the
+        # "buckets derive from the current payload" invariant explicit).
+        self._rank_buckets = None
         ctx.set("stage2_profile_payload", payload)
         log.info(
             "stage2-profile-cache: loaded %d-layer × %d-expert sidecar (top_k=%d, "
@@ -262,15 +326,18 @@ class Stage2ProfileCacheProvider:
         # _total_tokens_by_layer: scalar int.
         ream_acc._total_tokens_by_layer[layer_idx] = layer_tokens
 
-        # _neuron_act_sum / _neuron_act_count: iterate only the entries
-        # for this rank (the payload may carry many ranks; we hydrate
-        # only the current layer's slice).
-        for (lr, e), v in payload.neuron_act_sum.items():
-            if int(lr) == int(layer_rank):
-                ream_acc._neuron_act_sum[(layer_idx, int(e))] = v.clone()
-        for (lr, e), c in payload.neuron_act_count.items():
-            if int(lr) == int(layer_rank):
-                ream_acc._neuron_act_count[(layer_idx, int(e))] = int(c)
+        # C10: read this rank's pre-bucketed slice (built ONCE, cached on the
+        # instance) instead of re-scanning the whole payload dict per layer.
+        bucket = self._rank_bucket_for(layer_rank)
+
+        # _neuron_act_sum / _neuron_act_count: hydrate only the current
+        # layer's slice (the bucket holds the SAME payload references in the
+        # payload's original .items() order, so .clone() / int() are
+        # byte-identical to the pre-bucketing 4-scan path).
+        for e, v in bucket.neuron_act_sum:
+            ream_acc._neuron_act_sum[(layer_idx, e)] = v.clone()
+        for e, c in bucket.neuron_act_count:
+            ream_acc._neuron_act_count[(layer_idx, e)] = int(c)
 
         # cov_acc hydration — DIRECT dict write into the finalized
         # storage. NOT cov_acc.update(...) (which expects a raw input
@@ -280,14 +347,10 @@ class Stage2ProfileCacheProvider:
         # dtype across hydrated + live cov rows (round-2 Crit-2).
         cov_acc = self.cov_acc
         live_dtype = cov_acc.storage_dtype
-        for (lr, e, m), cov_t in payload.cov_acc.items():
-            if int(lr) == int(layer_rank):
-                cov_acc.covariance[(layer_idx, int(e), str(m))] = (
-                    cov_t.to(live_dtype)
-                )
-        for (lr, e, m), n in payload.cov_token_count.items():
-            if int(lr) == int(layer_rank):
-                cov_acc.token_count[(layer_idx, int(e), str(m))] = int(n)
+        for e, m, cov_t in bucket.cov_acc:
+            cov_acc.covariance[(layer_idx, e, m)] = cov_t.to(live_dtype)
+        for e, m, n in bucket.cov_token_count:
+            cov_acc.token_count[(layer_idx, e, m)] = int(n)
 
         # layer_input_acc hydration — REQUIRED by SC strategy
         # (cost_alignment="output") to compute _output_space_cost from
