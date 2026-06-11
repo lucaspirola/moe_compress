@@ -348,6 +348,59 @@ def _resolve_cov_window(config: dict, n_layers: int) -> int:
     return g
 
 
+def _resolve_cov_batch_size(s3: dict) -> int:
+    """Resolve the cov-collection batch size (A6).
+
+    Reads the cov-specific ``stage3_svd.cov_batch_size`` key, defaulting to the
+    inherited ``stage3_svd.batch_size`` (default 1) so the 1-GPU golden is
+    untouched (the golden was generated at ``batch_size``):
+
+      * absent              → inherits ``batch_size`` (no behavior change).
+      * explicit int / str  → passes through (operator opt-in on a sharded box).
+      * ``"auto"``          → on a real ≥2-GPU sharded box, probe free VRAM and
+        pick a conservative bs; on CPU / 1-GPU it DEGRADES to the inherited
+        ``batch_size`` (NO raise), keeping the 1-GPU golden byte-identical.
+
+    A6 is NOT byte-identical across batch sizes: re-partitioning tokens across
+    the ``flat.T @ flat`` GEMM vs ``add_`` partials changes the fp32-summation
+    GROUPING (fp-reassociation), the same class of noise as a GEMM-backend
+    change — far below signal but not bit-equal. Hence the DEFAULT preserving
+    the value is what keeps the golden safe, not byte-neutrality of the knob.
+
+    Compound-peak constraint (plan M2): the A1×A4×A6 dense-teacher peak is
+    ``G · cov_bs · seq · d_in · 4`` bytes per hot device (every G window layer
+    holds a full ``[T, d_in]`` fp32 teacher tensor, T = cov_bs·seq). The
+    ``"auto"`` raise MUST budget THIS, not just the forward activation, or it
+    can OOM the hot device precisely when it raises bs. The VRAM-measured raise
+    is DEFERRED to a real ≥2-GPU box; until then ``"auto"`` returns the
+    inherited value, so this resolver never raises bs off-box.
+    """
+    inherited = int(s3.get("batch_size", 1))
+    req = s3.get("cov_batch_size", inherited)
+    if req is None:
+        return inherited
+    if isinstance(req, str):
+        if req.strip().lower() == "auto":
+            # DEFERRED: VRAM-measured raise only on a real ≥2-GPU sharded box.
+            # The per-sample cost (GB/sample) and the compound dense-teacher
+            # peak (G·cov_bs·seq·d_in·4) must be measured live before raising;
+            # off-box (CPU / 1-GPU) degrade to the inherited value (no raise).
+            try:
+                if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+                    # Multi-GPU auto-raise is gated on a live per-sample
+                    # measurement (Deferred). Until that lands, return the
+                    # inherited value so we never OOM the hot device.
+                    return inherited
+            except Exception:                            # noqa: BLE001
+                return inherited
+            return inherited
+        try:
+            return int(req)
+        except ValueError:
+            return inherited
+    return int(req)
+
+
 # ---------------------------------------------------------------------------
 # Post-prune input covariance (for AA-SVD B matrix)
 # ---------------------------------------------------------------------------
@@ -362,6 +415,7 @@ def _collect_covariances(
     ccov_spill_dir=None,
     cov_window_size: int = 1,
     cov_capture_mode: str = "capture",
+    cov_cross_impl: str = "dense",
 ) -> None:
     """Collect post-prune input covariance S and (optionally) cross-covariance C.
 
@@ -428,13 +482,33 @@ def _collect_covariances(
             f"cov_capture_mode must be 'capture' (A7) or 'instrument' "
             f"(legacy fallback), got {cov_capture_mode!r}"
         )
+    if cov_cross_impl not in ("dense", "dict"):
+        raise ValueError(
+            f"cov_cross_impl must be 'dense' (A4, default) or 'dict' "
+            f"(legacy, retained only for the A4 equivalence test), "
+            f"got {cov_cross_impl!r}"
+        )
 
     # --- Storage for teacher's per-layer hidden states (for cross-cov) ---
-    # Structure: layer_idx → {token_idx → row Tensor [d_in]}. The nested
-    # dict is populated incrementally by ``_teacher_input_cb`` (one entry
-    # per token position the teacher dispatches through this MoE layer)
-    # and consumed by ``input_cb`` via per-token lookup.
+    # A4 (default ``cov_cross_impl="dense"``): one dense ``[T, d_in]`` fp32
+    # tensor per window layer (``teacher_dense``) plus a boolean ``[T]``
+    # ``filled`` mask, scattered via ``index_copy_`` and consumed by a single
+    # ``index_select`` in ``input_cb`` — replacing the per-token Python loop.
+    # ``T = batch.shape[0] * batch.shape[1]`` (rebound per batch in the
+    # enclosing batch loop and read by the dense-path closures as a free
+    # variable — NOT a ``nonlocal`` declaration, and none is required). Legacy
+    # ``cov_cross_impl="dict"`` (the ``{token_idx → row}`` nested dict) is
+    # RETAINED unchanged, reachable ONLY through this kwarg, PURELY so the
+    # A4 equivalence test (``test_a4_cross_cov_dense_equals_dict``) can compare
+    # dense-vs-dict bit-for-bit — both ``capture`` and ``instrument`` route the
+    # SAME closures, so there is no other legacy dict path to diff against.
     _teacher_hidden: dict[int, dict[int, torch.Tensor]] = {}
+    # Dense-path per-layer state (A4): layer_idx → dense [T, d_in] / [T] mask.
+    _teacher_dense: dict[int, torch.Tensor] = {}
+    _teacher_filled: dict[int, torch.Tensor] = {}
+    # Per-batch token count T (= rows * seq), set in the batch loop below so
+    # the lazily-allocated dense tensors are sized correctly each batch.
+    _teacher_T: int = 0
 
     def _teacher_input_cb(li, e, tensor, ctx):
         """Teacher hook: store the full hidden state for this layer.
@@ -455,12 +529,32 @@ def _collect_covariances(
         # all experts. We need to capture it per-token for cross-cov lookup.
         token_idx = ctx["token_idx"]
         key = li
-        if key not in _teacher_hidden:
-            # Will be populated incrementally per expert dispatch
-            _teacher_hidden[key] = {}
         det = tensor.detach().to(torch.float32)
-        for i, tidx in enumerate(token_idx.tolist()):
-            _teacher_hidden[key][tidx] = det[i]
+        if cov_cross_impl == "dict":
+            if key not in _teacher_hidden:
+                # Will be populated incrementally per expert dispatch
+                _teacher_hidden[key] = {}
+            for i, tidx in enumerate(token_idx.tolist()):
+                _teacher_hidden[key][tidx] = det[i]
+            return
+        # A4 dense path: lazily allocate a dense [T, d_in] fp32 tensor (+ a
+        # boolean [T] ``filled`` mask) for this layer on first dispatch this
+        # batch, then scatter the dispatched rows in one ``index_copy_``.
+        # ``token_idx`` from ``torch.where(mask[e])`` is UNIQUE within a single
+        # expert dispatch (no repeated-index hazard for ``index_copy_``); across
+        # experts the teacher's pre-routing layer-input row at a given position
+        # is identical, so a re-write is value-preserving.
+        if key not in _teacher_dense:
+            d_in = det.shape[1]
+            _teacher_dense[key] = torch.zeros(
+                (_teacher_T, d_in), dtype=torch.float32, device=det.device
+            )
+            _teacher_filled[key] = torch.zeros(
+                (_teacher_T,), dtype=torch.bool, device=det.device
+            )
+        tok = token_idx.to(det.device)
+        _teacher_dense[key].index_copy_(0, tok, det)
+        _teacher_filled[key][tok] = True
 
     def input_cb(li, e, tensor, ctx):
         # The student-side B accumulation uses the InputCovarianceAccumulator's
@@ -473,52 +567,61 @@ def _collect_covariances(
         # ``aa_svd_factor.py`` to serve ``up_proj``.
         B_acc.update(li, e, "gate_proj", tensor)
         # Cross-covariance: C += X_pre^T @ X_post for matching token positions.
-        if C_acc is not None and li in _teacher_hidden:
-            token_idx = ctx["token_idx"].tolist()
-            teacher_store = _teacher_hidden[li]
-            # Collect teacher activations for the same token positions.
-            # PERF (MEDIUM-2): the per-token Python loop here and in
-            # _teacher_input_cb is the dominant CPU cost of cross-cov
-            # capture; a vectorised replacement that indexes the teacher
-            # tensor with the student's token_idx (instead of building
-            # a {tidx: row} dict and stacking row-by-row) would remove
-            # ~256 small tensor builds per batch. Not correctness-critical.
-            pre_vecs = []
-            post_vecs = []
-            det_post = tensor.detach().to(torch.float32)
-            # Cross-device safety: with ``device_map="auto"`` teacher and
-            # student copies of the same MoE layer can land on different
-            # GPUs. ``det_post`` lives on the student tensor's device;
-            # teacher rows in ``_teacher_hidden`` were detached on the
-            # teacher's device. Coerce each teacher row onto
-            # ``tensor.device`` before stacking so the X_pre.T @ X_post
-            # matmul (and the in-place add inside ``update_cross``) is
-            # single-device. The .to() is a no-op when devices already
-            # match (common single-GPU case) and a cheap H2D/D2D copy
-            # under sharding.
-            tgt_device = tensor.device
-            for i, tidx in enumerate(token_idx):
-                if tidx in teacher_store:
-                    pre_vecs.append(teacher_store[tidx].to(device=tgt_device))
-                    post_vecs.append(det_post[i])
-            if pre_vecs:
-                X_pre = torch.stack(pre_vecs)   # [n_match, d_in]
-                X_post = torch.stack(post_vecs)  # [n_match, d_in]
-                # Cross term on the input device so the in-place add inside
-                # update_cross stays on-device (matches B_acc.update's
-                # contract; finalize_layer does the single GPU→CPU
-                # transfer per key, applying ``storage_dtype``). The per-row
-                # ``.to(tgt_device)`` above already pinned every X_pre vector
-                # to ``tensor.device``, so the matmul output lives there by
-                # construction — no trailing ``.to(tensor.device)`` needed.
+        # Cross-device safety: with ``device_map="auto"`` teacher and student
+        # copies of the same MoE layer can land on different GPUs. ``det_post``
+        # lives on the student tensor's device; the teacher rows were detached
+        # on the teacher's device. Coerce onto ``tensor.device`` before the
+        # ``X_pre.T @ X_post`` matmul (and the in-place add inside
+        # ``update_cross``) so the op is single-device. The ``.to()`` is a
+        # no-op when devices already match (single-GPU) and a cheap D2D copy
+        # under sharding.
+        tgt_device = tensor.device
+        if cov_cross_impl == "dict":
+            if C_acc is not None and li in _teacher_hidden:
+                token_idx = ctx["token_idx"].tolist()
+                teacher_store = _teacher_hidden[li]
+                pre_vecs = []
+                post_vecs = []
+                det_post = tensor.detach().to(torch.float32)
+                for i, tidx in enumerate(token_idx):
+                    if tidx in teacher_store:
+                        pre_vecs.append(teacher_store[tidx].to(device=tgt_device))
+                        post_vecs.append(det_post[i])
+                if pre_vecs:
+                    X_pre = torch.stack(pre_vecs)    # [n_match, d_in]
+                    X_post = torch.stack(post_vecs)  # [n_match, d_in]
+                    cross = X_pre.T @ X_post
+                    C_acc.update_cross(
+                        li, e, "gate_proj", cross, n_tokens=len(pre_vecs),
+                    )
+            return
+        # A4 dense path: a single ``index_select`` over the dense teacher
+        # tensor reproduces the dict's in-order matched-position gather. The
+        # ``filled`` mask reproduces the legacy ``if tidx in teacher_store``
+        # skip exactly; boolean masking is order-preserving and
+        # ``index_select(0, sel_idx)`` gathers in ``sel_idx`` order, so the
+        # rows align row-for-row with the old in-order Python loop ⇒ the
+        # ``X_pre.T @ X_post`` GEMM is bit-identical to the dict path.
+        if C_acc is not None and li in _teacher_dense:
+            token_idx = ctx["token_idx"]
+            filled = _teacher_filled[li]
+            tok = token_idx.to(filled.device)
+            keep = filled[tok]
+            sel_idx = tok[keep]
+            if sel_idx.numel() > 0:
+                det_post = tensor.detach().to(torch.float32)
+                X_pre = _teacher_dense[li].index_select(
+                    0, sel_idx.to(_teacher_dense[li].device)
+                ).to(tgt_device)
+                X_post = det_post[keep.to(det_post.device)]
                 cross = X_pre.T @ X_post
-                # Public entry: holds C_acc._lock around _pending writes
-                # and routes through finalize_layer's storage_dtype cast
-                # (D-cov-storage-fp16). Direct ``_gpu``/``_pending``
-                # mutation here would (a) bypass the lock and (b) leave
-                # GPU fp32 tensors alive past finalize.
+                # Public entry: holds C_acc._lock around _pending writes and
+                # routes through finalize_layer's storage_dtype cast. The
+                # token count feeds persisted ``_gpu_token_count`` metadata
+                # (not the Gram) but must stay correct (review L1).
                 C_acc.update_cross(
-                    li, e, "gate_proj", cross, n_tokens=len(pre_vecs),
+                    li, e, "gate_proj", cross,
+                    n_tokens=int(keep.sum().item()),
                 )
 
     def intermediate_cb(li, e, tensor, ctx):
@@ -615,10 +718,16 @@ def _collect_covariances(
                 for batch_idx, batch in enumerate(batches):
                     if device is not None:
                         batch = batch.to(device)
-                    # Clear per-BATCH (not per-layer): _teacher_hidden holds all
-                    # G window layers' teacher rows for this batch's student
-                    # forward, then is dropped before the next batch (PLAN §4.2).
+                    # Clear per-BATCH (not per-layer): the teacher stores hold
+                    # all G window layers' teacher rows for this batch's student
+                    # forward, then are dropped before the next batch (PLAN §4.2).
+                    # ``_teacher_T`` = rows*seq is threaded into the dense-path
+                    # closures so each layer's lazily-allocated ``[T, d_in]``
+                    # tensor is sized for THIS batch.
                     _teacher_hidden.clear()
+                    _teacher_dense.clear()
+                    _teacher_filled.clear()
+                    _teacher_T = int(batch.shape[0]) * int(batch.shape[1])
                     if teacher_model is not None:
                         with torch.no_grad():
                             teacher_model(input_ids=batch)
@@ -758,7 +867,12 @@ def _cov_replica_worker(
     )
     calib = _bct(tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache")
     shard = calib[shard_start:shard_end]
-    batch_size = int(config["stage3_svd"].get("batch_size", 1))
+    # A6: DP replica reads the SAME cov-specific key as the in-process path so
+    # the two agree (cross-replica Gram sum is bs-independent — finalized
+    # per-key Grams are summed). ``config["stage3_svd"]`` is this site's own
+    # local dict (review L2); the resolver defaults to the inherited
+    # ``batch_size`` (golden untouched).
+    batch_size = _resolve_cov_batch_size(config["stage3_svd"])
     batches = _iter_batches(shard, batch_size=batch_size)
 
     moe_layers = list(_iter_moe_layers(student))

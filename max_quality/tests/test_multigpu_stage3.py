@@ -549,7 +549,7 @@ def test_a7_capture_matches_instrument_single_layer(tiny_model):
             ), f"gate_proj key {k} must be bit-identical (pure gather)"
 
 
-def _collect_windowed(model_factory, batches, *, G, cross):
+def _collect_windowed(model_factory, batches, *, G, cross, cross_impl="dense"):
     """Run A7 cov collection at window size ``G`` and return (B, C) accumulators."""
     import copy
     from moe_compress.utils.model_io import iter_moe_layers
@@ -568,11 +568,119 @@ def _collect_windowed(model_factory, batches, *, G, cross):
         model, moe, batches, B, device=torch.device("cpu"),
         teacher_model=teacher, teacher_moe_layers=tmoe, C_acc=C,
         cov_window_size=G, cov_capture_mode="capture",
+        cov_cross_impl=cross_impl,
     )
     B.finalize_all()
     if C is not None:
         C.finalize_all()
     return B, C
+
+
+def test_a4_cross_cov_dense_equals_dict(tiny_model):
+    """A4: the dense ``index_select`` cross-cov path is BYTE-IDENTICAL
+    (``torch.equal``, atol=0) to the legacy ``{token_idx → row}`` dict path on
+    CPU per C key. Exercised across G ∈ {1, 2, N} (window independence) — G ≥ 2
+    additionally hooks multiple MoE layers SIMULTANEOUSLY, covering the
+    per-layer ``teacher_dense[li]`` separation. B keys are also checked equal
+    (the B path is impl-independent but must not regress)."""
+    from moe_compress.utils.model_io import iter_moe_layers
+
+    torch.manual_seed(13)
+    batches = [torch.randint(0, 32, (2, 8)) for _ in range(3)]
+    n_layers = len(list(iter_moe_layers(tiny_model)))
+    sizes = sorted({1, 2, n_layers})
+
+    for G in sizes:
+        B_dict, C_dict = _collect_windowed(
+            tiny_model, batches, G=G, cross=True, cross_impl="dict"
+        )
+        B_dense, C_dense = _collect_windowed(
+            tiny_model, batches, G=G, cross=True, cross_impl="dense"
+        )
+        assert set(C_dict.covariance) == set(C_dense.covariance), \
+            f"G={G}: C key sets differ dict vs dense"
+        for k in C_dict.covariance:
+            assert torch.equal(
+                C_dict.covariance[k].to(torch.float32),
+                C_dense.covariance[k].to(torch.float32),
+            ), f"G={G}: C dense != dict at {k}"
+        assert set(B_dict.covariance) == set(B_dense.covariance)
+        for k in B_dict.covariance:
+            assert torch.equal(
+                B_dict.covariance[k].to(torch.float32),
+                B_dense.covariance[k].to(torch.float32),
+            ), f"G={G}: B dense != dict at {k}"
+
+
+def test_a6_resolve_cov_batch_size():
+    """A6 resolver: ``cov_batch_size`` absent ⇒ inherits ``batch_size``; explicit
+    int / str passes through; ``"auto"`` on CPU / 1-GPU ⇒ inherited value (NO
+    raise, so the 1-GPU golden stays byte-identical)."""
+    from moe_compress.stage3.plugins.covariance_collection import (
+        _resolve_cov_batch_size,
+    )
+
+    # Absent ⇒ inherits batch_size.
+    assert _resolve_cov_batch_size({"batch_size": 4}) == 4
+    assert _resolve_cov_batch_size({}) == 1  # both absent ⇒ default 1
+    # Explicit int / str passes through.
+    assert _resolve_cov_batch_size({"batch_size": 1, "cov_batch_size": 8}) == 8
+    assert _resolve_cov_batch_size({"batch_size": 1, "cov_batch_size": "6"}) == 6
+    # None ⇒ inherits.
+    assert _resolve_cov_batch_size({"batch_size": 3, "cov_batch_size": None}) == 3
+    # "auto": on CPU / 1-GPU degrades to the inherited value (no raise). When a
+    # real ≥2-GPU box is present the deferred measurement still returns the
+    # inherited value (raise is DEFERRED), so this holds regardless of hardware.
+    assert _resolve_cov_batch_size({"batch_size": 2, "cov_batch_size": "auto"}) == 2
+
+
+def test_a6_cov_batch_size_close(tiny_model):
+    """A6: covariance at cov batch sizes bs ∈ {1, 2, 4} over the SAME tokens
+    matches within an fp-reassociation tolerance — NOT ``torch.equal``. Changing
+    bs re-partitions which tokens land in the same ``flat.T @ flat`` GEMM vs
+    separate ``add_`` partials, so the float SUMMATION GROUPING differs (same
+    math object, different reassociation). Asserted on both B and C keys."""
+    import copy
+    from moe_compress.utils.model_io import iter_moe_layers
+
+    torch.manual_seed(21)
+    # A flat pool of sequences; repartitioned into batches at each bs.
+    n_seq, seq = 8, 8
+    pool = torch.randint(0, 32, (n_seq, seq))
+
+    def run(bs):
+        batches = [pool[i:i + bs] for i in range(0, n_seq, bs)]
+        model = copy.deepcopy(tiny_model).eval()
+        teacher = copy.deepcopy(tiny_model).eval()
+        moe = list(iter_moe_layers(model))
+        tmoe = list(iter_moe_layers(teacher))
+        B = InputCovarianceAccumulator(); B.set_storage_dtype(torch.float32)
+        C = InputCovarianceAccumulator(); C.set_storage_dtype(torch.float32)
+        _collect_covariances(
+            model, moe, batches, B, device=torch.device("cpu"),
+            teacher_model=teacher, teacher_moe_layers=tmoe, C_acc=C,
+            cov_window_size=1, cov_capture_mode="capture",
+        )
+        B.finalize_all(); C.finalize_all()
+        return B, C
+
+    B1, C1 = run(1)
+    for bs in (2, 4):
+        B, C = run(bs)
+        assert set(B.covariance) == set(B1.covariance)
+        for k in B1.covariance:
+            assert torch.allclose(
+                B.covariance[k].to(torch.float32),
+                B1.covariance[k].to(torch.float32),
+                rtol=1e-5, atol=1e-5,
+            ), f"bs={bs}: B beyond fp-reassoc tolerance at {k}"
+        assert set(C.covariance) == set(C1.covariance)
+        for k in C1.covariance:
+            assert torch.allclose(
+                C.covariance[k].to(torch.float32),
+                C1.covariance[k].to(torch.float32),
+                rtol=1e-5, atol=1e-5,
+            ), f"bs={bs}: C beyond fp-reassoc tolerance at {k}"
 
 
 def test_a1_windowed_equals_perlayer(tiny_model):

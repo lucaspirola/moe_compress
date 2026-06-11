@@ -224,6 +224,7 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -370,6 +371,45 @@ def _evaluate_wikitext2_ppl(
     return math.exp(nll_sum / tok_count)
 
 
+_EIGH_DECOMP_FIELDS = (
+    "eigvals_keep", "eigvecs_keep", "inv_sqrt", "rhs", "rhs_pinv", "r_eff",
+)
+
+
+def _serialize_eigh_decomp(decomp):
+    """Serialize an ``_EighDecomp`` to a plain dict of its COMPLETE field set
+    (``aa_svd_factor.py:178-184``). Tensors are detached onto CPU so the spill
+    is device-agnostic (the load path moves them back to ``device``). ``None``
+    round-trips as ``None`` (the ValueError-sentinel: computed-but-failed eigh).
+    """
+    if decomp is None:
+        return None
+    out = {}
+    for f in _EIGH_DECOMP_FIELDS:
+        v = getattr(decomp, f)
+        out[f] = v.detach().cpu() if isinstance(v, torch.Tensor) else v
+    return out
+
+
+def _deserialize_eigh_decomp(payload, _EighDecomp, device=None):
+    """Rebuild an ``_EighDecomp`` from a serialized dict; ``None`` stays
+    ``None`` (sentinel preserved so the fallback ``_aa_svd`` is taken).
+
+    Tensors are moved to ``device`` (when given) to match the cache-MISS path,
+    which returns ``_precompute_eigh`` tensors on ``device``. A CPU→device move
+    of an fp32 tensor is lossless, so the hit path is bit-identical to miss.
+    ``r_eff`` is a Python int and is left as-is."""
+    if payload is None:
+        return None
+    fields = {}
+    for f in _EIGH_DECOMP_FIELDS:
+        v = payload[f]
+        if device is not None and isinstance(v, torch.Tensor):
+            v = v.to(device)
+        fields[f] = v
+    return _EighDecomp(**fields)
+
+
 def _factor_model_at_ranks(
     model,
     moe_layers: list[MoELayerRef],
@@ -384,6 +424,7 @@ def _factor_model_at_ranks(
     *,
     device,
     storage_dtype: torch.dtype = torch.float16,
+    gate_up_decomp_cache_dir: str | None = None,
 ) -> None:
     """Factor all MoE layers in-place at the given per-expert ranks.
 
@@ -399,11 +440,43 @@ def _factor_model_at_ranks(
     from ...stage3_svd import (  # noqa: PLC0415
         _cov_lookup, _precompute_eigh, _aa_svd, _aa_svd_precomputed,
     )
+    from .aa_svd_factor import _EighDecomp  # noqa: PLC0415
+
+    cache_dir_path = Path(gate_up_decomp_cache_dir) if gate_up_decomp_cache_dir else None
     for ref in moe_layers:
         # Load covariances for this layer.
         B_acc.load_layer_from_disk(ref.layer_idx, bcov_spill_dir)
         if C_acc is not None and ccov_spill_dir is not None:
             C_acc.load_layer_from_disk(ref.layer_idx, ccov_spill_dir)
+
+        # A2: per-layer eigh-decomp spill cache, keyed by expert index. The
+        # ``_EighDecomp`` is a deterministic function of (B, A, C) only and W-
+        # and k-independent (A is del'd inside ``_precompute_eigh``), so it is
+        # IDENTICAL across all 11 alpha candidates — they share the same B/C
+        # spill files (only ``k``/``per_expert_ranks`` change per candidate).
+        # Spill one layer's ``{expert: decomp_or_None}`` to disk on the FIRST
+        # candidate (cache miss) and reuse on candidates 1..10 (cache hit),
+        # matching the cov-spill single-layer residency model (load→use→free).
+        #
+        # Cache-validity INVARIANT (review H1): ``rhs`` is (B,C)-dependent
+        # (Path-1 ``C@eigvecs`` vs Path-3 B-only). The cache is valid ONLY
+        # because (B,C)-PRESENCE is identical across all candidates (same spill
+        # files). A future change that made C-presence candidate-dependent would
+        # silently corrupt this cache; the entry-rmtree guards only cross-RUN
+        # staleness, not within-run C-presence drift — keep this invariant true.
+        layer_cache: "dict[int, _EighDecomp | None] | None" = None
+        layer_cache_hit = False
+        if cache_dir_path is not None:
+            layer_cache_file = cache_dir_path / f"layer_{ref.layer_idx}.pt"
+            if layer_cache_file.exists():
+                raw = torch.load(layer_cache_file, map_location="cpu")
+                layer_cache = {
+                    int(e): _deserialize_eigh_decomp(p, _EighDecomp, device=device)
+                    for e, p in raw.items()
+                }
+                layer_cache_hit = True
+            else:
+                layer_cache = {}
 
         # Slot width = max per-expert rank within this layer/matrix.
         ranks_layer = {
@@ -441,14 +514,24 @@ def _factor_model_at_ranks(
             if C_acc is not None:
                 C_shared = _cov_lookup(C_acc.covariance, ref.layer_idx, e, "gate_proj")
             gate_up_decomp: _EighDecomp | None = None
-            if B_shared is not None:
+            if layer_cache_hit and layer_cache is not None and e in layer_cache:
+                # Cache hit: reuse the decomp computed on candidate 0. ``None``
+                # here is the persisted ValueError-sentinel (computed-but-failed)
+                # → same ``_aa_svd`` fallback, NOT retried.
+                gate_up_decomp = layer_cache[e]
+            elif B_shared is not None:
                 try:
                     gate_up_decomp = _precompute_eigh(
                         B_shared, A_shared, C_shared,
                         device=device, storage_dtype=storage_dtype,
                     )
                 except ValueError:
-                    pass  # falls through to full _aa_svd below
+                    gate_up_decomp = None  # falls through to full _aa_svd below
+                # Cache miss: record this expert's decomp (incl. None sentinel —
+                # distinguishes "computed→failed" from "absent"/not-computed) so
+                # candidates 1..10 take the identical path without recomputing.
+                if layer_cache is not None and not layer_cache_hit:
+                    layer_cache[e] = gate_up_decomp
 
             for name in MATRIX_NAMES:
                 W = originals[(ref.layer_idx, e, name)].to(
@@ -475,6 +558,21 @@ def _factor_model_at_ranks(
                 new_factored.set_factors(
                     e, name, U_k, V_k, effective_rank=k_eff,
                 )
+
+        # A2: on a cache MISS (candidate 0), persist this layer's
+        # ``{expert: decomp_or_None}`` to disk before unloading the layer so
+        # candidates 1..10 reuse it (one ``torch.save`` file per layer — the
+        # same spill convention as ``InputCovarianceAccumulator.spill_layer``).
+        # The serializer detaches tensors onto CPU; the load path moves them
+        # back to ``device``. ``None`` entries are the persisted
+        # ValueError-sentinel (computed-but-failed → identical fallback).
+        if cache_dir_path is not None and not layer_cache_hit and layer_cache is not None:
+            cache_dir_path.mkdir(parents=True, exist_ok=True)
+            payload = {
+                int(e): _serialize_eigh_decomp(d)
+                for e, d in layer_cache.items()
+            }
+            torch.save(payload, cache_dir_path / f"layer_{ref.layer_idx}.pt")
 
         # Swap in.
         setattr(ref.mlp, "experts", new_factored)
@@ -570,6 +668,7 @@ def _swift_svd_plus_alpha_search_validation(
     *,
     device,
     storage_dtype: torch.dtype = torch.float16,
+    artifacts_dir: Path | None = None,
 ) -> float:
     """Paper-exact α selection via end-to-end WikiText-2 PPL validation.
 
@@ -633,44 +732,69 @@ def _swift_svd_plus_alpha_search_validation(
     best_ppl = float("inf")
     results: list[tuple[float, float]] = []
 
-    for idx, alpha in enumerate(alpha_grid):
-        log.info("Stage 3 α-search: candidate %d/%d (α=%.1f)",
-                 idx + 1, len(alpha_grid), alpha)
+    # A2: per-layer eigh-decomp spill cache. The decomp is (B,A,C)-determined,
+    # W- and k-independent → IDENTICAL across all candidates (same B/C spill
+    # files). Candidate 0 fills it; 1..10 reuse it, eliminating ~10× the
+    # ``eigh(2048²)`` cost. Cache dir lives under ``artifacts_dir`` at a FIXED
+    # name, OUTSIDE the cov-spill resume scan path.
+    eigh_cache_dir: str | None = None
+    if artifacts_dir is not None:
+        _cache_path = Path(artifacts_dir) / "_stage3_alpha_eigh_cache"
+        # (a) LOAD-BEARING stale-cross-run guard: a hard-killed prior run
+        # (SIGKILL/OOM) may leave decomps from a DIFFERENT rank/dtype/model
+        # config; the H1 cache-validity invariant holds only WITHIN one run.
+        # UNCONDITIONALLY rmtree+recreate at search ENTRY so a stale file can
+        # NEVER be read as a false hit (independent of --no-resume).
+        shutil.rmtree(_cache_path, ignore_errors=True)
+        _cache_path.mkdir(parents=True, exist_ok=True)
+        eigh_cache_dir = str(_cache_path)
 
-        # 1. Compute per-expert ranks for this α (single α for all types).
-        alpha_by_type = {"all": alpha}
-        per_expert_ranks = _redistribute_ranks_swift_svd_plus(
-            moe_layers, group_stats, base_ranks, alpha_by_type,
-            A_cov=A_cov,
-        )
+    try:
+        for idx, alpha in enumerate(alpha_grid):
+            log.info("Stage 3 α-search: candidate %d/%d (α=%.1f)",
+                     idx + 1, len(alpha_grid), alpha)
 
-        # 2. Factor the full model at these ranks. Forward storage_dtype so
-        # the noise floor in `_aa_svd` matches the main factoring pass — using
-        # the default fp16 floor on a bf16-stored B-cov would over-truncate.
-        _factor_model_at_ranks(
-            model, moe_layers, originals, per_expert_ranks, base_ranks,
-            A_cov, B_acc, bcov_spill_dir, C_acc, ccov_spill_dir,
-            device=device, storage_dtype=storage_dtype,
-        )
+            # 1. Compute per-expert ranks for this α (single α for all types).
+            alpha_by_type = {"all": alpha}
+            per_expert_ranks = _redistribute_ranks_swift_svd_plus(
+                moe_layers, group_stats, base_ranks, alpha_by_type,
+                A_cov=A_cov,
+            )
 
-        # 3. Evaluate WikiText-2 PPL.
-        ppl = _evaluate_wikitext2_ppl(
-            model, val_tensor, device=device,
-            batch_size=validation_batch_size,
-        )
-        results.append((alpha, ppl))
-        log.info("  α=%.1f → WikiText-2 PPL=%.4f", alpha, ppl)
-        _trackio_log({
-            "stage3/alpha_search/alpha": alpha,
-            "stage3/alpha_search/ppl": ppl,
-        })
+            # 2. Factor the full model at these ranks. Forward storage_dtype so
+            # the noise floor in `_aa_svd` matches the main factoring pass —
+            # using the default fp16 floor on a bf16-stored B-cov would
+            # over-truncate. The eigh cache is filled on candidate 0 and reused
+            # thereafter (A2).
+            _factor_model_at_ranks(
+                model, moe_layers, originals, per_expert_ranks, base_ranks,
+                A_cov, B_acc, bcov_spill_dir, C_acc, ccov_spill_dir,
+                device=device, storage_dtype=storage_dtype,
+                gate_up_decomp_cache_dir=eigh_cache_dir,
+            )
 
-        # 4. Restore original fused experts for the next candidate.
-        _restore_fused_experts(model, moe_layers, originals, device=device)
+            # 3. Evaluate WikiText-2 PPL.
+            ppl = _evaluate_wikitext2_ppl(
+                model, val_tensor, device=device,
+                batch_size=validation_batch_size,
+            )
+            results.append((alpha, ppl))
+            log.info("  α=%.1f → WikiText-2 PPL=%.4f", alpha, ppl)
+            _trackio_log({
+                "stage3/alpha_search/alpha": alpha,
+                "stage3/alpha_search/ppl": ppl,
+            })
 
-        if ppl < best_ppl:
-            best_ppl = ppl
-            best_alpha = alpha
+            # 4. Restore original fused experts for the next candidate.
+            _restore_fused_experts(model, moe_layers, originals, device=device)
+
+            if ppl < best_ppl:
+                best_ppl = ppl
+                best_alpha = alpha
+    finally:
+        # (b) Remove the eigh cache on normal + exception exit of the search.
+        if eigh_cache_dir is not None:
+            shutil.rmtree(eigh_cache_dir, ignore_errors=True)
 
     log.info("Stage 3 α-search complete: best α=%.1f (PPL=%.4f)", best_alpha, best_ppl)
     log.info("  full results: %s",
@@ -1148,6 +1272,7 @@ class SwiftSvdAlphaPlugin:
                     ctx.get("ccov_spill_dir") if ctx.has("ccov_spill_dir") else None,
                     config,
                     device=ctx.get("device"),
+                    artifacts_dir=ctx.get("artifacts_dir") if ctx.has("artifacts_dir") else None,
                 )
                 if per_group_type:
                     # Branch (i): proxy runs → grouped_svs is built and reused.

@@ -198,3 +198,176 @@ def test_redistribute_ranks_budget_conservation(monkeypatch):
     # Every expert keeps at least the δ=0.5 rank floor and stays under the cap.
     cap = min(d_out, d_in) - 1
     assert all(1 <= r <= cap for r in out.values())
+
+
+# ---------------------------------------------------------------------------
+# A2 — eigh-decomp spill cache across alpha candidates
+# ---------------------------------------------------------------------------
+
+
+def test_a2_eigh_decomp_roundtrip():
+    """A2: ``_EighDecomp`` serialize→load preserves every field bit-for-bit;
+    the ``None`` ValueError-sentinel round-trips as ``None``."""
+    from moe_compress.stage3.plugins.aa_svd_factor import (
+        _EighDecomp, _precompute_eigh,
+    )
+    from moe_compress.stage3.plugins.swift_svd_alpha import (
+        _serialize_eigh_decomp, _deserialize_eigh_decomp, _EIGH_DECOMP_FIELDS,
+    )
+
+    torch.manual_seed(7)
+    d = 12
+    X = torch.randn(40, d)
+    B = X.T @ X  # PSD Gram with positive eigenvalues
+    decomp = _precompute_eigh(B, None, None, device=torch.device("cpu"))
+
+    payload = _serialize_eigh_decomp(decomp)
+    back = _deserialize_eigh_decomp(payload, _EighDecomp)
+    for f in _EIGH_DECOMP_FIELDS:
+        a, b = getattr(decomp, f), getattr(back, f)
+        if isinstance(a, torch.Tensor):
+            assert torch.equal(a, b), f"field {f} differs after round-trip"
+        else:
+            assert a == b, f"scalar field {f} differs after round-trip"
+
+    # None sentinel round-trips as None.
+    assert _serialize_eigh_decomp(None) is None
+    assert _deserialize_eigh_decomp(None, _EighDecomp) is None
+
+
+def _build_cov_for_layers(moe_layers, *, cross, seed):
+    """Populate + finalize a B (and optional C) accumulator with random PSD
+    covariances for every (layer, expert) so the eigh path engages."""
+    from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
+    from moe_compress.utils.model_io import MATRIX_NAMES
+
+    torch.manual_seed(seed)
+    B = InputCovarianceAccumulator(); B.set_storage_dtype(torch.float32)
+    C = None
+    if cross:
+        C = InputCovarianceAccumulator(); C.set_storage_dtype(torch.float32)
+    for ref in moe_layers:
+        ex = ref.experts_module
+        d_hid = ex.gate_up_proj.shape[-1]
+        d_int = ex.gate_up_proj.shape[1] // 2
+        for e in range(ref.num_routed_experts):
+            # gate_proj (up_proj aliases to it inside the accumulator).
+            xg = torch.randn(32, d_hid)
+            B.update(ref.layer_idx, e, "gate_proj", xg)
+            # down_proj input is intermediate-dim.
+            xd = torch.randn(32, d_int)
+            B.update(ref.layer_idx, e, "down_proj", xd)
+            if C is not None:
+                # cross-cov X_pre^T @ X_post (gate_proj only, per the pipeline).
+                xpre = torch.randn(32, d_hid)
+                C.update_cross(
+                    ref.layer_idx, e, "gate_proj", xpre.T @ xg, n_tokens=32,
+                )
+        B.finalize_layer(ref.layer_idx)
+        if C is not None:
+            C.finalize_layer(ref.layer_idx)
+    return B, C
+
+
+def _spill_cov(acc, moe_layers, dir_path):
+    for ref in moe_layers:
+        acc.spill_layer_to_disk(ref.layer_idx, dir_path)
+
+
+def _factored_uv_snapshot(moe_layers):
+    """Snapshot every installed FactoredExperts U/V tensor for comparison."""
+    from moe_compress.utils.model_io import MATRIX_NAMES
+    snap = {}
+    for ref in moe_layers:
+        ex = ref.experts_module
+        for e in range(ref.num_routed_experts):
+            for name in MATRIX_NAMES:
+                snap[(ref.layer_idx, e, name, "U")] = getattr(ex, f"{name}_U")[e].clone()
+                snap[(ref.layer_idx, e, name, "V")] = getattr(ex, f"{name}_V")[e].clone()
+    return snap
+
+
+def _run_cache_test(model_factory, tmp_path, cross):
+    """A2: factoring with the per-layer eigh spill cache ENABLED produces
+    BYTE-IDENTICAL FactoredExperts U/V (``torch.equal``) to factoring with the
+    cache DISABLED, across two distinct rank allocations (mimicking the
+    alpha-major candidate loop where candidate 0 fills the cache and candidate
+    1 reads it)."""
+    import copy
+    from moe_compress.stage3.plugins.swift_svd_alpha import (
+        _snapshot_originals, _factor_model_at_ranks, _restore_fused_experts,
+    )
+    from moe_compress.utils.model_io import iter_moe_layers, MATRIX_NAMES
+
+    device = torch.device("cpu")
+    bdir = tmp_path / "bcov"; bdir.mkdir()
+    cdir = (tmp_path / "ccov"); cdir.mkdir() if cross else None
+    ccov_dir = cdir if cross else None
+
+    def make():
+        m = copy.deepcopy(model_factory).eval()
+        return m, list(iter_moe_layers(m))
+
+    # Two rank allocations to mimic two alpha candidates.
+    def ranks_for(moe, scale):
+        ex0 = moe[0].experts_module
+        d_int = ex0.gate_up_proj.shape[1] // 2
+        d_hid = ex0.gate_up_proj.shape[-1]
+        base = {}
+        for ref in moe:
+            for name in MATRIX_NAMES:
+                cap = min(
+                    (d_int if name != "down_proj" else d_hid),
+                    (d_hid if name != "down_proj" else d_int),
+                )
+                base[(ref.layer_idx, name)] = max(1, min(scale, cap - 1))
+        return base, {}
+
+    results = {}
+    for use_cache in (False, True):
+        m, moe = make()
+        originals = _snapshot_originals(moe)
+        Bacc, Cacc = _build_cov_for_layers(moe, cross=cross, seed=3)
+        _spill_cov(Bacc, moe, bdir)
+        if cross:
+            _spill_cov(Cacc, moe, ccov_dir)
+        # Drop in-memory cov so factor must load from spill (matches prod).
+        for ref in moe:
+            Bacc.unload_layer(ref.layer_idx)
+            if cross:
+                Cacc.unload_layer(ref.layer_idx)
+
+        cache_dir = str(tmp_path / f"eigh_cache_{cross}") if use_cache else None
+        if use_cache:
+            import shutil
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+        snaps = []
+        for ci, scale in enumerate((2, 3)):
+            base_ranks, per_expert = ranks_for(moe, scale)
+            _factor_model_at_ranks(
+                m, moe, originals, per_expert, base_ranks,
+                {}, Bacc, bdir, Cacc, ccov_dir,
+                device=device, storage_dtype=torch.float32,
+                gate_up_decomp_cache_dir=cache_dir,
+            )
+            snaps.append(_factored_uv_snapshot(moe))
+            _restore_fused_experts(m, moe, originals, device=device)
+        results[use_cache] = snaps
+
+    # Cache-on must match cache-off for BOTH candidates, every key.
+    for ci in range(2):
+        off = results[False][ci]
+        on = results[True][ci]
+        assert set(off) == set(on)
+        for k in off:
+            assert torch.equal(off[k], on[k]), \
+                f"candidate {ci}: cache-on != cache-off at {k}"
+
+
+def test_a2_eigh_cache_byte_identical_nocross(tiny_model, tmp_path):
+    _run_cache_test(tiny_model, tmp_path, cross=False)
+
+
+def test_a2_eigh_cache_byte_identical_cross(tiny_model, tmp_path):
+    _run_cache_test(tiny_model, tmp_path, cross=True)
