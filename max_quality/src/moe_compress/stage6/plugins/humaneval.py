@@ -174,29 +174,32 @@ _STAGE6_ATTN_IMPLEMENTATION: str = "eager"  # noqa: F841 — see N1 comment abov
 
 def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None,
                batch_size: int = 8,
-               dataset_revisions: dict[str, str | None] | None = None) -> float:
-    try:
-        from datasets import load_dataset
-    except Exception as err:           # noqa: BLE001
-        log.warning("datasets not available (%s); skipping HumanEval.", err)
-        return float("nan")
-    revision = (dataset_revisions or {}).get("humaneval")
-    # F-iter4-LOW-3: prefer the namespaced HF id ("openai/openai_humaneval");
-    # fall back to the legacy unnamespaced id for HF datasets versions that
-    # haven't migrated yet.
-    ds = None
-    last_err: Exception | None = None
-    for ds_id in ("openai/openai_humaneval", "openai_humaneval"):
-        try:
-            ds = load_dataset(ds_id, split="test", revision=revision)
-            break
-        except Exception as err:           # noqa: BLE001
-            last_err = err
-            log.debug("HumanEval load via %r failed (%s); will try fallback.", ds_id, err)
-    if ds is None:
-        log.warning("HumanEval dataset load failed (%s); skipping.", last_err)
-        return float("nan")
+               dataset_revisions: dict[str, str | None] | None = None,
+               prebuilt: dict | None = None,
+               artifact_out: dict | None = None) -> float:
+    """HumanEval greedy pass@1.
 
+    C7 input-prep dedup (metric-identical)
+    --------------------------------------
+    The prepared problem set (``raw_prompts, prompts, tests, entry_points``,
+    post-HUMANEVAL_LIMIT-truncation, post-chat-format) is a PURE deterministic
+    function of (dataset rows, tokenizer, cfg, dataset_revisions, env limit) —
+    bit-identical on the student and teacher sides. This fn accepts:
+
+    * ``artifact_out`` (out): when a dict is passed, the prepared lists + the
+      build-time ``tokenizer`` object are stored into it for a caller to publish.
+    * ``prebuilt`` (in): when a dict carrying ``{"tokenizer", "raw_prompts",
+      "prompts", "tests", "entry_points"}`` is passed AND
+      ``prebuilt["tokenizer"] is tokenizer`` (object identity — M1
+      tokenizer-identity guard), the prepared lists are reused and the
+      dataset-load + truncate + chat-format are skipped. On ANY mismatch the
+      original build path runs unchanged (metric can never silently desync). The
+      generate() forward + scoring are model-specific and never shared.
+
+    ``collect=`` is populated ONLY on the build path (the student always builds).
+    """
+    # cfg-derived decode/timeout budgets are cheap + identical on both sides;
+    # computed unconditionally (NOT carried in the artifact).
     # Bumped default 512 → 2048 to leave room for thinking-mode traces
     # (Qwen3.5/3.6 think blocks are routinely 1-2k tokens). Override via
     # cfg.max_new_tokens or env STAGE6_MAX_NEW_HE if needed.
@@ -204,42 +207,90 @@ def _humaneval(model, tokenizer, cfg: dict, *, device=None, collect=None,
     max_new = _he_max
     exec_timeout_secs = int(cfg.get("exec_timeout_secs", 10))
 
-    raw_prompts = [row["prompt"] for row in ds]
-    tests = [row["test"] for row in ds]
-    entry_points = [row["entry_point"] for row in ds]
-
-    # Optional problem-count cap for smoke testing the segfault-fix path
-    # without burning 164 generates. Env var wins over cfg. Value 0/unset =
-    # no cap. Truncate prompts/tests/entry_points in lockstep so pass@1
-    # arithmetic still divides by the actual count.
-    _he_limit = int(os.environ.get("HUMANEVAL_LIMIT", cfg.get("limit", 0)) or 0)
-    if _he_limit > 0 and _he_limit < len(raw_prompts):
-        log.warning(
-            "Stage 6 HumanEval: HUMANEVAL_LIMIT=%d active — truncating from "
-            "%d → %d problems (smoke mode; pass@1 computed on subset)",
-            _he_limit, len(raw_prompts), _he_limit,
-        )
-        raw_prompts = raw_prompts[:_he_limit]
-        tests = tests[:_he_limit]
-        entry_points = entry_points[:_he_limit]
-
-    if collect is not None:
-        collect.extend(raw_prompts)
-
-    # Wrap each HumanEval stub with the model's chat template so the chat-
-    # tuned student/teacher actually engage their normal response behavior.
-    # Sending raw stubs to a thinking-mode-default chat model produced 0/164
-    # for the teacher and ~28% for the student in the prior run — the model
-    # decoded `<think>...` filler past max_new_tokens because EOS never fires
-    # on a raw-prompt continuation. (project_a0_student_diagnosis_2026_05_15.md)
-    _enable_thinking = _stage6_enable_thinking()
-    prompts = _chat_format_prompts(
-        tokenizer, raw_prompts,
-        system=(
-            "Complete the Python function. Reply with the full function "
-            "definition inside a ```python code block."
-        ),
+    # C7: M1 tokenizer-identity guard — reuse the prebuilt prepared problem set
+    # ONLY when it was built with this exact tokenizer object.
+    _reuse = (
+        prebuilt is not None
+        and prebuilt.get("prompts") is not None
+        and prebuilt.get("tokenizer") is tokenizer
     )
+    if _reuse:
+        raw_prompts = prebuilt["raw_prompts"]
+        prompts = prebuilt["prompts"]
+        tests = prebuilt["tests"]
+        entry_points = prebuilt["entry_points"]
+        _enable_thinking = _stage6_enable_thinking()
+        log.info("Stage 6 HumanEval: reusing prebuilt prompts (%d) — input prep deduped",
+                 len(prompts))
+    else:
+        try:
+            from datasets import load_dataset
+        except Exception as err:           # noqa: BLE001
+            log.warning("datasets not available (%s); skipping HumanEval.", err)
+            return float("nan")
+        revision = (dataset_revisions or {}).get("humaneval")
+        # F-iter4-LOW-3: prefer the namespaced HF id ("openai/openai_humaneval");
+        # fall back to the legacy unnamespaced id for HF datasets versions that
+        # haven't migrated yet.
+        ds = None
+        last_err: Exception | None = None
+        for ds_id in ("openai/openai_humaneval", "openai_humaneval"):
+            try:
+                ds = load_dataset(ds_id, split="test", revision=revision)
+                break
+            except Exception as err:           # noqa: BLE001
+                last_err = err
+                log.debug("HumanEval load via %r failed (%s); will try fallback.", ds_id, err)
+        if ds is None:
+            log.warning("HumanEval dataset load failed (%s); skipping.", last_err)
+            return float("nan")
+
+        raw_prompts = [row["prompt"] for row in ds]
+        tests = [row["test"] for row in ds]
+        entry_points = [row["entry_point"] for row in ds]
+
+        # Optional problem-count cap for smoke testing the segfault-fix path
+        # without burning 164 generates. Env var wins over cfg. Value 0/unset =
+        # no cap. Truncate prompts/tests/entry_points in lockstep so pass@1
+        # arithmetic still divides by the actual count.
+        _he_limit = int(os.environ.get("HUMANEVAL_LIMIT", cfg.get("limit", 0)) or 0)
+        if _he_limit > 0 and _he_limit < len(raw_prompts):
+            log.warning(
+                "Stage 6 HumanEval: HUMANEVAL_LIMIT=%d active — truncating from "
+                "%d → %d problems (smoke mode; pass@1 computed on subset)",
+                _he_limit, len(raw_prompts), _he_limit,
+            )
+            raw_prompts = raw_prompts[:_he_limit]
+            tests = tests[:_he_limit]
+            entry_points = entry_points[:_he_limit]
+
+        if collect is not None:
+            collect.extend(raw_prompts)
+
+        # Wrap each HumanEval stub with the model's chat template so the chat-
+        # tuned student/teacher actually engage their normal response behavior.
+        # Sending raw stubs to a thinking-mode-default chat model produced 0/164
+        # for the teacher and ~28% for the student in the prior run — the model
+        # decoded `<think>...` filler past max_new_tokens because EOS never fires
+        # on a raw-prompt continuation. (project_a0_student_diagnosis_2026_05_15.md)
+        _enable_thinking = _stage6_enable_thinking()
+        prompts = _chat_format_prompts(
+            tokenizer, raw_prompts,
+            system=(
+                "Complete the Python function. Reply with the full function "
+                "definition inside a ```python code block."
+            ),
+        )
+
+    # C7: publish the prepared (post-truncation, post-format) problem set + the
+    # tokenizer identity so a caller (the student plugin) can hand it to the
+    # teacher side via ``prebuilt``.
+    if artifact_out is not None:
+        artifact_out["tokenizer"] = tokenizer
+        artifact_out["raw_prompts"] = raw_prompts
+        artifact_out["prompts"] = prompts
+        artifact_out["tests"] = tests
+        artifact_out["entry_points"] = entry_points
     log.info("Stage 6 HumanEval: %d problems, batch_size=%d, max_new=%d, "
              "enable_thinking=%s, chat_template=on",
              len(prompts), batch_size, max_new, _enable_thinking)
@@ -457,7 +508,9 @@ class HumanEvalPlugin:
         "pre_compile_forward",
         "experts_implementation_generative",
     )
-    writes: tuple[str, ...] = ("eval_results",)
+    # C7: ``prebuilt_humaneval`` carries the prepared problem set + tokenizer
+    # identity to the teacher side for input-prep dedup (metric-identical).
+    writes: tuple[str, ...] = ("eval_results", "prebuilt_humaneval")
     # eval_results is a shared collector the orchestrator pre-creates per side
     # and every eval plugin appends to; it is NOT a calibration-pass accumulator,
     # so it belongs in `writes`, not `provides`. (S6-8 wires the collector.)
@@ -595,11 +648,20 @@ class HumanEvalPlugin:
                 _set_experts_implementation_s6(model, _gen_impl)
 
         eval_results = ctx.get("eval_results")
+        # C7: capture the prepared problem set (+ tokenizer identity) and publish
+        # it so the teacher side can reuse the input prep. The pass@1 is computed
+        # from the student's own generate()+scoring over these prompts; the
+        # artifact is a pure function of (dataset, tokenizer, cfg) so reuse is
+        # bit-exact.
+        _artifact: dict[str, Any] = {}
         eval_results["humaneval_pass_at_1"] = _humaneval(
             model, tokenizer, s6["generative"]["humaneval"], device=device,
             collect=collect, batch_size=gen_batch_size,
             dataset_revisions=dataset_revisions,
+            artifact_out=_artifact,
         )
+        if _artifact:
+            ctx.set("prebuilt_humaneval", _artifact)
 
 
 __all__ = ["_humaneval", "_check_humaneval", "HumanEvalPlugin"]

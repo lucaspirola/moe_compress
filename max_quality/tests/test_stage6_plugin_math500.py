@@ -110,7 +110,9 @@ def test_plugin_metadata():
         "pre_compile_forward",
         "experts_implementation_generative",
     )
-    assert plugin.writes == ("eval_results",)
+    # C7: writes the prebuilt-input-prep artifact slot in addition to the
+    # shared eval_results collector (teacher-side input-prep dedup).
+    assert plugin.writes == ("eval_results", "prebuilt_math500")
     # eval_results is a shared collector (in `writes`), not a calibration-pass
     # accumulator — `provides` is empty.
     assert plugin.provides == ()

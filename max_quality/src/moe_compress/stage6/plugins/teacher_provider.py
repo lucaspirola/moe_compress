@@ -337,6 +337,9 @@ class TeacherProviderPlugin:
     reads: tuple[str, ...] = (
         "config", "artifacts_dir", "tokenizer", "dataset_revisions",
         "experts_impl", "use_torch_compile",
+        # C7: student-published input-prep artifacts reused (M1 is-guarded) to
+        # skip the redundant dataset-load + tokenize/chat-format on this side.
+        "prebuilt_wikitext2", "prebuilt_humaneval", "prebuilt_math500",
     )
     writes: tuple[str, ...] = ("teacher_results", "teacher_param_counts")
     # teacher_results is a per-side collector dict (the `results["teacher"]`
@@ -572,6 +575,23 @@ class TeacherProviderPlugin:
                 gen_batch_size, PINNED_GEN_BATCH_SIZE,
             )
 
+        # C7: reuse the student-built input-prep artifacts when present. Each
+        # helper applies the M1 tokenizer-identity guard internally (reuse ONLY
+        # when the artifact's tokenizer object IS this teacher tokenizer), so a
+        # future distinct-teacher-tokenizer falls back to a full rebuild and the
+        # reported metric can never silently desync — worst case is the lost
+        # optimization. The forwards are model-specific and NOT shared; only the
+        # input preparation (dataset-load + tokenize/chat-format) is deduped.
+        _prebuilt_wikitext2 = (
+            ctx.get("prebuilt_wikitext2") if ctx.has("prebuilt_wikitext2") else None
+        )
+        _prebuilt_humaneval = (
+            ctx.get("prebuilt_humaneval") if ctx.has("prebuilt_humaneval") else None
+        )
+        _prebuilt_math500 = (
+            ctx.get("prebuilt_math500") if ctx.has("prebuilt_math500") else None
+        )
+
         # Step 5: conditional teacher-side eval calls (gated by the same
         # flags run() uses).
         teacher_results: dict[str, Any] = {}
@@ -579,6 +599,7 @@ class TeacherProviderPlugin:
             teacher_results["wikitext2_ppl"] = _wikitext2_ppl(
                 teacher, tokenizer, s6["wikitext2"], device=device,
                 batch_size=ppl_batch_size, dataset_revisions=dataset_revisions,
+                prebuilt=_prebuilt_wikitext2,
             )
         if s6["zero_shot"]["enabled"]:
             teacher_results.update(
@@ -621,11 +642,13 @@ class TeacherProviderPlugin:
                 teacher_results["humaneval_pass_at_1"] = _humaneval(
                     teacher, tokenizer, s6["generative"]["humaneval"], device=device,
                     batch_size=gen_batch_size, dataset_revisions=dataset_revisions,
+                    prebuilt=_prebuilt_humaneval,
                 )
             if "math500" in s6["generative"]:
                 teacher_results["math500_accuracy"] = _math500(
                     teacher, tokenizer, s6["generative"]["math500"], device=device,
                     batch_size=gen_batch_size, dataset_revisions=dataset_revisions,
+                    prebuilt=_prebuilt_math500,
                 )
 
         # Step 6: param counts + optional cache save.

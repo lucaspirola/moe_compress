@@ -105,7 +105,9 @@ _DEFAULT_PPL_BATCH_SIZE: int = 8
 
 def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
                    batch_size: int = _DEFAULT_PPL_BATCH_SIZE,
-                   dataset_revisions: dict[str, str | None] | None = None) -> float:
+                   dataset_revisions: dict[str, str | None] | None = None,
+                   prebuilt: dict | None = None,
+                   artifact_out: dict | None = None) -> float:
     """Standard next-token NLL → exp(mean_NLL), seq_len=2048.
 
     Batching doesn't change NLL computation — each sequence is scored
@@ -120,6 +122,30 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
     BOTH teacher and student to remove cross-batch sdpa-kernel variance and
     preserve the bs=1 ↔ bs>1 numerical-equivalence claim of Optimization #1.
     F-iter4-L-4: assert sequence_length == 2048 (Spec §9 line 769).
+
+    C7 input-prep dedup (metric-identical)
+    --------------------------------------
+    The tokenized ``chunks`` tensor is a PURE deterministic function of
+    (dataset rows, tokenizer, cfg, dataset_revisions) — bit-identical on the
+    student and teacher sides. To skip the redundant dataset-load + whole-corpus
+    tokenize on the teacher side this fn accepts an optional prebuilt artifact:
+
+    * ``artifact_out`` (out): when a dict is passed, the built ``chunks`` tensor
+      and the build-time ``tokenizer`` object reference are stored into it so a
+      caller (the student plugin) can publish them to a ctx slot.
+    * ``prebuilt`` (in): when a dict carrying ``{"tokenizer": ..., "chunks":
+      ...}`` is passed AND ``prebuilt["tokenizer"] is tokenizer`` (object
+      identity — M1 tokenizer-identity guard), the prebuilt ``chunks`` are
+      reused READ-ONLY (only sliced for the forward) and the dataset-load +
+      tokenize are skipped. On ANY mismatch (no prebuilt, or a DISTINCT
+      tokenizer object) the original build path runs unchanged, so the reported
+      PPL can never silently desync — worst case is the lost optimization. The
+      forward itself is model-specific and never shared.
+
+    NOTE the ``collect=`` side-channel is populated ONLY on the build path
+    (the student side, which always builds). The teacher side never passes
+    ``collect`` and reuses ``chunks`` read-only, so reuse cannot drop a
+    collected row.
     """
     # F-iter4-L-4: PPL chunk length is fixed by spec.
     assert int(cfg.get("sequence_length", 0)) == 2048, (
@@ -137,43 +163,63 @@ def _wikitext2_ppl(model, tokenizer, cfg: dict, *, device=None, collect=None,
         f"for the Stage 6 gate run. The student must be loaded with "
         f"attn_implementation='eager' (see run_pipeline._load_for_stage)."
     )
-    from datasets import load_dataset
+    # C7: M1 tokenizer-identity guard. Reuse the prebuilt tokenized ``chunks``
+    # ONLY when the artifact was built with this exact tokenizer object; else
+    # fall through to the full build below (metric can never silently desync).
+    _reuse = (
+        prebuilt is not None
+        and prebuilt.get("chunks") is not None
+        and prebuilt.get("tokenizer") is tokenizer
+    )
+    if _reuse:
+        chunks = prebuilt["chunks"]
+        n_full = int(chunks.shape[0])
+        seq_len = cfg["sequence_length"]
+        log.info("Stage 6 PPL: reusing prebuilt chunks (%d seqs) — input prep deduped", n_full)
+    else:
+        from datasets import load_dataset
 
-    revision = (dataset_revisions or {}).get("wikitext_ppl")
-    try:
-        ds = load_dataset(cfg["dataset"], cfg["subset"], split=cfg["split"], revision=revision)
-    except Exception as exc:
-        log.warning("_wikitext2_ppl: load_dataset failed (%s); returning inf PPL", exc)
-        return float("inf")
-    # F-CR2-H-1/H-2 (Spec §9 / F-S-C-1): tokenize the entire concatenated corpus
-    # in a single call with add_special_tokens=True. This:
-    #   - applies BOS exactly once (closes F-CR2-H-2),
-    #   - inserts no inter-row separator tokens beyond the natural newline that
-    #     wikitext-2-raw-v1 already uses (closes F-CR2-H-1),
-    #   - matches the canonical HF / lm-eval WikiText-2 PPL recipe.
-    rows: list[str] = []
-    for row in ds:
-        text = row.get("text", "")
-        # Spec §9 / F-S-C-1 says BOS is applied once on the concatenated text;
-        # the row-to-row joiner is "\n\n" matching the canonical HF / lm-eval
-        # PPL recipe. Empty rows ARE preserved here (canonical recipe keeps
-        # them, producing a "\n\n" + "" + "\n\n" sequence that turns into the
-        # expected paragraph-spacing tokens). Filtering empties would change
-        # the token stream and chunk boundaries vs. the cited recipe.
-        if collect is not None and text.strip():
-            collect.append(text)
-        rows.append(text)
-    concatenated = "\n\n".join(rows)
-    all_ids: list[int] = tokenizer(
-        concatenated, add_special_tokens=True, return_tensors=None,
-    )["input_ids"]
+        revision = (dataset_revisions or {}).get("wikitext_ppl")
+        try:
+            ds = load_dataset(cfg["dataset"], cfg["subset"], split=cfg["split"], revision=revision)
+        except Exception as exc:
+            log.warning("_wikitext2_ppl: load_dataset failed (%s); returning inf PPL", exc)
+            return float("inf")
+        # F-CR2-H-1/H-2 (Spec §9 / F-S-C-1): tokenize the entire concatenated corpus
+        # in a single call with add_special_tokens=True. This:
+        #   - applies BOS exactly once (closes F-CR2-H-2),
+        #   - inserts no inter-row separator tokens beyond the natural newline that
+        #     wikitext-2-raw-v1 already uses (closes F-CR2-H-1),
+        #   - matches the canonical HF / lm-eval WikiText-2 PPL recipe.
+        rows: list[str] = []
+        for row in ds:
+            text = row.get("text", "")
+            # Spec §9 / F-S-C-1 says BOS is applied once on the concatenated text;
+            # the row-to-row joiner is "\n\n" matching the canonical HF / lm-eval
+            # PPL recipe. Empty rows ARE preserved here (canonical recipe keeps
+            # them, producing a "\n\n" + "" + "\n\n" sequence that turns into the
+            # expected paragraph-spacing tokens). Filtering empties would change
+            # the token stream and chunk boundaries vs. the cited recipe.
+            if collect is not None and text.strip():
+                collect.append(text)
+            rows.append(text)
+        concatenated = "\n\n".join(rows)
+        all_ids: list[int] = tokenizer(
+            concatenated, add_special_tokens=True, return_tensors=None,
+        )["input_ids"]
 
-    seq_len = cfg["sequence_length"]
-    n_full = len(all_ids) // seq_len
-    if n_full == 0:
-        log.warning("WikiText-2 has no full-length sequences; returning inf.")
-        return float("inf")
-    chunks = torch.tensor(all_ids[: n_full * seq_len], dtype=torch.long).view(n_full, seq_len)
+        seq_len = cfg["sequence_length"]
+        n_full = len(all_ids) // seq_len
+        if n_full == 0:
+            log.warning("WikiText-2 has no full-length sequences; returning inf.")
+            return float("inf")
+        chunks = torch.tensor(all_ids[: n_full * seq_len], dtype=torch.long).view(n_full, seq_len)
+
+    # C7: publish the built/reused artifact + the tokenizer identity so a caller
+    # (the student plugin) can hand it to the teacher side via ``prebuilt``.
+    if artifact_out is not None:
+        artifact_out["tokenizer"] = tokenizer
+        artifact_out["chunks"] = chunks
 
     nll_sum = 0.0
     tok_count = 0
@@ -272,7 +318,9 @@ class WikitextPplPlugin:
     )
     config_key = "stage6_validate.wikitext2.enabled"
     reads: tuple[str, ...] = ("model", "tokenizer", "config", "dataset_revisions")
-    writes: tuple[str, ...] = ("eval_results",)
+    # C7: ``prebuilt_wikitext2`` carries the tokenized chunks + tokenizer
+    # identity to the teacher side for input-prep dedup (metric-identical).
+    writes: tuple[str, ...] = ("eval_results", "prebuilt_wikitext2")
     # eval_results is a shared collector the orchestrator pre-creates per side
     # and every eval plugin appends to; it is NOT a calibration-pass accumulator,
     # so it belongs in `writes`, not `provides`. (S6-8 wires the collector.)
@@ -341,10 +389,18 @@ class WikitextPplPlugin:
 
         log.info("Stage 6: WikiText-2 PPL (student), batch_size=%d", int(ppl_batch_size))
         eval_results = ctx.get("eval_results")
+        # C7: capture the tokenized-chunks artifact (+ tokenizer identity) and
+        # publish it so the teacher side can reuse the input prep. The metric is
+        # computed from the student's own forward over these chunks; the artifact
+        # is a pure function of (dataset, tokenizer, cfg) so reuse is bit-exact.
+        _artifact: dict[str, Any] = {}
         eval_results["wikitext2_ppl"] = _wikitext2_ppl(
             model, tokenizer, s6["wikitext2"], device=device, collect=collect,
             batch_size=ppl_batch_size, dataset_revisions=dataset_revisions,
+            artifact_out=_artifact,
         )
+        if _artifact:
+            ctx.set("prebuilt_wikitext2", _artifact)
 
 
 __all__ = ["_wikitext2_ppl", "WikitextPplPlugin"]

@@ -123,60 +123,113 @@ except Exception:  # noqa: BLE001
 
 def _math500(model, tokenizer, cfg: dict, *, device=None, collect=None,
              batch_size: int = 8,
-             dataset_revisions: dict[str, str | None] | None = None) -> float:
-    try:
-        from datasets import load_dataset
-    except Exception as err:           # noqa: BLE001
-        log.warning("datasets not available (%s); skipping MATH-500.", err)
-        return float("nan")
-    revision = (dataset_revisions or {}).get("math500")
-    try:
-        ds = load_dataset("HuggingFaceH4/MATH-500", split="test", revision=revision)
-    except Exception as err:           # noqa: BLE001
-        log.warning("MATH-500 dataset load failed (%s); skipping.", err)
-        return float("nan")
+             dataset_revisions: dict[str, str | None] | None = None,
+             prebuilt: dict | None = None,
+             artifact_out: dict | None = None) -> float:
+    """MATH-500 accuracy.
 
+    C7 input-prep dedup (metric-identical)
+    --------------------------------------
+    The prepared problem set (``raw_problems, prompts, answers``, post-select,
+    post-chat-format) is a PURE deterministic function of (dataset rows,
+    tokenizer, cfg, dataset_revisions) — bit-identical on the student and teacher
+    sides. This fn accepts:
+
+    * ``artifact_out`` (out): when a dict is passed, the prepared lists + the
+      build-time ``tokenizer`` object are stored into it for a caller to publish.
+    * ``prebuilt`` (in): when a dict carrying ``{"tokenizer", "raw_problems",
+      "prompts", "answers"}`` is passed AND ``prebuilt["tokenizer"] is
+      tokenizer`` (object identity — M1 tokenizer-identity guard), the prepared
+      lists are reused and the dataset-load + select + chat-format are skipped.
+      On ANY mismatch the original build path runs unchanged (metric can never
+      silently desync). The generate() forward + SymPy grading are
+      model-specific and never shared. On reuse the spec-gate (full-benchmark)
+      check is implicitly satisfied — the student already validated it when it
+      built the artifact.
+
+    ``collect=`` is populated ONLY on the build path (the student always builds).
+    """
+    # cfg-derived decode budget is cheap + identical on both sides; computed
+    # unconditionally (NOT carried in the artifact).
     # Bumped default 1024 → 4096 for thinking-mode (math reasoning traces
     # are routinely 2-4k tokens before the boxed answer).
     max_new = int(os.environ.get("STAGE6_MAX_NEW_MATH", cfg.get("max_new_tokens", 4096)) or 4096)
-    n = int(cfg.get("num_samples", 500))
-    if n > len(ds):
-        # N5: Warn explicitly rather than silently clamping, so config errors are visible.
-        log.warning(
-            "MATH-500: num_samples=%d exceeds dataset size=%d; clamping to %d",
-            n, len(ds), len(ds),
-        )
-    n_total = min(n, len(ds))
-    # Spec §9 mandates "MATH-500 (500 prompts)" — the gate is computed over
-    # the full benchmark, not a subset. Refuse to under-sample silently.
-    if n_total < len(ds):
-        raise ValueError(
-            f"MATH-500: configured num_samples={n} produces n_total={n_total} but "
-            f"the spec gate requires all {len(ds)} prompts. Either set "
-            "generative.math500.num_samples=500 (or omit) or update the spec to "
-            "permit subset evaluation."
-        )
 
-    selected = ds.select(range(n_total))
-    raw_problems = [row["problem"] for row in selected]
-    answers = [row.get("answer", "") for row in selected]
-
-    if collect is not None:
-        collect.extend(raw_problems)
-
-    # Wrap each problem with the model's chat template — thinking-mode chat
-    # models produce CoT reasoning + a \boxed{answer}. The downstream
-    # _check_math uses _extract_boxed / _last_numeric which work on
-    # free-form text. Same harness fix as HumanEval; see
-    # project_a0_student_diagnosis_2026_05_15.md.
-    _enable_thinking = _stage6_enable_thinking()
-    prompts = _chat_format_prompts(
-        tokenizer, raw_problems,
-        system=(
-            "Solve the math problem. Show your reasoning, then write the "
-            "final answer inside \\boxed{...}."
-        ),
+    # C7: M1 tokenizer-identity guard — reuse the prebuilt prepared problem set
+    # ONLY when it was built with this exact tokenizer object.
+    _reuse = (
+        prebuilt is not None
+        and prebuilt.get("prompts") is not None
+        and prebuilt.get("tokenizer") is tokenizer
     )
+    if _reuse:
+        raw_problems = prebuilt["raw_problems"]
+        prompts = prebuilt["prompts"]
+        answers = prebuilt["answers"]
+        n_total = len(prompts)
+        _enable_thinking = _stage6_enable_thinking()
+        log.info("Stage 6 MATH-500: reusing prebuilt prompts (%d) — input prep deduped",
+                 n_total)
+    else:
+        try:
+            from datasets import load_dataset
+        except Exception as err:           # noqa: BLE001
+            log.warning("datasets not available (%s); skipping MATH-500.", err)
+            return float("nan")
+        revision = (dataset_revisions or {}).get("math500")
+        try:
+            ds = load_dataset("HuggingFaceH4/MATH-500", split="test", revision=revision)
+        except Exception as err:           # noqa: BLE001
+            log.warning("MATH-500 dataset load failed (%s); skipping.", err)
+            return float("nan")
+
+        n = int(cfg.get("num_samples", 500))
+        if n > len(ds):
+            # N5: Warn explicitly rather than silently clamping, so config errors are visible.
+            log.warning(
+                "MATH-500: num_samples=%d exceeds dataset size=%d; clamping to %d",
+                n, len(ds), len(ds),
+            )
+        n_total = min(n, len(ds))
+        # Spec §9 mandates "MATH-500 (500 prompts)" — the gate is computed over
+        # the full benchmark, not a subset. Refuse to under-sample silently.
+        if n_total < len(ds):
+            raise ValueError(
+                f"MATH-500: configured num_samples={n} produces n_total={n_total} but "
+                f"the spec gate requires all {len(ds)} prompts. Either set "
+                "generative.math500.num_samples=500 (or omit) or update the spec to "
+                "permit subset evaluation."
+            )
+
+        selected = ds.select(range(n_total))
+        raw_problems = [row["problem"] for row in selected]
+        answers = [row.get("answer", "") for row in selected]
+
+        if collect is not None:
+            collect.extend(raw_problems)
+
+        # Wrap each problem with the model's chat template — thinking-mode chat
+        # models produce CoT reasoning + a \boxed{answer}. The downstream
+        # _check_math uses _extract_boxed / _last_numeric which work on
+        # free-form text. Same harness fix as HumanEval; see
+        # project_a0_student_diagnosis_2026_05_15.md.
+        _enable_thinking = _stage6_enable_thinking()
+        prompts = _chat_format_prompts(
+            tokenizer, raw_problems,
+            system=(
+                "Solve the math problem. Show your reasoning, then write the "
+                "final answer inside \\boxed{...}."
+            ),
+        )
+
+    # C7: publish the prepared (post-select, post-format) problem set + the
+    # tokenizer identity so a caller (the student plugin) can hand it to the
+    # teacher side via ``prebuilt``.
+    if artifact_out is not None:
+        artifact_out["tokenizer"] = tokenizer
+        artifact_out["raw_problems"] = raw_problems
+        artifact_out["prompts"] = prompts
+        artifact_out["answers"] = answers
     log.info("Stage 6 MATH-500: %d problems, batch_size=%d, max_new=%d, "
              "enable_thinking=%s, chat_template=on",
              n_total, batch_size, max_new, _enable_thinking)
@@ -330,7 +383,9 @@ class Math500Plugin:
         "pre_compile_forward",
         "experts_implementation_generative",
     )
-    writes: tuple[str, ...] = ("eval_results",)
+    # C7: ``prebuilt_math500`` carries the prepared problem set + tokenizer
+    # identity to the teacher side for input-prep dedup (metric-identical).
+    writes: tuple[str, ...] = ("eval_results", "prebuilt_math500")
     # eval_results is a shared collector the orchestrator pre-creates per side
     # and every eval plugin appends to; it is NOT a calibration-pass accumulator,
     # so it belongs in `writes`, not `provides`. (S6-8 wires the collector.)
@@ -438,11 +493,20 @@ class Math500Plugin:
 
         log.info("Stage 6: MATH-500 (student), batch_size=%d", int(gen_batch_size))
         eval_results = ctx.get("eval_results")
+        # C7: capture the prepared problem set (+ tokenizer identity) and publish
+        # it so the teacher side can reuse the input prep. The accuracy is
+        # computed from the student's own generate()+grading over these prompts;
+        # the artifact is a pure function of (dataset, tokenizer, cfg) so reuse
+        # is bit-exact.
+        _artifact: dict[str, Any] = {}
         eval_results["math500_accuracy"] = _math500(
             model, tokenizer, s6["generative"]["math500"], device=device,
             collect=collect, batch_size=gen_batch_size,
             dataset_revisions=dataset_revisions,
+            artifact_out=_artifact,
         )
+        if _artifact:
+            ctx.set("prebuilt_math500", _artifact)
 
 
 __all__ = [
