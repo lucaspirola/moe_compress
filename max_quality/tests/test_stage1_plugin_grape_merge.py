@@ -281,3 +281,153 @@ def test_plugin_run_rejects_missing_slot(missing_slot):
     with pytest.raises(KeyError) as exc:
         GrapeMergePlugin().run(ctx)
     assert missing_slot in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# 5. C8 persistent-mask GATE — byte-identical greedy-merge parity golden.
+#
+# This is a dedicated parity gate for the C8 speed-up that replaces the
+# per-iteration ``tmp = D_l.copy()`` mask rebuild with a persistent per-layer
+# ``tmp_l``.  The fixture is hand-tuned so that a SINGLE ``_grape_greedy_merge``
+# call exercises all four high-risk branches of the greedy loop:
+#
+#   (a) blacklisted experts        — every layer has a non-empty blacklist
+#                                     (layer 0 has TWO, driving floor->0).
+#   (b) structural-block trigger   — layer 0 (2 of 4 experts blacklisted, so
+#                                     only experts {0,3} are mergeable; after
+#                                     one merge no finite pair remains while the
+#                                     count is still above the floor) hits the
+#                                     ``if not np.isfinite(...).any()`` branch.
+#   (c) entropy freeze + restart   — gamma=0.02 makes E_hat just below E_init,
+#                                     so the first entropy-reducing merge per
+#                                     layer freezes it; once all non-permanently
+#                                     -blocked layers are frozen the loop
+#                                     restarts (both the top-of-loop and the
+#                                     lag-corrected post-selection restart fire).
+#   (d) zero-distance pair         — layer 0 has D[0,3]==D[3,0]==0.0, a genuine
+#                                     identical-weight pair that argmin SELECTS.
+#
+# The expected budgets are blessed from the PRE-EDIT implementation; the C8
+# edit must leave them byte-identical.  Do NOT regen on failure — a diff here
+# means the persistent-mask refactor changed the merge sequence.
+# ---------------------------------------------------------------------------
+
+
+def _grape_gate_inputs() -> dict:
+    """Hand-tuned GRAPE input that hits all four high-risk branches."""
+    n = 4
+    D0 = torch.full((n, n), 0.3, dtype=torch.float32)
+    D0.fill_diagonal_(0.0)
+    # Genuine zero-distance (identical) pair among the two non-blacklisted
+    # experts {0, 3} of layer 0 — branch (d).
+    D0[0, 3] = 0.0
+    D0[3, 0] = 0.0
+    # Layers 1 & 2: tightly clustered (0.1) so a single merge sharply reduces
+    # entropy and trips the freeze gate — branch (c).
+    D1 = torch.full((n, n), 0.1, dtype=torch.float32)
+    D1.fill_diagonal_(0.0)
+    D2 = torch.full((n, n), 0.1, dtype=torch.float32)
+    D2.fill_diagonal_(0.0)
+    return {
+        "D_matrices": {0: D0, 1: D1, 2: D2},
+        "per_layer_counts": {0: n, 1: n, 2: n},
+        # Branch (a): every layer blacklisted; layer 0 has TWO (floor -> 0)
+        # which is what lets it reach the structural-block branch (b).
+        "blacklist": {0: [1, 2], 1: [3], 2: [0]},
+        "global_budget": 3,
+        "gamma": 0.02,
+    }
+
+
+# Golden blessed from the PRE-EDIT _grape_greedy_merge on the fixture above.
+_GRAPE_GATE_GOLDEN = {0: 3, 1: 2, 2: 2}
+
+
+def _trace_grape_branches(inputs: dict):
+    """Run ``_grape_greedy_merge`` under a line tracer that records which of
+    the four high-risk branches fired, matching by SOURCE-LINE CONTENT so the
+    detection survives the C8 line-number shifts.  Returns ``(budgets,
+    branches)`` where ``branches`` is a dict of bool flags.
+    """
+    import sys
+    import inspect
+
+    src_file = inspect.getsourcefile(_grape_greedy_merge)
+    # Build absolute line-number -> stripped-text map for the module file so
+    # the tracer can classify a hit by what the executed line *says* (robust
+    # to the C8 line-number shifts).
+    with open(src_file, "r") as fh:
+        file_text = fh.readlines()
+    line_text = {i + 1: ln.strip() for i, ln in enumerate(file_text)}
+
+    flags = {
+        "structural_block": False,
+        "entropy_freeze": False,
+        "restart": False,
+        "zero_distance_selected": False,
+    }
+
+    # Detect each branch by the *content* of the executed line. The
+    # zero-distance check reads the masked distance matrix (named ``tmp`` in
+    # the pre-edit code and ``tmp_l`` after C8) at the argmin-selected index.
+    def tracer(frame, event, arg):
+        if event == "line" and frame.f_code.co_filename == src_file:
+            txt = line_text.get(frame.f_lineno, "")
+            if txt.startswith("structurally_blocked.add(best_layer)"):
+                flags["structural_block"] = True
+            elif txt.startswith("frozen.add(best_layer)"):
+                flags["entropy_freeze"] = True
+            elif txt.startswith("frozen.clear()"):
+                flags["restart"] = True
+            elif txt.startswith("_, j_star = divmod(flat_idx, n)"):
+                masked = frame.f_locals.get("tmp")
+                if masked is None:
+                    masked = frame.f_locals.get("tmp_l")
+                flat_idx = frame.f_locals.get("flat_idx")
+                if masked is not None and flat_idx is not None:
+                    if float(masked.flat[int(flat_idx)]) == 0.0:
+                        flags["zero_distance_selected"] = True
+        return tracer
+
+    sys.settrace(tracer)
+    try:
+        budgets = _grape_greedy_merge(
+            D_matrices=inputs["D_matrices"],
+            global_budget=inputs["global_budget"],
+            per_layer_counts=inputs["per_layer_counts"],
+            blacklist=inputs["blacklist"],
+            gamma=inputs["gamma"],
+        )
+    finally:
+        sys.settrace(None)
+    return budgets, flags
+
+
+def test_grape_gate_all_four_branches_fire():
+    """The gate fixture must exercise all four high-risk branches; if any
+    stops firing the parity argument for C8 no longer covers it."""
+    _, flags = _trace_grape_branches(_grape_gate_inputs())
+    assert flags["structural_block"], "structural-block branch did not fire"
+    assert flags["entropy_freeze"], "entropy-freeze branch did not fire"
+    assert flags["restart"], "entropy-restart branch did not fire"
+    assert flags["zero_distance_selected"], (
+        "zero-distance pair was not selected by argmin"
+    )
+
+
+def test_grape_gate_budgets_byte_identical_to_golden():
+    """C8 persistent-mask parity gate: budgets must stay byte-identical to the
+    pre-edit golden.  A mismatch means the refactor changed the merge order."""
+    inputs = _grape_gate_inputs()
+    budgets = _grape_greedy_merge(
+        D_matrices=inputs["D_matrices"],
+        global_budget=inputs["global_budget"],
+        per_layer_counts=inputs["per_layer_counts"],
+        blacklist=inputs["blacklist"],
+        gamma=inputs["gamma"],
+    )
+    assert budgets == _GRAPE_GATE_GOLDEN, (
+        f"GRAPE budgets {budgets} != golden {_GRAPE_GATE_GOLDEN}; "
+        "the C8 persistent-mask refactor changed the merge sequence."
+    )
+    assert sum(budgets.values()) == 7
