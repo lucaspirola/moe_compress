@@ -1029,6 +1029,25 @@ class InputCovarianceAccumulator:
                 cur.add_(cov)
             self._gpu_token_count[key] = self._gpu_token_count.get(key, 0) + n_tok
 
+    def update_grouped(
+        self, layer_idx: int, expert_idx: int, matrix_name: str,
+        x: torch.Tensor, seq_ids: torch.Tensor | None,
+    ) -> None:
+        """Pinned per-sequence Gram accumulation: split x's rows by seq_ids and
+        accumulate one update per source sequence in ASCENDING seq order. This makes
+        the running Gram independent of the forward batch's sequence-merging, while
+        each per-sequence matmul gets the identical row set (boolean select preserves
+        order) the bs=1 path would. seq_ids None / single distinct value => one plain
+        update (byte-identical to today's bs=1 path). update_grouped OWNS the
+        single-vs-split decision — callers do not pre-guard on token count."""
+        if seq_ids is None:
+            self.update(layer_idx, expert_idx, matrix_name, x); return
+        uniq = torch.unique(seq_ids, sorted=True)         # ascending order is load-bearing
+        if uniq.numel() <= 1:
+            self.update(layer_idx, expert_idx, matrix_name, x); return
+        for s in uniq.tolist():
+            self.update(layer_idx, expert_idx, matrix_name, x[seq_ids == s])
+
     def update_cross(
         self, layer_idx: int, expert_idx: int, matrix_name: str,
         cross: torch.Tensor, n_tokens: int,

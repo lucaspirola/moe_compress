@@ -635,11 +635,23 @@ def test_a6_resolve_cov_batch_size():
 
 
 def test_a6_cov_batch_size_close(tiny_model):
-    """A6: covariance at cov batch sizes bs ∈ {1, 2, 4} over the SAME tokens
-    matches within an fp-reassociation tolerance — NOT ``torch.equal``. Changing
-    bs re-partitions which tokens land in the same ``flat.T @ flat`` GEMM vs
-    separate ``add_`` partials, so the float SUMMATION GROUPING differs (same
-    math object, different reassociation). Asserted on both B and C keys."""
+    """A6 + reduction-pin: covariance at cov batch sizes bs ∈ {1, 2, 4} over the
+    SAME tokens. The per-sequence reduction-pin (``update_grouped`` /
+    operand-split) re-imposes the bs=1 *summation grouping* regardless of how a
+    bigger forward batch merged the sequences, so the result is BITWISE-INVARIANT
+    (``torch.equal``, atol=0) across bs for any key whose input operand is itself
+    batch-shape-stable:
+
+      * ``gate_proj`` B keys: operand is ``hidden_states[token_idx]`` — a pure
+        gather, identical at any bs -> bitwise.
+      * ALL cross-cov ``C`` keys: operands are the teacher dense gather + the
+        student gate-input gather, both batch-shape-stable -> bitwise.
+      * ``down_proj`` B keys: operand is ``act_fn(gate)*up`` from a PADDED
+        batched ``bmm`` in ``capture_experts`` whose fp reduction is perturbed by
+        the forward batch shape upstream of the pin -> the GROUPING is pinned but
+        the operand carries ~1e-6 forward drift -> allclose (NOT bitwise), the
+        same unavoidable v1 forward-activation drift.
+    """
     import copy
     from moe_compress.utils.model_io import iter_moe_layers
 
@@ -669,18 +681,25 @@ def test_a6_cov_batch_size_close(tiny_model):
         B, C = run(bs)
         assert set(B.covariance) == set(B1.covariance)
         for k in B1.covariance:
-            assert torch.allclose(
-                B.covariance[k].to(torch.float32),
-                B1.covariance[k].to(torch.float32),
-                rtol=1e-5, atol=1e-5,
-            ), f"bs={bs}: B beyond fp-reassoc tolerance at {k}"
+            matrix_name = k[2]
+            got = B.covariance[k].to(torch.float32)
+            ref = B1.covariance[k].to(torch.float32)
+            if matrix_name == "down_proj":
+                # Pinned grouping, but the padded-bmm operand drifts upstream.
+                assert torch.allclose(got, ref, rtol=1e-5, atol=1e-5), \
+                    f"bs={bs}: down_proj B beyond fp-reassoc tolerance at {k}"
+            else:
+                # gate_proj: pure-gather operand -> the pin makes it bitwise.
+                assert torch.equal(got, ref), \
+                    f"bs={bs}: {matrix_name} B not bitwise-invariant at {k}"
         assert set(C.covariance) == set(C1.covariance)
         for k in C1.covariance:
-            assert torch.allclose(
+            # Cross-cov operands are batch-shape-stable gathers -> the pin makes
+            # every C key bitwise-invariant across cov batch size.
+            assert torch.equal(
                 C.covariance[k].to(torch.float32),
                 C1.covariance[k].to(torch.float32),
-                rtol=1e-5, atol=1e-5,
-            ), f"bs={bs}: C beyond fp-reassoc tolerance at {k}"
+            ), f"bs={bs}: C not bitwise-invariant at {k}"
 
 
 def test_a1_windowed_equals_perlayer(tiny_model):

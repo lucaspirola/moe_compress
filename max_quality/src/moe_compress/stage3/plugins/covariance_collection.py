@@ -361,11 +361,30 @@ def _resolve_cov_batch_size(s3: dict) -> int:
         pick a conservative bs; on CPU / 1-GPU it DEGRADES to the inherited
         ``batch_size`` (NO raise), keeping the 1-GPU golden byte-identical.
 
-    A6 is NOT byte-identical across batch sizes: re-partitioning tokens across
-    the ``flat.T @ flat`` GEMM vs ``add_`` partials changes the fp32-summation
-    GROUPING (fp-reassociation), the same class of noise as a GEMM-backend
-    change — far below signal but not bit-equal. Hence the DEFAULT preserving
-    the value is what keeps the golden safe, not byte-neutrality of the knob.
+    Reduction-pin (per-sequence grouping): with the cov Gram now accumulated via
+    the per-sequence pinned split (``InputCovarianceAccumulator.update_grouped``,
+    routed in ``_collect_covariances``), raising ``cov_batch_size`` NO LONGER
+    changes the reduction GROUPING — each source sequence's tokens are reduced in
+    the same bs=1 order regardless of how the forward batch merged them. The
+    consequences differ per matrix:
+
+      * gate_proj/up B and the cross-cov C: the Gram is now BITWISE-INVARIANT to
+        ``cov_batch_size`` (the per-sequence operands and their accumulation order
+        are identical at any batch size).
+      * factored down_proj B: ``allclose`` (~1e-6), NOT bitwise — the residual is
+        upstream forward-activation drift (GPU matmul output is batch-shape
+        dependent), bounded and N-INDEPENDENT, not the old N-scaling reduction
+        drift. This is quality-neutral.
+
+    So a bigger cov batch is now quality-neutral rather than golden-breaking as it
+    was before the pin. The DEFAULT still preserves the inherited value (returns
+    ``1`` / inherited) so the bs=1 golden stays byte-identical; nothing below
+    raises bs.
+
+    NOTE: this resolver is NOT yet wired into the cov capture — threading the
+    auto-batch resolver (``size_batch`` / ``run_with_oom_backoff``) into cov
+    collection is a SEPARATE follow-on (the next v2 plan), not done here. Today
+    the value still comes from config and ``"auto"`` degrades to inherited.
 
     Compound-peak constraint (plan M2): the A1×A4×A6 dense-teacher peak is
     ``G · cov_bs · seq · d_in · 4`` bytes per hot device (every G window layer
@@ -509,6 +528,10 @@ def _collect_covariances(
     # Per-batch token count T (= rows * seq), set in the batch loop below so
     # the lazily-allocated dense tensors are sized correctly each batch.
     _teacher_T: int = 0
+    # Per-batch sequence length (= batch.shape[1]), set in the batch loop below.
+    # Read by the cov callbacks as a free variable to derive per-row source
+    # sequence ids (``token_idx // _seq_len``) for the reduction-pin split.
+    _seq_len: int = 0
 
     def _teacher_input_cb(li, e, tensor, ctx):
         """Teacher hook: store the full hidden state for this layer.
@@ -565,7 +588,20 @@ def _collect_covariances(
         # the cross term under "gate_proj" here and rely on the
         # factor-time ``_cov_lookup`` gate→up fallback in
         # ``aa_svd_factor.py`` to serve ``up_proj``.
-        B_acc.update(li, e, "gate_proj", tensor)
+        #
+        # Reduction-pin: split the captured rows by source sequence so the Gram
+        # accumulates in sequence-ascending order, independent of the cov
+        # forward batch size. ``input``-key ``tensor`` is ``hidden_states[tok]``
+        # (unpadded, ``tensor.shape[0] == tok.shape[0]``), so the prefix slice
+        # is a no-op here; it matters for the PADDED factored down_proj below.
+        # ``update_grouped`` owns the single-vs-split decision (no pre-guard).
+        tok = ctx.get("token_idx")
+        if _seq_len and tok is not None:
+            B_acc.update_grouped(
+                li, e, "gate_proj", tensor[: tok.shape[0]], tok // _seq_len
+            )
+        else:
+            B_acc.update(li, e, "gate_proj", tensor)
         # Cross-covariance: C += X_pre^T @ X_post for matching token positions.
         # Cross-device safety: with ``device_map="auto"`` teacher and student
         # copies of the same MoE layer can land on different GPUs. ``det_post``
@@ -582,18 +618,38 @@ def _collect_covariances(
                 teacher_store = _teacher_hidden[li]
                 pre_vecs = []
                 post_vecs = []
+                matched_tids = []                    # seq-id source, 1:1 with vecs
                 det_post = tensor.detach().to(torch.float32)
                 for i, tidx in enumerate(token_idx):
                     if tidx in teacher_store:
                         pre_vecs.append(teacher_store[tidx].to(device=tgt_device))
                         post_vecs.append(det_post[i])
+                        matched_tids.append(tidx)
                 if pre_vecs:
                     X_pre = torch.stack(pre_vecs)    # [n_match, d_in]
                     X_post = torch.stack(post_vecs)  # [n_match, d_in]
-                    cross = X_pre.T @ X_post
-                    C_acc.update_cross(
-                        li, e, "gate_proj", cross, n_tokens=len(pre_vecs),
+                    # Reduction-pin (legacy dict path): split the matched
+                    # operands by source sequence so the dict path stays
+                    # byte-identical to the dense path (A4 equivalence) under the
+                    # pin. ``matched_tids`` is 1:1 with the stacked rows; its seq
+                    # ids are ``tid // _seq_len``. Ascending per-sequence
+                    # accumulation = the bs=1 grouping.
+                    sids = (
+                        torch.tensor(matched_tids, dtype=torch.long) // _seq_len
+                        if _seq_len else None
                     )
+                    if sids is not None and torch.unique(sids).numel() > 1:
+                        for s in torch.unique(sids, sorted=True).tolist():
+                            m = (sids == s).to(tgt_device)
+                            C_acc.update_cross(
+                                li, e, "gate_proj",
+                                X_pre[m].T @ X_post[m], n_tokens=int(m.sum().item()),
+                            )
+                    else:
+                        C_acc.update_cross(
+                            li, e, "gate_proj", X_pre.T @ X_post,
+                            n_tokens=len(pre_vecs),
+                        )
             return
         # A4 dense path: a single ``index_select`` over the dense teacher
         # tensor reproduces the dict's in-order matched-position gather. The
@@ -614,18 +670,64 @@ def _collect_covariances(
                     0, sel_idx.to(_teacher_dense[li].device)
                 ).to(tgt_device)
                 X_post = det_post[keep.to(det_post.device)]
-                cross = X_pre.T @ X_post
-                # Public entry: holds C_acc._lock around _pending writes and
-                # routes through finalize_layer's storage_dtype cast. The
-                # token count feeds persisted ``_gpu_token_count`` metadata
-                # (not the Gram) but must stay correct (review L1).
-                C_acc.update_cross(
-                    li, e, "gate_proj", cross,
-                    n_tokens=int(keep.sum().item()),
-                )
+                # Reduction-pin (cross-cov). ``update_cross`` receives an
+                # already-formed product and cannot be split internally, so we
+                # split the pre-matmul OPERANDS here. CRITICAL: ``X_pre``/
+                # ``X_post`` are the ``keep``-filtered rows (``keep.sum()`` rows,
+                # 1:1 with ``sel_idx = tok[keep]``), NOT ``len(tok)`` rows — so
+                # the per-row sequence ids MUST come from ``sel_idx // _seq_len``
+                # (the kept-row identities), aligned with the operand rows.
+                # Ascending per-sequence accumulation reproduces the bs=1 Gram.
+                n_kept = int(keep.sum().item())
+                # ``sel_idx`` lives on ``filled.device``; the operands live on
+                # ``tgt_device`` — move the per-seq boolean mask to the operand
+                # device before indexing (no-op single-GPU, cheap D2D sharded).
+                sids = sel_idx // _seq_len if _seq_len else None
+                if sids is not None and torch.unique(sids).numel() > 1:
+                    for s in torch.unique(sids, sorted=True).tolist():
+                        m = (sids == s).to(tgt_device)
+                        C_acc.update_cross(
+                            li, e, "gate_proj",
+                            X_pre[m].T @ X_post[m], n_tokens=int(m.sum().item()),
+                        )
+                else:
+                    # bs=1 / single-sequence: UNCHANGED single product + count.
+                    # Public entry: holds C_acc._lock around _pending writes and
+                    # routes through finalize_layer's storage_dtype cast. The
+                    # token count feeds persisted ``_gpu_token_count`` metadata
+                    # (not the Gram) but must stay correct (review L1).
+                    C_acc.update_cross(
+                        li, e, "gate_proj", X_pre.T @ X_post,
+                        n_tokens=n_kept,
+                    )
 
     def intermediate_cb(li, e, tensor, ctx):
-        B_acc.update(li, e, "down_proj", tensor)
+        # Reduction-pin (down_proj). CRITICAL: for FactoredExperts ``tensor`` is
+        # the PADDED ``inter_padded[i]`` (``[max_tokens, d_int]`` with
+        # ``len(tok) <= max_tokens``); the trailing pad rows are zero
+        # (silu(0)*0 = 0) and contribute nothing to the Gram. Split on the
+        # UNPADDED prefix ``tensor[:tok.shape[0]]`` so the per-sequence row sets
+        # are correct — dropping the zero pad rows is byte-safe. The fused
+        # (non-factored) path passes an unpadded tensor, where the prefix slice
+        # is a no-op. ``update_grouped`` owns the single-vs-split decision.
+        #
+        # ACCURACY NOTE (down_proj only): the pin makes the *reduction grouping*
+        # cov-batch-size-invariant, but UNLIKE gate_proj/cross-cov the down_proj
+        # operand here (``act_fn(gate)*up``, ``inter_padded[i]``) is produced by
+        # a PADDED batched ``bmm`` in ``capture_experts`` whose fp reduction is
+        # perturbed by the forward batch SHAPE upstream of this callback. So the
+        # down_proj Gram is allclose (~1e-6), NOT bitwise, across cov_batch_size
+        # — the pin removes the reduction-order drift; the residual is the
+        # unavoidable upstream forward-activation drift (same as v1). gate_proj B
+        # and all cross-cov C keys (pure-gather operands) ARE bitwise-invariant.
+        # (test_a6_cov_batch_size_close pins both behaviours.)
+        tok = ctx.get("token_idx")
+        if _seq_len and tok is not None:
+            B_acc.update_grouped(
+                li, e, "down_proj", tensor[: tok.shape[0]], tok // _seq_len
+            )
+        else:
+            B_acc.update(li, e, "down_proj", tensor)
         # Cross-covariance for down_proj: teacher's intermediate → student's intermediate.
         # This requires hooking teacher's intermediate too — more complex.
         # For now, cross-cov is collected only for gate_up (input-side).
@@ -728,6 +830,16 @@ def _collect_covariances(
                     _teacher_dense.clear()
                     _teacher_filled.clear()
                     _teacher_T = int(batch.shape[0]) * int(batch.shape[1])
+                    # Cov reduction-pin seam: the per-sequence length for THIS
+                    # batch. ``iter_batches`` slices rows only, so ``seq_len`` is
+                    # uniform across the batch. The cov callbacks (closures) read
+                    # this free var to split each expert's captured rows by
+                    # source sequence (``seq_id = token_idx // _seq_len``) and
+                    # accumulate the Gram in sequence-ascending order, making the
+                    # accumulation independent of the cov forward batch size. At
+                    # ``cov_batch_size=1`` (the golden's setting) every captured
+                    # row shares one seq id → the split is a no-op → byte-identical.
+                    _seq_len = int(batch.shape[1])
                     if teacher_model is not None:
                         with torch.no_grad():
                             teacher_model(input_ids=batch)
