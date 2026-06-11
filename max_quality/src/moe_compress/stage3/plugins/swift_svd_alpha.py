@@ -224,6 +224,7 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -744,8 +745,7 @@ def _swift_svd_plus_alpha_search_validation(
         # config; the H1 cache-validity invariant holds only WITHIN one run.
         # UNCONDITIONALLY rmtree+recreate at search ENTRY so a stale file can
         # NEVER be read as a false hit (independent of --no-resume).
-        import shutil as _shutil
-        _shutil.rmtree(_cache_path, ignore_errors=True)
+        shutil.rmtree(_cache_path, ignore_errors=True)
         _cache_path.mkdir(parents=True, exist_ok=True)
         eigh_cache_dir = str(_cache_path)
 
@@ -794,8 +794,7 @@ def _swift_svd_plus_alpha_search_validation(
     finally:
         # (b) Remove the eigh cache on normal + exception exit of the search.
         if eigh_cache_dir is not None:
-            import shutil as _shutil2
-            _shutil2.rmtree(eigh_cache_dir, ignore_errors=True)
+            shutil.rmtree(eigh_cache_dir, ignore_errors=True)
 
     log.info("Stage 3 α-search complete: best α=%.1f (PPL=%.4f)", best_alpha, best_ppl)
     log.info("  full results: %s",

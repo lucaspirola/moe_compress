@@ -494,8 +494,9 @@ def _collect_covariances(
     # tensor per window layer (``teacher_dense``) plus a boolean ``[T]``
     # ``filled`` mask, scattered via ``index_copy_`` and consumed by a single
     # ``index_select`` in ``input_cb`` — replacing the per-token Python loop.
-    # ``T = batch.shape[0] * batch.shape[1]`` (threaded per batch via the
-    # ``_teacher_T`` nonlocal set in the batch loop). Legacy
+    # ``T = batch.shape[0] * batch.shape[1]`` (rebound per batch in the
+    # enclosing batch loop and read by the dense-path closures as a free
+    # variable — NOT a ``nonlocal`` declaration, and none is required). Legacy
     # ``cov_cross_impl="dict"`` (the ``{token_idx → row}`` nested dict) is
     # RETAINED unchanged, reachable ONLY through this kwarg, PURELY so the
     # A4 equivalence test (``test_a4_cross_cov_dense_equals_dict``) can compare
