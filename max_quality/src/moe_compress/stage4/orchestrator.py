@@ -66,6 +66,25 @@ from .plugins.input_cov_cache import Stage4InputCovCacheProvider
 log = logging.getLogger(__name__)
 
 
+def _resolve_eora_workers(config: dict) -> int:
+    """Resolve the effective task-parallel EoRA worker count (N-GPU lever 1).
+
+    Mirrors ``stage3/orchestrator.py::_resolve_cov_replicas``: read the optional
+    ``multi_gpu.eora_workers`` knob (default 1) and clamp to the number of
+    visible CUDA devices, with a floor of 1. ``n_gpu < 2`` OR ``eora_workers <=
+    1`` OR ``multi_gpu`` absent ⇒ 1 (the serial in-process path, byte-identical
+    to single-GPU today; §2.4 — no 1x/2x special-casing, any N is
+    ``min(...)``-clamped). The per-layer ``min(..., N_experts)`` clamp is applied
+    inside ``compensate_layer`` where ``N`` is known.
+    """
+    mg = config.get("multi_gpu") or {}
+    requested = int(mg.get("eora_workers", 1) or 1)
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if requested <= 1 or n_gpu < 2:
+        return 1
+    return max(1, min(requested, n_gpu))
+
+
 def run(
     model,
     tokenizer,
@@ -95,6 +114,10 @@ def run(
     run_ctx.set("no_resume", no_resume)
     run_ctx.set("rank_map", {})
     run_ctx.set("compensated_params", 0)
+    # N-GPU lever 1: resolve the task-parallel EoRA worker count once and thread
+    # it onto the ROOT ctx so every compensate_layer dispatch reads it. ==1
+    # (the default / single-GPU) ⇒ the serial path, byte-identical to today.
+    run_ctx.set("eora_workers", _resolve_eora_workers(config))
 
     # Cache provider registered FIRST so the V2 input-covariance cache
     # has a shot at populating ``A_cov`` (+ ``a_storage_dtype``) on the
