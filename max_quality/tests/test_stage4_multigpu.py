@@ -160,6 +160,35 @@ def test_solve_expert_tile_pure():
     assert up[5] is None
 
 
+def test_solve_expert_tile_residual_flag():
+    """``log_residuals`` gates slots 3,4 without touching the golden (Uc/Vc/take_eff)."""
+    d_out, d_in, r = 12, 8, 2
+    g = torch.Generator().manual_seed(7)
+    W_orig = torch.randn(d_out, d_in, generator=g, dtype=torch.float32)
+    U_e = torch.randn(d_out, r, generator=g, dtype=torch.float32)
+    V_e = torch.randn(r, d_in, generator=g, dtype=torch.float32)
+    A = _make_cov(d_in, seed=3)
+
+    out_off = _solve_expert_tile(
+        "gate_proj", 0, 0, W_orig, U_e, V_e, A, d_in, r,
+        torch.device("cpu"), torch.float32,
+        gate_spectrum=None, log_residuals=False,
+    )
+    out_on = _solve_expert_tile(
+        "gate_proj", 0, 0, W_orig, U_e, V_e, A, d_in, r,
+        torch.device("cpu"), torch.float32,
+        gate_spectrum=None, log_residuals=True,
+    )
+    # Productive output (the golden) is flag-independent.
+    assert torch.equal(out_off[0], out_on[0])   # Uc
+    assert torch.equal(out_off[1], out_on[1])   # Vc
+    assert out_off[2] == out_on[2]              # take_eff
+    # Residual slots: None when off, populated (>= 0) when on.
+    assert out_off[3] is None and out_off[4] is None
+    assert out_on[3] is not None and out_on[4] is not None
+    assert float(out_on[3]) >= 0.0 and float(out_on[4]) >= 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Unit: worker resolution clamps correctly
 # --------------------------------------------------------------------------- #
