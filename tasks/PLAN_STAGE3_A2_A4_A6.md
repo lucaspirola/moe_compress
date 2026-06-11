@@ -2,6 +2,12 @@
 
 Branch: `plan/stage3-a2-a4-a6` (off `main`). Loop 1 (A7 capture hook + A1 windowed single-pass cov) already LANDED on `main` ad849a2; this builds on it. All three opts are pure perf refactors — 1-GPU output **byte-identical** (or within documented fp tolerance). B-list (B1 proxy-alpha-selection, B2 coarser grid) is OFF-LIMITS.
 
+**File-path key** (all cites below use the bare filename + line; full paths under `max_quality/src/moe_compress/`):
+- `swift_svd_alpha.py`, `aa_svd_factor.py`, `covariance_collection.py` → `stage3/plugins/`
+- `orchestrator.py` → `stage3/orchestrator.py`
+- `activation_hooks.py`, `calibration.py` → `utils/`
+- tests → `max_quality/tests/test_multigpu_stage3.py`
+
 ## Invariants / non-goals (from the fidelity audit — apply to all three)
 - **N-1** Do NOT drop fp32 `eigh` to bf16/fp16 (A5 guardrail). `_precompute_eigh` casts B→fp32 at `aa_svd_factor.py:207`; A2 caches the *result object*, never changes its dtype.
 - **N-2** Do NOT change alpha SELECTION. A2 must not alter which alpha wins, only how fast each candidate is factored. No B1/B2.
@@ -24,12 +30,15 @@ Branch: `plan/stage3-a2-a4-a6` (off `main`). Loop 1 (A7 capture hook + A1 window
 The candidate loop is **alpha-major** (outer) and factors the whole model per alpha (PPL needs the full model at one alpha), so we cannot reorder to layer-major. Holding every layer's decomps in RAM across candidates does NOT fit (≈16 MB/expert × ~200 experts × 40 layers → hundreds of GB). Therefore **spill the decomps the same way cov is spilled** — one layer resident at a time, matching the existing cov-spill residency model (`swift_svd_alpha.py:404/484`):
 
 1. Add optional param `gate_up_decomp_cache_dir: str | None = None` to BOTH `_factor_model_at_ranks` (`swift_svd_alpha.py:373`) AND `_swift_svd_plus_alpha_search_validation` (`swift_svd_alpha.py:556-573` — its signature currently has NO `artifacts_dir`, so the cache path must be THREADED IN; the caller `select_alpha` at `:1136` supplies it). Default `None` ⇒ today's behavior (recompute) for any direct caller / test.
-2. In the per-expert loop, replace the unconditional `_precompute_eigh` (444-451) with a cache-aware path keyed `(layer_idx, expert_idx)`:
+2. In the per-expert loop, replace the `if B_shared is not None:` guard + `try/except ValueError: pass` block (444-451 — the cache-aware path wraps the guard+try, not line 451 literally) with a cache-aware path keyed `(layer_idx, expert_idx)`:
    - On the FIRST candidate (cache miss): compute `_precompute_eigh`, then serialize the COMPLETE `_EighDecomp` field set — verified `aa_svd_factor.py:178-184` = exactly `eigvals_keep, eigvecs_keep, inv_sqrt, rhs, rhs_pinv, r_eff` — to `{cache_dir}/layer_{L}.pt` (one file per layer, holding that layer's `{expert: decomp_or_None}`). gate_proj and up_proj SHARE one `gate_up_decomp` per expert (444-451), so the `(layer,expert)` key is correct (one decomp covers both).
    - On candidates 1..10 (cache hit): load that layer's `.pt` and reuse. Only one layer's decomps are resident at a time (loaded when `_factor_model_at_ranks` loads that layer's cov, freed when it unloads — `swift_svd_alpha.py:404/484-486`).
    - **ValueError sentinel:** an expert whose B has no eigenvalue above the floor raises `ValueError` at `_precompute_eigh` (`aa_svd_factor.py:216`); current code `pass`es (451) → full `_aa_svd` fallback. The cache MUST persist `None` for that (layer,expert) key (computed-but-failed) so candidates 1..10 take the same fallback and do NOT retry the eigh. Distinguish "absent" (not computed) from "present→None" (computed, failed).
    - **Cache-validity invariant (review H1):** `rhs` is `(B,C)`-dependent (Path-1 `C@eigvecs` vs Path-3). The cache is valid ONLY because `(B,C)`-PRESENCE is identical across all 11 candidates (same spill files, `swift_svd_alpha.py:405-406`). ASSERT/document this invariant at the cache site; a future change that made C-presence candidate-dependent would silently corrupt the cache.
-3. **Cache-dir location + cleanup (review H2):** create the cache dir under `artifacts_dir` at a FIXED name (e.g. `{artifacts_dir}/_stage3_alpha_eigh_cache`) BEFORE the `for alpha` loop (~636), thread it into the `_factor_model_at_ranks` call at 650. Cleanup at BOTH sites with the shared fixed path: (a) `rmtree` in a `finally` inside `_swift_svd_plus_alpha_search_validation` (covers normal+exception exit of the search), AND (b) add the fixed name to the orchestrator Stage-3 spill-cleanup block (`orchestrator.py:862-868`, which today only rmtrees `_stage3_bcov_partial`/`_stage3_ccov_partial`) as a crash backstop for a failure BETWEEN search and Stage-3 completion. The fixed `artifacts_dir`-relative name is what lets the orchestrator backstop find it. Place it OUTSIDE the path the cov-spill resume logic scans.
+3. **Cache-dir location + cleanup (review H2):** create the cache dir under `artifacts_dir` at a FIXED name (e.g. `{artifacts_dir}/_stage3_alpha_eigh_cache`) BEFORE the `for alpha` loop (~636), thread it into the `_factor_model_at_ranks` call at 650. `artifacts_dir` is available via `run_ctx` (orchestrator:252) so `select_alpha` (`swift_svd_alpha.py:1136`) supplies it through the threaded signature. Cleanup at THREE sites with the shared fixed path:
+   - (a) **Stale-cache guard at search ENTRY (review M-new) — the load-bearing one:** UNCONDITIONALLY `rmtree`+recreate the cache dir at the top of `_swift_svd_plus_alpha_search_validation`, BEFORE the alpha loop, so a stale `_stage3_alpha_eigh_cache` left by a hard-killed prior run (SIGKILL/OOM where the `finally` never ran) can NEVER be read as a false hit. This is critical because the H1 cache-validity invariant only holds WITHIN one run; a cross-run stale file could carry decomps from a different rank/dtype/model config and would be silently loaded. Entry-rmtree closes this regardless of `--no-resume`.
+   - (b) `rmtree` in a `finally` inside `_swift_svd_plus_alpha_search_validation` (covers normal+exception exit of the search).
+   - (c) add the fixed name to the orchestrator Stage-3 spill-cleanup block (`orchestrator.py:862-868`, today only `_stage3_bcov_partial`/`_stage3_ccov_partial`) AND to the `no_resume` early-cleanup block (`orchestrator.py:227-232`) as crash backstops. Place the dir OUTSIDE the path the cov-spill resume logic scans.
 
 *(A2 touches ONLY the candidate-validation path. The main factoring loop `AaSvdFactorPlugin.factor_layer` already computes each decomp exactly once — untouched. A2 is inert when `validation_samples == 0`, where the spectral-proxy path already caches via `grouped_svs`.)*
 
@@ -44,7 +53,7 @@ The candidate loop is **alpha-major** (outer) and factors the whole model per al
 ### (5) Risks / edge cases
 - ValueError sentinel (above) — must cache `None`, not skip the key.
 - **storage_dtype consistency:** a single search uses one storage_dtype (sourced from the same `B_cov_dtype`); the cache key need not include it but assert/document the single-dtype assumption.
-- **Resume/crash:** the eigh cache dir is ephemeral, rebuilt on the candidate-0 pass; safe to `rmtree` on any exit; keep it clear of the cov-spill resume scan path.
+- **Resume/crash:** the eigh cache dir is ephemeral. Candidate 0 only WRITES on cache-miss, so a stale cross-run file would otherwise be read as a false hit — the entry-rmtree (step 3a) is what makes it safe. Keep it clear of the cov-spill resume scan path. Backstopped by the orchestrator 862-868 + no_resume 227-232 cleanups.
 
 ---
 
