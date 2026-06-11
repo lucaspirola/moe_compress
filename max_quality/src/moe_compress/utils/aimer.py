@@ -27,8 +27,15 @@ def aimer_score_tensor(w: torch.Tensor) -> float:
     n = flat.numel()
     if n == 0:
         return 0.0
-    l1 = float(flat.abs().sum().item())
-    l2 = float(flat.norm(p=2).item())
+    if flat.is_cuda:
+        # Coalesce the two reductions into a single D2H transfer. Same two
+        # fp32 scalars, same op order; ``.tolist()`` widens identically to
+        # the per-tensor ``.item()`` path below.
+        vals = torch.stack([flat.abs().sum(), flat.norm(p=2)]).tolist()
+        l1, l2 = float(vals[0]), float(vals[1])
+    else:
+        l1 = float(flat.abs().sum().item())
+        l2 = float(flat.norm(p=2).item())
     if l2 == 0.0:
         return 0.0
     return l1 / (math.sqrt(n) * l2)

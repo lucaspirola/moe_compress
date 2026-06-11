@@ -474,10 +474,20 @@ def _detect_ma_layers(
         raise ValueError("_detect_ma_layers: weight-tied decoder layers detected")
     sorted_decoder_layer_indices = sorted(decoder_layer_modules.values())
 
-    # Residual-stream max: hooked on every decoder layer
-    layer_max: dict[int, float] = {idx: 0.0 for idx in sorted_decoder_layer_indices}
+    # Residual-stream max: hooked on every decoder layer.
+    # Seeded as on-device fp32 0.0 tensors so the per-batch ``torch.maximum``
+    # accumulation stays on-GPU (no per-call ``.item()`` D2H sync); a single
+    # ``.item()`` sweep after the run widens each back to the python-float
+    # ``dict[int, float]`` contract the downstream code expects.
+    layer_max: dict[int, torch.Tensor] = {
+        idx: torch.zeros((), dtype=torch.float32, device=device)
+        for idx in sorted_decoder_layer_indices
+    }
     # MoE-block-output max: hooked on each MoE layer's `mlp` (Qwen3_5MoeSparseMoeBlock)
-    moe_block_max: dict[int, float] = {idx: 0.0 for idx in sorted_moe_layer_indices}
+    moe_block_max: dict[int, torch.Tensor] = {
+        idx: torch.zeros((), dtype=torch.float32, device=device)
+        for idx in sorted_moe_layer_indices
+    }
     first_layer_q99_buffer: list[np.ndarray] = []
     handles: list = []
 
@@ -487,9 +497,16 @@ def _detect_ma_layers(
             if not isinstance(h, torch.Tensor):
                 return
             h_abs = h.detach().abs().float()
-            curr_max = h_abs.max().item()
-            if curr_max > layer_max[layer_idx]:
-                layer_max[layer_idx] = curr_max
+            # On-device fp32 running max; no per-call ``.item()`` D2H sync.
+            # ``torch.where(cand > running, cand, running)`` replicates the
+            # original ``if curr_max > running: running = curr_max`` bit-for-
+            # bit: cand>running→cand; cand≤running→running; cand is NaN→
+            # False→running (NaN dropped, matching the old ``>`` compare,
+            # unlike torch.maximum which would propagate NaN). Both operands
+            # are 0-dim fp32 tensors so the select is scalar-elementwise.
+            cand = h_abs.max()
+            running = layer_max[layer_idx]
+            layer_max[layer_idx] = torch.where(cand > running, cand, running)
             if layer_idx == first_moe_layer_idx:
                 first_layer_q99_buffer.append(h_abs.flatten().cpu().numpy())
         return _hook
@@ -500,9 +517,12 @@ def _detect_ma_layers(
             h = output[0] if isinstance(output, tuple) else output
             if not isinstance(h, torch.Tensor):
                 return
-            curr_max = h.detach().abs().float().max().item()
-            if curr_max > moe_block_max[layer_idx]:
-                moe_block_max[layer_idx] = curr_max
+            # On-device fp32 running max; no per-call ``.item()`` D2H sync.
+            # ``torch.where`` preserves the original ``>``/NaN-drop semantics
+            # exactly (same reasoning as the decoder hook above).
+            cand = h.detach().abs().float().max()
+            running = moe_block_max[layer_idx]
+            moe_block_max[layer_idx] = torch.where(cand > running, cand, running)
         return _hook
 
     for module, layer_idx in decoder_layer_modules.items():
@@ -524,6 +544,13 @@ def _detect_ma_layers(
     finally:
         for h in handles:
             h.remove()
+
+    # Collapse the on-device fp32 running-max tensors back to python floats
+    # in a single ``.item()`` sweep, restoring the ``dict[int, float]``
+    # contract the downstream consumers below expect. ``.item()`` widens the
+    # fp32 scalar to float64 identically to the original per-call path.
+    layer_max = {idx: float(t.item()) for idx, t in layer_max.items()}
+    moe_block_max = {idx: float(t.item()) for idx, t in moe_block_max.items()}
 
     if first_layer_q99_buffer:
         first_layer_q99 = float(

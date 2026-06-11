@@ -262,7 +262,12 @@ class ThreeWayAndPlugin:
         # ["a_max_fraction"] — confirmed against the legacy Stage 1 module. Default 0.1.
         a_max_fraction = float(se_cfg.get("a_max_fraction", 0.1))
 
-        p995, a_max = _compute_se_thresholds(per_expert_max, L)
+        # Walk ``per_expert_max.items()`` exactly once: the L-filtered triples
+        # (in insertion order) feed BOTH the threshold compute and the
+        # criterion apply below. Insertion order is the blacklist-append
+        # order pinned by ``_apply_paper_criterion``'s docstring.
+        filtered = [(li, e, v) for (li, e), v in per_expert_max.items() if li in L]
+        p995, a_max = _compute_se_thresholds(per_expert_max, L, filtered=filtered)
         a_max_threshold = a_max_fraction * a_max
 
         log.info(
@@ -271,7 +276,9 @@ class ThreeWayAndPlugin:
             p995, a_max, a_max_threshold, len(L),
         )
 
-        per_layer_paper = _apply_paper_criterion(per_expert_max, L, p995, a_max_threshold)
+        per_layer_paper = _apply_paper_criterion(
+            per_expert_max, L, p995, a_max_threshold, filtered=filtered
+        )
         for li, exps in per_layer_paper.items():
             for e in exps:
                 candidate_bag.add(int(li), int(e), "phase_c")
@@ -302,13 +309,24 @@ class ThreeWayAndPlugin:
 def _compute_se_thresholds(
     per_expert_max: dict[tuple[int, int], float],
     L: set[int],
+    filtered: list[tuple[int, int, float]] | None = None,
 ) -> tuple[float, float]:
     """Compute P99.5 and a_max over all (l, e) with l ∈ L.
 
     Moved verbatim from the legacy Stage 1 module in sub-task 8.
     Sole caller: :class:`ThreeWayAndPlugin.run`.
+
+    ``filtered`` is an optional pre-computed L-filtered ``(li, e, v)`` list
+    (built once at the caller from ``per_expert_max.items()`` in insertion
+    order) so the hot path walks ``.items()`` only once and shares it with
+    ``_apply_paper_criterion``. When ``None`` it is derived here, reproducing
+    the original in-line comprehension exactly (same A values). The
+    ``filtered is None`` recompute branch MUST mirror the caller's
+    ``if li in L`` filter verbatim — the two code paths have to stay in sync.
     """
-    A = [v for (li, _e), v in per_expert_max.items() if li in L]
+    if filtered is None:
+        filtered = [(li, e, v) for (li, e), v in per_expert_max.items() if li in L]
+    A = [v for (_li, _e, v) in filtered]
     if not A:
         if L:
             log.warning(
@@ -329,6 +347,7 @@ def _apply_paper_criterion(
     L: set[int],
     p995: float,
     a_max_threshold: float,
+    filtered: list[tuple[int, int, float]] | None = None,
 ) -> dict[int, list[int]]:
     """Apply Eq. 6 three-way AND: a > P99.5 AND a > 0.1·a_max AND l ∈ L.
 
@@ -336,6 +355,15 @@ def _apply_paper_criterion(
     Returns ``{layer_idx: [expert_idx, ...]}``; per-layer expert lists
     appear in insertion order (the order they iterate from
     ``per_expert_max.items()``).
+
+    ``filtered`` is an optional pre-computed L-filtered ``(li, e, v)`` list
+    (built once at the caller from ``per_expert_max.items()`` in insertion
+    order). Iterating it preserves the exact ``per_expert_max.items()``
+    insertion order the docstring pins for the per-layer ``blacklist``
+    appends, so the result is identical to re-walking ``.items()`` with the
+    ``l ∈ L`` skip. When ``None`` it is derived here from ``per_expert_max``;
+    that ``filtered is None`` recompute branch MUST mirror the caller's
+    ``if li in L`` filter verbatim — the two code paths have to stay in sync.
     """
     if not L:
         if per_expert_max:
@@ -346,11 +374,12 @@ def _apply_paper_criterion(
         return {}
     # Magnitudes are collected for ALL MoE layers (spec §4 Phase B: "All MoE layers
     # are instrumented simultaneously"); the SE three-way AND is then enforced here
-    # by silently skipping any (l, e) with l ∉ L (Eq. 6's `l ∈ L` clause).
+    # by the ``filtered`` list already excluding any (l, e) with l ∉ L
+    # (Eq. 6's `l ∈ L` clause).
+    if filtered is None:
+        filtered = [(li, e, v) for (li, e), v in per_expert_max.items() if li in L]
     blacklist: dict[int, list[int]] = {}
-    for (li, e), v in per_expert_max.items():
-        if li not in L:
-            continue
+    for (li, e, v) in filtered:
         if v > p995 and v > a_max_threshold:
             blacklist.setdefault(li, []).append(e)
     return blacklist

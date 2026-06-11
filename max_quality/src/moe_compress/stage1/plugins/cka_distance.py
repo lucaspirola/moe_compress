@@ -368,6 +368,33 @@ def _cka_distance_matrix_cpu_per_pair(
     fill). Fills the active-active sub-block of ``dist``; inactive rows/cols
     retain their pre-initialized 1.0 (with diagonal 0.0)."""
     n_active = len(active_indices)
+    # Memoize the centered self-Gram and its HSIC self-term. Both are fully
+    # determined by ``(expert, m_common)``: for a given expert ``e`` its
+    # representation ``X`` is fixed, and the ``[int(k*step)…]`` subsample is a
+    # deterministic function of ``X`` and ``m_common`` alone — so a cache hit
+    # returns the IDENTICAL fp64 tensor (torch.equal trivially). The key MUST
+    # include m_common because it varies per partner via ``min(mi, mj)``.
+    self_gram_cache: dict[tuple[int, int], tuple[torch.Tensor, float]] = {}
+
+    def _centered_self_gram(e: int, X: torch.Tensor, m: int) -> tuple[torch.Tensor, float]:
+        cached = self_gram_cache.get((e, m))
+        if cached is not None:
+            return cached
+        if X.shape[0] > m:
+            step = X.shape[0] / m
+            X_c = X[[int(k * step) for k in range(m)]]
+        else:
+            X_c = X
+        # Biased HSIC centering (Gretton 2005), identical to the GPU path.
+        # Upcast to fp64 for centering accumulators to match the
+        # google-research Demo.ipynb reference (means computed in float64).
+        K_raw = (X_c @ X_c.T).to(torch.float64)
+        K = K_raw - K_raw.mean(dim=1, keepdim=True) - K_raw.mean(dim=0, keepdim=True) + K_raw.mean()
+        hsic = float((K * K).sum().item())
+        result = (K, hsic)
+        self_gram_cache[(e, m)] = result
+        return result
+
     for ii in range(n_active):
         ei = active_indices[ii]
         Xi = active_reprs[ii]
@@ -381,26 +408,9 @@ def _cka_distance_matrix_cpu_per_pair(
                 # H=0 → CKA undefined → maximum distance.
                 dist[ei, ej] = dist[ej, ei] = 1.0
                 continue
-            if mi > m_common:
-                step = mi / m_common
-                Xi_c = Xi[[int(k * step) for k in range(m_common)]]
-            else:
-                Xi_c = Xi
-            if mj > m_common:
-                step = mj / m_common
-                Xj_c = Xj[[int(k * step) for k in range(m_common)]]
-            else:
-                Xj_c = Xj
-            # Biased HSIC centering (Gretton 2005), identical to the GPU path.
-            # Upcast to fp64 for centering accumulators to match the
-            # google-research Demo.ipynb reference (means computed in float64).
-            Ki_raw = (Xi_c @ Xi_c.T).to(torch.float64)
-            Ki = Ki_raw - Ki_raw.mean(dim=1, keepdim=True) - Ki_raw.mean(dim=0, keepdim=True) + Ki_raw.mean()
-            Kj_raw = (Xj_c @ Xj_c.T).to(torch.float64)
-            Kj = Kj_raw - Kj_raw.mean(dim=1, keepdim=True) - Kj_raw.mean(dim=0, keepdim=True) + Kj_raw.mean()
+            Ki, hsic_ii = _centered_self_gram(ei, Xi, m_common)
+            Kj, hsic_jj = _centered_self_gram(ej, Xj, m_common)
             hsic_ij = float((Ki * Kj).sum().item())
-            hsic_ii = float((Ki * Ki).sum().item())
-            hsic_jj = float((Kj * Kj).sum().item())
             denom = math.sqrt(max(hsic_ii, _CKA_EPSILON) * max(hsic_jj, _CKA_EPSILON))
             cka = hsic_ij / denom
             d = max(0.0, min(1.0, 1.0 - cka))

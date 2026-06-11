@@ -143,9 +143,14 @@ class Stage1OutputReservoirCacheProvider(BaseCacheProvider):
                 # contract (the writer stored bf16; the live accumulator
                 # writes fp32 in finalize()).
                 slab = payload.reservoir[rank, expert_id, :n_valid]
+                # dtype-changing ``.to(float32)`` on a bf16 slice ALWAYS
+                # allocates fresh storage (never a view), so no ``.clone()``
+                # is needed for ownership: the consumer
+                # ``get_representations`` re-clones on read, and
+                # ``payload.reservoir`` is never mutated post-load.
                 acc._finalized[(layer_idx, expert_id)] = slab.to(
                     torch.float32,
-                ).clone()
+                )
                 n_inserted += 1
 
         # Overwrite any prior ctx.output_acc -- the orchestrator's STEP 5
