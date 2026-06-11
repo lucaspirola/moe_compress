@@ -181,8 +181,9 @@ def compute_final_kept_ids(
     experts are NEVER dropped (D-protected-experts); with an empty
     protected set this reduces to the pure upstream formula.
 
-    Tie-break: deterministic keep-LOWEST-index. ``np.argsort`` is stable, so
-    equal scores keep ascending expert-index order; the descending pass
+    Tie-break: deterministic keep-LOWEST-index. ``np.argsort(-scores,
+    kind='stable')`` is a stable sort (NumPy's default ``kind='quicksort'`` is
+    NOT), so equal scores keep ascending expert-index order; the descending pass
     (``-scores``) then keeps the lowest index of a tie and drops the higher.
     This does NOT claim parity with ``torch.topk(largest=False)`` on ties —
     torch's tie order is implementation-defined and differs CPU vs CUDA (e.g.
@@ -199,11 +200,11 @@ def compute_final_kept_ids(
             f"{len(protected_set)}; prune_fraction is too aggressive for this "
             "layer's protected/blacklisted experts"
         )
-    # Descending saliency. np.argsort(-scores) is stable → ties resolve to
-    # ascending index, so the kept set prefers the lowest-index expert on a tie
-    # (deterministic keep-lowest-index; NOT a torch.topk tie-order match — see
-    # the docstring).
-    order = [int(e) for e in np.argsort(-scores)]
+    # Descending saliency. np.argsort(-scores, kind='stable') is a stable sort
+    # (the default quicksort is NOT) → ties resolve to ascending index, so the
+    # kept set prefers the lowest-index expert on a tie (deterministic
+    # keep-lowest-index; NOT a torch.topk tie-order match — see the docstring).
+    order = [int(e) for e in np.argsort(-scores, kind='stable')]
     n_kept_nonprotected = faithful_target - len(protected_set)
     kept_nonprotected = [
         e for e in order if e not in protected_set

@@ -268,9 +268,12 @@ def select_centroids_by_reap(
         return []
     protected_set = set(protected)
     selected: list[int] = []
-    # np.argsort(-scores) gives descending-score iteration order, matching
-    # the pre-T7 LegacyAdapter loop verbatim.
-    for _e in np.argsort(-scores):
+    # np.argsort(-scores, kind='stable') is a stable sort (the default
+    # quicksort is NOT) → descending-score order with ascending-index tie-break,
+    # giving the lowest-index centroid assignment priority on exact ties.
+    # DELIBERATE deterministic tie-order change vs the old non-stable argsort —
+    # see commit msg.
+    for _e in np.argsort(-scores, kind='stable'):
         if len(selected) >= ream_target:
             break
         e = int(_e)

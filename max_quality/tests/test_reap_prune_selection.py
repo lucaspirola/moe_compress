@@ -76,3 +76,19 @@ def test_tie_break_prefers_lower_index():
     )
     assert kept == [0, 2]
     assert pruned == [1]
+
+
+def test_heavy_tie_keeps_lowest_indices_would_fail_under_quicksort():
+    # Large tied array straddling the keep boundary: 18×0.9 and 14×0.5 over
+    # n_experts=32, n_prune=16. Default quicksort would NOT keep the lowest
+    # indices of the tied 0.9 block; the kind='stable' sort does. This test
+    # FAILS if kind='stable' is ever dropped from compute_final_kept_ids.
+    scores = np.array([0.5, 0.9, 0.9, 0.5, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9,
+                       0.5, 0.5, 0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.9, 0.5, 0.9,
+                       0.9, 0.5, 0.5, 0.9, 0.9, 0.9, 0.9, 0.5, 0.9, 0.5],
+                      dtype=np.float64)
+    kept, _ = compute_final_kept_ids(
+        scores, n_experts=32, n_prune=16, protected=[],
+    )
+    expected = sorted(int(i) for i in np.argsort(-scores, kind="stable")[:16])
+    assert kept == expected
