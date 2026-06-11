@@ -400,6 +400,7 @@ def _solve_expert_tile(
     a_storage_dtype,
     *,
     gate_spectrum=None,
+    log_residuals: bool = False,
 ):
     """Pure per-expert EoRA solve — the task-parallel unit (N-GPU lever 1).
 
@@ -428,7 +429,9 @@ def _solve_expert_tile(
     ``(Uc, Vc, take_eff, res_before, res_after, gate_spectrum_out)``
         ``Uc`` / ``Vc`` are the correction factors on ``target_device``;
         ``take_eff`` is the integer effective rank; ``res_before`` / ``res_after``
-        are scalar fp32 squared residual norms (log-only, never the golden);
+        are scalar fp32 squared residual norms (log-only, never the golden) when
+        ``log_residuals=True``, else both are ``None`` (the extra ``Uc@Vc`` recompute
+        is skipped — default);
         ``gate_spectrum_out`` is the memo to retain for this expert's up_proj
         pass (the gate spectrum on gate_proj, else ``None``).
     """
@@ -437,7 +440,7 @@ def _solve_expert_tile(
         U_e.to(device=target_device, dtype=torch.float32)
         @ V_e.to(device=target_device, dtype=torch.float32)
     )
-    res_before = delta.norm() ** 2
+    res_before = delta.norm() ** 2 if log_residuals else None
     # Lever A: gate_proj computes+memoizes the spectrum; up_proj reuses gate's
     # (identical A object) → skips the redundant eigh.
     if name == "up_proj":
@@ -458,8 +461,9 @@ def _solve_expert_tile(
     )
     # Residual after applying the planned correction (Uc @ Vc).
     res_after = (
-        delta - (Uc.to(torch.float32) @ Vc.to(torch.float32))
-    ).norm() ** 2
+        (delta - (Uc.to(torch.float32) @ Vc.to(torch.float32))).norm() ** 2
+        if log_residuals else None
+    )
     return Uc, Vc, int(take_eff), res_before, res_after, gate_spectrum_out
 
 
@@ -585,6 +589,7 @@ class EoraCompensationPlugin:
         partial_dir = ctx.get("partial_dir") if ctx.has("partial_dir") else None
 
         s4 = config["stage4_eora"]
+        log_residuals = bool(s4.get("log_residuals", False))
         fe = ref.experts_module
         if not isinstance(fe, FactoredExperts):
             return
@@ -692,6 +697,7 @@ class EoraCompensationPlugin:
                     name, e, ref.layer_idx, W_orig, U_e, V_e, A, d_in,
                     r_per_expert, tgt, a_storage_dtype,
                     gate_spectrum=gate_spectra.get(e),
+                    log_residuals=log_residuals,
                 )
                 if name == "gate_proj":
                     # Retain this expert's gate spectrum (on its worker device)
@@ -704,8 +710,9 @@ class EoraCompensationPlugin:
                 V_corr[e] = Vc.to(device=dev, dtype=dtype)
                 eff_per_expert[e] = int(take_eff)
                 # log-only residual norms (B4) — accumulate on dev.
-                res_before_acc += res_before.to(dev)
-                res_after_acc += res_after.to(dev)
+                if log_residuals:
+                    res_before_acc += res_before.to(dev)
+                    res_after_acc += res_after.to(dev)
                 n_eligible += 1
                 if (e + 1) % 32 == 0:
                     log.info("  L%d/%s expert %d/%d", ref.layer_idx, name, e + 1, N)
@@ -723,14 +730,25 @@ class EoraCompensationPlugin:
             rank_map_layer[f"L{ref.layer_idx}_{name}"] = fe.ranks[name]
             layer_compensated_params += int(U_corr.numel() + V_corr.numel())
             # Lever B: single device→host sync per matrix (was per-expert).
-            res_before_sum = float(res_before_acc.item())
-            res_after_sum = float(res_after_acc.item())
-            res_before = (res_before_sum / max(n_eligible, 1)) ** 0.5
-            res_after = (res_after_sum / max(n_eligible, 1)) ** 0.5
-            rel_drop = (res_before - res_after) / max(res_before, 1e-12)
-            log.info("  L%d/%s widened by r=%d → new rank=%d; residual %.4e→%.4e (-%.1f%%)",
-                     ref.layer_idx, name, r_per_expert, fe.ranks[name],
-                     res_before, res_after, 100 * rel_drop)
+            # Log-only — gated behind stage4_eora.log_residuals (default off).
+            residual_fields = {}
+            if log_residuals:
+                res_before_sum = float(res_before_acc.item())
+                res_after_sum = float(res_after_acc.item())
+                res_before = (res_before_sum / max(n_eligible, 1)) ** 0.5
+                res_after = (res_after_sum / max(n_eligible, 1)) ** 0.5
+                rel_drop = (res_before - res_after) / max(res_before, 1e-12)
+                log.info("  L%d/%s widened by r=%d → new rank=%d; residual %.4e→%.4e (-%.1f%%)",
+                         ref.layer_idx, name, r_per_expert, fe.ranks[name],
+                         res_before, res_after, 100 * rel_drop)
+                residual_fields = {
+                    f"stage4/{name}_residual_unweighted_before": res_before,
+                    f"stage4/{name}_residual_unweighted_after": res_after,
+                    f"stage4/{name}_residual_unweighted_rel_drop": rel_drop,
+                }
+            else:
+                log.info("  L%d/%s widened by r=%d → new rank=%d",
+                         ref.layer_idx, name, r_per_expert, fe.ranks[name])
             _eff_list = [v for v in eff_per_expert if v is not None]
             _trackio_log({
                 "stage4/layer_idx": ref.layer_idx,
@@ -741,9 +759,7 @@ class EoraCompensationPlugin:
                 # actually optimises (arXiv:2410.21271 Eq. 6, projected
                 # residual ‖ΔW·Q'‖_F). Key renamed to surface that distinction
                 # on dashboards.
-                f"stage4/{name}_residual_unweighted_before": res_before,
-                f"stage4/{name}_residual_unweighted_after": res_after,
-                f"stage4/{name}_residual_unweighted_rel_drop": rel_drop,
+                **residual_fields,
                 "stage4/compensated_params": compensated_params + layer_compensated_params,
                 # Additive v2 keys: per-layer aggregates of in-scope variables.
                 f"stage4/{name}_n_eligible_experts": int(n_eligible),
