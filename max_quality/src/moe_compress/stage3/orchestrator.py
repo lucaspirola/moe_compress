@@ -231,7 +231,10 @@ def run(
 
     if no_resume:
         import shutil as _shutil
-        for _d in ["_stage3_bcov_partial", "_stage3_ccov_partial"]:
+        for _d in [
+            "_stage3_bcov_partial", "_stage3_ccov_partial",
+            "_stage3_alpha_eigh_cache",  # A2: ephemeral alpha-search eigh cache
+        ]:
             _p = artifacts_dir / _d
             if _p.exists():
                 _shutil.rmtree(_p, ignore_errors=True)
@@ -871,6 +874,12 @@ def run(
     if (artifacts_dir / "_stage3_ccov_partial").exists():
         shutil.rmtree(artifacts_dir / "_stage3_ccov_partial", ignore_errors=True)
         log.info("Removed Stage 3 cross-cov spill dir (no longer needed post-success).")
+    # A2: backstop cleanup of the ephemeral alpha-search eigh cache (normally
+    # removed in the α-search ``finally``; this covers a crash between search
+    # end and Stage-3 success).
+    if (artifacts_dir / "_stage3_alpha_eigh_cache").exists():
+        shutil.rmtree(artifacts_dir / "_stage3_alpha_eigh_cache", ignore_errors=True)
+        log.info("Removed Stage 3 alpha-search eigh cache (no longer needed post-success).")
     log.info("Stage 3 complete -> %s", out_dir)
     return out_dir
 
