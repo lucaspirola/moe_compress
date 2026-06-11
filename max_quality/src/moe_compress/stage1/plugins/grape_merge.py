@@ -647,6 +647,33 @@ def _grape_greedy_merge(
         li: set(blacklist.get(li, [])) for li in sorted_layers
     }
 
+    # C8 speed-up: persistent per-layer masked distance matrix ``tmp_l``.
+    # The greedy loop previously rebuilt, every iteration, a fresh
+    # ``tmp = D_l.copy()`` with the diagonal and every absorbed (incl.
+    # blacklisted) row/col set to +inf. That O(n^2) rebuild is redundant
+    # because the set of inf'd cells only ever GROWS: each merge adds exactly
+    # one absorbed expert (j_star). So we build the masked matrix ONCE here
+    # (diagonal + blacklist masked, mirroring the per-iteration rebuild) and
+    # incrementally inf the j_star row/col after each merge.
+    #
+    # Byte-identity: the only post-init in-place mutation of D_l/D_work is the
+    # ``D_l[j_star, :] = 0.0; D_l[:, j_star] = 0.0`` zeroing below — and those
+    # exact cells are the ones we inf in tmp_l after the same merge. tmp_l
+    # starts as a copy of the initial D_l, only ever gains infs, and argmin
+    # (first min in C-order) is deterministic, so the selected j_star is
+    # identical every iteration => identical merge sequence => byte-identical
+    # budgets. ``merged[li]`` already holds the blacklist (pre-populated above),
+    # whose D_work rows/cols are 0.0; the per-iteration rebuild inf'd them via
+    # the ``for a in absorbed`` loop, so we mask them here once.
+    tmp_work: dict[int, np.ndarray] = {}
+    for li in sorted_layers:
+        tmp_l = D_work[li].copy()
+        np.fill_diagonal(tmp_l, np.inf)
+        for a in merged[li]:
+            tmp_l[a, :] = np.inf
+            tmp_l[:, a] = np.inf
+        tmp_work[li] = tmp_l
+
     if current_total == 0:
         log.debug("GRAPE: all unfrozen experts blacklisted; skipping greedy merge loop")
         return {li: cluster_counts[li] + len(blacklist.get(li, [])) for li in cluster_counts}
@@ -749,16 +776,19 @@ def _grape_greedy_merge(
         # neither expert has already been absorbed.  Track absorbed experts explicitly
         # so that genuinely zero-distance (identical-weight) pairs remain selectable.
         absorbed = merged[best_layer]
-        tmp = D_l.copy()
-        np.fill_diagonal(tmp, np.inf)
-        for a in absorbed:
-            tmp[a, :] = np.inf
-            tmp[:, a] = np.inf
-        if not np.isfinite(tmp).any():
+        # C8: read the PERSISTENT masked matrix instead of rebuilding it.
+        # tmp_l already has the diagonal, every blacklisted row/col, and every
+        # previously-absorbed j_star row/col set to +inf (maintained below
+        # after each merge), so it is identical to the old per-iteration
+        # ``tmp = D_l.copy(); fill_diagonal(inf); inf each absorbed`` rebuild.
+        tmp_l = tmp_work[best_layer]
+        # Structural-block check stays live EVERY visit: if no finite pair
+        # remains the layer can never donate again.
+        if not np.isfinite(tmp_l).any():
             structurally_blocked.add(best_layer)
             # not added to frozen — structurally_blocked takes precedence.
             continue
-        flat_idx = int(np.argmin(tmp))
+        flat_idx = int(np.argmin(tmp_l))
         # n is the original matrix dimension (total experts), not the count of
         # remaining unabsorbed experts.
         # D-grape-count-only: i_star is intentionally discarded. Paper line 8's
@@ -785,6 +815,12 @@ def _grape_greedy_merge(
             log.debug("_grape_greedy_merge: pre-clamp R[%d]=%.2e clamped to 0.0 (FP drift)", best_layer, pre_clamp_R)
         D_l[j_star, :] = 0.0
         D_l[:, j_star] = 0.0
+        # C8: mirror the D_l zeroing into the persistent mask. The old code
+        # re-derived this every iteration by inf'ing each member of `absorbed`
+        # (which j_star is about to join); maintaining it incrementally here is
+        # equivalent — these are exactly the cells argmin must never re-select.
+        tmp_l[j_star, :] = np.inf
+        tmp_l[:, j_star] = np.inf
         absorbed.add(j_star)
 
         cluster_counts[best_layer] -= 1
