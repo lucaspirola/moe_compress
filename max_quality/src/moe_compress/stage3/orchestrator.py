@@ -159,9 +159,16 @@ def run(
         # The cache provider is one of the plugins in the registry built
         # below; reuse the same registry here so an introspection tool
         # observes one wiring, not two.
+        # W-S3-1: only the InputCov provider belongs here. This first
+        # dispatch runs on the throwaway ``_cache_ctx`` and promotes ONLY
+        # ``A_cov`` (below); any ``stage3.wanda_scalar_row`` payload set
+        # here would be discarded with ``_cache_ctx``. The live wanda
+        # scalar_row value is loaded later onto ``run_ctx`` at the second
+        # dispatch (see "V2 wanda scalar_row cache (W-1)"), which is the
+        # ctx the plugin walk actually reads. Dispatching the wanda
+        # provider here was dead work.
         _cache_only_plugins = [
             Stage3InputCovCacheProvider(),
-            Stage3WandaScalarRowCacheProvider(),
         ]
         PluginRegistry.dispatch_first(
             _cache_only_plugins, "on_load", _cache_ctx, _calib_jsonl_path,
@@ -516,12 +523,15 @@ def run(
     # even for stage3 runs that do NOT opt into the wanda
     # intra-expert plugin (the consumer plugin is gated separately).
     try:
-        from pathlib import Path as _Path
-        from ..utils.calibration import _DEFAULT_SELF_TRACES_PATH
-        _wsr_cal_source = cal.get("jsonl_path", _DEFAULT_SELF_TRACES_PATH)
-        _wsr_cal_jsonl_path = _Path(_wsr_cal_source)
-        if not _wsr_cal_jsonl_path.is_absolute():
-            _wsr_cal_jsonl_path = _Path.cwd() / _wsr_cal_jsonl_path
+        # W-S3-2: reuse the single resolved JSONL path promoted onto
+        # ``run_ctx`` at the top of this function (``set(
+        # "calibration_jsonl_path", _calib_jsonl_path)``) instead of
+        # re-deriving it from ``cal["jsonl_path"]``. That set always runs
+        # before this site (same straight-line function body, no early
+        # return between them), so the value is guaranteed present.
+        # Mirrors the block-hidden cache site further down — single source
+        # of truth, drift between the two resolutions is now impossible.
+        _wsr_cal_jsonl_path = run_ctx.get("calibration_jsonl_path")
         _wsr_providers = [Stage3WandaScalarRowCacheProvider()]
         PluginRegistry.dispatch_first(
             _wsr_providers, "on_load", run_ctx, _wsr_cal_jsonl_path,
