@@ -510,7 +510,11 @@ class ExpertMatrixBank:
                 f"select: kept_ids contains index {max(kept_ids)} >= num_experts {stacked.shape[0]}"
             )
         idx = torch.as_tensor(kept_ids, device=stacked.device, dtype=torch.long)
-        new_stacked = stacked.data.index_select(0, idx).clone()
+        # index_select always allocates fresh contiguous storage (never a view
+        # of the source), and the result is wrapped in a new nn.Parameter that
+        # replaces the old one with no subsequent in-place mutation — so the
+        # trailing .clone() was redundant. Byte-identical (torch.equal).
+        new_stacked = stacked.data.index_select(0, idx)
         setattr(em, self.stacked_attr,
                 nn.Parameter(new_stacked, requires_grad=stacked.requires_grad))
         # NOTE: num_experts is updated here, on the first select call for this
@@ -811,7 +815,11 @@ class FactoredExperts(nn.Module):
         for attr in ("gate_proj_U", "gate_proj_V", "up_proj_U", "up_proj_V",
                      "down_proj_U", "down_proj_V"):
             t = getattr(self, attr)
-            new_t = t.data.index_select(0, idx).clone()
+            # index_select allocates fresh contiguous storage; the result is
+            # wrapped in a new nn.Parameter replacing the old one with no later
+            # in-place mutation — the trailing .clone() was redundant.
+            # Byte-identical (torch.equal).
+            new_t = t.data.index_select(0, idx)
             setattr(self, attr, nn.Parameter(new_t, requires_grad=t.requires_grad))
         self.num_experts = len(kept_ids)
         self._last_kept_ids = list(kept_ids)

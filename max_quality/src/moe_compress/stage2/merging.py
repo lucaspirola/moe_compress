@@ -230,8 +230,14 @@ def _merge_experts_inplace(
             ]
 
             def _solve_perm(m: int, _ref_gate=ref_gate, _ref_up=ref_up, _ref_act=ref_act):
-                gate_m = banks["gate_proj"].get(m).to(torch.float32)
-                up_m   = banks["up_proj"].get(m).to(torch.float32)
+                # gate_m/up_m flow ONLY into _permutation_align_to_centroid,
+                # which re-floats its child inputs via .float() (permutation_align
+                # L148-149). The .to(torch.float32) here was therefore a dead
+                # upcast — pass native dtype directly. Byte-identical (the callee
+                # re-casts identically). NOTE: the ref_* upcasts at the centroid
+                # read above are reused across members and MUST stay fp32.
+                gate_m = banks["gate_proj"].get(m)
+                up_m   = banks["up_proj"].get(m)
                 child_act = ream_acc.get_neuron_mean(li, m) if ream_acc else None
                 return _permutation_align_to_centroid(
                     _ref_gate, _ref_up, gate_m, up_m,
@@ -422,10 +428,14 @@ def _resize_router_for_kept_experts(layer_ref: MoELayerRef, kept_ids: list[int])
     router = layer_ref.router
     idx = torch.as_tensor(kept_ids, device=router.weight.device, dtype=torch.long)
     with torch.no_grad():
-        new_w = router.weight.data.index_select(0, idx).contiguous().clone()
+        # .contiguous() is kept (router weights feed downstream kernels that may
+        # assume contiguity); the trailing .clone() was redundant — index_select
+        # already produces fresh storage and the result replaces the param with
+        # no later in-place mutation. Byte-identical (torch.equal).
+        new_w = router.weight.data.index_select(0, idx).contiguous()
         router.weight = nn.Parameter(new_w, requires_grad=router.weight.requires_grad)
         if getattr(router, "bias", None) is not None:
-            new_b = router.bias.data.index_select(0, idx).contiguous().clone()
+            new_b = router.bias.data.index_select(0, idx).contiguous()
             router.bias = nn.Parameter(new_b, requires_grad=router.bias.requires_grad)
     router.num_experts = len(kept_ids)
     # Guard: not all router implementations expose top_k (e.g., custom routers).

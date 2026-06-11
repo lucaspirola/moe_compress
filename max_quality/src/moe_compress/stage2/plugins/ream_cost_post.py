@@ -259,6 +259,23 @@ def _post_alignment_cost(
         top_cj = topk_per_ci[ci].tolist()
         cells: list[tuple[int, float]] = []
         puts: list[tuple[tuple[int, int, int], np.ndarray, float | None]] = []
+        # The child gate/up/down upcasts depend only on m_id, which is fixed for
+        # this row (m_id = noncentroid_ids[ci]); c_id is the loop variable. They
+        # were re-read and re-cast on every cache-miss iteration of the for-cj
+        # loop. Hoist to a lazy per-row cache (computed on first cache-miss):
+        # banks[...].get(m_id).to(fp32) is a pure read + deterministic cast, so
+        # each iteration produced byte-identical tensors. The children flow only
+        # into _permutation_align_to_centroid / _aligned_whitened_residual and
+        # are never mutated in the loop body. Byte-identical (torch.equal).
+        _child: dict[str, torch.Tensor] = {}
+
+        def _get_child() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            if not _child:
+                _child["gate"] = banks["gate_proj"].get(m_id).to(torch.float32)
+                _child["up"]   = banks["up_proj"].get(m_id).to(torch.float32)
+                _child["down"] = banks["down_proj"].get(m_id).to(torch.float32)
+            return _child["gate"], _child["up"], _child["down"]
+
         with torch.no_grad():
             for cj in top_cj:
                 c_id = centroid_ids[cj]
@@ -287,9 +304,7 @@ def _post_alignment_cost(
                         ref_gate = banks["gate_proj"].get(c_id).to(torch.float32)
                         ref_up   = banks["up_proj"].get(c_id).to(torch.float32)
                         ref_down = banks["down_proj"].get(c_id).to(torch.float32)
-                    child_gate = banks["gate_proj"].get(m_id).to(torch.float32)
-                    child_up   = banks["up_proj"].get(m_id).to(torch.float32)
-                    child_down = banks["down_proj"].get(m_id).to(torch.float32)
+                    child_gate, child_up, child_down = _get_child()
 
                     ref_act   = ream_acc.get_neuron_mean(li, c_id) if ream_acc else None
                     child_act = ream_acc.get_neuron_mean(li, m_id) if ream_acc else None

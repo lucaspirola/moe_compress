@@ -59,6 +59,71 @@ def test_bank_select_slices_stacked_tensor(tiny_model):
     assert banks_after["up_proj"].num_experts() == 2
 
 
+def test_bank_select_independent_storage(tiny_model):
+    """C4 byte-identity + aliasing guard: dropping the redundant `.clone()`
+    after `index_select` in ExpertMatrixBank.select must (a) produce a tensor
+    byte-identical to a pre-edit cloned reference of the kept rows, and (b)
+    yield storage independent of the original stacked tensor — mutating the new
+    param must NOT write back into the source. index_select always allocates
+    fresh contiguous storage, so the `.clone()` was redundant.
+    """
+    layer_ref = next(iter_moe_layers(tiny_model))
+    banks = build_banks(layer_ref)
+    bank = banks["down_proj"]
+    kept = [0, 2]
+
+    # Snapshot the original stacked tensor and a reference of the kept rows
+    # *before* the edit (clone so the reference survives the param swap).
+    orig_stacked = bank._stacked()
+    orig_full_snapshot = orig_stacked.detach().clone()
+    expected_kept = orig_stacked.detach().index_select(
+        0, torch.tensor(kept, dtype=torch.long)
+    ).clone()
+
+    bank.select(kept)
+    new_stacked = bank._stacked()
+
+    # (a) byte-identical to the pre-edit cloned reference.
+    assert torch.equal(new_stacked.detach(), expected_kept)
+
+    # (b) independent storage: it is a fresh allocation, not a view of orig.
+    assert new_stacked.data_ptr() != orig_stacked.data_ptr()
+    assert new_stacked.untyped_storage().data_ptr() != orig_stacked.untyped_storage().data_ptr()
+
+    # (b cont.) mutating the new param must NOT alter the original source tensor.
+    with torch.no_grad():
+        new_stacked.add_(1.0)
+    assert torch.equal(orig_stacked.detach(), orig_full_snapshot)
+
+
+def test_router_resize_independent_storage(tiny_model):
+    """C4 byte-identity + aliasing guard for `_resize_router_for_kept_experts`:
+    `.clone()` was dropped while `.contiguous()` is kept. The resized router
+    weight (and bias, if present) must be byte-identical to a pre-edit cloned
+    reference and must not alias the original router weight storage.
+    """
+    layer_ref = next(iter_moe_layers(tiny_model))
+    router = layer_ref.router
+    kept = [0, 3]
+
+    orig_w = router.weight
+    orig_w_snapshot = orig_w.detach().clone()
+    expected_w = orig_w.detach().index_select(
+        0, torch.tensor(kept, dtype=torch.long)
+    ).contiguous().clone()
+
+    _resize_router_for_kept_experts(layer_ref, kept_ids=kept)
+    new_w = router.weight
+
+    assert torch.equal(new_w.detach(), expected_w)
+    assert new_w.is_contiguous()
+    assert new_w.untyped_storage().data_ptr() != orig_w.untyped_storage().data_ptr()
+
+    with torch.no_grad():
+        new_w.add_(1.0)
+    assert torch.equal(orig_w.detach(), orig_w_snapshot)
+
+
 def test_assign_children_when_more_children_than_centroids():
     import numpy as np
     cost = np.array([[0.1, 0.9], [0.8, 0.2], [0.3, 0.5]])
