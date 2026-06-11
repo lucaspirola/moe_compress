@@ -19,7 +19,7 @@ All load-bearing cites confirmed in this checkout. Corrected line drift vs. the 
 | accumulators | :707-708 | **:707-708** ✓ |
 | per-matrix `.item()` sync | :726-727 | **:726-727** ✓ |
 | log.info residual line | :731-733 | **:731-733** ✓ |
-| `_trackio_log` residual keys | :744-745 | **:744-746** (3 keys: before, after, **rel_drop**) |
+| `_trackio_log` residual keys | :744-746 | **:744-746** (3 keys: before, after, **rel_drop**) |
 
 **KEY CORRECTION to the threading premise:** residuals are computed ENTIRELY inside `_solve_expert_tile`. `_compute_eora_factors` (:235) returns only `(Uc, Vc, take_eff)` and never touches residuals. Therefore the flag threads into `_solve_expert_tile` ONLY — `_compute_eora_factors` needs **no** change.
 
@@ -126,10 +126,14 @@ The golden artifact is the widened U/V tensors + `rank_map`, derived from `Uc`/`
 
 **(a) Golden snapshot byte-identical (default off).** Re-run the Stage-4 golden snapshot test with no config change (flag defaults false), assert snapshot unchanged. (Residuals aren't in the golden, so it must pass — assert explicitly. Identify via `grep -rn "snapshot\|golden" max_quality/tests/test_stage4*`.)
 
-**(b) New unit `test_solve_expert_tile_residual_flag`:**
+**(b) New unit `test_solve_expert_tile_residual_flag`:** mirror `test_solve_expert_tile_pure`'s EXACT positional call (`name, e, layer_idx, W_orig, U_e, V_e, A, d_in, r_per_expert, target_device, a_storage_dtype`, e.g. `..., torch.float32`) then append the keyword args — do NOT drop `a_storage_dtype`:
 ```python
-out_off = _solve_expert_tile(..., gate_spectrum=None, log_residuals=False)
-out_on  = _solve_expert_tile(..., gate_spectrum=None, log_residuals=True)
+out_off = _solve_expert_tile(name, e, 0, W_orig, U_e, V_e, A, d_in, r,
+                             target_device, torch.float32,
+                             gate_spectrum=None, log_residuals=False)
+out_on  = _solve_expert_tile(name, e, 0, W_orig, U_e, V_e, A, d_in, r,
+                             target_device, torch.float32,
+                             gate_spectrum=None, log_residuals=True)
 assert torch.equal(out_off[0], out_on[0])   # Uc
 assert torch.equal(out_off[1], out_on[1])   # Vc
 assert out_off[2] == out_on[2]              # take_eff
@@ -161,6 +165,7 @@ VERIFIED at plan time: only an unrelated `..._before_teardown` function-name mat
 - [ ] Guard accumulators (:707-708) under `if log_residuals:`; keep `n_eligible` unconditional. (§2d)
 - [ ] Guard sync+log+trackio residual keys (:726-746); build `residual_fields`, splice `**residual_fields`. (§2e)
 - [ ] Add unit `test_solve_expert_tile_residual_flag`. (§5b)
+- [ ] Update `_solve_expert_tile` `Returns:` docstring (:428-433) to note slots 3,4 (`res_before`/`res_after`) are `None` when `log_residuals=False`. (doc-only, while touching the signature)
 - [ ] Re-run grep (§5c) to re-confirm no test reads residual slots as non-sentinel.
 
 ## 8. Test plan (commands)
