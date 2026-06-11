@@ -373,6 +373,97 @@ def _compute_eora_factors(
     return U_out, V_out, take_eff
 
 
+def _solve_expert_tile(
+    name: str,
+    e: int,
+    layer_idx: int,
+    W_orig,
+    U_e,
+    V_e,
+    A,
+    d_in: int,
+    r_per_expert: int,
+    target_device,
+    a_storage_dtype,
+    *,
+    gate_spectrum=None,
+):
+    """Pure per-expert EoRA solve — the task-parallel unit (N-GPU lever 1).
+
+    Verbatim extraction of the serial per-expert inner block
+    (``compensate_layer`` :523-557), parameterized by ``target_device`` in
+    place of the closure ``dev``. Reads ONLY this expert's tensors
+    (``W_orig`` / ``U_e`` / ``V_e`` / ``A``) — nothing from any other expert —
+    so it is a pure function of its inputs and relocating it to any device is a
+    pure relocation (same kernels on the same arch ⇒ bit-identical).
+
+    The gate→up whitening-spectrum memo (Lever A) is threaded as an explicit
+    in/out arg ``gate_spectrum`` so it stays PER-EXPERT and crosses no worker
+    boundary: a worker owning expert ``e`` computes the spectrum on the
+    gate_proj pass (returns it) and RETAINS it for the up_proj pass (the loop
+    is matrix-outer / expert-inner, so the memo must survive the whole gate→up
+    window for that worker — it is NOT intra-solve scratch). down_proj passes
+    ``gate_spectrum=None`` and gets ``None`` back.
+
+    Returns
+    -------
+    ``(Uc, Vc, take_eff, res_before, res_after, gate_spectrum_out)``
+        ``Uc`` / ``Vc`` are the correction factors on ``target_device``;
+        ``take_eff`` is the integer effective rank; ``res_before`` / ``res_after``
+        are scalar fp32 squared residual norms (log-only, never the golden);
+        ``gate_spectrum_out`` is the memo to retain for this expert's up_proj
+        pass (the gate spectrum on gate_proj, else ``None``).
+    """
+    W_orig_f = W_orig.to(device=target_device, dtype=torch.float32)
+    delta = W_orig_f - (
+        U_e.to(device=target_device, dtype=torch.float32)
+        @ V_e.to(device=target_device, dtype=torch.float32)
+    )
+    res_before = delta.norm() ** 2
+    # Lever A: gate_proj computes+memoizes the spectrum; up_proj reuses gate's
+    # (identical A object) → skips the redundant eigh.
+    if name == "up_proj":
+        spectrum = gate_spectrum
+        gate_spectrum_out = None
+    elif name == "gate_proj":
+        spectrum = (
+            _eigh_spectrum(A, d_in, target_device, a_storage_dtype)
+            if A is not None else None
+        )
+        gate_spectrum_out = spectrum
+    else:
+        spectrum = None
+        gate_spectrum_out = None
+    Uc, Vc, take_eff = _compute_eora_factors(
+        delta, A, r_per_expert, target_device, storage_dtype=a_storage_dtype,
+        spectrum=spectrum,
+    )
+    # Residual after applying the planned correction (Uc @ Vc).
+    res_after = (
+        delta - (Uc.to(torch.float32) @ Vc.to(torch.float32))
+    ).norm() ** 2
+    return Uc, Vc, int(take_eff), res_before, res_after, gate_spectrum_out
+
+
+def _resolve_worker_devices(worker_devices, n: int, home_device) -> list:
+    """Resolve the list of ``n`` target devices for the expert fan-out.
+
+    If ``worker_devices`` is supplied (the test/integration seam — e.g.
+    ``["cuda:0","cuda:1"]`` or the CI CPU stand-in ``["cpu","cpu"]``), it is
+    used verbatim (truncated/cycled to ``n``). Otherwise derive ascending CUDA
+    devices ``cuda:0..cuda:(n-1)`` when CUDA is available, else fall back to
+    ``n`` copies of the home device (graceful 1-GPU / CPU degrade).
+    """
+    if worker_devices:
+        devs = [torch.device(d) for d in worker_devices]
+        if len(devs) < n:
+            devs = [devs[i % len(devs)] for i in range(n)]
+        return devs[:n]
+    if torch.cuda.is_available() and torch.cuda.device_count() >= n:
+        return [torch.device(f"cuda:{i}") for i in range(n)]
+    return [home_device for _ in range(n)]
+
+
 class EoraCompensationPlugin:
     """Stage 4 EoRA residual-compensation plugin (S4-3 — registered-but-INERT).
 
@@ -411,6 +502,9 @@ class EoraCompensationPlugin:
     reads: tuple[str, ...] = (
         "layer_ref", "originals", "A_cov", "a_storage_dtype", "config",
         "partial_dir", "stage3_ranks", "rank_map", "compensated_params",
+        # N-GPU lever 1: task-parallel EoRA worker count (+ optional explicit
+        # device list seam). Both optional — absent ⇒ serial single-GPU path.
+        "eora_workers", "eora_worker_devices",
     )
     # ``rank_map`` is a shared mutable dict the hook MUTATES in place across
     # loop iterations (mirror of ``aa_svd_factor.factor_layer``'s HAZARD H1)
@@ -480,6 +574,17 @@ class EoraCompensationPlugin:
         dtype = fe.gate_proj_U.dtype
         N = fe.num_experts
 
+        # N-GPU lever 1 (task-parallel EoRA): the orchestrator resolves the
+        # effective worker count and (optionally) an explicit worker-device
+        # list onto the ctx. ``eora_workers <= 1`` (or absent) ⇒ the serial
+        # in-process path below, byte-identical to single-GPU today.
+        eora_workers = int(ctx.get("eora_workers")) if ctx.has("eora_workers") else 1
+        # ``eora_worker_devices`` is an optional test/integration seam: an
+        # explicit list of target devices to fan experts across (e.g.
+        # ["cuda:0", "cuda:1"], or ["cpu", "cpu"] for the CI CPU stand-in).
+        # When absent and workers>1, derive ascending CUDA devices.
+        worker_devices = ctx.get("eora_worker_devices") if ctx.has("eora_worker_devices") else None
+
         layer_compensated_params = 0
         rank_map_layer: dict[str, int] = {}
         # Lever A: memoize the gate_proj whitening spectrum per expert so the
@@ -519,42 +624,70 @@ class EoraCompensationPlugin:
             res_before_acc = torch.zeros((), device=dev, dtype=torch.float32)
             res_after_acc = torch.zeros((), device=dev, dtype=torch.float32)
             n_eligible = 0
-            for e in range(N):
+
+            # Eligible experts (have an ``originals`` entry) in ascending order.
+            # The gather always writes rows in ascending ``e`` (§4 determinism),
+            # so the serial and N-GPU paths fill ``U_corr``/``V_corr`` identically.
+            eligible = [
+                e for e in range(N)
+                if originals.get((ref.layer_idx, e, name)) is not None
+            ]
+
+            def _inputs_for(e):
                 key = (ref.layer_idx, e, name)
                 W_orig = originals.get(key)
-                if W_orig is None:
-                    continue
-                W_orig_f = W_orig.to(device=dev, dtype=torch.float32)
                 U_e = fe.gate_proj_U.data[e] if name == "gate_proj" else \
                        fe.up_proj_U.data[e]   if name == "up_proj"   else \
                        fe.down_proj_U.data[e]
                 V_e = fe.gate_proj_V.data[e] if name == "gate_proj" else \
                        fe.up_proj_V.data[e]   if name == "up_proj"   else \
                        fe.down_proj_V.data[e]
-                delta = W_orig_f - (U_e.to(torch.float32) @ V_e.to(torch.float32))
-                res_before_acc += delta.norm() ** 2
                 # up_proj shares the gate_proj input covariance (same fused tensor).
                 cov_key = (ref.layer_idx, e, "gate_proj") if name == "up_proj" else key
                 A = A_cov.get(cov_key)
-                # Lever A: gate_proj computes+memoizes the spectrum; up_proj
-                # reuses gate's (identical A object) → skips the redundant eigh.
-                if name == "up_proj":
-                    spectrum = gate_spectra.get(e)
-                elif name == "gate_proj":
-                    spectrum = _eigh_spectrum(A, d_in, dev, a_storage_dtype) if A is not None else None
-                    gate_spectra[e] = spectrum
-                else:
-                    spectrum = None
-                Uc, Vc, take_eff = _compute_eora_factors(
-                    delta, A, r_per_expert, dev, storage_dtype=a_storage_dtype,
-                    spectrum=spectrum,
+                return W_orig, U_e, V_e, A
+
+            # Resolve the effective per-layer worker count + the device each
+            # eligible expert is solved on. ``effective_workers <= 1`` ⇒ every
+            # expert runs on ``dev`` (the home device) in the same serial order
+            # as single-GPU today (byte-identical golden path). >1 ⇒ fan experts
+            # contiguously across the worker devices (deterministic bands).
+            effective_workers = min(eora_workers, max(1, len(eligible)))
+            if effective_workers > 1:
+                devices = _resolve_worker_devices(worker_devices, effective_workers, dev)
+                effective_workers = min(effective_workers, len(devices))
+            if effective_workers <= 1:
+                device_of = {e: dev for e in eligible}
+            else:
+                # Contiguous bands by sorted expert index — reproducible
+                # run-to-run and identical per-row to the serial fill.
+                device_of = {}
+                per = (len(eligible) + effective_workers - 1) // effective_workers
+                for w in range(effective_workers):
+                    for e in eligible[w * per:(w + 1) * per]:
+                        device_of[e] = devices[w]
+
+            for e in eligible:
+                tgt = device_of[e]
+                W_orig, U_e, V_e, A = _inputs_for(e)
+                Uc, Vc, take_eff, res_before, res_after, gate_spec_out = _solve_expert_tile(
+                    name, e, ref.layer_idx, W_orig, U_e, V_e, A, d_in,
+                    r_per_expert, tgt, a_storage_dtype,
+                    gate_spectrum=gate_spectra.get(e),
                 )
-                U_corr[e] = Uc.to(dtype)
-                V_corr[e] = Vc.to(dtype)
+                if name == "gate_proj":
+                    # Retain this expert's gate spectrum (on its worker device)
+                    # for the SEPARATE up_proj pass — the memo must survive the
+                    # whole gate→up window for the worker owning expert e.
+                    gate_spectra[e] = gate_spec_out
+                # Gather the tile back to the layer home device and place the
+                # disjoint row (ascending-e order, no cross-expert reduction).
+                U_corr[e] = Uc.to(device=dev, dtype=dtype)
+                V_corr[e] = Vc.to(device=dev, dtype=dtype)
                 eff_per_expert[e] = int(take_eff)
-                # Residual after applying the planned correction (Uc @ Vc).
-                res_after = delta - (Uc.to(torch.float32) @ Vc.to(torch.float32))
-                res_after_acc += res_after.norm() ** 2
+                # log-only residual norms (B4) — accumulate on dev.
+                res_before_acc += res_before.to(dev)
+                res_after_acc += res_after.to(dev)
                 n_eligible += 1
                 if (e + 1) % 32 == 0:
                     log.info("  L%d/%s expert %d/%d", ref.layer_idx, name, e + 1, N)
