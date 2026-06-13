@@ -1218,6 +1218,20 @@ def run(
     # cost_asymmetric × freq_weighted_merge invariant is checked at the very
     # top of run() (fail-fast); we rely on that here.
 
+    # Feature A — resolve the persistent-pool DP profile config (default OFF).
+    # The reservoir guard fires HERE (config resolution), naming the consumer, NOT
+    # 40 layers deep. enabled=False ⇒ the serial _profile_layer path everywhere,
+    # byte-identical. device_count<=1 / replicas<=1 / any reservoir consumer
+    # (expert_distill / cost_alignment="output" / merge_step="mergemoe") ⇒ serial.
+    from . import profile_dp as _profile_dp_mod
+    _dp_cfg = _profile_dp_mod.resolve_profile_dp_config(
+        s2,
+        expert_distill_steps=expert_distill_steps,
+        cost_alignment=cost_alignment_cfg,
+        merge_step=merge_step,
+        device_count=(torch.cuda.device_count() if torch.cuda.is_available() else 0),
+    )
+
     # Stage 2 v2 (spec § 6) — one-shot Trackio emit of the static config so
     # the dashboard run-summary reflects which features are active without
     # parsing per-layer logs. All v2 config flags + the partial-JSON
@@ -1670,7 +1684,36 @@ def run(
             _plug.on_load(run_ctx, _calib_jsonl_path)
             break
 
-    for k, layer_ref in enumerate(moe_layers):
+    # Feature A — spawn the persistent DP profile pool ONCE (default-off: this
+    # whole block is skipped unless profile_dp resolved enabled). The pool drives
+    # per-layer RESYNC(L-1)+PROFILE(L) inside the sequential loop; LayerMergePlugin
+    # .on_profile reads the run-scope slots set here and routes to run_dp_profile_layer.
+    # All _dp_* locals are inert on the serial path (pool stays None).
+    _profile_dp_pool = None
+    _dp_spill_root = None
+    _dp_prev_payload = None  # (prev_layer_idx, payload_path) for the RESYNC barrier
+    if _dp_cfg["enabled"]:
+        _dp_seq_len = int(calib.shape[1]) if calib.dim() >= 2 else None
+        _dp_spill_root = artifacts_dir / "_stage2_profile_dp_spill"
+        _dp_spill_root.mkdir(parents=True, exist_ok=True)
+        _dp_model_path = config["model"]["name_or_path"]
+        _profile_dp_pool = _profile_dp_mod.Stage2ProfilePool(
+            replicas=_dp_cfg["replicas"], executor="spawn",
+        )
+        log.info(
+            "Stage 2 profile_dp ENABLED: spawning %d replica(s), seq_len=%s",
+            _dp_cfg["replicas"], _dp_seq_len,
+        )
+        _profile_dp_pool.start(
+            config, _dp_model_path, int(calib.size(0)), _dp_seq_len,
+            shards_per_model=_dp_cfg["shards_per_model"],
+        )
+        run_ctx.set("profile_dp_pool", _profile_dp_pool)
+        run_ctx.set("profile_dp_seq_len", _dp_seq_len)
+        run_ctx.set("profile_dp_spill_root", str(_dp_spill_root))
+
+    try:
+      for k, layer_ref in enumerate(moe_layers):
         if layer_ref.layer_idx in completed_layers:
             log.info(
                 "Stage 2 layer %d/%d (idx=%d) — skipped (resumed from partial)",
@@ -1693,6 +1736,12 @@ def run(
         # uses. Stage2ReapScoresCacheProvider.on_score reads this to slice
         # the per-layer row out of the loaded payload.
         ctx.set("_layer_rank", k)
+        # Feature A (DP) — hand this layer's on_profile the RESYNC barrier input:
+        # the (idx, payload_path) of the PREVIOUSLY-merged layer, so every worker
+        # replays the merged upstream before profiling this layer. None on the
+        # first processed layer (no upstream merge yet) and on the serial path.
+        if _profile_dp_pool is not None and _dp_prev_payload is not None:
+            ctx.set("profile_dp_prev_layer", _dp_prev_payload)
         # S2-5: the assignment phase is no longer a plain ``walk_phases`` slot.
         # The pre-assign phases run, then ``_run_assignment`` drives the bump
         # loop over the four fine-grained assignment slots, then the
@@ -1718,6 +1767,25 @@ def run(
                 len(ctx.get("final_kept_ids")), target,
                 layer_idx=layer_ref.layer_idx, faithful=_faithful_prune,
             )
+
+        # Feature A (DP) — capture THIS layer's merged structure so the NEXT
+        # layer's on_profile can RESYNC every worker (structural replay) before
+        # profiling. The parent has just run bank.select + router resize on
+        # itself; we snapshot the post-select kept tensors + resized router to a
+        # per-layer scratch file referenced by path (never serialized through the
+        # mp.Queue). Inert on the serial path.
+        if _profile_dp_pool is not None:
+            _dp_payload = _profile_dp_mod.capture_merged_layer(
+                layer_ref, list(ctx.get("final_kept_ids")),
+            )
+            _dp_path = _dp_spill_root / f"_merged_layer_{layer_ref.layer_idx}.pt"
+            torch.save(_dp_payload, _dp_path)
+            _dp_prev_payload = (layer_ref.layer_idx, str(_dp_path))
+    finally:
+        # Feature A teardown: SHUTDOWN + drain reduce queue + join + exitcode
+        # check + leak/timeout terminate. No-op on the serial path (pool None).
+        if _profile_dp_pool is not None:
+            _profile_dp_pool.shutdown()
     walk_phases(("on_run_teardown",), plugins, run_ctx)
 
     out_dir = artifacts_dir / "stage2_pruned"
