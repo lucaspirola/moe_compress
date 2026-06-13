@@ -344,15 +344,20 @@ class LayerMergePlugin:
     reads: tuple[str, ...] = (
         "layer_ref", "reap_acc", "ream_acc", "layer_input_acc", "perm_cache",
         "target", "freq", "scores", "grouped", "protected",
-        "ream_centroid_ids", "final_kept_ids",
+        "ream_centroid_ids", "final_kept_ids", "merge_member_perms",
         "heal_state", "distill_state", "n_experts", "n_protected",
         "assigned_cost", "n_assigned", "c_fail", "em_rounds_done",
         "effective_cost_alignment", "effective_cost_asymmetric",
         "capacity_util_value", "effective_target", "mean_assigned_cost",
+        # Feature A (DP profile) — run-scope slots, present only when profile_dp
+        # resolved enabled; absent ⇒ serial path (default-off, byte-identical).
+        "profile_dp_pool", "profile_dp_seq_len", "profile_dp_spill_root",
+        "profile_dp_prev_layer",
     )
     writes: tuple[str, ...] = (
         "ream_acc", "perm_cache", "layer_input_acc",
         "distill_state", "final_kept_ids", "heal_state", "reap_acc",
+        "merge_member_perms",
     )
     provides: tuple[str, ...] = ()
 
@@ -525,6 +530,37 @@ class LayerMergePlugin:
         # bypass the monkey-patch.
         from .. import orchestrator as _srr
         layer_ref = ctx.get("layer_ref")
+
+        # A4 — DP-or-serial branch. The persistent pool + DP state are set on the
+        # RUN-scope ctx by the orchestrator ONLY when profile_dp resolved enabled
+        # (replicas>1, no reservoir consumer). Absent ⇒ the serial path below,
+        # byte-identical (default-off gate). The DP branch RESYNCs the workers with
+        # the just-merged upstream layer (barrier), profiles this layer across
+        # sequence-disjoint shards, and reduces the four accumulators into the
+        # parent's reap/cov/ream — leaving assign/merge to run exactly as serial.
+        pool = ctx.get("profile_dp_pool") if ctx.has("profile_dp_pool") else None
+        if pool is not None:
+            from .. import profile_dp as _pdp
+            seq_len = ctx.get("profile_dp_seq_len")
+            spill_root = ctx.get("profile_dp_spill_root")
+            cov_dtype = self.cov_acc.storage_dtype
+            prev = ctx.get("profile_dp_prev_layer") if ctx.has("profile_dp_prev_layer") else None
+            prev_idx = prev[0] if prev is not None else None
+            prev_path = prev[1] if prev is not None else None
+            _pdp.run_dp_profile_layer(
+                pool, layer_ref,
+                reap_acc=ctx.get("reap_acc"), cov_acc=self.cov_acc,
+                ream_acc=ctx.get("ream_acc"),
+                spill_root=spill_root, seq_len=seq_len,
+                cov_storage_dtype=cov_dtype,
+                prev_layer_idx=prev_idx, prev_layer_payload_path=prev_path,
+            )
+            # The DP reduce loaded an already-finalized cov off disk (the reduce
+            # owns the storage-dtype cast — Open-Q2); the parent finalize_layer is
+            # a no-op (nothing in _pending). Skip it to avoid touching the loaded
+            # cov.
+            return
+
         _srr._profile_layer(
             self.model, layer_ref, self.batches,
             ctx.get("reap_acc"), self.cov_acc, ctx.get("ream_acc"),
@@ -571,7 +607,7 @@ class LayerMergePlugin:
             else None
         )
 
-        _merge_experts_inplace(
+        member_perms = _merge_experts_inplace(
             layer_ref, grouped, freq,
             freq_weighted=self.s2["ream"]["frequency_weighted_merge"],
             scores=scores,
@@ -588,6 +624,10 @@ class LayerMergePlugin:
             cov_acc=self.cov_acc,
         )
 
+        # Feature B: stash the EXACT per-member merge perms so write_artifacts can
+        # build the survivor's down_proj Gram union on the same permuted axis the
+        # weights used. {centroid: {member: perm}}; perm is None for the centroid.
+        ctx.set("merge_member_perms", member_perms)
         ctx.set("distill_state", None)
 
     # ------------------------------------------------------------------
@@ -677,7 +717,17 @@ class LayerMergePlugin:
         }
         # Ordering critical: remap to post-merge indices BEFORE snapshotting.
         # Writing pre-remap covariance would silently corrupt the resume path.
-        _remap_covariance_for_layer(cov_acc, layer_ref.layer_idx, final_kept_ids)
+        #
+        # Feature B: pass the merge recipe (grouped + the EXACT per-member perms
+        # captured during the merge) so each survivor's input-Gram anchor becomes
+        # the group UNION Σ_j G_j (down_proj summands permuted on both axes by the
+        # same perm the weights used). Singleton / protected survivors and the
+        # legacy (None) path stay byte-identical. The union is written to disk here,
+        # so resume loads it for free (a resumed run reads the already-unioned cov).
+        _remap_covariance_for_layer(
+            cov_acc, layer_ref.layer_idx, final_kept_ids,
+            grouped=grouped, member_perms=ctx.get("merge_member_perms"),
+        )
 
         if partial_dir is not None:
             _snapshot_cov_layer(cov_acc, layer_ref.layer_idx, partial_dir)

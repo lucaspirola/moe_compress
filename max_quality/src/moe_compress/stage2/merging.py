@@ -45,7 +45,7 @@ def _merge_experts_inplace(
     token_cap: int = 1024,
     cov_acc: "InputCovarianceAccumulator | None" = None,
     lsa_max_workers: int | None = None,
-) -> None:
+) -> dict[int, dict[int, object]]:
     """Merge non-centroid experts into their centroid in place.
 
     Parameters
@@ -157,6 +157,12 @@ def _merge_experts_inplace(
 
     banks = build_banks(layer_ref)
     li = layer_ref.layer_idx
+    # Feature B: collect the EXACT per-member permutation each merge used so the
+    # post-merge covariance remap can build the survivor's down_proj Gram union on
+    # the SAME permuted neuron axis (mirrors RegMean's down-Gram perm). Keyed
+    # {centroid: {member: perm}} where perm is None for the centroid and the
+    # identical object consumed by the weight permutation (Wm[:, perm]) for members.
+    member_perms: dict[int, dict[int, object]] = {}
     with torch.no_grad():
         for centroid, members in grouped.items():
             if len(members) <= 1:
@@ -296,6 +302,11 @@ def _merge_experts_inplace(
                         # below still runs in original `zip(weights, members)`
                         # order so `accs` sums identically.
                         perm = _miss_perms[m]
+                # Feature B: record the EXACT perm this member's weights are about
+                # to be permuted by (consumed at Wm[:, perm] below). The remap reuses
+                # this same object to permute the member's down_proj Gram axes, so the
+                # Gram-axis permutation is provably consistent with the weight-axis one.
+                member_perms.setdefault(centroid, {})[m] = perm
                 for name, bank in banks.items():
                     if name == "gate_proj":
                         Wm = gate_m
@@ -422,6 +433,8 @@ def _merge_experts_inplace(
 
             for name, bank in banks.items():
                 bank.set(centroid, accs[name])
+
+    return member_perms
 
 
 def _resize_router_for_kept_experts(layer_ref: MoELayerRef, kept_ids: list[int]) -> None:
