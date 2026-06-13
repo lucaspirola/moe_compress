@@ -117,6 +117,7 @@ from .plugins.rkd_paper_recipe import RkdPaperRecipePlugin
 
 from .ddp_config import DdpConfig
 from ._unwrap import unwrap_student
+from .ddp_runtime import all_ranks_finite, grad_sync_context, wrap_ddp
 
 log = logging.getLogger(__name__)
 
@@ -593,6 +594,19 @@ def _run_single_process(
     # future architecture variant introduces dropout, set frozen submodules to
     # inference mode.
     student.train()
+
+    # --- DDP wrap (Task 5) -------------------------------------------------
+    # Wrap AFTER freeze (setup_trainable_scope) + optimizer build + optional
+    # torch.compile + the per-rank resume restore (M4: every rank loaded the
+    # SAME checkpoint above, so the DDP construction broadcast rank-0 → others
+    # is a no-op consistency check). The optimizer already holds the leaf
+    # params; DDP wraps the SAME module so its parameters() are identical
+    # objects — no optimizer rebuild. No-op on the single-process path.
+    if ddp is not None:
+        student = wrap_ddp(student, device=device, backend=ddp.backend)
+        run_ctx.set("student", student, overwrite=True)
+        run_ctx.set("model", student, overwrite=True)
+
     remaining_steps = max(0, total_steps - resume_step)
 
     # --- Resume restore for the scheduler ---------------------------------
@@ -895,7 +909,15 @@ def _run_single_process(
             # --- NaN tripwire (added 2026-05-13) ---
             # If loss went non-finite, dump diagnostics and abort. Earlier
             # crashes trained through 250+ NaN batches; this stops at batch 1.
-            if not torch.isfinite(loss):
+            #
+            # M1 (DDP NaN→deadlock fix): under DDP a NaN on ONE rank would let
+            # that rank raise + exit while the others block forever in the next
+            # gradient all-reduce. all_ranks_finite all-reduces a finiteness
+            # flag (ReduceOp.MIN) BEFORE backward so EVERY rank sees any rank's
+            # NaN and they raise TOGETHER. On the single-process path it is a
+            # plain local isfinite check (identical to before).
+            _local_finite = all_ranks_finite(loss, ddp=ddp)
+            if not _local_finite:
                 _dump_nan_diagnostics(
                     loss=loss,
                     teacher_logits=t_logits_shift,
@@ -904,9 +926,10 @@ def _run_single_process(
                     epoch=epoch, step=step, batch_i=i,
                 )
                 raise RuntimeError(
-                    f"Stage 5 KD loss is non-finite at epoch={epoch} step={step} "
-                    f"batch={i}: loss={float(loss):.6e}. See ERROR-level dump above "
-                    "for teacher/student/param state. Aborting before backward()."
+                    f"Stage 5 KD loss is non-finite on at least one rank at "
+                    f"epoch={epoch} step={step} batch={i}: loss={float(loss):.6e}. "
+                    "See ERROR-level dump above for teacher/student/param state. "
+                    "Aborting before backward()."
                 )
 
             # --- Per-step debug log (env-gated, added 2026-05-13) ---
@@ -930,7 +953,13 @@ def _run_single_process(
             # invariant to the Direction-E MSE term. When merge_repair is off
             # `kl_loss is loss`, so this is byte-identical to pre-E `main`.
             window_raw_kl_acc.append(kl_loss.detach() / max(T * T, 1e-12))
-            (loss / grad_accum).backward()
+            # DDP grad-accum no_sync (Task 5): the gradient all-reduce fires
+            # only on the boundary microbatch (one all-reduce per grad-accum
+            # window). nullcontext on the single-process path / boundary.
+            _is_boundary = (i + 1) % grad_accum == 0
+            with grad_sync_context(student, is_boundary=_is_boundary,
+                                   ddp_on=(ddp is not None)):
+                (loss / grad_accum).backward()
 
             if (i + 1) % grad_accum == 0:
                 # Pre-step: compute gradient norm over trainable params, but

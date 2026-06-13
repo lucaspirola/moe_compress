@@ -14,6 +14,7 @@ hang that escapes it.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 
 import torch
@@ -42,6 +43,61 @@ def _init_pg(rank, world_size, *, backend, master_addr="127.0.0.1", master_port)
 def _destroy_pg():
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def wrap_ddp(student, *, device, backend):
+    """Wrap ``student`` in DistributedDataParallel (Task 5).
+
+    Call AFTER freeze + optimizer build (+ optional torch.compile) so the
+    optimizer already holds the leaf params and DDP wraps the SAME module —
+    ``ddp.module.parameters()`` are the identical objects, no optimizer rebuild.
+
+    ``device_ids`` is ``[device.index]`` on CUDA/NCCL and ``None`` for gloo/CPU.
+    ``find_unused_parameters=False``: the router-only trainable scope is fully
+    used every step (faster + correct). ``gradient_as_bucket_view=True`` avoids
+    an extra grad copy. DDP averages gradients across ranks by default — exactly
+    the per-token-mean semantics; NO manual ``*world_size`` rescale anywhere.
+    """
+    device_ids = None
+    if device is not None and getattr(device, "type", None) == "cuda":
+        device_ids = [device.index]
+    return torch.nn.parallel.DistributedDataParallel(
+        student,
+        device_ids=device_ids,
+        find_unused_parameters=False,
+        gradient_as_bucket_view=True,
+    )
+
+
+def all_ranks_finite(loss, *, ddp) -> bool:
+    """Return whether the loss is finite on EVERY rank (M1 — NaN→deadlock fix).
+
+    Under DDP, a NaN on ONE rank would let that rank exit the loop while the
+    others block forever in the next gradient all-reduce. Before the per-rank
+    finiteness check, all-reduce a flag with ReduceOp.MIN (0 if ANY rank is
+    non-finite) so every rank sees any rank's NaN and they raise TOGETHER.
+    On the single-process path (``ddp is None``) this is a plain local check.
+    """
+    if ddp is None:
+        return bool(torch.isfinite(loss))
+    flag = torch.tensor(
+        [1.0 if torch.isfinite(loss) else 0.0], device=loss.device
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def grad_sync_context(ddp_student, *, is_boundary, ddp_on):
+    """Context manager for the microbatch backward (Task 5).
+
+    Returns ``ddp_student.no_sync()`` on a NON-boundary grad-accum microbatch so
+    the gradient all-reduce fires only on the boundary microbatch (one
+    all-reduce per grad-accum window). On the boundary, or on the single-process
+    path (``ddp_on`` False), returns a nullcontext.
+    """
+    if ddp_on and not is_boundary:
+        return ddp_student.no_sync()
+    return contextlib.nullcontext()
 
 
 def _worker_entry(rank, world_size, backend, master_port, result_q, payload, worker_fn):
@@ -128,4 +184,7 @@ __all__ = [
     "_destroy_pg",
     "_free_port",
     "spawn_ddp_workers",
+    "wrap_ddp",
+    "all_ranks_finite",
+    "grad_sync_context",
 ]
