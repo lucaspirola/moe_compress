@@ -97,6 +97,7 @@ from ..utils.calibration import (
 )
 from ..utils.model_io import (
     iter_moe_layers,
+    load_compressed_model,
     save_compressed_checkpoint,
 )
 from ..utils.runtime_monitor import snapshot_telemetry as _rt_snap, update as _rt_update
@@ -123,6 +124,7 @@ from .ddp_runtime import (
     broadcast_flag,
     broadcast_module_state,
     grad_sync_context,
+    spawn_ddp_workers,
     wrap_ddp,
 )
 
@@ -1282,15 +1284,70 @@ def validate_ddp_teacher_strategy(config: dict, ddp) -> None:
 
 def _spawn_ddp_workers(student, tokenizer, config, artifacts_dir, *,
                        no_resume, stage_key, ddp):
-    """Spawn ``ddp.world_size`` in-process rank workers (full impl in Task 8).
+    """Spawn ``ddp.world_size`` in-process rank workers (Task 8).
 
-    Placeholder until Task 8 wires the live-student materialization + worker
-    entrypoint. Kept as a real module-level symbol so the Task-1 dispatch fork
-    is testable (tests monkeypatch this).
+    Validates the teacher strategy, then serializes the LIVE compressed student
+    (post-merge at 2.5 / post-EoRA at 5) to a temp dir via
+    ``save_compressed_checkpoint`` — the SAME serializer the final export uses,
+    so factored/merged structure round-trips. Each worker reconstructs it via
+    ``load_compressed_model`` from that dir (H1: NOT
+    ``config["model"]["name_or_path"]`` — the original uncompressed checkpoint).
+    rank-0's ``out_dir`` Path is returned via the result queue; the temp dir is
+    cleaned up after the join.
     """
-    raise NotImplementedError(
-        "Router-KD DDP spawn is wired in Task 8 (student materialization + "
-        "worker entrypoint)."
+    validate_ddp_teacher_strategy(config, ddp)
+    artifacts_dir = Path(artifacts_dir)
+    src_dir = artifacts_dir / "_ddp_student_src"
+    save_compressed_checkpoint(
+        unwrap_student(student), tokenizer, src_dir,
+        pipeline_stage=f"{stage_key}_ddp_src",
+    )
+    payload = dict(
+        config=config,
+        artifacts_dir=str(artifacts_dir),
+        student_src=str(src_dir),
+        no_resume=no_resume,
+        stage_key=stage_key,
+        ddp_world_size=ddp.world_size,
+        backend=ddp.backend,
+    )
+    try:
+        return spawn_ddp_workers(
+            ddp.world_size, backend=ddp.backend,
+            payload=payload, worker_fn=_run_ddp_worker,
+        )
+    finally:
+        import shutil
+        shutil.rmtree(src_dir, ignore_errors=True)  # rank-0/parent cleanup
+
+
+def _run_ddp_worker(*, rank, world_size, config, artifacts_dir, student_src,
+                    no_resume, stage_key, ddp_world_size, backend):
+    """In-child rank worker (Task 8).
+
+    Reconstructs the COMPRESSED student from the parent-written temp dir
+    (rebuilds FactoredExperts at stored ranks, resizes routers) — NOT
+    ``load_model`` on the original repo — then runs the extracted single-process
+    loop threaded with this rank's ``rank`` / ``world_size`` / ``DdpConfig``.
+    Only rank-0's returned Path is consumed by the parent.
+    """
+    device = (
+        torch.device(f"cuda:{rank}") if backend == "nccl"
+        else torch.device("cpu")
+    )
+    # load_compressed_model returns a 3-tuple (model, tokenizer, meta) — unpack
+    # all 3 (L-new; mirror the Stage-3 precedent). NOT load_model(original).
+    student, tokenizer, _ = load_compressed_model(
+        student_src,
+        device_map=({"": f"cuda:{rank}"} if backend == "nccl" else "cpu"),
+        torch_dtype=config["model"]["torch_dtype"],
+        attn_implementation=config["model"]["attn_implementation"],
+    )
+    ddp_cfg = DdpConfig(enabled=True, world_size=world_size, backend=backend)
+    return _run_single_process(
+        student, tokenizer, config, Path(artifacts_dir),
+        device=device, no_resume=no_resume, stage_key=stage_key,
+        rank=rank, world_size=world_size, ddp=ddp_cfg,
     )
 
 
