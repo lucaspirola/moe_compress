@@ -38,22 +38,33 @@ def test_fit_cost_rejects_nonincreasing():
         fit_cost(peak1=50, peak2=50)
 
 def test_size_candidate_basic():
-    # usable = 100 - 10 - 0.1*100 = 80 ; (80-10)/20 = 3.5 -> floor 3
-    cand = size_candidate(total=100, allocated_baseline=10, headroom_frac=0.1,
+    # ABSOLUTE-peak semantics: fixed is the y-intercept (incl. resident model).
+    # usable = 100 - 0.1*100 = 90 ; (90 - fixed=10)/20 = 4.0 -> 4
+    cand = size_candidate(total=100, headroom_frac=0.1,
                           fixed=10, per_sample=20, fixed_batch=1, max_cap=4096)
-    assert cand == 3
+    assert cand == 4
+
+def test_size_candidate_no_double_count_when_model_dominates_vram():
+    # REGRESSION (the shipped bug): when the resident model dominates VRAM, the
+    # absolute y-intercept ``fixed`` ~= the whole baseline (~0.46*total here). The
+    # OLD formula subtracted that baseline a SECOND time -> negative -> floor=1, so
+    # auto-batch never engaged on any real model. With the fix, per_sample is tiny
+    # relative to the model so a large batch fits: usable=140-14=126; (126-65)/1=61.
+    cand = size_candidate(total=140, headroom_frac=0.1,
+                          fixed=65, per_sample=1, fixed_batch=1, max_cap=256)
+    assert cand == 61
 
 def test_size_candidate_clamps_to_floor_and_cap():
     # tiny usable -> never below fixed_batch
-    assert size_candidate(total=20, allocated_baseline=18, headroom_frac=0.1,
+    assert size_candidate(total=20, headroom_frac=0.1,
                           fixed=5, per_sample=5, fixed_batch=8, max_cap=4096) == 8
     # huge usable -> capped
-    assert size_candidate(total=10**12, allocated_baseline=0, headroom_frac=0.0,
+    assert size_candidate(total=10**12, headroom_frac=0.0,
                           fixed=0, per_sample=1, fixed_batch=1, max_cap=64) == 64
 
 def test_size_candidate_rejects_floor_above_cap():
     with pytest.raises(ValueError):
-        size_candidate(total=100, allocated_baseline=0, headroom_frac=0.0,
+        size_candidate(total=100, headroom_frac=0.0,
                        fixed=0, per_sample=1, fixed_batch=8192, max_cap=4096)
 
 
@@ -79,12 +90,22 @@ import torch
 from moe_compress.utils.auto_batch import size_batch, resolve_batch, FidelityClass, AutoBatchConfig
 
 def test_size_batch_predicts_from_cost_probe():
-    mem = FakeMem(total=1000, allocated=100)            # usable=1000-100-0.1*1000=800
-    peaks = {1: 200, 2: 300}                            # per=100, fixed=100 -> (800-100)/100=7
+    mem = FakeMem(total=1000, allocated=100)            # usable=1000-0.1*1000=900
+    peaks = {1: 200, 2: 300}                            # per=100, fixed=100 -> (900-100)/100=8
     calls = []
     def cost_probe_fn(mb): calls.append(mb); return peaks[mb]
     bs = size_batch(cost_probe_fn, fixed_batch=1, headroom_frac=0.1, max_cap=4096, mem=mem)
-    assert bs == 7 and calls == [1, 2]                  # ONLY the two cost probes
+    assert bs == 8 and calls == [1, 2]                  # ONLY the two cost probes
+
+def test_size_batch_no_double_count_when_model_dominates():
+    # REGRESSION: model resident = 650 (65% of VRAM); probe peaks are ABSOLUTE so
+    # they include it -> fixed=2*660-670=650. The OLD code subtracted allocated=650
+    # a second time -> (900-650-650)/10 < 0 -> floor 1 (auto-batch dead). Fixed:
+    # usable=1000-100=900; (900-650)/10=25.
+    mem = FakeMem(total=1000, allocated=650)
+    peaks = {1: 660, 2: 670}
+    bs = size_batch(lambda mb: peaks[mb], fixed_batch=1, headroom_frac=0.1, max_cap=256, mem=mem)
+    assert bs == 25
 
 def test_size_batch_bad_probe_degrades_to_floor_no_raise():
     # non-increasing peaks (e.g. probe_samples<2 / noise) -> fit_cost would raise -> must return floor
@@ -104,9 +125,9 @@ def test_size_batch_cost_probe_oom_degrades_to_floor():
 def test_resolve_batch_class_gate():
     cp = lambda mb: {1:200,2:300}[mb]
     cfg_on = AutoBatchConfig(enabled=True)
-    # eligible + on -> sized
+    # eligible + on -> sized (usable=1000-100=900; (900-100)/100=8)
     assert resolve_batch(cp, fixed_batch=1, fidelity_class=FidelityClass.BATCH_INVARIANT,
-                         cfg=cfg_on, mem=FakeMem(1000,100)) == 7
+                         cfg=cfg_on, mem=FakeMem(1000,100)) == 8
     # disabled -> fixed, no probe
     seen = []
     cp2 = lambda mb: seen.append(mb) or 200

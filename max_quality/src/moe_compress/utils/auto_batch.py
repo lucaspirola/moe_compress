@@ -84,10 +84,25 @@ def fit_cost(*, peak1: int, peak2: int) -> tuple[float, float]:
     return max(fixed, 0.0), per_sample
 
 
-def size_candidate(*, total: int, allocated_baseline: int, headroom_frac: float,
+def size_candidate(*, total: int, headroom_frac: float,
                    fixed: float, per_sample: float, fixed_batch: int,
                    max_cap: int) -> int:
-    """Largest batch whose predicted peak fits usable VRAM, clamped to [floor, cap].
+    """Largest batch whose predicted ABSOLUTE peak fits VRAM, clamped to [floor, cap].
+
+    The two-point probe peaks are ABSOLUTE ``max_memory_allocated`` bytes, so
+    ``fixed`` (= 2*peak1 - peak2, the cost line's y-intercept) already includes
+    EVERY byte resident at probe time — the model weights, the framework, and any
+    co-resident accumulator. The predicted absolute peak at batch ``b`` is
+    ``fixed + b*per_sample``; we size the largest ``b`` that satisfies
+    ``fixed + b*per_sample <= total*(1 - headroom_frac)``.
+
+    Do NOT subtract a separate ``allocated_baseline`` here: that byte count (the
+    resident model) is ALREADY inside ``fixed``. Subtracting it again
+    double-counts the model and, whenever the model dominates VRAM
+    (``fixed ≈ baseline ≈ total``, i.e. every real large model), drives the result
+    negative → clamps to ``fixed_batch`` → auto-batch silently never engages. That
+    was the shipped bug; the CPU probes (allocated()==0) masked it. ``headroom`` +
+    ``run_with_oom_backoff`` cover memory that grows AFTER the probe (Gram fill).
 
     Precondition: fixed_batch <= max_cap. The floor wins over the cap (we never
     return below the caller's proven-safe fixed batch), so a misconfigured
@@ -96,7 +111,7 @@ def size_candidate(*, total: int, allocated_baseline: int, headroom_frac: float,
     if fixed_batch > max_cap:
         raise ValueError(f"fixed_batch={fixed_batch} exceeds max_cap={max_cap}")
     headroom = headroom_frac * float(total)
-    usable = float(total) - float(allocated_baseline) - headroom
+    usable = float(total) - headroom
     raw = math.floor((usable - fixed) / per_sample) if per_sample > 0 else fixed_batch
     return int(max(fixed_batch, min(raw, max_cap)))
 
@@ -137,7 +152,8 @@ def size_batch(cost_probe_fn, fixed_batch: int, *, headroom_frac: float,
     import torch
     if mem is None:
         mem = CudaMemProbe()
-    baseline = mem.allocated()
+    baseline = mem.allocated()  # for logging only — NOT used in sizing (it is
+    # already inside ``fixed``; subtracting it would double-count, see size_candidate)
     try:
         mem.reset_peak(); peak1 = cost_probe_fn(1)
         mem.reset_peak(); peak2 = cost_probe_fn(2)
@@ -150,11 +166,12 @@ def size_batch(cost_probe_fn, fixed_batch: int, *, headroom_frac: float,
     except ValueError as exc:
         log.warning("auto_batch: cost probe unusable (%s); using floor %d", exc, fixed_batch)
         return int(fixed_batch)
-    candidate = size_candidate(total=mem.total(), allocated_baseline=baseline,
+    candidate = size_candidate(total=mem.total(),
                                headroom_frac=headroom_frac, fixed=fixed, per_sample=per,
                                fixed_batch=fixed_batch, max_cap=max_cap)
-    log.info("auto_batch: predicted batch=%d (floor=%d fixed=%.3g per=%.3g)",
-             candidate, fixed_batch, fixed, per)
+    log.info("auto_batch: predicted batch=%d (floor=%d total=%.3g baseline=%.3g "
+             "fixed=%.3g per=%.3g)",
+             candidate, fixed_batch, float(mem.total()), float(baseline), fixed, per)
     return int(candidate)
 
 
