@@ -117,7 +117,14 @@ from .plugins.rkd_paper_recipe import RkdPaperRecipePlugin
 
 from .ddp_config import DdpConfig
 from ._unwrap import unwrap_student
-from .ddp_runtime import all_ranks_finite, grad_sync_context, wrap_ddp
+from .ddp_runtime import (
+    all_ranks_finite,
+    all_reduce_mean,
+    broadcast_flag,
+    broadcast_module_state,
+    grad_sync_context,
+    wrap_ddp,
+)
 
 log = logging.getLogger(__name__)
 
@@ -744,11 +751,18 @@ def _run_single_process(
     # kill-switch (STAGE5_ASYNC_CKPT=0) is set or there is no partial_dir, in
     # which case _save_stage5_checkpoint falls back to a fully-synchronous
     # write. best.pt (early_stop.py) stays synchronous regardless.
+    # Rank-0-only async checkpoint writer (Task 6): only rank-0 writes
+    # step_*.pt, so ranks 1+ need no writer thread.
     _ckpt_writer = (
         _Stage5CheckpointWriter()
-        if (partial_dir is not None and _async_ckpt_enabled())
+        if (rank == 0 and partial_dir is not None and _async_ckpt_enabled())
         else None
     )
+    # Carries the BROADCAST early-stop decision out of the inner batch loop so
+    # the outer epoch break is DDP-synchronized (ranks 1+ never set the
+    # run_ctx flag — the tracker is rank-0-only, M2 — so the epoch break must
+    # use this lockstep flag, not run_ctx.get, to avoid a rank desync).
+    _stopped_early = False
     for epoch in range(s5["epochs"]):
         if epoch < resume_epoch:
             continue
@@ -1008,51 +1022,82 @@ def _run_single_process(
                     window_loss_acc.clear()
                     window_raw_kl_acc.clear()
 
-                    # Publish the per-window training-loop signals the
-                    # best-tracker / early-stop hooks read. step / epoch /
-                    # raw_kl_val are re-published every log window, so
-                    # overwrite=True (a no-op-safe unconditional write).
-                    run_ctx.set("step", step, overwrite=True)
-                    run_ctx.set("epoch", epoch, overwrite=True)
-                    run_ctx.set("raw_kl_val", raw_kl_val, overwrite=True)
+                    # DDP (Task 6): all-reduce-MEAN the window loss + raw_kl so
+                    # rank-0's tracker sees the single-GPU full-batch window mean
+                    # (equal per-rank token counts → mean-of-means == global
+                    # mean). No-op on the single-process path.
+                    if ddp is not None:
+                        import torch as _torch
+                        _dev = device if device is not None else _torch.device("cpu")
+                        loss_val = float(all_reduce_mean(
+                            _torch.tensor(loss_val, device=_dev)).item())
+                        raw_kl_val = float(all_reduce_mean(
+                            _torch.tensor(raw_kl_val, device=_dev)).item())
 
-                    # update_best_tracker: EMA update + best.pt save + patience
-                    # counter. check_early_stop: the early-stop DECISION (sets
-                    # early_stop_should_stop). Both rebind state on run_ctx
-                    # with overwrite=True - dispatched against the ROOT ctx so
-                    # the EMA carry survives across windows.
-                    walk_phases(
-                        ("update_best_tracker", "check_early_stop"),
-                        plugins, run_ctx,
-                    )
-                    ema = float(run_ctx.get("raw_kl_ema"))
-                    best_raw_kl_ema = float(run_ctx.get("best_raw_kl_ema"))
-                    best_step = int(run_ctx.get("best_step"))
-                    no_improve_windows = int(run_ctx.get("no_improve_windows"))
-                    _early_stopped = bool(run_ctx.get("early_stop_should_stop"))
+                    # M2: the best-tracker / early-stop DECISION runs RANK-0 ONLY
+                    # (all_reduce_mean is not guaranteed bit-identical across
+                    # ranks → up to 1 ULP drift → running the EMA/patience
+                    # arithmetic independently on every rank could desync the
+                    # stop decision). Ranks 1+ skip the entire tracker + log +
+                    # trackio block and receive the stop flag via broadcast.
+                    if rank == 0:
+                        # Publish the per-window training-loop signals the
+                        # best-tracker / early-stop hooks read. step / epoch /
+                        # raw_kl_val are re-published every log window, so
+                        # overwrite=True (a no-op-safe unconditional write).
+                        run_ctx.set("step", step, overwrite=True)
+                        run_ctx.set("epoch", epoch, overwrite=True)
+                        run_ctx.set("raw_kl_val", raw_kl_val, overwrite=True)
 
-                    current_lr = scheduler.get_last_lr()[0]
+                        # update_best_tracker: EMA update + best.pt save +
+                        # patience counter. check_early_stop: the early-stop
+                        # DECISION (sets early_stop_should_stop). Both rebind
+                        # state on run_ctx with overwrite=True - dispatched
+                        # against the ROOT ctx so the EMA carry survives across
+                        # windows.
+                        walk_phases(
+                            ("update_best_tracker", "check_early_stop"),
+                            plugins, run_ctx,
+                        )
+                        ema = float(run_ctx.get("raw_kl_ema"))
+                        best_raw_kl_ema = float(run_ctx.get("best_raw_kl_ema"))
+                        best_step = int(run_ctx.get("best_step"))
+                        no_improve_windows = int(run_ctx.get("no_improve_windows"))
+                        _early_stopped = bool(run_ctx.get("early_stop_should_stop"))
 
-                    log.info(
-                        "  epoch=%d step=%d window_loss=%.6f raw_kl=%.6f "
-                        "ema=%.6f best_ema=%.6f@%d lr=%.3e T=%.3f grad_norm=%.4f | %s",
-                        epoch, step, loss_val, raw_kl_val, ema, best_raw_kl_ema,
-                        best_step, current_lr, T, grad_norm, _rt_snap(),
-                    )
-                    payload = {
-                        "stage5/epoch": epoch,
-                        "stage5/step": step,
-                        "stage5/loss": loss_val,
-                        "stage5/raw_kl": raw_kl_val,
-                        "stage5/raw_kl_ema": ema,
-                        "stage5/best_raw_kl_ema": best_raw_kl_ema,
-                        "stage5/best_step": best_step,
-                        "stage5/lr": current_lr,
-                        "stage5/temperature": T,
-                        "stage5/grad_norm": grad_norm,
-                        "stage5/no_improve_windows": no_improve_windows,
-                    }
-                    _trackio_log(payload)
+                        current_lr = scheduler.get_last_lr()[0]
+
+                        log.info(
+                            "  epoch=%d step=%d window_loss=%.6f raw_kl=%.6f "
+                            "ema=%.6f best_ema=%.6f@%d lr=%.3e T=%.3f grad_norm=%.4f | %s",
+                            epoch, step, loss_val, raw_kl_val, ema, best_raw_kl_ema,
+                            best_step, current_lr, T, grad_norm, _rt_snap(),
+                        )
+                        payload = {
+                            "stage5/epoch": epoch,
+                            "stage5/step": step,
+                            "stage5/loss": loss_val,
+                            "stage5/raw_kl": raw_kl_val,
+                            "stage5/raw_kl_ema": ema,
+                            "stage5/best_raw_kl_ema": best_raw_kl_ema,
+                            "stage5/best_step": best_step,
+                            "stage5/lr": current_lr,
+                            "stage5/temperature": T,
+                            "stage5/grad_norm": grad_norm,
+                            "stage5/no_improve_windows": no_improve_windows,
+                        }
+                        _trackio_log(payload)
+                    else:
+                        # Ranks 1+ do not run the tracker; the stop flag is
+                        # broadcast from rank-0 below.
+                        _early_stopped = False
+
+                    # M2: broadcast rank-0's stop DECISION so ALL ranks break
+                    # together (the only broadcast needed for the decision).
+                    # All ranks reach this on the SAME log-window iterations
+                    # (step advances in lockstep). No-op on single-process.
+                    if ddp is not None:
+                        _early_stopped = broadcast_flag(_early_stopped, src=0)
                 else:
                     # Outside a log window the early-stop flag is not refreshed
                     # - keep the prior decision (False on the first windows).
@@ -1086,7 +1131,13 @@ def _run_single_process(
                 # into the writer, AFTER os.replace, so it never races a
                 # not-yet-written checkpoint. When _ckpt_writer is None
                 # (kill-switch) the save is fully synchronous, prune included.
-                if partial_dir is not None and ckpt_every > 0 and step % ckpt_every == 0:
+                # Rank-0-only I/O (Task 6): only rank-0 writes step_*.pt
+                # (N ranks racing the same files = torn writes / N× I/O). The
+                # best-tracker state slots (prev_ema / no_improve_windows /
+                # es_ref_ema) are published only on rank-0 (the tracker is
+                # rank-0-only, M2), so this block is unreachable on ranks 1+.
+                if (rank == 0 and partial_dir is not None and ckpt_every > 0
+                        and step % ckpt_every == 0):
                     _save_stage5_checkpoint(
                         partial_dir, step, epoch, i, student, optim,
                         grad_accum=grad_accum,
@@ -1107,8 +1158,11 @@ def _run_single_process(
                 # stopping point rather than re-running to the schedule end.
                 # No-op when _early_stop_patience == 0 (_early_stopped stays
                 # False) - byte-identical to pre-2026-05-17 `main`.
+                # _early_stopped is the BROADCAST decision (Task 6), so it is
+                # identical on every rank — all ranks break together (no DDP
+                # hang). Only rank-0 writes the final early-stop checkpoint.
                 if _early_stopped:
-                    if partial_dir is not None:
+                    if rank == 0 and partial_dir is not None:
                         # Drain any in-flight async step_*.pt write first so the
                         # final early-stop checkpoint is written AFTER it (no
                         # overlap / prune race), then write the early-stop
@@ -1127,16 +1181,15 @@ def _run_single_process(
                             es_ref_ema=float(run_ctx.get("es_ref_ema")),
                             writer=None,
                         )
+                    _stopped_early = True
                     break
         # Trailing-batch accounting is computed once before the epoch loop
         # (see the run-start log.warning above); no per-epoch repeat here.
         optim.zero_grad()
-        # Early-stop also breaks the outer epoch loop. No-op when
-        # _early_stop_patience == 0 (early_stop_should_stop stays False).
-        if (
-            run_ctx.has("early_stop_should_stop")
-            and bool(run_ctx.get("early_stop_should_stop"))
-        ):
+        # Early-stop also breaks the outer epoch loop. _stopped_early is the
+        # BROADCAST decision (identical on every rank under DDP) so the epoch
+        # break is unanimous. No-op when _early_stop_patience == 0.
+        if _stopped_early:
             break
 
     # ---- async checkpoint writer drain (Tier-1 Lever C) ------------------
@@ -1159,15 +1212,27 @@ def _run_single_process(
     # EarlyStopPlugin.reload_best_checkpoint swaps the trainable (router)
     # params for the best.pt snapshot before export (when save_best was active
     # and a best.pt exists).
-    walk_phases(("reload_best_checkpoint",), plugins, run_ctx)
+    #
+    # Task 6: best.pt was written by rank-0's tracker, so RANK-0 reloads it +
+    # swaps params; then broadcast_module_state propagates rank-0's params to
+    # every replica so all ranks export identical weights. (rank-0-load +
+    # broadcast avoids a read race vs all-ranks-load.) No-op on single-process.
+    if rank == 0:
+        walk_phases(("reload_best_checkpoint",), plugins, run_ctx)
+    if ddp is not None:
+        broadcast_module_state(unwrap_student(student), src=0)
 
     out_dir = artifacts_dir / f"{stage_key}_final"
-    save_compressed_checkpoint(
-        # Unwrap torch.compile wrapper before save so iter_moe_layers inside
-        # save_compressed_checkpoint can find the text tower via attribute lookup.
-        unwrap_student(student), tokenizer, out_dir,
-        pipeline_stage=f"{stage_key}_final",
-    )
+    # Rank-0-only final export (Task 6): N ranks writing the same dir = torn
+    # writes. All ranks return the SAME out_dir Path (the parent consumes
+    # rank-0's via the result queue).
+    if rank == 0:
+        save_compressed_checkpoint(
+            # Unwrap torch.compile + DDP wrappers before save so iter_moe_layers
+            # inside save_compressed_checkpoint can find the text tower.
+            unwrap_student(student), tokenizer, out_dir,
+            pipeline_stage=f"{stage_key}_final",
+        )
     log.info("Stage %s complete -> %s", stage_key, out_dir)
     return out_dir
 

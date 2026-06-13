@@ -100,6 +100,45 @@ def grad_sync_context(ddp_student, *, is_boundary, ddp_on):
     return contextlib.nullcontext()
 
 
+def all_reduce_mean(scalar_tensor):
+    """Average a scalar tensor across all ranks (Task 6).
+
+    ``dist.all_reduce(SUM); t /= world_size`` — applied to the window loss /
+    raw-KL so rank-0's tracker sees the single-GPU full-batch window mean.
+    Returns the tensor (mutated in place + returned for convenience).
+    """
+    t = scalar_tensor.clone()
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    t /= dist.get_world_size()
+    return t
+
+
+def broadcast_flag(flag: bool, *, src: int = 0) -> bool:
+    """Broadcast a boolean decision from ``src`` to all ranks (Task 6).
+
+    Used for the early-stop stop flag: rank-0 makes the DECISION (from the
+    all-reduced window loss) and broadcasts it so ALL ranks break together
+    (one rank breaking while others wait on the next all-reduce = classic
+    DDP hang).
+    """
+    t = torch.tensor([1 if flag else 0], dtype=torch.int64)
+    dist.broadcast(t, src=src)
+    return bool(t.item())
+
+
+def broadcast_module_state(module, *, src: int = 0) -> None:
+    """Broadcast every param + buffer of ``module`` from ``src`` in place.
+
+    After rank-0 reloads ``best.pt`` and swaps its trainable params, this makes
+    every replica's params match rank-0's before export. Operates on the
+    UNWRAPPED module's tensors (caller passes the unwrapped module).
+    """
+    for p in module.parameters():
+        dist.broadcast(p.data, src=src)
+    for b in module.buffers():
+        dist.broadcast(b.data, src=src)
+
+
 def _worker_entry(rank, world_size, backend, master_port, result_q, payload, worker_fn):
     try:
         _init_pg(rank, world_size, backend=backend, master_port=master_port)
@@ -187,4 +226,7 @@ __all__ = [
     "wrap_ddp",
     "all_ranks_finite",
     "grad_sync_context",
+    "all_reduce_mean",
+    "broadcast_flag",
+    "broadcast_module_state",
 ]
