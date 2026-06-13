@@ -77,3 +77,59 @@ def test_merge_ppl_zero_tokens_is_inf():
 def test_merge_ppl_overflow_is_inf():
     # nll_sum/tok_count huge → exp overflows → inf (guarded, not raised).
     assert _merge_ppl([(1e9, 1)]) == float("inf")
+
+
+# ---------------------------------------------------------------------------
+# M1 — PPL non-finite/error skip-guard parity (wikitext_ppl.py:280-291).
+#
+# Production refuses to report a sub-corpus PPL: if ANY batch was skipped
+# (None / non-finite loss / runtime error), the whole-corpus PPL is forced to
+# inf to FAIL the gate rather than silently shrink its domain. The DP path now
+# carries a per-replica `skipped` count in the 3-tuple partial, and `_merge_ppl`
+# enforces the same corpus-level guard: sum(skipped) > 0 -> inf.
+# ---------------------------------------------------------------------------
+
+
+def test_merge_ppl_any_skip_is_inf_even_with_finite_nll():
+    # Core M1 regression: a partial carrying skipped>0 forces inf even though
+    # tok_count>0 and nll is finite — matching wikitext_ppl.py:302-313.
+    p0 = (12.3, 100, 0)   # clean replica
+    p1 = (4.5, 40, 2)     # this replica skipped 2 batches
+    assert _merge_ppl([p0, p1]) == float("inf")
+
+
+def test_merge_ppl_skip_guard_precedes_tok_and_overflow_guards():
+    # skipped>0 wins even when tok_count would also be 0 (i.e. the skip guard is
+    # checked BEFORE the tok==0 and exp() guards — order matters for provenance).
+    assert _merge_ppl([(0.0, 0, 1)]) == float("inf")
+
+
+def test_merge_ppl_all_zero_skipped_behaves_as_before():
+    # With skipped==0 everywhere the 3-tuple path reduces to the pre-M1 result.
+    chunks = torch.randint(0, 50, (10, 8), generator=torch.Generator().manual_seed(7),
+                           dtype=torch.long)
+    n0, t0 = _deterministic_partial(chunks[:4])
+    n1, t1 = _deterministic_partial(chunks[4:])
+    expected = math.exp((n0 + n1) / (t0 + t1))
+    merged = _merge_ppl([(n0, t0, 0), (n1, t1, 0)])
+    assert math.isclose(merged, expected, rel_tol=0.0, abs_tol=0.0)
+    # tok==0 -> inf still holds with explicit zero-skip tuples
+    assert _merge_ppl([(0.0, 0, 0), (0.0, 0, 0)]) == float("inf")
+    # OverflowError -> inf still holds with explicit zero-skip tuple
+    assert _merge_ppl([(1e9, 1, 0)]) == float("inf")
+
+
+def test_merge_ppl_accepts_legacy_2tuple_partials():
+    # Backward compat: a 2-tuple partial means skipped defaults to 0, so the
+    # pre-M1 callers/tests keep working unchanged.
+    chunks = torch.randint(0, 50, (8, 8), generator=torch.Generator().manual_seed(3),
+                           dtype=torch.long)
+    n, t = _deterministic_partial(chunks)
+    expected = math.exp(n / t)
+    assert math.isclose(_merge_ppl([(n, t)]), expected, rel_tol=0.0, abs_tol=0.0)
+    # mixed 2-tuple + 3-tuple (legacy + new) merges fine when no skips
+    n0, t0 = _deterministic_partial(chunks[:4])
+    n1, t1 = _deterministic_partial(chunks[4:])
+    expected2 = math.exp((n0 + n1) / (t0 + t1))
+    assert math.isclose(_merge_ppl([(n0, t0), (n1, t1, 0)]), expected2,
+                        rel_tol=0.0, abs_tol=0.0)

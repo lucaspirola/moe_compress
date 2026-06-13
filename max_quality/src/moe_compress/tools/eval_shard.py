@@ -261,28 +261,47 @@ def _merge_completions(shard_results):
 
 
 def _merge_ppl(partials):
-    """Merge per-shard ``(nll_sum, tok_count)`` partials into the global PPL.
+    """Merge per-shard ``(nll_sum, tok_count, skipped)`` partials into the global PPL.
 
     Sums the disjoint partials and returns ``exp(sum_nll / sum_tok)``. Exact
     because the per-row forward is BATCH_INVARIANT and the ``mean_loss *
     (numel - n_rows)`` rescale recovers the true NLL sum (wikitext_ppl.py:260).
-    Carries the SAME guards as wikitext_ppl.py:273-295: ``tok_count == 0 -> inf``
-    (PPL undefined) and ``OverflowError -> inf``.
+
+    Carries the SAME guards as wikitext_ppl.py:280-317, IN THE SAME ORDER:
+
+      1. ``sum(skipped) > 0 -> inf`` (M1, wikitext_ppl.py:295-313): a replica
+         that skipped any batch (None / non-finite loss / runtime error) makes
+         the merged PPL a sub-corpus metric. Spec §9 mandates PPL over the FULL
+         retained-chunk corpus, so ANY skip forces inf to FAIL the gate rather
+         than silently report a partial-corpus PPL. Checked FIRST so it wins
+         even when ``sum_tok`` also happens to be 0.
+      2. ``sum_tok == 0 -> inf`` (PPL undefined; wikitext_ppl.py:295-301).
+      3. ``OverflowError -> inf`` (wikitext_ppl.py:314-317).
+
+    Backward-compatible: a 2-tuple partial ``(nll, tok)`` means ``skipped=0``
+    (tolerant unpack), so pre-M1 callers/tests keep working unchanged.
     """
     import math
 
     sum_nll = 0.0
     sum_tok = 0
-    for nll, tok in partials:
+    sum_skipped = 0
+    for p in partials:
+        nll, tok, *rest = p
+        skipped = rest[0] if rest else 0
         sum_nll += float(nll)
         sum_tok += int(tok)
+        sum_skipped += int(skipped)
+    if sum_skipped > 0:
+        # Sub-corpus PPL refused (wikitext_ppl.py:302-313) — checked BEFORE the
+        # tok==0 and exp() guards so a skip always forces inf.
+        return float("inf")
     if sum_tok == 0:
         return float("inf")
     try:
         return math.exp(sum_nll / sum_tok)
     except OverflowError:
         return float("inf")
-
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +461,11 @@ def _stub_ppl_partial(key, chunk_rows):
     """Deterministic (nll_sum, tok_count) over the given rows, using the SAME
     mean_loss * (numel - n_rows) rescale the production code uses. The per-row
     contribution is independent of the forward batch, so the merge of disjoint
-    shards equals the single pass exactly (BATCH_INVARIANT property)."""
+    shards equals the single pass exactly (BATCH_INVARIANT property).
+
+    NEVER skips a batch: every row is deterministic and finite, so the worker's
+    skip count is implicitly 0 for the stub path (no None / non-finite / raising
+    forward can occur)."""
     if key != _STUB_PPL_MOD7:
         raise ValueError(f"_stub_ppl_partial: unknown stub key {key!r}")
     numel = int(chunk_rows.numel())
@@ -457,6 +480,60 @@ def _stub_ppl_partial(key, chunk_rows):
 def _torch_float64():
     import torch as _t
     return _t.float64
+
+
+def _ppl_forward_all(model, shard, device, bs, iter_batches):
+    """Forward every batch of ``shard`` and accumulate ``(nll_sum, tok_count,
+    skipped)`` with PRODUCTION skip-semantics (wikitext_ppl.py:264-288).
+
+    Per batch, mirroring the single-GPU loop EXACTLY:
+      * ``out.loss is None`` -> skip (count it), continue.
+      * ``not math.isfinite(loss_val)`` -> skip (count it), continue.
+      * a runtime error in the forward -> skip (count it), continue.
+
+    A skipped batch contributes NOTHING to ``nll_sum`` / ``tok_count`` (so a
+    None / nan / inf loss can never poison the sum, and a raising batch can
+    never crash the replica). ``_merge_ppl`` then forces the WHOLE-corpus PPL
+    to inf when ``sum(skipped) > 0`` (wikitext_ppl.py:302-313).
+
+    The ENTIRE per-batch block — ``model(...)``, the None-check, ``.item()``,
+    the isfinite check, AND the nll accumulation — sits inside ONE ``try`` to
+    match production's single-try scope (wikitext_ppl.py:265-288). This matters
+    because ``out.loss.item()`` forces a CUDA sync that can surface a DEFERRED
+    device-side assert as a raise; production skip-counts that, so we must too
+    (a narrower try would let it escape and crash the replica).
+
+    CRUCIAL: ``torch.cuda.OutOfMemoryError`` is RE-RAISED, never swallowed —
+    the enclosing ``run_with_oom_backoff`` (auto_batch.py:188) catches OOM to
+    halve the batch and rerun. The OOM clause MUST precede the generic
+    ``Exception`` clause so OOM propagates instead of being skip-counted.
+
+    Returns ``(nll_sum, tok_count, skipped)``.
+    """
+    import math
+    import torch as _torch
+
+    nsum, tcount, skipped = 0.0, 0, 0
+    with _torch.no_grad():
+        for batch in iter_batches(shard, batch_size=bs):
+            batch = batch.to(device)
+            try:
+                out = model(input_ids=batch, labels=batch)
+                if out.loss is None:
+                    skipped += 1
+                    continue
+                loss_val = float(out.loss.item())
+                if not math.isfinite(loss_val):
+                    skipped += 1
+                    continue
+                nsum += loss_val * (batch.numel() - batch.shape[0])
+                tcount += batch.numel() - batch.shape[0]
+            except _torch.cuda.OutOfMemoryError:
+                raise
+            except Exception:  # noqa: BLE001 — skip the batch, mirror wikitext_ppl.py:285
+                skipped += 1
+                continue
+    return nsum, tcount, skipped
 
 
 def _ppl_replica_worker(
@@ -497,8 +574,11 @@ def _ppl_replica_worker(
     shard = chunks[shard_start:shard_end]
 
     if stub_ppl is not None:
+        # Stub path never produces a None/non-finite/raising batch, so skipped=0.
         nll_sum, tok_count = _stub(stub_ppl, shard)
+        skipped = 0
     else:
+        from .eval_shard import _ppl_forward_all as _fwd_all
         from ..utils.auto_batch import (
             AutoBatchConfig as _ABC, FidelityClass as _FC,
             resolve_batch as _resolve_batch, run_with_oom_backoff as _backoff,
@@ -524,21 +604,15 @@ def _ppl_replica_worker(
 
         eff_bs = _resolve_batch(_cost_probe, int(ppl_bs), _FC.BATCH_INVARIANT, _abc)
 
-        def _forward_all(bs):
-            nsum, tcount = 0.0, 0
-            with _torch.no_grad():
-                for batch in _iter_batches(shard, batch_size=bs):
-                    batch = batch.to(device)
-                    out = model(input_ids=batch, labels=batch)
-                    loss_val = float(out.loss.item())
-                    nsum += loss_val * (batch.numel() - batch.shape[0])
-                    tcount += batch.numel() - batch.shape[0]
-            return nsum, tcount
-
-        nll_sum, tok_count = _backoff(_forward_all, eff_bs, int(ppl_bs))
+        # _ppl_forward_all carries production skip-semantics (None/non-finite/
+        # error -> skip+count) AND re-raises CUDA OOM so the backoff can halve.
+        nll_sum, tok_count, skipped = _backoff(
+            lambda bs: _fwd_all(model, shard, device, bs, _iter_batches),
+            eff_bs, int(ppl_bs),
+        )
 
     with open(out_file, "w", encoding="utf-8") as _f:
-        _json.dump([nll_sum, tok_count], _f)
+        _json.dump([nll_sum, tok_count, skipped], _f)
 
 
 def run_dp_ppl(chunks, *, tmp_dir, replicas, gpus_per_replica, ppl_bs,
@@ -596,8 +670,12 @@ def run_dp_ppl(chunks, *, tmp_dir, replicas, gpus_per_replica, ppl_bs,
     partials = []
     for out_file in out_files:
         with open(out_file, "r", encoding="utf-8") as _f:
-            nll, tok = json.load(_f)
-        partials.append((nll, tok))
+            rec = json.load(_f)
+        # Tolerant unpack: 3-element [nll, tok, skipped] (current worker) or a
+        # 2-element [nll, tok] legacy file (skipped defaults to 0).
+        nll, tok, *rest = rec
+        skipped = rest[0] if rest else 0
+        partials.append((nll, tok, skipped))
     return _merge_ppl(partials)
 
 
@@ -616,6 +694,7 @@ __all__ = [
     "_STUB_GENERATE_PROMPTLEN",
     "_STUB_WIDTH_MODEL",
     "_ppl_replica_worker",
+    "_ppl_forward_all",
     "run_dp_ppl",
     "_STUB_PPL_MOD7",
 ]
