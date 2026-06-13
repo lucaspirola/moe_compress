@@ -116,6 +116,7 @@ from .plugins.early_stop import EarlyStopPlugin
 from .plugins.rkd_paper_recipe import RkdPaperRecipePlugin
 
 from .ddp_config import DdpConfig
+from ._unwrap import unwrap_student
 
 log = logging.getLogger(__name__)
 
@@ -378,7 +379,7 @@ def _run_single_process(
     # even though we're distilling at vocab level - the student's routers are
     # what we're training). The live-teacher plugin runs the teacher-side
     # topology guard; here only the count is needed for that plugin's read.
-    _ = sum(1 for _ in iter_moe_layers(getattr(student, "_orig_mod", student)))
+    _ = sum(1 for _ in iter_moe_layers(unwrap_student(student)))
 
     # total_optim_steps MUST be computed before build_optimizer - the plugin
     # builds the optimizer + scheduler together and the scheduler needs it.
@@ -478,7 +479,7 @@ def _run_single_process(
             # parameter names saved by _save_stage5_checkpoint (which also uses
             # the unwrapped module) resolve correctly even when `student` is a
             # torch.compile wrapper.
-            _restore_base = getattr(student, "_orig_mod", student)
+            _restore_base = unwrap_student(student)
             for pname, t in payload["router_state"].items():
                 parts = pname.split(".")
                 obj = _restore_base
@@ -497,7 +498,7 @@ def _run_single_process(
             # `_orig_mod.*`-prefixed names that wouldn't match the saved
             # unprefixed set, causing every resume to falsely fail the
             # trainable-scope-changed check.
-            _unwrapped_for_resume = getattr(student, "_orig_mod", student)
+            _unwrapped_for_resume = unwrap_student(student)
             _current_names = {
                 n for n, p in _unwrapped_for_resume.named_parameters() if p.requires_grad
             }
@@ -919,7 +920,7 @@ def _run_single_process(
                 _log_every = config["logging"]["log_every_n_steps"]
                 if (step + 1) % _log_every == 0:
                     # Unwrap compiled wrapper so parameters() reflects the original module's leaf params.
-                    _params_for_norm = getattr(student, "_orig_mod", student)
+                    _params_for_norm = unwrap_student(student)
                     grad_norm = float(
                         torch.nn.utils.clip_grad_norm_(
                             [p for p in _params_for_norm.parameters() if p.requires_grad and p.grad is not None],
@@ -1106,7 +1107,7 @@ def _run_single_process(
     save_compressed_checkpoint(
         # Unwrap torch.compile wrapper before save so iter_moe_layers inside
         # save_compressed_checkpoint can find the text tower via attribute lookup.
-        getattr(student, "_orig_mod", student), tokenizer, out_dir,
+        unwrap_student(student), tokenizer, out_dir,
         pipeline_stage=f"{stage_key}_final",
     )
     log.info("Stage %s complete -> %s", stage_key, out_dir)
@@ -1282,7 +1283,7 @@ def _save_stage5_checkpoint(
     # underlying module's attribute tree (e.g. "_orig_mod.*" prefixes are
     # stripped or mangled). Use the unwrapped module so that the names saved
     # here match the attribute path walked during restore.
-    unwrapped = getattr(student, "_orig_mod", student)
+    unwrapped = unwrap_student(student)
     router_state = {
         name: p.data.cpu().clone()
         for name, p in unwrapped.named_parameters()

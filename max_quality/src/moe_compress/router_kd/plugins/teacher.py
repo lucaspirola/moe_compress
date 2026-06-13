@@ -121,6 +121,7 @@ from typing import Any
 import torch
 
 from ..context import PipelineContext
+from .._unwrap import unwrap_student
 from ...utils.model_io import iter_moe_layers, load_model
 
 log = logging.getLogger(__name__)
@@ -585,7 +586,7 @@ class TeacherLivePlugin:
         use_compile = bool(s5.get("torch_compile", False))
         # Student MoE-layer count — the topology guard's reference.
         student_refs_count = sum(
-            1 for _ in iter_moe_layers(getattr(student, "_orig_mod", student))
+            1 for _ in iter_moe_layers(unwrap_student(student))
         )
 
         teacher_repo_override = s5.get("teacher_model_repo") or None
@@ -672,7 +673,7 @@ class TeacherLivePlugin:
         # producing a wrong KD signal. Passes by definition on the default
         # path. Unwrap a possible torch.compile wrapper to read .config
         # reliably.
-        _student_unwrapped = getattr(student, "_orig_mod", student)
+        _student_unwrapped = unwrap_student(student)
         _teacher_vocab = int(getattr(_t.config, "vocab_size", -1))
         _student_vocab = int(getattr(_student_unwrapped.config, "vocab_size", -1))
         if _teacher_vocab != _student_vocab:
