@@ -28,8 +28,10 @@ is fully-packed (uniform `L`, asserted at `vocab_kd.py:112-117`) and we force eq
 per-rank micro-batches. This is fundamentally different from *raising* `batch_size`
 (forbidden — METRIC_PINNED), because DDP keeps the effective global batch FIXED.
 
-Default (1 GPU, or DDP not requested) MUST be the existing single-process path,
-**byte-identical** — the Router-KD golden stays green. DDP is strictly opt-in.
+Default (1 GPU, or DDP not requested) MUST be the existing single-process path, running
+the **identical instruction stream** (no spawn, no DDP wrap, no new tensor ops) — the
+Router-KD golden's metadata-byte + loss-tolerance gates stay green (an optional weight-byte
+A/B is available, Task 9). DDP is strictly opt-in.
 
 ---
 
@@ -50,16 +52,41 @@ The Router-KD stage internally spawns N rank workers via
 repo: Stage 3 `covariance_collection.py:1213` `run_dp_covariance_collection` uses raw
 `ctx.Process(...).start()/join()` with `CUDA_VISIBLE_DEVICES` pins and a filesystem
 reduce — `:1271-1288`). We mirror that spawn style but layer NCCL collectives on top
-(`init_process_group("nccl")`). Each worker:
+(`init_process_group("nccl")`). The PARENT first materializes the live student to a temp
+dir (see "Per-rank student materialization" below); then each worker:
 1. bootstraps the process group (`init_process_group`, rank, world_size, NCCL),
 2. pins its GPU (`CUDA_VISIBLE_DEVICES` or `torch.cuda.set_device(rank)`),
-3. builds the student replica + freezes scope + builds optimizer + wraps in DDP,
-4. trains its calibration shard (per-rank batches, global step count),
+3. **loads the COMPRESSED student from the temp dir** (NOT the original checkpoint) +
+   freezes scope + builds optimizer + wraps in DDP,
+4. trains the FULL global batch list (every step row-split to its `per_gpu` rows; the
+   step count is the unchanged global count),
 5. rank-0 performs ALL I/O (checkpoint/log/trackio/best.pt/final export),
 6. rank-0's result (the `out_dir` Path) is returned to the parent via a `mp.SimpleQueue`.
 
 We pick in-process spawn (not requiring an external `torchrun`) so `run_pipeline` stays
 a single entrypoint — no operator workflow change, no separate launcher.
+
+### Per-rank student materialization (RESOLVED — was open question, now load-bearing)
+**The live student is NOT the original checkpoint.** Stage 2.5 (`run_pipeline.py:293`)
+and Stage 5 (`run_pipeline.py:328`) pass the LIVE in-memory model — post-merge (merged
+centroids) at 2.5, post-EoRA (factored experts + adapters) at 5. A worker that did
+`load_model(config["model"]["name_or_path"])` would load the ORIGINAL uncompressed
+weights and silently train the WRONG model. So the spawn handoff MUST carry the live
+compressed weights, not a repo name:
+
+- `_spawn_ddp_workers` first writes the live student to
+  `artifacts_dir/_ddp_student_src/` via `save_compressed_checkpoint(unwrap_student(
+  student), tokenizer, src_dir, pipeline_stage=f"{stage_key}_ddp_src")`
+  (`model_io.py:1126`) — the same serializer the final export uses, so factored/merged
+  structure round-trips.
+- each worker reconstructs it with `load_compressed_model(src_dir, device_map={"":
+  f"cuda:{rank}"}, ...)` (`model_io.py:1508`, which reads `compressed_metadata.json`,
+  rebuilds `FactoredExperts` at stored ranks, resizes routers, and streams the tensors).
+- **Equivalence test (Task 8):** assert each rank's reloaded trainable params are
+  `torch.allclose` to the parent's pre-spawn `unwrap_student(student)` params (rtol/atol
+  0 for the bf16 round-trip where exact, else 1e-3). Without this the entire
+  result-preservation gate is meaningless — it would compare two wrong-but-equal runs.
+- the temp dir is rank-0-cleaned after the join (best-effort `shutil.rmtree`).
 
 **Why NOT torchrun:** torchrun re-executes the WHOLE pipeline script N times, which would
 re-run Stages 1-4 N times (or require deep refactor to make every prior stage rank-aware).
@@ -69,7 +96,13 @@ untouched and runs once on the parent.
 ### Default-OFF contract (backward compat)
 A new config knob `stage5_router_kd.ddp` (mapping; default absent → disabled). When
 absent / `enabled: false` / resolved `world_size <= 1`, `orchestrator.run` takes the
-EXISTING single-process code path **unchanged** (no spawn, no DDP wrap, byte-identical).
+EXISTING single-process code path. The guarantee on that path is: **the IDENTICAL
+instruction stream — no spawn, no DDP wrap, no new tensor ops** (the dispatch fork is a
+single `if not ddp.enabled: return _run_single_process(...)` and `ddp=None` short-circuits
+every DDP site). It is NOT separately "proven byte-identical" by a byte gate today; the
+existing golden metadata-byte + loss-tolerance gates (Task 9) stay green, which is the
+operative regression guard. (If a hard byte bar is wanted, Task 9 includes an optional
+`best.pt`/`step_*.pt` byte A/B vs pre-change `main`.)
 DDP engages only when `ddp.enabled: true` AND `world_size >= 2`. This mirrors how
 Stage 3 (`multi_gpu.cov_replicas` default 1) and Stage 4 (`multi_gpu.eora_workers`)
 gate their multi-GPU paths — Router-KD currently reads NO `multi_gpu` key (grep
@@ -131,32 +164,48 @@ truth and no site is missed.
 ## Result-preservation gate (the acceptance test)
 
 A **tolerance test** (NOT byte-identical — DDP all-reduce reorders fp): run the SAME
-tiny Router-KD config (a) single-process and (b) under DDP `world_size=2` on CPU
-(`gloo`), with `global_batch=2`, `per_gpu_batch=1`, and assert the final loss trace and
-the final trainable (router) weights match within `rel_tol=1e-5, abs_tol=1e-7` (the same
-bar the existing golden uses, `test_router_kd_golden_snapshot.py:328-329`). This is the
-single most important test; it proves average-gradient DDP ≡ single-GPU at the same
-effective batch for this loss. See Task 10.
+tiny Router-KD config — **identical `batch_size` AND identical `len(batches)`** — (a)
+single-process and (b) under DDP `world_size=2` on CPU (`gloo`). The ONLY difference is
+that the 2-rank run **row-splits each step's `batch_size`-row batch** (rank 0 takes rows
+`[0:per_gpu]`, rank 1 rows `[per_gpu:2*per_gpu]`, `per_gpu = batch_size // world_size`)
+and all-reduce-averages the gradients. With `batch_size=2`, each rank sees 1 row/step and
+the AVERAGE of the two per-row gradients equals the gradient of the 2-row per-token mean —
+the exact single-GPU step. Assert the final loss trace and the final trainable (router)
+weights match within `rel_tol=1e-5, abs_tol=1e-7` (the bar the existing golden uses,
+`test_router_kd_golden_snapshot.py:328-329`). This is the single most important test; it
+proves average-gradient DDP ≡ single-GPU at the same effective batch AND the same step
+count. See Task 10.
 
 ---
 
 ## Hard requirements (the correctness checklist) — each maps to a task
 
 1. Result-preserving via average-gradient DDP at the SAME effective global batch.
-   `per_gpu_batch = global_batch / n_gpu`; with grad_accum, co-scale so the effective
-   batch is invariant. → Task 4 (shard), Task 5 (DDP wrap + no_sync), Task 10 (gate).
-2. Step-count stays GLOBAL (LR schedule keyed to global step). `total_optim_steps`
-   computed from the GLOBAL `len(batches)` BEFORE per-rank shard. → Task 4.
+   The global batch is split **by ROW within each optimizer step** (`per_gpu_batch =
+   batch_size // n_gpu` rows of the SAME `batches[_batch_idx]`), so EVERY step still
+   sees all `batch_size` sequences and the step count is UNCHANGED. → Task 4 (row-split),
+   Task 5 (DDP wrap + no_sync), Task 10 (gate).
+2. Step-count stays GLOBAL and UNCHANGED. `total_optim_steps` and the number of loop
+   iterations are computed from the GLOBAL `len(batches)` and are IDENTICAL to the
+   single-GPU run — DDP does NOT divide the batch list or the step count by `n_gpu`
+   (that would be the forbidden "raise effective batch / halve steps" transform). → Task 4.
 3. Rank-0-only I/O (checkpoint, logging, trackio, best.pt, final export). → Task 6.
-4. Synchronized early-stop/EMA: all-reduce-MEAN the window loss so every rank decides
-   identically; broadcast the stop flag (else ranks desync/deadlock). best.pt write
-   rank-0 + reload broadcast. → Task 6.
+4. Synchronized early-stop/EMA: run the best-tracker/early-stop DECISION on RANK-0 ONLY
+   (from the all-reduced window loss), then BROADCAST the stop flag (else ranks
+   desync/deadlock). Do NOT assume bit-identical tracker state across ranks. best.pt
+   write rank-0 + reload broadcast. → Task 6.
 5. Teacher VRAM: cache (faithful, 1-epoch) vs 4-bit/FP8 replicated (quality trade,
    multi-epoch). Validated precondition. → Task 7.
 6. In-process spawn process-group bootstrap + teardown. → Task 3.
-7. `.module` unwrap alongside `_orig_mod`. → Task 2.
-8. Backward-compat: default path byte-identical; DDP opt-in. → Task 1, Task 9 (golden
-   guardrail).
+7. `.module` unwrap alongside `_orig_mod`, scoped to TRAINING-STUDENT sites only (NOT
+   the teacher, NOT the pre-wrap `_set_experts_implementation`). → Task 2.
+8. Backward-compat: default path runs the IDENTICAL instruction stream (no new tensor
+   ops, no spawn); golden metadata-byte + loss-tolerance gates stay green; DDP opt-in.
+   → Task 1, Task 9 (guardrail).
+9. NaN/exception on ONE rank must not deadlock the others (all-reduce a finiteness flag).
+   → Task 5/Task 11.
+10. Per-rank resume: each rank independently loads router/optim/scheduler state and
+    moves optim state to its own `cuda:rank`. → Task 6/Task 11.
 
 ---
 
@@ -255,21 +304,24 @@ def run(student, tokenizer, config, artifacts_dir, *, device=None,
     RkdPaperRecipePlugin().apply_config_overrides(config)
     ddp = DdpConfig.from_config(config)
     if not ddp.enabled:
-        # EXISTING single-process path — byte-identical. ddp=None signals "no DDP".
+        # EXISTING single-process path. ddp=None signals "no DDP" → every DDP site is a
+        # no-op; the instruction stream is identical to pre-change.
         return _run_single_process(student, tokenizer, config, artifacts_dir,
                                    device=device, no_resume=no_resume,
                                    stage_key=stage_key)
-    return _spawn_ddp_workers(tokenizer, config, artifacts_dir,
+    # H1: the LIVE student + tokenizer are passed so the parent can serialize the
+    # compressed weights for the workers to reconstruct (Task 8).
+    return _spawn_ddp_workers(student, tokenizer, config, artifacts_dir,
                               no_resume=no_resume, stage_key=stage_key, ddp=ddp)
 ```
 **CRITICAL backward-compat detail:** `apply_config_overrides` must run BEFORE
 `DdpConfig.from_config` (it sets `epochs`, may clear the cache) so the DDP config sees
 the effective recipe. The `ddp=None` default of `_run_single_process` means every
-`_unwrap_student` / no_sync / all-reduce site (added in later tasks) is a no-op on the
-single-process path — guaranteeing byte-identity (see Task 9 guardrail).
+`unwrap_student` / no_sync / all-reduce site (added in later tasks) is a no-op on the
+single-process path — so the default path runs the identical op stream (see Task 9 guardrail).
 **Expected:** `pytest max_quality/tests/test_router_kd_ddp_dispatch.py -v` → pass.
 
-### Task 2 — Single `_unwrap_student` helper; replace all `_orig_mod` peels
+### Task 2 — Single `_unwrap_student` helper; replace `_orig_mod` peels at STUDENT sites only
 **Files:** new `router_kd/_unwrap.py`; edits across `orchestrator.py`, `early_stop.py`,
 `teacher.py`, `vocab_kd.py`.
 **Test first:** `test_router_kd_unwrap.py`
@@ -293,13 +345,21 @@ def unwrap_student(model):
             return model
         seen.add(id(model)); model = nxt
 ```
-Then replace EVERY `getattr(student, "_orig_mod", student)` (and the `_t` variants in
-teacher.py) in the Router-KD package with `unwrap_student(...)`. Sites to change (verify
-each by grep `_orig_mod` in `router_kd/`): `orchestrator.py:149,328,428,447,869,1056,1218`,
-`early_stop.py:140,497`, `teacher.py:161,588,675,709`, `vocab_kd.py:231`.
+**SCOPE — migrate ONLY the training-STUDENT `_orig_mod` peels** (the object that gets
+DDP-wrapped). These sites: `orchestrator.py:328,428,447,869,1056,1218`,
+`early_stop.py:140,497`, `teacher.py:588`(student topology-count ref),
+`teacher.py:675`(student-vocab guard `_student_unwrapped`), `vocab_kd.py:231`.
+**Do NOT migrate** (they are never DDP-wrapped — leave as plain `getattr(...,
+"_orig_mod", ...)`):
+- `orchestrator.py:149` — `_set_experts_implementation`, runs on the RAW student
+  *before* any DDP wrap (and also on the teacher); no `.module` is ever present there.
+- `teacher.py:161` — that is the TEACHER's `_set_experts_implementation` (the prior plan
+  draft wrongly listed it as a student site); the teacher is never DDP-wrapped.
+- `teacher.py:709` — `iter_moe_layers(getattr(_t, "_orig_mod", _t))` is the TEACHER
+  (`_t`), not the student.
 **Guardrail:** because the single-process student has neither `.module` nor (when
-compile off) `_orig_mod`, `unwrap_student` returns it unchanged → byte-identical on the
-default path. The golden (Task 9) proves this.
+compile off) `_orig_mod`, `unwrap_student` returns it unchanged → the default path runs
+the identical op stream. The golden (Task 9) confirms no regression.
 **Expected:** `pytest max_quality/tests/test_router_kd_unwrap.py -v` → pass; the existing
 golden still green after the mechanical replacement (run Task 9 command).
 
@@ -350,7 +410,7 @@ def _worker_entry(rank, world_size, backend, master_port, result_q, payload, wor
     finally:
         _destroy_pg()
 
-def spawn_ddp_workers(world_size, *, backend, payload, worker_fn):
+def spawn_ddp_workers(world_size, *, backend, payload, worker_fn, join_timeout_s=None):
     ctx = mp.get_context("spawn")
     result_q = ctx.SimpleQueue()
     port = _free_port()
@@ -360,7 +420,15 @@ def spawn_ddp_workers(world_size, *, backend, payload, worker_fn):
     for p in procs: p.start()
     # Drain rank-0 result / first error.
     status = result_q.get()
-    for p in procs: p.join()
+    # M1 watchdog: bounded join so a NaN/collective hang that escapes the in-loop
+    # finiteness all-reduce (Task 5) still terminates the run instead of wedging forever.
+    for p in procs:
+        p.join(timeout=join_timeout_s)
+        if p.is_alive():
+            for q in procs: q.terminate()
+            raise RuntimeError(
+                f"Router-KD DDP: worker exceeded join timeout {join_timeout_s}s "
+                "(suspected collective deadlock); terminated all workers.")
     for p in procs:
         if p.exitcode not in (0, None):
             raise RuntimeError(f"Router-KD DDP: a worker exited with code {p.exitcode}")
@@ -368,50 +436,72 @@ def spawn_ddp_workers(world_size, *, backend, payload, worker_fn):
         raise RuntimeError(f"Router-KD DDP rank {status[1]} failed: {status[2]}")
     return status[1]
 ```
+`join_timeout_s` defaults to `None` (block indefinitely) for production where a long real
+run is legitimate; the failure-mode tests (Task 11) pass a small finite value to assert
+the watchdog fires. The PRIMARY deadlock defense is the in-loop finiteness all-reduce
+(Task 5/M1); this watchdog is the backstop.
 **Note on serialization:** the spawn target and `payload` must be serializable for the
 spawn handoff. The student/teacher models are NOT passed through the queue — each worker
-loads its own via `load_model` (Stage-3 precedent: workers re-load inside the child,
-`covariance_collection.py:1099-1124`). `payload` carries only `config`, `artifacts_dir`,
-`stage_key`, `no_resume`, the resolved model repo + revision (so each rank loads the
-same student checkpoint Stage 4 produced) and the `DdpConfig`. See Task 8 for how the
-student is materialized per rank.
+reconstructs the COMPRESSED student via `load_compressed_model` from a parent-written temp
+dir (Stage-3 precedent for re-load-in-child, `covariance_collection.py:1099-1124`; H1 fix
+in Task 8). `payload` carries `config`, `artifacts_dir`, `stage_key`, `no_resume`,
+`student_src` (the temp-dir path of the serialized LIVE compressed student) and the
+`DdpConfig`. See Task 8 for the materialization.
 **Expected:** `pytest max_quality/tests/test_router_kd_ddp_runtime.py -v` → pass.
 
-### Task 4 — Per-rank batch shard + GLOBAL step count (result-preserving partition)
-**Files:** `router_kd/orchestrator.py` (`_run_single_process` batch setup, ~`:302-332`,
-`:683`).
-**Test first:** `test_router_kd_ddp_shard.py`
-- `test_total_optim_steps_is_global`: with `len(batches)=8, grad_accum=1, epochs=1,
-  world_size=2`, assert `total_optim_steps == 8` (NOT 4) — computed from the GLOBAL batch
-  count before the shard. (Call the extracted helper directly with a fake DdpConfig.)
-- `test_shard_partition_disjoint_and_even`: a `_rank_batch_indices(num_batches=8, rank,
-  world_size=2)` helper returns `[0,2,4,6]` for rank 0 and `[1,3,5,7]` for rank 1
-  (strided so each grad-accum window draws one sequence per rank from the SAME global
-  window — see note). Disjoint, equal length.
-- `test_shard_drops_uneven_tail`: `num_batches=7, world_size=2` → each rank gets 3 (the
-  trailing odd batch is dropped so token counts stay equal across ranks), and a WARNING
-  is logged naming the dropped count (extend the existing `trailing` drop semantics,
-  `orchestrator.py:560,589-595`).
+### Task 4 — Per-STEP ROW-split (NOT a batch-list shard) + UNCHANGED global step count
+**The C1 fix.** A `batches[rank::world_size]` *list* shard assigns whole optimizer STEPS
+to alternating ranks: the all-reduce would then average `∇L(batch 2w)` and
+`∇L(batch 2w+1)`, i.e. the gradient of a DOUBLED effective batch with HALF the optimizer
+steps — exactly the forbidden "raise effective batch / halve step count" transform. That
+is NOT result-preserving. The correct partition splits **each step's batch by ROW**: every
+rank participates in EVERY step, on a disjoint row-slice of the SAME
+`batches[_batch_idx]`. The step count and the batch list stay GLOBAL and UNCHANGED.
+**Files:** `router_kd/orchestrator.py` (the `for i, _batch_idx` loop body, `:683-695`).
+**Test first:** `test_router_kd_ddp_rowsplit.py`
+- `test_total_optim_steps_unchanged`: with `len(batches)=8, grad_accum=1, epochs=1,
+  world_size=2`, assert `total_optim_steps == 8` AND the loop runs 8 iterations PER RANK
+  (identical to single-GPU) — DDP does NOT divide either by `world_size`.
+- `test_rowsplit_slices_each_step`: with `batch_size=2, world_size=2`, a
+  `_row_slice(batch, rank, world_size)` helper returns `batch[0:1]` for rank 0 and
+  `batch[1:2]` for rank 1 of the SAME step's batch (`per_gpu = batch_size // world_size`).
+  Disjoint rows, equal count `per_gpu` on every rank.
+- `test_rowsplit_equal_tokens_by_construction`: assert every rank's local token count is
+  `per_gpu * (L-1)` regardless of which step — equal by construction, so NO across-rank
+  tail-drop is needed (the row-split cannot produce a ragged rank).
 **Implementation:**
 - `total_optim_steps = (len(batches) // grad_accum) * epochs` STAYS computed from the
-  GLOBAL `len(batches)` (it already is — `orchestrator.py:332`; do NOT change it). This
-  is the load-bearing fact: every rank computes the identical `total_optim_steps`, so the
-  LR schedule (`kd_optimizer.py:262-275`, keyed to `total_optim_steps`) and the global
-  `step` counter advance in lockstep across ranks.
-- Introduce the partition: the per-rank batch list is `batches[rank::world_size]` (strided)
-  so that grad-accum window `w` consumes, across the N ranks, the SAME N×grad_accum
-  sequences a single GPU would have consumed in that window. Equal `B_local` per rank →
-  equal `n_tokens` per rank → average-gradient ≡ global mean (the `vocab_kd.py:132` mean
-  is linear in the per-replica means when token counts are equal).
-  - **Divisibility:** require `len(batches) % world_size == 0`; drop the ragged tail
-    BEFORE sharding (extend the `trailing` logic) so all ranks get equal length. Log the
-    drop. Combined with the existing `len(batches) % grad_accum` trailing drop, this keeps
-    each global grad-accum window complete and identical across ranks.
-- The `step` counter, the grad-accum boundary test `(i + 1) % grad_accum == 0`
-  (`orchestrator.py:852`), and `scheduler.step()` are UNCHANGED — they operate on the
-  per-rank loop index `i`, which now ranges over `len(batches)//world_size`, but the
-  GLOBAL window cadence is identical because every rank steps on the same boundaries.
-**Expected:** `pytest max_quality/tests/test_router_kd_ddp_shard.py -v` → pass.
+  GLOBAL `len(batches)` (it already is — `orchestrator.py:332`; do NOT change it). The
+  iteration count, the grad-accum boundary `(i+1) % grad_accum == 0` (`:852`),
+  `scheduler.step()`, and the `step` counter are ALL UNCHANGED and IDENTICAL to single-GPU.
+- The ONLY loop change: inside `for i, _batch_idx in enumerate(_batch_order)` (`:683`),
+  after `batch = batches[_batch_idx]` (`:684`) and BEFORE `batch.to(device)` (`:695`),
+  slice the rows for this rank:
+  ```python
+  batch = batches[_batch_idx]
+  if ddp is not None:
+      per_gpu = s5["batch_size"] // world_size   # divisibility guaranteed by Task 0
+      batch = batch[rank * per_gpu:(rank + 1) * per_gpu]
+  if device is not None:
+      batch = batch.to(device)
+  ```
+  Now every rank runs the FULL `for i` loop over the global `batches`, but each forwards
+  only its `per_gpu` rows. DDP all-reduce-AVERAGES the per-row-mean gradients → the
+  average of the N per-replica means = the global per-token mean over all `batch_size`
+  rows (the `vocab_kd.py:132` mean is linear in the per-replica means when token counts
+  are equal — and they ARE, `per_gpu * (L-1)` on every rank, by construction).
+- **DELETE** the strided-list shard, any `_rank_batch_indices` helper, and any
+  across-rank tail-drop from earlier drafts — none are needed. The existing
+  `len(batches) % grad_accum` trailing drop (`:560`) is UNCHANGED and applies globally as
+  before. The only new precondition is `batch_size % world_size == 0` (Task 0), which
+  makes the row-split exact.
+- **Teacher cache index stays GLOBAL and correct for free:** `batch_index=i` and
+  `num_batches=len(batches)` passed to `provide_teacher_logits` (`:725-729`) are the
+  unchanged global values — every rank uses the SAME global `i`, then row-slices the
+  returned `[batch_size, L, |V|]` logits by the SAME `[rank*per_gpu:(rank+1)*per_gpu]`
+  rows to match its student rows. (Add the matching teacher row-slice right after the
+  `dispatch_first` return.)
+**Expected:** `pytest max_quality/tests/test_router_kd_ddp_rowsplit.py -v` → pass.
 
 ### Task 5 — DDP wrap (after freeze + optimizer) + grad-accum `no_sync`
 **Files:** `router_kd/orchestrator.py` (after `build_optimizer` ~`:340`, and the
@@ -424,9 +514,12 @@ microbatch backward `:850`).
   `ddp.no_sync()` is entered on microbatch 0 and NOT on microbatch 1 (spy on a wrapper);
   assert one all-reduce per grad-accum window, not per microbatch.
 - `test_grad_avg_matches_local` (the micro result-preservation unit): on a 1-layer toy
-  model, feed rank-0 batch A and rank-1 batch B; after backward+all-reduce, assert each
-  rank's `.grad` equals the gradient of `mean(loss(A), loss(B))` within tol — i.e. AVERAGE
-  not SUM.
+  model, give the SAME 2-row batch to both ranks but row-split it (rank 0 → row 0, rank 1
+  → row 1); after backward + all-reduce, assert each rank's `.grad` equals the gradient of
+  the 2-row per-token-mean loss (i.e. AVERAGE of the two per-row gradients, not SUM).
+- `test_nonfinite_loss_all_ranks_raise` (M1): force a NaN loss on rank-1 only; assert the
+  finiteness all-reduce makes BOTH ranks raise (no rank proceeds into the next collective
+  and hangs). See the all-reduce-finite guard below.
 **Implementation:**
 - Ordering (per analysis §4): freeze (`setup_trainable_scope`) → build optimizer over the
   raw `requires_grad` params → OPTIONAL `torch.compile` → wrap in DDP. So:
@@ -463,6 +556,26 @@ microbatch backward `:850`).
 - **MEAN not SUM:** DDP defaults to averaging gradients across ranks — exactly the
   per-token-mean semantics. Add an assertion/comment that NO manual `loss * world_size`
   rescale exists anywhere (grep guard in the test).
+- **M1 — finiteness all-reduce (NaN→deadlock fix):** the existing NaN tripwire
+  (`orchestrator.py:815`) raises on a non-finite loss on ONE rank. Under DDP that one rank
+  would exit the loop while the others block forever in the next gradient all-reduce (and
+  the gloo CPU test cannot reproduce a real NCCL hang). Fix: BEFORE the `if not
+  torch.isfinite(loss)` check, all-reduce a finiteness flag so EVERY rank sees any rank's
+  NaN and they raise TOGETHER:
+  ```python
+  if ddp is not None:
+      finite = torch.tensor([1.0 if torch.isfinite(loss) else 0.0], device=loss.device)
+      dist.all_reduce(finite, op=dist.ReduceOp.MIN)  # 0 if ANY rank is non-finite
+      local_finite = bool(finite.item())
+  else:
+      local_finite = bool(torch.isfinite(loss))
+  if not local_finite:
+      # rank-0 dumps diagnostics (Task 6 gates the dump); all ranks raise.
+      raise RuntimeError(f"Stage 5 KD loss non-finite on at least one rank ...")
+  ```
+  Belt-and-suspenders: the parent `spawn_ddp_workers` join also gets a `timeout` +
+  watchdog (Task 3 / Task 11) so a hang that escapes this guard still terminates the run
+  rather than wedging forever.
 **Expected:** `pytest max_quality/tests/test_router_kd_ddp_wrap.py -v` → pass.
 
 ### Task 6 — Synchronized early-stop/EMA + rank-0-only I/O + best.pt broadcast
@@ -471,13 +584,16 @@ microbatch backward `:850`).
 `broadcast_module_state` helpers).
 **Test first:** `test_router_kd_ddp_sync.py` (CPU, `gloo`, world_size=2)
 - `test_window_loss_all_reduced_mean`: give rank-0 a window loss of 2.0 and rank-1 of
-  4.0; assert the value fed to `update_best_tracker` is 3.0 on BOTH ranks (so both make
-  the identical best/EMA/patience decision). This makes the multi-GPU `raw_kl_val`
-  equal the single-GPU full-batch window mean (the gate's correctness, analysis §4).
-- `test_early_stop_flag_broadcast`: force rank-0's patience to trip while rank-1's local
-  view would not; assert BOTH ranks see `early_stop_should_stop=True` after the broadcast
-  → both `break` → no deadlock (one rank breaking while others wait on the next all-reduce
-  is the classic DDP hang).
+  4.0; assert the all-reduced value used by rank-0's tracker is 3.0 — equal to the
+  single-GPU full-batch window mean (the gate's correctness, analysis §4).
+- `test_tracker_runs_rank0_only` (M2): the best-tracker/early-stop DECISION
+  (`update_best_tracker` + `check_early_stop`) runs ON RANK-0 ONLY; assert ranks 1+ never
+  call `_save_best_router_state` and never compute the EMA. (We do NOT run the tracker
+  arithmetic on every rank — `all_reduce_mean` can differ by 1 ULP across ranks, so
+  "identical tracker state on all ranks" does NOT hold and must not be assumed.)
+- `test_early_stop_flag_broadcast`: rank-0 decides stop, then `broadcast_flag(src=0)` →
+  assert BOTH ranks read `early_stop_should_stop=True` and break (one rank breaking while
+  others wait on the next all-reduce is the classic DDP hang).
 - `test_rank0_only_writes`: assert `best.pt`, `step_*.pt`, trackio, and
   `save_compressed_checkpoint` are invoked ONLY on rank 0 (spy; ranks 1+ must not touch
   the filesystem — N ranks racing the same files = torn writes / N× I/O).
@@ -486,39 +602,56 @@ microbatch backward `:850`).
   rank-0's (so every replica ends with the same exported weights).
 **Implementation:**
 - `all_reduce_mean(scalar_tensor)`: `dist.all_reduce(t, op=SUM); t /= world_size`. Apply
-  to BOTH `loss_val` and `raw_kl_val` at the log boundary (`orchestrator.py:889,893`)
-  BEFORE publishing `raw_kl_val` to `run_ctx` for `update_best_tracker`. Do the reduce on
-  a GPU/CPU scalar tensor, then `.item()`.
-- **Rank-0 gates** (guard with `if rank == 0:`):
-  - `_trackio_log(...)` (`:566,943`) — rank-0 only (no-op on other ranks).
-  - `_save_best_router_state` via `update_best_tracker` (`early_stop.py:397`) — rank-0
-    only. **Subtlety:** `update_best_tracker` MUTATES EMA/patience state that EVERY rank
-    must keep identical for the synchronized decision. So: ALL ranks run the EMA/patience
-    arithmetic (it is deterministic given the all-reduced `raw_kl_val` — identical inputs
-    → identical state), but only rank-0 performs the `best.pt` WRITE. Implement by passing
-    `rank` into the ctx and guarding ONLY the `_save_best_router_state` call inside
-    `update_best_tracker` (add a `ctx.get("ddp_rank", 0) == 0` guard around
-    `early_stop.py:397`). The EMA/`best_step`/`no_improve_windows` updates stay on all ranks.
-  - `check_early_stop` runs on all ranks; then `broadcast_flag(early_stop_should_stop,
-    src=0)` so the BREAK decision is unanimous. (Because the all-reduced `raw_kl_val` is
-    identical on all ranks, the flag is ALSO identical pre-broadcast — the broadcast is a
-    belt-and-suspenders guard against any divergence in the float-compare; keep it.)
+  to BOTH `loss_val` and `raw_kl_val` at the log boundary (`orchestrator.py:889,893`) on a
+  scalar tensor, then `.item()`. This makes rank-0's window loss equal the single-GPU
+  full-batch window mean.
+- **M2 — best-tracker / early-stop decision is RANK-0 ONLY, then broadcast the flag.**
+  `all_reduce_mean` is not guaranteed bit-identical across ranks (fp reduction-order → up
+  to 1 ULP drift), so running the EMA/patience arithmetic independently on every rank
+  could desync the stop decision. The correct, simple design:
+  - Only rank-0 publishes `raw_kl_val` and dispatches
+    `walk_phases(("update_best_tracker", "check_early_stop"), ...)` (the existing call at
+    `:912-915`). Ranks 1+ SKIP the entire tracker block.
+  - rank-0 then `broadcast_flag(early_stop_should_stop, src=0)` so ALL ranks get the
+    SAME break decision; the orchestrator's `if _early_stopped: break` (`:998`) and the
+    epoch-loop break (`:1024`) fire unanimously. (This is the ONLY broadcast needed for
+    the decision; it is the fix, not belt-and-suspenders.)
+  - **Per-rank flag plumbing:** every rank must reach the `broadcast_flag` call on the
+    SAME iterations rank-0 does — i.e. the log-window cadence (`step % log_every == 0`,
+    `:882`) is identical on all ranks (true: `step` advances in lockstep), so all ranks
+    enter the broadcast together. On non-log-window steps NO broadcast happens and the
+    prior flag stands (mirrors the existing `:944-951` else-branch) — identical on all
+    ranks because it is purely a function of the lockstep `step`.
+- **Rank-0-only I/O** (guard with `if rank == 0:`):
+  - `_trackio_log(...)` (`:566,943`) — rank-0 only.
   - `_save_stage5_checkpoint` (`:977-988`, `:1007-1017`) + `_Stage5CheckpointWriter`
     (`:660-664`) — rank-0 only. Other ranks skip checkpoint writes entirely.
+  - `best.pt` write (inside `update_best_tracker`, `early_stop.py:397`) — already rank-0
+    only because the whole tracker runs only on rank-0 (above). No `ddp_rank` guard inside
+    `early_stop.py` is needed under the M2 design.
   - `save_compressed_checkpoint` (`:1053`) — rank-0 only; unwrap via
-    `unwrap_student(student)` (now peels `.module` then `_orig_mod`).
+    `unwrap_student(student)`.
 - **best.pt reload broadcast** (`reload_best_checkpoint`, `early_stop.py:467`): rank-0
   loads `best.pt` + swaps params; then `broadcast_module_state(student, src=0)` so every
-  replica's trainable params match rank-0 before export. (Alternative: all ranks load the
-  same `best.pt` from the shared filesystem — but rank-0-load+broadcast avoids a read race
-  and is the clean idiom; analysis §4.)
-- **Resume + DDP:** rank-0 loads the resume checkpoint (`orchestrator.py:403-511`) and the
-  DDP construction broadcasts module state from rank-0 on wrap (DDP broadcasts on
-  construction). So restore on rank-0 BEFORE the DDP wrap; the existing multi-device
-  optimizer-state migration (`:469-481`, device_map-era) is bypassed on the DDP path (each
-  rank loads the same optim state independently — see Task 8). Keep the old block as the
-  non-DDP fallback.
-**Expected:** `pytest max_quality/tests/test_router_kd_ddp_sync.py -v` → pass.
+  replica's trainable params match rank-0 before export. (rank-0-load+broadcast avoids a
+  read race vs all-ranks-load.)
+- **M4 — per-rank resume under DDP.** The resume restore (`orchestrator.py:403-511`) must
+  run INDEPENDENTLY ON EVERY RANK before the DDP wrap, NOT rank-0-only: each rank loads
+  the SAME `step_*.pt` (router_state + optim_state + scheduler_state) into its own replica
+  and moves the optim state to ITS OWN device (`_move_optimizer_state_to_device(optim,
+  torch.device(f"cuda:{rank}"))`, `kd_optimizer.py:109`). Because every rank loads the
+  identical checkpoint, all replicas start the resumed run with identical weights + optim
+  moments + scheduler position — and the DDP-wrap broadcast (rank-0 → others on
+  construction) is then a no-op consistency check. The existing single-device optimizer
+  migration (`:468-481`) is replaced under DDP by the explicit `cuda:rank` move; the
+  device_map "trainable parameters span N devices" warning (`:475-481`) is unreachable on
+  the DDP path (each rank is single-device). Keep the old block as the non-DDP fallback.
+  **Add a `gloo` world=2 resume test** (`test_router_kd_ddp_resume.py`): write a
+  `step_*.pt` from a single-process run, resume it under DDP world=2, assert (a) both
+  ranks load `resume_step` correctly, (b) the run completes, (c) the final router weights
+  match a single-process resume within tolerance.
+**Expected:** `pytest max_quality/tests/test_router_kd_ddp_sync.py
+max_quality/tests/test_router_kd_ddp_resume.py -v` → pass.
 
 ### Task 7 — Teacher VRAM strategy: validated precondition + per-rank teacher
 **Files:** new validation in `router_kd/orchestrator.py` (DDP branch, before spawn) or
@@ -565,62 +698,98 @@ cache path (`TeacherCachePlugin`) is read-only mmap — naturally shared across 
 node. No teacher code changes needed; only the precondition + per-rank load wiring (Task 8).
 **Expected:** `pytest max_quality/tests/test_router_kd_ddp_teacher.py -v` → pass.
 
-### Task 8 — `_run_ddp_worker`: assemble the per-rank training (the integration)
+### Task 8 — `_run_ddp_worker`: materialize the LIVE student per rank + assemble training
+**The H1 fix.** Each rank must train the LIVE compressed student (post-merge at 2.5,
+post-EoRA at 5), NOT the original repo checkpoint. The parent serializes the live student
+to a temp dir; each child reconstructs it with `load_compressed_model`.
 **Files:** `router_kd/orchestrator.py` (`_spawn_ddp_workers` + `_run_ddp_worker`).
-**Test first:** covered end-to-end by Task 10 (the result-preservation gate). Add a
-focused `test_ddp_worker_loads_own_student.py`:
-- `test_each_rank_loads_student`: monkeypatch `load_model` to count calls per rank; assert
-  each of the 2 ranks loads the student once (re-load-in-child pattern, Stage-3 precedent).
-- `test_rank0_returns_out_dir`: stub the loop; assert rank-0 puts the `{stage_key}_final`
-  Path on the result queue and parent returns it.
+**Test first:** `test_ddp_worker_student_materialization.py`
+- `test_reloaded_child_weights_match_parent` (THE H1 guard — without it the whole
+  result-preservation gate is meaningless): save a live tiny compressed student via
+  `save_compressed_checkpoint`, reload it via `load_compressed_model`, assert the reloaded
+  trainable params are `torch.allclose` to the parent's pre-spawn `unwrap_student(student)`
+  params (atol/rtol 0 where the bf16 round-trip is exact; else 1e-3 with a comment).
+- `test_each_rank_reloads_compressed`: monkeypatch `load_compressed_model` to count calls;
+  assert each of the 2 ranks reconstructs the student once from the temp dir (NOT
+  `load_model` on the original repo — assert `load_model(config["model"]
+  ["name_or_path"])` is NEVER called by a worker).
+- `test_rank0_returns_out_dir`: assert rank-0 puts the `{stage_key}_final` Path on the
+  result queue and the parent returns it.
 **Implementation:**
 ```python
-def _spawn_ddp_workers(tokenizer, config, artifacts_dir, *, no_resume, stage_key, ddp):
+def _spawn_ddp_workers(student, tokenizer, config, artifacts_dir, *,
+                       no_resume, stage_key, ddp):
     validate_ddp_teacher_strategy(config, ddp)
-    # Resolve the student source so each rank loads the SAME checkpoint Stage 4 wrote.
-    student_src = config["model"]["name_or_path"]  # or the Stage-4 output dir, per caller
+    # H1: serialize the LIVE compressed student (post-merge / post-EoRA) so each rank
+    # reconstructs the SAME weights — NOT config["model"]["name_or_path"] (the original
+    # uncompressed checkpoint). Uses the SAME serializer as the final export.
+    src_dir = artifacts_dir / "_ddp_student_src"
+    save_compressed_checkpoint(unwrap_student(student), tokenizer, src_dir,
+                               pipeline_stage=f"{stage_key}_ddp_src")
     payload = dict(config=config, artifacts_dir=str(artifacts_dir),
-                   no_resume=no_resume, stage_key=stage_key,
-                   student_src=student_src, ddp_world_size=ddp.world_size,
-                   backend=ddp.backend)
-    return spawn_ddp_workers(ddp.world_size, backend=ddp.backend,
-                             payload=payload, worker_fn=_run_ddp_worker)
+                   student_src=str(src_dir), no_resume=no_resume, stage_key=stage_key,
+                   ddp_world_size=ddp.world_size, backend=ddp.backend)
+    try:
+        return spawn_ddp_workers(ddp.world_size, backend=ddp.backend,
+                                 payload=payload, worker_fn=_run_ddp_worker)
+    finally:
+        import shutil
+        shutil.rmtree(src_dir, ignore_errors=True)  # rank-0/parent cleanup
 
-def _run_ddp_worker(*, rank, world_size, config, artifacts_dir, no_resume, stage_key,
-                    student_src, ddp_world_size, backend):
+def _run_ddp_worker(*, rank, world_size, config, artifacts_dir, student_src,
+                    no_resume, stage_key, ddp_world_size, backend):
     import torch
     device = (torch.device(f"cuda:{rank}") if backend == "nccl" else torch.device("cpu"))
-    # Re-load the student inside the child (Stage-3 precedent; models aren't shipped).
-    student, tokenizer = load_model(student_src, ...)  # mirror run_pipeline load
+    # H1: reconstruct the COMPRESSED student from the temp dir (rebuilds FactoredExperts
+    # at stored ranks, resizes routers — model_io.py:1508). NOT load_model(original).
+    student, tokenizer = load_compressed_model(
+        student_src, device_map=({"": f"cuda:{rank}"} if backend == "nccl" else "cpu"),
+        torch_dtype=config["model"]["torch_dtype"],
+        attn_implementation=config["model"]["attn_implementation"])
     ddp_cfg = DdpConfig(enabled=True, world_size=world_size, backend=backend)
     out = _run_single_process(student, tokenizer, config, Path(artifacts_dir),
                               device=device, no_resume=no_resume, stage_key=stage_key,
                               rank=rank, world_size=world_size, ddp=ddp_cfg)
-    return out  # only rank 0's is consumed by the parent (others return same Path)
+    return out  # only rank 0's is consumed by the parent (others return the same Path)
 ```
 `_run_single_process` is the extracted loop (Task 1) threaded with `rank`/`world_size`/
-`ddp`: it publishes `ddp_rank` on `run_ctx` (for the best.pt write guard, Task 6), shards
-batches (Task 4), wraps in DDP (Task 5), all-reduces the window loss + gates I/O (Task 6).
-**Serialization:** `config` (nested dicts/lists/scalars), `artifacts_dir` (str),
-`student_src` (str) carry across the spawn boundary fine. The student model + tokenizer
-are NOT passed — loaded in-child. `worker_fn` is a module-level function.
-**Expected:** `pytest max_quality/tests/test_ddp_worker_loads_own_student.py -v` → pass.
+`ddp`: it publishes `ddp_rank` on `run_ctx`, row-splits each step's batch (Task 4), wraps
+in DDP (Task 5), all-reduces the window loss + finiteness flag + gates I/O (Task 5/6).
+**Spawn-boundary payload** carries `config` (nested dicts/lists/scalars), `artifacts_dir`
+(str), `student_src` (str) — all carry fine; the model + tokenizer are NOT in the payload
+(reconstructed in-child from `student_src`). `worker_fn` is a module-level function.
+**Caller wiring:** `run()` (Task 1) must pass the live `student` + `tokenizer` into
+`_spawn_ddp_workers` — update the Task-1 fork to
+`_spawn_ddp_workers(student, tokenizer, config, artifacts_dir, no_resume=no_resume,
+stage_key=stage_key, ddp=ddp)`.
+**Expected:** `pytest max_quality/tests/test_ddp_worker_student_materialization.py -v` →
+pass.
 
-### Task 9 — DEFAULT-PATH GOLDEN GUARDRAIL (byte-identical, non-negotiable)
-**Files:** none new — re-run the existing golden after Tasks 1-8 land.
+### Task 9 — DEFAULT-PATH GUARDRAIL (metadata-byte + loss-tolerance, non-negotiable)
+**What the golden actually guarantees (H2 — corrected):** it BYTE-pins only
+`compressed_metadata.{stage_id}.json` (ints/strings — `:306`) and TOLERANCE-pins the loss
+trace at `rel_tol=1e-5, abs_tol=1e-7` (`:328-329`). It does NOT byte-pin the trained
+weights. So the correct claim for the default path is: **it executes the identical
+instruction stream (no new tensor ops, no spawn — `ddp=None` short-circuits every DDP
+site), and the metadata-byte + loss-tolerance gates stay green.** That is the operative
+regression guard, not a weight-byte guarantee.
+**Files:** none new for the primary check — re-run the existing golden after Tasks 1-8.
 **Command:**
 ```
 pytest max_quality/tests/test_router_kd_golden_snapshot.py -v
 ```
-**Expected output:** both params (`stage2p5`, `stage5`) PASS. The golden asserts
-`compressed_metadata.{stage_id}.json` BYTE-identical (`:306`) and the loss trace within
-`rel_tol=1e-5, abs_tol=1e-7` (`:328-329`) — both on the DEFAULT (no-`ddp`-key,
-`rkd_recipe="current"`) single-process path. This proves the mechanical `_unwrap_student`
+**Expected output:** both params (`stage2p5`, `stage5`) PASS on the DEFAULT (no-`ddp`-key,
+`rkd_recipe="current"`) single-process path — confirming the mechanical `unwrap_student`
 replacement (Task 2) and the dispatch fork (Task 1) did NOT perturb the existing path.
 **If it fails:** the single-process path was changed — STOP. Do not widen the tolerance
 (the golden docstring `:23-31` forbids masking same-machine drift). Root-cause the
 regression (most likely an `unwrap_student` site that changed behavior, or `ddp=None` not
 short-circuiting a new code branch).
+**Optional HARD byte bar (if a true weight-byte guarantee is wanted):** add
+`test_default_path_bytes_unchanged.py` that runs the tiny default-path Router-KD on this
+commit vs a pre-change `main` checkout and diffs the `best.pt` / `step_*.pt` raw bytes
+(`.read_bytes()`); assert equal. This is the only way to prove byte-identity since the
+golden does not. Mark it `@pytest.mark.skipif` unless a `MAIN_REF` checkout is provided.
 Also run the full Router-KD suite to catch seam regressions:
 ```
 pytest max_quality/tests/test_router_kd_orchestrator.py \
@@ -639,20 +808,27 @@ pytest max_quality/tests/test_router_kd_orchestrator.py \
   1. Build `tiny_model` + `tiny_config` (conftest `:167,:173`); set
      `stage5_router_kd.batch_size=2, gradient_accumulation=1, epochs=1,
      max_calibration_samples=8, rkd_recipe="current"` (defeat paper-dials so epochs stays
-     1 and we can use a deterministic single-process baseline), `log_every_n_steps=1`,
+     1 and the single-process baseline is deterministic), `log_every_n_steps=1`,
      teacher==student via the `load_model` monkeypatch (golden `:208-222`).
-  2. Run (a) single-process (no `ddp` key) → capture the final trainable (router) state
-     dict + the captured loss trace (via the `_trackio_log` capture monkeypatch).
-  3. Run (b) `ddp: {enabled: true, world_size: 2, backend: "gloo"}`,
-     `batch_size=2` → `per_gpu_batch=1` → capture rank-0's final exported router state +
-     loss trace. (DDP spawns 2 CPU workers; rank-0 writes the final checkpoint.)
+  2. Run (a) single-process (no `ddp` key) → `batch_size=2`, `len(batches)=4` → capture the
+     final trainable (router) state dict + the captured loss trace (`_trackio_log` capture).
+  3. Run (b) `ddp: {enabled: true, world_size: 2, backend: "gloo"}` with the **IDENTICAL**
+     `batch_size=2` AND **IDENTICAL** `max_calibration_samples=8` (→ identical
+     `len(batches)=4`, identical step count). The ONLY difference is the row-split:
+     `per_gpu = 2 // 2 = 1`, so rank 0 forwards row 0 and rank 1 forwards row 1 of EACH
+     step's 2-row batch, and DDP averages the two per-row gradients. Capture rank-0's final
+     exported router state + loss trace. (DDP spawns 2 CPU workers; rank-0 writes the
+     checkpoint.)
   4. Assert: per-step `loss` and `raw_kl` match within `math.isclose(rel_tol=1e-5,
      abs_tol=1e-7)` (the golden bar); the final router weight tensors match within
      `torch.allclose(rtol=1e-5, atol=1e-7)`. NOT byte-identical (DDP all-reduce reorders
      fp — documented).
-**Why this is the crux:** it empirically proves average-gradient DDP at the same effective
-batch ≡ single-GPU full-batch for the vocab-KL loss. If it fails, the result-preservation
-claim is false and DDP must NOT ship.
+**Why this is the crux:** both runs use the SAME batch_size, the SAME number of batches,
+and the SAME number of optimizer steps — they differ ONLY in single-process full-batch
+vs 2-rank row-split + grad-average. That is the EXACT equivalence the result-preservation
+claim makes. If it fails, the claim is false and DDP must NOT ship. (A test where run (b)
+used `len(batches)=2` or half the steps would be testing the WRONG transform — the C1
+defect — and is explicitly forbidden.)
 **Determinism notes for the test:** seed everything (`torch.manual_seed`), force CPU
 single-thread (`torch.set_num_threads(1)`) so the AdamW float math is reproducible across
 the two runs (mirror the golden's same-machine caveat). Use `gloo` (NCCL needs CUDA).
@@ -662,13 +838,19 @@ the two runs (mirror the golden's same-machine caveat). Use `gloo` (NCCL needs C
 ### Task 11 — Deadlock / failure-mode tests (defensive)
 **Files:** `test_router_kd_ddp_failure_modes.py` (CPU, `gloo`).
 **Tests:**
-- `test_uneven_batch_count_drops_tail_no_hang`: `max_calibration_samples` giving
-  `num_batches=7, world_size=2` → tail dropped, run completes, no hang.
-- `test_worker_exception_propagates`: inject a NaN-loss on rank-1 (the NaN tripwire,
-  `orchestrator.py:815`) → the parent re-raises naming the rank; no orphaned processes
-  (assert all child exitcodes set).
-- `test_early_stop_no_desync`: `early_stop_patience>0`, force a trip → both ranks break,
-  process group destroyed cleanly.
+- `test_nonfinite_loss_all_ranks_raise_no_hang` (M1): inject a NaN loss on rank-1 only;
+  the in-loop finiteness all-reduce (Task 5) makes BOTH ranks raise together; the parent
+  re-raises naming the rank; no orphaned processes (assert all child exitcodes set). This
+  is the DEADLOCK regression the gloo test CAN exercise (the finiteness flag is a
+  collective; a missing flag would hang here).
+- `test_join_watchdog_terminates_on_hang`: a worker that deliberately blocks in a fake
+  collective with `join_timeout_s` small → assert `spawn_ddp_workers` terminates all
+  workers and raises the timeout error (M1 backstop).
+- `test_early_stop_no_desync`: `early_stop_patience>0`, force a trip on rank-0's decision →
+  the broadcast flag makes both ranks break; process group destroyed cleanly, no hang.
+- (No `uneven_tail` test — the row-split (Task 4) makes per-rank token counts equal by
+  construction; there is no across-rank tail to drop. The existing global
+  `len(batches) % grad_accum` trailing drop is unchanged and orthogonal.)
 **Command:** `pytest max_quality/tests/test_router_kd_ddp_failure_modes.py -v`
 **Expected:** PASS.
 
@@ -712,20 +894,31 @@ clear "not yet supported" error** (add a guard in the DDP branch when
 ## Risk register (the gotcha checklist, each mapped to a code site + task)
 | Gotcha | Site | Mitigation (task) |
 |---|---|---|
-| Global step count must stay global | `orchestrator.py:332`, `kd_optimizer.py:262` | Compute from global `len(batches)` pre-shard (Task 4) |
-| Effective batch fixed (METRIC_PINNED) | `orchestrator.py:302` | `per_gpu = global/world_size`; reject non-divisible (Task 0/4) |
+| **C1 — partition must be per-STEP ROW-split, NOT batch-list shard** (list-shard = doubled effective batch / halved steps = forbidden) | `orchestrator.py:683-695` | Row-slice each step's batch; step count + batch list UNCHANGED (Task 4) |
+| Global step count must stay global AND unchanged | `orchestrator.py:332`, `kd_optimizer.py:262` | Computed from global `len(batches)`, NOT divided by world_size (Task 4) |
+| Effective batch fixed (METRIC_PINNED) | `orchestrator.py:302` | `per_gpu = batch_size // world_size` rows/step; reject non-divisible (Task 0/4) |
 | Grad all-reduce MEAN not SUM | DDP default | No manual `*world_size` rescale; unit test (Task 5) |
-| Equal token count per rank | `vocab_kd.py:119,132` | Drop ragged tail; strided even shard (Task 4) |
-| Early-stop desync → deadlock | `orchestrator.py:998,1024`; `early_stop.py` | All-reduce window loss + broadcast flag (Task 6) |
+| Equal token count per rank | `vocab_kd.py:119,132` | `per_gpu*(L-1)` on every rank BY CONSTRUCTION (row-split); no tail-drop (Task 4) |
+| **H1 — workers must train the LIVE compressed student, not the original repo** | `run_pipeline.py:293,328` | Parent saves live student → child `load_compressed_model` + allclose guard (Task 8) |
+| **M1 — NaN on one rank → NCCL deadlock** | `orchestrator.py:815` | All-reduce a finiteness flag (all ranks raise) + join watchdog (Task 5/3/11) |
+| **M2 — EMA not bit-equal across ranks** | `early_stop.py`; all_reduce 1-ULP | Tracker decision RANK-0 ONLY + broadcast stop flag; do NOT run on all ranks (Task 6) |
+| Early-stop desync → deadlock | `orchestrator.py:998,1024` | rank-0 decision → `broadcast_flag` (Task 6) |
 | Rank-0-only I/O | `:566,943,977,1053,1130`; `early_stop.py:397` | rank guards (Task 6) |
-| Resume + DDP | `:403-511,469-481` | rank-0 load → DDP broadcast on wrap (Task 6) |
-| Teacher cache index is GLOBAL | `teacher.py:498` | strided shard preserves global `batch_index`; pass global index (Task 4/8) |
-| `.module` + `_orig_mod` unwrap | many sites | single `unwrap_student` helper (Task 2) |
+| **M4 — resume under DDP** | `:403-511,468-481` | EVERY rank loads same ckpt + moves optim to `cuda:rank`; gloo resume test (Task 6/11) |
+| Teacher cache/live index is GLOBAL | `teacher.py:498` | global `batch_index=i`/`num_batches` unchanged; row-slice the returned logits (Task 4) |
+| **M3 — unwrap scope** (student sites only, NOT teacher/pre-wrap) | `orch:328,428,447,869,1056,1218`; `early_stop:140,497`; `teacher:588,675`; `vocab_kd:231` | `unwrap_student` ONLY at these; leave `orch:149`, `teacher:161`, `teacher:709` as-is (Task 2) |
 | compile + DDP ordering | `:359-368` | pin `DDP(compile(m))` (Task 5) |
 | no_sync on grad-accum | `:850` | `no_sync()` on non-boundary microbatch (Task 5) |
-| Default path must stay byte-identical | whole loop | `ddp=None` short-circuit + golden guardrail (Task 1/9) |
+| Default path runs identical op stream (NOT a weight-byte claim) | whole loop | `ddp=None` short-circuit; metadata-byte+loss-tol golden + optional byte A/B (Task 1/9) |
 
 ---
+
+## Resolved (was open) — now load-bearing design
+- **Student source per rank (was OQ#2 → RESOLVED, H1).** The parent serializes the LIVE
+  compressed student to a temp dir via `save_compressed_checkpoint`; each child
+  reconstructs it via `load_compressed_model` (Task 8). NOT `load_model(original_repo)`.
+  An `allclose` equivalence test guards that the reload matches the parent's pre-spawn
+  weights. This is no longer an open question — it is the Task-8 design.
 
 ## Open questions (need a decision before / during implementation)
 1. **Default recipe is `epochs=2` → no cache → the FAITHFUL teacher path (A) is
@@ -734,23 +927,17 @@ clear "not yet supported" error** (add a guard in the DDP branch when
    faithful cache? The plan REQUIRES an explicit choice (Task 7 raises otherwise) but does
    not pick the project default. **Recommendation: for the FAITHFUL result, run DDP only
    at epochs=1 + cache; use 4-bit teacher DDP only with sign-off.**
-2. **Student source per rank.** Task 8 re-loads the student in each child from
-   `config["model"]["name_or_path"]`. But at Stage 5 the student is the Stage-4 OUTPUT
-   (post-EoRA), not the original checkpoint — confirm the caller passes the Stage-4 output
-   dir as the student source (or that each rank can reconstruct it). The single-process
-   path receives the live `student` object; DDP must materialize the SAME weights per rank.
-   **Needs the run_pipeline wiring decision** (does `_spawn_ddp_workers` get a path, or do
-   we save+reload the live student to a temp dir first?).
-3. **`world_size > global_batch`.** With the paper `batch_size=2`, DDP caps at
-   `world_size=2` unless `grad_accum` is co-scaled down (keeping effective batch fixed).
-   Should the plan implement automatic grad_accum co-scaling, or just reject and require
-   the operator to raise `batch_size` to a multiple of `world_size`? (Task 0 currently
-   REJECTS; co-scaling is a possible enhancement but adds result-preservation surface.)
-4. **NCCL determinism for the LIVE result-preservation check.** The CPU `gloo` gate
+2. **`world_size > global_batch`.** With the paper `batch_size=2`, DDP caps at
+   `world_size=2` (row-split needs `per_gpu = batch_size // world_size >= 1`). Should the
+   plan implement automatic grad_accum co-scaling to allow more GPUs at fixed effective
+   batch, or just reject and require the operator to raise `batch_size` to a multiple of
+   `world_size`? (Task 0 currently REJECTS; co-scaling is a possible enhancement but adds
+   result-preservation surface.)
+3. **NCCL determinism for the LIVE result-preservation check.** The CPU `gloo` gate
    (Task 10) proves the math; a live NCCL run on real H200s should be spot-checked
    (1-GPU vs 2-GPU final loss within tolerance) before trusting a production science run.
    Defer to first real run, or block on a dedicated 2-GPU validation?
-5. **`find_unused_parameters=False`** assumes every trainable router param participates
+4. **`find_unused_parameters=False`** assumes every trainable router param participates
    every step. Confirm no architecture variant (e.g. a layer whose router is frozen by a
    `frozen_name_patterns` quirk) leaves a trainable-but-unused param — would error under
    DDP. (Router-only scope makes this unlikely; verify on the target model.)
