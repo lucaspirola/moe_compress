@@ -349,6 +349,10 @@ class LayerMergePlugin:
         "assigned_cost", "n_assigned", "c_fail", "em_rounds_done",
         "effective_cost_alignment", "effective_cost_asymmetric",
         "capacity_util_value", "effective_target", "mean_assigned_cost",
+        # Feature A (DP profile) — run-scope slots, present only when profile_dp
+        # resolved enabled; absent ⇒ serial path (default-off, byte-identical).
+        "profile_dp_pool", "profile_dp_seq_len", "profile_dp_spill_root",
+        "profile_dp_prev_layer",
     )
     writes: tuple[str, ...] = (
         "ream_acc", "perm_cache", "layer_input_acc",
@@ -526,6 +530,37 @@ class LayerMergePlugin:
         # bypass the monkey-patch.
         from .. import orchestrator as _srr
         layer_ref = ctx.get("layer_ref")
+
+        # A4 — DP-or-serial branch. The persistent pool + DP state are set on the
+        # RUN-scope ctx by the orchestrator ONLY when profile_dp resolved enabled
+        # (replicas>1, no reservoir consumer). Absent ⇒ the serial path below,
+        # byte-identical (default-off gate). The DP branch RESYNCs the workers with
+        # the just-merged upstream layer (barrier), profiles this layer across
+        # sequence-disjoint shards, and reduces the four accumulators into the
+        # parent's reap/cov/ream — leaving assign/merge to run exactly as serial.
+        pool = ctx.get("profile_dp_pool") if ctx.has("profile_dp_pool") else None
+        if pool is not None:
+            from .. import profile_dp as _pdp
+            seq_len = ctx.get("profile_dp_seq_len")
+            spill_root = ctx.get("profile_dp_spill_root")
+            cov_dtype = self.cov_acc.storage_dtype
+            prev = ctx.get("profile_dp_prev_layer") if ctx.has("profile_dp_prev_layer") else None
+            prev_idx = prev[0] if prev is not None else None
+            prev_path = prev[1] if prev is not None else None
+            _pdp.run_dp_profile_layer(
+                pool, layer_ref,
+                reap_acc=ctx.get("reap_acc"), cov_acc=self.cov_acc,
+                ream_acc=ctx.get("ream_acc"),
+                spill_root=spill_root, seq_len=seq_len,
+                cov_storage_dtype=cov_dtype,
+                prev_layer_idx=prev_idx, prev_layer_payload_path=prev_path,
+            )
+            # The DP reduce loaded an already-finalized cov off disk (the reduce
+            # owns the storage-dtype cast — Open-Q2); the parent finalize_layer is
+            # a no-op (nothing in _pending). Skip it to avoid touching the loaded
+            # cov.
+            return
+
         _srr._profile_layer(
             self.model, layer_ref, self.batches,
             ctx.get("reap_acc"), self.cov_acc, ctx.get("ream_acc"),
