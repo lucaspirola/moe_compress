@@ -581,6 +581,52 @@ def _resolve_worker_devices(worker_devices, n: int, home_device) -> list:
     return [home_device for _ in range(n)]
 
 
+class _AnchoredAdaptiveLookup:
+    """anchored_adaptive whitening: blend anchor + shift into a single [d,d]
+    cov for the EoRA √Λ basis. Reduction (NOT the full AA-SVD M=W·C·S⁻¹·R —
+    that needs cross-cov C and a different kernel; see plan §9 open question).
+    The blend is A_eff = A_anchor (when shift missing) else
+    0.5*(A_anchor+A_shift), keeping EoRA's single-cov contract."""
+
+    def __init__(self, A_cov, shift_cov):
+        self._a, self._s = A_cov, shift_cov or {}
+
+    def get(self, key):
+        a = self._a.get(key)
+        s = self._s.get(key)
+        if a is None:
+            return s
+        if s is None:
+            return a
+        return 0.5 * (a.to(torch.float32) + s.to(torch.float32))
+
+
+def _resolve_whitening_lookup(whitening_cov: str, A_cov, shift_cov):
+    """Select the EoRA whitening covariance dict per stage4_eora.whitening_cov.
+
+    'anchor' (default) -> the original-calibration anchor A_cov (byte-identical
+    to historical behaviour; the SAME object). 'shift' -> the post-2.5 SHIFT
+    cov (upstream-EoRA-faithful; spec 2026-06-13-acov-capture-point.md).
+    'anchored_adaptive' -> _AnchoredAdaptiveLookup(A_cov, shift_cov) (plan §7).
+    Unknown value raises.
+    """
+    if whitening_cov == "anchor":
+        return A_cov
+    if whitening_cov == "shift":
+        if not shift_cov:
+            raise ValueError(
+                "stage4_eora.whitening_cov='shift' but no shift_cov was loaded "
+                "(EoraInputsPlugin did not populate it — wiring bug)."
+            )
+        return shift_cov
+    if whitening_cov == "anchored_adaptive":
+        return _AnchoredAdaptiveLookup(A_cov, shift_cov)
+    raise ValueError(
+        f"stage4_eora.whitening_cov must be 'anchor', 'shift', or "
+        f"'anchored_adaptive', got {whitening_cov!r}"
+    )
+
+
 class EoraCompensationPlugin:
     """Stage 4 EoRA residual-compensation plugin (S4-3 — registered-but-INERT).
 
@@ -622,6 +668,9 @@ class EoraCompensationPlugin:
         # N-GPU lever 1: task-parallel EoRA worker count (+ optional explicit
         # device list seam). Both optional — absent ⇒ serial single-GPU path.
         "eora_workers", "eora_worker_devices",
+        # Optional: the post-2.5 shift cov for whitening_cov in {shift,
+        # anchored_adaptive}. Absent ⇒ default "anchor" path (A_cov).
+        "shift_cov",
     )
     # ``rank_map`` is a shared mutable dict the hook MUTATES in place across
     # loop iterations (mirror of ``aa_svd_factor.factor_layer``'s HAZARD H1)
@@ -685,6 +734,13 @@ class EoraCompensationPlugin:
 
         s4 = config["stage4_eora"]
         log_residuals = bool(s4.get("log_residuals", False))
+        # Whitening-cov selection (default "anchor" -> whitening_lookup IS
+        # A_cov -> _inputs_for byte-identical to history).
+        whitening_cov = str(s4.get("whitening_cov", "anchor"))
+        shift_cov = ctx.get("shift_cov") if ctx.has("shift_cov") else None
+        whitening_lookup = _resolve_whitening_lookup(
+            whitening_cov, A_cov, shift_cov
+        )
         fe = ref.experts_module
         if not isinstance(fe, FactoredExperts):
             return
@@ -762,7 +818,7 @@ class EoraCompensationPlugin:
                        fe.down_proj_V.data[e]
                 # up_proj shares the gate_proj input covariance (same fused tensor).
                 cov_key = (ref.layer_idx, e, "gate_proj") if name == "up_proj" else key
-                A = A_cov.get(cov_key)
+                A = whitening_lookup.get(cov_key)
                 return W_orig, U_e, V_e, A
 
             # Resolve the effective per-layer worker count + the device each
