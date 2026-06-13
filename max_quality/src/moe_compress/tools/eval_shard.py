@@ -107,9 +107,34 @@ def _merge_completions(shard_results):
     return merged
 
 
+def _merge_ppl(partials):
+    """Merge per-shard ``(nll_sum, tok_count)`` partials into the global PPL.
+
+    Sums the disjoint partials and returns ``exp(sum_nll / sum_tok)``. Exact
+    because the per-row forward is BATCH_INVARIANT and the ``mean_loss *
+    (numel - n_rows)`` rescale recovers the true NLL sum (wikitext_ppl.py:260).
+    Carries the SAME guards as wikitext_ppl.py:273-295: ``tok_count == 0 -> inf``
+    (PPL undefined) and ``OverflowError -> inf``.
+    """
+    import math
+
+    sum_nll = 0.0
+    sum_tok = 0
+    for nll, tok in partials:
+        sum_nll += float(nll)
+        sum_tok += int(tok)
+    if sum_tok == 0:
+        return float("inf")
+    try:
+        return math.exp(sum_nll / sum_tok)
+    except OverflowError:
+        return float("inf")
+
+
 __all__ = [
     "PINNED_GEN_BATCH_SIZE",
     "_group_aligned_split",
     "_even_split",
     "_merge_completions",
+    "_merge_ppl",
 ]
