@@ -1111,6 +1111,18 @@ class InputCovarianceAccumulator:
                     ).to(storage_dtype)
                 self.token_count[k] = self.token_count.get(k, 0) + n_tok
 
+    def discard_layer(self, layer_idx: int) -> None:
+        # Pop every in-flight ``_pending`` entry (and its token count) for this
+        # layer WITHOUT accumulating into ``self.covariance``. Mirrors
+        # ``finalize_layer``'s Phase-1 pop loop minus the CPU accumulate so an
+        # OOM-retry can reset a window's in-flight Gram before re-running the
+        # forwards — preventing double-counting on the retry.
+        with self._lock:
+            keys = [k for k in self._pending if k[0] == layer_idx]
+            for k in keys:
+                self._pending.pop(k)
+                self._gpu_token_count.pop(k, 0)
+
     def finalize_all(self) -> None:
         # Snapshot of layer_ids is taken at call time; layers added concurrently
         # after the snapshot are silently skipped. This is safe when called after

@@ -156,11 +156,25 @@ from ...utils.activation_hooks import (
     capture_experts,
     instrument_experts,
 )
+from ...utils.auto_batch import (
+    AutoBatchConfig,
+    CudaMemProbe,
+    run_with_oom_backoff,
+    size_batch,
+)
+from ...utils.calibration import iter_batches
 from ...utils.futures import drain_done_futures as _drain_done_futures
 from ...utils.trackio_log import trackio_log as _trackio_log
 from ...pipeline.context import PipelineContext
 
 log = logging.getLogger(__name__)
+
+# Cov-specific BACKSTOP cap on the auto-sized forward batch, in *sequences*
+# (NOT v1's 4096 default — a 4096-seq dual-forward over G window layers, each
+# holding a full ``[T, d_in]`` fp32 teacher tensor, would OOM-backoff
+# repeatedly). ``size_batch``'s ``headroom_frac`` VRAM fit is the real limiter;
+# this is only an upper clamp so a degenerate probe can't return an absurd bs.
+_COV_MAX_CAP = 256
 
 
 def _proc_rss_gb() -> float | None:
@@ -357,9 +371,15 @@ def _resolve_cov_batch_size(s3: dict) -> int:
 
       * absent              → inherits ``batch_size`` (no behavior change).
       * explicit int / str  → passes through (operator opt-in on a sharded box).
-      * ``"auto"``          → on a real ≥2-GPU sharded box, probe free VRAM and
-        pick a conservative bs; on CPU / 1-GPU it DEGRADES to the inherited
-        ``batch_size`` (NO raise), keeping the 1-GPU golden byte-identical.
+      * ``"auto"``          → this resolver returns the inherited floor; the
+        VRAM-auto-sizing happens in ``_collect_covariances`` (gated by
+        ``_cov_is_auto`` = ``cov_batch_size=="auto"`` AND ``auto_batch.enabled``),
+        which probes free VRAM with the G window resident, auto-sizes the cov
+        forward batch, and OOM-backs-off to this floor (=1). Auto-sizing is
+        1-GPU only; on a DP (≥2-GPU) box the worker stays on the inherited int
+        (min-agreement across replicas is a later step). The returned int is
+        always positive (it is the backoff ``floor`` + the non-auto fallback);
+        ``_resolve_cov_batch_size`` never returns the ``"auto"`` sentinel.
 
     Reduction-pin (per-sequence grouping): with the cov Gram now accumulated via
     the per-sequence pinned split (``InputCovarianceAccumulator.update_grouped``,
@@ -377,22 +397,25 @@ def _resolve_cov_batch_size(s3: dict) -> int:
         drift. This is quality-neutral.
 
     So a bigger cov batch is now quality-neutral rather than golden-breaking as it
-    was before the pin. The DEFAULT still preserves the inherited value (returns
-    ``1`` / inherited) so the bs=1 golden stays byte-identical; nothing below
-    raises bs.
+    was before the pin (gate_proj/up B + cross-cov C bitwise; factored down_proj B
+    allclose ~1e-6). The DEFAULT (int / inherited, no ``"auto"``) still returns
+    ``1`` / inherited so the bs=1 golden stays byte-identical; nothing below
+    raises bs and the auto path never runs.
 
-    NOTE: this resolver is NOT yet wired into the cov capture — threading the
-    auto-batch resolver (``size_batch`` / ``run_with_oom_backoff``) into cov
-    collection is a SEPARATE follow-on (the next v2 plan), not done here. Today
-    the value still comes from config and ``"auto"`` degrades to inherited.
+    Auto-batch (v2 step 2): when ``cov_batch_size=="auto"`` AND
+    ``auto_batch.enabled`` (see ``_cov_is_auto``), ``_collect_covariances`` probes
+    VRAM with the G window resident, auto-sizes the cov forward batch, and
+    OOM-backs-off to ``floor=1`` (this resolver supplies that floor). 1-GPU only;
+    the DP worker path keeps returning the inherited int until cross-replica
+    min-agreement lands.
 
     Compound-peak constraint (plan M2): the A1×A4×A6 dense-teacher peak is
     ``G · cov_bs · seq · d_in · 4`` bytes per hot device (every G window layer
-    holds a full ``[T, d_in]`` fp32 teacher tensor, T = cov_bs·seq). The
-    ``"auto"`` raise MUST budget THIS, not just the forward activation, or it
-    can OOM the hot device precisely when it raises bs. The VRAM-measured raise
-    is DEFERRED to a real ≥2-GPU box; until then ``"auto"`` returns the
-    inherited value, so this resolver never raises bs off-box.
+    holds a full ``[T, d_in]`` fp32 teacher tensor, T = cov_bs·seq). The auto
+    sizing budgets THIS (not just the forward activation) because ``size_batch``
+    probes the live ``max_memory_allocated`` with the G window already resident,
+    so the probe baseline absorbs the G commitment; OOM-backoff to ``floor=1``
+    is the safety net if the sized bs still over-commits the hot device.
     """
     inherited = int(s3.get("batch_size", 1))
     req = s3.get("cov_batch_size", inherited)
@@ -420,6 +443,23 @@ def _resolve_cov_batch_size(s3: dict) -> int:
     return int(req)
 
 
+def _cov_is_auto(s3: dict) -> bool:
+    """True iff the cov forward batch should be VRAM-auto-sized (v2 step 2).
+
+    DOUBLE-gated (Review H1, mirrors ``ma_detection``): the auto path fires only
+    when ``stage3_svd.cov_batch_size == "auto"`` AND
+    ``AutoBatchConfig.from_dict(stage3_svd.auto_batch).enabled`` is true. Either
+    condition absent → False → the original bs=``_resolve_cov_batch_size`` loop
+    runs unchanged (no probe, no backoff wrapper) → stage3 golden byte-identical.
+    ``_resolve_cov_batch_size`` itself is UNCHANGED and still returns a positive
+    int floor (used as the backoff ``floor`` and the non-auto fallback).
+    """
+    return (
+        s3.get("cov_batch_size") == "auto"
+        and AutoBatchConfig.from_dict(s3.get("auto_batch")).enabled
+    )
+
+
 # ---------------------------------------------------------------------------
 # Post-prune input covariance (for AA-SVD B matrix)
 # ---------------------------------------------------------------------------
@@ -435,6 +475,9 @@ def _collect_covariances(
     cov_window_size: int = 1,
     cov_capture_mode: str = "capture",
     cov_cross_impl: str = "dense",
+    calib=None,
+    cov_auto: bool = False,
+    auto_batch_cfg: AutoBatchConfig | None = None,
 ) -> None:
     """Collect post-prune input covariance S and (optionally) cross-covariance C.
 
@@ -507,6 +550,16 @@ def _collect_covariances(
             f"(legacy, retained only for the A4 equivalence test), "
             f"got {cov_cross_impl!r}"
         )
+    if cov_auto and calib is None:
+        raise ValueError(
+            "_collect_covariances: cov_auto=True requires the calib tensor "
+            "(the auto path re-slices iter_batches(calib, batch_size=cov_bs))"
+        )
+    # Backoff floor + sized batch (auto path). ``cov_floor`` is the proven-safe
+    # bs=1 forward (also the non-auto golden setting); ``run_with_oom_backoff``
+    # never drops below it and ``size_batch``'s ``fixed_batch`` is this floor.
+    cov_floor = 1
+    cov_bs: int | None = None  # lazily sized on the first non-skipped window
 
     # --- Storage for teacher's per-layer hidden states (for cross-cov) ---
     # A4 (default ``cov_cross_impl="dense"``): one dense ``[T, d_in]`` fp32
@@ -816,35 +869,123 @@ def _collect_covariances(
                             )
                         )
 
-            with stack:
-                for batch_idx, batch in enumerate(batches):
-                    if device is not None:
-                        batch = batch.to(device)
-                    # Clear per-BATCH (not per-layer): the teacher stores hold
-                    # all G window layers' teacher rows for this batch's student
-                    # forward, then are dropped before the next batch (PLAN §4.2).
-                    # ``_teacher_T`` = rows*seq is threaded into the dense-path
-                    # closures so each layer's lazily-allocated ``[T, d_in]``
-                    # tensor is sized for THIS batch.
+            if not cov_auto:
+                # ---- NON-AUTO PATH (default): the original loop, VERBATIM ----
+                # No nonlocal / probe / backoff wrapper. ``_teacher_T`` /
+                # ``_seq_len`` are assigned at the ``_collect_covariances`` scope
+                # here, so the cov callbacks read them correctly as free vars.
+                # This branch is provably byte-identical to the pre-wiring code.
+                with stack:
+                    for batch_idx, batch in enumerate(batches):
+                        if device is not None:
+                            batch = batch.to(device)
+                        # Clear per-BATCH (not per-layer): the teacher stores hold
+                        # all G window layers' teacher rows for this batch's
+                        # student forward, then are dropped before the next batch
+                        # (PLAN §4.2). ``_teacher_T`` = rows*seq is threaded into
+                        # the dense-path closures so each layer's lazily-allocated
+                        # ``[T, d_in]`` tensor is sized for THIS batch.
+                        _teacher_hidden.clear()
+                        _teacher_dense.clear()
+                        _teacher_filled.clear()
+                        _teacher_T = int(batch.shape[0]) * int(batch.shape[1])
+                        # Cov reduction-pin seam: the per-sequence length for THIS
+                        # batch. ``iter_batches`` slices rows only, so ``seq_len``
+                        # is uniform across the batch. The cov callbacks (closures)
+                        # read this free var to split each expert's captured rows
+                        # by source sequence (``seq_id = token_idx // _seq_len``)
+                        # and accumulate the Gram in sequence-ascending order,
+                        # making the accumulation independent of the cov forward
+                        # batch size. At ``cov_batch_size=1`` (the golden's
+                        # setting) every captured row shares one seq id → the split
+                        # is a no-op → byte-identical.
+                        _seq_len = int(batch.shape[1])
+                        if teacher_model is not None:
+                            with torch.no_grad():
+                                teacher_model(input_ids=batch)
+                        with torch.no_grad():
+                            model(input_ids=batch)
+            else:
+                # ---- AUTO PATH (cov_batch_size:"auto" + auto_batch.enabled) ----
+                # VRAM-auto-size the cov forward batch with the G window resident
+                # (so ``CudaMemProbe.allocated()`` baseline absorbs the G
+                # commitment), then run the dual-forward block under OOM-backoff.
+                # Per-window helpers used by BOTH the probe and the backoff run.
+                def _clear_teacher():
                     _teacher_hidden.clear()
                     _teacher_dense.clear()
                     _teacher_filled.clear()
-                    _teacher_T = int(batch.shape[0]) * int(batch.shape[1])
-                    # Cov reduction-pin seam: the per-sequence length for THIS
-                    # batch. ``iter_batches`` slices rows only, so ``seq_len`` is
-                    # uniform across the batch. The cov callbacks (closures) read
-                    # this free var to split each expert's captured rows by
-                    # source sequence (``seq_id = token_idx // _seq_len``) and
-                    # accumulate the Gram in sequence-ascending order, making the
-                    # accumulation independent of the cov forward batch size. At
-                    # ``cov_batch_size=1`` (the golden's setting) every captured
-                    # row shares one seq id → the split is a no-op → byte-identical.
-                    _seq_len = int(batch.shape[1])
-                    if teacher_model is not None:
-                        with torch.no_grad():
-                            teacher_model(input_ids=batch)
-                    with torch.no_grad():
-                        model(input_ids=batch)
+
+                def _discard_window():
+                    # Idempotent reset of this window's in-flight Gram so an
+                    # aborted attempt (OOM) or the cost probe never double-counts.
+                    for _dk, _dref in to_collect:
+                        B_acc.discard_layer(_dref.layer_idx)
+                        if C_acc is not None:          # None when cross-cov off
+                            C_acc.discard_layer(_dref.layer_idx)
+
+                with stack:
+                    if cov_bs is None:
+                        # Probe ONCE, on the first non-skipped window, with the G
+                        # hooks installed (G resident). Cache for all windows (G
+                        # constant → per-forward peak window-independent).
+                        def cost_probe_fn(mb):
+                            # CRITICAL (Review C1): the cov callbacks read
+                            # ``_teacher_T`` / ``_seq_len`` as free vars of
+                            # ``_collect_covariances``; without ``nonlocal`` a
+                            # nested assignment makes them locals → callbacks see
+                            # ``_seq_len == 0`` → the per-sequence PIN silently
+                            # dies (un-pinned ``update``, cross-cov ``// 0``).
+                            nonlocal _teacher_T, _seq_len
+                            _discard_window(); _clear_teacher()
+                            torch.cuda.reset_peak_memory_stats(device)
+                            b = calib[:mb]
+                            if device is not None:
+                                b = b.to(device)
+                            _teacher_T = int(b.shape[0]) * int(b.shape[1])
+                            _seq_len = int(b.shape[1])
+                            with torch.no_grad():
+                                if teacher_model is not None:
+                                    teacher_model(input_ids=b)
+                                model(input_ids=b)
+                            return int(torch.cuda.max_memory_allocated(device))
+
+                        # Clean baseline BEFORE size_batch (no in-flight Gram).
+                        _discard_window(); _clear_teacher()
+                        ab = auto_batch_cfg or AutoBatchConfig()
+                        cov_bs = size_batch(
+                            cost_probe_fn, cov_floor,
+                            headroom_frac=ab.headroom_frac,
+                            max_cap=_COV_MAX_CAP,
+                            mem=CudaMemProbe(device),
+                        )
+                        # The probe's Gram must NOT contaminate the real run.
+                        _discard_window(); _clear_teacher()
+                        log.info(
+                            "Stage 3 cov auto-batch: sized cov_bs=%d (floor=%d, "
+                            "max_cap=%d)", cov_bs, cov_floor, _COV_MAX_CAP,
+                        )
+
+                    def run_window_forwards(bs):
+                        # CRITICAL (Review C1): callbacks read these as free vars.
+                        nonlocal _teacher_T, _seq_len
+                        # Idempotent: reset any aborted attempt's in-flight Gram
+                        # before (re-)running, so OOM-retry never double-counts.
+                        _discard_window()
+                        for batch in iter_batches(calib, batch_size=bs):
+                            if device is not None:
+                                batch = batch.to(device)
+                            _clear_teacher()
+                            _teacher_T = int(batch.shape[0]) * int(batch.shape[1])
+                            _seq_len = int(batch.shape[1])
+                            with torch.no_grad():
+                                if teacher_model is not None:
+                                    teacher_model(input_ids=batch)
+                                model(input_ids=batch)
+
+                    run_with_oom_backoff(
+                        run_window_forwards, start_batch=cov_bs, floor=cov_floor,
+                    )
 
             # Finalize + spill every collected layer in the window.
             for _k, ref in to_collect:
@@ -1039,6 +1180,13 @@ def _cov_replica_worker(
         C_acc=C_acc,
         ccov_spill_dir=_Path(ccov_replica_dir) if ccov_replica_dir is not None else None,
         cov_window_size=cov_window_size,
+        # DP worker stays on the inherited-int path (cov_auto=False): the
+        # cross-replica reduce sums finalized fp32 Grams key-wise, so it is
+        # bs-agnostic and byte-identical. ``calib`` is threaded for signature
+        # parity (the auto path would re-slice it); ``auto_batch_cfg`` is unused
+        # here. DP-auto (min-agreement) is a later step.
+        calib=shard,
+        cov_auto=False,
     )
 
 
@@ -1206,7 +1354,7 @@ class CovarianceCollectionPlugin:
     reads: tuple[str, ...] = (
         "model", "moe_layers", "batches", "B_acc", "device",
         "bcov_spill_dir", "teacher_model", "teacher_moe_layers",
-        "C_acc", "ccov_spill_dir", "cov_window_size",
+        "C_acc", "ccov_spill_dir", "cov_window_size", "calib",
     )
     writes: tuple[str, ...] = ("B_acc", "C_acc")
     provides: tuple[str, ...] = ()
@@ -1261,5 +1409,19 @@ class CovarianceCollectionPlugin:
             ),
             cov_window_size=(
                 ctx.get("cov_window_size") if ctx.has("cov_window_size") else 1
+            ),
+            # v2 step 2 (Review C2/H1): thread ``calib`` + the double-gated auto
+            # flag so the auto path can re-slice ``iter_batches(calib, cov_bs)``.
+            # ``calib`` is on run_ctx (orchestrator). The gate is DOUBLE: the
+            # cov-specific ``cov_batch_size:"auto"`` AND ``auto_batch.enabled``.
+            # Default (no "auto") → cov_auto False → original loop, no probe.
+            calib=ctx.get("calib") if ctx.has("calib") else None,
+            cov_auto=_cov_is_auto(
+                ctx.get("config").get("stage3_svd", {})
+                if ctx.has("config") else {}
+            ),
+            auto_batch_cfg=AutoBatchConfig.from_dict(
+                ctx.get("config").get("stage3_svd", {}).get("auto_batch")
+                if ctx.has("config") else None
             ),
         )

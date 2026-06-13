@@ -199,9 +199,15 @@ def run(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache"
     )
     # A6: cov-specific batch size. Defaults to the inherited ``batch_size`` so
-    # the 1-GPU golden is untouched; an operator can raise ``cov_batch_size`` on
-    # a sharded box (or set ``"auto"``, which degrades to the inherited value
-    # off a real ≥2-GPU box). See ``_resolve_cov_batch_size``.
+    # the 1-GPU golden is untouched (default int / inherited → byte-identical,
+    # auto path never runs); an operator can raise ``cov_batch_size`` to an int
+    # on a sharded box. Set ``cov_batch_size: "auto"`` (+ ``auto_batch.enabled``)
+    # to VRAM-auto-size the cov forward batch: ``_collect_covariances`` probes
+    # free VRAM with the G window resident, sizes the batch, and OOM-backs-off
+    # to floor=1 (gate_proj/up B + cross-cov C stay bitwise, factored down_proj B
+    # allclose ~1e-6 per the reduction pin). Auto is 1-GPU only — the DP worker
+    # path returns the inherited int until cross-replica min-agreement lands.
+    # See ``_resolve_cov_batch_size`` / ``_cov_is_auto``.
     from .plugins.covariance_collection import _resolve_cov_batch_size
     bcov_batch_size = _resolve_cov_batch_size(s3)
     batches = iter_batches(calib, batch_size=bcov_batch_size)
