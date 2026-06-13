@@ -137,6 +137,16 @@ from ...pipeline.context import PipelineContext
 from ...tools.dtype_noise_floor import _NOISE_FLOOR_BY_DTYPE  # noqa: F401
 from ...utils.model_io import MATRIX_NAMES, FactoredExperts
 from ...utils.trackio_log import trackio_log as _trackio_log
+# Lever 2 (per-expert SVD factor task-parallel): reuse the stage-agnostic EoRA
+# concurrency engine in place (plan Q1 = reuse, NOT relocate). The import is one
+# direction (stage3 → stage4); ``eora_compensation`` imports nothing from
+# stage3, so there is no cycle. The engine bands per-expert solves by ORDINAL,
+# runs each band on its own thread, and returns ``{e: payload}`` (disjoint keys)
+# for the caller's ascending-e main-thread assembly.
+from ...stage4.plugins.eora_compensation import (
+    _resolve_worker_devices,
+    _run_expert_bands,
+)
 
 log = logging.getLogger(__name__)
 
@@ -610,6 +620,17 @@ class AaSvdFactorPlugin:
         # in which case the load falls back to the serial path below.
         bcov_prefetcher = ctx.get("bcov_prefetcher") if ctx.has("bcov_prefetcher") else None
         all_moe_layers = ctx.get("moe_layers") if ctx.has("moe_layers") else None
+        # Lever 2 (per-expert SVD factor task-parallel): the orchestrator
+        # resolves the effective worker count + (optionally) an explicit
+        # worker-device list onto the ctx. ``factor_workers <= 1`` (or absent) ⇒
+        # the serial in-process path below, byte-identical to single-GPU today.
+        # ``factor_worker_devices`` is a test/integration seam (e.g.
+        # ["cuda:0","cuda:1"], or ["cpu","cpu"] for the CI stand-in); absent +
+        # workers>1 ⇒ derive ascending CUDA devices.
+        factor_workers = int(ctx.get("factor_workers")) if ctx.has("factor_workers") else 1
+        factor_worker_devices = (
+            ctx.get("factor_worker_devices") if ctx.has("factor_worker_devices") else None
+        )
 
         # ---- VERBATIM per-layer factoring loop body from the monolith run() --
         # When Swift-SVD+ gives per-expert ranks, allocate at the max rank
@@ -704,78 +725,83 @@ class AaSvdFactorPlugin:
         err_sum: dict[str, float] = {n: 0.0 for n in MATRIX_NAMES}
         n_per_matrix: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
         k_eff_clip_count: dict[str, int] = {n: 0 for n in MATRIX_NAMES}
-        for e in range(ref.num_routed_experts):
-            # --- Precompute shared eigh for gate_proj / up_proj ---
-            B_shared = _cov_lookup(B_acc.covariance, ref.layer_idx, e, "gate_proj")
-            A_shared = _cov_lookup(A_cov, ref.layer_idx, e, "gate_proj")
-            C_shared = None
-            if C_acc is not None:
-                C_shared = _cov_lookup(C_acc.covariance, ref.layer_idx, e, "gate_proj")
-            gate_up_decomp: _EighDecomp | None = None
-            if B_shared is not None:
-                try:
-                    gate_up_decomp = _precompute_eigh(
-                        B_shared, A_shared, C_shared,
-                        device=dev, storage_dtype=B_cov_dtype,
-                    )
-                except ValueError:
-                    pass  # falls through to plain SVD per matrix below
 
+        # Lever 2 (per-expert SVD factor task-parallel): each expert's
+        # per-(matrix) AA-SVD solve is a PURE function of that expert's tensors
+        # (``_factor_expert_tile``), so the ~200-expert inner loop fans across
+        # worker devices via the EoRA band engine. The order-sensitive writes —
+        # ``set_factors`` / ``rank_map`` / the log-only err/n/clip accumulators —
+        # stay on the MAIN thread in ascending-e AFTER join (mirror EoRA's
+        # ascending-e assembly), so worker completion order is unobservable and
+        # the output is byte-identical to the serial loop. ``factor_workers<=1``
+        # (default) ⇒ one band ⇒ inline (no thread), byte-identical to today.
+        #
+        # The cov ``.covariance`` dicts are read INSIDE the tile (the main thread
+        # keeps owning per-layer load/unload + the prefetcher — never the tile).
+        B_cov = B_acc.covariance
+        C_cov = C_acc.covariance if C_acc is not None else None
+        eligible = list(range(ref.num_routed_experts))
+
+        # Resolve the effective worker count + the device each expert is solved
+        # on. ``effective_workers<=1`` ⇒ every expert on ``dev`` in serial order
+        # (byte-identical golden path); >1 ⇒ contiguous bands across the worker
+        # devices (deterministic, reproducible run-to-run). Mirror EoRA exactly.
+        effective_workers = min(factor_workers, max(1, len(eligible)))
+        if effective_workers > 1:
+            devices = _resolve_worker_devices(factor_worker_devices, effective_workers, dev)
+            effective_workers = min(effective_workers, len(devices))
+        if effective_workers <= 1:
+            device_of = {e: dev for e in eligible}
+            bands = [(0, eligible)]
+        else:
+            device_of = {}
+            per = (len(eligible) + effective_workers - 1) // effective_workers
+            for w in range(effective_workers):
+                for e in eligible[w * per:(w + 1) * per]:
+                    device_of[e] = devices[w]
+            # Bands by ORDINAL w (C1): two workers mapping to the same device
+            # object (the CPU ["cpu","cpu"] seam) remain distinct bands.
+            bands = [
+                (w, eligible[w * per:(w + 1) * per])
+                for w in range(effective_workers)
+            ]
+            bands = [(w, ex_) for (w, ex_) in bands if ex_]
+
+        def _solve_one(e, tgt):
+            # Pure per-expert solve on ``tgt``; gather each tile to the home
+            # device INSIDE this worker thread (overlaps the next band). The
+            # engine's ``solve_one`` contract is a fixed 6-tuple (EoRA-shaped);
+            # pack the 3-matrix tile dict into slot 0, ``None`` for the rest
+            # (Q2 — zero engine change).
+            tiles = _factor_expert_tile(
+                ref.layer_idx, e, tgt,
+                originals=originals, A_cov=A_cov, B_cov=B_cov, C_cov=C_cov,
+                per_expert_ranks=per_expert_ranks, ranks_layer=ranks_layer,
+                B_cov_dtype=B_cov_dtype,
+            )
+            home = {
+                name: (U.to(device=dev), V.to(device=dev), keff, k, rel_err)
+                for name, (U, V, keff, k, rel_err) in tiles.items()
+            }
+            return home, None, 0, None, None, None
+
+        band_results = _run_expert_bands(
+            bands, device_of, _solve_one,
+            name="factor",
+            set_gate_spectrum=lambda e, s: None,   # no cross-thread memo (matrix-inner)
+            concurrent=(effective_workers > 1),
+        )
+
+        # Deterministic ascending-e main-thread assembly (the byte-identity
+        # guarantee): set_factors + rank_map + the log-only accumulators, exactly
+        # the serial fill order. ``band_results[e][0]`` is the per-matrix tile
+        # dict (slot 0 of the engine's 6-tuple).
+        for e in eligible:
+            tiles = band_results[e][0]
             for name in MATRIX_NAMES:
-                W = originals[(ref.layer_idx, e, name)].to(device=dev, dtype=torch.float32)
-                # Per-expert rank from Swift-SVD+ if available, else group-uniform.
-                if per_expert_ranks is not None:
-                    k = per_expert_ranks.get((ref.layer_idx, name, e), ranks_layer[name])
-                else:
-                    k = ranks_layer[name]
-                if name in ("gate_proj", "up_proj") and gate_up_decomp is not None:
-                    # Reuse the precomputed eigh for gate_proj and up_proj.
-                    U_k, V_k, rel_err, k_eff = _aa_svd_precomputed(
-                        W, gate_up_decomp, k, device=dev,
-                    )
-                else:
-                    # down_proj has its own B (intermediate-dim covariance),
-                    # or gate_up_decomp failed — fall back to full _aa_svd.
-                    A = _cov_lookup(A_cov, ref.layer_idx, e, name)
-                    B = _cov_lookup(B_acc.covariance, ref.layer_idx, e, name)
-                    C = None
-                    if C_acc is not None:
-                        C = _cov_lookup(C_acc.covariance, ref.layer_idx, e, name)
-                    U_k, V_k, rel_err, k_eff = _aa_svd(
-                        W, A, B, k, C=C, device=dev, storage_dtype=B_cov_dtype,
-                    )
+                U_k, V_k, k_eff, k, rel_err = tiles[name]
                 if k_eff < k:
                     k_eff_clip_count[name] += 1
-                # Tier-2 §4: zero-pad the per-expert factors up to the layer
-                # slot width before set_factors. FactoredExperts allocates each
-                # matrix slot at the per-LAYER MAX per-expert rank
-                # (ranks_layer[name]); experts with a smaller k must be padded or
-                # set_factors raises on the shape check. Index by the ACTUAL
-                # returned factor width, NOT the requested k: _aa_svd* internally
-                # re-clamp k (`k = max(1, min(k, min(d_out, d_in)))` and
-                # `k_eff = max(1, min(k, r_eff))`) and zero-pad to that clamped k,
-                # so the returned U_k width can be < the requested k. The trailing
-                # zero col(U)/row(V) are inert in the forward (bmm: V row=0 → 0 →
-                # U col=0), same property EoRA widen_rank already relies on.
-                slot = ranks_layer[name]
-                u_w = U_k.shape[1]   # actual returned column count of U_k
-                v_w = V_k.shape[0]   # actual returned row count of V_k (== u_w)
-                # Defensive: the _aa_svd* re-clamp chain guarantees the returned
-                # factor width never exceeds the per-LAYER MAX slot, so u_w/v_w > slot
-                # is impossible. Assert it loudly here to localize the diagnostic
-                # instead of falling through to set_factors' generic shape error.
-                assert u_w <= slot and v_w <= slot, (
-                    f"factor width exceeds slot (u_w={u_w}, v_w={v_w}, slot={slot}) "
-                    f"for L{ref.layer_idx}_E{e}_{name} — _aa_svd* clamp chain violated"
-                )
-                if u_w < slot:
-                    U_pad = torch.zeros(
-                        U_k.shape[0], slot, device=U_k.device, dtype=U_k.dtype)
-                    V_pad = torch.zeros(
-                        slot, V_k.shape[1], device=V_k.device, dtype=V_k.dtype)
-                    U_pad[:, :u_w] = U_k
-                    V_pad[:v_w, :] = V_k
-                    U_k, V_k = U_pad, V_pad
                 new_factored.set_factors(e, name, U_k, V_k, effective_rank=k_eff)
                 rank_map[f"L{ref.layer_idx}_E{e}_{name}"] = k
                 err_sum[name] += rel_err
