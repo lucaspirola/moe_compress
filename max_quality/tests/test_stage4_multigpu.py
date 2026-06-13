@@ -360,3 +360,33 @@ def test_eora_concurrent_exact_equals_serial_cpu():
             a = getattr(fe_serial, f"{name}_{proj}").data
             b = getattr(fe_par, f"{name}_{proj}").data
             assert torch.equal(a, b), f"{name}_{proj} bytes differ serial vs concurrent"
+
+
+def test_eora_concurrent_gate_up_memo_skew_exact():
+    """Concurrent path with gate-eligible != up-eligible is bit-exact to serial.
+
+    Forces a shared expert onto different worker bands across the gate vs up
+    passes (the cross-device gate-spectrum reuse case). The threaded engine must
+    (a) build each gate spectrum on its band thread, (b) hand it to the up pass
+    via the per-expert memo (read-only; eora_compensation.py:321-325 rebinds
+    locals / allocs new tensors, never mutates the memo), (c) let
+    _compute_eora_factors relocate it to the up delta's device. Bit-exact on CPU,
+    AND genuinely threaded (gate pass yields >1 band)."""
+    make_fe, ref_factory, originals, A_cov, config = _build_case(n_experts=9)
+    originals_skew = _drop_up_originals(originals, {1, 4, 7})
+    fe_s, rm_s, cp_s = _run_compensate(
+        make_fe, ref_factory, originals_skew, A_cov, config, eora_workers=1)
+    fe_p, rm_p, cp_p = _run_compensate(
+        make_fe, ref_factory, originals_skew, A_cov, config,
+        eora_workers=3, worker_devices=["cpu", "cpu", "cpu"])
+    # H1/C1 guard: the LAST band run (the down_proj pass, 6 experts) ran threaded.
+    # The gate pass (9 experts) split into 3 bands too; the memo was exercised
+    # across real threads. _LAST_RAN_THREADED reflects the final per-matrix run.
+    assert _eora_mod._LAST_RAN_THREADED is True
+    assert _eora_mod._LAST_BAND_COUNT >= 2
+    assert fe_s.ranks == fe_p.ranks and rm_s == rm_p and cp_s == cp_p
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        for proj in ("U", "V"):
+            assert torch.equal(
+                getattr(fe_s, f"{name}_{proj}").data,
+                getattr(fe_p, f"{name}_{proj}").data), f"{name}_{proj} skew mismatch"
