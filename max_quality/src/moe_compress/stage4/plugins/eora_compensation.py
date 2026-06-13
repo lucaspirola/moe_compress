@@ -467,6 +467,101 @@ def _solve_expert_tile(
     return Uc, Vc, int(take_eff), res_before, res_after, gate_spectrum_out
 
 
+# Module-level read-only DIAGNOSTICS for tests (passive introspection — NOT a
+# behavior patch / monkeypatch). Reflect the most recent _run_expert_bands call.
+_LAST_BAND_COUNT: int = 0
+_LAST_RAN_THREADED: bool = False
+
+
+def _run_expert_bands(
+    bands,                           # [(w, [experts ascending]), ...] — keyed by ORDINAL w, NOT device
+    device_of,                       # {e: torch.device}
+    solve_one,                       # (e, tgt) -> (Uc_home, Vc_home, take_eff, rb, ra, spec_out)
+    *,
+    name: str,
+    set_gate_spectrum,               # (e, spectrum_out) -> None   (called inside band thread)
+    concurrent: bool,
+    log_residuals: bool = False,
+) -> dict:
+    """Run the per-expert solves grouped into per-WORKER bands (banded by ordinal).
+
+    Concurrency engine for N-GPU lever 1. Each band ordinal ``w`` gets ONE thread
+    that runs its contiguous band in ASCENDING-e order; threads overlap across
+    workers (CUDA kernels release the GIL and run async on each device's default
+    stream). The gather to the home device happens INSIDE each thread
+    (``solve_one`` returns home-resident tiles), so the only main-thread work is
+    the deterministic ascending-e assembly the caller does after join.
+
+    Banded by ORDINAL ``w`` (C1): the caller passes ``bands`` pre-grouped by the
+    worker index used in ``device_of`` construction, so two workers that happen
+    to map to the SAME device object (e.g. the CPU test stand-in
+    ``["cpu","cpu","cpu"]``) remain DISTINCT bands → real threads. Grouping by
+    ``device_of[e]`` here would silently collapse them and skip the pool.
+
+    Byte-identicality: ``solve_one`` is a pure function of (e, tgt); results are
+    keyed by ``e`` into a dict (disjoint keys, no race) and the CALLER reassembles
+    in ascending-e — so worker completion order is unobservable, exactly like
+    serial. ``concurrent=False`` OR a single band runs inline on the calling
+    thread → byte-identical to the legacy serial loop, and the 1-GPU default
+    (effective_workers<=1 ⇒ one band) never enters a thread.
+
+    Returns ``band_results: {e: (Uc_home, Vc_home, take_eff, rb, ra)}``.
+    """
+    global _LAST_BAND_COUNT, _LAST_RAN_THREADED
+    import torch as _torch
+    from concurrent.futures import ThreadPoolExecutor
+
+    band_results: dict = {}
+    _LAST_BAND_COUNT = len(bands)
+
+    def _run_band(experts):
+        # N2: this closure captures ``experts`` from the submit-time loop var,
+        # which is SAFE because the helper joins all threads synchronously below
+        # within this single call — threads never outlive _run_expert_bands, so
+        # no late-binding hazard (each future carries its own ``experts`` arg).
+        for e in experts:                    # ascending-e within the band
+            tgt = device_of[e]
+            Uc_home, Vc_home, take_eff, rb, ra, spec_out = solve_one(e, tgt)
+            if name == "gate_proj":
+                set_gate_spectrum(e, spec_out)   # disjoint key e — thread-safe under GIL
+            band_results[e] = (Uc_home, Vc_home, take_eff, rb, ra)
+
+    if not concurrent or len(bands) <= 1:
+        _LAST_RAN_THREADED = False
+        for _w, experts in bands:
+            _run_band(experts)
+        return band_results
+
+    # Threaded: one worker thread per band ordinal. Pin intra-op BLAS to 1 on the
+    # main thread (process-global; restored in finally) to avoid (bands x cores)
+    # oversubscription on the CPU stand-in path. No-op cost on real GPUs.
+    _LAST_RAN_THREADED = True
+    prev_threads = _torch.get_num_threads()
+    try:
+        _torch.set_num_threads(1)
+        with ThreadPoolExecutor(max_workers=len(bands)) as pool:
+            futures = [pool.submit(_run_band, experts) for _w, experts in bands]
+            for f in futures:
+                f.result()                   # re-raise any worker exception here
+    finally:
+        _torch.set_num_threads(prev_threads)
+
+    # 4c — RECOMMENDED guarded residual sync (M1). The residual scalars rb/ra are
+    # produced on each WORKER device and later copied to the home device by the
+    # main-thread assembly (rb.to(dev)), which can race the worker's in-flight
+    # kernel. Log-only ⇒ a race would silently corrupt a logged number without
+    # tripping any byte gate. Sync the distinct worker devices once per matrix,
+    # ONLY under log_residuals (default off ⇒ zero cost on the golden path).
+    if log_residuals:
+        seen = set()
+        for e in band_results:
+            d = device_of[e]
+            if d.type == "cuda" and d not in seen:
+                seen.add(d)
+                _torch.cuda.synchronize(d)
+    return band_results
+
+
 def _resolve_worker_devices(worker_devices, n: int, home_device) -> list:
     """Resolve the list of ``n`` target devices for the expert fan-out.
 
@@ -690,29 +785,59 @@ class EoraCompensationPlugin:
                     for e in eligible[w * per:(w + 1) * per]:
                         device_of[e] = devices[w]
 
-            for e in eligible:
-                tgt = device_of[e]
+            # Concurrency engine (N-GPU lever 1): run each worker's band
+            # CONCURRENTLY (one thread per band ORDINAL w — NOT per device object,
+            # so the CPU ["cpu","cpu"] seam stays multi-band), gathering each tile
+            # to the home device INSIDE its band thread. Assembly into U_corr/
+            # V_corr and the residual fp sum stay on THIS thread in ascending-e
+            # order, so the output is byte-identical to the serial path regardless
+            # of which device finishes first. effective_workers<=1 ⇒ one band ⇒
+            # inline (no thread), byte-identical to single-GPU today.
+            #
+            # Build bands by ORDINAL w, reusing the same w/per split that produced
+            # device_of above. C1: keyed by w, so two workers mapping to the same
+            # device object remain distinct bands.
+            if effective_workers <= 1:
+                bands = [(0, eligible)]
+            else:
+                bands = [
+                    (w, eligible[w * per:(w + 1) * per])
+                    for w in range(effective_workers)
+                ]
+                bands = [(w, ex) for (w, ex) in bands if ex]   # drop empty trailing bands
+
+            def _solve_one(e, tgt):
                 W_orig, U_e, V_e, A = _inputs_for(e)
-                Uc, Vc, take_eff, res_before, res_after, gate_spec_out = _solve_expert_tile(
+                Uc, Vc, take_eff, rb, ra, spec_out = _solve_expert_tile(
                     name, e, ref.layer_idx, W_orig, U_e, V_e, A, d_in,
                     r_per_expert, tgt, a_storage_dtype,
                     gate_spectrum=gate_spectra.get(e),
                     log_residuals=log_residuals,
                 )
-                if name == "gate_proj":
-                    # Retain this expert's gate spectrum (on its worker device)
-                    # for the SEPARATE up_proj pass — the memo must survive the
-                    # whole gate→up window for the worker owning expert e.
-                    gate_spectra[e] = gate_spec_out
-                # Gather the tile back to the layer home device and place the
-                # disjoint row (ascending-e order, no cross-expert reduction).
-                U_corr[e] = Uc.to(device=dev, dtype=dtype)
-                V_corr[e] = Vc.to(device=dev, dtype=dtype)
-                eff_per_expert[e] = int(take_eff)
-                # log-only residual norms (B4) — accumulate on dev.
+                # Gather to home device on the WORKER thread (overlaps next band).
+                Uc_home = Uc.to(device=dev, dtype=dtype)
+                Vc_home = Vc.to(device=dev, dtype=dtype)
+                return Uc_home, Vc_home, int(take_eff), rb, ra, spec_out
+
+            band_results = _run_expert_bands(
+                bands, device_of, _solve_one,
+                name=name,
+                set_gate_spectrum=gate_spectra.__setitem__,
+                concurrent=(effective_workers > 1),
+                log_residuals=log_residuals,
+            )
+
+            # Deterministic ascending-e assembly (the byte-identity guarantee).
+            for e in eligible:
+                Uc_home, Vc_home, take_eff, rb, ra = band_results[e]
+                # Place the disjoint row (ascending-e order, no cross-expert reduction).
+                U_corr[e] = Uc_home
+                V_corr[e] = Vc_home
+                eff_per_expert[e] = take_eff
+                # log-only residual norms (B4) — accumulate on dev in ascending-e.
                 if log_residuals:
-                    res_before_acc += res_before.to(dev)
-                    res_after_acc += res_after.to(dev)
+                    res_before_acc += rb.to(dev)
+                    res_after_acc += ra.to(dev)
                 n_eligible += 1
                 if (e + 1) % 32 == 0:
                     log.info("  L%d/%s expert %d/%d", ref.layer_idx, name, e + 1, N)
