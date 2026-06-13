@@ -345,6 +345,180 @@ def run_dp_generate(prompts, *, tmp_dir, replicas, gpus_per_replica, max_new,
         shard_results.append((start, end, completions))
     return _merge_completions(shard_results)
 
+
+# ---------------------------------------------------------------------------
+# PPL replica worker + spawn driver (run_dp_ppl)
+# ---------------------------------------------------------------------------
+
+# Test-only seam: a picklable stub-PPL key. When passed, the worker SKIPS the
+# model reload + forward and computes a deterministic per-row partial instead,
+# so the spawn + even-split + exact partial-sum merge plumbing is testable on
+# CPU with no real model. Production callers never pass it.
+_STUB_PPL_MOD7 = "mod7"
+
+
+def _stub_ppl_partial(key, chunk_rows):
+    """Deterministic (nll_sum, tok_count) over the given rows, using the SAME
+    mean_loss * (numel - n_rows) rescale the production code uses. The per-row
+    contribution is independent of the forward batch, so the merge of disjoint
+    shards equals the single pass exactly (BATCH_INVARIANT property)."""
+    if key != _STUB_PPL_MOD7:
+        raise ValueError(f"_stub_ppl_partial: unknown stub key {key!r}")
+    numel = int(chunk_rows.numel())
+    n_rows = int(chunk_rows.shape[0])
+    denom = max(numel - n_rows, 1)
+    per_tok = (chunk_rows.to(_torch_float64()) % 7).sum() / denom
+    mean_loss = float(per_tok)
+    nll = mean_loss * (numel - n_rows)
+    return nll, (numel - n_rows)
+
+
+def _torch_float64():
+    import torch as _t
+    return _t.float64
+
+
+def _ppl_replica_worker(
+    replica_idx,
+    visible_devices,
+    tmp_dir,
+    chunks_file,
+    shard_start,
+    shard_end,
+    ppl_bs,
+    experts_impl_generative,
+    auto_batch_cfg_dict,
+    out_file,
+    stub_ppl,
+):
+    """Spawn target: one data-parallel PPL replica.
+
+    Pins its GPU, reloads the student (``_reload_student_for_worker(...,
+    for_generate=False)`` — eager attn + kernel patch + mask passthrough; keeps
+    the PPL experts impl, NO compile), forwards its chunk sub-rows. Per-replica
+    auto-batch: ``resolve_batch(..., FidelityClass.BATCH_INVARIANT, ...)`` probes
+    THIS replica's pinned-device VRAM, and the forward is wrapped in
+    ``run_with_oom_backoff`` (safe — PPL is batch-invariant). Accumulates
+    ``(nll_sum, tok_count)`` with the ``wikitext_ppl.py:260`` rescale and writes
+    the partial to ``out_file``. Module-level (picklable); re-imports inside.
+    """
+    import os as _os
+    _os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+
+    import json as _json
+    import torch as _torch
+    from .eval_shard import (
+        _stub_ppl_partial as _stub,
+        _reload_student_for_worker as _reload,
+    )
+
+    chunks = _torch.load(chunks_file)
+    shard = chunks[shard_start:shard_end]
+
+    if stub_ppl is not None:
+        nll_sum, tok_count = _stub(stub_ppl, shard)
+    else:
+        from ..utils.auto_batch import (
+            AutoBatchConfig as _ABC, FidelityClass as _FC,
+            resolve_batch as _resolve_batch, run_with_oom_backoff as _backoff,
+        )
+        from ..utils.calibration import iter_batches as _iter_batches
+
+        device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+        model, _tok = _reload(
+            tmp_dir, experts_impl_generative=experts_impl_generative,
+            for_generate=False,
+            device_map=("cuda" if _torch.cuda.is_available() else "cpu"),
+            torch_dtype="bfloat16",
+        )
+        _abc = _ABC.from_dict(auto_batch_cfg_dict)
+
+        def _cost_probe(micro_batch):
+            mb = shard[:micro_batch].to(device)
+            with _torch.no_grad():
+                model(input_ids=mb, labels=mb)
+            if _torch.cuda.is_available():
+                return int(_torch.cuda.max_memory_allocated(device))
+            return 0
+
+        eff_bs = _resolve_batch(_cost_probe, int(ppl_bs), _FC.BATCH_INVARIANT, _abc)
+
+        def _forward_all(bs):
+            nsum, tcount = 0.0, 0
+            with _torch.no_grad():
+                for batch in _iter_batches(shard, batch_size=bs):
+                    batch = batch.to(device)
+                    out = model(input_ids=batch, labels=batch)
+                    loss_val = float(out.loss.item())
+                    nsum += loss_val * (batch.numel() - batch.shape[0])
+                    tcount += batch.numel() - batch.shape[0]
+            return nsum, tcount
+
+        nll_sum, tok_count = _backoff(_forward_all, eff_bs, int(ppl_bs))
+
+    with open(out_file, "w", encoding="utf-8") as _f:
+        _json.dump([nll_sum, tok_count], _f)
+
+
+def run_dp_ppl(chunks, *, tmp_dir, replicas, gpus_per_replica, ppl_bs,
+               experts_impl_generative, cfg, out_dir, auto_batch_cfg_dict=None,
+               _stub_ppl=None):
+    """Data-parallel WikiText-PPL.
+
+    Fan out ``replicas`` child processes over an even row-split (no group
+    constraint — BATCH_INVARIANT), each forwarding its chunk sub-rows at a
+    per-replica auto-batch; then sum the per-shard ``(nll_sum, tok_count)``
+    partials and return ``exp(sum_nll / sum_tok)`` (``_merge_ppl``). Exact
+    regardless of boundary or per-replica batch.
+
+    ``_stub_ppl`` is the test-only seam (see ``_STUB_PPL_MOD7``).
+    """
+    import json
+    from pathlib import Path as _Path
+    import torch as _torch
+    import torch.multiprocessing as _mp
+
+    n = int(chunks.shape[0])
+    bounds = _even_split(n, replicas)
+    out_dir = _Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    chunks_file = out_dir / "_ppl_chunks.pt"
+    _torch.save(chunks, chunks_file)
+
+    spawn_args = []
+    out_files = []
+    for r, (start, end) in enumerate(bounds):
+        out_file = out_dir / f"_ppl_replica_{r}.json"
+        out_files.append(out_file)
+        dev_lo = r * gpus_per_replica
+        dev_hi = dev_lo + gpus_per_replica
+        visible = ",".join(str(d) for d in range(dev_lo, dev_hi))
+        spawn_args.append(
+            (r, visible, str(tmp_dir), str(chunks_file), start, end, ppl_bs,
+             experts_impl_generative, auto_batch_cfg_dict, str(out_file), _stub_ppl)
+        )
+
+    ctx = _mp.get_context("spawn")
+    procs = []
+    for args in spawn_args:
+        p = ctx.Process(target=_ppl_replica_worker, args=args)
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(
+                f"Stage 6 DP PPL: replica process exited with code {p.exitcode}"
+            )
+
+    partials = []
+    for out_file in out_files:
+        with open(out_file, "r", encoding="utf-8") as _f:
+            nll, tok = json.load(_f)
+        partials.append((nll, tok))
+    return _merge_ppl(partials)
+
 __all__ = [
     "PINNED_GEN_BATCH_SIZE",
     "_group_aligned_split",
@@ -356,4 +530,7 @@ __all__ = [
     "_gen_replica_worker",
     "run_dp_generate",
     "_STUB_GENERATE_PROMPTLEN",
+    "_ppl_replica_worker",
+    "run_dp_ppl",
+    "_STUB_PPL_MOD7",
 ]
