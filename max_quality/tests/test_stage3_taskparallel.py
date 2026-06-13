@@ -397,3 +397,46 @@ def test_factor_workers_resolution():
     else:
         assert got == min(requested, n_gpu)
         assert got >= 1
+
+
+# =========================================================================== #
+# Lever 1 (α-grid task-parallel) — argmin fold + DP slice/merge + batch-invar.
+# =========================================================================== #
+def test_alpha_argmin_tiebreak():
+    """``_argmin_alpha`` reproduces the serial strict-< fold over ascending
+    grid_idx (H-α1): on a PPL tie the LOWER grid index (earlier-evaluated,
+    lower-α) candidate wins. Independent of input/completion order."""
+    from moe_compress.stage3.plugins.swift_svd_alpha import _argmin_alpha
+
+    # idx 0 (α=0.0) and idx 1 (α=0.1) TIE at ppl 5.0 → idx 0 wins (strict <).
+    assert _argmin_alpha([(0, 0.0, 5.0), (1, 0.1, 5.0)]) == 0.0
+    # Same tie, fed in REVERSE/completion order → still idx 0 (sort by grid_idx).
+    assert _argmin_alpha([(1, 0.1, 5.0), (0, 0.0, 5.0)]) == 0.0
+    # A clear winner mid-grid.
+    assert _argmin_alpha(
+        [(0, 0.0, 9.0), (1, 0.1, 3.0), (2, 0.2, 7.0)]) == 0.1
+    # Winner at a higher index when strictly lower, fed shuffled.
+    assert _argmin_alpha(
+        [(2, 0.2, 1.0), (0, 0.0, 9.0), (1, 0.1, 3.0)]) == 0.2
+    # Three-way tie → lowest grid idx.
+    assert _argmin_alpha(
+        [(2, 1.0, 4.0), (1, 0.5, 4.0), (0, 0.0, 4.0)]) == 0.0
+
+
+def test_alpha_argmin_matches_serial_loop():
+    """``_argmin_alpha`` is byte-identical to the legacy serial fold
+    (``for idx,alpha: results.append; if ppl < best_ppl: best=alpha``)."""
+    from moe_compress.stage3.plugins.swift_svd_alpha import _argmin_alpha
+
+    grid = [0.0, 0.1, 0.2, 0.3, 0.4]
+    ppls = [5.0, 4.0, 4.0, 6.0, 3.5]
+    # Legacy serial loop.
+    best_alpha, best_ppl = 0.5, float("inf")
+    for alpha, ppl in zip(grid, ppls):
+        if ppl < best_ppl:
+            best_ppl = ppl
+            best_alpha = alpha
+    # Factored fold, fed in grid order AND shuffled.
+    results = [(i, a, p) for i, (a, p) in enumerate(zip(grid, ppls))]
+    assert _argmin_alpha(results) == best_alpha
+    assert _argmin_alpha(list(reversed(results))) == best_alpha

@@ -651,6 +651,31 @@ def _restore_fused_experts(
         ref.experts_module = fused
 
 
+def _argmin_alpha(results: list[tuple[int, float, float]]) -> float:
+    """Pick the winning α from per-candidate ``(grid_idx, alpha, ppl)`` tuples.
+
+    Reproduces the serial validation loop's tie-break EXACTLY (H-α1): the
+    serial loop keeps the FIRST α (lowest grid index) on a strict-``<``
+    improvement, i.e. ties go to the earlier-evaluated (lower grid index)
+    candidate. We therefore iterate the merged results in ASCENDING GRID-INDEX
+    order (NOT completion order, NOT per-replica order) and apply the identical
+    ``if ppl < best_ppl`` rule. This makes the winner independent of which
+    replica finished first → byte-identical α selection between the serial and
+    the process-spawn DP paths.
+
+    Shared by BOTH the serial path (``_swift_svd_plus_alpha_search_validation``)
+    and the DP merge (``run_dp_alpha_search``), so the two are byte-identical by
+    construction. Returns ``0.5`` (the historical default) for an empty list.
+    """
+    best_alpha = 0.5
+    best_ppl = float("inf")
+    for _idx, alpha, ppl in sorted(results, key=lambda r: r[0]):
+        if ppl < best_ppl:
+            best_ppl = ppl
+            best_alpha = alpha
+    return best_alpha
+
+
 def _swift_svd_plus_alpha_search_validation(
     model,
     tokenizer,
@@ -728,9 +753,11 @@ def _swift_svd_plus_alpha_search_validation(
     log.info("Stage 3 α-search: %d validation sequences (%d tokens)",
              val_tensor.size(0), val_tensor.numel())
 
-    best_alpha = 0.5
-    best_ppl = float("inf")
-    results: list[tuple[float, float]] = []
+    # H-α1: accumulate per-candidate ``(grid_idx, alpha, ppl)`` and fold via the
+    # shared ``_argmin_alpha`` (sort-by-grid-idx + strict-< tie-break) AFTER the
+    # loop, so the serial path and the DP merge are byte-identical by
+    # construction. ``results`` doubles as the human-readable log line below.
+    results: list[tuple[int, float, float]] = []
 
     # A2: per-layer eigh-decomp spill cache. The decomp is (B,A,C)-determined,
     # W- and k-independent → IDENTICAL across all candidates (same B/C spill
@@ -778,7 +805,7 @@ def _swift_svd_plus_alpha_search_validation(
                 model, val_tensor, device=device,
                 batch_size=validation_batch_size,
             )
-            results.append((alpha, ppl))
+            results.append((idx, alpha, ppl))
             log.info("  α=%.1f → WikiText-2 PPL=%.4f", alpha, ppl)
             _trackio_log({
                 "stage3/alpha_search/alpha": alpha,
@@ -787,18 +814,20 @@ def _swift_svd_plus_alpha_search_validation(
 
             # 4. Restore original fused experts for the next candidate.
             _restore_fused_experts(model, moe_layers, originals, device=device)
-
-            if ppl < best_ppl:
-                best_ppl = ppl
-                best_alpha = alpha
     finally:
         # (b) Remove the eigh cache on normal + exception exit of the search.
         if eigh_cache_dir is not None:
             shutil.rmtree(eigh_cache_dir, ignore_errors=True)
 
+    # H-α1: shared completion-order-independent fold (sort-by-grid-idx + strict
+    # ``<`` tie-break). Byte-identical to the legacy inline serial fold; reused
+    # verbatim by the DP merge so serial and process-spawn pick the same α.
+    best_alpha = _argmin_alpha(results)
+    best_ppl = next((p for _i, a, p in sorted(results, key=lambda r: r[0])
+                     if a == best_alpha), float("inf"))
     log.info("Stage 3 α-search complete: best α=%.1f (PPL=%.4f)", best_alpha, best_ppl)
     log.info("  full results: %s",
-             ", ".join(f"α={a:.1f}→{p:.4f}" for a, p in results))
+             ", ".join(f"α={a:.1f}→{p:.4f}" for _i, a, p in results))
     _trackio_log({
         "stage3/alpha_search/best_alpha": best_alpha,
         "stage3/alpha_search/best_ppl": best_ppl,
