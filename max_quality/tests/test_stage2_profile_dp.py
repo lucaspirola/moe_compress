@@ -98,3 +98,153 @@ def test_cov_pin_batch_invariance_and_serial_byte_identical():
     assert cov_none.keys() == cov_plain.keys() and cov_none
     for k in cov_none:
         assert torch.equal(cov_none[k], cov_plain[k]), f"seq_len=None not byte-identical @ {k}"
+
+
+# ---------------------------------------------------------------------------
+# A7.1 — Sequence-disjoint shard.
+# ---------------------------------------------------------------------------
+def test_shard_calib_sequences_disjoint_and_complete():
+    from moe_compress.stage2 import profile_dp
+
+    calib = torch.arange(10 * 4).reshape(10, 4)  # 10 sequences
+    shards = profile_dp.shard_calib_sequences(calib, replicas=3)
+    assert len(shards) == 3
+    total = sum(s.size(0) for s in shards)
+    assert total == 10, "every sequence covered exactly once"
+    # Reassembled rows equal the original (contiguous, disjoint, in order).
+    cat = torch.cat(shards, dim=0)
+    assert torch.equal(cat, calib)
+    # replicas<=1 ⇒ single shard (serial / byte-identical premise).
+    assert len(profile_dp.shard_calib_sequences(calib, replicas=1)) == 1
+
+
+# ---------------------------------------------------------------------------
+# A7.2 — Reduce REAP: per-(l,e) sums/counts/freq.
+# ---------------------------------------------------------------------------
+def test_reduce_reap_sums_counts_and_score(tmp_path):
+    from moe_compress.stage2 import profile_dp
+
+    a = ReapAccumulator()
+    b = ReapAccumulator()
+    # Disjoint contributions for layer 0; score() = Σsum / Σcount.
+    a.add_gpu((0, 1), torch.tensor(3.0), n_tokens=2)
+    b.add_gpu((0, 1), torch.tensor(5.0), n_tokens=3)
+    a.add_gpu((0, 2), torch.tensor(7.0), n_tokens=4)
+    a.finalize_layer(0)
+    b.finalize_layer(0)
+
+    da, db = tmp_path / "ra", tmp_path / "rb"
+    profile_dp._spill_reap_layer(a, 0, da)
+    profile_dp._spill_reap_layer(b, 0, db)
+
+    merged = ReapAccumulator()
+    profile_dp._reduce_reap_dirs([da, db], 0, into=merged)
+    assert merged.sums[(0, 1)] == 8.0
+    assert merged.counts[(0, 1)] == 5
+    assert merged.freq[(0, 1)] == 5
+    assert abs(merged.score(0, 1) - 8.0 / 5.0) < 1e-9
+    assert merged.sums[(0, 2)] == 7.0 and merged.counts[(0, 2)] == 4
+
+
+# ---------------------------------------------------------------------------
+# A7.3 — Reduce REAM gate_gram (fp64 bit-exact).
+# ---------------------------------------------------------------------------
+def test_reduce_ream_gate_gram_bit_exact(tmp_path):
+    from moe_compress.stage2 import profile_dp
+
+    E = 4
+    a = ReamCostAccumulator(num_experts=E)
+    b = ReamCostAccumulator(num_experts=E)
+    # Feed disjoint router-logit batches; gate_gram = Σ vᵀv (fp64, order-independent).
+    la = torch.randn(6, E, dtype=torch.float64)
+    lb = torch.randn(5, E, dtype=torch.float64)
+    a.record_router_logits(0, la, 0)
+    b.record_router_logits(0, lb, 0)
+
+    da, db = tmp_path / "ma", tmp_path / "mb"
+    profile_dp._spill_ream_layer(a, 0, da)
+    profile_dp._spill_ream_layer(b, 0, db)
+
+    merged = ReamCostAccumulator(num_experts=E)
+    profile_dp._reduce_ream_dirs([da, db], 0, into=merged)
+
+    ref = ReamCostAccumulator(num_experts=E)
+    ref.record_router_logits(0, la, 0)
+    ref.record_router_logits(0, lb, 0)
+    assert torch.equal(merged._gate_gram[0], ref._gate_gram[0]), "gate_gram not bit-exact"
+
+
+# ---------------------------------------------------------------------------
+# A7.4 — Reduce REAM sim/total/neuron.
+# ---------------------------------------------------------------------------
+def test_reduce_ream_sim_total_neuron(tmp_path):
+    from moe_compress.stage2 import profile_dp
+
+    E = 3
+    a = ReamCostAccumulator(num_experts=E)
+    b = ReamCostAccumulator(num_experts=E)
+    # sim numerator (dense fp64), total token int, neuron sum/count.
+    a._sim_tensor[0] = torch.randn(E, E, dtype=torch.float64)
+    b._sim_tensor[0] = torch.randn(E, E, dtype=torch.float64)
+    a._total_tokens_by_layer[0] = 10
+    b._total_tokens_by_layer[0] = 7
+    a._neuron_act_sum[(0, 1)] = torch.arange(4.0)
+    a._neuron_act_count[(0, 1)] = 4
+    b._neuron_act_sum[(0, 1)] = torch.ones(4)
+    b._neuron_act_count[(0, 1)] = 2
+
+    da, db = tmp_path / "sa", tmp_path / "sb"
+    profile_dp._spill_ream_layer(a, 0, da)
+    profile_dp._spill_ream_layer(b, 0, db)
+
+    merged = ReamCostAccumulator(num_experts=E)
+    profile_dp._reduce_ream_dirs([da, db], 0, into=merged)
+
+    assert torch.equal(merged._sim_tensor[0], a._sim_tensor[0] + b._sim_tensor[0])
+    assert merged._total_tokens_by_layer[0] == 17
+    assert torch.equal(merged._neuron_act_sum[(0, 1)], torch.arange(4.0) + torch.ones(4))
+    assert merged._neuron_act_count[(0, 1)] == 6
+    # get_neuron_mean == single-pass mean.
+    expected_mean = (torch.arange(4.0) + torch.ones(4)) / 6
+    assert torch.allclose(merged.get_neuron_mean(0, 1), expected_mean)
+
+
+# ---------------------------------------------------------------------------
+# A7.6 — Structural replay (C1): worker reproduces parent's merged layer.
+# ---------------------------------------------------------------------------
+def test_structural_replay_matches_parent_select_and_resize():
+    from moe_compress.stage2 import profile_dp
+    from moe_compress.stage2.merging import _resize_router_for_kept_experts
+    from moe_compress.utils.model_io import build_banks
+
+    # Parent + worker start from the SAME model state.
+    torch.manual_seed(0); parent = _TinyModel()
+    torch.manual_seed(0); worker = _TinyModel()
+
+    final_kept_ids = [0, 2]  # drop experts 1, 3
+
+    p_lr = list(iter_moe_layers(parent))[0]
+    w_lr = list(iter_moe_layers(worker))[0]
+
+    # Parent runs the real structural surgery: bank.select + router resize.
+    p_banks = build_banks(p_lr)
+    for bank in p_banks.values():
+        bank.select(final_kept_ids)
+    _resize_router_for_kept_experts(p_lr, final_kept_ids)
+
+    # Capture the parent's merged layer + replay it on the worker copy.
+    payload = profile_dp.capture_merged_layer(p_lr, final_kept_ids)
+    profile_dp.replay_merged_layer(w_lr, payload)
+
+    # Shapes + counts match.
+    assert w_lr.experts_module.gate_up_proj.shape == p_lr.experts_module.gate_up_proj.shape
+    assert w_lr.experts_module.down_proj.shape == p_lr.experts_module.down_proj.shape
+    assert int(w_lr.experts_module.num_experts) == int(p_lr.experts_module.num_experts)
+    assert int(w_lr.router.weight.shape[0]) == int(p_lr.router.weight.shape[0])
+    assert int(getattr(w_lr.router, "num_experts")) == int(getattr(p_lr.router, "num_experts"))
+    assert int(getattr(w_lr.router, "top_k")) == int(getattr(p_lr.router, "top_k"))
+    assert int(w_lr.mlp.num_experts) == int(p_lr.mlp.num_experts)
+    # Values match exactly.
+    assert torch.equal(w_lr.experts_module.gate_up_proj, p_lr.experts_module.gate_up_proj)
+    assert torch.equal(w_lr.experts_module.down_proj, p_lr.experts_module.down_proj)
+    assert torch.equal(w_lr.router.weight, p_lr.router.weight)
