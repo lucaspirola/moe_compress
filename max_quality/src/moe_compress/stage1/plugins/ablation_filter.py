@@ -101,6 +101,33 @@ Git archaeology
   upcast ~9.5 GB); matches the v4-proven Phase F batch size and leaves
   ~40 GB free with the model + earlier-pipeline accumulators resident.
 
+Auto-batch (v2): ``ablation_filter.batch_size: "auto"``
+-------------------------------------------------------
+Set ``stage1_grape.ablation_filter.batch_size: "auto"`` AND
+``stage1_grape.auto_batch.enabled: true`` to VRAM-auto-size the held-out
+NLL forward instead of the fixed ``batch_size`` (default 8). The auto path
+swaps the fused HF ``ForCausalLMLoss`` token-mean for a **per-sequence
+pinned** cross-entropy (:func:`_measure_corpus_nll_pinned`) computed in a
+fixed sequence order: this makes the reduction grouping — and therefore
+the discrete ``ΔNLL > threshold`` admission decision — **independent of the
+forward batch** (``baseline_nll`` and every ``ablated_nll`` use the same
+pinned grouping, so ΔNLL is batch-invariant; the ~0.001 default margin sits
+~1000× above ordinary bs=1 forward noise). It also relieves the fp32-logits
+OOM that forced bs=32→8: the per-seq CE can chunk the upcast. The batch is
+sized once via ``size_batch`` (``headroom_frac`` / ``max_cap`` from the
+``auto_batch`` block) and the real baseline + per-candidate passes run
+through ``run_with_oom_backoff`` toward the fixed-``batch_size`` floor.
+
+**Default (a fixed int ``batch_size``) is byte-identical** — it keeps the
+fused ``_measure_corpus_nll`` path verbatim, so ``stage1_ablation_filter``
+golden is untouched. ``_ablation_is_auto`` is double-gated; the ``auto``
+sentinel + the ``auto_batch.enabled`` switch must BOTH be set.
+
+``block_refine`` is **METRIC-PINNED** (minibatch-SGD): changing its batch
+size changes the trained weights, so it is intentionally NOT auto-batchable
+(see the one-line note in ``stage3/plugins/block_refine.py``), unlike the
+reduction-accumulating cov / ablation-NLL paths.
+
 Naming-history note
 -------------------
 The legacy stage-1 monolith called this "Phase D" (the ablation filter
@@ -154,8 +181,15 @@ import warnings
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from ...utils.activation_hooks import instrument_experts
+from ...utils.auto_batch import (
+    AutoBatchConfig,
+    CudaMemProbe,
+    run_with_oom_backoff,
+    size_batch,
+)
 from ...utils.calibration import build_calibration_tensor, iter_batches, spec_from_config
 from ...utils.model_io import iter_moe_layers, save_json_artifact
 from ...pipeline.context import PipelineContext
@@ -295,12 +329,21 @@ class AblationFilterPlugin:
         # may overwrite this slot with a wider mix that includes Phase-C
         # state, in which case the golden-snapshot byte-anchor uses the
         # wider dict.
+        # ``batch_size`` is normally an int (default 8) but may be the "auto"
+        # sentinel (v2 auto-batch). Record the int when it parses; otherwise
+        # carry the sentinel string verbatim. On the default path this is
+        # exactly ``int(af.get("batch_size", 8))`` → golden byte-identical.
+        _bs = af.get("batch_size", 8)
+        try:
+            _bs = int(_bs)
+        except (TypeError, ValueError):
+            pass
         ctx.set(
             "ablation_filter_config",
             {
                 "holdout_samples": int(af.get("holdout_samples", 100)),
                 "ablation_filter_threshold": threshold,
-                "ablation_filter_batch_size": int(af.get("batch_size", 8)),
+                "ablation_filter_batch_size": _bs,
             },
         )
 
@@ -392,6 +435,44 @@ def _measure_corpus_nll(model, batches, device) -> float:
             ntok = (batch.shape[0] * (batch.shape[1] - 1))  # shift-by-1
             total_nll += float(out.loss.item()) * ntok
             total_tokens += ntok
+    return total_nll / max(total_tokens, 1)
+
+
+def _measure_corpus_nll_pinned(model, batches, device) -> float:
+    """Mean per-token NLL with a **per-sequence** CE reduction pinned in fixed order.
+
+    Auto-batch-path twin of :func:`_measure_corpus_nll`. Where the fused
+    variant assembles a token-mean from HF's per-batch ``ForCausalLMLoss``
+    (whose reduction grouping depends on the forward batch), this computes
+    the cross-entropy **one sequence at a time** in a fixed order and
+    accumulates the per-sequence sums -> the reduction grouping is
+    independent of the forward batch. The token-mean it returns therefore
+    matches HF's shift/all-tokens-count/fp32 semantics but is
+    **batch-invariant**, which is what makes the discrete ``dNLL >
+    threshold`` decision deterministic across auto-sized batches.
+
+    Mirrors the fused fn's ``model`` inference-mode + ``torch.no_grad()``
+    (Review N3): without ``no_grad`` the autograd graph over the
+    ``[bs, seq, vocab]`` fp32 logits defeats the memory win and risks OOM.
+    """
+    total_nll = 0.0
+    total_tokens = 0
+    model.eval()
+    with torch.no_grad():
+        for batch in batches:
+            batch = batch.to(device) if device is not None else batch
+            logits = model(input_ids=batch).logits
+            seq = batch.shape[1]
+            for i in range(batch.shape[0]):
+                labels_i = batch[i, 1:]
+                labels_i = labels_i.to(device) if device is not None else labels_i
+                ce = F.cross_entropy(
+                    logits[i, :-1].float(),
+                    labels_i,
+                    reduction="sum",
+                )
+                total_nll += float(ce.item())
+                total_tokens += seq - 1
     return total_nll / max(total_tokens, 1)
 
 
@@ -516,6 +597,26 @@ def _apply_threshold_filter(
     return bl
 
 
+def _ablation_is_auto(af: dict, s1: dict) -> bool:
+    """True iff the holdout NLL forward should be VRAM-auto-sized (v2 step 2).
+
+    DOUBLE-gated (mirrors ``ma_detection`` / ``_cov_is_auto``): the auto path
+    fires only when ``stage1_grape.ablation_filter.batch_size == "auto"`` AND
+    ``AutoBatchConfig.from_dict(stage1_grape.auto_batch).enabled`` is true.
+
+    NOTE: the ``batch_size`` sentinel lives under ``af`` (the
+    ``ablation_filter`` block); the ``auto_batch`` config block lives one
+    level up under ``s1`` (``stage1_grape``), NOT under ``af`` — hence both
+    dicts are passed. Either condition absent → False → the original fused
+    ``_measure_corpus_nll`` path runs unchanged (no probe, no backoff
+    wrapper) → stage1_ablation_filter golden byte-identical.
+    """
+    return (
+        af.get("batch_size") == "auto"
+        and AutoBatchConfig.from_dict(s1.get("auto_batch")).enabled
+    )
+
+
 def run_ablation_filter(
     model,
     tokenizer,
@@ -561,7 +662,11 @@ def run_ablation_filter(
 
     holdout_samples = int(af.get("holdout_samples", 100))
     threshold = float(af.get("blacklist_threshold", 0.001))
-    batch_size = int(af.get("batch_size", 8))
+    # ``batch_size`` parse keeps returning the int floor when not "auto"; the
+    # "auto" sentinel is read separately by ``_ablation_is_auto`` (don't break
+    # the existing ``int(af.get("batch_size", 8))`` on the default path).
+    auto = _ablation_is_auto(af, s1)
+    fixed_bs = int(af.get("batch_size", 8)) if not auto else 8
 
     spec = spec_from_config(
         config["calibration"], num_sequences_override=holdout_samples, seed_offset=999
@@ -569,10 +674,54 @@ def run_ablation_filter(
     calib = build_calibration_tensor(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache_phase_d",
     )
-    eval_batches = iter_batches(calib, batch_size=batch_size)
 
     moe_layers = {ref.layer_idx: ref for ref in iter_moe_layers(model)}
-    baseline_nll = _measure_corpus_nll(model, eval_batches, device)
+
+    if not auto:
+        # Default-OFF path: EXACTLY the original fused ``_measure_corpus_nll``
+        # over the fixed-bs eval batches → byte-identical golden. No probe, no
+        # backoff wrapper, no pinned per-seq CE.
+        eval_batches = iter_batches(calib, batch_size=fixed_bs)
+
+        def measure(model_):
+            return _measure_corpus_nll(model_, eval_batches, device)
+    else:
+        # Auto path: pin the reduction per-sequence (batch-invariant ΔNLL),
+        # cost-model size the holdout forward once, then run the REAL pass
+        # (baseline + every candidate) through OOM-backoff toward the fixed
+        # floor. ``_measure_corpus_nll_pinned`` returns a FRESH float (no
+        # persistent accumulator) so no discard/reset is needed across runs.
+        cfg = AutoBatchConfig.from_dict(s1.get("auto_batch"))
+
+        def cost_probe_fn(micro_batch: int) -> int:
+            torch.cuda.reset_peak_memory_stats(device)
+            _measure_corpus_nll_pinned(
+                model, [calib[: max(1, micro_batch)]], device
+            )
+            return int(torch.cuda.max_memory_allocated(device))
+
+        nll_bs = size_batch(
+            cost_probe_fn,
+            fixed_batch=fixed_bs,
+            headroom_frac=cfg.headroom_frac,
+            max_cap=cfg.max_cap,
+            mem=CudaMemProbe(device),
+        )
+        log.info(
+            "Stage 1 Phase D: auto-sized holdout NLL batch=%d (floor=%d, max_cap=%d)",
+            nll_bs, fixed_bs, cfg.max_cap,
+        )
+
+        def measure(model_):
+            return run_with_oom_backoff(
+                lambda b: _measure_corpus_nll_pinned(
+                    model_, iter_batches(calib, batch_size=b), device
+                ),
+                start_batch=nll_bs,
+                floor=fixed_bs,
+            )
+
+    baseline_nll = measure(model)
     log.info(
         "Stage 1 Phase D: baseline mean NLL = %.4f over %d candidates",
         baseline_nll, len(candidates),
@@ -588,7 +737,7 @@ def run_ablation_filter(
             )
             continue
         with _ablate_expert_context(ref, int(e)):
-            nll = _measure_corpus_nll(model, eval_batches, device)
+            nll = measure(model)
         deltas[(int(li), int(e))] = nll - baseline_nll
         # Per-candidate progress (Phase D ablation has no other progress signal;
         # one corpus-NLL pass per candidate, so it is the slow part). Log every

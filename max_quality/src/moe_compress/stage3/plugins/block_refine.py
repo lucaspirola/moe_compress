@@ -169,6 +169,10 @@ def _phase_c5_block_refine(
     teacher_moe_layers: list[MoELayerRef],
     calib_tensor: torch.Tensor,
     *,
+    # auto-batch v2: block_refine is METRIC-PINNED (minibatch-SGD) — NOT
+    # auto-batchable. Changing batch_size changes the minibatch grouping and
+    # therefore the trained weights, so it gets NO ``auto_batch`` wiring
+    # (unlike the reduction-accumulating cov / ablation_filter NLL paths).
     batch_size: int,
     learning_rate: float,
     epochs: int,
