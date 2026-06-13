@@ -121,6 +121,7 @@ from typing import Any
 import torch
 
 from ..context import PipelineContext
+from .._unwrap import unwrap_student
 from ...utils.model_io import iter_moe_layers, load_model
 
 log = logging.getLogger(__name__)
@@ -496,6 +497,19 @@ class TeacherCachePlugin:
         # cache_tokens_per_batch`. Kept as-is for future-proofing if the
         # orchestrator gains a deterministic multi-epoch shuffle.
         token_start = (epoch * num_batches + batch_index) * cache_tokens_per_batch
+        # DDP RANK OFFSET (Task 4): under DDP each rank's `input_ids` is the
+        # `per_gpu`-row slice of the step's `batch_size`-row block, so each rank
+        # must read its OWN window WITHIN that block. `cache_tokens_per_batch`
+        # is the FULL step block (batch_size * L); offset by rank*per_gpu*L so
+        # rank0 reads [base : base+per_gpu*L], rank1 reads the next window, etc.
+        # This is a token_start OFFSET, NOT a second slice (the returned logits
+        # are reshaped to the rank's `per_gpu` rows below). On the single-process
+        # path ddp_rank=0 / world_size=1 so the offset is 0 — identical to before.
+        ddp_rank = ctx.get("ddp_rank") if ctx.has("ddp_rank") else 0
+        ddp_world_size = ctx.get("ddp_world_size") if ctx.has("ddp_world_size") else 1
+        if ddp_world_size > 1:
+            per_gpu = cache_batch_size // ddp_world_size
+            token_start += ddp_rank * per_gpu * cache_seq_len
         token_end = token_start + (input_ids.shape[0] * input_ids.shape[1])
         teacher_vocab_logits = teacher_logits_cache["logits"][token_start:token_end]
         teacher_vocab_logits = teacher_vocab_logits.to(
@@ -585,7 +599,7 @@ class TeacherLivePlugin:
         use_compile = bool(s5.get("torch_compile", False))
         # Student MoE-layer count — the topology guard's reference.
         student_refs_count = sum(
-            1 for _ in iter_moe_layers(getattr(student, "_orig_mod", student))
+            1 for _ in iter_moe_layers(unwrap_student(student))
         )
 
         teacher_repo_override = s5.get("teacher_model_repo") or None
@@ -672,7 +686,7 @@ class TeacherLivePlugin:
         # producing a wrong KD signal. Passes by definition on the default
         # path. Unwrap a possible torch.compile wrapper to read .config
         # reliably.
-        _student_unwrapped = getattr(student, "_orig_mod", student)
+        _student_unwrapped = unwrap_student(student)
         _teacher_vocab = int(getattr(_t.config, "vocab_size", -1))
         _student_vocab = int(getattr(_student_unwrapped.config, "vocab_size", -1))
         if _teacher_vocab != _student_vocab:

@@ -65,6 +65,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..context import PipelineContext
+from .._unwrap import unwrap_student
 
 log = logging.getLogger(__name__)
 
@@ -228,7 +229,7 @@ def _check_param_sanity(student: nn.Module, step: int) -> list[str]:
     """Cheap O(params) scan: names of trainable params containing NaN/Inf,
     capped at 5 for log brevity."""
     bad: list[str] = []
-    base = getattr(student, "_orig_mod", student)
+    base = unwrap_student(student)
     for name, p in base.named_parameters():
         if not p.requires_grad:
             continue

@@ -119,6 +119,7 @@ import torch
 import torch.nn as nn
 
 from ..context import PipelineContext
+from .._unwrap import unwrap_student
 
 log = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ def _save_best_router_state(
     improvement. The slim payload also keeps the end-of-training reload
     boundaried: only trainable params land via load_state_dict(strict=False).
     """
-    unwrapped = getattr(student, "_orig_mod", student)
+    unwrapped = unwrap_student(student)
     router_state = {
         name: p.data.cpu().clone()
         for name, p in unwrapped.named_parameters()
@@ -494,7 +495,7 @@ class EarlyStopPlugin:
             best_blob = torch.load(
                 best_path, map_location="cpu", weights_only=True
             )
-            base = getattr(student, "_orig_mod", student)
+            base = unwrap_student(student)
             missing, unexpected = base.load_state_dict(
                 best_blob["router_state"], strict=False
             )

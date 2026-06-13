@@ -97,6 +97,7 @@ from ..utils.calibration import (
 )
 from ..utils.model_io import (
     iter_moe_layers,
+    load_compressed_model,
     save_compressed_checkpoint,
 )
 from ..utils.runtime_monitor import snapshot_telemetry as _rt_snap, update as _rt_update
@@ -115,7 +116,33 @@ from .plugins.merge_repair import MergeRepairPlugin, _LayerOutputCapture
 from .plugins.early_stop import EarlyStopPlugin
 from .plugins.rkd_paper_recipe import RkdPaperRecipePlugin
 
+from .ddp_config import DdpConfig
+from ._unwrap import unwrap_student
+from .ddp_runtime import (
+    all_ranks_finite,
+    all_reduce_mean,
+    broadcast_flag,
+    broadcast_module_state,
+    grad_sync_context,
+    spawn_ddp_workers,
+    wrap_ddp,
+)
+
 log = logging.getLogger(__name__)
+
+
+def _row_slice(batch, rank: int, world_size: int):
+    """Row-split one step's batch for ``rank`` under DDP (Task 4).
+
+    Returns ``batch[rank*per_gpu : (rank+1)*per_gpu]`` where
+    ``per_gpu = batch.shape[0] // world_size``. Divisibility is guaranteed by
+    :class:`DdpConfig` (``batch_size % world_size == 0``), so each rank gets a
+    disjoint slice of equal row count — equal token count by construction, no
+    across-rank tail. This is the per-STEP row-split, NOT a batch-LIST shard:
+    every rank still participates in EVERY optimizer step.
+    """
+    per_gpu = batch.shape[0] // world_size
+    return batch[rank * per_gpu:(rank + 1) * per_gpu]
 
 
 def _set_experts_implementation(model: nn.Module, impl: str) -> None:
@@ -171,6 +198,13 @@ def run(
     same code to serve both Stage 2.5 (``stage_key="stage2p5"``) and Stage 5
     (``stage_key="stage5"``).  The config section read is always
     ``stage5_router_kd`` regardless of ``stage_key``.
+
+    Dispatch fork (DDP, default-OFF). When ``stage5_router_kd.ddp.enabled`` is
+    absent / false / resolves to ``world_size <= 1`` this calls
+    :func:`_run_single_process` — the EXISTING single-process path, with
+    ``ddp=None`` so every DDP site added by later tasks is a no-op and the
+    instruction stream is identical to pre-change (golden stays green). DDP
+    engages only when enabled AND ``world_size >= 2``, spawning N rank workers.
     """
     # Fail loudly NOW if this environment cannot run the GDN backward correctly
     # (Hopper + Triton>=3.4 + no tilelang ⇒ fla raises at loss.backward()). This
@@ -189,8 +223,52 @@ def run(
     # EVERY Stage 2.5/5 run by default. It is a no-op ONLY when the operator
     # explicitly sets ``rkd_recipe: "current"`` (the deprecated rollback dials).
     # See router_kd/plugins/rkd_paper_recipe.py for the deltas + contract.
+    #
+    # MUST run BEFORE DdpConfig.from_config — it sets ``epochs`` (and may clear
+    # the cache), so the DDP config + teacher-strategy validation see the
+    # EFFECTIVE recipe.
     RkdPaperRecipePlugin().apply_config_overrides(config)
 
+    ddp = DdpConfig.from_config(config)
+    if not ddp.enabled:
+        # EXISTING single-process path. ddp=None signals "no DDP" → every DDP
+        # site is a no-op; the instruction stream is identical to pre-change.
+        return _run_single_process(
+            student, tokenizer, config, artifacts_dir,
+            device=device, no_resume=no_resume, stage_key=stage_key,
+        )
+    # H1: the LIVE student + tokenizer are passed so the parent can serialize
+    # the compressed weights for the workers to reconstruct (Task 8).
+    return _spawn_ddp_workers(
+        student, tokenizer, config, artifacts_dir,
+        no_resume=no_resume, stage_key=stage_key, ddp=ddp,
+    )
+
+
+def _run_single_process(
+    student,
+    tokenizer,
+    config: dict,
+    artifacts_dir: Path,
+    *,
+    device=None,
+    no_resume: bool = False,
+    stage_key: str = "stage5",
+    rank: int = 0,
+    world_size: int = 1,
+    ddp=None,
+) -> Path:
+    """The Router-KD training loop body (extracted from ``run``).
+
+    On the default path ``ddp is None`` and ``rank=0, world_size=1`` so every
+    DDP-conditional site is a no-op (identical instruction stream). Under DDP
+    each rank worker calls this with its own ``rank`` / ``world_size`` and a
+    ``DdpConfig`` ``ddp`` — the row-split (Task 4), DDP wrap + finiteness
+    all-reduce (Task 5), sync + rank-0 I/O (Task 6) all key off ``ddp``.
+
+    ``RkdPaperRecipePlugin().apply_config_overrides`` is already applied by the
+    public ``run`` before the dispatch fork — NOT re-applied here.
+    """
     s5 = config["stage5_router_kd"]
     cal = config["calibration"]
 
@@ -216,6 +294,11 @@ def run(
     run_ctx.set("device", device)
     run_ctx.set("stage_key", stage_key)
     run_ctx.set("no_resume", no_resume)
+    # DDP rank context (Task 4/6): the cache teacher reads ddp_rank to offset
+    # its token_start window; rank-0-only I/O gates key off ddp_rank too. On the
+    # single-process path rank=0/world_size=1 so every read is the identity.
+    run_ctx.set("ddp_rank", rank)
+    run_ctx.set("ddp_world_size", world_size)
 
     # Cache BEFORE live so dispatch_first prefers the cache on a hit.
     registry = PluginRegistry([
@@ -325,7 +408,7 @@ def run(
     # even though we're distilling at vocab level - the student's routers are
     # what we're training). The live-teacher plugin runs the teacher-side
     # topology guard; here only the count is needed for that plugin's read.
-    _ = sum(1 for _ in iter_moe_layers(getattr(student, "_orig_mod", student)))
+    _ = sum(1 for _ in iter_moe_layers(unwrap_student(student)))
 
     # total_optim_steps MUST be computed before build_optimizer - the plugin
     # builds the optimizer + scheduler together and the scheduler needs it.
@@ -425,7 +508,7 @@ def run(
             # parameter names saved by _save_stage5_checkpoint (which also uses
             # the unwrapped module) resolve correctly even when `student` is a
             # torch.compile wrapper.
-            _restore_base = getattr(student, "_orig_mod", student)
+            _restore_base = unwrap_student(student)
             for pname, t in payload["router_state"].items():
                 parts = pname.split(".")
                 obj = _restore_base
@@ -444,7 +527,7 @@ def run(
             # `_orig_mod.*`-prefixed names that wouldn't match the saved
             # unprefixed set, causing every resume to falsely fail the
             # trainable-scope-changed check.
-            _unwrapped_for_resume = getattr(student, "_orig_mod", student)
+            _unwrapped_for_resume = unwrap_student(student)
             _current_names = {
                 n for n, p in _unwrapped_for_resume.named_parameters() if p.requires_grad
             }
@@ -520,6 +603,19 @@ def run(
     # future architecture variant introduces dropout, set frozen submodules to
     # inference mode.
     student.train()
+
+    # --- DDP wrap (Task 5) -------------------------------------------------
+    # Wrap AFTER freeze (setup_trainable_scope) + optimizer build + optional
+    # torch.compile + the per-rank resume restore (M4: every rank loaded the
+    # SAME checkpoint above, so the DDP construction broadcast rank-0 → others
+    # is a no-op consistency check). The optimizer already holds the leaf
+    # params; DDP wraps the SAME module so its parameters() are identical
+    # objects — no optimizer rebuild. No-op on the single-process path.
+    if ddp is not None:
+        student = wrap_ddp(student, device=device, backend=ddp.backend)
+        run_ctx.set("student", student, overwrite=True)
+        run_ctx.set("model", student, overwrite=True)
+
     remaining_steps = max(0, total_steps - resume_step)
 
     # --- Resume restore for the scheduler ---------------------------------
@@ -657,11 +753,18 @@ def run(
     # kill-switch (STAGE5_ASYNC_CKPT=0) is set or there is no partial_dir, in
     # which case _save_stage5_checkpoint falls back to a fully-synchronous
     # write. best.pt (early_stop.py) stays synchronous regardless.
+    # Rank-0-only async checkpoint writer (Task 6): only rank-0 writes
+    # step_*.pt, so ranks 1+ need no writer thread.
     _ckpt_writer = (
         _Stage5CheckpointWriter()
-        if (partial_dir is not None and _async_ckpt_enabled())
+        if (rank == 0 and partial_dir is not None and _async_ckpt_enabled())
         else None
     )
+    # Carries the BROADCAST early-stop decision out of the inner batch loop so
+    # the outer epoch break is DDP-synchronized (ranks 1+ never set the
+    # run_ctx flag — the tracker is rank-0-only, M2 — so the epoch break must
+    # use this lockstep flag, not run_ctx.get, to avoid a rank desync).
+    _stopped_early = False
     for epoch in range(s5["epochs"]):
         if epoch < resume_epoch:
             continue
@@ -690,6 +793,16 @@ def run(
             # completed step and triggering a spurious duplicate optimizer step.
             if epoch == resume_epoch and i <= resume_batch_i:
                 continue
+
+            # DDP per-STEP ROW-split (Task 4): each rank forwards a disjoint
+            # `per_gpu` row-slice of the SAME step's batch. The step count + the
+            # batch list stay GLOBAL and UNCHANGED. No-op on the single-process
+            # path (ddp is None). Sliced ONCE here, BEFORE the teacher dispatch,
+            # so the teacher sees the rank's rows and its logits are used as-is
+            # (no second slice). The cache teacher reads its window via the
+            # ddp_rank offset published on run_ctx below.
+            if ddp is not None:
+                batch = _row_slice(batch, rank, world_size)
 
             if device is not None:
                 batch = batch.to(device)
@@ -812,7 +925,15 @@ def run(
             # --- NaN tripwire (added 2026-05-13) ---
             # If loss went non-finite, dump diagnostics and abort. Earlier
             # crashes trained through 250+ NaN batches; this stops at batch 1.
-            if not torch.isfinite(loss):
+            #
+            # M1 (DDP NaN→deadlock fix): under DDP a NaN on ONE rank would let
+            # that rank raise + exit while the others block forever in the next
+            # gradient all-reduce. all_ranks_finite all-reduces a finiteness
+            # flag (ReduceOp.MIN) BEFORE backward so EVERY rank sees any rank's
+            # NaN and they raise TOGETHER. On the single-process path it is a
+            # plain local isfinite check (identical to before).
+            _local_finite = all_ranks_finite(loss, ddp=ddp)
+            if not _local_finite:
                 _dump_nan_diagnostics(
                     loss=loss,
                     teacher_logits=t_logits_shift,
@@ -821,9 +942,10 @@ def run(
                     epoch=epoch, step=step, batch_i=i,
                 )
                 raise RuntimeError(
-                    f"Stage 5 KD loss is non-finite at epoch={epoch} step={step} "
-                    f"batch={i}: loss={float(loss):.6e}. See ERROR-level dump above "
-                    "for teacher/student/param state. Aborting before backward()."
+                    f"Stage 5 KD loss is non-finite on at least one rank at "
+                    f"epoch={epoch} step={step} batch={i}: loss={float(loss):.6e}. "
+                    "See ERROR-level dump above for teacher/student/param state. "
+                    "Aborting before backward()."
                 )
 
             # --- Per-step debug log (env-gated, added 2026-05-13) ---
@@ -847,7 +969,13 @@ def run(
             # invariant to the Direction-E MSE term. When merge_repair is off
             # `kl_loss is loss`, so this is byte-identical to pre-E `main`.
             window_raw_kl_acc.append(kl_loss.detach() / max(T * T, 1e-12))
-            (loss / grad_accum).backward()
+            # DDP grad-accum no_sync (Task 5): the gradient all-reduce fires
+            # only on the boundary microbatch (one all-reduce per grad-accum
+            # window). nullcontext on the single-process path / boundary.
+            _is_boundary = (i + 1) % grad_accum == 0
+            with grad_sync_context(student, is_boundary=_is_boundary,
+                                   ddp_on=(ddp is not None)):
+                (loss / grad_accum).backward()
 
             if (i + 1) % grad_accum == 0:
                 # Pre-step: compute gradient norm over trainable params, but
@@ -866,7 +994,7 @@ def run(
                 _log_every = config["logging"]["log_every_n_steps"]
                 if (step + 1) % _log_every == 0:
                     # Unwrap compiled wrapper so parameters() reflects the original module's leaf params.
-                    _params_for_norm = getattr(student, "_orig_mod", student)
+                    _params_for_norm = unwrap_student(student)
                     grad_norm = float(
                         torch.nn.utils.clip_grad_norm_(
                             [p for p in _params_for_norm.parameters() if p.requires_grad and p.grad is not None],
@@ -896,51 +1024,82 @@ def run(
                     window_loss_acc.clear()
                     window_raw_kl_acc.clear()
 
-                    # Publish the per-window training-loop signals the
-                    # best-tracker / early-stop hooks read. step / epoch /
-                    # raw_kl_val are re-published every log window, so
-                    # overwrite=True (a no-op-safe unconditional write).
-                    run_ctx.set("step", step, overwrite=True)
-                    run_ctx.set("epoch", epoch, overwrite=True)
-                    run_ctx.set("raw_kl_val", raw_kl_val, overwrite=True)
+                    # DDP (Task 6): all-reduce-MEAN the window loss + raw_kl so
+                    # rank-0's tracker sees the single-GPU full-batch window mean
+                    # (equal per-rank token counts → mean-of-means == global
+                    # mean). No-op on the single-process path.
+                    if ddp is not None:
+                        import torch as _torch
+                        _dev = device if device is not None else _torch.device("cpu")
+                        loss_val = float(all_reduce_mean(
+                            _torch.tensor(loss_val, device=_dev)).item())
+                        raw_kl_val = float(all_reduce_mean(
+                            _torch.tensor(raw_kl_val, device=_dev)).item())
 
-                    # update_best_tracker: EMA update + best.pt save + patience
-                    # counter. check_early_stop: the early-stop DECISION (sets
-                    # early_stop_should_stop). Both rebind state on run_ctx
-                    # with overwrite=True - dispatched against the ROOT ctx so
-                    # the EMA carry survives across windows.
-                    walk_phases(
-                        ("update_best_tracker", "check_early_stop"),
-                        plugins, run_ctx,
-                    )
-                    ema = float(run_ctx.get("raw_kl_ema"))
-                    best_raw_kl_ema = float(run_ctx.get("best_raw_kl_ema"))
-                    best_step = int(run_ctx.get("best_step"))
-                    no_improve_windows = int(run_ctx.get("no_improve_windows"))
-                    _early_stopped = bool(run_ctx.get("early_stop_should_stop"))
+                    # M2: the best-tracker / early-stop DECISION runs RANK-0 ONLY
+                    # (all_reduce_mean is not guaranteed bit-identical across
+                    # ranks → up to 1 ULP drift → running the EMA/patience
+                    # arithmetic independently on every rank could desync the
+                    # stop decision). Ranks 1+ skip the entire tracker + log +
+                    # trackio block and receive the stop flag via broadcast.
+                    if rank == 0:
+                        # Publish the per-window training-loop signals the
+                        # best-tracker / early-stop hooks read. step / epoch /
+                        # raw_kl_val are re-published every log window, so
+                        # overwrite=True (a no-op-safe unconditional write).
+                        run_ctx.set("step", step, overwrite=True)
+                        run_ctx.set("epoch", epoch, overwrite=True)
+                        run_ctx.set("raw_kl_val", raw_kl_val, overwrite=True)
 
-                    current_lr = scheduler.get_last_lr()[0]
+                        # update_best_tracker: EMA update + best.pt save +
+                        # patience counter. check_early_stop: the early-stop
+                        # DECISION (sets early_stop_should_stop). Both rebind
+                        # state on run_ctx with overwrite=True - dispatched
+                        # against the ROOT ctx so the EMA carry survives across
+                        # windows.
+                        walk_phases(
+                            ("update_best_tracker", "check_early_stop"),
+                            plugins, run_ctx,
+                        )
+                        ema = float(run_ctx.get("raw_kl_ema"))
+                        best_raw_kl_ema = float(run_ctx.get("best_raw_kl_ema"))
+                        best_step = int(run_ctx.get("best_step"))
+                        no_improve_windows = int(run_ctx.get("no_improve_windows"))
+                        _early_stopped = bool(run_ctx.get("early_stop_should_stop"))
 
-                    log.info(
-                        "  epoch=%d step=%d window_loss=%.6f raw_kl=%.6f "
-                        "ema=%.6f best_ema=%.6f@%d lr=%.3e T=%.3f grad_norm=%.4f | %s",
-                        epoch, step, loss_val, raw_kl_val, ema, best_raw_kl_ema,
-                        best_step, current_lr, T, grad_norm, _rt_snap(),
-                    )
-                    payload = {
-                        "stage5/epoch": epoch,
-                        "stage5/step": step,
-                        "stage5/loss": loss_val,
-                        "stage5/raw_kl": raw_kl_val,
-                        "stage5/raw_kl_ema": ema,
-                        "stage5/best_raw_kl_ema": best_raw_kl_ema,
-                        "stage5/best_step": best_step,
-                        "stage5/lr": current_lr,
-                        "stage5/temperature": T,
-                        "stage5/grad_norm": grad_norm,
-                        "stage5/no_improve_windows": no_improve_windows,
-                    }
-                    _trackio_log(payload)
+                        current_lr = scheduler.get_last_lr()[0]
+
+                        log.info(
+                            "  epoch=%d step=%d window_loss=%.6f raw_kl=%.6f "
+                            "ema=%.6f best_ema=%.6f@%d lr=%.3e T=%.3f grad_norm=%.4f | %s",
+                            epoch, step, loss_val, raw_kl_val, ema, best_raw_kl_ema,
+                            best_step, current_lr, T, grad_norm, _rt_snap(),
+                        )
+                        payload = {
+                            "stage5/epoch": epoch,
+                            "stage5/step": step,
+                            "stage5/loss": loss_val,
+                            "stage5/raw_kl": raw_kl_val,
+                            "stage5/raw_kl_ema": ema,
+                            "stage5/best_raw_kl_ema": best_raw_kl_ema,
+                            "stage5/best_step": best_step,
+                            "stage5/lr": current_lr,
+                            "stage5/temperature": T,
+                            "stage5/grad_norm": grad_norm,
+                            "stage5/no_improve_windows": no_improve_windows,
+                        }
+                        _trackio_log(payload)
+                    else:
+                        # Ranks 1+ do not run the tracker; the stop flag is
+                        # broadcast from rank-0 below.
+                        _early_stopped = False
+
+                    # M2: broadcast rank-0's stop DECISION so ALL ranks break
+                    # together (the only broadcast needed for the decision).
+                    # All ranks reach this on the SAME log-window iterations
+                    # (step advances in lockstep). No-op on single-process.
+                    if ddp is not None:
+                        _early_stopped = broadcast_flag(_early_stopped, src=0)
                 else:
                     # Outside a log window the early-stop flag is not refreshed
                     # - keep the prior decision (False on the first windows).
@@ -974,7 +1133,13 @@ def run(
                 # into the writer, AFTER os.replace, so it never races a
                 # not-yet-written checkpoint. When _ckpt_writer is None
                 # (kill-switch) the save is fully synchronous, prune included.
-                if partial_dir is not None and ckpt_every > 0 and step % ckpt_every == 0:
+                # Rank-0-only I/O (Task 6): only rank-0 writes step_*.pt
+                # (N ranks racing the same files = torn writes / N× I/O). The
+                # best-tracker state slots (prev_ema / no_improve_windows /
+                # es_ref_ema) are published only on rank-0 (the tracker is
+                # rank-0-only, M2), so this block is unreachable on ranks 1+.
+                if (rank == 0 and partial_dir is not None and ckpt_every > 0
+                        and step % ckpt_every == 0):
                     _save_stage5_checkpoint(
                         partial_dir, step, epoch, i, student, optim,
                         grad_accum=grad_accum,
@@ -995,8 +1160,11 @@ def run(
                 # stopping point rather than re-running to the schedule end.
                 # No-op when _early_stop_patience == 0 (_early_stopped stays
                 # False) - byte-identical to pre-2026-05-17 `main`.
+                # _early_stopped is the BROADCAST decision (Task 6), so it is
+                # identical on every rank — all ranks break together (no DDP
+                # hang). Only rank-0 writes the final early-stop checkpoint.
                 if _early_stopped:
-                    if partial_dir is not None:
+                    if rank == 0 and partial_dir is not None:
                         # Drain any in-flight async step_*.pt write first so the
                         # final early-stop checkpoint is written AFTER it (no
                         # overlap / prune race), then write the early-stop
@@ -1015,16 +1183,15 @@ def run(
                             es_ref_ema=float(run_ctx.get("es_ref_ema")),
                             writer=None,
                         )
+                    _stopped_early = True
                     break
         # Trailing-batch accounting is computed once before the epoch loop
         # (see the run-start log.warning above); no per-epoch repeat here.
         optim.zero_grad()
-        # Early-stop also breaks the outer epoch loop. No-op when
-        # _early_stop_patience == 0 (early_stop_should_stop stays False).
-        if (
-            run_ctx.has("early_stop_should_stop")
-            and bool(run_ctx.get("early_stop_should_stop"))
-        ):
+        # Early-stop also breaks the outer epoch loop. _stopped_early is the
+        # BROADCAST decision (identical on every rank under DDP) so the epoch
+        # break is unanimous. No-op when _early_stop_patience == 0.
+        if _stopped_early:
             break
 
     # ---- async checkpoint writer drain (Tier-1 Lever C) ------------------
@@ -1047,17 +1214,155 @@ def run(
     # EarlyStopPlugin.reload_best_checkpoint swaps the trainable (router)
     # params for the best.pt snapshot before export (when save_best was active
     # and a best.pt exists).
-    walk_phases(("reload_best_checkpoint",), plugins, run_ctx)
+    #
+    # Task 6: best.pt was written by rank-0's tracker, so RANK-0 reloads it +
+    # swaps params; then broadcast_module_state propagates rank-0's params to
+    # every replica so all ranks export identical weights. (rank-0-load +
+    # broadcast avoids a read race vs all-ranks-load.) No-op on single-process.
+    if rank == 0:
+        walk_phases(("reload_best_checkpoint",), plugins, run_ctx)
+    if ddp is not None:
+        broadcast_module_state(unwrap_student(student), src=0)
 
     out_dir = artifacts_dir / f"{stage_key}_final"
-    save_compressed_checkpoint(
-        # Unwrap torch.compile wrapper before save so iter_moe_layers inside
-        # save_compressed_checkpoint can find the text tower via attribute lookup.
-        getattr(student, "_orig_mod", student), tokenizer, out_dir,
-        pipeline_stage=f"{stage_key}_final",
-    )
+    # Rank-0-only final export (Task 6): N ranks writing the same dir = torn
+    # writes. All ranks return the SAME out_dir Path (the parent consumes
+    # rank-0's via the result queue).
+    if rank == 0:
+        save_compressed_checkpoint(
+            # Unwrap torch.compile + DDP wrappers before save so iter_moe_layers
+            # inside save_compressed_checkpoint can find the text tower.
+            unwrap_student(student), tokenizer, out_dir,
+            pipeline_stage=f"{stage_key}_final",
+        )
     log.info("Stage %s complete -> %s", stage_key, out_dir)
     return out_dir
+
+
+def validate_ddp_teacher_strategy(config: dict, ddp) -> None:
+    """Validate the teacher VRAM strategy for a DDP run (Task 7).
+
+    DDP needs a full student replica per GPU (~50 GB at net-35%). The faithful
+    BF16 teacher (~70 GB) does not co-fit one 80 GB card with a student replica.
+    Two DDP-compatible strategies:
+
+      (A) epochs==1 + teacher-logit cache — FAITHFUL, read-only mmap shared
+          across ranks, zero per-rank teacher VRAM. (The orchestrator rejects
+          epochs>1 + cache, so this path is epochs==1 only.)
+      (B) quantized replicated teacher (4-bit OR an FP8 ``teacher_model_repo``)
+          — QUALITY TRADE (KD target is an approximation of θ_T, NOT
+          result-preserving vs BF16); allowed only when explicitly configured.
+
+    Raise on epochs>1 + DDP without a quantized teacher (the default
+    ``paper_dials_only`` recipe is epochs=2 → cache unavailable → BF16
+    replicated teacher would OOM). We do NOT silently fall back to a BF16
+    replicated teacher.
+    """
+    s5 = config["stage5_router_kd"]
+    epochs = int(s5["epochs"])
+    has_cache = bool(s5.get("teacher_logits_cache"))
+    quantized = bool(s5.get("teacher_load_in_4bit")) or bool(
+        s5.get("teacher_model_repo")
+    )
+    if epochs == 1 and has_cache:
+        return  # path A — faithful, zero per-rank teacher VRAM
+    if epochs > 1 and not quantized:
+        raise RuntimeError(
+            "Router-KD DDP with epochs>1 (the paper_dials_only default) cannot "
+            "use the teacher-logit cache (orchestrator rejects epochs>1 + cache) "
+            "and a BF16 replicated teacher (~70 GB) will not co-fit a student "
+            "replica (~50 GB) on one 80 GB card. Choose ONE: (A) set epochs=1 "
+            "and configure stage5_router_kd.teacher_logits_cache (faithful, zero "
+            "per-rank teacher VRAM); or (B) set "
+            "stage5_router_kd.teacher_load_in_4bit=true OR teacher_model_repo "
+            "(FP8) — a QUALITY TRADE (KD target is an approximation of theta_T, "
+            "NOT result-preserving vs BF16) that needs explicit sign-off."
+        )
+    # epochs==1 without cache + quantized/BF16: each rank loads its own teacher
+    # (Task 8); allowed (BF16 only if it fits — operator's call).
+
+
+def _spawn_ddp_workers(student, tokenizer, config, artifacts_dir, *,
+                       no_resume, stage_key, ddp):
+    """Spawn ``ddp.world_size`` in-process rank workers (Task 8).
+
+    Validates the teacher strategy, then serializes the LIVE compressed student
+    (post-merge at 2.5 / post-EoRA at 5) to a temp dir via
+    ``save_compressed_checkpoint`` — the SAME serializer the final export uses,
+    so factored/merged structure round-trips. Each worker reconstructs it via
+    ``load_compressed_model`` from that dir (H1: NOT
+    ``config["model"]["name_or_path"]`` — the original uncompressed checkpoint).
+    rank-0's ``out_dir`` Path is returned via the result queue; the temp dir is
+    cleaned up after the join.
+    """
+    validate_ddp_teacher_strategy(config, ddp)
+    # Task 12: merge-repair under DDP is NOT YET SUPPORTED (the forward-capture
+    # hooks must attach to the DDP .module, and find_unused_parameters may need
+    # re-evaluation if masked centroid rows ever receive no grad). It is
+    # Stage-2.5-only + opt-in + default-OFF, so DDP ships without it; raise a
+    # clear error if both are requested rather than silently producing wrong
+    # gradients. Tracked as a separate follow-up plan.
+    _mr = (config.get("stage5_router_kd", {}) or {}).get("merge_repair", {}) or {}
+    if stage_key == "stage2p5" and bool(_mr.get("enabled")):
+        raise RuntimeError(
+            "Router-KD DDP + merge-repair (Direction E) is not yet supported. "
+            "merge-repair is Stage-2.5-only and opt-in; run it single-process, "
+            "or disable stage5_router_kd.merge_repair.enabled to use DDP. "
+            "(DDP support for merge-repair is a tracked follow-up.)"
+        )
+    artifacts_dir = Path(artifacts_dir)
+    src_dir = artifacts_dir / "_ddp_student_src"
+    save_compressed_checkpoint(
+        unwrap_student(student), tokenizer, src_dir,
+        pipeline_stage=f"{stage_key}_ddp_src",
+    )
+    payload = dict(
+        config=config,
+        artifacts_dir=str(artifacts_dir),
+        student_src=str(src_dir),
+        no_resume=no_resume,
+        stage_key=stage_key,
+        ddp_world_size=ddp.world_size,
+        backend=ddp.backend,
+    )
+    try:
+        return spawn_ddp_workers(
+            ddp.world_size, backend=ddp.backend,
+            payload=payload, worker_fn=_run_ddp_worker,
+        )
+    finally:
+        import shutil
+        shutil.rmtree(src_dir, ignore_errors=True)  # rank-0/parent cleanup
+
+
+def _run_ddp_worker(*, rank, world_size, config, artifacts_dir, student_src,
+                    no_resume, stage_key, ddp_world_size, backend):
+    """In-child rank worker (Task 8).
+
+    Reconstructs the COMPRESSED student from the parent-written temp dir
+    (rebuilds FactoredExperts at stored ranks, resizes routers) — NOT
+    ``load_model`` on the original repo — then runs the extracted single-process
+    loop threaded with this rank's ``rank`` / ``world_size`` / ``DdpConfig``.
+    Only rank-0's returned Path is consumed by the parent.
+    """
+    device = (
+        torch.device(f"cuda:{rank}") if backend == "nccl"
+        else torch.device("cpu")
+    )
+    # load_compressed_model returns a 3-tuple (model, tokenizer, meta) — unpack
+    # all 3 (L-new; mirror the Stage-3 precedent). NOT load_model(original).
+    student, tokenizer, _ = load_compressed_model(
+        student_src,
+        device_map=({"": f"cuda:{rank}"} if backend == "nccl" else "cpu"),
+        torch_dtype=config["model"]["torch_dtype"],
+        attn_implementation=config["model"]["attn_implementation"],
+    )
+    ddp_cfg = DdpConfig(enabled=True, world_size=world_size, backend=backend)
+    return _run_single_process(
+        student, tokenizer, config, Path(artifacts_dir),
+        device=device, no_resume=no_resume, stage_key=stage_key,
+        rank=rank, world_size=world_size, ddp=ddp_cfg,
+    )
 
 
 def _async_ckpt_enabled() -> bool:
@@ -1215,7 +1520,7 @@ def _save_stage5_checkpoint(
     # underlying module's attribute tree (e.g. "_orig_mod.*" prefixes are
     # stripped or mangled). Use the unwrapped module so that the names saved
     # here match the attribute path walked during restore.
-    unwrapped = getattr(student, "_orig_mod", student)
+    unwrapped = unwrap_student(student)
     router_state = {
         name: p.data.cpu().clone()
         for name, p in unwrapped.named_parameters()
