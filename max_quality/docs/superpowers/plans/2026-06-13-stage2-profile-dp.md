@@ -1,160 +1,138 @@
-# Stage 2 — DP per-layer profile forward + merge-anchor union fix
+# Stage 2 — persistent-pool DP profile forward (structural replay) + merge-anchor union fix
 
 **Branch:** `feat/stage2-profile-dp` · **Worktree:** `/home/lucas/ai/wt-s2mg` · **Code root:** `max_quality/`
 **Status:** PLAN (do not implement from this doc without the review loop).
-**Date:** 2026-06-13
+**Date:** 2026-06-13 · **Rev 2** (post plan-review CHANGES REQUESTED — A0 resolved to design-1, C1/H1/H2/H3 + B-polish folded in)
 
-Two independent features, both Stage 2, bundled in this worktree:
+Two features, both Stage 2, bundled in this worktree:
 
-- **(A)** Data-parallel the Stage-2 per-layer profiling forward (the bottleneck). Shard
-  calibration **by sequence** across GPUs, key-wise reduce the additive accumulators
-  (REAP + REAM grams + input covariance), normalize once. RESULT-PRESERVING, opt-in,
-  default byte-identical.
+- **(A)** Data-parallel the Stage-2 per-layer profiling forward (the bottleneck) via a
+  **PERSISTENT worker pool** spawned once at Stage-2 start, driven per layer over a
+  command/reduce IPC channel. Shard calibration **by sequence**, key-wise reduce the four
+  additive accumulators, normalize once. RESULT-PRESERVING, opt-in, default byte-identical.
 - **(B)** Fix the REAM **merge-anchor wart**: the post-merge covariance remap copies the
   **centroid's own** input Gram into the survivor slot instead of the **group-UNION**
-  (`Σ_j G_j` over the merge group). A real correctness bug surfaced by the acov research,
-  independent of multi-GPU. Lives in Stage 2 → bundled here (NOT the acov branch).
+  (`Σ_j G_j`). Real correctness bug surfaced by the acov research, independent of multi-GPU.
+
+> **Effort re-estimate (A0 resolved):** Feature A is **XL / high-risk greenfield**. There
+> is **no persistent-pool / live-IPC template in this repo** — Stage-3 spawns *fresh*
+> workers per call and reduces via disk (`covariance_collection.py:1271-1289`), it never
+> keeps workers alive or sends them live commands. Feature A builds a **new IPC subsystem**
+> (persistent pool + per-layer parent→worker command channel + worker→parent reduce
+> channel + structural-replay re-sync + lifecycle/teardown). Feature B is **S / low-risk**
+> and lands first to de-risk the baseline.
 
 ---
 
-## 0. Load-bearing facts established by the spec + code read (cite + verified)
+## 0. Load-bearing facts (cited + verified against the actual code)
 
-Spec: `max_quality/docs/multigpu_analysis/stage2.md`. Verified against the actual code below.
+Spec: `max_quality/docs/multigpu_analysis/stage2.md`. Verified below.
 
-### The sequential-merge constraint is LOAD-BEARING (no cross-layer parallelism)
+### The sequential-merge constraint is LOAD-BEARING — no cross-layer parallelism
 
-The driver loop (`stage2/orchestrator.py:1673-1712`) processes MoE layers **strictly in
-order**. Per layer it runs: profile → assign (`_run_assignment`) → merge
-(`LayerMergePlugin.merge` → `_merge_experts_inplace`, `merging.py:423-424` `bank.set`) →
-post_merge (`bank.select` + router resize, `layer_merge.py:624-627`). The merge **mutates
-the live model in place**. Layer `L+1`'s profile forwards through layers `0..L` of *that
-mutated model* (`profiling.py:338-342`, `model(input_ids=batch)` under
-`early_exit_after_layer(model, layer_idx)`). So **layer L+1's profile always consumes layer
-L's merged weights** — REAM §4 sequential merging (`layer_merge.py` docstring `:237-266`).
+Driver loop `stage2/orchestrator.py:1673-1712` processes MoE layers **strictly in order**:
+profile → assign (`_run_assignment`) → merge (`_merge_experts_inplace`,
+`merging.py:423-424` `bank.set`) → post_merge (`bank.select` + router resize,
+`layer_merge.py:624-627`). The merge **mutates the live model in place**; layer `L+1`'s
+profile forwards through `0..L` of *that mutated model* (`profiling.py:338-342` under
+`early_exit_after_layer(model, layer_idx)`). REAM §4 sequential merging
+(`layer_merge.py:237-266`).
 
-> **Therefore: task-parallelism ACROSS layers is ILLEGAL (−1.0 AVG, REAM §5.4 ablation).
-> The plan MUST NOT propose cross-layer parallelism.** The only exploitable axis is
-> DATA-PARALLEL **within each layer's profile forward**, applied PER LAYER inside the
-> sequential loop. Every task below respects this.
+> **Task-parallelism ACROSS layers is ILLEGAL (−1.0 AVG, REAM §5.4). The plan MUST NOT
+> propose it.** The only exploitable axis is DATA-PARALLEL **within each layer's profile
+> forward**, applied PER LAYER inside the sequential loop. Every task respects this.
 
 ### The forward is the bottleneck and is exactly DP-able
 
-There is exactly ONE calibration forward per layer: `_profile_layer` (`profiling.py:169`),
-an `instrument_experts`-hooked early-exit `model(input_ids=batch)`
-(`profiling.py:327-348`). It co-produces REAP scores, REAM δ_gate/δ̃_expert, input
-covariance, and the distill-input reservoir in one pass. Total layer-forwards across the
-sequential passes (40-layer model) = 1+2+…+40 = 820 (`profiling.py:190-191`).
+One calibration forward per layer: `_profile_layer` (`profiling.py:169`), an
+`instrument_experts`-hooked early-exit `model(input_ids=batch)`
+(`profiling.py:327-348`), co-producing REAP + REAM + cov + distill-input in one pass.
+820 layer-forwards across the 40 sequential passes (`profiling.py:190-191`).
 
-### All accumulators are additive Σ over tokens with a separate additive count — proven (verified)
+### All FOUR accumulators are additive Σ-over-tokens + separate additive count (verified)
 
-| Accumulator | Numerator (additive) | Count (additive) | Read (mean-at-read) |
+| Accumulator | Numerator (additive) | Count (additive) | Read |
 |---|---|---|---|
-| **REAP** `ReapAccumulator.add_gpu` | `_gpu_sums[k].add_(contrib)` `activation_hooks.py:885-887`; `contrib = (gate·‖f‖).sum()` `:1433-1434` | `counts[k]+=n`, `freq[k]+=n` `:888-889` | `score() = s/n` `:923-930` |
-| **REAM δ_gate** `record_router_logits` | `_gate_gram[li].add_(bᵀb)` `:182-186` | (Gram diag carries ‖v‖²; no separate count) | `compute_gate_similarity_matrix` `:464` |
-| **REAM δ̃_expert** `finalize_batch` | `_sim_tensor[li].add_(sim_sum)` `:460-462` | `_total_tokens_by_layer[li]+=n` `:235` (via `record_batch_token_count`) | `compute_delta_expert = sim/total` `:586` |
-| **REAM C_act** `record_neuron_activations` | `_neuron_act_sum[k]+=batch_sum` `:604-608` | `_neuron_act_count[k]+=n` `:609` | `get_neuron_mean = s/c` `:619` |
-| **Input cov** `InputCovarianceAccumulator.update` | `_pending[k].add_(cov)` `:1024-1029` (cov = `flatᵀ@flat`) | `_gpu_token_count[k]+=n` `:1030` | `finalize_layer` sums + casts `:1082-1112` |
+| **REAP** `add_gpu` | `_gpu_sums[k].add_(contrib)` `activation_hooks.py:885-887`; `contrib=(gate·‖f‖).sum()` `:1433-1434` | `counts[k]+=n`, `freq[k]+=n` `:888-889` | `score()=s/n` `:923-930` |
+| **REAM δ_gate** `record_router_logits` | `_gate_gram[li].add_(bᵀb)` (**fp64**) `:178-186` | (Gram diag = ‖v‖²) | `compute_gate_similarity_matrix` `:464` |
+| **REAM δ̃_expert** `finalize_batch` | `_sim_tensor[li].add_(sim_sum_f64)` (**fp64**) `:459-462` | `_total_tokens_by_layer[li]+=n` `:235` | `compute_delta_expert=sim/total` `:586` |
+| **REAM C_act** `record_neuron_activations` | `_neuron_act_sum[k]+=batch_sum` `:604-608` | `_neuron_act_count[k]+=n` `:609` | `get_neuron_mean=s/c` `:619` |
+| **Input cov** `update` | `_pending[k].add_(cov)` (**fp32**) `:1024-1029`, cov=`flatᵀ@flat` | `_gpu_token_count[k]+=n` `:1030` | `finalize_layer` sums+casts `:1082-1112` |
 
-Every numerator is a **linear sum over tokens**; every count is a **linear sum over
-tokens**. ⇒ For a sequence-disjoint shard set, the reduce is exactly
-`Σ_r numerator_r` and `Σ_r count_r`, mean applied once after the reduce. This is the
-**same additive-Gram property** Stage-3 already mp.spawn-reduces. The only non-determinism
-is fp32 accumulation non-associativity (~1e-5/1e-6), which the existing pipeline already
-tolerates (`activation_hooks.py:308-311`) and which the byte-identical default path avoids
-entirely (1 replica ⇒ no reduce).
+Every numerator is a linear sum over tokens; every count a linear sum over tokens. For a
+**sequence-disjoint** shard set the reduce is exactly `Σ_r num_r / Σ_r count_r`, mean once
+after the reduce. REAM grams are **fp64 ⇒ the reduce is bit-exact regardless of order**;
+cov + REAP are fp32 ⇒ ~1e-6 drift, the same class the serial path already tolerates
+(`activation_hooks.py:308-311`) — and absent on the byte-identical 1-replica default.
 
-### The Stage-3 DP template to mirror (verified, `stage3/plugins/covariance_collection.py`)
+### Stage-3 DP template to mirror (DISK-reduce only; NOT a persistent pool)
 
-1. **Driver:** `run_dp_covariance_collection(... replicas, ...)` `:1213-1289` — shards
-   calib, spawns replicas, joins, reduces spill dirs.
-2. **Shard:** `_shard_calib(calib, replicas)` `:1052-1071` — **contiguous dim-0 slices
-   (by sequence), token-disjoint**, last shard takes remainder. "each replica owns its own
-   token_idx space; we never share … only sum the final per-(layer,expert) Gram matrices".
-3. **Replica worker:** `_cov_replica_worker(...)` `:1074-1210` — pins via
-   `os.environ["CUDA_VISIBLE_DEVICES"]=visible_devices` `:1096`, **reloads model from
-   disk** (`_load_compressed_model(student_path,…)` `:1119`), builds its own accumulator,
-   runs `_collect_covariances(calib=shard, cov_auto=…)`, spills per-layer `layer_{idx}.pt`
-   to its **per-replica** dir.
-4. **Reduce:** `_reduce_spilled_cov_dirs(replica_dirs, out_dir, storage_dtype)` `:211-289`
-   — key-wise **fp32 sum** of `payload["covariance"]`, token counts sum as ints, processed
-   in **sorted replica-dir order** (determinism), write canonical `layer_{li}.pt`.
-5. **Per-replica auto-batch:** double-gate `_cov_is_auto` (`cov_batch_size=="auto"` AND
-   `auto_batch.enabled`) `:450-464`; each replica probes its OWN
-   `CudaMemProbe(device)` and sizes INDEPENDENTLY (`covariance_collection.py:373-447`
-   comment: "every replica probes its OWN pinned-device VRAM … NO cross-replica min").
-6. **Per-sequence reduction-pin:** `InputCovarianceAccumulator.update_grouped(... seq_ids)`
-   `activation_hooks.py:1032-1049` splits rows by `token_idx // seq_len` in ascending seq
-   order ⇒ the finalized per-key Gram is **batch-size-invariant**, so each replica can
-   auto-batch independently and the reduce stays exact.
-7. **Lifecycle:** fresh `mp.spawn` per call (no persistent pool); synchronous `join()` +
-   exit-code check `:1271-1282`; results flow through the **filesystem** (spill dirs).
-
-### The merge-anchor wart (B) — exact location + correctness statement (verified)
-
-`_remap_covariance_for_layer` (`stage2/shared_io.py:301-344`), called from
-`LayerMergePlugin.write_artifacts` (`layer_merge.py:678-680`) BEFORE the cov snapshot,
-remaps the post-merge survivor index. For a survivor slot that is a **merge centroid**, it
-copies the **centroid's OWN** Gram `(li, centroid, name)` verbatim into the new index
-(`shared_io.py:320-326`) and **drops** every non-centroid member's Gram (`:320-322`,
-`if eidx not in id_to_new: continue`).
-
-But the survivor weight is `W_merged = Σ_j b_j·perm_j(W_j)` (`merging.py:308`,
-`bank.set(centroid, accs[name])` `:424`) — a centroid of the whole group. The acov
-research states this precisely (`docs/research/2026-06-13-acov-capture-point.md:280-288`):
-
-> "a survivor slot is a centroid of a merge GROUP, but the stored `A` is the **single
-> original expert's** Gram copied verbatim into that slot (`stage2/shared_io.py:324-326`),
-> **not** averaged over the group. … the anchor `A` is genuinely mis-attributed — the
-> merged weight `W_merged` is anchored to ONE constituent's input distribution, not the
-> merged slot's true (group-union) distribution. This is a real correctness wart for the
-> merge arms (REAM)."
-
-**The fix:** the survivor's anchor Gram must be the **group UNION** `A_survivor = Σ_{j∈group} G_j`
-(sum of all constituents' input Grams). The Gram is `X^TX` summed over tokens, so the
-union of the group's input distributions is *exactly* the sum of the per-member Grams —
-no normalization, no averaging, purely additive (matches the AA-SVD anchor `A=X` semantics
-which is an unnormalized Gram; Stage 3 consumes it directly). `down_proj` Grams must be
-permuted to the centroid's neuron axis before summing (the same `perm` the merge used) —
-see Task B2.
+`stage3/plugins/covariance_collection.py`: driver
+`run_dp_covariance_collection(...replicas...)` `:1213-1289`; shard `_shard_calib`
+`:1052-1071` (contiguous dim-0 / by-sequence, token-disjoint); worker `_cov_replica_worker`
+`:1074-1210` (pins via `CUDA_VISIBLE_DEVICES` `:1096`, **reloads model from disk** `:1119`,
+spills per-layer); reduce `_reduce_spilled_cov_dirs` `:211-289` (fp32 key-wise sum, sorted
+dirs); per-replica auto-batch double-gate `_cov_is_auto` `:450-464`; per-seq pin
+`update_grouped` `activation_hooks.py:1032-1049`. **What we reuse:** the shard math, the
+per-key disk-spill reduce, the per-replica auto-batch wiring, the per-seq pin. **What we
+must BUILD NEW (no template):** persistent pool, live per-layer command channel, structural
+re-sync — see C1/A0.
 
 ---
 
-## 1. Scope / Out of scope
+## 1. CRITICAL — C1: the per-layer re-sync is STRUCTURAL SURGERY, not a value delta
 
-**In scope:**
-- (A) Per-layer DP profile forward: shard-by-sequence, key-wise reduce of REAP+REAM+cov+
-  distill accumulators, merged-weight re-sync to replicas per layer, per-replica auto-batch
-  inherited, default-off byte-identical golden gate.
-- (B) Merge-anchor union fix in `_remap_covariance_for_layer` (+ the down_proj-perm union)
-  with a test proving the survivor's `A` is the group union, not one constituent.
+**The Rev-1 "delta broadcast" framing was WRONG.** Verified, the per-layer merge changes
+TENSOR SHAPES and REPLACES Parameter objects — a worker cannot value-copy into its resident
+tensors because those tensors change shape and identity:
 
-**Out of scope (explicit):**
-- Live ≥2-GPU validation (DEFERRED to GPU — see Task A8; this plan ships 1-GPU
-  byte-identical + a mocked-spawn reduce test).
-- TASK-PARALLEL `expert_distill` across groups (Stage-2 roadmap item 2) and DP `merge_heal`
-  minibatch (item 3) — separate future work, NOT here.
-- Any change to the solver layer (all CPU-bound, MG-moot per spec Q2).
-- Cross-layer parallelism — ILLEGAL (§0); never propose it.
-- Changing REAP semantics: in production REAP rides the vLLM sidecar
-  (`reap_scores_cache.py`), so the HF forward's value is **cov + REAM**; REAP rides the
-  shard for free.
+- `merging.py:424` `bank.set(centroid, accs[name])` — writes merged centroid VALUES into the
+  stacked expert tensor (value change, still pre-select shape).
+- `layer_merge.py:626` `bank.select(final_kept_ids)` → `merging`/`model_io` **SLICES the
+  stacked expert tensor down to a smaller SHAPE** (n_experts → n_kept rows).
+- `merging.py:435-440` `_resize_router_for_kept_experts`: `router.weight =
+  nn.Parameter(router.weight.data.index_select(0, idx)...)` **REPLACES the Parameter
+  object** + mutates `router.num_experts` (`:440`), `router.top_k` (`:442-443`),
+  `mlp.num_experts` (`:446-447`).
+
+**FIX — structural replay (not delta broadcast).** Each layer, the parent sends each worker
+the *recipe* to reproduce the structural mutation on its own resident copy:
+
+1. parent merges layer `L` on itself (the normal serial merge/post_merge),
+2. parent broadcasts to every worker: `final_kept_ids`, `grouped`, and the **merged
+   centroid tensors** for layer `L` (`{name: bank.get(centroid)}` for each centroid, the
+   post-`bank.set` pre-`select` values — or equivalently the post-select kept tensors),
+3. each worker **REPLAYS the same structural ops** on its model copy:
+   `_merge_experts_inplace` is NOT re-run (no profile data on the worker); instead the
+   worker (a) patches the centroid bank rows with the broadcast merged values, then (b) runs
+   `bank.select(final_kept_ids)` + `_resize_router_for_kept_experts(layer_ref,
+   final_kept_ids)` — the *identical* structural surgery the parent ran. After replay the
+   worker's layer `L` is shape- and value-identical to the parent's.
+
+> **Simplification to consider in review (RAISE):** instead of "patch centroid values then
+> replay select+resize", broadcast the **already-merged, already-selected kept tensors**
+> (parent's post-`post_merge` `bank.get(pos)` for every kept position + the resized
+> `router.weight`/`bias`) and have the worker `bank.set` + replace the router Parameter +
+> set `num_experts`/`top_k` directly. This is the same wire volume (one merged MoE layer)
+> and skips re-deriving the slice on the worker — strictly simpler and less divergence-
+> prone. Recommend this variant; either is structural replay, NOT a value delta.
+>
+> **Drop all "delta broadcast" language.** The re-sync is broadcasting a structurally-merged
+> layer + replaying the shape change.
+
+The bulk of the model (all other layers) is unchanged each step, so the per-layer wire
+volume is one merged MoE layer's tensors — bounded, but this is a **live mp IPC transfer**
+(new subsystem), not a disk reload.
 
 ---
 
-## 2. Feature (B) FIRST — the merge-anchor union fix (independent, no multi-GPU)
+## 2. Feature (B) FIRST — merge-anchor union fix (independent, S/low-risk)
 
-Do (B) first: it is small, independent, and de-risks the golden baseline that (A) must
-preserve. **TDD: write the failing test, then the fix.**
+TDD: failing tests, then the fix. Lands first; de-risks the baseline A must preserve.
 
-### Task B1 — Failing test: survivor anchor must be the group UNION
+### Task B1 — Failing test: survivor anchor = group UNION (gate_proj)
 
-**File:** `max_quality/tests/test_stage2_merge_anchor_union.py` (NEW)
-
-Construct an `InputCovarianceAccumulator` populated for a layer with three experts
-(centroid `c=0`, members `m1=1`, `m2=2`) for `gate_proj` only (down_proj covered in B2),
-with **distinct, known** Gram tensors `G0, G1, G2`. Call the remap with
-`kept_ids=[0]` and a `grouped={0:[0,1,2]}` map (the merge group). Assert the survivor's
-remapped `(layer, 0, "gate_proj")` Gram equals `G0+G1+G2` (the union), NOT `G0`.
+**File:** `max_quality/tests/test_stage2_merge_anchor_union.py` (NEW).
 
 ```python
 import torch
@@ -170,15 +148,12 @@ def test_survivor_anchor_is_group_union_gate():
     G = {e: torch.full((4, 4), float(e + 1)) for e in (0, 1, 2)}
     for e in (0, 1, 2):
         _put(cov, 7, e, "gate_proj", G[e], ntok=10 * (e + 1))
-    # Merge group: centroid 0 absorbs 1 and 2. Survivor kept set = [0].
     _remap_covariance_for_layer(cov, 7, kept_ids=[0], grouped={0: [0, 1, 2]})
     A = cov.covariance[(7, 0, "gate_proj")]
-    assert torch.equal(A, G[0] + G[1] + G[2]), "anchor must be the group UNION Σ_j G_j"
-    # token_count is the union sum too (additive denominator).
+    assert torch.equal(A, G[0] + G[1] + G[2]), "anchor must be group UNION Σ_j G_j"
     assert cov.token_count[(7, 0, "gate_proj")] == 10 + 20 + 30
 
 def test_non_merged_survivor_unchanged_byte_identical():
-    # A protected / singleton survivor (no group) keeps its own Gram verbatim.
     cov = InputCovarianceAccumulator()
     G = torch.arange(9.0).reshape(3, 3)
     _put(cov, 3, 5, "gate_proj", G, ntok=42)
@@ -187,19 +162,16 @@ def test_non_merged_survivor_unchanged_byte_identical():
     assert cov.token_count[(3, 0, "gate_proj")] == 42
 ```
 
-Run (expect FAIL on the union assert before B2/B3):
-`cd max_quality && python -m pytest tests/test_stage2_merge_anchor_union.py -x -q`
+`cd max_quality && python -m pytest tests/test_stage2_merge_anchor_union.py -x -q` → FAIL.
 
-### Task B2 — Failing test: down_proj union must be PERMUTED to the centroid axis
+### Task B2 — Failing test: down_proj union PERMUTED to centroid axis (B2-opt-A, the ONLY option)
 
-**File:** same test module.
-
-The down_proj Gram lives on the SwiGLU intermediate-neuron axis. The merge permutes each
-member's neuron axis to the centroid (`merging.py:307` `Wm[:, perm]`,
-`merging.py:357-360` already permutes the member's down Gram for RegMean). The union must
-sum each member's down Gram **after** applying that member's `perm` to BOTH axes, so neuron
-labels align. Test: give members non-identity perms; assert the survivor down Gram equals
-`G0 + perm(G1) + perm(G2)`.
+**B2-opt-B (gate/up-only fallback) is DROPPED** — it would leave half the wart. We commit
+to exact perm threading. The down_proj Gram is on the SwiGLU intermediate-neuron axis; the
+merge permutes each member's neuron axis to the centroid (`merging.py:307` `Wm[:, perm]`).
+The union must permute **BOTH axes** of each member's down Gram by **the exact `perm` the
+merge used** before summing — mirroring the RegMean down-Gram permutation already in the
+code (`merging.py:352-360`, `G_down_m.index_select(0, perm_t).index_select(1, perm_t)`).
 
 ```python
 def test_survivor_anchor_down_is_permuted_union():
@@ -208,65 +180,48 @@ def test_survivor_anchor_down_is_permuted_union():
     G = {e: torch.arange(d * d, dtype=torch.float32).reshape(d, d) + 100 * e for e in (0, 1, 2)}
     for e in (0, 1, 2):
         _put(cov, 2, e, "down_proj", G[e], ntok=5)
-    # Per-member neuron permutations applied by the merge (centroid perm = identity).
-    perms = {0: None, 1: [2, 0, 1], 2: [1, 2, 0]}
-    def permute_both(t, p):
+    perms = {0: None, 1: [2, 0, 1], 2: [1, 2, 0]}   # centroid perm = None (identity)
+    def pb(t, p):
         idx = torch.as_tensor(p, dtype=torch.long)
         return t.index_select(0, idx).index_select(1, idx)
-    expected = G[0] + permute_both(G[1], perms[1]) + permute_both(G[2], perms[2])
+    expected = G[0] + pb(G[1], perms[1]) + pb(G[2], perms[2])
     _remap_covariance_for_layer(
         cov, 2, kept_ids=[0], grouped={0: [0, 1, 2]}, member_perms={0: perms},
     )
     assert torch.allclose(cov.covariance[(2, 0, "down_proj")], expected)
 ```
 
-> **Design note:** `_remap_covariance_for_layer` does not currently know the per-member
-> down-proj perms. Two options — decide in review:
-> - **B2-opt-A (preferred):** thread the perms from the merge. `_merge_experts_inplace`
->   already computes/uses them (`merging.py:280-298`, `perm_cache`). Have
->   `LayerMergePlugin.merge` capture a `{centroid: {member: perm}}` map into a ctx slot
->   (`merge_member_perms`) and `write_artifacts` pass it to the remap. This is exact.
-> - **B2-opt-B (fallback):** if threading perms is deemed too invasive for v1, sum the
->   gate/up union (B1, axis-free) but **leave down_proj as the centroid's own Gram** with
->   an explicit `# WART: down union pending perm-threading` comment + a logged WARNING, and
->   a skipped xfail test. NOT preferred — it leaves half the wart. Raise to user if B2-opt-A
->   looks larger than ~40 LOC.
-
 ### Task B3 — Implement the union remap
 
-**File:** `max_quality/src/moe_compress/stage2/shared_io.py`,
-`_remap_covariance_for_layer` (`:301-344`).
-
-Change the signature to accept the merge grouping (and, per B2-opt-A, the per-member
-perms), and accumulate the union into the survivor slot instead of copying the centroid's
-Gram. Sketch:
+**File:** `stage2/shared_io.py`, `_remap_covariance_for_layer` (`:301-344`). Signature gains
+**keyword-only `grouped=None, member_perms=None`** (None ⇒ today's verbatim singleton path,
+keeping `test_stage2_merge.py:17-32` green — see H2). Sketch:
 
 ```python
-def _remap_covariance_for_layer(
-    cov, layer_idx, kept_ids, *, grouped=None, member_perms=None,
-):
+def _remap_covariance_for_layer(cov, layer_idx, kept_ids, *, grouped=None, member_perms=None):
     grouped = grouped or {}
     member_perms = member_perms or {}
     id_to_new = {old: new for new, old in enumerate(kept_ids)}
     new_cov, new_tokens = {}, {}
     with cov._lock:
-        # 1) pass through other layers unchanged (verbatim).
-        # 2) for each kept survivor:
+        # pass through OTHER layers verbatim (unchanged from :316-318)
+        for key, val in list(cov.covariance.items()):
+            if key[0] != layer_idx:
+                new_cov[key] = val
+                new_tokens[key] = cov.token_count.get(key, 0)
         for old in kept_ids:
             new = id_to_new[old]
-            members = grouped.get(old)            # None ⇒ protected/singleton (byte-identical path)
-            for name in ("gate_proj", "down_proj"):   # up_proj aliases gate_proj (see acc)
+            members = grouped.get(old)
+            for name in ("gate_proj", "down_proj"):     # up_proj aliases gate_proj
                 key = (layer_idx, old, name)
-                if members is None or len(members) <= 1:
-                    # Singleton / protected — verbatim copy (NO behaviour change).
+                if not members or len(members) <= 1:     # singleton/protected — byte-identical
                     val = cov.covariance.get(key)
                     if val is None:
                         continue
                     new_cov[(layer_idx, new, name)] = val
                     new_tokens[(layer_idx, new, name)] = cov.token_count.get(key, 0)
                     continue
-                # MERGED survivor — UNION over the group.
-                acc, ntok = None, 0
+                acc, ntok = None, 0                       # MERGED — UNION Σ_j G_j
                 for m in members:
                     g = cov.covariance.get((layer_idx, m, name))
                     if g is None:
@@ -275,7 +230,7 @@ def _remap_covariance_for_layer(
                         p = member_perms.get(old, {}).get(m)
                         if p is not None:
                             idx = torch.as_tensor(p, dtype=torch.long, device=g.device)
-                            g = g.index_select(0, idx).index_select(1, idx)
+                            g = g.index_select(0, idx).index_select(1, idx)   # BOTH axes
                     g32 = g.to(torch.float32)
                     acc = g32 if acc is None else acc + g32
                     ntok += cov.token_count.get((layer_idx, m, name), 0)
@@ -284,356 +239,348 @@ def _remap_covariance_for_layer(
                 new_cov[(layer_idx, new, name)] = acc.to(cov.storage_dtype)
                 new_tokens[(layer_idx, new, name)] = ntok
         cov.covariance, cov.token_count = new_cov, new_tokens
+    # preserve the dropped-key WARNING (:335-344): recompute from keys absent in new_cov
 ```
 
-**Invariants to preserve:**
-- Non-merged survivors (protected experts, singleton centroids) keep their Gram **byte-
-  identical** to today (the `members is None or len<=1` branch). This is what keeps every
-  existing golden green and is asserted by `test_non_merged_survivor_unchanged_byte_identical`.
-- Dropped-expert logging (`shared_io.py:335-344`) preserved (recompute `n_dropped` from
-  keys not landing in `new_cov`).
-- `up_proj` aliases `gate_proj` in the accumulator (`InputCovarianceAccumulator._alias_gate_up`,
-  `:1001-1002` writes are skipped, `get` redirects `:1310-1314`) — so only `gate_proj` +
-  `down_proj` keys exist; iterating those two is complete.
-- fp32-sum-then-cast-to-`storage_dtype` mirrors `finalize_layer` `:1109-1111` and the
-  Stage-3 reduce `:266-280`.
+Invariants: singleton/protected byte-identical (B1 second test + `test_stage2_merge.py:17-32`);
+fp32-sum-then-cast mirrors `finalize_layer:1109-1111`; `up_proj` aliases gate so iterating
+`{gate_proj, down_proj}` is complete (`activation_hooks.py:1001-1002,1310-1314`); keep the
+orphan-token + dropped-expert logging.
 
-### Task B4 — Thread `grouped` + `member_perms` from the merge to the remap
+### Task B4 — Thread `grouped` + EXACT `member_perms` from the merge to the remap
 
-**Files:** `stage2/plugins/layer_merge.py` (`merge` `:543-591`, `write_artifacts`
-`:635-768`); `stage2/merging.py` (`_merge_experts_inplace` `:34-424`).
+**Files:** `stage2/merging.py` (`_merge_experts_inplace`), `stage2/plugins/layer_merge.py`
+(`merge` `:543-591`, `write_artifacts:680`).
 
-- In `merge`, capture the per-`(centroid, member)` perm actually used (the cache hit
-  `merging.py:291` or the Phase-B solve `merging.py:298`). Simplest: have
-  `_merge_experts_inplace` return / populate a `member_perms` dict (centroid → {member →
-  perm or None}); set it on `ctx` (`merge_member_perms`). Add the slot to
-  `LayerMergePlugin.reads/writes`.
-- In `write_artifacts`, pass `grouped=ctx.get("grouped")` and
-  `member_perms=ctx.get("merge_member_perms")` to `_remap_covariance_for_layer`
-  (`layer_merge.py:680`). `grouped` is already in ctx (`:557`, `:648-649`).
+- **Capture the EXACT perm the merge used**, NOT a recomputed one. At `merging.py:280/291/298`
+  the merge already binds `perm` per member (`None` for centroid `:280`, `cached[0]` on
+  perm-cache hit `:291`, `_miss_perms[m]` otherwise `:298`). Collect these into
+  `member_perms[centroid][m] = perm` inside the existing member loop and have
+  `_merge_experts_inplace` return (or out-param) the `{centroid: {member: perm}}` map. Use
+  the SAME object the weight permutation consumed (`:306-307`) so the Gram axis-permutation
+  is provably consistent with the weight axis-permutation.
+- `LayerMergePlugin.merge` stores it on ctx (`merge_member_perms`); add the slot to
+  `reads/writes`. `write_artifacts` passes `grouped=ctx.get("grouped")` (already present
+  `:557,:648-649`) and `member_perms=ctx.get("merge_member_perms")` to
+  `_remap_covariance_for_layer` (`layer_merge.py:680`).
+- **kw-only None defaults** ⇒ the single other lexical reference is the call at `:680`
+  (verified: `grep -rn _remap_covariance_for_layer max_quality/src max_quality/tests` →
+  one production caller + the test). Existing tests passing only `(cov, li, kept_ids)` hit
+  the byte-identical singleton path.
 
-> **Note on existing callers:** make `grouped`/`member_perms` keyword-only with `None`
-> defaults so any test/caller passing only `(cov, layer_idx, kept_ids)` gets the
-> byte-identical singleton path (B3's `members is None` branch). Verify no other call site
-> of `_remap_covariance_for_layer` exists: `grep -rn _remap_covariance_for_layer max_quality/src max_quality/tests`.
+### Task B5 — Run the REAL Stage-2 guardrails (H2: there is NO stage2 cov golden to regen)
 
-### Task B5 — Run the affected goldens + suite for (B)
+The Rev-1 "regenerate merged-layer cov goldens" step is **DELETED** — `test_stage2_golden_snapshot.py`
+and `golden/stage2` **do not exist**. The real guardrails (baseline **36 passed**):
 
 ```
-cd max_quality && python -m pytest tests/test_stage2_merge_anchor_union.py \
-  tests/test_stage2_cov_manifest.py tests/test_stage2_plugin_layer_merge.py \
-  tests/test_pipeline_shared_io.py tests/test_smoke_stage2_resume.py -q
+cd max_quality && python -m pytest \
+  tests/test_stage2_merge_anchor_union.py \
+  tests/test_stage2_merge.py \
+  tests/test_stage2_cov_manifest.py \
+  tests/test_stage2_shared_io.py \
+  tests/test_stage2_plugin_layer_merge.py \
+  tests/test_smoke_stage2_resume.py -q
 ```
 
-**Golden expectation:** the merged-survivor cov CHANGES (that is the fix). Any golden that
-pins the **post-merge cov of a merged layer** must be regenerated and the diff inspected to
-confirm it now equals the union. Goldens that pin **merge JSON / kept-ids / weights** must
-stay byte-identical (the fix touches only the cov sidecar). List the regenerated goldens
-explicitly in the commit body; do NOT blanket-regen.
+B's correctness is pinned by the NEW `test_stage2_merge_anchor_union.py` PLUS
+`test_stage2_merge.py::test_remap_covariance_keeps_only_centroids` (`:17-32`) staying green
+(it calls remap with NO `grouped` ⇒ singleton path ⇒ the kw-only default handles it — that
+test is the compat anchor; do NOT modify it).
+
+### H3 — Resume path needs NO change (positive)
+
+The resume loader at `orchestrator.py:1051` does `cov_acc.load_layer_from_disk(layer_idx,
+partial_dir)` — it reads the **already-remapped union cov** off disk (written by
+`write_artifacts` → `_snapshot_cov_layer` AFTER the remap, `layer_merge.py:680-683`). Since
+the union is computed at write time, resume is consistent **for free**: a resumed run loads
+the union, a fresh run computes the union, and they match. Record this in B4 + Q5.
 
 ---
 
-## 3. Feature (A) — DP per-layer profile forward
+## 3. Feature (A) — persistent-pool DP per-layer profile forward (XL / high-risk)
 
-Built ON TOP of (B). Default-off; 1-replica path is byte-identical. The hard new
-requirement vs Stage-3: **the model is mutated in place each layer**, so each layer's
-replicas must see the **already-merged upstream weights**.
+Built ON TOP of (B). Default-off; the 1-replica path is byte-identical (the serial
+`_profile_layer`). **A0 RESOLVED: design-1 (persistent pool + per-layer structural re-sync).**
 
-### A0 — Architecture decision: how replicas get the merged upstream model
+### A0 — Lifecycle of the persistent worker pool + IPC channels (NEW subsystem)
 
-Stage-3 replicas reload a *fixed* student from disk once. Stage-2 cannot: the upstream
-layers `0..L-1` are merged in place on the parent between layers. Two designs:
+No template exists; design it explicitly. **File:** `stage2/profile_dp.py` (NEW).
 
-- **A0-design-1 — per-layer merged-weight re-sync (PRIMARY).** Keep a persistent replica
-  pool. Each replica holds a full model copy. Before profiling layer `L`, the parent
-  **broadcasts only the weights that changed since the last layer** — i.e. layer `L-1`'s
-  merged expert bank + resized router (`bank.select` + `_resize_router_for_kept_experts`
-  outputs). Replicas apply them to their copy, then profile. This is the "re-syncing the
-  merged upstream weights to replicas each layer" cost the spec flagged
-  (`stage2.md:178-179`, `:263-264`). Broadcast volume per layer = one merged MoE layer's
-  expert tensors (bounded; the bulk of the model is unchanged).
-- **A0-design-2 — replay-from-partial (FALLBACK / v1-simplest).** Each replica reloads the
-  Stage-1 base model from disk and replays the **already-written** `merge_{0..L-1}.json` +
-  `_heal_weights_layer_*.pt` partials (the parent writes these in `write_artifacts` BEFORE
-  the next layer's profile) to reconstruct the merged upstream state, then profiles layer
-  `L`. Requires `partial_dir` (resume mode) to be enabled. Avoids live IPC weight broadcast
-  but pays a per-layer disk reload + replay (expensive; respawn-per-layer).
+**Spawn ONCE at Stage-2 start** (lazily on first DP `on_profile`, or eagerly in
+`orchestrator.run` right after model load). `mp.get_context("spawn")`; N workers, each:
+pins via `CUDA_VISIBLE_DEVICES` (Stage-3 `:1096`), **loads its OWN model copy from disk**
+(`config["model"]["name_or_path"]` / the Stage-1 artifact path — same source the parent
+loaded), enters a **command loop** blocking on its command channel.
 
-**Recommendation:** ship **A0-design-1** (persistent pool + per-layer delta broadcast) — it
-is the only one that is cheap per layer and does not couple DP to resume-mode. But it is
-the larger build (IPC weight transfer). If the review judges the IPC broadcast too risky
-for v1, fall back to **A0-design-2 respawn-per-layer** which reuses the Stage-3 spawn
-template almost verbatim (each layer = one `run_dp_*` call against a from-disk+replayed
-model). **RAISE this decision to the user before building A4-A6** — it is the load-bearing
-architectural choice and the spec explicitly leaves "persistent pool vs respawn-free" open
-(`stage2.md:168-179`).
+**Two channels per worker:**
+- **Command channel (parent→worker):** an `mp.Queue` (or `Pipe`) per worker carrying typed
+  messages: `RESYNC(layer_idx, final_kept_ids, grouped, merged_layer_tensors)` (structural
+  replay, C1), `PROFILE(layer_idx, shard_id, auto_batch_cfg)` (run the early-exit forward
+  on this worker's shard, spill the four accumulators to the worker's per-replica dir),
+  `SHUTDOWN`. Workers process commands in order.
+- **Reduce channel (worker→parent):** an `mp.Queue` carrying `DONE(layer_idx, shard_id,
+  spill_dir)` / `ERROR(layer_idx, traceback)`. Large accumulator payloads travel via the
+  **filesystem spill dir** (Stage-3 contract), NOT serialized through the queue — the queue
+  carries only the "spill ready" signal + the dir path. This keeps the IPC small and reuses
+  the proven disk-reduce. (Worker model weights load from disk; only small structured
+  control messages cross the queues, and the broadcast merged-layer tensors in RESYNC are
+  plain `torch.save`/`torch.load` to a per-layer scratch file referenced by path — never a
+  raw serialized object through the queue.)
 
-> Either design keeps the **sequential constraint**: the parent merges layer L on itself
-> AND re-syncs to replicas before layer L+1; replicas never run ahead.
+**Per-layer protocol (inside the sequential loop):**
+1. parent does layer `L-1` merge/post_merge on itself (normal),
+2. parent sends `RESYNC(L-1, ...)` to all workers, **waits for all ACKs** (structural replay
+   done — workers now have the merged upstream),
+3. parent sends `PROFILE(L, shard_r, ...)` to worker `r`,
+4. workers profile their shard through `0..L`, finalize their four accumulators per layer,
+   spill to per-replica dirs, send `DONE`,
+5. parent **joins on the reduce channel** (all `DONE`), then **reduces** the four spill-dir
+   sets into the parent's `reap_acc`/`cov_acc`/`ream_acc` (A3). Assign/merge run on the
+   parent exactly as serial.
 
-### A1 — `stage2_reap_ream.profile_dp` config block (default OFF)
+**Teardown at Stage-2 end** (a `finally` in `orchestrator.run` after the layer loop): send
+`SHUTDOWN`, `join()` every worker with a timeout, check `exitcode==0` for each (mirror
+Stage-3 `:1277-1282`), `terminate()` + raise on any non-zero/timeout. **Verify no leaked
+children** (the verify-teardown discipline). Any worker `ERROR` mid-run → parent aborts the
+run, tears the pool down, re-raises with the worker traceback (no silent partial result).
 
-**File:** `stage2/orchestrator.py` (run() parse block, near the other knob parses
-`:1100-1215`).
+> **Sequential constraint preserved:** step 2's RESYNC-then-ACK barrier means no worker
+> profiles layer `L` until every worker has the merged layer `L-1`. Workers never run ahead.
 
-Add an opt-in block mirroring Stage-3's `replicas` resolution:
+### A1 — `stage2_reap_ream.profile_dp` config (default OFF) + reservoir guard AT RESOLUTION
+
+**File:** `stage2/orchestrator.py` (knob-parse block `:1100-1215`).
 
 ```yaml
 stage2_reap_ream:
-  profile_dp:
-    enabled: false          # master switch — OFF ⇒ serial _profile_layer, byte-identical
-    replicas: auto          # "auto" ⇒ torch.cuda.device_count(); or an int
-    shards_per_model: 1      # GPUs per replica (mirror stage3 shards_per_model)
-  auto_batch: { enabled: false, ... }   # inherited per-replica (already parsed)
+  profile_dp: { enabled: false, replicas: auto, shards_per_model: 1 }
+  auto_batch: { enabled: false }   # inherited per-replica (already parsed)
 ```
 
-Parse to a small `Stage2ProfileDpConfig` (enabled, replicas resolved to int via
-`torch.cuda.device_count()` when "auto", clamped ≥1). **`enabled=False` OR `replicas<=1`
-⇒ the existing serial `_profile_layer` path runs unchanged** (the byte-identical gate).
-Reject `enabled=True` with `replicas==1` only if you want a loud config error; otherwise
-silently fall back to serial (prefer fall-back, matching Stage-3's `_shard_calib` clamp).
+`enabled=False` OR resolved `replicas<=1` ⇒ serial `_profile_layer`, byte-identical.
+`replicas: auto` → `torch.cuda.device_count()`, clamped ≥1.
 
-### A2 — Sequence-disjoint shard helper (mirror `_shard_calib`)
+**Reservoir guard fires HERE (config resolution), with `log.warning` naming the consumer —
+NOT 40 layers deep.** The distill-input reservoir (`_LayerInputAccumulator`) is a RESERVOIR
+SAMPLE, not additive, so it is NOT reducible across shards. When ANY layer-input consumer is
+active — `expert_distill_steps > 0` OR `cost_alignment == "output"` OR `merge_step ==
+"mergemoe"` (the exact disjunction at `layer_merge.py:468-472`) — DP profiling is **disabled
+for the whole run** with a single `log.warning` at resolution time naming which consumer
+forced the fallback. Implement as: if `profile_dp.enabled and (those consumers)` → set
+`profile_dp.enabled=False`, warn once, proceed serial. (Reservoir-merge across shards by
+global-`seen` weighting is future work.)
 
-**File:** `stage2/profiling.py` (new module-level helper) or reuse Stage-3's `_shard_calib`
-by import.
+### A2 — Sequence-disjoint shard (reuse Stage-3 `_shard_calib`) + cov per-seq pin (see H1)
 
-`batches` at `profiling.py:327` is an iterable of `[bs, seq_len]` tensors. The shard must
-be **by sequence** (each token's full top-k set stays whole — REAP saliency, REAM grams,
-cov are all per-token sums, so a sequence-disjoint partition makes every per-key reduction
-exact and replica-independent). Reuse the Stage-3 contiguous dim-0 slice
-(`covariance_collection.py:1052-1071`) at the **calibration-sequence** granularity (split
-the underlying calib sequence list, not the pre-batched tensors), then each replica
-re-batches its shard with its own (auto-)batch size. This is the same cut as Stage-3
-(`shard = calib[shard_start:shard_end]`, `covariance_collection.py:1125-1126`).
+`batches` at `profiling.py:327` are `[bs, seq_len]` tensors. Shard **by sequence** (each
+token's full top-k set stays whole ⇒ REAP/REAM/cov per-key sums are exact and replica-
+independent). Reuse Stage-3's contiguous dim-0 slice (`covariance_collection.py:1052-1071`)
+at the **calibration-sequence** granularity (split the calib sequence list, not pre-batched
+tensors); each worker re-batches its shard with its own (auto-)batch size. Built ONCE at
+pool spawn and indexed by `shard_id`.
 
-> **Per-sequence reduction-pin is inherited, not rebuilt.** Cov already routes through
-> `update`/`update_grouped`; for the DP path, pin cov via `update_grouped(seq_ids)` exactly
-> as Stage-3 (`covariance_collection.py:657-659`) so each replica's finalized Gram is
-> batch-size-invariant ⇒ replicas auto-batch independently and the reduce is exact. REAP
-> and REAM numerators are per-token sums with no cross-token coupling, so they are already
-> batch-invariant under a per-sequence shard (addition of the same per-sequence operands).
+### H1 — NEW plumbing: cov per-sequence pin is NOT inherited; it must be added
 
-### A3 — Per-replica spill: serialize ALL four accumulators (not just cov)
+The live cov path uses `cov_acc.update` (`profiling.py:230` `input_cb`, `:236`
+`intermediate_cb`), **NOT `update_grouped`**. For A5's premise (each replica auto-batches
+INDEPENDENTLY) the cov reduction must be **batch-invariant**, which requires the per-sequence
+pin (`update_grouped(..., seq_ids)`). REAP/REAM numerators are genuinely batch-invariant
+(per-token sums, no cross-token coupling) — **only cov needs the pin.** This is NEW code:
 
-**File:** new `stage2/profile_dp.py` (the Stage-2 analog of the Stage-3 DP driver +
-worker + reduce). Stage-3 only spills `InputCovarianceAccumulator`. Stage-2 must spill +
-reduce **four** additive structures per replica per layer:
+- **`input_cb` has NO `token_idx` today.** `down_cb`/REAP have `ctx["token_idx"]`
+  (`profiling.py:248`; supplied by `instrument_experts` `ctx={... "token_idx": token_idx}`
+  `activation_hooks.py:1512-1513,1551-1552`), but `input_cb`/`intermediate_cb` receive only
+  `(li, e, tensor, ctx)` and the current bodies ignore `ctx`. Both `input` and
+  `intermediate` ARE called with the SAME `ctx` that carries `token_idx`
+  (`_cb("input", ...)` / `_cb("intermediate", ...)` fire inside the per-expert loop that
+  already has `token_idx`, `activation_hooks.py:1514,1524 / 1553,1559`).
+- **New task:** in `profiling.py`, when DP is active, thread a `seq_len` into `_profile_layer`
+  and switch `input_cb`/`intermediate_cb` to:
+  ```python
+  def input_cb(li, e, tensor, ctx):
+      seq_ids = ctx["token_idx"] // seq_len if seq_len else None
+      cov_acc.update_grouped(li, e, "gate_proj", tensor, seq_ids)
+  def intermediate_cb(li, e, tensor, ctx):
+      seq_ids = ctx["token_idx"] // seq_len if seq_len else None
+      cov_acc.update_grouped(li, e, "down_proj", tensor, seq_ids)
+      ream_acc.record_neuron_activations(li, e, tensor)   # unchanged (additive, batch-invariant)
+  ```
+  `update_grouped` (`activation_hooks.py:1032-1049`) splits rows by ascending `seq_ids` and
+  reduces to plain `update` calls per sequence ⇒ the finalized per-key Gram is
+  batch-size-invariant. **Guard:** verify `token_idx` indexes the same rows as `tensor`
+  (both are the per-expert active-token view — `sel = hidden_states[token_idx]`
+  `activation_hooks.py:1511,1550`, so `tensor` rows ↔ `token_idx` 1:1). On the SERIAL path
+  keep plain `update` (default `seq_len=None` ⇒ `update_grouped` calls `update` once,
+  byte-identical) so the non-DP golden is untouched.
 
-| Structure | Spill payload | Reduce op |
+> **NIT to confirm in review:** `update_grouped` with a real multi-seq split changes the
+> fp32 reduction grouping vs a single `update` over the whole batch — that is the *point*
+> (it pins the grouping to bs=1 order). On the SERIAL default we pass `seq_len=None` ⇒ exactly
+> one `update` ⇒ byte-identical. The DP path's per-seq grouping is the batch-invariant
+> reference (matches Stage-3's cov pin rationale, `covariance_collection.py:373-447`).
+
+### A3 — Per-replica spill + per-layer reduce of ALL FOUR accumulators
+
+**File:** `stage2/profile_dp.py`. Stage-3 spills only cov; Stage-2 spills + reduces four
+additive structures per replica per layer:
+
+| Structure | Spill payload | Reduce |
 |---|---|---|
-| `InputCovarianceAccumulator` | `{covariance:{k:T}, tokens:{k:int}}` (reuse `spill_layer_to_disk` `:1135`) | fp32 key-wise sum (reuse `_reduce_spilled_cov_dirs` `:211`) |
-| `ReapAccumulator` | `{sums:{k:float}, counts:{k:int}, freq:{k:int}}` (finalize_layer first → CPU floats) | sum sums, sum counts, sum freq |
-| `ReamCostAccumulator._gate_gram` | `{li: [E,E] fp64}` | key-wise fp64 sum |
-| `ReamCostAccumulator._sim_tensor` + `_total_tokens_by_layer` + `_neuron_act_sum/_count` | dense [E,E] fp64 + int + per-(l,e) [d_int] sums + int counts | key-wise sum (fp64 sims, int counts) |
+| `InputCovarianceAccumulator` | reuse `spill_layer_to_disk` `:1135` | reuse `_reduce_spilled_cov_dirs` `:211` (fp32 sum) |
+| `ReapAccumulator` | finalize_layer→`{sums,counts,freq}` (CPU floats/ints) | sum sums (fp32), sum counts, sum freq |
+| `ReamCostAccumulator._gate_gram` | `{li: [E,E] fp64}` | fp64 key-wise sum (bit-exact) |
+| `_sim_tensor` + `_total_tokens_by_layer` + `_neuron_act_sum/_count` | dense [E,E] fp64 + int + per-(l,e)[d_int] + int | fp64/int sums (bit-exact / exact) |
 
-Write new `_spill_reap_layer` / `_reduce_reap_dirs` / `_spill_ream_layer` /
-`_reduce_ream_dirs` helpers (small; pattern-identical to `_reduce_spilled_cov_dirs`). The
-reduce must run **per layer** (inside the sequential loop), reconstructing a single merged
-set of accumulators that the assign/merge phases then consume exactly as the serial path
-does. **Determinism:** process replica dirs in sorted order (Stage-3 contract
-`:231`); REAM `_gate_gram`/`_sim_tensor` are fp64 so the reduce is bit-exact regardless of
-order; cov + REAP are fp32 (~1e-6 drift, same class the serial path already tolerates).
+New `_spill_reap_layer`/`_reduce_reap_dirs`/`_spill_ream_layer`/`_reduce_ream_dirs` (small;
+pattern-identical to `_reduce_spilled_cov_dirs`, **sorted dir order** `:231`). Reduce runs
+**per layer** inside the loop, reconstructing the parent's four accumulators so the
+assign/merge phases consume them exactly as serial. fp64 REAM ⇒ bit-exact; fp32 cov/REAP ⇒
+~1e-6 (tolerated; absent at 1 replica).
 
-> The distill-input reservoir (`_LayerInputAccumulator`) is a RESERVOIR SAMPLE, not an
-> additive reduction — it is NOT trivially reducible across shards. For v1, **disable DP
-> when any layer-input consumer is active** (`expert_distill_steps>0` or
-> `cost_alignment=="output"` or `merge_step=="mergemoe"` — see `layer_merge.py:468-489`):
-> fall back to serial profiling for the whole run with a loud INFO. Reducing a reservoir
-> across shards correctly (merge by global `seen` weights) is future work. State this
-> guard explicitly in A1's config validation.
+### A4 — DP-or-serial branch in `on_profile`
 
-### A4 — DP per-layer driver, wired into `on_profile`
+**File:** `stage2/plugins/layer_merge.py` `on_profile` (`:498-538`).
 
-**File:** `stage2/plugins/layer_merge.py` `on_profile` (`:498-538`); driver in
-`stage2/profile_dp.py`.
+Replace the single `_srr._profile_layer(...)` (`:528-533`) with: if
+`profile_dp.enabled and replicas>1` → `run_dp_profile_layer(pool, layer_ref, shards,
+reap_acc, cov_acc, ream_acc, device, auto_batch_cfg)` (issues RESYNC(L-1)+PROFILE(L),
+joins, reduces the four spill sets into the ctx/`self` accumulators); else the serial
+`_profile_layer` unchanged. `self.cov_acc.finalize_layer(layer_idx)` stays after the branch
+(the DP reduce already finalized per-shard; the parent-side finalize is a no-op on an
+already-CPU-resident cov OR is folded into the reduce — confirm in review which side owns
+the final cast — see Q2).
 
-Replace the single `_srr._profile_layer(...)` call (`layer_merge.py:528-533`) with a
-DP-or-serial branch:
+### A5 — Per-replica auto-batch (inherited verbatim; premise provided by H1's pin)
 
-```python
-def on_profile(self, ctx):
-    if ctx.has("stage2_profile_full_hit") and ctx.get("stage2_profile_full_hit"):
-        return
-    layer_ref = ctx.get("layer_ref")
-    if self.profile_dp.enabled and self.profile_dp.replicas > 1 and not self._dp_disabled:
-        from ..profile_dp import run_dp_profile_layer
-        run_dp_profile_layer(
-            replica_pool=self._replica_pool,        # persistent pool (A0-design-1)
-            layer_ref=layer_ref,
-            shards=self._calib_shards,              # sequence-disjoint, built once
-            reap_acc=ctx.get("reap_acc"),
-            cov_acc=self.cov_acc,
-            ream_acc=ctx.get("ream_acc"),
-            device=self.device,
-            auto_batch_cfg=self.auto_batch_cfg,
-        )
-    else:
-        from .. import orchestrator as _srr
-        _srr._profile_layer(self.model, layer_ref, self.batches,
-                            ctx.get("reap_acc"), self.cov_acc, ctx.get("ream_acc"),
-                            device=self.device, layer_input_acc=ctx.get("layer_input_acc"))
-    self.cov_acc.finalize_layer(layer_ref.layer_idx)
-```
+Each worker pins via `CUDA_VISIBLE_DEVICES` ⇒ its own `CudaMemProbe(device)`; uses
+`size_batch(... floor=1, mem=CudaMemProbe(device))` + `run_with_oom_backoff(..., floor=1)`
+(`utils/auto_batch.py:143-203`), gated by inherited `auto_batch.enabled`. **No new
+auto-batch logic.** Independent per-replica sizing is SOUND **because H1 pins cov per-seq**
+(finalized Grams batch-invariant) and REAP/REAM are inherently batch-invariant ⇒ no
+cross-replica min-agreement (Stage-3 contract `covariance_collection.py:373-447`). Default
+`auto_batch.enabled=false` ⇒ fixed batch, no probe.
 
-`run_dp_profile_layer` (in `profile_dp.py`):
-1. **Re-sync** layer `L-1`'s merged weights to replicas (A0-design-1) — skip on the first
-   layer (nothing merged yet).
-2. Each replica profiles its `shards[r]` through `0..L` of its (re-synced) model, building
-   its own four accumulators, finalizes them per layer, spills to its per-replica dir.
-3. Parent **joins**, then **reduces** the four spill dir sets into the parent's
-   `reap_acc` / `cov_acc` / `ream_acc` (the very ctx instances the assign/merge phases
-   read). After the reduce the parent state is identical to a serial single-GPU profile of
-   the full calib set (modulo the documented fp32 drift).
+### A6 — (folded into A0) pool lifecycle + clean teardown
 
-The parent's own model is what gets assigned/merged (`merge` mutates `self.model`); the
-re-sync in step 1 propagates that merge to replicas before the NEXT layer. This keeps the
-sequential constraint exact.
+Covered by A0: spawn-once, per-layer command/reduce protocol, SHUTDOWN + join + exitcode
+check + leak verification in `orchestrator.run`'s `finally`. Worker `ERROR` aborts the run.
 
-### A5 — Per-replica auto-batch (inherited verbatim, NOT rebuilt)
-
-Each replica pins itself via `CUDA_VISIBLE_DEVICES` (Stage-3 `:1096`) so
-`CudaMemProbe(device)` sees its OWN free VRAM. The replica's batch loop uses
-`size_batch(cost_probe_fn, floor=1, headroom_frac, max_cap, mem=CudaMemProbe(device))` +
-`run_with_oom_backoff(..., floor=1)` from `utils/auto_batch.py` (`:143-203`), gated by the
-inherited `auto_batch.enabled`. **No new auto-batch logic.** The per-sequence reduction-pin
-(A2) makes the finalized per-key reductions batch-size-invariant, so each replica sizes
-INDEPENDENTLY with NO cross-replica min-agreement — identical to the Stage-3 contract
-(`covariance_collection.py:373-447`). Default `auto_batch.enabled=false` ⇒ each replica
-uses the fixed batch ⇒ no probe.
-
-### A6 — Persistent replica pool lifecycle (A0-design-1) OR respawn (A0-design-2)
-
-**File:** `stage2/profile_dp.py` + `LayerMergePlugin.__init__`/teardown.
-
-- **A0-design-1:** build the pool once (lazily on first DP `on_profile`), tear it down at
-  run end (a `finally` in `orchestrator.run` after the layer loop, mirroring Stage-3's
-  `procs.join()` discipline `:1277-1282`). The pool holds N spawned processes, each with a
-  resident model copy; the parent communicates per-layer via a `mp` queue/pipe (re-sync
-  weights down, "done" up) + filesystem spill (accumulators up). Ensure clean teardown on
-  exception (the `verify-teardown` discipline — no leaked child processes).
-- **A0-design-2:** no pool; each layer calls a `run_dp_profile_layer` that spawns N
-  short-lived workers (Stage-3 template verbatim), each reloading base+replaying partials.
-  Simpler lifecycle, higher per-layer cost.
-
-### A7 — Tests for (A) (no live multi-GPU — mocked spawn + reduce-math)
+### A7 — Tests (no live multi-GPU — mocked in-process workers + reduce-math)
 
 **File:** `max_quality/tests/test_stage2_profile_dp.py` (NEW).
 
-1. **Shard correctness:** `_shard_calib`-equivalent splits N sequences into R disjoint
-   contiguous shards covering every sequence exactly once (mirror Stage-3 shard test).
-2. **Reduce math — REAP:** build two `ReapAccumulator`s with disjoint per-(l,e) sums/counts;
-   spill + reduce; assert merged `sums/counts/freq` == element-wise sums and
-   `score()==Σsum/Σcount` (the mean-at-read identity).
-3. **Reduce math — REAM gate_gram:** two `_gate_gram[li]` fp64 tensors; reduce; assert
-   bit-exact sum; assert `compute_gate_similarity_matrix` on the merged Gram == the matrix
-   from a single-accumulator that saw both shards' logits (fp64 ⇒ bit-exact).
-4. **Reduce math — REAM sim_tensor + total_tokens + neuron means:** disjoint shards; assert
-   `_sim_tensor` sum (fp64 bit-exact), `_total_tokens_by_layer` int sum, `_neuron_act_sum/_count`
-   sums; assert `compute_delta_expert`/`get_neuron_mean` equal the single-pass values.
-5. **End-to-end equivalence (mocked, 2 fake replicas, CPU):** monkeypatch the replica
-   "spawn" to run two shards **in-process on CPU** against a tiny stub MoE model; reduce;
-   assert the merged `reap_acc/cov_acc/ream_acc` match a serial `_profile_layer` over the
-   full calib set within `allclose` (fp32 cov/REAP ~1e-5; fp64 REAM bit-exact). Use the
-   existing `test_stage2_pipeline_run_layer.py` stub model as the fixture.
-6. **Byte-identical default gate:** with `profile_dp.enabled=false`, assert
-   `on_profile` calls the serial `_profile_layer` path (no DP import/spawn) — pin via a
-   spy. This is the golden guardrail proving default-off is a no-op.
-7. **Layer-input-consumer guard:** with `expert_distill_steps>0` AND
-   `profile_dp.enabled=true`, assert DP is disabled (serial fallback) + the loud INFO
-   (A3 reservoir guard).
+1. **Shard:** N sequences → R disjoint contiguous shards, every sequence covered once.
+2. **Reduce — REAP:** two accs, disjoint per-(l,e) sums/counts; spill+reduce; assert
+   element-wise sums + `score()==Σsum/Σcount`.
+3. **Reduce — REAM gate_gram:** two fp64 `_gate_gram[li]`; reduce; **bit-exact** sum;
+   `compute_gate_similarity_matrix` on merged == single-acc-over-both-shards.
+4. **Reduce — REAM sim/total/neuron:** disjoint shards; fp64 `_sim_tensor` bit-exact, int
+   `_total_tokens_by_layer`, `_neuron_act_sum/_count`; `compute_delta_expert`/`get_neuron_mean`
+   == single-pass.
+5. **E2E equivalence (mocked, 2 in-process CPU "workers"):** monkeypatch the spawn to run
+   two shards in-process against the `test_stage2_pipeline_run_layer.py` stub MoE; reduce;
+   assert merged `reap_acc/cov_acc/ream_acc` == serial `_profile_layer` over full calib
+   (`allclose` ~1e-5 cov/REAP; fp64 REAM bit-exact).
+6. **Structural replay (C1):** unit-test the RESYNC handler — give a worker-side model copy
+   + a parent's `(final_kept_ids, grouped, merged tensors)`; replay; assert the worker
+   layer's expert-bank SHAPE + router `num_experts`/`top_k`/`mlp.num_experts` + tensor
+   VALUES match a parent that ran `bank.select` + `_resize_router_for_kept_experts`.
+7. **Byte-identical default gate:** `profile_dp.enabled=false` ⇒ `on_profile` calls serial
+   `_profile_layer`, no DP import/spawn (spy).
+8. **Reservoir guard:** `expert_distill_steps>0` + `profile_dp.enabled=true` ⇒ DP disabled
+   at resolution + the `log.warning` names `expert_distill` (assert via `caplog`).
+9. **Cov per-seq pin (H1):** `_profile_layer` with `seq_len` set routes `input_cb`/
+   `intermediate_cb` through `update_grouped`; assert a 2-batch-vs-1-batch run yields the
+   SAME finalized cov Gram (batch-invariance), and `seq_len=None` is byte-identical to a
+   plain `update`.
 
-```
-cd max_quality && python -m pytest tests/test_stage2_profile_dp.py -q
-```
+`cd max_quality && python -m pytest tests/test_stage2_profile_dp.py -q`
 
 ### A8 — Out of scope: live ≥2-GPU validation (DEFERRED)
 
-Real ≥2-GPU run on a real model is DEFERRED to GPU (no box in this plan). The 1-GPU
-default-off path is byte-identical (A7.6); the reduce math is proven in-process (A7.2-5);
-the first live ≥2-GPU run validates the IPC re-sync + spawn lifecycle. Document this in the
-commit body and in `profile_dp.py`'s module docstring (mirror the Stage-3/4 multigpu
-"CAVEAT untested on real ≥2-GPU" memory note).
+Real ≥2-GPU run DEFERRED to GPU. 1-GPU default-off byte-identical (A7.7); reduce + replay
+math proven in-process (A7.2-6,9); first live ≥2-GPU run validates the persistent-pool IPC +
+RESYNC barrier + teardown. Document in `profile_dp.py` docstring + commit body (mirror the
+Stage-3/4 "untested on real ≥2-GPU" memory caveat).
 
-### A9 — Full-suite + whole-impl review before claiming green
+### A9 — Full suite + whole-impl review before green
 
 ```
 cd max_quality && python -m pytest tests/ -q -k "stage2 or cov or profil or shared_io or merge or pipeline"
 ```
-Then the per-task review → fixer ping-pong (all 5 categories incl. nitpick) → all-none, and
-a whole-implementation review + the full caller/integration suite (the
-`run_full_suite_and_final_review` memory rule). Confirm no other `_profile_layer` /
+Then per-task review→fixer ping-pong (all 5 categories incl. nitpick)→all-none + a
+whole-implementation review + the full caller/integration suite (the
+`run_full_suite_and_final_review` rule). Confirm no other `_profile_layer` /
 `_remap_covariance_for_layer` caller regressed.
 
 ---
 
-## 4. Task list (ordered, bite-sized, TDD)
+## 4. Task list (ordered, TDD)
 
 | # | Task | Files | Gate |
 |---|---|---|---|
-| **B1** | Failing test: survivor anchor = group UNION (gate_proj) | `tests/test_stage2_merge_anchor_union.py` (NEW) | test FAILS pre-fix |
-| **B2** | Failing test: down_proj union PERMUTED to centroid axis | same | test FAILS pre-fix |
-| **B3** | Implement union remap (fp32-sum-then-cast; singleton byte-identical branch) | `stage2/shared_io.py:301-344` | B1/B2 pass; singleton test green |
-| **B4** | Thread `grouped`+`member_perms` from merge → remap (kw-only, None default) | `plugins/layer_merge.py:543-591,635-768`; `merging.py:34-424` | no other caller breaks |
-| **B5** | Regenerate ONLY merged-layer cov goldens; inspect diff; suite | (goldens) | merge JSON/weights byte-identical; cov = union |
-| **A0** | DECISION: design-1 (delta broadcast pool) vs design-2 (replay-from-disk) — **RAISE to user** | (doc) | user picks |
-| **A1** | `profile_dp` config block (default OFF) + layer-input-consumer guard | `stage2/orchestrator.py` | default-off parses to serial |
-| **A2** | Sequence-disjoint shard helper (reuse Stage-3 `_shard_calib`) + per-seq cov pin | `stage2/profiling.py`/`profile_dp.py` | shard test green |
-| **A3** | Per-replica spill + per-layer reduce of ALL FOUR accumulators | `stage2/profile_dp.py` (NEW) | reduce-math tests green |
-| **A4** | DP-or-serial branch in `on_profile`; `run_dp_profile_layer` | `plugins/layer_merge.py:498-538`; `profile_dp.py` | e2e mocked equivalence |
-| **A5** | Per-replica auto-batch inherited (CUDA_VISIBLE_DEVICES + size_batch + backoff) | `profile_dp.py` | per-replica independent sizing |
-| **A6** | Pool lifecycle + clean teardown (or respawn per A0-design-2) | `profile_dp.py`; `orchestrator.run` finally | no leaked children |
-| **A7** | DP tests (shard, 4× reduce-math, e2e mocked, byte-identical gate, reservoir guard) | `tests/test_stage2_profile_dp.py` (NEW) | all green |
+| **B1** | Failing test: survivor anchor = group UNION (gate) | `tests/test_stage2_merge_anchor_union.py` (NEW) | FAILS pre-fix |
+| **B2** | Failing test: down_proj union PERMUTED (both axes, exact perm) | same | FAILS pre-fix |
+| **B3** | Union remap (kw-only grouped/member_perms=None; fp32-sum-cast; singleton byte-identical) | `shared_io.py:301-344` | B1/B2 pass; singleton green |
+| **B4** | Thread `grouped`+EXACT `member_perms` (capture perm at `merging.py:280/291/298`) → remap | `merging.py:34-424`; `layer_merge.py:543-591,680` | one caller; resume unchanged (H3) |
+| **B5** | Run REAL guardrails (NO golden regen — H2) | `test_stage2_merge.py`,`_cov_manifest`,`_shared_io`,`_plugin_layer_merge`,`_smoke_resume` | 36+ green; `:17-32` green |
+| **A0** | Persistent pool lifecycle + command/reduce IPC + teardown/exitcode | `profile_dp.py` (NEW); `orchestrator.run` finally | replay unit-test green; no leaks |
+| **C1** | Structural replay handler (RESYNC: patch centroids + `bank.select` + router resize) | `profile_dp.py` worker | A7.6 |
+| **A1** | `profile_dp` config (default OFF) + reservoir guard AT RESOLUTION (log.warning names consumer) | `orchestrator.py:1100-1215` | default-off serial; A7.8 |
+| **A2** | Sequence-disjoint shard (reuse `_shard_calib`), built once | `profile_dp.py` | A7.1 |
+| **H1** | NEW cov per-seq pin: thread `seq_len`, switch `input_cb`/`intermediate_cb`→`update_grouped(ctx["token_idx"]//seq_len)` | `profiling.py:228-239` | A7.9; serial byte-identical |
+| **A3** | Per-replica spill + per-layer reduce of ALL FOUR accumulators | `profile_dp.py` | A7.2-4 |
+| **A4** | DP-or-serial branch in `on_profile` | `layer_merge.py:498-538` | A7.5 |
+| **A5** | Per-replica auto-batch inherited (premise = H1 pin) | `profile_dp.py` | independent sizing |
+| **A7** | DP tests (shard, 4× reduce, e2e, structural-replay, default-gate, reservoir, pin) | `tests/test_stage2_profile_dp.py` (NEW) | all green |
 | **A8** | Out-of-scope note: live ≥2-GPU deferred | `profile_dp.py` docstring + commit | documented |
-| **A9** | Full suite + whole-impl review loop to all-none | (all) | green + reviewed |
+| **A9** | Full suite + whole-impl review to all-none | (all) | green + reviewed |
 
 ---
 
 ## 5. Key decisions (for the reviewer)
 
-1. **Per-layer DP, never cross-layer.** The merge mutates the live model in place
-   (`merging.py:424`) and layer L+1 forwards through layer L's merged weights
-   (`profiling.py:338-342`). Cross-layer parallelism is −1.0 AVG (REAM §5.4). The DP axis
-   is strictly **within** each layer's forward, inside the sequential loop.
-2. **Merged-weight re-sync per layer is the new cost** (vs Stage-3's once-from-disk).
-   A0-design-1 (persistent pool + per-layer delta broadcast) is primary; A0-design-2
-   (respawn + replay-from-partial) is the simpler fallback. **This is the one decision to
-   RAISE to the user before building A4-A6.**
-3. **Shard by sequence** (`_shard_calib` contiguous dim-0 slice, token-disjoint). Every
-   accumulator is a per-token additive Σ with a separate additive count ⇒ the reduce is
-   `Σ_r num_r / Σ_r count_r`, exact and replica-independent. Per-sequence cov pin
-   (`update_grouped`) inherited from Stage-3 ⇒ replicas auto-batch independently, no
-   cross-replica min.
-4. **Reduce all FOUR accumulators per layer** (cov + REAP + REAM-gate-gram + REAM-sim/
-   neuron), not just cov. REAM fp64 ⇒ bit-exact; cov/REAP fp32 ⇒ ~1e-6 (already-tolerated
-   class). Spill-dir + sorted-order reduce mirrors `_reduce_spilled_cov_dirs`.
-5. **Distill-input reservoir is NOT additively reducible** ⇒ v1 disables DP when a
-   layer-input consumer is active (loud serial fallback). Reservoir-merge across shards is
-   future work.
-6. **(B) merge-anchor union** = `Σ_{j∈group} G_j`, with `down_proj` Grams permuted to the
-   centroid neuron axis (same perm the merge used). The Gram is an unnormalized `X^TX`, so
-   the union is exactly the additive sum — matching AA-SVD's anchor `A=X` semantics (Stage 3
-   consumes it directly). Non-merged survivors stay byte-identical.
-7. **Default-off byte-identical everywhere.** `profile_dp.enabled=false` ⇒ serial
-   `_profile_layer` (A7.6 spy test). (B) changes only the cov of *merged* layers; merge
-   JSON / weights / singleton cov stay byte-identical (B5).
+1. **Per-layer DP, never cross-layer** — merge mutates in place (`merging.py:424`); L+1
+   forwards through L's merged weights (`profiling.py:338-342`). −1.0 AVG otherwise.
+2. **A0 = persistent pool + per-layer STRUCTURAL re-sync (design-1, user-accepted XL).** NEW
+   IPC subsystem (no repo template). Spawn-once; per-layer command/reduce channels; RESYNC
+   barrier before each layer; SHUTDOWN+exitcode teardown.
+3. **C1: re-sync is structural surgery, NOT a value delta.** `bank.select` reshapes;
+   `_resize_router_for_kept_experts` REPLACES the router Parameter + mutates counts. Workers
+   **replay** `bank.select`+`_resize_router_for_kept_experts` (after patching centroid values),
+   or — recommended — receive the already-selected kept tensors + resized router and set them
+   directly. Same wire volume; "delta broadcast" language dropped.
+4. **H1: cov per-seq pin is NEW, not inherited.** Live cov uses `update` (`profiling.py:230,236`);
+   switch to `update_grouped(ctx["token_idx"]//seq_len)`. `input_cb` gains `token_idx` use
+   (the ctx already carries it). REAP/REAM stay as-is (batch-invariant). Premise of A5.
+5. **Reduce all FOUR accumulators per layer.** REAM fp64 bit-exact; cov/REAP fp32 ~1e-6
+   (tolerated; absent at 1 replica). Disk-spill + sorted reduce mirrors `_reduce_spilled_cov_dirs`.
+6. **Reservoir guard at config resolution** (`log.warning` naming `expert_distill`/`output`/
+   `mergemoe`), not 40 layers deep. Reservoir-merge across shards is future work.
+7. **(B) union = `Σ_j G_j`**, down_proj permuted BOTH axes by the EXACT merge perm
+   (`merging.py:280/291/298`, mirrors RegMean `:352-360`). Non-merged survivors byte-identical
+   (kw-only `grouped=None`). The Gram is unnormalized `X^TX` ⇒ union = additive sum (matches
+   AA-SVD anchor `A=X`).
+8. **H2: no stage2 cov golden exists.** Guardrails are the 5 named real tests (baseline 36
+   passed) + the new union test; `test_stage2_merge.py:17-32` is the singleton compat anchor.
+9. **H3: resume is consistent for free** — `orchestrator.py:1051` loads the already-remapped
+   union cov off disk; no resume change.
+10. **Default-off byte-identical everywhere** — `profile_dp.enabled=false` ⇒ serial; (B)
+    changes only merged-layer cov; merge JSON/weights/singleton cov byte-identical.
 
 ---
 
-## 6. Open questions (resolve in review / with user)
+## 6. Open questions (resolve in review)
 
-1. **A0 design choice** (delta-broadcast pool vs respawn-from-disk replay) — RAISE to user.
-   Drives the size/risk of A4-A6. Spec leaves it open (`stage2.md:168-179`).
-2. **B2 down_proj perms:** thread the exact merge perms (B2-opt-A, preferred, exact) or
-   ship gate/up-only union + xfail down (B2-opt-B). If perm-threading exceeds ~40 LOC,
-   raise before committing to A.
-3. **REAM `_gate_gram` non-determinism under reduce:** it is fp64 (`activation_hooks.py:178`)
-   so the key-wise sum is order-independent and bit-exact. Confirm the cov + REAP fp32
-   ~1e-6 drift is acceptable for the DP-on path (it is NOT on the byte-identical default,
-   which has 1 replica and no reduce). Same drift class the serial path already accepts
-   (`activation_hooks.py:308-311`).
-4. **`shards_per_model` > 1** (tensor-sharded replica): mirror Stage-3's `shards_per_model`
-   knob but is it needed for Stage-2 model sizes? Default 1; defer multi-GPU-per-replica.
-5. **Resume interaction:** DP profiling writes the same per-layer partials
-   (`write_artifacts`); confirm a DP run and a serial resume are interchangeable (the
-   reduced accumulators feed the identical `write_artifacts`). Add a resume smoke if cheap.
+1. **C1 variant:** "patch centroids then replay select+resize" vs "send already-selected
+   kept tensors + resized router, set directly" (recommended). Same wire volume; pick the
+   simpler.
+2. **A4 finalize ownership:** does the DP reduce or the parent `cov_acc.finalize_layer`
+   apply the final storage-dtype cast? Pick one to avoid a double-cast.
+3. **fp32 cov/REAP ~1e-6 under reduce** acceptable on the DP-ON path (NOT on the 1-replica
+   default, which has no reduce). Same class as `activation_hooks.py:308-311`.
+4. **`shards_per_model>1`** (tensor-sharded replica): mirror Stage-3's knob; default 1, defer.
+5. **Resume × DP interchange (H3 closes the cov side):** a DP run writes the same per-layer
+   partials via `write_artifacts`; a serial resume loads the reduced+remapped union cov and
+   matches a fresh run. Add a cheap resume smoke if practical.
