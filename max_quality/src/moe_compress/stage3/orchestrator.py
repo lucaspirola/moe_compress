@@ -124,6 +124,24 @@ def _resolve_factor_workers(config: dict) -> int:
     return max(1, min(requested, n_gpu))
 
 
+def _resolve_alpha_workers(config: dict) -> int:
+    """Resolve the effective α-grid DP replica count (Lever 1).
+
+    Clone of ``_resolve_cov_replicas`` keyed ``alpha_workers``: read the
+    optional ``multi_gpu.alpha_workers`` knob (default 1) and clamp to the
+    number of visible CUDA devices, floor 1. ``n_gpu < 2`` OR ``alpha_workers
+    <= 1`` OR ``multi_gpu`` absent ⇒ 1 (the serial in-process validation grid,
+    byte-identical to today). Each replica runs one whole model per the cov DP
+    pattern; ``shards_per_model`` is fixed at 1.
+    """
+    mg = config.get("multi_gpu") or {}
+    requested = int(mg.get("alpha_workers", 1) or 1)
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if requested <= 1 or n_gpu < 2:
+        return 1
+    return max(1, min(requested, n_gpu))
+
+
 def run(
     model,
     tokenizer,
@@ -769,6 +787,37 @@ def run(
         # The originals snapshot + RAM pre-flight above and the alpha-cache I/O
         # below are run-glue. Publish the slots the hook reads, then walk.
         run_ctx.set("originals", originals)
+        # Lever 1 (α-grid task-parallel): resolve the DP replica count + the
+        # on-disk inputs a replica needs (student ckpt, the originals snapshot
+        # just persisted, the Stage-2 A-cov, the cov spill dirs). select_alpha
+        # dispatches to ``run_dp_alpha_search`` IN PLACE OF the serial validation
+        # grid when ``alpha_workers > 1`` (else the existing serial path). H-α2:
+        # under ``per_group_type=True`` (production default) the validation α is
+        # DISCARDED for factoring (the per-type spectral proxy drives the ranks),
+        # so the DP grid is pure audit/telemetry there — the FACTORING ranks are
+        # byte-identical either way. Default (alpha_workers absent / <2 GPUs) ⇒
+        # 1 ⇒ the serial in-process grid, byte-identical to today.
+        run_ctx.set("alpha_workers", _resolve_alpha_workers(config))
+        _alpha_student_path = None
+        for _cand in ("stage2p5_final", "stage2_pruned"):
+            _p = artifacts_dir / _cand
+            if _p.exists():
+                _alpha_student_path = str(_p)
+                break
+        run_ctx.set("alpha_student_path", _alpha_student_path)
+        run_ctx.set("alpha_originals_path", str(_orig_path))
+        _alpha_acov_path = artifacts_dir / "_stage2_input_covariance.pt"
+        run_ctx.set(
+            "alpha_acov_path",
+            str(_alpha_acov_path) if _alpha_acov_path.exists() else None,
+        )
+        run_ctx.set("alpha_bcov_spill_dir", str(bcov_spill_dir))
+        run_ctx.set(
+            "alpha_ccov_spill_dir",
+            str(ccov_spill_dir) if ccov_spill_dir is not None else None,
+        )
+        run_ctx.set("alpha_cross_cov_enabled", bool(cross_cov_enabled))
+        run_ctx.set("alpha_bcov_storage_dtype", str(B_cov_dtype).split(".")[-1])
         walk_phases(("select_alpha",), plugins, run_ctx)
         alpha_by_type = run_ctx.get("alpha_by_type")
         per_expert_ranks = run_ctx.get("per_expert_ranks")

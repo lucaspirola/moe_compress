@@ -1576,24 +1576,56 @@ class SwiftSvdAlphaPlugin:
             grouped_svs_cache = None
             cache_was_built = False
             if validation_samples > 0:
-                # Paper-exact: global α via WikiText-2 PPL validation (§3.2.2).
-                best_global_alpha = _swift_svd_plus_alpha_search_validation(
-                    model,
-                    ctx.get("tokenizer"),
-                    moe_layers,
-                    group_stats,
-                    ranks,
-                    alpha_grid,
-                    ctx.get("originals"),
-                    A_cov,
-                    ctx.get("B_acc"),
-                    ctx.get("bcov_spill_dir"),
-                    ctx.get("C_acc") if ctx.has("C_acc") else None,
-                    ctx.get("ccov_spill_dir") if ctx.has("ccov_spill_dir") else None,
-                    config,
-                    device=ctx.get("device"),
-                    artifacts_dir=ctx.get("artifacts_dir") if ctx.has("artifacts_dir") else None,
-                )
+                # Lever 1 (α-grid task-parallel): when the orchestrator resolved
+                # ``alpha_workers > 1``, distribute the 11-candidate WikiText-2
+                # PPL grid across process-spawn replicas (``run_dp_alpha_search``)
+                # IN PLACE OF the serial grid. The parent merges via
+                # ``_argmin_alpha`` (sort-by-grid-idx + strict-< tie-break), so
+                # ``best_global_alpha`` is BYTE-IDENTICAL to the serial loop
+                # regardless of completion order. Else the existing serial path.
+                # H-α2: under ``per_group_type=True`` this α is DISCARDED for
+                # factoring (the per-type proxy below drives the ranks) — the DP
+                # grid is pure audit/telemetry there, factoring is unchanged.
+                alpha_workers = int(ctx.get("alpha_workers")) if ctx.has("alpha_workers") else 1
+                _student_path = ctx.get("alpha_student_path") if ctx.has("alpha_student_path") else None
+                if alpha_workers > 1 and _student_path is not None:
+                    best_global_alpha = run_dp_alpha_search(
+                        config=config,
+                        artifacts_dir=ctx.get("artifacts_dir"),
+                        student_path=_student_path,
+                        alpha_grid=alpha_grid,
+                        originals_path=ctx.get("alpha_originals_path"),
+                        a_cov_path=ctx.get("alpha_acov_path") if ctx.has("alpha_acov_path") else None,
+                        group_stats=group_stats,
+                        base_ranks=ranks,
+                        bcov_spill_dir=ctx.get("alpha_bcov_spill_dir"),
+                        ccov_spill_dir=ctx.get("alpha_ccov_spill_dir") if ctx.has("alpha_ccov_spill_dir") else None,
+                        cross_cov_enabled=bool(ctx.get("alpha_cross_cov_enabled")) if ctx.has("alpha_cross_cov_enabled") else False,
+                        replicas=alpha_workers,
+                        bcov_storage_dtype=(
+                            ctx.get("alpha_bcov_storage_dtype")
+                            if ctx.has("alpha_bcov_storage_dtype") else "bfloat16"
+                        ),
+                    )
+                else:
+                    # Paper-exact: global α via WikiText-2 PPL validation (§3.2.2).
+                    best_global_alpha = _swift_svd_plus_alpha_search_validation(
+                        model,
+                        ctx.get("tokenizer"),
+                        moe_layers,
+                        group_stats,
+                        ranks,
+                        alpha_grid,
+                        ctx.get("originals"),
+                        A_cov,
+                        ctx.get("B_acc"),
+                        ctx.get("bcov_spill_dir"),
+                        ctx.get("C_acc") if ctx.has("C_acc") else None,
+                        ctx.get("ccov_spill_dir") if ctx.has("ccov_spill_dir") else None,
+                        config,
+                        device=ctx.get("device"),
+                        artifacts_dir=ctx.get("artifacts_dir") if ctx.has("artifacts_dir") else None,
+                    )
                 if per_group_type:
                     # Branch (i): proxy runs → grouped_svs is built and reused.
                     alpha_by_type, grouped_svs_cache = _swift_svd_plus_alpha_search(
