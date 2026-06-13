@@ -1296,6 +1296,20 @@ def _spawn_ddp_workers(student, tokenizer, config, artifacts_dir, *,
     cleaned up after the join.
     """
     validate_ddp_teacher_strategy(config, ddp)
+    # Task 12: merge-repair under DDP is NOT YET SUPPORTED (the forward-capture
+    # hooks must attach to the DDP .module, and find_unused_parameters may need
+    # re-evaluation if masked centroid rows ever receive no grad). It is
+    # Stage-2.5-only + opt-in + default-OFF, so DDP ships without it; raise a
+    # clear error if both are requested rather than silently producing wrong
+    # gradients. Tracked as a separate follow-up plan.
+    _mr = (config.get("stage5_router_kd", {}) or {}).get("merge_repair", {}) or {}
+    if stage_key == "stage2p5" and bool(_mr.get("enabled")):
+        raise RuntimeError(
+            "Router-KD DDP + merge-repair (Direction E) is not yet supported. "
+            "merge-repair is Stage-2.5-only and opt-in; run it single-process, "
+            "or disable stage5_router_kd.merge_repair.enabled to use DDP. "
+            "(DDP support for merge-repair is a tracked follow-up.)"
+        )
     artifacts_dir = Path(artifacts_dir)
     src_dir = artifacts_dir / "_ddp_student_src"
     save_compressed_checkpoint(
