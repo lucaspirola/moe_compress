@@ -294,6 +294,10 @@ def _merge_ppl(partials):
 # named deterministic stub to each prompt. This lets the spawn + split + merge
 # plumbing be tested on CPU with no real model. Production callers never pass it.
 _STUB_GENERATE_PROMPTLEN = "promptlen"
+# Width-derived stub MODEL key (golden gate): the worker reconstructs the
+# stub model + tokenizer and runs the REAL _generate_batched so the left-pad
+# + pad_to_multiple_of group geometry is exercised end-to-end.
+_STUB_WIDTH_MODEL = "width_model"
 
 
 def _apply_stub_generate(key, prompts):
@@ -328,10 +332,23 @@ def _gen_replica_worker(
     import json as _json
     import torch as _torch
     from .eval_harness import _generate_batched, PINNED_GEN_BATCH_SIZE as _PIN
-    from .eval_shard import _apply_stub_generate as _stub, _reload_student_for_worker as _reload
+    from .eval_shard import (
+        _apply_stub_generate as _stub,
+        _reload_student_for_worker as _reload,
+        _STUB_WIDTH_MODEL,
+    )
 
     prompts_shard = list(prompts_shard)
-    if stub_generate is not None:
+    if stub_generate == _STUB_WIDTH_MODEL:
+        from .eval_shard_stub import (
+            build_width_stub_model as _bm,
+            build_width_stub_tokenizer as _bt,
+        )
+        completions = _generate_batched(
+            _bm(), _bt(), prompts_shard, max_new=max_new,
+            device=None, batch_size=_PIN,
+        )
+    elif stub_generate is not None:
         completions = _stub(stub_generate, prompts_shard)
     else:
         device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
@@ -351,7 +368,8 @@ def _gen_replica_worker(
 
 
 def run_dp_generate(prompts, *, tmp_dir, replicas, gpus_per_replica, max_new,
-                    experts_impl_generative, cfg, out_dir, _stub_generate=None):
+                    experts_impl_generative, cfg, out_dir, _stub_generate=None,
+                    _stub_model=None, _force_bounds=None):
     """Data-parallel HumanEval/MATH-500 generation.
 
     Fan out ``replicas`` child processes (torch.multiprocessing spawn), each
@@ -368,7 +386,9 @@ def run_dp_generate(prompts, *, tmp_dir, replicas, gpus_per_replica, max_new,
     import torch.multiprocessing as _mp
 
     n = len(prompts)
-    bounds = _group_aligned_split(n, replicas)
+    # _force_bounds is the test-only NEGATIVE-CONTROL seam (a NON-mod-8 split);
+    # production always uses the group-aligned boundaries.
+    bounds = _force_bounds if _force_bounds is not None else _group_aligned_split(n, replicas)
     out_dir = _Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -380,9 +400,10 @@ def run_dp_generate(prompts, *, tmp_dir, replicas, gpus_per_replica, max_new,
         dev_lo = r * gpus_per_replica
         dev_hi = dev_lo + gpus_per_replica
         visible = ",".join(str(d) for d in range(dev_lo, dev_hi))
+        _stub_arg = _stub_model if _stub_model is not None else _stub_generate
         spawn_args.append(
             (r, visible, str(tmp_dir), list(prompts[start:end]), max_new,
-             experts_impl_generative, str(out_file), _stub_generate)
+             experts_impl_generative, str(out_file), _stub_arg)
         )
 
     ctx = _mp.get_context("spawn")
@@ -593,6 +614,7 @@ __all__ = [
     "_gen_replica_worker",
     "run_dp_generate",
     "_STUB_GENERATE_PROMPTLEN",
+    "_STUB_WIDTH_MODEL",
     "_ppl_replica_worker",
     "run_dp_ppl",
     "_STUB_PPL_MOD7",
