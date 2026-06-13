@@ -372,3 +372,28 @@ def test_factor_single_worker_is_one_band_not_threaded():
     _run_factor(build_ctx, factor_workers=1)
     assert _eng._LAST_BAND_COUNT == 1
     assert _eng._LAST_RAN_THREADED is False
+
+
+# --------------------------------------------------------------------------- #
+# Lever 2 — T2.4: worker-count resolution clamps correctly.
+# --------------------------------------------------------------------------- #
+def test_factor_workers_resolution():
+    """``_resolve_factor_workers`` clamps to min(requested, device_count), floor 1.
+
+    Clone of ``_resolve_eora_workers`` keyed ``factor_workers``: multi_gpu
+    absent ⇒ 1; <=1 ⇒ 1 regardless of GPUs; requested-8 clamps to
+    min(8, device_count()) (CI: 0 GPUs ⇒ 1)."""
+    from moe_compress.stage3.orchestrator import _resolve_factor_workers
+
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    assert _resolve_factor_workers({}) == 1
+    assert _resolve_factor_workers({"multi_gpu": {"factor_workers": 1}}) == 1
+    assert _resolve_factor_workers({"multi_gpu": {"factor_workers": 0}}) == 1
+
+    requested = 8
+    got = _resolve_factor_workers({"multi_gpu": {"factor_workers": requested}})
+    if n_gpu < 2:
+        assert got == 1
+    else:
+        assert got == min(requested, n_gpu)
+        assert got >= 1

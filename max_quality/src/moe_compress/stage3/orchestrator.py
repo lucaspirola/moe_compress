@@ -104,6 +104,26 @@ def _resolve_cov_replicas(config: dict) -> tuple[int, int]:
     return max(1, effective), shards_per_model
 
 
+def _resolve_factor_workers(config: dict) -> int:
+    """Resolve the effective per-expert SVD-factor worker count (Lever 2).
+
+    Byte-for-byte clone of ``stage4/orchestrator.py::_resolve_eora_workers``
+    keyed ``factor_workers``: read the optional ``multi_gpu.factor_workers``
+    knob (default 1) and clamp to the number of visible CUDA devices, with a
+    floor of 1. ``n_gpu < 2`` OR ``factor_workers <= 1`` OR ``multi_gpu`` absent
+    ⇒ 1 (the serial in-process factor path, byte-identical to single-GPU today;
+    no 1x/2x special-casing — any N is ``min(...)``-clamped). The per-layer
+    ``min(..., N_experts)`` clamp is applied inside ``factor_layer`` where the
+    expert count is known.
+    """
+    mg = config.get("multi_gpu") or {}
+    requested = int(mg.get("factor_workers", 1) or 1)
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if requested <= 1 or n_gpu < 2:
+        return 1
+    return max(1, min(requested, n_gpu))
+
+
 def run(
     model,
     tokenizer,
@@ -799,6 +819,14 @@ def run(
     # exception cannot leak the executor; the C-cov twin load stays serial
     # (out of item-9 scope). The ordered moe_layers list is also published so
     # factor_layer can resolve "the next layer" without re-deriving it.
+    # Lever 2 (per-expert SVD factor task-parallel): resolve the effective
+    # worker count onto run_ctx so factor_layer fans its per-expert solves
+    # across worker devices via the EoRA band engine. Default (multi_gpu absent
+    # / factor_workers<=1 / <2 GPUs) ⇒ 1 ⇒ serial inline, byte-identical to
+    # single-GPU today. The optional ``factor_worker_devices`` seam is set by
+    # tests only (CPU stand-in for ≥2 GPUs); production derives ascending CUDA
+    # devices inside factor_layer.
+    run_ctx.set("factor_workers", _resolve_factor_workers(config))
     from moe_compress.utils.activation_hooks import BcovLayerPrefetcher
     _bcov_prefetcher = BcovLayerPrefetcher(B_acc, bcov_spill_dir)
     run_ctx.set("bcov_prefetcher", _bcov_prefetcher)
