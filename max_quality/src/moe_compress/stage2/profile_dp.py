@@ -55,6 +55,72 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# A1 — config resolution (default OFF) + reservoir guard AT RESOLUTION.
+#
+# The distill-input reservoir (_LayerInputAccumulator) is a RESERVOIR SAMPLE,
+# not additive, so it is NOT reducible across shards. When ANY layer-input
+# consumer is active — expert_distill_steps>0 OR cost_alignment=="output" OR
+# merge_step=="mergemoe" (the exact disjunction at layer_merge.py:468-472) — DP
+# profiling is disabled for the WHOLE run with a single log.warning naming the
+# consumer, HERE at resolution time (not 40 layers deep). enabled=False OR
+# resolved replicas<=1 ⇒ the serial _profile_layer path, byte-identical.
+# (Reservoir-merge across shards by global-`seen` weighting is future work.)
+# ---------------------------------------------------------------------------
+def resolve_profile_dp_config(
+    s2: dict,
+    *,
+    expert_distill_steps: int,
+    cost_alignment: str,
+    merge_step: str,
+    device_count: int,
+) -> dict:
+    """Resolve the effective ``stage2_reap_ream.profile_dp`` config. Returns a
+    dict ``{enabled, replicas, shards_per_model}``. ``enabled`` is forced False
+    on any reservoir consumer, on ``device_count<=1``, or on resolved
+    ``replicas<=1`` — those paths run the byte-identical serial profile."""
+    raw = dict(s2.get("profile_dp") or {})
+    enabled = bool(raw.get("enabled", False))
+    shards_per_model = int(raw.get("shards_per_model", 1))
+
+    # Reservoir guard — fire at resolution, name the consumer.
+    if enabled:
+        consumer = None
+        if expert_distill_steps and expert_distill_steps > 0:
+            consumer = "expert_distill"
+        elif str(cost_alignment).lower() == "output":
+            consumer = "output"  # cost_alignment="output"
+        elif str(merge_step).lower() == "mergemoe":
+            consumer = "mergemoe"  # merge_step="mergemoe"
+        if consumer is not None:
+            log.warning(
+                "stage2 profile_dp DISABLED for the whole run: the layer-input "
+                "reservoir consumer %r is active (a reservoir sample is not "
+                "additive, so it is not reducible across DP shards). Falling back "
+                "to the serial profile. (Reservoir-merge across shards is future "
+                "work.)",
+                consumer,
+            )
+            enabled = False
+
+    # Resolve replicas: "auto" -> device_count; clamp >=1.
+    replicas_raw = raw.get("replicas", "auto")
+    if isinstance(replicas_raw, str) and replicas_raw.lower() == "auto":
+        replicas = max(int(device_count), 1)
+    else:
+        replicas = max(int(replicas_raw), 1)
+
+    # device_count<=1 or replicas<=1 ⇒ serial (byte-identical).
+    if enabled and (int(device_count) <= 1 or replicas <= 1):
+        enabled = False
+
+    return {
+        "enabled": enabled,
+        "replicas": replicas,
+        "shards_per_model": max(shards_per_model, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
 # A2 — sequence-disjoint shard (mirror Stage-3 _shard_calib at the
 # calibration-SEQUENCE granularity: contiguous dim-0 slices, last absorbs the
 # remainder, so every sequence is covered exactly once and the per-key Gram sum

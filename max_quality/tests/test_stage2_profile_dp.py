@@ -248,3 +248,155 @@ def test_structural_replay_matches_parent_select_and_resize():
     assert torch.equal(w_lr.experts_module.gate_up_proj, p_lr.experts_module.gate_up_proj)
     assert torch.equal(w_lr.experts_module.down_proj, p_lr.experts_module.down_proj)
     assert torch.equal(w_lr.router.weight, p_lr.router.weight)
+
+
+# ---------------------------------------------------------------------------
+# A7.5 — E2E equivalence: 2 in-process CPU "workers" reduce == serial pass.
+# ---------------------------------------------------------------------------
+def test_dp_reduce_equivalent_to_serial_profile(tmp_path):
+    """Two sequence-disjoint shards, each profiled into its own accumulator set
+    with the cov per-seq pin, spilled and reduced, reproduce the serial single-pass
+    accumulators: cov/REAP ~1e-5 (fp32), REAM bit-exact (fp64)."""
+    from moe_compress.stage2 import profiling, profile_dp
+    from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
+
+    n_seq, seq_len = 6, 8
+    torch.manual_seed(99)
+    calib = torch.randint(0, 32, (n_seq, seq_len), dtype=torch.long)
+
+    def _profile_into(model, batches, seq_len_arg):
+        lr = list(iter_moe_layers(model))[0]
+        reap, cov, ream = _new_accs(lr.num_routed_experts)
+        for b in batches:
+            profiling._profile_layer(
+                model, lr, [b], reap, cov, ream,
+                device=torch.device("cpu"), seq_len=seq_len_arg,
+            )
+        reap.finalize_layer(lr.layer_idx)
+        cov.finalize_layer(lr.layer_idx)
+        return reap, cov, ream, lr.layer_idx
+
+    # Serial reference: one model, all sequences as one batch (pin on so the
+    # comparison is to the batch-invariant reference, matching the DP target).
+    torch.manual_seed(0); m_serial = _TinyModel()
+    s_reap, s_cov, s_ream, li = _profile_into(m_serial, [calib], seq_len)
+
+    # DP: two replicas over disjoint shards (each its own fresh model copy).
+    shards = profile_dp.shard_calib_sequences(calib, replicas=2)
+    rep_dirs = []
+    for r, shard in enumerate(shards):
+        torch.manual_seed(0); m_r = _TinyModel()
+        reap, cov, ream, _ = _profile_into(m_r, [shard], seq_len)
+        d = tmp_path / f"rep{r}"
+        profile_dp._spill_reap_layer(reap, li, d / "reap")
+        cov.spill_layer_to_disk(li, str(d / "cov"))
+        profile_dp._spill_ream_layer(ream, li, d / "ream")
+        rep_dirs.append(d)
+
+    # Reduce the four accumulators into fresh parent accs.
+    from moe_compress.stage3.plugins.covariance_collection import _reduce_spilled_cov_dirs
+    p_reap, p_cov, p_ream = _new_accs(s_ream.num_experts)
+    profile_dp._reduce_reap_dirs([d / "reap" for d in rep_dirs], li, into=p_reap)
+    profile_dp._reduce_ream_dirs([d / "ream" for d in rep_dirs], li, into=p_ream)
+    cov_out = tmp_path / "cov_reduced"
+    _reduce_spilled_cov_dirs([d / "cov" for d in rep_dirs], cov_out, storage_dtype=torch.float32)
+    loaded = InputCovarianceAccumulator()
+    loaded.load_layer_from_disk(li, cov_out)
+
+    # cov ~1e-5 (fp32).
+    assert set(loaded.covariance) == set(s_cov.covariance) and s_cov.covariance
+    for k in s_cov.covariance:
+        assert torch.allclose(loaded.covariance[k], s_cov.covariance[k], atol=1e-4), f"cov @ {k}"
+    # REAP score ~1e-5.
+    for k in s_reap.sums:
+        assert abs(p_reap.score(k[0], k[1]) - s_reap.score(k[0], k[1])) < 1e-4, f"reap @ {k}"
+    # REAM gate_gram + sim: the REDUCE is bit-exact (A7.3/A7.4), but the
+    # serial-vs-DP comparison crosses a matmul-grouping boundary (serial folds
+    # one big xᵀx per batch; DP sums per-shard xᵀx), so it matches to fp64
+    # rounding (~1e-12), not bit-for-bit. The bit-exactness of the reduce given
+    # identical per-batch inputs is pinned by test_reduce_ream_gate_gram_bit_exact.
+    assert torch.allclose(p_ream._gate_gram[li], s_ream._gate_gram[li], atol=1e-9)
+    if li in s_ream._sim_tensor and li in p_ream._sim_tensor:
+        assert torch.allclose(p_ream._sim_tensor[li], s_ream._sim_tensor[li], atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# A7.7 — Byte-identical default gate: profile_dp.enabled=false ⇒ serial.
+# ---------------------------------------------------------------------------
+def test_default_gate_disabled_resolves_serial():
+    from moe_compress.stage2 import profile_dp
+
+    s2 = {"profile_dp": {"enabled": False}}
+    cfg = profile_dp.resolve_profile_dp_config(
+        s2, expert_distill_steps=0, cost_alignment="pre", merge_step="freq_weighted",
+        device_count=4,
+    )
+    assert cfg["enabled"] is False
+
+
+def test_default_gate_absent_resolves_serial():
+    from moe_compress.stage2 import profile_dp
+
+    cfg = profile_dp.resolve_profile_dp_config(
+        {}, expert_distill_steps=0, cost_alignment="pre", merge_step="freq_weighted",
+        device_count=4,
+    )
+    assert cfg["enabled"] is False
+
+
+def test_replicas_auto_resolves_to_device_count():
+    from moe_compress.stage2 import profile_dp
+
+    s2 = {"profile_dp": {"enabled": True, "replicas": "auto"}}
+    cfg = profile_dp.resolve_profile_dp_config(
+        s2, expert_distill_steps=0, cost_alignment="pre", merge_step="freq_weighted",
+        device_count=3,
+    )
+    assert cfg["enabled"] is True
+    assert cfg["replicas"] == 3
+    # device_count<=1 ⇒ enabled collapses to serial.
+    cfg1 = profile_dp.resolve_profile_dp_config(
+        s2, expert_distill_steps=0, cost_alignment="pre", merge_step="freq_weighted",
+        device_count=1,
+    )
+    assert cfg1["enabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# A7.8 — Reservoir guard at resolution: distill/output/mergemoe ⇒ DP off + warn.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("kwargs,consumer", [
+    (dict(expert_distill_steps=5, cost_alignment="pre", merge_step="freq_weighted"), "expert_distill"),
+    (dict(expert_distill_steps=0, cost_alignment="output", merge_step="freq_weighted"), "output"),
+    (dict(expert_distill_steps=0, cost_alignment="pre", merge_step="mergemoe"), "mergemoe"),
+])
+def test_reservoir_guard_disables_dp_and_warns(kwargs, consumer):
+    import logging as _logging
+    from moe_compress.stage2 import profile_dp
+
+    # Attach a capturing handler DIRECTLY to the module logger so the assertion
+    # is independent of caplog's propagation assumptions (other tests in the
+    # suite may reconfigure root-logger propagation/handlers).
+    records: list[_logging.LogRecord] = []
+
+    class _Cap(_logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    logger = _logging.getLogger("moe_compress.stage2.profile_dp")
+    h = _Cap(level=_logging.WARNING)
+    prev_level, prev_disabled = logger.level, logger.disabled
+    logger.addHandler(h)
+    logger.setLevel(_logging.WARNING)
+    logger.disabled = False
+    try:
+        s2 = {"profile_dp": {"enabled": True, "replicas": "auto"}}
+        cfg = profile_dp.resolve_profile_dp_config(s2, device_count=4, **kwargs)
+    finally:
+        logger.removeHandler(h)
+        logger.setLevel(prev_level)
+        logger.disabled = prev_disabled
+
+    assert cfg["enabled"] is False, "reservoir consumer must force serial"
+    assert any(consumer in r.getMessage() for r in records), \
+        f"warning must name the consumer {consumer!r}"
