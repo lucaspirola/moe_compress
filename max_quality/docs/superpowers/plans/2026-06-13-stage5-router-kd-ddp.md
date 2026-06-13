@@ -469,6 +469,17 @@ rank participates in EVERY step, on a disjoint row-slice of the SAME
 - `test_rowsplit_equal_tokens_by_construction`: assert every rank's local token count is
   `per_gpu * (L-1)` regardless of which step — equal by construction, so NO across-rank
   tail-drop is needed (the row-split cannot produce a ragged rank).
+- `test_live_teacher_logits_not_double_sliced` (H-new): with `batch_size=4, world_size=2`
+  (`per_gpu=2`) and a NON-degenerate live teacher returning distinct per-row logits,
+  assert rank-1's teacher logits cover its OWN rows `[2:4]` of the step batch (i.e. the
+  returned `[per_gpu,L,|V|]` is used AS-IS, NOT re-sliced to `[2:4]` of a `per_gpu`-row
+  tensor which would be empty). A regression that re-slices would yield empty/zero logits
+  on rank-1 → caught here.
+- `test_cache_teacher_token_start_rank_offset` (H-new): with `batch_size=4, world_size=2`,
+  assert `TeacherCachePlugin.provide_teacher_logits` reads `token_start = base +
+  rank*per_gpu*L` so rank-0 reads tokens `[base : base+2L]` and rank-1 reads
+  `[base+2L : base+4L]` (disjoint, covering the step's full `batch_size*L` block). A
+  regression without the offset makes both ranks read `[base : base+2L]`.
 **Implementation:**
 - `total_optim_steps = (len(batches) // grad_accum) * epochs` STAYS computed from the
   GLOBAL `len(batches)` (it already is — `orchestrator.py:332`; do NOT change it). The
@@ -495,12 +506,28 @@ rank participates in EVERY step, on a disjoint row-slice of the SAME
   `len(batches) % grad_accum` trailing drop (`:560`) is UNCHANGED and applies globally as
   before. The only new precondition is `batch_size % world_size == 0` (Task 0), which
   makes the row-split exact.
-- **Teacher cache index stays GLOBAL and correct for free:** `batch_index=i` and
-  `num_batches=len(batches)` passed to `provide_teacher_logits` (`:725-729`) are the
-  unchanged global values — every rank uses the SAME global `i`, then row-slices the
-  returned `[batch_size, L, |V|]` logits by the SAME `[rank*per_gpu:(rank+1)*per_gpu]`
-  rows to match its student rows. (Add the matching teacher row-slice right after the
-  `dispatch_first` return.)
+- **Teacher logits need NO second slice (H-new fix).** `batch` is row-sliced to `per_gpu`
+  rows ONCE, before `dispatch_first` (`:725-729`); `input_ids=batch` is then the already
+  sliced tensor. The teacher returns logits matching THAT input, so a second slice on the
+  returned logits is WRONG and must NOT be added:
+  - **LIVE teacher (the DEFAULT recipe — epochs=2, no cache):** `TeacherLivePlugin` runs
+    `teacher(input_ids=input_ids)` on the sliced `[per_gpu, L]` input and returns
+    `[per_gpu, L, |V|]` (`teacher.py:770-771`) — already the rank's rows. Slicing it again
+    by `[rank*per_gpu:(rank+1)*per_gpu]` would be out-of-range/empty for rank≥1 (and an
+    accidental no-op only at rank0/per_gpu=1) → a corrupted KD target on the very path the
+    plan targets. **Do NOT slice the returned live-teacher logits.**
+  - **CACHE teacher (epochs=1):** the cache hook computes
+    `token_start = (epoch*num_batches + batch_index)*(batch_size*L)` then reads
+    `input_ids.shape[0]*L = per_gpu*L` tokens (`teacher.py:498-506`). With the sliced
+    `input_ids`, EVERY rank would read the SAME leading `per_gpu*L` tokens (rank1 never
+    gets its rows). The fix is a **RANK OFFSET on `token_start`, NOT a second slice:**
+    `token_start += rank * per_gpu * L`. Thread `rank`/`per_gpu` into
+    `TeacherCachePlugin.provide_teacher_logits` (e.g. read `ctx.get("ddp_rank", 0)` and the
+    config `batch_size`/`world_size`) so each rank reads its own `per_gpu*L`-token window
+    within the step's `batch_size*L` block. (`batch_index=i` and `num_batches=len(batches)`
+    stay the unchanged GLOBAL values — only the within-block offset is rank-aware.)
+  - **Net:** add the rank offset to the cache `token_start`; change NOTHING in the live
+    path beyond the single pre-`dispatch_first` `batch` slice already specified above.
 **Expected:** `pytest max_quality/tests/test_router_kd_ddp_rowsplit.py -v` → pass.
 
 ### Task 5 — DDP wrap (after freeze + optimizer) + grad-accum `no_sync`
@@ -742,7 +769,9 @@ def _run_ddp_worker(*, rank, world_size, config, artifacts_dir, student_src,
     device = (torch.device(f"cuda:{rank}") if backend == "nccl" else torch.device("cpu"))
     # H1: reconstruct the COMPRESSED student from the temp dir (rebuilds FactoredExperts
     # at stored ranks, resizes routers — model_io.py:1508). NOT load_model(original).
-    student, tokenizer = load_compressed_model(
+    # L-new: load_compressed_model returns a 3-tuple (model, tokenizer, meta) — see
+    # model_io.py:1870 + the Stage-3 precedent covariance_collection.py:1119. Unpack all 3.
+    student, tokenizer, _ = load_compressed_model(
         student_src, device_map=({"": f"cuda:{rank}"} if backend == "nccl" else "cpu"),
         torch_dtype=config["model"]["torch_dtype"],
         attn_implementation=config["model"]["attn_implementation"])
@@ -806,29 +835,35 @@ pytest max_quality/tests/test_router_kd_orchestrator.py \
 **Test:**
 - `test_ddp2_matches_single_process`:
   1. Build `tiny_model` + `tiny_config` (conftest `:167,:173`); set
-     `stage5_router_kd.batch_size=2, gradient_accumulation=1, epochs=1,
-     max_calibration_samples=8, rkd_recipe="current"` (defeat paper-dials so epochs stays
-     1 and the single-process baseline is deterministic), `log_every_n_steps=1`,
-     teacher==student via the `load_model` monkeypatch (golden `:208-222`).
-  2. Run (a) single-process (no `ddp` key) → `batch_size=2`, `len(batches)=4` → capture the
+     `stage5_router_kd.batch_size=4, gradient_accumulation=1, epochs=1,
+     max_calibration_samples=16, rkd_recipe="current"` (defeat paper-dials so epochs stays
+     1 and the single-process baseline is deterministic), `log_every_n_steps=1`. Use a
+     **NON-degenerate teacher** (NOT teacher==student): monkeypatch `load_model` to return
+     a teacher whose logits DIFFER per row (e.g. a fixed random-but-seeded linear head, or
+     a second tiny model), so the per-rank teacher-row mapping is actually exercised — a
+     teacher==student / per_gpu=1 setup MASKS the H-new double-slice bug (rank-0's single
+     slice is a no-op), so it must NOT be used here.
+  2. Run (a) single-process (no `ddp` key) → `batch_size=4`, `len(batches)=4` → capture the
      final trainable (router) state dict + the captured loss trace (`_trackio_log` capture).
   3. Run (b) `ddp: {enabled: true, world_size: 2, backend: "gloo"}` with the **IDENTICAL**
-     `batch_size=2` AND **IDENTICAL** `max_calibration_samples=8` (→ identical
+     `batch_size=4` AND **IDENTICAL** `max_calibration_samples=16` (→ identical
      `len(batches)=4`, identical step count). The ONLY difference is the row-split:
-     `per_gpu = 2 // 2 = 1`, so rank 0 forwards row 0 and rank 1 forwards row 1 of EACH
-     step's 2-row batch, and DDP averages the two per-row gradients. Capture rank-0's final
-     exported router state + loss trace. (DDP spawns 2 CPU workers; rank-0 writes the
-     checkpoint.)
+     `per_gpu = 4 // 2 = 2`, so rank 0 forwards rows `[0:2]` and rank 1 forwards rows
+     `[2:4]` of EACH step's 4-row batch (and each rank's teacher logits cover those SAME
+     rows — exercising the live-no-double-slice and cache-rank-offset paths from Task 4),
+     and DDP averages the two per-rank-mean gradients. Capture rank-0's final exported
+     router state + loss trace. (DDP spawns 2 CPU workers; rank-0 writes the checkpoint.)
   4. Assert: per-step `loss` and `raw_kl` match within `math.isclose(rel_tol=1e-5,
      abs_tol=1e-7)` (the golden bar); the final router weight tensors match within
      `torch.allclose(rtol=1e-5, atol=1e-7)`. NOT byte-identical (DDP all-reduce reorders
      fp — documented).
 **Why this is the crux:** both runs use the SAME batch_size, the SAME number of batches,
 and the SAME number of optimizer steps — they differ ONLY in single-process full-batch
-vs 2-rank row-split + grad-average. That is the EXACT equivalence the result-preservation
-claim makes. If it fails, the claim is false and DDP must NOT ship. (A test where run (b)
-used `len(batches)=2` or half the steps would be testing the WRONG transform — the C1
-defect — and is explicitly forbidden.)
+vs 2-rank row-split (per_gpu=2) + grad-average. That is the EXACT equivalence the
+result-preservation claim makes, and `per_gpu=2` with a non-degenerate teacher exercises
+the per-rank teacher slice that `per_gpu=1` would mask. If it fails, the claim is false
+and DDP must NOT ship. (A test where run (b) used `len(batches)=2` or half the steps would
+be testing the WRONG transform — the C1 defect — and is explicitly forbidden.)
 **Determinism notes for the test:** seed everything (`torch.manual_seed`), force CPU
 single-thread (`torch.set_num_threads(1)`) so the AdamW float math is reproducible across
 the two runs (mirror the golden's same-machine caveat). Use `gloo` (NCCL needs CUDA).
@@ -905,7 +940,7 @@ clear "not yet supported" error** (add a guard in the DDP branch when
 | Early-stop desync → deadlock | `orchestrator.py:998,1024` | rank-0 decision → `broadcast_flag` (Task 6) |
 | Rank-0-only I/O | `:566,943,977,1053,1130`; `early_stop.py:397` | rank guards (Task 6) |
 | **M4 — resume under DDP** | `:403-511,468-481` | EVERY rank loads same ckpt + moves optim to `cuda:rank`; gloo resume test (Task 6/11) |
-| Teacher cache/live index is GLOBAL | `teacher.py:498` | global `batch_index=i`/`num_batches` unchanged; row-slice the returned logits (Task 4) |
+| **H-new — teacher logits must NOT be double-sliced** | `teacher.py:498-506,770-771` | `batch` sliced ONCE pre-dispatch; live logits used as-is; CACHE `token_start += rank*per_gpu*L` (Task 4) |
 | **M3 — unwrap scope** (student sites only, NOT teacher/pre-wrap) | `orch:328,428,447,869,1056,1218`; `early_stop:140,497`; `teacher:588,675`; `vocab_kd:231` | `unwrap_student` ONLY at these; leave `orch:149`, `teacher:161`, `teacher:709` as-is (Task 2) |
 | compile + DDP ordering | `:359-368` | pin `DDP(compile(m))` (Task 5) |
 | no_sync on grad-accum | `:850` | `no_sync()` on non-boundary microbatch (Task 5) |
