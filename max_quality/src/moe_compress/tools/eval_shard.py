@@ -224,6 +224,127 @@ def _merge_ppl(partials):
         return float("inf")
 
 
+
+# ---------------------------------------------------------------------------
+# Gen replica worker + spawn driver (run_dp_generate)
+# ---------------------------------------------------------------------------
+
+# Test-only seam: a picklable stub-generate key. When passed to the worker, the
+# worker SKIPS the model reload + _generate_batched and instead applies the
+# named deterministic stub to each prompt. This lets the spawn + split + merge
+# plumbing be tested on CPU with no real model. Production callers never pass it.
+_STUB_GENERATE_PROMPTLEN = "promptlen"
+
+
+def _apply_stub_generate(key, prompts):
+    if key == _STUB_GENERATE_PROMPTLEN:
+        return [f"<{p}|len{len(p)}>" for p in prompts]
+    raise ValueError(f"_apply_stub_generate: unknown stub key {key!r}")
+
+
+def _gen_replica_worker(
+    replica_idx,
+    visible_devices,
+    tmp_dir,
+    prompts_shard,
+    max_new,
+    experts_impl_generative,
+    out_file,
+    stub_generate,
+):
+    """Spawn target: one data-parallel GEN replica (mirror ``_cov_replica_worker``).
+
+    Pins itself to its GPU via ``CUDA_VISIBLE_DEVICES``, reloads the student with
+    the FULL generative-env contract (``_reload_student_for_worker(...,
+    for_generate=True)``), runs ``_generate_batched`` on its prompt sub-list at a
+    HARD-PINNED bs=8 (NO size_batch, NO run_with_oom_backoff — both would move bs
+    off 8 and flip near-tied argmax), and writes its completions (JSON) to
+    ``out_file``. Module-level (picklable) so it is a valid spawn target;
+    re-imports inside so the child has a clean import graph.
+    """
+    import os as _os
+    _os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+
+    import json as _json
+    import torch as _torch
+    from .eval_harness import _generate_batched, PINNED_GEN_BATCH_SIZE as _PIN
+    from .eval_shard import _apply_stub_generate as _stub, _reload_student_for_worker as _reload
+
+    prompts_shard = list(prompts_shard)
+    if stub_generate is not None:
+        completions = _stub(stub_generate, prompts_shard)
+    else:
+        device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+        model, tokenizer = _reload(
+            tmp_dir, experts_impl_generative=experts_impl_generative,
+            for_generate=True,
+            device_map=("cuda" if _torch.cuda.is_available() else "cpu"),
+            torch_dtype="bfloat16",
+        )
+        # HARD-PINNED bs=8 — no auto-batch, no OOM-backoff (METRIC_PINNED gen path).
+        completions = _generate_batched(
+            model, tokenizer, prompts_shard, max_new=max_new,
+            device=device, batch_size=_PIN,
+        )
+    with open(out_file, "w", encoding="utf-8") as _f:
+        _json.dump(completions, _f)
+
+
+def run_dp_generate(prompts, *, tmp_dir, replicas, gpus_per_replica, max_new,
+                    experts_impl_generative, cfg, out_dir, _stub_generate=None):
+    """Data-parallel HumanEval/MATH-500 generation.
+
+    Fan out ``replicas`` child processes (torch.multiprocessing spawn), each
+    pinned to its GPU subset, generating its group-aligned prompt shard at a
+    hard-pinned bs=8; then read the per-replica completion files and merge them
+    in original index order (``_merge_completions``). Boundaries come from
+    ``_group_aligned_split`` so every group-of-8 stays whole on one replica and
+    the merged completions are byte-identical to the single-GPU run.
+
+    ``_stub_generate`` is the test-only seam (see ``_STUB_GENERATE_PROMPTLEN``).
+    """
+    import json
+    from pathlib import Path as _Path
+    import torch.multiprocessing as _mp
+
+    n = len(prompts)
+    bounds = _group_aligned_split(n, replicas)
+    out_dir = _Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    spawn_args = []
+    out_files = []
+    for r, (start, end) in enumerate(bounds):
+        out_file = out_dir / f"_gen_replica_{r}.json"
+        out_files.append((start, end, out_file))
+        dev_lo = r * gpus_per_replica
+        dev_hi = dev_lo + gpus_per_replica
+        visible = ",".join(str(d) for d in range(dev_lo, dev_hi))
+        spawn_args.append(
+            (r, visible, str(tmp_dir), list(prompts[start:end]), max_new,
+             experts_impl_generative, str(out_file), _stub_generate)
+        )
+
+    ctx = _mp.get_context("spawn")
+    procs = []
+    for args in spawn_args:
+        p = ctx.Process(target=_gen_replica_worker, args=args)
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(
+                f"Stage 6 DP generate: replica process exited with code {p.exitcode}"
+            )
+
+    shard_results = []
+    for start, end, out_file in out_files:
+        with open(out_file, "r", encoding="utf-8") as _f:
+            completions = json.load(_f)
+        shard_results.append((start, end, completions))
+    return _merge_completions(shard_results)
+
 __all__ = [
     "PINNED_GEN_BATCH_SIZE",
     "_group_aligned_split",
@@ -232,4 +353,7 @@ __all__ = [
     "_merge_ppl",
     "_materialize_student",
     "_reload_student_for_worker",
+    "_gen_replica_worker",
+    "run_dp_generate",
+    "_STUB_GENERATE_PROMPTLEN",
 ]
