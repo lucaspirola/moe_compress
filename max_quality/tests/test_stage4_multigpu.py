@@ -30,6 +30,7 @@ import torch
 
 from moe_compress.pipeline.context import PipelineContext
 from moe_compress.stage4.orchestrator import _resolve_eora_workers
+from moe_compress.stage4.plugins import eora_compensation as _eora_mod
 from moe_compress.stage4.plugins.eora_compensation import (
     EoraCompensationPlugin,
     _compute_eora_factors,
@@ -323,3 +324,39 @@ def test_compute_eora_factors_relocates_cross_device_spectrum():
     )
     assert Uc.device == torch.device("cuda:1")
     assert Vc.device == torch.device("cuda:1")
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency engine: bit-exact concurrent==serial + ran-threaded proof
+# --------------------------------------------------------------------------- #
+def test_eora_concurrent_exact_equals_serial_cpu():
+    """W=3 concurrent path is BIT-identical to serial on CPU AND really threaded.
+
+    Uses torch.equal (not assert_close): CPU eigh/svd is deterministic, so the
+    concurrency engine — which only changes WHEN pure per-expert solves run, not
+    WHAT they compute, and assembles rows in ascending-e on the main thread —
+    must reproduce the serial bytes exactly. The len(bands)==3 / ran-threaded
+    assertions are the C1 guard: ["cpu","cpu","cpu"] MUST yield 3 real bands
+    (banded by ordinal w, not device object), proving the ThreadPoolExecutor
+    branch executed rather than silently collapsing to inline serial.
+    """
+    case = _build_case(n_experts=9)          # 9 experts → 3 full bands of 3 under W=3
+    fe_serial, rm_s, cp_s = _run_compensate(*case, eora_workers=1)
+
+    fe_par, rm_p, cp_p = _run_compensate(
+        *case, eora_workers=3, worker_devices=["cpu", "cpu", "cpu"],
+    )
+    # C1 guard: the threaded branch actually ran with 3 distinct bands.
+    assert _eora_mod._LAST_BAND_COUNT == 3, (
+        f"expected 3 bands (1 thread/worker), got {_eora_mod._LAST_BAND_COUNT} — "
+        "band-by-device-object bug would collapse CPU workers to 1 band")
+    assert _eora_mod._LAST_RAN_THREADED is True
+
+    assert fe_serial.ranks == fe_par.ranks
+    assert fe_serial.effective_ranks == fe_par.effective_ranks
+    assert rm_s == rm_p and cp_s == cp_p
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        for proj in ("U", "V"):
+            a = getattr(fe_serial, f"{name}_{proj}").data
+            b = getattr(fe_par, f"{name}_{proj}").data
+            assert torch.equal(a, b), f"{name}_{proj} bytes differ serial vs concurrent"
