@@ -93,6 +93,10 @@ class EoraInputsPlugin:
     writes: tuple[str, ...] = (
         "A_cov", "a_storage_dtype", "originals", "layers",
         "partial_dir", "stage3_ranks",
+        # Conditionally set: only when stage4_eora.whitening_cov requests the
+        # post-2.5 SHIFT cov ("shift" / "anchored_adaptive"). Absent (default
+        # "anchor") -> slot never bound -> byte-identical.
+        "shift_cov",
     )
     # Empty: EoraInputsPlugin needs no calibration pass — every Stage 4 input
     # (A-covariance, Stage-3 originals) is a precomputed on-disk artifact.
@@ -350,3 +354,43 @@ class EoraInputsPlugin:
         ctx.set("layers", layers)
         ctx.set("partial_dir", partial_dir)
         ctx.set("stage3_ranks", stage3_ranks)
+
+        # Shift-cov load (opt-in): when stage4_eora.whitening_cov requests the
+        # post-2.5 SHIFT cov, load the Stage-3 ride-along artifact into the
+        # "shift_cov" slot. Default "anchor" -> skipped (no I/O, no behaviour
+        # change). Missing-but-requested -> loud FileNotFoundError.
+        s4 = config.get("stage4_eora", {})
+        whitening_cov = str(s4.get("whitening_cov", "anchor"))
+        if whitening_cov in ("shift", "anchored_adaptive"):
+            shift_path = artifacts_dir / "_stage3_shift_covariance.pt"
+            if not shift_path.exists():
+                raise FileNotFoundError(
+                    f"stage4_eora.whitening_cov={whitening_cov!r} requires the "
+                    f"post-2.5 shift covariance at {shift_path}, but it is "
+                    "absent. Re-run Stage 3 with "
+                    "stage3_svd.persist_shift_covariance=true."
+                )
+            # Validate manifest (torn-write guard), mirroring the originals block.
+            shift_manifest = shift_path.with_suffix(
+                shift_path.suffix + ".MANIFEST.json"
+            )
+            if shift_manifest.exists():
+                from moe_compress.utils.atomic_io import (
+                    ManifestMismatchError,
+                    read_and_validate_manifest,
+                )
+                try:
+                    read_and_validate_manifest(
+                        shift_path, shift_manifest, expected_schema_version=1,
+                    )
+                except ManifestMismatchError as exc:
+                    raise RuntimeError(
+                        "Stage 4: shift covariance manifest validation FAILED "
+                        f"— {exc}. Delete {shift_path.name} + "
+                        f"{shift_manifest.name} and re-run Stage 3 with "
+                        "persist_shift_covariance=true."
+                    ) from exc
+            shift_payload = torch.load(shift_path, map_location="cpu")
+            ctx.set("shift_cov", shift_payload.get("covariance", {}))
+            log.info("Stage 4: loaded post-2.5 shift covariance (%d keys) for "
+                     "whitening_cov=%r", len(ctx.get("shift_cov")), whitening_cov)
