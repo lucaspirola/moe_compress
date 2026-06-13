@@ -208,6 +208,42 @@ def _fmt(x):
 # ---------------------------------------------------------------------------
 
 
+def _consolidate_shift_covariance(
+    spill_dir, out_path, layer_indices, *, storage_dtype,
+) -> int:
+    """Consolidate per-layer B-cov spills (the post-2.5 shift cov S=X'ᵀX')
+    into one durable named artifact for Stage-4 EoRA shift whitening.
+
+    Reads each ``spill_dir/layer_{idx}.pt`` (format_version 1, keyed
+    (layer,expert,matrix) -> Tensor[d,d]; up_proj aliased to gate_proj
+    upstream), merges the per-layer ``covariance`` dicts, and atomically
+    saves ``{"format_version": 1, "covariance": {...}}`` + a manifest sibling.
+    Near-zero cost: pure disk read+merge, no forward pass. Returns key count.
+    """
+    merged: dict = {}
+    for li in layer_indices:
+        p = Path(spill_dir) / f"layer_{li}.pt"
+        if not p.exists():
+            continue
+        payload = torch.load(p, map_location="cpu", weights_only=True)
+        cov = payload.get("covariance", {}) if isinstance(payload, dict) else {}
+        for k, t in cov.items():
+            merged[k] = t.to(storage_dtype)
+    from ...utils.atomic_io import atomic_torch_save, write_manifest_last
+    out_path = Path(out_path)
+    atomic_torch_save(out_path, {"format_version": 1, "covariance": merged})
+    manifest = out_path.with_suffix(out_path.suffix + ".MANIFEST.json")
+    try:
+        manifest.unlink(missing_ok=True)
+    except OSError:
+        pass
+    write_manifest_last(out_path, manifest, schema_version=1,
+                        extra_meta={"n_keys": len(merged),
+                                    "artifact": "stage3_shift_covariance"},
+                        compute_sha256=False)
+    return len(merged)
+
+
 def _reduce_spilled_cov_dirs(replica_dirs, out_dir, *, storage_dtype=None) -> list[int]:
     """Sum per-layer covariance spills from G data-parallel replicas into one
     canonical spill dir.
