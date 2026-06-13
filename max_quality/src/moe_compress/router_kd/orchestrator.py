@@ -1237,6 +1237,49 @@ def _run_single_process(
     return out_dir
 
 
+def validate_ddp_teacher_strategy(config: dict, ddp) -> None:
+    """Validate the teacher VRAM strategy for a DDP run (Task 7).
+
+    DDP needs a full student replica per GPU (~50 GB at net-35%). The faithful
+    BF16 teacher (~70 GB) does not co-fit one 80 GB card with a student replica.
+    Two DDP-compatible strategies:
+
+      (A) epochs==1 + teacher-logit cache — FAITHFUL, read-only mmap shared
+          across ranks, zero per-rank teacher VRAM. (The orchestrator rejects
+          epochs>1 + cache, so this path is epochs==1 only.)
+      (B) quantized replicated teacher (4-bit OR an FP8 ``teacher_model_repo``)
+          — QUALITY TRADE (KD target is an approximation of θ_T, NOT
+          result-preserving vs BF16); allowed only when explicitly configured.
+
+    Raise on epochs>1 + DDP without a quantized teacher (the default
+    ``paper_dials_only`` recipe is epochs=2 → cache unavailable → BF16
+    replicated teacher would OOM). We do NOT silently fall back to a BF16
+    replicated teacher.
+    """
+    s5 = config["stage5_router_kd"]
+    epochs = int(s5["epochs"])
+    has_cache = bool(s5.get("teacher_logits_cache"))
+    quantized = bool(s5.get("teacher_load_in_4bit")) or bool(
+        s5.get("teacher_model_repo")
+    )
+    if epochs == 1 and has_cache:
+        return  # path A — faithful, zero per-rank teacher VRAM
+    if epochs > 1 and not quantized:
+        raise RuntimeError(
+            "Router-KD DDP with epochs>1 (the paper_dials_only default) cannot "
+            "use the teacher-logit cache (orchestrator rejects epochs>1 + cache) "
+            "and a BF16 replicated teacher (~70 GB) will not co-fit a student "
+            "replica (~50 GB) on one 80 GB card. Choose ONE: (A) set epochs=1 "
+            "and configure stage5_router_kd.teacher_logits_cache (faithful, zero "
+            "per-rank teacher VRAM); or (B) set "
+            "stage5_router_kd.teacher_load_in_4bit=true OR teacher_model_repo "
+            "(FP8) — a QUALITY TRADE (KD target is an approximation of theta_T, "
+            "NOT result-preserving vs BF16) that needs explicit sign-off."
+        )
+    # epochs==1 without cache + quantized/BF16: each rank loads its own teacher
+    # (Task 8); allowed (BF16 only if it fits — operator's call).
+
+
 def _spawn_ddp_workers(student, tokenizer, config, artifacts_dir, *,
                        no_resume, stage_key, ddp):
     """Spawn ``ddp.world_size`` in-process rank workers (full impl in Task 8).
