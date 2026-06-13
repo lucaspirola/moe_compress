@@ -390,3 +390,20 @@ def test_eora_concurrent_gate_up_memo_skew_exact():
             assert torch.equal(
                 getattr(fe_s, f"{name}_{proj}").data,
                 getattr(fe_p, f"{name}_{proj}").data), f"{name}_{proj} skew mismatch"
+
+
+def test_eora_concurrent_log_residuals_bytes_unchanged():
+    """log_residuals=True must not perturb U/V/ranks vs log_residuals=False, and
+    concurrent==serial under it. Guards that the residual fp accumulation (pulled
+    onto the main thread in ascending-e) stays byte-irrelevant to the golden."""
+    case = _build_case(n_experts=9)
+    cfg_on = {"stage4_eora": {**case[4]["stage4_eora"], "log_residuals": True}}
+    case_on = (*case[:4], cfg_on)
+    fe_s, rm_s, cp_s = _run_compensate(*case_on, eora_workers=1)
+    fe_p, rm_p, cp_p = _run_compensate(
+        *case_on, eora_workers=3, worker_devices=["cpu", "cpu", "cpu"])
+    assert rm_s == rm_p and cp_s == cp_p and fe_s.ranks == fe_p.ranks
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        for proj in ("U", "V"):
+            assert torch.equal(getattr(fe_s, f"{name}_{proj}").data,
+                               getattr(fe_p, f"{name}_{proj}").data)
