@@ -884,6 +884,21 @@ def run(
     # purpose is mid-stage crash-resume only; once Stage 3 has completed
     # cleanly its outputs live in stage3_svd/ and originals.pt.
     import shutil
+    # Shift-cov ride-along (opt-in): persist the post-2.5 per-expert input Gram
+    # (B_acc = S = X'ᵀX', the post-2.5 SHIFT cov) as a durable artifact for
+    # Stage-4 EoRA shift whitening (upstream-EoRA-faithful). Default OFF →
+    # byte-identical (no artifact written, spill dir deleted below as before).
+    # MUST run BEFORE the _stage3_bcov_partial rmtree.
+    if bool(s3.get("persist_shift_covariance", False)):
+        from .plugins.covariance_collection import _consolidate_shift_covariance
+        _shift_path = artifacts_dir / "_stage3_shift_covariance.pt"
+        _n = _consolidate_shift_covariance(
+            bcov_spill_dir, _shift_path,
+            [ref.layer_idx for ref in moe_layers],
+            storage_dtype=B_cov_dtype,
+        )
+        log.info("Stage 3: persisted post-2.5 shift covariance (%d keys) -> %s",
+                 _n, _shift_path)
     if (artifacts_dir / "_stage3_bcov_partial").exists():
         shutil.rmtree(artifacts_dir / "_stage3_bcov_partial", ignore_errors=True)
         log.info("Removed Stage 3 B-cov spill dir (no longer needed post-success).")

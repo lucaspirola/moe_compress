@@ -353,3 +353,57 @@ def test_stage3_orchestrator_sets_calibration_jsonl_path(
     assert val.is_absolute(), (
         f"expected absolute Path; got {val}"
     )
+
+
+# ==========================================================================
+# Task 2 -- shift-cov ride-along (gated, default-off byte-identity).
+# ==========================================================================
+
+
+def test_orchestrator_persists_shift_cov_when_enabled(
+    tiny_model, patched_stage3, tmp_path,
+):
+    """With ``stage3_svd.persist_shift_covariance: true`` the orchestrator
+    writes ``_stage3_shift_covariance.pt`` + its manifest BEFORE deleting the
+    ``_stage3_bcov_partial`` spill dir, and the artifact holds the post-2.5
+    per-expert shift Grams keyed (layer, expert, matrix)."""
+    cfg = copy.deepcopy(patched_stage3)
+    cfg["stage3_svd"]["persist_shift_covariance"] = True
+    decomp = _run_stages_1_2(tiny_model, cfg, tmp_path)
+
+    stage3_orchestrator.run(
+        tiny_model, _TinyTokenizer(), cfg, tmp_path, decomp,
+        device=None, no_resume=True,
+    )
+
+    shift_path = tmp_path / "_stage3_shift_covariance.pt"
+    manifest = shift_path.with_suffix(shift_path.suffix + ".MANIFEST.json")
+    assert shift_path.is_file()
+    assert manifest.is_file()
+    # The spill dir is still cleaned up afterwards (ride-along precedes rmtree).
+    assert not (tmp_path / "_stage3_bcov_partial").exists()
+
+    payload = torch.load(shift_path, map_location="cpu", weights_only=True)
+    assert payload["format_version"] == 1
+    cov = payload["covariance"]
+    assert len(cov) > 0
+    for key, tensor in cov.items():
+        assert len(key) == 3  # (layer, expert, matrix)
+        assert tensor.ndim == 2 and tensor.shape[0] == tensor.shape[1]
+
+
+def test_orchestrator_no_shift_cov_by_default(
+    tiny_model, patched_stage3, tmp_path,
+):
+    """Default (key absent) -> no shift-cov artifact written (byte-identity)."""
+    decomp = _run_stages_1_2(tiny_model, patched_stage3, tmp_path)
+
+    stage3_orchestrator.run(
+        tiny_model, _TinyTokenizer(), patched_stage3, tmp_path, decomp,
+        device=None, no_resume=True,
+    )
+
+    assert not (tmp_path / "_stage3_shift_covariance.pt").exists()
+    assert not (
+        tmp_path / "_stage3_shift_covariance.pt.MANIFEST.json"
+    ).exists()
