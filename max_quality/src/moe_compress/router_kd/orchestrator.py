@@ -115,6 +115,8 @@ from .plugins.merge_repair import MergeRepairPlugin, _LayerOutputCapture
 from .plugins.early_stop import EarlyStopPlugin
 from .plugins.rkd_paper_recipe import RkdPaperRecipePlugin
 
+from .ddp_config import DdpConfig
+
 log = logging.getLogger(__name__)
 
 
@@ -171,6 +173,13 @@ def run(
     same code to serve both Stage 2.5 (``stage_key="stage2p5"``) and Stage 5
     (``stage_key="stage5"``).  The config section read is always
     ``stage5_router_kd`` regardless of ``stage_key``.
+
+    Dispatch fork (DDP, default-OFF). When ``stage5_router_kd.ddp.enabled`` is
+    absent / false / resolves to ``world_size <= 1`` this calls
+    :func:`_run_single_process` — the EXISTING single-process path, with
+    ``ddp=None`` so every DDP site added by later tasks is a no-op and the
+    instruction stream is identical to pre-change (golden stays green). DDP
+    engages only when enabled AND ``world_size >= 2``, spawning N rank workers.
     """
     # Fail loudly NOW if this environment cannot run the GDN backward correctly
     # (Hopper + Triton>=3.4 + no tilelang ⇒ fla raises at loss.backward()). This
@@ -189,8 +198,52 @@ def run(
     # EVERY Stage 2.5/5 run by default. It is a no-op ONLY when the operator
     # explicitly sets ``rkd_recipe: "current"`` (the deprecated rollback dials).
     # See router_kd/plugins/rkd_paper_recipe.py for the deltas + contract.
+    #
+    # MUST run BEFORE DdpConfig.from_config — it sets ``epochs`` (and may clear
+    # the cache), so the DDP config + teacher-strategy validation see the
+    # EFFECTIVE recipe.
     RkdPaperRecipePlugin().apply_config_overrides(config)
 
+    ddp = DdpConfig.from_config(config)
+    if not ddp.enabled:
+        # EXISTING single-process path. ddp=None signals "no DDP" → every DDP
+        # site is a no-op; the instruction stream is identical to pre-change.
+        return _run_single_process(
+            student, tokenizer, config, artifacts_dir,
+            device=device, no_resume=no_resume, stage_key=stage_key,
+        )
+    # H1: the LIVE student + tokenizer are passed so the parent can serialize
+    # the compressed weights for the workers to reconstruct (Task 8).
+    return _spawn_ddp_workers(
+        student, tokenizer, config, artifacts_dir,
+        no_resume=no_resume, stage_key=stage_key, ddp=ddp,
+    )
+
+
+def _run_single_process(
+    student,
+    tokenizer,
+    config: dict,
+    artifacts_dir: Path,
+    *,
+    device=None,
+    no_resume: bool = False,
+    stage_key: str = "stage5",
+    rank: int = 0,
+    world_size: int = 1,
+    ddp=None,
+) -> Path:
+    """The Router-KD training loop body (extracted from ``run``).
+
+    On the default path ``ddp is None`` and ``rank=0, world_size=1`` so every
+    DDP-conditional site is a no-op (identical instruction stream). Under DDP
+    each rank worker calls this with its own ``rank`` / ``world_size`` and a
+    ``DdpConfig`` ``ddp`` — the row-split (Task 4), DDP wrap + finiteness
+    all-reduce (Task 5), sync + rank-0 I/O (Task 6) all key off ``ddp``.
+
+    ``RkdPaperRecipePlugin().apply_config_overrides`` is already applied by the
+    public ``run`` before the dispatch fork — NOT re-applied here.
+    """
     s5 = config["stage5_router_kd"]
     cal = config["calibration"]
 
@@ -1058,6 +1111,20 @@ def run(
     )
     log.info("Stage %s complete -> %s", stage_key, out_dir)
     return out_dir
+
+
+def _spawn_ddp_workers(student, tokenizer, config, artifacts_dir, *,
+                       no_resume, stage_key, ddp):
+    """Spawn ``ddp.world_size`` in-process rank workers (full impl in Task 8).
+
+    Placeholder until Task 8 wires the live-student materialization + worker
+    entrypoint. Kept as a real module-level symbol so the Task-1 dispatch fork
+    is testable (tests monkeypatch this).
+    """
+    raise NotImplementedError(
+        "Router-KD DDP spawn is wired in Task 8 (student materialization + "
+        "worker entrypoint)."
+    )
 
 
 def _async_ckpt_enabled() -> bool:
