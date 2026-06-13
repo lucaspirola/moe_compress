@@ -77,14 +77,27 @@ context per op — more surface for a determinism bug, with no upside here becau
 each worker device's solves already serialize on that device's default stream
 within its own thread.
 
-**Granularity: one thread per *worker device*, not one thread per *expert*.** The
-unit of true parallelism is the *device*, not the task — N experts on one card
-still serialize on that card. So we spawn `effective_workers` threads, each
-owning the **contiguous band** of experts already assigned by `device_of`
-(`eora_compensation.py:684-691`). Within a thread, experts run in **ascending-e**
-order (preserving the gate→up memo and the per-expert spectrum reuse). This keeps
-the thread count tiny (= #devices), avoids GIL thrash, and means each thread
-touches exactly one CUDA device → no cross-thread same-device contention.
+**Granularity: one thread per *worker BAND*, not one thread per *expert*.** The
+unit of true parallelism is the *worker* (one band = one device's slice), not the
+task — N experts on one card still serialize on that card. So we spawn one thread
+per **band ordinal** `w` (the `0..effective_workers-1` index already used to
+build `device_of` at `eora_compensation.py:687-691`), each owning the
+**contiguous band** `eligible[w*per:(w+1)*per]` and carrying its band's target
+device `devices[w]`. Within a thread, experts run in **ascending-e** order
+(preserving the gate→up memo and the per-expert spectrum reuse). This keeps the
+thread count tiny (= #workers), avoids GIL thrash, and means each thread touches
+exactly one device → no cross-thread same-device contention.
+
+> **CRITICAL — band by INDEX `w`, never by device OBJECT.** The CPU test seam
+> passes `worker_devices=["cpu","cpu","cpu"]`, and
+> `torch.device("cpu") == torch.device("cpu")` (hash-equal). Grouping experts by
+> the device *object* would collapse all three CPU "workers" into ONE band → the
+> threaded branch would never run and every CPU equivalence test would pass
+> trivially as serial==serial, shipping the byte-identity-under-threading
+> guarantee **untested**. The band ordinal `w` is distinct per worker regardless
+> of device identity, so `["cpu","cpu","cpu"]` yields 3 real bands → 3 real
+> threads → a faithful 3-GPU model on CPU. The RED tests (Tasks 1-2) assert
+> `len(bands) == 3` so this can never silently regress to inline.
 
 ### Data-flow of the concurrent path (replaces the serial `for e in eligible:` block)
 
@@ -92,16 +105,18 @@ touches exactly one CUDA device → no cross-thread same-device contention.
 band_results: dict[e -> (Uc_home, Vc_home, take_eff, res_before, res_after)]   # filled by threads, keyed by e
 gate_spectra: dict[e -> spectrum]                                              # filled by gate-band threads (per-e, disjoint across bands)
 
-# Per worker device, a thread runs its band in ascending-e order:
-def _run_band(band_devs_experts):           # experts for ONE device, ascending e
-    for e in band:                           # serial WITHIN a device (correct: same-device work serializes anyway)
-        Uc, Vc, take_eff, rb, ra, spec = _solve_expert_tile(..., tgt=device, gate_spectrum=gate_spectra.get(e), ...)
+# bands keyed by ORDINAL w (NOT device object): {w: [experts...ascending]}, plus device_of[e]=devices[w]
+# One thread per band ordinal w; ["cpu","cpu","cpu"] → 3 distinct w → 3 real threads.
+def _run_band(experts):                      # experts for ONE band ordinal, ascending e
+    for e in experts:                        # serial WITHIN a band (same-device work serializes anyway)
+        tgt = device_of[e]
+        Uc, Vc, take_eff, rb, ra, spec = _solve_expert_tile(..., tgt=tgt, gate_spectrum=gate_spectra.get(e), ...)
         if name == "gate_proj": gate_spectra[e] = spec        # disjoint key e — no cross-thread race on same key
-        Uc_home = Uc.to(device=dev, dtype=dtype)              # gather to home INSIDE the thread (per-device copy, async on that device)
+        Uc_home = Uc.to(device=dev, dtype=dtype)              # gather to home INSIDE the thread (peer copy, async on tgt)
         Vc_home = Vc.to(device=dev, dtype=dtype)
         band_results[e] = (Uc_home, Vc_home, int(take_eff), rb, ra)   # disjoint key e — no race
 
-# main thread, AFTER all bands join:
+# main thread, AFTER all bands join (+ guarded cuda.synchronize over worker devices if log_residuals):
 for e in eligible:                           # ASCENDING-e — the byte-identity guarantee
     Uc_home, Vc_home, take_eff, rb, ra = band_results[e]
     U_corr[e] = Uc_home;  V_corr[e] = Vc_home
@@ -122,6 +137,14 @@ we additionally never read a key in a thread that another thread writes
 (`gate_spectra[e]` is written by e's gate-band thread and read by e's up-band
 thread, and the gate phase **fully joins** before the up phase begins — see Task 4).
 
+**Memo tensors are read-only to consumers.** When the up pass consumes
+`gate_spectra[e]`, `_compute_eora_factors` only ever *rebinds local names* to the
+spectrum tensors and, if a device move is needed, produces NEW tensors via `.to`
+(`eora_compensation.py:321-325`: `eigvecs_keep = eigvecs_keep.to(...)` etc.) — it
+never mutates the memo's tensors in place. So a gate-band thread's stored
+spectrum cannot be corrupted by the up pass, and concurrent up-pass reads of
+distinct `gate_spectra[e]` entries are safe.
+
 ### GPU thread-safety details
 
 - **Multi-device CUDA from multiple threads is safe with care.** Each thread
@@ -135,15 +158,25 @@ thread, and the gate phase **fully joins** before the up phase begins — see Ta
   sufficient. We do NOT share a single stream across threads.
 - **Final sync.** `ThreadPoolExecutor.__exit__` / `future.result()` joins the
   Python threads but does NOT by itself synchronize CUDA. The subsequent
-  `Uc.to(device=dev)` gather is itself a copy that orders after the producing
-  kernels on the same device (CUDA stream ordering), so the gathered tensor is
-  correct. The single `res_*_acc.item()` host sync (`:736-737`) — already
-  present, already after the loop — provides the one hard device→host barrier
-  per matrix. **No extra `torch.cuda.synchronize()` is required** for
-  correctness; the existing `.item()` and the `widen_rank` consumption order it.
-  (We add a defensive `torch.cuda.synchronize(dev)` ONLY behind the
-  `log_residuals` branch is NOT needed — call it out as a non-requirement so a
-  future reader doesn't add a spurious global sync that would mask a real bug.)
+  `Uc.to(device=dev)` gather (done inside each worker thread) is a copy that
+  orders after the producing kernels on the **same** device (CUDA stream
+  ordering), so each gathered tile is correct. For the U/V golden path the single
+  per-matrix `widen_rank` consumption and the existing `res_*_acc.item()` host
+  sync (`:736-737`) order the device work — **no extra
+  `torch.cuda.synchronize()` is required for the U/V bytes.**
+- **Residual path (`log_residuals=True`) — RECOMMENDED guarded sync.** The
+  residual scalars take a different route: each worker thread produces `rb`/`ra`
+  on its **worker** device, then the main-thread assembly does `rb.to(dev)`
+  (`:714-715`) — a cross-device copy from `tgt`→`dev` issued on the **main**
+  thread, which can race the worker's still-in-flight producing kernel on `tgt`.
+  Because the residual scalars are log-only (never the golden), a silent race
+  there would corrupt a logged number without tripping any byte gate. **Therefore
+  RECOMMEND** a single guarded `torch.cuda.synchronize(d)` over the distinct
+  worker devices, issued AFTER the pool joins and BEFORE the ascending-e
+  assembly, gated `if log_residuals and concurrent`. One sync per matrix,
+  default-off (residual logging is off by default), zero golden impact — cheap
+  insurance against a silently-wrong residual scalar. See Task 4c and
+  Open-Question #4.
 
 ### BLAS throttle note (CPU-stand-in path)
 
@@ -196,44 +229,65 @@ no-op (the heavy work is on-GPU).
 cd /home/lucas/ai/wt-stage4/max_quality
 python3 -m pytest tests/test_stage4_multigpu.py tests/test_stage4_golden_snapshot.py -q
 ```
-Expected: all pass (the multigpu file shows `6 passed, 1 skipped` — the skip is
-`test_compute_eora_factors_relocates_cross_device_spectrum`, which needs ≥2 CUDA
-devices; CI has 0). If the golden snapshot test FAILS or reports "Golden snapshot
-missing", STOP — the byte-identical baseline is not seeded and the plan's gate is
-invalid. Do not proceed.
+Expected for the **combined** command: `8 passed, 1 skipped` — that is the 6
+`test_stage4_multigpu.py` tests + the 2 `test_stage4_golden_snapshot.py` cases
+(`[fp32]` + `[bf16]`), with the 1 skip being
+`test_compute_eora_factors_relocates_cross_device_spectrum` (needs ≥2 CUDA
+devices; CI has 0). Run alone, `test_stage4_multigpu.py` shows `6 passed, 1
+skipped` and `test_stage4_golden_snapshot.py` shows `2 passed`. If the golden
+snapshot test FAILS or reports "Golden snapshot missing", STOP — the
+byte-identical baseline is not seeded and the plan's gate is invalid. Do not
+proceed.
 
 **Commit:** none (baseline only).
 
 ---
 
-### Task 1 — Failing test: concurrent (W=3) must byte-match serial on a band that actually splits
+### Task 1 — Failing test: concurrent (W=3) must byte-match serial AND prove the threaded branch actually ran
 
 The existing `test_eora_taskparallel_equivalence` (W=2) already passes against
 the **serial** dispatch because today's "parallel" path IS serial. We need a test
-that will pass once concurrency lands AND that exercises a genuine multi-band
-split (≥3 workers, ≥3 experts per band) with the gather assembled out of
-completion order. Add it RED first (it will pass trivially against the serial
-impl, so to make it a real regression gate for the concurrency change we assert
-**exact** equality `torch.equal` on CPU — CPU↔CPU is bit-identical — not just
-`assert_close`).
+that (a) exercises a genuine multi-band split (3 workers × 3 experts) with the
+gather assembled out of completion order, (b) asserts **exact** equality
+`torch.equal` on CPU (CPU↔CPU is bit-identical), AND (c) **proves the
+ThreadPoolExecutor branch ran** — without (c), the band-by-device bug (C1) could
+collapse all CPU workers to one band and the test would pass as serial==serial,
+shipping the concurrency guarantee untested.
+
+**Observability seam (no monkeypatch — repo rule).** Task 4a makes
+`_run_expert_bands` record the number of bands it built into a module-level
+read-only diagnostic `_LAST_BAND_COUNT` (an `int`, plus `_LAST_RAN_THREADED:
+bool`). Tests read these directly off the module after the run. This is a passive
+introspection counter, not a behavior patch.
 
 Add to `tests/test_stage4_multigpu.py`:
 
 ```python
+from moe_compress.stage4.plugins import eora_compensation as _eora_mod
+
 def test_eora_concurrent_exact_equals_serial_cpu():
-    """W>1 concurrent path is BIT-identical to serial on CPU (the byte gate).
+    """W=3 concurrent path is BIT-identical to serial on CPU AND really threaded.
 
     Uses torch.equal (not assert_close): CPU eigh/svd is deterministic, so the
     concurrency engine — which only changes WHEN pure per-expert solves run, not
     WHAT they compute, and assembles rows in ascending-e on the main thread —
-    must reproduce the serial bytes exactly. This is the load-bearing guard for
-    the 'byte-identical to current output' requirement.
+    must reproduce the serial bytes exactly. The len(bands)==3 / ran-threaded
+    assertions are the C1 guard: ["cpu","cpu","cpu"] MUST yield 3 real bands
+    (banded by ordinal w, not device object), proving the ThreadPoolExecutor
+    branch executed rather than silently collapsing to inline serial.
     """
     case = _build_case(n_experts=9)          # 9 experts → 3 full bands of 3 under W=3
     fe_serial, rm_s, cp_s = _run_compensate(*case, eora_workers=1)
+
     fe_par, rm_p, cp_p = _run_compensate(
         *case, eora_workers=3, worker_devices=["cpu", "cpu", "cpu"],
     )
+    # C1 guard: the threaded branch actually ran with 3 distinct bands.
+    assert _eora_mod._LAST_BAND_COUNT == 3, (
+        f"expected 3 bands (1 thread/worker), got {_eora_mod._LAST_BAND_COUNT} — "
+        "band-by-device-object bug would collapse CPU workers to 1 band")
+    assert _eora_mod._LAST_RAN_THREADED is True
+
     assert fe_serial.ranks == fe_par.ranks
     assert fe_serial.effective_ranks == fe_par.effective_ranks
     assert rm_s == rm_p and cp_s == cp_p
@@ -244,25 +298,39 @@ def test_eora_concurrent_exact_equals_serial_cpu():
             assert torch.equal(a, b), f"{name}_{proj} bytes differ serial vs concurrent"
 ```
 
-**Verify it currently passes** (serial impl satisfies it):
+**RED first.** Before Task 4 exists, `_run_expert_bands` /`_LAST_BAND_COUNT`
+/`_LAST_RAN_THREADED` are undefined, so this test errors at import/attribute
+access — a true failing test. (The byte-equality assertions would pass against
+serial, but the band-count + ran-threaded assertions cannot be satisfied until
+the real engine lands — this is the regression gate that forces a genuinely
+threaded impl.)
+
 ```bash
 python3 -m pytest tests/test_stage4_multigpu.py::test_eora_concurrent_exact_equals_serial_cpu -q
 ```
-Expected: `1 passed`. (It is a *forward-looking* regression gate — it must KEEP
-passing after Task 4 rewrites the dispatch. We commit it now so any concurrency
-regression is caught.)
+Expected (pre-Task-4): `1 failed` (`AttributeError`/`ImportError` on the
+diagnostic / `_run_expert_bands`). Post-Task-4: `1 passed`.
 
-**Commit:** `test(stage4-eora): bit-exact concurrent==serial gate (W=3, CPU)`
+**Commit:** `test(stage4-eora): bit-exact concurrent==serial gate + 3-band ran-threaded proof`
 
 ---
 
-### Task 2 — Failing test: gate→up spectrum memo must be correct under threaded bands
+### Task 2 — Failing test: gate→up spectrum memo must be correct under genuine threading (H1)
 
 The gate→up memo (`gate_spectra[e]`) is the one cross-pass shared state. Under
 threading it is written by e's gate-band thread and read by e's up-band thread.
-Add a test that forces gate and up eligibility to differ (so a shared expert is
-banded to different devices across the two passes — the existing
-`_drop_up_originals` seam at `tests/test_stage4_multigpu.py:262-269`), under W=3.
+This test forces gate and up eligibility to differ (so a shared expert is banded
+to a different worker ordinal across the two passes — the existing
+`_drop_up_originals` seam at `tests/test_stage4_multigpu.py:262-269`), under W=3,
+**and asserts the gate pass actually ran threaded** (the H1 ask: this must
+exercise the memo under genuine concurrency, not collapsed-to-serial).
+
+**Why this is safe under threading (H1 citation).** The memo tensors are
+**read-only to the up-pass consumer**: `_compute_eora_factors` only rebinds local
+names and, when a device move is needed, allocates NEW tensors via `.to`
+(`eora_compensation.py:321-325`) — it never mutates the stored spectrum in place.
+So concurrent up-pass reads of distinct `gate_spectra[e]` entries cannot corrupt
+each other or the gate-band writer's tensors.
 
 ```python
 def test_eora_concurrent_gate_up_memo_skew_exact():
@@ -271,8 +339,10 @@ def test_eora_concurrent_gate_up_memo_skew_exact():
     Forces a shared expert onto different worker bands across the gate vs up
     passes (the cross-device gate-spectrum reuse case). The threaded engine must
     (a) build each gate spectrum on its band thread, (b) hand it to the up pass
-    via the per-expert memo, (c) let _compute_eora_factors relocate it to the up
-    delta's device. Bit-exact on CPU."""
+    via the per-expert memo (read-only; eora_compensation.py:321-325 rebinds
+    locals / allocs new tensors, never mutates the memo), (c) let
+    _compute_eora_factors relocate it to the up delta's device. Bit-exact on CPU,
+    AND genuinely threaded (gate pass yields >1 band)."""
     make_fe, ref_factory, originals, A_cov, config = _build_case(n_experts=9)
     originals_skew = _drop_up_originals(originals, {1, 4, 7})
     fe_s, rm_s, cp_s = _run_compensate(
@@ -280,6 +350,11 @@ def test_eora_concurrent_gate_up_memo_skew_exact():
     fe_p, rm_p, cp_p = _run_compensate(
         make_fe, ref_factory, originals_skew, A_cov, config,
         eora_workers=3, worker_devices=["cpu", "cpu", "cpu"])
+    # H1/C1 guard: the LAST band run (the down_proj pass, 6 experts) ran threaded.
+    # The gate pass (9 experts) split into 3 bands too; the memo was exercised
+    # across real threads. _LAST_RAN_THREADED reflects the final per-matrix run.
+    assert _eora_mod._LAST_RAN_THREADED is True
+    assert _eora_mod._LAST_BAND_COUNT >= 2
     assert fe_s.ranks == fe_p.ranks and rm_s == rm_p and cp_s == cp_p
     for name in ("gate_proj", "up_proj", "down_proj"):
         for proj in ("U", "V"):
@@ -291,9 +366,15 @@ def test_eora_concurrent_gate_up_memo_skew_exact():
 ```bash
 python3 -m pytest tests/test_stage4_multigpu.py::test_eora_concurrent_gate_up_memo_skew_exact -q
 ```
-Expected: `1 passed` against serial today; must stay green post-Task-4.
+Expected (pre-Task-4): `1 failed` (diagnostic undefined). Post-Task-4: `1 passed`.
 
-**Commit:** `test(stage4-eora): gate→up memo bit-exact under skewed bands`
+> Note for the implementer: `_LAST_BAND_COUNT` / `_LAST_RAN_THREADED` reflect the
+> **most recent** `_run_expert_bands` call, i.e. the down_proj pass (the last
+> matrix in `MATRIX_NAMES`). With 9 experts and `{1,4,7}` up-dropped, down_proj
+> has 9 eligible → 3 bands; gate_proj 9 → 3 bands; up_proj 6 → 3 bands. So every
+> per-matrix pass is genuinely threaded here.
+
+**Commit:** `test(stage4-eora): gate→up memo bit-exact under genuine threading (H1)`
 
 ---
 
@@ -345,50 +426,69 @@ it in place of the `for e in eligible:` block. **Minimal, surgical** — touch O
 (`widen_rank`, trackio) is unchanged.
 
 **4a — Add the helper** (module scope, near `_solve_expert_tile`, after
-`:467`). The helper takes a callable that solves one expert and returns the tile
-**already gathered to home device**, plus the in/out memo. It runs one thread per
-worker device, each thread walking its band ascending-e; then the caller
-assembles in ascending-e on the main thread.
+`:467`). The helper takes a list of **(band-ordinal, experts) bands already
+grouped by worker index** and a callable that solves one expert (returning the
+tile **already gathered to home device**). It runs one thread per band ordinal,
+each thread walking its band ascending-e; then the caller assembles in ascending-e
+on the main thread.
+
+> **C1 — band by ORDINAL, not device object.** The grouping is done by the band
+> ordinal `w`, NOT by `device_of[e]`. The CPU test seam uses
+> `["cpu","cpu","cpu"]` and `torch.device("cpu")==torch.device("cpu")`
+> (hash-equal); grouping by device would collapse those to ONE band and never run
+> the pool. Banding by `w` keeps the 3 workers distinct → 3 threads → faithful
+> 3-GPU model on CPU. We pass the pre-grouped `bands` in (built at the call site
+> from the existing `w`-indexed `device_of` construction) so the helper never
+> re-derives keys from device identity.
 
 ```python
+# Module-level read-only DIAGNOSTICS for tests (passive introspection — NOT a
+# behavior patch / monkeypatch). Reflect the most recent _run_expert_bands call.
+_LAST_BAND_COUNT: int = 0
+_LAST_RAN_THREADED: bool = False
+
+
 def _run_expert_bands(
-    eligible: list[int],
+    bands: list[tuple[int, list[int]]],   # [(w, [experts ascending]), ...] — keyed by ORDINAL w, NOT device
     device_of: dict[int, "torch.device"],
-    solve_one,                       # (e, tgt) -> (Uc_home, Vc_home, take_eff, res_before, res_after)
+    solve_one,                       # (e, tgt) -> (Uc_home, Vc_home, take_eff, rb, ra, spec_out)
     *,
     name: str,
-    gate_spectra: dict,              # MUTATED: gate pass writes e->spectrum (disjoint keys)
     set_gate_spectrum,               # (e, spectrum_out) -> None   (called inside band thread)
     concurrent: bool,
+    home_device,                     # gather target (for the optional residual sync)
+    log_residuals: bool = False,
 ) -> dict:
-    """Run the per-expert solves grouped into per-DEVICE bands.
+    """Run the per-expert solves grouped into per-WORKER bands (banded by ordinal).
 
-    Concurrency engine for N-GPU lever 1. Each distinct worker device gets ONE
-    thread that runs its contiguous band in ASCENDING-e order; threads overlap
-    across devices (CUDA kernels release the GIL and run async on each device's
-    default stream). The gather to the home device happens INSIDE each thread
+    Concurrency engine for N-GPU lever 1. Each band ordinal ``w`` gets ONE thread
+    that runs its contiguous band in ASCENDING-e order; threads overlap across
+    workers (CUDA kernels release the GIL and run async on each device's default
+    stream). The gather to the home device happens INSIDE each thread
     (``solve_one`` returns home-resident tiles), so the only main-thread work is
     the deterministic ascending-e assembly the caller does after join.
+
+    Banded by ORDINAL ``w`` (C1): the caller passes ``bands`` pre-grouped by the
+    worker index used in ``device_of`` construction, so two workers that happen
+    to map to the SAME device object (e.g. the CPU test stand-in
+    ``["cpu","cpu","cpu"]``) remain DISTINCT bands → real threads. Grouping by
+    ``device_of[e]`` here would silently collapse them and skip the pool.
 
     Byte-identicality: ``solve_one`` is a pure function of (e, tgt); results are
     keyed by ``e`` into a dict (disjoint keys, no race) and the CALLER reassembles
     in ascending-e — so worker completion order is unobservable, exactly like
-    serial. ``concurrent=False`` (single worker device, i.e. effective_workers<=1)
-    runs the bands inline on the calling thread → byte-identical to the legacy
-    serial loop, and the 1-GPU default never enters a thread.
+    serial. ``concurrent=False`` OR a single band runs inline on the calling
+    thread → byte-identical to the legacy serial loop, and the 1-GPU default
+    (effective_workers<=1 ⇒ one band) never enters a thread.
 
-    Returns ``band_results: {e: (Uc_home, Vc_home, take_eff, res_before, res_after)}``.
+    Returns ``band_results: {e: (Uc_home, Vc_home, take_eff, rb, ra)}``.
     """
+    global _LAST_BAND_COUNT, _LAST_RAN_THREADED
     import torch as _torch
     from concurrent.futures import ThreadPoolExecutor
 
-    # Group eligible experts by their assigned worker device, preserving the
-    # ascending-e order WITHIN each band (the memo + spectrum reuse depend on it).
-    bands: dict = {}
-    for e in eligible:                       # eligible is already ascending
-        bands.setdefault(device_of[e], []).append(e)
-
     band_results: dict = {}
+    _LAST_BAND_COUNT = len(bands)
 
     def _run_band(experts: list[int]) -> None:
         for e in experts:                    # ascending-e within the band
@@ -399,34 +499,58 @@ def _run_expert_bands(
             band_results[e] = (Uc_home, Vc_home, take_eff, rb, ra)
 
     if not concurrent or len(bands) <= 1:
-        for experts in bands.values():
+        _LAST_RAN_THREADED = False
+        for _w, experts in bands:
             _run_band(experts)
         return band_results
 
-    # Threaded: one worker thread per device. Pin intra-op BLAS to 1 on the main
-    # thread (process-global; restored in finally) to avoid (devices x cores)
+    # Threaded: one worker thread per band ordinal. Pin intra-op BLAS to 1 on the
+    # main thread (process-global; restored in finally) to avoid (bands x cores)
     # oversubscription on the CPU stand-in path. No-op cost on real GPUs.
+    _LAST_RAN_THREADED = True
     prev_threads = _torch.get_num_threads()
     try:
         _torch.set_num_threads(1)
         with ThreadPoolExecutor(max_workers=len(bands)) as pool:
-            futures = [pool.submit(_run_band, experts) for experts in bands.values()]
+            futures = [pool.submit(_run_band, experts) for _w, experts in bands]
             for f in futures:
                 f.result()                   # re-raise any worker exception here
     finally:
         _torch.set_num_threads(prev_threads)
+
+    # 4c — RECOMMENDED guarded residual sync (M1). The residual scalars rb/ra are
+    # produced on each WORKER device and later copied to ``home_device`` by the
+    # main-thread assembly (rb.to(dev)), which can race the worker's in-flight
+    # kernel. Log-only ⇒ a race would silently corrupt a logged number without
+    # tripping any byte gate. Sync the distinct worker devices once per matrix,
+    # ONLY under log_residuals (default off ⇒ zero cost on the golden path).
+    if log_residuals:
+        seen = set()
+        for e in band_results:
+            d = device_of[e]
+            if d.type == "cuda" and d not in seen:
+                seen.add(d)
+                _torch.cuda.synchronize(d)
     return band_results
 ```
 
 Notes embedded for the implementer:
+- `bands` is built at the call site directly from the existing ordinal-indexed
+  loop (`eora_compensation.py:687-691`): `bands = [(w, eligible[w*per:(w+1)*per])
+  for w in range(effective_workers)]` in the W>1 branch, or `[(0, eligible)]` in
+  the `effective_workers<=1` branch. This reuses the already-correct `w`/`per`
+  banding and guarantees distinct ordinals.
 - `solve_one` is a closure built in `compensate_layer` that wraps
   `_solve_expert_tile` AND the home-device gather (so the gather runs on the
-  worker thread, overlapping the next device's solve). It returns the
+  worker thread, overlapping the next worker's solve). It returns the
   gate-spectrum-out as the 6th element only for the gate pass.
 - `set_gate_spectrum` is a tiny closure `lambda e, s: gate_spectra.__setitem__(e, s)`.
   Passing it (rather than mutating `gate_spectra` directly in the helper) keeps
   the helper agnostic of the memo dict's identity and makes the disjoint-key
   contract explicit at the call site.
+- The `_LAST_BAND_COUNT` / `_LAST_RAN_THREADED` module globals are passive test
+  diagnostics only — no production code reads them; they exist so Tasks 1-2/5 can
+  prove the threaded vs inline branch was taken without monkeypatching.
 
 **4b — Rewrite the dispatch block** at `eora_compensation.py:693-718`. Replace:
 
@@ -451,13 +575,27 @@ Notes embedded for the implementer:
 with:
 
 ```python
-            # Concurrency engine (N-GPU lever 1): run each worker device's band
-            # CONCURRENTLY (one thread per device), gathering each tile to the
-            # home device INSIDE its band thread. Assembly into U_corr/V_corr and
-            # the residual fp sum stay on THIS thread in ascending-e order, so the
-            # output is byte-identical to the serial path regardless of which
-            # device finishes first. effective_workers<=1 ⇒ inline (no thread),
-            # byte-identical to single-GPU today.
+            # Concurrency engine (N-GPU lever 1): run each worker's band
+            # CONCURRENTLY (one thread per band ORDINAL w — NOT per device object,
+            # so the CPU ["cpu","cpu"] seam stays multi-band), gathering each tile
+            # to the home device INSIDE its band thread. Assembly into U_corr/
+            # V_corr and the residual fp sum stay on THIS thread in ascending-e
+            # order, so the output is byte-identical to the serial path regardless
+            # of which device finishes first. effective_workers<=1 ⇒ one band ⇒
+            # inline (no thread), byte-identical to single-GPU today.
+            #
+            # Build bands by ORDINAL w, reusing the same w/per split that produced
+            # device_of above (eora_compensation.py:687-691). C1: keyed by w, so
+            # two workers mapping to the same device object remain distinct bands.
+            if effective_workers <= 1:
+                bands = [(0, eligible)]
+            else:
+                bands = [
+                    (w, eligible[w * per:(w + 1) * per])
+                    for w in range(effective_workers)
+                ]
+                bands = [(w, ex) for (w, ex) in bands if ex]   # drop empty trailing bands
+
             def _solve_one(e, tgt):
                 W_orig, U_e, V_e, A = _inputs_for(e)
                 Uc, Vc, take_eff, rb, ra, spec_out = _solve_expert_tile(
@@ -472,10 +610,12 @@ with:
                 return Uc_home, Vc_home, int(take_eff), rb, ra, spec_out
 
             band_results = _run_expert_bands(
-                eligible, device_of, _solve_one,
-                name=name, gate_spectra=gate_spectra,
+                bands, device_of, _solve_one,
+                name=name,
                 set_gate_spectrum=gate_spectra.__setitem__,
                 concurrent=(effective_workers > 1),
+                home_device=dev,
+                log_residuals=log_residuals,
             )
 
             # Deterministic ascending-e assembly (the byte-identity guarantee).
@@ -491,6 +631,20 @@ with:
                 if (e + 1) % 32 == 0:
                     log.info("  L%d/%s expert %d/%d", ref.layer_idx, name, e + 1, N)
 ```
+
+**4c — Guarded residual sync** is implemented INSIDE `_run_expert_bands` (see
+4a): one `torch.cuda.synchronize(d)` per distinct worker device, gated on
+`log_residuals`, after the pool joins and before the helper returns (so it
+precedes the main-thread ascending-e `rb.to(dev)` assembly). Default-off, zero
+golden impact. (M1.)
+
+**`per` scope note:** `per = (len(eligible) + effective_workers - 1) //
+effective_workers` is currently computed only inside the W>1 branch at
+`eora_compensation.py:688`. The new `bands` builder reuses `per` in that same W>1
+branch, so it stays in scope — keep the `bands` construction immediately after
+`device_of` is built (inside the existing `else:` at `:684-691`), or hoist `per`
+just above. Do NOT reference `per` in the `effective_workers<=1` branch (it uses
+`[(0, eligible)]`).
 
 **Important behavioral preservations (verify each against the diff):**
 - `gate_spectra[e]` is written inside `_run_expert_bands` via
@@ -513,45 +667,57 @@ Expected: `9 passed, 1 skipped` (6 original passing + 3 new; the 1 skip is the
 ≥2-CUDA spectrum test). If ANY equivalence test flips to FAIL, the concurrency
 broke byte-identity — STOP and debug (do NOT regen any golden).
 
-**Commit:** `feat(stage4-eora): concurrency engine — per-device threaded bands (byte-identical)`
+**Commit:** `feat(stage4-eora): concurrency engine — ordinal-banded threads (byte-identical)`
 
 ---
 
-### Task 5 — Test: single-worker path takes the inline (no-thread) branch + W>1 with one device collapses
+### Task 5 — Test: 1-GPU default takes the inline (no-thread) branch (M2)
 
-Guard that `effective_workers<=1` and the degenerate "all bands on one device"
-case do NOT spin a pool (the 1-GPU default must be a literal no-op, not a
-1-thread pool). Assert via a behavioral proxy: a fresh case with `eora_workers=1`
-is byte-identical AND (optional, if cheaply observable) that `_run_expert_bands`
-with `concurrent=False` returns without entering `ThreadPoolExecutor`. The
-simplest robust assertion is the byte-equality already covered; add a direct
-unit test on the helper for the no-op branch:
+Guard that `effective_workers<=1` (the 1-GPU default) is a literal no-op — ONE
+band, inline, no pool — not a 1-thread pool. Two assertions: (a) a direct unit
+test on the helper's inline branch (new ordinal-banded signature), and (b) the
+**M2 invariant via the full `compensate_layer` path**: with `eora_workers=1` the
+engine must report exactly one band and `_LAST_RAN_THREADED is False`.
 
 ```python
-def test_run_expert_bands_single_device_inline():
-    """concurrent=False (or a single band) runs inline — no pool, ascending-e."""
-    from moe_compress.stage4.plugins.eora_compensation import _run_expert_bands
+def test_run_expert_bands_single_band_inline():
+    """A single band runs inline — no pool — and reports not-threaded."""
+    from moe_compress.stage4.plugins import eora_compensation as m
     calls = []
     def solve_one(e, tgt):
         calls.append(e)
         return (torch.zeros(2, 2), torch.zeros(2, 2), 1, None, None, None)
     eligible = [0, 1, 2, 3]
-    device_of = {e: torch.device("cpu") for e in eligible}   # one device → one band
-    res = _run_expert_bands(
-        eligible, device_of, solve_one, name="down_proj",
-        gate_spectra={}, set_gate_spectrum=(lambda e, s: None),
-        concurrent=True,                # even concurrent=True collapses: 1 band
+    device_of = {e: torch.device("cpu") for e in eligible}
+    bands = [(0, eligible)]                       # ONE band ordinal
+    res = m._run_expert_bands(
+        bands, device_of, solve_one, name="down_proj",
+        set_gate_spectrum=(lambda e, s: None),
+        concurrent=True,                          # even concurrent=True: 1 band ⇒ inline
+        home_device=torch.device("cpu"),
     )
-    assert calls == [0, 1, 2, 3]        # ascending-e, inline
+    assert calls == [0, 1, 2, 3]                  # ascending-e, inline
     assert set(res.keys()) == {0, 1, 2, 3}
+    assert m._LAST_BAND_COUNT == 1
+    assert m._LAST_RAN_THREADED is False
+
+
+def test_eora_single_worker_is_one_band_not_threaded():
+    """M2 invariant: eora_workers=1 ⇒ exactly one band, never the threaded branch."""
+    from moe_compress.stage4.plugins import eora_compensation as m
+    case = _build_case(n_experts=6)
+    fe, rm, cp = _run_compensate(*case, eora_workers=1)
+    assert m._LAST_BAND_COUNT == 1
+    assert m._LAST_RAN_THREADED is False
 ```
 
 ```bash
-python3 -m pytest tests/test_stage4_multigpu.py::test_run_expert_bands_single_device_inline -q
+python3 -m pytest tests/test_stage4_multigpu.py::test_run_expert_bands_single_band_inline \
+                  tests/test_stage4_multigpu.py::test_eora_single_worker_is_one_band_not_threaded -q
 ```
-Expected: `1 passed`.
+Expected: `2 passed`.
 
-**Commit:** `test(stage4-eora): single-device band runs inline (1-GPU no-op)`
+**Commit:** `test(stage4-eora): 1-GPU default is one-band inline, never threaded (M2)`
 
 ---
 
@@ -687,10 +853,17 @@ final review").
    needed. If a future config allows `eora_workers` > device_count for some
    logical oversubscription, revisit — but `_resolve_eora_workers` already clamps
    to `device_count()` (`orchestrator.py:82-85`), so this cannot happen today.
-4. **Defensive CUDA sync.** The plan argues no extra `torch.cuda.synchronize()`
-   is needed (the gather copy + the existing per-matrix `.item()` order the
-   device work). Confirm on the first real ≥2-GPU run that no missing-sync
-   hazard appears under `log_residuals=True` (the only host-sync path). If a
-   hazard is observed, add a single `torch.cuda.synchronize(dev)` AFTER the join,
-   BEFORE the ascending-e assembly — never inside a thread.
+4. **Guarded CUDA sync under `log_residuals` (RECOMMENDED, M1).** For the U/V
+   golden path no extra sync is needed (the per-device gather copy + the
+   per-matrix `widen_rank`/`.item()` order the device work). For the **residual
+   path only**, the main-thread `rb.to(dev)` (`:714-715`) copies a worker-device
+   scalar that may still be in-flight on that worker — a race that would silently
+   corrupt a log-only number without tripping any byte gate. The plan therefore
+   **RECOMMENDS** (Task 4a/4c) a single `torch.cuda.synchronize(d)` over the
+   distinct worker devices, issued after the pool joins and before the ascending-e
+   assembly, gated `if log_residuals` — one sync per matrix, default-off, zero
+   golden impact. This is implemented inside `_run_expert_bands`, never inside a
+   worker thread. Confirm on the first real ≥2-GPU run that the residual stats are
+   stable; if profiling shows the guarded sync is unnecessary it may be dropped,
+   but it ships ON by default-of-the-flag as cheap insurance.
 ```
