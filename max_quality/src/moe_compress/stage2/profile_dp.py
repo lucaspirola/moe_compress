@@ -36,6 +36,13 @@ straight into ``cov_acc.covariance`` (already-finalized), so the parent-side
 double-cast. REAP/REAM reduces produce final CPU values placed directly into the
 parent accumulators.
 
+Open-Q5 (DEFERRED): DP × resume is NOT implemented. On a resumed run the orchestrator
+`continue`s over already-merged (completed) layers, so the workers — which load the
+PRE-merge model at spawn — would forward through un-merged upstream layers (no RESYNC
+backlog replay). The orchestrator therefore DISABLES DP on any resume with a loud
+warning and falls back to the serial profile. Backlog-replay of all completed layers'
+merges at pool spawn is future work.
+
 A8 — DEFERRED: live ≥2-GPU validation. The 1-GPU default-off path is byte-identical
 (test ``test_default_gate_*``); the reduce + structural-replay math is proven
 in-process (CPU-simulated workers). The FIRST live ≥2-GPU run validates the
@@ -449,7 +456,6 @@ def _profile_worker_main(
     model_path: str,
     shard_start: int,
     shard_end: int,
-    seq_len: int,
     cmd_q,
     reduce_q,
 ) -> None:
@@ -562,12 +568,14 @@ class Stage2ProfilePool:
         self._reduce_q = None        # worker -> parent (shared)
         self._started = False
 
-    def start(self, config: dict, model_path: str, calib_n_seq: int, seq_len: int,
+    def start(self, config: dict, model_path: str, calib_n_seq: int,
               *, shards_per_model: int = 1) -> None:
         """Spawn the persistent worker processes ONCE. Each worker pins a GPU
         subset, loads its own model copy, and slices its sequence-disjoint shard.
         Mirrors Stage-3's spawn wiring but keeps the processes alive across layers
-        (the per-layer RESYNC barrier is what makes that legal)."""
+        (the per-layer RESYNC barrier is what makes that legal). ``seq_len`` is NOT
+        a spawn arg — it travels in each PROFILE message (constant per run, but the
+        per-message form keeps the worker stateless about it)."""
         import torch.multiprocessing as _mp
 
         ctx = _mp.get_context("spawn")
@@ -586,7 +594,7 @@ class Stage2ProfilePool:
             cmd_q = ctx.Queue()
             p = ctx.Process(
                 target=_profile_worker_main,
-                args=(r, visible, config, model_path, start, end, seq_len,
+                args=(r, visible, config, model_path, start, end,
                       cmd_q, self._reduce_q),
             )
             p.start()

@@ -1692,6 +1692,21 @@ def run(
     _profile_dp_pool = None
     _dp_spill_root = None
     _dp_prev_payload = None  # (prev_layer_idx, payload_path) for the RESYNC barrier
+    # Open-Q5 (DEFERRED): DP × resume is not yet implemented. On resume the loop
+    # `continue`s over completed (already-merged) layers, so the first profiled
+    # layer would get no RESYNC and the workers (which load the PRE-merge model at
+    # spawn) would forward through un-merged upstream layers — silently wrong
+    # profile data. Until the backlog-replay is built, disable DP on any resume
+    # with a loud warning and fall back to the byte-identical serial profile.
+    if _dp_cfg["enabled"] and completed_layers:
+        log.warning(
+            "stage2 profile_dp DISABLED: resume detected (%d completed layer(s)). "
+            "DP × resume is not yet implemented (Open-Q5: workers would forward "
+            "through un-merged upstream layers). Falling back to the serial "
+            "profile for this run.",
+            len(completed_layers),
+        )
+        _dp_cfg = {**_dp_cfg, "enabled": False}
     if _dp_cfg["enabled"]:
         _dp_seq_len = int(calib.shape[1]) if calib.dim() >= 2 else None
         _dp_spill_root = artifacts_dir / "_stage2_profile_dp_spill"
@@ -1705,7 +1720,7 @@ def run(
             _dp_cfg["replicas"], _dp_seq_len,
         )
         _profile_dp_pool.start(
-            config, _dp_model_path, int(calib.size(0)), _dp_seq_len,
+            config, _dp_model_path, int(calib.size(0)),
             shards_per_model=_dp_cfg["shards_per_model"],
         )
         run_ctx.set("profile_dp_pool", _profile_dp_pool)
