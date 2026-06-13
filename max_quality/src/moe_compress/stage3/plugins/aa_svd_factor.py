@@ -415,6 +415,102 @@ def _cov_lookup(cov: dict, layer_idx: int, expert_idx: int, matrix_name: str):
     return None
 
 
+def _factor_expert_tile(
+    layer_idx: int,
+    e: int,
+    target_device,
+    *,
+    originals,
+    A_cov,
+    B_cov,
+    C_cov,
+    per_expert_ranks,
+    ranks_layer,
+    B_cov_dtype,
+) -> dict:
+    """Pure per-expert AA-SVD solve — the task-parallel unit (Lever 2).
+
+    Mirror of stage4 ``_solve_expert_tile``: a VERBATIM lift of the per-expert
+    inner block of ``factor_layer`` (the ``for name in MATRIX_NAMES:`` body),
+    parameterized by ``target_device`` in place of the closure ``dev``. Reads
+    ONLY expert ``e``'s tensors (``originals[(layer_idx, e, name)]`` + the
+    per-expert ``A``/``B``/``C`` cov lookups), so relocating it to any device is
+    a pure relocation (same kernels on the same arch ⇒ bit-identical).
+
+    The gate→up eigh memo (``_precompute_eigh``) stays a LOCAL here: this loop
+    is matrix-INNER / expert-OUTER, so ``gate_up_decomp`` is computed once per
+    expert and consumed within this same tile (gate + up of THIS expert) and
+    NEVER crosses threads — unlike EoRA's matrix-outer memo. No
+    ``set_gate_spectrum`` plumbing.
+
+    ``B_cov`` / ``C_cov`` are the plain ``.covariance`` dicts (the main thread
+    keeps owning per-layer load/unload + the prefetcher; the tile must NOT touch
+    the accumulator). ``C_cov`` is ``None`` when cross-cov is unavailable.
+
+    Returns ``{name: (U_k_padded, V_k_padded, k_eff, k, rel_err)}`` for the three
+    matrices, all on ``target_device``, zero-padded to ``ranks_layer[name]``.
+    L1: ``_cov_lookup`` / ``_precompute_eigh`` / ``_aa_svd`` /
+    ``_aa_svd_precomputed`` / ``_EighDecomp`` are referenced DIRECTLY (module-
+    local) — NOT lazy-imported from ``stage3_svd`` (that would be a
+    self-referential cycle copied from swift_svd_alpha's monolith-resident
+    escape; this module IS the AA-SVD core).
+    """
+    # --- Precompute shared eigh for gate_proj / up_proj (matrix-inner loop) ---
+    B_shared = _cov_lookup(B_cov, layer_idx, e, "gate_proj")
+    A_shared = _cov_lookup(A_cov, layer_idx, e, "gate_proj") if A_cov is not None else None
+    C_shared = _cov_lookup(C_cov, layer_idx, e, "gate_proj") if C_cov is not None else None
+    gate_up_decomp: _EighDecomp | None = None
+    if B_shared is not None:
+        try:
+            gate_up_decomp = _precompute_eigh(
+                B_shared, A_shared, C_shared,
+                device=target_device, storage_dtype=B_cov_dtype,
+            )
+        except ValueError:
+            pass  # falls through to plain SVD per matrix below
+
+    tiles: dict = {}
+    for name in MATRIX_NAMES:
+        W = originals[(layer_idx, e, name)].to(device=target_device, dtype=torch.float32)
+        # Per-expert rank from Swift-SVD+ if available, else group-uniform.
+        if per_expert_ranks is not None:
+            k = per_expert_ranks.get((layer_idx, name, e), ranks_layer[name])
+        else:
+            k = ranks_layer[name]
+        if name in ("gate_proj", "up_proj") and gate_up_decomp is not None:
+            U_k, V_k, rel_err, k_eff = _aa_svd_precomputed(
+                W, gate_up_decomp, k, device=target_device,
+            )
+        else:
+            A = _cov_lookup(A_cov, layer_idx, e, name) if A_cov is not None else None
+            B = _cov_lookup(B_cov, layer_idx, e, name)
+            C = _cov_lookup(C_cov, layer_idx, e, name) if C_cov is not None else None
+            U_k, V_k, rel_err, k_eff = _aa_svd(
+                W, A, B, k, C=C, device=target_device, storage_dtype=B_cov_dtype,
+            )
+        # Zero-pad to the per-LAYER slot width (verbatim factor_layer logic). The
+        # slot is a per-layer constant computed BEFORE the per-expert loop, so it
+        # is independent of expert order; the trailing zero col(U)/row(V) are
+        # inert in the forward.
+        slot = ranks_layer[name]
+        u_w = U_k.shape[1]
+        v_w = V_k.shape[0]
+        assert u_w <= slot and v_w <= slot, (
+            f"factor width exceeds slot (u_w={u_w}, v_w={v_w}, slot={slot}) "
+            f"for L{layer_idx}_E{e}_{name} — _aa_svd* clamp chain violated"
+        )
+        if u_w < slot:
+            U_pad = torch.zeros(
+                U_k.shape[0], slot, device=U_k.device, dtype=U_k.dtype)
+            V_pad = torch.zeros(
+                slot, V_k.shape[1], device=V_k.device, dtype=V_k.dtype)
+            U_pad[:, :u_w] = U_k
+            V_pad[:v_w, :] = V_k
+            U_k, V_k = U_pad, V_pad
+        tiles[name] = (U_k, V_k, int(k_eff), int(k), float(rel_err))
+    return tiles
+
+
 class AaSvdFactorPlugin:
     """Stage 3 AA-SVD rank-k factorization plugin (S3-5 — registered-but-INERT).
 
