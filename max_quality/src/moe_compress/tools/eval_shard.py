@@ -21,10 +21,70 @@ as ``stage3.plugins.covariance_collection._cov_replica_worker`` does.
 """
 from __future__ import annotations
 
+import dataclasses
 import tempfile
 from pathlib import Path
 
 from .eval_harness import PINNED_GEN_BATCH_SIZE
+
+
+# ---------------------------------------------------------------------------
+# Config dataclass + default-OFF resolver
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class EvalShardConfig:
+    """Frozen config for the Stage-6 DP eval-shard (``stage6_validate.eval_shard``).
+
+    Default-OFF: ``enabled=False`` / ``replicas<=1`` / ``device_count()<2`` all
+    route to the existing in-process path (byte-identical). ``ppl`` gates the
+    PPL-DP path SEPARATELY from the gen path (M3): enabling eval-shard for the
+    gen win never silently spawns N x ~50 GB reloads for the cheap PPL forward.
+    """
+    enabled: bool = False
+    replicas: int = 0
+    gpus_per_replica: int = 1
+    ppl: bool = False
+
+    @classmethod
+    def from_dict(cls, d):
+        d = d or {}
+        fields = {f.name for f in dataclasses.fields(cls)}
+        kw = {k: v for k, v in d.items() if k in fields}
+        # Safety contract "OFF unless explicitly on": coerce bool flags to real
+        # bools so a stray YAML string ("false") cannot silently enable the path.
+        for flag in ("enabled", "ppl"):
+            if flag in kw:
+                kw[flag] = (kw[flag] is True) or (str(kw[flag]).strip().lower() == "true")
+        if "replicas" in kw:
+            kw["replicas"] = int(kw["replicas"])
+        if "gpus_per_replica" in kw:
+            kw["gpus_per_replica"] = int(kw["gpus_per_replica"])
+        return cls(**kw)
+
+
+def _should_shard(cfg, n_examples, *, group_aligned=True):
+    """Return the effective replica count (``0`` = in-process single-GPU path).
+
+    Returns 0 when disabled, when ``replicas<=1``, or when fewer than 2 CUDA
+    devices are visible. Otherwise clamps the requested replica count to the
+    visible device count, to ``n_examples``, and -- on the gen path
+    (``group_aligned=True``) -- to the number of whole groups-of-8, so every shard
+    is a whole number of groups (the METRIC_PINNED boundary guarantee).
+    """
+    import torch
+
+    if not cfg.enabled or cfg.replicas <= 1 or n_examples <= 0:
+        return 0
+    n_dev = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if n_dev < 2:
+        return 0
+    eff = min(cfg.replicas, n_dev, n_examples)
+    if group_aligned:
+        n_groups = (n_examples + PINNED_GEN_BATCH_SIZE - 1) // PINNED_GEN_BATCH_SIZE
+        eff = min(eff, n_groups)
+    return eff if eff > 1 else 0
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +581,8 @@ def run_dp_ppl(chunks, *, tmp_dir, replicas, gpus_per_replica, ppl_bs,
 
 __all__ = [
     "PINNED_GEN_BATCH_SIZE",
+    "EvalShardConfig",
+    "_should_shard",
     "_group_aligned_split",
     "_even_split",
     "_merge_completions",
