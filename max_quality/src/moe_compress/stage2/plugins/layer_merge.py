@@ -344,7 +344,7 @@ class LayerMergePlugin:
     reads: tuple[str, ...] = (
         "layer_ref", "reap_acc", "ream_acc", "layer_input_acc", "perm_cache",
         "target", "freq", "scores", "grouped", "protected",
-        "ream_centroid_ids", "final_kept_ids",
+        "ream_centroid_ids", "final_kept_ids", "merge_member_perms",
         "heal_state", "distill_state", "n_experts", "n_protected",
         "assigned_cost", "n_assigned", "c_fail", "em_rounds_done",
         "effective_cost_alignment", "effective_cost_asymmetric",
@@ -353,6 +353,7 @@ class LayerMergePlugin:
     writes: tuple[str, ...] = (
         "ream_acc", "perm_cache", "layer_input_acc",
         "distill_state", "final_kept_ids", "heal_state", "reap_acc",
+        "merge_member_perms",
     )
     provides: tuple[str, ...] = ()
 
@@ -571,7 +572,7 @@ class LayerMergePlugin:
             else None
         )
 
-        _merge_experts_inplace(
+        member_perms = _merge_experts_inplace(
             layer_ref, grouped, freq,
             freq_weighted=self.s2["ream"]["frequency_weighted_merge"],
             scores=scores,
@@ -588,6 +589,10 @@ class LayerMergePlugin:
             cov_acc=self.cov_acc,
         )
 
+        # Feature B: stash the EXACT per-member merge perms so write_artifacts can
+        # build the survivor's down_proj Gram union on the same permuted axis the
+        # weights used. {centroid: {member: perm}}; perm is None for the centroid.
+        ctx.set("merge_member_perms", member_perms)
         ctx.set("distill_state", None)
 
     # ------------------------------------------------------------------
@@ -677,7 +682,17 @@ class LayerMergePlugin:
         }
         # Ordering critical: remap to post-merge indices BEFORE snapshotting.
         # Writing pre-remap covariance would silently corrupt the resume path.
-        _remap_covariance_for_layer(cov_acc, layer_ref.layer_idx, final_kept_ids)
+        #
+        # Feature B: pass the merge recipe (grouped + the EXACT per-member perms
+        # captured during the merge) so each survivor's input-Gram anchor becomes
+        # the group UNION Σ_j G_j (down_proj summands permuted on both axes by the
+        # same perm the weights used). Singleton / protected survivors and the
+        # legacy (None) path stay byte-identical. The union is written to disk here,
+        # so resume loads it for free (a resumed run reads the already-unioned cov).
+        _remap_covariance_for_layer(
+            cov_acc, layer_ref.layer_idx, final_kept_ids,
+            grouped=grouped, member_perms=ctx.get("merge_member_perms"),
+        )
 
         if partial_dir is not None:
             _snapshot_cov_layer(cov_acc, layer_ref.layer_idx, partial_dir)
