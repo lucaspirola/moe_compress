@@ -1367,16 +1367,29 @@ def _assign_storage(model: nn.Module, key: str, tensor: torch.Tensor) -> None:
         )
     existing_dev = _canonical_device(existing.device)
     incoming_dev = _canonical_device(tensor.device)
-    # Allow CPU-skeleton → CUDA-tensor: this is the intended streaming scenario where
-    # the Transformers skeleton starts on CPU (from_config default) and tensors are
-    # loaded one-at-a-time directly onto the target device, freeing CPU storage as we go.
-    # Reject anything else that isn't same-device (e.g. CUDA:0 → CUDA:1, CUDA → CPU).
-    if existing_dev != incoming_dev and existing_dev != torch.device("cpu"):
-        raise RuntimeError(
-            f"_assign_storage: unexpected device on {key!r} — "
-            f"existing={existing_dev}, incoming={incoming_dev}. "
-            "Expected either matching devices or a CPU-skeleton → target-device stream."
-        )
+    # Device reconciliation between the skeleton slot and the incoming checkpoint tensor:
+    #   * same device → no-op (the common path).
+    #   * CPU-skeleton → CUDA-tensor: the intended streaming scenario where the
+    #     Transformers skeleton starts on CPU (from_config default) and tensors are
+    #     loaded one-at-a-time directly onto the target device, freeing CPU storage.
+    #     Keep the tensor on its CUDA target (the assignment moves the param there).
+    #   * CUDA-skeleton → different-CUDA tensor: a ``device_map``-SHARDED skeleton
+    #     (e.g. ``device_map="balanced"`` for the dual-model / large-model fit). The
+    #     skeleton's per-module device placement IS authoritative (it encodes the
+    #     device_map), so move the incoming weight onto the skeleton's device rather
+    #     than reject. Without this, loading a compressed checkpoint into a sharded
+    #     skeleton fails (e.g. layer on cuda:0, checkpoint tensor on cuda:1).
+    if existing_dev != incoming_dev:
+        if existing_dev.type == "cuda" and incoming_dev.type == "cuda":
+            tensor = tensor.to(existing_dev)
+            incoming_dev = existing_dev
+        elif existing_dev != torch.device("cpu"):
+            raise RuntimeError(
+                f"_assign_storage: unexpected device on {key!r} — "
+                f"existing={existing_dev}, incoming={incoming_dev}. "
+                "Expected matching devices, a CPU-skeleton → target-device stream, "
+                "or a CUDA-sharded (device_map) skeleton → target-device move."
+            )
     if isinstance(existing, nn.Parameter):
         # Param: rebind .data so the registered Parameter object stays the
         # same (preserves any tying / hooks). Drop refcount on old storage.
