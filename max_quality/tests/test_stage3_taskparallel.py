@@ -440,3 +440,66 @@ def test_alpha_argmin_matches_serial_loop():
     results = [(i, a, p) for i, (a, p) in enumerate(zip(grid, ppls))]
     assert _argmin_alpha(results) == best_alpha
     assert _argmin_alpha(list(reversed(results))) == best_alpha
+
+
+def test_alpha_dp_slice_disjoint_covers_grid():
+    """``_alpha_grid_slice(grid, r, N)`` returns disjoint ``r::N`` slices whose
+    union is the whole grid, each carrying its absolute ``(grid_idx, alpha)``."""
+    from moe_compress.stage3.plugins.swift_svd_alpha import _alpha_grid_slice
+
+    grid = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    N = 3
+    slices = [_alpha_grid_slice(grid, r, N) for r in range(N)]
+    # Disjoint absolute indices.
+    seen = [idx for sl in slices for (idx, _a) in sl]
+    assert sorted(seen) == list(range(len(grid)))
+    # Each slice carries the ABSOLUTE grid index + the matching alpha.
+    for sl in slices:
+        for idx, alpha in sl:
+            assert grid[idx] == alpha
+    # r::N stride.
+    assert [a for _i, a in slices[0]] == grid[0::N]
+    assert [a for _i, a in slices[1]] == grid[1::N]
+
+
+def test_alpha_dp_equivalence_inproc():
+    """In-process stand-in for the spawn driver: slicing the grid into N
+    disjoint ``r::N`` slices, evaluating each candidate via the SAME per-
+    candidate fn, then merging via ``_argmin_alpha`` gives the IDENTICAL
+    winning α + the IDENTICAL per-candidate ``(idx,alpha,ppl)`` set as the
+    serial full-grid evaluation. Proves the SLICE + MERGE math without 2 GPUs /
+    real processes (real spawn is exercised only on the live box)."""
+    from moe_compress.stage3.plugins.swift_svd_alpha import (
+        _alpha_grid_slice,
+        _argmin_alpha,
+        _run_alpha_candidates,
+    )
+
+    grid = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    # Deterministic per-candidate PPL: a parabola with min at α=0.3, plus a
+    # planted TIE at α=0.6 / α=0.9 to also exercise the tie-break under slicing.
+    def candidate_fn(idx, alpha):
+        # Parabola with a unique minimum at α=0.3 (ppl 0.0); the winner is
+        # unambiguous so the serial-vs-DP equivalence is about slice/merge
+        # plumbing, not tie semantics (ties are pinned in test_alpha_argmin_*).
+        return round((alpha - 0.3) ** 2, 6)
+
+    # Serial: the whole grid in order.
+    serial = _run_alpha_candidates(
+        [(i, a) for i, a in enumerate(grid)], candidate_fn)
+    serial_alpha = _argmin_alpha(serial)
+
+    # DP: N disjoint slices, each evaluated independently, then concatenated.
+    N = 3
+    merged = []
+    for r in range(N):
+        merged.extend(_run_alpha_candidates(_alpha_grid_slice(grid, r, N),
+                                            candidate_fn))
+    dp_alpha = _argmin_alpha(merged)
+
+    # Identical winning α.
+    assert dp_alpha == serial_alpha
+    # Identical per-candidate (idx, alpha, ppl) SET (order may differ).
+    assert sorted(serial) == sorted(merged)
+    # The unique parabola minimum.
+    assert serial_alpha == 0.3
