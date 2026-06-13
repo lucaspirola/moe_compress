@@ -371,6 +371,49 @@ def _evaluate_wikitext2_ppl(
     return math.exp(nll_sum / tok_count)
 
 
+def _resolve_alpha_eval_batch(config: dict, model, val_tensor, device) -> int:
+    """Per-replica auto-batch for the α-eval forward (BATCH_INVARIANT).
+
+    ``_evaluate_wikitext2_ppl`` sums NLL over tokens (``nll_sum += loss *
+    n_tokens`` then ``exp(nll_sum/tok_count)``) — grouping-independent, so the
+    PPL is a TRUE ``FidelityClass.BATCH_INVARIANT``: the size of the forward
+    batch never changes the number, only how fast it runs. Per-replica sizing is
+    therefore safe.
+
+    Double-gated EXACTLY like the cov DP worker: probe ONLY when
+    ``swift_svd_plus.validation_batch_size == "auto"`` AND ``auto_batch.enabled``.
+    The default (an int ``validation_batch_size``, =16) → no probe → the int
+    floor → byte-identical eval. The probe builds ``CudaMemProbe(device)`` AFTER
+    the worker's ``CUDA_VISIBLE_DEVICES`` pin (the caller is inside the spawned
+    replica), so it reads THIS replica's pinned-device VRAM
+    (``CUDA_VISIBLE_DEVICES``-first ordering — the HARD REQUIREMENT). On CPU /
+    no-CUDA the probe degrades to the floor.
+    """
+    svd_plus_cfg = config["stage3_svd"]["swift_svd_plus"]
+    raw = svd_plus_cfg.get("validation_batch_size", 16)
+    floor = 16
+    if not (isinstance(raw, str) and raw == "auto"):
+        return int(raw)
+    from ...utils.auto_batch import (
+        AutoBatchConfig, CudaMemProbe, size_batch,
+    )
+    import torch as _torch
+    cfg = AutoBatchConfig.from_dict(config["stage3_svd"].get("auto_batch"))
+    if not cfg.enabled or device is None or not _torch.cuda.is_available():
+        return floor
+
+    def _cost_probe(micro_batch: int) -> int:
+        batch = val_tensor[:micro_batch].to(device)
+        with _torch.no_grad():
+            model(input_ids=batch, labels=batch)
+        return int(_torch.cuda.max_memory_allocated(device))
+
+    return int(size_batch(
+        _cost_probe, floor, headroom_frac=cfg.headroom_frac,
+        max_cap=cfg.max_cap, mem=CudaMemProbe(device),
+    ))
+
+
 _EIGH_DECOMP_FIELDS = (
     "eigvals_keep", "eigvecs_keep", "inv_sqrt", "rhs", "rhs_pinv", "r_eff",
 )
@@ -651,6 +694,62 @@ def _restore_fused_experts(
         ref.experts_module = fused
 
 
+def _argmin_alpha(results: list[tuple[int, float, float]]) -> float:
+    """Pick the winning α from per-candidate ``(grid_idx, alpha, ppl)`` tuples.
+
+    Reproduces the serial validation loop's tie-break EXACTLY (H-α1): the
+    serial loop keeps the FIRST α (lowest grid index) on a strict-``<``
+    improvement, i.e. ties go to the earlier-evaluated (lower grid index)
+    candidate. We therefore iterate the merged results in ASCENDING GRID-INDEX
+    order (NOT completion order, NOT per-replica order) and apply the identical
+    ``if ppl < best_ppl`` rule. This makes the winner independent of which
+    replica finished first → byte-identical α selection between the serial and
+    the process-spawn DP paths.
+
+    Shared by BOTH the serial path (``_swift_svd_plus_alpha_search_validation``)
+    and the DP merge (``run_dp_alpha_search``), so the two are byte-identical by
+    construction. Returns ``0.5`` (the historical default) for an empty list.
+    """
+    best_alpha = 0.5
+    best_ppl = float("inf")
+    for _idx, alpha, ppl in sorted(results, key=lambda r: r[0]):
+        if ppl < best_ppl:
+            best_ppl = ppl
+            best_alpha = alpha
+    return best_alpha
+
+
+def _alpha_grid_slice(
+    alpha_grid: list[float], replica_idx: int, replicas: int,
+) -> list[tuple[int, float]]:
+    """Replica ``r``'s disjoint candidate slice ``alpha_grid[r::N]``.
+
+    Returns ``[(grid_idx, alpha), ...]`` carrying the ABSOLUTE grid index so
+    the parent merge can sort/fold by it (H-α1) independent of which replica
+    produced it. The slices are disjoint and their union is the whole grid, so
+    every candidate is evaluated exactly once across replicas.
+    """
+    return [(i, alpha_grid[i]) for i in range(replica_idx, len(alpha_grid), replicas)]
+
+
+def _run_alpha_candidates(
+    idx_alpha_pairs: list[tuple[int, float]],
+    candidate_fn,
+) -> list[tuple[int, float, float]]:
+    """Evaluate a list of ``(grid_idx, alpha)`` candidates → ``(grid_idx, alpha,
+    ppl)`` via ``candidate_fn(idx, alpha) -> ppl``.
+
+    The single shared per-candidate driver: the serial path runs it over the
+    WHOLE grid, each DP replica runs it over its ``_alpha_grid_slice``. Because
+    every candidate is a pure, independent factor→eval→restore cycle, the
+    per-candidate ``(idx, alpha, ppl)`` is identical regardless of which process
+    runs it — so concatenating the slices and folding via ``_argmin_alpha``
+    gives the byte-identical winner the serial loop would (proved in-process by
+    ``test_alpha_dp_equivalence_inproc``; real spawn deferred to the live box).
+    """
+    return [(idx, alpha, candidate_fn(idx, alpha)) for idx, alpha in idx_alpha_pairs]
+
+
 def _swift_svd_plus_alpha_search_validation(
     model,
     tokenizer,
@@ -728,9 +827,11 @@ def _swift_svd_plus_alpha_search_validation(
     log.info("Stage 3 α-search: %d validation sequences (%d tokens)",
              val_tensor.size(0), val_tensor.numel())
 
-    best_alpha = 0.5
-    best_ppl = float("inf")
-    results: list[tuple[float, float]] = []
+    # H-α1: accumulate per-candidate ``(grid_idx, alpha, ppl)`` and fold via the
+    # shared ``_argmin_alpha`` (sort-by-grid-idx + strict-< tie-break) AFTER the
+    # loop, so the serial path and the DP merge are byte-identical by
+    # construction. ``results`` doubles as the human-readable log line below.
+    results: list[tuple[int, float, float]] = []
 
     # A2: per-layer eigh-decomp spill cache. The decomp is (B,A,C)-determined,
     # W- and k-independent → IDENTICAL across all candidates (same B/C spill
@@ -778,7 +879,7 @@ def _swift_svd_plus_alpha_search_validation(
                 model, val_tensor, device=device,
                 batch_size=validation_batch_size,
             )
-            results.append((alpha, ppl))
+            results.append((idx, alpha, ppl))
             log.info("  α=%.1f → WikiText-2 PPL=%.4f", alpha, ppl)
             _trackio_log({
                 "stage3/alpha_search/alpha": alpha,
@@ -787,18 +888,237 @@ def _swift_svd_plus_alpha_search_validation(
 
             # 4. Restore original fused experts for the next candidate.
             _restore_fused_experts(model, moe_layers, originals, device=device)
-
-            if ppl < best_ppl:
-                best_ppl = ppl
-                best_alpha = alpha
     finally:
         # (b) Remove the eigh cache on normal + exception exit of the search.
         if eigh_cache_dir is not None:
             shutil.rmtree(eigh_cache_dir, ignore_errors=True)
 
+    # H-α1: shared completion-order-independent fold (sort-by-grid-idx + strict
+    # ``<`` tie-break). Byte-identical to the legacy inline serial fold; reused
+    # verbatim by the DP merge so serial and process-spawn pick the same α.
+    best_alpha = _argmin_alpha(results)
+    best_ppl = next((p for _i, a, p in sorted(results, key=lambda r: r[0])
+                     if a == best_alpha), float("inf"))
     log.info("Stage 3 α-search complete: best α=%.1f (PPL=%.4f)", best_alpha, best_ppl)
     log.info("  full results: %s",
-             ", ".join(f"α={a:.1f}→{p:.4f}" for a, p in results))
+             ", ".join(f"α={a:.1f}→{p:.4f}" for _i, a, p in results))
+    _trackio_log({
+        "stage3/alpha_search/best_alpha": best_alpha,
+        "stage3/alpha_search/best_ppl": best_ppl,
+    })
+    return best_alpha
+
+
+def _alpha_replica_worker(
+    replica_idx: int,
+    visible_devices: str,
+    config: dict,
+    artifacts_dir: str,
+    student_path: str,
+    originals_path: str,
+    a_cov_path,
+    group_stats,
+    base_ranks: dict,
+    bcov_spill_dir: str,
+    ccov_spill_dir,
+    cross_cov_enabled: bool,
+    bcov_storage_dtype: str,
+    idx_alpha_pairs: list,
+    result_path: str,
+    eigh_cache_dir: str,
+) -> None:
+    """Spawn target: one α-grid DP replica (Lever 1).
+
+    Pins itself to its GPU subset via ``CUDA_VISIBLE_DEVICES`` FIRST, then
+    reloads the student model + the CPU ``originals`` snapshot + ``A_cov``, and
+    for each owned ``(grid_idx, alpha)``: redistribute → factor → eval (per-
+    replica auto-batch) → restore, recording ``(grid_idx, alpha, ppl)``. Spills
+    its results to a per-replica JSON file (Q3 — crash-inspectable, no Queue
+    serialization-of-CUDA-context risk); the parent reads + merges them via
+    ``_argmin_alpha``.
+
+    ``group_stats`` / ``base_ranks`` are passed as picklable spawn args (plain
+    dicts of ``_GroupStats`` / ints), so the replica reproduces the parent's
+    exact redistribution. ``originals`` + ``A_cov`` reload from the on-disk
+    paths the parent persisted before the α-search.
+
+    Module-level (picklable) so it is a valid ``torch.multiprocessing`` spawn
+    target. Re-imports inside so the child has a clean import graph. The
+    ``CUDA_VISIBLE_DEVICES``-FIRST ordering is the HARD REQUIREMENT: every
+    later ``CudaMemProbe`` / model load sees ONLY this replica's GPU subset, so
+    each replica auto-batches against its OWN VRAM (mirror
+    covariance_collection._cov_replica_worker)."""
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+
+    import json as _json
+    import torch as _torch
+    from pathlib import Path as _Path
+    from ...utils.model_io import (
+        load_compressed_model as _load_compressed_model,
+        iter_moe_layers as _iter_moe_layers,
+    )
+    from ...utils.activation_hooks import InputCovarianceAccumulator
+    from ...stage3.plugins.swift_svd_alpha import (
+        _redistribute_ranks_swift_svd_plus,
+        _factor_model_at_ranks,
+        _evaluate_wikitext2_ppl,
+        _restore_fused_experts,
+        _build_wikitext2_validation,
+        _run_alpha_candidates,
+        _resolve_alpha_eval_batch,
+    )
+
+    device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+    B_dtype = getattr(_torch, bcov_storage_dtype)
+
+    student, tokenizer, _ = _load_compressed_model(
+        student_path,
+        device_map=config["model"]["device_map"],
+        torch_dtype=config["model"]["torch_dtype"],
+        attn_implementation=config["model"].get("attn_implementation", "sdpa"),
+    )
+    moe_layers = list(_iter_moe_layers(student))
+
+    # CPU snapshots / covariances reload (shared, identical across replicas).
+    originals = _torch.load(originals_path, map_location="cpu")
+    A_cov = _torch.load(a_cov_path, map_location="cpu") if a_cov_path is not None else None
+
+    B_acc = InputCovarianceAccumulator()
+    B_acc.set_storage_dtype(B_dtype)
+    C_acc = None
+    if cross_cov_enabled and ccov_spill_dir is not None:
+        C_acc = InputCovarianceAccumulator()
+        C_acc.set_storage_dtype(B_dtype)
+
+    svd_plus_cfg = config["stage3_svd"]["swift_svd_plus"]
+    validation_samples = int(svd_plus_cfg.get("validation_samples", 512))
+    val_tensor = _build_wikitext2_validation(
+        tokenizer, n_seqs=validation_samples, seq_len=2048,
+    )
+
+    def candidate_fn(idx, alpha):
+        per_expert_ranks = _redistribute_ranks_swift_svd_plus(
+            moe_layers, group_stats, base_ranks, {"all": alpha}, A_cov=A_cov,
+        )
+        _factor_model_at_ranks(
+            student, moe_layers, originals, per_expert_ranks, base_ranks,
+            A_cov, B_acc, _Path(bcov_spill_dir),
+            C_acc, _Path(ccov_spill_dir) if ccov_spill_dir is not None else None,
+            device=device, storage_dtype=B_dtype,
+            gate_up_decomp_cache_dir=eigh_cache_dir,
+        )
+        batch_size = _resolve_alpha_eval_batch(config, student, val_tensor, device)
+        ppl = _evaluate_wikitext2_ppl(
+            student, val_tensor, device=device, batch_size=batch_size,
+        )
+        _restore_fused_experts(student, moe_layers, originals, device=device)
+        return ppl
+
+    results = _run_alpha_candidates(idx_alpha_pairs, candidate_fn)
+    _Path(result_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(result_path, "w") as fh:
+        _json.dump(results, fh)
+
+
+def run_dp_alpha_search(
+    *,
+    config: dict,
+    artifacts_dir,
+    student_path: str,
+    alpha_grid: list[float],
+    originals_path: str,
+    a_cov_path,
+    group_stats,
+    base_ranks: dict,
+    bcov_spill_dir,
+    ccov_spill_dir,
+    cross_cov_enabled: bool,
+    replicas: int,
+    bcov_storage_dtype: str = "bfloat16",
+) -> float:
+    """Data-parallel α-grid validation search (Lever 1).
+
+    Fan out ``replicas`` child processes (torch.multiprocessing spawn), each
+    pinned to one GPU via ``CUDA_VISIBLE_DEVICES`` and owning the disjoint
+    candidate slice ``alpha_grid[r::N]`` (``_alpha_grid_slice``). Each replica
+    factors→evals→restores its candidates and spills ``(grid_idx, alpha, ppl)``
+    to a per-replica JSON file (Q3); the parent concatenates them and folds via
+    ``_argmin_alpha`` (sort-by-grid-idx + strict-< tie-break), so the winner is
+    BYTE-IDENTICAL to the serial loop regardless of which replica finished
+    first.
+
+    Each replica rebuilds the eigh cache in its OWN subdir
+    (``_stage3_alpha_eigh_cache/_replica_{r}``) so candidate-0-on-replica-r
+    fills it and r's other candidates reuse it — never sharing one dir across
+    replicas (the unconditional rmtree-at-entry would clobber peers).
+    """
+    from pathlib import Path as _Path
+    import json as _json
+    import torch.multiprocessing as _mp
+
+    artifacts_dir = _Path(artifacts_dir)
+    dp_dir = artifacts_dir / "_stage3_alpha_dp"
+    dp_dir.mkdir(parents=True, exist_ok=True)
+    eigh_root = artifacts_dir / "_stage3_alpha_eigh_cache"
+
+    spawn_args = []
+    result_paths = []
+    for r in range(replicas):
+        owned = _alpha_grid_slice(alpha_grid, r, replicas)
+        if not owned:
+            continue
+        result_path = dp_dir / f"_replica_{r}.json"
+        result_paths.append(result_path)
+        eigh_cache_dir = eigh_root / f"_replica_{r}"
+        shutil.rmtree(eigh_cache_dir, ignore_errors=True)
+        eigh_cache_dir.mkdir(parents=True, exist_ok=True)
+        spawn_args.append((
+            r, str(r), config, str(artifacts_dir), str(student_path),
+            str(originals_path),
+            (str(a_cov_path) if a_cov_path is not None else None),
+            group_stats, base_ranks, str(bcov_spill_dir),
+            (str(ccov_spill_dir) if ccov_spill_dir is not None else None),
+            cross_cov_enabled, bcov_storage_dtype, owned,
+            str(result_path), str(eigh_cache_dir),
+        ))
+
+    log.info("Stage 3 DP α-search: spawning %d replica(s) over %d candidates",
+             len(spawn_args), len(alpha_grid))
+    procs = []
+    ctx = _mp.get_context("spawn")
+    try:
+        for args in spawn_args:
+            p = ctx.Process(target=_alpha_replica_worker, args=args)
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(
+                    f"Stage 3 DP α-search: replica process exited with code "
+                    f"{p.exitcode}"
+                )
+        merged: list = []
+        for rp in result_paths:
+            with open(rp) as fh:
+                merged.extend(tuple(t) for t in _json.load(fh))
+    finally:
+        shutil.rmtree(eigh_root, ignore_errors=True)
+
+    best_alpha = _argmin_alpha(merged)
+    # Re-emit per-candidate telemetry in grid order from the parent (Q4): the
+    # replica emits interleave across processes, so the audit-trail order is
+    # restored here.
+    for _idx, alpha, ppl in sorted(merged, key=lambda r: r[0]):
+        _trackio_log({
+            "stage3/alpha_search/alpha": alpha,
+            "stage3/alpha_search/ppl": ppl,
+        })
+    best_ppl = next((p for _i, a, p in sorted(merged, key=lambda r: r[0])
+                     if a == best_alpha), float("inf"))
+    log.info("Stage 3 DP α-search complete: best α=%.1f (PPL=%.4f)",
+             best_alpha, best_ppl)
     _trackio_log({
         "stage3/alpha_search/best_alpha": best_alpha,
         "stage3/alpha_search/best_ppl": best_ppl,
@@ -1256,24 +1576,56 @@ class SwiftSvdAlphaPlugin:
             grouped_svs_cache = None
             cache_was_built = False
             if validation_samples > 0:
-                # Paper-exact: global α via WikiText-2 PPL validation (§3.2.2).
-                best_global_alpha = _swift_svd_plus_alpha_search_validation(
-                    model,
-                    ctx.get("tokenizer"),
-                    moe_layers,
-                    group_stats,
-                    ranks,
-                    alpha_grid,
-                    ctx.get("originals"),
-                    A_cov,
-                    ctx.get("B_acc"),
-                    ctx.get("bcov_spill_dir"),
-                    ctx.get("C_acc") if ctx.has("C_acc") else None,
-                    ctx.get("ccov_spill_dir") if ctx.has("ccov_spill_dir") else None,
-                    config,
-                    device=ctx.get("device"),
-                    artifacts_dir=ctx.get("artifacts_dir") if ctx.has("artifacts_dir") else None,
-                )
+                # Lever 1 (α-grid task-parallel): when the orchestrator resolved
+                # ``alpha_workers > 1``, distribute the 11-candidate WikiText-2
+                # PPL grid across process-spawn replicas (``run_dp_alpha_search``)
+                # IN PLACE OF the serial grid. The parent merges via
+                # ``_argmin_alpha`` (sort-by-grid-idx + strict-< tie-break), so
+                # ``best_global_alpha`` is BYTE-IDENTICAL to the serial loop
+                # regardless of completion order. Else the existing serial path.
+                # H-α2: under ``per_group_type=True`` this α is DISCARDED for
+                # factoring (the per-type proxy below drives the ranks) — the DP
+                # grid is pure audit/telemetry there, factoring is unchanged.
+                alpha_workers = int(ctx.get("alpha_workers")) if ctx.has("alpha_workers") else 1
+                _student_path = ctx.get("alpha_student_path") if ctx.has("alpha_student_path") else None
+                if alpha_workers > 1 and _student_path is not None:
+                    best_global_alpha = run_dp_alpha_search(
+                        config=config,
+                        artifacts_dir=ctx.get("artifacts_dir"),
+                        student_path=_student_path,
+                        alpha_grid=alpha_grid,
+                        originals_path=ctx.get("alpha_originals_path"),
+                        a_cov_path=ctx.get("alpha_acov_path") if ctx.has("alpha_acov_path") else None,
+                        group_stats=group_stats,
+                        base_ranks=ranks,
+                        bcov_spill_dir=ctx.get("alpha_bcov_spill_dir"),
+                        ccov_spill_dir=ctx.get("alpha_ccov_spill_dir") if ctx.has("alpha_ccov_spill_dir") else None,
+                        cross_cov_enabled=bool(ctx.get("alpha_cross_cov_enabled")) if ctx.has("alpha_cross_cov_enabled") else False,
+                        replicas=alpha_workers,
+                        bcov_storage_dtype=(
+                            ctx.get("alpha_bcov_storage_dtype")
+                            if ctx.has("alpha_bcov_storage_dtype") else "bfloat16"
+                        ),
+                    )
+                else:
+                    # Paper-exact: global α via WikiText-2 PPL validation (§3.2.2).
+                    best_global_alpha = _swift_svd_plus_alpha_search_validation(
+                        model,
+                        ctx.get("tokenizer"),
+                        moe_layers,
+                        group_stats,
+                        ranks,
+                        alpha_grid,
+                        ctx.get("originals"),
+                        A_cov,
+                        ctx.get("B_acc"),
+                        ctx.get("bcov_spill_dir"),
+                        ctx.get("C_acc") if ctx.has("C_acc") else None,
+                        ctx.get("ccov_spill_dir") if ctx.has("ccov_spill_dir") else None,
+                        config,
+                        device=ctx.get("device"),
+                        artifacts_dir=ctx.get("artifacts_dir") if ctx.has("artifacts_dir") else None,
+                    )
                 if per_group_type:
                     # Branch (i): proxy runs → grouped_svs is built and reused.
                     alpha_by_type, grouped_svs_cache = _swift_svd_plus_alpha_search(
