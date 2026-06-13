@@ -429,6 +429,282 @@ def test_cov_dp_equivalence(tiny_model, tmp_path):
 
 
 # ===========================================================================
+# Lever 2 (v2 step 3) — per-replica AUTO cov-batch sizing on the DP path.
+#
+# The load-bearing correctness claim: with the per-sequence reduction pin
+# active, each DP replica may auto-size its forward batch INDEPENDENTLY (to its
+# own VRAM) and the key-wise DP reduce (``_reduce_spilled_cov_dirs``, a fp32
+# key-wise SUM of finalized per-replica Grams) is still correct — no
+# cross-replica min(candidate) agreement is required (supersedes spec §6). The
+# only residual is the bounded ~1e-6 forward-activation drift on factored
+# down_proj B, N-independent and quality-neutral (the single-GPU property).
+#
+# CPU harness: we drive the REAL auto path (``cov_auto=True`` →
+# ``size_batch`` + ``run_with_oom_backoff`` + ``iter_batches(shard, cov_bs)`` +
+# the per-sequence pin) by monkeypatching the same cuda shims the cov-autobatch
+# wire test uses (fake ``CudaMemProbe`` + ``torch.cuda`` peak shims) and pinning
+# ``_COV_MAX_CAP`` per replica so each replica clamps to a DISTINCT cov_bs. This
+# exercises the actual auto re-slice — NOT a monkeypatched non-auto branch.
+# ===========================================================================
+
+
+def _patch_cov_cuda_shims(monkeypatch, *, max_cap, mem_total=10 ** 12):
+    """Make the REAL ``_collect_covariances`` auto path runnable on CPU and force
+    ``size_batch`` to clamp the sized cov_bs to ``max_cap``.
+
+    The probe's ``cost_probe_fn`` runs ``calib[:1]`` / ``calib[:2]`` through the
+    real model and reads ``torch.cuda.max_memory_allocated`` for the peak; with a
+    gentle 2-point slope and a huge ``mem.total()`` the predicted candidate is
+    huge, so ``size_candidate`` returns ``min(raw, max_cap) == max_cap`` (verified
+    by ``size_candidate``'s ``max(fixed_batch, min(raw, max_cap))``). Returns a
+    one-shot reset for the peak counter so each replica probes from a clean slope.
+    """
+    import moe_compress.stage3.plugins.covariance_collection as cc
+
+    monkeypatch.setattr(cc, "_COV_MAX_CAP", int(max_cap))
+
+    class _FakeMem:
+        def __init__(self, device=None):
+            pass
+
+        def total(self):
+            return mem_total
+
+        def allocated(self):
+            return 0
+
+        def reset_peak(self):
+            pass
+
+        def peak(self):
+            return 0
+
+    monkeypatch.setattr(cc, "CudaMemProbe", _FakeMem)
+
+    # Two-point probe slope: peak(1)=1000, peak(2)=1100 (gentle → big candidate,
+    # clamped to max_cap). The counter advances per max_memory_allocated read;
+    # size_batch reads it exactly twice (cost_probe_fn(1), cost_probe_fn(2)).
+    peaks = [1000, 1100]
+    pk = {"i": 0}
+
+    def _max_alloc(d=None):
+        v = peaks[min(pk["i"], len(peaks) - 1)]
+        pk["i"] += 1
+        return v
+
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda d=None: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", _max_alloc)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    return pk
+
+
+def test_dp_reduce_heterogeneous_replica_batches_matches_bs1(tiny_model, tmp_path):
+    """LOAD-BEARING: replica 0 auto-sizes to cov_bs=A, replica 1 to cov_bs=B
+    (A != B), both via the REAL auto path with the pin active, each spilled and
+    then key-wise reduced. The reduced per-key Gram must equal a UNIFORM bs=1 DP
+    reduce: ``torch.equal`` for gate_proj/up B + cross-cov C keys (the pin makes
+    those bitwise-invariant to forward batch), ``torch.allclose`` (~1e-5) for
+    factored down_proj B (bounded forward-activation drift). This proves replicas
+    need NOT agree on a batch — the pin subsumes the spec §6 min-agreement.
+    """
+    import copy
+    from moe_compress.utils.model_io import iter_moe_layers
+    from moe_compress.utils.calibration import iter_batches
+    from moe_compress.stage3.plugins.covariance_collection import AutoBatchConfig
+
+    torch.manual_seed(11)
+    # 8 sequences → 2 disjoint shards of 4. Per-replica caps 2 and 3 force
+    # DISTINCT auto cov_bs (A=2, B=3) — both > 1 and != each other.
+    calib = torch.randint(0, 32, (8, 8), dtype=torch.long)
+    shards = _shard_calib(calib, 2)
+    assert len(shards) == 2
+
+    ab = AutoBatchConfig(enabled=True, headroom_frac=0.0)
+
+    def _collect_replica(shard, *, b_dir, c_dir, cov_auto, max_cap, monkeypatch_ctx):
+        student = copy.deepcopy(tiny_model).eval()
+        teacher = copy.deepcopy(tiny_model).eval()
+        moe = list(iter_moe_layers(student))
+        tmoe = list(iter_moe_layers(teacher))
+        B = InputCovarianceAccumulator(); B.set_storage_dtype(torch.float32)
+        C = InputCovarianceAccumulator(); C.set_storage_dtype(torch.float32)
+        if cov_auto:
+            _patch_cov_cuda_shims(monkeypatch_ctx, max_cap=max_cap)
+        _collect_covariances(
+            student, moe, iter_batches(shard, 1), B, device=torch.device("cpu"),
+            spill_dir=b_dir, teacher_model=teacher, teacher_moe_layers=tmoe,
+            C_acc=C, ccov_spill_dir=c_dir, cov_window_size=1,
+            calib=shard, cov_auto=cov_auto, auto_batch_cfg=ab,
+        )
+
+    # --- Heterogeneous AUTO DP: replica 0 → cov_bs=2, replica 1 → cov_bs=3. ---
+    auto_b_dirs, auto_c_dirs = [], []
+    caps = [2, 3]
+    for r, shard in enumerate(shards):
+        b_dir = tmp_path / f"auto{r}_b"; b_dir.mkdir()
+        c_dir = tmp_path / f"auto{r}_c"; c_dir.mkdir()
+        auto_b_dirs.append(b_dir); auto_c_dirs.append(c_dir)
+        with pytest.MonkeyPatch.context() as mp:
+            _collect_replica(shard, b_dir=b_dir, c_dir=c_dir, cov_auto=True,
+                             max_cap=caps[r], monkeypatch_ctx=mp)
+    auto_b = tmp_path / "auto_merged_b"; auto_c = tmp_path / "auto_merged_c"
+    _reduce_spilled_cov_dirs(auto_b_dirs, auto_b, storage_dtype=torch.float32)
+    _reduce_spilled_cov_dirs(auto_c_dirs, auto_c, storage_dtype=torch.float32)
+
+    # --- Uniform bs=1 DP reference (non-auto, same shards). ---
+    ref_b_dirs, ref_c_dirs = [], []
+    for r, shard in enumerate(shards):
+        b_dir = tmp_path / f"ref{r}_b"; b_dir.mkdir()
+        c_dir = tmp_path / f"ref{r}_c"; c_dir.mkdir()
+        ref_b_dirs.append(b_dir); ref_c_dirs.append(c_dir)
+        _collect_replica(shard, b_dir=b_dir, c_dir=c_dir, cov_auto=False,
+                         max_cap=1, monkeypatch_ctx=None)
+    ref_b = tmp_path / "ref_merged_b"; ref_c = tmp_path / "ref_merged_c"
+    _reduce_spilled_cov_dirs(ref_b_dirs, ref_b, storage_dtype=torch.float32)
+    _reduce_spilled_cov_dirs(ref_c_dirs, ref_c, storage_dtype=torch.float32)
+
+    # B keys: gate_proj/up bitwise-equal, down_proj allclose (~1e-5 fwd drift).
+    b_layers = _layer_ids_on_disk(ref_b)
+    assert b_layers, "no B layers spilled (harness wiring bug)"
+    for li in b_layers:
+        ref_payload = torch.load(ref_b / f"layer_{li}.pt", map_location="cpu",
+                                 weights_only=True)
+        auto_payload = torch.load(auto_b / f"layer_{li}.pt", map_location="cpu",
+                                  weights_only=True)
+        assert set(ref_payload["covariance"]) == set(auto_payload["covariance"])
+        for k, ref_t in ref_payload["covariance"].items():
+            auto_t = auto_payload["covariance"][k]
+            rf = ref_t.to(torch.float32); af = auto_t.to(torch.float32)
+            if k[2] == "down_proj":
+                assert torch.allclose(af, rf, rtol=1e-5, atol=1e-5), (
+                    f"down_proj B beyond fwd-drift tol at {k}: heterogeneous DP "
+                    f"reduce diverged from uniform bs=1"
+                )
+            else:
+                assert torch.equal(af, rf), (
+                    f"{k[2]} B not bitwise-equal at {k}: the pin failed to make "
+                    f"the heterogeneous DP reduce batch-independent"
+                )
+        # Token counts must sum identically regardless of per-replica batching.
+        for k, n in ref_payload["tokens"].items():
+            assert auto_payload["tokens"][k] == n, f"token_count mismatch {k}"
+
+    # Cross-cov C keys: bitwise-equal across the heterogeneous reduce.
+    c_layers = _layer_ids_on_disk(ref_c)
+    assert c_layers, "no C layers spilled (cross-cov harness wiring bug)"
+    for li in c_layers:
+        ref_payload = torch.load(ref_c / f"layer_{li}.pt", map_location="cpu",
+                                 weights_only=True)
+        auto_payload = torch.load(auto_c / f"layer_{li}.pt", map_location="cpu",
+                                  weights_only=True)
+        assert set(ref_payload["covariance"]) == set(auto_payload["covariance"])
+        for k, ref_t in ref_payload["covariance"].items():
+            assert torch.equal(
+                ref_t.to(torch.float32),
+                auto_payload["covariance"][k].to(torch.float32),
+            ), f"cross-cov C not bitwise-equal at {k} (heterogeneous DP reduce)"
+
+
+def test_dp_default_no_auto_inherited(tiny_model, tmp_path, monkeypatch):
+    """DEFAULT (no ``cov_batch_size:"auto"``): the worker's ``_cov_is_auto`` is
+    False → ``cov_auto=False`` → the probe / OOM-backoff NEVER run (spy on
+    ``size_batch``) and the DP reduce is byte-identical to today (the inherited
+    bs=1 path). Pins that flipping the worker gate is a no-op when not opted in.
+    """
+    import copy
+    import moe_compress.stage3.plugins.covariance_collection as cc
+    from moe_compress.utils.model_io import iter_moe_layers
+    from moe_compress.utils.calibration import iter_batches
+    from moe_compress.stage3.plugins.covariance_collection import (
+        AutoBatchConfig, _cov_is_auto,
+    )
+
+    # The worker resolves its gate from stage3_svd; default (no "auto") → False.
+    assert _cov_is_auto({}) is False
+    assert _cov_is_auto({"cov_batch_size": "auto"}) is False  # auto_batch absent
+
+    calls = {"size_batch": 0}
+    real_sb = cc.size_batch
+    monkeypatch.setattr(
+        cc, "size_batch",
+        lambda *a, **k: (calls.__setitem__("size_batch", calls["size_batch"] + 1),
+                         real_sb(*a, **k))[1],
+    )
+
+    torch.manual_seed(11)
+    calib = torch.randint(0, 32, (8, 8), dtype=torch.long)
+    shards = _shard_calib(calib, 2)
+    ab = AutoBatchConfig.from_dict(None)  # disabled by default
+
+    # DP path with the (default) inherited gate: cov_auto=_cov_is_auto({}) → False.
+    dp_b_dirs, dp_c_dirs = [], []
+    for r, shard in enumerate(shards):
+        student = copy.deepcopy(tiny_model).eval()
+        teacher = copy.deepcopy(tiny_model).eval()
+        moe = list(iter_moe_layers(student))
+        tmoe = list(iter_moe_layers(teacher))
+        b_dir = tmp_path / f"dp{r}_b"; b_dir.mkdir()
+        c_dir = tmp_path / f"dp{r}_c"; c_dir.mkdir()
+        dp_b_dirs.append(b_dir); dp_c_dirs.append(c_dir)
+        B = InputCovarianceAccumulator(); B.set_storage_dtype(torch.float32)
+        C = InputCovarianceAccumulator(); C.set_storage_dtype(torch.float32)
+        _collect_covariances(
+            student, moe, iter_batches(shard, 1), B, device=torch.device("cpu"),
+            spill_dir=b_dir, teacher_model=teacher, teacher_moe_layers=tmoe,
+            C_acc=C, ccov_spill_dir=c_dir, cov_window_size=1,
+            calib=shard, cov_auto=_cov_is_auto({}), auto_batch_cfg=ab,
+        )
+    dp_b = tmp_path / "dp_merged_b"; dp_c = tmp_path / "dp_merged_c"
+    _reduce_spilled_cov_dirs(dp_b_dirs, dp_b, storage_dtype=torch.float32)
+    _reduce_spilled_cov_dirs(dp_c_dirs, dp_c, storage_dtype=torch.float32)
+
+    # The auto sizer must NEVER have been invoked on the default path.
+    assert calls["size_batch"] == 0, "size_batch ran on the default (non-auto) DP path"
+
+    # And the gated-default DP reduce is BYTE-IDENTICAL to today's DP reduce: an
+    # explicit non-auto (``cov_auto=False``) DP pass over the SAME shards. (We
+    # compare against the non-auto DP reduce — NOT a single-pass — because the
+    # DP reduce sums two separately-finalized fp32 Grams, which is allclose- but
+    # not bitwise-equal to a single accumulator; the property the gate flip must
+    # preserve is "default == today's DP path", and that is the same code path.)
+    today_b_dirs, today_c_dirs = [], []
+    for r, shard in enumerate(shards):
+        student = copy.deepcopy(tiny_model).eval()
+        teacher = copy.deepcopy(tiny_model).eval()
+        moe = list(iter_moe_layers(student))
+        tmoe = list(iter_moe_layers(teacher))
+        b_dir = tmp_path / f"today{r}_b"; b_dir.mkdir()
+        c_dir = tmp_path / f"today{r}_c"; c_dir.mkdir()
+        today_b_dirs.append(b_dir); today_c_dirs.append(c_dir)
+        B = InputCovarianceAccumulator(); B.set_storage_dtype(torch.float32)
+        C = InputCovarianceAccumulator(); C.set_storage_dtype(torch.float32)
+        _collect_covariances(
+            student, moe, iter_batches(shard, 1), B, device=torch.device("cpu"),
+            spill_dir=b_dir, teacher_model=teacher, teacher_moe_layers=tmoe,
+            C_acc=C, ccov_spill_dir=c_dir, cov_window_size=1,
+            calib=shard, cov_auto=False,
+        )
+    today_b = tmp_path / "today_merged_b"; today_c = tmp_path / "today_merged_c"
+    _reduce_spilled_cov_dirs(today_b_dirs, today_b, storage_dtype=torch.float32)
+    _reduce_spilled_cov_dirs(today_c_dirs, today_c, storage_dtype=torch.float32)
+
+    for li in _layer_ids_on_disk(today_b):
+        rp = torch.load(today_b / f"layer_{li}.pt", map_location="cpu", weights_only=True)
+        dp = torch.load(dp_b / f"layer_{li}.pt", map_location="cpu", weights_only=True)
+        for k, rt in rp["covariance"].items():
+            assert torch.equal(
+                rt.to(torch.float32), dp["covariance"][k].to(torch.float32)
+            ), f"default DP B not byte-identical to today's DP path at {k}"
+    for li in _layer_ids_on_disk(today_c):
+        rp = torch.load(today_c / f"layer_{li}.pt", map_location="cpu", weights_only=True)
+        dp = torch.load(dp_c / f"layer_{li}.pt", map_location="cpu", weights_only=True)
+        for k, rt in rp["covariance"].items():
+            assert torch.equal(
+                rt.to(torch.float32), dp["covariance"][k].to(torch.float32)
+            ), f"default DP C not byte-identical to today's DP path at {k}"
+
+
+# ===========================================================================
 # Lever 2 — config replica resolution (auto-detect, 1-GPU no-op)
 # ===========================================================================
 

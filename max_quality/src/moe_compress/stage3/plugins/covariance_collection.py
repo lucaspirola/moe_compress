@@ -375,11 +375,14 @@ def _resolve_cov_batch_size(s3: dict) -> int:
         VRAM-auto-sizing happens in ``_collect_covariances`` (gated by
         ``_cov_is_auto`` = ``cov_batch_size=="auto"`` AND ``auto_batch.enabled``),
         which probes free VRAM with the G window resident, auto-sizes the cov
-        forward batch, and OOM-backs-off to this floor (=1). Auto-sizing is
-        1-GPU only; on a DP (≥2-GPU) box the worker stays on the inherited int
-        (min-agreement across replicas is a later step). The returned int is
-        always positive (it is the backoff ``floor`` + the non-auto fallback);
-        ``_resolve_cov_batch_size`` never returns the ``"auto"`` sentinel.
+        forward batch, and OOM-backs-off to this floor (=1). This applies to BOTH
+        the in-process (1-GPU) path AND each DP (≥2-GPU) replica: every replica
+        probes its OWN pinned-device VRAM and sizes INDEPENDENTLY — the
+        per-sequence pin makes the key-wise DP reduce batch-independent, so NO
+        cross-replica min(candidate) agreement is needed (supersedes spec §6).
+        The returned int is always positive (it is the backoff ``floor`` + the
+        non-auto fallback); ``_resolve_cov_batch_size`` never returns the
+        ``"auto"`` sentinel.
 
     Reduction-pin (per-sequence grouping): with the cov Gram now accumulated via
     the per-sequence pinned split (``InputCovarianceAccumulator.update_grouped``,
@@ -402,12 +405,15 @@ def _resolve_cov_batch_size(s3: dict) -> int:
     ``1`` / inherited so the bs=1 golden stays byte-identical; nothing below
     raises bs and the auto path never runs.
 
-    Auto-batch (v2 step 2): when ``cov_batch_size=="auto"`` AND
+    Auto-batch (v2 step 2 + step 3): when ``cov_batch_size=="auto"`` AND
     ``auto_batch.enabled`` (see ``_cov_is_auto``), ``_collect_covariances`` probes
     VRAM with the G window resident, auto-sizes the cov forward batch, and
-    OOM-backs-off to ``floor=1`` (this resolver supplies that floor). 1-GPU only;
-    the DP worker path keeps returning the inherited int until cross-replica
-    min-agreement lands.
+    OOM-backs-off to ``floor=1`` (this resolver supplies that floor). This runs on
+    BOTH the in-process path and the DP worker path (v2 step 3): each DP replica
+    auto-sizes against its OWN pinned-device VRAM, independently, because the
+    per-sequence pin makes the key-wise DP reduce batch-independent — no
+    cross-replica min-agreement (supersedes spec §6). ``_resolve_cov_batch_size``
+    still returns only the inherited int FLOOR in every case.
 
     Compound-peak constraint (plan M2): the A1×A4×A6 dense-teacher peak is
     ``G · cov_bs · seq · d_in · 4`` bytes per hot device (every G window layer
@@ -423,18 +429,16 @@ def _resolve_cov_batch_size(s3: dict) -> int:
         return inherited
     if isinstance(req, str):
         if req.strip().lower() == "auto":
-            # DEFERRED: VRAM-measured raise only on a real ≥2-GPU sharded box.
-            # The per-sample cost (GB/sample) and the compound dense-teacher
-            # peak (G·cov_bs·seq·d_in·4) must be measured live before raising;
-            # off-box (CPU / 1-GPU) degrade to the inherited value (no raise).
-            try:
-                if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
-                    # Multi-GPU auto-raise is gated on a live per-sample
-                    # measurement (Deferred). Until that lands, return the
-                    # inherited value so we never OOM the hot device.
-                    return inherited
-            except Exception:                            # noqa: BLE001
-                return inherited
+            # ``"auto"`` resolves here to the inherited int FLOOR only — the
+            # actual VRAM-measured sizing is NOT done in this resolver. It is
+            # done inside ``_collect_covariances`` (``size_batch`` + the G-window
+            # probe + OOM-backoff to this floor), on BOTH the in-process path and
+            # each DP replica (v2 step 3). Every replica probes its OWN
+            # pinned-device VRAM and sizes independently; the per-sequence pin
+            # makes the key-wise DP reduce batch-independent, so there is no
+            # cross-replica min(candidate) agreement (supersedes spec §6). This
+            # floor is what the OOM-backoff falls back to (=1 by default), so the
+            # hot device is never OOM'd even if the probe over-commits.
             return inherited
         try:
             return int(req)
@@ -1123,8 +1127,13 @@ def _cov_replica_worker(
     # A6: DP replica reads the SAME cov-specific key as the in-process path so
     # the two agree (cross-replica Gram sum is bs-independent — finalized
     # per-key Grams are summed). ``config["stage3_svd"]`` is this site's own
-    # local dict (review L2); the resolver defaults to the inherited
-    # ``batch_size`` (golden untouched).
+    # local dict (review L2); ``_resolve_cov_batch_size`` returns the inherited
+    # int FLOOR (golden untouched) — the actual per-replica VRAM auto-sizing,
+    # when ``cov_batch_size:"auto"``, happens inside ``_collect_covariances``
+    # (``size_batch``), gated by ``cov_auto=_cov_is_auto(...)`` at the call site
+    # below. Each replica probes its OWN pinned-device VRAM and sizes
+    # independently; the per-sequence pin makes the key-wise DP reduce
+    # batch-independent, so NO cross-replica min(candidate) agreement is needed.
     batch_size = _resolve_cov_batch_size(config["stage3_svd"])
     batches = _iter_batches(shard, batch_size=batch_size)
 
@@ -1180,13 +1189,24 @@ def _cov_replica_worker(
         C_acc=C_acc,
         ccov_spill_dir=_Path(ccov_replica_dir) if ccov_replica_dir is not None else None,
         cov_window_size=cov_window_size,
-        # DP worker stays on the inherited-int path (cov_auto=False): the
-        # cross-replica reduce sums finalized fp32 Grams key-wise, so it is
-        # bs-agnostic and byte-identical. ``calib`` is threaded for signature
-        # parity (the auto path would re-slice it); ``auto_batch_cfg`` is unused
-        # here. DP-auto (min-agreement) is a later step.
+        # v2 step 3: this replica AUTO-sizes its cov forward batch when
+        # ``cov_batch_size:"auto"`` + ``auto_batch.enabled`` (double-gated via
+        # ``_cov_is_auto``). The probe reads THIS replica's pinned-device VRAM
+        # (CUDA_VISIBLE_DEVICES is set above), so each replica sizes to its OWN
+        # budget — NO cross-replica min(candidate) agreement (supersedes spec
+        # §6). The per-sequence reduction pin makes each replica's finalized
+        # per-key Gram independent of its forward batch, so the key-wise DP
+        # reduce (``_reduce_spilled_cov_dirs``, a fp32 sum of finalized Grams)
+        # is batch-independent: gate_proj/up B + cross-cov C bitwise, factored
+        # down_proj B allclose ~1e-6 (bounded, N-independent fwd drift — the
+        # single-GPU property). ``calib=shard`` so the auto path re-slices THIS
+        # replica's shard. Default (no "auto") → ``cov_auto`` False → inherited
+        # bs=1 → byte-identical DP reduce (golden/A4 untouched).
         calib=shard,
-        cov_auto=False,
+        cov_auto=_cov_is_auto(config["stage3_svd"]),
+        auto_batch_cfg=AutoBatchConfig.from_dict(
+            config["stage3_svd"].get("auto_batch")
+        ),
     )
 
 
