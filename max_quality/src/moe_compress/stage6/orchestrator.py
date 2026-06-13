@@ -177,11 +177,41 @@ def run(model, tokenizer, config: dict, artifacts_dir: Path, *, device=None) -> 
     run_ctx.set("eval_text_concat", [])
     run_ctx.set("eval_results", {})
 
+    # ---- DP eval-shard materialization (C1; ENABLED branch only) --------
+    # Stage 6 holds a LIVE in-memory student with NO on-disk path; a spawned
+    # eval-shard worker has nothing to load. When stage6_validate.eval_shard is
+    # enabled, serialize the student via save_compressed_checkpoint (NOT
+    # save_pretrained — which unpacks FactoredExperts and breaks
+    # load_compressed_model) to a temp dir BEFORE the eval walk and BEFORE the
+    # mutating model.to("cpu") below. Publish the dir on ctx; the eval plugins
+    # read it. Default (disabled) → no save, no spawn, current stream verbatim.
+    _eval_shard_src = None
+    try:
+        from ..tools.eval_shard import EvalShardConfig as _ESC, _materialize_student
+        _es_cfg = _ESC.from_dict(s6.get("eval_shard"))
+        if _es_cfg.enabled and _es_cfg.replicas > 1:
+            _eval_shard_src = _materialize_student(model, tokenizer)
+            run_ctx.set("eval_shard_src_dir", str(_eval_shard_src))
+            log.info("Stage 6 DP eval-shard: materialized student to %s", _eval_shard_src)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Stage 6 DP eval-shard materialization skipped (%s)", exc)
+        _eval_shard_src = None
+
     # ---- eval_task (student side) ---------------------------------------
     # Walks the four student-side sub-eval plugins; each is internally
     # gated on its own enabled flag via PluginRegistry.enabled(config)
     # above, so only the enabled sub-evals actually run.
     walk_phases(("eval_task",), plugins, run_ctx)
+
+    # Best-effort cleanup of the eval-shard temp checkpoint after the student
+    # eval walk has joined (the teacher side reuses prebuilt prompts/chunks, not
+    # the temp dir).
+    if _eval_shard_src is not None:
+        import shutil as _shutil
+        try:
+            _shutil.rmtree(_eval_shard_src, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---- Teacher cache lookup (orchestrator preamble) -------------------
     # Verbatim from the monolith: resolve the cache key + path, call

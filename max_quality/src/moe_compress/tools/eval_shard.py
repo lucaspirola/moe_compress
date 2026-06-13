@@ -579,6 +579,7 @@ def run_dp_ppl(chunks, *, tmp_dir, replicas, gpus_per_replica, ppl_bs,
         partials.append((nll, tok))
     return _merge_ppl(partials)
 
+
 __all__ = [
     "PINNED_GEN_BATCH_SIZE",
     "EvalShardConfig",

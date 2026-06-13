@@ -125,7 +125,8 @@ def _math500(model, tokenizer, cfg: dict, *, device=None, collect=None,
              batch_size: int = 8,
              dataset_revisions: dict[str, str | None] | None = None,
              prebuilt: dict | None = None,
-             artifact_out: dict | None = None) -> float:
+             artifact_out: dict | None = None,
+             eval_shard: dict | None = None) -> float:
     """MATH-500 accuracy.
 
     C7 input-prep dedup (metric-identical)
@@ -233,10 +234,30 @@ def _math500(model, tokenizer, cfg: dict, *, device=None, collect=None,
     log.info("Stage 6 MATH-500: %d problems, batch_size=%d, max_new=%d, "
              "enable_thinking=%s, chat_template=on",
              n_total, batch_size, max_new, _enable_thinking)
-    completions = _generate_batched(
-        model, tokenizer, prompts, max_new=max_new,
-        device=device, batch_size=batch_size,
-    )
+    # DP eval-shard branch (default OFF → in-process call VERBATIM). When
+    # enabled and _should_shard returns >1 replicas, route generation through
+    # the group-aligned spawn driver (hard-pinned bs=8); else the existing
+    # in-process _generate_batched call is byte-for-byte the current stream.
+    _dp_replicas = 0
+    if eval_shard is not None:
+        from ...tools.eval_shard import _should_shard as _ss, run_dp_generate
+        _dp_replicas = _ss(eval_shard["cfg"], len(prompts), group_aligned=True)
+    if _dp_replicas > 1:
+        completions = run_dp_generate(
+            list(prompts),
+            tmp_dir=eval_shard["tmp_dir"],
+            replicas=_dp_replicas,
+            gpus_per_replica=eval_shard["cfg"].gpus_per_replica,
+            max_new=max_new,
+            experts_impl_generative=eval_shard["experts_impl_generative"],
+            cfg=eval_shard["cfg"],
+            out_dir=eval_shard["out_dir"],
+        )
+    else:
+        completions = _generate_batched(
+            model, tokenizer, prompts, max_new=max_new,
+            device=device, batch_size=batch_size,
+        )
 
     correct = 0
     for i, (completion, answer) in enumerate(zip(completions, answers)):
@@ -498,12 +519,33 @@ class Math500Plugin:
         # computed from the student's own generate()+grading over these prompts;
         # the artifact is a pure function of (dataset, tokenizer, cfg) so reuse
         # is bit-exact.
+        # DP eval-shard: assemble the worker-input dict when enabled + the
+        # parent materialized a student source (orchestrator C1 wiring). Default
+        # OFF → eval_shard stays None and the in-process path runs verbatim.
+        _eval_shard = None
+        try:
+            from ...tools.eval_shard import EvalShardConfig as _ESC
+            _es_cfg = _ESC.from_dict(s6.get("eval_shard"))
+            if _es_cfg.enabled and _es_cfg.replicas > 1 and ctx.has("eval_shard_src_dir"):
+                _artifacts_dir = ctx.get("artifacts_dir") if ctx.has("artifacts_dir") else None
+                _eval_shard = {
+                    "cfg": _es_cfg,
+                    "tmp_dir": ctx.get("eval_shard_src_dir"),
+                    "experts_impl_generative": (
+                        ctx.get("experts_implementation_generative")
+                        if ctx.has("experts_implementation_generative") else None
+                    ),
+                    "out_dir": str(_artifacts_dir) + "/_eval_shard_math500",
+                }
+        except Exception:  # noqa: BLE001
+            _eval_shard = None
         _artifact: dict[str, Any] = {}
         eval_results["math500_accuracy"] = _math500(
             model, tokenizer, s6["generative"]["math500"], device=device,
             collect=collect, batch_size=gen_batch_size,
             dataset_revisions=dataset_revisions,
             artifact_out=_artifact,
+            eval_shard=_eval_shard,
         )
         if _artifact:
             ctx.set("prebuilt_math500", _artifact)
