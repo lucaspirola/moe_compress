@@ -347,3 +347,380 @@ def replay_merged_layer(layer_ref, payload: dict) -> None:
             router.top_k = int(payload["router_top_k"])
         if payload.get("mlp_num_experts") is not None and hasattr(layer_ref.mlp, "num_experts"):
             layer_ref.mlp.num_experts = int(payload["mlp_num_experts"])
+
+
+# ---------------------------------------------------------------------------
+# A3 (parent side) — reduce the four per-replica spill sets for one layer into
+# the parent's accumulators, so assign/merge consume them exactly as serial.
+# Cov is reduced via Stage-3's _reduce_spilled_cov_dirs into a canonical dir and
+# loaded already-finalized (the reduce owns the storage-dtype cast — Open-Q2).
+# ---------------------------------------------------------------------------
+def reduce_layer_into_parent(
+    layer_idx: int,
+    replica_dirs,
+    *,
+    reap_acc,
+    cov_acc,
+    ream_acc,
+    cov_storage_dtype: torch.dtype,
+) -> None:
+    """Reduce REAP/REAM (this module) + cov (Stage-3 helper) for ``layer_idx``
+    from each replica's ``{reap,cov,ream}`` subdir into the parent accumulators."""
+    from ..stage3.plugins.covariance_collection import _reduce_spilled_cov_dirs
+
+    rdirs = [Path(d) for d in replica_dirs]
+    _reduce_reap_dirs([d / "reap" for d in rdirs], layer_idx, into=reap_acc)
+    _reduce_ream_dirs([d / "ream" for d in rdirs], layer_idx, into=ream_acc)
+    # Reduce cov into a per-layer canonical dir, then load already-finalized into
+    # the parent cov_acc (the reduce already cast to storage_dtype; the parent's
+    # cov_acc.finalize_layer is a no-op afterwards — Open-Q2: reduce owns cast).
+    cov_canon = rdirs[0].parent / f"_cov_reduced_layer_{layer_idx}"
+    _reduce_spilled_cov_dirs(
+        [d / "cov" for d in rdirs], cov_canon, storage_dtype=cov_storage_dtype,
+    )
+    cov_acc.load_layer_from_disk(layer_idx, cov_canon)
+
+
+# ---------------------------------------------------------------------------
+# A3 (worker side) — run the early-exit profile on one shard and spill the four
+# accumulators. Shared by the real mp worker and the CPU in-process executor.
+# ---------------------------------------------------------------------------
+def run_profile_shard(
+    model,
+    layer_ref,
+    shard_batches,
+    spill_dir,
+    *,
+    seq_len: int,
+    device=None,
+    auto_batch_cfg=None,
+) -> None:
+    """Profile ``layer_ref`` over this replica's shard (cov per-seq pinned via
+    ``seq_len``), finalize the four accumulators for the layer, and spill them to
+    ``spill_dir/{reap,cov,ream}``. One call per (layer, replica)."""
+    from .profiling import _profile_layer
+    from ..utils.activation_hooks import (
+        InputCovarianceAccumulator, ReamCostAccumulator, ReapAccumulator,
+    )
+
+    li = layer_ref.layer_idx
+    n_experts = layer_ref.num_routed_experts
+    reap = ReapAccumulator()
+    cov = InputCovarianceAccumulator()
+    ream = ReamCostAccumulator(num_experts=n_experts)
+    _profile_layer(
+        model, layer_ref, shard_batches, reap, cov, ream,
+        device=device, seq_len=seq_len,
+    )
+    reap.finalize_layer(li)
+    cov.finalize_layer(li)
+    sd = Path(spill_dir)
+    _spill_reap_layer(reap, li, sd / "reap")
+    cov.spill_layer_to_disk(li, str(sd / "cov"))
+    _spill_ream_layer(ream, li, sd / "ream")
+
+
+# ---------------------------------------------------------------------------
+# A0 — persistent worker pool + per-layer command/reduce IPC (NEW subsystem).
+#
+# Message protocol (parent→worker command queue; worker→parent reduce queue):
+#   RESYNC(layer_idx, payload_path)  -> worker replays the merged layer, ACKs.
+#   PROFILE(layer_idx, shard_id, spill_dir, seq_len, auto_batch_cfg)
+#                                    -> worker profiles its shard, spills, DONE.
+#   SHUTDOWN                         -> worker exits the loop.
+# worker→parent: ("ACK", layer_idx) / ("DONE", layer_idx, shard_id, spill_dir)
+#                / ("ERROR", layer_idx, traceback_str).
+#
+# Large payloads (the merged-layer tensors broadcast in RESYNC, and the four
+# accumulators) travel via the FILESYSTEM (torch.save path / spill dir), never
+# serialized through the mp.Queue — the queue carries only small control
+# messages + paths. This keeps IPC small and reuses the proven disk reduce.
+#
+# Barrier protocol (deadlock-free): RESYNC -> wait ALL ACK before PROFILE each
+# layer; parent joins ALL DONE before its own layer merge. At SHUTDOWN the parent
+# DRAINS the reduce queue BEFORE join() and the worker-ERROR handler READS the
+# queue (bounded traceback string), so a full pipe buffer + blocked join() cannot
+# deadlock (the reviewer's Low note).
+# ---------------------------------------------------------------------------
+def _profile_worker_main(
+    replica_idx: int,
+    visible_devices: str,
+    config: dict,
+    model_path: str,
+    shard_start: int,
+    shard_end: int,
+    seq_len: int,
+    cmd_q,
+    reduce_q,
+) -> None:
+    """Spawn target: one persistent DP replica. Pins its GPU subset via
+    ``CUDA_VISIBLE_DEVICES``, loads its OWN model copy from disk (the same source
+    the parent loaded), rebuilds + slices its sequence-disjoint calibration shard,
+    then enters the command loop. Module-level (picklable) so it is a valid
+    ``torch.multiprocessing`` spawn target.
+
+    Command loop (blocks on ``cmd_q``):
+      RESYNC(layer_idx, payload_path) -> replay_merged_layer on the resident copy,
+                                         then reply ("ACK", layer_idx).
+      PROFILE(layer_idx, shard_id, spill_dir, seq_len, ...) -> run_profile_shard,
+                                         then reply ("DONE", layer_idx, shard_id, spill_dir).
+      SHUTDOWN -> break.
+
+    Any exception is caught, formatted to a BOUNDED traceback string, and sent as
+    ("ERROR", layer_idx, tb) on the reduce queue so the parent surfaces it by
+    READING the queue (not relying on exitcode), then the worker exits non-zero.
+    """
+    import os as _os
+    _os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+    import traceback as _tb
+    import torch as _torch
+    from ..utils.model_io import (
+        load_compressed_model as _load_compressed_model,
+        iter_moe_layers as _iter_moe_layers,
+    )
+    from ..utils.calibration import (
+        build_calibration_tensor as _bct,
+        spec_from_config as _spec_from_config,
+    )
+
+    cur_layer = -1
+    try:
+        device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+        model, tokenizer, _ = _load_compressed_model(
+            model_path,
+            device_map=config["model"]["device_map"],
+            torch_dtype=config["model"]["torch_dtype"],
+            attn_implementation=config["model"].get("attn_implementation", "sdpa"),
+        )
+        layer_refs = {lr.layer_idx: lr for lr in _iter_moe_layers(model)}
+        spec = _spec_from_config(config["calibration"])
+        calib = _bct(tokenizer, spec)
+        shard = calib[shard_start:shard_end]
+        while True:
+            msg = cmd_q.get()
+            kind = msg[0]
+            if kind == "SHUTDOWN":
+                break
+            if kind == "RESYNC":
+                _, cur_layer, payload_path = msg
+                payload = _torch.load(payload_path, map_location="cpu", weights_only=False)
+                replay_merged_layer(layer_refs[cur_layer], payload)
+                reduce_q.put(("ACK", cur_layer))
+            elif kind == "PROFILE":
+                _, cur_layer, shard_id, spill_dir, sl = msg
+                # Each worker re-batches its shard with its own (auto-)batch size;
+                # bs=1 here keeps the cov pin trivially exact (A5 default).
+                batches = [shard[i:i + 1] for i in range(shard.size(0))]
+                run_profile_shard(
+                    model, layer_refs[cur_layer], batches, spill_dir,
+                    seq_len=sl, device=device,
+                )
+                reduce_q.put(("DONE", cur_layer, shard_id, spill_dir))
+    except BaseException:
+        tb = _tb.format_exc()[-4000:]  # bounded — never blow the pipe buffer
+        try:
+            reduce_q.put(("ERROR", cur_layer, tb))
+        except Exception:
+            pass
+        raise
+
+
+class _InProcessProc:
+    """Test-only synchronous 'process' standing in for a spawned worker. Runs the
+    worker command-handler inline so the protocol (barrier, drain, error-read) is
+    exercised on CPU without real multiprocessing. exitcode mirrors mp.Process."""
+
+    def __init__(self, handler):
+        self._handler = handler
+        self.exitcode = None
+        self._alive = True
+
+    def is_alive(self):
+        return self._alive
+
+    def join(self, timeout=None):
+        self._alive = False
+
+    def terminate(self):
+        self._alive = False
+
+
+class Stage2ProfilePool:
+    """Persistent DP worker pool for Stage-2 per-layer profiling. Spawn ONCE at
+    Stage-2 start; drive per layer via RESYNC + PROFILE; SHUTDOWN at Stage-2 end.
+
+    ``executor='spawn'`` (default) uses ``mp.get_context('spawn')`` with one
+    process per replica. ``executor='inprocess'`` runs synchronous in-process
+    workers (CPU tests) that exercise the SAME barrier/drain/error protocol.
+    """
+
+    def __init__(self, replicas: int, *, executor: str = "spawn"):
+        self.replicas = int(replicas)
+        self.executor = executor
+        self._procs: list = []
+        self._cmd_qs: list = []      # parent -> worker
+        self._reduce_q = None        # worker -> parent (shared)
+        self._started = False
+
+    def start(self, config: dict, model_path: str, calib_n_seq: int, seq_len: int,
+              *, shards_per_model: int = 1) -> None:
+        """Spawn the persistent worker processes ONCE. Each worker pins a GPU
+        subset, loads its own model copy, and slices its sequence-disjoint shard.
+        Mirrors Stage-3's spawn wiring but keeps the processes alive across layers
+        (the per-layer RESYNC barrier is what makes that legal)."""
+        import torch.multiprocessing as _mp
+
+        ctx = _mp.get_context("spawn")
+        self._reduce_q = ctx.Queue()
+        self._cmd_qs = []
+        self._procs = []
+        # Contiguous by-sequence shard boundaries (same math as shard_calib_sequences).
+        n = int(calib_n_seq)
+        replicas = min(self.replicas, max(n, 1))
+        base = n // replicas if replicas else 0
+        start = 0
+        for r in range(replicas):
+            end = n if r == replicas - 1 else start + base
+            dev_lo = r * shards_per_model
+            visible = ",".join(str(d) for d in range(dev_lo, dev_lo + shards_per_model))
+            cmd_q = ctx.Queue()
+            p = ctx.Process(
+                target=_profile_worker_main,
+                args=(r, visible, config, model_path, start, end, seq_len,
+                      cmd_q, self._reduce_q),
+            )
+            p.start()
+            self._cmd_qs.append(cmd_q)
+            self._procs.append(p)
+            start = end
+        self.replicas = replicas
+        self._started = True
+
+    # -- in-process protocol drivers (CPU tests; mirror the mp message loop) --
+    def start_inprocess(self, worker_handlers: list) -> None:
+        """Attach a list of per-replica handler objects exposing ``resync(payload)``
+        and ``profile(layer_idx, shard_id, spill_dir, seq_len)`` and an optional
+        ``fail_on`` hook. Used only by CPU protocol tests."""
+        import queue as _queue
+        self._reduce_q = _queue.Queue()
+        self._procs = [_InProcessProc(h) for h in worker_handlers]
+        self._handlers = worker_handlers
+        self._started = True
+
+    def resync(self, layer_idx: int, payload_path) -> None:
+        """Broadcast RESYNC to every worker and WAIT for all ACKs before
+        returning — the barrier that guarantees no worker profiles layer L until
+        every worker holds the merged layer L-1."""
+        if self.executor == "inprocess":
+            for h in self._handlers:
+                h.resync(layer_idx, payload_path)   # synchronous => ACK is implicit
+            return
+        for q in self._cmd_qs:
+            q.put(("RESYNC", layer_idx, str(payload_path)))
+        # Wait for one ACK per worker (or surface an ERROR by reading the queue).
+        acked = 0
+        while acked < self.replicas:
+            msg = self._reduce_q.get()
+            if msg[0] == "ERROR":
+                raise RuntimeError(
+                    f"profile_dp worker ERROR during RESYNC(layer={msg[1]}):\n{msg[2]}"
+                )
+            if msg[0] == "ACK":
+                acked += 1
+
+    def profile_layer(self, layer_idx: int, spill_root, *, seq_len: int) -> list:
+        """Send PROFILE to each worker (one shard each), JOIN all DONE, return the
+        per-replica spill dirs in shard order. Surfaces a worker ERROR by reading
+        the reduce queue (never relies on exitcode alone)."""
+        spill_dirs = [Path(spill_root) / f"_replica_{r}" for r in range(self.replicas)]
+        if self.executor == "inprocess":
+            for r, h in enumerate(self._handlers):
+                h.profile(layer_idx, r, spill_dirs[r], seq_len)
+            return spill_dirs
+        for r, q in enumerate(self._cmd_qs):
+            q.put(("PROFILE", layer_idx, r, str(spill_dirs[r]), seq_len))
+        done = 0
+        out: dict[int, Path] = {}
+        while done < self.replicas:
+            msg = self._reduce_q.get()
+            if msg[0] == "ERROR":
+                raise RuntimeError(
+                    f"profile_dp worker ERROR during PROFILE(layer={msg[1]}):\n{msg[2]}"
+                )
+            if msg[0] == "DONE":
+                _, _li, shard_id, spill_dir = msg
+                out[shard_id] = Path(spill_dir)
+                done += 1
+        return [out[r] for r in range(self.replicas)]
+
+    def shutdown(self) -> None:
+        """Send SHUTDOWN, DRAIN the reduce queue BEFORE join (Low note: a full
+        pipe + blocked join deadlocks), join with timeout, check exitcode per
+        worker, terminate + raise on any non-zero/timeout, verify no leaks."""
+        if not self._started:
+            return
+        if self.executor == "inprocess":
+            for p in self._procs:
+                p.join()
+            self._started = False
+            return
+        for q in self._cmd_qs:
+            q.put(("SHUTDOWN",))
+        # Drain anything still in the reduce queue so a worker blocked writing it
+        # can reach its own exit before we join().
+        self._drain_reduce_queue()
+        bad = []
+        for p in self._procs:
+            p.join(timeout=120)
+            if p.is_alive():
+                p.terminate()
+                bad.append((p, "timeout"))
+            elif p.exitcode not in (0, None):
+                bad.append((p, f"exitcode={p.exitcode}"))
+        self._started = False
+        if bad:
+            raise RuntimeError(
+                "profile_dp pool teardown: %d worker(s) failed: %s"
+                % (len(bad), ", ".join(str(b[1]) for b in bad))
+            )
+
+    def _drain_reduce_queue(self) -> None:
+        if self._reduce_q is None:
+            return
+        try:
+            while True:
+                self._reduce_q.get_nowait()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# A4 — per-layer DP entrypoint (called from LayerMergePlugin.on_profile on the
+# DP path). Issues RESYNC(L-1) (barrier) + PROFILE(L) (join), then reduces the
+# four spill sets into the parent's accumulators.
+# ---------------------------------------------------------------------------
+def run_dp_profile_layer(
+    pool: "Stage2ProfilePool",
+    layer_ref,
+    *,
+    reap_acc,
+    cov_acc,
+    ream_acc,
+    spill_root,
+    seq_len: int,
+    cov_storage_dtype: torch.dtype,
+    prev_layer_idx=None,
+    prev_layer_payload_path=None,
+) -> None:
+    """One DP profile step for ``layer_ref``. If ``prev_layer_idx`` is set, RESYNC
+    the workers with the just-merged upstream layer (barrier) before profiling.
+    Then PROFILE this layer across shards, join, and reduce into the parent."""
+    li = layer_ref.layer_idx
+    if prev_layer_idx is not None and prev_layer_payload_path is not None:
+        pool.resync(prev_layer_idx, prev_layer_payload_path)
+    replica_dirs = pool.profile_layer(li, spill_root, seq_len=seq_len)
+    reduce_layer_into_parent(
+        li, replica_dirs,
+        reap_acc=reap_acc, cov_acc=cov_acc, ream_acc=ream_acc,
+        cov_storage_dtype=cov_storage_dtype,
+    )

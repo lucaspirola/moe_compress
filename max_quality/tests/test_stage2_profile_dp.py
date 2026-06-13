@@ -400,3 +400,117 @@ def test_reservoir_guard_disables_dp_and_warns(kwargs, consumer):
     assert cfg["enabled"] is False, "reservoir consumer must force serial"
     assert any(consumer in r.getMessage() for r in records), \
         f"warning must name the consumer {consumer!r}"
+
+
+# ---------------------------------------------------------------------------
+# A0/A4 — persistent-pool protocol: RESYNC barrier ordering + run_dp reduce.
+# ---------------------------------------------------------------------------
+class _RecordingHandler:
+    """In-process worker stand-in. Records the order of resync/profile calls and
+    runs run_profile_shard against its own model copy so the reduce is real."""
+
+    def __init__(self, model, layer_ref, shard, seq_len):
+        self.model = model
+        self.layer_ref = layer_ref
+        self.shard = shard
+        self.seq_len = seq_len
+        self.calls: list[tuple] = []
+
+    def resync(self, layer_idx, payload_path):
+        from moe_compress.stage2 import profile_dp
+        self.calls.append(("resync", layer_idx))
+        if payload_path is not None:
+            payload = torch.load(payload_path, map_location="cpu", weights_only=False)
+            profile_dp.replay_merged_layer(self.layer_ref, payload)
+
+    def profile(self, layer_idx, shard_id, spill_dir, seq_len):
+        from moe_compress.stage2 import profile_dp
+        self.calls.append(("profile", layer_idx, shard_id))
+        profile_dp.run_profile_shard(
+            self.model, self.layer_ref, [self.shard], spill_dir,
+            seq_len=seq_len, device=torch.device("cpu"),
+        )
+
+
+def test_pool_run_dp_profile_layer_reduces_and_barrier_order(tmp_path):
+    from moe_compress.stage2 import profile_dp
+
+    n_seq, seq_len = 4, 8
+    torch.manual_seed(5)
+    calib = torch.randint(0, 32, (n_seq, seq_len), dtype=torch.long)
+    shards = profile_dp.shard_calib_sequences(calib, replicas=2)
+
+    handlers = []
+    for shard in shards:
+        torch.manual_seed(0); m = _TinyModel()
+        lr = list(iter_moe_layers(m))[0]
+        handlers.append(_RecordingHandler(m, lr, shard, seq_len))
+
+    pool = profile_dp.Stage2ProfilePool(replicas=2, executor="inprocess")
+    pool.start_inprocess(handlers)
+
+    li = handlers[0].layer_ref.layer_idx
+    reap, cov, ream = _new_accs(handlers[0].layer_ref.num_routed_experts)
+    # prev_layer payload (a no-op replay path here) exercises the RESYNC barrier.
+    payload_path = tmp_path / "prev_payload.pt"
+    torch.save(
+        profile_dp.capture_merged_layer(handlers[0].layer_ref, list(range(4))),
+        payload_path,
+    )
+    profile_dp.run_dp_profile_layer(
+        pool, handlers[0].layer_ref,
+        reap_acc=reap, cov_acc=cov, ream_acc=ream,
+        spill_root=tmp_path / "spill", seq_len=seq_len,
+        cov_storage_dtype=torch.float32,
+        prev_layer_idx=li - 1 if li > 0 else 99,
+        prev_layer_payload_path=payload_path,
+    )
+    pool.shutdown()
+
+    # Barrier order: every worker did resync BEFORE profile.
+    for h in handlers:
+        names = [c[0] for c in h.calls]
+        assert names == ["resync", "profile"], f"barrier violated: {names}"
+
+    # Reduce populated the parent accumulators.
+    assert any(k[0] == li for k in cov.covariance), "cov reduced into parent"
+    assert li in ream._gate_gram, "ream gate_gram reduced into parent"
+    assert any(k[0] == li for k in reap.counts), "reap reduced into parent"
+
+
+def test_pool_shutdown_drains_then_joins_and_reads_error_queue():
+    """Protocol guard (reviewer Low note): shutdown DRAINS the reduce queue before
+    join (so a worker blocked writing it can exit), and a worker ERROR is surfaced
+    by READING the queue, not by exitcode alone."""
+    import queue
+    from moe_compress.stage2 import profile_dp
+
+    pool = profile_dp.Stage2ProfilePool(replicas=2, executor="spawn")
+    # Wire fake spawn-mode queues.
+    pool._cmd_qs = [queue.Queue(), queue.Queue()]
+    pool._reduce_q = queue.Queue()
+
+    class _FakeProc:
+        def __init__(self): self.exitcode = 0; self._alive = False
+        def is_alive(self): return self._alive
+        def join(self, timeout=None): pass
+        def terminate(self): self._alive = False
+
+    pool._procs = [_FakeProc(), _FakeProc()]
+    pool._started = True
+    # Pre-load the reduce queue with stale messages; shutdown must drain them
+    # WITHOUT hanging (no DONE/ACK left blocking a join).
+    pool._reduce_q.put(("DONE", 3, 0, "/tmp/x"))
+    pool._reduce_q.put(("DONE", 3, 1, "/tmp/y"))
+    pool.shutdown()  # must drain + join cleanly, no exception (exitcodes 0)
+    assert pool._reduce_q.empty(), "reduce queue must be drained before join"
+
+    # ERROR is surfaced by reading the queue during PROFILE (not exitcode).
+    pool2 = profile_dp.Stage2ProfilePool(replicas=1, executor="spawn")
+    pool2._cmd_qs = [queue.Queue()]
+    pool2._reduce_q = queue.Queue()
+    pool2._procs = [_FakeProc()]
+    pool2._started = True
+    pool2._reduce_q.put(("ERROR", 7, "boom-traceback"))
+    with pytest.raises(RuntimeError, match="boom-traceback"):
+        pool2.profile_layer(7, "/tmp/spill", seq_len=8)
