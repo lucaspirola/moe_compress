@@ -176,6 +176,7 @@ def _profile_layer(
     *,
     device=None,
     layer_input_acc: "_LayerInputAccumulator | None" = None,
+    seq_len: int | None = None,
 ) -> None:
     """Profile a single MoE layer with early-exit forward.
 
@@ -225,15 +226,34 @@ def _profile_layer(
     # to obtain σ(x)_e at active token positions.
     _full_softmax: list[torch.Tensor | None] = [None]
 
+    # H1 — DP cov per-sequence pin. When ``seq_len`` is set (the DP path), route
+    # the input/intermediate Gram through ``update_grouped`` so the finalized
+    # per-key Gram is independent of the forward batch's sequence-merging. This is
+    # the premise that lets each DP replica auto-batch INDEPENDENTLY (A5): the
+    # finalized Grams are batch-invariant. ``ctx["token_idx"]`` carries the
+    # per-expert active-token GLOBAL row index (``sel = hidden_states[token_idx]``,
+    # so ``tensor`` rows ↔ ``token_idx`` 1:1); ``token_idx // seq_len`` is the
+    # source-sequence id. On the SERIAL default ``seq_len is None`` ⇒ a single
+    # plain ``update`` ⇒ byte-identical to the legacy path (the non-DP golden is
+    # untouched). REAP/REAM are inherently batch-invariant (per-token sums, no
+    # cross-token coupling) so ONLY cov needs the pin.
     def input_cb(li, e, tensor, ctx):
         _t = _diag_time_mod.monotonic()
-        cov_acc.update(li, e, "gate_proj", tensor)
+        if seq_len:
+            seq_ids = ctx["token_idx"] // seq_len
+            cov_acc.update_grouped(li, e, "gate_proj", tensor, seq_ids)
+        else:
+            cov_acc.update(li, e, "gate_proj", tensor)
         _diag_cb[0] += _diag_time_mod.monotonic() - _t
         _diag_cb[3] += 1
 
     def intermediate_cb(li, e, tensor, ctx):
         _t = _diag_time_mod.monotonic()
-        cov_acc.update(li, e, "down_proj", tensor)
+        if seq_len:
+            seq_ids = ctx["token_idx"] // seq_len
+            cov_acc.update_grouped(li, e, "down_proj", tensor, seq_ids)
+        else:
+            cov_acc.update(li, e, "down_proj", tensor)
         ream_acc.record_neuron_activations(li, e, tensor)
         _diag_cb[1] += _diag_time_mod.monotonic() - _t
 
