@@ -121,6 +121,20 @@ from ._unwrap import unwrap_student
 log = logging.getLogger(__name__)
 
 
+def _row_slice(batch, rank: int, world_size: int):
+    """Row-split one step's batch for ``rank`` under DDP (Task 4).
+
+    Returns ``batch[rank*per_gpu : (rank+1)*per_gpu]`` where
+    ``per_gpu = batch.shape[0] // world_size``. Divisibility is guaranteed by
+    :class:`DdpConfig` (``batch_size % world_size == 0``), so each rank gets a
+    disjoint slice of equal row count — equal token count by construction, no
+    across-rank tail. This is the per-STEP row-split, NOT a batch-LIST shard:
+    every rank still participates in EVERY optimizer step.
+    """
+    per_gpu = batch.shape[0] // world_size
+    return batch[rank * per_gpu:(rank + 1) * per_gpu]
+
+
 def _set_experts_implementation(model: nn.Module, impl: str) -> None:
     """Override the MoE experts forward dispatch on `model`.
 
@@ -270,6 +284,11 @@ def _run_single_process(
     run_ctx.set("device", device)
     run_ctx.set("stage_key", stage_key)
     run_ctx.set("no_resume", no_resume)
+    # DDP rank context (Task 4/6): the cache teacher reads ddp_rank to offset
+    # its token_start window; rank-0-only I/O gates key off ddp_rank too. On the
+    # single-process path rank=0/world_size=1 so every read is the identity.
+    run_ctx.set("ddp_rank", rank)
+    run_ctx.set("ddp_world_size", world_size)
 
     # Cache BEFORE live so dispatch_first prefers the cache on a hit.
     registry = PluginRegistry([
@@ -744,6 +763,16 @@ def _run_single_process(
             # completed step and triggering a spurious duplicate optimizer step.
             if epoch == resume_epoch and i <= resume_batch_i:
                 continue
+
+            # DDP per-STEP ROW-split (Task 4): each rank forwards a disjoint
+            # `per_gpu` row-slice of the SAME step's batch. The step count + the
+            # batch list stay GLOBAL and UNCHANGED. No-op on the single-process
+            # path (ddp is None). Sliced ONCE here, BEFORE the teacher dispatch,
+            # so the teacher sees the rank's rows and its logits are used as-is
+            # (no second slice). The cache teacher reads its window via the
+            # ddp_rank offset published on run_ctx below.
+            if ddp is not None:
+                batch = _row_slice(batch, rank, world_size)
 
             if device is not None:
                 batch = batch.to(device)
