@@ -302,14 +302,40 @@ def _remap_covariance_for_layer(
     cov: InputCovarianceAccumulator,
     layer_idx: int,
     kept_ids: list[int],
+    *,
+    grouped: "dict[int, list[int]] | None" = None,
+    member_perms: "dict[int, dict[int, object]] | None" = None,
 ) -> None:
     # kept_ids contains both REAM centroids and protected experts (the full post-merge
     # kept set), not just REAM centroids.
+    #
+    # ``grouped`` / ``member_perms`` (kw-only, default None) carry the merge recipe so
+    # the survivor's input-Gram anchor becomes the **group UNION** ``Σ_j G_j`` of every
+    # merged member's Gram (Feature B), instead of the centroid's own Gram. ``None``
+    # (or a singleton / protected survivor) ⇒ today's verbatim per-key remap, which is
+    # byte-identical to the legacy path (the singleton compat anchor,
+    # ``test_stage2_merge.py::test_remap_covariance_keeps_only_centroids``).
+    #
+    # For ``down_proj`` the Gram lives on the SwiGLU intermediate-neuron axis; each
+    # member's down weight was permuted to the centroid via ``Wm[:, perm]``
+    # (``merging.py:307``), so its down Gram must be permuted on BOTH axes by the SAME
+    # ``perm`` before summing — mirroring the RegMean down-Gram permutation at
+    # ``merging.py:352-360``. fp32-sum-then-cast mirrors ``finalize_layer:1109-1111``.
+    grouped = grouped or {}
+    member_perms = member_perms or {}
     id_to_new = {old: new for new, old in enumerate(kept_ids)}
     new_cov: dict = {}
     new_tokens: dict = {}
     n_dropped = 0
     dropped_expert_ids: set[int] = set()
+    # When a survivor is the centroid of a real merge group (|members| > 1), its
+    # per-key entries are produced from the UNION below; suppress the plain per-key
+    # copy for those (layer, centroid, name) keys so the legacy loop does not also
+    # emit them. Singleton / protected survivors keep the byte-identical copy.
+    union_centroids = {
+        old for old in kept_ids
+        if old in grouped and len(grouped.get(old) or []) > 1
+    }
     with cov._lock:
         for key, val in list(cov.covariance.items()):
             li, eidx, name = key
@@ -321,9 +347,38 @@ def _remap_covariance_for_layer(
                 n_dropped += 1
                 dropped_expert_ids.add(eidx)
                 continue
+            if eidx in union_centroids:
+                # Handled by the UNION pass below; do not emit the centroid's own Gram.
+                continue
             new_key = (li, id_to_new[eidx], name)
             new_cov[new_key] = val
             new_tokens[new_key] = cov.token_count.get(key, 0)
+        # UNION pass: for every merged-group centroid, build Σ_j G_j (down_proj
+        # permuted on both axes by the exact merge perm) and place it in the
+        # survivor slot. up_proj aliases gate_proj in the accumulator, so iterating
+        # {gate_proj, down_proj} is complete.
+        for old in union_centroids:
+            new = id_to_new[old]
+            members = grouped[old]
+            for name in ("gate_proj", "down_proj"):
+                acc = None
+                ntok = 0
+                for m in members:
+                    g = cov.covariance.get((layer_idx, m, name))
+                    if g is None:
+                        continue
+                    if name == "down_proj":
+                        p = member_perms.get(old, {}).get(m)
+                        if p is not None:
+                            idx = torch.as_tensor(p, dtype=torch.long, device=g.device)
+                            g = g.index_select(0, idx).index_select(1, idx)  # BOTH axes
+                    g32 = g.to(torch.float32)
+                    acc = g32 if acc is None else acc + g32
+                    ntok += cov.token_count.get((layer_idx, m, name), 0)
+                if acc is None:
+                    continue
+                new_cov[(layer_idx, new, name)] = acc.to(cov.storage_dtype)
+                new_tokens[(layer_idx, new, name)] = ntok
         orphan_token_keys = set(cov.token_count.keys()) - set(cov.covariance.keys())
         if orphan_token_keys:
             log.warning(
