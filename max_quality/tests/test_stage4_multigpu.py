@@ -407,3 +407,36 @@ def test_eora_concurrent_log_residuals_bytes_unchanged():
         for proj in ("U", "V"):
             assert torch.equal(getattr(fe_s, f"{name}_{proj}").data,
                                getattr(fe_p, f"{name}_{proj}").data)
+
+
+# --------------------------------------------------------------------------- #
+# 1-GPU default: inline (no-thread) branch (M2)
+# --------------------------------------------------------------------------- #
+def test_run_expert_bands_single_band_inline():
+    """A single band runs inline — no pool — and reports not-threaded."""
+    from moe_compress.stage4.plugins import eora_compensation as m
+    calls = []
+    def solve_one(e, tgt):
+        calls.append(e)
+        return (torch.zeros(2, 2), torch.zeros(2, 2), 1, None, None, None)
+    eligible = [0, 1, 2, 3]
+    device_of = {e: torch.device("cpu") for e in eligible}
+    bands = [(0, eligible)]                       # ONE band ordinal
+    res = m._run_expert_bands(
+        bands, device_of, solve_one, name="down_proj",
+        set_gate_spectrum=(lambda e, s: None),
+        concurrent=True,                          # even concurrent=True: 1 band ⇒ inline
+    )
+    assert calls == [0, 1, 2, 3]                  # ascending-e, inline
+    assert set(res.keys()) == {0, 1, 2, 3}
+    assert m._LAST_BAND_COUNT == 1
+    assert m._LAST_RAN_THREADED is False
+
+
+def test_eora_single_worker_is_one_band_not_threaded():
+    """M2 invariant: eora_workers=1 ⇒ exactly one band, never the threaded branch."""
+    from moe_compress.stage4.plugins import eora_compensation as m
+    case = _build_case(n_experts=6)
+    fe, rm, cp = _run_compensate(*case, eora_workers=1)
+    assert m._LAST_BAND_COUNT == 1
+    assert m._LAST_RAN_THREADED is False
