@@ -74,15 +74,21 @@ paper's evaluated range ``{64, 128, 256, 512}``.
 
 (*TODO: ablate 1 % / 3 % / 5 % once Stage 6 evals are available.*)
 
-Activation-cov reuse
---------------------
-This plugin reads the **post-merge** A-covariance from Stage 2's
-sidecar. The "pre-merge A on post-merge weights" mismatch documented
-under D-drank-premerge-A (consumed at
-:mod:`stage3.plugins.d_rank_allocate`) is intentionally absorbed
-here: the EoRA √Λ projection is computed on the **post-merge** A
-re-collected for Stage 4, so the activation-aware projection sees
-the true post-merge distribution.
+Activation-cov whitening (whitening_cov knob)
+---------------------------------------------
+By DEFAULT (``stage4_eora.whitening_cov="anchor"``) this plugin whitens the
+EoRA residual ``ΔW`` with the **original-calibration anchor** ``A_cov`` (the
+Stage-2 sidecar, or its Stage-2 index-remap). NOTHING in Stage 4 re-collects
+``A`` — the prior "post-merge A re-collected for Stage 4" claim was false
+(see docs/research/2026-06-13-acov-capture-point.md §1.3). Upstream EoRA
+(NVlabs/EoRA @ 6a42e2e, eora.py:512,518-526) instead whitens with the
+sequentially-compressed **SHIFT** ``X'``; whitening with the anchor is a
+measured deviation. Set ``whitening_cov="shift"`` to whiten with the post-2.5
+shift cov (Stage-3 ride-along ``_stage3_shift_covariance.pt``) for
+upstream-EoRA fidelity, or ``"anchored_adaptive"`` for the AA-SVD-consistent
+anchor+shift form. The ``ΔW = W_orig − Ŵ`` *target* is always original-anchored
+(``_solve_expert_tile`` :438-442) — original enters only the target, never the
+whitening basis, matching upstream EoRA (eora.py:478).
 
 Naming-history note
 -------------------
