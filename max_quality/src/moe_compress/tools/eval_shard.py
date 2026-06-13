@@ -71,8 +71,45 @@ def _even_split(n, replicas):
     return bounds
 
 
+# ---------------------------------------------------------------------------
+# Merge helpers (pure)
+# ---------------------------------------------------------------------------
+
+
+def _merge_completions(shard_results):
+    """Concatenate contiguous gen-shard results into original index order.
+
+    ``shard_results`` is a list of ``(start, end, completions)`` tuples. Shards
+    are sorted by ``start`` and validated to tile ``[0, N)`` with no gap/overlap
+    (defensive: an off-by-group split is exactly the silent-metric-flip risk
+    this whole feature guards against), then their completion lists are
+    concatenated. Because each completion is a pure function of its
+    group-of-8 + within-group order, the concatenation reproduces the
+    single-GPU completion list byte-for-byte.
+    """
+    ordered = sorted(shard_results, key=lambda t: t[0])
+    merged: list[str] = []
+    expected_start = 0
+    for start, end, completions in ordered:
+        if start != expected_start:
+            raise ValueError(
+                f"_merge_completions: shards are not contiguous from 0 — expected "
+                f"start={expected_start}, got start={start} (gap/overlap). "
+                f"Shard bounds: {[(s, e) for s, e, _ in ordered]}"
+            )
+        if len(completions) != end - start:
+            raise ValueError(
+                f"_merge_completions: shard [{start}:{end}] has {len(completions)} "
+                f"completions but expected {end - start} (length mismatch)."
+            )
+        merged.extend(completions)
+        expected_start = end
+    return merged
+
+
 __all__ = [
     "PINNED_GEN_BATCH_SIZE",
     "_group_aligned_split",
     "_even_split",
+    "_merge_completions",
 ]
