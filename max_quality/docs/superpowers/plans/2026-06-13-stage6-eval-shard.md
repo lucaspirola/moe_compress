@@ -158,15 +158,36 @@ student materialization", `2026-06-13-stage5-router-kd-ddp.md:69-89`).
 
 **Parent side (gated to the ENABLED branch only):** before the walk and BEFORE any of
 the mutating steps above (`orchestrator.py:249,284` `model.to("cpu")`;
-`humaneval.py:629`/`math500.py:482` forward-swap), `model.save_pretrained(tmp_dir)` +
-`tokenizer.save_pretrained(tmp_dir)`. Pass `tmp_dir` + the resolved
+`humaneval.py:629`/`math500.py:482` forward-swap), serialize the student with
+**`save_compressed_checkpoint`, NOT `model.save_pretrained`** (NEW-C1). The Stage-6
+student is post-EoRA → carries `FactoredExperts`, and HF `save_pretrained` UNPACKS the
+stacked expert tensors (`mlp.experts.gate_up_proj [E,2I,H]`) into ~24448 per-expert keys
+**regardless of the state_dict passed** (`model_io.py:1185-1197`, verified 2026-05-13);
+the inter-stage `load_compressed_model` path (always used on resume —
+`run_pipeline.py:494,528,568,593`) then fails with "80 missing keys" (the exact failure
+that already bit Stage 6). So:
+
+```python
+from ...utils.model_io import save_compressed_checkpoint
+model_unwrapped = getattr(model, "_orig_mod", model)   # unwrap compile, as humaneval.py:640 / math500.py:489
+save_compressed_checkpoint(
+    model_unwrapped, tokenizer, tmp_dir,
+    pipeline_stage="stage6_eval_shard_src",
+)
+```
+
+This mirrors the Stage-5 DDP precedent exactly (`save_compressed_checkpoint(unwrap_student(student), ...)`
+to write the stacked-expert state_dict + `compressed_metadata.json`). Workers then reload
+via `load_compressed_model(tmp_dir, attn_implementation="eager", ...)`
+(`model_io.py:1508`), which reconstructs the `FactoredExperts` ranks from the metadata
+sidecar before `load_state_dict`. Pass `tmp_dir` + the resolved
 `experts_implementation_generative` STRING + per-plugin cfg through spawn args (all
 picklable). Temp dir is best-effort `shutil.rmtree`'d after the join. This is **Task 4a**
 below. Default (DP off) → no save, no spawn, current path verbatim.
 
 **Worker side — the FULL generative-env reload contract** (a bare
 `load_compressed_model` is NOT enough; the worker must reproduce everything
-`EvalEnvironmentPlugin.setup_environment` did, since save_pretrained persists weights +
+`EvalEnvironmentPlugin.setup_environment` did, since the saved checkpoint persists weights +
 config only, not the runtime patches):
 
 1. `load_compressed_model(tmp_dir, attn_implementation="eager", ...)` — eager is the gen
@@ -299,11 +320,15 @@ The Stage-6 entry has **no on-disk student**; the worker has nothing to load (se
 and is a prerequisite for Tasks 4 and 5.
 
 - **Parent helper** `_materialize_student(model, tokenizer) -> Path`: create a temp dir
-  (`tempfile.mkdtemp`), `model.save_pretrained(tmp_dir)` + `tokenizer.save_pretrained`,
-  return the path. Called by the orchestrator (Task 7 wiring) ONLY on the `eval_shard`
-  ENABLED branch, BEFORE the mutating steps (`orchestrator.py:249,284` `model.to("cpu")`;
-  the forward-swap at `humaneval.py:629`/`math500.py:482`). Best-effort `shutil.rmtree`
-  after the eval walk joins.
+  (`tempfile.mkdtemp`), unwrap (`getattr(model, "_orig_mod", model)`), then
+  `save_compressed_checkpoint(model_unwrapped, tokenizer, tmp_dir,
+  pipeline_stage="stage6_eval_shard_src")` (`model_io.py:1126`) — **NOT
+  `model.save_pretrained`** (NEW-C1: save_pretrained unpacks FactoredExperts → 24448 keys →
+  `load_compressed_model` "80 missing keys", `model_io.py:1185-1197`). Return the path.
+  Called by the orchestrator (Task 7 wiring) ONLY on the `eval_shard` ENABLED branch,
+  BEFORE the mutating steps (`orchestrator.py:249,284` `model.to("cpu")`; the forward-swap
+  at `humaneval.py:629`/`math500.py:482`). Best-effort `shutil.rmtree` after the eval walk
+  joins.
 - **Worker reload helper** `_reload_student_for_worker(tmp_dir, *, experts_impl_generative,
   for_generate: bool) -> (model, tokenizer)` (function-local imports inside the spawn
   target): runs the FULL contract from "Worker side" above — steps 1–4 always
@@ -312,19 +337,28 @@ and is a prerequisite for Tasks 4 and 5.
   `linear_attention → full_attention` mask passthrough), then step 5
   (`_set_experts_implementation_s6`) ONLY when `for_generate` is True. Never calls
   `torch.compile`.
-- **Reload-fidelity test** `tests/test_eval_shard_reload_fidelity.py` (CPU, tiny stub
-  model that exposes `config._attn_implementation`, a GatedDeltaNet-marker module, and a
-  settable `_experts_implementation`): save via `_materialize_student`, reload via
-  `_reload_student_for_worker(..., for_generate=True)`, and assert the reloaded model has:
-  (a) `config._attn_implementation == "eager"`;
-  (b) the kernel-patch marker applied (stub flag flipped by a monkeypatched
-  `_apply_stage6_kernel_patches`, OR assert the real helper was invoked);
-  (c) `"linear_attention" in masking_utils.LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING`
-  (registered in the child) ;
-  (d) `config._experts_implementation == experts_impl_generative`;
-  (e) `model.forward` is NOT a torch.compile wrapper (uncompiled).
-  Also assert `for_generate=False` (PPL) gives (a)–(c) but leaves the experts impl
-  unswitched.
+- **Reload-fidelity test** `tests/test_eval_shard_reload_fidelity.py` (CPU). The stub model
+  MUST exercise the unpack/repack path that NEW-C1 is about — otherwise the test is
+  vacuous against the real failure mode. It therefore includes a **stacked / factored-expert
+  MoE module** discoverable by `iter_moe_layers` (a `FactoredExperts` instance with real
+  `ranks` / `effective_ranks` and stacked `gate_up_proj [E,2I,H]` / `down_proj`
+  Parameters), plus `config._attn_implementation`, a GatedDeltaNet-marker module, and a
+  settable `_experts_implementation`.
+  - **Structural round-trip (the binding assertion, mirrors Stage-5 Task 8):** snapshot the
+    parent's pre-save stacked-expert params; `_materialize_student` (→
+    `save_compressed_checkpoint`); `_reload_student_for_worker(..., for_generate=True)`;
+    then assert the reloaded worker's expert params are `torch.allclose` to the parent's
+    pre-save params (no NaN, exact shapes) AND the `FactoredExperts` ranks /
+    effective_ranks survive (reconstructed from `compressed_metadata.json`). A
+    `save_pretrained`-based materialization would FAIL this (24448 unpacked keys → load
+    error), so the test actively guards NEW-C1.
+  - **Generative-env asserts:** reloaded model has (a) `config._attn_implementation ==
+    "eager"`; (b) the kernel-patch marker applied (real `_apply_stage6_kernel_patches`
+    invoked, or a stub flag it flips); (c) `"linear_attention" in
+    masking_utils.LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING`; (d) `config._experts_implementation
+    == experts_impl_generative`; (e) `model.forward` is NOT a torch.compile wrapper.
+  - Also assert `for_generate=False` (PPL) gives the structural round-trip + (a)–(c) but
+    leaves the experts impl unswitched.
 - Command:
   `pytest max_quality/tests/test_eval_shard_reload_fidelity.py -v`
 
@@ -494,10 +528,13 @@ split silently changes the metric — `stage6.md:222-225`).
 6. **CPU `ProcessPool` untouched.** HumanEval's scoring pool is exec-isolation, not GPU
    parallelism (`stage6.md:61-74`); scoring still runs serially in the parent after merge.
 
-7. **Live-model materialization + full worker reload contract (C1/H1).** Stage 6 holds a
-   LIVE in-memory model that the orchestrator later relocates/mutates, so the parent
-   `save_pretrained`s it to a temp dir BEFORE those mutations (ENABLED branch only); each
-   worker reloads and re-applies the COMPLETE generative-env contract — eager attn,
+7. **Live-model materialization + full worker reload contract (C1/H1/NEW-C1).** Stage 6
+   holds a LIVE in-memory model that the orchestrator later relocates/mutates, so the parent
+   serializes it via **`save_compressed_checkpoint`** (NOT `save_pretrained`, which unpacks
+   FactoredExperts and breaks `load_compressed_model` — `model_io.py:1185-1197`) to a temp
+   dir BEFORE those mutations (ENABLED branch only); each worker `load_compressed_model`s
+   (rebuilding FactoredExperts ranks from the metadata sidecar) and re-applies the COMPLETE
+   generative-env contract — eager attn,
    `model.eval()`, `_apply_stage6_kernel_patches(role="student")`
    (`eval_environment.py:594`), the `linear_attention→full_attention` mask passthrough
    (`eval_environment.py:638-646`, else `generate()` raises `KeyError`), generative
@@ -533,9 +570,10 @@ split silently changes the metric — `stage6.md:222-225`).
 - **O1 — RESOLVED (was Task 4/5 blocker).** Stage 6 has NO on-disk student: `run()` gets a
   live model (`orchestrator.py:117,129`; `run_pipeline.py:347-348`) which the orchestrator
   then relocates/mutates (`orchestrator.py:249,284`; `humaneval.py:629,648`;
-  `math500.py:482,492`). Resolution = parent-side `_materialize_student` (save_pretrained
-  to a temp dir, ENABLED branch only, BEFORE the mutations) + worker reload. See
-  "Per-replica student materialization", Task 4a, and Key decision 7.
+  `math500.py:482,492`). Resolution = parent-side `_materialize_student`
+  (`save_compressed_checkpoint` — NOT `save_pretrained`, NEW-C1 — to a temp dir, ENABLED
+  branch only, BEFORE the mutations) + worker `load_compressed_model`. See "Per-replica
+  student materialization", Task 4a, and Key decision 7.
 
 - **O2 — RESOLVED.** The worker reproduces the generative env via the full reload contract:
   eager attn (`run_pipeline.py:483`), `_apply_stage6_kernel_patches` (`eval_environment.py:594`),
