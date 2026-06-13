@@ -503,3 +503,60 @@ def test_alpha_dp_equivalence_inproc():
     assert sorted(serial) == sorted(merged)
     # The unique parabola minimum.
     assert serial_alpha == 0.3
+
+
+class _TinyCausalLM(torch.nn.Module):
+    """A minimal next-token LM with the HF ``model(input_ids, labels=...)`` →
+    ``.loss`` contract ``_evaluate_wikitext2_ppl`` consumes. ``.loss`` is the
+    mean NLL over the (seq_len-1) shifted positions, exactly like a causal LM."""
+
+    def __init__(self, vocab=32, dim=16, seed=0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        self.emb = torch.nn.Embedding(vocab, dim)
+        self.head = torch.nn.Linear(dim, vocab)
+        with torch.no_grad():
+            self.emb.weight.copy_(torch.randn(vocab, dim, generator=g))
+            self.head.weight.copy_(torch.randn(vocab, dim, generator=g) * 0.1)
+            self.head.bias.copy_(torch.randn(vocab, generator=g) * 0.1)
+
+    def forward(self, input_ids, labels=None):
+        h = self.emb(input_ids)
+        logits = self.head(h)
+        shift_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
+        shift_labels = labels[:, 1:].reshape(-1)
+        loss = torch.nn.functional.cross_entropy(shift_logits, shift_labels)
+        return type("Out", (), {"loss": loss})()
+
+
+def test_alpha_eval_batch_invariant():
+    """``_evaluate_wikitext2_ppl`` is BATCH_INVARIANT: bs=4 == bs=7 to ~1e-6.
+
+    The token-sum NLL (``nll_sum += loss * n_tokens``; ``exp(nll_sum/tok_count)``)
+    is grouping-independent, so per-replica auto-batch sizing on the α-eval path
+    is safe (the size of the forward batch never changes the PPL, only the
+    runtime). CPU + a tiny LM."""
+    from moe_compress.stage3.plugins.swift_svd_alpha import _evaluate_wikitext2_ppl
+
+    model = _TinyCausalLM(seed=3)
+    g = torch.Generator().manual_seed(11)
+    val = torch.randint(0, 32, (14, 9), generator=g, dtype=torch.long)
+    ppl4 = _evaluate_wikitext2_ppl(model, val, device=None, batch_size=4)
+    ppl7 = _evaluate_wikitext2_ppl(model, val, device=None, batch_size=7)
+    assert abs(ppl4 - ppl7) < 1e-4 * max(1.0, ppl4)
+
+
+def test_alpha_eval_batch_default_no_probe():
+    """``_resolve_alpha_eval_batch`` default (int validation_batch_size) returns
+    that int with NO probe — byte-identical eval (the auto path is opt-in)."""
+    from moe_compress.stage3.plugins.swift_svd_alpha import _resolve_alpha_eval_batch
+
+    cfg = {"stage3_svd": {"swift_svd_plus": {"validation_batch_size": 16}}}
+    assert _resolve_alpha_eval_batch(cfg, model=None, val_tensor=None, device=None) == 16
+    cfg2 = {"stage3_svd": {"swift_svd_plus": {"validation_batch_size": 8}}}
+    assert _resolve_alpha_eval_batch(cfg2, model=None, val_tensor=None, device=None) == 8
+    # "auto" but auto_batch disabled / no CUDA ⇒ the floor (16), still no probe.
+    cfg3 = {"stage3_svd": {"swift_svd_plus": {"validation_batch_size": "auto"},
+                           "auto_batch": {"enabled": False}}}
+    assert _resolve_alpha_eval_batch(
+        cfg3, model=None, val_tensor=None, device=torch.device("cpu")) == 16
