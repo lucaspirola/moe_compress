@@ -8,6 +8,8 @@ the shipped CPU weight list and calls the existing ``_group_stat``.
 """
 from __future__ import annotations
 
+import concurrent.futures
+import multiprocessing
 from dataclasses import dataclass
 
 import torch
@@ -53,3 +55,28 @@ def _group_stat_payload(payload: "_GroupStatPayload"):
     bank = _ListBank(payload.weights_cpu)
     gs = _group_stat(payload.n_experts, bank, A_g=payload.a_g_cpu)
     return (payload.layer_idx, payload.name), gs
+
+
+def run_group_stats_pool(payloads, workers: int):
+    """Compute {(layer_idx,name): _GroupStats} for all group payloads.
+
+    workers<=1 → serial in-process (1-thread-pinned here), byte-identical to
+    today's serial default path. workers>1 → spawn ProcessPool (CUDA-fork-safe),
+    each worker 1-thread-pinned. Reassembly is order-free (dict keyed by
+    (layer_idx,name)); the order-sensitive mean(0) stays INSIDE each worker by
+    the group granularity.
+    """
+    if workers is None or workers <= 1:
+        _pin_one_thread()
+        return dict(_group_stat_payload(p) for p in payloads)
+
+    # FORCE spawn — the parent is CUDA-initialized (Stage 3 is GPU-resident);
+    # fork-after-CUDA-init deadlocks the child. Precedent humaneval.py:374-381.
+    ctx = multiprocessing.get_context("spawn")
+    out: dict = {}
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=workers, mp_context=ctx, initializer=_pin_one_thread,
+    ) as ex:
+        for key, gs in ex.map(_group_stat_payload, payloads):
+            out[key] = gs
+    return out

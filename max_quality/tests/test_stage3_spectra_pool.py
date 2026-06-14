@@ -83,3 +83,51 @@ def test_thread_pinning_holds_the_bits():
     _, gs_w = _group_stat_payload(payload)
     assert gs_w.effective_rank == er1
     assert torch.equal(gs_w.singular_values_mean, sv1)
+
+
+def _build_multigroup_payloads():
+    from moe_compress.stage3.spectra_pool import _GroupStatPayload
+    torch.manual_seed(13)
+    d_out, d_in, n = 16, 12, 4
+    payloads = []
+    for li in range(2):
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            weights = [torch.randn(d_out, d_in, dtype=torch.float32) for _ in range(n)]
+            m = torch.randn(d_in, d_in, dtype=torch.float32)
+            a_g = (m @ m.T + d_in * torch.eye(d_in)).to(torch.float32)
+            payloads.append(_GroupStatPayload(li, name, n, weights, a_g))
+    return payloads
+
+
+def _run_group_stats(payloads, workers):
+    from moe_compress.stage3.spectra_pool import run_group_stats_pool
+    return run_group_stats_pool(payloads, workers=workers)
+
+
+def test_group_stat_parallel_equals_serial():
+    """PRIMARY gate: parallel (workers=2, spawn, 1-thread-pinned) == 1-thread
+    serial on effective_rank (exact float) + singular_values_mean (torch.equal)."""
+    payloads = _build_multigroup_payloads()
+    serial = _run_group_stats(payloads, workers=1)
+    parallel = _run_group_stats(payloads, workers=2)
+    assert set(serial) == set(parallel)
+    for key in serial:
+        assert serial[key].effective_rank == parallel[key].effective_rank, key
+        assert torch.equal(serial[key].singular_values_mean,
+                           parallel[key].singular_values_mean), key
+
+
+def test_group_stat_rank_map_equal_across_workers():
+    """Downstream int rank_map identical across workers in {1,2,4}, swept over
+    a couple of T budgets (a borderline round() can't hide a float drift)."""
+    from moe_compress.stage3.plugins.d_rank_allocate import (
+        _d_rank_allocate, _compute_T_budget,
+    )
+    payloads = _build_multigroup_payloads()
+    base = _run_group_stats(payloads, workers=1)
+    for w in (2, 4):
+        cand = _run_group_stats(payloads, workers=w)
+        for ratio in (0.2, 0.3, 0.5):
+            Tb = _compute_T_budget(base, svd_rank_ratio=ratio)
+            Tc = _compute_T_budget(cand, svd_rank_ratio=ratio)
+            assert _d_rank_allocate(base, Tb) == _d_rank_allocate(cand, Tc), (w, ratio)
