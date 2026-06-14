@@ -348,3 +348,28 @@ def test_dp_replica_worker_threads_cov_num_sequences_override():
         inproc_spec = _resolve_bcov_spec(s3, cal)
         assert worker_spec.num_sequences == inproc_spec.num_sequences
         assert worker_spec.seed == inproc_spec.seed
+
+
+def test_run_with_oom_backoff_gentler_sequence():
+    import pytest, torch
+    from moe_compress.utils.auto_batch import run_with_oom_backoff
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA for OutOfMemoryError class")
+
+    threshold = 10
+    attempts = []
+
+    def _fake_run(batch):
+        attempts.append(batch)
+        if batch > threshold:
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return batch
+
+    result = run_with_oom_backoff(_fake_run, start_batch=18, floor=4)
+
+    # 18 -> min(int(18*0.75), 17) = min(13, 17) = 13  (OOM)
+    # 13 -> min(int(13*0.75), 12) = min(9,  12) = 9   (success)
+    assert attempts == [18, 13, 9], f"expected [18, 13, 9], got {attempts}"
+    assert result == 9
+    assert len(attempts) > 2, "must take more steps than halving ([18, 9])"

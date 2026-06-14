@@ -186,8 +186,10 @@ def resolve_batch(cost_probe_fn, fixed_batch: int, fidelity_class: FidelityClass
 
 
 def run_with_oom_backoff(run_fn, start_batch: int, floor: int):
-    """Run run_fn(batch) at start_batch; on CUDA OOM empty_cache + halve toward
-    floor and rerun. The real pass is the fit test. Re-raises if the floor OOMs."""
+    """Run run_fn(batch) at start_batch; on CUDA OOM empty_cache + back off
+    gently toward floor (x0.75, capped at attempt-1) and rerun, e.g.
+    18->13->9 instead of 18->9. The real pass is the fit test. Re-raises if
+    the floor OOMs."""
     import torch
     attempt = max(int(start_batch), int(floor))
     while True:
@@ -198,6 +200,6 @@ def run_with_oom_backoff(run_fn, start_batch: int, floor: int):
             if attempt <= floor:
                 log.error("auto_batch: OOM at floor batch=%d; unrecoverable", floor)
                 raise
-            new = max(attempt // 2, floor)
+            new = max(min(int(attempt * 0.75), attempt - 1), floor)
             log.warning("auto_batch: OOM at batch=%d; retrying at %d", attempt, new)
             attempt = new
