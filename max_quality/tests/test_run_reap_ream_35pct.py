@@ -261,13 +261,13 @@ def test_keep_count_pins_documented_rounding():
 # ---------------------------------------------------------------------------
 
 def test_pipeline_subprocesses_never_invoke_stage1():
-    """The runner's per-arm stage windows (the constant the two
-    ``subprocess.run`` launches actually read) must never resume Stage-1. Source
-    the (resume, stop) pairs from the REAL ``ARM_STAGE_WINDOWS`` constant — not
-    hardcoded literals — so a future ``run_one_arm`` edit that lowers a resume to
-    1 is caught here, and feed each through the real ``_pipeline_argv`` to lock
-    the rendered argv. Stage-1 GRAPE/RCO is gated on start<=1 in run_pipeline.py;
-    every window with resume>=2 proves it is NEVER invoked per arm."""
+    """The runner's per-arm stage windows (the pairs the ``subprocess.run``
+    launches actually read) must never resume Stage-1. Source the (resume, stop)
+    pairs from the REAL ``ARM_SPECS`` — not hardcoded literals — so a future edit
+    that lowers a resume to 1 is caught here, and feed each through the real
+    ``_pipeline_argv`` to lock the rendered argv. Stage-1 GRAPE/RCO is gated on
+    start<=1 in run_pipeline.py; every window with resume>=2 proves it is NEVER
+    invoked for any arm."""
     import tempfile
     from pathlib import Path
 
@@ -277,19 +277,19 @@ def test_pipeline_subprocesses_never_invoke_stage1():
     def _resume_of(argv: list[str]) -> int:
         return int(argv[argv.index("--resume-from-stage") + 1])
 
-    windows = rr.ARM_STAGE_WINDOWS
-    assert len(windows) >= 1
+    all_windows = [w for spec in rr.ARM_SPECS for w in spec.stage_windows]
+    assert len(all_windows) >= 1
 
     # (a) Every window's resume stage proves Stage-1 is never re-entered.
-    for resume, stop in windows:
+    for resume, stop in all_windows:
         assert resume >= 2, (
-            f"ARM_STAGE_WINDOWS has a window resuming at stage {resume} "
+            f"ARM_SPECS has a window resuming at stage {resume} "
             "(<=1 ⇒ Stage-1 GRAPE/RCO would run!)"
         )
 
     # (b) Feed each window through the real formatter and lock the argv: it must
     #     carry --resume-from-stage <resume> with resume>=2, never 1 or 0.
-    for resume, stop in windows:
+    for resume, stop in all_windows:
         argv = rr._pipeline_argv(cfg_path, "fake/repo", arm_dir,
                                  resume=resume, stop=stop)
         assert "--resume-from-stage" in argv
@@ -298,8 +298,10 @@ def test_pipeline_subprocesses_never_invoke_stage1():
         assert "--resume-from-stage 1" not in " ".join(argv)
         assert "--resume-from-stage 0" not in " ".join(argv)
 
-    # The two locked windows: (Stage2+2.5)=2/2 then (Stage3-6)=3/6.
-    assert windows[0][0] == 2 and windows[1][0] == 3
+    # Per-spec: reap resumes post-2.5 (single 3/6 window); ream runs 2/2 then 3/6.
+    specs = {s.arm_id: s for s in rr.ARM_SPECS}
+    assert specs["reap-s234"].stage_windows == ((3, 6),)
+    assert specs["ream-s234"].stage_windows == ((2, 2), (3, 6))
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +319,28 @@ def test_assert_covariance_resolves_raises_on_missing_sidecar(tmp_path):
     base_cfg = {"calibration": {"jsonl_path": str(missing_jsonl)}}
     with pytest.raises(RuntimeError, match="H-B"):
         rr.assert_covariance_resolves(base_cfg)
+
+
+# ===========================================================================
+# Task 1: per-arm ArmSpec (windows + optional HF seed) replaces global windows
+# ===========================================================================
+
+def test_arm_specs_reap_resumes_post_2p5_ream_runs_2p5():
+    """reap-s234 carries an HF seed repo + a single (3,6) window (resumes
+    post-2.5, skips Stage-2/2.5); ream-s234 has no seed + the (2,2),(3,6) pair
+    (runs its own Stage-2/2.5). --only still filters by arm_id."""
+    specs = {s.arm_id: s for s in rr.ARM_SPECS}
+    assert set(specs) == {"reap-s234", "ream-s234"}
+
+    reap = specs["reap-s234"]
+    assert reap.method == "faithful_prune"
+    assert reap.seed_hub_repo == "pirola/reap-s234-stage2p5-final"
+    assert reap.stage_windows == ((3, 6),)
+
+    ream = specs["ream-s234"]
+    assert ream.method == "merge"
+    assert ream.seed_hub_repo is None
+    assert ream.stage_windows == ((2, 2), (3, 6))
 
 
 # --- small tmp helpers for the iso-K REAM-pin write/read ---

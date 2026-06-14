@@ -145,12 +145,16 @@ import copy
 import gc
 import json
 import logging
+import shutil
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
+
+from huggingface_hub import snapshot_download
 
 from .budget import solver as budget_solver
 from .utils.model_io import iter_moe_layers, save_json_artifact
@@ -168,19 +172,47 @@ from .run_probe import (
 
 log = logging.getLogger(__name__)
 
-# The two "ours" arms. ``method`` selects the Stage-2 mechanism; both share the
-# SAME solver K + sp (iso-compression) and the SAME paper router-kd dials.
-ARMS: tuple[tuple[str, str], ...] = (
-    ("reap-s234", "faithful_prune"),
-    ("ream-s234", "merge"),
-)
-
 # Net compression target (M-C) — these arms target NET-35% after Stage-4 EoRA.
 NET_TARGET = 0.35
 
-# Per-arm run_pipeline stage windows: (resume, stop) for (Stage2+2.5, Stage3-6).
-# resume>=2 ⇒ Stage-1 GRAPE/RCO never runs (run_pipeline.py gates start<=1).
-ARM_STAGE_WINDOWS = ((2, 2), (3, 6))
+
+@dataclass(frozen=True)
+class ArmSpec:
+    """One "ours" arm: Stage-2 ``method`` + its run_pipeline stage windows + an
+    optional HF seed repo for a resume-from-post-2.5 checkpoint.
+
+    ``stage_windows`` is a tuple of ``(resume, stop)`` pairs run in order. Every
+    resume stage is >= 2 ⇒ Stage-1 GRAPE/RCO never runs (run_pipeline gates
+    start<=1). A ``seed_hub_repo`` arm has its post-2.5 ``stage2p5_final/`` placed
+    on disk from the Hub before the loop, so it carries a single ``(3, 6)``
+    window (skips Stage-2/2.5 entirely); a non-seeded arm runs the
+    ``(2,2),(3,6)`` pair (its own Stage 2 + auto-2.5, then Stage 3→6).
+    """
+
+    arm_id: str
+    method: str
+    seed_hub_repo: str | None
+    stage_windows: tuple[tuple[int, int], ...]
+
+
+# The two "ours" arms. ``method`` selects the Stage-2 mechanism; both share the
+# SAME solver K + sp (iso-compression) and the SAME paper router-kd dials.
+#   * reap-s234 resumes from its HF-backed stage2p5_final → Stage 3→6 ONLY.
+#   * ream-s234 runs its own Stage 2→2.5 then Stage 3→6 (unchanged).
+ARM_SPECS: tuple[ArmSpec, ...] = (
+    ArmSpec(
+        arm_id="reap-s234",
+        method="faithful_prune",
+        seed_hub_repo="pirola/reap-s234-stage2p5-final",
+        stage_windows=((3, 6),),
+    ),
+    ArmSpec(
+        arm_id="ream-s234",
+        method="merge",
+        seed_hub_repo=None,
+        stage_windows=((2, 2), (3, 6)),
+    ),
+)
 
 # Final Stage-6alt artifact filename — completion gate (mirrors run_probe).
 STAGE6ALT_ARTIFACT = "stage6alt_eval.json"
@@ -555,11 +587,11 @@ def main(argv: list[str] | None = None) -> int:
     probe_root.mkdir(parents=True, exist_ok=True)
     shared_dir = probe_root / "_shared"
 
-    arms = list(ARMS)
+    arms = list(ARM_SPECS)
     if args.only:
         wanted = {x.strip() for x in args.only.split(",") if x.strip()}
-        arms = [a for a in arms if a[0] in wanted]
-    log.info("Will run %d arm(s): %s", len(arms), [a[0] for a in arms])
+        arms = [a for a in arms if a.arm_id in wanted]
+    log.info("Will run %d arm(s): %s", len(arms), [a.arm_id for a in arms])
 
     # Shared Stage-1 artifacts gate (same contract as run_probe).
     if not all((shared_dir / n).exists() for n in (
@@ -617,16 +649,17 @@ def main(argv: list[str] | None = None) -> int:
 
     results: dict[str, dict] = {}
     failures: list[tuple[str, str]] = []
-    for arm_id, method in arms:
+    for spec in arms:
         try:
-            results[arm_id] = run_one_arm(
-                arm_id=arm_id, method=method, base_config=base_config,
+            results[spec.arm_id] = run_one_arm(
+                spec=spec, base_config=base_config,
                 budget=budget, shared_dir=shared_dir, probe_root=probe_root,
                 model_repo=args.model, num_sequences=args.num_sequences,
+                num_gpus=args.num_gpus, whitening_cov=args.whitening_cov,
             )
         except Exception as exc:  # noqa: BLE001
-            log.exception("[%s] failed", arm_id)
-            failures.append((arm_id, str(exc)))
+            log.exception("[%s] failed", spec.arm_id)
+            failures.append((spec.arm_id, str(exc)))
 
     summary = {
         "solver_budget": budget,
