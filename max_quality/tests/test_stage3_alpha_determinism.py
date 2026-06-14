@@ -10,6 +10,74 @@ assertion proves nothing about the bug.
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
+
+
+# ---------------------------------------------------------------------------
+# Module-local fixture builders. The codebase rule is tests do not import each
+# other, so these are verbatim local copies of the private builders in
+# test_stage3_tier1.py (_FusedExperts / _make_layer_ref / _build_acov /
+# _group_stats_for) rather than imports.
+# ---------------------------------------------------------------------------
+
+
+class _FusedExperts(nn.Module):
+    """Minimal fused-layout experts module matching ``_is_fused_experts``."""
+
+    def __init__(self, n_experts, d_int, d_hid, seed=0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        self.num_experts = n_experts
+        self.gate_up_proj = nn.Parameter(
+            torch.randn(n_experts, 2 * d_int, d_hid, generator=g)
+        )
+        self.down_proj = nn.Parameter(
+            torch.randn(n_experts, d_hid, d_int, generator=g)
+        )
+
+
+def _make_layer_ref(layer_idx, experts):
+    from moe_compress.utils.model_io import MoELayerRef
+
+    dummy = nn.Identity()
+    return MoELayerRef(
+        layer_idx=layer_idx,
+        layer_module=dummy,
+        mlp=dummy,
+        router=dummy,
+        experts_module=experts,
+        shared_expert=None,
+        layer_type="unknown",
+    )
+
+
+def _build_acov(layer_idx, experts, d_hid, d_int, seed=1):
+    A_cov = {}
+    n = experts.num_experts
+    for e in range(n):
+        g = torch.Generator().manual_seed(seed + e)
+        for name, dim in (("gate_proj", d_hid), ("up_proj", d_hid),
+                          ("down_proj", d_int)):
+            M = torch.randn(dim, dim, generator=g)
+            A_cov[(layer_idx, e, name)] = (M @ M.T) + torch.eye(dim)
+    return A_cov
+
+
+def _group_stats_for(layer_idx, experts, d_int, d_hid):
+    from moe_compress.stage3.plugins.d_rank_allocate import _GroupStats
+
+    n = experts.num_experts
+    dims = {"gate_proj": (d_int, d_hid), "up_proj": (d_int, d_hid),
+            "down_proj": (d_hid, d_int)}
+    gs = {}
+    for name, (d_out, d_in) in dims.items():
+        gs[(layer_idx, name)] = _GroupStats(
+            d_out=d_out, d_in=d_in, n_experts=n,
+            singular_values_mean=torch.ones(min(d_out, d_in)),
+            effective_rank=float(min(d_out, d_in)) / 2.0,
+            omega=n * (d_out + d_in),
+        )
+    return gs
 
 
 def _eigh_factor(A64: torch.Tensor) -> torch.Tensor:
@@ -77,3 +145,30 @@ def test_cholesky_whitening_is_threshold_free_and_stable():
     assert s0.shape == s1.shape
     assert torch.allclose(s0, s1, rtol=0, atol=1e-9)
     assert torch.equal(_chol_factor(A.clone()), _chol_factor(A.clone()))
+
+
+def test_producer1_uses_cholesky_spectrum():
+    """``_swift_svd_plus_alpha_search`` (producer 1) emits svdvals(W @ L_C)
+    bit-identical to the helper-based recompute (proves the eigh block is gone)."""
+    from moe_compress.stage3.plugins.swift_svd_alpha import (
+        _swift_svd_plus_alpha_search, _alpha_whiten_factor,
+    )
+    from moe_compress.utils.model_io import build_banks
+    layer_idx, n, d_int, d_hid = 0, 4, 6, 8
+    experts = _FusedExperts(n, d_int, d_hid, seed=3)        # local copy
+    ref = _make_layer_ref(layer_idx, experts)              # local copy
+    A_cov = _build_acov(layer_idx, experts, d_hid, d_int)  # local copy
+    group_stats = _group_stats_for(layer_idx, experts, d_int, d_hid)  # local copy
+    base_ranks = {k: 3 for k in group_stats}
+    _, grouped_svs = _swift_svd_plus_alpha_search(
+        [ref], group_stats, base_ranks, [0.0, 0.5, 1.0],
+        per_group_type=True, A_cov=A_cov, return_svs=True,
+    )
+    banks = build_banks(ref)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        for e in range(n):
+            W = banks[name].get(e).detach().to(device="cpu", dtype=torch.float64)
+            A = A_cov[(layer_idx, e, name)].to(device="cpu", dtype=torch.float64)
+            A = 0.5 * (A + A.T)
+            inline = torch.linalg.svdvals(W @ _alpha_whiten_factor(A))
+            assert torch.equal(grouped_svs[name][(layer_idx, e)], inline)

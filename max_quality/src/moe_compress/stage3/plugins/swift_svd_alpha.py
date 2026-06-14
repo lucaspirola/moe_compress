@@ -1222,15 +1222,14 @@ def _swift_svd_plus_alpha_search(
             if A is not None:
                 A64 = A.to(device="cpu", dtype=torch.float64)
                 A64 = 0.5 * (A64 + A64.T)
-                eigvals_a, eigvecs_a = torch.linalg.eigh(A64)
-                keep_a = eigvals_a > eigvals_a.max() * 1e-6
-                if keep_a.any():
-                    L_A = eigvecs_a[:, keep_a] * eigvals_a[keep_a].clamp_min(1e-12).sqrt().unsqueeze(0)
-                    M_A = W @ L_A
-                    svs = torch.linalg.svdvals(M_A)
-                else:
+                try:
+                    # F1: Cholesky whitening — host-stable, full-rank, no
+                    # discrete keep_a threshold. KEEP svdvals(W @ L_C) order.
+                    L_C = _alpha_whiten_factor(A64)
+                    svs = torch.linalg.svdvals(W @ L_C)
+                except Exception:
                     _warn_raw_svd_fallback_once(
-                        "A_cov is rank-zero / empty after eigh thresholding "
+                        "A_cov Cholesky failed / rank-zero "
                         "(in _swift_svd_plus_alpha_search)"
                     )
                     svs = torch.linalg.svdvals(W)
