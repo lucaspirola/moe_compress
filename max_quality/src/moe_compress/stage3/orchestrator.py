@@ -35,6 +35,7 @@ fixture needing to also patch ``stage3.orchestrator``.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -140,6 +141,22 @@ def _resolve_alpha_workers(config: dict) -> int:
     if requested <= 1 or n_gpu < 2:
         return 1
     return max(1, min(requested, n_gpu))
+
+
+def _resolve_spectra_workers(config: dict) -> int:
+    """Resolve the effective fp64-CPU rank-spectra worker count (F2).
+
+    Reads the optional ``stage3_svd.spectra_workers`` knob (default 1) and
+    clamps to ``[1, os.cpu_count()]``. Unlike the GPU-keyed ``_resolve_*``
+    helpers above, this is a CPU ProcessPool (the spectra are fp64-on-CPU), so
+    it clamps to the host core count, not visible CUDA devices. Default 1 ⇒ the
+    serial in-process path, byte-identical to today's serial default. Tolerates
+    a missing/non-int/0/negative/huge value (e.g. ``int("auto")`` would raise,
+    so we coerce via the same int() the orchestrator used and clamp).
+    """
+    s3 = config.get("stage3_svd") or {}
+    requested = int(s3.get("spectra_workers", 1))
+    return max(1, min(requested, os.cpu_count() or 1))
 
 
 def _maybe_cpu_hot_accum(
@@ -654,7 +671,7 @@ def run(
     # build_banks / _cov_lookup); only _compute_T_budget + _d_rank_allocate
     # live inside DRankAllocatePlugin.allocate_ranks.
     log.info("Stage 3: computing per-group stats over %d layers", len(moe_layers))
-    spectra_workers = int(s3.get("spectra_workers", 1))
+    spectra_workers = _resolve_spectra_workers(config)
     from .spectra_pool import _GroupStatPayload, run_group_stats_pool  # noqa: PLC0415
 
     # Group-average pre-prune input covariance for D-Rank whitening.

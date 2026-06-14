@@ -146,7 +146,50 @@ def test_group_stat_worker_order_invariant():
 
 
 def test_spectra_workers_defaults_to_one():
-    """The orchestrator reads stage3_svd.spectra_workers with default 1
-    (byte-identical serial path)."""
-    cfg = {"stage3_svd": {}}
-    assert int(cfg["stage3_svd"].get("spectra_workers", 1)) == 1
+    """The orchestrator's REAL resolver returns 1 when the knob is absent
+    (byte-identical serial path). Non-vacuous: calls _resolve_spectra_workers,
+    so it would catch a default change."""
+    from moe_compress.stage3.orchestrator import _resolve_spectra_workers
+    assert _resolve_spectra_workers({"stage3_svd": {}}) == 1
+    assert _resolve_spectra_workers({}) == 1
+
+
+def test_resolve_spectra_workers_clamps():
+    """The resolver clamps to [1, os.cpu_count()] and tolerates bad values."""
+    import os
+    from moe_compress.stage3.orchestrator import _resolve_spectra_workers
+    ncpu = os.cpu_count() or 1
+    assert _resolve_spectra_workers({"stage3_svd": {"spectra_workers": 0}}) == 1
+    assert _resolve_spectra_workers({"stage3_svd": {"spectra_workers": -4}}) == 1
+    assert _resolve_spectra_workers({"stage3_svd": {"spectra_workers": 10 ** 9}}) == ncpu
+    assert _resolve_spectra_workers({"stage3_svd": {"spectra_workers": 2}}) == min(2, ncpu)
+
+
+def test_serial_pool_restores_parent_thread_count():
+    """H1 guard: run_group_stats_pool(workers=1) pins to 1 thread internally for
+    the serial spectra determinism but MUST restore the parent's thread count
+    (else Stage 3/4/5 inherit a 1-thread cap for the rest of the run)."""
+    from moe_compress.stage3.spectra_pool import run_group_stats_pool
+    payloads = _build_multigroup_payloads()
+    saved = torch.get_num_threads()
+    try:
+        torch.set_num_threads(4)
+        assert torch.get_num_threads() == 4
+        run_group_stats_pool(payloads, workers=1)
+        assert torch.get_num_threads() == 4  # restored, not left at 1
+    finally:
+        torch.set_num_threads(saved)
+
+
+def test_parallel_pool_does_not_pin_parent():
+    """workers>1 pins threads only in WORKER processes (pool initializer);
+    the parent's thread count is untouched."""
+    from moe_compress.stage3.spectra_pool import run_group_stats_pool
+    payloads = _build_multigroup_payloads()
+    saved = torch.get_num_threads()
+    try:
+        torch.set_num_threads(3)
+        run_group_stats_pool(payloads, workers=2)
+        assert torch.get_num_threads() == 3  # parent never pinned
+    finally:
+        torch.set_num_threads(saved)

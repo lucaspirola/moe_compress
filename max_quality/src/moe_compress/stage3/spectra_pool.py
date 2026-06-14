@@ -12,8 +12,6 @@ import concurrent.futures
 import multiprocessing
 from dataclasses import dataclass
 
-import torch
-
 
 @dataclass
 class _GroupStatPayload:
@@ -44,6 +42,9 @@ def _pin_one_thread() -> None:
     """Pool initializer. 1 intra-op thread per worker is a FIDELITY invariant
     (multi-thread BLAS reassociates fp sums → bit drift in effective_rank), not
     just perf. See F2 doc §2."""
+    # Lazy import keeps this leaf module torch-light at load time so each spawned
+    # worker's re-import is cheap (torch is only needed here, at runtime).
+    import torch
     torch.set_num_threads(1)
 
 
@@ -67,8 +68,18 @@ def run_group_stats_pool(payloads, workers: int):
     the group granularity.
     """
     if workers is None or workers <= 1:
-        _pin_one_thread()
-        return dict(_group_stat_payload(p) for p in payloads)
+        # Pin to 1 thread for the serial spectra determinism, then RESTORE the
+        # parent's thread count — otherwise Stage 3/4/5 (EoRA eigh/SVD,
+        # Router-KD) inherit a 1-thread cap for the rest of the run. The
+        # parallel path's _pin_one_thread runs in WORKER processes (isolated),
+        # never touching the parent — so only the serial leg needs this guard.
+        import torch
+        _saved = torch.get_num_threads()
+        try:
+            _pin_one_thread()
+            return dict(_group_stat_payload(p) for p in payloads)
+        finally:
+            torch.set_num_threads(_saved)
 
     # FORCE spawn — the parent is CUDA-initialized (Stage 3 is GPU-resident);
     # fork-after-CUDA-init deadlocks the child. Precedent humaneval.py:374-381.
