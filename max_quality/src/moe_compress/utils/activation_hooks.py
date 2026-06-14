@@ -976,9 +976,13 @@ class InputCovarianceAccumulator:
     _pending: dict[tuple[int, int, str], torch.Tensor] = field(default_factory=dict)
     _gpu_token_count: dict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))
     _lock: "threading.Lock" = field(default_factory=threading.Lock)
+    _hot_accum_device: str | None = None
 
     def set_storage_dtype(self, dtype: torch.dtype) -> None:
         self.storage_dtype = dtype
+
+    def set_hot_accumulator_device(self, device: str) -> None:
+        self._hot_accum_device = device
 
     def update(
         self, layer_idx: int, expert_idx: int, matrix_name: str, x: torch.Tensor
