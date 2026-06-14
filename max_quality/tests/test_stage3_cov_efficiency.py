@@ -33,3 +33,24 @@ def test_update_gpu_hot_vs_cpu_hot_bitwise():
 
     k = (0, 0, "gate_proj")
     assert torch.equal(acc_gpu.covariance[k], acc_cpu.covariance[k])
+
+
+def test_update_gemm_on_gpu_pending_on_cpu():
+    import pytest
+    import torch
+    from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
+
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA")
+
+    acc = InputCovarianceAccumulator()
+    acc.set_hot_accumulator_device("cpu")
+
+    x = torch.randn(4, 8, device="cuda")
+    acc.update(0, 0, "gate_proj", x)
+
+    k = (0, 0, "gate_proj")
+    assert acc._pending[k].device.type == "cpu", \
+        "_pending must be on CPU when hot_accum_device='cpu'"
+    assert acc._pending[k].abs().max() > 0, \
+        "result must be non-zero (GEMM ran correctly on GPU)"
