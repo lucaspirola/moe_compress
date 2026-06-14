@@ -117,3 +117,20 @@ def test_finalize_layer_already_cpu_pending():
     assert acc.covariance[k].device.type == "cpu"
     expected = (x.T @ x).to(acc.storage_dtype)
     assert torch.allclose(acc.covariance[k], expected, atol=1e-6)
+
+
+def test_default_none_pending_stays_on_input_device():
+    import pytest
+    import torch
+    from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
+
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA")
+
+    acc = InputCovarianceAccumulator()   # _hot_accum_device=None (default)
+    x = torch.randn(4, 8, device="cuda")
+    acc.update(0, 0, "gate_proj", x)
+
+    k = (0, 0, "gate_proj")
+    assert acc._pending[k].device.type == "cuda", \
+        "default path must leave _pending on the input device"
