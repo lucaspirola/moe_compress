@@ -283,3 +283,27 @@ def test_spec_from_config_num_sequences_override_contract():
 
     # cal dict is not mutated
     assert cal["num_sequences"] == 2048
+
+
+def test_resolve_bcov_spec_helper():
+    import pytest
+
+    try:
+        from moe_compress.stage3.orchestrator import _resolve_bcov_spec
+    except ImportError:
+        pytest.fail("_resolve_bcov_spec not yet in orchestrator")
+
+    cal = {
+        "num_sequences": 2048, "sequence_length": 512, "seed": 0,
+        "source": "nvidia-cascade", "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data",
+        "subset_weights": {"math": 1.0},
+    }
+
+    spec_with = _resolve_bcov_spec({"cov_num_sequences": 512}, cal)
+    assert spec_with.num_sequences == 512
+
+    spec_without = _resolve_bcov_spec({}, cal)
+    assert spec_without.num_sequences == 2048
+
+    # cal dict not mutated
+    assert cal["num_sequences"] == 2048

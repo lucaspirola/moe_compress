@@ -158,6 +158,22 @@ def _maybe_cpu_hot_accum(
     return acc
 
 
+def _resolve_bcov_spec(s3: dict, cal: dict):
+    """Build the Stage-3 B/C calibration spec.
+
+    Reads ``stage3_svd.cov_num_sequences``; if set, overrides num_sequences
+    for the cov pass only via spec_from_config's existing kwarg. Does NOT
+    mutate the caller's cal dict. Absent → cal["num_sequences"] unchanged
+    (byte-identical default).
+    """
+    _cov_num_seq = s3.get("cov_num_sequences")
+    return spec_from_config(
+        cal,
+        seed_offset=2,
+        num_sequences_override=int(_cov_num_seq) if _cov_num_seq is not None else None,
+    )
+
+
 def run(
     model,
     tokenizer,
@@ -248,7 +264,7 @@ def run(
     # Use cal["num_sequences"] directly -- do NOT reuse validation_samples here,
     # because validation_samples=0 means "disable PPL alpha-search, use spectral
     # proxy" and must NOT zero out the B-cov calibration pass.
-    spec = spec_from_config(cal, seed_offset=2)
+    spec = _resolve_bcov_spec(s3, cal)
     calib = cal_mod.build_calibration_tensor(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache"
     )
