@@ -275,6 +275,26 @@ def _reset_raw_svd_fallback_warning() -> None:
     _RAW_SVD_FALLBACK_WARNED = False
 
 
+def _alpha_whiten_factor(A64: torch.Tensor) -> torch.Tensor:
+    """Cholesky whitening factor for the α-path spectra.
+
+    F1: replaces the prior eigh-based ``L_A`` (discrete ``keep_a`` threshold,
+    cross-host-unstable) with the unique full-rank lower-triangular Cholesky
+    factor of ``A64 + jitter`` (jitter recipe mirrors d_rank_allocate.py:372-374).
+    The CALLER keeps the ``svdvals(W @ L_C)`` order — do NOT use ``L_C @ W.T``:
+    for a triangular factor ``L_C^T L_C != A``, so ``svdvals(L_C @ W.T)`` is a
+    DIFFERENT, paper-incorrect quantity (reviewer measured 3.95 divergence).
+    ``svdvals(W @ L_C) = sqrt(eig(W (A+jitter) W^T))`` is the correct
+    activation-weighted spectrum (depends on A only through L_C L_C^T = A+jitter).
+
+    ``A64`` MUST already be CPU-fp64 and symmetrized (``0.5*(A+A.T)``).
+    """
+    jitter = 1e-6 * A64.diag().mean().clamp_min(1e-12) * torch.eye(
+        A64.shape[0], dtype=torch.float64
+    )
+    return torch.linalg.cholesky(A64 + jitter)
+
+
 def _snapshot_originals(
     moe_layers: list[MoELayerRef],
 ) -> dict[tuple[int, int, str], torch.Tensor]:
