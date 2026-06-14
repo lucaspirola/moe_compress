@@ -11,3 +11,25 @@ def test_cpu_accum_flag_exists():
     acc = InputCovarianceAccumulator()
     assert hasattr(acc, "_hot_accum_device") and acc._hot_accum_device is None
     assert callable(getattr(acc, "set_hot_accumulator_device", None))
+
+
+def test_update_gpu_hot_vs_cpu_hot_bitwise():
+    import torch
+    from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
+
+    torch.manual_seed(0)
+    d = 16
+    acc_gpu = InputCovarianceAccumulator()
+    acc_cpu = InputCovarianceAccumulator()
+    acc_cpu.set_hot_accumulator_device("cpu")
+
+    for _ in range(3):
+        x = torch.randn(8, d)   # CPU tensor; no CUDA required
+        acc_gpu.update(0, 0, "gate_proj", x)
+        acc_cpu.update(0, 0, "gate_proj", x)
+
+    acc_gpu.finalize_layer(0)
+    acc_cpu.finalize_layer(0)
+
+    k = (0, 0, "gate_proj")
+    assert torch.equal(acc_gpu.covariance[k], acc_cpu.covariance[k])

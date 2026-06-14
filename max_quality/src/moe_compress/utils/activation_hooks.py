@@ -1023,6 +1023,11 @@ class InputCovarianceAccumulator:
         # Matmul on the input's device (typically GPU). The covariance tensor
         # stays on-device — see method docstring for the cross-stream contract.
         cov = flat_f32.transpose(0, 1) @ flat_f32
+        # Opt-in CPU hot-accumulator: the GEMM above stays on the input device
+        # (typically GPU); only the *result* migrates so the running-sum frees
+        # per-layer GPU Gram VRAM. Default path (None) is byte-identical.
+        if self._hot_accum_device is not None:
+            cov = cov.to(self._hot_accum_device)
         n_tok = flat.shape[0]
         key = (layer_idx, expert_idx, matrix_name)
         with self._lock:
