@@ -360,11 +360,16 @@ def _resolve_cov_window(config: dict, n_layers: int) -> int:
     """
     if n_layers <= 0:
         return 1
+    s3 = config.get("stage3_svd") or {}
+    if s3.get("cov_single_pass", False):
+        return n_layers
     mg = config.get("multi_gpu") or {}
     req = mg.get("cov_window_size", "auto")
     if req is None:
         req = "auto"
     if isinstance(req, str):
+        if req.strip().lower() == "all":
+            return n_layers
         if req.strip().lower() != "auto":
             try:
                 req = int(req)
