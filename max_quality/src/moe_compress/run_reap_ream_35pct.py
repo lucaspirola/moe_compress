@@ -148,7 +148,7 @@ import logging
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -174,6 +174,18 @@ log = logging.getLogger(__name__)
 
 # Net compression target (M-C) — these arms target NET-35% after Stage-4 EoRA.
 NET_TARGET = 0.35
+
+
+def _default_num_gpus() -> int:
+    """Detected CUDA device count (floor 1) for the ``--num-gpus`` default.
+
+    Best-effort — a torch import / CUDA probe failure falls back to 1 (the
+    1-GPU path injects no multi-GPU overlay)."""
+    try:
+        import torch
+        return max(1, int(torch.cuda.device_count()))
+    except Exception:  # noqa: BLE001 — no torch / no CUDA ⇒ single-GPU default
+        return 1
 
 
 @dataclass(frozen=True)
@@ -513,7 +525,79 @@ def build_arm_config(
         cfg.setdefault("calibration", {})["num_sequences"] = int(num_sequences)
         s2["num_calibration_samples"] = int(num_sequences)
 
+    # ---- acov whitening (Task 5) ----
+    if whitening_cov not in ("anchor", "shift", "anchored_adaptive"):
+        raise ValueError(
+            f"unknown whitening_cov {whitening_cov!r} (expected anchor/shift/"
+            "anchored_adaptive)")
+    cfg.setdefault("stage4_eora", {})["whitening_cov"] = whitening_cov
+    if whitening_cov != "anchor":
+        # shift / anchored_adaptive REQUIRE the persisted post-2.5 shift cov
+        # (eora_inputs.py:363-371 raises otherwise). Default anchor leaves
+        # persist_shift_covariance UNSET ⇒ byte-identical historical path.
+        cfg.setdefault("stage3_svd", {})["persist_shift_covariance"] = True
+
+    # ---- Multi-GPU overlay (Task 4), gated on num_gpus>=2 ----
+    # num_gpus<2 injects NONE of these ⇒ the 1-GPU path is byte-identical to the
+    # historical config. All these knobs are default-OFF in their stage plugins.
+    if num_gpus >= 2:
+        # Stage-3 cov DP + per-expert SVD + α-grid + Stage-4 EoRA concurrency.
+        # All read top-level config.get("multi_gpu", {}) (stage3/orchestrator.py
+        # :97,119,137 ; stage4/orchestrator.py:80).
+        mg = cfg.setdefault("multi_gpu", {})
+        mg["cov_replicas"] = num_gpus
+        mg["factor_workers"] = num_gpus
+        mg["alpha_workers"] = num_gpus
+        mg["eora_workers"] = num_gpus
+
+        # Stage-2 profile DP. M2: profile_dp is SILENTLY disabled on a Stage-2
+        # *resume* (profile_dp.py:10-14) — if the ream arm crashes mid-Stage-2
+        # and resumes, this enabled=True is overridden to serial with a loud log.
+        # Acceptable; noted so the operator isn't surprised. (Also auto-disables
+        # if a reservoir consumer is active; ream by-the-book uses
+        # cost_alignment="pre" + expert_distill_steps=0 + no merge_step=mergemoe,
+        # so it does NOT auto-disable here.)
+        pdp = cfg["stage2_reap_ream"].setdefault("profile_dp", {})
+        pdp["enabled"] = True
+        pdp["replicas"] = "auto"
+
+        # Stage-2.5 + Stage-5 DDP (both read stage5_router_kd regardless of
+        # stage_key — router_kd/orchestrator.py:200). NO stage6_validate.eval_shard
+        # — this ablation evals via the stage6alt thermometer where eval_shard
+        # does not apply; setting it would be misleading.
+        cfg["stage5_router_kd"]["ddp"] = {
+            "enabled": True, "world_size": num_gpus, "backend": "nccl",
+        }
+        assert_ddp_batch_divisible(cfg, num_gpus)
+        # model.device_map left at base (auto): DP cov replicas / DDP ranks pin
+        # their own GPU via CUDA_VISIBLE_DEVICES and DDP overrides device_map
+        # per-rank, so the parent auto placement is safe.
+
     return cfg
+
+
+def assert_ddp_batch_divisible(cfg: dict, world_size: int) -> None:
+    """DDP guard: ``stage5_router_kd.batch_size`` must be divisible by
+    ``world_size`` (per_gpu = batch / ws must be an integer — ddp_config.py:52-65).
+
+    Validates the AS-WRITTEN config ONLY. ``rkd_paper_recipe`` runs later inside
+    ``router_kd.run()`` (after this runner emits the config) but does NOT touch
+    ``batch_size`` (plan M1), so this pre-check is valid. Reads ``batch_size``
+    with ``.get`` (NOT ``[...]``): an absent batch_size (paper_dials_only does
+    not set one) validates nothing here — the plugin resolves the effective
+    batch downstream — rather than KeyError-ing."""
+    s5 = cfg.get("stage5_router_kd", {}) or {}
+    batch_size = s5.get("batch_size")
+    if batch_size is None:
+        return
+    if int(batch_size) % int(world_size) != 0:
+        raise RuntimeError(
+            f"Router-KD DDP: stage5_router_kd.batch_size={batch_size} is not "
+            f"divisible by world_size={world_size} (per-GPU batch = "
+            f"batch_size/world_size must be an integer). Set batch_size to a "
+            "multiple of world_size (and co-scale gradient_accumulation to keep "
+            "the effective batch fixed) before launching the multi-GPU run."
+        )
 
 
 def assert_paper_recipe_safety(cfg: dict) -> None:
@@ -717,6 +801,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", default=None,
                         help="Comma-separated subset of arm ids "
                              "(e.g. reap-s234,ream-s234)")
+    parser.add_argument(
+        "--num-gpus", type=int, default=_default_num_gpus(),
+        help="GPUs to fan the multi-GPU opt-in features across (Stage-3 cov "
+             "DP/SVD, Stage-4 EoRA threads, Router-KD DDP). Default: detected "
+             "torch.cuda.device_count() (floor 1). num_gpus<2 ⇒ 1-GPU path.")
+    parser.add_argument(
+        "--whitening-cov", default="anchor",
+        choices=("anchor", "shift", "anchored_adaptive"),
+        help="Stage-4 EoRA whitening covariance (acov A/B). Default 'anchor' "
+             "(byte-identical historical path); 'shift'/'anchored_adaptive' "
+             "also persist the Stage-3 shift covariance.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(

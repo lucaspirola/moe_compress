@@ -528,6 +528,69 @@ def test_run_one_arm_ream_runs_both_windows_no_seed(tmp_path, monkeypatch):
     assert _resumes(calls) == [2, 3]
 
 
+# ===========================================================================
+# Task 4: multi-GPU overlay (gated on num_gpus>=2) + DDP divisibility guard
+# ===========================================================================
+
+def _base_mg() -> dict:
+    # batch_size:2 mirrors the real base config (configs/...:459) so the
+    # divisibility guard (2 % 2 == 0) is exercised on real dims.
+    return {"stage5_router_kd": {"save_best": True, "batch_size": 2}}
+
+
+def test_multi_gpu_overlay_injected_when_num_gpus_2():
+    cfg = rr.build_arm_config(_base_mg(), method="faithful_prune",
+                              prune_fraction=0.23, num_gpus=2)
+    mg = cfg["multi_gpu"]
+    assert mg["cov_replicas"] == 2
+    assert mg["factor_workers"] == 2
+    assert mg["alpha_workers"] == 2
+    assert mg["eora_workers"] == 2
+    pdp = cfg["stage2_reap_ream"]["profile_dp"]
+    assert pdp["enabled"] is True
+    assert pdp["replicas"] == "auto"
+    ddp = cfg["stage5_router_kd"]["ddp"]
+    assert ddp == {"enabled": True, "world_size": 2, "backend": "nccl"}
+    # stage6alt path — eval-shard must NOT be set (would no-op / mislead).
+    assert "eval_shard" not in cfg.get("stage6_validate", {})
+    # device_map left at base (auto / unset by build_arm_config).
+    assert cfg.get("model", {}).get("device_map", "auto") == "auto"
+
+
+def test_multi_gpu_overlay_absent_when_num_gpus_1():
+    cfg = rr.build_arm_config(_base_mg(), method="faithful_prune",
+                              prune_fraction=0.23, num_gpus=1)
+    assert "multi_gpu" not in cfg
+    assert "profile_dp" not in cfg.get("stage2_reap_ream", {})
+    assert "ddp" not in cfg["stage5_router_kd"]
+
+
+def test_ddp_batch_divisible_guard_raises_on_odd_batch():
+    cfg = {"stage5_router_kd": {"batch_size": 3}}
+    with pytest.raises(RuntimeError, match="divisible"):
+        rr.assert_ddp_batch_divisible(cfg, 2)
+
+
+def test_ddp_batch_divisible_guard_passes_on_even_batch():
+    cfg = {"stage5_router_kd": {"batch_size": 4}}
+    rr.assert_ddp_batch_divisible(cfg, 2)  # no raise
+
+
+def test_ddp_batch_divisible_guard_noop_when_batch_absent():
+    # batch_size absent ⇒ .get returns None ⇒ guard validates nothing (the
+    # plugin resolves the effective batch later); must NOT KeyError.
+    rr.assert_ddp_batch_divisible({"stage5_router_kd": {}}, 2)
+    rr.assert_ddp_batch_divisible({}, 2)
+
+
+def test_multi_gpu_overlay_guard_trips_on_odd_base_batch():
+    # num_gpus=2 with an odd base batch_size must raise via the in-builder guard.
+    base = {"stage5_router_kd": {"save_best": True, "batch_size": 3}}
+    with pytest.raises(RuntimeError, match="divisible"):
+        rr.build_arm_config(base, method="faithful_prune",
+                            prune_fraction=0.23, num_gpus=2)
+
+
 # --- small tmp helpers for the iso-K REAM-pin write/read ---
 
 import contextlib  # noqa: E402
