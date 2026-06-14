@@ -76,3 +76,24 @@ def test_update_cross_gpu_hot_vs_cpu_hot_bitwise():
 
     k = (0, 0, "gate_proj")
     assert torch.equal(acc_gpu.covariance[k], acc_cpu.covariance[k])
+
+
+def test_update_cross_pending_on_cpu_after_gpu_compute():
+    import pytest
+    import torch
+    from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
+
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA")
+
+    acc = InputCovarianceAccumulator()
+    acc.set_hot_accumulator_device("cpu")
+
+    cross = torch.randn(8, 8, device="cuda")
+    acc.update_cross(0, 0, "gate_proj", cross, n_tokens=4)
+
+    k = (0, 0, "gate_proj")
+    assert acc._pending[k].device.type == "cpu", \
+        "_pending must be on CPU when hot_accum_device='cpu'"
+    expected = cross.to(torch.float32).cpu()
+    assert torch.equal(acc._pending[k], expected)
