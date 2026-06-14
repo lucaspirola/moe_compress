@@ -212,3 +212,47 @@ def test_maybe_cpu_hot_accum_helper():
     # (c) returns the same accumulator object (for chaining / call-site clarity)
     assert result is acc_on
     assert result_off is acc_off
+
+
+def test_single_pass_detection_case_and_whitespace_insensitive():
+    """The orchestrator's `_single_pass` "all" detection must normalize
+    case/whitespace IDENTICALLY to `_resolve_cov_window`. Otherwise spellings
+    like "ALL" / " all " make the cov window collapse to G=N (all layers hooked)
+    while `_single_pass` stays False, the CPU hot-accumulator is never engaged,
+    and the all-layer Grams stay GPU-resident → the OOM Task B exists to prevent.
+    """
+    from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
+    from moe_compress.stage3.orchestrator import _maybe_cpu_hot_accum
+
+    # Mirror the orchestrator's `_single_pass` expression exactly.
+    def _single_pass(s3: dict, mg: dict) -> bool:
+        raw = mg.get("cov_window_size", "auto")
+        return bool(
+            s3.get("cov_single_pass", False)
+            or (isinstance(raw, str) and raw.strip().lower() == "all")
+        )
+
+    # Non-lowercase / whitespace "all" spellings must engage single-pass (and
+    # thus the CPU hot-accumulator at every call site).
+    for spelling in ("all", "ALL", "All", " all ", "\tAll\n"):
+        sp = _single_pass({}, {"cov_window_size": spelling})
+        assert sp is True, f"{spelling!r} must be detected as single-pass"
+        acc = InputCovarianceAccumulator()
+        _maybe_cpu_hot_accum(acc, sp)
+        assert acc._hot_accum_device == "cpu", \
+            f"helper must migrate to CPU for cov_window_size={spelling!r}"
+
+    # cov_single_pass: true also engages regardless of window spelling.
+    assert _single_pass({"cov_single_pass": True}, {}) is True
+
+    # A real int window and "auto" must NOT trigger single-pass.
+    for non_sp in (8, "auto", "AUTO", " auto "):
+        sp = _single_pass({}, {"cov_window_size": non_sp})
+        assert sp is False, f"{non_sp!r} must NOT be single-pass"
+        acc = InputCovarianceAccumulator()
+        _maybe_cpu_hot_accum(acc, sp)
+        assert acc._hot_accum_device is None, \
+            f"helper must be a no-op for cov_window_size={non_sp!r}"
+
+    # Absent multi_gpu / cov_window_size (default path) → not single-pass.
+    assert _single_pass({}, {}) is False

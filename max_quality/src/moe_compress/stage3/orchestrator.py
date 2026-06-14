@@ -269,9 +269,10 @@ def run(
 
     B_acc = InputCovarianceAccumulator()
     B_acc.set_storage_dtype(B_cov_dtype)
+    _cov_window_raw = (config.get("multi_gpu") or {}).get("cov_window_size", "auto")
     _single_pass = (
         s3.get("cov_single_pass", False)
-        or (config.get("multi_gpu") or {}).get("cov_window_size", "auto") == "all"
+        or (isinstance(_cov_window_raw, str) and _cov_window_raw.strip().lower() == "all")
     )
     _maybe_cpu_hot_accum(B_acc, _single_pass)
 
