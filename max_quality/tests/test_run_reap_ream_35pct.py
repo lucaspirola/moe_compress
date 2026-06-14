@@ -428,6 +428,106 @@ def test_seed_stage2p5_from_hub_raises_on_missing_shard(tmp_path):
         rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=_bad_dl)
 
 
+# ===========================================================================
+# Task 3: run_one_arm honors the per-arm spec (seed + windows)
+# ===========================================================================
+
+def _seed_shared_stage1(shared_dir):
+    """Place the three shared Stage-1 artifacts seed_stage1_artifacts copies."""
+    import json as _j
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    (shared_dir / "stage1_blacklist.json").write_text("{}", encoding="utf-8")
+    (shared_dir / "budget_decomposition.json").write_text(
+        _j.dumps({"svd_rank_ratio": 0.1}), encoding="utf-8")
+    (shared_dir / "stage1_budgets.json").write_text(
+        _j.dumps({"per_layer_target_experts": {str(i): 999 for i in range(4)},
+                  "per_layer_redundancy": {}}), encoding="utf-8")
+
+
+def _install_fake_subprocess(monkeypatch, probe_root, arm_id):
+    """Monkeypatch subprocess.run to record argv and create the expected output
+    dirs (stage2p5_final/ when a window stops at 2; stage6alt_eval.json when a
+    window stops at 6)."""
+    import json as _j
+    calls = []
+
+    def _fake_run(argv, check=False, **kw):
+        calls.append(list(argv))
+        arm_dir = probe_root / arm_id
+        stop = int(argv[argv.index("--stop-after-stage") + 1])
+        if stop == 2:
+            (arm_dir / "stage2p5_final").mkdir(parents=True, exist_ok=True)
+        if stop >= 6:
+            (arm_dir / rr.STAGE6ALT_ARTIFACT).write_text(
+                _j.dumps({"student_bpt": 3.0}), encoding="utf-8")
+
+        class _R:
+            returncode = 0
+        return _R()
+
+    monkeypatch.setattr(rr.subprocess, "run", _fake_run)
+    return calls
+
+
+def _resumes(calls):
+    return [int(a[a.index("--resume-from-stage") + 1]) for a in calls]
+
+
+def test_run_one_arm_reap_seeds_and_resumes_at_3(tmp_path, monkeypatch):
+    """A seeded (reap) arm calls _seed_stage2p5_from_hub BEFORE the loop, then
+    issues exactly ONE pipeline call resuming at stage 3 (NO --resume-from-stage
+    2)."""
+    probe_root = tmp_path / "probe"
+    shared_dir = probe_root / "_shared"
+    _seed_shared_stage1(shared_dir)
+    calls = _install_fake_subprocess(monkeypatch, probe_root, "reap-s234")
+
+    seed_calls = []
+
+    def _fake_seed(repo, arm_dir, **kw):
+        seed_calls.append(repo)
+        (arm_dir / "stage2p5_final").mkdir(parents=True, exist_ok=True)
+        return arm_dir / "stage2p5_final"
+
+    monkeypatch.setattr(rr, "_seed_stage2p5_from_hub", _fake_seed)
+
+    spec = next(s for s in rr.ARM_SPECS if s.arm_id == "reap-s234")
+    rr.run_one_arm(
+        spec=spec, base_config={"stage5_router_kd": {"save_best": True}},
+        budget={"prune_fraction": 0.23, "K": 200}, shared_dir=shared_dir,
+        probe_root=probe_root, model_repo="fake/repo", num_sequences=8,
+        num_gpus=1, whitening_cov="anchor",
+    )
+
+    assert seed_calls == ["pirola/reap-s234-stage2p5-final"]
+    assert _resumes(calls) == [3]
+    assert 2 not in _resumes(calls)
+
+
+def test_run_one_arm_ream_runs_both_windows_no_seed(tmp_path, monkeypatch):
+    """A non-seeded (ream) arm issues the 2→2 then 3→6 pair and NEVER calls the
+    seed helper."""
+    probe_root = tmp_path / "probe"
+    shared_dir = probe_root / "_shared"
+    _seed_shared_stage1(shared_dir)
+    calls = _install_fake_subprocess(monkeypatch, probe_root, "ream-s234")
+
+    seed_calls = []
+    monkeypatch.setattr(rr, "_seed_stage2p5_from_hub",
+                        lambda *a, **k: seed_calls.append(a))
+
+    spec = next(s for s in rr.ARM_SPECS if s.arm_id == "ream-s234")
+    rr.run_one_arm(
+        spec=spec, base_config={"stage5_router_kd": {"save_best": True}},
+        budget={"prune_fraction": 0.23, "K": 200}, shared_dir=shared_dir,
+        probe_root=probe_root, model_repo="fake/repo", num_sequences=8,
+        num_gpus=1, whitening_cov="anchor",
+    )
+
+    assert seed_calls == []  # no seed for ream
+    assert _resumes(calls) == [2, 3]
+
+
 # --- small tmp helpers for the iso-K REAM-pin write/read ---
 
 import contextlib  # noqa: E402

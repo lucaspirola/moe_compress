@@ -456,6 +456,7 @@ def _verify_stage2p5_content(final_dir: Path) -> None:
 def build_arm_config(
     base: dict, *, method: str, prune_fraction: float,
     num_sequences: int | None = None,
+    num_gpus: int = 1, whitening_cov: str = "anchor",
 ) -> dict:
     """Build one arm's config from the faithful base config.
 
@@ -623,14 +624,25 @@ def is_complete(arm_dir: Path) -> bool:
 
 
 def run_one_arm(
-    *, arm_id: str, method: str, base_config: dict, budget: dict[str, Any],
+    *, spec: ArmSpec, base_config: dict, budget: dict[str, Any],
     shared_dir: Path, probe_root: Path, model_repo: str, num_sequences: int,
+    num_gpus: int = 1, whitening_cov: str = "anchor",
 ) -> dict[str, Any]:
-    """Drive one arm Stage 2 → 2.5 → 3 → 4 → 5 → 6 (two subprocesses; see D1).
+    """Drive one arm through its ``spec.stage_windows`` (see D1).
 
-    Idempotent: a present stage6alt_eval.json short-circuits. Seeds the
-    uniform-K Stage-1 artifacts (H-A step 4 — pin for BOTH arms) before Stage 2.
+    A ``seed_hub_repo`` arm (reap) materializes its post-2.5 ``stage2p5_final/``
+    from the Hub BEFORE the loop, then runs ONLY its ``(3, 6)`` window (zero
+    ``--resume-from-stage 2`` calls). A non-seeded arm (ream) runs all windows in
+    order — its own Stage 2 + auto-2.5, then Stage 3→6 — with the
+    ``stage2p5_final/`` existence guard between a stop@2 and the next window.
+
+    ``seed_stage1_artifacts`` runs for BOTH arms (the survivor guard reads
+    ``_shared/`` even for reap; harmless and already present).
+
+    Idempotent: a present stage6alt_eval.json short-circuits; a seeded reap
+    re-run does not re-download (the seed helper is itself idempotent).
     """
+    arm_id, method = spec.arm_id, spec.method
     arm_dir = probe_root / arm_id
     arm_dir.mkdir(parents=True, exist_ok=True)
 
@@ -643,6 +655,7 @@ def run_one_arm(
     cfg = build_arm_config(
         base_config, method=method,
         prune_fraction=budget["prune_fraction"], num_sequences=num_sequences,
+        num_gpus=num_gpus, whitening_cov=whitening_cov,
     )
     assert_paper_recipe_safety(cfg)
     cfg_path = _write_config(cfg, arm_dir)
@@ -652,31 +665,30 @@ def run_one_arm(
     # REAP too. survivors=K passed EXPLICITLY (default is run_probe's 166).
     seed_stage1_artifacts(arm_dir, shared_dir, group="ream", survivors=budget["K"])
 
-    # ---- (a) Stage 2 + auto Stage 2.5 → stage2p5_final/ ----
-    log.info("[%s] Stage 2 + 2.5 (method=%s, K=%d) → stage2p5_final/",
-             arm_id, method, budget["K"])
-    rc1 = subprocess.run(
-        _pipeline_argv(cfg_path, model_repo, arm_dir,
-                       resume=ARM_STAGE_WINDOWS[0][0], stop=ARM_STAGE_WINDOWS[0][1]),
-        check=False,
-    ).returncode
-    if rc1 != 0:
-        raise RuntimeError(f"[{arm_id}] Stage 2/2.5 returned exit code {rc1}")
-    if not (arm_dir / "stage2p5_final").exists():
-        raise RuntimeError(
-            f"[{arm_id}] Stage 2.5 exited 0 but stage2p5_final/ is absent — "
-            "refusing to resume Stage 3 on a missing post-2.5 checkpoint."
-        )
+    # A seeded arm places its post-2.5 checkpoint on disk so its (3,6) window
+    # resumes from a real stage2p5_final/ — no Stage-2/2.5 subprocess at all.
+    if spec.seed_hub_repo is not None:
+        log.info("[%s] seeding post-2.5 checkpoint from %s (Stage 2/2.5 SKIPPED)",
+                 arm_id, spec.seed_hub_repo)
+        _seed_stage2p5_from_hub(spec.seed_hub_repo, arm_dir)
 
-    # ---- (b) Stage 3 → 4 → 5 → 6 (loads stage2p5_final/ per STAGE_REGISTRY) ----
-    log.info("[%s] Stage 3 → 4 → 5 → 6alt", arm_id)
-    rc2 = subprocess.run(
-        _pipeline_argv(cfg_path, model_repo, arm_dir,
-                       resume=ARM_STAGE_WINDOWS[1][0], stop=ARM_STAGE_WINDOWS[1][1]),
-        check=False,
-    ).returncode
-    if rc2 != 0:
-        raise RuntimeError(f"[{arm_id}] Stage 3-6 returned exit code {rc2}")
+    for resume, stop in spec.stage_windows:
+        log.info("[%s] Stage %d → %d (method=%s, K=%d)",
+                 arm_id, resume, stop, method, budget["K"])
+        rc = subprocess.run(
+            _pipeline_argv(cfg_path, model_repo, arm_dir, resume=resume, stop=stop),
+            check=False,
+        ).returncode
+        if rc != 0:
+            raise RuntimeError(
+                f"[{arm_id}] Stage {resume}-{stop} returned exit code {rc}")
+        # Post-2.5 (stop@2) checkpoint guard: the next window resumes@3 and must
+        # find stage2p5_final/ on disk.
+        if stop == 2 and not (arm_dir / "stage2p5_final").exists():
+            raise RuntimeError(
+                f"[{arm_id}] Stage 2.5 exited 0 but stage2p5_final/ is absent — "
+                "refusing to resume Stage 3 on a missing post-2.5 checkpoint."
+            )
 
     if not is_complete(arm_dir):
         raise RuntimeError(
