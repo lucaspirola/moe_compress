@@ -54,3 +54,32 @@ def test_pin_one_thread_initializer():
         assert torch.get_num_threads() == 1
     finally:
         torch.set_num_threads(saved)
+
+
+def _eff_rank_under_threads(payload, nthreads):
+    from moe_compress.stage3.plugins.d_rank_allocate import _group_stat
+    from moe_compress.stage3.spectra_pool import _ListBank
+    saved = torch.get_num_threads()
+    try:
+        torch.set_num_threads(nthreads)
+        gs = _group_stat(payload.n_experts, _ListBank(payload.weights_cpu),
+                         A_g=payload.a_g_cpu)
+        return gs.effective_rank, gs.singular_values_mean.clone()
+    finally:
+        torch.set_num_threads(saved)
+
+
+def test_thread_pinning_holds_the_bits():
+    """The 1-thread path is the canonical reduction; the pool worker reproduces
+    it bit-for-bit. (The 1-vs-N-thread numeric DIFFERENCE is matrix-size
+    dependent — the F2 doc measured ~1e-11 on real [2048,1536] shapes; the tiny
+    16x12 fixture may not reassociate, so we do NOT hard-assert inequality. The
+    load-bearing contract is worker(1-thread) == reference(1-thread).)"""
+    payload = _make_payload(seed=7)
+    er1, sv1 = _eff_rank_under_threads(payload, 1)
+    from moe_compress.stage3.spectra_pool import _group_stat_payload, _pin_one_thread
+    _pin_one_thread()
+    assert torch.get_num_threads() == 1
+    _, gs_w = _group_stat_payload(payload)
+    assert gs_w.effective_rank == er1
+    assert torch.equal(gs_w.singular_values_mean, sv1)
