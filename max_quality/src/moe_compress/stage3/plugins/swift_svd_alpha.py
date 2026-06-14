@@ -1419,14 +1419,14 @@ def _redistribute_ranks_swift_svd_plus(
                 if A is not None:
                     A64 = A.to(device="cpu", dtype=torch.float64)
                     A64 = 0.5 * (A64 + A64.T)
-                    eigvals_a, eigvecs_a = torch.linalg.eigh(A64)
-                    keep_a = eigvals_a > eigvals_a.max() * 1e-6
-                    if keep_a.any():
-                        L_A = eigvecs_a[:, keep_a] * eigvals_a[keep_a].clamp_min(1e-12).sqrt().unsqueeze(0)
-                        svs = torch.linalg.svdvals(W @ L_A)
-                    else:
+                    try:
+                        # F1: identical Cholesky whitening as producer 1 so the
+                        # Tier-1 torch.equal cache precondition holds. KEEP W @ L_C.
+                        L_C = _alpha_whiten_factor(A64)
+                        svs = torch.linalg.svdvals(W @ L_C)
+                    except Exception:
                         _warn_raw_svd_fallback_once(
-                            "A_cov is rank-zero / empty after eigh thresholding "
+                            "A_cov Cholesky failed / rank-zero "
                             "(in _redistribute_ranks_swift_svd_plus)"
                         )
                         svs = torch.linalg.svdvals(W)
