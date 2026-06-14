@@ -131,3 +131,15 @@ def test_group_stat_rank_map_equal_across_workers():
             Tb = _compute_T_budget(base, svd_rank_ratio=ratio)
             Tc = _compute_T_budget(cand, svd_rank_ratio=ratio)
             assert _d_rank_allocate(base, Tb) == _d_rank_allocate(cand, Tc), (w, ratio)
+
+
+def test_group_stat_worker_order_invariant():
+    """workers in {1,2,4} → identical effective_rank (exact) + singular_values_mean."""
+    payloads = _build_multigroup_payloads()
+    ref = _run_group_stats(payloads, workers=1)
+    for w in (2, 4):
+        got = _run_group_stats(payloads, workers=w)
+        for key in ref:
+            assert got[key].effective_rank == ref[key].effective_rank, (w, key)
+            assert torch.equal(got[key].singular_values_mean,
+                               ref[key].singular_values_mean), (w, key)
