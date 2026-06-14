@@ -344,6 +344,26 @@ def _iter_windows(seq, window_size: int):
         yield seq[start:start + g]
 
 
+def _resolve_single_pass(config: dict) -> bool:
+    """Single source of truth for the single-pass G=N detection.
+
+    True when ``stage3_svd.cov_single_pass`` is set, OR when
+    ``multi_gpu.cov_window_size`` is the case/whitespace-insensitive sentinel
+    ``"all"``. Used by BOTH the in-process orchestrator (to engage the CPU
+    hot-accumulator on its B_acc/C_acc handles) AND the DP replica worker (to
+    engage it on the worker's OWN collection accumulators). Keeping the
+    detection here — the module the orchestrator already imports from — ensures
+    the two paths can never drift, which would re-open the all-40-layer
+    GPU-resident-Gram OOM that Task B exists to prevent.
+    """
+    s3 = config.get("stage3_svd") or {}
+    raw = (config.get("multi_gpu") or {}).get("cov_window_size", "auto")
+    return bool(
+        s3.get("cov_single_pass", False)
+        or (isinstance(raw, str) and raw.strip().lower() == "all")
+    )
+
+
 def _resolve_cov_window(config: dict, n_layers: int) -> int:
     """Resolve the cov collection window size G ∈ [1, n_layers].
 
@@ -360,11 +380,16 @@ def _resolve_cov_window(config: dict, n_layers: int) -> int:
     """
     if n_layers <= 0:
         return 1
+    s3 = config.get("stage3_svd") or {}
+    if s3.get("cov_single_pass", False):
+        return n_layers
     mg = config.get("multi_gpu") or {}
     req = mg.get("cov_window_size", "auto")
     if req is None:
         req = "auto"
     if isinstance(req, str):
+        if req.strip().lower() == "all":
+            return n_layers
         if req.strip().lower() != "auto":
             try:
                 req = int(req)
@@ -1119,6 +1144,7 @@ def _cov_replica_worker(
     ccov_replica_dir,
     cross_cov_enabled: bool,
     bcov_storage_dtype: str,
+    cov_num_sequences_override: int | None = None,
 ) -> None:
     """Spawn target: one data-parallel replica. Pins itself to its GPU subset
     via ``CUDA_VISIBLE_DEVICES``, reloads teacher+student, runs
@@ -1150,8 +1176,14 @@ def _cov_replica_worker(
     B_dtype = getattr(_torch, bcov_storage_dtype)
 
     # Rebuild the SAME calibration tensor, then slice this replica's shard.
+    # MUST thread cov_num_sequences_override so the replica's rebuilt spec has
+    # the SAME num_sequences as the parent's _resolve_bcov_spec-built calib;
+    # otherwise the parent's shard bounds (computed against the override-length
+    # tensor) slice a differently-sized worker calib → corrupted reduction.
     cal = config["calibration"]
-    spec = _spec_from_config(cal, seed_offset=2)
+    spec = _spec_from_config(
+        cal, seed_offset=2, num_sequences_override=cov_num_sequences_override
+    )
     student, tokenizer, _ = _load_compressed_model(
         student_path,
         device_map=config["model"]["device_map"],
@@ -1192,11 +1224,21 @@ def _cov_replica_worker(
         pass
     cov_window_size = _resolve_cov_window(_cfg_for_window, len(moe_layers))
 
+    # Single-pass (G=N) engages the CPU hot-accumulator on the worker's OWN
+    # collection accumulators — same detection the orchestrator uses for its
+    # parent-side handles (shared _resolve_single_pass). Without this, a
+    # cov_single_pass + cov_replicas>1 run accumulates all N layers' Grams
+    # GPU-resident inside the worker → the exact OOM Task B prevents. Default
+    # (no single-pass) → False → no migration → byte-identical.
+    single_pass = _resolve_single_pass(config)
+
     teacher_model = None
     teacher_moe_layers = None
     C_acc = None
     B_acc = InputCovarianceAccumulator()
     B_acc.set_storage_dtype(B_dtype)
+    if single_pass:
+        B_acc.set_hot_accumulator_device("cpu")
     if cross_cov_enabled:
         teacher_model, _ = _load_model(
             config["model"]["name_or_path"],
@@ -1212,6 +1254,8 @@ def _cov_replica_worker(
         teacher_moe_layers = list(_iter_moe_layers(teacher_model))
         C_acc = InputCovarianceAccumulator()
         C_acc.set_storage_dtype(B_dtype)
+        if single_pass:
+            C_acc.set_hot_accumulator_device("cpu")
 
     _Path(bcov_replica_dir).mkdir(parents=True, exist_ok=True)
     if ccov_replica_dir is not None:
@@ -1280,6 +1324,12 @@ def run_dp_covariance_collection(
     ccov_spill_dir = _Path(ccov_spill_dir) if ccov_spill_dir is not None else None
     store_dtype = getattr(_torch, bcov_storage_dtype)
 
+    # Mirror _resolve_bcov_spec's read of stage3_svd.cov_num_sequences so every
+    # replica builds the SAME spec as the in-process path. None → no override.
+    _s3 = config.get("stage3_svd") or {}
+    _cov_num_seq = _s3.get("cov_num_sequences")
+    _cov_num_seq_override = int(_cov_num_seq) if _cov_num_seq is not None else None
+
     bcov_replica_dirs = []
     ccov_replica_dirs = []
     spawn_args = []
@@ -1298,7 +1348,7 @@ def run_dp_covariance_collection(
         spawn_args.append(
             (r, visible, config, str(artifacts_dir), str(student_path),
              start, end, str(b_dir), (str(c_dir) if c_dir is not None else None),
-             cross_cov_enabled, bcov_storage_dtype)
+             cross_cov_enabled, bcov_storage_dtype, _cov_num_seq_override)
         )
         start = end
 

@@ -976,9 +976,13 @@ class InputCovarianceAccumulator:
     _pending: dict[tuple[int, int, str], torch.Tensor] = field(default_factory=dict)
     _gpu_token_count: dict[tuple[int, int, str], int] = field(default_factory=lambda: defaultdict(int))
     _lock: "threading.Lock" = field(default_factory=threading.Lock)
+    _hot_accum_device: str | None = None
 
     def set_storage_dtype(self, dtype: torch.dtype) -> None:
         self.storage_dtype = dtype
+
+    def set_hot_accumulator_device(self, device: str) -> None:
+        self._hot_accum_device = device
 
     def update(
         self, layer_idx: int, expert_idx: int, matrix_name: str, x: torch.Tensor
@@ -1019,6 +1023,11 @@ class InputCovarianceAccumulator:
         # Matmul on the input's device (typically GPU). The covariance tensor
         # stays on-device — see method docstring for the cross-stream contract.
         cov = flat_f32.transpose(0, 1) @ flat_f32
+        # Opt-in CPU hot-accumulator: the GEMM above stays on the input device
+        # (typically GPU); only the *result* migrates so the running-sum frees
+        # per-layer GPU Gram VRAM. Default path (None) is byte-identical.
+        if self._hot_accum_device is not None:
+            cov = cov.to(self._hot_accum_device)
         n_tok = flat.shape[0]
         key = (layer_idx, expert_idx, matrix_name)
         with self._lock:
@@ -1069,6 +1078,11 @@ class InputCovarianceAccumulator:
             return
         key = (layer_idx, expert_idx, matrix_name)
         cross_f32 = cross.to(torch.float32)
+        # Opt-in CPU hot-accumulator (Task A): the caller computes ``cross`` on
+        # the input device (typically GPU); only the result migrates so the
+        # running-sum frees per-layer GPU VRAM. Default path (None) byte-identical.
+        if self._hot_accum_device is not None:
+            cross_f32 = cross_f32.to(self._hot_accum_device)
         with self._lock:
             cur = self._pending.get(key)
             if cur is None:
@@ -1088,12 +1102,10 @@ class InputCovarianceAccumulator:
                          for k in keys]
             storage_dtype = self.storage_dtype  # capture under lock
 
-        # Phase 2: cast to storage dtype on the source device (typically GPU)
-        # and then transfer once to CPU. Doing the dtype cast first keeps the
-        # wire transfer at the storage-dtype byte width (e.g. half the volume
-        # for bf16/fp16). The pending tensors now live on GPU until this call
-        # (see update() — the prior per-call .cpu() was removed to eliminate
-        # ~256 GPU→CPU syncs per batch).
+        # Phase 2: cast to storage dtype on the source device and transfer to CPU.
+        # When _hot_accum_device="cpu" the pending tensors already live on CPU;
+        # .cpu() is a no-op and the dtype cast is device-local. Default path
+        # (None) retains the original single GPU→CPU transfer per key.
         cpu_items = [(k, gpu_cov.to(storage_dtype).cpu(), n_tok)
                      for k, gpu_cov, n_tok in gpu_items]
 

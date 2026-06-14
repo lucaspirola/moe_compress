@@ -146,14 +146,15 @@ def test_run_backoff_adopts_start_when_fits():
     def run_fn(b): calls.append(b); return f"ok@{b}"
     assert run_with_oom_backoff(run_fn, start_batch=32, floor=1) == "ok@32" and calls == [32]
 
-def test_run_backoff_halves_on_oom_and_reruns():
+def test_run_backoff_steps_down_on_oom_and_reruns():
     calls = []
     def run_fn(b):
         calls.append(b)
-        if b > 8: raise torch.cuda.OutOfMemoryError("boom")   # 32,16 OOM; 8 fits
+        if b > 8: raise torch.cuda.OutOfMemoryError("boom")   # all >8 OOM; first <=8 fits
         return f"ok@{b}"
-    assert run_with_oom_backoff(run_fn, start_batch=32, floor=1) == "ok@8"
-    assert calls == [32, 16, 8]                                 # REAL re-invocation at each smaller batch
+    assert run_with_oom_backoff(run_fn, start_batch=32, floor=1) == "ok@6"
+    # gentler x0.75 backoff (capped at attempt-1): 32->24->18->13->9->6
+    assert calls == [32, 24, 18, 13, 9, 6]                      # REAL re-invocation at each smaller batch
 
 def test_run_backoff_never_below_floor_and_reraises_if_floor_ooms():
     calls = []
@@ -161,4 +162,4 @@ def test_run_backoff_never_below_floor_and_reraises_if_floor_ooms():
         calls.append(b); raise torch.cuda.OutOfMemoryError("boom")  # everything OOMs
     with pytest.raises(torch.cuda.OutOfMemoryError):
         run_with_oom_backoff(run_fn, start_batch=8, floor=4)
-    assert calls == [8, 4]                                       # halved 8->4, floor OOM -> reraise, never <4
+    assert calls == [8, 6, 4]                                    # x0.75 8->6->4, floor OOM -> reraise, never <4

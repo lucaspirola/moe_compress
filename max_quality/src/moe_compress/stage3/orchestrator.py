@@ -142,6 +142,39 @@ def _resolve_alpha_workers(config: dict) -> int:
     return max(1, min(requested, n_gpu))
 
 
+def _maybe_cpu_hot_accum(
+    acc: "InputCovarianceAccumulator",
+    single_pass: bool,
+) -> "InputCovarianceAccumulator":
+    """Opt-in CPU hot-accumulator for single-pass cov collection.
+
+    When ``single_pass`` is True, migrates the running-sum device to CPU
+    immediately after GPU GEMM (Task A), preventing all-40-layer GPU Gram
+    residency from OOMing a single-pass G=N run. No-op when False (default
+    path unchanged). Returns ``acc`` for chaining.
+    """
+    if single_pass:
+        acc.set_hot_accumulator_device("cpu")
+    return acc
+
+
+def _resolve_bcov_spec(s3: dict, cal: dict):
+    """Build the Stage-3 B/C calibration spec.
+
+    Reads ``stage3_svd.cov_num_sequences``; if set, overrides num_sequences
+    for the cov pass only via spec_from_config's existing kwarg. Does NOT
+    mutate the caller's cal dict. Absent → cal["num_sequences"] unchanged
+    (byte-identical default). Note: cov_num_sequences=0 raises ValueError via
+    spec_from_config's num_sequences>0 check.
+    """
+    _cov_num_seq = s3.get("cov_num_sequences")
+    return spec_from_config(
+        cal,
+        seed_offset=2,
+        num_sequences_override=int(_cov_num_seq) if _cov_num_seq is not None else None,
+    )
+
+
 def run(
     model,
     tokenizer,
@@ -232,7 +265,7 @@ def run(
     # Use cal["num_sequences"] directly -- do NOT reuse validation_samples here,
     # because validation_samples=0 means "disable PPL alpha-search, use spectral
     # proxy" and must NOT zero out the B-cov calibration pass.
-    spec = spec_from_config(cal, seed_offset=2)
+    spec = _resolve_bcov_spec(s3, cal)
     calib = cal_mod.build_calibration_tensor(
         tokenizer, spec, cache_dir=artifacts_dir / "_calibration_cache"
     )
@@ -253,6 +286,9 @@ def run(
 
     B_acc = InputCovarianceAccumulator()
     B_acc.set_storage_dtype(B_cov_dtype)
+    from .plugins.covariance_collection import _resolve_single_pass
+    _single_pass = _resolve_single_pass(config)
+    _maybe_cpu_hot_accum(B_acc, _single_pass)
 
     # Cross-covariance C = X_pre^T @ X_post (AA-SVD Theorem 3.2, paper 2604.02119).
     # Requires both the original (teacher) model and the pruned (student) model
@@ -418,6 +454,7 @@ def run(
         if cross_cov_enabled:
             C_acc = InputCovarianceAccumulator()
             C_acc.set_storage_dtype(B_cov_dtype)
+            _maybe_cpu_hot_accum(C_acc, _single_pass)
         # Load the teacher even on resume if Phase C.5 is enabled -- its block
         # forwards are required for the anchored MSE objective. Skip the
         # ~60 s / 70 GB load only when block_refine is off.
@@ -477,6 +514,7 @@ def run(
         if cross_cov_enabled:
             C_acc = InputCovarianceAccumulator()
             C_acc.set_storage_dtype(B_cov_dtype)
+            _maybe_cpu_hot_accum(C_acc, _single_pass)
         # Load the parent teacher only if Phase C.5 (block_refine) needs it; the
         # collection itself was done by the child replicas.
         if bool(s3.get("block_refine", {}).get("enabled", False)):
@@ -517,6 +555,7 @@ def run(
             if cross_cov_enabled:
                 C_acc = InputCovarianceAccumulator()
                 C_acc.set_storage_dtype(B_cov_dtype)
+                _maybe_cpu_hot_accum(C_acc, _single_pass)
                 log.info("Stage 3: dual-forward covariance collection (B + cross-cov C), batch_size=%d",
                          bcov_batch_size)
             else:
