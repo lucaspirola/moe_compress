@@ -373,3 +373,41 @@ def test_run_with_oom_backoff_gentler_sequence():
     assert attempts == [18, 13, 9], f"expected [18, 13, 9], got {attempts}"
     assert result == 9
     assert len(attempts) > 2, "must take more steps than halving ([18, 9])"
+
+
+def test_run_with_oom_backoff_floor_reraise():
+    import pytest, torch
+    from moe_compress.utils.auto_batch import run_with_oom_backoff
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA for OutOfMemoryError class")
+
+    def _always_oom(batch):
+        raise torch.cuda.OutOfMemoryError("always")
+
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        run_with_oom_backoff(_always_oom, start_batch=4, floor=4)
+
+
+def test_run_with_oom_backoff_strict_decrease_to_floor():
+    import pytest, torch
+    from moe_compress.utils.auto_batch import run_with_oom_backoff
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA for OutOfMemoryError class")
+
+    attempts = []
+
+    def _run(batch):
+        attempts.append(batch)
+        if batch > 2:
+            raise torch.cuda.OutOfMemoryError("oom")
+        return batch
+
+    result = run_with_oom_backoff(_run, start_batch=100, floor=2)
+    assert result == 2
+
+    for i in range(1, len(attempts)):
+        assert attempts[i] < attempts[i - 1], \
+            f"not strictly decreasing at index {i}: {attempts}"
+    assert attempts[-1] == 2
