@@ -428,6 +428,39 @@ def test_seed_stage2p5_from_hub_raises_on_missing_shard(tmp_path):
         rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=_bad_dl)
 
 
+def test_seed_stage2p5_self_heals_partial_then_succeeds(tmp_path):
+    """H1: a partial-copy (metadata present but a shard missing) must (1) RAISE
+    on the first call AND wipe final_dir, so (2) a retry with a now-complete
+    downloader re-downloads and succeeds — the partial dir must not block all
+    retries forever."""
+    import json as _j
+    from pathlib import Path as _P
+    arm_dir = tmp_path / "reap-s234"
+    final = arm_dir / "stage2p5_final"
+
+    def _partial_dl(*, repo_id, local_dir, **kw):
+        root = _P(local_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "config.json").write_text("{}", encoding="utf-8")
+        (root / "compressed_metadata.json").write_text("{}", encoding="utf-8")
+        # index references a shard that is NOT placed (simulated mid-copy fill)
+        (root / "model.safetensors.index.json").write_text(
+            _j.dumps({"weight_map": {"w": "model-00001-of-00001.safetensors"}}),
+            encoding="utf-8")
+        return str(local_dir)
+
+    with pytest.raises(RuntimeError, match="shard"):
+        rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=_partial_dl)
+    # self-heal: the partial checkpoint dir is gone so the next call re-downloads
+    assert not final.exists()
+
+    good = _fake_downloader(False)
+    rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=good)
+    assert (final / "compressed_metadata.json").exists()
+    assert (final / "model-00001-of-00001.safetensors").exists()
+    assert good.calls["n"] == 1  # the retry actually re-downloaded
+
+
 # ===========================================================================
 # Task 3: run_one_arm honors the per-arm spec (seed + windows)
 # ===========================================================================
@@ -650,6 +683,7 @@ def test_cli_parses_whitening_cov_and_num_gpus(monkeypatch):
 
 import contextlib  # noqa: E402
 import json as _json  # noqa: E402
+import shutil as _shutil  # noqa: E402
 import tempfile as _tempfile  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
 
@@ -657,12 +691,18 @@ from pathlib import Path as _Path  # noqa: E402
 @contextlib.contextmanager
 def _tmp_json(obj):
     d = _tempfile.mkdtemp()
-    p = _Path(d) / "shared_budgets.json"
-    p.write_text(_json.dumps(obj), encoding="utf-8")
-    yield p
+    try:
+        p = _Path(d) / "shared_budgets.json"
+        p.write_text(_json.dumps(obj), encoding="utf-8")
+        yield p
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)
 
 
 @contextlib.contextmanager
 def _tmp_path():
     d = _tempfile.mkdtemp()
-    yield _Path(d) / "stage1_budgets.json"
+    try:
+        yield _Path(d) / "stage1_budgets.json"
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)

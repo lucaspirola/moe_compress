@@ -331,7 +331,8 @@ def derive_solver_budget(model, base_config: dict) -> dict[str, Any]:
 # HF seed — place a post-2.5 stage2p5_final/ checkpoint on disk for a seeded arm
 # ---------------------------------------------------------------------------
 
-# The 4 file KINDS a resume@3 needs in stage2p5_final/ (run_pipeline.py:516-535).
+# The 3 required METADATA files a resume@3 needs in stage2p5_final/
+# (shards handled separately below; run_pipeline.py:516-535).
 _STAGE2P5_REQUIRED = (
     "config.json",
     "model.safetensors.index.json",
@@ -370,8 +371,17 @@ def _seed_stage2p5_from_hub(
     if meta_path.exists():
         log.info("[seed] %s already present — skipping Hub download (idempotent)",
                  meta_path)
-        _verify_stage2p5_content(final_dir)
-        return final_dir
+        # Self-heal: if the existing dir is a half-checkpoint (e.g. a prior run
+        # filled the disk mid-shard-copy), wipe it so this call re-downloads
+        # rather than re-raising forever on every retry.
+        try:
+            _verify_stage2p5_content(final_dir)
+        except Exception:
+            log.warning("[seed] existing %s failed content-verify — wiping the "
+                        "partial checkpoint and re-downloading", final_dir)
+            shutil.rmtree(final_dir, ignore_errors=True)
+        else:
+            return final_dir
 
     final_dir.mkdir(parents=True, exist_ok=True)
     snap_root = arm_dir / "_hub_snapshot_stage2p5"
@@ -392,8 +402,9 @@ def _seed_stage2p5_from_hub(
         )
 
     # Copy the checkpoint files (config + index + metadata + every shard) into
-    # arm_dir/stage2p5_final/. Shards are matched by the model-*.safetensors glob
-    # plus whatever the index names, so non-standard shard names still transfer.
+    # arm_dir/stage2p5_final/. The pipeline's save_compressed_checkpoint ALWAYS
+    # emits the multi-shard + index layout, so shards are matched by the
+    # model-*.safetensors glob.
     for name in _STAGE2P5_REQUIRED:
         src = src_root / name
         if not src.exists():
@@ -404,10 +415,6 @@ def _seed_stage2p5_from_hub(
         shutil.copy2(src, final_dir / name)
     for shard in src_root.glob("model-*.safetensors"):
         shutil.copy2(shard, final_dir / shard.name)
-    # Also carry any single-file model.safetensors if that is the layout.
-    single = src_root / "model.safetensors"
-    if single.exists():
-        shutil.copy2(single, final_dir / single.name)
 
     # Optional _shared/ metadata ride-along: copy only what is MISSING locally
     # (do not clobber a locally-seeded _shared/).
@@ -419,7 +426,14 @@ def _seed_stage2p5_from_hub(
             if f.is_file() and not (dst_shared / f.name).exists():
                 shutil.copy2(f, dst_shared / f.name)
 
-    _verify_stage2p5_content(final_dir)
+    # Self-heal: a FAILED post-copy verify (e.g. disk filled mid-shard-copy)
+    # wipes the partial dir before raising, so the next call re-downloads rather
+    # than short-circuiting forever on the present-but-incomplete metadata.
+    try:
+        _verify_stage2p5_content(final_dir)
+    except Exception:
+        shutil.rmtree(final_dir, ignore_errors=True)
+        raise
     log.info("[seed] placed + content-verified %s", final_dir)
     return final_dir
 
@@ -457,7 +471,8 @@ def _verify_stage2p5_content(final_dir: Path) -> None:
             f"[seed] {len(missing)} shard(s) listed in the index are absent from "
             f"{final_dir}: {missing[:5]}{'...' if len(missing) > 5 else ''}. The "
             "post-2.5 download is incomplete — refusing to resume Stage 3 on a "
-            "half-checkpoint (would silently fall back to stage2_pruned)."
+            "half-checkpoint (would silently fall back to stage2_pruned). "
+            f"Delete {final_dir} to retry."
         )
 
 
