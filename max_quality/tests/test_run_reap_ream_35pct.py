@@ -596,11 +596,12 @@ def test_multi_gpu_overlay_guard_trips_on_odd_base_batch():
 # ===========================================================================
 
 def test_whitening_cov_default_anchor_no_persist_shift():
-    """Default anchor ⇒ whitening_cov=='anchor' AND persist_shift_covariance
-    NOT set (byte-identical historical path)."""
+    """Default anchor ⇒ NEITHER key emitted (byte-identical historical path):
+    no stage4_eora.whitening_cov (anchor IS the plugin default) AND no
+    stage3_svd.persist_shift_covariance."""
     cfg = rr.build_arm_config(_base(), method="faithful_prune",
                               prune_fraction=0.23)  # default whitening_cov
-    assert cfg["stage4_eora"]["whitening_cov"] == "anchor"
+    assert "whitening_cov" not in cfg.get("stage4_eora", {})
     assert "persist_shift_covariance" not in cfg.get("stage3_svd", {})
 
 

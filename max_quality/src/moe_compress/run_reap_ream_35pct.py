@@ -530,11 +530,13 @@ def build_arm_config(
         raise ValueError(
             f"unknown whitening_cov {whitening_cov!r} (expected anchor/shift/"
             "anchored_adaptive)")
-    cfg.setdefault("stage4_eora", {})["whitening_cov"] = whitening_cov
     if whitening_cov != "anchor":
-        # shift / anchored_adaptive REQUIRE the persisted post-2.5 shift cov
-        # (eora_inputs.py:363-371 raises otherwise). Default anchor leaves
-        # persist_shift_covariance UNSET ⇒ byte-identical historical path.
+        # Opt-in only: 'anchor' IS the plugin default (eora_inputs.py:363
+        # s4.get("whitening_cov", "anchor")), so the default path emits NEITHER
+        # key ⇒ byte-identical to the historical config. shift / anchored_adaptive
+        # set whitening_cov AND REQUIRE the persisted post-2.5 shift cov
+        # (eora_inputs.py:363-371 raises without persist_shift_covariance).
+        cfg.setdefault("stage4_eora", {})["whitening_cov"] = whitening_cov
         cfg.setdefault("stage3_svd", {})["persist_shift_covariance"] = True
 
     # ---- Multi-GPU overlay (Task 4), gated on num_gpus>=2 ----
