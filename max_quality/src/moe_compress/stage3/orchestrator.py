@@ -142,6 +142,22 @@ def _resolve_alpha_workers(config: dict) -> int:
     return max(1, min(requested, n_gpu))
 
 
+def _maybe_cpu_hot_accum(
+    acc: "InputCovarianceAccumulator",
+    single_pass: bool,
+) -> "InputCovarianceAccumulator":
+    """Opt-in CPU hot-accumulator for single-pass cov collection.
+
+    When ``single_pass`` is True, migrates the running-sum device to CPU
+    immediately after GPU GEMM (Task A), preventing all-40-layer GPU Gram
+    residency from OOMing a single-pass G=N run. No-op when False (default
+    path unchanged). Returns ``acc`` for chaining.
+    """
+    if single_pass:
+        acc.set_hot_accumulator_device("cpu")
+    return acc
+
+
 def run(
     model,
     tokenizer,
@@ -253,6 +269,11 @@ def run(
 
     B_acc = InputCovarianceAccumulator()
     B_acc.set_storage_dtype(B_cov_dtype)
+    _single_pass = (
+        s3.get("cov_single_pass", False)
+        or (config.get("multi_gpu") or {}).get("cov_window_size", "auto") == "all"
+    )
+    _maybe_cpu_hot_accum(B_acc, _single_pass)
 
     # Cross-covariance C = X_pre^T @ X_post (AA-SVD Theorem 3.2, paper 2604.02119).
     # Requires both the original (teacher) model and the pruned (student) model
@@ -418,6 +439,7 @@ def run(
         if cross_cov_enabled:
             C_acc = InputCovarianceAccumulator()
             C_acc.set_storage_dtype(B_cov_dtype)
+            _maybe_cpu_hot_accum(C_acc, _single_pass)
         # Load the teacher even on resume if Phase C.5 is enabled -- its block
         # forwards are required for the anchored MSE objective. Skip the
         # ~60 s / 70 GB load only when block_refine is off.
@@ -477,6 +499,7 @@ def run(
         if cross_cov_enabled:
             C_acc = InputCovarianceAccumulator()
             C_acc.set_storage_dtype(B_cov_dtype)
+            _maybe_cpu_hot_accum(C_acc, _single_pass)
         # Load the parent teacher only if Phase C.5 (block_refine) needs it; the
         # collection itself was done by the child replicas.
         if bool(s3.get("block_refine", {}).get("enabled", False)):
@@ -517,6 +540,7 @@ def run(
             if cross_cov_enabled:
                 C_acc = InputCovarianceAccumulator()
                 C_acc.set_storage_dtype(B_cov_dtype)
+                _maybe_cpu_hot_accum(C_acc, _single_pass)
                 log.info("Stage 3: dual-forward covariance collection (B + cross-cov C), batch_size=%d",
                          bcov_batch_size)
             else:
