@@ -63,7 +63,7 @@ from .plugins.covariance_collection import (
     CovarianceCollectionPlugin,
     _load_stage2_covariance,
 )
-from .plugins.d_rank_allocate import DRankAllocatePlugin, _GroupStats, _group_stat
+from .plugins.d_rank_allocate import DRankAllocatePlugin, _GroupStats
 from .plugins.input_cov_cache import Stage3InputCovCacheProvider
 from .plugins.swift_svd_alpha import (
     SwiftSvdAlphaPlugin,
@@ -654,16 +654,19 @@ def run(
     # build_banks / _cov_lookup); only _compute_T_budget + _d_rank_allocate
     # live inside DRankAllocatePlugin.allocate_ranks.
     log.info("Stage 3: computing per-group stats over %d layers", len(moe_layers))
-    group_stats: dict[tuple[int, str], _GroupStats] = {}
+    spectra_workers = int(s3.get("spectra_workers", 1))
+    from .spectra_pool import _GroupStatPayload, run_group_stats_pool  # noqa: PLC0415
+
+    # Group-average pre-prune input covariance for D-Rank whitening.
+    # Spec section 6 Phase B.1: gate/up share `A_gate_up` (hidden-state
+    # input); down_proj uses `A_down` (intermediate-activation input).
+    # These come from Stage 2 `_stage2_input_covariance.pt` (already loaded
+    # into `A_cov`). We average across experts in the group since the
+    # spec stipulates a single covariance per (layer, matrix_type).
+    payloads: list[_GroupStatPayload] = []
     for k, ref in enumerate(moe_layers):
         log.info("  group-stat layer %d/%d (idx=%d)", k + 1, len(moe_layers), ref.layer_idx)
         banks = build_banks(ref)
-        # Group-average pre-prune input covariance for D-Rank whitening.
-        # Spec section 6 Phase B.1: gate/up share `A_gate_up` (hidden-state
-        # input); down_proj uses `A_down` (intermediate-activation input).
-        # These come from Stage 2 `_stage2_input_covariance.pt` (already loaded
-        # into `A_cov`). We average across experts in the group since the
-        # spec stipulates a single covariance per (layer, matrix_type).
         for name in MATRIX_NAMES:
             cov_key_name = "gate_proj" if name == "up_proj" else name
             covs = []
@@ -672,9 +675,25 @@ def run(
                 if t is not None:
                     covs.append(t.to(torch.float32))
             A_g = torch.stack(covs).mean(0) if covs else None
-            group_stats[(ref.layer_idx, name)] = _group_stat(
-                ref.num_routed_experts, banks[name], A_g=A_g,
-            )
+            # Hoist the .cpu() to the dispatch site so ONLY CPU tensors cross the
+            # process boundary (CPU torch tensor serialization is bit-exact).
+            # bank.get(e) MUST run in the parent (banks hold live module refs,
+            # not serializable). Ship the bank's NATIVE dtype to CPU and let
+            # _group_stat do its own fp64 cast — matching today's exact sequence
+            # so the default path is byte-identical (A_g was already .to(float32)
+            # above, as in the old loop).
+            weights_cpu = [
+                banks[name].get(e).detach().to("cpu")
+                for e in range(ref.num_routed_experts)
+            ]
+            a_g_cpu = A_g.to("cpu") if A_g is not None else None
+            payloads.append(_GroupStatPayload(
+                ref.layer_idx, name, ref.num_routed_experts, weights_cpu, a_g_cpu,
+            ))
+
+    group_stats: dict[tuple[int, str], _GroupStats] = run_group_stats_pool(
+        payloads, workers=spectra_workers,
+    )
 
     run_ctx.set("group_stats", group_stats)
     walk_phases(("allocate_ranks",), plugins, run_ctx)

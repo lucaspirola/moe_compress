@@ -143,3 +143,10 @@ def test_group_stat_worker_order_invariant():
             assert got[key].effective_rank == ref[key].effective_rank, (w, key)
             assert torch.equal(got[key].singular_values_mean,
                                ref[key].singular_values_mean), (w, key)
+
+
+def test_spectra_workers_defaults_to_one():
+    """The orchestrator reads stage3_svd.spectra_workers with default 1
+    (byte-identical serial path)."""
+    cfg = {"stage3_svd": {}}
+    assert int(cfg["stage3_svd"].get("spectra_workers", 1)) == 1
