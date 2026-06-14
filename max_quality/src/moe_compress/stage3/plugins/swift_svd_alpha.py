@@ -1231,14 +1231,18 @@ def _swift_svd_plus_alpha_search(
                 try:
                     # F1: Cholesky whitening — host-stable, full-rank, no
                     # discrete keep_a threshold. KEEP svdvals(W @ L_C) order.
+                    # Narrow except: only a non-PD cholesky (LinAlgError) is the
+                    # rank-zero fallback; a real bug in svdvals(W @ L_C)
+                    # (shape/OOM/LAPACK) must propagate, not be mislabelled.
                     L_C = _alpha_whiten_factor(A64)
-                    svs = torch.linalg.svdvals(W @ L_C)
-                except Exception:
+                except torch.linalg.LinAlgError:
                     _warn_raw_svd_fallback_once(
                         "A_cov Cholesky failed / rank-zero "
                         "(in _swift_svd_plus_alpha_search)"
                     )
                     svs = torch.linalg.svdvals(W)
+                else:
+                    svs = torch.linalg.svdvals(W @ L_C)
             else:
                 _warn_raw_svd_fallback_once(
                     "A_cov=None passed to _swift_svd_plus_alpha_search"
@@ -1428,14 +1432,17 @@ def _redistribute_ranks_swift_svd_plus(
                     try:
                         # F1: identical Cholesky whitening as producer 1 so the
                         # Tier-1 torch.equal cache precondition holds. KEEP W @ L_C.
+                        # Narrow except (see producer 1): only LinAlgError is the
+                        # rank-zero fallback; svdvals(W @ L_C) bugs must propagate.
                         L_C = _alpha_whiten_factor(A64)
-                        svs = torch.linalg.svdvals(W @ L_C)
-                    except Exception:
+                    except torch.linalg.LinAlgError:
                         _warn_raw_svd_fallback_once(
                             "A_cov Cholesky failed / rank-zero "
                             "(in _redistribute_ranks_swift_svd_plus)"
                         )
                         svs = torch.linalg.svdvals(W)
+                    else:
+                        svs = torch.linalg.svdvals(W @ L_C)
                 else:
                     _warn_raw_svd_fallback_once(
                         "A_cov=None passed to _redistribute_ranks_swift_svd_plus"

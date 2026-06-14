@@ -1,9 +1,9 @@
 {
   "T_budget": 27,
   "alpha_by_type": {
-    "down_proj": 0.5,
+    "down_proj": 1.0,
     "gate_proj": 1.0,
-    "up_proj": 0.0
+    "up_proj": 1.0
   },
   "config": {
     "aa_svd": {
@@ -36,8 +36,8 @@
   },
   "per_layer_ranks": {
     "0": {
-      "down_proj": 4,
-      "gate_proj": 5,
+      "down_proj": 5,
+      "gate_proj": 4,
       "up_proj": 4
     },
     "1": {
@@ -47,17 +47,17 @@
     }
   },
   "rank_map": {
-    "L0_E0_down_proj": 3,
-    "L0_E0_gate_proj": 4,
-    "L0_E0_up_proj": 3,
-    "L0_E1_down_proj": 5,
-    "L0_E1_gate_proj": 6,
-    "L0_E1_up_proj": 5,
-    "L1_E0_down_proj": 3,
-    "L1_E0_gate_proj": 6,
-    "L1_E0_up_proj": 5,
-    "L1_E1_down_proj": 5,
-    "L1_E1_gate_proj": 4,
-    "L1_E1_up_proj": 5
+    "L0_E0_down_proj": 6,
+    "L0_E0_gate_proj": 5,
+    "L0_E0_up_proj": 5,
+    "L0_E1_down_proj": 4,
+    "L0_E1_gate_proj": 3,
+    "L0_E1_up_proj": 3,
+    "L1_E0_down_proj": 2,
+    "L1_E0_gate_proj": 4,
+    "L1_E0_up_proj": 4,
+    "L1_E1_down_proj": 6,
+    "L1_E1_gate_proj": 6,
+    "L1_E1_up_proj": 6
   }
 }
