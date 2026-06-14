@@ -820,6 +820,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     log.info("===== Full-pipeline REAP-vs-REAM @ net-35% (ours arms) =====")
     log.info("%s", _PAPER_BASELINE_NOTE)
+    log.info("num_gpus=%d (multi-GPU overlay %s), whitening_cov=%s",
+             args.num_gpus, "ON" if args.num_gpus >= 2 else "OFF (1-GPU)",
+             args.whitening_cov)
 
     base_config = yaml.safe_load(Path(args.config).read_text())
     if args.model:
