@@ -258,6 +258,55 @@ def test_single_pass_detection_case_and_whitespace_insensitive():
     assert _single_pass({}, {}) is False
 
 
+def test_resolve_single_pass_shared_helper():
+    """The shared `_resolve_single_pass(config)` — single source of truth used by
+    BOTH the orchestrator and the DP replica worker — must detect the same
+    spellings/negatives as the inline expression it replaced.
+    """
+    from moe_compress.stage3.plugins.covariance_collection import _resolve_single_pass
+
+    # "all" spellings (case/whitespace-insensitive) → single-pass.
+    for spelling in ("all", "ALL", "All", " all ", "\tAll\n"):
+        assert _resolve_single_pass({"multi_gpu": {"cov_window_size": spelling}}) is True, \
+            f"{spelling!r} must be single-pass"
+
+    # cov_single_pass: true → single-pass regardless of window.
+    assert _resolve_single_pass({"stage3_svd": {"cov_single_pass": True}}) is True
+    assert _resolve_single_pass(
+        {"stage3_svd": {"cov_single_pass": True}, "multi_gpu": {"cov_window_size": 8}}
+    ) is True
+
+    # Int window / "auto" / absent → NOT single-pass (default byte-identical path).
+    for non_sp in (8, "auto", "AUTO", " auto ", None):
+        assert _resolve_single_pass({"multi_gpu": {"cov_window_size": non_sp}}) is False, \
+            f"{non_sp!r} must NOT be single-pass"
+    assert _resolve_single_pass({}) is False
+    assert _resolve_single_pass({"stage3_svd": {}, "multi_gpu": {}}) is False
+
+
+def test_dp_replica_worker_engages_cpu_hot_under_single_pass():
+    """CRITICAL seam guard: the DP replica worker creates its OWN B_acc/C_acc and
+    runs the actual _collect_covariances. Under single-pass (G=N) it MUST engage
+    the CPU hot-accumulator on BOTH, or all N layers' Grams stay GPU-resident →
+    OOM. The worker is a model-loading subprocess, so we guard the seam at the
+    source level: the worker body must resolve single_pass via the shared helper
+    and call set_hot_accumulator_device("cpu") on both accumulators.
+    """
+    import inspect
+
+    from moe_compress.stage3.plugins import covariance_collection as cc
+
+    src = inspect.getsource(cc._cov_replica_worker)
+    assert "_resolve_single_pass(config)" in src, \
+        "worker must resolve single-pass via the shared helper"
+    assert "single_pass" in src
+    # Both accumulators engage CPU-hot under single_pass.
+    assert 'B_acc.set_hot_accumulator_device("cpu")' in src, \
+        "worker must engage CPU-hot on B_acc under single-pass"
+    assert 'C_acc.set_hot_accumulator_device("cpu")' in src, \
+        "worker must engage CPU-hot on C_acc under single-pass"
+
+
 # ---------------------------------------------------------------------------
 # Task C — cov_num_sequences knob
 # ---------------------------------------------------------------------------

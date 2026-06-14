@@ -344,6 +344,26 @@ def _iter_windows(seq, window_size: int):
         yield seq[start:start + g]
 
 
+def _resolve_single_pass(config: dict) -> bool:
+    """Single source of truth for the single-pass G=N detection.
+
+    True when ``stage3_svd.cov_single_pass`` is set, OR when
+    ``multi_gpu.cov_window_size`` is the case/whitespace-insensitive sentinel
+    ``"all"``. Used by BOTH the in-process orchestrator (to engage the CPU
+    hot-accumulator on its B_acc/C_acc handles) AND the DP replica worker (to
+    engage it on the worker's OWN collection accumulators). Keeping the
+    detection here — the module the orchestrator already imports from — ensures
+    the two paths can never drift, which would re-open the all-40-layer
+    GPU-resident-Gram OOM that Task B exists to prevent.
+    """
+    s3 = config.get("stage3_svd") or {}
+    raw = (config.get("multi_gpu") or {}).get("cov_window_size", "auto")
+    return bool(
+        s3.get("cov_single_pass", False)
+        or (isinstance(raw, str) and raw.strip().lower() == "all")
+    )
+
+
 def _resolve_cov_window(config: dict, n_layers: int) -> int:
     """Resolve the cov collection window size G ∈ [1, n_layers].
 
@@ -1204,11 +1224,21 @@ def _cov_replica_worker(
         pass
     cov_window_size = _resolve_cov_window(_cfg_for_window, len(moe_layers))
 
+    # Single-pass (G=N) engages the CPU hot-accumulator on the worker's OWN
+    # collection accumulators — same detection the orchestrator uses for its
+    # parent-side handles (shared _resolve_single_pass). Without this, a
+    # cov_single_pass + cov_replicas>1 run accumulates all N layers' Grams
+    # GPU-resident inside the worker → the exact OOM Task B prevents. Default
+    # (no single-pass) → False → no migration → byte-identical.
+    single_pass = _resolve_single_pass(config)
+
     teacher_model = None
     teacher_moe_layers = None
     C_acc = None
     B_acc = InputCovarianceAccumulator()
     B_acc.set_storage_dtype(B_dtype)
+    if single_pass:
+        B_acc.set_hot_accumulator_device("cpu")
     if cross_cov_enabled:
         teacher_model, _ = _load_model(
             config["model"]["name_or_path"],
@@ -1224,6 +1254,8 @@ def _cov_replica_worker(
         teacher_moe_layers = list(_iter_moe_layers(teacher_model))
         C_acc = InputCovarianceAccumulator()
         C_acc.set_storage_dtype(B_dtype)
+        if single_pass:
+            C_acc.set_hot_accumulator_device("cpu")
 
     _Path(bcov_replica_dir).mkdir(parents=True, exist_ok=True)
     if ccov_replica_dir is not None:

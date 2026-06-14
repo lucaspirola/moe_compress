@@ -286,11 +286,8 @@ def run(
 
     B_acc = InputCovarianceAccumulator()
     B_acc.set_storage_dtype(B_cov_dtype)
-    _cov_window_raw = (config.get("multi_gpu") or {}).get("cov_window_size", "auto")
-    _single_pass = (
-        s3.get("cov_single_pass", False)
-        or (isinstance(_cov_window_raw, str) and _cov_window_raw.strip().lower() == "all")
-    )
+    from .plugins.covariance_collection import _resolve_single_pass
+    _single_pass = _resolve_single_pass(config)
     _maybe_cpu_hot_accum(B_acc, _single_pass)
 
     # Cross-covariance C = X_pre^T @ X_post (AA-SVD Theorem 3.2, paper 2604.02119).
