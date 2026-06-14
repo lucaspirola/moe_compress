@@ -1102,12 +1102,10 @@ class InputCovarianceAccumulator:
                          for k in keys]
             storage_dtype = self.storage_dtype  # capture under lock
 
-        # Phase 2: cast to storage dtype on the source device (typically GPU)
-        # and then transfer once to CPU. Doing the dtype cast first keeps the
-        # wire transfer at the storage-dtype byte width (e.g. half the volume
-        # for bf16/fp16). The pending tensors now live on GPU until this call
-        # (see update() — the prior per-call .cpu() was removed to eliminate
-        # ~256 GPU→CPU syncs per batch).
+        # Phase 2: cast to storage dtype on the source device and transfer to CPU.
+        # When _hot_accum_device="cpu" the pending tensors already live on CPU;
+        # .cpu() is a no-op and the dtype cast is device-local. Default path
+        # (None) retains the original single GPU→CPU transfer per key.
         cpu_items = [(k, gpu_cov.to(storage_dtype).cpu(), n_tok)
                      for k, gpu_cov, n_tok in gpu_items]
 

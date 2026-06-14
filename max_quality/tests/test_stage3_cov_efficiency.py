@@ -97,3 +97,23 @@ def test_update_cross_pending_on_cpu_after_gpu_compute():
         "_pending must be on CPU when hot_accum_device='cpu'"
     expected = cross.to(torch.float32).cpu()
     assert torch.equal(acc._pending[k], expected)
+
+
+def test_finalize_layer_already_cpu_pending():
+    import torch
+    from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
+
+    acc = InputCovarianceAccumulator()
+    acc.set_hot_accumulator_device("cpu")
+    x = torch.randn(6, 10)
+    acc.update(0, 2, "gate_proj", x)
+
+    k = (0, 2, "gate_proj")
+    assert acc._pending[k].device.type == "cpu"
+
+    acc.finalize_layer(0)
+
+    assert k in acc.covariance
+    assert acc.covariance[k].device.type == "cpu"
+    expected = (x.T @ x).to(acc.storage_dtype)
+    assert torch.allclose(acc.covariance[k], expected, atol=1e-6)
