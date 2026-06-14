@@ -140,10 +140,9 @@ def test_grouped_svs_cache_precondition_torch_equal():
             W = banks[name].get(e).detach().to(device="cpu", dtype=torch.float64)
             A = A_cov[(layer_idx, e, name)].to(device="cpu", dtype=torch.float64)
             A = 0.5 * (A + A.T)
-            ev, evec = torch.linalg.eigh(A)
-            keep = ev > ev.max() * 1e-6
-            L_A = evec[:, keep] * ev[keep].clamp_min(1e-12).sqrt().unsqueeze(0)
-            inline = torch.linalg.svdvals(W @ L_A)
+            from moe_compress.stage3.plugins.swift_svd_alpha import _alpha_whiten_factor
+            L_C = _alpha_whiten_factor(A)
+            inline = torch.linalg.svdvals(W @ L_C)
             assert torch.equal(grouped_svs[name][(layer_idx, e)], inline), (
                 f"proxy spectrum != inline recompute for {name} expert {e}"
             )

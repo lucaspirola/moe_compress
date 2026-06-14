@@ -239,6 +239,40 @@ def patched_stage3_alpha(request, monkeypatch, tiny_config, tiny_config_bf16):
     monkeypatch.setattr(stage2_reap_ream, "save_compressed_checkpoint", _noop_save)
     monkeypatch.setattr(stage3_svd, "save_compressed_checkpoint", _noop_save)
 
+    # F1 coverage: the tiny-model Stage-2 covariance is near-singular, so the
+    # α-path's ``torch.linalg.cholesky`` raises and the golden would exercise
+    # only the rank-zero FALLBACK (``svdvals(W)``), NOT the Cholesky whitening
+    # the fix is about. Re-condition the loaded A_cov to a guaranteed-SPD matrix
+    # of the SAME shape (``M @ M.T + dim·I`` — strictly positive-definite, like
+    # ``_build_acov`` in the Tier-1 tests) so Stage-3's α-path runs real Cholesky
+    # end-to-end. This wraps the real loader (preserving every key/shape) and
+    # touches ONLY the α-variant fixture; the non-α fixture/golden and the ×0.02
+    # weight scale are untouched.
+    from moe_compress.stage3 import orchestrator as s3_orch
+    _real_loader = s3_orch._load_stage2_covariance
+
+    # Process-STABLE seed from the key contents (NOT Python ``hash()``, which is
+    # salted per-process via PYTHONHASHSEED → would make the golden
+    # non-reproducible between the regen run and the verify run).
+    _MATRIX_SEED = {"gate_proj": 0, "up_proj": 1, "down_proj": 2}
+
+    def _stable_seed(key):
+        layer_idx, expert_idx, name = key
+        return 1009 + 131 * int(layer_idx) + 17 * int(expert_idx) + _MATRIX_SEED.get(name, 7)
+
+    def _spd_loader(path):
+        cov = _real_loader(path)
+        spd = {}
+        for key, mat in cov.items():
+            mat = mat.to(torch.float64)
+            dim = mat.shape[-1]
+            g = torch.Generator().manual_seed(_stable_seed(key))
+            M = torch.randn(dim, dim, generator=g, dtype=torch.float64)
+            spd[key] = ((M @ M.T) + dim * torch.eye(dim, dtype=torch.float64)).to(mat.dtype)
+        return spd
+
+    monkeypatch.setattr(s3_orch, "_load_stage2_covariance", _spd_loader)
+
     return cfg
 
 
@@ -256,12 +290,35 @@ def stage3_alpha_case(request):
 # Tier-2 rank diff. Until they are committed, this test fails with
 # "golden missing" (expected on the impl branch; green once the goldens land).
 def test_stage3_rank_map_alpha_variant_byte_identical(
-    tiny_model, patched_stage3_alpha, stage3_alpha_case, tmp_path
+    tiny_model, patched_stage3_alpha, stage3_alpha_case, tmp_path, caplog
 ):
+    # F1 coverage proof: reset the warn-once latch and capture WARNING-level
+    # logs so we can assert the α-path took the REAL Cholesky branch (not the
+    # rank-zero fallback) on the re-conditioned, guaranteed-SPD A_cov.
+    import logging
+    from moe_compress.stage3.plugins.swift_svd_alpha import (
+        _reset_raw_svd_fallback_warning,
+    )
+    _reset_raw_svd_fallback_warning()
+
     decomp = _run_stages_012(tiny_model, patched_stage3_alpha, tmp_path)
-    stage3_svd.run(
-        tiny_model, _TinyTokenizer(), patched_stage3_alpha, tmp_path, decomp,
-        device=None,
+    with caplog.at_level(logging.WARNING):
+        stage3_svd.run(
+            tiny_model, _TinyTokenizer(), patched_stage3_alpha, tmp_path, decomp,
+            device=None,
+        )
+
+    # The whole point of F1 is the Cholesky whitening path; assert it actually
+    # ran end-to-end here (the re-conditioned SPD A_cov never triggers the
+    # cholesky LinAlgError fallback). If this fires, the golden would be pinning
+    # the fallback svdvals(W), proving nothing about the fix.
+    fallback_msgs = [
+        r.getMessage() for r in caplog.records
+        if "D-raw-svd-fallback" in r.getMessage()
+    ]
+    assert not fallback_msgs, (
+        "α-path took the rank-zero/Cholesky-failed FALLBACK instead of the "
+        f"Cholesky whitening path — golden does not exercise the fix:\n{fallback_msgs}"
     )
 
     produced = tmp_path / "stage3_svd" / "rank_map.json"

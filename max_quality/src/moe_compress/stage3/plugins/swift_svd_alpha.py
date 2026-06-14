@@ -238,6 +238,12 @@ from .d_rank_allocate import _GroupStats
 
 log = logging.getLogger(__name__)
 
+# F1 §3.2: relative tie-break so a near-tied α never depends on float ordering.
+# Larger than residual fp64 round-off (~1e-13..1e-15) after Cholesky whitening,
+# smaller than any meaningful spectral gap (35B gate_proj real gap ~1.4%).
+# Ties resolve to the lowest grid index / lowest α (matches strict-< + _argmin_alpha).
+ALPHA_ERR_REL_TOL = 1e-9
+
 # M1 / D-raw-svd-fallback: emit ONE warning per process the first time we fall
 # through to raw svdvals(W) because A_cov is None. Subsequent calls are silent
 # (one warning is enough — flooding the log buys nothing). Reset by reloading
@@ -273,6 +279,26 @@ def _reset_raw_svd_fallback_warning() -> None:
     """
     global _RAW_SVD_FALLBACK_WARNED
     _RAW_SVD_FALLBACK_WARNED = False
+
+
+def _alpha_whiten_factor(A64: torch.Tensor) -> torch.Tensor:
+    """Cholesky whitening factor for the α-path spectra.
+
+    F1: replaces the prior eigh-based ``L_A`` (discrete ``keep_a`` threshold,
+    cross-host-unstable) with the unique full-rank lower-triangular Cholesky
+    factor of ``A64 + jitter`` (jitter recipe mirrors d_rank_allocate.py:372-374).
+    The CALLER keeps the ``svdvals(W @ L_C)`` order — do NOT use ``L_C @ W.T``:
+    for a triangular factor ``L_C^T L_C != A``, so ``svdvals(L_C @ W.T)`` is a
+    DIFFERENT, paper-incorrect quantity (reviewer measured 3.95 divergence).
+    ``svdvals(W @ L_C) = sqrt(eig(W (A+jitter) W^T))`` is the correct
+    activation-weighted spectrum (depends on A only through L_C L_C^T = A+jitter).
+
+    ``A64`` MUST already be CPU-fp64 and symmetrized (``0.5*(A+A.T)``).
+    """
+    jitter = 1e-6 * A64.diag().mean().clamp_min(1e-12) * torch.eye(
+        A64.shape[0], dtype=torch.float64
+    )
+    return torch.linalg.cholesky(A64 + jitter)
 
 
 def _snapshot_originals(
@@ -1202,18 +1228,21 @@ def _swift_svd_plus_alpha_search(
             if A is not None:
                 A64 = A.to(device="cpu", dtype=torch.float64)
                 A64 = 0.5 * (A64 + A64.T)
-                eigvals_a, eigvecs_a = torch.linalg.eigh(A64)
-                keep_a = eigvals_a > eigvals_a.max() * 1e-6
-                if keep_a.any():
-                    L_A = eigvecs_a[:, keep_a] * eigvals_a[keep_a].clamp_min(1e-12).sqrt().unsqueeze(0)
-                    M_A = W @ L_A
-                    svs = torch.linalg.svdvals(M_A)
-                else:
+                try:
+                    # F1: Cholesky whitening — host-stable, full-rank, no
+                    # discrete keep_a threshold. KEEP svdvals(W @ L_C) order.
+                    # Narrow except: only a non-PD cholesky (LinAlgError) is the
+                    # rank-zero fallback; a real bug in svdvals(W @ L_C)
+                    # (shape/OOM/LAPACK) must propagate, not be mislabelled.
+                    L_C = _alpha_whiten_factor(A64)
+                except torch.linalg.LinAlgError:
                     _warn_raw_svd_fallback_once(
-                        "A_cov is rank-zero / empty after eigh thresholding "
+                        "A_cov Cholesky failed / rank-zero "
                         "(in _swift_svd_plus_alpha_search)"
                     )
                     svs = torch.linalg.svdvals(W)
+                else:
+                    svs = torch.linalg.svdvals(W @ L_C)
             else:
                 _warn_raw_svd_fallback_once(
                     "A_cov=None passed to _swift_svd_plus_alpha_search"
@@ -1319,22 +1348,22 @@ def _swift_svd_plus_alpha_search(
         # before relying on per-type α.
         best_alphas: dict[str, float] = {}
         for name in MATRIX_NAMES:
-            best_alpha = 0.5
+            best_alpha = alpha_grid[0]
             best_err = float("inf")
             for alpha in alpha_grid:
                 err = _evaluate_alpha(name, alpha)
-                if err < best_err:
+                if err < best_err * (1.0 - ALPHA_ERR_REL_TOL):  # strictly better beyond tol
                     best_err = err
                     best_alpha = alpha
             best_alphas[name] = best_alpha
             log.info("  Swift-SVD+ %s: best α=%.1f (err=%.4e)", name, best_alpha, best_err)
         return (best_alphas, grouped_svs) if return_svs else best_alphas
     else:
-        best_alpha = 0.5
+        best_alpha = alpha_grid[0]
         best_err = float("inf")
         for alpha in alpha_grid:
             err = sum(_evaluate_alpha(n, alpha) for n in MATRIX_NAMES)
-            if err < best_err:
+            if err < best_err * (1.0 - ALPHA_ERR_REL_TOL):
                 best_err = err
                 best_alpha = alpha
         log.info("  Swift-SVD+ global: best α=%.1f (err=%.4e)", best_alpha, best_err)
@@ -1400,17 +1429,20 @@ def _redistribute_ranks_swift_svd_plus(
                 if A is not None:
                     A64 = A.to(device="cpu", dtype=torch.float64)
                     A64 = 0.5 * (A64 + A64.T)
-                    eigvals_a, eigvecs_a = torch.linalg.eigh(A64)
-                    keep_a = eigvals_a > eigvals_a.max() * 1e-6
-                    if keep_a.any():
-                        L_A = eigvecs_a[:, keep_a] * eigvals_a[keep_a].clamp_min(1e-12).sqrt().unsqueeze(0)
-                        svs = torch.linalg.svdvals(W @ L_A)
-                    else:
+                    try:
+                        # F1: identical Cholesky whitening as producer 1 so the
+                        # Tier-1 torch.equal cache precondition holds. KEEP W @ L_C.
+                        # Narrow except (see producer 1): only LinAlgError is the
+                        # rank-zero fallback; svdvals(W @ L_C) bugs must propagate.
+                        L_C = _alpha_whiten_factor(A64)
+                    except torch.linalg.LinAlgError:
                         _warn_raw_svd_fallback_once(
-                            "A_cov is rank-zero / empty after eigh thresholding "
+                            "A_cov Cholesky failed / rank-zero "
                             "(in _redistribute_ranks_swift_svd_plus)"
                         )
                         svs = torch.linalg.svdvals(W)
+                    else:
+                        svs = torch.linalg.svdvals(W @ L_C)
                 else:
                     _warn_raw_svd_fallback_once(
                         "A_cov=None passed to _redistribute_ranks_swift_svd_plus"
