@@ -145,12 +145,16 @@ import copy
 import gc
 import json
 import logging
+import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
+
+from huggingface_hub import snapshot_download
 
 from .budget import solver as budget_solver
 from .utils.model_io import iter_moe_layers, save_json_artifact
@@ -168,19 +172,59 @@ from .run_probe import (
 
 log = logging.getLogger(__name__)
 
-# The two "ours" arms. ``method`` selects the Stage-2 mechanism; both share the
-# SAME solver K + sp (iso-compression) and the SAME paper router-kd dials.
-ARMS: tuple[tuple[str, str], ...] = (
-    ("reap-s234", "faithful_prune"),
-    ("ream-s234", "merge"),
-)
-
 # Net compression target (M-C) — these arms target NET-35% after Stage-4 EoRA.
 NET_TARGET = 0.35
 
-# Per-arm run_pipeline stage windows: (resume, stop) for (Stage2+2.5, Stage3-6).
-# resume>=2 ⇒ Stage-1 GRAPE/RCO never runs (run_pipeline.py gates start<=1).
-ARM_STAGE_WINDOWS = ((2, 2), (3, 6))
+
+def _default_num_gpus() -> int:
+    """Detected CUDA device count (floor 1) for the ``--num-gpus`` default.
+
+    Best-effort — a torch import / CUDA probe failure falls back to 1 (the
+    1-GPU path injects no multi-GPU overlay)."""
+    try:
+        import torch
+        return max(1, int(torch.cuda.device_count()))
+    except Exception:  # noqa: BLE001 — no torch / no CUDA ⇒ single-GPU default
+        return 1
+
+
+@dataclass(frozen=True)
+class ArmSpec:
+    """One "ours" arm: Stage-2 ``method`` + its run_pipeline stage windows + an
+    optional HF seed repo for a resume-from-post-2.5 checkpoint.
+
+    ``stage_windows`` is a tuple of ``(resume, stop)`` pairs run in order. Every
+    resume stage is >= 2 ⇒ Stage-1 GRAPE/RCO never runs (run_pipeline gates
+    start<=1). A ``seed_hub_repo`` arm has its post-2.5 ``stage2p5_final/`` placed
+    on disk from the Hub before the loop, so it carries a single ``(3, 6)``
+    window (skips Stage-2/2.5 entirely); a non-seeded arm runs the
+    ``(2,2),(3,6)`` pair (its own Stage 2 + auto-2.5, then Stage 3→6).
+    """
+
+    arm_id: str
+    method: str
+    seed_hub_repo: str | None
+    stage_windows: tuple[tuple[int, int], ...]
+
+
+# The two "ours" arms. ``method`` selects the Stage-2 mechanism; both share the
+# SAME solver K + sp (iso-compression) and the SAME paper router-kd dials.
+#   * reap-s234 resumes from its HF-backed stage2p5_final → Stage 3→6 ONLY.
+#   * ream-s234 runs its own Stage 2→2.5 then Stage 3→6 (unchanged).
+ARM_SPECS: tuple[ArmSpec, ...] = (
+    ArmSpec(
+        arm_id="reap-s234",
+        method="faithful_prune",
+        seed_hub_repo="pirola/reap-s234-stage2p5-final",
+        stage_windows=((3, 6),),
+    ),
+    ArmSpec(
+        arm_id="ream-s234",
+        method="merge",
+        seed_hub_repo=None,
+        stage_windows=((2, 2), (3, 6)),
+    ),
+)
 
 # Final Stage-6alt artifact filename — completion gate (mirrors run_probe).
 STAGE6ALT_ARTIFACT = "stage6alt_eval.json"
@@ -284,12 +328,162 @@ def derive_solver_budget(model, base_config: dict) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# HF seed — place a post-2.5 stage2p5_final/ checkpoint on disk for a seeded arm
+# ---------------------------------------------------------------------------
+
+# The 3 required METADATA files a resume@3 needs in stage2p5_final/
+# (shards handled separately below; run_pipeline.py:516-535).
+_STAGE2P5_REQUIRED = (
+    "config.json",
+    "model.safetensors.index.json",
+    "compressed_metadata.json",
+)
+
+
+def _seed_stage2p5_from_hub(
+    repo: str,
+    arm_dir: Path,
+    *,
+    _downloader: Callable[..., Any] = snapshot_download,
+) -> Path:
+    """Download a post-2.5 checkpoint from the Hub and materialize
+    ``arm_dir/stage2p5_final/`` so a ``--resume-from-stage 3`` run loads it from
+    disk (run_pipeline.py:516-535 — no in-process Hub download).
+
+    Handles BOTH repo layouts: the checkpoint files at the repo ROOT, or under a
+    ``stage2p5_final/`` subdir — detected by probing for ``compressed_metadata.json``.
+
+    Idempotent: if ``arm_dir/stage2p5_final/compressed_metadata.json`` is already
+    present, skips the download entirely (a re-run / resumed arm does not
+    re-fetch 52 GB).
+
+    CONTENT-VERIFY (per [[feedback_verify_content_not_filesize]]): after placing,
+    asserts ``compressed_metadata.json`` parses AND every shard listed in
+    ``model.safetensors.index.json`` exists on disk; RAISES loudly on any gap —
+    a half-download must FAIL, never silently fall back to ``stage2_pruned``.
+
+    The ``_downloader`` seam keeps tests off the network.
+
+    Returns the placed ``stage2p5_final/`` dir.
+    """
+    final_dir = arm_dir / "stage2p5_final"
+    meta_path = final_dir / "compressed_metadata.json"
+    if meta_path.exists():
+        log.info("[seed] %s already present — skipping Hub download (idempotent)",
+                 meta_path)
+        # Self-heal: if the existing dir is a half-checkpoint (e.g. a prior run
+        # filled the disk mid-shard-copy), wipe it so this call re-downloads
+        # rather than re-raising forever on every retry.
+        try:
+            _verify_stage2p5_content(final_dir)
+        except Exception:
+            log.warning("[seed] existing %s failed content-verify — wiping the "
+                        "partial checkpoint and re-downloading", final_dir)
+            shutil.rmtree(final_dir, ignore_errors=True)
+        else:
+            return final_dir
+
+    final_dir.mkdir(parents=True, exist_ok=True)
+    snap_root = arm_dir / "_hub_snapshot_stage2p5"
+    snap_root.mkdir(parents=True, exist_ok=True)
+    log.info("[seed] downloading %s → %s", repo, snap_root)
+    _downloader(repo_id=repo, local_dir=str(snap_root))
+
+    # Detect the layout: files at root, or nested under stage2p5_final/.
+    if (snap_root / "compressed_metadata.json").exists():
+        src_root = snap_root
+    elif (snap_root / "stage2p5_final" / "compressed_metadata.json").exists():
+        src_root = snap_root / "stage2p5_final"
+    else:
+        raise RuntimeError(
+            f"[seed] {repo}: compressed_metadata.json not found at the snapshot "
+            f"root ({snap_root}) nor under a stage2p5_final/ subdir — cannot "
+            "locate the post-2.5 checkpoint. Refusing to resume Stage 3."
+        )
+
+    # Copy the checkpoint files (config + index + metadata + every shard) into
+    # arm_dir/stage2p5_final/. The pipeline's save_compressed_checkpoint ALWAYS
+    # emits the multi-shard + index layout, so shards are matched by the
+    # model-*.safetensors glob.
+    for name in _STAGE2P5_REQUIRED:
+        src = src_root / name
+        if not src.exists():
+            raise RuntimeError(
+                f"[seed] {repo}: required file {name} missing from the snapshot "
+                f"({src}). The Hub checkpoint is incomplete; refusing to resume."
+            )
+        shutil.copy2(src, final_dir / name)
+    for shard in src_root.glob("model-*.safetensors"):
+        shutil.copy2(shard, final_dir / shard.name)
+
+    # Optional _shared/ metadata ride-along: copy only what is MISSING locally
+    # (do not clobber a locally-seeded _shared/).
+    src_shared = src_root / "_shared"
+    if src_shared.is_dir():
+        dst_shared = arm_dir.parent / "_shared"
+        dst_shared.mkdir(parents=True, exist_ok=True)
+        for f in src_shared.iterdir():
+            if f.is_file() and not (dst_shared / f.name).exists():
+                shutil.copy2(f, dst_shared / f.name)
+
+    # Self-heal: a FAILED post-copy verify (e.g. disk filled mid-shard-copy)
+    # wipes the partial dir before raising, so the next call re-downloads rather
+    # than short-circuiting forever on the present-but-incomplete metadata.
+    try:
+        _verify_stage2p5_content(final_dir)
+    except Exception:
+        shutil.rmtree(final_dir, ignore_errors=True)
+        raise
+    log.info("[seed] placed + content-verified %s", final_dir)
+    return final_dir
+
+
+def _verify_stage2p5_content(final_dir: Path) -> None:
+    """CONTENT-VERIFY the placed stage2p5_final/: metadata parses + every shard
+    the index lists exists on disk. RAISE loudly on any gap (a half-download
+    must FAIL, never silently fall back to stage2_pruned)."""
+    meta_path = final_dir / "compressed_metadata.json"
+    try:
+        json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"[seed] compressed_metadata.json at {meta_path} does not parse "
+            f"({exc!r}) — the seeded post-2.5 checkpoint is corrupt."
+        ) from exc
+
+    index_path = final_dir / "model.safetensors.index.json"
+    if not index_path.exists():
+        raise RuntimeError(
+            f"[seed] model.safetensors.index.json missing from {final_dir} — "
+            "cannot verify shard completeness; refusing to resume Stage 3."
+        )
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"[seed] index {index_path} does not parse ({exc!r})."
+        ) from exc
+    weight_map = index.get("weight_map", {}) or {}
+    shards = sorted(set(weight_map.values()))
+    missing = [s for s in shards if not (final_dir / s).exists()]
+    if missing:
+        raise RuntimeError(
+            f"[seed] {len(missing)} shard(s) listed in the index are absent from "
+            f"{final_dir}: {missing[:5]}{'...' if len(missing) > 5 else ''}. The "
+            "post-2.5 download is incomplete — refusing to resume Stage 3 on a "
+            "half-checkpoint (would silently fall back to stage2_pruned). "
+            f"Delete {final_dir} to retry."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Config builder — paper-pure Stage-2 + WS2 dials + M-C net accounting (pure)
 # ---------------------------------------------------------------------------
 
 def build_arm_config(
     base: dict, *, method: str, prune_fraction: float,
     num_sequences: int | None = None,
+    num_gpus: int = 1, whitening_cov: str = "anchor",
 ) -> dict:
     """Build one arm's config from the faithful base config.
 
@@ -346,7 +540,81 @@ def build_arm_config(
         cfg.setdefault("calibration", {})["num_sequences"] = int(num_sequences)
         s2["num_calibration_samples"] = int(num_sequences)
 
+    # ---- acov whitening (Task 5) ----
+    if whitening_cov not in ("anchor", "shift", "anchored_adaptive"):
+        raise ValueError(
+            f"unknown whitening_cov {whitening_cov!r} (expected anchor/shift/"
+            "anchored_adaptive)")
+    if whitening_cov != "anchor":
+        # Opt-in only: 'anchor' IS the plugin default (eora_inputs.py:363
+        # s4.get("whitening_cov", "anchor")), so the default path emits NEITHER
+        # key ⇒ byte-identical to the historical config. shift / anchored_adaptive
+        # set whitening_cov AND REQUIRE the persisted post-2.5 shift cov
+        # (eora_inputs.py:363-371 raises without persist_shift_covariance).
+        cfg.setdefault("stage4_eora", {})["whitening_cov"] = whitening_cov
+        cfg.setdefault("stage3_svd", {})["persist_shift_covariance"] = True
+
+    # ---- Multi-GPU overlay (Task 4), gated on num_gpus>=2 ----
+    # num_gpus<2 injects NONE of these ⇒ the 1-GPU path is byte-identical to the
+    # historical config. All these knobs are default-OFF in their stage plugins.
+    if num_gpus >= 2:
+        # Stage-3 cov DP + per-expert SVD + α-grid + Stage-4 EoRA concurrency.
+        # All read top-level config.get("multi_gpu", {}) (stage3/orchestrator.py
+        # :97,119,137 ; stage4/orchestrator.py:80).
+        mg = cfg.setdefault("multi_gpu", {})
+        mg["cov_replicas"] = num_gpus
+        mg["factor_workers"] = num_gpus
+        mg["alpha_workers"] = num_gpus
+        mg["eora_workers"] = num_gpus
+
+        # Stage-2 profile DP. M2: profile_dp is SILENTLY disabled on a Stage-2
+        # *resume* (profile_dp.py:10-14) — if the ream arm crashes mid-Stage-2
+        # and resumes, this enabled=True is overridden to serial with a loud log.
+        # Acceptable; noted so the operator isn't surprised. (Also auto-disables
+        # if a reservoir consumer is active; ream by-the-book uses
+        # cost_alignment="pre" + expert_distill_steps=0 + no merge_step=mergemoe,
+        # so it does NOT auto-disable here.)
+        pdp = cfg["stage2_reap_ream"].setdefault("profile_dp", {})
+        pdp["enabled"] = True
+        pdp["replicas"] = "auto"
+
+        # Stage-2.5 + Stage-5 DDP (both read stage5_router_kd regardless of
+        # stage_key — router_kd/orchestrator.py:200). NO stage6_validate.eval_shard
+        # — this ablation evals via the stage6alt thermometer where eval_shard
+        # does not apply; setting it would be misleading.
+        cfg["stage5_router_kd"]["ddp"] = {
+            "enabled": True, "world_size": num_gpus, "backend": "nccl",
+        }
+        assert_ddp_batch_divisible(cfg, num_gpus)
+        # model.device_map left at base (auto): DP cov replicas / DDP ranks pin
+        # their own GPU via CUDA_VISIBLE_DEVICES and DDP overrides device_map
+        # per-rank, so the parent auto placement is safe.
+
     return cfg
+
+
+def assert_ddp_batch_divisible(cfg: dict, world_size: int) -> None:
+    """DDP guard: ``stage5_router_kd.batch_size`` must be divisible by
+    ``world_size`` (per_gpu = batch / ws must be an integer — ddp_config.py:52-65).
+
+    Validates the AS-WRITTEN config ONLY. ``rkd_paper_recipe`` runs later inside
+    ``router_kd.run()`` (after this runner emits the config) but does NOT touch
+    ``batch_size`` (plan M1), so this pre-check is valid. Reads ``batch_size``
+    with ``.get`` (NOT ``[...]``): an absent batch_size (paper_dials_only does
+    not set one) validates nothing here — the plugin resolves the effective
+    batch downstream — rather than KeyError-ing."""
+    s5 = cfg.get("stage5_router_kd", {}) or {}
+    batch_size = s5.get("batch_size")
+    if batch_size is None:
+        return
+    if int(batch_size) % int(world_size) != 0:
+        raise RuntimeError(
+            f"Router-KD DDP: stage5_router_kd.batch_size={batch_size} is not "
+            f"divisible by world_size={world_size} (per-GPU batch = "
+            f"batch_size/world_size must be an integer). Set batch_size to a "
+            "multiple of world_size (and co-scale gradient_accumulation to keep "
+            "the effective batch fixed) before launching the multi-GPU run."
+        )
 
 
 def assert_paper_recipe_safety(cfg: dict) -> None:
@@ -457,14 +725,25 @@ def is_complete(arm_dir: Path) -> bool:
 
 
 def run_one_arm(
-    *, arm_id: str, method: str, base_config: dict, budget: dict[str, Any],
+    *, spec: ArmSpec, base_config: dict, budget: dict[str, Any],
     shared_dir: Path, probe_root: Path, model_repo: str, num_sequences: int,
+    num_gpus: int = 1, whitening_cov: str = "anchor",
 ) -> dict[str, Any]:
-    """Drive one arm Stage 2 → 2.5 → 3 → 4 → 5 → 6 (two subprocesses; see D1).
+    """Drive one arm through its ``spec.stage_windows`` (see D1).
 
-    Idempotent: a present stage6alt_eval.json short-circuits. Seeds the
-    uniform-K Stage-1 artifacts (H-A step 4 — pin for BOTH arms) before Stage 2.
+    A ``seed_hub_repo`` arm (reap) materializes its post-2.5 ``stage2p5_final/``
+    from the Hub BEFORE the loop, then runs ONLY its ``(3, 6)`` window (zero
+    ``--resume-from-stage 2`` calls). A non-seeded arm (ream) runs all windows in
+    order — its own Stage 2 + auto-2.5, then Stage 3→6 — with the
+    ``stage2p5_final/`` existence guard between a stop@2 and the next window.
+
+    ``seed_stage1_artifacts`` runs for BOTH arms (the survivor guard reads
+    ``_shared/`` even for reap; harmless and already present).
+
+    Idempotent: a present stage6alt_eval.json short-circuits; a seeded reap
+    re-run does not re-download (the seed helper is itself idempotent).
     """
+    arm_id, method = spec.arm_id, spec.method
     arm_dir = probe_root / arm_id
     arm_dir.mkdir(parents=True, exist_ok=True)
 
@@ -477,6 +756,7 @@ def run_one_arm(
     cfg = build_arm_config(
         base_config, method=method,
         prune_fraction=budget["prune_fraction"], num_sequences=num_sequences,
+        num_gpus=num_gpus, whitening_cov=whitening_cov,
     )
     assert_paper_recipe_safety(cfg)
     cfg_path = _write_config(cfg, arm_dir)
@@ -486,31 +766,30 @@ def run_one_arm(
     # REAP too. survivors=K passed EXPLICITLY (default is run_probe's 166).
     seed_stage1_artifacts(arm_dir, shared_dir, group="ream", survivors=budget["K"])
 
-    # ---- (a) Stage 2 + auto Stage 2.5 → stage2p5_final/ ----
-    log.info("[%s] Stage 2 + 2.5 (method=%s, K=%d) → stage2p5_final/",
-             arm_id, method, budget["K"])
-    rc1 = subprocess.run(
-        _pipeline_argv(cfg_path, model_repo, arm_dir,
-                       resume=ARM_STAGE_WINDOWS[0][0], stop=ARM_STAGE_WINDOWS[0][1]),
-        check=False,
-    ).returncode
-    if rc1 != 0:
-        raise RuntimeError(f"[{arm_id}] Stage 2/2.5 returned exit code {rc1}")
-    if not (arm_dir / "stage2p5_final").exists():
-        raise RuntimeError(
-            f"[{arm_id}] Stage 2.5 exited 0 but stage2p5_final/ is absent — "
-            "refusing to resume Stage 3 on a missing post-2.5 checkpoint."
-        )
+    # A seeded arm places its post-2.5 checkpoint on disk so its (3,6) window
+    # resumes from a real stage2p5_final/ — no Stage-2/2.5 subprocess at all.
+    if spec.seed_hub_repo is not None:
+        log.info("[%s] seeding post-2.5 checkpoint from %s (Stage 2/2.5 SKIPPED)",
+                 arm_id, spec.seed_hub_repo)
+        _seed_stage2p5_from_hub(spec.seed_hub_repo, arm_dir)
 
-    # ---- (b) Stage 3 → 4 → 5 → 6 (loads stage2p5_final/ per STAGE_REGISTRY) ----
-    log.info("[%s] Stage 3 → 4 → 5 → 6alt", arm_id)
-    rc2 = subprocess.run(
-        _pipeline_argv(cfg_path, model_repo, arm_dir,
-                       resume=ARM_STAGE_WINDOWS[1][0], stop=ARM_STAGE_WINDOWS[1][1]),
-        check=False,
-    ).returncode
-    if rc2 != 0:
-        raise RuntimeError(f"[{arm_id}] Stage 3-6 returned exit code {rc2}")
+    for resume, stop in spec.stage_windows:
+        log.info("[%s] Stage %d → %d (method=%s, K=%d)",
+                 arm_id, resume, stop, method, budget["K"])
+        rc = subprocess.run(
+            _pipeline_argv(cfg_path, model_repo, arm_dir, resume=resume, stop=stop),
+            check=False,
+        ).returncode
+        if rc != 0:
+            raise RuntimeError(
+                f"[{arm_id}] Stage {resume}-{stop} returned exit code {rc}")
+        # Post-2.5 (stop@2) checkpoint guard: the next window resumes@3 and must
+        # find stage2p5_final/ on disk.
+        if stop == 2 and not (arm_dir / "stage2p5_final").exists():
+            raise RuntimeError(
+                f"[{arm_id}] Stage 2.5 exited 0 but stage2p5_final/ is absent — "
+                "refusing to resume Stage 3 on a missing post-2.5 checkpoint."
+            )
 
     if not is_complete(arm_dir):
         raise RuntimeError(
@@ -539,6 +818,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", default=None,
                         help="Comma-separated subset of arm ids "
                              "(e.g. reap-s234,ream-s234)")
+    parser.add_argument(
+        "--num-gpus", type=int, default=_default_num_gpus(),
+        help="GPUs to fan the multi-GPU opt-in features across (Stage-3 cov "
+             "DP/SVD, Stage-4 EoRA threads, Router-KD DDP). Default: detected "
+             "torch.cuda.device_count() (floor 1). num_gpus<2 ⇒ 1-GPU path.")
+    parser.add_argument(
+        "--whitening-cov", default="anchor",
+        choices=("anchor", "shift", "anchored_adaptive"),
+        help="Stage-4 EoRA whitening covariance (acov A/B). Default 'anchor' "
+             "(byte-identical historical path); 'shift'/'anchored_adaptive' "
+             "also persist the Stage-3 shift covariance.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -547,6 +837,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     log.info("===== Full-pipeline REAP-vs-REAM @ net-35% (ours arms) =====")
     log.info("%s", _PAPER_BASELINE_NOTE)
+    log.info("num_gpus=%d (multi-GPU overlay %s), whitening_cov=%s",
+             args.num_gpus, "ON" if args.num_gpus >= 2 else "OFF (1-GPU)",
+             args.whitening_cov)
 
     base_config = yaml.safe_load(Path(args.config).read_text())
     if args.model:
@@ -555,11 +848,11 @@ def main(argv: list[str] | None = None) -> int:
     probe_root.mkdir(parents=True, exist_ok=True)
     shared_dir = probe_root / "_shared"
 
-    arms = list(ARMS)
+    arms = list(ARM_SPECS)
     if args.only:
         wanted = {x.strip() for x in args.only.split(",") if x.strip()}
-        arms = [a for a in arms if a[0] in wanted]
-    log.info("Will run %d arm(s): %s", len(arms), [a[0] for a in arms])
+        arms = [a for a in arms if a.arm_id in wanted]
+    log.info("Will run %d arm(s): %s", len(arms), [a.arm_id for a in arms])
 
     # Shared Stage-1 artifacts gate (same contract as run_probe).
     if not all((shared_dir / n).exists() for n in (
@@ -617,16 +910,17 @@ def main(argv: list[str] | None = None) -> int:
 
     results: dict[str, dict] = {}
     failures: list[tuple[str, str]] = []
-    for arm_id, method in arms:
+    for spec in arms:
         try:
-            results[arm_id] = run_one_arm(
-                arm_id=arm_id, method=method, base_config=base_config,
+            results[spec.arm_id] = run_one_arm(
+                spec=spec, base_config=base_config,
                 budget=budget, shared_dir=shared_dir, probe_root=probe_root,
                 model_repo=args.model, num_sequences=args.num_sequences,
+                num_gpus=args.num_gpus, whitening_cov=args.whitening_cov,
             )
         except Exception as exc:  # noqa: BLE001
-            log.exception("[%s] failed", arm_id)
-            failures.append((arm_id, str(exc)))
+            log.exception("[%s] failed", spec.arm_id)
+            failures.append((spec.arm_id, str(exc)))
 
     summary = {
         "solver_budget": budget,

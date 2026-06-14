@@ -261,13 +261,13 @@ def test_keep_count_pins_documented_rounding():
 # ---------------------------------------------------------------------------
 
 def test_pipeline_subprocesses_never_invoke_stage1():
-    """The runner's per-arm stage windows (the constant the two
-    ``subprocess.run`` launches actually read) must never resume Stage-1. Source
-    the (resume, stop) pairs from the REAL ``ARM_STAGE_WINDOWS`` constant — not
-    hardcoded literals — so a future ``run_one_arm`` edit that lowers a resume to
-    1 is caught here, and feed each through the real ``_pipeline_argv`` to lock
-    the rendered argv. Stage-1 GRAPE/RCO is gated on start<=1 in run_pipeline.py;
-    every window with resume>=2 proves it is NEVER invoked per arm."""
+    """The runner's per-arm stage windows (the pairs the ``subprocess.run``
+    launches actually read) must never resume Stage-1. Source the (resume, stop)
+    pairs from the REAL ``ARM_SPECS`` — not hardcoded literals — so a future edit
+    that lowers a resume to 1 is caught here, and feed each through the real
+    ``_pipeline_argv`` to lock the rendered argv. Stage-1 GRAPE/RCO is gated on
+    start<=1 in run_pipeline.py; every window with resume>=2 proves it is NEVER
+    invoked for any arm."""
     import tempfile
     from pathlib import Path
 
@@ -277,19 +277,19 @@ def test_pipeline_subprocesses_never_invoke_stage1():
     def _resume_of(argv: list[str]) -> int:
         return int(argv[argv.index("--resume-from-stage") + 1])
 
-    windows = rr.ARM_STAGE_WINDOWS
-    assert len(windows) >= 1
+    all_windows = [w for spec in rr.ARM_SPECS for w in spec.stage_windows]
+    assert len(all_windows) >= 1
 
     # (a) Every window's resume stage proves Stage-1 is never re-entered.
-    for resume, stop in windows:
+    for resume, stop in all_windows:
         assert resume >= 2, (
-            f"ARM_STAGE_WINDOWS has a window resuming at stage {resume} "
+            f"ARM_SPECS has a window resuming at stage {resume} "
             "(<=1 ⇒ Stage-1 GRAPE/RCO would run!)"
         )
 
     # (b) Feed each window through the real formatter and lock the argv: it must
     #     carry --resume-from-stage <resume> with resume>=2, never 1 or 0.
-    for resume, stop in windows:
+    for resume, stop in all_windows:
         argv = rr._pipeline_argv(cfg_path, "fake/repo", arm_dir,
                                  resume=resume, stop=stop)
         assert "--resume-from-stage" in argv
@@ -298,8 +298,10 @@ def test_pipeline_subprocesses_never_invoke_stage1():
         assert "--resume-from-stage 1" not in " ".join(argv)
         assert "--resume-from-stage 0" not in " ".join(argv)
 
-    # The two locked windows: (Stage2+2.5)=2/2 then (Stage3-6)=3/6.
-    assert windows[0][0] == 2 and windows[1][0] == 3
+    # Per-spec: reap resumes post-2.5 (single 3/6 window); ream runs 2/2 then 3/6.
+    specs = {s.arm_id: s for s in rr.ARM_SPECS}
+    assert specs["reap-s234"].stage_windows == ((3, 6),)
+    assert specs["ream-s234"].stage_windows == ((2, 2), (3, 6))
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +321,369 @@ def test_assert_covariance_resolves_raises_on_missing_sidecar(tmp_path):
         rr.assert_covariance_resolves(base_cfg)
 
 
+# ===========================================================================
+# Task 1: per-arm ArmSpec (windows + optional HF seed) replaces global windows
+# ===========================================================================
+
+def test_arm_specs_reap_resumes_post_2p5_ream_runs_2p5():
+    """reap-s234 carries an HF seed repo + a single (3,6) window (resumes
+    post-2.5, skips Stage-2/2.5); ream-s234 has no seed + the (2,2),(3,6) pair
+    (runs its own Stage-2/2.5). --only still filters by arm_id."""
+    specs = {s.arm_id: s for s in rr.ARM_SPECS}
+    assert set(specs) == {"reap-s234", "ream-s234"}
+
+    reap = specs["reap-s234"]
+    assert reap.method == "faithful_prune"
+    assert reap.seed_hub_repo == "pirola/reap-s234-stage2p5-final"
+    assert reap.stage_windows == ((3, 6),)
+
+    ream = specs["ream-s234"]
+    assert ream.method == "merge"
+    assert ream.seed_hub_repo is None
+    assert ream.stage_windows == ((2, 2), (3, 6))
+
+
+# ===========================================================================
+# Task 2: HF seed helper — place stage2p5_final/ on disk (content-verified)
+# ===========================================================================
+
+def _make_fake_checkpoint(dest, *, subdir: bool):
+    """Populate ``dest`` with a tiny stub stage2p5 checkpoint in one of the two
+    candidate repo layouts: files at root (subdir=False) or under a
+    ``stage2p5_final/`` subdir (subdir=True). Index lists one shard that exists."""
+    import json as _j
+    from pathlib import Path as _P
+
+    root = _P(dest) / "stage2p5_final" if subdir else _P(dest)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.json").write_text("{}", encoding="utf-8")
+    (root / "model-00001-of-00001.safetensors").write_bytes(b"\x00\x01")
+    (root / "model.safetensors.index.json").write_text(
+        _j.dumps({"weight_map": {"w": "model-00001-of-00001.safetensors"}}),
+        encoding="utf-8",
+    )
+    (root / "compressed_metadata.json").write_text(
+        _j.dumps({"survivors": 200}), encoding="utf-8")
+
+
+def _fake_downloader(layout_subdir):
+    """Return a fake snapshot_download that populates ``local_dir`` in the chosen
+    layout and records call count."""
+    calls = {"n": 0}
+
+    def _dl(*, repo_id, local_dir, **kw):
+        calls["n"] += 1
+        _make_fake_checkpoint(local_dir, subdir=layout_subdir)
+        return str(local_dir)
+
+    _dl.calls = calls
+    return _dl
+
+
+@pytest.mark.parametrize("layout_subdir", [False, True])
+def test_seed_stage2p5_from_hub_places_and_verifies(tmp_path, layout_subdir):
+    """Both repo layouts (files at root, or under stage2p5_final/) produce a
+    populated, content-verified arm_dir/stage2p5_final/. The fake downloader
+    never hits the network."""
+    arm_dir = tmp_path / "reap-s234"
+    dl = _fake_downloader(layout_subdir)
+    rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=dl)
+
+    final = arm_dir / "stage2p5_final"
+    assert (final / "compressed_metadata.json").exists()
+    assert (final / "model.safetensors.index.json").exists()
+    assert (final / "model-00001-of-00001.safetensors").exists()
+    assert (final / "config.json").exists()
+    assert dl.calls["n"] == 1
+
+
+def test_seed_stage2p5_from_hub_is_idempotent(tmp_path):
+    """A second call with the metadata already present does NOT re-download."""
+    arm_dir = tmp_path / "reap-s234"
+    dl = _fake_downloader(False)
+    rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=dl)
+    rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=dl)
+    assert dl.calls["n"] == 1  # second call short-circuited
+
+
+def test_seed_stage2p5_from_hub_raises_on_missing_shard(tmp_path):
+    """CONTENT-VERIFY: a half-download (index lists a shard that is absent) must
+    RAISE loudly, never silently fall back to stage2_pruned."""
+    arm_dir = tmp_path / "reap-s234"
+
+    def _bad_dl(*, repo_id, local_dir, **kw):
+        import json as _j
+        from pathlib import Path as _P
+        root = _P(local_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "config.json").write_text("{}", encoding="utf-8")
+        (root / "compressed_metadata.json").write_text("{}", encoding="utf-8")
+        # index references a shard that is NOT on disk
+        (root / "model.safetensors.index.json").write_text(
+            _j.dumps({"weight_map": {"w": "model-00001-of-00001.safetensors"}}),
+            encoding="utf-8")
+        return str(local_dir)
+
+    with pytest.raises(RuntimeError, match="shard"):
+        rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=_bad_dl)
+
+
+def test_seed_stage2p5_self_heals_partial_then_succeeds(tmp_path):
+    """H1: a partial-copy (metadata present but a shard missing) must (1) RAISE
+    on the first call AND wipe final_dir, so (2) a retry with a now-complete
+    downloader re-downloads and succeeds — the partial dir must not block all
+    retries forever."""
+    import json as _j
+    from pathlib import Path as _P
+    arm_dir = tmp_path / "reap-s234"
+    final = arm_dir / "stage2p5_final"
+
+    def _partial_dl(*, repo_id, local_dir, **kw):
+        root = _P(local_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "config.json").write_text("{}", encoding="utf-8")
+        (root / "compressed_metadata.json").write_text("{}", encoding="utf-8")
+        # index references a shard that is NOT placed (simulated mid-copy fill)
+        (root / "model.safetensors.index.json").write_text(
+            _j.dumps({"weight_map": {"w": "model-00001-of-00001.safetensors"}}),
+            encoding="utf-8")
+        return str(local_dir)
+
+    with pytest.raises(RuntimeError, match="shard"):
+        rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=_partial_dl)
+    # self-heal: the partial checkpoint dir is gone so the next call re-downloads
+    assert not final.exists()
+
+    good = _fake_downloader(False)
+    rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=good)
+    assert (final / "compressed_metadata.json").exists()
+    assert (final / "model-00001-of-00001.safetensors").exists()
+    assert good.calls["n"] == 1  # the retry actually re-downloaded
+
+
+# ===========================================================================
+# Task 3: run_one_arm honors the per-arm spec (seed + windows)
+# ===========================================================================
+
+def _seed_shared_stage1(shared_dir):
+    """Place the three shared Stage-1 artifacts seed_stage1_artifacts copies."""
+    import json as _j
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    (shared_dir / "stage1_blacklist.json").write_text("{}", encoding="utf-8")
+    (shared_dir / "budget_decomposition.json").write_text(
+        _j.dumps({"svd_rank_ratio": 0.1}), encoding="utf-8")
+    (shared_dir / "stage1_budgets.json").write_text(
+        _j.dumps({"per_layer_target_experts": {str(i): 999 for i in range(4)},
+                  "per_layer_redundancy": {}}), encoding="utf-8")
+
+
+def _install_fake_subprocess(monkeypatch, probe_root, arm_id):
+    """Monkeypatch subprocess.run to record argv and create the expected output
+    dirs (stage2p5_final/ when a window stops at 2; stage6alt_eval.json when a
+    window stops at 6)."""
+    import json as _j
+    calls = []
+
+    def _fake_run(argv, check=False, **kw):
+        calls.append(list(argv))
+        arm_dir = probe_root / arm_id
+        stop = int(argv[argv.index("--stop-after-stage") + 1])
+        if stop == 2:
+            (arm_dir / "stage2p5_final").mkdir(parents=True, exist_ok=True)
+        if stop >= 6:
+            (arm_dir / rr.STAGE6ALT_ARTIFACT).write_text(
+                _j.dumps({"student_bpt": 3.0}), encoding="utf-8")
+
+        class _R:
+            returncode = 0
+        return _R()
+
+    monkeypatch.setattr(rr.subprocess, "run", _fake_run)
+    return calls
+
+
+def _resumes(calls):
+    return [int(a[a.index("--resume-from-stage") + 1]) for a in calls]
+
+
+def test_run_one_arm_reap_seeds_and_resumes_at_3(tmp_path, monkeypatch):
+    """A seeded (reap) arm calls _seed_stage2p5_from_hub BEFORE the loop, then
+    issues exactly ONE pipeline call resuming at stage 3 (NO --resume-from-stage
+    2)."""
+    probe_root = tmp_path / "probe"
+    shared_dir = probe_root / "_shared"
+    _seed_shared_stage1(shared_dir)
+    calls = _install_fake_subprocess(monkeypatch, probe_root, "reap-s234")
+
+    seed_calls = []
+
+    def _fake_seed(repo, arm_dir, **kw):
+        seed_calls.append(repo)
+        (arm_dir / "stage2p5_final").mkdir(parents=True, exist_ok=True)
+        return arm_dir / "stage2p5_final"
+
+    monkeypatch.setattr(rr, "_seed_stage2p5_from_hub", _fake_seed)
+
+    spec = next(s for s in rr.ARM_SPECS if s.arm_id == "reap-s234")
+    rr.run_one_arm(
+        spec=spec, base_config={"stage5_router_kd": {"save_best": True}},
+        budget={"prune_fraction": 0.23, "K": 200}, shared_dir=shared_dir,
+        probe_root=probe_root, model_repo="fake/repo", num_sequences=8,
+        num_gpus=1, whitening_cov="anchor",
+    )
+
+    assert seed_calls == ["pirola/reap-s234-stage2p5-final"]
+    assert _resumes(calls) == [3]
+    assert 2 not in _resumes(calls)
+
+
+def test_run_one_arm_ream_runs_both_windows_no_seed(tmp_path, monkeypatch):
+    """A non-seeded (ream) arm issues the 2→2 then 3→6 pair and NEVER calls the
+    seed helper."""
+    probe_root = tmp_path / "probe"
+    shared_dir = probe_root / "_shared"
+    _seed_shared_stage1(shared_dir)
+    calls = _install_fake_subprocess(monkeypatch, probe_root, "ream-s234")
+
+    seed_calls = []
+    monkeypatch.setattr(rr, "_seed_stage2p5_from_hub",
+                        lambda *a, **k: seed_calls.append(a))
+
+    spec = next(s for s in rr.ARM_SPECS if s.arm_id == "ream-s234")
+    rr.run_one_arm(
+        spec=spec, base_config={"stage5_router_kd": {"save_best": True}},
+        budget={"prune_fraction": 0.23, "K": 200}, shared_dir=shared_dir,
+        probe_root=probe_root, model_repo="fake/repo", num_sequences=8,
+        num_gpus=1, whitening_cov="anchor",
+    )
+
+    assert seed_calls == []  # no seed for ream
+    assert _resumes(calls) == [2, 3]
+
+
+# ===========================================================================
+# Task 4: multi-GPU overlay (gated on num_gpus>=2) + DDP divisibility guard
+# ===========================================================================
+
+def _base_mg() -> dict:
+    # batch_size:2 mirrors the real base config (configs/...:459) so the
+    # divisibility guard (2 % 2 == 0) is exercised on real dims.
+    return {"stage5_router_kd": {"save_best": True, "batch_size": 2}}
+
+
+def test_multi_gpu_overlay_injected_when_num_gpus_2():
+    cfg = rr.build_arm_config(_base_mg(), method="faithful_prune",
+                              prune_fraction=0.23, num_gpus=2)
+    mg = cfg["multi_gpu"]
+    assert mg["cov_replicas"] == 2
+    assert mg["factor_workers"] == 2
+    assert mg["alpha_workers"] == 2
+    assert mg["eora_workers"] == 2
+    pdp = cfg["stage2_reap_ream"]["profile_dp"]
+    assert pdp["enabled"] is True
+    assert pdp["replicas"] == "auto"
+    ddp = cfg["stage5_router_kd"]["ddp"]
+    assert ddp == {"enabled": True, "world_size": 2, "backend": "nccl"}
+    # stage6alt path — eval-shard must NOT be set (would no-op / mislead).
+    assert "eval_shard" not in cfg.get("stage6_validate", {})
+    # device_map left at base (auto / unset by build_arm_config).
+    assert cfg.get("model", {}).get("device_map", "auto") == "auto"
+
+
+def test_multi_gpu_overlay_absent_when_num_gpus_1():
+    cfg = rr.build_arm_config(_base_mg(), method="faithful_prune",
+                              prune_fraction=0.23, num_gpus=1)
+    assert "multi_gpu" not in cfg
+    assert "profile_dp" not in cfg.get("stage2_reap_ream", {})
+    assert "ddp" not in cfg["stage5_router_kd"]
+
+
+def test_ddp_batch_divisible_guard_raises_on_odd_batch():
+    cfg = {"stage5_router_kd": {"batch_size": 3}}
+    with pytest.raises(RuntimeError, match="divisible"):
+        rr.assert_ddp_batch_divisible(cfg, 2)
+
+
+def test_ddp_batch_divisible_guard_passes_on_even_batch():
+    cfg = {"stage5_router_kd": {"batch_size": 4}}
+    rr.assert_ddp_batch_divisible(cfg, 2)  # no raise
+
+
+def test_ddp_batch_divisible_guard_noop_when_batch_absent():
+    # batch_size absent ⇒ .get returns None ⇒ guard validates nothing (the
+    # plugin resolves the effective batch later); must NOT KeyError.
+    rr.assert_ddp_batch_divisible({"stage5_router_kd": {}}, 2)
+    rr.assert_ddp_batch_divisible({}, 2)
+
+
+def test_multi_gpu_overlay_guard_trips_on_odd_base_batch():
+    # num_gpus=2 with an odd base batch_size must raise via the in-builder guard.
+    base = {"stage5_router_kd": {"save_best": True, "batch_size": 3}}
+    with pytest.raises(RuntimeError, match="divisible"):
+        rr.build_arm_config(base, method="faithful_prune",
+                            prune_fraction=0.23, num_gpus=2)
+
+
+# ===========================================================================
+# Task 5: --whitening-cov flag wires acov shift-cov + persist
+# ===========================================================================
+
+def test_whitening_cov_default_anchor_no_persist_shift():
+    """Default anchor ⇒ NEITHER key emitted (byte-identical historical path):
+    no stage4_eora.whitening_cov (anchor IS the plugin default) AND no
+    stage3_svd.persist_shift_covariance."""
+    cfg = rr.build_arm_config(_base(), method="faithful_prune",
+                              prune_fraction=0.23)  # default whitening_cov
+    assert "whitening_cov" not in cfg.get("stage4_eora", {})
+    assert "persist_shift_covariance" not in cfg.get("stage3_svd", {})
+
+
+def test_whitening_cov_shift_sets_persist_shift():
+    cfg = rr.build_arm_config(_base(), method="faithful_prune",
+                              prune_fraction=0.23, whitening_cov="shift")
+    assert cfg["stage4_eora"]["whitening_cov"] == "shift"
+    assert cfg["stage3_svd"]["persist_shift_covariance"] is True
+
+
+def test_whitening_cov_anchored_adaptive_sets_persist_shift():
+    cfg = rr.build_arm_config(_base(), method="merge",
+                              prune_fraction=0.23,
+                              whitening_cov="anchored_adaptive")
+    assert cfg["stage4_eora"]["whitening_cov"] == "anchored_adaptive"
+    assert cfg["stage3_svd"]["persist_shift_covariance"] is True
+
+
+def test_whitening_cov_rejects_unknown():
+    with pytest.raises(ValueError, match="whitening_cov"):
+        rr.build_arm_config(_base(), method="faithful_prune",
+                            prune_fraction=0.23, whitening_cov="bogus")
+
+
+def test_cli_parses_whitening_cov_and_num_gpus(monkeypatch):
+    """--whitening-cov + --num-gpus reach args (parser smoke; main not run)."""
+    import argparse
+    captured = {}
+
+    real_parse = argparse.ArgumentParser.parse_args
+
+    def _spy(self, argv=None):
+        ns = real_parse(self, argv)
+        captured.update(vars(ns))
+        raise SystemExit(0)  # bail before any I/O
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", _spy)
+    with pytest.raises(SystemExit):
+        rr.main(["--config", "x.yaml", "--model", "m", "--probe-root", "p",
+                 "--whitening-cov", "shift", "--num-gpus", "4"])
+    assert captured["whitening_cov"] == "shift"
+    assert captured["num_gpus"] == 4
+
+
 # --- small tmp helpers for the iso-K REAM-pin write/read ---
 
 import contextlib  # noqa: E402
 import json as _json  # noqa: E402
+import shutil as _shutil  # noqa: E402
 import tempfile as _tempfile  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
 
@@ -330,12 +691,18 @@ from pathlib import Path as _Path  # noqa: E402
 @contextlib.contextmanager
 def _tmp_json(obj):
     d = _tempfile.mkdtemp()
-    p = _Path(d) / "shared_budgets.json"
-    p.write_text(_json.dumps(obj), encoding="utf-8")
-    yield p
+    try:
+        p = _Path(d) / "shared_budgets.json"
+        p.write_text(_json.dumps(obj), encoding="utf-8")
+        yield p
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)
 
 
 @contextlib.contextmanager
 def _tmp_path():
     d = _tempfile.mkdtemp()
-    yield _Path(d) / "stage1_budgets.json"
+    try:
+        yield _Path(d) / "stage1_budgets.json"
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)
