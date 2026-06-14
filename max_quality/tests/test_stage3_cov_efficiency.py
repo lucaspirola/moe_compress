@@ -256,3 +256,30 @@ def test_single_pass_detection_case_and_whitespace_insensitive():
 
     # Absent multi_gpu / cov_window_size (default path) → not single-pass.
     assert _single_pass({}, {}) is False
+
+
+# ---------------------------------------------------------------------------
+# Task C — cov_num_sequences knob
+# ---------------------------------------------------------------------------
+
+
+def test_spec_from_config_num_sequences_override_contract():
+    from moe_compress.utils.calibration import spec_from_config
+
+    cal = {
+        "num_sequences": 2048, "sequence_length": 512, "seed": 0,
+        "source": "nvidia-cascade", "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data",
+        "subset_weights": {"math": 1.0},
+    }
+
+    spec_with = spec_from_config(cal, seed_offset=2, num_sequences_override=512)
+    assert spec_with.num_sequences == 512
+
+    spec_without = spec_from_config(cal, seed_offset=2, num_sequences_override=None)
+    assert spec_without.num_sequences == 2048
+
+    # Seed is unchanged by the override
+    assert spec_with.seed == spec_without.seed
+
+    # cal dict is not mutated
+    assert cal["num_sequences"] == 2048
