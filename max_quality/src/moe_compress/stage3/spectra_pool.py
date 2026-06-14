@@ -11,6 +11,10 @@ from __future__ import annotations
 import concurrent.futures
 import multiprocessing
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch  # type-checking only; runtime import stays lazy (_pin_one_thread)
 
 
 @dataclass
