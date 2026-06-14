@@ -17,16 +17,16 @@ Four independent, default-OFF knobs that reduce Stage-3 covariance-pass wall tim
 | ID | Short name | What it does |
 |----|---|---|
 | A | CPU hot-accumulator | Running-sum (`_pending`) migrated to CPU after GPU GEMM; frees per-layer GPU Gram VRAM so a wider window fits |
-| B | Single-pass G=N | Sets window G = n\_layers AND auto-enables Task A on every `C_acc` and `B_acc`, so all 40 layers accumulate in one forward pass |
+| B | Single-pass G=N | Sets window G = n\_layers AND auto-enables Task A on every `B_acc` and `C_acc`, so all 40 layers accumulate in one forward pass |
 | C | `cov_num_sequences` knob | Independent sequence-count override for the Stage-3 B/C calib build via the existing `spec_from_config(..., num_sequences_override=...)` kwarg; intended fast value 512 |
 | D | Gentler OOM backoff | Replace halve (`// 2`) with `× 0.75` (floor `attempt-1`) in `run_with_oom_backoff`; 18→13→9 instead of 18→9 |
 
 ### Non-negotiable correctness invariants
 
 1. **Byte-identical default path.** All four knobs default OFF / absent. `test_stage3_golden_snapshot.py`, `test_stage4_golden_snapshot.py`, `test_stage6_golden_snapshot.py`, `test_stage6alt_golden_snapshot.py` MUST pass without `MOE_REGEN_GOLDEN`.
-2. **GEMM NEVER moves to CPU (Task A).** The `flat_f32.transpose(0, 1) @ flat_f32` in `update()` and the incoming `cross` tensor in `update_cross()` are processed on GPU. Only the result tensor is migrated to `_hot_accum_device` afterward.
+2. **GEMM NEVER moves to CPU (Task A).** The `flat_f32.transpose(0, 1) @ flat_f32` matmul in `update()` and the incoming `cross` tensor in `update_cross()` execute on GPU. Only the result tensor is migrated to `_hot_accum_device` afterward.
 3. **Single-pass bitwise guarantee (Task B).** At `cov_batch_size=1`, matmul and reduction order are unchanged; finalized covs must be `torch.equal` to the windowed baseline.
-4. **B implies A everywhere.** `_single_pass` must be applied to `B_acc` at its creation site (:254) AND to every `C_acc` creation site (:419, :478, :518). Missing any one site causes that accumulator's Grams to stay on GPU and OOM on a single-pass G=40 run.
+4. **B implies A at ALL four accumulator sites.** `_maybe_cpu_hot_accum` must be called at the `B_acc` site (:254) and at every `C_acc = InputCovarianceAccumulator()` site: resume (:419), DP (:478), live-else (:518). Missing any one site causes that accumulator's Grams to stay on GPU and OOM on a single-pass G=40 run.
 5. **Task C does not mutate `cal`.** Uses `spec_from_config`'s existing `num_sequences_override` kwarg (`calibration.py:336,357`); no dict copy.
 
 ---
@@ -37,7 +37,7 @@ Four independent, default-OFF knobs that reduce Stage-3 covariance-pass wall tim
 |---|---|---|
 | `src/moe_compress/utils/activation_hooks.py` | A | Add `_hot_accum_device: str \| None = None` field and `set_hot_accumulator_device()` on `InputCovarianceAccumulator`; migrate result to `_hot_accum_device` in `update()` (:1021) and `update_cross()` (:1071); update stale comment at :1091-1096 |
 | `src/moe_compress/stage3/plugins/covariance_collection.py` | B | Extend `_resolve_cov_window()` (:347-398): accept `stage3_svd.cov_single_pass: true` or `multi_gpu.cov_window_size: "all"` → return `n_layers` |
-| `src/moe_compress/stage3/orchestrator.py` | B, C | (B) Resolve `_single_pass` bool once at :255 (after B_acc); call `B_acc.set_hot_accumulator_device("cpu")` immediately after. At each of the three `C_acc = InputCovarianceAccumulator()` sites (:419, :478, :518), add `if _single_pass: C_acc.set_hot_accumulator_device("cpu")`. (C) Add `_resolve_bcov_spec(s3, cal)` helper; replace `spec = spec_from_config(cal, seed_offset=2)` at :235 |
+| `src/moe_compress/stage3/orchestrator.py` | B, C | (B) Add `_maybe_cpu_hot_accum(acc, single_pass)` helper; resolve `_single_pass` bool once at :255; call `_maybe_cpu_hot_accum(B_acc, _single_pass)` there; call `_maybe_cpu_hot_accum(C_acc, _single_pass)` immediately after each of the three `C_acc = InputCovarianceAccumulator()` sites (:419, :478, :518). (C) Add `_resolve_bcov_spec(s3, cal)` helper; replace `spec = spec_from_config(cal, seed_offset=2)` at :235 |
 | `src/moe_compress/utils/auto_batch.py` | D | Replace `:201` `new = max(attempt // 2, floor)` with `new = max(min(int(attempt * 0.75), attempt - 1), floor)`; update docstring example to 18→13→9 |
 | `tests/test_stage3_cov_efficiency.py` | A,B,C,D | New file — all TDD tests |
 
@@ -72,18 +72,18 @@ In `update_cross()`, after `cross_f32 = cross.to(torch.float32)` (:1071):
 if self._hot_accum_device is not None:
     cross_f32 = cross_f32.to(self._hot_accum_device)
 ```
-The existing `cur.add_(cross_f32.to(device=cur.device))` handles the device match transparently (no-op cast when both are already on `_hot_accum_device`).
+The existing `cur.add_(cross_f32.to(device=cur.device))` handles the device match transparently — a no-op cast when both sides are already on `_hot_accum_device`.
 
-In `finalize_layer()`, update the stale comment at :1091-1096. The current text says "The pending tensors now live on GPU until this call". Replace with:
+In `finalize_layer()`, update the stale comment at :1091-1096. Current text: "The pending tensors now live on GPU until this call". Replace with:
 ```
 # Phase 2: cast to storage dtype on the source device and transfer to CPU.
 # When _hot_accum_device="cpu" the pending tensors already live on CPU;
-# .cpu() is a no-op and the dtype cast is applied in-place. Default path
-# (None) retains the single GPU→CPU transfer per key.
+# .cpu() is a no-op and the dtype cast is device-local. Default path
+# (None) retains the original single GPU→CPU transfer per key.
 ```
-No logic change; `gpu_cov.to(storage_dtype).cpu()` is transparent when the tensor is already on CPU.
+No logic change in `finalize_layer`; `gpu_cov.to(storage_dtype).cpu()` is transparent when the tensor is already on CPU.
 
-**Bitwise guarantee.** At `cov_batch_size=1` the GEMM operands and batch-sequential accumulation order are identical to the GPU-hot path. Only the running-sum device differs. Phase-3 merge (`prev.to(float32) + cpu_cov.to(float32)`) is device-agnostic.
+**Bitwise guarantee.** At `cov_batch_size=1` the GEMM operands and batch-sequential accumulation order are identical to the GPU-hot path. Only the running-sum device differs. The Phase-3 merge (`prev.to(float32) + cpu_cov.to(float32)`) is device-agnostic.
 
 ### Task B — single-pass G=N
 
@@ -102,7 +102,25 @@ if req.strip().lower() == "all":
     return n_layers
 ```
 
-**Orchestrator wiring** (`orchestrator.py`) — critical: three C_acc sites, not one.
+**Orchestrator wiring** (`orchestrator.py`) — four call sites, one helper.
+
+Add a module-level helper before `run()`:
+```python
+def _maybe_cpu_hot_accum(
+    acc: "InputCovarianceAccumulator",
+    single_pass: bool,
+) -> "InputCovarianceAccumulator":
+    """Opt-in CPU hot-accumulator for single-pass cov collection.
+
+    When ``single_pass`` is True, migrates the running-sum device to CPU
+    immediately after GPU GEMM (Task A), preventing all-40-layer GPU Gram
+    residency from OOMing a single-pass G=N run. No-op when False (default
+    path unchanged). Returns ``acc`` for chaining.
+    """
+    if single_pass:
+        acc.set_hot_accumulator_device("cpu")
+    return acc
+```
 
 Resolve `_single_pass` once, immediately after `B_acc` is set up at :254:
 ```python
@@ -112,39 +130,37 @@ _single_pass = (
     s3.get("cov_single_pass", False)
     or (config.get("multi_gpu") or {}).get("cov_window_size", "auto") == "all"
 )
-if _single_pass:
-    B_acc.set_hot_accumulator_device("cpu")
+_maybe_cpu_hot_accum(B_acc, _single_pass)
 ```
 
-Then at each of the three `C_acc = InputCovarianceAccumulator()` sites, add the guard immediately after `C_acc.set_storage_dtype(...)`:
+Then at each of the three `C_acc = InputCovarianceAccumulator()` sites, add the call immediately after `C_acc.set_storage_dtype(...)`:
 
 - **Resume branch** (:419-420):
 ```python
 C_acc = InputCovarianceAccumulator()
 C_acc.set_storage_dtype(B_cov_dtype)
-if _single_pass:
-    C_acc.set_hot_accumulator_device("cpu")
+_maybe_cpu_hot_accum(C_acc, _single_pass)
 ```
 
 - **DP branch** (:478-479):
 ```python
 C_acc = InputCovarianceAccumulator()
 C_acc.set_storage_dtype(B_cov_dtype)
-if _single_pass:
-    C_acc.set_hot_accumulator_device("cpu")
+_maybe_cpu_hot_accum(C_acc, _single_pass)
 ```
 
 - **Live else-branch** (:518-519):
 ```python
 C_acc = InputCovarianceAccumulator()
 C_acc.set_storage_dtype(B_cov_dtype)
-if _single_pass:
-    C_acc.set_hot_accumulator_device("cpu")
+_maybe_cpu_hot_accum(C_acc, _single_pass)
 ```
 
-All three are inside `if cross_cov_enabled:` guards so `C_acc` is non-None by the time the guard runs.
+All three are inside `if cross_cov_enabled:` guards so `C_acc` is non-None at each call.
 
-**VRAM argument.** Without CPU accum, G=40 would hold 40 layers × ~4 GB/layer of fp32 gate\_proj Grams on GPU ≈ 160 GB — impossible on a 141 GB H200 with both models resident. Task A is the mechanical prerequisite; Task B enforces it automatically at all three accumulator creation sites.
+**Code-review checklist item (impl reviewer must verify):** grep for `C_acc = InputCovarianceAccumulator()` in `orchestrator.py` — there must be exactly three matches, and each must have `_maybe_cpu_hot_accum(C_acc, _single_pass)` on the immediately following line (after `set_storage_dtype`). A missed site re-introduces the H2 OOM on single-pass runs with cross-covariance enabled.
+
+**VRAM argument.** Without CPU accum, G=40 would hold 40 layers × ~4 GB/layer of fp32 gate\_proj Grams on GPU ≈ 160 GB — impossible on a 141 GB H200 with both models resident. Task A is the mechanical prerequisite; Task B enforces it automatically at all four accumulator creation sites via the shared helper.
 
 ### Task C — `cov_num_sequences` knob
 
@@ -187,7 +203,7 @@ with:
 new = max(min(int(attempt * 0.75), attempt - 1), floor)
 ```
 
-Update the docstring of `run_with_oom_backoff` (:188-190) to read "18→13→9 instead of 18→9" as the recovery example.
+Update the docstring of `run_with_oom_backoff` (:188-190) to replace the existing description with "18→13→9 instead of 18→9" as the recovery example.
 
 **Termination proof.** For any `attempt > floor ≥ 1`: `int(attempt * 0.75) ≤ attempt - 1` for `attempt ≥ 4` (0.75×4=3<4). For `attempt=2`: `int(1.5)=1<2`. For `attempt=3`: `int(2.25)=2<3`. The `min(..., attempt-1)` clamp guarantees strict decrease for all values. The floor re-raise path is unchanged.
 
@@ -195,7 +211,7 @@ Update the docstring of `run_with_oom_backoff` (:188-190) to read "18→13→9 i
 
 ## Bite-sized TDD tasks
 
-> Discipline: write the failing test first (red), implement (green), commit. All tests use tiny synthetic tensors on CPU or CUDA-skip where noted. Zero model loads. Zero golden regen.
+> Discipline: write the failing test first (red), implement (green), commit. All tests use tiny synthetic tensors on CPU or are CUDA-skipped where noted. Zero model loads. Zero golden regen.
 
 ---
 
@@ -245,7 +261,7 @@ assert torch.equal(acc_gpu.covariance[k], acc_cpu.covariance[k])
 ```
 
 Run: `python -m pytest tests/test_stage3_cov_efficiency.py::test_update_gpu_hot_vs_cpu_hot_bitwise -x`
-Expected: **FAILED** (no migration logic).
+Expected: **FAILED** (no migration logic yet).
 Impl: in `update()` after `cov = flat_f32.transpose(0, 1) @ flat_f32`, add `if self._hot_accum_device is not None: cov = cov.to(self._hot_accum_device)`.
 Rerun: **PASSED**.
 Commit: `feat(stage3-cov-eff): Task A — update() hot-accum device migration`
@@ -272,10 +288,10 @@ k = (0, 0, "gate_proj")
 assert acc._pending[k].device.type == "cpu", \
     "_pending must be on CPU when hot_accum_device='cpu'"
 assert acc._pending[k].abs().max() > 0, \
-    "result must be non-zero (GEMM ran correctly)"
+    "result must be non-zero (GEMM ran correctly on GPU)"
 ```
 
-Run: **PASSED** after TA.2 impl (or skipped if no CUDA). No separate impl step.
+Run: **PASSED** after TA.2 impl (or SKIPPED if no CUDA). No separate impl.
 Commit: `test(stage3-cov-eff): Task A — GEMM-on-GPU / pending-on-CPU invariant`
 
 ---
@@ -312,7 +328,7 @@ Commit: `feat(stage3-cov-eff): Task A — update_cross() hot-accum migration`
 
 ---
 
-**TA.5 — `update_cross()` GEMM-result on GPU migrates to CPU (CUDA-gated)**
+**TA.5 — `update_cross()` GPU tensor migrates `_pending` to CPU (CUDA-gated)**
 
 Test `test_update_cross_pending_on_cpu_after_gpu_compute`:
 ```python
@@ -325,20 +341,17 @@ if not torch.cuda.is_available():
 acc = InputCovarianceAccumulator()
 acc.set_hot_accumulator_device("cpu")
 
-# cross is pre-computed; it may arrive from a GPU matmul
 cross = torch.randn(8, 8, device="cuda")
 acc.update_cross(0, 0, "gate_proj", cross, n_tokens=4)
 
 k = (0, 0, "gate_proj")
 assert acc._pending[k].device.type == "cpu", \
     "_pending must be on CPU when hot_accum_device='cpu'"
-
-# Verify content matches CPU reference
 expected = cross.to(torch.float32).cpu()
 assert torch.equal(acc._pending[k], expected)
 ```
 
-Run: **PASSED** after TA.4 impl (or skipped). No separate impl.
+Run: **PASSED** after TA.4 impl (or SKIPPED). No separate impl.
 Commit: `test(stage3-cov-eff): Task A — update_cross GPU-tensor pending-on-CPU invariant`
 
 ---
@@ -366,7 +379,7 @@ expected = (x.T @ x).to(acc.storage_dtype)
 assert torch.allclose(acc.covariance[k], expected, atol=1e-6)
 ```
 
-Run: **PASSED** after TA.2 impl (`.cpu()` is no-op on already-CPU). No separate impl.
+Run: **PASSED** after TA.2 impl (`.cpu()` is no-op on already-CPU tensor). No separate impl.
 Commit: `test(stage3-cov-eff): Task A — finalize_layer already-CPU pending transparent`
 
 ---
@@ -397,13 +410,13 @@ from moe_compress.stage3.plugins.covariance_collection import _resolve_cov_windo
 n = 40
 assert _resolve_cov_window({"stage3_svd": {"cov_single_pass": True}}, n) == n
 assert _resolve_cov_window({"multi_gpu": {"cov_window_size": "all"}}, n) == n
-assert _resolve_cov_window({"multi_gpu": {"cov_window_size": "ALL"}}, n) == n  # case-insensitive
+assert _resolve_cov_window({"multi_gpu": {"cov_window_size": "ALL"}}, n) == n
 
 # Default path: valid int in [1, n]
 result = _resolve_cov_window({}, n)
 assert 1 <= result <= n
 
-# n_layers=0 guard unchanged
+# n_layers=0 guard unchanged (fires before new code)
 assert _resolve_cov_window({"stage3_svd": {"cov_single_pass": True}}, 0) == 1
 ```
 
@@ -451,54 +464,46 @@ for k in cov_windowed:
     assert torch.equal(cov_windowed[k], cov_single[k]), f"mismatch at {k}"
 ```
 
-Run: **PASSED** after TA.2 (single-pass is mechanically window=n_layers + CPU accum).
+Run: **PASSED** after TA.2 impl. No separate impl.
 Commit: `test(stage3-cov-eff): Task B — single-pass vs windowed bitwise equality`
 
 ---
 
-**TB.3 — orchestrator wires CPU accumulator at ALL creation sites (targeted coupling test)**
+**TB.3 — `_maybe_cpu_hot_accum` helper: tests the real function each site calls**
 
-This test is specifically designed to catch H2-class bugs where a C_acc site is missed.
-
-Test `test_single_pass_wires_cpu_accum_on_b_acc_and_c_acc`:
+Test `test_maybe_cpu_hot_accum_helper`:
 ```python
-"""
-Simulate the orchestrator's _single_pass wiring logic by directly
-instantiating accumulators the same way the orchestrator does, applying
-the wiring, and asserting _hot_accum_device on both B_acc and C_acc.
-
-This tests the COUPLING between _single_pass and set_hot_accumulator_device
-— the same check that would have caught the H2 bug (C_acc site missed).
-"""
+import pytest
 from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
 
-B_cov_dtype = __import__("torch").bfloat16
+try:
+    from moe_compress.stage3.orchestrator import _maybe_cpu_hot_accum
+except ImportError:
+    pytest.fail("_maybe_cpu_hot_accum not yet in orchestrator")
 
-# --- simulate orchestrator resume-branch C_acc creation ---
-def _make_accumulators_resume(single_pass: bool):
-    B_acc = InputCovarianceAccumulator()
-    B_acc.set_storage_dtype(B_cov_dtype)
-    _single_pass = single_pass
-    if _single_pass:
-        B_acc.set_hot_accumulator_device("cpu")
-    # resume branch (mirrors :419-420 + fix)
-    C_acc = InputCovarianceAccumulator()
-    C_acc.set_storage_dtype(B_cov_dtype)
-    if _single_pass:
-        C_acc.set_hot_accumulator_device("cpu")
-    return B_acc, C_acc
+# (a) single_pass=True sets _hot_accum_device="cpu"
+acc_on = InputCovarianceAccumulator()
+result = _maybe_cpu_hot_accum(acc_on, single_pass=True)
+assert acc_on._hot_accum_device == "cpu"
 
-B, C = _make_accumulators_resume(single_pass=True)
-assert B._hot_accum_device == "cpu", "B_acc must be CPU-hot when single_pass=True"
-assert C._hot_accum_device == "cpu", "C_acc resume-branch must be CPU-hot when single_pass=True"
+# (b) single_pass=False leaves _hot_accum_device None
+acc_off = InputCovarianceAccumulator()
+result_off = _maybe_cpu_hot_accum(acc_off, single_pass=False)
+assert acc_off._hot_accum_device is None
 
-B2, C2 = _make_accumulators_resume(single_pass=False)
-assert B2._hot_accum_device is None, "B_acc must be None when single_pass=False"
-assert C2._hot_accum_device is None, "C_acc must be None when single_pass=False"
+# (c) returns the same accumulator object (for chaining / call-site clarity)
+assert result is acc_on
+assert result_off is acc_off
 ```
 
-Run: **PASSED** after TA.1 impl (tests the wiring pattern, not `_resolve_cov_window`).
-Commit: `test(stage3-cov-eff): Task B — B_acc+C_acc CPU-hot coupling test`
+Run: `python -m pytest tests/test_stage3_cov_efficiency.py::test_maybe_cpu_hot_accum_helper -x`
+Expected: **FAILED** (ImportError — helper not yet defined).
+Impl: add `_maybe_cpu_hot_accum` to `orchestrator.py` (before `run()`); wire all four call sites (B_acc at :254, C_acc at :419, :478, :518).
+
+**Impl reviewer must verify:** run `grep -n "C_acc = InputCovarianceAccumulator()" src/moe_compress/stage3/orchestrator.py` — must show exactly three hits. Each must have `_maybe_cpu_hot_accum(C_acc, _single_pass)` on the line immediately following `C_acc.set_storage_dtype(...)`. A missed site re-introduces the H2 OOM on single-pass runs with cross-covariance enabled.
+
+Rerun: **PASSED**.
+Commit: `feat(stage3-cov-eff): Task B — _maybe_cpu_hot_accum helper + all four call sites`
 
 ---
 
@@ -517,7 +522,7 @@ Expected: all PASSED.
 
 ### Task C — `cov_num_sequences` knob
 
-**TC.1 — `spec_from_config` `num_sequences_override` contract (confirms the hook exists)**
+**TC.1 — `spec_from_config` `num_sequences_override` contract (confirms hook exists before orchestrator work)**
 
 Test `test_spec_from_config_num_sequences_override_contract`:
 ```python
@@ -541,7 +546,7 @@ assert spec_with.seed == spec_without.seed
 assert cal["num_sequences"] == 2048
 ```
 
-Run: **PASSED** (confirms calibration.py:357 hook before orchestrator work begins).
+Run: **PASSED** (confirms `calibration.py:357` hook exists before impl begins).
 Commit: `test(stage3-cov-eff): Task C — spec_from_config num_sequences_override contract`
 
 ---
@@ -615,11 +620,11 @@ def _fake_run(batch):
 
 result = run_with_oom_backoff(_fake_run, start_batch=18, floor=4)
 
-# 18 → min(int(18*0.75), 17) = min(13, 17) = 13 (OOM)
-# 13 → min(int(13*0.75), 12) = min(9, 12) = 9 (success, 9 <= 10)
+# 18 → min(int(18*0.75), 17) = min(13, 17) = 13  (OOM)
+# 13 → min(int(13*0.75), 12) = min(9,  12) = 9   (success)
 assert attempts == [18, 13, 9], f"expected [18, 13, 9], got {attempts}"
 assert result == 9
-assert len(attempts) > 2, "must take more steps than halving ([18,9])"
+assert len(attempts) > 2, "must take more steps than halving ([18, 9])"
 ```
 
 Run: `python -m pytest tests/test_stage3_cov_efficiency.py::test_run_with_oom_backoff_gentler_sequence -x`
@@ -687,10 +692,7 @@ Commit: `test(stage3-cov-eff): Task D — strict-decrease termination to floor`
 **TD.4 — full suite gate**
 
 ```bash
-python -m pytest \
-    tests/test_stage3_cov_efficiency.py \
-    -v -k "backoff"
-
+python -m pytest tests/test_stage3_cov_efficiency.py -v -k "backoff"
 python -m pytest tests/ -q --tb=short
 ```
 Expected: all PASSED.
@@ -726,7 +728,7 @@ Run on a GPU box where the 35B model fits (H200 or equivalent):
 
 1. **Byte-identical default gate.** Run Stage-3 at default config (no new knobs set). Assert `torch.equal` on every finalized `B_cov` / `C_cov` key vs a pre-recorded reference.
 
-2. **Single-pass CPU-hot vs windowed GPU-hot.** With `cov_single_pass: true`, run Stage-3 cov collection on 1-2 layers; assert `torch.equal` on `B_cov` and `C_cov` vs the windowed baseline at `cov_batch_size=1`. Confirm all three C_acc creation branches produce CPU-resident `_pending` (verify by checking `C_acc._hot_accum_device == "cpu"` in a debug log or assertion before `_collect_covariances` runs).
+2. **Single-pass CPU-hot vs windowed GPU-hot.** With `cov_single_pass: true`, run Stage-3 cov collection on 1-2 layers; assert `torch.equal` on `B_cov` and `C_cov` vs the windowed baseline at `cov_batch_size=1`. Confirm all four accumulator sites have `_hot_accum_device == "cpu"` before `_collect_covariances` runs (log or debug assertion).
 
 3. **`cov_num_sequences: 512` quality gate.** Run the full pipeline (cov → d-rank → α-search → factor) with the override; confirm: (a) `rank_map.json` rank distribution differs from the 2048-sequence baseline by ≤ 5% of keys; (b) WikiText-2 PPL degrades ≤ 0.05 nats vs baseline.
 
@@ -738,14 +740,15 @@ Run on a GPU box where the 35B model fits (H200 or equivalent):
 
 - [ ] **TA.1** `_hot_accum_device` field + `set_hot_accumulator_device()` added; test PASSES
 - [ ] **TA.2** `update()` migrates result to `_hot_accum_device` after GPU GEMM; bitwise equality test PASSES
-- [ ] **TA.3** CUDA-gated: `update()` GEMM-on-GPU / `_pending`-on-CPU invariant test PASSES or SKIPPED
+- [ ] **TA.3** CUDA-gated: `update()` GEMM-on-GPU / `_pending`-on-CPU invariant PASSES or SKIPPED
 - [ ] **TA.4** `update_cross()` migrates `cross_f32` to `_hot_accum_device`; CPU bitwise equality test PASSES
-- [ ] **TA.5** CUDA-gated: `update_cross()` GPU-tensor pending-on-CPU invariant test PASSES or SKIPPED
+- [ ] **TA.5** CUDA-gated: `update_cross()` GPU-tensor `_pending`-on-CPU invariant PASSES or SKIPPED
 - [ ] **TA.6** `finalize_layer` already-CPU pending transparent; test PASSES
 - [ ] **TA.7** full suite gate — all PASSED, zero regen
 - [ ] **TB.1** `_resolve_cov_window` single-pass + `"all"` → test PASSES
 - [ ] **TB.2** single-pass vs windowed G=2 bitwise equality test PASSES
-- [ ] **TB.3** B_acc + C_acc CPU-hot coupling test PASSES (catches H2-class missed-site bugs)
+- [ ] **TB.3** `_maybe_cpu_hot_accum` imported and tested; (a) True→"cpu", (b) False→None, (c) returns same object — PASSES; impl adds helper + all four call sites
+- [ ] **TB.3 code-review gate** `grep -n "C_acc = InputCovarianceAccumulator()" src/moe_compress/stage3/orchestrator.py` shows exactly three hits; each is immediately followed by `_maybe_cpu_hot_accum(C_acc, _single_pass)` — a missed site re-introduces the H2 OOM
 - [ ] **TB.4** full suite gate — all PASSED
 - [ ] **TC.1** `spec_from_config num_sequences_override` contract test PASSES
 - [ ] **TC.2** `_resolve_bcov_spec` helper + orchestrator wire; test PASSES
