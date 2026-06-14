@@ -1078,6 +1078,11 @@ class InputCovarianceAccumulator:
             return
         key = (layer_idx, expert_idx, matrix_name)
         cross_f32 = cross.to(torch.float32)
+        # Opt-in CPU hot-accumulator (Task A): the caller computes ``cross`` on
+        # the input device (typically GPU); only the result migrates so the
+        # running-sum frees per-layer GPU VRAM. Default path (None) byte-identical.
+        if self._hot_accum_device is not None:
+            cross_f32 = cross_f32.to(self._hot_accum_device)
         with self._lock:
             cur = self._pending.get(key)
             if cur is None:

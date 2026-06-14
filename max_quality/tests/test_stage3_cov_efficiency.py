@@ -54,3 +54,25 @@ def test_update_gemm_on_gpu_pending_on_cpu():
         "_pending must be on CPU when hot_accum_device='cpu'"
     assert acc._pending[k].abs().max() > 0, \
         "result must be non-zero (GEMM ran correctly on GPU)"
+
+
+def test_update_cross_gpu_hot_vs_cpu_hot_bitwise():
+    import torch
+    from moe_compress.utils.activation_hooks import InputCovarianceAccumulator
+
+    torch.manual_seed(7)
+    d = 12
+    acc_gpu = InputCovarianceAccumulator()
+    acc_cpu = InputCovarianceAccumulator()
+    acc_cpu.set_hot_accumulator_device("cpu")
+
+    for _ in range(4):
+        cross = torch.randn(d, d)   # CPU tensor
+        acc_gpu.update_cross(0, 0, "gate_proj", cross, n_tokens=8)
+        acc_cpu.update_cross(0, 0, "gate_proj", cross, n_tokens=8)
+
+    acc_gpu.finalize_layer(0)
+    acc_cpu.finalize_layer(0)
+
+    k = (0, 0, "gate_proj")
+    assert torch.equal(acc_gpu.covariance[k], acc_cpu.covariance[k])
