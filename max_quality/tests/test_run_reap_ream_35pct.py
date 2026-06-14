@@ -343,6 +343,91 @@ def test_arm_specs_reap_resumes_post_2p5_ream_runs_2p5():
     assert ream.stage_windows == ((2, 2), (3, 6))
 
 
+# ===========================================================================
+# Task 2: HF seed helper — place stage2p5_final/ on disk (content-verified)
+# ===========================================================================
+
+def _make_fake_checkpoint(dest, *, subdir: bool):
+    """Populate ``dest`` with a tiny stub stage2p5 checkpoint in one of the two
+    candidate repo layouts: files at root (subdir=False) or under a
+    ``stage2p5_final/`` subdir (subdir=True). Index lists one shard that exists."""
+    import json as _j
+    from pathlib import Path as _P
+
+    root = _P(dest) / "stage2p5_final" if subdir else _P(dest)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.json").write_text("{}", encoding="utf-8")
+    (root / "model-00001-of-00001.safetensors").write_bytes(b"\x00\x01")
+    (root / "model.safetensors.index.json").write_text(
+        _j.dumps({"weight_map": {"w": "model-00001-of-00001.safetensors"}}),
+        encoding="utf-8",
+    )
+    (root / "compressed_metadata.json").write_text(
+        _j.dumps({"survivors": 200}), encoding="utf-8")
+
+
+def _fake_downloader(layout_subdir):
+    """Return a fake snapshot_download that populates ``local_dir`` in the chosen
+    layout and records call count."""
+    calls = {"n": 0}
+
+    def _dl(*, repo_id, local_dir, **kw):
+        calls["n"] += 1
+        _make_fake_checkpoint(local_dir, subdir=layout_subdir)
+        return str(local_dir)
+
+    _dl.calls = calls
+    return _dl
+
+
+@pytest.mark.parametrize("layout_subdir", [False, True])
+def test_seed_stage2p5_from_hub_places_and_verifies(tmp_path, layout_subdir):
+    """Both repo layouts (files at root, or under stage2p5_final/) produce a
+    populated, content-verified arm_dir/stage2p5_final/. The fake downloader
+    never hits the network."""
+    arm_dir = tmp_path / "reap-s234"
+    dl = _fake_downloader(layout_subdir)
+    rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=dl)
+
+    final = arm_dir / "stage2p5_final"
+    assert (final / "compressed_metadata.json").exists()
+    assert (final / "model.safetensors.index.json").exists()
+    assert (final / "model-00001-of-00001.safetensors").exists()
+    assert (final / "config.json").exists()
+    assert dl.calls["n"] == 1
+
+
+def test_seed_stage2p5_from_hub_is_idempotent(tmp_path):
+    """A second call with the metadata already present does NOT re-download."""
+    arm_dir = tmp_path / "reap-s234"
+    dl = _fake_downloader(False)
+    rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=dl)
+    rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=dl)
+    assert dl.calls["n"] == 1  # second call short-circuited
+
+
+def test_seed_stage2p5_from_hub_raises_on_missing_shard(tmp_path):
+    """CONTENT-VERIFY: a half-download (index lists a shard that is absent) must
+    RAISE loudly, never silently fall back to stage2_pruned."""
+    arm_dir = tmp_path / "reap-s234"
+
+    def _bad_dl(*, repo_id, local_dir, **kw):
+        import json as _j
+        from pathlib import Path as _P
+        root = _P(local_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "config.json").write_text("{}", encoding="utf-8")
+        (root / "compressed_metadata.json").write_text("{}", encoding="utf-8")
+        # index references a shard that is NOT on disk
+        (root / "model.safetensors.index.json").write_text(
+            _j.dumps({"weight_map": {"w": "model-00001-of-00001.safetensors"}}),
+            encoding="utf-8")
+        return str(local_dir)
+
+    with pytest.raises(RuntimeError, match="shard"):
+        rr._seed_stage2p5_from_hub("pirola/fake", arm_dir, _downloader=_bad_dl)
+
+
 # --- small tmp helpers for the iso-K REAM-pin write/read ---
 
 import contextlib  # noqa: E402

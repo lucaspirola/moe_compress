@@ -316,6 +316,140 @@ def derive_solver_budget(model, base_config: dict) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# HF seed — place a post-2.5 stage2p5_final/ checkpoint on disk for a seeded arm
+# ---------------------------------------------------------------------------
+
+# The 4 file KINDS a resume@3 needs in stage2p5_final/ (run_pipeline.py:516-535).
+_STAGE2P5_REQUIRED = (
+    "config.json",
+    "model.safetensors.index.json",
+    "compressed_metadata.json",
+)
+
+
+def _seed_stage2p5_from_hub(
+    repo: str,
+    arm_dir: Path,
+    *,
+    _downloader: Callable[..., Any] = snapshot_download,
+) -> Path:
+    """Download a post-2.5 checkpoint from the Hub and materialize
+    ``arm_dir/stage2p5_final/`` so a ``--resume-from-stage 3`` run loads it from
+    disk (run_pipeline.py:516-535 — no in-process Hub download).
+
+    Handles BOTH repo layouts: the checkpoint files at the repo ROOT, or under a
+    ``stage2p5_final/`` subdir — detected by probing for ``compressed_metadata.json``.
+
+    Idempotent: if ``arm_dir/stage2p5_final/compressed_metadata.json`` is already
+    present, skips the download entirely (a re-run / resumed arm does not
+    re-fetch 52 GB).
+
+    CONTENT-VERIFY (per [[feedback_verify_content_not_filesize]]): after placing,
+    asserts ``compressed_metadata.json`` parses AND every shard listed in
+    ``model.safetensors.index.json`` exists on disk; RAISES loudly on any gap —
+    a half-download must FAIL, never silently fall back to ``stage2_pruned``.
+
+    The ``_downloader`` seam keeps tests off the network.
+
+    Returns the placed ``stage2p5_final/`` dir.
+    """
+    final_dir = arm_dir / "stage2p5_final"
+    meta_path = final_dir / "compressed_metadata.json"
+    if meta_path.exists():
+        log.info("[seed] %s already present — skipping Hub download (idempotent)",
+                 meta_path)
+        _verify_stage2p5_content(final_dir)
+        return final_dir
+
+    final_dir.mkdir(parents=True, exist_ok=True)
+    snap_root = arm_dir / "_hub_snapshot_stage2p5"
+    snap_root.mkdir(parents=True, exist_ok=True)
+    log.info("[seed] downloading %s → %s", repo, snap_root)
+    _downloader(repo_id=repo, local_dir=str(snap_root))
+
+    # Detect the layout: files at root, or nested under stage2p5_final/.
+    if (snap_root / "compressed_metadata.json").exists():
+        src_root = snap_root
+    elif (snap_root / "stage2p5_final" / "compressed_metadata.json").exists():
+        src_root = snap_root / "stage2p5_final"
+    else:
+        raise RuntimeError(
+            f"[seed] {repo}: compressed_metadata.json not found at the snapshot "
+            f"root ({snap_root}) nor under a stage2p5_final/ subdir — cannot "
+            "locate the post-2.5 checkpoint. Refusing to resume Stage 3."
+        )
+
+    # Copy the checkpoint files (config + index + metadata + every shard) into
+    # arm_dir/stage2p5_final/. Shards are matched by the model-*.safetensors glob
+    # plus whatever the index names, so non-standard shard names still transfer.
+    for name in _STAGE2P5_REQUIRED:
+        src = src_root / name
+        if not src.exists():
+            raise RuntimeError(
+                f"[seed] {repo}: required file {name} missing from the snapshot "
+                f"({src}). The Hub checkpoint is incomplete; refusing to resume."
+            )
+        shutil.copy2(src, final_dir / name)
+    for shard in src_root.glob("model-*.safetensors"):
+        shutil.copy2(shard, final_dir / shard.name)
+    # Also carry any single-file model.safetensors if that is the layout.
+    single = src_root / "model.safetensors"
+    if single.exists():
+        shutil.copy2(single, final_dir / single.name)
+
+    # Optional _shared/ metadata ride-along: copy only what is MISSING locally
+    # (do not clobber a locally-seeded _shared/).
+    src_shared = src_root / "_shared"
+    if src_shared.is_dir():
+        dst_shared = arm_dir.parent / "_shared"
+        dst_shared.mkdir(parents=True, exist_ok=True)
+        for f in src_shared.iterdir():
+            if f.is_file() and not (dst_shared / f.name).exists():
+                shutil.copy2(f, dst_shared / f.name)
+
+    _verify_stage2p5_content(final_dir)
+    log.info("[seed] placed + content-verified %s", final_dir)
+    return final_dir
+
+
+def _verify_stage2p5_content(final_dir: Path) -> None:
+    """CONTENT-VERIFY the placed stage2p5_final/: metadata parses + every shard
+    the index lists exists on disk. RAISE loudly on any gap (a half-download
+    must FAIL, never silently fall back to stage2_pruned)."""
+    meta_path = final_dir / "compressed_metadata.json"
+    try:
+        json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"[seed] compressed_metadata.json at {meta_path} does not parse "
+            f"({exc!r}) — the seeded post-2.5 checkpoint is corrupt."
+        ) from exc
+
+    index_path = final_dir / "model.safetensors.index.json"
+    if not index_path.exists():
+        raise RuntimeError(
+            f"[seed] model.safetensors.index.json missing from {final_dir} — "
+            "cannot verify shard completeness; refusing to resume Stage 3."
+        )
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"[seed] index {index_path} does not parse ({exc!r})."
+        ) from exc
+    weight_map = index.get("weight_map", {}) or {}
+    shards = sorted(set(weight_map.values()))
+    missing = [s for s in shards if not (final_dir / s).exists()]
+    if missing:
+        raise RuntimeError(
+            f"[seed] {len(missing)} shard(s) listed in the index are absent from "
+            f"{final_dir}: {missing[:5]}{'...' if len(missing) > 5 else ''}. The "
+            "post-2.5 download is incomplete — refusing to resume Stage 3 on a "
+            "half-checkpoint (would silently fall back to stage2_pruned)."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Config builder — paper-pure Stage-2 + WS2 dials + M-C net accounting (pure)
 # ---------------------------------------------------------------------------
 
