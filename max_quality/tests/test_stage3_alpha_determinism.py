@@ -172,3 +172,63 @@ def test_producer1_uses_cholesky_spectrum():
             A = 0.5 * (A + A.T)
             inline = torch.linalg.svdvals(W @ _alpha_whiten_factor(A))
             assert torch.equal(grouped_svs[name][(layer_idx, e)], inline)
+
+
+def test_alpha_selection_invariant_under_epsilon_perturbation():
+    """A near-tie α is stable under a relative ±1e-12 perturbation of A_cov
+    (what cross-host jitter looks like)."""
+    from moe_compress.stage3.plugins.swift_svd_alpha import _swift_svd_plus_alpha_search
+    layer_idx, n, d_int, d_hid = 0, 4, 6, 8
+    experts = _FusedExperts(n, d_int, d_hid, seed=3)
+    ref = _make_layer_ref(layer_idx, experts)
+    A_cov = _build_acov(layer_idx, experts, d_hid, d_int)
+    gs = _group_stats_for(layer_idx, experts, d_int, d_hid)
+    base = {k: 3 for k in gs}
+    grid = [0.0, 0.5, 1.0]
+    a0, _ = _swift_svd_plus_alpha_search([ref], gs, base, grid,
+                                         per_group_type=True, A_cov=A_cov, return_svs=True)
+    A_pert = {k: v * (1.0 + 1e-12) for k, v in A_cov.items()}
+    a1, _ = _swift_svd_plus_alpha_search([ref], gs, base, grid,
+                                         per_group_type=True, A_cov=A_pert, return_svs=True)
+    assert a0 == a1, f"alpha flipped under epsilon: {a0} vs {a1}"
+
+
+def test_alpha_clear_winner_preserved():
+    """The ε-tolerance does NOT mask a genuine winner: a tight budget gives real
+    tail-energy separation; the winner is stable across a ±1e-12 perturbation."""
+    from moe_compress.stage3.plugins.swift_svd_alpha import _swift_svd_plus_alpha_search
+    layer_idx, n, d_int, d_hid = 0, 4, 6, 8
+    experts = _FusedExperts(n, d_int, d_hid, seed=11)
+    ref = _make_layer_ref(layer_idx, experts)
+    A_cov = _build_acov(layer_idx, experts, d_hid, d_int)
+    gs = _group_stats_for(layer_idx, experts, d_int, d_hid)
+    base = {k: 1 for k in gs}  # tight budget → real tail-energy separation
+    grid = [0.0, 0.5, 1.0]
+    a0, _ = _swift_svd_plus_alpha_search([ref], gs, base, grid,
+                                         per_group_type=True, A_cov=A_cov, return_svs=True)
+    A_pert = {k: v * (1.0 + 1e-12) for k, v in A_cov.items()}
+    a1, _ = _swift_svd_plus_alpha_search([ref], gs, base, grid,
+                                         per_group_type=True, A_cov=A_pert, return_svs=True)
+    assert a0 == a1
+
+
+def test_redistribute_ranks_invariant_under_epsilon():
+    """Integer ranks (covers F1-doc §2.3 score-value drift) are identical under
+    the same ±1e-12 A_cov perturbation."""
+    from moe_compress.stage3.plugins.swift_svd_alpha import (
+        _swift_svd_plus_alpha_search, _redistribute_ranks_swift_svd_plus,
+    )
+    layer_idx, n, d_int, d_hid = 0, 4, 6, 8
+    experts = _FusedExperts(n, d_int, d_hid, seed=3)
+    ref = _make_layer_ref(layer_idx, experts)
+    A_cov = _build_acov(layer_idx, experts, d_hid, d_int)
+    gs = _group_stats_for(layer_idx, experts, d_int, d_hid)
+    base = {k: 3 for k in gs}
+    a0, _ = _swift_svd_plus_alpha_search([ref], gs, base, [0.0, 0.5, 1.0],
+                                         per_group_type=True, A_cov=A_cov, return_svs=True)
+    r0 = _redistribute_ranks_swift_svd_plus([ref], gs, base, a0, A_cov=A_cov)
+    A_pert = {k: v * (1.0 + 1e-12) for k, v in A_cov.items()}
+    a1, _ = _swift_svd_plus_alpha_search([ref], gs, base, [0.0, 0.5, 1.0],
+                                         per_group_type=True, A_cov=A_pert, return_svs=True)
+    r1 = _redistribute_ranks_swift_svd_plus([ref], gs, base, a1, A_cov=A_pert)
+    assert r0 == r1

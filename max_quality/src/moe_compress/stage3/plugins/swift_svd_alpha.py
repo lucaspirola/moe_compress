@@ -238,6 +238,12 @@ from .d_rank_allocate import _GroupStats
 
 log = logging.getLogger(__name__)
 
+# F1 §3.2: relative tie-break so a near-tied α never depends on float ordering.
+# Larger than residual fp64 round-off (~1e-13..1e-15) after Cholesky whitening,
+# smaller than any meaningful spectral gap (35B gate_proj real gap ~1.4%).
+# Ties resolve to the lowest grid index / lowest α (matches strict-< + _argmin_alpha).
+ALPHA_ERR_REL_TOL = 1e-9
+
 # M1 / D-raw-svd-fallback: emit ONE warning per process the first time we fall
 # through to raw svdvals(W) because A_cov is None. Subsequent calls are silent
 # (one warning is enough — flooding the log buys nothing). Reset by reloading
@@ -1338,22 +1344,22 @@ def _swift_svd_plus_alpha_search(
         # before relying on per-type α.
         best_alphas: dict[str, float] = {}
         for name in MATRIX_NAMES:
-            best_alpha = 0.5
+            best_alpha = alpha_grid[0]
             best_err = float("inf")
             for alpha in alpha_grid:
                 err = _evaluate_alpha(name, alpha)
-                if err < best_err:
+                if err < best_err * (1.0 - ALPHA_ERR_REL_TOL):  # strictly better beyond tol
                     best_err = err
                     best_alpha = alpha
             best_alphas[name] = best_alpha
             log.info("  Swift-SVD+ %s: best α=%.1f (err=%.4e)", name, best_alpha, best_err)
         return (best_alphas, grouped_svs) if return_svs else best_alphas
     else:
-        best_alpha = 0.5
+        best_alpha = alpha_grid[0]
         best_err = float("inf")
         for alpha in alpha_grid:
             err = sum(_evaluate_alpha(n, alpha) for n in MATRIX_NAMES)
-            if err < best_err:
+            if err < best_err * (1.0 - ALPHA_ERR_REL_TOL):
                 best_err = err
                 best_alpha = alpha
         log.info("  Swift-SVD+ global: best α=%.1f (err=%.4e)", best_alpha, best_err)
