@@ -305,5 +305,46 @@ def test_resolve_bcov_spec_helper():
     spec_without = _resolve_bcov_spec({}, cal)
     assert spec_without.num_sequences == 2048
 
+    # Seed is unchanged by the override (self-contained guard)
+    assert spec_with.seed == spec_without.seed
+
     # cal dict not mutated
     assert cal["num_sequences"] == 2048
+
+
+def test_dp_replica_worker_threads_cov_num_sequences_override():
+    """The DP multi-GPU replica worker MUST honor cov_num_sequences so it builds
+    the SAME calib length as the in-process _resolve_bcov_spec path; otherwise
+    the parent's shard bounds (computed against the override-length calib) slice
+    a differently-sized worker calib → corrupted reduced covariance.
+
+    Spawning real processes isn't feasible here, so this asserts (a) the worker
+    exposes the override param, and (b) the worker's spec-build (same kwargs)
+    produces a spec IDENTICAL to _resolve_bcov_spec for the same override.
+    """
+    import inspect
+
+    from moe_compress.stage3.orchestrator import _resolve_bcov_spec
+    from moe_compress.stage3.plugins.covariance_collection import _cov_replica_worker
+    from moe_compress.utils.calibration import spec_from_config
+
+    # (a) param exists with a None default (default path = no override).
+    sig = inspect.signature(_cov_replica_worker)
+    assert "cov_num_sequences_override" in sig.parameters
+    assert sig.parameters["cov_num_sequences_override"].default is None
+
+    cal = {
+        "num_sequences": 2048, "sequence_length": 512, "seed": 0,
+        "source": "nvidia-cascade", "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data",
+        "subset_weights": {"math": 1.0},
+    }
+
+    # (b) For any override (incl. None), the worker's spec build (same kwargs it
+    # uses internally) matches the in-process _resolve_bcov_spec spec.
+    for override, s3 in ((512, {"cov_num_sequences": 512}), (None, {})):
+        worker_spec = spec_from_config(
+            cal, seed_offset=2, num_sequences_override=override
+        )
+        inproc_spec = _resolve_bcov_spec(s3, cal)
+        assert worker_spec.num_sequences == inproc_spec.num_sequences
+        assert worker_spec.seed == inproc_spec.seed

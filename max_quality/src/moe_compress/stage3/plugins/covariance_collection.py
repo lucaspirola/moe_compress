@@ -1124,6 +1124,7 @@ def _cov_replica_worker(
     ccov_replica_dir,
     cross_cov_enabled: bool,
     bcov_storage_dtype: str,
+    cov_num_sequences_override: int | None = None,
 ) -> None:
     """Spawn target: one data-parallel replica. Pins itself to its GPU subset
     via ``CUDA_VISIBLE_DEVICES``, reloads teacher+student, runs
@@ -1155,8 +1156,14 @@ def _cov_replica_worker(
     B_dtype = getattr(_torch, bcov_storage_dtype)
 
     # Rebuild the SAME calibration tensor, then slice this replica's shard.
+    # MUST thread cov_num_sequences_override so the replica's rebuilt spec has
+    # the SAME num_sequences as the parent's _resolve_bcov_spec-built calib;
+    # otherwise the parent's shard bounds (computed against the override-length
+    # tensor) slice a differently-sized worker calib → corrupted reduction.
     cal = config["calibration"]
-    spec = _spec_from_config(cal, seed_offset=2)
+    spec = _spec_from_config(
+        cal, seed_offset=2, num_sequences_override=cov_num_sequences_override
+    )
     student, tokenizer, _ = _load_compressed_model(
         student_path,
         device_map=config["model"]["device_map"],
@@ -1285,6 +1292,12 @@ def run_dp_covariance_collection(
     ccov_spill_dir = _Path(ccov_spill_dir) if ccov_spill_dir is not None else None
     store_dtype = getattr(_torch, bcov_storage_dtype)
 
+    # Mirror _resolve_bcov_spec's read of stage3_svd.cov_num_sequences so every
+    # replica builds the SAME spec as the in-process path. None → no override.
+    _s3 = config.get("stage3_svd") or {}
+    _cov_num_seq = _s3.get("cov_num_sequences")
+    _cov_num_seq_override = int(_cov_num_seq) if _cov_num_seq is not None else None
+
     bcov_replica_dirs = []
     ccov_replica_dirs = []
     spawn_args = []
@@ -1303,7 +1316,7 @@ def run_dp_covariance_collection(
         spawn_args.append(
             (r, visible, config, str(artifacts_dir), str(student_path),
              start, end, str(b_dir), (str(c_dir) if c_dir is not None else None),
-             cross_cov_enabled, bcov_storage_dtype)
+             cross_cov_enabled, bcov_storage_dtype, _cov_num_seq_override)
         )
         start = end
 

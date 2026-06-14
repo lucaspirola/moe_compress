@@ -164,7 +164,8 @@ def _resolve_bcov_spec(s3: dict, cal: dict):
     Reads ``stage3_svd.cov_num_sequences``; if set, overrides num_sequences
     for the cov pass only via spec_from_config's existing kwarg. Does NOT
     mutate the caller's cal dict. Absent → cal["num_sequences"] unchanged
-    (byte-identical default).
+    (byte-identical default). Note: cov_num_sequences=0 raises ValueError via
+    spec_from_config's num_sequences>0 check.
     """
     _cov_num_seq = s3.get("cov_num_sequences")
     return spec_from_config(
