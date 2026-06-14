@@ -591,6 +591,60 @@ def test_multi_gpu_overlay_guard_trips_on_odd_base_batch():
                             prune_fraction=0.23, num_gpus=2)
 
 
+# ===========================================================================
+# Task 5: --whitening-cov flag wires acov shift-cov + persist
+# ===========================================================================
+
+def test_whitening_cov_default_anchor_no_persist_shift():
+    """Default anchor ⇒ whitening_cov=='anchor' AND persist_shift_covariance
+    NOT set (byte-identical historical path)."""
+    cfg = rr.build_arm_config(_base(), method="faithful_prune",
+                              prune_fraction=0.23)  # default whitening_cov
+    assert cfg["stage4_eora"]["whitening_cov"] == "anchor"
+    assert "persist_shift_covariance" not in cfg.get("stage3_svd", {})
+
+
+def test_whitening_cov_shift_sets_persist_shift():
+    cfg = rr.build_arm_config(_base(), method="faithful_prune",
+                              prune_fraction=0.23, whitening_cov="shift")
+    assert cfg["stage4_eora"]["whitening_cov"] == "shift"
+    assert cfg["stage3_svd"]["persist_shift_covariance"] is True
+
+
+def test_whitening_cov_anchored_adaptive_sets_persist_shift():
+    cfg = rr.build_arm_config(_base(), method="merge",
+                              prune_fraction=0.23,
+                              whitening_cov="anchored_adaptive")
+    assert cfg["stage4_eora"]["whitening_cov"] == "anchored_adaptive"
+    assert cfg["stage3_svd"]["persist_shift_covariance"] is True
+
+
+def test_whitening_cov_rejects_unknown():
+    with pytest.raises(ValueError, match="whitening_cov"):
+        rr.build_arm_config(_base(), method="faithful_prune",
+                            prune_fraction=0.23, whitening_cov="bogus")
+
+
+def test_cli_parses_whitening_cov_and_num_gpus(monkeypatch):
+    """--whitening-cov + --num-gpus reach args (parser smoke; main not run)."""
+    import argparse
+    captured = {}
+
+    real_parse = argparse.ArgumentParser.parse_args
+
+    def _spy(self, argv=None):
+        ns = real_parse(self, argv)
+        captured.update(vars(ns))
+        raise SystemExit(0)  # bail before any I/O
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", _spy)
+    with pytest.raises(SystemExit):
+        rr.main(["--config", "x.yaml", "--model", "m", "--probe-root", "p",
+                 "--whitening-cov", "shift", "--num-gpus", "4"])
+    assert captured["whitening_cov"] == "shift"
+    assert captured["num_gpus"] == 4
+
+
 # --- small tmp helpers for the iso-K REAM-pin write/read ---
 
 import contextlib  # noqa: E402
