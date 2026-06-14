@@ -558,25 +558,28 @@ def build_arm_config(
     # num_gpus<2 injects NONE of these ⇒ the 1-GPU path is byte-identical to the
     # historical config. All these knobs are default-OFF in their stage plugins.
     if num_gpus >= 2:
-        # Stage-3 cov DP + per-expert SVD + α-grid + Stage-4 EoRA concurrency.
+        # RESULT-PRESERVING SUBSET (live 2×H200 validation 2026-06-14):
+        # the data-parallel AUTO-BATCH cov paths (multi_gpu.cov_replicas and
+        # stage2_reap_ream.profile_dp) are EXCLUDED — validate_cov_dp_live.py
+        # showed a 2-replica auto-batched reduce is NOT bitwise-equal to the
+        # 1-GPU bs=1 cov (bf16 MoE/attention forward is not batch-invariant, so
+        # replicas that auto-size a different batch drift the covariance at fp
+        # level). validate_cov_sharded_live.py confirmed sharding + the reduce
+        # MATH are bitwise-exact, so the drift is purely auto-batch. cov collection
+        # is also not the bottleneck (the 35B student fits one H200), so we run it
+        # 1-GPU and keep the covariance bitwise-faithful.
+        #
+        # KEPT (byte-identical / grad-avg-equivalent, high value):
+        #   * Stage-3 per-expert SVD factor + α-grid task-parallel (independent
+        #     per-expert work, no cross-device reduction) — multi_gpu.{factor,alpha}_workers
+        #   * Stage-4 EoRA per-expert concurrency — multi_gpu.eora_workers
+        #   * Stage-2.5 + Stage-5 Router-KD DDP (the runtime long pole)
         # All read top-level config.get("multi_gpu", {}) (stage3/orchestrator.py
-        # :97,119,137 ; stage4/orchestrator.py:80).
+        # :119,137 ; stage4/orchestrator.py:80).
         mg = cfg.setdefault("multi_gpu", {})
-        mg["cov_replicas"] = num_gpus
         mg["factor_workers"] = num_gpus
         mg["alpha_workers"] = num_gpus
         mg["eora_workers"] = num_gpus
-
-        # Stage-2 profile DP. M2: profile_dp is SILENTLY disabled on a Stage-2
-        # *resume* (profile_dp.py:10-14) — if the ream arm crashes mid-Stage-2
-        # and resumes, this enabled=True is overridden to serial with a loud log.
-        # Acceptable; noted so the operator isn't surprised. (Also auto-disables
-        # if a reservoir consumer is active; ream by-the-book uses
-        # cost_alignment="pre" + expert_distill_steps=0 + no merge_step=mergemoe,
-        # so it does NOT auto-disable here.)
-        pdp = cfg["stage2_reap_ream"].setdefault("profile_dp", {})
-        pdp["enabled"] = True
-        pdp["replicas"] = "auto"
 
         # Stage-2.5 + Stage-5 DDP (both read stage5_router_kd regardless of
         # stage_key — router_kd/orchestrator.py:200). NO stage6_validate.eval_shard

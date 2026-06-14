@@ -575,13 +575,14 @@ def test_multi_gpu_overlay_injected_when_num_gpus_2():
     cfg = rr.build_arm_config(_base_mg(), method="faithful_prune",
                               prune_fraction=0.23, num_gpus=2)
     mg = cfg["multi_gpu"]
-    assert mg["cov_replicas"] == 2
+    # RESULT-PRESERVING SUBSET (live 2-GPU validation 2026-06-14): the auto-batch
+    # cov-DP paths are EXCLUDED because they drift the bf16 covariance off the
+    # 1-GPU bs=1 reference; only byte-identical / grad-avg paths are kept.
+    assert "cov_replicas" not in mg            # cov-DP (auto-batch) NOT enabled
+    assert "profile_dp" not in cfg["stage2_reap_ream"]  # Stage-2 profile-DP NOT enabled
     assert mg["factor_workers"] == 2
     assert mg["alpha_workers"] == 2
     assert mg["eora_workers"] == 2
-    pdp = cfg["stage2_reap_ream"]["profile_dp"]
-    assert pdp["enabled"] is True
-    assert pdp["replicas"] == "auto"
     ddp = cfg["stage5_router_kd"]["ddp"]
     assert ddp == {"enabled": True, "world_size": 2, "backend": "nccl"}
     # stage6alt path — eval-shard must NOT be set (would no-op / mislead).
