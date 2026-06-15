@@ -20,6 +20,13 @@
 #     --single-pass-cov --cov-num-sequences 512 --spectra-workers "$(nproc)"
 set -uo pipefail
 
+# Raise the open-files limit. The Stage-3 spectra spawn-ProcessPool
+# (stage3_svd.spectra_workers) opens many pipes/sockets per worker plus heavy
+# per-worker re-imports; the base image default (ulimit -n 1024) exhausts FDs
+# → "OSError: [Errno 24] Too many open files" kills the arm. Caught on box
+# 41049095 (2026-06-15). Raise to the hard max (best-effort).
+ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+
 BASE="${BASE:-/root/work}"
 REPO="${REPO:-/root/work/repo}"
 VENV="${VENV:-/root/work/venv}"
