@@ -364,6 +364,24 @@ def _resolve_single_pass(config: dict) -> bool:
     )
 
 
+def _cov_per_layer_gram_bytes(d_hid: int, d_int: int, n_exp: int, cross_cov: bool) -> float:
+    """Persistent on-GPU fp32 Gram footprint for ONE cov-window layer.
+
+    The accumulator holds a fp32 Gram PER (expert, matrix): per expert the input
+    covariance B = gate_proj ``[d_hid, d_hid]`` + down_proj ``[d_int, d_int]``;
+    when cross-cov is enabled the cross covariance C adds gate_proj
+    ``[d_hid, d_hid]``. ``up_proj`` aliases ``gate_proj`` (same d_hid input) — no
+    separate Gram. So the per-LAYER footprint is ``n_exp ×`` the per-expert bytes,
+    NOT a single expert's. Omitting the ``× n_exp`` factor (the historical bug)
+    under-counted ~``n_exp``× and made ``cov_window_size: auto`` pick a G whose
+    Grams overflow VRAM. fp32 → 4 bytes.
+    """
+    per_expert = (float(d_hid) ** 2 + float(d_int) ** 2) * 4.0
+    if cross_cov:
+        per_expert += float(d_hid) ** 2 * 4.0
+    return float(n_exp) * per_expert
+
+
 def _resolve_cov_window(config: dict, n_layers: int) -> int:
     """Resolve the cov collection window size G ∈ [1, n_layers].
 
@@ -374,9 +392,10 @@ def _resolve_cov_window(config: dict, n_layers: int) -> int:
 
     Unlike ``orchestrator._resolve_cov_replicas`` (config-ONLY), ``auto`` here
     adds a real per-device VRAM probe: each hooked layer holds a persistent
-    on-device fp32 Gram (≈ ``d_hid²·4`` gate + ``d_int²·4`` down bytes) until
-    its window's ``finalize_layer`` runs at window end, plus transient gathered
-    activations. We size ``G ≈ floor((free − headroom) / per_layer_bytes)``.
+    on-device fp32 Gram sized by ``_cov_per_layer_gram_bytes`` —
+    ``n_exp · ((d_hid² + d_int²) + d_hid²·[cross]) · 4`` bytes — until its window's
+    ``finalize_layer`` runs at window end, plus transient gathered activations. We
+    size ``G ≈ floor((free − headroom) / per_layer_bytes)``.
     """
     if n_layers <= 0:
         return 1
@@ -405,12 +424,18 @@ def _resolve_cov_window(config: dict, n_layers: int) -> int:
         free, _total = torch.cuda.mem_get_info()
     except Exception:                                # noqa: BLE001
         return 1
-    # Per-layer persistent Gram estimate. d_hid / d_int from the model config
-    # when available; fall back to a conservative 8K/8K. fp32 → 4 bytes.
-    cfg_m = config.get("model") or {}
-    d_hid = int(config.get("_d_hidden", cfg_m.get("hidden_size", 8192)) or 8192)
-    d_int = int(config.get("_d_intermediate", cfg_m.get("moe_intermediate_size", 8192)) or 8192)
-    per_layer_bytes = float(d_hid) ** 2 * 4 + float(d_int) ** 2 * 4
+    # Per-layer persistent Gram estimate. d_hid / d_int / n_exp are seeded from the
+    # model config by the caller (orchestrator / DP worker); the literal fallbacks
+    # are conservative over-estimates used only if seeding failed. (The old
+    # ``config["model"].get("hidden_size")`` fallback was dead — that block is the
+    # run config, not the HF model config, and num_experts is nested under
+    # text_config — so it silently returned the defaults; dropped.)
+    d_hid = int(config.get("_d_hidden") or 8192)
+    d_int = int(config.get("_d_intermediate") or 8192)
+    n_exp = int(config.get("_n_experts") or 256)
+    s3 = config.get("stage3_svd") or {}
+    cross_cov = bool((s3.get("aa_svd") or {}).get("cross_covariance", True))
+    per_layer_bytes = _cov_per_layer_gram_bytes(d_hid, d_int, n_exp, cross_cov)
     # Reserve headroom for transient activations + the native forward's own
     # working set (conservative: keep 25% of free VRAM in reserve).
     usable = free * 0.75
@@ -1220,6 +1245,7 @@ def _cov_replica_worker(
             _cfg_for_window["_d_intermediate"] = int(
                 getattr(_tcfg, "moe_intermediate_size", 0)
             ) or None
+            _cfg_for_window["_n_experts"] = int(getattr(_tcfg, "num_experts", 0)) or None
     except Exception:                                # noqa: BLE001
         pass
     cov_window_size = _resolve_cov_window(_cfg_for_window, len(moe_layers))

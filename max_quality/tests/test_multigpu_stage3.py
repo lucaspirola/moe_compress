@@ -1049,6 +1049,26 @@ def test_resolve_cov_window_config():
     assert _resolve_cov_window({}, 0) == 1
 
 
+def test_cov_per_layer_gram_bytes_includes_expert_factor():
+    """The per-layer Gram estimate MUST scale with n_experts (the historical bug
+    omitted this ~256× factor → auto picked a catastrophic G). Also: cross-cov adds
+    the gate term, and B uses gate=d_hid² + down=d_int² per expert."""
+    from moe_compress.stage3.plugins.covariance_collection import _cov_per_layer_gram_bytes
+
+    d_hid, d_int = 2048, 512
+    # B-only, one expert: gate d_hid² + down d_int², fp32.
+    one_b = _cov_per_layer_gram_bytes(d_hid, d_int, n_exp=1, cross_cov=False)
+    assert one_b == (d_hid ** 2 + d_int ** 2) * 4.0
+    # Linear in n_exp — the fix. 256 experts == 256× one expert (the old formula
+    # used a single expert's footprint → ~256× under-count).
+    assert _cov_per_layer_gram_bytes(d_hid, d_int, 256, False) == 256 * one_b
+    # Cross-cov adds gate d_hid² per expert.
+    with_c = _cov_per_layer_gram_bytes(d_hid, d_int, 256, cross_cov=True)
+    assert with_c == _cov_per_layer_gram_bytes(d_hid, d_int, 256, False) + 256 * d_hid ** 2 * 4.0
+    # Realistic Qwen3.6 layer (256 experts, cross-cov on) is multi-GB, not ~18 MB.
+    assert with_c > 8e9  # ~8.85 GB/layer — the figure the old estimate missed by ~256×
+
+
 def test_capture_experts_rejects_double_instrument(tiny_model):
     """A7 ``capture_experts`` refuses to attach to a module whose forward is
     already swapped by ``instrument_experts`` (mutually exclusive, PLAN §3.3)."""

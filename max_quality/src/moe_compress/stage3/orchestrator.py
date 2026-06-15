@@ -393,6 +393,10 @@ def run(
     if _mtcfg is not None:
         _win_cfg["_d_hidden"] = int(getattr(_mtcfg, "hidden_size", 0)) or None
         _win_cfg["_d_intermediate"] = int(getattr(_mtcfg, "moe_intermediate_size", 0)) or None
+        # num_experts (nominal, pre-prune) — a safe UPPER bound for the post-prune
+        # student's per-layer routed count, so the per-layer Gram estimate is
+        # conservative (over-estimate → smaller G → never OOM).
+        _win_cfg["_n_experts"] = int(getattr(_mtcfg, "num_experts", 0)) or None
     _cov_window = _rcw(_win_cfg, len(moe_layers))
     log.info("Stage 3: cov collection window G=%d (N=%d MoE layers)", _cov_window, len(moe_layers))
     run_ctx.set("cov_window_size", _cov_window)
