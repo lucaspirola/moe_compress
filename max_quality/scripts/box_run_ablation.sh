@@ -32,7 +32,7 @@ cd "${REPO}"
 # no-ops to a flat draw). Abort before spending GPU on a mis-calibrated run.
 JSONL="${BASE}/run/self_traces_489ee0e1b17b43b0.jsonl"
 echo "=================== PRE-FLIGHT: domain-mix guardrail ==================="
-"${PY}" "${REPO}/max_quality/scripts/box_verify_domain_mix.py" "${JSONL}" 512 2 \
+"${PY}" "${REPO}/scripts/box_verify_domain_mix.py" "${JSONL}" 512 2 \
   || { echo "DOMAIN_MIX_FAIL — JSONL not domain-tagged or 512 draw drifts; aborting"; exit 1; }
 
 echo "=================== s234 ABLATION (whitening=shift, 1-GPU single-pass) ==================="
