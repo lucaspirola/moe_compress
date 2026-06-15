@@ -27,6 +27,14 @@ export HF_HUB_DISABLE_XET=1      # xet writer error on the 52GB seed (2026-06-14
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 cd "${REPO}"
 
+# Pre-flight HARD gate: the self-traces JSONL must be domain-tagged AND the 512
+# draw must preserve the calibration domain mix (else stratification silently
+# no-ops to a flat draw). Abort before spending GPU on a mis-calibrated run.
+JSONL="${BASE}/run/self_traces_489ee0e1b17b43b0.jsonl"
+echo "=================== PRE-FLIGHT: domain-mix guardrail ==================="
+"${PY}" "${REPO}/max_quality/scripts/box_verify_domain_mix.py" "${JSONL}" 512 2 \
+  || { echo "DOMAIN_MIX_FAIL — JSONL not domain-tagged or 512 draw drifts; aborting"; exit 1; }
+
 echo "=================== s234 ABLATION (whitening=shift, 1-GPU single-pass) ==================="
 "${PY}" -u -m moe_compress.run_reap_ream_35pct \
   --config "${CFG}" --model "${MODEL}" \
