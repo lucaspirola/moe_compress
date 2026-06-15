@@ -224,7 +224,11 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import shutil
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -249,21 +253,28 @@ ALPHA_ERR_REL_TOL = 1e-9
 # (one warning is enough — flooding the log buys nothing). Reset by reloading
 # the module (test fixtures that exercise both branches re-import).
 _RAW_SVD_FALLBACK_WARNED = False
+# `_build_grouped_svs` fans the per-expert spectra across a ThreadPoolExecutor,
+# so the warn-once check-and-set must be atomic — a bare global check-then-set
+# races under threads (lets several warnings through). Guard with a lock.
+_RAW_SVD_FALLBACK_LOCK = threading.Lock()
 
 
 def _warn_raw_svd_fallback_once(reason: str) -> None:
-    """Emit the D-raw-svd-fallback warning at most once per process."""
+    """Emit the D-raw-svd-fallback warning at most once per process (thread-safe)."""
     global _RAW_SVD_FALLBACK_WARNED
-    if not _RAW_SVD_FALLBACK_WARNED:
+    with _RAW_SVD_FALLBACK_LOCK:
+        if _RAW_SVD_FALLBACK_WARNED:
+            return
         _RAW_SVD_FALLBACK_WARNED = True
-        log.warning(
-            "Swift-SVD+ D-raw-svd-fallback: A_cov unavailable (%s) — falling "
-            "back to raw torch.linalg.svdvals(W). ε* / β computed in "
-            "weight-space, not activation-weighted (paper Eq. 4/9 requires "
-            "A^{1/2}·W). This is acceptable for tests/smoke runs but NOT "
-            "paper-compliant for production. See D-raw-svd-fallback in module "
-            "docstring.", reason,
-        )
+    # Log OUTSIDE the lock — never hold it across the logging handlers.
+    log.warning(
+        "Swift-SVD+ D-raw-svd-fallback: A_cov unavailable (%s) — falling "
+        "back to raw torch.linalg.svdvals(W). ε* / β computed in "
+        "weight-space, not activation-weighted (paper Eq. 4/9 requires "
+        "A^{1/2}·W). This is acceptable for tests/smoke runs but NOT "
+        "paper-compliant for production. See D-raw-svd-fallback in module "
+        "docstring.", reason,
+    )
 
 
 def _reset_raw_svd_fallback_warning() -> None:
@@ -278,7 +289,10 @@ def _reset_raw_svd_fallback_warning() -> None:
     for live runs.
     """
     global _RAW_SVD_FALLBACK_WARNED
-    _RAW_SVD_FALLBACK_WARNED = False
+    # Symmetry with `_warn_raw_svd_fallback_once`: take the same lock so the
+    # reset can never race a concurrent pool worker's check-and-set.
+    with _RAW_SVD_FALLBACK_LOCK:
+        _RAW_SVD_FALLBACK_WARNED = False
 
 
 def _alpha_whiten_factor(A64: torch.Tensor) -> torch.Tensor:
@@ -299,6 +313,176 @@ def _alpha_whiten_factor(A64: torch.Tensor) -> torch.Tensor:
         A64.shape[0], dtype=torch.float64
     )
     return torch.linalg.cholesky(A64 + jitter)
+
+
+def _expert_whitened_svs(
+    W64: torch.Tensor, A: torch.Tensor | None, *, reason_ctx: str,
+) -> torch.Tensor:
+    """Single per-expert activation-weighted spectrum ``svdvals(W @ L_C)``.
+
+    The ONE definition shared by the Swift-SVD+ proxy α-search
+    (``_swift_svd_plus_alpha_search``) and the rank redistributor
+    (``_redistribute_ranks_swift_svd_plus``) so the two are spectrum-identical
+    by construction (the Tier-1 ``torch.equal`` cache precondition — previously
+    upheld by two byte-identical copies of this body, now a single source).
+
+    ``W64`` MUST already be CPU-fp64. ``A`` is the per-expert activation
+    covariance (CPU, any dtype) or ``None``. Computes the Cholesky whitening
+    factor ``L_C`` of ``A`` (jitter recipe in :func:`_alpha_whiten_factor`) and
+    returns ``svdvals(W64 @ L_C)`` in fp64; on a non-PD Cholesky
+    (``LinAlgError``, rank-zero) or ``A is None`` it falls back to the raw
+    ``svdvals(W64)`` and warns once (D-raw-svd-fallback). The narrow ``except``
+    is deliberate: only a Cholesky failure is the rank-zero fallback; a real bug
+    in ``svdvals(W @ L_C)`` (shape/OOM/LAPACK) must propagate, not be relabelled.
+    """
+    if A is not None:
+        A64 = A.to(device="cpu", dtype=torch.float64)
+        A64 = 0.5 * (A64 + A64.T)
+        try:
+            # F1: Cholesky whitening — host-stable, full-rank, no discrete
+            # keep_a threshold. KEEP the svdvals(W @ L_C) order (see
+            # `_alpha_whiten_factor`: `L_C @ W.T` is a different, paper-incorrect
+            # quantity for a triangular factor).
+            L_C = _alpha_whiten_factor(A64)
+        except torch.linalg.LinAlgError:
+            _warn_raw_svd_fallback_once(
+                f"A_cov Cholesky failed / rank-zero (in {reason_ctx})"
+            )
+            return torch.linalg.svdvals(W64)
+        return torch.linalg.svdvals(W64 @ L_C)
+    _warn_raw_svd_fallback_once(f"A_cov=None passed to {reason_ctx}")
+    return torch.linalg.svdvals(W64)
+
+
+def _resolve_svd_workers(svd_workers: int | None, n_tasks: int) -> int:
+    """Thread-pool width for the per-expert fp64 spectra build.
+
+    ``None`` (default) → ``os.cpu_count()`` (capped to ``n_tasks`` — never more
+    workers than experts). An explicit int is honoured (clamped to
+    ``[1, n_tasks]``). A resolved value ``<=1`` selects the serial path (no
+    pool); the spectra are still computed at 1-thread BLAS in
+    :func:`_build_grouped_svs`, so serial and pool results are byte-identical.
+    """
+    if n_tasks <= 0:
+        return 1
+    if svd_workers is None:
+        svd_workers = os.cpu_count() or 1
+    return max(1, min(int(svd_workers), n_tasks))
+
+
+def _build_grouped_svs(
+    moe_layers: list,
+    group_stats: dict,
+    A_cov: dict | None,
+    *,
+    svd_workers: int | None = None,
+    log_label: str = "Swift-SVD+ α",
+) -> dict[str, dict[tuple[int, int], torch.Tensor]]:
+    """Activation-weighted per-expert spectra for every ``(layer, matrix-type)``
+    group: ``grouped_svs[name][(layer_idx, expert_idx)] = svdvals(W @ L_C)``
+    (CPU-fp64), parallelised across a thread pool.
+
+    Why threads. The per-expert fp64 ``cholesky`` + ``svdvals`` is the Stage-3
+    α-phase bottleneck (~``n_layers × 3 × n_experts`` decompositions, ~1 h
+    single-threaded for the 35B). ``torch.linalg.svdvals`` / ``cholesky``
+    release the GIL during LAPACK, so a ``ThreadPoolExecutor`` over the
+    per-expert calls scales across cores with no process-spawn / heavy
+    re-import / pickling cost (the failure mode that made the
+    ``spectra_pool`` ProcessPool unreliable — FD exhaustion + teardown
+    deadlock).
+
+    Determinism. Each ``svdvals(W @ L_C)`` is per-expert-independent, so the
+    result dict (keyed by ``(layer, expert)``) is completion-order-independent.
+    torch intra-op threads are pinned to 1 for the whole numerical section
+    (save/restore) so every decomposition is single-thread-BLAS — a FIXED
+    reduction order → the per-expert spectrum is byte-reproducible run-to-run,
+    host-to-host, AND independent of ``svd_workers`` (serial == pool, proved
+    ``torch.equal`` in ``test_stage3_swift_svd_vectorized``). This is strictly
+    MORE reproducible than the prior serial-at-ambient-threads loop, whose
+    spectrum drifted ~1e-13 with the box core count (absorbed by the integer
+    rank map; pinning removes it at the source). The tiny golden / producer-1
+    fixtures are below the BLAS multi-thread threshold, so their spectra are
+    bit-identical with or without pinning (``test_producer1_uses_cholesky_spectrum``'s
+    ``torch.equal`` against an ambient-thread inline still holds).
+    ``svd_workers <= 1`` runs the serial path (no pool) — still 1-thread BLAS,
+    byte-identical to the pool — used by strict determinism tests and as the
+    conservative fallback.
+    """
+    # S3-4 lazy import: _cov_lookup stays monolith-resident (S3-5 target);
+    # a module-top import would deadlock the import cycle (see module docstring).
+    from ...stage3_svd import _cov_lookup  # noqa: PLC0415
+
+    grouped_svs: dict[str, dict[tuple[int, int], torch.Tensor]] = {
+        n: {} for n in MATRIX_NAMES
+    }
+    moe_layers_by_idx = {ref.layer_idx: ref for ref in moe_layers}
+    n_total = sum(gs.n_experts for gs in group_stats.values())
+    workers = _resolve_svd_workers(svd_workers, n_total)
+    log.info(
+        "Stage 3 %s spectra: %d per-expert fp64 svdvals over %d group(s), "
+        "%d worker thread(s)", log_label, n_total, len(group_stats), workers,
+    )
+
+    done = 0
+    t0 = time.monotonic()
+    saved_threads = torch.get_num_threads()
+    # Pin BLAS to a single thread for the WHOLE numerical section (serial and
+    # pool paths alike). Every cholesky + svdvals then runs with a FIXED
+    # reduction order, so each per-expert spectrum is identical run-to-run,
+    # host-to-host, AND independent of `workers` (serial == pool, byte-equal).
+    # Cross-core scaling comes from the thread POOL, not intra-op BLAS threads —
+    # which also avoids nested-parallelism oversubscription. Restored in
+    # `finally`. (This is strictly MORE reproducible than the historical
+    # serial-at-ambient-threads loop, whose spectrum drifted ~1e-13 with the
+    # box's core count; the integer rank map absorbed that drift, and pinning
+    # removes it at the source.)
+    torch.set_num_threads(1)
+    try:
+        groups = sorted(group_stats.items())
+        for gi, ((li, name), gs) in enumerate(groups):
+            banks = build_banks(moe_layers_by_idx[li])
+            # Extract this group's W (CPU-fp64) + A on the calling thread —
+            # bounded to one group's residency (~n_experts × W64); the
+            # GIL-releasing fp64 cholesky+svdvals is what we fan out.
+            tasks = []
+            for e in range(gs.n_experts):
+                W64 = banks[name].get(e).detach().to(
+                    device="cpu", dtype=torch.float64,
+                )
+                A = _cov_lookup(A_cov, li, e, name) if A_cov else None
+                tasks.append((e, W64, A))
+            if workers > 1:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    svs_list = list(ex.map(
+                        lambda t: _expert_whitened_svs(
+                            t[1], t[2], reason_ctx="_build_grouped_svs",
+                        ),
+                        tasks,
+                    ))
+            else:
+                svs_list = [
+                    _expert_whitened_svs(
+                        W64, A, reason_ctx="_build_grouped_svs",
+                    )
+                    for (_e, W64, A) in tasks
+                ]
+            for (e, _W, _A), svs in zip(tasks, svs_list):
+                grouped_svs[name][(li, e)] = svs
+            done += gs.n_experts
+            elapsed = time.monotonic() - t0
+            rate = done / elapsed if elapsed > 0 else 0.0
+            eta = (n_total - done) / rate if rate > 0 else float("inf")
+            log.info(
+                "Stage 3 %s spectra: group %d/%d (layer=%d %s, %d experts) — "
+                "%d/%d done (%.0f%%), %.1fs elapsed, ETA %.0fs",
+                log_label, gi + 1, len(groups), li, name, gs.n_experts,
+                done, n_total, 100.0 * done / max(n_total, 1), elapsed, eta,
+            )
+    finally:
+        torch.set_num_threads(saved_threads)
+    log.info("Stage 3 %s spectra: complete — %d spectra in %.1fs",
+             log_label, n_total, time.monotonic() - t0)
+    return grouped_svs
 
 
 def _snapshot_originals(
@@ -1161,6 +1345,7 @@ def _swift_svd_plus_alpha_search(
     per_group_type: bool = True,
     A_cov: dict | None = None,
     return_svs: bool = False,
+    svd_workers: int | None = None,
 ):
     """Swift-SVD+ (2604.01609, Algorithm 2): select α per projection type.
 
@@ -1191,64 +1376,22 @@ def _swift_svd_plus_alpha_search(
     the package re-export (``stage3_svd.py``), the name-pin test, and every
     existing caller keep their current contract.
     """
-    # S3-4 lazy import: _cov_lookup stays monolith-resident (S3-5 target);
-    # a module-top import would deadlock the import cycle (see module docstring).
-    from ...stage3_svd import _cov_lookup  # noqa: PLC0415
-
-    # Collect per-expert singular value spectra, grouped by matrix type.
-    # When A_cov is available (D8 fix), compute activation-weighted SVD
-    # (SVD of W @ L_A) instead of raw SVD. This gives ε* that reflects
-    # actual reconstruction error weighted by input distribution.
-    # grouped_svs[name][(layer_idx, expert_idx)] = singular_values tensor
-    # L4: banks are rebuilt per (layer, matrix-type). The current group_stats
-    # cardinality (~40 layers × 3 matrix types = 120 entries) makes this O(120)
-    # `build_banks` calls — cheap (banks is just a view-wrapper, ~µs each), so
-    # we leave the simple form. Memoise here if profiling ever flags it.
-    grouped_svs: dict[str, dict[tuple[int, int], torch.Tensor]] = {
-        n: {} for n in MATRIX_NAMES
-    }
-    # N3: hoist O(1) layer_idx → ref lookup once at function entry — replaces
-    # the per-(layer, matrix-type) list comprehension `[r for r in moe_layers
-    # if r.layer_idx == li][0]`. Removes the IndexError footgun if a stale
-    # group_stats key ever references a missing layer_idx (dict lookup raises
-    # KeyError with a clear message instead of an opaque slice-out-of-range).
-    moe_layers_by_idx = {ref.layer_idx: ref for ref in moe_layers}
-    for (li, name), gs in group_stats.items():
-        banks = build_banks(moe_layers_by_idx[li])
-        for e in range(gs.n_experts):
-            # Tier-2 §2.2/§3: the rank-deciding spectrum is computed on CPU in
-            # fp64. This (a) co-locates W with the CPU-resident A_cov so the
-            # whitened decomp never crosses devices on a GPU-resident model, and
-            # (b) makes the rank decision device-independent (CPU-fp64 ==
-            # GPU-fp64 to ~1e-14, 0 rank flips). The bulk fp32-GPU factor build
-            # in aa_svd_factor.factor_layer is unchanged.
-            W = banks[name].get(e).detach().to(device="cpu", dtype=torch.float64)
-            # D8 fix: activation-weighted singular values when A_cov available.
-            A = _cov_lookup(A_cov, li, e, name) if A_cov else None
-            if A is not None:
-                A64 = A.to(device="cpu", dtype=torch.float64)
-                A64 = 0.5 * (A64 + A64.T)
-                try:
-                    # F1: Cholesky whitening — host-stable, full-rank, no
-                    # discrete keep_a threshold. KEEP svdvals(W @ L_C) order.
-                    # Narrow except: only a non-PD cholesky (LinAlgError) is the
-                    # rank-zero fallback; a real bug in svdvals(W @ L_C)
-                    # (shape/OOM/LAPACK) must propagate, not be mislabelled.
-                    L_C = _alpha_whiten_factor(A64)
-                except torch.linalg.LinAlgError:
-                    _warn_raw_svd_fallback_once(
-                        "A_cov Cholesky failed / rank-zero "
-                        "(in _swift_svd_plus_alpha_search)"
-                    )
-                    svs = torch.linalg.svdvals(W)
-                else:
-                    svs = torch.linalg.svdvals(W @ L_C)
-            else:
-                _warn_raw_svd_fallback_once(
-                    "A_cov=None passed to _swift_svd_plus_alpha_search"
-                )
-                svs = torch.linalg.svdvals(W)
-            grouped_svs[name][(li, e)] = svs
+    # Collect per-expert activation-weighted singular value spectra (D8 fix:
+    # svdvals(W @ L_C) when A_cov is available), grouped by matrix type:
+    # grouped_svs[name][(layer_idx, expert_idx)] = singular_values tensor.
+    #
+    # Tier-2 §2.2/§3: each spectrum is computed on CPU in fp64 — co-locating W
+    # with the CPU-resident A_cov so the whitened decomp never crosses devices,
+    # and making the rank decision device-independent (CPU-fp64 == GPU-fp64 to
+    # ~1e-14, 0 rank flips). The bulk fp32-GPU factor build in
+    # aa_svd_factor.factor_layer is unchanged. This per-expert fp64 cholesky +
+    # svdvals is the Stage-3 α-phase bottleneck; `_build_grouped_svs` fans it
+    # across a thread pool (svdvals/cholesky release the GIL) — see its
+    # docstring for the byte-determinism argument.
+    grouped_svs = _build_grouped_svs(
+        moe_layers, group_stats, A_cov,
+        svd_workers=svd_workers, log_label="Swift-SVD+ α-proxy",
+    )
 
     def _evaluate_alpha(name: str, alpha: float) -> float:
         """Total weighted reconstruction error for this α across all experts
@@ -1379,6 +1522,7 @@ def _redistribute_ranks_swift_svd_plus(
     *,
     grouped_svs_cache=None,
     A_cov: dict | None = None,
+    svd_workers: int | None = None,
 ) -> dict[tuple[int, str, int], int]:
     """Given the selected α per type, compute per-expert ranks.
 
@@ -1386,68 +1530,60 @@ def _redistribute_ranks_swift_svd_plus(
     The total rank within each (layer, matrix_type) group is conserved
     (sum of per-expert ranks = base_rank × n_experts).
     """
-    # S3-4 lazy import: _cov_lookup stays monolith-resident (S3-5 target);
-    # a module-top import would deadlock the import cycle (see module docstring).
-    from ...stage3_svd import _cov_lookup  # noqa: PLC0415
-
     # N3: hoist O(1) layer_idx → ref lookup once at function entry — see same
-    # note in `_swift_svd_plus_alpha_search`.
+    # note in `_swift_svd_plus_alpha_search`. Used ONLY by the partial-cache
+    # fallback below (which production never reaches), so it is cheap to keep.
     moe_layers_by_idx = {ref.layer_idx: ref for ref in moe_layers}
+
+    # Tier-1 item 2: reuse the proxy's per-expert spectra when the caller
+    # threaded the cache it built in `_swift_svd_plus_alpha_search`
+    # (select_alpha branches (i)/(iii)). The cached svs is byte-identical to a
+    # fresh build (same shared `_expert_whitened_svs` source) — a precondition
+    # test asserts torch.equal. When the cache is ABSENT (branch (ii) +
+    # orchestrator α-resume) build the WHOLE grouped_svs once in a single fast
+    # parallel pass (was the slow per-expert serial recompute below).
+    if grouped_svs_cache is not None:
+        grouped_svs = grouped_svs_cache
+    else:
+        grouped_svs = _build_grouped_svs(
+            moe_layers, group_stats, A_cov,
+            svd_workers=svd_workers, log_label="Swift-SVD+ redistribute",
+        )
 
     out: dict[tuple[int, str, int], int] = {}
     for (li, name), gs in group_stats.items():
         k_group = base_ranks[(li, name)]
         alpha = alpha_by_type.get(name, alpha_by_type.get("all", 0.5))
 
-        # Collect per-expert singular values (activation-weighted when A_cov available).
-        banks = build_banks(moe_layers_by_idx[li])
+        # Per-expert spectra come from `grouped_svs` (cache or fresh parallel
+        # build, resolved above). `banks` is built lazily ONLY if the
+        # partial-cache fallback fires — a threaded cache / fresh build is always
+        # full, so production never constructs it (H1: avoids a per-group
+        # allocation that could silently diverge from the cache if a future
+        # change made the build sparse).
+        banks = None
         energies: list[float] = []
         epsilons: list[float] = []
         for e in range(gs.n_experts):
-            # Tier-1 item 2: reuse the proxy's per-expert spectrum when the
-            # caller threaded the cache it built in _swift_svd_plus_alpha_search
-            # (select_alpha branches (i)/(iii) only — see select_alpha). The
-            # cached svs is byte-identical to the recompute below (same A,
-            # same eigh+threshold, same svdvals(W @ L_A)); a precondition test
-            # asserts torch.equal. When the cache is absent (branch (ii) +
-            # orchestrator α-resume) we recompute exactly as before.
-            cached_svs = (
-                grouped_svs_cache[name].get((li, e))
-                if grouped_svs_cache is not None and name in grouped_svs_cache
-                else None
-            )
-            if cached_svs is not None:
-                svs = cached_svs
-            else:
-                # Tier-2 §2.3: mirror the producer in _swift_svd_plus_alpha_search
-                # exactly — CPU-fp64 spectrum. The cached branch above reuses the
-                # producer's fp64-CPU tensor, so cache producer and this recompute
-                # stay identical dtype/device (the tier-1 torch.equal precondition).
-                W = banks[name].get(e).detach().to(device="cpu", dtype=torch.float64)
-                # D8 fix: activation-weighted SVD when A_cov available.
+            svs = grouped_svs.get(name, {}).get((li, e))
+            if svs is None:
+                # Partial-cache fallback: recompute this one expert via the SAME
+                # shared source as the build, so it stays byte-identical (the
+                # Tier-1 torch.equal precondition). Production never lands here
+                # (the proxy cache / fresh build is always full).
+                if banks is None:
+                    banks = build_banks(moe_layers_by_idx[li])
+                # S3-4 lazy import (deferred to first fallback use): _cov_lookup
+                # stays monolith-resident — a module-top import would deadlock
+                # the import cycle (see module docstring).
+                from ...stage3_svd import _cov_lookup  # noqa: PLC0415
+                W = banks[name].get(e).detach().to(
+                    device="cpu", dtype=torch.float64,
+                )
                 A = _cov_lookup(A_cov, li, e, name) if A_cov else None
-                if A is not None:
-                    A64 = A.to(device="cpu", dtype=torch.float64)
-                    A64 = 0.5 * (A64 + A64.T)
-                    try:
-                        # F1: identical Cholesky whitening as producer 1 so the
-                        # Tier-1 torch.equal cache precondition holds. KEEP W @ L_C.
-                        # Narrow except (see producer 1): only LinAlgError is the
-                        # rank-zero fallback; svdvals(W @ L_C) bugs must propagate.
-                        L_C = _alpha_whiten_factor(A64)
-                    except torch.linalg.LinAlgError:
-                        _warn_raw_svd_fallback_once(
-                            "A_cov Cholesky failed / rank-zero "
-                            "(in _redistribute_ranks_swift_svd_plus)"
-                        )
-                        svs = torch.linalg.svdvals(W)
-                    else:
-                        svs = torch.linalg.svdvals(W @ L_C)
-                else:
-                    _warn_raw_svd_fallback_once(
-                        "A_cov=None passed to _redistribute_ranks_swift_svd_plus"
-                    )
-                    svs = torch.linalg.svdvals(W)
+                svs = _expert_whitened_svs(
+                    W, A, reason_ctx="_redistribute_ranks_swift_svd_plus",
+                )
             s2 = svs * svs
             total_e = float(s2.sum().clamp_min(1e-30).item())
             energies.append(total_e)
