@@ -1231,8 +1231,20 @@ def save_compressed_checkpoint(
             gen_config.save_pretrained(out_path)
         except Exception as exc:
             log.warning("save_compressed_checkpoint: generation_config save failed (%s) — non-fatal", exc)
-    if tokenizer is not None:
-        tokenizer.save_pretrained(out_path)
+    # FAIL LOUD: never write a compressed checkpoint without a usable tokenizer.
+    # A tokenizer-less dir (or a degenerate vocab<=1 one) makes AutoTokenizer build
+    # an empty fallback on resume that maps ALL text to 0 tokens → ~100% EOS-padded
+    # calibration → near-rank-1 covariance, with no error. This is how
+    # pirola/reap-s234-stage2p5-final shipped without a tokenizer (2026-06-15).
+    # Require a real tokenizer here so the gap can't reach an HF backup; the
+    # symmetric read-side guard is in load_model.
+    if tokenizer is None:
+        raise ValueError(
+            f"save_compressed_checkpoint: tokenizer is None for {out_path} — refusing to "
+            f"write a checkpoint with no tokenizer (it would silently corrupt calibration "
+            f"on resume; see load_model's vocab<=1 guard)."
+        )
+    tokenizer.save_pretrained(out_path)
     return out_path
 
 

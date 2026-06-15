@@ -416,6 +416,18 @@ def _seed_stage2p5_from_hub(
     for shard in src_root.glob("model-*.safetensors"):
         shutil.copy2(shard, final_dir / shard.name)
 
+    # Tokenizer ride-along: copy whatever tokenizer files the Hub checkpoint ships
+    # so the resumed Stage-3 load gets the REAL tokenizer (not a degenerate vocab=1
+    # fallback). _verify_stage2p5_content asserts at least one is present. Required,
+    # not optional — a tokenizer-less placement silently corrupts calibration
+    # (pirola/reap-s234-stage2p5-final, 2026-06-15).
+    for name in ("tokenizer.json", "vocab.json", "merges.txt", "tokenizer_config.json",
+                 "tokenizer.model", "special_tokens_map.json", "added_tokens.json",
+                 "chat_template.jinja"):
+        src = src_root / name
+        if src.exists():
+            shutil.copy2(src, final_dir / name)
+
     # Optional _shared/ metadata ride-along: copy only what is MISSING locally
     # (do not clobber a locally-seeded _shared/).
     src_shared = src_root / "_shared"
@@ -473,6 +485,21 @@ def _verify_stage2p5_content(final_dir: Path) -> None:
             "post-2.5 download is incomplete — refusing to resume Stage 3 on a "
             "half-checkpoint (would silently fall back to stage2_pruned). "
             f"Delete {final_dir} to retry."
+        )
+
+    # Tokenizer presence. A checkpoint that ships NO tokenizer files makes
+    # AutoTokenizer build a degenerate vocab=1 fallback on resume that maps ALL text
+    # to 0 tokens → ~100% EOS-padded calibration → near-rank-1 cov, silently. This is
+    # the exact gap that let pirola/reap-s234-stage2p5-final through (2026-06-15).
+    # Require tokenizer files here so a tokenizer-less HF download fails BEFORE any
+    # Stage-3 calibration trusts it (the load_model vocab<=1 guard is the backstop).
+    _TOK_FILES = ("tokenizer.json", "vocab.json", "tokenizer_config.json", "tokenizer.model")
+    if not any((final_dir / f).exists() for f in _TOK_FILES):
+        raise RuntimeError(
+            f"[seed] {final_dir} has no tokenizer files (looked for {_TOK_FILES}) — "
+            "refusing to resume Stage 3. A tokenizer-less checkpoint silently corrupts "
+            "calibration (every text → 0 tokens → EOS-padded cov). Re-upload the "
+            "post-2.5 checkpoint WITH its tokenizer files."
         )
 
 

@@ -364,6 +364,11 @@ def _make_fake_checkpoint(dest, *, subdir: bool):
     )
     (root / "compressed_metadata.json").write_text(
         _j.dumps({"survivors": 200}), encoding="utf-8")
+    # A real post-2.5 checkpoint ships its tokenizer; _verify_stage2p5_content now
+    # requires it (a tokenizer-less checkpoint silently corrupts calibration — the
+    # pirola/reap-s234-stage2p5-final incident, 2026-06-15).
+    (root / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (root / "tokenizer_config.json").write_text("{}", encoding="utf-8")
 
 
 def _fake_downloader(layout_subdir):
