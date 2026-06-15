@@ -168,6 +168,25 @@ def load_model(
     tokenizer = AutoTokenizer.from_pretrained(
         name_or_path, revision=revision, trust_remote_code=trust_remote_code
     )
+    # FAIL LOUD on a DEGENERATE tokenizer. A checkpoint dir that ships only
+    # weights+config (no tokenizer.json/vocab.json/merges.txt) makes
+    # AutoTokenizer build an empty fallback (observed vocab_size=1) that
+    # tokenizes ALL text to 0 tokens. That silently corrupts every downstream
+    # calibration — the cov tensor becomes ~100% EOS padding → a near-rank-1
+    # covariance → garbage SVD rank decisions — with no error. Convert the
+    # silent corruption into a hard error here. Fix = ship the tokenizer files
+    # alongside the weights (save_checkpoint) or point name_or_path at a dir
+    # that has them. Caught on box 41023933 / reap-s234 stage2p5_final (2026-06-15).
+    _vocab = getattr(tokenizer, "vocab_size", 0) or 0
+    if _vocab <= 1:
+        raise RuntimeError(
+            f"load_model: tokenizer loaded from {name_or_path!r} is DEGENERATE "
+            f"(vocab_size={_vocab}) — the dir is almost certainly missing tokenizer "
+            f"files (tokenizer.json / vocab.json / merges.txt). Loading it would "
+            f"silently corrupt calibration (every text → 0 tokens → ~100% EOS-padded "
+            f"cov). Copy the tokenizer files from the base model into the checkpoint, "
+            f"or load the tokenizer from the base model path."
+        )
     log.info("Model loaded: %s on devices=%s",
              type(model).__name__, _summarize_device_placement(model))
     return model, tokenizer
