@@ -13,8 +13,16 @@ STEM="self_traces_489ee0e1b17b43b0"
 DS="pirola/calib-v2-self-traces"
 MODEL="Qwen/Qwen3.6-35B-A3B"
 
-# System python + pip (the base image has python3 but no pip).
-export HF_HUB_ENABLE_HF_TRANSFER=1
+# System python + pip. The base CUDA image has python3 but NO pip, and its
+# ensurepip is stripped — so bootstrap pip via apt before any `python3 -m pip`.
+# (Lock::Timeout waits out the parallel venv-build's apt lock instead of failing.)
+# Caught live on box 41023933 (2026-06-15): without this the first `python3 -m
+# pip` died with "No module named pip" and the download aborted under set -e.
+export HF_HUB_ENABLE_HF_TRANSFER=1 DEBIAN_FRONTEND=noninteractive
+if ! python3 -m pip --version >/dev/null 2>&1; then
+    apt-get -o DPkg::Lock::Timeout=300 update -qq
+    apt-get -o DPkg::Lock::Timeout=300 install -y -qq python3-pip
+fi
 PIP="python3 -m pip install -q --break-system-packages"   # PEP 668 base image
 ${PIP} huggingface_hub hf_transfer
 

@@ -2,7 +2,17 @@
 """Authoritative CONTENT verify of the downloaded covariance (run with venv torch,
 post-build). Asserts non-empty + finite — file size is NOT proof (prior incidents:
 fp16 inf corruption, stale manifest). Exit 0 + COV_VERIFY_OK on success."""
-import sys, torch
+import sys
+from pathlib import Path
+
+# torch.load must resolve the CovariancePayload class to load the .pt; put the
+# package src on the path so a standalone run works without PYTHONPATH being set
+# (caught live on box 41023933: ModuleNotFoundError: moe_compress).
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if _SRC.is_dir():
+    sys.path.insert(0, str(_SRC))
+
+import torch
 
 p = sys.argv[1] if len(sys.argv) > 1 else "/root/work/run/sidecars/self_traces_489ee0e1b17b43b0/covariance.pt"
 payload = torch.load(p, map_location="cpu", weights_only=False)
