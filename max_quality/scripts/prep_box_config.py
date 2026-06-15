@@ -16,6 +16,13 @@ ap.add_argument("dst")
 ap.add_argument("--base", default="/root/work", help="box base dir")
 ap.add_argument("--shard", action="store_true", help="device_map=balanced (multi-GPU sharding)")
 ap.add_argument("--cov-window", type=int, default=0, help="fixed multi_gpu.cov_window_size (0=leave auto)")
+# Stage-3 cov optimizations: default-OFF in the library, turned ON here per-run.
+ap.add_argument("--single-pass-cov", action="store_true",
+                help="stage3_svd.cov_single_pass=true (one forward, CPU hot-accum → fits 1 GPU)")
+ap.add_argument("--cov-num-sequences", type=int, default=0,
+                help="stage3_svd.cov_num_sequences (0=leave library default; resume plan uses 512)")
+ap.add_argument("--spectra-workers", type=int, default=1,
+                help="stage3_svd.spectra_workers (1=serial; >1 parallelizes the fp64-CPU rank spectra)")
 args = ap.parse_args()
 
 MODEL = f"{args.base}/models/Qwen3.6-35B-A3B"
@@ -36,6 +43,14 @@ s3 = cfg.setdefault("stage3_svd", {})
 s3["cov_batch_size"] = "auto"
 s3["auto_batch"] = {"enabled": True, "headroom_frac": 0.1, "max_cap": 256}
 
+# Stage-3 cov optimizations (per-run opt-in; library defaults stay OFF).
+if args.single_pass_cov:
+    s3["cov_single_pass"] = True
+if args.cov_num_sequences > 0:
+    s3["cov_num_sequences"] = args.cov_num_sequences
+if args.spectra_workers > 1:
+    s3["spectra_workers"] = args.spectra_workers
+
 if args.cov_window > 0:
     mg = cfg.setdefault("multi_gpu", {})
     mg["cov_window_size"] = args.cov_window   # pin G (auto over-sizes for dual-model cross-cov -> OOM)
@@ -49,4 +64,7 @@ print(f"  model.device_map   = {m.get('device_map', '(default)')}")
 print(f"  calibration.jsonl_path = {cfg['calibration']['jsonl_path']}")
 print(f"  target.net_of_eora = {cfg['target']['net_of_eora']}")
 print(f"  stage3_svd.cov_batch_size = {s3['cov_batch_size']} auto_batch={s3['auto_batch']}")
+print(f"  stage3_svd.cov_single_pass = {s3.get('cov_single_pass', False)}")
+print(f"  stage3_svd.cov_num_sequences = {s3.get('cov_num_sequences', '(library default)')}")
+print(f"  stage3_svd.spectra_workers = {s3.get('spectra_workers', 1)}")
 print(f"  multi_gpu.cov_window_size = {cfg.get('multi_gpu', {}).get('cov_window_size', '(auto)')}")

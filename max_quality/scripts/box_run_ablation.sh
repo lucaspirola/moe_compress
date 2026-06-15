@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 # The real s234 ablation on the box: reap-s234 (resumes HF stage2p5_final, Stage
-# 3->6) + ream-s234 (Stage 2->6). whitening_cov=shift (paper-fidelity acov), the
-# result-preserving multi-GPU subset (--num-gpus 2: DDP + SVD/EoRA task-parallel,
-# NO auto-batch cov-DP). Neither arm runs Stage 1 (_shared/ is the gen_shared stub).
+# 3->6) + ream-s234 (Stage 2->6). whitening_cov=shift (paper-fidelity acov).
+# SINGLE-H200 strategy (--num-gpus 1): the 35B student + single-pass CPU-accum cov
+# fit one card, so the 1-GPU path injects NO multi-GPU overlay (byte-identical) and
+# is far cheaper than the paused 2-GPU 4000-seq run. No arm runs Stage 1 (_shared/
+# is the gen_shared stub).
+#
+# REQUIRES box_reap.yaml prepped WITH the Stage-3 cov optimizations ON (default-OFF
+# in the library), e.g.:
+#   python scripts/prep_box_config.py configs/qwen36_35b_a3b_reap_faithful.yaml \
+#     "${BASE}/box_reap.yaml" --base "${BASE}" \
+#     --single-pass-cov --cov-num-sequences 512 --spectra-workers "$(nproc)"
+# (do NOT pass --shard: single GPU).
 set -uo pipefail
 
 BASE="${BASE:-/root/work}"
@@ -18,12 +27,12 @@ export HF_HUB_DISABLE_XET=1      # xet writer error on the 52GB seed (2026-06-14
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 cd "${REPO}"
 
-echo "=================== s234 ABLATION (whitening=shift, 2-GPU) ==================="
+echo "=================== s234 ABLATION (whitening=shift, 1-GPU single-pass) ==================="
 "${PY}" -u -m moe_compress.run_reap_ream_35pct \
   --config "${CFG}" --model "${MODEL}" \
   --probe-root "${PROBE}" \
   --only reap-s234,ream-s234 \
-  --whitening-cov shift --num-gpus 2 --num-sequences 4000
+  --whitening-cov shift --num-gpus 1 --num-sequences 512
 RC=$?
 echo "ABLATION_RC=${RC}"
 
