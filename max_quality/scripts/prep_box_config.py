@@ -36,7 +36,17 @@ m["name_or_path"] = MODEL
 if args.shard:
     m["device_map"] = "balanced"   # shard teacher+student across all visible GPUs
 
-cfg.setdefault("calibration", {})["jsonl_path"] = JSONL
+# Route ALL calibration consumers (Stage-2 profiling, Stage-3 B/C cross-cov,
+# Stage-5 Router-KD) to the LOCAL self-traces JSONL replay. The base config's
+# source=qwen3-pretrain-mix-v2 makes spec_from_config dispatch to the STREAMING
+# adapter and silently IGNORE jsonl_path — observed live (box 41023933) to yield
+# ~1 token/row → a (512,4096) cov tensor that was 99.77% EOS padding → a
+# near-rank-1 degenerate cross-cov. self-traces is the intended (Stage-0) domain-
+# stratified dataset and is what box_verify_domain_mix.py guards. source MUST be
+# "self-traces" for the jsonl_path to take effect (calibration.py get_corpus_adapter).
+_cal = cfg.setdefault("calibration", {})
+_cal["source"] = "self-traces"
+_cal["jsonl_path"] = JSONL
 cfg.setdefault("target", {})["net_of_eora"] = True
 
 s3 = cfg.setdefault("stage3_svd", {})
@@ -61,6 +71,7 @@ with open(args.dst, "w") as f:
 print(f"wrote {args.dst}")
 print(f"  model.name_or_path = {m['name_or_path']}")
 print(f"  model.device_map   = {m.get('device_map', '(default)')}")
+print(f"  calibration.source = {cfg['calibration']['source']}")
 print(f"  calibration.jsonl_path = {cfg['calibration']['jsonl_path']}")
 print(f"  target.net_of_eora = {cfg['target']['net_of_eora']}")
 print(f"  stage3_svd.cov_batch_size = {s3['cov_batch_size']} auto_batch={s3['auto_batch']}")
