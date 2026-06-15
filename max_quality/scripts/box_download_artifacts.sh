@@ -15,13 +15,23 @@ MODEL="Qwen/Qwen3.6-35B-A3B"
 
 # System python + pip. The base CUDA image has python3 but NO pip, and its
 # ensurepip is stripped — so bootstrap pip via apt before any `python3 -m pip`.
-# (Lock::Timeout waits out the parallel venv-build's apt lock instead of failing.)
-# Caught live on box 41023933 (2026-06-15): without this the first `python3 -m
-# pip` died with "No module named pip" and the download aborted under set -e.
+# This script runs IN PARALLEL with the venv build's apt, and `DPkg::Lock::Timeout`
+# only covers the dpkg lock — NOT the `apt-get update` *lists* lock — so a bare
+# parallel `apt-get update` collides and aborts under set -e (caught on box
+# 41023933 then again on 41049095, 2026-06-15). Retry the apt calls until the
+# build's apt releases (up to ~5 min) so the collision is waited out, not fatal.
 export HF_HUB_ENABLE_HF_TRANSFER=1 DEBIAN_FRONTEND=noninteractive
+_apt_retry() {  # apt-get with a lock-collision retry loop (lists lock is not covered by Lock::Timeout)
+    for _ in $(seq 1 60); do
+        apt-get -o DPkg::Lock::Timeout=60 "$@" && return 0
+        echo "[dl] apt busy (parallel build apt holds the lock); retrying in 5s..." >&2
+        sleep 5
+    done
+    return 1
+}
 if ! python3 -m pip --version >/dev/null 2>&1; then
-    apt-get -o DPkg::Lock::Timeout=300 update -qq
-    apt-get -o DPkg::Lock::Timeout=300 install -y -qq python3-pip
+    _apt_retry update -qq
+    _apt_retry install -y -qq python3-pip
 fi
 PIP="python3 -m pip install -q --break-system-packages"   # PEP 668 base image
 ${PIP} huggingface_hub hf_transfer
